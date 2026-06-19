@@ -13,3 +13,4 @@ Handlers Postgres Integration / Handlers Postgres Integration
 E2E Peer Visibility (literal MCP list_peers) / E2E Peer Visibility
 Secret scan / Scan diff for credential-shaped strings
 template-delivery-e2e / Template-asset delivery (fresh seo-agent — config+prompts via asset channel, seo-all via plugin reconcile)
+E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace

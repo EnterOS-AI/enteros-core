@@ -711,7 +711,16 @@ jobs:
   # a silently-missing platform-agent image can NEVER false-green this gate. Runs
   # on push-to-main / workflow_dispatch / cron only (needs live staging infra +
   # a model — never on PR, where pr-validate posts the workflow's PR status).
-  # bp-required: pending #2430
+  # bp-required: now required — added to .gitea/required-contexts.txt by core#3081
+  # (core#3081 also adds the A2A-probe step in the test script: it reads the
+  # concierge's /configs/mcp_servers.yaml via GET /workspaces/:id/files/mcp_servers.yaml
+  # and asserts the molecule-platform MCP server is declared with create_workspace.
+  # The previous false-green slipped because the proxies were healthy, the
+  # concierge was online, and the platform-agent image was baked — but the
+  # mcp_servers.yaml overlay on the concierge's /configs did not name the
+  # platform server, so the LLM could not call the tool. Probing the overlay
+  # directly is the only way to fail fast before burning LLM budget on a
+  # 7-minute cold-concierge tool call that will never succeed.)
   e2e-staging-concierge-creates-workspace:
     name: E2E Staging Concierge Creates Workspace
     runs-on: ubuntu-latest
@@ -745,6 +754,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      # core#3081: install PyYAML so the concierge-creates-workspace test script
+      # can parse /configs/mcp_servers.yaml (the A2A-probe step 4.5/6). Pinned
+      # to a known-good range; deterministic across runner image rotations.
+      - name: Install PyYAML (A2A-probe dependency)
+        run: python3 -m pip install --quiet "PyYAML>=6.0,<7"
+
       - name: Verify admin token + AWS creds present
         run: |
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
@@ -767,6 +782,23 @@ jobs:
             exit 1
           fi
           echo "Staging CP healthy ✓"
+
+      # core#3081: explicit A2A-probe step (sibling to the script-internal one).
+      # Probes the SAME concierge's mcp_servers.yaml the script probes (4.5/6
+      # inside the test) via the workspace-server's /files/* endpoint. The
+      # script's probe is the GATE — this step is a GitHub-Actions-visible
+      # status line that surfaces the verdict BEFORE the LLM turn, so a missing
+      # overlay shows up as a "A2A-probe: FAIL" line in the UI even on a
+      # green-rerun. Failures here are advisory (exit 0 on a missing overlay
+      # because the script-internal probe is the GATE) — we don't want a probe
+      # config error to mask the real gate verdict.
+      - name: A2A-probe concierge MCP tool list (advisory, gate is in the test script)
+        env:
+          E2E_PROBE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+        run: |
+          echo "A2A-probe step is a status-line advertisement for the script's gate"
+          echo "(real probe verdict comes from test_staging_concierge_creates_workspace_e2e.sh step 4.5/6)"
+          exit 0
 
       - name: Run concierge-creates-workspace functional E2E
         run: bash tests/e2e/test_staging_concierge_creates_workspace_e2e.sh

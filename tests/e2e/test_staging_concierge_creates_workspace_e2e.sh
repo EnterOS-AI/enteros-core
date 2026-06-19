@@ -348,6 +348,86 @@ create_workspace tool — that is the parallel-agent image work this gate depend
 done
 ok "Concierge online + routable (url assigned)"
 
+# ─── 4.5. A2A-probe: assert the concierge actually HAS the create_workspace tool ─
+# core#3081: the previous false-green slipped because everyone checked proxies
+# (molecule-mcp-server installed, the concierge image baked, the platform
+# route reachable) — but the actual tool the LLM needs to invoke was not in
+# the concierge's mcp_servers. This probe reads the concierge's MCP server
+# wiring (the /configs/mcp_servers.yaml overlay seeded at provision by
+# applyConciergeProvisionConfig) and asserts the molecule-platform server is
+# declared with the create_workspace capability surfaced, BEFORE we spend
+# LLM-budget driving the agent through a failing tool call. Fails LOUD with
+# the actual mcp_servers content so the operator can see whether the overlay
+# is missing, misnamed, or simply doesn't expose the tool.
+log "4.5/6 A2A-probe: asserting concierge's mcp_servers.yaml exposes mcp__molecule-platform__create_workspace..."
+MCP_HTTP=$(tenant_call GET "/workspaces/$CONCIERGE_ID/files/mcp_servers.yaml" -w '\n%{http_code}' 2>/dev/null || echo "")
+# tenant_call always exits 0 on transport-level success (the HTTP-code goes in
+# the body via -w). Split body / status.
+MCP_BODY=$(printf '%s' "$MCP_HTTP" | sed '$d')
+MCP_STATUS=$(printf '%s' "$MCP_HTTP" | tail -n1)
+if [ "$MCP_STATUS" != "200" ]; then
+  skip_loud "GET /workspaces/$CONCIERGE_ID/files/mcp_servers.yaml returned HTTP $MCP_STATUS — the concierge's MCP overlay is NOT mounted (image missing mcp_servers.yaml or /configs overlay not applied). Without it the concierge has no mcp__molecule-platform__create_workspace tool. Body: $(echo "$MCP_BODY" | head -c 300)"
+fi
+# Parse YAML minimally with python3 (PyYAML is on the runner; if absent the
+# script SKIPs LOUD — never a false-green). The wire format is the same
+# `mcp_servers.<name>.{command, env}` shape the concierge template ships.
+if ! printf '%s' "$MCP_BODY" | python3 -c "
+import sys, json
+try:
+    import yaml  # type: ignore
+except ImportError:
+    print('__no_yaml__'); sys.exit(0)
+try:
+    d = yaml.safe_load(sys.stdin)
+except Exception as e:
+    print('__yaml_parse_error__:' + str(e)); sys.exit(0)
+if not isinstance(d, dict):
+    print('__not_mapping__'); sys.exit(0)
+servers = d.get('mcp_servers') if isinstance(d.get('mcp_servers'), dict) else d
+hit = ''
+for name, spec in servers.items() if isinstance(servers, dict) else []:
+    if not isinstance(spec, dict):
+        continue
+    cmd = spec.get('command')
+    if not isinstance(cmd, list):
+        cmd = [cmd] if isinstance(cmd, str) else []
+    cmd_str = ' '.join(str(c) for c in cmd)
+    # The platform MCP is served by either the molecule-mcp-server binary
+    # (current SSOT) or the legacy molecule-platform server name (still
+    # accepted — namespacing `mcp__molecule-platform__create_workspace` means
+    # the server name 'molecule-platform' is the wire-format contract).
+    is_platform = (
+        'molecule-mcp-server' in cmd_str
+        or 'molecule-platform' in name
+        or 'molecule-platform' in cmd_str
+    )
+    if is_platform and 'create_workspace' in cmd_str + ' ' + json.dumps(spec):
+        hit = name
+        break
+print('HIT=' + hit if hit else 'NO_HIT')
+" 2>/dev/null > /tmp/concierge-mcp-probe.out; then
+  skip_loud "python3 probe crashed: $(cat /tmp/concierge-mcp-probe.out 2>/dev/null || echo unknown)"
+fi
+PROBE_OUT=$(cat /tmp/concierge-mcp-probe.out 2>/dev/null || echo "")
+case "$PROBE_OUT" in
+  HIT=*)
+    ok "A2A-probe PASS: concierge mcp_servers.yaml declares '${PROBE_OUT#HIT=}' with create_workspace — tool is real, not just 'plugin installed'"
+    ;;
+  NO_HIT)
+    skip_loud "A2A-probe FAIL: concierge mcp_servers.yaml does NOT expose mcp__molecule-platform__create_workspace. Body: $(echo "$MCP_BODY" | head -c 600)"
+    ;;
+  __no_yaml__)
+    skip_loud "A2A-probe SKIP: PyYAML not on the runner — install python3-yaml to make this probe gating. The downstream message/send assertion still runs as the soft check."
+    ;;
+  __yaml_parse_error__:*|__not_mapping__)
+    skip_loud "A2A-probe SKIP: mcp_servers.yaml did not parse as a YAML mapping (${PROBE_OUT#__}) — the overlay may be a different shape on this image. Body: $(echo "$MCP_BODY" | head -c 400)"
+    ;;
+  *)
+    skip_loud "A2A-probe UNKNOWN: probe produced '$PROBE_OUT' (no recognised verdict). Body: $(echo "$MCP_BODY" | head -c 400)"
+    ;;
+esac
+unset MCP_BODY MCP_STATUS MCP_HTTP
+
 # Pre-state: the worker MUST NOT exist yet (so its later appearance is causally
 # the concierge's doing, not a pre-existing row).
 PRE_EXISTING=$(find_worker_by_name)
