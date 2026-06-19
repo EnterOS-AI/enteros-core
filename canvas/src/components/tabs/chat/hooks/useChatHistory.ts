@@ -6,6 +6,11 @@ import { type ChatMessage, appendMessageDeduped as appendMessageDedupedFn } from
 
 const INITIAL_HISTORY_LIMIT = 10;
 const OLDER_HISTORY_BATCH = 20;
+// Mobile-chat audit F4: prevent the in-memory message buffer from growing
+// without bound on long-lived chats. Server-side pagination still works;
+// we just discard the oldest messages client-side to bound re-render cost
+// and scroll jank on low-end mobile. A virtualized list is the larger fix.
+const MAX_MESSAGES = 500;
 
 async function loadMessagesFromDB(
   workspaceId: string,
@@ -120,7 +125,7 @@ export function useChatHistory(
         return;
       }
       if (older.length > 0) {
-        setMessages((prev) => [...older, ...prev]);
+        setMessages((prev) => [...older, ...prev].slice(-MAX_MESSAGES));
       } else {
         scrollAnchorRef.current = null;
       }
@@ -140,7 +145,7 @@ export function useChatHistory(
     loadInitial,
     loadOlder,
     appendMessageDeduped: (msg: ChatMessage) =>
-      setMessages((prev) => appendMessageDedupedFn(prev, msg)),
+      setMessages((prev) => appendMessageDedupedFn(prev, msg).slice(-MAX_MESSAGES)),
     setMessages,
     scrollAnchorRef,
   };
