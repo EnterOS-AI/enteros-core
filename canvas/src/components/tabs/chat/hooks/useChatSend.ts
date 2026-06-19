@@ -175,6 +175,8 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   const pendingWSTokensRef = useRef<Set<number>>(new Set());
   const wsCompletedTokensRef = useRef<Set<number>>(new Set());
   const messageIdToTokenRef = useRef<Map<string, number>>(new Map());
+  // Reverse index for O(1) cleanup when a token finishes (mc#2908 F8).
+  const tokenToMessageIdRef = useRef<Map<number, string>>(new Map());
   const sendingFromAPIRef = useRef(false);
   const nextTokenRef = useRef(1);
   const setupGuardRef = useRef(false);
@@ -192,12 +194,11 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
     inFlightTokensRef.current.delete(token);
     pendingWSTokensRef.current.delete(token);
     wsCompletedTokensRef.current.delete(token);
-    // Clean up the messageId mapping (linear scan is fine: N is tiny).
-    for (const [mid, tok] of messageIdToTokenRef.current) {
-      if (tok === token) {
-        messageIdToTokenRef.current.delete(mid);
-        break;
-      }
+    // O(1) cleanup of the bidirectional messageId mapping (mc#2908 F8).
+    const mid = tokenToMessageIdRef.current.get(token);
+    if (mid !== undefined) {
+      tokenToMessageIdRef.current.delete(token);
+      messageIdToTokenRef.current.delete(mid);
     }
     syncSendingState();
   }, [syncSendingState]);
@@ -309,6 +310,7 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
       const myToken = nextTokenRef.current++;
       inFlightTokensRef.current.add(myToken);
       messageIdToTokenRef.current.set(messageId, myToken);
+      tokenToMessageIdRef.current.set(myToken, messageId);
       syncSendingState();
 
       const history = optionsRef.current
