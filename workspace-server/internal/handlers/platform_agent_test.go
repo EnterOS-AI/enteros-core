@@ -975,4 +975,3 @@ func TestRecordDeclaredPlugin_PrivilegedPluginEntitlement(t *testing.T) {
 		}
 	})
 }
-

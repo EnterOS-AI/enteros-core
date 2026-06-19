@@ -286,4 +286,3 @@ func deleteWorkspacePluginRow(ctx context.Context, workspaceID, pluginName strin
 	`, workspaceID, pluginName)
 	return err
 }
-

@@ -819,4 +819,3 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 
 	return tx.Commit()
 }
-
