@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -984,15 +985,36 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// Runtime from DB — no more config file parsing
 	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime})
 
-	// RFC#2843 #33: on SaaS (cpProv), restore the persisted template so the
-	// re-provision re-delivers config.yaml + prompts — TemplateIdentity is
-	// derived from payload.Template (workspace_provision.go). Without this the
-	// SaaS re-provision ran with template="" → 218-byte stub config + dropped
-	// skills on every restart. Docker keeps its persistent config volume, so it
-	// retains the "do not re-apply templates" behavior (template left empty).
+	// RFC#2843 #33 + SaaS restart re-stub fix: on SaaS (cpProv), restore the
+	// persisted template AND resolve its LOCAL template dir so the re-provision
+	// re-delivers config.yaml + prompts.
+	//
+	// Setting payload.Template alone is NOT enough: it only drives the fetcher's
+	// TemplateAssets wire field, which the deployed control-plane does NOT consume
+	// (CP /cp/workspaces/provision reads `config_files` only — see
+	// controlplane wsProvisionRequest). config.yaml/prompts reach a SaaS box
+	// EXCLUSIVELY via `config_files`, which collectCPConfigFiles populates by
+	// walking cfg.TemplatePath. The restart previously passed templatePath="" →
+	// config routed only into the dropped TemplateAssets → every SaaS restart
+	// (each a fresh EC2 with empty /configs) landed a 218-byte stub config.yaml.
+	// That is the template-delivery-e2e intermittent (loses the race vs the
+	// post-online plugin-reconcile restart) AND a prod identity-loss-on-restart
+	// bug. Re-applying only touches template-owned, allowlisted files
+	// (config.yaml, prompts/**); user/agent paths (CLAUDE.md, MEMORY.md,
+	// .claude/**, /workspace) are excluded by IsCPTemplateAssetPath, so a
+	// persisted /configs is never clobbered. Docker keeps templatePath="" to
+	// preserve its persistent config volume.
+	restartTemplatePath := ""
 	if h.cpProv != nil {
 		if storedTmpl := storedWorkspaceTemplate(ctx, workspaceID); storedTmpl != "" {
 			payload.Template = storedTmpl
+			if p, resolveErr := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, storedTmpl); resolveErr != nil {
+				log.Printf("Auto-restart: %s template %q path resolution failed: %v — re-provision may land a stub config", workspaceID, storedTmpl, resolveErr)
+			} else if _, statErr := os.Stat(p); statErr == nil {
+				restartTemplatePath = p
+			} else {
+				log.Printf("Auto-restart: %s template %q dir absent at %q — re-provision may land a stub config", workspaceID, storedTmpl, p)
+			}
 		}
 	}
 
@@ -1022,7 +1044,7 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// status='provisioning' (the UPDATE above already ran). User-
 	// observable result on SaaS pre-fix: dead workspace → manual canvas
 	// restart was the only recovery path.
-	h.provisionWorkspaceAutoSyncLocked(workspaceID, "", nil, payload)
+	h.provisionWorkspaceAutoSyncLocked(workspaceID, restartTemplatePath, nil, payload)
 	// sendRestartContext is a one-way notification to the new container; safe
 	// to fire async — the next restart cycle won't depend on it completing.
 	// Tracked via h.goAsync so tests can wait for it via h.asyncWG before
