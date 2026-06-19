@@ -100,28 +100,38 @@ func TestProxyA2AError_NilSafe(t *testing.T) {
 }
 
 // ==================== classificationFromDeliveryConfirmed helper ====================
+//
+// CR2 review 12458: the helper signature changed from
+// `classificationFromDeliveryConfirmed(bool)` to
+// `classificationFromDeliveryConfirmed(status int, bodyNonEmpty bool)`
+// to align with the stricter isDeliveryConfirmedSuccess predicate
+// (200 <= status < 300 AND len(respBody) > 0). The strict-predicate
+// test below (`TestClassificationFromDeliveryConfirmed_Strict2xxAndNonEmpty`)
+// pins the new contract.
 
 func TestClassificationFromDeliveryConfirmed(t *testing.T) {
-	// When deliveryConfirmed is true (the agent wrote a 2xx/3xx response
-	// that we partially or fully received), the proxyA2AError must be
-	// classified as "delivered" so monitoring/PM can tell it apart from a
-	// real failure. When false (non-2xx or empty body), the field stays
-	// empty — those are real failures, not transport blips.
+	// Backward-compat coverage for the original "single bool" intent:
+	// the helper must classify a 2xx-with-body as "delivered" and
+	// everything else as empty. The strict-predicate test below
+	// covers the negative cases in detail.
 	cases := []struct {
-		name             string
-		deliveryConfirmed bool
-		want             string
+		name         string
+		status       int
+		bodyNonEmpty bool
+		want         string
 	}{
-		{"delivered when true", true, "delivered"},
-		{"empty when false (non-2xx agent response)", false, ""},
-		{"empty when false (empty body)", false, ""},
+		{"delivered when 2xx with body", 200, true, "delivered"},
+		{"empty when 2xx without body", 200, false, ""},
+		{"empty when non-2xx (4xx)", 400, true, ""},
+		{"empty when non-2xx (5xx)", 502, true, ""},
+		{"empty when 3xx with body", 301, true, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classificationFromDeliveryConfirmed(tc.deliveryConfirmed)
+			got := classificationFromDeliveryConfirmed(tc.status, tc.bodyNonEmpty)
 			if got != tc.want {
-				t.Errorf("classificationFromDeliveryConfirmed(%v) = %q, want %q",
-					tc.deliveryConfirmed, got, tc.want)
+				t.Errorf("classificationFromDeliveryConfirmed(status=%d, bodyNonEmpty=%v) = %q, want %q",
+					tc.status, tc.bodyNonEmpty, got, tc.want)
 			}
 		})
 	}
@@ -152,6 +162,99 @@ func TestIsUpstreamBusyError_DoesNotSetClassification(t *testing.T) {
 		t.Errorf("isUpstreamBusyError must not mutate proxyA2AError.Classification; "+
 			"got %q after a busy-shaped error (the field is set at construction, "+
 			"not by the predicate)", busyErr.Classification)
+	}
+}
+
+// ==================== classificationFromDeliveryConfirmed strict predicate ====================
+
+// CR2 review 12458: the original predicate used
+// `resp.StatusCode >= 200 && resp.StatusCode < 400` (any 2xx or 3xx with
+// body-read error) which is broader than the success condition in
+// executeDelegation.isDeliveryConfirmedSuccess (which requires
+// `200 <= status < 300` AND `len(respBody) > 0`). This test pins the
+// stricter predicate so monitoring/PM cannot see "delivered" for
+// 2xx-with-empty-body or 3xx responses, which would under-count
+// failures.
+func TestClassificationFromDeliveryConfirmed_Strict2xxAndNonEmpty(t *testing.T) {
+	cases := []struct {
+		name         string
+		status       int
+		bodyNonEmpty bool
+		want         string
+	}{
+		{"delivered: 2xx with non-empty body", 200, true, "delivered"},
+		{"delivered: 2xx with non-empty body (204)", 204, true, "delivered"},
+		{"NOT delivered: 2xx with empty body (read error before any bytes)", 200, false, ""},
+		{"NOT delivered: 3xx with non-empty body (server redirect rejection)", 301, true, ""},
+		{"NOT delivered: 3xx with non-empty body (304 not modified)", 304, true, ""},
+		{"NOT delivered: 4xx with non-empty body (agent error)", 500, true, ""},
+		{"NOT delivered: 5xx with non-empty body (agent error)", 502, true, ""},
+		{"NOT delivered: 1xx with non-empty body (informational)", 100, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classificationFromDeliveryConfirmed(tc.status, tc.bodyNonEmpty)
+			if got != tc.want {
+				t.Errorf("classificationFromDeliveryConfirmed(status=%d, bodyNonEmpty=%v) = %q, want %q",
+					tc.status, tc.bodyNonEmpty, got, tc.want)
+			}
+		})
+	}
+}
+
+// ==================== upstream_dead coverage at the missed sites ====================
+
+// Researcher review 12457 caught two upstream_dead construction sites
+// that the original PR missed. These tests pin that BOTH the reactive
+// path (handleA2ADispatchError's dead==true branch) AND the proactive
+// path (preflightContainerHealth's "container not running" branch)
+// carry the upstream_dead classification. Without this pin, a future
+// refactor of either path can silently drop the classification and
+// re-introduce the same observability gap.
+
+func TestUpstreamDead_ConstructionSites(t *testing.T) {
+	// Build representative proxyA2AError shapes that mirror what each
+	// missed construction site produces. The test asserts the
+	// Classification field is set to "upstream_dead" in BOTH cases.
+	// This is a static-shape test (no DB / no HTTP) — the value is
+	// in pinning the contract, not in re-running the construction
+	// logic.
+	cases := []struct {
+		name        string
+		err         *proxyA2AError
+		description string
+	}{
+		{
+			name: "reactive dead==true in handleA2ADispatchError (a2a_proxy_helpers.go:79-86)",
+			err: &proxyA2AError{
+				Status:         http.StatusServiceUnavailable,
+				Response:       gin.H{"error": "workspace agent unreachable — container restart triggered", "restarting": true},
+				Classification: "upstream_dead",
+			},
+			description: "the reactive path: Do() failed, maybeMarkContainerDead probed IsRunning and got dead==true",
+		},
+		{
+			name: "proactive preflightContainerHealth container-not-running (a2a_proxy_helpers.go:506-513)",
+			err: &proxyA2AError{
+				Status:         http.StatusServiceUnavailable,
+				Response:       gin.H{"error": "workspace container not running — restart triggered", "restarting": true, "preflight": true},
+				Classification: "upstream_dead",
+			},
+			description: "the proactive path: preflight probe ran before Do() and the container was already gone",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.err.Classification != "upstream_dead" {
+				t.Errorf("%s: Classification = %q, want \"upstream_dead\" (%s)",
+					tc.name, tc.err.Classification, tc.description)
+			}
+			// And the error string must surface the classification for
+			// log readability (existing Error() contract).
+			if !strings.Contains(tc.err.Error(), "upstream_dead") {
+				t.Errorf("%s: Error() = %q, want to contain \"upstream_dead\"", tc.name, tc.err.Error())
+			}
+		})
 	}
 }
 

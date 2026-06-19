@@ -83,6 +83,13 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 		return 0, nil, &proxyA2AError{
 			Status:   http.StatusServiceUnavailable,
 			Response: gin.H{"error": "workspace agent unreachable — container restart triggered", "restarting": true},
+			// 2026-06-19 a2a RCA (#3056): the handleA2ADispatchError
+			// path's "dead==true" branch is the same upstream-dead
+			// family as the a2a_proxy.go:881-892 site (502/504/521/
+			// 522/523/524 + 503-restarting) — a real dead container
+			// that the platform will restart. Researcher review 12457
+			// caught this site as unclassified in the original PR.
+			Classification: "upstream_dead",
 		}
 	}
 	// Container is alive but upstream Do() failed with a timeout/EOF-
@@ -510,6 +517,15 @@ func (h *WorkspaceHandler) preflightContainerHealth(ctx context.Context, workspa
 			"restarting": true,
 			"preflight":  true, // distinguishes from reactive containerDead path
 		},
+		// 2026-06-19 a2a RCA (#3056): the preflight's "container
+		// not running → restart triggered" branch is the proactive
+		// analogue of the reactive handleA2ADispatchError's dead==true
+		// branch (a2a_proxy_helpers.go:79-86). Both are genuine
+		// dead-origin failures that the platform is auto-restarting.
+		// Researcher review 12457 caught this site as unclassified
+		// in the original PR; classifying it here keeps the
+		// upstream_dead bucket exhaustive.
+		Classification: "upstream_dead",
 	}
 }
 

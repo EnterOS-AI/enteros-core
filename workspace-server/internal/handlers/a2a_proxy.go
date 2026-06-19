@@ -265,20 +265,35 @@ func isUpstreamDeadStatus(status int) bool {
 }
 
 // classificationFromDeliveryConfirmed returns the proxyA2AError
-// classification that corresponds to the deliveryConfirmed flag set by the
-// 2xx-body-read-error path. When deliveryConfirmed is true, the agent wrote
-// a 2xx (or 3xx) response that we partially or fully received before the
-// transport error fired — the work IS done, the error is on the wire. We
-// mark the error as "delivered" so monitoring/PM can distinguish it from a
-// real failure. When deliveryConfirmed is false, no classification is set
-// (a non-2xx agent response or empty body is a real failure, not a
-// delivery blip, and the existing log shape stays intact for backward
-// compatibility with log parsers).
+// classification that corresponds to the deliveryConfirmed predicate
+// set by the 2xx-body-read-error path. The classification "delivered"
+// must align exactly with the success condition in
+// executeDelegation.isDeliveryConfirmedSuccess (which promotes the
+// delegation to handleSuccess on proxyErr != nil, 200 <= status < 300,
+// len(respBody) > 0), otherwise monitoring/PM would under-count failures:
+//   - A 2xx response with body-read error and len(respBody) > 0 is a
+//     real "delivered" — the work is done, the error is on the wire.
+//   - A 2xx response with body-read error and len(respBody) == 0 is
+//     NOT a real "delivered" — the agent wrote status + headers but no
+//     body bytes reached us, and executeDelegation's
+//     isDeliveryConfirmedSuccess gates on len(respBody) > 0, so the
+//     delegation is recorded as a failure. Classifying this as
+//     "delivered" would under-count failures.
+//   - A 3xx response with body-read error is a server-authored redirect
+//     rejection (A2A does not follow redirects). executeDelegation
+//     keeps the failure status. Classifying as "delivered" would also
+//     under-count failures.
+//
+// CR2 review 12458: the original implementation used
+// `resp.StatusCode >= 200 && resp.StatusCode < 400` (any 2xx OR 3xx)
+// which is broader than the success gate and recreates the same
+// false-classification problem in a narrower shape. This stricter
+// predicate restores the alignment with isDeliveryConfirmedSuccess.
 //
 // 2026-06-19 a2a RCA (#3056). See proxyA2AError.Classification for the
 // full set of possible values.
-func classificationFromDeliveryConfirmed(deliveryConfirmed bool) string {
-	if deliveryConfirmed {
+func classificationFromDeliveryConfirmed(status int, bodyNonEmpty bool) string {
+	if status >= 200 && status < 300 && bodyNonEmpty {
 		return "delivered"
 	}
 	return ""
@@ -788,7 +803,7 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 			// deliveryConfirmed is false (the response was non-2xx or
 			// the body was empty) — those are real failures, not
 			// delivery blips.
-			Classification: classificationFromDeliveryConfirmed(deliveryConfirmed),
+			Classification: classificationFromDeliveryConfirmed(resp.StatusCode, len(respBody) > 0),
 		}
 	}
 
