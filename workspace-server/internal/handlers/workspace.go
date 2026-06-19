@@ -1356,24 +1356,34 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 		ws["last_outbound_at"] = nil
 	}
 
+	// 2026-06-19 a2a RCA (#3057): fetch last_heartbeat_at alongside
+	// last_outbound_at. The GET SELECT and scanWorkspaceRow do NOT
+	// include it (reviewers 12459 + 12460 caught the previous
+	// assumption that the column was already scanned), so we read
+	// it as a separate column-shaped follow-up query. The wedge
+	// predicate needs BOTH timestamps — without the heartbeat fetch,
+	// lastHeartbeat stayed invalid and any active workspace with a
+	// stale outbound was flagged wedged, recreating the false-positive
+	// safety concern this PR exists to fix.
+	var lastHeartbeat sql.NullTime
+	if err := db.DB.QueryRowContext(c.Request.Context(),
+		`SELECT last_heartbeat_at FROM workspaces WHERE id = $1`, id,
+	).Scan(&lastHeartbeat); err == nil && lastHeartbeat.Valid {
+		ws["last_heartbeat_at"] = lastHeartbeat.Time
+	} else {
+		ws["last_heartbeat_at"] = nil
+	}
+
 	// 2026-06-19 a2a RCA (#3057): surface a `wedged` boolean so
 	// operators and the canvas can detect the alive-but-wedged case
 	// (active_tasks>0, no outbound, no heartbeat) without manually
 	// inspecting the tuple. The predicate is the same one the
 	// wedged-agent monitor uses internally (registry.IsWedgedAgent),
 	// so the flag and the monitor can never disagree. Threshold comes
-	// from the same env var override; default 5 minutes. Active
-	// tasks and last_heartbeat_at are already in the scanned row
-	// (`ws`); last_outbound_at was just fetched above.
+	// from the same env var override; default 5 minutes. active_tasks
+	// is in the scanned row; last_outbound_at and last_heartbeat_at
+	// are both fetched above as separate column queries.
 	activeTasksVal, _ := ws["active_tasks"].(int)
-	var lastHeartbeat sql.NullTime
-	if hb, ok := ws["last_heartbeat_at"].(time.Time); ok {
-		lastHeartbeat = sql.NullTime{Time: hb, Valid: true}
-	} else if hbStr, ok := ws["last_heartbeat_at"].(string); ok {
-		if parsed, perr := time.Parse(time.RFC3339Nano, hbStr); perr == nil {
-			lastHeartbeat = sql.NullTime{Time: parsed, Valid: true}
-		}
-	}
 	ws["wedged"] = registry.IsWedgedAgent(activeTasksVal, lastOutbound, lastHeartbeat, registry.WedgedThresholdForHTTP())
 
 	// #2054 phase 2: per-runtime provision-timeout for canvas's

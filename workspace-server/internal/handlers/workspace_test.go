@@ -2258,3 +2258,148 @@ func TestWorkspaceCreate_188_ExplicitRuntimeNoTemplate_OK(t *testing.T) {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
+
+// ==================== GET /workspaces/:id — wedged flag (#3057) ====================
+
+// 2026-06-19 a2a RCA (#3057) regression: the previous version of the
+// wedged flag assumed `last_heartbeat_at` was in the scanned row, but
+// scanWorkspaceRow does not select/scan it. As a result, lastHeartbeat
+// stayed invalid and any workspace with active_tasks>0 + stale outbound
+// was reported as wedged — even if the heartbeat was fresh. This test
+// pins the fix: GET must fetch last_heartbeat_at separately, and the
+// flag must be false when the heartbeat is recent (the canonical
+// "legitimately busy" case from the IsWedgedAgent truth table).
+func TestWorkspaceGet_Wedged_FreshHeartbeatStaleOutbound(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	id := "cccccccc-00a0-0000-0000-000000000000"
+	now := time.Now().UTC()
+	freshHeartbeat := now.Add(-30 * time.Second) // well within the 5min default threshold
+	staleOutbound := now.Add(-15 * time.Minute)  // well past the 5min threshold
+
+	columns := []string{
+		"id", "name", "role", "tier", "status", "agent_card", "url",
+		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
+		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
+		"budget_limit", "monthly_spend",
+		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+	}
+	// active_tasks=1 (busy), but the GET row carries only what
+	// scanWorkspaceRow scans (which does NOT include last_heartbeat_at).
+	mock.ExpectQuery("SELECT w.id, w.name").
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows(columns).
+			AddRow(id, "Busy Agent", "worker", 1, "online", []byte(`null`),
+				"", nil, 1, 1, 0.0, "", 60, "mid-turn", "claude-code",
+				"", 0.0, 0.0, false,
+				nil, 0, false, true, []byte(`{}`), "workspace"))
+	// Follow-up query for last_outbound_at (existing #817 path).
+	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows([]string{"last_outbound_at"}).AddRow(staleOutbound))
+	// New follow-up query for last_heartbeat_at (the fix the reviewers
+	// caught was missing). The predicate MUST see this fresh heartbeat
+	// to keep the flag false.
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces`).
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(freshHeartbeat))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: id}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/"+id, nil)
+
+	handler.Get(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	// The wedged flag must be FALSE: a busy agent with a fresh
+	// heartbeat is not wedged. If this fails, the false-positive
+	// regression is back.
+	if wedged, _ := resp["wedged"].(bool); wedged {
+		t.Errorf("wedged flag = true, want false (active=1, fresh heartbeat, stale outbound) — "+
+			"the false-positive regression: last_heartbeat_at is not being fetched or read into the predicate")
+	}
+	// And last_heartbeat_at should be surfaced in the response so
+	// operators can see the value the predicate consumed.
+	if _, ok := resp["last_heartbeat_at"]; !ok {
+		t.Errorf("last_heartbeat_at missing from response — the GET must surface it so "+
+			"operators can verify the wedge predicate's input")
+	}
+	if resp["last_outbound_at"] == nil {
+		t.Errorf("last_outbound_at should be the stale value, got nil")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// Companion test: the WEDGE case (active>0, stale outbound, stale/null
+// heartbeat) must produce wedged:true. The two tests together pin
+// BOTH directions of the predicate at the HTTP integration boundary.
+func TestWorkspaceGet_Wedged_StaleHeartbeatStaleOutbound(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	id := "cccccccc-00a1-0000-0000-000000000000"
+	now := time.Now().UTC()
+	staleHeartbeat := now.Add(-15 * time.Minute) // past the 5min threshold
+	staleOutbound := now.Add(-15 * time.Minute)  // past the 5min threshold
+
+	columns := []string{
+		"id", "name", "role", "tier", "status", "agent_card", "url",
+		"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
+		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
+		"budget_limit", "monthly_spend",
+		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+	}
+	mock.ExpectQuery("SELECT w.id, w.name").
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows(columns).
+			AddRow(id, "Wedged Agent", "worker", 1, "online", []byte(`null`),
+				"", nil, 1, 1, 0.0, "", 60, "stuck", "claude-code",
+				"", 0.0, 0.0, false,
+				nil, 0, false, true, []byte(`{}`), "workspace"))
+	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows([]string{"last_outbound_at"}).AddRow(staleOutbound))
+	mock.ExpectQuery(`SELECT last_heartbeat_at FROM workspaces`).
+		WithArgs(id).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(staleHeartbeat))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: id}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/"+id, nil)
+
+	handler.Get(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if wedged, _ := resp["wedged"].(bool); !wedged {
+		t.Errorf("wedged flag = false, want true (active=1, stale heartbeat, stale outbound) — "+
+			"the wedge predicate failed at the HTTP integration boundary")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
