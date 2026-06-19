@@ -318,7 +318,7 @@ func TestMaybeProvisionPlatformAgentOnBoot_RestartsRunningButVanilla(t *testing.
 	mock.ExpectQuery(kindQuery).WithArgs(bootPlatformID).
 		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
 	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
-		WithArgs(bootPlatformID, conciergePlatformMCPPlugin, sqlmock.AnyArg()).
+		WithArgs(bootPlatformID, conciergePlatformMCPName, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Running, but ExecRead of system-prompt.md returns vanilla content (no

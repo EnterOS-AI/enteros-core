@@ -165,6 +165,11 @@ jobs:
           # go-arch-lint "without types"). Fleet sweep after the cp ci.yml find.
           cache: false
       - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: Install workspace-runtime wheel for contract tests
+        working-directory: .
+        run: |
+          pip install --index-url "https://agent-dev-a:${{ secrets.AUTO_SYNC_TOKEN }}@git.moleculesai.app/api/packages/molecule-ai/pypi/simple/" molecule-ai-workspace-runtime || true
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         run: go mod download
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         run: go build ./cmd/server

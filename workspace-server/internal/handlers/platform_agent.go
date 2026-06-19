@@ -663,8 +663,8 @@ func MaybeProvisionPlatformAgentOnBoot(ctx context.Context, database *sql.DB, pr
 			return
 		}
 		log.Printf("boot: platform-agent %s running but MISSING concierge identity — re-declaring management MCP and restarting once to apply the system prompt + platform MCP", id)
-		if rec, skip := seedTemplatePlugins(ctx, id, []string{conciergePlatformMCPPlugin}); skip > 0 {
-			log.Printf("boot: concierge %s could not re-declare %q plugin (recorded=%d skipped=%d) — management MCP may be absent until next provision", id, conciergePlatformMCPPlugin, rec, skip)
+		if rec, skip := seedTemplatePlugins(ctx, id, []string{conciergePlatformMCPSource}); skip > 0 {
+			log.Printf("boot: concierge %s could not re-declare %q plugin (recorded=%d skipped=%d) — management MCP may be absent until next provision", id, conciergePlatformMCPSource, rec, skip)
 		}
 		go restartByID(id)
 		return
