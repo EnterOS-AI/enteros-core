@@ -3,58 +3,12 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
-
-// mergeMCPPluginSettings models the runtime MCPServerAdaptor's write side for
-// the contract test: it reads a plugin's settings-fragment.json and merges its
-// mcpServers block into the contract settings_path/key. Keeping this logic in
-// the test file makes the contract test hermetic and avoids adding dead
-// production code; the live pipeline still uses the Python runtime adaptor.
-func mergeMCPPluginSettings(configsDir, pluginRoot string, contract *MCPPluginDeliveryContract) error {
-	data, err := os.ReadFile(filepath.Join(pluginRoot, "settings-fragment.json"))
-	if err != nil {
-		return fmt.Errorf("read settings-fragment.json: %w", err)
-	}
-	var fragment map[string]any
-	if err := json.Unmarshal(data, &fragment); err != nil {
-		return fmt.Errorf("parse settings-fragment.json: %w", err)
-	}
-	mcpServers, ok := fragment[contract.Key].(map[string]any)
-	if !ok {
-		return fmt.Errorf("settings-fragment.json %q key missing or not an object", contract.Key)
-	}
-
-	if !strings.HasPrefix(contract.SettingsPath, "/configs/") {
-		return fmt.Errorf("contract settings_path %q does not start with /configs/", contract.SettingsPath)
-	}
-	rel := strings.TrimPrefix(contract.SettingsPath, "/configs/")
-	settingsPath := filepath.Join(configsDir, rel)
-	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
-		return fmt.Errorf("mkdir settings dir: %w", err)
-	}
-
-	existing := map[string]any{}
-	if cur, err := os.ReadFile(settingsPath); err == nil {
-		_ = json.Unmarshal(cur, &existing)
-	}
-	existing[contract.Key] = mcpServers
-
-	out, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal settings: %w", err)
-	}
-	out = append(out, '\n')
-	if err := os.WriteFile(settingsPath, out, 0o644); err != nil {
-		return fmt.Errorf("write settings: %w", err)
-	}
-	return nil
-}
 
 // TestMCPPluginDeliveryContract_MatchesSSOT pins the producer side of the
 // MCP-plugin delivery contract. The contract file is the SSOT shared with
@@ -93,69 +47,12 @@ func TestMCPPluginDeliveryContract_LoadableFromRepoRoot(t *testing.T) {
 }
 
 // TestMCPPluginDeliveryContract_MCPServerAdaptorWritesMcpServers asserts the
-// producer side of the contract: an MCP-server plugin's settings-fragment.json
-// is merged into the exact settings_path and key pinned by the contract. This
-// prevents silent divergence between where MCPServerAdaptor writes and where
-// claude_sdk_executor._load_settings_mcp reads.
+// producer side of the contract by exercising the REAL production
+// MCPServerAdaptor from molecule-ai-workspace-runtime. It merges an MCP-server
+// plugin's settings-fragment.json into the exact settings_path and key pinned
+// by the contract. This catches real producer drift; the previous test-local
+// helper that modelled the adaptor has been removed.
 func TestMCPPluginDeliveryContract_MCPServerAdaptorWritesMcpServers(t *testing.T) {
-	contract, err := LoadMCPPluginDeliveryContract()
-	if err != nil {
-		t.Fatalf("load contract: %v", err)
-	}
-
-	configsDir := t.TempDir()
-	pluginRoot := t.TempDir()
-
-	fragment := map[string]any{
-		contract.Key: map[string]any{
-			"molecule-platform": map[string]any{
-				"command": "molecule-mcp",
-				"env": map[string]string{
-					"MOLECULE_MCP_MODE": "management",
-				},
-			},
-		},
-	}
-	fragmentBytes, err := json.Marshal(fragment)
-	if err != nil {
-		t.Fatalf("marshal fragment: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(pluginRoot, "settings-fragment.json"), fragmentBytes, 0o644); err != nil {
-		t.Fatalf("write settings-fragment.json: %v", err)
-	}
-
-	if err := mergeMCPPluginSettings(configsDir, pluginRoot, contract); err != nil {
-		t.Fatalf("merge mcp plugin settings: %v", err)
-	}
-
-	rel := strings.TrimPrefix(contract.SettingsPath, "/configs/")
-	settingsPath := filepath.Join(configsDir, rel)
-	gotBytes, err := os.ReadFile(settingsPath)
-	if err != nil {
-		t.Fatalf("read produced settings at %s: %v", contract.SettingsPath, err)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(gotBytes, &got); err != nil {
-		t.Fatalf("parse produced settings: %v", err)
-	}
-	if _, ok := got[contract.Key]; !ok {
-		t.Fatalf("produced settings missing contract key %q", contract.Key)
-	}
-	mcpServers, ok := got[contract.Key].(map[string]any)
-	if !ok {
-		t.Fatalf("produced settings %q is not an object: %T", contract.Key, got[contract.Key])
-	}
-	if _, ok := mcpServers["molecule-platform"]; !ok {
-		t.Fatalf("produced settings %q does not contain the molecule-platform entry", contract.Key)
-	}
-}
-
-// TestMCPPluginDeliveryContract_RealMCPServerAdaptorWritesMcpServers exercises
-// the actual runtime MCPServerAdaptor when molecule-ai-workspace-runtime is
-// available. This is the real producer named in the contract; the hermetic test
-// above is the always-on CI guard, while this test catches drift in the runtime
-// implementation itself.
-func TestMCPPluginDeliveryContract_RealMCPServerAdaptorWritesMcpServers(t *testing.T) {
 	contract, err := LoadMCPPluginDeliveryContract()
 	if err != nil {
 		t.Fatalf("load contract: %v", err)
@@ -170,6 +67,7 @@ func TestMCPPluginDeliveryContract_RealMCPServerAdaptorWritesMcpServers(t *testi
 			runtimePath = sibling
 		}
 	}
+
 	pyScript := `
 import asyncio, json, sys
 from pathlib import Path
