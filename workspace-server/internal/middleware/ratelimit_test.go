@@ -45,9 +45,12 @@ func TestRateLimit_HeadersPresentOnAllowedRequest(t *testing.T) {
 	}
 }
 
-// TestRateLimit_XFF_BypassDocumented shows that WITHOUT SetTrustedProxies(nil)
-// a spoofed X-Forwarded-For header can rotate an attacker's effective IP and
-// bypass per-IP rate limiting (documents the issue #179 vulnerability).
+// TestRateLimit_XFF_BypassDocumented shows that when the test router is
+// configured to trust the source proxy, a spoofed X-Forwarded-For header can
+// rotate an attacker's effective IP and bypass per-IP rate limiting
+// (documents the issue #179 vulnerability). Modern Gin defaults to trusting
+// NO proxies, so we explicitly trust the test RemoteAddr to reproduce the
+// pre-fix behavior; without this trust the bypass is correctly blocked.
 func TestRateLimit_XFF_BypassDocumented(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -55,8 +58,11 @@ func TestRateLimit_XFF_BypassDocumented(t *testing.T) {
 	rl := NewRateLimiter(2, 5*time.Second, ctx)
 
 	r := gin.New()
-	// Intentionally NOT calling r.SetTrustedProxies(nil) — replicates the
-	// pre-fix behaviour where Gin trusts all proxies by default.
+	// Replicate the pre-fix trust model: the request source (10.0.0.1) is
+	// treated as a trusted proxy, so c.ClientIP() reads X-Forwarded-For.
+	if err := r.SetTrustedProxies([]string{"10.0.0.1/32"}); err != nil {
+		t.Fatalf("SetTrustedProxies: %v", err)
+	}
 	r.Use(rl.Middleware())
 	r.GET("/x", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
 
@@ -80,8 +86,8 @@ func TestRateLimit_XFF_BypassDocumented(t *testing.T) {
 			t.Fatalf("3rd request (no XFF): want 429, got %d", w.Code)
 		}
 	}
-	// With default proxy trust, spoofing X-Forwarded-For rotates the effective
-	// IP → new bucket → bypass succeeds (returns 200).
+	// With trusted proxy config, spoofing X-Forwarded-For rotates the
+	// effective IP → new bucket → bypass succeeds (returns 200).
 	{
 		req := httptest.NewRequest(http.MethodGet, "/x", nil)
 		req.RemoteAddr = "10.0.0.1:1234"
@@ -89,7 +95,7 @@ func TestRateLimit_XFF_BypassDocumented(t *testing.T) {
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
-			t.Skipf("bypass no longer works without trusted-proxy config (Gin version changed?): got %d", w.Code)
+			t.Errorf("XFF bypass did not work under trusted-proxy config: want 200, got %d", w.Code)
 		}
 	}
 }
