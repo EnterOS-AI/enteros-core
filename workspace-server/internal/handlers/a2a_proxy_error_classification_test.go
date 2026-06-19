@@ -8,7 +8,6 @@
 package handlers
 
 import (
-	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -274,5 +273,4 @@ func TestUpstreamDead_ConstructionSites(t *testing.T) {
 // These imports are used by the tests above. If a future refactor removes
 // any of them, the test file will fail to compile — that is intentional,
 // it forces whoever removes the dependency to also update the test.
-var _ = errors.New
 var _ = http.StatusOK
