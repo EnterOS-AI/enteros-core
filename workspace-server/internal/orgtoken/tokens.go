@@ -72,7 +72,11 @@ type Token struct {
 // records provenance for audit. orgID is the caller's org workspace
 // ID and is used by requireCallerOwnsOrg to enforce org isolation
 // on org-scoped routes (#1200 / F1094).
-func Issue(ctx context.Context, db *sql.DB, name, createdBy, orgID string) (plaintext, id string, err error) {
+//
+// reqCtx carries HTTP-derived metadata for the audit log. Callers
+// without an HTTP request (background jobs, tests) may pass the zero
+// value.
+func Issue(ctx context.Context, db *sql.DB, name, createdBy, orgID string, reqCtx AuditLogRequestContext) (plaintext, id string, err error) {
 	buf := make([]byte, tokenPayloadBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return "", "", fmt.Errorf("orgtoken: generate: %w", err)
@@ -89,6 +93,7 @@ func Issue(ctx context.Context, db *sql.DB, name, createdBy, orgID string) (plai
 	if err != nil {
 		return "", "", fmt.Errorf("orgtoken: persist: %w", err)
 	}
+	LogMint(ctx, db, id, createdBy, orgID, reqCtx, map[string]any{"name": name, "prefix": prefix})
 	return plaintext, id, nil
 }
 
@@ -109,7 +114,20 @@ func Issue(ctx context.Context, db *sql.DB, name, createdBy, orgID string) (plai
 // a second lookup) rather than trusting an empty org_id here — this
 // avoids a breaking change to the Validate interface while still
 // populating the Gin context for callers that don't need it.
-func Validate(ctx context.Context, db *sql.DB, plaintext string) (id, prefix, orgID string, err error) {
+//
+// reqCtx carries HTTP-derived metadata for the audit log. actor is an
+// optional caller provenance label; when empty and the token is
+// invalid, the actor is derived from the presented token prefix so
+// audit queries can still correlate attempts.
+//
+// auditInvalid controls whether a failed validation (sql.ErrNoRows)
+// writes a validate_fail audit row. Callers that use Validate as one
+// probe in a multi-credential fallback chain — WorkspaceAuth,
+// AdminAuth, discovery, A2A proxy — MUST pass false so routine
+// workspace-token/admin-token misses are not logged as org-token
+// lifecycle failures. Callers that genuinely expect an org token and
+// want to audit rejected attempts can pass true.
+func Validate(ctx context.Context, db *sql.DB, plaintext string, reqCtx AuditLogRequestContext, actor string, auditInvalid bool) (id, prefix, orgID string, err error) {
 	if plaintext == "" {
 		return "", "", "", ErrInvalidToken
 	}
@@ -123,6 +141,19 @@ func Validate(ctx context.Context, db *sql.DB, plaintext string) (id, prefix, or
 		// Collapse all failure shapes into ErrInvalidToken so the
 		// caller can't accidentally leak "row exists but revoked" vs
 		// "row never existed" via response shape.
+		if errors.Is(queryErr, sql.ErrNoRows) {
+			if auditInvalid {
+				failActor := actor
+				if failActor == "" {
+					if len(plaintext) >= tokenPrefixLen {
+						failActor = "org-token:" + plaintext[:tokenPrefixLen]
+					} else {
+						failActor = "org-token:<short>"
+					}
+				}
+				LogValidateFail(ctx, db, failActor, "", reqCtx, map[string]any{"prefix": plaintext[:min(len(plaintext), tokenPrefixLen)]})
+			}
+		}
 		return "", "", "", ErrInvalidToken
 	}
 	if orgIDNull.Valid {
@@ -186,7 +217,11 @@ func List(ctx context.Context, db *sql.DB) ([]Token, error) {
 // already revoked or absent. The caller maps (false, nil) to 404 so
 // ops tooling can distinguish "already dealt with" from "silently
 // worked".
-func Revoke(ctx context.Context, db *sql.DB, id string) (bool, error) {
+//
+// reqCtx carries HTTP-derived metadata for the audit log. actor is the
+// caller provenance label (e.g. "admin-token", "session:<hash>",
+// "org-token:<prefix>").
+func Revoke(ctx context.Context, db *sql.DB, id string, reqCtx AuditLogRequestContext, actor string) (bool, error) {
 	res, err := db.ExecContext(ctx, `
 		UPDATE org_api_tokens
 		SET revoked_at = now()
@@ -198,6 +233,9 @@ func Revoke(ctx context.Context, db *sql.DB, id string) (bool, error) {
 	n, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("orgtoken: revoke RowsAffected: %w", err)
+	}
+	if n > 0 {
+		LogRevoke(ctx, db, id, actor, "", reqCtx, nil)
 	}
 	return n > 0, nil
 }

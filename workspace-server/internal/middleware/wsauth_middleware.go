@@ -86,7 +86,7 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 			// power surface as ADMIN_TOKEN but named, revocable, audited.
 			// Check before per-workspace token so an org-key presenter
 			// doesn't hit the narrower ValidateToken failure path.
-			if id, prefix, orgID, err := orgtoken.Validate(ctx, database, tok); err == nil {
+			if id, prefix, orgID, err := orgtoken.Validate(ctx, database, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); err == nil {
 				c.Set("org_token_id", id)
 				c.Set("org_token_prefix", prefix)
 				// org_id may be "" for pre-migration tokens (NULL column).
@@ -223,7 +223,7 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 		// index with revoked_at IS NULL) + an async last_used_at
 		// bump. Cost per request: one SELECT + one UPDATE, both
 		// hitting the same narrow partial index.
-		if id, prefix, orgID, err := orgtoken.Validate(ctx, database, tok); err == nil {
+		if id, prefix, orgID, err := orgtoken.Validate(ctx, database, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); err == nil {
 			c.Set("org_token_id", id)
 			c.Set("org_token_prefix", prefix)
 			// Conditional set — see WorkspaceAuth branch above for rationale.
