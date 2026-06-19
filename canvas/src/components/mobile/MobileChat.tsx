@@ -219,6 +219,9 @@ export function MobileChat({
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  // Preserve composer state so a genuine send error can restore the draft
+  // and attachments instead of silently dropping them (mc#2908 F7).
+  const lastComposerRef = useRef<{ text: string; files: File[] } | null>(null);
 
   const {
     messages,
@@ -253,6 +256,17 @@ export function MobileChat({
       clearError();
     },
   });
+
+  // Restore draft + attachments when a genuine send error surfaces, so the
+  // user can retry without retyping (mc#2908 F7). Clear the snapshot after
+  // restoring to avoid replaying on unrelated error changes.
+  useEffect(() => {
+    if (sendError && lastComposerRef.current) {
+      setDraft(lastComposerRef.current.text);
+      setPendingFiles(lastComposerRef.current.files);
+      lastComposerRef.current = null;
+    }
+  }, [sendError, setDraft, setPendingFiles]);
 
   // The agent is "thinking" when the user's send is in flight OR the workspace
   // reports an in-flight task — either way it's reachable, so clear any stale
@@ -364,6 +378,9 @@ export function MobileChat({
     // shipped this; mobile reused the hook but still blocked here.)
     if ((!text && pendingFiles.length === 0) || !reachable) return;
     clearError();
+    // Snapshot the composer so a subsequent genuine send error can restore
+    // the draft and attachments instead of leaving the input empty (mc#2908 F7).
+    lastComposerRef.current = { text, files: [...pendingFiles] };
     setDraft("");
     const files = pendingFiles;
     setPendingFiles([]);
