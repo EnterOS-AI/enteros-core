@@ -973,7 +973,11 @@ def main(argv: list[str] | None = None) -> int:
 
     token = os.environ.get("GITEA_TOKEN", "")
     if not token and not args.dry_run:
-        print("::error::GITEA_TOKEN env required", file=sys.stderr)
+        print(
+            "::error::GITEA_TOKEN env var required (set via secrets.SOP_CHECKLIST_GATE_TOKEN); "
+            "GITHUB_TOKEN fallback removed because it lacks read:org scope for team-membership checks",
+            file=sys.stderr,
+        )
         return 2
 
     cfg = load_config(args.config)

@@ -47,7 +47,7 @@ jobs:
       - name: Detect force-merge + emit audit event
         env:
           # Same org-level secret the sop-checklist workflow uses.
-          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}

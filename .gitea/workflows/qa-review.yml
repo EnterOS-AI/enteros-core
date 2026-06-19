@@ -143,7 +143,7 @@ jobs:
         # no comment.user.login so the step is a no-op skip there.
         if: github.event_name == 'issue_comment'
         env:
-          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN }}
         run: |
           set -euo pipefail
           login="${{ github.event.comment.user.login }}"
@@ -175,7 +175,7 @@ jobs:
       - name: Evaluate qa-review
         id: eval
         env:
-          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           # PR number lives in different places per event:

@@ -152,9 +152,10 @@ class TestRefireTokenSeparation:
         assert env.get("STATUS_POST_TOKEN") == "${{ secrets.STATUS_POST_TOKEN }}", (
             "qa refire must receive STATUS_POST_TOKEN env var"
         )
-        # Evaluator stays on read token
-        assert "SOP_CHECKLIST_GATE_TOKEN" in env.get("GITEA_TOKEN", "") or "GITHUB_TOKEN" in env.get("GITEA_TOKEN", ""), (
-            "qa refire evaluator must stay on read-scoped token"
+        # Evaluator stays on read token (no GITHUB_TOKEN fallback; it lacks
+        # read:org scope for team-membership checks).
+        assert env.get("GITEA_TOKEN") == "${{ secrets.SOP_CHECKLIST_GATE_TOKEN }}", (
+            "qa refire evaluator must use read-scoped SOP_CHECKLIST_GATE_TOKEN"
         )
 
     def test_security_refire_uses_status_post_token(self):
@@ -163,6 +164,6 @@ class TestRefireTokenSeparation:
         assert env.get("STATUS_POST_TOKEN") == "${{ secrets.STATUS_POST_TOKEN }}", (
             "security refire must receive STATUS_POST_TOKEN env var"
         )
-        assert "SOP_CHECKLIST_GATE_TOKEN" in env.get("GITEA_TOKEN", "") or "GITHUB_TOKEN" in env.get("GITEA_TOKEN", ""), (
-            "security refire evaluator must stay on read-scoped token"
+        assert env.get("GITEA_TOKEN") == "${{ secrets.SOP_CHECKLIST_GATE_TOKEN }}", (
+            "security refire evaluator must use read-scoped SOP_CHECKLIST_GATE_TOKEN"
         )
