@@ -60,10 +60,11 @@ PLUGIN_INSTALL_TIMEOUT_SECS="${E2E_PLUGIN_INSTALL_TIMEOUT_SECS:-600}"
 # A freshly-online tenant's /configs inspection endpoint (execs into the
 # container) can be transiently slow or time out the first read — observed:
 # `curl: (28) ... 0 bytes` on a just-online box → config.yaml read as size 0 →
-# false "stub" failure. The assertions poll within this budget and only FAIL
-# after it expires, so a genuine stub still fails loudly (the gate's real
-# signal) while a transient/early read no longer false-negatives. Required for
-# this gate to be merge-blocking without flaking (mc#2996 Phase 2).
+# false "stub" failure. We now poll the config endpoint DIRECTLY with bounded
+# exponential backoff and STOP re-fetching once we see a real (>1 KiB) file,
+# so a late timeout while we wait for prompts cannot reset the observed size
+# and flake the assertion. We also distinguish "workspace still provisioning"
+# from "genuine missing config" when the settle budget expires (core#3062).
 ASSET_SETTLE_SECS="${E2E_ASSET_SETTLE_SECS:-180}"
 
 # Collision-proof slug (random suffix), same convention as the sibling harness.
@@ -171,27 +172,78 @@ ok "B: model=$MODEL"
 # C. config.yaml delivered + REAL (not the 218 B default stub)
 # D. prompts/ delivered (identity prompt)
 #
-# Both read the tenant's /configs inspection endpoint, which can be transiently
-# slow / time out on a just-online box. Poll within ASSET_SETTLE_SECS so a
-# transient read or a not-yet-settled volume retries; only fail AFTER the budget
-# (a real stub stays a stub). The LAST observed values feed the failure message.
-ASSET_DEADLINE=$(( $(date +%s) + ASSET_SETTLE_SECS )); CFG_SIZE=0; PROMPTS=0
-while true; do
-  CFG_SIZE=$(tenant_call GET "/workspaces/$WID/files" | python3 -c "
+# Deterministic fetch: the /configs inspection endpoint can transiently time out
+# (curl 28) on a just-online box and fall back to a 218 B default stub, giving a
+# false "config not delivered" failure. We poll the config endpoint DIRECTLY
+# with bounded exponential backoff until it returns a real (>1 KiB) config OR
+# the settle budget expires. Once config is confirmed real we STOP re-fetching
+# it, so a late timeout while we wait for prompts cannot reset the observed
+# size to 0 and flake assertion C. We also distinguish a workspace that is still
+# provisioning from a genuine missing-config failure (core#3062).
+ASSET_DEADLINE=$(( $(date +%s) + ASSET_SETTLE_SECS ))
+CFG_SIZE=0; PROMPTS=0; WS_STATUS=""; CFG_ATTEMPTS=0; BACKOFF=2
+
+workspace_status() {
+  tenant_call GET "/workspaces/$WID" 2>/dev/null | python3 -c "
 import json,sys
-for f in json.load(sys.stdin):
-    if f.get('path')=='config.yaml': print(f.get('size',0)); break
-else: print(0)
-" 2>/dev/null || echo 0)
-  PROMPTS=$(tenant_call GET "/workspaces/$WID/files?path=prompts" | python3 -c "
+print(json.load(sys.stdin).get('status',''))
+" 2>/dev/null || echo ""
+}
+
+config_size() {
+  # Direct fetch of /configs/config.yaml. size_download tells us how many bytes
+  # the endpoint actually returned. A curl error (e.g. 28) is reported as -1.
+  local size
+  size=$(tenant_call GET "/workspaces/$WID/files/config.yaml" -o /dev/null -w "%{size_download}" 2>/dev/null) || { echo -1; return; }
+  echo "${size:-0}"
+}
+
+while true; do
+  [ "$(date +%s)" -gt "$ASSET_DEADLINE" ] && break
+
+  WS_STATUS=$(workspace_status)
+
+  # Only keep polling config until we have seen a real file. Freezing the value
+  # prevents a late curl timeout (while prompts are still settling) from wiping
+  # out an earlier successful read and causing a false stub failure.
+  if [ "${CFG_SIZE:-0}" -le 1024 ]; then
+    CFG_ATTEMPTS=$((CFG_ATTEMPTS + 1))
+    CFG_SIZE=$(config_size)
+    if [ "${CFG_SIZE:-0}" -gt 1024 ]; then
+      log "    config.yaml ready after $CFG_ATTEMPTS attempt(s) ($CFG_SIZE B)"
+    elif [ "${CFG_SIZE:-0}" -lt 0 ]; then
+      log "    config fetch transient error (attempt $CFG_ATTEMPTS) — still provisioning?"
+      CFG_SIZE=0
+    fi
+  fi
+
+  if [ "${PROMPTS:-0}" -le 0 ]; then
+    PROMPTS=$(tenant_call GET "/workspaces/$WID/files?path=prompts" | python3 -c "
 import json,sys
 d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 0)
 " 2>/dev/null || echo 0)
+  fi
+
   { [ "${CFG_SIZE:-0}" -gt 1024 ] && [ "${PROMPTS:-0}" -gt 0 ]; } && break
-  [ "$(date +%s)" -gt "$ASSET_DEADLINE" ] && break
-  sleep 10
+
+  # Bounded exponential backoff: 2,4,8,16,30,30,... up to the deadline.
+  [ "$BACKOFF" -lt 30 ] && BACKOFF=$((BACKOFF * 2))
+  [ "$BACKOFF" -gt 30 ] && BACKOFF=30
+  sleep "$BACKOFF"
 done
-[ "${CFG_SIZE:-0}" -gt 1024 ] || fail "C: config.yaml size=$CFG_SIZE B after ${ASSET_SETTLE_SECS}s (≤1KiB ⇒ default stub, template config NOT delivered)"
+
+# Distinguish a genuine missing config from a workspace that was still
+# provisioning when the settle budget expired.
+if [ "${CFG_SIZE:-0}" -le 1024 ]; then
+  case "$WS_STATUS" in
+    online|running)
+      fail "C: config.yaml size=$CFG_SIZE B after ${ASSET_SETTLE_SECS}s and workspace is $WS_STATUS (≤1KiB ⇒ default stub, template config NOT delivered — genuine missing config)"
+      ;;
+    *)
+      fail "C: config.yaml size=$CFG_SIZE B after ${ASSET_SETTLE_SECS}s while workspace status='$WS_STATUS' — workspace still provisioning; config delivery NOT YET VERIFIABLE (not a genuine missing-config failure)"
+      ;;
+  esac
+fi
 ok "C: config.yaml delivered ($CFG_SIZE B)"
 [ "${PROMPTS:-0}" -gt 0 ] || fail "D: prompts/ empty after ${ASSET_SETTLE_SECS}s — identity prompt NOT delivered"
 ok "D: prompts/ delivered ($PROMPTS file(s))"
