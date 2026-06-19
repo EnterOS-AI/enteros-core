@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -186,4 +187,74 @@ func TestMatch_NoRoundtrip(t *testing.T) {
 	_ = m.Description
 	// The two-field shape is part of the public contract; new fields
 	// require deliberation about whether they leak the secret value.
+}
+
+// resetPatternState snapshots the package-level pattern state and returns a
+// cleanup function that restores it. Tests that intentionally corrupt
+// Patterns to exercise compile-failure paths must restore the canonical state
+// so later tests don't see the corrupted slice / stuck compileErr.
+func resetPatternState(t *testing.T) (cleanup func()) {
+	t.Helper()
+	origPatterns := make([]Pattern, len(Patterns))
+	copy(origPatterns, Patterns)
+	origCompiledPatterns := compiledPatterns
+	origCompileErr := compileErr
+	return func() {
+		Patterns = origPatterns
+		compiledPatterns = origCompiledPatterns
+		compileErr = origCompileErr
+		compiledOnce = sync.Once{}
+	}
+}
+
+// TestCompileError exercises the compileAll error path when a pattern regex
+// is invalid. This is intentionally unreachable in production (a build bug),
+// but the error path must be covered.
+func TestCompileError(t *testing.T) {
+	cleanup := resetPatternState(t)
+	defer cleanup()
+
+	Patterns = []Pattern{{
+		Name:        "bad-pattern",
+		Description: "invalid regex for testing",
+		regexSource: `(`, // unbalanced paren
+	}}
+	compiledOnce = sync.Once{}
+	compiledPatterns = nil
+	compileErr = nil
+
+	compileAll()
+	if compileErr == nil {
+		t.Fatal("compileAll expected compile error for invalid regex, got nil")
+	}
+	if !strings.Contains(compileErr.Error(), "bad-pattern") {
+		t.Errorf("compileErr should mention pattern name, got: %v", compileErr)
+	}
+}
+
+// TestScanBytes_CompileErr exercises ScanBytes returning the compile error
+// when Patterns contains an invalid regex.
+func TestScanBytes_CompileErr(t *testing.T) {
+	cleanup := resetPatternState(t)
+	defer cleanup()
+
+	Patterns = []Pattern{{
+		Name:        "another-bad-pattern",
+		Description: "invalid regex for testing",
+		regexSource: `[`, // unclosed character class
+	}}
+	compiledOnce = sync.Once{}
+	compiledPatterns = nil
+	compileErr = nil
+
+	m, err := ScanBytes([]byte("anything"))
+	if err == nil {
+		t.Fatal("ScanBytes expected compile error, got nil")
+	}
+	if m != nil {
+		t.Errorf("ScanBytes should return nil Match on compile error, got %+v", m)
+	}
+	if !strings.Contains(err.Error(), "another-bad-pattern") {
+		t.Errorf("error should mention pattern name, got: %v", err)
+	}
 }
