@@ -659,7 +659,7 @@ func TestIntegration_OrgToken_RevokeStopsValidation(t *testing.T) {
 	}
 
 	// Live token validates and reports its org anchor.
-	gotID, _, gotOrg, err := orgtoken.Validate(ctx, conn, plaintext, orgtoken.AuditLogRequestContext{}, "")
+	gotID, _, gotOrg, err := orgtoken.Validate(ctx, conn, plaintext, orgtoken.AuditLogRequestContext{}, "", false)
 	if err != nil {
 		t.Fatalf("Validate (live): %v", err)
 	}
@@ -680,7 +680,7 @@ func TestIntegration_OrgToken_RevokeStopsValidation(t *testing.T) {
 	}
 
 	// Revoked token MUST NOT validate.
-	if _, _, _, err := orgtoken.Validate(ctx, conn, plaintext, orgtoken.AuditLogRequestContext{}, ""); err != orgtoken.ErrInvalidToken {
+	if _, _, _, err := orgtoken.Validate(ctx, conn, plaintext, orgtoken.AuditLogRequestContext{}, "", false); err != orgtoken.ErrInvalidToken {
 		t.Fatalf("Validate after revoke: want ErrInvalidToken, got %v (revoked_at filter regressed)", err)
 	}
 

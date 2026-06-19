@@ -119,7 +119,15 @@ func Issue(ctx context.Context, db *sql.DB, name, createdBy, orgID string, reqCt
 // optional caller provenance label; when empty and the token is
 // invalid, the actor is derived from the presented token prefix so
 // audit queries can still correlate attempts.
-func Validate(ctx context.Context, db *sql.DB, plaintext string, reqCtx AuditLogRequestContext, actor string) (id, prefix, orgID string, err error) {
+//
+// auditInvalid controls whether a failed validation (sql.ErrNoRows)
+// writes a validate_fail audit row. Callers that use Validate as one
+// probe in a multi-credential fallback chain — WorkspaceAuth,
+// AdminAuth, discovery, A2A proxy — MUST pass false so routine
+// workspace-token/admin-token misses are not logged as org-token
+// lifecycle failures. Callers that genuinely expect an org token and
+// want to audit rejected attempts can pass true.
+func Validate(ctx context.Context, db *sql.DB, plaintext string, reqCtx AuditLogRequestContext, actor string, auditInvalid bool) (id, prefix, orgID string, err error) {
 	if plaintext == "" {
 		return "", "", "", ErrInvalidToken
 	}
@@ -134,15 +142,17 @@ func Validate(ctx context.Context, db *sql.DB, plaintext string, reqCtx AuditLog
 		// caller can't accidentally leak "row exists but revoked" vs
 		// "row never existed" via response shape.
 		if errors.Is(queryErr, sql.ErrNoRows) {
-			failActor := actor
-			if failActor == "" {
-				if len(plaintext) >= tokenPrefixLen {
-					failActor = "org-token:" + plaintext[:tokenPrefixLen]
-				} else {
-					failActor = "org-token:<short>"
+			if auditInvalid {
+				failActor := actor
+				if failActor == "" {
+					if len(plaintext) >= tokenPrefixLen {
+						failActor = "org-token:" + plaintext[:tokenPrefixLen]
+					} else {
+						failActor = "org-token:<short>"
+					}
 				}
+				LogValidateFail(ctx, db, failActor, "", reqCtx, map[string]any{"prefix": plaintext[:min(len(plaintext), tokenPrefixLen)]})
 			}
-			LogValidateFail(ctx, db, failActor, "", reqCtx, map[string]any{"prefix": plaintext[:min(len(plaintext), tokenPrefixLen)]})
 		}
 		return "", "", "", ErrInvalidToken
 	}

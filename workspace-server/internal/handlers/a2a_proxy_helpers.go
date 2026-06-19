@@ -899,7 +899,7 @@ func isGenuineCanvasUser(ctx context.Context, c *gin.Context) bool {
 		if adminSecret != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(adminSecret)) == 1 {
 			return true
 		}
-		if _, _, _, err := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), ""); err == nil {
+		if _, _, _, err := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); err == nil {
 			return true
 		}
 	}
