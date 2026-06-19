@@ -258,3 +258,31 @@ func TestScanBytes_CompileErr(t *testing.T) {
 		t.Errorf("error should mention pattern name, got: %v", err)
 	}
 }
+
+// TestScanString_CompileErr exercises ScanString returning the compile error
+// when Patterns contains an invalid regex. ScanString is the zero-copy wrapper
+// around ScanBytes, so this confirms the error path propagates through it.
+func TestScanString_CompileErr(t *testing.T) {
+	cleanup := resetPatternState(t)
+	defer cleanup()
+
+	Patterns = []Pattern{{
+		Name:        "string-bad-pattern",
+		Description: "invalid regex for testing",
+		regexSource: `(?`, // invalid regex syntax
+	}}
+	compiledOnce = sync.Once{}
+	compiledPatterns = nil
+	compileErr = nil
+
+	m, err := ScanString("anything")
+	if err == nil {
+		t.Fatal("ScanString expected compile error, got nil")
+	}
+	if m != nil {
+		t.Errorf("ScanString should return nil Match on compile error, got %+v", m)
+	}
+	if !strings.Contains(err.Error(), "string-bad-pattern") {
+		t.Errorf("error should mention pattern name, got: %v", err)
+	}
+}
