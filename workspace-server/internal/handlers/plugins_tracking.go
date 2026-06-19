@@ -74,7 +74,7 @@ func recordWorkspacePluginInstall(
 	// plugin files could get the management MCP installed. Refuse the privileged
 	// name here, mirroring the gate in recordDeclaredPlugin. Fail-closed on a kind
 	// read error.
-	if pluginName == conciergePlatformMCPPlugin {
+	if pluginName == conciergePlatformMCPName {
 		var kind string
 		if err := db.DB.QueryRowContext(ctx,
 			`SELECT COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`, workspaceID).Scan(&kind); err != nil {
