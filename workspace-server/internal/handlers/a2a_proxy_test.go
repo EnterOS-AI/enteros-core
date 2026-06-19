@@ -1307,9 +1307,9 @@ func TestValidateCallerToken_CanvasUser_OrgToken(t *testing.T) {
 	// lookup — there is no SELECT COUNT(*) expectation anymore.
 
 	// orgtoken.Validate lookup
-	mock.ExpectQuery(`SELECT id, prefix, org_id FROM org_api_tokens WHERE token_hash = .* AND revoked_at IS NULL`).
+	mock.ExpectQuery(`SELECT id, prefix, org_id, expires_at FROM org_api_tokens WHERE token_hash = .* AND revoked_at IS NULL`).
 		WithArgs(sqlmock.AnyArg()).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id"}).AddRow("orgtok-1", "pref1234", "org-1"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).AddRow("orgtok-1", "pref1234", "org-1", nil))
 	mock.ExpectExec(`UPDATE org_api_tokens SET last_used_at`).
 		WithArgs("orgtok-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))

@@ -25,6 +25,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -43,6 +45,11 @@ const (
 	// no legitimate flow hits it, low enough that a mint-storm can't
 	// force a big allocation on every list render.
 	listMax = 500
+
+	// defaultMintCeiling is the per-org cap on live org API tokens.
+	// Override with ORG_TOKEN_MINT_CEILING env var. A value <= 0
+	// disables the ceiling (legacy / self-hosted behaviour).
+	defaultMintCeiling = 100
 )
 
 // ErrInvalidToken is returned when a presented bearer doesn't match
@@ -50,6 +57,32 @@ const (
 // "bad bytes" from "revoked" — that would be an enumeration signal
 // on which tokens were ever minted.
 var ErrInvalidToken = errors.New("invalid or revoked org api token")
+
+// ErrMintCeilingExceeded is returned when an org already has the
+// configured maximum number of live org API tokens. Callers map to
+// HTTP 429/400.
+var ErrMintCeilingExceeded = errors.New("org api token mint ceiling exceeded")
+
+// ErrPastExpiry is returned when IssueWithExpiry is called with an
+// expiry time that has already passed. Minting an immediately-invalid
+// token is poor UX and almost always a caller bug.
+var ErrPastExpiry = errors.New("expires_at is in the past")
+
+// mintCeiling returns the per-org live-token ceiling from env, or
+// the default. Cached at process start because it is not expected to
+// change without a restart.
+var mintCeiling = func() int {
+	if v := os.Getenv("ORG_TOKEN_MINT_CEILING"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+		log.Printf("orgtoken: ignoring non-numeric ORG_TOKEN_MINT_CEILING=%q", v)
+	}
+	return defaultMintCeiling
+}()
+
+// MintCeiling exposes the effective ceiling for tests.
+func MintCeiling() int { return mintCeiling }
 
 // Token is the admin-UI shape. Plaintext is NEVER part of this —
 // the only place plaintext exists is the return value of Issue.
@@ -61,6 +94,7 @@ type Token struct {
 	CreatedBy  string     `json:"created_by,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 }
 
 // Issue mints a fresh token and persists sha256(plaintext) + prefix.
@@ -77,6 +111,37 @@ type Token struct {
 // without an HTTP request (background jobs, tests) may pass the zero
 // value.
 func Issue(ctx context.Context, db *sql.DB, name, createdBy, orgID string, reqCtx AuditLogRequestContext) (plaintext, id string, err error) {
+	return IssueWithExpiry(ctx, db, name, createdBy, orgID, nil, reqCtx)
+}
+
+// IssueWithExpiry is like Issue but allows setting an optional expiry
+// time. Tokens whose expiry has passed are rejected by Validate.
+// expiresAt may be nil for unbounded tokens (legacy behaviour).
+func IssueWithExpiry(ctx context.Context, db *sql.DB, name, createdBy, orgID string, expiresAt *time.Time, reqCtx AuditLogRequestContext) (plaintext, id string, err error) {
+	// Reject immediately-invalid expiry times at the API boundary.
+	if expiresAt != nil && !expiresAt.IsZero() && time.Now().After(*expiresAt) {
+		return "", "", ErrPastExpiry
+	}
+
+	// Enforce per-org mint ceiling for anchored tokens. Unanchored
+	// tokens (orgID == "") are not org-scoped, so the ceiling does
+	// not apply to them; they remain limited by the global listMax
+	// UI cap. The ceiling counts only currently-valid tokens:
+	// non-revoked AND (no expiry or expiry in the future).
+	if mintCeiling > 0 && orgID != "" {
+		var count int
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM org_api_tokens
+			WHERE org_id = $1 AND revoked_at IS NULL
+			  AND (expires_at IS NULL OR expires_at > now())
+		`, nullIfEmpty(orgID)).Scan(&count); err != nil {
+			return "", "", fmt.Errorf("orgtoken: count live tokens: %w", err)
+		}
+		if count >= mintCeiling {
+			return "", "", ErrMintCeilingExceeded
+		}
+	}
+
 	buf := make([]byte, tokenPayloadBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return "", "", fmt.Errorf("orgtoken: generate: %w", err)
@@ -86,10 +151,10 @@ func Issue(ctx context.Context, db *sql.DB, name, createdBy, orgID string, reqCt
 	prefix := plaintext[:tokenPrefixLen]
 
 	err = db.QueryRowContext(ctx, `
-		INSERT INTO org_api_tokens (token_hash, prefix, name, created_by, org_id)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO org_api_tokens (token_hash, prefix, name, created_by, org_id, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id
-	`, hash[:], prefix, nullIfEmpty(name), nullIfEmpty(createdBy), nullIfEmpty(orgID)).Scan(&id)
+	`, hash[:], prefix, nullIfEmpty(name), nullIfEmpty(createdBy), nullIfEmpty(orgID), nullTimeIfZero(expiresAt)).Scan(&id)
 	if err != nil {
 		return "", "", fmt.Errorf("orgtoken: persist: %w", err)
 	}
@@ -133,10 +198,11 @@ func Validate(ctx context.Context, db *sql.DB, plaintext string, reqCtx AuditLog
 	}
 	hash := sha256.Sum256([]byte(plaintext))
 	var orgIDNull sql.NullString
+	var expiresAt sql.NullTime
 	queryErr := db.QueryRowContext(ctx, `
-		SELECT id, prefix, org_id FROM org_api_tokens
+		SELECT id, prefix, org_id, expires_at FROM org_api_tokens
 		WHERE token_hash = $1 AND revoked_at IS NULL
-	`, hash[:]).Scan(&id, &prefix, &orgIDNull)
+	`, hash[:]).Scan(&id, &prefix, &orgIDNull, &expiresAt)
 	if queryErr != nil {
 		// Collapse all failure shapes into ErrInvalidToken so the
 		// caller can't accidentally leak "row exists but revoked" vs
@@ -154,6 +220,9 @@ func Validate(ctx context.Context, db *sql.DB, plaintext string, reqCtx AuditLog
 				LogValidateFail(ctx, db, failActor, "", reqCtx, map[string]any{"prefix": plaintext[:min(len(plaintext), tokenPrefixLen)]})
 			}
 		}
+		return "", "", "", ErrInvalidToken
+	}
+	if expiresAt.Valid && time.Now().After(expiresAt.Time) {
 		return "", "", "", ErrInvalidToken
 	}
 	if orgIDNull.Valid {
@@ -183,7 +252,7 @@ func List(ctx context.Context, db *sql.DB) ([]Token, error) {
 	// a real Postgres (prod).
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, prefix, COALESCE(name,''), COALESCE(org_id::text,''),
-		       COALESCE(created_by,''), created_at, last_used_at
+		       COALESCE(created_by,''), created_at, last_used_at, expires_at
 		FROM org_api_tokens
 		WHERE revoked_at IS NULL
 		ORDER BY created_at DESC
@@ -198,13 +267,18 @@ func List(ctx context.Context, db *sql.DB) ([]Token, error) {
 	for rows.Next() {
 		var t Token
 		var lastUsed sql.NullTime
+		var expiresAt sql.NullTime
 		if err := rows.Scan(&t.ID, &t.Prefix, &t.Name, &t.OrgID, &t.CreatedBy,
-			&t.CreatedAt, &lastUsed); err != nil {
+			&t.CreatedAt, &lastUsed, &expiresAt); err != nil {
 			return nil, fmt.Errorf("orgtoken: scan: %w", err)
 		}
 		if lastUsed.Valid {
 			v := lastUsed.Time
 			t.LastUsedAt = &v
+		}
+		if expiresAt.Valid {
+			v := expiresAt.Time
+			t.ExpiresAt = &v
 		}
 		out = append(out, t)
 	}
@@ -279,4 +353,11 @@ func nullIfEmpty(s string) interface{} {
 		return nil
 	}
 	return s
+}
+
+func nullTimeIfZero(t *time.Time) interface{} {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return *t
 }

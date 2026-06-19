@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -44,15 +46,17 @@ func (h *OrgTokenHandler) List(c *gin.Context) {
 }
 
 type createOrgTokenRequest struct {
-	Name string `json:"name"`
+	Name      string     `json:"name"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 type createOrgTokenResponse struct {
-	ID      string `json:"id"`
-	Prefix  string `json:"prefix"`
-	Name    string `json:"name,omitempty"`
-	Token   string `json:"auth_token"` // plaintext — shown ONCE
-	Warning string `json:"warning"`    // UX hint: copy now
+	ID        string     `json:"id"`
+	Prefix    string     `json:"prefix"`
+	Name      string     `json:"name,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Token     string     `json:"auth_token"` // plaintext — shown ONCE
+	Warning   string     `json:"warning"`    // UX hint: copy now
 }
 
 // Create mints a new org token. The plaintext is returned exactly
@@ -136,8 +140,12 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 
 	createdBy, orgID := orgTokenActor(c)
 
-	plaintext, id, err := orgtoken.Issue(c.Request.Context(), db.DB, req.Name, createdBy, orgID, orgtoken.AuditLogRequestContextFromGin(c))
+		plaintext, id, err := orgtoken.IssueWithExpiry(c.Request.Context(), db.DB, req.Name, createdBy, orgID, req.ExpiresAt, orgtoken.AuditLogRequestContextFromGin(c))
 	if err != nil {
+		if errors.Is(err, orgtoken.ErrMintCeilingExceeded) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "org api token mint ceiling exceeded"})
+			return
+		}
 		log.Printf("orgtoken issue: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mint token"})
 		return
@@ -145,11 +153,12 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 	log.Printf("orgtoken: minted id=%s by=%s org=%s name=%q", id, createdBy, orgID, req.Name)
 
 	c.JSON(http.StatusOK, createOrgTokenResponse{
-		ID:      id,
-		Prefix:  plaintext[:8],
-		Name:    req.Name,
-		Token:   plaintext,
-		Warning: "copy this token now; it will not be shown again",
+		ID:        id,
+		Prefix:    plaintext[:8],
+		Name:      req.Name,
+		ExpiresAt: req.ExpiresAt,
+		Token:     plaintext,
+		Warning:   "copy this token now; it will not be shown again",
 	})
 }
 

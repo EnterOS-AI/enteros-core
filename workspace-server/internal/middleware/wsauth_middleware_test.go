@@ -621,7 +621,7 @@ func TestAdminAuth_InvalidBearer_Returns401(t *testing.T) {
 // orgTokenValidateQueryV1 is matched for orgtoken.Validate().
 // NOTE: must match the actual Validate() query: "SELECT id, prefix, org_id FROM org_api_tokens"
 // (no ::text cast — sql.NullString handles the NULL scan natively).
-const orgTokenValidateQueryV1 = "SELECT id, prefix, org_id FROM org_api_tokens"
+const orgTokenValidateQueryV1 = "SELECT id, prefix, org_id, expires_at FROM org_api_tokens"
 
 // orgTokenLastUsedQuery is matched for the best-effort last_used_at UPDATE.
 const orgTokenLastUsedQuery = "UPDATE org_api_tokens SET last_used_at"
@@ -670,8 +670,8 @@ func TestAdminAuth_OrgToken_SetsOrgID(t *testing.T) {
 			// (ValidateAnyToken), so ValidateAnyToken is NOT called here.
 			mock.ExpectQuery(orgTokenValidateQueryV1).
 				WithArgs(orgTokenHash[:]).
-				WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id"}).
-					AddRow("tok-org-1", "tok-org-1", tt.orgIDFromDB))
+				WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).
+					AddRow("tok-org-1", "tok-org-1", tt.orgIDFromDB, nil))
 
 			// Best-effort last_used_at UPDATE (after Validate).
 			mock.ExpectExec(orgTokenLastUsedQuery).

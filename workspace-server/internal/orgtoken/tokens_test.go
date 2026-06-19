@@ -21,8 +21,11 @@ func TestIssue_StoresHashNotPlaintext(t *testing.T) {
 	// Can't predict the generated plaintext, but we can verify the
 	// INSERT arguments are a hash (bytea) + short prefix + optional
 	// fields. sqlmock's AnyArg sidesteps the randomness.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM org_api_tokens`).
+		WithArgs("org-1").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "my-ci", "user_01", "org-1").
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "my-ci", "user_01", "org-1", nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-1"))
 	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
 		WithArgs("tok-1", "mint", "user_01", "org-1", nil, nil, sqlmock.AnyArg()).
@@ -53,7 +56,7 @@ func TestIssue_EmptyNameAndCreatedByStoreNull(t *testing.T) {
 	// Empty name + createdBy + orgID → NULL in DB so `WHERE name IS NULL`
 	// works for future queries that want "unnamed" tokens.
 	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), nil, nil, nil).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), nil, nil, nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-min"))
 	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
 		WithArgs("tok-min", "mint", "", nil, nil, nil, sqlmock.AnyArg()).
@@ -78,9 +81,9 @@ func TestValidate_HappyPath(t *testing.T) {
 	plaintext := "known-plaintext-for-test"
 	hash := sha256.Sum256([]byte(plaintext))
 
-	mock.ExpectQuery(`SELECT id, prefix, org_id FROM org_api_tokens`).
+	mock.ExpectQuery(`SELECT id, prefix, org_id, expires_at FROM org_api_tokens`).
 		WithArgs(hash[:]).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id"}).AddRow("tok-live", "abcd1234", nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).AddRow("tok-live", "abcd1234", nil, nil))
 	mock.ExpectExec(`UPDATE org_api_tokens SET last_used_at`).
 		WithArgs("tok-live").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -112,7 +115,7 @@ func TestValidate_UnknownHashErrInvalid(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery(`SELECT id, prefix, org_id FROM org_api_tokens`).
+	mock.ExpectQuery(`SELECT id, prefix, org_id, expires_at FROM org_api_tokens`).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
@@ -132,7 +135,7 @@ func TestValidate_RevokedTokenNotAccepted(t *testing.T) {
 	defer db.Close()
 	// Query has `AND revoked_at IS NULL` — sqlmock will return
 	// ErrNoRows because the revoked row is filtered out.
-	mock.ExpectQuery(`SELECT id, prefix, org_id FROM org_api_tokens`).
+	mock.ExpectQuery(`SELECT id, prefix, org_id, expires_at FROM org_api_tokens`).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
@@ -155,9 +158,9 @@ func TestList_NewestFirst(t *testing.T) {
 	earlier := now.Add(-1 * time.Hour)
 	mock.ExpectQuery(`SELECT id, prefix.*FROM org_api_tokens.*ORDER BY created_at DESC`).
 		WithArgs(listMax).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "name", "org_id", "created_by", "created_at", "last_used_at"}).
-			AddRow("t2", "abcd1234", "zapier", "org-1", "user_01", now, now).
-			AddRow("t1", "efgh5678", "", "", "", earlier, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "name", "org_id", "created_by", "created_at", "last_used_at", "expires_at"}).
+			AddRow("t2", "abcd1234", "zapier", "org-1", "user_01", now, now, nil).
+			AddRow("t1", "efgh5678", "", "", "", earlier, nil, nil))
 
 	tokens, err := List(context.Background(), db)
 	if err != nil {
@@ -285,5 +288,177 @@ func TestOrgIDByTokenID_DBError(t *testing.T) {
 	_, err = OrgIDByTokenID(context.Background(), db, "tok-bad")
 	if err == nil {
 		t.Error("expected error on DB failure, got nil")
+	}
+}
+
+func TestIssue_MintCeilingExceeded(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Temporarily lower the ceiling to 2 for this test.
+	old := mintCeiling
+	mintCeiling = 2
+	defer func() { mintCeiling = old }()
+
+	// The ceiling counts only currently-valid tokens.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM org_api_tokens`).
+		WithArgs("org-capped").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
+
+	_, _, err = Issue(context.Background(), db, "new-token", "user_01", "org-capped", AuditLogRequestContext{})
+	if !errors.Is(err, ErrMintCeilingExceeded) {
+		t.Fatalf("expected ErrMintCeilingExceeded, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestIssue_MintCeilingIgnoresExpiredTokens(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Ceiling of 1, but the one existing row is expired and unrevoked.
+	old := mintCeiling
+	mintCeiling = 1
+	defer func() { mintCeiling = old }()
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM org_api_tokens`).
+		WithArgs("org-with-expired").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "replacement", "user_01", "org-with-expired", nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-replacement"))
+	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
+		WithArgs("tok-replacement", "mint", "user_01", "org-with-expired", nil, nil, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	_, id, err := Issue(context.Background(), db, "replacement", "user_01", "org-with-expired", AuditLogRequestContext{})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if id != "tok-replacement" {
+		t.Errorf("id = %q, want tok-replacement", id)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestIssueWithExpiry_PastExpiryRejected(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	past := time.Now().Add(-1 * time.Hour)
+	_, _, err = IssueWithExpiry(context.Background(), db, "x", "user_01", "org-1", &past, AuditLogRequestContext{})
+	if !errors.Is(err, ErrPastExpiry) {
+		t.Fatalf("expected ErrPastExpiry, got %v", err)
+	}
+}
+
+func TestIssue_MintCeilingDisabled(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Disable ceiling.
+	old := mintCeiling
+	mintCeiling = 0
+	defer func() { mintCeiling = old }()
+
+	// No count query expected; INSERT proceeds.
+	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "x", "user_01", "org-any", nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-ok"))
+	mock.ExpectExec(`INSERT INTO org_token_audit_logs`).
+		WithArgs("tok-ok", "mint", "user_01", "org-any", nil, nil, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	_, _, err = Issue(context.Background(), db, "x", "user_01", "org-any", AuditLogRequestContext{})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestIssueWithExpiry_StoresExpiry(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	exp := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "ci", "user_01", nil, exp).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-exp"))
+
+	_, id, err := IssueWithExpiry(context.Background(), db, "ci", "user_01", "", &exp, AuditLogRequestContext{})
+	if err != nil {
+		t.Fatalf("IssueWithExpiry: %v", err)
+	}
+	if id != "tok-exp" {
+		t.Errorf("id = %q, want tok-exp", id)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestValidate_ExpiredTokenRejected(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	plaintext := "known-plaintext-for-test"
+	hash := sha256.Sum256([]byte(plaintext))
+	expired := time.Now().Add(-1 * time.Hour)
+
+	mock.ExpectQuery(`SELECT id, prefix, org_id, expires_at FROM org_api_tokens`).
+		WithArgs(hash[:]).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).
+			AddRow("tok-expired", "abcd1234", nil, expired))
+
+	if _, _, _, err := Validate(context.Background(), db, plaintext, AuditLogRequestContext{}, "", false); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("expired token should be ErrInvalidToken, got %v", err)
+	}
+}
+
+func TestValidate_NonExpiredTokenWithExpiryOK(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	plaintext := "known-plaintext-for-test"
+	hash := sha256.Sum256([]byte(plaintext))
+	future := time.Now().Add(1 * time.Hour)
+
+	mock.ExpectQuery(`SELECT id, prefix, org_id, expires_at FROM org_api_tokens`).
+		WithArgs(hash[:]).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).
+			AddRow("tok-live", "abcd1234", nil, future))
+	mock.ExpectExec(`UPDATE org_api_tokens SET last_used_at`).
+		WithArgs("tok-live").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if _, _, _, err := Validate(context.Background(), db, plaintext, AuditLogRequestContext{}, "", false); err != nil {
+		t.Fatalf("non-expired token should validate, got %v", err)
 	}
 }

@@ -68,8 +68,8 @@ func TestOrgTokenHandler_List_HappyPath(t *testing.T) {
 
 	now := time.Now().UTC()
 	mock.ExpectQuery(`SELECT id, prefix.*FROM org_api_tokens`).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "name", "org_id", "created_by", "created_at", "last_used_at"}).
-			AddRow("tok-1", "abcd1234", "zapier", "", "session", now, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "name", "org_id", "created_by", "created_at", "last_used_at", "expires_at"}).
+			AddRow("tok-1", "abcd1234", "zapier", "", "session", now, nil, nil))
 
 	c, w := buildCtx("GET", "/org/tokens", "")
 	h.List(c)
@@ -391,7 +391,7 @@ func TestOrgTokenHandler_Create_VerifiedSession_SkipsGate(t *testing.T) {
 	const actor = "session"
 	const userID = "u_dashboard_user_42"
 	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "from-dashboard", actor+":"+userID, nil).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), "from-dashboard", actor+":"+userID, nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-human"))
 
 	c, w := buildCtx("POST", "/org/tokens", `{"name":"from-dashboard"}`)
@@ -459,7 +459,7 @@ func TestOrgTokenHandler_Create_EmptyBodyOK(t *testing.T) {
 		WithArgs(platformOrgWS).
 		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
 	mock.ExpectQuery(`INSERT INTO org_api_tokens`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), nil, actorAdminToken, nil).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), nil, actorAdminToken, nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("tok-min"))
 
 	c, w := buildCtx("POST", "/org/tokens", "")
