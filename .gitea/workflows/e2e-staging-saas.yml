@@ -700,10 +700,19 @@ jobs:
   # platform server, so the LLM could not call the tool. Probing the overlay
   # directly is the only way to fail fast before burning LLM budget on a
   # 7-minute cold-concierge tool call that will never succeed.)
+  #
+  # core#3081 / CR2 #12653: NO `if:` guard on this job. The job IS the
+  # required status context (see .gitea/required-contexts.txt) — a required
+  # context that never fires on pull_request degrades the merge gate to a
+  # silent indefinite pending (the exact failure mode lint-required-no-paths
+  # exists to prevent; see feedback_path_filtered_workflow_cant_be_required).
+  # The job runs on every PR; E2E_REQUIRE_LIVE is 0 on PR (the script
+  # detects the missing-creds case and exit 0s with a self-check), 1 on
+  # push-to-main / dispatch / cron (the real staging test runs and HARD
+  # FAILs on missing infra).
   e2e-staging-concierge-creates-workspace:
     name: E2E Staging Concierge Creates Workspace
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     timeout-minutes: 45
     permissions:
       contents: read
@@ -721,9 +730,14 @@ jobs:
       # BYOK-MiniMax (parallel-agent image work) still has a model; harmless when
       # the concierge is platform-managed.
       E2E_MINIMAX_API_KEY: ${{ secrets.MOLECULE_STAGING_MINIMAX_API_KEY }}
-      # False-green guard: a concierge that is absent / not on the platform-agent
-      # image / never online must FAIL this gate (exit 5), not silently skip.
-      E2E_REQUIRE_LIVE: '1'
+      # False-green guard, gated by event:
+      #   pull_request: 0 → PR has no staging creds, the script's PR-mode
+      #                  self-check (bash -n) is the gate; a no-creds real
+      #                  test would just exit 2 at the ADMIN_TOKEN check.
+      #   push / dispatch / schedule: 1 → the real staging test runs and
+      #                  HARD FAILs (exit 5) on a missing platform-agent
+      #                  image / never-online concierge / no creds.
+      E2E_REQUIRE_LIVE: ${{ github.event_name == 'pull_request' && '0' || '1' }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
     steps:

@@ -74,11 +74,42 @@ source "$(dirname "$0")/lib/aws_leak_check.sh"
 source "$(dirname "$0")/lib/completion_assert.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 CONCIERGE_ONLINE_SECS="${E2E_CONCIERGE_ONLINE_SECS:-900}"
 AGENT_ACT_SECS="${E2E_AGENT_ACT_SECS:-420}"
 REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
+
+# ─── PR-mode early-exit (core#3081 / CR2 #12653) ──────────────────────────────
+# A required status context that never fires on pull_request degrades the
+# merge gate to a silent indefinite pending (the failure mode
+# lint-required-no-paths exists to prevent). The workflow sets
+# E2E_REQUIRE_LIVE=0 on pull_request runs because PRs do not have staging
+# creds wired; the real staging test would just exit 2 at the ADMIN_TOKEN
+# check below. The PR-mode gate is a self-check:
+#   - bash -n on the script's own syntax (catches PR-merge regressions
+#     that break the script BEFORE it runs).
+# On push / dispatch / cron, E2E_REQUIRE_LIVE=1, the real staging test
+# runs against live staging, and skip_loud on missing infra exits 5
+# (HARD FAIL — the false-green guard).
+if [ "${REQUIRE_LIVE}" = "0" ] && [ -z "${ADMIN_TOKEN}" ]; then
+  log "PR-mode: E2E_REQUIRE_LIVE=0 and no MOLECULE_ADMIN_TOKEN — skipping live staging test."
+  log "(the real staging test runs on push-to-main / dispatch / cron with E2E_REQUIRE_LIVE=1)"
+  # Self-check: bash -n on the script's own syntax. The script IS the
+  # gate on push; on PR, the gate is 'script exists and is bash-clean'.
+  if ! bash -n "$0"; then
+    fail "PR-mode self-check FAILED: bash -n on $0 returned non-zero — script has a syntax error"
+  fi
+  ok "PR-mode self-check PASSED: $(basename "$0") is bash-clean (real staging test runs on push-to-main with E2E_REQUIRE_LIVE=1)"
+  exit 0
+fi
+# Beyond here, we are running for real: REQUIRE_LIVE=1 OR ADMIN_TOKEN
+# is set. If ADMIN_TOKEN is set but REQUIRE_LIVE=0, that's an operator-
+# dispatched local run (the original PR test path) — keep the original
+# strict check below.
+if [ -z "${ADMIN_TOKEN}" ]; then
+  fail "MOLECULE_ADMIN_TOKEN required (Railway staging CP_ADMIN_API_TOKEN) — E2E_REQUIRE_LIVE=1 needs staging creds"
+fi
 # Collision-proof slug (core#2782). The prior `head -c 32` truncation
 # dropped the run_attempt suffix and let two parallel/retry runs
 # collide (POST /cp/admin/orgs 409). The helper appends a random
