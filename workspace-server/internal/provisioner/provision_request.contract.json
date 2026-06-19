@@ -10,11 +10,14 @@
     "SaaS via that channel) -- see memory project_saas_restart_re_stub_config / RFC #2843.",
     "",
     "TWO GUARDS keep the channels honest:",
-    "  1. PRODUCER PIN (this repo, provision_request_contract_test.go): cpProvisionRequest's JSON tags MUST",
-    "     equal `fields` keys exactly. Adding/removing a wire field forces a deliberate, reviewed edit here.",
-    "  2. CONSUMER COMPLETENESS (molecule-controlplane companion test): wsProvisionRequest MUST have a json",
-    "     tag for every field marked cp_consumes:true. A field with cp_consumes:false is a DEAD wire field",
-    "     (sent but ignored) -- it must carry a `note` justifying why, so dead channels are explicit, not silent."
+    "  1. PRODUCER PIN (molecule-core provisioner/provision_request_contract_test.go): cpProvisionRequest's",
+    "     JSON tags MUST equal `fields` keys exactly. Adding/removing a wire field forces a deliberate edit.",
+    "  2. CONSUMER COMPLETENESS (molecule-controlplane handlers/provision_request_contract_test.go):",
+    "     wsProvisionRequest MUST have a json tag for every field marked cp_consumes:true. A field with",
+    "     cp_consumes:false is a DEAD wire field (sent but ignored) -- it must carry a `note` justifying why,",
+    "     so dead channels are explicit, not silent.",
+    "",
+    "  This file is the SSOT; the copy in the other repo MUST stay byte-identical (a CI diff-check is a follow-up)."
   ],
   "endpoint": "POST /cp/workspaces/provision",
   "fields": {
