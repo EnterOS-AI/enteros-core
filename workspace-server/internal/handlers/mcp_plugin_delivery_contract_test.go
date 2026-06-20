@@ -131,8 +131,19 @@ asyncio.run(main())
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		// CR2 #12653 fix: this test is the real-producer gate for the
+		// MCP-plugin delivery contract. The previous behavior of
+		// `t.Skipf` when runtimePath was empty turned the green Platform
+		// (Go) job into a false-green whenever the runtime wasn't
+		// checked out (HTTP 401 on the old `pip install ... || true` step).
+		// The skip counted as a pass, so the test was not actually
+		// exercising the real MCPServerAdaptor. A skip here is a
+		// production-blocking false-green; the test must FAIL so the
+		// missing runtime is visible in the gate.
 		if runtimePath == "" {
-			t.Skipf("molecule-ai-workspace-runtime not available (%v); skipping real-producer test", err)
+			t.Fatalf("CR2 #12653: molecule-ai-workspace-runtime source not found — this test must exercise the REAL MCPServerAdaptor. "+
+				"Set MOLECULE_WORKSPACE_RUNTIME=/path/to/molecule-ai-workspace-runtime or check out the runtime as a sibling of the repo root. "+
+				"Underlying python error (if any): %v", err)
 		}
 		t.Fatalf("run MCPServerAdaptor: %v\nstderr: %s", err, stderr.String())
 	}

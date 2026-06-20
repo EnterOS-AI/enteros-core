@@ -165,10 +165,33 @@ jobs:
           # go-arch-lint "without types"). Fleet sweep after the cp ci.yml find.
           cache: false
       - if: ${{ needs.changes.outputs.platform == 'true' }}
-        name: Install workspace-runtime wheel for contract tests
+        # CR2 #12653 fix: the previous step tried to `pip install` the runtime
+        # wheel and used `|| true` to swallow install failures. With
+        # AUTO_SYNC_TOKEN lacking the package-install scope (HTTP 401),
+        # the install silently failed; the contract test then SKIPPED with
+        # "runtime not available" — a false-green because the green
+        # Platform (Go) job was NOT exercising the real MCPServerAdaptor.
+        #
+        # The contract test imports the runtime from its SOURCE TREE
+        # (PYTHONPATH=<runtime>/) and `mergeMCPPluginSettings` needs the
+        # settings-fragment.json layout, so a pip-installed wheel in
+        # site-packages is the wrong artifact. The correct fix is to
+        # check out the runtime source into a sibling of workspace-server
+        # so the test's sibling-detection (../../molecule-ai-workspace-
+        # runtime) finds it, and export MOLECULE_WORKSPACE_RUNTIME so the
+        # env-var path also resolves. NO `|| true` — if the checkout
+        # fails the gate goes red, which is the correct signal.
+        name: Checkout molecule-ai-workspace-runtime source for contract tests
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: molecule-ai/molecule-ai-workspace-runtime
+          path: molecule-ai-workspace-runtime
+          token: ${{ secrets.AUTO_SYNC_TOKEN }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: Export MOLECULE_WORKSPACE_RUNTIME for contract tests
         working-directory: .
         run: |
-          pip install --index-url "https://agent-dev-a:${{ secrets.AUTO_SYNC_TOKEN }}@git.moleculesai.app/api/packages/molecule-ai/pypi/simple/" molecule-ai-workspace-runtime || true
+          echo "MOLECULE_WORKSPACE_RUNTIME=$GITHUB_WORKSPACE/molecule-ai-workspace-runtime" >> "$GITHUB_ENV"
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         run: go mod download
       - if: ${{ needs.changes.outputs.platform == 'true' }}
