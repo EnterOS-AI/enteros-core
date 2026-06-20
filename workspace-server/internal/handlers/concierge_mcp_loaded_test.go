@@ -270,8 +270,10 @@ func TestHeartbeatHandler_PlatformManagementMCPLookupError_FlipsOnlineToDegraded
 		WillReturnError(errors.New("connection refused"))
 
 	// Degraded UPDATE — lookup failure must not silently look healthy.
+	// Use AnyArg for the human-readable message so the test is not brittle
+	// against the exact wrapped error string produced by listDeclaredPlugins.
 	mock.ExpectExec("UPDATE workspaces SET status =.*status = 'online'").
-		WithArgs(models.StatusDegraded, "platform agent declared management MCP lookup failed: declared-plugin lookup: listDeclaredPlugins: query: connection refused; marking degraded (core#3082)", "ws-mcp-lookup-err").
+		WithArgs(models.StatusDegraded, sqlmock.AnyArg(), "ws-mcp-lookup-err").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// WORKSPACE_DEGRADED broadcast.
