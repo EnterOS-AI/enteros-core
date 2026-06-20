@@ -518,6 +518,9 @@ function MyChatPanel({ workspaceId, data }: Props) {
   };
 
   const isOnline = data.status === "online" || data.status === "degraded";
+  // Transient startup states. These are NOT errors — render a friendly
+  // centered loader in the chat body and suppress the red error banner.
+  const provisioning = data.status === "provisioning" || data.status === "starting";
 
   return (
     <div
@@ -600,7 +603,17 @@ function MyChatPanel({ workspaceId, data }: Props) {
             </button>
           </div>
         )}
-        {!history.loading && history.loadError === null && history.messages.length === 0 && (
+        {!history.loading && history.loadError === null && history.messages.length === 0 && provisioning && (
+          <div className="flex h-full min-h-[12rem] flex-col items-center justify-center gap-3 text-ink-mid">
+            <div className="flex gap-1.5" aria-hidden="true">
+              <span className="w-2 h-2 rounded-full bg-accent/70 motion-safe:animate-bounce" style={{ animationDelay: "0ms" }} />
+              <span className="w-2 h-2 rounded-full bg-accent/70 motion-safe:animate-bounce" style={{ animationDelay: "150ms" }} />
+              <span className="w-2 h-2 rounded-full bg-accent/70 motion-safe:animate-bounce" style={{ animationDelay: "300ms" }} />
+            </div>
+            <p className="text-xs" role="status">Starting up your agent…</p>
+          </div>
+        )}
+        {!history.loading && history.loadError === null && history.messages.length === 0 && !provisioning && (
           <div className="text-xs text-ink-mid text-center py-8">
             No messages yet. Send a message to start chatting with this agent.
           </div>
@@ -813,7 +826,10 @@ function MyChatPanel({ workspaceId, data }: Props) {
         // set) would otherwise show "unreachable" beside the live "●●● Ns"
         // timer. Gating render on !thinking is the durable fix (mirrors
         // MobileChat); a still-unresolved error resurfaces once the turn ends.
-        message={thinking ? null : displayError}
+        // While the agent is provisioning/starting (a normal transient
+        // state, not a failure) we show the centered loader in the body
+        // instead — don't surface the red error banner + Restart for it.
+        message={thinking || provisioning ? null : displayError}
         isOnline={isOnline}
         onRestart={() => setConfirmRestart(true)}
       />
