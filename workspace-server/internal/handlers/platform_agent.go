@@ -456,6 +456,28 @@ const conciergePlatformMCPSource = "gitea://molecule-ai/molecule-ai-plugin-molec
 // derivation, not the human label "molecule-platform-mcp".
 const conciergePlatformMCPName = "molecule-ai-plugin-molecule-platform-mcp"
 
+// conciergePlatformMCPCreateWorkspaceTool is the literal MCP tool identifier
+// the platform concierge must surface for the post-online fail-loud gate
+// (core#3082) to consider the management MCP actually loaded. The Claude
+// Code dispatcher formats every MCP tool as `mcp__<server>__<tool>`; the
+// platform MCP server's install name derives to "molecule-platform" via
+// PluginNameFromSource(conciergePlatformMCPSource), so the create_workspace
+// tool's namespaced identifier is `mcp__molecule-platform__create_workspace`.
+// This is the SAME literal the staging concierge E2E (tests/e2e/test_staging_
+// concierge_creates_workspace_e2e.sh:4.5/6) probes for; pinning it as a
+// constant keeps the runtime gate and the E2E in lock-step so a drift in
+// one breaks both with the same signal.
+//
+// Why we don't match the server/plugin NAME here: the heartbeat's
+// loaded_mcp_tools list carries TOOL identifiers (mcp__<server>__<tool>),
+// not plugin names. The previous check (loadedSet[conciergePlatformMCPName])
+// was a no-op false-green — it matched the plugin NAME against a list of
+// TOOL strings, which would always be empty for the management MCP (the
+// plugin is named "molecule-ai-plugin-molecule-platform-mcp" while its
+// tools are namespaced "mcp__molecule-platform__*"). The literal-tool
+// match below is the actual contract the runtime must satisfy.
+const conciergePlatformMCPCreateWorkspaceTool = "mcp__molecule-platform__create_workspace"
+
 // ensureConciergeProvider pins the concierge's LLM provider to `platform` (core
 // companion to ensureConciergeModel). It guarantees the env-level provider pin
 // that the runtime needs, independent of the template config.yaml (which is NOT
