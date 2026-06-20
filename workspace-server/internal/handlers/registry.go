@@ -413,6 +413,53 @@ func (h *RegistryHandler) platformAgentMCPServerPresent(present *bool) bool {
 	return present == nil || *present
 }
 
+// platformAgentManagementMCPLoaded reports whether the concierge's declared
+// management MCP is actually loaded into the LLM's runtime tool list. It
+// returns true (caller marks degraded) only when:
+//   - the workspace has the management plugin declared in
+//     workspace_declared_plugins (the install NAME conciergePlatformMCPName),
+//     AND
+//   - the reported loaded tool list does NOT contain the literal required
+//     tool identifier (conciergePlatformMCPCreateWorkspaceTool).
+//
+// Why this checks the TOOL identifier and not the plugin name: the heartbeat's
+// loaded_mcp_tools carries namespaced tool ids (`mcp__<server>__<tool>`), not
+// plugin names. The management MCP's server is "molecule-platform" (the
+// PluginNameFromSource derivation), so its create_workspace tool is
+// "mcp__molecule-platform__create_workspace" — a different value from the
+// plugin name "molecule-ai-plugin-molecule-platform-mcp". Comparing the
+// plugin NAME against TOOL ids was a no-op false-green (CR2 #12653).
+//
+// If the management plugin is not declared (non-platform workspace, or a
+// platform concierge before plugin reconciliation), it returns false (NOT
+// missing) so we don't false-alarm on workspaces that legitimately don't
+// declare it. Errors are returned to the caller and MUST be treated as
+// fail-loud/degraded — a failed lookup must not silently look healthy.
+func (h *RegistryHandler) platformAgentManagementMCPLoaded(ctx context.Context, workspaceID string, loaded []string) (bool, error) {
+	declared, err := listDeclaredPlugins(ctx, workspaceID)
+	if err != nil {
+		return false, fmt.Errorf("declared-plugin lookup: %w", err)
+	}
+
+	hasDeclaredManagement := false
+	for _, d := range declared {
+		if d.PluginName == conciergePlatformMCPName {
+			hasDeclaredManagement = true
+			break
+		}
+	}
+	if !hasDeclaredManagement {
+		return false, nil
+	}
+
+	for _, t := range loaded {
+		if t == conciergePlatformMCPCreateWorkspaceTool {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // markWorkspaceFailed updates a workspace row to status='failed' and broadcasts
 // WORKSPACE_PROVISION_FAILED. It is a RegistryHandler-local fallback for the
 // fail-closed platform-agent identity gate; the WorkspaceHandler's
@@ -1276,6 +1323,67 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
 			h.markWorkspaceFailed(ctx, payload.WorkspaceID, msg, reason)
 			return
+		}
+
+		// core#3082: post-online fail-loud for a missing declared management MCP.
+		//
+		// Triggered when the runtime AFFIRMATIVELY reports mcp_server_present=true
+		// (the #147 contract). For pre-#147 runtimes where the field is nil,
+		// platformAgentMCPServerPresent above already returned true under
+		// backward-compat — we DO NOT run the #3082 check in that case so
+		// legacy runtimes don't flip to degraded before the runtime-side
+		// loaded_mcp_tools producer lands.
+		//
+		// Once triggered, the gate has two fail-loud paths:
+		//   - loaded_mcp_tools present but missing the required tool
+		//     (mcp__molecule-platform__create_workspace) → degraded.
+		//   - loaded_mcp_tools ABSENT (runtime says server is up but won't
+		//     report the tools list) → degraded. This is the fail-loud
+		//     behavior CR2+Researcher asked for: silent-skip when the runtime
+		//     doesn't speak the new contract is exactly the false-green
+		//     #3082 exists to catch. Runtime needs a loaded_mcp_tools
+		//     producer (tracked separately — see PR #3101 PM flag).
+		if payload.MCPServerPresent != nil && *payload.MCPServerPresent {
+			loaded := payload.LoadedMCPTools
+			var (
+				managementMissing bool
+				mErr              error
+				absentToolsList   bool
+			)
+			if loaded == nil {
+				// Runtime speaks #147 (server_present=true) but omits the new
+				// loaded_mcp_tools producer → we cannot verify the specific
+				// required tool is loaded. Fail-loud.
+				managementMissing = true
+				absentToolsList = true
+			} else {
+				managementMissing, mErr = h.platformAgentManagementMCPLoaded(ctx, payload.WorkspaceID, loaded)
+			}
+			if mErr != nil {
+				msg := fmt.Sprintf("platform agent declared management MCP lookup failed: %v; marking degraded (core#3082)", mErr)
+				log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
+					log.Printf("Heartbeat: failed to mark %s degraded (management MCP lookup error): %v", payload.WorkspaceID, err)
+				}
+				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+					"management_mcp_lookup_failed": true,
+					"sample_error":                 msg,
+				})
+			} else if managementMissing {
+				msg := "platform agent management MCP declared but not loaded; marking degraded (core#3082)"
+				if absentToolsList {
+					msg = "platform agent runtime did not report loaded_mcp_tools on a mcp_server_present=true heartbeat; cannot verify create_workspace tool is loaded — marking degraded (core#3082)"
+				}
+				log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
+					log.Printf("Heartbeat: failed to mark %s degraded (management MCP missing): %v", payload.WorkspaceID, err)
+				}
+				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+					"management_mcp_missing": true,
+					"loaded_mcp_tools_absent": absentToolsList,
+					"sample_error":           msg,
+				})
+			}
 		}
 	}
 

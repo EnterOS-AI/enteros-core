@@ -158,6 +158,23 @@ type HeartbeatPayload struct {
 	// so the fail-closed platform-agent gate can block recovery paths that
 	// would otherwise resurrect an mcp-less concierge (RCA #2970).
 	MCPServerPresent *bool `json:"mcp_server_present,omitempty"`
+
+	// LoadedMCPTools is the list of namespaced MCP tool identifiers the
+	// runtime reports as actually loaded for this workspace. For platform
+	// concierges, core cross-checks this against the declared management
+	// MCP so a missing plugin is surfaced as degraded instead of silent
+	// (core#3082, CR2 #12653 fix). Each entry is a Claude Code dispatcher
+	// id of the form `mcp__<server>__<tool>`; the platform MCP's required
+	// tool is `mcp__molecule-platform__create_workspace` (see
+	// conciergePlatformMCPCreateWorkspaceTool).
+	//
+	// On a heartbeat where mcp_server_present=true and LoadedMCPTools is
+	// nil/omitted, the #3082 gate fails loud (degraded) — the runtime
+	// spoke the #147 contract but omitted the new loaded_mcp_tools
+	// producer, so we cannot verify the specific required tool is loaded.
+	// Runtime needs a loaded_mcp_tools producer to make the deployed path
+	// healthy (tracked separately — see PR #3101 PM flag).
+	LoadedMCPTools []string `json:"loaded_mcp_tools,omitempty"`
 }
 
 // RuntimeMetadata is the adapter-declared capability + override block
