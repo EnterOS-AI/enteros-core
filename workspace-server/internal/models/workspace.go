@@ -158,6 +158,13 @@ type HeartbeatPayload struct {
 	// so the fail-closed platform-agent gate can block recovery paths that
 	// would otherwise resurrect an mcp-less concierge (RCA #2970).
 	MCPServerPresent *bool `json:"mcp_server_present,omitempty"`
+
+	// LoadedMCPTools is the list of MCP tool names the runtime reports as
+	// actually loaded for this workspace. For platform concierges, core
+	// cross-checks this against the declared management MCP so a missing
+	// plugin is surfaced as degraded instead of silent (core#3082).
+	// nil/omitted means the runtime does not yet speak this contract.
+	LoadedMCPTools []string `json:"loaded_mcp_tools,omitempty"`
 }
 
 // RuntimeMetadata is the adapter-declared capability + override block

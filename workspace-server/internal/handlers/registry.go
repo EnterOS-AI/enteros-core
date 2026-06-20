@@ -413,6 +413,40 @@ func (h *RegistryHandler) platformAgentMCPServerPresent(present *bool) bool {
 	return present == nil || *present
 }
 
+// platformAgentManagementMCPLoaded reports whether the concierge's declared
+// management MCP (workspace_declared_plugins) is present in the runtime's
+// reported loaded_mcp_tools list. It returns true only when:
+//   - the workspace has the management plugin declared, AND
+//   - the reported loaded tool list does not contain the declared plugin name.
+//
+// If the management plugin is not declared (e.g. a non-platform workspace or a
+// platform concierge before plugin reconciliation), it returns false. Errors
+// are returned to the caller for logging; a failed lookup must not silently
+// look healthy.
+func (h *RegistryHandler) platformAgentManagementMCPLoaded(ctx context.Context, workspaceID string, loaded []string) (bool, error) {
+	declared, err := listDeclaredPlugins(ctx, workspaceID)
+	if err != nil {
+		return false, fmt.Errorf("listDeclaredPlugins: %w", err)
+	}
+
+	hasDeclaredManagement := false
+	for _, d := range declared {
+		if d.PluginName == conciergePlatformMCPName {
+			hasDeclaredManagement = true
+			break
+		}
+	}
+	if !hasDeclaredManagement {
+		return false, nil
+	}
+
+	loadedSet := make(map[string]bool, len(loaded))
+	for _, t := range loaded {
+		loadedSet[t] = true
+	}
+	return !loadedSet[conciergePlatformMCPName], nil
+}
+
 // markWorkspaceFailed updates a workspace row to status='failed' and broadcasts
 // WORKSPACE_PROVISION_FAILED. It is a RegistryHandler-local fallback for the
 // fail-closed platform-agent identity gate; the WorkspaceHandler's
@@ -1276,6 +1310,28 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
 			h.markWorkspaceFailed(ctx, payload.WorkspaceID, msg, reason)
 			return
+		}
+
+		// core#3082: post-online fail-loud for a missing declared management MCP.
+		// If the runtime reports loaded_mcp_tools, compare it against the
+		// concierge's declared management plugin. A declared-but-not-loaded
+		// management MCP marks the workspace degraded and alerts instead of
+		// serving silently.
+		if payload.LoadedMCPTools != nil {
+			managementMissing, mErr := h.platformAgentManagementMCPLoaded(ctx, payload.WorkspaceID, payload.LoadedMCPTools)
+			if mErr != nil {
+				log.Printf("Heartbeat: management MCP load check failed for %s: %v", payload.WorkspaceID, mErr)
+			} else if managementMissing {
+				msg := "platform agent management MCP declared but not loaded; marking degraded (core#3082)"
+				log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
+					log.Printf("Heartbeat: failed to mark %s degraded (management MCP missing): %v", payload.WorkspaceID, err)
+				}
+				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+					"management_mcp_missing": true,
+					"sample_error":           msg,
+				})
+			}
 		}
 	}
 
