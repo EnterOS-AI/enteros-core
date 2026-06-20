@@ -433,8 +433,8 @@ func (h *RegistryHandler) platformAgentMCPServerPresent(present *bool) bool {
 // If the management plugin is not declared (non-platform workspace, or a
 // platform concierge before plugin reconciliation), it returns false (NOT
 // missing) so we don't false-alarm on workspaces that legitimately don't
-// declare it. Errors are returned to the caller for logging; a failed
-// lookup must not silently look healthy.
+// declare it. Errors are returned to the caller and MUST be treated as
+// fail-loud/degraded — a failed lookup must not silently look healthy.
 func (h *RegistryHandler) platformAgentManagementMCPLoaded(ctx context.Context, workspaceID string, loaded []string) (bool, error) {
 	declared, err := listDeclaredPlugins(ctx, workspaceID)
 	if err != nil {
@@ -1360,7 +1360,15 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				managementMissing, mErr = h.platformAgentManagementMCPLoaded(ctx, payload.WorkspaceID, loaded)
 			}
 			if mErr != nil {
-				log.Printf("Heartbeat: management MCP load check failed for %s: %v", payload.WorkspaceID, mErr)
+				msg := fmt.Sprintf("platform agent declared management MCP lookup failed: %v; marking degraded (core#3082)", mErr)
+				log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
+					log.Printf("Heartbeat: failed to mark %s degraded (management MCP lookup error): %v", payload.WorkspaceID, err)
+				}
+				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+					"management_mcp_lookup_failed": true,
+					"sample_error":                 msg,
+				})
 			} else if managementMissing {
 				msg := "platform agent management MCP declared but not loaded; marking degraded (core#3082)"
 				if absentToolsList {

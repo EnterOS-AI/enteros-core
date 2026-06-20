@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -220,6 +221,69 @@ func TestHeartbeatHandler_Pre147RuntimeNoMCPServerPresent_StaysOnline(t *testing
 	c, _ := gin.CreateTestContext(w)
 
 	body := `{"workspace_id":"ws-pre-147","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestHeartbeatHandler_PlatformManagementMCPLookupError_FlipsOnlineToDegraded
+// verifies that a failure to read workspace_declared_plugins is fail-loud:
+// the workspace is marked degraded rather than staying online with an
+// unverified management MCP. This closes the false-green path where a broken
+// lookup silently looked healthy (CR2 #12653 follow-up).
+func TestHeartbeatHandler_PlatformManagementMCPLookupError_FlipsOnlineToDegraded(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	// Initial heartbeat UPDATE.
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-mcp-lookup-err").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-mcp-lookup-err", 0.0, "", 0, 60, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// evaluateStatus: currentStatus=online, kind=platform.
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at FROM workspaces WHERE id =").
+		WithArgs("ws-mcp-lookup-err").
+		WillReturnRows(sqlmock.NewRows([]string{"status", "kind", "last_register_failure_at"}).AddRow("online", "platform", nil))
+
+	// platformAgentHasModelSecret: model secret exists.
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs("ws-mcp-lookup-err").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	// platformAgentManagementMCPLoaded: listDeclaredPlugins fails.
+	mock.ExpectQuery("SELECT plugin_name, source_raw FROM workspace_declared_plugins").
+		WithArgs("ws-mcp-lookup-err").
+		WillReturnError(errors.New("connection refused"))
+
+	// Degraded UPDATE — lookup failure must not silently look healthy.
+	mock.ExpectExec("UPDATE workspaces SET status =.*status = 'online'").
+		WithArgs(models.StatusDegraded, "platform agent declared management MCP lookup failed: listDeclaredPlugins: query: connection refused; marking degraded (core#3082)", "ws-mcp-lookup-err").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// WORKSPACE_DEGRADED broadcast.
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	// Even though loaded_mcp_tools contains the required tool, the lookup error
+	// takes precedence and the workspace must degrade.
+	body := `{"workspace_id":"ws-mcp-lookup-err","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["` + conciergePlatformMCPCreateWorkspaceTool + `"]}`
 	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
