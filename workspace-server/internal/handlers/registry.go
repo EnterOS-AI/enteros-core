@@ -438,7 +438,7 @@ func (h *RegistryHandler) platformAgentMCPServerPresent(present *bool) bool {
 func (h *RegistryHandler) platformAgentManagementMCPLoaded(ctx context.Context, workspaceID string, loaded []string) (bool, error) {
 	declared, err := listDeclaredPlugins(ctx, workspaceID)
 	if err != nil {
-		return false, fmt.Errorf("listDeclaredPlugins: %w", err)
+		return false, fmt.Errorf("declared-plugin lookup: %w", err)
 	}
 
 	hasDeclaredManagement := false
