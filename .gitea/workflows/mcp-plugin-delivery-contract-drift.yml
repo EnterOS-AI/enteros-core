@@ -117,3 +117,25 @@ jobs:
             echo "Re-sync: copy molecule-ai-workspace-template-claude-code contracts/mcp-plugin-delivery.contract.json verbatim over $LOCAL."
             exit 1
           fi
+
+          # Runtime party (added): the workspace-runtime vendored copy must also
+          # stay byte-identical — its platform_agent_identity consumer is the one
+          # whose literal drift caused the RCA#2970 concierge-online bug.
+          RT_URL="${API_ROOT}/repos/molecule-ai/molecule-ai-workspace-runtime/raw/contracts/mcp-plugin-delivery.contract.json?ref=${REF}"
+          set +e
+          curl -fsS -H "Authorization: token ${AUTO_SYNC_TOKEN}" "${RT_URL}" -o /tmp/runtime-mcp-plugin-delivery.contract.json
+          rt_status=$?
+          set -e
+          if [ "$rt_status" -eq 22 ]; then
+            RT_URL="${API_ROOT}/repos/molecule-ai/molecule-ai-workspace-runtime/raw/contracts/mcp-plugin-delivery.contract.json?ref=main"
+            curl -fsS -H "Authorization: token ${AUTO_SYNC_TOKEN}" "${RT_URL}" -o /tmp/runtime-mcp-plugin-delivery.contract.json || { echo "::warning::runtime contract copy not found (404) — skipping runtime compare during bootstrap."; exit 0; }
+          elif [ "$rt_status" -ne 0 ]; then
+            echo "::error::Failed to fetch runtime canonical contract (exit $rt_status)."; exit 1
+          fi
+          if diff -u /tmp/runtime-mcp-plugin-delivery.contract.json "$LOCAL"; then
+            echo "OK — core's contract is byte-identical to the workspace-runtime copy."
+          else
+            echo "::error::core's mcp-plugin-delivery.contract.json DRIFTED from the workspace-runtime copy."
+            echo "Re-sync: keep contracts/mcp-plugin-delivery.contract.json identical across core, template, and runtime."
+            exit 1
+          fi
