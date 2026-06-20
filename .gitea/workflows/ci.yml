@@ -173,20 +173,35 @@ jobs:
         # Platform (Go) job was NOT exercising the real MCPServerAdaptor.
         #
         # The contract test imports the runtime from its SOURCE TREE
-        # (PYTHONPATH=<runtime>/) and `mergeMCPPluginSettings` needs the
-        # settings-fragment.json layout, so a pip-installed wheel in
-        # site-packages is the wrong artifact. The correct fix is to
-        # check out the runtime source into a sibling of workspace-server
-        # so the test's sibling-detection (../../molecule-ai-workspace-
-        # runtime) finds it, and export MOLECULE_WORKSPACE_RUNTIME so the
-        # env-var path also resolves. NO `|| true` — if the checkout
-        # fails the gate goes red, which is the correct signal.
+        # (PYTHONPATH=<runtime>/) so the settings-fragment.json layout is
+        # preserved. The runtime's own import chain pulls `a2a-sdk` (and
+        # other declared deps) — those MUST be available in the Python env
+        # where the test runs, otherwise `import molecule_runtime.*`
+        # fails with `ModuleNotFoundError: No module named 'a2a'`. We
+        # therefore `pip install` the runtime package from the checked-out
+        # source (no `|| true` — failures must be loud). The pip install
+        # resolves deps from PyPI (not the org package index that
+        # AUTO_SYNC_TOKEN couldn't reach) and the test's explicit
+        # PYTHONPATH override keeps the source on the import path so the
+        # source wins over the site-packages copy.
         name: Checkout molecule-ai-workspace-runtime source for contract tests
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: molecule-ai/molecule-ai-workspace-runtime
           path: molecule-ai-workspace-runtime
           token: ${{ secrets.AUTO_SYNC_TOKEN }}
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: Install molecule-ai-workspace-runtime and its Python deps for contract tests
+        working-directory: ./molecule-ai-workspace-runtime
+        run: |
+          set -euo pipefail
+          # Ensure pip is available (bare ubuntu-latest runners may not have it
+          # by default; `ensurepip` is the standard-library bootstrap).
+          if ! python3 -m pip --version >/dev/null 2>&1; then
+            python3 -m ensurepip --upgrade
+          fi
+          python3 -m pip install --upgrade pip
+          python3 -m pip install .
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Export MOLECULE_WORKSPACE_RUNTIME for contract tests
         working-directory: .
