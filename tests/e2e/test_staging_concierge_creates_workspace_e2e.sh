@@ -421,7 +421,7 @@ MCP_READY_START_TS=$(date +%s)
 MCP_READY_DEADLINE=$(( MCP_READY_START_TS + MCP_READY_SECS ))
 PROBE_HIT=0
 
-while true; do
+while [ "$(date +%s)" -lt "$MCP_READY_DEADLINE" ]; do
   PROBE_TEXT=""
   PROBE_OK=0
   # Inner transport-level retry: only 502/503/504 are retried.
