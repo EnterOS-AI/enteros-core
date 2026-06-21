@@ -37,8 +37,8 @@
     "config_files":     {"type": "map",    "cp_consumes": true},
     "template_assets":  {
       "type": "map",
-      "cp_consumes": false,
-      "note": "DEAD WIRE FIELD as of 2026-06-19: core fetches+sends template assets here (RFC #2843 #24) but the deployed CP wsProvisionRequest has no `template_assets` field, so it is silently dropped. config.yaml/prompts reach SaaS boxes via config_files instead. Follow-up: either remove this send from core OR add the consumer to the CP. Tracked alongside project_saas_restart_re_stub_config."
+      "cp_consumes": true,
+      "note": "CONSUMED as of internal#33 (2026-06-21): wsProvisionRequest now decodes `template_assets` and the workspace-provision handler routes it to a backend implementing provisioner.WorkspaceTemplateAssetProvisioner (EC2 + LocalDocker). The backend materializes the concierge persona as /configs/system-prompt.md -- what the claude-code executor's get_system_prompt actually reads (NOT config.yaml prompt_files) -- shipped through the same config-files channel. Previously DROPPED (RFC #2843 #24), which left SaaS concierges booting identity-less on create AND restart. See project_saas_restart_re_stub_config."
     }
   }
 }
