@@ -24,6 +24,7 @@
     "org_id":           {"type": "string", "cp_consumes": true},
     "workspace_id":     {"type": "string", "cp_consumes": true},
     "runtime":          {"type": "string", "cp_consumes": true},
+    "template":         {"type": "string", "cp_consumes": true},
     "tier":             {"type": "int",    "cp_consumes": true},
     "instance_type":    {"type": "string", "cp_consumes": true},
     "disk_gb":          {"type": "int",    "cp_consumes": true},
