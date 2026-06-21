@@ -48,10 +48,41 @@ docker network create "$NET" >/dev/null
 docker run -d --rm --name "$PGV" --network "$NET" \
   -e POSTGRES_PASSWORD=smoketest -e POSTGRES_USER=smoke -e POSTGRES_DB=smoke \
   pgvector/pgvector:pg16 >/dev/null
-docker run -d --rm --name "$RED" --network "$NET" redis:7-alpine >/dev/null
+# Mirror CI smoke exactly (CR2 RC 13003 / PR #3120 pattern):
+#   --bind 0.0.0.0 avoids the default [::1]:6379 IPv6-loopback bind that
+#   breaks cross-container go-redis connectivity on the user-defined bridge
+#   network. --protected-mode no lets the tenant (no AUTH) connect. The
+#   --save/--appendonly flags turn off disk persistence (smoke data is
+#   throwaway). The PING readiness probe below waits for Redis to accept
+#   connections before the tenant boots — same pattern as #3120.
+docker run -d --rm --name "$RED" --network "$NET" \
+  redis:7-alpine \
+  redis-server \
+    --bind 0.0.0.0 \
+    --protected-mode no \
+    --save "" \
+    --appendonly no >/dev/null
 
 for _ in $(seq 1 30); do docker exec "$PGV" pg_isready -U smoke >/dev/null 2>&1 && break; sleep 2; done
 docker exec "$PGV" psql -U smoke -d smoke -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
+
+# PING readiness probe for redis (matches #3120 CI smoke pattern).
+# Without this, the tenant can race Redis startup and hit a
+# `connection refused` that fails the smoke.
+redis_ok=0
+for _ in $(seq 1 15); do
+  if docker exec "$RED" redis-cli -h 127.0.0.1 -p 6379 PING 2>/dev/null | grep -q PONG; then
+    redis_ok=1
+    break
+  fi
+  sleep 2
+done
+if [ "$redis_ok" -ne 1 ]; then
+  echo "FAIL: redis sidecar never responded to PING in 30s"
+  docker logs --tail 40 "$RED" 2>&1 | tail -40 || true
+  exit 1
+fi
+echo ">> redis sidecar ready (PING ok)"
 
 echo ">> Starting tenant (FULL ENV: DB + Redis + MEMORY_PLUGIN sidecar) ..."
 docker run -d --rm --name "$TEN" --network "$NET" \
