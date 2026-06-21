@@ -24,6 +24,13 @@ type MCPPluginDeliveryContract struct {
 	EntryShape   string `json:"entry_shape"`
 	Producer     string `json:"producer"`
 	Consumer     string `json:"consumer"`
+	// MCPServerName is the SSOT for the platform MCP server NAME — the mcpServers
+	// key the runtime registers the server under, which Claude Code turns into
+	// the tool-id prefix `mcp__<MCPServerName>__<tool>`. The platform-agent
+	// template's mcp_servers.yaml and the online/degraded gate's expected tool id
+	// (conciergePlatformMCPCreateWorkspaceTool) both derive from this value — see
+	// TestSSOT_DegradeGateToolDerivesFromContract.
+	MCPServerName string `json:"mcp_server_name"`
 }
 
 // LoadMCPPluginDeliveryContract loads the contract from the repo root.
