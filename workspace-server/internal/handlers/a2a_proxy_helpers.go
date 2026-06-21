@@ -52,6 +52,52 @@ type proxyDispatchBuildError struct{ err error }
 
 func (e *proxyDispatchBuildError) Error() string { return e.err.Error() }
 
+// isGatewayOriginFailure reports whether a proxy error looks like a transient
+// gateway-origin failure (Cloudflare 5xx tunnel, "no healthy upstream",
+// push-route blip) rather than a confirmed-dead workspace agent. The PM
+// 2026-06-21 RCA found that DrainQueueForWorkspace was treating these
+// transient 502/503/504 responses as generic "dead agent unreachable"
+// failures and burning the 5-attempt terminal cap on otherwise-healthy
+// workspaces.
+//
+// Distinction:
+//   - proxyErr.Classification == "upstream_dead"  → the proxy already
+//     confirmed the container is dead via maybeMarkContainerDead /
+//     preflightContainerHealth. That is a real dead-agent failure and
+//     MUST keep going through MarkQueueItemFailed so the cap can fire.
+//   - isUpstreamDeadStatus(status) (502/503/504/521-524) without an
+//     "upstream_dead" classification  → the proxy saw a dead-origin
+//     status from a CDN/gateway but did NOT confirm a dead container.
+//     This is the gateway-origin family; with a recent heartbeat from
+//     the target workspace it is almost certainly a transient upstream
+//     blip and should be re-queued without burning an attempt.
+//
+// Anything else (5xx not in the dead-origin set, 4xx) is not a
+// gateway-origin failure and should be handled by the regular
+// MarkQueueItemFailed path. The classification field is authoritative
+// when set; the status code is the fallback signal.
+func isGatewayOriginFailure(proxyErr *proxyA2AError) bool {
+	if proxyErr == nil {
+		return false
+	}
+	if proxyErr.Classification == "upstream_dead" {
+		return false
+	}
+	return isUpstreamDeadStatus(proxyErr.Status)
+}
+
+// invalidateCachedURLForDrain evicts the cached agent URL for workspaceID
+// from Redis so the next drain tick re-resolves it from the DB. Called
+// on transient gateway-origin failures where the cached URL is a likely
+// contributor (stale mapping after a tunnel flap, container port change
+// behind a CDN, etc.). db.ClearWorkspaceKeys already swallows Redis
+// errors internally (the platform's Redis layer is best-effort for the
+// URL cache — a cache-miss is harmless, just slower), so this helper
+// exists mainly for symmetry with the other drain instrumentation.
+func (h *WorkspaceHandler) invalidateCachedURLForDrain(ctx context.Context, workspaceID string) {
+	db.ClearWorkspaceKeys(ctx, workspaceID)
+}
+
 // handleA2ADispatchError translates a forward-call failure into a proxyA2AError,
 // runs the reactive container-health check, and records the outcome. Busy
 // targets that are successfully queued are logged as queued, not failed.

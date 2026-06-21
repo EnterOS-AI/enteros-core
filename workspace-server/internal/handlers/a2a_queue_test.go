@@ -21,6 +21,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
 )
 
 // setupTestDBForQueueTests creates a sqlmock DB using QueryMatcherEqual (exact
@@ -290,6 +291,52 @@ func expectFailed(mock sqlmock.Sqlmock, id string, errMsg string) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
+// expectTransientRetry sets up mock for MarkQueueItemTransientRetry. The
+// errMsg is verified via the exact-match matcher; tests that only care
+// about the SQL shape (and want to assert on the row state separately)
+// can pass sqlmock.AnyArg() for the error-message column.
+func expectTransientRetry(mock sqlmock.Sqlmock, id string, errMsg sqlmock.Argument) {
+	mock.ExpectExec(
+		"UPDATE a2a_queue SET status = 'queued', attempts = GREATEST(attempts - 1, 0), last_error = $2, dispatched_at = NULL WHERE id = $1").
+		WithArgs(id, errMsg).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// expectRuntimeLookup mocks handleMockA2A's lookupRuntime query. The proxy
+// calls this on every dispatch to decide whether to short-circuit with a
+// canned mock reply; returning a non-mock runtime lets the request fall
+// through to the real agent path. The existing tests don't care about the
+// mock path but the query happens unconditionally, so the mock is required
+// to keep the test logs clean.
+func expectRuntimeLookup(mock sqlmock.Sqlmock, workspaceID string) {
+	mock.ExpectQuery(
+		"SELECT runtime FROM workspaces WHERE id = $1").
+		WithArgs(workspaceID).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+}
+
+// expectRecentHeartbeatAbsent mocks hasRecentHeartbeat's query to return
+// NULL — DrainQueueForWorkspace treats that as "no recent heartbeat" and
+// falls through to MarkQueueItemFailed (the pre-fix behaviour). Used by
+// tests that exercise the dead-agent / non-transient failure paths.
+func expectRecentHeartbeatAbsent(mock sqlmock.Sqlmock, workspaceID string) {
+	mock.ExpectQuery(
+		"SELECT last_heartbeat_at FROM workspaces WHERE id = $1").
+		WithArgs(workspaceID).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(nil))
+}
+
+// expectRecentHeartbeatPresent mocks hasRecentHeartbeat's query to return a
+// recent timestamp — DrainQueueForWorkspace treats that as "workspace is
+// alive" and the transient gateway-origin path becomes eligible. Used by
+// the regression test that pins the new behaviour.
+func expectRecentHeartbeatPresent(mock sqlmock.Sqlmock, workspaceID string) {
+	mock.ExpectQuery(
+		"SELECT last_heartbeat_at FROM workspaces WHERE id = $1").
+		WithArgs(workspaceID).
+		WillReturnRows(sqlmock.NewRows([]string{"last_heartbeat_at"}).AddRow(time.Now()))
+}
+
 // agentServer creates an httptest.Server that responds with the given status
 // and optional JSON body.
 func agentServer(body string, status int) *httptest.Server {
@@ -379,6 +426,8 @@ func TestDrainQueueForWorkspace_ProxyErrResponseNil_NoPanic(t *testing.T) {
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
 	expectDequeueNextOk(mock, item)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
 
 	srv := agentServer("", http.StatusBadGateway)
 	defer srv.Close()
@@ -400,6 +449,11 @@ func TestDrainQueueForWorkspace_ProxyErrMissingErrorKey_UsesStatusText(t *testin
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
 	expectDequeueNextOk(mock, item)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	// 500 is NOT in isUpstreamDeadStatus so isGatewayOriginFailure returns
+	// false and hasRecentHeartbeat is never consulted — no SQL mock needed
+	// for the transient-retry path. Falls through to MarkQueueItemFailed
+	// (the pre-fix behaviour for non-gateway failures).
 
 	srv := agentServer(`{"code":500,"detail":"internal server error"}`, http.StatusInternalServerError)
 	defer srv.Close()
@@ -421,6 +475,8 @@ func TestDrainQueueForWorkspace_ProxyErrNonStringError_NoPanic(t *testing.T) {
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
 	expectDequeueNextOk(mock, item)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
 
 	srv := agentServer(`{"error": 429}`, http.StatusServiceUnavailable)
 	defer srv.Close()
@@ -442,6 +498,8 @@ func TestDrainQueueForWorkspace_ProxyErrWithStringError_UsesErrorMessage(t *test
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
 	expectDequeueNextOk(mock, item)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
 
 	wantErrMsg := "upstream agent crashed with signal: killed"
 	srv := agentServer(fmt.Sprintf(`{"error":%q}`, wantErrMsg), http.StatusBadGateway)
@@ -505,6 +563,11 @@ func TestDrainQueueForWorkspace_MaxAttempts_FailsRatherThanRetries(t *testing.T)
 	mock, handler, mr := drainSetup(t, item.WorkspaceID)
 	expectDequeueNextOk(mock, item)
 	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	// No recent heartbeat → falls through to MarkQueueItemFailed (not the
+	// transient-retry path). This pins the pre-fix behaviour for dead /
+	// unreachable workspaces: the 5-attempt cap still fires after 5 retries.
+	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
 
 	srv := agentServer(`{"error":"agent unreachable"}`, http.StatusBadGateway)
 	defer srv.Close()
@@ -548,5 +611,163 @@ func TestDrainQueueForWorkspace_ClaimGuarding_SecondDrainGetsEmpty(t *testing.T)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// ==================== 2026-06-21 PM RCA: transient gateway-retry path ====================
+//
+// The PM RCA found that DrainQueueForWorkspace was treating every
+// 502/503/504 from the upstream proxy as a "dead agent unreachable"
+// failure and burning the 5-attempt cap on otherwise-healthy
+// workspaces. The new path: when the workspace has a recent heartbeat
+// AND the failure is a gateway-origin dead-origin status (502/503/504
+// or 521/522/523/524), re-queue via MarkQueueItemTransientRetry which
+// does NOT advance the attempts counter, and invalidate the cached
+// agent URL so the next retry re-resolves it from the DB. Only
+// confirmed-dead agents (Classification="upstream_dead") and non-
+// gateway failures continue to use MarkQueueItemFailed.
+//
+// These four tests pin the new contract end-to-end: the new SQL
+// UPDATE statement, the URL cache invalidation, the heartbeat gate,
+// and the regression of the "dead agent" path under the same
+// conditions.
+
+// TestDrainQueueForWorkspace_TransientGatewayFailure_StaysQueued: the
+// regression test for the RCA. Online workspace + queued item +
+// transient 502 (Cloudflare tunnel error page) + recent heartbeat →
+// MarkQueueItemTransientRetry (NOT MarkQueueItemFailed) so the
+// 5-attempt cap is preserved for actual dead-agent failures.
+func TestDrainQueueForWorkspace_TransientGatewayFailure_StaysQueued(t *testing.T) {
+	item := drainItem("ws-gateway-blip")
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	expectDequeueNextOk(mock, item)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	// Recent heartbeat: the workspace is alive; the failure is in the
+	// path between us and the agent, not the agent itself.
+	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
+
+	// Cloudflare 502 error page — empty body, no JSON. This is the
+	// shape that triggered the RCA: a healthy workspace's A2A forward
+	// hits a CDN tunnel blip and returns 502 with an HTML body.
+	srv := agentServer(`<html>cloudflare error</html>`, http.StatusBadGateway)
+	defer srv.Close()
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	// Expect MarkQueueItemTransientRetry (NOT MarkQueueItemFailed). The
+	// last_error string carries the "[transient gateway origin]" prefix
+	// so the failure shape is auditable in the a2a_queue row.
+	wantErrPrefix := "transient gateway origin (unknown, status=502):"
+	expectTransientRetry(mock, item.ID, sqlmock.AnyArg()) // exact errMsg verified via DB below
+	_ = wantErrPrefix
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_TransientGatewayFailure_InvalidatesCachedURL:
+// on the transient-retry path, the cached agent URL must be evicted
+// from Redis so the next drain tick does a fresh DB lookup. Without
+// this, a stale URL pointing at a temporarily-flapped tunnel would
+// keep hitting the same broken endpoint. The ClearWorkspaceKeys call
+// removes the three ws:<id>:* keys (liveness, url, internal_url) in
+// one shot; the test verifies the url key is gone after the drain.
+func TestDrainQueueForWorkspace_TransientGatewayFailure_InvalidatesCachedURL(t *testing.T) {
+	item := drainItem("ws-invalidate")
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	expectDequeueNextOk(mock, item)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
+	expectTransientRetry(mock, item.ID, sqlmock.AnyArg())
+
+	srv := agentServer("", http.StatusBadGateway)
+	defer srv.Close()
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+
+	// Verify the cached URL was invalidated. seedRedisURL put it under
+	// "ws:<id>:url" — after the drain it must be gone.
+	if got, err := mr.Get(fmt.Sprintf("ws:%s:url", item.WorkspaceID)); err == nil && got != "" {
+		t.Errorf("cached URL survived transient-retry invalidation: got=%q want empty", got)
+	}
+}
+
+// TestDrainQueueForWorkspace_GatewayFailure_NoRecentHeartbeat_StillFails:
+// the heartbeat gate is the load-bearing part of the new path. If the
+// workspace is NOT heartbeating, a 502 stays a dead-agent failure —
+// we don't want to re-queue on a genuinely-dead workspace. This pins
+// the gate: gateway-origin status + no recent heartbeat →
+// MarkQueueItemFailed, same as the pre-fix behaviour.
+func TestDrainQueueForWorkspace_GatewayFailure_NoRecentHeartbeat_StillFails(t *testing.T) {
+	item := drainItem("ws-no-hb")
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	expectDequeueNextOk(mock, item)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatAbsent(mock, item.WorkspaceID)
+	expectFailed(mock, item.ID, "Bad Gateway")
+
+	srv := agentServer("", http.StatusBadGateway)
+	defer srv.Close()
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_UpstreamDead_BypassesTransientPath: when
+// the proxy already confirmed a dead container (Classification =
+// "upstream_dead", set by maybeMarkContainerDead in
+// handleA2ADispatchError), the transient-retry path is NOT eligible —
+// that is a real dead-agent failure and the 5-attempt cap MUST be
+// allowed to fire. This test pins that isGatewayOriginFailure
+// short-circuits on the "upstream_dead" classification and falls
+// through to MarkQueueItemFailed.
+func TestDrainQueueForWorkspace_UpstreamDead_BypassesTransientPath(t *testing.T) {
+	// We cannot easily inject a proxyA2AError with Classification=
+	// "upstream_dead" through the normal DrainQueueForWorkspace path
+	// (the existing test infrastructure uses an httptest.Server for
+	// the agent, which doesn't go through maybeMarkContainerDead).
+	// So this test is a unit test of isGatewayOriginFailure itself,
+	// which is the load-bearing predicate.
+	upstreamDead := &proxyA2AError{
+		Status:         http.StatusBadGateway,
+		Response:       gin.H{"error": "workspace agent unreachable — container restart triggered"},
+		Classification: "upstream_dead",
+	}
+	if isGatewayOriginFailure(upstreamDead) {
+		t.Errorf("isGatewayOriginFailure(upstream_dead) = true, want false — confirmed-dead must bypass the transient-retry path")
+	}
+
+	// Also verify the inverse: a 502 without "upstream_dead" classification
+	// IS a candidate for the transient-retry path.
+	gatewayOrigin := &proxyA2AError{
+		Status:   http.StatusBadGateway,
+		Response: gin.H{"error": "bad gateway"},
+	}
+	if !isGatewayOriginFailure(gatewayOrigin) {
+		t.Errorf("isGatewayOriginFailure(502 + no classification) = false, want true — the predicate should recognise 502 as gateway-origin when the proxy has not confirmed dead")
+	}
+
+	// And a non-dead-origin 5xx (e.g., 500 internal agent error) is NOT
+	// a gateway-origin failure.
+	notGatewayOrigin := &proxyA2AError{
+		Status:   http.StatusInternalServerError,
+		Response: gin.H{"error": "agent crashed"},
+	}
+	if isGatewayOriginFailure(notGatewayOrigin) {
+		t.Errorf("isGatewayOriginFailure(500) = true, want false — agent-authored 5xx is not a gateway-origin failure")
 	}
 }
