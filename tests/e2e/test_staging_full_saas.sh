@@ -123,7 +123,11 @@
 set -euo pipefail
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
+# #48: tolerate an absent admin token here — the PR-mode early-exit below
+# (E2E_REQUIRE_LIVE=0 + no token) handles the pull_request lane cleanly. On a
+# real run (push/dispatch/cron, E2E_REQUIRE_LIVE=1) the missing-token case is
+# caught as a HARD FAIL just past the PR-mode block, with a clear message.
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
 RUNTIME="${E2E_RUNTIME:-hermes}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-3600}"
@@ -215,6 +219,32 @@ require_live_or_die() {
     exit 5
   fi
 }
+
+# ─── PR-mode early-exit (#48 — mirrors test_staging_concierge_creates_workspace_e2e.sh) ──
+# This harness is invoked by TWO jobs in e2e-staging-saas.yml:
+#   - e2e-staging-saas         (push/dispatch/cron only; always has creds + REQUIRE_LIVE=1)
+#   - e2e-staging-platform-boot (now ALSO pull_request; #48 made it merge-blocking)
+# E2E_REQUIRE_LIVE=0 on pull_request runs because PRs do not have staging creds
+# wired; without this block the script would hard-fail at the first admin-auth
+# call and red-X every PR (a false-red, not a real regression). The PR-mode gate
+# is a self-check: bash -n on the script's own syntax (catches PR-merge
+# regressions that would break the real run on push-to-main). On push / dispatch
+# / cron, E2E_REQUIRE_LIVE=1 and the real staging boot runs and HARD FAILs
+# (exit 5 via require_live_or_die) on a run that validated no live lifecycle.
+if [ "${REQUIRE_LIVE}" = "0" ] && [ -z "${ADMIN_TOKEN}" ]; then
+  log "PR-mode: E2E_REQUIRE_LIVE=0 and no MOLECULE_ADMIN_TOKEN — skipping live staging boot."
+  log "(the real staging boot runs on push-to-main / dispatch / cron with E2E_REQUIRE_LIVE=1)"
+  if ! bash -n "$0"; then
+    fail "PR-mode self-check FAILED: bash -n on $0 returned non-zero — script has a syntax error"
+  fi
+  ok "PR-mode self-check PASSED: $(basename "$0") is bash-clean (real staging boot runs on push-to-main with E2E_REQUIRE_LIVE=1)"
+  exit 0
+fi
+# Beyond here we are running for real: REQUIRE_LIVE=1 OR ADMIN_TOKEN is set.
+# A real run with no admin token is a HARD FAIL (was the `:?` default before #48).
+if [ -z "${ADMIN_TOKEN}" ]; then
+  fail "MOLECULE_ADMIN_TOKEN required (Railway staging CP_ADMIN_API_TOKEN) — a non-PR run (E2E_REQUIRE_LIVE=${REQUIRE_LIVE}) needs staging creds"
+fi
 
 # Per-runtime model slug dispatch — see lib/model_slug.sh for the rationale.
 # Extracted so unit tests (tests/e2e/test_model_slug.sh) can pin every branch

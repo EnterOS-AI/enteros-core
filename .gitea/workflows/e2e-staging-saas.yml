@@ -369,22 +369,32 @@ jobs:
   # honest (BYOK requires a key; platform requires its ABSENCE not to matter) and
   # gives the regression its own named commit-status for branch protection.
   #
-  # Add `E2E Staging Platform Boot` to branch protection after 3 consecutive
-  # green runs on main (de-flake window; this path shares the cp#245
-  # boot-timeout flake surface the BYOK job has, so it must prove stable before
-  # it can BLOCK — see the gate-making plan in the PR body).
-  # bp-required: pending #2187
+  # GATING (no continue-on-error), FALSE-GREEN-PROOF via E2E_REQUIRE_LIVE
+  # (0 on pull_request → PR-mode self-check; 1 on push/dispatch/cron → real
+  # staging boot, HARD FAILs on missing infra). Promoted to merge-blocking
+  # per #48 — RCA: molecule-controlplane PR #878 rendered the tenant
+  # `docker run` env block with a blank line that broke shell `\`-continuation,
+  # orphaning the image arg → `docker run exit=127` → no tenant container →
+  # prod onboarding outage 06:04–08:09 UTC 2026-06-21 (fixed by CP #885). The
+  # real-boot e2e being advisory + PR-skipped is why that class escaped
+  # pre-merge. This job now exercises a real platform-managed boot on every
+  # push-to-main and is the merge gate.
+  #
+  # bp-required: now required — added to .gitea/required-contexts.txt by #48
+  #
+  # core#3081 / #48: NO `if:` guard on this job (mirrors
+  # e2e-staging-concierge-creates-workspace). The job IS a required status
+  # context (see .gitea/required-contexts.txt); a required context that never
+  # fires on pull_request degrades the merge gate to a silent indefinite
+  # pending (the exact failure mode lint-required-no-paths exists to prevent;
+  # see feedback_path_filtered_workflow_cant_be_required). The job runs on
+  # every PR with E2E_REQUIRE_LIVE=0 (the harness detects the missing-creds
+  # case and exit 0s after a bash -n self-check), and on push/dispatch/cron
+  # with E2E_REQUIRE_LIVE=1 (the real staging boot runs and HARD FAILs on
+  # missing infra).
   e2e-staging-platform-boot:
     name: E2E Staging Platform Boot
     runs-on: ubuntu-latest
-    # core#3081: gate the slow platform-boot job to push/dispatch/cron now
-    # that the workflow's `paths:` filter has been removed (lint-required-no-paths
-    # compliance). Matches the pattern of the other slow jobs in this workflow.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    # Phase 3 (RFC #219 §1): surface without blocking until the de-flake window
-    # closes. mc#2654: do NOT renew this mask silently — the gate-making plan
-    # tracks the flip to false under #2187.
-    continue-on-error: true
     timeout-minutes: 45
     permissions:
       contents: read
@@ -410,17 +420,33 @@ jobs:
       E2E_MODE: smoke
       E2E_RUN_ID: "platform-${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
-      # Fail-closed-on-skip (see BYOK job). smoke mode still runs steps 2/4/7/8b,
-      # so all four required milestones (provisioned/tenant_online/
-      # workspace_online/a2a_roundtrip) fire — the guard is valid for this lane too.
-      E2E_REQUIRE_LIVE: '1'
+      # Fail-closed-on-skip (see BYOK job + e2e-staging-concierge-creates-workspace).
+      # smoke mode still runs steps 2/4/7/8b, so all four required milestones
+      # (provisioned/tenant_online/workspace_online/a2a_roundtrip) fire — the guard
+      # is valid for this lane too.
+      #   pull_request: 0 → PRs have no staging creds; the harness's PR-mode
+      #                  self-check (bash -n) is the gate, then exit 0.
+      #   push / dispatch / schedule: 1 → the real staging boot runs and HARD
+      #                  FAILs (exit 5) on a run that proves no live lifecycle.
+      E2E_REQUIRE_LIVE: ${{ github.event_name == 'pull_request' && '0' || '1' }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Verify admin token present
+        env:
+          E2E_REQUIRE_LIVE: ${{ github.event_name == 'pull_request' && '0' || '1' }}
         run: |
+          # PR-mode (#48): on pull_request the job runs with E2E_REQUIRE_LIVE=0
+          # and PRs carry no staging creds. Don't hard-fail here — the harness
+          # detects the missing-creds case, runs a bash -n self-check, and
+          # exit 0s. On push/dispatch/cron (E2E_REQUIRE_LIVE=1) the creds MUST
+          # be present and a missing token/AWS-cred is a hard error.
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
+            if [ "${E2E_REQUIRE_LIVE}" = "0" ]; then
+              echo "PR-mode: no MOLECULE_ADMIN_TOKEN (E2E_REQUIRE_LIVE=0) — harness will self-check and skip the live boot ✓"
+              exit 0
+            fi
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
             exit 2
           fi
