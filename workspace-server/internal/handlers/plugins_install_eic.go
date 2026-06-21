@@ -247,3 +247,69 @@ func realReadPluginManifestViaEIC(ctx context.Context, instanceID, runtime, plug
 	}
 	return out, nil
 }
+
+// buildPluginsListShell returns the remote command that lists the immediate
+// child directory names under <runtime-config-prefix>/plugins/. One name per
+// line; missing-dir lands as empty stdout (the `2>/dev/null || true` mirrors
+// the local-Docker ListInstalled `ls ... || true`). `-mindepth 1 -maxdepth 1
+// -type d -printf '%f\n'` returns bare names (not paths) so the caller can
+// validate + read each plugin.yaml without string-stripping.
+func buildPluginsListShell(hostPluginsDir string) string {
+	q := shellQuote(hostPluginsDir)
+	return fmt.Sprintf(
+		"sudo -n find %s -mindepth 1 -maxdepth 1 -type d -printf '%%f\\n' 2>/dev/null || true",
+		q,
+	)
+}
+
+// listPluginsViaEIC returns the directory names under the SaaS workspace EC2's
+// <runtime-config-prefix>/plugins/ — the EIC sibling of the local-Docker
+// `ls /configs/plugins/` in ListInstalled. Without it, ListInstalled returns
+// [] for EVERY SaaS tenant (findRunningContainer finds no LOCAL container), so
+// an installed plugin reads back as not-installed even though it is on the box.
+//
+// Best-effort: a missing plugins dir returns an empty slice (not an error),
+// matching the local path's `|| true`. Tunnel/ssh failures DO return an error
+// so the caller can distinguish "no plugins" from "couldn't reach the box".
+var listPluginsViaEIC = realListPluginsViaEIC
+
+func realListPluginsViaEIC(ctx context.Context, instanceID, runtime string) ([]string, error) {
+	if instanceID == "" {
+		return nil, fmt.Errorf("listPluginsViaEIC: empty instance_id")
+	}
+
+	hostPluginsDir := filepath.Join(resolveWorkspaceRootPath(runtime, "/configs"), "plugins")
+	cmd := buildPluginsListShell(hostPluginsDir)
+
+	ctx, cancel := context.WithTimeout(ctx, eicPluginOpTimeout)
+	defer cancel()
+
+	var stdout bytes.Buffer
+	runErr := withEICTunnel(ctx, instanceID, func(s eicSSHSession) error {
+		sshCmd := exec.CommandContext(ctx, "ssh", s.sshArgs(cmd)...)
+		sshCmd.Env = os.Environ()
+		var stderr bytes.Buffer
+		sshCmd.Stdout = &stdout
+		sshCmd.Stderr = &stderr
+		if err := sshCmd.Run(); err != nil {
+			return fmt.Errorf(
+				"ssh list: %w (instance=%s runtime=%s stderr=%s)",
+				err, instanceID, runtime, strings.TrimSpace(stderr.String()),
+			)
+		}
+		return nil
+	})
+	if runErr != nil {
+		return nil, runErr
+	}
+
+	var names []string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}

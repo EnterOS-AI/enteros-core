@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -61,51 +62,87 @@ func (h *PluginsHandler) ListInstalled(c *gin.Context) {
 	ctx := c.Request.Context()
 	plugins := []pluginInfo{}
 
-	containerName := h.findRunningContainer(ctx, workspaceID)
-	if containerName == "" {
-		c.JSON(http.StatusOK, plugins)
-		return
-	}
-
-	// List directories in /configs/plugins/
-	output, err := h.execInContainer(ctx, containerName, []string{
-		"sh", "-c", "ls -1 /configs/plugins/ 2>/dev/null || true",
-	})
-	if err != nil {
-		c.JSON(http.StatusOK, plugins)
-		return
-	}
-
-	for _, name := range strings.Split(output, "\n") {
-		name = strings.TrimSpace(name)
-		if name == "" || validatePluginName(name) != nil {
-			continue
-		}
-		// Try to read manifest from container (safe: name is validated)
-		manifestOutput, err := h.execInContainer(ctx, containerName, []string{
-			"cat", fmt.Sprintf("/configs/plugins/%s/plugin.yaml", name),
+	// Dispatch order mirrors Install/Uninstall (plugins_install.go): a local
+	// Docker container wins; otherwise fall back to the SaaS EIC path. Without
+	// the SaaS branch ListInstalled returned [] for EVERY SaaS tenant (no LOCAL
+	// container), so an installed plugin read back as not-installed even though
+	// it was on the box — the "[] readback after a successful install" bug.
+	if containerName := h.findRunningContainer(ctx, workspaceID); containerName != "" {
+		// List directories in /configs/plugins/
+		output, err := h.execInContainer(ctx, containerName, []string{
+			"sh", "-c", "ls -1 /configs/plugins/ 2>/dev/null || true",
 		})
-		if err != nil || manifestOutput == "" {
-			plugins = append(plugins, pluginInfo{Name: name})
-			continue
+		if err != nil {
+			c.JSON(http.StatusOK, plugins)
+			return
 		}
-		info := parseManifestYAML(name, []byte(manifestOutput))
-		plugins = append(plugins, info)
-	}
-
-	// Annotate each installed plugin with whether it still supports the
-	// workspace's current runtime. Lets the canvas grey out plugins that
-	// went inert after a runtime change.
-	if h.runtimeLookup != nil {
-		if runtime, err := h.runtimeLookup(workspaceID); err == nil && runtime != "" {
-			for i := range plugins {
-				ok := plugins[i].supportsRuntime(runtime)
-				plugins[i].SupportedOnRuntime = &ok
+		for _, name := range strings.Split(output, "\n") {
+			name = strings.TrimSpace(name)
+			if name == "" || validatePluginName(name) != nil {
+				continue
 			}
+			// Try to read manifest from container (safe: name is validated)
+			manifestOutput, err := h.execInContainer(ctx, containerName, []string{
+				"cat", fmt.Sprintf("/configs/plugins/%s/plugin.yaml", name),
+			})
+			if err != nil || manifestOutput == "" {
+				plugins = append(plugins, pluginInfo{Name: name})
+				continue
+			}
+			info := parseManifestYAML(name, []byte(manifestOutput))
+			plugins = append(plugins, info)
 		}
+		h.annotateRuntimeSupport(workspaceID, plugins)
+		c.JSON(http.StatusOK, plugins)
+		return
 	}
 
+	// SaaS path: list + read manifests over the EIC SSH tunnel.
+	if instanceID, runtime := h.lookupSaaSDispatch(workspaceID); instanceID != "" {
+		names, err := listPluginsViaEIC(ctx, instanceID, runtime)
+		if err != nil {
+			// Couldn't reach the box — return [] (not a 5xx) to match the
+			// local path's fail-soft posture; the canvas treats an empty list
+			// as "none installed / try again", never a hard error.
+			log.Printf("ListInstalled: EIC list failed for %s: %v", workspaceID, err)
+			c.JSON(http.StatusOK, plugins)
+			return
+		}
+		for _, name := range names {
+			if validatePluginName(name) != nil {
+				continue
+			}
+			manifest, mErr := readPluginManifestViaEIC(ctx, instanceID, runtime, name)
+			if mErr != nil || len(manifest) == 0 {
+				plugins = append(plugins, pluginInfo{Name: name})
+				continue
+			}
+			plugins = append(plugins, parseManifestYAML(name, manifest))
+		}
+		h.annotateRuntimeSupport(workspaceID, plugins)
+		c.JSON(http.StatusOK, plugins)
+		return
+	}
+
+	// Neither backend reachable — empty list (fail-soft, same as before).
 	c.JSON(http.StatusOK, plugins)
+}
+
+// annotateRuntimeSupport stamps each plugin with whether it still supports the
+// workspace's current runtime. Lets the canvas grey out plugins that went inert
+// after a runtime change. Shared by the Docker and SaaS ListInstalled branches.
+func (h *PluginsHandler) annotateRuntimeSupport(workspaceID string, plugins []pluginInfo) {
+	if h.runtimeLookup == nil {
+		return
+	}
+	runtime, err := h.runtimeLookup(workspaceID)
+	if err != nil || runtime == "" {
+		return
+	}
+	for i := range plugins {
+		ok := plugins[i].supportsRuntime(runtime)
+		plugins[i].SupportedOnRuntime = &ok
+	}
 }
 
 // CheckRuntimeCompatibility handles GET /workspaces/:id/plugins/compatibility?runtime=<name>
