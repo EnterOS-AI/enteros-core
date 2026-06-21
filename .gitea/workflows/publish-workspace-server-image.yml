@@ -310,7 +310,7 @@ jobs:
           # gate below can run the just-built image locally BEFORE it ever
           # touches ECR. A broken image can no longer become :staging-latest —
           # the gate fails the build (and the push step is skipped) if the
-          # container does not reach /healthz=200 within 120s.
+          # container does not reach /health=200 within 120s.
           for attempt in 1 2 3; do
             echo "::notice::Tenant image build (--load) attempt ${attempt}/3 ..."
             builder="tenant-builder-${GITHUB_RUN_ID}-${attempt}"
@@ -344,7 +344,7 @@ jobs:
           done
 
           # ====== SMOKE GATE (P0 SEV hardening) ======
-          # Run the just-built image locally and assert it reaches /healthz=200
+          # Run the just-built image locally and assert it reaches /health=200
           # BEFORE pushing to ECR. A broken image MUST NOT become
           # :staging-latest. The existing canary/staging-verify job is a
           # post-push safety net — this gate is the build-time pre-push net
@@ -363,7 +363,7 @@ jobs:
           #   (A) FULL ENV  — DATABASE_URL + MEMORY_PLUGIN_URL set, so
           #       the sidecar branch EXECUTES. Boots a local pgvector
           #       container, points the tenant at it, asserts BOTH
-          #       /healthz=200 (platform) AND :9100/v1/health=200
+          #       /health=200 (platform) AND :9100/v1/health=200
           #       (memory-plugin sidecar).
           #   (B) SIDECAR-DISABLED — MEMORY_PLUGIN_DISABLE=1, no DATABASE_URL.
           #       Verifies the "sidecar off" boot path still works
@@ -444,7 +444,7 @@ jobs:
 
           full_ok=0
           for i in $(seq 1 90); do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080/healthz" 2>/dev/null || echo "000")
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080/health" 2>/dev/null || echo "000")
             if [ "$code" = "200" ]; then
               full_ok=1
               break
@@ -452,14 +452,14 @@ jobs:
             sleep 2
           done
           if [ "${full_ok}" -ne 1 ]; then
-            echo "::error::Smoke gate (A: FULL ENV) FAILED: tenant /healthz never returned 200 in 180s (last code: ${code})"
+            echo "::error::Smoke gate (A: FULL ENV) FAILED: tenant /health never returned 200 in 180s (last code: ${code})"
             echo "::error::This means the entrypoint-tenant.sh MEMORY_PLUGIN_URL sidecar branch could not"
             echo "::error::boot to healthy — the same class of defect that caused the prod-outage."
             echo "::error::Last 120 lines of container logs:"
             docker logs --tail 120 "${SMOKE_NAME_FULL}" 2>&1 | tail -120 || true
             trap - EXIT; cleanup_all; exit 1
           fi
-          echo "::notice::Smoke gate (A: FULL ENV) PASSED: platform /healthz=200 in ~$((i*2))s"
+          echo "::notice::Smoke gate (A: FULL ENV) PASSED: platform /health=200 in ~$((i*2))s"
 
           # Verify the memory-plugin sidecar itself is healthy on :9100.
           # We port-mapped :9100 → :19100 so the host can curl the sidecar
@@ -502,7 +502,7 @@ jobs:
 
           bare_ok=0
           for i in $(seq 1 60); do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18081/healthz" 2>/dev/null || echo "000")
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18081/health" 2>/dev/null || echo "000")
             if [ "$code" = "200" ]; then
               bare_ok=1
               break
@@ -510,12 +510,12 @@ jobs:
             sleep 2
           done
           if [ "${bare_ok}" -ne 1 ]; then
-            echo "::error::Smoke gate (B: SIDECAR-DISABLED) FAILED: /healthz never returned 200 in 120s (last code: ${code})"
+            echo "::error::Smoke gate (B: SIDECAR-DISABLED) FAILED: /health never returned 200 in 120s (last code: ${code})"
             echo "::error::Last 80 lines of container logs:"
             docker logs --tail 80 "${SMOKE_NAME_BARE}" 2>&1 | tail -80 || true
             trap - EXIT; cleanup_all; exit 1
           fi
-          echo "::notice::Smoke gate (B: SIDECAR-DISABLED) PASSED: /healthz=200 in ~$((i*2))s"
+          echo "::notice::Smoke gate (B: SIDECAR-DISABLED) PASSED: /health=200 in ~$((i*2))s"
           docker rm -f "${SMOKE_NAME_BARE}" >/dev/null 2>&1
 
           trap - EXIT
