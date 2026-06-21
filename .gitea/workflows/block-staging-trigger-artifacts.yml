@@ -18,6 +18,8 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
+  # bp-required: pending #313 — new merge-blocking contamination gate;
+  # branch protection must require `Block integration-tester contamination artifacts / check (pull_request)` once it has posted green on 3 PRs.
   check:
     name: Block staging-trigger / invalid manifest contamination
     runs-on: ubuntu-latest
