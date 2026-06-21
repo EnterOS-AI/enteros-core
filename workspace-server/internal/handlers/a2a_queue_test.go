@@ -300,14 +300,16 @@ func expectFailed(mock sqlmock.Sqlmock, id string, errMsg string) {
 // about the SQL shape (and want to assert on the row state separately)
 // can pass sqlmock.AnyArg() for the error-message column.
 //
-// #3127 follow-up: the SQL now also sets next_attempt_at = now() + 5s so
-// DequeueNext's WHERE clause (added in the same change) skips the row
-// during the backoff window. This is what breaks the capacity>1
-// tight-retry loop.
+// #3127 follow-up: the SQL now also sets next_attempt_at = now() +
+// make_interval(secs => $3) so DequeueNext's WHERE clause (added in
+// the same change) skips the row during the backoff window. The seconds
+// count is parameterised via transientRetryBackoffSecs (Go constant)
+// rather than inlined as a literal interval string — golangci-lint
+// flagged the literal form as having an unused sibling const.
 func expectTransientRetry(mock sqlmock.Sqlmock, id string, errMsg sqlmock.Argument) {
 	mock.ExpectExec(
-		"UPDATE a2a_queue SET status = 'queued', attempts = GREATEST(attempts - 1, 0), last_error = $2, dispatched_at = NULL, next_attempt_at = now() + interval '5 seconds' WHERE id = $1").
-		WithArgs(id, errMsg).
+		"UPDATE a2a_queue SET status = 'queued', attempts = GREATEST(attempts - 1, 0), last_error = $2, dispatched_at = NULL, next_attempt_at = now() + make_interval(secs => $3) WHERE id = $1").
+		WithArgs(id, errMsg, transientRetryBackoffSecs).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 

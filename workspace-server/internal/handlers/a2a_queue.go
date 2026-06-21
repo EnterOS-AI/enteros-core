@@ -92,16 +92,19 @@ const (
 	a2aQueueSweeperStatusAlert = 10 // log a warning every N stranded items
 )
 
-// transientRetryBackoff is how long a MarkQueueItemTransientRetry row
-// remains ineligible for re-dispatch. #3127 follow-up (Researcher
-// REQUEST_CHANGES) — the transient-retry path requeues with status='queued'
-// but the same DrainQueueForWorkspace for-loop can iterate up to capacity
-// times. Without this backoff, a capacity>1 drain would re-claim the
-// just-requeued row on the next iteration and hit the same gateway
-// failure again, in a tight loop. 5s is long enough to break that loop
-// (sweeper interval is 10s, heartbeats typically every 5-30s) and short
-// enough that recovery on the next heartbeat is not perceptibly delayed.
-const transientRetryBackoff = 5 * time.Second
+// transientRetryBackoffSecs is how long a MarkQueueItemTransientRetry
+// row remains ineligible for re-dispatch, expressed in seconds (the
+// integer form that PostgreSQL's make_interval(secs => $N) accepts).
+//
+// #3127 follow-up (Researcher REQUEST_CHANGES) — the transient-retry
+// path requeues with status='queued' but the same DrainQueueForWorkspace
+// for-loop can iterate up to capacity times. Without this backoff, a
+// capacity>1 drain would re-claim the just-requeued row on the next
+// iteration and hit the same gateway failure again, in a tight loop.
+// 5s is long enough to break that loop (sweeper interval is 10s,
+// heartbeats typically every 5-30s) and short enough that recovery on
+// the next heartbeat is not perceptibly delayed.
+const transientRetryBackoffSecs = 5
 
 // QueuedItem is what the heartbeat drain path pulls off the queue.
 type QueuedItem struct {
@@ -344,14 +347,17 @@ func MarkQueueItemFailed(ctx context.Context, id, errMsg string) {
 // the next sweep / heartbeat-drain picks it up naturally.
 //
 // Backoff (Researcher #3127 REQUEST_CHANGES follow-up): sets
-// next_attempt_at = now() + transientRetryBackoff so the row is
-// backoff-gated against re-dispatch for the window. This is the gate
-// that prevents a capacity>1 DrainQueueForWorkspace from tight-looping
-// on the same row (the just-requeued row would otherwise be eligible
-// for re-claim on the very next for-loop iteration, and would hit the
-// same gateway failure again without ever burning an attempt or being
-// delayed). DequeueNext's WHERE clause skips rows whose
-// next_attempt_at is still in the future.
+// next_attempt_at = now() + make_interval(secs => transientRetryBackoffSecs)
+// so the row is backoff-gated against re-dispatch for the window. This
+// is the gate that prevents a capacity>1 DrainQueueForWorkspace from
+// tight-looping on the same row (the just-requeued row would otherwise
+// be eligible for re-claim on the very next for-loop iteration, and
+// would hit the same gateway failure again without ever burning an
+// attempt or being delayed). DequeueNext's WHERE clause skips rows
+// whose next_attempt_at is still in the future. The seconds count is
+// passed as a parameter (rather than inlined as `interval '5 seconds'`)
+// so the transientRetryBackoff Go constant drives the SQL behavior
+// directly — golangci-lint flagged the previous unused-const shape.
 //
 // Race-safety note: between DequeueNext's COMMIT and this UPDATE, the row
 // is in 'dispatched' status, so a concurrent DequeueNext call (sweeper
@@ -365,9 +371,9 @@ func MarkQueueItemTransientRetry(ctx context.Context, id, errMsg string) {
 		    attempts = GREATEST(attempts - 1, 0),
 		    last_error = $2,
 		    dispatched_at = NULL,
-		    next_attempt_at = now() + interval '5 seconds'
+		    next_attempt_at = now() + make_interval(secs => $3)
 		WHERE id = $1
-	`, id, errMsg); err != nil {
+	`, id, errMsg, transientRetryBackoffSecs); err != nil {
 		log.Printf("A2AQueue: failed to mark %s for transient retry: %v", id, err)
 	}
 }
