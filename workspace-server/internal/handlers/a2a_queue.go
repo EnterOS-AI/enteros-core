@@ -92,6 +92,20 @@ const (
 	a2aQueueSweeperStatusAlert = 10 // log a warning every N stranded items
 )
 
+// transientRetryBackoffSecs is how long a MarkQueueItemTransientRetry
+// row remains ineligible for re-dispatch, expressed in seconds (the
+// integer form that PostgreSQL's make_interval(secs => $N) accepts).
+//
+// #3127 follow-up (Researcher REQUEST_CHANGES) — the transient-retry
+// path requeues with status='queued' but the same DrainQueueForWorkspace
+// for-loop can iterate up to capacity times. Without this backoff, a
+// capacity>1 drain would re-claim the just-requeued row on the next
+// iteration and hit the same gateway failure again, in a tight loop.
+// 5s is long enough to break that loop (sweeper interval is 10s,
+// heartbeats typically every 5-30s) and short enough that recovery on
+// the next heartbeat is not perceptibly delayed.
+const transientRetryBackoffSecs = 5
+
 // QueuedItem is what the heartbeat drain path pulls off the queue.
 type QueuedItem struct {
 	ID          string
@@ -223,7 +237,18 @@ func EnqueueA2A(
 // 'dispatched'. Uses SELECT ... FOR UPDATE SKIP LOCKED so two concurrent
 // drain calls don't both claim the same row.
 //
-// Returns (nil, nil) when the queue is empty — not an error.
+// Honors a per-row next_attempt_at backoff (added in #3127 follow-up
+// migration 20260621120000). Rows whose next_attempt_at is in the future
+// are SKIPPED — they remain 'queued' but are not eligible for dispatch
+// until the backoff expires. This is the gate that breaks the
+// capacity>1 tight-retry loop on a flapping gateway: when
+// MarkQueueItemTransientRetry sets next_attempt_at = now() + 5s, the
+// same for-loop iteration that just requeued the row cannot re-dequeue
+// it on the very next iteration even if the row is still highest
+// priority.
+//
+// Returns (nil, nil) when the queue is empty (or all eligible rows are
+// backoff-gated) — not an error.
 func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 	tx, err := db.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -238,6 +263,7 @@ func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 		FROM a2a_queue
 		WHERE workspace_id = $1 AND status = 'queued'
 		  AND (expires_at IS NULL OR expires_at > now())
+		  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
 		ORDER BY priority DESC, enqueued_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
@@ -305,6 +331,53 @@ func MarkQueueItemFailed(ctx context.Context, id, errMsg string) {
 	}
 }
 
+// MarkQueueItemTransientRetry returns a dispatched item to 'queued' WITHOUT
+// burning the 5-attempt terminal cap. Used by DrainQueueForWorkspace for
+// transient gateway-origin failures (Cloudflare 502, push-route blip, "no
+// healthy upstream") where the workspace is online and heartbeating — the
+// failure is in the path BETWEEN the platform and the agent, not in the
+// agent itself. The PM 2026-06-21 RCA caught that the previous behaviour
+// (always MarkQueueItemFailed) consumed the cap on healthy workspaces and
+// stranded queued requests until TTL.
+//
+// Mechanism: DequeueNext (line 256-262 of this file) increments `attempts`
+// at dispatch time under FOR UPDATE SKIP LOCKED. MarkQueueItemTransientRetry
+// undoes that increment so a transient retry does not advance the cap
+// counter. The row stays in 'queued' status with dispatched_at = NULL, so
+// the next sweep / heartbeat-drain picks it up naturally.
+//
+// Backoff (Researcher #3127 REQUEST_CHANGES follow-up): sets
+// next_attempt_at = now() + make_interval(secs => transientRetryBackoffSecs)
+// so the row is backoff-gated against re-dispatch for the window. This
+// is the gate that prevents a capacity>1 DrainQueueForWorkspace from
+// tight-looping on the same row (the just-requeued row would otherwise
+// be eligible for re-claim on the very next for-loop iteration, and
+// would hit the same gateway failure again without ever burning an
+// attempt or being delayed). DequeueNext's WHERE clause skips rows
+// whose next_attempt_at is still in the future. The seconds count is
+// passed as a parameter (rather than inlined as `interval '5 seconds'`)
+// so the transientRetryBackoff Go constant drives the SQL behavior
+// directly — golangci-lint flagged the previous unused-const shape.
+//
+// Race-safety note: between DequeueNext's COMMIT and this UPDATE, the row
+// is in 'dispatched' status, so a concurrent DequeueNext call (sweeper
+// tick, second heartbeat in flight) cannot re-claim it. The status='queued'
+// transition is the only window during which re-claim is possible, and it
+// is bounded by the time this UPDATE takes to commit.
+func MarkQueueItemTransientRetry(ctx context.Context, id, errMsg string) {
+	if _, err := db.DB.ExecContext(ctx, `
+		UPDATE a2a_queue
+		SET status = 'queued',
+		    attempts = GREATEST(attempts - 1, 0),
+		    last_error = $2,
+		    dispatched_at = NULL,
+		    next_attempt_at = now() + make_interval(secs => $3)
+		WHERE id = $1
+	`, id, errMsg, transientRetryBackoffSecs); err != nil {
+		log.Printf("A2AQueue: failed to mark %s for transient retry: %v", id, err)
+	}
+}
+
 // DropStaleQueueItems marks queued items older than maxAge as 'dropped' with a
 // system-generated reason so PM agents stop processing stale post-incident noise.
 // Called with a workspaceID to scope cleanup to one workspace, or empty to sweep
@@ -367,6 +440,19 @@ func DropStaleQueueItems(ctx context.Context, workspaceID string, maxAgeMinutes 
 // spare capacity, and from the periodic A2A queue sweeper as a fallback when
 // heartbeats stop (#2930). Errors here are logged but not returned — callers
 // are fire-and-forget goroutines.
+//
+// #2026-06-21 PM RCA: distinguish GATEWAY-ORIGIN failures (transient
+// Cloudflare 502 / push-route blip / "no healthy upstream") from TRUE
+// dead-agent failures. Healthy workspaces that happened to get a 502
+// from the CDN were terminal-failing the queue item under the previous
+// behaviour — MarkQueueItemFailed increments attempts each tick, so a
+// transient blip that lasted 5 ticks would burn the cap and strand the
+// request at 'failed'. Now: gateway-origin failures with a recent
+// heartbeat invalidate the cached URL, re-queue via
+// MarkQueueItemTransientRetry (which DOES NOT advance the 5-attempt
+// counter), and let the next sweep retry. Only confirmed-dead agents
+// (Classification="upstream_dead") or non-gateway failures continue
+// through MarkQueueItemFailed.
 func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspaceID string, capacity int) {
 	if capacity <= 0 {
 		return
@@ -385,6 +471,15 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		if item.CallerID.Valid {
 			callerID = item.CallerID.String
 		}
+		// Resolve the agent URL up front so every drain log line carries it.
+		// resolveAgentURL swallows its own errors into a proxyA2AError, so a
+		// resolution failure here is rare — usually a workspace with no URL
+		// row. Empty string is fine for the log; the dispatch below will
+		// produce the structured error and we already log it.
+		resolvedURL, _ := h.resolveAgentURL(ctx, workspaceID)
+		log.Printf("A2AQueue drain: dispatching queue_id=%s workspace_id=%s url=%s attempt=%d",
+			item.ID, workspaceID, resolvedURL, item.Attempts)
+
 		// logActivity=false: the original EnqueueA2A callsite already logged
 		// the dispatch attempt; re-logging here would double-count events.
 		status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false, false)
@@ -395,7 +490,8 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		// count attempts; the new (re-)queue row already exists.
 		if status == http.StatusAccepted {
 			MarkQueueItemCompleted(ctx, item.ID, nil)
-			log.Printf("A2AQueue drain: %s re-queued (target still busy)", item.ID)
+			log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s re-queued (target still busy)",
+				item.ID, workspaceID)
 			continue
 		}
 
@@ -412,14 +508,36 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 					errMsg = "unknown drain dispatch error"
 				}
 			}
+			classification := proxyErr.Classification
+
+			// #2026-06-21 PM RCA: transient gateway-origin failure (CF 5xx,
+			// push-route blip, "no healthy upstream") on a workspace that is
+			// still heartbeating → re-queue without burning the 5-attempt cap.
+			// The agent is alive; the path between us and the agent is not.
+			// Invalidate the cached URL so the next retry re-resolves, and
+			// hand off to MarkQueueItemTransientRetry which undoes the
+			// DequeueNext attempts-increment.
+			if isGatewayOriginFailure(proxyErr) && h.hasRecentHeartbeat(ctx, workspaceID) {
+				h.invalidateCachedURLForDrain(ctx, workspaceID)
+				MarkQueueItemTransientRetry(ctx, item.ID,
+					fmt.Sprintf("transient gateway origin (%s, status=%d): %s",
+						classificationOrUnknown(classification), proxyErr.Status, errMsg))
+				log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s transient gateway failure "+
+					"(status=%d classification=%s) — re-queued without burning attempt cap (attempts preserved at %d)",
+					item.ID, workspaceID, resolvedURL, proxyErr.Status, classificationOrUnknown(classification), item.Attempts)
+				continue
+			}
+
 			MarkQueueItemFailed(ctx, item.ID, errMsg)
-			log.Printf("A2AQueue drain: dispatch for %s failed (attempt=%d): %s",
-				item.ID, item.Attempts, errMsg)
+			log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s dispatch failed "+
+				"(attempt=%d status=%d classification=%s): %s",
+				item.ID, workspaceID, resolvedURL, item.Attempts, proxyErr.Status,
+				classificationOrUnknown(classification), errMsg)
 			continue
 		}
 		MarkQueueItemCompleted(ctx, item.ID, respBody)
-		log.Printf("A2AQueue drain: dispatched %s to workspace %s (attempt=%d)",
-			item.ID, workspaceID, item.Attempts)
+		log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s dispatched (attempt=%d)",
+			item.ID, workspaceID, resolvedURL, item.Attempts)
 
 		// Stitch the response back to the originating delegation row, if this
 		// queue item was a delegation. Without this, check_task_status would
@@ -432,6 +550,17 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 			h.stitchDrainResponseToDelegation(ctx, callerID, item.WorkspaceID, delegationID, respBody)
 		}
 	}
+}
+
+// classificationOrUnknown renders an empty proxyA2AError.Classification as
+// the literal "unknown" so the structured drain log line never has an empty
+// classification field — makes log-scrapers and human readers happier than
+// trailing whitespace.
+func classificationOrUnknown(c string) string {
+	if c == "" {
+		return "unknown"
+	}
+	return c
 }
 
 // extractDelegationIDFromBody pulls params.message.metadata.delegation_id
