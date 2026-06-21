@@ -341,54 +341,176 @@ jobs:
           # that catches the same defect ~10x faster (no ECR round-trip, no
           # cloudflared tunnel, no full org provisioning).
           #
-          # Health probe: ${TENANT_IMAGE_NAME}:${TAG_SHA} serves /healthz on
-          # port 8080 (the platform reverse proxy exposes it). We bind the
-          # smoke container to host port 18080 to avoid clashes with the
-          # runner's own services. Timeout 120s covers the worst-case
-          # platform-server cold start.
-          SMOKE_NAME="smoke-tenant-${GITHUB_RUN_ID}"
-          echo "::notice::Smoke gate: starting ${SMOKE_NAME} from ${TENANT_IMAGE_NAME}:${TAG_SHA}"
-          cleanup_smoke() {
-            docker rm -f "${SMOKE_NAME}" >/dev/null 2>&1 || true
-          }
-          trap cleanup_smoke EXIT
-          docker run -d --rm \
-            --name "${SMOKE_NAME}" \
-            -p 18080:8080 \
-            -e PORT=8080 \
-            -e MOLECULE_TENANT_MODE=smoke \
-            "${TENANT_IMAGE_NAME}:${TAG_SHA}" >/dev/null
+          # P0 UPDATE (RCA 107680, PM dispatch fb0ab22f): the original
+          # "bare `docker run`" smoke did NOT exercise the
+          # env-activated MEMORY_PLUGIN_URL sidecar branch of
+          # entrypoint-tenant.sh — a bare run with no MEMORY_PLUGIN_URL
+          # set skips the sidecar entirely, so a defect in that branch
+          # (the actual prod-onboarding root cause was a malformed
+          # templateRepoEnvLine that the sidecar boot path tripped on)
+          # would have passed the bare smoke. The gate now runs TWO
+          # variants per build:
+          #   (A) FULL ENV  — DATABASE_URL + MEMORY_PLUGIN_URL set, so
+          #       the sidecar branch EXECUTES. Boots a local pgvector
+          #       container, points the tenant at it, asserts BOTH
+          #       /healthz=200 (platform) AND :9100/v1/health=200
+          #       (memory-plugin sidecar).
+          #   (B) SIDECAR-DISABLED — MEMORY_PLUGIN_DISABLE=1, no DATABASE_URL.
+          #       Verifies the "sidecar off" boot path still works
+          #       (e.g. for a CP template that explicitly opts out, or
+          #       for self-hosted tenants without the memory v2 stack).
+          # Both must pass. If either fails, the build is failed and
+          # NO push occurs.
 
-          smoke_ok=0
-          for i in $(seq 1 60); do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080/healthz" 2>/dev/null || echo "000")
-            if [ "$code" = "200" ]; then
-              echo "::notice::Smoke gate PASSED: /healthz=200 on attempt $i (~${i}*2=$((i*2))s)"
-              smoke_ok=1
+          SMOKE_NET="smoke-net-${GITHUB_RUN_ID}"
+          PGV_NAME="smoke-pgv-${GITHUB_RUN_ID}"
+          SMOKE_NAME_FULL="smoke-tenant-full-${GITHUB_RUN_ID}"
+          SMOKE_NAME_BARE="smoke-tenant-bare-${GITHUB_RUN_ID}"
+
+          cleanup_all() {
+            docker rm -f "${SMOKE_NAME_FULL}" "${SMOKE_NAME_BARE}" "${PGV_NAME}" >/dev/null 2>&1 || true
+            docker network rm "${SMOKE_NET}" >/dev/null 2>&1 || true
+          }
+          trap cleanup_all EXIT
+
+          # Create an isolated user-defined bridge network so the pgvector
+          # container and the tenant container can resolve each other by
+          # name (DNS baked into user-defined networks).
+          docker network create "${SMOKE_NET}" >/dev/null
+
+          # --- pgvector sidecar (FULL ENV only) -----------------------------
+          # Pull pgvector on first use. We use the official image
+          # (pgvector/pgvector:pg16) which bundles the vector extension.
+          # Pull is cached after the first run, so steady-state cost is
+          # ~0s; first-run cost is ~10-15s. Total gate budget is 180s
+          # for BOTH variants.
+          echo "::notice::Smoke gate (FULL ENV): starting pgvector sidecar ${PGV_NAME}"
+          docker run -d --rm \
+            --name "${PGV_NAME}" \
+            --network "${SMOKE_NET}" \
+            -e POSTGRES_PASSWORD=smoketest \
+            -e POSTGRES_USER=smoke \
+            -e POSTGRES_DB=smoke \
+            pgvector/pgvector:pg16 >/dev/null
+
+          # Wait for pgvector to accept connections (max 60s).
+          pgv_ok=0
+          for i in $(seq 1 30); do
+            if docker exec "${PGV_NAME}" pg_isready -U smoke >/dev/null 2>&1; then
+              pgv_ok=1
               break
             fi
             sleep 2
           done
-
-          if [ "${smoke_ok}" -ne 1 ]; then
-            echo "::error::Smoke gate FAILED: container did not reach /healthz=200 within 120s (last code: ${code})"
-            echo "::error::Last 80 lines of container logs:"
-            docker logs --tail 80 "${SMOKE_NAME}" 2>&1 | tail -80 || true
-            echo "::error::A broken image MUST NOT become :staging-latest — build is failed, NO push will occur."
-            trap - EXIT
-            cleanup_smoke
-            exit 1
+          if [ "${pgv_ok}" -ne 1 ]; then
+            echo "::error::pgvector sidecar never reached ready in 60s — aborting smoke"
+            trap - EXIT; cleanup_all; exit 1
           fi
+          # Install the vector extension. The memory-plugin's 000_schema_bootstrap
+          # migration expects this to exist (per entrypoint-tenant.sh comment
+          # on search_path + public fallback). Created explicitly here so
+          # any future schema-bootstrap refactor still gets a clean test.
+          docker exec "${PGV_NAME}" psql -U smoke -d smoke -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
+          echo "::notice::pgvector sidecar ready + vector extension installed"
 
-          # Optional: hit a few more endpoints to catch class-of-bug not caught
-          # by /healthz alone (404 on /, etc.). Keep this fast (<10s budget).
-          for path in /healthz /readyz /api/v1/health; do
-            c=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080${path}" 2>/dev/null || echo "000")
-            echo "::notice::Smoke probe ${path} → ${c}"
+          # --- (A) FULL ENV smoke: sidecar branch must execute ---------------
+          # DATABASE_URL points at the pgvector container via DNS name
+          # (user-defined network). MEMORY_PLUGIN_URL points at the
+          # in-container sidecar on :9100 (localhost inside the tenant
+          # container's network namespace). We port-map :9100 → :19100
+          # so the host can probe the sidecar's /v1/health via curl.
+          echo "::notice::Smoke gate (A: FULL ENV): starting ${SMOKE_NAME_FULL}"
+          docker run -d --rm \
+            --name "${SMOKE_NAME_FULL}" \
+            --network "${SMOKE_NET}" \
+            -e PORT=8080 \
+            -e MOLECULE_TENANT_MODE=smoke \
+            -e DATABASE_URL="postgres://smoke:smoketest@${PGV_NAME}:5432/smoke?sslmode=disable" \
+            -e MEMORY_PLUGIN_URL="http://localhost:9100" \
+            -e MEMORY_PLUGIN_LISTEN_ADDR=":9100" \
+            -p 18080:8080 \
+            -p 19100:9100 \
+            "${TENANT_IMAGE_NAME}:${TAG_SHA}" >/dev/null
+
+          full_ok=0
+          for i in $(seq 1 90); do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080/healthz" 2>/dev/null || echo "000")
+            if [ "$code" = "200" ]; then
+              full_ok=1
+              break
+            fi
+            sleep 2
           done
+          if [ "${full_ok}" -ne 1 ]; then
+            echo "::error::Smoke gate (A: FULL ENV) FAILED: tenant /healthz never returned 200 in 180s (last code: ${code})"
+            echo "::error::This means the entrypoint-tenant.sh MEMORY_PLUGIN_URL sidecar branch could not"
+            echo "::error::boot to healthy — the same class of defect that caused the prod-outage."
+            echo "::error::Last 120 lines of container logs:"
+            docker logs --tail 120 "${SMOKE_NAME_FULL}" 2>&1 | tail -120 || true
+            trap - EXIT; cleanup_all; exit 1
+          fi
+          echo "::notice::Smoke gate (A: FULL ENV) PASSED: platform /healthz=200 in ~$((i*2))s"
+
+          # Verify the memory-plugin sidecar itself is healthy on :9100.
+          # We port-mapped :9100 → :19100 so the host can curl the sidecar
+          # directly (avoids the YAML-escaping problem of running a node
+          # script inside the tenant container). The sidecar is the
+          # regression point — the prod-outage was the sidecar boot path
+          # failing under malformed env, not the platform itself.
+          sidecar_ok=0
+          for j in $(seq 1 30); do
+            sc=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:19100/v1/health" 2>/dev/null || echo "000")
+            if [ "$sc" = "200" ]; then
+              sidecar_ok=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "${sidecar_ok}" -ne 1 ]; then
+            echo "::error::Smoke gate (A: FULL ENV) FAILED: memory-plugin /v1/health did not return 200 in 30s (last code: ${sc})"
+            echo "::error::Platform is healthy but the sidecar isn't — the sidecar is the regression point."
+            echo "::error::Last 60 lines of container logs:"
+            docker logs --tail 60 "${SMOKE_NAME_FULL}" 2>&1 | tail -60 || true
+            trap - EXIT; cleanup_all; exit 1
+          fi
+          echo "::notice::Smoke gate (A: FULL ENV) PASSED: memory-plugin /v1/health=200 on :9100 in ~${j}s"
+          docker rm -f "${SMOKE_NAME_FULL}" >/dev/null 2>&1
+
+          # --- (B) SIDECAR-DISABLED smoke: bare-equivalent path --------------
+          # Verifies the "sidecar off" boot path still works (no
+          # DATABASE_URL, MEMORY_PLUGIN_DISABLE=1 — entrypoint skips the
+          # sidecar branch entirely, just like a self-hosted tenant
+          # without the memory v2 stack).
+          echo "::notice::Smoke gate (B: SIDECAR-DISABLED): starting ${SMOKE_NAME_BARE}"
+          docker run -d --rm \
+            --name "${SMOKE_NAME_BARE}" \
+            -p 18081:8080 \
+            -e PORT=8080 \
+            -e MOLECULE_TENANT_MODE=smoke \
+            -e MEMORY_PLUGIN_DISABLE=1 \
+            "${TENANT_IMAGE_NAME}:${TAG_SHA}" >/dev/null
+
+          bare_ok=0
+          for i in $(seq 1 60); do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18081/healthz" 2>/dev/null || echo "000")
+            if [ "$code" = "200" ]; then
+              bare_ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${bare_ok}" -ne 1 ]; then
+            echo "::error::Smoke gate (B: SIDECAR-DISABLED) FAILED: /healthz never returned 200 in 120s (last code: ${code})"
+            echo "::error::Last 80 lines of container logs:"
+            docker logs --tail 80 "${SMOKE_NAME_BARE}" 2>&1 | tail -80 || true
+            trap - EXIT; cleanup_all; exit 1
+          fi
+          echo "::notice::Smoke gate (B: SIDECAR-DISABLED) PASSED: /healthz=200 in ~$((i*2))s"
+          docker rm -f "${SMOKE_NAME_BARE}" >/dev/null 2>&1
+
           trap - EXIT
-          cleanup_smoke
-          echo "::notice::Smoke gate complete; pushing to ECR (4 tags)"
+          cleanup_all
+          echo "::notice::Smoke gate PASSED both variants; pushing to ECR (4 tags)"
 
           # Smoke passed — push the loaded image to ECR with all 4 tags. If any
           # push fails, the build fails (--load already in the daemon, so this
