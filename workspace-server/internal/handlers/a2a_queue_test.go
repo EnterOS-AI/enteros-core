@@ -247,10 +247,13 @@ func drainItem(wsID string) *QueuedItem {
 //	BEGIN → SELECT FOR UPDATE SKIP LOCKED → UPDATE status='dispatched', attempts=attempts+1 → COMMIT
 //
 // SQL strings are EXACT matches to the handler code — QueryMatcherEqual verifies verbatim.
+// The next_attempt_at filter was added in #3127 follow-up; without it the
+// `WHERE (next_attempt_at IS NULL OR next_attempt_at <= now())` clause
+// wouldn't match the handler's exact SQL string.
 func expectDequeueNextOk(mock sqlmock.Sqlmock, item *QueuedItem) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(
-		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
+		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
 		WithArgs(item.WorkspaceID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "workspace_id", "caller_id", "priority", "body", "method", "attempts",
@@ -266,10 +269,11 @@ func expectDequeueNextOk(mock sqlmock.Sqlmock, item *QueuedItem) {
 }
 
 // expectDequeueNextEmpty sets up sqlmock for DequeueNext returning no rows.
+// next_attempt_at filter added in #3127 follow-up.
 func expectDequeueNextEmpty(mock sqlmock.Sqlmock, wsID string) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(
-		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
+		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
 		WithArgs(wsID).
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectRollback()
@@ -295,9 +299,14 @@ func expectFailed(mock sqlmock.Sqlmock, id string, errMsg string) {
 // errMsg is verified via the exact-match matcher; tests that only care
 // about the SQL shape (and want to assert on the row state separately)
 // can pass sqlmock.AnyArg() for the error-message column.
+//
+// #3127 follow-up: the SQL now also sets next_attempt_at = now() + 5s so
+// DequeueNext's WHERE clause (added in the same change) skips the row
+// during the backoff window. This is what breaks the capacity>1
+// tight-retry loop.
 func expectTransientRetry(mock sqlmock.Sqlmock, id string, errMsg sqlmock.Argument) {
 	mock.ExpectExec(
-		"UPDATE a2a_queue SET status = 'queued', attempts = GREATEST(attempts - 1, 0), last_error = $2, dispatched_at = NULL WHERE id = $1").
+		"UPDATE a2a_queue SET status = 'queued', attempts = GREATEST(attempts - 1, 0), last_error = $2, dispatched_at = NULL, next_attempt_at = now() + interval '5 seconds' WHERE id = $1").
 		WithArgs(id, errMsg).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
@@ -536,7 +545,7 @@ func TestDrainQueueForWorkspace_DequeueError_LogsAndReturns(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(
-		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
+		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
 		WithArgs("ws-dequeue-err").
 		WillReturnError(sql.ErrConnDone)
 	mock.ExpectRollback()
@@ -769,5 +778,54 @@ func TestDrainQueueForWorkspace_UpstreamDead_BypassesTransientPath(t *testing.T)
 	}
 	if isGatewayOriginFailure(notGatewayOrigin) {
 		t.Errorf("isGatewayOriginFailure(500) = true, want false — agent-authored 5xx is not a gateway-origin failure")
+	}
+}
+
+// TestDrainQueueForWorkspace_TransientRetry_BackoffBreaksCapacityLoop:
+// Regression test for Researcher #3127 REQUEST_CHANGES. The original
+// transient-retry fix requeued the row with status='queued' and no
+// backoff, so a capacity>1 DrainQueueForWorkspace could re-claim the
+// just-requeued row on the very next for-loop iteration and hit the
+// same gateway failure in a tight loop. The fix: next_attempt_at = now() + 5s
+// on transient retry, plus a WHERE clause in DequeueNext that skips
+// rows whose next_attempt_at is still in the future.
+//
+// This test pins the backoff: capacity=2, one queued item that hits a
+// transient 502, expect the second DequeueNext to return (nil, nil)
+// because the only item is now backoff-gated. Without the WHERE clause
+// the second DequeueNext would have re-claimed the row and the test
+// would fail (the budget check + MarkQueueItemTransientRetry expectations
+// would be unmet, since the row would not be requeued a second time).
+func TestDrainQueueForWorkspace_TransientRetry_BackoffBreaksCapacityLoop(t *testing.T) {
+	item := drainItem("ws-capacity-loop")
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+
+	// Iteration 1 of the for-loop (capacity=2): the only queued row is
+	// claimed, dispatched, and hits a transient 502. Recent heartbeat
+	// keeps the transient-retry path eligible.
+	expectDequeueNextOk(mock, item)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
+
+	srv := agentServer("", http.StatusBadGateway)
+	defer srv.Close()
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	expectTransientRetry(mock, item.ID, sqlmock.AnyArg())
+
+	// Iteration 2 of the for-loop (capacity=2): the just-requeued row
+	// is still the highest-priority item, but next_attempt_at is now()
+	// + 5s — DequeueNext's WHERE clause MUST skip it. The mock returns
+	// sql.ErrNoRows as if the queue is empty, and the test framework
+	// will fail if the second iteration ever calls into proxyA2ARequest
+	// (no MarkQueueItemTransientRetry / MarkQueueItemFailed mock is
+	// registered for it).
+	expectDequeueNextEmpty(mock, item.WorkspaceID)
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 2)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }

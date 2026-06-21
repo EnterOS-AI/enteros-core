@@ -92,6 +92,17 @@ const (
 	a2aQueueSweeperStatusAlert = 10 // log a warning every N stranded items
 )
 
+// transientRetryBackoff is how long a MarkQueueItemTransientRetry row
+// remains ineligible for re-dispatch. #3127 follow-up (Researcher
+// REQUEST_CHANGES) — the transient-retry path requeues with status='queued'
+// but the same DrainQueueForWorkspace for-loop can iterate up to capacity
+// times. Without this backoff, a capacity>1 drain would re-claim the
+// just-requeued row on the next iteration and hit the same gateway
+// failure again, in a tight loop. 5s is long enough to break that loop
+// (sweeper interval is 10s, heartbeats typically every 5-30s) and short
+// enough that recovery on the next heartbeat is not perceptibly delayed.
+const transientRetryBackoff = 5 * time.Second
+
 // QueuedItem is what the heartbeat drain path pulls off the queue.
 type QueuedItem struct {
 	ID          string
@@ -223,7 +234,18 @@ func EnqueueA2A(
 // 'dispatched'. Uses SELECT ... FOR UPDATE SKIP LOCKED so two concurrent
 // drain calls don't both claim the same row.
 //
-// Returns (nil, nil) when the queue is empty — not an error.
+// Honors a per-row next_attempt_at backoff (added in #3127 follow-up
+// migration 20260621120000). Rows whose next_attempt_at is in the future
+// are SKIPPED — they remain 'queued' but are not eligible for dispatch
+// until the backoff expires. This is the gate that breaks the
+// capacity>1 tight-retry loop on a flapping gateway: when
+// MarkQueueItemTransientRetry sets next_attempt_at = now() + 5s, the
+// same for-loop iteration that just requeued the row cannot re-dequeue
+// it on the very next iteration even if the row is still highest
+// priority.
+//
+// Returns (nil, nil) when the queue is empty (or all eligible rows are
+// backoff-gated) — not an error.
 func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 	tx, err := db.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -238,6 +260,7 @@ func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 		FROM a2a_queue
 		WHERE workspace_id = $1 AND status = 'queued'
 		  AND (expires_at IS NULL OR expires_at > now())
+		  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
 		ORDER BY priority DESC, enqueued_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
@@ -320,6 +343,16 @@ func MarkQueueItemFailed(ctx context.Context, id, errMsg string) {
 // counter. The row stays in 'queued' status with dispatched_at = NULL, so
 // the next sweep / heartbeat-drain picks it up naturally.
 //
+// Backoff (Researcher #3127 REQUEST_CHANGES follow-up): sets
+// next_attempt_at = now() + transientRetryBackoff so the row is
+// backoff-gated against re-dispatch for the window. This is the gate
+// that prevents a capacity>1 DrainQueueForWorkspace from tight-looping
+// on the same row (the just-requeued row would otherwise be eligible
+// for re-claim on the very next for-loop iteration, and would hit the
+// same gateway failure again without ever burning an attempt or being
+// delayed). DequeueNext's WHERE clause skips rows whose
+// next_attempt_at is still in the future.
+//
 // Race-safety note: between DequeueNext's COMMIT and this UPDATE, the row
 // is in 'dispatched' status, so a concurrent DequeueNext call (sweeper
 // tick, second heartbeat in flight) cannot re-claim it. The status='queued'
@@ -331,7 +364,8 @@ func MarkQueueItemTransientRetry(ctx context.Context, id, errMsg string) {
 		SET status = 'queued',
 		    attempts = GREATEST(attempts - 1, 0),
 		    last_error = $2,
-		    dispatched_at = NULL
+		    dispatched_at = NULL,
+		    next_attempt_at = now() + interval '5 seconds'
 		WHERE id = $1
 	`, id, errMsg); err != nil {
 		log.Printf("A2AQueue: failed to mark %s for transient retry: %v", id, err)
