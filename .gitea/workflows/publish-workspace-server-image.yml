@@ -371,21 +371,43 @@ jobs:
           #       for self-hosted tenants without the memory v2 stack).
           # Both must pass. If either fails, the build is failed and
           # NO push occurs.
+          #
+          # P0 UPDATE (CR2 log pull, job 538500 step 8): the FULL ENV
+          # variant must also boot a Redis sidecar. The tenant's
+          # `cmd/server/main.go:161` calls `db.InitRedis(REDIS_URL)`
+          # and `log.Fatalf` on failure → tenant exits 1 BEFORE
+          # serving /healthz. With runtime v0.3.43 from PR #161,
+          # the workspace-server startup path requires Redis (events
+          # broadcaster + health-sweep subscribe). Without a working
+          # Redis at the REDIS_URL the tenant points at, the FULL ENV
+          # smoke's `/healthz=200` never happens. The bare-equivalent
+          # 248c7f52 didn't need Redis because variant (B) short-circuits
+          # the same boot path with MEMORY_PLUGIN_DISABLE=1.
+          #
+          # IMPORTANT: redis:7 defaults to binding `[::1]:6379` (IPv6
+          # loopback) — which the tenant's go-redis client may not
+          # reach over the user-defined bridge network. The smoke runs
+          # the redis container with `--bind 0.0.0.0 --protected-mode no`
+          # so the tenant can reach it via the user-defined bridge
+          # network's DNS-resolved hostname. CR2's job 538500 log
+          # specifically called out the `[::1]:6379` bind — that's the
+          # exact failure mode this fixes.
 
           SMOKE_NET="smoke-net-${GITHUB_RUN_ID}"
           PGV_NAME="smoke-pgv-${GITHUB_RUN_ID}"
+          REDIS_NAME="smoke-redis-${GITHUB_RUN_ID}"
           SMOKE_NAME_FULL="smoke-tenant-full-${GITHUB_RUN_ID}"
           SMOKE_NAME_BARE="smoke-tenant-bare-${GITHUB_RUN_ID}"
 
           cleanup_all() {
-            docker rm -f "${SMOKE_NAME_FULL}" "${SMOKE_NAME_BARE}" "${PGV_NAME}" >/dev/null 2>&1 || true
+            docker rm -f "${SMOKE_NAME_FULL}" "${SMOKE_NAME_BARE}" "${PGV_NAME}" "${REDIS_NAME}" >/dev/null 2>&1 || true
             docker network rm "${SMOKE_NET}" >/dev/null 2>&1 || true
           }
           trap cleanup_all EXIT
 
-          # Create an isolated user-defined bridge network so the pgvector
-          # container and the tenant container can resolve each other by
-          # name (DNS baked into user-defined networks).
+          # Create an isolated user-defined bridge network so the sidecar
+          # containers (pgvector, redis) and the tenant container can
+          # resolve each other by name (DNS baked into user-defined networks).
           docker network create "${SMOKE_NET}" >/dev/null
 
           # --- pgvector sidecar (FULL ENV only) -----------------------------
@@ -423,6 +445,40 @@ jobs:
           docker exec "${PGV_NAME}" psql -U smoke -d smoke -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
           echo "::notice::pgvector sidecar ready + vector extension installed"
 
+          # --- Redis sidecar (FULL ENV only, runtime v0.3.43+) -------------
+          # The workspace-server's `cmd/server/main.go:161` calls
+          # `db.InitRedis(REDIS_URL)` and `log.Fatalf` on failure →
+          # tenant exits 1 BEFORE /healthz. Without this sidecar the
+          # FULL ENV smoke always fails on /healthz=200. Bind to
+          # 0.0.0.0 (NOT the default `[::1]` IPv6 loopback) and disable
+          # protected-mode so go-redis can connect from the user-defined
+          # bridge network via DNS-resolved hostname.
+          echo "::notice::Smoke gate (FULL ENV): starting redis sidecar ${REDIS_NAME}"
+          docker run -d --rm \
+            --name "${REDIS_NAME}" \
+            --network "${SMOKE_NET}" \
+            redis:7-alpine \
+            redis-server \
+              --bind 0.0.0.0 \
+              --protected-mode no \
+              --save "" \
+              --appendonly no >/dev/null
+
+          # Wait for redis to respond to PING (max 30s).
+          redis_ok=0
+          for i in $(seq 1 15); do
+            if docker exec "${REDIS_NAME}" redis-cli -h 127.0.0.1 -p 6379 PING 2>/dev/null | grep -q PONG; then
+              redis_ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${redis_ok}" -ne 1 ]; then
+            echo "::error::redis sidecar never responded to PING in 30s — aborting smoke"
+            trap - EXIT; cleanup_all; exit 1
+          fi
+          echo "::notice::redis sidecar ready (responded PONG to PING)"
+
           # --- (A) FULL ENV smoke: sidecar branch must execute ---------------
           # DATABASE_URL points at the pgvector container via DNS name
           # (user-defined network). MEMORY_PLUGIN_URL points at the
@@ -438,6 +494,7 @@ jobs:
             -e DATABASE_URL="postgres://smoke:smoketest@${PGV_NAME}:5432/smoke?sslmode=disable" \
             -e MEMORY_PLUGIN_URL="http://localhost:9100" \
             -e MEMORY_PLUGIN_LISTEN_ADDR=":9100" \
+            -e REDIS_URL="redis://${REDIS_NAME}:6379/0" \
             -p 18080:8080 \
             -p 19100:9100 \
             "${TENANT_IMAGE_NAME}:${TAG_SHA}" >/dev/null
