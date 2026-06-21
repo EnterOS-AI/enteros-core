@@ -14,6 +14,9 @@ import type { NextRequest } from "next/server";
  *     is significantly lower risk than script injection and is acceptable here.
  *   • object-src locked to 'none'; frame-src allows self + blob: for
  *     browser-native PDF previews backed by authenticated Blob URLs.
+ *   • img-src allows the generated-image blob host (Cloudflare R2) so the
+ *     chat can render images returned by the image-gen capability socket as
+ *     presigned R2 URLs. See buildImgSrc() for the security rationale.
  *   • base-uri / frame-ancestors locked to 'self'/'none'.
  *   • upgrade-insecure-requests forces HTTPS on mixed-content.
  *
@@ -24,13 +27,49 @@ import type { NextRequest } from "next/server";
  *
  * Exported for unit testing.
  */
+/**
+ * Build the img-src directive value.
+ *
+ * Beyond the canvas's own assets ('self' + blob:/data: for avatars,
+ * thumbnails, and ObjectURL-wrapped authenticated attachments) we must allow
+ * the host that serves GENERATED images. The image-gen capability socket
+ * (RFC #3105) stores each generated image in Cloudflare R2 and returns it to
+ * the agent as a time-boxed, SigV4-presigned GET URL on
+ * `<bucket>.<cf-account-hash>.r2.cloudflarestorage.com`. The chat renders that
+ * URL directly as `<img src="https://…r2.cloudflarestorage.com/…">`, so the
+ * host must be in img-src or the browser blocks the image (broken thumbnail).
+ *
+ * Which host?
+ *   • The bucket name (MOLECULE_IMAGE_GEN_BUCKET) and the CF R2 account hash
+ *     (MOLECULE_IMAGE_GEN_ENDPOINT) are CONTROL-PLANE deploy config, not known
+ *     to this canvas build. So we cannot hardcode the exact host here.
+ *   • A deploy MAY pin the exact origin via NEXT_PUBLIC_IMAGE_GEN_R2_HOST
+ *     (e.g. "https://molecule-workspace-data.<hash>.r2.cloudflarestorage.com")
+ *     — preferred when known, since it is the tightest policy.
+ *   • Otherwise we fall back to the documented wildcard
+ *     `https://*.r2.cloudflarestorage.com`.
+ *
+ * Security rationale for the wildcard fallback: this ONLY widens img-src
+ * (image *display*). connect-src is left unchanged, so fetch()/XHR to R2 stays
+ * blocked — there is no data-exfiltration channel via this directive. The R2
+ * URLs the browser loads are time-boxed, SigV4-presigned GETs scoped to a
+ * single object key that the agent already legitimately holds; permitting the
+ * `<img>` to render them grants no new capability beyond viewing an image the
+ * user's own agent produced.
+ */
+export function buildImgSrc(): string {
+  const pinned = process.env.NEXT_PUBLIC_IMAGE_GEN_R2_HOST ?? "";
+  const r2Host = pinned || "https://*.r2.cloudflarestorage.com";
+  return `img-src 'self' blob: data: ${r2Host}`;
+}
+
 export function buildCsp(nonce: string, isDev: boolean): string {
   if (isDev) {
     return [
       "default-src 'self'",
       "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
       "style-src 'self' 'unsafe-inline'",
-      "img-src 'self' blob: data:",
+      buildImgSrc(),
       "font-src 'self'",
       "connect-src *",
       "worker-src 'self' blob:",
@@ -60,7 +99,7 @@ export function buildCsp(nonce: string, isDev: boolean): string {
     `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`,
     // unsafe-inline kept for inline style="" attributes used by React Flow.
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' blob: data:",
+    buildImgSrc(),
     "font-src 'self'",
     "object-src 'none'",
     "frame-src 'self' blob:",

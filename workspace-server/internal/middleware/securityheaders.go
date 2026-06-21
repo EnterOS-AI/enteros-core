@@ -1,10 +1,43 @@
 package middleware
 
 import (
+	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 )
+
+// generatedImageImgSrc returns the img-src directive for canvas (HTML) routes.
+//
+// Beyond the canvas's own assets ('self' + data:/blob:) we must allow the host
+// that serves GENERATED images. The image-gen capability socket (RFC #3105)
+// stores each generated image in Cloudflare R2 and hands the agent a time-boxed,
+// SigV4-presigned GET URL on `<bucket>.<cf-account-hash>.r2.cloudflarestorage.com`.
+// The chat renders that URL directly as
+// `<img src="https://…r2.cloudflarestorage.com/…">`, so the host must be in
+// img-src or the browser blocks display (broken thumbnail).
+//
+// The exact bucket + CF account hash are control-plane deploy config, so we
+// cannot hardcode the origin. A deploy MAY pin it via MOLECULE_IMAGE_GEN_R2_HOST
+// (tightest policy); otherwise we use the documented wildcard
+// `https://*.r2.cloudflarestorage.com`.
+//
+// This must stay in sync with canvas/src/middleware.ts buildImgSrc(): the
+// combined tenant image returns BOTH this Go header and the proxied Next.js
+// CSP, and browsers enforce the INTERSECTION of multiple CSP headers — so the
+// generated-image host has to be present in both or it is still blocked.
+//
+// Security: this widens only image *display* (img-src). connect-src is left
+// unchanged, so fetch()/XHR to R2 stays blocked — no exfiltration channel. The
+// URLs are time-boxed, signed GETs of a single object key the agent already
+// holds; rendering them grants no capability beyond viewing the produced image.
+func generatedImageImgSrc() string {
+	r2Host := os.Getenv("MOLECULE_IMAGE_GEN_R2_HOST")
+	if r2Host == "" {
+		r2Host = "https://*.r2.cloudflarestorage.com"
+	}
+	return "img-src 'self' data: blob: " + r2Host + "; "
+}
 
 // apiPrefixes lists the URL path prefixes that are served by Go platform
 // handlers (JSON/binary responses). Canvas-proxied routes (Next.js HTML) are
@@ -94,7 +127,10 @@ func SecurityHeaders() gin.HandlerFunc {
 				"default-src 'self'; "+
 					"script-src 'self' 'unsafe-inline'; "+
 					"style-src 'self' 'unsafe-inline'; "+
-					"img-src 'self' data: blob:; "+
+					// img-src includes the generated-image R2 host so the chat
+					// can render image-gen results (presigned R2 URLs). See
+					// generatedImageImgSrc() for the security rationale.
+					generatedImageImgSrc()+
 					"frame-src 'self' blob:; "+
 					"connect-src 'self' ws: wss:; "+
 					"font-src 'self' data:")

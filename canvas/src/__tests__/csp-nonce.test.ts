@@ -6,8 +6,8 @@
  *
  * Fix: nonce-based script-src in production; permissive only in dev.
  */
-import { describe, it, expect } from "vitest";
-import { buildCsp } from "../middleware";
+import { describe, it, expect, afterEach } from "vitest";
+import { buildCsp, buildImgSrc } from "../middleware";
 
 const TEST_NONCE = "dGVzdC1ub25jZQ=="; // base64("test-nonce")
 
@@ -147,5 +147,52 @@ describe("buildCsp — format invariants", () => {
       expect(imgSrc).toContain("blob:");
       expect(imgSrc).toContain("data:");
     });
+
+    it(`[${label}] allows the generated-image R2 host in img-src`, () => {
+      const imgSrc = csp.match(/img-src[^;]*/)?.[0] ?? "";
+      expect(imgSrc).toContain("r2.cloudflarestorage.com");
+    });
   }
+});
+
+// ---------------------------------------------------------------------------
+// buildImgSrc — generated-image (image-gen socket / R2) host handling
+// ---------------------------------------------------------------------------
+describe("buildImgSrc — generated-image R2 host", () => {
+  afterEach(() => {
+    delete process.env.NEXT_PUBLIC_IMAGE_GEN_R2_HOST;
+  });
+
+  it("keeps self/blob:/data: for the canvas's own assets", () => {
+    const imgSrc = buildImgSrc();
+    expect(imgSrc.startsWith("img-src ")).toBe(true);
+    expect(imgSrc).toContain("'self'");
+    expect(imgSrc).toContain("blob:");
+    expect(imgSrc).toContain("data:");
+  });
+
+  it("defaults to the documented R2 wildcard when no host is pinned", () => {
+    delete process.env.NEXT_PUBLIC_IMAGE_GEN_R2_HOST;
+    expect(buildImgSrc()).toContain("https://*.r2.cloudflarestorage.com");
+  });
+
+  it("uses NEXT_PUBLIC_IMAGE_GEN_R2_HOST when pinned (tightest policy)", () => {
+    const pinned =
+      "https://molecule-workspace-data.deadbeef.r2.cloudflarestorage.com";
+    process.env.NEXT_PUBLIC_IMAGE_GEN_R2_HOST = pinned;
+    const imgSrc = buildImgSrc();
+    expect(imgSrc).toContain(pinned);
+    expect(imgSrc).not.toContain("*.r2.cloudflarestorage.com");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security invariant: connect-src must NOT be widened to R2 (no exfil channel)
+// ---------------------------------------------------------------------------
+describe("buildCsp — connect-src stays narrow (R2 only displayable, not fetchable)", () => {
+  it("does not include any r2.cloudflarestorage.com host in connect-src", () => {
+    const csp = buildCsp(TEST_NONCE, false);
+    const connectSrc = csp.match(/connect-src[^;]*/)?.[0] ?? "";
+    expect(connectSrc).not.toContain("r2.cloudflarestorage.com");
+  });
 });

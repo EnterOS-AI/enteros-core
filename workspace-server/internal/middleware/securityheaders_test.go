@@ -56,7 +56,9 @@ func TestSecurityHeaders(t *testing.T) {
 		"default-src 'self'",
 		"script-src 'self' 'unsafe-inline'",
 		"style-src 'self' 'unsafe-inline'",
-		"img-src 'self' data: blob:",
+		// img-src must allow the generated-image R2 host (default wildcard)
+		// in addition to self/data:/blob: — see generatedImageImgSrc().
+		"img-src 'self' data: blob: https://*.r2.cloudflarestorage.com",
 		"frame-src 'self' blob:",
 		"connect-src 'self' ws: wss:",
 		"font-src 'self' data:",
@@ -201,6 +203,88 @@ func TestCSPCanvasRoutesGetPermissivePolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCSPGeneratedImageHost verifies the canvas CSP allows the generated-image
+// R2 host in img-src (so image-gen results render) WITHOUT widening connect-src
+// (no exfiltration channel). Covers both the default wildcard and a pinned host
+// via MOLECULE_IMAGE_GEN_R2_HOST.
+func TestCSPGeneratedImageHost(t *testing.T) {
+	t.Run("default wildcard", func(t *testing.T) {
+		t.Setenv("MOLECULE_IMAGE_GEN_R2_HOST", "")
+		r := gin.New()
+		r.Use(SecurityHeaders())
+		r.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "<html/>") })
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(w, req)
+
+		csp := w.Header().Get("Content-Security-Policy")
+		imgSrc := cspDirective(csp, "img-src")
+		if !strings.Contains(imgSrc, "https://*.r2.cloudflarestorage.com") {
+			t.Errorf("img-src should allow R2 wildcard for generated images, got %q", imgSrc)
+		}
+		// img-src must still keep self/data:/blob: for canvas's own assets.
+		for _, want := range []string{"'self'", "data:", "blob:"} {
+			if !strings.Contains(imgSrc, want) {
+				t.Errorf("img-src missing %q, got %q", want, imgSrc)
+			}
+		}
+		// connect-src must NOT be widened to R2 — fetch()/XHR to R2 stays blocked.
+		connectSrc := cspDirective(csp, "connect-src")
+		if strings.Contains(connectSrc, "r2.cloudflarestorage.com") {
+			t.Errorf("connect-src must NOT include R2 (no exfil channel), got %q", connectSrc)
+		}
+	})
+
+	t.Run("pinned host", func(t *testing.T) {
+		const pinned = "https://molecule-workspace-data.deadbeef.r2.cloudflarestorage.com"
+		t.Setenv("MOLECULE_IMAGE_GEN_R2_HOST", pinned)
+		r := gin.New()
+		r.Use(SecurityHeaders())
+		r.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "<html/>") })
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(w, req)
+
+		imgSrc := cspDirective(w.Header().Get("Content-Security-Policy"), "img-src")
+		if !strings.Contains(imgSrc, pinned) {
+			t.Errorf("img-src should use the pinned R2 host, got %q", imgSrc)
+		}
+		if strings.Contains(imgSrc, "*.r2.cloudflarestorage.com") {
+			t.Errorf("img-src should NOT fall back to wildcard when pinned, got %q", imgSrc)
+		}
+	})
+
+	t.Run("api routes stay strict", func(t *testing.T) {
+		t.Setenv("MOLECULE_IMAGE_GEN_R2_HOST", "")
+		r := gin.New()
+		r.Use(SecurityHeaders())
+		r.GET("/workspaces/abc", func(c *gin.Context) { c.JSON(http.StatusOK, nil) })
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/workspaces/abc", nil)
+		r.ServeHTTP(w, req)
+
+		csp := w.Header().Get("Content-Security-Policy")
+		if csp != "default-src 'self'" {
+			t.Errorf("API route must keep strict CSP (no R2 host), got %q", csp)
+		}
+	})
+}
+
+// cspDirective extracts the single directive (e.g. "img-src ...") from a CSP
+// header value, or "" if absent.
+func cspDirective(csp, name string) string {
+	for _, d := range strings.Split(csp, ";") {
+		d = strings.TrimSpace(d)
+		if strings.HasPrefix(d, name+" ") || d == name {
+			return d
+		}
+	}
+	return ""
 }
 
 // TestSecurityHeaders_614_NosniffOnSSEAndAPIEndpoints is the acceptance test for
