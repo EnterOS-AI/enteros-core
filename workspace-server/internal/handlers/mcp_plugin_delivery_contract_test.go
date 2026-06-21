@@ -35,6 +35,32 @@ func TestMCPPluginDeliveryContract_MatchesSSOT(t *testing.T) {
 	if c.Consumer != "claude_sdk_executor._load_settings_mcp" {
 		t.Errorf("consumer = %q, want claude_sdk_executor._load_settings_mcp", c.Consumer)
 	}
+	if c.MCPServerName != "molecule-platform" {
+		t.Errorf("mcp_server_name = %q, want molecule-platform", c.MCPServerName)
+	}
+}
+
+// TestSSOT_DegradeGateToolDerivesFromContract enforces that the online/degraded
+// gate's expected platform tool id is DERIVED from the contract's
+// mcp_server_name (the SSOT), not an independent hardcode. If the contract's
+// server name changes (or the constant drifts), this fails — preventing the
+// class of bug where the gate looked for mcp__molecule-platform__create_workspace
+// while the runtime (mcp_servers.yaml name: platform) emitted
+// mcp__platform__create_workspace, marking every concierge degraded.
+func TestSSOT_DegradeGateToolDerivesFromContract(t *testing.T) {
+	c, err := LoadMCPPluginDeliveryContract()
+	if err != nil {
+		t.Fatalf("load contract: %v", err)
+	}
+	if c.MCPServerName == "" {
+		t.Fatal("contract mcp_server_name is empty — SSOT for the platform MCP tool prefix")
+	}
+	want := "mcp__" + c.MCPServerName + "__create_workspace"
+	if conciergePlatformMCPCreateWorkspaceTool != want {
+		t.Errorf("SSOT drift: conciergePlatformMCPCreateWorkspaceTool = %q, but contract mcp_server_name = %q implies %q.\n"+
+			"The degraded gate must look for the tool id the runtime actually emits (mcp__<server>__create_workspace).",
+			conciergePlatformMCPCreateWorkspaceTool, c.MCPServerName, want)
+	}
 }
 
 // TestMCPPluginDeliveryContract_LoadableFromRepoRoot guards against a moved
