@@ -543,17 +543,27 @@ jobs:
           echo "::notice::Smoke gate (A: FULL ENV) PASSED: memory-plugin /v1/health=200 on :9100 in ~${j}s"
           docker rm -f "${SMOKE_NAME_FULL}" >/dev/null 2>&1
 
-          # --- (B) SIDECAR-DISABLED smoke: bare-equivalent path --------------
-          # Verifies the "sidecar off" boot path still works (no
-          # DATABASE_URL, MEMORY_PLUGIN_DISABLE=1 — entrypoint skips the
-          # sidecar branch entirely, just like a self-hosted tenant
-          # without the memory v2 stack).
-          echo "::notice::Smoke gate (B: SIDECAR-DISABLED): starting ${SMOKE_NAME_BARE}"
+          # --- (B) MEMORY-PLUGIN-DISABLED smoke: core infra ON, sidecar OFF ---
+          # The tenant ALWAYS needs core Postgres + Redis — cmd/server/main.go
+          # log.Fatals on Postgres init (dial :5432) and Redis init (dial :6379)
+          # regardless of mode; ONLY the memory-plugin sidecar is truly optional.
+          # So this variant reuses the FULL-ENV pgvector + redis sidecars (still
+          # running — only SMOKE_NAME_FULL was removed) and just sets
+          # MEMORY_PLUGIN_DISABLE=1 with no memory-plugin sidecar — i.e. a
+          # self-hosted tenant WITHOUT the memory v2 stack, but WITH its core
+          # Postgres + Redis. Providing no DB at all made /health hang at 000
+          # forever ("Postgres init failed: dial tcp [::1]:5432 connection
+          # refused"). DATABASE_URL/REDIS_URL use the sidecar DNS names on the
+          # user-defined network so the tenant resolves IPv4 (not [::1]).
+          echo "::notice::Smoke gate (B: MEMORY-PLUGIN-DISABLED): starting ${SMOKE_NAME_BARE}"
           docker run -d --rm \
             --name "${SMOKE_NAME_BARE}" \
+            --network "${SMOKE_NET}" \
             -p 18081:8080 \
             -e PORT=8080 \
             -e MOLECULE_TENANT_MODE=smoke \
+            -e DATABASE_URL="postgres://smoke:smoketest@${PGV_NAME}:5432/smoke?sslmode=disable" \
+            -e REDIS_URL="redis://${REDIS_NAME}:6379/0" \
             -e MEMORY_PLUGIN_DISABLE=1 \
             "${TENANT_IMAGE_NAME}:${TAG_SHA}" >/dev/null
 
