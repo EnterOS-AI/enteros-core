@@ -343,7 +343,7 @@ func TestWorkspaceCreate_DBInsertError(t *testing.T) {
 	// Transaction begins, workspace INSERT fails, transaction is rolled back.
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Failing Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Failing Agent", nil, 3, "claude-code", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnError(sql.ErrConnDone)
 	mock.ExpectRollback()
 
@@ -376,7 +376,7 @@ func TestWorkspaceCreate_DefaultsApplied(t *testing.T) {
 	// Expect workspace INSERT with defaulted tier=3 (Privileged — the
 	// handler default in workspace.go), runtime="claude-code"
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Default Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Default Agent", nil, 3, "claude-code", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO workspace_secrets").
@@ -428,7 +428,7 @@ func TestWorkspaceCreate_SaaSHardForcesTier4(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "SaaS External Agent", nil, 4, "external", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "SaaS External Agent", nil, 4, "external", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -472,7 +472,7 @@ func TestWorkspaceCreate_WithSecrets_Persists(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "External Agent", nil, 3, "external", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "External Agent", nil, 3, "external", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// Secret inserted inside the same transaction.
 	mock.ExpectExec("INSERT INTO workspace_secrets").
@@ -597,7 +597,7 @@ func TestWorkspaceCreate_ExternalURL_SSRFSafe(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Ext Agent", nil, 3, "external", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Ext Agent", nil, 3, "external", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	// External URL update (localhost is explicitly allowed by validateAgentURL).
@@ -637,7 +637,7 @@ func TestWorkspaceCreate_KimiRuntime_PreservesLabel(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Kimi Agent", nil, 3, "kimi", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Kimi Agent", nil, 3, "kimi", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	// Pre-register flow: awaiting_agent + runtime preserved as "kimi"
@@ -702,7 +702,7 @@ func TestWorkspaceCreate_ExternalFlagDefaultsRuntimeExternal(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "External Agent", nil, 3, "external", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "External Agent", nil, 3, "external", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("UPDATE workspaces SET status").
@@ -1818,7 +1818,7 @@ runtime_config:
 	// and hand the completed values to the INSERT.
 	mock.ExpectExec("INSERT INTO workspaces").
 		WithArgs(
-			sqlmock.AnyArg(), "Hermes Agent", nil, 3, "hermes",
+			sqlmock.AnyArg(), "Hermes Agent", nil, 3, "hermes", "hermes-template",
 			(*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
@@ -1877,7 +1877,7 @@ model: moonshot/kimi-k2.5
 	// this assertion should flip back to 1.
 	mock.ExpectExec("INSERT INTO workspaces").
 		WithArgs(
-			sqlmock.AnyArg(), "Legacy Agent", nil, 3, "hermes",
+			sqlmock.AnyArg(), "Legacy Agent", nil, 3, "hermes", "legacy-template",
 			(*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
@@ -1934,7 +1934,7 @@ runtime_config:
 	// absence of a handler error to mean the model passthrough was honored.
 	mock.ExpectExec("INSERT INTO workspaces").
 		WithArgs(
-			sqlmock.AnyArg(), "Custom Hermes", nil, 3, "hermes",
+			sqlmock.AnyArg(), "Custom Hermes", nil, 3, "hermes", "hermes-template",
 			(*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
@@ -2232,7 +2232,7 @@ func TestWorkspaceCreate_188_ExplicitRuntimeNoTemplate_OK(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Explicit Codex", nil, 3, "codex", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Explicit Codex", nil, 3, "codex", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").

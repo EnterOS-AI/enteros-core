@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -748,6 +749,113 @@ func TestUpdate_Runtime_ModelUnresolved_SkipsCheckAndProceeds(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 (unresolved model → skip check, proceed), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPatchTemplate pins the admin/CP-gated PATCH /workspaces/:id/template endpoint.
+func TestPatchTemplate(t *testing.T) {
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+	// Wire a temp manifest so seo-agent is a known template.
+	dir := t.TempDir()
+	manifestPath := dir + "/manifest.json"
+	manifest := `{"workspace_templates": [{"name": "seo-agent", "repo": "molecule-ai/t-seo", "ref": "main"}]}`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	t.Setenv("WORKSPACE_MANIFEST_PATH", manifestPath)
+	initTemplateRepoByName()
+
+	mock, r := setupWorkspaceCrudTest(t)
+	h := newWorkspaceCrudHandler(t)
+	r.PATCH("/workspaces/:id/template", h.PatchTemplate)
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec(`UPDATE workspaces SET template = \$2, updated_at = now\(\) WHERE id = \$1`).
+		WithArgs(wsID, "seo-agent").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	body := map[string]interface{}{"template": "seo-agent"}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PATCH", "/workspaces/"+wsID+"/template", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp["status"] != "updated" {
+		t.Errorf("expected status=updated, got %v", resp["status"])
+	}
+	if resp["needs_restart"] != true {
+		t.Errorf("expected needs_restart=true, got %v", resp["needs_restart"])
+	}
+}
+
+func TestPatchTemplate_UnknownTemplate_Fails422(t *testing.T) {
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+	dir := t.TempDir()
+	manifestPath := dir + "/manifest.json"
+	manifest := `{"workspace_templates": [{"name": "seo-agent", "repo": "r", "ref": "main"}]}`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	t.Setenv("WORKSPACE_MANIFEST_PATH", manifestPath)
+	initTemplateRepoByName()
+
+	_, r := setupWorkspaceCrudTest(t)
+	h := newWorkspaceCrudHandler(t)
+	r.PATCH("/workspaces/:id/template", h.PatchTemplate)
+
+	body := map[string]interface{}{"template": "ghost-template"}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PATCH", "/workspaces/"+wsID+"/template", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPatchTemplate_NotFound_Fails404(t *testing.T) {
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+	dir := t.TempDir()
+	manifestPath := dir + "/manifest.json"
+	manifest := `{"workspace_templates": [{"name": "seo-agent", "repo": "r", "ref": "main"}]}`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	t.Setenv("WORKSPACE_MANIFEST_PATH", manifestPath)
+	initTemplateRepoByName()
+
+	mock, r := setupWorkspaceCrudTest(t)
+	h := newWorkspaceCrudHandler(t)
+	r.PATCH("/workspaces/:id/template", h.PatchTemplate)
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+
+	body := map[string]interface{}{"template": "seo-agent"}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PATCH", "/workspaces/"+wsID+"/template", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

@@ -385,7 +385,7 @@ func TestWorkspaceCreate(t *testing.T) {
 	// Default tier is 3 (Privileged) — see workspace.go create-handler comment.
 	// delivery_mode defaults to "push" when payload omits it (#2339).
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "claude-code", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect transaction commit (no secrets in this payload)
@@ -464,7 +464,7 @@ func TestWorkspaceCreate_ReturnsAuthToken_201(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Token Holder", nil, 3, "claude-code", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Token Holder", nil, 3, "claude-code", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").

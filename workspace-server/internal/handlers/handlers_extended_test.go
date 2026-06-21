@@ -190,7 +190,7 @@ func TestExtended_WorkspaceRestart_NoProvisioner(t *testing.T) {
 	// Expect SELECT for workspace existence check (includes runtime column)
 	mock.ExpectQuery("SELECT status, name, tier").
 		WithArgs("ws-restart").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).AddRow("offline", "Restarting Agent", 1, "claude-code"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime", "template"}).AddRow("offline", "Restarting Agent", 1, "claude-code", ""))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

@@ -112,6 +112,7 @@ const (
 type WorkspaceConfig struct {
 	WorkspaceID      string
 	TemplatePath     string            // Host path to template dir to copy from (e.g. claude-code-default/)
+        Template         string            // RFC #2948 Phase 1: installed template name, distinct from engine runtime.
 	TemplateIdentity string            // RFC #2843 #24: opaque token the TemplateAssetFetcher resolves to the template repo+ref (e.g. "claudius-v1.2.3" or a sha). Used by SaaS; ignored by the local-dir TemplatePath path.
 	ConfigFiles      map[string][]byte // Generated config files to write into /configs volume
 	PluginsPath      string            // Host path to plugins directory (mounted at /plugins)

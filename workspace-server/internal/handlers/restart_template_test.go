@@ -54,7 +54,7 @@ func TestResolveRestartTemplate_DefaultRestart_PreservesVolume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	path, label := resolveRestartTemplate(root, "Hermes Agent", "hermes", restartTemplateInput{
+	path, label := resolveRestartTemplate(root, "Hermes Agent", "hermes", "", restartTemplateInput{
 		// ApplyTemplate intentionally omitted — this is the default restart.
 	})
 	if path != "" {
@@ -71,7 +71,7 @@ func TestResolveRestartTemplate_DefaultRestart_PreservesVolume(t *testing.T) {
 func TestResolveRestartTemplate_ExplicitTemplate_AlwaysHonoured(t *testing.T) {
 	root := newTemplateDir(t, "claude-code")
 
-	path, label := resolveRestartTemplate(root, "Some Agent", "", restartTemplateInput{
+	path, label := resolveRestartTemplate(root, "Some Agent", "", "", restartTemplateInput{
 		Template: "claude-code",
 	})
 	if path == "" || label != "claude-code" {
@@ -85,7 +85,7 @@ func TestResolveRestartTemplate_ExplicitTemplate_AlwaysHonoured(t *testing.T) {
 func TestResolveRestartTemplate_ApplyTemplate_NameMatch(t *testing.T) {
 	root := newTemplateDir(t, "hermes")
 
-	path, label := resolveRestartTemplate(root, "Hermes", "", restartTemplateInput{
+	path, label := resolveRestartTemplate(root, "Hermes", "", "", restartTemplateInput{
 		ApplyTemplate: true,
 	})
 	if path == "" || label != "hermes" {
@@ -100,7 +100,7 @@ func TestResolveRestartTemplate_ApplyTemplate_NameMatch(t *testing.T) {
 func TestResolveRestartTemplate_ApplyTemplate_RuntimeDefault(t *testing.T) {
 	root := newTemplateDir(t, "hermes-default")
 
-	path, label := resolveRestartTemplate(root, "Some Workspace", "hermes", restartTemplateInput{
+	path, label := resolveRestartTemplate(root, "Some Workspace", "hermes", "", restartTemplateInput{
 		ApplyTemplate: true,
 	})
 	if path == "" || label != "hermes-default" {
@@ -179,7 +179,7 @@ func TestRestartRuntimeFromConfig_DefaultRestartPreservesContainerRuntime(t *tes
 func TestResolveRestartTemplate_ApplyTemplate_NoMatch_NoRuntime(t *testing.T) {
 	root := newTemplateDir(t) // empty templates dir
 
-	path, label := resolveRestartTemplate(root, "Orphan", "", restartTemplateInput{
+	path, label := resolveRestartTemplate(root, "Orphan", "", "", restartTemplateInput{
 		ApplyTemplate: true,
 	})
 	if path != "" {
@@ -197,7 +197,7 @@ func TestResolveRestartTemplate_ApplyTemplate_NoMatch_NoRuntime(t *testing.T) {
 func TestResolveRestartTemplate_InvalidExplicitTemplate_ProceedsWithout(t *testing.T) {
 	root := newTemplateDir(t, "claude-code")
 
-	path, label := resolveRestartTemplate(root, "Some Agent", "", restartTemplateInput{
+	path, label := resolveRestartTemplate(root, "Some Agent", "", "", restartTemplateInput{
 		Template: "../../etc/passwd",
 	})
 	if path != "" {
@@ -214,7 +214,7 @@ func TestResolveRestartTemplate_InvalidExplicitTemplate_ProceedsWithout(t *testi
 func TestResolveRestartTemplate_NonExistentExplicitTemplate(t *testing.T) {
 	root := newTemplateDir(t, "claude-code")
 
-	path, label := resolveRestartTemplate(root, "Some Agent", "", restartTemplateInput{
+	path, label := resolveRestartTemplate(root, "Some Agent", "", "", restartTemplateInput{
 		Template: "deleted-template",
 	})
 	if path != "" {
@@ -232,7 +232,7 @@ func TestResolveRestartTemplate_NonExistentExplicitTemplate(t *testing.T) {
 func TestResolveRestartTemplate_Priority_ExplicitBeatsApplyTemplate(t *testing.T) {
 	root := newTemplateDir(t, "hermes", "claude-code")
 
-	path, label := resolveRestartTemplate(root, "Hermes", "", restartTemplateInput{
+	path, label := resolveRestartTemplate(root, "Hermes", "", "", restartTemplateInput{
 		Template:      "claude-code",
 		ApplyTemplate: true,
 	})
@@ -279,7 +279,7 @@ func TestResolveRestartTemplate_CWE22_TraversalRuntime_FallsThrough(t *testing.T
 		{"deep traversal", "a/b/c/../../../d"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			path, label := resolveRestartTemplate(root, "Some Workspace", tc.dbRuntime, restartTemplateInput{
+			path, label := resolveRestartTemplate(root, "Some Workspace", tc.dbRuntime, "", restartTemplateInput{
 				ApplyTemplate: true,
 			})
 			// Must NOT return a path that escapes root
@@ -300,7 +300,7 @@ func TestResolveRestartTemplate_CWE22_TraversalRuntime_FallsThrough(t *testing.T
 func TestResolveRestartTemplate_CWE22_TraversalRuntime_CannotOverrideKnownRuntime(t *testing.T) {
 	root := newTemplateDir(t, "claude-code-default")
 
-	path, label := resolveRestartTemplate(root, "Some Workspace", "../../../etc", restartTemplateInput{
+	path, label := resolveRestartTemplate(root, "Some Workspace", "../../../etc", "", restartTemplateInput{
 		ApplyTemplate: true,
 	})
 	// Must resolve to claude-code-default (the safe default after sanitizeRuntime),
@@ -313,3 +313,56 @@ func TestResolveRestartTemplate_CWE22_TraversalRuntime_CannotOverrideKnownRuntim
 		t.Errorf("label must be claude-code-default; got %q", label)
 	}
 }
+
+// TestResolveRestartTemplate_PersistedTemplate_FallsBack verifies that a
+// workspace with a non-empty DB template uses that template on a plain
+// restart when no body template or apply/rebuild flags are supplied.
+// Regression test for core#2980 review feedback.
+func TestResolveRestartTemplate_PersistedTemplate_FallsBack(t *testing.T) {
+	root := newTemplateDir(t, "seo-agent")
+
+	path, label := resolveRestartTemplate(root, "Some Workspace", "claude-code", "seo-agent", restartTemplateInput{
+		// no body.Template, no ApplyTemplate, no RebuildConfig
+	})
+	expected := filepath.Join(root, "seo-agent")
+	if path != expected {
+		t.Errorf("persisted template fallback: expected path %q, got %q", expected, path)
+	}
+	if label != "seo-agent" {
+		t.Errorf("persisted template fallback: expected label %q, got %q", "seo-agent", label)
+	}
+}
+
+// TestResolveRestartTemplate_PersistedTemplate_EmptyPreservesVolume verifies
+// that workspaces with an empty DB template still reuse the existing config
+// volume on a plain restart.
+func TestResolveRestartTemplate_PersistedTemplate_EmptyPreservesVolume(t *testing.T) {
+	root := newTemplateDir(t, "seo-agent")
+
+	path, label := resolveRestartTemplate(root, "Some Workspace", "claude-code", "", restartTemplateInput{})
+	if path != "" {
+		t.Errorf("empty persisted template must preserve volume; got path=%q", path)
+	}
+	if label != "existing-volume" {
+		t.Errorf("empty persisted template must fall back to existing-volume; got label=%q", label)
+	}
+}
+
+// TestResolveRestartTemplate_ExplicitBodyTemplateOverridesPersistedTemplate
+// verifies that a template named in the request body still wins over the
+// stored template.
+func TestResolveRestartTemplate_ExplicitBodyTemplateOverridesPersistedTemplate(t *testing.T) {
+	root := newTemplateDir(t, "seo-agent", "hermes")
+
+	path, label := resolveRestartTemplate(root, "Some Workspace", "claude-code", "seo-agent", restartTemplateInput{
+		Template: "hermes",
+	})
+	expected := filepath.Join(root, "hermes")
+	if path != expected {
+		t.Errorf("explicit body template must win; expected path %q, got %q", expected, path)
+	}
+	if label != "hermes" {
+		t.Errorf("explicit body template must win; expected label %q, got %q", "hermes", label)
+	}
+}
+

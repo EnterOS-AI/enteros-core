@@ -223,22 +223,93 @@ func TestTemplateIdentityForRuntime(t *testing.T) {
 	}
 }
 
-// TestTemplateIdentityForRuntimeOrEmpty pins the
-// single-expression wrapper used at the call site in
-// buildProvisionerConfig.
-func TestTemplateIdentityForRuntimeOrEmpty(t *testing.T) {
+// TestTemplateIdentityOrEmpty pins the single-expression wrapper used at the
+// call site in buildProvisionerConfig.
+func TestTemplateIdentityOrEmpty(t *testing.T) {
 	if manifestPath() == "" {
 		t.Skip("manifest.json not discoverable from this test cwd")
 	}
 	initTemplateRepoByName()
-	if got := templateIdentityForRuntimeOrEmpty("claude-code"); got == "" {
+	if got := templateIdentityOrEmpty(resolveTemplateIdentity("", "claude-code")); got == "" {
 		t.Error("claude-code should return a non-empty identity")
 	}
-	if got := templateIdentityForRuntimeOrEmpty("external"); got != "" {
+	if got := templateIdentityOrEmpty(resolveTemplateIdentity("", "external")); got != "" {
 		t.Errorf("external should return empty, got %q", got)
 	}
-	if got := templateIdentityForRuntimeOrEmpty("unknown-xyz"); got != "" {
+	if got := templateIdentityOrEmpty(resolveTemplateIdentity("", "unknown-xyz")); got != "" {
 		t.Errorf("unknown-xyz should return empty, got %q", got)
+	}
+	// Phase 1: explicit template wins over runtime fallback.
+	if got := templateIdentityOrEmpty(resolveTemplateIdentity("claude-code", "external")); got == "" {
+		t.Error("explicit claude-code template should return a non-empty identity even when runtime is external")
+	}
+	if got := templateIdentityOrEmpty(resolveTemplateIdentity("unknown-template-xyz", "claude-code")); got != "" {
+		t.Errorf("unknown explicit template should fail-closed to empty, got %q", got)
+	}
+}
+
+// TestResolveTemplateIdentity pins the Phase 1 template-first resolver.
+func TestResolveTemplateIdentity(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "manifest.json")
+	manifest := `{
+		"workspace_templates": [
+			{"name": "claude-code-default", "repo": "molecule-ai/t-cc", "ref": "main"},
+			{"name": "seo-agent", "repo": "molecule-ai/t-seo", "ref": "v1"},
+			{"name": "hermes", "repo": "molecule-ai/t-hermes", "ref": "v2"}
+		]
+	}`
+	if err := os.WriteFile(p, []byte(manifest), 0600); err != nil {
+		t.Fatalf("write temp manifest: %v", err)
+	}
+	t.Setenv("WORKSPACE_MANIFEST_PATH", p)
+	initTemplateRepoByName()
+
+	cases := []struct {
+		name     string
+		template string
+		runtime  string
+		wantOk   bool
+		wantRepo string
+	}{
+		{"template wins", "seo-agent", "claude-code", true, "molecule-ai/t-seo@v1"},
+		{"template empty falls back to runtime", "", "claude-code", true, "molecule-ai/t-cc@main"},
+		{"template empty external returns empty", "", "external", false, ""},
+		{"unknown explicit template fail-closed", "no-such-template", "claude-code", false, ""},
+		{"unknown runtime empty", "", "no-such-runtime", false, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			id, ok := resolveTemplateIdentity(c.template, c.runtime)
+			if ok != c.wantOk {
+				t.Fatalf("template=%q runtime=%q: want ok=%v, got ok=%v", c.template, c.runtime, c.wantOk, ok)
+			}
+			if id != c.wantRepo {
+				t.Errorf("template=%q runtime=%q: want id=%q, got %q", c.template, c.runtime, c.wantRepo, id)
+			}
+		})
+	}
+}
+
+// TestIsKnownTemplate pins the manifest-entry gate used by PATCH /template.
+func TestIsKnownTemplate(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "manifest.json")
+	manifest := `{"workspace_templates": [{"name": "seo-agent", "repo": "r", "ref": "main"}]}`
+	if err := os.WriteFile(p, []byte(manifest), 0600); err != nil {
+		t.Fatalf("write temp manifest: %v", err)
+	}
+	t.Setenv("WORKSPACE_MANIFEST_PATH", p)
+	initTemplateRepoByName()
+
+	if isKnownTemplate("") {
+		t.Error("empty template should not be known")
+	}
+	if !isKnownTemplate("seo-agent") {
+		t.Error("seo-agent should be known")
+	}
+	if isKnownTemplate("ghost") {
+		t.Error("ghost template should not be known")
 	}
 }
 
@@ -309,7 +380,7 @@ func TestInitTemplateRepoByName_PopulatesMap_FromTempManifest(t *testing.T) {
 
 	// Assert the map is populated for the shipped runtimes.
 	cases := []struct {
-		runtime string
+		runtime  string
 		wantRepo string
 		wantRef  string
 	}{

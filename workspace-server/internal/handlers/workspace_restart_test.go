@@ -78,8 +78,8 @@ func TestRestartHandler_RemovedWorkspaceReturns404(t *testing.T) {
 
 	mock.ExpectQuery("SELECT status, name, tier, COALESCE").
 		WithArgs("ws-removed").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).
-			AddRow("removed", "Removed Agent", 1, "claude-code"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime", "template"}).
+			AddRow("removed", "Removed Agent", 1, "claude-code", ""))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -106,8 +106,8 @@ func TestRestartHandler_AncestorPausedBlocksRestart(t *testing.T) {
 	// Lookup workspace
 	mock.ExpectQuery("SELECT status, name, tier, COALESCE").
 		WithArgs("ws-grandchild").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).
-			AddRow("offline", "Grandchild Agent", 1, "claude-code"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime", "template"}).
+			AddRow("offline", "Grandchild Agent", 1, "claude-code", ""))
 
 	// isParentPaused: get parent_id of grandchild -> child
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
@@ -163,8 +163,8 @@ func TestRestartHandler_ExternalRuntimeNoOps(t *testing.T) {
 
 	mock.ExpectQuery("SELECT status, name, tier, COALESCE").
 		WithArgs("ws-external").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).
-			AddRow("offline", "External Agent", 1, "external"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime", "template"}).
+			AddRow("offline", "External Agent", 1, "external", ""))
 
 	// isParentPaused: no parent
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
@@ -214,8 +214,8 @@ func TestRestartHandler_KimiRuntimeNoOps(t *testing.T) {
 
 	mock.ExpectQuery("SELECT status, name, tier, COALESCE").
 		WithArgs("ws-kimi").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).
-			AddRow("offline", "Kimi Agent", 1, "kimi-cli"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime", "template"}).
+			AddRow("offline", "Kimi Agent", 1, "kimi-cli", ""))
 
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
 		WithArgs("ws-kimi").
@@ -259,8 +259,8 @@ func TestRestartHandler_NilProvisionerReturns503(t *testing.T) {
 
 	mock.ExpectQuery("SELECT status, name, tier, COALESCE").
 		WithArgs("ws-no-prov").
-		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime"}).
-			AddRow("offline", "Test Agent", 1, "claude-code"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "name", "tier", "runtime", "template"}).
+			AddRow("offline", "Test Agent", 1, "claude-code", ""))
 
 	// isParentPaused: no parent
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
@@ -528,8 +528,8 @@ func TestResumeHandler_NilProvisionerReturns503(t *testing.T) {
 
 	mock.ExpectQuery("SELECT name, tier, COALESCE").
 		WithArgs("ws-resume-noprov").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime"}).
-			AddRow("Test Agent", 1, "claude-code"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime", "template"}).
+			AddRow("Test Agent", 1, "claude-code", ""))
 
 	// provisioner nil check happens BEFORE isParentPaused, so no parent query expected
 
@@ -562,8 +562,8 @@ func TestResumeHandler_DescendantsNoCascadeReturns409(t *testing.T) {
 
 	mock.ExpectQuery("SELECT name, tier, COALESCE").
 		WithArgs("ws-resume-parent").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime"}).
-			AddRow("Parent Agent", 1, "claude-code"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime", "template"}).
+			AddRow("Parent Agent", 1, "claude-code", ""))
 
 	// isParentPaused: no parent
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
@@ -572,9 +572,9 @@ func TestResumeHandler_DescendantsNoCascadeReturns409(t *testing.T) {
 
 	mock.ExpectQuery("WITH RECURSIVE descendants").
 		WithArgs("ws-resume-parent").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "tier", "runtime"}).
-			AddRow("ws-child-1", "Child 1", 1, "claude-code").
-			AddRow("ws-child-2", "Child 2", 1, "claude-code"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "tier", "runtime", "template"}).
+			AddRow("ws-child-1", "Child 1", 1, "claude-code", "").
+			AddRow("ws-child-2", "Child 2", 1, "claude-code", ""))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -610,8 +610,8 @@ func TestResumeHandler_DescendantsWithCascadeReturns200(t *testing.T) {
 
 	mock.ExpectQuery("SELECT name, tier, COALESCE").
 		WithArgs("ws-resume-parent-cascade").
-		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime"}).
-			AddRow("Parent Agent", 1, "claude-code"))
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "runtime", "template"}).
+			AddRow("Parent Agent", 1, "claude-code", ""))
 
 	// isParentPaused: no parent
 	mock.ExpectQuery("SELECT parent_id FROM workspaces WHERE id =").
@@ -620,9 +620,9 @@ func TestResumeHandler_DescendantsWithCascadeReturns200(t *testing.T) {
 
 	mock.ExpectQuery("WITH RECURSIVE descendants").
 		WithArgs("ws-resume-parent-cascade").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "tier", "runtime"}).
-			AddRow("ws-child-1", "Child 1", 1, "claude-code").
-			AddRow("ws-child-2", "Child 2", 1, "claude-code"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "tier", "runtime", "template"}).
+			AddRow("ws-child-1", "Child 1", 1, "claude-code", "").
+			AddRow("ws-child-2", "Child 2", 1, "claude-code", ""))
 
 	for _, wsID := range []string{"ws-resume-parent-cascade", "ws-child-1", "ws-child-2"} {
 		mock.ExpectExec("UPDATE workspaces SET status =").

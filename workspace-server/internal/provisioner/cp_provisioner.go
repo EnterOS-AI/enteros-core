@@ -159,6 +159,7 @@ type cpProvisionRequest struct {
 	OrgID        string `json:"org_id"`
 	WorkspaceID  string `json:"workspace_id"`
 	Runtime      string `json:"runtime"`
+	Template     string `json:"template,omitempty"`
 	Tier         int    `json:"tier"`
 	InstanceType string `json:"instance_type,omitempty"`
 	DiskGB       int32  `json:"disk_gb,omitempty"`
@@ -295,6 +296,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		OrgID:           p.orgID,
 		WorkspaceID:     cfg.WorkspaceID,
 		Runtime:         cfg.Runtime,
+		Template:        cfg.Template,
 		Tier:            cfg.Tier,
 		InstanceType:    cfg.InstanceType,
 		DiskGB:          cfg.DiskGB,

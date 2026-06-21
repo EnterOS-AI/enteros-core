@@ -527,6 +527,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		budgeth := handlers.NewBudgetHandler()
 		wsAuth.GET("/budget", budgeth.GetBudget)
 		r.PATCH("/workspaces/:id/budget", middleware.AdminAuth(db.DB), budgeth.PatchBudget)
+		r.PATCH("/workspaces/:id/template", middleware.AdminAuth(db.DB), wh.PatchTemplate)
 
 		// Token management (user-facing create/list/revoke)
 		tokh := handlers.NewTokenHandler()
