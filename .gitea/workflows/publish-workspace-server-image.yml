@@ -280,11 +280,21 @@ jobs:
           aws ecr get-login-password --region us-east-2 | \
             docker login --username AWS --password-stdin "${STAGING_ECR_REGISTRY}"
 
+          # build_tags is the buildx-argv form (--tag, ref, --tag, ref) so we
+          # can pass "${build_tags[@]}" to `docker buildx build`. The push
+          # loop below needs the image refs WITHOUT the --tag flag, so we
+          # also build a parallel list of bare image refs.
           build_tags=(
             --tag "${TENANT_IMAGE_NAME}:${TAG_SHA}"
             --tag "${TENANT_IMAGE_NAME}:${TAG_LATEST}"
             --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_SHA}"
             --tag "${STAGING_TENANT_IMAGE_NAME}:${TAG_LATEST}"
+          )
+          push_refs=(
+            "${TENANT_IMAGE_NAME}:${TAG_SHA}"
+            "${TENANT_IMAGE_NAME}:${TAG_LATEST}"
+            "${STAGING_TENANT_IMAGE_NAME}:${TAG_SHA}"
+            "${STAGING_TENANT_IMAGE_NAME}:${TAG_LATEST}"
           )
 
           # Retry loop: buildkit EOF (internal#2468) is often transient on the
@@ -515,10 +525,16 @@ jobs:
           # Smoke passed — push the loaded image to ECR with all 4 tags. If any
           # push fails, the build fails (--load already in the daemon, so this
           # is a fast network-only operation).
-          for t in "${build_tags[@]}"; do
-            tag_value="${t#--tag }"
-            echo "::notice::Pushing ${tag_value}"
-            docker push "${tag_value}"
+          #
+          # CR2 RC 12948 / Researcher RC 12946: previous version iterated
+          # build_tags (the buildx --tag, ref alternating argv) which
+          # produced `docker push --tag` on the first iteration and
+          # failed before any image reached ECR. The fix: iterate the
+          # parallel push_refs list which holds only the bare image
+          # refs (no --tag flag).
+          for ref in "${push_refs[@]}"; do
+            echo "::notice::Pushing ${ref}"
+            docker push "${ref}"
           done
 
   # Staging auto-deploy: every workspace-server image publish on main should
