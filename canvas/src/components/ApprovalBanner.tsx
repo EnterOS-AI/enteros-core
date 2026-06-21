@@ -71,9 +71,13 @@ export function ApprovalBanner() {
             </div>
             <div className="flex-1 min-w-0">
               <div className="text-xs text-amber-200 font-semibold">{approval.workspace_name} needs approval</div>
-              <div className="text-sm text-amber-100 mt-0.5 font-medium">{approval.action}</div>
+              {/* Clamp action + reason: agents can author very long messages,
+                  and unclamped these sprawled the banner into a full-canvas
+                  text column. line-clamp works here (plain-text fields, not
+                  markdown). break-words handles long unbroken tokens. */}
+              <div className="text-sm text-amber-100 mt-0.5 font-medium line-clamp-2 break-words">{approval.action}</div>
               {approval.reason && (
-                <div className="text-xs text-warm/70 mt-1">{approval.reason}</div>
+                <div className="text-xs text-warm/70 mt-1 line-clamp-3 break-words">{approval.reason}</div>
               )}
               <div className="flex gap-2 mt-3">
                 <button
