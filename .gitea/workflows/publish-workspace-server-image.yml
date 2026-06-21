@@ -295,8 +295,14 @@ jobs:
           # NEVER local cache here — cache-from gives retries AND the next run
           # a warm start. Cache lives on the PRIMARY ECR only (the staging
           # mirror is a push target, not a cache source).
+          #
+          # P0 SEV (2026-06-21): build uses --load (not --push) so the smoke
+          # gate below can run the just-built image locally BEFORE it ever
+          # touches ECR. A broken image can no longer become :staging-latest —
+          # the gate fails the build (and the push step is skipped) if the
+          # container does not reach /healthz=200 within 120s.
           for attempt in 1 2 3; do
-            echo "::notice::Tenant image build attempt ${attempt}/3 ..."
+            echo "::notice::Tenant image build (--load) attempt ${attempt}/3 ..."
             builder="tenant-builder-${GITHUB_RUN_ID}-${attempt}"
             docker buildx create --name "${builder}" --use >/dev/null 2>&1 || true
             if docker buildx build \
@@ -313,9 +319,9 @@ jobs:
                 --cache-from "type=registry,ref=${TENANT_IMAGE_NAME}:buildcache" \
                 --cache-to "type=registry,ref=${TENANT_IMAGE_NAME}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
                 "${build_tags[@]}" \
-                --push .; then
+                --load .; then
               docker buildx rm "${builder}" >/dev/null 2>&1 || true
-              echo "::notice::Tenant image build succeeded on attempt ${attempt}"
+              echo "::notice::Tenant image build (--load) succeeded on attempt ${attempt}"
               break
             fi
             echo "::warning::Tenant image build attempt ${attempt} failed — cleaning builder and retrying"
@@ -325,6 +331,72 @@ jobs:
               echo "::error::Tenant image build failed after 3 attempts"
               exit 1
             fi
+          done
+
+          # ====== SMOKE GATE (P0 SEV hardening) ======
+          # Run the just-built image locally and assert it reaches /healthz=200
+          # BEFORE pushing to ECR. A broken image MUST NOT become
+          # :staging-latest. The existing canary/staging-verify job is a
+          # post-push safety net — this gate is the build-time pre-push net
+          # that catches the same defect ~10x faster (no ECR round-trip, no
+          # cloudflared tunnel, no full org provisioning).
+          #
+          # Health probe: ${TENANT_IMAGE_NAME}:${TAG_SHA} serves /healthz on
+          # port 8080 (the platform reverse proxy exposes it). We bind the
+          # smoke container to host port 18080 to avoid clashes with the
+          # runner's own services. Timeout 120s covers the worst-case
+          # platform-server cold start.
+          SMOKE_NAME="smoke-tenant-${GITHUB_RUN_ID}"
+          echo "::notice::Smoke gate: starting ${SMOKE_NAME} from ${TENANT_IMAGE_NAME}:${TAG_SHA}"
+          cleanup_smoke() {
+            docker rm -f "${SMOKE_NAME}" >/dev/null 2>&1 || true
+          }
+          trap cleanup_smoke EXIT
+          docker run -d --rm \
+            --name "${SMOKE_NAME}" \
+            -p 18080:8080 \
+            -e PORT=8080 \
+            -e MOLECULE_TENANT_MODE=smoke \
+            "${TENANT_IMAGE_NAME}:${TAG_SHA}" >/dev/null
+
+          smoke_ok=0
+          for i in $(seq 1 60); do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080/healthz" 2>/dev/null || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "::notice::Smoke gate PASSED: /healthz=200 on attempt $i (~${i}*2=$((i*2))s)"
+              smoke_ok=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "${smoke_ok}" -ne 1 ]; then
+            echo "::error::Smoke gate FAILED: container did not reach /healthz=200 within 120s (last code: ${code})"
+            echo "::error::Last 80 lines of container logs:"
+            docker logs --tail 80 "${SMOKE_NAME}" 2>&1 | tail -80 || true
+            echo "::error::A broken image MUST NOT become :staging-latest — build is failed, NO push will occur."
+            trap - EXIT
+            cleanup_smoke
+            exit 1
+          fi
+
+          # Optional: hit a few more endpoints to catch class-of-bug not caught
+          # by /healthz alone (404 on /, etc.). Keep this fast (<10s budget).
+          for path in /healthz /readyz /api/v1/health; do
+            c=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080${path}" 2>/dev/null || echo "000")
+            echo "::notice::Smoke probe ${path} → ${c}"
+          done
+          trap - EXIT
+          cleanup_smoke
+          echo "::notice::Smoke gate complete; pushing to ECR (4 tags)"
+
+          # Smoke passed — push the loaded image to ECR with all 4 tags. If any
+          # push fails, the build fails (--load already in the daemon, so this
+          # is a fast network-only operation).
+          for t in "${build_tags[@]}"; do
+            tag_value="${t#--tag }"
+            echo "::notice::Pushing ${tag_value}"
+            docker push "${tag_value}"
           done
 
   # Staging auto-deploy: every workspace-server image publish on main should
