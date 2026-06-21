@@ -44,53 +44,9 @@ jobs:
           GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
         run: |
           set -euo pipefail
+          bash scripts/manifest-entry-existence-check.sh
 
-          # Strip JSON5 // comments to match clone-manifest.sh parsing.
-          sed '/^[[:space:]]*\/\//d' manifest.json > /tmp/manifest.json
-
-          # Build a flat list of entries: name<TAB>repo.
-          jq -r '
-            (.plugins + .workspace_templates + .org_templates)
-            | .[]
-            | [.name, .repo]
-            | @tsv
-          ' /tmp/manifest.json > /tmp/entries.tsv
-
-          total=$(wc -l < /tmp/entries.tsv | tr -d ' ')
-          missing=()
-
-          while IFS=$'\t' read -r name repo; do
-            last_http_code=""
-            for attempt in 1 2 3; do
-              http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-                -H "Authorization: token ${GITEA_TOKEN}" \
-                "https://${GITEA_HOST}/api/v1/repos/${repo}")
-              last_http_code="$http_code"
-              if [ "$http_code" = "200" ]; then
-                echo "  OK: $name -> $repo"
-                break
-              elif [ "$http_code" = "404" ]; then
-                echo "::error::manifest entry '$name' points at $repo which does not exist on Gitea (404)"
-                missing+=("$name:$repo (404)")
-                break
-              else
-                echo "  attempt $attempt: '$name' -> $repo returned HTTP $http_code, retrying"
-                sleep $((attempt * 2))
-              fi
-            done
-            # After exhausting retries, any non-200 status that wasn't already
-            # recorded as 404 is a validation failure (500, 403, auth/network
-            # gateway errors, etc.). Fail closed rather than silently passing.
-            if [ "$last_http_code" != "200" ] && [ "$last_http_code" != "404" ]; then
-              echo "::error::manifest entry '$name' -> $repo could not be validated after 3 attempts (last HTTP $last_http_code)"
-              missing+=("$name:$repo (last HTTP $last_http_code)")
-            fi
-          done < /tmp/entries.tsv
-
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error::${#missing[@]} of ${total} manifest entries are broken:"
-            printf '  - %s\n' "${missing[@]}"
-            exit 1
-          fi
-
-          echo "::notice::All ${total} manifest entries resolve to existing Gitea repos."
+      - name: Regression test manifest-entry-existence-check script
+        run: |
+          set -euo pipefail
+          bash scripts/test-manifest-entry-existence-check.sh
