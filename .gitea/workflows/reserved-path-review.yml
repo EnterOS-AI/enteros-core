@@ -58,16 +58,16 @@ permissions:
 
 jobs:
   # IS intended to be branch-protection-enforced (that's its purpose —
-  # closes cp#673). But main BP currently has 0 status_check_contexts
-  # (see .gitea/required-contexts.txt, only CI / all-required /
-  # E2E API Smoke / Handlers PG are pinned) so `bp-required: yes`
-  # would fail the in-BP verification. `bp-required: pending #673`
-  # therefore: commit to enforcement, defer the actual
-  # BP-status-check-add to a separate operator follow-up tracked via
-  # cp#673. (The actual addition of `reserved-path-review` to main
-  # BP status_check_contexts is an OPERATOR action — not in scope for
-  # the lint or this PR.)
-  # bp-required: pending #673 — the reserved-path-review self-merge guard
+  # closes cp#673). The BP context add (`reserved-path-review /
+  # reserved-path-review (pull_request_target)` → main
+  # status_check_contexts) is an OPERATOR action; it is now CTO-authorized
+  # and tracked in #3141 alongside qa-review + security-review (the same
+  # owner BP flip). The allowlist (.gitea/required-contexts.txt) lands this
+  # PR; the BP flip follows merge (allowlist-superset-of-BP is lint-clean,
+  # the reverse is not). `bp-required: yes` would fail the in-BP verification
+  # until BP is flipped, so this stays `pending #NNN` per
+  # lint_required_context_exists_in_bp grammar.
+  # bp-required: pending #3141 — the reserved-path-review self-merge guard
   reserved-path-review:
     runs-on: ubuntu-latest
     # Draft PRs can't merge anyway; skip to save a runner. Still runs on
