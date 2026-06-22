@@ -222,6 +222,28 @@ func (h *RegistryHandler) resolveDeliveryMode(ctx context.Context, workspaceID, 
 // mark a non-root workspace as a platform agent.
 const errPlatformNotRoot = "a platform agent must be the org root (parent_id must be null) and there can be only one per org"
 
+// managementMCPUnloadedGrace is the startup/warmup grace window for the
+// core#3082 management-MCP gate. The gate degrades a platform concierge whose
+// declared management MCP is not present in the heartbeat's loaded_mcp_tools
+// (or whose runtime omits the list entirely) ONLY once the absence has
+// persisted continuously for at least this long — tracked via the
+// workspaces.mcp_unloaded_since timestamp.
+//
+// Why a grace window: the management MCP connects asynchronously after the
+// agent process starts, and the runtime can only observe its loaded tool list
+// from a live turn. A heartbeat that fires before the first turn / before the
+// MCP finishes connecting legitimately reports an absent/partial tool list;
+// degrading on that single sample (then recovering on the next) is the
+// ~50/50 online<->degraded flap this window eliminates. A genuinely-missing
+// management MCP stays absent past the window and degrades — preserving the
+// fail-closed RCA#2970 intent (steady-state guarantee: sustained-missing DOES
+// degrade).
+//
+// 90s ≈ 4-5 heartbeats at the runtime's 20s cadence: comfortably longer than
+// MCP warmup + first-turn latency, short enough that a real regression is
+// surfaced within ~1.5 min.
+const managementMCPUnloadedGrace = 90 * time.Second
+
 // isPlatformRootViolation reports whether err is the DB rejecting a register
 // that tried to mark a non-root workspace as a platform agent (the
 // workspaces_platform_root_check CHECK constraint). The handler maps it to a
@@ -1284,12 +1306,21 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	var currentStatus string
 	var currentKind string
 	var lastRegisterFailure sql.NullTime
-	err := db.DB.QueryRowContext(ctx, `SELECT status, kind, last_register_failure_at FROM workspaces WHERE id = $1`, payload.WorkspaceID).
-		Scan(&currentStatus, &currentKind, &lastRegisterFailure)
+	var mcpUnloadedSince sql.NullTime
+	err := db.DB.QueryRowContext(ctx, `SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id = $1`, payload.WorkspaceID).
+		Scan(&currentStatus, &currentKind, &lastRegisterFailure, &mcpUnloadedSince)
 	if err != nil {
 		return
 	}
 	hasRecentRegisterFailure := lastRegisterFailure.Valid && time.Since(lastRegisterFailure.Time) < 5*time.Minute
+
+	// managementMCPUnloaded tracks whether THIS heartbeat observed the declared
+	// management MCP as absent/incomplete. It gates the degraded->online
+	// recovery branch below so a platform agent in sustained #3082 violation is
+	// not flapped back to online (Bug B: the generic recovery branch keys only
+	// on error_rate/runtime_state and would otherwise resurrect a genuinely
+	// MCP-less concierge). Set inside the #3082 block.
+	managementMCPUnloaded := false
 
 	// FAIL-CLOSED concierge online-marking gate (RCA #2970).
 	// A kind='platform' workspace that has lost either its seeded MODEL secret or
@@ -1334,15 +1365,25 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		// legacy runtimes don't flip to degraded before the runtime-side
 		// loaded_mcp_tools producer lands.
 		//
-		// Once triggered, the gate has two fail-loud paths:
+		// The gate has two fail-loud conditions:
 		//   - loaded_mcp_tools present but missing the required tool
-		//     (mcp__molecule-platform__create_workspace) → degraded.
+		//     (mcp__molecule-platform__create_workspace).
 		//   - loaded_mcp_tools ABSENT (runtime says server is up but won't
-		//     report the tools list) → degraded. This is the fail-loud
-		//     behavior CR2+Researcher asked for: silent-skip when the runtime
-		//     doesn't speak the new contract is exactly the false-green
-		//     #3082 exists to catch. Runtime needs a loaded_mcp_tools
-		//     producer (tracked separately — see PR #3101 PM flag).
+		//     report the tools list).
+		//
+		// GRACE WINDOW (flap fix): neither condition degrades on a SINGLE
+		// heartbeat. The management MCP connects asynchronously after process
+		// start and the runtime can only observe its loaded tool list from a
+		// live turn — so an absent/partial list on an early heartbeat is a
+		// warmup signal, not a fault. We record the first-seen-unloaded time in
+		// workspaces.mcp_unloaded_since and only degrade once the absence has
+		// persisted continuously past managementMCPUnloadedGrace. The moment a
+		// heartbeat reports the required tool loaded we clear the stamp. This
+		// eliminates the ~50/50 online<->degraded oscillation (the agent is
+		// functional throughout) while PRESERVING the RCA#2970 fail-closed
+		// intent: a genuinely-missing management MCP stays absent past the
+		// window and degrades, and stays degraded (the recovery branch below is
+		// gated on managementMCPUnloaded).
 		if payload.MCPServerPresent != nil && *payload.MCPServerPresent {
 			loaded := payload.LoadedMCPTools
 			var (
@@ -1353,15 +1394,20 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			if loaded == nil {
 				// Runtime speaks #147 (server_present=true) but omits the new
 				// loaded_mcp_tools producer → we cannot verify the specific
-				// required tool is loaded. Fail-loud.
+				// required tool is loaded. Treated as unloaded (subject to the
+				// grace window below).
 				managementMissing = true
 				absentToolsList = true
 			} else {
 				managementMissing, mErr = h.platformAgentManagementMCPLoaded(ctx, payload.WorkspaceID, loaded)
 			}
-			if mErr != nil {
+			switch {
+			case mErr != nil:
+				// A lookup error is a system fault, not a warmup signal — it is
+				// not subject to the grace window. Fail-loud immediately.
 				msg := fmt.Sprintf("platform agent declared management MCP lookup failed: %v; marking degraded (core#3082)", mErr)
 				log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
+				managementMCPUnloaded = true
 				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
 					log.Printf("Heartbeat: failed to mark %s degraded (management MCP lookup error): %v", payload.WorkspaceID, err)
 				}
@@ -1369,20 +1415,51 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 					"management_mcp_lookup_failed": true,
 					"sample_error":                 msg,
 				})
-			} else if managementMissing {
-				msg := "platform agent management MCP declared but not loaded; marking degraded (core#3082)"
-				if absentToolsList {
-					msg = "platform agent runtime did not report loaded_mcp_tools on a mcp_server_present=true heartbeat; cannot verify create_workspace tool is loaded — marking degraded (core#3082)"
+			case managementMissing:
+				managementMCPUnloaded = true
+				// Stamp the first-seen-unloaded time if not already set, then
+				// decide whether the absence has outlasted the grace window.
+				now := time.Now()
+				firstUnloaded := mcpUnloadedSince
+				if !firstUnloaded.Valid {
+					firstUnloaded = sql.NullTime{Time: now, Valid: true}
+					// Best-effort: persist the stamp so the window survives
+					// across heartbeats and CP restarts. Don't gate the rest of
+					// evaluateStatus on the write succeeding.
+					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET mcp_unloaded_since = COALESCE(mcp_unloaded_since, now()), updated_at = now() WHERE id = $1`, payload.WorkspaceID); err != nil {
+						log.Printf("Heartbeat: failed to stamp mcp_unloaded_since for %s: %v", payload.WorkspaceID, err)
+					}
 				}
-				log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
-				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
-					log.Printf("Heartbeat: failed to mark %s degraded (management MCP missing): %v", payload.WorkspaceID, err)
+				withinGrace := now.Sub(firstUnloaded.Time) < managementMCPUnloadedGrace
+				if withinGrace {
+					// Warmup window — do NOT degrade. The agent stays online (or
+					// continues whatever transition the rest of evaluateStatus
+					// drives) while the management MCP finishes connecting.
+					log.Printf("Heartbeat: platform agent %s management MCP not yet loaded (absent_tools_list=%v); within %s grace window (unloaded for %s) — not degrading (core#3082)", payload.WorkspaceID, absentToolsList, managementMCPUnloadedGrace, now.Sub(firstUnloaded.Time).Truncate(time.Second))
+				} else {
+					msg := "platform agent management MCP declared but not loaded; marking degraded (core#3082)"
+					if absentToolsList {
+						msg = "platform agent runtime did not report loaded_mcp_tools on a mcp_server_present=true heartbeat; cannot verify create_workspace tool is loaded — marking degraded (core#3082)"
+					}
+					log.Printf("Heartbeat: %s (workspace=%s, unloaded for %s)", msg, payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second))
+					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
+						log.Printf("Heartbeat: failed to mark %s degraded (management MCP missing): %v", payload.WorkspaceID, err)
+					}
+					h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+						"management_mcp_missing":  true,
+						"loaded_mcp_tools_absent": absentToolsList,
+						"sample_error":            msg,
+					})
 				}
-				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
-					"management_mcp_missing": true,
-					"loaded_mcp_tools_absent": absentToolsList,
-					"sample_error":           msg,
-				})
+			default:
+				// Management MCP confirmed loaded this heartbeat. Clear any
+				// outstanding unloaded stamp so a future absence starts a fresh
+				// grace window rather than degrading instantly.
+				if mcpUnloadedSince.Valid {
+					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET mcp_unloaded_since = NULL, updated_at = now() WHERE id = $1 AND mcp_unloaded_since IS NOT NULL`, payload.WorkspaceID); err != nil {
+						log.Printf("Heartbeat: failed to clear mcp_unloaded_since for %s: %v", payload.WorkspaceID, err)
+					}
+				}
 			}
 		}
 	}
@@ -1459,8 +1536,15 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	//
 	// #2530: also require no recent register failure — the workspace stays
 	// degraded until a successful register clears the failure timestamp.
-	if !nativeStatus && currentStatus == "degraded" && payload.ErrorRate < 0.1 && payload.RuntimeState == "" && !hasRecentRegisterFailure {
+	if !nativeStatus && currentStatus == "degraded" && payload.ErrorRate < 0.1 && payload.RuntimeState == "" && !hasRecentRegisterFailure && !managementMCPUnloaded {
 		// #73 guard: heartbeat recovery must not resurrect a removed workspace.
+		// core#3082 (Bug B): also require !managementMCPUnloaded so a platform
+		// agent whose declared management MCP is still absent THIS heartbeat is
+		// not flapped back to online — otherwise a genuinely MCP-less concierge
+		// would oscillate degraded->online forever (the recovery condition is
+		// satisfied by any functional agent with low error_rate). Recovery now
+		// requires the management MCP to actually be observed loaded again,
+		// which clears mcp_unloaded_since and leaves managementMCPUnloaded=false.
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'degraded'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s to online: %v", payload.WorkspaceID, err)
 		}
