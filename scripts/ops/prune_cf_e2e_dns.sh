@@ -250,10 +250,11 @@ now = datetime.now(timezone.utc)
 
 # Conservative: only the two known disposable E2E prefixes, anchored to the
 # configured zone domain so similarly-named records in other zones never match.
-# The prefix must include the trailing hyphen so e2e-smokeprod.moleculesai.app
-# is NOT matched.
+# The prefix MUST be followed immediately by a hyphen and then at least one
+# suffix character, so names like e2e-smokeprod, e2e-smoketest-keep, or
+# prod-e2e-smoke-x are NEVER matched.
 EPHEMERAL_RE = re.compile(
-    r"^(e2e-smoke-|e2e-tmpl-)[a-zA-Z0-9_-]*\." + re.escape(zone_domain) + r"$"
+    r"^(e2e-smoke-[a-zA-Z0-9_-]+|e2e-tmpl-[a-zA-Z0-9_-]+)\." + re.escape(zone_domain) + r"$"
 )
 
 def parse_iso(s):
