@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -309,8 +310,8 @@ func TestProxyA2A_Upstream502_TriggersContainerDeadCheck(t *testing.T) {
 	if w.Header().Get("Retry-After") != "15" {
 		t.Errorf("Retry-After header should be 15 to throttle canvas-side retry loop; got %q", w.Header().Get("Retry-After"))
 	}
-	if cp.calls != 1 {
-		t.Errorf("cpProv.IsRunning must be consulted exactly once; got %d calls", cp.calls)
+	if cp.Calls() != 1 {
+		t.Errorf("cpProv.IsRunning must be consulted exactly once; got %d calls", cp.Calls())
 	}
 }
 
@@ -2199,8 +2200,8 @@ func TestMaybeMarkContainerDead_CPOnly_NotRunning(t *testing.T) {
 	if !dead {
 		t.Fatal("expected true (cpProv reports not running) — without cpProv consultation, SaaS dead-agent recovery is impossible")
 	}
-	if cp.calls != 1 {
-		t.Errorf("expected exactly 1 IsRunning call on cpProv; got %d", cp.calls)
+	if cp.Calls() != 1 {
+		t.Errorf("expected exactly 1 IsRunning call on cpProv; got %d", cp.Calls())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -2228,8 +2229,8 @@ func TestMaybeMarkContainerDead_CPOnly_Running(t *testing.T) {
 	if dead {
 		t.Error("expected false when cpProv reports running — must not recycle a healthy agent")
 	}
-	if cp.calls != 1 {
-		t.Errorf("expected exactly 1 IsRunning call on cpProv; got %d", cp.calls)
+	if cp.Calls() != 1 {
+		t.Errorf("expected exactly 1 IsRunning call on cpProv; got %d", cp.Calls())
 	}
 }
 
@@ -2259,11 +2260,11 @@ func TestStopForRestart_SaaSPath_DispatchesViaCPProv(t *testing.T) {
 
 	handler.stopForRestart(context.Background(), "ws-saas-restart")
 
-	if cp.stopCalls != 1 {
-		t.Fatalf("expected cpProv.Stop to be called once on SaaS auto-restart; got %d", cp.stopCalls)
+	if cp.StopCalls() != 1 {
+		t.Fatalf("expected cpProv.Stop to be called once on SaaS auto-restart; got %d", cp.StopCalls())
 	}
-	if cp.startCalls != 0 {
-		t.Fatalf("expected cpProv.Start NOT to be called by stopForRestart; got %d", cp.startCalls)
+	if cp.StartCalls() != 0 {
+		t.Fatalf("expected cpProv.Start NOT to be called by stopForRestart; got %d", cp.StartCalls())
 	}
 }
 
@@ -2294,6 +2295,7 @@ func TestStopForRestart_NoProvisioner_NoOp(t *testing.T) {
 // after the assertions ran). Tests that want to ASSERT a method is unused
 // can check `calls == 0` after a sync barrier.
 type fakeCPProv struct {
+	mu         sync.Mutex
 	running    bool
 	err        error
 	calls      int
@@ -2301,15 +2303,45 @@ type fakeCPProv struct {
 	startCalls int
 }
 
+func (f *fakeCPProv) setRunning(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.running = v
+}
+
+func (f *fakeCPProv) Calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeCPProv) StopCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stopCalls
+}
+
+func (f *fakeCPProv) StartCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.startCalls
+}
+
 func (f *fakeCPProv) Start(_ context.Context, _ provisioner.WorkspaceConfig) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.startCalls++
 	return "", nil
 }
 func (f *fakeCPProv) Stop(_ context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.stopCalls++
 	return nil
 }
 func (f *fakeCPProv) StopAndPrune(_ context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.stopCalls++
 	return nil
 }
@@ -2317,6 +2349,8 @@ func (f *fakeCPProv) GetConsoleOutput(_ context.Context, _ string) (string, erro
 	return "", nil
 }
 func (f *fakeCPProv) IsRunning(_ context.Context, _ string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	return f.running, f.err
 }
@@ -2369,8 +2403,8 @@ func TestMaybeMarkContainerDead_RecentHeartbeat_DoesNotRestart(t *testing.T) {
 		t.Fatal("dead observation with recent heartbeat should not declare container dead")
 	}
 	// It re-probes, so two IsRunning calls even with delay=0.
-	if cp.calls != 2 {
-		t.Errorf("expected 2 IsRunning calls (probe + re-probe), got %d", cp.calls)
+	if cp.Calls() != 2 {
+		t.Errorf("expected 2 IsRunning calls (probe + re-probe), got %d", cp.Calls())
 	}
 	// If EnqueueA2A fails (no DB expectations here) it returns status=0 and
 	// lets the caller fall back to its normal error path. The critical
@@ -2403,8 +2437,8 @@ func TestMaybeMarkContainerDead_NoRecentHeartbeat_DeclaresDead(t *testing.T) {
 	if !dead {
 		t.Fatal("expected dead when there is no recent heartbeat and IsRunning=false")
 	}
-	if cp.calls != 1 {
-		t.Errorf("expected 1 IsRunning call, got %d", cp.calls)
+	if cp.Calls() != 1 {
+		t.Errorf("expected 1 IsRunning call, got %d", cp.Calls())
 	}
 }
 
@@ -2453,8 +2487,8 @@ func TestMaybeMarkContainerDead_SettleWindow_DoesNotClearURL(t *testing.T) {
 	if dead {
 		t.Fatal("single IsRunning=false in post-restart settle window must not declare container dead")
 	}
-	if cp.calls != 2 {
-		t.Errorf("expected 2 IsRunning calls (probe + re-probe), got %d", cp.calls)
+	if cp.Calls() != 2 {
+		t.Errorf("expected 2 IsRunning calls (probe + re-probe), got %d", cp.Calls())
 	}
 }
 
@@ -2511,7 +2545,7 @@ func TestMaybeMarkContainerDead_RunningTrueAfterReprobe_Resets(t *testing.T) {
 	}
 
 	// Next observation says running=true → no restart.
-	cp.running = true
+	cp.setRunning(true)
 	mock.ExpectQuery(`SELECT COALESCE\(runtime, 'claude-code'\) FROM workspaces WHERE id =`).
 		WithArgs(wsid).
 		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("hermes"))
