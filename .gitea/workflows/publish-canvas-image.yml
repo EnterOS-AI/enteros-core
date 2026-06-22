@@ -192,12 +192,19 @@ jobs:
           SECRET_PLATFORM_URL: ${{ secrets.CANVAS_PLATFORM_URL }}
           INPUT_WS_URL: ${{ github.event.inputs.ws_url }}
           SECRET_WS_URL: ${{ secrets.CANVAS_WS_URL }}
+          # Exact generated-image R2 origin baked into the CSP img-src at build
+          # time (config, not a secret — it is a public CSP directive value).
+          # Falls back to the production-derived host. prod + staging share the
+          # R2 bucket + account so a single value is correct for both.
+          VAR_IMAGE_GEN_R2_HOST: ${{ vars.IMAGE_GEN_R2_HOST }}
         run: |
           PLATFORM_URL="${INPUT_PLATFORM_URL:-${SECRET_PLATFORM_URL:-http://localhost:8080}}"
           WS_URL="${INPUT_WS_URL:-${SECRET_WS_URL:-ws://localhost:8080/ws}}"
+          IMAGE_GEN_R2_HOST="${VAR_IMAGE_GEN_R2_HOST:-https://molecule-workspace-data.bfa4e604e168a938e565600b27e2828c.r2.cloudflarestorage.com}"
 
           echo "platform_url=${PLATFORM_URL}" >> "$GITHUB_OUTPUT"
           echo "ws_url=${WS_URL}" >> "$GITHUB_OUTPUT"
+          echo "image_gen_r2_host=${IMAGE_GEN_R2_HOST}" >> "$GITHUB_OUTPUT"
 
       - name: Build & push canvas image to ECR
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -209,6 +216,7 @@ jobs:
           build-args: |
             NEXT_PUBLIC_PLATFORM_URL=${{ steps.build_args.outputs.platform_url }}
             NEXT_PUBLIC_WS_URL=${{ steps.build_args.outputs.ws_url }}
+            NEXT_PUBLIC_IMAGE_GEN_R2_HOST=${{ steps.build_args.outputs.image_gen_r2_host }}
             # Bake the merge SHA into the image so /api/buildinfo reports the
             # served canvas SHA (core#2235). Mirrors how the platform image
             # surfaces GIT_SHA at /buildinfo. Full 40-char SHA (not the

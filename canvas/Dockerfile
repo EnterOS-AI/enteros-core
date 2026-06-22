@@ -10,9 +10,17 @@ COPY . .
 ARG NEXT_PUBLIC_PLATFORM_URL=http://localhost:8080
 ARG NEXT_PUBLIC_WS_URL=ws://localhost:8080/ws
 ARG NEXT_PUBLIC_ADMIN_TOKEN=
+# NEXT_PUBLIC_IMAGE_GEN_R2_HOST pins the exact generated-image R2 origin into
+# the CSP img-src (buildImgSrc() in src/middleware.ts). Inlined by Next.js at
+# build time. Unset → buildImgSrc() falls back to the wildcard. The combined
+# tenant image (workspace-server/Dockerfile.tenant) is the primary serving
+# path; this standalone canvas image (docker-compose / self-host) gets it too
+# for parity.
+ARG NEXT_PUBLIC_IMAGE_GEN_R2_HOST=
 ENV NEXT_PUBLIC_PLATFORM_URL=$NEXT_PUBLIC_PLATFORM_URL
 ENV NEXT_PUBLIC_WS_URL=$NEXT_PUBLIC_WS_URL
 ENV NEXT_PUBLIC_ADMIN_TOKEN=$NEXT_PUBLIC_ADMIN_TOKEN
+ENV NEXT_PUBLIC_IMAGE_GEN_R2_HOST=$NEXT_PUBLIC_IMAGE_GEN_R2_HOST
 RUN npm run build
 
 FROM node:22-alpine@sha256:cb15fca92530d7ac113467696cf1001208dac49c3c64355fd1348c11a88ddf8f

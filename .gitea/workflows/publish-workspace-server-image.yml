@@ -287,6 +287,18 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-2
+          # Exact generated-image R2 origin baked into the canvas CSP img-src
+          # at BUILD time (NEXT_PUBLIC_* is inlined by Next.js, not read at
+          # runtime). This single image serves BOTH prod and staging tenants
+          # (pushed to both ECR accounts below), and both environments share
+          # the same R2 bucket + Cloudflare account, so one baked value is
+          # correct for both. Sourced from the IMAGE_GEN_R2_HOST repo variable
+          # (config, not a secret — it is a public CSP directive value);
+          # defaults to the production-derived host
+          # `<MOLECULE_IMAGE_GEN_BUCKET>.<MOLECULE_IMAGE_GEN_ENDPOINT host>`
+          # if the variable is unset. Empty/unset → canvas buildImgSrc() falls
+          # back to the wildcard (functional, just looser).
+          IMAGE_GEN_R2_HOST: ${{ vars.IMAGE_GEN_R2_HOST || 'https://molecule-workspace-data.bfa4e604e168a938e565600b27e2828c.r2.cloudflarestorage.com' }}
         run: |
           set -euo pipefail
           ECR_REGISTRY="${TENANT_IMAGE_NAME%%/*}"
@@ -337,6 +349,7 @@ jobs:
                 --provenance=false \
                 --sbom=false \
                 --build-arg NEXT_PUBLIC_PLATFORM_URL= \
+                --build-arg NEXT_PUBLIC_IMAGE_GEN_R2_HOST="${IMAGE_GEN_R2_HOST}" \
                 --build-arg GIT_SHA="${GIT_SHA}" \
                 --label "org.opencontainers.image.source=https://git.moleculesai.app/molecule-ai/${REPO}" \
                 --label "org.opencontainers.image.revision=${GIT_SHA}" \
