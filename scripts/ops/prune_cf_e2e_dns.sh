@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # prune_cf_e2e_dns.sh — targeted, fail-closed cleanup of disposable E2E DNS
-# records that accumulate under the moleculesai.app zone and exhaust the
-# Cloudflare DNS record quota (code 81045).
+# records that accumulate under the moleculesai.app zone (typically the
+# staging.moleculesai.app subdomain) and exhaust the Cloudflare DNS record
+# quota (code 81045).
 #
 # Why this exists: staging E2E harnesses create DNS records for slugs like
 # e2e-smoke-<date>-<run>-<uuid> and e2e-tmpl-<rand> (see
@@ -16,6 +17,8 @@
 #   - Records whose full name matches
 #       e2e-smoke-*.<zone-domain>
 #       e2e-tmpl-*.<zone-domain>
+#   - Multiple zone domains may be supplied as a comma-separated list
+#     (e.g. "moleculesai.app,staging.moleculesai.app").
 #   - Records older than --min-age-hours / PRUNE_MIN_AGE_HOURS (default 24)
 #     so in-flight runs are not touched.
 #   - Anything else is kept untouched.
@@ -33,7 +36,8 @@
 #   PRUNE_MIN_AGE_HOURS=<int> — default minimum age in hours (default: 24).
 #   MAX_DELETE_PCT=<int>     — refuse to delete more than this percentage of
 #                              matched ephemeral records (default: 50).
-#   PRUNE_ZONE_DOMAIN=<domain> — zone domain to anchor matches (default: moleculesai.app).
+#   PRUNE_ZONE_DOMAIN=<domain> — comma-separated zone domain(s) to anchor
+#                                matches (default: staging.moleculesai.app).
 #
 # Exit codes:
 #   0  — dry-run completed or prune executed successfully
@@ -45,7 +49,10 @@ set -euo pipefail
 DRY_RUN=1
 MIN_AGE_HOURS="${PRUNE_MIN_AGE_HOURS:-24}"
 MAX_DELETE_PCT="${MAX_DELETE_PCT:-50}"
-ZONE_DOMAIN="${PRUNE_ZONE_DOMAIN:-moleculesai.app}"
+ZONE_DOMAIN="${PRUNE_ZONE_DOMAIN:-}"
+if [ -z "$ZONE_DOMAIN" ]; then
+  ZONE_DOMAIN="staging.moleculesai.app"
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -246,15 +253,19 @@ from datetime import datetime, timezone, timedelta
 
 min_age = timedelta(hours=int(os.environ["MIN_AGE_HOURS"]))
 zone_domain = os.environ["ZONE_DOMAIN"]
+zone_domains = [d.strip() for d in zone_domain.split(",") if d.strip()]
 now = datetime.now(timezone.utc)
 
-# Conservative: only the two known disposable E2E prefixes, anchored to the
-# configured zone domain so similarly-named records in other zones never match.
+# Conservative: only the two known disposable E2E prefixes, anchored to one
+# of the configured zone domains so similarly-named records in other zones
+# never match. Multiple zone domains may be supplied as a comma-separated
+# list (e.g. "moleculesai.app,staging.moleculesai.app").
 # The prefix MUST be followed immediately by a hyphen and then at least one
 # suffix character, so names like e2e-smokeprod, e2e-smoketest-keep, or
 # prod-e2e-smoke-x are NEVER matched.
+zone_part = r"(?:" + r"|".join(re.escape(d) for d in zone_domains) + r")"
 EPHEMERAL_RE = re.compile(
-    r"^(e2e-smoke-[a-zA-Z0-9_-]+|e2e-tmpl-[a-zA-Z0-9_-]+)\." + re.escape(zone_domain) + r"$"
+    r"^(e2e-smoke-[a-zA-Z0-9_-]+|e2e-tmpl-[a-zA-Z0-9_-]+)\." + zone_part + r"$"
 )
 
 def parse_iso(s):

@@ -17,7 +17,7 @@ PASS=0
 FAIL=0
 
 run_case() {
-  local name="$1" list_exit="$2" list_body="$3" expect_delete_sentinel="$4" zone_domain="${5:-moleculesai.app}"
+  local name="$1" list_exit="$2" list_body="$3" expect_delete_sentinel="$4" zone_domain="${5:-}"
   local tmp
   tmp=$(mktemp -d -t cf-e2e-prune-fail-closed-XXXXXX)
   local delete_sentinel="$tmp/delete_reached"
@@ -129,9 +129,10 @@ run_case "CF DNS list returns malformed JSON"  0   'this is not json'           
 run_case "CF DNS list returns non-array result" 0 '{"success":true,"result":{"id":"rec1"}}'      false-abort
 
 # Helper to build a DNS list result with one record, given created_on ISO string
-# and optional zone domain (default: moleculesai.app).
+# and optional zone domain (default: staging.moleculesai.app, the observed
+# domain for leaked e2e-smoke/e2e-tmpl records).
 make_list() {
-  local created_on="$1" zone_domain="${2:-moleculesai.app}"
+  local created_on="$1" zone_domain="${2:-staging.moleculesai.app}"
   cat <<JSON
 {"success":true,"result":[{"id":"rec1","name":"e2e-smoke-20260622-1234-abcdef12.${zone_domain}","type":"A","created_on":"$created_on"}],"result_info":{"page":1,"total_pages":1,"per_page":100,"count":1}}
 JSON
@@ -154,12 +155,24 @@ run_case "e2e-tmplate-keep (extra chars before hyphen) kept" 0 "$(make_list "$ol
 run_case "e2e-smoke (no hyphen suffix) kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/e2e-smoke/')" false-keep
 run_case "prod-e2e-smoke-x (does not start with prefix) kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/prod-e2e-smoke-x/')" false-keep
 
-# Staging subdomain must match when PRUNE_ZONE_DOMAIN is set.
-run_case "old e2e-smoke staging subdomain deleted" 0 "$(make_list "$old_ts" staging.moleculesai.app)" true staging.moleculesai.app
+# Zone-domain coverage (Researcher RC 13130 correctness blocker).
+# Default PRUNE_ZONE_DOMAIN is staging.moleculesai.app, matching observed leaks.
+run_case "old e2e-smoke staging subdomain deleted (default)" 0 "$(make_list "$old_ts")" true
 
-# Old e2e-smoke record must be deleted (happy path, apex domain).
-run_case "old e2e-smoke record deleted" 0 "$(make_list "$old_ts")" true
+# Apex domain is NOT matched when PRUNE_ZONE_DOMAIN is staging only.
+run_case "apex e2e-smoke kept when staging-only" 0 "$(make_list "$old_ts" moleculesai.app)" false-keep staging.moleculesai.app
 
-echo
+# A record under a different subdomain is NOT matched.
+run_case "dev-subdomain e2e-smoke kept" 0 "$(make_list "$old_ts" dev.moleculesai.app)" false-keep staging.moleculesai.app
+
+# Explicit apex zone domain still works when requested.
+run_case "old e2e-smoke apex domain deleted" 0 "$(make_list "$old_ts" moleculesai.app)" true moleculesai.app
+
+# Comma-separated zone domains match both apex and staging.
+run_case "multi-zone matches staging record" 0 "$(make_list "$old_ts")" true "moleculesai.app,staging.moleculesai.app"
+run_case "multi-zone matches apex record" 0 "$(make_list "$old_ts" moleculesai.app)" true "moleculesai.app,staging.moleculesai.app"
+
+# Near-miss under the staging zone is still kept (safety guard).
+run_case "e2e-smoketest-keep under staging kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/e2e-smoketest-keep/')" false-keep
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
