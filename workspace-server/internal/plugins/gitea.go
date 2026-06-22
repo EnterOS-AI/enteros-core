@@ -1,21 +1,26 @@
 package plugins
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
-// GiteaResolver fetches plugins from a (typically private) Gitea repository
-// by shallow-cloning at the specified ref and extracting an optional
-// subpath. It exists so a declared plugin can resolve to a *subdirectory*
-// of a larger repo — e.g. the `agent-skills/seo-all/` skill package inside
-// the private seo-agent template repo — which the GitHub resolver cannot do
-// (it copies the whole repo root).
+// GiteaResolver fetches plugins from a (typically private) Gitea repository.
+// It uses the Gitea archive API for HTTP(S) remotes and falls back to a
+// shallow git clone only for local file:// test repos. The archive path is
+// fast-fail: private or missing repos return a clear error within seconds
+// instead of hanging on a credential prompt.
 //
 // Source-contract string (the value a template puts in `plugins:`):
 //
@@ -34,14 +39,25 @@ import (
 // Authentication: private Gitea repos need a PAT. The resolver reads the
 // token from the environment (MOLECULE_TEMPLATE_REPO_TOKEN by default — the
 // same read-only Gitea PAT CP PR#850 already places on every tenant box).
-// The token is injected into the clone URL's userinfo and never logged.
+// The token is sent in an Authorization header for API calls and is never
+// logged or returned to clients.
 //
 // Pinned-ref enforcement mirrors GithubResolver: an unpinned spec (no
 // `#<ref>`) is rejected unless PLUGIN_ALLOW_UNPINNED=true.
 type GiteaResolver struct {
-	// GitRunner runs git commands. Defaults to defaultGitRunner (shells out
-	// to the system `git`). Overridable in tests.
+	// GitRunner runs git commands for file:// / local test remotes.
+	// Defaults to defaultGitRunner. Unused for HTTP(S) archive fetches.
 	GitRunner func(ctx context.Context, dir string, args ...string) error
+
+	// ArchiveDownloader downloads and extracts a Gitea archive tarball for
+	// HTTP(S) remotes. Defaults to defaultArchiveDownloader. Overridable in
+	// tests to simulate private-repo 401/403/404 responses.
+	ArchiveDownloader func(ctx context.Context, archiveURL, token, dstDir string) error
+
+	// ResolveRefClient optionally overrides the HTTP client used by
+	// ResolveRef to fetch the commit SHA via the Gitea API. Defaults to
+	// http.DefaultClient. Overridable in tests.
+	ResolveRefClient *http.Client
 
 	// BaseURL is the Gitea instance origin, e.g. "https://git.moleculesai.app".
 	// Tests point it at a local file:// bare repo (in which case TokenEnv is
@@ -51,8 +67,12 @@ type GiteaResolver struct {
 	// TokenEnv is the environment variable the PAT is read from at Fetch
 	// time. Read lazily (not at construction) so a token rotated into the
 	// process env after startup is picked up. Empty disables auth injection
-	// (anonymous clone — works for public repos and file:// test repos).
+	// (anonymous API calls — works for public repos; fails fast on private).
 	TokenEnv string
+
+	// FetchTimeout bounds the archive download + SHA resolution for HTTP(S)
+	// remotes. Defaults to 30 seconds. Overridable in tests.
+	FetchTimeout time.Duration
 
 	// LastFetchSHA holds the commit SHA checked out by the last successful
 	// Fetch. Mirrors GithubResolver so the install pipeline's drift-seed
@@ -68,9 +88,10 @@ func NewGiteaResolver() *GiteaResolver {
 		base = "https://git.moleculesai.app"
 	}
 	return &GiteaResolver{
-		GitRunner: defaultGitRunner,
-		BaseURL:   base,
-		TokenEnv:  "MOLECULE_TEMPLATE_REPO_TOKEN",
+		GitRunner:         defaultGitRunner,
+		ArchiveDownloader: defaultArchiveDownloader,
+		BaseURL:           base,
+		TokenEnv:          "MOLECULE_TEMPLATE_REPO_TOKEN",
 	}
 }
 
@@ -169,7 +190,130 @@ func (r *GiteaResolver) cloneURL(owner, repo string) (string, error) {
 	return u.String(), nil
 }
 
-// Fetch clones the repo at the pinned ref and copies the (optional) subpath
+// archiveRef returns a ref string suitable for the Gitea archive API.
+// It strips the "tag:" and "sha:" prefixes used in plugin specs.
+func archiveRef(ref string) string {
+	switch {
+	case strings.HasPrefix(ref, "tag:"):
+		return strings.TrimPrefix(ref, "tag:")
+	case strings.HasPrefix(ref, "sha:"):
+		return strings.TrimPrefix(ref, "sha:")
+	}
+	return ref
+}
+
+// defaultArchiveDownloader downloads a Gitea archive tarball to dstDir and
+// extracts it. It is fail-closed and token-safe: the token is sent in the
+// Authorization header, never logged, and never surfaced in error messages.
+func defaultArchiveDownloader(ctx context.Context, archiveURL, token, dstDir string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, archiveURL, nil)
+	if err != nil {
+		return fmt.Errorf("gitea resolver: build archive request: %w", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("gitea resolver: archive download timed out")
+		}
+		return fmt.Errorf("gitea resolver: archive download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// proceed
+	case http.StatusNotFound:
+		return fmt.Errorf("gitea resolver: %s: %w", archiveURL, ErrPluginNotFound)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return fmt.Errorf("gitea resolver: %s: repository not accessible (HTTP %d)", archiveURL, resp.StatusCode)
+	default:
+		return fmt.Errorf("gitea resolver: %s: unexpected HTTP %d", archiveURL, resp.StatusCode)
+	}
+
+	gr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return fmt.Errorf("gitea resolver: gzip archive: %w", err)
+	}
+	defer gr.Close()
+
+	tr := tar.NewReader(gr)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("gitea resolver: read tar archive: %w", err)
+		}
+
+		// Clean the header name and reject traversal / absolute paths.
+		rel := filepath.Clean(hdr.Name)
+		if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			continue
+		}
+		target := filepath.Join(dstDir, rel)
+		cleanTarget, err := filepath.Abs(target)
+		if err != nil {
+			return fmt.Errorf("gitea resolver: abs target: %w", err)
+		}
+		cleanDst, err := filepath.Abs(dstDir)
+		if err != nil {
+			return fmt.Errorf("gitea resolver: abs dst: %w", err)
+		}
+		if !strings.HasPrefix(cleanTarget, cleanDst+string(filepath.Separator)) {
+			continue // tar entry escapes extraction root — skip
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(hdr.Mode&0o777)); err != nil {
+				return fmt.Errorf("gitea resolver: mkdir %s: %w", target, err)
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fmt.Errorf("gitea resolver: mkdir %s: %w", filepath.Dir(target), err)
+			}
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode&0o777))
+			if err != nil {
+				return fmt.Errorf("gitea resolver: create %s: %w", target, err)
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				return fmt.Errorf("gitea resolver: write %s: %w", target, err)
+			}
+			f.Close()
+		default:
+			// Skip symlinks, devices, etc. copyTree also skips symlinks.
+		}
+	}
+	return nil
+}
+
+// repoRootFromArchive picks the single top-level directory inside an
+// extracted Gitea archive. Gitea archives contain exactly one root directory
+// named after the repo.
+func repoRootFromArchive(archiveDir string) (string, error) {
+	entries, err := os.ReadDir(archiveDir)
+	if err != nil {
+		return "", fmt.Errorf("gitea resolver: read archive dir: %w", err)
+	}
+	var dirs []os.DirEntry
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, e)
+		}
+	}
+	if len(dirs) != 1 {
+		return "", fmt.Errorf("gitea resolver: expected exactly one root dir in archive, found %d", len(dirs))
+	}
+	return filepath.Join(archiveDir, dirs[0].Name()), nil
+}
+
+// Fetch resolves the repo at the pinned ref and copies the (optional) subpath
 // into dst. Returns the resolved plugin name.
 func (r *GiteaResolver) Fetch(ctx context.Context, spec string, dst string) (string, error) {
 	p, err := parseGiteaSpec(spec)
@@ -183,6 +327,22 @@ func (r *GiteaResolver) Fetch(ctx context.Context, spec string, dst string) (str
 			spec, p.owner, p.repo)
 	}
 
+	base := r.BaseURL
+	if base == "" {
+		base = "https://git.moleculesai.app"
+	}
+
+	// Local file:// remotes (tests) keep the git-clone path.
+	if strings.HasPrefix(base, "file://") || strings.HasPrefix(base, "/") {
+		return r.fetchGit(ctx, p, dst)
+	}
+
+	return r.fetchArchive(ctx, p, dst, base)
+}
+
+// fetchGit is the legacy local-file:// path used only by tests. It preserves
+// the original shallow-clone behavior so real-git test fixtures keep working.
+func (r *GiteaResolver) fetchGit(ctx context.Context, p parsedGiteaSpec, dst string) (string, error) {
 	runner := r.GitRunner
 	if runner == nil {
 		runner = defaultGitRunner
@@ -206,11 +366,6 @@ func (r *GiteaResolver) Fetch(ctx context.Context, spec string, dst string) (str
 	}
 	args = append(args, "--", cloneURL, cloneTarget)
 	if err := runner(ctx, workDir, args...); err != nil {
-		// Map "repo/ref doesn't exist" to ErrPluginNotFound (handler → 404).
-		// NOTE: the error string may contain the tokenized URL; callers MUST
-		// NOT surface resolver errors to clients (the install pipeline logs
-		// them server-side and returns a sanitized body). Errors are wrapped
-		// with a non-tokenized URL form for the log line.
 		safeURL := fmt.Sprintf("%s/%s/%s.git", r.BaseURL, p.owner, p.repo)
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "repository not found") ||
@@ -222,17 +377,83 @@ func (r *GiteaResolver) Fetch(ctx context.Context, spec string, dst string) (str
 		return "", fmt.Errorf("gitea resolver: clone %s failed: %w", safeURL, err)
 	}
 
-	// Capture the installed SHA before stripping .git (drift-seed parity).
 	if shaOut, shaErr := runGitOneLine(ctx, cloneTarget, "rev-parse", "--verify", "HEAD"); shaErr == nil {
 		r.LastFetchSHA = strings.TrimSpace(shaOut)
 	}
 
-	// The source tree to copy: repo root, or the subpath within it.
+	return r.stageTree(ctx, p, cloneTarget, dst)
+}
+
+// fetchArchive downloads the repo via the authenticated Gitea archive API,
+// extracts it, and stages the requested subpath. It is bounded by a strict
+// timeout and maps 401/403/404 to clear, token-safe errors.
+func (r *GiteaResolver) fetchArchive(ctx context.Context, p parsedGiteaSpec, dst, base string) (string, error) {
+	token := ""
+	if r.TokenEnv != "" {
+		token = strings.TrimSpace(os.Getenv(r.TokenEnv))
+	}
+
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("gitea resolver: invalid base url: %w", err)
+	}
+	ref := archiveRef(p.ref)
+	u.Path = fmt.Sprintf("/api/v1/repos/%s/%s/archive/%s.tar.gz", p.owner, p.repo, ref)
+	archiveURL := u.String()
+
+	workDir, err := os.MkdirTemp("", "molecule-gitea-archive-*")
+	if err != nil {
+		return "", fmt.Errorf("gitea resolver: tempdir: %w", err)
+	}
+	defer os.RemoveAll(workDir)
+
+	archiveDir := filepath.Join(workDir, "extracted")
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		return "", fmt.Errorf("gitea resolver: mkdir archive dir: %w", err)
+	}
+
+	downloader := r.ArchiveDownloader
+	if downloader == nil {
+		downloader = defaultArchiveDownloader
+	}
+
+	// Bounded timeout: a private or unreachable repo must fail fast instead
+	// of hanging the install request until the gateway gives up (~100 s → 502).
+	timeout := r.FetchTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if err := downloader(fetchCtx, archiveURL, token, archiveDir); err != nil {
+		return "", err
+	}
+
+	cloneTarget, err := repoRootFromArchive(archiveDir)
+	if err != nil {
+		return "", err
+	}
+
+	// Resolve the installed SHA via the Gitea API. Same timeout so a missing
+	// or private repo fails fast here too.
+	sha, err := r.resolveSHA(fetchCtx, p.owner, p.repo, ref, token, base)
+	if err != nil {
+		return "", err
+	}
+	if sha != "" {
+		r.LastFetchSHA = sha
+	}
+
+	return r.stageTree(ctx, p, cloneTarget, dst)
+}
+
+// stageTree copies the repo root (or subpath) into dst and derives the plugin
+// name. Shared by fetchGit and fetchArchive.
+func (r *GiteaResolver) stageTree(ctx context.Context, p parsedGiteaSpec, cloneTarget, dst string) (string, error) {
 	srcTree := cloneTarget
 	pluginName := p.repo
 	if p.subpath != "" {
-		// filepath.Join cleans the path; reject any attempt to escape the
-		// clone (defence in depth — parseGiteaSpec already rejected "..").
 		joined := filepath.Join(cloneTarget, filepath.FromSlash(p.subpath))
 		relCheck, relErr := filepath.Rel(cloneTarget, joined)
 		if relErr != nil || strings.HasPrefix(relCheck, "..") {
@@ -250,11 +471,9 @@ func (r *GiteaResolver) Fetch(ctx context.Context, spec string, dst string) (str
 			return "", fmt.Errorf("gitea resolver: subpath %q is not a directory", p.subpath)
 		}
 		srcTree = joined
-		// Plugin name is the last subpath segment.
 		parts := strings.Split(p.subpath, "/")
 		pluginName = parts[len(parts)-1]
 	} else {
-		// Whole-repo install: strip .git so the plugin dir isn't a nested repo.
 		if err := os.RemoveAll(filepath.Join(cloneTarget, ".git")); err != nil {
 			return "", fmt.Errorf("gitea resolver: remove .git: %w", err)
 		}
@@ -265,6 +484,63 @@ func (r *GiteaResolver) Fetch(ctx context.Context, spec string, dst string) (str
 	}
 
 	return pluginName, nil
+}
+
+// resolveSHA fetches the commit SHA for a ref via the Gitea API. It is used
+// by both Fetch (to populate LastFetchSHA) and ResolveRef. The ref argument
+// must already be archiveRef-normalized.
+func (r *GiteaResolver) resolveSHA(ctx context.Context, owner, repo, ref, token, base string) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("gitea resolver: invalid base url: %w", err)
+	}
+	u.Path = fmt.Sprintf("/api/v1/repos/%s/%s/commits", owner, repo)
+	q := u.Query()
+	q.Set("sha", ref)
+	q.Set("limit", "1")
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("gitea resolver: build commits request: %w", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+
+	client := r.ResolveRefClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("gitea resolver: resolve SHA timed out")
+		}
+		return "", fmt.Errorf("gitea resolver: resolve SHA request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return "", fmt.Errorf("gitea resolver: %s/%s ref %q: %w", owner, repo, ref, ErrPluginNotFound)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "", fmt.Errorf("gitea resolver: %s/%s ref %q: not accessible (HTTP %d)", owner, repo, ref, resp.StatusCode)
+	default:
+		return "", fmt.Errorf("gitea resolver: %s/%s ref %q: unexpected HTTP %d", owner, repo, ref, resp.StatusCode)
+	}
+
+	var commits []struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&commits); err != nil {
+		return "", fmt.Errorf("gitea resolver: decode commits: %w", err)
+	}
+	if len(commits) == 0 || commits[0].SHA == "" {
+		return "", fmt.Errorf("gitea resolver: %s/%s ref %q: no commit returned", owner, repo, ref)
+	}
+	return strings.TrimSpace(commits[0].SHA), nil
 }
 
 // ResolveRef resolves a gitea spec's ref to a full commit SHA, so the drift
@@ -284,6 +560,30 @@ func (r *GiteaResolver) ResolveRef(ctx context.Context, spec string) (string, er
 		return "", fmt.Errorf("gitea resolver: ResolveRef requires a ref (got bare %q)", spec)
 	}
 
+	base := r.BaseURL
+	if base == "" {
+		base = "https://git.moleculesai.app"
+	}
+	ref := archiveRef(p.ref)
+
+	// Local file:// remotes (tests) keep the git-fetch path.
+	if strings.HasPrefix(base, "file://") || strings.HasPrefix(base, "/") {
+		return r.resolveRefGit(ctx, p, ref)
+	}
+
+	token := ""
+	if r.TokenEnv != "" {
+		token = strings.TrimSpace(os.Getenv(r.TokenEnv))
+	}
+
+	resolveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	return r.resolveSHA(resolveCtx, p.owner, p.repo, ref, token, base)
+}
+
+// resolveRefGit is the legacy local-file:// path used only by tests.
+func (r *GiteaResolver) resolveRefGit(ctx context.Context, p parsedGiteaSpec, fetchRef string) (string, error) {
 	runner := r.GitRunner
 	if runner == nil {
 		runner = defaultGitRunner
@@ -299,16 +599,6 @@ func (r *GiteaResolver) ResolveRef(ctx context.Context, spec string) (string, er
 	}
 	defer os.RemoveAll(workDir)
 
-	// Normalize the ref into a fetchable git ref.
-	fetchRef := p.ref
-	switch {
-	case strings.HasPrefix(p.ref, "tag:"):
-		fetchRef = strings.TrimPrefix(p.ref, "tag:")
-	case strings.HasPrefix(p.ref, "sha:"):
-		fetchRef = strings.TrimPrefix(p.ref, "sha:")
-	}
-
-	// `git -C <workDir> init` then fetch the single ref shallowly.
 	if err := runner(ctx, workDir, "init", "-q"); err != nil {
 		return "", fmt.Errorf("gitea resolver: git init: %w", err)
 	}
