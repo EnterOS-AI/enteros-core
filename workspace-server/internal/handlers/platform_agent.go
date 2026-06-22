@@ -502,10 +502,17 @@ func (h *WorkspaceHandler) ensureConciergeProvider(ctx context.Context, workspac
 	// just above (the fresh-boot seed) — so reading it here is sufficient and
 	// avoids a redundant secret decrypt.
 	model := strings.TrimSpace(envVars["MODEL"])
-	// Only pin when the model is in the platform-managed namespace that needs it.
-	// A non-platform model (e.g. `sonnet`, a BYOK `claude-…`) resolves on its
-	// own; forcing `platform` there would mis-route auth and break the agent.
-	if !strings.HasPrefix(strings.ToLower(model), platformManagedModelPrefix) {
+	// Pin platform when the model is platform-managed OR unresolved (empty). An
+	// empty MODEL here is NOT a BYOK/self-host signal — those carry a stored
+	// LLM_PROVIDER (handled by the early-return above) or an explicit non-platform
+	// MODEL (skipped just below). Empty means an unresolved fresh/rebuilt-from-DB
+	// payload, which defaults to the platform-managed family; skipping the pin
+	// there (the old `HasPrefix("", …)`==false path) left the concierge without
+	// LLM_PROVIDER, so the runtime could not drop the inherited tenant
+	// CLAUDE_CODE_OAUTH_TOKEN and the agent 401'd against the CP LLM proxy. Only a
+	// NON-empty non-platform model (an explicit BYOK pick) resolves on its own;
+	// forcing `platform` there would mis-route auth and break the agent.
+	if model != "" && !strings.HasPrefix(strings.ToLower(model), platformManagedModelPrefix) {
 		return
 	}
 
