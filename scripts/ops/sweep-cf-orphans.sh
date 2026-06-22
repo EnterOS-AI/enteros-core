@@ -149,18 +149,42 @@ fi
 log "  zone $CF_ZONE_ID reachable ✓"
 
 
+# Fetch org slugs from a CP admin API endpoint.
+# Fail-closed: any non-2xx HTTP response, invalid JSON, or missing/invalid
+# 'orgs' array aborts the sweep with a non-zero exit. This prevents the
+# safety gate from being the only defense when the CP source of truth is
+# unreachable or returns an error body.
+fetch_cp_orgs() {
+  local url="$1" token="$2" label="$3"
+  local resp
+  resp=$(curl -sS -f -m 15 -H "Authorization: Bearer $token" "$url" 2>&1) || {
+    echo "ERROR: $label CP admin API request failed (non-2xx or network error)" >&2
+    echo "$resp" >&2
+    return 1
+  }
+  python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except json.JSONDecodeError as e:
+    print('ERROR: $label CP admin API returned invalid JSON:', e, file=sys.stderr)
+    sys.exit(1)
+orgs = d.get('orgs')
+if not isinstance(orgs, list):
+    print('ERROR: $label CP admin API response missing or invalid \"orgs\" array', file=sys.stderr)
+    sys.exit(1)
+print(' '.join(o['slug'] for o in orgs))
+" <<< "$resp"
+}
+
 # --- Gather live sets ------------------------------------------------------
 
 log "Fetching CP prod org slugs..."
-PROD_SLUGS=$(curl -sS -m 15 -H "Authorization: Bearer $CP_ADMIN_API_TOKEN" \
-  "https://api.moleculesai.app/cp/admin/orgs?limit=500" \
-  | python3 -c "import json,sys; print(' '.join(o['slug'] for o in json.load(sys.stdin).get('orgs',[])))")
+PROD_SLUGS=$(fetch_cp_orgs "https://api.moleculesai.app/cp/admin/orgs?limit=500" "$CP_ADMIN_API_TOKEN" "prod")
 log "  prod orgs: $(echo "$PROD_SLUGS" | wc -w | tr -d ' ')"
 
 log "Fetching CP staging org slugs..."
-STAGING_SLUGS=$(curl -sS -m 15 -H "Authorization: Bearer $CP_STAGING_ADMIN_API_TOKEN" \
-  "https://staging-api.moleculesai.app/cp/admin/orgs?limit=500" \
-  | python3 -c "import json,sys; print(' '.join(o['slug'] for o in json.load(sys.stdin).get('orgs',[])))")
+STAGING_SLUGS=$(fetch_cp_orgs "https://staging-api.moleculesai.app/cp/admin/orgs?limit=500" "$CP_STAGING_ADMIN_API_TOKEN" "staging")
 log "  staging orgs: $(echo "$STAGING_SLUGS" | wc -w | tr -d ' ')"
 
 log "Fetching live EC2 Name tags (region=$REGION)..."
