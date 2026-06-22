@@ -149,6 +149,10 @@ run_case "non-ephemeral old record kept" 0 "$(make_list "$old_ts" | sed 's/e2e-s
 # Near-miss names without the required hyphen must be kept (CR2 safety blocker).
 run_case "e2e-smokeprod (no hyphen) kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/e2e-smokeprod/')" false-keep
 run_case "e2e-tmplprod (no hyphen) kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/e2e-tmplprod/')" false-keep
+run_case "e2e-smoketest-keep (extra chars before hyphen) kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/e2e-smoketest-keep/')" false-keep
+run_case "e2e-tmplate-keep (extra chars before hyphen) kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/e2e-tmplate-keep/')" false-keep
+run_case "e2e-smoke (no hyphen suffix) kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/e2e-smoke/')" false-keep
+run_case "prod-e2e-smoke-x (does not start with prefix) kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/prod-e2e-smoke-x/')" false-keep
 
 # Staging subdomain must match when PRUNE_ZONE_DOMAIN is set.
 run_case "old e2e-smoke staging subdomain deleted" 0 "$(make_list "$old_ts" staging.moleculesai.app)" true staging.moleculesai.app
