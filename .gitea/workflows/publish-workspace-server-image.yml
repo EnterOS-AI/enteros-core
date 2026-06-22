@@ -255,6 +255,22 @@ jobs:
             --tag "${IMAGE_NAME}:${TAG_LATEST}" \
             --push .
 
+      # Keep the prod ECR storage bill bounded: declare the canonical image
+      # lifecycle policy on the repo we just pushed. Idempotent + fail-soft
+      # (never fails the publish). SSOT JSON lives in the script. The platform
+      # build above is continue-on-error (dead base), so this runs regardless.
+      - name: Ensure ECR lifecycle policy (platform)
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -uo pipefail
+          # Strip the registry host; pass the bare molecule-ai/<repo> name.
+          REPO_NAME="${IMAGE_NAME#*/}"
+          bash scripts/ops/ensure-ecr-lifecycle.sh "${REPO_NAME}"
+
       # Build + push tenant image (Go platform + Next.js canvas in one image).
       # Push the same build to the staging account too so fresh staging/E2E
       # tenants can pull without cross-account ECR reads. The staging ECR repo
@@ -603,6 +619,22 @@ jobs:
             echo "::notice::Pushing ${ref}"
             docker push "${ref}"
           done
+
+      # Keep the prod ECR storage bill bounded: declare the canonical image
+      # lifecycle policy on the prod tenant repo we just pushed. platform-tenant
+      # is the biggest accumulator (70+ images / 12GB+). Idempotent + fail-soft.
+      # Only the PROD repo is targeted here (staging ECR has its own account).
+      - name: Ensure ECR lifecycle policy (platform-tenant)
+        env:
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -uo pipefail
+          # Strip the registry host; pass the bare molecule-ai/<repo> name.
+          REPO_NAME="${TENANT_IMAGE_NAME#*/}"
+          bash scripts/ops/ensure-ecr-lifecycle.sh "${REPO_NAME}"
 
   # Staging auto-deploy: every workspace-server image publish on main should
   # roll out to the staging fleet so code fixes reach staging without a
