@@ -139,6 +139,7 @@ jobs:
             git show "${HEAD_SHA}:.gitea/reserved-paths.txt" > .gitea/reserved-paths.txt
           fi
       - name: Evaluate reserved-path non-author-approval gate
+        id: eval
         env:
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN || secrets.GITHUB_TOKEN }}
           GITEA_HOST: git.moleculesai.app
@@ -148,3 +149,61 @@ jobs:
           # or head-fallback) manifest we just staged at .gitea/reserved-paths.txt.
           RESERVED_PATHS_FILE: .gitea/reserved-paths.txt
         run: bash .gitea/scripts/reserved-path-review.sh
+
+      - name: Post required status context on pull_request_review
+        # Gitea Actions auto-publishes (pull_request_review) context for this
+        # event, but branch-protection requires (pull_request_target). We
+        # explicitly POST the BP-required context so the gate flips on a review
+        # without waiting for the next push. Trust boundary preserved: same
+        # BASE-ref script result, no PR-head code.
+        if: github.event_name == 'pull_request_review' && always()
+        env:
+          GITEA_TOKEN: ${{ secrets.STATUS_POST_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVAL_OUTCOME: ${{ steps.eval.outcome }}
+        run: |
+          set -euo pipefail
+          authfile=$(mktemp)
+          chmod 600 "$authfile"
+          printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$authfile"
+
+          prfile=$(mktemp)
+          code=$(curl -sS -o "$prfile" -w '%{http_code}' -K "$authfile" \
+            "https://${GITEA_HOST}/api/v1/repos/${REPO}/pulls/${PR_NUMBER}")
+          if [ "$code" != "200" ]; then
+            echo "::error::GET /pulls/${PR_NUMBER} returned HTTP ${code}"
+            rm -f "$prfile" "$authfile"
+            exit 1
+          fi
+          head_sha=$(jq -r '.head.sha // ""' "$prfile")
+          rm -f "$prfile"
+
+          if [ "$EVAL_OUTCOME" = "success" ]; then
+            status_state="success"
+            description="Approved via pull_request_review trigger"
+          else
+            status_state="failure"
+            description="Review check failed via pull_request_review trigger"
+          fi
+
+          body=$(jq -nc \
+            --arg state "$status_state" \
+            --arg context "reserved-path-review / reserved-path-review (pull_request_target)" \
+            --arg description "$description" \
+            '{state:$state, context:$context, description:$description}')
+
+          post_code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -K "$authfile" -H "Content-Type: application/json" \
+            -d "$body" \
+            "https://${GITEA_HOST}/api/v1/repos/${REPO}/statuses/${head_sha}")
+
+          rm -f "$authfile"
+
+          if [ "$post_code" != "200" ] && [ "$post_code" != "201" ]; then
+            echo "::error::POST /statuses/${head_sha} returned HTTP ${post_code}"
+            exit 1
+          fi
+
+          echo "::notice::posted ${status_state} for context=\"reserved-path-review / reserved-path-review (pull_request_target)\" on sha=${head_sha}"
