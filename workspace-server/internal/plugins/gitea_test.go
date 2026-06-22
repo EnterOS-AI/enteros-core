@@ -1,13 +1,21 @@
 package plugins
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGiteaResolver_Scheme(t *testing.T) {
@@ -314,5 +322,323 @@ func TestGiteaResolver_RegisteredScheme(t *testing.T) {
 	}
 	if _, err := reg.Resolve(src); err != nil {
 		t.Errorf("gitea scheme must resolve: %v", err)
+	}
+}
+
+// makePluginTarball returns a gzip-compressed tar archive containing a repo
+// root directory named after repo, with files under the given relPaths.
+func makePluginTarball(t *testing.T, repo string, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+
+	for rel, content := range files {
+		name := repo + "/" + rel
+		hdr := &tar.Header{
+			Name:     name,
+			Mode:     0o644,
+			Size:     int64(len(content)),
+			Typeflag: tar.TypeReg,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write header: %v", err)
+		}
+		if _, err := io.WriteString(tw, content); err != nil {
+			t.Fatalf("write body: %v", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("close gzip: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// writeTarball writes a tarball to dstDir, simulating defaultArchiveDownloader.
+func writeTarball(t *testing.T, dstDir string, data []byte) {
+	t.Helper()
+	gr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer gr.Close()
+	tr := tar.NewReader(gr)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar next: %v", err)
+		}
+		target := filepath.Join(dstDir, hdr.Name)
+		if hdr.Typeflag == tar.TypeDir {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatalf("mkdir parent: %v", err)
+		}
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			t.Fatalf("create file: %v", err)
+		}
+		if _, err := io.Copy(f, tr); err != nil {
+			f.Close()
+			t.Fatalf("copy: %v", err)
+		}
+		f.Close()
+	}
+}
+
+func TestGiteaResolver_ArchiveFetch_PrivateRepo_FastFail(t *testing.T) {
+	const tok = "SUPERSECRET-ARCHIVE-TOKEN-999"
+	t.Setenv("MOLECULE_TEMPLATE_REPO_TOKEN", tok)
+
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		t.Run(fmt.Sprintf("HTTP%d", code), func(t *testing.T) {
+			r := &GiteaResolver{
+				BaseURL:  "https://git.example.com",
+				TokenEnv: "MOLECULE_TEMPLATE_REPO_TOKEN",
+				ArchiveDownloader: func(ctx context.Context, archiveURL, token, dstDir string) error {
+					if token != tok {
+						t.Errorf("token not passed to downloader: got %q", token)
+					}
+					switch code {
+					case http.StatusNotFound:
+						return fmt.Errorf("gitea resolver: %s: %w", archiveURL, ErrPluginNotFound)
+					default:
+						return fmt.Errorf("gitea resolver: %s: repository not accessible (HTTP %d)", archiveURL, code)
+					}
+				},
+			}
+
+			start := time.Now()
+			_, err := r.Fetch(context.Background(), "owner/repo#main", t.TempDir())
+			if time.Since(start) > 2*time.Second {
+				t.Errorf("Fetch took too long (%s); should fast-fail", time.Since(start))
+			}
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if strings.Contains(err.Error(), tok) {
+				t.Errorf("PAT leaked into error: %v", err)
+			}
+			if code == http.StatusNotFound {
+				if !errors.Is(err, ErrPluginNotFound) {
+					t.Errorf("expected ErrPluginNotFound for 404, got %v", err)
+				}
+			} else {
+				if errors.Is(err, ErrPluginNotFound) {
+					t.Errorf("did not expect ErrPluginNotFound for %d", code)
+				}
+			}
+		})
+	}
+}
+
+func TestGiteaResolver_ArchiveFetch_Timeout(t *testing.T) {
+	t.Setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "tok")
+	r := &GiteaResolver{
+		BaseURL:      "https://git.example.com",
+		TokenEnv:     "MOLECULE_TEMPLATE_REPO_TOKEN",
+		FetchTimeout: 500 * time.Millisecond,
+		ArchiveDownloader: func(ctx context.Context, archiveURL, token, dstDir string) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Minute):
+				return errors.New("should have been cancelled")
+			}
+		},
+	}
+
+	start := time.Now()
+	_, err := r.Fetch(context.Background(), "owner/repo#main", t.TempDir())
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("Fetch took too long (%s); timeout should fire around 500ms", time.Since(start))
+	}
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") && !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Errorf("expected timeout/deadline error, got %v", err)
+	}
+}
+
+func TestGiteaResolver_ArchiveFetch_Success(t *testing.T) {
+	const tok = "SUPERSECRET-ARCHIVE-TOKEN-777"
+	t.Setenv("MOLECULE_TEMPLATE_REPO_TOKEN", tok)
+
+	archive := makePluginTarball(t, "repo", map[string]string{
+		"plugin.yaml": "name: repo\nversion: 1.0.0\n",
+		"README.md":   "# repo",
+	})
+	const wantSHA = "abc123def456abc123def456abc123def456abcd"
+
+	commitsHandler := func(w http.ResponseWriter, req *http.Request) {
+		if auth := req.Header.Get("Authorization"); auth != "token "+tok {
+			t.Errorf("commits request auth header = %q, want token %s", auth, tok)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `[{"sha":"%s"}]`, wantSHA)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasSuffix(req.URL.Path, "/commits") {
+			commitsHandler(w, req)
+			return
+		}
+		http.NotFound(w, req)
+	}))
+	defer server.Close()
+
+	r := &GiteaResolver{
+		BaseURL:          server.URL,
+		TokenEnv:         "MOLECULE_TEMPLATE_REPO_TOKEN",
+		ResolveRefClient: server.Client(),
+		ArchiveDownloader: func(ctx context.Context, archiveURL, token, dstDir string) error {
+			if token != tok {
+				t.Errorf("token not passed to downloader: got %q", token)
+			}
+			writeTarball(t, dstDir, archive)
+			return nil
+		},
+	}
+
+	dst := t.TempDir()
+	name, err := r.Fetch(context.Background(), "owner/repo#main", dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if name != "repo" {
+		t.Errorf("plugin name = %q, want repo", name)
+	}
+	for _, want := range []string{"plugin.yaml", "README.md"} {
+		if _, err := os.Stat(filepath.Join(dst, want)); err != nil {
+			t.Errorf("expected %q in dst: %v", want, err)
+		}
+	}
+	if r.LastSHA() != wantSHA {
+		t.Errorf("LastSHA = %q, want %q", r.LastSHA(), wantSHA)
+	}
+}
+
+func TestGiteaResolver_ArchiveFetch_Subpath(t *testing.T) {
+	const wantSHA = "abc123def456abc123def456abc123def456abcd"
+	archive := makePluginTarball(t, "template", map[string]string{
+		"agent-skills/seo-all/plugin.yaml": "name: seo-all\n",
+		"agent-skills/seo-all/SKILL.md":    "# SEO",
+		"config.yaml":                      "name: template",
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasSuffix(req.URL.Path, "/commits") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `[{"sha":"%s"}]`, wantSHA)
+			return
+		}
+		http.NotFound(w, req)
+	}))
+	defer server.Close()
+
+	r := &GiteaResolver{
+		BaseURL:          server.URL,
+		ResolveRefClient: server.Client(),
+		ArchiveDownloader: func(ctx context.Context, archiveURL, token, dstDir string) error {
+			writeTarball(t, dstDir, archive)
+			return nil
+		},
+	}
+
+	dst := t.TempDir()
+	name, err := r.Fetch(context.Background(), "owner/template/agent-skills/seo-all#main", dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if name != "seo-all" {
+		t.Errorf("plugin name = %q, want seo-all", name)
+	}
+	for _, want := range []string{"plugin.yaml", "SKILL.md"} {
+		if _, err := os.Stat(filepath.Join(dst, want)); err != nil {
+			t.Errorf("expected %q in dst: %v", want, err)
+		}
+	}
+	for _, notWant := range []string{"config.yaml", "agent-skills"} {
+		if _, err := os.Stat(filepath.Join(dst, notWant)); !os.IsNotExist(err) {
+			t.Errorf("subpath isolation violated: %q leaked", notWant)
+		}
+	}
+	if r.LastSHA() != wantSHA {
+		t.Errorf("LastSHA = %q, want %q", r.LastSHA(), wantSHA)
+	}
+}
+
+func TestGiteaResolver_ArchiveFetch_ResolveRef(t *testing.T) {
+	const wantSHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if auth := req.Header.Get("Authorization"); auth != "token the-token" {
+			t.Errorf("auth = %q, want token the-token", auth)
+		}
+		if strings.HasSuffix(req.URL.Path, "/commits") {
+			q := req.URL.Query()
+			if got := q.Get("sha"); got != "main" {
+				t.Errorf("sha query = %q, want main", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `[{"sha":"%s"}]`, wantSHA)
+			return
+		}
+		http.NotFound(w, req)
+	}))
+	defer server.Close()
+
+	t.Setenv("MOLECULE_TEMPLATE_REPO_TOKEN", "the-token")
+	r := &GiteaResolver{
+		BaseURL:          server.URL,
+		TokenEnv:         "MOLECULE_TEMPLATE_REPO_TOKEN",
+		ResolveRefClient: server.Client(),
+	}
+
+	sha, err := r.ResolveRef(context.Background(), "owner/repo#main")
+	if err != nil {
+		t.Fatalf("ResolveRef: %v", err)
+	}
+	if sha != wantSHA {
+		t.Errorf("ResolveRef = %q, want %q", sha, wantSHA)
+	}
+}
+
+func TestGiteaResolver_ArchiveFetch_ResolveRef_TagPrefix(t *testing.T) {
+	const wantSHA = "1111111111111111111111111111111111111111"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasSuffix(req.URL.Path, "/commits") {
+			q := req.URL.Query()
+			if got := q.Get("sha"); got != "v1.2.0" {
+				t.Errorf("sha query = %q, want v1.2.0", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `[{"sha":"%s"}]`, wantSHA)
+			return
+		}
+		http.NotFound(w, req)
+	}))
+	defer server.Close()
+
+	r := &GiteaResolver{
+		BaseURL:          server.URL,
+		ResolveRefClient: server.Client(),
+	}
+
+	sha, err := r.ResolveRef(context.Background(), "owner/repo#tag:v1.2.0")
+	if err != nil {
+		t.Fatalf("ResolveRef: %v", err)
+	}
+	if sha != wantSHA {
+		t.Errorf("ResolveRef = %q, want %q", sha, wantSHA)
 	}
 }
