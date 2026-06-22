@@ -374,13 +374,13 @@ jobs:
   #   - Token and zone id come from repository secrets ONLY; never hardcoded.
   #   - --min-age-hours is conservative (2h) so in-flight records from a long
   #     E2E run or a recently-started dispatch are never touched.
-  # bp-required: pending #3140 — non-required / best-effort cleanup job.
+  # bp-required: pending #3147 — non-required / best-effort cleanup job.
   prune-stale-e2e-dns:
     name: Prune stale e2e DNS records
     runs-on: ubuntu-latest
     needs: e2e-staging-saas
     if: always()
-    # mc#3140: best-effort cleanup; transient CF API failures must not block merge.
+    # mc#3147: best-effort cleanup; transient CF API failures must not block merge.
     continue-on-error: true
     timeout-minutes: 10
     permissions:
