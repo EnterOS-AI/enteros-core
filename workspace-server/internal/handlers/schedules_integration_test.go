@@ -207,8 +207,21 @@ func TestIntegration_Schedules_CRUDRunHistoryHealth_RoundTrip(t *testing.T) {
 		`SELECT next_run_at FROM workspace_schedules WHERE id = $1`, created.ID).Scan(&newNextRun); err != nil {
 		t.Fatalf("read new next_run_at: %v", err)
 	}
-	if !newNextRun.After(origNextRun) {
-		t.Errorf("UPDATE cron: next_run_at should have moved (orig=%v new=%v)", origNextRun, newNextRun)
+	// The UPDATE must have RECOMPUTED next_run_at from the new cron. We must NOT
+	// assert newNextRun.After(origNextRun): "0 3" and "0 5" are daily crons whose
+	// next-occurrence wraps every 24h, so whenever this test runs in the
+	// 03:00–05:00 UTC window the 3am schedule has already rolled to *tomorrow*
+	// while the 5am schedule is still *today*, making the 5am next-run EARLIER
+	// than the 3am next-run and inverting any "strictly after" ordering. Instead
+	// assert the deterministic invariants that hold at every wall-clock time:
+	//  (a) next_run_at actually changed, and
+	//  (b) it now lands at exactly 05:00 UTC, proving the new cron was applied.
+	if newNextRun.Equal(origNextRun) {
+		t.Errorf("UPDATE cron: next_run_at should have been recomputed (orig=%v new=%v)", origNextRun, newNextRun)
+	}
+	nrUTC := newNextRun.UTC()
+	if nrUTC.Hour() != 5 || nrUTC.Minute() != 0 || nrUTC.Second() != 0 {
+		t.Errorf("UPDATE cron: next_run_at want 05:00:00 UTC (new cron \"0 5 * * *\"), got %v", nrUTC)
 	}
 
 	// --- Case 4: UPDATE with NEW timezone also recomputes next_run_at ---
