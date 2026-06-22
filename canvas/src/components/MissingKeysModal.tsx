@@ -256,6 +256,17 @@ function ProviderPickerModal({
   }, [catalog, initialModel, configuredKeys]);
 
   const [selectorValue, setSelectorValue] = useState<SelectorValue>(initial);
+
+  // Platform-managed providers (e.g. moonshot/kimi via the CP proxy) do
+  // NOT require a tenant-supplied API key — Molecule injects its own
+  // usage credential. Skip the credential inputs and treat as already
+  // satisfied so the Deploy button is immediately available (#2248).
+  const selectedProviderEntry = useMemo(
+    () => catalog.find((p) => p.id === selectorValue.providerId),
+    [catalog, selectorValue.providerId],
+  );
+  const isSelectedPlatformManaged = isPlatformManagedProvider(selectedProviderEntry);
+
   const [entries, setEntries] = useState<KeyEntry[]>([]);
   const [optionalEntries, setOptionalEntries] = useState<KeyEntry[]>([]);
   const firstInputRef = useRef<HTMLInputElement>(null);
@@ -281,18 +292,22 @@ function ProviderPickerModal({
 
   useEffect(() => {
     if (!open) return;
-    setEntries(
-      userEditableEnvVars.map((key) => ({
-        key,
-        value: "",
-        // Pre-mark as saved when the key is already in the configured
-        // set (global or workspace scope). Lets the user click Deploy
-        // without re-entering a key the platform already holds.
-        saved: configuredKeys?.has(key) ?? false,
-        saving: false,
-        error: null,
-      })),
-    );
+    if (isSelectedPlatformManaged) {
+      setEntries([]);
+    } else {
+      setEntries(
+        userEditableEnvVars.map((key) => ({
+          key,
+          value: "",
+          // Pre-mark as saved when the key is already in the configured
+          // set (global or workspace scope). Lets the user click Deploy
+          // without re-entering a key the platform already holds.
+          saved: configuredKeys?.has(key) ?? false,
+          saving: false,
+          error: null,
+        })),
+      );
+    }
     setOptionalEntries(
       optionalKeys
         .filter((key) => !userEditableEnvVars.includes(key))
@@ -304,7 +319,7 @@ function ProviderPickerModal({
           error: null,
         })),
     );
-  }, [open, userEditableEnvVars, configuredKeys, optionalKeys]);
+  }, [open, userEditableEnvVars, isSelectedPlatformManaged, configuredKeys, optionalKeys]);
 
   useEffect(() => {
     if (!open) return;
@@ -403,7 +418,8 @@ function ProviderPickerModal({
   // wrapper's bounds instead of the viewport.
   if (typeof document === "undefined") return null;
 
-  const allSaved = entries.every((e) => e.saved);
+  // Platform-managed providers need no tenant key — always satisfied.
+  const allSaved = isSelectedPlatformManaged || entries.every((e) => e.saved);
   const anySaving = entries.some((e) => e.saving);
   const runtimeLabel = runtime
     .replace(/[-_]/g, " ")
@@ -470,59 +486,66 @@ function ProviderPickerModal({
           />
 
           <div className="space-y-2">
-            {entries.map((entry, index) => (
-              <div
-                key={entry.key}
-                className="bg-surface-card/50 rounded-lg px-3 py-2.5 border border-line/50"
-              >
-                <div className="flex items-center justify-between mb-1.5">
-                  <div>
-                    <div className="text-[11px] text-ink-mid font-medium">
-                      {getKeyLabel(entry.key)}
+            {isSelectedPlatformManaged ? (
+              <div className="bg-surface-card/50 rounded-lg px-3 py-2.5 border border-line/50 text-[11px] text-ink-mid">
+                Platform-managed — no API key required. Molecule handles LLM
+                billing and proxy credentials.
+              </div>
+            ) : (
+              entries.map((entry, index) => (
+                <div
+                  key={entry.key}
+                  className="bg-surface-card/50 rounded-lg px-3 py-2.5 border border-line/50"
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <div>
+                      <div className="text-[11px] text-ink-mid font-medium">
+                        {getKeyLabel(entry.key)}
+                      </div>
+                      <div className="text-[9px] font-mono text-ink-mid">{entry.key}</div>
                     </div>
-                    <div className="text-[9px] font-mono text-ink-mid">{entry.key}</div>
+                    {entry.saved && (
+                      <span className="text-[9px] text-good bg-emerald-900/30 px-1.5 py-0.5 rounded flex items-center gap-1">
+                        <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
+                          <path d="M1.5 4L3.5 6L6.5 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                        Saved
+                      </span>
+                    )}
                   </div>
-                  {entry.saved && (
-                    <span className="text-[9px] text-good bg-emerald-900/30 px-1.5 py-0.5 rounded flex items-center gap-1">
-                      <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
-                        <path d="M1.5 4L3.5 6L6.5 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                      Saved
-                    </span>
+
+                  {!entry.saved && (
+                    <div className="flex gap-2 mt-2">
+                      <input
+                        value={entry.value}
+                        onChange={(e) => updateEntry(index, { value: e.target.value.trimStart() })}
+                        placeholder={entry.key.includes("API_KEY") ? "sk-..." : "Enter value"}
+                        type="password"
+                        aria-label={`Value for ${entry.key}`}
+                        ref={index === 0 ? firstInputRef : undefined}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && entry.value.trim()) {
+                            handleSaveKey(index);
+                          }
+                        }}
+                        className="flex-1 bg-surface-sunken border border-line rounded px-2 py-1.5 text-[11px] text-ink font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20 transition-colors"
+                      />
+                      <button
+                        onClick={() => handleSaveKey(index)}
+                        disabled={!entry.value.trim() || entry.saving}
+                        className="px-3 py-1.5 bg-accent-strong hover:bg-accent text-[11px] rounded text-white disabled:opacity-30 transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
+                      >
+                        {entry.saving ? "..." : "Save"}
+                      </button>
+                    </div>
+                  )}
+
+                  {entry.error && (
+                    <div role="alert" aria-live="assertive" className="mt-1.5 text-[10px] text-bad">{entry.error}</div>
                   )}
                 </div>
-
-                {!entry.saved && (
-                  <div className="flex gap-2 mt-2">
-                    <input
-                      value={entry.value}
-                      onChange={(e) => updateEntry(index, { value: e.target.value.trimStart() })}
-                      placeholder={entry.key.includes("API_KEY") ? "sk-..." : "Enter value"}
-                      type="password"
-                      aria-label={`Value for ${entry.key}`}
-                      ref={index === 0 ? firstInputRef : undefined}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && entry.value.trim()) {
-                          handleSaveKey(index);
-                        }
-                      }}
-                      className="flex-1 bg-surface-sunken border border-line rounded px-2 py-1.5 text-[11px] text-ink font-mono focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20 transition-colors"
-                    />
-                    <button
-                      onClick={() => handleSaveKey(index)}
-                      disabled={!entry.value.trim() || entry.saving}
-                      className="px-3 py-1.5 bg-accent-strong hover:bg-accent text-[11px] rounded text-white disabled:opacity-30 transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
-                    >
-                      {entry.saving ? "..." : "Save"}
-                    </button>
-                  </div>
-                )}
-
-                {entry.error && (
-                  <div role="alert" aria-live="assertive" className="mt-1.5 text-[10px] text-bad">{entry.error}</div>
-                )}
-              </div>
-            ))}
+              ))
+            )}
           </div>
 
           {optionalEntries.length > 0 && (

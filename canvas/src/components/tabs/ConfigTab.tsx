@@ -685,17 +685,20 @@ export function ConfigTab({ workspaceId }: Props) {
   const selectorModels: ModelSpec[] = useMemo(
     () =>
       registryBacked
-        ? (selectedRuntime?.registryModels ?? []).map((m) => ({
-            id: m.id,
-            name: m.name,
-            // carry the derived provider so the selector buckets correctly
-            ...(m.provider ? { provider: m.provider } : {}),
-            // carry required_env so wasTemplateDriven can detect
-            // template-driven env lists for registry-backed runtimes
-            ...(m.required_env ? { required_env: m.required_env } : {}),
-          }))
+        ? (selectedRuntime?.registryModels ?? []).map((m) => {
+            const catalogEntry = providerCatalog.find((p) => p.vendor === m.provider);
+            return {
+              id: m.id,
+              name: m.name,
+              // carry the derived provider so the selector buckets correctly
+              ...(m.provider ? { provider: m.provider } : {}),
+              // carry auth_env from the registry provider so
+              // wasTemplateDriven can compare against persisted required_env
+              ...(catalogEntry?.envVars?.length ? { required_env: catalogEntry.envVars } : {}),
+            };
+          })
         : availableModels,
-    [registryBacked, selectedRuntime?.registryModels, availableModels],
+    [registryBacked, selectedRuntime?.registryModels, providerCatalog, availableModels],
   );
 
   // Derive the selector's current value from the form state. Provider
@@ -726,6 +729,16 @@ export function ConfigTab({ workspaceId }: Props) {
     // 3. Empty — user hasn't picked yet (or template has no models).
     return { providerId: "", model: currentModelId, envVars: [] };
   }, [provider, currentModelId, providerCatalog]);
+
+  // Platform-managed providers need no tenant key; exclude their auth_env
+  // from the Secrets section so the user isn't prompted for a credential
+  // the CP injects automatically (#2248).
+  const currentProviderEntry = useMemo(
+    () => providerCatalog.find((p) => p.id === selectorValue.providerId),
+    [providerCatalog, selectorValue.providerId],
+  );
+  const isCurrentPlatformManaged = isPlatformManagedProvider(currentProviderEntry);
+
   const setSelectorValue = (_next: SelectorValue) => {
     // Selector emits `next`; the actual writes happen in the onChange
     // handler in JSX which calls setConfig + setProvider directly.
@@ -1038,21 +1051,23 @@ export function ConfigTab({ workspaceId }: Props) {
                 value={selectorValue}
                 onChange={(next) => {
                   setSelectorValue(next);
+                  // Platform-managed providers (CP LLM proxy) do NOT
+                  // require tenant-supplied credentials. Skip injecting
+                  // their auth_env (e.g. MOLECULE_LLM_USAGE_TOKEN) into
+                  // required_env so the Secrets section doesn't ask for
+                  // a key the user cannot provide (#2248).
+                  const selectedEntry = providerCatalog.find((p) => p.id === next.providerId);
+                  // Defensive: if the catalog has not yet resolved the selected
+                  // provider, treat it as non-platform-managed so the user still
+                  // sees the env vars instead of a blank Secrets section.
+                  const isPlatformManaged = selectedEntry ? isPlatformManagedProvider(selectedEntry) : false;
+                  const nextEnvVars = isPlatformManaged ? [] : next.envVars;
                   // Mirror selection into the config object the rest of
                   // the form / save handler still reads. Model lands in
                   // runtime_config.model when a runtime is set, else
                   // top-level model. required_env follows the selected
                   // provider's envVars when the existing required_env
                   // was template-driven (don't clobber user-typed envs).
-                  //
-                  // #2248: suppress provisioner-injected internal tokens
-                  // (MOLECULE_LLM_USAGE_TOKEN) for platform-managed providers
-                  // so the user can't clobber them.
-                  const selectedEntry = providerCatalog.find((p) => p.id === next.providerId);
-                  const isPlatformManaged = selectedEntry ? isPlatformManagedProvider(selectedEntry) : false;
-                  const filteredEnvVars = isPlatformManaged
-                    ? next.envVars.filter((k) => k !== "MOLECULE_LLM_USAGE_TOKEN")
-                    : next.envVars;
                   setConfig((prev) => {
                     const v = next.model;
                     const prevModelId = prev.runtime_config?.model || prev.model || "";
@@ -1066,7 +1081,7 @@ export function ConfigTab({ workspaceId }: Props) {
                         : false);
                     const nextRequired =
                       wasTemplateDriven
-                        ? filteredEnvVars
+                        ? nextEnvVars
                         : prevRequired;
                     if (prev.runtime) {
                       return {
@@ -1306,7 +1321,13 @@ export function ConfigTab({ workspaceId }: Props) {
 
           <SecretsSection
             workspaceId={workspaceId}
-            requiredEnv={config.runtime_config?.required_env}
+            requiredEnv={
+              isCurrentPlatformManaged
+                ? config.runtime_config?.required_env?.filter(
+                    (k) => !(currentProviderEntry?.envVars ?? []).includes(k),
+                  )
+                : config.runtime_config?.required_env
+            }
           />
 
           <AgentCardSection workspaceId={workspaceId} />

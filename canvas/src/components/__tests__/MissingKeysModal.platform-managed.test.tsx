@@ -50,7 +50,7 @@ function makeProviders(billingMode: "platform_managed" | "byok"): ProviderChoice
 describe("ProviderPickerModal — platform-managed suppression (#2248)", () => {
   afterEach(() => cleanup());
 
-  it("hides MOLECULE_LLM_USAGE_TOKEN when provider is platform-managed", () => {
+  it("hides all tenant API keys when provider is platform-managed", () => {
     render(
       <MissingKeysModal
         open
@@ -62,9 +62,11 @@ describe("ProviderPickerModal — platform-managed suppression (#2248)", () => {
         onCancel={vi.fn()}
       />,
     );
-    // Only ANTHROPIC_API_KEY should be rendered; MOLECULE_LLM_USAGE_TOKEN suppressed
-    expect(screen.getByText("ANTHROPIC_API_KEY")).toBeTruthy();
+    // Platform-managed providers use Molecule-injected credentials; no tenant
+    // API key inputs should be rendered.
+    expect(screen.queryByText("ANTHROPIC_API_KEY")).toBeNull();
     expect(screen.queryByText("MOLECULE_LLM_USAGE_TOKEN")).toBeNull();
+    expect(screen.getByText(/Platform-managed/)).toBeTruthy();
   });
 
   it("shows MOLECULE_LLM_USAGE_TOKEN when provider is BYOK", () => {
@@ -166,10 +168,11 @@ describe("ProviderPickerModal — platform-managed suppression (#2248)", () => {
       });
     });
 
-    // MOLECULE_LLM_USAGE_TOKEN should now be suppressed
+    // Platform-managed selection should suppress all tenant API key inputs.
     await waitFor(() => {
-      expect(screen.getByText("ANTHROPIC_API_KEY")).toBeTruthy();
+      expect(screen.queryByText("ANTHROPIC_API_KEY")).toBeNull();
     });
     expect(screen.queryByText("MOLECULE_LLM_USAGE_TOKEN")).toBeNull();
+    expect(screen.getByText(/Platform-managed/)).toBeTruthy();
   });
 });
