@@ -17,7 +17,7 @@ PASS=0
 FAIL=0
 
 run_case() {
-  local name="$1" list_exit="$2" list_body="$3" expect_delete_sentinel="$4"
+  local name="$1" list_exit="$2" list_body="$3" expect_delete_sentinel="$4" zone_domain="${5:-moleculesai.app}"
   local tmp
   tmp=$(mktemp -d -t cf-e2e-prune-fail-closed-XXXXXX)
   local delete_sentinel="$tmp/delete_reached"
@@ -75,6 +75,7 @@ MOCK
     CF_API_TOKEN=tok \
     CF_ZONE_ID=zone \
     PRUNE_MIN_AGE_HOURS=1 \
+    PRUNE_ZONE_DOMAIN="$zone_domain" \
     bash "$SCRIPT" --apply > "$out" 2> "$err"
   local actual_exit=$?
   local case_fail=0
@@ -127,23 +128,32 @@ run_case "CF DNS list returns 500"            55  '{"success":false,"errors":[{"
 run_case "CF DNS list returns malformed JSON"  0   'this is not json'                              false-abort
 run_case "CF DNS list returns non-array result" 0 '{"success":true,"result":{"id":"rec1"}}'      false-abort
 
-# Helper to build a DNS list result with one record, given created_on ISO string.
+# Helper to build a DNS list result with one record, given created_on ISO string
+# and optional zone domain (default: moleculesai.app).
 make_list() {
-  local created_on="$1"
+  local created_on="$1" zone_domain="${2:-moleculesai.app}"
   cat <<JSON
-{"success":true,"result":[{"id":"rec1","name":"e2e-smoke-20260622-1234-abcdef12.moleculesai.app","type":"A","created_on":"$created_on"}],"result_info":{"page":1,"total_pages":1,"per_page":100,"count":1}}
+{"success":true,"result":[{"id":"rec1","name":"e2e-smoke-20260622-1234-abcdef12.${zone_domain}","type":"A","created_on":"$created_on"}],"result_info":{"page":1,"total_pages":1,"per_page":100,"count":1}}
 JSON
 }
+
+old_ts=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=2)).isoformat().replace('+00:00','Z'))")
 
 # Too-new record must be kept, not deleted.
 new_ts=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat().replace('+00:00','Z'))")
 run_case "e2e-smoke record too new" 0 "$(make_list "$new_ts")" false-keep
 
 # Non-ephemeral old record must be kept.
-old_ts=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=2)).isoformat().replace('+00:00','Z'))")
 run_case "non-ephemeral old record kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/api/')" false-keep
 
-# Old e2e-smoke record must be deleted (happy path).
+# Near-miss names without the required hyphen must be kept (CR2 safety blocker).
+run_case "e2e-smokeprod (no hyphen) kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/e2e-smokeprod/')" false-keep
+run_case "e2e-tmplprod (no hyphen) kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/e2e-tmplprod/')" false-keep
+
+# Staging subdomain must match when PRUNE_ZONE_DOMAIN is set.
+run_case "old e2e-smoke staging subdomain deleted" 0 "$(make_list "$old_ts" staging.moleculesai.app)" true staging.moleculesai.app
+
+# Old e2e-smoke record must be deleted (happy path, apex domain).
 run_case "old e2e-smoke record deleted" 0 "$(make_list "$old_ts")" true
 
 echo
