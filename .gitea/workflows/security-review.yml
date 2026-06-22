@@ -36,7 +36,15 @@ permissions:
   statuses: write
 
 jobs:
-  # bp-exempt: PR security review bot signal; required merge state is enforced by CI / all-required.
+  # bp-required: pending #3141 — CTO-authorized: this gate is becoming TRULY
+  # merge-blocking. NB: `CI / all-required` does NOT enforce this context — it is
+  # a plain `needs:` aggregator over CI's OWN jobs (ci.yml) and Gitea has no
+  # cross-workflow `needs:`; the prior poll-the-status-API design was removed
+  # (runner-squat RCA 2026-06-01). Enforcement requires the BP context
+  # `security-review / approved (pull_request_target)` to be in
+  # branch_protections/main.status_check_contexts (owner action, tracked in
+  # #3141; allowlist landed in .gitea/required-contexts.txt this PR, BP flip
+  # follows merge). `pending #NNN` per lint_required_context_exists_in_bp grammar.
   approved:
     # Gate the job:
     #   - On pull_request_target events: always run.
