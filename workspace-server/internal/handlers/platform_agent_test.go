@@ -717,6 +717,61 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 	})
 }
 
+// TestEnsureConciergeProvider_EmptyModelPins is the direct-unit regression gate
+// for the fix/concierge-provider-empty-model fix: the pin gate changed from
+// `if !strings.HasPrefix(strings.ToLower(model), platformManagedModelPrefix)`
+// to `if model != "" && !strings.HasPrefix(...)`. The old form computed
+// HasPrefix("", "moonshot/") == false for an EMPTY model and so returned early
+// WITHOUT pinning — leaving a fresh/rebuilt-from-DB concierge payload (whose
+// MODEL env was not yet populated) with no LLM_PROVIDER, which 401'd against the
+// CP LLM proxy. The fix treats an unresolved (empty) model as the platform-
+// managed default and pins. This calls ensureConciergeProvider DIRECTLY (not via
+// applyConciergeProvisionConfig) to isolate the gate.
+func TestEnsureConciergeProvider_EmptyModelPins(t *testing.T) {
+	h := &WorkspaceHandler{}
+	const providerSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'LLM_PROVIDER'`
+	const secretInsert = `INSERT INTO workspace_secrets`
+
+	t.Run("empty MODEL (rebuilt-from-DB payload) still pins platform", func(t *testing.T) {
+		mock := setupTestDB(t)
+		// No LLM_PROVIDER stored yet → existence SELECT empty → proceed to the gate.
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-empty-model").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		// Empty model is the platform-managed default → the pin MUST persist.
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-empty-model", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		env := map[string]string{} // no MODEL key — unresolved fresh/rebuilt payload
+		h.ensureConciergeProvider(context.Background(), "ws-empty-model", env)
+
+		if env["LLM_PROVIDER"] != conciergeProvider {
+			t.Errorf("empty MODEL did not pin LLM_PROVIDER=%q; got %q (env=%v) — concierge would 401 against the CP LLM proxy", conciergeProvider, env["LLM_PROVIDER"], env)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (LLM_PROVIDER pin not persisted): %v", err)
+		}
+	})
+
+	t.Run("explicit BYOK non-platform model still skips the pin", func(t *testing.T) {
+		mock := setupTestDB(t)
+		// No LLM_PROVIDER stored yet → existence SELECT empty → proceed to the gate.
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-byok-model").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		// NO ExpectExec: a non-empty BYOK model resolves on its own → no pin.
+
+		env := map[string]string{"MODEL": "anthropic:claude-opus-4-8"}
+		h.ensureConciergeProvider(context.Background(), "ws-byok-model", env)
+
+		if _, ok := env["LLM_PROVIDER"]; ok {
+			t.Errorf("explicit BYOK model wrongly pinned LLM_PROVIDER=%q — would mis-route a BYOK/self-host concierge", env["LLM_PROVIDER"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (an unexpected INSERT means it pinned a BYOK model): %v", err)
+		}
+	})
+}
+
 // TestApplyConciergeProvisionConfig_SeedsProvider is the CI regression gate for
 // the concierge non-response incident (prod 2026-06-18): the concierge booted
 // online but configuration_status=not_configured because the runtime wheel
