@@ -961,3 +961,65 @@ jobs:
       # (e2e-cncrg-* slug), running even on a t.Fatal. The age-guarded
       # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
       # net for a tenant orphaned by a hard runner cancel.
+
+  # Tenant plugin-install lifecycle guard (canvas Plugins tab regression class):
+  # boots a real staging workspace, asserts the registry is non-empty (the
+  # "no registry available" report), installs a registry plugin via
+  # POST /workspaces/:id/plugins, then asserts (a) GET /workspaces/:id/plugins
+  # returns it — guards the SaaS EIC readback (CP #3125), (b) the workspace
+  # comes back online+routable and serves A2A after the install-triggered
+  # restart — guards the #159 mgmt-MCP self-heal online-gate. Drives
+  # TestPluginInstallLifecycle_Staging (workspace-server/internal/staginge2e).
+  #
+  # GATING: fail-loud (no continue-on-error) on push/dispatch/cron — a real
+  # red here blocks the deploy path. NOT yet a branch-protection REQUIRED
+  # context: to make it merge-blocking, add
+  #   "E2E Staging SaaS (full lifecycle) / E2E Staging Plugin Install Lifecycle"
+  # to .gitea/required-contexts.txt AND to branch_protections/main
+  # status_check_contexts (owner action — same two-step the platform-boot
+  # gate documents above). Until then it runs + fails loud but is advisory,
+  # exactly like e2e-staging-workspace-requests.
+  # bp-required: pending #3133
+  e2e-staging-plugin-lifecycle:
+    name: E2E Staging Plugin Install Lifecycle
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CP_BASE_URL: https://staging-api.moleculesai.app
+      CP_ADMIN_API_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      STAGING_E2E: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+          # cache:false — see the concierge-platform job; the self-hosted
+          # runner bind-mounts a persistent GOCACHE/GOMODCACHE and
+          # actions/cache corrupts it.
+          cache: false
+          cache-dependency-path: workspace-server/go.sum
+      - name: Verify admin token present
+        run: |
+          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            exit 2
+          fi
+          echo "Admin token present"
+      - name: CP staging health preflight
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
+          if [ "$code" != "200" ]; then
+            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a plugin-lifecycle bug."
+            exit 1
+          fi
+          echo "Staging CP healthy"
+      - name: Run plugin-install-lifecycle staginge2e
+        working-directory: workspace-server
+        run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 40m
+      # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
+      # (e2e-plgn-* slug), running even on a t.Fatal. The age-guarded
+      # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
+      # net for a tenant orphaned by a hard runner cancel.

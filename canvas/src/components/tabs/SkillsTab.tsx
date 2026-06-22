@@ -92,7 +92,17 @@ export function SkillsTab({ workspaceId, data }: Props) {
   // positive.
   const [installedLoaded, setInstalledLoaded] = useState(false);
 
+  // Tracks an in-flight installed-plugins fetch so the panel can render
+  // skeleton rows instead of the bare "0 installed" header while the
+  // request is pending. Without this the full panel paints "0 installed"
+  // with no list during the initial load (compactEmpty is gated on
+  // installedLoaded so it can't fire yet) — indistinguishable from a
+  // genuinely-empty workspace, the "looks broken until data arrives a
+  // second later" report.
+  const [installedLoading, setInstalledLoading] = useState(true);
+
   const loadInstalled = useCallback(async () => {
+    if (mountedRef.current) setInstalledLoading(true);
     try {
       const result = await api.get<PluginInfo[]>(`/workspaces/${workspaceId}/plugins`);
       if (mountedRef.current) {
@@ -101,6 +111,8 @@ export function SkillsTab({ workspaceId, data }: Props) {
       }
     } catch (e) {
       console.warn("SkillsTab: installed plugins load failed", e);
+    } finally {
+      if (mountedRef.current) setInstalledLoading(false);
     }
   }, [workspaceId]);
 
@@ -357,8 +369,12 @@ export function SkillsTab({ workspaceId, data }: Props) {
           </button>
         </div>
 
-        {/* Installed plugins */}
-        {installed.length > 0 && (
+        {/* Installed plugins — skeleton while the initial fetch is in
+            flight (distinguish loading from a genuinely-empty list),
+            then the rows. */}
+        {installedLoading && !installedLoaded && installed.length === 0 ? (
+          <PluginSkeletonRows label="Loading installed plugins" />
+        ) : installed.length > 0 ? (
           <div className="mt-3 space-y-1.5">
             {installed.map((p) => {
               // Plugin was installed but does NOT declare support for
@@ -409,7 +425,7 @@ export function SkillsTab({ workspaceId, data }: Props) {
               );
             })}
           </div>
-        )}
+        ) : null}
 
         {/* Plugin registry (expandable) */}
         {showRegistry && (
@@ -486,7 +502,7 @@ export function SkillsTab({ workspaceId, data }: Props) {
               )}
             </div>
             {registryLoading && registry.length === 0 ? (
-              <div className="text-[10px] text-ink-mid">Loading registry…</div>
+              <PluginSkeletonRows label="Loading registry" />
             ) : registryError ? (
               <div className="rounded-lg border border-red-800/40 bg-red-950/20 px-2 py-1.5">
                 <div className="text-[10px] text-bad font-semibold mb-0.5">
@@ -661,6 +677,39 @@ export function extractSkills(agentCard: Record<string, unknown> | null): SkillE
       examples: Array.isArray(skill.examples) ? skill.examples.map((example) => String(example)) : [],
     }))
     .filter((skill) => skill.id.length > 0);
+}
+
+// Animated skeleton placeholder rows for the async plugin sections
+// (installed list + registry). Rendered while the fetch is in flight so
+// the user sees an explicit "loading" affordance rather than the empty
+// state ("0 installed" / "Registry returned 0 plugins"). aria-busy +
+// role=status keep it announced for assistive tech. Mirrors the
+// MemoryInspectorPanel skeleton style. `motion-safe:` honours
+// prefers-reduced-motion.
+function PluginSkeletonRows({ label }: { label: string }) {
+  return (
+    <div
+      className="mt-3 space-y-1.5"
+      role="status"
+      aria-busy="true"
+      aria-label={label}
+      data-testid="plugin-skeleton"
+    >
+      {Array.from({ length: 2 }).map((_, i) => (
+        <div
+          key={i}
+          className="rounded-lg border border-line/60 bg-surface/40 px-3 py-2 motion-safe:animate-pulse"
+        >
+          <div className="flex items-center gap-2">
+            <div className="h-2 rounded bg-surface-card/50 w-24" />
+            <div className="h-2 rounded bg-surface-card/50 w-8" />
+          </div>
+          <div className="mt-1.5 h-2 rounded bg-surface-card/40 w-3/4" />
+        </div>
+      ))}
+      <span className="sr-only">{label}…</span>
+    </div>
+  );
 }
 
 function MetaPill({ label, value }: { label: string; value: string }) {
