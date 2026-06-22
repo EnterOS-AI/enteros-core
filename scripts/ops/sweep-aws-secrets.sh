@@ -19,24 +19,36 @@
 # add KindSecretsManagerSecret + recorder hook + reconciler enumerator.
 # Tracked separately as a controlplane issue.
 #
-# This is a parallel-shape janitor to sweep-cf-tunnels.sh:
+# Sweeps TWO managed namespaces (both reduce to "owning org is gone"):
+#   - molecule/tenant/<org_id>/bootstrap  — org_id is in the NAME.
+#   - molecule/workspace/<ws_id>/config   — owning org is on the OrgID TAG
+#     (cp#329 per-workspace config delivery). THIS prefix was the entire
+#     ~$253/mo SM bill in June 2026 (2.4k orphan secrets from purged
+#     ephemeral E2E orgs) and was NOT swept before — the old filter only
+#     matched molecule/tenant/, so the janitor reported SUCCESS while
+#     deleting nothing relevant. Per-workspace liveness INSIDE a still-live
+#     org is owned by the CP auto-reap secrets reaper; this sweeper only
+#     deletes a workspace secret whose whole org is gone (no race risk).
+#
+# Steps:
 #   1. Query CP admin API to enumerate live org IDs (prod + staging)
-#   2. Enumerate AWS Secrets Manager secrets matching the tenant prefix
-#   3. For each secret matching `molecule/tenant/<org_id>/bootstrap`,
-#      check if <org_id> appears in the live set
-#   4. Defense-in-depth: skip secrets created in the last 24h
-#      (window for a provision-in-progress that hasn't yet finished
-#      its first heartbeat to CP)
-#   5. Only delete secrets with NO live org counterpart AND outside
-#      the 24h grace window
+#   2. Enumerate SM secrets matching either managed prefix
+#   3. tenant/* → org_id from name; workspace/* → org_id from OrgID tag
+#   4. Defense-in-depth: skip secrets created in the last GRACE_HOURS
+#   5. Only delete secrets whose owning org is NOT in the live set AND are
+#      outside the grace window
 #
 # Dry-run by default; must pass --execute to actually delete.
 #
-# Note on deletion semantics: --force-delete-without-recovery skips
-# the 7-30 day recovery window. We accept this because (a) the grace
-# window above already filters in-flight provisions, and (b) the
-# bootstrap secret is regenerated on every reprovision — losing one
-# is recoverable by re-running the provision flow.
+# Deletion semantics: RECOVERABLE 30-day delete (NOT force-delete). A
+# mistaken sweep is reversible via `aws secretsmanager restore-secret`
+# for 30 days. At thousands-of-secrets scale an unrecoverable bulk delete
+# is an unacceptable blast radius; matches the CP provisioner + reaper.
+#
+# Bulk backlog: the MAX_DELETE_PCT gate will (correctly) block a genuine
+# >50%-orphan backlog. To drain one deliberately, set SWEEP_ALLOW_BULK=1
+# — the real safety is the live-org cross-reference + 30d recovery, not
+# the percent gate.
 #
 # Env vars required:
 #   AWS_REGION              — region the secrets live in (default: us-east-1)
@@ -52,7 +64,8 @@
 #   0  — dry-run completed or sweep executed successfully
 #   1  — missing required env, API failure, or unexpected state
 #   2  — safety check failed (would delete >MAX_DELETE_PCT% of
-#         tenant-shaped secrets; refusing)
+#         managed-shaped secrets; refusing — set SWEEP_ALLOW_BULK=1 to
+#         drain a deliberate backlog)
 
 set -euo pipefail
 
@@ -106,16 +119,40 @@ log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 # awsapi.TenantSecretName in molecule-controlplane. The /cp/admin/orgs
 # response includes both `id` and `slug`; we extract `id` here.
 
+# Fetch org IDs from a CP admin API endpoint.
+# Fail-closed: any non-2xx HTTP response, invalid JSON, or missing/invalid
+# 'orgs' array aborts the sweep with a non-zero exit. This is critical under
+# SWEEP_ALLOW_BULK=1, where an empty live-org set would classify every old
+# managed secret as orphan.
+fetch_cp_orgs() {
+  local url="$1" token="$2" label="$3"
+  local resp
+  resp=$(curl -sS -f -m 15 -H "Authorization: Bearer $token" "$url" 2>&1) || {
+    echo "ERROR: $label CP admin API request failed (non-2xx or network error)" >&2
+    echo "$resp" >&2
+    return 1
+  }
+  python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except json.JSONDecodeError as e:
+    print('ERROR: $label CP admin API returned invalid JSON:', e, file=sys.stderr)
+    sys.exit(1)
+orgs = d.get('orgs')
+if not isinstance(orgs, list):
+    print('ERROR: $label CP admin API response missing or invalid \"orgs\" array', file=sys.stderr)
+    sys.exit(1)
+print(' '.join(o['id'] for o in orgs))
+" <<< "$resp"
+}
+
 log "Fetching CP prod org ids..."
-PROD_IDS=$(curl -sS -m 15 -H "Authorization: Bearer $CP_ADMIN_API_TOKEN" \
-  "https://api.moleculesai.app/cp/admin/orgs?limit=500" \
-  | python3 -c "import json,sys; print(' '.join(o['id'] for o in json.load(sys.stdin).get('orgs',[])))")
+PROD_IDS=$(fetch_cp_orgs "https://api.moleculesai.app/cp/admin/orgs?limit=500" "$CP_ADMIN_API_TOKEN" "prod")
 log "  prod orgs: $(echo "$PROD_IDS" | wc -w | tr -d ' ')"
 
 log "Fetching CP staging org ids..."
-STAGING_IDS=$(curl -sS -m 15 -H "Authorization: Bearer $CP_STAGING_ADMIN_API_TOKEN" \
-  "https://staging-api.moleculesai.app/cp/admin/orgs?limit=500" \
-  | python3 -c "import json,sys; print(' '.join(o['id'] for o in json.load(sys.stdin).get('orgs',[])))")
+STAGING_IDS=$(fetch_cp_orgs "https://staging-api.moleculesai.app/cp/admin/orgs?limit=500" "$CP_STAGING_ADMIN_API_TOKEN" "staging")
 log "  staging orgs: $(echo "$STAGING_IDS" | wc -w | tr -d ' ')"
 
 log "Fetching AWS Secrets Manager secrets (region=$AWS_REGION)..."
@@ -143,16 +180,22 @@ NEXT_TOKEN=""
 PAGE=1
 while :; do
   page_file="$PAGES_DIR/page-$(printf '%05d' "$PAGE").json"
+  # Sweep BOTH managed prefixes: molecule/tenant/* (per-org bootstrap) AND
+  # molecule/workspace/* (per-workspace config, cp#329). The latter was the
+  # entire ~$253/mo SM bill in June 2026 (2.4k orphan secrets) and this
+  # filter never matched it before — the sweeper reported SUCCESS while
+  # deleting nothing relevant. A name-filter Values list is OR-matched by
+  # Secrets Manager, so this captures both namespaces in one paginated walk.
   if [ -z "$NEXT_TOKEN" ]; then
     aws secretsmanager list-secrets \
       --region "$AWS_REGION" \
-      --filters Key=name,Values=molecule/tenant/ \
+      --filters Key=name,Values=molecule/tenant/,molecule/workspace/ \
       --max-results 100 \
       --output json > "$page_file"
   else
     aws secretsmanager list-secrets \
       --region "$AWS_REGION" \
-      --filters Key=name,Values=molecule/tenant/ \
+      --filters Key=name,Values=molecule/tenant/,molecule/workspace/ \
       --max-results 100 \
       --next-token "$NEXT_TOKEN" \
       --output json > "$page_file"
@@ -160,8 +203,8 @@ while :; do
   NEXT_TOKEN=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('NextToken') or '')" "$page_file")
   PAGE=$((PAGE + 1))
   if [ -z "$NEXT_TOKEN" ]; then break; fi
-  if [ "$PAGE" -gt 50 ]; then
-    log "::warning::stopping pagination at page 50 (5000 secrets) — re-run if more"
+  if [ "$PAGE" -gt 100 ]; then
+    log "::warning::stopping pagination at page 100 (10000 secrets) — re-run if more"
     break
   fi
 done
@@ -179,14 +222,28 @@ log "  total tenant-prefixed secrets: $TOTAL_SECRETS"
 
 # --- Compute orphans -------------------------------------------------------
 #
-# Rules (in order):
-#   1. Name doesn't match `molecule/tenant/<org_id>/bootstrap` → keep
-#      (unknown — never sweep arbitrary secrets that might belong to
-#      platform infra or other tenants of this AWS account).
-#   2. CreatedDate within $GRACE_HOURS → keep (defense-in-depth: don't
-#      kill a secret while its provision is still mid-flight).
-#   3. org_id ∈ {prod_ids ∪ staging_ids} → keep (live tenant).
-#   4. Otherwise → delete (orphan).
+# Two managed namespaces, cross-referenced against the SAME live ORG set
+# (prod_ids ∪ staging_ids fetched from the CP admin API). Both reduce to
+# "the owning org no longer exists ⇒ orphan", which is the safe, org-level
+# signal the sweeper can establish without per-workspace liveness:
+#
+#   molecule/tenant/<org_id>/bootstrap  — org_id is in the NAME.
+#   molecule/workspace/<ws_id>/config   — ws_id is in the name (NOT an org
+#     id); the owning org is on the secret's OrgID TAG (set by the CP
+#     provisioner's seedWorkspaceConfigSecret). A workspace secret whose
+#     OrgID tag is not a live org is a guaranteed orphan: the whole tenant
+#     is gone, so the workspace can't exist. (Per-workspace liveness inside
+#     a STILL-LIVE org is owned by the CP auto-reap secrets reaper, which
+#     calls the tenant /workspaces endpoint — this sweeper deliberately
+#     does NOT delete a workspace secret whose org is still live, to avoid
+#     racing a live tenant's in-flight workspace.)
+#
+# Rules (in order, per secret):
+#   1. Name matches neither managed shape → keep (never sweep arbitrary
+#      secrets that might belong to platform infra).
+#   2. CreatedDate within $GRACE_HOURS → keep (provision-in-flight margin).
+#   3. owning org ∈ {prod_ids ∪ staging_ids} → keep (live tenant).
+#   4. Otherwise → delete (orphan) via 30-day RECOVERABLE delete.
 
 export PROD_IDS STAGING_IDS GRACE_HOURS
 DECISIONS=$(echo "$SECRET_JSON" | python3 -c '
@@ -201,6 +258,8 @@ now = datetime.now(timezone.utc)
 
 # molecule/tenant/<org_id>/bootstrap — org_id is a UUID.
 _TENANT_RE = re.compile(r"^molecule/tenant/([0-9a-fA-F-]{36})/bootstrap$")
+# molecule/workspace/<ws_id>/config — ws_id is a UUID; owning org is on the tag.
+_WS_RE = re.compile(r"^molecule/workspace/([0-9a-fA-F-]{36})/config$")
 
 def parse_iso(s):
     if not s:
@@ -212,24 +271,43 @@ def parse_iso(s):
     except ValueError:
         return None
 
+def org_tag(s):
+    for t in s.get("Tags") or []:
+        if t.get("Key") == "OrgID":
+            return t.get("Value") or ""
+    return ""
+
 def decide(s, all_ids, grace, now):
     name = s.get("Name", "")
     arn = s.get("ARN", "")
 
-    m = _TENANT_RE.match(name)
-    if not m:
-        return ("keep", "not-a-tenant-secret", arn, name)
+    mt = _TENANT_RE.match(name)
+    mw = _WS_RE.match(name)
+    if not mt and not mw:
+        return ("keep", "not-a-managed-secret", arn, name)
 
-    org_id = m.group(1)
-
+    # Grace gate (both shapes): never touch a secret younger than the window.
     created = parse_iso(s.get("CreatedDate") or s.get("LastChangedDate"))
     if created is not None and (now - created) < grace:
         return ("keep", "in-grace-window", arn, name)
 
-    if org_id in all_ids:
-        return ("keep", "live-tenant", arn, name)
+    if mt:
+        org_id = mt.group(1)
+        if org_id in all_ids:
+            return ("keep", "live-tenant", arn, name)
+        return ("delete", "orphan-tenant", arn, name)
 
-    return ("delete", "orphan-tenant", arn, name)
+    # workspace-config: owning org is on the OrgID tag.
+    org_id = org_tag(s)
+    if not org_id:
+        # No OrgID tag (legacy / hand-created) — cannot establish ownership;
+        # keep and let the CP reaper (which parses the live set) handle it.
+        return ("keep", "workspace-no-org-tag", arn, name)
+    if org_id in all_ids:
+        # Org still live — defer to the CP auto-reap secrets reaper for
+        # per-workspace liveness; do not race a live tenant here.
+        return ("keep", "workspace-live-org", arn, name)
+    return ("delete", "orphan-workspace", arn, name)
 
 d = json.loads(sys.stdin.read())
 for s in d.get("SecretList", []):
@@ -241,16 +319,16 @@ for s in d.get("SecretList", []):
 
 DELETE_COUNT=$(printf '%s' "$DECISIONS" | python3 -c "import json,sys; print(sum(1 for l in sys.stdin if json.loads(l)['action']=='delete'))")
 KEEP_COUNT=$((TOTAL_SECRETS - DELETE_COUNT))
-TENANT_SECRETS=$(printf '%s' "$DECISIONS" | python3 -c "
+MANAGED_SECRETS=$(printf '%s' "$DECISIONS" | python3 -c "
 import json, sys
-n = sum(1 for l in sys.stdin if json.loads(l)['reason'] != 'not-a-tenant-secret')
+n = sum(1 for l in sys.stdin if json.loads(l)['reason'] != 'not-a-managed-secret')
 print(n)
 ")
 
 log ""
 log "== Sweep plan =="
 log "  total secrets:          $TOTAL_SECRETS"
-log "  tenant-shaped secrets:  $TENANT_SECRETS"
+log "  managed-shaped secrets: $MANAGED_SECRETS"
 log "  would delete:           $DELETE_COUNT"
 log "  would keep:             $KEEP_COUNT"
 log ""
@@ -272,17 +350,35 @@ for reason, n in keep_c.most_common():
     print(f'  keep/{reason}: {n}')
 "
 
-# Safety gate operates against the tenant-shaped subset — same
+# Safety gate operates against the managed-shaped subset — same
 # rationale as sweep-cf-tunnels: a miscount of platform-infra
 # secrets shouldn't relax the gate.
-if [ "$TENANT_SECRETS" -gt 0 ]; then
-  PCT=$(( DELETE_COUNT * 100 / TENANT_SECRETS ))
+#
+# IMPORTANT (the historical no-op trap): the REAL safety here is the
+# per-secret live-ORG cross-reference above — a secret is only marked
+# delete when its owning org provably no longer exists in the CP DB. The
+# percent gate is a blunt second line that, on a large genuine backlog
+# (e.g. the June-2026 2.4k-orphan workspace-config sprawl, ~99% orphan),
+# would itself BLOCK the very cleanup it exists to allow. So:
+#   - Normal steady state: <50% delete → gate passes, runs every hour.
+#   - Genuine bulk backlog: set SWEEP_ALLOW_BULK=1 to bypass the percent
+#     gate DELIBERATELY, trusting the live-org cross-reference. This is the
+#     sanctioned way to drain a backlog — NOT a blind MAX_DELETE_PCT bump.
+if [ "$MANAGED_SECRETS" -gt 0 ]; then
+  PCT=$(( DELETE_COUNT * 100 / MANAGED_SECRETS ))
   if [ "$PCT" -gt "$MAX_DELETE_PCT" ]; then
-    log ""
-    log "SAFETY: would delete $PCT% of tenant-shaped secrets (threshold $MAX_DELETE_PCT%) — refusing."
-    log "  If this is expected (e.g. major cleanup after incident), rerun with"
-    log "  MAX_DELETE_PCT=$((PCT+5)) $0 $*"
-    exit 2
+    if [ "${SWEEP_ALLOW_BULK:-0}" = "1" ]; then
+      log ""
+      log "SAFETY: would delete $PCT% of managed-shaped secrets (>$MAX_DELETE_PCT%) — BULK override active (SWEEP_ALLOW_BULK=1)."
+      log "  Proceeding: every delete is live-org-cross-referenced AND a 30-day RECOVERABLE delete (restorable)."
+    else
+      log ""
+      log "SAFETY: would delete $PCT% of managed-shaped secrets (threshold $MAX_DELETE_PCT%) — refusing."
+      log "  This is the expected gate on a genuine backlog. The deletes are"
+      log "  live-org-cross-referenced and recoverable (30d). To drain a backlog"
+      log "  deliberately, rerun with SWEEP_ALLOW_BULK=1 $0 $*"
+      exit 2
+    fi
   fi
 fi
 
@@ -312,11 +408,15 @@ fi
 # 30 min cap, but parallel-by-default keeps us symmetric with the
 # other sweepers and gives headroom for a one-off backlog.
 #
-# --force-delete-without-recovery skips the 7-30 day recovery window.
-# Acceptable here because (a) the GRACE_HOURS filter prevents touching
-# in-flight provisions, and (b) the secret is regenerated on every
-# fresh provision — losing one only matters for a tenant we're
-# explicitly trying to forget.
+# Deletion is RECOVERABLE (30-day recovery window), NOT force-delete.
+# Changed from --force-delete-without-recovery: a mistaken sweep must be
+# reversible via `aws secretsmanager restore-secret` for 30 days. The
+# GRACE_HOURS filter + live-org cross-reference make a mistake unlikely,
+# but at this scale (thousands of secrets) an unrecoverable bulk delete is
+# an unacceptable blast radius. The secret is also regenerated on every
+# fresh provision, so the recovery window is belt-and-suspenders, not the
+# only safety. Matches the CP provisioner + auto-reap reaper, which both
+# use DeleteSecret + RecoveryWindowInDays=30.
 
 CONCURRENCY="${SWEEP_CONCURRENCY:-8}"
 DELETE_PLAN=$(mktemp -t aws-secrets-plan-XXXXXX)
@@ -353,7 +453,7 @@ xargs -P "$CONCURRENCY" -L 1 -I {} bash -c '
   if aws secretsmanager delete-secret \
        --region "$AWS_REGION" \
        --secret-id "$arn" \
-       --force-delete-without-recovery \
+       --recovery-window-in-days 30 \
        --output json >/dev/null 2>&1; then
     echo OK
   else
