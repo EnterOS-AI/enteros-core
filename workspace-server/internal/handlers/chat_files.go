@@ -98,6 +98,31 @@ func NewChatFilesHandler(t *TemplatesHandler) *ChatFilesHandler {
 			// surfaces "connection too slow" — distinct from the file-size
 			// pre-flight that returns immediately before any network I/O.
 			Timeout: 1200 * time.Second,
+			// core#2129 RC 13395/CR2: disable redirects entirely. A safe
+			// workspace URL that 302s to a metadata/loopback/non-http
+			// target would otherwise be followed by the default client
+			// and the platform_inbound_secret would be forwarded to the
+			// unsafe target. ErrUseLastResponse surfaces the 3xx to the
+			// caller; we never chase. Mirrors the transcript-proxy
+			// pattern (transcript.go:73). The dial-time IP guard below
+			// is the belt-and-suspenders for any future code that
+			// re-enables redirects.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+			// Dial-time IP guard: safeDialer.Control inspects the
+			// POST-resolution IP on every dial and rejects if it
+			// violates isSafeURL. Catches DNS rebinding (where the
+			// preflight lookup returned a safe IP and the dial resolves
+			// to a different one) and any code that bypasses the
+			// redirect guard. Same pattern as transcript-proxy
+			// (transcript.go:91-98).
+			Transport: &http.Transport{
+				DialContext:         safeDialer().DialContext,
+				MaxIdleConns:        100,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 5 * time.Second,
+			},
 		},
 	}
 }
