@@ -138,6 +138,22 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		return fmt.Errorf("workspace %s: %w", ws.Name, err)
 	}
 
+	// core#2129 write-path SSRF defense (CR2 RC 13399): validate the
+	// external URL BEFORE any durable side effect (workspaces INSERT,
+	// canvas_layouts INSERT, structure_events INSERT). Pre-#3170RC1
+	// ordering put the validation after the INSERT, which left a
+	// stranded provisioning workspace row + layout + event for a
+	// rejected malicious leaf. Mirrors workspace.go's pre-BeginTx
+	// pattern (workspace.go:624) — reject at the boundary, not after
+	// the fact. The post-INSERT UPDATE that originally carried the URL
+	// never runs on rejection, so no unsafe URL ever lands in the DB.
+	if ws.External && ws.URL != "" {
+		if err := validateAgentURL(ws.URL); err != nil {
+			log.Printf("Org import: external workspace URL rejected for %s (pre-INSERT): %v — leaf rejected", ws.Name, err)
+			return fmt.Errorf("external workspace %s URL rejected: %w", ws.Name, err)
+		}
+	}
+
 	ctx := context.Background()
 
 	// Org-template imports default to expanded so children render
@@ -262,26 +278,13 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	h.workspace.seedInitialMemories(ctx, id, wsMemories)
 
 	// Handle external workspaces
+	//
+	// NOTE: external URL validation moved to the top of this function
+	// (CR2 RC 13399) — before the workspaces INSERT — so a rejected
+	// malicious URL leaves no workspace-row / canvas-layout / structure-
+	// event side effects. Only the UPDATE that lands `ws.URL` lives
+	// here, and it runs unconditionally on the happy path.
 	if ws.External {
-		// core#2129 write-path SSRF defense: validateAgentURL runs at
-		// registration-time on the /registry/register path. The org-import
-		// path bypasses /registry/register entirely (it writes `ws.URL`
-		// directly here), so re-validate before persisting to `workspaces.url`
-		// — otherwise a malicious template URL lands in the DB and the
-		// downstream chat-files forward would attach platform_inbound_secret
-		// to it. The forward-time layer added in PR#3169 is the critical
-		// gate; this is defense-in-depth.
-		//
-		// Reject the leaf via a non-nil return: the caller (top-level
-		// OrgImport handler) already returns 207 partial-import on a per-
-		// workspace error, so a per-leaf SSRF rejection surfaces correctly
-		// to the user without aborting the rest of the tree.
-		if ws.URL != "" {
-			if err := validateAgentURL(ws.URL); err != nil {
-				log.Printf("Org import: external workspace URL rejected for %s (%s): %v — leaf rejected", ws.Name, id, err)
-				return fmt.Errorf("external workspace %s URL rejected: %w", ws.Name, err)
-			}
-		}
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, url = $2 WHERE id = $3`, models.StatusOnline, ws.URL, id); err != nil {
 			log.Printf("Org import: external workspace status update failed for %s: %v", ws.Name, err)
 		}

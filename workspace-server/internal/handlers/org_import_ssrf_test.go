@@ -16,35 +16,39 @@ package handlers
 // The workspace.go (Create) write site already had SSRF tests
 // (TestWorkspaceCreate_ExternalURL_SSRFMetadataBlocked +
 // TestWorkspaceCreate_ExternalURL_SSRFLoopbackBlocked). The org_import
-// write site was the gap that CR2 RC 13398 called out — the fix is in
-// createWorkspaceTree (org_import.go:266) but the test coverage was
-// missing. This file closes the gap.
+// write site was the gap that CR2 RC 13398 called out.
+//
+// CR2 RC 13399 (raised after the initial #3170RC1 fix) tightened the
+// contract further: the validation must fire BEFORE the workspace
+// INSERT (and the canvas_layouts INSERT, and the structure_events
+// INSERT), so a rejected malicious URL leaves NO workspace-row side
+// effects. The previous post-INSERT check created a stranded
+// provisioning row + layout + event for the rejected leaf — same class
+// of "leave debris on failure" the Researcher flagged. These tests
+// assert the no-stray-row contract: a rejected external URL produces
+// no INSERT INTO workspaces, no INSERT INTO canvas_layouts, and no
+// INSERT INTO structure_events. sqlmock catches any unexpected call
+// as a test failure (the same way the existing TestEmitOrgEvent tests
+// pin SQL shapes).
 
 import (
-	"errors"
 	"strings"
 	"testing"
-
-	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/google/uuid"
 )
 
-// TestCreateWorkspaceTree_RejectsMetadataURL exercises the org_import
-// write-path SSRF defense for an external workspace whose URL points at
-// the cloud-metadata endpoint (169.254.169.254). The block must fire
-// AFTER the workspaces INSERT (the function inserts the row first, then
-// validates the URL before the status/url UPDATE) so the rejection
-// surfaces as a per-leaf error to the caller (the top-level OrgImport
-// handler returns 207 partial-import on a per-workspace error, so a
-// per-leaf SSRF rejection doesn't abort the rest of the tree).
+// TestCreateWorkspaceTree_RejectsMetadataURL is the cloud-metadata
+// analogue of the workspace.go SSRF tests, for the org_import write
+// path. The test pins two contracts:
 //
-// Key assertions:
-//   * createWorkspaceTree returns a non-nil error mentioning "URL rejected"
-//   * the workspaces INSERT happened (the row exists; otherwise the URL
-//     UPDATE would not even be reachable — the test is exercising the
-//     after-INSERT validation, not the pre-INSERT refusal)
-//   * the URL UPDATE for the metadata URL was NOT issued (sqlmock fails
-//     the test if any unmatched UPDATE with a metadata URL is posted).
+//  1. The function returns a non-nil error mentioning "URL rejected"
+//     (so the top-level OrgImport handler's 207 partial-import path
+//     surfaces the leaf error to the caller).
+//
+//  2. The function leaves NO database side effects on rejection —
+//     no workspaces row, no canvas_layouts row, no structure_events
+//     row. sqlmock expects zero queries, so any INSERT/UPDATE the
+//     function might have issued would fail the test via
+//     mock.ExpectationsWereMet() (it reports unexpected calls).
 func TestCreateWorkspaceTree_RejectsMetadataURL(t *testing.T) {
 	setSSRFCheckForTest(true)
 	t.Cleanup(func() { setSSRFCheckForTest(false)() })
@@ -58,32 +62,6 @@ func TestCreateWorkspaceTree_RejectsMetadataURL(t *testing.T) {
 		workspace:   wh,
 		broadcaster: broadcaster,
 	}
-
-	// 1. INSERT workspaces (RETURNING id) — the row IS created; the URL
-	// check fires AFTER the INSERT. The test exercises the post-INSERT
-	// defense; pre-INSERT refusal is covered by the workspace.go tests.
-	mock.ExpectQuery(`INSERT INTO workspaces`).
-		WithArgs(
-			sqlmock.AnyArg(), // id
-			"Bad Agent",      // name
-			sqlmock.AnyArg(), // role
-			sqlmock.AnyArg(), // tier
-			sqlmock.AnyArg(), // runtime
-			"provisioning",   // status
-			sqlmock.AnyArg(), // parent_id
-			sqlmock.AnyArg(), // workspace_dir
-			sqlmock.AnyArg(), // workspace_access
-			sqlmock.AnyArg(), // max_concurrent_tasks
-		).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(uuid.New().String()))
-
-	// 2. INSERT canvas_layouts (for the canvas placement).
-	mock.ExpectExec(`INSERT INTO canvas_layouts`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
-
-	// 3. INSERT structure_events (RecordAndBroadcast for EventWorkspaceProvisioning).
-	mock.ExpectExec(`INSERT INTO structure_events`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	ws := OrgWorkspace{
 		Name:     "Bad Agent",
@@ -106,27 +84,25 @@ func TestCreateWorkspaceTree_RejectsMetadataURL(t *testing.T) {
 		t.Errorf("expected error to mention 'URL rejected', got: %v", err)
 	}
 
-	// The URL UPDATE for the metadata URL must NOT have been issued.
-	// sqlmock.ExpectationsWereMet() fails the test if any expected exec
-	// wasn't called AND if any unexpected call was logged. The latter
-	// is what catches an UPDATE for the metadata URL — we never set up
-	// that expectation, so any UPDATE call would be flagged.
+	// No-stray-row contract: zero INSERTs/UPDATEs to workspaces,
+	// canvas_layouts, or structure_events. mock.ExpectationsWereMet()
+	// returns nil when zero expectations were set AND zero unexpected
+	// calls were logged; any INSERT/UPDATE the function would have
+	// made surfaces here as a test failure.
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
 }
 
-// TestCreateWorkspaceTree_RejectsLoopbackURL is the loopback analogue of
-// TestCreateWorkspaceTree_RejectsMetadataURL. Loopback is blocked in
-// self-hosted mode (the default for the org_import test) — a malicious
-// org template pointing an external workspace at 127.0.0.1 must be
-// rejected by the same defense-in-depth gate.
+// TestCreateWorkspaceTree_RejectsLoopbackURL is the loopback analogue
+// of TestCreateWorkspaceTree_RejectsMetadataURL. Loopback is blocked
+// in self-hosted mode (the default for the org_import test) — a
+// malicious org template pointing an external workspace at 127.0.0.1
+// must be rejected by the same pre-INSERT defense.
 //
-// 127.0.0.1 is a metadata-class target (same class as the AWS / GCP /
-// Azure IMDS endpoints — an attacker reaching the loopback interface of
-// the host running the platform can hit services that listen on
-// 127.0.0.1 only, including any debug/admin endpoints a developer left
-// open during development).
+// 127.0.0.1 is a metadata-class target — an attacker reaching the
+// host's loopback interface can hit any debug/admin endpoint a
+// developer left open during development.
 func TestCreateWorkspaceTree_RejectsLoopbackURL(t *testing.T) {
 	setSSRFCheckForTest(true)
 	t.Cleanup(func() { setSSRFCheckForTest(false)() })
@@ -140,26 +116,6 @@ func TestCreateWorkspaceTree_RejectsLoopbackURL(t *testing.T) {
 		workspace:   wh,
 		broadcaster: broadcaster,
 	}
-
-	mock.ExpectQuery(`INSERT INTO workspaces`).
-		WithArgs(
-			sqlmock.AnyArg(),
-			"Bad Loopback",
-			sqlmock.AnyArg(),
-			sqlmock.AnyArg(),
-			sqlmock.AnyArg(),
-			"provisioning",
-			sqlmock.AnyArg(),
-			sqlmock.AnyArg(),
-			sqlmock.AnyArg(),
-			sqlmock.AnyArg(),
-		).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(uuid.New().String()))
-
-	mock.ExpectExec(`INSERT INTO canvas_layouts`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectExec(`INSERT INTO structure_events`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	ws := OrgWorkspace{
 		Name:     "Bad Loopback",
@@ -186,13 +142,3 @@ func TestCreateWorkspaceTree_RejectsLoopbackURL(t *testing.T) {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
 }
-
-// errSentinel is referenced in package tests that need a stable error
-// for sqlmock expectation error returns. Declared here to keep the SSRF
-// test self-contained.
-var errSentinel = errors.New("sentinel")
-
-// errSentinelTest aliases the package-level test helper when present
-// (some test files already declare their own; this keeps the SSRF file
-// importable in isolation).
-var _ = errSentinelTest
