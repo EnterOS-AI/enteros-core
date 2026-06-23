@@ -223,6 +223,15 @@ func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args
 		return "", fmt.Errorf("task is required")
 	}
 
+	// core#2127: defence-in-depth — even if the MCP tools/list gate is
+	// bypassed (stale tool cache, a caller that hand-builds an A2A body),
+	// the delegation call itself must 403 on can_delegate=false. Per
+	// OFFSEC-001, the error message is constant; the policy is documented
+	// in tools/list (hidden) + the abilities API.
+	if canDelegate, derr := loadWorkspaceCanDelegate(ctx, h.database, callerID); derr == nil && !canDelegate {
+		return "", fmt.Errorf("tool call failed")
+	}
+
 	if !registry.CanCommunicate(callerID, targetID) {
 		return "", fmt.Errorf("workspace %s is not authorised to communicate with %s", callerID, targetID)
 	}
@@ -277,6 +286,11 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 	}
 	if task == "" {
 		return "", fmt.Errorf("task is required")
+	}
+
+	// core#2127: see toolDelegateTask — same defence-in-depth gate.
+	if canDelegate, derr := loadWorkspaceCanDelegate(ctx, h.database, callerID); derr == nil && !canDelegate {
+		return "", fmt.Errorf("tool call failed")
 	}
 
 	if !registry.CanCommunicate(callerID, targetID) {

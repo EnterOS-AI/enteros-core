@@ -1624,3 +1624,153 @@ func TestMCPHandler_dispatchRPC_InvalidParams_ArrayInsteadOfObject(t *testing.T)
 		t.Errorf("error message should be constant 'invalid parameters', got: %q", resp.Error.Message)
 	}
 }
+
+// ---------- core#2127: can_delegate=FALSE rejects delegate_task / async ----------
+
+// TestMCPHandler_DelegateTask_CanDelegateFalse_Rejects is the server-side
+// delegation-policy gate. A role-locked "coding executor" with
+// can_delegate=FALSE must NOT be able to delegate, even if its prompt
+// bypasses the role or its MCP tools/list cache is stale. The MCP gate
+// at the tool-entry point is the second line of defence (the first is
+// the tools/list filter that hides the tools).
+func TestMCPHandler_DelegateTask_CanDelegateFalse_Rejects(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+
+	// can_delegate lookup returns FALSE — the gate MUST short-circuit
+	// BEFORE the CanCommunicate lookup or any A2A proxy call.
+	mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+		WithArgs(callerID).
+		WillReturnRows(sqlmock.NewRows([]string{"can_delegate"}).AddRow(false))
+	// No further DB or proxy expectations — the call MUST fail closed.
+
+	out, err := h.toolDelegateTask(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "do work",
+	}, mcpCallTimeout)
+	if err == nil {
+		t.Fatalf("delegate_task must return error when can_delegate=false, got nil (out=%q)", out)
+	}
+	// Per OFFSEC-001: error message is constant; the policy lives in
+	// tools/list (hidden) + the abilities API. Do NOT assert the
+	// can_delegate wording leaks to the caller.
+	if strings.Contains(err.Error(), "can_delegate") {
+		t.Errorf("error message leaks can_delegate wording: %q", err.Error())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (a follow-up CanCommunicate or proxy call means the gate leaked): %v", err)
+	}
+}
+
+func TestMCPHandler_DelegateTaskAsync_CanDelegateFalse_Rejects(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+
+	mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+		WithArgs(callerID).
+		WillReturnRows(sqlmock.NewRows([]string{"can_delegate"}).AddRow(false))
+
+	out, err := h.toolDelegateTaskAsync(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "do work",
+	})
+	if err == nil {
+		t.Fatalf("delegate_task_async must return error when can_delegate=false, got nil (out=%q)", out)
+	}
+	if strings.Contains(err.Error(), "can_delegate") {
+		t.Errorf("error message leaks can_delegate wording: %q", err.Error())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestMCPHandler_DelegateTask_CanDelegateTrue_Proceeds is the no-regression
+// sentinel: a workspace with can_delegate=TRUE (the default for every
+// existing workspace) MUST follow the existing delegation path unchanged.
+func TestMCPHandler_DelegateTask_CanDelegateTrue_Proceeds(t *testing.T) {
+	h, mock := newMCPHandler(t)
+	callerID := "11111111-1111-1111-1111-111111111111"
+	targetID := "22222222-2222-2222-2222-222222222222"
+	parentID := "33333333-3333-3333-3333-333333333333"
+
+	// can_delegate=TRUE (the default) — proceed.
+	mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+		WithArgs(callerID).
+		WillReturnRows(sqlmock.NewRows([]string{"can_delegate"}).AddRow(true))
+	expectCanCommunicateSiblings(mock, callerID, targetID, parentID)
+	mock.ExpectExec(`(?s)INSERT INTO activity_logs.*'delegation'.*'delegate'`).
+		WithArgs(callerID, callerID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), "pending").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`UPDATE activity_logs`).
+		WithArgs("dispatched", "", callerID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	h.a2aProxy = func(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error) {
+		return 200, []byte(`{"result":{"message":{"parts":[{"text":"done"}]}}}`), nil
+	}
+
+	out, err := h.toolDelegateTask(context.Background(), callerID, map[string]interface{}{
+		"workspace_id": targetID,
+		"task":         "do work",
+	}, mcpCallTimeout)
+	if err != nil {
+		t.Fatalf("delegate_task with can_delegate=true returned error: %v", err)
+	}
+	if out != "done" {
+		t.Fatalf("delegate_task response = %q, want done", out)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// TestMCPToolList_CanDelegateFalse_HidesDelegateTools is the
+// tools/list-side filter. A locked-out workspace must NOT see
+// delegate_task or delegate_task_async in its tools/list response.
+func TestMCPToolList_CanDelegateFalse_HidesDelegateTools(t *testing.T) {
+	tools := mcpToolList(false)
+	for _, tool := range tools {
+		if tool.Name == "delegate_task" || tool.Name == "delegate_task_async" {
+			t.Errorf("can_delegate=false must hide %q from tools/list; got it visible", tool.Name)
+		}
+	}
+	// And the rest still show up — delegate_task filtering must be the
+	// ONLY change. Check that list_peers, get_workspace_info, check_task_status
+	// all remain visible (the rest of the surface is unaffected).
+	wantVisible := []string{"list_peers", "get_workspace_info", "check_task_status"}
+	for _, name := range wantVisible {
+		found := false
+		for _, tool := range tools {
+			if tool.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("can_delegate=false must still expose %q (only delegate_* are gated)", name)
+		}
+	}
+}
+
+func TestMCPToolList_CanDelegateTrue_ShowsDelegateTools(t *testing.T) {
+	tools := mcpToolList(true)
+	foundDelegate := false
+	foundDelegateAsync := false
+	for _, tool := range tools {
+		if tool.Name == "delegate_task" {
+			foundDelegate = true
+		}
+		if tool.Name == "delegate_task_async" {
+			foundDelegateAsync = true
+		}
+	}
+	if !foundDelegate {
+		t.Errorf("can_delegate=true must include delegate_task in tools/list")
+	}
+	if !foundDelegateAsync {
+		t.Errorf("can_delegate=true must include delegate_task_async in tools/list")
+	}
+}
