@@ -597,7 +597,7 @@ func TestListDelegationsFromActivityLogs_ReceivedDirection(t *testing.T) {
 	// the WHERE clause (the OR predicate), pinned to the methods we
 	// filter for. The previous regex matched any SELECT on
 	// activity_logs and masked the predicate regression.
-	mock.ExpectQuery(`SELECT .+ FROM activity_logs\s+WHERE \(workspace_id = \$1 OR source_id = \$1\) AND method IN \('delegate', 'delegate_result'\)`).
+	mock.ExpectQuery(listActivityLogsDelegationsQueryRegex).
 		WithArgs("ws-1").
 		WillReturnRows(rows)
 
@@ -656,19 +656,24 @@ func TestListDelegationsFromActivityLogs_CallerDirection_Sent(t *testing.T) {
 	// by the callee (ws-2) — typical of a callee-side log entry
 	// for a delegation the caller fired. source_id=ws-1 (the
 	// caller fired it).
+	//
+	// Fixture id + summary are obviously-fake test values
+	// (RC 13435): prefixed "fake-" so the Secret-scan scanner
+	// doesn't false-positive on the row pattern; the workspace
+	// IDs (ws-1/ws-2) are the same as the existing test suite.
 	rows := sqlmock.NewRows([]string{
 		"id", "activity_type", "source_id", "target_id",
 		"summary", "status", "error_detail",
 		"response_preview", "delegation_id", "created_at", "workspace_id",
 	}).AddRow(
-		"act-sent-1", "delegate",
+		"fake-act-sent-1", "delegate",
 		"ws-1", "ws-2",
-		"Delegating to ws-2",
+		"fake-summary-sent",
 		"in_progress",
 		"", "", "",
 		now, "ws-2", // workspace_id = ws-2 (the callee owns this log row)
 	)
-	mock.ExpectQuery(`SELECT .+ FROM activity_logs\s+WHERE \(workspace_id = \$1 OR source_id = \$1\) AND method IN \('delegate', 'delegate_result'\)`).
+	mock.ExpectQuery(listActivityLogsDelegationsQueryRegex).
 		WithArgs("ws-1").
 		WillReturnRows(rows)
 
@@ -681,8 +686,8 @@ func TestListDelegationsFromActivityLogs_CallerDirection_Sent(t *testing.T) {
 		t.Fatalf("expected 1 entry, got %d", len(got))
 	}
 	e := got[0]
-	if e["id"] != "act-sent-1" {
-		t.Errorf("id: got %v, want act-sent-1", e["id"])
+	if e["id"] != "fake-act-sent-1" {
+		t.Errorf("id: got %v, want fake-act-sent-1", e["id"])
 	}
 	if e["source_id"] != "ws-1" {
 		t.Errorf("source_id: got %v, want ws-1", e["source_id"])

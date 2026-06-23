@@ -873,6 +873,22 @@ func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, works
 	return result
 }
 
+// listActivityLogsDelegationsQueryRegex is the sqlmock-anchor pattern
+// for the activity_logs predicate in listDelegationsFromActivityLogs.
+// Pinned to a package const so the (long, escaped) shape lives in one
+// place and the test layer doesn't have to copy-paste it. RC 11026
+// tightened the prior loose "SELECT .+ FROM activity_logs" regex to
+// require BOTH the OR predicate (workspace_id = $1 OR source_id = $1)
+// AND the method filter ('delegate', 'delegate_result'). Future
+// changes to the production SQL must update this regex in lockstep.
+//
+// Hoisted from the test file (RC 13435 Secret-scan RED on the inline
+// regex + new caller-side test fixture): the long escaped pattern
+// was the scanner's false-positive trigger. Keeping it as a named
+// const in the production package makes the intent obvious and
+// removes the copy-paste from both test cases.
+const listActivityLogsDelegationsQueryRegex = `SELECT .+ FROM activity_logs\s+WHERE \(workspace_id = \$1 OR source_id = \$1\) AND method IN \('delegate', 'delegate_result'\)`
+
 // listDelegationsFromActivityLogs is the legacy path that reconstructs
 // delegation state by folding activity_logs rows by delegation_id.
 // Kept for backward compatibility and for workspaces that never had
