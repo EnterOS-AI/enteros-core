@@ -82,6 +82,13 @@ COPY .tenant-bundle-deps/plugins /plugins
 # Non-root runtime with Docker socket access for workspace provisioning.
 RUN addgroup -g 1000 platform && adduser -u 1000 -G platform -s /bin/sh -D platform
 EXPOSE 8080
+# HEALTHCHECK: probe the /health endpoint so orchestrators and docker's
+# health monitoring can detect a crashed or wedged server.
+# mc#1158: workspace/Dockerfile has a HEALTHCHECK; workspace-server/Dockerfile
+# was missing one, so docker ps never shows (healthy) for this container.
+# Interval 30s, timeout 5s, 3 retries, 30s start period (server boot).
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=30s \
+  CMD wget -qO- --timeout=5 http://localhost:8080/health || exit 1
 COPY <<'ENTRY' /entrypoint.sh
 #!/bin/sh
 # Set up docker-socket group (unchanged from pre-sidecar entrypoint).
