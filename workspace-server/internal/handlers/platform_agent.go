@@ -360,7 +360,10 @@ func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID
 	// boot). Re-asserting on EVERY provision would silently revert the customer's
 	// pick — exactly the platform-overriding-customer violation the SSOT
 	// directive forbids.
-	if existing := readStoredModelSecret(ctx, workspaceID); existing != "" {
+	if existing, readErr := readStoredModelSecret(ctx, workspaceID); readErr != nil {
+		log.Printf("Provisioner: concierge %s MODEL read failed (failing closed, NOT seeding): %v", workspaceID, readErr)
+		return
+	} else if existing != "" {
 		return // explicit model already set; never overwrite the customer's choice
 	}
 
@@ -392,23 +395,39 @@ func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID
 	}
 }
 
-// readStoredModelSecret returns the decrypted MODEL workspace_secret, or "" when
-// none is stored (or on any read/decrypt error — treated as "unset" so a
-// transient miss re-seeds rather than wedges). Used by ensureConciergeModel to
-// decide seed-vs-respect.
-func readStoredModelSecret(ctx context.Context, workspaceID string) string {
+// readStoredModelSecret returns the decrypted MODEL workspace_secret.
+// The second return value distinguishes the three observed states so the caller
+// can fail closed rather than fail open on a transient error:
+//
+//   - (value, nil): a secret is stored and decrypted successfully → caller
+//     respects the existing model and skips the seed.
+//   - ("", nil): no row exists for this workspace/key → caller may re-seed
+//     safely (this is the fresh-boot / cleared-secret case).
+//   - ("", error): the row exists (or the read otherwise succeeded) but the
+//     decryption failed → caller MUST NOT treat this as "unset" and MUST NOT
+//     fall back to seeding the platform default. Returning "" without the
+//     error used to silently overwrite the customer's model pick if the
+//     secret store later recovered: the seed path would re-fire on the next
+//     provision and the customer's choice would be lost without any error
+//     surfaced. Sibling of core#3162 (which closed the same fail-open shape
+//     on readStoredProviderSecret).
+func readStoredModelSecret(ctx context.Context, workspaceID string) (string, error) {
 	var stored []byte
 	var version int
-	if err := db.DB.QueryRowContext(ctx,
+	err := db.DB.QueryRowContext(ctx,
 		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL'`,
-		workspaceID).Scan(&stored, &version); err != nil {
-		return ""
-	}
-	dec, err := crypto.DecryptVersioned(stored, version)
+		workspaceID).Scan(&stored, &version)
 	if err != nil {
-		return ""
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("readStoredModelSecret scan: %w", err)
 	}
-	return string(dec)
+	dec, derr := crypto.DecryptVersioned(stored, version)
+	if derr != nil {
+		return "", fmt.Errorf("readStoredModelSecret decrypt: %w", derr)
+	}
+	return string(dec), nil
 }
 
 // conciergeProvider is the provider-registry NAME the concierge's declared

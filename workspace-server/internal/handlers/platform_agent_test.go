@@ -1140,3 +1140,94 @@ func TestEnsureConciergeProvider_FailsClosedOnReadError(t *testing.T) {
 		}
 	})
 }
+
+// TestEnsureConciergeModel_FailsClosedOnReadError is the sibling regression
+// gate for the MODEL half of the fail-open shape (paired with
+// TestEnsureConciergeProvider_FailsClosedOnReadError). Same shape as core#3162:
+// a transient decrypt/read error on an existing MODEL row used to be collapsed
+// into "" and treated as "unset", which would silently overwrite the customer's
+// model pick if the secret store later recovered (the seed path would re-fire
+// on the next provision and the customer's choice would be lost without any
+// error surfaced). The fix returns the error; ensureConciergeModel MUST fail
+// closed (return without seeding) so the next provision re-tries rather than
+// losing the customer's pick.
+func TestEnsureConciergeModel_FailsClosedOnReadError(t *testing.T) {
+	h := &WorkspaceHandler{}
+	const modelSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`
+	const secretInsert = `INSERT INTO workspace_secrets`
+
+	t.Run("decrypt error on existing MODEL row fails closed (does NOT seed default)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-model-decrypt-fail").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("corrupt-ciphertext-that-cannot-be-decrypted"), 0))
+		// NO ExpectExec: the fail-closed path MUST NOT persist MODEL.
+
+		env := map[string]string{}
+		h.ensureConciergeModel(context.Background(), "ws-model-decrypt-fail", env)
+
+		if _, seeded := env["MODEL"]; seeded {
+			t.Errorf("transient decrypt error seeded MODEL=%q — would silently overwrite the customer's pick", env["MODEL"])
+		}
+		if _, seeded := env["MOLECULE_MODEL"]; seeded {
+			t.Errorf("transient decrypt error seeded MOLECULE_MODEL=%q", env["MOLECULE_MODEL"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (a MODEL INSERT means the fail-closed path leaked): %v", err)
+		}
+	})
+
+	t.Run("db scan error (non-ErrNoRows) on MODEL fails closed", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-model-scan-fail").
+			WillReturnError(fmt.Errorf("connection refused"))
+		// NO ExpectExec: fail closed.
+
+		env := map[string]string{}
+		h.ensureConciergeModel(context.Background(), "ws-model-scan-fail", env)
+
+		if _, seeded := env["MODEL"]; seeded {
+			t.Errorf("DB scan error seeded MODEL=%q", env["MODEL"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("sql.ErrNoRows (genuine unset MODEL) proceeds to seed (no regression)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-model-fresh-unset").
+			WillReturnError(sql.ErrNoRows)
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-model-fresh-unset", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		env := map[string]string{}
+		h.ensureConciergeModel(context.Background(), "ws-model-fresh-unset", env)
+
+		if env["MODEL"] != conciergeDeclaredModel {
+			t.Errorf("genuine unset did not seed MODEL=%q; got %q (env=%v) — regression on the seed path", conciergeDeclaredModel, env["MODEL"], env)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (the seed path did not persist): %v", err)
+		}
+	})
+
+	t.Run("existing stored MODEL is respected on successful read (no regression)", func(t *testing.T) {
+		mock := setupTestDB(t)
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-model-existing").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("anthropic:claude-opus-4-8"), 0))
+		// NO ExpectExec: existing pick wins → no seed.
+
+		env := map[string]string{}
+		h.ensureConciergeModel(context.Background(), "ws-model-existing", env)
+
+		if _, seeded := env["MODEL"]; seeded {
+			t.Errorf("existing MODEL pick wrongly overwrote with default (env=%v)", env)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+}
