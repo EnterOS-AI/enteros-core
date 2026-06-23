@@ -160,6 +160,32 @@ items:
       List of feedback memories applicable to this change. Ack from
       any engineer who has the same memory access.
 
+  - slug: scope-matches-declared
+    numeric_alias: 8
+    pr_section_marker: "Scope matches title"
+    required_teams: [engineers, managers, ceo]
+    required_teams_high_risk: [ceo]
+    description: >-
+      The PR file list matches its declared scope/title — no off-topic
+      files, no unreviewable size (a "36 test cases" PR that adds 396 files
+      + a lockfile + runbooks is a REJECT / re-scope, not a pass). Reviewer
+      confirms they walked the FULL file list, not just the headline change.
+      Non-author ack; NOT ai-ack-eligible (a reviewer must actually look).
+      Added 2026-06-23 after PR #881 slipped 6 runbooks into the PUBLIC repo
+      under a canvas-test title.
+
+  - slug: public-repo-hygiene
+    numeric_alias: 9
+    pr_section_marker: "Public-repo hygiene checked"
+    required_teams: [engineers, security, managers, ceo]
+    required_teams_high_risk: [ceo]
+    description: >-
+      molecule-core is PUBLIC (private=false): every added path AND all git
+      history is world-readable. Reviewer confirms this PR adds NO operational
+      runbooks, internal docs, infra identifiers (hosts, account IDs, cred
+      paths), or secrets. Ops docs belong in the private internal repo.
+      Non-author ack; NOT ai-ack-eligible.
+
 # N/A gate declarations (RFC#324 §N/A follow-up).
 # PRs where a gate genuinely does not apply (e.g., pure-infra with no
 # qa surface, or docs-only) can be declared N/A by a non-author peer
