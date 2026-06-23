@@ -106,6 +106,48 @@ built-in `AgentskillsAdaptor` covers the common shape (copy skills to
 [plugins_registry](../../workspace/plugins_registry/__init__.py)
 for the resolution order.
 
+## MCP-server plugins (the plugin declaration is the SSOT)
+
+A plugin can also carry an **MCP server** rather than (or alongside) skills
+and rules. This is how privileged capabilities like the **management /
+platform MCP** reach an agent — see
+[`rfc-platform-mcp-as-plugin.md`](../design/rfc-platform-mcp-as-plugin.md).
+
+The model is the same two-layer split, applied to MCP:
+
+- **The plugin declaration is the single source of truth.** An agent's MCP
+  servers come from the plugins it declares (`config.yaml: plugins:`), **not**
+  from a separate, hand-maintained `mcp_servers:` list. There is one place an
+  MCP capability is named: the plugin.
+- **The plugin ships a runtime-agnostic MCP descriptor** — the logical server
+  definition (command/args/env, with secrets *referenced*, never embedded),
+  independent of any one runtime's config file format.
+- **A per-runtime shape adapter renders that descriptor into the runtime's
+  native MCP config.** Each runtime reads MCP servers from a different place,
+  so the adapter writes the descriptor into the right shape for the active
+  runtime:
+
+  | Runtime | Native MCP config the adapter renders into |
+  |---|---|
+  | claude-code | `.claude/settings.json` (`mcpServers` block) |
+  | codex | `~/.codex/config.toml` |
+  | gemini | `~/.gemini/settings.json` |
+  | hermes | `platforms.*` config stanza |
+
+  Because the descriptor is runtime-agnostic and the adapter is per-runtime,
+  the **same MCP plugin works across runtimes** — the agent is
+  runtime-switchable, and the plugin declaration doesn't change when the
+  runtime does.
+
+The exact adapter API (class names, function signatures, the registry
+resolution order) is owned by the workspace runtime and is being finalized
+there — **see the runtime implementation** rather than pinning specifics here.
+
+> Privileged MCP plugins (e.g. the org-admin management MCP) are
+> **entitlement-gated**: installable only on the org-root `kind=platform`
+> concierge, enforced server-side. See
+> [`rfc-platform-mcp-as-plugin.md`](../design/rfc-platform-mcp-as-plugin.md) §4.
+
 ## Validator
 
 Run before publishing a plugin:

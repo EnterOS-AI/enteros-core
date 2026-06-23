@@ -2,7 +2,7 @@
 
 **Status:** Draft
 **Author:** CEO Assistant (on CTO direction)
-**Related:** RCA #2831 (SaaS agents lose config/skills/memory), #2832 (credentials in auto-memory), #2838 (provisioner reconciliation — partial), merged runtime fix #125/#134 (memory re-inject on auto-heal + persistence discipline), seo-template #16 (slash-command format)
+**Related:** RCA #2831 (SaaS agents lose config/skills/memory), #2832 (credentials in auto-memory), #2838 (provisioner reconciliation — partial), merged runtime fix #125/#134 (memory re-inject on auto-heal + persistence discipline), seo-template #16 (slash-command format), [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md) (the concierge **management MCP** moves to the plugin channel — companion to the §10a concierge-identity-as-template fix below)
 
 ## 1. Summary
 
@@ -118,6 +118,15 @@ The same "should be a template, not a patch" smell exists for the **org concierg
 - `conciergeIdentityFiles()` overlays these as `system-prompt.md` + `config.yaml` at provision.
 
 The concierge has an image (`Dockerfile.platform-agent`) but **no template home for its identity** — so its prompt/config/model live as core string literals, exactly like the SEO skill files did. The fix is the same abstraction: make the concierge a **platform-agent template** (prompt/config/model in template files) delivered via this RFC's generic asset channel, and delete the `conciergeSystemPromptTmpl`/`conciergeMCPServersBlock`/`conciergeIdentityFiles` literals from core. The asset channel introduced here is the enabler for removing **both** the SEO patch **and** the concierge hardcoding.
+
+> **Cross-ref: [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md).** That RFC completes
+> this de-hardcoding for the concierge along the **plugin** axis: the `conciergeMCPServersBlock`
+> management-MCP wiring moves out of core into an **entitlement-gated MCP plugin** declared by the
+> platform-agent template (`config.yaml: plugins:` is the SSOT). It also **retires the
+> `Dockerfile.platform-agent` baked image** (the standard runtime image + the plugin is the
+> concierge) and makes the platform agent **runtime-switchable** (no hardcoded `runtime: claude-code`).
+> In short: this RFC's asset channel carries the small concierge **identity** (config/prompts);
+> the plugin channel carries the concierge **capability** (the management MCP).
 
 **Audit scope notes:** per-runtime branches in core (e.g. `if runtime == "hermes"` for provision-timeout/config paths) are adapter/registry concerns, not per-template patches — lower priority, candidates for data-driven cleanup but not in this RFC. No plugin-behavior was found hardcoded in core (the plugin system is used for extensions). The two clear "should be a template" patches are: (1) SEO skill package, (2) concierge identity.
 
