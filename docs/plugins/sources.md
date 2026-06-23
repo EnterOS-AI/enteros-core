@@ -165,3 +165,14 @@ layer works. The two are wired together but independent: the source
 layer's job ends when plugin files are staged on disk; the shape layer
 (per-runtime adapter inside the workspace) decides what to do with them
 on workspace startup.
+
+One shape is an **MCP server**. An MCP plugin ships a *runtime-agnostic
+MCP descriptor*, and the per-runtime shape adapter renders it into that
+runtime's native MCP config (claude `.claude/settings.json`, codex
+`~/.codex/config.toml`, gemini `~/.gemini/settings.json`, hermes
+`platforms.*`). The plugin declaration (`config.yaml: plugins:`) is the
+**single source of truth** for an agent's MCP servers — there is no
+separate `mcp_servers:` list. This is how the privileged management /
+platform MCP reaches the org concierge; see
+[agentskills-compat.md](agentskills-compat.md#mcp-server-plugins-the-plugin-declaration-is-the-ssot)
+and [`rfc-platform-mcp-as-plugin.md`](../design/rfc-platform-mcp-as-plugin.md).

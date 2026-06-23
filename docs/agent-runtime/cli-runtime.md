@@ -182,6 +182,30 @@ The agent uses these tools naturally — no special instructions needed. Access 
 
 Example flow: Marketing uses `delegate_task(seo_id, "What is your status?")` → A2A message to SEO → SEO responds → result returned to Marketing.
 
+### Additional MCP servers via plugins (plugin declaration is the SSOT)
+
+Beyond the always-on `a2a` server, a workspace gains **additional MCP servers
+by declaring plugins** — the plugin declaration (`config.yaml: plugins:`) is
+the single source of truth for an agent's MCP servers; there is **no separate
+hand-maintained `mcp_servers:` list**.
+
+Conceptually: an **MCP plugin** ships a *runtime-agnostic MCP descriptor* (the
+logical server definition, with secrets referenced rather than embedded), and a
+**per-runtime shape adapter** renders that descriptor into the active runtime's
+native MCP config — for claude-code that is the `.claude/settings.json`
+`mcpServers` block read by the SDK; for other runtimes it is their own MCP
+config location (codex `~/.codex/config.toml`, gemini `~/.gemini/settings.json`,
+hermes `platforms.*`). Because the descriptor is runtime-agnostic, the same MCP
+plugin works across runtimes and the agent stays **runtime-switchable**.
+
+This is the channel by which the org concierge gets its privileged management /
+platform MCP (entitlement-gated to the org-root `kind=platform` agent) — see
+[`rfc-platform-mcp-as-plugin.md`](../design/rfc-platform-mcp-as-plugin.md) and
+[plugins/agentskills-compat.md](../plugins/agentskills-compat.md#mcp-server-plugins-the-plugin-declaration-is-the-ssot).
+The concrete adapter API and registry resolution order live in the workspace
+runtime — **see the runtime implementation**; they are intentionally not pinned
+here.
+
 ### Delegation Error Handling
 
 When `delegate_task` receives an error from a child (auth failure, timeout, offline), the MCP server wraps it as a `DELEGATION FAILED` message with instructions for the calling agent to: (1) try a different peer, (2) handle the task itself, or (3) inform the user which peer is unavailable and provide its own best answer. Errors are tagged with a `[A2A_ERROR]` sentinel prefix so they can be reliably distinguished from normal response text. Coordinator prompts and A2A instructions reinforce that agents must never forward raw error messages to the user.
