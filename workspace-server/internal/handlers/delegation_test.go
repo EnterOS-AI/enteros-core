@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1831,5 +1832,102 @@ func TestBuildDelegateA2ABody_SchemaValidSendMessageRequest(t *testing.T) {
 	}
 	if meta["delegation_id"] != delegationID {
 		t.Errorf("metadata.delegation_id = %v, want %s", meta["delegation_id"], delegationID)
+	}
+}
+
+// ---------- core#2127 (Researcher RC 13387): can_delegate REST gate ----------
+
+// TestDelegate_CanDelegateFalse_RestEndpointRejected is the regression for
+// the REST endpoint bypass surfaced by Researcher RC 13387. The MCP
+// delegation gate (PR#3165) covers the MCP tools/list + tools/call + the
+// delegate helpers, but the RAW REST endpoint POST /workspaces/:id/delegate
+// remained unguarded. A locked-out workspace that hand-builds an HTTP body
+// would otherwise still dispatch delegations via this path.
+//
+// This test exercises the REST path directly (not via the MCP bridge) so the
+// regression sentinel stays pinned even if the MCP layer is refactored.
+func TestDelegate_CanDelegateFalse_RestEndpointRejected(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	sourceID := "11111111-2222-3333-4444-555555555555"
+	targetID := "66666666-7777-8888-9999-aaaaaaaaaaaa"
+
+	// can_delegate lookup returns FALSE — the REST gate MUST short-circuit
+	// BEFORE the self-delegation check, idempotency lookup, or any
+	// insertDelegationRow / executeDelegation work.
+	mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+		WithArgs(sourceID).
+		WillReturnRows(sqlmock.NewRows([]string{"can_delegate"}).AddRow(false))
+	// No further DB or proxy expectations — the call MUST fail closed.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: sourceID}}
+	body := `{"target_id":"` + targetID + `","task":"do something"}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+sourceID+"/delegate", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	dh.Delegate(c)
+
+	// Per OFFSEC-001: the error message is constant; the policy itself
+	// lives in tools/list (hidden) + the abilities API + this REST gate.
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for can_delegate=false, got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "can_delegate") {
+		t.Errorf("error body leaks can_delegate wording: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (a follow-up idempotency/insert/exec call means the gate leaked): %v", err)
+	}
+}
+
+// TestDelegate_CanDelegateTrue_NoRegression is the no-regression sentinel
+// for the default-true path. A workspace with can_delegate=TRUE (every
+// existing workspace) MUST follow the existing delegation flow unchanged.
+// Mirrors TestDelegate_Success (the only delta is the can_delegate lookup
+// returning true in front of the same activity_logs + structure_events
+// inserts).
+func TestDelegate_CanDelegateTrue_NoRegression(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	sourceID := "ws-source"
+	targetID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+	// can_delegate=TRUE — proceed through the existing flow.
+	mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+		WithArgs(sourceID).
+		WillReturnRows(sqlmock.NewRows([]string{"can_delegate"}).AddRow(true))
+	// Existing success-path expectations (mirrors TestDelegate_Success).
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WithArgs(sourceID, sourceID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), sqlmock.AnyArg(), nil).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: sourceID}}
+	body := fmt.Sprintf(`{"target_id":"%s","task":"write unit tests"}`, targetID)
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+sourceID+"/delegate", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	dh.Delegate(c)
+
+	if w.Code != http.StatusAccepted {
+		t.Errorf("expected 202 for can_delegate=true happy path, got %d: %s", w.Code, w.Body.String())
+	}
+	// Wait for the background goroutine (mirrors TestDelegate_Success).
+	time.Sleep(100 * time.Millisecond)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
