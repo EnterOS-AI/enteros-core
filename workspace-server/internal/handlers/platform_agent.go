@@ -24,6 +24,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -492,7 +493,18 @@ const conciergePlatformMCPCreateWorkspaceTool = "mcp__molecule-platform__create_
 func (h *WorkspaceHandler) ensureConciergeProvider(ctx context.Context, workspaceID string, envVars map[string]string) {
 	// Respect an explicit provider already set (customer canvas pick or a prior
 	// seed): loadWorkspaceSecrets already injected it into envVars. Do nothing.
-	if existing := readStoredProviderSecret(ctx, workspaceID); existing != "" {
+	//
+	// Fail-CLOSED on decrypt/read error (core#3162): if the secret store returned
+	// an error rather than a clean "" (the row exists but the value is unreadable
+	// — transient DB blip, key-rotation drift, ciphertext corruption), we MUST NOT
+	// fall through to the platform-provider pin below. Doing so would wedge a
+	// transient decrypt failure into a fail-OPEN platform mis-pin on the next
+	// provision — combined with a momentarily-empty MODEL, that could silently
+	// route a BYOK/self-host concierge through the platform LLM proxy.
+	if existing, readErr := readStoredProviderSecret(ctx, workspaceID); readErr != nil {
+		log.Printf("Provisioner: concierge %s LLM_PROVIDER read failed (failing closed, NOT seeding): %v", workspaceID, readErr)
+		return
+	} else if existing != "" {
 		return
 	}
 
@@ -524,22 +536,47 @@ func (h *WorkspaceHandler) ensureConciergeProvider(ctx context.Context, workspac
 	}
 }
 
-// readStoredProviderSecret returns the decrypted LLM_PROVIDER workspace_secret,
-// or "" when none is stored (or on any read/decrypt error — treated as "unset"
-// so a transient miss re-seeds rather than wedges). Mirrors readStoredModelSecret.
-func readStoredProviderSecret(ctx context.Context, workspaceID string) string {
+// readStoredProviderSecret returns the decrypted LLM_PROVIDER workspace_secret.
+// The second return value distinguishes the three observed states so the caller
+// can fail closed rather than fail open on a transient error:
+//
+//   - (value, nil): a secret is stored and decrypted successfully → caller
+//     respects the existing provider pin and skips the seed.
+//   - ("", nil): no row exists for this workspace/key → caller may re-seed
+//     safely (this is the fresh-boot / cleared-secret case).
+//   - ("", error): the row exists (or the read otherwise succeeded) but the
+//     decryption failed → caller MUST NOT treat this as "unset" and MUST NOT
+//     fall back to seeding the platform provider. Returning "" without the
+//     error used to wedge a transient decrypt failure into a fail-OPEN
+//     platform-pin (see core#3162): combined with a momentarily-empty MODEL,
+//     a BYOK/self-host concierge could be silently mis-routed onto the
+//     platform LLM proxy on the next provision.
+//
+// `sql.ErrNoRows` is the canonical "no row" case and is mapped to ("", nil).
+// Any other Scan error or a DecryptVersioned error is treated as the
+// error-case and returned as ("", err).
+//
+// NOTE: this fix is scoped to the BYOK fail-open path (core#3162).
+// `readStoredModelSecret` has the same shape but is intentionally out of scope
+// per the issue body and PM's scope discipline (one item, don't bundle).
+// Tracking separately.
+func readStoredProviderSecret(ctx context.Context, workspaceID string) (string, error) {
 	var stored []byte
 	var version int
-	if err := db.DB.QueryRowContext(ctx,
+	err := db.DB.QueryRowContext(ctx,
 		`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = $1 AND key = 'LLM_PROVIDER'`,
-		workspaceID).Scan(&stored, &version); err != nil {
-		return ""
-	}
-	dec, err := crypto.DecryptVersioned(stored, version)
+		workspaceID).Scan(&stored, &version)
 	if err != nil {
-		return ""
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("readStoredProviderSecret scan: %w", err)
 	}
-	return string(dec)
+	dec, derr := crypto.DecryptVersioned(stored, version)
+	if derr != nil {
+		return "", fmt.Errorf("readStoredProviderSecret decrypt: %w", derr)
+	}
+	return string(dec), nil
 }
 
 // setProviderSecret persists (or clears, when provider == "") the LLM_PROVIDER
