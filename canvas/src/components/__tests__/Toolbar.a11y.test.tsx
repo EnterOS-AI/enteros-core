@@ -286,9 +286,20 @@ describe("Toolbar — aria-hidden on decorative elements", () => {
     render(<Toolbar />);
     // The count span inside StatusPill uses aria-hidden="true"
     const pill = screen.getByLabelText(/1 online/i);
-    // The pill renders two elements: dot (aria-hidden) + count text (aria-hidden)
-    const countSpans = pill.querySelectorAll("[aria-hidden='true']");
-    expect(countSpans.length).toBeGreaterThanOrEqual(1);
+    // Direct assertion (RC 13312): the StatusPill renders TWO
+    // aria-hidden children — a dot (decorative) and a count-text
+    // span (also decorative; the count is exposed via aria-label on
+    // the parent). The pre-fix version asserted that AT LEAST ONE
+    // descendant has aria-hidden="true", which the decorative dot
+    // alone satisfies — vacuous. Pin the count-text span specifically:
+    // it must exist, must have aria-hidden="true", and must contain
+    // the numeric count as text content (so a future regression
+    // that accidentally exposes the count as readable text — e.g. by
+    // removing the aria-hidden — would fail this test).
+    const countSpan = pill.querySelector("span[aria-hidden='true']");
+    expect(countSpan).not.toBeNull();
+    expect(countSpan!.getAttribute("aria-hidden")).toBe("true");
+    expect(countSpan!.textContent).toBe("1");
   });
 });
 
@@ -324,16 +335,23 @@ describe("Toolbar — focus-visible:ring on interactive buttons", () => {
     expect(cls.includes("focus-visible:ring")).toBeTruthy();
   });
 
-  it("Help popover close button has focus-visible:ring class", () => {
+  it("Help popover close button has focus-visible:underline class (small text-button design — not ring)", () => {
     render(<Toolbar />);
     const helpBtn = screen.getByRole("button", { name: /open shortcuts and tips/i });
     fireEvent.click(helpBtn);
     const closeBtn = screen.getByRole("button", { name: /close help dialog/i });
     const cls = closeBtn.className;
-    // Close button uses focus-visible:underline, not ring — skip this assertion
-    // since the design intent for this small text button is underline on focus.
-    // This test documents the current behavior.
-    expect(cls).toBeTruthy();
+    // Direct assertion (RC 13312): the close button's design uses
+    // focus-visible:underline (small text-button convention), NOT
+    // focus-visible:ring (the larger-icon-button convention). The
+    // pre-fix version of this test only asserted that className was
+    // truthy, which passed for ANY styled button — vacuous. Pin the
+    // exact class so the design intent is documented + tested.
+    expect(cls.includes("focus-visible:underline")).toBeTruthy();
+    // Negative: also pin that it does NOT use the ring convention
+    // (a regression to the icon-button class would make the close
+    // button visually inconsistent with the rest of the toolbar).
+    expect(cls.includes("focus-visible:ring")).toBeFalsy();
   });
 });
 
@@ -390,10 +408,20 @@ describe("Toolbar — Escape closes help popover", () => {
 describe("Toolbar — screen reader summary", () => {
   it("toolbar container has no implicit role (div is fine for a toolbar widget)", () => {
     render(<Toolbar />);
-    // The outermost div should not have role="toolbar" since the HTML landmark
-    // structure is sufficient and no role is explicitly set.
+    // Direct assertion (RC 13312): the toolbar's root element is a
+    // plain <div> with no `role` attribute (the design rationale is
+    // that the HTML landmark structure + the surrounding <main>
+    // landmark on the page is sufficient for AT navigation; adding
+    // role="toolbar" would require the full WCAG toolbar pattern
+    // (single-tab-stop roving tabindex, etc.) which is out of scope).
+    // The pre-fix version only checked that `.fixed.top-3` exists —
+    // vacuous, since any container matching that selector would
+    // pass. Pin the NEGATIVE: the `role` attribute must be absent
+    // (null) so a future regression that adds role="toolbar"
+    // without the full toolbar pattern is caught.
     const container = document.querySelector(".fixed.top-3");
     expect(container).not.toBeNull();
+    expect(container!.getAttribute("role")).toBeNull();
   });
 
   it("workspace count is exposed as text content (not only aria-label)", () => {
