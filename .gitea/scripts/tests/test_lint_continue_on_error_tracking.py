@@ -314,5 +314,122 @@ class TestE2eStagingSaasWorkflow(unittest.TestCase):
         self.fail("prune-stale-e2e-dns coe directive not found")
 
 
+# --------------------------------------------------------------------------
+# End-to-end fixture pin: the real .gitea/workflows/design-token-drift-gate.yml
+# --------------------------------------------------------------------------
+class TestDesignTokenDriftGateWorkflow(unittest.TestCase):
+    """Pin the live workflow file: drift job must have a fresh, open
+    tracker reference. Regression guard for mc#3089 (governance decision:
+    keep fail-soft + renew tracker until the gate promotes to required)."""
+
+    REPO_ROOT = Path(__file__).resolve().parents[3]
+    WORKFLOW_PATH = (
+        REPO_ROOT / ".gitea" / "workflows" / "design-token-drift-gate.yml"
+    )
+
+    def test_workflow_has_drift_with_truthy_coe(self):
+        """The live workflow must contain the drift job with
+        continue-on-error: true (governance decision per mc#3089:
+        Phase-1 advisory gate, keep fail-soft until promote to required)."""
+        self.assertTrue(
+            self.WORKFLOW_PATH.exists(),
+            f"workflow not found at {self.WORKFLOW_PATH}",
+        )
+        raw = self.WORKFLOW_PATH.read_text(encoding="utf-8")
+        doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
+        raw_lines = raw.splitlines()
+        locs = lcoet.find_coe_truthies(doc, raw_lines)
+        coe_jobs = {jkey for jkey, _ in locs}
+        self.assertIn(
+            "drift",
+            coe_jobs,
+            f"drift job must have continue-on-error: true; "
+            f"found coe jobs: {coe_jobs}",
+        )
+
+    def test_workflow_drift_has_tracker_in_window(self):
+        """The drift job's continue-on-error directive must have a
+        `# mc#NNN` or `# internal#NNN` tracker within 2 lines."""
+        raw = self.WORKFLOW_PATH.read_text(encoding="utf-8")
+        doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
+        raw_lines = raw.splitlines()
+        locs = lcoet.find_coe_truthies(doc, raw_lines)
+        for jkey, line in locs:
+            if jkey == "drift":
+                tracker = lcoet.find_tracker_in_window(raw_lines, line)
+                self.assertIsNotNone(
+                    tracker,
+                    f"drift at line {line} has no tracker comment within "
+                    f"±{lcoet.WINDOW} lines. Per mc#3089, the fail-soft "
+                    f"mask must carry a fresh mc#NNNN reference.",
+                )
+                slug, num = tracker
+                self.assertEqual(slug, "mc", "tracker slug should be 'mc'")
+                self.assertGreater(
+                    num, 0, f"tracker number must be positive, got {num}"
+                )
+                return
+        self.fail("drift coe directive not found")
+
+
+# --------------------------------------------------------------------------
+# End-to-end fixture pin: the real .gitea/workflows/local-provision-e2e.yml
+# --------------------------------------------------------------------------
+class TestLocalProvisionE2eWorkflow(unittest.TestCase):
+    """Pin the live workflow file: lifecycle-real job must have a fresh,
+    open tracker reference. Regression guard for mc#2408 (governance
+    decision: keep fail-soft + renew tracker; promote to gating when
+    docker-host + MiniMax API are stable)."""
+
+    REPO_ROOT = Path(__file__).resolve().parents[3]
+    WORKFLOW_PATH = (
+        REPO_ROOT / ".gitea" / "workflows" / "local-provision-e2e.yml"
+    )
+
+    def test_workflow_has_lifecycle_real_with_truthy_coe(self):
+        """The live workflow must contain the lifecycle-real job with
+        continue-on-error: true (governance decision per mc#2408)."""
+        self.assertTrue(
+            self.WORKFLOW_PATH.exists(),
+            f"workflow not found at {self.WORKFLOW_PATH}",
+        )
+        raw = self.WORKFLOW_PATH.read_text(encoding="utf-8")
+        doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
+        raw_lines = raw.splitlines()
+        locs = lcoet.find_coe_truthies(doc, raw_lines)
+        coe_jobs = {jkey for jkey, _ in locs}
+        self.assertIn(
+            "lifecycle-real",
+            coe_jobs,
+            f"lifecycle-real must have continue-on-error: true; "
+            f"found coe jobs: {coe_jobs}",
+        )
+
+    def test_workflow_lifecycle_real_has_tracker_in_window(self):
+        """The lifecycle-real job's continue-on-error directive must
+        have a `# mc#NNN` or `# internal#NNN` tracker within 2 lines."""
+        raw = self.WORKFLOW_PATH.read_text(encoding="utf-8")
+        doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
+        raw_lines = raw.splitlines()
+        locs = lcoet.find_coe_truthies(doc, raw_lines)
+        for jkey, line in locs:
+            if jkey == "lifecycle-real":
+                tracker = lcoet.find_tracker_in_window(raw_lines, line)
+                self.assertIsNotNone(
+                    tracker,
+                    f"lifecycle-real at line {line} has no tracker "
+                    f"comment within ±{lcoet.WINDOW} lines. Per mc#2408, "
+                    f"the fail-soft mask must carry a fresh mc#NNNN "
+                    f"reference.",
+                )
+                slug, num = tracker
+                self.assertEqual(slug, "mc", "tracker slug should be 'mc'")
+                self.assertGreater(
+                    num, 0, f"tracker number must be positive, got {num}"
+                )
+                return
+        self.fail("lifecycle-real coe directive not found")
+
+
 if __name__ == "__main__":
     unittest.main()
