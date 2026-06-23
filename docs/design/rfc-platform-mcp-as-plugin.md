@@ -1,6 +1,6 @@
 # RFC: Deliver `molecule-platform-mcp` as an entitlement-gated MCP plugin
 
-- **Status:** Draft — pending CTO sign-off (arch + entitlement change)
+- **Status:** **Proposed — ready for CTO sign-off** (was Draft). Open questions resolved to decisions (§6), rollout made concrete and gated (§5), image-retirement scoped. Updated 2026-06-23.
 - **Author:** devops-engineer (agent)
 - **Date:** 2026-06-18
 - **Related:** `rfc-platform-agent.md` §5.7, RFC #2843 (delivery decoupling),
@@ -127,37 +127,53 @@ Requirements:
 - **Audit:** install of the privileged plugin is logged like any org-admin
   action.
 
-## 5. Migration / rollout
+## 5. Migration / rollout — concrete, gated sequence
 
-1. Land `molecule-platform-mcp` plugin (settings-fragment + persona content) in
-   the registry; entitlement-gate to org-root.
-2. Platform-agent template declares it in `workspace_declared_plugins`.
-3. Add a **readiness gate**: the "Concierge Creates Workspace" e2e must wait for
-   the management MCP to be present before asserting `create_workspace`, so the
-   post-online install window doesn't false-red.
-4. Re-provision concierges → they install the plugin and gain the management MCP.
-5. **Deprecate** the baked `molecule-platform-agent` image and the asset
-   `mcp_servers.yaml` path once the plugin path is green on a fresh provision.
-6. Keep core PR #3044 (provider-pin seed) — orthogonal; it fixes *responsiveness*
-   (model resolution), this RFC fixes *concierge capability* (identity + MCP).
+**Already shipped** (the plugin path exists end-to-end — only the cutover + retirement remain):
+- `molecule-platform-mcp` plugin (settings-fragment + `MCPServerAdaptor`) — built, in the registry.
+- Org-root-only **entitlement gate** (server-side, keyed on `kind=platform` + org-root) — shipped.
+- Platform-agent provisioner **declares** it (`seedTemplatePlugins` in `applyConciergeProvisionConfig`).
+- Verified: a fresh concierge can install it + gain `create_workspace`.
+- Readiness gate (the original step 3): the management-MCP gate has a 90s warmup grace (`managementMCPUnloadedGrace`, core#3082), so the post-online install window doesn't false-red.
 
-## 6. Open questions for the CTO
+**The one blocker before the image can be retired:** the plugin is a **private Gitea repo** fetched at boot, and that fetch has been **flaky** (404 on missing/over-scoped token, gitea hang — #3065/#3108). The baked image is today's *safety net* against exactly that. Retiring it without hardening the fetch trades an intermittent degradation for a hard one.
 
-1. **Entitlement mechanism** — reuse the marketplace entitlement broker, or a
-   simpler core-side "org-root only" gate for this single privileged plugin to
-   start?
-2. **Persona prompt** — ship as part of this plugin, or keep the concierge
-   system prompt in the (small) identity-asset channel and fix *that* delivery
-   separately? (The MCP and the prompt are independent failures; this RFC
-   primarily fixes the MCP.)
-3. **`npx` on first turn vs. pre-bundled** — acceptable cold-start latency, or
-   bundle the server in the plugin payload?
-4. **Image deprecation** — retire `molecule-platform-agent` entirely, or keep it
-   as an offline/self-host fallback (no registry reachability)?
+**Sequence (staging-first, each step gated on the prior):**
+1. **Make the failure visible** — land the #3164 instrumentation (runtime PR #171: `platform_mcp_diag` in the heartbeat) so the CP can see *which* path fails (image-fallback vs plugin-fetch) without box SSH. **Already up for review.**
+2. **Harden the plugin fetch** — retry-with-backoff + a **fail-LOUD** signal when the management-MCP plugin fetch fails on a `kind=platform` agent, so a concierge can never come up silently "online-but-no-MCP." Closes the safety-net dependency the image currently provides.
+3. **Prove plugin-only on staging** — provision a `kind=platform` agent on the **plain `claude-code` image** (no platform-agent image) + the plugin; confirm `create_workspace` on a FRESH provision and the staging E2E ("Platform Boot", "Concierge Creates Workspace") green.
+4. **Cut over provisioning** — flip `kind=platform` image selection to the plain runtime image (retire `resolvePlatformAgentImage` / the `-platform-agent` variant); the plugin becomes the sole MCP delivery.
+5. **Re-provision existing concierges** → plugin-only; verify each online + `create_workspace` via real-chat.
+6. **Retire the image** — drop the `publish-platform-agent` job; remove the dual-path code (`on_platform_agent_image`, `MOLECULE_PLATFORM_AGENT_IMAGE_BAKED`, the baked-binary branch of `mcp_server_present`). Keep a documented offline/self-host build recipe (§6 Q4) but publish/provision nothing.
+7. Keep PR #3044 (provider-pin) — orthogonal (responsiveness, not capability).
+
+**Acceptance:** a fresh `kind=platform` agent on the plain image + plugin surfaces `create_workspace`; staging E2E green; no `molecule-platform-agent` image referenced in the provision path.
+
+## 6. Decisions (resolved for sign-off)
+
+1. **Entitlement mechanism** → **core-side org-root-only gate** (already shipped — server-enforced, keyed on `kind=platform` + org-root). The marketplace entitlement broker is the future general path, NOT a blocker for this one privileged plugin.
+2. **Persona prompt** → **out of scope here.** This RFC fixes the *MCP* (capability). The concierge *system prompt* is an independent failure (the runtime reads `/configs/system-prompt.md` but the template ships `prompts/concierge.md` — a naming/delivery mismatch) tracked as a companion fix. Retiring the image does not regress the prompt — the baked/asset channel never reliably delivered it on SaaS anyway.
+3. **`npx` vs pre-bundled** → **`npx -y @molecule-ai/mcp-server`** (the current settings-fragment shape). Revisit pre-bundling only if first-turn cold-start is measured as a real problem.
+4. **Image deprecation** → **RETIRE** the `molecule-platform-agent` image (CTO directive, 2026-06-23): platform agent = standard `claude-code` image + the entitlement-gated plugin. A documented offline/self-host build recipe may be kept for air-gapped use, but nothing in the SaaS provision path references the image.
 
 ## 7. Non-goals
 
 - The general core↔runtime provider-derivation drift (tracked separately,
   template-claude-code issue #143).
 - The CP config-regeneration-to-stub behavior — this RFC routes *around* it for
-  the MCP; whether to also stop the stub clobbering `prompt_files` is open Q2.
+  the MCP; whether to also stop the stub clobbering `prompt_files` is the
+  companion system-prompt fix (§6 D2), tracked separately.
+
+## 8. Decision requested (CTO sign-off)
+
+Sign-off requested to adopt, as the committed architecture:
+
+- **(a)** plugin-only delivery of the management MCP — a platform agent is a standard `claude-code` workspace + the entitlement-gated `molecule-platform-mcp` plugin; **no baked image**;
+- **(b)** **retirement** of the `molecule-platform-agent` image per the gated §5 sequence — staging-first, and *blocked on the plugin-fetch hardening (§5 step 2)* so we never trade an intermittent failure for a hard one;
+- **(c)** the resolved decisions in §6.
+
+On sign-off, the fleet executes §5 in order. Step 1 (the #3164 `platform_mcp_diag` instrumentation, runtime PR #171) is already up for review and is the empirical gate that tells us whether prod failures today are image-fallback or plugin-fetch — informing the cutover.
+
+**Why now:** the dual image+plugin delivery is the direct root of the recurring #3164 fragility (silent image-fallback → no `molecule-platform-mcp` binary → MCP fails to start → concierge can't `create_workspace` → staging E2E red). Collapsing to plugin-only removes the image-resolution failure mode, the `MOLECULE_PLATFORM_AGENT_IMAGE_BAKED` env-marker gating, and the build/publish/cross-account-pull maintenance burden — with no loss of the privilege boundary (it moves to the already-shipped org-root entitlement gate).
+
+**Sign-off:** ☐ Approved as written ☐ Approved with changes ☐ Hold — _________________ (CTO) — Date: __________
