@@ -128,6 +128,21 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 		return // response already written
 	}
 
+	// core#2127 (Researcher RC 13387): server-side enforcement of the
+	// can_delegate policy MUST cover the RAW REST endpoint, not only the
+	// MCP tools/list+tools/call paths gated in PR#3165. A locked-out
+	// workspace that hand-builds an HTTP body to POST /workspaces/:id/
+	// delegate would otherwise still dispatch delegations via this path.
+	// The check fires BEFORE the self-delegation guard, idempotency
+	// lookup, insertDelegationRow, and executeDelegation goroutine —
+	// i.e. before any DB or proxy side effect. Same constant error as
+	// the MCP gate (OFFSEC-001): no policy wording leaks to the caller.
+	if canDelegate, derr := loadWorkspaceCanDelegate(ctx, db.DB, sourceID); derr == nil && !canDelegate {
+		log.Printf("Delegate: can_delegate=FALSE rejected delegation from workspace=%s target=%s", sourceID, body.TargetID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "tool call failed"})
+		return
+	}
+
 	// #548 — prevent self-delegation: a workspace delegating to itself
 	// acquires _run_lock twice on the same mutex, deadlocking permanently.
 	//
