@@ -84,6 +84,15 @@ func refreshOne(ctx context.Context, cacheDir, token string, entry ManifestEntry
 		return result
 	}
 
+	// Resolve host + per-provider token, FAIL-CLOSED on an unknown provider
+	// (don't fetch against the wrong host with the wrong token).
+	host, providerToken, err := resolveProvider(entry.Provider, token)
+	if err != nil {
+		result.Status = "failed"
+		result.Error = err.Error()
+		return result
+	}
+
 	tmp, err := os.MkdirTemp(cacheDir, ".tmp-"+entry.Name+"-")
 	if err != nil {
 		result.Status = "failed"
@@ -92,7 +101,7 @@ func refreshOne(ctx context.Context, cacheDir, token string, entry ManifestEntry
 	}
 	defer os.RemoveAll(tmp)
 
-	cloneURL := authenticatedURL(entry.Repo, entry.Provider, token)
+	cloneURL := authenticatedURL(entry.Repo, host, providerToken)
 	for _, args := range [][]string{
 		{"init", "-q", tmp},
 		{"-C", tmp, "remote", "add", "origin", cloneURL},
@@ -147,27 +156,33 @@ func safeTemplateName(name string) bool {
 	return true
 }
 
-// providerHost maps a manifest `provider` discriminator to its git host.
-// The discriminator names our HOST IDENTITY, not the server software, so
-// "moleculesai" survives a Gitea-software swap. Empty / unknown ⇒ the
-// moleculesai default (keeps every legacy, provider-less entry working and
-// fail-soft: a typo'd provider resolves to the default rather than panicking
-// the refresh — the shell resolvers and pinning test fail-closed on unknown
-// providers, so a real mistake is still caught upstream). Keep the known
-// cases in sync with manifest.json _provider_contract and the shell
-// resolvers (clone-manifest.sh, check-manifest-repos-exist.sh).
-func providerHost(provider string) string {
+// resolveProvider maps a manifest `provider` discriminator to its git host and
+// the read token to use for it. FAIL-CLOSED on an unknown provider — matching
+// the shell resolvers (clone-manifest.sh, check-manifest-repos-exist.sh) and
+// the static manifest contract test: a typo must STOP the refresh, not silently
+// resolve against the wrong host with the wrong token. Empty ⇒ moleculesai
+// (default), so every legacy, provider-less entry keeps working.
+//
+// Token selection is per provider: `moleculesai` uses the SSOT token passed
+// into RefreshWorkspaceTemplates (MOLECULE_TEMPLATE_GITEA_TOKEN / MOLECULE_GITEA_TOKEN);
+// `github` uses MOLECULE_GITHUB_TOKEN — a github entry must NEVER receive the
+// gitea token. Keep in sync with manifest.json _provider_contract.
+func resolveProvider(provider, moleculesaiToken string) (host, token string, err error) {
 	switch provider {
-	case "github":
-		return "github.com"
 	case "", "moleculesai":
-		return "git.moleculesai.app"
+		return "git.moleculesai.app", moleculesaiToken, nil
+	case "github":
+		return "github.com", os.Getenv("MOLECULE_GITHUB_TOKEN"), nil
 	default:
-		return "git.moleculesai.app"
+		return "", "", fmt.Errorf("unknown provider %q (known: moleculesai, github)", provider)
 	}
 }
 
-func authenticatedURL(repo, provider, token string) string {
+// authenticatedURL builds the clone URL against the resolved host, embedding
+// the token as basic-auth. A repo that is already a full URL is honored
+// verbatim (its host kept); otherwise the location-free repo path is prefixed
+// with the resolved provider host.
+func authenticatedURL(repo, host, token string) string {
 	if strings.HasPrefix(repo, "http://") || strings.HasPrefix(repo, "https://") {
 		u, err := url.Parse(repo)
 		if err == nil {
@@ -177,7 +192,7 @@ func authenticatedURL(repo, provider, token string) string {
 	}
 	u := &url.URL{
 		Scheme: "https",
-		Host:   providerHost(provider),
+		Host:   host,
 		Path:   "/" + strings.TrimSuffix(repo, ".git") + ".git",
 		User:   url.UserPassword("oauth2", token),
 	}
