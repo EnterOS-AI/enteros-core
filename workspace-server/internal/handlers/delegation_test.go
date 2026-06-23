@@ -299,14 +299,14 @@ func TestListDelegations_Empty(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"delegation_id", "caller_id", "callee_id", "task_preview",
 			"status", "result_preview", "error_detail", "last_heartbeat",
-			"deadline", "created_at", "updated_at",
+			"deadline", "created_at", "updated_at", "direction",
 		}))
 	mock.ExpectQuery("SELECT id, activity_type").
 		WithArgs("ws-source").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "activity_type", "source_id", "target_id",
 			"summary", "status", "error_detail", "response_body",
-			"delegation_id", "created_at",
+			"delegation_id", "created_at", "workspace_id",
 		}))
 
 	w := httptest.NewRecorder()
@@ -347,14 +347,14 @@ func TestListDelegations_WithResults(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"delegation_id", "caller_id", "callee_id", "task_preview",
 		"status", "result_preview", "error_detail", "last_heartbeat",
-		"deadline", "created_at", "updated_at",
+		"deadline", "created_at", "updated_at", "direction",
 	}).
 		AddRow("del-111", "ws-source", "ws-target",
 			"Delegating to ws-target", "pending", "", "",
-			&now, &deadline, now, now).
+			&now, &deadline, now, now, "sent").
 		AddRow("del-222", "ws-source", "ws-target",
 			"Delegation completed (hello world)", "completed", "hello world", "",
-			&now, &deadline, now, now.Add(time.Minute))
+			&now, &deadline, now, now.Add(time.Minute), "sent")
 
 	mock.ExpectQuery("SELECT d.delegation_id, d.caller_id, d.callee_id, d.task_preview").
 		WithArgs("ws-source").
@@ -394,6 +394,9 @@ func TestListDelegations_WithResults(t *testing.T) {
 	}
 	if resp[0]["_ledger"] != true {
 		t.Errorf("expected _ledger=true marker, got %v", resp[0]["_ledger"])
+	}
+	if resp[0]["direction"] != "sent" {
+		t.Errorf("expected direction 'sent', got %v", resp[0]["direction"])
 	}
 
 	// Check second entry (completed, has response_preview)
@@ -1452,11 +1455,11 @@ func TestListDelegations_LedgerRowsReturned(t *testing.T) {
 	ledgerRows := sqlmock.NewRows([]string{
 		"delegation_id", "caller_id", "callee_id", "task_preview",
 		"status", "result_preview", "error_detail", "last_heartbeat",
-		"deadline", "created_at", "updated_at",
+		"deadline", "created_at", "updated_at", "direction",
 	}).AddRow(
 		"del-ledger-001", "caller-uuid", "callee-uuid",
 		"Analyze the codebase for bugs", "in_progress", "", "",
-		&now, &deadline, now, now,
+		&now, &deadline, now, now, "sent",
 	)
 	mock.ExpectQuery("SELECT d.delegation_id, d.caller_id, d.callee_id, d.task_preview").
 		WithArgs("caller-uuid").
@@ -1494,6 +1497,9 @@ func TestListDelegations_LedgerRowsReturned(t *testing.T) {
 	if resp[0]["target_id"] != "callee-uuid" {
 		t.Errorf("expected target_id 'callee-uuid', got %v", resp[0]["target_id"])
 	}
+	if resp[0]["direction"] != "sent" {
+		t.Errorf("expected direction 'sent', got %v", resp[0]["direction"])
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
@@ -1514,18 +1520,18 @@ func TestListDelegations_LedgerEmptyFallsBackToActivityLogs(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"delegation_id", "caller_id", "callee_id", "task_preview",
 			"status", "result_preview", "error_detail", "last_heartbeat",
-			"deadline", "created_at", "updated_at",
+			"deadline", "created_at", "updated_at", "direction",
 		}))
 
 	now := time.Now()
 	activityRows := sqlmock.NewRows([]string{
 		"id", "activity_type", "source_id", "target_id",
 		"summary", "status", "error_detail", "response_body",
-		"delegation_id", "created_at",
+		"delegation_id", "created_at", "workspace_id",
 	}).AddRow(
 		"act-001", "delegation", "ws-source", "ws-target",
 		"Delegating to ws-target", "pending", "", "",
-		"del-old-001", now,
+		"del-old-001", now, "ws-source",
 	)
 	mock.ExpectQuery("SELECT id, activity_type").
 		WithArgs("ws-source").
@@ -1574,7 +1580,7 @@ func TestListDelegations_BothEmptyReturnsEmptyArray(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"delegation_id", "caller_id", "callee_id", "task_preview",
 			"status", "result_preview", "error_detail", "last_heartbeat",
-			"deadline", "created_at", "updated_at",
+			"deadline", "created_at", "updated_at", "direction",
 		}))
 	// activity_logs also empty
 	mock.ExpectQuery("SELECT id, activity_type").
@@ -1582,7 +1588,7 @@ func TestListDelegations_BothEmptyReturnsEmptyArray(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "activity_type", "source_id", "target_id",
 			"summary", "status", "error_detail", "response_body",
-			"delegation_id", "created_at",
+			"delegation_id", "created_at", "workspace_id",
 		}))
 
 	w := httptest.NewRecorder()
@@ -1625,11 +1631,11 @@ func TestListDelegations_LedgerQueryErrorFallsBackToActivityLogs(t *testing.T) {
 	activityRows := sqlmock.NewRows([]string{
 		"id", "activity_type", "source_id", "target_id",
 		"summary", "status", "error_detail", "response_body",
-		"delegation_id", "created_at",
+		"delegation_id", "created_at", "workspace_id",
 	}).AddRow(
 		"act-002", "delegation", "ws-source", "ws-target",
 		"Some task", "completed", "", "result here",
-		"del-pre-318", now,
+		"del-pre-318", now, "ws-source",
 	)
 	mock.ExpectQuery("SELECT id, activity_type").
 		WithArgs("ws-source").
@@ -1671,11 +1677,11 @@ func TestListDelegations_LedgerCompletedIncludesResultPreview(t *testing.T) {
 	ledgerRows := sqlmock.NewRows([]string{
 		"delegation_id", "caller_id", "callee_id", "task_preview",
 		"status", "result_preview", "error_detail", "last_heartbeat",
-		"deadline", "created_at", "updated_at",
+		"deadline", "created_at", "updated_at", "direction",
 	}).AddRow(
 		"del-complete-001", "caller-uuid", "callee-uuid",
 		"Run analysis", "completed", "Analysis complete: 42 issues found", "",
-		&now, &deadline, now, now,
+		&now, &deadline, now, now, "sent",
 	)
 	mock.ExpectQuery("SELECT d.delegation_id, d.caller_id, d.callee_id, d.task_preview").
 		WithArgs("caller-uuid").
@@ -1726,11 +1732,11 @@ func TestListDelegations_LedgerFailedIncludesErrorDetail(t *testing.T) {
 	ledgerRows := sqlmock.NewRows([]string{
 		"delegation_id", "caller_id", "callee_id", "task_preview",
 		"status", "result_preview", "error_detail", "last_heartbeat",
-		"deadline", "created_at", "updated_at",
+		"deadline", "created_at", "updated_at", "direction",
 	}).AddRow(
 		"del-failed-001", "caller-uuid", "callee-uuid",
 		"Fetch data", "failed", "", "Callee workspace not reachable",
-		&now, &deadline, now, now,
+		&now, &deadline, now, now, "sent",
 	)
 	mock.ExpectQuery("SELECT d.delegation_id, d.caller_id, d.callee_id, d.task_preview").
 		WithArgs("caller-uuid").
