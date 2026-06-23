@@ -620,6 +620,32 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	}
 	body = normalizedBody
 
+	// core#2127 RC 13392: a workspace with can_delegate=false MUST NOT be
+	// able to send a delegation via the raw A2A message/send path. The MCP
+	// tools/list+tools/call+helper gates (PR#3165+#3168) and the REST
+	// /delegate handler (PR#3168 RC 13387 fix) need a 4th layer — the raw
+	// A2A proxy itself. A locked-out workspace that hand-builds a
+	// message/send JSON-RPC body and posts to /workspaces/:id/a2a would
+	// otherwise still dispatch a delegation. The check fires AFTER access
+	// control + budget + normalize (so unauthorized / over-budget / malformed
+	// calls are rejected first) and BEFORE the persist / poll-mode
+	// short-circuit / push-dispatch (so no side effect on a blocked call).
+	// Skipped for self-calls (callerID == workspaceID — replying to your
+	// own queued turn is not a delegation) and for system / canvas callers
+	// (whose auth path bypasses CanCommunicate above and whose can_delegate
+	// is not a meaningful policy surface). OFFSEC-001: constant 403 body,
+	// no can_delegate wording leaks.
+	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) && !isCanvasUser && a2aMethod == "message/send" {
+		canDelegate, lookupErr := loadWorkspaceCanDelegate(ctx, db.DB, callerID)
+		if lookupErr == nil && !canDelegate {
+			log.Printf("ProxyA2A: can_delegate=FALSE rejected message/send caller=%s → %s", callerID, workspaceID)
+			return 0, nil, &proxyA2AError{
+				Status:   http.StatusForbidden,
+				Response: gin.H{"error": "tool call failed"},
+			}
+		}
+	}
+
 	// #2560 (chat UX: persist in-flight exchange across leave/refresh):
 	// write the user message to activity_logs AT RECEIPT — before any of
 	// the downstream short-circuits (poll-mode, mock-runtime, push dispatch)

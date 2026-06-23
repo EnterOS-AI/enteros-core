@@ -5,11 +5,14 @@ package handlers
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
@@ -200,4 +203,157 @@ func TestPatchAbilities_BothFields_UpdateError(t *testing.T) {
 	// Because only one UPDATE is issued, there is no partial-mutation
 	// path to assert against; sqlmock implicitly verifies no second
 	// exec occurred.
+}
+
+// ---------- core#2127: can_delegate field ----------
+
+func TestPatchAbilities_CanDelegateOnly(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1 AND status != 'removed'\)`).
+		WithArgs(wsUUID1).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec(`UPDATE workspaces SET can_delegate = \$2, updated_at = now\(\) WHERE id = \$1`).
+		WithArgs(wsUUID1, false).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := patchAbilitiesReq(t, wsUUID1, `{"can_delegate":false}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestPatchAbilities_AllThreeFields(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1 AND status != 'removed'\)`).
+		WithArgs(wsUUID1).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec(`UPDATE workspaces SET broadcast_enabled = \$2, talk_to_user_enabled = \$3, can_delegate = \$4, updated_at = now\(\) WHERE id = \$1`).
+		WithArgs(wsUUID1, true, true, false).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := patchAbilitiesReq(t, wsUUID1, `{"broadcast_enabled":true,"talk_to_user_enabled":true,"can_delegate":false}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestPatchAbilities_BroadcastAndCanDelegate(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1 AND status != 'removed'\)`).
+		WithArgs(wsUUID1).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec(`UPDATE workspaces SET broadcast_enabled = \$2, can_delegate = \$3, updated_at = now\(\) WHERE id = \$1`).
+		WithArgs(wsUUID1, true, false).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := patchAbilitiesReq(t, wsUUID1, `{"broadcast_enabled":true,"can_delegate":false}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestPatchAbilities_TalkToUserAndCanDelegate(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1 AND status != 'removed'\)`).
+		WithArgs(wsUUID1).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec(`UPDATE workspaces SET talk_to_user_enabled = \$2, can_delegate = \$3, updated_at = now\(\) WHERE id = \$1`).
+		WithArgs(wsUUID1, false, true).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := patchAbilitiesReq(t, wsUUID1, `{"talk_to_user_enabled":false,"can_delegate":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// TestLoadWorkspaceCanDelegate covers the helper used by the MCP tools/list +
+// tools/call gates. Tolerates column absence (pre-migration) by returning
+// the safe default true so a forward-only migration never accidentally
+// locks an entire org out of delegation.
+func TestLoadWorkspaceCanDelegate(t *testing.T) {
+	const wsID = "ws-can-delegate-1"
+
+	t.Run("returns the stored value (true)", func(t *testing.T) {
+		mock, cleanup := withMockDB(t)
+		defer cleanup()
+		mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+			WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows([]string{"can_delegate"}).AddRow(true))
+		got, err := loadWorkspaceCanDelegate(context.Background(), db.DB, wsID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !got {
+			t.Errorf("expected can_delegate=true, got false")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet: %v", err)
+		}
+	})
+
+	t.Run("returns the stored value (false) — locked-out workspace", func(t *testing.T) {
+		mock, cleanup := withMockDB(t)
+		defer cleanup()
+		mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+			WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows([]string{"can_delegate"}).AddRow(false))
+		got, err := loadWorkspaceCanDelegate(context.Background(), db.DB, wsID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got {
+			t.Errorf("expected can_delegate=false (locked out), got true — would let a role-locked agent delegate")
+		}
+	})
+
+	t.Run("column missing (pre-migration) → safe default true (no live lockout)", func(t *testing.T) {
+		mock, cleanup := withMockDB(t)
+		defer cleanup()
+		mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+			WithArgs(wsID).
+			WillReturnError(errors.New(`pq: column "can_delegate" does not exist`))
+		got, err := loadWorkspaceCanDelegate(context.Background(), db.DB, wsID)
+		if err == nil {
+			t.Errorf("expected non-nil error (column-missing), got nil")
+		}
+		if !got {
+			t.Errorf("expected safe-default true on column-missing (no live lockout), got false")
+		}
+	})
+
+	t.Run("sql.ErrNoRows (workspace not found) → safe default true", func(t *testing.T) {
+		mock, cleanup := withMockDB(t)
+		defer cleanup()
+		mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+			WithArgs(wsID).
+			WillReturnError(sql.ErrNoRows)
+		got, err := loadWorkspaceCanDelegate(context.Background(), db.DB, wsID)
+		if err != nil {
+			t.Errorf("expected nil error on ErrNoRows (downstream 404/403 handles), got %v", err)
+		}
+		if !got {
+			t.Errorf("expected safe-default true on ErrNoRows, got false")
+		}
+	})
 }

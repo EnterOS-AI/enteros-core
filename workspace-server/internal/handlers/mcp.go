@@ -445,11 +445,17 @@ var mcpAllTools = []mcpTool{
 
 // mcpToolList returns the filtered tool list for this MCP bridge.
 // C3: send_message_to_user is excluded unless MOLECULE_MCP_ALLOW_SEND_MESSAGE=true.
-func mcpToolList() []mcpTool {
+// core#2127: delegate_task + delegate_task_async are excluded when the
+// caller's workspace has can_delegate=FALSE (defense-in-depth: a role-locked
+// agent whose prompt is bypassed still cannot discover the tools).
+func mcpToolList(canDelegate bool) []mcpTool {
 	allowSend := os.Getenv("MOLECULE_MCP_ALLOW_SEND_MESSAGE") == "true"
 	var out []mcpTool
 	for _, t := range mcpAllTools {
 		if t.Name == "send_message_to_user" && !allowSend {
+			continue
+		}
+		if !canDelegate && (t.Name == "delegate_task" || t.Name == "delegate_task_async") {
 			continue
 		}
 		out = append(out, t)
@@ -552,8 +558,18 @@ func (h *MCPHandler) dispatchRPC(ctx context.Context, workspaceID string, req mc
 		base.Result = nil
 
 	case "tools/list":
+		// core#2127: tool-list visibility gated on can_delegate (defence-in-depth).
+		// Default TRUE keeps the existing list for the vast majority of workspaces.
+		canDelegate, lookupErr := loadWorkspaceCanDelegate(ctx, h.database, workspaceID)
+		if lookupErr != nil {
+			log.Printf("mcp: tools/list can_delegate lookup failed workspace=%s: %v", workspaceID, lookupErr)
+			// Fail open on the lookup error: surface the full tool list rather
+			// than a misleading 403. The tools/call path enforces can_delegate
+			// again as a second gate.
+			canDelegate = true
+		}
 		base.Result = map[string]interface{}{
-			"tools": mcpToolList(),
+			"tools": mcpToolList(canDelegate),
 		}
 
 	case "tools/call":
@@ -564,6 +580,20 @@ func (h *MCPHandler) dispatchRPC(ctx context.Context, workspaceID string, req mc
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			base.Error = &mcpRPCError{Code: -32602, Message: "invalid parameters"}
 			return base
+		}
+		// core#2127: server-side delegation-policy gate. A role-locked
+		// "coding executor" agent (Kimi/MiniMax) has can_delegate=FALSE; even
+		// if a prompt-bypass or a stale tool list makes them attempt
+		// delegate_task / delegate_task_async, the call MUST 403 here.
+		// Per OFFSEC-001, the error message is constant; the policy
+		// itself is documented in tools/list (hidden) + the abilities API.
+		if params.Name == "delegate_task" || params.Name == "delegate_task_async" {
+			canDelegate, lookupErr := loadWorkspaceCanDelegate(ctx, h.database, workspaceID)
+			if lookupErr == nil && !canDelegate {
+				log.Printf("mcp: can_delegate=FALSE rejected %s from workspace=%s", params.Name, workspaceID)
+				base.Error = &mcpRPCError{Code: -32000, Message: "tool call failed"}
+				return base
+			}
 		}
 		text, err := h.dispatch(ctx, workspaceID, params.Name, params.Arguments)
 		if err != nil {

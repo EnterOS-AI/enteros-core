@@ -3628,3 +3628,145 @@ func TestLogA2ASuccess_NoBroadcastForWorkspaceCaller(t *testing.T) {
 		}
 	}
 }
+
+// ---------- core#2127 RC 13392: can_delegate gate on raw A2A /a2a message/send ----------
+
+// TestProxyA2A_MessageSend_CanDelegateFalse_Rejects is the 4th-layer regression
+// for the can_delegate policy (after PR#3165/#3168 + the REST /delegate fix).
+// The raw /a2a message/send path was still ungated — a locked-out workspace
+// could hand-build a message/send JSON-RPC body and post it directly to
+// /workspaces/:id/a2a, bypassing the MCP tool-hiding, the MCP tools/call
+// gate, the MCP delegate helper gate, and the REST /delegate handler.
+//
+// The gate fires after access control + budget + normalize and before the
+// persist / poll-mode short-circuit / push-dispatch, so a blocked call has
+// zero side effects. Per OFFSEC-001, the 403 body is constant — no
+// can_delegate wording leaks to the caller.
+func TestProxyA2A_MessageSend_CanDelegateFalse_Rejects(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-target"), "http://localhost:1")
+	mockCanCommunicate(mock, "ws-caller", "ws-target", true) // same parent
+	mockSameOrg(mock, "ws-caller", "ws-target", true)        // same tenant
+	expectBudgetCheck(mock, "ws-target")
+
+	// can_delegate lookup on the CALLER — returns FALSE.
+	mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-caller").
+		WillReturnRows(sqlmock.NewRows([]string{"can_delegate"}).AddRow(false))
+	// No follow-up expectations — a persist, INSERT, or proxy call would
+	// mean the gate leaked.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}}
+	body := `{"method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hi"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-target/a2a", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
+
+	handler.ProxyA2A(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for can_delegate=false message/send, got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "can_delegate") {
+		t.Errorf("error body leaks can_delegate wording: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (a follow-up persist/insert/proxy call means the gate leaked): %v", err)
+	}
+}
+
+// TestProxyA2A_MessageSend_CanDelegateTrue_Proceeds is the no-regression
+// sentinel for the default-true path. A workspace with can_delegate=TRUE
+// (the default for every existing workspace) MUST follow the existing
+// message/send flow unchanged. We use the poll-mode short-circuit (no
+// real upstream dispatch) so the mock setup is bounded; the existing
+// TestProxyA2A_AllowedSelf_SkipsAccessCheck test covers the full
+// happy-path dispatch. This test focuses on the gate behaviour: the
+// can_delegate=TRUE lookup happens, then the poll-mode path returns 200.
+func TestProxyA2A_MessageSend_CanDelegateTrue_Proceeds(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-target"), "http://localhost:1")
+	mockCanCommunicate(mock, "ws-caller", "ws-target", true) // same parent
+	mockSameOrg(mock, "ws-caller", "ws-target", true)        // same tenant
+	expectBudgetCheck(mock, "ws-target")
+
+	// Poll-mode short-circuit: setting delivery_mode='poll' skips the
+	// upstream dispatch, so the test exercises the gate (can_delegate
+	// lookup + canDelegate=true) without the rest of the dispatch path.
+	mock.ExpectQuery(`SELECT delivery_mode FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-target").
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("poll"))
+	// can_delegate=TRUE — proceed (the gate's lookup happens, the value
+	// is true, so the gate does NOT short-circuit to 403).
+	mock.ExpectQuery(`SELECT can_delegate FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-caller").
+		WillReturnRows(sqlmock.NewRows([]string{"can_delegate"}).AddRow(true))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}}
+	body := `{"method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hi"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-target/a2a", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
+
+	handler.ProxyA2A(c)
+
+	// Not 403 (the gate's rejection code) — the poll-mode handler
+	// returns 200 {status:"queued"} after the gate passes. We don't
+	// pin the exact body since the poll-mode tests cover that.
+	if w.Code == http.StatusForbidden {
+		t.Errorf("can_delegate=true must NOT trigger the gate (403); got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestProxyA2A_MessageSend_CanDelegateFalse_SelfCall_Allowed is the
+// no-false-positive sentinel. Self-calls (callerID == workspaceID) reply
+// to the workspace's own queued turn — that is NOT a delegation and must
+// not be can_delegate-gated.
+func TestProxyA2A_MessageSend_CanDelegateFalse_SelfCall_Allowed(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+	mr.Set(fmt.Sprintf("ws:%s:url", "ws-self"), agentServer.URL)
+	expectBudgetCheck(mock, "ws-self")
+
+	// can_delegate=FALSE on the workspace — but the call is a self-call
+	// (callerID == workspaceID), so the gate MUST NOT fire. The lookup
+	// itself is also skipped — no can_delegate expectation.
+	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-self"}}
+	body := `{"method":"message/send","params":{"message":{"role":"user","parts":[{"text":"hi"}]}}}`
+	c.Request = httptest.NewRequest("POST", "/workspaces/ws-self/a2a", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("X-Workspace-ID", "ws-self")
+
+	handler.ProxyA2A(c)
+	time.Sleep(50 * time.Millisecond)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("self-call with can_delegate=false must NOT be gated, got %d: %s", w.Code, w.Body.String())
+	}
+}
