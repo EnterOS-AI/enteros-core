@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -890,3 +891,121 @@ func TestChatDownload_RejectsNonHTTPScheme(t *testing.T) {
 		t.Errorf("expected 400 for file:// scheme in download, got %d: %s", w.Code, w.Body.String())
 	}
 }
+// ---------- core#2129 RC 13395/CR2: redirect + DNS-rebind bypass ----------
+
+// safeWorkspaceURLServer is a tiny upstream that 302-redirects every request
+// to the metadata endpoint. Used to prove the chat-files client refuses
+// to follow a redirect to a blocked target (RC 13395).
+//
+// Returns (workspaceURL, metadataURL, metadataHitCount) so each test can
+// assert the metadata target got the expected number of hits (0 for the
+// redirect-blocked cases). The metadata counter is the load-bearing
+// signal — w.Code can't be used for POST-based 3xx responses because
+// Go's http.Redirect omits the body for non-GET/HEAD, so a recorder-
+// based check would not detect the 302 in those cases.
+func safeWorkspaceURLServer(t *testing.T) (workspaceURL string, metadataURL string, metadataHits *int32) {
+	t.Helper()
+	var hits int32
+	metadata := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("metadata"))
+	}))
+	t.Cleanup(metadata.Close)
+
+	safe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, metadata.URL+"/latest/meta-data/", http.StatusFound)
+	}))
+	t.Cleanup(safe.Close)
+	return safe.URL, metadata.URL, &hits
+}
+
+// TestChatDownload_RedirectToMetadata_NotFollowed is the RC 13395 regression:
+// a SAFE workspace URL (the one that passes isSafeURL on the front-door
+// check) that 302-redirects to a metadata target must NOT be followed.
+// The chat-files client returns the 3xx to the caller without chasing —
+// the platform_inbound_secret bearer is never attached to the unsafe
+// redirect target.
+func TestChatDownload_RedirectToMetadata_NotFollowed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	// Disable the front-door isSafeURL check so the test URL passes the
+	// workspace-URL gate — this test focuses on the REDIRECT guard,
+	// not the front-door (which the existing TestChatDownload_RejectsMetadataWorkspaceURL
+	// already covers). The redirect guard MUST still refuse to follow
+	// the 302 to the metadata target even when the front-door is happy.
+	restore := setSSRFCheckForTest(false)
+	t.Cleanup(restore)
+
+	safeURL, _, metadataHits := safeWorkspaceURLServer(t)
+	wsID := "00000000-0000-0000-0000-000000000060"
+	expectURL(mock, wsID, safeURL)
+	// The secret IS read (the redirect guard fires AFTER the secret is
+	// attached — the guard is on the http.Client, not on the secret
+	// fetch). We mock the secret so the test can reach the HTTP call.
+	expectInboundSecret(mock, wsID, "tok-redirect-test")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil))
+	c, w := makeDownloadRequest(t, wsID, "/workspace/foo.txt")
+	h.Download(c)
+
+	// 302 from the safe URL — surfaced to the caller without chasing.
+	// The default client would follow to the metadata target; our
+	// client uses CheckRedirect: http.ErrUseLastResponse to refuse.
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 (redirect surfaced, not followed), got %d: %s", w.Code, w.Body.String())
+	}
+	// And the metadata target was NOT hit (it would have returned 200 +
+	// the body "metadata" if the client had followed the redirect).
+	if strings.Contains(w.Body.String(), "metadata") {
+		t.Errorf("response body looks like the metadata target was fetched: %s", w.Body.String())
+	}
+	// Authoritative signal: the metadata server got zero hits.
+	if got := atomic.LoadInt32(metadataHits); got != 0 {
+		t.Errorf("metadata target was hit %d times — the client followed the redirect", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestChatUpload_RedirectToMetadata_NotFollowed is the same regression
+// for the upload path. A SAFE workspace URL that 302-redirects to
+// metadata must NOT be followed (a 302 from a POST would have the
+// http.Client follow by default; ErrUseLastResponse refuses).
+//
+// Note: we can't assert w.Code on a POST-based 3xx response because
+// Go's http.Redirect omits the body for non-GET/HEAD, so a recorder-
+// based check (which only sees the status when a body byte is written)
+// would not detect the 302. The metadata-hit counter is the load-bearing
+// signal — if the client followed, the metadata server would have been
+// hit.
+func TestChatUpload_RedirectToMetadata_NotFollowed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	// Same setup as the download test: disable the front-door so the
+	// redirect guard is the gate under test.
+	restore := setSSRFCheckForTest(false)
+	t.Cleanup(restore)
+
+	safeURL, _, metadataHits := safeWorkspaceURLServer(t)
+	wsID := "00000000-0000-0000-0000-000000000061"
+	expectURL(mock, wsID, safeURL)
+	// The secret IS read (redirect guard is on the http.Client, not on
+	// the secret fetch).
+	expectInboundSecret(mock, wsID, "tok-redirect-test-upload")
+
+	h := NewChatFilesHandler(NewTemplatesHandler(t.TempDir(), nil, nil))
+	c, _ := makeUploadRequest(t, wsID, bytes.NewBufferString("hi"), "application/octet-stream")
+	h.Upload(c)
+
+	// Authoritative signal: the metadata server got zero hits.
+	// If the client had followed the 302, this counter would be 1.
+	if got := atomic.LoadInt32(metadataHits); got != 0 {
+		t.Errorf("metadata target was hit %d times — the client followed the redirect", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
