@@ -560,6 +560,17 @@ func TestListDelegationsFromLedger_CalleeDirection_Received(t *testing.T) {
 func TestListDelegationsFromActivityLogs_ReceivedDirection(t *testing.T) {
 	// When workspace_id differs from source_id, direction = "received".
 	// This happens when the workspace received a delegation, not sent one.
+	//
+	// Non-vacuous guard (RC 11026): the sqlmock regex is tightened to
+	// require BOTH `workspace_id` AND `source_id` in the WHERE clause
+	// (with a "delegate" method filter). The previous regex
+	// ("SELECT .+ FROM activity_logs") matched any query on
+	// activity_logs and let a source_id-only predicate pass even
+	// though it would silently exclude this row in real SQL. The
+	// tightened regex pins the contract: any future change that
+	// drops the OR clause (or narrows back to a single column)
+	// fails this mock expectation, so the test is a real assertion
+	// of the predicate shape, not just a happy-path sqlmock.
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)
@@ -582,7 +593,11 @@ func TestListDelegationsFromActivityLogs_ReceivedDirection(t *testing.T) {
 		"", "", "",
 		now, "ws-1", // workspace_id = ws-1 (the receiving workspace)
 	)
-	mock.ExpectQuery("SELECT .+ FROM activity_logs").
+	// Tightened regex: require BOTH workspace_id AND source_id in
+	// the WHERE clause (the OR predicate), pinned to the methods we
+	// filter for. The previous regex matched any SELECT on
+	// activity_logs and masked the predicate regression.
+	mock.ExpectQuery(`SELECT .+ FROM activity_logs\s+WHERE \(workspace_id = \$1 OR source_id = \$1\) AND method IN \('delegate', 'delegate_result'\)`).
 		WithArgs("ws-1").
 		WillReturnRows(rows)
 

@@ -877,6 +877,17 @@ func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, works
 // delegation state by folding activity_logs rows by delegation_id.
 // Kept for backward compatibility and for workspaces that never had
 // DELEGATION_LEDGER_WRITE=1 during their delegation lifecycle.
+//
+// Predicate: the row matches if the workspace is EITHER the actor
+// (source_id, fired the delegation) OR the owner of the activity log
+// (workspace_id, received a delegation). A source_id-only predicate
+// would exclude "received" rows that the same workspace owns but did
+// not fire (its session was the target of another workspace's
+// delegate call). RC 11026: this was the vacuous-test fallout — the
+// test fabricated a received row with source_id="ws-other" +
+// workspace_id="ws-1" and the previous WHERE source_id=$1 would
+// have silently excluded it in real SQL even though the unit test
+// passed (sqlmock regex was too loose to catch the shape).
 func (h *DelegationHandler) listDelegationsFromActivityLogs(ctx context.Context, workspaceID string) []map[string]interface{} {
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT id, activity_type, COALESCE(source_id::text, ''), COALESCE(target_id::text, ''),
@@ -885,7 +896,7 @@ func (h *DelegationHandler) listDelegationsFromActivityLogs(ctx context.Context,
 		       COALESCE(request_body->>'delegation_id', response_body->>'delegation_id', ''),
 		       created_at, workspace_id
 		FROM activity_logs
-		WHERE source_id = $1 AND method IN ('delegate', 'delegate_result')
+		WHERE (workspace_id = $1 OR source_id = $1) AND method IN ('delegate', 'delegate_result')
 		ORDER BY created_at DESC
 		LIMIT 50
 	`, workspaceID)
