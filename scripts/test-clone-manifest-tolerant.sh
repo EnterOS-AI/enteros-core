@@ -1,13 +1,19 @@
 #!/bin/sh
 # test-clone-manifest-tolerant.sh — local, network-free test of the
-# tokenless graceful-degradation behavior in clone-manifest.sh.
+# strict/best-effort behavior in clone-manifest.sh.
 #
-# Stubs `git` so a "private" repo clone fails when the URL is anonymous
-# (no oauth2: userinfo) and succeeds when a token is embedded — mirroring
-# real Gitea. Asserts:
-#   A. no token  → public repos clone, private repos SKIP, exit 0
+# Stubs `git` so a clone fails for a repo listed in $PRIVATE_REPOS when the
+# URL is anonymous (no oauth2: userinfo) and for any repo in $HARD_FAIL_REPOS
+# (fails even with a token) — mirroring real Gitea. The SKIP decision in
+# clone-manifest.sh is driven by the manifest's `"private": true` flag, NOT by
+# which repo the stub fails, so these tests prove the safety boundary:
+#
+#   A. no token  → public clone, MARKED-private skip, exit 0
 #   B. token set → every repo clones, exit 0
-#   C. token set + a repo that fails even authed → exit 1 (genuine failure)
+#   C. token set + genuine failure → exit 1 (strict)
+#   E. no token + a PUBLIC (unmarked) repo hard-fails → exit 1
+#        (the key negative case: best-effort must NOT swallow public failures)
+#   D. no token + EVERY entry marked private → exit 0 + empty-palette warning
 #
 # Run:  sh scripts/test-clone-manifest-tolerant.sh
 # Exit: 0 all pass, 1 otherwise.
@@ -22,8 +28,8 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"
 
 # git stub. Fails clone when:
-#   - repo basename is in $PRIVATE_REPOS and the URL is anonymous, OR
-#   - repo basename is in $HARD_FAIL_REPOS (fails even with a token).
+#   - repo basename is in $HARD_FAIL_REPOS (fails even with a token), OR
+#   - repo basename is in $PRIVATE_REPOS and the URL is anonymous.
 cat > "$WORK/bin/git" <<'STUB'
 #!/bin/sh
 [ "$1" = "clone" ] || exit 0
@@ -43,23 +49,24 @@ exit 0
 STUB
 chmod +x "$WORK/bin/git"
 
-# manifest: 2 public + 1 private workspace template
-cat > "$WORK/manifest.json" <<'JSON'
+# Default manifest: 2 public + 1 MARKED-private workspace template.
+write_manifest() { cat > "$WORK/manifest.json"; }
+write_manifest <<'JSON'
 {
   "version": 1, "plugins": [], "org_templates": [],
   "workspace_templates": [
-    {"name": "pub-a",   "repo": "molecule-ai/pub-a",   "ref": "main"},
-    {"name": "priv-x",  "repo": "molecule-ai/priv-x",  "ref": "main"},
-    {"name": "pub-b",   "repo": "molecule-ai/pub-b",   "ref": "main"}
+    {"name": "pub-a",  "repo": "molecule-ai/pub-a",  "ref": "main"},
+    {"name": "priv-x", "repo": "molecule-ai/priv-x", "ref": "main", "private": true},
+    {"name": "pub-b",  "repo": "molecule-ai/pub-b",  "ref": "main"}
   ]
 }
 JSON
 
 fail() { echo "FAIL: $1"; exit 1; }
-run() {  # run <env-opts/assignments...>  (returns exit code, captures $OUT)
-    # NOTE: env opts (-u) must precede NAME=VALUE assignments (BSD env),
-    # so caller args go FIRST.
-    OUT=$(env "$@" PATH="$WORK/bin:$PATH" PRIVATE_REPOS="priv-x" \
+# run <env opts/assignments...>  → exit code preserved, output in $OUT.
+# env opts (-u) must precede NAME=VALUE assignments (BSD env), so "$@" goes first.
+run() {
+    OUT=$(env "$@" PATH="$WORK/bin:$PATH" \
         sh "$CLONE_SH" "$WORK/manifest.json" "$WORK/ws" "$WORK/org" "$WORK/plugins" 2>&1)
     rc=$?
     printf '%s\n' "$OUT" > "$WORK/last.out"
@@ -67,18 +74,18 @@ run() {  # run <env-opts/assignments...>  (returns exit code, captures $OUT)
 }
 reset() { rm -rf "$WORK/ws" "$WORK/org" "$WORK/plugins"; }
 
-# --- A. no token → private skipped, public cloned, exit 0 ----------------
+# --- A. no token → marked-private skipped, public cloned, exit 0 ----------
 reset
-if run -u MOLECULE_GITEA_TOKEN; then :; else fail "A: tokenless run should exit 0 (got non-zero)"; fi
+if run -u MOLECULE_GITEA_TOKEN PRIVATE_REPOS="priv-x"; then :; else fail "A: tokenless run should exit 0 (got $?)"; fi
 [ -f "$WORK/ws/pub-a/STUB" ] && [ -f "$WORK/ws/pub-b/STUB" ] || fail "A: public repos not cloned"
-[ -d "$WORK/ws/priv-x" ] && fail "A: private repo should have been skipped (dir present)"
+[ -d "$WORK/ws/priv-x" ] && fail "A: private repo should have been skipped"
 echo "$OUT" | grep -q "skipping 'priv-x'" || fail "A: missing skip warning for priv-x"
-echo "$OUT" | grep -q "2/3 cloned, 1 skipped" || fail "A: summary line wrong: $(echo "$OUT" | tail -1)"
-echo "ok A: tokenless → 2 public cloned, 1 private skipped, exit 0"
+echo "$OUT" | grep -q "2/3 cloned, 1 skipped" || fail "A: summary wrong: $(echo "$OUT" | tail -1)"
+echo "ok A: tokenless → 2 public cloned, 1 marked-private skipped, exit 0"
 
 # --- B. token set → all clone, exit 0 ------------------------------------
 reset
-if run MOLECULE_GITEA_TOKEN=tok; then :; else fail "B: tokened run should exit 0"; fi
+if run MOLECULE_GITEA_TOKEN=tok PRIVATE_REPOS="priv-x"; then :; else fail "B: tokened run should exit 0"; fi
 [ -f "$WORK/ws/priv-x/STUB" ] || fail "B: private repo should clone with token"
 echo "$OUT" | grep -q "3/3 repos cloned successfully" || fail "B: summary wrong: $(echo "$OUT" | tail -1)"
 echo "ok B: with token → all 3 cloned, exit 0"
@@ -91,14 +98,29 @@ fi
 echo "$OUT" | grep -q "genuine failure" || fail "C: missing genuine-failure error"
 echo "ok C: with token + real failure → exit 1 (strict preserved)"
 
-# --- D. no token + ALL repos private → exit 0 with empty-palette warning -
-# (every repo skipped; must NOT block bootstrap — setup.sh tolerates an
-#  empty palette. Mark every repo private via PRIVATE_REPOS override.)
+# --- E. no token + PUBLIC repo hard-fails → exit 1 (the key boundary) -----
+# pub-a clones, priv-x is skipped (marked private), pub-b fails and is NOT
+# marked private → must abort. Proves best-effort does NOT swallow a genuine
+# public failure (bad ref / deleted repo / outage), even after a success.
 reset
-OUT=$(env -u MOLECULE_GITEA_TOKEN PATH="$WORK/bin:$PATH" PRIVATE_REPOS="pub-a priv-x pub-b" \
-    sh "$CLONE_SH" "$WORK/manifest.json" "$WORK/ws" "$WORK/org" "$WORK/plugins" 2>&1) \
-    && rc=0 || rc=$?
-[ "${rc:-0}" -eq 0 ] || fail "D: all-private tokenless run must exit 0 (got $rc)"
+if run -u MOLECULE_GITEA_TOKEN PRIVATE_REPOS="priv-x" HARD_FAIL_REPOS=pub-b; then
+    fail "E: tokenless run must exit 1 when a PUBLIC repo fails to clone"
+fi
+echo "$OUT" | grep -q "PUBLIC repo 'pub-b'" || fail "E: missing public-failure error for pub-b"
+echo "ok E: tokenless + public hard-fail → exit 1 (no fail-open on public repos)"
+
+# --- D. no token + EVERY entry marked private → exit 0 + warning ----------
+write_manifest <<'JSON'
+{
+  "version": 1, "plugins": [], "org_templates": [],
+  "workspace_templates": [
+    {"name": "priv-a", "repo": "molecule-ai/priv-a", "ref": "main", "private": true},
+    {"name": "priv-b", "repo": "molecule-ai/priv-b", "ref": "main", "private": true}
+  ]
+}
+JSON
+reset
+if run -u MOLECULE_GITEA_TOKEN PRIVATE_REPOS="priv-a priv-b"; then :; else fail "D: all-private tokenless run must exit 0 (got $?)"; fi
 echo "$OUT" | grep -q "EMPTY template palette" || fail "D: missing empty-palette warning"
 echo "ok D: tokenless + all-private → exit 0 with empty-palette warning"
 

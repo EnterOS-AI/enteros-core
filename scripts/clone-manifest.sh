@@ -12,10 +12,13 @@
 #     the private platform templates, so ANY clone failure is a genuine
 #     error and aborts (exit 1). This is the build-correctness path.
 #   BEST-EFFORT (no token; ecosystem contributor via setup.sh/dev-start.sh):
-#     the private platform templates (internal IP) aren't fetchable, and a
-#     contributor shouldn't need creds to spin up a local dev env. Clone
-#     what's public, SKIP what we can't access with a warning, exit 0. The
-#     Canvas template palette is then sparse but the platform runs.
+#     a contributor shouldn't need creds to spin up a local dev env. Clone
+#     what's public; SKIP (with a warning) ONLY repos the manifest marks
+#     `"private": true` — those need a token. A failure of any UNMARKED
+#     (public) repo still ABORTS (exit 1), so a bad ref / deleted repo /
+#     network outage is never swallowed as a missing-creds skip. Exit 0 when
+#     the only failures were private skips. The palette is then sparse but
+#     the platform runs.
 #   Set MOLECULE_GITEA_TOKEN to the SSOT-managed template read token to
 #   populate the full set.
 #
@@ -138,10 +141,15 @@ clone_category() {
 
     local i=0
     while [ "$i" -lt "$count" ]; do
-        local name repo ref
+        local name repo ref private
         name=$(echo "$MANIFEST_JSON" | jq -r ".${category}[$i].name")
         repo=$(echo "$MANIFEST_JSON" | jq -r ".${category}[$i].repo")
         ref=$(echo "$MANIFEST_JSON" | jq -r ".${category}[$i].ref // \"main\"")
+        # `private: true` marks repos that REQUIRE a token to clone. Only
+        # these may be skipped in best-effort (tokenless) mode; an unmarked
+        # (public) repo that fails is a genuine error and must fail the run
+        # even without a token. (manifest.json _comment.)
+        private=$(echo "$MANIFEST_JSON" | jq -r ".${category}[$i].private // false")
 
         # Idempotent: skip if the target already looks populated. Lets the
         # README quickstart rerun setup.sh safely without having to delete
@@ -181,14 +189,21 @@ clone_category() {
                 exit 1
             fi
         else
-            # No token → best effort. A failure is most likely a private
-            # platform template we can't access; skip it and keep going.
+            # No token → best effort. A failure is only TOLERATED for a repo
+            # explicitly marked `private: true` (needs creds we don't have).
+            # A failure of any UNMARKED (public) repo — bad ref, deleted repo,
+            # DNS/network outage, git regression, Gitea non-auth error — is a
+            # GENUINE error and must still abort, so a real outage can never be
+            # silently swallowed as a missing-creds skip.
             if clone_one_with_retry "$target_dir" "$name" "$clone_url" "$display_url" "$ref" 1; then
                 CLONED=$((CLONED + 1))
-            else
-                echo "  ⚠ skipping '$name' — clone failed and MOLECULE_GITEA_TOKEN is unset (likely a private platform template; set the token to include it). Bootstrap continues with a reduced template palette." >&2
+            elif [ "$private" = "true" ]; then
+                echo "  ⚠ skipping '$name' — marked private and MOLECULE_GITEA_TOKEN is unset (set the token to include it). Bootstrap continues with a reduced template palette." >&2
                 SKIPPED=$((SKIPPED + 1))
                 rm -rf "$target_dir/$name"   # drop any partial dir so a later token-backed run re-clones cleanly
+            else
+                echo "::error::clone failed for PUBLIC repo '$name' ($display_url) — genuine failure (not a missing-creds skip). Check the manifest ref / network / repo existence. (If this repo is actually private, mark it \"private\": true in manifest.json.)" >&2
+                exit 1
             fi
         fi
         i=$((i + 1))
@@ -216,14 +231,15 @@ if [ "$STRICT" -eq 1 ]; then
     fi
     echo "==> Done. $CLONED/$EXPECTED repos cloned successfully."
 else
-    # No token: NEVER hard-fail — local bootstrap must not be blocked on
-    # creds the contributor doesn't have, and setup.sh explicitly tolerates
-    # an empty palette (the platform falls through to a bare default). We
-    # can't distinguish "all repos private" from "Gitea down" without a
-    # token, so if nothing cloned we warn loudly but still exit 0.
+    # No token, and we got here — so every failure was a tolerated `private`
+    # skip (any PUBLIC-repo failure would already have exited 1 above). A real
+    # outage can't reach this point: it fails the public clones first. setup.sh
+    # tolerates an empty palette (the platform falls through to a bare
+    # default), so we exit 0. CLONED==0 here just means every manifest entry
+    # was marked private — warn loudly, but still don't block bootstrap.
     if [ "$CLONED" -eq 0 ] && [ "$EXPECTED" -gt 0 ]; then
-        echo "  ⚠ WARNING: 0/$EXPECTED template/plugin repos cloned ($SKIPPED skipped) — none were publicly reachable without MOLECULE_GITEA_TOKEN. The platform will start with an EMPTY template palette. Set MOLECULE_GITEA_TOKEN to populate it (or check network if you expected public templates)." >&2
+        echo "  ⚠ WARNING: 0/$EXPECTED template/plugin repos cloned ($SKIPPED private, skipped) — every manifest entry needs MOLECULE_GITEA_TOKEN. The platform will start with an EMPTY template palette. Set the token to populate it." >&2
     else
-        echo "==> Done (best-effort, no MOLECULE_GITEA_TOKEN). $CLONED/$EXPECTED cloned, $SKIPPED skipped (private platform templates; set the token to include them)."
+        echo "==> Done (best-effort, no MOLECULE_GITEA_TOKEN). $CLONED/$EXPECTED cloned, $SKIPPED skipped (marked private; set the token to include them)."
     fi
 fi
