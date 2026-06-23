@@ -626,3 +626,77 @@ func TestListDelegationsFromActivityLogs_ReceivedDirection(t *testing.T) {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
 }
+
+// TestListDelegationsFromActivityLogs_CallerDirection_Sent (RC 13430)
+// pins the caller-side sent case. The previous direction
+// computation (actWorkspaceID != sourceID) mis-labeled a
+// callee-owned log row whose source_id matched the caller as
+// "received" — a regression that mixed the caller's sent history
+// with the callee's received view in the same call.
+// The fix: direction is from the QUERYING workspace's perspective:
+// sourceID == workspaceID => "sent"; otherwise "received".
+//
+// Fixture: caller is ws-1 (the workspaceID passed to the function).
+// The activity_log row is owned by ws-2 (the callee) — i.e. a
+// callee-side log entry for a delegation the caller fired. The
+// row's source_id is ws-1 (the caller). Pre-fix: returned
+// "received" (because workspace_id=ws-2 != source_id=ws-1).
+// Post-fix: returns "sent" (because source_id=ws-1 == workspaceID=ws-1).
+func TestListDelegationsFromActivityLogs_CallerDirection_Sent(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	prevDB := db.DB
+	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prevDB; mockDB.Close() })
+
+	now := time.Now()
+	// Caller perspective: ws-1 is querying. The log row is owned
+	// by the callee (ws-2) — typical of a callee-side log entry
+	// for a delegation the caller fired. source_id=ws-1 (the
+	// caller fired it).
+	rows := sqlmock.NewRows([]string{
+		"id", "activity_type", "source_id", "target_id",
+		"summary", "status", "error_detail",
+		"response_preview", "delegation_id", "created_at", "workspace_id",
+	}).AddRow(
+		"act-sent-1", "delegate",
+		"ws-1", "ws-2",
+		"Delegating to ws-2",
+		"in_progress",
+		"", "", "",
+		now, "ws-2", // workspace_id = ws-2 (the callee owns this log row)
+	)
+	mock.ExpectQuery(`SELECT .+ FROM activity_logs\s+WHERE \(workspace_id = \$1 OR source_id = \$1\) AND method IN \('delegate', 'delegate_result'\)`).
+		WithArgs("ws-1").
+		WillReturnRows(rows)
+
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	got := dh.listDelegationsFromActivityLogs(context.Background(), "ws-1")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(got))
+	}
+	e := got[0]
+	if e["id"] != "act-sent-1" {
+		t.Errorf("id: got %v, want act-sent-1", e["id"])
+	}
+	if e["source_id"] != "ws-1" {
+		t.Errorf("source_id: got %v, want ws-1", e["source_id"])
+	}
+	if e["target_id"] != "ws-2" {
+		t.Errorf("target_id: got %v, want ws-2", e["target_id"])
+	}
+	// Pre-fix: this would be "received" (the old actWorkspaceID!=sourceID
+	// check saw workspace_id=ws-2 != source_id=ws-1). Post-fix:
+	// "sent" because source_id=ws-1 == workspaceID=ws-1.
+	if e["direction"] != "sent" {
+		t.Errorf("direction: got %v, want sent (caller's sent view; pre-fix the actWorkspaceID!=sourceID check mis-labeled this as received)", e["direction"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}

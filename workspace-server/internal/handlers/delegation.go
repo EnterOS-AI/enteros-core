@@ -913,7 +913,17 @@ func (h *DelegationHandler) listDelegationsFromActivityLogs(ctx context.Context,
 			continue
 		}
 		direction := "sent"
-		if actWorkspaceID != sourceID {
+		// RC 13430: compute direction from the QUERYING
+		// workspace's perspective, not from the row owner's
+		// perspective. A row whose source_id equals the querying
+		// workspaceID is a delegation that workspace FIRED (sent),
+		// even if the activity_log row happens to be owned by
+		// the callee (i.e. a callee-owned row whose source_id
+		// matches $1). The previous owner-vs-source check
+		// (`actWorkspaceID != sourceID`) mis-labeled such rows as
+		// received, mixing the caller's sent history with the
+		// callee's received view in the same call.
+		if sourceID != workspaceID {
 			direction = "received"
 		}
 		entry := map[string]interface{}{
