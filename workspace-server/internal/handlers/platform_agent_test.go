@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
@@ -1033,6 +1034,106 @@ func TestRecordDeclaredPlugin_PrivilegedPluginEntitlement(t *testing.T) {
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		if err := recordDeclaredPlugin(context.Background(), "ws-user", "browser-automation", "browser-automation"); err != nil {
 			t.Fatalf("ordinary plugin declaration must succeed: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+}
+
+// TestEnsureConciergeProvider_FailsClosedOnReadError is the CI regression gate
+// for core#3162 (BYOK fail-open): a transient decrypt/read error on an EXISTING
+// LLM_PROVIDER row used to be collapsed into "" and treated as "unset", which
+// combined with a momentarily-empty MODEL could silently mis-pin a BYOK/self-host
+// concierge onto the platform LLM proxy. The fix returns the error to the
+// caller; ensureConciergeProvider MUST fail closed (return without seeding) so
+// the next provision re-tries rather than silently mis-routing.
+func TestEnsureConciergeProvider_FailsClosedOnReadError(t *testing.T) {
+	h := &WorkspaceHandler{}
+	const providerSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'LLM_PROVIDER'`
+	const secretInsert = `INSERT INTO workspace_secrets`
+
+	t.Run("decrypt error on existing row fails closed (does NOT seed platform)", func(t *testing.T) {
+		// Real encrypted_value bytes that cannot be decrypted by the current
+		// key/algorithm: forces crypto.DecryptVersioned to return an error.
+		// This is the realistic "the row exists but the ciphertext is unreadable"
+		// case — exactly the failure mode that previously fell through to a
+		// fail-OPEN platform pin.
+		mock := setupTestDB(t)
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-decrypt-fail").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("corrupt-ciphertext-that-cannot-be-decrypted"), 0))
+		// NO ExpectExec: the fail-closed path MUST NOT persist LLM_PROVIDER.
+
+		env := map[string]string{} // empty MODEL — the mis-pin window
+		h.ensureConciergeProvider(context.Background(), "ws-decrypt-fail", env)
+
+		if _, pinned := env["LLM_PROVIDER"]; pinned {
+			t.Errorf("transient decrypt error caused a platform provider pin (env=%v) — would mis-route a BYOK/self-host concierge", env)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (a pin INSERT means the fail-closed path leaked): %v", err)
+		}
+	})
+
+	t.Run("db scan error (non-ErrNoRows) fails closed", func(t *testing.T) {
+		// A connection error / context-cancellation on the secret lookup. Not
+		// the clean "row doesn't exist" case (sql.ErrNoRows) — this is a real
+		// failure that must also fail closed.
+		mock := setupTestDB(t)
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-scan-fail").
+			WillReturnError(fmt.Errorf("connection refused"))
+		// NO ExpectExec: fail closed.
+
+		env := map[string]string{}
+		h.ensureConciergeProvider(context.Background(), "ws-scan-fail", env)
+
+		if _, pinned := env["LLM_PROVIDER"]; pinned {
+			t.Errorf("DB scan error caused a platform provider pin (env=%v)", env)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("sql.ErrNoRows (genuine unset) proceeds to seed (no regression)", func(t *testing.T) {
+		// The clean "no row exists" case MUST still let the caller proceed to
+		// the platform-provider seed. This is the fresh-boot / cleared-secret
+		// case the existing happy-path tests cover; we re-pin it here so a
+		// future refactor of the error-path can break it loudly.
+		mock := setupTestDB(t)
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-fresh-unset").
+			WillReturnError(sql.ErrNoRows)
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-fresh-unset", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		env := map[string]string{} // empty MODEL → seed path
+		h.ensureConciergeProvider(context.Background(), "ws-fresh-unset", env)
+
+		if env["LLM_PROVIDER"] != conciergeProvider {
+			t.Errorf("genuine unset did not pin LLM_PROVIDER=%q; got %q (env=%v) — regression on the seed path", conciergeProvider, env["LLM_PROVIDER"], env)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (the seed path did not persist): %v", err)
+		}
+	})
+
+	t.Run("existing stored provider is respected on successful read (no regression)", func(t *testing.T) {
+		// Existing happy path: a stored provider row reads cleanly → caller
+		// returns early without pinning. Pinned here as the regression
+		// sentinel for the successful-read branch.
+		mock := setupTestDB(t)
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-existing-prov").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("customer-picked-byok-provider"), 0))
+		// NO ExpectExec: existing provider wins → no pin.
+
+		env := map[string]string{}
+		h.ensureConciergeProvider(context.Background(), "ws-existing-prov", env)
+
+		if _, pinned := env["LLM_PROVIDER"]; pinned {
+			t.Errorf("existing stored provider wrongly pinned platform (env=%v) — would override the customer pick", env)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations: %v", err)
