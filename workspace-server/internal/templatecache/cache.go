@@ -16,6 +16,9 @@ type ManifestEntry struct {
 	Name string `json:"name"`
 	Repo string `json:"repo"`
 	Ref  string `json:"ref"`
+	// Provider names the SCM host the Repo path resolves against (see
+	// manifest.json _provider_contract). Empty ⇒ "moleculesai" (default).
+	Provider string `json:"provider"`
 }
 
 type manifestFile struct {
@@ -89,7 +92,7 @@ func refreshOne(ctx context.Context, cacheDir, token string, entry ManifestEntry
 	}
 	defer os.RemoveAll(tmp)
 
-	cloneURL := authenticatedURL(entry.Repo, token)
+	cloneURL := authenticatedURL(entry.Repo, entry.Provider, token)
 	for _, args := range [][]string{
 		{"init", "-q", tmp},
 		{"-C", tmp, "remote", "add", "origin", cloneURL},
@@ -144,7 +147,27 @@ func safeTemplateName(name string) bool {
 	return true
 }
 
-func authenticatedURL(repo, token string) string {
+// providerHost maps a manifest `provider` discriminator to its git host.
+// The discriminator names our HOST IDENTITY, not the server software, so
+// "moleculesai" survives a Gitea-software swap. Empty / unknown ⇒ the
+// moleculesai default (keeps every legacy, provider-less entry working and
+// fail-soft: a typo'd provider resolves to the default rather than panicking
+// the refresh — the shell resolvers and pinning test fail-closed on unknown
+// providers, so a real mistake is still caught upstream). Keep the known
+// cases in sync with manifest.json _provider_contract and the shell
+// resolvers (clone-manifest.sh, check-manifest-repos-exist.sh).
+func providerHost(provider string) string {
+	switch provider {
+	case "github":
+		return "github.com"
+	case "", "moleculesai":
+		return "git.moleculesai.app"
+	default:
+		return "git.moleculesai.app"
+	}
+}
+
+func authenticatedURL(repo, provider, token string) string {
 	if strings.HasPrefix(repo, "http://") || strings.HasPrefix(repo, "https://") {
 		u, err := url.Parse(repo)
 		if err == nil {
@@ -154,7 +177,7 @@ func authenticatedURL(repo, token string) string {
 	}
 	u := &url.URL{
 		Scheme: "https",
-		Host:   "git.moleculesai.app",
+		Host:   providerHost(provider),
 		Path:   "/" + strings.TrimSuffix(repo, ".git") + ".git",
 		User:   url.UserPassword("oauth2", token),
 	}

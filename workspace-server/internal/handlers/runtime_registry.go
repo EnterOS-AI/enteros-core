@@ -59,10 +59,11 @@ func manifestPath() string {
 // manifestEntry mirrors the shape of a workspace_templates item.
 // Only the fields we read are declared; extras are ignored.
 type manifestEntry struct {
-	Name    string `json:"name"`
-	Repo    string `json:"repo"`
-	Ref     string `json:"ref"`
-	Runtime string `json:"runtime"` // optional base runtime identifier for template variants (e.g. "seo-agent" → "claude-code")
+	Name     string `json:"name"`
+	Repo     string `json:"repo"`
+	Ref      string `json:"ref"`
+	Runtime  string `json:"runtime"`  // optional base runtime identifier for template variants (e.g. "seo-agent" → "claude-code")
+	Provider string `json:"provider"` // optional SCM host the repo path resolves against; empty ⇒ "moleculesai" (see manifest.json _provider_contract)
 }
 
 type manifestFile struct {
