@@ -10,6 +10,24 @@ mq = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mq
 spec.loader.exec_module(mq)
 
+# Capture the REAL loader before the autouse stub below replaces it, so the
+# dedicated loader tests can exercise the genuine parser on a tmp file.
+_REAL_LOAD_ENFORCED = mq.load_enforced_file_contexts
+
+
+@pytest.fixture(autouse=True)
+def _no_enforced_file_contexts_by_default(monkeypatch):
+    """internal#3181: process_once / enumerate_readiness now read
+    `.gitea/required-contexts.txt` via load_enforced_file_contexts(). The
+    integration tests below predate that feature and only set up
+    branch-protection + governance statuses; left unpatched they would pick
+    up the REAL repo file (whose entries aren't in their fixtures) and
+    correctly go `wait`. Default the loader to [] so the legacy BP-path tests
+    keep asserting the BP path; the dedicated SSOT-enforced tests pass
+    `enforced_file_contexts=` explicitly to evaluate_merge_readiness (and
+    call load_enforced_file_contexts on a tmp file), so they are unaffected."""
+    monkeypatch.setattr(mq, "load_enforced_file_contexts", lambda path: [])
+
 
 def test_latest_statuses_dedupes_by_context_newest_first():
     statuses = [
@@ -2698,3 +2716,169 @@ def test_is_active_release_candidate_returns_false_when_no_rc_labels():
         },
     ]
     assert mq._is_active_release_candidate(prs, pr_number=999) is False
+
+
+# --------------------------------------------------------------------------
+# SSOT-as-ENFORCED: required-contexts.txt is the enforced merge gate
+# (internal#3181 — close the PR#3181 force-merge-over-red regression).
+# --------------------------------------------------------------------------
+def _write_ctx_file(tmp_path, text):
+    p = tmp_path / "required-contexts.txt"
+    p.write_text(text, encoding="utf-8")
+    return str(p)
+
+
+def test_strip_event_removes_known_suffixes():
+    assert mq._strip_event("A / B (pull_request)") == "A / B"
+    assert mq._strip_event("A / B (push)") == "A / B"
+    assert mq._strip_event("A / B (pull_request_target)") == "A / B"
+    # No suffix → unchanged (bare file form).
+    assert mq._strip_event("A / B") == "A / B"
+
+
+def test_load_enforced_file_contexts_parses_and_strips(tmp_path):
+    path = _write_ctx_file(
+        tmp_path,
+        "# header comment\n"
+        "CI / all-required\n"
+        "E2E API Smoke Test / E2E API Smoke Test  # inline note\n"
+        "\n"
+        "Secret scan / Scan diff for credential-shaped strings\n",
+    )
+    out = _REAL_LOAD_ENFORCED(path)
+    assert out == [
+        "CI / all-required",
+        "E2E API Smoke Test / E2E API Smoke Test",
+        "Secret scan / Scan diff for credential-shaped strings",
+    ]
+
+
+def test_load_enforced_file_contexts_excludes_pending_tail(tmp_path):
+    # Everything at or below the first `# pending-#NNNN` marker is excluded.
+    path = _write_ctx_file(
+        tmp_path,
+        "CI / all-required\n"
+        "qa-review / approved\n"
+        "# pending-#3159 (not yet enforced)\n"
+        "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace\n"
+        "E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot\n",
+    )
+    out = _REAL_LOAD_ENFORCED(path)
+    assert out == ["CI / all-required", "qa-review / approved"]
+    assert not any("E2E Staging" in c for c in out)
+
+
+def test_load_enforced_file_contexts_missing_file_is_fail_soft(tmp_path):
+    # Missing file → [] (BP+governance still enforced; lint catches deletion).
+    out = _REAL_LOAD_ENFORCED(str(tmp_path / "nope.txt"))
+    assert out == []
+
+
+def test_enforced_file_contexts_green_event_insensitive_match():
+    latest = mq.latest_statuses_by_context([
+        {"context": "E2E Staging SaaS (full lifecycle) / X (pull_request)", "status": "success"},
+    ])
+    ok, bad = mq.enforced_file_contexts_green(
+        latest, ["E2E Staging SaaS (full lifecycle) / X"]
+    )
+    assert ok is True
+    assert bad == []
+
+
+def test_enforced_file_contexts_green_flags_red_and_missing():
+    latest = mq.latest_statuses_by_context([
+        {"context": "Foo / Bar (pull_request)", "status": "failure"},
+    ])
+    ok, bad = mq.enforced_file_contexts_green(
+        latest, ["Foo / Bar", "Absent / Job"]
+    )
+    assert ok is False
+    assert bad == ["Foo / Bar=failure", "Absent / Job=missing"]
+
+
+def test_enforced_file_red_blocks_merge_not_forced_over():
+    """The PR#3181 regression: a context in required-contexts.txt but NOT in
+    BP was force-merged over while red. With enforcement it must `wait`."""
+    pr_status = {
+        "state": "failure",
+        "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+            {"context": "security-review / approved (pull_request_target)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
+            # In required-contexts.txt, NOT in BP, RED — the #3181 case.
+            {
+                "context": "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace (pull_request)",
+                "status": "failure",
+            },
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_status=pr_status),
+        enforced_file_contexts=[
+            "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace"
+        ],
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert decision.force is False
+    assert "enforced required-contexts.txt" in decision.reason
+
+
+def test_enforced_file_green_allows_merge():
+    pr_status = {
+        "state": "success",
+        "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+            {"context": "security-review / approved (pull_request_target)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
+            {
+                "context": "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace (pull_request)",
+                "status": "success",
+            },
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_status=pr_status),
+        enforced_file_contexts=[
+            "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace"
+        ],
+    )
+    assert decision.ready is True
+    assert decision.action == "merge"
+
+
+def test_parked_pending_context_does_not_block(tmp_path):
+    """A red context PARKED below the pending marker is NOT loaded as
+    enforced, so it does not block — the #3159 sequencing escape hatch."""
+    path = _write_ctx_file(
+        tmp_path,
+        "CI / all-required\n"
+        "# pending-#3159 (not yet enforced)\n"
+        "E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot\n",
+    )
+    enforced = _REAL_LOAD_ENFORCED(path)
+    pr_status = {
+        "state": "failure",
+        "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+            {"context": "security-review / approved (pull_request_target)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
+            # Parked context is RED but must NOT block (it is below the marker).
+            {
+                "context": "E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot (pull_request)",
+                "status": "failure",
+            },
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_status=pr_status),
+        enforced_file_contexts=enforced,
+    )
+    # Only "CI / all-required" is enforced from the file; it is green, and the
+    # parked red is treated as a non-required advisory red (force bypass).
+    assert decision.ready is True
+    assert decision.action == "merge"
+    assert decision.force is True  # advisory red present → force bypass

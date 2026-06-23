@@ -180,6 +180,42 @@ REQUIRED_CONTEXTS_RAW = _env(
         "sop-checklist / all-items-acked (pull_request)"
     ),
 )
+# --------------------------------------------------------------------------
+# Enforced-contexts SSOT file (internal#3181 — close the BP↔allowlist gap)
+# --------------------------------------------------------------------------
+# `.gitea/required-contexts.txt` is the DOCUMENTED authoritative set of
+# "required to merge" contexts. Historically it was only consumed by
+# lint_no_coe_on_required.py, and the merge gate derived its required set
+# ONLY from branch-protection `status_check_contexts`. So a context listed
+# in the file but ABSENT from BP was NOT merge-blocking — it was classified
+# as a non-required advisory red and force_merge=true bypassed it. That is
+# exactly how PR#3181 merged with `E2E Staging SaaS (full lifecycle) /
+# E2E Staging Concierge Creates Workspace` RED (in the file, not in BP).
+#
+# Fix: the merge gate now ALSO enforces every ENFORCED entry of this file
+# (fail-closed, event-suffix-insensitive). The owner keeps BP edits
+# owner-side; this does NOT require expanding BP status_check_contexts.
+#
+# `# pending-#NNNN` exclusion: a context that is documented-required but
+# currently RED for a known, tracked reason can be parked under a section
+# marker line of the form `# pending-#NNNN (not yet enforced)`. EVERY entry
+# at or below the FIRST such marker is EXCLUDED from enforcement until the
+# operator promotes it (move it above the marker). This is the sequencing
+# escape hatch: it lets us ship the gate WITHOUT freezing merges on a check
+# that an in-flight runtime PR is still fixing. See SEQUENCING in the file.
+ENFORCED_CONTEXTS_FILE = _env(
+    "ENFORCED_CONTEXTS_FILE",
+    default=".gitea/required-contexts.txt",
+)
+# A line of this shape begins the "documented but NOT-yet-enforced" tail.
+# Everything from the first match to EOF is parsed as documentation only.
+_PENDING_MARKER_RE = re.compile(r"^\s*#\s*pending-#\d+\b", re.IGNORECASE)
+# Strip the Gitea event suffix so the bare file form (`workflow / job`)
+# matches a live status context (`workflow / job (pull_request)` etc).
+# Mirrors lint_no_coe_on_required.strip_event so both sides agree.
+_EVENT_SUFFIX_RE = re.compile(
+    r"\s*\((?:pull_request|push|pull_request_target)\)\s*$"
+)
 # Required contexts for push (main/staging) runs. The push CI uses the same
 # aggregator names with " (push)" suffix. Checking these explicitly instead of
 # the combined state avoids false-pause when non-blocking jobs (e.g. Platform
@@ -494,6 +530,98 @@ def required_contexts_green(
         state = status_state(status or {})
         if state != "success":
             missing_or_bad.append(f"{context}={state or 'missing'}")
+    return not missing_or_bad, missing_or_bad
+
+
+def _strip_event(ctx: str) -> str:
+    """Event-suffix-stripped form of a context name.
+
+    `.gitea/required-contexts.txt` stores the bare `workflow / job` form;
+    live status contexts carry a ` (pull_request)` / ` (push)` /
+    ` (pull_request_target)` suffix. Strip it so file entries match live
+    statuses regardless of trigger. Mirrors lint_no_coe_on_required.strip_event
+    so both consumers agree on the canonical key.
+    """
+    return _EVENT_SUFFIX_RE.sub("", ctx).strip()
+
+
+def load_enforced_file_contexts(path: str) -> list[str]:
+    """Parse `.gitea/required-contexts.txt` → the ENFORCED (event-stripped)
+    context names the merge gate must treat as merge-blocking.
+
+    Rules:
+      - blank lines and `#` comment lines are ignored;
+      - inline `# ...` trailing comments are stripped (matches the lint);
+      - a line matching `# pending-#NNNN ...` begins the NOT-YET-ENFORCED
+        tail: that line AND everything after it (to EOF) is parsed as
+        documentation only, NEVER enforced. This is the #3159 sequencing
+        escape hatch — park a documented-but-currently-red context below
+        the marker so shipping the gate does not freeze merges, then
+        promote it (move it above the marker) once it goes green.
+
+    Fail-closed contract: if the file is MISSING or UNREADABLE, returns []
+    (the gate keeps enforcing BP + governance — it never silently widens,
+    but it also must not crash the whole queue on a missing file). A missing
+    file is independently caught by lint_no_coe_on_required, which hard-fails
+    PR CI, so a deleted SSOT cannot land unnoticed.
+    """
+    enforced: list[str] = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        sys.stderr.write(
+            f"::warning::enforced-contexts file {path} unreadable ({exc}); "
+            "merge gate enforces BP + governance only this tick\n"
+        )
+        return enforced
+    in_pending_tail = False
+    for raw in lines:
+        if _PENDING_MARKER_RE.match(raw):
+            # First pending marker → everything below is documentation.
+            in_pending_tail = True
+            continue
+        if in_pending_tail:
+            continue
+        body = raw.split("#", 1)[0].strip()
+        if not body:
+            continue
+        stripped = _strip_event(body)
+        if stripped and stripped not in enforced:
+            enforced.append(stripped)
+    return enforced
+
+
+def enforced_file_contexts_green(
+    latest_statuses: dict[str, dict],
+    enforced_stripped: list[str],
+) -> tuple[bool, list[str]]:
+    """Event-suffix-INSENSITIVE green check for the file-sourced enforced set.
+
+    BP-required contexts are matched exactly (they carry the suffix BP
+    records). File entries are bare, so here we compare event-stripped
+    forms: an enforced entry is green only if SOME live status whose
+    event-stripped context equals it is `success`. Missing, pending, or
+    failure → not green (fail-closed, same semantics as
+    required_contexts_green)."""
+    # Best status per event-stripped context key (success wins; otherwise
+    # any non-success is retained so a red is never masked by a missing).
+    best: dict[str, str] = {}
+    for ctx, status in latest_statuses.items():
+        if not isinstance(ctx, str):
+            continue
+        key = _strip_event(ctx)
+        state = status_state(status or {})
+        prev = best.get(key)
+        if prev == "success":
+            continue
+        if prev is None or state == "success":
+            best[key] = state
+    missing_or_bad: list[str] = []
+    for ctx in enforced_stripped:
+        state = best.get(ctx)
+        if state != "success":
+            missing_or_bad.append(f"{ctx}={state or 'missing'}")
     return not missing_or_bad, missing_or_bad
 
 
@@ -1114,6 +1242,7 @@ def evaluate_merge_readiness(
     mergeable: bool | None,
     pr_labels: set[str] | None = None,
     runtime_bump_exempt: bool = False,
+    enforced_file_contexts: list[str] | None = None,
 ) -> MergeDecision:
     # 1) Main's push-required contexts must be green. Combined state can be
     #    "failure" due to non-blocking jobs (continue-on-error: true) that do
@@ -1165,6 +1294,32 @@ def evaluate_merge_readiness(
     ok, missing_or_bad = required_contexts_green(latest, required_contexts)
     if not ok:
         return MergeDecision(False, "wait", "required contexts not green: " + ", ".join(missing_or_bad))
+
+    # 4b) Every ENFORCED entry of `.gitea/required-contexts.txt` must be green
+    #     (internal#3181). This is the SSOT-as-ENFORCED fix: the file is the
+    #     documented "required to merge" set, but historically the gate read
+    #     ONLY branch protection, so a file entry absent from BP was treated
+    #     as a non-required advisory red and force_merge=true bypassed it —
+    #     exactly how PR#3181 merged with `E2E Staging SaaS (full lifecycle) /
+    #     E2E Staging Concierge Creates Workspace` RED.
+    #
+    #     Matching is event-suffix-INSENSITIVE (file entries are bare; live
+    #     statuses carry a `(pull_request)` etc. suffix). Entries parked under
+    #     a `# pending-#NNNN` marker in the file are NOT in this list (the
+    #     loader excludes the tail) and are therefore NOT enforced — the
+    #     sequencing escape hatch that keeps a known-red, tracked check from
+    #     freezing the whole queue. Fail-closed: a red/missing enforced context
+    #     returns `wait`, so the flow NEVER reaches the force_merge path below
+    #     for it. This runs AFTER step 4 so a BP-required red is reported first.
+    enforced = enforced_file_contexts or []
+    if enforced:
+        efok, efbad = enforced_file_contexts_green(latest, enforced)
+        if not efok:
+            return MergeDecision(
+                False, "wait",
+                "enforced required-contexts.txt entries not green: "
+                + ", ".join(efbad),
+            )
 
     # 5) DIRECT-MERGE when conflict-free (issue #2358 — throughput fix).
     #    If Gitea reports the PR conflict-free (mergeable is True), MERGE IT
@@ -1491,10 +1646,16 @@ def process_once(*, dry_run: bool = False) -> int:
     # protection does not enumerate them. Deduplicate against BP list.
     contexts = list(dict.fromkeys(bp.required_contexts + GOVERNANCE_REQUIRED_CONTEXTS))
     required_approvals = bp.required_approvals
+    # SSOT-as-ENFORCED (internal#3181): the documented required set in
+    # `.gitea/required-contexts.txt` is ALSO merge-blocking, fail-closed and
+    # event-suffix-insensitive, regardless of whether each entry is in BP.
+    # Entries below a `# pending-#NNNN` marker are excluded (sequencing).
+    enforced_file_contexts = load_enforced_file_contexts(ENFORCED_CONTEXTS_FILE)
     print(
         f"::notice::queue policy from branch protection: "
         f"required_approvals={required_approvals} "
-        f"required_contexts={contexts or '[none]'}"
+        f"required_contexts={contexts or '[none]'} "
+        f"enforced_file_contexts={enforced_file_contexts or '[none]'}"
     )
 
     main_sha = get_branch_head(WATCH_BRANCH)
@@ -1569,6 +1730,7 @@ def process_once(*, dry_run: bool = False) -> int:
             required_contexts=contexts,
             required_approvals=required_approvals,
             dry_run=dry_run,
+            enforced_file_contexts=enforced_file_contexts,
         )
         if decision is None:
             continue  # not merge-eligible (not-open / opted-out / fork / wrong base)
@@ -1824,6 +1986,7 @@ def _evaluate_candidate(
     required_contexts: list[str],
     required_approvals: int,
     dry_run: bool,
+    enforced_file_contexts: list[str] | None = None,
 ) -> tuple[MergeDecision | None, dict]:
     """Evaluate a single auto-discovered candidate against the full merge bar.
 
@@ -1946,6 +2109,7 @@ def _evaluate_candidate(
         mergeable=mergeable,
         pr_labels=pr_labels,
         runtime_bump_exempt=runtime_bump_exempt,
+        enforced_file_contexts=enforced_file_contexts,
     )
     return decision, ctx
 
@@ -1973,6 +2137,7 @@ def enumerate_readiness(*, dry_run: bool = False) -> list[ReadinessEntry]:
     # protection does not enumerate them. Deduplicate against BP list.
     contexts = list(dict.fromkeys(bp.required_contexts + GOVERNANCE_REQUIRED_CONTEXTS))
     required_approvals = bp.required_approvals
+    enforced_file_contexts = load_enforced_file_contexts(ENFORCED_CONTEXTS_FILE)
 
     main_sha = get_branch_head(WATCH_BRANCH)
     main_status = get_combined_status(main_sha)
@@ -1997,6 +2162,7 @@ def enumerate_readiness(*, dry_run: bool = False) -> list[ReadinessEntry]:
                 required_contexts=contexts,
                 required_approvals=required_approvals,
                 dry_run=dry_run,
+                enforced_file_contexts=enforced_file_contexts,
             )
         except ApiError as exc:
             # Fail-closed per candidate: an unreadable PR is recorded as
