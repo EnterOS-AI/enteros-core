@@ -1241,6 +1241,28 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		// workspace's own ANTHROPIC_BASE_URL, and DO NOT strip the tenant's own
 		// (provider-matching) LLM credentials.
 		//
+		// RC 12082: derive the resolved BYOK provider NOW so the presence check
+		// below (hasAnyPlatformManagedLLMKey) can be provider-AWARE. Without
+		// this, a stray key (e.g. OPENAI_API_KEY in a claude-code+anthropic
+		// workspace) would satisfy the global bypass set even though the
+		// resolved provider (anthropic-api) would never authenticate with it.
+		var byokResolvedProvider providers.Provider
+		if manifest, mErr := providerRegistry(); mErr == nil && manifest != nil {
+			providerName := derefOrEmpty(res.ProviderSelection)
+			if providerName == "" {
+				if p, dErr := manifest.DeriveProvider(runtime, effectiveModel, availableAuthEnv); dErr == nil {
+					providerName = p.Name
+				}
+			}
+			if p, ok := providerFromRegistry(providerName); ok {
+				byokResolvedProvider = p
+			}
+		}
+
+		// molecule-core#1994 (corrected model): `global_secrets` is the
+		// workspace's own ANTHROPIC_BASE_URL, and DO NOT strip the tenant's own
+		// (provider-matching) LLM credentials.
+		//
 		// molecule-core#1994 (corrected model): `global_secrets` is the
 		// TENANT's store, not the platform's. The tenant's own credential —
 		// at global OR workspace scope — is exactly what byok runs on, direct.
@@ -1325,7 +1347,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 
 		return platformLLMEnvResult{
 			ResolvedMode:     res.ResolvedMode,
-			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(envVars),
+			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(byokResolvedProvider, envVars),
 			Source:           res.Source,
 		}
 	}
@@ -1404,12 +1426,33 @@ func stripPlatformManagedLLMBypassEnv(envVars map[string]string) {
 }
 
 // hasAnyPlatformManagedLLMKey reports whether envVars carries at least one
-// non-empty platform-managed-shaped LLM credential key (the tenant's own, at
-// global or workspace scope). Used by the byok fail-closed branch: a byok
-// workspace with no LLM credential at ANY scope must be aborted with
+// non-empty platform-managed-shaped LLM credential key that ALSO matches
+// the resolved provider's auth_env (RC 12082 — provider-mismatch fail-closed).
+// Used by the byok fail-closed branch: a byok workspace with no LLM
+// credential for ITS resolved provider at ANY scope must be aborted with
 // MISSING_BYOK_CREDENTIAL rather than started credential-less.
-func hasAnyPlatformManagedLLMKey(envVars map[string]string) bool {
+//
+// The provider-AWARE check is the real fail-closed predicate. The global
+// bypass set (platformManagedDirectLLMBypassKeys) is over-broad by design
+// (every known LLM vendor key lives there so the canvas Secrets tab can
+// write any vendor's key without a registry check) — without the
+// provider.AuthEnv intersection, a stray key (e.g. OPENAI_API_KEY in a
+// claude-code+anthropic workspace) would satisfy presence even though the
+// resolved provider would never authenticate with it. Mirrors the
+// create-time gate's anyBYOKCredentialKeyMatchesProvider (byok_credential_gate.go).
+func hasAnyPlatformManagedLLMKey(provider providers.Provider, envVars map[string]string) bool {
+	// Build the accepted-key set from the provider's auth_env (case-insensitive).
+	accepted := make(map[string]struct{}, len(provider.AuthEnv))
+	for _, e := range provider.AuthEnv {
+		accepted[strings.ToUpper(strings.TrimSpace(e))] = struct{}{}
+	}
 	for key := range platformManagedDirectLLMBypassKeys {
+		// Must be a recognized bypass shape (LLM key) AND match the provider's auth_env
+		// AND have a non-empty value in envVars. All three conditions required.
+		upper := strings.ToUpper(strings.TrimSpace(key))
+		if _, matches := accepted[upper]; !matches {
+			continue
+		}
 		if strings.TrimSpace(envVars[key]) != "" {
 			return true
 		}
