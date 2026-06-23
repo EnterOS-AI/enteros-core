@@ -263,6 +263,25 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 
 	// Handle external workspaces
 	if ws.External {
+		// core#2129 write-path SSRF defense: validateAgentURL runs at
+		// registration-time on the /registry/register path. The org-import
+		// path bypasses /registry/register entirely (it writes `ws.URL`
+		// directly here), so re-validate before persisting to `workspaces.url`
+		// — otherwise a malicious template URL lands in the DB and the
+		// downstream chat-files forward would attach platform_inbound_secret
+		// to it. The forward-time layer added in PR#3169 is the critical
+		// gate; this is defense-in-depth.
+		//
+		// Reject the leaf via a non-nil return: the caller (top-level
+		// OrgImport handler) already returns 207 partial-import on a per-
+		// workspace error, so a per-leaf SSRF rejection surfaces correctly
+		// to the user without aborting the rest of the tree.
+		if ws.URL != "" {
+			if err := validateAgentURL(ws.URL); err != nil {
+				log.Printf("Org import: external workspace URL rejected for %s (%s): %v — leaf rejected", ws.Name, id, err)
+				return fmt.Errorf("external workspace %s URL rejected: %w", ws.Name, err)
+			}
+		}
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, url = $2 WHERE id = $3`, models.StatusOnline, ws.URL, id); err != nil {
 			log.Printf("Org import: external workspace status update failed for %s: %v", ws.Name, err)
 		}
