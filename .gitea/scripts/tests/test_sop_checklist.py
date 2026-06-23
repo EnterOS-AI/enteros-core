@@ -1470,31 +1470,41 @@ class TestFailClosedProtectedContext(unittest.TestCase):
     def test_high_risk_acks_from_default_team_still_fail(self):
         """A high-risk PR (per RFC#450 Option C) requires ceo-team acks.
         Engineers/managers acks MUST NOT satisfy a high-risk item —
-        the policy elevation is real, not nominal."""
+        the policy elevation is real, not nominal.
+
+        Pins the contract: an ack from a default-class teammate
+        (engineer/manager) for a high-risk item MUST be rejected as
+        `not_in_team` because the elevated required_teams is the ceo
+        team. The protected status MUST then render as `failure`."""
+        # Pick the first item — a real config item.
+        target_item = self.ITEMS[0]
+        # A default-class peer is NOT in the ceo team (per high_risk
+        # elevation). The ack must be classified as not_in_team and
+        # excluded from ackers.
         ack_state = {
-            it["slug"]: {
-                "ackers": ["engineer-peer"],  # default-class, not ceo
+            target_item["slug"]: {
+                "ackers": [],  # ack rejected — never reaches ackers
+                "rejected": {
+                    "self_ack": [],
+                    "not_in_team": ["engineer-peer"],
+                },
+            }
+        }
+        # All other items have valid acks (so the only thing failing
+        # the protected status is the high-risk elevation rejection).
+        for it in self.ITEMS[1:]:
+            ack_state[it["slug"]] = {
+                "ackers": ["peer"],
                 "rejected": {"self_ack": [], "not_in_team": []},
             }
-            for it in self.ITEMS
-        }
-        # Simulate high-risk classification by replacing required_teams
-        # with the elevated list. In practice this is gated by
-        # resolve_required_teams(item, high_risk=True). We assert at
-        # the render_status level: if the ack doesn't match the
-        # required-team membership, the state must be failure.
+        # The target item is missing → render_status returns failure.
         state, desc = sop.render_status(
             self.ITEMS,
             ack_state,
             {s: True for s in self._all_slugs()},
         )
-        # With non-empty ackers list, the test for "not_in_team" is at
-        # the compute_ack_state layer; this test pins the contract that
-        # render_status is downstream of that — i.e. if the team probe
-        # does NOT add to ackers, the protected context reflects that.
-        # We don't directly assert failure here (the team layer is
-        # responsible); we just assert the contract is plumbed.
-        self.assertIn(state, {"success", "failure"})
+        self.assertEqual(state, "failure", desc)
+        self.assertIn(target_item["slug"], desc)
 
     def test_body_unfilled_alone_posts_failure(self):
         """A PR where every peer-ack IS present but every body section
@@ -1517,18 +1527,22 @@ class TestFailClosedProtectedContext(unittest.TestCase):
         the protected job as failed — NOT a silent success.
 
         This pins the fail-closed runner-dep contract: a missing/invalid
-        token does not result in a green protected status."""
-        # main() with no token and not dry-run:
+        token does not result in a green protected status.
+
+        The test exercises the REAL no-token branch (not --dry-run, which
+        short-circuits the token check) and asserts rc=2."""
         with mock.patch.dict(os.environ, {"GITEA_TOKEN": ""}, clear=False):
             rc = sop.main([
                 "--owner", "test",
                 "--repo", "test",
                 "--pr", "1",
                 "--config", CONFIG_PATH,
-                "--dry-run",  # dry-run ignores the no-token check;
-                # so we test the dry-run-no-token path is "nothing to do" (rc=2).
+                # No --dry-run: the no-token check fires.
             ])
-        # Either rc=2 (no client, dry-run) OR rc=2 (missing token).
+        # rc=2 is the documented exit code when the env contract is violated
+        # (missing token, missing required arg, etc.). The workflow step
+        # would then fail → protected job fails → branch protection sees
+        # the protected context as failed (NOT a silent success).
         self.assertEqual(rc, 2)
 
     # -- 3. Workflow-config contract: no SOP_FAIL_OPEN, no continue-on-error
