@@ -95,8 +95,14 @@ remains the one small identity asset, per the RFC #2843 carve-out for
   `workspace_declared_plugins`.
 - The post-online reconcile resolves `MCPServerAdaptor` and installs it.
 - `command: npx -y @molecule-ai/mcp-server` launches on demand → **no baked
-  binary**, so the special `molecule-platform-agent` image is no longer required;
-  the standard `claude-code` image + this plugin = concierge.
+  binary**, so the special `molecule-platform-agent` image is no longer required:
+  the standard runtime image **for the concierge's CONFIGURED runtime** (claude-code
+  by default, but switchable — see §3.4) + this plugin = concierge.
+- **Runtime-agnostic delivery is a requirement, not an assumption.** `MCPServerAdaptor`
+  must wire the management MCP into whatever the configured runtime reads for MCP
+  servers (claude-code's `settings.json`; the equivalent for codex/hermes/etc.) —
+  so a concierge on any runtime gets `create_workspace`. (The baked image can never
+  be runtime-agnostic; the plugin can.)
 
 ## 3. Why this is the right channel
 
@@ -109,6 +115,15 @@ remains the one small identity asset, per the RFC #2843 carve-out for
 3. **Retires a maintenance burden** — no special concierge image to build, pin,
    repin (a large share of recent incident toil), and MCP updates ship via the
    registry without an image rebuild.
+4. **Required for runtime-switchable platform agents (correctness, not just
+   cleanup).** A platform agent is NOT claude-code-specific — its runtime is
+   *switchable* (claude-code is only the current default; codex/hermes/openclaw
+   are first-class). The baked `molecule-platform-agent` image is built **FROM the
+   claude-code runtime image**, so it structurally **binds the concierge to
+   claude-code** and cannot serve a codex/hermes concierge. Only the
+   runtime-agnostic plugin model (MCP wired per the configured runtime via
+   `MCPServerAdaptor`) supports a switchable-runtime concierge. The image isn't
+   just redundant — for any non-claude-code platform agent it is **wrong**.
 
 ## 4. Security — the load-bearing constraint
 
@@ -141,7 +156,7 @@ Requirements:
 **Sequence (staging-first, each step gated on the prior):**
 1. **Make the failure visible** — land the #3164 instrumentation (runtime PR #171: `platform_mcp_diag` in the heartbeat) so the CP can see *which* path fails (image-fallback vs plugin-fetch) without box SSH. **Already up for review.**
 2. **Harden the plugin fetch** — retry-with-backoff + a **fail-LOUD** signal when the management-MCP plugin fetch fails on a `kind=platform` agent, so a concierge can never come up silently "online-but-no-MCP." Closes the safety-net dependency the image currently provides.
-3. **Prove plugin-only on staging** — provision a `kind=platform` agent on the **plain `claude-code` image** (no platform-agent image) + the plugin; confirm `create_workspace` on a FRESH provision and the staging E2E ("Platform Boot", "Concierge Creates Workspace") green.
+3. **Prove plugin-only on staging** — provision a `kind=platform` agent on the **plain runtime image for its configured runtime** (claude-code by default; ALSO smoke at least one non-claude-code runtime, e.g. codex, to prove switchability) (no platform-agent image) + the plugin; confirm `create_workspace` on a FRESH provision and the staging E2E ("Platform Boot", "Concierge Creates Workspace") green.
 4. **Cut over provisioning** — flip `kind=platform` image selection to the plain runtime image (retire `resolvePlatformAgentImage` / the `-platform-agent` variant); the plugin becomes the sole MCP delivery.
 5. **Re-provision existing concierges** → plugin-only; verify each online + `create_workspace` via real-chat.
 6. **Retire the image** — drop the `publish-platform-agent` job; remove the dual-path code (`on_platform_agent_image`, `MOLECULE_PLATFORM_AGENT_IMAGE_BAKED`, the baked-binary branch of `mcp_server_present`). Keep a documented offline/self-host build recipe (§6 Q4) but publish/provision nothing.
@@ -154,7 +169,7 @@ Requirements:
 1. **Entitlement mechanism** → **core-side org-root-only gate** (already shipped — server-enforced, keyed on `kind=platform` + org-root). The marketplace entitlement broker is the future general path, NOT a blocker for this one privileged plugin.
 2. **Persona prompt** → **out of scope here.** This RFC fixes the *MCP* (capability). The concierge *system prompt* is an independent failure (the runtime reads `/configs/system-prompt.md` but the template ships `prompts/concierge.md` — a naming/delivery mismatch) tracked as a companion fix. Retiring the image does not regress the prompt — the baked/asset channel never reliably delivered it on SaaS anyway.
 3. **`npx` vs pre-bundled** → **`npx -y @molecule-ai/mcp-server`** (the current settings-fragment shape). Revisit pre-bundling only if first-turn cold-start is measured as a real problem.
-4. **Image deprecation** → **RETIRE** the `molecule-platform-agent` image (CTO directive, 2026-06-23): platform agent = standard `claude-code` image + the entitlement-gated plugin. A documented offline/self-host build recipe may be kept for air-gapped use, but nothing in the SaaS provision path references the image.
+4. **Image deprecation** → **RETIRE** the `molecule-platform-agent` image (CTO directive, 2026-06-23): platform agent = the standard image **for its configured runtime** (claude-code by default, switchable to codex/hermes/etc.) + the entitlement-gated plugin. The baked image is claude-code-bound and cannot serve other runtimes (§3.4), so it is incompatible with switchable platform agents regardless. A documented offline/self-host build recipe may be kept for air-gapped use, but nothing in the SaaS provision path references the image.
 
 ## 7. Non-goals
 
@@ -168,7 +183,7 @@ Requirements:
 
 Sign-off requested to adopt, as the committed architecture:
 
-- **(a)** plugin-only delivery of the management MCP — a platform agent is a standard `claude-code` workspace + the entitlement-gated `molecule-platform-mcp` plugin; **no baked image**;
+- **(a)** plugin-only delivery of the management MCP — a platform agent is a standard workspace of its **configured runtime** (claude-code by default, but switchable to codex/hermes/etc.) + the entitlement-gated `molecule-platform-mcp` plugin; **no baked image** (the baked image is claude-code-bound and cannot serve other runtimes — §3.4 — so it is structurally incompatible with switchable platform agents);
 - **(b)** **retirement** of the `molecule-platform-agent` image per the gated §5 sequence — staging-first, and *blocked on the plugin-fetch hardening (§5 step 2)* so we never trade an intermittent failure for a hard one;
 - **(c)** the resolved decisions in §6.
 
