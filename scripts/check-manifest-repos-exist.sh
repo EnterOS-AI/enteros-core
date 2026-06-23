@@ -45,26 +45,38 @@ check_category() {
 
     local i=0
     while [ "$i" -lt "$count" ]; do
-        local name repo
+        local name repo provider api_base token
         name=$(echo "$MANIFEST_JSON" | jq -r ".${category}[$i].name")
         repo=$(echo "$MANIFEST_JSON" | jq -r ".${category}[$i].repo")
+        # provider names the SCM host the repo path resolves against
+        # (see manifest.json _provider_contract). Absent ⇒ moleculesai.
+        provider=$(echo "$MANIFEST_JSON" | jq -r ".${category}[$i].provider // \"moleculesai\"")
         TOTAL=$((TOTAL + 1))
 
-        # Check repo existence via Gitea API. Many manifest repos are PRIVATE
-        # (e.g. the workspace templates), so an *unauthenticated* GET returns
-        # 404 even when the repo exists — indistinguishable from a genuinely
-        # missing repo. We therefore authenticate with the same token
-        # clone-manifest.sh uses (MOLECULE_GITEA_TOKEN). A 404 *with* a valid
-        # token still means the repo is truly missing, which is what we want
-        # to catch. If the token is unset (local dev), fall back to an
-        # unauthenticated request — private repos will then 404, so run the
-        # check in CI where the token is present.
-        if [ -n "${MOLECULE_GITEA_TOKEN:-}" ]; then
+        # Resolve the provider to its API base + read-token env var. Mirrors
+        # clone-manifest.sh's resolver (keep the cases in sync). The GITEA_API
+        # env override is preserved as the moleculesai default for back-compat.
+        case "$provider" in
+            moleculesai) api_base="${GITEA_API:-https://git.moleculesai.app/api/v1/repos}"; token="${MOLECULE_GITEA_TOKEN:-}" ;;
+            github)      api_base="${GITHUB_API:-https://api.github.com/repos}";            token="${MOLECULE_GITHUB_TOKEN:-}" ;;
+            *) echo "::error::manifest.json ${category} entry '${name}': unknown provider '${provider}' (known: moleculesai, github)" >&2; MISSING=$((MISSING + 1)); i=$((i + 1)); continue ;;
+        esac
+
+        # Check repo existence via the provider API. Many manifest repos are
+        # PRIVATE (e.g. the workspace templates), so an *unauthenticated* GET
+        # returns 404 even when the repo exists — indistinguishable from a
+        # genuinely missing repo. We therefore authenticate with the same
+        # token clone-manifest.sh uses. A 404 *with* a valid token still means
+        # the repo is truly missing, which is what we want to catch. If the
+        # token is unset (local dev), fall back to an unauthenticated request
+        # — private repos will then 404, so run the check in CI where the
+        # token is present.
+        if [ -n "$token" ]; then
             http_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-                -H "Authorization: token ${MOLECULE_GITEA_TOKEN}" \
-                "${GITEA_API}/${repo}" 2>/dev/null || true)
+                -H "Authorization: token ${token}" \
+                "${api_base}/${repo}" 2>/dev/null || true)
         else
-            http_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "${GITEA_API}/${repo}" 2>/dev/null || true)
+            http_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "${api_base}/${repo}" 2>/dev/null || true)
         fi
 
         if [ "$http_code" != "200" ]; then
@@ -76,7 +88,7 @@ check_category() {
     done
 }
 
-echo "==> Checking manifest repo existence against ${GITEA_API} ..."
+echo "==> Checking manifest repo existence (per-entry provider; moleculesai default → ${GITEA_API}) ..."
 check_category "plugins"
 check_category "workspace_templates"
 check_category "org_templates"
