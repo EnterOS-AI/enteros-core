@@ -877,7 +877,19 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	if payload.External || isExternalLikeRuntime(payload.Runtime) {
 		var connectionToken string
 		if payload.URL != "" {
-			// URL already validated by validateAgentURL above (before BeginTx).
+			// core#2129 write-path SSRF defense: validateAgentURL runs at
+			// registration-time on the /registry/register path. This is the
+			// OTHER external-create entrypoint (the dashboard admin path +
+			// any update-with-URL flow) — it previously relied on the comment
+			// claim that "URL already validated by validateAgentURL above"
+			// but the above validation lives in CreateWorkspace, not in
+			// this handler. Re-validate here so a workspace URL can NEVER
+			// land in the DB without passing the SSRF policy.
+			if err := validateAgentURL(payload.URL); err != nil {
+				log.Printf("External workspace: URL rejected for %s: %v", payload.Name, err)
+				c.JSON(http.StatusBadRequest, gin.H{"error": "unsafe workspace URL: " + err.Error()})
+				return
+			}
 			// Now persist it: the external URL is set after the workspace row
 			// commits so that a failed URL UPDATE doesn't roll back the row.
 			// Preserve BYO-compute runtime label (kimi, kimi-cli, external) —
