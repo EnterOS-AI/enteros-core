@@ -334,10 +334,27 @@ func runMCPAdaptorHarness(t *testing.T, pyScript, pluginRoot, configsDir string,
 		python = "python3"
 	}
 
+	// Build the child's PYTHONPATH. It must contain the runtime SOURCE tree (so
+	// `import molecule_runtime.*` resolves) AND the interpreter's resolved
+	// site-packages dirs (so the runtime's own deps — notably `a2a-sdk`, which
+	// adapter_base imports at module level — resolve too).
+	//
+	// Why the explicit site-packages: the codex sub-test pins HOME to a sandbox
+	// so the codex renderer's `~/.codex/config.toml` lands inside the temp dir.
+	// But when the runtime's deps were `pip install`ed into the *user* site
+	// (CI does this — "Defaulting to user installation because normal
+	// site-packages is not writeable"), Python derives the user-site location
+	// from $HOME. Overriding HOME therefore relocates user-site to the empty
+	// sandbox and `a2a` vanishes → `ModuleNotFoundError: No module named 'a2a'`
+	// (RC 13567 — the claude sub-test passes only because it does NOT override
+	// HOME). We resolve the real site-packages dirs HERE, under the inherited
+	// HOME, and pin them onto PYTHONPATH so the import survives the HOME swap.
+	pythonPath := buildHarnessPythonPath(python, runtimePath)
+
 	cmd := exec.Command(python, "-", runtimePath, pluginRoot, configsDir)
 	cmd.Env = os.Environ()
-	if runtimePath != "" {
-		cmd.Env = append(cmd.Env, "PYTHONPATH="+runtimePath)
+	if pythonPath != "" {
+		cmd.Env = append(cmd.Env, "PYTHONPATH="+pythonPath)
 	}
 	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdin = strings.NewReader(strings.TrimSpace(pyScript))
@@ -353,4 +370,46 @@ func runMCPAdaptorHarness(t *testing.T, pyScript, pluginRoot, configsDir string,
 		t.Fatalf("run MCPServerAdaptor: %v\nstderr: %s", err, stderr.String())
 	}
 	return stdout.String()
+}
+
+// buildHarnessPythonPath returns the PYTHONPATH for the harness child: the
+// runtime source tree (so `molecule_runtime.*` imports) followed by the
+// interpreter's resolved site-packages dirs (so the runtime's deps, e.g.
+// `a2a-sdk`, import). It queries `python` for its site dirs while the inherited
+// HOME is still in effect, which is what makes the user-site path stable across
+// a subsequent HOME override (see runMCPAdaptorHarness). Existing PYTHONPATH
+// entries are preserved. A query failure degrades to just the runtime path
+// rather than aborting — the real assertion lives in the harness run.
+func buildHarnessPythonPath(python, runtimePath string) string {
+	var parts []string
+	if runtimePath != "" {
+		parts = append(parts, runtimePath)
+	}
+
+	// Resolve user-site + global site-packages from the SAME interpreter the
+	// harness uses, under the current (un-overridden) HOME.
+	const siteQuery = `import site,json
+dirs=[]
+try:
+    u=site.getusersitepackages()
+    if u: dirs.append(u)
+except Exception: pass
+try:
+    dirs+= [d for d in site.getsitepackages() if d]
+except Exception: pass
+print(json.dumps(dirs))`
+	out, err := exec.Command(python, "-c", siteQuery).Output()
+	if err == nil {
+		var siteDirs []string
+		if json.Unmarshal(bytes.TrimSpace(out), &siteDirs) == nil {
+			parts = append(parts, siteDirs...)
+		}
+	}
+
+	// Preserve any inherited PYTHONPATH so we add to it rather than replace it.
+	if existing := os.Getenv("PYTHONPATH"); existing != "" {
+		parts = append(parts, existing)
+	}
+
+	return strings.Join(parts, string(os.PathListSeparator))
 }
