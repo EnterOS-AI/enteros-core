@@ -44,6 +44,7 @@ import (
 	"log"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/push"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
@@ -81,12 +82,18 @@ type AgentMessageAttachment struct {
 type AgentMessageWriter struct {
 	db          *sql.DB
 	broadcaster events.EventEmitter
+	notifier    *push.Notifier
 }
 
 // NewAgentMessageWriter binds the writer to the platform's DB pool +
-// WebSocket broadcaster.
-func NewAgentMessageWriter(db *sql.DB, broadcaster events.EventEmitter) *AgentMessageWriter {
-	return &AgentMessageWriter{db: db, broadcaster: broadcaster}
+// WebSocket broadcaster. notifier may be nil if push notifications are
+// not configured.
+func NewAgentMessageWriter(db *sql.DB, broadcaster events.EventEmitter, notifier ...*push.Notifier) *AgentMessageWriter {
+	w := &AgentMessageWriter{db: db, broadcaster: broadcaster}
+	if len(notifier) > 0 {
+		w.notifier = notifier[0]
+	}
+	return w
 }
 
 // Send delivers a single agent → user message. Look up + broadcast +
@@ -141,7 +148,12 @@ func (w *AgentMessageWriter) Send(
 	}
 	w.broadcaster.BroadcastOnly(workspaceID, string(events.EventAgentMessage), broadcastPayload)
 
-	// 3. Persist for chat-history hydration. response_body shape MUST stay
+	// 3. Send push notifications to mobile devices.
+	if w.notifier != nil {
+		w.notifier.NotifyAgentMessage(ctx, workspaceID, wsName, message)
+	}
+
+	// 4. Persist for chat-history hydration. response_body shape MUST stay
 	//    in sync with extractResponseText + extractFilesFromTask in
 	//    canvas/src/components/tabs/chat/historyHydration.ts:
 	//      - extractResponseText reads body.result (string) → renders text
