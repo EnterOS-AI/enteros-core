@@ -75,6 +75,21 @@ type WorkspaceHandler struct {
 	// reconciles every boot, not just first provision, per the
 	// dispatch's "every boot" requirement.
 	giteaTemplateFetcher provisioner.TemplateAssetFetcher
+	// refreshTemplateCache re-fetches the workspace-template manifest into
+	// the local cacheDir using the SAME mechanism POST /admin/templates/refresh
+	// uses (templatecache.RefreshWorkspaceTemplates). main.go wires it from
+	// the existing refreshTemplates closure. nil = no refresh available
+	// (self-host / unit-test contexts) — the cache-miss path then degrades to
+	// the existing fail-loud guard rather than auto-refreshing.
+	//
+	// internal#3211: a create/provision for a KNOWN non-claude-code runtime
+	// whose template is a cache MISS at provision time used to fall through
+	// to a runtime-default / claude-code-shaped config. The on-disk Docker
+	// guard (runtimeSeedMismatchAbort) catches that pre-launch, but it is
+	// skipped in SaaS/CP mode (configFiles==nil), so prod launched the EC2 and
+	// the runtime's model-registry check rejected the claude model post-launch.
+	// The auto-refresh-on-miss closes that gap before any backend is picked.
+	refreshTemplateCache func(ctx context.Context) error
 	// stopFnOverride is set exclusively in tests to intercept provisioner.Stop
 	// calls made by HibernateWorkspace without requiring a running Docker daemon.
 	// Always nil in production; the real provisioner path is used when nil.
@@ -231,6 +246,19 @@ func NewWorkspaceHandler(b events.EventEmitter, p *provisioner.Provisioner, plat
 
 func (h *WorkspaceHandler) WithTemplateCacheDir(cacheDir string) *WorkspaceHandler {
 	h.cacheDir = cacheDir
+	return h
+}
+
+// WithTemplateRefresh wires the template-cache refresh function
+// (internal#3211). main.go passes a closure over
+// templatecache.RefreshWorkspaceTemplates (the same one
+// POST /admin/templates/refresh uses); tests pass a stub. Nil-safe:
+// omitting this leaves refreshTemplateCache nil, so the cache-miss path
+// for a known non-claude-code runtime degrades to the existing fail-loud
+// guard instead of attempting an auto-refresh — it NEVER silently
+// substitutes claude-code for a non-claude runtime.
+func (h *WorkspaceHandler) WithTemplateRefresh(fn func(ctx context.Context) error) *WorkspaceHandler {
+	h.refreshTemplateCache = fn
 	return h
 }
 
@@ -978,14 +1006,49 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	var templatePath string
 	var configFiles map[string][]byte
 	if payload.Template != "" {
-		candidatePath, resolveErr := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, payload.Template)
+		// internal#3211: resolveTemplateWithRefreshOnMiss auto-refreshes the
+		// template cache on a MISS for a runtime that REQUIRES its own
+		// template (a KNOWN non-claude-code runtime — google-adk/hermes/codex/
+		// openclaw) and re-resolves. On a persistent miss it returns a LOUD
+		// error and we fail-closed here — we NEVER fall through to a
+		// runtime-default / claude-code-shaped config for such a runtime. The
+		// old on-disk guard (runtimeSeedMismatchAbort) caught this pre-launch
+		// in Docker mode but was skipped in SaaS/CP mode (configFiles==nil),
+		// so prod launched an EC2 that the runtime's model-registry check then
+		// rejected post-launch (UNREGISTERED_MODEL_FOR_RUNTIME).
+		candidatePath, resolveErr := h.resolveTemplateWithRefreshOnMiss(ctx, payload.Template, payload.Runtime)
 		if resolveErr != nil {
-			log.Printf("Create provision: rejecting template %q: %v", payload.Template, resolveErr)
+			// Two refusal classes share one fail-closed response: a rejected
+			// (e.g. traversal) template path, AND a non-claude runtime whose
+			// own template is still missing after a refresh attempt. Either
+			// way, refusing to provision is correct — never substitute a
+			// claude-code default for a non-claude-code runtime.
+			log.Printf("Create provision: refusing template %q (runtime=%q) for %s: %v", payload.Template, payload.Runtime, payload.Name, resolveErr)
+			// The workspace row is already committed; mark it failed so it
+			// doesn't dangle in `provisioning` until a timeout (the prior code
+			// returned with NO response and NO status update, stranding the
+			// row). No backend was picked, so nothing to deprovision.
+			h.markProvisionFailed(ctx, id, resolveErr.Error(), map[string]interface{}{
+				"code":     "TEMPLATE_UNAVAILABLE",
+				"template": payload.Template,
+				"runtime":  payload.Runtime,
+			})
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":    resolveErr.Error(),
+				"template": payload.Template,
+				"runtime":  payload.Runtime,
+				"code":     "TEMPLATE_UNAVAILABLE",
+			})
 			return
 		}
-		if _, err := os.Stat(candidatePath); err == nil {
+		if candidatePath != "" {
 			templatePath = candidatePath
 		} else {
+			// Miss for a runtime that does NOT require its own template
+			// (claude-code / external-like / mock). Preserve the prior
+			// fallback: the runtime-default dir if baked, else a generated
+			// default config. resolveTemplateWithRefreshOnMiss already
+			// guaranteed this is never a NAMED non-claude runtime.
 			log.Printf("Create: template %q not found, falling back for %s", payload.Template, payload.Name)
 			safeRuntime := sanitizeRuntime(payload.Runtime)
 			runtimeDefault := filepath.Join(h.configsDir, safeRuntime+"-default")

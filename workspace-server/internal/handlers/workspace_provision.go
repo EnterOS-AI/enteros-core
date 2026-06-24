@@ -633,6 +633,88 @@ func resolveWorkspaceTemplatePath(configsDir, cacheDir, template string) (string
 	return resolveInsideRoot(configsDir, template)
 }
 
+// runtimeRequiresOwnTemplate reports whether a runtime MUST be seeded from
+// its own workspace template (i.e. a cache-miss must never silently degrade
+// to a runtime-default / claude-code-shaped config). True for a KNOWN,
+// template-backed, non-claude-code runtime — e.g. google-adk / hermes /
+// codex / openclaw. False for claude-code (its `-default` template is baked
+// into the image, and a generated default config is correct), for
+// external-like meta-runtimes (no template repo), for "mock" (virtual, no
+// template), and for unknown runtimes (sanitizeRuntime coerces those to
+// claude-code, so they're not a NAMED non-claude runtime anyway).
+//
+// internal#3211: the seed-time symptom of a missed non-claude template is a
+// claude-shaped config whose model the runtime's registry check rejects
+// post-launch. This predicate decides where we must auto-refresh + fail loud.
+func runtimeRequiresOwnTemplate(runtime string) bool {
+	runtime = strings.TrimSpace(runtime)
+	if runtime == "" || runtime == "claude-code" {
+		return false
+	}
+	if isExternalLikeRuntime(runtime) || runtime == "mock" {
+		return false
+	}
+	return isKnownRuntime(runtime)
+}
+
+// resolveTemplateWithRefreshOnMiss resolves a workspace template path,
+// auto-refreshing the local template cache (the SAME mechanism
+// POST /admin/templates/refresh uses, threaded via WithTemplateRefresh) on a
+// cache MISS for a runtime that REQUIRES its own template, then re-resolving.
+//
+// internal#3211 — durable fix for the silent claude-code substitution:
+//   - found on first resolve              → (path, nil) (the common case).
+//   - miss for a claude-code/external/etc → ("", nil): the caller keeps its
+//     existing behavior (baked default / generated config). No refresh.
+//   - miss for a non-claude runtime that
+//     requires its own template:
+//       · refresh func wired   → refresh, re-resolve. Found → (path, nil).
+//         Still missing after refresh → ("", error): FAIL LOUD naming the
+//         runtime's own template. NEVER a claude-code substitution.
+//       · refresh func NOT wired (unit
+//         tests / self-host)   → ("", error): degrade to fail-loud, same
+//         no-silent-substitution guarantee.
+//
+// A resolve ERROR (path traversal etc.) is returned unchanged — the caller
+// already rejects those with a 400.
+func (h *WorkspaceHandler) resolveTemplateWithRefreshOnMiss(ctx context.Context, template, runtime string) (string, error) {
+	path, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, template)
+	if err != nil {
+		return "", err
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		return path, nil
+	}
+
+	// Cache miss. Only runtimes that MUST be seeded from their own template
+	// trigger the auto-refresh + fail-loud path; everything else keeps the
+	// caller's pre-existing miss behavior (return "" with no error).
+	if !runtimeRequiresOwnTemplate(runtime) {
+		return "", nil
+	}
+
+	if h.refreshTemplateCache == nil {
+		// No refresh wired (self-host / unit-test). Degrade to fail-loud —
+		// never a silent claude-code substitution for a non-claude runtime.
+		return "", fmt.Errorf("template %q for runtime %q is not in the template cache and no refresh mechanism is configured; refusing to substitute a claude-code default for a non-claude-code runtime (internal#3211)", template, runtime)
+	}
+
+	log.Printf("Provisioner: template %q for runtime %q missing from cache — auto-refreshing template cache before seeding (internal#3211)", template, runtime)
+	if refreshErr := h.refreshTemplateCache(ctx); refreshErr != nil {
+		return "", fmt.Errorf("template %q for runtime %q not in cache and auto-refresh failed (%v); refusing to substitute a claude-code default for a non-claude-code runtime (internal#3211)", template, runtime, refreshErr)
+	}
+
+	path, err = resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, template)
+	if err != nil {
+		return "", err
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		log.Printf("Provisioner: template %q resolved after cache refresh", template)
+		return path, nil
+	}
+	return "", fmt.Errorf("template %q for runtime %q still missing after template-cache refresh; refusing to substitute a claude-code default for a non-claude-code runtime (internal#3211)", template, runtime)
+}
+
 // resolveOrgTemplate looks for a matching role directory under
 // configsDir/org-templates/ and returns the absolute path and a short label
 // ("org-templates/<dir>"). Used by the restart handler's rebuild_config path

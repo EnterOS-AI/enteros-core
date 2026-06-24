@@ -270,7 +270,17 @@ func main() {
 	// WorkspaceHandler is created before the router so RestartByID can be wired into
 	// the offline callbacks used by both the liveness monitor and the health sweep.
 	wh := handlers.NewWorkspaceHandler(broadcaster, prov, platformURL, configsDir).
-		WithTemplateCacheDir(templateCacheDir)
+		WithTemplateCacheDir(templateCacheDir).
+		// internal#3211: wire the SAME refresh mechanism POST
+		// /admin/templates/refresh uses so a create/provision for a KNOWN
+		// non-claude-code runtime whose template is a cache MISS auto-refreshes
+		// the cache before seeding, then fails LOUD if still missing — never a
+		// silent claude-code substitution. The report is discarded; the handler
+		// only needs success/failure.
+		WithTemplateRefresh(func(ctx context.Context) error {
+			_, err := refreshTemplates(ctx)
+			return err
+		})
 	if cpProv != nil {
 		wh.SetCPProvisioner(cpProv)
 	}
