@@ -111,7 +111,28 @@ type RegistryHandler struct {
 	// reconcile when unset (e.g. unit tests, CP/SaaS mode without a plugins
 	// handler). Wired by the router to PluginsHandler.ReconcileWorkspacePlugins.
 	reconcilePlugins ReconcileFunc
+	// mcpRecoveryLastFire rate-limits the RCA#2970 deadlock-break reconcile (#33).
+	// The gate fails on EVERY heartbeat until the management MCP lands, so without
+	// a throttle a concierge that cannot recover (e.g. a missing plugin-source
+	// token, and where deliver() restarts the container) would re-fire a
+	// clone+deliver every heartbeat interval — restart churn that never converges.
+	// Keyed by workspace ID → time.Time of the last fire; a new fire is allowed
+	// only after mcpRecoveryCooldown. The happy path leaves the mcp-missing state
+	// on the next heartbeat (MCP now present), so the cooldown only throttles the
+	// genuinely-stuck case. Stored-before-fire so concurrent heartbeats can't both
+	// fire (the second sees the just-stored timestamp); a rare double-fire is
+	// harmless — ReconcileWorkspacePlugins is idempotent. In-memory only: a CP
+	// redeploy / conductor tick resets it, so the once-per-cooldown guarantee
+	// holds within a process lifetime (acceptable — redeploys are not sub-minute,
+	// and one extra reconcile per redeploy on a stuck concierge is tolerable).
+	mcpRecoveryLastFire sync.Map
 }
+
+// mcpRecoveryCooldown bounds how often a single concierge's RCA#2970
+// deadlock-break reconcile may fire (#33). Long enough to cover a
+// clone+deliver+restart+boot cycle so a stuck concierge retries gently rather
+// than hammering, short enough to self-heal a transient miss within minutes.
+const mcpRecoveryCooldown = 5 * time.Minute
 
 func NewRegistryHandler(b *events.Broadcaster) *RegistryHandler {
 	return &RegistryHandler{broadcaster: b}
@@ -141,6 +162,44 @@ func (h *RegistryHandler) fireReconcileOnline(ctx context.Context, workspaceID s
 	if h.reconcilePlugins == nil {
 		return
 	}
+	rctx := context.WithoutCancel(ctx)
+	wsID := workspaceID
+	globalGoAsync(func() { h.reconcilePlugins(rctx, wsID) })
+}
+
+// fireReconcileMCPRecovery breaks the RCA#2970 management-MCP deadlock (#33).
+//
+// A kind=platform concierge whose runtime reports mcp_server_present=false is
+// marked failed and the heartbeat returns BEFORE the recovery branches that
+// fire fireReconcileOnline — so the declared-plugin reconcile (the ONLY SaaS
+// path that installs the management MCP into the running container, reading
+// workspace_declared_plugins) never runs, and mcp_server_present can never flip
+// to true. A concierge that boots MCP-less (e.g. a boot-install miss on
+// re-provision) is then permanently stuck failed. This fires that reconcile
+// from the fail branch so the declared management MCP is delivered; the
+// workspace stays failed for THIS heartbeat (fail-closed preserved), and once
+// the runtime re-reads /configs/.claude/settings.json and reports
+// mcp_server_present=true the existing failed→online recovery in evaluateStatus
+// climbs it back. If the reconcile cannot deliver (missing token / fetch
+// failure) it logs loudly and the concierge stays failed — the correct
+// fail-closed outcome, now with a root cause surfaced in the logs.
+//
+// Rate-limited per workspace by mcpRecoveryLastFire/mcpRecoveryCooldown so a
+// sustained-missing concierge retries gently (the gate fails on every heartbeat
+// until the MCP lands) rather than re-firing a clone+deliver every beat.
+// nil-safe via the reconcilePlugins check + the empty-id guard.
+func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspaceID string) {
+	if h.reconcilePlugins == nil || workspaceID == "" {
+		return
+	}
+	if last, ok := h.mcpRecoveryLastFire.Load(workspaceID); ok {
+		if t, _ := last.(time.Time); time.Since(t) < mcpRecoveryCooldown {
+			return // fired recently — let the in-flight reconcile converge
+		}
+	}
+	// Store BEFORE firing so a concurrent heartbeat sees the fresh timestamp and
+	// does not double-fire (a rare race double-fire is harmless — idempotent).
+	h.mcpRecoveryLastFire.Store(workspaceID, time.Now())
 	rctx := context.WithoutCancel(ctx)
 	wsID := workspaceID
 	globalGoAsync(func() { h.reconcilePlugins(rctx, wsID) })
@@ -667,6 +726,13 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 				msg = "platform agent registered without /opt/molecule-mcp-server; refusing online"
 				reason = "mcp_server_missing"
 				logCode = "platform_agent_mcp_server_missing"
+				// #33 deadlock-break (mirrors the heartbeat gate): this branch
+				// return()s before the register's provisioning→online reconcile
+				// fire, so without this a concierge registering MCP-less would
+				// never get the declared management MCP delivered. Fire it here;
+				// the in-flight guard dedupes against the heartbeat-path fire.
+				// Stays fail-closed (markWorkspaceFailed below + 400 response).
+				h.fireReconcileMCPRecovery(ctx, payload.ID)
 			}
 			log.Printf("Registry register: %s (workspace=%s)", msg, payload.ID)
 			h.markWorkspaceFailed(ctx, payload.ID, msg, reason)
@@ -1350,6 +1416,16 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			case !hasMCP:
 				msg = "platform agent heartbeat denied: /opt/molecule-mcp-server missing; refusing to mark online (RCA #2970 FAIL-CLOSED)"
 				reason = "mcp_server_missing"
+				// #33 deadlock-break: the management MCP is delivered on SaaS by
+				// the declared-plugin reconcile (workspace_declared_plugins), but
+				// this branch return()s before the recovery paths that fire it —
+				// so a concierge that boots MCP-less can never self-heal. Fire the
+				// reconcile here to deliver the declared MCP into the running
+				// container. Stays fail-closed for THIS heartbeat (markWorkspaceFailed
+				// below); the NEXT heartbeat — once the runtime re-reads settings.json
+				// and reports mcp_server_present=true — recovers failed→online via
+				// the existing recovery branch. Guarded against per-heartbeat storms.
+				h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
 			}
 			log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
 			h.markWorkspaceFailed(ctx, payload.WorkspaceID, msg, reason)
