@@ -761,6 +761,14 @@ func TestSecretsSetModel_UnregisteredModel_422(t *testing.T) {
 	if !strings.Contains(body, "UNREGISTERED_MODEL_FOR_RUNTIME") {
 		t.Errorf("expected code UNREGISTERED_MODEL_FOR_RUNTIME in body, got: %s", body)
 	}
+	// The explicit model-set path keeps STRICT validation: the error must
+	// carry the actionable "pick one of the runtime's registered models"
+	// pointer, and the model must NOT auto-reset (no INSERT mocked, so any
+	// write would surface as an unmet/unexpected expectation). This is the
+	// invariant the runtime-change auto-reset must NOT leak into.
+	if !strings.Contains(body, "registered model") {
+		t.Errorf("expected actionable valid-models reason in body, got: %s", body)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
 	}

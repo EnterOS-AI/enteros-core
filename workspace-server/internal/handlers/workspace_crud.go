@@ -248,6 +248,11 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		}
 	}
 	needsRestart := false
+	// Set when the runtime-change auto-reset path rewrites the MODEL secret to
+	// the target runtime's default registered model (see below). Surfaced in
+	// the response so the caller knows the model changed under it.
+	modelWasReset := false
+	resetModel := ""
 	if runtime, ok := body["runtime"]; ok {
 		// Reject non-string or unrecognized runtime values before the model-
 		// compatibility check. Prevents template slugs such as "seo-agent"
@@ -308,21 +313,92 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read model secret"})
 			return
 		}
-		// Only enforce the (runtime, model) pair when we actually HAVE a model.
+		// AUTO-RESET-TO-DEFAULT (defense-in-depth, the "dual-422 trap" fix).
+		//
+		// Historically a runtime change whose current model was NOT registered
+		// for the TARGET runtime returned 422 and the runtime change SILENTLY
+		// ROLLED BACK (nothing was persisted). That forced every caller into a
+		// fragile "DELETE MODEL → PATCH runtime → PUT new model → restart" dance
+		// (and a MCP `update_config.runtime` that no-ops the column made it
+		// worse). The trap fired from ANY client, including ones that have no
+		// concept of clearing the model first.
+		//
+		// New contract for the RUNTIME-CHANGE path ONLY: if the current model
+		// would be orphaned on the target runtime, DON'T fail+rollback — reset
+		// the model to the target runtime's DEFAULT registered model
+		// (registry SSOT) in the SAME update, change the runtime, and signal it
+		// in the response (`model_was_reset:true` + the new `model`). The
+		// explicit model-set path (PUT /model, SecretsHandler.SetModel) keeps
+		// STRICT validation — an invalid explicit model still 422s with the
+		// actionable valid-models list. Only this implicit-orphan case
+		// auto-resets.
+		// resetTo is the target runtime's default model the auto-reset path
+		// will write, set only when the current model is orphaned AND a safe
+		// default exists. Empty = no reset; the runtime UPDATE runs alone.
+		resetTo := ""
 		if currentModel != "" {
-			if ok, reason := validateRegisteredModelForRuntime(runtimeStr, currentModel); !ok {
-				log.Printf("Update: PATCH runtime=%q on %s REJECTED (model=%q is not registered for that runtime): %s",
-					runtimeStr, id, currentModel, reason)
-				// 422 = syntactically valid PATCH body, but the (runtime, model)
-				// pair is unroutable per the registry SSOT.
-				c.JSON(http.StatusUnprocessableEntity, gin.H{"error": reason})
-				return
+			if ok, _ := validateRegisteredModelForRuntime(runtimeStr, currentModel); !ok {
+				// Current model is orphaned for the target runtime. Try to
+				// reset it to the target runtime's default registered model
+				// instead of rejecting the whole PATCH.
+				def, haveDefault := defaultModelForRuntime(runtimeStr)
+				if haveDefault {
+					resetTo = def
+				} else {
+					// No safe platform default exists for the target runtime
+					// (registry unavailable, runtime not in the registry /
+					// federated, or all native arms are name-only/BYOK). We
+					// cannot pick a model to reset to, so preserve the
+					// pre-existing fail-closed behavior: reject the PATCH rather
+					// than persist a runtime whose model is unroutable. Returns
+					// the SAME 422 the strict validator produced.
+					_, reason := validateRegisteredModelForRuntime(runtimeStr, currentModel)
+					log.Printf("Update: PATCH runtime=%q on %s REJECTED (model=%q is not registered and no runtime default to reset to): %s",
+						runtimeStr, id, currentModel, reason)
+					c.JSON(http.StatusUnprocessableEntity, gin.H{"error": reason})
+					return
+				}
 			}
 		}
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtimeStr); err != nil {
-			log.Printf("Update runtime error for %s: %v", id, err)
+		// ATOMICITY (CR2 review 13597): the model reset and the runtime UPDATE
+		// MUST commit-or-rollback as ONE unit. Doing them as two independent
+		// statements (the model write, then a separate runtime UPDATE) means a
+		// failed runtime UPDATE leaves the model already reset but the runtime
+		// unchanged — the mismatched model/runtime dual-state this whole change
+		// exists to prevent. Wrapping both in a single tx makes the reset roll
+		// back with the runtime UPDATE on any failure. The non-reset case
+		// (resetTo == "") runs only the runtime UPDATE inside the tx, which is
+		// behaviorally identical to the old standalone UPDATE.
+		if err := func() error {
+			tx, err := db.DB.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			// Safe even after a successful Commit — the second Rollback is a
+			// no-op (database/sql tracks tx state).
+			defer func() { _ = tx.Rollback() }()
+
+			if resetTo != "" {
+				log.Printf("Update: PATCH runtime=%q on %s — current model=%q is not registered for that runtime; AUTO-RESET model to runtime default %q (atomic with runtime UPDATE)",
+					runtimeStr, id, currentModel, resetTo)
+				if err := setModelSecretExec(ctx, tx, id, resetTo); err != nil {
+					return err
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtimeStr); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}(); err != nil {
+			// On ANY failure (begin/reset/runtime-UPDATE/commit) the tx rolled
+			// back: neither the model reset nor the runtime change persisted.
+			log.Printf("Update runtime error for %s (resetTo=%q): %v", id, resetTo, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save runtime"})
 			return
+		}
+		if resetTo != "" {
+			modelWasReset = true
+			resetModel = resetTo
 		}
 		needsRestart = true
 	}
@@ -412,6 +488,13 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 	resp := gin.H{"status": "updated"}
 	if needsRestart {
 		resp["needs_restart"] = true
+	}
+	if modelWasReset {
+		// The runtime-change auto-reset rewrote the model to the target
+		// runtime's default. Signal it so the caller can reflect the change
+		// (and knows it does NOT need the legacy DELETE/PUT model dance).
+		resp["model_was_reset"] = true
+		resp["model"] = resetModel
 	}
 	c.JSON(http.StatusOK, resp)
 }

@@ -965,9 +965,13 @@ func TestWorkspaceUpdate_RuntimeField(t *testing.T) {
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs("cccccccc-0006-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
+	// The runtime UPDATE now runs inside the atomic model-reset+runtime tx
+	// (no reset here, so the tx wraps only the UPDATE).
+	mock.ExpectBegin()
 	mock.ExpectExec("UPDATE workspaces SET runtime").
 		WithArgs("cccccccc-0006-0000-0000-000000000000", "claude-code").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
