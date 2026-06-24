@@ -249,6 +249,20 @@ func TestIsCPTemplateAssetPath_AllowsPromptsPrefix(t *testing.T) {
 	}
 }
 
+// TestIsCPTemplateAssetPath_AllowsSystemPromptMd pins the SSOT concierge/agent
+// prompt filename as asset-channel-deliverable. system-prompt.md is the single
+// prompt filename the runtime loads, the platform-agent template ships, and core
+// substitutes {{CONCIERGE_NAME}} into; it MUST be deliverable so a kind=platform
+// concierge gets its identity LIVE on the standard runtime image (no baked
+// molecule-platform-agent image). Guards the de-bake migration: narrowing the
+// allowlist back to config.yaml + prompts/* only would boot the concierge
+// identity-less, and this test fails.
+func TestIsCPTemplateAssetPath_AllowsSystemPromptMd(t *testing.T) {
+	if !IsCPTemplateAssetPath("system-prompt.md") {
+		t.Error("expected system-prompt.md to be asset-channel deliverable (concierge identity)")
+	}
+}
+
 // TestIsCPTemplateAssetPath_RejectsAgentSkillsPrefix pins the RFC#2843 #32
 // contract: agent-skills/* is NO LONGER asset-channel eligible. Skills are
 // PLUGINS now — they install dynamically post-online via the plugin pipeline
