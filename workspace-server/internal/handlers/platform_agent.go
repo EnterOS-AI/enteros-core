@@ -224,14 +224,19 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	envVars map[string]string,
 	name string,
 ) map[string][]byte {
-	var kind string
+	var kind, runtime string
 	if err := db.DB.QueryRowContext(ctx,
-		`SELECT COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1`, workspaceID).Scan(&kind); err != nil {
+		`SELECT COALESCE(kind, 'workspace'), COALESCE(runtime, '') FROM workspaces WHERE id = $1`, workspaceID).Scan(&kind, &runtime); err != nil {
 		// Non-fatal: a missing row / probe error just means "treat as ordinary".
 		return configFiles
 	}
 	if kind != models.KindPlatform {
 		return configFiles
+	}
+	// The concierge runtime is per-org (P3b). Fall back to the default when the
+	// row carries none (legacy rows / self-host seed before the column was set).
+	if strings.TrimSpace(runtime) == "" {
+		runtime = defaultConciergeRuntime
 	}
 
 	// 0. Concierge model (core#2594). The platform agent carries an explicit,
@@ -240,7 +245,7 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	//    MODEL secret at provision time — before any template config.yaml is
 	//    fetched — so this MUST run here, not be deferred to the template.
 	//    Seed-only: it respects a model the customer later picked.
-	h.ensureConciergeModel(ctx, workspaceID, envVars)
+	h.ensureConciergeModel(ctx, workspaceID, runtime, envVars)
 
 	// 0b. Concierge LLM provider pin (companion to the model seed). The
 	//    molecule-runtime wheel DERIVES a provider slug from the model id
@@ -263,7 +268,7 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	//    flipped a stuck concierge from not_configured to ready + responding.
 	//    Seed-only + gated to the platform-managed model namespace so it never
 	//    overrides a BYOK/self-host concierge (see ensureConciergeProvider).
-	h.ensureConciergeProvider(ctx, workspaceID, envVars)
+	h.ensureConciergeProvider(ctx, workspaceID, runtime, envVars)
 
 	// 0c. Declare the concierge's management MCP as a PLUGIN (RFC:
 	//    rfc-platform-mcp-as-plugin). The asset-channel mcp_servers.yaml does NOT
@@ -329,10 +334,15 @@ func substituteConciergeName(prompt []byte, name string) []byte {
 	return []byte(strings.ReplaceAll(string(prompt), conciergeNamePlaceholder, name))
 }
 
-// conciergeRuntime is the runtime the platform agent (concierge) always runs as
-// (the platform-agent image variant of 'claude-code'). conciergeDeclaredModel is
-// validated against the registry for this runtime before being seeded.
-const conciergeRuntime = "claude-code"
+// defaultConciergeRuntime is the runtime the platform agent (concierge) runs as
+// when no per-org runtime is specified. The platform de-bake (P3b) makes the
+// concierge runtime a PARAMETER (threaded through installPlatformAgent +
+// ensureConciergeModel), so a per-org concierge can run on codex / openclaw /
+// hermes, not only the legacy 'claude-code' image variant. The default stays
+// 'claude-code' for backward compatibility (existing installs, self-host seed).
+// conciergeDeclaredModel is validated against the registry FOR THE CHOSEN RUNTIME
+// before being seeded.
+const defaultConciergeRuntime = "claude-code"
 
 // conciergeDeclaredModel is the platform agent's OWN declared model — a
 // first-class product decision, NOT a generic platform default. It mirrors a
@@ -341,7 +351,42 @@ const conciergeRuntime = "claude-code"
 // from defaulting a USER workspace's model, but the concierge IS the
 // platform-agent product, so it declares its own model exactly as a template
 // declares one (core#2594).
-const conciergeDeclaredModel = "moonshot/kimi-k2.6"
+//
+// CTO decision (P3b): the platform-managed default for ALL concierge runtimes is
+// "minimax/MiniMax-M2.7" — MiniMax is cheaper than kimi and is served via the
+// proxy's Anthropic-compatible arm (providers.yaml minimax: base_url_anthropic
+// https://api.minimax.io/anthropic/v1, auth_env MINIMAX_API_KEY), so the SAME
+// declared model routes for claude-code AND codex/openclaw. It is a registered
+// platform model (providers.yaml `provider: platform` set). The credential is
+// platform-proxy-side (Infisical /shared/minimax-token-plan); NO API key is
+// hardcoded here. A per-runtime override is possible via conciergeModelForRuntime,
+// but the default for every runtime is this id.
+const conciergeDeclaredModel = "minimax/MiniMax-M2.7"
+
+// conciergeModelForRuntime returns the concierge's declared model for a given
+// runtime. The platform-managed default (conciergeDeclaredModel) is shared across
+// all runtimes because it routes through the proxy's Anthropic-compatible arm,
+// which every concierge runtime speaks. This indirection keeps a per-runtime
+// override a one-line change (e.g. a future codex-only model) without touching
+// the seed logic. Today it is runtime-independent by design.
+func conciergeModelForRuntime(_ string) string {
+	return conciergeDeclaredModel
+}
+
+// conciergeTemplateForRuntime maps a concierge runtime to its platform-agent
+// template name. The claude-code concierge keeps the historical "platform-agent"
+// template name (the row column installPlatformAgent has always written, and the
+// name conciergeTemplateOrDefault forces on provision); other runtimes use the
+// "<runtime>-platform-agent" convention (mirrors the localbuild image naming
+// `workspace-template-<runtime>-platform-agent`). This is what installPlatformAgent
+// stamps into workspaces.template so the asset fetcher pulls the right identity.
+func conciergeTemplateForRuntime(runtime string) string {
+	runtime = strings.TrimSpace(runtime)
+	if runtime == "" || runtime == defaultConciergeRuntime {
+		return "platform-agent"
+	}
+	return runtime + "-platform-agent"
+}
 
 // ensureConciergeModel makes the platform agent's model explicit (core#2594).
 // It (1) seeds the container model env for the current provision and (2)
@@ -351,7 +396,15 @@ const conciergeDeclaredModel = "moonshot/kimi-k2.6"
 // drift — a build bug caught by the model-registry CI test), it sets NOTHING:
 // the downstream universal MISSING_MODEL gate then fails the provision CLOSED
 // rather than letting the runtime pick an opaque default.
-func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID string, envVars map[string]string) {
+//
+// runtime is the concierge's per-org runtime (P3b). The declared model is
+// validated against the registry FOR THIS RUNTIME, so a codex/openclaw concierge
+// is gated against codex/openclaw's model set, not claude-code's. An empty runtime
+// falls back to the default.
+func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID, runtime string, envVars map[string]string) {
+	if strings.TrimSpace(runtime) == "" {
+		runtime = defaultConciergeRuntime
+	}
 	// SEED-ONLY (CTO 2026-06-12: customer setting > platform default; the
 	// concierge's model is changeable like any workspace, "anytime"). If a MODEL
 	// secret already exists — whether the original seed or a model the customer
@@ -372,13 +425,13 @@ func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID
 	// if it is genuinely routable for the runtime; otherwise leave it unset and
 	// let the MISSING_MODEL gate fail closed (loud) rather than seed a model the
 	// platform cannot actually route to (silent late failure).
-	model := conciergeDeclaredModel
-	if ok, why := validateRegisteredModelForRuntime(conciergeRuntime, model); !ok {
-		log.Printf("Provisioner: concierge %s declared model %q is NOT registered for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, conciergeRuntime, why)
+	model := conciergeModelForRuntime(runtime)
+	if ok, why := validateRegisteredModelForRuntime(runtime, model); !ok {
+		log.Printf("Provisioner: concierge %s declared model %q is NOT registered for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, runtime, why)
 		return
 	}
-	if ok, why := validateDerivedProviderInRegistry(conciergeRuntime, model); !ok {
-		log.Printf("Provisioner: concierge %s declared model %q has no derivable registry provider for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, conciergeRuntime, why)
+	if ok, why := validateDerivedProviderInRegistry(runtime, model); !ok {
+		log.Printf("Provisioner: concierge %s declared model %q has no derivable registry provider for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, runtime, why)
 		return
 	}
 
@@ -437,14 +490,39 @@ func readStoredModelSecret(ctx context.Context, workspaceID string) (string, err
 // provider is unconditionally "platform" for the platform-managed model family.
 const conciergeProvider = "platform"
 
-// platformManagedModelPrefix is the model-id namespace served by the platform
-// LLM proxy that ALSO collides with the wheel's provider derivation (the slug
-// before '/' is "moonshot", not a registry name). A concierge whose effective
-// model carries this prefix MUST have its provider pinned to `platform`
-// explicitly; without the pin the claude-code adapter fail-closes. Gating on
-// this prefix keeps the seed from touching a BYOK/self-host concierge whose
-// model resolves cleanly on its own (e.g. `sonnet` -> anthropic-oauth).
-const platformManagedModelPrefix = "moonshot/"
+// conciergeModelIsPlatformManaged reports whether the concierge's effective model
+// is a platform-managed (proxy-billed) id for the given runtime — i.e. one whose
+// registry derivation resolves to the `platform` provider. A concierge running a
+// platform-managed model MUST have its provider pinned to `platform` explicitly;
+// without the pin the runtime's wheel re-derives a slug-PREFIX (e.g. "moonshot"
+// from "moonshot/kimi-k2.6", or "minimax" from "minimax/MiniMax-M2.7") that is
+// NOT a registry provider name and the adapter fail-closes.
+//
+// Registry-derived (NOT a hardcoded model-id prefix) so it is runtime- and
+// model-agnostic: the P3b default flipped from "moonshot/…" to "minimax/…" and a
+// per-org concierge can run any registered platform model on any runtime. An empty
+// model is treated as platform-managed (unresolved fresh/rebuilt-from-DB payload
+// defaults to the platform family — see ensureConciergeProvider). A derive miss
+// (unknown runtime/model) is NOT platform-managed: leave such a concierge alone
+// (it resolves on its own or fails the create/provision gate elsewhere). Mirrors
+// ensureCreatedWorkspaceProviderPin's IsPlatform gate.
+func conciergeModelIsPlatformManaged(runtime, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return true // unresolved → platform-managed family
+	}
+	m, err := providerRegistry()
+	if err != nil || m == nil {
+		// Registry unavailable (build-time gate owns it). Be conservative and do
+		// NOT pin — an unverifiable model must not force `platform` auth routing.
+		return false
+	}
+	prov, derr := m.DeriveProvider(runtime, model, nil)
+	if derr != nil {
+		return false // unknown/ambiguous — not provably platform-managed
+	}
+	return prov.IsPlatform()
+}
 
 // The management-MCP plugin the concierge declares. It wires the `molecule-mcp`
 // server (MOLECULE_MCP_MODE=management — create_workspace, list_workspaces, …)
@@ -510,7 +588,10 @@ const conciergePlatformMCPCreateWorkspaceTool = "mcp__molecule-platform__create_
 // (which writes LLM_PROVIDER) is respected. GATED on the effective model's
 // platform-managed namespace so it never forces `platform` onto a BYOK or
 // self-hosted concierge running a non-proxy model.
-func (h *WorkspaceHandler) ensureConciergeProvider(ctx context.Context, workspaceID string, envVars map[string]string) {
+func (h *WorkspaceHandler) ensureConciergeProvider(ctx context.Context, workspaceID, runtime string, envVars map[string]string) {
+	if strings.TrimSpace(runtime) == "" {
+		runtime = defaultConciergeRuntime
+	}
 	// Respect an explicit provider already set (customer canvas pick or a prior
 	// seed): loadWorkspaceSecrets already injected it into envVars. Do nothing.
 	//
@@ -539,12 +620,17 @@ func (h *WorkspaceHandler) ensureConciergeProvider(ctx context.Context, workspac
 	// LLM_PROVIDER (handled by the early-return above) or an explicit non-platform
 	// MODEL (skipped just below). Empty means an unresolved fresh/rebuilt-from-DB
 	// payload, which defaults to the platform-managed family; skipping the pin
-	// there (the old `HasPrefix("", …)`==false path) left the concierge without
-	// LLM_PROVIDER, so the runtime could not drop the inherited tenant
-	// CLAUDE_CODE_OAUTH_TOKEN and the agent 401'd against the CP LLM proxy. Only a
-	// NON-empty non-platform model (an explicit BYOK pick) resolves on its own;
-	// forcing `platform` there would mis-route auth and break the agent.
-	if model != "" && !strings.HasPrefix(strings.ToLower(model), platformManagedModelPrefix) {
+	// there left the concierge without LLM_PROVIDER, so the runtime could not drop
+	// the inherited tenant CLAUDE_CODE_OAUTH_TOKEN and the agent 401'd against the
+	// CP LLM proxy. Only a NON-empty non-platform model (an explicit BYOK pick)
+	// resolves on its own; forcing `platform` there would mis-route auth and break
+	// the agent.
+	//
+	// The platform-managed test is now registry-DERIVED (conciergeModelIsPlatformManaged)
+	// rather than a hardcoded "moonshot/" model-id prefix, so the P3b minimax/
+	// default — and any other registered platform model on any concierge runtime —
+	// is correctly recognized.
+	if !conciergeModelIsPlatformManaged(runtime, model) {
 		return
 	}
 
@@ -707,7 +793,10 @@ func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error 
 		return fmt.Errorf("check existing platform agent: %w", err)
 	}
 	log.Printf("boot: no platform agent present — self-seeding %s (self-hosted)", SelfHostedPlatformAgentID)
-	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, defaultPlatformAgentName())
+	// Self-host seed uses the default concierge runtime (claude-code); a
+	// self-host operator who wants a different runtime switches it post-seed via
+	// the standard runtime-change path.
+	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, defaultPlatformAgentName(), defaultConciergeRuntime)
 }
 
 // OrgIdentityResponse is the body of GET /org/identity.
@@ -824,10 +913,22 @@ func MaybeProvisionPlatformAgentOnBoot(ctx context.Context, database *sql.DB, pr
 }
 
 // conciergeIdentityPresent reports whether the running concierge container
-// already carries the seeded identity (a non-empty /configs/system-prompt.md).
+// already carries the seeded identity (a substituted /configs/system-prompt.md).
 // Used to decide whether a running-but-vanilla concierge needs a one-shot
 // restart to pick up the overlay. Best-effort: on a probe error or an empty
 // file it returns false (so the safe action — re-seed via restart — is taken).
+//
+// P3b: the check is the ABSENCE of the {{CONCIERGE_NAME}} placeholder, NOT the
+// presence of the literal "Org Concierge". The old substring check broke the
+// moment the concierge was renamed (MOLECULE_ORG_NAME → "<Org> Agent", never
+// "Org Concierge") or ran on a non-claude-code template whose prompt never
+// mentions that phrase: conciergeIdentityPresent would return false on a
+// perfectly-seeded concierge → MaybeProvisionPlatformAgentOnBoot restarts it on
+// EVERY boot (the boot-restart loop). The placeholder is the unambiguous,
+// name-/runtime-agnostic signal of "identity NOT yet substituted": the template
+// ships it literal and applyConciergeProvisionConfig's substituteConciergeName
+// replaces it at provision. A file that still contains the literal placeholder
+// has NOT had the per-instance overlay applied; any other non-empty file has.
 func conciergeIdentityPresent(ctx context.Context, prov localProvisionerIsRunning, id string) bool {
 	reader, ok := prov.(interface {
 		ExecRead(ctx context.Context, containerName, filePath string) ([]byte, error)
@@ -841,7 +942,15 @@ func conciergeIdentityPresent(ctx context.Context, prov localProvisionerIsRunnin
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(body), "Org Concierge")
+	s := string(body)
+	if strings.TrimSpace(s) == "" {
+		// Empty / vanilla file — no identity delivered. Re-seed via restart.
+		return false
+	}
+	// Identity is present iff the placeholder has been substituted away. A file
+	// still carrying the literal {{CONCIERGE_NAME}} is an un-substituted (or
+	// stub) prompt → not yet identity-bearing.
+	return !strings.Contains(s, conciergeNamePlaceholder)
 }
 
 // localProvisionerIsRunning is the minimal slice of the local Docker
@@ -860,6 +969,10 @@ type installPlatformAgentPayload struct {
 	ID string `json:"id" binding:"required"`
 	// Name is the display name; defaults to "Org Concierge" when omitted.
 	Name string `json:"name"`
+	// Runtime is the concierge's runtime (P3b). Optional; defaults to
+	// claude-code when omitted so existing CP callers that don't send it keep
+	// the legacy behavior. A CP that wants a codex/openclaw concierge passes it.
+	Runtime string `json:"runtime"`
 }
 
 // InstallPlatformAgent handles POST /admin/org/platform-agent (AdminAuth).
@@ -877,7 +990,7 @@ func InstallPlatformAgent(c *gin.Context) {
 	if name == "" {
 		name = defaultPlatformAgentName()
 	}
-	if err := installPlatformAgent(c.Request.Context(), db.DB, p.ID, name); err != nil {
+	if err := installPlatformAgent(c.Request.Context(), db.DB, p.ID, name, p.Runtime); err != nil {
 		log.Printf("InstallPlatformAgent: %v (id=%s)", err, p.ID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "install failed"})
 		return
@@ -893,7 +1006,14 @@ func InstallPlatformAgent(c *gin.Context) {
 // in the file header. Separated from the gin handler so integration tests can
 // exercise it directly against a real Postgres (the org-anchor migration cannot
 // be proven with sqlmock).
-func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, name string) error {
+func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, name, runtime string) error {
+	// P3b: the concierge runtime is a parameter. An empty runtime (legacy callers,
+	// self-host seed) defaults to claude-code. The template is mapped per-runtime
+	// so the asset fetcher pulls the right platform-agent identity.
+	if strings.TrimSpace(runtime) == "" {
+		runtime = defaultConciergeRuntime
+	}
+	template := conciergeTemplateForRuntime(runtime)
 	tx, err := database.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
@@ -925,11 +1045,23 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    rather than silently rename/reparent, which could orphan billing or
 	//    provisioning state. The integration tests use unique names per fixture
 	//    to avoid cross-test collision (CR-A RC 10610).
+	//
+	//    RUNTIME (P3b): the INSERT seeds the requested concierge runtime. The
+	//    ON CONFLICT clause deliberately does NOT re-write `runtime` — re-running
+	//    the install (CP backfill, idempotent re-call) must PRESERVE the row's
+	//    current runtime, not revert a codex/openclaw concierge back to
+	//    claude-code. The pre-P3b `runtime = 'claude-code'` on conflict (core#2496)
+	//    is the exact clobber this de-bake removes. The template IS corrected on
+	//    conflict because it is a deterministic function of the row's runtime —
+	//    but since the conflict clause can't read the EXISTING runtime in a single
+	//    statement, it only sets the template that matches the REQUESTED runtime;
+	//    a same-runtime re-install (the common case) keeps it correct, and a
+	//    runtime CHANGE flows through the dedicated runtime-switch path, not here.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id, template)
-		VALUES ($1, $2, 'platform', 0, 'offline', 'claude-code', NULL, 'platform-agent')
-		ON CONFLICT (id) DO UPDATE SET kind = 'platform', runtime = 'claude-code', parent_id = NULL, template = 'platform-agent'
-	`, platformID, name); err != nil {
+		VALUES ($1, $2, 'platform', 0, 'offline', $3, NULL, $4)
+		ON CONFLICT (id) DO UPDATE SET kind = 'platform', parent_id = NULL, template = $4
+	`, platformID, name, runtime, template); err != nil {
 		return fmt.Errorf("upsert platform agent: %w", err)
 	}
 
