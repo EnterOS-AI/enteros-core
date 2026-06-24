@@ -100,17 +100,27 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from molecule_runtime.plugins_registry.builtins import MCPServerAdaptor
 from molecule_runtime.plugins_registry.protocol import InstallContext
+from molecule_runtime.mcp_render import render_for_runtime
 
 plugin_root = Path(sys.argv[2])
 configs_dir = Path(sys.argv[3])
 configs_dir.mkdir(parents=True, exist_ok=True)
 
 async def main():
+    # Runtime-agnostic PORT (#3159): the adaptor no longer writes
+    # .claude/settings.json directly; it routes mcpServers through
+    # ctx.register_mcp_server, and the active runtime's renderer writes the
+    # native config. Bind the real Claude renderer here so this test still
+    # verifies the end-to-end delivery path produces the expected file.
+    def register_mcp_server(name, spec):
+        render_for_runtime("claude_code", str(configs_dir), name, spec)
+
     ctx = InstallContext(
         configs_dir=configs_dir,
         workspace_id="test-ws",
         runtime="claude_code",
         plugin_root=plugin_root,
+        register_mcp_server=register_mcp_server,
     )
     adaptor = MCPServerAdaptor("molecule-platform-mcp", "claude_code")
     await adaptor.install(ctx)
