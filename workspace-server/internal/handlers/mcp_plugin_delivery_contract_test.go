@@ -20,23 +20,16 @@ func TestMCPPluginDeliveryContract_MatchesSSOT(t *testing.T) {
 		t.Fatalf("load contract: %v", err)
 	}
 
-	if c.SettingsPath != "/configs/.claude/settings.json" {
-		t.Errorf("settings_path = %q, want /configs/.claude/settings.json", c.SettingsPath)
-	}
-	if c.Key != "mcpServers" {
-		t.Errorf("key = %q, want mcpServers", c.Key)
-	}
-	if c.EntryShape != "name->{command,args?,env?}" {
-		t.Errorf("entry_shape = %q, want name->{command,args?,env?}", c.EntryShape)
-	}
-	if c.Producer != "MCPServerAdaptor" {
-		t.Errorf("producer = %q, want MCPServerAdaptor", c.Producer)
-	}
-	if c.Consumer != "claude_sdk_executor._load_settings_mcp" {
-		t.Errorf("consumer = %q, want claude_sdk_executor._load_settings_mcp", c.Consumer)
-	}
-	if c.MCPServerName != "molecule-platform" {
-		t.Errorf("mcp_server_name = %q, want molecule-platform", c.MCPServerName)
+	// MatchesSSOT asserts the scalar fields AND the #3159 extensions: the
+	// MCP-wiring PORT symbol names (port.hook/impl/present_probe/dispatch/
+	// resolver_default) and the per-runtime native delivery surfaces
+	// (claude_code/codex implemented, gemini/hermes declared-but-todo). A drift
+	// in any of these — e.g. the PORT being collapsed back into a hard-coded
+	// Claude write, or a runtime silently dropping out — fails here.
+	if diffs := c.MatchesSSOT(); len(diffs) > 0 {
+		for _, d := range diffs {
+			t.Errorf("contract SSOT drift: %s", d)
+		}
 	}
 }
 
@@ -84,14 +77,113 @@ func TestMCPPluginDeliveryContract_MCPServerAdaptorWritesMcpServers(t *testing.T
 		t.Fatalf("load contract: %v", err)
 	}
 
-	runtimePath := os.Getenv("MOLECULE_WORKSPACE_RUNTIME")
-	if runtimePath == "" {
-		// Default sibling checkout relative to the core repo root.
-		repoRoot := filepath.Join("..", "..", "..")
-		sibling := filepath.Join(repoRoot, "molecule-ai-workspace-runtime")
-		if _, err := os.Stat(filepath.Join(sibling, "molecule_runtime", "plugins_registry", "builtins.py")); err == nil {
-			runtimePath = sibling
-		}
+	// The python harness installs the REAL MCPServerAdaptor and binds a SPY for
+	// ctx.register_mcp_server. The spy (a) records every (name, spec) the adaptor
+	// routes through the PORT, then (b) renders via the real Claude renderer so
+	// the end-to-end file is still produced. It emits the recorded calls as a
+	// JSON line `RECORDER=[...]` on stdout.
+	//
+	// KEYSTONE (Researcher RC 13562): the previous test only checked that the
+	// produced .claude/settings.json contained the mcpServers key. That
+	// false-greened — if MCPServerAdaptor regressed to writing
+	// .claude/settings.json DIRECTLY (the #3159 bug) instead of going through
+	// ctx.register_mcp_server, the file would still exist with the key and the
+	// test would still pass while the PORT was bypassed. We now ASSERT the spy
+	// captured exactly [(molecule-platform, spec)], so a direct-write regression
+	// (which never calls the spy) FAILS here.
+	pyScript := `
+import asyncio, json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from molecule_runtime.plugins_registry.builtins import MCPServerAdaptor
+from molecule_runtime.plugins_registry.protocol import InstallContext
+from molecule_runtime.mcp_render import render_for_runtime
+
+plugin_root = Path(sys.argv[2])
+configs_dir = Path(sys.argv[3])
+configs_dir.mkdir(parents=True, exist_ok=True)
+
+recorded = []
+
+async def main():
+    # Runtime-agnostic PORT (#3159): the adaptor must route mcpServers through
+    # ctx.register_mcp_server (it must NOT write .claude/settings.json directly).
+    # The spy records the call, then the active runtime's renderer writes the
+    # native config so the end-to-end delivery path is still exercised.
+    def register_mcp_server(name, spec):
+        recorded.append({"name": name, "spec": spec})
+        render_for_runtime("claude_code", str(configs_dir), name, spec)
+
+    ctx = InstallContext(
+        configs_dir=configs_dir,
+        workspace_id="test-ws",
+        runtime="claude_code",
+        plugin_root=plugin_root,
+        register_mcp_server=register_mcp_server,
+    )
+    adaptor = MCPServerAdaptor("molecule-platform-mcp", "claude_code")
+    await adaptor.install(ctx)
+
+asyncio.run(main())
+print("RECORDER=" + json.dumps(recorded))
+`
+
+	configsDir := t.TempDir()
+	pluginRoot := t.TempDir()
+	writePlatformFragment(t, contract, pluginRoot)
+
+	stdout := runMCPAdaptorHarness(t, pyScript, pluginRoot, configsDir, nil)
+
+	// (1) KEYSTONE: assert the adaptor actually CALLED ctx.register_mcp_server
+	// with [(molecule-platform, spec)]. A direct .claude write would leave the
+	// recorder empty → this fails.
+	recorded := parseRecorder(t, stdout)
+	if len(recorded) != 1 {
+		t.Fatalf("register_mcp_server PORT was not called exactly once with the platform server: recorded=%v\n"+
+			"A direct .claude/settings.json write (the #3159 regression) bypasses the PORT and leaves this empty.", recorded)
+	}
+	if recorded[0].Name != "molecule-platform" {
+		t.Errorf("register_mcp_server called with name %q, want molecule-platform", recorded[0].Name)
+	}
+	if cmd, _ := recorded[0].Spec["command"].(string); cmd != "molecule-mcp" {
+		t.Errorf("register_mcp_server spec.command = %q, want molecule-mcp", cmd)
+	}
+	if env, ok := recorded[0].Spec["env"].(map[string]any); !ok || env["MOLECULE_MCP_MODE"] != "management" {
+		t.Errorf("register_mcp_server spec.env = %v, want MOLECULE_MCP_MODE=management", recorded[0].Spec["env"])
+	}
+
+	// (2) End-to-end: the produced Claude settings.json still has the key/entry.
+	rel := strings.TrimPrefix(contract.SettingsPath, "/configs/")
+	settingsPath := filepath.Join(configsDir, rel)
+	gotBytes, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read produced settings at %s: %v", contract.SettingsPath, err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(gotBytes, &got); err != nil {
+		t.Fatalf("parse produced settings: %v", err)
+	}
+	mcpServers, ok := got[contract.Key].(map[string]any)
+	if !ok {
+		t.Fatalf("real MCPServerAdaptor produced settings %q is not an object: %T", contract.Key, got[contract.Key])
+	}
+	if _, ok := mcpServers["molecule-platform"]; !ok {
+		t.Fatalf("real MCPServerAdaptor produced settings %q does not contain the molecule-platform entry", contract.Key)
+	}
+}
+
+// TestMCPPluginDeliveryContract_CodexRoutesToCodexConfig is the codex-runtime
+// regression for #3159. It installs the REAL MCPServerAdaptor with runtime
+// "codex" and a spy that renders via the codex renderer, then asserts the codex
+// native config ($HOME/.codex/config.toml) declares [mcp_servers.molecule-platform]
+// with env MOLECULE_MCP_MODE=management — and that NO /configs/.claude/settings.json
+// was produced. This catches the exact #3159 bug class: a hard-coded Claude
+// write would mis-wire a codex concierge (MCP written to a file codex never
+// reads), leaving create_workspace absent.
+func TestMCPPluginDeliveryContract_CodexRoutesToCodexConfig(t *testing.T) {
+	contract, err := LoadMCPPluginDeliveryContract()
+	if err != nil {
+		t.Fatalf("load contract: %v", err)
 	}
 
 	pyScript := `
@@ -106,31 +198,100 @@ plugin_root = Path(sys.argv[2])
 configs_dir = Path(sys.argv[3])
 configs_dir.mkdir(parents=True, exist_ok=True)
 
+recorded = []
+
 async def main():
-    # Runtime-agnostic PORT (#3159): the adaptor no longer writes
-    # .claude/settings.json directly; it routes mcpServers through
-    # ctx.register_mcp_server, and the active runtime's renderer writes the
-    # native config. Bind the real Claude renderer here so this test still
-    # verifies the end-to-end delivery path produces the expected file.
+    # codex PORT: the active codex renderer writes ~/.codex/config.toml. HOME is
+    # pinned to a temp dir by the Go harness so the codex renderer's $HOME lookup
+    # lands inside the sandbox.
     def register_mcp_server(name, spec):
-        render_for_runtime("claude_code", str(configs_dir), name, spec)
+        recorded.append({"name": name, "spec": spec})
+        render_for_runtime("codex", str(configs_dir), name, spec)
 
     ctx = InstallContext(
         configs_dir=configs_dir,
         workspace_id="test-ws",
-        runtime="claude_code",
+        runtime="codex",
         plugin_root=plugin_root,
         register_mcp_server=register_mcp_server,
     )
-    adaptor = MCPServerAdaptor("molecule-platform-mcp", "claude_code")
+    adaptor = MCPServerAdaptor("molecule-platform-mcp", "codex")
     await adaptor.install(ctx)
 
 asyncio.run(main())
+print("RECORDER=" + json.dumps(recorded))
 `
 
 	configsDir := t.TempDir()
 	pluginRoot := t.TempDir()
+	homeDir := t.TempDir()
+	writePlatformFragment(t, contract, pluginRoot)
 
+	// Pin HOME so the codex renderer's ~/.codex/config.toml lands in the sandbox.
+	stdout := runMCPAdaptorHarness(t, pyScript, pluginRoot, configsDir, []string{"HOME=" + homeDir})
+
+	// The PORT must have been called (same keystone guard, codex side).
+	recorded := parseRecorder(t, stdout)
+	if len(recorded) != 1 || recorded[0].Name != "molecule-platform" {
+		t.Fatalf("codex: register_mcp_server PORT not called with the platform server: recorded=%v", recorded)
+	}
+
+	// codex native config must declare [mcp_servers.molecule-platform] + env.
+	codexConfig := filepath.Join(homeDir, ".codex", "config.toml")
+	tomlBytes, err := os.ReadFile(codexConfig)
+	if err != nil {
+		t.Fatalf("codex config not produced at %s: %v\n"+
+			"A hard-coded Claude write (the #3159 bug) would mis-wire a codex concierge.", codexConfig, err)
+	}
+	toml := string(tomlBytes)
+	if !strings.Contains(toml, "[mcp_servers.molecule-platform]") {
+		t.Errorf("codex config missing [mcp_servers.molecule-platform] table:\n%s", toml)
+	}
+	if !strings.Contains(toml, "[mcp_servers.molecule-platform.env]") || !strings.Contains(toml, `MOLECULE_MCP_MODE = "management"`) {
+		t.Errorf("codex config missing env MOLECULE_MCP_MODE=management:\n%s", toml)
+	}
+
+	// And the Claude settings.json must be ABSENT — proving the MCP did NOT get
+	// mis-routed to the Claude file on a codex runtime.
+	rel := strings.TrimPrefix(contract.SettingsPath, "/configs/")
+	claudeSettings := filepath.Join(configsDir, rel)
+	if _, err := os.Stat(claudeSettings); err == nil {
+		t.Errorf("codex runtime produced %s — the MCP was mis-routed to the Claude file (#3159 regression)", contract.SettingsPath)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", claudeSettings, err)
+	}
+}
+
+// recordedCall mirrors one ctx.register_mcp_server(name, spec) call captured by
+// the python spy and emitted as JSON.
+type recordedCall struct {
+	Name string         `json:"name"`
+	Spec map[string]any `json:"spec"`
+}
+
+// parseRecorder extracts the `RECORDER=[...]` JSON line the harness prints.
+func parseRecorder(t *testing.T, stdout string) []recordedCall {
+	t.Helper()
+	const marker = "RECORDER="
+	var payload string
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), marker) {
+			payload = strings.TrimSpace(line)[len(marker):]
+		}
+	}
+	if payload == "" {
+		t.Fatalf("harness did not emit a RECORDER= line; stdout:\n%s", stdout)
+	}
+	var calls []recordedCall
+	if err := json.Unmarshal([]byte(payload), &calls); err != nil {
+		t.Fatalf("parse RECORDER payload %q: %v", payload, err)
+	}
+	return calls
+}
+
+// writePlatformFragment writes the platform MCP plugin's settings-fragment.json.
+func writePlatformFragment(t *testing.T, contract *MCPPluginDeliveryContract, pluginRoot string) {
+	t.Helper()
 	fragment := map[string]any{
 		contract.Key: map[string]any{
 			"molecule-platform": map[string]any{
@@ -148,60 +309,48 @@ asyncio.run(main())
 	if err := os.WriteFile(filepath.Join(pluginRoot, "settings-fragment.json"), fragmentBytes, 0o644); err != nil {
 		t.Fatalf("write settings-fragment.json: %v", err)
 	}
+}
+
+// runMCPAdaptorHarness runs the given python harness against the REAL
+// molecule-ai-workspace-runtime MCPServerAdaptor and returns its stdout. extraEnv
+// entries (e.g. HOME=...) are appended to the child env. It fails the test (never
+// skips) when the runtime source can't be found — a skip here would re-introduce
+// the CR2 #12653 false-green where the Platform (Go) job passed without ever
+// exercising the real adaptor.
+func runMCPAdaptorHarness(t *testing.T, pyScript, pluginRoot, configsDir string, extraEnv []string) string {
+	t.Helper()
+
+	runtimePath := os.Getenv("MOLECULE_WORKSPACE_RUNTIME")
+	if runtimePath == "" {
+		repoRoot := filepath.Join("..", "..", "..")
+		sibling := filepath.Join(repoRoot, "molecule-ai-workspace-runtime")
+		if _, err := os.Stat(filepath.Join(sibling, "molecule_runtime", "plugins_registry", "builtins.py")); err == nil {
+			runtimePath = sibling
+		}
+	}
 
 	python := os.Getenv("MOLECULE_RUNTIME_PYTHON")
 	if python == "" {
 		python = "python3"
 	}
-	var pythonPath string
-	if runtimePath != "" {
-		pythonPath = runtimePath
-	}
 
 	cmd := exec.Command(python, "-", runtimePath, pluginRoot, configsDir)
 	cmd.Env = os.Environ()
-	if pythonPath != "" {
-		cmd.Env = append(cmd.Env, "PYTHONPATH="+pythonPath)
+	if runtimePath != "" {
+		cmd.Env = append(cmd.Env, "PYTHONPATH="+runtimePath)
 	}
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdin = strings.NewReader(strings.TrimSpace(pyScript))
-	var stderr bytes.Buffer
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		// CR2 #12653 fix: this test is the real-producer gate for the
-		// MCP-plugin delivery contract. The previous behavior of
-		// `t.Skipf` when runtimePath was empty turned the green Platform
-		// (Go) job into a false-green whenever the runtime wasn't
-		// checked out (HTTP 401 on the old `pip install ... || true` step).
-		// The skip counted as a pass, so the test was not actually
-		// exercising the real MCPServerAdaptor. A skip here is a
-		// production-blocking false-green; the test must FAIL so the
-		// missing runtime is visible in the gate.
 		if runtimePath == "" {
 			t.Fatalf("CR2 #12653: molecule-ai-workspace-runtime source not found — this test must exercise the REAL MCPServerAdaptor. "+
 				"Set MOLECULE_WORKSPACE_RUNTIME=/path/to/molecule-ai-workspace-runtime or check out the runtime as a sibling of the repo root. "+
-				"Underlying python error (if any): %v", err)
+				"Underlying python error (if any): %v\nstderr: %s", err, stderr.String())
 		}
 		t.Fatalf("run MCPServerAdaptor: %v\nstderr: %s", err, stderr.String())
 	}
-
-	rel := strings.TrimPrefix(contract.SettingsPath, "/configs/")
-	settingsPath := filepath.Join(configsDir, rel)
-	gotBytes, err := os.ReadFile(settingsPath)
-	if err != nil {
-		t.Fatalf("read produced settings at %s: %v", contract.SettingsPath, err)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(gotBytes, &got); err != nil {
-		t.Fatalf("parse produced settings: %v", err)
-	}
-	if _, ok := got[contract.Key]; !ok {
-		t.Fatalf("real MCPServerAdaptor produced settings missing contract key %q", contract.Key)
-	}
-	mcpServers, ok := got[contract.Key].(map[string]any)
-	if !ok {
-		t.Fatalf("real MCPServerAdaptor produced settings %q is not an object: %T", contract.Key, got[contract.Key])
-	}
-	if _, ok := mcpServers["molecule-platform"]; !ok {
-		t.Fatalf("real MCPServerAdaptor produced settings %q does not contain the molecule-platform entry", contract.Key)
-	}
+	return stdout.String()
 }
