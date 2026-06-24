@@ -713,10 +713,29 @@ def parse_branch_protection(body: Any) -> BranchProtection:
             raise BranchProtectionUnavailable(
                 "enable_status_check is true but status_check_contexts is empty"
             )
+    # FAIL-CLOSED approval floor (internal#3210 FIX-1).
+    #
+    # `required_approvals` is the genuine-approval bar consumed by
+    # evaluate_merge_readiness step 3. A degraded BP value here would silently
+    # weaken or zero that gate, so we clamp it UP to the default floor and never
+    # accept a value that lowers/skips it:
+    #
+    #   - bool: `isinstance(True, int)` is True in Python, so an upstream bool
+    #     True would coerce to int 1 and HALVE a 2-genuine bar to 1. Reject bool
+    #     explicitly → fall back to the default floor.
+    #   - 0 / negative: an admin lowering the bar, a Gitea migration/default
+    #     reset, or a blanked/restored BP record can yield 0 (or a negative that
+    #     passes a naive `< N` check). These must clamp UP to the default, NEVER
+    #     down/skip.
+    #   - valid positive int >= default: honored as-is (a stricter BP wins).
+    #
+    # max(int(approvals), REQUIRED_APPROVALS_DEFAULT) gives exactly this: the
+    # derived bar is never below the SSOT default floor.
     approvals = body.get("required_approvals")
-    required_approvals = (
-        int(approvals) if isinstance(approvals, int) else REQUIRED_APPROVALS_DEFAULT
-    )
+    if isinstance(approvals, bool) or not isinstance(approvals, int):
+        required_approvals = REQUIRED_APPROVALS_DEFAULT
+    else:
+        required_approvals = max(approvals, REQUIRED_APPROVALS_DEFAULT)
     return BranchProtection(
         required_contexts=contexts,
         required_approvals=required_approvals,
@@ -1420,7 +1439,21 @@ def evaluate_merge_readiness(
     #    bar, which a bot cannot satisfy by construction. Required
     #    approvals is forced to 0 for the check below when the exemption
     #    holds.
-    effective_required_approvals = 0 if runtime_bump_exempt else required_approvals
+    #
+    #    DEFENSIVE FLOOR (internal#3210 FIX-1, defence-in-depth). On the
+    #    NON-exempt path the bar can never legitimately be below 1 genuine
+    #    approval — a single upstream `required_approvals == 0` (degraded BP,
+    #    a caller that bypassed parse_branch_protection, a future refactor)
+    #    must NOT be able to zero the genuine-approval gate. parse_branch_
+    #    protection already clamps the derived value up to the default floor;
+    #    this is the second, independent guard at the consumption site so the
+    #    two would both have to fail to open the gate. The runtime-bump
+    #    exemption path is UNTOUCHED — it legitimately zeroes the HUMAN bar
+    #    (a bot cannot self-approve), and the floor must not break it.
+    if runtime_bump_exempt:
+        effective_required_approvals = 0
+    else:
+        effective_required_approvals = max(required_approvals, 1)
     if len(approvers) < effective_required_approvals:
         return MergeDecision(
             False, "wait",
