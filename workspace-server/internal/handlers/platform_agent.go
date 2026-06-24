@@ -34,6 +34,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/providers"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -622,6 +623,70 @@ func setProviderSecret(ctx context.Context, workspaceID, provider string) error 
 			SET encrypted_value = $2, encryption_version = $3, updated_at = now()
 	`, workspaceID, encrypted, version)
 	return err
+}
+
+// ensureCreatedWorkspaceProviderPin pins LLM_PROVIDER=platform on a freshly
+// CREATED workspace (the Create handler / `create_workspace` management-MCP
+// path) when, and ONLY when, its (runtime, model) derives to the closed
+// `platform` provider via the registry.
+//
+// Why this exists (the create_workspace NOT_CONFIGURED bug): the platform/root
+// concierge gets LLM_PROVIDER=platform from ensureConciergeProvider, but that
+// helper runs ONLY on the kind=platform provision path. A CHILD workspace the
+// concierge spawns via `create_workspace` goes through WorkspaceHandler.Create,
+// which persists MODEL (setModelSecret) but — since the internal#718 P4 closure
+// removed the unconditional setProviderSecret write — persists NO LLM_PROVIDER.
+// For a platform-managed model id like "moonshot/kimi-k2.6" the on-box runtime
+// re-derives the provider with its own slug-split (_derive_provider_from_model →
+// "moonshot", a model-PREFIX, NOT a registry provider NAME), so the claude-code
+// adapter fail-closes: "workspace config picks provider='moonshot' but it is not
+// in the providers registry" → the child boots online but NOT_CONFIGURED. This
+// is the exact symptom ensureConciergeProvider was added to cure for the root;
+// children created via create_workspace need the same env-level pin.
+//
+// The pin is gated on the registry-DERIVED provider being `platform`
+// (providers.Manifest.DeriveProvider → IsPlatform), NOT on a model-prefix string
+// or on the parent being platform-managed. This:
+//   - is parent-independent and not moonshot-specific (any platform-managed
+//     model id whose registry derivation is `platform` gets the pin);
+//   - leaves BYOK / OAuth / self-host children UNTOUCHED — their model derives to
+//     a real provider entry (anthropic-oauth, minimax, kimi-coding, …) the
+//     runtime resolves correctly on its own, so pinning would be wrong. Mirrors
+//     ensureConciergeProvider's `IsPlatform` gate (it only ever pins `platform`).
+//
+// availableAuthEnv is the auth-env-var NAMES present in the create payload's
+// secrets — the same disambiguation input DeriveProvider uses elsewhere — so a
+// BYOK create that carries vendor keys derives to its real provider (not
+// platform) and is correctly skipped. Best-effort + non-fatal: a derive miss or
+// a persist error logs and returns; the workspace row stays consistent and the
+// (unchanged) downstream provision validation still applies.
+func ensureCreatedWorkspaceProviderPin(ctx context.Context, workspaceID, runtime, model string, secretKeys []string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	m, err := providerRegistry()
+	if err != nil || m == nil {
+		log.Printf("Create workspace %s: provider registry unavailable; cannot pin LLM_PROVIDER (non-fatal): %v", workspaceID, err)
+		return
+	}
+	prov, derr := m.DeriveProvider(runtime, model, secretKeys)
+	if derr != nil {
+		// Unknown/ambiguous (runtime, model) — the create-boundary registry
+		// gates already let this through (e.g. federated/unknown runtimes), and
+		// a non-derivable model is not platform-managed by construction. No pin.
+		return
+	}
+	if !prov.IsPlatform() {
+		// BYOK / OAuth / self-host: the model derives to a real provider entry
+		// the runtime resolves on its own. Pinning here would mis-route.
+		return
+	}
+	if setErr := setProviderSecret(ctx, workspaceID, providers.PlatformProviderName); setErr != nil {
+		log.Printf("Create workspace %s: failed to pin LLM_PROVIDER=%s for platform-managed model %q: %v (non-fatal)", workspaceID, providers.PlatformProviderName, model, setErr)
+		return
+	}
+	log.Printf("Create workspace %s: pinned LLM_PROVIDER=%s for platform-managed model %q (create_workspace child config completeness)", workspaceID, providers.PlatformProviderName, model)
 }
 
 // EnsureSelfHostedPlatformAgent installs the org's platform agent (the concierge,
