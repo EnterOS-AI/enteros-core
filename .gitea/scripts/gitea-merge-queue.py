@@ -1636,15 +1636,26 @@ def _snapshot_status_for_sha(sha: str) -> dict | None:
     return None
 
 
-def get_combined_status(sha: str) -> dict:
+def get_combined_status(sha: str, *, prefer_live: bool = False) -> dict:
     """Combined status + all individual statuses for `sha`.
 
     Uses the conductor snapshot when available (same tick, same observed
     state as the merge-queue pass), otherwise self-fetches via API.
+
+    `prefer_live=True` BYPASSES the snapshot entirely and always self-fetches
+    the LIVE state from the Gitea status API. The cheap enumeration/scan pass
+    (the decision) reads the snapshot for throughput, but the FINAL pre-merge
+    re-check (internal#3210 — process_once, immediately before merge_pull)
+    needs ground truth: a required/enforced/critical context that flipped to
+    RED *within* the snapshot's freshness window — AFTER the snapshot was
+    captured but before this tick acts — is still GREEN in the snapshot, so a
+    snapshot read here would re-confirm a stale green and merge a now-red PR.
+    A live read closes that within-window staleness gap to ~0.
     """
-    snapshot_status = _snapshot_status_for_sha(sha)
-    if snapshot_status is not None:
-        return snapshot_status
+    if not prefer_live:
+        snapshot_status = _snapshot_status_for_sha(sha)
+        if snapshot_status is not None:
+            return snapshot_status
 
     _, combined = api("GET", f"/repos/{OWNER}/{NAME}/commits/{sha}/status")
     if not isinstance(combined, dict):
@@ -1867,6 +1878,58 @@ def merge_pull(pr_number: int, *, dry_run: bool, force: bool = False) -> None:
         raise  # re-raise other ApiErrors unchanged
 
 
+def live_premerge_status_regressions(
+    head_sha: str,
+    *,
+    required_contexts: list[str],
+    enforced_file_contexts: list[str],
+) -> list[str]:
+    """internal#3210 — final pre-merge re-check against LIVE status.
+
+    The merge decision (`evaluate_merge_readiness`) may run its status gates
+    against the conductor SNAPSHOT, which is trusted while it is within its
+    freshness window. But a required/enforced/critical context can flip to RED
+    *inside* that window — AFTER the snapshot was captured — and still read
+    GREEN from the snapshot. `process_once` only re-checks that MAIN has not
+    moved before the merge POST; it does NOT re-verify the candidate's own
+    statuses live. This re-fetches the candidate head's combined status with
+    the snapshot BYPASSED (`prefer_live=True`) and re-runs the SAME status
+    gates the decision used:
+
+      * critical_contexts_block (CRITICAL_REQUIRED_CONTEXT_PREFIXES),
+      * required_contexts_green(live_latest, required_contexts),
+      * enforced_file_contexts_green(live_latest, enforced) — only if the
+        enforced set is non-empty (matches evaluate_merge_readiness step 4b).
+
+    Returns a list of human-readable regression reasons (now red/missing where
+    the decision saw green). An EMPTY list means LIVE state still satisfies
+    every status gate and the merge may proceed. Any non-empty list means the
+    candidate must be SKIPPED (treated as `wait`, never merged) this tick.
+
+    This does NOT re-do the approvals / REQUEST_CHANGES / mergeable gates —
+    those are not snapshot-sourced status flips and process_once already holds
+    them via the decision. It re-runs ONLY the status-context gates, which are
+    exactly the ones the snapshot can stale.
+    """
+    live_status = get_combined_status(head_sha, prefer_live=True)
+    live_latest = latest_statuses_by_context(live_status.get("statuses") or [])
+
+    regressions: list[str] = []
+    # Same order evaluate_merge_readiness checks: critical first (force cannot
+    # bypass), then BP+governance required, then the enforced-file SSOT set.
+    critical_block = critical_contexts_block(live_latest)
+    if critical_block:
+        regressions.extend(critical_block)
+    ok, bad = required_contexts_green(live_latest, required_contexts)
+    if not ok:
+        regressions.extend(bad)
+    if enforced_file_contexts:
+        efok, efbad = enforced_file_contexts_green(live_latest, enforced_file_contexts)
+        if not efok:
+            regressions.extend(efbad)
+    return regressions
+
+
 def process_once(*, dry_run: bool = False) -> int:
     # Required status contexts come from BRANCH PROTECTION, not a hand-kept env
     # list. Fail-closed: if BP cannot be enumerated, HOLD the whole tick rather
@@ -2025,6 +2088,30 @@ def process_once(*, dry_run: bool = False) -> int:
                     "deferring to next tick"
                 )
                 return 0
+            # FINAL pre-merge re-check against LIVE status (internal#3210).
+            # The decision above may have run its status gates against the
+            # conductor snapshot; a required/enforced/critical context can
+            # flip to RED within the snapshot's freshness window AFTER it was
+            # captured and still read GREEN there. Re-fetch this candidate's
+            # head statuses live (snapshot BYPASSED) and re-run the SAME
+            # status gates. On ANY regression, SKIP this PR (treat as wait —
+            # never merge a snapshot-green-but-now-red head) and keep scanning
+            # so a genuinely-ready PR behind it can still merge this tick. One
+            # extra GET, only for the single candidate about to merge.
+            head_sha = ctx.get("head_sha")
+            if isinstance(head_sha, str) and head_sha:
+                regressions = live_premerge_status_regressions(
+                    head_sha,
+                    required_contexts=contexts,
+                    enforced_file_contexts=enforced_file_contexts,
+                )
+                if regressions:
+                    print(
+                        f"::notice::PR #{pr_number} SKIPPED: live pre-merge "
+                        f"re-check found {', '.join(regressions)} "
+                        "(snapshot was stale)"
+                    )
+                    continue  # skip — keep scanning for a still-ready candidate
             try:
                 merge_pull(pr_number, dry_run=dry_run, force=decision.force)
             except MergePermissionError as exc:
@@ -2259,6 +2346,11 @@ def _evaluate_candidate(
     head_sha = pr.get("head", {}).get("sha")
     if not isinstance(head_sha, str) or len(head_sha) < 7:
         raise ApiError(f"PR #{pr_number} missing head sha")
+    # Surface the candidate head SHA so process_once can re-fetch its LIVE
+    # combined status immediately before the merge POST (internal#3210
+    # pre-merge re-check). The decision below may run against the conductor
+    # snapshot; the final gate must re-verify against ground truth.
+    ctx["head_sha"] = head_sha
     commits = get_pull_commits(pr_number)
     current_base = pr_has_current_base(pr, commits, main_sha)
     # Fail-closed: a failed status fetch raises here and propagates (the PR is
