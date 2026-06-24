@@ -65,39 +65,30 @@ func TestMCPPluginDeliveryContract_LoadableFromRepoRoot(t *testing.T) {
 	}
 }
 
-// TestMCPPluginDeliveryContract_MCPServerAdaptorWritesMcpServers asserts the
+// TestMCPPluginDeliveryContract_MCPServerAdaptorRoutesThroughPort asserts the
 // producer side of the contract by exercising the REAL production
-// MCPServerAdaptor from molecule-ai-workspace-runtime. It merges an MCP-server
-// plugin's settings-fragment.json into the exact settings_path and key pinned
-// by the contract. This catches real producer drift; the previous test-local
-// helper that modelled the adaptor has been removed.
-func TestMCPPluginDeliveryContract_MCPServerAdaptorWritesMcpServers(t *testing.T) {
+// MCPServerAdaptor from molecule-ai-workspace-runtime. The runtime#3159 PORT is
+// the delivery seam: the adaptor must route the molecule-platform descriptor
+// through ctx.register_mcp_server and must NOT write /configs/.claude/settings.json
+// directly (the legacy path that bypasses the PORT).
+func TestMCPPluginDeliveryContract_MCPServerAdaptorRoutesThroughPort(t *testing.T) {
 	contract, err := LoadMCPPluginDeliveryContract()
 	if err != nil {
 		t.Fatalf("load contract: %v", err)
 	}
 
 	// The python harness installs the REAL MCPServerAdaptor and binds a SPY for
-	// ctx.register_mcp_server. The spy (a) records every (name, spec) the adaptor
-	// routes through the PORT, then (b) renders via the real Claude renderer so
-	// the end-to-end file is still produced. It emits the recorded calls as a
+	// ctx.register_mcp_server. The spy ONLY records every (name, spec) the adaptor
+	// routes through the PORT; it deliberately does NOT render, so a direct
+	// .claude/settings.json write (the #3159 regression) would leave the recorder
+	// empty AND create the legacy file. The harness emits recorded calls as a
 	// JSON line `RECORDER=[...]` on stdout.
-	//
-	// KEYSTONE (Researcher RC 13562): the previous test only checked that the
-	// produced .claude/settings.json contained the mcpServers key. That
-	// false-greened — if MCPServerAdaptor regressed to writing
-	// .claude/settings.json DIRECTLY (the #3159 bug) instead of going through
-	// ctx.register_mcp_server, the file would still exist with the key and the
-	// test would still pass while the PORT was bypassed. We now ASSERT the spy
-	// captured exactly [(molecule-platform, spec)], so a direct-write regression
-	// (which never calls the spy) FAILS here.
 	pyScript := `
 import asyncio, json, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from molecule_runtime.plugins_registry.builtins import MCPServerAdaptor
 from molecule_runtime.plugins_registry.protocol import InstallContext
-from molecule_runtime.mcp_render import render_for_runtime
 
 plugin_root = Path(sys.argv[2])
 configs_dir = Path(sys.argv[3])
@@ -108,11 +99,10 @@ recorded = []
 async def main():
     # Runtime-agnostic PORT (#3159): the adaptor must route mcpServers through
     # ctx.register_mcp_server (it must NOT write .claude/settings.json directly).
-    # The spy records the call, then the active runtime's renderer writes the
-    # native config so the end-to-end delivery path is still exercised.
+    # The spy records the call and deliberately does not render, so a direct
+    # write regression is caught by both the empty recorder and the leftover file.
     def register_mcp_server(name, spec):
         recorded.append({"name": name, "spec": spec})
-        render_for_runtime("claude_code", str(configs_dir), name, spec)
 
     ctx = InstallContext(
         configs_dir=configs_dir,
@@ -152,23 +142,14 @@ print("RECORDER=" + json.dumps(recorded))
 		t.Errorf("register_mcp_server spec.env = %v, want MOLECULE_MCP_MODE=management", recorded[0].Spec["env"])
 	}
 
-	// (2) End-to-end: the produced Claude settings.json still has the key/entry.
+	// (2) The legacy /configs/.claude/settings.json must NOT be created by the
+	// adaptor itself. The PORT is the only legitimate delivery path.
 	rel := strings.TrimPrefix(contract.SettingsPath, "/configs/")
-	settingsPath := filepath.Join(configsDir, rel)
-	gotBytes, err := os.ReadFile(settingsPath)
-	if err != nil {
-		t.Fatalf("read produced settings at %s: %v", contract.SettingsPath, err)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(gotBytes, &got); err != nil {
-		t.Fatalf("parse produced settings: %v", err)
-	}
-	mcpServers, ok := got[contract.Key].(map[string]any)
-	if !ok {
-		t.Fatalf("real MCPServerAdaptor produced settings %q is not an object: %T", contract.Key, got[contract.Key])
-	}
-	if _, ok := mcpServers["molecule-platform"]; !ok {
-		t.Fatalf("real MCPServerAdaptor produced settings %q does not contain the molecule-platform entry", contract.Key)
+	claudeSettings := filepath.Join(configsDir, rel)
+	if _, err := os.Stat(claudeSettings); err == nil {
+		t.Errorf("MCPServerAdaptor wrote %s directly — it bypassed the PORT (#3159 regression)", contract.SettingsPath)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", claudeSettings, err)
 	}
 }
 
