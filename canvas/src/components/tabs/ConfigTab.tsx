@@ -394,6 +394,39 @@ const FALLBACK_RUNTIME_OPTIONS: RuntimeOption[] = [
   { value: "hermes", label: "Hermes", models: [], providers: [], registryBacked: false, registryProviders: [], registryModels: [] },
 ];
 
+// modelsForRuntime — the set of model slugs the backend will accept for a
+// runtime, sourced from the SAME server-served data the selector dropdown
+// renders. Registry-backed runtimes carry the registry's native model list
+// (registry_gen.go `Runtimes` map, surfaced as registry_models on GET
+// /templates); older / non-registry runtimes fall back to the template's
+// models[]. This is the canvas-side view of the (runtime, model) pairing the
+// workspace-server validates atomically on Save — keeping the two in sync is
+// what makes the on-runtime-change reset pick a model that won't 422.
+export function modelIdsForRuntime(opt: RuntimeOption | null | undefined): string[] {
+  if (!opt) return [];
+  const registryBacked = opt.registryBacked && opt.registryModels.length > 0;
+  const src = registryBacked
+    ? opt.registryModels.map((m) => m.id)
+    : opt.models.map((m) => m.id);
+  // Wildcard model ids (e.g. "openrouter/*") aren't concrete defaults — a
+  // wildcard runtime has no single safe auto-pick, so exclude them from the
+  // default-selection candidate set (the user types the id by hand).
+  return src.filter((id) => !!id && !id.includes("*"));
+}
+
+// defaultModelForRuntime — the model the form should reset to when the user
+// switches INTO this runtime. The first concrete registered model is a safe,
+// always-valid pick for the new (runtime, model) pair, eliminating the 422 +
+// silent-rollback the backend would otherwise return when the prior runtime's
+// model isn't registered for the newly-selected one. Empty string when the
+// runtime serves no concrete models (e.g. a template that ships none, or a
+// wildcard-only runtime) — the form then leaves the model blank and the
+// existing modelUnresolved / empty-model guards keep Save from sending an
+// invalid pair.
+export function defaultModelForRuntime(opt: RuntimeOption | null | undefined): string {
+  return modelIdsForRuntime(opt)[0] ?? "";
+}
+
 export function ConfigTab({ workspaceId }: Props) {
   const [config, setConfig] = useState<ConfigData>({ ...DEFAULT_CONFIG });
   const [originalYaml, setOriginalYaml] = useState("");
@@ -449,6 +482,11 @@ export function ConfigTab({ workspaceId }: Props) {
   // value to display. Used to show a "derived from environment" hint and to
   // block Save from appearing to wipe env-derived routing.
   const [modelSource, setModelSource] = useState<"workspace_secrets" | "unresolved" | null>(null);
+  // When a runtime change forces a model reset (the prior model isn't
+  // registered for the new runtime), record the {from,to} so the UI can show
+  // the user the swap happened instead of it being silent. Cleared on the next
+  // model edit or a runtime change that keeps the model valid.
+  const [modelResetNote, setModelResetNote] = useState<{ from: string; to: string } | null>(null);
   const successTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   useEffect(() => {
@@ -752,6 +790,48 @@ export function ConfigTab({ workspaceId }: Props) {
     setConfig((prev) => ({ ...prev, [key]: value }));
   };
 
+  // When the runtime changes, the previously-selected model is almost never
+  // registered for the NEW runtime — the backend validates the (runtime,
+  // model) pair atomically on Save and returns 422 (`model "X" is not a
+  // registered model for runtime "Y"`), after which the runtime silently
+  // rolls back and the user thinks nothing changed. We pre-empt that here by
+  // resetting the model to a valid default for the new runtime (the first
+  // concrete registered model), so the form can never submit an invalid pair.
+  // The model dropdown is already constrained to the new runtime's models
+  // because it derives its options from selectedRuntime. `provider` is also
+  // cleared so the back-derived provider re-resolves from the new model.
+  // modelResetNote surfaces the reset so it isn't silent.
+  const handleRuntimeChange = (nextRuntime: string) => {
+    const nextOption = runtimeOptions.find((o) => o.value === nextRuntime) ?? null;
+    setConfig((prev) => {
+      if ((prev.runtime || "") === nextRuntime) return prev;
+      const prevModelId = prev.runtime_config?.model || prev.model || "";
+      const nextModel = defaultModelForRuntime(nextOption);
+      // Only announce a reset when the model actually had to change (the old
+      // model isn't valid for the new runtime). If the old model happens to be
+      // registered for the new runtime too, keep it and stay quiet.
+      const stillValid =
+        !!prevModelId && modelIdsForRuntime(nextOption).includes(prevModelId);
+      const resolvedModel = stillValid ? prevModelId : nextModel;
+      if (!stillValid && prevModelId && resolvedModel !== prevModelId) {
+        setModelResetNote({ from: prevModelId, to: resolvedModel });
+      } else {
+        setModelResetNote(null);
+      }
+      return {
+        ...prev,
+        runtime: nextRuntime,
+        // Mirror into both top-level + nested so currentModelId (which reads
+        // runtime_config.model first) and the YAML Save path stay consistent.
+        model: resolvedModel,
+        runtime_config: { ...(prev.runtime_config ?? {}), model: resolvedModel },
+      };
+    });
+    // The provider override is derived from (runtime, model); clear the local
+    // hint so it re-derives from the freshly-reset model.
+    setProvider("");
+  };
+
   const updateNested = <K extends keyof ConfigData>(key: K, subKey: string, value: unknown) => {
     setConfig((prev) => ({
       ...prev,
@@ -940,7 +1020,47 @@ export function ConfigTab({ workspaceId }: Props) {
   // an empty /model PUT), but it is confusing and can stall the user on other
   // fields without surfacing why. Block save until a model is picked.
   const modelUnresolved = modelSource === "unresolved" && !currentModelId;
-  const canSave = isDirty && !modelUnresolved;
+  // Hard guard against submitting an invalid (runtime, model) pair. The
+  // workspace-server validates the pair atomically on Save and 422s +
+  // silently rolls back the runtime when the model isn't registered for it.
+  // The runtime-change reset normally keeps the pair valid; this is the
+  // belt-and-suspenders for the raw-YAML edit path, where a user can hand-
+  // type a runtime/model mismatch the selector would never produce.
+  //
+  // Only enforced for REGISTRY-BACKED runtimes, whose served model set is the
+  // exhaustive registered list (registry_gen.go `Runtimes`) — there, a model
+  // outside the set is GUARANTEED to 422. Non-registry runtimes (hermes free-
+  // text, custom-escape) keep the existing permissive behavior: their served
+  // list isn't authoritative, so a hand-entered slug may still be valid and
+  // blocking it would break the legitimate power-user path.
+  //
+  // In raw-YAML mode the pair is read from the draft (the user can hand-type a
+  // runtime/model mismatch there); in form mode it's the live config. Either
+  // way the runtime must be re-resolved against its option so the registered
+  // set matches what the user actually typed, not the form's prior runtime.
+  const effectivePair = useMemo(() => {
+    if (rawMode) {
+      const parsed = parseYaml(rawDraft) as {
+        runtime?: string;
+        model?: string;
+        runtime_config?: { model?: string };
+      };
+      return {
+        runtime: (parsed.runtime || "").trim(),
+        model: (parsed.runtime_config?.model || parsed.model || "").trim(),
+      };
+    }
+    return { runtime: config.runtime || "", model: currentModelId };
+  }, [rawMode, rawDraft, config.runtime, currentModelId]);
+  const effectiveRuntimeOption =
+    runtimeOptions.find((o) => o.value === effectivePair.runtime) ?? null;
+  const registeredModelIds = modelIdsForRuntime(effectiveRuntimeOption);
+  const modelPairInvalid =
+    (effectiveRuntimeOption?.registryBacked ?? false) &&
+    registeredModelIds.length > 0 &&
+    !!effectivePair.model &&
+    !registeredModelIds.includes(effectivePair.model);
+  const canSave = isDirty && !modelUnresolved && !modelPairInvalid;
 
   if (loading) {
     return <div className="p-4 text-xs text-ink-mid">Loading config...</div>;
@@ -1019,7 +1139,7 @@ export function ConfigTab({ workspaceId }: Props) {
               <select
                 id={runtimeId}
                 value={config.runtime || ""}
-                onChange={(e) => update("runtime", e.target.value)}
+                onChange={(e) => handleRuntimeChange(e.target.value)}
                 className="w-full bg-surface-card border border-line rounded px-2 py-1 text-xs text-ink focus:outline-none focus:border-accent"
               >
                 {runtimeOptions.map((opt) => (
@@ -1027,6 +1147,24 @@ export function ConfigTab({ workspaceId }: Props) {
                 ))}
               </select>
             </div>
+            {/* Make the runtime-change model reset VISIBLE. The backend
+                validates the (runtime, model) pair atomically — switching
+                runtime would otherwise 422 on the stale model and silently
+                roll the runtime back. We reset the model to a registered
+                default here and tell the user so the change isn't mysterious. */}
+            {modelResetNote && (
+              <div
+                role="status"
+                aria-live="polite"
+                data-testid="model-reset-note"
+                className="px-2 py-1.5 bg-surface-sunken/50 border border-warm/40 rounded text-[10px] text-ink-mid"
+              >
+                Model reset to{" "}
+                <code className="font-mono text-ink">{modelResetNote.to}</code>{" "}
+                because <code className="font-mono">{modelResetNote.from}</code>{" "}
+                isn&apos;t available for this runtime.
+              </div>
+            )}
             {/* core#2594: env-resolved workspaces have no stored model/provider.
                 Surface that clearly so users don't see empty required dropdowns
                 on a healthy workspace, and can't hit Save expecting it to stay
@@ -1051,6 +1189,9 @@ export function ConfigTab({ workspaceId }: Props) {
                 value={selectorValue}
                 onChange={(next) => {
                   setSelectorValue(next);
+                  // The user is explicitly choosing a model now — dismiss the
+                  // runtime-change reset notice so it doesn't linger.
+                  setModelResetNote(null);
                   // Platform-managed providers (CP LLM proxy) do NOT
                   // require tenant-supplied credentials. Skip injecting
                   // their auth_env (e.g. MOLECULE_LLM_USAGE_TOKEN) into
