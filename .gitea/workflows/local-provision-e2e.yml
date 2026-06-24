@@ -367,13 +367,13 @@ jobs:
     if: ${{ always() }}
     # Tracker for lint-continue-on-error-tracking (Tier 2e / internal#350): this
     # mask has a forced 14-day renewal cycle. mc#2408 is the decision /
-    # promotion-criteria issue; mc#3177 is the current renewal tracker
-    # (mc#2408 was 16d old, past the 14d cap, would fail the lint). Per
+    # promotion-criteria issue; mc#3230 is the current renewal tracker
+    # (mc#3177 expired 2026-06-23, past the 14d cap, would fail the lint). Per
     # mc#2408, the fail-soft mask is KEEP until the docker-host runner
     # pool reliably builds the template + reaches api.minimax.io AND
     # MOLECULE_STAGING_MINIMAX_API_KEY is stably available — at which point
     # the gate promotes to required and the mask flips to false.
-    continue-on-error: true  # mc#3177: governance tracker — advisory MiniMax e2e; promote to gating when stable. Per mc#2408 (decision issue), fail-soft mask is KEEP until promotion. This mc#3177 tracker expires 14 days after 2026-06-23.
+    continue-on-error: true  # mc#3230: governance tracker — advisory MiniMax e2e; promote to gating when stable. Per mc#2408 (decision issue), fail-soft mask is KEEP until promotion. This mc#3230 tracker expires 14 days after 2026-06-24.
     timeout-minutes: 30
     env:
       PG_CONTAINER: pg-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
