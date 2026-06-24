@@ -153,10 +153,10 @@ type WorkspaceConfig struct {
 	TemplateAssetFetcher TemplateAssetFetcher
 
 	// Kind is the workspace kind: "" / "workspace" (ordinary) or "platform"
-	// (the org-level concierge / platform agent). When "platform", the local
-	// Docker provisioner prefers the platform-agent image variant (which bakes
-	// /opt/molecule-mcp-server so the org-admin platform MCP can load) over the
-	// plain runtime image. See models.KindPlatform + RFC
+	// (the org-level concierge / platform agent). The concierge runs on the
+	// plain per-runtime image — identity is delivered via the template
+	// asset-channel and the org-admin platform MCP via the plugin system, so no
+	// baked image variant is needed. See models.KindPlatform + RFC
 	// docs/design/rfc-platform-agent.md.
 	Kind string
 
@@ -688,21 +688,6 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 			}
 			image = builtTag
 			log.Printf("Provisioner: local-build mode → using locally-built image %s for runtime %s", image, cfg.Runtime)
-
-			// kind='platform' (the org concierge): prefer the platform-agent
-			// image variant, which bakes /opt/molecule-mcp-server so the
-			// org-admin platform MCP can load. Gated on the image being present
-			// — if an operator hasn't built it (Dockerfile.platform-agent), we
-			// fall back to the plain runtime image + log, so an ordinary local
-			// stack keeps working (the concierge just runs without org-admin
-			// tools, exactly as before this change). Never breaks normal
-			// workspaces (kind != platform) or the SaaS/CP path (handled in the
-			// control-plane provisioner — separate repo).
-			if cfg.Kind == WorkspaceKindPlatform {
-				if paTag, ok := resolvePlatformAgentImage(ctx, cfg.Runtime, image, nil); ok {
-					image = paTag
-				}
-			}
 		}
 	}
 

@@ -171,11 +171,11 @@ type cpProvisionRequest struct {
 	// from it. Empty = auto (omitted on the wire).
 	DataPersistence string `json:"data_persistence,omitempty"`
 	// Kind forwards the workspace kind ("" / "workspace" ordinary, "platform"
-	// = the org concierge) so the CP can select the platform-agent image
-	// variant — the SaaS mirror of the local Docker provisioner's kind-driven
-	// image preference (RFC docs/design/rfc-platform-agent.md; core#2495 SSOT:
-	// the concierge is a normal workspace provisioned through this same path,
-	// differing ONLY in image + config overlay). Omitted when empty so the
+	// = the org concierge) so the CP can apply the concierge's config overlay
+	// (RFC docs/design/rfc-platform-agent.md; core#2495 SSOT: the concierge is a
+	// normal workspace provisioned through this same path, differing ONLY in its
+	// config/identity overlay — it runs on the plain per-runtime image, with the
+	// platform MCP delivered via the plugin system). Omitted when empty so the
 	// wire shape is unchanged for ordinary workspaces; an older CP simply
 	// ignores the field.
 	Kind        string                 `json:"kind,omitempty"`
