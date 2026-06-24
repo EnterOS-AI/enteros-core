@@ -257,6 +257,41 @@ func validateBYOKCredentialSatisfiable(ctx context.Context, runtime, model strin
 		model, prov.Name, strings.Join(prov.AuthEnv, ", "))
 }
 
+// defaultModelForRuntime returns the runtime's DEFAULT registered model — the
+// first model id on the runtime's platform menu (ModelsForRuntime returns ids
+// in manifest-declared order, and the registry SSOT lists each runtime's
+// primary/default arm first; see registry_gen.go `Runtimes`). It is the model
+// the runtime-change auto-reset path falls back to when the workspace's current
+// model is orphaned (not registered) for the target runtime.
+//
+// Returns:
+//
+//	(model, true)  — the runtime is in the registry and exposes at least one
+//	                 registered model; `model` is its default.
+//	("",    false) — the registry is unavailable (build-time gate owns it),
+//	                 the runtime is not in the registry (federation /
+//	                 non-first-party), or the runtime exposes NO registered
+//	                 models (every native arm is name-only/BYOK). In all three
+//	                 cases the caller must NOT auto-reset (there is no safe
+//	                 platform default to reset to) — it leaves the model
+//	                 untouched and lets the existing validation decide.
+func defaultModelForRuntime(runtime string) (string, bool) {
+	m, err := providerRegistry()
+	if err != nil || m == nil {
+		return "", false
+	}
+	models, err := m.ModelsForRuntime(runtime)
+	if err != nil {
+		// Runtime not in the registry (federation / non-first-party).
+		return "", false
+	}
+	if len(models) == 0 {
+		// Registered runtime with no platform-menu models (all arms name-only).
+		return "", false
+	}
+	return models[0], true
+}
+
 // globalSecretKeyNames returns the tenant's global_secrets key names (never
 // values) and whether the scan succeeded. A query error returns (nil, false)
 // with a log line — the caller fails open and the provision preflight

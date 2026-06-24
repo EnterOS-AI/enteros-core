@@ -114,3 +114,26 @@ jobs:
         # contract (e.g. accepting skipped/failure as success, or re-inlining
         # the logic into ci.yml) fails CI.
         run: bash .gitea/scripts/tests/test_all_required_check.sh
+
+      - name: clone-manifest.sh tolerant-bootstrap contract (network-free)
+        # Regression lock for the strict/best-effort split in clone-manifest.sh:
+        # tokenless dev bootstrap must skip ONLY `private: true` repos and still
+        # hard-fail on any public-repo clone failure (so a real outage / bad ref
+        # is never swallowed as a missing-creds skip). git-stubbed, no network.
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+          # bash, not sh: the runner's /bin/sh is dash, and clone-manifest.sh
+          # (which this test drives) uses `set -o pipefail` — undefined in dash.
+          bash scripts/test-clone-manifest-tolerant.sh
+
+      - name: clone-manifest.sh provider-resolution contract (network-free)
+        # Regression lock for per-provider host+token resolution in clone-manifest.sh:
+        # provider absent ⇒ moleculesai (git.moleculesai.app + MOLECULE_GITEA_TOKEN),
+        # github ⇒ github.com + MOLECULE_GITHUB_TOKEN, unknown provider ⇒ fail-closed.
+        # git-stubbed, no network.
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+          # bash, not sh (see tolerant step above): clone-manifest.sh needs pipefail.
+          bash scripts/test-clone-manifest-provider.sh

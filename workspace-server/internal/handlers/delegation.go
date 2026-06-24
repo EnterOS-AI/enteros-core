@@ -805,13 +805,17 @@ func (h *DelegationHandler) ListDelegations(c *gin.Context) {
 
 // listDelegationsFromLedger queries the durable delegations table.
 // Returns nil on error so the caller can fall back to activity_logs.
+// Includes both outgoing (caller) and incoming (callee) delegations so
+// the canvas shows the full delegation history regardless of which side
+// the workspace played. A "direction" field distinguishes sent vs. received.
 func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, workspaceID string) []map[string]interface{} {
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT d.delegation_id, d.caller_id, d.callee_id, d.task_preview,
 		       d.status, d.result_preview, d.error_detail, d.last_heartbeat,
-		       d.deadline, d.created_at, d.updated_at
+		       d.deadline, d.created_at, d.updated_at,
+		       CASE WHEN d.caller_id = $1 THEN 'sent' ELSE 'received' END AS direction
 		FROM delegations d
-		WHERE d.caller_id = $1
+		WHERE d.caller_id = $1 OR d.callee_id = $1
 		ORDER BY d.created_at DESC
 		LIMIT 50
 	`, workspaceID)
@@ -824,13 +828,13 @@ func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, works
 
 	var result []map[string]interface{}
 	for rows.Next() {
-		var delegationID, callerID, calleeID, taskPreview, status string
+		var delegationID, callerID, calleeID, taskPreview, status, direction string
 		var resultPreview, errorDetail sql.NullString
 		var lastHeartbeat, deadline, createdAt, updatedAt *time.Time
 		if err := rows.Scan(
 			&delegationID, &callerID, &calleeID, &taskPreview,
 			&status, &resultPreview, &errorDetail, &lastHeartbeat,
-			&deadline, &createdAt, &updatedAt,
+			&deadline, &createdAt, &updatedAt, &direction,
 		); err != nil {
 			continue
 		}
@@ -838,6 +842,7 @@ func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, works
 			"delegation_id": delegationID,
 			"source_id":     callerID,
 			"target_id":     calleeID,
+			"direction":     direction,
 			"summary":       textutil.TruncateBytes(taskPreview, 200),
 			"status":        status,
 			"created_at":    createdAt,
@@ -868,19 +873,46 @@ func (h *DelegationHandler) listDelegationsFromLedger(ctx context.Context, works
 	return result
 }
 
+// listActivityLogsDelegationsQueryRegex is the sqlmock-anchor pattern
+// for the activity_logs predicate in listDelegationsFromActivityLogs.
+// Pinned to a package const so the (long, escaped) shape lives in one
+// place and the test layer doesn't have to copy-paste it. RC 11026
+// tightened the prior loose "SELECT .+ FROM activity_logs" regex to
+// require BOTH the OR predicate (workspace_id = $1 OR source_id = $1)
+// AND the method filter ('delegate', 'delegate_result'). Future
+// changes to the production SQL must update this regex in lockstep.
+//
+// Hoisted from the test file (RC 13435 Secret-scan RED on the inline
+// regex + new caller-side test fixture): the long escaped pattern
+// was the scanner's false-positive trigger. Keeping it as a named
+// const in the production package makes the intent obvious and
+// removes the copy-paste from both test cases.
+const listActivityLogsDelegationsQueryRegex = `SELECT .+ FROM activity_logs\s+WHERE \(workspace_id = \$1 OR source_id = \$1\) AND method IN \('delegate', 'delegate_result'\)`
+
 // listDelegationsFromActivityLogs is the legacy path that reconstructs
 // delegation state by folding activity_logs rows by delegation_id.
 // Kept for backward compatibility and for workspaces that never had
 // DELEGATION_LEDGER_WRITE=1 during their delegation lifecycle.
+//
+// Predicate: the row matches if the workspace is EITHER the actor
+// (source_id, fired the delegation) OR the owner of the activity log
+// (workspace_id, received a delegation). A source_id-only predicate
+// would exclude "received" rows that the same workspace owns but did
+// not fire (its session was the target of another workspace's
+// delegate call). RC 11026: this was the vacuous-test fallout — the
+// test fabricated a received row with source_id="ws-other" +
+// workspace_id="ws-1" and the previous WHERE source_id=$1 would
+// have silently excluded it in real SQL even though the unit test
+// passed (sqlmock regex was too loose to catch the shape).
 func (h *DelegationHandler) listDelegationsFromActivityLogs(ctx context.Context, workspaceID string) []map[string]interface{} {
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT id, activity_type, COALESCE(source_id::text, ''), COALESCE(target_id::text, ''),
 		       COALESCE(summary, ''), COALESCE(status, ''), COALESCE(error_detail, ''),
 		       COALESCE(response_body->>'text', response_body::text, ''),
 		       COALESCE(request_body->>'delegation_id', response_body->>'delegation_id', ''),
-		       created_at
+		       created_at, workspace_id
 		FROM activity_logs
-		WHERE workspace_id = $1 AND method IN ('delegate', 'delegate_result')
+		WHERE (workspace_id = $1 OR source_id = $1) AND method IN ('delegate', 'delegate_result')
 		ORDER BY created_at DESC
 		LIMIT 50
 	`, workspaceID)
@@ -891,16 +923,31 @@ func (h *DelegationHandler) listDelegationsFromActivityLogs(ctx context.Context,
 
 	var result []map[string]interface{}
 	for rows.Next() {
-		var id, actType, sourceID, targetID, summary, status, errorDetail, responseBody, delegationID string
+		var id, actType, sourceID, targetID, summary, status, errorDetail, responseBody, delegationID, actWorkspaceID string
 		var createdAt time.Time
-		if err := rows.Scan(&id, &actType, &sourceID, &targetID, &summary, &status, &errorDetail, &responseBody, &delegationID, &createdAt); err != nil {
+		if err := rows.Scan(&id, &actType, &sourceID, &targetID, &summary, &status, &errorDetail, &responseBody, &delegationID, &createdAt, &actWorkspaceID); err != nil {
 			continue
+		}
+		direction := "sent"
+		// RC 13430: compute direction from the QUERYING
+		// workspace's perspective, not from the row owner's
+		// perspective. A row whose source_id equals the querying
+		// workspaceID is a delegation that workspace FIRED (sent),
+		// even if the activity_log row happens to be owned by
+		// the callee (i.e. a callee-owned row whose source_id
+		// matches $1). The previous owner-vs-source check
+		// (`actWorkspaceID != sourceID`) mis-labeled such rows as
+		// received, mixing the caller's sent history with the
+		// callee's received view in the same call.
+		if sourceID != workspaceID {
+			direction = "received"
 		}
 		entry := map[string]interface{}{
 			"id":         id,
 			"type":       actType,
 			"source_id":  sourceID,
 			"target_id":  targetID,
+			"direction":  direction,
 			"summary":    summary,
 			"status":     status,
 			"created_at": createdAt,

@@ -6,6 +6,22 @@
 **This document is the single source of truth (SSOT) for the feature.** Code, OpenAPI, the platform
 MCP, and end-user docs reconcile to this RFC — not to each other.
 
+> **Superseded in part by [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md).**
+> The conceptual model in this RFC (platform agent as the org root, `kind` discriminator,
+> default-target resolver, approval gate, billing/model parity) still stands. What has changed is
+> the **delivery mechanism for the management MCP and the concierge identity**:
+> - The management MCP is now delivered as an **entitlement-gated MCP plugin** (the plugin
+>   declaration in `config.yaml: plugins:` is the SSOT), **not** via a `config.yaml: mcp_servers:`
+>   list (§5.5) and **not** via a dedicated baked image (§5.7).
+> - The concierge persona/config/model is a **platform-agent template** (see
+>   [`rfc-decouple-config-skill-delivery.md`](rfc-decouple-config-skill-delivery.md) §10a),
+>   not core string literals or a baked image.
+> - The platform agent is **runtime-switchable** (claude-code is the default, not a hard
+>   requirement); the baked `molecule-platform-agent` image is **retired**.
+>
+> Sections below tagged *(superseded by rfc-platform-mcp-as-plugin)* are retained for history;
+> defer to that RFC for the MCP-delivery, image, and runtime-switchability shape.
+
 ---
 
 ## 1. Summary
@@ -122,7 +138,17 @@ caller's `orgRootID()` and return it iff `kind='platform'`. This is the server h
 targets by default; no change to `ProxyA2A`. **Authored in the OpenAPI SSOT first**; MCP/CLI/docs
 derive from it.
 
-### 5.5 Runtime: two MCPs, config-driven
+### 5.5 Runtime: two MCPs, config-driven *(superseded by rfc-platform-mcp-as-plugin)*
+
+> **Superseded by [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md).** This section
+> proposed a dedicated `config.yaml: mcp_servers:` list as the wiring channel for the management MCP.
+> That is the redundant/competing path: the management MCP is now delivered as an **MCP plugin**,
+> and the **plugin declaration (`config.yaml: plugins:`) is the SSOT** — there is no separate
+> `mcp_servers:` list. The plugin carries a runtime-agnostic MCP descriptor; the per-runtime
+> **shape adapter** renders it into the runtime's native MCP config (claude `.claude/settings.json`,
+> codex `~/.codex/config.toml`, gemini `~/.gemini/settings.json`, hermes `platforms.*`). This also
+> drops the hardcoded `runtime: claude-code` below — the platform agent is runtime-switchable
+> (claude-code is just the default). The original text is retained for history.
 
 Make the runtime's `mcp_servers` **config-driven** rather than hardcoded:
 - `molecule_runtime/config.py`: add `extra_mcp_servers: list[dict]` to `WorkspaceConfig`, read
@@ -149,6 +175,11 @@ env (passed through to the stdio child) — no per-server `env` block needed.
 
 ### 5.6 Hosting & provisioning (tenant EC2 container)
 
+> Note: per [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md), `<platform-agent-image>`
+> below is now the **standard runtime image** (claude-code by default, runtime-switchable), not a
+> dedicated baked image; the management MCP arrives via the entitlement-gated plugin installed
+> post-online, not baked into the image.
+
 In `ec2.go:buildTenantUserDataSM()` add a `start_platform_agent` stage **after** `wait_platform_health`
 (the agent registers against `localhost:8080` on boot):
 
@@ -166,7 +197,17 @@ docker run -d --restart=always --name molecule-platform-agent --network host \
 - `--restart=always` provides Docker-level supervision (matches `molecule-tenant`).
 - Mirror the block into the redeploy path (`buildRedeployScript`) so existing tenants backfill it.
 
-### 5.7 Image
+### 5.7 Image *(superseded by rfc-platform-mcp-as-plugin)*
+
+> **Superseded by [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md): the dedicated
+> `molecule-platform-agent` image is RETIRED.** Because the management MCP now ships as a plugin
+> (launched on demand, e.g. `npx -y @molecule-ai/mcp-server`), there is **no baked binary** to bake
+> into a special image — the standard runtime image (claude-code by default, or any switchable
+> runtime) + the entitlement-gated platform-MCP plugin **is** the concierge. The original
+> security hygiene goal ("keep the org-admin MCP out of ordinary workspace images") is now met by
+> the **entitlement gate** (the privileged plugin installs only on the org-root `kind=platform`
+> concierge, enforced server-side) rather than by image separation. The original text is retained
+> for history.
 
 A **dedicated `molecule-platform-agent` image**: `FROM workspace-template-claude-code`, `COPY` the
 prebuilt `molecule-mcp-server/dist` + `node_modules` into `/opt/molecule-mcp-server`, and **pin Node
@@ -227,8 +268,11 @@ end-user chat. Mitigations:
 - **Approval gate (§5.8)** must ship *with* the agent going user-facing, not after. Until then the
   agent is operator-only.
 - **Tenant isolation** is unchanged — every reach path still passes `sameOrg()`.
-- **MCP not in workspace images** (dedicated image, §5.7); the admin token lives only in the
-  platform-agent container env on the tenant box.
+- **MCP not on ordinary workspaces** — originally via a dedicated image (§5.7); now enforced by the
+  **entitlement gate** (the privileged management-MCP plugin installs only on the org-root
+  `kind=platform` concierge — see [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md) §4).
+  The admin token lives only in the platform-agent container env on the tenant box and is
+  *referenced* by the plugin, never embedded.
 - **Token rotation:** the MCP reads env once at spawn → rotation = `docker restart
   molecule-platform-agent` (runbook item).
 - Future: a scoped-down org token (no delete/billing/member) — see §10.
@@ -251,9 +295,14 @@ Phase ordering is the rollout contract:
    constants; `Register` accepts/validates `kind` with invariants.
 1. **Platform-as-root + resolver** (`molecule-core` + CP): CP pre-seeds the platform row and creates
    teams under it; per-org re-parent backfill (after the §8 audit); `GET /registry/platform-agent`.
-2. **Config-driven two-MCP runtime** (runtime + claude-code template).
-3. **Image + tenant provisioning** (CP + image + `molecule-ci`): dedicated image; `start_platform_agent`
-   in user-data + redeploy; config via the tenant Secrets Manager bundle; billing knob.
+2. **Management MCP via plugin** (runtime + template) — *revised per
+   [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md)*: the template declares the
+   entitlement-gated platform-MCP plugin in `config.yaml: plugins:`; the per-runtime shape adapter
+   wires it into the runtime's native MCP config post-online. (Was: a config-driven `mcp_servers:`
+   list, superseded.)
+3. **Tenant provisioning** (CP + `molecule-ci`) — *revised*: the **standard runtime image** (no
+   dedicated `molecule-platform-agent` image); `start_platform_agent` in user-data + redeploy;
+   identity/config via the template asset channel; billing knob.
 4. **Approval gate** (`molecule-core`): policy map + `requireApproval` at destructive handlers; OpenAPI
    202 shape.
 5. **Dashboard concierge UX** (`molecule-app`): design-first, then build against the resolver.

@@ -15,7 +15,7 @@
  *   - aria-modal="false" — canvas stays interactive
  */
 import React from "react";
-import { render, screen, fireEvent, cleanup, act, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "../SettingsPanel";
 
@@ -120,35 +120,45 @@ describe("SettingsPanel — closed by default", () => {
 // ─── Open / close ──────────────────────────────────────────────────────────
 
 describe("SettingsPanel — open / close", () => {
-  it("renders SecretsTab when panel is open", () => {
+  it("renders SecretsTab when panel is open", async () => {
     storeState.isPanelOpen = true;
-    render(<SettingsPanel workspaceId="ws-xyz" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-xyz" />);
+    });
     expect(screen.getByTestId("secrets-tab")).toBeTruthy();
     expect(screen.getByText(/workspaceId=ws-xyz/i)).toBeTruthy();
   });
 
-  it("renders TokensTab tab in tabs list", () => {
+  it("renders TokensTab tab in tabs list", async () => {
     storeState.isPanelOpen = true;
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     expect(screen.getByRole("tab", { name: /workspace tokens/i })).toBeTruthy();
   });
 
-  it("renders Org API Keys tab in tabs list", () => {
+  it("renders Org API Keys tab in tabs list", async () => {
     storeState.isPanelOpen = true;
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     expect(screen.getByRole("tab", { name: /org api keys/i })).toBeTruthy();
   });
 
-  it("Secrets tab is default active", () => {
+  it("Secrets tab is default active", async () => {
     storeState.isPanelOpen = true;
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     expect(screen.getByTestId("secrets-tab")).toBeTruthy();
     expect(screen.getByRole("tab", { name: /secrets/i }).getAttribute("data-state")).toBe("active");
   });
 
-  it("Tokens tab trigger exists with correct aria attributes", () => {
+  it("Tokens tab trigger exists with correct aria attributes", async () => {
     storeState.isPanelOpen = true;
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     const tab = screen.getByRole("tab", { name: /workspace tokens/i });
     // Radix Tabs.Trigger has role="tab" and aria-selected
     expect(tab).toBeTruthy();
@@ -159,16 +169,20 @@ describe("SettingsPanel — open / close", () => {
     expect(tab.getAttribute("data-state")).not.toBe("active");
   });
 
-  it("Close button calls closePanel", () => {
+  it("Close button calls closePanel", async () => {
     storeState.isPanelOpen = true;
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
     expect(mockClosePanel).toHaveBeenCalled();
   });
 
-  it("calls fetchSecrets(workspaceId) when panel opens", () => {
+  it("calls fetchSecrets(workspaceId) when panel opens", async () => {
     storeState.isPanelOpen = true;
-    render(<SettingsPanel workspaceId="ws-fetch-test" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-fetch-test" />);
+    });
     expect(mockFetchSecrets).toHaveBeenCalledWith("ws-fetch-test");
   });
 });
@@ -176,26 +190,32 @@ describe("SettingsPanel — open / close", () => {
 // ─── Unsaved changes guard ──────────────────────────────────────────────────
 
 describe("SettingsPanel — unsaved changes guard", () => {
-  it("shows guard when panel closing with isAddFormOpen=true", () => {
+  it("shows guard when panel closing with isAddFormOpen=true", async () => {
     storeState.isPanelOpen = true;
     storeState.isAddFormOpen = true;
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
     expect(screen.getByTestId("unsaved-guard")).toBeTruthy();
   });
 
-  it("guard shows when editingKey is set (dirty form)", () => {
+  it("guard shows when editingKey is set (dirty form)", async () => {
     storeState.isPanelOpen = true;
     storeState.editingKey = "GITHUB_TOKEN";
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
     expect(screen.getByTestId("unsaved-guard")).toBeTruthy();
   });
 
-  it("'Keep editing' closes guard but panel stays open", () => {
+  it("'Keep editing' closes guard but panel stays open", async () => {
     storeState.isPanelOpen = true;
     storeState.editingKey = "GITHUB_TOKEN";
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     // Trigger close attempt
     fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
     expect(screen.getByTestId("unsaved-guard")).toBeTruthy();
@@ -206,28 +226,34 @@ describe("SettingsPanel — unsaved changes guard", () => {
     expect(screen.getByTestId("secrets-tab")).toBeTruthy();
   });
 
-  it("'Discard' button on guard calls closePanel", () => {
+  it("'Discard' button on guard calls closePanel", async () => {
     storeState.isPanelOpen = true;
     storeState.isAddFormOpen = true;
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
     fireEvent.click(screen.getByTestId("guard-discard"));
     expect(mockClosePanel).toHaveBeenCalled();
   });
 });
 
-// ─── Accessibility ──────────────────────────────────────────────────────────
+// ─── Accessibility ─────────────────────────────────────────────────────────
 
 describe("SettingsPanel — accessibility", () => {
-  it("Dialog.Content has aria-label='Settings: API Keys'", () => {
+  it("Dialog.Content has aria-label='Settings: API Keys'", async () => {
     storeState.isPanelOpen = true;
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     expect(document.querySelector('[aria-label="Settings: API Keys"]')).toBeTruthy();
   });
 
-  it("TabList has aria-label='Settings sections'", () => {
+  it("TabList has aria-label='Settings sections'", async () => {
     storeState.isPanelOpen = true;
-    render(<SettingsPanel workspaceId="ws-1" />);
+    await act(async () => {
+      render(<SettingsPanel workspaceId="ws-1" />);
+    });
     expect(document.querySelector('[aria-label="Settings sections"]')).toBeTruthy();
   });
 });

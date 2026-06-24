@@ -112,8 +112,9 @@ class TestNormalizeSlug(unittest.TestCase):
         )
 
     def test_numeric_shorthand_unknown_returns_empty(self):
-        # "8" is out of range → empty so caller can flag as unparseable.
-        self.assertEqual(sop.normalize_slug("8", _numeric_aliases()), "")
+        # "10" is out of range (aliases run 1..9) → empty so caller can flag
+        # it as unparseable.
+        self.assertEqual(sop.normalize_slug("10", _numeric_aliases()), "")
 
     def test_numeric_without_alias_table_keeps_digits(self):
         # No alias table → return the digits as-is.
@@ -135,9 +136,9 @@ class TestParseDirectives(unittest.TestCase):
         self.aliases = _numeric_aliases()
 
     def parse_ack_revoke(self, body):
-        directives, na_directives = sop.parse_directives(body, self.aliases)
-        self.assertEqual(na_directives, [])
-        return directives
+        # parse_directives returns a combined list of (kind, slug, note) tuples.
+        # Return it directly; the old two-list interface no longer applies.
+        return sop.parse_directives(body, self.aliases)
 
     def test_simple_ack(self):
         d = self.parse_ack_revoke("/sop-ack comprehensive-testing")
@@ -201,8 +202,8 @@ class TestParseDirectives(unittest.TestCase):
         self.assertEqual(len(d), 1)
 
     def test_empty_body(self):
-        self.assertEqual(sop.parse_directives("", self.aliases), ([], []))
-        self.assertEqual(sop.parse_directives(None, self.aliases), ([], []))
+        self.assertEqual(sop.parse_directives("", self.aliases), [])
+        self.assertEqual(sop.parse_directives(None, self.aliases), [])
 
     def test_normalization_applied(self):
         # /sop-ack Comprehensive_Testing → canonical comprehensive-testing
@@ -400,7 +401,7 @@ class TestRenderStatus(unittest.TestCase):
             self.items, self._state_with(all_slugs), {s: True for s in all_slugs}
         )
         self.assertEqual(state, "success")
-        self.assertIn("7/7", desc)
+        self.assertIn("9/9", desc)
 
     def test_partial_acked_returns_failure(self):
         state, desc = sop.render_status(
@@ -409,7 +410,7 @@ class TestRenderStatus(unittest.TestCase):
             {it["slug"]: True for it in self.items},
         )
         self.assertEqual(state, "failure")
-        self.assertIn("2/7", desc)
+        self.assertIn("2/9", desc)
         self.assertIn("missing", desc)
 
     def test_description_truncates_long_missing_list(self):
@@ -443,7 +444,7 @@ class TestLoadConfig(unittest.TestCase):
     def test_default_config_parses(self):
         cfg = sop.load_config(CONFIG_PATH)
         self.assertIn("items", cfg)
-        self.assertEqual(len(cfg["items"]), 7)
+        self.assertEqual(len(cfg["items"]), 9)
         slugs = {it["slug"] for it in cfg["items"]}
         self.assertEqual(
             slugs,
@@ -455,6 +456,8 @@ class TestLoadConfig(unittest.TestCase):
                 "five-axis-review",
                 "no-backwards-compat",
                 "memory-consulted",
+                "scope-matches-declared",
+                "public-repo-hygiene",
             },
         )
 
@@ -475,10 +478,10 @@ class TestLoadConfig(unittest.TestCase):
 
 
 class TestEndToEndAckFlow(unittest.TestCase):
-    """All-7-items happy path with synthetic comments. Verifies the
+    """All-items happy path with synthetic comments. Verifies the
     full pipeline minus the Gitea API."""
 
-    def test_all_seven_acked_by_proper_teams(self):
+    def test_all_items_acked_by_proper_teams(self):
         items = _items_by_slug()
         aliases = _numeric_aliases()
         comments = [
@@ -489,6 +492,8 @@ class TestEndToEndAckFlow(unittest.TestCase):
             _comment("eng-bot", "/sop-ack five-axis-review"),
             _comment("mgr-bot", "/sop-ack no-backwards-compat"),
             _comment("eng-bot", "/sop-ack memory-consulted"),
+            _comment("eng-bot", "/sop-ack scope-matches-declared"),
+            _comment("sec-bot", "/sop-ack public-repo-hygiene"),
         ]
 
         def probe(slug, users):
@@ -500,7 +505,7 @@ class TestEndToEndAckFlow(unittest.TestCase):
         items_list = list(items.values())
         result_state, desc = sop.render_status(items_list, state, body)
         self.assertEqual(result_state, "success")
-        self.assertIn("7/7", desc)
+        self.assertIn("9/9", desc)
 
     def test_all_acks_still_fail_when_body_section_unfilled(self):
         items = _items_by_slug()
@@ -513,6 +518,8 @@ class TestEndToEndAckFlow(unittest.TestCase):
             _comment("eng-bot", "/sop-ack five-axis-review"),
             _comment("mgr-bot", "/sop-ack no-backwards-compat"),
             _comment("eng-bot", "/sop-ack memory-consulted"),
+            _comment("eng-bot", "/sop-ack scope-matches-declared"),
+            _comment("sec-bot", "/sop-ack public-repo-hygiene"),
         ]
 
         def probe(slug, users):
@@ -524,7 +531,7 @@ class TestEndToEndAckFlow(unittest.TestCase):
         items_list = list(items.values())
         result_state, desc = sop.render_status(items_list, state, body)
         self.assertEqual(result_state, "failure")
-        self.assertIn("7/7", desc)
+        self.assertIn("9/9", desc)
         self.assertIn("body-unfilled: root-cause", desc)
 
 
@@ -1431,7 +1438,7 @@ class TestFailClosedProtectedContext(unittest.TestCase):
             self.ITEMS, self._empty_acked_state(), {s: True for s in self._all_slugs()}
         )
         self.assertEqual(state, "failure", desc)
-        self.assertIn("0/7", desc)
+        self.assertIn("0/9", desc)
         self.assertNotEqual(state, "success")
 
     def test_only_self_acks_posts_failure(self):

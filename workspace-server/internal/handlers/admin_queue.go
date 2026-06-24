@@ -8,14 +8,24 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// dropStaleItems is the package-level function slot used by DropStale.
+// Tests stub this via variable reassignment to exercise the handler without
+// a real DB. Default-installed to the real production impl
+// (DropStaleQueueItems) so prod hits the sweeper; the handler's success
+// path is no longer a silent no-op (pre-fix CR-A 10781).
+//
+// Signature MUST match DropStaleQueueItems: (ctx, workspaceID, maxAgeMinutes) -> (int, error).
+var dropStaleItems = DropStaleQueueItems
+
 // AdminQueueHandler serves POST /admin/a2a-queue/drop-stale — an ops tool for
 // post-incident queue cleanup. Marks queued items older than the given TTL as
 // 'dropped', preventing PM agents from spending cycles on stale post-incident
 // TASK-priority messages.
 //
 // POST /admin/a2a-queue/drop-stale
-//   ?max_age_minutes=N  (default 60)
-//   &workspace_id=<id> (optional; empty = all workspaces)
+//
+//	?max_age_minutes=N  (default 60)
+//	&workspace_id=<id> (optional; empty = all workspaces)
 //
 // Returns JSON { "dropped": <count> } on success, 500 on error.
 type AdminQueueHandler struct{}
@@ -33,7 +43,7 @@ func (h *AdminQueueHandler) DropStale(c *gin.Context) {
 	}
 
 	workspaceID := c.Query("workspace_id")
-	count, err := DropStaleQueueItems(c.Request.Context(), workspaceID, maxAge)
+	count, err := dropStaleItems(c.Request.Context(), workspaceID, maxAge)
 	if err != nil {
 		log.Printf("AdminQueueHandler.DropStale: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to drop stale items"})

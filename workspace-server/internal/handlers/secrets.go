@@ -874,8 +874,20 @@ func (h *SecretsHandler) GetModel(c *gin.Context) {
 // Returns nil on success. Caller is responsible for any restart trigger;
 // the gin handler re-adds that after a successful write.
 func setModelSecret(ctx context.Context, workspaceID, model string) error {
+	return setModelSecretExec(ctx, db.DB, workspaceID, model)
+}
+
+// setModelSecretExec is the Tx-aware core of setModelSecret. It writes (or
+// clears) the MODEL workspace_secret against any execContext — the package
+// db.DB (fire-and-forget caller) OR a *sql.Tx so the write can participate in
+// a larger transaction and roll back atomically with it. The runtime-change
+// auto-reset path (workspace_crud Update) uses the Tx form so the model reset
+// and the runtime UPDATE commit-or-rollback as one unit — otherwise a failed
+// runtime UPDATE would leave the model reset but the runtime unchanged, i.e.
+// the exact mismatched dual-state #3198 exists to prevent.
+func setModelSecretExec(ctx context.Context, exec activityExecutor, workspaceID, model string) error {
 	if model == "" {
-		_, err := db.DB.ExecContext(ctx,
+		_, err := exec.ExecContext(ctx,
 			`DELETE FROM workspace_secrets WHERE workspace_id = $1 AND key = 'MODEL'`,
 			workspaceID)
 		return err
@@ -885,7 +897,7 @@ func setModelSecret(ctx context.Context, workspaceID, model string) error {
 		return err
 	}
 	version := crypto.CurrentEncryptionVersion()
-	_, err = db.DB.ExecContext(ctx, `
+	_, err = exec.ExecContext(ctx, `
 		INSERT INTO workspace_secrets (workspace_id, key, encrypted_value, encryption_version)
 		VALUES ($1, 'MODEL', $2, $3)
 		ON CONFLICT (workspace_id, key) DO UPDATE

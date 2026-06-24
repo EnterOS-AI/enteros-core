@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -829,5 +830,118 @@ func TestDrainQueueForWorkspace_TransientRetry_BackoffBreaksCapacityLoop(t *test
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DropStaleQueueItems
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestDropStaleQueueItems_SingleWorkspace verifies the function marks queued
+// items older than maxAge for a given workspace as 'dropped' and returns the
+// count. The WITH ... UPDATE uses FOR UPDATE SKIP LOCKED so concurrent drains
+// do not fight over the same items.
+func TestDropStaleQueueItems_SingleWorkspace(t *testing.T) {
+	mock := setupTestDBForQueueTests(t)
+
+	// Exact SQL from a2a_queue.go DropStaleQueueItems workspace-scoped branch.
+	// Using QueryMatcherEqual so the string must match verbatim.
+	const query = `WITH dropped AS (
+				UPDATE a2a_queue
+				SET status = 'dropped',
+				    last_error = last_error ||
+			        E'\n[DropStaleQueueItems] auto-dropped: queue item age exceeded the post-incident TTL. '
+			        || 'Dropped at ' || now()::text
+				WHERE id IN (
+					SELECT id FROM a2a_queue
+					WHERE workspace_id = $1
+					  AND status = 'queued'
+					  AND enqueued_at < now() - interval '1 minute' * $2
+					FOR UPDATE SKIP LOCKED
+				)
+				RETURNING id
+			)
+			SELECT count(*) FROM dropped`
+	mock.ExpectQuery(query).
+		WithArgs("ws-abc", 30).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(5))
+
+	count, err := DropStaleQueueItems(context.Background(), "ws-abc", 30)
+	if err != nil {
+		t.Fatalf("DropStaleQueueItems: %v", err)
+	}
+	if count != 5 {
+		t.Errorf("count=%d; want 5", count)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestDropStaleQueueItems_AllWorkspaces verifies the function sweeps all
+// workspaces when workspaceID is empty, using the all-workspaces SQL branch.
+func TestDropStaleQueueItems_AllWorkspaces(t *testing.T) {
+	mock := setupTestDBForQueueTests(t)
+
+	const query = `WITH dropped AS (
+				UPDATE a2a_queue
+				SET status = 'dropped',
+				    last_error = last_error ||
+			        E'\n[DropStaleQueueItems] auto-dropped: queue item age exceeded the post-incident TTL. '
+			        || 'Dropped at ' || now()::text
+				WHERE id IN (
+					SELECT id FROM a2a_queue
+					WHERE status = 'queued'
+					  AND enqueued_at < now() - interval '1 minute' * $1
+					FOR UPDATE SKIP LOCKED
+				)
+				RETURNING id
+			)
+			SELECT count(*) FROM dropped`
+	mock.ExpectQuery(query).
+		WithArgs(120).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	count, err := DropStaleQueueItems(context.Background(), "", 120)
+	if err != nil {
+		t.Fatalf("DropStaleQueueItems (all workspaces): %v", err)
+	}
+	if count != 0 {
+		t.Errorf("count=%d; want 0", count)
+	}
+}
+
+// TestDropStaleQueueItems_DBError verifies the function returns a wrapped error
+// when the UPDATE fails (e.g. connection loss, constraint violation).
+func TestDropStaleQueueItems_DBError(t *testing.T) {
+	mock := setupTestDBForQueueTests(t)
+
+	const query = `WITH dropped AS (
+				UPDATE a2a_queue
+				SET status = 'dropped',
+				    last_error = last_error ||
+			        E'\n[DropStaleQueueItems] auto-dropped: queue item age exceeded the post-incident TTL. '
+			        || 'Dropped at ' || now()::text
+				WHERE id IN (
+					SELECT id FROM a2a_queue
+					WHERE workspace_id = $1
+					  AND status = 'queued'
+					  AND enqueued_at < now() - interval '1 minute' * $2
+					FOR UPDATE SKIP LOCKED
+				)
+				RETURNING id
+			)
+			SELECT count(*) FROM dropped`
+	mock.ExpectQuery(query).
+		WithArgs("ws-err", 60).
+		WillReturnError(sql.ErrConnDone)
+
+	_, err := DropStaleQueueItems(context.Background(), "ws-err", 60)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	// Error message must include the function name per the wrapped fmt.Errorf.
+	if !strings.Contains(err.Error(), "DropStaleQueueItems") {
+		t.Errorf("error = %v; want wrapped error mentioning DropStaleQueueItems", err)
 	}
 }

@@ -63,6 +63,51 @@ func readRealManifestForPinningTest(t *testing.T) ([]byte, error) {
 // shaPattern matches a 40-char lowercase hex string (Gitea commit SHA).
 var shaPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
+// knownProviders is the set of SCM-host discriminators a manifest entry's
+// `provider` field may take (empty ⇒ "moleculesai"). Keep in sync with
+// manifest.json _provider_contract and the shell resolvers (clone-manifest.sh,
+// check-manifest-repos-exist.sh). A value outside this set is rejected static-
+// ally below — a typo'd provider must fail in CI, not silently mis-resolve.
+var knownProviders = map[string]bool{"": true, "moleculesai": true, "github": true}
+
+// commitLookupURL builds the provider-appropriate single-commit API URL used
+// by the reachability test. Gitea and GitHub expose different paths; resolving
+// per provider keeps the contract test correct once a non-moleculesai entry
+// lands. Empty/unknown provider falls back to the moleculesai (Gitea) shape.
+func commitLookupURL(provider, repo, sha string) string {
+	switch provider {
+	case "github":
+		return "https://api.github.com/repos/" + repo + "/commits/" + sha
+	default: // "", "moleculesai", or any other → Gitea shape
+		return "https://git.moleculesai.app/api/v1/repos/" + repo + "/git/commits/" + sha
+	}
+}
+
+// TestManifest_Provider_KnownValues is the static (no network) provider half
+// of the contract: every entry's `provider` (when present) must be a known
+// SCM-host discriminator. Always runs.
+func TestManifest_Provider_KnownValues(t *testing.T) {
+	data, err := readRealManifestForPinningTest(t)
+	if err != nil {
+		t.Skipf("manifest.json not readable: %v", err)
+	}
+	var m struct {
+		Plugins            []manifestEntry `json:"plugins"`
+		WorkspaceTemplates []manifestEntry `json:"workspace_templates"`
+		OrgTemplates       []manifestEntry `json:"org_templates"`
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("manifest parse failed: %v", err)
+	}
+	all := append(append([]manifestEntry{}, m.Plugins...), m.WorkspaceTemplates...)
+	all = append(all, m.OrgTemplates...)
+	for _, e := range all {
+		if !knownProviders[e.Provider] {
+			t.Errorf("entry %q (%s): provider=%q is not a known SCM host (known: moleculesai, github, or omit for the moleculesai default). Add a case to every resolver before introducing a new provider.", e.Name, e.Repo, e.Provider)
+		}
+	}
+}
+
 // TestManifest_RefPinning_AllEntriesAreCommitSHAs is the static (no
 // network) part of the pinning contract — every ref is a 40-char
 // lowercase hex string. Failing this test means someone reintroduced
@@ -203,14 +248,15 @@ func TestManifest_RefPinning_AllSHAsReachable(t *testing.T) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	auth := giteaBasicAuthForTest(t)
 	for _, e := range all {
-		// GET /api/v1/repos/{owner}/{repo}/git/commits/{sha}
-		// Returns 200 if the SHA exists in the repo, 404 otherwise.
+		// Single-commit lookup, resolved per provider (Gitea and GitHub
+		// expose different commit-lookup paths). Returns 200 if the SHA
+		// exists in the repo, 404 otherwise.
 		// NOTE: the commit-lookup endpoint requires the same auth as
 		// refs/heads (the API treats unauth'd requests as 404 for
 		// private repos, even when the SHA is correct). The
 		// helper below injects the agent's Gitea basic-auth header
 		// (the same one used by the runtime's giteaTemplateAssetFetcher).
-		url := "https://git.moleculesai.app/api/v1/repos/" + e.Repo + "/git/commits/" + e.Ref
+		url := commitLookupURL(e.Provider, e.Repo, e.Ref)
 		req, _ := http.NewRequest("GET", url, nil)
 		req.Header.Set("Authorization", auth)
 		resp, err := client.Do(req)

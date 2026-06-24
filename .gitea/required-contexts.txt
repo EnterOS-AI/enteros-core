@@ -46,6 +46,7 @@ template-delivery-e2e / Template-asset delivery (fresh seo-agent — config+prom
 # complete and keeps lint-no-coe-on-required honest. Event suffix stripped.
 qa-review / approved
 security-review / approved
+sop-checklist / all-items-acked
 reserved-path-review / reserved-path-review
 
 # pending-#3159 (not yet enforced) ──────────────────────────────────────

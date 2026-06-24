@@ -41,6 +41,13 @@ until curl -s --max-time 5 "$PLATFORM_URL/health" >/dev/null 2>&1; do
 done
 echo "  platform up"
 
+# MINIMAX_BASE_URL defaults to the global endpoint (api.minimax.io) —
+# matches the operator-host MINIMAX_API_KEY scope. Override by setting
+# MINIMAX_BASE_URL before running this script (e.g. for the China
+# endpoint api.minimaxi.com). See RFC internal#417 for why the global
+# URL is the safe default.
+: "${MINIMAX_BASE_URL:=https://api.minimax.io}"
+
 echo "=== Inserting global secrets ==="
 docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -c "
 INSERT INTO global_secrets (key, encrypted_value, encryption_version) VALUES
@@ -50,10 +57,12 @@ INSERT INTO global_secrets (key, encrypted_value, encryption_version) VALUES
 ('ANTHROPIC_SMALL_FAST_MODEL', 'MiniMax-M2.7', 0),
 ('API_TIMEOUT_MS', '3000000', 0),
 ('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', '1', 0),
-('GITHUB_TOKEN', '$GITHUB_PAT', 0)
+('GITHUB_TOKEN', '$GITHUB_PAT', 0),
+('MINIMAX_API_KEY', '$MINIMAX_API_KEY', 0),
+('MINIMAX_BASE_URL', '$MINIMAX_BASE_URL', 0)
 ON CONFLICT (key) DO UPDATE SET encrypted_value = EXCLUDED.encrypted_value;
 "
-echo "  7 global secrets set"
+echo "  9 global secrets set"
 
 echo "=== Importing org template ==="
 curl -s --max-time 600 -X POST "$PLATFORM_URL/org/import" \

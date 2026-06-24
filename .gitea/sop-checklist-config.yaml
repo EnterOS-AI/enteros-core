@@ -10,7 +10,7 @@
 #                       GET /api/v1/teams/{id}/members/{login}.
 #                       Team-id resolution happens at script start via
 #                       GET /api/v1/orgs/{org}/teams (cheap, one call).
-#   numeric_alias     — 1..7; lets reviewers type `/sop-ack 3` as a
+#   numeric_alias     — 1..N (currently 1..9); lets reviewers type `/sop-ack 3` as a
 #                       shortcut for `/sop-ack staging-smoke`.
 #
 # WHY THESE TEAM MAPPINGS:

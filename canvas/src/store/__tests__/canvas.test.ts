@@ -1342,3 +1342,407 @@ describe("nestNode – cyclic parent chain", () => {
     await expect(useCanvasStore.getState().nestNode("a", null)).resolves.toBeUndefined();
   });
 });
+
+// ---------- growParentsToFitChildren ----------
+
+describe("growParentsToFitChildren", () => {
+  it("grows a parent when its children exceed the parent's measured dimensions", () => {
+    useCanvasStore.setState({
+      nodes: [
+        {
+          id: "parent",
+          type: "workspace",
+          position: { x: 0, y: 0 },
+          data: {
+            name: "Parent",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9000",
+            parentId: null,
+            currentTask: "",
+            runtime: "",
+          },
+          // Small parent — children will overflow it
+          width: 100,
+          height: 100,
+          measured: { width: 100, height: 100 },
+        },
+        {
+          id: "child",
+          parentId: "parent",
+          type: "workspace",
+          position: { x: 0, y: 0 },
+          data: {
+            name: "Child",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9001",
+            parentId: "parent",
+            currentTask: "",
+            runtime: "",
+          },
+          // Wide child that overflows a 100px parent
+          measured: { width: 500, height: 300 },
+        },
+      ],
+      edges: [],
+    });
+
+    useCanvasStore.getState().growParentsToFitChildren();
+
+    const parent = useCanvasStore.getState().nodes.find((n) => n.id === "parent")!;
+    // Must grow to at least child max-right + padding and child max-bottom + padding.
+    // With child at x=0,y=0 and w=500,h=300: requiredW=516, requiredH=316 (PARENT_BOTTOM_PADDING=16)
+    expect(parent.width).toBeGreaterThanOrEqual(516);
+    expect(parent.height).toBeGreaterThanOrEqual(316);
+  });
+
+  it("skips collapsed parents (they render compact intentionally)", () => {
+    useCanvasStore.setState({
+      nodes: [
+        {
+          id: "parent",
+          type: "workspace",
+          position: { x: 0, y: 0 },
+          width: 100,
+          height: 100,
+          data: {
+            name: "Parent",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: true, // ← collapsed
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9000",
+            parentId: null,
+            currentTask: "",
+            runtime: "",
+          },
+          measured: { width: 100, height: 100 },
+        },
+        {
+          id: "child",
+          parentId: "parent",
+          type: "workspace",
+          position: { x: 0, y: 0 },
+          data: {
+            name: "Child",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9001",
+            parentId: "parent",
+            currentTask: "",
+            runtime: "",
+          },
+          measured: { width: 500, height: 300 },
+        },
+      ],
+      edges: [],
+    });
+
+    useCanvasStore.getState().growParentsToFitChildren();
+
+    const parent = useCanvasStore.getState().nodes.find((n) => n.id === "parent")!;
+    // Collapsed parent must NOT grow
+    expect(parent.width).toBe(100);
+  });
+
+  it("returns the original nodes array unchanged when no grow is needed", () => {
+    useCanvasStore.setState({
+      nodes: [
+        {
+          id: "parent",
+          type: "workspace",
+          position: { x: 0, y: 0 },
+          data: {
+            name: "Parent",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9000",
+            parentId: null,
+            currentTask: "",
+            runtime: "",
+          },
+          // Large enough to fit children without growing
+          width: 1000,
+          height: 1000,
+          measured: { width: 1000, height: 1000 },
+        },
+        {
+          id: "child",
+          parentId: "parent",
+          type: "workspace",
+          position: { x: 0, y: 0 },
+          data: {
+            name: "Child",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9001",
+            parentId: "parent",
+            currentTask: "",
+            runtime: "",
+          },
+          measured: { width: 200, height: 200 },
+        },
+      ],
+      edges: [],
+    });
+
+    const nodesBefore = useCanvasStore.getState().nodes;
+    useCanvasStore.getState().growParentsToFitChildren();
+    const nodesAfter = useCanvasStore.getState().nodes;
+
+    // Parent should still be 1000x1000
+    const parent = nodesAfter.find((n) => n.id === "parent")!;
+    expect(parent.width).toBe(1000);
+    // The store action always calls set — check the nodes array was updated (even if unchanged)
+    expect(nodesAfter).toEqual(nodesBefore);
+  });
+});
+
+// ---------- arrangeChildren ----------
+
+describe("arrangeChildren", () => {
+  it("is a no-op when the parent has no children", () => {
+    useCanvasStore.setState({
+      nodes: [
+        {
+          id: "orphan",
+          type: "workspace",
+          position: { x: 50, y: 50 },
+          data: {
+            name: "Orphan",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9000",
+            parentId: null,
+            currentTask: "",
+            runtime: "",
+          },
+        },
+      ],
+      edges: [],
+    });
+
+    expect(() => useCanvasStore.getState().arrangeChildren("orphan")).not.toThrow();
+    // Node position must not change
+    expect(useCanvasStore.getState().nodes[0].position).toEqual({ x: 50, y: 50 });
+  });
+
+  it("sorts children by name and assigns default slots", async () => {
+    const mock = global.fetch as ReturnType<typeof vi.fn>;
+    mock.mockResolvedValue({ ok: true, json: () => Promise.resolve({}) } as Response);
+
+    useCanvasStore.setState({
+      nodes: [
+        {
+          id: "parent",
+          type: "workspace",
+          position: { x: 0, y: 0 },
+          data: {
+            name: "Parent",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9000",
+            parentId: null,
+            currentTask: "",
+            runtime: "",
+          },
+        },
+        {
+          id: "child-z",
+          parentId: "parent",
+          type: "workspace",
+          position: { x: 9999, y: 9999 }, // existing position should be overwritten
+          data: {
+            name: "Zoe",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9001",
+            parentId: "parent",
+            currentTask: "",
+            runtime: "",
+          },
+        },
+        {
+          id: "child-a",
+          parentId: "parent",
+          type: "workspace",
+          position: { x: 9999, y: 9999 },
+          data: {
+            name: "Alice",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9002",
+            parentId: "parent",
+            currentTask: "",
+            runtime: "",
+          },
+        },
+      ],
+      edges: [],
+    });
+
+    useCanvasStore.getState().arrangeChildren("parent");
+    await vi.waitFor(() => {
+      expect(mock).toHaveBeenCalled();
+    });
+
+    // Alice (index 0) gets slot 0: x=16, y=130
+    // Zoe (index 1) gets slot 1: x=16+300+14=330, y=130
+    const alice = useCanvasStore.getState().nodes.find((n) => n.id === "child-a")!;
+    const zoe = useCanvasStore.getState().nodes.find((n) => n.id === "child-z")!;
+    expect(alice.position).toEqual({ x: 16, y: 130 });
+    expect(zoe.position).toEqual({ x: 330, y: 130 });
+  });
+
+  it("PATCHes each child with absolute canvas coordinates (nested parent offset)", async () => {
+    const mock = global.fetch as ReturnType<typeof vi.fn>;
+    mock.mockResolvedValue({ ok: true, json: () => Promise.resolve({}) } as Response);
+
+    useCanvasStore.setState({
+      nodes: [
+        {
+          id: "grandparent",
+          type: "workspace",
+          position: { x: 100, y: 200 },
+          data: {
+            name: "Grandparent",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9000",
+            parentId: null,
+            currentTask: "",
+            runtime: "",
+          },
+        },
+        {
+          id: "parent",
+          type: "workspace",
+          position: { x: 16, y: 130 }, // relative to grandparent
+          data: {
+            name: "Parent",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9001",
+            parentId: "grandparent",
+            currentTask: "",
+            runtime: "",
+          },
+        },
+        {
+          id: "child",
+          parentId: "parent",
+          type: "workspace",
+          position: { x: 9999, y: 9999 },
+          data: {
+            name: "Child",
+            status: "online",
+            tier: 1,
+            agentCard: null,
+            activeTasks: 0,
+            collapsed: false,
+            role: "agent",
+            lastErrorRate: 0,
+            lastSampleError: "",
+            url: "http://localhost:9002",
+            parentId: "parent",
+            currentTask: "",
+            runtime: "",
+          },
+        },
+      ],
+      edges: [],
+    });
+
+    useCanvasStore.getState().arrangeChildren("parent");
+    await vi.waitFor(() => {
+      expect(mock).toHaveBeenCalledWith(
+        expect.stringContaining("/workspaces/child"),
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({ x: 132, y: 460 })
+          // absOf(parent) = grandparent.x + parent.x = 100+16=116, 200+130=330
+          // slot.x=16, slot.y=130
+          // absX = 16+116 = 132
+          // absY = 130+330 = 460... wait no:
+          // absOf(parentId) walks from null→grandparent→parent, so:
+          // parent.absX = grandparent.position.x + parent.position.x = 100+16=116
+          // parent.absY = grandparent.position.y + parent.position.y = 200+130=330
+          // slot for child: defaultChildSlot(0) = {x:16, y:130}
+          // absX = slot.x + absOf(parent).x = 16 + 116 = 132
+          // absY = slot.y + absOf(parent).y = 130 + 330 = 460
+        }),
+      );
+    });
+  });
+});

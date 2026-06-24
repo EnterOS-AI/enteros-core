@@ -20,6 +20,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/push"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/supervised"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/uploads"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/ws"
@@ -476,12 +477,24 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Remaining auth-gated workspace sub-routes — appended to wsAuth group declared above.
 	{
+		// Push notifications (mobile)
+		var pushNotifier *push.Notifier
+		if expoToken := os.Getenv("EXPO_ACCESS_TOKEN"); expoToken != "" {
+			pushNotifier = push.NewNotifier(db.DB, push.NewSender(expoToken))
+		}
+
 		// Activity Logs
-		acth := handlers.NewActivityHandler(broadcaster)
+		acth := handlers.NewActivityHandler(broadcaster, pushNotifier)
 		wsAuth.GET("/activity", acth.List)
 		wsAuth.GET("/session-search", acth.SessionSearch)
 		wsAuth.POST("/activity", acth.Report)
 		wsAuth.POST("/notify", acth.Notify)
+
+		// Push token registration (mobile)
+		if pushNotifier != nil {
+			pushH := push.NewHandler(push.NewRepo(db.DB))
+			pushH.RegisterRoutes(wsAuth)
+		}
 
 		// Chat history — RFC #2945 PR-C (issue #3017) + PR-D (issue
 		// #3026). Server-side rendering of activity_logs rows into
@@ -608,7 +621,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		//       opencode session cannot saturate the platform.
 		//   C3: commit_memory/recall_memory with scope=GLOBAL → permission error;
 		//       send_message_to_user excluded unless MOLECULE_MCP_ALLOW_SEND_MESSAGE=true.
-		mcpH := handlers.NewMCPHandler(db.DB, broadcaster)
+		mcpH := handlers.NewMCPHandler(db.DB, broadcaster, pushNotifier)
 		if memBundle != nil {
 			mcpH.WithMemoryV2(memBundle.Plugin, memBundle.Resolver)
 		}

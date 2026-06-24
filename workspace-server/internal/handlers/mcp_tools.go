@@ -432,7 +432,7 @@ func (h *MCPHandler) toolSendMessageToUser(ctx context.Context, workspaceID stri
 	if err != nil {
 		return "", err
 	}
-	writer := NewAgentMessageWriter(h.database, h.broadcaster)
+	writer := NewAgentMessageWriter(h.database, h.broadcaster, h.notifier)
 	if err := writer.Send(ctx, workspaceID, message, attachments); err != nil {
 		if errors.Is(err, ErrWorkspaceNotFound) {
 			return "", fmt.Errorf("workspace not found")
