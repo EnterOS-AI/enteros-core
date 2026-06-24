@@ -629,14 +629,18 @@ func TestUpdate_Runtime_RegisteredModelForRuntime_Passes(t *testing.T) {
 	}
 }
 
-// TestUpdate_Runtime_UnroutableModel_Fails422 pins the (runtime, model)
-// compatibility check REJECT path: the new runtime + current model pair
-// is unroutable (the model isn't registered for that runtime AND no
-// provider prefix-matches a native arm). Rejected with 422 + the
-// registry-SSOT reason. The PATCH does NOT update the DB (the UPDATE
-// exec is NOT mocked, so unmet-expectations would fire if the UPDATE
-// happened — but we only check the 422 response code here).
-func TestUpdate_Runtime_UnroutableModel_Fails422(t *testing.T) {
+// TestUpdate_Runtime_IncompatibleModel_AutoResetsToDefault pins the
+// "dual-422 trap" fix: a runtime change whose CURRENT model is NOT registered
+// for the TARGET runtime no longer fails+rolls back — instead the model is
+// atomically reset to the target runtime's DEFAULT registered model and the
+// runtime change is persisted (NO rollback). The response signals
+// model_was_reset:true + the new model.
+//
+// Repro shape from the bug report: model "moonshot/kimi-k2.6" (a claude-code
+// platform id, NOT registered for google-adk) + switch runtime to google-adk.
+// Pre-fix: 422, runtime stays claude-code. Post-fix: model resets to
+// google-adk's default ("platform:gemini-2.5-pro"), runtime becomes google-adk.
+func TestUpdate_Runtime_IncompatibleModel_AutoResetsToDefault(t *testing.T) {
 	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	mock, r := setupWorkspaceCrudTest(t)
 	h := newWorkspaceCrudHandler(t)
@@ -645,15 +649,72 @@ func TestUpdate_Runtime_UnroutableModel_Fails422(t *testing.T) {
 	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	// A model that is NOT registered for any runtime (so
-	// validateRegisteredModelForRuntime returns false via both the
-	// exact-membership loop AND the DeriveProvider allow path).
-	// "unroutable/unknown" has no model-prefix matches in any runtime's
-	// native provider set, and doesn't appear on any runtime's
-	// ModelsForRuntime list — both checks fail.
+	// Current model = moonshot/kimi-k2.6 (a claude-code platform id). It is
+	// NOT registered for google-adk → orphaned → auto-reset fires.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("unroutable/unknown"), 0))
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
+	// Auto-reset writes the google-adk DEFAULT model into the MODEL secret.
+	// google-adk's first registered model is "platform:gemini-2.5-pro"
+	// (registry_gen.go). Tests run with encryption disabled, so the encrypted
+	// value is the plaintext bytes and the version is the plaintext version (0).
+	mock.ExpectExec(`INSERT INTO workspace_secrets`).
+		WithArgs(wsID, []byte("platform:gemini-2.5-pro"), 0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The runtime change is then persisted — NO rollback.
+	mock.ExpectExec(`UPDATE workspaces\s+SET runtime = \$2`).
+		WithArgs(wsID, "google-adk").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	body := map[string]interface{}{"runtime": "google-adk"}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (auto-reset, no rollback), got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v (body=%s)", err, w.Body.String())
+	}
+	if resp["model_was_reset"] != true {
+		t.Errorf("expected model_was_reset=true, got %v (body=%s)", resp["model_was_reset"], w.Body.String())
+	}
+	if resp["model"] != "platform:gemini-2.5-pro" {
+		t.Errorf("expected reset model=platform:gemini-2.5-pro, got %v", resp["model"])
+	}
+	// Both the model-reset INSERT and the runtime UPDATE must have fired —
+	// this asserts there was NO rollback (the runtime change is persisted).
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (rollback would leave the UPDATE unconsumed): %v", err)
+	}
+}
+
+// TestUpdate_Runtime_ClaudeCode_IncompatibleModel_AutoResetsToDefault is the
+// reverse direction: google-adk → claude-code with an orphaned google model.
+// claude-code's default registered model is "sonnet" (registry_gen.go).
+func TestUpdate_Runtime_ClaudeCode_IncompatibleModel_AutoResetsToDefault(t *testing.T) {
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	mock, r := setupWorkspaceCrudTest(t)
+	h := newWorkspaceCrudHandler(t)
+	r.PATCH("/workspaces/:id", h.Update)
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	// gemini-2.5-pro is a google-adk model, NOT registered for claude-code.
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("gemini-2.5-pro"), 0))
+	mock.ExpectExec(`INSERT INTO workspace_secrets`).
+		WithArgs(wsID, []byte("sonnet"), 0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE workspaces\s+SET runtime = \$2`).
+		WithArgs(wsID, "claude-code").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	body := map[string]interface{}{"runtime": "claude-code"}
 	b, _ := json.Marshal(body)
@@ -662,22 +723,19 @@ func TestUpdate_Runtime_UnroutableModel_Fails422(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// 422 (Unprocessable Entity) matches the create-boundary's
-	// validateRegisteredModelForRuntime path (secrets.go:942, 952 +
-	// workspace_crud.go create) — 422-align per CR2 + Researcher's
-	// review on the 400→422 consistency ask. Precise semantic: the
-	// PATCH body is syntactically valid, but the (runtime, model) pair
-	// is unroutable per the registry SSOT.
-	if w.Code != http.StatusUnprocessableEntity {
-		t.Errorf("expected 422 (unroutable (runtime, model)), got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (auto-reset), got %d: %s", w.Code, w.Body.String())
 	}
-	// The UPDATE should NOT have fired. ExpectationsWereMet is
-	// informational (the unmet-expectations log would surface in
-	// verbose test output); the code status is the load-bearing
-	// assertion. We DON'T add a strict unmet check here because
-	// sqlmock's ExpectationsWereMet fires on the failure path too
-	// (mock has unconsumed expectations).
-	_ = mock
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["model_was_reset"] != true || resp["model"] != "sonnet" {
+		t.Errorf("expected model_was_reset=true + model=sonnet, got reset=%v model=%v", resp["model_was_reset"], resp["model"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
 }
 
 // TestUpdate_Runtime_UnknownPseudoRuntime_Fails422 pins the runtime-identity
