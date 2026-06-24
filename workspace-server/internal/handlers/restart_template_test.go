@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
-	"github.com/DATA-DOG/go-sqlmock"
 )
 
 // Tests for resolveRestartTemplate — the pure helper that implements the
@@ -152,24 +151,27 @@ func TestRestartRuntimeFromConfig_ApplyTemplateTrustsDBRuntime(t *testing.T) {
 	}
 }
 
-func TestRestartRuntimeFromConfig_DefaultRestartPreservesContainerRuntime(t *testing.T) {
-	mock := setupTestDB(t)
-	mock.ExpectExec(`UPDATE workspaces SET runtime = \$1 WHERE id = \$2`).
-		WithArgs("claude-code", "ws-runtime").
-		WillReturnResult(sqlmock.NewResult(0, 1))
+// TestRestartRuntimeFromConfig_DefaultRestartTrustsDBRuntime is the regression
+// test for the runtime-switch-then-restart bug. The runtime-switch PATCH
+// (workspace_crud.go Update) writes ONLY the workspaces.runtime DB column — it
+// does not write through to the running container's /configs/config.yaml — so
+// on a plain restart (apply_template=false) the DB column is the SSOT.
+//
+// Pre-fix, this default path let the container's stale template-default
+// config.yaml ("claude-code") win over the switched DB runtime ("hermes") AND
+// overwrote the DB column back to the stale value, so a switched-runtime box
+// was never re-provisioned. The DB value must now win, and the DB must NOT be
+// stomped (setupTestDB asserts no unexpected queries).
+func TestRestartRuntimeFromConfig_DefaultRestartTrustsDBRuntime(t *testing.T) {
+	// No sqlmock UPDATE expectation: the function must NOT write the DB anymore.
+	setupTestDB(t)
 	prov := &restartRuntimeProv{config: []byte("runtime: claude-code\n")}
 	h := &WorkspaceHandler{provisioner: prov}
 
 	got := h.restartRuntimeFromConfig(context.Background(), "ws-runtime", "Runtime Workspace", "hermes", false)
 
-	if got != "claude-code" {
-		t.Fatalf("runtime = %q, want container runtime claude-code", got)
-	}
-	if prov.execReadCalls != 1 {
-		t.Fatalf("ExecRead calls = %d, want 1", prov.execReadCalls)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet sqlmock expectations: %v", err)
+	if got != "hermes" {
+		t.Fatalf("runtime = %q, want DB SSOT runtime hermes (stale config.yaml=claude-code must NOT win)", got)
 	}
 }
 

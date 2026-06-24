@@ -488,28 +488,38 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 }
 
 func (h *WorkspaceHandler) restartRuntimeFromConfig(ctx context.Context, id, wsName, dbRuntime string, applyTemplate bool) string {
+	// The workspaces.runtime DB column is the SSOT for the workspace's runtime
+	// — it is the column the runtime-switch PATCH (workspace_crud.go Update)
+	// writes, and ONLY that column; the PATCH does NOT write through to the
+	// running container's /configs/config.yaml. So on restart we must always
+	// re-provision with the DB runtime, never the runtime baked into the
+	// container's (possibly stale, template-default) config.yaml.
+	//
+	// Pre-fix this function let a config.yaml runtime that differed from the DB
+	// WIN, and even stomped the DB column back to the config value. That
+	// silently reverted a switched runtime (e.g. google-adk → claude-code) on
+	// every plain "Restart" click, so a switched-runtime box was never built.
 	if h.provisioner == nil || applyTemplate {
 		return dbRuntime
 	}
-	containerRuntime := dbRuntime
+	// Best-effort drift detection only: if the container's config.yaml disagrees
+	// with the DB, log it (the config volume will be re-rendered from the
+	// runtime-default template on re-provision), but the DB value remains
+	// authoritative and is never overwritten from the stale config.
 	containerName := provisioner.ContainerName(id) // ws-{id} (KI-013 full UUID)
 	if cfgBytes, readErr := h.provisioner.ExecRead(ctx, containerName, "/configs/config.yaml"); readErr == nil {
 		for _, line := range strings.Split(string(cfgBytes), "\n") {
 			line = strings.TrimSpace(line)
 			if strings.HasPrefix(line, "runtime:") {
 				parsed := strings.TrimSpace(strings.TrimPrefix(line, "runtime:"))
-				if parsed != "" && parsed != containerRuntime {
-					log.Printf("Restart: runtime changed in config.yaml %q→%q for %s", containerRuntime, parsed, wsName)
-					containerRuntime = parsed
-					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $1 WHERE id = $2`, containerRuntime, id); err != nil {
-						log.Printf("Restart: failed to persist runtime %q for %s: %v", containerRuntime, id, err)
-					}
+				if parsed != "" && parsed != dbRuntime {
+					log.Printf("Restart: config.yaml runtime %q differs from DB runtime %q for %s — using DB (SSOT); config volume will be re-rendered", parsed, dbRuntime, wsName)
 				}
 				break
 			}
 		}
 	}
-	return containerRuntime
+	return dbRuntime
 }
 
 // Hibernate handles POST /workspaces/:id/hibernate
