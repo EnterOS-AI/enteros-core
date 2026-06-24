@@ -2190,6 +2190,79 @@ def test_load_conductor_snapshot_ignores_stale_snapshot(monkeypatch):
         os.unlink(path)
 
 
+def test_load_conductor_snapshot_discards_snapshot_without_ts(monkeypatch):
+    """internal#3210 MEDIUM (fail-closed): a snapshot with NO `ts` field has an
+    UNVERIFIABLE age — it could be arbitrarily old (a wedged conductor). The old
+    `if ts_str:` guard skipped the age check entirely on an absent/empty ts and
+    trusted the snapshot as fresh. It must instead be discarded (return None →
+    the caller self-fetches live state), never trusted as current."""
+    snapshot = {  # no "ts" key at all
+        "repo": "molecule-ai/molecule-core",
+        "prs": [{"number": 60, "head_sha": "a" * 40, "labels": []}],
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot, f)
+        path = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path)
+        assert mq.load_conductor_snapshot() is None
+    finally:
+        os.unlink(path)
+
+    # An explicitly EMPTY ts is the same case (freshness unverifiable).
+    snapshot_empty = _make_snapshot(
+        [{"number": 61, "head_sha": "b" * 40, "labels": []}], ts=""
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot_empty, f)
+        path2 = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path2)
+        assert mq.load_conductor_snapshot() is None
+    finally:
+        os.unlink(path2)
+
+
+def test_load_conductor_snapshot_discards_snapshot_with_malformed_ts(monkeypatch):
+    """internal#3210 MEDIUM (fail-closed): a snapshot whose `ts` does not parse
+    has an UNVERIFIABLE age. The old `except ValueError: pass` swallowed the
+    strptime failure and fell through to `return snapshot` ('treat as fresh
+    (conservative)') — which was ANTI-conservative (an old snapshot from a
+    wedged conductor would be trusted as current). It must be discarded (return
+    None → self-fetch)."""
+    snapshot = _make_snapshot(
+        [{"number": 70, "head_sha": "c" * 40, "labels": []}],
+        ts="not-a-timestamp",
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot, f)
+        path = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path)
+        assert mq.load_conductor_snapshot() is None
+    finally:
+        os.unlink(path)
+
+
+def test_load_conductor_snapshot_honors_fresh_dated_snapshot(monkeypatch):
+    """The fail-closed ts guard does NOT regress the happy path: a present,
+    parseable, in-window ts is still trusted and returned (so the existing
+    snapshot-consumption fast path is preserved)."""
+    snapshot = _make_snapshot(
+        [{"number": 80, "head_sha": "d" * 40, "labels": []}]
+    )  # _make_snapshot defaults ts to now → fresh + parseable
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(snapshot, f)
+        path = f.name
+    try:
+        monkeypatch.setenv("CONDUCTOR_SNAPSHOT_FILE", path)
+        loaded = mq.load_conductor_snapshot()
+        assert loaded is not None
+        assert loaded["prs"][0]["number"] == 80
+    finally:
+        os.unlink(path)
+
+
 # --------------------------------------------------------------------------
 # Fix 3: non-main base PRs are skipped loudly/observably, not silently.
 # core#2548 stopped the per-tick PR-comment flood; the skip must still be
@@ -3091,6 +3164,67 @@ def test_process_once_fails_closed_when_enforced_contexts_unreadable(monkeypatch
     monkeypatch.setattr(mq, "merge_pull", lambda *a, **k: merged.__setitem__("called", True))
 
     with pytest.raises(mq.EnforcedContextsUnavailable):
+        mq.process_once(dry_run=False)
+    assert merged["called"] is False
+
+
+# ---------------------------------------------------------------------------
+# internal#3210 HIGH: an empty PUSH_REQUIRED_CONTEXTS must NOT vacuously pass
+# the main-green backstop. push_required_contexts() raises
+# PushRequiredContextsUnavailable (an ApiError) so the gate HOLDS rather than
+# letting required_contexts_green(main_latest, []) == (True, []) wave through
+# ANY main state (including all-red).
+# ---------------------------------------------------------------------------
+
+
+def test_PushRequiredContextsUnavailable_inherits_from_ApiError():
+    # So main()'s `except ApiError` handler catches it → rc 1 (no merge + page).
+    assert issubclass(mq.PushRequiredContextsUnavailable, mq.ApiError)
+
+
+@pytest.mark.parametrize("raw", ["", "   ", ",", " , , "])
+def test_push_required_contexts_raises_when_parse_empty(monkeypatch, raw):
+    """Empty / whitespace-only / all-comma PUSH_REQUIRED_CONTEXTS parses to []
+    and must fail closed — NOT return [] (which would vacuously green main)."""
+    monkeypatch.setattr(mq, "PUSH_REQUIRED_CONTEXTS_RAW", raw)
+    with pytest.raises(mq.PushRequiredContextsUnavailable):
+        mq.push_required_contexts()
+
+
+def test_push_required_contexts_returns_configured_set():
+    """Regression guard: a normal configured value still parses to the set
+    (the fail-closed raise must not break the happy path)."""
+    # The module default is non-empty; assert it parses to a non-empty list.
+    assert mq.push_required_contexts() == ["CI / all-required (push)"]
+
+
+def test_process_once_holds_tick_when_push_required_contexts_empty(monkeypatch):
+    """internal#3210 HIGH integration: with PUSH_REQUIRED_CONTEXTS empty, the
+    main-green check in process_once would VACUOUSLY pass (the backstop that
+    pauses the queue on a red main disappears). push_required_contexts() raises
+    PushRequiredContextsUnavailable BEFORE the candidate loop; process_once lets
+    it propagate so main() surfaces rc 1 — and crucially NO PR is merged.
+
+    Main is wired ALL-RED here: the bug let the queue keep merging onto a red
+    main; the fix must HOLD instead."""
+    merged = {"called": False}
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "PUSH_REQUIRED_CONTEXTS_RAW", "")  # parses to []
+    monkeypatch.setattr(mq, "get_branch_protection", lambda branch: mq.BranchProtection(
+        required_contexts=["CI / all-required (pull_request)"],
+        required_approvals=2,
+        block_on_rejected_reviews=True,
+    ))
+    main_sha = "b" * 40
+    monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
+    # Main is RED — the exact state the old vacuous pass would have ignored.
+    monkeypatch.setattr(mq, "get_combined_status", lambda sha: {
+        "state": "failure",
+        "statuses": [{"context": "CI / all-required (push)", "status": "failure"}],
+    })
+    monkeypatch.setattr(mq, "merge_pull", lambda *a, **k: merged.__setitem__("called", True))
+
+    with pytest.raises(mq.PushRequiredContextsUnavailable):
         mq.process_once(dry_run=False)
     assert merged["called"] is False
 
