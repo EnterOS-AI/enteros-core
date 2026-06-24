@@ -120,6 +120,13 @@ type TemplateAssetFetcher interface {
 func IsCPTemplateAssetPath(name string) bool {
 	name = filepath.ToSlash(filepath.Clean(name))
 	return name == "config.yaml" ||
+		// system-prompt.md is the SSOT concierge/agent prompt filename (the
+		// runtime's default prompt file + what the platform-agent template
+		// ships + the key core substitutes {{CONCIERGE_NAME}} into). It must be
+		// asset-channel-deliverable so a kind=platform concierge gets its
+		// identity LIVE on the standard runtime image — no baked
+		// molecule-platform-agent image required (the de-bake migration).
+		name == "system-prompt.md" ||
 		strings.HasPrefix(name, "prompts/")
 }
 
