@@ -147,24 +147,23 @@ func TestHeartbeatHandler_PlatformModelMissing_DoesNotFireReconcile(t *testing.T
 	}
 }
 
-// The recovery reconcile is guarded so a concierge that fails the gate on
-// every heartbeat (until the MCP lands) fires AT MOST one concurrent reconcile
-// — otherwise each blocked beat would spawn another clone+deliver.
-func TestFireReconcileMCPRecovery_InflightGuard(t *testing.T) {
+// The recovery reconcile is rate-limited per workspace: the gate fails on every
+// heartbeat until the MCP lands, so without a throttle each blocked beat would
+// spawn another clone+deliver (restart churn). A new fire is allowed only after
+// mcpRecoveryCooldown.
+func TestFireReconcileMCPRecovery_RateLimited(t *testing.T) {
 	handler := NewRegistryHandler(newTestBroadcaster())
-	started := make(chan string, 8)
-	release := make(chan struct{})
+	fired := make(chan string, 8)
 	handler.SetReconcileFunc(func(_ context.Context, workspaceID string) {
-		started <- workspaceID
-		<-release // hold the goroutine "in flight"
+		fired <- workspaceID
 	})
-
 	ctx := context.Background()
-	handler.fireReconcileMCPRecovery(ctx, "ws-x") // spawns reconcile goroutine
-	handler.fireReconcileMCPRecovery(ctx, "ws-x") // guarded — must NOT spawn a second
+
+	handler.fireReconcileMCPRecovery(ctx, "ws-x") // fires
+	handler.fireReconcileMCPRecovery(ctx, "ws-x") // within cooldown → must NOT fire
 
 	select {
-	case got := <-started:
+	case got := <-fired:
 		if got != "ws-x" {
 			t.Fatalf("reconcile fired for wrong workspace: %q", got)
 		}
@@ -172,12 +171,22 @@ func TestFireReconcileMCPRecovery_InflightGuard(t *testing.T) {
 		t.Fatal("first recovery reconcile did not fire")
 	}
 	select {
-	case <-started:
-		t.Fatal("inflight guard failed: a second concurrent reconcile fired for the same workspace")
+	case <-fired:
+		t.Fatal("rate-limit failed: a second reconcile fired within the cooldown window")
 	case <-time.After(200 * time.Millisecond):
-		// good — guard held
+		// good — cooldown held
 	}
-	close(release) // let the goroutine complete + clear the inflight key (drained at cleanup)
+
+	// Simulate the cooldown elapsing → a fresh fire is allowed again so a
+	// genuinely-stuck concierge keeps retrying (gently).
+	handler.mcpRecoveryLastFire.Store("ws-x", time.Now().Add(-2*mcpRecoveryCooldown))
+	handler.fireReconcileMCPRecovery(ctx, "ws-x")
+	select {
+	case <-fired:
+		// good — re-fired after cooldown
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery reconcile did not re-fire after the cooldown elapsed")
+	}
 }
 
 // nil reconcile func / empty id must be no-ops (never panic).

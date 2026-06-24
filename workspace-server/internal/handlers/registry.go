@@ -111,14 +111,25 @@ type RegistryHandler struct {
 	// reconcile when unset (e.g. unit tests, CP/SaaS mode without a plugins
 	// handler). Wired by the router to PluginsHandler.ReconcileWorkspacePlugins.
 	reconcilePlugins ReconcileFunc
-	// mcpRecoveryInflight guards the RCA#2970 deadlock-break reconcile (#33) so
-	// a concierge stuck failing the mcp_server_present gate fires AT MOST ONE
-	// recovery reconcile at a time. The gate fails every heartbeat until the
-	// management MCP lands (~once per heartbeat interval); without this guard
-	// each blocked beat would spawn another concurrent clone+deliver. Keyed by
-	// workspace ID; the entry is cleared when the reconcile goroutine returns.
-	mcpRecoveryInflight sync.Map
+	// mcpRecoveryLastFire rate-limits the RCA#2970 deadlock-break reconcile (#33).
+	// The gate fails on EVERY heartbeat until the management MCP lands, so without
+	// a throttle a concierge that cannot recover (e.g. a missing plugin-source
+	// token, and where deliver() restarts the container) would re-fire a
+	// clone+deliver every heartbeat interval — restart churn that never converges.
+	// Keyed by workspace ID → time.Time of the last fire; a new fire is allowed
+	// only after mcpRecoveryCooldown. The happy path leaves the mcp-missing state
+	// on the next heartbeat (MCP now present), so the cooldown only throttles the
+	// genuinely-stuck case. Stored-before-fire so concurrent heartbeats can't both
+	// fire (the second sees the just-stored timestamp); a rare double-fire is
+	// harmless — ReconcileWorkspacePlugins is idempotent.
+	mcpRecoveryLastFire sync.Map
 }
+
+// mcpRecoveryCooldown bounds how often a single concierge's RCA#2970
+// deadlock-break reconcile may fire (#33). Long enough to cover a
+// clone+deliver+restart+boot cycle so a stuck concierge retries gently rather
+// than hammering, short enough to self-heal a transient miss within minutes.
+const mcpRecoveryCooldown = 5 * time.Minute
 
 func NewRegistryHandler(b *events.Broadcaster) *RegistryHandler {
 	return &RegistryHandler{broadcaster: b}
@@ -170,22 +181,25 @@ func (h *RegistryHandler) fireReconcileOnline(ctx context.Context, workspaceID s
 // failure) it logs loudly and the concierge stays failed — the correct
 // fail-closed outcome, now with a root cause surfaced in the logs.
 //
-// Guarded by mcpRecoveryInflight so a sustained-missing concierge fires AT MOST
-// one concurrent recovery reconcile (the gate fails on every heartbeat until
-// the MCP lands). nil-safe via the reconcilePlugins check + the empty-id guard.
+// Rate-limited per workspace by mcpRecoveryLastFire/mcpRecoveryCooldown so a
+// sustained-missing concierge retries gently (the gate fails on every heartbeat
+// until the MCP lands) rather than re-firing a clone+deliver every beat.
+// nil-safe via the reconcilePlugins check + the empty-id guard.
 func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspaceID string) {
 	if h.reconcilePlugins == nil || workspaceID == "" {
 		return
 	}
-	if _, inflight := h.mcpRecoveryInflight.LoadOrStore(workspaceID, struct{}{}); inflight {
-		return // a recovery reconcile is already running for this workspace
+	if last, ok := h.mcpRecoveryLastFire.Load(workspaceID); ok {
+		if t, _ := last.(time.Time); time.Since(t) < mcpRecoveryCooldown {
+			return // fired recently — let the in-flight reconcile converge
+		}
 	}
+	// Store BEFORE firing so a concurrent heartbeat sees the fresh timestamp and
+	// does not double-fire (a rare race double-fire is harmless — idempotent).
+	h.mcpRecoveryLastFire.Store(workspaceID, time.Now())
 	rctx := context.WithoutCancel(ctx)
 	wsID := workspaceID
-	globalGoAsync(func() {
-		defer h.mcpRecoveryInflight.Delete(wsID)
-		h.reconcilePlugins(rctx, wsID)
-	})
+	globalGoAsync(func() { h.reconcilePlugins(rctx, wsID) })
 }
 
 // validateAgentURL rejects URLs that could be used as SSRF vectors against
