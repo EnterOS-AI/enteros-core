@@ -2768,10 +2768,77 @@ def test_load_enforced_file_contexts_excludes_pending_tail(tmp_path):
     assert not any("E2E Staging" in c for c in out)
 
 
-def test_load_enforced_file_contexts_missing_file_is_fail_soft(tmp_path):
-    # Missing file → [] (BP+governance still enforced; lint catches deletion).
-    out = _REAL_LOAD_ENFORCED(str(tmp_path / "nope.txt"))
-    assert out == []
+def test_EnforcedContextsUnavailable_inherits_from_ApiError():
+    # So main()'s `except ApiError` handler catches it → rc 1 (no merge + page).
+    assert issubclass(mq.EnforcedContextsUnavailable, mq.ApiError)
+
+
+def test_load_enforced_file_contexts_missing_file_fails_closed(tmp_path):
+    # RC 13618: a MISSING SSOT file must NOT silently disable enforcement
+    # (the old fail-OPEN returned []). It now raises so the gate HOLDS.
+    with pytest.raises(mq.EnforcedContextsUnavailable):
+        _REAL_LOAD_ENFORCED(str(tmp_path / "nope.txt"))
+
+
+def test_load_enforced_file_contexts_unreadable_file_fails_closed(tmp_path):
+    # An UNREADABLE path (here: a directory → IsADirectoryError, an OSError)
+    # is a read failure → fail-closed raise, not an empty allowlist.
+    with pytest.raises(mq.EnforcedContextsUnavailable):
+        _REAL_LOAD_ENFORCED(str(tmp_path))
+
+
+def test_load_enforced_file_contexts_corrupt_nonutf8_fails_closed(tmp_path):
+    # A corrupt/binary SSOT raises UnicodeDecodeError (a ValueError, NOT an
+    # OSError). It must STILL fail closed CLEANLY as EnforcedContextsUnavailable
+    # — not slip through as an unhandled traceback. (Audit RC 13618 follow-up.)
+    p = tmp_path / "required-contexts.txt"
+    p.write_bytes(b"CI / all-required\n\xff\xfe not utf-8 \x80\x81\n")
+    with pytest.raises(mq.EnforcedContextsUnavailable):
+        _REAL_LOAD_ENFORCED(str(p))
+
+
+def test_load_enforced_file_contexts_empty_file_is_valid_empty(tmp_path):
+    # DISTINCT from a read failure: a file that READS fine but is
+    # legitimately empty (comments only) returns [] WITHOUT raising — a valid
+    # "enforce BP + governance only" state, not the RC 13618 error.
+    path = _write_ctx_file(tmp_path, "# only a comment\n\n   \n")
+    assert _REAL_LOAD_ENFORCED(path) == []
+
+
+def test_load_enforced_file_contexts_all_pending_is_valid_empty(tmp_path):
+    # Every entry parked below the pending marker → readable, empty enforced
+    # set → [] (no raise). The sequencing escape hatch must not fail closed.
+    path = _write_ctx_file(
+        tmp_path,
+        "# pending-#3159 (not yet enforced)\n"
+        "E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot\n",
+    )
+    assert _REAL_LOAD_ENFORCED(path) == []
+
+
+def test_process_once_fails_closed_when_enforced_contexts_unreadable(monkeypatch):
+    """RC 13618 integration: if the SSOT file can't be read at merge time,
+    process_once must NOT merge. The loader raises EnforcedContextsUnavailable
+    (before the candidate loop); process_once lets it propagate so main()
+    surfaces rc 1 (no merge + operators paged) — never a silent fall-back to
+    BP + governance only."""
+    merged = {"called": False}
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "get_branch_protection", lambda branch: mq.BranchProtection(
+        required_contexts=["CI / all-required (pull_request)"],
+        required_approvals=2,
+        block_on_rejected_reviews=True,
+    ))
+
+    def boom(path):
+        raise mq.EnforcedContextsUnavailable(f"{path} unreadable (simulated)")
+    # Override the autouse []-stub: this test exercises a read FAILURE.
+    monkeypatch.setattr(mq, "load_enforced_file_contexts", boom)
+    monkeypatch.setattr(mq, "merge_pull", lambda *a, **k: merged.__setitem__("called", True))
+
+    with pytest.raises(mq.EnforcedContextsUnavailable):
+        mq.process_once(dry_run=False)
+    assert merged["called"] is False
 
 
 def test_enforced_file_contexts_green_event_insensitive_match():

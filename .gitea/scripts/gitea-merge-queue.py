@@ -395,6 +395,20 @@ class BranchProtectionUnavailable(ApiError):
     required-context set (fail-closed, no fail-open)."""
 
 
+class EnforcedContextsUnavailable(ApiError):
+    """The SSOT enforced-contexts file (`.gitea/required-contexts.txt`) could
+    not be READ (missing or unreadable). The queue must HOLD rather than merge
+    with the file-sourced SSOT enforcement SILENTLY DISABLED — returning an
+    empty enforced set on a read failure is a fail-OPEN that defeats the whole
+    point of #3181 (a deleted/unreadable SSOT would let the gate fall back to
+    BP + governance only, exactly the force-merge-over-red class #3207 closes).
+
+    DISTINCT from a successfully-read but legitimately-EMPTY file (only comments,
+    or every entry parked below a `# pending-#NNNN` marker): that returns [] and
+    enforces BP + governance only, which is a valid, intended state — NOT this
+    error. Only an OSError opening/reading the file raises this."""
+
+
 @dataclasses.dataclass(frozen=True)
 class MergeDecision:
     ready: bool
@@ -559,22 +573,35 @@ def load_enforced_file_contexts(path: str) -> list[str]:
         the marker so shipping the gate does not freeze merges, then
         promote it (move it above the marker) once it goes green.
 
-    Fail-closed contract: if the file is MISSING or UNREADABLE, returns []
-    (the gate keeps enforcing BP + governance — it never silently widens,
-    but it also must not crash the whole queue on a missing file). A missing
-    file is independently caught by lint_no_coe_on_required, which hard-fails
-    PR CI, so a deleted SSOT cannot land unnoticed.
+    Fail-closed contract (RC 13618): if the file is MISSING or UNREADABLE,
+    RAISE EnforcedContextsUnavailable. The merge gate must HOLD rather than
+    silently fall back to BP + governance only — returning [] on a read
+    failure was a fail-OPEN: a deleted/unreadable SSOT would disable the
+    file-sourced enforcement WITHOUT any merge being blocked. The lint
+    (lint_no_coe_on_required) only guards the PR-CI path on the proposing
+    branch; it does NOT protect the queue at merge time against a file that
+    is absent/unreadable in the queue's own checkout, so the gate cannot
+    delegate its fail-closed duty to the lint. A successfully-read file that
+    is legitimately empty (comments only, or all entries below a pending
+    marker) still returns [] — that is a valid "enforce BP + governance only"
+    state, not an error.
     """
     enforced: list[str] = []
     try:
         with open(path, encoding="utf-8") as fh:
             lines = fh.readlines()
-    except OSError as exc:
-        sys.stderr.write(
-            f"::warning::enforced-contexts file {path} unreadable ({exc}); "
-            "merge gate enforces BP + governance only this tick\n"
-        )
-        return enforced
+    except (OSError, UnicodeError) as exc:
+        # OSError = missing / permission / IO failure; UnicodeError (incl.
+        # UnicodeDecodeError, a ValueError NOT an OSError) = a corrupt/binary
+        # SSOT file. BOTH mean "cannot read the gate's source of truth" and
+        # must fail closed CLEANLY as an unavailable-SSOT incident — not slip
+        # past as an unhandled traceback that main()'s ApiError handler would
+        # not classify. (Audit RC 13618 follow-up.)
+        raise EnforcedContextsUnavailable(
+            f"enforced-contexts SSOT {path} unreadable/undecodable ({exc!r}); "
+            "merge gate HOLDS the tick (fail-closed) rather than silently "
+            "enforcing BP + governance only"
+        ) from exc
     in_pending_tail = False
     for raw in lines:
         if _PENDING_MARKER_RE.match(raw):
@@ -1311,6 +1338,12 @@ def evaluate_merge_readiness(
     #     freezing the whole queue. Fail-closed: a red/missing enforced context
     #     returns `wait`, so the flow NEVER reaches the force_merge path below
     #     for it. This runs AFTER step 4 so a BP-required red is reported first.
+    # `enforced_file_contexts` here is ALWAYS a real (possibly empty) list:
+    # a read FAILURE was converted to an EnforcedContextsUnavailable hold at
+    # the call site BEFORE this function runs (RC 13618), so reaching here
+    # with [] / None means "the SSOT was read and has nothing extra to
+    # enforce", NOT "couldn't read it". Do not reintroduce a None→[] error
+    # sentinel through this path.
     enforced = enforced_file_contexts or []
     if enforced:
         efok, efbad = enforced_file_contexts_green(latest, enforced)
@@ -1650,6 +1683,13 @@ def process_once(*, dry_run: bool = False) -> int:
     # `.gitea/required-contexts.txt` is ALSO merge-blocking, fail-closed and
     # event-suffix-insensitive, regardless of whether each entry is in BP.
     # Entries below a `# pending-#NNNN` marker are excluded (sequencing).
+    # FAIL-CLOSED (RC 13618): if the SSOT file is missing/unreadable here,
+    # load_enforced_file_contexts raises EnforcedContextsUnavailable (an
+    # ApiError) BEFORE the candidate loop. We deliberately do NOT catch it:
+    # it propagates to main()'s ApiError handler → rc 1 (no merge + operators
+    # paged). A vanished merge-gate SSOT is an incident, not a transient to be
+    # held silently — unlike BranchProtectionUnavailable, which can be a Gitea
+    # blip and is held quietly with rc 0.
     enforced_file_contexts = load_enforced_file_contexts(ENFORCED_CONTEXTS_FILE)
     print(
         f"::notice::queue policy from branch protection: "
@@ -2127,7 +2167,11 @@ def enumerate_readiness(*, dry_run: bool = False) -> list[ReadinessEntry]:
     """Evaluate ALL candidates and return their readiness states.
 
     Fail-closed: if branch protection cannot be fetched, raise
-    BranchProtectionUnavailable (caller must handle). Unlike
+    BranchProtectionUnavailable; if the enforced-contexts SSOT file is
+    missing/unreadable, load_enforced_file_contexts raises
+    EnforcedContextsUnavailable. Both propagate to main()'s ApiError
+    handler (rc 1) — this read-only report must surface a broken gate, not
+    print a summary derived from a silently-disabled SSOT. Unlike
     process_once, this does NOT stop at the first actionable candidate;
     it evaluates every eligible PR and returns the full list so a
     post-batch summary can be printed.
