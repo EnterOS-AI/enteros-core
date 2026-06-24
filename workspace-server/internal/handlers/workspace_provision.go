@@ -1686,6 +1686,21 @@ func loadWorkspaceSecrets(ctx context.Context, workspaceID string) (map[string]s
 			log.Printf("Provisioner: workspace_secrets rows.Err workspace=%s: %v", workspaceID, err)
 		}
 	}
+
+	// Provider BASE_URL fallback (RFC internal#417): when the operator
+	// saved a vendor API key (e.g. MINIMAX_API_KEY) but no matching
+	// <PROVIDER>_BASE_URL, inject the canonical regional URL so the
+	// in-workspace adapter doesn't fall back to its hardcoded default
+	// (which is wrong for at least MiniMax — api.minimaxi.com China vs
+	// api.minimax.io global). Operator-saved URLs win; this only fills
+	// holes. See provider_defaults.go for the registry + precedence.
+	if injected := applyProviderBaseURLDefaults(envVars); len(injected) > 0 {
+		for _, k := range injected {
+			log.Printf("Provisioner: provider BASE_URL fallback applied for %s: %s=%s",
+				workspaceID, k, envVars[k])
+		}
+	}
+
 	return envVars, globalKeys, workspaceKeys, ""
 }
 
