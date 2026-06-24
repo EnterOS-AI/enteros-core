@@ -1,54 +1,64 @@
-# SSOT: the branch-protection REQUIRED status contexts on molecule-core
-# main. Authoritative for lint-no-coe-on-required (CI cannot always read
-# branch_protections; when a repo-admin token is present the lint also
-# live-cross-checks this list against BP and fails on drift).
+# SSOT: the ENFORCED "required to merge" status contexts on molecule-core
+# main. This file is now AUTHORITATIVE AND ENFORCED (internal#3181):
 #
-# Form: "<workflow name> / <job name>" (event suffix stripped). Verified
-# 2026-06-10 against GET /api/v1/repos/molecule-ai/molecule-core/branch_protections.
-# Keep in sync with branch protection; lint-required-context-exists-in-bp
-# is the cousin that guards the other direction.
+#   1. lint-no-coe-on-required reads it as the required-context allowlist
+#      (CI cannot always read branch_protections; when a repo-admin token
+#      is present the lint also live-cross-checks against BP and fails when
+#      live BP has a context NOT in this list).
+#   2. THE MERGE QUEUE (gitea-merge-queue.py, the bot that actually performs
+#      merges via the operator conductor tick) now ENFORCES every entry
+#      ABOVE the `# pending-` marker below: each must be `success` on the PR
+#      head before the PR can merge, fail-closed and event-suffix-insensitive
+#      — REGARDLESS of whether the entry is in branch-protection
+#      status_check_contexts. This closes the gap where a context listed
+#      here but absent from BP was treated as a non-required ADVISORY red
+#      and force_merge=true bypassed it (PR#3181 merged with
+#      `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates
+#      Workspace` RED for exactly this reason).
+#
+# Form: "<workflow name> / <job name>" (event suffix stripped — the gate
+# strips `(pull_request)` / `(push)` / `(pull_request_target)` on both
+# sides before matching). Keep this list curated: anything ABOVE the
+# pending marker WILL block every merge if it is red.
+#
+# ── SEQUENCING (READ BEFORE EDITING) ────────────────────────────────────
+# Entries AT OR BELOW the first `# pending-#NNNN (not yet enforced)` marker
+# line are DOCUMENTED-required but NOT enforced by the merge queue. This is
+# the escape hatch that lets a known-red, separately-tracked check live in
+# the SSOT without freezing the whole queue. To PROMOTE a parked context to
+# enforced: verify it is green on main, then MOVE its line above the marker
+# (and ideally collapse the marker once its section is empty). To PARK a
+# context that has started failing for a tracked reason: move it below the
+# marker and reference the tracking issue, rather than deleting it.
+# ────────────────────────────────────────────────────────────────────────
+
+# ── ENFORCED (merge-blocking) ──────────────────────────────────────────
 CI / all-required
 E2E API Smoke Test / E2E API Smoke Test
 Handlers Postgres Integration / Handlers Postgres Integration
 E2E Peer Visibility (literal MCP list_peers) / E2E Peer Visibility
 Secret scan / Scan diff for credential-shaped strings
 template-delivery-e2e / Template-asset delivery (fresh seo-agent — config+prompts via asset channel, seo-all via plugin reconcile)
-E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
-# #48 (RCA molecule-controlplane #878→#885): real platform-managed boot is now
-# merge-blocking. SSOT updated here in the same PR that removed continue-on-error
-# (lint-no-coe-on-required forbids CoE on any listed context). REMAINING OWNER
-# ACTION: add "E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot
-# (pull_request)" to branch_protections/main.status_check_contexts AFTER this PR
-# merges (allowlist-superset-of-BP is lint-clean; BP-superset-of-allowlist is not).
-E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot
-# #3141 (CTO-authorized): make the three review-team gates TRULY merge-blocking.
-# Today they post commit statuses but are NOT in BP, so a PR merges once its 4
-# BP-required contexts are green regardless of the review verdicts (proven: #3131
-# merged with qa-review red).
-#
-# MECHANISM — Path B (owner BP flip) is the ONLY option; Path A (sentinel) is
-# structurally impossible: `CI / all-required` is a plain `needs:` aggregator
-# over CI's OWN jobs (ci.yml). Gitea has no cross-workflow `needs:`, and the
-# poll-the-status-API design was deliberately removed (runner-squat RCA
-# 2026-06-01). These three contexts are emitted by SEPARATE workflow files on
-# pull_request_target / pull_request_review events, so the sentinel cannot gate
-# them — which is exactly why ci-required-drift.py F4 enforces cross-workflow
-# required contexts in BP directly.
-#
-# BP variant = (pull_request_target): it fires on every PR open/synchronize and
-# starts RED when there is no APPROVE (review-check.sh exits 1 → job conclusion
-# publishes `failure`) — fail-closed, no false-green, no deadlock. The
-# pull_request_review path explicitly RE-POSTS the (pull_request_target) context
-# to flip green on a genuine non-author APPROVE (same shape as sop-checklist).
-# Requiring (pull_request_review) instead would deadlock (absent-until-review =
-# pending forever).
-#
-# REMAINING OWNER ACTION: after THIS PR merges, PATCH
-# branch_protections/main.status_check_contexts to ADD the three
-# `(pull_request_target)` variants of the contexts below (keep the existing 4).
-# Allowlist-superset-of-BP is lint-clean; BP-superset-of-allowlist is not — so
-# the allowlist (this file) MUST land first, BP flip second. See #3141.
+# #3141 (CTO-authorized): the three review-team gates are merge-blocking.
+# They post commit statuses on pull_request_target / pull_request_review.
+# The merge queue already enforces qa-review/security-review/sop-checklist
+# via GOVERNANCE_REQUIRED_CONTEXTS; listing them here makes the SSOT
+# complete and keeps lint-no-coe-on-required honest. Event suffix stripped.
 qa-review / approved
 security-review / approved
-reserved-path-review / reserved-path-review
 sop-checklist / all-items-acked
+reserved-path-review / reserved-path-review
+
+# pending-#3159 (not yet enforced) ──────────────────────────────────────
+# The two E2E Staging SaaS contexts below are DOCUMENTED-required but are
+# currently RED, blocked by #3159 (a separate runtime PR is fixing it in
+# parallel). They are PARKED here so this enforcement change can ship
+# WITHOUT freezing every merge. SEQUENCING: once #3159 is green on main and
+# these two contexts are reliably `success`, PROMOTE them by moving the two
+# lines above this marker (and remove this block). Do NOT promote them while
+# #3159 is open — doing so will freeze the merge queue.
+#
+# #48 (RCA molecule-controlplane #878→#885): real platform-managed boot is
+# the intended merge gate. #3081: concierge create-workspace likewise.
+E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
+E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot
