@@ -65,9 +65,11 @@ JSON
 fail() { echo "FAIL: $1"; exit 1; }
 # run <env opts/assignments...>  → exit code preserved, output in $OUT.
 # env opts (-u) must precede NAME=VALUE assignments (BSD env), so "$@" goes first.
+# clone-manifest.sh is run with `bash` (NOT sh): it uses `set -o pipefail`, which
+# dash (the CI runner's /bin/sh) rejects — and production runs it via bash too.
 run() {
     OUT=$(env "$@" PATH="$WORK/bin:$PATH" \
-        sh "$CLONE_SH" "$WORK/manifest.json" "$WORK/ws" "$WORK/org" "$WORK/plugins" 2>&1)
+        bash "$CLONE_SH" "$WORK/manifest.json" "$WORK/ws" "$WORK/org" "$WORK/plugins" 2>&1)
     rc=$?
     printf '%s\n' "$OUT" > "$WORK/last.out"
     return $rc

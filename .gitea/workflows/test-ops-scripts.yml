@@ -123,7 +123,9 @@ jobs:
         run: |
           set -euo pipefail
           command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
-          sh scripts/test-clone-manifest-tolerant.sh
+          # bash, not sh: the runner's /bin/sh is dash, and clone-manifest.sh
+          # (which this test drives) uses `set -o pipefail` — undefined in dash.
+          bash scripts/test-clone-manifest-tolerant.sh
 
       - name: clone-manifest.sh provider-resolution contract (network-free)
         # Regression lock for per-provider host+token resolution in clone-manifest.sh:
@@ -133,4 +135,5 @@ jobs:
         run: |
           set -euo pipefail
           command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
-          sh scripts/test-clone-manifest-provider.sh
+          # bash, not sh (see tolerant step above): clone-manifest.sh needs pipefail.
+          bash scripts/test-clone-manifest-provider.sh
