@@ -75,7 +75,6 @@ func (s *Sender) Send(ctx context.Context, messages []Message) ([]SendResult, er
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Encoding", "gzip, deflate")
 	if s.expoToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.expoToken)
 	}
