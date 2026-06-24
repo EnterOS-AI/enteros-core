@@ -707,7 +707,7 @@ func TestRestartWorkspaceAuto_RoutesToDockerWhenOnlyDocker(t *testing.T) {
 	// recovered by logProvisionPanic. Without this wait, the goroutine
 	// outlives the test and writes to a sqlmock that the NEXT test
 	// owns, causing a `was not expected` race.
-	time.Sleep(200 * time.Millisecond)
+	h.waitAsyncForTest()
 
 	// Stop call is synchronous on the Docker leg.
 	if len(stub.stopped) == 0 || stub.stopped[0] != wsID {

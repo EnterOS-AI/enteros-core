@@ -297,8 +297,7 @@ func TestProxyA2A_Upstream502_TriggersContainerDeadCheck(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	handler.ProxyA2A(c)
-
-	time.Sleep(80 * time.Millisecond)
+	handler.waitAsyncForTest()
 
 	// Caller sees a structured 503 (NOT the upstream 502 which CF would mask).
 	if w.Code != http.StatusServiceUnavailable {
@@ -354,7 +353,7 @@ func TestProxyA2A_Upstream502_AliveAgent_PropagatesAsIs(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	handler.ProxyA2A(c)
-	time.Sleep(50 * time.Millisecond)
+	handler.waitAsyncForTest()
 
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("alive agent 502 should propagate as 502; got %d: %s", w.Code, w.Body.String())
