@@ -51,3 +51,4 @@ E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot
 qa-review / approved
 security-review / approved
 reserved-path-review / reserved-path-review
+sop-checklist / all-items-acked
