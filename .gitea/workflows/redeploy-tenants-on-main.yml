@@ -8,7 +8,9 @@ name: redeploy-tenants-on-main
 #   - Dropped `environment:` blocks (Gitea has no environments).
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
-#   - `continue-on-error: true` on each job (RFC §1 contract).
+#   - `continue-on-error: true` on the redeploy job REMOVED (internal#3210 FIX
+#     E): it masked the prod redeploy/rollback gates so a failure reported
+#     success. A side-effecting prod action must surface failure.
 #   - Dropped unsupported `workflow_run` (task #81).
 #   - Later changed to manual-only after publish-workspace-server-image.yml
 #     gained an integrated ordered production deploy job.
@@ -72,9 +74,14 @@ jobs:
     # Production tenant redeploy — a deploy action, reserved capacity so
     # it never queues behind PR-CI. `publish` -> molecule-runner-publish-*.
     runs-on: publish
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # mc#2654 root-fix (internal#3210 FIX E): this is a SIDE-EFFECTING prod
+    # action (redeploy/rollback), not an advisory lint. A job-level
+    # `continue-on-error: true` masked the real gates below — HTTP!=200 and
+    # ok!=true at the redeploy POST, and the stale/unreachable /buildinfo
+    # verify — so a FAILED prod redeploy reported success. Removed so a real
+    # failure surfaces. The kill-switch guard step already short-circuits
+    # cleanly via its own `if:` / `exit 0`, so dropping the mask does not
+    # red the job on a legitimate "deploy disabled" skip.
     timeout-minutes: 25
     env:
       # Rule 9 fix: keep the same operational kill switch surface as the
