@@ -1269,3 +1269,183 @@ func TestA2AErrorFromBody_InvalidJSON(t *testing.T) {
 		t.Errorf("a2aErrorFromBody(invalid) = %q, want empty", got)
 	}
 }
+
+// ── extractResponseSummary coverage ───────────────────────────────────────────
+
+func TestExtractResponseSummary_EmptyBody(t *testing.T) {
+	s := New(nil, nil)
+	if got := s.extractResponseSummary(nil); got != "" {
+		t.Errorf("nil body: got %q, want %q", got, "")
+	}
+	if got := s.extractResponseSummary([]byte{}); got != "" {
+		t.Errorf("empty body: got %q, want %q", got, "")
+	}
+}
+
+func TestExtractResponseSummary_InvalidJSON(t *testing.T) {
+	s := New(nil, nil)
+	got := s.extractResponseSummary([]byte(`not json`))
+	if got != "" {
+		t.Errorf("invalid JSON: got %q, want %q", got, "")
+	}
+}
+
+func TestExtractResponseSummary_NoResultKey(t *testing.T) {
+	s := New(nil, nil)
+	got := s.extractResponseSummary([]byte(`{"error": "oops"}`))
+	if got != "" {
+		t.Errorf("no result key: got %q, want %q", got, "")
+	}
+}
+
+func TestExtractResponseSummary_EmptyResult(t *testing.T) {
+	s := New(nil, nil)
+	got := s.extractResponseSummary([]byte(`{"result": {}}`))
+	if got != "" {
+		t.Errorf("empty result: got %q, want %q", got, "")
+	}
+}
+
+func TestExtractResponseSummary_NoPartsKey(t *testing.T) {
+	s := New(nil, nil)
+	got := s.extractResponseSummary([]byte(`{"result": {"data": "hello"}}`))
+	if got != "" {
+		t.Errorf("no parts key: got %q, want %q", got, "")
+	}
+}
+
+func TestExtractResponseSummary_EmptyPartsArray(t *testing.T) {
+	s := New(nil, nil)
+	got := s.extractResponseSummary([]byte(`{"result": {"parts": []}}`))
+	if got != "" {
+		t.Errorf("empty parts: got %q, want %q", got, "")
+	}
+}
+
+func TestExtractResponseSummary_PartsWithText(t *testing.T) {
+	s := New(nil, nil)
+	got := s.extractResponseSummary([]byte(`{"result": {"parts": [{"text": "Hello world"}]}}`))
+	if got != "Hello world" {
+		t.Errorf("got %q, want %q", got, "Hello world")
+	}
+}
+
+func TestExtractResponseSummary_MultipleParts(t *testing.T) {
+	// The function returns the FIRST non-empty text it finds.
+	s := New(nil, nil)
+	got := s.extractResponseSummary([]byte(`{"result": {"parts": [{"text": ""}, {"text": "second"}]}}`))
+	if got != "second" {
+		t.Errorf("got %q, want %q", got, "second")
+	}
+}
+
+func TestExtractResponseSummary_NonStringText(t *testing.T) {
+	s := New(nil, nil)
+	got := s.extractResponseSummary([]byte(`{"result": {"parts": [{"text": 42}]}}`))
+	if got != "" {
+		t.Errorf("non-string text: got %q, want %q", got, "")
+	}
+}
+
+// ── maybeSweepPhantomBusy coverage ─────────────────────────────────────────────
+
+// phantomSweepInterval = 5 minutes. maybeSweepPhantomBusy skips the DB query
+// when lastSweepAt is within the interval.
+
+func TestMaybeSweepPhantomBusy_SkipsWithinInterval(t *testing.T) {
+	mock := setupTestDB(t)
+	// No DB calls expected since we skip within the interval.
+
+	s := New(nil, nil)
+	s.mu.Lock()
+	s.lastSweepAt = time.Now() // just swept
+	s.mu.Unlock()
+
+	s.maybeSweepPhantomBusy(context.Background())
+
+	// Verify no DB calls were made.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected DB call: %v", err)
+	}
+}
+
+func TestMaybeSweepPhantomBusy_RunsWhenStale(t *testing.T) {
+	mock := setupTestDB(t)
+
+	// Return a row so the sweep logs one reset.
+	rows := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow("ws-phantom", "Phantom Agent")
+	mock.ExpectQuery(`UPDATE workspaces`).
+		WillReturnRows(rows)
+
+	s := New(nil, nil)
+	s.mu.Lock()
+	s.lastSweepAt = time.Now().Add(-6 * time.Minute) // older than 5 min interval
+	s.mu.Unlock()
+
+	s.maybeSweepPhantomBusy(context.Background())
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+
+	// Verify lastSweepAt was updated.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if time.Since(s.lastSweepAt) > time.Second {
+		t.Error("lastSweepAt should be updated to time.Now() after a sweep")
+	}
+}
+
+func TestMaybeSweepPhantomBusy_StaleFirstSweep(t *testing.T) {
+	// Zero time.Time is treated as "never swept" — time.Since(zero) is many years,
+	// which is > 5 min, so the sweep runs on first call.
+	mock := setupTestDB(t)
+
+	rows := sqlmock.NewRows([]string{"id", "name"})
+	mock.ExpectQuery(`UPDATE workspaces`).
+		WillReturnRows(rows)
+
+	s := New(nil, nil)
+	// lastSweepAt is zero (never swept) — this should trigger the sweep.
+	s.maybeSweepPhantomBusy(context.Background())
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// ── sweepPhantomBusy DB-error coverage ──────────────────────────────────────────
+
+func TestSweepPhantomBusy_QueryError(t *testing.T) {
+	mock := setupTestDB(t)
+
+	mock.ExpectQuery(`UPDATE workspaces`).
+		WillReturnError(errDBDown)
+
+	s := New(nil, nil)
+	// Should not panic — error is logged and function returns.
+	s.sweepPhantomBusy(context.Background())
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+func TestSweepPhantomBusy_RowsError(t *testing.T) {
+	// Query succeeds but rows.Next() returns an error.
+	mock := setupTestDB(t)
+
+	rows := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow("ws-1", "Test Agent").
+		RowError(0, errDBDown)
+	mock.ExpectQuery(`UPDATE workspaces`).
+		WillReturnRows(rows)
+
+	s := New(nil, nil)
+	s.sweepPhantomBusy(context.Background())
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
