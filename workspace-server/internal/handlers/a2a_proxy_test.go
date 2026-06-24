@@ -2926,20 +2926,25 @@ func TestProxyA2A_PollMode_CanvasUserCallerID_PropagatesToActivityLog(t *testing
 	// which is exactly how the regression in #1675 escaped CI: the INSERT
 	// fired, but with source_id=NULL because callerID propagation was
 	// bypassed somewhere upstream. Pin the source_id position explicitly.
+	//
+	// #2560: the INSERT now carries message_id ($13) inside a CTE that also
+	// updates workspaces.last_activity_at; the query text still contains
+	// "INSERT INTO activity_logs" so the substring expectation matches.
 	mock.ExpectExec("INSERT INTO activity_logs").
 		WithArgs(
-			targetWS,                  // workspace_id
-			"a2a_receive",             // activity_type
-			canvasUserWS,              // source_id (NOT NULL the contract this test exists to pin)
-			targetWS,                  // target_id
-			"message/send",            // method
-			sqlmock.AnyArg(),          // summary
-			sqlmock.AnyArg(),          // request_body
-			sqlmock.AnyArg(),          // response_body (nil for queued)
-			sqlmock.AnyArg(),          // tool_trace
-			sqlmock.AnyArg(),          // duration_ms
-			"ok",                      // status
-			sqlmock.AnyArg(),          // error_detail
+			targetWS,         // workspace_id
+			"a2a_receive",    // activity_type
+			canvasUserWS,     // source_id (NOT NULL the contract this test exists to pin)
+			targetWS,         // target_id
+			"message/send",   // method
+			sqlmock.AnyArg(), // summary
+			sqlmock.AnyArg(), // request_body
+			sqlmock.AnyArg(), // response_body (nil for queued)
+			sqlmock.AnyArg(), // tool_trace
+			sqlmock.AnyArg(), // duration_ms
+			"ok",             // status
+			sqlmock.AnyArg(), // error_detail
+			sqlmock.AnyArg(), // message_id (#2560 idempotent upsert)
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -3325,7 +3330,6 @@ func TestInjectCanvasUserIdentity_Nil(t *testing.T) {
 	}
 }
 
-
 // ==================== ProxyA2A — canvas cap-and-queue (core#2751) ====================
 
 // When A2A_CANVAS_SYNC_BUDGET > 0, a canvas turn that outlives the budget is
@@ -3659,7 +3663,6 @@ func TestProxyA2A_CanvasCapAndQueue_EndToEndContract(t *testing.T) {
 		t.Fatalf("expected A2A_RESPONSE payload to carry the agent's actual reply content (`reply:\"hello\"`) so the canvas can render it; recorded: %+v", rec.snapshotCalls())
 	}
 }
-
 
 // TestLogA2ASuccess_BroadcastsForCanvasUser pins core#2751: the A2A_RESPONSE
 // WS broadcast must fire for an AUTHENTICATED canvas user (isCanvasUser=true,
