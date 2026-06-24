@@ -52,12 +52,14 @@ JSON
 LOG="$WORK/clone.log"
 : > "$LOG"
 
+# clone-manifest.sh is run with `bash` (NOT sh): it uses `set -o pipefail`, which
+# dash (the CI runner's /bin/sh) rejects — and production runs it via bash too.
 run_clone() {
     GIT_CLONE_LOG="$LOG" \
     MOLECULE_GITEA_TOKEN="gtok" \
     MOLECULE_GITHUB_TOKEN="ghtok" \
     PATH="$WORK/bin:$PATH" \
-        sh "$CLONE_SH" "$WORK/manifest.json" "$WORK/ws" "$WORK/org" "$WORK/plugins" >/dev/null 2>&1
+        bash "$CLONE_SH" "$WORK/manifest.json" "$WORK/ws" "$WORK/org" "$WORK/plugins" >/dev/null 2>&1
 }
 
 fail() { echo "FAIL: $1"; exit 1; }
