@@ -129,6 +129,9 @@ def _ready_kwargs(**overrides):
             "state": "success",
             "statuses": [
                 {"context": "CI / all-required (pull_request)", "status": "success"},
+                # CRITICAL fail-closed contexts (RCA core#1676) — a genuinely
+                # ready PR has these green; the step-0 guard requires them.
+                {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
                 {"context": "qa-review / approved (pull_request_target)", "status": "success"},
                 {"context": "security-review / approved (pull_request_target)", "status": "success"},
                 {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
@@ -321,6 +324,7 @@ def test_governance_red_blocks_merge():
         "state": "failure",
         "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "failure"},
             {"context": "security-review / approved (pull_request_target)", "status": "pending"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "failure"},
@@ -341,6 +345,7 @@ def test_non_required_red_does_not_block_merge():
         "state": "failure",
         "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request)", "status": "failure"},
             {"context": "security-review / approved (pull_request)", "status": "pending"},
             {"context": "sop-checklist / all-items-acked (pull_request)", "status": "failure"},
@@ -361,6 +366,7 @@ def test_non_required_advisory_red_does_not_block_merge():
         "state": "failure",  # combined polluted by advisory non-required reds
         "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "success"},
             {"context": "security-review / approved (pull_request_target)", "status": "success"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
@@ -384,7 +390,109 @@ def test_failing_required_context_blocks_even_with_approvals():
     assert decision.ready is False
     assert decision.action == "wait"
     assert decision.force is False
-    assert "required contexts not green" in decision.reason
+    # all-required IS a CRITICAL fail-closed context (RCA core#1676); a failing
+    # all-required is now caught by the step-0 critical guard (an even stronger
+    # block — force_merge cannot bypass it).
+    assert "required context" in decision.reason.lower()
+
+
+# --------------------------------------------------------------------------
+# CRITICAL fail-closed contexts (RCA core#1676 — merged with
+# CI/Platform(Go)=failure AND CI/all-required=skipped onto a red main; the
+# force_merge path swept these up as "non-required reds" and bypassed them).
+# --------------------------------------------------------------------------
+
+def _rca_1676_statuses():
+    """The exact critical-context shape that let core PR #1676 merge red."""
+    return {
+        "state": "failure",
+        "statuses": [
+            {"context": "CI / Platform (Go) (pull_request)", "status": "failure"},
+            {"context": "CI / all-required (pull_request)", "status": "skipped"},
+            {"context": "qa-review / approved (pull_request_target)", "status": "success"},
+            {"context": "security-review / approved (pull_request_target)", "status": "success"},
+            {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
+        ],
+    }
+
+
+def test_critical_contexts_block_helper_flags_1676():
+    latest = mq.latest_statuses_by_context(_rca_1676_statuses()["statuses"])
+    reasons = mq.critical_contexts_block(latest)
+    joined = " ".join(reasons)
+    assert "CI / Platform (Go)" in joined
+    assert "CI / all-required" in joined
+
+
+def test_critical_guard_blocks_1676_even_force_merge_path():
+    # mergeable=True + genuine approvals is the EXACT force_merge precondition
+    # that let #1676 through. The step-0 critical guard must block it anyway,
+    # and the decision must NOT be a (forced) merge.
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            pr_status=_rca_1676_statuses(),
+            # The #1676 gap: BP-required set did NOT enumerate the critical
+            # contexts, so step-4 alone would have let them slip to force.
+            required_contexts=["sop-checklist / all-items-acked (pull_request_target)"],
+            mergeable=True,
+        )
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert decision.force is False
+    assert "CRITICAL" in decision.reason
+
+
+def test_critical_guard_blocks_skipped_all_required():
+    statuses = {
+        "state": "success",  # combined can mask a skipped sentinel as non-failing
+        "statuses": [
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
+            {"context": "CI / all-required (pull_request)", "status": "skipped"},
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_status=statuses, required_contexts=[], mergeable=True)
+    )
+    assert decision.ready is False
+    assert "CI / all-required" in decision.reason
+
+
+def test_critical_guard_blocks_missing_platform_go():
+    statuses = {
+        "state": "success",
+        "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            # CI / Platform (Go) entirely absent → cannot prove green → BLOCK.
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_status=statuses, required_contexts=[], mergeable=True)
+    )
+    assert decision.ready is False
+    assert "CI / Platform (Go)=missing" in decision.reason
+
+
+def test_critical_guard_allows_when_both_green():
+    statuses = {
+        "state": "success",
+        "statuses": [
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            pr_status=statuses,
+            required_contexts=[
+                "CI / Platform (Go) (pull_request)",
+                "CI / all-required (pull_request)",
+            ],
+            mergeable=True,
+        )
+    )
+    assert decision.ready is True
+    assert decision.action == "merge"
 
 
 def test_unmergeable_pr_blocks():
@@ -471,6 +579,7 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
             return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
         return {"state": "success", "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "success"},
             {"context": "security-review / approved (pull_request_target)", "status": "success"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
@@ -544,6 +653,7 @@ def _fully_ready_process_once_monkeypatch(monkeypatch, mergeable, calls):
             return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
         return {"state": "success", "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "success"},
             {"context": "security-review / approved (pull_request_target)", "status": "success"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
@@ -717,7 +827,8 @@ def test_process_once_pauses_when_main_not_green_no_direct_merge(monkeypatch):
             return {"state": "failure",
                     "statuses": [{"context": "CI / all-required (push)", "status": "failure"}]}
         return {"state": "success",
-                "statuses": [{"context": "CI / all-required (pull_request)", "status": "success"}]}
+                "statuses": [{"context": "CI / all-required (pull_request)", "status": "success"},
+                             {"context": "CI / Platform (Go) (pull_request)", "status": "success"}]}
     monkeypatch.setattr(mq, "get_combined_status", red_main_combined)
 
     rc = mq.process_once(dry_run=False)
@@ -955,6 +1066,7 @@ def _stale_pr_update_409_monkeypatch(monkeypatch, queued_issues, calls):
             return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
         return {"state": "success", "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "success"},
             {"context": "security-review / approved (pull_request_target)", "status": "success"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
@@ -1232,6 +1344,7 @@ def _wire_ready_process_once(monkeypatch, *, issues, pr_payload, calls):
             ]}
         return {"state": "success", "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "success"},
             {"context": "security-review / approved (pull_request_target)", "status": "success"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
@@ -1420,6 +1533,7 @@ def _wire_multi_candidate_process_once(monkeypatch, *, issues, pulls, reviews, c
             return {"state": "success", "statuses": [{"context": "CI / all-required (push)", "status": "success"}]}
         return {"state": "success", "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "success"},
             {"context": "security-review / approved (pull_request_target)", "status": "success"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
@@ -1557,6 +1671,7 @@ def test_hol_unready_red_required_ci_is_skipped_for_ready_pr(monkeypatch):
         return {"state": state,
                 "statuses": [
                     {"context": "CI / all-required (pull_request)", "status": state},
+                    {"context": "CI / Platform (Go) (pull_request)", "status": state},
                     {"context": "qa-review / approved (pull_request_target)", "status": "success"},
                     {"context": "security-review / approved (pull_request_target)", "status": "success"},
                     {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},

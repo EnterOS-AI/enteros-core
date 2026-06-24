@@ -173,6 +173,40 @@ GOVERNANCE_REQUIRED_CONTEXTS = [
     "security-review / approved (pull_request_target)",
     "sop-checklist / all-items-acked (pull_request_target)",
 ]
+
+# --------------------------------------------------------------------------
+# CRITICAL fail-closed contexts (RCA: core PR #1676 merged 2026-06-24 with
+# `CI / Platform (Go) = failure` AND `CI / all-required = skipped`, turning
+# main RED. Same class as #3181.)
+# --------------------------------------------------------------------------
+# These two contexts MUST be green before ANY merge, INCLUDING a force_merge.
+# They are checked here UNCONDITIONALLY and INDEPENDENTLY of whatever branch
+# protection happens to enumerate in status_check_contexts — the #1676 gap was
+# precisely that when BP did NOT list these (or listed a different suffix),
+# Platform(Go)=failure + all-required=skipped fell through the required-set
+# check and were then swept up as "non-required reds" and FORCE-MERGED past.
+#
+# Rules (all fail-closed — unverifiable == BLOCK):
+#   * `CI / Platform (Go)`  : must be `success`. failure/error/skipped/missing
+#                              all BLOCK. (skipped/missing = the gate did not
+#                              actually run → cannot prove green.)
+#   * `CI / all-required`   : the aggregator sentinel. `skipped` is FATAL —
+#                              a skipped all-required means the required jobs
+#                              it gates did NOT actually run, so nothing
+#                              gated the merge. failure/error/missing also
+#                              BLOCK; only `success` passes.
+# The context names are matched by their base prefix (the part before the
+# trailing " (pull_request*)" event suffix) so the guard catches the context
+# regardless of which event variant Gitea emitted it under.
+CRITICAL_REQUIRED_CONTEXT_PREFIXES = [
+    name.strip()
+    for name in _env(
+        "CRITICAL_REQUIRED_CONTEXT_PREFIXES",
+        default="CI / Platform (Go),CI / all-required",
+    ).split(",")
+    if name.strip()
+]
+
 REQUIRED_CONTEXTS_RAW = _env(
     "REQUIRED_CONTEXTS",
     default=(
@@ -1102,6 +1136,70 @@ def _non_required_red_present(
     return False
 
 
+def _context_base_name(context: str) -> str:
+    """Strip the trailing ` (pull_request*)` / ` (push)` event suffix from a
+    Gitea status context, returning the stable base name.
+
+    `"CI / Platform (Go) (pull_request)"` -> `"CI / Platform (Go)"`.
+    Note: the inner `(Go)` is preserved — only the FINAL parenthesized event
+    token is removed (it always names a Gitea webhook event).
+    """
+    stripped = context.strip()
+    if stripped.endswith(")"):
+        open_idx = stripped.rfind(" (")
+        if open_idx != -1:
+            inner = stripped[open_idx + 2 : -1]
+            if inner.startswith(("pull_request", "push")):
+                return stripped[:open_idx].strip()
+    return stripped
+
+
+def critical_contexts_block(latest: dict[str, dict]) -> list[str]:
+    """FAIL-CLOSED guard for the CRITICAL_REQUIRED_CONTEXT_PREFIXES.
+
+    Returns a list of human-readable block reasons; an EMPTY list means every
+    critical context is provably green. A NON-empty list means the merge MUST
+    be refused (this gates the normal AND the force_merge path — see
+    evaluate_merge_readiness, which calls this BEFORE any merge decision incl.
+    force).
+
+    Fail-closed semantics (RCA core#1676):
+      * A critical context that is failure/error/skipped/missing → BLOCK.
+        `skipped` and `missing` are FATAL: the gate did not actually run, so
+        we cannot prove it green. (#1676's `all-required = skipped` is the
+        canonical case — a skipped aggregator sentinel means nothing gated
+        the required jobs.)
+      * Only `success` clears a critical context.
+
+    Each critical PREFIX must be matched by at least one observed context whose
+    base name equals it AND that context must be `success`. If the prefix is
+    not present at all in the statuses, that is ALSO a block (missing == not
+    proven green).
+    """
+    # Map base-name -> set of observed states for that base name.
+    observed: dict[str, list[str]] = {}
+    for context, status in latest.items():
+        if not isinstance(context, str):
+            continue
+        base = _context_base_name(context)
+        observed.setdefault(base, []).append(status_state(status))
+
+    reasons: list[str] = []
+    for prefix in CRITICAL_REQUIRED_CONTEXT_PREFIXES:
+        states = observed.get(prefix)
+        if not states:
+            reasons.append(f"{prefix}=missing (critical context not reported — cannot prove green)")
+            continue
+        # Every occurrence of the critical context must be success. A single
+        # failure/error/skipped occurrence blocks (newest-wins was already
+        # applied by latest_statuses_by_context, but a critical context that
+        # appears under multiple event suffixes must ALL be green).
+        bad = [s or "missing" for s in states if s != "success"]
+        if bad:
+            reasons.append(f"{prefix}={','.join(sorted(set(bad)))} (critical context not green)")
+    return reasons
+
+
 def evaluate_merge_readiness(
     *,
     main_status: dict,
@@ -1115,6 +1213,25 @@ def evaluate_merge_readiness(
     pr_labels: set[str] | None = None,
     runtime_bump_exempt: bool = False,
 ) -> MergeDecision:
+    # 0) CRITICAL fail-closed guard (RCA core#1676). Before ANY other gate —
+    #    and BEFORE step 5 computes the force_merge flag — the PR head's
+    #    critical contexts (CI / Platform (Go), CI / all-required) MUST be
+    #    green. This is checked UNCONDITIONALLY, independent of branch
+    #    protection's status_check_contexts, so a force_merge can NEVER bypass
+    #    a red/skipped Platform(Go) or a skipped all-required. #1676 merged red
+    #    because these fell out of the BP-required set and were then swept up
+    #    as "non-required reds" and force-merged. There is no exemption from
+    #    this gate — runtime-bump exemption only bypasses the APPROVALS bar,
+    #    never a red required CI status.
+    pr_latest_critical = latest_statuses_by_context(pr_status.get("statuses") or [])
+    critical_block = critical_contexts_block(pr_latest_critical)
+    if critical_block:
+        return MergeDecision(
+            False, "wait",
+            "CRITICAL required context(s) not green (fail-closed, force_merge "
+            "cannot bypass): " + "; ".join(critical_block),
+        )
+
     # 1) Main's push-required contexts must be green. Combined state can be
     #    "failure" due to non-blocking jobs (continue-on-error: true) that do
     #    not gate merges, so check the explicit required set, not combined.
