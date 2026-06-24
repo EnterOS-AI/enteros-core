@@ -959,3 +959,145 @@ def test_wait_for_ci_context_times_out_fail_closed_when_required_absent(monkeypa
         assert "missing" in str(exc)
     else:
         raise AssertionError("expected fail-closed TimeoutError, not a satisfied gate")
+
+
+# ---------------------------------------------------------------------------
+# FIX C (internal#3210): live kill-switch re-check must FAIL CLOSED.
+#
+# `live_disable_flag` is the emergency re-check immediately before prod side
+# effects. During an incident an operator sets the live Gitea variable
+# PROD_AUTO_DEPLOY_DISABLED=true. If the API read fails (401 on a rotated
+# token, 500, timeout, missing token), the OLD code returned "" (= not
+# disabled) and the rollout PROCEEDED despite the armed kill switch. Only a
+# 404 (variable simply unset) legitimately means not-disabled; anything else
+# must HOLD.
+# ---------------------------------------------------------------------------
+
+_DISABLE_ENV = {
+    "GITEA_TOKEN": "tok",
+    "GITEA_HOST": "git.moleculesai.app",
+    "GITHUB_REPOSITORY": "molecule-ai/molecule-core",
+}
+
+
+def test_live_disable_flag_404_is_the_only_not_disabled_signal(monkeypatch):
+    # 404 = variable unset = genuinely not disabled → empty string, no raise.
+    monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (404, None))
+    assert prod.live_disable_flag(dict(_DISABLE_ENV)) == ""
+
+
+def test_live_disable_flag_returns_value_when_variable_set(monkeypatch):
+    # 200 with a value → return it so assert_not_disabled can act on it.
+    monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (200, {"data": "true"}))
+    assert prod.live_disable_flag(dict(_DISABLE_ENV)) == "true"
+    monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (200, {"value": "true"}))
+    assert prod.live_disable_flag(dict(_DISABLE_ENV)) == "true"
+
+
+@pytest.mark.parametrize("status", [401, 403, 500, 502, 503])
+def test_live_disable_flag_fails_closed_on_read_error(monkeypatch, status):
+    # Any non-404 HTTP error means we could NOT verify the kill switch.
+    # Fail closed: raise (HOLD the deploy) instead of returning "".
+    monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (status, None))
+    with pytest.raises(RuntimeError, match="kill switch"):
+        prod.live_disable_flag(dict(_DISABLE_ENV))
+
+
+def test_live_disable_flag_fails_closed_without_token():
+    # A missing token can't verify the kill switch → HOLD, never assume off.
+    with pytest.raises(RuntimeError, match="GITEA_TOKEN is required"):
+        prod.live_disable_flag({"GITEA_HOST": "git.moleculesai.app"})
+
+
+def test_live_disable_flag_fails_closed_on_network_error(monkeypatch):
+    # A socket timeout / connection drop on the re-check is NOT not-disabled.
+    def boom(_u, _t):
+        raise TimeoutError("read operation timed out")
+
+    monkeypatch.setattr(prod, "_api_json_optional", boom)
+    with pytest.raises(RuntimeError, match="kill switch"):
+        prod.live_disable_flag(dict(_DISABLE_ENV))
+
+
+def test_assert_not_disabled_holds_when_live_recheck_unreadable(monkeypatch):
+    # End-to-end: build_plan says enabled (DISABLED unset in the job env), but
+    # the LIVE re-check read fails → assert_not_disabled must propagate the
+    # raise so the CLI exits non-zero and the deploy HOLDS.
+    monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (500, None))
+    env = dict(_DISABLE_ENV)
+    env["GITHUB_SHA"] = "abcdef1234567890"
+    with pytest.raises(RuntimeError, match="kill switch"):
+        prod.assert_not_disabled(env)
+
+
+def test_assert_not_disabled_proceeds_when_live_recheck_404(monkeypatch):
+    # Happy path: enabled + live variable unset (404) → no raise.
+    monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (404, None))
+    env = dict(_DISABLE_ENV)
+    env["GITHUB_SHA"] = "abcdef1234567890"
+    prod.assert_not_disabled(env)  # must not raise
+
+
+def test_assert_not_disabled_raises_when_live_variable_armed(monkeypatch):
+    # Operator armed the kill switch mid-flight → live re-check sees true → HOLD.
+    monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (200, {"data": "true"}))
+    env = dict(_DISABLE_ENV)
+    env["GITHUB_SHA"] = "abcdef1234567890"
+    with pytest.raises(RuntimeError, match="live Gitea variable"):
+        prod.assert_not_disabled(env)
+
+
+# ---------------------------------------------------------------------------
+# FIX D (internal#3210): empty derived required-context set must HOLD.
+#
+# A non-blank PROD_AUTO_DEPLOY_REQUIRED_CONTEXTS that yields no tokens (e.g.
+# "," / ", ,") parsed to [] in the OLD code → wait_for_ci_context()'s
+# all([]) is vacuously True → the gate returned "success" with ZERO contexts
+# checked → rollout proceeded with no CI verification.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", [",", ", ,", " , ", ",,,", "\n,\n"])
+def test_required_contexts_raises_on_non_blank_but_empty_override(raw):
+    with pytest.raises(ValueError, match="zero"):
+        prod.required_contexts({"PROD_AUTO_DEPLOY_REQUIRED_CONTEXTS": raw})
+
+
+def test_required_contexts_blank_override_still_uses_defaults():
+    # A genuinely blank/unset override is NOT a misconfiguration → defaults.
+    assert prod.required_contexts({"PROD_AUTO_DEPLOY_REQUIRED_CONTEXTS": ""}) == prod.DEFAULT_REQUIRED_CONTEXTS
+    assert prod.required_contexts({"PROD_AUTO_DEPLOY_REQUIRED_CONTEXTS": "   "}) == prod.DEFAULT_REQUIRED_CONTEXTS
+    assert prod.required_contexts({}) == prod.DEFAULT_REQUIRED_CONTEXTS
+
+
+def test_required_contexts_parses_real_override():
+    assert prod.required_contexts(
+        {"PROD_AUTO_DEPLOY_REQUIRED_CONTEXTS": "ctx-a (push), ctx-b (push)"}
+    ) == ["ctx-a (push)", "ctx-b (push)"]
+
+
+def test_wait_for_ci_context_refuses_empty_context_override(monkeypatch):
+    # The misconfigured override propagates up through wait_for_ci_context as a
+    # ValueError BEFORE any status read — the deploy never gets a vacuous pass.
+    monkeypatch.setattr(
+        prod, "fetch_all_statuses", lambda *a, **k: pytest.fail("must not poll with empty contexts")
+    )
+    with pytest.raises(ValueError, match="zero|no required CI contexts"):
+        prod.wait_for_ci_context(
+            {
+                "GITHUB_SHA": "f" * 40,
+                "GITEA_TOKEN": "tok",
+                "PROD_AUTO_DEPLOY_REQUIRED_CONTEXTS": ", ,",
+            }
+        )
+
+
+def test_wait_for_ci_context_refuses_empty_contexts_defense_in_depth(monkeypatch):
+    # Belt-and-suspenders: even if required_contexts() somehow returned [],
+    # wait_for_ci_context must NOT vacuously satisfy the gate (all([]) is True).
+    monkeypatch.setattr(prod, "required_contexts", lambda _env: [])
+    monkeypatch.setattr(
+        prod, "fetch_all_statuses", lambda *a, **k: pytest.fail("must not poll with empty contexts")
+    )
+    with pytest.raises(ValueError, match="no required CI contexts"):
+        prod.wait_for_ci_context({"GITHUB_SHA": "0" * 40, "GITEA_TOKEN": "tok"})

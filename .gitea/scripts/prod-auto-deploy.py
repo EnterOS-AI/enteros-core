@@ -183,7 +183,19 @@ def required_contexts(env: dict[str, str]) -> list[str]:
     raw = env.get("PROD_AUTO_DEPLOY_REQUIRED_CONTEXTS", "")
     if not raw.strip():
         return DEFAULT_REQUIRED_CONTEXTS
-    return [line.strip() for line in raw.replace(",", "\n").splitlines() if line.strip()]
+    contexts = [line.strip() for line in raw.replace(",", "\n").splitlines() if line.strip()]
+    if not contexts:
+        # Fail closed: a NON-blank override that parses to zero contexts (e.g.
+        # "," or ", ,") is a misconfiguration, not "no contexts required". If
+        # we returned [] here, wait_for_ci_context()'s `all([])` would be
+        # vacuously True and the deploy would proceed with ZERO CI verified.
+        # An empty derived set must HOLD, not pass.
+        raise ValueError(
+            "PROD_AUTO_DEPLOY_REQUIRED_CONTEXTS was set but parsed to zero "
+            f"contexts (raw={raw!r}); refusing to deploy with no required CI "
+            "contexts to verify (fail-closed). Unset it to use the defaults."
+        )
+    return contexts
 
 
 def chunks(items: list[str], size: int) -> list[list[str]]:
@@ -639,22 +651,53 @@ def superseded_by(env: dict[str, str]) -> str | None:
 
 
 def live_disable_flag(env: dict[str, str]) -> str:
-    """Return a live disable value from Gitea variables when readable.
+    """Return the live disable value from Gitea variables, fail-CLOSED on read failure.
 
     Gitea evaluates `${{ vars.* }}` once when the job starts. This API read is
     the emergency re-check immediately before production side effects.
+
+    Fail-closed contract: this re-check exists so an operator can ABORT an
+    in-flight rollout during an incident by setting the live
+    `PROD_AUTO_DEPLOY_DISABLED` variable. If the read itself fails — a missing
+    token, a 401 on a rotated token, a 5xx, a network timeout — we MUST NOT
+    treat that as "not disabled" and let the rollout proceed; the kill switch
+    could be armed and we just couldn't see it. The ONLY response that legitimately
+    means "not disabled" is HTTP 404 (the variable is simply unset). Any other
+    non-200 (or missing token / network error) RAISES so the caller HOLDS the
+    deploy.
     """
 
     token = env.get("GITEA_TOKEN", "").strip()
     if not token:
-        return ""
+        raise RuntimeError(
+            "GITEA_TOKEN is required to re-check the live PROD_AUTO_DEPLOY_DISABLED "
+            "kill switch; refusing to deploy without verifying it (fail-closed)"
+        )
     host = env.get("GITEA_HOST", "git.moleculesai.app")
     repo = env.get("GITHUB_REPOSITORY", "molecule-ai/molecule-core")
     variable = quote("PROD_AUTO_DEPLOY_DISABLED", safe="")
     url = f"https://{host}/api/v1/repos/{repo}/actions/variables/{variable}"
-    status, body = _api_json_optional(url, token)
-    if status != 200 or not isinstance(body, dict):
+    try:
+        status, body = _api_json_optional(url, token)
+    except (TimeoutError, urllib.error.URLError) as exc:
+        # A network failure on the live re-check is NOT a not-disabled signal.
+        # Fail closed: an armed kill switch we couldn't reach must HOLD.
+        reason = getattr(exc, "reason", exc)
+        raise RuntimeError(
+            f"network error reading live PROD_AUTO_DEPLOY_DISABLED kill switch "
+            f"(GET {url}): {reason}; refusing to deploy while the kill switch "
+            "is unverifiable (fail-closed)"
+        ) from exc
+    # 404 = variable not set = genuinely not disabled. This is the ONLY
+    # not-disabled signal we accept from a non-200 response.
+    if status == 404:
         return ""
+    if status != 200 or not isinstance(body, dict):
+        raise RuntimeError(
+            f"could not read live PROD_AUTO_DEPLOY_DISABLED kill switch "
+            f"(GET {url} -> HTTP {status}); refusing to deploy while the "
+            "kill switch is unverifiable (fail-closed)"
+        )
     return str(body.get("data") or body.get("value") or "")
 
 
@@ -680,6 +723,16 @@ def wait_for_ci_context(env: dict[str, str]) -> str:
         raise ValueError("GITHUB_SHA is required")
     if not token:
         raise ValueError("GITEA_TOKEN is required to wait for CI status")
+    # Defense in depth: never let an empty context set vacuously satisfy the
+    # gate. `all([])` is True, so an empty `contexts` would return "success"
+    # with ZERO contexts checked. required_contexts() already raises on a
+    # non-blank-but-empty override; this guard closes the hole regardless of
+    # how `contexts` became empty.
+    if not contexts:
+        raise ValueError(
+            "refusing to deploy: no required CI contexts to verify "
+            "(empty required-context set; fail-closed)"
+        )
 
     deadline = time.time() + timeout
     last_states: dict[str, str] = {}
