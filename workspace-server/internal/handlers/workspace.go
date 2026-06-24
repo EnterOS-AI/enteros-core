@@ -837,6 +837,26 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		if err := setModelSecret(ctx, id, payload.Model); err != nil {
 			log.Printf("Create workspace %s: failed to persist MODEL_PROVIDER %q: %v (non-fatal)", id, payload.Model, err)
 		}
+
+		// core (create_workspace NOT_CONFIGURED): a child workspace the concierge
+		// spawns via `create_workspace` lands here with MODEL but — since the
+		// internal#718 P4 closure removed the unconditional setProviderSecret write
+		// — NO LLM_PROVIDER. For a platform-managed model id (e.g.
+		// "moonshot/kimi-k2.6") the on-box runtime re-derives provider="moonshot"
+		// (a model PREFIX, not a registry NAME) and the adapter fail-closes ("picks
+		// provider='moonshot' but it is not in the providers registry") → the child
+		// boots online but NOT_CONFIGURED. Mirror the concierge's ensureConcierge-
+		// Provider pin here so the child is born with a COMPLETE config: pin
+		// LLM_PROVIDER=platform iff the registry derivation of (runtime, model) is
+		// the closed `platform` provider. BYOK/OAuth/self-host children (whose model
+		// derives to a real provider entry) are left untouched. availableAuthEnv =
+		// the create payload's secret KEYS so a BYOK create derives to its real
+		// provider and is correctly skipped. Non-fatal.
+		createSecretKeys := make([]string, 0, len(payload.Secrets))
+		for k := range payload.Secrets {
+			createSecretKeys = append(createSecretKeys, k)
+		}
+		ensureCreatedWorkspaceProviderPin(ctx, id, payload.Runtime, payload.Model, createSecretKeys)
 	}
 
 	// Insert canvas layout — non-fatal: workspace can be dragged into position later
