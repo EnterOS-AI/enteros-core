@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -609,10 +610,13 @@ func TestUpdate_Runtime_RegisteredModelForRuntime_Passes(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
 	// The validation passes (moonshot/kimi-k2.6 is a registered model
 	// for claude-code in the harness's provider registry), so the
-	// UPDATE proceeds.
+	// UPDATE proceeds. The runtime UPDATE now runs inside the atomic tx
+	// (no model reset here, so the tx wraps only the UPDATE).
+	mock.ExpectBegin()
 	mock.ExpectExec(`UPDATE workspaces\s+SET runtime = \$2`).
 		WithArgs(wsID, "claude-code").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	body := map[string]interface{}{"runtime": "claude-code"}
 	b, _ := json.Marshal(body)
@@ -654,17 +658,20 @@ func TestUpdate_Runtime_IncompatibleModel_AutoResetsToDefault(t *testing.T) {
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
-	// Auto-reset writes the google-adk DEFAULT model into the MODEL secret.
+	// Auto-reset + runtime UPDATE are ONE atomic tx (CR2 review 13597): the
+	// model-reset INSERT and the runtime UPDATE commit-or-rollback together.
 	// google-adk's first registered model is "platform:gemini-2.5-pro"
 	// (registry_gen.go). Tests run with encryption disabled, so the encrypted
 	// value is the plaintext bytes and the version is the plaintext version (0).
+	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO workspace_secrets`).
 		WithArgs(wsID, []byte("platform:gemini-2.5-pro"), 0).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// The runtime change is then persisted — NO rollback.
+	// The runtime change is then persisted in the SAME tx — NO rollback.
 	mock.ExpectExec(`UPDATE workspaces\s+SET runtime = \$2`).
 		WithArgs(wsID, "google-adk").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	body := map[string]interface{}{"runtime": "google-adk"}
 	b, _ := json.Marshal(body)
@@ -709,12 +716,14 @@ func TestUpdate_Runtime_ClaudeCode_IncompatibleModel_AutoResetsToDefault(t *test
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("gemini-2.5-pro"), 0))
+	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO workspace_secrets`).
 		WithArgs(wsID, []byte("sonnet"), 0).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE workspaces\s+SET runtime = \$2`).
 		WithArgs(wsID, "claude-code").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	body := map[string]interface{}{"runtime": "claude-code"}
 	b, _ := json.Marshal(body)
@@ -735,6 +744,73 @@ func TestUpdate_Runtime_ClaudeCode_IncompatibleModel_AutoResetsToDefault(t *test
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestUpdate_Runtime_AutoReset_RuntimeUpdateFails_RollsBack is the CR2 review
+// 13597 invariant: the model reset and the runtime UPDATE are wrapped in a
+// SINGLE tx, so if the runtime UPDATE fails AFTER the model-reset INSERT, the
+// whole tx ROLLS BACK — the MODEL secret is NOT left changed and the runtime
+// is unchanged. Pre-fix (non-transactional setModelSecret then a standalone
+// UPDATE) the reset would have already committed, leaving the exact mismatched
+// model/runtime dual-state this change exists to prevent.
+//
+// We drive it with the same orphaned-model repro (claude-code MODEL ->
+// google-adk runtime) but make the runtime UPDATE error inside the tx. sqlmock
+// asserts: Begin fired, the INSERT fired, the UPDATE was attempted and errored,
+// then Rollback (NOT Commit) fired — i.e. neither write persisted.
+func TestUpdate_Runtime_AutoReset_RuntimeUpdateFails_RollsBack(t *testing.T) {
+	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	mock, r := setupWorkspaceCrudTest(t)
+	h := newWorkspaceCrudHandler(t)
+	r.PATCH("/workspaces/:id", h.Update)
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	// Orphaned model → auto-reset to google-adk's default fires.
+	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
+	mock.ExpectBegin()
+	// The model-reset INSERT succeeds...
+	mock.ExpectExec(`INSERT INTO workspace_secrets`).
+		WithArgs(wsID, []byte("platform:gemini-2.5-pro"), 0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// ...but the runtime UPDATE FAILS. The tx must roll back — NOT commit.
+	mock.ExpectExec(`UPDATE workspaces\s+SET runtime = \$2`).
+		WithArgs(wsID, "google-adk").
+		WillReturnError(fmt.Errorf("simulated runtime UPDATE failure"))
+	// Rollback (not Commit) is the load-bearing assertion: the model-reset
+	// INSERT is undone with it, so the MODEL secret is NOT left changed.
+	mock.ExpectRollback()
+
+	body := map[string]interface{}{"runtime": "google-adk"}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// The handler surfaces the failure as 500 — the runtime change did NOT
+	// persist (and neither did the model reset, via the rollback).
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 (tx rolled back on runtime UPDATE failure), got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err == nil {
+		// model_was_reset must NOT be signaled — the reset was rolled back, so
+		// it would be a lie to tell the caller the model changed.
+		if resp["model_was_reset"] == true {
+			t.Errorf("model_was_reset must NOT be true after a rollback; got body=%s", w.Body.String())
+		}
+	}
+	// ExpectationsWereMet proves Begin → INSERT → UPDATE(err) → Rollback all
+	// fired in order and NO Commit happened. If the model write had committed
+	// outside the tx (the pre-fix non-atomic shape), there'd be no Rollback to
+	// satisfy and a stray Commit/standalone-Exec would surface as unmet.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (rollback path not exercised as expected): %v", err)
 	}
 }
 
@@ -794,9 +870,12 @@ func TestUpdate_Runtime_ModelUnresolved_SkipsCheckAndProceeds(t *testing.T) {
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
 		WillReturnError(sql.ErrNoRows)
+	// No reset (unresolved model) → the tx wraps only the runtime UPDATE.
+	mock.ExpectBegin()
 	mock.ExpectExec(`UPDATE workspaces\s+SET runtime = \$2`).
 		WithArgs(wsID, "claude-code").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	body := map[string]interface{}{"runtime": "claude-code"}
 	b, _ := json.Marshal(body)

@@ -332,6 +332,10 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		// STRICT validation — an invalid explicit model still 422s with the
 		// actionable valid-models list. Only this implicit-orphan case
 		// auto-resets.
+		// resetTo is the target runtime's default model the auto-reset path
+		// will write, set only when the current model is orphaned AND a safe
+		// default exists. Empty = no reset; the runtime UPDATE runs alone.
+		resetTo := ""
 		if currentModel != "" {
 			if ok, _ := validateRegisteredModelForRuntime(runtimeStr, currentModel); !ok {
 				// Current model is orphaned for the target runtime. Try to
@@ -339,15 +343,7 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 				// instead of rejecting the whole PATCH.
 				def, haveDefault := defaultModelForRuntime(runtimeStr)
 				if haveDefault {
-					log.Printf("Update: PATCH runtime=%q on %s — current model=%q is not registered for that runtime; AUTO-RESET model to runtime default %q (no rollback)",
-						runtimeStr, id, currentModel, def)
-					if err := setModelSecret(ctx, id, def); err != nil {
-						log.Printf("Update runtime: auto-reset MODEL secret for %s to %q failed: %v", id, def, err)
-						c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reset model for new runtime"})
-						return
-					}
-					modelWasReset = true
-					resetModel = def
+					resetTo = def
 				} else {
 					// No safe platform default exists for the target runtime
 					// (registry unavailable, runtime not in the registry /
@@ -364,10 +360,45 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 				}
 			}
 		}
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtimeStr); err != nil {
-			log.Printf("Update runtime error for %s: %v", id, err)
+		// ATOMICITY (CR2 review 13597): the model reset and the runtime UPDATE
+		// MUST commit-or-rollback as ONE unit. Doing them as two independent
+		// statements (the model write, then a separate runtime UPDATE) means a
+		// failed runtime UPDATE leaves the model already reset but the runtime
+		// unchanged — the mismatched model/runtime dual-state this whole change
+		// exists to prevent. Wrapping both in a single tx makes the reset roll
+		// back with the runtime UPDATE on any failure. The non-reset case
+		// (resetTo == "") runs only the runtime UPDATE inside the tx, which is
+		// behaviorally identical to the old standalone UPDATE.
+		if err := func() error {
+			tx, err := db.DB.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			// Safe even after a successful Commit — the second Rollback is a
+			// no-op (database/sql tracks tx state).
+			defer func() { _ = tx.Rollback() }()
+
+			if resetTo != "" {
+				log.Printf("Update: PATCH runtime=%q on %s — current model=%q is not registered for that runtime; AUTO-RESET model to runtime default %q (atomic with runtime UPDATE)",
+					runtimeStr, id, currentModel, resetTo)
+				if err := setModelSecretExec(ctx, tx, id, resetTo); err != nil {
+					return err
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE workspaces SET runtime = $2, updated_at = now() WHERE id = $1`, id, runtimeStr); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}(); err != nil {
+			// On ANY failure (begin/reset/runtime-UPDATE/commit) the tx rolled
+			// back: neither the model reset nor the runtime change persisted.
+			log.Printf("Update runtime error for %s (resetTo=%q): %v", id, resetTo, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save runtime"})
 			return
+		}
+		if resetTo != "" {
+			modelWasReset = true
+			resetModel = resetTo
 		}
 		needsRestart = true
 	}
