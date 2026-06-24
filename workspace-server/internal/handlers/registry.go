@@ -121,7 +121,10 @@ type RegistryHandler struct {
 	// on the next heartbeat (MCP now present), so the cooldown only throttles the
 	// genuinely-stuck case. Stored-before-fire so concurrent heartbeats can't both
 	// fire (the second sees the just-stored timestamp); a rare double-fire is
-	// harmless — ReconcileWorkspacePlugins is idempotent.
+	// harmless — ReconcileWorkspacePlugins is idempotent. In-memory only: a CP
+	// redeploy / conductor tick resets it, so the once-per-cooldown guarantee
+	// holds within a process lifetime (acceptable — redeploys are not sub-minute,
+	// and one extra reconcile per redeploy on a stuck concierge is tolerable).
 	mcpRecoveryLastFire sync.Map
 }
 
