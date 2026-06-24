@@ -254,15 +254,84 @@ func TestDiagnoseRemote_StopsAtSSHProbe(t *testing.T) {
 	}
 }
 
+// TestSyncBuf_WriteAndString verifies syncBuf is a correct
+// bytes.Buffer wrapper: Write appends, String returns accumulated content,
+// and neither operation returns an error.
+func TestSyncBuf_WriteAndString(t *testing.T) {
+	var buf syncBuf
+	n, err := buf.Write([]byte("hello"))
+	if n != 5 || err != nil {
+		t.Fatalf("Write returned n=%d err=%v; want 5 nil", n, err)
+	}
+	got := buf.String()
+	if got != "hello" {
+		t.Errorf("String() = %q; want hello", got)
+	}
+}
+
+// TestSyncBuf_WriteMultiple verifies successive Write calls accumulate
+// and String reflects the full concatenated content.
+func TestSyncBuf_WriteMultiple(t *testing.T) {
+	var buf syncBuf
+	buf.Write([]byte("foo"))
+	buf.Write([]byte("bar"))
+	got := buf.String()
+	if got != "foobar" {
+		t.Errorf("String() = %q; want foobar", got)
+	}
+}
+
+// TestSyncBuf_WriteConcurrent exercises that concurrent Write calls
+// do not panic and the final content is consistent (deterministic order
+// not required — only that no data race is introduced by the mutex).
+func TestSyncBuf_WriteConcurrent(t *testing.T) {
+	var buf syncBuf
+	ch := make(chan bool, 2)
+	go func() {
+		for i := 0; i < 100; i++ {
+			buf.Write([]byte("a"))
+		}
+		ch <- true
+	}()
+	go func() {
+		for i := 0; i < 100; i++ {
+			buf.Write([]byte("b"))
+		}
+		ch <- true
+	}()
+	<-ch
+	<-ch
+	got := buf.String()
+	if len(got) != 200 {
+		t.Errorf("String() length = %d; want 200", len(got))
+	}
+}
+
+// TestSyncBuf_Empty verifies zero-value syncBuf is safe to call before
+// any Write: String returns "" and Write succeeds.
+func TestSyncBuf_Empty(t *testing.T) {
+	var buf syncBuf
+	if s := buf.String(); s != "" {
+		t.Errorf("zero-value String() = %q; want empty string", s)
+	}
+	n, err := buf.Write([]byte("x"))
+	if n != 1 || err != nil {
+		t.Errorf("Write on zero-value buf: n=%d err=%v; want 1 nil", n, err)
+	}
+	if buf.String() != "x" {
+		t.Errorf("String() after write on zero-value buf: got %q; want x", buf.String())
+	}
+}
+
 // TestUnwrapGoError pins the unwrapGoError helper that extracts subprocess
 // stderr from the Go-wrapped error string produced by sendSSHPublicKey.
 // Regression gate for mc#687: the E2E smoke now reads detail (not error),
 // so detail MUST contain the actionable AWS permission signal.
 func TestUnwrapGoError(t *testing.T) {
 	cases := []struct {
-		name   string
-		input  string
-		want   string
+		name  string
+		input string
+		want  string
 	}{
 		{
 			name:  "AWS permission denied",
@@ -300,4 +369,3 @@ func TestUnwrapGoError(t *testing.T) {
 		})
 	}
 }
-
