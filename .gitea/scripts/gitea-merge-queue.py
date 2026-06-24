@@ -379,23 +379,41 @@ def load_conductor_snapshot() -> dict | None:
     if not isinstance(snapshot, dict):
         return None
 
+    # Freshness is fail-closed: an UNVERIFIABLE age must NOT be trusted as
+    # current. A snapshot with no `ts` (absent/empty) or an unparseable `ts`
+    # could be arbitrarily old (e.g. written by a wedged conductor), so we
+    # CANNOT prove it is within the 10-minute window — discard it and let the
+    # caller self-fetch the live state via the API (the None-return path every
+    # consumer already handles on a cache miss). The previous behaviour skipped
+    # the age check on an empty `ts` and swallowed a strptime failure as
+    # "treat as fresh (conservative)" — that was ANTI-conservative: it trusted
+    # an undated/old snapshot as current.
     ts_str = snapshot.get("ts", "")
-    if ts_str:
-        try:
-            from datetime import datetime, timezone
+    if not ts_str:
+        print(
+            "::notice::conductor snapshot has no ts (freshness unverifiable); "
+            "self-fetching"
+        )
+        return None
+    try:
+        from datetime import datetime, timezone
 
-            ts = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=timezone.utc
-            )
-            age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
-            if age_sec > 600:  # 10 minutes
-                print(
-                    f"::notice::conductor snapshot stale ({int(age_sec)}s); "
-                    "self-fetching"
-                )
-                return None
-        except ValueError:
-            pass  # malformed ts, treat as fresh (conservative)
+        ts = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        print(
+            f"::notice::conductor snapshot ts unparseable ({ts_str!r}; freshness "
+            "unverifiable); self-fetching"
+        )
+        return None
+    age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
+    if age_sec > 600:  # 10 minutes
+        print(
+            f"::notice::conductor snapshot stale ({int(age_sec)}s); "
+            "self-fetching"
+        )
+        return None
 
     return snapshot
 
@@ -441,6 +459,24 @@ class EnforcedContextsUnavailable(ApiError):
     or every entry parked below a `# pending-#NNNN` marker): that returns [] and
     enforces BP + governance only, which is a valid, intended state — NOT this
     error. Only an OSError opening/reading the file raises this."""
+
+
+class PushRequiredContextsUnavailable(ApiError):
+    """The push-required context set (env `PUSH_REQUIRED_CONTEXTS`) parsed to
+    EMPTY. The queue must HOLD rather than treat the main-green backstop as
+    satisfied (internal#3210 HIGH).
+
+    The main-green gate checks `required_contexts_green(main_latest, <set>)`;
+    with an empty set that call returns `(True, [])` — a VACUOUS pass for ANY
+    main state, INCLUDING all-red. The backstop that makes the direct-merge
+    path safe (it PAUSES the queue when main's required CI goes red after a
+    semantic main-break) would silently disappear, and the queue would keep
+    merging onto a red main.
+
+    An empty parse is a MISCONFIGURATION (env unset/blank/all-comma), not a
+    transient Gitea blip, so — like EnforcedContextsUnavailable — it propagates
+    to main()'s ApiError handler (rc 1: no merge + operators paged) rather than
+    being held quietly with rc 0."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -548,8 +584,26 @@ def required_contexts(raw: str) -> list[str]:
 
 
 def push_required_contexts() -> list[str]:
-    """Required contexts for push (branch) CI runs. See PUSH_REQUIRED_CONTEXTS_RAW."""
-    return required_contexts(PUSH_REQUIRED_CONTEXTS_RAW)
+    """Required contexts for push (branch) CI runs. See PUSH_REQUIRED_CONTEXTS_RAW.
+
+    Fail-closed (internal#3210 HIGH): if `PUSH_REQUIRED_CONTEXTS` is empty,
+    whitespace-only, or all-comma, the parse is [] and the main-green backstop
+    (`required_contexts_green(main_latest, [])`) would PASS VACUOUSLY for any
+    main state, including all-red — letting the queue merge onto a red main.
+    Raise PushRequiredContextsUnavailable instead so the gate HOLDS rather than
+    silently disabling its own main-green guard. Mirrors the
+    EnforcedContextsUnavailable fail-closed convention; never returns []."""
+    contexts = required_contexts(PUSH_REQUIRED_CONTEXTS_RAW)
+    if not contexts:
+        raise PushRequiredContextsUnavailable(
+            "PUSH_REQUIRED_CONTEXTS parsed to an empty set "
+            f"(raw={PUSH_REQUIRED_CONTEXTS_RAW!r}); the main-green backstop "
+            "would pass vacuously for ANY main state (including all-red). "
+            "Merge gate HOLDS the tick (fail-closed) rather than disabling the "
+            "main-green guard. Set at least the default 'CI / all-required "
+            "(push)'."
+        )
+    return contexts
 
 
 def status_state(status: dict) -> str:
