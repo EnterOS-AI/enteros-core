@@ -15,6 +15,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/push"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -61,10 +62,15 @@ func sanitizeErrorDetailForBroadcast(s string) string {
 
 type ActivityHandler struct {
 	broadcaster events.EventEmitter
+	notifier    *push.Notifier
 }
 
-func NewActivityHandler(b events.EventEmitter) *ActivityHandler {
-	return &ActivityHandler{broadcaster: b}
+func NewActivityHandler(b events.EventEmitter, notifier ...*push.Notifier) *ActivityHandler {
+	h := &ActivityHandler{broadcaster: b}
+	if len(notifier) > 0 {
+		h.notifier = notifier[0]
+	}
+	return h
 }
 
 // extractAttachmentsFromRequestBody walks a JSON-RPC a2a inbound body to
@@ -838,7 +844,7 @@ func (h *ActivityHandler) Notify(c *gin.Context) {
 	for _, a := range body.Attachments {
 		attachments = append(attachments, AgentMessageAttachment(a))
 	}
-	writer := NewAgentMessageWriter(db.DB, h.broadcaster)
+	writer := NewAgentMessageWriter(db.DB, h.broadcaster, h.notifier)
 	if err := writer.Send(c.Request.Context(), workspaceID, body.Message, attachments); err != nil {
 		if errors.Is(err, ErrWorkspaceNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})

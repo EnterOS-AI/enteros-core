@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/push"
 	"github.com/gin-gonic/gin"
 )
 
@@ -84,6 +85,7 @@ type mcpTool struct {
 type MCPHandler struct {
 	database    *sql.DB
 	broadcaster *events.Broadcaster
+	notifier    *push.Notifier
 	a2aProxy    func(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error)
 
 	// memv2 is the v2 memory plugin wiring (RFC #2728). nil-safe:
@@ -95,8 +97,13 @@ type MCPHandler struct {
 
 // NewMCPHandler wires the handler to db and broadcaster.
 // Pass db.DB and the platform broadcaster at router-setup time.
-func NewMCPHandler(database *sql.DB, broadcaster *events.Broadcaster) *MCPHandler {
-	return &MCPHandler{database: database, broadcaster: broadcaster}
+// notifier may be nil if push notifications are not configured.
+func NewMCPHandler(database *sql.DB, broadcaster *events.Broadcaster, notifier ...*push.Notifier) *MCPHandler {
+	h := &MCPHandler{database: database, broadcaster: broadcaster}
+	if len(notifier) > 0 {
+		h.notifier = notifier[0]
+	}
+	return h
 }
 
 // userTaskStore builds the SSOT user-task store over the handler's DB pool +
