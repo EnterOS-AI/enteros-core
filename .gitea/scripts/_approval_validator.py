@@ -212,14 +212,26 @@ def classify_reviews(
     # cannot overwrite or erase a genuine review. A user's verdict is the
     # state of their latest VALID (official, current-head, non-dismissed,
     # non-stale, commit_id-present-and-matching) review.
+    #
+    # REVIEWER_SET DECOUPLING (internal#3210 FIX-2, fail-open).
+    #
+    # The `reviewer_set` membership filter must apply ONLY to the APPROVER
+    # tally — it is the "recognised reviewers count toward the N-genuine
+    # floor" roster. It must NOT gate the REQUEST_CHANGES (block) set: an
+    # official, current-head, non-stale, non-dismissed REQUEST_CHANGES from
+    # ANY login (e.g. the CTO/founder or any non-roster reviewer) MUST block
+    # the merge regardless of roster membership. The earlier code applied the
+    # `user not in reviewer_set_set: continue` filter in this reduce loop,
+    # BEFORE the verdict was known, so an out-of-roster REQUEST_CHANGES was
+    # silently dropped and did not block — a fail-open. We therefore reduce
+    # over ALL users here (no roster gate) and apply the roster check only at
+    # the `approvers.add(...)` step below.
     latest_valid_by_user: dict = {}
     for review in reviews:
         if not isinstance(review, dict):
             continue
         user = (review.get("user") or {}).get("login")
         if not isinstance(user, str):
-            continue
-        if reviewer_set_set is not None and user not in reviewer_set_set:
             continue
         # EXACT-ENUM (fail-closed): exact constants only, no coercion. A
         # case-coerced row must not become eligible to overwrite/erase a
@@ -240,7 +252,11 @@ def classify_reviews(
         # Each surviving review already passed is_official_current_head, so
         # the state alone determines the verdict. We still go through the
         # per-verdict SSOT predicates so the rule cannot drift.
-        if is_genuine_approval(review, headsha=headsha, reviewer_set=None):
+        #
+        # APPROVERS: gated on reviewer_set membership (recognised-reviewer
+        # roster). REQUEST_CHANGES: NEVER gated — any official current-head
+        # block counts, regardless of roster (internal#3210 FIX-2).
+        if is_genuine_approval(review, headsha=headsha, reviewer_set=reviewer_set_set):
             approvers.add(user)
         elif is_open_request_changes(review, headsha=headsha):
             request_changes.append(user)

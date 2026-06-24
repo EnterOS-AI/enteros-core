@@ -317,6 +317,37 @@ def test_genuine_approvals_latest_review_supersedes_earlier():
     assert rc == ["agent-reviewer-cr2"]
 
 
+def test_genuine_approvals_out_of_roster_request_changes_still_blocks():
+    """FIX-2 (internal#3210): an official current-head REQUEST_CHANGES from a
+    login OUTSIDE REVIEWER_SET (e.g. the CTO/founder) must be surfaced in the
+    request_changes list so the merge is blocked — while roster approvals are
+    still tallied. The earlier reviewer_set filter dropped it silently."""
+    reviews = [
+        {"state": "APPROVED", "user": {"login": "agent-researcher"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": "HEAD"},
+        {"state": "APPROVED", "user": {"login": "agent-reviewer-cr2"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": "HEAD"},
+        # CTO/founder — NOT in REVIEWER_SET — requests changes on current head.
+        {"state": "REQUEST_CHANGES", "user": {"login": "hongming-cto"},
+         "official": True, "stale": False, "dismissed": False, "commit_id": "HEAD"},
+    ]
+    approvers, rc = mq.genuine_approvals(reviews, headsha="HEAD", reviewer_set=REVIEWERS)
+    # Roster approvals are still counted (roster gate unchanged for approvers).
+    assert approvers == {"agent-researcher", "agent-reviewer-cr2"}
+    # The out-of-roster block is honored.
+    assert "hongming-cto" in rc
+
+    # End-to-end: that block flows into evaluate_merge_readiness and WAITS,
+    # even though the 2-genuine approval floor is otherwise satisfied.
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(approvers=approvers, request_changes=rc, required_approvals=2)
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "REQUEST_CHANGES" in decision.reason
+    assert "hongming-cto" in decision.reason
+
+
 def test_merge_blocked_when_open_request_changes_on_current_head():
     decision = mq.evaluate_merge_readiness(
         **_ready_kwargs(request_changes=["agent-reviewer-cr2"])
@@ -564,6 +595,114 @@ def test_parse_branch_protection_fail_closed_on_non_object():
     import pytest
     with pytest.raises(mq.BranchProtectionUnavailable):
         mq.parse_branch_protection(None)
+
+
+# --------------------------------------------------------------------------
+# FIX-1 (internal#3210, CRITICAL fail-open): required_approvals FLOOR.
+#
+# A degraded `required_approvals` from branch protection — 0 (admin lowered
+# it / migration reset / blanked-restored BP), a negative (passes a naive
+# `< N`), or a bool True (isinstance(True, int) is True → coerces to 1,
+# HALVING a 2-genuine bar) — must NEVER weaken or skip the genuine-approval
+# gate. parse_branch_protection clamps UP to REQUIRED_APPROVALS_DEFAULT;
+# evaluate_merge_readiness applies an independent floor of 1 on the
+# non-exempt path. These tests pin both layers.
+# --------------------------------------------------------------------------
+
+def _bp_body(required_approvals):
+    return {
+        "enable_status_check": True,
+        "status_check_contexts": ["CI / all-required (pull_request)"],
+        "required_approvals": required_approvals,
+        "block_on_rejected_reviews": True,
+    }
+
+
+def test_parse_branch_protection_clamps_zero_up_to_default():
+    """required_approvals: 0 from BP must clamp UP to the default floor (2),
+    never zero/skip the genuine-approval gate."""
+    bp = mq.parse_branch_protection(_bp_body(0))
+    assert bp.required_approvals == mq.REQUIRED_APPROVALS_DEFAULT
+    assert bp.required_approvals >= 1
+
+
+def test_parse_branch_protection_clamps_negative_up_to_default():
+    """A negative required_approvals (would pass a naive `len < N`) must
+    clamp UP to the default floor, never below it."""
+    bp = mq.parse_branch_protection(_bp_body(-1))
+    assert bp.required_approvals == mq.REQUIRED_APPROVALS_DEFAULT
+
+
+def test_parse_branch_protection_rejects_bool_true_uses_default():
+    """bool True is NOT a valid approval count. isinstance(True, int) is True
+    in Python, so the naive int() path would coerce True->1 and HALVE a
+    2-genuine bar. It must be rejected and fall back to the default floor."""
+    bp = mq.parse_branch_protection(_bp_body(True))
+    assert bp.required_approvals == mq.REQUIRED_APPROVALS_DEFAULT
+    # Defensive: a False would also be rejected (treated as invalid).
+    bp_false = mq.parse_branch_protection(_bp_body(False))
+    assert bp_false.required_approvals == mq.REQUIRED_APPROVALS_DEFAULT
+
+
+def test_parse_branch_protection_honors_stricter_value():
+    """A BP value ABOVE the default floor is honored as-is (stricter wins)."""
+    bp = mq.parse_branch_protection(_bp_body(3))
+    assert bp.required_approvals == 3
+
+
+def test_parse_branch_protection_missing_approvals_uses_default():
+    """No required_approvals key at all → the default floor, not zero."""
+    body = _bp_body(0)
+    del body["required_approvals"]
+    bp = mq.parse_branch_protection(body)
+    assert bp.required_approvals == mq.REQUIRED_APPROVALS_DEFAULT
+
+
+def test_evaluate_merge_readiness_floors_zero_required_approvals_nonexempt():
+    """Defence-in-depth: even if a degraded required_approvals=0 reaches
+    evaluate_merge_readiness on the NON-exempt path, the genuine-approval
+    gate is NOT skipped — a PR with zero approvers must still WAIT."""
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            approvers=set(),
+            required_approvals=0,
+            # runtime_bump_exempt omitted → defaults to False (non-exempt)
+        )
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "insufficient genuine approvals" in decision.reason
+    # The floor is reported as need >= 1, never 0.
+    assert "need 1" in decision.reason
+
+
+def test_evaluate_merge_readiness_floors_negative_required_approvals_nonexempt():
+    """A negative required_approvals must not pass a naive `len(approvers) < N`
+    check — the floor forces the gate to require at least 1."""
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            approvers=set(),
+            required_approvals=-5,
+        )
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "insufficient genuine approvals" in decision.reason
+
+
+def test_evaluate_merge_readiness_floor_does_not_break_runtime_bump_exemption():
+    """The non-exempt floor must NOT touch the runtime-bump exemption path,
+    which legitimately zeroes the HUMAN approval bar (a bot cannot
+    self-approve). With exempt=True + 0 approvers the PR still merges."""
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            approvers=set(),
+            required_approvals=0,
+            runtime_bump_exempt=True,
+        )
+    )
+    assert decision.ready is True
+    assert decision.action == "merge"
 
 
 # --------------------------------------------------------------------------

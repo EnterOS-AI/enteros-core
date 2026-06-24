@@ -327,6 +327,72 @@ class ClassifyReviewsContract(unittest.TestCase):
         )
         self.assertEqual(approvers, {"alice"})
 
+    # -----------------------------------------------------------------
+    # FIX-2 (internal#3210, HIGH fail-open): reviewer_set DECOUPLING.
+    #
+    # The reviewer_set roster gates ONLY the approver tally. An official,
+    # current-head, non-stale, non-dismissed REQUEST_CHANGES from a login
+    # OUTSIDE the roster (e.g. the CTO/founder, or any non-roster reviewer)
+    # MUST still block the merge. The earlier code applied the roster
+    # membership filter in the reduce loop BEFORE the verdict was known, so
+    # an out-of-roster REQUEST_CHANGES was silently dropped and did not
+    # block — exactly the fail-open these tests pin shut.
+    # -----------------------------------------------------------------
+
+    def test_out_of_roster_request_changes_still_blocks(self):
+        """An out-of-roster official current-head REQUEST_CHANGES MUST block,
+        while in-roster approvals are still tallied normally."""
+        reviews = [
+            _review(user="alice", state="APPROVED", commit_id=HEAD),
+            _review(user="bob", state="APPROVED", commit_id=HEAD),
+            # CTO/founder is NOT in the reviewer roster, but their
+            # REQUEST_CHANGES must not evaporate.
+            _review(user="cto-founder", state="REQUEST_CHANGES", commit_id=HEAD),
+        ]
+        approvers, request_changes = classify_reviews(
+            reviews, headsha=HEAD, reviewer_set={"alice", "bob"}
+        )
+        # Roster approvals are counted (out-of-roster gate unchanged for them).
+        self.assertEqual(approvers, {"alice", "bob"})
+        # The out-of-roster block is honored.
+        self.assertIn("cto-founder", request_changes)
+
+    def test_out_of_roster_approval_still_excluded(self):
+        """The roster gate is unchanged for APPROVERS: an out-of-roster
+        APPROVED still does NOT count toward the genuine-approval floor."""
+        reviews = [
+            _review(user="alice", state="APPROVED", commit_id=HEAD),
+            _review(user="outsider", state="APPROVED", commit_id=HEAD),
+        ]
+        approvers, request_changes = classify_reviews(
+            reviews, headsha=HEAD, reviewer_set={"alice"}
+        )
+        self.assertEqual(approvers, {"alice"})
+        self.assertEqual(request_changes, [])
+
+    def test_out_of_roster_request_changes_blocks_with_no_roster_approvals(self):
+        """Even with zero in-roster approvers, an out-of-roster
+        REQUEST_CHANGES is surfaced (the merge-queue step-2 gate then waits)."""
+        reviews = [
+            _review(user="random-non-roster", state="REQUEST_CHANGES", commit_id=HEAD),
+        ]
+        approvers, request_changes = classify_reviews(
+            reviews, headsha=HEAD, reviewer_set={"alice", "bob"}
+        )
+        self.assertEqual(approvers, set())
+        self.assertEqual(request_changes, ["random-non-roster"])
+
+    def test_out_of_roster_stale_request_changes_does_not_block(self):
+        """The decouple does NOT weaken the fail-closed head/stale contract:
+        an out-of-roster REQUEST_CHANGES on a PRIOR head must NOT block."""
+        reviews = [
+            _review(user="cto-founder", state="REQUEST_CHANGES", commit_id=OTHER_HEAD),
+        ]
+        _, request_changes = classify_reviews(
+            reviews, headsha=HEAD, reviewer_set={"alice"}
+        )
+        self.assertEqual(request_changes, [])
+
     def test_latest_review_per_user_wins(self):
         # alice's REQUEST_CHANGES (latest) supersedes her earlier APPROVED.
         reviews = [
