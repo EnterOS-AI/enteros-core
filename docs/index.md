@@ -63,6 +63,7 @@ features:
 - [Product Overview](/product/overview)
 - [Product Narrative](/product/molecule-product-doc)
 - [System Architecture](/architecture/architecture)
+- [Runtime ↔ Platform ↔ Plugin Responsibilities](/architecture/runtime-platform-plugin-responsibilities)
 - [Comprehensive Technical Documentation](/architecture/molecule-technical-doc)
 - [Memory Architecture](/architecture/memory)
 - [Workspace Runtime](/agent-runtime/workspace-runtime)
