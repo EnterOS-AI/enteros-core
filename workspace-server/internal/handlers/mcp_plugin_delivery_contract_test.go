@@ -48,11 +48,26 @@ func TestSSOT_DegradeGateToolDerivesFromContract(t *testing.T) {
 	if c.MCPServerName == "" {
 		t.Fatal("contract mcp_server_name is empty — SSOT for the platform MCP tool prefix")
 	}
-	want := "mcp__" + c.MCPServerName + "__create_workspace"
+	if c.RequiredTool == "" {
+		t.Fatal("contract required_tool is empty — SSOT for the management MCP's required tool verb")
+	}
+	// The PRODUCTION gate const is COMPOSED from two building-block consts; pin
+	// EACH to the contract so the gate (not just this test) can never use a
+	// server name or verb that diverges from the SSOT.
+	if conciergePlatformMCPServerName != c.MCPServerName {
+		t.Errorf("SSOT drift: conciergePlatformMCPServerName = %q, but contract mcp_server_name = %q",
+			conciergePlatformMCPServerName, c.MCPServerName)
+	}
+	if conciergePlatformMCPRequiredTool != c.RequiredTool {
+		t.Errorf("SSOT drift: conciergePlatformMCPRequiredTool = %q, but contract required_tool = %q",
+			conciergePlatformMCPRequiredTool, c.RequiredTool)
+	}
+	// And the composed full id must equal the contract-derived id (mcp__<server>__<verb>).
+	want := "mcp__" + c.MCPServerName + "__" + c.RequiredTool
 	if conciergePlatformMCPCreateWorkspaceTool != want {
-		t.Errorf("SSOT drift: conciergePlatformMCPCreateWorkspaceTool = %q, but contract mcp_server_name = %q implies %q.\n"+
-			"The degraded gate must look for the tool id the runtime actually emits (mcp__<server>__create_workspace).",
-			conciergePlatformMCPCreateWorkspaceTool, c.MCPServerName, want)
+		t.Errorf("SSOT drift: conciergePlatformMCPCreateWorkspaceTool = %q, but contract implies %q (mcp__%s__%s).\n"+
+			"The degraded gate must look for the tool id the runtime actually emits (mcp__<server>__<required_tool>).",
+			conciergePlatformMCPCreateWorkspaceTool, want, c.MCPServerName, c.RequiredTool)
 	}
 }
 

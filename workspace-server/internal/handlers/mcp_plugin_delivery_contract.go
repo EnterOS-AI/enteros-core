@@ -32,6 +32,21 @@ type MCPPluginDeliveryContract struct {
 	// TestSSOT_DegradeGateToolDerivesFromContract.
 	MCPServerName string `json:"mcp_server_name"`
 
+	// RequiredTool is the SSOT for the management MCP's REQUIRED tool VERB (e.g.
+	// "create_workspace"). Combined with MCPServerName it yields the full
+	// dispatcher id the online/degraded gate looks for:
+	// `mcp__<MCPServerName>__<RequiredTool>`. Pinning the verb here (not as a
+	// hardcoded literal in the gate const or the test) closes the SSOT gap the
+	// 2026-06-25 audit flagged: previously only the `mcp__<server>__` prefix was
+	// contract-derived while `create_workspace` was re-spelled in both the Go
+	// const and the test. See TestSSOT_DegradeGateToolDerivesFromContract.
+	RequiredTool string `json:"required_tool"`
+
+	// LoadedMCPToolsField is the SSOT for the register/heartbeat status-field NAME
+	// the runtime emits (the loaded MCP tool inventory) and core's #3082 gate
+	// consumes. Pinned so a rename on either side is caught by the drift gate.
+	LoadedMCPToolsField string `json:"loaded_mcp_tools_field"`
+
 	// Descriptor is the prose SSOT describing the runtime-agnostic MCP descriptor
 	// shape and the wiring-PORT indirection (register_mcp_server →
 	// register_mcp_server_hook). It is pinned so a refactor that collapses the
@@ -105,6 +120,8 @@ func (c *MCPPluginDeliveryContract) MatchesSSOT() []string {
 	eq("producer", c.Producer, "MCPServerAdaptor")
 	eq("consumer", c.Consumer, "claude_sdk_executor._load_settings_mcp")
 	eq("mcp_server_name", c.MCPServerName, "molecule-platform")
+	eq("required_tool", c.RequiredTool, "create_workspace")
+	eq("loaded_mcp_tools_field", c.LoadedMCPToolsField, "loaded_mcp_tools")
 
 	// PORT symbols (#3159). These pin the wiring seam: if the adaptor regresses
 	// to a hard-coded Claude write, the hook/impl indirection disappears and this
