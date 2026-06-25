@@ -480,8 +480,10 @@ func (h *RegistryHandler) platformAgentHasModelSecret(ctx context.Context, works
 // The payload field is a pointer to distinguish three states:
 //   - nil   → the runtime did NOT report the field at all. This is a runtime
 //     PREDATING the #147 contract (mcp_server_present on register/heartbeat).
-//     The concierge image bakes /opt/molecule-mcp-server unconditionally, so an
-//     old runtime that simply can't SPEAK the contract must NOT be fail-closed —
+//     A pre-contract concierge runtime carries its management MCP (historically
+//     the baked /opt/molecule-mcp-server binary; on a de-baked image it is the
+//     plugin-delivered MCP) but simply can't SPEAK the contract, so it must NOT
+//     be fail-closed —
 //     that would take every concierge offline the moment this gate deploys ahead
 //     of the runtime release that adds the field (the exact rollout-order hazard
 //     that fail-closed #2989 + a pre-#147 concierge image hit on 2026-06-18:
@@ -691,13 +693,16 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	}
 
 	// Issue #2970: fail CLOSED if a platform agent reaches registration without
-	// BOTH the seeded MODEL workspace_secret AND the platform-agent image's baked
-	// /opt/molecule-mcp-server binary. The MISSING_MODEL gate in
-	// prepareProvisionContext is the primary defense, but if a model-less/identity-
-	// less/mcp-less concierge somehow boots on a path that bypasses that gate (e.g.
-	// an old or generic image), this second-layer guard prevents it from ever marking
-	// itself online-routable. Instead we mark the workspace failed so the canvas
-	// surfaces a provision failure rather than serving users a generic Claude Code.
+	// BOTH the seeded MODEL workspace_secret AND its management MCP server (the
+	// runtime reports availability via mcp_server_present; the MCP is delivered by
+	// the baked binary on legacy images or by the plugin channel on a de-baked
+	// image — this gate is runtime-agnostic and only trusts the *bool). The
+	// MISSING_MODEL gate in prepareProvisionContext is the primary defense, but if
+	// a model-less/identity-less/mcp-less concierge somehow boots on a path that
+	// bypasses that gate (e.g. an old or generic image), this second-layer guard
+	// prevents it from ever marking itself online-routable. Instead we mark the
+	// workspace failed so the canvas surfaces a provision failure rather than
+	// serving users a generic agent.
 	//
 	// The runtime declares mcp-server availability via payload.mcp_server_present.
 	// A nil/false value is fail-closed: an undeclared or missing MCP server cannot be
@@ -723,7 +728,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 				reason = "model_missing"
 				logCode = "platform_agent_model_missing"
 			case !hasMCP:
-				msg = "platform agent registered without /opt/molecule-mcp-server; refusing online"
+				msg = "platform agent registered without its management MCP server (mcp_server_present=false); refusing online"
 				reason = "mcp_server_missing"
 				logCode = "platform_agent_mcp_server_missing"
 				// #33 deadlock-break (mirrors the heartbeat gate): this branch
@@ -1390,12 +1395,14 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 
 	// FAIL-CLOSED concierge online-marking gate (RCA #2970).
 	// A kind='platform' workspace that has lost either its seeded MODEL secret or
-	// the image-baked /opt/molecule-mcp-server binary must never be allowed back
-	// to status='online' via heartbeat recovery. The Register handler already gates
+	// its management MCP server (reported via mcp_server_present — the baked binary
+	// on legacy images or the plugin-delivered MCP on a de-baked image; this gate
+	// is runtime-agnostic and only trusts the *bool) must never be allowed back to
+	// status='online' via heartbeat recovery. The Register handler already gates
 	// the initial online marking; this gate closes the heartbeat-driven recovery
 	// paths (provisioning/failed/offline/awaiting_agent/degraded → online) that
 	// would otherwise resurrect a model-less/mcp-less concierge and let it serve
-	// users generic Claude Code.
+	// users a generic agent.
 	//
 	// The runtime now declares mcp-server availability via
 	// payload.mcp_server_present on every heartbeat/register call. nil/false is
@@ -1414,7 +1421,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				msg = "platform agent heartbeat denied: no seeded MODEL workspace_secret; refusing to mark online (RCA #2970 FAIL-CLOSED)"
 				reason = "model_missing"
 			case !hasMCP:
-				msg = "platform agent heartbeat denied: /opt/molecule-mcp-server missing; refusing to mark online (RCA #2970 FAIL-CLOSED)"
+				msg = "platform agent heartbeat denied: management MCP server absent (mcp_server_present=false); refusing to mark online (RCA #2970 FAIL-CLOSED)"
 				reason = "mcp_server_missing"
 				// #33 deadlock-break: the management MCP is delivered on SaaS by
 				// the declared-plugin reconcile (workspace_declared_plugins), but

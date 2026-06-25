@@ -56,7 +56,7 @@ func TestHeartbeatHandler_PlatformMCPMissing_FiresRecoveryReconcile(t *testing.T
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 
 	// markWorkspaceFailed: broadcast (structure_events) then the failed UPDATE.
-	mcpMissingMsg := "platform agent heartbeat denied: /opt/molecule-mcp-server missing; refusing to mark online (RCA #2970 FAIL-CLOSED)"
+	mcpMissingMsg := "platform agent heartbeat denied: management MCP server absent (mcp_server_present=false); refusing to mark online (RCA #2970 FAIL-CLOSED)"
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE workspaces SET status =").
