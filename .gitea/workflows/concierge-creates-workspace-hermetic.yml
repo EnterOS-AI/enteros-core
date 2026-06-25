@@ -19,6 +19,7 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
+  # bp-required: pending #3081 — hermetic gate is intended merge-blocking but not yet enrolled in branch protection
   hermetic:
     name: Concierge Creates Workspace Hermetic
     runs-on: ubuntu-latest
