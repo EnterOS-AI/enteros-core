@@ -147,11 +147,34 @@ The `.githooks/pre-commit` hook enforces:
 
 Fix violations before committing — the hook will reject the commit.
 
+### Development pipeline (SOP-24)
+
+The canonical development pipeline is defined in
+[`internal/runbooks/dev-sop.md` §SOP-24](https://git.moleculesai.app/molecule-ai/internal/src/branch/main/runbooks/dev-sop.md)
+(private repo). It specifies five ordered stages:
+
+1. **local lint** — pre-commit hooks + linters (stage 1)
+2. **compile** — `platform-build` / `canvas-build` build the binaries (stage 2)
+3. **local e2e** — the `e2e-api` suite (**merge-blocking**)
+4. **staging e2e** — the staging E2E gate run by CP's deploy pipeline (**merge-blocking**)
+5. **production monitor** — post-deploy canary soak + rollback authority
+
+Stages 1–2 are implemented by the CI jobs in the table below. Stages 3–4
+(local e2e + staging e2e) are **merge-blocking**: a PR cannot merge until both
+are green. The provisioner-parity / `e2e-smoke` staging jobs that gate stage 4
+run in CP's deploy pipeline, not in this repo's CI — so the table below is the
+stage-1/2 job set, **not** the complete merge-gate set. See
+`internal/runbooks/dev-sop.md` §SOP-24 for the authoritative gate list.
+
 ### CI Pipeline
 
 CI runs on Gitea Actions with self-hosted runners. External contributors:
 PRs from forks will not trigger CI automatically. A maintainer will review
 and run CI manually.
+
+The jobs below implement **stages 1–2** of the SOP-24 pipeline (local lint +
+compile). They are not the full gate set — local-e2e and staging-e2e (SOP-24
+stages 3–4) are merge-blocking and partly live in CP's deploy pipeline.
 
 | Job | What it checks |
 |-----|---------------|
