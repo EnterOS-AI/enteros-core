@@ -54,13 +54,17 @@ online/degraded gate reads (built by `platform_agent_identity.identity_gate_payl
 `mcp_server_present` (declared) is **necessary but not sufficient** — a
 declared-but-dead MCP is the false-green core#3082 catches, so the concierge also
 reports `loaded_mcp_tools`, the namespaced ids that actually loaded into the
-model. The runtime produces `loaded_mcp_tools` **at init** (enumerating the
-connected MCP servers over the wire), so the concierge reaches `online` without
-waiting for a user turn. Tri-state: the field is **omitted** until something is
-observed (grace window applies), `[]` when a server connected with zero tools, or
-the id list. The required tool id `mcp__molecule-platform__create_workspace` is
-pinned in `contracts/mcp-plugin-delivery.contract.json` and derived on both
-sides. See [Runtime ↔ Platform ↔ Plugin Responsibilities](/architecture/runtime-platform-plugin-responsibilities).
+model. The runtime produces `loaded_mcp_tools` by enumerating the connected MCP
+servers over the wire (retrying in the background until the management MCP is
+connectable), so the concierge reaches `online` without waiting for a user turn.
+Tri-state: the field is **omitted** until something is observed (grace window
+applies), `[]` when a server connected with zero tools, or the id list. The
+required tool id is `mcp__molecule-platform__create_workspace`; *current state*
+core holds it as a literal const (`conciergePlatformMCPCreateWorkspaceTool`)
+guarded by a contract **drift test**, and the contract pins the management server
+name + status-field shape only — pinning the full id in the contract and deriving
+both sides is a *target* (in progress). See
+[Runtime ↔ Platform ↔ Plugin Responsibilities](/architecture/runtime-platform-plugin-responsibilities).
 
 `active_tasks` is included because the canvas uses it for a busy indicator on the node, and it sets up backpressure for Phase 2 without a schema change.
 
