@@ -78,13 +78,11 @@ env:
   # touching every workflow). Pattern mirrors `vars.CP_URL || 'literal'` already in
   # use below in this repo's staging-verify.yml.
   IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform
-  # Concierge (kind=platform) image (molecule-ai/molecule-platform-agent) is
-  # built by the TEMPLATE repo (workspace-template-claude-code, publish-image.yml
-  # → publish-platform-agent) FROM the claude-code runtime image with the
-  # org-management MCP baked at /opt/molecule-mcp-server (RFC platform-agent §5.7).
-  # Core does NOT build it: the prior FROM-platform-tenant build here shipped an
-  # image with no runtime + no MCP server, so the concierge never registered
-  # (#2970/#30). Pin promotion is operator-gated (POST /cp/admin/runtime-image/promote).
+  # Concierge (kind=platform) provisions on the same claude-code runtime image
+  # as other workspaces; the org-management MCP is delivered as a plugin via
+  # the platform MCP plugin delivery contract. Core does NOT build a dedicated
+  # concierge image. Pin promotion is operator-gated
+  # (POST /cp/admin/runtime-image/promote).
   TENANT_IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform-tenant
   STAGING_TENANT_IMAGE_NAME: ${{ vars.STAGING_ECR_REGISTRY || '004947743811.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform-tenant
 
@@ -218,12 +216,11 @@ jobs:
       #   - cache-from on a missing tag (first run) is a warning, not an error.
       #   - Concurrent publishes overwrite :buildcache last-writer-wins —
       #     same best-effort semantics as :staging-latest.
-      # NOTE: molecule-ai/platform is now ORPHANED — the concierge image was
-      # repointed to FROM platform-tenant (the live workspace-server image), and
-      # nothing else consumes molecule-ai/platform (it has not built since
-      # 2026-05-15). continue-on-error so a failure of this dead base build can
-      # never block the tenant + platform-agent builds below. Remove this step
-      # entirely in a follow-up once confirmed no consumer remains.
+      # NOTE: molecule-ai/platform is now ORPHANED — nothing consumes
+      # molecule-ai/platform (it has not built since 2026-05-15).
+      # continue-on-error so a failure of this dead base build can never
+      # block the live tenant build below. Remove this step entirely in a
+      # follow-up once confirmed no consumer remains.
       - name: Build & push platform image to ECR (staging-<sha> + staging-latest)
         continue-on-error: true
         env:
