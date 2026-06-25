@@ -568,7 +568,7 @@ jobs:
             # $1=key  $2=env  $3=url-encoded secretPath
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=$2&secretPath=$3" \
               -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json;print(json.load(sys.stdin)["secret"]["secretValue"])'
+              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
           }
           E2E_MODEL=$(read_secret MOLECULE_LLM_DEFAULT_MODEL staging %2Fshared%2Fcontrolplane%2Fllm)
           E2E_RUNTIME=$(read_secret MOLECULE_DEFAULT_RUNTIME staging %2Fshared%2Fcontrolplane%2Fllm)
