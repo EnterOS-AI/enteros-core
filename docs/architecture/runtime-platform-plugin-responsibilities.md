@@ -51,10 +51,17 @@ tool-list message.
 actually wired (not just a scaffold) and a **liveness test**. A producer that is
 unreferenced serializes (`omitempty`) identically to a correctly-warming-up one —
 that is how a half-wired producer silently degrades every concierge (the
-2026-06-25 incident). The contract field + the required tool id
-(`mcp__molecule-platform__create_workspace`) are pinned in
-`contracts/mcp-plugin-delivery.contract.json`; **both sides derive from it**,
-neither hardcodes the literal.
+2026-06-25 incident).
+
+> **Current state vs target.** Today the required tool id is a Go **literal
+> constant** (`conciergePlatformMCPCreateWorkspaceTool`) guarded by a contract
+> **drift test**, and `contracts/mcp-plugin-delivery.contract.json` pins the
+> management **server name** + the **status-field** shape — it does **not** yet
+> pin the full tool id, and the runtime does not derive it (it enumerates the
+> live MCP). **Target** (guardrail/SSOT workstream, in progress): pin the full
+> id `mcp__molecule-platform__create_workspace` in the contract and have core's
+> gate **derive** it, so a rename on either side fails the (blocking) drift
+> check rather than agreeing by convention.
 
 ## 2. Plugin → Runtime: per-runtime rendering
 
@@ -87,10 +94,11 @@ mis-attribution class).
   `if runtime == …` branches; runtime selection happens once via `ADAPTER_MODULE`
   → `get_adapter`, and per-runtime shape happens via the `mcp_render` dispatch.
   No platform logic is baked into a plugin.
-- **Tool ids are SSOT.** `mcp__molecule-platform__create_workspace` is defined
-  once (the contract) and derived everywhere — core's gate, the runtime emitter,
-  and the e2e all read it. Re-spelling it per layer is how the codex#142
-  `mcp__platform__` vs `mcp__molecule-platform__` drift happened.
+- **Tool ids should be SSOT.** Re-spelling `mcp__molecule-platform__create_workspace`
+  per layer is how the codex#142 `mcp__platform__` vs `mcp__molecule-platform__`
+  drift happened. *Current state:* core holds it as a literal const guarded by a
+  drift test; the runtime enumerates it from the live MCP (no literal). *Target:*
+  pin the full id in the contract and derive core's gate from it (in progress).
 - **Platform-ness is a composition, not an image.** A platform concierge is an
   **ordinary runtime image** plus (a) the org-admin key and (b) the management
   MCP plugin — *not* a special baked `molecule-platform-agent` image. The baked
@@ -103,20 +111,23 @@ mis-attribution class).
 
 ## 4. How this is enforced (guardrails)
 
-Each rule above is (or is becoming) a red-on-regression test, so the principle
-can't drift back into tribal knowledge:
+Each rule should be a red-on-regression test so the principle can't drift back
+into tribal knowledge. **Status is honest** — ✅ enforced in CI today,
+◻ target/in-progress (guardrail/SSOT workstream, post the 2026-06-25 audit):
 
-| Rule | Guardrail |
-|------|-----------|
-| Plugin renders per-runtime native config | `test_mcp_plugin_delivery_contract` (codex writes `config.toml`, not claude settings) |
-| No runtime branching in the gate | gate has zero `if runtime==`; `…RoutesThroughPort` |
-| Renderer/reader/present-probe lockstep | `test_mcp_render_lockstep` (`set(_RUNTIME_SPECS)==set(_RUNTIME_READERS)`) |
-| Unmapped runtime fails closed | G6 `test_mcp_render_completeness_g6` |
-| Tool-id / prompt SSOT | G0/G1 + `test_mcp_ssot`; contract-derivation tests both sides |
-| `loaded_mcp_tools` producer is live | producer-liveness boot test (real gate, no `force`) |
-| `loaded_mcp_tools` contract pinned both sides | `mcp-plugin-delivery-contract-drift` (branch-protection blocking, runtime copy in the compare set) |
-| Concierge reaches online + has create_workspace | deterministic e2e asserting `status=online` + heartbeat `loaded_mcp_tools` ∋ `create_workspace` (not LLM self-enumeration) |
-| Baked image cannot return | de-bake absence guard (fails if `Dockerfile.platform-agent` / `resolvePlatformAgentImage` / baked publish job reappear) |
+| Rule | Guardrail | Status |
+|------|-----------|--------|
+| Plugin renders per-runtime native config | `test_mcp_plugin_delivery_contract` (codex writes `config.toml`, not claude settings) | ✅ |
+| No runtime branching in the gate | gate has zero `if runtime==`; `…RoutesThroughPort` | ✅ |
+| Unmapped runtime fails closed | G6 `test_mcp_render_completeness_g6` | ✅ |
+| Prompt SSOT (filename / channel) | G0 `test_prompt_filename_ssot_g0`, G1 `test_prompt_channel_ssot_g1`, `test_mcp_ssot` | ✅ |
+| `loaded_mcp_tools` producer fires through the real gate | `test_debaked_concierge_runs_via_mcp_server_present` (runtime#181) | ✅ (partial) |
+| Renderer/reader/present-probe lockstep | `test_mcp_render_lockstep` (`set(_RUNTIME_SPECS)==set(_RUNTIME_READERS)`) | ◻ target |
+| Full tool id derived from a shared contract | pin `mcp__molecule-platform__create_workspace` in the contract + derive core's gate | ◻ target |
+| `loaded_mcp_tools` / required tool pinned both sides + blocking drift | `mcp-plugin-delivery-contract-drift` made fail-closed, runtime copy in the compare set | ◻ target |
+| Producer-liveness via the full `main.py` boot path | boot test (real gate, no `force`) | ◻ target |
+| Concierge reaches online + has `create_workspace` | **current**: e2e LLM self-enumeration; **target**: deterministic `status=online` + heartbeat `loaded_mcp_tools` ∋ `create_workspace` | ◻ target (pending the deterministic e2e PR) |
+| Baked image cannot return | de-bake absence guard (fails if `Dockerfile.platform-agent` / `resolvePlatformAgentImage` / baked publish job reappear) | ◻ target (#78) |
 
-See the guardrail audit (2026-06-25) for the current enforced/gap status; items
-not yet green are tracked under the guardrail/SSOT workstream.
+See the guardrail audit (2026-06-25) for the full enforced/gap analysis; the ◻
+items are tracked under the guardrail/SSOT workstream.

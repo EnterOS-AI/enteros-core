@@ -33,8 +33,10 @@ tribal knowledge:
 1. **The runtime adapts the agent to the platform.** It owns the register/
    heartbeat **status contract** (`mcp_server_present` *and* `loaded_mcp_tools`),
    reported runtime-agnostically in one place. Every gate-consumed field must
-   have a wired producer + a liveness test. The required tool id is pinned in a
-   shared contract and **derived** on both sides, never hardcoded per layer.
+   have a wired producer + a liveness test. The required tool id should be pinned
+   in a shared contract and **derived** on both sides rather than hardcoded per
+   layer — *target state*; today core holds it as a literal const guarded by a
+   drift test and the runtime enumerates it live (contract-pin in progress).
 
 2. **The plugin adapts its abilities to each runtime.** One runtime-agnostic
    descriptor (the plugin = SSOT); per-runtime renderers write it into native
@@ -42,10 +44,12 @@ tribal knowledge:
    runtime fails **closed**.
 
 3. **Platform-ness is a composition, not an image.** A concierge is an ordinary
-   runtime image + the org-admin key + the management MCP plugin. The baked
-   `molecule-platform-agent` image is removed and guarded against return;
-   "is this a concierge?" is detected via `mcp_server_present()`, not the
-   baked-image marker.
+   runtime image + the org-admin key + the management MCP plugin. "Is this a
+   concierge?" is detected via `mcp_server_present()`, not the baked-image marker
+   (runtime#181). The baked `molecule-platform-agent` image is being removed and
+   guarded against return — *in progress* (artifact deletion + absence guard,
+   #78); until then the CP still carries vestigial `resolvePlatformAgentImage`
+   references.
 
 The full statement, the field tables, and the guardrail matrix live in
 [`architecture/runtime-platform-plugin-responsibilities.md`](/architecture/runtime-platform-plugin-responsibilities).
