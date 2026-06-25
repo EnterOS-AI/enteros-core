@@ -48,11 +48,17 @@ func TestSSOT_DegradeGateToolDerivesFromContract(t *testing.T) {
 	if c.MCPServerName == "" {
 		t.Fatal("contract mcp_server_name is empty — SSOT for the platform MCP tool prefix")
 	}
-	want := "mcp__" + c.MCPServerName + "__create_workspace"
+	if c.RequiredTool == "" {
+		t.Fatal("contract required_tool is empty — SSOT for the management MCP's required tool verb")
+	}
+	// Derive the FULL id entirely from the contract (server name + required tool
+	// verb) — no hardcoded "create_workspace" here. This closes the SSOT gap: the
+	// verb is now contract-pinned, not re-spelled in this test.
+	want := "mcp__" + c.MCPServerName + "__" + c.RequiredTool
 	if conciergePlatformMCPCreateWorkspaceTool != want {
-		t.Errorf("SSOT drift: conciergePlatformMCPCreateWorkspaceTool = %q, but contract mcp_server_name = %q implies %q.\n"+
-			"The degraded gate must look for the tool id the runtime actually emits (mcp__<server>__create_workspace).",
-			conciergePlatformMCPCreateWorkspaceTool, c.MCPServerName, want)
+		t.Errorf("SSOT drift: conciergePlatformMCPCreateWorkspaceTool = %q, but contract implies %q (mcp__%s__%s).\n"+
+			"The degraded gate must look for the tool id the runtime actually emits (mcp__<server>__<required_tool>).",
+			conciergePlatformMCPCreateWorkspaceTool, want, c.MCPServerName, c.RequiredTool)
 	}
 }
 
