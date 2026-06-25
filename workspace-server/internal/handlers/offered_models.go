@@ -35,7 +35,12 @@ type OfferedModel struct {
 func ListOfferedModels(c *gin.Context) {
 	runtime := c.Query("runtime")
 	if runtime == "" {
-		runtime = "claude-code"
+		// An explicit ?runtime= query wins; only the unset fallback FOLLOWS the
+		// platform default SSOT (MOLECULE_DEFAULT_RUNTIME, KMS-injected) via
+		// bareCreateDefaultRuntime instead of a baked "claude-code" literal so
+		// discovery stays aligned with the create/billing default. Behavior-
+		// neutral today: resolves to "claude-code".
+		runtime = bareCreateDefaultRuntime()
 	}
 	m, err := providerRegistry()
 	if err != nil || m == nil {

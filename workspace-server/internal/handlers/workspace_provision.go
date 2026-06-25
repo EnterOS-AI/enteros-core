@@ -799,16 +799,23 @@ func yamlQuote(s string) string {
 // sanitizeRuntime coerces a payload runtime string to a known entry.
 // Empty strings → the default. Unknown strings also → the default,
 // with a log so operators can notice typos or attack attempts.
+//
+// The DEFAULT (for empty/unknown input) FOLLOWS the platform default SSOT
+// (MOLECULE_DEFAULT_RUNTIME, KMS-injected) via bareCreateDefaultRuntime instead
+// of a baked "claude-code" literal. The security coercion is unchanged — an
+// EXPLICIT, known runtime still passes through verbatim, and an unknown/empty
+// one is still coerced to the (now SSOT-resolved, always known) default.
+// Behavior-neutral today: the resolved default equals "claude-code".
 func sanitizeRuntime(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "claude-code"
+		return bareCreateDefaultRuntime()
 	}
 	if _, ok := knownRuntimes[raw]; ok {
 		return raw
 	}
-	log.Printf("provisioner: rejected unknown runtime %q, falling back to claude-code", raw)
-	return "claude-code"
+	log.Printf("provisioner: rejected unknown runtime %q, falling back to default runtime", raw)
+	return bareCreateDefaultRuntime()
 }
 
 // ensureDefaultConfig generates minimal config files in memory for workspaces without a template.

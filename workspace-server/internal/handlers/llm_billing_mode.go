@@ -331,8 +331,11 @@ func readWorkspaceDeriveInputs(ctx context.Context, workspaceID string) (runtime
 	}
 	runtime = rt.String
 	if runtime == "" {
-		// Mirror the DB column default so an unset runtime still derives.
-		runtime = "claude-code"
+		// Mirror the DB column default so an unset runtime still derives. The
+		// default FOLLOWS the platform default SSOT (MOLECULE_DEFAULT_RUNTIME,
+		// KMS-injected) via bareCreateDefaultRuntime instead of a baked
+		// "claude-code" literal. Behavior-neutral today: resolves to "claude-code".
+		runtime = bareCreateDefaultRuntime()
 	}
 
 	// Gather model + auth-env-name keys from workspace_secrets in one pass.
