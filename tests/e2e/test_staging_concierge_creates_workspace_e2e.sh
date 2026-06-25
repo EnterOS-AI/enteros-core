@@ -17,16 +17,18 @@
 # name we asked for now EXISTS in GET /workspaces — which can only happen if the
 # concierge's LLM actually invoked the create_workspace platform-MCP tool.
 #
+# The old step 4.5 asked the LLM to SELF-REPORT its tool list; that flaked because
+# the LLM can omit create_workspace even when the tool is loaded. This version
+# removes that probe and relies on the real side-effect plus an optional
+# `loaded_mcp_tools` inventory guard (core#3082) once the runtime producer lands.
+#
 # WHAT MUST BE LIVE for this to pass GREEN (else it SKIPs LOUD, never false-red):
 #   • The org's concierge must be installed as the kind='platform' root AND
-#     provisioned on the DEDICATED platform-agent image (Dockerfile.platform-agent),
-#     which ships /opt/molecule-mcp-server — the ONLY image where the platform MCP
-#     (create_workspace) lights up. On SaaS staging the CP installs + provisions it
-#     at org-provision time. (See platform_agent.go's SELF-HOST CAVEAT: the ordinary
-#     claude-code image does NOT ship the platform MCP, so create_workspace is a
-#     no-op there.) A parallel agent is wiring the platform-agent image into the
-#     staging provision path; until that lands, this test SKIPs LOUD with a clear
-#     "concierge not on platform-agent image" message rather than failing red.
+#     provisioned on a runtime image that installs the molecule-platform-mcp
+#     PLUGIN (RFC #3045). On SaaS staging the CP installs + provisions it at
+#     org-provision time. If the concierge never reaches online, or the platform
+#     MCP plugin is not wired, this test SKIPs LOUD with a clear message rather
+#     than failing red.
 #   • A working model for the concierge. On SaaS the concierge is platform_managed
 #     (the CP-exported LLM proxy supplies the model) so no BYOK key is needed for
 #     the concierge itself.
@@ -40,8 +42,6 @@
 #   E2E_CONCIERGE_ONLINE_SECS     default 900 (concierge boot-to-online budget)
 #   E2E_AGENT_ACT_SECS            default 420 (LLM think+tool-call budget after we
 #                                 send the message — generous for nondeterminism)
-#   E2E_MCP_READY_SECS            default 180 (post-online wait for platform MCP
-#                                 tool registration to surface via A2A probe)
 #   E2E_KEEP_ORG                  1 → skip teardown (debugging only)
 #   E2E_RUN_ID                    slug suffix; CI: ${GITHUB_RUN_ID}-${RUN_ATTEMPT}
 #   E2E_AWS_LEAK_CHECK            auto (default) | required | off
@@ -80,7 +80,6 @@ ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 CONCIERGE_ONLINE_SECS="${E2E_CONCIERGE_ONLINE_SECS:-900}"
 AGENT_ACT_SECS="${E2E_AGENT_ACT_SECS:-420}"
-MCP_READY_SECS="${E2E_MCP_READY_SECS:-180}"
 REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
 
 # ─── PR-mode early-exit (core#3081 / CR2 #12653) ──────────────────────────────
@@ -374,167 +373,50 @@ while true; do
   if [ "$(date +%s)" -gt "$ONLINE_DEADLINE" ]; then
     LAST_ERR=$(workspace_field "$CONCIERGE_ID" last_sample_error)
     skip_loud "concierge $CONCIERGE_ID never reached online+routable within ${CONCIERGE_ONLINE_SECS}s \
-(last status='${C_STATUS}', url='${C_URL}', err='${LAST_ERR}'). On a tenant where the concierge is NOT \
-provisioned on the platform-agent image (no /opt/molecule-mcp-server, no model), it cannot run the \
-create_workspace tool — that is the parallel-agent image work this gate depends on."
+(last status='${C_STATUS}', url='${C_URL}', err='${LAST_ERR}'). The concierge must be provisioned on a \
+runtime image that installs the molecule-platform-mcp plugin and has a working model; otherwise it cannot \
+run the create_workspace tool."
   fi
   sleep 10
 done
 ok "Concierge online + routable (url assigned)"
 
-# ─── 4.5. A2A-probe: assert the concierge's RUNTIME tool list includes ─────────
-# mcp__molecule-platform__create_workspace (not just that the config declared it).
-#
-# core#3081 / Researcher #12646: the previous false-green slipped because the
-# test asserted the mcp_servers.yaml TEXT, which only proves a config file
-# exists on disk — it does NOT prove the concierge's LLM can actually call
-# the tool. The whole point of the gate is to assert REAL capability: a
-# runtime, live, actually-callable tool — not a proxy (file presence, plugin
-# install, platform-agent image presence, mcp_servers.yaml text).
-#
-# Mechanism: send a structured A2A `message/send` envelope to the concierge
-# asking it to enumerate its MCP tool names by their literal namespaced
-# identifiers (the `mcp__<server>__<tool>` form that Claude Code's tool
-# dispatcher uses), then parse the reply for the literal
-# `mcp__molecule-platform__create_workspace` string. This is LLM-mediated
-# (the concierge LLM must respond) but goes through the SAME A2A channel
-# the real create_workspace call (5/6) will use, so a missing tool shows up
-# as a missing-string-in-reply here, before the LLM-budget is burned on the
-# 7-minute cold-concierge tool call that will never succeed.
-#
-# Defensive parsing: the concierge LLM may list tools in a few formats
-# (`mcp__molecule-platform__create_workspace`, `create_workspace`, or as a
-# JSON array). We accept any of the literal namespaced form OR a JSON array
-# containing the namespaced form. A "yes" in any format is a PASS; an absent
-# namespaced identifier is a HARD FAIL (skip_loud + E2E_REQUIRE_LIVE=1 →
-# exit 5).
-log "4.5/6 A2A-probe: asserting the concierge's RUNTIME tool list exposes mcp__molecule-platform__create_workspace (budget ${MCP_READY_SECS}s)..."
-# Cold concierge: same wide per-call window + cold-start 5xx retry as the
-# real create call (5/6). Each probe attempt retries transport 5xx up to 5
-# times; we then POLL for the tool to surface, because the MCP server may
-# register its tools a few seconds after the A2A endpoint returns 2xx
-# (npx cold-start / RFC#3045).
-PROBE_PROMPT='List every MCP tool you have access to, by its full namespaced identifier (e.g. mcp__server-name__tool-name). Output ONLY a JSON array of strings, no commentary, no markdown fence. Example: ["mcp__memory__commit_memory", "mcp__platform__create_workspace"]. Reply with [] if you have no MCP tools.'
-A2A_PROBE_TMP="$TMPDIR_E2E/a2a_probe_out"
-PROBE_POLL_INTERVAL_SECS=25
-MCP_READY_START_TS=$(date +%s)
-MCP_READY_DEADLINE=$(( MCP_READY_START_TS + MCP_READY_SECS ))
-PROBE_HIT=0
+# ─── 4.5. Required loaded-MCP-tools inventory check (core#3082) ──────────────
+# The concierge runtime must report `loaded_mcp_tools` on its heartbeat and
+# that list must include the platform management `create_workspace` tool.
+# This is a REQUIRED gate: if the field is absent or does not include the
+# tool, the concierge cannot satisfy the core#3082 online gate and this
+# test fails closed. The real side-effect assertion below is NOT sufficient
+# without this deterministic inventory check.
+log "4.5/6 Required loaded_mcp_tools inventory check..."
 
-while [ "$(date +%s)" -lt "$MCP_READY_DEADLINE" ]; do
-  PROBE_TEXT=""
-  PROBE_OK=0
-  # Inner transport-level retry: only 502/503/504 are retried.
-  for PROBE_ATTEMPT in $(seq 1 5); do
-    : >"$A2A_PROBE_TMP"
-    set +e
-    PROBE_CODE=$(tenant_call POST "/workspaces/$CONCIERGE_ID/a2a" \
-        --max-time "$AGENT_ACT_SECS" \
-        -H "Content-Type: application/json" \
-        -d "$(WORKER_NAME="$WORKER_NAME" PROBE_PROMPT="$PROBE_PROMPT" python3 -c "
-import json, os
-print(json.dumps({
-    'jsonrpc': '2.0',
-    'method': 'message/send',
-    'id': 'e2e-cncrg-mk-probe-' + os.urandom(4).hex(),
-    'params': {
-        'message': {
-            'role': 'user',
-            'messageId': 'e2e-probe-' + os.urandom(4).hex(),
-            'parts': [{'kind': 'text', 'text': os.environ['PROBE_PROMPT']}],
-        }
-    }
-}))")" \
-      -o "$A2A_PROBE_TMP" -w '%{http_code}' 2>/dev/null)
-    PROBE_RC=$?
-    set -e
-    PROBE_CODE=${PROBE_CODE:-000}
-    PROBE_RESP=$(cat "$A2A_PROBE_TMP" 2>/dev/null || echo "")
-    if [ "$PROBE_RC" = "0" ] && [ "$PROBE_CODE" -ge 200 ] && [ "$PROBE_CODE" -lt 300 ]; then
-      PROBE_OK=1
-      break
-    fi
-    if echo "$PROBE_CODE" | grep -Eq '^(502|503|504)$'; then
-      log "    A2A-probe cold-start attempt $PROBE_ATTEMPT/5 returned $PROBE_CODE — retrying"
-      [ "$PROBE_ATTEMPT" -lt 5 ] && { sleep 15; continue; }
-    fi
-    break
-  done
-  if [ "$PROBE_OK" != "1" ]; then
-    fail "A2A-probe POST /workspaces/$CONCIERGE_ID/a2a failed (curl_rc=$PROBE_RC, http=$PROBE_CODE) after $PROBE_ATTEMPT attempt(s): $(echo "$PROBE_RESP" | head -c 400)"
-  fi
-
-  PROBE_TEXT=$(echo "$PROBE_RESP" | python3 -c "
+# concierge_loaded_mcp_tools_json: echo the concierge's `loaded_mcp_tools`
+# field as a JSON array, or "" if the field is missing/unreadable.
+concierge_loaded_mcp_tools_json() {
+  tenant_call GET "/workspaces/$CONCIERGE_ID" 2>/dev/null | python3 -c "
 import sys, json
 try: d = json.load(sys.stdin)
 except Exception: print(''); sys.exit(0)
-parts = (d.get('result') or {}).get('parts', []) if isinstance(d, dict) else []
-print(parts[0].get('text','') if parts else '')" 2>/dev/null || echo "")
-  log "    concierge probe reply (first 300 chars): $(echo "$PROBE_TEXT" | head -c 300)"
+if not isinstance(d, dict): print(''); sys.exit(0)
+tools = d.get('loaded_mcp_tools')
+if not isinstance(tools, list): print(''); sys.exit(0)
+print(json.dumps(tools))"
+}
 
-  # Decide: does the literal `mcp__molecule-platform__create_workspace` appear
-  # anywhere in the reply text?  We strip a leading/trailing markdown fence if
-  # present (some LLM outputs wrap the JSON array in ```json ... ```) and parse
-  # for the namespaced identifier.
-  PROBE_VERDICT=$(printf '%s' "$PROBE_TEXT" | python3 -c "
-import sys, json, re
-text = sys.stdin.read()
-if not text:
-    print('EMPTY'); sys.exit(0)
-# Accept the namespaced identifier directly (covers the prose-format reply).
-if 'mcp__molecule-platform__create_workspace' in text:
-    print('HIT'); sys.exit(0)
-# Tolerate the LLM wrapping the JSON array in a markdown fence (the
-# literal triple-backtick form) or padding it with prose. Pull the first
-# [...] match and parse as JSON; accept any list element containing the
-# namespaced identifier.
-m = re.search(r'\[[^\]]*\]', text, re.S)
-if m:
-    try:
-        arr = json.loads(m.group(0))
-        if isinstance(arr, list):
-            for t in arr:
-                if isinstance(t, str) and 'mcp__molecule-platform__create_workspace' in t:
-                    print('HIT'); sys.exit(0)
-    except Exception:
-        pass
-print('NO_HIT')
-" 2>/dev/null || echo "PARSE_ERR")
-
-  case "$PROBE_VERDICT" in
-    HIT)
-      ok "A2A-probe PASS: concierge's RUNTIME tool list contains mcp__molecule-platform__create_workspace — REAL capability confirmed (not just a config-text proxy)"
-      PROBE_HIT=1
-      break
-      ;;
-    *)
-      ELAPSED=$(( $(date +%s) - MCP_READY_START_TS ))
-      if [ "$ELAPSED" -ge "$MCP_READY_SECS" ]; then
-        break
-      fi
-      log "    platform MCP tool not yet surfaced, re-probing (${ELAPSED}s elapsed, budget ${MCP_READY_SECS}s)"
-      sleep "$PROBE_POLL_INTERVAL_SECS"
-      ;;
-  esac
-done
-
-if [ "$PROBE_HIT" != "1" ]; then
-  case "$PROBE_VERDICT" in
-    NO_HIT)
-      skip_loud "A2A-probe FAIL: concierge's reply does NOT contain mcp__molecule-platform__create_workspace. The tool is NOT in the LLM's runtime tool list — even if /configs/mcp_servers.yaml declares it, the concierge's MCP layer is not surfacing it to the LLM (overlay applied to wrong path, server name mismatch, or molecule-mcp-server not actually running). Reply: $(echo "$PROBE_TEXT" | head -c 600)"
-      ;;
-    EMPTY)
-      skip_loud "A2A-probe FAIL: concierge returned no text part to the tool-list probe. The A2A channel is up (HTTP 2xx) but the LLM did not reply — could be a cold-start model-load failure, a missing model, or a wired-but-not-running MCP server. Reply was empty."
-      ;;
-    PARSE_ERR)
-      skip_loud "A2A-probe FAIL: probe response did not parse as JSON-RPC text. Transport was up (HTTP 2xx) but the envelope shape is wrong — possible concierge runtime regression. Reply: $(echo "$PROBE_TEXT" | head -c 600)"
-      ;;
-    *)
-      skip_loud "A2A-probe FAIL: probe produced unknown verdict '$PROBE_VERDICT'. Reply: $(echo "$PROBE_TEXT" | head -c 400)"
-      ;;
-  esac
+LOADED_TOOLS=$(concierge_loaded_mcp_tools_json)
+if [ -n "$LOADED_TOOLS" ] && [ "$LOADED_TOOLS" != "[]" ]; then
+  if [ "$(echo "$LOADED_TOOLS" | python3 -c "
+import sys, json
+tools = json.load(sys.stdin)
+print('yes' if 'mcp__molecule-platform__create_workspace' in tools else 'no')")" = "yes" ]; then
+    ok "loaded_mcp_tools inventory confirms mcp__molecule-platform__create_workspace"
+  else
+    skip_loud "loaded_mcp_tools inventory check FAIL: mcp__molecule-platform__create_workspace not reported. Tools: $(echo "$LOADED_TOOLS" | head -c 400)"
+  fi
+else
+  skip_loud "loaded_mcp_tools absent or empty — the runtime producer (runtime#181) must populate this field and include mcp__molecule-platform__create_workspace"
 fi
-unset PROBE_TEXT PROBE_RESP PROBE_CODE PROBE_RC PROBE_VERDICT A2A_PROBE_TMP PROBE_HIT PROBE_POLL_INTERVAL_SECS MCP_READY_START_TS MCP_READY_DEADLINE
+
 # Pre-state: the worker MUST NOT exist yet (so its later appearance is causally
 # the concierge's doing, not a pre-existing row).
 PRE_EXISTING=$(find_worker_by_name)

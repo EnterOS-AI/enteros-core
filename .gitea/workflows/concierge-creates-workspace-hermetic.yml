@@ -1,0 +1,45 @@
+name: Concierge Creates Workspace Hermetic
+
+# In-repo, mock-driven complement to the live staging E2E in
+# e2e-staging-saas.yml. Runs on every PR/push so the deterministic
+# concierge create_workspace assertions (loaded_mcp_tools gate,
+# status=online, real workspace row creation) cannot silently regress.
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main, staging]
+
+concurrency:
+  group: cncrg-hermetic-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+jobs:
+  # bp-required: pending #3081 — hermetic gate is intended merge-blocking but not yet enrolled in branch protection
+  hermetic:
+    name: Concierge Creates Workspace Hermetic
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: workspace-server
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+          # cache:false — the self-hosted runner bind-mounts a persistent
+          # GOCACHE/GOMODCACHE (/var/cache/ci-go-{build,mod}); actions/cache is
+          # redundant and corrupts it by untarring over the bind mount.
+          cache: false
+
+      - run: go mod download
+
+      - name: Run concierge creates-workspace hermetic tests
+        run: go test -timeout 5m -v ./internal/handlers/ -run '^TestConciergeCreatesWorkspace_Hermetic' -count=1

@@ -1233,7 +1233,7 @@ func scanWorkspaceRow(rows interface {
 	Scan(dest ...interface{}) error
 }) (map[string]interface{}, error) {
 	var id, name, role, status, url, sampleError, currentTask, runtime, workspaceDir, kind string
-	var computeRaw []byte
+	var computeRaw, loadedMCPToolsRaw []byte
 	var tier, activeTasks, maxConcurrentTasks, uptimeSeconds int
 	var errorRate, x, y float64
 	var collapsed, broadcastEnabled, talkToUserEnabled bool
@@ -1245,7 +1245,8 @@ func scanWorkspaceRow(rows interface {
 	err := rows.Scan(&id, &name, &role, &tier, &status, &agentCard, &url,
 		&parentID, &activeTasks, &maxConcurrentTasks, &errorRate, &sampleError, &uptimeSeconds,
 		&currentTask, &runtime, &workspaceDir, &x, &y, &collapsed,
-		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw, &kind)
+		&budgetLimit, &monthlySpend, &broadcastEnabled, &talkToUserEnabled, &computeRaw, &kind,
+		&loadedMCPToolsRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -1304,6 +1305,18 @@ func scanWorkspaceRow(rows interface {
 		ws["agent_card"] = nil
 	}
 
+	// core#3082: loaded_mcp_tools is the runtime-reported MCP tool inventory.
+	// Return an empty array when the runtime has not yet reported it so the
+	// GET response contract is deterministic (molecule-core#3256).
+	loadedMCPTools := []string{}
+	if len(loadedMCPToolsRaw) > 0 && string(loadedMCPToolsRaw) != "null" {
+		if unmarshalErr := json.Unmarshal(loadedMCPToolsRaw, &loadedMCPTools); unmarshalErr != nil {
+			log.Printf("scanWorkspaceRow: failed to unmarshal loaded_mcp_tools: %v", unmarshalErr)
+			loadedMCPTools = []string{}
+		}
+	}
+	ws["loaded_mcp_tools"] = loadedMCPTools
+
 	return ws, nil
 }
 
@@ -1319,7 +1332,8 @@ const workspaceListQuery = `
 		   w.budget_limit, COALESCE(w.monthly_spend, 0),
 		   w.broadcast_enabled, w.talk_to_user_enabled,
 		   COALESCE(w.compute, '{}'::jsonb),
-		   COALESCE(w.kind, 'workspace')
+		   COALESCE(w.kind, 'workspace'),
+		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb)
 	FROM workspaces w
 	LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 	WHERE w.status != 'removed'
@@ -1382,7 +1396,8 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			   w.budget_limit, COALESCE(w.monthly_spend, 0),
 			   w.broadcast_enabled, w.talk_to_user_enabled,
 			   COALESCE(w.compute, '{}'::jsonb),
-		   COALESCE(w.kind, 'workspace')
+		   COALESCE(w.kind, 'workspace'),
+		   COALESCE(w.loaded_mcp_tools, '[]'::jsonb)
 		FROM workspaces w
 		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
 		WHERE w.id = $1

@@ -48,17 +48,18 @@ qa-review / approved
 security-review / approved
 sop-checklist / all-items-acked
 reserved-path-review / reserved-path-review
+Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
+E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
 
 # pending-#3159 (not yet enforced) ──────────────────────────────────────
-# The two E2E Staging SaaS contexts below are DOCUMENTED-required but are
+# The E2E Staging SaaS context below is DOCUMENTED-required but is
 # currently RED, blocked by #3159 (a separate runtime PR is fixing it in
-# parallel). They are PARKED here so this enforcement change can ship
-# WITHOUT freezing every merge. SEQUENCING: once #3159 is green on main and
-# these two contexts are reliably `success`, PROMOTE them by moving the two
-# lines above this marker (and remove this block). Do NOT promote them while
+# parallel). It is PARKED here so this enforcement change can ship
+# WITHOUT freezing every merge. SEQUENCING: once #3159 is green on main
+# and this context is reliably `success`, PROMOTE it by moving the line
+# above this marker (and remove this block). Do NOT promote it while
 # #3159 is open — doing so will freeze the merge queue.
 #
 # #48 (RCA molecule-controlplane #878→#885): real platform-managed boot is
-# the intended merge gate. #3081: concierge create-workspace likewise.
-E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
+# the intended merge gate.
 E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot
