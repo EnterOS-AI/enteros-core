@@ -15,7 +15,7 @@ import { appendActivityLine } from "./chat/activityLog";
 import { ToolTraceChips } from "./chat/ToolTraceChips";
 import { decisionForChip, decisionChipText } from "./chat/decisionChip";
 import { fetchSession } from "@/lib/auth";
-import { runtimeDisplayName } from "@/lib/runtime-names";
+import { processingAgentLabel } from "@/lib/runtime-names";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useChatHistory } from "./chat/hooks/useChatHistory";
 import { useChatSend } from "./chat/hooks/useChatSend";
@@ -351,8 +351,8 @@ function MyChatPanel({ workspaceId, data }: Props) {
       setActivityLog([]);
       return;
     }
-    setActivityLog([`Processing with ${runtimeDisplayName(data.runtime)}...`]);
-  }, [thinking, data.runtime]);
+    setActivityLog([`Processing with ${processingAgentLabel(data.kind, data.runtime)}...`]);
+  }, [thinking, data.kind, data.runtime]);
 
   // IntersectionObserver on the top sentinel. Fires loadOlder() the
   // moment the user scrolls within 200px of the top. AbortController
@@ -798,7 +798,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
               </div>
               {activityLog.length > 0 && (
                 <div data-testid="activity-log" className="mt-1.5 text-[9px] text-ink-mid space-y-0.5">
-                  <div className="text-ink-mid">Processing with {runtimeDisplayName(data.runtime)}...</div>
+                  <div className="text-ink-mid">Processing with {processingAgentLabel(data.kind, data.runtime)}...</div>
                   {activityLog.map((line, i) => (
                     <div key={line + i} className="pl-2 border-l border-line">◇ {line}</div>
                   ))}
