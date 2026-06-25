@@ -475,10 +475,15 @@ func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
 		if conciergeDeclaredModel != "minimax/MiniMax-M2.7" {
 			t.Fatalf("conciergeDeclaredModel = %q, want %q — the P3b CTO decision pins the platform-managed concierge default to MiniMax (cheaper, proxy Anthropic-compat arm)", conciergeDeclaredModel, "minimax/MiniMax-M2.7")
 		}
-		// And it is the per-runtime default for every concierge runtime.
+		// PR-6 (concierge-follows): conciergeModelForRuntime RESOLVES the seed from
+		// MOLECULE_LLM_DEFAULT_MODEL, with the const as fallback. Clear the env so
+		// this asserts the COMPILED-IN fallback path (the const) — the prod KMS
+		// value equals this const, so the fallback is the no-regression baseline.
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+		// And it is the per-runtime fallback for every concierge runtime.
 		for _, rt := range []string{"claude-code", "codex", "openclaw", ""} {
 			if got := conciergeModelForRuntime(rt); got != "minimax/MiniMax-M2.7" {
-				t.Errorf("conciergeModelForRuntime(%q) = %q, want minimax/MiniMax-M2.7", rt, got)
+				t.Errorf("conciergeModelForRuntime(%q) = %q, want minimax/MiniMax-M2.7 (env-unset fallback)", rt, got)
 			}
 		}
 	})
@@ -542,6 +547,97 @@ func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
 			if got := conciergeTemplateForRuntime(rt); got != want {
 				t.Errorf("conciergeTemplateForRuntime(%q) = %q, want %q", rt, got, want)
 			}
+		}
+	})
+}
+
+// TestConciergeDefaultRuntime_EnvWinsOverConstAndBindsIntoInstall is the PROVE-FAIL
+// positive control for the PR-6 (concierge-follows) runtime SSOT-follow, replacing
+// the earlier tautological control (Researcher REQUEST_CHANGES 14231). The OLD
+// positive control set MOLECULE_DEFAULT_RUNTIME="claude-code", which EQUALS the
+// compiled-in fallback const defaultConciergeRuntime, so it would have PASSED even
+// if conciergeDefaultRuntime ignored the env entirely and returned the const (a
+// no-op assertion). It also never proved that the resolved runtime is THREADED into
+// the installPlatformAgent DB INSERT ($3).
+//
+// This test fixes BOTH gaps using a NON-DEFAULT known runtime ("codex": in
+// knownRuntimes' allowlist via fallbackRuntimes, and NOT equal to "claude-code"):
+//
+//	(a) ENV WINS over the const: with MOLECULE_DEFAULT_RUNTIME="codex" set,
+//	    conciergeDefaultRuntime() resolves to "codex", NOT defaultConciergeRuntime.
+//	    Because the env value differs from the const fallback, a pass PROVES the env
+//	    drove the result: no longer a tautology.
+//	(b) INSERT $3 BINDS the resolved runtime: installPlatformAgent called with an
+//	    EMPTY runtime (the legacy/self-host path that falls back to
+//	    conciergeDefaultRuntime) must stamp the env-resolved "codex" into the
+//	    workspaces INSERT $3, NOT the "claude-code" const, and the matching
+//	    "codex-platform-agent" template into $4. The sqlmock WithArgs is the
+//	    capture seam: it asserts the exact bound value of $3 (and $4), so a
+//	    regression that hardcodes 'claude-code' in the INSERT VALUES (or ignores the
+//	    env) fails here at unit-test time (no -tags=integration / Postgres needed).
+//
+// Sibling of the integration test's Case 1
+// (TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered), which
+// proves the same binding against a real Postgres with an EXPLICIT runtime arg;
+// this unit test additionally proves the ENV-RESOLUTION half (empty arg -> KMS env
+// -> $3) that the integration test does not exercise.
+func TestConciergeDefaultRuntime_EnvWinsOverConstAndBindsIntoInstall(t *testing.T) {
+	// A NON-DEFAULT runtime in the isKnownRuntime allowlist (fallbackRuntimes),
+	// chosen specifically so it differs from the const fallback: that difference
+	// is what makes the assertions non-tautological.
+	const nonDefaultRuntime = "codex"
+	if nonDefaultRuntime == defaultConciergeRuntime {
+		t.Fatalf("test invariant broken: nonDefaultRuntime (%q) must DIFFER from the const fallback (%q) to prove the env wins", nonDefaultRuntime, defaultConciergeRuntime)
+	}
+	if !isKnownRuntime(nonDefaultRuntime) {
+		t.Fatalf("test invariant broken: %q must be a known runtime (isKnownRuntime allowlist) or installPlatformAgent's env resolution would reject it and fall back to the const", nonDefaultRuntime)
+	}
+
+	t.Run("(a) env WINS over the const fallback (no longer a tautology)", func(t *testing.T) {
+		t.Setenv("MOLECULE_DEFAULT_RUNTIME", nonDefaultRuntime)
+		if got := conciergeDefaultRuntime(); got != nonDefaultRuntime {
+			t.Fatalf("conciergeDefaultRuntime() = %q, want %q: the env MUST win over the const fallback %q", got, nonDefaultRuntime, defaultConciergeRuntime)
+		}
+		if got := conciergeDefaultRuntime(); got == defaultConciergeRuntime {
+			t.Fatalf("conciergeDefaultRuntime() returned the const fallback %q despite MOLECULE_DEFAULT_RUNTIME=%q: the env was ignored (tautology regression)", defaultConciergeRuntime, nonDefaultRuntime)
+		}
+	})
+
+	t.Run("(b) installPlatformAgent binds the env-resolved NON-default runtime into INSERT $3 (and the matching template into $4)", func(t *testing.T) {
+		t.Setenv("MOLECULE_DEFAULT_RUNTIME", nonDefaultRuntime)
+		mock := setupTestDB(t)
+
+		const platformID = "33333333-4444-5555-6666-777777777777"
+		const paName = "Org Concierge runtime-follow"
+		// The template that MUST accompany the resolved runtime (conciergeTemplateForRuntime).
+		wantTemplate := conciergeTemplateForRuntime(nonDefaultRuntime) // "codex-platform-agent"
+
+		mock.ExpectBegin()
+		// Step 0: downgrade any other platform root ($1 = platformID).
+		mock.ExpectExec(`UPDATE workspaces SET kind = 'workspace'`).
+			WithArgs(platformID).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		// Step 1: the upsert. THIS is the capture seam: $3 MUST be the env-resolved
+		// NON-default runtime (not the 'claude-code' const), $4 the matching template.
+		// Arg order matches the INSERT: ($1 id, $2 name, $3 runtime, $4 template).
+		mock.ExpectExec(`INSERT INTO workspaces`).
+			WithArgs(platformID, paName, nonDefaultRuntime, wantTemplate).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		// Step 2: capture old roots: none in this fixture.
+		mock.ExpectQuery(`SELECT id FROM workspaces WHERE parent_id IS NULL AND id <>`).
+			WithArgs(platformID).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}))
+		mock.ExpectCommit()
+
+		// EMPTY runtime arg -> installPlatformAgent falls back to conciergeDefaultRuntime(),
+		// which (with the env set) resolves to the NON-default runtime. If the binding
+		// regressed to a hardcoded 'claude-code' (or the env were ignored), the
+		// WithArgs($3=codex) expectation below would be UNMET and this test fails.
+		if err := installPlatformAgent(context.Background(), db.DB, platformID, paName, ""); err != nil {
+			t.Fatalf("installPlatformAgent with empty runtime (env-resolved %q): %v", nonDefaultRuntime, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("INSERT $3 did not bind the env-resolved runtime %q (or $4 the template %q): %v", nonDefaultRuntime, wantTemplate, err)
 		}
 	})
 }
@@ -851,6 +947,102 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations (ordinary workspace ran a model query): %v", err)
+		}
+	})
+
+	// PR-6 (concierge-follows): the seed model is RESOLVED from the generic KMS
+	// platform default env MOLECULE_LLM_DEFAULT_MODEL, with conciergeDeclaredModel
+	// as the compiled-in fallback. These two sub-tests prove BOTH halves of the
+	// SSOT-follow: (a) env SET → the seed is the KMS value (NOT the const), and
+	// (b) env UNSET → the seed is the const fallback. The runtime default is
+	// likewise resolved (MOLECULE_DEFAULT_RUNTIME else 'claude-code'); both are
+	// set/unset together to exercise the full follow path.
+	t.Run("env SET: fresh concierge seeds the KMS default model+runtime (NOT the const)", func(t *testing.T) {
+		// A DIFFERENT routable platform model than the const default, so a pass
+		// proves the env value (not conciergeDeclaredModel) drives the seed. Both
+		// registry gates pass for it and it is platform-managed on claude-code.
+		const kmsModel = "moonshot/kimi-k2.6"
+		if kmsModel == conciergeDeclaredModel {
+			t.Fatalf("test invariant broken: kmsModel must differ from the const fallback to prove the env wins")
+		}
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", kmsModel)
+		t.Setenv("MOLECULE_DEFAULT_RUNTIME", "claude-code")
+
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-kms").
+			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-kms").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-kms", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		// kmsModel is platform-managed → provider pin persists too.
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-kms").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-kms", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(recordKindQuery).WithArgs("ws-kms").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-kms", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		env := map[string]string{}
+		h.applyConciergeProvisionConfig(context.Background(), "ws-kms", "", nil, env, "Org Concierge")
+
+		if env["MODEL"] != kmsModel {
+			t.Errorf("env-set seed did not follow MOLECULE_LLM_DEFAULT_MODEL=%q; got MODEL=%q (env=%v)", kmsModel, env["MODEL"], env)
+		}
+		if env["MOLECULE_MODEL"] != kmsModel {
+			t.Errorf("env-set seed did not follow the KMS model for MOLECULE_MODEL; got %q", env["MOLECULE_MODEL"])
+		}
+		if env["MODEL"] == conciergeDeclaredModel {
+			t.Errorf("env-set seed wrongly used the const fallback %q instead of the KMS value", conciergeDeclaredModel)
+		}
+		if env["LLM_PROVIDER"] != conciergeProvider {
+			t.Errorf("env-set platform-managed KMS model did not pin LLM_PROVIDER=%q; got %q", conciergeProvider, env["LLM_PROVIDER"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (KMS model/provider not persisted): %v", err)
+		}
+	})
+
+	t.Run("env UNSET: fresh concierge falls back to the const declared model", func(t *testing.T) {
+		// Defensively clear the envs so this sub-test is order-independent.
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+		t.Setenv("MOLECULE_DEFAULT_RUNTIME", "")
+
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-fallback").
+			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-fallback").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-fallback", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-fallback").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-fallback", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(recordKindQuery).WithArgs("ws-fallback").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-fallback", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		env := map[string]string{}
+		h.applyConciergeProvisionConfig(context.Background(), "ws-fallback", "", nil, env, "Org Concierge")
+
+		if env["MODEL"] != conciergeDeclaredModel {
+			t.Errorf("env-unset seed did not fall back to the const declared model %q; got MODEL=%q (env=%v) — MISSING_MODEL would fire", conciergeDeclaredModel, env["MODEL"], env)
+		}
+		if env["MOLECULE_MODEL"] != conciergeDeclaredModel {
+			t.Errorf("env-unset seed did not fall back to the const for MOLECULE_MODEL; got %q", env["MOLECULE_MODEL"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (const-fallback seed not persisted): %v", err)
 		}
 	})
 }

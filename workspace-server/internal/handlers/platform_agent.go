@@ -233,10 +233,12 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	if kind != models.KindPlatform {
 		return configFiles
 	}
-	// The concierge runtime is per-org (P3b). Fall back to the default when the
-	// row carries none (legacy rows / self-host seed before the column was set).
+	// The concierge runtime is per-org (P3b). Fall back to the KMS-resolved
+	// platform default (conciergeDefaultRuntime: MOLECULE_DEFAULT_RUNTIME else the
+	// const) when the row carries none (legacy rows / self-host seed before the
+	// column was set).
 	if strings.TrimSpace(runtime) == "" {
-		runtime = defaultConciergeRuntime
+		runtime = conciergeDefaultRuntime()
 	}
 
 	// 0. Concierge model (core#2594). The platform agent carries an explicit,
@@ -334,17 +336,45 @@ func substituteConciergeName(prompt []byte, name string) []byte {
 	return []byte(strings.ReplaceAll(string(prompt), conciergeNamePlaceholder, name))
 }
 
-// defaultConciergeRuntime is the runtime the platform agent (concierge) runs as
-// when no per-org runtime is specified. The platform de-bake (P3b) makes the
-// concierge runtime a PARAMETER (threaded through installPlatformAgent +
-// ensureConciergeModel), so a per-org concierge can run on codex / openclaw /
-// hermes, not only the legacy 'claude-code' image variant. The default stays
-// 'claude-code' for backward compatibility (existing installs, self-host seed).
-// conciergeDeclaredModel is validated against the registry FOR THE CHOSEN RUNTIME
-// before being seeded.
+// defaultConciergeRuntime is the compiled-in FALLBACK runtime for the platform
+// agent (concierge) when no per-org runtime is specified AND the generic KMS
+// platform default env is unset. The platform de-bake (P3b) makes the concierge
+// runtime a PARAMETER (threaded through installPlatformAgent + ensureConciergeModel),
+// so a per-org concierge can run on codex / openclaw / hermes, not only the legacy
+// 'claude-code' image variant. The fallback stays 'claude-code' for backward
+// compatibility (existing installs, self-host seed, OSS/local). conciergeDeclaredModel
+// is validated against the registry FOR THE CHOSEN RUNTIME before being seeded.
+//
+// SSOT FOLLOW (PR-6 concierge-follows): this const is now only the FALLBACK.
+// conciergeDefaultRuntime resolves the runtime default from the generic KMS env
+// MOLECULE_DEFAULT_RUNTIME (the same SSOT handlers.Create reads via
+// bareCreateDefaultRuntime), falling back to this const when the env is unset.
+// The prod KMS value equals this const ('claude-code'), so the follow is
+// behavior-neutral on prod — no regression.
 const defaultConciergeRuntime = "claude-code"
 
-// conciergeDeclaredModel is the platform agent's OWN declared model — a
+// conciergeDefaultRuntime resolves the concierge's default runtime, honoring the
+// generic KMS platform default env MOLECULE_DEFAULT_RUNTIME (injected at deploy
+// from the KMS SSOT) over the compiled-in defaultConciergeRuntime fallback. This
+// is the SAME env + the SAME known-runtime allowlist the bare-create default path
+// uses (runtime_registry.go bareCreateDefaultRuntime), so the concierge follows
+// the one platform-runtime SSOT instead of a second hardcoded literal.
+//
+// FAIL CLOSED on an unknown override (mirrors bareCreateDefaultRuntime): the
+// resolved runtime MUST pass isKnownRuntime; an override naming a runtime the
+// provisioner can't honor is refused and we fall back to the compiled-in known
+// default rather than seed an unprovisionable concierge runtime.
+func conciergeDefaultRuntime() string {
+	if v := strings.TrimSpace(os.Getenv("MOLECULE_DEFAULT_RUNTIME")); v != "" {
+		if isKnownRuntime(v) {
+			return v
+		}
+		log.Printf("Concierge: MOLECULE_DEFAULT_RUNTIME=%q is not a known runtime; falling back to %q for the platform-agent default", v, defaultConciergeRuntime)
+	}
+	return defaultConciergeRuntime
+}
+
+// conciergeDeclaredModel is the platform agent's compiled-in FALLBACK model — a
 // first-class product decision, NOT a generic platform default. It mirrors a
 // template's runtime_config.model SSOT. The SSOT directive
 // (feedback_workspace_model_required_no_platform_default...) forbids the platform
@@ -359,17 +389,37 @@ const defaultConciergeRuntime = "claude-code"
 // declared model routes for claude-code AND codex/openclaw. It is a registered
 // platform model (providers.yaml `provider: platform` set). The credential is
 // platform-proxy-side (Infisical /shared/minimax-token-plan); NO API key is
-// hardcoded here. A per-runtime override is possible via conciergeModelForRuntime,
-// but the default for every runtime is this id.
+// hardcoded here.
+//
+// SSOT FOLLOW (PR-6 concierge-follows): this const is now only the FALLBACK.
+// conciergeModelForRuntime resolves the seed model from the generic KMS platform
+// default env MOLECULE_LLM_DEFAULT_MODEL (the same SSOT the rest of core reads at
+// deploy time), falling back to this const when the env is unset (OSS / local).
+// The prod KMS value equals this const ("minimax/MiniMax-M2.7"), so making the
+// concierge follow the generic default is behavior-neutral on prod — no
+// regression. A per-runtime override remains possible via conciergeModelForRuntime,
+// but the default for every runtime is the resolved KMS value (or this fallback).
 const conciergeDeclaredModel = "minimax/MiniMax-M2.7"
 
-// conciergeModelForRuntime returns the concierge's declared model for a given
-// runtime. The platform-managed default (conciergeDeclaredModel) is shared across
-// all runtimes because it routes through the proxy's Anthropic-compatible arm,
-// which every concierge runtime speaks. This indirection keeps a per-runtime
-// override a one-line change (e.g. a future codex-only model) without touching
-// the seed logic. Today it is runtime-independent by design.
+// conciergeModelForRuntime returns the concierge's seed model for a given runtime.
+// It RESOLVES the model at runtime, NOT compile time: the generic KMS platform
+// default (MOLECULE_LLM_DEFAULT_MODEL, injected at deploy from the KMS SSOT) wins,
+// and the conciergeDeclaredModel const is only the compiled-in FALLBACK when the
+// env is unset. The platform-managed default is shared across all runtimes because
+// it routes through the proxy's Anthropic-compatible arm, which every concierge
+// runtime speaks. This indirection keeps a per-runtime override a one-line change
+// (e.g. a future codex-only model) without touching the seed logic; today it is
+// runtime-independent by design.
+//
+// CRITICAL (incident 2026-06-15): this only RESOLVES the seed candidate. The
+// caller (ensureConciergeModel) still runs the validateRegisteredModelForRuntime /
+// validateDerivedProviderInRegistry gates on the resolved id and leaves the model
+// UNSET if it is not routable for the runtime — so a bad/unroutable KMS value does
+// NOT bypass the universal MISSING_MODEL fail-closed; it triggers it.
 func conciergeModelForRuntime(_ string) string {
+	if v := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); v != "" {
+		return v
+	}
 	return conciergeDeclaredModel
 }
 
@@ -403,7 +453,7 @@ func conciergeTemplateForRuntime(runtime string) string {
 // falls back to the default.
 func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID, runtime string, envVars map[string]string) {
 	if strings.TrimSpace(runtime) == "" {
-		runtime = defaultConciergeRuntime
+		runtime = conciergeDefaultRuntime()
 	}
 	// SEED-ONLY (CTO 2026-06-12: customer setting > platform default; the
 	// concierge's model is changeable like any workspace, "anytime"). If a MODEL
@@ -598,7 +648,7 @@ const conciergePlatformMCPCreateWorkspaceTool = "mcp__" + conciergePlatformMCPSe
 // self-hosted concierge running a non-proxy model.
 func (h *WorkspaceHandler) ensureConciergeProvider(ctx context.Context, workspaceID, runtime string, envVars map[string]string) {
 	if strings.TrimSpace(runtime) == "" {
-		runtime = defaultConciergeRuntime
+		runtime = conciergeDefaultRuntime()
 	}
 	// Respect an explicit provider already set (customer canvas pick or a prior
 	// seed): loadWorkspaceSecrets already injected it into envVars. Do nothing.
@@ -801,10 +851,11 @@ func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error 
 		return fmt.Errorf("check existing platform agent: %w", err)
 	}
 	log.Printf("boot: no platform agent present — self-seeding %s (self-hosted)", SelfHostedPlatformAgentID)
-	// Self-host seed uses the default concierge runtime (claude-code); a
-	// self-host operator who wants a different runtime switches it post-seed via
-	// the standard runtime-change path.
-	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, defaultPlatformAgentName(), defaultConciergeRuntime)
+	// Self-host seed follows the KMS-resolved platform default runtime
+	// (conciergeDefaultRuntime: MOLECULE_DEFAULT_RUNTIME else 'claude-code'); a
+	// self-host operator who wants a different runtime sets the env or switches it
+	// post-seed via the standard runtime-change path.
+	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, defaultPlatformAgentName(), conciergeDefaultRuntime())
 }
 
 // OrgIdentityResponse is the body of GET /org/identity.
@@ -1016,10 +1067,13 @@ func InstallPlatformAgent(c *gin.Context) {
 // be proven with sqlmock).
 func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, name, runtime string) error {
 	// P3b: the concierge runtime is a parameter. An empty runtime (legacy callers,
-	// self-host seed) defaults to claude-code. The template is mapped per-runtime
-	// so the asset fetcher pulls the right platform-agent identity.
+	// self-host seed) falls back to the KMS-resolved platform default
+	// (conciergeDefaultRuntime: MOLECULE_DEFAULT_RUNTIME else 'claude-code'). The
+	// resolved runtime is what the INSERT below stamps into workspaces.runtime
+	// ($3) and what conciergeTemplateForRuntime maps to the template ($4), so the
+	// asset fetcher pulls the right platform-agent identity.
 	if strings.TrimSpace(runtime) == "" {
-		runtime = defaultConciergeRuntime
+		runtime = conciergeDefaultRuntime()
 	}
 	template := conciergeTemplateForRuntime(runtime)
 	tx, err := database.BeginTx(ctx, nil)
