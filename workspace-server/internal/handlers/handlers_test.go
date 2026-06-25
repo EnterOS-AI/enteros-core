@@ -549,12 +549,15 @@ func TestWorkspaceList(t *testing.T) {
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+		"loaded_mcp_tools",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("ws-1", "Agent One", "worker", 1, "online", []byte("null"), "http://localhost:8001",
-			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace").
+			nil, 0, 1, 0.0, "", 100, "", "claude-code", "", 10.0, 20.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+		).
 		AddRow("ws-2", "Agent Two", "manager", 2, "provisioning", []byte("null"), "",
-			nil, 0, 1, 0.0, "", 0, "", "claude-code", "", 50.0, 60.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace")
+			nil, 0, 1, 0.0, "", 0, "", "claude-code", "", 50.0, 60.0, false, nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+		)
 
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WillReturnRows(rows)
@@ -1275,13 +1278,14 @@ func TestWorkspaceGet_CurrentTask(t *testing.T) {
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+		"loaded_mcp_tools",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("dddddddd-0004-0000-0000-000000000000").
 		WillReturnRows(sqlmock.NewRows(columns).AddRow(
 			"dddddddd-0004-0000-0000-000000000000", "Task Worker", "worker", 1, "online", []byte("null"), "http://localhost:9000",
 			nil, 2, 1, 0.0, "", 300, "Analyzing document", "claude-code", "", 10.0, 20.0, false,
-			nil, int64(0), false, true, []byte(`{}`), "workspace",
+			nil, int64(0), false, true, []byte(`{}`), "workspace", []byte(`[]`),
 		))
 
 	w := httptest.NewRecorder()

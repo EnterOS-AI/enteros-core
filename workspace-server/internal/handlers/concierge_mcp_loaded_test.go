@@ -43,6 +43,11 @@ func TestHeartbeatHandler_PlatformManagementMCPMissing_SustainedDegrades(t *test
 		WithArgs("ws-mcp-missing", 0.0, "", 0, 60, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
+	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
+	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+		WithArgs(sqlmock.AnyArg(), "ws-mcp-missing").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
 	// evaluateStatus: currentStatus=online, kind=platform, unloaded since 5min ago.
 	sustained := time.Now().Add(-5 * time.Minute)
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
@@ -105,6 +110,11 @@ func TestHeartbeatHandler_PlatformManagementMCPMissing_WithinGrace_NoDegrade(t *
 		WithArgs("ws-mcp-warmup", 0.0, "", 0, 60, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
+	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
+	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+		WithArgs(sqlmock.AnyArg(), "ws-mcp-warmup").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
 	// mcp_unloaded_since is NULL → first observation → stamp, no degrade.
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
 		WithArgs("ws-mcp-warmup").
@@ -158,6 +168,11 @@ func TestHeartbeatHandler_PlatformManagementMCPLoaded_ClearsStampStaysOnline(t *
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-mcp-ok", 0.0, "", 0, 60, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
+	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+		WithArgs(sqlmock.AnyArg(), "ws-mcp-ok").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// A stale stamp is present (the agent was warming up); it must be cleared.
@@ -323,6 +338,11 @@ func TestHeartbeatHandler_DegradedNotRecoveredWhileMCPUnloaded(t *testing.T) {
 		WithArgs("ws-stuck-degraded", 0.0, "", 0, 60, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
+	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
+	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+		WithArgs(sqlmock.AnyArg(), "ws-stuck-degraded").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
 	// currentStatus=degraded; mcp_unloaded_since well past the grace window.
 	sustained := time.Now().Add(-5 * time.Minute)
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
@@ -430,6 +450,11 @@ func TestHeartbeatHandler_PlatformManagementMCPLookupError_FlipsOnlineToDegraded
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-mcp-lookup-err", 0.0, "", 0, 60, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
+	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+		WithArgs(sqlmock.AnyArg(), "ws-mcp-lookup-err").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// No prior stamp — lookup error degrades regardless of the grace window.

@@ -60,6 +60,11 @@ func expectHealthyOnlinePlatformHeartbeat(mock sqlmock.Sqlmock, wsID string) {
 		WithArgs(wsID, 0.0, "", 0, 60, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
+	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
+	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+		WithArgs(sqlmock.AnyArg(), wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
 		WithArgs(wsID).
 		WillReturnRows(evalStatusRows("online", "platform", nil, nil))

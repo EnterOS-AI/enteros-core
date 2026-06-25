@@ -31,6 +31,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+		"loaded_mcp_tools",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0001-0000-0000-000000000000").
@@ -38,7 +39,8 @@ func TestWorkspaceGet_Success(t *testing.T) {
 			AddRow("cccccccc-0001-0000-0000-000000000000", "My Agent", "worker", 1, "online", []byte(`{"name":"test"}`),
 				"http://localhost:8001", nil, 2, 1, 0.05, "", 3600, "working", "claude-code",
 				"", 10.0, 20.0, false,
-				nil, 0, false, true, []byte(`{}`), "workspace"))
+				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`["a2a","mcp__molecule-platform__create_workspace"]`),
+			))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -67,6 +69,16 @@ func TestWorkspaceGet_Success(t *testing.T) {
 	// current_task is stripped from public GET response (#955)
 	if _, exists := resp["current_task"]; exists {
 		t.Errorf("current_task should be stripped from public GET response")
+	}
+	// core#3082 / molecule-core#3256: GET response contract for loaded_mcp_tools.
+	loaded, ok := resp["loaded_mcp_tools"].([]interface{})
+	if !ok || len(loaded) != 2 {
+		t.Errorf("expected loaded_mcp_tools to be a 2-element array, got %v", resp["loaded_mcp_tools"])
+	}
+	if ok {
+		if loaded[0] != "a2a" || loaded[1] != "mcp__molecule-platform__create_workspace" {
+			t.Errorf("expected loaded_mcp_tools [a2a mcp__molecule-platform__create_workspace], got %v", loaded)
+		}
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -121,6 +133,7 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+		"loaded_mcp_tools",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -128,7 +141,8 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 			AddRow(id, "Old Agent", "worker", 1, string(models.StatusRemoved), []byte(`null`),
 				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
-				nil, 0, false, true, []byte(`{}`), "workspace"))
+				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			))
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows([]string{"updated_at"}).AddRow(removedAt))
@@ -185,6 +199,7 @@ func TestWorkspaceGet_RemovedReturns410WithNullRemovedAtOnTimestampFetchFailure(
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+		"loaded_mcp_tools",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -192,7 +207,8 @@ func TestWorkspaceGet_RemovedReturns410WithNullRemovedAtOnTimestampFetchFailure(
 			AddRow(id, "Vanished", "worker", 1, string(models.StatusRemoved), []byte(`null`),
 				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
-				nil, 0, false, true, []byte(`{}`), "workspace"))
+				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			))
 	// Simulate the row vanishing between the two queries.
 	mock.ExpectQuery(`SELECT updated_at FROM workspaces`).
 		WithArgs(id).
@@ -248,6 +264,7 @@ func TestWorkspaceGet_RemovedWithIncludeQueryReturns200(t *testing.T) {
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+		"loaded_mcp_tools",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -255,7 +272,8 @@ func TestWorkspaceGet_RemovedWithIncludeQueryReturns200(t *testing.T) {
 			AddRow(id, "Audit Agent", "worker", 1, string(models.StatusRemoved), []byte(`null`),
 				"", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
-				nil, 0, false, true, []byte(`{}`), "workspace"))
+				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			))
 	// last_outbound_at follow-up query (existing path)
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
 		WithArgs(id).
@@ -1607,6 +1625,7 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+		"loaded_mcp_tools",
 	}
 	// Populate with non-zero financial values to confirm they are stripped.
 	mock.ExpectQuery("SELECT w.id, w.name").
@@ -1615,7 +1634,8 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 			AddRow("cccccccc-0010-0000-0000-000000000000", "Finance Test", "worker", 1, "online", []byte(`{}`),
 				"http://localhost:9001", nil, 0, 1, 0.0, "", 0, "", "claude-code",
 				"", 0.0, 0.0, false,
-				int64(50000), int64(12500), false, true, []byte(`{}`), "workspace")) // budget_limit=500 USD, spend=125 USD
+				int64(50000), int64(12500), false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			)) // budget_limit=500 USD, spend=125 USD
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -1664,6 +1684,7 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+		"loaded_mcp_tools",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs("cccccccc-0955-0000-0000-000000000000").
@@ -1676,7 +1697,8 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 				"claude-code",
 				"/home/user/secret-projects/client-work",
 				0.0, 0.0, false,
-				nil, 0, false, true, []byte(`{}`), "workspace"))
+				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -2290,6 +2312,7 @@ func TestWorkspaceGet_Wedged_FreshHeartbeatStaleOutbound(t *testing.T) {
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+		"loaded_mcp_tools",
 	}
 	// active_tasks=1 (busy), but the GET row carries only what
 	// scanWorkspaceRow scans (which does NOT include last_heartbeat_at).
@@ -2299,7 +2322,8 @@ func TestWorkspaceGet_Wedged_FreshHeartbeatStaleOutbound(t *testing.T) {
 			AddRow(id, "Busy Agent", "worker", 1, "online", []byte(`null`),
 				"", nil, 1, 1, 0.0, "", 60, "mid-turn", "claude-code",
 				"", 0.0, 0.0, false,
-				nil, 0, false, true, []byte(`{}`), "workspace"))
+				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			))
 	// Follow-up query for last_outbound_at (existing #817 path).
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
 		WithArgs(id).
@@ -2330,13 +2354,13 @@ func TestWorkspaceGet_Wedged_FreshHeartbeatStaleOutbound(t *testing.T) {
 	// heartbeat is not wedged. If this fails, the false-positive
 	// regression is back.
 	if wedged, _ := resp["wedged"].(bool); wedged {
-		t.Errorf("wedged flag = true, want false (active=1, fresh heartbeat, stale outbound) — "+
+		t.Errorf("wedged flag = true, want false (active=1, fresh heartbeat, stale outbound) — " +
 			"the false-positive regression: last_heartbeat_at is not being fetched or read into the predicate")
 	}
 	// And last_heartbeat_at should be surfaced in the response so
 	// operators can see the value the predicate consumed.
 	if _, ok := resp["last_heartbeat_at"]; !ok {
-		t.Errorf("last_heartbeat_at missing from response — the GET must surface it so "+
+		t.Errorf("last_heartbeat_at missing from response — the GET must surface it so " +
 			"operators can verify the wedge predicate's input")
 	}
 	if resp["last_outbound_at"] == nil {
@@ -2368,6 +2392,7 @@ func TestWorkspaceGet_Wedged_StaleHeartbeatStaleOutbound(t *testing.T) {
 		"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
 		"budget_limit", "monthly_spend",
 		"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+		"loaded_mcp_tools",
 	}
 	mock.ExpectQuery("SELECT w.id, w.name").
 		WithArgs(id).
@@ -2375,7 +2400,8 @@ func TestWorkspaceGet_Wedged_StaleHeartbeatStaleOutbound(t *testing.T) {
 			AddRow(id, "Wedged Agent", "worker", 1, "online", []byte(`null`),
 				"", nil, 1, 1, 0.0, "", 60, "stuck", "claude-code",
 				"", 0.0, 0.0, false,
-				nil, 0, false, true, []byte(`{}`), "workspace"))
+				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`[]`),
+			))
 	mock.ExpectQuery(`SELECT last_outbound_at FROM workspaces`).
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows([]string{"last_outbound_at"}).AddRow(staleOutbound))
@@ -2399,7 +2425,7 @@ func TestWorkspaceGet_Wedged_StaleHeartbeatStaleOutbound(t *testing.T) {
 		t.Fatalf("failed to parse response: %v", err)
 	}
 	if wedged, _ := resp["wedged"].(bool); !wedged {
-		t.Errorf("wedged flag = false, want true (active=1, stale heartbeat, stale outbound) — "+
+		t.Errorf("wedged flag = false, want true (active=1, stale heartbeat, stale outbound) — " +
 			"the wedge predicate failed at the HTTP integration boundary")
 	}
 

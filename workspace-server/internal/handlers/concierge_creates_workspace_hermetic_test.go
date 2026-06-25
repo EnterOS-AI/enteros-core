@@ -41,6 +41,11 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 			WithArgs("ws-concierge-ok", 0.0, "", 0, 60, "").
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
+		// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
+		mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+			WithArgs(sqlmock.AnyArg(), "ws-concierge-ok").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
 		// evaluateStatus: currently online, kind=platform, no outstanding unload stamp.
 		mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
 			WithArgs("ws-concierge-ok").
@@ -88,6 +93,11 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 
 		mock.ExpectExec("UPDATE workspaces SET").
 			WithArgs("ws-concierge-missing", 0.0, "", 0, 60, "").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
+		mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+			WithArgs(sqlmock.AnyArg(), "ws-concierge-missing").
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		sustained := time.Now().Add(-5 * time.Minute)
@@ -190,6 +200,58 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 		}
 		if resp["status"] != "provisioning" {
 			t.Errorf("expected status 'provisioning', got %v", resp["status"])
+		}
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("get_workspace_returns_loaded_mcp_tools", func(t *testing.T) {
+		mock := setupTestDB(t)
+		setupTestRedis(t)
+		broadcaster := newTestBroadcaster()
+		handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+		wsID := "cccccccc-000f-0000-0000-000000000000"
+		columns := []string{
+			"id", "name", "role", "tier", "status", "agent_card", "url",
+			"parent_id", "active_tasks", "max_concurrent_tasks", "last_error_rate", "last_sample_error",
+			"uptime_seconds", "current_task", "runtime", "workspace_dir", "x", "y", "collapsed",
+			"budget_limit", "monthly_spend",
+			"broadcast_enabled", "talk_to_user_enabled", "compute", "kind",
+			"loaded_mcp_tools",
+		}
+		mock.ExpectQuery("SELECT w.id, w.name").
+			WithArgs(wsID).
+			WillReturnRows(sqlmock.NewRows(columns).
+				AddRow(wsID, "Concierge", "concierge", 1, "online", []byte(`null`),
+					"http://localhost:8001", nil, 0, 1, 0.0, "", 60, "", "claude-code",
+					"", 0.0, 0.0, false,
+					nil, 0, false, true, []byte(`{}`), "workspace",
+					[]byte(`["a2a","`+conciergePlatformMCPCreateWorkspaceTool+`"]`)))
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Params = gin.Params{{Key: "id", Value: wsID}}
+		c.Request = httptest.NewRequest("GET", "/workspaces/"+wsID, nil)
+
+		handler.Get(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to parse response: %v", err)
+		}
+		loaded, ok := resp["loaded_mcp_tools"].([]interface{})
+		if !ok || len(loaded) != 2 {
+			t.Errorf("expected loaded_mcp_tools to be a 2-element array, got %v", resp["loaded_mcp_tools"])
+		}
+		if ok && (loaded[0] != "a2a" || loaded[1] != conciergePlatformMCPCreateWorkspaceTool) {
+			t.Errorf("expected loaded_mcp_tools [a2a %s], got %v", conciergePlatformMCPCreateWorkspaceTool, loaded)
 		}
 
 		if err := mock.ExpectationsWereMet(); err != nil {

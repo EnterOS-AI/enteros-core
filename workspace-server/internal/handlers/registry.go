@@ -1373,6 +1373,26 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 		return
 	}
 
+	// core#3082 / molecule-core#3256: persist the runtime-reported loaded MCP
+	// tool inventory so GET /workspaces/:id can return it deterministically.
+	// Only write when the runtime actually sent the list; omitting it means the
+	// producer isn't wired yet, so we preserve any previously-captured value.
+	if payload.LoadedMCPTools != nil {
+		loadedJSON, marshalErr := json.Marshal(payload.LoadedMCPTools)
+		if marshalErr != nil {
+			log.Printf("Heartbeat: failed to marshal loaded_mcp_tools for %s: %v", payload.WorkspaceID, marshalErr)
+		} else {
+			if _, persistErr := db.DB.ExecContext(ctx, `
+				UPDATE workspaces SET
+					loaded_mcp_tools = $1::jsonb,
+					updated_at        = now()
+				WHERE id = $2 AND status != 'removed'
+			`, loadedJSON, payload.WorkspaceID); persistErr != nil {
+				log.Printf("Heartbeat: failed to persist loaded_mcp_tools for %s: %v", payload.WorkspaceID, persistErr)
+			}
+		}
+	}
+
 	// RFC#2843 #32: fire the declared-plugin reconcile when THIS heartbeat just
 	// performed the provisioning→online self-heal (the inline CASE in the UPDATE
 	// above). This is the primary fresh-boot transition: a newly-provisioned
