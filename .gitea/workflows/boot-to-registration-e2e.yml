@@ -121,7 +121,7 @@ jobs:
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
+            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
           read_secret() {
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
