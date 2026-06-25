@@ -21,6 +21,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // isProvisionerHostPortURL reports whether u is a loopback URL with a port
@@ -272,14 +273,22 @@ const conciergeWarmupTimeout = 60 * time.Second
 // validator). messageId is a fresh UUID so the turn is idempotent at the
 // runtime and never collides with a real message.
 func buildConciergeWarmupBody(workspaceID string) ([]byte, error) {
+	// UNIQUE messageId per fire (CR2 #14189). The in-process one-shot guard
+	// (warmedConcierges) RESETS on a CP restart, so a post-restart warmup
+	// legitimately re-fires. A DETERMINISTIC messageId would collide with the
+	// pre-restart fire and be DEDUPED downstream → the re-warmup no-ops → the
+	// concierge stays degraded (the exact failure this warmup exists to fix). A
+	// nonce suffix makes every fire a distinct, never-deduped turn, while the
+	// in-process guard still prevents repeat warmups within one CP lifetime.
+	warmupID := "concierge-warmup-" + workspaceID + "-" + uuid.New().String()
 	return json.Marshal(map[string]interface{}{
 		"jsonrpc": "2.0",
-		"id":      "concierge-warmup-" + workspaceID,
+		"id":      warmupID,
 		"method":  "message/send",
 		"params": map[string]interface{}{
 			"message": map[string]interface{}{
 				"role":      "user",
-				"messageId": "concierge-warmup-" + workspaceID,
+				"messageId": warmupID,
 				"parts":     []map[string]interface{}{{"kind": "text", "text": conciergeWarmupText}},
 				"metadata":  map[string]interface{}{"concierge_warmup": true},
 			},

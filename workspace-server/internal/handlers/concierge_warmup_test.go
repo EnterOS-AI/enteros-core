@@ -3,9 +3,11 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -286,6 +288,47 @@ func TestConciergeWarmup_BodyIsValidA2A(t *testing.T) {
 	if bytes.Contains(body, []byte(`"type":"text"`)) {
 		t.Errorf("warmup body used `type`-keyed part (dropped by v0.3); body=%s", body)
 	}
+}
+
+// TestConciergeWarmup_MessageIDUniquePerFire is the regression for CR2 #14189:
+// the warmup messageId must be UNIQUE per fire. The in-process one-shot guard
+// resets on a CP restart, so a post-restart warmup legitimately re-fires; a
+// deterministic messageId would collide with the pre-restart fire and be deduped
+// downstream → the re-warmup no-ops → the concierge stays degraded (the exact
+// failure this warmup fixes). It must also keep the recognizable prefix.
+func TestConciergeWarmup_MessageIDUniquePerFire(t *testing.T) {
+	b1, err := buildConciergeWarmupBody("ws-dup")
+	if err != nil {
+		t.Fatalf("build1: %v", err)
+	}
+	b2, err := buildConciergeWarmupBody("ws-dup")
+	if err != nil {
+		t.Fatalf("build2: %v", err)
+	}
+	id1, id2 := warmupMessageID(t, b1), warmupMessageID(t, b2)
+	if id1 == id2 {
+		t.Errorf("two warmup fires produced the SAME messageId %q — a post-restart re-warmup would be deduped (CR2 #14189)", id1)
+	}
+	for _, id := range []string{id1, id2} {
+		if !strings.HasPrefix(id, "concierge-warmup-ws-dup-") {
+			t.Errorf("messageId %q lost the recognizable 'concierge-warmup-<ws>-' prefix", id)
+		}
+	}
+}
+
+func warmupMessageID(t *testing.T, body []byte) string {
+	t.Helper()
+	var m struct {
+		Params struct {
+			Message struct {
+				MessageID string `json:"messageId"`
+			} `json:"message"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("unmarshal warmup body: %v", err)
+	}
+	return m.Params.Message.MessageID
 }
 
 // TestConciergeWarmup_TimeoutIsBounded is a cheap guard that the warmup POST
