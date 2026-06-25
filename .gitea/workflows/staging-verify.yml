@@ -219,15 +219,61 @@ jobs:
     env:
       SHA: ${{ needs.staging-smoke.outputs.sha }}
       CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}
-      # CP_ADMIN_API_TOKEN gates write access to the redeploy endpoint.
-      # Stored at the repo level so all workflows pick it up automatically.
-      CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+      # CP_ADMIN_API_TOKEN now arrives via $GITHUB_ENV from the "Fetch
+      # CP_ADMIN_API_TOKEN from Infisical KMS" step below (wave-3 migration);
+      # it is the Infisical SSOT value and gates write access to the redeploy
+      # endpoint. The "Check CP credentials" step still validates it is set.
       # canary_slug pin: deploy the verified :staging-<sha> to the canary
       # first (soak 120s), then fan out to the rest of the fleet.
       CANARY_SLUG: ${{ vars.CANARY_PROMOTE_SLUG || '' }}
       SOAK_SECONDS: ${{ vars.CANARY_PROMOTE_SOAK || '120' }}
       BATCH_SIZE: ${{ vars.CANARY_PROMOTE_BATCH || '3' }}
     steps:
+      # KMS wave-3 (Gitea-Actions-secrets -> Infisical SSOT): source
+      # CP_ADMIN_API_TOKEN from Infisical (prod /shared/controlplane-admin) via
+      # the CI machine identity instead of the duplicated Gitea Actions secret,
+      # mirroring this repo's boot-to-registration-e2e KMS pattern. Exported to
+      # $GITHUB_ENV so the credential-check + promote steps read it as a masked
+      # env var.
+      #
+      # TRUSTED-REF GATING: molecule-core is a PUBLIC repo; this step consumes
+      # the INFISICAL_CI_* machine-identity secrets, so it must only run on a
+      # TRUSTED event — a push to the protected staging branch, or an operator
+      # workflow_dispatch. This workflow has no pull_request trigger, so an
+      # untrusted-fork PR cannot reach it.
+      - name: Fetch CP_ADMIN_API_TOKEN from Infisical KMS
+        id: cp_admin_token
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/staging')
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
+          }
+          CP_ADMIN_API_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
+          echo "::add-mask::$CP_ADMIN_API_TOKEN"
+          # Masking-control: this promote step performs a side-effecting fleet
+          # redeploy. Assert NON-EMPTY and FAIL LOUD — never promote with an
+          # empty admin token.
+          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at prod /shared/controlplane-admin — failing closed."
+            exit 1
+          fi
+          echo "CP_ADMIN_API_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
+          echo "CP_ADMIN_API_TOKEN loaded from Infisical (len=${#CP_ADMIN_API_TOKEN})"
+
       - name: Check CP credentials
         run: |
           if [ -z "${CP_ADMIN_API_TOKEN:-}" ]; then

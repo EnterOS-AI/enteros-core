@@ -772,7 +772,10 @@ jobs:
     timeout-minutes: 90
     env:
       CP_URL: ${{ vars.PROD_CP_URL || 'https://api.moleculesai.app' }}
-      CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+      # CP_ADMIN_API_TOKEN now arrives via $GITHUB_ENV from the "Fetch
+      # CP_ADMIN_API_TOKEN from Infisical KMS" step below (wave-3 migration);
+      # it is the Infisical SSOT value. The "Build deploy plan" step still
+      # validates it is non-empty before any production rollout.
       GITEA_HOST: git.moleculesai.app
       GITEA_TOKEN: ${{ secrets.PROD_AUTO_DEPLOY_CONTROL_TOKEN || secrets.AUTO_SYNC_TOKEN }}
       CI_STATUS_TIMEOUT_SECONDS: "3600"
@@ -803,6 +806,50 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # KMS wave-3 (Gitea-Actions-secrets -> Infisical SSOT): source
+      # CP_ADMIN_API_TOKEN from Infisical (prod /shared/controlplane-admin) via
+      # the CI machine identity instead of the duplicated Gitea Actions secret,
+      # mirroring this repo's boot-to-registration-e2e KMS pattern. Exported to
+      # $GITHUB_ENV so the plan + redeploy steps read it as a masked env var.
+      #
+      # TRUSTED-REF GATING: molecule-core is a PUBLIC repo; this step consumes
+      # the INFISICAL_CI_* machine-identity secrets, so it must only run on a
+      # TRUSTED event — a push to the protected main branch or an operator
+      # workflow_dispatch. This workflow has no pull_request trigger, so an
+      # untrusted-fork PR cannot reach it.
+      - name: Fetch CP_ADMIN_API_TOKEN from Infisical KMS
+        id: cp_admin_token
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
+          }
+          CP_ADMIN_API_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
+          echo "::add-mask::$CP_ADMIN_API_TOKEN"
+          # Masking-control: production auto-deploy is side-effecting. Assert
+          # NON-EMPTY and FAIL LOUD — never roll the prod fleet with an empty
+          # admin token.
+          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at prod /shared/controlplane-admin — failing closed."
+            exit 1
+          fi
+          echo "CP_ADMIN_API_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
+          echo "CP_ADMIN_API_TOKEN loaded from Infisical (len=${#CP_ADMIN_API_TOKEN})"
 
       - name: Build deploy plan
         id: plan
