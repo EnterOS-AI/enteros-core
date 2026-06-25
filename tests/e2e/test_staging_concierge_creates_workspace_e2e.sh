@@ -381,14 +381,14 @@ run the create_workspace tool."
 done
 ok "Concierge online + routable (url assigned)"
 
-# ─── 4.5. Optional loaded-MCP-tools inventory check (core#3082) ──────────────
-# The keystone runtime producer will populate `loaded_mcp_tools` on the
-# concierge heartbeat once it lands. Until then this check is a no-op:
-# if the field is present but does NOT include the platform create_workspace
-# tool, we fail fast deterministically. If the field is absent (current
-# runtime), we skip the check and rely on the real side-effect assertion
-# below.
-log "4.5/6 Optional loaded_mcp_tools inventory check..."
+# ─── 4.5. Required loaded-MCP-tools inventory check (core#3082) ──────────────
+# The concierge runtime must report `loaded_mcp_tools` on its heartbeat and
+# that list must include the platform management `create_workspace` tool.
+# This is a REQUIRED gate: if the field is absent or does not include the
+# tool, the concierge cannot satisfy the core#3082 online gate and this
+# test fails closed. The real side-effect assertion below is NOT sufficient
+# without this deterministic inventory check.
+log "4.5/6 Required loaded_mcp_tools inventory check..."
 
 # concierge_loaded_mcp_tools_json: echo the concierge's `loaded_mcp_tools`
 # field as a JSON array, or "" if the field is missing/unreadable.
@@ -414,7 +414,7 @@ print('yes' if 'mcp__molecule-platform__create_workspace' in tools else 'no')")"
     skip_loud "loaded_mcp_tools inventory check FAIL: mcp__molecule-platform__create_workspace not reported. Tools: $(echo "$LOADED_TOOLS" | head -c 400)"
   fi
 else
-  log "    loaded_mcp_tools absent or empty (runtime producer not yet wired) — relying on deterministic side-effect below"
+  skip_loud "loaded_mcp_tools absent or empty — the runtime producer (runtime#181) must populate this field and include mcp__molecule-platform__create_workspace"
 fi
 
 # Pre-state: the worker MUST NOT exist yet (so its later appearance is causally
