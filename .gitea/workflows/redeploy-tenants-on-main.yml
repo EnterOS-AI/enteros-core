@@ -88,6 +88,50 @@ jobs:
       # integrated auto-deploy workflow.
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
     steps:
+      # KMS wave-3 (Gitea-Actions-secrets -> Infisical SSOT): source
+      # CP_ADMIN_API_TOKEN from Infisical (prod /shared/controlplane-admin) via
+      # the CI machine identity instead of the duplicated Gitea Actions secret,
+      # mirroring the molecule-controlplane bench-provision-time bootstrap and
+      # this repo's boot-to-registration-e2e KMS pattern. The value is exported
+      # to $GITHUB_ENV so the "Call CP redeploy-fleet" step reads it as an
+      # ordinary masked env var.
+      #
+      # TRUSTED-REF GATING: molecule-core is a PUBLIC repo; this step consumes
+      # the INFISICAL_CI_* machine-identity secrets, so it must only run on a
+      # TRUSTED event. This workflow is workflow_dispatch-only, so the guard
+      # matches that; it is defense-in-depth if other triggers are ever added.
+      - name: Fetch CP_ADMIN_API_TOKEN from Infisical KMS
+        id: cp_admin_token
+        if: >-
+          github.event_name == 'workflow_dispatch'
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["secret"]["secretValue"])'
+          }
+          CP_ADMIN_API_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
+          echo "::add-mask::$CP_ADMIN_API_TOKEN"
+          # Masking-control: Infisical is the authoritative source for this token.
+          # Assert NON-EMPTY and FAIL LOUD — a side-effecting prod redeploy must
+          # never run with an empty admin token.
+          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at prod /shared/controlplane-admin — failing closed."
+            exit 1
+          fi
+          echo "CP_ADMIN_API_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
+          echo "CP_ADMIN_API_TOKEN loaded from Infisical (len=${#CP_ADMIN_API_TOKEN})"
+
       - name: Kill-switch guard
         # Rule 9 fix: exit fast if kill switch is set. No redeploy happens.
         if: env.PROD_AUTO_DEPLOY_DISABLED == 'true'
@@ -124,13 +168,12 @@ jobs:
           fi
 
       - name: Call CP redeploy-fleet
-        # CP_ADMIN_API_TOKEN must be set as a repo/org secret on
-        # molecule-ai/molecule-core, matching the staging/prod CP's
-        # CP_ADMIN_API_TOKEN env. Stored in Railway, mirrored to this
-        # repo's secrets for CI.
+        # CP_ADMIN_API_TOKEN now arrives via $GITHUB_ENV from the "Fetch
+        # CP_ADMIN_API_TOKEN from Infisical KMS" step above (wave-3 migration);
+        # it is the Infisical SSOT value, matching the staging/prod CP's
+        # CP_ADMIN_API_TOKEN env. The [ -z ... ] guard below still validates it.
         env:
           CP_URL: ${{ vars.CP_URL || 'https://api.moleculesai.app' }}
-          CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
           TARGET_TAG: ${{ steps.tag.outputs.target_tag }}
           CANARY_SLUG: ${{ vars.PROD_REDEPLOY_CANARY_SLUG || secrets.PROD_REDEPLOY_CANARY_SLUG || '' }}
           SOAK_SECONDS: ${{ vars.PROD_REDEPLOY_SOAK_SECONDS || secrets.PROD_REDEPLOY_SOAK_SECONDS || '' }}

@@ -105,7 +105,10 @@ jobs:
     timeout-minutes: 30
     env:
       MOLECULE_CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}
-      MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+      # MOLECULE_ADMIN_TOKEN (alias for CP_ADMIN_API_TOKEN) now arrives via
+      # $GITHUB_ENV from the "Fetch CP_ADMIN_API_TOKEN from Infisical KMS" step
+      # below (wave-3 migration). The "Verify required secret present" step
+      # still validates it is non-empty before the e2e runs.
       E2E_EXPECTED_MODEL: moonshot/kimi-k2.6
     steps:
       - name: No-op pass (delivery surface unchanged in this diff)
@@ -115,6 +118,57 @@ jobs:
           echo "::notice::template-delivery-e2e no-op pass (detect-changes: ${{ needs.detect-changes.outputs.debug }})."
       - if: needs.detect-changes.outputs.delivery == 'true'
         uses: actions/checkout@v4
+      # KMS wave-3 (Gitea-Actions-secrets -> Infisical SSOT): source the admin
+      # token (consumed here as MOLECULE_ADMIN_TOKEN) from Infisical (prod
+      # /shared/controlplane-admin) via the CI machine identity instead of the
+      # duplicated Gitea Actions secret, mirroring this repo's
+      # boot-to-registration-e2e KMS pattern. Exported to $GITHUB_ENV under the
+      # alias MOLECULE_ADMIN_TOKEN so the verify + e2e steps read it unchanged.
+      # Only runs when the delivery surface changed (the real e2e runs); a
+      # no-op PR never touches the CI identity.
+      #
+      # TRUSTED-REF GATING: molecule-core is a PUBLIC repo; this step consumes
+      # the INFISICAL_CI_* machine-identity secrets, so it must only run on a
+      # TRUSTED event — operator workflow_dispatch, a push to the protected main
+      # branch, or a SAME-REPO (non-fork) pull_request. An untrusted-fork PR
+      # (github.event.pull_request.head.repo.fork == true) is excluded so it
+      # cannot harvest the KMS token. A fork delivery PR will fail the "Verify
+      # required secret present" check below (loud, not silent) until a
+      # maintainer runs it from a trusted ref.
+      - name: Fetch CP_ADMIN_API_TOKEN from Infisical KMS
+        id: cp_admin_token
+        if: >-
+          needs.detect-changes.outputs.delivery == 'true' &&
+          (github.event_name == 'workflow_dispatch' ||
+           (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+           (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false))
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["secret"]["secretValue"])'
+          }
+          CP_ADMIN_API_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
+          echo "::add-mask::$CP_ADMIN_API_TOKEN"
+          # Masking-control: this required delivery gate must not run against an
+          # empty admin token. Assert NON-EMPTY and FAIL LOUD.
+          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at prod /shared/controlplane-admin — failing closed."
+            exit 1
+          fi
+          # Export under the alias the e2e consumes.
+          echo "MOLECULE_ADMIN_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
+          echo "CP_ADMIN_API_TOKEN loaded from Infisical (len=${#CP_ADMIN_API_TOKEN})"
       - name: Verify required secret present
         if: needs.detect-changes.outputs.delivery == 'true'
         run: |
