@@ -105,9 +105,10 @@ jobs:
       # (/shared/controlplane/llm @ environment=staging) by the
       # "Fetch platform model+runtime from KMS SSOT" step below, which exports
       # E2E_RUNTIME / E2E_MODEL / E2E_MODEL_SLUG via $GITHUB_ENV on TRUSTED refs
-      # only (push/dispatch/schedule — never an untrusted-fork pull_request,
-      # because molecule-core is a PUBLIC repo). These literals are the
-      # fail-safe default for the untrusted-PR / local path and are kept ==
+      # only (push/dispatch/schedule or a same-repo non-fork pull_request --
+      # never an untrusted-fork pull_request, because molecule-core is a PUBLIC
+      # repo). These literals are the
+      # fail-safe default for the untrusted-fork / local path and are kept ==
       # the staging KMS values (runtime=claude-code, model=moonshot/kimi-k2.6),
       # so this is BEHAVIOR-NEUTRAL: trusted runs read the same values from KMS,
       # untrusted/local runs fall back to the same literals.
@@ -157,14 +158,27 @@ jobs:
       #
       # TRUSTED-REF GATE: molecule-core is a PUBLIC repo. This step authenticates
       # the CI machine identity and reads org secrets, so it MUST NOT run for an
-      # untrusted-fork pull_request. It runs only on protected-branch push /
-      # operator workflow_dispatch / schedule. On the skipped (untrusted-PR /
-      # local) path the job falls back to the env-block literals, which are kept
-      # == the staging KMS values — so the resolved model+runtime are identical
-      # either way (behavior-neutral).
+      # untrusted-fork pull_request. It runs on protected-branch push / operator
+      # workflow_dispatch / schedule, AND on a SAME-REPO (non-fork) pull_request
+      # -- a trusted PR whose head lives in this repo -- so PR CI actually
+      # exercises the staging KMS-default lane. Only untrusted-FORK PRs are
+      # skipped. On the skipped (untrusted-fork / local) path the job falls back
+      # to the env-block literals, which are kept == the staging KMS values -- so
+      # the resolved model+runtime are identical either way (behavior-neutral).
       - name: Fetch platform model+runtime from KMS SSOT
         id: kms_llm
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+        # Run on trusted refs: protected-branch push / operator dispatch /
+        # schedule, OR a SAME-REPO (non-fork) pull_request. A same-repo PR is
+        # trusted (its head lives in this repo, gated by branch protection), so
+        # it may read KMS -- this lets PR CI actually exercise the staging
+        # KMS-default lane. Only UNTRUSTED forks are skipped (their head repo's
+        # .fork == true), where the env-block literals are the fail-safe default.
+        if: >-
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch' ||
+          github.event_name == 'schedule' ||
+          (github.event_name == 'pull_request' &&
+           github.event.pull_request.head.repo.fork == false)
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
