@@ -441,7 +441,13 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		} else {
 			// Legitimate default path: no template AND no runtime requested
 			// (bare {"name":...}) — claude-code is the intended default here.
-			payload.Runtime = "claude-code"
+			//
+			// De-hardcode (behavior-neutral): honor the MOLECULE_DEFAULT_RUNTIME
+			// env override (KMS SSOT, injected at deploy time) over the compiled-in
+			// "claude-code" literal. The staging KMS value equals the old literal,
+			// and unset/local falls back to the same literal, so no behavior change
+			// today; a later platform-default flip is a separate KMS edit.
+			payload.Runtime = bareCreateDefaultRuntime()
 		}
 	}
 

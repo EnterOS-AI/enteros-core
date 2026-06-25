@@ -81,7 +81,7 @@ var RuntimeImages = computeRuntimeImages()
 // If a runtime is missing, it falls back to DefaultImage which may have
 // wrong deps. Add new runtimes to knownRuntimes AND create the standalone
 // template repo.
-var DefaultImage = RuntimeImage(defaultRuntime)
+var DefaultImage = RuntimeImage(defaultRuntime())
 
 const (
 	// DefaultNetwork is the Docker network workspaces join.
