@@ -59,6 +59,17 @@ func defaultRuntime() string {
 	return defaultRuntimeFallback
 }
 
+// DefaultRuntime is the exported SSOT accessor for the platform default runtime.
+// It resolves the MOLECULE_DEFAULT_RUNTIME env override (KMS SSOT, injected at
+// deploy time) over the compiled-in defaultRuntimeFallback, fail-closed on an
+// unknown override (see defaultRuntime). Lower-level callers outside this
+// package (e.g. internal/bundle) use this to FOLLOW the one platform-runtime
+// SSOT instead of baking a second "claude-code" literal. Behavior-neutral today:
+// the prod/staging KMS value equals the fallback, and unset/local resolves to it.
+func DefaultRuntime() string {
+	return defaultRuntime()
+}
+
 // RegistryPrefix returns the registry prefix all workspace-template image
 // references should use. Defaults to ghcr.io/molecule-ai (the upstream OSS
 // face) and is overridden by the MOLECULE_IMAGE_REGISTRY env var in
