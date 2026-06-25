@@ -565,10 +565,10 @@ const conciergePlatformMCPName = "molecule-ai-plugin-molecule-platform-mcp"
 // by TestSSOT_DegradeGateToolDerivesFromContract — there is NO standalone
 // hardcoded full tool-id and NO independently-spelled verb. The gate and the test
 // share the single `mcp__<server>__<verb>` formula and the same contract source.
-// (The contract file lives at repo root, OUTSIDE this Go module, so it cannot be
-// go:embed'd for a true runtime load; compile-time composition + the dual
-// contract-assertion test is the deployment-safe SSOT enforcement — a drift on
-// either building block vs the contract fails CI before it can reach the gate.)
+// (The contract file lives at repo root, OUTSIDE this Go module, so the embed
+// directive cannot reach it for a true runtime load; compile-time composition +
+// the dual contract-assertion test is the deployment-safe SSOT enforcement — a
+// drift on either building block vs the contract fails CI before the gate.)
 //
 // Note we match the TOOL id, not the plugin/server NAME: the heartbeat's
 // loaded_mcp_tools list carries TOOL identifiers (mcp__<server>__<tool>); a name
