@@ -438,10 +438,17 @@ const errPlatformNotRoot = "a platform agent must be the org root (parent_id mus
 // fail-closed RCA#2970 intent (steady-state guarantee: sustained-missing DOES
 // degrade).
 //
-// 90s ≈ 4-5 heartbeats at the runtime's 20s cadence: comfortably longer than
-// MCP warmup + first-turn latency, short enough that a real regression is
-// surfaced within ~1.5 min.
-const managementMCPUnloadedGrace = 90 * time.Second
+// 180s ≈ 9 heartbeats at the runtime's 20s cadence. Sized for the platform-side
+// warmup turn (fireConciergeWarmup), which fires on the SAME heartbeat that opens
+// this window: that warmup is a COLD first turn — model cold-start (~25-30s P95
+// for the platform-managed default) + async MCP connect + the turn itself — and
+// the loaded_mcp_tools capture only lands on the NEXT heartbeat after the turn
+// completes. 90s was borderline for that cold path (single-degrade-flap before
+// recovery, observed 2026-06-25 staging); 180s gives the cold warmup turn +
+// capture-bearing heartbeat comfortable headroom while still surfacing a genuine
+// sustained-missing regression within ~3 min (the fail-closed RCA#2970 intent is
+// preserved — sustained absence past the window still degrades).
+const managementMCPUnloadedGrace = 180 * time.Second
 
 // isPlatformRootViolation reports whether err is the DB rejecting a register
 // that tried to mark a non-root workspace as a platform agent (the
