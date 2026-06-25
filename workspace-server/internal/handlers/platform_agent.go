@@ -1051,16 +1051,31 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    the install (CP backfill, idempotent re-call) must PRESERVE the row's
 	//    current runtime, not revert a codex/openclaw concierge back to
 	//    claude-code. The pre-P3b `runtime = 'claude-code'` on conflict (core#2496)
-	//    is the exact clobber this de-bake removes. The template IS corrected on
-	//    conflict because it is a deterministic function of the row's runtime —
-	//    but since the conflict clause can't read the EXISTING runtime in a single
-	//    statement, it only sets the template that matches the REQUESTED runtime;
-	//    a same-runtime re-install (the common case) keeps it correct, and a
-	//    runtime CHANGE flows through the dedicated runtime-switch path, not here.
+	//    is the exact clobber this de-bake removes.
+	//
+	//    TEMPLATE (RC 13985): the conflict clause must NOT stamp the template that
+	//    matches the REQUESTED runtime ($4) — that desyncs the pair. A codex
+	//    concierge (runtime='codex', template='codex-platform-agent') reinstalled
+	//    via the DEFAULT path (which carries claude-code/$4='platform-agent')
+	//    would keep its preserved runtime='codex' but silently revert
+	//    template='platform-agent' → a runtime/template MISMATCH. Since `runtime`
+	//    is PRESERVED on conflict, the template must be derived from the row's
+	//    EXISTING runtime (`workspaces.runtime`), not the incoming one, so the
+	//    (runtime, template) pair stays matched after any default reinstall. The
+	//    CASE mirrors conciergeTemplateForRuntime: claude-code/empty →
+	//    'platform-agent', else '<runtime>-platform-agent'. An explicit runtime
+	//    change flows through the dedicated runtime-switch path, never here.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id, template)
 		VALUES ($1, $2, 'platform', 0, 'offline', $3, NULL, $4)
-		ON CONFLICT (id) DO UPDATE SET kind = 'platform', parent_id = NULL, template = $4
+		ON CONFLICT (id) DO UPDATE SET
+			kind = 'platform',
+			parent_id = NULL,
+			template = CASE
+				WHEN COALESCE(NULLIF(TRIM(workspaces.runtime), ''), 'claude-code') = 'claude-code'
+					THEN 'platform-agent'
+				ELSE TRIM(workspaces.runtime) || '-platform-agent'
+			END
 	`, platformID, name, runtime, template); err != nil {
 		return fmt.Errorf("upsert platform agent: %w", err)
 	}

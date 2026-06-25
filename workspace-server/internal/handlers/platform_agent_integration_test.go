@@ -351,24 +351,37 @@ func TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered(t *t
 	}
 
 	// Case 2 (PROVE-FAIL): a re-install (ON CONFLICT path) must NOT revert the
-	// runtime back to claude-code. We call the DEFAULT-runtime install path on
-	// purpose — even when the re-install requests no specific runtime (empty →
-	// default claude-code), the existing 'codex' row must be PRESERVED. Against
-	// the pre-P3b `ON CONFLICT ... SET runtime = 'claude-code'` clause this fails;
-	// against the P3b clause (runtime omitted from the conflict SET) it passes.
+	// runtime back to claude-code, AND the (runtime, template) pair must stay
+	// MATCHED. We call the DEFAULT-runtime install path on purpose — even when
+	// the re-install requests no specific runtime (empty → default claude-code,
+	// which maps to template 'platform-agent'), the existing 'codex' row must be
+	// PRESERVED for BOTH columns. Against the pre-P3b `ON CONFLICT ... SET runtime
+	// = 'claude-code'` clause the runtime check fails; against head 9e4e5d08
+	// (`... SET ... template = $4`, i.e. the REQUESTED runtime's template) the
+	// runtime is preserved but the template is silently reverted to
+	// 'platform-agent' → a runtime/template MISMATCH (RC 13985). The fix derives
+	// the template on conflict from the PRESERVED (existing) runtime, so this
+	// case only passes once template stays 'codex-platform-agent'.
 	if err := installPlatformAgent(ctx, conn, platformID, paName, defaultConciergeRuntime); err != nil {
 		t.Fatalf("re-install (default runtime): %v", err)
 	}
-	var runtimeAfterReinstall string
+	var runtimeAfterReinstall, templateAfterReinstall string
 	if err := conn.QueryRowContext(ctx,
-		`SELECT runtime FROM workspaces WHERE id = $1`, platformID).Scan(&runtimeAfterReinstall); err != nil {
-		t.Fatalf("read runtime after re-install: %v", err)
+		`SELECT runtime, COALESCE(template, '') FROM workspaces WHERE id = $1`, platformID).Scan(&runtimeAfterReinstall, &templateAfterReinstall); err != nil {
+		t.Fatalf("read runtime/template after re-install: %v", err)
 	}
 	if runtimeAfterReinstall != codexRuntime {
 		t.Fatalf("P3b regression: re-install reverted runtime to %q, want %q PRESERVED. "+
 			"The ON CONFLICT DO UPDATE SET clause must NOT include `runtime = 'claude-code'` — "+
 			"re-installing a codex/openclaw concierge must not clobber it back to claude-code.",
 			runtimeAfterReinstall, codexRuntime)
+	}
+	if wantTemplate := conciergeTemplateForRuntime(codexRuntime); templateAfterReinstall != wantTemplate {
+		t.Fatalf("RC 13985 regression: re-install via the default path desynced the template to %q, "+
+			"want %q (the template MATCHING the PRESERVED runtime %q). The ON CONFLICT clause must "+
+			"derive `template` from the existing `workspaces.runtime`, never stamp the REQUESTED "+
+			"runtime's template — a default reinstall must keep (runtime, template) a matched pair.",
+			templateAfterReinstall, wantTemplate, codexRuntime)
 	}
 
 	// Case 3: the default-runtime install path seeds 'claude-code' on a FRESH row
