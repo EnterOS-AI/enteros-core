@@ -101,11 +101,29 @@ jobs:
       # so teardown MUST positively confirm no slug-tagged box survives.
       E2E_AWS_LEAK_CHECK: required
       E2E_AWS_TERMINATE_LEAKS: '1'
+      # Platform model + runtime are de-hardcoded to the KMS SSOT
+      # (/shared/controlplane/llm @ environment=staging) by the
+      # "Fetch platform model+runtime from KMS SSOT" step below, which exports
+      # E2E_RUNTIME / E2E_MODEL / E2E_MODEL_SLUG via $GITHUB_ENV on TRUSTED refs
+      # only (push/dispatch/schedule or a same-repo non-fork pull_request --
+      # never an untrusted-fork pull_request, because molecule-core is a PUBLIC
+      # repo). These literals are the
+      # fail-safe default for the untrusted-fork / local path and are kept ==
+      # the staging KMS values (runtime=claude-code, model=moonshot/kimi-k2.6),
+      # so this is BEHAVIOR-NEUTRAL: trusted runs read the same values from KMS,
+      # untrusted/local runs fall back to the same literals.
       E2E_RUNTIME: claude-code
       # Platform-managed create path (moonshot/kimi-k2.6, no tenant key) — the
       # combo proven to create cleanly; this test only needs the ws online.
       #
-      # DELIBERATELY no E2E_MODEL_SLUG and no E2E_*_API_KEY here — mirror the
+      # On the platform path the model is normally left implicit (the harness's
+      # pick_model_slug returns the platform default). The KMS step below sets
+      # E2E_MODEL_SLUG to the KMS-sourced model id on trusted refs; that id ==
+      # the platform default literal (moonshot/kimi-k2.6), so the resolved slug
+      # is unchanged. On untrusted-fork PRs / local the step is skipped and the
+      # implicit default applies — same slug either way.
+      #
+      # DELIBERATELY no static E2E_MODEL_SLUG and no E2E_*_API_KEY here — mirror the
       # e2e-staging-platform-boot job in e2e-staging-saas.yml. On
       # E2E_LLM_PATH=platform the harness sends EMPTY secrets and lets
       # pick_model_slug return the platform default moonshot/kimi-k2.6 (a member
@@ -129,6 +147,74 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # De-hardcode the platform model + runtime to the Infisical/KMS SSOT
+      # (/shared/controlplane/llm @ environment=staging), mirroring the CP
+      # bench-provision-time.yml KMS-fetch recipe generalised to read BOTH
+      # MOLECULE_LLM_DEFAULT_MODEL -> $E2E_MODEL and MOLECULE_DEFAULT_RUNTIME ->
+      # $E2E_RUNTIME. Exported to $GITHUB_ENV so later steps read them as
+      # ordinary masked env vars; E2E_MODEL_SLUG is also set to the model id so
+      # the platform-path harness pins the SSOT model id explicitly.
+      #
+      # TRUSTED-REF GATE: molecule-core is a PUBLIC repo. This step authenticates
+      # the CI machine identity and reads org secrets, so it MUST NOT run for an
+      # untrusted-fork pull_request. It runs on protected-branch push / operator
+      # workflow_dispatch / schedule, AND on a SAME-REPO (non-fork) pull_request
+      # -- a trusted PR whose head lives in this repo -- so PR CI actually
+      # exercises the staging KMS-default lane. Only untrusted-FORK PRs are
+      # skipped. On the skipped (untrusted-fork / local) path the job falls back
+      # to the env-block literals, which are kept == the staging KMS values -- so
+      # the resolved model+runtime are identical either way (behavior-neutral).
+      - name: Fetch platform model+runtime from KMS SSOT
+        id: kms_llm
+        # Run on trusted refs: protected-branch push / operator dispatch /
+        # schedule, OR a SAME-REPO (non-fork) pull_request. A same-repo PR is
+        # trusted (its head lives in this repo, gated by branch protection), so
+        # it may read KMS -- this lets PR CI actually exercise the staging
+        # KMS-default lane. Only UNTRUSTED forks are skipped (their head repo's
+        # .fork == true), where the env-block literals are the fail-safe default.
+        if: >-
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch' ||
+          github.event_name == 'schedule' ||
+          (github.event_name == 'pull_request' &&
+           github.event.pull_request.head.repo.fork == false)
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["secret"]["secretValue"])'
+          }
+          E2E_MODEL=$(read_secret MOLECULE_LLM_DEFAULT_MODEL %2Fshared%2Fcontrolplane%2Fllm)
+          E2E_RUNTIME=$(read_secret MOLECULE_DEFAULT_RUNTIME %2Fshared%2Fcontrolplane%2Fllm)
+          echo "::add-mask::$E2E_MODEL"
+          echo "::add-mask::$E2E_RUNTIME"
+          # Fail closed: an empty SSOT value must abort, never silently fall
+          # back to the literal and mask a KMS regression.
+          if [ -z "$E2E_MODEL" ]; then
+            echo "::error::MOLECULE_LLM_DEFAULT_MODEL is empty in KMS (/shared/controlplane/llm @ staging)"
+            exit 1
+          fi
+          if [ -z "$E2E_RUNTIME" ]; then
+            echo "::error::MOLECULE_DEFAULT_RUNTIME is empty in KMS (/shared/controlplane/llm @ staging)"
+            exit 1
+          fi
+          {
+            echo "E2E_MODEL=$E2E_MODEL"
+            echo "E2E_MODEL_SLUG=$E2E_MODEL"
+            echo "E2E_RUNTIME=$E2E_RUNTIME"
+          } >> "$GITHUB_ENV"
+          echo "Platform model+runtime loaded from KMS SSOT (model len=${#E2E_MODEL}, runtime len=${#E2E_RUNTIME})"
 
       - name: Verify required secrets present
         run: |
