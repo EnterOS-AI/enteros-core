@@ -943,6 +943,30 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	return resp.StatusCode, respBody, nil
 }
 
+// SendConciergeWarmupA2A adapts proxyA2ARequest to the RegistryHandler's
+// WarmupSendFunc signature for the concierge warmup (core#3082 keystone). The
+// router wires it via rh.SetWarmupSendFunc(wh.SendConciergeWarmupA2A) — the
+// same exported-method late-wiring pattern as rh.SetQueueDrainFunc(
+// wh.DrainQueueForWorkspace). It REUSES the exact internal A2A dispatch +
+// auth + URL-resolution mechanism that delegations use (proxyA2ARequest →
+// resolveAgentURL → dispatchA2A); no new auth path is invented.
+//
+// logActivity=false: the warmup is an internal readiness probe, not a
+// user/agent turn worth recording in activity_logs. isCanvasUser=false: the
+// system caller (callerID "system:…") is trusted via isSystemCaller and is
+// NOT treated as a delegation (so can_delegate is irrelevant) and NOT a
+// canvas user.
+//
+// The typed *proxyA2AError is converted to a plain error explicitly: a nil
+// pointer assigned to an error interface would otherwise be a non-nil error.
+func (h *WorkspaceHandler) SendConciergeWarmupA2A(ctx context.Context, workspaceID string, body []byte, callerID string) (int, []byte, error) {
+	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, false, false)
+	if proxyErr != nil {
+		return status, respBody, proxyErr
+	}
+	return status, respBody, nil
+}
+
 // resolveAgentURL returns a routable URL for the target workspace agent. It
 // checks the Redis URL cache first, then falls back to a DB lookup, caching
 // the result on success. When the platform runs inside Docker, 127.0.0.1:<host
