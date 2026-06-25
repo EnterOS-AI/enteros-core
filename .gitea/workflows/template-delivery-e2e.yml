@@ -130,18 +130,23 @@ jobs:
       # TRUSTED-REF GATING: molecule-core is a PUBLIC repo; this step consumes
       # the INFISICAL_CI_* machine-identity secrets, so it must only run on a
       # TRUSTED event — operator workflow_dispatch, a push to the protected main
-      # branch, or a SAME-REPO (non-fork) pull_request. An untrusted-fork PR
-      # (github.event.pull_request.head.repo.fork == true) is excluded so it
-      # cannot harvest the KMS token. A fork delivery PR will fail the "Verify
-      # required secret present" check below (loud, not silent) until a
-      # maintainer runs it from a trusted ref.
+      # branch, or a SAME-REPO pull_request. The pull_request clause uses the
+      # FAIL-CLOSED positive allowlist
+      # (github.event.pull_request.head.repo.full_name == github.repository):
+      # it admits ONLY a same-repo head and fails closed on a fork, a
+      # detached/cross-repo head, OR a missing/null head.repo field (the negative
+      # `head.repo.fork == false` form would FAIL-OPEN on a null `fork`, since
+      # `null == false` coerces TRUE in the expression engine). An untrusted-fork
+      # PR is therefore excluded so it cannot harvest the KMS token. A fork
+      # delivery PR will fail the "Verify required secret present" check below
+      # (loud, not silent) until a maintainer runs it from a trusted ref.
       - name: Fetch CP_ADMIN_API_TOKEN from Infisical KMS
         id: cp_admin_token
         if: >-
           needs.detect-changes.outputs.delivery == 'true' &&
           (github.event_name == 'workflow_dispatch' ||
            (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-           (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false))
+           (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
