@@ -72,19 +72,10 @@ permissions:
 
 env:
   # SSOT-Instance-10 (#333): ECR registry triplet (account.dkr.ecr.region.amazonaws.com)
-  # sourced from org/repo var `ECR_REGISTRY` with the current prod-account literal as
-  # bootstrap fallback. When the org var is set, the fallback becomes dead code and
-  # switching accounts/regions is a one-line change at the org level (instead of
-  # touching every workflow). Pattern mirrors `vars.CP_URL || 'literal'` already in
-  # use below in this repo's staging-verify.yml.
-  IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform
-  # Concierge (kind=platform) image (molecule-ai/molecule-platform-agent) is
-  # built by the TEMPLATE repo (workspace-template-claude-code, publish-image.yml
-  # → publish-platform-agent) FROM the claude-code runtime image with the
-  # org-management MCP baked at /opt/molecule-mcp-server (RFC platform-agent §5.7).
-  # Core does NOT build it: the prior FROM-platform-tenant build here shipped an
-  # image with no runtime + no MCP server, so the concierge never registered
-  # (#2970/#30). Pin promotion is operator-gated (POST /cp/admin/runtime-image/promote).
+  # Tenant image names are sourced from org/repo vars `ECR_REGISTRY` /
+  # `STAGING_ECR_REGISTRY` with the current account literals as bootstrap
+  # fallback. When the org vars are set, the fallbacks become dead code and
+  # switching accounts/regions is a one-line change at the org level.
   TENANT_IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform-tenant
   STAGING_TENANT_IMAGE_NAME: ${{ vars.STAGING_ECR_REGISTRY || '004947743811.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/platform-tenant
 
@@ -218,58 +209,6 @@ jobs:
       #   - cache-from on a missing tag (first run) is a warning, not an error.
       #   - Concurrent publishes overwrite :buildcache last-writer-wins —
       #     same best-effort semantics as :staging-latest.
-      # NOTE: molecule-ai/platform is now ORPHANED — the concierge image was
-      # repointed to FROM platform-tenant (the live workspace-server image), and
-      # nothing else consumes molecule-ai/platform (it has not built since
-      # 2026-05-15). continue-on-error so a failure of this dead base build can
-      # never block the tenant + platform-agent builds below. Remove this step
-      # entirely in a follow-up once confirmed no consumer remains.
-      - name: Build & push platform image to ECR (staging-<sha> + staging-latest)
-        continue-on-error: true
-        env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          TAG_SHA: staging-${{ steps.tags.outputs.sha }}
-          TAG_LATEST: staging-latest
-          GIT_SHA: ${{ github.sha }}
-          REPO: ${{ github.repository }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-2
-        run: |
-          set -euo pipefail
-          ECR_REGISTRY="${IMAGE_NAME%%/*}"
-          aws ecr get-login-password --region us-east-2 | \
-            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-          docker buildx build \
-            --file ./workspace-server/Dockerfile \
-            --provenance=false \
-            --sbom=false \
-            --build-arg GIT_SHA="${GIT_SHA}" \
-            --label "org.opencontainers.image.source=https://git.moleculesai.app/molecule-ai/${REPO}" \
-            --label "org.opencontainers.image.revision=${GIT_SHA}" \
-            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
-            --cache-from "type=registry,ref=${IMAGE_NAME}:buildcache" \
-            --cache-to "type=registry,ref=${IMAGE_NAME}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
-            --tag "${IMAGE_NAME}:${TAG_SHA}" \
-            --tag "${IMAGE_NAME}:${TAG_LATEST}" \
-            --push .
-
-      # Keep the prod ECR storage bill bounded: declare the canonical image
-      # lifecycle policy on the repo we just pushed. Idempotent + fail-soft
-      # (never fails the publish). SSOT JSON lives in the script. The platform
-      # build above is continue-on-error (dead base), so this runs regardless.
-      - name: Ensure ECR lifecycle policy (platform)
-        env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-2
-        run: |
-          set -uo pipefail
-          # Strip the registry host; pass the bare molecule-ai/<repo> name.
-          REPO_NAME="${IMAGE_NAME#*/}"
-          bash scripts/ops/ensure-ecr-lifecycle.sh "${REPO_NAME}"
 
       # Build + push tenant image (Go platform + Next.js canvas in one image).
       # Push the same build to the staging account too so fresh staging/E2E
@@ -530,7 +469,7 @@ jobs:
 
           full_ok=0
           for i in $(seq 1 90); do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080/health" 2>/dev/null || echo "000")
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080/health" 2>/dev/null) || code="000"
             if [ "$code" = "200" ]; then
               full_ok=1
               break
@@ -555,7 +494,7 @@ jobs:
           # failing under malformed env, not the platform itself.
           sidecar_ok=0
           for j in $(seq 1 30); do
-            sc=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:19100/v1/health" 2>/dev/null || echo "000")
+            sc=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:19100/v1/health" 2>/dev/null) || sc="000"
             if [ "$sc" = "200" ]; then
               sidecar_ok=1
               break
@@ -598,7 +537,7 @@ jobs:
 
           bare_ok=0
           for i in $(seq 1 60); do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18081/health" 2>/dev/null || echo "000")
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18081/health" 2>/dev/null) || code="000"
             if [ "$code" = "200" ]; then
               bare_ok=1
               break

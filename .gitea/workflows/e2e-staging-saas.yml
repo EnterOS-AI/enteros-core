@@ -381,11 +381,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: e2e-staging-saas
     if: always()
-    # mc#3234: governance tracker — best-effort cleanup, transient CF API
+    # mc#3244: governance tracker — best-effort cleanup, transient CF API
     # failures must not block the merge gate. Per mc#3147 (the decision
     # issue), the fail-soft mask is KEEP until a durable idempotent
-    # retry/backoff fix lands. This mc#3234 tracker expires 14 days after
-    # 2026-06-24 (mc#3173, the prior tracker, expired 2026-06-23).
+    # retry/backoff fix lands. This mc#3244 tracker expires 14 days after
+    # 2026-06-24 (mc#3234, the prior tracker, expired 2026-06-23).
     continue-on-error: true
     timeout-minutes: 10
     permissions:
