@@ -530,7 +530,7 @@ jobs:
 
           full_ok=0
           for i in $(seq 1 90); do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080/health" 2>/dev/null || echo "000")
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080/health" 2>/dev/null) || code="000"
             if [ "$code" = "200" ]; then
               full_ok=1
               break
@@ -555,7 +555,7 @@ jobs:
           # failing under malformed env, not the platform itself.
           sidecar_ok=0
           for j in $(seq 1 30); do
-            sc=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:19100/v1/health" 2>/dev/null || echo "000")
+            sc=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:19100/v1/health" 2>/dev/null) || sc="000"
             if [ "$sc" = "200" ]; then
               sidecar_ok=1
               break
@@ -598,7 +598,7 @@ jobs:
 
           bare_ok=0
           for i in $(seq 1 60); do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18081/health" 2>/dev/null || echo "000")
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18081/health" 2>/dev/null) || code="000"
             if [ "$code" = "200" ]; then
               bare_ok=1
               break
