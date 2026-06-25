@@ -808,11 +808,16 @@ func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID strin
 	})
 	if h.provisioner != nil {
 		h.provisioner.Stop(ctx, workspaceID)
-		return
-	}
-	if h.cpProv != nil {
+	} else if h.cpProv != nil {
 		h.cpStopWithRetry(ctx, workspaceID, "Auto-restart")
 	}
+
+	// core#3220: the old container is gone; clear any cached A2A routing keys
+	// so concurrent probes do not resolve to the dead URL while the workspace
+	// is reprovisioning. Cleared here (rather than in the caller) because this
+	// is the earliest point where the backend Stop has been issued and the
+	// cache is guaranteed stale.
+	db.ClearWorkspaceKeys(ctx, workspaceID)
 }
 
 // cpStopRetryAttempts caps total Stop attempts (initial + retries). 3 catches

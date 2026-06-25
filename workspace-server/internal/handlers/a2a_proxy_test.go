@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/DATA-DOG/go-sqlmock"
@@ -2281,6 +2282,30 @@ func TestStopForRestart_NoProvisioner_NoOp(t *testing.T) {
 	handler.stopForRestart(context.Background(), "ws-orphan")
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("stopForRestart no-provisioner path should not touch DB: %v", err)
+	}
+}
+
+// core#3220: stopForRestart must clear the cached A2A URL so the proxy does
+// not route probes to the container we just stopped while the workspace is
+// reprovisioning.
+func TestStopForRestart_ClearsCachedURL(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	wsID := "ws-cache-clear-3220"
+	oldURL := "http://dead-container:8000/agent"
+	if err := db.CacheURL(context.Background(), wsID, oldURL); err != nil {
+		t.Fatalf("CacheURL failed: %v", err)
+	}
+
+	// No provisioner wired: stopForRestart is a no-op backend-wise, but it
+	// must still invalidate Redis routing keys.
+	handler.stopForRestart(context.Background(), wsID)
+
+	_, err := db.GetCachedURL(context.Background(), wsID)
+	if err == nil {
+		t.Fatalf("expected cached URL to be cleared after stopForRestart, but GetCachedURL succeeded")
 	}
 }
 
