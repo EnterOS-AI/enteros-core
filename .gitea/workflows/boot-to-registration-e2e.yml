@@ -73,6 +73,13 @@ jobs:
       # Hardcoded defaults — Gitea 1.22.6 does not support workflow_dispatch.inputs
       # (feedback_gitea_workflow_dispatch_inputs_unsupported). Stage 2 can add
       # matrix/param support once the Gitea version supports it.
+      #
+      # E2E_RUNTIME / E2E_MODEL: these literals are now only the FALLBACK. On a
+      # trusted event the "Fetch platform defaults from KMS SSOT" step below
+      # overrides them with the authoritative Infisical values
+      # (MOLECULE_DEFAULT_RUNTIME / MOLECULE_LLM_DEFAULT_MODEL). This is
+      # BEHAVIOR-NEUTRAL: the staging KMS values equal these literals today, and
+      # if the KMS step is gated off (untrusted ref) these literals stand in.
       E2E_RUNTIME: claude-code
       E2E_BILLING_MODE: platform_managed
       E2E_PROVIDER: platform
@@ -83,6 +90,61 @@ jobs:
       MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # KMS SSOT for the platform default model+runtime (de-hardcode): the env
+      # block above embeds "moonshot/kimi-k2.6" / "claude-code" as fallback
+      # literals. Read the authoritative values from Infisical (staging
+      # /shared/controlplane/llm: MOLECULE_LLM_DEFAULT_MODEL /
+      # MOLECULE_DEFAULT_RUNTIME) and export them as E2E_MODEL / E2E_RUNTIME so
+      # this gate tracks the platform default. BEHAVIOR-NEUTRAL today (the
+      # staging KMS values equal the old literals); a later staging-model flip is
+      # a separate, deliberate KMS edit. FAIL CLOSED on empty.
+      #
+      # TRUSTED-REF GATING: molecule-core is a PUBLIC repo. This step consumes
+      # the CI machine-identity secrets, so it must only run on a TRUSTED event —
+      # operator workflow_dispatch, or a push to the protected main branch. It
+      # MUST NOT run on an untrusted-fork PR (which could exfiltrate the KMS
+      # token). Today this workflow is dispatch-only, so the guard is a no-op;
+      # it is here as defense-in-depth if a pull_request trigger is ever added.
+      - name: Fetch platform defaults (model+runtime) from KMS SSOT
+        id: defaults
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["secret"]["secretValue"])'
+          }
+          E2E_MODEL=$(read_secret MOLECULE_LLM_DEFAULT_MODEL %2Fshared%2Fcontrolplane%2Fllm)
+          E2E_RUNTIME=$(read_secret MOLECULE_DEFAULT_RUNTIME %2Fshared%2Fcontrolplane%2Fllm)
+          if [ -z "$E2E_MODEL" ]; then
+            echo "::error::Infisical returned empty for MOLECULE_LLM_DEFAULT_MODEL at staging /shared/controlplane/llm - a required boot gate must not run with an empty platform default model."
+            exit 1
+          fi
+          if [ -z "$E2E_RUNTIME" ]; then
+            echo "::error::Infisical returned empty for MOLECULE_DEFAULT_RUNTIME at staging /shared/controlplane/llm - a required boot gate must not run with an empty platform default runtime."
+            exit 1
+          fi
+          # model + runtime ids are not secrets, but mask defensively before export.
+          echo "::add-mask::$E2E_MODEL"
+          echo "::add-mask::$E2E_RUNTIME"
+          {
+            echo "E2E_MODEL=$E2E_MODEL"
+            echo "E2E_RUNTIME=$E2E_RUNTIME"
+          } >> "$GITHUB_ENV"
+          echo "platform defaults loaded from Infisical (model len=${#E2E_MODEL}, runtime len=${#E2E_RUNTIME})"
 
       - name: Verify required secrets present
         run: |

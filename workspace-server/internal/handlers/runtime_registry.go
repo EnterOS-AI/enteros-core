@@ -275,6 +275,34 @@ func isKnownRuntime(runtime string) bool {
 	return false
 }
 
+// bareCreateDefaultRuntimeFallback is the compiled-in default runtime for a
+// bare create (no template, no runtime) — the OSS / unset-override fallback.
+const bareCreateDefaultRuntimeFallback = "claude-code"
+
+// bareCreateDefaultRuntime resolves the default runtime for the bare-create
+// path (handlers.Create), honoring the MOLECULE_DEFAULT_RUNTIME env override
+// (KMS SSOT, injected at deploy time) over the compiled-in fallback.
+//
+// De-hardcode (behavior-neutral): the override's staging KMS value equals the
+// old literal ("claude-code"), and unset/local falls back to the same literal,
+// so no behavior changes today.
+//
+// FAIL CLOSED on an unknown override: the resolved runtime MUST pass
+// isKnownRuntime (the runtime_registry allowlist). An override naming a runtime
+// the provisioner can't honor would otherwise wedge the bare-create default; we
+// refuse it and fall back to the compiled-in known default rather than provision
+// an unknown runtime. (The downstream knownRuntimes gate in Create stays a
+// no-op for this path because the resolved value is always known.)
+func bareCreateDefaultRuntime() string {
+	if v := os.Getenv("MOLECULE_DEFAULT_RUNTIME"); v != "" {
+		if isKnownRuntime(v) {
+			return v
+		}
+		log.Printf("Create: MOLECULE_DEFAULT_RUNTIME=%q is not a known runtime; falling back to %q for bare-create default", v, bareCreateDefaultRuntimeFallback)
+	}
+	return bareCreateDefaultRuntimeFallback
+}
+
 // templateRepoRef is the parsed manifest entry needed to
 // derive a TemplateIdentity for the Gitea fetcher. The
 // identity is "<repo>@<ref>" (the giteaTemplateAssetFetcher

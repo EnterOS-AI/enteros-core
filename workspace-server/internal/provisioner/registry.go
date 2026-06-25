@@ -25,9 +25,39 @@ var knownRuntimes = []string{
 	"openclaw",
 }
 
-// defaultRuntime is the fallback when a workspace's config doesn't specify a
-// runtime.
-const defaultRuntime = "claude-code"
+// defaultRuntimeFallback is the compiled-in fallback when a workspace's config
+// doesn't specify a runtime AND the MOLECULE_DEFAULT_RUNTIME env override is
+// unset/empty/unknown. It is also the OSS default for self-hosted operators who
+// run without the platform KMS-injected override.
+const defaultRuntimeFallback = "claude-code"
+
+// defaultRuntime resolves the platform default runtime, honoring the
+// MOLECULE_DEFAULT_RUNTIME env override (KMS SSOT, injected at deploy time)
+// over the compiled-in defaultRuntimeFallback const.
+//
+// De-hardcode (behavior-neutral): the override's staging KMS value equals the
+// old literal ("claude-code"), and unset/local falls back to the same literal,
+// so no behavior changes today. A later platform-default flip is a separate,
+// deliberate KMS edit — not a code change.
+//
+// FAIL CLOSED on an unknown override: the resolved runtime MUST be in the
+// canonical knownRuntimes allowlist (IsKnownRuntime). An override that names a
+// runtime with no template repo / publish entry would otherwise resolve to a
+// DefaultImage with the wrong deps; we refuse it and fall back to the known
+// compiled-in default rather than provision an unknown runtime.
+func defaultRuntime() string {
+	if v := os.Getenv("MOLECULE_DEFAULT_RUNTIME"); v != "" {
+		if IsKnownRuntime(v) {
+			return v
+		}
+		// Unknown override — do NOT provision an unknown runtime. Fall back to
+		// the compiled-in known default (which always passes IsKnownRuntime).
+		fmt.Fprintf(os.Stderr,
+			"provisioner: MOLECULE_DEFAULT_RUNTIME=%q is not a known runtime; falling back to %q\n",
+			v, defaultRuntimeFallback)
+	}
+	return defaultRuntimeFallback
+}
 
 // RegistryPrefix returns the registry prefix all workspace-template image
 // references should use. Defaults to ghcr.io/molecule-ai (the upstream OSS
