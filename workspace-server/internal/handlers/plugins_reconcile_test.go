@@ -86,11 +86,19 @@ func TestReconcile_AlreadyInstalled_NoOp(t *testing.T) {
 	defer cleanup()
 	h, delivered := newReconcileHandler(t)
 
+	// Plugin row present AND plugin manifest is present on the box → pure no-op.
+	h.instanceIDLookup = func(string) (string, error) { return "i-present", nil }
+	orig := readPluginManifestViaEIC
+	readPluginManifestViaEIC = func(ctx context.Context, instanceID, runtime, pluginName string) ([]byte, error) {
+		return []byte("name: seo-all\n"), nil
+	}
+	defer func() { readPluginManifestViaEIC = orig }()
+
 	expectDeclared(mock,
 		[]DeclaredPlugin{{PluginName: "seo-all", SourceRaw: "local://seo-all"}},
 		[]string{"seo-all"}, // already installed
 	)
-	// No INSERT expected — already installed is a pure no-op.
+	// No INSERT expected — already installed AND present on box is a pure no-op.
 
 	h.ReconcileWorkspacePlugins(context.Background(), "ws-1")
 
@@ -114,6 +122,17 @@ func TestReconcile_PartialDiff_InstallsOnlyMissing(t *testing.T) {
 	}
 	_ = os.WriteFile(filepath.Join(second, "plugin.yaml"), []byte("name: research\n"), 0o644)
 
+	// seo-all is in DB AND confirmed present on the box; research is missing.
+	h.instanceIDLookup = func(string) (string, error) { return "i-present", nil }
+	orig := readPluginManifestViaEIC
+	readPluginManifestViaEIC = func(ctx context.Context, instanceID, runtime, pluginName string) ([]byte, error) {
+		if pluginName == "seo-all" {
+			return []byte("name: seo-all\n"), nil
+		}
+		return nil, nil // research not on box
+	}
+	defer func() { readPluginManifestViaEIC = orig }()
+
 	expectDeclared(mock,
 		[]DeclaredPlugin{
 			{PluginName: "seo-all", SourceRaw: "local://seo-all"},
@@ -128,6 +147,42 @@ func TestReconcile_PartialDiff_InstallsOnlyMissing(t *testing.T) {
 
 	if len(*delivered) != 1 || (*delivered)[0] != "research" {
 		t.Fatalf("expected only research installed, got %v", *delivered)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// TestReconcile_StaleInstalledRow_MissingOnBox_Delivers pins the fix for the
+// latent plugin-delivery skip bug: a workspace_plugins row can survive a fresh
+// image boot or de-baked box where /configs/plugins is empty. The reconcile must
+// detect that the plugin is NOT on the box and re-deliver (instead of trusting
+// the stale row and skipping).
+func TestReconcile_StaleInstalledRow_MissingOnBox_Delivers(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	h, delivered := newReconcileHandler(t)
+
+	// Row says installed, but EIC manifest read returns empty → not on box.
+	h.instanceIDLookup = func(string) (string, error) { return "i-stale", nil }
+	orig := readPluginManifestViaEIC
+	readPluginManifestViaEIC = func(ctx context.Context, instanceID, runtime, pluginName string) ([]byte, error) {
+		return nil, nil // empty manifest = not present
+	}
+	defer func() { readPluginManifestViaEIC = orig }()
+
+	expectDeclared(mock,
+		[]DeclaredPlugin{{PluginName: "seo-all", SourceRaw: "local://seo-all"}},
+		[]string{"seo-all"}, // stale installed row
+	)
+	// Reconcile must re-deliver AND upsert the tracking row.
+	mock.ExpectExec(`INSERT INTO workspace_plugins`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	h.ReconcileWorkspacePlugins(context.Background(), "ws-stale")
+
+	if len(*delivered) != 1 || (*delivered)[0] != "seo-all" {
+		t.Fatalf("stale installed-row with missing plugin must re-deliver, got %v", *delivered)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet DB expectations: %v", err)

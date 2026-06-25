@@ -94,8 +94,16 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 	var installedCount, skipped int
 	for _, d := range declared {
 		if installed[d.PluginName] {
-			skipped++
-			continue // already installed — idempotent no-op
+			// Stale-row guard: the workspace_plugins row may survive a fresh
+			// image boot or de-baked box where /configs/plugins is empty. Trust
+			// the row ONLY when the plugin is also confirmed present on the box.
+			if h.pluginPresentOnBox(ctx, workspaceID, d.PluginName) {
+				skipped++
+				continue // installed in DB and present on box — idempotent no-op
+			}
+			log.Printf("Plugin reconcile: workspace=%s plugin=%s installed-row present but not on box — re-delivering",
+				workspaceID, d.PluginName)
+			// Fall through to (re)delivery so the MCP actually lands in settings.json.
 		}
 
 		// Track value: a tag:/sha: ref opts the plugin into drift tracking;
@@ -158,11 +166,26 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 // workspace box — e.g. delivered by the runtime-image boot-install
 // (RFC#2843 #32) before this online-transition reconcile runs. Used to skip the
 // redundant EIC re-deliver + restart that caused the per-fresh-workspace
-// reprovision churn (#38). CONSERVATIVE by design: returns false on any
-// uncertainty (not SaaS / no instance / read error / empty manifest), so the
-// caller falls back to delivering — a genuinely-missing install is never
-// silently skipped, only a confirmed-present one is deduped.
+// reprovision churn (#38), and to detect stale workspace_plugins rows on a
+// fresh/de-baked box. CONSERVATIVE by design: returns false on any uncertainty
+// (no container / no instance / read error / empty manifest), so the caller
+// falls back to delivering — a genuinely-missing install is never silently
+// skipped, only a confirmed-present one is deduped.
 func (h *PluginsHandler) pluginPresentOnBox(ctx context.Context, workspaceID, pluginName string) bool {
+	// Local Docker path: if the workspace container is running, read its
+	// /configs/plugins/<name>/plugin.yaml directly. This covers local/dev boxes
+	// where there is no EC2 instance to probe via EIC.
+	if containerName := h.findRunningContainer(ctx, workspaceID); containerName != "" {
+		out, err := h.execInContainer(ctx, containerName, []string{
+			"cat", "/configs/plugins/" + pluginName + "/plugin.yaml",
+		})
+		if err != nil || len(out) == 0 {
+			return false // not present or unreadable on the box
+		}
+		return true
+	}
+
+	// SaaS EC2 path: probe the remote instance via EIC SSH.
 	instanceID, runtime := h.lookupSaaSDispatch(workspaceID)
 	if instanceID == "" {
 		return false // not a SaaS box we can probe — deliver as before
