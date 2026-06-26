@@ -1,0 +1,259 @@
+name: zone-count-drift guardrail
+
+# Detects when the shared `moleculesai.app` CF zone's record count approaches
+# the Free-plan 200-record hard cap. The CP in-process teardown cascade and
+# the CI janitor (sweep-cf-orphans) are the two backstops that delete tenant
+# DNS records on org/tenant teardown; when BOTH are down (or when neither
+# runs the catch-all scope), records accumulate at ~10/hour under normal
+# E2E cadence. The zone hits 200 → every new provision fails with
+# CF `81045 Record quota exceeded` (this already caused the 2026-06-22
+# staging provisioning outage, #895).
+#
+# This is the drift guardrail from molecule-controlplane#965 (ROOT FIX:
+# tenant DNS records are not reliably deleted on org/tenant teardown).
+# It does NOT fix the root cause — that's the DNS-capable-token PR (sub-fix
+# PR1 in #965). This just catches the next silent accrual at 150/200, not
+# at the 200 wall.
+#
+# Why this exists as a separate workflow (not folded into sweep-cf-orphans):
+#   - The zone-count threshold is a different signal from "records to delete
+#     now" — a health check, not a sweep action.
+#   - The drift gate keeps producing failure rows even when the janitor
+#     sweep itself is in the failure chain (current state per #965).
+#   - A 200/200 cap means 0 capacity for new provisions; a count alert
+#     must fire before that, at 150.
+#
+# Triggers:
+#   - schedule: hourly. Catches silent accrual between workflow_dispatch runs.
+#   - workflow_dispatch: manual run for ad-hoc count checks.
+#
+# Why hourly (not daily like main-red-watchdog): zone accrual is FAST
+# (~10/hour) and a daily check could miss the 150→200 window entirely on
+# a busy day. Hourly is the right cadence for a 200-record hard cap.
+
+on:
+  schedule:
+    # Hourly at :17, offset from sweep-cf-orphans (:15) and
+    # sweep-cf-tunnels (:45) so the three CF jobs don't all hit
+    # api.cloudflare.com/client/v4 at the same minute.
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+# IMPORTANT — Gitea 1.22.6 parser quirk per
+# `feedback_gitea_workflow_dispatch_inputs_unsupported`: do NOT add an
+# `inputs:` block here. Gitea 1.22.6 rejects the whole workflow as
+# "unknown on type" when `workflow_dispatch.inputs.X` is present. Revisit
+# when Gitea is upgraded to 1.26+.
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+# Auto-injected GITHUB_TOKEN scoped to read-only. The check only does
+# HTTP GETs + file-writes via gh CLI; no source-clone needed.
+permissions:
+  contents: read
+  issues: write
+
+# Read-scope token is enough — this check does a GET on
+# /zones/:id/dns_records, not a DELETE. The actual DELETE fix needs
+# DNS:Edit scope (sub-fix PR1 in #965) and is CTO-gated. The canonical
+# Infisical path for the read-scope token is /shared/cloudflare-tunnel-admin
+# (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ZONE_ID).
+#
+concurrency:
+  # Cancel any in-flight re-runs so an hourly cron can re-trigger cleanly
+  # without queueing stale state.
+  group: zone-count-drift
+  cancel-in-progress: true
+
+jobs:
+  zone-count-drift:
+    name: zone-count-drift
+    runs-on: ubuntu-latest
+    # 2 min: CF list + (optional) file-issue. Surfaced hangs without
+    # burning a full tick. Worst case is ~30s: 1 CF GET + gh issue create.
+    timeout-minutes: 2
+    continue-on-error: false
+
+    env:
+      # The Infisical fetch step populates these from the same
+      # /shared/cloudflare-tunnel-admin path that sweep-cf-orphans uses
+      # (wave-B aliases migration). No direct Gitea-secret read for the
+      # values being fetched — only the Infisical-fetch bootstrap
+      # credentials (INFISICAL_CI_*) are Gitea secrets; the values
+      # themselves come through the read_secret → add-mask → GITHUB_ENV
+      # chain. The Infisical-fetch + string-only isinstance + ::add-mask::
+      # pattern is the canonical fail-closed convention (see #971 + #3274).
+      INFISICAL_BASE: 'https://key.moleculesai.app'
+      INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+      INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+      INFISICAL_PROJECT_ID: '7c8e456a-2eb5-4326-b4ed-7c1a6c4f4c5c'
+      ZONE_LABEL: ${{ vars.ZONE_LABEL || 'moleculesai.app' }}
+
+    steps:
+      - name: Fetch CF_API_TOKEN + CF_ZONE_ID from Infisical SSOT
+        id: fetch
+        run: |
+          set -euo pipefail
+          BASE="$INFISICAL_BASE"
+          PROJECT="$INFISICAL_PROJECT_ID"
+          TOK=$(curl -sS -m 15 -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys, json; v = json.load(sys.stdin).get("accessToken"); print(v if isinstance(v, str) and v else "")')
+          if [ -z "$TOK" ]; then
+            echo "::error::Infisical accessToken empty - failing closed"
+            exit 1
+          fi
+          read_secret() {
+            curl -sS -m 15 "$BASE/api/v3/secrets/raw/$1?workspaceId=$PROJECT&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys, json; v = (json.load(sys.stdin).get("secret") or {}).get("secretValue"); print(v if isinstance(v, str) and v else "")'
+          }
+          # CF_API_TOKEN + CF_ZONE_ID live in /shared/cloudflare-tunnel-admin
+          # (read-scope is enough for the zone-list GET; the actual DELETE
+          # fix is sub-fix PR1 in #965 which needs /shared/cloudflare-admin
+          # DNS:Edit — out of scope here).
+          CF_API_TOKEN=$(read_secret CLOUDFLARE_API_TOKEN %2Fshared%2Fcloudflare-tunnel-admin)
+          if [ -z "$CF_API_TOKEN" ]; then
+            echo "::error::Infisical returned empty CLOUDFLARE_API_TOKEN at prod /shared/cloudflare-tunnel-admin — failing closed"
+            exit 1
+          fi
+          CF_ZONE_ID=$(read_secret CLOUDFLARE_ZONE_ID %2Fshared%2Fcloudflare-tunnel-admin)
+          if [ -z "$CF_ZONE_ID" ]; then
+            echo "::error::Infisical returned empty CLOUDFLARE_ZONE_ID at prod /shared/cloudflare-tunnel-admin — failing closed"
+            exit 1
+          fi
+          echo "::add-mask::$CF_API_TOKEN"
+          echo "::add-mask::$CF_ZONE_ID"
+          echo "CF_API_TOKEN=$CF_API_TOKEN" >> "$GITHUB_ENV"
+          echo "CF_ZONE_ID=$CF_ZONE_ID" >> "$GITHUB_ENV"
+          echo "secrets OK: CF_API_TOKEN + CF_ZONE_ID loaded from /shared/cloudflare-tunnel-admin"
+
+      - name: Fetch zone record count
+        id: count
+        env:
+          # Override the per-page cap so a single GET is enough for the
+          # 200-record cap we're guarding. CF default is 20 which would
+          # force pagination; per_page=500 is the max and one-shot.
+          PER_PAGE: '500'
+        run: |
+          set -euo pipefail
+          # CF API: list DNS records for the zone. Read-scope token is enough
+          # (this is a GET, not a DELETE). The `result_info.total_count` field
+          # is the authoritative count for the zone.
+          CF_JSON=$(curl -sS -m 15 \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?per_page=${PER_PAGE}")
+          CF_RESULT_INFO_TOTAL=$(printf '%s' "$CF_JSON" | python3 -c "
+          import json, sys
+          try:
+            payload = json.loads(sys.stdin.read())
+          except Exception as e:
+            print(f'PARSE_ERR:{e}', file=sys.stderr)
+            sys.exit(1)
+          if not payload.get('success', False):
+            print('API_ERR:' + str(payload.get('errors', 'unknown')), file=sys.stderr)
+            sys.exit(2)
+          info = payload.get('result_info', {}) or {}
+          print(info.get('total_count', 0))
+          ")
+          echo "total_count=$CF_RESULT_INFO_TOTAL"
+          if [ -z "$CF_RESULT_INFO_TOTAL" ] || ! echo "$CF_RESULT_INFO_TOTAL" | grep -qE '^[0-9]+$'; then
+            echo "::error::Failed to parse total_count from CF response"
+            exit 2
+          fi
+          echo "count=$CF_RESULT_INFO_TOTAL" >> "$GITHUB_OUTPUT"
+          echo "zone=$ZONE_LABEL" >> "$GITHUB_OUTPUT"
+          echo "max=200" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate thresholds
+        id: eval
+        env:
+          COUNT: ${{ steps.count.outputs.count }}
+          ZONE: ${{ steps.count.outputs.zone }}
+          MAX: ${{ steps.count.outputs.max }}
+        run: |
+          set -euo pipefail
+          # Thresholds (per #965): warn at 150 (approaching cap; issue-only,
+          # job stays green — this is the canary for the janitor to fix),
+          # error+exit1 at 180 (CRITICAL — both backstops likely down,
+          # investigate teardown DNS-deletion path), error+exit1 at 200
+          # (at-cap; provisioning will fail with CF 81045).
+          #
+          # The job-exit semantic IS the guardrail — ::warning:: / ::error::
+          # alone don't fail the run. Without an explicit nonzero exit
+          # here, a count=199 run would still appear "green" and let
+          # provisioning fail silently. So:
+          #   count >= 200  -> exit 1 (at-cap; provisioning breaks)
+          #   count >= 180  -> exit 1 (critical; both backstops down)
+          #   count >= 150  -> exit 0 (canary; issue-only, no fail)
+          #   else          -> exit 0 (ok)
+          WARN_AT=150
+          CRIT_AT=180
+          if [ "$COUNT" -ge "$MAX" ]; then
+            LEVEL=at-cap
+            echo "::error::zone=$ZONE record count = $COUNT / $MAX (at the Free-plan hard cap — every new provision will fail with CF 81045 Record quota exceeded)"
+            echo "exit_code=1 reason=at-cap" >> "$GITHUB_OUTPUT"
+            exit 1
+          elif [ "$COUNT" -ge "$CRIT_AT" ]; then
+            LEVEL=critical
+            echo "::error::zone=$ZONE record count = $COUNT / $MAX (CRITICAL — approaching cap, both backstops appear to be down; investigate teardown DNS-deletion path per molecule-controlplane#965)"
+            echo "exit_code=1 reason=critical" >> "$GITHUB_OUTPUT"
+            exit 1
+          elif [ "$COUNT" -ge "$WARN_AT" ]; then
+            LEVEL=approaching
+            echo "::warning::zone=$ZONE record count = $COUNT / $MAX (approaching the cap; if the CI janitor is failing or the in-process reaper is disabled, this is the canary)"
+            echo "exit_code=0 reason=approaching" >> "$GITHUB_OUTPUT"
+            # CANARY: stay green at 150. Issue file below is the alert; the
+            # job-exit is reserved for the actual fail conditions. This
+            # matches the issue body's "drift guardrail" intent — the gate
+            # triggers on a REAL cap risk, not on every "approaching" tick.
+          else
+            LEVEL=ok
+            echo "ok zone=$ZONE record count = $COUNT / $MAX"
+            echo "exit_code=0 reason=ok" >> "$GITHUB_OUTPUT"
+          fi
+          echo "level=$LEVEL" >> "$GITHUB_OUTPUT"
+
+      - name: File issue on threshold breach
+        if: steps.eval.outputs.level != 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ZONE: ${{ steps.count.outputs.zone }}
+          COUNT: ${{ steps.count.outputs.count }}
+          MAX: ${{ steps.count.outputs.max }}
+          LEVEL: ${{ steps.eval.outputs.level }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$LEVEL" in
+            at-cap)        LEVEL_TITLE=AT-CAP ;;
+            critical)      LEVEL_TITLE=CRITICAL ;;
+            approaching)   LEVEL_TITLE=APPROACHING ;;
+          esac
+          NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          BODY_FILE=$(mktemp)
+          BODY=$(printf 'Zone-record count on this CF zone crossed the guardrail threshold.\n\n- zone: %s\n- record count: **%s / %s**\n- level: %s\n- workflow run: %s\n\nThis is the early-warning drift guardrail from molecule-controlplane#965. The 200-record Free-plan hard cap on the CF zone means every new provision fails with 81045 Record quota exceeded once we hit the wall.\n\nIf the count is climbing despite this alert, both teardown backstops (CP in-process reaper + CI janitor sweep-cf-orphans) are likely down. The root fix lives in #965 (sub-fix PR1 = DNS-capable CF token).\n' "$ZONE" "$COUNT" "$MAX" "$LEVEL_TITLE" "$RUN_URL")
+          printf '%s' "$BODY" > "$BODY_FILE"
+          # Search for an existing open issue for this zone so we don't
+          # spam duplicates. Dedup on the standard title pattern.
+          existing=$(gh issue list --repo "$GH_REPO" --state open --search "zone-count-drift guardrail: $ZONE in:title" --limit 1 --json number --jq '.[].number' 2>/dev/null || echo "")
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            echo "::notice::Existing open issue #$existing for this zone - not filing a duplicate. Commenting instead."
+            COMMENT_FILE=$(mktemp)
+            COMMENT_BODY=$(printf 'zone-count-drift guardrail re-fired at %s.\n- zone: %s\n- record count: **%s / %s**\n- level: %s\n- run: %s\n\nIf the count is climbing despite this alert, both teardown backstops (CP in-process reaper + CI janitor) are likely down - see molecule-controlplane#965 for the root fix.\n' "$NOW_ISO" "$ZONE" "$COUNT" "$MAX" "$LEVEL_TITLE" "$RUN_URL")
+            printf '%s' "$COMMENT_BODY" > "$COMMENT_FILE"
+            # `|| true` here is intentional: even if the issue-comment fails
+            # (e.g. transient network), the EVAL step's exit-1 above is the
+            # real guardrail. The issue is a notification channel, not a
+            # guard. Failed comments re-appear on the next scheduled run.
+            gh issue comment "$existing" --repo "$GH_REPO" --body-file "$COMMENT_FILE" 2>&1 | head -2 || true
+            rm -f "$COMMENT_FILE"
+          else
+            # Same rationale as the comment path: file is a notification,
+            # not the guard. Failure here doesn't undo the eval-step exit-1.
+            gh issue create --repo "$GH_REPO" --title "zone-count-drift guardrail: $ZONE at $COUNT / $MAX ($LEVEL_TITLE)" --body-file "$BODY_FILE" --label "drift/cf-zone,zone=$ZONE" 2>&1 | head -3 || true
+          fi
+          rm -f "$BODY_FILE"
