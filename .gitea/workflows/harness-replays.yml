@@ -235,10 +235,54 @@ jobs:
       # `feedback_per_agent_gitea_identity_default`). clone-manifest.sh
       # embeds it as basic-auth for the duration of the clones and strips
       # .git directories — the token never enters the resulting image.
+      - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
+        # Bot-token consolidation (secrets->kms). AUTO_SYNC_TOKEN (the
+        # devops-engineer persona PAT, used here as the cross-repo clone token
+        # for manifest deps) is now pulled from the Infisical SSOT at
+        # /shared/dev-utils::AUTO_SYNC_TOKEN (environment=prod) instead of the
+        # duplicated `secrets.AUTO_SYNC_TOKEN` Gitea secret. Exported to
+        # $GITHUB_ENV and consumed as env.* by "Pre-clone manifest deps" below.
+        # The old Gitea secret stays in place until a green run proves this
+        # fetch (validate-before-delete).
+        #
+        # FORK SAFETY: this workflow fires on pull_request, so the fetch is
+        # gated to same-repo PRs only — a fork PR must NEVER harvest the
+        # merge-actor token. On a fork PR this step is skipped, env.* stays
+        # empty, and the clone step below falls back to anonymous clone (its
+        # pre-existing fork behaviour: repos are public per the manifest OSS
+        # contract). Gitea also withholds secrets from forks at the runner
+        # level (defense in depth).
+        id: auto_sync_token
+        if: needs.detect-changes.outputs.run == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -z "$AUTO_SYNC_TOKEN" ]; then
+            echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils"
+            exit 1
+          fi
+          echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
+          echo "AUTO_SYNC_TOKEN loaded from Infisical (len=${#AUTO_SYNC_TOKEN})"
+
       - name: Pre-clone manifest deps
         if: needs.detect-changes.outputs.run == 'true'
         env:
-          MOLECULE_GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+          MOLECULE_GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${MOLECULE_GITEA_TOKEN}" ]; then
