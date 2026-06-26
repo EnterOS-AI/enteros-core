@@ -26,10 +26,21 @@ name: mcp-verb-published-manifest
 # branch protection (soak-then-promote; mirrors
 # mcp-plugin-delivery-contract-drift.yml). Promote into BP once it has soaked.
 #
-# AUTH: MCP_SERVER_READPKG_TOKEN — a Gitea token with read:package scope for the
-# molecule-ai npm registry. Fail-closed on trusted contexts; soft-skip on
-# untrusted fork PRs (which cannot hold repo secrets — the check still runs on
-# the trusted post-merge / scheduled run before any provision).
+# AUTH: the read:package token for the molecule-ai npm registry is sourced from
+# the Infisical SSOT (NOT a Gitea Actions secret). It is MOLECULE_TEMPLATE_REPO_TOKEN
+# at /shared/controlplane (prod), which carries read:package on org molecule-ai —
+# the SAME token+path the merged mcp-server provenance gate (#70) fetches. The
+# only Gitea Actions secrets used here are the documented Infisical bootstrap
+# creds (INFISICAL_CI_CLIENT_ID / INFISICAL_CI_CLIENT_SECRET /
+# INFISICAL_CI_PROJECT_ID), already wired on this repo (reserved-path-review.yml
+# consumes the same creds). The token is then exported to the env var
+# MCP_SERVER_READPKG_TOKEN the install step already expects, so downstream logic
+# is unchanged. Fail-closed on trusted contexts; soft-skip on untrusted fork PRs
+# (which cannot hold repo secrets — neither the old Actions secret nor the
+# Infisical bootstrap creds — so the check still runs on the trusted post-merge /
+# scheduled run before any provision). The old MCP_SERVER_READPKG_TOKEN Gitea
+# Actions secret can be retired after a green soak validates this path
+# (validate-before-delete).
 #
 # DEPENDS ON: molecule-core's verb-SSOT PR (feat/3082-mcp-verb-ssot-contract)
 # landing `required_tools` (+ optional `transitional_tool_aliases`) in
@@ -76,9 +87,85 @@ jobs:
         with:
           node-version: '20'
 
+      # Source the read:package token from the Infisical SSOT (NOT a Gitea
+      # Actions secret). It is MOLECULE_TEMPLATE_REPO_TOKEN at /shared/controlplane
+      # (prod) — the SAME token+path the merged mcp-server provenance gate (#70)
+      # fetches; that token carries read:package on org molecule-ai. The only
+      # Gitea Actions secrets consumed are the documented Infisical bootstrap
+      # creds (INFISICAL_CI_CLIENT_ID / INFISICAL_CI_CLIENT_SECRET /
+      # INFISICAL_CI_PROJECT_ID — the same ones reserved-path-review.yml already
+      # uses on this repo). The token is exported to $GITHUB_ENV as
+      # MCP_SERVER_READPKG_TOKEN, which the install step already reads.
+      #
+      # TRUST SEMANTICS (preserved from the prior Actions-secret wiring):
+      #   • Trusted contexts (push / schedule / workflow_dispatch / same-repo PR):
+      #     the published manifest MUST be resolvable, so the token is REQUIRED —
+      #     a missing bootstrap cred, an empty Infisical login, or an empty
+      #     secret read all FAIL CLOSED (exit 1).
+      #   • Untrusted fork PRs: forks cannot reach the INFISICAL_CI_* secrets
+      #     (just as they could not hold the old MCP_SERVER_READPKG_TOKEN secret),
+      #     so we SOFT-SKIP (exit 0) without exporting the token. The downstream
+      #     install step then sees an empty MCP_SERVER_READPKG_TOKEN and takes its
+      #     existing soft-skip-on-fork path. The check still runs on the trusted
+      #     post-merge / scheduled run before any provision.
+      - name: Fetch read:package token from Infisical SSOT
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_CI_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+
+          case "${{ github.event_name }}" in
+            push|schedule|workflow_dispatch)
+              is_trusted=true ;;
+            pull_request)
+              if [ "${{ github.event.pull_request.head.repo.fork }}" = "false" ]; then
+                is_trusted=true
+              else
+                is_trusted=false
+              fi ;;
+            *)
+              is_trusted=true ;;
+          esac
+
+          # Forks cannot reach the INFISICAL_CI_* secrets. On an untrusted fork
+          # PR, soft-skip (do not export the token); the install step's existing
+          # soft-skip-on-fork path then runs. On a trusted context, an absent
+          # bootstrap cred is a real fault — fail closed.
+          if [ -z "${INFISICAL_CI_CLIENT_ID:-}" ] || [ -z "${INFISICAL_CI_PROJECT_ID:-}" ]; then
+            if [ "$is_trusted" = "true" ]; then
+              echo "::error::Infisical CI bootstrap creds (INFISICAL_CI_CLIENT_ID/SECRET + INFISICAL_CI_PROJECT_ID) missing on a trusted context — cannot fetch the read:package token to resolve the published mcp-server manifest."
+              exit 1
+            fi
+            echo "::warning::Infisical CI bootstrap creds absent on an untrusted fork PR — skipping the Infisical token fetch (forks cannot hold repo secrets). The published-manifest check soft-skips and runs on the trusted post-merge / scheduled run before any provision."
+            exit 0
+          fi
+
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
+          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
+
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_CI_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); print(v if isinstance(v,str) and v else "")'
+          }
+
+          MCP_SERVER_READPKG_TOKEN=$(read_secret MOLECULE_TEMPLATE_REPO_TOKEN %2Fshared%2Fcontrolplane)
+          echo "::add-mask::$MCP_SERVER_READPKG_TOKEN"
+          if [ -z "$MCP_SERVER_READPKG_TOKEN" ]; then
+            echo "::error::Infisical returned empty for MOLECULE_TEMPLATE_REPO_TOKEN at /shared/controlplane (prod) — cannot resolve the published mcp-server manifest. Failing closed on a trusted context."
+            exit 1
+          fi
+          echo "MCP_SERVER_READPKG_TOKEN=$MCP_SERVER_READPKG_TOKEN" >> "$GITHUB_ENV"
+          echo "read:package token loaded from Infisical SSOT (non-empty, len=${#MCP_SERVER_READPKG_TOKEN})"
+
       - name: Resolve published mcp-server manifest and assert against the contract
         env:
-          MCP_SERVER_READPKG_TOKEN: ${{ secrets.MCP_SERVER_READPKG_TOKEN }}
           REGISTRY_HOST: ${{ github.server_url }}
           # Override to pin a specific published version (e.g. the version core
           # would deliver). Defaults to the registry's `latest` dist-tag.
@@ -124,7 +211,7 @@ jobs:
           echo "Installing @molecule-ai/mcp-server@${MCP_SERVER_VERSION} from ${REGISTRY}"
           npm install "@molecule-ai/mcp-server@${MCP_SERVER_VERSION}" --no-audit --no-fund
 
-          INSTALLED_VERSION="$(node -e "console.log(require('@molecule-ai/mcp-server/package.json').version)")"
+          INSTALLED_VERSION="$(node -e "const fs=require('fs'); console.log(JSON.parse(fs.readFileSync(process.cwd()+'/node_modules/@molecule-ai/mcp-server/package.json','utf8')).version)")"
           echo "Resolved published version: ${INSTALLED_VERSION}"
 
           cd "${GITHUB_WORKSPACE}"
