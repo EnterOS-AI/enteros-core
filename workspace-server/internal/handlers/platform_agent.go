@@ -575,7 +575,9 @@ func conciergeModelIsPlatformManaged(runtime, model string) bool {
 }
 
 // The management-MCP plugin the concierge declares. It wires the `molecule-mcp`
-// server (MOLECULE_MCP_MODE=management — create_workspace, list_workspaces, …)
+// server (MOLECULE_MCP_MODE=management — provision_workspace, list_workspaces, …;
+// the management lifecycle verb is provision_workspace — create_workspace is a
+// legacy/workspace-mode tool that is never on the concierge's management surface)
 // into the Claude Code runtime via the plugin channel's MCPServerAdaptor,
 // replacing the baked-image + asset-channel mcp_servers.yaml path that does NOT
 // reach the on-box config (RFC: rfc-platform-mcp-as-plugin). Declaring it from
