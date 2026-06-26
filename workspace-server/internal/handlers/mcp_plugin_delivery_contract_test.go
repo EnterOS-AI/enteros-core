@@ -37,9 +37,9 @@ func TestMCPPluginDeliveryContract_MatchesSSOT(t *testing.T) {
 // gate's expected platform tool id is DERIVED from the contract's
 // mcp_server_name (the SSOT), not an independent hardcode. If the contract's
 // server name changes (or the constant drifts), this fails — preventing the
-// class of bug where the gate looked for mcp__molecule-platform__create_workspace
+// class of bug where the gate looked for mcp__molecule-platform__provision_workspace
 // while the runtime (mcp_servers.yaml name: platform) emitted
-// mcp__platform__create_workspace, marking every concierge degraded.
+// mcp__platform__provision_workspace, marking every concierge degraded.
 func TestSSOT_DegradeGateToolDerivesFromContract(t *testing.T) {
 	c, err := LoadMCPPluginDeliveryContract()
 	if err != nil {
@@ -64,10 +64,10 @@ func TestSSOT_DegradeGateToolDerivesFromContract(t *testing.T) {
 	}
 	// And the composed full id must equal the contract-derived id (mcp__<server>__<verb>).
 	want := "mcp__" + c.MCPServerName + "__" + c.RequiredTool
-	if conciergePlatformMCPCreateWorkspaceTool != want {
-		t.Errorf("SSOT drift: conciergePlatformMCPCreateWorkspaceTool = %q, but contract implies %q (mcp__%s__%s).\n"+
+	if conciergePlatformMCPProvisionWorkspaceTool != want {
+		t.Errorf("SSOT drift: conciergePlatformMCPProvisionWorkspaceTool = %q, but contract implies %q (mcp__%s__%s).\n"+
 			"The degraded gate must look for the tool id the runtime actually emits (mcp__<server>__<required_tool>).",
-			conciergePlatformMCPCreateWorkspaceTool, want, c.MCPServerName, c.RequiredTool)
+			conciergePlatformMCPProvisionWorkspaceTool, want, c.MCPServerName, c.RequiredTool)
 	}
 }
 
@@ -175,7 +175,7 @@ print("RECORDER=" + json.dumps(recorded))
 // with env MOLECULE_MCP_MODE=management — and that NO /configs/.claude/settings.json
 // was produced. This catches the exact #3159 bug class: a hard-coded Claude
 // write would mis-wire a codex concierge (MCP written to a file codex never
-// reads), leaving create_workspace absent.
+// reads), leaving provision_workspace absent.
 func TestMCPPluginDeliveryContract_CodexRoutesToCodexConfig(t *testing.T) {
 	contract, err := LoadMCPPluginDeliveryContract()
 	if err != nil {

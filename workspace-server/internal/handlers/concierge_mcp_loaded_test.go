@@ -23,7 +23,7 @@ func evalStatusRows(status, kind string, lastRegisterFailure, mcpUnloadedSince i
 // TestHeartbeatHandler_PlatformManagementMCPMissing_SustainedDegrades
 // verifies core#3082 (CR2 #12653 fix) AND the grace-window flap fix: a
 // platform concierge that reports loaded_mcp_tools but does NOT include the
-// literal required tool identifier `mcp__molecule-platform__create_workspace`
+// literal required tool identifier `mcp__molecule-platform__provision_workspace`
 // is marked degraded — BUT ONLY once the absence has persisted past
 // managementMCPUnloadedGrace. Here mcp_unloaded_since is set well in the past,
 // so the grace window has elapsed and the gate degrades (intent preserved:
@@ -153,7 +153,7 @@ func TestHeartbeatHandler_PlatformManagementMCPMissing_WithinGrace_NoDegrade(t *
 
 // TestHeartbeatHandler_PlatformManagementMCPLoaded_ClearsStampStaysOnline
 // verifies that a platform concierge reporting the literal required
-// create_workspace tool stays online AND that an outstanding
+// provision_workspace tool stays online AND that an outstanding
 // mcp_unloaded_since stamp is cleared (so a future absence starts a fresh
 // grace window instead of degrading instantly).
 func TestHeartbeatHandler_PlatformManagementMCPLoaded_ClearsStampStaysOnline(t *testing.T) {
@@ -198,7 +198,7 @@ func TestHeartbeatHandler_PlatformManagementMCPLoaded_ClearsStampStaysOnline(t *
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"workspace_id":"ws-mcp-ok","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["a2a","` + conciergePlatformMCPCreateWorkspaceTool + `"]}`
+	body := `{"workspace_id":"ws-mcp-ok","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["a2a","` + conciergePlatformMCPProvisionWorkspaceTool + `"]}`
 	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -243,7 +243,7 @@ func TestHeartbeatHandler_RuntimeEmitsServerPresentButNoLoadedTools_SustainedDeg
 	// Degraded UPDATE — runtime spoke server-present but omitted loaded_mcp_tools
 	// and the absence has outlasted the grace window.
 	mock.ExpectExec("UPDATE workspaces SET status =.*status = 'online'").
-		WithArgs(models.StatusDegraded, "platform agent runtime did not report loaded_mcp_tools on a mcp_server_present=true heartbeat; cannot verify create_workspace tool is loaded — marking degraded (core#3082)", "ws-server-present-no-tools").
+		WithArgs(models.StatusDegraded, "platform agent runtime did not report loaded_mcp_tools on a mcp_server_present=true heartbeat; cannot verify provision_workspace tool is loaded — marking degraded (core#3082)", "ws-server-present-no-tools").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	mock.ExpectExec("INSERT INTO structure_events").
@@ -484,7 +484,7 @@ func TestHeartbeatHandler_PlatformManagementMCPLookupError_FlipsOnlineToDegraded
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"workspace_id":"ws-mcp-lookup-err","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["` + conciergePlatformMCPCreateWorkspaceTool + `"]}`
+	body := `{"workspace_id":"ws-mcp-lookup-err","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["` + conciergePlatformMCPProvisionWorkspaceTool + `"]}`
 	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 

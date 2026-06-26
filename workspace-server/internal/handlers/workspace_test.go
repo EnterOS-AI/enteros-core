@@ -39,7 +39,7 @@ func TestWorkspaceGet_Success(t *testing.T) {
 			AddRow("cccccccc-0001-0000-0000-000000000000", "My Agent", "worker", 1, "online", []byte(`{"name":"test"}`),
 				"http://localhost:8001", nil, 2, 1, 0.05, "", 3600, "working", "claude-code",
 				"", 10.0, 20.0, false,
-				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`["a2a","mcp__molecule-platform__create_workspace"]`),
+				nil, 0, false, true, []byte(`{}`), "workspace", []byte(`["a2a","mcp__molecule-platform__provision_workspace"]`),
 			))
 
 	w := httptest.NewRecorder()
@@ -76,8 +76,8 @@ func TestWorkspaceGet_Success(t *testing.T) {
 		t.Errorf("expected loaded_mcp_tools to be a 2-element array, got %v", resp["loaded_mcp_tools"])
 	}
 	if ok {
-		if loaded[0] != "a2a" || loaded[1] != "mcp__molecule-platform__create_workspace" {
-			t.Errorf("expected loaded_mcp_tools [a2a mcp__molecule-platform__create_workspace], got %v", loaded)
+		if loaded[0] != "a2a" || loaded[1] != "mcp__molecule-platform__provision_workspace" {
+			t.Errorf("expected loaded_mcp_tools [a2a mcp__molecule-platform__provision_workspace], got %v", loaded)
 		}
 	}
 

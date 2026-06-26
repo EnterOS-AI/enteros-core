@@ -165,8 +165,8 @@ type HeartbeatPayload struct {
 	// MCP so a missing plugin is surfaced as degraded instead of silent
 	// (core#3082, CR2 #12653 fix). Each entry is a Claude Code dispatcher
 	// id of the form `mcp__<server>__<tool>`; the platform MCP's required
-	// tool is `mcp__molecule-platform__create_workspace` (see
-	// conciergePlatformMCPCreateWorkspaceTool).
+	// tool is `mcp__molecule-platform__provision_workspace` (see
+	// conciergePlatformMCPProvisionWorkspaceTool).
 	//
 	// On a heartbeat where mcp_server_present=true and LoadedMCPTools is
 	// nil/omitted, the #3082 gate fails loud (degraded) — the runtime
