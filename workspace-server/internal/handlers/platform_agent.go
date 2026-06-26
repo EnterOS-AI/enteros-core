@@ -605,10 +605,20 @@ const conciergePlatformMCPSource = "gitea://molecule-ai/molecule-ai-plugin-molec
 // derivation, not the human label "molecule-platform-mcp".
 const conciergePlatformMCPName = "molecule-ai-plugin-molecule-platform-mcp"
 
-// The platform concierge must surface mcp__molecule-platform__create_workspace
+// The platform concierge must surface mcp__molecule-platform__provision_workspace
 // for the post-online fail-loud gate (core#3082) to consider the management MCP
 // actually loaded. The Claude Code dispatcher formats every MCP tool as
 // `mcp__<server>__<tool>`.
+//
+// VERB CORRECTION (2026-06-25): the concierge runs the platform MCP in
+// MOLECULE_MCP_MODE=management. In that mode @molecule-ai/mcp-server's
+// createServer() returns EARLY after registering only the management tools and
+// NEVER calls registerWorkspaceTools — so the lifecycle verb on the concierge's
+// management surface is `provision_workspace` in ALL published versions
+// (1.1.1 → 1.6.1). `create_workspace` is a WORKSPACE-mode tool that has never
+// shipped on the concierge's management surface; the previous contract required a
+// phantom verb. This SSOT now matches the deployed producer + the live 1.6.1
+// concierge (which loads provision_workspace and no create_workspace).
 //
 // SSOT (audit 2026-06-25): the gate tool id is COMPOSED from two building blocks,
 // each pinned to the shared contract (contracts/mcp-plugin-delivery.contract.json)
@@ -629,11 +639,13 @@ const conciergePlatformMCPName = "molecule-ai-plugin-molecule-platform-mcp"
 // conciergePlatformMCPServerName == contract.mcp_server_name (the mcp__<server>__
 // prefix). conciergePlatformMCPRequiredTool == contract.required_tool (the verb).
 const conciergePlatformMCPServerName = "molecule-platform"
-const conciergePlatformMCPRequiredTool = "create_workspace"
+const conciergePlatformMCPRequiredTool = "provision_workspace"
 
-// conciergePlatformMCPCreateWorkspaceTool is composed from the two contract-pinned
-// constants above via the canonical mcp__<server>__<tool> formula.
-const conciergePlatformMCPCreateWorkspaceTool = "mcp__" + conciergePlatformMCPServerName + "__" + conciergePlatformMCPRequiredTool
+// conciergePlatformMCPProvisionWorkspaceTool is composed from the two contract-
+// pinned constants above via the canonical mcp__<server>__<tool> formula. It
+// resolves to mcp__molecule-platform__provision_workspace — the real lifecycle
+// verb the management-mode concierge exposes.
+const conciergePlatformMCPProvisionWorkspaceTool = "mcp__" + conciergePlatformMCPServerName + "__" + conciergePlatformMCPRequiredTool
 
 // ensureConciergeProvider pins the concierge's LLM provider to `platform` (core
 // companion to ensureConciergeModel). It guarantees the env-level provider pin

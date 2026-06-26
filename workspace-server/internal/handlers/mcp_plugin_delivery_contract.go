@@ -28,18 +28,23 @@ type MCPPluginDeliveryContract struct {
 	// key the runtime registers the server under, which Claude Code turns into
 	// the tool-id prefix `mcp__<MCPServerName>__<tool>`. The platform-agent
 	// template's mcp_servers.yaml and the online/degraded gate's expected tool id
-	// (conciergePlatformMCPCreateWorkspaceTool) both derive from this value — see
+	// (conciergePlatformMCPProvisionWorkspaceTool) both derive from this value — see
 	// TestSSOT_DegradeGateToolDerivesFromContract.
 	MCPServerName string `json:"mcp_server_name"`
 
-	// RequiredTool is the SSOT for the management MCP's REQUIRED tool VERB (e.g.
-	// "create_workspace"). Combined with MCPServerName it yields the full
+	// RequiredTool is the SSOT for the management MCP's REQUIRED tool VERB. The
+	// concierge runs the platform MCP in MOLECULE_MCP_MODE=management, where the
+	// lifecycle verb is "provision_workspace" (createServer() returns early in
+	// management mode and never registers the workspace-mode create_workspace
+	// tool — confirmed across @molecule-ai/mcp-server 1.1.1 → 1.6.1 and on the
+	// live 1.6.1 concierge). Combined with MCPServerName it yields the full
 	// dispatcher id the online/degraded gate looks for:
 	// `mcp__<MCPServerName>__<RequiredTool>`. Pinning the verb here (not as a
 	// hardcoded literal in the gate const or the test) closes the SSOT gap the
 	// 2026-06-25 audit flagged: previously only the `mcp__<server>__` prefix was
-	// contract-derived while `create_workspace` was re-spelled in both the Go
-	// const and the test. See TestSSOT_DegradeGateToolDerivesFromContract.
+	// contract-derived while the verb was re-spelled in both the Go const and the
+	// test — AND the verb was wrong (create_workspace is a workspace-mode tool the
+	// concierge never exposes). See TestSSOT_DegradeGateToolDerivesFromContract.
 	RequiredTool string `json:"required_tool"`
 
 	// LoadedMCPToolsField is the SSOT for the register/heartbeat status-field NAME
@@ -120,7 +125,7 @@ func (c *MCPPluginDeliveryContract) MatchesSSOT() []string {
 	eq("producer", c.Producer, "MCPServerAdaptor")
 	eq("consumer", c.Consumer, "claude_sdk_executor._load_settings_mcp")
 	eq("mcp_server_name", c.MCPServerName, "molecule-platform")
-	eq("required_tool", c.RequiredTool, "create_workspace")
+	eq("required_tool", c.RequiredTool, "provision_workspace")
 	eq("loaded_mcp_tools_field", c.LoadedMCPToolsField, "loaded_mcp_tools")
 
 	// PORT symbols (#3159). These pin the wiring seam: if the adaptor regresses

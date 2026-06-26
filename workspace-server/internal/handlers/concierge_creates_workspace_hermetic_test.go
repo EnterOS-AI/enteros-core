@@ -18,7 +18,7 @@ import (
 // the same three deterministic claims without any live staging dependency:
 //
 //  1. The concierge heartbeat's loaded_mcp_tools field contains the exact
-//     management tool id mcp__molecule-platform__create_workspace.
+//     management tool id mcp__molecule-platform__provision_workspace.
 //  2. When that tool is reported, the concierge stays status=online (the
 //     core#3082 gate is satisfied, not degraded).
 //  3. The workspace create handler actually creates a workspace row — the real
@@ -67,7 +67,7 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 
-		body := `{"workspace_id":"ws-concierge-ok","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["a2a","` + conciergePlatformMCPCreateWorkspaceTool + `"]}`
+		body := `{"workspace_id":"ws-concierge-ok","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["a2a","` + conciergePlatformMCPProvisionWorkspaceTool + `"]}`
 		c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
 		c.Request.Header.Set("Content-Type", "application/json")
 
@@ -229,7 +229,7 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 					"http://localhost:8001", nil, 0, 1, 0.0, "", 60, "", "claude-code",
 					"", 0.0, 0.0, false,
 					nil, 0, false, true, []byte(`{}`), "workspace",
-					[]byte(`["a2a","`+conciergePlatformMCPCreateWorkspaceTool+`"]`)))
+					[]byte(`["a2a","`+conciergePlatformMCPProvisionWorkspaceTool+`"]`)))
 
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
@@ -250,8 +250,8 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 		if !ok || len(loaded) != 2 {
 			t.Errorf("expected loaded_mcp_tools to be a 2-element array, got %v", resp["loaded_mcp_tools"])
 		}
-		if ok && (loaded[0] != "a2a" || loaded[1] != conciergePlatformMCPCreateWorkspaceTool) {
-			t.Errorf("expected loaded_mcp_tools [a2a %s], got %v", conciergePlatformMCPCreateWorkspaceTool, loaded)
+		if ok && (loaded[0] != "a2a" || loaded[1] != conciergePlatformMCPProvisionWorkspaceTool) {
+			t.Errorf("expected loaded_mcp_tools [a2a %s], got %v", conciergePlatformMCPProvisionWorkspaceTool, loaded)
 		}
 
 		if err := mock.ExpectationsWereMet(); err != nil {

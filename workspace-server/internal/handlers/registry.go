@@ -118,7 +118,7 @@ type QueueDrainFunc func(ctx context.Context, workspaceID string, capacity int)
 // the agent's live MCP on a real turn) reliably publishes them. The #3082
 // gate then degrades the idle concierge ~90s later. Sending one warmup turn
 // fires that capture so the next heartbeat carries loaded_mcp_tools (incl.
-// mcp__molecule-platform__create_workspace) and the concierge HOLDS online
+// mcp__molecule-platform__provision_workspace) and the concierge HOLDS online
 // without any user message.
 //
 // Returns the HTTP status, the (ignored) response body, and an error. The
@@ -659,13 +659,13 @@ func (h *RegistryHandler) platformAgentMCPServerPresent(present *bool) bool {
 //     workspace_declared_plugins (the install NAME conciergePlatformMCPName),
 //     AND
 //   - the reported loaded tool list does NOT contain the literal required
-//     tool identifier (conciergePlatformMCPCreateWorkspaceTool).
+//     tool identifier (conciergePlatformMCPProvisionWorkspaceTool).
 //
 // Why this checks the TOOL identifier and not the plugin name: the heartbeat's
 // loaded_mcp_tools carries namespaced tool ids (`mcp__<server>__<tool>`), not
 // plugin names. The management MCP's server is "molecule-platform" (the
-// PluginNameFromSource derivation), so its create_workspace tool is
-// "mcp__molecule-platform__create_workspace" — a different value from the
+// PluginNameFromSource derivation), so its provision_workspace tool is
+// "mcp__molecule-platform__provision_workspace" — a different value from the
 // plugin name "molecule-ai-plugin-molecule-platform-mcp". Comparing the
 // plugin NAME against TOOL ids was a no-op false-green (CR2 #12653).
 //
@@ -692,7 +692,7 @@ func (h *RegistryHandler) platformAgentManagementMCPLoaded(ctx context.Context, 
 	}
 
 	for _, t := range loaded {
-		if t == conciergePlatformMCPCreateWorkspaceTool {
+		if t == conciergePlatformMCPProvisionWorkspaceTool {
 			return false, nil
 		}
 	}
@@ -1649,7 +1649,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		//
 		// The gate has two fail-loud conditions:
 		//   - loaded_mcp_tools present but missing the required tool
-		//     (mcp__molecule-platform__create_workspace).
+		//     (mcp__molecule-platform__provision_workspace).
 		//   - loaded_mcp_tools ABSENT (runtime says server is up but won't
 		//     report the tools list).
 		//
@@ -1721,7 +1721,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				} else {
 					msg := "platform agent management MCP declared but not loaded; marking degraded (core#3082)"
 					if absentToolsList {
-						msg = "platform agent runtime did not report loaded_mcp_tools on a mcp_server_present=true heartbeat; cannot verify create_workspace tool is loaded — marking degraded (core#3082)"
+						msg = "platform agent runtime did not report loaded_mcp_tools on a mcp_server_present=true heartbeat; cannot verify provision_workspace tool is loaded — marking degraded (core#3082)"
 					}
 					log.Printf("Heartbeat: %s (workspace=%s, unloaded for %s)", msg, payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second))
 					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
