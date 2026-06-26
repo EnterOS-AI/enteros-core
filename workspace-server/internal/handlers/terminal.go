@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -315,16 +316,83 @@ var sshCommandCmd = func(o eicSSHOptions) *exec.Cmd {
 	)
 }
 
-// sendSSHPublicKey pushes an ephemeral public key to the EIC service so
-// the workspace's sshd accepts the paired private key for the next 60s.
-// Exposed as a var so tests can stub the AWS call.
-var sendSSHPublicKey = func(ctx context.Context, region, instanceID, osUser, pubKey string) error {
-	cmd := exec.CommandContext(ctx, "aws", "ec2-instance-connect", "send-ssh-public-key",
+// eicInstanceState holds the EC2 fields needed before pushing an EIC key.
+type eicInstanceState struct {
+	State string
+	AZ    string
+}
+
+// describeEC2InstanceForEIC queries EC2 DescribeInstances for the instance
+// state and availability zone. The AZ is required by send-ssh-public-key in
+// some partitions to avoid exit 252 Parameter-validation, and the running
+// check prevents pushing keys to a stopped/pending instance. Exposed as a var
+// so tests can stub the AWS CLI call.
+var describeEC2InstanceForEIC = func(ctx context.Context, region, instanceID string) (eicInstanceState, error) {
+	out, err := eicExecCommandContext(ctx, "aws", "ec2", "describe-instances",
 		"--region", region,
+		"--instance-ids", instanceID,
+		"--output", "json",
+	).CombinedOutput()
+	if err != nil {
+		return eicInstanceState{}, fmt.Errorf("describe-instances: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return parseDescribeInstancesOutput(out)
+}
+
+func parseDescribeInstancesOutput(out []byte) (eicInstanceState, error) {
+	var resp struct {
+		Reservations []struct {
+			Instances []struct {
+				State struct {
+					Name string `json:"Name"`
+				} `json:"State"`
+				Placement struct {
+					AvailabilityZone string `json:"AvailabilityZone"`
+				} `json:"Placement"`
+			} `json:"Instances"`
+		} `json:"Reservations"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return eicInstanceState{}, fmt.Errorf("parse describe-instances output: %w", err)
+	}
+	if len(resp.Reservations) == 0 || len(resp.Reservations[0].Instances) == 0 {
+		return eicInstanceState{}, fmt.Errorf("instance not found")
+	}
+	inst := resp.Reservations[0].Instances[0]
+	return eicInstanceState{State: inst.State.Name, AZ: inst.Placement.AvailabilityZone}, nil
+}
+
+// eicExecCommandContext is the exec.CommandContext used by EIC helpers.
+// Exposed as a var so tests can capture the CLI argv without running AWS.
+var eicExecCommandContext = exec.CommandContext
+
+// sendSSHPublicKeyImpl gates the EIC key push on the EC2 instance being
+// running and resolves its availability zone before calling
+// `aws ec2-instance-connect send-ssh-public-key`. This avoids the live
+// exit 252 Parameter-validation failure when AZ is missing and prevents
+// retries against a stopped instance. Exposed as a var so tests can stub.
+var sendSSHPublicKey = sendSSHPublicKeyImpl
+
+func sendSSHPublicKeyImpl(ctx context.Context, region, instanceID, osUser, pubKey string) error {
+	info, err := describeEC2InstanceForEIC(ctx, region, instanceID)
+	if err != nil {
+		return fmt.Errorf("send-ssh-public-key: cannot verify instance: %w", err)
+	}
+	if info.State != "running" {
+		return fmt.Errorf("send-ssh-public-key: instance %s is %s (expected running)", instanceID, info.State)
+	}
+
+	args := []string{
+		"--region", region,
+		"ec2-instance-connect", "send-ssh-public-key",
 		"--instance-id", instanceID,
 		"--instance-os-user", osUser,
-		"--ssh-public-key", pubKey)
-	out, err := cmd.CombinedOutput()
+		"--ssh-public-key", pubKey,
+	}
+	if info.AZ != "" {
+		args = append(args, "--availability-zone", info.AZ)
+	}
+	out, err := eicExecCommandContext(ctx, "aws", args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("send-ssh-public-key: %w (%s)", err, strings.TrimSpace(string(out)))
 	}

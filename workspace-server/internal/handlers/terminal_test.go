@@ -1,8 +1,11 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -558,5 +561,72 @@ func TestSSHCommandCmd_ConnectTimeoutPresent(t *testing.T) {
 			"timeout with no error message reaching the user. See terminal.go "+
 			"sshCommandCmd comment (2026-04-30 hongmingwang hermes). args=%v",
 			args)
+	}
+}
+
+// TestParseDescribeInstancesOutput_RunningAndAZ verifies the AWS CLI JSON
+// parser extracts state and availability zone.
+func TestParseDescribeInstancesOutput_RunningAndAZ(t *testing.T) {
+	out := []byte(`{"Reservations":[{"Instances":[{"State":{"Name":"running"},"Placement":{"AvailabilityZone":"us-east-2c"}}]}]}`)
+	info, err := parseDescribeInstancesOutput(out)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if info.State != "running" {
+		t.Errorf("state=%q, want running", info.State)
+	}
+	if info.AZ != "us-east-2c" {
+		t.Errorf("az=%q, want us-east-2c", info.AZ)
+	}
+}
+
+// TestParseDescribeInstancesOutput_NoInstance errors when the instance is
+// absent from the describe-instances response.
+func TestParseDescribeInstancesOutput_NoInstance(t *testing.T) {
+	out := []byte(`{"Reservations":[]}`)
+	_, err := parseDescribeInstancesOutput(out)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected instance-not-found error, got %v", err)
+	}
+}
+
+// TestSendSSHPublicKeyImpl_GatesNotRunning verifies the EIC key push is
+// rejected before invoking AWS when the instance is not running.
+func TestSendSSHPublicKeyImpl_GatesNotRunning(t *testing.T) {
+	prev := describeEC2InstanceForEIC
+	describeEC2InstanceForEIC = func(ctx context.Context, region, instanceID string) (eicInstanceState, error) {
+		return eicInstanceState{State: "stopped", AZ: "us-east-2a"}, nil
+	}
+	defer func() { describeEC2InstanceForEIC = prev }()
+
+	err := sendSSHPublicKeyImpl(context.Background(), "us-east-2", "i-123", "ubuntu", "pk")
+	if err == nil || !strings.Contains(err.Error(), "expected running") {
+		t.Fatalf("expected not-running error, got %v", err)
+	}
+}
+
+// TestSendSSHPublicKeyImpl_PassesAZ verifies the resolved AZ is forwarded as
+// --availability-zone on the send-ssh-public-key command.
+func TestSendSSHPublicKeyImpl_PassesAZ(t *testing.T) {
+	prevDescribe := describeEC2InstanceForEIC
+	describeEC2InstanceForEIC = func(ctx context.Context, region, instanceID string) (eicInstanceState, error) {
+		return eicInstanceState{State: "running", AZ: "us-east-2b"}, nil
+	}
+	defer func() { describeEC2InstanceForEIC = prevDescribe }()
+
+	prevExec := eicExecCommandContext
+	captured := []string{}
+	eicExecCommandContext = func(ctx context.Context, name string, arg ...string) *exec.Cmd {
+		captured = append([]string{name}, arg...)
+		return exec.CommandContext(ctx, "true")
+	}
+	defer func() { eicExecCommandContext = prevExec }()
+
+	if err := sendSSHPublicKeyImpl(context.Background(), "us-east-2", "i-123", "ubuntu", "pk"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := strings.Join(captured, " ")
+	if !strings.Contains(got, "--availability-zone us-east-2b") {
+		t.Errorf("send-ssh-public-key args missing AZ; got %q", got)
 	}
 }
