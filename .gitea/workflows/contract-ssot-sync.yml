@@ -1,0 +1,72 @@
+name: contract-ssot-sync
+
+# SSOT sync gate for the MCP-plugin delivery contract (RFC core#3285 §10).
+#
+# molecule-contracts is the PUBLIC SSOT for the cross-repo tool contract
+# (RFC §10: "Contract-repo visibility -- DECIDED: Public"; molecule-contracts#1
+# merged it). Core keeps a local MIRROR at
+# contracts/mcp-plugin-delivery.contract.json -- the producer-side copy the
+# degrade gate derives conciergePlatformMCPRequiredTool from, asserted by
+# TestSSOT_DegradeGateToolDerivesFromContract. This gate chains the mirror to
+# the SSOT: it fetches molecule-contracts' canonical copy over the PUBLIC raw
+# endpoint (no token) and verifies core's mirror is the SAME CONTRACT.
+#
+# RELATIONSHIP TO mcp-plugin-delivery-contract-drift.yml (RFC §7, "one check per
+# invariant"): that gate enforces a DIFFERENT invariant over a DIFFERENT
+# participant set and trust model -- core <-> the PRIVATE template + runtime
+# repos, fetched with an authenticated cross-repo token (AUTO_SYNC_TOKEN). This
+# gate enforces core <-> the PUBLIC molecule-contracts SSOT, unauthenticated.
+# The two reds on disjoint defect sets (a template/runtime drift vs an SSOT
+# drift) and therefore do NOT collapse into one job (RFC §7: collapse only
+# same-defect-same-layer checks; keep cross-boundary coverage). This is the
+# transitional "vendored copy + sync-check" form (RFC §10, "one source, never
+# two copies") and the migration step-3 "prove they agree through a soak".
+#
+# ENFORCEMENT GATING: standalone workflow, ADVISORY-FIRST -- NOT a job in ci.yml
+# and NOT in branch protection (RFC §13/§14.2 advisory -> soak -> required;
+# mirrors mcp-plugin-delivery-contract-drift.yml and sync-providers-yaml.yml).
+# The BP-required promotion is a separate post-soak step (needs repo-admin).
+#
+# AUTH: NONE. molecule-contracts is public, so the canonical contract is
+# readable over the raw endpoint without a token; the gate runs on EVERY context
+# (incl. fork PRs) and is FAIL-CLOSED on a fetch error (non-200 / network) and
+# on canonical drift.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'contracts/mcp-plugin-delivery.contract.json'
+      - '.gitea/scripts/check-contract-ssot-sync.sh'
+      - '.gitea/workflows/contract-ssot-sync.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'contracts/mcp-plugin-delivery.contract.json'
+      - '.gitea/scripts/check-contract-ssot-sync.sh'
+      - '.gitea/workflows/contract-ssot-sync.yml'
+  schedule:
+    # Daily at :39 -- catch a molecule-contracts SSOT change that landed without
+    # a paired core mirror re-sync PR (off-zero to spread cron load).
+    - cron: '39 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contract-ssot-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # bp-required: pending #3285 -- advisory-first; standalone SSOT-sync gate,
+  # not in branch protection yet (promote after a green soak; needs repo-admin).
+  ssot-sync:
+    name: Verify core's contract mirror matches the molecule-contracts SSOT
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify mirror == molecule-contracts SSOT (unauthenticated, fail-closed)
+        run: bash .gitea/scripts/check-contract-ssot-sync.sh
