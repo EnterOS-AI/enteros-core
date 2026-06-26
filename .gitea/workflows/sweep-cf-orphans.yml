@@ -83,8 +83,9 @@ jobs:
     env:
       # CF_API_TOKEN / CF_ZONE_ID now arrive via $GITHUB_ENV from the "Fetch
       # CF_API_TOKEN + CF_ZONE_ID from Infisical SSOT" step below (wave-B
-      # aliases migration). They come from prod /shared/cloudflare-admin
-      # (CLOUDFLARE_API_TOKEN_ADMIN = zone:dns:edit token, CLOUDFLARE_ZONE_ID = the
+      # aliases migration). CF_API_TOKEN comes from prod /shared/cloudflare-admin
+      # (CLOUDFLARE_API_TOKEN_ADMIN = zone:dns:edit token); CF_ZONE_ID comes from
+      # prod /shared/cloudflare-tunnel-admin (CLOUDFLARE_ZONE_ID = the
       # moleculesai.app apex zone). The old CF_API_TOKEN/CLOUDFLARE_API_TOKEN +
       # CF_ZONE_ID/CLOUDFLARE_ZONE_ID Gitea Actions secrets are left in place
       # until a green run validates this path (validate-before-delete). The
@@ -144,9 +145,11 @@ jobs:
           echo "CP_ADMIN_API_TOKEN loaded from Infisical (len=${#CP_ADMIN_API_TOKEN})"
 
       # KMS wave-B (Gitea-Actions-secrets -> Infisical SSOT): source the
-      # zone-scoped Cloudflare DNS token + the moleculesai.app apex zone id from
-      # Infisical (prod /shared/cloudflare-admin) via the CI machine
-      # identity instead of the duplicated CF_API_TOKEN/CLOUDFLARE_API_TOKEN and
+      # zone-scoped Cloudflare DNS token (prod /shared/cloudflare-admin,
+      # CLOUDFLARE_API_TOKEN_ADMIN) + the moleculesai.app apex zone id (prod
+      # /shared/cloudflare-tunnel-admin, CLOUDFLARE_ZONE_ID) from Infisical via
+      # the CI machine identity instead of the duplicated
+      # CF_API_TOKEN/CLOUDFLARE_API_TOKEN and
       # CF_ZONE_ID/CLOUDFLARE_ZONE_ID Gitea Actions secrets. Exported to
       # $GITHUB_ENV under the same CF_API_TOKEN / CF_ZONE_ID names the verify +
       # sweep steps already read, so nothing downstream changes. The script's
@@ -184,10 +187,10 @@ jobs:
             echo "::error::Infisical returned empty CLOUDFLARE_API_TOKEN_ADMIN at prod /shared/cloudflare-admin — failing closed."
             exit 1
           fi
-          CF_ZONE_ID=$(read_secret CLOUDFLARE_ZONE_ID %2Fshared%2Fcloudflare-admin)
+          CF_ZONE_ID=$(read_secret CLOUDFLARE_ZONE_ID %2Fshared%2Fcloudflare-tunnel-admin)
           echo "::add-mask::$CF_ZONE_ID"
           if [ -z "$CF_ZONE_ID" ]; then
-            echo "::error::Infisical returned empty CLOUDFLARE_ZONE_ID at prod /shared/cloudflare-admin — failing closed."
+            echo "::error::Infisical returned empty CLOUDFLARE_ZONE_ID at prod /shared/cloudflare-tunnel-admin — failing closed."
             exit 1
           fi
           {
