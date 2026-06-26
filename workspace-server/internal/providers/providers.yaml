@@ -997,10 +997,28 @@ runtimes:
       # routes these via that surface (provider_config.py platform provider,
       # auth_mode=openai_compat_responses, wire_api=responses). Default
       # mirrors the deploy's MOLECULE_LLM_DEFAULT_MODEL (openai/gpt-5.4-mini).
+      #
+      # task #83 (CTO 2026-06-24): MiniMax is the PLATFORM-MANAGED default for
+      # ALL runtimes (cheaper, token-plan prepaid; BYOK optional), so the
+      # concierge default `minimax/MiniMax-M2.7` must derive to the closed
+      # `platform` provider (IsPlatform=true → platform_managed billing,
+      # required_env=[]) for codex too — NOT byok-minimax (which needs a tenant
+      # key). These EXACT `minimax/...` ids are listed here so DeriveProvider's
+      # exact-id step (authoritative, beats prefix) picks `platform` even though
+      # byok-minimax's `(?i)^(minimax[:/]|codex-minimax-)` prefix also matches
+      # them — exactly how claude-code's platform arm carries them. They route
+      # via the proxy's MiniMax upstream (ResolveUpstream maps `minimax/` →
+      # the `minimax` catalog entry's api.minimax.io). The BYOK
+      # `codex-minimax-m2.7` token-plan id stays on byok-minimax below (its
+      # `codex-minimax-` leg), so the platform default and the BYOK opt-in
+      # coexist without overlap.
       - name: platform
         models:
           - openai/gpt-5.4
           - openai/gpt-5.4-mini
+          - minimax/MiniMax-M2.7
+          - minimax/MiniMax-M2.7-highspeed
+          - minimax/MiniMax-M3
       # NAME-ONLY BYOK arm (cp#529): the codex template offers a BYOK MiniMax
       # token-plan model `codex-minimax-m2.7` (its `minimax-token-plan` provider:
       # base_url api.minimax.io, tenant MINIMAX_API_KEY, model_id_override
@@ -1023,10 +1041,27 @@ runtimes:
       # Platform-managed Kimi. Note the slash form (moonshot/...) here vs the
       # BYOK colon form (moonshot:...) above — openclaw's adapter uses colon
       # ids natively; the platform path normalizes to the proxy's slash form.
+      #
+      # task #83 (CTO 2026-06-24): MiniMax is the PLATFORM-MANAGED default for
+      # ALL runtimes (cheaper, token-plan prepaid; BYOK optional). openclaw's
+      # default model is MiniMax, so its concierge default `minimax/MiniMax-M2.7`
+      # must derive to the closed `platform` provider (IsPlatform=true →
+      # platform_managed billing, required_env=[]) — NOT byok-minimax (which
+      # needs a tenant key). These EXACT `minimax/...` ids (slash form, the
+      # proxy's platform spelling) are listed here so DeriveProvider's exact-id
+      # step (authoritative, beats prefix) picks `platform` even though
+      # byok-minimax's `(?i)^(minimax[:/]|codex-minimax-)` prefix also matches
+      # them. They route via the proxy's MiniMax upstream (ResolveUpstream maps
+      # `minimax/` → the `minimax` catalog entry's api.minimax.io). The BYOK
+      # colon form `minimax:MiniMax-M2.7` stays on byok-minimax below, so the
+      # platform default and the BYOK opt-in coexist without overlap.
       - name: platform
         models:
           - moonshot/kimi-k2.6
           - moonshot/kimi-k2.5
+          - minimax/MiniMax-M2.7
+          - minimax/MiniMax-M2.7-highspeed
+          - minimax/MiniMax-M3
       # NAME-ONLY BYOK arms (cp#529): zero model ids → no platform-menu change,
       # but wire openclaw's CONFIRMED-NON-PLATFORM passthroughs into its NATIVE
       # prefix-routing set so the BYOK colon/slash ids the openclaw template

@@ -135,17 +135,27 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
 		},
 		// codex: openai BYOK + platform-managed openai (served via the proxy
-		// Responses surface; codex CLI 0.130+ is Responses-API-only).
+		// Responses surface; codex CLI 0.130+ is Responses-API-only) +
+		// platform-managed MiniMax (task #83, CTO 2026-06-24): MiniMax is the
+		// platform-managed default for ALL runtimes, so the codex platform arm
+		// now also carries the slash-form `minimax/...` platform ids.
 		"codex": {
 			"gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 			"gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2",
 			"openai/gpt-5.4", "openai/gpt-5.4-mini",
+			// minimax via platform proxy (task #83 platform default)
+			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 		},
 		// openclaw: kimi BYOK (moonshot: prefix -> KIMI_API_KEY ->
-		// api.kimi.com/coding gateway) + platform-managed kimi (moonshot/).
+		// api.kimi.com/coding gateway) + platform-managed kimi (moonshot/) +
+		// platform-managed MiniMax (task #83, CTO 2026-06-24): openclaw's
+		// platform arm now also carries the slash-form `minimax/...` platform
+		// ids (the platform default), distinct from its BYOK colon-form below.
 		"openclaw": {
 			"moonshot:kimi-k2.6", "moonshot:kimi-k2.5",
 			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
+			// minimax via platform proxy (task #83 platform default)
+			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 		},
 	}
 
