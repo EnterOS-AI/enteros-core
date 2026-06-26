@@ -83,8 +83,8 @@ jobs:
     env:
       # CF_API_TOKEN / CF_ZONE_ID now arrive via $GITHUB_ENV from the "Fetch
       # CF_API_TOKEN + CF_ZONE_ID from Infisical SSOT" step below (wave-B
-      # aliases migration). They come from prod /shared/cloudflare-tunnel-admin
-      # (CLOUDFLARE_API_TOKEN = zone:dns:edit token, CLOUDFLARE_ZONE_ID = the
+      # aliases migration). They come from prod /shared/cloudflare-admin
+      # (CLOUDFLARE_API_TOKEN_ADMIN = zone:dns:edit token, CLOUDFLARE_ZONE_ID = the
       # moleculesai.app apex zone). The old CF_API_TOKEN/CLOUDFLARE_API_TOKEN +
       # CF_ZONE_ID/CLOUDFLARE_ZONE_ID Gitea Actions secrets are left in place
       # until a green run validates this path (validate-before-delete). The
@@ -145,7 +145,7 @@ jobs:
 
       # KMS wave-B (Gitea-Actions-secrets -> Infisical SSOT): source the
       # zone-scoped Cloudflare DNS token + the moleculesai.app apex zone id from
-      # Infisical (prod /shared/cloudflare-tunnel-admin) via the CI machine
+      # Infisical (prod /shared/cloudflare-admin) via the CI machine
       # identity instead of the duplicated CF_API_TOKEN/CLOUDFLARE_API_TOKEN and
       # CF_ZONE_ID/CLOUDFLARE_ZONE_ID Gitea Actions secrets. Exported to
       # $GITHUB_ENV under the same CF_API_TOKEN / CF_ZONE_ID names the verify +

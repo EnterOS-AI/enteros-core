@@ -78,8 +78,8 @@ jobs:
     env:
       # CF_API_TOKEN / CF_ACCOUNT_ID now arrive via $GITHUB_ENV from the "Fetch
       # CF_API_TOKEN + CF_ACCOUNT_ID from Infisical SSOT" step below (wave-B
-      # aliases migration). They come from prod /shared/cloudflare-admin
-      # (CLOUDFLARE_API_TOKEN_ADMIN = the account:cloudflare_tunnel:edit-scoped
+      # aliases migration). They come from prod /shared/cloudflare-tunnel-admin
+      # (CLOUDFLARE_API_TOKEN = the account:cloudflare_tunnel:edit-scoped
       # token this account-level sweep requires, CLOUDFLARE_ACCOUNT_ID = the
       # account that owns the tunnels). The old CF_API_TOKEN/CLOUDFLARE_API_TOKEN
       # + CF_ACCOUNT_ID/CLOUDFLARE_ACCOUNT_ID Gitea Actions secrets are left in
@@ -140,11 +140,11 @@ jobs:
 
       # KMS wave-B (Gitea-Actions-secrets -> Infisical SSOT): source the
       # account-scoped Cloudflare tunnel token + the owning account id from
-      # Infisical (prod /shared/cloudflare-admin) via the CI machine identity
-      # instead of the duplicated CF_API_TOKEN/CLOUDFLARE_API_TOKEN and
+      # Infisical (prod /shared/cloudflare-tunnel-admin) via the CI machine
+      # identity instead of the duplicated CF_API_TOKEN/CLOUDFLARE_API_TOKEN and
       # CF_ACCOUNT_ID/CLOUDFLARE_ACCOUNT_ID Gitea Actions secrets. This sweep
       # hits /accounts/<id>/cfd_tunnel, so it needs the account-scoped
-      # CLOUDFLARE_API_TOKEN_ADMIN (account:cloudflare_tunnel:edit), NOT the
+      # CLOUDFLARE_API_TOKEN (account:cloudflare_tunnel:edit), NOT the
       # zone-scoped DNS token the orphans sweep uses. Exported to $GITHUB_ENV
       # under the same CF_API_TOKEN / CF_ACCOUNT_ID names the verify + sweep
       # steps already read, so nothing downstream changes.
