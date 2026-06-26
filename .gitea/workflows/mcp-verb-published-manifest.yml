@@ -166,9 +166,6 @@ jobs:
 
       - name: Resolve published mcp-server manifest and assert against the contract
         env:
-          # read:package token, sourced from the Infisical SSOT in the step above
-          # (NOT a Gitea Actions secret) and exported to $GITHUB_ENV.
-          MCP_SERVER_READPKG_TOKEN: ${{ env.MCP_SERVER_READPKG_TOKEN }}
           REGISTRY_HOST: ${{ github.server_url }}
           # Override to pin a specific published version (e.g. the version core
           # would deliver). Defaults to the registry's `latest` dist-tag.
