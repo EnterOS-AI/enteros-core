@@ -150,15 +150,59 @@ jobs:
           RESERVED_PATHS_FILE: .gitea/reserved-paths.txt
         run: bash .gitea/scripts/reserved-path-review.sh
 
+      # KMS consolidation (#971/#3274 pattern): the explicit status POST
+      # below previously read the per-bot Gitea Actions secret
+      # `STATUS_POST_TOKEN`. We now fetch the consolidated CI_STATUS_TOKEN
+      # from the Infisical SSOT (prod /shared/ci-status) via the CI machine
+      # identity and export it to $GITHUB_ENV. The POST step keeps reading it
+      # under the GITEA_TOKEN env var name it already expects, so the script
+      # is unchanged. The old STATUS_POST_TOKEN Gitea secret is left in place
+      # until a green run validates this path (validate-before-delete).
+      #
+      # Trust boundary: this job runs on pull_request_target with a BASE-ref
+      # checkout (security model above), so it is the trusted base context and
+      # the INFISICAL_CI_* machine-identity secrets are available (same
+      # boundary that already gated the direct STATUS_POST_TOKEN consumption).
+      - name: Fetch CI_STATUS_TOKEN from Infisical SSOT
+        if: github.event_name == 'pull_request_review' && always()
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
+          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
+          }
+          CI_STATUS_TOKEN=$(read_secret CI_STATUS_TOKEN %2Fshared%2Fci-status)
+          echo "::add-mask::$CI_STATUS_TOKEN"
+          if [ -z "$CI_STATUS_TOKEN" ]; then
+            echo "::error::Infisical returned empty CI_STATUS_TOKEN at prod /shared/ci-status — failing closed."
+            exit 1
+          fi
+          echo "CI_STATUS_TOKEN=$CI_STATUS_TOKEN" >> "$GITHUB_ENV"
+          echo "CI_STATUS_TOKEN loaded from Infisical (len=${#CI_STATUS_TOKEN})"
+
       - name: Post required status context on pull_request_review
         # Gitea Actions auto-publishes (pull_request_review) context for this
         # event, but branch-protection requires (pull_request_target). We
         # explicitly POST the BP-required context so the gate flips on a review
         # without waiting for the next push. Trust boundary preserved: same
         # BASE-ref script result, no PR-head code.
+        #
+        # KMS consolidation: GITEA_TOKEN now arrives via $GITHUB_ENV as
+        # CI_STATUS_TOKEN from the fetch step above (was secrets.STATUS_POST_TOKEN).
         if: github.event_name == 'pull_request_review' && always()
         env:
-          GITEA_TOKEN: ${{ secrets.STATUS_POST_TOKEN }}
+          GITEA_TOKEN: ${{ env.CI_STATUS_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
