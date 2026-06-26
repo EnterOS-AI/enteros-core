@@ -468,23 +468,39 @@ type errProbeT string
 
 func (e errProbeT) Error() string { return string(e) }
 
+// setConciergeModelResolver stubs conciergeModelResolver for a single test.
+// Callers that expect a seed can return a model; callers that expect fail-closed
+// can return an error.
+func setConciergeModelResolver(t *testing.T, model string, err error) {
+	t.Helper()
+	old := conciergeModelResolver
+	conciergeModelResolver = func(context.Context) (string, error) { return model, err }
+	t.Cleanup(func() { conciergeModelResolver = old })
+}
+
 // TestConciergeRuntimeGeneralization_Defaults is the PROVE-FAIL gate for the P3b
 // model + template + runtime defaults (items 1, 2, 3).
 func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
-	t.Run("the platform-managed default model is minimax/MiniMax-M2.7 (CTO P3b)", func(t *testing.T) {
+	t.Run("the reference platform-managed default model is minimax/MiniMax-M2.7 (CTO P3b)", func(t *testing.T) {
 		if conciergeDeclaredModel != "minimax/MiniMax-M2.7" {
-			t.Fatalf("conciergeDeclaredModel = %q, want %q — the P3b CTO decision pins the platform-managed concierge default to MiniMax (cheaper, proxy Anthropic-compat arm)", conciergeDeclaredModel, "minimax/MiniMax-M2.7")
+			t.Fatalf("conciergeDeclaredModel = %q, want %q — the P3b CTO decision pins the platform-managed concierge reference model to MiniMax", conciergeDeclaredModel, "minimax/MiniMax-M2.7")
 		}
-		// PR-6 (concierge-follows): conciergeModelForRuntime RESOLVES the seed from
-		// MOLECULE_LLM_DEFAULT_MODEL, with the const as fallback. Clear the env so
-		// this asserts the COMPILED-IN fallback path (the const) — the prod KMS
-		// value equals this const, so the fallback is the no-regression baseline.
-		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
-		// And it is the per-runtime fallback for every concierge runtime.
-		for _, rt := range []string{"claude-code", "codex", "openclaw", ""} {
-			if got := conciergeModelForRuntime(rt); got != "minimax/MiniMax-M2.7" {
-				t.Errorf("conciergeModelForRuntime(%q) = %q, want minimax/MiniMax-M2.7 (env-unset fallback)", rt, got)
-			}
+	})
+
+	t.Run("model resolution fails closed when the authoritative source is unavailable", func(t *testing.T) {
+		setConciergeModelResolver(t, "", fmt.Errorf("cp unreachable"))
+		mock := setupTestDB(t)
+		mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
+			WithArgs("ws-resolver-fail").
+			WillReturnError(sql.ErrNoRows)
+		env := map[string]string{}
+		h := &WorkspaceHandler{}
+		h.ensureConciergeModel(context.Background(), "ws-resolver-fail", defaultConciergeRuntime, env)
+		if _, seeded := env["MODEL"]; seeded {
+			t.Errorf("resolver failure seeded MODEL=%q — must fail closed", env["MODEL"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
 		}
 	})
 
@@ -538,9 +554,9 @@ func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
 
 	t.Run("conciergeTemplateForRuntime maps per-runtime", func(t *testing.T) {
 		cases := map[string]string{
-			"":            "platform-agent",        // empty → default
-			"claude-code": "platform-agent",        // claude-code keeps the historical name
-			"codex":       "codex-platform-agent",  // others use <runtime>-platform-agent
+			"":            "platform-agent",       // empty → default
+			"claude-code": "platform-agent",       // claude-code keeps the historical name
+			"codex":       "codex-platform-agent", // others use <runtime>-platform-agent
 			"openclaw":    "openclaw-platform-agent",
 		}
 		for rt, want := range cases {
@@ -879,6 +895,11 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 			WithArgs("ws-fresh", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		env := map[string]string{}
+		// Stub the authoritative resolver so this test is hermetic regardless of
+		// whether the process env looks like SaaS (MOLECULE_ORG_ID + ADMIN_TOKEN)
+		// or self-hosted. The resolver returning the declared model exercises the
+		// successful-seed path end-to-end.
+		setConciergeModelResolver(t, conciergeDeclaredModel, nil)
 		h.applyConciergeProvisionConfig(context.Background(), "ws-fresh", "", nil, env, "Org Concierge")
 
 		// THE regression assertion: without this seed the provision hits
@@ -950,99 +971,182 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		}
 	})
 
-	// PR-6 (concierge-follows): the seed model is RESOLVED from the generic KMS
-	// platform default env MOLECULE_LLM_DEFAULT_MODEL, with conciergeDeclaredModel
-	// as the compiled-in fallback. These two sub-tests prove BOTH halves of the
-	// SSOT-follow: (a) env SET → the seed is the KMS value (NOT the const), and
-	// (b) env UNSET → the seed is the const fallback. The runtime default is
-	// likewise resolved (MOLECULE_DEFAULT_RUNTIME else 'claude-code'); both are
-	// set/unset together to exercise the full follow path.
-	t.Run("env SET: fresh concierge seeds the KMS default model+runtime (NOT the const)", func(t *testing.T) {
+	// #3267 follow-up #2: the concierge model is resolved from an AUTHORITATIVE
+	// source (CP on SaaS, operator env on self-hosted). It MUST fail closed if the
+	// source is missing/unreachable. The const is intentionally NOT a fallback.
+	t.Run("authoritative resolver returns a non-const model → seed follows it", func(t *testing.T) {
 		// A DIFFERENT routable platform model than the const default, so a pass
-		// proves the env value (not conciergeDeclaredModel) drives the seed. Both
-		// registry gates pass for it and it is platform-managed on claude-code.
-		const kmsModel = "moonshot/kimi-k2.6"
-		if kmsModel == conciergeDeclaredModel {
-			t.Fatalf("test invariant broken: kmsModel must differ from the const fallback to prove the env wins")
+		// proves the resolved value (not conciergeDeclaredModel) drives the seed.
+		const resolvedModel = "moonshot/kimi-k2.6"
+		if resolvedModel == conciergeDeclaredModel {
+			t.Fatalf("test invariant broken: resolvedModel must differ from the const to prove the resolver wins")
 		}
-		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", kmsModel)
+		setConciergeModelResolver(t, resolvedModel, nil)
 		t.Setenv("MOLECULE_DEFAULT_RUNTIME", "claude-code")
 
 		mock := setupTestDB(t)
-		mock.ExpectQuery(kindQuery).WithArgs("ws-kms").
+		mock.ExpectQuery(kindQuery).WithArgs("ws-resolved").
 			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
-		mock.ExpectQuery(modelSelQuery).WithArgs("ws-kms").
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-resolved").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
 		mock.ExpectExec(secretInsert).
-			WithArgs("ws-kms", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WithArgs("ws-resolved", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
-		// kmsModel is platform-managed → provider pin persists too.
-		mock.ExpectQuery(providerSelQuery).WithArgs("ws-kms").
+		// resolvedModel is platform-managed → provider pin persists too.
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-resolved").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
 		mock.ExpectExec(secretInsert).
-			WithArgs("ws-kms", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WithArgs("ws-resolved", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectQuery(recordKindQuery).WithArgs("ws-kms").
+		mock.ExpectQuery(recordKindQuery).WithArgs("ws-resolved").
 			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
 		mock.ExpectExec(declaredInsert).
-			WithArgs("ws-kms", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WithArgs("ws-resolved", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		env := map[string]string{}
-		h.applyConciergeProvisionConfig(context.Background(), "ws-kms", "", nil, env, "Org Concierge")
+		h.applyConciergeProvisionConfig(context.Background(), "ws-resolved", "", nil, env, "Org Concierge")
 
-		if env["MODEL"] != kmsModel {
-			t.Errorf("env-set seed did not follow MOLECULE_LLM_DEFAULT_MODEL=%q; got MODEL=%q (env=%v)", kmsModel, env["MODEL"], env)
+		if env["MODEL"] != resolvedModel {
+			t.Errorf("resolved seed did not follow resolver model %q; got MODEL=%q (env=%v)", resolvedModel, env["MODEL"], env)
 		}
-		if env["MOLECULE_MODEL"] != kmsModel {
-			t.Errorf("env-set seed did not follow the KMS model for MOLECULE_MODEL; got %q", env["MOLECULE_MODEL"])
+		if env["MOLECULE_MODEL"] != resolvedModel {
+			t.Errorf("resolved seed did not set MOLECULE_MODEL=%q; got %q", resolvedModel, env["MOLECULE_MODEL"])
 		}
 		if env["MODEL"] == conciergeDeclaredModel {
-			t.Errorf("env-set seed wrongly used the const fallback %q instead of the KMS value", conciergeDeclaredModel)
+			t.Errorf("resolved seed wrongly used the const fallback %q instead of the authoritative value", conciergeDeclaredModel)
 		}
 		if env["LLM_PROVIDER"] != conciergeProvider {
-			t.Errorf("env-set platform-managed KMS model did not pin LLM_PROVIDER=%q; got %q", conciergeProvider, env["LLM_PROVIDER"])
+			t.Errorf("resolved platform-managed model did not pin LLM_PROVIDER=%q; got %q", conciergeProvider, env["LLM_PROVIDER"])
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("unmet sqlmock expectations (KMS model/provider not persisted): %v", err)
+			t.Errorf("unmet sqlmock expectations (resolved model/provider not persisted): %v", err)
 		}
 	})
 
-	t.Run("env UNSET: fresh concierge falls back to the const declared model", func(t *testing.T) {
-		// Defensively clear the envs so this sub-test is order-independent.
-		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
-		t.Setenv("MOLECULE_DEFAULT_RUNTIME", "")
+	t.Run("authoritative resolver returns empty → seed fails closed", func(t *testing.T) {
+		setConciergeModelResolver(t, "", nil)
+		t.Setenv("MOLECULE_DEFAULT_RUNTIME", "claude-code")
 
 		mock := setupTestDB(t)
-		mock.ExpectQuery(kindQuery).WithArgs("ws-fallback").
+		mock.ExpectQuery(kindQuery).WithArgs("ws-empty-resolve").
 			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
-		mock.ExpectQuery(modelSelQuery).WithArgs("ws-fallback").
+		// No MODEL row yet, so ensureConciergeModel calls the resolver. The resolver
+		// returns empty → fail closed. No model INSERT, and because the model stays
+		// empty the provider pin also stays off (conciergeModelIsPlatformManaged
+		// treats empty as platform-managed, but ensureConciergeProvider only pins
+		// when there is no stored LLM_PROVIDER; the empty-model branch still fires
+		// the provider pin in production, but here there is no stored provider and
+		// the env MODEL is empty, so the pin WILL be attempted and should succeed).
+		// Actually: ensureConciergeModel leaves env["MODEL"] empty. Then
+		// ensureConciergeProvider sees empty model → platform-managed → pins. So we
+		// expect the provider SELECT + INSERT.
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-empty-resolve").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-empty-resolve").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
 		mock.ExpectExec(secretInsert).
-			WithArgs("ws-fallback", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WithArgs("ws-empty-resolve", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectQuery(providerSelQuery).WithArgs("ws-fallback").
-			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
-		mock.ExpectExec(secretInsert).
-			WithArgs("ws-fallback", sqlmock.AnyArg(), sqlmock.AnyArg()).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectQuery(recordKindQuery).WithArgs("ws-fallback").
+		mock.ExpectQuery(recordKindQuery).WithArgs("ws-empty-resolve").
 			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
 		mock.ExpectExec(declaredInsert).
-			WithArgs("ws-fallback", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WithArgs("ws-empty-resolve", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		env := map[string]string{}
-		h.applyConciergeProvisionConfig(context.Background(), "ws-fallback", "", nil, env, "Org Concierge")
+		h.applyConciergeProvisionConfig(context.Background(), "ws-empty-resolve", "", nil, env, "Org Concierge")
 
-		if env["MODEL"] != conciergeDeclaredModel {
-			t.Errorf("env-unset seed did not fall back to the const declared model %q; got MODEL=%q (env=%v) — MISSING_MODEL would fire", conciergeDeclaredModel, env["MODEL"], env)
+		if _, seeded := env["MODEL"]; seeded {
+			t.Errorf("empty resolver result seeded MODEL=%q — must fail closed", env["MODEL"])
 		}
-		if env["MOLECULE_MODEL"] != conciergeDeclaredModel {
-			t.Errorf("env-unset seed did not fall back to the const for MOLECULE_MODEL; got %q", env["MOLECULE_MODEL"])
+		if _, seeded := env["MOLECULE_MODEL"]; seeded {
+			t.Errorf("empty resolver result seeded MOLECULE_MODEL=%q — must fail closed", env["MOLECULE_MODEL"])
+		}
+		// Provider pin for empty/unresolved model is intentional; see comment above.
+		if env["LLM_PROVIDER"] != conciergeProvider {
+			t.Errorf("empty unresolved model did not pin LLM_PROVIDER=%q; got %q", conciergeProvider, env["LLM_PROVIDER"])
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("unmet sqlmock expectations (const-fallback seed not persisted): %v", err)
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("self-hosted path reads MOLECULE_LLM_DEFAULT_MODEL when org creds are absent", func(t *testing.T) {
+		// Force self-hosted mode by clearing the SaaS creds. The resolver then reads
+		// the operator-supplied env as the SSOT.
+		t.Setenv("MOLECULE_ORG_ID", "")
+		t.Setenv("ADMIN_TOKEN", "")
+		const selfHostedModel = "moonshot/kimi-k2.6"
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", selfHostedModel)
+		t.Setenv("MOLECULE_DEFAULT_RUNTIME", "claude-code")
+
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-selfhosted").
+			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-selfhosted").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-selfhosted", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-selfhosted").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-selfhosted", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(recordKindQuery).WithArgs("ws-selfhosted").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-selfhosted", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		env := map[string]string{}
+		h.applyConciergeProvisionConfig(context.Background(), "ws-selfhosted", "", nil, env, "Org Concierge")
+
+		if env["MODEL"] != selfHostedModel {
+			t.Errorf("self-hosted seed did not follow MOLECULE_LLM_DEFAULT_MODEL=%q; got MODEL=%q (env=%v)", selfHostedModel, env["MODEL"], env)
+		}
+		if env["MOLECULE_MODEL"] != selfHostedModel {
+			t.Errorf("self-hosted seed did not set MOLECULE_MODEL=%q; got %q", selfHostedModel, env["MOLECULE_MODEL"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("self-hosted path with no env fails closed", func(t *testing.T) {
+		t.Setenv("MOLECULE_ORG_ID", "")
+		t.Setenv("ADMIN_TOKEN", "")
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+		t.Setenv("MOLECULE_DEFAULT_RUNTIME", "claude-code")
+
+		mock := setupTestDB(t)
+		mock.ExpectQuery(kindQuery).WithArgs("ws-selfhosted-missing").
+			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-selfhosted-missing").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectQuery(providerSelQuery).WithArgs("ws-selfhosted-missing").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-selfhosted-missing", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(recordKindQuery).WithArgs("ws-selfhosted-missing").
+			WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+		mock.ExpectExec(declaredInsert).
+			WithArgs("ws-selfhosted-missing", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		env := map[string]string{}
+		h.applyConciergeProvisionConfig(context.Background(), "ws-selfhosted-missing", "", nil, env, "Org Concierge")
+
+		if _, seeded := env["MODEL"]; seeded {
+			t.Errorf("missing self-hosted env seeded MODEL=%q — must fail closed", env["MODEL"])
+		}
+		if _, seeded := env["MOLECULE_MODEL"]; seeded {
+			t.Errorf("missing self-hosted env seeded MOLECULE_MODEL=%q — must fail closed", env["MOLECULE_MODEL"])
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
 		}
 	})
 }
@@ -1539,6 +1643,9 @@ func TestEnsureConciergeModel_FailsClosedOnReadError(t *testing.T) {
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		env := map[string]string{}
+		// Hermetic: the resolver is the authoritative source for the seed. Stub it
+		// so this test is not coupled to SaaS env/CP reachability.
+		setConciergeModelResolver(t, conciergeDeclaredModel, nil)
 		h.ensureConciergeModel(context.Background(), "ws-model-fresh-unset", defaultConciergeRuntime, env)
 
 		if env["MODEL"] != conciergeDeclaredModel {
@@ -1564,6 +1671,109 @@ func TestEnsureConciergeModel_FailsClosedOnReadError(t *testing.T) {
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+}
+
+// TestDefaultResolveConciergeModel is the unit regression gate for #3267 follow-up #2:
+// the concierge model MUST come from the control plane on SaaS tenants and from the
+// operator env on self-hosted tenants; any missing/unreachable source fails closed.
+func TestDefaultResolveConciergeModel(t *testing.T) {
+	t.Run("SaaS path fetches MOLECULE_LLM_DEFAULT_MODEL from CP /cp/tenants/config", func(t *testing.T) {
+		cpModel := "minimax/MiniMax-M2.7"
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/cp/tenants/config" {
+				t.Errorf("unexpected CP path: %s", r.URL.Path)
+			}
+			if auth := r.Header.Get("Authorization"); auth != "Bearer cp-admin-token" {
+				t.Errorf("unexpected Authorization header: %q", auth)
+			}
+			if org := r.Header.Get("X-Molecule-Org-Id"); org != "org-123" {
+				t.Errorf("unexpected X-Molecule-Org-Id header: %q", org)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"MOLECULE_LLM_DEFAULT_MODEL": cpModel,
+			})
+		}))
+		defer ts.Close()
+
+		t.Setenv("MOLECULE_ORG_ID", "org-123")
+		t.Setenv("ADMIN_TOKEN", "cp-admin-token")
+		t.Setenv("MOLECULE_CP_URL", ts.URL)
+
+		got, err := defaultResolveConciergeModel(context.Background())
+		if err != nil {
+			t.Fatalf("defaultResolveConciergeModel returned error: %v", err)
+		}
+		if got != cpModel {
+			t.Errorf("defaultResolveConciergeModel() = %q, want %q", got, cpModel)
+		}
+	})
+
+	t.Run("SaaS path fails closed when CP returns no model key", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]string{"other_key": "value"})
+		}))
+		defer ts.Close()
+
+		t.Setenv("MOLECULE_ORG_ID", "org-123")
+		t.Setenv("ADMIN_TOKEN", "cp-admin-token")
+		t.Setenv("MOLECULE_CP_URL", ts.URL)
+
+		got, err := defaultResolveConciergeModel(context.Background())
+		if err == nil {
+			t.Fatalf("expected error for missing model key, got model %q", got)
+		}
+		if !strings.Contains(err.Error(), "MISSING_MODEL") {
+			t.Errorf("error %q does not contain MISSING_MODEL", err.Error())
+		}
+	})
+
+	t.Run("SaaS path fails closed on non-2xx CP response", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer ts.Close()
+
+		t.Setenv("MOLECULE_ORG_ID", "org-123")
+		t.Setenv("ADMIN_TOKEN", "cp-admin-token")
+		t.Setenv("MOLECULE_CP_URL", ts.URL)
+
+		got, err := defaultResolveConciergeModel(context.Background())
+		if err == nil {
+			t.Fatalf("expected error for 401, got model %q", got)
+		}
+		if !strings.Contains(err.Error(), "MISSING_MODEL") {
+			t.Errorf("error %q does not contain MISSING_MODEL", err.Error())
+		}
+	})
+
+	t.Run("self-hosted path reads MOLECULE_LLM_DEFAULT_MODEL env", func(t *testing.T) {
+		t.Setenv("MOLECULE_ORG_ID", "")
+		t.Setenv("ADMIN_TOKEN", "")
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "moonshot/kimi-k2.6")
+
+		got, err := defaultResolveConciergeModel(context.Background())
+		if err != nil {
+			t.Fatalf("defaultResolveConciergeModel returned error: %v", err)
+		}
+		if got != "moonshot/kimi-k2.6" {
+			t.Errorf("defaultResolveConciergeModel() = %q, want %q", got, "moonshot/kimi-k2.6")
+		}
+	})
+
+	t.Run("self-hosted path fails closed when env is missing", func(t *testing.T) {
+		t.Setenv("MOLECULE_ORG_ID", "")
+		t.Setenv("ADMIN_TOKEN", "")
+		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
+
+		got, err := defaultResolveConciergeModel(context.Background())
+		if err == nil {
+			t.Fatalf("expected error for missing env, got model %q", got)
+		}
+		if !strings.Contains(err.Error(), "MISSING_MODEL") {
+			t.Errorf("error %q does not contain MISSING_MODEL", err.Error())
 		}
 	})
 }
