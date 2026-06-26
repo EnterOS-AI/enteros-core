@@ -68,6 +68,7 @@ jobs:
   #   3. Add "Lint forbidden hand-written mcp__ tool-id literals / scan" to the
   #      CI required-contexts set (and ci.yml all-required needs: list per the
   #      sentinel pattern) in a follow-up PR, with its own pool review.
+  # bp-exempt: advisory RFC #3285 §8 cheap-80% lint; not a branch-protection gate on introduction.
   scan:
     name: Scan for hand-written mcp__ tool-id literals
     runs-on: ubuntu-latest
