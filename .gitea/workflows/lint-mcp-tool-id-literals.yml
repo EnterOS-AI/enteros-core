@@ -1,0 +1,154 @@
+name: Lint forbidden hand-written mcp__ tool-id literals
+
+# RFC #3285 §8 / Appendix-A "cheap-80%" enforcement: scan workspace-server Go
+# code for a HAND-WRITTEN MCP tool-id string literal of the form
+# "mcp__<server>__<verb>" (e.g. "mcp__molecule-platform__provision_workspace").
+#
+# Catches the #3082 CLASS of bug: someone re-types the namespaced tool id as a
+# raw string literal instead of deriving it from the single declared source.
+# When the id is hand-typed in two places, the two drift (a verb is renamed in
+# one and not the other) and the concierge silently goes degraded because the
+# gate looks for a tool id the runtime never emits. The fix that RFC #3285
+# settled on is SINGLE-SOURCING the id; this lint stops a NEW hand-typed copy
+# from being re-introduced at PR-review time.
+#
+# ── Why a grep workflow and NOT forbidigo ──
+# The natural reach is golangci-lint's `forbidigo`. It does not work for this:
+# forbidigo (v1 and v2.3.1, the version bundled in golangci-lint v2.12.2 that
+# `Platform (Go)` runs) only visits *ast.Ident and *ast.SelectorExpr nodes —
+# it NEVER inspects *ast.BasicLit, so a forbid pattern can never match a Go
+# STRING LITERAL like "mcp__foo__bar". A forbidigo rule here would be inert
+# (false enforcement). The repo already has the right idiom for "ban a textual
+# pattern in Go source": the standalone grep lint workflows (see
+# lint-forbidden-env-keys.yml, which this file is modeled on). Grep CAN match a
+# string literal, so it is the correct cheap-80% mechanism. Promote-to-required
+# criteria are documented at the bottom of this file.
+#
+# ── The single declared source (DO NOT flag) ──
+# The canonical id lives in:
+#   workspace-server/internal/handlers/platform_agent.go
+# composed via the sanctioned formula
+#   const conciergePlatformMCPProvisionWorkspaceTool =
+#       "mcp__" + conciergePlatformMCPServerName + "__" + conciergePlatformMCPRequiredTool
+# The bare prefix literal "mcp__" does NOT match this lint's full-id regex, so
+# the SSOT is already safe; platform_agent.go is also listed in EXEMPT_FILES
+# below as belt-and-suspenders + documentation of intent.
+#
+# ── Scope (why this is GREEN on introduction) ──
+#   * Non-test .go only (--exclude='*_test.go'): the tests that PIN the gate
+#     legitimately embed the literal (workspace_test.go, postgres_store_test.go)
+#     and exercising the contract is their job.
+#   * // comments are filtered out (a comment that spells the id is fine).
+#   * The one SSOT file is exempt.
+# Verified against main 2026-06-26: the only non-test, non-comment match count
+# is ZERO. This lint does not red main on introduction.
+#
+# Path-filter discipline:
+#   Runs on every PR (no paths: filter — a path-filtered workflow can never be
+#   required and silently passes on unrelated PRs). The scan is a sub-second
+#   grep over workspace-server/ so unconditional run is fine.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, staging]
+
+jobs:
+  # bp-exempt: advisory RFC #3285 §8 cheap-80% lint; PR review gate is
+  # review-driven, not BP-driven. This context is intentionally NOT added to the
+  # required set / branch protection on introduction.
+  #
+  # Promote-to-required criteria (when the cheap-80% becomes the floor):
+  #   1. The derive/codegen for MCP tool ids has landed (RFC #3285 §8 / App-A):
+  #      every consumer reads the id from the single generated binding, so a
+  #      hand-typed literal is unambiguously wrong everywhere.
+  #   2. This lint has run green on main for at least one full release cycle
+  #      with no false positives reported.
+  #   3. Add "Lint forbidden hand-written mcp__ tool-id literals / scan" to the
+  #      CI required-contexts set (and ci.yml all-required needs: list per the
+  #      sentinel pattern) in a follow-up PR, with its own pool review.
+  # bp-exempt: advisory RFC #3285 §8 cheap-80% lint; not a branch-protection gate on introduction.
+  scan:
+    name: Scan for hand-written mcp__ tool-id literals
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Scan workspace-server Go code for hand-written mcp__ tool-id literals
+        run: |
+          set -euo pipefail
+
+          # Full-id regex: a Go string literal of the form
+          #   "mcp__<server>__<verb>"
+          # server = [a-z0-9-]+, verb = [a-z0-9_]+. The bare prefix "mcp__"
+          # (the SSOT concat) does NOT match because the regex requires the
+          # full "__<verb>" suffix inside the SAME quotes.
+          LITERAL_REGEX='"mcp__[a-z0-9-]+__[a-z0-9_]+"'
+
+          SCAN_ROOT="workspace-server/internal"
+
+          # Files that legitimately reference a full mcp__ id in NON-test code.
+          # New entries require reviewer signoff + a one-line justification in
+          # the diff. Drift between a hand-typed copy and the SSOT is exactly
+          # the failure mode this lint exists to catch — keep this list tiny.
+          EXEMPT_FILES=(
+            # The SINGLE declared source. The id is built by the sanctioned
+            # "mcp__" + server + "__" + verb concat, so it does not even match
+            # the full-id regex; listed here to document that this is THE
+            # source and must never be flagged. RFC #3285 §8.
+            "workspace-server/internal/handlers/platform_agent.go"
+          )
+
+          # Build exempt-paths filter (grep -v -F -f style).
+          EXEMPT_FILTER=$(mktemp)
+          trap 'rm -f "$EXEMPT_FILTER"' EXIT
+          for p in "${EXEMPT_FILES[@]}"; do
+            echo "$p" >> "$EXEMPT_FILTER"
+          done
+
+          # --- Scan ---
+          # Non-test .go only: the *_test.go files pin the gate and legitimately
+          # embed the literal. Then drop the exempt SSOT file, then drop any
+          # match that sits inside a // line-comment (a comment spelling the id
+          # is documentation, not a hand-written tool-id sink).
+          RAW=$(grep -rnE --include='*.go' --exclude='*_test.go' "$LITERAL_REGEX" "$SCAN_ROOT" 2>/dev/null \
+                  | grep -v -F -f "$EXEMPT_FILTER" || true)
+
+          # Drop comment-only matches: a hit is a // comment if "//" appears
+          # before the "mcp__ literal on that line. grep output is
+          # path:lineno:content; awk strips the prefix and compares positions.
+          HITS=$(printf '%s\n' "$RAW" | awk -F: '
+            NF >= 3 {
+              prefixlen = length($1) + length($2) + 2
+              rest = substr($0, prefixlen + 1)
+              cpos = index(rest, "//")
+              mpos = index(rest, "\"mcp__")
+              if (mpos == 0) next
+              if (cpos > 0 && cpos < mpos) next   # match inside a // comment
+              print $0
+            }')
+
+          if [ -n "$HITS" ]; then
+            echo "::error::RFC #3285 §8: hand-written mcp__ tool-id literal(s) found in workspace-server Go code:"
+            printf '%s\n' "$HITS"
+            echo ""
+            echo "A namespaced MCP tool id (\"mcp__<server>__<verb>\") was typed as a raw"
+            echo "string literal. Re-typing the id lets it drift from the single declared"
+            echo "source and silently degrades the concierge gate (the #3082 class of bug)."
+            echo ""
+            echo "Use the generated/single-sourced contract binding instead — derive the id"
+            echo "from the canonical constants in"
+            echo "  workspace-server/internal/handlers/platform_agent.go"
+            echo "(conciergePlatformMCPServerName / conciergePlatformMCPRequiredTool, composed"
+            echo "via the \"mcp__\" + server + \"__\" + verb formula)."
+            echo ""
+            echo "If a NON-test file legitimately must hold the full literal, add it to"
+            echo "EXEMPT_FILES in this workflow with a one-line justification — reviewer"
+            echo "signoff required."
+            exit 1
+          fi
+
+          echo "OK No hand-written mcp__ tool-id literals in non-test workspace-server Go code."
