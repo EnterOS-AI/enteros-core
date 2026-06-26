@@ -90,10 +90,14 @@ jobs:
       # CF_ZONE_ID/CLOUDFLARE_ZONE_ID Gitea Actions secrets are left in place
       # until a green run validates this path (validate-before-delete). The
       # Verify-required-secrets gate still validates both are non-empty.
-      # CP_ADMIN_API_TOKEN now arrives via $GITHUB_ENV from the "Fetch
-      # CP_ADMIN_API_TOKEN from Infisical KMS" step below (wave-3 migration).
-      # The Verify-required-secrets gate still validates it is non-empty.
-      CP_STAGING_ADMIN_API_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      # CP_ADMIN_API_TOKEN (prod) AND CP_STAGING_ADMIN_API_TOKEN (staging) now
+      # arrive via $GITHUB_ENV from the "Fetch CP_ADMIN_API_TOKEN from Infisical
+      # KMS" step below (wave-3 migration; staging arm added alongside the prod
+      # one). Both come from Infisical /shared/controlplane-admin keyed
+      # CP_ADMIN_API_TOKEN, just at different environments (prod vs STAGING). The
+      # old CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret is left in place
+      # until a green run validates this path (validate-before-delete). The
+      # Verify-required-secrets gate still validates both are non-empty.
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-east-2
@@ -143,6 +147,25 @@ jobs:
           fi
           echo "CP_ADMIN_API_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
           echo "CP_ADMIN_API_TOKEN loaded from Infisical (len=${#CP_ADMIN_API_TOKEN})"
+          # Staging arm (wave-3 follow-up): the cross-env reconcile also needs
+          # the STAGING CP admin token. Same key (CP_ADMIN_API_TOKEN) and path
+          # (/shared/controlplane-admin), environment=staging — exported under
+          # the CP_STAGING_ADMIN_API_TOKEN name the verify + sweep steps already
+          # read, so the secrets.CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret
+          # can retire once a green run validates this path.
+          read_secret_staging() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          CP_STAGING_ADMIN_API_TOKEN=$(read_secret_staging CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
+          echo "::add-mask::$CP_STAGING_ADMIN_API_TOKEN"
+          if [ -z "$CP_STAGING_ADMIN_API_TOKEN" ]; then
+            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
+            exit 1
+          fi
+          echo "CP_STAGING_ADMIN_API_TOKEN=$CP_STAGING_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
+          echo "CP_STAGING_ADMIN_API_TOKEN loaded from Infisical (len=${#CP_STAGING_ADMIN_API_TOKEN})"
 
       # KMS wave-B (Gitea-Actions-secrets -> Infisical SSOT): source the
       # zone-scoped Cloudflare DNS token (prod /shared/cloudflare-admin,
