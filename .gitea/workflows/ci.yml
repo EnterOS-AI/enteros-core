@@ -140,8 +140,12 @@ jobs:
     # molecule-ai-workspace-template-seo-agent) return 404 without
     # auth — same secret as harness-replays.yml uses for
     # clone-manifest.sh.
-    env:
-      MOLECULE_GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+    # MOLECULE_GITEA_TOKEN was a job-level `env` sourced from
+    # `secrets.AUTO_SYNC_TOKEN`. It is now sourced from the Infisical SSOT by
+    # the "Fetch AUTO_SYNC_TOKEN from Infisical SSOT" step below, which exports
+    # both AUTO_SYNC_TOKEN and MOLECULE_GITEA_TOKEN to $GITHUB_ENV. (A job-level
+    # `env` cannot reference a value a step writes to $GITHUB_ENV, so the export
+    # happens per-job in the fetch step and downstream steps read env.* .)
     defaults:
       run:
         working-directory: workspace-server
@@ -153,6 +157,50 @@ jobs:
           echo "::notice::detect-changes debug: ${{ needs.changes.outputs.debug }}"
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
+        # Bot-token consolidation (secrets->kms). AUTO_SYNC_TOKEN (the
+        # devops-engineer persona PAT) is pulled from the Infisical SSOT at
+        # /shared/dev-utils::AUTO_SYNC_TOKEN (environment=prod) instead of the
+        # duplicated `secrets.AUTO_SYNC_TOKEN` Gitea secret. Exported to
+        # $GITHUB_ENV as AUTO_SYNC_TOKEN (consumed as `token: ${{ env.* }}` by
+        # the workspace-runtime checkout below) and as MOLECULE_GITEA_TOKEN
+        # (read by the manifest_pinning Go tests). The old Gitea secret stays in
+        # place until a green run proves this fetch (validate-before-delete).
+        #
+        # FORK SAFETY: ci.yml fires on pull_request, so the fetch is gated to
+        # same-repo PRs only — a fork PR must NEVER harvest the merge-actor
+        # token. On a fork PR this step is skipped and env.* stays empty; the
+        # manifest_pinning tests then run unauthenticated (their pre-existing
+        # fork behaviour — public template repos return 200). Gitea also
+        # withholds secrets from forks at the runner level (defense in depth).
+        if: ${{ needs.changes.outputs.platform == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) }}
+        id: auto_sync_token
+        working-directory: .
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -z "$AUTO_SYNC_TOKEN" ]; then
+            echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils"
+            exit 1
+          fi
+          echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
+          echo "MOLECULE_GITEA_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
+          echo "AUTO_SYNC_TOKEN loaded from Infisical (len=${#AUTO_SYNC_TOKEN})"
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
@@ -189,7 +237,7 @@ jobs:
         with:
           repository: molecule-ai/molecule-ai-workspace-runtime
           path: molecule-ai-workspace-runtime
-          token: ${{ secrets.AUTO_SYNC_TOKEN }}
+          token: ${{ env.AUTO_SYNC_TOKEN }}
       - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Install molecule-ai-workspace-runtime and its Python deps for contract tests
         working-directory: ./molecule-ai-workspace-runtime
