@@ -36,6 +36,11 @@
 #   PRUNE_MIN_AGE_HOURS=<int> — default minimum age in hours (default: 24).
 #   MAX_DELETE_PCT=<int>     — refuse to delete more than this percentage of
 #                              matched ephemeral records (default: 50).
+#   ABSOLUTE_FLOOR=<int>     — always allow deletion when the total number of
+#                              matched ephemeral records is at most this many,
+#                              regardless of MAX_DELETE_PCT. Prevents a lone
+#                              orphan from being un-deletable just because it
+#                              is 100% of the matched set (default: 1).
 #   PRUNE_ZONE_DOMAIN=<domain> — comma-separated zone domain(s) to anchor
 #                                matches (default: staging.moleculesai.app).
 #
@@ -49,6 +54,7 @@ set -euo pipefail
 DRY_RUN=1
 MIN_AGE_HOURS="${PRUNE_MIN_AGE_HOURS:-24}"
 MAX_DELETE_PCT="${MAX_DELETE_PCT:-50}"
+ABSOLUTE_FLOOR="${ABSOLUTE_FLOOR:-1}"
 ZONE_DOMAIN="${PRUNE_ZONE_DOMAIN:-}"
 if [ -z "$ZONE_DOMAIN" ]; then
   ZONE_DOMAIN="staging.moleculesai.app"
@@ -335,12 +341,17 @@ for reason, n in c.most_common():
 
 # --- Safety gate -------------------------------------------------------------
 if [ "$MATCHED_COUNT" -gt 0 ]; then
-  PCT=$(( DELETE_COUNT * 100 / MATCHED_COUNT ))
-  if [ "$PCT" -gt "$MAX_DELETE_PCT" ]; then
+  if [ "$MATCHED_COUNT" -le "$ABSOLUTE_FLOOR" ]; then
     log ""
-    log "SAFETY: would delete $PCT% of matched ephemeral records (threshold $MAX_DELETE_PCT%) — refusing."
-    log "  If this is expected, rerun with MAX_DELETE_PCT=$((PCT+5)) $0 $*"
-    exit 2
+    log "SAFETY: matched ephemeral count $MATCHED_COUNT ≤ absolute floor $ABSOLUTE_FLOOR — allowing."
+  else
+    PCT=$(( DELETE_COUNT * 100 / MATCHED_COUNT ))
+    if [ "$PCT" -gt "$MAX_DELETE_PCT" ]; then
+      log ""
+      log "SAFETY: would delete $PCT% of matched ephemeral records (threshold $MAX_DELETE_PCT%, absolute floor $ABSOLUTE_FLOOR) — refusing."
+      log "  If this is expected, rerun with MAX_DELETE_PCT=$((PCT+5)) $0 $*"
+      exit 2
+    fi
   fi
 fi
 

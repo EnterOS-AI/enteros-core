@@ -17,7 +17,7 @@ PASS=0
 FAIL=0
 
 run_case() {
-  local name="$1" list_exit="$2" list_body="$3" expect_delete_sentinel="$4" zone_domain="${5:-}"
+  local name="$1" list_exit="$2" list_body="$3" expect_delete_sentinel="$4" zone_domain="${5:-}" max_delete_pct="${6:-100}"
   local tmp
   tmp=$(mktemp -d -t cf-e2e-prune-fail-closed-XXXXXX)
   local delete_sentinel="$tmp/delete_reached"
@@ -69,8 +69,9 @@ MOCK
   # Export paths so the mock script can find the list body file and sentinel.
   export DELETE_SENTINEL="$delete_sentinel"
   export LIST_BODY_FILE="$tmp/list_body.txt"
-  # Allow the single-record happy-path case to delete 100% of matched records.
-  export MAX_DELETE_PCT=100
+  # Default MAX_DELETE_PCT=100 lets the existing happy-path cases delete the
+  # single matched record. New hybrid-gate cases override this to 50.
+  export MAX_DELETE_PCT="$max_delete_pct"
   PATH="$tmp:$PATH" \
     CF_API_TOKEN=tok \
     CF_ZONE_ID=zone \
@@ -138,6 +139,35 @@ make_list() {
 JSON
 }
 
+# Helper to build a DNS list with N ephemeral-shaped records, K of which are
+# stale (older than min-age) and the rest too new. Used to exercise the hybrid
+# safety gate (ABSOLUTE_FLOOR / MAX_DELETE_PCT).
+make_bulk_list() {
+  local total="$1" stale="$2" zone_domain="${3:-staging.moleculesai.app}"
+  python3 - "$total" "$stale" "$zone_domain" <<'PY'
+import json, sys
+from datetime import datetime, timezone, timedelta
+total, stale = int(sys.argv[1]), int(sys.argv[2])
+zone_domain = sys.argv[3]
+now = datetime.now(timezone.utc)
+old_ts = (now - timedelta(hours=2)).isoformat().replace('+00:00', 'Z')
+new_ts = (now - timedelta(minutes=5)).isoformat().replace('+00:00', 'Z')
+records = []
+for i in range(total):
+    records.append({
+        "id": f"rec{i:04d}",
+        "name": f"e2e-smoke-20260622-{i:04d}-abcdef12.{zone_domain}",
+        "type": "A",
+        "created_on": old_ts if i < stale else new_ts,
+    })
+print(json.dumps({
+    "success": True,
+    "result": records,
+    "result_info": {"page": 1, "total_pages": 1, "per_page": 100, "count": total},
+}))
+PY
+}
+
 old_ts=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)-timedelta(hours=2)).isoformat().replace('+00:00','Z'))")
 
 # Too-new record must be kept, not deleted.
@@ -174,5 +204,12 @@ run_case "multi-zone matches apex record" 0 "$(make_list "$old_ts" moleculesai.a
 
 # Near-miss under the staging zone is still kept (safety guard).
 run_case "e2e-smoketest-keep under staging kept" 0 "$(make_list "$old_ts" | sed 's/e2e-smoke-20260622-1234-abcdef12/e2e-smoketest-keep/')" false-keep
+
+# Hybrid safety-gate coverage (Researcher RCA: percent-only gate stranded a
+# lone orphan because 1-of-1 is 100%). MAX_DELETE_PCT=50 for these cases.
+run_case "hybrid: 1-of-1 allowed via ABSOLUTE_FLOOR" 0 "$(make_list "$old_ts")" true "" 50
+run_case "hybrid: 1-of-100 allowed via MAX_DELETE_PCT" 0 "$(make_bulk_list 100 1)" true "" 50
+run_case "hybrid: 60-of-100 blocked by MAX_DELETE_PCT" 0 "$(make_bulk_list 100 60)" false-abort "" 50
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
