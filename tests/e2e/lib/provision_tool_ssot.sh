@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # Path to this helper, relative to repo root.
-__ssot_contract_go="$(cd "$(dirname "$0")/../.." && pwd)/workspace-server/internal/handlers/mcp_plugin_delivery_contract.go"
+__ssot_contract_go="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/workspace-server/internal/handlers/mcp_plugin_delivery_contract.go"
 if [ ! -f "$__ssot_contract_go" ]; then
   echo "provision_tool_ssot.sh: SSOT contract Go file not found at $__ssot_contract_go" >&2
   exit 1
