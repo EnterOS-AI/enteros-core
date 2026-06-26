@@ -175,16 +175,16 @@ jobs:
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
           }
-          CF_API_TOKEN=$(read_secret CLOUDFLARE_API_TOKEN_ADMIN %2Fshared%2Fcloudflare-admin)
+          CF_API_TOKEN=$(read_secret CLOUDFLARE_API_TOKEN %2Fshared%2Fcloudflare-tunnel-admin)
           echo "::add-mask::$CF_API_TOKEN"
           if [ -z "$CF_API_TOKEN" ]; then
-            echo "::error::Infisical returned empty CLOUDFLARE_API_TOKEN_ADMIN at prod /shared/cloudflare-admin — failing closed."
+            echo "::error::Infisical returned empty CLOUDFLARE_API_TOKEN at prod /shared/cloudflare-tunnel-admin — failing closed."
             exit 1
           fi
-          CF_ACCOUNT_ID=$(read_secret CLOUDFLARE_ACCOUNT_ID %2Fshared%2Fcloudflare-admin)
+          CF_ACCOUNT_ID=$(read_secret CLOUDFLARE_ACCOUNT_ID %2Fshared%2Fcloudflare-tunnel-admin)
           echo "::add-mask::$CF_ACCOUNT_ID"
           if [ -z "$CF_ACCOUNT_ID" ]; then
-            echo "::error::Infisical returned empty CLOUDFLARE_ACCOUNT_ID at prod /shared/cloudflare-admin — failing closed."
+            echo "::error::Infisical returned empty CLOUDFLARE_ACCOUNT_ID at prod /shared/cloudflare-tunnel-admin — failing closed."
             exit 1
           fi
           {
