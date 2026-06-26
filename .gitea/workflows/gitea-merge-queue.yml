@@ -23,6 +23,21 @@ on:
   # The queue bot still processes one PR per tick, but no longer occupies
   # one of the shared Actions runners just to poll.
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >-
+          Safe evaluate-only mode. When true (the DEFAULT for manual
+          dispatches), the queue runs the script with `--enumerate --dry-run`:
+          it evaluates EVERY open candidate and prints a readiness summary but
+          NEVER merges, updates, comments on, or labels any PR. This exists
+          because this workflow runs in LIVE MERGE mode with AUTO_DISCOVER=1, so
+          a bare forced dispatch could merge any mergeable open PR. Set to false
+          ONLY to deliberately run a real live merge tick from the UI. The
+          scheduled/automatic cron path (operator-config) is unaffected and
+          stays LIVE.
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -88,4 +103,15 @@ jobs:
           # bare `CI / all-required`. Gitea treats absent contexts as pending, not
           # skipped; requiring the bare name silently blocks all merges (issue #1473).
           PUSH_REQUIRED_CONTEXTS: CI / all-required (push)
-        run: python3 .gitea/scripts/gitea-merge-queue.py
+        # SAFE manual dispatch: when this run was started from the UI/API with
+        # dry_run=true (the default), evaluate every candidate and print a
+        # readiness summary WITHOUT merging (`--enumerate --dry-run`). Any other
+        # trigger (and dry_run=false) runs the bare script in LIVE MERGE mode,
+        # so the scheduled/automatic path is byte-equivalent to before.
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "::notice::dry_run=true — evaluate-only (no merges): --enumerate --dry-run"
+            python3 .gitea/scripts/gitea-merge-queue.py --enumerate --dry-run
+          else
+            python3 .gitea/scripts/gitea-merge-queue.py
+          fi
