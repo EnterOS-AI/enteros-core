@@ -18,6 +18,10 @@ name: publish-workspace-server-image
 #   :staging-<sha> — per-commit digest, stable for canary verify
 #   :staging-latest — tracks most recent BUILD on this branch (set by the
 #                     build job, last-writer-wins, NOT prod-gated)
+#   :prod-latest — NEW-TENANT moving tag. Advanced after build-and-push + green
+#                  staging deploy, independent of the production fleet rollout.
+#                  This decouples the image new tenants are born on from the
+#                  image existing tenants redeploy to (#3267 follow-up #1).
 #   :latest — tracks the most recent PROD-PROMOTED build. Re-pointed by the
 #             deploy-production job ONLY after green main CI + canary +
 #             fleet rollout + /buildinfo verification pass. So :latest ==
@@ -843,6 +847,57 @@ jobs:
             echo "::error::Staging verify failed — stale=$STALE_COUNT unreachable=$UNREACHABLE_COUNT"
             exit 1
           fi
+
+  # bp-exempt: promote-prod-latest side-effect; advances a new-tenant moving
+  # tag after the same build-and-push + deploy-staging gates, but independent
+  # of deploy-production's fleet rollout. This stops new-tenant image stalling
+  # when the prod fleet gate is chronically held (#3267 follow-up #1).
+  promote-prod-latest:
+    name: Promote prod-latest moving tag
+    needs: [build-and-push, deploy-staging]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    # Publish/release lane (mc#2942) — image metadata operation; reserved
+    # capacity so a queued publish job is not blocked behind PR-CI.
+    runs-on: publish
+    timeout-minutes: 15
+    env:
+      TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
+      STAGING_TENANT_IMAGE_NAME: ${{ env.STAGING_TENANT_IMAGE_NAME }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-2
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
+
+      # Advance :prod-latest to the exact digest that just passed the build
+      # smoke gate and the staging fleet redeploy + /buildinfo verification.
+      # This is the new-tenant image SSOT; it moves as soon as staging is
+      # green, without waiting for the production existing-fleet rollout.
+      # Existing tenants continue to use the fleet-gated :latest (or their
+      # configured DefaultTag such as :staging-latest), so redeploy safety is
+      # not weakened.
+      - name: Promote prod-latest to staging-verified SHA
+        run: |
+          set -euo pipefail
+          SHA_TAG="staging-${GITHUB_SHA::7}"
+          PROD_ECR_REGISTRY="${TENANT_IMAGE_NAME%%/*}"
+          STAGING_ECR_REGISTRY="${STAGING_TENANT_IMAGE_NAME%%/*}"
+
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${PROD_ECR_REGISTRY}"
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${STAGING_ECR_REGISTRY}"
+
+          # imagetools create copies the verified manifest by digest (no rebuild).
+          docker buildx imagetools create \
+            --tag "${TENANT_IMAGE_NAME}:prod-latest" \
+            "${TENANT_IMAGE_NAME}:${SHA_TAG}"
+          docker buildx imagetools create \
+            --tag "${STAGING_TENANT_IMAGE_NAME}:prod-latest" \
+            "${STAGING_TENANT_IMAGE_NAME}:${SHA_TAG}"
+
+          echo "::notice::platform-tenant:prod-latest advanced to ${SHA_TAG} (staging-verified, independent of fleet rollout)."
 
   # bp-exempt: production deploy side-effect; merge is gated by CI / all-required and this job waits for push CI before acting.
   deploy-production:
