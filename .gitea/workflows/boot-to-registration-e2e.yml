@@ -87,18 +87,28 @@ jobs:
       E2E_RUN_ID: cp455-${{ github.run_id }}
       E2E_PROVISION_TIMEOUT_SECS: '300' # 5 min — fast teardown budget
       MOLECULE_CP_URL: ${{ vars.STAGING_CP_URL || 'https://staging-api.moleculesai.app' }}
-      MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      # MOLECULE_ADMIN_TOKEN now arrives via $GITHUB_ENV from the "Fetch platform
+      # defaults (model+runtime) from KMS SSOT" step below (wave-B staging
+      # consumers migration extends that same fetch). It is sourced from Infisical
+      # CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin. The old
+      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret is left in place until a
+      # green run validates this path (validate-before-delete). The Verify-
+      # required-secrets gate still validates MOLECULE_ADMIN_TOKEN is non-empty.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      # KMS SSOT for the platform default model+runtime (de-hardcode): the env
+      # KMS SSOT for the platform default model+runtime (de-hardcode) AND the
+      # staging CP admin bearer (wave-B staging consumers migration): the env
       # block above embeds "moonshot/kimi-k2.6" / "claude-code" as fallback
       # literals. Read the authoritative values from Infisical (staging
       # /shared/controlplane/llm: MOLECULE_LLM_DEFAULT_MODEL /
       # MOLECULE_DEFAULT_RUNTIME) and export them as E2E_MODEL / E2E_RUNTIME so
-      # this gate tracks the platform default. BEHAVIOR-NEUTRAL today (the
-      # staging KMS values equal the old literals); a later staging-model flip is
-      # a separate, deliberate KMS edit. FAIL CLOSED on empty.
+      # this gate tracks the platform default. This same step also sources
+      # MOLECULE_ADMIN_TOKEN from CP_ADMIN_API_TOKEN @ staging
+      # /shared/controlplane-admin, replacing the duplicated
+      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret. BEHAVIOR-NEUTRAL today
+      # (the staging KMS values equal the old literals); a later staging-model
+      # flip is a separate, deliberate KMS edit. FAIL CLOSED on empty.
       #
       # TRUSTED-REF GATING: molecule-core is a PUBLIC repo. This step consumes
       # the CI machine-identity secrets, so it must only run on a TRUSTED event —
@@ -138,14 +148,24 @@ jobs:
             echo "::error::Infisical returned empty for MOLECULE_DEFAULT_RUNTIME at staging /shared/controlplane/llm - a required boot gate must not run with an empty platform default runtime."
             exit 1
           fi
+          # Wave-B: staging CP admin bearer (CP_ADMIN_API_TOKEN @ staging
+          # /shared/controlplane-admin) -> MOLECULE_ADMIN_TOKEN, replacing the
+          # duplicated CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret.
+          MOLECULE_ADMIN_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
+          echo "::add-mask::$MOLECULE_ADMIN_TOKEN"
+          if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
+            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
+            exit 1
+          fi
           # model + runtime ids are not secrets, but mask defensively before export.
           echo "::add-mask::$E2E_MODEL"
           echo "::add-mask::$E2E_RUNTIME"
           {
             echo "E2E_MODEL=$E2E_MODEL"
             echo "E2E_RUNTIME=$E2E_RUNTIME"
+            echo "MOLECULE_ADMIN_TOKEN=$MOLECULE_ADMIN_TOKEN"
           } >> "$GITHUB_ENV"
-          echo "platform defaults loaded from Infisical (model len=${#E2E_MODEL}, runtime len=${#E2E_RUNTIME})"
+          echo "platform defaults + admin token loaded from Infisical (model len=${#E2E_MODEL}, runtime len=${#E2E_RUNTIME}, admin len=${#MOLECULE_ADMIN_TOKEN})"
 
       - name: Verify required secrets present
         run: |

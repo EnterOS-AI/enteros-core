@@ -93,7 +93,13 @@ jobs:
       # Single admin-bearer secret drives provision + tenant-token retrieval +
       # teardown (= Railway staging CP_ADMIN_API_TOKEN). Same secret name the
       # saas workflow canonicalised to under internal#322.
-      MOLECULE_ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+      # MOLECULE_ADMIN_TOKEN now arrives via $GITHUB_ENV from the "Fetch platform
+      # model+runtime from KMS SSOT" step below (wave-B staging consumers
+      # migration extends that same fetch). It is sourced from Infisical
+      # CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin. The old
+      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret is left in place until a
+      # green run validates this path (validate-before-delete). The Verify-
+      # required-secrets gate still validates MOLECULE_ADMIN_TOKEN is non-empty.
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-east-2
@@ -210,12 +216,22 @@ jobs:
             echo "::error::MOLECULE_DEFAULT_RUNTIME is empty in KMS (/shared/controlplane/llm @ staging)"
             exit 1
           fi
+          # Wave-B: staging CP admin bearer (CP_ADMIN_API_TOKEN @ staging
+          # /shared/controlplane-admin) -> MOLECULE_ADMIN_TOKEN, replacing the
+          # duplicated CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret.
+          MOLECULE_ADMIN_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
+          echo "::add-mask::$MOLECULE_ADMIN_TOKEN"
+          if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
+            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
+            exit 1
+          fi
           {
             echo "E2E_MODEL=$E2E_MODEL"
             echo "E2E_MODEL_SLUG=$E2E_MODEL"
             echo "E2E_RUNTIME=$E2E_RUNTIME"
+            echo "MOLECULE_ADMIN_TOKEN=$MOLECULE_ADMIN_TOKEN"
           } >> "$GITHUB_ENV"
-          echo "Platform model+runtime loaded from KMS SSOT (model len=${#E2E_MODEL}, runtime len=${#E2E_RUNTIME})"
+          echo "Platform model+runtime + admin token loaded from KMS SSOT (model len=${#E2E_MODEL}, runtime len=${#E2E_RUNTIME}, admin len=${#MOLECULE_ADMIN_TOKEN})"
 
       - name: Verify required secrets present
         run: |
@@ -251,7 +267,9 @@ jobs:
       - name: Teardown safety net (runs on cancel/failure)
         if: always()
         env:
-          ADMIN_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+          # Sourced from Infisical (staging /shared/controlplane-admin) via the
+          # "Fetch platform model+runtime from KMS SSOT" job step above.
+          ADMIN_TOKEN: ${{ env.MOLECULE_ADMIN_TOKEN }}
         run: |
           set +e
           orgs=$(curl -sS "$MOLECULE_CP_URL/cp/admin/orgs" \
