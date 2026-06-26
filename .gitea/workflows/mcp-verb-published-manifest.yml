@@ -214,7 +214,7 @@ jobs:
           echo "Installing @molecule-ai/mcp-server@${MCP_SERVER_VERSION} from ${REGISTRY}"
           npm install "@molecule-ai/mcp-server@${MCP_SERVER_VERSION}" --no-audit --no-fund
 
-          INSTALLED_VERSION="$(node -e "console.log(require('@molecule-ai/mcp-server/package.json').version)")"
+          INSTALLED_VERSION="$(node -e "const fs=require('fs'); console.log(JSON.parse(fs.readFileSync(process.cwd()+'/node_modules/@molecule-ai/mcp-server/package.json','utf8')).version)")"
           echo "Resolved published version: ${INSTALLED_VERSION}"
 
           cd "${GITHUB_WORKSPACE}"
