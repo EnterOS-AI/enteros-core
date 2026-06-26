@@ -59,7 +59,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # bp-required: pending RFC #3285 -- advisory-first; standalone SSOT-sync gate,
+  # bp-required: pending #3285 -- advisory-first; standalone SSOT-sync gate,
   # not in branch protection yet (promote after a green soak; needs repo-admin).
   ssot-sync:
     name: Verify core's contract mirror matches the molecule-contracts SSOT
