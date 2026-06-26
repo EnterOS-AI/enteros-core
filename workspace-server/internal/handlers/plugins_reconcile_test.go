@@ -189,6 +189,107 @@ func TestReconcile_StaleInstalledRow_MissingOnBox_Delivers(t *testing.T) {
 	}
 }
 
+// TestReconcile_PlatformMCP_PresentOnBoxButMissingFromRuntimeConfig_Redelivers
+// verifies part (a) of the SaaS nil-backend fix: the concierge management MCP
+// can have its plugin files on disk while the executor's runtime config
+// (/configs/.claude/settings.json) still lacks the molecule-platform server.
+// pluginPresentOnBox must detect that mismatch and re-deliver (which restarts
+// the workspace so the runtime config regenerates). The check uses EIC, not the
+// nil local-Docker provisioner backend.
+func TestReconcile_PlatformMCP_PresentOnBoxButMissingFromRuntimeConfig_Redelivers(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	h, delivered := newReconcileHandler(t)
+
+	// Seed a local management MCP plugin so the local resolver can stage it.
+	mgmtDir := filepath.Join(h.pluginsDir, conciergePlatformMCPName)
+	if err := os.MkdirAll(mgmtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(mgmtDir, "plugin.yaml"), []byte("name: "+conciergePlatformMCPName+"\n"), 0o644)
+
+	h.instanceIDLookup = func(string) (string, error) { return "i-123", nil }
+
+	origManifest := readPluginManifestViaEIC
+	readPluginManifestViaEIC = func(ctx context.Context, instanceID, runtime, pluginName string) ([]byte, error) {
+		return []byte("name: " + conciergePlatformMCPName + "\n"), nil
+	}
+	defer func() { readPluginManifestViaEIC = origManifest }()
+
+	origSettings := readRuntimeConfigViaEIC
+	readRuntimeConfigViaEIC = func(ctx context.Context, instanceID, runtime, relPath string) ([]byte, error) {
+		// Settings.json exists but does NOT include molecule-platform yet.
+		return []byte(`{"mcpServers":{"other-server":{"command":"/bin/false"}}}`), nil
+	}
+	defer func() { readRuntimeConfigViaEIC = origSettings }()
+
+	expectDeclared(mock,
+		[]DeclaredPlugin{{PluginName: conciergePlatformMCPName, SourceRaw: "local://" + conciergePlatformMCPName}},
+		[]string{conciergePlatformMCPName}, // stale installed row
+	)
+	// recordWorkspacePluginInstall does a kind precheck for the privileged
+	// management MCP plugin.
+	mock.ExpectQuery(`SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-mgmt").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+	// Reconcile must re-deliver and upsert the tracking row.
+	mock.ExpectExec(`INSERT INTO workspace_plugins`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	h.ReconcileWorkspacePlugins(context.Background(), "ws-mgmt")
+
+	if len(*delivered) != 1 || (*delivered)[0] != conciergePlatformMCPName {
+		t.Fatalf("management MCP with missing runtime-config entry must re-deliver, got %v", *delivered)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// TestReconcile_PlatformMCP_RuntimeConfigAlreadyPresent_NoOp verifies the
+// happy path: plugin files present AND runtime config already contains
+// molecule-platform → pure no-op, no re-delivery.
+func TestReconcile_PlatformMCP_RuntimeConfigAlreadyPresent_NoOp(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	h, delivered := newReconcileHandler(t)
+
+	mgmtDir := filepath.Join(h.pluginsDir, conciergePlatformMCPName)
+	if err := os.MkdirAll(mgmtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(mgmtDir, "plugin.yaml"), []byte("name: "+conciergePlatformMCPName+"\n"), 0o644)
+
+	h.instanceIDLookup = func(string) (string, error) { return "i-123", nil }
+
+	origManifest := readPluginManifestViaEIC
+	readPluginManifestViaEIC = func(ctx context.Context, instanceID, runtime, pluginName string) ([]byte, error) {
+		return []byte("name: " + conciergePlatformMCPName + "\n"), nil
+	}
+	defer func() { readPluginManifestViaEIC = origManifest }()
+
+	origSettings := readRuntimeConfigViaEIC
+	readRuntimeConfigViaEIC = func(ctx context.Context, instanceID, runtime, relPath string) ([]byte, error) {
+		return []byte(`{"mcpServers":{"molecule-platform":{"command":"/opt/molecule-mcp-server"}}}`), nil
+	}
+	defer func() { readRuntimeConfigViaEIC = origSettings }()
+
+	expectDeclared(mock,
+		[]DeclaredPlugin{{PluginName: conciergePlatformMCPName, SourceRaw: "local://" + conciergePlatformMCPName}},
+		[]string{conciergePlatformMCPName},
+	)
+	// No INSERT expected.
+
+	h.ReconcileWorkspacePlugins(context.Background(), "ws-mgmt-ok")
+
+	if len(*delivered) != 0 {
+		t.Fatalf("management MCP already in runtime config must be a no-op, got %v", *delivered)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
 func TestReconcile_NoDeclared_NoQueriesBeyondFirst(t *testing.T) {
 	mock, cleanup := withMockDB(t)
 	defer cleanup()

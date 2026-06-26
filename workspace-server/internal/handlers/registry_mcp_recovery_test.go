@@ -189,6 +189,85 @@ func TestFireReconcileMCPRecovery_RateLimited(t *testing.T) {
 	}
 }
 
+// TestHeartbeatHandler_PlatformMCPPresentButEmptyTools_FiresRecoveryReconcile
+// verifies part (b) of the PR-4 fix: when the runtime reports
+// mcp_server_present=true but loaded_mcp_tools is empty/missing the required
+// tool, the concierge degrades AND fires the recovery reconcile. The previous
+// code only fired recovery when mcp_server_present=false, leaving this
+// post-de-bake deadlock variant uncovered (RCA#2970/#3082/#3228).
+func TestHeartbeatHandler_PlatformMCPPresentButEmptyTools_FiresRecoveryReconcile(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewRegistryHandler(broadcaster)
+
+	reconcileFired := make(chan string, 4)
+	handler.SetReconcileFunc(func(_ context.Context, workspaceID string) {
+		reconcileFired <- workspaceID
+	})
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-mcp-empty-tools").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-mcp-empty-tools", 0.0, "", 0, 60, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// loaded_mcp_tools persistence.
+	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+		WithArgs(sqlmock.AnyArg(), "ws-mcp-empty-tools").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Grace window already elapsed.
+	sustained := time.Now().Add(-5 * time.Minute)
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
+		WithArgs("ws-mcp-empty-tools").
+		WillReturnRows(evalStatusRows("online", "platform", nil, sustained))
+
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs("ws-mcp-empty-tools").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	mock.ExpectQuery("SELECT plugin_name, source_raw FROM workspace_declared_plugins").
+		WithArgs("ws-mcp-empty-tools").
+		WillReturnRows(sqlmock.NewRows([]string{"plugin_name", "source_raw"}).
+			AddRow(conciergePlatformMCPName, "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"))
+
+	msg := "platform agent management MCP declared but not loaded; marking degraded (core#3082)"
+	mock.ExpectExec("UPDATE workspaces SET status =.*status = 'online'").
+		WithArgs(models.StatusDegraded, msg, "ws-mcp-empty-tools").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"workspace_id":"ws-mcp-empty-tools","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":[]}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case got := <-reconcileFired:
+		if got != "ws-mcp-empty-tools" {
+			t.Errorf("recovery reconcile fired for wrong workspace: got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("PR-4 regression: mcp_server_present=true with empty tools did NOT fire recovery reconcile")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // nil reconcile func / empty id must be no-ops (never panic).
 func TestFireReconcileMCPRecovery_NilSafe(t *testing.T) {
 	h := &RegistryHandler{} // reconcilePlugins is nil

@@ -37,6 +37,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os"
 	"strings"
@@ -171,22 +172,35 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 // (no container / no instance / read error / empty manifest), so the caller
 // falls back to delivering — a genuinely-missing install is never silently
 // skipped, only a confirmed-present one is deduped.
+//
+// For the concierge's management MCP (molecule-ai-plugin-molecule-platform-mcp),
+// file presence is not enough. The executor's runtime config
+// (/configs/.claude/settings.json) must actually contain the molecule-platform
+// MCP server entry; on a de-baked SaaS box the plugin files can be present while
+// the runtime config was generated before the plugin landed, so a restart is
+// required. This check uses EIC / docker exec, never the nil local-Docker
+// provisioner backend, so SaaS tenants without a Docker daemon still recover.
 func (h *PluginsHandler) pluginPresentOnBox(ctx context.Context, workspaceID, pluginName string) bool {
+	var containerName, instanceID, runtime string
 	// Local Docker path: if the workspace container is running, read its
 	// /configs/plugins/<name>/plugin.yaml directly. This covers local/dev boxes
 	// where there is no EC2 instance to probe via EIC.
-	if containerName := h.findRunningContainer(ctx, workspaceID); containerName != "" {
+	if containerName = h.findRunningContainer(ctx, workspaceID); containerName != "" {
 		out, err := h.execInContainer(ctx, containerName, []string{
 			"cat", "/configs/plugins/" + pluginName + "/plugin.yaml",
 		})
 		if err != nil || len(out) == 0 {
 			return false // not present or unreadable on the box
 		}
+		if pluginName == conciergePlatformMCPName &&
+			!h.managementMCPRuntimeConfigPresent(ctx, workspaceID, containerName, "", "") {
+			return false // plugin files present but runtime config hasn't picked it up
+		}
 		return true
 	}
 
 	// SaaS EC2 path: probe the remote instance via EIC SSH.
-	instanceID, runtime := h.lookupSaaSDispatch(workspaceID)
+	instanceID, runtime = h.lookupSaaSDispatch(workspaceID)
 	if instanceID == "" {
 		return false // not a SaaS box we can probe — deliver as before
 	}
@@ -194,7 +208,51 @@ func (h *PluginsHandler) pluginPresentOnBox(ctx context.Context, workspaceID, pl
 	if err != nil || len(data) == 0 {
 		return false // can't confirm presence — fall back to deliver
 	}
+	if pluginName == conciergePlatformMCPName &&
+		!h.managementMCPRuntimeConfigPresent(ctx, workspaceID, "", instanceID, runtime) {
+		return false // plugin files present but runtime config hasn't picked it up
+	}
 	return true
+}
+
+// managementMCPRuntimeConfigPresent reports whether the executor's runtime
+// config already references the molecule-platform MCP server. This closes the
+// post-de-bake gap where plugin files exist on disk but the runtime config
+// (/configs/.claude/settings.json) was generated before they landed, so the
+// concierge stays degraded with loaded_mcp_tools empty. Probes via the same
+// Docker/EIC primitives pluginPresentOnBox uses — no local provisioner backend
+// required.
+// readRuntimeConfigViaEIC is the testable hook for reading a runtime-config
+// file from a SaaS workspace EC2. Production uses readFileViaEIC; tests stub it
+// to avoid standing up AWS EIC tunnels.
+var readRuntimeConfigViaEIC = func(ctx context.Context, instanceID, runtime, relPath string) ([]byte, error) {
+	return readFileViaEIC(ctx, instanceID, runtime, "/configs", relPath)
+}
+
+func (h *PluginsHandler) managementMCPRuntimeConfigPresent(ctx context.Context, workspaceID, containerName, instanceID, runtime string) bool {
+	const settingsRelPath = ".claude/settings.json"
+	var data []byte
+	var err error
+	if containerName != "" {
+		var out string
+		out, err = h.execInContainer(ctx, containerName, []string{"cat", "/configs/" + settingsRelPath})
+		data = []byte(out)
+	} else if instanceID != "" {
+		data, err = readRuntimeConfigViaEIC(ctx, instanceID, runtime, settingsRelPath)
+	} else {
+		return false
+	}
+	if err != nil || len(data) == 0 {
+		return false
+	}
+	var cfg struct {
+		MCPServers map[string]json.RawMessage `json:"mcpServers"`
+	}
+	if json.Unmarshal(data, &cfg) != nil {
+		return false
+	}
+	_, ok := cfg.MCPServers[conciergePlatformMCPServerName]
+	return ok
 }
 
 // cleanup removes the staged tempdir. Mirrors the defer the interactive
