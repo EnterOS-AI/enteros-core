@@ -2,12 +2,12 @@
 # FUNCTIONAL real-LLM E2E: prove the org concierge (the platform agent) can
 # actually DO org-management work — send it a natural-language request and
 # assert it REALLY CREATES a workspace via its platform MCP (87 org-admin tools,
-# incl. create_workspace), NOT just that a REST API returned 200.
+# incl. provision_workspace), NOT just that a REST API returned 200.
 #
 # This is the RFC docs/design/rfc-platform-agent.md §11.4 "Reach" check, made
 # into a gating CI test:
 #
-#   "chat the platform agent → it list_workspaces then create_workspace via the
+#   "chat the platform agent → it list_workspaces then provision_workspace via the
 #    platform MCP and reports back via send_message_to_user."
 #
 # Unlike test_staging_concierge_e2e.sh (which drives the user_tasks REST+MCP
@@ -15,10 +15,10 @@
 # the AGENT: it sends an A2A message/send envelope (the user→concierge chat
 # path) and asserts the DETERMINISTIC SIDE EFFECT — a workspace with the exact
 # name we asked for now EXISTS in GET /workspaces — which can only happen if the
-# concierge's LLM actually invoked the create_workspace platform-MCP tool.
+# concierge's LLM actually invoked the provision_workspace platform-MCP tool.
 #
 # The old step 4.5 asked the LLM to SELF-REPORT its tool list; that flaked because
-# the LLM can omit create_workspace even when the tool is loaded. This version
+# the LLM can omit provision_workspace even when the tool is loaded. This version
 # removes that probe and relies on the real side-effect plus an optional
 # `loaded_mcp_tools` inventory guard (core#3082) once the runtime producer lands.
 #
@@ -74,6 +74,12 @@ source "$(dirname "$0")/lib/aws_leak_check.sh"
 # shellcheck disable=SC1091
 # shellcheck source=lib/completion_assert.sh
 source "$(dirname "$0")/lib/completion_assert.sh"
+# SSOT for the platform MCP management tool verb. Sourcing this gives us
+# PLATFORM_MCP_REQUIRED_TOOL and PLATFORM_MCP_REQUIRED_TOOL_ID so the test
+# cannot drift from the real tool name again.
+# shellcheck disable=SC1091
+# shellcheck source=lib/provision_tool_ssot.sh
+source "$(dirname "$0")/lib/provision_tool_ssot.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
@@ -375,7 +381,7 @@ while true; do
     skip_loud "concierge $CONCIERGE_ID never reached online+routable within ${CONCIERGE_ONLINE_SECS}s \
 (last status='${C_STATUS}', url='${C_URL}', err='${LAST_ERR}'). The concierge must be provisioned on a \
 runtime image that installs the molecule-platform-mcp plugin and has a working model; otherwise it cannot \
-run the create_workspace tool."
+run the ${PLATFORM_MCP_REQUIRED_TOOL} tool."
   fi
   sleep 10
 done
@@ -383,7 +389,7 @@ ok "Concierge online + routable (url assigned)"
 
 # ─── 4.5. Required loaded-MCP-tools inventory check (core#3082) ──────────────
 # The concierge runtime must report `loaded_mcp_tools` on its heartbeat and
-# that list must include the platform management `create_workspace` tool.
+# that list must include the platform management `${PLATFORM_MCP_REQUIRED_TOOL}` tool.
 # This is a REQUIRED gate: if the field is absent or does not include the
 # tool, the concierge cannot satisfy the core#3082 online gate and this
 # test fails closed. The real side-effect assertion below is NOT sufficient
@@ -405,16 +411,13 @@ print(json.dumps(tools))"
 
 LOADED_TOOLS=$(concierge_loaded_mcp_tools_json)
 if [ -n "$LOADED_TOOLS" ] && [ "$LOADED_TOOLS" != "[]" ]; then
-  if [ "$(echo "$LOADED_TOOLS" | python3 -c "
-import sys, json
-tools = json.load(sys.stdin)
-print('yes' if 'mcp__molecule-platform__create_workspace' in tools else 'no')")" = "yes" ]; then
-    ok "loaded_mcp_tools inventory confirms mcp__molecule-platform__create_workspace"
+  if [ "$(loaded_mcp_tools_has_required "$LOADED_TOOLS")" = "yes" ]; then
+    ok "loaded_mcp_tools inventory confirms $(required_provision_tool_id)"
   else
-    skip_loud "loaded_mcp_tools inventory check FAIL: mcp__molecule-platform__create_workspace not reported. Tools: $(echo "$LOADED_TOOLS" | head -c 400)"
+    skip_loud "loaded_mcp_tools inventory check FAIL: $(required_provision_tool_id) not reported. Tools: $(echo "$LOADED_TOOLS" | head -c 400)"
   fi
 else
-  skip_loud "loaded_mcp_tools absent or empty — the runtime producer (runtime#181) must populate this field and include mcp__molecule-platform__create_workspace"
+  skip_loud "loaded_mcp_tools absent or empty — the runtime producer (runtime#181) must populate this field and include $(required_provision_tool_id)"
 fi
 
 # Pre-state: the worker MUST NOT exist yet (so its later appearance is causally
@@ -430,7 +433,7 @@ log "5/6 Sending the concierge a natural-language create-workspace request..."
 # message/send envelope is the canvas user→agent chat path (handlers/a2a_proxy.go),
 # identical to the shape test_a2a_e2e.sh / test_staging_full_saas.sh use.
 AGENT_PROMPT="Please create a new workspace in this org right now using your platform tools. \
-Use the create_workspace tool with name exactly \"${WORKER_NAME}\" and role \"engineer\". \
+Use the ${PLATFORM_MCP_REQUIRED_TOOL} tool with name exactly \"${WORKER_NAME}\" and role \"engineer\". \
 Do not ask me any clarifying questions — the name and role are final. \
 After the tool succeeds, reply with the new workspace id."
 A2A_PAYLOAD=$(WORKER_NAME="$WORKER_NAME" AGENT_PROMPT="$AGENT_PROMPT" python3 -c "
@@ -499,13 +502,13 @@ while true; do
   [ -n "$WORKER_ID" ] && break
   if [ "$(date +%s)" -gt "$ACT_DEADLINE" ]; then
     # The agent answered but the workspace never appeared → the LLM did NOT call
-    # create_workspace (or the tool failed). Distinguish the two for the operator.
+    # ${PLATFORM_MCP_REQUIRED_TOOL} (or the tool failed). Distinguish the two for the operator.
     if hit=$(a2a_completion_error_marker "$AGENT_TEXT"); then
       fail "TOOL FAILED: concierge surfaced an error-as-text reply (matched '$hit') and no workspace '$WORKER_NAME' was created. \
-The platform MCP create_workspace tool errored. Reply: $(echo "$AGENT_TEXT" | head -c 400)"
+The platform MCP ${PLATFORM_MCP_REQUIRED_TOOL} tool errored. Reply: $(echo "$AGENT_TEXT" | head -c 400)"
     fi
     fail "AGENT DID NOT ACT: concierge replied but no workspace named '$WORKER_NAME' exists in GET /workspaces after ${AGENT_ACT_SECS}s. \
-The concierge's LLM did not invoke the create_workspace platform-MCP tool. \
+The concierge's LLM did not invoke the ${PLATFORM_MCP_REQUIRED_TOOL} platform-MCP tool. \
 Reply: $(echo "$AGENT_TEXT" | head -c 400)"
   fi
   sleep 8
@@ -515,7 +518,7 @@ ok "DETERMINISTIC SIDE EFFECT CONFIRMED: workspace '$WORKER_NAME' now EXISTS (id
 # Confirm it is a real workspace row (kind='workspace') parented under the org —
 # i.e. a genuine create, not a no-op echo. parent_id may be the concierge (the
 # concierge creates children under itself by convention) or another node; we
-# assert only that it's a non-platform workspace, which is what create_workspace
+# assert only that it's a non-platform workspace, which is what ${PLATFORM_MCP_REQUIRED_TOOL}
 # yields.
 WORKER_KIND=$(workspace_field "$WORKER_ID" kind)
 if [ -n "$WORKER_KIND" ] && [ "$WORKER_KIND" != "workspace" ]; then
@@ -537,4 +540,4 @@ else
 fi
 
 ok "═══ STAGING CONCIERGE CREATES-A-WORKSPACE E2E PASSED ═══"
-log "Proven: a natural-language A2A request → the concierge's LLM invoked create_workspace via the platform MCP → real org mutation (workspace '$WORKER_NAME' id=$WORKER_ID). Teardown runs via EXIT trap."
+log "Proven: a natural-language A2A request → the concierge's LLM invoked ${PLATFORM_MCP_REQUIRED_TOOL} via the platform MCP → real org mutation (workspace '$WORKER_NAME' id=$WORKER_ID). Teardown runs via EXIT trap."
