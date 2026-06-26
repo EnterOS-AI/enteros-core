@@ -78,10 +78,15 @@ jobs:
     env:
       # The Infisical fetch step populates these from the same
       # /shared/cloudflare-tunnel-admin path that sweep-cf-orphans uses
-      # (wave-B aliases migration). No direct Gitea-secret read — the
-      # Infisical-fetch + string-only isinstance + ::add-mask:: chain is
-      # the canonical fail-closed pattern (see #971 + #3274).
+      # (wave-B aliases migration). No direct Gitea-secret read for the
+      # values being fetched — only the Infisical-fetch bootstrap
+      # credentials (INFISICAL_CI_*) are Gitea secrets; the values
+      # themselves come through the read_secret → add-mask → GITHUB_ENV
+      # chain. The Infisical-fetch + string-only isinstance + ::add-mask::
+      # pattern is the canonical fail-closed convention (see #971 + #3274).
       INFISICAL_BASE: 'https://key.moleculesai.app'
+      INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+      INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
       INFISICAL_PROJECT_ID: '7c8e456a-2eb5-4326-b4ed-7c1a6c4f4c5c'
       ZONE_LABEL: ${{ vars.ZONE_LABEL || 'moleculesai.app' }}
 
