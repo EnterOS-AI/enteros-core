@@ -76,8 +76,15 @@ jobs:
     # the sweep-cf-orphans companion job).
     timeout-minutes: 30
     env:
-      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
-      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # CF_API_TOKEN / CF_ACCOUNT_ID now arrive via $GITHUB_ENV from the "Fetch
+      # CF_API_TOKEN + CF_ACCOUNT_ID from Infisical SSOT" step below (wave-B
+      # aliases migration). They come from prod /shared/cloudflare-tunnel-admin
+      # (CLOUDFLARE_API_TOKEN = the account:cloudflare_tunnel:edit-scoped
+      # token this account-level sweep requires, CLOUDFLARE_ACCOUNT_ID = the
+      # account that owns the tunnels). The old CF_API_TOKEN/CLOUDFLARE_API_TOKEN
+      # + CF_ACCOUNT_ID/CLOUDFLARE_ACCOUNT_ID Gitea Actions secrets are left in
+      # place until a green run validates this path (validate-before-delete).
+      # The Verify-required-secrets gate still validates both are non-empty.
       # CP_ADMIN_API_TOKEN now arrives via $GITHUB_ENV from the "Fetch
       # CP_ADMIN_API_TOKEN from Infisical KMS" step below (wave-3 migration).
       # The Verify-required-secrets gate still validates it is non-empty.
@@ -130,6 +137,61 @@ jobs:
           fi
           echo "CP_ADMIN_API_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
           echo "CP_ADMIN_API_TOKEN loaded from Infisical (len=${#CP_ADMIN_API_TOKEN})"
+
+      # KMS wave-B (Gitea-Actions-secrets -> Infisical SSOT): source the
+      # account-scoped Cloudflare tunnel token + the owning account id from
+      # Infisical (prod /shared/cloudflare-tunnel-admin) via the CI machine
+      # identity instead of the duplicated CF_API_TOKEN/CLOUDFLARE_API_TOKEN and
+      # CF_ACCOUNT_ID/CLOUDFLARE_ACCOUNT_ID Gitea Actions secrets. This sweep
+      # hits /accounts/<id>/cfd_tunnel, so it needs the account-scoped
+      # CLOUDFLARE_API_TOKEN (account:cloudflare_tunnel:edit), NOT the
+      # zone-scoped DNS token the orphans sweep uses. Exported to $GITHUB_ENV
+      # under the same CF_API_TOKEN / CF_ACCOUNT_ID names the verify + sweep
+      # steps already read, so nothing downstream changes.
+      #
+      # TRUSTED-REF GATING: molecule-core is a PUBLIC repo; this step consumes
+      # the INFISICAL_CI_* machine-identity secrets, so it must only run on a
+      # TRUSTED event — the schedule cron or an operator workflow_dispatch. An
+      # untrusted-fork PR cannot reach this step.
+      - name: Fetch CF_API_TOKEN + CF_ACCOUNT_ID from Infisical SSOT
+        id: cf_tunnel_creds
+        if: >-
+          github.event_name == 'schedule' ||
+          github.event_name == 'workflow_dispatch'
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
+          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
+          }
+          CF_API_TOKEN=$(read_secret CLOUDFLARE_API_TOKEN %2Fshared%2Fcloudflare-tunnel-admin)
+          echo "::add-mask::$CF_API_TOKEN"
+          if [ -z "$CF_API_TOKEN" ]; then
+            echo "::error::Infisical returned empty CLOUDFLARE_API_TOKEN at prod /shared/cloudflare-tunnel-admin — failing closed."
+            exit 1
+          fi
+          CF_ACCOUNT_ID=$(read_secret CLOUDFLARE_ACCOUNT_ID %2Fshared%2Fcloudflare-tunnel-admin)
+          echo "::add-mask::$CF_ACCOUNT_ID"
+          if [ -z "$CF_ACCOUNT_ID" ]; then
+            echo "::error::Infisical returned empty CLOUDFLARE_ACCOUNT_ID at prod /shared/cloudflare-tunnel-admin — failing closed."
+            exit 1
+          fi
+          {
+            echo "CF_API_TOKEN=$CF_API_TOKEN"
+            echo "CF_ACCOUNT_ID=$CF_ACCOUNT_ID"
+          } >> "$GITHUB_ENV"
+          echo "CF_API_TOKEN + CF_ACCOUNT_ID loaded from Infisical (token_len=${#CF_API_TOKEN}, account_len=${#CF_ACCOUNT_ID})"
 
       - name: Verify required secrets present
         id: verify
