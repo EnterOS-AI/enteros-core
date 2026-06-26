@@ -64,8 +64,14 @@ class TestQaReviewDirectTrigger:
         wf = load_workflow("qa-review.yml")
         post = _post_step(wf)
         env = post.get("env", {})
-        assert env.get("GITEA_TOKEN") == "${{ secrets.STATUS_POST_TOKEN }}", (
-            "POST step must use STATUS_POST_TOKEN for write-scoped status POST"
+        # KMS consolidation (#971/#3274): the write-scoped status POST token is
+        # now fetched from the Infisical SSOT (prod /shared/ci-status) and
+        # exported to $GITHUB_ENV as CI_STATUS_TOKEN by the "Fetch
+        # CI_STATUS_TOKEN from Infisical SSOT" step, replacing the old
+        # secrets.STATUS_POST_TOKEN Gitea Actions secret.
+        assert env.get("GITEA_TOKEN") == "${{ env.CI_STATUS_TOKEN }}", (
+            "POST step must use the Infisical-sourced CI_STATUS_TOKEN "
+            "(env.CI_STATUS_TOKEN) for the write-scoped status POST"
         )
 
     def test_post_step_context_name_exact(self):
@@ -105,8 +111,14 @@ class TestSecurityReviewDirectTrigger:
         wf = load_workflow("security-review.yml")
         post = _post_step(wf)
         env = post.get("env", {})
-        assert env.get("GITEA_TOKEN") == "${{ secrets.STATUS_POST_TOKEN }}", (
-            "POST step must use STATUS_POST_TOKEN for write-scoped status POST"
+        # KMS consolidation (#971/#3274): the write-scoped status POST token is
+        # now fetched from the Infisical SSOT (prod /shared/ci-status) and
+        # exported to $GITHUB_ENV as CI_STATUS_TOKEN by the "Fetch
+        # CI_STATUS_TOKEN from Infisical SSOT" step, replacing the old
+        # secrets.STATUS_POST_TOKEN Gitea Actions secret.
+        assert env.get("GITEA_TOKEN") == "${{ env.CI_STATUS_TOKEN }}", (
+            "POST step must use the Infisical-sourced CI_STATUS_TOKEN "
+            "(env.CI_STATUS_TOKEN) for the write-scoped status POST"
         )
 
     def test_post_step_context_name_exact(self):
@@ -149,8 +161,13 @@ class TestRefireTokenSeparation:
     def test_qa_refire_uses_status_post_token(self):
         step = self._refire_step("sop-checklist.yml", "Refire qa-review")
         env = step.get("env", {})
-        assert env.get("STATUS_POST_TOKEN") == "${{ secrets.STATUS_POST_TOKEN }}", (
-            "qa refire must receive STATUS_POST_TOKEN env var"
+        # KMS consolidation (#971/#3274): the STATUS_POST_TOKEN env var the
+        # review-refire-status.sh script reads is now sourced from the
+        # Infisical SSOT (prod /shared/ci-status) via $GITHUB_ENV
+        # (CI_STATUS_TOKEN), replacing the old secrets.STATUS_POST_TOKEN.
+        assert env.get("STATUS_POST_TOKEN") == "${{ env.CI_STATUS_TOKEN }}", (
+            "qa refire must receive the Infisical-sourced CI_STATUS_TOKEN "
+            "under the STATUS_POST_TOKEN env var"
         )
         # Evaluator stays on read token (no GITHUB_TOKEN fallback; it lacks
         # read:org scope for team-membership checks).
@@ -161,8 +178,13 @@ class TestRefireTokenSeparation:
     def test_security_refire_uses_status_post_token(self):
         step = self._refire_step("sop-checklist.yml", "Refire security-review")
         env = step.get("env", {})
-        assert env.get("STATUS_POST_TOKEN") == "${{ secrets.STATUS_POST_TOKEN }}", (
-            "security refire must receive STATUS_POST_TOKEN env var"
+        # KMS consolidation (#971/#3274): the STATUS_POST_TOKEN env var the
+        # review-refire-status.sh script reads is now sourced from the
+        # Infisical SSOT (prod /shared/ci-status) via $GITHUB_ENV
+        # (CI_STATUS_TOKEN), replacing the old secrets.STATUS_POST_TOKEN.
+        assert env.get("STATUS_POST_TOKEN") == "${{ env.CI_STATUS_TOKEN }}", (
+            "security refire must receive the Infisical-sourced CI_STATUS_TOKEN "
+            "under the STATUS_POST_TOKEN env var"
         )
         assert env.get("GITEA_TOKEN") == "${{ secrets.SOP_CHECKLIST_GATE_TOKEN }}", (
             "security refire evaluator must use read-scoped SOP_CHECKLIST_GATE_TOKEN"
