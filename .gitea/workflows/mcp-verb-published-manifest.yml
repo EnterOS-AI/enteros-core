@@ -1,0 +1,133 @@
+name: mcp-verb-published-manifest
+
+# Cross-repo manifest check — published @molecule-ai/mcp-server vs the
+# MCP-plugin delivery verb contract (core#3082).
+#
+# Resolves the ACTUAL tool manifest of the PUBLISHED @molecule-ai/mcp-server
+# build (the build a concierge is delivered) and asserts it satisfies the
+# contract's accepted verb union (required_tools ∪ transitional_tool_aliases).
+# This is the layer that would have caught the staging stale-published-build
+# degrade — a published build skewed away from the contract fails HERE, in core
+# CI, BEFORE any tenant provisions a concierge against it.
+#
+# It complements:
+#   • the in-repo Go contract test (mcp_plugin_delivery_contract_test.go) which
+#     checks core's OWN hand-written verb against the contract, and
+#   • the producer-binding test in @molecule-ai/mcp-server which checks the
+#     producer SOURCE against the same contract.
+# Neither sees the PUBLISHED artifact; this workflow does.
+#
+# DELIBERATELY runs against the PUBLISHED package, not a source checkout: the
+# mcp-server's git `main` lacks the management-mode split the published
+# artifacts carry, so the verb a concierge runs lives only in the published
+# build. See scripts/mcp-verb-manifest-check/check-published-mcp-manifest.mjs.
+#
+# ENFORCEMENT GATING: standalone workflow, NOT a job in ci.yml and NOT yet in
+# branch protection (soak-then-promote; mirrors
+# mcp-plugin-delivery-contract-drift.yml). Promote into BP once it has soaked.
+#
+# AUTH: MCP_SERVER_READPKG_TOKEN — a Gitea token with read:package scope for the
+# molecule-ai npm registry. Fail-closed on trusted contexts; soft-skip on
+# untrusted fork PRs (which cannot hold repo secrets — the check still runs on
+# the trusted post-merge / scheduled run before any provision).
+#
+# DEPENDS ON: molecule-core's verb-SSOT PR (feat/3082-mcp-verb-ssot-contract)
+# landing `required_tools` (+ optional `transitional_tool_aliases`) in
+# contracts/mcp-plugin-delivery.contract.json. The checker reads those fields
+# and falls back to the legacy singular `required_tool` if absent, so it is safe
+# to merge AFTER the contract shape lands.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'contracts/mcp-plugin-delivery.contract.json'
+      - 'scripts/mcp-verb-manifest-check/**'
+      - '.gitea/workflows/mcp-verb-published-manifest.yml'
+  push:
+    branches: [main, staging]
+    paths:
+      - 'contracts/mcp-plugin-delivery.contract.json'
+      - 'scripts/mcp-verb-manifest-check/**'
+      - '.gitea/workflows/mcp-verb-published-manifest.yml'
+  schedule:
+    # Daily at :41 — catch a newly PUBLISHED mcp-server build that skewed away
+    # from the contract even when neither file in this repo changed (the stale
+    # published-build failure mode is time-dependent, not commit-dependent).
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-verb-published-manifest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Published mcp-server manifest ⊇ contract required verbs
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Resolve published mcp-server manifest and assert against the contract
+        env:
+          MCP_SERVER_READPKG_TOKEN: ${{ secrets.MCP_SERVER_READPKG_TOKEN }}
+          REGISTRY_HOST: ${{ github.server_url }}
+          # Override to pin a specific published version (e.g. the version core
+          # would deliver). Defaults to the registry's `latest` dist-tag.
+          MCP_SERVER_VERSION: latest
+        run: |
+          set -euo pipefail
+
+          case "${{ github.event_name }}" in
+            push|schedule|workflow_dispatch)
+              is_trusted=true ;;
+            pull_request)
+              if [ "${{ github.event.pull_request.head.repo.fork }}" = "false" ]; then
+                is_trusted=true
+              else
+                is_trusted=false
+              fi ;;
+            *)
+              is_trusted=true ;;
+          esac
+
+          if [ -z "${MCP_SERVER_READPKG_TOKEN:-}" ]; then
+            if [ "$is_trusted" = "true" ]; then
+              echo "::error::MCP_SERVER_READPKG_TOKEN (read:package) missing on a trusted context — cannot resolve the published mcp-server manifest."
+              exit 1
+            fi
+            echo "::warning::MCP_SERVER_READPKG_TOKEN missing on an untrusted fork PR — skipping the published-manifest check (it runs on the trusted post-merge / scheduled run before any provision)."
+            exit 0
+          fi
+
+          # host without scheme, e.g. git.moleculesai.app
+          HOST="${REGISTRY_HOST#https://}"; HOST="${HOST#http://}"
+          REGISTRY="${REGISTRY_HOST}/api/packages/molecule-ai/npm/"
+
+          WORKDIR="$(mktemp -d)"
+          cd "$WORKDIR"
+          printf '{ "name": "mcp-manifest-probe", "private": true, "type": "module" }\n' > package.json
+          # Scope @molecule-ai to the Gitea registry with read:package auth.
+          {
+            echo "@molecule-ai:registry=${REGISTRY}"
+            echo "//${HOST}/api/packages/molecule-ai/npm/:_authToken=${MCP_SERVER_READPKG_TOKEN}"
+          } > .npmrc
+
+          echo "Installing @molecule-ai/mcp-server@${MCP_SERVER_VERSION} from ${REGISTRY}"
+          npm install "@molecule-ai/mcp-server@${MCP_SERVER_VERSION}" --no-audit --no-fund
+
+          INSTALLED_VERSION="$(node -e "console.log(require('@molecule-ai/mcp-server/package.json').version)")"
+          echo "Resolved published version: ${INSTALLED_VERSION}"
+
+          cd "${GITHUB_WORKSPACE}"
+          node scripts/mcp-verb-manifest-check/check-published-mcp-manifest.mjs \
+            --contract contracts/mcp-plugin-delivery.contract.json \
+            --install-dir "$WORKDIR"
