@@ -24,12 +24,15 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -374,53 +377,92 @@ func conciergeDefaultRuntime() string {
 	return defaultConciergeRuntime
 }
 
-// conciergeDeclaredModel is the platform agent's compiled-in FALLBACK model — a
-// first-class product decision, NOT a generic platform default. It mirrors a
-// template's runtime_config.model SSOT. The SSOT directive
-// (feedback_workspace_model_required_no_platform_default...) forbids the platform
-// from defaulting a USER workspace's model, but the concierge IS the
-// platform-agent product, so it declares its own model exactly as a template
-// declares one (core#2594).
-//
-// CTO decision (P3b): the platform-managed default for ALL concierge runtimes is
-// "minimax/MiniMax-M2.7" — MiniMax is cheaper than kimi and is served via the
-// proxy's Anthropic-compatible arm (providers.yaml minimax: base_url_anthropic
-// https://api.minimax.io/anthropic/v1, auth_env MINIMAX_API_KEY), so the SAME
-// declared model routes for claude-code AND codex/openclaw. It is a registered
-// platform model (providers.yaml `provider: platform` set). The credential is
-// platform-proxy-side (Infisical /shared/minimax-token-plan); NO API key is
-// hardcoded here.
-//
-// SSOT FOLLOW (PR-6 concierge-follows): this const is now only the FALLBACK.
-// conciergeModelForRuntime resolves the seed model from the generic KMS platform
-// default env MOLECULE_LLM_DEFAULT_MODEL (the same SSOT the rest of core reads at
-// deploy time), falling back to this const when the env is unset (OSS / local).
-// The prod KMS value equals this const ("minimax/MiniMax-M2.7"), so making the
-// concierge follow the generic default is behavior-neutral on prod — no
-// regression. A per-runtime override remains possible via conciergeModelForRuntime,
-// but the default for every runtime is the resolved KMS value (or this fallback).
+// conciergeDeclaredModel is the platform agent's REFERENCE platform-managed model.
+// It is intentionally NOT used as a fallback at provision time (#3267 follow-up #2):
+// the concierge model MUST be resolved authoritatively from the control plane
+// (SaaS) or from the operator-supplied MOLECULE_LLM_DEFAULT_MODEL env (self-hosted),
+// and MUST fail closed if neither source is available. This const remains only as a
+// validation reference and a self-documenting product default.
 const conciergeDeclaredModel = "minimax/MiniMax-M2.7"
 
-// conciergeModelForRuntime returns the concierge's seed model for a given runtime.
-// It RESOLVES the model at runtime, NOT compile time: the generic KMS platform
-// default (MOLECULE_LLM_DEFAULT_MODEL, injected at deploy from the KMS SSOT) wins,
-// and the conciergeDeclaredModel const is only the compiled-in FALLBACK when the
-// env is unset. The platform-managed default is shared across all runtimes because
-// it routes through the proxy's Anthropic-compatible arm, which every concierge
-// runtime speaks. This indirection keeps a per-runtime override a one-line change
-// (e.g. a future codex-only model) without touching the seed logic; today it is
-// runtime-independent by design.
-//
-// CRITICAL (incident 2026-06-15): this only RESOLVES the seed candidate. The
-// caller (ensureConciergeModel) still runs the validateRegisteredModelForRuntime /
-// validateDerivedProviderInRegistry gates on the resolved id and leaves the model
-// UNSET if it is not routable for the runtime — so a bad/unroutable KMS value does
-// NOT bypass the universal MISSING_MODEL fail-closed; it triggers it.
-func conciergeModelForRuntime(_ string) string {
-	if v := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); v != "" {
-		return v
+// conciergeModelResolver resolves the concierge's seed model at provision time.
+// It is a variable so tests can stub it. The default implementation fetches the
+// model authoritatively from the CP on SaaS tenants, reads the operator env on
+// self-hosted tenants, and fails closed otherwise.
+var conciergeModelResolver = defaultResolveConciergeModel
+
+// defaultResolveConciergeModel returns the platform default model for a fresh
+// concierge. In SaaS (MOLECULE_ORG_ID + ADMIN_TOKEN present) it asks the control
+// plane at /cp/tenants/config for MOLECULE_LLM_DEFAULT_MODEL. In self-hosted/local
+// mode it reads the MOLECULE_LLM_DEFAULT_MODEL env. Any missing/unreachable source
+// returns an error so ensureConciergeModel refuses to seed and the universal
+// MISSING_MODEL gate fails closed.
+func defaultResolveConciergeModel(ctx context.Context) (string, error) {
+	// Self-hosted / local dev: the operator's env is the SSOT.
+	if os.Getenv("MOLECULE_ORG_ID") == "" || os.Getenv("ADMIN_TOKEN") == "" {
+		if v := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); v != "" {
+			return v, nil
+		}
+		return "", fmt.Errorf("MISSING_MODEL: MOLECULE_LLM_DEFAULT_MODEL not set for self-hosted concierge")
 	}
-	return conciergeDeclaredModel
+
+	cpModel, err := fetchCPDefaultModel(ctx)
+	if err != nil {
+		return "", fmt.Errorf("MISSING_MODEL: failed to fetch platform default model from CP: %w", err)
+	}
+	if cpModel == "" {
+		return "", fmt.Errorf("MISSING_MODEL: CP /cp/tenants/config returned no MOLECULE_LLM_DEFAULT_MODEL")
+	}
+	return cpModel, nil
+}
+
+// fetchCPDefaultModel asks the control plane for the tenant's config and returns
+// the value of MOLECULE_LLM_DEFAULT_MODEL. It requires MOLECULE_CP_URL,
+// ADMIN_TOKEN, and MOLECULE_ORG_ID env vars. A non-200 response or invalid JSON
+// returns an error so the caller fails closed rather than seeding a stale/default
+// model.
+func fetchCPDefaultModel(ctx context.Context) (string, error) {
+	orgID := os.Getenv("MOLECULE_ORG_ID")
+	adminToken := os.Getenv("ADMIN_TOKEN")
+	if orgID == "" || adminToken == "" {
+		return "", fmt.Errorf("missing MOLECULE_ORG_ID or ADMIN_TOKEN")
+	}
+
+	base := os.Getenv("MOLECULE_CP_URL")
+	if base == "" {
+		base = "https://api.moleculesai.app"
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", base+"/cp/tenants/config", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("X-Molecule-Org-Id", orgID)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("cp returned %d", resp.StatusCode)
+	}
+
+	var cfg map[string]string
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(cfg["MOLECULE_LLM_DEFAULT_MODEL"]), nil
 }
 
 // conciergeTemplateForRuntime maps a concierge runtime to its platform-agent
@@ -471,17 +513,26 @@ func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID
 		return // explicit model already set; never overwrite the customer's choice
 	}
 
-	// First boot — no model yet. Seed the concierge's declared default, but only
-	// if it is genuinely routable for the runtime; otherwise leave it unset and
-	// let the MISSING_MODEL gate fail closed (loud) rather than seed a model the
-	// platform cannot actually route to (silent late failure).
-	model := conciergeModelForRuntime(runtime)
+	// First boot — no model yet. Resolve the concierge's declared default from the
+	// authoritative source (CP on SaaS, operator env on self-hosted), then validate
+	// it against the registry for its runtime. If resolution fails or returns empty,
+	// leave the model unset so the universal MISSING_MODEL gate fails closed rather
+	// than seeding a stale or hardcoded default.
+	model, err := conciergeModelResolver(ctx)
+	if err != nil {
+		log.Printf("Provisioner: concierge %s model resolution failed (failing closed, NOT seeding): %v", workspaceID, err)
+		return
+	}
+	if model == "" {
+		log.Printf("Provisioner: concierge %s model unresolved (failing closed, NOT seeding)", workspaceID)
+		return
+	}
 	if ok, why := validateRegisteredModelForRuntime(runtime, model); !ok {
-		log.Printf("Provisioner: concierge %s declared model %q is NOT registered for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, runtime, why)
+		log.Printf("Provisioner: concierge %s resolved model %q is NOT registered for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, runtime, why)
 		return
 	}
 	if ok, why := validateDerivedProviderInRegistry(runtime, model); !ok {
-		log.Printf("Provisioner: concierge %s declared model %q has no derivable registry provider for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, runtime, why)
+		log.Printf("Provisioner: concierge %s resolved model %q has no derivable registry provider for runtime %q (%s) — leaving model unset; provision will fail closed", workspaceID, model, runtime, why)
 		return
 	}
 
