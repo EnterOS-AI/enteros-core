@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
@@ -97,23 +99,32 @@ func TestDecideEnsureAction(t *testing.T) {
 		found, force, hasProv      bool
 		wantTarget, wantStatus     string
 		wantProvision              bool
+		wantRevive                 bool
 	}{
-		{"missing -> create + provision", "", "", false, false, true, derived, "created", true},
-		{"missing, no provisioner -> create, no provision", "", "", false, false, false, derived, "created", false},
-		{"online -> exists no-op", existing, "online", true, false, true, existing, "exists", false},
-		{"online + force -> repair", existing, "online", true, true, true, existing, "repaired", true},
-		{"failed -> repair", existing, "failed", true, false, true, existing, "repaired", true},
-		{"offline -> repair", existing, "offline", true, false, true, existing, "repaired", true},
-		{"degraded -> repair", existing, "degraded", true, false, true, existing, "repaired", true},
-		{"degraded, no provisioner -> repair, no provision", existing, "degraded", true, false, false, existing, "repaired", false},
-		{"online uppercase still healthy", existing, "ONLINE", true, false, true, existing, "exists", false},
+		{"missing -> create + provision", "", "", false, false, true, derived, "created", true, false},
+		{"missing, no provisioner -> create, no provision", "", "", false, false, false, derived, "created", false, false},
+		{"online -> exists no-op", existing, "online", true, false, true, existing, "exists", false, false},
+		{"online + force -> repair", existing, "online", true, true, true, existing, "repaired", true, false},
+		{"failed -> repair", existing, "failed", true, false, true, existing, "repaired", true, false},
+		{"offline -> repair", existing, "offline", true, false, true, existing, "repaired", true, false},
+		{"degraded -> repair", existing, "degraded", true, false, true, existing, "repaired", true, false},
+		{"degraded, no provisioner -> repair, no provision", existing, "degraded", true, false, false, existing, "repaired", false, false},
+		{"online uppercase still healthy", existing, "ONLINE", true, false, true, existing, "exists", false, false},
+		// CR2 RC 14676 — a REMOVED (tombstoned) concierge is never 'online', so it
+		// always lands on the repair path AND is flagged for an explicit revive
+		// (clear the removed flag before provisioning). Force is irrelevant: a
+		// removed row is repaired+revived with or without it. Case-insensitive.
+		{"removed -> repair + revive", existing, "removed", true, false, true, existing, "repaired", true, true},
+		{"removed + force -> repair + revive", existing, "removed", true, true, true, existing, "repaired", true, true},
+		{"removed uppercase -> repair + revive", existing, "REMOVED", true, false, true, existing, "repaired", true, true},
+		{"removed, no provisioner -> repair + revive, no provision", existing, "removed", true, false, false, existing, "repaired", false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := decideEnsureAction(derived, tc.existingID, tc.existingStatus, tc.found, tc.force, tc.hasProv)
-			if got.targetID != tc.wantTarget || got.status != tc.wantStatus || got.provision != tc.wantProvision {
-				t.Errorf("decideEnsureAction = %+v, want target=%q status=%q provision=%v",
-					got, tc.wantTarget, tc.wantStatus, tc.wantProvision)
+			if got.targetID != tc.wantTarget || got.status != tc.wantStatus || got.provision != tc.wantProvision || got.revive != tc.wantRevive {
+				t.Errorf("decideEnsureAction = %+v, want target=%q status=%q provision=%v revive=%v",
+					got, tc.wantTarget, tc.wantStatus, tc.wantProvision, tc.wantRevive)
 			}
 		})
 	}
@@ -268,6 +279,169 @@ func TestEnsurePlatformAgent_RepairsDegraded(t *testing.T) {
 	}
 	if !cap.installCalled || !cap.provisionCalled {
 		t.Errorf("repair must install (%v) and provision (%v)", cap.installCalled, cap.provisionCalled)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestEnsurePlatformAgent_RepairsRemovedConciergeRevives is the CR2 RC 14676 fix:
+// a REMOVED (tombstoned) platform root is SELECTED by the ensure lookup (it is not
+// filtered out), repaired IN PLACE, and EXPLICITLY revived — the handler runs the
+// `UPDATE workspaces SET status='offline' ... AND status='removed'` un-tombstone
+// before triggering the provision. Without the revive the install would preserve
+// status='removed' and RestartByID would skip the row, so repair would silently
+// no-op for exactly the case it exists to handle.
+func TestEnsurePlatformAgent_RepairsRemovedConciergeRevives(t *testing.T) {
+	mock := setupTestDB(t)
+	// The lookup INCLUDES removed roots — it returns the tombstoned concierge.
+	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-removed", "removed"))
+	// The explicit revive: clear the removed flag (scoped to status='removed').
+	mock.ExpectExec(`UPDATE workspaces SET status = \$2, updated_at = now\(\) WHERE id = \$1 AND status = 'removed'`).
+		WithArgs("pa-removed", string(models.StatusOffline)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	h, cap := ensureTestHandler(t, true)
+	w, body := doEnsureRequest(t, h, `{}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if body["status"] != "repaired" {
+		t.Errorf("status = %v, want repaired (removed concierge is repaired+revived)", body["status"])
+	}
+	if cap.installID != "pa-removed" {
+		t.Errorf("repair must target the EXISTING removed id, got install id=%q", cap.installID)
+	}
+	if !cap.installCalled {
+		t.Error("repair must reinstall the removed concierge")
+	}
+	if !cap.provisionCalled || cap.provisionID != "pa-removed" {
+		t.Errorf("revived concierge must be provisioned: called=%v id=%q", cap.provisionCalled, cap.provisionID)
+	}
+	if body["provisioning"] != true {
+		t.Errorf("provisioning = %v, want true", body["provisioning"])
+	}
+	// The revive UPDATE expectation being met is the assertion that the flag was
+	// cleared deliberately.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (revive UPDATE must run): %v", err)
+	}
+}
+
+// TestEnsurePlatformAgent_NonRemovedRepairDoesNotRevive guards the inverse: a
+// degraded/failed (NOT removed) concierge is repaired WITHOUT any revive UPDATE —
+// the un-tombstone is scoped to genuinely-removed rows only. If the handler ran a
+// revive here, sqlmock would flag the unexpected UPDATE.
+func TestEnsurePlatformAgent_NonRemovedRepairDoesNotRevive(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-degraded", "degraded"))
+	// NOTE: no ExpectExec for a revive — a non-removed repair must NOT issue one.
+
+	h, cap := ensureTestHandler(t, true)
+	w, body := doEnsureRequest(t, h, `{}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if body["status"] != "repaired" {
+		t.Errorf("status = %v, want repaired", body["status"])
+	}
+	if !cap.installCalled || !cap.provisionCalled {
+		t.Errorf("degraded repair must install (%v) + provision (%v)", cap.installCalled, cap.provisionCalled)
+	}
+	// ExpectationsWereMet passes iff NO unexpected revive UPDATE was executed.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a non-removed repair must not run a revive UPDATE: %v", err)
+	}
+}
+
+// TestEnsurePlatformAgent_ReviveFailureIs500 — if the revive UPDATE errors, the
+// handler surfaces a 500 and does NOT trigger a provision (a concierge that could
+// not be un-tombstoned must not be reported as provisioning).
+func TestEnsurePlatformAgent_ReviveFailureIs500(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-removed", "removed"))
+	mock.ExpectExec(`UPDATE workspaces SET status = \$2, updated_at = now\(\) WHERE id = \$1 AND status = 'removed'`).
+		WillReturnError(fmt.Errorf("db down"))
+
+	h, cap := ensureTestHandler(t, true)
+	w, _ := doEnsureRequest(t, h, `{}`)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on revive failure, got %d: %s", w.Code, w.Body.String())
+	}
+	if cap.provisionCalled {
+		t.Error("provision must NOT fire when the revive failed")
+	}
+}
+
+// TestInstallPlatformAgent_PreservesRemovedStatusOnConflict drives the real
+// installPlatformAgent transaction through sqlmock and proves the upsert PRESERVES
+// the removed flag: the modeled statements are Begin, the kind-downgrade, the
+// INSERT…ON CONFLICT upsert, the old-roots SELECT, and Commit — and crucially NO
+// `UPDATE … SET status …` statement. sqlmock runs ordered expectations and fails
+// on any unexpected query, so the test passing is the proof that install never
+// un-tombstones a row as a side-effect (the deliberate revive lives in the ensure
+// handler, not here). The post-transaction ROW state is additionally proven on
+// real Postgres by TestIntegration_PlatformAgentInstall_PreservesRemovedFlag.
+func TestInstallPlatformAgent_PreservesRemovedStatusOnConflict(t *testing.T) {
+	mock := setupTestDB(t)
+
+	mock.ExpectBegin()
+	// 0. downgrade any other platform root (no-op here, still issued).
+	mock.ExpectExec(`UPDATE workspaces SET kind = 'workspace'.*WHERE kind = 'platform' AND parent_id IS NULL AND id <> \$1`).
+		WithArgs("pa-removed").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	// 1. upsert — the ON CONFLICT clause sets kind/parent_id/template and must NOT
+	//    touch status. Matching the DO UPDATE clause here documents that status is
+	//    absent from it.
+	mock.ExpectExec(`INSERT INTO workspaces .*ON CONFLICT \(id\) DO UPDATE SET\s+kind = 'platform',\s+parent_id = NULL,\s+template = CASE`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// 2. capture old roots — none.
+	mock.ExpectQuery(`SELECT id FROM workspaces WHERE parent_id IS NULL AND id <> \$1 FOR UPDATE`).
+		WithArgs("pa-removed").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectCommit()
+
+	if err := installPlatformAgent(context.Background(), db.DB, "pa-removed", "Org Concierge", "claude-code"); err != nil {
+		t.Fatalf("installPlatformAgent: %v", err)
+	}
+	// If install had issued any `UPDATE ... SET status` (un-tombstoning the row),
+	// sqlmock would have failed on the unexpected query above. Reaching here with
+	// all expectations met proves the upsert preserved the removed flag.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet/unexpected sqlmock expectations (install must not mutate status): %v", err)
+	}
+}
+
+// TestRestartByID_RemovedConciergeSkipped proves fix 3: with a provisioner wired,
+// RestartByID of a REMOVED concierge is a no-op. runRestartCycle's lookup filters
+// `status NOT IN ('removed','paused','hibernated')`, so a removed row scans to
+// ErrNoRows and the cycle returns BEFORE any Stop/provision — the tombstone is
+// never restarted. (The earlier provisioner-nil test only covered the early
+// return; this one exercises the DB filter with a live provisioner.)
+func TestRestartByID_RemovedConciergeSkipped(t *testing.T) {
+	mock := setupTestDB(t)
+	cp := &trackingCPProv{}
+	h := &WorkspaceHandler{cpProv: cp}
+
+	// The removed row is filtered out by the status guard → no rows.
+	mock.ExpectQuery(`SELECT name, status, tier,.*WHERE id = \$1 AND status NOT IN \('removed', 'paused', 'hibernated'\)`).
+		WithArgs("ws-removed-concierge").
+		WillReturnError(sql.ErrNoRows)
+
+	h.RestartByID("ws-removed-concierge")
+	drainTestAsync()
+
+	if stops := cp.stoppedSnapshot(); len(stops) != 0 {
+		t.Errorf("removed concierge must not be stopped/restarted, got stops: %v", stops)
+	}
+	if started := cp.startedSnapshot(); len(started) != 0 {
+		t.Errorf("removed concierge must not be (re)started, got starts: %v", started)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)

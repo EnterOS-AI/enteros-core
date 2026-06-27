@@ -49,6 +49,7 @@ package handlers
 // core never calls back into the CP.
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"io"
@@ -122,6 +123,27 @@ type ensureAction struct {
 	// provision is whether a workspace provision should be triggered. False for
 	// a no-op ("exists") and on deployments with no provisioner wired.
 	provision bool
+	// revive is true when the targeted platform root is currently REMOVED
+	// (tombstoned) and the decision is to repair it. A removed concierge needs a
+	// DELIBERATE un-tombstone: installPlatformAgent PRESERVES the removed flag on
+	// its upsert (an ordinary CP install / self-host re-seed must never silently
+	// un-delete a concierge) and RestartByID SKIPS a removed row — so without an
+	// explicit revive the repair's install would no-op the status and the
+	// provision would be silently dropped, leaving the concierge deleted. revive
+	// is therefore what distinguishes "repair a degraded concierge" (status
+	// cleared by the provision) from "revive a deleted one" (flag cleared on
+	// purpose, then provisioned). Only ever set on the repair path.
+	revive bool
+}
+
+// isRemovedStatus reports whether a status string marks a tombstoned/removed
+// workspace. This is the single predicate the three removed-concierge paths
+// agree on: the ensure SELECT INCLUDES removed rows (so a repair can target a
+// tombstone), installPlatformAgent PRESERVES the removed flag, and RestartByID
+// SKIPS a removed row — so the only way a removed concierge comes back is a
+// repair that explicitly revives it (clears the flag) before provisioning.
+func isRemovedStatus(status string) bool {
+	return strings.EqualFold(strings.TrimSpace(status), string(models.StatusRemoved))
 }
 
 // decideEnsureAction is the pure create/repair decision. derivedID is the
@@ -139,7 +161,18 @@ func decideEnsureAction(derivedID, existingID, existingStatus string, existingFo
 	if platformAgentHealthy(existingStatus) && !force {
 		return ensureAction{targetID: existingID, status: "exists", provision: false}
 	}
-	return ensureAction{targetID: existingID, status: "repaired", provision: hasProvisioner}
+	return ensureAction{
+		targetID:  existingID,
+		status:    "repaired",
+		provision: hasProvisioner,
+		// A repair of a tombstoned concierge is an EXPLICIT revive: a removed row
+		// is never 'online', so it never hits the no-op branch above — it always
+		// lands here. revive=true tells the handler to clear the removed flag
+		// (reviveRemovedPlatformAgent) before the provision; without it the
+		// install preserves the flag and RestartByID skips the row, so the
+		// provision would be a silent no-op and the concierge would stay deleted.
+		revive: isRemovedStatus(existingStatus),
+	}
 }
 
 // ensureInstallFn is the platform-agent install EnsurePlatformAgent runs. It
@@ -160,6 +193,25 @@ func (h *WorkspaceHandler) triggerPlatformProvision(id string) {
 		return
 	}
 	h.goAsync(func() { h.RestartByID(id) })
+}
+
+// reviveRemovedPlatformAgent clears the 'removed' tombstone on the platform-agent
+// row so a DELIBERATE repair can bring the concierge back online. This is the ONE
+// path that is allowed to un-tombstone a concierge: installPlatformAgent preserves
+// the removed flag and RestartByID skips a removed row, so reviving never happens
+// as a side-effect of an ordinary install or restart — only here, on an explicit
+// create/repair-tool call that targeted a removed root.
+//
+// The UPDATE is scoped to id AND status='removed' so it is a strict no-op (0 rows)
+// for any non-removed row — a force-repair of a healthy/degraded concierge never
+// changes its status here. Status is reset to 'offline' (the same no-container-yet
+// status installPlatformAgent seeds a fresh row with); the subsequent provision
+// (RestartByID) then drives it offline -> provisioning -> online.
+func reviveRemovedPlatformAgent(ctx context.Context, database *sql.DB, id string) error {
+	_, err := database.ExecContext(ctx,
+		`UPDATE workspaces SET status = $2, updated_at = now() WHERE id = $1 AND status = 'removed'`,
+		id, string(models.StatusOffline))
+	return err
 }
 
 // ensurePlatformAgentPayload is the (entirely optional) body of POST
@@ -204,6 +256,17 @@ func (h *WorkspaceHandler) EnsurePlatformAgent(c *gin.Context) {
 
 	// Look up the org's current platform root (if any). COALESCE keeps an
 	// unexpected NULL status from failing the scan.
+	//
+	// REMOVED/TOMBSTONED ROOTS ARE INCLUDED ON PURPOSE (CR2 RC 14676): the SELECT
+	// deliberately does NOT filter `status != 'removed'`. A deleted concierge
+	// keeps kind='platform' + parent_id IS NULL (CascadeDelete only stamps
+	// status='removed'), and the partial unique index uniq_workspaces_one_platform_root
+	// (over kind WHERE kind='platform') forbids a SECOND platform row — so the
+	// ONLY way to restore a removed concierge is to find this tombstone and revive
+	// it IN PLACE. Filtering removed rows out here would make repair report
+	// "created" against a fresh id that the unique index then rejects, i.e. repair
+	// would fail for exactly the case it exists to handle. decideEnsureAction reads
+	// the returned status and flags a removed root for an explicit revive.
 	var existingID, existingStatus string
 	found := false
 	err := db.DB.QueryRowContext(ctx,
@@ -245,6 +308,22 @@ func (h *WorkspaceHandler) EnsurePlatformAgent(c *gin.Context) {
 		log.Printf("EnsurePlatformAgent: install failed (id=%s): %v", decision.targetID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "install failed"})
 		return
+	}
+
+	// Explicit revive: a repair of a REMOVED (tombstoned) concierge must clear the
+	// removed flag, on purpose, before the provision. installPlatformAgent above
+	// PRESERVES status on its upsert — an ordinary CP install / self-host re-seed
+	// must never silently un-delete a concierge — and RestartByID SKIPS a removed
+	// row, so without this deliberate step the provision below would be a no-op and
+	// the concierge would stay deleted. Scoped (in reviveRemovedPlatformAgent) to
+	// status='removed', so it is the un-tombstone and nothing else.
+	if decision.revive {
+		if err := reviveRemovedPlatformAgent(ctx, db.DB, decision.targetID); err != nil {
+			log.Printf("EnsurePlatformAgent: revive failed (id=%s): %v", decision.targetID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "revive failed"})
+			return
+		}
+		log.Printf("EnsurePlatformAgent: revived tombstoned platform agent %s (cleared removed flag)", decision.targetID)
 	}
 
 	if decision.provision {
