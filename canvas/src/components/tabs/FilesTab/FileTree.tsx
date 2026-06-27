@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useMemo, memo } from "react";
 import { type TreeNode, getIcon } from "./tree";
 import { FileTreeContextMenu, type MenuItem } from "./FileTreeContextMenu";
 
@@ -91,17 +91,30 @@ export function FileTree({
   // drilling. This keeps "only one menu open" + "only one drop
   // target highlighted" as structural invariants rather than
   // render-order coincidences.
-  const childCallbacks: TreeCallbacks = {
-    selectedPath,
-    onSelect,
-    onDelete,
-    onDownload,
-    canDelete,
-    onDropToTarget,
-    expandedDirs,
-    onToggleDir,
-    loadingDir,
-  };
+  const childCallbacks: TreeCallbacks = useMemo(
+    () => ({
+      selectedPath,
+      onSelect,
+      onDelete,
+      onDownload,
+      canDelete,
+      onDropToTarget,
+      expandedDirs,
+      onToggleDir,
+      loadingDir,
+    }),
+    [
+      selectedPath,
+      onSelect,
+      onDelete,
+      onDownload,
+      canDelete,
+      onDropToTarget,
+      expandedDirs,
+      onToggleDir,
+      loadingDir,
+    ],
+  );
 
   return (
     <div>
@@ -128,7 +141,7 @@ export function FileTree({
   );
 }
 
-function TreeItem({
+const TreeItem = memo(function TreeItem({
   node,
   selectedPath,
   onSelect,
@@ -265,4 +278,4 @@ function TreeItem({
       </button>
     </div>
   );
-}
+});
