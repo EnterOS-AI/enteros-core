@@ -123,6 +123,7 @@ function MyChatPanel({ workspaceId, data }: Props) {
   const [confirmNewSession, setConfirmNewSession] = useState(false);
   const [newSessionPending, setNewSessionPending] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [stopping, setStopping] = useState(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const topRef = useRef<HTMLDivElement>(null);
@@ -462,6 +463,21 @@ function MyChatPanel({ workspaceId, data }: Props) {
       setNewSessionPending(false);
     }
   }, [workspaceId, history]);
+
+  const stopTurn = useCallback(async () => {
+    setStopping(true);
+    try {
+      await api.post(`/workspaces/${workspaceId}/a2a`, {
+        method: "tasks/cancel",
+        params: {},
+      });
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : "unknown";
+      setError(`Couldn't stop agent turn: ${reason}`);
+    } finally {
+      setStopping(false);
+    }
+  }, [workspaceId]);
 
   const removePendingFile = (index: number) =>
     setPendingFiles((prev) => prev.filter((_, i) => i !== index));
@@ -816,6 +832,15 @@ function MyChatPanel({ workspaceId, data }: Props) {
                   <span className="w-1.5 h-1.5 bg-zinc-500 rounded-full motion-safe:animate-bounce" style={{ animationDelay: "300ms" }} />
                 </span>
                 {thinkingElapsed}s
+                <button
+                  onClick={stopTurn}
+                  disabled={stopping}
+                  aria-label="Stop current agent turn"
+                  title="Stop current agent turn"
+                  className="ml-1 px-1.5 py-0.5 rounded border border-bad/40 bg-bad/10 text-bad hover:bg-bad/20 disabled:opacity-40 transition-colors text-[10px] font-medium"
+                >
+                  {stopping ? "Stopping…" : "Stop"}
+                </button>
               </div>
               {activityLog.length > 0 && (
                 <div data-testid="activity-log" className="mt-1.5 text-[9px] text-ink-mid space-y-0.5">
