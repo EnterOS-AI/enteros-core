@@ -861,8 +861,16 @@ jobs:
     runs-on: publish
     timeout-minutes: 15
     env:
-      TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
-      STAGING_TENANT_IMAGE_NAME: ${{ env.STAGING_TENANT_IMAGE_NAME }}
+      # NOTE: TENANT_IMAGE_NAME / STAGING_TENANT_IMAGE_NAME are intentionally
+      # NOT defined here at JOB level. Gitea's act runner does NOT interpolate
+      # `${{ env.* }}` (the workflow-level env context) inside a JOB-level
+      # `env:` block — it leaves the expression LITERAL (evaluates to
+      # `%!t(string=${{ env.TENANT_IMAGE_NAME }})`), so `docker login` then
+      # fails with `unable to parse server address: ... invalid character "{"`
+      # (job 579102). `secrets.*` / `vars.*` DO resolve at job level, so the AWS
+      # creds below are fine here; only the env-context refs must move to the
+      # STEP that uses them (the working pattern in build-and-push and
+      # deploy-production). See the Promote step's own `env:` below.
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-east-2
@@ -878,6 +886,13 @@ jobs:
       # configured DefaultTag such as :staging-latest), so redeploy safety is
       # not weakened.
       - name: Promote prod-latest to staging-verified SHA
+        # STEP-level env: the act runner DOES resolve `${{ env.* }}` here (unlike
+        # a job-level env block — see the job `env:` note above). Mirrors the
+        # build-and-push "Build & push tenant image" and deploy-production
+        # "Promote :latest" steps, which reference these same vars at step level.
+        env:
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE_NAME }}
+          STAGING_TENANT_IMAGE_NAME: ${{ env.STAGING_TENANT_IMAGE_NAME }}
         run: |
           set -euo pipefail
           SHA_TAG="staging-${GITHUB_SHA::7}"

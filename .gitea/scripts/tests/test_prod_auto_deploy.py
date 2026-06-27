@@ -994,13 +994,50 @@ def test_live_disable_flag_returns_value_when_variable_set(monkeypatch):
     assert prod.live_disable_flag(dict(_DISABLE_ENV)) == "true"
 
 
-@pytest.mark.parametrize("status", [401, 403, 500, 502, 503])
+@pytest.mark.parametrize("status", [401, 500, 502, 503])
 def test_live_disable_flag_fails_closed_on_read_error(monkeypatch, status):
-    # Any non-404 HTTP error means we could NOT verify the kill switch.
-    # Fail closed: raise (HOLD the deploy) instead of returning "".
+    # A 401 (rotated/invalid token) or 5xx (transient) means we could NOT verify
+    # the kill switch on an otherwise-valid token — it could be hiding an armed
+    # switch. Fail closed: raise (HOLD the deploy) instead of returning "".
+    # NOTE: 403 is handled separately (see the 403-fallback test below) because
+    # it is a DETERMINISTIC permission gap, not an uncertain transient state.
     monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (status, None))
     with pytest.raises(RuntimeError, match="kill switch"):
         prod.live_disable_flag(dict(_DISABLE_ENV))
+
+
+def test_live_disable_flag_403_falls_back_to_job_start_value(monkeypatch, capfd):
+    # 403 = token authenticated but NOT authorized to read repo Actions
+    # variables (a permanent capability gap — AUTO_SYNC_TOKEN lacks repo-admin
+    # scope, and PROD_AUTO_DEPLOY_CONTROL_TOKEN is unset). Failing closed here
+    # would PERMANENTLY brick prod auto-deploy. Instead, fall back to the
+    # runner-injected job-start PROD_AUTO_DEPLOY_DISABLED value (which build_plan
+    # already gates on) and warn loudly that the live mid-rollout re-check is
+    # degraded. Must NOT raise.
+    monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (403, None))
+
+    # Job-start value empty (variable not armed at dispatch) -> returns "" (proceed).
+    assert prod.live_disable_flag(dict(_DISABLE_ENV)) == ""
+    warn = capfd.readouterr().err
+    assert "HTTP 403" in warn
+    assert "DEGRADED" in warn
+    assert "PROD_AUTO_DEPLOY_CONTROL_TOKEN" in warn
+
+    # If the switch WAS armed at job start, the fallback still honors it: it
+    # returns the truthy job-start value so assert_not_disabled() HOLDs.
+    armed_env = dict(_DISABLE_ENV)
+    armed_env["PROD_AUTO_DEPLOY_DISABLED"] = "true"
+    assert prod.live_disable_flag(armed_env) == "true"
+
+
+def test_assert_not_disabled_proceeds_on_403_when_not_armed_at_job_start(monkeypatch):
+    # End-to-end: build_plan says enabled (DISABLED unset in the job env) AND the
+    # live re-check 403s (under-scoped token) -> fall back to job-start value
+    # ("") -> the deploy is NOT blocked by the permission error.
+    monkeypatch.setattr(prod, "_api_json_optional", lambda _u, _t: (403, None))
+    env = dict(_DISABLE_ENV)
+    env["GITHUB_SHA"] = "abcdef1234567890"
+    prod.assert_not_disabled(env)  # must not raise
 
 
 def test_live_disable_flag_fails_closed_without_token():
