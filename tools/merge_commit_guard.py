@@ -120,6 +120,7 @@ def main() -> int:
         return 0
 
     failures: list[tuple[str, int, str]] = []
+    api_failures: list[tuple[str, int, str]] = []
     skipped = 0
 
     for sha in pushed_commits(before, after):
@@ -134,18 +135,35 @@ def main() -> int:
 
         try:
             head_sha = pr_head_sha(pr_number, repo, token, server)
-        except urllib.error.HTTPError as exc:
-            print(
-                f"merge-commit-guard: could not fetch PR #{pr_number}: "
-                f"HTTP {exc.code}",
-                file=sys.stderr,
-            )
+        except urllib.error.URLError as exc:
+            # CR2 #14649: fail-closed. If we cannot fetch the PR head, we
+            # cannot prove the merge queue did not drop commits. Skipping the
+            # check would make the guard fail-open.
+            code = getattr(exc, "code", "network error")
+            api_failures.append((sha, pr_number, str(code)))
             continue
 
         fetch_pr_head(pr_number)
 
         if not is_ancestor(head_sha, after):
             failures.append((sha, pr_number, head_sha))
+
+    if api_failures:
+        print(
+            "ERROR: merge-commit-guard could not verify these merged PRs:",
+            file=sys.stderr,
+        )
+        for sha, pr_number, reason in api_failures:
+            print(
+                f"  - commit {sha} PR #{pr_number}: {reason}",
+                file=sys.stderr,
+            )
+        print(
+            "Refusing to pass while PR heads cannot be fetched. "
+            "See core#2641.",
+            file=sys.stderr,
+        )
+        return 1
 
     if failures:
         print("ERROR: merge queue appears to have dropped commits from these PRs:")
