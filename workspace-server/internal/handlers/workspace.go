@@ -94,6 +94,12 @@ type WorkspaceHandler struct {
 	// calls made by HibernateWorkspace without requiring a running Docker daemon.
 	// Always nil in production; the real provisioner path is used when nil.
 	stopFnOverride func(ctx context.Context, workspaceID string)
+	// provisionTriggerOverride is set exclusively in tests to intercept the async
+	// provision EnsurePlatformAgent fires (triggerPlatformProvision), so the
+	// create/repair handler can be asserted without standing up a real
+	// provisioner + restart cycle. Always nil in production (the real
+	// goAsync(RestartByID) path runs when nil).
+	provisionTriggerOverride func(workspaceID string)
 	// enqueueA2A is the function handleA2ADispatchError calls to persist a busy
 	// A2A request to a2a_queue. Always EnqueueA2A in production; tests swap it
 	// to assert the passed context is detached from the inbound request (#2930).

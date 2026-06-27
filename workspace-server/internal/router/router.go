@@ -561,6 +561,18 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// (RFC docs/design/rfc-platform-agent.md)
 		r.POST("/admin/org/platform-agent", middleware.AdminAuth(db.DB), handlers.InstallPlatformAgent)
 
+		// Platform-agent create/repair — CORE-OWNED, self-contained (NO control-
+		// plane dependency). Derives the platform-agent id IN core
+		// (DeterministicPlatformAgentID from MOLECULE_ORG_ID, else
+		// SelfHostedPlatformAgentID), runs the SAME idempotent install as
+		// POST /admin/org/platform-agent, then triggers the workspace provision via
+		// the local/CP provisioner (RestartByID). Idempotent: a healthy concierge is
+		// a no-op; a missing/degraded one is created/repaired. Powers the canvas
+		// "Create / repair platform agent" button so the OSS canvas brings the
+		// concierge online WITHOUT ever calling a /cp/* endpoint.
+		// (RFC docs/design/rfc-platform-agent.md)
+		r.POST("/admin/org/platform-agent/ensure", middleware.AdminAuth(db.DB), wh.EnsurePlatformAgent)
+
 		// Memory
 		memh := handlers.NewMemoryHandler()
 		wsAuth.GET("/memory", memh.List)
