@@ -3890,20 +3890,23 @@ func TestProxyA2A_MessageSend_CanDelegateFalse_SelfCall_Allowed(t *testing.T) {
 // ==================== core#3319: platform→external-agent /a2a/inbound auth ====================
 
 func TestIsExternalAgentURL(t *testing.T) {
+	const wsID = "abc123def456ghi789"
 	cases := []struct {
 		url  string
 		want bool
 	}{
-		{"http://ws-abc123:8000/a2a", false},           // container DNS
-		{"http://127.0.0.1:8000/a2a", false},           // loopback
-		{"http://[::1]:8000/a2a", false},               // IPv6 loopback
-		{"http://10.0.0.5:8000/a2a", false},            // RFC-1918 private
-		{"http://169.254.169.254/a2a", false},          // metadata link-local
-		{"http://agent.example.com/a2a/inbound", true}, // public external agent
-		{"https://8.8.8.8/a2a/inbound", true},          // public IP
+		{"http://ws-abc123def456ghi789:8000/a2a", false},  // exact container DNS
+		{"http://ws-abc123def456:8000/a2a", false},        // legacy truncated container DNS (first 12 chars of ID)
+		{"http://ws-agent.example.com/a2a/inbound", true}, // public hostname starting with ws-
+		{"http://127.0.0.1:8000/a2a", false},              // loopback
+		{"http://[::1]:8000/a2a", false},                  // IPv6 loopback
+		{"http://10.0.0.5:8000/a2a", false},               // RFC-1918 private
+		{"http://169.254.169.254/a2a", false},             // metadata link-local
+		{"http://agent.example.com/a2a/inbound", true},    // public external agent
+		{"https://8.8.8.8/a2a/inbound", true},             // public IP
 	}
 	for _, tc := range cases {
-		got := isExternalAgentURL(tc.url)
+		got := isExternalAgentURL(wsID, tc.url)
 		if got != tc.want {
 			t.Errorf("isExternalAgentURL(%q) = %v, want %v", tc.url, got, tc.want)
 		}
@@ -3936,6 +3939,60 @@ func TestDispatchA2A_InboundSecretHeader(t *testing.T) {
 
 	if gotAuth != "Bearer "+secret {
 		t.Errorf("expected Authorization header %q, got %q", "Bearer "+secret, gotAuth)
+	}
+}
+
+// TestDispatchA2A_InboundVerifierSimulation models an external agent's
+// /a2a/inbound endpoint that rejects unauthenticated or wrong-secret requests
+// and accepts the workspace's platform_inbound_secret. The platform's outbound
+// request must carry the correct bearer for the inbound verifier to allow it.
+func TestDispatchA2A_InboundVerifierSimulation(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	const secret = "platform-inbound-secret-xyz"
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
+			return
+		}
+		if auth != "Bearer "+secret {
+			http.Error(w, `{"error":"invalid secret"}`, http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+
+	cases := []struct {
+		name       string
+		secret     string
+		wantStatus int
+	}{
+		{"unauthenticated", "", http.StatusUnauthorized},
+		{"wrong secret", "wrong-secret", http.StatusForbidden},
+		{"valid secret", secret, http.StatusOK},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", agentServer.URL, []byte(`{}`), "", tc.secret)
+			if err != nil {
+				t.Fatalf("unexpected transport error: %v", err)
+			}
+			if cancel != nil {
+				defer cancel()
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("expected status %d, got %d", tc.wantStatus, resp.StatusCode)
+			}
+		})
 	}
 }
 

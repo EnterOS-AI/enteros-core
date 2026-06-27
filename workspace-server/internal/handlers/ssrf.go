@@ -214,12 +214,18 @@ func mustCIDR(s string) net.IPNet {
 }
 
 // isExternalAgentURL reports whether agentURL points to an agent that lives
-// outside the platform's own infrastructure. Internal addresses (loopback,
-// RFC-1918/private, link-local, container DNS ws-*) are treated as in-cluster
-// and are not required to present the platform_inbound_secret on the A2A
-// forward. Public hostnames/IPs are treated as external agents and the
-// platform MUST authenticate with the per-workspace platform_inbound_secret.
-func isExternalAgentURL(agentURL string) bool {
+// outside the platform's own infrastructure for the given workspace. Internal
+// addresses (loopback, RFC-1918/private, link-local, and the workspace's own
+// container DNS name) are treated as in-cluster and are not required to
+// present the platform_inbound_secret on the A2A forward. Public hostnames/IPs
+// are treated as external agents and the platform MUST authenticate with the
+// per-workspace platform_inbound_secret.
+//
+// The container-DNS check is an exact match against ws-<workspaceID> (and the
+// legacy truncated ws-<first12>) rather than a broad `strings.HasPrefix(host,
+// "ws-")` check, so a public hostname like `ws-agent.example.com` is correctly
+// classified as external.
+func isExternalAgentURL(workspaceID, agentURL string) bool {
 	u, err := url.Parse(agentURL)
 	if err != nil {
 		return false
@@ -228,8 +234,8 @@ func isExternalAgentURL(agentURL string) bool {
 	if host == "" {
 		return false
 	}
-	// Container DNS names are internal by convention.
-	if strings.HasPrefix(host, "ws-") {
+	// The workspace's own container DNS name is internal.
+	if host == containerNameForWorkspace(workspaceID) || host == legacyContainerNameForWorkspace(workspaceID) {
 		return false
 	}
 	if ip := net.ParseIP(host); ip != nil {
@@ -240,8 +246,20 @@ func isExternalAgentURL(agentURL string) bool {
 		}
 		return true
 	}
-	// Hostname: assume public unless it matched the container prefix above.
+	// Any other resolvable hostname is treated as external/public.
 	return true
+}
+
+func containerNameForWorkspace(workspaceID string) string {
+	return "ws-" + workspaceID
+}
+
+func legacyContainerNameForWorkspace(workspaceID string) string {
+	id := workspaceID
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	return "ws-" + id
 }
 
 // validateRelPath checks that a file path is relative and does not escape

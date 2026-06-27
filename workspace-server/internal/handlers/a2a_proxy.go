@@ -786,7 +786,7 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// Internal container addresses are unchanged. Reuses the same per-workspace
 	// bearer that already gates /internal/* forwards (chat_files.go).
 	inboundSecret := ""
-	if isExternalAgentURL(agentURL) {
+	if isExternalAgentURL(workspaceID, agentURL) {
 		secret, healed, secretErr := readOrLazyHealInboundSecret(ctx, workspaceID, "ProxyA2A")
 		if secretErr != nil {
 			log.Printf("ProxyA2A: no platform_inbound_secret for external workspace %s: %v", workspaceID, secretErr)
