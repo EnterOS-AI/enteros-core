@@ -366,20 +366,54 @@ func parseDescribeInstancesOutput(out []byte) (eicInstanceState, error) {
 // Exposed as a var so tests can capture the CLI argv without running AWS.
 var eicExecCommandContext = exec.CommandContext
 
+// sendSSHPublicKeyWaitMax is the bounded wait for a concierge EC2 to reach
+// running with a resolved AZ. The EIC key push is retried only in the sense
+// of re-polling DescribeInstances; the actual `send-ssh-public-key` call is
+// made exactly once with valid parameters, so a deterministic 252 Parameter
+// validation error cannot be papered over by retrying an invalid command.
+const sendSSHPublicKeyWaitInterval = 5 * time.Second
+const sendSSHPublicKeyWaitMax = 90 * time.Second
+
 // sendSSHPublicKeyImpl gates the EIC key push on the EC2 instance being
 // running and resolves its availability zone before calling
 // `aws ec2-instance-connect send-ssh-public-key`. This avoids the live
 // exit 252 Parameter-validation failure when AZ is missing and prevents
-// retries against a stopped instance. Exposed as a var so tests can stub.
+// retries against a stopped/pending instance. Exposed as a var so tests can stub.
 var sendSSHPublicKey = sendSSHPublicKeyImpl
 
 func sendSSHPublicKeyImpl(ctx context.Context, region, instanceID, osUser, pubKey string) error {
-	info, err := describeEC2InstanceForEIC(ctx, region, instanceID)
-	if err != nil {
-		return fmt.Errorf("send-ssh-public-key: cannot verify instance: %w", err)
-	}
-	if info.State != "running" {
-		return fmt.Errorf("send-ssh-public-key: instance %s is %s (expected running)", instanceID, info.State)
+	// Poll DescribeInstances with bounded backoff until the instance is
+	// running and its AZ is known. This fixes the timing race where the
+	// concierge EC2 is still pending/AZ-unresolved when we try the key push.
+	deadline := time.Now().Add(sendSSHPublicKeyWaitMax)
+	var lastInfo eicInstanceState
+	for {
+		info, err := describeEC2InstanceForEIC(ctx, region, instanceID)
+		lastInfo = info
+		if err == nil && info.State == "running" && info.AZ != "" {
+			break
+		}
+		// Fail immediately on terminal non-running states; only wait for
+		// pending/AZ-unresolved instances. Retrying a stopped/terminated
+		// instance would never succeed, and retrying an invalid send-ssh-public-key
+		// parameter would hit the same 252 Parameter-validation error.
+		if err == nil && info.State != "pending" && info.State != "" {
+			return fmt.Errorf("send-ssh-public-key: instance %s is %s (expected running)", instanceID, info.State)
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("send-ssh-public-key: timed out waiting for instance %s describe: %w", instanceID, err)
+			}
+			if info.State != "running" {
+				return fmt.Errorf("send-ssh-public-key: timed out waiting for instance %s to be running (state=%s)", instanceID, info.State)
+			}
+			return fmt.Errorf("send-ssh-public-key: timed out waiting for AZ on running instance %s", instanceID)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("send-ssh-public-key: context cancelled while waiting for instance %s: %w", instanceID, ctx.Err())
+		case <-time.After(sendSSHPublicKeyWaitInterval):
+		}
 	}
 
 	args := []string{
@@ -388,9 +422,7 @@ func sendSSHPublicKeyImpl(ctx context.Context, region, instanceID, osUser, pubKe
 		"--instance-id", instanceID,
 		"--instance-os-user", osUser,
 		"--ssh-public-key", pubKey,
-	}
-	if info.AZ != "" {
-		args = append(args, "--availability-zone", info.AZ)
+		"--availability-zone", lastInfo.AZ,
 	}
 	out, err := eicExecCommandContext(ctx, "aws", args...).CombinedOutput()
 	if err != nil {

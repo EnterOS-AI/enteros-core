@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
@@ -591,7 +592,7 @@ func TestParseDescribeInstancesOutput_NoInstance(t *testing.T) {
 }
 
 // TestSendSSHPublicKeyImpl_GatesNotRunning verifies the EIC key push is
-// rejected before invoking AWS when the instance is not running.
+// rejected after the bounded wait when the instance never reaches running.
 func TestSendSSHPublicKeyImpl_GatesNotRunning(t *testing.T) {
 	prev := describeEC2InstanceForEIC
 	describeEC2InstanceForEIC = func(ctx context.Context, region, instanceID string) (eicInstanceState, error) {
@@ -599,9 +600,45 @@ func TestSendSSHPublicKeyImpl_GatesNotRunning(t *testing.T) {
 	}
 	defer func() { describeEC2InstanceForEIC = prev }()
 
-	err := sendSSHPublicKeyImpl(context.Background(), "us-east-2", "i-123", "ubuntu", "pk")
-	if err == nil || !strings.Contains(err.Error(), "expected running") {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := sendSSHPublicKeyImpl(ctx, "us-east-2", "i-123", "ubuntu", "pk")
+	if err == nil || !strings.Contains(err.Error(), "running") {
 		t.Fatalf("expected not-running error, got %v", err)
+	}
+}
+
+// TestSendSSHPublicKeyImpl_WaitsForRunning verifies the bounded wait loop
+// polls DescribeInstances until the instance reaches running + AZ.
+func TestSendSSHPublicKeyImpl_WaitsForRunning(t *testing.T) {
+	prevDescribe := describeEC2InstanceForEIC
+	calls := 0
+	describeEC2InstanceForEIC = func(ctx context.Context, region, instanceID string) (eicInstanceState, error) {
+		calls++
+		if calls < 2 {
+			return eicInstanceState{State: "pending", AZ: ""}, nil
+		}
+		return eicInstanceState{State: "running", AZ: "us-east-2d"}, nil
+	}
+	defer func() { describeEC2InstanceForEIC = prevDescribe }()
+
+	prevExec := eicExecCommandContext
+	captured := []string{}
+	eicExecCommandContext = func(ctx context.Context, name string, arg ...string) *exec.Cmd {
+		captured = append([]string{name}, arg...)
+		return exec.CommandContext(ctx, "true")
+	}
+	defer func() { eicExecCommandContext = prevExec }()
+
+	if err := sendSSHPublicKeyImpl(context.Background(), "us-east-2", "i-123", "ubuntu", "pk"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("expected describe polling, got %d calls", calls)
+	}
+	got := strings.Join(captured, " ")
+	if !strings.Contains(got, "--availability-zone us-east-2d") {
+		t.Errorf("send-ssh-public-key args missing AZ; got %q", got)
 	}
 }
 
