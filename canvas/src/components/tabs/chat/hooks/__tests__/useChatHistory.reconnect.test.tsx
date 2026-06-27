@@ -105,6 +105,52 @@ describe("useChatHistory — core#2598 reconcile", () => {
     expect(result.current.messages).toHaveLength(1);
   });
 
+  it("reconcile during a slow initial load does not block loading", async () => {
+    // CR2 #14653 regression: reconcile must not share the loadInitial/
+    // loadOlder fetch-generation token. If it did, calling reconcile while
+    // the initial load is still in flight would bump the token and cause
+    // loadInitial to discard its own result before setLoading(false).
+    const userMsg = {
+      id: "msg-slow-load",
+      role: "user",
+      content: "still loading?",
+      timestamp: "2026-06-27T00:00:00.000Z",
+    };
+
+    let resolveInitial: ((value: unknown) => void) | undefined;
+
+    // Initial load is deferred so we can race reconcile against it.
+    apiGetMock.mockImplementationOnce((path: string) => {
+      if (path.includes("/workspaces/ws-slow/")) {
+        return new Promise((resolve) => {
+          resolveInitial = resolve;
+        });
+      }
+      return Promise.resolve({ messages: [], reached_end: true });
+    });
+
+    // Reconcile returns empty and should not disturb the pending initial load.
+    apiGetMock.mockResolvedValueOnce({ messages: [], reached_end: true });
+
+    const { result } = renderHook(() => useChatHistory("ws-slow"));
+
+    await act(async () => {
+      await result.current.reconcile();
+    });
+
+    // The initial load is still pending; reconcile must not have caused it
+    // to be abandoned.
+    expect(result.current.loading).toBe(true);
+
+    await act(async () => {
+      resolveInitial?.({ messages: [userMsg], reached_end: true });
+    });
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0].content).toBe("still loading?");
+  });
+
   it("drops a stale reconcile after switching workspaces (no cross-workspace leak)", async () => {
     // Researcher #14648 regression: without a stale-workspace guard, a
     // reconcile fetch started for workspace A could resolve after the user
@@ -149,9 +195,9 @@ describe("useChatHistory — core#2598 reconcile", () => {
       void result.current.reconcile();
     });
 
-    // Switch to workspace B before A's reconcile resolves. loadInitial for
-    // B bumps the shared fetch-generation token, invalidating A's in-flight
-    // reconcile.
+    // Switch to workspace B before A's reconcile resolves. The reconcile
+    // closure remembers workspace A; when it resolves it must see the
+    // workspace has changed and drop the result.
     apiGetMock.mockResolvedValueOnce({ messages: [bReply], reached_end: true });
     rerender({ workspaceId: "ws-B" });
     await waitFor(() => expect(result.current.loading).toBe(false));

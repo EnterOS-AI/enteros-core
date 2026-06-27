@@ -93,10 +93,15 @@ export function useChatHistory(
   const [hasMore, setHasMore] = useState(true);
 
   const fetchTokenRef = useRef(0);
+  const workspaceIdRef = useRef(workspaceId);
   const oldestMessageRef = useRef<ChatMessage | null>(null);
   const hasMoreRef = useRef(true);
   const inflightRef = useRef(false);
   const scrollAnchorRef = useRef<ScrollAnchor | null>(null);
+
+  useEffect(() => {
+    workspaceIdRef.current = workspaceId;
+  }, [workspaceId]);
 
   useEffect(() => {
     oldestMessageRef.current = messages[0] ?? null;
@@ -175,21 +180,20 @@ export function useChatHistory(
     // be worse than the missed-reply bug we're fixing. Failures are ignored
     // — the next interval or WS reconnect will retry.
     //
-    // STALE-WORKSPACE GUARD (core#2598 Researcher #14648): a reconcile can
-    // be in flight when the user switches to a different workspace. The
-    // fetch is keyed to the workspaceId that was current when it started,
-    // but the setMessages callback could otherwise land after the switch
-    // and merge workspace A's messages into workspace B. We capture the
-    // current fetch-generation token before the await and drop the result
-    // if the token has been bumped (by loadInitial/loadOlder on switch).
-    fetchTokenRef.current += 1;
-    const myToken = fetchTokenRef.current;
+    // STALE-WORKSPACE GUARD (core#2598 Researcher #14648 / CR2 #14653):
+    // a reconcile can be in flight when the user switches to a different
+    // workspace. We capture the workspace id that was current when the
+    // fetch started and drop the result if it has changed. Reading the
+    // current id from a ref lets a stale callback see the latest workspace
+    // after a rerender, and keeping this separate from fetchTokenRef avoids
+    // colliding with an in-flight loadInitial/loadOlder.
+    const startedForWorkspace = workspaceIdRef.current;
     try {
       const { messages: fetched } = await loadMessagesFromDB(
         workspaceId,
         INITIAL_HISTORY_LIMIT,
       );
-      if (fetchTokenRef.current !== myToken) return;
+      if (workspaceIdRef.current !== startedForWorkspace) return;
       if (fetched.length === 0) return;
       setMessages((prev) => mergeReconciledMessages(prev, fetched));
     } catch {
