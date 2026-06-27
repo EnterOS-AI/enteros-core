@@ -12,6 +12,15 @@ const OLDER_HISTORY_BATCH = 20;
 // and scroll jank on low-end mobile. A virtualized list is the larger fix.
 const MAX_MESSAGES = 500;
 
+// Reconcile from the DB copy of chat-history every 10s. This is the
+// fail-safe for the WS delivery race diagnosed in core#2598: a reply can
+// be persisted on the server (and therefore visible in Agent Comms / the
+// activity log) before the canvas WebSocket subscriber is listening, so
+// the AGENT_MESSAGE/A2A_RESPONSE frame is missed and My Chat stays empty
+// until a manual reload. A short polling reconcile catches any missed
+// persisted replies without changing the live WS-driven path.
+const RECONCILE_INTERVAL_MS = 10_000;
+
 async function loadMessagesFromDB(
   workspaceId: string,
   limit: number,
@@ -44,6 +53,30 @@ async function loadMessagesFromDB(
   }
 }
 
+/** Merge a freshly-fetched batch of persisted messages into the existing
+ *  in-memory list. Identical messages are keyed by `id` and overwritten
+ *  with the server copy (so fields like `toolTrace` stay in sync), then
+ *  the combined set is re-sorted by timestamp. New replies that were
+ *  missed by the WebSocket path therefore appear in the correct order
+ *  without discarding older history the user has already lazy-loaded.
+ *
+ *  The map-key fallback for messages without an id is a stable tuple of
+ *  timestamp+role+content; this path is defensive — chat-history rows
+ *  today always carry an id. */
+function mergeReconciledMessages(
+  existing: ChatMessage[],
+  fetched: ChatMessage[],
+): ChatMessage[] {
+  const keyOf = (m: ChatMessage) => m.id || `${m.timestamp}|${m.role}|${m.content}`;
+  const map = new Map<string, ChatMessage>();
+  for (const m of existing) map.set(keyOf(m), m);
+  for (const m of fetched) map.set(keyOf(m), m);
+  const merged = Array.from(map.values()).sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+  );
+  return merged.slice(-MAX_MESSAGES);
+}
+
 export interface ScrollAnchor {
   savedDistanceFromBottom: number;
   expectFirstIdNotEqual: string | null;
@@ -60,10 +93,15 @@ export function useChatHistory(
   const [hasMore, setHasMore] = useState(true);
 
   const fetchTokenRef = useRef(0);
+  const workspaceIdRef = useRef(workspaceId);
   const oldestMessageRef = useRef<ChatMessage | null>(null);
   const hasMoreRef = useRef(true);
   const inflightRef = useRef(false);
   const scrollAnchorRef = useRef<ScrollAnchor | null>(null);
+
+  useEffect(() => {
+    workspaceIdRef.current = workspaceId;
+  }, [workspaceId]);
 
   useEffect(() => {
     oldestMessageRef.current = messages[0] ?? null;
@@ -136,6 +174,45 @@ export function useChatHistory(
     }
   }, [workspaceId, containerRef]);
 
+  const reconcile = useCallback(async () => {
+    // Silent reconcile: don't flip loading/loadingOlder flags. The user is
+    // already looking at the conversation; briefly flashing a spinner would
+    // be worse than the missed-reply bug we're fixing. Failures are ignored
+    // — the next interval or WS reconnect will retry.
+    //
+    // STALE-WORKSPACE GUARD (core#2598 Researcher #14648 / CR2 #14653):
+    // a reconcile can be in flight when the user switches to a different
+    // workspace. We capture the workspace id that was current when the
+    // fetch started and drop the result if it has changed. Reading the
+    // current id from a ref lets a stale callback see the latest workspace
+    // after a rerender, and keeping this separate from fetchTokenRef avoids
+    // colliding with an in-flight loadInitial/loadOlder.
+    const startedForWorkspace = workspaceIdRef.current;
+    try {
+      const { messages: fetched } = await loadMessagesFromDB(
+        workspaceId,
+        INITIAL_HISTORY_LIMIT,
+      );
+      if (workspaceIdRef.current !== startedForWorkspace) return;
+      if (fetched.length === 0) return;
+      setMessages((prev) => mergeReconciledMessages(prev, fetched));
+    } catch {
+      // Intentionally swallow: this is a background safety net, not a
+      // user-initiated fetch. A transient API failure must not spam the UI.
+    }
+  }, [workspaceId]);
+
+  // Background reconcile: catch replies that landed while the WebSocket
+  // subscriber was not yet listening (core#2598). Runs on a short cadence
+  // so a missed frame is repaired within human-perceptible time, and also
+  // exposes `reconcile` so ChatTab can fire it immediately on reconnect.
+  useEffect(() => {
+    const id = setInterval(() => {
+      void reconcile();
+    }, RECONCILE_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [reconcile]);
+
   return {
     messages,
     loading,
@@ -144,6 +221,7 @@ export function useChatHistory(
     hasMore,
     loadInitial,
     loadOlder,
+    reconcile,
     appendMessageDeduped: (msg: ChatMessage) =>
       setMessages((prev) => appendMessageDedupedFn(prev, msg).slice(-MAX_MESSAGES)),
     setMessages,

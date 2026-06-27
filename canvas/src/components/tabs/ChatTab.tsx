@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api } from "@/lib/api";
 import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
-import { type ChatMessage, type ChatAttachment, createMessage, appendMessageDeduped, appendMessageDedupedById } from "./chat/types";
+import { type ChatAttachment, createMessage, appendMessageDeduped, appendMessageDedupedById } from "./chat/types";
 import { downloadChatFile, isPlatformAttachment } from "./chat/uploads";
 import { PendingAttachmentPill } from "./chat/AttachmentViews";
 import { AttachmentPreview } from "./chat/AttachmentPreview";
@@ -158,6 +158,27 @@ function MyChatPanel({ workspaceId, data }: Props) {
     onAgentMessage: (msg) => history.setMessages((prev) => appendMessageDeduped(prev, msg)),
   });
   const { sending, uploading, sendMessage, error: sendError, clearError: clearSendError, releaseSendGuards, sendingFromAPIRef } = chatSend;
+
+  // core#2598: if the WebSocket reconnects (or connects for the first
+  // time after the tab opened), reconcile My Chat against the persisted
+  // chat-history immediately. A reply can be persisted on the server
+  // before the socket subscriber is listening; the live WS path alone
+  // would leave the reply hidden until a manual reload. The background
+  // interval in useChatHistory is the second line of defense.
+  const wsStatus = useCanvasStore((s) => s.wsStatus);
+  const prevWsStatusRef = useRef(wsStatus);
+  const reconcileRef = useRef(history.reconcile);
+  reconcileRef.current = history.reconcile;
+  useEffect(() => {
+    const prev = prevWsStatusRef.current;
+    prevWsStatusRef.current = wsStatus;
+    if (
+      (prev === "connecting" || prev === "disconnected") &&
+      wsStatus === "connected"
+    ) {
+      reconcileRef.current();
+    }
+  }, [wsStatus]);
 
   const displayError = error || sendError;
 
