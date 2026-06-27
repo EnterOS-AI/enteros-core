@@ -104,4 +104,72 @@ describe("useChatHistory — core#2598 reconcile", () => {
 
     expect(result.current.messages).toHaveLength(1);
   });
+
+  it("drops a stale reconcile after switching workspaces (no cross-workspace leak)", async () => {
+    // Researcher #14648 regression: without a stale-workspace guard, a
+    // reconcile fetch started for workspace A could resolve after the user
+    // switched to workspace B and merge A's messages into B's conversation.
+    const aReply = {
+      id: "msg-a-stale",
+      role: "agent",
+      content: "workspace A reply",
+      timestamp: "2026-06-27T00:00:01.000Z",
+    };
+    const bReply = {
+      id: "msg-b-live",
+      role: "agent",
+      content: "workspace B reply",
+      timestamp: "2026-06-27T00:00:02.000Z",
+    };
+
+    let resolveA: ((value: unknown) => void) | undefined;
+
+    // Initial load for A returns empty so we can get to a stable state quickly.
+    apiGetMock.mockResolvedValueOnce({ messages: [], reached_end: true });
+
+    const { result, rerender } = renderHook(
+      ({ workspaceId }: { workspaceId: string }) => useChatHistory(workspaceId),
+      { initialProps: { workspaceId: "ws-A" } },
+    );
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    // Reconcile for A: block on a deferred response so we can switch
+    // workspaces before it lands.
+    apiGetMock.mockImplementationOnce((path: string) => {
+      if (path.includes("/workspaces/ws-A/")) {
+        return new Promise((resolve) => {
+          resolveA = resolve;
+        });
+      }
+      return Promise.resolve({ messages: [], reached_end: true });
+    });
+
+    act(() => {
+      void result.current.reconcile();
+    });
+
+    // Switch to workspace B before A's reconcile resolves. loadInitial for
+    // B bumps the shared fetch-generation token, invalidating A's in-flight
+    // reconcile.
+    apiGetMock.mockResolvedValueOnce({ messages: [bReply], reached_end: true });
+    rerender({ workspaceId: "ws-B" });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0].content).toBe("workspace B reply");
+
+    // Now resolve the stale A fetch.
+    await act(async () => {
+      resolveA?.({ messages: [aReply], reached_end: true });
+      // Let the microtask queue drain so the stale reconcile's setMessages
+      // attempt (which should be dropped) is processed.
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // A's message must NOT have leaked into B.
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0].content).toBe("workspace B reply");
+  });
 });

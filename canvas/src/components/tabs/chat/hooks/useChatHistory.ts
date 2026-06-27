@@ -174,11 +174,22 @@ export function useChatHistory(
     // already looking at the conversation; briefly flashing a spinner would
     // be worse than the missed-reply bug we're fixing. Failures are ignored
     // — the next interval or WS reconnect will retry.
+    //
+    // STALE-WORKSPACE GUARD (core#2598 Researcher #14648): a reconcile can
+    // be in flight when the user switches to a different workspace. The
+    // fetch is keyed to the workspaceId that was current when it started,
+    // but the setMessages callback could otherwise land after the switch
+    // and merge workspace A's messages into workspace B. We capture the
+    // current fetch-generation token before the await and drop the result
+    // if the token has been bumped (by loadInitial/loadOlder on switch).
+    fetchTokenRef.current += 1;
+    const myToken = fetchTokenRef.current;
     try {
       const { messages: fetched } = await loadMessagesFromDB(
         workspaceId,
         INITIAL_HISTORY_LIMIT,
       );
+      if (fetchTokenRef.current !== myToken) return;
       if (fetched.length === 0) return;
       setMessages((prev) => mergeReconciledMessages(prev, fetched));
     } catch {
