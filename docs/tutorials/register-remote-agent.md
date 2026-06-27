@@ -149,7 +149,7 @@ If the platform misses three consecutive heartbeats (90 seconds), it marks the a
 > **Tip:** Use the SDK's `run_heartbeat_loop()` method instead of writing the loop manually. It handles the timing and includes an optional `task_supplier` callable so the heartbeat reports live `active_tasks` and `current_task` automatically:
 >
 > ```python
-> from molecule_agent import RemoteAgentClient
+> from molecule_external_workspace import RemoteAgentClient
 >
 > client = RemoteAgentClient(
 >     platform_url=PLATFORM_URL,
@@ -168,7 +168,7 @@ If the platform misses three consecutive heartbeats (90 seconds), it marks the a
 Remote agents use the standard A2A protocol. Use the SDK's `fetch_inbound()` method to poll for inbound tasks:
 
 ```python
-from molecule_agent import RemoteAgentClient
+from molecule_external_workspace import RemoteAgentClient
 
 client = RemoteAgentClient(
     platform_url=PLATFORM_URL,

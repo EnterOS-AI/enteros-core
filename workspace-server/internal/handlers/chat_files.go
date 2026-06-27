@@ -207,7 +207,7 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 		//    workspace with a publicly-reachable URL.
 		//
 		// Live-observed 2026-05-04: external runtime workspaces (e.g.
-		// molecule-sdk-python on a mac laptop) register with
+		// molecule-external-workspace-sdk on a mac laptop) register with
 		// delivery_mode=NULL. The narrow "poll" check missed them; the
 		// invariant we actually want is "URL empty + not-push = no
 		// dispatch path, ever".
