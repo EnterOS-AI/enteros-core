@@ -1,0 +1,45 @@
+# merge-commit-guard — detect merge-queue commit drops (core#2641).
+#
+# The Gitea merge queue has been observed landing multi-commit PRs at their
+# first commit only, silently dropping later commits. This workflow runs on
+# every push to main, inspects the merge commits in that push, and verifies
+# that each merged PR's HEAD commit is an ancestor of the new main tip. If a
+# PR head is not an ancestor, the queue dropped commits and this workflow
+# fails loudly so operators can investigate instead of discovering the data
+# loss later.
+
+name: merge-commit-guard
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+jobs:
+  # bp-exempt: post-merge advisory guard; not a branch-protection merge gate.
+  guard:
+    name: Verify merged PR commits are on main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Run merge-commit guard
+        env:
+          GITEA_TOKEN: ${{ secrets.SOP_CHECKLIST_GATE_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_EVENT_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          python3 tools/merge_commit_guard.py
