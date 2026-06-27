@@ -4246,3 +4246,150 @@ func TestProxyA2A_InboundAuth_InternalHost_Accepted(t *testing.T) {
 		t.Errorf("unmet expectations (a platform_inbound_secret query for an internal URL means regression): %v", err)
 	}
 }
+
+// ==================== core#3319 inbound /a2a/inbound auth ====================
+
+// TestReceiveA2AInbound exercises POST /workspaces/:id/a2a/inbound. External
+// agents must present the target workspace's platform_inbound_secret; missing,
+// wrong, or cross-workspace secrets are rejected before any forward to the
+// target workspace happens. A valid secret is accepted and the message is
+// forwarded through ProxyA2A with the consumed Authorization header stripped.
+func TestReceiveA2AInbound(t *testing.T) {
+	var forwardedAuth string
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+
+	cases := []struct {
+		name         string
+		targetWS     string
+		targetSecret string
+		authHeader   string
+		wantStatus   int
+		wantBody     string
+	}{
+		{
+			name:         "no_secret",
+			targetWS:     "ws-inbound",
+			targetSecret: "valid-secret",
+			authHeader:   "",
+			wantStatus:   http.StatusUnauthorized,
+			wantBody:     "missing Authorization",
+		},
+		{
+			name:         "wrong_secret",
+			targetWS:     "ws-inbound",
+			targetSecret: "valid-secret",
+			authHeader:   "Bearer wrong-secret",
+			wantStatus:   http.StatusForbidden,
+			wantBody:     "invalid inbound secret",
+		},
+		{
+			name:         "valid_secret",
+			targetWS:     "ws-inbound",
+			targetSecret: "valid-secret",
+			authHeader:   "Bearer valid-secret",
+			wantStatus:   http.StatusOK,
+		},
+		{
+			name:         "cross_workspace_secret",
+			targetWS:     "ws-inbound-b",
+			targetSecret: "secret-b",
+			authHeader:   "Bearer secret-a",
+			wantStatus:   http.StatusForbidden,
+			wantBody:     "invalid inbound secret",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			mr := setupTestRedis(t)
+			allowLoopbackForTest(t)
+			broadcaster := newTestBroadcaster()
+			handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+			waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+			forwardedAuth = ""
+
+			mr.Set(fmt.Sprintf("ws:%s:url", tc.targetWS), agentServer.URL)
+
+			if tc.authHeader != "" {
+				mock.ExpectQuery(`SELECT platform_inbound_secret FROM workspaces WHERE id =`).
+					WithArgs(tc.targetWS).
+					WillReturnRows(sqlmock.NewRows([]string{"platform_inbound_secret"}).AddRow(tc.targetSecret))
+			}
+
+			// Expectations below only matter when auth passes and ProxyA2A runs.
+			if tc.wantStatus == http.StatusOK {
+				expectBudgetCheck(mock, tc.targetWS)
+				mock.ExpectQuery(`SELECT delivery_mode FROM workspaces WHERE id`).
+					WithArgs(tc.targetWS).
+					WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("push"))
+				mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id =`).
+					WithArgs(tc.targetWS).
+					WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+				mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Params = gin.Params{{Key: "id", Value: tc.targetWS}}
+			c.Request = httptest.NewRequest("POST", "/workspaces/"+tc.targetWS+"/a2a/inbound", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+			if tc.authHeader != "" {
+				c.Request.Header.Set("Authorization", tc.authHeader)
+			}
+
+			handler.ReceiveA2AInbound(c)
+			if tc.wantStatus == http.StatusOK {
+				handler.waitAsyncForTest()
+			}
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("expected status %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+			if tc.wantBody != "" && !strings.Contains(w.Body.String(), tc.wantBody) {
+				t.Errorf("expected body to contain %q, got %s", tc.wantBody, w.Body.String())
+			}
+			if tc.wantStatus == http.StatusOK && forwardedAuth != "" {
+				t.Errorf("inbound Authorization header must not be forwarded to target workspace, got %q", forwardedAuth)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet sqlmock expectations: %v", err)
+			}
+		})
+	}
+}
+
+// TestReceiveA2AInbound_PublicWsPrefixTarget is the regression guard that the
+// inbound endpoint enforces platform_inbound_secret even when the target
+// workspace's resolved URL is a public ws-* hostname. Without the exact/suffix
+// internal-host classification, the downstream proxy might skip the outbound
+// secret too; here we verify the inbound gate rejects the request before any
+// such classification matters.
+func TestReceiveA2AInbound_PublicWsPrefixTarget(t *testing.T) {
+	_ = setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	const wsID = "ws-inbound-public-ws-prefix"
+	// No URL/Redis setup needed: auth runs before resolveAgentURL.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a/inbound", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.ReceiveA2AInbound(c)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for inbound request without secret, got %d: %s", w.Code, w.Body.String())
+	}
+}

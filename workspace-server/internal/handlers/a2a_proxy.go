@@ -8,6 +8,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -520,6 +521,54 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	}
 
 	c.Data(status, "application/json", respBody)
+}
+
+// ReceiveA2AInbound handles POST /workspaces/:id/a2a/inbound.
+//
+// External agents POST A2A JSON-RPC messages here to reach a workspace that
+// lives on the platform. The caller must authenticate with the target
+// workspace's platform_inbound_secret in the Authorization header. After a
+// successful constant-time comparison, the message is forwarded through the
+// same ProxyA2A path used by canvas/peer traffic.
+//
+// The X-Workspace-ID header is stripped before forwarding so the downstream
+// proxy treats this as an inbound/canvas-class request rather than attempting
+// workspace-token validation on a value supplied by an external caller.
+func (h *WorkspaceHandler) ReceiveA2AInbound(c *gin.Context) {
+	workspaceID := c.Param("id")
+	ctx := c.Request.Context()
+
+	bearer := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
+	if bearer == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing Authorization header"})
+		return
+	}
+
+	secret, err := wsauth.ReadPlatformInboundSecret(ctx, db.DB, workspaceID)
+	if err != nil {
+		if errors.Is(err, wsauth.ErrNoInboundSecret) {
+			log.Printf("ReceiveA2AInbound: no platform_inbound_secret for workspace %s", workspaceID)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace has no inbound secret configured"})
+			return
+		}
+		log.Printf("ReceiveA2AInbound: failed to read platform_inbound_secret for workspace %s: %v", workspaceID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "inbound auth unavailable"})
+		return
+	}
+
+	if subtle.ConstantTimeCompare([]byte(bearer), []byte(secret)) != 1 {
+		log.Printf("ReceiveA2AInbound: invalid platform_inbound_secret for workspace %s", workspaceID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid inbound secret"})
+		return
+	}
+
+	// Strip any caller-supplied X-Workspace-ID and the consumed Authorization
+	// header so the downstream proxy cannot be coerced into workspace-token
+	// validation using external-controlled values, and so the inbound secret is
+	// not forwarded to the target workspace.
+	c.Request.Header.Del("X-Workspace-ID")
+	c.Request.Header.Del("Authorization")
+	h.ProxyA2A(c)
 }
 
 // checkWorkspaceBudget returns a proxyA2AError with 402 when the workspace has

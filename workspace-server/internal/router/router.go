@@ -250,6 +250,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// A2A proxy — registered outside the auth group; already enforces CanCommunicate access control.
 	r.POST("/workspaces/:id/a2a", wh.ProxyA2A)
 
+	// core#3319: A2A inbound endpoint for external agents. Authenticates with the
+	// target workspace's platform_inbound_secret before forwarding through ProxyA2A.
+	r.POST("/workspaces/:id/a2a/inbound", wh.ReceiveA2AInbound)
+
 	// A2A queue status lookup (RFC #2331 Tier 1) — registered outside the
 	// workspace auth group because the row's caller_id may be a DIFFERENT
 	// workspace than :id. The handler runs its own access check (caller
