@@ -224,7 +224,10 @@ func mustCIDR(s string) net.IPNet {
 // The container-DNS check is an exact match against ws-<workspaceID> (and the
 // legacy truncated ws-<first12>) rather than a broad `strings.HasPrefix(host,
 // "ws-")` check, so a public hostname like `ws-agent.example.com` is correctly
-// classified as external.
+// classified as external. Platform-provisioned tunnel hostnames
+// (ws-<id>.<appDomain>) are also treated as internal by delegating to
+// isPlatformTunnelHostname, which matches the canonical suffix check used
+// elsewhere in the codebase.
 func isExternalAgentURL(workspaceID, agentURL string) bool {
 	u, err := url.Parse(agentURL)
 	if err != nil {
@@ -236,6 +239,10 @@ func isExternalAgentURL(workspaceID, agentURL string) bool {
 	}
 	// The workspace's own container DNS name is internal.
 	if host == containerNameForWorkspace(workspaceID) || host == legacyContainerNameForWorkspace(workspaceID) {
+		return false
+	}
+	// Platform-provisioned tunnel hostnames (ws-<id>.<appDomain>) are internal.
+	if isPlatformTunnelHostname(host) {
 		return false
 	}
 	if ip := net.ParseIP(host); ip != nil {
