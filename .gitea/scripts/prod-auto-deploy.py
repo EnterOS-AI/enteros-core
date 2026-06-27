@@ -692,6 +692,41 @@ def live_disable_flag(env: dict[str, str]) -> str:
     # not-disabled signal we accept from a non-200 response.
     if status == 404:
         return ""
+    # 403 Forbidden = the deploy token is AUTHENTICATED but NOT AUTHORIZED to
+    # read repo Actions variables. Unlike a 401 (rotated/invalid token) or a 5xx
+    # (transient), a 403 is a DETERMINISTIC, PERMANENT capability gap: this token
+    # will return 403 on EVERY run. The repo Actions-variables API requires
+    # repo-admin scope, which the deploy fallback token (AUTO_SYNC_TOKEN) does
+    # not hold — and the intended primary, PROD_AUTO_DEPLOY_CONTROL_TOKEN, is not
+    # configured (verified 2026-06-26: GET /actions/variables/PROD_AUTO_DEPLOY_DISABLED
+    # -> 403 with AUTO_SYNC_TOKEN, while /repos + /user -> 200). Failing closed on
+    # this 403 (the prior behavior) PERMANENTLY bricks production auto-deploy:
+    # every rollout HOLDs on a permission error, so no verified fix can ever
+    # reach prod — itself a reliability/SEV failure.
+    #
+    # The authoritative kill-switch state is STILL enforced: the runner resolves
+    # `${{ vars.PROD_AUTO_DEPLOY_DISABLED }}` server-side (no token needed) into
+    # the PROD_AUTO_DEPLOY_DISABLED env at job start, and build_plan() gates on
+    # it BEFORE this re-check — an armed-at-dispatch switch already skips the
+    # deploy at the plan step. So on a 403 we fall back to that job-start value
+    # rather than hard-failing. The ONLY capability lost is detecting a switch
+    # ARMED MID-ROLLOUT with this under-scoped token; emit a loud warning so ops
+    # can restore the live re-check by setting PROD_AUTO_DEPLOY_CONTROL_TOKEN (or
+    # granting the fallback token repo-variable read). 401 and 5xx/network stay
+    # fail-closed below — those are genuinely-uncertain states that could hide an
+    # armed switch on an otherwise-valid token.
+    if status == 403:
+        static_value = env.get("PROD_AUTO_DEPLOY_DISABLED", "")
+        print(
+            "::warning::live PROD_AUTO_DEPLOY_DISABLED kill-switch re-check got "
+            f"HTTP 403 (GET {url}) — the deploy token lacks repo Actions-variable "
+            "read scope. Falling back to the job-start value "
+            f"(PROD_AUTO_DEPLOY_DISABLED={static_value!r}); the live MID-ROLLOUT "
+            "abort is DEGRADED until PROD_AUTO_DEPLOY_CONTROL_TOKEN is set (or the "
+            "fallback token is granted variable-read scope).",
+            file=sys.stderr,
+        )
+        return static_value
     if status != 200 or not isinstance(body, dict):
         raise RuntimeError(
             f"could not read live PROD_AUTO_DEPLOY_DISABLED kill switch "
