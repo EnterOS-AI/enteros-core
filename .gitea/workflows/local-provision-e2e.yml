@@ -373,7 +373,7 @@ jobs:
     # pool reliably builds the template + reaches api.minimax.io AND
     # MOLECULE_STAGING_MINIMAX_API_KEY is stably available — at which point
     # the gate promotes to required and the mask flips to false.
-    continue-on-error: true  # mc#3230: governance tracker — advisory MiniMax e2e; promote to gating when stable. Per mc#2408 (decision issue), fail-soft mask is KEEP until promotion. This mc#3230 tracker expires 14 days after 2026-06-24.
+    continue-on-error: true  # mc#3230: governance tracker — advisory MiniMax e2e; promote to gating when stable. Per mc#2408 (decision issue), fail-soft mask is KEEP until promotion. This mc#3230 tracker expires 14 days after 2026-06-24. Renewal cycle 2026-06-27 (mc#3230 still within the 14-day window; expires 2026-07-08): Gitea workflow-runs API did not return per-workflow run history for this gate, so green/flappy cannot be confirmed by API — relying on the prior-renewal evidence chain (mc#3177 → mc#3230) plus the 97bb804f consolidation commit as the basis for keeping the mask. Next renewal: 2026-07-08 (or earlier if a Phase-1 promote-to-gating PR is opened per mc#2408 with documented stable runner pool + MOLECULE_STAGING_MINIMAX_API_KEY availability).
     timeout-minutes: 30
     env:
       PG_CONTAINER: pg-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}
