@@ -1704,7 +1704,12 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
 				managementMCPUnloaded = true
 				// Observability: emit the deciding inputs at this demote site (core#3082 / runtime#181 follow-up).
-				log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=management_mcp_lookup_error mcp_server_present_payload=%v loaded_mcp_tools_count=%d management_mcp_unloaded=%v", payload.WorkspaceID, currentStatus, mcpServerPresentPayloadForLog(payload.MCPServerPresent), len(payload.LoadedMCPTools), managementMissing)
+				// NOTE: in the mErr != nil branch, managementMissing is the zero-value
+				// (false) — the lookup errored before platformAgentManagementMCPLoaded
+				// could assign it. Emit managementMCPUnloaded (set true above) so the
+				// field reflects the actual unloaded-state used by the recovery gate
+				// below. (CR2 #14695 / Researcher #14696 on #3334.)
+				log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=management_mcp_lookup_error mcp_server_present_payload=%v loaded_mcp_tools_count=%d management_mcp_unloaded=%v", payload.WorkspaceID, currentStatus, mcpServerPresentPayloadForLog(payload.MCPServerPresent), len(payload.LoadedMCPTools), managementMCPUnloaded)
 				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
 					log.Printf("Heartbeat: failed to mark %s degraded (management MCP lookup error): %v", payload.WorkspaceID, err)
 				}
@@ -1740,7 +1745,11 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 					}
 					log.Printf("Heartbeat: %s (workspace=%s, unloaded for %s)", msg, payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second))
 					// Observability: emit the deciding inputs at this demote site (core#3082 / runtime#181 follow-up).
-					log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=management_mcp_missing loaded_mcp_tools_count=%d absent_tools_list=%v mcp_unloaded_for=%s grace=%s management_mcp_unloaded=%v", payload.WorkspaceID, currentStatus, len(payload.LoadedMCPTools), absentToolsList, now.Sub(firstUnloaded.Time).Truncate(time.Second), managementMCPUnloadedGrace, managementMissing)
+					// Emit managementMCPUnloaded (true here, set at line 1701) — the
+				// tool-missing boolean (managementMissing) is already conveyed by
+				// the loaded_mcp_tools_count + absent_tools_list pair right above.
+					// (Consistency with lookup-error branch per CR2 #14695 / Researcher #14696 on #3334.)
+					log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=management_mcp_missing loaded_mcp_tools_count=%d absent_tools_list=%v mcp_unloaded_for=%s grace=%s management_mcp_unloaded=%v", payload.WorkspaceID, currentStatus, len(payload.LoadedMCPTools), absentToolsList, now.Sub(firstUnloaded.Time).Truncate(time.Second), managementMCPUnloadedGrace, managementMCPUnloaded)
 					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
 						log.Printf("Heartbeat: failed to mark %s degraded (management MCP missing): %v", payload.WorkspaceID, err)
 					}
