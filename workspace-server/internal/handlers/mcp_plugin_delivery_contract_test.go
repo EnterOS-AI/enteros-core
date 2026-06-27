@@ -26,7 +26,7 @@ func TestMCPPluginDeliveryContract_MatchesSSOT(t *testing.T) {
 	// (claude_code/codex implemented, gemini/hermes declared-but-todo). A drift
 	// in any of these — e.g. the PORT being collapsed back into a hard-coded
 	// Claude write, or a runtime silently dropping out — fails here.
-	if diffs := c.MatchesSSOT(); len(diffs) > 0 {
+	if diffs := MatchesSSOT(c); len(diffs) > 0 {
 		for _, d := range diffs {
 			t.Errorf("contract SSOT drift: %s", d)
 		}

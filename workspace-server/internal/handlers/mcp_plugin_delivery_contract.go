@@ -2,116 +2,46 @@ package handlers
 
 // MCP-plugin delivery contract (core#3080).
 //
-// This is the producer-side guard for the MCP-plugin delivery contract
-// between molecule-core (which ships plugin declarations) and the
-// claude-code workspace template (whose runtime writes/reads
-// /configs/.claude/settings.json under the mcpServers key).
+// Core now CONSUMES this contract from the molecule-contracts SSOT (RFC
+// molecule-core#3285 §10 "consume, never two copies"): it imports the generated
+// Go binding (go.moleculesai.app/molecule-contracts/gen/go) instead of reading
+// its own JSON file. The import IS the link — core's runtime + tests can no
+// longer drift from the SSOT.
 //
-// The contract file is duplicated byte-for-byte in both repos and kept
-// honest by a cross-repo drift gate.
+// The on-disk contracts/mcp-plugin-delivery.contract.json is RETAINED only as a
+// CI cross-repo comparison anchor (the template/runtime drift gate + the
+// verb-manifest check still byte-compare against it), kept byte-equal to the
+// SSOT by contract-ssot-sync. Core CODE no longer reads it. Fully removing the
+// JSON — repointing those cross-repo gates straight at the molecule-contracts
+// SSOT — is a deliberate follow-up (one of those gates is the SEV1-relevant
+// verb-manifest check, so it is sequenced after the incident).
 
 import (
-	"encoding/json"
-	"os"
+	molcontracts "go.moleculesai.app/molecule-contracts/gen/go"
 )
 
-const mcpPluginDeliveryContractPath = "../../../contracts/mcp-plugin-delivery.contract.json"
+// MCPPluginDeliveryContract / Port / Runtime are the generated SSOT types,
+// re-exported as aliases so existing references compile unchanged.
+type (
+	MCPPluginDeliveryContract = molcontracts.MCPPluginDeliveryContract
+	Port                      = molcontracts.Port
+	Runtime                   = molcontracts.Runtime
+)
 
-// MCPPluginDeliveryContract describes the pinned MCP-plugin delivery surface.
-type MCPPluginDeliveryContract struct {
-	SettingsPath string `json:"settings_path"`
-	Key          string `json:"key"`
-	EntryShape   string `json:"entry_shape"`
-	Producer     string `json:"producer"`
-	Consumer     string `json:"consumer"`
-	// MCPServerName is the SSOT for the platform MCP server NAME — the mcpServers
-	// key the runtime registers the server under, which Claude Code turns into
-	// the tool-id prefix `mcp__<MCPServerName>__<tool>`. The platform-agent
-	// template's mcp_servers.yaml and the online/degraded gate's expected tool id
-	// (conciergePlatformMCPProvisionWorkspaceTool) both derive from this value — see
-	// TestSSOT_DegradeGateToolDerivesFromContract.
-	MCPServerName string `json:"mcp_server_name"`
-
-	// RequiredTool is the SSOT for the management MCP's REQUIRED tool VERB. The
-	// concierge runs the platform MCP in MOLECULE_MCP_MODE=management, where the
-	// lifecycle verb is "provision_workspace" (createServer() returns early in
-	// management mode and never registers the workspace-mode create_workspace
-	// tool — confirmed across @molecule-ai/mcp-server 1.1.1 → 1.6.1 and on the
-	// live 1.6.1 concierge). Combined with MCPServerName it yields the full
-	// dispatcher id the online/degraded gate looks for:
-	// `mcp__<MCPServerName>__<RequiredTool>`. Pinning the verb here (not as a
-	// hardcoded literal in the gate const or the test) closes the SSOT gap the
-	// 2026-06-25 audit flagged: previously only the `mcp__<server>__` prefix was
-	// contract-derived while the verb was re-spelled in both the Go const and the
-	// test — AND the verb was wrong (create_workspace is a workspace-mode tool the
-	// concierge never exposes). See TestSSOT_DegradeGateToolDerivesFromContract.
-	RequiredTool string `json:"required_tool"`
-
-	// LoadedMCPToolsField is the SSOT for the register/heartbeat status-field NAME
-	// the runtime emits (the loaded MCP tool inventory) and core's #3082 gate
-	// consumes. Pinned so a rename on either side is caught by the drift gate.
-	LoadedMCPToolsField string `json:"loaded_mcp_tools_field"`
-
-	// Descriptor is the prose SSOT describing the runtime-agnostic MCP descriptor
-	// shape and the wiring-PORT indirection (register_mcp_server →
-	// register_mcp_server_hook). It is pinned so a refactor that collapses the
-	// PORT back into a hard-coded Claude write is caught by MatchesSSOT.
-	Descriptor string `json:"descriptor"`
-
-	// Port pins the MCP-wiring PORT symbol names on the runtime side. These are
-	// the seam #3159 introduced: an adaptor calls Port.Hook; the active runtime's
-	// Port.Impl renders the descriptor into the native config it reads. If any of
-	// these symbols is renamed or removed, the contract (and this struct) must be
-	// updated deliberately.
-	Port Port `json:"port"`
-
-	// Runtimes maps each known runtime id to its native MCP-config delivery
-	// surface. claude_code/codex are implemented; gemini_cli/hermes are todo
-	// stubs (fail-loud renderers). MatchesSSOT asserts per-runtime so a runtime
-	// silently dropping out of the contract is caught.
-	Runtimes map[string]Runtime `json:"runtimes"`
+// LoadMCPPluginDeliveryContract returns the contract from the molecule-contracts
+// SSOT binding. The signature (and the always-nil error) is kept so existing
+// callers/tests are unchanged; there is no longer a file to read or fail on.
+func LoadMCPPluginDeliveryContract() (*MCPPluginDeliveryContract, error) {
+	c := molcontracts.Contract
+	return &c, nil
 }
 
-// Port names the MCP-wiring PORT symbols on the runtime side (#3159). The
-// indirection is what lets a single runtime-agnostic descriptor reach the
-// native config of whichever runtime is active.
-type Port struct {
-	// Hook is the InstallContext seam an adaptor calls to wire an MCP server
-	// (e.g. "InstallContext.register_mcp_server").
-	Hook string `json:"hook"`
-	// Impl is the BaseAdapter method bound behind Hook at install time.
-	Impl string `json:"impl"`
-	// PresentProbe is the BaseAdapter method that reports whether the management
-	// MCP is present in the active runtime's native config.
-	PresentProbe string `json:"present_probe"`
-	// Dispatch describes how the default hook dispatches on the runtime name.
-	Dispatch string `json:"dispatch"`
-	// ResolverDefault describes the registry default that routes an
-	// mcpServers-shaped plugin to MCPServerAdaptor for ANY runtime.
-	ResolverDefault string `json:"resolver_default"`
-}
-
-// Runtime is a single runtime's native MCP-config delivery surface.
-type Runtime struct {
-	SettingsPath string `json:"settings_path"`
-	Format       string `json:"format"`
-	// Key is the JSON object key (claude_code/gemini_cli); empty for TOML runtimes.
-	Key string `json:"key,omitempty"`
-	// Table is the TOML table prefix (codex); empty for JSON runtimes.
-	Table string `json:"table,omitempty"`
-	// Renderer names the mcp_render function that writes this runtime's config.
-	Renderer string `json:"renderer"`
-	// Status is "implemented" or a "todo-*" marker for unverified runtimes.
-	Status string `json:"status"`
-}
-
-// MatchesSSOT asserts that the loaded contract matches the pinned SSOT values:
-// the core scalar fields, the MCP-wiring PORT symbol names, and each runtime's
-// native delivery surface (claude_code/codex implemented; gemini/hermes todo).
-// It returns the list of mismatches (empty == matches). The test wrapper turns
-// a non-empty list into a failure. Keeping the assertion here (rather than only
-// in the test) lets any contract consumer self-check the SSOT.
-func (c *MCPPluginDeliveryContract) MatchesSSOT() []string {
+// MatchesSSOT asserts the contract carries the exact values core depends on.
+// With the binding this is a value-pin: a contract change in molecule-contracts
+// reaches core only via a module bump, and this catches a bumped value that
+// would break the degrade gate or the PORT wiring. Kept as a function (not a
+// method) since the type is now an alias of the imported struct.
+func MatchesSSOT(c *MCPPluginDeliveryContract) []string {
 	var diffs []string
 	eq := func(field, got, want string) {
 		if got != want {
@@ -128,9 +58,8 @@ func (c *MCPPluginDeliveryContract) MatchesSSOT() []string {
 	eq("required_tool", c.RequiredTool, "provision_workspace")
 	eq("loaded_mcp_tools_field", c.LoadedMCPToolsField, "loaded_mcp_tools")
 
-	// PORT symbols (#3159). These pin the wiring seam: if the adaptor regresses
-	// to a hard-coded Claude write, the hook/impl indirection disappears and this
-	// catches the contract drift.
+	// PORT symbols (#3159): if the adaptor regresses to a hard-coded Claude
+	// write, the hook/impl indirection disappears and this catches the drift.
 	eq("port.hook", c.Port.Hook, "InstallContext.register_mcp_server")
 	eq("port.impl", c.Port.Impl, "BaseAdapter.register_mcp_server_hook")
 	eq("port.present_probe", c.Port.PresentProbe, "BaseAdapter.management_mcp_present")
@@ -146,9 +75,7 @@ func (c *MCPPluginDeliveryContract) MatchesSSOT() []string {
 	}
 
 	// Per-runtime native delivery surfaces. claude_code/codex must be present and
-	// implemented with the renderer the runtime really uses; gemini/hermes must be
-	// declared but flagged todo (so a runtime can't silently fall out of the
-	// contract, and so an "implemented" claim for a stub is caught).
+	// implemented; gemini/hermes must be declared but flagged todo.
 	wantRuntimes := map[string]Runtime{
 		"claude_code": {SettingsPath: "/configs/.claude/settings.json", Format: "json", Key: "mcpServers", Renderer: "mcp_render.render_claude_settings", Status: "implemented"},
 		"codex":       {SettingsPath: "~/.codex/config.toml", Format: "toml", Table: "mcp_servers", Renderer: "mcp_render.render_codex_config", Status: "implemented"},
@@ -166,7 +93,6 @@ func (c *MCPPluginDeliveryContract) MatchesSSOT() []string {
 		eq("runtimes."+name+".renderer", got.Renderer, want.Renderer)
 		eq("runtimes."+name+".status", got.Status, want.Status)
 	}
-	// gemini/hermes are declared-but-todo: present, and NOT claiming implemented.
 	for _, name := range []string{"gemini_cli", "hermes"} {
 		got, ok := c.Runtimes[name]
 		if !ok {
@@ -181,17 +107,4 @@ func (c *MCPPluginDeliveryContract) MatchesSSOT() []string {
 		}
 	}
 	return diffs
-}
-
-// LoadMCPPluginDeliveryContract loads the contract from the repo root.
-func LoadMCPPluginDeliveryContract() (*MCPPluginDeliveryContract, error) {
-	data, err := os.ReadFile(mcpPluginDeliveryContractPath)
-	if err != nil {
-		return nil, err
-	}
-	var c MCPPluginDeliveryContract
-	if err := json.Unmarshal(data, &c); err != nil {
-		return nil, err
-	}
-	return &c, nil
 }
