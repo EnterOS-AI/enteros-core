@@ -213,6 +213,37 @@ func mustCIDR(s string) net.IPNet {
 	return *n
 }
 
+// isExternalAgentURL reports whether agentURL points to an agent that lives
+// outside the platform's own infrastructure. Internal addresses (loopback,
+// RFC-1918/private, link-local, container DNS ws-*) are treated as in-cluster
+// and are not required to present the platform_inbound_secret on the A2A
+// forward. Public hostnames/IPs are treated as external agents and the
+// platform MUST authenticate with the per-workspace platform_inbound_secret.
+func isExternalAgentURL(agentURL string) bool {
+	u, err := url.Parse(agentURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	// Container DNS names are internal by convention.
+	if strings.HasPrefix(host, "ws-") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
+			ip.IsPrivate() || isPrivateOrMetadataIP(ip) {
+			return false
+		}
+		return true
+	}
+	// Hostname: assume public unless it matched the container prefix above.
+	return true
+}
+
 // validateRelPath checks that a file path is relative and does not escape
 // the destination via absolute paths or ".." traversal. Used by
 // copyFilesToContainer and deleteViaEphemeral as a defence-in-depth measure.

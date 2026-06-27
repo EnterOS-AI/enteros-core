@@ -1797,7 +1797,7 @@ func TestDispatchA2A_BuildRequestError(t *testing.T) {
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
 	// Malformed URL causes http.NewRequestWithContext to fail.
-	_, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", "http://%%badhost", []byte("{}"), "")
+	_, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", "http://%%badhost", []byte("{}"), "", "")
 	if cancel != nil {
 		cancel()
 	}
@@ -1820,7 +1820,7 @@ func TestDispatchA2A_CanvasTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", srv.URL, []byte(`{}`), "")
+	resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", srv.URL, []byte(`{}`), "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1841,7 +1841,7 @@ func TestDispatchA2A_AgentTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", srv.URL, []byte(`{}`), "ws-caller")
+	resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", srv.URL, []byte(`{}`), "ws-caller", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1870,7 +1870,7 @@ func TestDispatchA2A_ContextDeadline_NoExtraCeiling(t *testing.T) {
 	ctx, ctxCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer ctxCancel()
 
-	resp, cancel, err := handler.dispatchA2A(ctx, "ws-target", srv.URL, []byte(`{}`), "")
+	resp, cancel, err := handler.dispatchA2A(ctx, "ws-target", srv.URL, []byte(`{}`), "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1983,6 +1983,7 @@ func TestDispatchA2A_RejectsUnsafeURL(t *testing.T) {
 		"ws-target",
 		"http://169.254.169.254/latest/meta-data/",
 		[]byte(`{}`),
+		"",
 		"",
 	)
 	if cancel != nil {
@@ -3883,5 +3884,101 @@ func TestProxyA2A_MessageSend_CanDelegateFalse_SelfCall_Allowed(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("self-call with can_delegate=false must NOT be gated, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ==================== core#3319: platform→external-agent /a2a/inbound auth ====================
+
+func TestIsExternalAgentURL(t *testing.T) {
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"http://ws-abc123:8000/a2a", false},           // container DNS
+		{"http://127.0.0.1:8000/a2a", false},           // loopback
+		{"http://[::1]:8000/a2a", false},               // IPv6 loopback
+		{"http://10.0.0.5:8000/a2a", false},            // RFC-1918 private
+		{"http://169.254.169.254/a2a", false},          // metadata link-local
+		{"http://agent.example.com/a2a/inbound", true}, // public external agent
+		{"https://8.8.8.8/a2a/inbound", true},          // public IP
+	}
+	for _, tc := range cases {
+		got := isExternalAgentURL(tc.url)
+		if got != tc.want {
+			t.Errorf("isExternalAgentURL(%q) = %v, want %v", tc.url, got, tc.want)
+		}
+	}
+}
+
+func TestDispatchA2A_InboundSecretHeader(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	const secret = "platform-inbound-secret-xyz"
+	var gotAuth string
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+
+	resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", agentServer.URL, []byte(`{}`), "", secret)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+	if cancel != nil {
+		defer cancel()
+	}
+
+	if gotAuth != "Bearer "+secret {
+		t.Errorf("expected Authorization header %q, got %q", "Bearer "+secret, gotAuth)
+	}
+}
+
+func TestProxyA2A_ExternalAgent_MissingInboundSecret_Rejected(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	restoreSSRF := setSSRFCheckForTest(false)
+	defer restoreSSRF()
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	const wsID = "ws-external-no-secret"
+	expectBudgetCheck(mock, wsID)
+	mock.ExpectQuery(`SELECT delivery_mode FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("push"))
+	mock.ExpectQuery(`SELECT url, status FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "status"}).AddRow("http://external-agent.example/a2a/inbound", "online"))
+	mock.ExpectQuery(`SELECT platform_inbound_secret FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"platform_inbound_secret"}).AddRow(nil))
+	mock.ExpectExec(`UPDATE workspaces SET platform_inbound_secret`).
+		WithArgs(sqlmock.AnyArg(), wsID).
+		WillReturnError(errors.New("db locked"))
+
+	prevAdmin := os.Getenv("ADMIN_TOKEN")
+	os.Setenv("ADMIN_TOKEN", "admin-secret-3319")
+	defer os.Setenv("ADMIN_TOKEN", prevAdmin)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer admin-secret-3319")
+
+	handler.ProxyA2A(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 when external workspace has no inbound secret, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "inbound auth") {
+		t.Errorf("expected inbound-auth error message, got %s", w.Body.String())
 	}
 }

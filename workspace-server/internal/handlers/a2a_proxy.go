@@ -781,8 +781,38 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		}
 	}
 
+	// core#3319: external agents (public /a2a/inbound endpoints) must receive
+	// the workspace's platform_inbound_secret in the Authorization header.
+	// Internal container addresses are unchanged. Reuses the same per-workspace
+	// bearer that already gates /internal/* forwards (chat_files.go).
+	inboundSecret := ""
+	if isExternalAgentURL(agentURL) {
+		secret, healed, secretErr := readOrLazyHealInboundSecret(ctx, workspaceID, "ProxyA2A")
+		if secretErr != nil {
+			log.Printf("ProxyA2A: no platform_inbound_secret for external workspace %s: %v", workspaceID, secretErr)
+			return 0, nil, &proxyA2AError{
+				Status: http.StatusServiceUnavailable,
+				Response: gin.H{
+					"error":  "workspace not yet enrolled in inbound auth (RFC #2312)",
+					"detail": "Failed to read platform_inbound_secret. Reprovision the workspace if this persists.",
+				},
+			}
+		}
+		if healed {
+			return 0, nil, &proxyA2AError{
+				Status: http.StatusServiceUnavailable,
+				Response: gin.H{
+					"error":               "workspace re-registering — please retry in 30 seconds",
+					"detail":              "Inbound auth secret was just minted. Workspace will pick it up on its next heartbeat.",
+					"retry_after_seconds": 30,
+				},
+			}
+		}
+		inboundSecret = secret
+	}
+
 	startTime := time.Now()
-	resp, cancelFwd, err := h.dispatchA2A(ctx, workspaceID, agentURL, body, callerID)
+	resp, cancelFwd, err := h.dispatchA2A(ctx, workspaceID, agentURL, body, callerID, inboundSecret)
 	if cancelFwd != nil {
 		defer cancelFwd()
 	}
@@ -1304,7 +1334,7 @@ func parseIdleTimeoutEnv(v string) time.Duration {
 //
 // Either layer is overridable by the X-Timeout header upstream in
 // ProxyA2A; X-Timeout: 0 explicitly disables the absolute ceiling.
-func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentURL string, body []byte, callerID string) (*http.Response, context.CancelFunc, error) {
+func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentURL string, body []byte, callerID string, inboundSecret string) (*http.Response, context.CancelFunc, error) {
 	// #1483 SSRF defense-in-depth: the primary call path through
 	// proxyA2ARequest → resolveAgentURL already validates via isSafeURL
 	// (a2a_proxy.go:424), but adding the check here closes the gap for
@@ -1367,6 +1397,9 @@ func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentUR
 		return nil, nil, &proxyDispatchBuildError{err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if inboundSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+inboundSecret)
+	}
 	resp, doErr := a2aClient.Do(req)
 	return resp, cancel, doErr
 }
