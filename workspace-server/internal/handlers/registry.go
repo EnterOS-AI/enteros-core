@@ -1732,6 +1732,14 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 						"loaded_mcp_tools_absent": absentToolsList,
 						"sample_error":            msg,
 					})
+					// RCA#2970/#3082/#3228 deadlock-break: the runtime reports the
+					// management MCP server present but cannot enumerate its tools
+					// (loaded_mcp_tools empty or missing provision_workspace). This
+					// variant was uncovered — fireReconcileMCPRecovery only fired when
+					// mcp_server_present=false. Delivering/restarting the declared
+					// management MCP plugin can regenerate the runtime config so the
+					// next heartbeat carries the required tool.
+					h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
 				}
 			default:
 				// Management MCP confirmed loaded this heartbeat. Clear any
