@@ -763,7 +763,7 @@ func configDirName(workspaceID string) string {
 // "external" is a first-class runtime that intentionally does NOT
 // spawn a Docker container. Workspaces with runtime="external" are
 // created in status=awaiting_agent; the operator installs
-// molecule-sdk-python (or any A2A-compatible agent) somewhere they
+// molecule-external-workspace-sdk (or any A2A-compatible agent) somewhere they
 // control and calls POST /registry/register with the workspace_id +
 // workspace_auth_token from the create response. Canvas proxies A2A
 // calls to the registered URL thereafter. "external" has no template

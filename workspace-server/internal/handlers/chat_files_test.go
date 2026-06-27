@@ -79,7 +79,7 @@ func expectURLAndMode(mock sqlmock.Sqlmock, workspaceID, url, mode string) {
 }
 
 // expectURLNullMode is the production-observed shape: external runtime
-// workspaces (molecule-sdk-python on user infra) register with
+// workspaces (molecule-external-workspace-sdk on user infra) register with
 // delivery_mode = NULL, not "poll". Caught 2026-05-04 — the narrow
 // "poll" check missed three of three real workspaces in user reports.
 func expectURLNullMode(mock sqlmock.Sqlmock, workspaceID, url string) {
@@ -271,7 +271,7 @@ func TestChatUpload_PollModeEmptyURL(t *testing.T) {
 }
 
 // TestChatUpload_NullModeEmptyURL — production-observed 2026-05-04:
-// external-runtime workspaces (molecule-sdk-python on user infra)
+// external-runtime workspaces (molecule-external-workspace-sdk on user infra)
 // register with delivery_mode = NULL, not "poll". The earlier narrow
 // poll-only check fell through to the misleading 503. The fix is the
 // inverse-of-push test: anything not exactly "push" with empty URL

@@ -19,6 +19,7 @@ require (
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/stretchr/testify v1.11.1
+	go.moleculesai.app/molecule-contracts v0.0.0-20260627044329-ffd2cf33343a
 	go.moleculesai.app/plugin/gh-identity v0.0.0-20260509010445-788988195fce
 	golang.org/x/crypto v0.50.0
 	gopkg.in/yaml.v3 v3.0.1

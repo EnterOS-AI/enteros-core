@@ -535,7 +535,7 @@ func TestPollUpload_TooManyFiles_400(t *testing.T) {
 
 func TestPollUpload_NullDeliveryMode_TreatedAsPush(t *testing.T) {
 	// Production-observed 2026-05-04: external runtime workspaces
-	// (molecule-sdk-python on user infra) sometimes register with
+	// (molecule-external-workspace-sdk on user infra) sometimes register with
 	// delivery_mode = NULL — the schema default for legacy rows from
 	// before #2339. The poll branch must NOT activate on NULL — only
 	// the explicit "poll" string. This is the same defensive posture

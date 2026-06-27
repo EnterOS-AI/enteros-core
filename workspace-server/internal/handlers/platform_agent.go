@@ -41,6 +41,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	molcontracts "go.moleculesai.app/molecule-contracts/gen/go"
 )
 
 // The concierge system-prompt template, the concierge MCP servers block, the
@@ -691,8 +692,8 @@ const conciergePlatformMCPName = "molecule-ai-plugin-molecule-platform-mcp"
 
 // conciergePlatformMCPServerName == contract.mcp_server_name (the mcp__<server>__
 // prefix). conciergePlatformMCPRequiredTool == contract.required_tool (the verb).
-const conciergePlatformMCPServerName = "molecule-platform"
-const conciergePlatformMCPRequiredTool = "provision_workspace"
+const conciergePlatformMCPServerName = molcontracts.MCPServerName
+const conciergePlatformMCPRequiredTool = molcontracts.RequiredTool
 
 // conciergePlatformMCPProvisionWorkspaceTool is composed from the two contract-
 // pinned constants above via the canonical mcp__<server>__<tool> formula. It

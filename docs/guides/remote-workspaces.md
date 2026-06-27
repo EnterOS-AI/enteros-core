@@ -35,14 +35,14 @@ detail — not an architectural constraint.
 |---|---|
 | **Platform** | Molecule AI platform running v0.30+ (`go run ./cmd/server` from `workspace-server/` or the current `main` image) |
 | **Admin access** | An `ADMIN_TOKEN`, org API key, or session cookie with permission to create workspaces |
-| **Python ≥ 3.11** | For the `molecule-sdk-python` client (`pip install molecule-ai-sdk`) |
+| **Python ≥ 3.11** | For the `molecule-external-workspace-sdk` client (`pip install molecule-external-workspace`) |
 | **Publicly reachable endpoint** | The agent's host must be reachable from the platform over HTTPS. If behind NAT, use [ngrok](https://ngrok.com) or [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/). |
 | **Network** | Outbound HTTPS from the agent to the platform; inbound HTTPS from the platform to the agent's A2A endpoint |
 
 ### SDK Installation
 
 ```bash
-pip install molecule-ai-sdk
+pip install molecule-external-workspace
 ```
 
 Or from the repo checkout:
@@ -96,10 +96,10 @@ WORKSPACE=$(curl -s -X POST https://acme.moleculesai.app/workspaces \
 WORKSPACE_ID=$(echo $WORKSPACE | jq -r '.id')
 
 # 2. Run the agent (any machine that can reach the platform)
-pip install molecule-ai-sdk
+pip install molecule-external-workspace
 
 python3 - <<'EOF'
-from molecule_agent import RemoteAgentClient
+from molecule_external_workspace import RemoteAgentClient
 import os, logging
 
 client = RemoteAgentClient(
@@ -163,12 +163,12 @@ workspace IDs do not need to match across tenants.
 | 30.5 | A2A proxy enforces caller token | `POST /workspaces/:id/a2a` |
 | 30.6 | Sibling discovery + URL caching | `GET /registry/:id/peers` |
 | 30.7 | Poll-liveness for external runtime | Redis TTL (90s timeout) |
-| 30.8 | Remote-agent SDK + docs | `molecule-sdk-python` |
+| 30.8 | Remote-agent SDK + docs | `molecule-external-workspace-sdk` |
 
 ---
 
 ## Next Steps
 
 - **[External Agent Registration Guide →](/docs/guides/external-agent-registration)** — full endpoint reference, Python + Node.js examples, troubleshooting
-- **[molecule-sdk-python →](https://git.moleculesai.app/molecule-ai/molecule-sdk-python)** — SDK source, `RemoteAgentClient` API docs
-- **[SDK Examples →](https://git.moleculesai.app/molecule-ai/molecule-sdk-python/src/branch/main/examples/remote-agent)** — `run.py` demo script, annotated walkthrough
+- **[molecule-external-workspace-sdk →](https://git.moleculesai.app/molecule-ai/molecule-external-workspace-sdk)** — SDK source, `RemoteAgentClient` API docs
+- **[SDK Examples →](https://git.moleculesai.app/molecule-ai/molecule-external-workspace-sdk/src/branch/main/examples/remote-agent)** — `run.py` demo script, annotated walkthrough
