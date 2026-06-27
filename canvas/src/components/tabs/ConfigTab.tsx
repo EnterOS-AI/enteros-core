@@ -966,7 +966,11 @@ export function ConfigTab({ workspaceId }: Props) {
   const sandboxBackendId = useId();
 
   const providerDirty = provider !== originalProvider;
-  const isDirty = (rawMode ? rawDraft !== originalYaml : toYaml(config) !== originalYaml) || providerDirty;
+  const isDirty = useMemo(() => {
+    if (providerDirty) return true;
+    if (rawMode) return rawDraft !== originalYaml;
+    return toYaml(config) !== originalYaml;
+  }, [providerDirty, rawMode, rawDraft, originalYaml, config]);
   // core#2594: an env-resolved workspace has no stored model. Saving while
   // the model dropdown is still empty can't "wipe" routing (handleSave skips
   // an empty /model PUT), but it is confusing and can stall the user on other
