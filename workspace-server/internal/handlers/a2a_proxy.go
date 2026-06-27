@@ -646,6 +646,23 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		}
 	}
 
+	// core#3082 warming gate: a kind=platform concierge in 'provisioning' is UP
+	// but NOT yet VERIFIED able to serve a turn (provision_workspace not loaded).
+	// Dispatching now falls to poll-mode 'queued' and hangs with no reply (the
+	// 675s dead-air the principal hit in test1). Defer a real caller with 503 +
+	// Retry-After (the canvas renders a warming state and auto-retries post-flip,
+	// mirroring the existing hibernation-wake contract). EXEMPT system callers —
+	// system:concierge-warmup MUST reach the runtime DURING warming, it produces
+	// the loaded_mcp_tools capture that drives the verified flip — and self-calls.
+	// Placed AFTER access-control + budget + can_delegate so an unauthorized /
+	// over-budget caller still gets 403/429 first (denial hierarchy preserved),
+	// and BEFORE persist so a deferred call leaves no half-persisted bubble.
+	if !isSystemCaller(callerID) && callerID != workspaceID {
+		if proxyErr := h.conciergeWarmingGate(ctx, workspaceID); proxyErr != nil {
+			return 0, nil, proxyErr
+		}
+	}
+
 	// #2560 (chat UX: persist in-flight exchange across leave/refresh):
 	// write the user message to activity_logs AT RECEIPT — before any of
 	// the downstream short-circuits (poll-mode, mock-runtime, push dispatch)
@@ -659,7 +676,13 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	//
 	// Skipped when the body has no messageId (system callers, legacy
 	// a2a_send payloads) — the completion path remains authoritative.
-	if a2aMethod == "message/send" {
+	//
+	// core#3082: also skip for system callers so the platform-fired warmup turn
+	// (system:concierge-warmup) does NOT leak as a user bubble. The warmup body
+	// carries a messageId (so persistUserMessageAtIngest would otherwise INSERT a
+	// USER_MESSAGE row + broadcast "Platform readiness check — no action needed."),
+	// but a system-initiated self-turn is not a user message.
+	if a2aMethod == "message/send" && !isSystemCaller(callerID) {
 		h.persistUserMessageAtIngest(ctx, workspaceID, callerID, body, a2aMethod)
 	}
 
@@ -965,6 +988,41 @@ func (h *WorkspaceHandler) SendConciergeWarmupA2A(ctx context.Context, workspace
 		return status, respBody, proxyErr
 	}
 	return status, respBody, nil
+}
+
+// conciergeWarmingGate returns a 503 + Retry-After deferral when the target is a
+// kind=platform concierge still HELD in 'provisioning' (warming) — i.e. it is UP
+// but has not yet proven provision_workspace is callable (core#3082). Dispatching
+// to it would fall to poll-mode 'queued' and hang with no reply. The caller-side
+// system/self exemption lives at the call site (the warmup itself MUST get
+// through). Mirrors the hibernation-wake 503 contract (Retry-After + a structured
+// {warming:true} body the canvas can auto-retry on).
+//
+// Fail-OPEN: sql.ErrNoRows returns nil so resolveAgentURL can emit the canonical
+// 404; any other DB error returns nil so a transient lookup failure never blocks
+// legitimate traffic. Non-platform / non-provisioning targets return nil (no-op).
+func (h *WorkspaceHandler) conciergeWarmingGate(ctx context.Context, workspaceID string) *proxyA2AError {
+	var wsKind, wsStatus string
+	err := db.DB.QueryRowContext(ctx,
+		`SELECT kind, status FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&wsKind, &wsStatus)
+	if err != nil {
+		// ErrNoRows → let resolveAgentURL 404; other errors → fail open.
+		return nil
+	}
+	if wsKind != models.KindPlatform || wsStatus != string(models.StatusProvisioning) {
+		return nil
+	}
+	log.Printf("ProxyA2A: deferring caller -> warming platform concierge %s (503 + Retry-After, core#3082)", workspaceID)
+	return &proxyA2AError{
+		Status:  http.StatusServiceUnavailable,
+		Headers: map[string]string{"Retry-After": "5"},
+		Response: gin.H{
+			"error":       "concierge is warming up (verifying management tools) — retry shortly",
+			"warming":     true,
+			"retry_after": 5,
+		},
+	}
 }
 
 // resolveAgentURL returns a routable URL for the target workspace agent. It
