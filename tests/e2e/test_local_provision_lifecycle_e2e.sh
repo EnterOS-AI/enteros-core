@@ -17,6 +17,15 @@
 #   2. POST /workspaces (runtime=claude-code) — capture id.
 #   3. Poll GET /workspaces/{id} until status==online (<=90s); assert a ws-<id>
 #      container is running.
+#  3b. TENANT USABILITY (beyond a shallow /health=200): assert the app/data-plane
+#      is genuinely usable — GET /workspaces returns 200 (NOT 404), the list
+#      actually CONTAINS the provisioned id, and GET /workspaces/{id} resolves
+#      (200). A workspace can report online + /health=200 while GET /workspaces
+#      404s; that shallow-check gap let a broken-app tenant through. The real
+#      management-tool round-trip (provision_workspace callable, not a ping) is
+#      exercised end-to-end by Step 5 below; the management-MCP provision_workspace
+#      verb specifically is asserted by the STAGING gate (org + platform agent),
+#      since this local lane provisions a generic runtime.
 #   4. RESTART-SURVIVAL: POST /workspaces/{id}/restart, poll until online AGAIN
 #      (<=90s); assert the container is back and the workspace did NOT wedge in
 #      failed / "config volume is empty". <-- the key assertion.
@@ -559,6 +568,69 @@ if [ "$URL_HOST_AFTER" = "127.0.0.1" ] || [ "$URL_HOST_AFTER" = "localhost" ]; t
   pass "workspace registered a host-reachable URL (host=$URL_HOST_AFTER)"
 else
   fail "workspace URL is not a host-reachable address" "url=$WS_URL_AFTER expected localhost/127.0.0.1"
+fi
+echo ""
+
+# ----------------------------------------------------------------------------
+# Step 3b — TENANT USABILITY (beyond a shallow /health=200).
+# ----------------------------------------------------------------------------
+# status==online + /health==200 is NOT proof a tenant is usable. The shallow
+# /health check let a broken-app tenant through: it returned /health=200 but its
+# app's GET /workspaces 404'd. Assert the data-plane is genuinely usable, not
+# merely reachable:
+#   (a) GET /workspaces        -> HTTP 200 (the app loads; NOT 404/5xx)
+#   (b) the list CONTAINS the provisioned id  (NOT an empty/garbage stub)
+#   (c) GET /workspaces/{id}   -> HTTP 200 (the tenant resource resolves)
+# The real management-tool round-trip (provision_workspace callable, not a ping)
+# is exercised end-to-end by Step 5's A2A message/send; asserting the management
+# MCP `provision_workspace` verb itself requires an org + platform agent and is
+# owned by the STAGING gate (this lane provisions a generic runtime).
+echo "--- Step 3b: tenant usability (GET /workspaces 200 + lists id + resource resolves) ---"
+
+# GET with HTTP-status capture using the harness admin auth. Emits the status
+# code on line 1 and the response body on the following lines.
+usability_get() {  # usability_get <url>
+  local _a=(); e2e_admin_auth_args _a
+  local _tmp; _tmp="$(mktemp)"
+  local _code
+  _code="$(curl -s -o "$_tmp" -w '%{http_code}' -m 15 "${_a[@]+"${_a[@]}"}" "$1" 2>/dev/null || echo 000)"
+  printf '%s\n' "$_code"
+  cat "$_tmp"
+  rm -f "$_tmp"
+}
+
+# (a) the collection endpoint must LOAD with 200 — a 404 here is the exact
+#     broken-app symptom the shallow /health check missed.
+USABILITY_LIST="$(usability_get "$BASE/workspaces")"
+USABILITY_LIST_CODE="$(printf '%s\n' "$USABILITY_LIST" | head -1)"
+USABILITY_LIST_BODY="$(printf '%s\n' "$USABILITY_LIST" | tail -n +2)"
+if [ "$USABILITY_LIST_CODE" = "200" ]; then
+  pass "app loads: GET /workspaces -> 200"
+else
+  fail "GET /workspaces did not return 200 (got ${USABILITY_LIST_CODE}) — tenant app is NOT usable" "$(printf '%s' "$USABILITY_LIST_BODY" | head -c 300)"
+fi
+
+# (b) a 200 with an empty/garbage body is still broken — the list must be valid
+#     JSON AND actually contain the workspace we just provisioned.
+if printf '%s' "$USABILITY_LIST_BODY" | python3 -c "import sys,json
+b=sys.stdin.read()
+try:
+    json.loads(b)
+except Exception:
+    sys.exit(3)            # 200 but body is not JSON -> broken app
+sys.exit(0 if '\"$WSID\"' in b else 4)" 2>/dev/null; then
+  pass "GET /workspaces lists the provisioned id ($WSID)"
+else
+  fail "GET /workspaces (200) did NOT list the provisioned id ($WSID) — list is empty/garbage" "body: $(printf '%s' "$USABILITY_LIST_BODY" | head -c 300)"
+fi
+
+# (c) the specific tenant resource must resolve (NOT 404).
+USABILITY_WS="$(usability_get "$BASE/workspaces/$WSID")"
+USABILITY_WS_CODE="$(printf '%s\n' "$USABILITY_WS" | head -1)"
+if [ "$USABILITY_WS_CODE" = "200" ]; then
+  pass "tenant resource resolves: GET /workspaces/$WSID -> 200"
+else
+  fail "GET /workspaces/$WSID did not return 200 (got ${USABILITY_WS_CODE}) — tenant resource does not resolve"
 fi
 echo ""
 
