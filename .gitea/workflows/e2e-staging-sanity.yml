@@ -1,3 +1,4 @@
+# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
 name: E2E Staging Sanity (leak-detection self-check)
 
 # Ported from .github/workflows/e2e-staging-sanity.yml on 2026-05-11 per
@@ -18,9 +19,12 @@ name: E2E Staging Sanity (leak-detection self-check)
 # workflow always()-step must still tear down cleanly.
 
 on:
-  schedule:
-    - cron: '0 6 * * 1'
+  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+#   schedule:
+#     - cron: '0 6 * * 1'
 
+  # DISABLED 2026-06-27: no manual trigger remained after neutralizing auto-triggers; workflow_dispatch added so the workflow stays manually runnable.
+  workflow_dispatch:
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 

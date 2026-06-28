@@ -1,3 +1,4 @@
+# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
 name: Continuous synthetic E2E (staging)
 
 # Ported from .github/workflows/continuous-synth-e2e.yml on 2026-05-11 per RFC
@@ -42,43 +43,46 @@ name: Continuous synthetic E2E (staging)
 # alerting.
 
 on:
-  schedule:
-    # Every 30 minutes, on :02 and :32. This keeps a recurring SaaS
-    # behavior probe while cutting runner occupancy from this workflow by
-    # roughly two thirds; fast liveness belongs in the lighter smoke/heartbeat
-    # probes, not in a full tenant/workspace synth every 10 minutes.
-    #
-    # Previous cadence was every 10 minutes (:02 :12 :22 :32 :42 :52).
-    # The current operator-host runner pool is the bottleneck, so full
-    # synth E2E is deliberately lower-cadence until it moves to a dedicated
-    # runner host or warm-runtime pool.
-    #
-    # Historical notes from the 10-minute shape:
-    #
-    # Every 10 minutes, on :02 :12 :22 :32 :42 :52. Three constraints:
-    #   1. Stay off the top-of-hour. GitHub Actions scheduler drops
-    #      :00 firings under high load (own docs:
-    #      https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#schedule).
-    #      Prior history: cron was '0,20,40' (2026-05-02) — only :00
-    #      ever survived. Bumped to '10,30,50' (2026-05-03) on the
-    #      theory that further-from-:00 wins. Empirically 2026-05-04
-    #      that ALSO dropped to ~60 min effective cadence (only ~1
-    #      schedule fire per hour — see molecule-core#2726). Detection
-    #      latency was claimed 20 min, actual 60 min.
-    #   2. Avoid colliding with the existing :15 sweep-cf-orphans
-    #      and :45 sweep-cf-tunnels — both hit the CF API and we
-    #      don't want to fight for rate-limit tokens.
-    #   3. Avoid the :30 heavy slot (staging-smoke /30, sweep-aws-
-    #      secrets, sweep-stale-e2e-orgs every :15) — multiple
-    #      overlapping cron registrations on the same minute is part
-    #      of what GH drops under load.
-    # Solution: bump fires-per-hour 3 → 6 AND keep all slots in clean
-    # lanes (1-3 min away from any other cron). Even with empirically-
-    # observed ~67% GH drop ratio, 6 attempts/hour yields ~2 effective
-    # fires = ~30 min cadence; closer to the 20-min target than the
-    # current shape and provides a real degradation alarm if drops
-    # get worse.
-    - cron: '2,32 * * * *'
+  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+#   schedule:
+#     # Every 30 minutes, on :02 and :32. This keeps a recurring SaaS
+#     # behavior probe while cutting runner occupancy from this workflow by
+#     # roughly two thirds; fast liveness belongs in the lighter smoke/heartbeat
+#     # probes, not in a full tenant/workspace synth every 10 minutes.
+#     #
+#     # Previous cadence was every 10 minutes (:02 :12 :22 :32 :42 :52).
+#     # The current operator-host runner pool is the bottleneck, so full
+#     # synth E2E is deliberately lower-cadence until it moves to a dedicated
+#     # runner host or warm-runtime pool.
+#     #
+#     # Historical notes from the 10-minute shape:
+#     #
+#     # Every 10 minutes, on :02 :12 :22 :32 :42 :52. Three constraints:
+#     #   1. Stay off the top-of-hour. GitHub Actions scheduler drops
+#     #      :00 firings under high load (own docs:
+#     #      https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#schedule).
+#     #      Prior history: cron was '0,20,40' (2026-05-02) — only :00
+#     #      ever survived. Bumped to '10,30,50' (2026-05-03) on the
+#     #      theory that further-from-:00 wins. Empirically 2026-05-04
+#     #      that ALSO dropped to ~60 min effective cadence (only ~1
+#     #      schedule fire per hour — see molecule-core#2726). Detection
+#     #      latency was claimed 20 min, actual 60 min.
+#     #   2. Avoid colliding with the existing :15 sweep-cf-orphans
+#     #      and :45 sweep-cf-tunnels — both hit the CF API and we
+#     #      don't want to fight for rate-limit tokens.
+#     #   3. Avoid the :30 heavy slot (staging-smoke /30, sweep-aws-
+#     #      secrets, sweep-stale-e2e-orgs every :15) — multiple
+#     #      overlapping cron registrations on the same minute is part
+#     #      of what GH drops under load.
+#     # Solution: bump fires-per-hour 3 → 6 AND keep all slots in clean
+#     # lanes (1-3 min away from any other cron). Even with empirically-
+#     # observed ~67% GH drop ratio, 6 attempts/hour yields ~2 effective
+#     # fires = ~30 min cadence; closer to the 20-min target than the
+#     # current shape and provides a real degradation alarm if drops
+#     # get worse.
+#     - cron: '2,32 * * * *'
+  # DISABLED 2026-06-27: no manual trigger remained after neutralizing auto-triggers; workflow_dispatch added so the workflow stays manually runnable.
+  workflow_dispatch:
 permissions:
   contents: read
   # No issue-write here — failures surface as red runs in the workflow

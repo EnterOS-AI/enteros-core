@@ -1,3 +1,4 @@
+# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
 name: redeploy-tenants-on-main
 
 # Ported from .github/workflows/redeploy-tenants-on-main.yml on 2026-05-11 per RFC
@@ -46,6 +47,7 @@ name: redeploy-tenants-on-main
 # re-pulling the pinned image on every tenant.
 
 on:
+  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
   workflow_dispatch:
 permissions:
   contents: read
