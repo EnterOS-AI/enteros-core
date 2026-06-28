@@ -1,5 +1,6 @@
-# ci-required-drift — hourly sentinel for drift between the canonical
-# "what counts as required" sources of truth in this repo:
+# ci-required-drift — per-PR + prod-merge (push:main/staging) sentinel for
+# drift between the canonical "what counts as required" sources of truth in
+# this repo:
 #
 #   1. `.gitea/workflows/ci.yml` jobs                       (CI source)
 #   2. `branch_protections/{main,staging}.status_check_contexts`
@@ -40,12 +41,17 @@ name: ci-required-drift
 # (no schedule, no dispatch). When Gitea ≥ 1.23 lands fleet-wide,
 # this constraint can be revisited.
 on:
-  schedule:
-    # Hourly at :17 — offset from :00 to spread load away from the
-    # peak when N cron workflows fire on the hour-boundary, per
-    # RFC §4 cadence ("off-zero").
-    - cron: '17 * * * *'
   workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.gitea/workflows/**'
+      - '.gitea/required-contexts.txt'
+  push:
+    branches: [main, staging]
+    paths:
+      - '.gitea/workflows/**'
+      - '.gitea/required-contexts.txt'
 
 # Read protection + read CI YAML + write issue. No write on contents.
 permissions:

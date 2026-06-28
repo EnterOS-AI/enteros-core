@@ -21,9 +21,6 @@ name: gate-check-v3
 on:
   pull_request_target:
     types: [opened, edited, synchronize, reopened]
-  schedule:
-    # Hourly: refresh all open PRs
-    - cron: '8 * * * *'
   # NOTE: `workflow_dispatch.inputs` block intentionally omitted.
   # Gitea 1.22.6 parser rejects `workflow_dispatch.inputs.X` with
   # "unknown on type" — it mis-treats the inputs sub-keys as top-level

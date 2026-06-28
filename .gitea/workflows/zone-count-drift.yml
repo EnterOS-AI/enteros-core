@@ -32,11 +32,6 @@ name: zone-count-drift guardrail
 # a busy day. Hourly is the right cadence for a 200-record hard cap.
 
 on:
-  schedule:
-    # Hourly at :17, offset from sweep-cf-orphans (:15) and
-    # sweep-cf-tunnels (:45) so the three CF jobs don't all hit
-    # api.cloudflare.com/client/v4 at the same minute.
-    - cron: '17 * * * *'
   workflow_dispatch:
 
 # IMPORTANT — Gitea 1.22.6 parser quirk per

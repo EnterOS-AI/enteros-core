@@ -45,10 +45,6 @@ on:
       - 'contracts/mcp-plugin-delivery.contract.json'
       - '.gitea/scripts/check-contract-ssot-sync.sh'
       - '.gitea/workflows/contract-ssot-sync.yml'
-  schedule:
-    # Daily at :39 -- catch a molecule-contracts SSOT change that landed without
-    # a paired core mirror re-sync PR (off-zero to spread cron load).
-    - cron: '39 4 * * *'
   workflow_dispatch:
 
 permissions:

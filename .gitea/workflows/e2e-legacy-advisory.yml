@@ -8,10 +8,11 @@ name: E2E Legacy Advisory
 # Gitea 1.22.6 rejects workflow_dispatch.inputs, so keep dispatch input-free.
 
 on:
-  schedule:
-    # Stagger after the staging smoke/canvas morning lanes.
-    - cron: '15 9 * * *'
   workflow_dispatch:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main]
 
 concurrency:
   group: e2e-legacy-advisory
