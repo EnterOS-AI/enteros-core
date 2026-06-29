@@ -464,18 +464,18 @@ func tenantAdminToken(t *testing.T, cfg stagingCfg, slug string) string {
 // tenantCreateWorkspace creates a default-runtime workspace via the tenant
 // ws-server, exercising the full tenant → CP provisioner → EC2 path.
 //
-// De-hardcode (behavior-neutral): the runtime + model FOLLOW the same KMS-
-// injection pattern the de-hardcode lanes use — E2E_RUNTIME / E2E_MODEL are
-// exported by the e2e workflows from the platform default SSOT
-// (MOLECULE_DEFAULT_RUNTIME / MOLECULE_LLM_DEFAULT_MODEL @ /shared/controlplane/llm).
-// When unset (local runs), envOr falls back to the historical literals, so
-// behavior is identical today (runtime=claude-code, model=moonshot/kimi-k2.6).
+// De-hardcode: the runtime + model FOLLOW the same KMS-injection pattern the
+// de-hardcode lanes use — E2E_RUNTIME / E2E_MODEL are exported by the e2e
+// workflows from the platform default SSOT (MOLECULE_DEFAULT_RUNTIME /
+// MOLECULE_LLM_DEFAULT_MODEL @ /shared/controlplane/llm). When unset (local runs),
+// envOr falls back to the CURRENT SSOT value (minimax/MiniMax-M2.7), NOT a
+// moonshot vendor const, so the local fallback tracks the SSOT default.
 func tenantCreateWorkspace(t *testing.T, cfg stagingCfg, host, token, orgID string) string {
 	t.Helper()
 	return tenantCreateWorkspaceWithRuntime(
 		t, cfg, host, token, orgID, "core2332-life-e2e",
 		envOr("E2E_RUNTIME", "claude-code"),
-		envOr("E2E_MODEL", "moonshot/kimi-k2.6"),
+		envOr("E2E_MODEL", "minimax/MiniMax-M2.7"),
 	)
 }
 

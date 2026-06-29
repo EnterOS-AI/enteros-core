@@ -352,7 +352,7 @@ SECRETS_JSON='{}'
 # proven to create cleanly. (The BYOK key paths below 400'd at create — see
 # the create-failure capture added below — which is why platform is default.)
 if [ "${E2E_LLM_PATH:-platform}" = "platform" ]; then
-  log "    LLM path: PLATFORM-MANAGED (no tenant key; moonshot/kimi-k2.6 via proxy)"
+  log "    LLM path: PLATFORM-MANAGED (no tenant key; SSOT default model via proxy)"
   SECRETS_JSON='{}'
 elif [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
   SECRETS_JSON=$(python3 -c "import json,os; print(json.dumps({'MINIMAX_API_KEY': os.environ['E2E_MINIMAX_API_KEY']}))")

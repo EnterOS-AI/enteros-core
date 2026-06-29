@@ -529,7 +529,19 @@ func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID
 		log.Printf("Provisioner: concierge %s MODEL read failed (failing closed, NOT seeding): %v", workspaceID, readErr)
 		return
 	} else if existing != "" {
-		return // explicit model already set; never overwrite the customer's choice
+		// A model is already stored. RECONCILE a platform-managed (proxy) default
+		// to the current SSOT so a platform-default bump propagates to an
+		// already-seeded concierge instead of freezing at whatever the default was
+		// at first boot (the one-shot-seed drift — e.g. a concierge seeded as
+		// moonshot/kimi-k2.6 or minimax/MiniMax-M2 never picking up the
+		// minimax/MiniMax-M2.7 SSOT). A non-platform (BYOK) model is a deliberate
+		// CUSTOMER pick and is left untouched (CTO: customer setting > platform
+		// default). EITHER WAY both canonical env names are re-asserted to the SAME
+		// effective model so a stale frozen MOLECULE_MODEL from a prior provision
+		// can never out-rank a fresh MODEL (runtime precedence is
+		// MOLECULE_MODEL > MODEL) — the MODEL/MOLECULE_MODEL split fix.
+		h.reconcileExistingConciergeModel(ctx, workspaceID, runtime, existing, envVars)
+		return
 	}
 
 	// First boot — no model yet. Resolve the concierge's declared default from the
@@ -566,6 +578,69 @@ func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID
 	// the next provision's readStoredModelSecret takes the respect-existing path.
 	if setErr := setModelSecret(ctx, workspaceID, model); setErr != nil {
 		log.Printf("Provisioner: concierge %s persist MODEL secret failed: %v (env still seeded for this provision)", workspaceID, setErr)
+	}
+}
+
+// reconcileExistingConciergeModel keeps an already-seeded concierge's model in
+// sync with the platform SSOT WITHOUT clobbering a genuine customer choice.
+//
+// ensureConciergeModel is seed-once (it only seeds when no MODEL secret exists),
+// which froze a concierge on whatever the platform default was at first boot — so
+// a later SSOT bump (e.g. the moonshot/kimi-k2.6 → minimax/MiniMax-M2.7 default
+// migration, or a future M2.x bump) never reached an existing concierge. This
+// reconciler closes that drift:
+//
+//   - PLATFORM-MANAGED stored model (derives to the `platform` provider — i.e.
+//     the platform default, not a BYOK pick): re-resolve the authoritative SSOT
+//     default (CP on SaaS / MOLECULE_LLM_DEFAULT_MODEL env on self-host). When it
+//     resolves to a DIFFERENT, registered + routable id, overwrite the stored
+//     MODEL secret and the container env so the bump propagates. A resolver
+//     error / empty / unchanged / unroutable result leaves the existing model in
+//     place — never break a running concierge on a transient CP blip. (This is a
+//     RECONCILE of the platform default, NOT an override of a customer pick, so
+//     it honors the CTO "customer setting > platform default" directive.)
+//   - NON-platform-managed stored model: a deliberate customer BYOK pick — respect
+//     it untouched.
+//
+// In BOTH cases it re-asserts envVars["MODEL"] == envVars["MOLECULE_MODEL"] ==
+// the effective model, eliminating the cross-provision MODEL/MOLECULE_MODEL split
+// (a stale MOLECULE_MODEL frozen in a prior container out-ranking a fresh MODEL,
+// since the runtime's precedence is MOLECULE_MODEL > MODEL).
+func (h *WorkspaceHandler) reconcileExistingConciergeModel(ctx context.Context, workspaceID, runtime, existing string, envVars map[string]string) {
+	// A non-platform (BYOK) model is a deliberate customer pick: respect it
+	// untouched (loadWorkspaceSecrets + applyRuntimeModelEnv already put it in
+	// envVars for this provision). This also covers a stale/unknown id that does
+	// not derive to the platform provider — left to the customer-pick path rather
+	// than auto-rewritten.
+	if !conciergeModelIsPlatformManaged(runtime, existing) {
+		return
+	}
+	resolved, err := conciergeModelResolver(ctx)
+	if err != nil {
+		log.Printf("Provisioner: concierge %s model reconcile skipped (resolver error, keeping %q): %v", workspaceID, existing, err)
+		return
+	}
+	if resolved == "" || resolved == existing {
+		return // SSOT unavailable or unchanged — nothing to reconcile.
+	}
+	if ok, why := validateRegisteredModelForRuntime(runtime, resolved); !ok {
+		log.Printf("Provisioner: concierge %s SSOT model %q is NOT registered for runtime %q (%s) — keeping current %q", workspaceID, resolved, runtime, why, existing)
+		return
+	}
+	if ok, why := validateDerivedProviderInRegistry(runtime, resolved); !ok {
+		log.Printf("Provisioner: concierge %s SSOT model %q has no derivable registry provider for runtime %q (%s) — keeping current %q", workspaceID, resolved, runtime, why, existing)
+		return
+	}
+	// Overwrite the frozen platform default to the SSOT. Update BOTH canonical env
+	// names (applyRuntimeModelEnv set them to the OLD value) so the new default
+	// takes effect THIS provision and a stale MOLECULE_MODEL can never out-rank the
+	// fresh MODEL (runtime precedence is MOLECULE_MODEL > MODEL — the split fix).
+	envVars["MODEL"] = resolved
+	envVars["MOLECULE_MODEL"] = resolved
+	if setErr := setModelSecret(ctx, workspaceID, resolved); setErr != nil {
+		log.Printf("Provisioner: concierge %s persist reconciled MODEL secret failed: %v (env still updated for this provision)", workspaceID, setErr)
+	} else {
+		log.Printf("Provisioner: concierge %s reconciled platform-managed model %q → SSOT default %q", workspaceID, existing, resolved)
 	}
 }
 

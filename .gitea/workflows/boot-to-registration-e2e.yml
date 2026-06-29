@@ -62,7 +62,7 @@ concurrency:
 jobs:
   # bp-exempt: advisory e2e — non-gating, manual dispatch only (cp#455 Stage 1)
   minimal-cell:
-    name: Minimal cell (claude-code + platform + moonshot/kimi-k2.6)
+    name: Minimal cell (claude-code + platform + SSOT default model)
     runs-on: ubuntu-latest
     # Bounded at 12 min. Wall-clock budget breakdown:
     #   - cold EC2 provision: ~3-4 min (SPOT)
@@ -79,13 +79,13 @@ jobs:
       # E2E_RUNTIME / E2E_MODEL: these literals are now only the FALLBACK. On a
       # trusted event the "Fetch platform defaults from KMS SSOT" step below
       # overrides them with the authoritative Infisical values
-      # (MOLECULE_DEFAULT_RUNTIME / MOLECULE_LLM_DEFAULT_MODEL). This is
-      # BEHAVIOR-NEUTRAL: the staging KMS values equal these literals today, and
-      # if the KMS step is gated off (untrusted ref) these literals stand in.
+      # (MOLECULE_DEFAULT_RUNTIME / MOLECULE_LLM_DEFAULT_MODEL). The fallback model
+      # is the CURRENT SSOT value (minimax/MiniMax-M2.7), NOT a moonshot vendor
+      # const — so an untrusted-ref/local run still tracks the SSOT default.
       E2E_RUNTIME: claude-code
       E2E_BILLING_MODE: platform_managed
       E2E_PROVIDER: platform
-      E2E_MODEL: moonshot/kimi-k2.6
+      E2E_MODEL: minimax/MiniMax-M2.7
       E2E_RUN_ID: cp455-${{ github.run_id }}
       E2E_PROVISION_TIMEOUT_SECS: '300' # 5 min — fast teardown budget
       MOLECULE_CP_URL: ${{ vars.STAGING_CP_URL || 'https://staging-api.moleculesai.app' }}
