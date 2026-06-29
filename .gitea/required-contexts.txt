@@ -49,7 +49,42 @@ security-review / approved
 sop-checklist / all-items-acked
 reserved-path-review / reserved-path-review
 Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
+
+# pending-AWS-closure (not yet enforced) ────────────────────────────────
+# PARKED (this PR): `E2E Staging SaaS (full lifecycle) / E2E Staging
+# Concierge Creates Workspace` was ENFORCED above, but its producer
+# (e2e-staging-saas.yml) is now `workflow_dispatch`-only — the AWS account
+# is closed (2026-06-27) so the live-staging concierge lane cannot run on
+# PRs. Leaving it enforced while the producer no longer posts the context
+# on PRs would FREEZE the merge queue (fail-closed, REGARDLESS of BP). It
+# is parked here (not deleted) so the gate is restored — not forgotten —
+# when staging concierge coverage is rebuilt on the local-docker stack.
+#
+# Per-PR concierge coverage is NOT lost: the deterministic
+# `Concierge Creates Workspace Hermetic` gate (above, ENFORCED, runs on
+# every PR/push) asserts the same create_workspace contract
+# (loaded_mcp_tools gate, status=online, real workspace-row creation), and
+# the new local-docker `Local Provision Lifecycle E2E (stub)` lane
+# (below, pending #2409) provisions a REAL tenant + asserts GET /workspaces
+# usability per PR — both on local docker (+ MiniMax) at ~zero cloud spend.
+# The real tool-use concierge→provision_workspace→GET /workspaces gate also
+# blocks prod via the controlplane local staging→prod e2e gate (CP #1013).
+# SEQUENCING: when the local-docker staging concierge lane is green on main,
+# PROMOTE it back above the ENFORCED marker.
 E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
+
+# pending-#2409 (not yet enforced) ──────────────────────────────────────
+# The local-docker real-tenant provision lane (local-provision-e2e.yml,
+# job "Local Provision Lifecycle E2E (stub)") provisions a REAL workspace
+# via the local Docker provisioner and asserts the full lifecycle
+# (provision → online → restart-survive → proxy-reach → GET /workspaces
+# usability). It runs per-PR + push:main/staging and gates within the
+# workflow (continue-on-error: false). It is DOCUMENTED-required here and
+# is the intended cheap-per-PR replacement for the AWS staging concierge
+# gate; PROMOTE above once the operator confirms docker-host runners
+# reliably provision sibling containers from the host platform binary
+# (#2409 substrate confirmation).
+Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)
 
 # pending-#3159 (not yet enforced) ──────────────────────────────────────
 # The E2E Staging SaaS context below is DOCUMENTED-required but is
