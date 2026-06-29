@@ -34,7 +34,7 @@
 #   E2E_RUNTIME            default claude-code
 #   E2E_BILLING_MODE       default platform_managed
 #   E2E_PROVIDER           default platform
-#   E2E_MODEL              default moonshot/kimi-k2.6
+#   E2E_MODEL              default: SSOT (MOLECULE_LLM_DEFAULT_MODEL) else minimax/MiniMax-M2.7
 #   E2E_RUN_ID             Slug suffix; CI: cp455-${GITHUB_RUN_ID}
 #   E2E_PROVISION_TIMEOUT_SECS  default 300 (5 min — fast teardown budget)
 #   E2E_KEEP_ORG           1 → skip teardown (debugging only)
@@ -55,7 +55,10 @@ ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway s
 RUNTIME="${E2E_RUNTIME:-claude-code}"
 BILLING_MODE="${E2E_BILLING_MODE:-platform_managed}"
 PROVIDER="${E2E_PROVIDER:-platform}"
-MODEL="${E2E_MODEL:-moonshot/kimi-k2.6}"
+# Platform default model: prefer the explicit E2E_MODEL (injected by the workflow
+# from the Infisical SSOT MOLECULE_LLM_DEFAULT_MODEL), else the SSOT env directly,
+# else the current SSOT value — never a hardcoded moonshot vendor const.
+MODEL="${E2E_MODEL:-${MOLECULE_LLM_DEFAULT_MODEL:-minimax/MiniMax-M2.7}}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}"
 KEEP_ORG="${E2E_KEEP_ORG:-}"
 RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"

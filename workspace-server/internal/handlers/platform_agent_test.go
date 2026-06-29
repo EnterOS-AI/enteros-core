@@ -768,6 +768,11 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 	})
 
 	t.Run("platform agent gets org MCP env + admin token + {{CONCIERGE_NAME}} substitution", func(t *testing.T) {
+		// The stored model is platform-managed, so ensureConciergeModel now takes
+		// the RECONCILE path (re-resolve the SSOT). Stub the resolver to the SAME
+		// stored model so reconcile is a no-op (no re-persist) — this subtest is
+		// about the MCP/name wiring, not the model reconcile.
+		setConciergeModelResolver(t, "moonshot/kimi-k2.6", nil)
 		mock := setupTestDB(t)
 		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
@@ -816,6 +821,8 @@ func TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP(t *testing.T) {
 	})
 
 	t.Run("idempotent re-provision on the platform agent (no double-substitution)", func(t *testing.T) {
+		// Reconcile no-op (stored == resolved SSOT) — see the subtest above.
+		setConciergeModelResolver(t, "moonshot/kimi-k2.6", nil)
 		mock := setupTestDB(t)
 		mock.ExpectQuery(kindQuery).WithArgs("ws-concierge").
 			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
@@ -1153,6 +1160,110 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
+}
+
+// TestEnsureConciergeModel_ReconcilesPlatformManagedToSSOT is the PROVE-FAIL gate
+// for the one-shot-seed drift fix (audit BREAK A). ensureConciergeModel used to
+// return early on ANY existing MODEL secret, freezing an already-seeded concierge
+// on whatever the platform default was at first boot — so a later SSOT bump (the
+// moonshot/kimi-k2.6 → minimax/MiniMax-M2.7 migration) never propagated. The
+// reconcile path now: (1) re-resolves the SSOT and overwrites a PLATFORM-MANAGED
+// default to it, (2) respects a genuine BYOK customer pick, (3) keeps the existing
+// model on a resolver blip, and (4) ALWAYS re-asserts MODEL == MOLECULE_MODEL to
+// kill the cross-provision split. Calls ensureConciergeModel DIRECTLY to isolate
+// the behavior.
+func TestEnsureConciergeModel_ReconcilesPlatformManagedToSSOT(t *testing.T) {
+	h := &WorkspaceHandler{}
+	const modelSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`
+	const secretInsert = `INSERT INTO workspace_secrets`
+	const ssot = "minimax/MiniMax-M2.7"
+
+	t.Run("platform-managed default reconciles to the SSOT (the M-bump propagates)", func(t *testing.T) {
+		setConciergeModelResolver(t, ssot, nil)
+		mock := setupTestDB(t)
+		// Stored model is the OLD platform default (moonshot) → platform-managed.
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-recon").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("moonshot/kimi-k2.6"), 0))
+		// Reconcile overwrites → the SSOT model is persisted.
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-recon", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		// Simulate applyRuntimeModelEnv having already run with the stale stored model.
+		env := map[string]string{"MODEL": "moonshot/kimi-k2.6", "MOLECULE_MODEL": "moonshot/kimi-k2.6"}
+		h.ensureConciergeModel(context.Background(), "ws-recon", "claude-code", env)
+
+		if env["MODEL"] != ssot || env["MOLECULE_MODEL"] != ssot {
+			t.Fatalf("platform-managed default not reconciled to SSOT; env=%v (want both %q)", env, ssot)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (reconciled MODEL not persisted): %v", err)
+		}
+	})
+
+	t.Run("platform-managed but SSOT unchanged → no redundant DB write, env preserved", func(t *testing.T) {
+		setConciergeModelResolver(t, ssot, nil)
+		mock := setupTestDB(t)
+		// Stored model already equals the SSOT → resolver returns the same → no-op.
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-noop").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte(ssot), 0))
+		// No INSERT expected — an unchanged SSOT must not churn the secret store.
+
+		env := map[string]string{"MODEL": ssot, "MOLECULE_MODEL": ssot}
+		h.ensureConciergeModel(context.Background(), "ws-noop", "claude-code", env)
+
+		if env["MODEL"] != ssot || env["MOLECULE_MODEL"] != ssot {
+			t.Fatalf("unchanged-SSOT no-op mutated env; env=%v", env)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (an unchanged SSOT must not persist): %v", err)
+		}
+	})
+
+	t.Run("a genuine BYOK customer pick is NOT reconciled (respected untouched)", func(t *testing.T) {
+		// Resolver would offer the SSOT, but a non-platform model is a customer pick.
+		setConciergeModelResolver(t, ssot, nil)
+		mock := setupTestDB(t)
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-byok").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("anthropic:claude-opus-4-8"), 0))
+		// No INSERT expected — the customer's pick is preserved. envVars reflects
+		// what applyRuntimeModelEnv already set (the reconciler does not touch it).
+
+		env := map[string]string{"MODEL": "anthropic:claude-opus-4-8", "MOLECULE_MODEL": "anthropic:claude-opus-4-8"}
+		h.ensureConciergeModel(context.Background(), "ws-byok", "claude-code", env)
+
+		if env["MODEL"] != "anthropic:claude-opus-4-8" || env["MOLECULE_MODEL"] != "anthropic:claude-opus-4-8" {
+			t.Fatalf("BYOK pick not respected; env=%v", env)
+		}
+		if env["MODEL"] == ssot {
+			t.Fatal("BYOK customer pick was overwritten with the SSOT default — the platform must not clobber a customer choice")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (an unexpected INSERT means it reconciled a BYOK pick): %v", err)
+		}
+	})
+
+	t.Run("reconcile keeps the existing model on a resolver blip (no break on transient CP error)", func(t *testing.T) {
+		setConciergeModelResolver(t, "", fmt.Errorf("cp unreachable"))
+		mock := setupTestDB(t)
+		mock.ExpectQuery(modelSelQuery).WithArgs("ws-blip").
+			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+				AddRow([]byte("moonshot/kimi-k2.6"), 0))
+		// No INSERT — keep the existing model rather than wedge the concierge.
+
+		env := map[string]string{"MODEL": "moonshot/kimi-k2.6", "MOLECULE_MODEL": "moonshot/kimi-k2.6"}
+		h.ensureConciergeModel(context.Background(), "ws-blip", "claude-code", env)
+
+		if env["MODEL"] != "moonshot/kimi-k2.6" || env["MOLECULE_MODEL"] != "moonshot/kimi-k2.6" {
+			t.Fatalf("resolver blip lost the existing model; env=%v", env)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations (a transient resolver error must not persist anything): %v", err)
 		}
 	})
 }
