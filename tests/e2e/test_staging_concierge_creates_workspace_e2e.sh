@@ -1,4 +1,43 @@
 #!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════════
+# FULL-JOURNEY staging E2E — the SSOT real-LLM gate that runs PER-PR (as the
+# required "E2E Staging Concierge Creates Workspace" context) AND is mirrored by
+# the deploy-pipeline staging gate that blocks the prod promote
+# (molecule-controlplane scripts/deploy/local-cp-staging-e2e-gate.sh). Every step
+# is a REAL assertion (a deterministic side effect / a real completion), never a
+# PONG. LLM = MiniMax (cheap): the org is platform-managed (the CP LLM proxy
+# supplies the MiniMax default) so agent turns stay short + cheap.
+#
+#   STEP 1  CREATE A NEW ORG          via the CP admin API; wait running + tenant
+#                                     TLS + per-tenant admin token.
+#   STEP 2  CANVAS WORKS              the tenant canvas/app + its PROXIED API
+#                                     resolve: GET /workspaces → 200 (real list),
+#                                     /org/identity, /canvas/viewport,
+#                                     /requests/pending all 200 + JSON (NOT
+#                                     404/502 and NOT the canvas SPA HTML
+#                                     fallback). This is exactly the half-wired-
+#                                     tenant break controlplane#1012 fixes.
+#   STEP 3  PLATFORM AGENT APPEARS    the concierge auto-installs; assert it is
+#                                     present + online AND its loaded_mcp_tools
+#                                     include the management verb (callable).
+#   STEP 4  CREATE A TEAM             drive a real A2A message (MiniMax) asking the
+#                                     concierge to create a team member; assert the
+#                                     DETERMINISTIC side effect — the workspace
+#                                     appears in GET /workspaces (the management
+#                                     MCP provision_workspace verb was really run).
+#   STEP 5  ASSIGN TEAM WORK          assign the new team member a real task over
+#                                     A2A; assert it is accepted AND the round-trip
+#                                     completes with a real known-answer MiniMax
+#                                     completion (a2a_assert_real_completion).
+#   STEP 6  TEARDOWN                  the throwaway org is deleted cleanly (trap),
+#                                     leak-checked (org row + EC2).
+#
+# NOTE on "team": this architecture has no separate create_team verb — a team is
+# realised as workspace(s) under the org, and the management MCP
+# `provision_workspace` verb IS the "create a team member" action (see the
+# deploy-pipeline gate's matching framing). STEP 4 asserts that verb really ran
+# via its deterministic side effect; STEP 5 then assigns that member real work.
+#
 # FUNCTIONAL real-LLM E2E: prove the org concierge (the platform agent) can
 # actually DO org-management work — send it a natural-language request and
 # assert it REALLY CREATES a workspace via its platform MCP (87 org-admin tools,
@@ -86,7 +125,19 @@ ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 CONCIERGE_ONLINE_SECS="${E2E_CONCIERGE_ONLINE_SECS:-900}"
 AGENT_ACT_SECS="${E2E_AGENT_ACT_SECS:-420}"
+# STEP 5 budget: how long to wait for the concierge-created team member to reach
+# online+routable before we can assign it work over A2A (cold runtime+model boot).
+TEAM_ONLINE_SECS="${E2E_TEAM_ONLINE_SECS:-900}"
 REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
+
+# log/fail/ok are defined HERE (before the PR-mode early-exit block) so the
+# no-creds PR-mode self-check — which logs + calls fail/ok — actually works.
+# (Previously these were defined further down, after the PR-mode block that
+# uses them, so under `set -e` the fork-PR / local no-creds path aborted with
+# `log: command not found` exit 127 before reaching the self-check exit 0.)
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
+ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # ─── PR-mode early-exit (core#3081 / CR2 #12653) ──────────────────────────────
 # A required status context that never fires on pull_request degrades the
@@ -142,10 +193,7 @@ WORKER_NAME=$(echo "$WORKER_NAME" | tr -cd 'a-zA-Z0-9-' | head -c 48)
 # via os.environ — a bare shell var would not survive into the subprocess env.
 export WORKER_NAME
 
-log()  { echo "[$(date +%H:%M:%S)] $*"; }
-fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
-ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
-
+# (log/fail/ok are defined above, before the PR-mode early-exit block.)
 # SLUG construction runs after log/fail/ok so the assert can call `fail`.
 SLUG="e2e-cncrg-mk-$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" 13)"
 assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
@@ -289,7 +337,7 @@ curl "${CURL_COMMON[@]}" "$CP_URL/health" >/dev/null || fail "CP health check fa
 ok "CP reachable"
 
 # ─── 1. Create org (CP installs + provisions the concierge as platform root) ──
-log "1/6 Creating org $SLUG..."
+log "1/6 CREATE A NEW ORG — creating org $SLUG..."
 CREATE_RESP=$(admin_call POST /cp/admin/orgs \
   -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
 echo "$CREATE_RESP" | python3 -m json.tool >/dev/null || fail "Org create non-JSON: $CREATE_RESP"
@@ -298,7 +346,7 @@ ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.
 ok "Org created (id=$ORG_ID)"
 
 # ─── 2. Wait for tenant provisioning ─────────────────────────────────────────
-log "2/6 Waiting for tenant provisioning (up to ${PROVISION_TIMEOUT_SECS}s)..."
+log "1/6 CREATE A NEW ORG — waiting for tenant provisioning (up to ${PROVISION_TIMEOUT_SECS}s)..."
 DEADLINE=$(( $(date +%s) + PROVISION_TIMEOUT_SECS ))
 LAST_STATUS=""
 while true; do
@@ -332,7 +380,7 @@ TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
 log "    TENANT_URL=$TENANT_URL"
 
 # ─── 3. Per-tenant admin token + TLS readiness ───────────────────────────────
-log "3/6 Fetching per-tenant admin token..."
+log "1/6 CREATE A NEW ORG — fetching per-tenant admin token..."
 TENANT_TOKEN=$(admin_call GET "/cp/admin/orgs/$SLUG/admin-token" \
   | python3 -c "import json,sys; print(json.load(sys.stdin).get('admin_token',''))" 2>/dev/null || echo "")
 [ -z "$TENANT_TOKEN" ] && fail "Could not retrieve per-tenant admin token for $SLUG"
@@ -347,8 +395,71 @@ while true; do
 done
 ok "Tenant reachable at $TENANT_URL"
 
-# ─── 4. Discover the concierge (kind='platform' root) + ensure it can act ─────
-log "4/6 Discovering the concierge (kind='platform' root)..."
+# ─── 2. CANVAS WORKS — the tenant canvas/app + its PROXIED API actually resolve ─
+# THE break this gate exists to catch (cp#576 / controlplane#1012): a tenant can
+# report instance_status=running and answer /health=200 while its APP is
+# half-wired (tenant↔CP network isolation + a dead CP internal port) — the canvas
+# loads but every proxied API call 401/404/502s, and gin's NoRoute then proxies
+# the request to the canvas SPA so the bytes come back as HTML, not JSON. /health
+# is allowlisted past the tenant guard, so the shallow check stays green while the
+# app is unusable. Assert each canvas-critical route returns HTTP 200 AND a JSON
+# body (NOT 404/502/503, NOT the canvas SPA HTML fallback):
+#   GET /workspaces       (tenant admin auth) → 200 + a real JSON list (array)
+#   GET /org/identity     (open route)        → 200 + JSON object
+#   GET /canvas/viewport  (open route)        → 200 + JSON (not HTML)
+#   GET /requests/pending (tenant admin auth) → 200 + JSON (not HTML)
+log "2/6 CANVAS WORKS — asserting the tenant's proxied API resolves (not 404/502/SPA-HTML)..."
+CANVAS_BODY_TMP="$TMPDIR_E2E/canvas_body"
+# canvas_probe <label> <method> <path> <auth:tenant|open> <shape:array|json|nothtml>
+# Asserts the probe in place; calls fail() (which EXITS the script — so this
+# MUST NOT be invoked inside a $() command substitution, where exit would only
+# leave the subshell) on any non-200 / wrong-shape / HTML-fallback.
+canvas_probe() {
+  local label="$1" method="$2" path="$3" auth="$4" shape="$5"
+  local code rc body first
+  local -a args=(-sS --max-time 25 -X "$method" -o "$CANVAS_BODY_TMP" -w '%{http_code}')
+  if [ "$auth" = "tenant" ]; then
+    args+=(-H "Authorization: Bearer $TENANT_TOKEN" -H "X-Molecule-Org-Id: $ORG_ID" -H "Origin: $TENANT_URL")
+  fi
+  set +e
+  code=$(curl "${args[@]}" "$TENANT_URL$path" 2>/dev/null); rc=$?
+  set -e
+  body=$(cat "$CANVAS_BODY_TMP" 2>/dev/null || echo "")
+  code=${code:-000}
+  if [ "$rc" != "0" ]; then
+    fail "CANVAS WORKS: $label ($method $path) transport error (curl_rc=$rc, http=$code) — tenant proxied API unreachable"
+  fi
+  if [ "$code" != "200" ]; then
+    fail "CANVAS WORKS: $label ($method $path) returned HTTP $code (want 200). A 404/502/503 here is the half-wired-tenant break (controlplane#1012). Body: $(printf '%s' "$body" | head -c 200)"
+  fi
+  # First non-whitespace byte '<' ⇒ we got the canvas SPA HTML fallback
+  # (gin NoRoute → canvas), i.e. the API route did NOT resolve. Strip ALL leading
+  # whitespace (incl. newlines) from the first chunk, then take the first char.
+  first=$(printf '%s' "$body" | head -c 200 | tr -d '[:space:]' | head -c 1)
+  if [ "$first" = "<" ]; then
+    fail "CANVAS WORKS: $label ($method $path) returned 200 but the body is HTML (canvas SPA fallback), not JSON — the API route did NOT resolve (gin NoRoute → canvas). Body: $(printf '%s' "$body" | head -c 120)"
+  fi
+  case "$shape" in
+    array)
+      [ "$first" = "[" ] || fail "CANVAS WORKS: $label ($method $path) 200 but body is not a JSON array (real list). first='$first' body: $(printf '%s' "$body" | head -c 160)" ;;
+    json)
+      { [ "$first" = "{" ] || [ "$first" = "[" ]; } || fail "CANVAS WORKS: $label ($method $path) 200 but body is not a JSON object/array. first='$first' body: $(printf '%s' "$body" | head -c 160)" ;;
+    nothtml) : ;;  # '<' already rejected above; any other non-HTML 200 is fine
+  esac
+}
+
+canvas_probe "GET /workspaces" GET /workspaces tenant array
+ok "CANVAS WORKS: GET /workspaces → 200 + real JSON list"
+canvas_probe "GET /org/identity" GET /org/identity open json
+ok "CANVAS WORKS: GET /org/identity → 200 + JSON"
+canvas_probe "GET /canvas/viewport" GET /canvas/viewport open nothtml
+ok "CANVAS WORKS: GET /canvas/viewport → 200 (not 404/502/SPA-HTML)"
+canvas_probe "GET /requests/pending" GET /requests/pending tenant nothtml
+ok "CANVAS WORKS: GET /requests/pending → 200 (not 404/502/SPA-HTML)"
+ok "═ STEP 2 PASS: tenant canvas/app + proxied API resolve (the controlplane#1012 break is gated)"
+
+# ─── 3. PLATFORM AGENT APPEARS — discover the concierge (kind='platform' root) ─
+log "3/6 PLATFORM AGENT APPEARS — discovering the concierge (kind='platform' root)..."
 # The CP installs the platform agent at org-provision; allow a short settle for
 # the row + re-parent backfill to land.
 CONCIERGE_ID=""
@@ -394,7 +505,7 @@ ok "Concierge online + routable (url assigned)"
 # tool, the concierge cannot satisfy the core#3082 online gate and this
 # test fails closed. The real side-effect assertion below is NOT sufficient
 # without this deterministic inventory check.
-log "4.5/6 Required loaded_mcp_tools inventory check..."
+log "3.5/6 PLATFORM AGENT APPEARS — required loaded_mcp_tools inventory check (management verb callable)..."
 
 # concierge_loaded_mcp_tools_json: echo the concierge's `loaded_mcp_tools`
 # field as a JSON array, or "" if the field is missing/unreadable.
@@ -427,7 +538,7 @@ PRE_EXISTING=$(find_worker_by_name)
 ok "Pre-state confirmed: '$WORKER_NAME' does not exist yet"
 
 # ─── 5. Drive the AGENT: A2A message/send → it must create the workspace ──────
-log "5/6 Sending the concierge a natural-language create-workspace request..."
+log "4/6 CREATE A TEAM — sending the concierge a natural-language create-team-member request..."
 # Imperative + explicit to defuse LLM nondeterminism: name the tool, the exact
 # workspace NAME and ROLE, and tell it not to ask a clarifying question. The
 # message/send envelope is the canvas user→agent chat path (handlers/a2a_proxy.go),
@@ -492,7 +603,7 @@ print(parts[0].get('text','') if parts else '')" 2>/dev/null || echo "")
 log "    concierge replied (first 300 chars): $(echo "$AGENT_TEXT" | head -c 300)"
 
 # ─── 6. ASSERT the deterministic side effect: the worker now EXISTS ───────────
-log "6/6 Polling GET /workspaces for the worker the concierge was asked to create..."
+log "4/6 CREATE A TEAM — polling GET /workspaces for the new team member the concierge was asked to create..."
 # The create is the side effect; the LLM may take a few turns / a moment to flush
 # the tool call. Poll the NAME (deterministic) — tolerant of when exactly the row
 # lands, intolerant of it never landing.
@@ -539,5 +650,77 @@ else
   log "    (concierge returned no text part — the row landing is the proof; reply is optional)"
 fi
 
-ok "═══ STAGING CONCIERGE CREATES-A-WORKSPACE E2E PASSED ═══"
-log "Proven: a natural-language A2A request → the concierge's LLM invoked ${PLATFORM_MCP_REQUIRED_TOOL} via the platform MCP → real org mutation (workspace '$WORKER_NAME' id=$WORKER_ID). Teardown runs via EXIT trap."
+# ─── 5. ASSIGN TEAM WORK — give the new team member a real task; round-trip it ─
+# The workspace the concierge just created via the management MCP
+# ${PLATFORM_MCP_REQUIRED_TOOL} verb IS the team member. "Assigning work" = sending it a
+# real task over the A2A user→agent path and proving the member ACCEPTS it (2xx)
+# AND runs a real LLM turn that reports back. NOT a PONG: a deterministic
+# known-answer arithmetic task (17×23=391), so a broken member that echoes its
+# error-as-text FAILs via a2a_assert_real_completion. MiniMax keeps it cheap
+# (one short turn, minimal tokens).
+log "5/6 ASSIGN TEAM WORK — waiting for team member '$WORKER_NAME' ($WORKER_ID) to come online (up to ${TEAM_ONLINE_SECS}s)..."
+M_STATUS=""; M_URL=""; LAST_M_STATUS=""
+MEMBER_ONLINE_DEADLINE=$(( $(date +%s) + TEAM_ONLINE_SECS ))
+while true; do
+  M_STATUS=$(workspace_field "$WORKER_ID" status)
+  M_URL=$(workspace_field "$WORKER_ID" url)
+  if [ "$M_STATUS" != "$LAST_M_STATUS" ]; then log "    team member → ${M_STATUS:-<none>}"; LAST_M_STATUS="$M_STATUS"; fi
+  if [ "$M_STATUS" = "online" ] && [ -n "$M_URL" ]; then break; fi
+  if [ "$(date +%s)" -gt "$MEMBER_ONLINE_DEADLINE" ]; then
+    M_ERR=$(workspace_field "$WORKER_ID" last_sample_error)
+    skip_loud "team member $WORKER_ID never reached online+routable within ${TEAM_ONLINE_SECS}s \
+(last status='${M_STATUS}', url='${M_URL}', err='${M_ERR}'). Cannot assign work / round-trip to a member \
+that never booted a runtime+model. (Under E2E_REQUIRE_LIVE=1 this is a HARD FAIL — false-green guard.)"
+  fi
+  sleep 10
+done
+ok "Team member online + routable — assigning a task"
+
+WORK_EXPECT="391"
+WORK_PROMPT="You are a team member. Your assigned task: compute 17 multiplied by 23 and reply with ONLY the resulting number and nothing else."
+WORK_PAYLOAD=$(WORK_PROMPT="$WORK_PROMPT" python3 -c "
+import json, os, uuid
+print(json.dumps({
+    'jsonrpc': '2.0',
+    'method': 'message/send',
+    'id': 'e2e-cncrg-work-1',
+    'params': {'message': {'role': 'user', 'messageId': f'e2e-{uuid.uuid4().hex[:8]}',
+        'parts': [{'kind': 'text', 'text': os.environ['WORK_PROMPT']}]}}
+}))")
+WORK_TMP="$TMPDIR_E2E/work_out"
+WORK_OK=0; WORK_CODE=000; WORK_RC=1
+for WORK_ATTEMPT in $(seq 1 8); do
+  : >"$WORK_TMP"
+  set +e
+  WORK_CODE=$(tenant_call POST "/workspaces/$WORKER_ID/a2a" \
+    --max-time "$AGENT_ACT_SECS" -H "Content-Type: application/json" \
+    -d "$WORK_PAYLOAD" -o "$WORK_TMP" -w '%{http_code}' 2>/dev/null)
+  WORK_RC=$?
+  set -e
+  WORK_CODE=${WORK_CODE:-000}
+  if [ "$WORK_RC" = "0" ] && [ "$WORK_CODE" -ge 200 ] && [ "$WORK_CODE" -lt 300 ]; then WORK_OK=1; break; fi
+  if echo "$WORK_CODE" | grep -Eq '^(502|503|504)$'; then
+    log "    assign-work A2A cold-start attempt $WORK_ATTEMPT/8 returned $WORK_CODE — retrying"
+    [ "$WORK_ATTEMPT" -lt 8 ] && { sleep 15; continue; }
+  fi
+  break
+done
+WORK_RESP=$(cat "$WORK_TMP" 2>/dev/null || echo "")
+[ "$WORK_OK" = "1" ] || fail "ASSIGN TEAM WORK: A2A POST to team member $WORKER_ID failed (curl_rc=$WORK_RC, http=$WORK_CODE) after $WORK_ATTEMPT attempt(s): $(echo "$WORK_RESP" | head -c 300)"
+ok "Task ACCEPTED by the team member (A2A 2xx)"
+WORK_TEXT=$(echo "$WORK_RESP" | python3 -c "
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: print(''); sys.exit(0)
+parts = (d.get('result') or {}).get('parts', []) if isinstance(d, dict) else []
+print(parts[0].get('text','') if parts else '')" 2>/dev/null || echo "")
+log "    team member replied (first 200 chars): $(echo "$WORK_TEXT" | head -c 200)"
+# Hard gate: a real (non-error-as-text) round-trip containing the known answer.
+a2a_assert_real_completion "$WORK_TEXT" "$WORK_EXPECT" "assign-work"
+ok "═ STEP 5 PASS: work assigned to the team member round-tripped a real MiniMax completion (got '$WORK_EXPECT')"
+
+ok "═══ FULL-JOURNEY STAGING E2E PASSED (org → canvas → agent → team → work) ═══"
+log "Proven end-to-end: (1) org created; (2) tenant canvas/app + proxied API resolve (/workspaces 200 real list, /org/identity, /canvas/viewport, /requests/pending — not 404/502/SPA-HTML); \
+(3) platform agent auto-appeared online with ${PLATFORM_MCP_REQUIRED_TOOL} in loaded_mcp_tools; \
+(4) a natural-language A2A request → the concierge's LLM invoked ${PLATFORM_MCP_REQUIRED_TOOL} via the platform MCP → real org mutation (team member '$WORKER_NAME' id=$WORKER_ID); \
+(5) the team member accepted assigned work and round-tripped a real MiniMax completion. Teardown runs via EXIT trap."

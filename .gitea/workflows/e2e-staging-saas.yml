@@ -1154,7 +1154,12 @@ jobs:
   e2e-staging-concierge-creates-workspace:
     name: E2E Staging Concierge Creates Workspace
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 45 -> 75 (matches the sibling E2E Staging SaaS job): the full-journey STEP 5
+    # (assign-team-work) adds TEAM_ONLINE + a second AGENT_ACT (~22 min) once
+    # runtime#181 lands and STEP 5 is reachable. Worst-case step budget then runs
+    # PROVISION 900 + CONCIERGE_ONLINE 900 + AGENT_ACT 420 + TEAM_ONLINE 900 +
+    # work AGENT_ACT 420 ~= 59 min, which overruns the old 45-min cap.
+    timeout-minutes: 75
     permissions:
       contents: read
     env:
