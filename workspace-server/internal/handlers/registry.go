@@ -155,12 +155,15 @@ type RegistryHandler struct {
 	// + fireConciergeWarmup). nil-safe: the warmup is skipped when unset. Wired
 	// by the router to WorkspaceHandler.proxyA2ARequest.
 	warmupSend WarmupSendFunc
-	// warmedConcierges is the in-process one-shot guard for the concierge
-	// warmup: the set of kind=platform workspace IDs that have already had a
-	// warmup turn fired this process lifetime. Keyed by workspace ID → struct{}.
-	// A CP restart re-warms (acceptable — a fresh process has no live capture
-	// state and one extra warmup turn is harmless). LoadOrStore makes the
-	// fire-once decision atomic so two concurrent heartbeats can't double-fire.
+	// warmedConcierges throttles the concierge warmup per process. Keyed by
+	// workspace ID → time.Time of the last fire. core#3082 changed this from a
+	// strict one-shot to a time-throttle (re-fires every conciergeWarmupTimeout):
+	// under the verified-ready model the warmup DRIVES the warming→online flip, so
+	// a cold warmup turn that raced ahead of the MCP connect — or a transient
+	// warmup failure — MUST be retryable, or the concierge would sit warming until
+	// the 180s timeout force-fails it. Since each warmup POST is bounded at
+	// conciergeWarmupTimeout, two can't be in flight. A CP restart re-warms
+	// (acceptable — a fresh process has no live capture state).
 	warmedConcierges sync.Map
 }
 
@@ -301,10 +304,12 @@ func buildConciergeWarmupBody(workspaceID string) ([]byte, error) {
 // keystone). See WarmupSendFunc for the full rationale.
 //
 // Contract (this is the heartbeat path — fleet-wide, correctness is critical):
-//   - ONE-SHOT + IDEMPOTENT: at most once per concierge per process lifetime.
-//     LoadOrStore on warmedConcierges makes the fire-once decision atomic so two
-//     concurrent heartbeats can't both fire. A process restart re-warms — that's
-//     acceptable (a fresh process has no live capture state).
+//   - THROTTLED + IDEMPOTENT: at most once per conciergeWarmupTimeout per
+//     concierge per process. core#3082 made this retryable (was a strict
+//     one-shot) so the warming→online flip self-heals if a cold warmup turn
+//     raced ahead of the MCP connect or failed transiently. Since each POST is
+//     bounded at conciergeWarmupTimeout, two warmups can't be in flight. A
+//     process restart re-warms (a fresh process has no live capture state).
 //   - ASYNC / NON-BLOCKING: dispatched on a detached globalGoAsync goroutine so
 //     it never blocks or slows the Heartbeat handler response.
 //   - FAIL-SAFE: a send error (timeout, 4xx/5xx, anything) is logged loudly and
@@ -321,16 +326,23 @@ func (h *RegistryHandler) fireConciergeWarmup(ctx context.Context, workspaceID s
 	if h.warmupSend == nil || workspaceID == "" {
 		return
 	}
-	// One-shot: claim the warmup atomically. If this workspace was already
-	// claimed (this process), do nothing — never fire on every heartbeat.
-	if _, alreadyWarmed := h.warmedConcierges.LoadOrStore(workspaceID, struct{}{}); alreadyWarmed {
-		return
+	// Throttle: re-fire at most once per conciergeWarmupTimeout. The Load+Store
+	// is not strictly atomic, so two concurrent heartbeats could both fire one
+	// extra warmup — harmless (idempotent, bounded, fail-safe). Storing the
+	// timestamp BEFORE firing means a concurrent beat within the window sees the
+	// fresh stamp and skips.
+	now := time.Now()
+	if prev, ok := h.warmedConcierges.Load(workspaceID); ok {
+		if last, isTime := prev.(time.Time); isTime && now.Sub(last) < conciergeWarmupTimeout {
+			return // fired recently — let the in-flight / recent warmup converge
+		}
 	}
+	h.warmedConcierges.Store(workspaceID, now)
 	body, err := buildConciergeWarmupBody(workspaceID)
 	if err != nil {
 		// Marshalling a constant body cannot realistically fail; if it somehow
-		// does, release the claim so a later heartbeat can retry, and bail.
-		log.Printf("Heartbeat: concierge warmup body marshal failed for %s: %v (releasing one-shot claim)", workspaceID, err)
+		// does, clear the throttle stamp so a later heartbeat can retry, and bail.
+		log.Printf("Heartbeat: concierge warmup body marshal failed for %s: %v (clearing throttle stamp)", workspaceID, err)
 		h.warmedConcierges.Delete(workspaceID)
 		return
 	}
@@ -711,7 +723,7 @@ func (h *RegistryHandler) markWorkspaceFailed(ctx context.Context, workspaceID, 
 	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisionFailed), workspaceID, extra)
 	if _, dbErr := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $3, last_sample_error = $2, updated_at = now() WHERE id = $1`,
+		`UPDATE workspaces SET status = $3::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $1`,
 		workspaceID, msg, models.StatusFailed); dbErr != nil {
 		log.Printf("markWorkspaceFailed: db update failed for %s: %v", workspaceID, dbErr)
 	}
@@ -1070,7 +1082,13 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// workspaces_platform_root_check constraint → friendly 409 below.
 	_, err = db.DB.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, url, agent_card, status, last_heartbeat_at, delivery_mode, kind)
-		VALUES ($1, $2, $3, $4::jsonb, 'online', now(), $5, COALESCE(NULLIF($6, ''), 'workspace'))
+		-- core#3082: a NEW platform concierge INSERTs as 'provisioning' (the warming
+		-- display state), NOT 'online'. /registry/register can fire before the first
+		-- heartbeat, so this closes the second unverified path to online: the
+		-- heartbeat's verified-ready gate (which proves provision_workspace is loaded)
+		-- is the SOLE authority that promotes a platform row to online. Non-platform
+		-- keeps the fast online-on-register.
+		VALUES ($1, $2, $3, $4::jsonb, (CASE WHEN COALESCE(NULLIF($6, ''), 'workspace') = 'platform' THEN 'provisioning' ELSE 'online' END)::workspace_status, now(), $5, COALESCE(NULLIF($6, ''), 'workspace'))
 		ON CONFLICT (id) DO UPDATE SET
 			-- Preserve the provisioner-set host-port URL. The provisioner
 			-- injects MOLECULE_WORKSPACE_URL=<host-port> into the container
@@ -1102,7 +1120,13 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 				ELSE EXCLUDED.url
 			END,
 			agent_card = EXCLUDED.agent_card,
-			status = 'online',
+			-- core#3082: re-register NEVER flips a platform row's status. The
+			-- heartbeat's verified-ready gate is the sole authority for platform
+			-- online-marking, so a re-registering live concierge stays whatever it
+			-- is (online stays online; warming/failed keeps its status to be promoted
+			-- only by a verified heartbeat). workspaces.kind is the pre-update (OLD)
+			-- row value — correct for re-register. Non-platform keeps fast online.
+			status = (CASE WHEN workspaces.kind = 'platform' THEN workspaces.status ELSE 'online' END)::workspace_status,
 			last_heartbeat_at = now(),
 			delivery_mode = EXCLUDED.delivery_mode,
 			kind = COALESCE(NULLIF($6, ''), workspaces.kind),
@@ -1346,7 +1370,13 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				uptime_seconds    = $5,
 				current_task      = $6,
 				monthly_spend     = $7,
-				status            = CASE WHEN status = 'provisioning' THEN 'online' ELSE status END,
+				-- core#3082: a kind=platform concierge is HELD in 'provisioning'
+				-- (the warming display state) and promoted to 'online' ONLY by the
+				-- verified-ready gate in evaluateStatus, which proves
+				-- provision_workspace is loaded. Excluding platform here is what makes
+				-- "online" mean verified-by-construction. Non-platform keeps today's
+				-- fast first-heartbeat flip. kind is NOT NULL so the CASE is safe.
+				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' THEN 'online' ELSE status END)::workspace_status,
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed'
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
@@ -1361,7 +1391,13 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				active_tasks      = $4,
 				uptime_seconds    = $5,
 				current_task      = $6,
-				status            = CASE WHEN status = 'provisioning' THEN 'online' ELSE status END,
+				-- core#3082: a kind=platform concierge is HELD in 'provisioning'
+				-- (the warming display state) and promoted to 'online' ONLY by the
+				-- verified-ready gate in evaluateStatus, which proves
+				-- provision_workspace is loaded. Excluding platform here is what makes
+				-- "online" mean verified-by-construction. Non-platform keeps today's
+				-- fast first-heartbeat flip. kind is NOT NULL so the CASE is safe.
+				status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' THEN 'online' ELSE status END)::workspace_status,
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed'
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
@@ -1404,6 +1440,13 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// currentStatus), so declared plugins (e.g. seo-all) never install. Firing
 	// is idempotent — ReconcileWorkspacePlugins diffs declared-vs-installed and
 	// no-ops when everything is present — and nil-safe via fireReconcileOnline.
+	//
+	// core#3082 note: a kind=platform concierge now STAYS 'provisioning' while
+	// warming (the inline CASE excludes platform), so prevStatus=='provisioning'
+	// matches on every warming heartbeat until the verified-ready gate flips it
+	// online. Re-firing the reconcile each warming beat is harmless (idempotent),
+	// bounded by the 180s warming window, and actively helps deliver the declared
+	// management MCP whose provision_workspace tool the verified flip requires.
 	if prevStatus == string(models.StatusProvisioning) {
 		h.fireReconcileOnline(ctx, payload.WorkspaceID)
 	}
@@ -1615,29 +1658,169 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			return
 		}
 
-		// Concierge warmup (core#3082 keystone): the gate above passed, so this
-		// is a kind=platform concierge with both its model secret and its
-		// management MCP server present — i.e. a healthy, online platform agent.
-		// Fire ONE benign A2A turn at it (once per process) to trigger the proven
-		// per-turn loaded_mcp_tools capture. A de-baked concierge reaches online
-		// but its runtime init-time MCP enumeration fails, so it never reports
-		// loaded_mcp_tools on its own — only a real turn's claude_sdk_executor
-		// capture publishes them. Without this, an idle/never-messaged concierge
-		// is degraded ~90s later by the #3082 grace window (it never carries
-		// loaded_mcp_tools). The warmup makes the capture fire so the next
-		// heartbeat carries the tools and the concierge HOLDS online with no user
-		// turn. Gated on currentStatus == online so we only warm a concierge that
-		// is actually serving (the provisioning→online flip already ran in the
-		// main Heartbeat UPDATE before evaluateStatus reads currentStatus, so a
-		// freshly-online concierge is 'online' here). fireConciergeWarmup is
-		// one-shot (warmedConcierges guard), async (globalGoAsync), bounded
-		// (conciergeWarmupTimeout), and fail-safe (a send error never touches the
-		// status decision). This is purely an ADDITIONAL trigger — it does NOT
-		// change the #3082 gate, the grace window, or any status transition.
-		if currentStatus == string(models.StatusOnline) {
+		// core#3082 VERIFIED-READY status management. For a kind=platform
+		// concierge, "online" MUST mean provision_workspace is callable. The
+		// closest by-construction signal available in the heartbeat is the tool
+		// present in THIS heartbeat's loaded_mcp_tools — STRICTER than
+		// platformAgentManagementMCPLoaded (which reports not-missing when the
+		// management plugin row isn't declared yet, so it would false-flip to online
+		// before the plugin reconcile lands). A platform row is HELD in
+		// 'provisioning' (the warming display state) until a heartbeat proves the
+		// tool loaded; the warmup below fires the per-turn capture that produces that
+		// proof. This inverts the old "online-first, degrade-only-if-tools-never-load"
+		// model that let an unverified concierge accept a user turn and hang (the
+		// principal's live test1).
+		//
+		// ⚠️ PRESENCE, NOT CALLABILITY — and the field is UNRELIABLE (runtime#181).
+		// loaded_mcp_tools is a PRESENCE signal, not a true callability probe, and a
+		// genuine inline probe (an actual provision_workspace call) is infeasible on
+		// the fleet-wide heartbeat path — it must stay fast / non-blocking, so the
+		// async warmup turn is the only "is it really callable?" driver we have. WORSE,
+		// runtime#181 reports the producer under-emits: loaded_mcp_tools comes back
+		// null/empty even when the tool IS loaded and deliverable (proven on staging).
+		// That means trusting PRESENCE alone risks the INVERSE failure of test1 — a
+		// healthy concierge held in 'provisioning' and then force-FAILED at the 180s
+		// warming bound while the tool is actually callable. Two safeguards keep that
+		// from hanging the fleet: (1) the legacy (mcp_server_present==nil) fast-path
+		// promotes a null-field runtime immediately; (2) the bounded warming timeout
+		// stops an infinite 'provisioning' hold. But for MODERN runtimes neither
+		// safeguard makes this gate RELIABLE — that requires fixing the producer.
+		// runtime#181 (wire/repair the loaded_mcp_tools producer so it emits the real
+		// loaded set) is a REQUIRED, BLOCKING companion fix: this gate must not reach
+		// prod ahead of it, or every modern concierge warms-then-fails. See the PR
+		// description for the explicit blocking-companion recommendation.
+		provisionToolLoaded := false
+		for _, t := range payload.LoadedMCPTools {
+			if t == conciergePlatformMCPProvisionWorkspaceTool {
+				provisionToolLoaded = true
+				break
+			}
+		}
+
+		// recoverable lists the statuses a live heartbeat may legitimately promote
+		// to online. removed/paused/hibernated/hibernating are terminal or
+		// operator-managed and must never be resurrected by a heartbeat (hibernated
+		// keeps its own auto-wake path in resolveAgentURL).
+		recoverable := currentStatus == string(models.StatusProvisioning) ||
+			currentStatus == string(models.StatusFailed) ||
+			currentStatus == string(models.StatusOffline) ||
+			currentStatus == string(models.StatusAwaitingAgent) ||
+			currentStatus == string(models.StatusDegraded)
+
+		// Fire the warmup whenever the tool is not yet proven loaded — it drives the
+		// per-turn loaded_mcp_tools capture that resolves the warming→online
+		// chicken-and-egg (and re-captures during any post-online #3082 grace gap).
+		// Scoped to online/recoverable states so a terminal row is never warmed.
+		// fireConciergeWarmup is throttled per process (re-fires every
+		// conciergeWarmupTimeout) so a cold warmup turn that raced ahead of the MCP
+		// connect — or a transient warmup failure — self-heals rather than stranding
+		// the concierge until the warming timeout; system:concierge-warmup is exempt
+		// from the dispatch warming-gate so it reaches the runtime while warming.
+		if !provisionToolLoaded && (currentStatus == string(models.StatusOnline) || recoverable) {
 			h.fireConciergeWarmup(ctx, payload.WorkspaceID)
 		}
 
+		// nil mcp_server_present == a legacy runtime that can never report
+		// loaded_mcp_tools; applying the strict verified gate would strand it in
+		// 'provisioning' forever — the exact fleet-wide rollout-order hazard the
+		// #147 nil=>allow contract guards. Keep a fast online path for it.
+		runtimeSpeaksReadiness := payload.MCPServerPresent != nil
+
+		// core#3082 (CR2 #14642 — GATE BEFORE WRITE): the SAME health signals that
+		// DEMOTE an already-online concierge below (runtime self-reported wedge,
+		// sustained error rate, a recent register failure) must also BLOCK a
+		// non-online → online promotion. Previously the verified-ready flip wrote
+		// 'online' and RETURNED before these gates ran, so a wedged / high-error /
+		// register-failing concierge that merely reported provision_workspace in
+		// loaded_mcp_tools was marked online — re-introducing the exact false-online
+		// mask this PR exists to kill (just on a different axis). Evaluating the
+		// gates HERE, before any promotion ExecContext, makes "online" mean
+		// verified-ready AND healthy by construction. runtime_state=="wedged" is a
+		// runtime self-report (honored for every kind, native_status_mgmt included);
+		// error_rate>=0.5 mirrors the post-online degrade threshold; and
+		// hasRecentRegisterFailure mirrors the #2530 register-failure degrade.
+		conciergeUnhealthy := payload.RuntimeState == "wedged" ||
+			payload.ErrorRate >= 0.5 ||
+			hasRecentRegisterFailure
+
+		if currentStatus != string(models.StatusOnline) {
+			if !recoverable {
+				return // terminal / operator-managed — a heartbeat must not promote it
+			}
+			switch {
+			case !runtimeSpeaksReadiness && !conciergeUnhealthy:
+				// BACKWARD-COMPAT fast online: a pre-#147 runtime cannot speak the
+				// verified contract, so promote on a live heartbeat as the old model
+				// did — but ONLY when healthy (CR2 gate-before-write). Once it upgrades
+				// and reports mcp_server_present, the post-online #3082 grace converges
+				// it. An unhealthy legacy runtime falls through to the hold branches
+				// below (it never promotes while wedged/erroring/register-failing).
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = $3::workspace_status`, models.StatusOnline, payload.WorkspaceID, currentStatus); err != nil {
+					log.Printf("Heartbeat: legacy platform %s %s->online failed: %v", payload.WorkspaceID, currentStatus, err)
+				}
+				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"recovered_from": currentStatus})
+				h.fireReconcileOnline(ctx, payload.WorkspaceID)
+			case provisionToolLoaded && !conciergeUnhealthy:
+				// VERIFIED-ready by construction: provision_workspace is callable, so
+				// promote and clear any warming stamp. The AND status=$currentStatus
+				// guard keeps the flip conditional so a racing Delete/pause is not
+				// overwritten.
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND status = $3::workspace_status`, models.StatusOnline, payload.WorkspaceID, currentStatus); err != nil {
+					log.Printf("Heartbeat: verified platform %s %s->online failed: %v", payload.WorkspaceID, currentStatus, err)
+				} else {
+					log.Printf("Heartbeat: platform %s VERIFIED-ready (provision_workspace loaded) %s->online (core#3082)", payload.WorkspaceID, currentStatus)
+				}
+				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"verified_ready": true, "recovered_from": currentStatus})
+				h.fireReconcileOnline(ctx, payload.WorkspaceID)
+			case currentStatus == string(models.StatusProvisioning):
+				// WARMING / held: hold 'provisioning' but BOUND the wait. Reached when
+				// the tool is not yet proven loaded OR the row is healthy-blocked
+				// (conciergeUnhealthy short-circuited the verified promote above). The
+				// provision-timeout sweeper keys on updated_at, which every heartbeat
+				// refreshes, so it can NEVER catch a heartbeating warming row — this
+				// bounded window is the only terminal for a concierge that heartbeats
+				// forever without ever becoming verified-AND-healthy. Reuse
+				// mcp_unloaded_since + managementMCPUnloadedGrace (180s, already sized
+				// for the cold warmup-turn + capture cycle) so the pre-online fail is
+				// symmetric with the post-online degrade.
+				//
+				// runtime#181 CAVEAT: this bound is what stops a null/empty
+				// loaded_mcp_tools from hanging the row forever — but because the
+				// producer currently under-reports (emits nothing even when the tool
+				// IS loaded; see the verified-gate comment above), a MODERN runtime can
+				// be force-FAILED here at 180s despite a deliverable tool. The legacy
+				// (mcp_server_present==nil) fast-path can't hit this branch; for modern
+				// runtimes the reliable fix is runtime#181, NOT loosening this bound.
+				now := time.Now()
+				firstUnloaded := mcpUnloadedSince
+				if !firstUnloaded.Valid {
+					firstUnloaded = sql.NullTime{Time: now, Valid: true}
+					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET mcp_unloaded_since = COALESCE(mcp_unloaded_since, now()), updated_at = now() WHERE id = $1`, payload.WorkspaceID); err != nil {
+						log.Printf("Heartbeat: failed to stamp warming mcp_unloaded_since for %s: %v", payload.WorkspaceID, err)
+					}
+				}
+				if now.Sub(firstUnloaded.Time) >= managementMCPUnloadedGrace {
+					msg := "platform agent never became verified-ready during warmup (provision_workspace not proven loaded, or held unhealthy); marking failed (core#3082 verified-ready gate)"
+					log.Printf("Heartbeat: %s (workspace=%s warmed %s, provision_workspace_loaded=%v unhealthy=%v)", msg, payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second), provisionToolLoaded, conciergeUnhealthy)
+					h.markWorkspaceFailed(ctx, payload.WorkspaceID, msg, "management_mcp_never_loaded")
+				} else {
+					log.Printf("Heartbeat: platform %s warming, holding provisioning (%s/%s, provision_workspace_loaded=%v unhealthy=%v)", payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second), managementMCPUnloadedGrace, provisionToolLoaded, conciergeUnhealthy)
+				}
+			default:
+				// Modern runtime in failed/offline/awaiting_agent/degraded that is NOT
+				// promotable this beat — either the tool is not proven loaded OR the
+				// row is held by the health gate (conciergeUnhealthy). HOLD. Never fall
+				// to the generic unverified recovery branches below, which would
+				// resurrect it without the verified-AND-healthy proof.
+				log.Printf("Heartbeat: platform %s in %s -> holding (provision_workspace_loaded=%v unhealthy=%v) (core#3082)", payload.WorkspaceID, currentStatus, provisionToolLoaded, conciergeUnhealthy)
+			}
+			return // platform status is OWNED here; never run the generic recovery branches
+		}
+
+		// currentStatus == online below. The existing #3082 post-online grace block
+		// is now reachable ONLY for an already-online platform concierge (every
+		// non-online platform path returned above). It remains the POST-online degrade
+		// guard for LATER management-MCP loss.
 		// core#3082: post-online fail-loud for a missing declared management MCP.
 		//
 		// Triggered when the runtime AFFIRMATIVELY reports mcp_server_present=true
@@ -1690,7 +1873,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				msg := fmt.Sprintf("platform agent declared management MCP lookup failed: %v; marking degraded (core#3082)", mErr)
 				log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
 				managementMCPUnloaded = true
-				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
 					log.Printf("Heartbeat: failed to mark %s degraded (management MCP lookup error): %v", payload.WorkspaceID, err)
 				}
 				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
@@ -1724,7 +1907,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 						msg = "platform agent runtime did not report loaded_mcp_tools on a mcp_server_present=true heartbeat; cannot verify provision_workspace tool is loaded — marking degraded (core#3082)"
 					}
 					log.Printf("Heartbeat: %s (workspace=%s, unloaded for %s)", msg, payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second))
-					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
+					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
 						log.Printf("Heartbeat: failed to mark %s degraded (management MCP missing): %v", payload.WorkspaceID, err)
 					}
 					h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
@@ -1766,7 +1949,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// degraded card without the operator scraping container logs.
 	if payload.RuntimeState == "wedged" && currentStatus == "online" {
 		_, err := db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'online'`,
+			`UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'online'`,
 			models.StatusDegraded, payload.WorkspaceID)
 		if err != nil {
 			log.Printf("Heartbeat: failed to mark %s degraded (wedged): %v", payload.WorkspaceID, err)
@@ -1790,7 +1973,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 
 	if !nativeStatus && currentStatus == "online" && payload.ErrorRate >= 0.5 {
 		// #73 guard: heartbeat degrade must not resurrect a removed workspace.
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'online'`, models.StatusDegraded, payload.WorkspaceID); err != nil {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'online'`, models.StatusDegraded, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to mark %s degraded: %v", payload.WorkspaceID, err)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
@@ -1805,7 +1988,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// canvas chat delivery silently starves. Surfacing degraded gives the user
 	// a visible restart/credential-repair hint.
 	if currentStatus == "online" && hasRecentRegisterFailure {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'online'`, models.StatusDegraded, payload.WorkspaceID); err != nil {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'online'`, models.StatusDegraded, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to mark %s degraded (register failure): %v", payload.WorkspaceID, err)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
@@ -1835,7 +2018,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		// satisfied by any functional agent with low error_rate). Recovery now
 		// requires the management MCP to actually be observed loaded again,
 		// which clears mcp_unloaded_since and leaves managementMCPUnloaded=false.
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'degraded'`, models.StatusOnline, payload.WorkspaceID); err != nil {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'degraded'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s to online: %v", payload.WorkspaceID, err)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{})
@@ -1847,7 +2030,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// #73 guard: `AND status = 'offline'` makes the flip conditional in a single statement,
 	// so a Delete that races with this recovery can't flip 'removed' back to 'online'.
 	if currentStatus == "offline" {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'offline'`, models.StatusOnline, payload.WorkspaceID); err != nil {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'offline'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s from offline: %v", payload.WorkspaceID, err)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{})
@@ -1868,7 +2051,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// see the fireReconcileOnline call right after the main UPDATE. Do not rely
 	// on this branch as the reconcile trigger; it does not fire for new boxes.
 	if currentStatus == "provisioning" {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'provisioning'`, models.StatusOnline, payload.WorkspaceID); err != nil {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'provisioning'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to transition %s from provisioning to online: %v", payload.WorkspaceID, err)
 		} else {
 			log.Printf("Heartbeat: transitioned %s from provisioning to online (heartbeat received)", payload.WorkspaceID)
@@ -1900,7 +2083,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// heartbeats can't lift the workspace out of awaiting_agent on
 	// their own.
 	if currentStatus == "awaiting_agent" {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'awaiting_agent'`, models.StatusOnline, payload.WorkspaceID); err != nil {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'awaiting_agent'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s from awaiting_agent: %v", payload.WorkspaceID, err)
 		} else {
 			log.Printf("Heartbeat: transitioned %s from awaiting_agent to online (heartbeat received)", payload.WorkspaceID)
@@ -1925,7 +2108,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 	// `AND status = 'failed'` guard keeps the flip conditional (won't override
 	// 'removed').
 	if currentStatus == "failed" {
-		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status = 'failed'`, models.StatusOnline, payload.WorkspaceID); err != nil {
+		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'failed'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s from failed: %v", payload.WorkspaceID, err)
 		} else {
 			log.Printf("Heartbeat: transitioned %s from failed to online (late heartbeat after provision-timeout)", payload.WorkspaceID)

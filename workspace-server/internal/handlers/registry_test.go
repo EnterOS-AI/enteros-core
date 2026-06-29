@@ -2263,7 +2263,7 @@ func TestRegister_PlatformAgentMissingModelSecret_FailsClosed(t *testing.T) {
 	// Gate failure broadcasts WORKSPACE_PROVISION_FAILED and marks the row failed.
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("UPDATE workspaces SET status = \\$3, last_sample_error = \\$2, updated_at = now\\(\\) WHERE id = \\$1").
+	mock.ExpectExec("UPDATE workspaces SET status = \\$3::workspace_status, last_sample_error = \\$2, updated_at = now\\(\\) WHERE id = \\$1").
 		WithArgs(wsID, sqlmock.AnyArg(), models.StatusFailed).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -3453,7 +3453,7 @@ func TestRegister_PlatformAgentMissingMCPServer_FailsClosed(t *testing.T) {
 	// Gate failure broadcasts WORKSPACE_PROVISION_FAILED and marks the row failed.
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("UPDATE workspaces SET status = \\$3, last_sample_error = \\$2, updated_at = now\\(\\) WHERE id = \\$1").
+	mock.ExpectExec("UPDATE workspaces SET status = \\$3::workspace_status, last_sample_error = \\$2, updated_at = now\\(\\) WHERE id = \\$1").
 		WithArgs(wsID, sqlmock.AnyArg(), models.StatusFailed).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -3510,7 +3510,7 @@ func TestHeartbeat_PlatformAgentMissingMCPServer_FailsClosed(t *testing.T) {
 	// Gate failure: broadcast WORKSPACE_PROVISION_FAILED + mark failed.
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("UPDATE workspaces SET status = \\$3, last_sample_error = \\$2, updated_at = now\\(\\) WHERE id = \\$1").
+	mock.ExpectExec("UPDATE workspaces SET status = \\$3::workspace_status, last_sample_error = \\$2, updated_at = now\\(\\) WHERE id = \\$1").
 		WithArgs(wsID, sqlmock.AnyArg(), models.StatusFailed).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
