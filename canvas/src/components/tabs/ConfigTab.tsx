@@ -20,6 +20,7 @@ import {
   type RegistryModel,
 } from "../ProviderModelSelector";
 import { isExternalLikeRuntime } from "@/lib/externalRuntimes";
+import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 
 interface Props {
   workspaceId: string;
@@ -493,6 +494,22 @@ export function ConfigTab({ workspaceId }: Props) {
     return () => clearTimeout(successTimerRef.current);
   }, []);
 
+  // The platform agent (org concierge, kind='platform') legitimately ships NO
+  // editable platform config.yaml: its model is INHERITED from the SSOT default
+  // (MOLECULE_LLM_DEFAULT_MODEL) and seeded as the MODEL/MOLECULE_MODEL container
+  // env by core's ensureConciergeModel — surfaced to this form via
+  // GET /workspaces/:id/model, NOT a template config.yaml. Detect it off the
+  // canvas store node (kind is hydrated by the platform event stream) so we can
+  // suppress the scary "No config.yaml found" red banner (it has none by design)
+  // and render a gentle inherited-model note instead — mirroring the hermes/
+  // own-config handling. The model line still shows the RESOLVED value because
+  // loadConfig mirrors wsMetadataModel (GET /model) into the form regardless of
+  // any (absent or stale-pinned) config.yaml.
+  const isPlatformAgent = useCanvasStore((s) => {
+    const node = s.nodes?.find?.((n) => n.id === workspaceId);
+    return node?.data?.kind === WORKSPACE_KIND.Platform;
+  });
+
   const loadConfig = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -598,7 +615,17 @@ export function ConfigTab({ workspaceId }: Props) {
       // an error. Populate the form from workspace metadata so the user
       // still sees the saved runtime + model.
       const runtimeManagesOwnConfig = RUNTIMES_WITH_OWN_CONFIG.has(wsMetadataRuntime);
-      if (!runtimeManagesOwnConfig) {
+      // The platform agent (org concierge) has no editable config.yaml by design
+      // — its model is inherited from the SSOT default and surfaced via GET
+      // /model (mirrored into the form below). Suppress the red error for it,
+      // exactly like the own-config runtimes. Read kind authoritatively from the
+      // live store (getState) so this is not a stale closure if kind hydrated
+      // after loadConfig was memoised.
+      const nodeKind = useCanvasStore
+        .getState()
+        .nodes?.find?.((n) => n.id === workspaceId)?.data?.kind;
+      const isPlatformAgentWorkspace = nodeKind === WORKSPACE_KIND.Platform;
+      if (!runtimeManagesOwnConfig && !isPlatformAgentWorkspace) {
         setError("No config.yaml found");
       }
       setConfig({
@@ -1483,6 +1510,14 @@ export function ConfigTab({ workspaceId }: Props) {
           {config.runtime === "hermes"
             ? "Hermes manages its own config at ~/.hermes/config.yaml on the workspace host. Edit it via the Terminal tab or the hermes CLI, not this form."
             : "This runtime manages its own config outside the platform template."}
+        </div>
+      )}
+      {!error && isPlatformAgent && !RUNTIMES_WITH_OWN_CONFIG.has(config.runtime || "") && (
+        <div className="mx-3 mb-2 px-3 py-1.5 bg-surface-sunken/50 border border-line rounded text-xs text-ink-mid">
+          The org concierge inherits its model from the platform default
+          (<code className="font-mono">MOLECULE_LLM_DEFAULT_MODEL</code>). It has
+          no editable config.yaml — the model shown above is the resolved runtime
+          value.
         </div>
       )}
       {!error && isExternalLikeRuntime(config.runtime) && (
