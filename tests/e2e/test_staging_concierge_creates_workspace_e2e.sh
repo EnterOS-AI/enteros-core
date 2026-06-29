@@ -119,6 +119,14 @@ source "$(dirname "$0")/lib/completion_assert.sh"
 # shellcheck disable=SC1091
 # shellcheck source=lib/provision_tool_ssot.sh
 source "$(dirname "$0")/lib/provision_tool_ssot.sh"
+# Structured observability → Loki/Grafana: every step below emits a tagged
+# event (e2e_run_id + env + git_sha + step + status + duration_secs + error)
+# so a failed run renders as a TIMELINE in the e2e-runs Grafana dashboard
+# instead of needing a dig through raw runner/CP logs. FAIL-SOFT: a down obs
+# stack never fails or slows this gate. See tests/e2e/lib/obs.sh.
+# shellcheck disable=SC1091
+# shellcheck source=lib/obs.sh
+source "$(dirname "$0")/lib/obs.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
@@ -136,7 +144,10 @@ REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
 # uses them, so under `set -e` the fork-PR / local no-creds path aborted with
 # `log: command not found` exit 127 before reaching the self-check exit 0.)
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
-fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
+# fail()/ok() also feed the obs timeline: a failure is attributed to the step
+# currently in flight (obs_fail_current), guarded so the pre-init PR-mode path
+# emits nothing. obs is fail-soft so this never changes fail()'s exit behaviour.
+fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; [ -n "${OBS_RUN_ID:-}" ] && obs_fail_current fail "$*"; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # ─── PR-mode early-exit (core#3081 / CR2 #12653) ──────────────────────────────
@@ -204,8 +215,10 @@ skip_loud() {
   echo "[$(date +%H:%M:%S)] ⏭️  SKIP: $*" >&2
   if [ "$REQUIRE_LIVE" = "1" ]; then
     echo "[$(date +%H:%M:%S)] ❌ E2E_REQUIRE_LIVE=1 — a skip is a false-green guard breach here. Failing." >&2
+    [ -n "${OBS_RUN_ID:-}" ] && obs_fail_current fail "skip-as-fail (E2E_REQUIRE_LIVE=1): $*"
     exit 5
   fi
+  [ -n "${OBS_RUN_ID:-}" ] && obs_fail_current skip "$*"
   exit 0
 }
 
@@ -237,8 +250,10 @@ cleanup() {
 
   if [ "${E2E_KEEP_ORG:-0}" = "1" ]; then
     log "E2E_KEEP_ORG=1 — skipping teardown. Manually delete $SLUG when done."
+    [ -n "${OBS_RUN_ID:-}" ] && obs_run_end "$( [ "$entry_rc" = "0" ] && echo kept || echo fail )"
     return 0
   fi
+  [ -n "${OBS_RUN_ID:-}" ] && obs_step_start teardown
   log "🧹 Tearing down org $SLUG..."
   if curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
     -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
@@ -260,14 +275,29 @@ cleanup() {
   done
   if [ "$leak_count" != "0" ]; then
     echo "⚠️  LEAK: org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" >&2
+    if [ -n "${OBS_RUN_ID:-}" ]; then
+      obs_leak org "$SLUG" "executeOrgPurge:purgeDBRows (org row survived admin-list)"
+      obs_step_end zero_leftover_verify fail "org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" "elapsed_secs=$elapsed"
+      obs_run_end fail
+    fi
     exit 4
   fi
   local aws_leak_rc=0
   e2e_verify_no_ec2_leaks_for_slug "$SLUG" || aws_leak_rc=$?
   if [ "$aws_leak_rc" != "0" ]; then
+    if [ -n "${OBS_RUN_ID:-}" ]; then
+      obs_leak ec2 "$SLUG" "CascadeWorkspaceEC2s / deprovisionTenantInfra (slug-tagged EC2 survived)"
+      obs_step_end zero_leftover_verify fail "EC2/resource leak for $SLUG (aws_leak_rc=$aws_leak_rc)" "aws_leak_rc=$aws_leak_rc"
+      obs_run_end fail
+    fi
     case "$aws_leak_rc" in 2) exit 2 ;; *) exit 4 ;; esac
   fi
   ok "Teardown clean — no orphan org or EC2 resources for $SLUG (${elapsed}s)"
+  if [ -n "${OBS_RUN_ID:-}" ]; then
+    obs_step_end teardown pass "" "elapsed_secs=$elapsed"
+    obs_step_end zero_leftover_verify pass "no orphan org or EC2 resources" "elapsed_secs=$elapsed"
+    obs_run_end "$( [ "$entry_rc" = "0" ] && echo pass || echo fail )"
+  fi
   case "$entry_rc" in 0|1|2|3|4|5) ;; *) exit 1 ;; esac
 }
 trap cleanup EXIT INT TERM
@@ -333,24 +363,39 @@ else:
 # ─── 0. Preflight ────────────────────────────────────────────────────────────
 log "═══ Staging concierge CREATES-A-WORKSPACE (real-LLM) E2E ═══  CP=$CP_URL  Slug=$SLUG"
 log "    worker the concierge will be asked to create: name=$WORKER_NAME"
+# Initialise the structured-obs run identity. OBS_SLUG is the org slug == the
+# universal run link the leak reaper + run_footprint use; OBS_ENV is guessed
+# from CP_URL. From here every step emits a tagged event to Loki/Grafana.
+OBS_TEST="staging_concierge_full_journey"
+# Exported so lib/obs.sh (sourced) reads them as the run's slug/org cross-link;
+# export also documents to shellcheck that they are consumed out-of-file.
+export OBS_SLUG="$SLUG"
+export OBS_CP_URL="$CP_URL"
+obs_init "$OBS_TEST"
+obs_step_start preflight
 curl "${CURL_COMMON[@]}" "$CP_URL/health" >/dev/null || fail "CP health check failed"
 ok "CP reachable"
+obs_step_end preflight pass "" "cp_url=$CP_URL"
 
 # ─── 1. Create org (CP installs + provisions the concierge as platform root) ──
+obs_step_start org_create
 log "1/6 CREATE A NEW ORG — creating org $SLUG..."
 CREATE_RESP=$(admin_call POST /cp/admin/orgs \
   -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
 echo "$CREATE_RESP" | python3 -m json.tool >/dev/null || fail "Org create non-JSON: $CREATE_RESP"
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
 [ -z "$ORG_ID" ] && fail "Org create response missing 'id': $CREATE_RESP"
+export OBS_ORG_ID="$ORG_ID"
 ok "Org created (id=$ORG_ID)"
+obs_step_end org_create pass "" "org_id=$ORG_ID"
 
 # ─── 2. Wait for tenant provisioning ─────────────────────────────────────────
+obs_step_start provision
 log "1/6 CREATE A NEW ORG — waiting for tenant provisioning (up to ${PROVISION_TIMEOUT_SECS}s)..."
 DEADLINE=$(( $(date +%s) + PROVISION_TIMEOUT_SECS ))
 LAST_STATUS=""
 while true; do
-  [ "$(date +%s)" -gt "$DEADLINE" ] && exit 3
+  [ "$(date +%s)" -gt "$DEADLINE" ] && { obs_fail_current timeout "tenant provisioning exceeded ${PROVISION_TIMEOUT_SECS}s (last instance_status='$LAST_STATUS')" "last_status=$LAST_STATUS"; exit 3; }
   LIST_JSON=$(admin_call GET /cp/admin/orgs 2>/dev/null || echo '{"orgs":[]}')
   STATUS=$(echo "$LIST_JSON" | python3 -c "
 import json, sys
@@ -367,6 +412,7 @@ print('')" 2>/dev/null || echo "")
   esac
 done
 ok "Tenant provisioning complete"
+obs_step_end provision pass "" "instance_status=running"
 
 # Derive tenant domain from CP hostname (prod vs staging).
 CP_HOST=$(echo "$CP_URL" | sed -E 's#^https?://##; s#/.*$##')
@@ -380,6 +426,7 @@ TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
 log "    TENANT_URL=$TENANT_URL"
 
 # ─── 3. Per-tenant admin token + TLS readiness ───────────────────────────────
+obs_step_start tenant_health
 log "1/6 CREATE A NEW ORG — fetching per-tenant admin token..."
 TENANT_TOKEN=$(admin_call GET "/cp/admin/orgs/$SLUG/admin-token" \
   | python3 -c "import json,sys; print(json.load(sys.stdin).get('admin_token',''))" 2>/dev/null || echo "")
@@ -394,6 +441,7 @@ while true; do
   sleep 5
 done
 ok "Tenant reachable at $TENANT_URL"
+obs_step_end tenant_health pass "" "tenant_url=$TENANT_URL"
 
 # ─── 2. CANVAS WORKS — the tenant canvas/app + its PROXIED API actually resolve ─
 # THE break this gate exists to catch (cp#576 / controlplane#1012): a tenant can
@@ -408,6 +456,7 @@ ok "Tenant reachable at $TENANT_URL"
 #   GET /org/identity     (open route)        → 200 + JSON object
 #   GET /canvas/viewport  (open route)        → 200 + JSON (not HTML)
 #   GET /requests/pending (tenant admin auth) → 200 + JSON (not HTML)
+obs_step_start canvas
 log "2/6 CANVAS WORKS — asserting the tenant's proxied API resolves (not 404/502/SPA-HTML)..."
 CANVAS_BODY_TMP="$TMPDIR_E2E/canvas_body"
 # canvas_probe <label> <method> <path> <auth:tenant|open> <shape:array|json|nothtml>
@@ -457,8 +506,10 @@ ok "CANVAS WORKS: GET /canvas/viewport → 200 (not 404/502/SPA-HTML)"
 canvas_probe "GET /requests/pending" GET /requests/pending tenant nothtml
 ok "CANVAS WORKS: GET /requests/pending → 200 (not 404/502/SPA-HTML)"
 ok "═ STEP 2 PASS: tenant canvas/app + proxied API resolve (the controlplane#1012 break is gated)"
+obs_step_end canvas pass "" "routes=workspaces,org_identity,canvas_viewport,requests_pending"
 
 # ─── 3. PLATFORM AGENT APPEARS — discover the concierge (kind='platform' root) ─
+obs_step_start concierge_online
 log "3/6 PLATFORM AGENT APPEARS — discovering the concierge (kind='platform' root)..."
 # The CP installs the platform agent at org-provision; allow a short settle for
 # the row + re-parent backfill to land.
@@ -497,8 +548,10 @@ run the ${PLATFORM_MCP_REQUIRED_TOOL} tool."
   sleep 10
 done
 ok "Concierge online + routable (url assigned)"
+obs_step_end concierge_online pass "" "concierge_id=$CONCIERGE_ID"
 
 # ─── 4.5. Required loaded-MCP-tools inventory check (core#3082) ──────────────
+obs_step_start mcp_tools
 # The concierge runtime must report `loaded_mcp_tools` on its heartbeat and
 # that list must include the platform management `${PLATFORM_MCP_REQUIRED_TOOL}` tool.
 # This is a REQUIRED gate: if the field is absent or does not include the
@@ -536,8 +589,10 @@ fi
 PRE_EXISTING=$(find_worker_by_name)
 [ -n "$PRE_EXISTING" ] && fail "worker '$WORKER_NAME' already exists pre-test ($PRE_EXISTING) — name collision, cannot prove causality"
 ok "Pre-state confirmed: '$WORKER_NAME' does not exist yet"
+obs_step_end mcp_tools pass "" "required_tool=$(required_provision_tool_id)"
 
 # ─── 5. Drive the AGENT: A2A message/send → it must create the workspace ──────
+obs_step_start create_team_a2a
 log "4/6 CREATE A TEAM — sending the concierge a natural-language create-team-member request..."
 # Imperative + explicit to defuse LLM nondeterminism: name the tool, the exact
 # workspace NAME and ROLE, and tell it not to ask a clarifying question. The
@@ -601,8 +656,10 @@ except Exception: print(''); sys.exit(0)
 parts = (d.get('result') or {}).get('parts', []) if isinstance(d, dict) else []
 print(parts[0].get('text','') if parts else '')" 2>/dev/null || echo "")
 log "    concierge replied (first 300 chars): $(echo "$AGENT_TEXT" | head -c 300)"
+obs_step_end create_team_a2a pass "" "http_code=$A2A_CODE" "attempts=$A2A_ATTEMPT"
 
 # ─── 6. ASSERT the deterministic side effect: the worker now EXISTS ───────────
+obs_step_start create_team_verify
 log "4/6 CREATE A TEAM — polling GET /workspaces for the new team member the concierge was asked to create..."
 # The create is the side effect; the LLM may take a few turns / a moment to flush
 # the tool call. Poll the NAME (deterministic) — tolerant of when exactly the row
@@ -636,6 +693,7 @@ if [ -n "$WORKER_KIND" ] && [ "$WORKER_KIND" != "workspace" ]; then
   fail "created node '$WORKER_NAME' has kind='$WORKER_KIND' (want 'workspace') — not a real worker create"
 fi
 ok "Created node is a real kind='workspace' row"
+obs_step_end create_team_verify pass "" "worker_id=$WORKER_ID" "worker_kind=${WORKER_KIND:-workspace}"
 
 # Soft confirmation: the concierge SHOULD report back. Non-fatal (the side
 # effect above is the hard proof) — but a reply that is itself an error is a
@@ -658,6 +716,7 @@ fi
 # known-answer arithmetic task (17×23=391), so a broken member that echoes its
 # error-as-text FAILs via a2a_assert_real_completion. MiniMax keeps it cheap
 # (one short turn, minimal tokens).
+obs_step_start assign_work
 log "5/6 ASSIGN TEAM WORK — waiting for team member '$WORKER_NAME' ($WORKER_ID) to come online (up to ${TEAM_ONLINE_SECS}s)..."
 M_STATUS=""; M_URL=""; LAST_M_STATUS=""
 MEMBER_ONLINE_DEADLINE=$(( $(date +%s) + TEAM_ONLINE_SECS ))
@@ -718,6 +777,7 @@ log "    team member replied (first 200 chars): $(echo "$WORK_TEXT" | head -c 20
 # Hard gate: a real (non-error-as-text) round-trip containing the known answer.
 a2a_assert_real_completion "$WORK_TEXT" "$WORK_EXPECT" "assign-work"
 ok "═ STEP 5 PASS: work assigned to the team member round-tripped a real MiniMax completion (got '$WORK_EXPECT')"
+obs_step_end assign_work pass "" "http_code=$WORK_CODE" "expected=$WORK_EXPECT"
 
 ok "═══ FULL-JOURNEY STAGING E2E PASSED (org → canvas → agent → team → work) ═══"
 log "Proven end-to-end: (1) org created; (2) tenant canvas/app + proxied API resolve (/workspaces 200 real list, /org/identity, /canvas/viewport, /requests/pending — not 404/502/SPA-HTML); \
