@@ -54,14 +54,19 @@
 # authentication method" + the synth-E2E gate goes red without naming
 # the slug-format mismatch.
 
-# Default platform-managed model for the platform-boot regression path. The
-# exact id that booted NOT_CONFIGURED in prod. Must stay a member of the
-# claude-code `platform` arm in workspace-server/internal/providers/providers.yaml
-# (the deterministic suite TestEnsureDefaultConfig_StampsProviderForEverySSOTPlatformModel
-# enforces every member of that arm derives provider=platform). Resolved INSIDE
-# pick_model_slug via ${E2E_DEFAULT_PLATFORM_MODEL:-...} so callers can override
-# it (or unset it) without tripping `set -u`.
-E2E_DEFAULT_PLATFORM_MODEL_FALLBACK="moonshot/kimi-k2.6"
+# Default platform-managed model for the platform-boot regression path. This
+# MIRRORS the platform SSOT default (MOLECULE_LLM_DEFAULT_MODEL =
+# minimax/MiniMax-M2.7 in Infisical /shared/controlplane/llm), so the e2e
+# exercises the SAME default a fresh tenant resolves — not a stale literal. The
+# authoritative value is the env override E2E_DEFAULT_PLATFORM_MODEL (which the
+# CI injects from the staging KMS SSOT); this is only the baked fallback. Must
+# stay a member of the claude-code `platform` arm in
+# workspace-server/internal/providers/providers.yaml (the deterministic suite
+# TestEnsureDefaultConfig_StampsProviderForEverySSOTPlatformModel enforces every
+# member of that arm derives provider=platform). Resolved INSIDE pick_model_slug
+# via ${E2E_DEFAULT_PLATFORM_MODEL:-...} so callers can override it (or unset it)
+# without tripping `set -u`.
+E2E_DEFAULT_PLATFORM_MODEL_FALLBACK="minimax/MiniMax-M2.7"
 
 # Usage: pick_model_slug <runtime>
 #   stdout: the slug string

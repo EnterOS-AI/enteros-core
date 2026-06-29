@@ -129,10 +129,16 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 			// minimax via platform proxy
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 		},
-		// hermes: kimi (BYOK gateway) + platform-managed kimi.
+		// hermes: kimi (BYOK gateway) + platform-managed kimi + platform-managed
+		// MiniMax (task #83 / shared-default parity, CTO 2026-06-24): MiniMax is
+		// the ONE shared platform-managed default for ALL runtimes, so the hermes
+		// platform arm now also carries the slash-form `minimax/...` platform ids
+		// — closing the cross-runtime gap that left hermes Kimi-only.
 		"hermes": {
 			"kimi-coding/kimi-k2",
 			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
+			// minimax via platform proxy (task #83 platform default)
+			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 		},
 		// codex: openai BYOK + platform-managed openai (served via the proxy
 		// Responses surface; codex CLI 0.130+ is Responses-API-only) +

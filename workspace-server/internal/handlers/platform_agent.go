@@ -347,7 +347,7 @@ func substituteConciergeName(prompt []byte, name string) []byte {
 // runtime a PARAMETER (threaded through installPlatformAgent + ensureConciergeModel),
 // so a per-org concierge can run on codex / openclaw / hermes, not only the legacy
 // 'claude-code' image variant. The fallback stays 'claude-code' for backward
-// compatibility (existing installs, self-host seed, OSS/local). conciergeDeclaredModel
+// compatibility (existing installs, self-host seed, OSS/local). platformDefaultModelFallback
 // is validated against the registry FOR THE CHOSEN RUNTIME before being seeded.
 //
 // SSOT FOLLOW (PR-6 concierge-follows): this const is now only the FALLBACK.
@@ -379,13 +379,19 @@ func conciergeDefaultRuntime() string {
 	return defaultConciergeRuntime
 }
 
-// conciergeDeclaredModel is the platform agent's REFERENCE platform-managed model.
-// It is intentionally NOT used as a fallback at provision time (#3267 follow-up #2):
-// the concierge model MUST be resolved authoritatively from the control plane
-// (SaaS) or from the operator-supplied MOLECULE_LLM_DEFAULT_MODEL env (self-hosted),
-// and MUST fail closed if neither source is available. This const remains only as a
-// validation reference and a self-documenting product default.
-const conciergeDeclaredModel = "minimax/MiniMax-M2.7"
+// platformDefaultModelFallback is THE single shared platform-default model — one
+// value, not per-runtime. The authoritative SSOT remains Infisical
+// /shared/controlplane/llm (MOLECULE_LLM_DEFAULT_MODEL), read from the control
+// plane on SaaS tenants or from the operator env on self-hosted ones. This const
+// is the LAST-RESORT fallback used ONLY when that SSOT value is unset (a CP
+// reachable-but-unconfigured response, or a self-hosted/local boot with no
+// operator env) — never a per-runtime hardcode. It is a platform-managed-routable
+// id (every runtime's `platform` arm in providers.yaml lists it: claude-code,
+// codex, openclaw AND hermes), so a fresh concierge on any runtime resolves it to
+// the proxy, never to a tenant BYOK key. A genuine CP transport/auth FAILURE
+// still fails closed (defaultResolveConciergeModel) — the fallback covers "SSOT
+// unset", not "SSOT unreachable".
+const platformDefaultModelFallback = "minimax/MiniMax-M2.7"
 
 // conciergeModelResolver resolves the concierge's seed model at provision time.
 // It is a variable so tests can stub it. The default implementation fetches the
@@ -395,25 +401,37 @@ var conciergeModelResolver = defaultResolveConciergeModel
 
 // defaultResolveConciergeModel returns the platform default model for a fresh
 // concierge. In SaaS (MOLECULE_ORG_ID + ADMIN_TOKEN present) it asks the control
-// plane at /cp/tenants/config for MOLECULE_LLM_DEFAULT_MODEL. In self-hosted/local
-// mode it reads the MOLECULE_LLM_DEFAULT_MODEL env. Any missing/unreachable source
-// returns an error so ensureConciergeModel refuses to seed and the universal
-// MISSING_MODEL gate fails closed.
+// plane at /cp/tenants/config for MOLECULE_LLM_DEFAULT_MODEL (which the CP in turn
+// sources from the Infisical SSOT /shared/controlplane/llm). In self-hosted/local
+// mode it reads the MOLECULE_LLM_DEFAULT_MODEL env (the operator's SSOT).
+//
+// When the SSOT value is UNSET — a CP reachable-but-unconfigured response, or a
+// self-hosted boot with no operator env — it returns the ONE shared
+// platformDefaultModelFallback (never a per-runtime literal). A genuine CP
+// transport/auth FAILURE is NOT "SSOT unset": it still returns an error so
+// ensureConciergeModel refuses to seed and the universal MISSING_MODEL gate fails
+// closed rather than masking a CP outage with a fabricated default.
 func defaultResolveConciergeModel(ctx context.Context) (string, error) {
 	// Self-hosted / local dev: the operator's env is the SSOT.
 	if os.Getenv("MOLECULE_ORG_ID") == "" || os.Getenv("ADMIN_TOKEN") == "" {
 		if v := strings.TrimSpace(os.Getenv("MOLECULE_LLM_DEFAULT_MODEL")); v != "" {
 			return v, nil
 		}
-		return "", fmt.Errorf("MISSING_MODEL: MOLECULE_LLM_DEFAULT_MODEL not set for self-hosted concierge")
+		// SSOT unset on a self-hosted/local boot → the one shared fallback.
+		return platformDefaultModelFallback, nil
 	}
 
 	cpModel, err := fetchCPDefaultModel(ctx)
 	if err != nil {
+		// CP unreachable / non-2xx / bad JSON is an OUTAGE, not "SSOT unset":
+		// fail closed rather than fabricate a default.
 		return "", fmt.Errorf("MISSING_MODEL: failed to fetch platform default model from CP: %w", err)
 	}
 	if cpModel == "" {
-		return "", fmt.Errorf("MISSING_MODEL: CP /cp/tenants/config returned no MOLECULE_LLM_DEFAULT_MODEL")
+		// CP reachable but the SSOT carries no platform default → the one
+		// shared fallback (in prod the CP boot fail-closes on an empty
+		// selector, so this branch only fires on a dev/e2e CP).
+		return platformDefaultModelFallback, nil
 	}
 	return cpModel, nil
 }
