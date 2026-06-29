@@ -574,13 +574,15 @@ echo ""
 # ----------------------------------------------------------------------------
 # Step 3b — TENANT USABILITY (beyond a shallow /health=200).
 # ----------------------------------------------------------------------------
-# status==online + /health==200 is NOT proof a tenant is usable. The shallow
-# /health check let a broken-app tenant through: it returned /health=200 but its
-# app's GET /workspaces 404'd. Assert the data-plane is genuinely usable, not
-# merely reachable:
-#   (a) GET /workspaces        -> HTTP 200 (the app loads; NOT 404/5xx)
-#   (b) the list CONTAINS the provisioned id  (NOT an empty/garbage stub)
-#   (c) GET /workspaces/{id}   -> HTTP 200 (the tenant resource resolves)
+# status==online + /health==200 is NOT proof the workspace is genuinely usable:
+# a broken-app workspace can flip status=online while its API surface is unusable.
+# NB $BASE is the PLATFORM control-plane server (http://localhost:8080, see
+# _lib.sh), so these assert the platform's workspace surface actually SERVES the
+# row we just provisioned — not merely that a status field changed:
+#   (a) GET /workspaces        -> HTTP 200 (the collection endpoint loads; NOT 404/5xx)
+#   (b) the list CONTAINS the provisioned id  (NOT an empty/garbage list)  ← the new coverage
+#   (c) GET /workspaces/{id}   -> HTTP 200 (the resource resolves; overlaps Step 3's
+#       online-poll of the same path, kept as an explicit usability assertion)
 # The real management-tool round-trip (provision_workspace callable, not a ping)
 # is exercised end-to-end by Step 5's A2A message/send; asserting the management
 # MCP `provision_workspace` verb itself requires an org + platform agent and is
@@ -592,11 +594,18 @@ echo "--- Step 3b: tenant usability (GET /workspaces 200 + lists id + resource r
 usability_get() {  # usability_get <url>
   local _a=(); e2e_admin_auth_args _a
   local _tmp; _tmp="$(mktemp)"
+  local _codef="$_tmp.code"
   local _code
-  _code="$(curl -s -o "$_tmp" -w '%{http_code}' -m 15 "${_a[@]+"${_a[@]}"}" "$1" 2>/dev/null || echo 000)"
+  # Route the http_code to its OWN file (NOT stdout). `-w` already writes the
+  # code; a trailing `|| echo 000` on transport failure would APPEND a second
+  # code → "000000", the lint-banned status-capture pollution
+  # (.gitea/scripts/lint-curl-status-capture.py; HTTP-000000 bug, PRs
+  # #2779/#2783/#2797). Reading from a dedicated file keeps the code clean.
+  curl -s -o "$_tmp" -w '%{http_code}' -m 15 "${_a[@]+"${_a[@]}"}" "$1" >"$_codef" 2>/dev/null || true
+  _code="$(cat "$_codef" 2>/dev/null)"; [ -z "$_code" ] && _code="000"
   printf '%s\n' "$_code"
   cat "$_tmp"
-  rm -f "$_tmp"
+  rm -f "$_tmp" "$_codef"
 }
 
 # (a) the collection endpoint must LOAD with 200 — a 404 here is the exact
