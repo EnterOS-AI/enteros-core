@@ -1,3 +1,4 @@
+# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
 name: Staging SaaS smoke (every 30 min)
 
 # Renamed from canary-staging.yml on 2026-05-11 per Hongming directive
@@ -28,10 +29,13 @@ name: Staging SaaS smoke (every 30 min)
 # to signal "SaaS stack end-to-end is alive."
 
 on:
-  schedule:
-    # Every 30 min. Cron on GitHub-hosted runners has a known drift of
-    # a few minutes under load — that's fine for a smoke check.
-    - cron: '*/30 * * * *'
+  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+#   schedule:
+#     # Every 30 min. Cron on GitHub-hosted runners has a known drift of
+#     # a few minutes under load — that's fine for a smoke check.
+#     - cron: '*/30 * * * *'
+  # DISABLED 2026-06-27: no manual trigger remained after neutralizing auto-triggers; workflow_dispatch added so the workflow stays manually runnable.
+  workflow_dispatch:
 # Serialise with the full-SaaS workflow so they don't contend for the
 # same org-create quota on staging. Different group key from
 # e2e-staging-saas since we don't mind queueing smoke runs behind one

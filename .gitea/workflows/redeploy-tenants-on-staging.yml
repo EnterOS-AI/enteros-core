@@ -1,3 +1,4 @@
+# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
 name: redeploy-tenants-on-staging
 
 # Ported from .github/workflows/redeploy-tenants-on-staging.yml on 2026-05-11 per RFC
@@ -51,10 +52,11 @@ name: redeploy-tenants-on-staging
 # of a known-good build.
 
 on:
-  push:
-    branches: [staging]
-    paths:
-      - '.gitea/workflows/publish-workspace-server-image.yml'
+  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+#   push:
+#     branches: [staging]
+#     paths:
+#       - '.gitea/workflows/publish-workspace-server-image.yml'
   workflow_dispatch:
 permissions:
   contents: read

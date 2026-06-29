@@ -1,3 +1,4 @@
+# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
 name: E2E Staging SaaS (full lifecycle)
 
 # Ported from .github/workflows/e2e-staging-saas.yml on 2026-05-11 per RFC
@@ -39,6 +40,7 @@ name: E2E Staging SaaS (full lifecycle)
 # the pull_request-trigger removal in PRs #516/#530.
 
 on:
+  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
   # Trunk-based (Phase 3 of internal#81): main is the only branch.
   #
   # core#3081 / lint-required-no-paths: NO `paths:` filter on either push or
@@ -53,15 +55,15 @@ on:
   # Per-job gating is moved to the job level (`if:` guards below) so the
   # slow provisioning jobs (e2e-staging-saas, e2e-staging-platform-boot)
   # still skip on docs-only PRs, but the workflow ITSELF is unconditional.
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+#   push:
+#     branches: [main]
+#   pull_request:
+#     branches: [main]
   workflow_dispatch:
-  schedule:
-    # 07:00 UTC every day — catches AMI drift, WorkOS cert rotation,
-    # Cloudflare API regressions, etc. even on quiet days.
-    - cron: '0 7 * * *'
+#   schedule:
+#     # 07:00 UTC every day — catches AMI drift, WorkOS cert rotation,
+#     # Cloudflare API regressions, etc. even on quiet days.
+#     - cron: '0 7 * * *'
 
 # Serialize: staging has a finite per-hour org creation quota. Two pushes
 # landing in quick succession should queue, not race. `cancel-in-progress:
