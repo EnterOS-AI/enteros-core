@@ -26,10 +26,11 @@ name: E2E Staging Reconciler (heals terminated EC2)
 # platform-boot job in e2e-staging-saas.yml documents.
 
 on:
-  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+  # DISABLED 2026-06-27: push/pull_request auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+  # The schedule/cron trigger was DELETED (no-nightly-e2e rule) — not commented.
   # Run when the reconciler itself, the script, or the libs it depends on
   # change — so a reconciler regression is caught on the PR that introduces
-  # it (paths filter), plus a daily schedule to catch infra/AMI drift.
+  # it (paths filter). On-demand only until the local-docker rework.
 #   push:
 #     branches: [main]
 #     paths:
@@ -47,10 +48,6 @@ on:
 #       - 'tests/e2e/lib/model_slug.sh'
 #       - '.gitea/workflows/e2e-staging-reconciler.yml'
   workflow_dispatch:
-#   schedule:
-#     # 08:00 UTC daily — offset from e2e-staging-saas (07:00) so the two live
-#     # harnesses don't fight over staging's per-hour org-creation quota.
-#     - cron: '0 8 * * *'
 
 # Serialize against itself: staging has a finite per-hour org-creation quota,
 # and a cancelled run mid-teardown leaks EC2. cancel-in-progress: false

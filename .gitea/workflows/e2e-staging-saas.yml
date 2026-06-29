@@ -29,7 +29,14 @@ name: E2E Staging SaaS (full lifecycle)
 #   - pull_request: pr-validate always posts success; real E2E step runs only
 #     when provisioning-critical files change (detect-changes gates the step).
 #   - workflow_dispatch (manual re-run from UI)
-#   - Nightly cron (catches drift even when no pushes land)
+#
+# NO schedule/cron: per the no-nightly-e2e rule, this gate runs per-PR +
+# on merge (push) only — never on a timer. The single consolidated
+# staging e2e gate is this workflow's `E2E Staging Concierge Creates
+# Workspace` job (the #3347 full-journey: create-org → canvas-works →
+# agent-appears → create-team → assign-work → zero-leftover-teardown,
+# tests/e2e/test_staging_concierge_creates_workspace_e2e.sh), which also
+# gates the prod promote. Nightly drift detection was deleted, not moved.
 #
 # NOTE: A separate pr-validate job handles the pull_request path so this
 # workflow posts CI status for workflow-only PRs. Without it, a PR that
@@ -40,7 +47,8 @@ name: E2E Staging SaaS (full lifecycle)
 # the pull_request-trigger removal in PRs #516/#530.
 
 on:
-  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+  # DISABLED 2026-06-27: push/pull_request auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+  # The schedule/cron trigger was DELETED (no-nightly-e2e rule) — not commented.
   # Trunk-based (Phase 3 of internal#81): main is the only branch.
   #
   # core#3081 / lint-required-no-paths: NO `paths:` filter on either push or
@@ -60,10 +68,6 @@ on:
 #   pull_request:
 #     branches: [main]
   workflow_dispatch:
-#   schedule:
-#     # 07:00 UTC every day — catches AMI drift, WorkOS cert rotation,
-#     # Cloudflare API regressions, etc. even on quiet days.
-#     - cron: '0 7 * * *'
 
 # Serialize: staging has a finite per-hour org creation quota. Two pushes
 # landing in quick succession should queue, not race. `cancel-in-progress:
