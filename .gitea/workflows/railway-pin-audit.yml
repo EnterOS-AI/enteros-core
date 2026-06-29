@@ -32,8 +32,15 @@ name: Railway pin audit (drift detection)
 # the schedule trigger HARD-FAILS on missing RAILWAY_AUDIT_TOKEN.
 
 on:
-  schedule:
-    - cron: '0 13 * * *'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.gitea/workflows/**'
+  push:
+    branches: [main, staging]
+    paths:
+      - '.gitea/workflows/**'
+  workflow_dispatch:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app

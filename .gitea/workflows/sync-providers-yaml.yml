@@ -46,10 +46,6 @@ on:
     paths:
       - 'workspace-server/internal/providers/providers.yaml'
       - '.gitea/workflows/sync-providers-yaml.yml'
-  schedule:
-    # Daily at :23 — catch a canonical change in controlplane that landed
-    # without a paired core re-sync PR (off-zero to spread cron load).
-    - cron: '23 4 * * *'
   workflow_dispatch:
 
 env:

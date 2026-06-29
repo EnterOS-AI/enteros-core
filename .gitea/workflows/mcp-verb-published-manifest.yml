@@ -61,11 +61,6 @@ on:
       - 'contracts/mcp-plugin-delivery.contract.json'
       - 'scripts/mcp-verb-manifest-check/**'
       - '.gitea/workflows/mcp-verb-published-manifest.yml'
-  schedule:
-    # Daily at :41 — catch a newly PUBLISHED mcp-server build that skewed away
-    # from the contract even when neither file in this repo changed (the stale
-    # published-build failure mode is time-dependent, not commit-dependent).
-    - cron: '41 4 * * *'
   workflow_dispatch:
 
 permissions:

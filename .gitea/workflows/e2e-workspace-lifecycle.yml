@@ -40,11 +40,6 @@ on:
       - 'workspace-server/internal/staginge2e/**'
       - '.gitea/workflows/e2e-workspace-lifecycle.yml'
   workflow_dispatch:
-  schedule:
-    # 08:00 UTC daily — offset from e2e-staging-saas (07:00) and
-    # e2e-peer-visibility (07:30) so the three don't collide on the staging
-    # org-creation quota.
-    - cron: '0 8 * * *'
 
 concurrency:
   # Per-SHA (feedback_concurrency_group_per_sha).

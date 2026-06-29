@@ -42,10 +42,6 @@ on:
   # to absorb runner-saturation latency without spurious cancels (the original cascade
   # cause). If runner-saturation root persists, the dedicated-runner-label split
   # remains the structural next step (tracked separately).
-  schedule:
-    # Hourly at :05 — task spec calls for "off-zero" (`5 * * * *`),
-    # offset from :17 (ci-required-drift) and :00 (peak cron load).
-    - cron: '5 * * * *'
   workflow_dispatch:
 
 # Read commit status + branch ref + issues; write issues (open/PATCH/close).

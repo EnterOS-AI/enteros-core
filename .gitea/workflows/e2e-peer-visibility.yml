@@ -96,11 +96,6 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-  schedule:
-    # 07:30 UTC daily — catches AMI / template-hermes / template-openclaw
-    # drift even on quiet days. Offset 30m from e2e-staging-saas (07:00)
-    # so the two don't collide on the staging org-creation quota.
-    - cron: '30 7 * * *'
 
 concurrency:
   # Per-SHA (feedback_concurrency_group_per_sha). A single global group

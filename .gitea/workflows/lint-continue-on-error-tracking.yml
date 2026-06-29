@@ -72,10 +72,6 @@ on:
     paths:
       - '.gitea/workflows/**'
       - '.gitea/scripts/lint_continue_on_error_tracking.py'
-  schedule:
-    # Daily at 13:11 UTC — off-peak, prime-staggered from the other
-    # Tier-2 lint schedules (ci-required-drift runs hourly :00).
-    - cron: '11 13 * * *'
   workflow_dispatch:
 
 env:

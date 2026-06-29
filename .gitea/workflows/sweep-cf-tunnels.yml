@@ -37,10 +37,7 @@ name: Sweep stale Cloudflare Tunnels
 # (schedule → hard-fail, dispatch → soft-skip) surfaces it clearly.
 
 on:
-  schedule:
-    # Hourly at :45 — offset from sweep-cf-orphans (:15) so the two
-    # janitors don't issue parallel CF API bursts at the same minute.
-    - cron: '45 * * * *'
+  workflow_dispatch:
 # Don't let two sweeps race the same account.
 concurrency:
   group: sweep-cf-tunnels
