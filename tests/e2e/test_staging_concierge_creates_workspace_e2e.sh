@@ -410,9 +410,8 @@ ok "Tenant reachable at $TENANT_URL"
 #   GET /requests/pending (tenant admin auth) → 200 + JSON (not HTML)
 log "2/6 CANVAS WORKS — asserting the tenant's proxied API resolves (not 404/502/SPA-HTML)..."
 CANVAS_BODY_TMP="$TMPDIR_E2E/canvas_body"
-CANVAS_LAST_BODY=""
 # canvas_probe <label> <method> <path> <auth:tenant|open> <shape:array|json|nothtml>
-# Sets CANVAS_LAST_BODY on success; calls fail() (which EXITS the script — so this
+# Asserts the probe in place; calls fail() (which EXITS the script — so this
 # MUST NOT be invoked inside a $() command substitution, where exit would only
 # leave the subshell) on any non-200 / wrong-shape / HTML-fallback.
 canvas_probe() {
@@ -447,11 +446,9 @@ canvas_probe() {
       { [ "$first" = "{" ] || [ "$first" = "[" ]; } || fail "CANVAS WORKS: $label ($method $path) 200 but body is not a JSON object/array. first='$first' body: $(printf '%s' "$body" | head -c 160)" ;;
     nothtml) : ;;  # '<' already rejected above; any other non-HTML 200 is fine
   esac
-  CANVAS_LAST_BODY="$body"
 }
 
 canvas_probe "GET /workspaces" GET /workspaces tenant array
-WS_LIST_BODY="$CANVAS_LAST_BODY"
 ok "CANVAS WORKS: GET /workspaces → 200 + real JSON list"
 canvas_probe "GET /org/identity" GET /org/identity open json
 ok "CANVAS WORKS: GET /org/identity → 200 + JSON"
