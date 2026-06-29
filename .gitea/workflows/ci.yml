@@ -492,6 +492,13 @@ jobs:
         name: Run E2E bash unit tests (no live infra)
         run: |
           bash tests/e2e/test_model_slug.sh
+          # E2E structured-observability lib (lib/obs.sh). Offline (no Loki /
+          # network): proves JSON escaping, secret redaction, numeric fields,
+          # and the FAIL-SOFT contract — with Loki unreachable AND `set -e`,
+          # every public obs fn still returns 0 so a down obs stack can never
+          # fail or hang an e2e. A regression that makes obs.sh able to abort a
+          # caller goes red on every PR.
+          bash tests/e2e/lib/test_obs_lib_unit.sh
           # molecule-core#1995 (#1994 follow-on): fail-direction proof for
           # the A2A real-completion + byok-routing assertion helpers
           # (lib/completion_assert.sh). Offline (no LLM, no network): it
