@@ -70,6 +70,17 @@ expect_fail "error result as text MUST fail" \
   a2a_assert_real_completion "tool returned error result" "PINEAPPLE" "unit"
 expect_fail "MISSING_BYOK_CREDENTIAL as text MUST fail" \
   a2a_assert_real_completion "MISSING_BYOK_CREDENTIAL: set your own key" "PINEAPPLE" "unit"
+# DECISIVE (created-agent auth escape): a concierge-created agent that never got
+# the platform LLM usage token replies with its auth failure AS text. Both the
+# prefixed and the bare "Not logged in" / login-prompt forms MUST classify as
+# error-as-text — this is the exact symptom the created-agent first-turn gate
+# in test_staging_concierge_creates_workspace_e2e.sh STEP 5 relies on.
+expect_fail "Not-logged-in auth error (prefixed) MUST fail" \
+  a2a_assert_real_completion "Agent error: Not logged in · Please run /login" "PINEAPPLE" "unit"
+expect_fail "bare 'Not logged in' auth error MUST fail" \
+  a2a_assert_real_completion "Not logged in" "PINEAPPLE" "unit"
+expect_fail "bare login-prompt auth error MUST fail" \
+  a2a_assert_real_completion "Please run /login to continue" "PINEAPPLE" "unit"
 # Error-as-text that ALSO happens to contain the token still fails (error
 # marker takes precedence — a real completion never carries these markers).
 expect_fail "error-as-text containing the token still fails" \
@@ -104,6 +115,12 @@ if hit=$(a2a_completion_error_marker "An Exception occurred"); then
   echo "PASS: error marker detected ($hit)"; PASS=$((PASS + 1))
 else
   echo "FAIL: error marker NOT detected in 'An Exception occurred'"; FAIL=$((FAIL + 1))
+fi
+# Created-agent auth-failure symptom must be detected by the bare scanner too.
+if hit=$(a2a_completion_error_marker "Not logged in · Please run /login"); then
+  echo "PASS: 'Not logged in' auth symptom detected ($hit)"; PASS=$((PASS + 1))
+else
+  echo "FAIL: 'Not logged in' auth symptom NOT detected"; FAIL=$((FAIL + 1))
 fi
 
 # ---- redact_secrets (diagnostic-output safety) ----
