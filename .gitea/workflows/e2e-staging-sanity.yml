@@ -11,19 +11,18 @@ name: E2E Staging Sanity (leak-detection self-check)
 #   - Workflow-level env.GITHUB_SERVER_URL set.
 #   - `continue-on-error: true` on the job (RFC §1 contract).
 #
-# Periodic assertion that the teardown safety nets in e2e-staging-saas
-# and staging-smoke (formerly canary-staging) actually work. Runs the
+# On-demand assertion that the teardown safety nets in e2e-staging-saas
+# actually work (the standalone staging-smoke probe was retired into the
+# e2e-staging-saas gate). Runs the
 # E2E harness with E2E_INTENTIONAL_FAILURE=1, which poisons the tenant
 # admin token after the org is provisioned. The workspace-provision
 # step then fails, the script exits non-zero, and the EXIT trap +
 # workflow always()-step must still tear down cleanly.
 
 on:
-  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
-#   schedule:
-#     - cron: '0 6 * * 1'
-
-  # DISABLED 2026-06-27: no manual trigger remained after neutralizing auto-triggers; workflow_dispatch added so the workflow stays manually runnable.
+  # DISABLED 2026-06-27: AWS account closed; pending local-docker rework. See ABSTRACTION-FINDINGS.
+  # The schedule/cron trigger was DELETED (no-nightly-e2e rule) — not commented.
+  # Manual workflow_dispatch only.
   workflow_dispatch:
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app

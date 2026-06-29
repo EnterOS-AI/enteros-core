@@ -35,15 +35,19 @@ name: E2E Staging External Runtime
 #     hibernation, or the migration set changes.
 #   - PR review for the same set.
 #   - Manual workflow_dispatch.
-#   - Daily cron at 07:30 UTC (catches drift on quiet days; staggered
-#     30 min after e2e-staging-saas.yml's 07:00 UTC cron).
+#
+# NO schedule/cron: per the no-nightly-e2e rule, this on-demand lane has no
+# timer. Its unique external-runtime assertions live in
+# tests/e2e/test_staging_external_runtime.sh and are exercised per-PR/push
+# (paths filter above) once the local-docker rework restores the auto-triggers.
 #
 # Concurrency: serialized so two staging pushes don't fight for the
 # same EC2 quota window. cancel-in-progress=false so a half-rolled
 # tenant always finishes its teardown.
 
 on:
-  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+  # DISABLED 2026-06-27: push/pull_request auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+  # The schedule/cron trigger was DELETED (no-nightly-e2e rule) — not commented.
 #   push:
 #     branches: [main]
 #     paths:
@@ -68,8 +72,6 @@ on:
 #       - 'workspace-server/internal/db/workspace_status_enum_drift_test.go'
 #       - 'tests/e2e/test_staging_external_runtime.sh'
 #       - '.gitea/workflows/e2e-staging-external.yml'
-#   schedule:
-#     - cron: '30 7 * * *'
 
   # DISABLED 2026-06-27: no manual trigger remained after neutralizing auto-triggers; workflow_dispatch added so the workflow stays manually runnable.
   workflow_dispatch:
