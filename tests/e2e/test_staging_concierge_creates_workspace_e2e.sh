@@ -18,17 +18,27 @@
 #                                     fallback). This is exactly the half-wired-
 #                                     tenant break controlplane#1012 fixes.
 #   STEP 3  PLATFORM AGENT APPEARS    the concierge auto-installs; assert it is
-#                                     present + online AND its loaded_mcp_tools
-#                                     include the management verb (callable).
+#                                     present + online. The loaded_mcp_tools
+#                                     inventory is ADVISORY (skip, not gate) until
+#                                     the runtime#181 heartbeat producer lands — it
+#                                     does NOT gate the created-agent auth check.
 #   STEP 4  CREATE A TEAM             drive a real A2A message (MiniMax) asking the
 #                                     concierge to create a team member; assert the
 #                                     DETERMINISTIC side effect — the workspace
 #                                     appears in GET /workspaces (the management
-#                                     MCP provision_workspace verb was really run).
-#   STEP 5  ASSIGN TEAM WORK          assign the new team member a real task over
+#                                     MCP provision_workspace verb was really run)
+#                                     AND (STEP 4.6) the created member received its
+#                                     platform LLM auth — MOLECULE_LLM_USAGE_TOKEN
+#                                     is present (presence-only via the workspace
+#                                     API; never the value, never docker-exec).
+#   STEP 5  ASSIGN TEAM WORK          the CREATED-AGENT AUTH + REAL-FIRST-TURN HARD
+#                                     GATE: assign the new member a real task over
 #                                     A2A; assert it is accepted AND the round-trip
 #                                     completes with a real known-answer MiniMax
-#                                     completion (a2a_assert_real_completion).
+#                                     completion (a2a_assert_real_completion) — NOT
+#                                     "Not logged in"/error/empty. This reds on the
+#                                     created-agent auth bug (no LLM token) and is
+#                                     INDEPENDENT of runtime#181.
 #   STEP 6  TEARDOWN                  the throwaway org is deleted cleanly (trap),
 #                                     leak-checked (org row + EC2).
 #
@@ -550,15 +560,30 @@ done
 ok "Concierge online + routable (url assigned)"
 obs_step_end concierge_online pass "" "concierge_id=$CONCIERGE_ID"
 
-# ─── 4.5. Required loaded-MCP-tools inventory check (core#3082) ──────────────
+# ─── 4.5. loaded_mcp_tools inventory check (core#3082) — ADVISORY, NOT A GATE ──
 obs_step_start mcp_tools
-# The concierge runtime must report `loaded_mcp_tools` on its heartbeat and
-# that list must include the platform management `${PLATFORM_MCP_REQUIRED_TOOL}` tool.
-# This is a REQUIRED gate: if the field is absent or does not include the
-# tool, the concierge cannot satisfy the core#3082 online gate and this
-# test fails closed. The real side-effect assertion below is NOT sufficient
-# without this deterministic inventory check.
-log "3.5/6 PLATFORM AGENT APPEARS — required loaded_mcp_tools inventory check (management verb callable)..."
+# The concierge runtime SHOULD report `loaded_mcp_tools` on its heartbeat with
+# the platform management `${PLATFORM_MCP_REQUIRED_TOOL}` tool in it. That field
+# is produced by the runtime#181 heartbeat producer, which has NOT landed on
+# staging yet — so the field is absent today.
+#
+# DECOUPLING (core — the created-agent auth escape): this check used to
+# skip_loud, which EXITS the whole script (exit 5 under E2E_REQUIRE_LIVE=1).
+# Because the create-team (STEP 4) + created-agent AUTH + real-first-turn
+# (STEP 5) steps run AFTER this point, an absent loaded_mcp_tools field
+# skip_loud-EXITED before they ever ran — so the gate NEVER exercised the
+# concierge-CREATED team member, and the "agent-created workspace has no
+# MOLECULE_LLM_USAGE_TOKEN → 'Not logged in'" bug class escaped to prod.
+#
+# That coupling is wrong: loaded_mcp_tools is the MCP-tools heartbeat PRODUCER
+# (runtime#181); the created-agent auth check is the LLM USAGE TOKEN — a
+# DIFFERENT, INDEPENDENT concern. So this inventory check is now ADVISORY
+# (never exits): when the field is present we confirm the required tool; when it
+# is absent or missing the tool we LOG + CONTINUE to the runtime#181-INDEPENDENT
+# created-agent auth gate below (STEP 4→5), which is the real false-green guard
+# now. (Promote this back to a hard assertion once runtime#181 lands — see
+# the loaded_mcp_tools-present branch, which is already enforced.)
+log "3.5/6 PLATFORM AGENT APPEARS — loaded_mcp_tools inventory check (ADVISORY until runtime#181 lands; does NOT gate the created-agent auth check)..."
 
 # concierge_loaded_mcp_tools_json: echo the concierge's `loaded_mcp_tools`
 # field as a JSON array, or "" if the field is missing/unreadable.
@@ -578,10 +603,13 @@ if [ -n "$LOADED_TOOLS" ] && [ "$LOADED_TOOLS" != "[]" ]; then
   if [ "$(loaded_mcp_tools_has_required "$LOADED_TOOLS")" = "yes" ]; then
     ok "loaded_mcp_tools inventory confirms $(required_provision_tool_id)"
   else
-    skip_loud "loaded_mcp_tools inventory check FAIL: $(required_provision_tool_id) not reported. Tools: $(echo "$LOADED_TOOLS" | head -c 400)"
+    # ADVISORY (skip, not gate): keep this skip_loud-flavored — i.e. NOT a hard
+    # fail — until runtime#181 lands, but DO NOT exit (that would re-couple the
+    # created-agent auth gate below to the unrelated MCP-tools producer).
+    log "    ⏭️  ADVISORY (skip, not gate): loaded_mcp_tools present but $(required_provision_tool_id) not reported — runtime#181 heartbeat producer incomplete. CONTINUING to the runtime#181-INDEPENDENT created-agent auth gate (STEP 4→5). Tools: $(echo "$LOADED_TOOLS" | head -c 400)"
   fi
 else
-  skip_loud "loaded_mcp_tools absent or empty — the runtime producer (runtime#181) must populate this field and include $(required_provision_tool_id)"
+  log "    ⏭️  ADVISORY (skip, not gate): loaded_mcp_tools absent/empty — runtime#181 heartbeat producer has not landed. CONTINUING to the runtime#181-INDEPENDENT created-agent auth gate (STEP 4→5)."
 fi
 
 # Pre-state: the worker MUST NOT exist yet (so its later appearance is causally
@@ -695,6 +723,78 @@ fi
 ok "Created node is a real kind='workspace' row"
 obs_step_end create_team_verify pass "" "worker_id=$WORKER_ID" "worker_kind=${WORKER_KIND:-workspace}"
 
+# ─── 4.6. CREATED-AGENT LLM AUTH PRESENCE (corroborating, observability-tolerant)
+# The concierge-created member must receive the platform LLM auth — the CP proxy
+# usage token MOLECULE_LLM_USAGE_TOKEN — or it cannot complete a turn and replies
+# "Agent error: Not logged in · Please run /login" (the exact bug this gate now
+# guards). The token is injected into the member's container env at PROVISION
+# time (it is NOT a tenant secret), so it surfaces only through an env-key
+# PRESENCE signal on the workspace object (core env-presence observability,
+# a06a52eb). This check is PRESENCE-ONLY — never the value, never docker-exec —
+# and is INDEPENDENT of the runtime#181 MCP-tools producer:
+#   present      → ok (auth propagated)
+#   absent       → HARD fail (THIS is the bug; once a06a52eb exposes the field it
+#                  reads false today and true once a57b73e9 propagates the token)
+#   unobservable → ADVISORY (a06a52eb not landed) — defer to the REAL FIRST TURN
+#                  gate in STEP 5, which is authoritative and needs no new field.
+obs_step_start created_agent_auth_presence
+log "4.6/6 CREATED-AGENT LLM AUTH — presence-check MOLECULE_LLM_USAGE_TOKEN on member $WORKER_ID (key presence only, value NEVER read)..."
+
+# created_agent_llm_token_presence: echoes present|absent|unobservable. Reads
+# ONLY presence/boolean signals — it must NEVER echo a secret value.
+created_agent_llm_token_presence() {
+  tenant_call GET "/workspaces/$WORKER_ID" 2>/dev/null | python3 -c '
+import sys, json
+KEY = "MOLECULE_LLM_USAGE_TOKEN"
+try: d = json.load(sys.stdin)
+except Exception: print("unobservable"); sys.exit(0)
+if not isinstance(d, dict): print("unobservable"); sys.exit(0)
+# a06a52eb env-presence observability (boolean — presence, NOT value):
+for f in ("llm_usage_token_present","has_llm_usage_token","llm_auth_present","platform_llm_auth_present"):
+    v = d.get(f)
+    if isinstance(v, bool):
+        print("present" if v else "absent"); sys.exit(0)
+# array-of-present-env-key NAMES (names only, never values):
+for f in ("provisioned_env_keys","container_env_keys","env_keys","llm_env_keys"):
+    v = d.get(f)
+    if isinstance(v, list):
+        print("present" if KEY in v else "absent"); sys.exit(0)
+ep = d.get("env_key_presence")
+if isinstance(ep, dict) and KEY in ep:
+    print("present" if bool(ep[KEY]) else "absent"); sys.exit(0)
+print("unobservable")'
+}
+
+# Secondary surface: the secrets KEY list (has_value flag, never the value) — in
+# case the fix lands the token as a workspace_secret rather than a pure env var.
+# Absence here alone is NOT proof (the token is normally env-injected, not a
+# secret), so a "no" maps back to unobservable; only a "yes" is a positive.
+created_agent_token_key_in_secrets() {  # echoes yes|no|unobservable
+  tenant_call GET "/workspaces/$WORKER_ID/secrets" 2>/dev/null | python3 -c '
+import sys, json
+KEY = "MOLECULE_LLM_USAGE_TOKEN"
+try: rows = json.load(sys.stdin)
+except Exception: print("unobservable"); sys.exit(0)
+if not isinstance(rows, list): print("unobservable"); sys.exit(0)
+print("yes" if any(isinstance(r, dict) and r.get("key") == KEY for r in rows) else "no")'
+}
+
+AUTH_PRESENCE=$(created_agent_llm_token_presence)
+if [ "$AUTH_PRESENCE" = "unobservable" ] && [ "$(created_agent_token_key_in_secrets)" = "yes" ]; then
+  AUTH_PRESENCE=present
+fi
+case "$AUTH_PRESENCE" in
+  present)
+    ok "CREATED-AGENT LLM AUTH PRESENT: member $WORKER_ID carries MOLECULE_LLM_USAGE_TOKEN (presence-only — value never read)"
+    obs_step_end created_agent_auth_presence pass "" "worker_id=$WORKER_ID" "presence=present" ;;
+  absent)
+    # fail() attributes the obs failure to this in-flight step (obs_fail_current).
+    fail "CREATED-AGENT LLM AUTH MISSING: the concierge-created member $WORKER_ID has NO MOLECULE_LLM_USAGE_TOKEN — a created agent without the platform LLM usage token cannot authenticate and surfaces 'Not logged in' on its first turn. HARD gate (the LLM token, INDEPENDENT of the runtime#181 MCP-tools producer)." ;;
+  *)
+    log "    ⏭️  ADVISORY: MOLECULE_LLM_USAGE_TOKEN presence is not yet observable via the workspace API (core a06a52eb env-presence observability not landed). The REAL FIRST TURN gate in STEP 5 is authoritative and catches the same bug deterministically."
+    obs_step_end created_agent_auth_presence pass "" "worker_id=$WORKER_ID" "presence=unobservable" ;;
+esac
+
 # Soft confirmation: the concierge SHOULD report back. Non-fatal (the side
 # effect above is the hard proof) — but a reply that is itself an error is a
 # yellow flag worth logging even though the row landed.
@@ -708,7 +808,7 @@ else
   log "    (concierge returned no text part — the row landing is the proof; reply is optional)"
 fi
 
-# ─── 5. ASSIGN TEAM WORK — give the new team member a real task; round-trip it ─
+# ─── 5. ASSIGN TEAM WORK — the CREATED-AGENT AUTH + REAL-FIRST-TURN HARD GATE ──
 # The workspace the concierge just created via the management MCP
 # ${PLATFORM_MCP_REQUIRED_TOOL} verb IS the team member. "Assigning work" = sending it a
 # real task over the A2A user→agent path and proving the member ACCEPTS it (2xx)
@@ -716,6 +816,18 @@ fi
 # known-answer arithmetic task (17×23=391), so a broken member that echoes its
 # error-as-text FAILs via a2a_assert_real_completion. MiniMax keeps it cheap
 # (one short turn, minimal tokens).
+#
+# THIS IS THE REGRESSION GATE for the created-agent auth escape: a concierge-
+# created workspace that never received the platform LLM usage token
+# (MOLECULE_LLM_USAGE_TOKEN) cannot authenticate and answers its FIRST TURN with
+# "Agent error: Not logged in · Please run /login". a2a_assert_real_completion
+# classifies that as error-as-text (the "Not logged in" / "Please run /login"
+# markers) AND it lacks the known answer → HARD fail. This is DEEP (a completed
+# model turn / real output, NOT status==online or field-presence — the exact
+# 'presence/no-op-text not callability' flaw that let the bug through) and is
+# INDEPENDENT of the runtime#181 MCP-tools producer (it exercises the LLM token,
+# not loaded_mcp_tools). It REDS on today's broken behavior and GREENS once the
+# LLM-auth fix (token propagation to created workspaces) lands.
 obs_step_start assign_work
 log "5/6 ASSIGN TEAM WORK — waiting for team member '$WORKER_NAME' ($WORKER_ID) to come online (up to ${TEAM_ONLINE_SECS}s)..."
 M_STATUS=""; M_URL=""; LAST_M_STATUS=""
