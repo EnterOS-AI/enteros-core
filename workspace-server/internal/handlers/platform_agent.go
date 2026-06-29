@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cpurl"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
@@ -429,10 +430,9 @@ func fetchCPDefaultModel(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("missing MOLECULE_ORG_ID or ADMIN_TOKEN")
 	}
 
-	base := os.Getenv("MOLECULE_CP_URL")
-	if base == "" {
-		base = "https://api.moleculesai.app"
-	}
+	// Single CP-URL seam (internal/cpurl): MOLECULE_CP_URL, else the managed
+	// default. MOLECULE_CP_DEFAULT_URL lets an OSS deployer redirect it.
+	base := cpurl.Base()
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

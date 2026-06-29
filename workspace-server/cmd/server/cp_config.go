@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cpurl"
 )
 
 // refreshEnvFromCP pulls the tenant's current config-plane env vars
@@ -44,12 +46,12 @@ func refreshEnvFromCP() error {
 		return nil
 	}
 
-	base := os.Getenv("MOLECULE_CP_URL")
-	if base == "" {
-		// Default to prod for any tenant that lost track of its CP URL
-		// (e.g. older user-data that only set MOLECULE_ORG_ID).
-		base = "https://api.moleculesai.app"
-	}
+	// Resolve via the single CP-URL seam (internal/cpurl). Behavior is
+	// unchanged for managed tenants: MOLECULE_CP_URL, else the managed
+	// default — for any tenant that lost track of its CP URL (e.g. older
+	// user-data that only set MOLECULE_ORG_ID). A self-host operator can
+	// redirect the default via MOLECULE_CP_DEFAULT_URL without code edits.
+	base := cpurl.Base()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
