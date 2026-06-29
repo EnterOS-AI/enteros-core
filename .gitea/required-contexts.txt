@@ -50,7 +50,7 @@ sop-checklist / all-items-acked
 reserved-path-review / reserved-path-review
 Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 
-# pending-AWS-closure (not yet enforced) ────────────────────────────────
+# pending-#3086 (AWS closure — not yet enforced) ────────────────────────
 # PARKED (this PR): `E2E Staging SaaS (full lifecycle) / E2E Staging
 # Concierge Creates Workspace` was ENFORCED above, but its producer
 # (e2e-staging-saas.yml) is now `workflow_dispatch`-only — the AWS account
