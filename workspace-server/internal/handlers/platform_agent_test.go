@@ -1268,6 +1268,79 @@ func TestEnsureConciergeModel_ReconcilesPlatformManagedToSSOT(t *testing.T) {
 	})
 }
 
+// TestApplyConciergeProvisionConfig_MoleculeModelResolvesMinimaxNotMoonshot is
+// the end-to-end DISPLAY regression for the moonshot->minimax issue. The concierge
+// DISPLAY env the canvas Config tab surfaces is MOLECULE_MODEL; the bug was that a
+// concierge re-baked MOLECULE_MODEL=moonshot/kimi-k2.6 (the dead template pin) even
+// though its resolved runtime model was minimax — MODEL and MOLECULE_MODEL split.
+//
+// This drives the FULL provision hook (applyConciergeProvisionConfig → reconcile +
+// provider pin) for a concierge whose stored MODEL is the stale platform-managed
+// moonshot default, with the authoritative resolver returning the minimax SSOT. It
+// asserts BOTH canonical env names land on minimax and that NEITHER is left on the
+// moonshot pin — so MODEL and MOLECULE_MODEL agree and the Config tab shows minimax.
+func TestApplyConciergeProvisionConfig_MoleculeModelResolvesMinimaxNotMoonshot(t *testing.T) {
+	h := &WorkspaceHandler{}
+	const kindQuery = `SELECT COALESCE\(kind, 'workspace'\), COALESCE\(runtime, ''\) FROM workspaces WHERE id =`
+	const recordKindQuery = `SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id =`
+	const modelSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`
+	const providerSelQuery = `SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'LLM_PROVIDER'`
+	const declaredInsert = `INSERT INTO workspace_declared_plugins`
+	const secretInsert = `INSERT INTO workspace_secrets`
+
+	const ssot = "minimax/MiniMax-M2.7"
+	const deadPin = "moonshot/kimi-k2.6"
+
+	setConciergeModelResolver(t, ssot, nil)
+	t.Setenv("MOLECULE_DEFAULT_RUNTIME", "claude-code")
+
+	mock := setupTestDB(t)
+	mock.ExpectQuery(kindQuery).WithArgs("ws-disp").
+		WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
+	// Stale stored MODEL is the OLD platform-managed default (moonshot) — the
+	// exact value the dead template pin used to seed.
+	mock.ExpectQuery(modelSelQuery).WithArgs("ws-disp").
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
+			AddRow([]byte(deadPin), 0))
+	// Reconcile (#3355): platform-managed stale default → overwrite to the SSOT.
+	mock.ExpectExec(secretInsert).
+		WithArgs("ws-disp", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// ensureConciergeProvider: no LLM_PROVIDER yet → platform-managed minimax pins it.
+	mock.ExpectQuery(providerSelQuery).WithArgs("ws-disp").
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+	mock.ExpectExec(secretInsert).
+		WithArgs("ws-disp", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(recordKindQuery).WithArgs("ws-disp").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("platform"))
+	mock.ExpectExec(declaredInsert).
+		WithArgs("ws-disp", sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// applyRuntimeModelEnv runs BEFORE this hook with the stale stored model, so
+	// both env names arrive on the dead moonshot pin — exactly the prod split.
+	env := map[string]string{"MODEL": deadPin, "MOLECULE_MODEL": deadPin}
+	h.applyConciergeProvisionConfig(context.Background(), "ws-disp", "", nil, env, "Org Concierge")
+
+	if env["MODEL"] != ssot {
+		t.Errorf("MODEL did not reconcile to the SSOT minimax; got %q want %q (env=%v)", env["MODEL"], ssot, env)
+	}
+	if env["MOLECULE_MODEL"] != ssot {
+		t.Errorf("MOLECULE_MODEL (the Config-tab DISPLAY env) did not resolve to minimax; got %q want %q", env["MOLECULE_MODEL"], ssot)
+	}
+	if env["MODEL"] == deadPin || env["MOLECULE_MODEL"] == deadPin {
+		t.Errorf("a dead moonshot pin survived reconcile: MODEL=%q MOLECULE_MODEL=%q — the DISPLAY would still show moonshot", env["MODEL"], env["MOLECULE_MODEL"])
+	}
+	// The whole point: MODEL and MOLECULE_MODEL must AGREE (no split).
+	if env["MODEL"] != env["MOLECULE_MODEL"] {
+		t.Errorf("MODEL/MOLECULE_MODEL split persists: MODEL=%q MOLECULE_MODEL=%q", env["MODEL"], env["MOLECULE_MODEL"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 // TestEnsureConciergeProvider_EmptyModelPins is the direct-unit regression gate
 // for the empty-model pin behavior. An unresolved (empty) MODEL on a
 // fresh/rebuilt-from-DB concierge payload MUST be treated as the platform-managed
