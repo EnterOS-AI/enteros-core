@@ -43,6 +43,20 @@ func TestIsForbiddenTenantEnvKey_ExactMatches(t *testing.T) {
 		{"CP_ADMIN_API_TOKEN", true},
 		{"CP_ADMIN_TOKEN", true},
 
+		// Control-plane shared/provision + encryption + source + cloud
+		// secrets (security-audit M5/H1/C2/H2/L1/H8). The systemic break the
+		// audit names: high-value GLOBAL secrets injected into every box.
+		{"PROVISION_SHARED_SECRET", true},
+		{"MOLECULE_CP_SHARED_SECRET", true},
+		{"SECRETS_ENCRYPTION_KEY", true},
+		{"MOLECULE_TEMPLATE_REPO_TOKEN", true},
+		{"AWS_ACCESS_KEY_ID", true},
+		{"AWS_SECRET_ACCESS_KEY", true},
+		{"AWS_SESSION_TOKEN", true},
+		{"GHCR_PULL_TOKEN", true},
+		{"INFISICAL_CLIENT_ID", true},
+		{"INFISICAL_CLIENT_SECRET", true},
+
 		// Secret-store operator tokens.
 		{"INFISICAL_OPERATOR_TOKEN", true},
 		{"INFISICAL_BOOTSTRAP_TOKEN", true},

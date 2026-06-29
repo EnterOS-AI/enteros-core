@@ -81,9 +81,44 @@ var forbiddenTenantEnvKeys = map[string]struct{}{
 	"CP_ADMIN_API_TOKEN": {},
 	"CP_ADMIN_TOKEN":     {},
 
+	// Control-plane shared/provision secrets (security-audit M5). One
+	// fleet-wide value gating /cp/workspaces/* + re-served by
+	// /cp/tenants/config — never per-tenant, so it must not sit in an
+	// untrusted box's env where a single leak exposes the platform-wide
+	// router gate.
+	"PROVISION_SHARED_SECRET":   {},
+	"MOLECULE_CP_SHARED_SECRET": {},
+
+	// Platform at-rest encryption master key (security-audit H1). A single
+	// global AES-256 key shipped to a box nullifies at-rest encryption as a
+	// tenant-isolation control; the box must hold at most a per-tenant data
+	// key it cannot use to reach other tenants.
+	"SECRETS_ENCRYPTION_KEY": {},
+
+	// Source-host read PAT for control-plane/private templates
+	// (security-audit C2). An org-wide Gitea read PAT on a box exfiltrates
+	// the whole control-plane source + every tenant's private template;
+	// template fetch must be platform-proxied, not PAT-on-box.
+	"MOLECULE_TEMPLATE_REPO_TOKEN": {},
+
+	// Static cloud IAM keys (security-audit H2). A long-lived AWS access
+	// key baked into a box is fleet-wide; ECR auth must be a short-TTL
+	// docker-login password minted server-side, never an IAM key/secret.
+	"AWS_ACCESS_KEY_ID":     {},
+	"AWS_SECRET_ACCESS_KEY": {},
+	"AWS_SESSION_TOKEN":     {},
+
+	// Stale org-wide registry pull PAT (security-audit L1). Vestigial but
+	// denied so it can never be repointed at a live registry from a box.
+	"GHCR_PULL_TOKEN": {},
+
 	// Secret-store operator tokens (Infisical SSOT — operator scope only).
 	"INFISICAL_OPERATOR_TOKEN":  {},
 	"INFISICAL_BOOTSTRAP_TOKEN": {},
+	// Universal-auth machine-identity creds: the broad CP boot-fetch /
+	// bootstrap identity (security-audit H8) must never reach a box.
+	"INFISICAL_CLIENT_ID":     {},
+	"INFISICAL_CLIENT_SECRET": {},
 
 	// Infra-platform tokens.
 	"RAILWAY_TOKEN":              {},
