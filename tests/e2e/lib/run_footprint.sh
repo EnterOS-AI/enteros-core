@@ -275,7 +275,8 @@ rf_force_clean() {
 
 rf_force_clean_cf() {
   local slug="$1" domain="${RF_APP_DOMAIN:-moleculesai.app}" rid wid short
-  for fqdn in "$slug.$domain"; do
+  local fqdns=( "$slug.$domain" )   # one element today; array keeps it extensible (ws-subdomains) + SC2066-clean
+  for fqdn in "${fqdns[@]}"; do
     rid=$(curl -sS --max-time 20 \
       "https://api.cloudflare.com/client/v4/zones/${RF_CF_ZONE_ID}/dns_records?name=${fqdn}" \
       -H "Authorization: Bearer ${RF_CF_API_TOKEN}" 2>/dev/null \

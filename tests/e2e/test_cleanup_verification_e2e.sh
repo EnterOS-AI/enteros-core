@@ -124,8 +124,8 @@ cp_teardown() {  # the product's OWN teardown — CP admin tenant delete cascade
     -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1 || \
     log "  (delete returned non-2xx — may be mid-cascade / already gone)"
   # Eventual-consistency: wait for the org row to disappear from the admin list.
-  local gone=0 i
-  for i in $(seq 1 24); do
+  local gone=0
+  for _ in $(seq 1 24); do
     if ! admin_call GET "/cp/admin/orgs" 2>/dev/null \
         | python3 -c "import json,sys
 d=json.load(sys.stdin); sys.exit(0 if any(o.get('slug')=='$SLUG' and o.get('status')!='purged' for o in d.get('orgs',[])) else 1)" 2>/dev/null; then
