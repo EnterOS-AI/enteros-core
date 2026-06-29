@@ -481,9 +481,9 @@ func setConciergeModelResolver(t *testing.T, model string, err error) {
 // TestConciergeRuntimeGeneralization_Defaults is the PROVE-FAIL gate for the P3b
 // model + template + runtime defaults (items 1, 2, 3).
 func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
-	t.Run("the reference platform-managed default model is minimax/MiniMax-M2.7 (CTO P3b)", func(t *testing.T) {
-		if conciergeDeclaredModel != "minimax/MiniMax-M2.7" {
-			t.Fatalf("conciergeDeclaredModel = %q, want %q — the P3b CTO decision pins the platform-managed concierge reference model to MiniMax", conciergeDeclaredModel, "minimax/MiniMax-M2.7")
+	t.Run("the ONE shared platform-default fallback model is minimax/MiniMax-M2.7 (CTO P3b)", func(t *testing.T) {
+		if platformDefaultModelFallback != "minimax/MiniMax-M2.7" {
+			t.Fatalf("platformDefaultModelFallback = %q, want %q — the single shared platform-default model (used only when the MOLECULE_LLM_DEFAULT_MODEL SSOT is unset) is MiniMax", platformDefaultModelFallback, "minimax/MiniMax-M2.7")
 		}
 	})
 
@@ -508,11 +508,11 @@ func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
 		// Guards against the model id drifting out of the providers registry's
 		// platform set for the DEFAULT concierge runtime, which would make
 		// ensureConciergeModel leave the model unset and fail the provision closed.
-		if ok, why := validateRegisteredModelForRuntime("claude-code", conciergeDeclaredModel); !ok {
-			t.Errorf("declared model %q not registered for claude-code: %s", conciergeDeclaredModel, why)
+		if ok, why := validateRegisteredModelForRuntime("claude-code", platformDefaultModelFallback); !ok {
+			t.Errorf("declared model %q not registered for claude-code: %s", platformDefaultModelFallback, why)
 		}
-		if ok, why := validateDerivedProviderInRegistry("claude-code", conciergeDeclaredModel); !ok {
-			t.Errorf("declared model %q has no registry provider for claude-code: %s", conciergeDeclaredModel, why)
+		if ok, why := validateDerivedProviderInRegistry("claude-code", platformDefaultModelFallback); !ok {
+			t.Errorf("declared model %q has no registry provider for claude-code: %s", platformDefaultModelFallback, why)
 		}
 	})
 
@@ -522,8 +522,8 @@ func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
 		// claude-code concierge (the provider's Anthropic-compat arm), else
 		// ensureConciergeProvider would skip the pin and the concierge would boot
 		// without LLM_PROVIDER and 401 against the CP proxy.
-		if !conciergeModelIsPlatformManaged("claude-code", conciergeDeclaredModel) {
-			t.Errorf("conciergeModelIsPlatformManaged(claude-code, %q) = false, want true — the registry-derived gate must recognize the minimax/ platform default", conciergeDeclaredModel)
+		if !conciergeModelIsPlatformManaged("claude-code", platformDefaultModelFallback) {
+			t.Errorf("conciergeModelIsPlatformManaged(claude-code, %q) = false, want true — the registry-derived gate must recognize the minimax/ platform default", platformDefaultModelFallback)
 		}
 		// An empty model is treated as the (platform-managed) default.
 		if !conciergeModelIsPlatformManaged("claude-code", "") {
@@ -535,20 +535,19 @@ func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
 		}
 	})
 
-	// KNOWN REGISTRY GAP (P3b blocker, documented not asserted-green): the codex
-	// runtime's `platform` arm currently serves ONLY OpenAI ids
-	// (openai/gpt-5.4(-mini)); minimax/MiniMax-M2.7 derives to the BYOK
-	// `byok-minimax` arm for codex, NOT `platform`. So a codex concierge on the
-	// shared minimax/ default would NOT get the platform LLM_PROVIDER pin and would
-	// require a tenant MINIMAX_API_KEY. The shared default (item 2) is correct; the
-	// cross-runtime PLATFORM routing for minimax on codex/openclaw needs a
-	// providers.yaml change (add minimax/MiniMax-M2.7 to codex+openclaw's platform
-	// arms) before a codex concierge can run it platform-billed. This subtest
-	// pins the CURRENT registry truth so the gap is visible and a future registry
-	// fix flips it deliberately.
-	t.Run("codex minimax routing is the known registry gap (NOT yet platform-managed)", func(t *testing.T) {
-		if conciergeModelIsPlatformManaged("codex", conciergeDeclaredModel) {
-			t.Log("codex now routes minimax/MiniMax-M2.7 to platform — the registry gap is closed; update the cross-runtime narrative + remove this guard")
+	// CROSS-RUNTIME PARITY (gap CLOSED): the shared default minimax/MiniMax-M2.7
+	// MUST derive to the platform-managed `platform` arm on EVERY concierge-capable
+	// runtime, so a fresh concierge on any of them runs the shared default
+	// proxy-billed (no tenant MINIMAX_API_KEY). This was historically a registry
+	// gap for codex/openclaw (fixed earlier) and hermes (this change adds
+	// minimax/* to hermes's platform arm in providers.yaml). If any runtime here
+	// regresses to BYOK routing, the universal MISSING_MODEL gate would either fail
+	// the provision closed or require a tenant key for the shared default.
+	t.Run("the shared default routes platform-managed on all four runtimes", func(t *testing.T) {
+		for _, runtime := range []string{"claude-code", "codex", "openclaw", "hermes"} {
+			if !conciergeModelIsPlatformManaged(runtime, platformDefaultModelFallback) {
+				t.Errorf("conciergeModelIsPlatformManaged(%q, %q) = false, want true — the shared platform default must route platform-managed on every runtime", runtime, platformDefaultModelFallback)
+			}
 		}
 	})
 
@@ -899,17 +898,17 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		// whether the process env looks like SaaS (MOLECULE_ORG_ID + ADMIN_TOKEN)
 		// or self-hosted. The resolver returning the declared model exercises the
 		// successful-seed path end-to-end.
-		setConciergeModelResolver(t, conciergeDeclaredModel, nil)
+		setConciergeModelResolver(t, platformDefaultModelFallback, nil)
 		h.applyConciergeProvisionConfig(context.Background(), "ws-fresh", "", nil, env, "Org Concierge")
 
 		// THE regression assertion: without this seed the provision hits
 		// MISSING_MODEL and fails closed. Both canonical env names must carry
 		// the declared model so the runtime actually boots on it this provision.
-		if env["MODEL"] != conciergeDeclaredModel {
-			t.Errorf("fresh concierge did not seed MODEL=%q; got %q (env=%v) — MISSING_MODEL would fail this provision closed", conciergeDeclaredModel, env["MODEL"], env)
+		if env["MODEL"] != platformDefaultModelFallback {
+			t.Errorf("fresh concierge did not seed MODEL=%q; got %q (env=%v) — MISSING_MODEL would fail this provision closed", platformDefaultModelFallback, env["MODEL"], env)
 		}
-		if env["MOLECULE_MODEL"] != conciergeDeclaredModel {
-			t.Errorf("fresh concierge did not seed MOLECULE_MODEL=%q; got %q", conciergeDeclaredModel, env["MOLECULE_MODEL"])
+		if env["MOLECULE_MODEL"] != platformDefaultModelFallback {
+			t.Errorf("fresh concierge did not seed MOLECULE_MODEL=%q; got %q", platformDefaultModelFallback, env["MOLECULE_MODEL"])
 		}
 		// Companion provider pin: the concierge can't run a turn without it
 		// (moonshot/… derives a non-registry provider name → adapter fail-closes).
@@ -946,7 +945,7 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		env := map[string]string{}
 		h.applyConciergeProvisionConfig(context.Background(), "ws-picked", "", nil, env, "Org Concierge")
 
-		if env["MODEL"] == conciergeDeclaredModel {
+		if env["MODEL"] == platformDefaultModelFallback {
 			t.Errorf("seed-only violated: ensureConciergeModel overwrote the customer's model with the declared default")
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -976,9 +975,9 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 	// source is missing/unreachable. The const is intentionally NOT a fallback.
 	t.Run("authoritative resolver returns a non-const model → seed follows it", func(t *testing.T) {
 		// A DIFFERENT routable platform model than the const default, so a pass
-		// proves the resolved value (not conciergeDeclaredModel) drives the seed.
+		// proves the resolved value (not platformDefaultModelFallback) drives the seed.
 		const resolvedModel = "moonshot/kimi-k2.6"
-		if resolvedModel == conciergeDeclaredModel {
+		if resolvedModel == platformDefaultModelFallback {
 			t.Fatalf("test invariant broken: resolvedModel must differ from the const to prove the resolver wins")
 		}
 		setConciergeModelResolver(t, resolvedModel, nil)
@@ -1013,8 +1012,8 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		if env["MOLECULE_MODEL"] != resolvedModel {
 			t.Errorf("resolved seed did not set MOLECULE_MODEL=%q; got %q", resolvedModel, env["MOLECULE_MODEL"])
 		}
-		if env["MODEL"] == conciergeDeclaredModel {
-			t.Errorf("resolved seed wrongly used the const fallback %q instead of the authoritative value", conciergeDeclaredModel)
+		if env["MODEL"] == platformDefaultModelFallback {
+			t.Errorf("resolved seed wrongly used the const fallback %q instead of the authoritative value", platformDefaultModelFallback)
 		}
 		if env["LLM_PROVIDER"] != conciergeProvider {
 			t.Errorf("resolved platform-managed model did not pin LLM_PROVIDER=%q; got %q", conciergeProvider, env["LLM_PROVIDER"])
@@ -1114,7 +1113,11 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		}
 	})
 
-	t.Run("self-hosted path with no env fails closed", func(t *testing.T) {
+	t.Run("self-hosted path with no env falls back to the shared platform default", func(t *testing.T) {
+		// SSOT unset on a self-hosted boot → the ONE shared platformDefaultModelFallback
+		// is seeded (NOT fail-closed), so a fresh concierge still has a routable,
+		// platform-managed model. The fallback follows the SEEDING mock sequence
+		// (it persists the resolved MODEL secret), identical to the env-present case.
 		t.Setenv("MOLECULE_ORG_ID", "")
 		t.Setenv("ADMIN_TOKEN", "")
 		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
@@ -1125,6 +1128,9 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-selfhosted-missing").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
+		mock.ExpectExec(secretInsert).
+			WithArgs("ws-selfhosted-missing", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectQuery(providerSelQuery).WithArgs("ws-selfhosted-missing").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
 		mock.ExpectExec(secretInsert).
@@ -1139,11 +1145,11 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		env := map[string]string{}
 		h.applyConciergeProvisionConfig(context.Background(), "ws-selfhosted-missing", "", nil, env, "Org Concierge")
 
-		if _, seeded := env["MODEL"]; seeded {
-			t.Errorf("missing self-hosted env seeded MODEL=%q — must fail closed", env["MODEL"])
+		if env["MODEL"] != platformDefaultModelFallback {
+			t.Errorf("missing self-hosted env did not seed the shared fallback MODEL=%q; got %q (env=%v)", platformDefaultModelFallback, env["MODEL"], env)
 		}
-		if _, seeded := env["MOLECULE_MODEL"]; seeded {
-			t.Errorf("missing self-hosted env seeded MOLECULE_MODEL=%q — must fail closed", env["MOLECULE_MODEL"])
+		if env["MOLECULE_MODEL"] != platformDefaultModelFallback {
+			t.Errorf("missing self-hosted env did not seed MOLECULE_MODEL=%q; got %q", platformDefaultModelFallback, env["MOLECULE_MODEL"])
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations: %v", err)
@@ -1235,7 +1241,7 @@ func TestApplyConciergeProvisionConfig_SeedsProvider(t *testing.T) {
 		// Existing platform model → ensureConciergeModel respects it (no INSERT).
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-heal").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
-				AddRow([]byte(conciergeDeclaredModel), 0))
+				AddRow([]byte(platformDefaultModelFallback), 0))
 		// No LLM_PROVIDER yet → existence SELECT empty, then PERSIST the pin.
 		mock.ExpectQuery(providerSelQuery).WithArgs("ws-heal").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
@@ -1251,7 +1257,7 @@ func TestApplyConciergeProvisionConfig_SeedsProvider(t *testing.T) {
 		mock.ExpectExec(declaredInsert).
 			WithArgs("ws-heal", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
-		env := map[string]string{"MODEL": conciergeDeclaredModel}
+		env := map[string]string{"MODEL": platformDefaultModelFallback}
 		h.applyConciergeProvisionConfig(context.Background(), "ws-heal", "", nil, env, "Org Concierge")
 
 		if env["LLM_PROVIDER"] != conciergeProvider {
@@ -1268,7 +1274,7 @@ func TestApplyConciergeProvisionConfig_SeedsProvider(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-prov-picked").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).
-				AddRow([]byte(conciergeDeclaredModel), 0))
+				AddRow([]byte(platformDefaultModelFallback), 0))
 		// Customer already pinned a provider in the canvas → existence SELECT
 		// returns it → NO INSERT (respecting the pick).
 		mock.ExpectQuery(providerSelQuery).WithArgs("ws-prov-picked").
@@ -1281,7 +1287,7 @@ func TestApplyConciergeProvisionConfig_SeedsProvider(t *testing.T) {
 		mock.ExpectExec(declaredInsert).
 			WithArgs("ws-prov-picked", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
-		env := map[string]string{"MODEL": conciergeDeclaredModel, "LLM_PROVIDER": "anthropic-api"}
+		env := map[string]string{"MODEL": platformDefaultModelFallback, "LLM_PROVIDER": "anthropic-api"}
 		h.applyConciergeProvisionConfig(context.Background(), "ws-prov-picked", "", nil, env, "Org Concierge")
 
 		if env["LLM_PROVIDER"] != "anthropic-api" {
@@ -1330,17 +1336,16 @@ func TestApplyConciergeProvisionConfig_SeedsProvider(t *testing.T) {
 // fails on a fresh build if any of the banned identifiers reappear as bare Go
 // references in the package source.
 //
-// NOTE (incident 2026-06-15): conciergeDeclaredModel is DELIBERATELY NOT
-// banned. The model is the ONE concierge identity element that legitimately
-// lives in core: the universal MISSING_MODEL gate (core#2594) reads the stored
-// MODEL secret at provision time — BEFORE any template config.yaml is fetched —
-// so the model MUST be seeded from a core-resident declared value, not deferred
-// to template delivery. #2919 wrongly lumped the model in with the prompt/MCP
-// literals and banned it here; removing the model-seed regressed every fresh
-// platform-agent provision to MISSING_MODEL fail-closed. The concierge IS the
-// platform-agent product, so it declares its own model exactly as a template
-// does (this is SSOT-correct, not a hardcoded platform default). The seeding is
-// gated by TestApplyConciergeProvisionConfig_SeedsModel.
+// NOTE (incident 2026-06-15): platformDefaultModelFallback is DELIBERATELY NOT
+// banned. It is the ONE shared platform-default model — a single last-resort
+// fallback used ONLY when the MOLECULE_LLM_DEFAULT_MODEL SSOT
+// (Infisical /shared/controlplane/llm, read from the CP on SaaS or the operator
+// env on self-host) is unset. The authoritative model is ALWAYS the SSOT; this
+// const merely keeps a fresh concierge from MISSING_MODEL on a dev/e2e/self-host
+// boot with no SSOT configured. It is NOT a per-runtime hardcode (the prior
+// divergent template defaults were removed) and NOT the primary seed source. A
+// genuine CP outage still fails closed (defaultResolveConciergeModel). The seed
+// path is gated by TestApplyConciergeProvisionConfig_SeedsModel.
 //
 // This is a grep over the package — brittle by design (intentionally so:
 // the concierge-literal pattern was the exact failure mode of the
@@ -1645,11 +1650,11 @@ func TestEnsureConciergeModel_FailsClosedOnReadError(t *testing.T) {
 		env := map[string]string{}
 		// Hermetic: the resolver is the authoritative source for the seed. Stub it
 		// so this test is not coupled to SaaS env/CP reachability.
-		setConciergeModelResolver(t, conciergeDeclaredModel, nil)
+		setConciergeModelResolver(t, platformDefaultModelFallback, nil)
 		h.ensureConciergeModel(context.Background(), "ws-model-fresh-unset", defaultConciergeRuntime, env)
 
-		if env["MODEL"] != conciergeDeclaredModel {
-			t.Errorf("genuine unset did not seed MODEL=%q; got %q (env=%v) — regression on the seed path", conciergeDeclaredModel, env["MODEL"], env)
+		if env["MODEL"] != platformDefaultModelFallback {
+			t.Errorf("genuine unset did not seed MODEL=%q; got %q (env=%v) — regression on the seed path", platformDefaultModelFallback, env["MODEL"], env)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations (the seed path did not persist): %v", err)
@@ -1711,7 +1716,10 @@ func TestDefaultResolveConciergeModel(t *testing.T) {
 		}
 	})
 
-	t.Run("SaaS path fails closed when CP returns no model key", func(t *testing.T) {
+	t.Run("SaaS path falls back to the shared platform default when CP returns no model key", func(t *testing.T) {
+		// CP reachable (200) but the SSOT carries no platform default → the ONE
+		// shared fallback (NOT a hard error). In prod the CP boot fail-closes on
+		// an empty selector, so this only fires on a dev/e2e CP.
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"other_key": "value"})
 		}))
@@ -1722,11 +1730,11 @@ func TestDefaultResolveConciergeModel(t *testing.T) {
 		t.Setenv("MOLECULE_CP_URL", ts.URL)
 
 		got, err := defaultResolveConciergeModel(context.Background())
-		if err == nil {
-			t.Fatalf("expected error for missing model key, got model %q", got)
+		if err != nil {
+			t.Fatalf("CP-reachable-but-unconfigured must use the shared fallback, got error: %v", err)
 		}
-		if !strings.Contains(err.Error(), "MISSING_MODEL") {
-			t.Errorf("error %q does not contain MISSING_MODEL", err.Error())
+		if got != platformDefaultModelFallback {
+			t.Errorf("defaultResolveConciergeModel() = %q, want shared fallback %q", got, platformDefaultModelFallback)
 		}
 	})
 
@@ -1763,17 +1771,20 @@ func TestDefaultResolveConciergeModel(t *testing.T) {
 		}
 	})
 
-	t.Run("self-hosted path fails closed when env is missing", func(t *testing.T) {
+	t.Run("self-hosted path falls back to the shared platform default when env is missing", func(t *testing.T) {
+		// Self-hosted/local boot with no operator SSOT env → the ONE shared
+		// fallback (NOT a hard error). This is the single platform default used
+		// only when MOLECULE_LLM_DEFAULT_MODEL is unset.
 		t.Setenv("MOLECULE_ORG_ID", "")
 		t.Setenv("ADMIN_TOKEN", "")
 		t.Setenv("MOLECULE_LLM_DEFAULT_MODEL", "")
 
 		got, err := defaultResolveConciergeModel(context.Background())
-		if err == nil {
-			t.Fatalf("expected error for missing env, got model %q", got)
+		if err != nil {
+			t.Fatalf("self-hosted SSOT-unset must use the shared fallback, got error: %v", err)
 		}
-		if !strings.Contains(err.Error(), "MISSING_MODEL") {
-			t.Errorf("error %q does not contain MISSING_MODEL", err.Error())
+		if got != platformDefaultModelFallback {
+			t.Errorf("defaultResolveConciergeModel() = %q, want shared fallback %q", got, platformDefaultModelFallback)
 		}
 	})
 }

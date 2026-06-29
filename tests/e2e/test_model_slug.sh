@@ -94,20 +94,20 @@ run_test "unknown runtime → slash-form fallback"                   gemini     
 run_test "empty runtime → slash-form fallback"                     ""          "openai/gpt-4o"
 
 # ── Platform-managed path (E2E_LLM_PATH=platform) ──
-# The moonshot/kimi NOT_CONFIGURED regression path (RFC#340 Fix A #2187).
-# Selects the slash-namespaced platform model (default moonshot/kimi-k2.6),
-# takes precedence over the per-key BYOK branches, and is itself overridden by
+# Selects the slash-namespaced platform model, defaulting to the shared platform
+# SSOT default (minimax/MiniMax-M2.7 — MOLECULE_LLM_DEFAULT_MODEL), takes
+# precedence over the per-key BYOK branches, and is itself overridden by
 # E2E_MODEL_SLUG. These pins guard the harness's ability to drive the platform
-# arm — the one the prod bug shipped on.
+# arm with the SAME default a fresh tenant resolves.
 echo
 echo "Test: pick_model_slug — platform-managed path (E2E_LLM_PATH=platform)"
 echo
 
 got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform pick_model_slug claude-code)
-assert_eq "claude-code + platform path → headline kimi model"      "$got" "moonshot/kimi-k2.6"
+assert_eq "claude-code + platform path → shared SSOT default model" "$got" "minimax/MiniMax-M2.7"
 
 got=$(unset E2E_MODEL_SLUG E2E_DEFAULT_PLATFORM_MODEL; E2E_LLM_PATH=platform E2E_MINIMAX_API_KEY="mx-stray" pick_model_slug claude-code)
-assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "moonshot/kimi-k2.6"
+assert_eq "platform path beats a stray BYOK key (no mask)"         "$got" "minimax/MiniMax-M2.7"
 
 got=$(unset E2E_MODEL_SLUG; E2E_LLM_PATH=platform E2E_DEFAULT_PLATFORM_MODEL="minimax/MiniMax-M3" pick_model_slug claude-code)
 assert_eq "platform path honours E2E_DEFAULT_PLATFORM_MODEL"        "$got" "minimax/MiniMax-M3"

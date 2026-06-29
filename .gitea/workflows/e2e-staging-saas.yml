@@ -641,9 +641,10 @@ jobs:
       # values are IDENTICAL to the old literals (model=moonshot/kimi-k2.6,
       # runtime=claude-code), so this changes no behavior — it only moves the
       # source of truth. These two literals remain as the FALLBACK for the paths
-      # the KMS step intentionally skips (untrusted-fork PR / local), where the
-      # harness then falls back to the same moonshot/kimi-k2.6 platform default via
-      # pick_model_slug's ${E2E_DEFAULT_PLATFORM_MODEL:-moonshot/kimi-k2.6}.
+      # the KMS step intentionally skips (untrusted-fork PR / local; those do NOT
+      # boot live — E2E_REQUIRE_LIVE=0), where the harness falls back to the shared
+      # platform default that MIRRORS the SSOT (minimax/MiniMax-M2.7) via
+      # pick_model_slug's ${E2E_DEFAULT_PLATFORM_MODEL:-minimax/MiniMax-M2.7}.
       E2E_RUNTIME: claude-code
       E2E_LLM_PATH: platform
       # Smoke mode: a single parent workspace is enough to prove online +
