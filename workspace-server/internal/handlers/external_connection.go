@@ -70,11 +70,38 @@ func BuildExternalConnectionPayload(platformURL, workspaceID, workspaceName, aut
 // externalPlatformURL returns the public URL at which this workspace-
 // server instance is reachable by the operator's external agent. This
 // is NOT necessarily the caller's Host header (which could be an
-// internal CF tunnel hostname). Prefer the EXTERNAL_PLATFORM_URL env
-// that Railway/ops sets for the tenant; fall back to the request's
-// Host + scheme if unset.
+// internal CF-tunnel / host.docker.internal address in the local-docker
+// published-port posture — a topology leak AND unreachable by a real
+// external agent off the docker host).
+//
+// Resolution order, public-base-env first, request Host LAST:
+//
+//  1. EXTERNAL_PLATFORM_URL — the control plane injects this as the
+//     tenant's PUBLIC tunnel URL (molecule-controlplane #1050,
+//     tenantPublicURLEnvArgs → "https://<slug>.<public-base-domain>").
+//     The authoritative customer-facing base when present.
+//
+//  2. PLATFORM_URL — defense-in-depth (#1050 follow-up). The CP sets
+//     PLATFORM_URL to the SAME public tunnel URL on EVERY backend: the
+//     EC2 user-data (ec2.go: `-e PLATFORM_URL=https://<slug>.<domain>`,
+//     where EXTERNAL_PLATFORM_URL is NOT set at all) and the local-docker
+//     provisioner (tenantPublicURLEnvArgs sets both). So if a deploy ever
+//     ships a tenant WITHOUT EXTERNAL_PLATFORM_URL (older user-data, a
+//     forgotten env, a new backend), PLATFORM_URL still yields the public
+//     base — the snippet stays correct instead of silently falling
+//     through to the internal request Host. Preferred over the Host
+//     header for exactly the leak reason above.
+//
+//  3. Request scheme + Host — last resort, reached only when NEITHER
+//     public-base env is set (pure local dev / a misconfigured deploy).
 func externalPlatformURL(c *gin.Context) string {
-	if v := os.Getenv("EXTERNAL_PLATFORM_URL"); v != "" {
+	if v := strings.TrimSpace(os.Getenv("EXTERNAL_PLATFORM_URL")); v != "" {
+		return v
+	}
+	// Defense-in-depth: the public PLATFORM_URL the CP also injects. Falls
+	// here BEFORE the request Host so a missing EXTERNAL_PLATFORM_URL never
+	// leaks an internal host into the customer-facing connect snippet.
+	if v := strings.TrimSpace(os.Getenv("PLATFORM_URL")); v != "" {
 		return v
 	}
 	scheme := "https"
