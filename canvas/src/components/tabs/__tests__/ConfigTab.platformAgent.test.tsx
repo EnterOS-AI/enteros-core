@@ -137,6 +137,24 @@ describe("ConfigTab — platform agent (org concierge) model display", () => {
     ).toBeTruthy();
   });
 
+  it("does NOT surface the hardcoded DEFAULT_CONFIG version ('1.0.0') for the concierge", async () => {
+    // The concierge ships no editable config.yaml, so the form falls into the
+    // no-config branch and spreads DEFAULT_CONFIG — whose version "1.0.0" is a
+    // UI placeholder, NOT a real concierge version (no SSOT backs it). It must
+    // be blanked rather than imply a version the platform never declared.
+    wirePlatformAgent({
+      workspaceModel: "minimax/MiniMax-M2",
+      configYamlContent: null,
+    });
+
+    render(<ConfigTab workspaceId="ws-test" />);
+
+    await waitFor(() => screen.getByLabelText("Model"));
+    const versionInput = screen.getByLabelText("Version") as HTMLInputElement;
+    expect(versionInput.value).toBe("");
+    expect(versionInput.value).not.toBe("1.0.0");
+  });
+
   it("GET /model (resolved minimax) WINS over a stale moonshot config.yaml pin", async () => {
     // Even if the on-box config.yaml still carries the dead vendor pin, the
     // resolved MODEL secret (GET /model) must be what the form displays.
