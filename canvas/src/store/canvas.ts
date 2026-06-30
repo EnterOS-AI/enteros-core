@@ -155,9 +155,11 @@ export type PanelTab = "details" | "skills" | "chat" | "terminal" | "display" | 
 
 /**
  * Top-level canvas view. "home" is the Org Concierge view (chat with the
- * platform agent); "map" is the node-graph canvas (the original view).
+ * platform agent); "map" is the node-graph canvas (the original view);
+ * "monitor" is the OSS monitoring dashboard (A2A traffic, topology, HITL
+ * queue) — the in-shell mount of the same panel served standalone at /monitor.
  */
-export type TopView = "home" | "map" | "settings";
+export type TopView = "home" | "map" | "settings" | "monitor";
 
 export interface ContextMenuState {
   x: number;

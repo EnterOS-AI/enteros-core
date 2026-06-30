@@ -480,6 +480,19 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		eventsAdmin.GET("/events/:workspaceId", eh.ListByWorkspace)
 	}
 
+	// Monitor — the OSS org-dashboard monitoring API behind the canvas
+	// /monitor page. AdminAuth-gated for the same reason as /events and
+	// /requests/pending: these are cross-workspace org reads (A2A traffic
+	// time-series + topology counts) that leak fleet shape if unauthenticated.
+	// Every number is read straight from local tables (activity_logs,
+	// workspaces) — no synthetic data. The control plane / app only READ these.
+	mh := handlers.NewMonitorHandler(db.DB)
+	{
+		monitorAdmin := r.Group("", middleware.AdminAuth(db.DB))
+		monitorAdmin.GET("/monitor/a2a-traffic", mh.A2ATraffic)
+		monitorAdmin.GET("/monitor/topology-summary", mh.TopologySummary)
+	}
+
 	// Remaining auth-gated workspace sub-routes — appended to wsAuth group declared above.
 	{
 		// Push notifications (mobile)
