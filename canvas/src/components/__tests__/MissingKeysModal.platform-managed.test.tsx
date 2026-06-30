@@ -31,12 +31,11 @@ const BYOK_MODELS: ModelSpec[] = [
   { id: "byok-claude", provider: "anthropic", required_env: ["ANTHROPIC_API_KEY", "MOLECULE_LLM_USAGE_TOKEN"] },
 ];
 
-function makeProviders(billingMode: "platform_managed" | "byok"): ProviderChoice[] {
+function makeProviders(mode: "platform_managed" | "byok"): ProviderChoice[] {
   const main = {
-    id: billingMode === "platform_managed" ? "platform|ANTHROPIC_API_KEY|MOLECULE_LLM_USAGE_TOKEN" : "anthropic|ANTHROPIC_API_KEY|MOLECULE_LLM_USAGE_TOKEN",
-    label: billingMode === "platform_managed" ? "Platform Anthropic" : "BYOK Anthropic",
+    id: mode === "platform_managed" ? "platform|ANTHROPIC_API_KEY|MOLECULE_LLM_USAGE_TOKEN" : "anthropic|ANTHROPIC_API_KEY|MOLECULE_LLM_USAGE_TOKEN",
+    label: mode === "platform_managed" ? "Platform Anthropic" : "BYOK Anthropic",
     envVars: ["ANTHROPIC_API_KEY", "MOLECULE_LLM_USAGE_TOKEN"],
-    billingMode,
   };
   // Need ≥2 providers so MissingKeysModal enters picker mode (pickerMode = providers.length > 1).
   const dummy = {
@@ -124,13 +123,11 @@ describe("ProviderPickerModal — platform-managed suppression (#2248)", () => {
         id: "anthropic|ANTHROPIC_API_KEY|MOLECULE_LLM_USAGE_TOKEN",
         label: "BYOK Anthropic",
         envVars: ["ANTHROPIC_API_KEY", "MOLECULE_LLM_USAGE_TOKEN"],
-        billingMode: "byok",
       },
       {
         id: "platform|ANTHROPIC_API_KEY|MOLECULE_LLM_USAGE_TOKEN",
         label: "Platform Anthropic",
         envVars: ["ANTHROPIC_API_KEY", "MOLECULE_LLM_USAGE_TOKEN"],
-        billingMode: "platform_managed",
       },
       {
         id: "openai|OPENAI_API_KEY",

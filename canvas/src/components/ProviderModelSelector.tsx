@@ -49,10 +49,6 @@ export interface ProviderEntry {
   wildcard: boolean;
   /** Optional tooltip text (rendered as native title=). */
   tooltip?: string;
-  /** Billing mode the DERIVED provider implies, when this entry came from the
-   *  registry-backed payload (internal#718 P3): "platform_managed" | "byok".
-   *  Undefined for entries built by the legacy inferVendor heuristic. */
-  billingMode?: "platform_managed" | "byok";
 }
 
 /** A provider is "platform-managed" when the Molecule platform proxies the LLM
@@ -61,36 +57,32 @@ export interface ProviderEntry {
  *  (controlplane ec2.go: `MOLECULE_LLM_USAGE_TOKEN="$ADMIN_TOKEN"`). The user
  *  supplies NO key for these: the credential is internal plumbing, not a user
  *  input. Detected by vendor==="platform" (the platform proxy provider, which
- *  declares MOLECULE_LLM_USAGE_TOKEN in its AuthEnv) OR
- *  billingMode==="platform_managed" (registry-backed, internal#718 P3). BYOK
- *  providers return false and DO require a user-supplied credential. */
+ *  declares MOLECULE_LLM_USAGE_TOKEN in its AuthEnv). BYOK providers return
+ *  false and DO require a user-supplied credential. */
 export function isPlatformManagedProvider(
-  p?: Pick<ProviderEntry, "vendor" | "billingMode"> | null,
+  p?: Pick<ProviderEntry, "vendor"> | null,
 ): boolean {
-  return p?.vendor === "platform" || p?.billingMode === "platform_managed";
+  return p?.vendor === "platform";
 }
 
 /** RegistryProvider mirrors one entry of GET /templates `registry_providers`
  *  (workspace-server registryProviderView): the registry's native provider for
- *  a runtime, with its display label, auth-env NAMES, and billing mode. This is
- *  the SSOT the dropdown labels come from — the canvas drops VENDOR_LABELS for
+ *  a runtime, with its display label and auth-env NAMES. This is the SSOT the
+ *  dropdown labels come from — the canvas drops VENDOR_LABELS for
  *  registry-backed runtimes (internal#718 P3, retire-list #4). */
 export interface RegistryProvider {
   name: string;
   display_name?: string;
   auth_env?: string[];
-  billing_mode?: "platform_managed" | "byok";
   deprecated?: boolean;
 }
 
 /** RegistryModel mirrors one entry of GET /templates `registry_models`: a
- *  native model id annotated with its DERIVED provider (registry name) and the
- *  billing_mode that provider implies. */
+ *  native model id annotated with its DERIVED provider (registry name). */
 export interface RegistryModel {
   id: string;
   name?: string;
   provider?: string;
-  billing_mode?: "platform_managed" | "byok";
   required_env?: string[];
 }
 
@@ -115,8 +107,8 @@ interface Props {
    *  verbatim instead of re-inferring one from `models` via
    *  buildProviderCatalog — the registry-backed path (internal#718 P3), where
    *  the parent builds the catalog from the registry-served providers/models
-   *  so dropdown labels + billing come from the provider-registry SSOT rather
-   *  than the inferVendor heuristic. Omitted = legacy heuristic over `models`. */
+   *  so dropdown labels come from the provider-registry SSOT rather than the
+   *  inferVendor heuristic. Omitted = legacy heuristic over `models`. */
   catalog?: ProviderEntry[];
   /** Display variant. "grid" = label+control side-by-side (used in ConfigTab
    *  Runtime section). "stack" = vertical (used in MissingKeysModal). */
@@ -307,10 +299,9 @@ export function buildProviderCatalog(models: SelectorModel[]): ProviderEntry[] {
  *  Unlike buildProviderCatalog (which RE-INFERS vendor from model-id prefixes
  *  + env via inferVendor/VENDOR_LABELS/BARE_VENDOR_PATTERNS), this trusts the
  *  registry: each model carries its DERIVED `provider` (a registry provider
- *  name) and the dropdown label/billing/auth come from the matching
+ *  name) and the dropdown label/auth come from the matching
  *  `registry_providers` entry. The canvas can render no provider/model the
- *  registry did not serve ("only registered selectable"), and the billing-mode
- *  shown reflects the derived provider rather than a hardcoded rule.
+ *  registry did not serve ("only registered selectable").
  *
  *  A provider with no served model is omitted (no empty buckets). Models whose
  *  `provider` doesn't match a registry_providers entry still get a bucket
@@ -341,7 +332,6 @@ export function buildProviderCatalogFromRegistry(
         envVars: meta?.auth_env ?? [],
         models: [],
         wildcard,
-        billingMode: meta?.billing_mode ?? m.billing_mode,
         tooltip: VENDOR_TOOLTIPS[vendor],
       };
       buckets.set(vendor, entry);

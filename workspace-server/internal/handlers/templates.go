@@ -95,23 +95,13 @@ type modelSpec struct {
 	Name        string   `json:"name,omitempty" yaml:"name"`
 	Provider    string   `json:"provider,omitempty" yaml:"provider"`
 	RequiredEnv []string `json:"required_env,omitempty" yaml:"required_env"`
-	// BillingMode is the billing source the DERIVED provider implies:
-	// "platform_managed" (the closed core-only platform provider; Molecule
-	// owns the upstream key + the bill) or "byok" (any other provider; the
-	// tenant supplies its own key). Set ONLY on registry-served models
-	// (RegistryModels) where DeriveProvider resolved an owning provider;
-	// empty on template-served models. internal#718 P3 — the canvas reads
-	// this to show the billing-mode of the DERIVED provider instead of its
-	// hardcoded billingModeForProvider rule.
-	BillingMode string `json:"billing_mode,omitempty" yaml:"-"`
 }
 
 // registryProviderView is the canvas-facing projection of a single registry
 // Provider entry for a registry-known runtime: the stable name, the dropdown
-// display label, the auth-env-var NAMES (never values), and the billing mode
-// the provider implies. Sourced from the provider registry
-// (internal/providers) so the canvas drops its hardcoded VENDOR_LABELS map
-// and billingModeForProvider rule (internal#718 P3, retire-list #4/#5).
+// display label, and the auth-env-var NAMES (never values). Sourced from the
+// provider registry (internal/providers) so the canvas drops its hardcoded
+// VENDOR_LABELS map (internal#718 P3, retire-list #4).
 type registryProviderView struct {
 	// Name is the registry provider key (e.g. "anthropic-oauth", "platform").
 	Name string `json:"name"`
@@ -120,10 +110,6 @@ type registryProviderView struct {
 	// AuthEnv is the env-var NAMES any one of which satisfies auth for this
 	// provider (registry Provider.AuthEnv). Names only, never secret values.
 	AuthEnv []string `json:"auth_env,omitempty"`
-	// BillingMode is "platform_managed" for the closed platform provider,
-	// "byok" otherwise — keyed off the registry IsPlatform predicate so the
-	// canvas shows the DERIVED provider's billing source.
-	BillingMode string `json:"billing_mode,omitempty"`
 	// Deprecated mirrors the registry's deprecated flag so the canvas can
 	// grey the provider out without breaking saved configs.
 	Deprecated bool `json:"deprecated,omitempty"`

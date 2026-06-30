@@ -15,20 +15,30 @@ It writes down the four hard requirements, audits the current implementation
 against them (two are met today, one partial, one missing), and specifies the
 two gaps to close. The derive-from-model SSOT and the platform proxy boundary are
 **non-goals** here — this RFC is only about closing the credential-validation
-holes around an already-correct billing-mode resolver.
+holes around the provider derivation.
+
+> **Update 2026-06-30:** the per-workspace `llm_billing_mode` field and its
+> resolver (`ResolveLLMBillingModeDerived`) + operator-override column were
+> removed. The platform-vs-BYOK decision is now a pure derivation from the
+> workspace's selected `(runtime, model)` via the provider registry
+> (`providers.DeriveProvider` → `IsPlatform`): a workspace routes to the metered
+> proxy iff its resolved provider is the closed `platform` arm, else it is BYOK.
+> The fail-closed BYOK contract below is unchanged in intent; "mode == BYOK" now
+> reads "resolved provider is a specific vendor (not platform)", and there is no
+> override escape hatch — the model selection alone decides.
 
 ## TL;DR
 
 ```
-create API request (runtime, model[, billing override])
+create API request (runtime, model)
         │
         ▼
-  derive provider/mode from providers.yaml registry SSOT   ── Req1 MET today
-  (explicit operator-override column = escape hatch)
+  derive provider from providers.yaml registry SSOT        ── Req1 MET today
+  (DeriveProvider; no override, no billing-mode flag)
         │
-        ├─ mode == platform_managed ──────────────► create OK (proxy bills)
+        ├─ provider IsPlatform ───────────────────► create OK (proxy bills)
         │
-        └─ mode == BYOK
+        └─ provider is a specific vendor (BYOK)
               │
               ├─ GAP A: credential PRESENT for the derived provider?
               │         (no → 422 MISSING_BYOK_CREDENTIAL, synchronous, loud)
@@ -42,11 +52,11 @@ create API request (runtime, model[, billing override])
 
 ## The model — four hard requirements
 
-1. **Explicit selection drives the adapter.** Provider/mode is *selected*, never
-   guessed. Today the selection is **derived deterministically** from the chosen
-   model via the `providers.yaml` registry SSOT (`DeriveProvider(runtime, model,
-   availableAuthEnv)`); the per-workspace operator-override column is the explicit
-   escape hatch with top precedence. There is no heuristic fallback to a vendor.
+1. **Explicit selection drives the adapter.** The provider is *selected*, never
+   guessed. The selection is **derived deterministically** from the chosen model
+   via the `providers.yaml` registry SSOT (`DeriveProvider(runtime, model,
+   availableAuthEnv)`). There is no heuristic fallback to a vendor and no
+   billing-mode override — the model selection alone decides platform vs BYOK.
 
 2. **BYOK requires the credential, validated AT CREATION, fail-closed.** A
    BYOK workspace with no usable credential for the derived provider must be
@@ -73,11 +83,11 @@ to `workspace-server/`; the proxy/charge layer lives in the controlplane repo.
 
 ### Req1 — Explicit selection drives the adapter — **MET**
 
-- `internal/handlers/llm_billing_mode.go:197-264` — `ResolveLLMBillingModeDerived`:
-  precedence 1 = explicit workspace override column; precedence 2 = derive the
-  provider from `(runtime, model)` via the embedded `providers.yaml` registry
-  (`manifest.DeriveProvider`). A specific non-platform vendor → `byok`; a platform
-  provider → `platform_managed`. No guessing.
+- `internal/handlers/workspace_provision.go` `applyPlatformManagedLLMEnv` +
+  `internal/handlers/provider_derive_helpers.go` — the provider is derived from
+  `(runtime, model)` via the embedded `providers.yaml` registry
+  (`manifest.DeriveProvider`). A specific non-platform vendor → BYOK; the closed
+  `platform` provider → route to the metered proxy. No override, no guessing.
 - `internal/handlers/workspace.go:420-503` — create-time validation already
   hard-rejects (422) an unregistered `(runtime, model)` pair
   (`UNREGISTERED_MODEL_FOR_RUNTIME`) and a model whose derived provider is absent
@@ -87,11 +97,12 @@ to `workspace-server/`; the proxy/charge layer lives in the controlplane repo.
 
 ### Req4 — Fail loud, never silent — **MET**
 
-- Default-closed on ambiguity: `internal/handlers/llm_billing_mode.go:26-39` and
-  `:217-252` — every ambiguous / error / no-id path resolves to
-  `platform_managed` *with the error surfaced* (logged + returned on the
-  resolution struct), never a silent BYOK→platform flip that bills the tenant
-  by surprise.
+- Default-closed on ambiguity: `internal/handlers/workspace_provision.go`
+  `applyPlatformManagedLLMEnv` — an underivable provider (no model / unknown
+  runtime / unregistered / ambiguous / registry-load failure) routes to the
+  platform proxy *only when a proxy is wired* (`PlatformManagedProxyConfigured`),
+  else BYOK on self-host; a derived specific vendor is never silently flipped to
+  platform to bill the tenant by surprise.
 - Proxy is platform-managed-only: controlplane `internal/handlers/llm_proxy.go:94,
   158,223,664-748` — the platform LLM proxy only serves platform-managed traffic;
   BYOK never routes through it.
@@ -102,8 +113,8 @@ to `workspace-server/`; the proxy/charge layer lives in the controlplane repo.
 ### Req2 — Credential validated at creation, fail-closed — **PARTIAL**
 
 - The fail-closed BYOK check EXISTS but only at **provision** time:
-  `internal/handlers/workspace_provision_shared.go:225-232` — if
-  `ResolvedMode == BYOK && !HasUsableLLMCred`, the provisioner aborts with
+  `internal/handlers/workspace_provision_shared.go` — if
+  `!RoutedToPlatform && !HasUsableLLMCred`, the provisioner aborts with
   `MISSING_BYOK_CREDENTIAL` (molecule-core#1994).
 - Gap: a credential-less BYOK **create** returns **201** and only fails later at
   provision. That violates Req2's "rejected at the create API, not
@@ -125,16 +136,16 @@ to `workspace-server/`; the proxy/charge layer lives in the controlplane repo.
 
 Add a synchronous presence check inside the create handler
 (`(h *WorkspaceHandler) Create`, `internal/handlers/workspace.go:242`), after
-billing-mode resolution and the existing registry validation, **in addition to**
+provider derivation and the existing registry validation, **in addition to**
 the provision-time check (keep that as defense-in-depth — do not remove it).
 
-- When the resolved mode is `byok`, resolve the derived provider's accepted auth
-  env-var names from the `providers.yaml` registry (`auth_env` list, e.g.
+- When the derived provider is a specific vendor (BYOK), resolve its accepted
+  auth env-var names from the `providers.yaml` registry (`auth_env` list, e.g.
   `[ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN]` for `anthropic-api`) and confirm at
   least one is present (non-empty) for the workspace at any in-scope secret level.
 - On absence: **422** with a structured body:
   `code: MISSING_BYOK_CREDENTIAL`, plus `provider`, `missing_env` (the candidate
-  env-var names), `billing_mode: byok`, and a human `error` that names the
+  env-var names), `routing: byok`, and a human `error` that names the
   provider, the missing credential, and the remediation ("set
   `ANTHROPIC_API_KEY` as a workspace or org secret, then retry create"). Reuse the
   existing `formatMissingBYOKCredentialError` wording where possible so create and
@@ -171,8 +182,8 @@ Add a minimal authenticated probe per provider, driven entirely by the
 ## Non-goals
 
 - **Not** changing the derive-from-model SSOT. Selection stays
-  `providers.yaml` → `DeriveProvider`; the operator-override column stays the only
-  escape hatch. No new heuristics.
+  `providers.yaml` → `DeriveProvider`. There is no override column and no
+  billing-mode flag. No new heuristics.
 - **Not** routing BYOK through the platform proxy. The proxy stays
   platform-managed-only; this RFC adds validation around BYOK, it does not move
   BYOK onto a platform code path.

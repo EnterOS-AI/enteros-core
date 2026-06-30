@@ -1209,21 +1209,19 @@ func effectiveModelForBilling(model string, envVars map[string]string) string {
 }
 
 // applyPlatformManagedLLMEnv wires the control-plane LLM proxy into a
-// workspace only when the RESOLVED billing mode for this workspace is
-// platform_managed. "Resolved" is PER-WORKSPACE only: the workspace-level
-// override (if any) wins, else the mode is DERIVED from the workspace's
-// selected model/provider (platform-namespaced → platform_managed; a specific
-// vendor → byok). There is NO org-level billing mode (retired 2026-06-12); the
-// SSOT resolver (ResolveLLMBillingModeDerived) never reads any org input.
+// workspace only when its resolved provider routes to the platform. The
+// platform-vs-BYOK decision is PER-WORKSPACE and flag-free: it DERIVES the
+// provider from the workspace's selected (runtime, model) via the provider
+// registry (providers.DeriveProvider) and routes to the proxy iff that provider
+// is the closed `platform` arm (IsPlatform). A specific vendor provider is BYOK
+// (direct vendor key). There is NO stored billing-mode signal anywhere — the
+// per-workspace llm_billing_mode field and its resolver were removed
+// (2026-06-30); the decision is a pure function of the selection.
 //
-// Default-closed: any resolver error / garbled enum / underivable model
-// collapses to the deployment default (platform_managed when a proxy is wired,
-// byok on self-host — see llm_billing_mode.go).
-//
-// The resolved mode is exported into the workspace container as
-// MOLECULE_LLM_BILLING_MODE_RESOLVED so an in-container debug check can
-// answer "what mode is this workspace running under" without DB queries
-// (RFC Observability hot-spot).
+// Default-closed: an underivable provider (no model / unknown runtime /
+// unregistered / ambiguous / registry-load failure) collapses to the deployment
+// default — platform when a proxy is wired (PlatformManagedProxyConfigured),
+// byok on self-host — see provider_derive_helpers.go.
 //
 // molecule-core#1994 (credential-handling follow-on, CTO-confirmed model).
 // `global_secrets` is the TENANT's own secret store, shared across all of
@@ -1253,22 +1251,19 @@ func effectiveModelForBilling(model string, envVars map[string]string) string {
 // aborted with a clear MISSING_BYOK_CREDENTIAL error at provision time rather
 // than started credential-less.
 // platformLLMEnvResult is the structured outcome of applyPlatformManagedLLMEnv.
-// ResolvedMode is the per-workspace billing/provider mode the resolver
-// landed on. HasUsableLLMCred reports whether the workspace has at least one
-// platform-managed-shaped LLM credential key in its env — the tenant's own,
-// at global or workspace scope. Only the non-platform (byok) path consults
-// HasUsableLLMCred for the fail-closed decision; the platform_managed path
-// always returns true (it forces the CP proxy usage token, which IS the
-// usable credential).
+// RoutedToPlatform reports whether the workspace was wired to the metered CP
+// proxy: true iff the workspace's resolved provider is the closed `platform`
+// arm (providers.DeriveProvider → IsPlatform), OR a provider could not be
+// derived AND a CP proxy is wired (default-closed to platform on SaaS; BYOK on
+// self-host). True ⇒ the workspace bills on provider==platform via the proxy;
+// false ⇒ BYOK (direct vendor key, no platform billing). HasUsableLLMCred
+// reports whether the workspace has at least one usable LLM credential: on the
+// BYOK path the tenant's own provider-matching key (global or workspace scope);
+// on the platform path the injected CP proxy usage token (which is always
+// present once the proxy env is wired — false signals a proxy-env-absent abort).
 type platformLLMEnvResult struct {
-	ResolvedMode     string
+	RoutedToPlatform bool
 	HasUsableLLMCred bool
-	// Source records which layer decided the mode (internal#718 P2-B + core#2608):
-	// workspace_override, org_default, derived_provider (registry derivation),
-	// derived_default (derive failed → platform default), or constant_fallback
-	// (DB error). Surfaced for observability + asserted by the behavior-delta
-	// tests so a regression of "derived, not stored" flips red.
-	Source BillingModeSource
 }
 
 // globalKeys is the provenance side-channel from loadWorkspaceSecrets: the set
@@ -1285,68 +1280,85 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// internal#718 P2-B: the platform-vs-byok decision now DERIVES the provider
 	// from (runtime, model) via the registry and keys off IsPlatform(derived) —
 	// NOT a stored LLM_PROVIDER and NOT the org rung. This path already carries
-	// runtime + model + the workspace env, so it calls the DERIVED resolver
-	// directly (no DB round-trip for runtime/model). availableAuthEnv is the set
-	// of recognized provider auth-env-var NAMES present in envVars (the same
+	// runtime + model + the workspace env, so it derives the provider directly
+	// (no DB round-trip for runtime/model). availableAuthEnv is the set of
+	// recognized provider auth-env-var NAMES present in envVars (the same
 	// disambiguation input the registry uses to split oauth-vs-api). There is NO
-	// org-level billing mode input: the org-env MOLECULE_LLM_BILLING_MODE was
-	// fully retired (CTO 2026-06-12 — billing is per-workspace only).
+	// stored billing-mode input — the decision is a pure function of the
+	// selection (CTO 2026-06-12 — billing is per-workspace, derived).
 	availableAuthEnv := availableAuthEnvNames(envVars)
-	// molecule-core#1994: derive billing mode from the EFFECTIVE model, not the
+	// molecule-core#1994: derive the provider from the EFFECTIVE model, not the
 	// raw payload.Model. On a re-provision (restart/resume/auto-restart) the
 	// payload is rebuilt from the DB with Name+Tier+Runtime only — payload.Model
 	// is "" (workspace_restart.go via withStoredCompute, which backfills Compute
-	// but NOT Model). With an empty model DeriveProvider errors → the resolver
-	// defaults closed to platform_managed and bakes the CP proxy, DIVERGING from
-	// the read endpoint (which reads the stored MODEL workspace_secret and derives
-	// byok). The stored model already lives in the merged envVars (loaded by
-	// loadWorkspaceSecrets); resolve it with the SAME fallback chain
+	// but NOT Model). With an empty model DeriveProvider errors → we default-closed
+	// to platform when a proxy is wired, DIVERGING from a key'd workspace; the
+	// stored model already lives in the merged envVars (loaded by
+	// loadWorkspaceSecrets), so resolve it with the SAME fallback chain
 	// applyRuntimeModelEnv uses so the provision-path derive inputs match the
-	// read-path's — keeping the two resolvers in parity (the #1994 regression
-	// guard test asserts this).
+	// read-path's (the #1994 regression guard test asserts this).
 	effectiveModel := effectiveModelForBilling(model, envVars)
-	res, resolveErr := ResolveLLMBillingModeDerived(ctx, workspaceID, runtime, effectiveModel, availableAuthEnv)
-	if resolveErr != nil {
-		// resolveErr != nil ⇒ resolver hit a DB error AND already defaulted
-		// res.ResolvedMode to platform_managed. Log + proceed; the safe default
-		// is already in place, no early return needed.
-		log.Printf("workspace_provision: resolve billing mode workspace=%s err=%v (defaulting to platform_managed)", workspaceID, resolveErr)
-	}
-	log.Printf("workspace_provision: billing mode workspace=%s resolved=%s source=%s derived_provider=%s", workspaceID, res.ResolvedMode, res.Source, derefOrEmpty(res.ProviderSelection))
-	// internal#703: MOLECULE_LLM_BILLING_MODE in the container must reflect the
-	// RESOLVED per-workspace mode, not a hardcoded literal. Pre-fix this var was
-	// only emitted (hardcoded "platform_managed") on the strip path below, so a
-	// byok/disabled container never carried a truthful billing-mode value — only
-	// MOLECULE_LLM_BILLING_MODE_RESOLVED. Emit both here, resolver-driven, for
-	// every mode so the value is correct on the byok/disabled early-return path
-	// too (and downstream consumers / debug shells see byok, not platform_managed).
-	envVars["MOLECULE_LLM_BILLING_MODE"] = res.ResolvedMode
-	// Observability: surface the resolved mode in the container env so the
-	// agent / debug shell can answer "why is my key being stripped" without
-	// pulling logs or hitting the admin route.
-	envVars["MOLECULE_LLM_BILLING_MODE_RESOLVED"] = res.ResolvedMode
-	if res.ResolvedMode != LLMBillingModePlatformManaged {
-		// byok or disabled — DO NOT force-route to CP, DO NOT override the
-		// workspace's own ANTHROPIC_BASE_URL, and DO NOT strip the tenant's own
-		// (provider-matching) LLM credentials.
-		//
-		// RC 12082: derive the resolved BYOK provider NOW so the presence check
-		// below (hasAnyPlatformManagedLLMKey) can be provider-AWARE. Without
-		// this, a stray key (e.g. OPENAI_API_KEY in a claude-code+anthropic
-		// workspace) would satisfy the global bypass set even though the
-		// resolved provider (anthropic-api) would never authenticate with it.
-		var byokResolvedProvider providers.Provider
-		if manifest, mErr := providerRegistry(); mErr == nil && manifest != nil {
-			providerName := derefOrEmpty(res.ProviderSelection)
-			if providerName == "" {
-				if p, dErr := manifest.DeriveProvider(runtime, effectiveModel, availableAuthEnv); dErr == nil {
-					providerName = p.Name
-				}
-			}
-			if p, ok := providerFromRegistry(providerName); ok {
-				byokResolvedProvider = p
-			}
+
+	// The platform-vs-BYOK decision DERIVES the provider from (runtime, model)
+	// via the registry and keys off IsPlatform(derived) — there is NO stored
+	// billing-mode signal (the per-workspace llm_billing_mode field was removed
+	// 2026-06-30). Route to the metered CP proxy iff the resolved provider is the
+	// closed `platform` arm, OR a provider cannot be derived (no model / unknown
+	// runtime / unregistered / ambiguous / registry-load failure) AND a proxy is
+	// wired (default-closed to platform on SaaS; BYOK on self-host where
+	// PlatformManagedProxyConfigured() == false).
+	var derivedProvider providers.Provider
+	routeToPlatform := false
+	resolvedProviderName := ""
+	if manifest, mErr := providerRegistry(); mErr == nil && manifest != nil {
+		if p, dErr := manifest.DeriveProvider(runtime, effectiveModel, availableAuthEnv); dErr == nil {
+			derivedProvider = p
+			routeToPlatform = p.IsPlatform()
+			// availableAuthEnv is honored by DeriveProvider, so e.g. a gpt-*
+			// model with CODEX_AUTH_JSON present resolves to openai-subscription
+			// (the OAuth arm), NOT openai-api — the resolved arm name we publish.
+			resolvedProviderName = p.Name
+		} else {
+			// Underivable provider → default-closed to platform iff a proxy is wired.
+			routeToPlatform = PlatformManagedProxyConfigured()
 		}
+	} else {
+		// Registry unavailable → default-closed to platform iff a proxy is wired.
+		routeToPlatform = PlatformManagedProxyConfigured()
+	}
+
+	// SSOT emitter (internal#718): publish the resolved provider as the single
+	// MOLECULE_RESOLVED_PROVIDER signal for EVERY workspace — this set is reached
+	// before the platform/byok branch split, so it is published on BOTH paths.
+	// The value is the registry arm name (lowercase, e.g. platform,
+	// openai-subscription, minimax). Downstream layers (CP local_docker_workspace,
+	// template adapters) READ this and never re-derive. The deleted
+	// llm_billing_mode field and the LLM_PROVIDER=platform force-pin are replaced
+	// by this one published value. When the provider is underivable but a proxy is
+	// wired we default-closed to platform above, so publish "platform" to match
+	// RoutedToPlatform=true on that fallback; underivable + no proxy (self-host
+	// byok) has no resolved arm name → leave the var unset for back-compat fallback.
+	if resolvedProviderName == "" && routeToPlatform {
+		resolvedProviderName = providers.PlatformProviderName
+	}
+	if resolvedProviderName != "" {
+		envVars["MOLECULE_RESOLVED_PROVIDER"] = resolvedProviderName
+	}
+
+	log.Printf("workspace_provision: llm routing workspace=%s provider=%q resolved=%q route_to_platform=%t", workspaceID, derivedProvider.Name, resolvedProviderName, routeToPlatform)
+
+	if !routeToPlatform {
+		// BYOK — DO NOT force-route to CP, DO NOT override the workspace's own
+		// ANTHROPIC_BASE_URL, and DO NOT strip the tenant's own (provider-
+		// matching) LLM credentials.
+		//
+		// RC 12082: the resolved BYOK provider (derivedProvider, possibly the
+		// zero value when derivation failed on self-host) makes the presence check
+		// below (hasAnyPlatformManagedLLMKey) provider-AWARE. Without it, a stray
+		// key (e.g. OPENAI_API_KEY in a claude-code+anthropic workspace) would
+		// satisfy the global bypass set even though the resolved provider
+		// (anthropic-api) would never authenticate with it.
+		byokResolvedProvider := derivedProvider
 
 		// molecule-core#1994 (corrected model): `global_secrets` is the
 		// workspace's own ANTHROPIC_BASE_URL, and DO NOT strip the tenant's own
@@ -1392,21 +1404,21 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		// MINIMAX_API_KEY but no Anthropic-shaped creds, so the adapter 401s after
 		// restart. Project the provider's preferred auth token env and Anthropic
 		// base URL from the workspace's available provider credential.
-		if res.ResolvedMode == LLMBillingModeBYOK && runtimeUsesAnthropicNativeProxy(runtime) {
-			providerName := derefOrEmpty(res.ProviderSelection)
-			// core#2712: a per-workspace billing-mode override (source=workspace_override)
-			// short-circuits ResolveLLMBillingModeDerived before it sets ProviderSelection,
-			// but the Anthropic-adapter projection still needs to know WHICH BYOK
-			// provider the workspace is running so it can map MINIMAX_API_KEY (etc.)
-			// to ANTHROPIC_AUTH_TOKEN. Derive it from the effective model when missing.
-			if providerName == "" && effectiveModel != "" {
+		if runtimeUsesAnthropicNativeProxy(runtime) {
+			// The Anthropic-adapter projection needs to know WHICH BYOK provider
+			// the workspace is running so it can map MINIMAX_API_KEY (etc.) to
+			// ANTHROPIC_AUTH_TOKEN. byokResolvedProvider is the derived provider;
+			// fall back to a fresh derive from the effective model when it is the
+			// zero value (derivation failed on self-host).
+			provider := byokResolvedProvider
+			if provider.Name == "" && effectiveModel != "" {
 				if manifest, mErr := providerRegistry(); mErr == nil && manifest != nil {
 					if p, dErr := manifest.DeriveProvider(runtime, effectiveModel, availableAuthEnv); dErr == nil {
-						providerName = p.Name
+						provider = p
 					}
 				}
 			}
-			if provider, ok := providerFromRegistry(providerName); ok && provider.AuthTokenEnv != "" {
+			if provider.AuthTokenEnv != "" {
 				if _, hasToken := envVars[provider.AuthTokenEnv]; !hasToken {
 					for _, authEnv := range provider.AuthEnv {
 						if v := strings.TrimSpace(envVars[authEnv]); v != "" {
@@ -1435,9 +1447,8 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		}
 
 		return platformLLMEnvResult{
-			ResolvedMode:     res.ResolvedMode,
+			RoutedToPlatform: false,
 			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(byokResolvedProvider, envVars),
-			Source:           res.Source,
 		}
 	}
 	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")
@@ -1450,12 +1461,10 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		// credential-less — the adk-demo dark-wedge class (#2162).
 		// Return false so the caller's fail-closed branch aborts with
 		// MISSING_PLATFORM_PROXY.
-		return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: false, Source: res.Source}
+		return platformLLMEnvResult{RoutedToPlatform: true, HasUsableLLMCred: false}
 	}
 	stripPlatformManagedLLMBypassEnv(envVars)
 
-	// MOLECULE_LLM_BILLING_MODE is already set to res.ResolvedMode (==
-	// platform_managed on this path) above (internal#703); no hardcode here.
 	envVars["MOLECULE_LLM_BASE_URL"] = baseURL
 	envVars["MOLECULE_LLM_USAGE_TOKEN"] = token
 	if anthropicBaseURL != "" {
@@ -1475,8 +1484,8 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		// expects ANTHROPIC_AUTH_TOKEN, while the platform proxy surface expects
 		// ANTHROPIC_API_KEY.
 		anthropicTokenEnv := "ANTHROPIC_API_KEY"
-		if provider, ok := providerFromRegistry(derefOrEmpty(res.ProviderSelection)); ok && provider.AuthTokenEnv != "" {
-			anthropicTokenEnv = provider.AuthTokenEnv
+		if derivedProvider.AuthTokenEnv != "" {
+			anthropicTokenEnv = derivedProvider.AuthTokenEnv
 		}
 		envVars[anthropicTokenEnv] = token
 		envVars["ANTHROPIC_BASE_URL"] = anthropicBaseURL
@@ -1501,11 +1510,11 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// universal MISSING_MODEL gate in prepareProvisionContext rather than letting
 	// the runtime pick its hardcoded anthropic:claude-opus-4-7 fallback.
 	//
-	// platform_managed: the CP proxy usage token (injected as ANTHROPIC_API_KEY
+	// platform path: the CP proxy usage token (injected as ANTHROPIC_API_KEY
 	// / OPENAI_API_KEY above) IS the usable credential, so the workspace is
 	// never fail-closed on the CREDENTIAL axis on this path; the model axis is
 	// gated separately below.
-	return platformLLMEnvResult{ResolvedMode: res.ResolvedMode, HasUsableLLMCred: true, Source: res.Source}
+	return platformLLMEnvResult{RoutedToPlatform: true, HasUsableLLMCred: true}
 }
 
 func stripPlatformManagedLLMBypassEnv(envVars map[string]string) {

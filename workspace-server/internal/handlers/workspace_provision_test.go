@@ -1715,9 +1715,11 @@ func TestProvisionWorkspaceCP_NoInternalErrorsInBroadcast(t *testing.T) {
 		Name:    "ws-cp-1206",
 		Tier:    1,
 		Runtime: "claude-code",
-		// core#2594: a model is required — the provision gate fails closed
-		// without one. This test exercises a downstream path, so just supply one.
-		Model: "anthropic:claude-opus-4-7",
+		// core#2594: a model is required — the provision gate fails closed without
+		// one. The slash form derives the platform provider so the workspace
+		// routes platform (proxy env set) and reaches the downstream path this
+		// test exercises (the colon form would derive BYOK and abort).
+		Model: "anthropic/claude-opus-4-7",
 	})
 
 	if cap.lastData == nil {
@@ -1931,9 +1933,11 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 		Name:    "ws-cp-orphan",
 		Tier:    1,
 		Runtime: "claude-code",
-		// core#2594: a model is required — the provision gate fails closed
-		// without one. This test exercises a downstream path, so just supply one.
-		Model: "anthropic:claude-opus-4-7",
+		// core#2594: a model is required — the provision gate fails closed without
+		// one. The slash form derives the platform provider so the workspace
+		// routes platform (proxy env set) and reaches the downstream path this
+		// test exercises (the colon form would derive BYOK and abort).
+		Model: "anthropic/claude-opus-4-7",
 	})
 
 	if cap.lastData == nil {
@@ -2013,9 +2017,11 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_RetrySucceeds(t *testing.T) 
 		Name:    "ws-cp-retry-ok",
 		Tier:    1,
 		Runtime: "claude-code",
-		// core#2594: a model is required — the provision gate fails closed
-		// without one. This test exercises a downstream path, so just supply one.
-		Model: "anthropic:claude-opus-4-7",
+		// core#2594: a model is required — the provision gate fails closed without
+		// one. The slash form derives the platform provider so the workspace
+		// routes platform (proxy env set) and reaches the downstream path this
+		// test exercises (the colon form would derive BYOK and abort).
+		Model: "anthropic/claude-opus-4-7",
 	})
 
 	// No failure broadcast should have fired.

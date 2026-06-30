@@ -487,8 +487,8 @@ func tenantCreateWorkspaceWithRuntime(t *testing.T, cfg stagingCfg, host, token,
 	t.Helper()
 	url := "https://" + host + "/workspaces"
 	body := fmt.Sprintf(
-		`{"name":%q,"runtime":%q,"tier":%d,"model":%q,"billing_mode":%q,"provider":%q}`,
-		name, runtime, 1, model, "platform_managed", "platform",
+		`{"name":%q,"runtime":%q,"tier":%d,"model":%q,"provider":%q}`,
+		name, runtime, 1, model, "platform",
 	)
 	status, resp := doTenantJSON(t, "POST", url, token, orgID, body)
 	if status != http.StatusCreated && status != http.StatusOK {

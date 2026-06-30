@@ -83,15 +83,11 @@ func formatMissingEnvError(missing []string) string {
 // workspace — resolving to them would bill the platform's Anthropic credits —
 // so the provision fails closed here rather than starting the workspace on
 // stripped/absent creds. Rendered verbatim in the canvas Events tab.
-func formatMissingBYOKCredentialError(mode string) string {
-	return fmt.Sprintf(
-		"this workspace's LLM billing mode is %q (not platform-managed) but it has no LLM credential of its own. "+
-			"Add a workspace-scoped credential (e.g. CLAUDE_CODE_OAUTH_TOKEN or your provider's API key) under "+
-			"Config → Secrets, or switch the workspace to platform-managed billing via "+
-			"/admin/workspaces/:id/llm-billing-mode, then retry. The platform's shared LLM credentials are not "+
-			"used for non-platform workspaces.",
-		mode,
-	)
+func formatMissingBYOKCredentialError() string {
+	return "this workspace selected a BYOK provider (its own vendor key) but has no LLM credential of its own. " +
+		"Add a workspace-scoped credential (e.g. CLAUDE_CODE_OAUTH_TOKEN or your provider's API key) under " +
+		"Config → Secrets, or select a platform-managed model under Config → Model, then retry. The platform's " +
+		"shared LLM credentials are not used for non-platform workspaces."
 }
 
 // formatMissingPlatformProxyError builds the user-facing message for a
@@ -112,12 +108,9 @@ func formatMissingPlatformProxyError() string {
 // substitutes a default model (the MOLECULE_LLM_DEFAULT_MODEL env fail-open was
 // removed); a model is required input. Rather than letting the runtime fall back
 // to its hardcoded anthropic:claude-opus-4-7, the provision fails closed here.
-func formatMissingModelError(mode string) string {
-	return fmt.Sprintf(
-		"this workspace (LLM billing mode %q) reached provisioning with no model set. "+
-			"The platform does not pick a default model — choose one under Config → Model "+
-			"(or set the MODEL workspace secret) and retry. Provisioning is refused rather "+
-			"than silently running an arbitrary model.",
-		mode,
-	)
+func formatMissingModelError() string {
+	return "this workspace reached provisioning with no model set. " +
+		"The platform does not pick a default model — choose one under Config → Model " +
+		"(or set the MODEL workspace secret) and retry. Provisioning is refused rather " +
+		"than silently running an arbitrary model."
 }

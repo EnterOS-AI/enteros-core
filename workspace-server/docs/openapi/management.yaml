@@ -82,7 +82,7 @@ tags:
   - name: cp-provision
     description: "[CP] Workspace EC2 provisioning (provision shared-secret)."
   - name: tenant-workspaces
-    description: "[Tenant] Workspace lifecycle + secrets + budget + billing-mode."
+    description: "[Tenant] Workspace lifecycle + secrets + budget."
   - name: tenant-org
     description: "[Tenant] Org import, templates, Org API Key (org-token) management."
   - name: tenant-secrets
@@ -549,25 +549,6 @@ components:
           minimum: 0
           description: "Legacy single-monthly limit (USD cents, >=0); null clears it."
 
-    BillingModeResponse:
-      type: object
-      properties:
-        mode: { type: string, enum: [platform_managed, byok, disabled] }
-        effective_mode: { type: string }
-        source: { type: string, description: "workspace | org | default" }
-      additionalProperties: true
-
-    PutBillingModeRequest:
-      type: object
-      description: |
-        {"mode":"byok"} sets the override; {"mode":null} clears it; {} is a 400
-        (caller must be explicit).
-      properties:
-        mode:
-          type: [string, "null"]
-          enum: [platform_managed, byok, disabled, null]
-      required: [mode]
-
     # ---- Tenant: secrets ----
     SecretSummary:
       type: object
@@ -583,8 +564,9 @@ components:
       type: object
       description: |
         Upserts AES-256-GCM, emits secret.set audit, auto-restarts the
-        workspace. platform-managed billing strips vendor-LLM keys unless
-        billing-mode is byok; GIT_HTTP_* are never stripped.
+        workspace. A platform-routed workspace (its selected model derives to the
+        closed `platform` provider) strips vendor-LLM keys; a BYOK workspace (a
+        specific vendor model) keeps its own keys. GIT_HTTP_* are never stripped.
       properties:
         key: { type: string }
         value: { type: string }
@@ -1173,91 +1155,6 @@ paths:
               schema: { type: array, items: { type: object, additionalProperties: true } }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
-  /api/v1/admin/workspaces/{id}/llm-billing-mode:
-    parameters: [{ $ref: "#/components/parameters/WorkspaceId" }]
-    get:
-      tags: [cp-admin]
-      summary: Get a workspace LLM billing mode (CP-admin proxy)
-      description: |
-        CP-side operator proxy to the per-tenant
-        /admin/workspaces/:id/llm-billing-mode. **Requires `?org_slug=`** — CP
-        has no workspace_id→org_id index, so the slug tells CP which tenant to
-        dispatch to (controlplane internal/handlers/admin_workspace_billing_mode.go).
-      operationId: adminGetWorkspaceBillingMode
-      security: [{ cpAdminBearer: [] }]
-      parameters:
-        - name: org_slug
-          in: query
-          required: true
-          description: Org slug — resolves which tenant CP proxies to.
-          schema: { type: string, pattern: "^[a-z][a-z0-9-]{2,31}$" }
-      responses:
-        "200":
-          description: OK.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/BillingModeResponse" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404":
-          description: Slug doesn't resolve to an org.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-        "502":
-          description: Per-tenant call failed (auth/network/parse).
-          content:
-            application/json:
-              schema: { type: object, additionalProperties: true }
-        "503":
-          description: Billing-mode client unwired on this CP (dev / no Secrets).
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-    put:
-      tags: [cp-admin]
-      summary: Set/clear a workspace LLM billing mode (CP-admin proxy)
-      description: |
-        CP-side operator proxy. **Requires `?org_slug=`.** Body
-        {"mode": "byok"|"platform_managed"|"disabled"|null}; mode is validated
-        against the credits enum BEFORE the per-tenant call.
-      operationId: adminPutWorkspaceBillingMode
-      security: [{ cpAdminBearer: [] }]
-      parameters:
-        - name: org_slug
-          in: query
-          required: true
-          description: Org slug — resolves which tenant CP proxies to.
-          schema: { type: string, pattern: "^[a-z][a-z0-9-]{2,31}$" }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/PutBillingModeRequest" }
-      responses:
-        "200":
-          description: Updated.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/BillingModeResponse" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404":
-          description: Slug doesn't resolve to an org.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-        "502":
-          description: Per-tenant call failed (auth/network/parse).
-          content:
-            application/json:
-              schema: { type: object, additionalProperties: true }
-        "503":
-          description: Billing-mode client unwired on this CP (dev / no Secrets).
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-
   # ------------------------------------------------------------- CP: PROVISION
   /api/v1/workspaces/provision:
     post:
@@ -1544,52 +1441,6 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
-  /admin/workspaces/{id}/llm-billing-mode:
-    parameters: [{ $ref: "#/components/parameters/WorkspaceId" }]
-    get:
-      tags: [tenant-workspaces]
-      summary: Get workspace LLM billing mode
-      operationId: tenantGetBillingMode
-      security:
-        - orgApiKey: []
-          orgRoutingHeaderId: []
-      parameters:
-        - { $ref: "#/components/parameters/OrgIdHeader" }
-        - { $ref: "#/components/parameters/OrgSlugHeader" }
-      responses:
-        "200":
-          description: OK.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/BillingModeResponse" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-    put:
-      tags: [tenant-workspaces]
-      summary: Set/clear workspace LLM billing mode (tenant-admin)
-      description: '{"mode":"byok"} sets override; {"mode":null} clears; {} → 400.'
-      operationId: tenantPutBillingMode
-      security:
-        - orgApiKey: []
-          orgRoutingHeaderId: []
-      parameters:
-        - { $ref: "#/components/parameters/OrgIdHeader" }
-        - { $ref: "#/components/parameters/OrgSlugHeader" }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/PutBillingModeRequest" }
-      responses:
-        "200":
-          description: Updated.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/BillingModeResponse" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
-
   # ------------------------------------------------------ TENANT: WS SECRETS
   /workspaces/{id}/secrets:
     parameters: [{ $ref: "#/components/parameters/WorkspaceId" }]
@@ -1617,8 +1468,9 @@ paths:
       summary: Set a workspace secret (auto-restarts the workspace)
       description: |
         THE secret/env lever. Upserts AES-256-GCM, emits secret.set audit,
-        auto-restarts the workspace. platform-managed billing strips vendor-LLM
-        keys unless billing-mode=byok; GIT_HTTP_* never stripped.
+        auto-restarts the workspace. A platform-routed workspace (model derives
+        to the closed `platform` provider) strips vendor-LLM keys; a BYOK
+        workspace keeps its own keys. GIT_HTTP_* never stripped.
       operationId: tenantSetWorkspaceSecret
       security:
         - orgApiKey: []
