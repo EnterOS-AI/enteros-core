@@ -1309,10 +1309,15 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	// PlatformManagedProxyConfigured() == false).
 	var derivedProvider providers.Provider
 	routeToPlatform := false
+	resolvedProviderName := ""
 	if manifest, mErr := providerRegistry(); mErr == nil && manifest != nil {
 		if p, dErr := manifest.DeriveProvider(runtime, effectiveModel, availableAuthEnv); dErr == nil {
 			derivedProvider = p
 			routeToPlatform = p.IsPlatform()
+			// availableAuthEnv is honored by DeriveProvider, so e.g. a gpt-*
+			// model with CODEX_AUTH_JSON present resolves to openai-subscription
+			// (the OAuth arm), NOT openai-api — the resolved arm name we publish.
+			resolvedProviderName = p.Name
 		} else {
 			// Underivable provider → default-closed to platform iff a proxy is wired.
 			routeToPlatform = PlatformManagedProxyConfigured()
@@ -1321,7 +1326,26 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		// Registry unavailable → default-closed to platform iff a proxy is wired.
 		routeToPlatform = PlatformManagedProxyConfigured()
 	}
-	log.Printf("workspace_provision: llm routing workspace=%s provider=%q route_to_platform=%t", workspaceID, derivedProvider.Name, routeToPlatform)
+
+	// SSOT emitter (internal#718): publish the resolved provider as the single
+	// MOLECULE_RESOLVED_PROVIDER signal for EVERY workspace — this set is reached
+	// before the platform/byok branch split, so it is published on BOTH paths.
+	// The value is the registry arm name (lowercase, e.g. platform,
+	// openai-subscription, minimax). Downstream layers (CP local_docker_workspace,
+	// template adapters) READ this and never re-derive. The deleted
+	// llm_billing_mode field and the LLM_PROVIDER=platform force-pin are replaced
+	// by this one published value. When the provider is underivable but a proxy is
+	// wired we default-closed to platform above, so publish "platform" to match
+	// RoutedToPlatform=true on that fallback; underivable + no proxy (self-host
+	// byok) has no resolved arm name → leave the var unset for back-compat fallback.
+	if resolvedProviderName == "" && routeToPlatform {
+		resolvedProviderName = providers.PlatformProviderName
+	}
+	if resolvedProviderName != "" {
+		envVars["MOLECULE_RESOLVED_PROVIDER"] = resolvedProviderName
+	}
+
+	log.Printf("workspace_provision: llm routing workspace=%s provider=%q resolved=%q route_to_platform=%t", workspaceID, derivedProvider.Name, resolvedProviderName, routeToPlatform)
 
 	if !routeToPlatform {
 		// BYOK — DO NOT force-route to CP, DO NOT override the workspace's own
