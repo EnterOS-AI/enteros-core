@@ -31,19 +31,35 @@ name: contract-ssot-sync
 # readable over the raw endpoint without a token; the gate runs on EVERY context
 # (incl. fork PRs) and is FAIL-CLOSED on a fetch error (non-200 / network) and
 # on canonical drift.
+#
+# WORKSPACE-COMMS SIBLING: this workflow now ALSO runs
+# check-workspace-comms-ssot-sync.sh, which keeps the VENDORED workspace-comms
+# schema copies (workspace-server/internal/models/testdata/workspace-comms/)
+# honest against the molecule-contracts SSOT. Those vendored copies are what the
+# Go PRODUCER gate (workspace-server/internal/models/workspace_comms_ssot_test.go)
+# embeds to assert workspace.go's wire structs (RegisterPayload / HeartbeatPayload
+# / RuntimeMetadata) don't silently drift the contract. Same trust model (public,
+# unauthenticated, fail-closed). The two halves together close the producer loop:
+# Go gate = struct <-> vendored schema; this check = vendored schema <-> SSOT.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
       - 'contracts/mcp-plugin-delivery.contract.json'
+      - 'workspace-server/internal/models/workspace.go'
+      - 'workspace-server/internal/models/testdata/workspace-comms/**'
       - '.gitea/scripts/check-contract-ssot-sync.sh'
+      - '.gitea/scripts/check-workspace-comms-ssot-sync.sh'
       - '.gitea/workflows/contract-ssot-sync.yml'
   push:
     branches: [main]
     paths:
       - 'contracts/mcp-plugin-delivery.contract.json'
+      - 'workspace-server/internal/models/workspace.go'
+      - 'workspace-server/internal/models/testdata/workspace-comms/**'
       - '.gitea/scripts/check-contract-ssot-sync.sh'
+      - '.gitea/scripts/check-workspace-comms-ssot-sync.sh'
       - '.gitea/workflows/contract-ssot-sync.yml'
   workflow_dispatch:
 
@@ -66,3 +82,10 @@ jobs:
 
       - name: Verify mirror == molecule-contracts SSOT (unauthenticated, fail-closed)
         run: bash .gitea/scripts/check-contract-ssot-sync.sh
+
+      # workspace-comms sibling: keep the VENDORED schema copies that the Go
+      # producer gate (workspace_comms_ssot_test.go) embeds in lockstep with the
+      # molecule-contracts SSOT. Same trust model (public, unauthenticated,
+      # fail-closed on fetch error / canonical drift).
+      - name: Verify vendored workspace-comms schemas == molecule-contracts SSOT
+        run: bash .gitea/scripts/check-workspace-comms-ssot-sync.sh
