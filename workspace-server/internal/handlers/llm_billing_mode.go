@@ -68,16 +68,11 @@ var providerRegistry = func() (*providers.Manifest, error) {
 	return providerRegistryManifest, providerRegistryErr
 }
 
-// Constants mirror molecule-controlplane/internal/credits/llm_billing.go.
-// Kept as string literals (not imports) because workspace-server has no
-// build-time dependency on the CP module; the values are stable wire
-// strings used in the tenant_config response, the workspaces.llm_billing_mode
-// column check constraint, and the CP route bodies.
-const (
-	LLMBillingModePlatformManaged = "platform_managed"
-	LLMBillingModeBYOK            = "byok"
-	LLMBillingModeDisabled        = "disabled"
-)
+// The LLM billing-mode wire constants (LLMBillingModePlatformManaged / BYOK /
+// Disabled) are now imported from the shared SSOT module
+// go.moleculesai.app/sdk/llmwire and re-exported in llm_wire_sdk.go, so this
+// package and molecule-controlplane no longer keep two hand-synced copies of the
+// same wire strings. See that file for the seam.
 
 // BillingModeSource describes which layer of the resolution stack supplied
 // the final mode. Surfaced via the admin route for operator debug

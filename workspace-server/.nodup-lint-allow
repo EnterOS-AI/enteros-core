@@ -1,0 +1,6 @@
+# Sanctioned per-repo seams exempt from nodup-lint symbol/fingerprint checks.
+# These are thin RE-EXPORT shims: they alias the SDK's SSOT constants (the value
+# is an import selector like `llmwire.X`, never a re-pasted string literal), so
+# the value cannot drift from go.moleculesai.app/sdk. The linter already lets
+# selector-valued aliases pass; this file documents the seam explicitly.
+internal/handlers/llm_wire_sdk.go
