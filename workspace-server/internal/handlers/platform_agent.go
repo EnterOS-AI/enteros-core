@@ -1274,6 +1274,16 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    claude-code. The pre-P3b `runtime = 'claude-code'` on conflict (core#2496)
 	//    is the exact clobber this de-bake removes.
 	//
+	//    STATUS (CR2 RC 14676): the ON CONFLICT clause likewise NEVER touches
+	//    `status`. Install must PRESERVE the removed/tombstoned flag — a re-install
+	//    of a REMOVED concierge (CP backfill, self-host re-seed, or the create/
+	//    repair endpoint's reinstall step) must not silently un-delete it. Only a
+	//    DELIBERATE repair of a removed root un-tombstones it, and that is done by
+	//    EnsurePlatformAgent's explicit reviveRemovedPlatformAgent step AFTER this
+	//    install, never as a side-effect of the upsert. (A brand-new row still
+	//    seeds status='offline' via the INSERT's VALUES; only the conflict path
+	//    leaves status untouched.)
+	//
 	//    TEMPLATE (RC 13985): the conflict clause must NOT stamp the template that
 	//    matches the REQUESTED runtime ($4) — that desyncs the pair. A codex
 	//    concierge (runtime='codex', template='codex-platform-agent') reinstalled

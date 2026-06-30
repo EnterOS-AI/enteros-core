@@ -7,6 +7,7 @@ import { useTheme } from "@/lib/theme-provider";
 import { api, PLATFORM_URL } from "@/lib/api";
 import { switchOrgUrl } from "@/lib/org-switch";
 import type { ActivityEntry } from "@/types/activity";
+import { CreatePlatformAgentButton } from "./CreatePlatformAgentButton";
 import { Canvas } from "@/components/Canvas";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
 import { MessageFlightHome } from "./MessageFlightHome";
@@ -518,6 +519,7 @@ export function ConciergeShell() {
                     <div className={s.greet}>
                       <span className={s.stamp}>✷</span> No platform agent yet
                     </div>
+                    <CreatePlatformAgentButton />
                   </div>
                 </section>
               )}
@@ -602,8 +604,12 @@ export function ConciergeShell() {
                           <WorkspacePanelTabs key={platformRoot.id} node={platformRoot} defaultTab="config" idPrefix="concierge-" />
                         </div>
                       ) : (
-                        <div className={s.scardDesc}>
-                          No platform agent yet. Spin one up from Home to configure it.
+                        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                          <div className={s.scardDesc}>
+                            No platform agent yet. Create or repair the org concierge —
+                            it provisions in-place from here, no control plane needed.
+                          </div>
+                          <CreatePlatformAgentButton />
                         </div>
                       )}
                     </div>
