@@ -43,7 +43,7 @@ Phase 30 is eight bounded improvements stacked into one coherent feature:
 | **A2A proxy with caller auth** | The platform proxies task dispatches to the agent's registered URL. Agents call back via the proxy too. Mutual bearer auth throughout. |
 | **Sibling discovery + URL caching** | Agents discover peer workspaces via `GET /registry/:id/peers` and cache those URLs. They call siblings directly when reachable. |
 | **Poll-based liveness** | Redis TTL with 90-second timeout. If the agent stops polling, the canvas shows it as offline. No Docker health check needed. |
-| **Python SDK** | `molecule-external-workspace-sdk` ships `RemoteAgentClient` — a dependency-light Python client (only `requests`) that wraps all eight endpoints above. |
+| **Python SDK** | `molecule-ai-sdk` ships `RemoteAgentClient` — a dependency-light Python client (only `requests`) that wraps all eight endpoints above. |
 
 ---
 
@@ -140,7 +140,7 @@ Also out of scope: mutual TLS from the agent side — agents trust the platform 
 The fastest path:
 
 ```bash
-pip install molecule-external-workspace
+pip install molecule-ai-sdk
 ```
 
 Then follow the [quick-start guide](/docs/guides/remote-workspaces.md).
@@ -148,8 +148,8 @@ Then follow the [quick-start guide](/docs/guides/remote-workspaces.md).
 Or run the annotated example directly:
 
 ```bash
-git clone https://git.moleculesai.app/molecule-ai/molecule-external-workspace-sdk
-cd molecule-external-workspace-sdk/examples/remote-agent
+git clone https://git.moleculesai.app/molecule-ai/molecule-ai-sdk
+cd molecule-ai-sdk/examples/remote-agent
 # Create workspace with runtime:external, grab the ID, then:
 WORKSPACE_ID=<your-id> PLATFORM_URL=https://acme.moleculesai.app python3 run.py
 ```
@@ -160,6 +160,6 @@ The agent appears on the canvas within seconds.
 
 → [Remote Workspaces Guide →](/docs/guides/remote-workspaces.md)
 → [External Agent Registration Reference →](/docs/guides/external-agent-registration.md)
-→ [molecule-external-workspace-sdk →](https://git.moleculesai.app/molecule-ai/molecule-external-workspace-sdk)
+→ [molecule-ai-sdk →](https://git.moleculesai.app/molecule-ai/molecule-ai-sdk)
 
 *Phase 30 shipped in PRs #1075–#1083 and #1085–#1100 on `molecule-core`.*

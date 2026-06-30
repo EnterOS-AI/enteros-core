@@ -926,7 +926,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	//       immediately. Legacy flow, preserved for callers that
 	//       don't need the copy-this-snippet UX (org-import, etc.).
 	//   (b) URL omitted             — the operator will install
-	//       molecule-external-workspace-sdk or another A2A server later. We
+	//       molecule-ai-sdk or another A2A server later. We
 	//       mint a workspace_auth_token now and return it alongside
 	//       workspace_id + platform_url so the canvas UI can show
 	//       one copy-paste connection snippet. Status is set to

@@ -7,7 +7,7 @@ package handlers
 // hand the block to whoever runs their external agent without having
 // to piece together workspace_id + platform_url + auth_token + API
 // shape from the docs. curl snippet has zero dependencies; Python
-// snippet pairs with molecule-external-workspace-sdk's A2AServer + RemoteAgentClient.
+// snippet pairs with molecule-ai-sdk's A2AServer + RemoteAgentClient.
 //
 // BuildExternalConnectionPayload (below) is the single source of truth
 // for the payload shape — used by Create (#workspace.go), Rotate
@@ -391,10 +391,10 @@ claude mcp add {{MCP_SERVER_NAME}} -s user -- env \
 #       with: curl ${PLATFORM_URL}/healthz
 `
 
-// externalPythonTemplate uses molecule-external-workspace-sdk's RemoteAgentClient +
+// externalPythonTemplate uses molecule-ai-sdk's RemoteAgentClient +
 // A2AServer. Until the SDK is published to the Gitea package registry the
 // snippet pins git+main.
-const externalPythonTemplate = `# pip install 'git+https://git.moleculesai.app/molecule-ai/molecule-external-workspace-sdk.git@main'
+const externalPythonTemplate = `# pip install 'git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@main'
 
 import asyncio
 from molecule_external_workspace import RemoteAgentClient, A2AServer
