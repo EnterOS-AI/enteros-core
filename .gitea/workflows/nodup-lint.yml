@@ -1,0 +1,51 @@
+name: nodup-lint
+
+# Shared NO-DUPLICATION linter — built once in the SDK
+# (go.moleculesai.app/sdk/tools/cmd/nodup-lint), invoked here so a re-paste of
+# SDK-owned code (e.g. the LLM wire-string enums) is caught per-PR. This is the
+# inverse of the retired "keep your copy byte-equal" gates: there must be NO
+# copy, you must IMPORT the SSOT. The ban-list is the SDK-embedded owned.yaml, so
+# the policy is single-sourced and cannot drift between repos.
+
+on:
+  pull_request:
+    branches: [main, staging]
+    paths:
+      - 'workspace-server/**'
+  push:
+    branches: [main, staging]
+    paths:
+      - 'workspace-server/**'
+
+concurrency:
+  group: nodup-lint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+  GOTOOLCHAIN: local
+
+jobs:
+  nodup-lint:
+    name: no-duplication
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: workspace-server
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: workspace-server/go.mod
+          # cache:false — self-hosted runners bind-mount a shared GOCACHE/GOMODCACHE
+          # (fleet convention; see lint-setup-go-cache).
+          cache: false
+      - name: Run shared no-duplication linter (from the SDK)
+        # Uses the SDK version pinned in workspace-server/go.mod. The linter scans
+        # this module's tree for re-declared SDK-owned symbols / re-pasted owned
+        # blobs; sanctioned re-export shims are listed in .nodup-lint-allow.
+        run: go run go.moleculesai.app/sdk/tools/cmd/nodup-lint -repo .
