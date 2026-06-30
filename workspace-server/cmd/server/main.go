@@ -2,7 +2,7 @@
 //
 //	@title			Molecule AI Workspace Server API
 //	@version		1.0
-//	@description	The per-tenant workspace-server HTTP API. Single source of truth for workspace/schedule/agent/secrets/files/memory CRUD. Hand-written clients (canvas, molecule-mcp-server, molecule-cli, molecule-external-workspace-sdk) should be replaced by clients generated from this spec — see RFC #1706.
+//	@description	The per-tenant workspace-server HTTP API. Single source of truth for workspace/schedule/agent/secrets/files/memory CRUD. Hand-written clients (canvas, molecule-mcp-server, molecule-cli, molecule-ai-sdk) should be replaced by clients generated from this spec — see RFC #1706.
 //	@host			api.moleculesai.app
 //	@BasePath		/
 //	@schemes		https
