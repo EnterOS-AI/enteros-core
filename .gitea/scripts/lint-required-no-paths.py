@@ -96,6 +96,16 @@ WORKFLOWS_DIR = _env(
 OWNER, NAME = (REPO.split("/", 1) + [""])[:2] if REPO else ("", "")
 API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
 
+# Cloudflare's WAF in front of git.moleculesai.app returns HTTP 403 /
+# "error code: 1010" (banned-browser-signature) to the default
+# `Python-urllib/<ver>` User-Agent, so this BP reader was failing closed
+# at the edge (CF-1010) before ever reaching Gitea. The ban is a
+# UA-denylist (any non-urllib UA passes — empirically verified); send an
+# explicit non-urllib UA. Transport-only change; auth/method/semantics
+# unchanged. (curl-based gates like review-check.sh are unaffected for
+# the same reason.)
+_GITEA_UA = "molecule-ci-gate/1.0 (+gitea-api)"
+
 
 def _require_runtime_env() -> None:
     """Enforce env contract — called from `run()` only. Tests import
@@ -130,6 +140,7 @@ def api(
     headers = {
         "Authorization": f"token {GITEA_TOKEN}",
         "Accept": "application/json",
+        "User-Agent": _GITEA_UA,
     }
     if body is not None:
         data = json.dumps(body).encode("utf-8")

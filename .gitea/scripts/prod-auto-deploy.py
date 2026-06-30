@@ -506,7 +506,15 @@ def rollout_from_plan_file(plan_path: str, response_path: str, env: dict[str, st
 
 
 def _api_json(url: str, token: str) -> dict:
-    req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"token {token}",
+            # CF WAF 1010-bans the default Python-urllib UA; send a
+            # non-urllib UA so this gitea read reaches the API (transport-only).
+            "User-Agent": "molecule-ci-gate/1.0 (+gitea-api)",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             return json.loads(resp.read())
@@ -522,7 +530,15 @@ def _api_json_list(url: str, token: str) -> list:
     body (or HTTP error) raises so the caller never mistakes an unreadable page
     for "no more statuses" and silently truncates the required-context scan.
     """
-    req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"token {token}",
+            # CF WAF 1010-bans the default Python-urllib UA; send a
+            # non-urllib UA so this gitea read reaches the API (transport-only).
+            "User-Agent": "molecule-ci-gate/1.0 (+gitea-api)",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             body = json.loads(resp.read())
@@ -573,7 +589,15 @@ def fetch_all_statuses(host: str, repo: str, sha: str, token: str, page_size: in
 
 
 def _api_json_optional(url: str, token: str) -> tuple[int, dict | None]:
-    req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"token {token}",
+            # CF WAF 1010-bans the default Python-urllib UA; send a
+            # non-urllib UA so this gitea read reaches the API (transport-only).
+            "User-Agent": "molecule-ci-gate/1.0 (+gitea-api)",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             return resp.status, json.loads(resp.read())
