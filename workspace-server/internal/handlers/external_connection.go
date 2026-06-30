@@ -395,6 +395,7 @@ claude mcp add {{MCP_SERVER_NAME}} -s user -- env \
 // A2AServer. Until the SDK is published to the Gitea package registry the
 // snippet pins git+main.
 const externalPythonTemplate = `# pip install 'git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@main'
+# (installs as molecule-ai-sdk, imports as molecule_external_workspace — the names intentionally differ)
 
 import asyncio
 from molecule_external_workspace import RemoteAgentClient, A2AServer

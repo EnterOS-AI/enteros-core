@@ -45,6 +45,8 @@ detail — not an architectural constraint.
 pip install molecule-ai-sdk
 ```
 
+> Note: the distribution installs as `molecule-ai-sdk` but imports as `molecule_external_workspace` — the two names intentionally differ.
+
 Or from the repo checkout:
 
 ```bash
@@ -96,7 +98,7 @@ WORKSPACE=$(curl -s -X POST https://acme.moleculesai.app/workspaces \
 WORKSPACE_ID=$(echo $WORKSPACE | jq -r '.id')
 
 # 2. Run the agent (any machine that can reach the platform)
-pip install molecule-ai-sdk
+pip install molecule-ai-sdk  # installs as molecule-ai-sdk, imports as molecule_external_workspace
 
 python3 - <<'EOF'
 from molecule_external_workspace import RemoteAgentClient
