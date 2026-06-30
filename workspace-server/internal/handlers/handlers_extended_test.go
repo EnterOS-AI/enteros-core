@@ -257,9 +257,10 @@ func TestExtended_SecretsListEmpty(t *testing.T) {
 func TestExtended_SecretsSet(t *testing.T) {
 	// The per-workspace key-write guard keys off the workspace's SELECTED model:
 	// a VENDOR model (kimi-for-coding → kimi-coding, IsPlatform=false) is a BYOK
-	// workspace, so writing a vendor key proceeds. Guard query order: runtime →
-	// secrets (MODEL) → (vendor only) override. (A platform model would block —
-	// see TestPlatformManagedLLMModeForWorkspace_GatesOnModelNotResolvedMode.)
+	// workspace, so writing a vendor key proceeds. Guard derives purely from
+	// (runtime, model) via the registry — query order: runtime → secrets (MODEL).
+	// (A platform model would block — see
+	// TestPlatformManagedLLMModeForWorkspace_GatesOnModel.)
 	mock := setupTestDB(t)
 	handler := NewSecretsHandler(nil)
 
@@ -270,9 +271,6 @@ func TestExtended_SecretsSet(t *testing.T) {
 		WithArgs("22222222-2222-2222-2222-222222222222").
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
 			AddRow("MODEL", []byte("kimi-for-coding"), 0))
-	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-		WithArgs("22222222-2222-2222-2222-222222222222").
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(nil))
 
 	// Expect INSERT (encrypted value is dynamic, use AnyArg)
 	mock.ExpectExec("INSERT INTO workspace_secrets").
@@ -310,7 +308,10 @@ func TestExtended_SecretsSet(t *testing.T) {
 }
 
 func TestExtended_SecretsSetRejectsHermesCustomProviderInPlatformManagedMode(t *testing.T) {
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed")
+	// No runtime/model is mocked, so the workspace's provider is underivable →
+	// platformManagedLLMModeForWorkspace default-closes (blocks) the vendor-key
+	// write. (The per-workspace billing-mode env/override was removed 2026-06-30;
+	// the block now derives purely from the provider registry.)
 	_ = setupTestDB(t)
 	handler := NewSecretsHandler(nil)
 

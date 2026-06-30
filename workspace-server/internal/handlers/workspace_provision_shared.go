@@ -222,24 +222,24 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	//
 	// The bypass-key check is intentionally broad — any present bypass key
 	// (the tenant's own, at global or workspace scope) clears it.
-	if llmRes.ResolvedMode == LLMBillingModeBYOK && !llmRes.HasUsableLLMCred {
-		msg := formatMissingBYOKCredentialError(llmRes.ResolvedMode)
-		log.Printf("Provisioner: ABORT workspace=%s — byok billing mode has no usable LLM credential (MISSING_BYOK_CREDENTIAL, molecule-core#1994)", workspaceID)
+	if !llmRes.RoutedToPlatform && !llmRes.HasUsableLLMCred {
+		msg := formatMissingBYOKCredentialError()
+		log.Printf("Provisioner: ABORT workspace=%s — BYOK workspace has no usable LLM credential (MISSING_BYOK_CREDENTIAL, molecule-core#1994)", workspaceID)
 		return nil, &provisionAbort{
 			Msg:   msg,
-			Extra: map[string]interface{}{"error": msg, "code": "MISSING_BYOK_CREDENTIAL", "billing_mode": llmRes.ResolvedMode, "issue": "1994"},
+			Extra: map[string]interface{}{"error": msg, "code": "MISSING_BYOK_CREDENTIAL", "routing": "byok", "issue": "1994"},
 		}
 	}
-	// Fail closed for a platform-managed workspace whose CP proxy env is
+	// Fail closed for a platform-routed workspace whose CP proxy env is
 	// absent: do NOT start it credential-less (adk-demo dark-wedge class,
-	// #2162). The platform_managed path requires the proxy injection to
-	// produce a usable credential.
-	if llmRes.ResolvedMode == LLMBillingModePlatformManaged && !llmRes.HasUsableLLMCred {
+	// #2162). The platform path requires the proxy injection to produce a
+	// usable credential.
+	if llmRes.RoutedToPlatform && !llmRes.HasUsableLLMCred {
 		msg := formatMissingPlatformProxyError()
-		log.Printf("Provisioner: ABORT workspace=%s — platform-managed billing mode but CP proxy env absent (MISSING_PLATFORM_PROXY, molecule-core#2162)", workspaceID)
+		log.Printf("Provisioner: ABORT workspace=%s — platform-routed workspace but CP proxy env absent (MISSING_PLATFORM_PROXY, molecule-core#2162)", workspaceID)
 		return nil, &provisionAbort{
 			Msg:   msg,
-			Extra: map[string]interface{}{"error": msg, "code": "MISSING_PLATFORM_PROXY", "billing_mode": llmRes.ResolvedMode, "issue": "2162"},
+			Extra: map[string]interface{}{"error": msg, "code": "MISSING_PLATFORM_PROXY", "routing": "platform", "issue": "2162"},
 		}
 	}
 	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
@@ -283,18 +283,16 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	// catches every other provision path (restart/resume/auto-recover/import) so
 	// the guarantee holds "for everything".
 	//
-	// Scoped to NON-disabled billing: a "disabled" workspace runs no platform-
-	// billed LLM at all (terminal / file work), so requiring a model there would
-	// regress a legitimate no-LLM workspace — same scoping rationale as the
-	// MISSING_BYOK / MISSING_PLATFORM_PROXY credential gates above.
-	if llmRes.ResolvedMode != LLMBillingModeDisabled &&
-		strings.TrimSpace(envVars["MOLECULE_MODEL"]) == "" &&
+	// Applies to every workspace: with the per-workspace billing-mode override
+	// (and its "disabled" escape hatch) removed, a workspace is either platform-
+	// routed or BYOK and in both cases a model is required input.
+	if strings.TrimSpace(envVars["MOLECULE_MODEL"]) == "" &&
 		strings.TrimSpace(envVars["MODEL"]) == "" {
-		msg := formatMissingModelError(llmRes.ResolvedMode)
+		msg := formatMissingModelError()
 		log.Printf("Provisioner: ABORT workspace=%s — no resolved model (MISSING_MODEL, core#2594); refusing the runtime's opaque default", workspaceID)
 		return nil, &provisionAbort{
 			Msg:   msg,
-			Extra: map[string]interface{}{"error": msg, "code": "MISSING_MODEL", "billing_mode": llmRes.ResolvedMode, "issue": "2594"},
+			Extra: map[string]interface{}{"error": msg, "code": "MISSING_MODEL", "issue": "2594"},
 		}
 	}
 

@@ -946,12 +946,9 @@ func TestSecretsValues_LegacyWorkspaceGrandfathered(t *testing.T) {
 		WithArgs(testWsID).
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
 			AddRow("WS_KEY", []byte("ws_plainvalue"), 0))
-	// internal#711: Values now resolves billing mode to gate the global LLM-cred
-	// merge. Neither key here is a platform-managed LLM bypass key, so the mode
-	// is immaterial to the assertions — but the resolver query must be mocked.
-	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-		WithArgs(testWsID).
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModePlatformManaged))
+	// molecule-core#1994: Values returns the tenant's merged secrets as-is — it
+	// no longer resolves any billing mode (the per-workspace billing-mode field
+	// was removed 2026-06-30), so there is no resolver query to mock.
 
 	w := httptest.NewRecorder()
 	c := secretsValuesRequest(w, "") // no auth — grandfathered
@@ -1029,12 +1026,8 @@ func TestSecretsValues_ValidTokenReturnsDecryptedMerge(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
 			AddRow("ONLY_WS", []byte("ws_val"), 0).
 			AddRow("SHARED_KEY", []byte("ws_wins"), 0))
-	// internal#711: billing-mode resolver query. None of these keys is a
-	// platform-managed LLM bypass key, so the resolved mode does not affect the
-	// merge assertions; platform_managed keeps the existing pass-through.
-	mock.ExpectQuery(`SELECT llm_billing_mode FROM workspaces WHERE id = \$1`).
-		WithArgs(testWsID).
-		WillReturnRows(sqlmock.NewRows([]string{"llm_billing_mode"}).AddRow(LLMBillingModePlatformManaged))
+	// molecule-core#1994: Values returns the merged secrets as-is — no
+	// billing-mode resolver query (the field was removed 2026-06-30).
 
 	w := httptest.NewRecorder()
 	c := secretsValuesRequest(w, "Bearer good-token")
@@ -1201,10 +1194,10 @@ func TestSetGlobal_AutoRestartsAffectedWorkspaces(t *testing.T) {
 // shared credential and is always writable at global scope; the provision-time
 // provider-matched strip (workspace_provision) keeps any platform-managed
 // workspace from USING a non-matching global cred, and per-workspace secret
-// writes still enforce the strip-list via the per-workspace guard. So even with
-// the legacy MOLECULE_LLM_BILLING_MODE env still set to platform_managed, a
-// global vendor/oauth key write MUST SUCCEED (200) and persist — the retired
-// org rung no longer gates it.
+// writes still enforce the strip-list via the per-workspace guard. With the
+// per-org/per-workspace billing-mode signal fully removed (2026-06-30), a global
+// vendor/oauth key write MUST SUCCEED (200) and persist — nothing at the global
+// scope gates it.
 //
 // Mutation: re-add the org-level rejectPlatformManagedDirectLLMBypass guard to
 // SetGlobal → the write 400s before the INSERT → this test RED.
@@ -1215,8 +1208,9 @@ func TestSetGlobal_AllowsTenantOwnedVendorKeyDespiteLegacyOrgEnv(t *testing.T) {
 	restarted := make(chan string, 2)
 	handler := NewSecretsHandler(func(id string) { restarted <- id })
 
-	// Legacy org env still platform_managed — it must no longer gate the write.
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", LLMBillingModePlatformManaged)
+	// The per-org/per-workspace billing-mode signal was removed entirely
+	// (2026-06-30); a global vendor/oauth key write is the tenant's own credential
+	// and must always be allowed.
 
 	mock.ExpectExec("INSERT INTO global_secrets").
 		WithArgs("CLAUDE_CODE_OAUTH_TOKEN", sqlmock.AnyArg(), sqlmock.AnyArg()).
@@ -1863,16 +1857,15 @@ func TestDeleteGlobal_SpoofedHeader_DoesNotSuppressRestart(t *testing.T) {
 	}
 }
 
-// TestPlatformManagedLLMModeForWorkspace_GatesOnModelNotResolvedMode is the Fix C
-// guard regression (CTO 2026-06-12): the vendor-key-write guard must key off
-// whether the workspace's MODEL is platform-servable (derives to the closed
-// `platform` provider), NOT off the resolved billing mode. A workspace on a
-// VENDOR model must be allowed to write its own key — including the FIRST key,
-// before billing has derived byok (when the resolved mode is still the org
-// platform_managed fallback). A workspace on a PLATFORM model is blocked (a
-// stray vendor key would co-mingle with proxy billing).
-func TestPlatformManagedLLMModeForWorkspace_GatesOnModelNotResolvedMode(t *testing.T) {
-	overrideQ := `SELECT llm_billing_mode FROM workspaces WHERE id = \$1`
+// TestPlatformManagedLLMModeForWorkspace_GatesOnModel is the Fix C guard
+// regression (CTO 2026-06-12): the vendor-key-write guard keys off whether the
+// workspace's MODEL is platform-servable (derives to the closed `platform`
+// provider). A workspace on a VENDOR model must be allowed to write its own key
+// — including the FIRST key. A workspace on a PLATFORM model is blocked (a stray
+// vendor key would co-mingle with proxy billing). The per-workspace billing-mode
+// override was removed 2026-06-30; the decision now derives purely from
+// (runtime, model) via the registry — there is no override read.
+func TestPlatformManagedLLMModeForWorkspace_GatesOnModel(t *testing.T) {
 	runtimeQ := `SELECT runtime FROM workspaces WHERE id = \$1`
 	secretsQ := `SELECT key, encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1`
 
@@ -1883,34 +1876,27 @@ func TestPlatformManagedLLMModeForWorkspace_GatesOnModelNotResolvedMode(t *testi
 		return c
 	}
 
-	// Query order (new): runtime → secrets → (vendor only) override. A platform
-	// model short-circuits at IsPlatform and never reads the override.
-	vendorOK := func(m sqlmock.Sqlmock, wsID, override string) {
+	// Query order: runtime → secrets (MODEL). The platform-vs-byok split is then
+	// derived from (runtime, model) via the registry — no DB billing read.
+	vendorOK := func(m sqlmock.Sqlmock, wsID string) {
 		m.ExpectQuery(runtimeQ).WithArgs(wsID).
 			WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 		m.ExpectQuery(secretsQ).WithArgs(wsID).
 			WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
 				AddRow("MODEL", []byte("kimi-for-coding"), 0)) // vendor model
-		row := sqlmock.NewRows([]string{"llm_billing_mode"})
-		if override == "" {
-			row.AddRow(nil)
-		} else {
-			row.AddRow(override)
-		}
-		m.ExpectQuery(overrideQ).WithArgs(wsID).WillReturnRows(row)
 	}
 	platformModelOnly := func(m sqlmock.Sqlmock, wsID string) {
 		m.ExpectQuery(runtimeQ).WithArgs(wsID).
 			WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
 		m.ExpectQuery(secretsQ).WithArgs(wsID).
 			WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}).
-				AddRow("MODEL", []byte("moonshot/kimi-k2.6"), 0)) // platform model — no override read
+				AddRow("MODEL", []byte("moonshot/kimi-k2.6"), 0)) // platform model
 	}
 
-	t.Run("vendor model + no override → NOT blocked (can add first BYOK key)", func(t *testing.T) {
+	t.Run("vendor model → NOT blocked (can add first BYOK key)", func(t *testing.T) {
 		mock := setupTestDB(t)
 		const wsID = "11111111-1111-1111-1111-111111111111"
-		vendorOK(mock, wsID, "")
+		vendorOK(mock, wsID)
 		if platformManagedLLMModeForWorkspace(newCtx(wsID), wsID) {
 			t.Error("vendor-model workspace must NOT be blocked from writing its own key")
 		}
@@ -1925,33 +1911,6 @@ func TestPlatformManagedLLMModeForWorkspace_GatesOnModelNotResolvedMode(t *testi
 		platformModelOnly(mock, wsID)
 		if !platformManagedLLMModeForWorkspace(newCtx(wsID), wsID) {
 			t.Error("platform-model workspace must block stray vendor-key writes")
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("sqlmock: %v", err)
-		}
-	})
-
-	t.Run("platform model + byok override → STILL blocked (CR: co-mingle guard)", func(t *testing.T) {
-		// agent-researcher REQUEST_CHANGES: a platform-servable MODEL must stay
-		// protected even when a (stale/incorrect) byok override is set — the
-		// MODEL is checked first, so the override is never even read.
-		mock := setupTestDB(t)
-		const wsID = "33333333-3333-3333-3333-333333333333"
-		platformModelOnly(mock, wsID) // no override query — platform short-circuits
-		if !platformManagedLLMModeForWorkspace(newCtx(wsID), wsID) {
-			t.Error("platform model must block vendor-key writes even under a byok override")
-		}
-		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("sqlmock: %v", err)
-		}
-	})
-
-	t.Run("vendor model + platform_managed override → blocked (operator forced managed)", func(t *testing.T) {
-		mock := setupTestDB(t)
-		const wsID = "44444444-4444-4444-4444-444444444444"
-		vendorOK(mock, wsID, LLMBillingModePlatformManaged)
-		if !platformManagedLLMModeForWorkspace(newCtx(wsID), wsID) {
-			t.Error("vendor model with an explicit platform_managed override must block (co-mingle)")
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("sqlmock: %v", err)

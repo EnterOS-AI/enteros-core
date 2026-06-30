@@ -162,7 +162,7 @@ func TestProvisionWorkspaceAuto_RoutesToCPWhenSet(t *testing.T) {
 
 	wsID := "ws-routes-to-cp-0123456789abcdef"
 	ok := h.provisionWorkspaceAuto(wsID, "", nil, models.CreateWorkspacePayload{
-		Name: "test", Tier: 1, Runtime: "claude-code", Model: "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
+		Name: "test", Tier: 1, Runtime: "claude-code", Model: "anthropic/claude-opus-4-7", // core#2594 model gate; slash form derives the platform provider so it routes platform (proxy env set)
 	})
 	if !ok {
 		t.Fatalf("expected provisionWorkspaceAuto to return true with CP wired")
@@ -632,7 +632,7 @@ func TestRestartWorkspaceAuto_RoutesToCPWhenSet(t *testing.T) {
 
 	wsID := "ws-restart-routes-cp-0123456789ab"
 	ok := h.RestartWorkspaceAuto(context.Background(), wsID, "", nil, models.CreateWorkspacePayload{
-		Name: "restart-test", Tier: 1, Runtime: "claude-code", Model: "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
+		Name: "restart-test", Tier: 1, Runtime: "claude-code", Model: "anthropic/claude-opus-4-7", // core#2594 model gate; slash form derives the platform provider so it routes platform (proxy env set)
 	})
 	if !ok {
 		t.Fatalf("expected RestartWorkspaceAuto to return true with CP wired")
@@ -832,7 +832,7 @@ func TestProvisionWorkspaceAutoSync_RoutesToCPWhenSet(t *testing.T) {
 
 	wsID := "ws-sync-routes-cp"
 	ok := h.provisionWorkspaceAutoSync(wsID, "", nil, models.CreateWorkspacePayload{
-		Name: "sync-test", Tier: 1, Runtime: "claude-code", Model: "anthropic:claude-opus-4-7", // core#2594: model required by provision gate
+		Name: "sync-test", Tier: 1, Runtime: "claude-code", Model: "anthropic/claude-opus-4-7", // core#2594 model gate; slash form derives the platform provider so it routes platform (proxy env set)
 	})
 	if !ok {
 		t.Fatalf("expected provisionWorkspaceAutoSync to return true with CP wired")

@@ -1455,32 +1455,24 @@ skills: []
 	}
 	got := resp[0]
 
-	billByModel := map[string]string{}
 	provByModel := map[string]string{}
 	for _, m := range got.RegistryModels {
-		billByModel[m.ID] = m.BillingMode
 		provByModel[m.ID] = m.Provider
 	}
 
-	// A BYOK API model derives to anthropic-api → byok.
+	// A BYOK API model derives to anthropic-api.
 	if provByModel["claude-opus-4-7"] != "anthropic-api" {
 		t.Errorf("claude-opus-4-7 derived provider: want anthropic-api, got %q", provByModel["claude-opus-4-7"])
 	}
-	if billByModel["claude-opus-4-7"] != "byok" {
-		t.Errorf("claude-opus-4-7 billing_mode: want byok, got %q", billByModel["claude-opus-4-7"])
-	}
-	// A platform-namespaced model derives to the closed platform provider →
-	// platform_managed.
+	// A platform-namespaced model derives to the closed platform provider.
 	if provByModel["anthropic/claude-opus-4-7"] != "platform" {
 		t.Errorf("anthropic/claude-opus-4-7 derived provider: want platform, got %q", provByModel["anthropic/claude-opus-4-7"])
 	}
-	if billByModel["anthropic/claude-opus-4-7"] != "platform_managed" {
-		t.Errorf("anthropic/claude-opus-4-7 billing_mode: want platform_managed, got %q", billByModel["anthropic/claude-opus-4-7"])
-	}
 
-	// registry_providers carries the provider display_name + auth_env +
-	// billing_mode for the dropdown labels — sourced from the registry, not
-	// the canvas VENDOR_LABELS map.
+	// registry_providers carries the provider display_name + auth_env for the
+	// dropdown labels — sourced from the registry, not the canvas VENDOR_LABELS
+	// map. (The billing_mode field was removed 2026-06-30 — billing now derives
+	// purely from the provider registry, not a payload field.)
 	byName := map[string]registryProviderView{}
 	for _, p := range got.RegistryProviders {
 		byName[p.Name] = p
@@ -1492,15 +1484,11 @@ skills: []
 	if oauth.DisplayName != "Claude Code subscription" {
 		t.Errorf("anthropic-oauth display_name: want %q, got %q", "Claude Code subscription", oauth.DisplayName)
 	}
-	if oauth.BillingMode != "byok" {
-		t.Errorf("anthropic-oauth billing_mode: want byok, got %q", oauth.BillingMode)
-	}
 	if len(oauth.AuthEnv) != 1 || oauth.AuthEnv[0] != "CLAUDE_CODE_OAUTH_TOKEN" {
 		t.Errorf("anthropic-oauth auth_env: want [CLAUDE_CODE_OAUTH_TOKEN], got %v", oauth.AuthEnv)
 	}
-	plat, ok := byName["platform"]
-	if !ok || plat.BillingMode != "platform_managed" {
-		t.Errorf("platform provider billing_mode: want platform_managed, got %+v", plat)
+	if _, ok := byName["platform"]; !ok {
+		t.Errorf("registry_providers missing platform provider; got %v", byName)
 	}
 }
 

@@ -19,30 +19,13 @@ package handlers
 // RegistryBacked=false and an empty registry block — the template's own fields
 // stay authoritative. No behavior change for non-registry runtimes.
 //
-// NOTE: this reuses the package-level providerRegistry() accessor +
-// LLMBillingModePlatformManaged / LLMBillingModeBYOK constants from
-// llm_billing_mode.go (added by P2-B, internal#718 #1972, now on main) — both
-// the billing-derivation and this templates projection wrap the same
-// providers.LoadManifest() SSOT and the same platform_managed/byok wire
-// strings, so there is one accessor + one constant set for the package.
+// NOTE: this reuses the package-level providerRegistry() accessor from
+// provider_derive_helpers.go — both the provider-derivation and this templates
+// projection wrap the same providers.LoadManifest() SSOT.
 
 import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/providers"
 )
-
-// billingModeForRegistryProvider maps a registry Provider to the billing mode
-// it implies: platform_managed for the closed core-only platform provider,
-// byok for everything else. Keyed off the registry IsPlatform predicate —
-// the same one billing/credential emission (llm_billing_mode.go) keys off the
-// DERIVED provider — so the canvas shows the true billing source of the
-// resolved provider. Returns the same LLMBillingMode* wire strings the Config
-// tab's billing-mode switch sends.
-func billingModeForRegistryProvider(p providers.Provider) string {
-	if p.IsPlatform() {
-		return LLMBillingModePlatformManaged
-	}
-	return LLMBillingModeBYOK
-}
 
 // requiredEnvForRegistryProvider derives the env vars the USER must supply for
 // a model owned by the resolved provider — the proper-SSOT single fact behind
@@ -103,7 +86,6 @@ func enrichFromRegistry(summary *templateSummary, runtime string) {
 			Name:        p.Name,
 			DisplayName: p.DisplayName,
 			AuthEnv:     p.AuthEnv,
-			BillingMode: billingModeForRegistryProvider(p),
 			Deprecated:  p.Deprecated,
 		})
 	}
@@ -132,7 +114,6 @@ func enrichFromRegistry(summary *templateSummary, runtime string) {
 				continue
 			}
 			ms.Provider = derived.Name
-			ms.BillingMode = billingModeForRegistryProvider(derived)
 			ms.RequiredEnv = requiredEnvForRegistryProvider(derived)
 		}
 		// If DeriveProvider errors (ambiguous/overlap — a manifest defect the

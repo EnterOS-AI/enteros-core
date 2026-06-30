@@ -88,10 +88,12 @@ subsystem.
   (`MOLECULE_API_KEY` = org-admin token, `MOLECULE_API_URL`, `MOLECULE_ORG_ID`; `src/api.ts`), is a
   thin proxy over the tenant REST/A2A API (`chat_with_agent` → `POST /workspaces/:id/a2a`,
   `async_delegate` → `/delegate`), and has **zero embeddability blockers**.
-- **Billing** is a per-workspace resolver — `ResolveLLMBillingModeDerived`
-  (`workspace-server/internal/handlers/workspace_provision.go`, `llm_billing_mode.go`), defaulting
-  closed to `platform_managed`; `byok` runs on the tenant's own provider key (see
-  `docs/architecture/byok-fail-closed-billing.md`).
+- **Billing** is decided per-workspace by deriving the provider from the
+  selected `(runtime, model)` — `applyPlatformManagedLLMEnv`
+  (`workspace-server/internal/handlers/workspace_provision.go`, `provider_derive_helpers.go`):
+  the closed `platform` provider routes to the metered proxy (default-closed when
+  a proxy is wired), a specific vendor runs BYOK on the tenant's own provider key
+  (see `docs/architecture/byok-fail-closed-billing.md`).
 - **Approvals** exist: `migrations/007_approvals.sql`, `internal/handlers/approvals.go`,
   `EventApprovalRequested`, decide route `POST /workspaces/:id/approvals/:approvalId/decide`.
 
@@ -234,11 +236,12 @@ The MCP is a *client* of the tenant handlers, so enforcement lives in the **hand
 
 ### 5.9 Billing & model/provider parity
 
-The platform agent is a `workspaces` row, so it inherits the one billing resolver and the
+The platform agent is a `workspaces` row, so it inherits the one provider-derivation path and the
 `providers.yaml` runtime matrix unchanged:
-- **Default `platform_managed`** (metered CP proxy, billed to org credits) — the env wiring in §5.6.
-- **`byok`** = flip `/admin/workspaces/:id/llm-billing-mode` + supply the org's `ANTHROPIC_API_KEY`
-  secret (workspace or global). Exposed as a provisioning flag so a tenant can choose at create time.
+- **Default: platform-routed** (metered CP proxy, billed to org credits) — the concierge's default
+  model derives to the closed `platform` provider; the env wiring is in §5.6.
+- **BYOK** = select a specific vendor model + supply that provider's key (e.g. `ANTHROPIC_API_KEY`)
+  as a workspace or global secret. The model selection alone decides — there is no billing-mode flag.
 - Model **and provider** are switchable (Claude, Kimi-for-coding, …) via the same dashboard
   model-switcher any workspace uses.
 
@@ -255,7 +258,7 @@ for advanced users. First UI version is produced in Claude Design and iterated b
 | "The org" | `orgRootID()`/`sameOrg()` (`org_scope.go`) | platform agent *becomes* the root; no `org_id` column |
 | Platform marker | `workspaces.kind` | `kind` only; never also `role`/`tier` |
 | Model/provider | `providers.yaml` runtime matrix | concierge switches via the same registry |
-| LLM billing | `ResolveLLMBillingModeDerived` | inherits the one resolver; no new path |
+| LLM billing | `providers.DeriveProvider` → `IsPlatform` | inherits the one derivation; no new path |
 | Config/secrets delivery | tenant Secrets Manager bundle (`seedWorkspaceConfigSecret`) | no new S3 prefix / second store |
 | Management API | OpenAPI spec | new endpoints authored there first; MCP/CLI/docs derive |
 | Gated actions | `internal/approvals/policy.go` | one map |

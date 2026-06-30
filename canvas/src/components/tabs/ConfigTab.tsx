@@ -6,7 +6,6 @@ import { useCanvasStore } from "@/store/canvas";
 import { type ConfigData, DEFAULT_CONFIG, TextInput, NumberInput, Toggle, TagList, Section } from "./config/form-inputs";
 import { parseYaml, toYaml } from "./config/yaml-utils";
 import { SecretsSection } from "./config/secrets-section";
-import { LLMBillingSection } from "./config/llm-billing-section";
 import { ExternalConnectionSection } from "./ExternalConnectionSection";
 import {
   ProviderModelSelector,
@@ -15,7 +14,6 @@ import {
   findProviderForModel,
   isPlatformManagedProvider,
   type SelectorValue,
-  type ProviderEntry,
   type RegistryProvider,
   type RegistryModel,
 } from "../ProviderModelSelector";
@@ -268,10 +266,10 @@ interface RuntimeOption {
   // registry-served GET /templates fields (internal#718 P3). When
   // registryBacked is true, the selectable provider+model list is built from
   // the registry (registryProviders/registryModels) — display labels +
-  // billing mode + derived provider come from the provider-registry SSOT, not
-  // the canvas VENDOR_LABELS / billingModeForProvider vocabularies. When
-  // false (non-registry runtime / older backend), the canvas falls back to
-  // the template-served models[] + its inferVendor heuristic.
+  // derived provider come from the provider-registry SSOT, not the canvas
+  // VENDOR_LABELS vocabulary. When false (non-registry runtime / older
+  // backend), the canvas falls back to the template-served models[] + its
+  // inferVendor heuristic.
   registryBacked: boolean;
   registryProviders: RegistryProvider[];
   registryModels: RegistryModel[];
@@ -303,66 +301,6 @@ export function deriveProvidersFromModels(models: ModelSpec[]): string[] {
     }
   }
   return out;
-}
-
-// billingModeForProvider — maps a selected PROVIDER (vendor key) to the
-// LLM billing_mode it implies (internal#703 Gap 2).
-//
-// Today, picking a non-Platform provider in the Config tab writes the
-// credential env (CLAUDE_CODE_OAUTH_TOKEN / vendor key) but leaves
-// llm_billing_mode at its resolved default (`platform_managed`). The CP
-// tenant_config endpoint then keeps injecting the platform proxy base
-// URLs, so the OAuth token / vendor key is never actually used — BYOK
-// silently no-ops (the live SEO-Agent symptom in #703). The workspace-
-// server even hard-blocks vendor-key writes on platform_managed
-// workspaces (secrets.go:87), pointing the user at this exact billing-
-// mode switch. Wiring the provider change to also set billing_mode is
-// the UI half that makes BYOK take (the CP/workspace-server backend half
-// is being fixed in parallel — internal#703 Gap 1).
-//
-// Mapping:
-//   - "platform" (the Platform-managed proxy) OR "" (no explicit
-//     provider override → inherit, defaults to platform) → "platform_managed".
-//   - any other vendor key ("anthropic-oauth" = Claude Code subscription
-//     OAuth, "anthropic" = Anthropic API key, "minimax", "openrouter",
-//     etc.) → "byok".
-//
-// Returns the billing_mode string the PUT body should carry. The valid
-// set is fixed by workspace-server's recognizer (platform_managed | byok
-// | disabled); "disabled" is never auto-selected by a provider choice —
-// it's an explicit operator action via the LLM Billing section.
-export type LLMBillingMode = "platform_managed" | "byok";
-
-export function billingModeForProvider(provider: string): LLMBillingMode {
-  const v = provider.trim().toLowerCase();
-  if (v === "" || v === "platform") return "platform_managed";
-  return "byok";
-}
-
-// billingModeForSelectedProvider — internal#718 P3 (retire-list #5): the
-// billing mode the Config tab shows/sends for the selected PROVIDER, sourced
-// from the registry-served catalog when available rather than the hardcoded
-// billingModeForProvider rule.
-//
-// When the runtime is registry-backed, GET /templates serves each provider's
-// DERIVED billing_mode (platform_managed for the closed platform provider,
-// byok otherwise) on the ProviderEntry. We read it off the catalog so the UI
-// reflects the registry SSOT — the same predicate billing/credential emission
-// keys off the derived provider.
-//
-// Falls back to billingModeForProvider when: no catalog (non-registry runtime
-// / older backend), or the provider string isn't carried by the catalog
-// (e.g. a stale saved value). The fallback keeps the legacy behavior intact
-// for everything the registry doesn't yet speak to.
-export function billingModeForSelectedProvider(
-  provider: string,
-  catalog?: ProviderEntry[],
-): LLMBillingMode {
-  if (catalog && catalog.length > 0) {
-    const entry = catalog.find((p) => p.vendor === provider.trim());
-    if (entry?.billingMode) return entry.billingMode;
-  }
-  return billingModeForProvider(provider);
 }
 
 // Fallback used when /templates can't be fetched (offline, older backend).
@@ -729,8 +667,8 @@ export function ConfigTab({ workspaceId }: Props) {
   // catalog identity is stable across renders (selector relies on it).
   //
   // internal#718 P3: when the runtime is registry-backed, build the catalog
-  // FROM the registry-served providers/models (display labels + billing +
-  // derived provider from the provider-registry SSOT) instead of re-inferring
+  // FROM the registry-served providers/models (display labels + derived
+  // provider from the provider-registry SSOT) instead of re-inferring
   // vendor from model-id prefixes. Falls back to the inferVendor heuristic
   // for non-registry runtimes / older backends.
   const registryBacked = selectedRuntime?.registryBacked ?? false;
@@ -977,17 +915,6 @@ export function ConfigTab({ workspaceId }: Props) {
       const providerSaveError: string | null = null;
       const providerChanged = false;
 
-      // internal#718 P4 closure: provider → billing_mode linkage is also
-      // RETIRED. P2-B (#1972) moved the billing decision to
-      // ResolveLLMBillingModeDerived, which DERIVES the provider from
-      // (runtime, model) at every read. The canvas can no longer
-      // override it via a separate PUT, by design — the runtime+model
-      // selection IS the billing-mode selection. The
-      // /admin/workspaces/:id/llm-billing-mode endpoint still exists
-      // as the operator override surface (workspaces.llm_billing_mode
-      // column); it is no longer driven by the provider dropdown.
-      const billingModeSaveError: string | null = null;
-
       setOriginalYaml(content);
       if (rawMode) {
         const parsed = parseYaml(content);
@@ -1006,18 +933,16 @@ export function ConfigTab({ workspaceId }: Props) {
       } else if (!restart) {
         useCanvasStore.getState().updateNodeData(workspaceId, { needsRestart: !providerWillAutoRestart });
       }
-      // Aggregate partial-save errors. With provider+billing-mode PUTs
-      // retired, only modelSaveError can fire from the secret-mint side
-      // — the provider/billing branches are dead code retained as
-      // constant nils to keep the diff small. They are surfaced
-      // defensively in case a future re-enablement needs the wiring.
+      // Aggregate partial-save errors. With the provider PUT retired, only
+      // modelSaveError can fire from the secret-mint side — the provider
+      // branch is dead code retained as a constant nil to keep the diff
+      // small. It is surfaced defensively in case a future re-enablement
+      // needs the wiring.
       const partialError = providerSaveError
         ? `Other fields saved, but provider update failed: ${providerSaveError}`
-        : billingModeSaveError
-          ? `Provider saved, but switching billing mode failed — your own provider key/OAuth may not take effect until billing mode is set: ${billingModeSaveError}`
-          : modelSaveError
-            ? `Other fields saved, but model update failed: ${modelSaveError}`
-            : null;
+        : modelSaveError
+          ? `Other fields saved, but model update failed: ${modelSaveError}`
+          : null;
       if (partialError) {
         setError(partialError);
       } else {
@@ -1484,8 +1409,6 @@ export function ConfigTab({ workspaceId }: Props) {
               <NumberInput label="Timeout (s)" value={config.sandbox?.timeout ?? 30} onChange={(v) => updateNested("sandbox" as keyof ConfigData, "timeout", v)} min={5} />
             </div>
           </Section>
-
-          <LLMBillingSection workspaceId={workspaceId} />
 
           <SecretsSection
             workspaceId={workspaceId}

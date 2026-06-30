@@ -216,17 +216,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// health check (assertCompletionServes in CP#824) verifies the
 		// cred re-injection landed.
 		wsAdmin.POST("/admin/workspaces/:id/restart", wh.AdminRestart)
-		// Per-workspace LLM billing mode override (internal#691). Used by
-		// CP's /cp/admin/workspaces/:id/llm-billing-mode proxy + (via that
-		// proxy) by the canvas Config-tab "LLM Billing" section. Default-
-		// closed resolver lives in handlers/llm_billing_mode.go.
-		wsAdmin.GET("/admin/workspaces/:id/llm-billing-mode", handlers.GetWorkspaceLLMBillingMode)
 		// SSOT model discovery (core#2608): what runtimes offer, which entries
 		// are platform-billed (no key) vs BYOK (auth_env required). The
 		// concierge's pre-provision lookup; pairs with the create-boundary
 		// MISSING_BYOK_CREDENTIAL hard-reject.
 		wsAdmin.GET("/admin/llm/offered-models", handlers.ListOfferedModels)
-		wsAdmin.PUT("/admin/workspaces/:id/llm-billing-mode", handlers.PutWorkspaceLLMBillingMode)
 		// Proxy to CP's serial-console endpoint so the canvas's "View
 		// Logs" button can render the actual boot trace without handing
 		// the tenant AWS credentials. Admin-gated because console output
