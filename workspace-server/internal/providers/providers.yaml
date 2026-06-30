@@ -390,6 +390,25 @@ providers:
     # inferLLMProvider), so this cannot change live routing.
     model_prefix_match: "^kimi-"
     model_aliases: []
+    # THINKING-PARAM POLICY (serving-e2e RED fix, 2026-06-29; EMPIRICALLY VERIFIED
+    # against the live api.kimi.com/coding gateway). The kimi-for-coding model
+    # REJECTS an Anthropic-protocol request that OMITS the `thinking` object:
+    #   HTTP 400 {"error":{"type":"invalid_request_error",
+    #     "message":"invalid thinking: only type=enabled is allowed for this model"}}
+    # Observed live: no `thinking` field -> 400; thinking:{type:enabled} -> 200
+    # (reasoning model: answers with a leading `thinking` block); thinking:
+    # {type:disabled} -> 200 (plain text). So the true upstream rule is "a
+    # `thinking` object MUST be present", and {type:enabled} is the shape the
+    # error names. This is a per-model REQUEST-SHAPING fact, so it lives on the
+    # SSOT entry (not a hardcoded model-name special-case). Consumers that DIAL
+    # this entry's endpoint — the serving-e2e gate (via ResolveEndpoint) and the
+    # BYOK claude-code adapter — call Provider.NormalizeThinking, which injects
+    # thinking:{type:enabled} when the caller supplied NO thinking object, and
+    # leaves an explicit caller-set thinking (enabled OR disabled) untouched.
+    # NOTE: the CP proxy is NOT a consumer — it never routes to this gateway (it
+    # is a verbatim passthrough that resolves bare kimi-* to the moonshot vendor /
+    # api.moonshot.ai; see internal/handlers/llm_proxy.go inferLLMProviderLegacy).
+    thinking_policy: require_enabled
 
   # ===========================================================================
   # DeepSeek — adapter + canvas. proxy has no arm; DB has no rows.
