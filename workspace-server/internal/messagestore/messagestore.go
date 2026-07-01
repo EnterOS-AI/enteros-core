@@ -28,6 +28,11 @@
 //
 //   - Return messages newest-first, up to opts.Limit. Caller (the
 //     handler) is responsible for opts.Limit clamping.
+//   - Assign each ChatMessage a STABLE id: the same logical message must
+//     get the same ChatMessage.ID across repeated List calls. Clients
+//     dedupe reconcile fetches by id; a per-request random id doubles the
+//     visible history on every poll. Derive it from a stable per-row key
+//     (e.g. the storage row id/PK) + bubble kind, never uuid-per-fetch.
 //   - Honor opts.BeforeTS as a strict less-than cursor when
 //     opts.HasBefore is true; ignore it when false. Use HasBefore (not
 //     a zero-time check) so a legitimate "start of epoch" cursor is
@@ -69,9 +74,15 @@ import (
 // Mirrors canvas's ChatMessage TS type so the canvas can render
 // without per-row mapping.
 //
-// ID is server-minted per ChatMessage. Activity-log rows don't carry
-// message-shaped ids; canvas dedupes by (role, content, timestamp
-// window) not by id, so id stability across requests is not required.
+// ID is a STABLE, deterministic per-message id: the SAME logical
+// message MUST yield the SAME ChatMessage.ID on every List call. The
+// canvas reconcile (useChatHistory.mergeReconciledMessages) dedupes by
+// id, so a fresh/random id per fetch makes every poll re-append the
+// whole window — the "My Chat" doubling bug. The Postgres default
+// derives it from the activity_logs row PK + bubble kind
+// ("<row_id>:user" / "<row_id>:agent"); alternative stores MUST likewise
+// return an id that is stable for a given logical message across
+// repeated List calls.
 type ChatMessage struct {
 	ID          string           `json:"id"`
 	Role        string           `json:"role"` // "user" | "agent" | "system"

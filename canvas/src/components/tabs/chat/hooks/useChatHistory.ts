@@ -54,20 +54,28 @@ async function loadMessagesFromDB(
 }
 
 /** Merge a freshly-fetched batch of persisted messages into the existing
- *  in-memory list. Identical messages are keyed by `id` and overwritten
- *  with the server copy (so fields like `toolTrace` stay in sync), then
- *  the combined set is re-sorted by timestamp. New replies that were
- *  missed by the WebSocket path therefore appear in the correct order
- *  without discarding older history the user has already lazy-loaded.
+ *  in-memory list. Messages are keyed by their identity tuple
+ *  (timestamp+role+content) and overwritten with the server copy (so
+ *  fields like `toolTrace` stay in sync), then the combined set is
+ *  re-sorted by timestamp. New replies that were missed by the WebSocket
+ *  path therefore appear in the correct order without discarding older
+ *  history the user has already lazy-loaded.
  *
- *  The map-key fallback for messages without an id is a stable tuple of
- *  timestamp+role+content; this path is defensive — chat-history rows
- *  today always carry an id. */
+ *  Why key on the tuple, not `m.id`: this reconcile re-fetches the same
+ *  chat-history window every 10s and on every WS reconnect. If it keyed
+ *  on a server id that was NOT stable across fetches, the same row would
+ *  land under a new key each poll and the whole window would be
+ *  re-appended — the "My Chat" doubling bug (36→72→…). The backend now
+ *  mints a STABLE per-row id (activity_logs PK + bubble kind), but keying
+ *  on the intrinsic tuple keeps this dedup correct even if a store ever
+ *  regresses to a per-fetch id. The row's created_at timestamp is per-row
+ *  unique and role separates the user/agent bubbles of one row, so
+ *  distinct messages keep distinct keys. */
 function mergeReconciledMessages(
   existing: ChatMessage[],
   fetched: ChatMessage[],
 ): ChatMessage[] {
-  const keyOf = (m: ChatMessage) => m.id || `${m.timestamp}|${m.role}|${m.content}`;
+  const keyOf = (m: ChatMessage) => `${m.timestamp}|${m.role}|${m.content}`;
   const map = new Map<string, ChatMessage>();
   for (const m of existing) map.set(keyOf(m), m);
   for (const m of fetched) map.set(keyOf(m), m);
