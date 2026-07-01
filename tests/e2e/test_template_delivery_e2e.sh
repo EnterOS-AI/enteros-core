@@ -76,6 +76,21 @@ ASSET_SETTLE_SECS="${E2E_ASSET_SETTLE_SECS:-180}"
 # back to the random suffix (unchanged behavior).
 RAND=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
 SLUG="${E2E_TMPL_SLUG:-e2e-tmpl-${RAND}}"
+# SAFETY (destructive-selector guard): SLUG is the teardown selector — BOTH this
+# script's cleanup_org trap (installed below on EXIT/INT/TERM) and the wrapping
+# workflow's always() net run `DELETE /cp/admin/tenants/$SLUG` with the CP admin
+# token. An unvalidated E2E_TMPL_SLUG override (typo, stale value, or a real org
+# name) would aim that admin DELETE at an arbitrary tenant. Accept ONLY an
+# ephemeral e2e-tmpl-* slug — the exact shape both the CI mint step and the RAND
+# fallback above produce (`e2e-tmpl-<8 hex>`, what slugs.IsEphemeral() / the CP
+# reaper classify ephemeral; a strict subset of the ephemeral policy
+# ^e2e-tmpl-[a-z0-9]+$). Fail fast HERE — before the delete trap is installed and
+# before any create/delete — so a bad override can neither provision nor
+# deprovision anything. Exit 2 = bad env (see the header's exit map).
+if [[ ! "$SLUG" =~ ^e2e-tmpl-[a-f0-9]{8}$ ]]; then
+  echo "[FATAL] refusing unsafe E2E_TMPL_SLUG='$SLUG' — must be an ephemeral e2e org matching ^e2e-tmpl-[a-f0-9]{8}\$. NOT installing the teardown trap; NOT creating or deprovisioning any org." >&2
+  exit 2
+fi
 CURL_COMMON=(-sS --max-time 30)
 
 log()  { echo "[$(date +%H:%M:%S)] $*" >&2; }

@@ -246,6 +246,15 @@ jobs:
             echo "::notice::no E2E_TMPL_SLUG recorded — nothing to tear down (no org was minted)."
             exit 0
           fi
+          # SAFETY (destructive-selector guard): this net runs `DELETE
+          # /cp/admin/tenants/$slug` with the admin token. slug is normally the
+          # mint step's e2e-tmpl-<8hex>, but validate defensively so a corrupted
+          # or overridden $GITHUB_ENV value can never turn the net into an
+          # arbitrary-tenant deleter. Only ever target a validated ephemeral slug.
+          if ! printf '%s' "$slug" | grep -Eq '^e2e-tmpl-[a-f0-9]{8}$'; then
+            echo "::warning::refusing teardown of non-ephemeral slug '$slug' (must match ^e2e-tmpl-[a-f0-9]{8}$) — skipping admin DELETE."
+            exit 0
+          fi
           if [ -z "$token" ]; then
             echo "::warning::teardown: no admin token (fork PR / KMS step skipped) — cannot deprovision $slug. The CP reaper e2e-leak pass is the backstop."
             exit 0
