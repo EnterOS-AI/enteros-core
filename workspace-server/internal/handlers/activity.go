@@ -947,6 +947,63 @@ func (h *ActivityHandler) Report(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "logged"})
 }
 
+// Ack handles POST /workspaces/:id/activity/ack — MUST-FIX 3.
+//
+// The workspace's inbox poller calls this after draining a batch of
+// activity_logs rows to durably record the highest `seq` it has handled.
+// The stored cursor (inbox_delivery_state.last_acked_seq) gates the
+// retention prune: an old row is only reclaimed once its consumer has
+// acked past it (db.PruneActivityLogs), so a slow / restarted poller can
+// no longer lose un-drained inbox rows to the cleaner.
+//
+// Body: {"acked_seq": <int64>}.
+//
+// Semantics:
+//   - Monotonic max-advance: the cursor only ever moves forward. The
+//     UPSERT uses GREATEST(existing, incoming), so a re-ordered, duplicate,
+//     or stale ack for a lower seq is a safe no-op — idempotent by
+//     construction. Re-POSTing the same acked_seq is also a no-op.
+//   - acked_seq must be >= 0 (0 is a valid, if pointless, no-op ack). A
+//     missing or negative value is a 400 at the trust boundary.
+//
+// WorkspaceAuth on the wsAuth group already proves the caller owns :id, so
+// there is no cross-workspace cursor write here (workspace_id is taken from
+// the authenticated path param, never from the body).
+func (h *ActivityHandler) Ack(c *gin.Context) {
+	workspaceID := c.Param("id")
+	var body struct {
+		AckedSeq *int64 `json:"acked_seq"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.AckedSeq == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "acked_seq is required"})
+		return
+	}
+	if *body.AckedSeq < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "acked_seq must be >= 0"})
+		return
+	}
+
+	// UPSERT with GREATEST so the cursor is strictly non-decreasing even
+	// under out-of-order / concurrent acks. RETURNING gives the caller the
+	// authoritative stored value (which may be HIGHER than what it sent if a
+	// later ack already landed) so a poller can detect it was behind.
+	var stored int64
+	if err := db.DB.QueryRowContext(c.Request.Context(), `
+		INSERT INTO inbox_delivery_state (workspace_id, last_acked_seq, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (workspace_id) DO UPDATE
+		   SET last_acked_seq = GREATEST(inbox_delivery_state.last_acked_seq, EXCLUDED.last_acked_seq),
+		       updated_at     = now()
+		RETURNING last_acked_seq
+	`, workspaceID, *body.AckedSeq).Scan(&stored); err != nil {
+		log.Printf("activity ack: upsert failed for ws=%s: %v", workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record ack"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"last_acked_seq": stored})
+}
+
 // LogActivity inserts an activity log and optionally broadcasts via WebSocket.
 // Takes events.EventEmitter (#1814) so callers passing a stub broadcaster
 // in tests no longer need to construct the full *events.Broadcaster.
