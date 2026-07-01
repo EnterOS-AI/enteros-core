@@ -438,11 +438,21 @@ func (h *ActivityHandler) List(c *gin.Context) {
 	if includePeerInfo {
 		actCol = "activity_logs."
 	}
+	// `seq` is the monotonic per-row sequence (activity_logs.seq, NOT NULL —
+	// see 20260604000000_activity_logs_seq migration). It is already used in
+	// the WHERE/ORDER BY tuple cursor below, but MUST also be projected so
+	// consumers receive it: the runtime inbox poller derives its durable-
+	// consumed high-water mark from row["seq"] and POSTs it to /activity/ack.
+	// Omitting it here made that ack inert (max_seq stayed 0 → no ack →
+	// last_acked_seq never advanced → acked-prune reclaimed nothing → the
+	// activity_logs table degraded to the 30d hard-ceiling-only retention).
+	// Appended AFTER created_at (last base column) so it precedes the
+	// JOIN-derived peer columns and keeps the existing scan/wire order stable.
 	selectClause := `SELECT ` + actCol + `id, ` + actCol + `workspace_id, ` + actCol + `activity_type, ` +
 		actCol + `source_id, ` + actCol + `target_id, ` + actCol + `method, ` +
 		actCol + `summary, ` + actCol + `request_body, ` + actCol + `response_body, ` +
 		actCol + `tool_trace, ` + actCol + `duration_ms, ` + actCol + `status, ` +
-		actCol + `error_detail, ` + actCol + `created_at`
+		actCol + `error_detail, ` + actCol + `created_at, ` + actCol + `seq`
 	fromClause := ` FROM activity_logs`
 	if includePeerInfo {
 		selectClause += `, w.name AS peer_name, w.role AS peer_role`
@@ -559,6 +569,9 @@ func (h *ActivityHandler) List(c *gin.Context) {
 		var reqBody, respBody, toolTrace []byte
 		var durationMs *int
 		var createdAt time.Time
+		// Monotonic per-row sequence — projected so the runtime inbox
+		// poller can ack it (drives durable acked-delivery pruning).
+		var seq int64
 		// LEFT JOIN'd peer columns — pointer-string so a NULL row
 		// (canvas message OR deleted peer workspace) decodes as nil
 		// rather than empty-string. Only scanned when includePeerInfo
@@ -569,10 +582,11 @@ func (h *ActivityHandler) List(c *gin.Context) {
 		if includePeerInfo {
 			scanErr = rows.Scan(&id, &wsID, &actType, &sourceID, &targetID, &method,
 				&summary, &reqBody, &respBody, &toolTrace, &durationMs, &status, &errorDetail, &createdAt,
-				&peerName, &peerRole)
+				&seq, &peerName, &peerRole)
 		} else {
 			scanErr = rows.Scan(&id, &wsID, &actType, &sourceID, &targetID, &method,
-				&summary, &reqBody, &respBody, &toolTrace, &durationMs, &status, &errorDetail, &createdAt)
+				&summary, &reqBody, &respBody, &toolTrace, &durationMs, &status, &errorDetail, &createdAt,
+				&seq)
 		}
 		if scanErr != nil {
 			log.Printf("Activity scan error: %v", scanErr)
@@ -591,6 +605,10 @@ func (h *ActivityHandler) List(c *gin.Context) {
 			"status":        status,
 			"error_detail":  errorDetail,
 			"created_at":    createdAt,
+			// seq: monotonic per-row sequence. Consumers (notably the
+			// runtime inbox poller's /activity/ack) read this off the row;
+			// without it the ack is inert and acked-prune reclaims nothing.
+			"seq": seq,
 		}
 		if reqBody != nil {
 			entry["request_body"] = json.RawMessage(reqBody)
