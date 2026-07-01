@@ -230,33 +230,39 @@ jobs:
       # the CP reaper e2e-leak pass remains the last-resort backstop.
       - name: Teardown safety-net (deprovision e2e-tmpl org on cancel/timeout/failure)
         if: always() && needs.detect-changes.outputs.delivery == 'true'
-        env:
-          # Sourced from Infisical by the KMS step above (same alias the e2e uses).
-          ADMIN_TOKEN: ${{ env.MOLECULE_ADMIN_TOKEN }}
-          E2E_TMPL_SLUG: ${{ env.E2E_TMPL_SLUG }}
         run: |
           set +e
-          if [ -z "${E2E_TMPL_SLUG:-}" ]; then
+          # MOLECULE_ADMIN_TOKEN (KMS step) and E2E_TMPL_SLUG (mint step) were
+          # written to $GITHUB_ENV by earlier steps, so they are already job-scoped
+          # shell env vars here — read them DIRECTLY rather than re-binding through
+          # `${{ env.* }}` step-env (which is redundant and, if a runner resolves
+          # the expression before the prior step's $GITHUB_ENV commit, could read
+          # empty and skip teardown exactly when it is needed). Direct reads are
+          # unambiguous and survive a mid-run cancel/timeout (the writing steps
+          # ran first). Mirrors the reviewer-recommended shape.
+          slug="${E2E_TMPL_SLUG:-}"
+          token="${MOLECULE_ADMIN_TOKEN:-}"
+          if [ -z "$slug" ]; then
             echo "::notice::no E2E_TMPL_SLUG recorded — nothing to tear down (no org was minted)."
             exit 0
           fi
-          if [ -z "${ADMIN_TOKEN:-}" ]; then
-            echo "::warning::teardown: no admin token (fork PR / KMS step skipped) — cannot deprovision $E2E_TMPL_SLUG. The CP reaper e2e-leak pass is the backstop."
+          if [ -z "$token" ]; then
+            echo "::warning::teardown: no admin token (fork PR / KMS step skipped) — cannot deprovision $slug. The CP reaper e2e-leak pass is the backstop."
             exit 0
           fi
-          echo "Safety-net teardown: deprovisioning org $E2E_TMPL_SLUG via CP admin delete"
+          echo "Safety-net teardown: deprovisioning org $slug via CP admin delete"
           # Tempfile-routed -w keeps curl's exit code from polluting the captured
           # HTTP status (lint-curl-status-capture). confirm body is REQUIRED by
           # the CP DeleteTenant handler (must equal the URL slug).
           curl -sS -o /tmp/tmpl-teardown.out -w "%{http_code}" \
-            --max-time 180 -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$E2E_TMPL_SLUG" \
-            -H "Authorization: Bearer $ADMIN_TOKEN" \
+            --max-time 180 -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
+            -H "Authorization: Bearer $token" \
             -H "Content-Type: application/json" \
-            -d "{\"confirm\":\"$E2E_TMPL_SLUG\"}" >/tmp/tmpl-teardown.code
+            -d "{\"confirm\":\"$slug\"}" >/tmp/tmpl-teardown.code
           code=$(cat /tmp/tmpl-teardown.code 2>/dev/null || echo "000")
           if [ "$code" = "200" ] || [ "$code" = "204" ] || [ "$code" = "404" ]; then
-            echo "[teardown] deprovisioned $E2E_TMPL_SLUG (HTTP $code)"
+            echo "[teardown] deprovisioned $slug (HTTP $code)"
           else
-            echo "::warning::teardown for $E2E_TMPL_SLUG returned HTTP $code — the CP reaper e2e-leak pass is the backstop. Body: $(head -c 300 /tmp/tmpl-teardown.out 2>/dev/null)"
+            echo "::warning::teardown for $slug returned HTTP $code — the CP reaper e2e-leak pass is the backstop. Body: $(head -c 300 /tmp/tmpl-teardown.out 2>/dev/null)"
           fi
           exit 0
