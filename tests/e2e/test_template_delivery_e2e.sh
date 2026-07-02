@@ -68,8 +68,29 @@ PLUGIN_INSTALL_TIMEOUT_SECS="${E2E_PLUGIN_INSTALL_TIMEOUT_SECS:-600}"
 ASSET_SETTLE_SECS="${E2E_ASSET_SETTLE_SECS:-180}"
 
 # Collision-proof slug (random suffix), same convention as the sibling harness.
+# Honors an optional E2E_TMPL_SLUG override so the wrapping CI workflow can MINT
+# a deterministic slug BEFORE this script starts. That is what lets the
+# workflow's always() teardown safety-net deprovision the exact org even when
+# this script is SIGKILLed mid-provision (job hard-timeout / runner cancel)
+# before its own EXIT trap can fire. Local / dispatch runs with no override fall
+# back to the random suffix (unchanged behavior).
 RAND=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
-SLUG="e2e-tmpl-${RAND}"
+SLUG="${E2E_TMPL_SLUG:-e2e-tmpl-${RAND}}"
+# SAFETY (destructive-selector guard): SLUG is the teardown selector — BOTH this
+# script's cleanup_org trap (installed below on EXIT/INT/TERM) and the wrapping
+# workflow's always() net run `DELETE /cp/admin/tenants/$SLUG` with the CP admin
+# token. An unvalidated E2E_TMPL_SLUG override (typo, stale value, or a real org
+# name) would aim that admin DELETE at an arbitrary tenant. Accept ONLY an
+# ephemeral e2e-tmpl-* slug — the exact shape both the CI mint step and the RAND
+# fallback above produce (`e2e-tmpl-<8 hex>`, what slugs.IsEphemeral() / the CP
+# reaper classify ephemeral; a strict subset of the ephemeral policy
+# ^e2e-tmpl-[a-z0-9]+$). Fail fast HERE — before the delete trap is installed and
+# before any create/delete — so a bad override can neither provision nor
+# deprovision anything. Exit 2 = bad env (see the header's exit map).
+if [[ ! "$SLUG" =~ ^e2e-tmpl-[a-f0-9]{8}$ ]]; then
+  echo "[FATAL] refusing unsafe E2E_TMPL_SLUG='$SLUG' — must be an ephemeral e2e org matching ^e2e-tmpl-[a-f0-9]{8}\$. NOT installing the teardown trap; NOT creating or deprovisioning any org." >&2
+  exit 2
+fi
 CURL_COMMON=(-sS --max-time 30)
 
 log()  { echo "[$(date +%H:%M:%S)] $*" >&2; }
@@ -86,8 +107,13 @@ cleanup_org() {
     log "E2E_KEEP_ORG=1 — leaving $SLUG; delete manually."; return $rc
   fi
   log "teardown: DELETE tenant $SLUG"
+  # The CP DeleteTenant handler REQUIRES a {"confirm":"<slug>"} body that equals
+  # the URL slug (fat-finger / replay guard). Without it the DELETE 400s — which
+  # is exactly why this trap used to leak: it sent no body, the 400 was swallowed
+  # by `|| true`, and the org was never deprovisioned. Send the confirm body.
   curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" >/dev/null 2>&1 || true
+    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1 || true
   return $rc
 }
 trap cleanup_org EXIT INT TERM
@@ -104,6 +130,14 @@ CREATE=$(admin_call POST /cp/admin/orgs \
 ORG_ID=$(echo "$CREATE" | python3 -c "import json,sys;print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
 [ -z "$ORG_ID" ] && fail "org create missing id: $CREATE"
 ok "org created id=$ORG_ID"
+# Publish the created org's slug + id to the CI env file the moment the org
+# (and its tenant container) exist — BEFORE the long provisioning waits — so the
+# wrapping workflow's always() teardown safety-net can deprovision THIS org even
+# if the script is killed mid-provision before its EXIT trap runs. No-op outside
+# Actions (GITHUB_ENV unset). Best-effort: never fail the run on a write error.
+if [ -n "${GITHUB_ENV:-}" ]; then
+  { echo "E2E_TMPL_SLUG=$SLUG"; echo "E2E_TMPL_ORG_ID=$ORG_ID"; } >> "$GITHUB_ENV" 2>/dev/null || true
+fi
 
 # ─── 2. wait for tenant running ──────────────────────────────────────────────
 log "2/6 waiting for tenant provisioning (≤${PROVISION_TIMEOUT_SECS}s)"

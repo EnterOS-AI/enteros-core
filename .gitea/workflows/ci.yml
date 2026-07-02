@@ -526,6 +526,14 @@ jobs:
           # live arm to prove this, so this unit test IS the regression gate:
           # a revert of the zero-validated→RED logic goes red on every PR.
           bash tests/e2e/test_require_live_priority_gate_unit.sh
+          # core#3375: fail-direction proof for the E2E_TMPL_SLUG
+          # destructive-selector guard in test_template_delivery_e2e.sh.
+          # Offline (no CP/network): drives the REAL script with dummy creds and
+          # CP pointed at a closed port — asserts a non-ephemeral override exits 2
+          # with the refusal BEFORE the delete trap / any provision-or-deprovision,
+          # and that a legitimate e2e-tmpl-<8hex> slug clears the guard. A revert
+          # of the guard (re-trusting the raw override) goes red on every PR.
+          bash tests/e2e/test_template_slug_guard.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Drift guard — KI-013 container/volume naming (SEV #2499)
