@@ -142,6 +142,27 @@ func sanitizeSourceForLog(raw string) string {
 	return u.String()
 }
 
+// manifestSSOTEnforceDisabledLogOnce gates the single operator-facing
+// notice that the SSOT manifest kill-switch is engaged.
+var manifestSSOTEnforceDisabledLogOnce sync.Once
+
+// manifestSSOTEnforcementEnabled reports whether install-time SSOT
+// manifest validation is fail-closed (core#3383 PR-4). Default ON; the
+// operator escape hatch is MOLECULE_MANIFEST_SSOT_ENFORCE=off (case-
+// insensitive), which reverts violations to the advisory log line.
+// envx.Bool is deliberately not used: its ParseBool vocabulary does not
+// accept "off", and the mental model here is "set off to disable", not
+// a truthy flag. Read per call — the install path is not hot.
+func manifestSSOTEnforcementEnabled() bool {
+	if strings.EqualFold(os.Getenv("MOLECULE_MANIFEST_SSOT_ENFORCE"), "off") {
+		manifestSSOTEnforceDisabledLogOnce.Do(func() {
+			log.Printf("Plugin install: SSOT manifest enforcement DISABLED via MOLECULE_MANIFEST_SSOT_ENFORCE=off — advisory mode")
+		})
+		return false
+	}
+	return true
+}
+
 // installRequest is the decoded, validated payload a caller submits.
 // Held out as its own type so resolveAndStage is testable without a
 // gin.Context; the handler just decodes into this shape.
@@ -312,16 +333,33 @@ func (h *PluginsHandler) resolveAndStage(ctx context.Context, req installRequest
 		}
 	}
 
-	// SSOT manifest validation — ADVISORY phase of core#3383. Violations
-	// against the vendored plugin-manifest schema are logged, never block:
-	// zero behavior change. Fail-closed promotion is PR-4, post-soak.
-	// The staged tree is untrusted: the manifest read rejects symlinks /
-	// non-regular files and is size-capped, and the logged source is
-	// credential-stripped.
+	// SSOT manifest validation — FAIL-CLOSED phase of core#3383 (PR-4,
+	// post-soak: 25/25 real org manifests validated clean). A present,
+	// readable plugin.yaml that violates the vendored plugin-manifest
+	// schema now aborts the install with 422, mirroring the
+	// VerifyManifestIntegrity posture above; the kill-switch
+	// MOLECULE_MANIFEST_SSOT_ENFORCE=off reverts to the advisory line.
+	// A MISSING or not-validatable plugin.yaml (absent file, symlink /
+	// non-regular, over the read cap) stays ADVISORY: staged trees with
+	// no plugin.yaml are legal today. The staged tree is untrusted: the
+	// manifest read rejects symlinks / non-regular files and is size-
+	// capped, and the source is credential-stripped in BOTH the log line
+	// and the 422 body (responses can land in client logs / proxies /
+	// support bundles — no new secret-echo path).
 	if data, readErr := readStagedManifestForAdvisory(stagedDir); readErr != nil {
 		log.Printf("Plugin install: SSOT manifest validation (advisory): plugin=%s source=%s: no validatable plugin.yaml in staged tree: %v",
 			pluginName, sanitizeSourceForLog(source.Raw()), readErr)
 	} else if v := plugins.ValidateManifestSSOT(data); len(v) > 0 {
+		if manifestSSOTEnforcementEnabled() {
+			cleanup()
+			log.Printf("Plugin install: SSOT manifest validation FAILED (fail-closed): plugin=%s source=%s %d violation(s): %s",
+				pluginName, sanitizeSourceForLog(source.Raw()), len(v), strings.Join(v, "; "))
+			return nil, newHTTPErr(http.StatusUnprocessableEntity, gin.H{
+				"error":      "plugin manifest violates the plugin-manifest SSOT schema (core#3383)",
+				"violations": v,
+				"source":     sanitizeSourceForLog(source.Raw()),
+			})
+		}
 		log.Printf("Plugin install: SSOT manifest validation (advisory): plugin=%s source=%s %d violation(s): %s",
 			pluginName, sanitizeSourceForLog(source.Raw()), len(v), strings.Join(v, "; "))
 	}
