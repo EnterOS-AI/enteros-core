@@ -203,13 +203,13 @@ func TestActivityList_IncludePeerInfo_IssuesLeftJoin(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "workspace_id", "activity_type", "source_id", "target_id",
 			"method", "summary", "request_body", "response_body",
-			"tool_trace", "duration_ms", "status", "error_detail", "created_at",
+			"tool_trace", "duration_ms", "status", "error_detail", "created_at", "seq",
 			"peer_name", "peer_role",
 		}).
 			AddRow("act-1", "ws-1", "a2a_receive", peerID, "ws-1",
 				"message/send", "Agent message: hello",
 				[]byte(`{"jsonrpc":"2.0","method":"message/send","params":{"message":{"parts":[{"kind":"text","text":"hello"}]}}}`),
-				nil, nil, nil, "ok", nil, time.Now(),
+				nil, nil, nil, "ok", nil, time.Now(), int64(11),
 				"Production Manager", "product manager"))
 
 	gin.SetMode(gin.TestMode)
@@ -266,14 +266,14 @@ func TestActivityList_IncludePeerInfo_CanvasRowHasNoPeerFields(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "workspace_id", "activity_type", "source_id", "target_id",
 			"method", "summary", "request_body", "response_body",
-			"tool_trace", "duration_ms", "status", "error_detail", "created_at",
+			"tool_trace", "duration_ms", "status", "error_detail", "created_at", "seq",
 			"peer_name", "peer_role",
 		}).
 			// source_id NULL = canvas message; peer columns also NULL.
 			AddRow("act-canvas", "ws-1", "a2a_receive", nil, "ws-1",
 				"notify", "User said hi",
 				[]byte(`{"params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}`),
-				nil, nil, nil, "ok", nil, time.Now(),
+				nil, nil, nil, "ok", nil, time.Now(), int64(12),
 				nil, nil))
 
 	gin.SetMode(gin.TestMode)
@@ -317,7 +317,7 @@ func TestActivityList_IncludePeerInfo_AttachmentsSurfaceFromRequestBody(t *testi
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "workspace_id", "activity_type", "source_id", "target_id",
 			"method", "summary", "request_body", "response_body",
-			"tool_trace", "duration_ms", "status", "error_detail", "created_at",
+			"tool_trace", "duration_ms", "status", "error_detail", "created_at", "seq",
 			"peer_name", "peer_role",
 		}).
 			AddRow("act-with-file", "ws-1", "a2a_receive", peerID, "ws-1",
@@ -326,7 +326,7 @@ func TestActivityList_IncludePeerInfo_AttachmentsSurfaceFromRequestBody(t *testi
 					{"kind":"text","text":"see attached"},
 					{"kind":"file","file":{"uri":"workspace:foo.pdf","mime_type":"application/pdf","name":"foo.pdf"}}
 				]}}}`),
-				nil, nil, nil, "ok", nil, time.Now(),
+				nil, nil, nil, "ok", nil, time.Now(), int64(13),
 				"Code Reviewer", "code reviewer"))
 
 	gin.SetMode(gin.TestMode)
@@ -378,11 +378,11 @@ func TestActivityList_IncludePeerInfo_Unset_NoJoinNoExtraFields(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "workspace_id", "activity_type", "source_id", "target_id",
 			"method", "summary", "request_body", "response_body",
-			"tool_trace", "duration_ms", "status", "error_detail", "created_at",
+			"tool_trace", "duration_ms", "status", "error_detail", "created_at", "seq",
 		}).
 			AddRow("act-1", "ws-1", "a2a_receive", "11111111-2222-3333-4444-555555555555", "ws-1",
 				"message/send", "Hello",
-				nil, nil, nil, nil, "ok", nil, time.Now()))
+				nil, nil, nil, nil, "ok", nil, time.Now(), int64(1)))
 
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -631,7 +631,7 @@ func TestActivityList_IncludePeerInfo_ChatUploadReceiveCanvasRow(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "workspace_id", "activity_type", "source_id", "target_id",
 			"method", "summary", "request_body", "response_body",
-			"tool_trace", "duration_ms", "status", "error_detail", "created_at",
+			"tool_trace", "duration_ms", "status", "error_detail", "created_at", "seq",
 			"peer_name", "peer_role",
 		}).
 			// Empirical shape from 2026-05-21 ~23:12Z agents-team canvas paste.
@@ -644,7 +644,7 @@ func TestActivityList_IncludePeerInfo_ChatUploadReceiveCanvasRow(t *testing.T) {
 					"file_id":"26111d48-aaaa-bbbb-cccc-dddddddddddd",
 					"mimeType":"image/png"
 				}`),
-				nil, nil, nil, "ok", nil, time.Now(),
+				nil, nil, nil, "ok", nil, time.Now(), int64(14),
 				nil, nil))
 
 	gin.SetMode(gin.TestMode)

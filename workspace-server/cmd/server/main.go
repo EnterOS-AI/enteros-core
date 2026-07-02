@@ -31,6 +31,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -180,8 +181,23 @@ func main() {
 	// (systemic — affects every background goroutine).
 	go supervised.RunWithRecover(ctx, "broadcaster", broadcaster.Subscribe)
 
-	// Activity log retention — configurable via env vars
-	retentionDays := envOr("ACTIVITY_RETENTION_DAYS", "7")
+	// Activity log retention — configurable via env vars.
+	//
+	// MUST-FIX 3: the prune is now age-AND-acked with a hard ceiling instead
+	// of age-only. softDays (ACTIVITY_RETENTION_DAYS, default 7) reclaims a
+	// row only once the workspace's inbox poller has acked past it; hardDays
+	// (ACTIVITY_HARD_RETENTION_DAYS, default 30) is the unconditional backstop
+	// so a permanently-silent consumer can't pin rows forever. See
+	// db.PruneActivityLogs — it is provably never less conservative than the
+	// old age-only prune (and clamps hard >= soft to keep that guarantee).
+	softDays := 7
+	if n, err := strconv.Atoi(envOr("ACTIVITY_RETENTION_DAYS", "7")); err == nil && n > 0 {
+		softDays = n
+	}
+	hardDays := 30
+	if n, err := strconv.Atoi(envOr("ACTIVITY_HARD_RETENTION_DAYS", "30")); err == nil && n > 0 {
+		hardDays = n
+	}
 	cleanupHours := envOr("ACTIVITY_CLEANUP_INTERVAL_HOURS", "6")
 	cleanupInterval, _ := time.ParseDuration(cleanupHours + "h")
 	if cleanupInterval == 0 {
@@ -195,16 +211,11 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				result, err := db.DB.ExecContext(ctx, `DELETE FROM activity_logs WHERE created_at < now() - ($1 || ' days')::interval`, retentionDays)
+				n, err := db.PruneActivityLogs(ctx, softDays, hardDays)
 				if err != nil {
 					log.Printf("Activity log cleanup error: %v", err)
-				} else {
-					n, err := result.RowsAffected()
-					if err != nil {
-						log.Printf("Activity log cleanup RowsAffected error: %v", err)
-					} else if n > 0 {
-						log.Printf("Activity log cleanup: purged %d old entries", n)
-					}
+				} else if n > 0 {
+					log.Printf("Activity log cleanup: purged %d old entries", n)
 				}
 			}
 		}
