@@ -185,6 +185,10 @@ def http(
     final_headers = {
         "Authorization": f"token {GITEA_TOKEN}",
         "Accept": "application/json" if expect_json else "text/plain",
+        # CF WAF in front of git.moleculesai.app 1010-bans the default
+        # Python-urllib UA; send a non-urllib UA so this reaches Gitea
+        # (transport-only — auth/method/semantics unchanged).
+        "User-Agent": "molecule-ci-gate/1.0 (+gitea-api)",
     }
     if headers:
         final_headers.update(headers)

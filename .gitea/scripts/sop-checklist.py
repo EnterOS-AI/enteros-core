@@ -482,6 +482,10 @@ class GiteaClient:
         headers = {
             "Authorization": f"token {self.token}",
             "Accept": "application/json",
+            # CF WAF in front of git.moleculesai.app 1010-bans the default
+            # Python-urllib UA; send a non-urllib UA so this reaches Gitea
+            # (transport-only — auth/method/semantics unchanged).
+            "User-Agent": "molecule-ci-gate/1.0 (+gitea-api)",
         }
         if body is not None:
             data = json.dumps(body).encode("utf-8")
