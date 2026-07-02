@@ -46,11 +46,16 @@
 #   those remain human-team-only (enforced by review-check.sh team
 #   probe against TEAM_ID 20/21).
 #
-#   INITIAL ai_ack_eligible allowlist (CTO-controlled, msg 1388c76f):
+#   ai_ack_eligible allowlist (CTO-controlled, msg 1388c76f; widened
+#   2026-07-01 to make the four reviewer-judgment items agent-resolvable
+#   via the ai-sop-ack team — the widening is ADDITIVE: each still requires
+#   a non-author ack from its configured required_teams, it only adds the
+#   ai-sop-ack team as an accepted acker):
 #     comprehensive-testing, local-postgres-e2e, staging-smoke,
-#     five-axis-review, memory-consulted
-#   HUMAN-ONLY carve-out:
-#     root-cause, no-backwards-compat
+#     five-axis-review, memory-consulted, root-cause, no-backwards-compat,
+#     scope-matches-declared, public-repo-hygiene
+#   HUMAN-ONLY carve-out (code-level _HUMAN_ONLY_SLUGS; not in live config):
+#     migration, schema
 #   Any widening requires an explicit config change reviewed by CTO.
 
 version: 1
@@ -118,6 +123,7 @@ items:
     pr_section_marker: "Root-cause not symptom"
     required_teams: [engineers, managers, ceo]
     required_teams_high_risk: [ceo]
+    ai_ack_eligible: true
     description: >-
       One-sentence root-cause statement. Default class: non-author
       engineers/managers/ceo ack suffices (engineers can attest
@@ -140,6 +146,7 @@ items:
     pr_section_marker: "No backwards-compat shim / dead code added"
     required_teams: [engineers, managers, ceo]
     required_teams_high_risk: [ceo]
+    ai_ack_eligible: true
     description: >-
       Yes/no + justification if no. Default class: non-author
       engineers/managers/ceo ack suffices. High-risk class
@@ -165,12 +172,15 @@ items:
     pr_section_marker: "Scope matches title"
     required_teams: [engineers, managers, ceo]
     required_teams_high_risk: [ceo]
+    ai_ack_eligible: true
     description: >-
       The PR file list matches its declared scope/title — no off-topic
       files, no unreviewable size (a "36 test cases" PR that adds 396 files
       + a lockfile + runbooks is a REJECT / re-scope, not a pass). Reviewer
       confirms they walked the FULL file list, not just the headline change.
-      Non-author ack; NOT ai-ack-eligible (a reviewer must actually look).
+      Non-author ack required. Agent-resolvable (2026-07-01): an ai-sop-ack
+      team member may ack on behalf of an automated FULL-file-list walk; a
+      non-author human engineers/managers/ceo ack also satisfies.
       Added 2026-06-23 after PR #881 slipped 6 runbooks into the PUBLIC repo
       under a canvas-test title.
 
@@ -179,12 +189,15 @@ items:
     pr_section_marker: "Public-repo hygiene checked"
     required_teams: [engineers, security, managers, ceo]
     required_teams_high_risk: [ceo]
+    ai_ack_eligible: true
     description: >-
       molecule-core is PUBLIC (private=false): every added path AND all git
       history is world-readable. Reviewer confirms this PR adds NO operational
       runbooks, internal docs, infra identifiers (hosts, account IDs, cred
       paths), or secrets. Ops docs belong in the private internal repo.
-      Non-author ack; NOT ai-ack-eligible.
+      Non-author ack required. Agent-resolvable (2026-07-01): an ai-sop-ack
+      team member may ack on behalf of an automated public-repo-hygiene scan;
+      a non-author human engineers/security/managers/ceo ack also satisfies.
 
 # N/A gate declarations (RFC#324 §N/A follow-up).
 # PRs where a gate genuinely does not apply (e.g., pure-infra with no
