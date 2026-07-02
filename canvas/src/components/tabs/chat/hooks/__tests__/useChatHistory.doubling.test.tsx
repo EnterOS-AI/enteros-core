@@ -6,13 +6,15 @@
 // fresh id per row per fetch: keying the merge on `m.id` then never
 // collided, so the whole window was re-appended and the visible list
 // doubled on every poll (36→72→…). The store now returns a STABLE per-row
-// id; the frontend also keys the merge on the (timestamp, role, content)
-// identity tuple as defense-in-depth. These tests pin both:
+// id (activity_logs PK + bubble kind), so the merge keys on that id and
+// dedupes correctly. These tests pin both halves of the contract:
 //
-//   1. repeated reconciles of the same window keep the list flat, and
-//   2. even if a fetch returns DIFFERENT ids for the same logical messages
-//      (a regressed/unstable backend id), the merge still does not grow —
-//      which is exactly what the old `m.id`-first key failed to do.
+//   1. repeated reconciles of the same window keep the list flat (the
+//      stable id dedupes), and
+//   2. two DISTINCT messages that happen to share (timestamp, role,
+//      content) but carry different stable ids BOTH survive — an id key
+//      preserves them where a (timestamp+role+content) tuple key would
+//      silently drop one (message loss).
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, waitFor, act } from "@testing-library/react";
@@ -59,33 +61,49 @@ describe("useChatHistory — My Chat doubling regression", () => {
       });
     }
 
-    // Five re-fetches of the identical window must NOT append anything.
+    // Five re-fetches of the identical window must NOT append anything:
+    // the stable per-row id collides on every merge.
     expect(result.current.messages).toHaveLength(4);
+    expect(result.current.messages.map((m) => m.id)).toEqual([
+      "row-1:user",
+      "row-1:agent",
+      "row-2:user",
+      "row-2:agent",
+    ]);
   });
 
-  it("does not double even if the backend re-mints ids for the same rows (tuple-keyed defense)", async () => {
-    apiGetMock.mockResolvedValueOnce({ messages: window0, reached_end: true });
+  it("keeps two distinct messages that share timestamp+role+content but differ by id (no silent drop)", async () => {
+    // Two SEPARATE persisted rows produced the same short user text ("ok")
+    // at the same created_at. They are genuinely distinct messages and must
+    // both remain visible. A (timestamp, role, content) tuple key collapses
+    // them into one — message loss. The stable per-row id keeps them apart.
+    const collidingWindow: Msg[] = [
+      { id: "row-7:user", role: "user", content: "ok", timestamp: "2026-06-27T00:05:00.000Z" },
+      { id: "row-8:user", role: "user", content: "ok", timestamp: "2026-06-27T00:05:00.000Z" },
+    ];
+    apiGetMock.mockResolvedValue({ messages: collidingWindow, reached_end: true });
 
-    const { result } = renderHook(() => useChatHistory("ws-remint"));
+    const { result } = renderHook(() => useChatHistory("ws-collide"));
     await waitFor(() => expect(result.current.loading).toBe(false));
-    expect(result.current.messages).toHaveLength(4);
 
-    // Each reconcile returns the SAME logical messages but with FRESH ids,
-    // simulating a store that regressed to a per-fetch id. With the old
-    // `m.id`-first key this grew the list by 4 every poll; the tuple key
-    // must keep it flat.
-    let mint = 0;
-    for (let r = 0; r < 5; r++) {
-      const reminted = window0.map((m) => ({ ...m, id: `remint-${mint++}-${m.role}` }));
-      apiGetMock.mockResolvedValueOnce({ messages: reminted, reached_end: true });
+    // Both distinct rows survive the initial load...
+    expect(result.current.messages).toHaveLength(2);
+    expect(result.current.messages.map((m) => m.id).sort()).toEqual([
+      "row-7:user",
+      "row-8:user",
+    ]);
+
+    // ...and survive repeated reconciles without either doubling (stable id
+    // dedupes) or collapsing (distinct ids are preserved).
+    for (let i = 0; i < 3; i++) {
       await act(async () => {
         await result.current.reconcile();
       });
     }
-
-    expect(result.current.messages).toHaveLength(4);
-    // Sanity: the surviving copies are the reminted ones (fetched overwrites
-    // existing under the same tuple key), and content is intact.
-    expect(result.current.messages.map((m) => m.content)).toEqual(["u1", "a1", "u2", "a2"]);
+    expect(result.current.messages).toHaveLength(2);
+    expect(result.current.messages.map((m) => m.id).sort()).toEqual([
+      "row-7:user",
+      "row-8:user",
+    ]);
   });
 });
