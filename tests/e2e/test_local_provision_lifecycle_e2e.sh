@@ -376,27 +376,25 @@ echo ""
 # ----------------------------------------------------------------------------
 echo "--- Step 2: provision workspace (POST /workspaces) ---"
 # Provision-time billing on this dev stack (no CP proxy env):
-#   * A claude-code workspace with a BARE model id derives provider=anthropic-api
-#     => BYOK, which FAILS CLOSED in prepare unless a usable LLM credential
-#     exists (MISSING_BYOK_CREDENTIAL).
-#   * The per-workspace secret-write guard blocks a vendor key while the
-#     workspace still resolves platform-managed (the MODEL secret isn't stored
-#     until AFTER payload.secrets are written at create time) — so we can't pass
-#     the key in the create payload.
-# So: create WITHOUT secrets, flip the workspace to byok (explicit override wins
-# in BOTH the guard's resolver and the provision resolver), then write the dummy
-# vendor key — now permitted. We do NOT rely on Create's first provision to seed
-# the config volume (it aborts byok-no-cred BEFORE Start, leaving the volume
-# empty). Instead we SEED config.yaml directly into the named config volume and
-# then trigger ONE clean provision via /restart. Seeding the volume is also what
-# makes the restart-survival assertion meaningful: the restart path reuses the
-# volume rather than any template.
-# core#2608: create is now ATOMIC for byok — the create-boundary gate
-# hard-rejects a byok model with no credential in scope, and the create-scope
-# vendor-key guard accepts the credential in the SAME payload (deriving from
-# the payload model instead of the not-yet-stored MODEL secret). So the dummy
-# key rides in the create body; the later flip+write steps remain as
-# idempotent belt-and-suspenders for the restart path.
+#   * platform-vs-BYOK is DERIVED purely from (runtime, model) via the provider
+#     registry — there is no stored billing-mode signal to set. The per-workspace
+#     `llm_billing_mode` field AND its PUT /admin/workspaces/:id/llm-billing-mode
+#     endpoint were removed 2026-06-30 (internal#691); nothing to "flip". A
+#     claude-code workspace on an anthropic model id (default LIFECYCLE_MODEL=
+#     claude-opus-4-7) derives provider=anthropic-api => IsPlatform()==false =>
+#     BYOK by model alone (minimax mode: MiniMax-M3 => provider=minimax, also BYOK).
+#   * BYOK FAILS CLOSED in prepare unless a usable LLM credential exists
+#     (MISSING_BYOK_CREDENTIAL). core#2608 made create ATOMIC for byok: the
+#     create-boundary gate hard-rejects a byok model with no credential in scope,
+#     and the create-scope vendor-key guard accepts the credential in the SAME
+#     payload (deriving from the payload model instead of the not-yet-stored
+#     MODEL secret). So the dummy vendor key rides in the create body below.
+# We do NOT rely on Create's first provision to seed the config volume: we SEED
+# config.yaml directly into the named config volume and then trigger ONE clean
+# provision via /restart. Seeding the volume is also what makes the restart-
+# survival assertion meaningful — the restart path reuses the volume rather than
+# any template. The later secret-write is idempotent belt-and-suspenders for the
+# restart path.
 CREATE_BODY=$(cat <<JSON
 {"name":"Lifecycle E2E Stub","tier":2,"runtime":"$RUNTIME","model":"$LIFECYCLE_MODEL","secrets":{"$LIFECYCLE_LLM_KEY":"$LIFECYCLE_LLM_VALUE"}}
 JSON
@@ -418,11 +416,11 @@ if [ -z "$WTOKEN" ]; then
   echo "=== Results: $PASS passed, $FAIL failed ==="; exit 1
 fi
 
-# Flip to byok BEFORE writing the vendor key (explicit override unblocks the
-# secret-write guard AND makes the provision resolver pick byok).
-BM=$(admin_curl -X PUT "$BASE/admin/workspaces/$WSID/llm-billing-mode" \
-  -H "Content-Type: application/json" -d '{"mode":"byok"}')
-check "billing mode set to byok" "byok" "$BM"
+# No billing-mode flip: BYOK is derived from the model (see Step 2 header). The
+# removed PUT /admin/workspaces/:id/llm-billing-mode endpoint (internal#691,
+# 2026-06-30) 404s and is not needed — the anthropic/minimax model id already
+# resolves the workspace to BYOK, so the vendor-key write below is permitted and
+# the provision resolver routes BYOK (route_to_platform=false).
 
 # Write the dummy LLM credential (now allowed on a byok workspace). Inert — the
 # stub never calls an LLM; it only needs to exist so byok has a usable cred.
