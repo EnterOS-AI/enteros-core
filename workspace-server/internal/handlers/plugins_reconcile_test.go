@@ -24,7 +24,7 @@ func newReconcileHandler(t *testing.T) (*PluginsHandler, *[]string) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(pluginDir, "plugin.yaml"),
-		[]byte("name: seo-all\nversion: 1.0.0\nskills:\n  - seo-all\n"), 0o644); err != nil {
+		[]byte("name: seo-all\nversion: 1.0.0\ndescription: seo skills bundle\nskills:\n  - seo-all\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -120,7 +120,7 @@ func TestReconcile_PartialDiff_InstallsOnlyMissing(t *testing.T) {
 	if err := os.MkdirAll(second, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_ = os.WriteFile(filepath.Join(second, "plugin.yaml"), []byte("name: research\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(second, "plugin.yaml"), []byte("name: research\nversion: 1.0.0\ndescription: research plugin\n"), 0o644)
 
 	// seo-all is in DB AND confirmed present on the box; research is missing.
 	h.instanceIDLookup = func(string) (string, error) { return "i-present", nil }
@@ -206,7 +206,8 @@ func TestReconcile_PlatformMCP_PresentOnBoxButMissingFromRuntimeConfig_Redeliver
 	if err := os.MkdirAll(mgmtDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_ = os.WriteFile(filepath.Join(mgmtDir, "plugin.yaml"), []byte("name: "+conciergePlatformMCPName+"\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(mgmtDir, "plugin.yaml"),
+		[]byte("name: "+conciergePlatformMCPName+"\nversion: 1.0.0\ndescription: management MCP plugin\n"), 0o644)
 
 	h.instanceIDLookup = func(string) (string, error) { return "i-123", nil }
 

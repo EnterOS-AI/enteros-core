@@ -18,11 +18,13 @@ require (
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/robfig/cron/v3 v3.0.1
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/stretchr/testify v1.11.1
 	go.moleculesai.app/molecule-contracts v0.0.0-20260627044329-ffd2cf33343a
 	go.moleculesai.app/plugin/gh-identity v0.0.0-20260509010445-788988195fce
 	go.moleculesai.app/sdk v0.0.0-20260630004536-bee667e92123
 	golang.org/x/crypto v0.50.0
+	golang.org/x/text v0.36.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -81,7 +83,6 @@ require (
 	golang.org/x/arch v0.23.0 // indirect
 	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
