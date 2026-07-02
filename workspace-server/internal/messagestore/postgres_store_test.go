@@ -48,7 +48,7 @@ func TestChatHistory_UserMessageTimestampPinsToCreatedAt(t *testing.T) {
 	created := mustParseTime(t, "2026-04-25T18:00:00Z")
 	body := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"hello from earlier today"}]}}}`)
 
-	msgs := activityRowToChatMessages(created, "ok", body, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", created, "ok", body, nil, nil, neverInternal)
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 user message, got %d", len(msgs))
 	}
@@ -64,7 +64,7 @@ func TestChatHistory_AgentMessageTimestampPinsToCreatedAt(t *testing.T) {
 	created := mustParseTime(t, "2026-04-25T18:05:00Z")
 	body := json.RawMessage(`{"result":"agent reply"}`)
 
-	msgs := activityRowToChatMessages(created, "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", created, "ok", nil, body, nil, neverInternal)
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 agent message, got %d", len(msgs))
 	}
@@ -79,8 +79,8 @@ func TestChatHistory_AgentMessageTimestampPinsToCreatedAt(t *testing.T) {
 func TestChatHistory_TwoRowsDistinctTimestamps(t *testing.T) {
 	bodyA := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"first"}]}}}`)
 	bodyB := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"second"}]}}}`)
-	a := activityRowToChatMessages(mustParseTime(t, "2026-04-25T14:00:00Z"), "ok", bodyA, nil, nil, neverInternal)
-	b := activityRowToChatMessages(mustParseTime(t, "2026-04-25T21:01:58Z"), "ok", bodyB, nil, nil, neverInternal)
+	a := activityRowToChatMessages("row-a", mustParseTime(t, "2026-04-25T14:00:00Z"), "ok", bodyA, nil, nil, neverInternal)
+	b := activityRowToChatMessages("row-b", mustParseTime(t, "2026-04-25T21:01:58Z"), "ok", bodyB, nil, nil, neverInternal)
 
 	if len(a) != 1 || len(b) != 1 {
 		t.Fatalf("expected 1 message each; got %d and %d", len(a), len(b))
@@ -99,7 +99,7 @@ func TestChatHistory_TwoRowsDistinctTimestamps(t *testing.T) {
 
 func TestChatHistory_EmitsUserMessageWhenRequestHasText(t *testing.T) {
 	body := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"hi agent"}]}}}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
@@ -111,7 +111,7 @@ func TestChatHistory_EmitsUserMessageWhenRequestHasText(t *testing.T) {
 func TestChatHistory_DropsInternalSelfMessages(t *testing.T) {
 	body := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"Delegation results are ready..."}]}}}`)
 	predicate := func(t string) bool { return strings.HasPrefix(t, "Delegation results are ready") }
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, predicate)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, predicate)
 	for _, m := range msgs {
 		if m.Role == "user" {
 			t.Errorf("internal-self message rendered as user bubble: %q", m.Content)
@@ -120,7 +120,7 @@ func TestChatHistory_DropsInternalSelfMessages(t *testing.T) {
 }
 
 func TestChatHistory_NoUserMessageWhenRequestBodyNull(t *testing.T) {
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil, neverInternal)
 	for _, m := range msgs {
 		if m.Role == "user" {
 			t.Errorf("emitted user bubble despite null request_body: %+v", m)
@@ -139,7 +139,7 @@ func TestChatHistory_UserAttachmentsHydratedFromRequestBody(t *testing.T) {
 	    }
 	  }
 	}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
 	var user *ChatMessage
 	for i := range msgs {
 		if msgs[i].Role == "user" {
@@ -176,7 +176,7 @@ func TestChatHistory_AttachmentsOnlyUserBubbleWhenTextEmpty(t *testing.T) {
 	    }
 	  }
 	}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 attachments-only bubble, got %d", len(msgs))
 	}
@@ -200,7 +200,7 @@ func TestChatHistory_InternalSelfPredicateSuppressesEvenWithAttachments(t *testi
 	  }
 	}`)
 	predicate := func(t string) bool { return strings.HasPrefix(t, "Delegation results are ready") }
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, predicate)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, predicate)
 	for _, m := range msgs {
 		if m.Role == "user" {
 			t.Errorf("internal-self predicate did NOT suppress user bubble despite attachments: %+v", m)
@@ -214,7 +214,7 @@ func TestChatHistory_InternalSelfPredicateSuppressesEvenWithAttachments(t *testi
 
 func TestChatHistory_AgentMessageFromResultString(t *testing.T) {
 	body := json.RawMessage(`{"result":"agent says hi"}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
 	if len(msgs) != 1 || msgs[0].Role != "agent" || msgs[0].Content != "agent says hi" {
 		t.Errorf("got %+v", msgs)
 	}
@@ -222,7 +222,7 @@ func TestChatHistory_AgentMessageFromResultString(t *testing.T) {
 
 func TestChatHistory_RoleSystemWhenStatusError(t *testing.T) {
 	body := json.RawMessage(`{"result":"delegation failed"}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "error", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "error", nil, body, nil, neverInternal)
 	if len(msgs) != 1 || msgs[0].Role != "system" {
 		t.Errorf("status=error did NOT promote role to system: %+v", msgs)
 	}
@@ -233,7 +233,7 @@ func TestChatHistory_RoleSystemWhenAgentErrorPrefix(t *testing.T) {
 	// itself starts with "agent error", the canvas would still
 	// render system role. Mirror that here.
 	body := json.RawMessage(`{"result":"Agent error: ProcessError(exit=1)"}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
 	if len(msgs) != 1 || msgs[0].Role != "system" {
 		t.Errorf("agent-error prefix did NOT promote to system: %+v", msgs)
 	}
@@ -247,7 +247,7 @@ func TestChatHistory_AgentAttachmentsFromResponseBodyParts(t *testing.T) {
 	    {"kind":"file","file":{"name":"build.zip","uri":"workspace:/tmp/build.zip","size":12345}}
 	  ]
 	}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
 	var agent *ChatMessage
 	for i := range msgs {
 		if msgs[i].Role == "agent" {
@@ -267,7 +267,7 @@ func TestChatHistory_AgentAttachmentsFromResponseBodyParts(t *testing.T) {
 }
 
 func TestChatHistory_NoAgentMessageWhenResponseBodyNull(t *testing.T) {
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil, neverInternal)
 	for _, m := range msgs {
 		if m.Role == "agent" || m.Role == "system" {
 			t.Errorf("emitted agent/system bubble despite null response_body: %+v", m)
@@ -277,7 +277,7 @@ func TestChatHistory_NoAgentMessageWhenResponseBodyNull(t *testing.T) {
 
 func TestChatHistory_NoAgentMessageWhenResponseHasNoTextNoFiles(t *testing.T) {
 	body := json.RawMessage(`{"unrelated":"metadata"}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
 	for _, m := range msgs {
 		if m.Role == "agent" {
 			t.Errorf("emitted agent bubble despite empty content: %+v", m)
@@ -309,16 +309,16 @@ func TestList_WireOrderIsOldestFirstAcrossPagedRows(t *testing.T) {
 
 	// Server's SQL is ORDER BY created_at DESC. Build mock rows in
 	// THAT order so the row-aware reversal has work to do.
-	rows := sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms"}).
+	rows := sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms", "id"}).
 		AddRow(mustParseTime(t, "2026-05-05T00:03:00Z"), "ok",
 			`{"params":{"message":{"parts":[{"kind":"text","text":"u3"}]}}}`,
-			`{"result":"a3"}`, nil, nil).
+			`{"result":"a3"}`, nil, nil, "row-3").
 		AddRow(mustParseTime(t, "2026-05-05T00:02:00Z"), "ok",
 			`{"params":{"message":{"parts":[{"kind":"text","text":"u2"}]}}}`,
-			`{"result":"a2"}`, nil, nil).
+			`{"result":"a2"}`, nil, nil, "row-2").
 		AddRow(mustParseTime(t, "2026-05-05T00:01:00Z"), "ok",
 			`{"params":{"message":{"parts":[{"kind":"text","text":"u1"}]}}}`,
-			`{"result":"a1"}`, nil, nil)
+			`{"result":"a1"}`, nil, nil, "row-1")
 
 	mock.ExpectQuery(`SELECT created_at, status, request_body::text, response_body::text`).
 		WillReturnRows(rows)
@@ -432,7 +432,7 @@ func TestChatHistory_PairedUserAndAgentSameTimestamp(t *testing.T) {
 	created := mustParseTime(t, "2026-04-25T18:00:00Z")
 	req := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"what's 2+2?"}]}}}`)
 	resp := json.RawMessage(`{"result":"4"}`)
-	msgs := activityRowToChatMessages(created, "ok", req, resp, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", created, "ok", req, resp, nil, neverInternal)
 	if len(msgs) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(msgs))
 	}
@@ -459,7 +459,7 @@ func TestChatHistory_MalformedJSONInRequestBodyReturnsEmpty(t *testing.T) {
 			t.Fatalf("panic on malformed json: %v", r)
 		}
 	}()
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
 	for _, m := range msgs {
 		if m.Role == "user" && (m.Content != "" || len(m.Attachments) > 0) {
 			t.Errorf("malformed JSON yielded a non-empty user bubble: %+v", m)
@@ -476,7 +476,7 @@ func TestChatHistory_V1ProtobufFlatFileShape(t *testing.T) {
 	    ]
 	  }
 	}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
 	var agent *ChatMessage
 	for i := range msgs {
 		if msgs[i].Role == "agent" {
@@ -505,7 +505,7 @@ func TestChatHistory_TaskShapeArtifactsExtracted(t *testing.T) {
 	    ]
 	  }
 	}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
 	if len(msgs) != 1 || msgs[0].Content != "hermes detail line" {
 		t.Errorf("artifact text not extracted: %+v", msgs)
 	}
@@ -518,7 +518,7 @@ func TestChatHistory_OlderNestedRootTextShape(t *testing.T) {
 	    "parts": [{"root":{"text":"legacy nested text"}}]
 	  }
 	}`)
-	msgs := activityRowToChatMessages(mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
 	if len(msgs) != 1 || !strings.Contains(msgs[0].Content, "legacy nested text") {
 		t.Errorf("nested root.text not extracted: %+v", msgs)
 	}
@@ -568,6 +568,7 @@ func TestChatHistory_BasenameStripsSchemeAndPath(t *testing.T) {
 func TestActivityRow_AgentMessageCarriesToolTrace(t *testing.T) {
 	trace := json.RawMessage(`[{"tool":"mcp__platform__create_request","input":"{}"}]`)
 	msgs := activityRowToChatMessages(
+		"row-1",
 		mustParseTime(t, "2026-06-12T00:00:00Z"), "ok",
 		json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"do it"}]}}}`),
 		json.RawMessage(`{"result":"done"}`),
@@ -598,10 +599,10 @@ func TestList_ReconstructsToolTraceFromAgentLog(t *testing.T) {
 	turnEnd := mustParseTime(t, "2026-06-12T00:00:10Z")
 	// a2a_receive turn: 10s duration, NULL tool_trace.
 	mock.ExpectQuery(`SELECT created_at, status, request_body::text, response_body::text, tool_trace::text, duration_ms`).
-		WillReturnRows(sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms"}).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms", "id"}).
 			AddRow(turnEnd, "ok",
 				`{"params":{"message":{"parts":[{"kind":"text","text":"do it"}]}}}`,
-				`{"result":"done"}`, nil, int64(10000)))
+				`{"result":"done"}`, nil, int64(10000), "row-recon"))
 
 	// Reconstruction query: two tool steps inside [end-10s, end].
 	mock.ExpectQuery(`SELECT created_at, summary\s+FROM activity_logs\s+WHERE workspace_id = \$1\s+AND activity_type = 'agent_log'`).
@@ -656,10 +657,10 @@ func TestReconstruction_FiltersToToolMarker(t *testing.T) {
 
 	turnEnd := mustParseTime(t, "2026-06-12T00:00:10Z")
 	mock.ExpectQuery(`SELECT created_at, status, request_body::text, response_body::text, tool_trace::text, duration_ms`).
-		WillReturnRows(sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms"}).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms", "id"}).
 			AddRow(turnEnd, "ok",
 				`{"params":{"message":{"parts":[{"kind":"text","text":"go"}]}}}`,
-				`{"result":"done"}`, nil, int64(10000)))
+				`{"result":"done"}`, nil, int64(10000), "row-marker"))
 
 	// The reconstruction query MUST pass the "🛠 %" LIKE arg — that is the
 	// DB-level guard that excludes non-tool agent_log summaries. sqlmock's
@@ -752,7 +753,7 @@ func TestChatHistory_SessionFilter_AppliesToQuery(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms"}))
 
 	_, _, err = store.List(context.Background(), "ws-1", ListOptions{
-		Limit:            100,
+		Limit:             100,
 		HasSessionStarted: true,
 		SessionStartedAt:  marker,
 	})
@@ -794,5 +795,138 @@ func TestChatHistory_SessionFilter_ComposesWithBeforeCursor(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// =====================================================================
+// Stable ChatMessage.ID (My Chat doubling fix)
+//
+// The canvas reconcile refetches the chat-history window every 10s and
+// on every WS reconnect, then dedupes by ChatMessage.ID. If the store
+// stamps a fresh id per row per request the id-keyed dedup never
+// collides and the whole window is re-appended — "My Chat" doubling
+// (36→72→…). These tests pin that the id is DETERMINISTIC (derived from
+// the activity_logs row PK + bubble kind) so repeat fetches collapse.
+// =====================================================================
+
+// TestActivityRow_MessageIDsAreDeterministicFromRowID is the unit-level
+// cover: same rowID → same ids across calls (dedup-enabling), user and
+// agent bubbles differ, a different row yields different ids.
+func TestActivityRow_MessageIDsAreDeterministicFromRowID(t *testing.T) {
+	req := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}`)
+	resp := json.RawMessage(`{"result":"yo"}`)
+
+	first := activityRowToChatMessages("row-42", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil, neverInternal)
+	second := activityRowToChatMessages("row-42", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil, neverInternal)
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("want 2 bubbles each, got %d and %d", len(first), len(second))
+	}
+	// Same row, repeated call → identical ids (the property the canvas
+	// reconcile relies on to dedupe instead of re-appending).
+	for i := range first {
+		if first[i].ID != second[i].ID {
+			t.Errorf("bubble %d id not stable across calls: %q vs %q — unstable id would double My Chat", i, first[i].ID, second[i].ID)
+		}
+	}
+	if first[0].ID != "row-42:user" || first[1].ID != "row-42:agent" {
+		t.Errorf("ids not derived from row id+kind: user=%q agent=%q", first[0].ID, first[1].ID)
+	}
+	if first[0].ID == first[1].ID {
+		t.Errorf("user and agent bubble share an id %q — would collapse distinct bubbles", first[0].ID)
+	}
+	// Different row → different ids.
+	other := activityRowToChatMessages("row-99", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil, neverInternal)
+	if other[0].ID == first[0].ID {
+		t.Errorf("different rows produced the same id %q", other[0].ID)
+	}
+}
+
+// TestActivityRow_EmptyRowIDFallsBackToUniqueID pins the defensive
+// fallback: a row with no id still gets NON-EMPTY, unique ids (a random
+// uuid) rather than a shared ":kind" id that would collapse unrelated
+// rows. The fallback is intentionally non-stable — better a transient
+// dup than silently merging different messages.
+func TestActivityRow_EmptyRowIDFallsBackToUniqueID(t *testing.T) {
+	req := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}`)
+	resp := json.RawMessage(`{"result":"yo"}`)
+	msgs := activityRowToChatMessages("", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil, neverInternal)
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 bubbles, got %d", len(msgs))
+	}
+	if msgs[0].ID == "" || msgs[1].ID == "" {
+		t.Errorf("empty rowID must not yield empty ids: %q, %q", msgs[0].ID, msgs[1].ID)
+	}
+	if msgs[0].ID == ":user" || msgs[1].ID == ":agent" {
+		t.Errorf("empty rowID must not yield the deterministic ':kind' form (collides across rows): %q, %q", msgs[0].ID, msgs[1].ID)
+	}
+	if msgs[0].ID == msgs[1].ID {
+		t.Errorf("fallback ids for the two bubbles collided: %q", msgs[0].ID)
+	}
+}
+
+// TestList_StableIDsAcrossRepeatedFetches is the load-bearing, end-to-end
+// regression for the doubling bug. It fetches the SAME backing rows twice
+// (a real DB returns the stored PK on every read) and asserts every
+// message keeps the SAME id — exactly what makes the canvas id-keyed
+// reconcile collapse the repeat instead of growing the list. Reverting
+// deterministicMessageID to uuid.New() turns this red.
+func TestList_StableIDsAcrossRepeatedFetches(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	// Same two activity_logs rows on both fetches, with the SAME PK id
+	// values. sqlmock rows are single-use, so rebuild per expectation.
+	makeRows := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"created_at", "status", "request_body", "response_body", "tool_trace", "duration_ms", "id"}).
+			AddRow(mustParseTime(t, "2026-05-05T00:02:00Z"), "ok",
+				`{"params":{"message":{"parts":[{"kind":"text","text":"u2"}]}}}`,
+				`{"result":"a2"}`, nil, nil, "row-2").
+			AddRow(mustParseTime(t, "2026-05-05T00:01:00Z"), "ok",
+				`{"params":{"message":{"parts":[{"kind":"text","text":"u1"}]}}}`,
+				`{"result":"a1"}`, nil, nil, "row-1")
+	}
+	mock.ExpectQuery(`SELECT created_at, status, request_body::text`).WillReturnRows(makeRows())
+	mock.ExpectQuery(`SELECT created_at, status, request_body::text`).WillReturnRows(makeRows())
+
+	store := NewPostgresMessageStore(db)
+	idsOf := func() []string {
+		msgs, _, err := store.List(context.Background(), "ws-1", ListOptions{Limit: 10})
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		ids := make([]string, len(msgs))
+		for i, m := range msgs {
+			ids[i] = m.ID
+		}
+		return ids
+	}
+
+	first := idsOf()
+	second := idsOf()
+
+	// Oldest-first wire order: row-1 pair, then row-2 pair.
+	want := []string{"row-1:user", "row-1:agent", "row-2:user", "row-2:agent"}
+	if len(first) != len(want) {
+		t.Fatalf("expected %d messages, got %d (%v)", len(want), len(first), first)
+	}
+	for i, w := range want {
+		if first[i] != w {
+			t.Errorf("id[%d]=%q want %q", i, first[i], w)
+		}
+	}
+	// The core invariant: ids are identical between the two fetches.
+	if len(first) != len(second) {
+		t.Fatalf("fetch count drifted: %d vs %d", len(first), len(second))
+	}
+	for i := range first {
+		if first[i] != second[i] {
+			t.Errorf("id[%d] changed between fetches: %q vs %q — unstable id would double My Chat", i, first[i], second[i])
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }

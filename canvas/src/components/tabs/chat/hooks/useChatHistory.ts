@@ -60,9 +60,20 @@ async function loadMessagesFromDB(
  *  missed by the WebSocket path therefore appear in the correct order
  *  without discarding older history the user has already lazy-loaded.
  *
- *  The map-key fallback for messages without an id is a stable tuple of
- *  timestamp+role+content; this path is defensive — chat-history rows
- *  today always carry an id. */
+ *  Why key on `id`, not the (timestamp+role+content) tuple: this
+ *  reconcile re-fetches the same chat-history window every 10s and on
+ *  every WS reconnect. The "My Chat" doubling bug (36→72→…) was caused by
+ *  a backend that minted a FRESH id per row per fetch, so an id-keyed
+ *  merge never collided and re-appended the whole window. That is fixed
+ *  at the source: the store now returns a STABLE per-row id (activity_logs
+ *  PK + bubble kind), so the same logical message keeps the same id across
+ *  fetches and the merge dedupes correctly. Keying on `id` — not the
+ *  tuple — is the SSOT for identity here: two DISTINCT rows that happen to
+ *  share created_at, role and content (e.g. repeated "ok"/"thanks") have
+ *  different ids and must BOTH survive; a tuple key would silently drop
+ *  one. The tuple is retained only as a defensive fallback for a message
+ *  that somehow arrives without an id (never expected for a persisted
+ *  row). */
 function mergeReconciledMessages(
   existing: ChatMessage[],
   fetched: ChatMessage[],
