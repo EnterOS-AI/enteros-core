@@ -531,7 +531,6 @@ func TestWorkspaceCreate_SecretPersistFails_RollsBack(t *testing.T) {
 	// (org rung retired). An explicit byok override makes the workspace byok in a
 	// single resolver read (precedence-1 short-circuit), so the OPENAI_API_KEY
 	// write is allowed and reaches the INSERT-and-fail path this test exercises.
-	t.Setenv("MOLECULE_LLM_BILLING_MODE", "platform_managed") // org env ignored now
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()

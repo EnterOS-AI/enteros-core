@@ -282,8 +282,8 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		// pair is what the boot path will try to resolve; an unroutable pair
 		// is rejected at the API boundary instead of wedging the agent at
 		// boot. validateRegisteredModelForRuntime is the same SSOT the
-		// create-boundary uses (workspace_crud.go create + llm_billing_mode
-		// resolver); mirroring it here keeps the PATCH-runtime path consistent
+		// create-boundary uses (workspace_crud.go create + the provider
+		// derivation); mirroring it here keeps the PATCH-runtime path consistent
 		// and catches the drift surface CR2 found on the #21 review.
 		// The CURRENT model lives in the MODEL workspace_secret (the SSOT that
 		// GET /model + the boot path use), NOT the workspaces.model column.

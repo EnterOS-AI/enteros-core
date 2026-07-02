@@ -653,22 +653,22 @@ const REGISTRY_TEMPLATE = {
   // moonshot/kimi-k2.6 → "platform"; MiniMax-M2.7 → "minimax".
   registry_backed: true,
   registry_providers: [
-    { name: "platform", display_name: "Platform", auth_env: [], billing_mode: "platform_managed" },
-    { name: "minimax", display_name: "MiniMax", auth_env: ["MINIMAX_API_KEY"], billing_mode: "byok" },
-    { name: "anthropic", display_name: "Anthropic API", auth_env: ["ANTHROPIC_API_KEY"], billing_mode: "byok" },
+    { name: "platform", display_name: "Platform", auth_env: [] },
+    { name: "minimax", display_name: "MiniMax", auth_env: ["MINIMAX_API_KEY"] },
+    { name: "anthropic", display_name: "Anthropic API", auth_env: ["ANTHROPIC_API_KEY"] },
   ],
   registry_models: [
-    { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", billing_mode: "platform_managed" },
-    { id: "MiniMax-M2.7", name: "MiniMax M2.7", provider: "minimax", billing_mode: "byok" },
-    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic", billing_mode: "byok" },
+    { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform" },
+    { id: "MiniMax-M2.7", name: "MiniMax M2.7", provider: "minimax" },
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic" },
   ],
 };
 
 // Registry-backed platform provider WITH a non-empty auth_env — this matches
 // the PRODUCTION provider view, which ships the raw AuthEnv
 // ([MOLECULE_LLM_USAGE_TOKEN]). REGISTRY_TEMPLATE above uses auth_env:[] so it
-// never exercises suppression; this one drives the billingMode==="platform_
-// managed" branch end-to-end through buildProviderCatalogFromRegistry. (#2245)
+// never exercises suppression; this one drives the vendor==="platform"
+// suppression branch end-to-end through buildProviderCatalogFromRegistry. (#2245)
 const REGISTRY_TEMPLATE_PLATFORM_AUTHENV = {
   ...REGISTRY_TEMPLATE,
   registry_providers: [
@@ -676,10 +676,9 @@ const REGISTRY_TEMPLATE_PLATFORM_AUTHENV = {
       name: "platform",
       display_name: "Platform",
       auth_env: ["MOLECULE_LLM_USAGE_TOKEN"],
-      billing_mode: "platform_managed",
     },
-    { name: "minimax", display_name: "MiniMax", auth_env: ["MINIMAX_API_KEY"], billing_mode: "byok" },
-    { name: "anthropic", display_name: "Anthropic API", auth_env: ["ANTHROPIC_API_KEY"], billing_mode: "byok" },
+    { name: "minimax", display_name: "MiniMax", auth_env: ["MINIMAX_API_KEY"] },
+    { name: "anthropic", display_name: "Anthropic API", auth_env: ["ANTHROPIC_API_KEY"] },
   ],
 };
 
@@ -760,7 +759,7 @@ describe("CreateWorkspaceDialog — registry-backed provider catalog (RFC#340 Fi
     expect(body.secrets).toEqual({ MINIMAX_API_KEY: "sk-minimax-test" });
   });
 
-  it("suppresses the credential for a registry-backed platform provider that declares an auth_env — billingMode path (#2245)", async () => {
+  it("suppresses the credential for a registry-backed platform provider that declares an auth_env — vendor==='platform' path (#2245)", async () => {
     // Override the default REGISTRY_TEMPLATE (auth_env:[]) with the production-
     // shaped one whose platform provider declares MOLECULE_LLM_USAGE_TOKEN.
     mockGet.mockImplementation(async (url: string) => {
@@ -776,7 +775,7 @@ describe("CreateWorkspaceDialog — registry-backed provider catalog (RFC#340 Fi
       target: { value: "Registry Platform Agent" },
     });
     // Platform is the default bucket; even with a non-empty auth_env the key
-    // field must NOT render (suppressed via billingMode==="platform_managed").
+    // field must NOT render (suppressed via vendor==="platform").
     await waitFor(() => {
       const sel = document.querySelector("[data-testid='provider-select']") as HTMLSelectElement;
       expect(sel?.value).toBe("registry|platform");
@@ -883,13 +882,8 @@ describe("CreateWorkspaceDialog — platform-managed credential suppression (#22
     it("is true for the platform proxy vendor", () => {
       expect(isPlatformManagedProvider({ vendor: "platform" })).toBe(true);
     });
-    it("is true for a registry billingMode of platform_managed", () => {
-      expect(
-        isPlatformManagedProvider({ vendor: "minimax", billingMode: "platform_managed" }),
-      ).toBe(true);
-    });
     it("is false for a BYOK provider", () => {
-      expect(isPlatformManagedProvider({ vendor: "anthropic", billingMode: "byok" })).toBe(false);
+      expect(isPlatformManagedProvider({ vendor: "anthropic" })).toBe(false);
       expect(isPlatformManagedProvider({ vendor: "minimax" })).toBe(false);
     });
     it("is false for null/undefined", () => {
