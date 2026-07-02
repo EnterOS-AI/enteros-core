@@ -33,6 +33,10 @@ from datetime import datetime, timezone
 GITEA_HOST = os.environ.get("GITEA_HOST", "git.moleculesai.app")
 GITEA_TOKEN = os.environ.get("GITEA_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
 API_BASE = f"https://{GITEA_HOST}/api/v1"
+# CF edge 1010-bans the default python-urllib UA (Error 1010: browser signature
+# banned); send a browser-legit UA on every API call — same fix as the watchdog /
+# release scripts. Overridable via GITEA_UA for tests / alternate edges.
+USER_AGENT = os.environ.get("GITEA_UA", "curl/8.4.0")
 
 # Timeout in seconds for all HTTP calls. Defence-in-depth: ensures a missing or
 # invalid GITEA_TOKEN causes a fast (~15 s) failure rather than an
@@ -48,6 +52,7 @@ def api_get(path: str) -> dict | list:
         headers={
             "Authorization": f"token {GITEA_TOKEN}",
             "Accept": "application/json",
+            "User-Agent": USER_AGENT,
         },
     )
     try:
@@ -926,6 +931,7 @@ def run(repo: str, pr_number: int, post_comment: bool = False) -> dict:
                 "Authorization": f"token {GITEA_TOKEN}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                "User-Agent": USER_AGENT,
             }
             # Check if a gate-check comment already exists to avoid spamming
             existing = api_list(f"/repos/{owner}/{name}/issues/{pr_number}/comments")
