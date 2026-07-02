@@ -21,6 +21,30 @@
 # `(pull_request_target)` context variant, so the review-event path
 # EXPLICITLY POSTS the required context via the API. Trust boundary
 # preserved (BASE ref, no PR-head).
+#
+# ── AGENT-RESOLVABLE addendum (doc only — no logic change) ───────────────
+# This gate is cleared by a distinct security-lens reviewer AGENT, not a
+# human and not the same identity that clears qa-review. The gate is
+# TEAM-KEYED (TEAM=security, TEAM_ID=21): review-check.sh passes iff there
+# is a genuine, non-author, current-head APPROVED review (per the
+# fail-closed SSOT predicate in .gitea/scripts/_approval_validator.py) by a
+# member of Gitea team `security` (id 21). The authorized security-lens
+# identity is `core-security` (id 68) — already a member of team 21 and
+# NOT of team 20 (qa), so its APPROVE is a SECOND, orthogonal lens rather
+# than a duplicate of the qa approval. (`molecule-code-reviewer`, id 109,
+# is in BOTH teams today, so one APPROVE from it clears qa+security — the
+# rubber-stamp this binding removes; see the org-Owner bootstrap below.)
+#
+# This is producer/consumer separation: THIS workflow is the read-only
+# EVALUATOR (BASE ref, no PR-head code) that maps a genuine review to the
+# BP status. The PRODUCER (the security-lens agent that runs the review and
+# POSTs a real APPROVED/REQUEST_CHANGES review under `core-security`) is the
+# operator reviewer harness security-lane, or the fallback producer
+# workflow. Persona, rubric, invocation, mapping, and the one-time
+# org-Owner bootstrap (remove molecule-code-reviewer from team 21 for
+# enforced qa/security diversity; point the harness at core-security) are
+# the SSOT in `.gitea/security-reviewer.md`. No workflow / branch-protection
+# / script edit is required for eligibility — proven end-to-end on PR #3369.
 
 name: security-review
 
