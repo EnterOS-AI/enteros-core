@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,6 +102,44 @@ func dirSize(dir string, limit int64) (int64, error) {
 		return nil
 	})
 	return total, err
+}
+
+// advisoryManifestMaxBytes caps how much of a staged plugin.yaml the
+// advisory SSOT check will read. Real manifests are a few KiB; anything
+// past this is reported as not-validatable rather than read.
+const advisoryManifestMaxBytes = 1 << 20 // 1 MiB
+
+// readStagedManifestForAdvisory reads stagedDir/plugin.yaml for the
+// advisory SSOT check without trusting staged content: a hostile archive
+// could ship plugin.yaml as a symlink (e.g. to /dev/zero or a host file),
+// so symlinks and other non-regular files are rejected via Lstat and the
+// read is size-capped before it happens.
+func readStagedManifestForAdvisory(stagedDir string) ([]byte, error) {
+	p := filepath.Join(stagedDir, "plugin.yaml")
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("plugin.yaml is not a regular file (mode %v)", fi.Mode())
+	}
+	if fi.Size() > advisoryManifestMaxBytes {
+		return nil, fmt.Errorf("plugin.yaml is %d bytes, over the %d-byte advisory cap", fi.Size(), advisoryManifestMaxBytes)
+	}
+	return os.ReadFile(p)
+}
+
+// sanitizeSourceForLog strips credential-bearing URL parts (userinfo,
+// query) from a plugin source before it reaches a log line — sources can
+// be user-provided URLs with embedded tokens.
+func sanitizeSourceForLog(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable-source>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	return u.String()
 }
 
 // installRequest is the decoded, validated payload a caller submits.
@@ -271,6 +310,20 @@ func (h *PluginsHandler) resolveAndStage(ctx context.Context, req installRequest
 				"source": source.Raw(),
 			})
 		}
+	}
+
+	// SSOT manifest validation — ADVISORY phase of core#3383. Violations
+	// against the vendored plugin-manifest schema are logged, never block:
+	// zero behavior change. Fail-closed promotion is PR-4, post-soak.
+	// The staged tree is untrusted: the manifest read rejects symlinks /
+	// non-regular files and is size-capped, and the logged source is
+	// credential-stripped.
+	if data, readErr := readStagedManifestForAdvisory(stagedDir); readErr != nil {
+		log.Printf("Plugin install: SSOT manifest validation (advisory): plugin=%s source=%s: no validatable plugin.yaml in staged tree: %v",
+			pluginName, sanitizeSourceForLog(source.Raw()), readErr)
+	} else if v := plugins.ValidateManifestSSOT(data); len(v) > 0 {
+		log.Printf("Plugin install: SSOT manifest validation (advisory): plugin=%s source=%s %d violation(s): %s",
+			pluginName, sanitizeSourceForLog(source.Raw()), len(v), strings.Join(v, "; "))
 	}
 
 	return &stageResult{StagedDir: stagedDir, PluginName: pluginName, Source: source, InstalledSHA: installedSHA}, nil
