@@ -983,10 +983,12 @@ class TestComputeNaStateAcceptsGateNotInItems(unittest.TestCase):
 
 
 class TestAIAckEligibleConfig(unittest.TestCase):
-    """CTO-controlled allowlist (msg 1388c76f):
+    """CTO-controlled allowlist (msg 1388c76f; widened 2026-07-01):
       ai_ack_eligible: comprehensive-testing, local-postgres-e2e, staging-smoke,
-                       five-axis-review, memory-consulted
-      human-only:      root-cause, no-backwards-compat
+                       five-axis-review, memory-consulted, root-cause,
+                       no-backwards-compat, scope-matches-declared,
+                       public-repo-hygiene
+      human-only (code-level, not in live config): migration, schema
     """
 
     def test_ai_ack_eligible_items(self):
@@ -998,6 +1000,13 @@ class TestAIAckEligibleConfig(unittest.TestCase):
             "staging-smoke",
             "five-axis-review",
             "memory-consulted",
+            # Widened 2026-07-01 — the four reviewer-judgment items are now
+            # agent-resolvable via the ai-sop-ack team (additive: they still
+            # require a non-author ack from their configured required_teams).
+            "root-cause",
+            "no-backwards-compat",
+            "scope-matches-declared",
+            "public-repo-hygiene",
         }
         for slug in eligible:
             self.assertTrue(
@@ -1005,14 +1014,31 @@ class TestAIAckEligibleConfig(unittest.TestCase):
                 f"{slug} must be ai_ack_eligible",
             )
 
-    def test_human_only_items(self):
+    def test_human_only_carveout_is_code_level_only(self):
+        """After the 2026-07-01 widening, NO live config item is human-only.
+
+        The human-only carve-out (migration/schema) is enforced purely by the
+        code-level _HUMAN_ONLY_SLUGS guard, and those slugs are not present as
+        live config items. The four reviewer-judgment items that used to be
+        human-only are now ai_ack_eligible.
+        """
         cfg = sop.load_config(CONFIG_PATH)
         items_by_slug = {it["slug"]: it for it in cfg["items"]}
-        human_only = {"root-cause", "no-backwards-compat"}
-        for slug in human_only:
-            self.assertFalse(
-                items_by_slug[slug].get("ai_ack_eligible", False),
-                f"{slug} must NOT be ai_ack_eligible (human-only)",
+        for slug in ("migration", "schema"):
+            self.assertNotIn(
+                slug,
+                items_by_slug,
+                f"{slug} must remain a code-level carve-out, not a live config item",
+            )
+        for slug in (
+            "root-cause",
+            "no-backwards-compat",
+            "scope-matches-declared",
+            "public-repo-hygiene",
+        ):
+            self.assertTrue(
+                items_by_slug[slug].get("ai_ack_eligible"),
+                f"{slug} must be ai_ack_eligible after the 2026-07-01 widening",
             )
 
     def test_testing_class_slugs_constant(self):
@@ -1025,11 +1051,12 @@ class TestAIAckEligibleConfig(unittest.TestCase):
     def test_human_only_slugs_constant(self):
         """_HUMAN_ONLY_SLUGS encodes the migration/schema carve-out.
 
-        If this set changes, the CTO must approve the widening.
+        root-cause / no-backwards-compat were removed on 2026-07-01 when they
+        became ai_ack_eligible. If this set changes, the CTO must approve it.
         """
         self.assertEqual(
             sop._HUMAN_ONLY_SLUGS,
-            {"root-cause", "no-backwards-compat", "migration", "schema"},
+            {"migration", "schema"},
         )
 
     def test_human_only_invariant_enforced_in_code_and_config(self):
@@ -1085,14 +1112,16 @@ class TestAIAckEligibilityProbe(unittest.TestCase):
         )
         self.assertEqual(state["five-axis-review"]["ackers"], ["ai-bot"])
 
-    def test_ai_ack_rejected_for_human_only_item(self):
+    def test_ai_ack_passes_for_newly_eligible_root_cause(self):
+        # root-cause was widened to ai_ack_eligible on 2026-07-01 and removed
+        # from the _HUMAN_ONLY_SLUGS code guard, so an ai-sop-ack member can now
+        # ack it on behalf of automated evidence (still non-author).
         comments = [_comment("ai-bot", "/sop-ack root-cause")]
         probe = self._probe_human_then_ai(human_users=set(), ai_users={"ai-bot"})
         state = sop.compute_ack_state(
             comments, "alice", self.items, self.aliases, probe
         )
-        self.assertEqual(state["root-cause"]["ackers"], [])
-        self.assertIn("ai-bot", state["root-cause"]["rejected"]["not_in_team"])
+        self.assertEqual(state["root-cause"]["ackers"], ["ai-bot"])
 
     def test_human_ack_still_works_for_ai_eligible_item(self):
         comments = [_comment("bob", "/sop-ack comprehensive-testing")]
