@@ -19,15 +19,17 @@ This pattern parallels what `.gitea/workflows/status-reaper.yml` does for defaul
      | python3 -c "import sys,json; [print(s['status'], s['context']) for s in json.load(sys.stdin)['statuses'] if 'all-required' in s['context']]"
    ```
 
-2. Look up the actual sub-job statuses in the Gitea DB:
+2. Look up the actual sub-job statuses in the Gitea DB. Gitea now runs in
+   local Docker on the operator PC (the old operator box `5.78.80.188` was
+   decommissioned 2026-06-28); run this on the Gitea host:
 
    ```bash
-   ssh root@5.78.80.188 "docker exec molecule-postgres-1 psql -U gitea -d gitea -tAc \"
+   docker exec molecule-postgres-1 psql -U gitea -d gitea -tAc "
      SELECT aj.name,
        CASE aj.status WHEN 1 THEN 'success' WHEN 2 THEN 'failure' WHEN 3 THEN 'cancelled' WHEN 4 THEN 'skipped' WHEN 5 THEN 'waiting' WHEN 6 THEN 'running' END
      FROM action_run ar JOIN action_run_job aj ON aj.run_id=ar.id
      WHERE ar.repo_id=17 AND ar.workflow_id='ci.yml' AND ar.commit_sha='$sha'
-     ORDER BY aj.id;\""
+     ORDER BY aj.id;"
    ```
 
    The 5 required-by-umbrella sub-jobs must all be `success`. (`Canvas Deploy Reminder` is intentionally not required — its state doesn't matter.)

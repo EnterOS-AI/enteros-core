@@ -113,8 +113,8 @@ causing a render loop when any node position changed.
 2. **CI:** the `pr-guards` workflow (calling [molecule-ci `disable-auto-merge-on-push`](https://git.moleculesai.app/molecule-ai/molecule-ci/src/branch/main/.github/workflows/disable-auto-merge-on-push.yml)) fires on every push to an open PR. If auto-merge was already enabled, it's disabled and a comment is posted. You must explicitly re-enable after verifying the new commit.
 
 **Workflow rules that follow from the guards:**
-- Push **all** commits before running `gh pr merge --auto`.
-- If you realize you need another commit after enabling auto-merge: push it, then **re-run** `gh pr merge --auto` — the guard will already have disabled it. The disable + re-enable is the verification step.
+- Push **all** commits before enabling auto-merge on the PR (Gitea's "Merge When Checks Succeed").
+- If you realize you need another commit after enabling auto-merge: push it, then **re-enable** auto-merge — the guard will already have disabled it. The disable + re-enable is the verification step.
 - For changes that depend on each other across PRs (e.g. a build-script change + a workflow that consumes it), prefer a **stack** of PRs (PR-B branched off PR-A's branch, opened only after PR-A is in queue) over amending one in-flight PR.
 
 ### Running Tests
