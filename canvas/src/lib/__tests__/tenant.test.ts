@@ -49,4 +49,25 @@ describe('getTenantSlug', () => {
     // doesn't end with "." + suffix
     expect(getTenantSlug()).toBe('');
   });
+
+  // Regression: the staging 2-level subdomain. The old suffix-strip against the
+  // (unwired) default SaaSHostSuffix `.moleculesai.app` yielded `acme.staging`,
+  // which the canvas sent as `X-Molecule-Org-Slug: acme.staging` → CP 404 (the
+  // in-browser /workspaces 404). First-label derivation returns the real slug.
+  it('returns the leftmost label on a 2-level staging subdomain', () => {
+    setHost('acme.staging.moleculesai.app');
+    expect(getTenantSlug()).toBe('acme');
+  });
+
+  it('is case-insensitive on a staging subdomain', () => {
+    setHost('ACME.Staging.MoleculesAI.app');
+    expect(getTenantSlug()).toBe('acme');
+  });
+
+  it('returns empty for reserved subdomains on staging (first-label guard)', () => {
+    for (const s of ['app', 'www', 'api', 'admin']) {
+      setHost(`${s}.staging.moleculesai.app`);
+      expect(getTenantSlug()).toBe('');
+    }
+  });
 });
