@@ -139,8 +139,16 @@ func setupTestRedis(t *testing.T) *miniredis.Miniredis {
 	if err != nil {
 		t.Fatalf("failed to start miniredis: %v", err)
 	}
-	db.RDB = redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { mr.Close() })
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	db.RDB = client
+	// Close the redis client on cleanup. go-redis v9.19 enables maintenance
+	// notifications by default (MaintNotificationsConfig.Mode == auto), which
+	// starts a per-client circuit-breaker cleanupLoop goroutine. Without an
+	// explicit Close() the client — and its cleanupLoop — leaks for the life of
+	// the test binary; across the whole handlers package that piled up dozens of
+	// live goroutines that showed up in the -race timeout goroutine dump. Close()
+	// shuts the maintnotifications manager down (Shutdown → close(cleanupStop)).
+	t.Cleanup(func() { _ = client.Close(); mr.Close() })
 	return mr
 }
 

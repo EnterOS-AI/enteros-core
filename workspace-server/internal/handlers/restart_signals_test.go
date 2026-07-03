@@ -310,12 +310,15 @@ func setupTestRedisWithURL(t *testing.T, url string) *miniredis.Miniredis {
 	if err != nil {
 		t.Fatalf("failed to start miniredis: %v", err)
 	}
-	db.RDB = redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	db.RDB = client
 	for _, wsID := range []string{"ws-cache-hit-123", "ws-cache-miss-456", "ws-ack-789", "ws-noimpl-999", "ws-unreachable-000"} {
 		if err := db.CacheURL(context.Background(), wsID, url); err != nil {
 			t.Fatalf("failed to cache URL for %s: %v", wsID, err)
 		}
 	}
-	t.Cleanup(func() { mr.Close() })
+	// See setupTestRedis: Close() the client so the go-redis maintnotifications
+	// circuit-breaker cleanupLoop goroutine does not leak for the test binary's life.
+	t.Cleanup(func() { _ = client.Close(); mr.Close() })
 	return mr
 }
