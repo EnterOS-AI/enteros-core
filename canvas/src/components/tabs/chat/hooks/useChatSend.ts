@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { uploadChatFiles, FileTooLargeError } from "../uploads";
 import { createMessage, type ChatMessage, type ChatAttachment } from "../types";
 import { extractFilesFromTask } from "../message-parser";
+import { getConversationId } from "./chatContext";
 
 interface A2APart {
   kind?: string;
@@ -345,6 +346,12 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
               message: {
                 role: "user",
                 messageId,
+                // STABLE per-conversation contextId (tenant-agent BUG 3). Without
+                // it the runtime a2a-sdk mints a fresh context_id per request and
+                // any session keyed on it (openclaw's SessionManager, the native
+                // LangGraph thread_id) resets every turn → the agent re-greets.
+                // Persisted per workspace; rotated on "New session".
+                contextId: getConversationId(workspaceId),
                 parts,
               },
               metadata: { history },
