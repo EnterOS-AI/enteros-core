@@ -1223,6 +1223,16 @@ func effectiveModelForBilling(model string, envVars map[string]string) string {
 // default — platform when a proxy is wired (PlatformManagedProxyConfigured),
 // byok on self-host — see provider_derive_helpers.go.
 //
+// Platform-mode default-to-proxy: even a DERIVABLE vendor arm defaults to the
+// metered proxy when a proxy is wired AND the workspace has NOT explicitly
+// configured a provider-matching BYOK credential. This is the operator topology
+// — on the PLATFORM the proxy is the default and BYOK is optional; on a
+// SELF-HOSTED stack (no proxy wired) the vendor arm stays BYOK. It fixes the
+// team-member path: an agent-created member inherits the template default model
+// (a bare/colon vendor id), which resolves to a vendor arm, yet holds no vendor
+// key — without this it fails closed with MISSING_BYOK_CREDENTIAL instead of
+// billing on the platform proxy the member is entitled to.
+//
 // molecule-core#1994 (credential-handling follow-on, CTO-confirmed model).
 // `global_secrets` is the TENANT's own secret store, shared across all of
 // that tenant's workspaces — it is NOT the platform's. The platform's own
@@ -1318,6 +1328,51 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 			// model with CODEX_AUTH_JSON present resolves to openai-subscription
 			// (the OAuth arm), NOT openai-api — the resolved arm name we publish.
 			resolvedProviderName = p.Name
+
+			// PLATFORM-MODE DEFAULT-TO-PROXY (member-LLM path). Operator topology:
+			// on the PLATFORM (staging/prod) the metered CP proxy is the DEFAULT and
+			// BYOK is OPTIONAL; on a SELF-HOSTED stack BYOK is the default (there is
+			// no hosted proxy). So a workspace whose model resolves to a specific
+			// VENDOR arm (NOT the closed `platform` arm) but that has NOT explicitly
+			// configured a BYOK credential for that vendor must DEFAULT to the proxy
+			// when a proxy is wired — it must NOT be silently dropped to BYOK and
+			// fail closed with MISSING_BYOK_CREDENTIAL.
+			//
+			// This is the team-member / provision_workspace case: the agent-created
+			// member is provisioned with NO explicit model, so it inherits the
+			// template DEFAULT model. A bare/colon vendor model-id form (e.g.
+			// `MiniMax-M2.7` for claude-code, which DeriveProvider resolves to the
+			// `minimax` vendor arm — the slash form `minimax/MiniMax-M2.7` is the
+			// platform arm) is derivable to a vendor yet the member holds no vendor
+			// key → 422. Defaulting to the proxy is exactly the platform contract.
+			//
+			// GATED ON PLATFORM MODE ONLY. The platform-vs-self-host signal is
+			// proxy-config presence (PlatformManagedProxyConfigured): a SELF-HOSTED
+			// stack wires no CP proxy, so this flip never fires there and the derived
+			// vendor arm stays BYOK (self-host default — UNCHANGED). Explicit BYOK is
+			// still honored in BOTH modes: hasAnyPlatformManagedLLMKey reports a real,
+			// provider-MATCHING credential the tenant set at global or workspace scope
+			// → no flip, BYOK is preserved. (The proxy env is set from server env on
+			// the platform branch below; the proxy token has not been injected into
+			// envVars yet at this point, so it cannot masquerade as a BYOK key here.)
+			if !routeToPlatform && PlatformManagedProxyConfigured() && !hasAnyPlatformManagedLLMKey(p, envVars) {
+				routeToPlatform = true
+				resolvedProviderName = providers.PlatformProviderName
+				// Emit the SAME proxy-auth env shape as a natively platform-derived
+				// model (#1101 locks that shape): adopt the closed `platform` provider
+				// entry so the platform branch below keys the anthropic token env off
+				// its auth_token_env (ANTHROPIC_API_KEY), not the vendor arm's own
+				// (e.g. minimax's ANTHROPIC_AUTH_TOKEN). Fail-open: if the platform
+				// entry is somehow absent, derivedProvider stays the vendor arm — its
+				// auth_token_env still carries the proxy token to the proxy base URL,
+				// so routing is correct; only the auth header name would differ.
+				for _, pp := range manifest.Providers {
+					if pp.IsPlatform() {
+						derivedProvider = pp
+						break
+					}
+				}
+			}
 		} else {
 			// Underivable provider → default-closed to platform iff a proxy is wired.
 			routeToPlatform = PlatformManagedProxyConfigured()

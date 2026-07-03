@@ -1161,14 +1161,23 @@ func TestApplyPlatformManagedLLMEnv_NoopsOutsidePlatformManaged(t *testing.T) {
 	const wsID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	// Derive from (claude-code, kimi-for-coding) → kimi-coding (byok). No DB
 	// round-trip: the platform-vs-byok decision is purely registry-derived.
-	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
-	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+	//
+	// "Outside platform-managed mode" = SELF-HOST: no CP proxy is wired, so
+	// PlatformManagedProxyConfigured() is false. This is the genuine off-platform
+	// setup — the platform-mode default-to-proxy flip does NOT fire here, so the
+	// keyless vendor arm stays BYOK. (When the proxy IS wired the same keyless
+	// vendor model would DEFAULT to the metered proxy — see
+	// member_platform_default_test.go.)
+	t.Setenv("MOLECULE_LLM_BASE_URL", "")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "")
+	t.Setenv("OPENAI_BASE_URL", "")
+	t.Setenv("OPENAI_API_KEY", "")
 
 	envVars := map[string]string{}
 	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "kimi-for-coding", nil)
 
 	if res.RoutedToPlatform {
-		t.Fatalf("RoutedToPlatform = true, want false (kimi-for-coding derives to a non-platform provider)")
+		t.Fatalf("RoutedToPlatform = true, want false (self-host: kimi-for-coding derives to a non-platform provider and no proxy is wired)")
 	}
 	if _, ok := envVars["OPENAI_API_KEY"]; ok {
 		t.Fatalf("OPENAI_API_KEY should not be set outside platform-managed mode")
@@ -1269,10 +1278,13 @@ func TestApplyPlatformManagedLLMEnv_ClaudeCodeAttributionHeaderAbsentForBYOK(t *
 	t.Setenv("MOLECULE_LLM_ANTHROPIC_BASE_URL", "https://api.example.test/api/v1/internal/llm/anthropic/v1")
 	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
 
-	// BYOK claude-code (a bare "sonnet" model derives to anthropic-oauth, a
-	// non-platform vendor arm): header absent (BYOK workspaces do not use the
-	// CP proxy).
-	envVars := map[string]string{}
+	// EXPLICIT-BYOK claude-code in platform mode (proxy IS wired): a bare "sonnet"
+	// model derives to anthropic-oauth, and the tenant supplied a real,
+	// provider-matching key (CLAUDE_CODE_OAUTH_TOKEN) — so BYOK is HONORED (the
+	// proxy is the default, not a forced override) and the attribution header is
+	// absent (BYOK workspaces do not use the CP proxy). The explicit key is what
+	// keeps this BYOK now that a keyless vendor model would default to the proxy.
+	envVars := map[string]string{"CLAUDE_CODE_OAUTH_TOKEN": "user-oauth-token"}
 	applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "sonnet", nil)
 	if got, ok := envVars["ANTHROPIC_CUSTOM_HEADERS"]; ok {
 		t.Fatalf("ANTHROPIC_CUSTOM_HEADERS must NOT be injected for byok, got %q", got)
@@ -1366,28 +1378,33 @@ func TestApplyPlatformManagedLLMEnv_DERIVED_PlatformModelKeepsPlatformCreds(t *t
 	}
 }
 
-// NON-PLATFORM-DERIVED + NO CREDENTIAL AT ALL → byok + FAIL-CLOSED. This is
-// the legitimate remaining fail-closed path under the corrected model
-// (molecule-core#1994): a claude-code workspace with a non-platform model
-// (kimi-for-coding → byok) and NO override and NO LLM credential at ANY scope
-// (no global row, no workspace row) has nothing to run on → HasUsableLLMCred=
-// false → caller (prepareProvisionContext) aborts MISSING_BYOK_CREDENTIAL. The
-// fail-closed branch is unchanged by the strip removal; only its trigger
-// narrowed from "no workspace-scoped cred" to "no cred at any scope".
+// NON-PLATFORM-DERIVED + NO CREDENTIAL AT ALL → byok + FAIL-CLOSED, on SELF-HOST.
+// Under the operator topology the byok-fail-closed path is reachable ONLY off the
+// platform: with a CP proxy wired (platform mode) a keyless vendor model DEFAULTS
+// to the metered proxy instead of failing closed (member_platform_default_test.go).
+// On a SELF-HOSTED stack (no proxy wired — PlatformManagedProxyConfigured()==false)
+// a claude-code workspace with a non-platform model (kimi-for-coding → byok) and
+// NO LLM credential at ANY scope has nothing to run on → HasUsableLLMCred=false →
+// caller (prepareProvisionContext) aborts MISSING_BYOK_CREDENTIAL. This is the
+// correct self-host contract: the operator must supply a key; the platform must
+// not be billed for a self-hosted deployment.
 func TestApplyPlatformManagedLLMEnv_DERIVED_ByokNoCredentialFailsClosed(t *testing.T) {
 	const wsID = "99999999-8888-7777-6666-555555555555"
 
-	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
-	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+	// Self-host: no CP proxy wired, so the default-to-proxy flip does not fire.
+	t.Setenv("MOLECULE_LLM_BASE_URL", "")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "")
+	t.Setenv("OPENAI_BASE_URL", "")
+	t.Setenv("OPENAI_API_KEY", "")
 
 	// No LLM credential at all — neither global nor workspace scope.
 	envVars := map[string]string{}
 
 	res := applyPlatformManagedLLMEnv(context.Background(), envVars, wsID, "claude-code", "kimi-for-coding", nil)
 
-	// 1. DERIVED byok (kimi-for-coding → kimi-coding, a non-platform arm).
+	// 1. DERIVED byok (kimi-for-coding → kimi-coding, a non-platform arm) on self-host.
 	if res.RoutedToPlatform {
-		t.Fatalf("non-platform-derived model must route byok (RoutedToPlatform=false)")
+		t.Fatalf("self-host non-platform-derived model must route byok (RoutedToPlatform=false)")
 	}
 	// 2. No CP proxy creds forced.
 	if got, ok := envVars["ANTHROPIC_API_KEY"]; ok {
