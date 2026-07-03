@@ -2,6 +2,7 @@ package db
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,21 +52,32 @@ func TestPlatformAgentImage_DeadArtifactsIsGone(t *testing.T) {
 		}
 	}
 
-	// 3. The workspace-server publish workflow must not reference the baked image.
+	// 3. If the workspace-server publish workflow exists, it must not reference
+	//    the baked image. The workflow file itself was retired in #3391 (the
+	//    dead ECR workspace-server publish/deploy path removed when AWS was
+	//    retired). A workflow that no longer exists trivially cannot reference
+	//    the decommissioned platform-agent artifacts, so its absence SATISFIES
+	//    the invariant — exactly like the Dockerfile.platform-agent absence
+	//    check above. If the publish workflow ever reappears, it is re-scanned
+	//    for the banned strings (fail-closed on any actual reference).
 	publishWorkflow := filepath.Join(repoRoot, ".gitea", "workflows", "publish-workspace-server-image.yml")
 	workflowData, err := os.ReadFile(publishWorkflow)
-	if err != nil {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// Publish workflow retired (#3391) — no file to scan, invariant holds.
+	case err != nil:
 		t.Fatalf("could not read publish-workspace-server-image.yml: %v", err)
-	}
-	workflow := string(workflowData)
-	banned := []string{
-		"molecule-platform-agent",
-		"publish-platform-agent",
-		"promote-platform-agent-pin",
-	}
-	for _, s := range banned {
-		if strings.Contains(workflow, s) {
-			t.Errorf("publish-workspace-server-image.yml still references baked platform-agent artifact %q. The molecule-platform-agent image build is decommissioned.", s)
+	default:
+		workflow := string(workflowData)
+		banned := []string{
+			"molecule-platform-agent",
+			"publish-platform-agent",
+			"promote-platform-agent-pin",
+		}
+		for _, s := range banned {
+			if strings.Contains(workflow, s) {
+				t.Errorf("publish-workspace-server-image.yml still references baked platform-agent artifact %q. The molecule-platform-agent image build is decommissioned.", s)
+			}
 		}
 	}
 }
