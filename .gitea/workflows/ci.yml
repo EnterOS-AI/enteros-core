@@ -541,6 +541,16 @@ jobs:
           # and that a legitimate e2e-tmpl-<8hex> slug clears the guard. A revert
           # of the guard (re-trusting the raw override) goes red on every PR.
           bash tests/e2e/test_template_slug_guard.sh
+          # core#2782 boot-cell regression: fail-direction proof for the
+          # collision-proof slug helper (lib/collision-proof-slug.sh). Offline
+          # (pure bash, no CP/network): asserts the helper ALWAYS emits the
+          # 8-char hex uuid anchor — including for the 18-char `cp455-<runtime>-`
+          # prefix used by test_minimal_boot_cell.sh, where there is no room for
+          # the <date>-<run_id> context. A revert to the old `return 1`/empty-suffix
+          # behavior (which produced the collision-UNsafe `cp455-claude-code-`
+          # slug and aborted boot-to-registration BEFORE provisioning) goes red
+          # here on every PR instead of burning a live boot-cell run.
+          bash tests/e2e/test_collision_proof_slug_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Drift guard — KI-013 container/volume naming (SEV #2499)
