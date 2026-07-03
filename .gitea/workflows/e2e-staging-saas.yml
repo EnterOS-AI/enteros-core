@@ -326,12 +326,10 @@ jobs:
 
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
-            exit 1
-          fi
-          echo "Staging CP healthy ✓"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$MOLECULE_CP_URL" "workspace"
 
       # core#2675: completion-gated lanes must distinguish "staging LLM proxy
       # down" from "real code bug" with a distinct, machine-readable status
@@ -807,12 +805,10 @@ jobs:
 
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
-            exit 1
-          fi
-          echo "Staging CP healthy ✓"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$MOLECULE_CP_URL" "workspace"
 
       - name: Run platform-managed boot E2E (online + completion)
         id: e2e
@@ -967,12 +963,10 @@ jobs:
 
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
-            exit 1
-          fi
-          echo "Staging CP healthy ✓"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$MOLECULE_CP_URL" "workspace"
 
       - name: Run concierge user_tasks E2E
         run: bash tests/e2e/test_staging_concierge_e2e.sh
@@ -1106,12 +1100,10 @@ jobs:
           echo "Admin token present"
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a workspace-requests bug."
-            exit 1
-          fi
-          echo "Staging CP healthy"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$CP_BASE_URL" "workspace-requests"
       - name: Run workspace-requests staginge2e (core#2606)
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceCanRaiseTaskAndApprovalToUser -count=1 -v -timeout 30m
@@ -1288,12 +1280,10 @@ jobs:
 
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
-            exit 1
-          fi
-          echo "Staging CP healthy ✓"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$MOLECULE_CP_URL" "workspace"
 
       # core#3081: the A2A-probe (asserting the live concierge's tool list
       # actually contains mcp__molecule-platform__create_workspace, not just
@@ -1486,12 +1476,10 @@ jobs:
           echo "Admin token present"
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a concierge bug."
-            exit 1
-          fi
-          echo "Staging CP healthy"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$CP_BASE_URL" "concierge"
       - name: Run concierge/platform-agent staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestConciergePlatformAgent_Staging -count=1 -v -timeout 35m
@@ -1589,12 +1577,10 @@ jobs:
           echo "Admin token present"
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a plugin-lifecycle bug."
-            exit 1
-          fi
-          echo "Staging CP healthy"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$CP_BASE_URL" "plugin-lifecycle"
       - name: Run plugin-install-lifecycle staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 40m
