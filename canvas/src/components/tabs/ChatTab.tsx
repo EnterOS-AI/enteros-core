@@ -155,7 +155,6 @@ function MyChatPanel({ workspaceId, data }: Props) {
 
   const history = useChatHistory(workspaceId, containerRef);
   const chatSend = useChatSend(workspaceId, {
-    getHistoryMessages: () => history.messages,
     onUserMessage: (msg) => history.setMessages((prev) => [...prev, msg]),
     onAgentMessage: (msg) => history.setMessages((prev) => appendMessageDeduped(prev, msg)),
   });
