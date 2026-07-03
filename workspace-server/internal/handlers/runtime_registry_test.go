@@ -291,6 +291,62 @@ func TestResolveTemplateIdentity(t *testing.T) {
 	}
 }
 
+// TestIsConciergeTemplateName pins the concierge-template predicate the
+// resolveTemplateIdentity fail-loud belt keys on (tenant-agent BUG 1).
+func TestIsConciergeTemplateName(t *testing.T) {
+	concierge := []string{"platform-agent", "openclaw-platform-agent", "codex-platform-agent", "hermes-platform-agent"}
+	for _, n := range concierge {
+		if !isConciergeTemplateName(n) {
+			t.Errorf("isConciergeTemplateName(%q) = false, want true", n)
+		}
+	}
+	notConcierge := []string{"", "claude-code-default", "seo-agent", "hermes", "platform-agent-extra"}
+	for _, n := range notConcierge {
+		if isConciergeTemplateName(n) {
+			t.Errorf("isConciergeTemplateName(%q) = true, want false", n)
+		}
+	}
+}
+
+// TestResolveTemplateIdentity_ConciergeTemplate covers the tenant-agent BUG 1
+// belt: when the platform-agent concierge template IS registered it resolves to a
+// non-empty identity; when it is NOT registered it fail-closes to ("", false) (and
+// the resolver logs a CRITICAL — the loud signal that a concierge would boot with
+// no persona). The claude-code concierge default resolution must not depend on the
+// per-runtime concierge template name at all.
+func TestResolveTemplateIdentity_ConciergeTemplate(t *testing.T) {
+	dir := t.TempDir()
+
+	// (1) platform-agent registered → resolves.
+	p := filepath.Join(dir, "with.json")
+	if err := os.WriteFile(p, []byte(`{"workspace_templates":[
+		{"name":"claude-code-default","repo":"molecule-ai/t-cc","ref":"main"},
+		{"name":"platform-agent","repo":"molecule-ai/t-pa","ref":"sha1","runtime":"claude-code"}
+	]}`), 0600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	t.Setenv("WORKSPACE_MANIFEST_PATH", p)
+	initTemplateRepoByName()
+	if id, ok := resolveTemplateIdentity("platform-agent", "openclaw"); !ok || id != "molecule-ai/t-pa@sha1" {
+		t.Fatalf("registered platform-agent: got (%q,%v), want (molecule-ai/t-pa@sha1,true)", id, ok)
+	}
+
+	// (2) platform-agent NOT registered → fail-closed empty identity (the BUG 1
+	//     regression shape). resolveTemplateIdentity must return ok=false so the
+	//     concierge provision surfaces the empty identity rather than a wrong repo.
+	p2 := filepath.Join(dir, "without.json")
+	if err := os.WriteFile(p2, []byte(`{"workspace_templates":[
+		{"name":"claude-code-default","repo":"molecule-ai/t-cc","ref":"main"}
+	]}`), 0600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	t.Setenv("WORKSPACE_MANIFEST_PATH", p2)
+	initTemplateRepoByName()
+	if id, ok := resolveTemplateIdentity("platform-agent", "openclaw"); ok || id != "" {
+		t.Fatalf("unregistered platform-agent: got (%q,%v), want (\"\",false)", id, ok)
+	}
+}
+
 // TestIsKnownTemplate pins the manifest-entry gate used by PATCH /template.
 func TestIsKnownTemplate(t *testing.T) {
 	dir := t.TempDir()

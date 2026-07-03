@@ -484,19 +484,27 @@ func fetchCPDefaultModel(ctx context.Context) (string, error) {
 	return strings.TrimSpace(cfg["MOLECULE_LLM_DEFAULT_MODEL"]), nil
 }
 
-// conciergeTemplateForRuntime maps a concierge runtime to its platform-agent
-// template name. The claude-code concierge keeps the historical "platform-agent"
-// template name (the row column installPlatformAgent has always written, and the
-// name conciergeTemplateOrDefault forces on provision); other runtimes use the
-// "<runtime>-platform-agent" convention (mirrors the localbuild image naming
-// `workspace-template-<runtime>-platform-agent`). This is what installPlatformAgent
-// stamps into workspaces.template so the asset fetcher pulls the right identity.
+// conciergeTemplateForRuntime returns the concierge's platform-agent template
+// name. There is ONE runtime-agnostic concierge persona template — "platform-agent"
+// — for EVERY runtime (claude-code, openclaw, codex, hermes, …). This is what
+// installPlatformAgent stamps into workspaces.template so the asset fetcher pulls
+// the concierge identity.
+//
+// SSOT COLLAPSE (tenant-agent BUG 1, P0): this used to map non-claude-code
+// concierges to a per-runtime "<runtime>-platform-agent" name (e.g.
+// "openclaw-platform-agent"). No such template is registered in manifest.json, so
+// resolveTemplateIdentity fail-closed to an EMPTY identity and the concierge booted
+// with NO persona (the 97-byte stub /configs/config.yaml). The concierge identity
+// is runtime-agnostic (the SAME orchestrator persona regardless of the underlying
+// runtime image), so it now resolves through the single "platform-agent" template
+// entry (manifest.json workspace_templates) whose config.yaml + system-prompt.md +
+// prompts/concierge.md serve every runtime via the control-plane materializer.
+//
+// The `runtime` parameter is retained for call-site compatibility; it no longer
+// changes the template (kept named for readability at the stamp site).
 func conciergeTemplateForRuntime(runtime string) string {
-	runtime = strings.TrimSpace(runtime)
-	if runtime == "" || runtime == defaultConciergeRuntime {
-		return "platform-agent"
-	}
-	return runtime + "-platform-agent"
+	_ = strings.TrimSpace(runtime) // runtime-agnostic: one concierge persona template for all runtimes
+	return "platform-agent"
 }
 
 // ensureConciergeModel makes the platform agent's model explicit (core#2594).
@@ -1284,29 +1292,23 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    seeds status='offline' via the INSERT's VALUES; only the conflict path
 	//    leaves status untouched.)
 	//
-	//    TEMPLATE (RC 13985): the conflict clause must NOT stamp the template that
-	//    matches the REQUESTED runtime ($4) — that desyncs the pair. A codex
-	//    concierge (runtime='codex', template='codex-platform-agent') reinstalled
-	//    via the DEFAULT path (which carries claude-code/$4='platform-agent')
-	//    would keep its preserved runtime='codex' but silently revert
-	//    template='platform-agent' → a runtime/template MISMATCH. Since `runtime`
-	//    is PRESERVED on conflict, the template must be derived from the row's
-	//    EXISTING runtime (`workspaces.runtime`), not the incoming one, so the
-	//    (runtime, template) pair stays matched after any default reinstall. The
-	//    CASE mirrors conciergeTemplateForRuntime: claude-code/empty →
-	//    'platform-agent', else '<runtime>-platform-agent'. An explicit runtime
-	//    change flows through the dedicated runtime-switch path, never here.
+	//    TEMPLATE (tenant-agent BUG 1, P0): the concierge persona template is now
+	//    RUNTIME-AGNOSTIC — a single 'platform-agent' entry serves every runtime
+	//    (see conciergeTemplateForRuntime). The previous per-runtime CASE stamped
+	//    '<runtime>-platform-agent' (e.g. 'openclaw-platform-agent') for a
+	//    non-claude-code concierge; no such template is registered in manifest.json,
+	//    so resolveTemplateIdentity fail-closed to an empty identity and the
+	//    concierge booted with no persona. On conflict `runtime` is still PRESERVED
+	//    (never reverted), but the template is now unconditionally 'platform-agent'
+	//    for both a fresh INSERT ($4) and a reinstall — the (runtime, template) pair
+	//    can no longer desync because there is exactly one concierge template.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id, template)
 		VALUES ($1, $2, 'platform', 0, 'offline', $3, NULL, $4)
 		ON CONFLICT (id) DO UPDATE SET
 			kind = 'platform',
 			parent_id = NULL,
-			template = CASE
-				WHEN COALESCE(NULLIF(TRIM(workspaces.runtime), ''), 'claude-code') = 'claude-code'
-					THEN 'platform-agent'
-				ELSE TRIM(workspaces.runtime) || '-platform-agent'
-			END
+			template = 'platform-agent'
 	`, platformID, name, runtime, template); err != nil {
 		return fmt.Errorf("upsert platform agent: %w", err)
 	}

@@ -399,7 +399,7 @@ func TestInstallPlatformAgent_PreservesRemovedStatusOnConflict(t *testing.T) {
 	// 1. upsert — the ON CONFLICT clause sets kind/parent_id/template and must NOT
 	//    touch status. Matching the DO UPDATE clause here documents that status is
 	//    absent from it.
-	mock.ExpectExec(`INSERT INTO workspaces .*ON CONFLICT \(id\) DO UPDATE SET\s+kind = 'platform',\s+parent_id = NULL,\s+template = CASE`).
+	mock.ExpectExec(`INSERT INTO workspaces .*ON CONFLICT \(id\) DO UPDATE SET\s+kind = 'platform',\s+parent_id = NULL,\s+template = 'platform-agent'`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// 2. capture old roots — none.
 	mock.ExpectQuery(`SELECT id FROM workspaces WHERE parent_id IS NULL AND id <> \$1 FOR UPDATE`).
