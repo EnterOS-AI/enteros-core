@@ -95,6 +95,7 @@ jobs:
   # workflow-only PRs. The actual E2E step only runs when provisioning-
   # critical files change (git-paths filter + if: guard below).
   # All steps use continue-on-error: true so runner issues do not block merge.
+  # bp-exempt: informational PR-shape validation job; not a required gate.
   pr-validate:
     runs-on: ubuntu-latest
     steps:
@@ -121,6 +122,7 @@ jobs:
   # paths. pr-validate remains as the lightweight workflow-shape check for PRs,
   # but it is not a substitute for live staging proof when this workflow or the
   # staging harness changes.
+  # bp-exempt: EC2-only full-lifecycle lane, dormant behind vars.E2E_EC2_ENABLED; not a required gate.
   e2e-staging-saas:
     name: E2E Staging SaaS
     runs-on: ubuntu-latest
@@ -453,8 +455,9 @@ jobs:
   #   - Token and zone id come from repository secrets ONLY; never hardcoded.
   #   - --min-age-hours is conservative (2h) so in-flight records from a long
   #     E2E run or a recently-started dispatch are never touched.
-  # bp-required: pending — non-required / best-effort cleanup job.
-  # mc#3147 = decision issue; mc#3173 = current governance tracker.
+  # (non-required / best-effort cleanup job. mc#3147 = decision issue;
+  #  mc#3173 = current governance tracker.)
+  # bp-exempt: best-effort DNS cleanup (runs on always()); not a required gate.
   prune-stale-e2e-dns:
     name: Prune stale e2e DNS records
     runs-on: ubuntu-latest
@@ -604,7 +607,8 @@ jobs:
   # pre-merge. This job now exercises a real platform-managed boot on every
   # push-to-main and is the merge gate.
   #
-  # bp-required: now required — added to .gitea/required-contexts.txt by #48
+  # (formerly bp-required; now EC2-dormant behind vars.E2E_EC2_ENABLED — the
+  # authoritative directive is the bp-exempt line directly above the job key.)
   #
   # core#3081 / #48: NO `if:` guard on this job (mirrors
   # e2e-staging-concierge-creates-workspace). The job IS a required status
@@ -616,6 +620,7 @@ jobs:
   # case and exit 0s after a bash -n self-check), and on push/dispatch/cron
   # with E2E_REQUIRE_LIVE=1 (the real staging boot runs and HARD FAILs on
   # missing infra).
+  # bp-exempt: EC2-only, dormant behind vars.E2E_EC2_ENABLED (no cloud backend); not a required gate until re-enabled.
   e2e-staging-platform-boot:
     name: E2E Staging Platform Boot
     runs-on: ubuntu-latest
@@ -1151,8 +1156,9 @@ jobs:
   # a silently-missing platform-agent image can NEVER false-green this gate. Runs
   # on push-to-main / workflow_dispatch / cron only (needs live staging infra +
   # a model — never on PR, where pr-validate posts the workflow's PR status).
-  # bp-required: now required — added to .gitea/required-contexts.txt by core#3081
-  # (core#3081 also adds the A2A-probe step in the test script: it reads the
+  # (enforcement sequenced on molecules-server — the authoritative directive is
+  # the `bp-required: pending #3411` line directly above the job key; core#3081
+  # also adds the A2A-probe step in the test script: it reads the
   # concierge's /configs/mcp_servers.yaml via GET /workspaces/:id/files/mcp_servers.yaml
   # and asserts the molecule-platform MCP server is declared with create_workspace.
   # The previous false-green slipped because the proxies were healthy, the
@@ -1171,6 +1177,9 @@ jobs:
   # detects the missing-creds case and exit 0s with a self-check), 1 on
   # push-to-main / dispatch / cron (the real staging test runs and HARD
   # FAILs on missing infra).
+  # bp-required: pending #3411 (molecules-server enforcement sequenced — kept below
+  # the ENFORCED marker in .gitea/required-contexts.txt until a green main run +
+  # creds-less PR/fork path, then BP-PATCH + promote).
   e2e-staging-concierge-creates-workspace:
     name: E2E Staging Concierge Creates Workspace
     runs-on: ubuntu-latest
