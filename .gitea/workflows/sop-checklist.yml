@@ -62,10 +62,30 @@
 
 name: sop-checklist
 
-# Cancel any in-progress runs for the same PR to prevent
-# stale runs from overwriting newer status contexts.
+# Concurrency: supersede only same-EVENT-TYPE in-progress runs for the same PR.
+#
+# `github.event_name` is part of the group key on purpose. This workflow runs
+# on BOTH `pull_request_target` (posts the BP-required
+# `sop-checklist / all-items-acked (pull_request_target)` context, from the
+# trusted base ref) AND `issue_comment` (posts the non-required
+# `(pull_request)` context on /sop-ack). Gitea auto-suffixes the status
+# context from the trigger event, so the two event types write DIFFERENT
+# contexts.
+#
+# Before this fix the group was keyed by PR number alone with
+# cancel-in-progress: true, so a /sop-ack comment run would CANCEL an
+# in-flight pull_request_target run — leaving the required
+# `(pull_request_target)` context stuck at `failure: Has been cancelled`
+# with no same-event trigger to re-post it (a permanent merge wedge;
+# repro'd on #3392/#3393/docs#91 2026-07-02). Splitting the group by
+# event_name keeps "newest run of the SAME event type wins" (older
+# pull_request_target edits/labels still supersede correctly, older
+# comment runs still supersede) while a comment can no longer strand the
+# trusted required status. The gate eval is idempotent (reads live
+# PR+comments, posts a per-SHA status), so the surviving run always posts
+# the correct verdict.
 concurrency:
-  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
 # bp-required: yes  ← emits sop-checklist / all-items-acked (pull_request)
