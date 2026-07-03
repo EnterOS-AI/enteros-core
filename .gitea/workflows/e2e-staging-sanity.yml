@@ -1,4 +1,12 @@
-# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
+# KEPT DORMANT (group A — molecules-server cutover): unlike the other three e2e lanes, this one
+# CANNOT be switched to molecules-server here. It is the self-check that the teardown safety net
+# terminates a leaked *EC2 instance* — E2E_AWS_LEAK_CHECK=required + AWS creds +
+# E2E_AWS_TERMINATE_LEAKS — an AWS-EC2-specific assertion. It also drives the a9f331fa-owned
+# harness tests/e2e/test_staging_full_saas.sh, which hardcodes the org-create body with NO
+# provider knob, so a workflow-env-only switch is impossible without editing that (out-of-scope)
+# harness. It therefore stays workflow_dispatch-only until a9f331fa reworks the leak-check to
+# inspect docker containers instead of EC2 instances; re-enabling push/pull_request now would
+# gate on the intentionally-closed AWS path. See ABSTRACTION-FINDINGS.
 name: E2E Staging Sanity (leak-detection self-check)
 
 # Ported from .github/workflows/e2e-staging-sanity.yml on 2026-05-11 per

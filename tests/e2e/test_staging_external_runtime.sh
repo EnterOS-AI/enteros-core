@@ -52,7 +52,11 @@
 #   MOLECULE_ADMIN_TOKEN     CP admin bearer (Railway CP_ADMIN_API_TOKEN)
 #
 # Optional env:
-#   E2E_PROVISION_TIMEOUT_SECS  default 900 (15 min cold EC2 budget)
+#   E2E_PROVIDER                default molecules-server (the local-docker compute backend).
+#                               Canonical cloudprovider SSOT wire id; pinned into the
+#                               org-create body so the tenant does NOT fall back to the CP
+#                               DefaultProvider (the closed AWS EC2 path).
+#   E2E_PROVISION_TIMEOUT_SECS  default 900 (15 min cold-provision budget)
 #   E2E_KEEP_ORG                1 → skip teardown (debugging only)
 #   E2E_RUN_ID                  Slug suffix; CI: ${GITHUB_RUN_ID}
 #   E2E_STALE_WAIT_SECS         default 180 (90s window + 90s buffer)
@@ -95,6 +99,11 @@ STALE_WAIT_SECS="${E2E_STALE_WAIT_SECS:-180}"
 STALE_POLL_DEADLINE_SECS="${E2E_STALE_POLL_DEADLINE_SECS:-240}"
 TRANSIENT_RETRIES="${E2E_TRANSIENT_RETRIES:-8}"
 REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
+# Compute backend for the throwaway tenant. Defaults to molecules-server (the local-docker
+# backend) now that the AWS EC2 path is closed. This is the canonical cloudprovider SSOT wire
+# id the CP org-create validates (IsValidRequest) and persists as organizations.provider
+# 'local' (PersistKey). Empty string → CP DefaultProvider (the closed AWS path), so we pin it.
+PROVIDER="${E2E_PROVIDER:-molecules-server}"
 
 # Collision-proof slug (core#2782). The prior `head -c 32` truncation
 # dropped the run_attempt suffix and let two parallel/retry runs
@@ -259,7 +268,7 @@ log "1/8 Creating org $SLUG..."
 # still wrote the body, so CREATE_RESP holds it and the id-check surfaces why.
 set +e
 CREATE_RESP=$(admin_call POST /cp/admin/orgs \
-  -d "{\"slug\":\"$SLUG\",\"name\":\"E2E ext $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
+  -d "{\"slug\":\"$SLUG\",\"name\":\"E2E ext $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\",\"provider\":\"$PROVIDER\"}")
 set -e
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
 [ -z "$ORG_ID" ] && fail "Org create response missing 'id': $(printf '%s' "$CREATE_RESP" | sanitize_http_body 2>/dev/null || printf '%s' "$CREATE_RESP")"

@@ -1,4 +1,9 @@
-# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
+# RE-ENABLED (group A — molecules-server cutover): AWS is closed, so this lane now provisions
+# its throwaway tenant on the molecules-server (local-docker) backend via E2E_PROVIDER=molecules-server
+# (threaded into the org-create body by test_staging_external_runtime.sh). push/pull_request on
+# main+staging are restored and the continue-on-error advisory mask is removed so the four
+# awaiting_agent-transition assertions actually GATE. Advisory-RED (not yet in
+# .gitea/required-contexts.txt) until the local-docker gate + CP health + browser fixes land.
 name: E2E Staging External Runtime
 
 # Ported from .github/workflows/e2e-staging-external.yml on 2026-05-11 per RFC
@@ -46,34 +51,33 @@ name: E2E Staging External Runtime
 # tenant always finishes its teardown.
 
 on:
-  # DISABLED 2026-06-27: push/pull_request auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
-  # The schedule/cron trigger was DELETED (no-nightly-e2e rule) — not commented.
-#   push:
-#     branches: [main]
-#     paths:
-#       - 'workspace-server/internal/handlers/workspace.go'
-#       - 'workspace-server/internal/handlers/registry.go'
-#       - 'workspace-server/internal/handlers/workspace_restart.go'
-#       - 'workspace-server/internal/registry/healthsweep.go'
-#       - 'workspace-server/internal/registry/liveness.go'
-#       - 'workspace-server/migrations/**'
-#       - 'workspace-server/internal/db/workspace_status_enum_drift_test.go'
-#       - 'tests/e2e/test_staging_external_runtime.sh'
-#       - '.gitea/workflows/e2e-staging-external.yml'
-#   pull_request:
-#     branches: [main]
-#     paths:
-#       - 'workspace-server/internal/handlers/workspace.go'
-#       - 'workspace-server/internal/handlers/registry.go'
-#       - 'workspace-server/internal/handlers/workspace_restart.go'
-#       - 'workspace-server/internal/registry/healthsweep.go'
-#       - 'workspace-server/internal/registry/liveness.go'
-#       - 'workspace-server/migrations/**'
-#       - 'workspace-server/internal/db/workspace_status_enum_drift_test.go'
-#       - 'tests/e2e/test_staging_external_runtime.sh'
-#       - '.gitea/workflows/e2e-staging-external.yml'
-
-  # DISABLED 2026-06-27: no manual trigger remained after neutralizing auto-triggers; workflow_dispatch added so the workflow stays manually runnable.
+  # RE-ENABLED (group A): molecules-server (local-docker) replaces the closed AWS EC2 path.
+  # The schedule/cron trigger stays DELETED (no-nightly-e2e rule). Path-scoped so only PRs
+  # touching the external-runtime surface (or this harness/workflow) spin a real tenant.
+  push:
+    branches: [main, staging]
+    paths:
+      - 'workspace-server/internal/handlers/workspace.go'
+      - 'workspace-server/internal/handlers/registry.go'
+      - 'workspace-server/internal/handlers/workspace_restart.go'
+      - 'workspace-server/internal/registry/healthsweep.go'
+      - 'workspace-server/internal/registry/liveness.go'
+      - 'workspace-server/migrations/**'
+      - 'workspace-server/internal/db/workspace_status_enum_drift_test.go'
+      - 'tests/e2e/test_staging_external_runtime.sh'
+      - '.gitea/workflows/e2e-staging-external.yml'
+  pull_request:
+    branches: [main, staging]
+    paths:
+      - 'workspace-server/internal/handlers/workspace.go'
+      - 'workspace-server/internal/handlers/registry.go'
+      - 'workspace-server/internal/handlers/workspace_restart.go'
+      - 'workspace-server/internal/registry/healthsweep.go'
+      - 'workspace-server/internal/registry/liveness.go'
+      - 'workspace-server/migrations/**'
+      - 'workspace-server/internal/db/workspace_status_enum_drift_test.go'
+      - 'tests/e2e/test_staging_external_runtime.sh'
+      - '.gitea/workflows/e2e-staging-external.yml'
   workflow_dispatch:
 concurrency:
   group: e2e-staging-external
@@ -89,11 +93,13 @@ jobs:
   e2e-staging-external:
     name: E2E Staging External Runtime
     runs-on: ubuntu-latest
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # UN-ADVISORIED (group A): the mc#2654 continue-on-error mask is REMOVED so a real
+    # failure fails the job (Gitea Quirk #10 no longer rolls a failed step up to success).
+    # This context was dispatch-only, so it has no push/PR run history on the protected
+    # branches — lint-pre-flip-continue-on-error's no-run-history exemption covers the
+    # true→false flip.
     #
-    # PROMOTION-READINESS (toward required gate — do NOT flip continue-on-error
-    # without CTO sign-off, that's the irreversible call):
+    # PROMOTION-READINESS (toward a required branch-protection context):
     #   NOW FAIL-CLOSED:
     #     - Missing CP_STAGING_ADMIN_API_TOKEN → hard exit 2 (preflight).
     #     - Staging CP unhealthy → hard exit 1 (preflight, not a workspace bug).
@@ -110,12 +116,14 @@ jobs:
     #     - "CP unhealthy → exit 1" currently looks identical to a real
     #       failure on the run page; required-gate would need it demoted to
     #       a neutral/skip so staging flakiness can't block merges.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
     timeout-minutes: 25
 
     env:
       MOLECULE_CP_URL: https://staging-api.moleculesai.app
+      # Compute backend: molecules-server (local-docker), threaded into the org-create body
+      # by test_staging_external_runtime.sh. Canonical cloudprovider SSOT wire id; CP validates
+      # it (IsValidRequest) and persists organizations.provider 'local' (PersistKey).
+      E2E_PROVIDER: molecules-server
       # 2026-05-11: secret canonicalised from MOLECULE_STAGING_ADMIN_TOKEN
       # (dead in org secret store) to CP_STAGING_ADMIN_API_TOKEN per
       # internal#322 — see this PR for the cross-workflow sweep.
