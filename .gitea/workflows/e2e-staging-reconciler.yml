@@ -1,12 +1,20 @@
-# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
-name: E2E Staging Reconciler (heals terminated EC2)
+# ADAPTED 2026-07-03 (AWS account closed → local-docker rework): the kill
+# primitive is now `docker rm -f <container>` on the MOLECULES-SERVER
+# (local-docker) provider by default (E2E_PROVIDER=molecules-server); the legacy
+# EC2 path is one env flip away (E2E_PROVIDER=aws). Auto-triggers RE-ENABLED — the
+# original disable reason (AWS account closed) no longer applies now that the
+# default kill is docker, and this job is advisory (continue-on-error: true) so a
+# red run cannot block a merge while the core health/browser + a9f331fa gate fixes
+# land.
+name: E2E Staging Reconciler (heals killed workspace instance)
 
 # Live staging proof for the core#2261 instance-state reconciler
 # (workspace-server/internal/registry/cp_instance_reconciler.go). The
 # real-infra complement to the deterministic unit tests: provisions a real
-# staging workspace, TERMINATES its EC2, and asserts the reconciler flips it
-# off 'online' (PRIMARY gate) and auto-reprovisions on a new instance_id
-# (SECONDARY, best-effort). See
+# staging workspace, KILLS its instance (docker rm -f the mol-ws container on
+# molecules-server; aws ec2 terminate-instances on aws), and asserts the
+# reconciler flips it off 'online' (PRIMARY gate) and auto-reprovisions on a new
+# instance_id (SECONDARY, best-effort). See
 # tests/e2e/test_reconciler_heals_terminated_instance.sh for the assertion
 # contract + timeouts.
 #
@@ -16,37 +24,34 @@ name: E2E Staging Reconciler (heals terminated EC2)
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
 #
-# NOT a required check (yet). This is a brand-new live E2E that provisions +
-# terminates real EC2 (costs money, shares the cp#245 cold-boot flake
-# surface). A new live e2e must NOT hard-gate every merge until it has a
-# green track record. continue-on-error: true surfaces failures without
+# NOT a required check (yet). continue-on-error: true surfaces failures without
 # blocking. PROMOTE to branch-required (flip continue-on-error → false AND
 # add "E2E Staging Reconciler" to branch protection) once it has run green on
-# main for several consecutive days — same de-flake discipline the
-# platform-boot job in e2e-staging-saas.yml documents.
+# main for several consecutive days on molecules-server — same de-flake
+# discipline the platform-boot job in e2e-staging-saas.yml documents.
 
 on:
-  # DISABLED 2026-06-27: push/pull_request auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
-  # The schedule/cron trigger was DELETED (no-nightly-e2e rule) — not commented.
-  # Run when the reconciler itself, the script, or the libs it depends on
-  # change — so a reconciler regression is caught on the PR that introduces
-  # it (paths filter). On-demand only until the local-docker rework.
-#   push:
-#     branches: [main]
-#     paths:
-#       - 'workspace-server/internal/registry/cp_instance_reconciler.go'
-#       - 'tests/e2e/test_reconciler_heals_terminated_instance.sh'
-#       - 'tests/e2e/lib/aws_leak_check.sh'
-#       - 'tests/e2e/lib/model_slug.sh'
-#       - '.gitea/workflows/e2e-staging-reconciler.yml'
-#   pull_request:
-#     branches: [main]
-#     paths:
-#       - 'workspace-server/internal/registry/cp_instance_reconciler.go'
-#       - 'tests/e2e/test_reconciler_heals_terminated_instance.sh'
-#       - 'tests/e2e/lib/aws_leak_check.sh'
-#       - 'tests/e2e/lib/model_slug.sh'
-#       - '.gitea/workflows/e2e-staging-reconciler.yml'
+  # RE-ENABLED (2026-07-03): the push-to-main auto-trigger runs the docker-kill
+  # reconciler proof post-merge whenever the reconciler / script / libs change
+  # (paths filter). Advisory (continue-on-error) so a needsCoreFix red on main is
+  # informational, not blocking. The schedule/cron trigger stays DELETED
+  # (no-nightly-e2e rule).
+  push:
+    branches: [main]
+    paths:
+      - 'workspace-server/internal/registry/cp_instance_reconciler.go'
+      - 'tests/e2e/test_reconciler_heals_terminated_instance.sh'
+      - 'tests/e2e/lib/collision-proof-slug.sh'
+      - 'tests/e2e/lib/model_slug.sh'
+      - '.gitea/workflows/e2e-staging-reconciler.yml'
+  # pull_request auto-trigger deliberately NOT re-armed yet: it would run a REAL
+  # staging molecules-server provision + docker-kill on EVERY PR touching these
+  # paths (box load), and this lane is still red pending the core health/browser +
+  # a9f331fa gate fixes. RE-ARM once green + once the box can absorb per-PR live
+  # runs (restore the same paths block as push above).
+  # pull_request:
+  #   branches: [main]
+  #   paths: [ ...same as push... ]
   workflow_dispatch:
 
 # Serialize against itself: staging has a finite per-hour org-creation quota,
@@ -99,13 +104,12 @@ jobs:
       # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret is left in place until a
       # green run validates this path (validate-before-delete). The Verify-
       # required-secrets gate still validates MOLECULE_ADMIN_TOKEN is non-empty.
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-east-2
-      # Leak-check is REQUIRED here: this test deliberately terminates an EC2,
-      # so teardown MUST positively confirm no slug-tagged box survives.
-      E2E_AWS_LEAK_CHECK: required
-      E2E_AWS_TERMINATE_LEAKS: '1'
+      # Provider knob: molecules-server (local-docker) is the DEFAULT — the kill
+      # primitive is `docker rm -f <container>` and teardown's leak-check is a
+      # `docker ps -a` sweep (no cloud IAM creds needed). Set E2E_PROVIDER=aws to
+      # restore the legacy EC2 path (which then needs AWS_ACCESS_KEY_ID /
+      # AWS_SECRET_ACCESS_KEY + E2E_AWS_LEAK_CHECK — wire them back here too).
+      E2E_PROVIDER: molecules-server
       # Platform model + runtime are de-hardcoded to the KMS SSOT
       # (/shared/controlplane/llm @ environment=staging) by the
       # "Fetch platform model+runtime from KMS SSOT" step below, which exports
@@ -232,19 +236,31 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "Platform model+runtime + admin token loaded from KMS SSOT (model len=${#E2E_MODEL}, runtime len=${#E2E_RUNTIME}, admin len=${#MOLECULE_ADMIN_TOKEN})"
 
-      - name: Verify required secrets present
+      - name: Verify required secrets + kill capability present
         run: |
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
             exit 2
           fi
-          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
-            if [ -z "${!var:-}" ]; then
-              echo "::error::$var not set — this test terminates an EC2 and verifies no leak; AWS creds are mandatory"
+          if [ "${E2E_PROVIDER:-molecules-server}" = "aws" ]; then
+            # Legacy EC2 path: AWS creds are mandatory (terminate + leak-verify).
+            for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+              if [ -z "${!var:-}" ]; then
+                echo "::error::$var not set — E2E_PROVIDER=aws terminates an EC2 and verifies no leak; AWS creds are mandatory"
+                exit 2
+              fi
+            done
+          else
+            # molecules-server: the reconciler test docker-kills the mol-ws
+            # container, so the runner must reach the docker daemon CP's
+            # local-docker backend used (DOCKER_HOST → the molecules-server host;
+            # a co-located self-hosted runner shares it).
+            if ! docker info >/dev/null 2>&1; then
+              echo "::error::docker daemon unreachable — E2E_PROVIDER=molecules-server kills the workspace CONTAINER. Point DOCKER_HOST at the molecules-server host (needs the core health/browser + a9f331fa gate wiring)."
               exit 2
             fi
-          done
-          echo "Required secrets present ✓"
+          fi
+          echo "Required secrets + kill capability present ✓"
 
       - name: CP staging health preflight
         run: |
