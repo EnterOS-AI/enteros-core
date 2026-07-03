@@ -15,6 +15,12 @@ name: redeploy-tenants-on-main
 # tag (:latest, not staging-latest), and the PROD_AUTO_DEPLOY_DISABLED kill
 # switch (below).
 #
+# CANONICAL ALGORITHM REFERENCE: redeploy-tenants-on-staging.yml. The
+# canary-first / health-gated / self-rolling-back swap logic is intentionally
+# identical in both files — treat the STAGING workflow as the source of truth,
+# make algorithm changes THERE FIRST, then port only the prod-only deltas
+# (label filter / tag / kill switch) here so edits land in the right file.
+#
 # Dropped vs the EC2/SSM era: AWS creds / EC2 DescribeInstances / SSM
 # RunShellCommand / the CP redeploy-fleet call / GHCR sleep / the Infisical
 # CP-admin-token fetch. Added: the docker-host canary-first, health-gated,
@@ -44,8 +50,15 @@ on:
 permissions:
   contents: read
 
+# Serialize per-branch so two rapid main pushes' redeploys don't overlap and
+# leave the fleet half-rolled. cancel-in-progress:false — aborting a partial
+# PROD roll mid-fleet is worse than letting it finish (each swap is
+# health-gated + self-rolls-back, so a completed predecessor is always in a
+# good state). Explicit here to match redeploy-tenants-on-staging.yml rather
+# than lean on the Gitea/Actions default.
 concurrency:
   group: redeploy-tenants-on-main
+  cancel-in-progress: false
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
@@ -72,6 +85,13 @@ jobs:
           case "$(printf '%s' "${PROD_AUTO_DEPLOY_DISABLED:-}" | tr '[:upper:]' '[:lower:]')" in
             1|true|yes|on|disabled|disable)
               echo "::notice::PROD_AUTO_DEPLOY_DISABLED is set — production redeploy is frozen. Skipping."
+              # Audit-trail marker so a future operator inspecting the run
+              # summary can see WHY it short-circuited (not just an empty run).
+              {
+                echo "## Production fleet redeploy — SKIPPED (frozen)"
+                echo ""
+                echo "\`PROD_AUTO_DEPLOY_DISABLED\` is set — production auto-redeploy is frozen; no containers were touched. An operator must unset it to lift the freeze."
+              } >> "$GITHUB_STEP_SUMMARY"
               echo "skip=1" >> "$GITHUB_OUTPUT"
               ;;
             *)
@@ -108,10 +128,10 @@ jobs:
           fi
 
           health_gate() {
-            local name="$1" port i
+            local name="$1" port
             port="$(docker port "$name" 8080/tcp 2>/dev/null | head -1 | sed 's/.*://')"
             [ -n "$port" ] || return 1
-            for i in $(seq 1 20); do
+            for _ in $(seq 1 20); do
               if curl -fsS --max-time 5 "http://127.0.0.1:${port}/buildinfo" >/dev/null 2>&1; then
                 return 0
               fi

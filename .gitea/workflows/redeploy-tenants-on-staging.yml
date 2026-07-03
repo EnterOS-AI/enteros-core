@@ -115,10 +115,10 @@ jobs:
           # health_gate <container>: probe the tenant's published :8080
           # /buildinfo through the host loopback. Returns 0 when it answers.
           health_gate() {
-            local name="$1" port i
+            local name="$1" port
             port="$(docker port "$name" 8080/tcp 2>/dev/null | head -1 | sed 's/.*://')"
             [ -n "$port" ] || return 1
-            for i in $(seq 1 20); do
+            for _ in $(seq 1 20); do
               if curl -fsS --max-time 5 "http://127.0.0.1:${port}/buildinfo" >/dev/null 2>&1; then
                 return 0
               fi
