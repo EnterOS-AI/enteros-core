@@ -55,17 +55,21 @@ set -uo pipefail
 #   1: Run id (typically E2E_RUN_ID from the workflow; falls back
 #      to a wall-clock+PID value when empty).
 #   2: Optional length of the caller's literal prefix in the
-#      SLUG=... assignment. When supplied, the suffix budget is
-#      computed precisely (CP_ORG_SLUG_MAX_LEN - prefix_len - 19,
-#      where 19 = 1 separator + 8 date + 1 separator + 1 separator
-#      + 8 uuid). When omitted, the helper uses a conservative
-#      default of 11 (the "e2e-smoke-" prefix length).
+#      SLUG=... assignment. When supplied, the context budget is
+#      computed precisely (CP_ORG_SLUG_MAX_LEN - prefix_len - 9,
+#      where 9 = 8 uuid + 1 anchor separator). When omitted, the
+#      helper uses a conservative default of 11 (the "e2e-smoke-"
+#      prefix length).
 #
 #   Echoes a collision-proof SUFFIX of the form
 #   <date>-<sanitized_run_id>-<uuid>, lowercased, with non-
 #   alphanumerics stripped (except -). The 8-char uuid is ALWAYS
-#   preserved at the END of the suffix; the prefix (date + run_id)
-#   is truncated if needed to fit CP_ORG_SLUG_MAX_LEN.
+#   emitted at the END of the suffix; the leading <date>-<run_id>
+#   context is truncated — or dropped WHOLESALE — to fit
+#   CP_ORG_SLUG_MAX_LEN. When even the date does not fit after a
+#   long caller prefix (e.g. `cp455-claude-code-`, 18 chars), the
+#   suffix degrades to the bare 8-char uuid rather than aborting
+#   with an empty suffix — so the slug is ALWAYS collision-proof.
 make_collision_proof_slug_suffix() {
   local run_id="${1:-}"
   local prefix_len="${2:-11}"
@@ -79,25 +83,64 @@ make_collision_proof_slug_suffix() {
 
   local uuid_short
   if [ -r /proc/sys/kernel/random/uuid ]; then
-    uuid_short="$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 8)"
+    uuid_short="$(tr -d '-' < /proc/sys/kernel/random/uuid | head -c 8)"
   else
-    uuid_short="$(printf '%04x%04x' $RANDOM $RANDOM)"
+    uuid_short="$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
+  fi
+  # Defensive: the 8-char uuid is the SOLE collision-proof anchor and is
+  # asserted downstream via `-[0-9a-f]{8}$`. If the entropy source ever
+  # misbehaves (short/empty read, SIGPIPE truncation, non-hex), fall back
+  # to $RANDOM so we NEVER emit a short/empty anchor — that was the
+  # class of bug that produced the empty suffix + `...-` slug at
+  # test_minimal_boot_cell.sh (core boot-to-registration aborted before
+  # provisioning).
+  if ! printf '%s' "$uuid_short" | grep -qE '^[0-9a-f]{8}$'; then
+    uuid_short="$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
   fi
 
-  # Suffix layout: <date:8> + - + <run_id:N> + - + <uuid:8> = N+18 chars.
-  # The caller's literal prefix already includes its trailing separator,
-  # so the full slug is <prefix_len> + (N+18) = prefix_len + N + 18.
-  # Cap: prefix_len + N + 18 <= CP_ORG_SLUG_MAX_LEN
-  #      => N <= CP_ORG_SLUG_MAX_LEN - prefix_len - 18
-  local run_id_budget=$(( CP_ORG_SLUG_MAX_LEN - prefix_len - 18 ))
-  if [ "$run_id_budget" -lt 1 ]; then
-    echo "make_collision_proof_slug_suffix: caller prefix (${prefix_len} chars) too long for CP_ORG_SLUG_MAX_LEN=${CP_ORG_SLUG_MAX_LEN}; date (8 chars) + uuid anchor (8 chars) + 2 separators = 18 chars minimum after the prefix, no room for run_id segment. Shorten the prefix literal in the SLUG= assignment." >&2
-    return 1
+  # The 8-char uuid anchor is NON-NEGOTIABLE and is ALWAYS the tail of the
+  # suffix — dropping it reintroduces the core#2782 collision class (and,
+  # via the early `return 1` this replaces, produced an EMPTY suffix that
+  # yielded the collision-UNsafe slug `<prefix>-`). The optional
+  # <date>-<run_id> context in FRONT of the uuid is truncated — or dropped
+  # entirely — so the FULL slug (caller prefix + suffix) never exceeds
+  # CP_ORG_SLUG_MAX_LEN. The context budget is the cap minus the caller's
+  # prefix, minus the uuid anchor (8) and its leading separator (1).
+  #
+  #   full = prefix_len + [ len(context) + 1 ] + 8   (context present)
+  #   full = prefix_len + 8                           (context dropped; the
+  #                                                    caller prefix's own
+  #                                                    trailing '-' supplies
+  #                                                    the anchor separator)
+  local context_budget=$(( CP_ORG_SLUG_MAX_LEN - prefix_len - 8 - 1 ))
+
+  local context=""
+  if [ "$context_budget" -ge "${#date_part}" ]; then
+    # Room for the whole date; keep it, then append as much sanitized
+    # run_id as still fits (its own '-' separator included). We prefer
+    # whole segments — a partial-date fragment adds no value since the
+    # uuid alone is the collision guarantee.
+    context="$date_part"
+    local run_id_budget=$(( context_budget - ${#date_part} - 1 ))
+    if [ "$run_id_budget" -ge 1 ]; then
+      local sanitized_run_id
+      sanitized_run_id="$(printf '%s' "$run_id" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c "$run_id_budget")"
+      # Strip any trailing '-' left by truncation so we never emit '--'.
+      sanitized_run_id="$(printf '%s' "$sanitized_run_id" | sed 's/-*$//')"
+      if [ -n "$sanitized_run_id" ]; then
+        context="${context}-${sanitized_run_id}"
+      fi
+    fi
   fi
 
-  local sanitized_run_id
-  sanitized_run_id="$(printf '%s' "$run_id" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | head -c "$run_id_budget")"
-  printf '%s-%s-%s' "$date_part" "$sanitized_run_id" "$uuid_short"
+  if [ -n "$context" ]; then
+    printf '%s-%s' "$context" "$uuid_short"
+  else
+    # Prefix too long for any <date>-<run_id> context — emit the bare uuid
+    # anchor. The caller's literal prefix already ends in '-', so the full
+    # slug still matches the assert's `-<8hex>$` anchor and stays <= cap.
+    printf '%s' "$uuid_short"
+  fi
 }
 
 # assert_collision_proof_slug <slug> asserts the FULL slug ends in

@@ -243,6 +243,59 @@ test_e2e_cncrg_mk_prefix_caps_to_32() {
 
 test_e2e_cncrg_mk_prefix_caps_to_32 || failed=$((failed+1))
 
+# core boot-cell regression: the minimal-boot-cell harness
+# (tests/e2e/test_minimal_boot_cell.sh) uses an 18-char literal prefix
+# `cp455-claude-code-`. At that length there is NO room for the
+# <date>-<run_id> context after the prefix (32 - 18 - 9 = 5 < 8), so
+# the old helper hit its `return 1` guard and echoed NOTHING — the
+# command substitution produced an EMPTY suffix, giving the
+# collision-UNsafe slug `cp455-claude-code-` and aborting core
+# boot-to-registration at assert_collision_proof_slug (test_minimal_boot_cell.sh:94)
+# BEFORE any provisioning. The helper must now degrade to the bare
+# 8-char uuid anchor and keep the slug collision-proof + <= cap.
+test_boot_cell_prefix_18_degrades_to_uuid() {
+  local runtime="claude-code"
+  local prefix="cp455-${runtime}-"     # 18 chars
+  local s
+  # Exercise both an explicit E2E_RUN_ID and the empty-run_id fallback.
+  s="${prefix}$(make_collision_proof_slug_suffix "cp455-3607-1" ${#prefix})"
+  if ! assert_collision_proof_slug "$s"; then
+    echo "FAIL: test_boot_cell_prefix_18_degrades_to_uuid — slug '$s' (len=${#s}) failed assert_collision_proof_slug"
+    return 1
+  fi
+  if [ "${#s}" -gt 32 ]; then
+    echo "FAIL: test_boot_cell_prefix_18_degrades_to_uuid — slug '$s' is ${#s} chars (want <= 32)"
+    return 1
+  fi
+  if ! printf '%s' "$s" | grep -q "^cp455-claude-code-"; then
+    echo "FAIL: test_boot_cell_prefix_18_degrades_to_uuid — prefix not preserved in '$s'"
+    return 1
+  fi
+  if ! printf '%s' "$s" | grep -qE '^[a-z][a-z0-9-]{2,31}$'; then
+    echo "FAIL: test_boot_cell_prefix_18_degrades_to_uuid — slug '$s' does NOT match CP regex ^[a-z][a-z0-9-]{2,31}\$"
+    return 1
+  fi
+  # Empty run_id (harness fallback) must ALSO stay collision-proof.
+  local s2
+  s2="${prefix}$(make_collision_proof_slug_suffix "" ${#prefix})"
+  if ! assert_collision_proof_slug "$s2"; then
+    echo "FAIL: test_boot_cell_prefix_18_degrades_to_uuid — empty run_id slug '$s2' (len=${#s2}) failed assert"
+    return 1
+  fi
+  # Two draws with the same run_id must differ (the uuid still varies).
+  local a b
+  a="$(make_collision_proof_slug_suffix "cp455-3607-1" ${#prefix})"
+  b="$(make_collision_proof_slug_suffix "cp455-3607-1" ${#prefix})"
+  if [ "$a" = "$b" ]; then
+    echo "FAIL: test_boot_cell_prefix_18_degrades_to_uuid — identical suffixes for same run_id ('$a'), collision possible"
+    return 1
+  fi
+  echo "PASS: test_boot_cell_prefix_18_degrades_to_uuid (slug=$s, len=${#s})"
+  return 0
+}
+
+test_boot_cell_prefix_18_degrades_to_uuid || failed=$((failed+1))
+
 if [ "$failed" -gt 0 ]; then
   echo "FAILED: $failed test(s)"
   exit 1
