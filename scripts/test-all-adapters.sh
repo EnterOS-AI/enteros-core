@@ -34,6 +34,22 @@ wait_online() {
   return 1
 }
 
+# wait_restart ID NAME [MAX] — poll a secret-triggered auto-restart to
+# completion instead of a blind `sleep 15`. First waits (bounded ~45s) for the
+# restart to take EFFECT (status LEAVES "online") so the subsequent online
+# check can't observe the PRE-restart "online" state and pass falsely; then
+# reuses wait_online (with its per-adapter MAX) for the back-online gate.
+wait_restart() {
+  local id="$1" name="$2" max="${3:-60}"
+  for i in $(seq 1 15); do
+    local s
+    s=$(curl -s "$PLATFORM/workspaces/$id" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+    [ "$s" != "online" ] && break
+    sleep 3
+  done
+  wait_online "$id" "$name" "$max"
+}
+
 a2a_send() {
   local id="$1" message="$2" max_retries="${3:-3}"
   for attempt in $(seq 1 "$max_retries"); do
@@ -89,18 +105,20 @@ for ID in $BOB $CAROL $DAVE; do
 done
 echo "Set OPENAI_API_KEY on 3 agents"
 
-# Auto-restart happens automatically when secrets are set
-echo "Secrets trigger auto-restart — waiting for agents to come back..."
-sleep 15
+# Auto-restart happens automatically when secrets are set. Poll each restarted
+# agent (Bob/Dave/Carol) through the restart transition instead of a blind
+# `sleep 15` (see wait_restart). Alice was NOT re-keyed, so she is not
+# restarting → a plain online poll is correct for her.
+echo "Secrets trigger auto-restart — polling each restarted agent back online..."
 
 # --- Wait for all online ---
 echo ""
 echo "--- Step 3: Wait for agents (OpenClaw ~3min, Hermes may take longer) ---"
 
 wait_online "$ALICE" "Alice-Claude" 20 && check "Alice online" "ok" "ok" || check "Alice online" "online" "timeout"
-wait_online "$BOB" "Bob-Codex" 60 && check "Bob online" "ok" "ok" || check "Bob online" "online" "timeout"
-wait_online "$DAVE" "Dave-Hermes" 180 && check "Dave online" "ok" "ok" || check "Dave online" "online" "timeout"
-wait_online "$CAROL" "Carol-OpenClaw" 360 && check "Carol online" "ok" "ok" || check "Carol online" "online" "timeout"
+wait_restart "$BOB" "Bob-Codex" 60 && check "Bob online" "ok" "ok" || check "Bob online" "online" "timeout"
+wait_restart "$DAVE" "Dave-Hermes" 180 && check "Dave online" "ok" "ok" || check "Dave online" "online" "timeout"
+wait_restart "$CAROL" "Carol-OpenClaw" 360 && check "Carol online" "ok" "ok" || check "Carol online" "online" "timeout"
 
 # --- Test A2A messages ---
 echo ""
