@@ -499,6 +499,13 @@ jobs:
           # fail or hang an e2e. A regression that makes obs.sh able to abort a
           # caller goes red on every PR.
           bash tests/e2e/lib/test_obs_lib_unit.sh
+          # CP /health readiness-poll helper (lib/cp_health_preflight.sh). Offline
+          # (mocked curl, zero real sleeps): proves a cold-start / mid-recreate CP
+          # (000/5xx/non-200) RETRIES to a stable Nx200 streak instead of a
+          # single-shot `--max-time 10` that hard-failed the canary on any blip
+          # (mc#3244). Locks in: cold-start burst retries then succeeds, a mid-flap
+          # resets the streak, persistent non-ready returns 1 (no hang/false green).
+          bash tests/e2e/lib/test_cp_health_preflight.sh
           # molecule-core#1995 (#1994 follow-on): fail-direction proof for
           # the A2A real-completion + byok-routing assertion helpers
           # (lib/completion_assert.sh). Offline (no LLM, no network): it
