@@ -33,6 +33,24 @@ wait_online() {
   return 1
 }
 
+# wait_restart ID NAME — poll a restart to completion instead of a blind
+# `sleep 30`. First waits (bounded ~45s) for the restart to take EFFECT (the
+# status LEAVES "online": restarting/offline/provisioning) so the subsequent
+# online check can't observe the PRE-restart "online" state and pass falsely;
+# then reuses wait_online for the back-online gate. Strictly more correct than
+# a fixed sleep: no false pass, and it proceeds as soon as the agent is
+# actually back — never wasting time or under-waiting a slow restart.
+wait_restart() {
+  local id="$1" name="$2"
+  for i in $(seq 1 15); do
+    local s
+    s=$(curl -s "$PLATFORM/workspaces/$id" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+    [ "$s" != "online" ] && break
+    sleep 3
+  done
+  wait_online "$id" "$name"
+}
+
 echo "============================================"
 echo "  E2E Test: Multi-Template Team + A2A"
 echo "============================================"
@@ -139,12 +157,11 @@ echo "--- Step 6: Restart agents ---"
 for ID in $RES_ID $DEV_ID $ANA_ID; do
   curl -s -X POST "$PLATFORM/workspaces/$ID/restart" > /dev/null
 done
-echo "Restarting 3 agents... waiting 30s"
-sleep 30
+echo "Restarting 3 agents — polling each back to online (no blind sleep)..."
 
 for name_id in "Researcher:$RES_ID" "Developer:$DEV_ID" "Analyst:$ANA_ID"; do
   IFS=: read name id <<< "$name_id"
-  if wait_online "$id" "$name"; then
+  if wait_restart "$id" "$name"; then
     check "$name back online" "online" "online"
   else
     check "$name back online" "online" "timeout"
