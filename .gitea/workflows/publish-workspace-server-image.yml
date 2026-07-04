@@ -23,21 +23,25 @@ name: publish-workspace-server-image
 # ---------------------------------------------
 # The AWS account was retired 2026-06-27; the dead ECR
 # publish-workspace-server-image.yml was removed in #3391. This is its
-# molecules-server successor. Modeled on the CURRENT local-fleet SSOT
-# molecule-controlplane/scripts/deploy/local-cp-build.sh:
-#   - Builds on the `docker-host` runner, whose /var/run/docker.sock IS the
-#     molecules-server HOST daemon — the SAME daemon redeploy-tenants-on-*
-#     enumerate + swap against, and the SAME daemon the CP LocalDocker
-#     provisioner runs fresh tenants on.
-#   - Builds with `--load` so the image lands in that shared host daemon under
-#     the SSOT-qualified name `${TENANT_IMAGE}:<tag>`. That means the redeploy's
-#     `docker pull … || docker image inspect …` local-fallback finds it even if
-#     the registry push is unavailable (single-host: no registry round-trip is
-#     required for the deploy).
-#   - The registry push to registry.moleculesai.app is BEST-EFFORT + durable
-#     record only (mirrors local-cp-build.sh). It runs only when a registry
-#     credential is wired (secrets.MOLECULE_REGISTRY_TOKEN); absent it, the
-#     shared-daemon local tag still completes the loop.
+# molecules-server successor.
+#   - Builds on ROBOT-1 (`runs-on: [docker-host, robot-1]`, robot-1's 32c
+#     dedicated build box) to keep the heavy Go-platform + canvas tenant image
+#     build OFF the local molecules-server box. `--load`s the image into
+#     robot-1's daemon under the SSOT-qualified name `${TENANT_IMAGE}:<tag>`.
+#   - Publishes to registry.moleculesai.app via the PARALLEL CHUNKED PUSHER
+#     (SSOT: molecule-ai/operator-config bin/registry-parallel-push.py), THROUGH
+#     the Cloudflare tunnel. A plain `docker push` of the multi-GB layers 413s at
+#     the CF Free ~100MB request-body cap; the pusher uploads each blob in
+#     <=90MB sequential contiguous chunks (adaptive across-blob concurrency +
+#     resume), so no PATCH ever exceeds the cap. Because the build now runs
+#     off-host, this registry push is the SSOT the deploy pulls from — NOT a
+#     same-daemon --load tag. redeploy-tenants-on-* + fresh provisions resolve
+#     the image via `docker pull` (uncapped through CF).
+#   - DOCUMENTED FALLBACK (kept until the chunked path is prod-proven): repo var
+#     PUBLISH_PUSH_MODE=localhost-bypass reverts to the pre-migration CF-BYPASS
+#     (push straight to the host's local Gitea OCI endpoint localhost:3200,
+#     skipping the CF edge). That path requires local-host placement, so using it
+#     also means overriding runs-on to a local docker-host runner. Not deleted.
 #
 # Tag scheme (parallels publish-canvas-image.yml):
 #   :staging-<sha>  — immutable per-commit build. What an operator pins to.
@@ -88,11 +92,17 @@ jobs:
   # changes that trigger it were already gated by CI / all-required on the PR.
   build-and-push:
     name: Build & push tenant image
-    # docker-host: self-hosted molecules-server runner whose docker.sock is the
-    # HOST daemon (same daemon redeploy-tenants-on-* + the CP provisioner use).
-    # Pinned here to satisfy lint-required-workflows-docker-host-pinned (any
-    # docker-touching job must pin docker-host|publish).
-    runs-on: docker-host
+    # robot-1's 32c dedicated build box (the `robot-1` label is exclusive to that
+    # host's fleet runners). Offloads the heavy Go-platform + canvas tenant image
+    # build off the local molecules-server box. `[docker-host, robot-1]` = AND
+    # semantics, so it lands ONLY on robot-1 while still satisfying
+    # lint-required-workflows-docker-host-pinned (docker-host is present). The
+    # image is `--load`ed into robot-1's daemon and then pushed to the registry
+    # via the parallel chunked pusher (below); redeploy-tenants-on-* + fresh
+    # provisions pull the CI-green tag FROM registry.moleculesai.app (the reliable
+    # chunked push makes the registry the SSOT, so the build no longer has to run
+    # on the same daemon as the deploy).
+    runs-on: [docker-host, robot-1]
     timeout-minutes: 45
     outputs:
       staging_sha: ${{ steps.tags.outputs.staging_sha }}
@@ -262,40 +272,87 @@ jobs:
             || { echo "::error::image ${TENANT_IMAGE}:${TAG_SHA} missing after build"; exit 1; }
           echo "::notice::image present in host daemon: $(docker image inspect "${TENANT_IMAGE}:${TAG_SHA}" --format '{{.Id}}')"
 
-      # Best-effort durable record: push to registry.moleculesai.app. The deploy
-      # uses the LOCAL tag on the SAME daemon (redeploy local-fallback), so a
-      # push failure (tunnel hiccup, or no registry credential wired) is
-      # NON-fatal — mirrors molecule-controlplane/scripts/deploy/local-cp-build.sh.
-      # When secrets.MOLECULE_REGISTRY_TOKEN is later wired at the org/repo level
-      # this starts pushing with zero workflow change.
-      - name: Push tenant image to registry (best-effort, durable record)
+      # Publish to registry.moleculesai.app via the PARALLEL CHUNKED PUSHER,
+      # THROUGH the Cloudflare tunnel. A plain `docker push` of the multi-GB
+      # tenant layers 413s at the CF Free ~100MB request-body cap; the pusher
+      # (SSOT: molecule-ai/operator-config bin/registry-parallel-push.py) uploads
+      # each blob in <=90MB sequential contiguous chunks with adaptive
+      # across-blob concurrency + resume, so no PATCH ever exceeds the cap. Now
+      # that this build runs on robot-1 (off the deploy host), the reliable
+      # registry push is what redeploy-tenants-on-* + fresh provisions pull from
+      # (`docker pull` is uncapped through CF) — the registry is the SSOT, not a
+      # same-host --load tag.
+      #
+      # DOCUMENTED FALLBACK (kept until the chunked path is prod-proven): set the
+      # repo var PUBLISH_PUSH_MODE=localhost-bypass to use the pre-migration
+      # CF-BYPASS that pushes straight to the host's local Gitea OCI endpoint
+      # (localhost:3200), skipping the CF edge + its cap. That path ONLY works
+      # when this job runs ON the local Gitea host, so switching to it also means
+      # overriding runs-on to a local docker-host runner. The bypass code is
+      # preserved here, not deleted.
+      - name: Publish tenant image to registry (chunked pusher through CF tunnel)
         env:
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
           TAG_SHA: staging-${{ steps.tags.outputs.sha }}
           TAG_LATEST: staging-latest
-          REGISTRY_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
-          REGISTRY_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          IMAGE_REPO: molecule-ai/molecule-tenant
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          # Token that can read the private operator-config repo to fetch the
+          # pusher. Already resolved from the Infisical SSOT above.
+          AUTO_SYNC_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
+          PUSHER_REF: ${{ vars.OPERATOR_CONFIG_PUSHER_REF || 'main' }}
+          GITHUB_SERVER_URL: ${{ env.GITHUB_SERVER_URL }}
+          PUBLISH_PUSH_MODE: ${{ vars.PUBLISH_PUSH_MODE || 'chunked-tunnel' }}
+          LOCALHOST_PUSH_HOST: ${{ vars.LOCALHOST_PUSH_HOST || 'localhost:3200' }}
         run: |
           set -uo pipefail
-          reg_host="${TENANT_IMAGE%%/*}"
-          if [ -z "${REGISTRY_TOKEN:-}" ]; then
+          REG_HOST="${TENANT_IMAGE%%/*}"
+          LOCAL_IMAGE="${TENANT_IMAGE}:${TAG_SHA}"
+          if [ -z "${REG_TOKEN:-}" ]; then
             echo "::notice::MOLECULE_REGISTRY_TOKEN not set — skipping registry push."
-            echo "::notice::The image is present in the shared host daemon as ${TENANT_IMAGE}:${TAG_LATEST};"
-            echo "::notice::redeploy-tenants-on-* pick it up via their docker-image-inspect local fallback."
+            echo "::notice::The image is present in the build daemon as ${LOCAL_IMAGE}; wire the org secret to publish."
             exit 0
           fi
-          echo "::add-mask::$REGISTRY_TOKEN"
-          if ! printf '%s' "$REGISTRY_TOKEN" | docker login "$reg_host" --username "$REGISTRY_USER" --password-stdin >/dev/null 2>&1; then
-            echo "::warning::docker login $reg_host failed — skipping push (non-fatal; local tag serves the single-host loop)"
-            exit 0
-          fi
-          for ref in "${TENANT_IMAGE}:${TAG_SHA}" "${TENANT_IMAGE}:${TAG_LATEST}"; do
-            if docker push "$ref" >/dev/null 2>&1; then
-              echo "::notice::pushed ${ref}"
-            else
-              echo "::warning::push of ${ref} failed (non-fatal; local tag serves the deploy)"
+          echo "::add-mask::$REG_TOKEN"
+
+          # ---- DOCUMENTED CF-BYPASS FALLBACK (localhost:3200) ------------------
+          if [ "${PUBLISH_PUSH_MODE}" = "localhost-bypass" ]; then
+            echo "::notice::PUBLISH_PUSH_MODE=localhost-bypass — pushing via ${LOCALHOST_PUSH_HOST} (CF-bypass; requires local-host placement)."
+            if ! printf '%s' "$REG_TOKEN" | docker login "$LOCALHOST_PUSH_HOST" --username "$REG_USER" --password-stdin >/dev/null 2>&1; then
+              echo "::warning::docker login ${LOCALHOST_PUSH_HOST} failed — is this job on the local Gitea host? (non-fatal)"; exit 0
             fi
+            for t in "$TAG_SHA" "$TAG_LATEST"; do
+              docker tag "$LOCAL_IMAGE" "${LOCALHOST_PUSH_HOST}/${IMAGE_REPO}:${t}"
+              docker push "${LOCALHOST_PUSH_HOST}/${IMAGE_REPO}:${t}" >/dev/null 2>&1 \
+                && echo "::notice::bypass-pushed ${IMAGE_REPO}:${t}" \
+                || echo "::warning::bypass push of ${t} failed (non-fatal)"
+            done
+            exit 0
+          fi
+
+          # ---- PRIMARY: parallel chunked pusher THROUGH the CF tunnel ----------
+          PUSHER="$RUNNER_TEMP/registry-parallel-push.py"
+          url="${GITHUB_SERVER_URL}/api/v1/repos/molecule-ai/operator-config/raw/bin/registry-parallel-push.py?ref=${PUSHER_REF}"
+          if ! curl -fsSL -H "Authorization: token ${AUTO_SYNC_TOKEN}" "$url" -o "$PUSHER"; then
+            echo "::warning::could not fetch the chunked pusher from operator-config@${PUSHER_REF} (needs operator-config PR #364 on that ref). Non-fatal; no registry push this run."
+            exit 0
+          fi
+          rc=0
+          for t in "$TAG_SHA" "$TAG_LATEST"; do
+            echo "::group::chunked push ${REG_HOST}/${IMAGE_REPO}:${t}"
+            if python3 "$PUSHER" --image "$LOCAL_IMAGE" --registry "$REG_HOST" \
+                 --repo "$IMAGE_REPO" --tag "$t" --user "$REG_USER"; then
+              echo "::notice::chunked-pushed ${REG_HOST}/${IMAGE_REPO}:${t}"
+            else
+              echo "::warning::chunked push of ${t} failed"; rc=1
+            fi
+            echo "::endgroup::"
           done
+          if [ "$rc" != 0 ]; then
+            echo "::warning::one or more chunked pushes failed — investigate before relying on the registry for off-host deploys."
+          fi
+          exit 0
 
       # Tighten the loop: deterministically kick the matching redeploy AFTER the
       # fresh image exists. redeploy-tenants-on-* also self-trigger on this same
@@ -397,47 +454,43 @@ jobs:
           # push contexts go green on THIS sha; fail closed if any terminally fail.
           python3 .gitea/scripts/prod-auto-deploy.py wait-ci
 
-      - name: Promote :latest to the CI-green tenant image
+      - name: Promote :latest to the CI-green tenant image (registry manifest re-point)
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
           STAGING_SHA_TAG: ${{ needs.build-and-push.outputs.staging_sha }}
-          REGISTRY_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
-          REGISTRY_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
         run: |
           set -euo pipefail
           # Fail-safe: recompute the immutable per-commit tag from the SHA if the
           # build job's output didn't propagate, so we never promote a guess.
           SHA_TAG="${STAGING_SHA_TAG:-staging-${GITHUB_SHA::7}}"
+          REG_HOST="${TENANT_IMAGE%%/*}"
           SRC="${TENANT_IMAGE}:${SHA_TAG}"
           DST="${TENANT_IMAGE}:latest"
-
-          # Local re-tag on the shared host daemon (no pull/rebuild): :latest
-          # becomes the verified :staging-<sha> for this commit, so
-          # redeploy-tenants-on-main's docker-image-inspect local fallback +
-          # fresh prod provisions resolve the CI-green build.
-          docker image inspect "$SRC" >/dev/null 2>&1 \
-            || { echo "::error::source image $SRC not present in host daemon — cannot promote"; exit 1; }
-          docker tag "$SRC" "$DST"
-          echo "::notice::re-tagged $SRC -> $DST in host daemon"
-
-          # Best-effort durable record: push :latest to the registry too.
-          reg_host="${TENANT_IMAGE%%/*}"
-          if [ -n "${REGISTRY_TOKEN:-}" ]; then
-            echo "::add-mask::$REGISTRY_TOKEN"
-            if printf '%s' "$REGISTRY_TOKEN" | docker login "$reg_host" --username "$REGISTRY_USER" --password-stdin >/dev/null 2>&1; then
-              docker push "$DST" >/dev/null 2>&1 && echo "::notice::pushed $DST" \
-                || echo "::warning::push of $DST failed (non-fatal; local tag serves the deploy)"
-            else
-              echo "::warning::docker login $reg_host failed — skipping :latest push (non-fatal)"
-            fi
-          else
-            echo "::notice::MOLECULE_REGISTRY_TOKEN not set — :latest promoted locally only (serves the single-host loop)."
+          if [ -z "${REG_TOKEN:-}" ]; then
+            echo "::error::MOLECULE_REGISTRY_TOKEN required to re-point :latest in the registry."
+            exit 1
           fi
+          echo "::add-mask::$REG_TOKEN"
+          printf '%s' "$REG_TOKEN" | docker login "$REG_HOST" --username "$REG_USER" --password-stdin >/dev/null
+
+          # Registry-level, MANIFEST-ONLY re-point (no pull/rebuild, no blob
+          # transfer — well under the CF 100MB request-body cap, so this is
+          # tunnel-safe without the chunked pusher). :latest becomes
+          # byte-identical to the CI-green :staging-<sha> that build-and-push
+          # chunked-pushed to registry.moleculesai.app. Because the build now
+          # runs off-host on robot-1, we re-point in the REGISTRY (the SSOT) —
+          # NOT a same-daemon `docker tag`, which would not see the build's
+          # --load tag. redeploy-tenants-on-main + fresh prod provisions pull
+          # this from the registry (`docker pull`, uncapped through CF).
+          docker buildx imagetools create --tag "$DST" "$SRC"
+          echo "::notice::re-pointed $DST -> $SRC (registry manifest)"
 
           {
             echo "## Tenant :latest promoted"
             echo ""
-            echo "Re-pointed \`${TENANT_IMAGE}:latest\` -> \`${SHA_TAG}\` for commit \`${GITHUB_SHA::7}\`."
+            echo "Re-pointed \`${TENANT_IMAGE}:latest\` -> \`${SHA_TAG}\` for commit \`${GITHUB_SHA::7}\` (registry manifest)."
             echo "redeploy-tenants-on-main + fresh production provisions now resolve this CI-green tenant build."
           } >> "$GITHUB_STEP_SUMMARY"
