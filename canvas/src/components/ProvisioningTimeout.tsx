@@ -152,8 +152,8 @@ export function ProvisioningTimeout({
       // Per-node timeout: each workspace resolves its own base via
       // @/lib/runtimeProfiles (server-override → runtime profile →
       // default), then scales by concurrent-provisioning count. A
-      // hermes workspace in a batch alongside two langgraph workspaces
-      // gets hermes's 12-min base, not langgraph's 2-min base.
+      // hermes workspace in a batch alongside two codex workspaces
+      // gets hermes's 12-min base, not codex's 2-min base.
       //
       // Resolution priority (most specific wins):
       //   1. node.provisionTimeoutMs — server-declared per-workspace

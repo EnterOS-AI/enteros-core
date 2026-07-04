@@ -75,7 +75,7 @@ func MatchesSSOT(c *MCPPluginDeliveryContract) []string {
 	}
 
 	// Per-runtime native delivery surfaces. claude_code/codex must be present and
-	// implemented; gemini/hermes must be declared but flagged todo.
+	// implemented; hermes must be declared but flagged todo.
 	wantRuntimes := map[string]Runtime{
 		"claude_code": {SettingsPath: "/configs/.claude/settings.json", Format: "json", Key: "mcpServers", Renderer: "mcp_render.render_claude_settings", Status: "implemented"},
 		"codex":       {SettingsPath: "~/.codex/config.toml", Format: "toml", Table: "mcp_servers", Renderer: "mcp_render.render_codex_config", Status: "implemented"},
@@ -93,7 +93,7 @@ func MatchesSSOT(c *MCPPluginDeliveryContract) []string {
 		eq("runtimes."+name+".renderer", got.Renderer, want.Renderer)
 		eq("runtimes."+name+".status", got.Status, want.Status)
 	}
-	for _, name := range []string{"gemini_cli", "hermes"} {
+	for _, name := range []string{"hermes"} {
 		got, ok := c.Runtimes[name]
 		if !ok {
 			diffs = append(diffs, "runtimes missing declared-todo runtime "+name)

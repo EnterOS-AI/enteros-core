@@ -181,7 +181,7 @@ export function useTemplateDeploy(
       //      workspace pick or the adapter falls back to its
       //      compiled-in default and 500s with "No LLM provider
       //      configured".
-      //   2. Single-provider templates (claude-code, langgraph)
+      //   2. Single-provider templates (claude-code, codex)
       //      still need the model field — the template's default
       //      may be wrong for the user's billing tier or a model
       //      they explicitly want (sonnet vs opus vs haiku).

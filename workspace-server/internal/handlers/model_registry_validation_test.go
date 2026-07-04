@@ -4,8 +4,8 @@ package handlers
 // validation at the create/config API (internal#718 P2-B item 3). Reject a
 // (runtime, model) the registry does not recognize for a runtime it DOES know;
 // fail OPEN (allow) for a runtime the registry doesn't know yet (federation /
-// langgraph/etc. not in the first-party registry) so the existing knownRuntimes
-// gate stays authoritative there.
+// third-party runtimes not in the first-party registry) so the existing
+// knownRuntimes gate stays authoritative there.
 //
 // TestValidateDerivedProviderInRegistry (issue #2172) is the provider-side
 // companion: once the model-side check passes, confirm the DERIVED provider
@@ -57,10 +57,10 @@ func TestValidateRegisteredModelForRuntime(t *testing.T) {
 			wantOK:  false,
 		},
 		{
-			// langgraph is a real core runtime but NOT in the first-party
+			// a federated third-party runtime NOT in the first-party
 			// registry → fail OPEN (the registry can't speak to it yet).
 			name:    "runtime_not_in_registry_allowed_failopen",
-			runtime: "langgraph",
+			runtime: "federated",
 			model:   "anything-goes",
 			wantOK:  true,
 		},
@@ -219,8 +219,8 @@ func TestValidateDerivedProviderInRegistry(t *testing.T) {
 		},
 		// Federation contract — mirror of the model-side test above.
 		{
-			name:    "langgraph_runtime_failopen",
-			runtime: "langgraph",
+			name:    "federated_runtime_failopen",
+			runtime: "federated",
 			model:   "anything-goes",
 			wantOK:  true,
 		},
