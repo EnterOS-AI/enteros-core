@@ -1,0 +1,223 @@
+# main-canary — post-merge build/vet/test canary for `main`.
+#
+# Principal directive ("push-to-main build canary"): on every push to main,
+# re-run the Go toolchain (build + vet + test) against the ACTUAL merged tree
+# and, on failure, open a CRITICAL idempotent Gitea issue with the scrubbed
+# failing output (and a best-effort Sentry event if SENTRY_DSN is wired).
+#
+# Why this exists / relationship to siblings:
+#   - ci.yml runs build/vet/test against the PR HEAD (an older base than the
+#     merge commit) — it cannot see sibling-merge incompatibility.
+#   - main-red-watchdog.yml WATCHES the combined commit-status (it does not
+#     itself compile anything).
+# # Core test scope: this runs `go test ./...` from workspace-server/ exactly
+# as ci.yml's blocking gate does (minus the coverage threshold). The
+# runtime/Gitea-auth-dependent tests (manifest_pinning, mcp_plugin_delivery
+# contract) GATE on MOLECULE_GITEA_TOKEN / MOLECULE_WORKSPACE_RUNTIME being
+# set and SKIP when they are absent, so no external infra is needed here and
+# the canary will not false-alarm on them.
+#   This canary actually COMPILES + TESTS the merged main HEAD and turns a
+#   red build into an immediate tracked issue (the issue IS the alarm).
+#
+# Boundaries (mirrors main-red-watchdog philosophy):
+#   - push-event only; never a required PR status (cannot block merges).
+#   - never auto-reverts; the issue is the signal, a human fixes forward.
+#   - exits 0 even when the build is red — failing the workflow would
+#     double-page and risk a silent-loop if the canary itself flaked.
+#   - "containerized" toolchain == the pinned hermetic actions/setup-go step
+#     (matches the rest of the fleet; a raw `container:` is intentionally not
+#     used — the runner pool standard is setup-go on ubuntu-latest).
+
+name: main-canary
+
+on:
+  push:
+    branches: [main]
+  # NOTE: bare workflow_dispatch — NO `inputs:` block (Gitea 1.22.6 rejects
+  # workflow_dispatch.inputs; see lint-workflow-yaml.py Rule 1).
+  workflow_dispatch:
+
+concurrency:
+  # Serialize per-ref so back-to-back merges each get a verdict without
+  # racing the Go build cache. cancel-in-progress:false — we want EACH
+  # merge commit checked, which is exactly the sibling-merge case.
+  group: main-canary-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: 'stable'
+          # cache:false — self-hosted runners bind-mount a persistent
+          # GOCACHE/GOMODCACHE; actions/cache corrupts it (lint_setup_go_cache).
+          cache: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: build + vet + test (capture; never fails the job here)
+        id: canary
+        working-directory: workspace-server
+        run: |
+          set +e
+          LOG="${RUNNER_TEMP:-/tmp}/main-canary.log"
+          : > "$LOG"
+          fail=0
+          stages=""
+          run_stage() {
+            label="$1"; shift
+            echo "::group::$label"
+            echo "### $label: $*" | tee -a "$LOG"
+            "$@" 2>&1 | tee -a "$LOG"
+            rc=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::main-canary stage FAILED: $label (exit $rc)"
+              echo "[FAILED] $label (exit $rc)" | tee -a "$LOG"
+              fail=1
+              stages="${stages:+$stages, }$label"
+            fi
+          }
+          # go mod download first so a go.sum/module drift after a parallel
+          # go.mod merge surfaces here too (harmless if already cached).
+          go mod download 2>&1 | tee -a "$LOG"
+          run_stage "go vet"   go vet ./...
+          run_stage "go build" go build ./...
+          run_stage "go test"  go test -count=1 -timeout 10m ./...
+          {
+            echo "failed=$fail"
+            echo "stages=$stages"
+            echo "log_path=$LOG"
+          } >> "$GITHUB_OUTPUT"
+          # Never fail the job here — the CRITICAL issue is the alarm.
+          exit 0
+
+      - name: File CRITICAL gitea issue on canary failure
+        if: steps.canary.outputs.failed == '1'
+        env:
+          # GITEA_TOKEN reads/writes issues; falls back to the auto-injected
+          # GITHUB_TOKEN when the org secret isn't set (same pattern as
+          # main-red-watchdog.yml + ci-required-drift.yml).
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN || secrets.GITHUB_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STAGES: ${{ steps.canary.outputs.stages }}
+          LOG_PATH: ${{ steps.canary.outputs.log_path }}
+          # Optional — absence is a silent no-op (never fails the step).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          python3 - <<'PY'
+          import os, re, json, urllib.request, urllib.error, urllib.parse, time, sys
+
+          HOST=os.environ["GITEA_HOST"]; TOKEN=os.environ.get("GITEA_TOKEN","")
+          REPO=os.environ["REPO"]; SHA=os.environ.get("SHA",""); RUN_URL=os.environ.get("RUN_URL","")
+          STAGES=os.environ.get("STAGES","(unknown)"); LOG_PATH=os.environ.get("LOG_PATH","")
+          OWNER,NAME=(REPO.split("/",1)+[""])[:2]
+          API="https://%s/api/v1" % HOST
+          TITLE="[main-canary] %s: %s" % (REPO, SHA[:10])
+
+          def api(method, path, body=None):
+              url=API+path
+              data=json.dumps(body).encode() if body is not None else None
+              h={"Authorization":"token "+TOKEN,"Accept":"application/json"}
+              if data is not None: h["Content-Type"]="application/json"
+              req=urllib.request.Request(url, data=data, method=method, headers=h)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      raw=r.read(); st=r.status
+              except urllib.error.HTTPError as e:
+                  raw=e.read(); st=e.code
+              if not (200<=st<300):
+                  raise RuntimeError("%s %s -> HTTP %s: %s" % (method, path, st, raw[:300].decode("utf-8","replace")))
+              return (json.loads(raw) if raw else None)
+
+          def scrub(t):
+              t=re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----","***REDACTED-PRIVATE-KEY***",t,flags=re.DOTALL)
+              t=re.sub(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+","***REDACTED-JWT***",t)
+              t=re.sub(r"(?i)\b(authorization|token|secret|passwd|password|bearer|api[_-]?key|access[_-]?token|client[_-]?secret)(\"?\s*[:=]\s*\"?)([^\s\"']+)",
+                       lambda m: m.group(1)+m.group(2)+"***REDACTED***", t)
+              return t
+
+          log=""
+          try:
+              with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+                  log=f.read()
+          except Exception as e:
+              log="(could not read canary log at %s: %s)" % (LOG_PATH, e)
+          log=scrub(log)
+          if len(log)>12000:
+              log="...(truncated to last 12000 chars)...\n"+log[-12000:]
+
+          body="\n".join([
+              "# \U0001F534 CRITICAL — main-canary FAILED on `%s` at `%s`" % (REPO, SHA[:10]),
+              "",
+              "Failed stage(s): **%s**" % STAGES,
+              "",
+              "Commit: <https://%s/%s/commit/%s>" % (HOST, REPO, SHA),
+              "Run: %s" % RUN_URL,
+              "",
+              "The push-to-main build canary (`.gitea/workflows/main-canary.yml`) "
+              "re-ran `go build`/`go vet`/`go test` against the merged `main` HEAD "
+              "and it did not pass. This is a real defect on `main` (sibling-merge "
+              "incompatibility, go.sum drift, or a freshly-broken test). Fix forward "
+              "— do NOT revert as a reflex (`feedback_no_such_thing_as_flakes`).",
+              "",
+              "## Scrubbed output (secret-shaped strings redacted)",
+              "",
+              "```",
+              log,
+              "```",
+              "",
+              "_Idempotent by title: re-runs on this SHA PATCH this issue in place. "
+              "Close it once `main` builds green again._",
+          ])
+
+          # idempotent by exact title (paginate open issues)
+          existing=None; page=1
+          while True:
+              res=api("GET","/repos/%s/%s/issues?state=open&type=issues&limit=50&page=%d"%(OWNER,NAME,page))
+              if not isinstance(res,list) or not res: break
+              for i in res:
+                  if isinstance(i,dict) and i.get("title")==TITLE:
+                      existing=i; break
+              if existing or len(res)<50: break
+              page+=1
+
+          if existing:
+              api("PATCH","/repos/%s/%s/issues/%d"%(OWNER,NAME,existing["number"]),{"body":body})
+              print("::warning::Updated existing CRITICAL main-canary issue #%d"%existing["number"])
+          else:
+              created=api("POST","/repos/%s/%s/issues"%(OWNER,NAME),{"title":TITLE,"body":body,"labels":[]})
+              print("::warning::Filed CRITICAL main-canary issue #%s"%(created or {}).get("number"))
+
+          # Best-effort Sentry (guarded; absence of DSN is a no-op, never fails).
+          dsn=os.environ.get("SENTRY_DSN","").strip()
+          if dsn:
+              try:
+                  m=re.match(r"https://([^@]+)@([^/]+)/(\d+)", dsn)
+                  if m:
+                      key,host,pid=m.group(1).split(":")[0],m.group(2),m.group(3)
+                      url="https://%s/api/%s/store/"%(host,pid)
+                      ev={"message":"main-canary FAILED on %s at %s (stages: %s)"%(REPO,SHA[:10],STAGES),
+                          "level":"fatal","platform":"other",
+                          "tags":{"repo":REPO,"sha":SHA[:10],"canary":"main"},
+                          "extra":{"run_url":RUN_URL}}
+                      auth="Sentry sentry_version=7, sentry_key=%s, sentry_client=main-canary/1.0"%key
+                      req=urllib.request.Request(url, data=json.dumps(ev).encode(),
+                          headers={"Content-Type":"application/json","X-Sentry-Auth":auth}, method="POST")
+                      urllib.request.urlopen(req, timeout=10).read()
+                      print("::notice::Sentry event sent")
+              except Exception as e:
+                  print("::notice::Sentry emit skipped (%s)"%e)
+          PY
