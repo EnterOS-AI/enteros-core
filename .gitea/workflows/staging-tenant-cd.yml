@@ -1,0 +1,238 @@
+name: staging-tenant-cd
+
+# Gated CONTINUOUS DEPLOY of the local-docker STAGING tenant fleet.
+#
+# The deploy half of the tenant auto-update loop, mirroring the control-plane's
+# own gated pipeline (molecule-controlplane/.gitea/workflows/
+# local-cp-deploy-pipeline.yml). A push to `staging` that changes the tenant
+# image sources flows through a STRUCTURALLY-GATED job chain:
+#
+#   await-image -> e2e-smoke -> advance-pin -> redeploy-fleet
+#                  ^^^^^^^^^
+#                  HARD GATE (real staging provision + A2A-serve e2e)
+#
+# THE LOOP (build half + deploy half)
+#   publish-workspace-server-image.yml  (BUILD)  — on the same `staging` push,
+#     builds the tenant image and pushes :staging-<sha> + :staging-latest to
+#     registry.moleculesai.app via the chunked pusher.
+#   staging-tenant-cd.yml               (THIS)    — awaits that :staging-<sha>
+#     artifact, gates on a real staging e2e, advances the staging image pin, and
+#     rolls the running staging tenant fleet onto it (session-preserving).
+# The two coordinate through the immutable per-commit :staging-<sha> tag, so the
+# deploy never rolls onto a half-built image and never races the build.
+#
+# WHY STRUCTURALLY GATED (un-bypassable)
+#   redeploy-fleet `needs: advance-pin` which `needs: e2e-smoke` which
+#   `needs: await-image`. Gitea `needs:` skips every downstream job when an
+#   upstream is red, so a failed staging e2e SKIPS the pin advance AND the fleet
+#   roll — the fleet is only ever rolled on a green gate. There is no
+#   continue-on-error on any gating job (that would mask a red step as success),
+#   and the invariant is enforced statically by
+#   lint-staging-tenant-cd-gate-chain.yml. If the e2e gate fails AFTER the pin
+#   was advanced (it can't — advance-pin needs e2e-smoke), rollback-pin reverts.
+#
+# SESSION PRESERVATION
+#   redeploy-fleet delegates to scripts/deploy/redeploy-staging-fleet.sh, which
+#   rolls ONLY the STATELESS mol-tenant-* platform containers (cp-env=staging);
+#   the session-bearing mol-ws-* agent container + its mol-ws-rtstate-* volume
+#   are never touched, so the concierge session survives BY CONSTRUCTION (the
+#   script also asserts every rtstate volume is intact after the roll). The
+#   CP-driven restart path is separately session-safe via controlplane #1118.
+#
+# STAGING ONLY. Production is untouched: redeploy-tenants-on-main.yml (:latest,
+# PROD_AUTO_DEPLOY_DISABLED-gated) owns the prod fleet, and this pipeline never
+# writes the prod pin nor the :latest tag.
+#
+# Runs on the docker-host runner (host /var/run/docker.sock = the daemon serving
+# the mol-tenant-* fleet) for the image/pin/roll jobs; the e2e-smoke job runs on
+# a Go runner and hits staging over HTTPS (no CP source dependency — molecule-core
+# stays OSS/CP-independent; it exercises the DEPLOYED staging system exactly like
+# the existing e2e-workspace-lifecycle.yml staging job it reuses).
+
+on:
+  push:
+    branches: [staging]
+    paths:
+      - 'workspace-server/**'
+      - 'canvas/**'
+      - 'manifest.json'
+      - '.gitea/workflows/staging-tenant-cd.yml'
+      - 'scripts/deploy/redeploy-staging-fleet.sh'
+      - 'scripts/deploy/advance-staging-tenant-pin.sh'
+  # NOTE: no `workflow_dispatch.inputs:` — Gitea rejects the whole workflow if an
+  # inputs: map is present (feedback_gitea_workflow_dispatch_inputs_unsupported,
+  # enforced by lint-workflow-yaml). Operator overrides are read from repo/org
+  # VARS instead: STAGING_TENANT_CD_IMAGE_TAG (roll to a specific tag) and
+  # STAGING_TENANT_CD_FORCE_GATE_FAIL=1 (force the e2e gate RED to prove the roll
+  # is blocked). Set the var, dispatch, then unset it.
+  workflow_dispatch: {}
+
+# Serialize the WHOLE pipeline GLOBALLY (one static group, NOT keyed on ref) so a
+# workflow_dispatch and a staging push never overlap two fleet rolls / two pin
+# writes. cancel-in-progress:false — never abort an in-flight roll (each swap is
+# health-gated + self-rolls-back, so a completed predecessor is always good).
+concurrency:
+  group: staging-tenant-cd
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TENANT_IMAGE: ${{ vars.MOLECULE_TENANT_IMAGE || 'registry.moleculesai.app/molecule-ai/molecule-tenant' }}
+
+jobs:
+  await-image:
+    name: await-image (staging-<sha> published)
+    runs-on: docker-host
+    timeout-minutes: 45
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - name: Resolve target tag
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ -n "${{ vars.STAGING_TENANT_CD_IMAGE_TAG }}" ]; then
+            TAG="${{ vars.STAGING_TENANT_CD_IMAGE_TAG }}"
+          else
+            TAG="staging-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "image=${TENANT_IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "::notice::tenant CD target = ${TENANT_IMAGE}:${TAG}"
+      - name: Wait for the published tenant image to be pullable
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+        run: |
+          set -euo pipefail
+          # publish-workspace-server-image.yml is building + pushing this exact
+          # :staging-<sha> on the same push; poll the registry until the immutable
+          # artifact the fleet will pull is present (uncapped pull through CF).
+          # Dynamic wait on the real signal (the image), not a fixed sleep.
+          deadline=$(( $(date +%s) + 40*60 ))
+          until docker pull "$IMAGE" >/dev/null 2>&1; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::tenant image $IMAGE never became pullable within 40m (publish build failed or slow?)"
+              exit 1
+            fi
+            echo "  $IMAGE not yet in registry — publish still building; re-poll in 20s"
+            sleep 20
+          done
+          docker image inspect "$IMAGE" --format 'present {{.Id}}' >/dev/null
+          echo "::notice::tenant image present + pullable: $IMAGE"
+
+  e2e-smoke:
+    name: e2e-smoke (staging real provision + A2A HARD GATE)
+    needs: await-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CP_BASE_URL: https://staging-api.moleculesai.app
+      E2E_PROVIDER: molecules-server
+      STAGING_E2E: '1'
+      GATE_FORCE_FAIL: ${{ vars.STAGING_TENANT_CD_FORCE_GATE_FAIL }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Force-fail hook (prove a red gate blocks the fleet roll)
+        run: |
+          set -euo pipefail
+          if [ "${GATE_FORCE_FAIL:-0}" = "1" ]; then
+            echo "::error::GATE_FORCE_FAIL=1 — gate forced RED; this MUST skip advance-pin + redeploy-fleet."
+            exit 1
+          fi
+          echo "gate not forced — running the real e2e"
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+          cache: false
+          cache-dependency-path: workspace-server/go.sum
+      # Reuse the SSOT staging e2e (workspace-server/internal/staginge2e): it
+      # provisions a REAL throwaway molecules-server tenant, creates a workspace,
+      # and asserts it SERVES A2A across restart/pause/hibernate — i.e. the tenant
+      # runtime works on staging. Same recipe as e2e-workspace-lifecycle.yml's
+      # staging job; no CP source dependency (HTTPS client of the deployed CP).
+      - name: Fetch staging CP admin token from Infisical KMS
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
+          CP_ADMIN_API_TOKEN=$(curl -fsS "$BASE/api/v3/secrets/raw/CP_ADMIN_API_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fcontrolplane-admin" \
+            -H "Authorization: Bearer $TOK" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          echo "::add-mask::$CP_ADMIN_API_TOKEN"
+          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
+            exit 1
+          fi
+          echo "CP_ADMIN_API_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
+          echo "CP_ADMIN_API_TOKEN loaded from Infisical staging SSOT (len=${#CP_ADMIN_API_TOKEN})"
+      - name: CP staging health preflight
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
+          if [ "$code" != "200" ]; then
+            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a lifecycle bug. Failing loud."
+            exit 1
+          fi
+          echo "Staging CP healthy"
+      - name: Run workspace-lifecycle staginge2e (HARD GATE)
+        working-directory: workspace-server
+        run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceLifecycle_Staging -count=1 -v -timeout 50m
+
+  advance-pin:
+    name: advance-pin (staging LOCAL_TENANT_IMAGE)
+    needs: [e2e-smoke, await-image]
+    runs-on: docker-host
+    timeout-minutes: 10
+    outputs:
+      old_image: ${{ steps.advance.outputs.old_image }}
+      new_image: ${{ steps.advance.outputs.new_image }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Advance the staging tenant-image pin in Infisical
+        id: advance
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.STAGING_INFISICAL_PROJECT_ID }}
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
+        run: bash scripts/deploy/advance-staging-tenant-pin.sh --tag "${{ needs.await-image.outputs.tag }}"
+
+  redeploy-fleet:
+    name: redeploy-fleet (roll staging tenants, session-preserving)
+    needs: [advance-pin, await-image]
+    runs-on: docker-host
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Roll the staging tenant fleet onto the gate-proven image
+        env:
+          TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
+        run: bash scripts/deploy/redeploy-staging-fleet.sh --tag "${{ needs.await-image.outputs.tag }}"
+
+  rollback-pin:
+    name: rollback-pin (revert pin if the fleet roll failed)
+    needs: [advance-pin, redeploy-fleet]
+    if: failure() && needs.advance-pin.result == 'success'
+    runs-on: docker-host
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Revert the staging pin to its pre-roll value
+        if: needs.advance-pin.outputs.old_image != ''
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.STAGING_INFISICAL_PROJECT_ID }}
+        run: |
+          echo "::warning::fleet roll failed after pin advance — reverting staging pin to ${{ needs.advance-pin.outputs.old_image }}"
+          bash scripts/deploy/advance-staging-tenant-pin.sh --image "${{ needs.advance-pin.outputs.old_image }}"
