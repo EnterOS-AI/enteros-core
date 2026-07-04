@@ -1,0 +1,443 @@
+name: publish-workspace-server-image
+
+# The PUBLISH half of the tenant auto-update loop (the missing sibling of
+# redeploy-tenants-on-{main,staging}.yml).
+#
+# THE LOOP
+# --------
+#   publish-workspace-server-image   (THIS FILE)  — build the tenant image
+#        push :staging-<sha> + :staging-latest  (+ promote :latest on main)
+#                     │
+#                     ▼
+#   redeploy-tenants-on-staging.yml  — pulls molecule-tenant:staging-latest
+#   redeploy-tenants-on-main.yml     — pulls molecule-tenant:latest
+#        canary-first, health-gated, self-rolling-back swap of the local
+#        docker tenant fleet onto the freshly published image.
+#
+# Before this file existed, redeploy-tenants-on-* triggered on
+# `workspace-server/**` / `canvas/**` pushes but NOTHING rebuilt the tenant
+# image, so a merged fix never reached a running tenant — the deploy half had
+# no fresh artifact to deploy. This workflow closes that gap.
+#
+# molecules-server (local-docker) era — NOT ECR
+# ---------------------------------------------
+# The AWS account was retired 2026-06-27; the dead ECR
+# publish-workspace-server-image.yml was removed in #3391. This is its
+# molecules-server successor. Modeled on the CURRENT local-fleet SSOT
+# molecule-controlplane/scripts/deploy/local-cp-build.sh:
+#   - Builds on the `docker-host` runner, whose /var/run/docker.sock IS the
+#     molecules-server HOST daemon — the SAME daemon redeploy-tenants-on-*
+#     enumerate + swap against, and the SAME daemon the CP LocalDocker
+#     provisioner runs fresh tenants on.
+#   - Builds with `--load` so the image lands in that shared host daemon under
+#     the SSOT-qualified name `${TENANT_IMAGE}:<tag>`. That means the redeploy's
+#     `docker pull … || docker image inspect …` local-fallback finds it even if
+#     the registry push is unavailable (single-host: no registry round-trip is
+#     required for the deploy).
+#   - The registry push to registry.moleculesai.app is BEST-EFFORT + durable
+#     record only (mirrors local-cp-build.sh). It runs only when a registry
+#     credential is wired (secrets.MOLECULE_REGISTRY_TOKEN); absent it, the
+#     shared-daemon local tag still completes the loop.
+#
+# Tag scheme (parallels publish-canvas-image.yml):
+#   :staging-<sha>  — immutable per-commit build. What an operator pins to.
+#   :staging-latest — most recent BUILD (last-writer-wins, NOT gated). What
+#                     redeploy-tenants-on-staging + fresh staging provisions pull.
+#   :latest         — most recent CI-GREEN build. Only moved by promote-latest
+#                     (main only, after green push CI, and only when the
+#                     production freeze PROD_AUTO_DEPLOY_DISABLED is lifted).
+#                     What redeploy-tenants-on-main + fresh prod provisions pull.
+#
+# The tenant image bakes BOTH the Go platform (workspace-server) AND the canvas
+# Next.js UI (workspace-server/Dockerfile.tenant, stage 2 at /canvas), which is
+# why a `canvas/**` change must also rebuild it — mirrors the trigger set of the
+# redeploy workflows exactly so publish + deploy key off the same pushes.
+
+on:
+  push:
+    branches: [main, staging]
+    paths:
+      - 'workspace-server/**'
+      - 'canvas/**'
+      - 'manifest.json'
+      - '.gitea/workflows/publish-workspace-server-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Serialize per-branch so two rapid pushes don't race two builds onto the same
+# moving :staging-latest / :latest tag. cancel-in-progress:false — never abort a
+# publish mid-push (the per-commit :staging-<sha> tag is immutable, so a
+# completed predecessor is always a good artifact). Mirrors the redeploy
+# workflows' concurrency posture.
+concurrency:
+  group: publish-workspace-server-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+  # SSOT: the exact var + default the redeploy-tenants-on-* workflows consume,
+  # so whatever they pull, this publishes (no-hardcoding principle). Overridable
+  # org/repo-wide via the MOLECULE_TENANT_IMAGE var without touching any workflow.
+  TENANT_IMAGE: ${{ vars.MOLECULE_TENANT_IMAGE || 'registry.moleculesai.app/molecule-ai/molecule-tenant' }}
+
+jobs:
+  # bp-exempt: post-merge tenant-image publication side effect; the source
+  # changes that trigger it were already gated by CI / all-required on the PR.
+  build-and-push:
+    name: Build & push tenant image
+    # docker-host: self-hosted molecules-server runner whose docker.sock is the
+    # HOST daemon (same daemon redeploy-tenants-on-* + the CP provisioner use).
+    # Pinned here to satisfy lint-required-workflows-docker-host-pinned (any
+    # docker-touching job must pin docker-host|publish).
+    runs-on: docker-host
+    timeout-minutes: 45
+    outputs:
+      staging_sha: ${{ steps.tags.outputs.staging_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Fail loudly at step 1 if the runner's docker.sock is inaccessible,
+      # instead of deep inside `docker build` with a cryptic error.
+      - name: Verify Docker daemon access
+        run: |
+          set -euo pipefail
+          echo "::group::Docker daemon health check"
+          echo "Runner: ${HOSTNAME:-unknown}"
+          docker_info="$(docker info 2>&1)" || {
+            echo "::error::Docker daemon is not accessible at /var/run/docker.sock"
+            printf '%s\n' "${docker_info}"
+            echo "::error::Check: (1) daemon running, (2) runner user in docker group, (3) sock perms 660+"
+            exit 1
+          }
+          printf '%s\n' "${docker_info}" | sed -n '1,5p'
+          echo "Docker daemon OK"
+          echo "::endgroup::"
+
+      # The publish runner's default HOME can be host-owned + non-writable, so
+      # docker credential saves fail. Point HOME + DOCKER_CONFIG at the writable
+      # job temp dir (same fix as publish-canvas-image.yml #2193).
+      - name: Prepare writable HOME + Docker config
+        run: |
+          set -euo pipefail
+          H="$RUNNER_TEMP/wss-publish-home"
+          mkdir -p "$H/.docker"
+          echo "HOME=$H" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$H/.docker" >> "$GITHUB_ENV"
+
+      # AUTO_SYNC_TOKEN (devops-engineer persona PAT) is the cross-repo clone
+      # token for the private workspace-template-* / org-template-* / plugin
+      # repos in manifest.json. Sourced from the Infisical SSOT
+      # (/shared/dev-utils::AUTO_SYNC_TOKEN, environment=prod) via the CI machine
+      # identity — matches the secrets->kms direction and the retired ECR
+      # workflow's proven pre-clone auth path.
+      #
+      # FORK SAFETY: this workflow fires only on push:[main,staging] +
+      # workflow_dispatch (no pull_request trigger), so the token is never
+      # fetchable on an untrusted fork trigger; the conditional is
+      # belt-and-suspenders. Gitea also withholds secrets from forks at the
+      # runner level (defense in depth).
+      - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
+        id: auto_sync_token
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -z "$AUTO_SYNC_TOKEN" ]; then
+            echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils"
+            exit 1
+          fi
+          echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
+          echo "AUTO_SYNC_TOKEN loaded from Infisical (len=${#AUTO_SYNC_TOKEN})"
+
+      # Pre-flight: fail fast with a per-entry ::error:: if a manifest repo was
+      # deleted without updating manifest.json (issue #2192), instead of a
+      # generic git 404 deep in the clone step. Private repos → authenticated.
+      - name: Validate manifest entries exist
+        env:
+          MOLECULE_GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
+          GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash scripts/check-manifest-repos-exist.sh manifest.json
+
+      # Pre-clone manifest deps before docker build. workspace-template-* /
+      # org-template-* / plugin repos are PRIVATE; Dockerfile.tenant COPYs them
+      # from .tenant-bundle-deps/ (it cannot `git clone` inside the build with
+      # no auth path that wouldn't leak the token into a layer). clone-manifest.sh
+      # embeds AUTO_SYNC_TOKEN as basic-auth, then strips .git — the token never
+      # enters the image.
+      - name: Pre-clone manifest deps
+        env:
+          MOLECULE_GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tenant-bundle-deps
+          # Strip JSON5 `//` comments before jq parsing in clone-manifest.sh.
+          sed '/^[[:space:]]*\/\//d' manifest.json > .manifest-stripped.json
+          bash scripts/clone-manifest.sh \
+            .manifest-stripped.json \
+            .tenant-bundle-deps/workspace-configs-templates \
+            .tenant-bundle-deps/org-templates \
+            .tenant-bundle-deps/plugins
+          ws_count=$(find .tenant-bundle-deps/workspace-configs-templates -mindepth 1 -maxdepth 1 -type d | wc -l)
+          org_count=$(find .tenant-bundle-deps/org-templates -mindepth 1 -maxdepth 1 -type d | wc -l)
+          plugins_count=$(find .tenant-bundle-deps/plugins -mindepth 1 -maxdepth 1 -type d | wc -l)
+          echo "Cloned: ws=$ws_count org=$org_count plugins=$plugins_count"
+
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "staging_sha=staging-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # Build the combined platform+canvas tenant image and --load it into the
+      # shared host daemon under the SSOT-qualified name. Retry loop: buildkit
+      # EOF (internal#2468) is often transient under memory pressure on the
+      # publish host. GIT_SHA is baked so /buildinfo reports the served SHA,
+      # which the redeploy health gate verifies (Dockerfile.tenant #2395).
+      - name: Build tenant image (--load, staging-<sha> + staging-latest)
+        env:
+          TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
+          TAG_SHA: staging-${{ steps.tags.outputs.sha }}
+          TAG_LATEST: staging-latest
+          GIT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          # Exact generated-image R2 origin baked into the canvas CSP img-src at
+          # BUILD time (NEXT_PUBLIC_* is inlined by Next.js, not read at runtime).
+          # Config, not a secret — a public CSP directive value. prod + staging
+          # share the R2 bucket + account, so one baked value is correct for both.
+          IMAGE_GEN_R2_HOST: ${{ vars.IMAGE_GEN_R2_HOST || 'https://molecule-workspace-data.bfa4e604e168a938e565600b27e2828c.r2.cloudflarestorage.com' }}
+        run: |
+          set -euo pipefail
+          export DOCKER_BUILDKIT=1
+          built=0
+          for attempt in 1 2 3; do
+            echo "::notice::Tenant image build attempt ${attempt}/3 ..."
+            if docker build \
+                --file ./workspace-server/Dockerfile.tenant \
+                --build-arg GIT_SHA="${GIT_SHA}" \
+                --build-arg NEXT_PUBLIC_PLATFORM_URL= \
+                --build-arg NEXT_PUBLIC_IMAGE_GEN_R2_HOST="${IMAGE_GEN_R2_HOST}" \
+                --label "org.opencontainers.image.source=https://git.moleculesai.app/${REPO}" \
+                --label "org.opencontainers.image.revision=${GIT_SHA}" \
+                --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
+                --tag "${TENANT_IMAGE}:${TAG_SHA}" \
+                --tag "${TENANT_IMAGE}:${TAG_LATEST}" \
+                . ; then
+              built=1
+              echo "::notice::Tenant image build succeeded on attempt ${attempt}"
+              break
+            fi
+            echo "::warning::Tenant image build attempt ${attempt} failed — retrying"
+            sleep 10
+          done
+          if [ "$built" -ne 1 ]; then
+            echo "::error::Tenant image build failed after 3 attempts"
+            exit 1
+          fi
+          # End-state verification (not exit-code trust): the tag must exist in
+          # the daemon redeploy-tenants-on-* reads.
+          docker image inspect "${TENANT_IMAGE}:${TAG_SHA}" --format 'built {{.Id}}' >/dev/null \
+            || { echo "::error::image ${TENANT_IMAGE}:${TAG_SHA} missing after build"; exit 1; }
+          echo "::notice::image present in host daemon: $(docker image inspect "${TENANT_IMAGE}:${TAG_SHA}" --format '{{.Id}}')"
+
+      # Best-effort durable record: push to registry.moleculesai.app. The deploy
+      # uses the LOCAL tag on the SAME daemon (redeploy local-fallback), so a
+      # push failure (tunnel hiccup, or no registry credential wired) is
+      # NON-fatal — mirrors molecule-controlplane/scripts/deploy/local-cp-build.sh.
+      # When secrets.MOLECULE_REGISTRY_TOKEN is later wired at the org/repo level
+      # this starts pushing with zero workflow change.
+      - name: Push tenant image to registry (best-effort, durable record)
+        env:
+          TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
+          TAG_SHA: staging-${{ steps.tags.outputs.sha }}
+          TAG_LATEST: staging-latest
+          REGISTRY_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          REGISTRY_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+        run: |
+          set -uo pipefail
+          reg_host="${TENANT_IMAGE%%/*}"
+          if [ -z "${REGISTRY_TOKEN:-}" ]; then
+            echo "::notice::MOLECULE_REGISTRY_TOKEN not set — skipping registry push."
+            echo "::notice::The image is present in the shared host daemon as ${TENANT_IMAGE}:${TAG_LATEST};"
+            echo "::notice::redeploy-tenants-on-* pick it up via their docker-image-inspect local fallback."
+            exit 0
+          fi
+          echo "::add-mask::$REGISTRY_TOKEN"
+          if ! printf '%s' "$REGISTRY_TOKEN" | docker login "$reg_host" --username "$REGISTRY_USER" --password-stdin >/dev/null 2>&1; then
+            echo "::warning::docker login $reg_host failed — skipping push (non-fatal; local tag serves the single-host loop)"
+            exit 0
+          fi
+          for ref in "${TENANT_IMAGE}:${TAG_SHA}" "${TENANT_IMAGE}:${TAG_LATEST}"; do
+            if docker push "$ref" >/dev/null 2>&1; then
+              echo "::notice::pushed ${ref}"
+            else
+              echo "::warning::push of ${ref} failed (non-fatal; local tag serves the deploy)"
+            fi
+          done
+
+      # Tighten the loop: deterministically kick the matching redeploy AFTER the
+      # fresh image exists. redeploy-tenants-on-* also self-trigger on this same
+      # push, but on Gitea 1.22.6 (no workflow_run) that sibling run can start
+      # BEFORE this build finishes and pull the prior tag; this dispatch
+      # guarantees at least one redeploy runs against the just-published image.
+      # Best-effort + non-fatal: if it fails, the sibling push-trigger still
+      # covers the deploy (belt-and-suspenders, eventual consistency).
+      - name: Trigger matching redeploy on the fresh image (best-effort)
+        if: github.event_name == 'push'
+        env:
+          DISPATCH_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -uo pipefail
+          case "$REF_NAME" in
+            main)    wf="redeploy-tenants-on-main.yml" ;;
+            staging) wf="redeploy-tenants-on-staging.yml" ;;
+            *)       echo "::notice::no redeploy mapping for ref ${REF_NAME} — skipping"; exit 0 ;;
+          esac
+          if [ -z "${DISPATCH_TOKEN:-}" ]; then
+            echo "::notice::no dispatch token — relying on the redeploy push-trigger"; exit 0
+          fi
+          code=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: token ${DISPATCH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://git.moleculesai.app/api/v1/repos/${REPO}/actions/workflows/${wf}/dispatches" \
+            -d "{\"ref\":\"${REF_NAME}\"}") || code="000"
+          if [ "$code" = "204" ] || [ "$code" = "201" ] || [ "$code" = "200" ]; then
+            echo "::notice::dispatched ${wf} on ${REF_NAME} (HTTP ${code})"
+          else
+            echo "::warning::dispatch of ${wf} returned HTTP ${code} (non-fatal; the redeploy push-trigger still covers this deploy)"
+          fi
+
+  # bp-exempt: post-merge prod :latest promote side effect; gated on green push
+  # CI for this SHA AND the PROD_AUTO_DEPLOY_DISABLED production freeze.
+  promote-latest:
+    name: Promote tenant :latest to CI-green build
+    needs: build-and-push
+    # main only, real push only. staging advances :staging-latest directly in
+    # build-and-push (no promote); workflow_dispatch / non-main never promote.
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: docker-host
+    timeout-minutes: 60
+    env:
+      GITEA_HOST: git.moleculesai.app
+      CI_STATUS_TIMEOUT_SECONDS: "3600"
+      # Reuses the platform's production kill-switch: while prod auto-deploy is
+      # frozen, the :latest promote pauses too (correct — an unpromoted build
+      # must not become :latest, and redeploy-tenants-on-main is frozen in
+      # lockstep, so prod stays byte-stable until an operator lifts the freeze).
+      PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
+    steps:
+      - name: Prepare writable HOME + Docker config
+        run: |
+          set -euo pipefail
+          H="$RUNNER_TEMP/wss-promote-home"
+          mkdir -p "$H/.docker"
+          echo "HOME=$H" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$H/.docker" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Resolve promote gate (production freeze)
+        id: gate
+        env:
+          PROD_AUTO_DEPLOY_DISABLED: ${{ env.PROD_AUTO_DEPLOY_DISABLED }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PROD_AUTO_DEPLOY_DISABLED:-}" ]; then
+            case "$(printf '%s' "$PROD_AUTO_DEPLOY_DISABLED" | tr '[:upper:]' '[:lower:]')" in
+              1|true|yes|on|disabled|disable)
+                echo "enabled=false" >> "$GITHUB_OUTPUT"
+                echo "::notice::tenant :latest promote skipped: PROD_AUTO_DEPLOY_DISABLED=$PROD_AUTO_DEPLOY_DISABLED"
+                {
+                  echo "## Tenant :latest promote skipped (production frozen)"
+                  echo ""
+                  echo "Reason: \`PROD_AUTO_DEPLOY_DISABLED=$PROD_AUTO_DEPLOY_DISABLED\`. The build is published as \`:staging-${GITHUB_SHA::7}\` + \`:staging-latest\`; \`:latest\` was left unchanged, so production stays on its current image."
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0 ;;
+            esac
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for green push CI on this SHA
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEA_TOKEN:-}" ]; then
+            echo "::error::AUTO_SYNC_TOKEN required so the promote can wait for green CI on this SHA."
+            exit 1
+          fi
+          # Same SSOT wait the CP prod promote uses: block until the required
+          # push contexts go green on THIS sha; fail closed if any terminally fail.
+          python3 .gitea/scripts/prod-auto-deploy.py wait-ci
+
+      - name: Promote :latest to the CI-green tenant image
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
+          STAGING_SHA_TAG: ${{ needs.build-and-push.outputs.staging_sha }}
+          REGISTRY_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          REGISTRY_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+        run: |
+          set -euo pipefail
+          # Fail-safe: recompute the immutable per-commit tag from the SHA if the
+          # build job's output didn't propagate, so we never promote a guess.
+          SHA_TAG="${STAGING_SHA_TAG:-staging-${GITHUB_SHA::7}}"
+          SRC="${TENANT_IMAGE}:${SHA_TAG}"
+          DST="${TENANT_IMAGE}:latest"
+
+          # Local re-tag on the shared host daemon (no pull/rebuild): :latest
+          # becomes the verified :staging-<sha> for this commit, so
+          # redeploy-tenants-on-main's docker-image-inspect local fallback +
+          # fresh prod provisions resolve the CI-green build.
+          docker image inspect "$SRC" >/dev/null 2>&1 \
+            || { echo "::error::source image $SRC not present in host daemon — cannot promote"; exit 1; }
+          docker tag "$SRC" "$DST"
+          echo "::notice::re-tagged $SRC -> $DST in host daemon"
+
+          # Best-effort durable record: push :latest to the registry too.
+          reg_host="${TENANT_IMAGE%%/*}"
+          if [ -n "${REGISTRY_TOKEN:-}" ]; then
+            echo "::add-mask::$REGISTRY_TOKEN"
+            if printf '%s' "$REGISTRY_TOKEN" | docker login "$reg_host" --username "$REGISTRY_USER" --password-stdin >/dev/null 2>&1; then
+              docker push "$DST" >/dev/null 2>&1 && echo "::notice::pushed $DST" \
+                || echo "::warning::push of $DST failed (non-fatal; local tag serves the deploy)"
+            else
+              echo "::warning::docker login $reg_host failed — skipping :latest push (non-fatal)"
+            fi
+          else
+            echo "::notice::MOLECULE_REGISTRY_TOKEN not set — :latest promoted locally only (serves the single-host loop)."
+          fi
+
+          {
+            echo "## Tenant :latest promoted"
+            echo ""
+            echo "Re-pointed \`${TENANT_IMAGE}:latest\` -> \`${SHA_TAG}\` for commit \`${GITHUB_SHA::7}\`."
+            echo "redeploy-tenants-on-main + fresh production provisions now resolve this CI-green tenant build."
+          } >> "$GITHUB_STEP_SUMMARY"
