@@ -15,13 +15,17 @@ def _all_required(workflow: dict) -> dict:
     return workflow["jobs"]["all-required"]
 
 
-def test_all_required_uses_dedicated_meta_runner_lane():
+def test_all_required_does_no_docker_work_off_docker_host_pool():
     workflow = load_workflow("ci.yml")
     all_required = _all_required(workflow)
 
-    # Stays on the dedicated `ci-meta` lane (the sentinel does no docker
-    # work, so it must NOT occupy the general docker-host pool).
-    assert all_required["runs-on"] == "ci-meta"
+    # The sentinel does NO docker work, so it must NOT occupy the general
+    # `docker-host` pool. #3431 moved it OFF the dedicated `ci-meta` lane and
+    # co-located it on `ubuntu-latest` (where its `needs:` already run), which
+    # frees the meta executor slot immediately. Pin the post-#3431 shape: the
+    # invariant is "not on docker-host", realised as `ubuntu-latest`.
+    assert all_required["runs-on"] == "ubuntu-latest"
+    assert all_required["runs-on"] != "docker-host"
 
 
 def test_all_required_is_needs_aggregator_not_a_polling_gate():
