@@ -347,22 +347,19 @@ func TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered(t *t
 	if runtime != codexRuntime {
 		t.Fatalf("fresh install: runtime=%q, want %q — the INSERT VALUES must use the runtime PARAMETER, not a hardcoded 'claude-code'", runtime, codexRuntime)
 	}
-	if template != "codex-platform-agent" {
-		t.Fatalf("fresh install: template=%q, want %q — the template must map per-runtime (conciergeTemplateForRuntime)", template, "codex-platform-agent")
+	if template != "platform-agent" {
+		t.Fatalf("fresh install: template=%q, want %q — the concierge persona template is runtime-agnostic (conciergeTemplateForRuntime returns 'platform-agent' for every runtime, tenant-agent BUG 1)", template, "platform-agent")
 	}
 
 	// Case 2 (PROVE-FAIL): a re-install (ON CONFLICT path) must NOT revert the
-	// runtime back to claude-code, AND the (runtime, template) pair must stay
-	// MATCHED. We call the DEFAULT-runtime install path on purpose — even when
-	// the re-install requests no specific runtime (empty → default claude-code,
-	// which maps to template 'platform-agent'), the existing 'codex' row must be
-	// PRESERVED for BOTH columns. Against the pre-P3b `ON CONFLICT ... SET runtime
-	// = 'claude-code'` clause the runtime check fails; against head 9e4e5d08
-	// (`... SET ... template = $4`, i.e. the REQUESTED runtime's template) the
-	// runtime is preserved but the template is silently reverted to
-	// 'platform-agent' → a runtime/template MISMATCH (RC 13985). The fix derives
-	// the template on conflict from the PRESERVED (existing) runtime, so this
-	// case only passes once template stays 'codex-platform-agent'.
+	// runtime back to claude-code. The concierge persona template is now RUNTIME-
+	// AGNOSTIC (a single 'platform-agent' entry serves every runtime, tenant-agent
+	// BUG 1), so the (runtime, template) pair can never desync: runtime is PRESERVED
+	// on conflict, template is unconditionally 'platform-agent'. Against the pre-P3b
+	// `ON CONFLICT ... SET runtime = 'claude-code'` clause the runtime check fails.
+	// We call the DEFAULT-runtime install path on purpose to prove the existing
+	// 'codex' runtime survives a default reinstall while the template stays
+	// 'platform-agent'.
 	if err := installPlatformAgent(ctx, conn, platformID, paName, defaultConciergeRuntime); err != nil {
 		t.Fatalf("re-install (default runtime): %v", err)
 	}
@@ -378,10 +375,9 @@ func TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered(t *t
 			runtimeAfterReinstall, codexRuntime)
 	}
 	if wantTemplate := conciergeTemplateForRuntime(codexRuntime); templateAfterReinstall != wantTemplate {
-		t.Fatalf("RC 13985 regression: re-install via the default path desynced the template to %q, "+
-			"want %q (the template MATCHING the PRESERVED runtime %q). The ON CONFLICT clause must "+
-			"derive `template` from the existing `workspaces.runtime`, never stamp the REQUESTED "+
-			"runtime's template — a default reinstall must keep (runtime, template) a matched pair.",
+		t.Fatalf("re-install via the default path changed the concierge template to %q, want %q. "+
+			"The concierge persona template is runtime-agnostic (tenant-agent BUG 1): the ON CONFLICT "+
+			"clause must set `template = 'platform-agent'` unconditionally, and runtime %q must be PRESERVED.",
 			templateAfterReinstall, wantTemplate, codexRuntime)
 	}
 

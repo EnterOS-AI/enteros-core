@@ -50,27 +50,29 @@ sop-checklist / all-items-acked
 reserved-path-review / reserved-path-review
 Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 
-# pending-#3086 (AWS closure — not yet enforced) ────────────────────────
-# PARKED (this PR): `E2E Staging SaaS (full lifecycle) / E2E Staging
-# Concierge Creates Workspace` was ENFORCED above, but its producer
-# (e2e-staging-saas.yml) is now `workflow_dispatch`-only — the AWS account
-# is closed (2026-06-27) so the live-staging concierge lane cannot run on
-# PRs. Leaving it enforced while the producer no longer posts the context
-# on PRs would FREEZE the merge queue (fail-closed, REGARDLESS of BP). It
-# is parked here (not deleted) so the gate is restored — not forgotten —
-# when staging concierge coverage is rebuilt on the local-docker stack.
+# RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────
+# `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
+# is NO LONGER workflow_dispatch-only: its producer (e2e-staging-saas.yml) was
+# re-enabled on push + pull_request and the job now provisions on the
+# MOLECULES-SERVER (local-docker, provider='local') backend — no AWS creds, no
+# EC2. It runs as a DEPLOY GATE on push-to-main (continue-on-error:false; a
+# cold-open /workspaces failure REDs the run), and its full-journey script now
+# also carries the COLD-OPEN browser-slug assertion (STEP 2.5) that catches the
+# in-browser /workspaces 404 the admin-bearer probe misses.
 #
-# Per-PR concierge coverage is NOT lost: the deterministic
-# `Concierge Creates Workspace Hermetic` gate (above, ENFORCED, runs on
-# every PR/push) asserts the same create_workspace contract
-# (loaded_mcp_tools gate, status=online, real workspace-row creation), and
-# the new local-docker `Local Provision Lifecycle E2E (stub)` lane
-# (below, pending #2409) provisions a REAL tenant + asserts GET /workspaces
-# usability per PR — both on local docker (+ MiniMax) at ~zero cloud spend.
-# The real tool-use concierge→provision_workspace→GET /workspaces gate also
-# blocks prod via the controlplane local staging→prod e2e gate (CP #1013).
-# SEQUENCING: when the local-docker staging concierge lane is green on main,
-# PROMOTE it back above the ENFORCED marker.
+# It is kept BELOW the ENFORCED marker (documented-required, not merge-blocking)
+# for now — two conditions gate promotion, per the repo's validate-before-enforce
+# rule (do NOT promote early or the public-repo merge queue freezes):
+#   1. a GREEN molecules-server run of this job on main, and
+#   2. the PR/fork path posts `success` WITHOUT staging creds (E2E_REQUIRE_LIVE=0
+#      PR-mode self-check) so fork PRs — which cannot read the staging admin token
+#      — do not fail-closed and wedge the queue.
+# When both hold, PROMOTE this line above the ENFORCED marker (and delete this
+# block). Until then, per-PR concierge coverage remains via the deterministic
+# `Concierge Creates Workspace Hermetic` gate (above, ENFORCED) and the
+# local-docker `Local Provision Lifecycle E2E (stub)` lane (below); the real
+# tool-use concierge→provision_workspace→GET /workspaces gate also blocks prod
+# via the controlplane local staging→prod e2e gate (CP #1013).
 E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
 
 # pending-#2409 (not yet enforced) ──────────────────────────────────────

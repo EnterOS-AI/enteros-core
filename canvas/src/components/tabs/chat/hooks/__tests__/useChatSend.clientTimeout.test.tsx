@@ -54,7 +54,7 @@ describe("useChatSend — client timeout is NOT 'unreachable'", () => {
     apiPostMock.mockRejectedValueOnce(timeoutError());
 
     const { result } = renderHook(() =>
-      useChatSend("ws-long-turn", { getHistoryMessages: () => [] }),
+      useChatSend("ws-long-turn", {}),
     );
 
     await act(async () => {
@@ -70,7 +70,7 @@ describe("useChatSend — client timeout is NOT 'unreachable'", () => {
     apiPostMock.mockRejectedValueOnce(new Error("connect ECONNREFUSED"));
 
     const { result } = renderHook(() =>
-      useChatSend("ws-dead", { getHistoryMessages: () => [] }),
+      useChatSend("ws-dead", {}),
     );
 
     await act(async () => {

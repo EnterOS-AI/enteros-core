@@ -12,6 +12,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/gin-gonic/gin"
+	sdkcp "go.moleculesai.app/sdk/cloudprovider"
 )
 
 const (
@@ -43,18 +44,24 @@ type workspaceDisplayResponse struct {
 // allowlist then rejected with a 400. The canvas now derives its options from
 // this endpoint, so drift is impossible by construction.
 //
-// The ordered slices below are the canonical form. workspaceComputeInstanceAllowlist
+// The instance-type slices below are the canonical form. workspaceComputeInstanceAllowlist
 // (the O(1) validation set) is DERIVED from them in init(), so the ordered list
 // the canvas renders and the set the backend validates can never disagree.
 //
-// Mirrors the CP provider SSOT — keep in lock-step with the controlplane provider
-// configs (Hetzner ServerType cpx*/cax*, GCP MachineType e2-*, AWS EC2
-// t3*/m6i*/c6i*). TestValidateWorkspaceCompute_Provider / _InstanceTypePerProvider
-// pin the sets. "" provider = AWS default.
+// The PROVIDER SET is no longer a hand-maintained mirror of the controlplane
+// list: it DERIVES from the shared SDK SSOT (go.moleculesai.app/sdk/cloudprovider,
+// CloudIDs — the cloud/billable set, which excludes the local Molecules-Server
+// box that has no per-provider instance types). The per-provider instance-type
+// catalogs (Hetzner cpx*/cax*, GCP e2-*, AWS t3*/m6i*/c6i*) remain core-local
+// since machine sizes are not part of the provider-set SSOT.
+// TestValidateWorkspaceCompute_Provider / _InstanceTypePerProvider pin the sets.
+// "" provider = AWS default.
 
-// workspaceComputeProvidersOrdered is the canonical provider order (AWS first =
-// default). The canvas renders the provider dropdown in this order.
-var workspaceComputeProvidersOrdered = []string{"aws", "hetzner", "gcp"}
+// workspaceComputeProvidersOrdered is the cloud provider set the canvas renders
+// its dropdown from, DERIVED from the SDK cloudprovider SSOT (CloudIDs) so it can
+// never drift from the controlplane. The local Molecules-Server box is excluded:
+// it has no cloud instance-type catalog.
+var workspaceComputeProvidersOrdered = sdkcp.CloudIDs()
 
 // workspaceComputeInstanceTypesOrdered lists each provider's machine sizes in the
 // order the canvas should render them. An AWS t3.* is meaningless on Hetzner, and

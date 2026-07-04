@@ -1,0 +1,68 @@
+// chatContext.ts — a STABLE per-conversation id threaded as the A2A
+// `message.contextId` (tenant-agent BUG 3, client half).
+//
+// WHY: the canvas used to send each chat message with only a fresh random
+// `messageId` and NO `contextId`. The a2a-sdk on the runtime then calls
+// `_check_or_generate_context_id()` and mints a FRESH uuid per request — so any
+// runtime that keys its native session on `context_id` (openclaw's
+// SessionManager, and the base RuntimeA2AExecutor's LangGraph thread_id) opened a
+// NEW session every turn → the agent re-greeted with no prior context.
+//
+// Threading a stable `contextId` per conversation makes the a2a-sdk REUSE it, so
+// the runtime's session resumes across turns. This is the all-runtime client-side
+// fix (the runtime SDK also derives a stable session id from WORKSPACE_ID as a
+// belt, but the client should not force the sdk to invent one).
+//
+// The id is:
+//   * STABLE across turns + across reloads (persisted, so a page refresh resumes
+//     the same conversation rather than resetting the agent), and
+//   * ROTATED on an explicit "New session" (startNewSession / SESSION_RESET), so a
+//     new session gets a fresh agent context.
+//
+// Scoped per workspace so distinct workspaces never share a conversation key.
+
+const storageKey = (workspaceId: string): string =>
+  `mol.chat.contextId.${workspaceId}`;
+
+function mint(workspaceId: string): string {
+  const rand =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `conv-${workspaceId}-${rand}`;
+}
+
+/**
+ * Return the stable conversation id for a workspace, creating + persisting one on
+ * first use. Safe on SSR / storage-denied contexts (falls back to a workspace-
+ * scoped constant, still stable within the session).
+ */
+export function getConversationId(workspaceId: string): string {
+  const key = storageKey(workspaceId);
+  try {
+    const existing = window.localStorage.getItem(key);
+    if (existing) return existing;
+    const id = mint(workspaceId);
+    window.localStorage.setItem(key, id);
+    return id;
+  } catch {
+    // No storage (SSR / privacy mode): a workspace-scoped constant is still far
+    // better than a fresh-per-request context_id — it stays stable within the
+    // page's lifetime for that workspace.
+    return `conv-${workspaceId}`;
+  }
+}
+
+/**
+ * Rotate the conversation id for a workspace (called when a NEW chat session is
+ * started). Returns the fresh id. Best-effort persistence.
+ */
+export function rotateConversationId(workspaceId: string): string {
+  const id = mint(workspaceId);
+  try {
+    window.localStorage.setItem(storageKey(workspaceId), id);
+  } catch {
+    // ignore — the next getConversationId falls back to the scoped constant.
+  }
+  return id;
+}

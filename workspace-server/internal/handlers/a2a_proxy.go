@@ -8,6 +8,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -522,6 +523,64 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	c.Data(status, "application/json", respBody)
 }
 
+// ReceiveA2AInbound handles POST /workspaces/:id/a2a/inbound.
+//
+// External agents POST A2A JSON-RPC messages here to reach a workspace that
+// lives on the platform. The caller must authenticate with the target
+// workspace's platform_inbound_secret in the Authorization header. After a
+// successful constant-time comparison, the message is forwarded through the
+// same ProxyA2A path used by canvas/peer traffic.
+//
+// The X-Workspace-ID header is stripped before forwarding so the downstream
+// proxy treats this as an inbound/canvas-class request rather than attempting
+// workspace-token validation on a value supplied by an external caller.
+func (h *WorkspaceHandler) ReceiveA2AInbound(c *gin.Context) {
+	workspaceID := c.Param("id")
+	ctx := c.Request.Context()
+
+	bearer := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
+	if bearer == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing Authorization header"})
+		return
+	}
+
+	secret, err := wsauth.ReadPlatformInboundSecret(ctx, db.DB, workspaceID)
+	if err != nil {
+		// Deliberate status asymmetry (keep both arms in sync if either changes):
+		//   - ErrNoInboundSecret → 401: the workspace is genuinely not enrolled
+		//     in inbound auth (NULL/empty secret). This is a credential problem
+		//     on the CALLER's side of the trust boundary — from an unauthenticated
+		//     external caller's view it is indistinguishable from a wrong secret,
+		//     so we return an auth error, not a retry hint, and never auto-mint on
+		//     this inbound-receiver path (minting is the platform's job on the
+		//     OUTBOUND dispatch, where proxyA2ARequest lazy-heals + 503s).
+		//   - any other (transient DB) error → 503: retry-worthy, the secret may
+		//     well exist; surfacing 401 here would wrongly imply "not enrolled".
+		if errors.Is(err, wsauth.ErrNoInboundSecret) {
+			log.Printf("ReceiveA2AInbound: no platform_inbound_secret for workspace %s", workspaceID)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace has no inbound secret configured"})
+			return
+		}
+		log.Printf("ReceiveA2AInbound: failed to read platform_inbound_secret for workspace %s: %v", workspaceID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "inbound auth unavailable"})
+		return
+	}
+
+	if subtle.ConstantTimeCompare([]byte(bearer), []byte(secret)) != 1 {
+		log.Printf("ReceiveA2AInbound: invalid platform_inbound_secret for workspace %s", workspaceID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid inbound secret"})
+		return
+	}
+
+	// Strip any caller-supplied X-Workspace-ID and the consumed Authorization
+	// header so the downstream proxy cannot be coerced into workspace-token
+	// validation using external-controlled values, and so the inbound secret is
+	// not forwarded to the target workspace.
+	c.Request.Header.Del("X-Workspace-ID")
+	c.Request.Header.Del("Authorization")
+	h.ProxyA2A(c)
+}
+
 // checkWorkspaceBudget returns a proxyA2AError with 402 when the workspace has
 // exceeded ANY of its configured per-period budget limits (hourly/daily/weekly/
 // monthly — see budget_periods.go). Per-period spend is the rolling-window sum
@@ -781,8 +840,38 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		}
 	}
 
+	// core#3319: external agents (public /a2a/inbound endpoints) must receive
+	// the workspace's platform_inbound_secret in the Authorization header.
+	// Internal container addresses are unchanged. Reuses the same per-workspace
+	// bearer that already gates /internal/* forwards (chat_files.go).
+	inboundSecret := ""
+	if isExternalAgentURL(workspaceID, agentURL) {
+		secret, healed, secretErr := readOrLazyHealInboundSecret(ctx, workspaceID, "ProxyA2A")
+		if secretErr != nil {
+			log.Printf("ProxyA2A: no platform_inbound_secret for external workspace %s: %v", workspaceID, secretErr)
+			return 0, nil, &proxyA2AError{
+				Status: http.StatusServiceUnavailable,
+				Response: gin.H{
+					"error":  "workspace not yet enrolled in inbound auth (RFC #2312)",
+					"detail": "Failed to read platform_inbound_secret. Reprovision the workspace if this persists.",
+				},
+			}
+		}
+		if healed {
+			return 0, nil, &proxyA2AError{
+				Status: http.StatusServiceUnavailable,
+				Response: gin.H{
+					"error":               "workspace re-registering — please retry in 30 seconds",
+					"detail":              "Inbound auth secret was just minted. Workspace will pick it up on its next heartbeat.",
+					"retry_after_seconds": 30,
+				},
+			}
+		}
+		inboundSecret = secret
+	}
+
 	startTime := time.Now()
-	resp, cancelFwd, err := h.dispatchA2A(ctx, workspaceID, agentURL, body, callerID)
+	resp, cancelFwd, err := h.dispatchA2A(ctx, workspaceID, agentURL, body, callerID, inboundSecret)
 	if cancelFwd != nil {
 		defer cancelFwd()
 	}
@@ -1304,7 +1393,7 @@ func parseIdleTimeoutEnv(v string) time.Duration {
 //
 // Either layer is overridable by the X-Timeout header upstream in
 // ProxyA2A; X-Timeout: 0 explicitly disables the absolute ceiling.
-func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentURL string, body []byte, callerID string) (*http.Response, context.CancelFunc, error) {
+func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentURL string, body []byte, callerID string, inboundSecret string) (*http.Response, context.CancelFunc, error) {
 	// #1483 SSRF defense-in-depth: the primary call path through
 	// proxyA2ARequest → resolveAgentURL already validates via isSafeURL
 	// (a2a_proxy.go:424), but adding the check here closes the gap for
@@ -1367,6 +1456,9 @@ func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentUR
 		return nil, nil, &proxyDispatchBuildError{err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if inboundSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+inboundSecret)
+	}
 	resp, doErr := a2aClient.Do(req)
 	return resp, cancel, doErr
 }

@@ -31,6 +31,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -43,6 +44,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	molcontracts "go.moleculesai.app/molecule-contracts/gen/go"
+	"gopkg.in/yaml.v3"
 )
 
 // The concierge system-prompt template, the concierge MCP servers block, the
@@ -295,22 +297,196 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	// 1. Platform-MCP env (org-admin token + platform URL + org id).
 	conciergePlatformMCPEnv(envVars)
 
-	// 2. {{CONCIERGE_NAME}} substitution in the template-delivered
-	//    system-prompt.md. The runtime's build_system_prompt does NOT
-	//    template prompt files, so we do the minimal per-instance
-	//    substitution here at provision time. The template's
-	//    prompts/concierge.md carries the {{CONCIERGE_NAME}} placeholder
-	//    where the per-instance name goes. Idempotent: a re-provision
-	//    re-runs the substitution; the result is stable.
+	// 2. Compose the concierge's /configs from its ACTUAL (switchable) runtime's
+	//    NATIVE base config + the runtime-agnostic persona, grafted per that
+	//    runtime's convention. This is the GENERAL fix for the #2027
+	//    runtime-seed-mismatch abort (BUG: the single platform-agent template
+	//    config.yaml pins `runtime: claude-code`, so a concierge whose row
+	//    declares any OTHER runtime — including the default openclaw — received a
+	//    config whose top-level runtime contradicted the requested one; the
+	//    provision aborted and the concierge got no persona). The concierge runs
+	//    on the plain per-runtime image (selectImage: kind=platform →
+	//    RuntimeImages[runtime]), so its config.yaml MUST be that runtime's own
+	//    config, and the persona is grafted per the runtime's convention:
+	//    claude-code reads system-prompt.md; every other runtime reads
+	//    prompt_files: [prompts/concierge.md]. See composeConciergeRuntimeConfig.
+	//
+	//    The {{CONCIERGE_NAME}} substitution is applied to the delivered persona
+	//    at provision time (the runtime's build_system_prompt does NOT template
+	//    prompt files). Idempotent: a re-provision re-runs it; the result is
+	//    stable (the placeholder is gone after the first substitution).
 	if configFiles == nil {
 		configFiles = map[string][]byte{}
 	}
-	if prompt, ok := configFiles["system-prompt.md"]; ok {
-		configFiles["system-prompt.md"] = substituteConciergeName(prompt, name)
+	if composed, err := h.composeConciergeRuntimeConfig(runtime); err != nil {
+		// Base config unavailable (template-cache miss / a test without the
+		// template tree). Fall back to the delivered config UNCHANGED and keep the
+		// historical {{CONCIERGE_NAME}} substitution so we never regress the
+		// claude-code path — but log loudly so a real cache miss is visible.
+		log.Printf("Provisioner: concierge %s could not compose runtime-native config for runtime=%q (%v) — keeping delivered config + {{CONCIERGE_NAME}} substitution", workspaceID, runtime, err)
+		if prompt, ok := configFiles["system-prompt.md"]; ok {
+			configFiles["system-prompt.md"] = substituteConciergeName(prompt, name)
+		}
+	} else {
+		configFiles["config.yaml"] = composed
+		persona := substituteConciergeName(h.resolveConciergePersonaBytes(configFiles), name)
+		if len(persona) > 0 {
+			// Always land the persona at prompts/concierge.md (the path the
+			// grafted prompt_files references for non-claude-code runtimes); ALSO
+			// deliver system-prompt.md for claude-code (its runtime reads that file
+			// by convention).
+			configFiles[conciergePersonaPromptPath] = persona
+			if runtime == defaultConciergeRuntime {
+				configFiles["system-prompt.md"] = persona
+			}
+		}
+		log.Printf("Provisioner: concierge %s composed runtime-native /configs for runtime=%q (persona grafted per convention, name=%q, %d config file(s))",
+			workspaceID, runtime, name, len(configFiles))
 	}
-	log.Printf("Provisioner: applied platform-agent env + {{CONCIERGE_NAME}} substitution for %s (name=%q, %d config file(s))",
-		workspaceID, name, len(configFiles))
 	return configFiles
+}
+
+// conciergePersonaPromptPath is the /configs-relative path the concierge's
+// runtime-agnostic persona (prompts/concierge.md, shipped by the platform-agent
+// template) lands at. It is what the grafted config.yaml's prompt_files points to
+// for every NON-claude-code runtime; claude-code reads system-prompt.md instead.
+const conciergePersonaPromptPath = "prompts/concierge.md"
+
+// conciergeBaseTemplateName maps the concierge's runtime to the on-disk template
+// whose config.yaml is that runtime's NATIVE base config (runtime + provider
+// registry the runtime's own adapter parses). The concierge runs on the plain
+// per-runtime image (selectImage: kind=platform uses RuntimeImages[runtime]), so
+// its /configs/config.yaml MUST be that runtime's config, not the historical
+// claude-code-pinned platform-agent config. claude-code's baked base template is
+// the "-default" variant; every other runtime's template dir == its name.
+func conciergeBaseTemplateName(runtime string) string {
+	runtime = strings.TrimSpace(runtime)
+	if runtime == "" || runtime == defaultConciergeRuntime {
+		return defaultConciergeRuntime + "-default"
+	}
+	return runtime
+}
+
+// composeConciergeRuntimeConfig builds the concierge's /configs/config.yaml from
+// its ACTUAL runtime's native base template, grafting the runtime-agnostic
+// persona per that runtime's convention. This is the general fix for the #2027
+// runtime-seed-mismatch abort that fired for every non-claude-code concierge.
+//
+// Returns the composed config bytes, or a non-nil error when the runtime's base
+// config is unavailable (template-cache miss / tests without the template tree) —
+// the caller then falls back to the delivered config unchanged.
+//
+// Transforms applied to the base config (yaml.v3 node edit, so the rest of the
+// runtime-native config — provider registry, models, a2a, timeouts — is
+// preserved):
+//   - runtime_config.required_env -> []  (the concierge is platform-managed; its
+//     LLM creds are injected server-side via LLM_PROVIDER=platform, so it needs
+//     no tenant key. Without this a codex/claude-code base config whose
+//     runtime_config.required_env lists OPENAI_API_KEY / an anthropic key would
+//     trip the missingRequiredEnv preflight and abort the concierge.)
+//   - prompt_files -> [prompts/concierge.md]  for every NON-claude-code runtime
+//     (the persona is the sole system-prompt file; claude-code reads
+//     system-prompt.md, delivered separately, so its prompt_files is untouched).
+func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte, error) {
+	base := conciergeBaseTemplateName(runtime)
+	dir, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, base)
+	if err != nil {
+		return nil, fmt.Errorf("resolve concierge base template %q: %w", base, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		return nil, fmt.Errorf("read concierge base config %q: %w", base, err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("parse concierge base config %q: %w", base, err)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("concierge base config %q is not a YAML mapping", base)
+	}
+	root := doc.Content[0]
+
+	// Neutralize required_env — the concierge is platform-managed (no tenant key).
+	if rc := yamlMappingGet(root, "runtime_config"); rc != nil && rc.Kind == yaml.MappingNode {
+		yamlMappingSet(rc, "required_env", yamlEmptySeq())
+	}
+	// Graft the persona per the runtime's convention. claude-code reads
+	// system-prompt.md (delivered separately); every other runtime reads the
+	// prompt_files list, so the persona becomes its sole prompt file.
+	if strings.TrimSpace(runtime) != "" && runtime != defaultConciergeRuntime {
+		yamlMappingSet(root, "prompt_files", yamlStringSeq(conciergePersonaPromptPath))
+	}
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal composed concierge config %q: %w", base, err)
+	}
+	return out, nil
+}
+
+// resolveConciergePersonaBytes returns the RAW (unsubstituted) concierge persona
+// bytes — the runtime-agnostic prompts/concierge.md shipped by the platform-agent
+// template. It prefers the persona already delivered in configFiles (the SaaS
+// gitea asset channel populates prompts/concierge.md + system-prompt.md), and
+// falls back to reading it from the on-disk platform-agent template cache (the
+// local-docker path, where configFiles is nil and the template dir is copied to
+// /configs). Returns nil when no persona source is available.
+func (h *WorkspaceHandler) resolveConciergePersonaBytes(configFiles map[string][]byte) []byte {
+	if b, ok := configFiles[conciergePersonaPromptPath]; ok && len(b) > 0 {
+		return b
+	}
+	if b, ok := configFiles["system-prompt.md"]; ok && len(b) > 0 {
+		return b
+	}
+	if dir, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, "platform-agent"); err == nil {
+		if b, rerr := os.ReadFile(filepath.Join(dir, conciergePersonaPromptPath)); rerr == nil && len(b) > 0 {
+			return b
+		}
+	}
+	return nil
+}
+
+// yamlMappingGet returns the value node for key in a YAML mapping node, or nil.
+func yamlMappingGet(m *yaml.Node, key string) *yaml.Node {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// yamlMappingSet sets key=val in a mapping node, replacing an existing value or
+// appending a new key/value pair.
+func yamlMappingSet(m *yaml.Node, key string, val *yaml.Node) {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content[i+1] = val
+			return
+		}
+	}
+	m.Content = append(m.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		val)
+}
+
+// yamlEmptySeq returns an empty flow sequence node ([]).
+func yamlEmptySeq() *yaml.Node {
+	return &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq", Style: yaml.FlowStyle}
+}
+
+// yamlStringSeq returns a block sequence of string scalars.
+func yamlStringSeq(items ...string) *yaml.Node {
+	seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	for _, it := range items {
+		seq.Content = append(seq.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: it})
+	}
+	return seq
 }
 
 // conciergeNamePlaceholder is the {{CONCIERGE_NAME}} marker the template's
@@ -484,19 +660,27 @@ func fetchCPDefaultModel(ctx context.Context) (string, error) {
 	return strings.TrimSpace(cfg["MOLECULE_LLM_DEFAULT_MODEL"]), nil
 }
 
-// conciergeTemplateForRuntime maps a concierge runtime to its platform-agent
-// template name. The claude-code concierge keeps the historical "platform-agent"
-// template name (the row column installPlatformAgent has always written, and the
-// name conciergeTemplateOrDefault forces on provision); other runtimes use the
-// "<runtime>-platform-agent" convention (mirrors the localbuild image naming
-// `workspace-template-<runtime>-platform-agent`). This is what installPlatformAgent
-// stamps into workspaces.template so the asset fetcher pulls the right identity.
+// conciergeTemplateForRuntime returns the concierge's platform-agent template
+// name. There is ONE runtime-agnostic concierge persona template — "platform-agent"
+// — for EVERY runtime (claude-code, openclaw, codex, hermes, …). This is what
+// installPlatformAgent stamps into workspaces.template so the asset fetcher pulls
+// the concierge identity.
+//
+// SSOT COLLAPSE (tenant-agent BUG 1, P0): this used to map non-claude-code
+// concierges to a per-runtime "<runtime>-platform-agent" name (e.g.
+// "openclaw-platform-agent"). No such template is registered in manifest.json, so
+// resolveTemplateIdentity fail-closed to an EMPTY identity and the concierge booted
+// with NO persona (the 97-byte stub /configs/config.yaml). The concierge identity
+// is runtime-agnostic (the SAME orchestrator persona regardless of the underlying
+// runtime image), so it now resolves through the single "platform-agent" template
+// entry (manifest.json workspace_templates) whose config.yaml + system-prompt.md +
+// prompts/concierge.md serve every runtime via the control-plane materializer.
+//
+// The `runtime` parameter is retained for call-site compatibility; it no longer
+// changes the template (kept named for readability at the stamp site).
 func conciergeTemplateForRuntime(runtime string) string {
-	runtime = strings.TrimSpace(runtime)
-	if runtime == "" || runtime == defaultConciergeRuntime {
-		return "platform-agent"
-	}
-	return runtime + "-platform-agent"
+	_ = strings.TrimSpace(runtime) // runtime-agnostic: one concierge persona template for all runtimes
+	return "platform-agent"
 }
 
 // ensureConciergeModel makes the platform agent's model explicit (core#2594).
@@ -1284,29 +1468,23 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    seeds status='offline' via the INSERT's VALUES; only the conflict path
 	//    leaves status untouched.)
 	//
-	//    TEMPLATE (RC 13985): the conflict clause must NOT stamp the template that
-	//    matches the REQUESTED runtime ($4) — that desyncs the pair. A codex
-	//    concierge (runtime='codex', template='codex-platform-agent') reinstalled
-	//    via the DEFAULT path (which carries claude-code/$4='platform-agent')
-	//    would keep its preserved runtime='codex' but silently revert
-	//    template='platform-agent' → a runtime/template MISMATCH. Since `runtime`
-	//    is PRESERVED on conflict, the template must be derived from the row's
-	//    EXISTING runtime (`workspaces.runtime`), not the incoming one, so the
-	//    (runtime, template) pair stays matched after any default reinstall. The
-	//    CASE mirrors conciergeTemplateForRuntime: claude-code/empty →
-	//    'platform-agent', else '<runtime>-platform-agent'. An explicit runtime
-	//    change flows through the dedicated runtime-switch path, never here.
+	//    TEMPLATE (tenant-agent BUG 1, P0): the concierge persona template is now
+	//    RUNTIME-AGNOSTIC — a single 'platform-agent' entry serves every runtime
+	//    (see conciergeTemplateForRuntime). The previous per-runtime CASE stamped
+	//    '<runtime>-platform-agent' (e.g. 'openclaw-platform-agent') for a
+	//    non-claude-code concierge; no such template is registered in manifest.json,
+	//    so resolveTemplateIdentity fail-closed to an empty identity and the
+	//    concierge booted with no persona. On conflict `runtime` is still PRESERVED
+	//    (never reverted), but the template is now unconditionally 'platform-agent'
+	//    for both a fresh INSERT ($4) and a reinstall — the (runtime, template) pair
+	//    can no longer desync because there is exactly one concierge template.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id, template)
 		VALUES ($1, $2, 'platform', 0, 'offline', $3, NULL, $4)
 		ON CONFLICT (id) DO UPDATE SET
 			kind = 'platform',
 			parent_id = NULL,
-			template = CASE
-				WHEN COALESCE(NULLIF(TRIM(workspaces.runtime), ''), 'claude-code') = 'claude-code'
-					THEN 'platform-agent'
-				ELSE TRIM(workspaces.runtime) || '-platform-agent'
-			END
+			template = 'platform-agent'
 	`, platformID, name, runtime, template); err != nil {
 		return fmt.Errorf("upsert platform agent: %w", err)
 	}

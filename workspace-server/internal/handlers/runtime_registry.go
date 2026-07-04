@@ -389,6 +389,15 @@ func isKnownTemplate(name string) bool {
 	return ok
 }
 
+// isConciergeTemplateName reports whether a template name is (or looks like) a
+// concierge / platform-agent identity template — the single "platform-agent"
+// entry or the legacy per-runtime "<runtime>-platform-agent" convention. Used by
+// the resolveTemplateIdentity belt to fail LOUD when a concierge template does
+// not resolve (see below).
+func isConciergeTemplateName(template string) bool {
+	return template == "platform-agent" || strings.HasSuffix(template, "-platform-agent")
+}
+
 // resolveTemplateIdentity returns the Gitea template identity (repo@ref) for a
 // workspace. If a template is explicitly installed, it wins; otherwise the
 // runtime's default template is used. This is the SSOT for the RFC #2843 asset
@@ -397,10 +406,22 @@ func isKnownTemplate(name string) bool {
 // Fail-closed: an explicitly set but unknown template returns ("", false) so
 // callers can surface a 422 instead of silently degrading to the runtime
 // fallback (matches the create-boundary posture for unknown runtimes).
+//
+// BELT (tenant-agent BUG 1, P0): when the UNRESOLVED template is a concierge /
+// platform-agent identity template, emit a loud CRITICAL log before returning the
+// empty identity. An empty concierge identity means the concierge boots with NO
+// persona (the 97-byte stub) — the exact silent-degradation that shipped when the
+// platform-agent template was decommissioned from the manifest while
+// conciergeTemplateForRuntime still stamped its name. A future decommission /
+// manifest edit that drops the "platform-agent" entry now trips this CRITICAL
+// (visible in provision logs + alertable) instead of silently stripping identity.
 func resolveTemplateIdentity(template, runtime string) (string, bool) {
 	if template != "" {
 		if rr, ok := templateRepoByName[template]; ok {
 			return rr.Repo + "@" + rr.Ref, true
+		}
+		if isConciergeTemplateName(template) {
+			log.Printf("CRITICAL: concierge template %q is not registered in manifest.json workspace_templates — the concierge will boot with NO persona (empty template identity). Re-register the platform-agent template. (tenant-agent BUG 1 belt)", template)
 		}
 		return "", false
 	}

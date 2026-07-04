@@ -18,6 +18,7 @@ import { fetchSession } from "@/lib/auth";
 import { processingAgentLabel } from "@/lib/runtime-names";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useChatHistory } from "./chat/hooks/useChatHistory";
+import { rotateConversationId } from "./chat/hooks/chatContext";
 import { useChatSend } from "./chat/hooks/useChatSend";
 import { useChatSocket } from "./chat/hooks/useChatSocket";
 
@@ -154,7 +155,6 @@ function MyChatPanel({ workspaceId, data }: Props) {
 
   const history = useChatHistory(workspaceId, containerRef);
   const chatSend = useChatSend(workspaceId, {
-    getHistoryMessages: () => history.messages,
     onUserMessage: (msg) => history.setMessages((prev) => [...prev, msg]),
     onAgentMessage: (msg) => history.setMessages((prev) => appendMessageDeduped(prev, msg)),
   });
@@ -218,6 +218,10 @@ function MyChatPanel({ workspaceId, data }: Props) {
     // on reload.
     onSessionReset: () => {
       history.setMessages([]);
+      // Rotate the conversation contextId so the agent starts a FRESH session
+      // (tenant-agent BUG 3). Fires on every device via the SESSION_RESET
+      // broadcast, including the origin.
+      rotateConversationId(workspaceId);
     },
     onActivityLog: (entry) => {
       if (!thinking) return;
@@ -450,6 +454,10 @@ function MyChatPanel({ workspaceId, data }: Props) {
     // Optimistic local clear — even if the server round-trip
     // fails, the user's "new session" intent is satisfied.
     history.setMessages([]);
+    // Rotate the conversation contextId immediately on the origin device so a
+    // send right after "New session" already carries the fresh agent context
+    // (tenant-agent BUG 3), without waiting for the SESSION_RESET broadcast.
+    rotateConversationId(workspaceId);
     try {
       await api.post(
         `/workspaces/${workspaceId}/chat-session/new`,

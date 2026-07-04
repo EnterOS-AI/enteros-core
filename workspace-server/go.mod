@@ -22,7 +22,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	go.moleculesai.app/molecule-contracts v0.0.0-20260627044329-ffd2cf33343a
 	go.moleculesai.app/plugin/gh-identity v0.0.0-20260509010445-788988195fce
-	go.moleculesai.app/sdk v0.0.0-20260630004536-bee667e92123
+	go.moleculesai.app/sdk v0.0.0-20260630092023-470efdc37c6e
 	golang.org/x/crypto v0.50.0
 	golang.org/x/text v0.36.0
 	gopkg.in/yaml.v3 v3.0.1

@@ -943,3 +943,61 @@ def test_signal_7_refactor_exempt_with_still_high_diff_surfaces_numbers(monkeypa
     assert result["deleted_lines"] == 55800
     assert result["diverged"] is True
     assert result["refactor_exemption"] is True
+
+
+# ── Regression: CF-1010 UA fix ────────────────────────────────────────────────
+# gate_check.py must send a browser-legit User-Agent on every Gitea API call.
+# Without it the Cloudflare edge returns "Error 1010: browser signature banned"
+# (403), api_get raises, and the gate exits verdict=ERROR (fail-closed) — which
+# manifested as gate-check-v3 wedging every core PR (2026-07-02).
+import io
+import json as _json
+
+
+class _FakeResp(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_api_get_sends_browser_user_agent(monkeypatch):
+    mod = load_gate_check()
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _FakeResp(_json.dumps({"ok": True}).encode())
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    mod.api_get("/repos/molecule-ai/molecule-core/pulls/1")
+
+    req = captured["req"]
+    # urllib capitalizes header keys → "User-agent"
+    ua = req.get_header("User-agent")
+    assert ua == "curl/8.4.0", f"expected browser-legit UA, got {ua!r}"
+
+
+def test_api_get_user_agent_overridable_via_env(monkeypatch):
+    monkeypatch.setenv("GITEA_UA", "curl/9.9.9")
+    mod = load_gate_check()  # re-import so module-level USER_AGENT re-reads env
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _FakeResp(_json.dumps({}).encode())
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    mod.api_get("/x")
+    assert captured["req"].get_header("User-agent") == "curl/9.9.9"
+
+
+def test_comment_post_sends_browser_user_agent(monkeypatch):
+    """The PATCH/POST comment path must also carry the UA (second request site)."""
+    mod = load_gate_check()
+    src = SCRIPT.read_text()
+    # Structural guarantee: exactly the two request-header sites carry USER_AGENT,
+    # and the constant is env-overridable.
+    assert 'USER_AGENT = os.environ.get("GITEA_UA"' in src
+    assert src.count('"User-Agent": USER_AGENT') == 2

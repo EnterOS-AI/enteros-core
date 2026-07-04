@@ -551,12 +551,16 @@ func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
 		}
 	})
 
-	t.Run("conciergeTemplateForRuntime maps per-runtime", func(t *testing.T) {
+	t.Run("conciergeTemplateForRuntime is runtime-agnostic (single platform-agent template)", func(t *testing.T) {
+		// tenant-agent BUG 1 (P0): ONE runtime-agnostic concierge persona template
+		// serves every runtime. The prior per-runtime "<runtime>-platform-agent"
+		// names were never registered in the manifest → empty identity → no persona.
 		cases := map[string]string{
-			"":            "platform-agent",       // empty → default
-			"claude-code": "platform-agent",       // claude-code keeps the historical name
-			"codex":       "codex-platform-agent", // others use <runtime>-platform-agent
-			"openclaw":    "openclaw-platform-agent",
+			"":            "platform-agent", // empty → the one template
+			"claude-code": "platform-agent",
+			"codex":       "platform-agent", // was "codex-platform-agent" (unregistered)
+			"openclaw":    "platform-agent", // was "openclaw-platform-agent" (unregistered)
+			"hermes":      "platform-agent",
 		}
 		for rt, want := range cases {
 			if got := conciergeTemplateForRuntime(rt); got != want {
@@ -586,7 +590,7 @@ func TestConciergeRuntimeGeneralization_Defaults(t *testing.T) {
 //	    EMPTY runtime (the legacy/self-host path that falls back to
 //	    conciergeDefaultRuntime) must stamp the env-resolved "codex" into the
 //	    workspaces INSERT $3, NOT the "claude-code" const, and the matching
-//	    "codex-platform-agent" template into $4. The sqlmock WithArgs is the
+//	    runtime-agnostic "platform-agent" template into $4. The sqlmock WithArgs is the
 //	    capture seam: it asserts the exact bound value of $3 (and $4), so a
 //	    regression that hardcodes 'claude-code' in the INSERT VALUES (or ignores the
 //	    env) fails here at unit-test time (no -tags=integration / Postgres needed).
@@ -625,7 +629,8 @@ func TestConciergeDefaultRuntime_EnvWinsOverConstAndBindsIntoInstall(t *testing.
 		const platformID = "33333333-4444-5555-6666-777777777777"
 		const paName = "Org Concierge runtime-follow"
 		// The template that MUST accompany the resolved runtime (conciergeTemplateForRuntime).
-		wantTemplate := conciergeTemplateForRuntime(nonDefaultRuntime) // "codex-platform-agent"
+		// Runtime-agnostic since BUG 1: this is "platform-agent" for every runtime.
+		wantTemplate := conciergeTemplateForRuntime(nonDefaultRuntime) // "platform-agent"
 
 		mock.ExpectBegin()
 		// Step 0: downgrade any other platform root ($1 = platformID).
