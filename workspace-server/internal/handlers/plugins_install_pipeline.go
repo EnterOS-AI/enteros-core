@@ -373,69 +373,104 @@ func (h *PluginsHandler) resolveAndStage(ctx context.Context, req installRequest
 //
 // Dispatch order:
 //
-//  1. Local Docker container is up → tar+CopyToContainer (historical path).
-//  2. SaaS workspace (instance_id set) → push via EIC SSH to the EC2's
-//     bind-mounted /configs/plugins/<name>/. Closes the 🔴 docker-only
-//     row in docs/architecture/backends.md by routing through the same
-//     primitive Files API uses (template_files_eic.go).
-//  3. Neither wired → 503. True "no backend" case (dev box without
-//     Docker AND without an instance_id row).
+//  1. Local Docker container is up (self-host ws-<id>) → tar+CopyToContainer.
+//  2. instance_id set → SHAPE-routed (isEC2InstanceID, mirrors
+//     files_backend_dispatch.go):
+//     2a. real "i-<hex>" EC2 id (AWS SaaS) → push via EIC SSH to the EC2's
+//         bind-mounted /configs/plugins/<name>/ (template_files_eic.go).
+//     2b. anything else = a local-docker / molecules-server CONTAINER NAME
+//         ("mol-ws-<slug>-<hex>", which the CP local-docker provisioner
+//         persists into instance_id) → docker CopyToContainer straight into
+//         THAT container, when a docker client is wired. NEVER the AWS EIC
+//         path (that 90-120s-times-out with no AWS creds → 502; core#182).
+//     2c. local-docker id but no docker client wired → fail LOUD (503),
+//         never a silent 90s AWS EIC timeout.
+//  3. Neither wired → 503. True "no backend" case.
 //
 // The SaaS branch is gated on h.instanceIDLookup so unit tests can keep
 // using NewPluginsHandler without a DB; production wires it in router.go.
 func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID string, r *stageResult) error {
 	if containerName := h.findRunningContainer(ctx, workspaceID); containerName != "" {
-		// Hot-reload classifier (molecule-core#112) — decide BEFORE the
-		// install whether this update can skip restartFunc. SKILL.md
-		// content changes are filesystem-visible to Claude Code on the
-		// next Skill invocation; hooks / settings.json / plugin.yaml /
-		// added-or-removed files need a container restart.
-		// Classifier reads live tree from container; on any read error
-		// it returns kindCold so we never hot-reload speculatively.
-		kind, _ := h.classifyInstallChanges(ctx, containerName, r.StagedDir, r.PluginName)
-
-		// Atomic stage→snapshot→swap→marker (molecule-core#114).
-		// Replaces the prior single docker.CopyToContainer write that
-		// left a partially-extracted tree on mid-install failure with
-		// no rollback path. atomicCopyToContainer writes a .complete
-		// marker as the last step; workspace-side plugin loaders should
-		// refuse to load a plugin dir without it.
-		if err := h.atomicCopyToContainer(ctx, containerName, r.StagedDir, r.PluginName); err != nil {
-			log.Printf("Plugin install: failed to copy %s to %s: %v", r.PluginName, workspaceID, err)
-			return newHTTPErr(http.StatusInternalServerError, gin.H{"error": "failed to copy plugin to container"})
-		}
-		h.execAsRoot(ctx, containerName, []string{
-			"chown", "-R", "1000:1000", "/configs/plugins/" + r.PluginName,
-		})
-		if h.restartFunc != nil {
-			if kind == classifyKindSkillContentOnly {
-				log.Printf("Plugin install: %s → workspace %s — SKILL-content-only update, SKIPPING restart", r.PluginName, workspaceID)
-			} else {
-				// RFC internal#524 Layer 1: drain via globalGoAsync (see
-				// workspace.go:globalGoAsync).
-				wsID := workspaceID
-				globalGoAsync(func() { h.restartFunc(wsID) })
-			}
-		}
-		return nil
+		return h.deliverViaDocker(ctx, workspaceID, containerName, r)
 	}
 
 	if instanceID, runtime := h.lookupSaaSDispatch(workspaceID); instanceID != "" {
-		if err := installPluginViaEIC(ctx, instanceID, runtime, r.PluginName, r.StagedDir); err != nil {
-			log.Printf("Plugin install: EIC push failed for %s → %s: %v", r.PluginName, workspaceID, err)
-			return newHTTPErr(http.StatusBadGateway, gin.H{
-				"error": "failed to deliver plugin to workspace EC2",
-			})
+		// AWS (EC2-per-workspace) SaaS backend — real "i-<hex>" id → EIC SSH.
+		if isEC2InstanceID(instanceID) {
+			if err := installPluginViaEIC(ctx, instanceID, runtime, r.PluginName, r.StagedDir); err != nil {
+				log.Printf("Plugin install: EIC push failed for %s → %s: %v", r.PluginName, workspaceID, err)
+				return newHTTPErr(http.StatusBadGateway, gin.H{
+					"error": "failed to deliver plugin to workspace EC2",
+				})
+			}
+			if h.restartFunc != nil {
+				// RFC internal#524 Layer 1: see Docker path above.
+				wsID := workspaceID
+				globalGoAsync(func() { h.restartFunc(wsID) })
+			}
+			return nil
 		}
-		if h.restartFunc != nil {
-			// RFC internal#524 Layer 1: see Docker path above.
-			wsID := workspaceID
-			globalGoAsync(func() { h.restartFunc(wsID) })
+
+		// molecules-server / local-docker backend: instance_id IS the running
+		// container name on the local docker daemon. Deliver straight into it
+		// via the SAME docker primitive the findRunningContainer branch uses —
+		// findRunningContainer looked for "ws-<id>" and never matches the CP's
+		// "mol-ws-*" name, so we key delivery on the instance_id container name.
+		if h.docker != nil {
+			return h.deliverViaDocker(ctx, workspaceID, instanceID, r)
 		}
-		return nil
+
+		// Non-EC2 instance id (local-docker) but no docker client wired — the
+		// "prov==nil and no reachable docker daemon" misconfiguration. Fail
+		// LOUD instead of masking it as a 90s AWS EIC timeout → 502.
+		log.Printf("Plugin install: workspace %s is on the local-docker backend (instance_id=%s) but this server has no docker client; refusing to fall back to AWS EIC", workspaceID, instanceID)
+		return newHTTPErr(http.StatusServiceUnavailable, gin.H{
+			"error": "workspace runs on the local-docker backend but this server has no docker client (prov==nil and no reachable docker daemon)",
+		})
 	}
 
 	return newHTTPErr(http.StatusServiceUnavailable, gin.H{"error": "workspace container not running"})
+}
+
+// deliverViaDocker copies the staged plugin dir into containerName via docker
+// CopyToContainer, chowns it for the agent user (uid 1000), and triggers a
+// restart unless the change is skill-content-only. Shared by the self-host
+// ws-<id> branch and the molecules-server mol-ws-* (instance_id) branch —
+// docker delivery is identical once we know which container to write into.
+func (h *PluginsHandler) deliverViaDocker(ctx context.Context, workspaceID, containerName string, r *stageResult) error {
+	// Hot-reload classifier (molecule-core#112) — decide BEFORE the
+	// install whether this update can skip restartFunc. SKILL.md
+	// content changes are filesystem-visible to Claude Code on the
+	// next Skill invocation; hooks / settings.json / plugin.yaml /
+	// added-or-removed files need a container restart.
+	// Classifier reads live tree from container; on any read error
+	// it returns kindCold so we never hot-reload speculatively.
+	kind, _ := h.classifyInstallChanges(ctx, containerName, r.StagedDir, r.PluginName)
+
+	// Atomic stage→snapshot→swap→marker (molecule-core#114).
+	// Replaces the prior single docker.CopyToContainer write that
+	// left a partially-extracted tree on mid-install failure with
+	// no rollback path. atomicCopyToContainer writes a .complete
+	// marker as the last step; workspace-side plugin loaders should
+	// refuse to load a plugin dir without it.
+	if err := h.atomicCopyToContainer(ctx, containerName, r.StagedDir, r.PluginName); err != nil {
+		log.Printf("Plugin install: failed to copy %s to %s (container %s): %v", r.PluginName, workspaceID, containerName, err)
+		return newHTTPErr(http.StatusInternalServerError, gin.H{"error": "failed to copy plugin to container"})
+	}
+	h.execAsRoot(ctx, containerName, []string{
+		"chown", "-R", "1000:1000", "/configs/plugins/" + r.PluginName,
+	})
+	if h.restartFunc != nil {
+		if kind == classifyKindSkillContentOnly {
+			log.Printf("Plugin install: %s → workspace %s — SKILL-content-only update, SKIPPING restart", r.PluginName, workspaceID)
+		} else {
+			// RFC internal#524 Layer 1: drain via globalGoAsync (see
+			// workspace.go:globalGoAsync).
+			wsID := workspaceID
+			globalGoAsync(func() { h.restartFunc(wsID) })
+		}
+	}
+	return nil
 }
 
 // lookupSaaSDispatch returns (instance_id, runtime) for SaaS dispatch, or

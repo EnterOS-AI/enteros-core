@@ -141,7 +141,21 @@ func (h *PluginsHandler) Uninstall(c *gin.Context) {
 	}
 
 	if instanceID, runtime := h.lookupSaaSDispatch(workspaceID); instanceID != "" {
-		h.uninstallViaEIC(ctx, c, workspaceID, pluginName, instanceID, runtime)
+		// SHAPE-routed exactly like Install/deliverToContainer + the Files API
+		// (files_backend_dispatch.go). A real "i-<hex>" EC2 id → EIC SSH; a
+		// local-docker CONTAINER NAME ("mol-ws-*") → docker exec into that
+		// container; never route local-docker to the AWS-only EIC path.
+		if isEC2InstanceID(instanceID) {
+			h.uninstallViaEIC(ctx, c, workspaceID, pluginName, instanceID, runtime)
+			return
+		}
+		if h.docker != nil {
+			h.uninstallViaDocker(ctx, c, workspaceID, pluginName, instanceID)
+			return
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "workspace runs on the local-docker backend but this server has no docker client (prov==nil and no reachable docker daemon)",
+		})
 		return
 	}
 

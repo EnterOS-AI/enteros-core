@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -740,9 +741,24 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// only the plgh block left dockerCli used-before-declared. Same nil
 	// guard semantics: prov nil → dockerCli nil → handlers fall back to
 	// non-Docker paths or skip Docker-dependent routes.
+	//
+	// CP-provisioner mode on the local-docker / molecules-server backend
+	// (MOLECULE_ORG_ID set → prov == nil): the tenant's mol-ws-* workspace
+	// containers still run on a docker daemon this process can reach, so wire
+	// a client from that daemon when it answers a Ping. Without this the
+	// plugins handler's docker client was nil, findRunningContainer returned
+	// ErrNoBackend, and delivery fell back to the retired AWS EIC path →
+	// 90-120s timeout → 502 on every local-docker tenant (blocked the
+	// Lark-channel live test and all plugin installs). A genuine cloud tenant
+	// has no local daemon → Ping fails → dockerCli stays nil → the AWS EIC
+	// path is unchanged for real "i-<hex>" instance ids. See
+	// provisioner.NewDockerClientIfReachable + files_backend_dispatch.go.
 	var dockerCli *client.Client
 	if prov != nil {
 		dockerCli = prov.DockerClient()
+	} else if cli, ok := provisioner.NewDockerClientIfReachable(context.Background()); ok {
+		dockerCli = cli
+		log.Printf("router: CP-provisioner mode with a reachable local docker daemon — wired docker client for local-docker plugin/template/terminal delivery (no AWS EIC)")
 	}
 
 	// Plugins — plgh must be initialized before the drift handler that uses it.

@@ -53,9 +53,12 @@ on:
   # full-journey canvas gate (`E2E Staging Concierge Creates Workspace`) no longer
   # provisions EC2 — staging tenants run on the molecules-server (local-docker,
   # provider='local') backend the CP now defaults to (no-AWS directive), so that
-  # job needs no AWS creds and no EC2 leak-check. The remaining EC2-only jobs
-  # (platform-boot, concierge-user-tasks, workspace-requests, concierge-platform,
-  # plugin-lifecycle) stay DORMANT behind the `E2E_EC2_ENABLED` repo var (unset →
+  # job needs no AWS creds and no EC2 leak-check. `E2E Staging Plugin Install
+  # Lifecycle` was likewise moved onto the molecules-server backend (core#182:
+  # plugin install now rides docker CopyToContainer into the mol-ws-* container,
+  # not AWS EIC) and runs on push/dispatch/cron. The remaining EC2-only jobs
+  # (platform-boot, concierge-user-tasks, workspace-requests, concierge-platform)
+  # stay DORMANT behind the `E2E_EC2_ENABLED` repo var (unset →
   # skip) until a cloud EC2 backend is wired again — re-enable by setting
   # vars.E2E_EC2_ENABLED='1'. (Was DISABLED 2026-06-27 when the AWS account closed.)
   # The schedule/cron trigger was DELETED (no-nightly-e2e rule) — not commented.
@@ -1544,11 +1547,17 @@ jobs:
   e2e-staging-plugin-lifecycle:
     name: E2E Staging Plugin Install Lifecycle
     runs-on: ubuntu-latest
-    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
-    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
-    # the molecules-server canvas gate does not fire these AWS-dead jobs.
-    if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
-    timeout-minutes: 45
+    # MOLECULES-SERVER (local-docker) live gate — NO EC2 dependency. The CP
+    # provisions the staging tenant as a local-docker container, so the plugin
+    # install rides docker CopyToContainer into the mol-ws-* container, NOT the
+    # AWS EIC path. This job was previously EC2-dormant (E2E_EC2_ENABLED) which
+    # is exactly why the local-docker plugin-install 502 (core#182) reached prod
+    # uncaught. Runs on push-to-main / dispatch / cron (never pull_request, where
+    # the KMS token fetch is skipped and the admin-token verify would exit 2);
+    # requireStagingEnv skips LOUD if creds are absent. Mirrors the live
+    # molecules-server gate e2e-staging-concierge-creates-workspace.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
@@ -1621,7 +1630,7 @@ jobs:
           cp_health_preflight "$CP_BASE_URL" "plugin-lifecycle"
       - name: Run plugin-install-lifecycle staginge2e
         working-directory: workspace-server
-        run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 40m
+        run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 55m
       # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
       # (e2e-plgn-* slug), running even on a t.Fatal. The age-guarded
       # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
