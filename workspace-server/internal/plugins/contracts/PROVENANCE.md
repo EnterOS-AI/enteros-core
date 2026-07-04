@@ -8,9 +8,9 @@ copy to it, never the reverse.
 | --- | --- |
 | Source repo | `molecule-ai/molecule-ai-sdk` |
 | Source path | `contracts/plugin-manifest/plugin-manifest.schema.json` |
-| Source commit (last change to the schema) | `20d47232a9f7ee95a56f1014e3ac06cc5ccf6dcc` |
-| molecule-ai-sdk `main` HEAD at vendoring | `8aedf2bc8f820d79de8534e07e0d482ac1c43f4e` |
-| Vendored | 2026-07-02 (core#3383 PR-1, advisory install-time validation) |
+| Source commit (last change to the schema) | `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` |
+| molecule-ai-sdk `main` HEAD at vendoring | `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` |
+| Vendored | 2026-07-04 (ai-sdk#53 dropped langgraph/autogen/gemini-cli/deepagents from the runtime enum) |
 
 Consumers:
 

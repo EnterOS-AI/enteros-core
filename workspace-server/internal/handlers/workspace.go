@@ -533,7 +533,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// For a runtime the provider registry knows (first-party:
 	// claude-code/codex/hermes/openclaw) this checks the (runtime, model) pair
 	// against the registry's native model set. Fails OPEN for runtimes the
-	// registry doesn't know (langgraph/external/kimi/mock/federated) so
+	// registry doesn't know (external/kimi/mock/federated) so
 	// non-first-party / federated flows are UNCHANGED. Skipped for external
 	// workspaces (the URL is the contract, not the model — see MODEL_REQUIRED
 	// rationale above).
@@ -587,7 +587,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		// invariant — any future drift between `providers:` and `runtimes:`
 		// fails the create with a clear pointer to the missing provider
 		// rather than silently wedging the agent. Fails open for runtimes
-		// the registry doesn't know (langgraph/external/kimi/mock/federated
+		// the registry doesn't know (external/kimi/mock/federated
 		// — the federation contract the model-side check also honors).
 		if ok, why := validateDerivedProviderInRegistry(payload.Runtime, payload.Model); !ok {
 			log.Printf("Create: 422 DERIVED_PROVIDER_NOT_IN_REGISTRY (runtime=%q model=%q): %s [issue #2172 hard-reject]", payload.Runtime, payload.Model, why)

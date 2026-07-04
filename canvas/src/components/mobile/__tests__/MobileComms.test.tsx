@@ -38,7 +38,7 @@ vi.mock("@/store/canvas", () => ({
     }
     return mockNodes;
   }),
-  summarizeWorkspaceCapabilities: vi.fn(() => ({ runtime: "langgraph", skillCount: 0, currentTask: "" })),
+  summarizeWorkspaceCapabilities: vi.fn(() => ({ runtime: "codex", skillCount: 0, currentTask: "" })),
 }));
 
 const mockActivity: Array<{

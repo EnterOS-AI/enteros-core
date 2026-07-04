@@ -405,7 +405,7 @@ components:
       properties:
         org_id: { type: string, format: uuid }
         workspace_id: { type: string, format: uuid }
-        runtime: { type: string, description: "claude-code | codex | langgraph | ..." }
+        runtime: { type: string, description: "claude-code | codex | crewai | ..." }
         tier: { type: integer }
         instance_type: { type: string }
         disk_gb: { type: integer, format: int32 }
