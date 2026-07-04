@@ -210,15 +210,20 @@ services:
     # is the prod-blessed tag the ordered deploy keeps pointed at the last
     # green build — still deterministic vs. the old raw `:latest`.
     #
-    # To pin by content digest instead of tag (fully immutable):
-    #   aws ecr describe-images --repository-name molecule-ai/canvas \
-    #     --image-tags staging-<sha> --region us-east-2 \
-    #     --query 'imageDetails[0].imageDigest' --output text
+    # To pin by content digest instead of tag (fully immutable), resolve the
+    # digest for a tag from our registry, e.g.
+    #   docker buildx imagetools inspect \
+    #     registry.moleculesai.app/molecule-ai/canvas:staging-<sha> \
+    #     --format '{{.Manifest.Digest}}'
     # then set CANVAS_IMAGE_TAG=staging-<sha>@<digest> (compose passes it through).
     #
-    # Note: ECR images require AWS auth — `aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 153263036946.dkr.ecr.us-east-2.amazonaws.com` before pull.
+    # Registry: OUR OWN container registry (the Gitea registry). Pull auth is a
+    # standard `docker login registry.moleculesai.app` with a Gitea PAT
+    # (GITEA_USER/GITEA_TOKEN) — no AWS/ECR credentials required. The image is
+    # overridable for a mirror via MOLECULE_CANVAS_IMAGE (mirrors the SSOT var
+    # the redeploy workflows already read); default is our registry.
     # Local dev keeps working via the `build:` context below (docker compose build canvas).
-    image: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/canvas:${CANVAS_IMAGE_TAG:-latest}
+    image: ${MOLECULE_CANVAS_IMAGE:-registry.moleculesai.app/molecule-ai/canvas}:${CANVAS_IMAGE_TAG:-latest}
     build:
       context: ./canvas
       dockerfile: Dockerfile
