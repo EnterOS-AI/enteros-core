@@ -679,6 +679,26 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	}
 	body = normalizedBody
 
+	// Server-side session-continuity belt (concierge double-greeting fix).
+	// A canvas-origin message/send that arrives WITHOUT a message.contextId
+	// makes the runtime a2a-sdk mint a FRESH context_id per request, so any
+	// runtime that keys its native session on it (openclaw's SessionManager,
+	// the base executor's LangGraph thread_id) opens a NEW session every turn
+	// → the agent re-greets with no prior context (the "identical greeting
+	// twice" bug). The canvas client-side fix threads a stable contextId, but
+	// a STALE canvas bundle, a third-party A2A client, or an MCP bridge that
+	// never sends one still resets every turn. Inject a stable, deterministic
+	// contextId derived from the workspace so the session resumes regardless of
+	// client version. A caller-supplied contextId is PRESERVED untouched, so an
+	// updated canvas's "New session" rotation keeps working. Only canvas-origin
+	// turns (anonymous callerID=="" or an authenticated canvas user) — agent-to-
+	// agent and system (warmup) traffic carry their own context semantics.
+	if a2aMethod == "message/send" && (callerID == "" || isCanvasUser) {
+		if rewritten, changed := ensureCanvasSessionContextID(body, workspaceID); changed {
+			body = rewritten
+		}
+	}
+
 	// core#2127 RC 13392: a workspace with can_delegate=false MUST NOT be
 	// able to send a delegation via the raw A2A message/send path. The MCP
 	// tools/list+tools/call+helper gates (PR#3165+#3168) and the REST
@@ -1315,6 +1335,59 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 		a2aMethod = m
 	}
 	return marshaledBody, a2aMethod, nil
+}
+
+// canvasSessionContextID is the deterministic, per-workspace conversation id
+// injected as message.contextId for canvas-origin turns that arrive WITHOUT
+// one. Derived SOLELY from the workspace id so it is STABLE across turns and
+// across process restarts — exactly the property runtime session resumption
+// needs. The workspace id is a UUID (dash-delimited, no colons), so the
+// resulting id survives any runtime session-id sanitisation unchanged.
+func canvasSessionContextID(workspaceID string) string {
+	return "canvas-" + workspaceID
+}
+
+// ensureCanvasSessionContextID injects a stable, deterministic contextId into a
+// canvas-origin message/send envelope that lacks one, and reports whether it
+// rewrote the body. It is the server half of the concierge double-greeting fix:
+// without a stable contextId the runtime a2a-sdk mints a fresh context_id per
+// request, resetting any session keyed on it (openclaw's SessionManager, the
+// LangGraph thread_id) → the agent re-greets every turn.
+//
+// A caller-supplied, non-empty contextId is PRESERVED untouched (so an updated
+// canvas's per-conversation id and its "New session" rotation still govern the
+// session). The injection only fills the GAP left by clients that never send
+// one — a stale canvas bundle, a third-party A2A client, or an MCP bridge.
+//
+// Best-effort and non-destructive: any parse/marshal problem returns the
+// original body unchanged (the caller has already run normalizeA2APayload, so
+// a well-formed message/send envelope is expected here).
+func ensureCanvasSessionContextID(body []byte, workspaceID string) ([]byte, bool) {
+	if workspaceID == "" {
+		return body, false
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, false
+	}
+	params, ok := payload["params"].(map[string]interface{})
+	if !ok {
+		return body, false
+	}
+	msg, ok := params["message"].(map[string]interface{})
+	if !ok {
+		return body, false
+	}
+	// Preserve any non-empty caller-supplied contextId.
+	if existing, ok := msg["contextId"].(string); ok && strings.TrimSpace(existing) != "" {
+		return body, false
+	}
+	msg["contextId"] = canvasSessionContextID(workspaceID)
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return rewritten, true
 }
 
 // idleTimeoutDuration is the per-dispatch silence window: if the

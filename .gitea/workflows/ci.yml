@@ -741,10 +741,16 @@ jobs:
     # on PRs and is included here — internal#817. If a new always-running
     # CI job is added, add it here too or ci-required-drift F1 will flag it.
     #
-    # Stays on the dedicated `ci-meta` lane (no docker work, so the
-    # docker-host-pin lint does not apply), but now the job is sub-second:
-    # it only inspects already-settled `needs.*.result` values, so it frees
-    # the slot immediately instead of holding it for the whole CI duration.
+    # Runs on the shared robot-1 `ubuntu-latest` pool. Operator directive
+    # (2026-07): CI runs on robot-1; the local box is reserved for the
+    # staging/prod stacks + Gitea registry + genuinely-must-be-local jobs.
+    # This aggregator does NO docker work (so the docker-host-pin lint does
+    # not apply) and is sub-second: it only inspects already-settled
+    # `needs.*.result` values, so it never needed a local lane. All of its
+    # `needs:` already run on `ubuntu-latest`, so co-locating it there removes
+    # the last core-CI job stranded on the local `ci-meta` runner. The emitted
+    # status context (`CI / all-required (<event>)`) is derived from the
+    # job/workflow name, not the runner, so branch protection is unaffected.
     #
     needs:
       - changes
@@ -754,7 +760,7 @@ jobs:
       - python-lint
       - canvas-deploy-status
     continue-on-error: false
-    runs-on: ci-meta
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
