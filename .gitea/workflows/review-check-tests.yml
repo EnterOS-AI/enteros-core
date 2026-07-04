@@ -23,20 +23,30 @@ on:
       - '.gitea/scripts/review-check.sh'
       - '.gitea/scripts/_approval_validator.py'
       - '.gitea/scripts/_review_check_filter.py'
+      - '.gitea/scripts/lib/ci-status.sh'
       - '.gitea/scripts/tests/test_review_check.sh'
+      - '.gitea/scripts/tests/test_ci_status.sh'
       - '.gitea/scripts/tests/_review_check_fixture.py'
       - '.gitea/scripts/tests/test_approval_validator.py'
       - '.gitea/workflows/review-check-tests.yml'
+      - '.gitea/workflows/qa-review.yml'
+      - '.gitea/workflows/security-review.yml'
+      - '.gitea/workflows/secret-scan.yml'
   pull_request:
     branches: [main, staging]
     paths:
       - '.gitea/scripts/review-check.sh'
       - '.gitea/scripts/_approval_validator.py'
       - '.gitea/scripts/_review_check_filter.py'
+      - '.gitea/scripts/lib/ci-status.sh'
       - '.gitea/scripts/tests/test_review_check.sh'
+      - '.gitea/scripts/tests/test_ci_status.sh'
       - '.gitea/scripts/tests/_review_check_fixture.py'
       - '.gitea/scripts/tests/test_approval_validator.py'
       - '.gitea/workflows/review-check-tests.yml'
+      - '.gitea/workflows/qa-review.yml'
+      - '.gitea/workflows/security-review.yml'
+      - '.gitea/workflows/secret-scan.yml'
   workflow_dispatch:
 
 env:
@@ -73,6 +83,15 @@ jobs:
 
       - name: Run review-check.sh regression suite
         run: bash .gitea/scripts/tests/test_review_check.sh
+
+      - name: Run ci-status lib regression suite (PR #3422 gate-integrity)
+        # Covers the SSOT governance-emission lib (.gitea/scripts/lib/ci-status.sh)
+        # shared by qa-review / security-review / secret-scan: internal-host
+        # derivation, CI_STATUS_TOKEN resolution (direct-secret-first, Infisical
+        # fallback, fail-closed vs best-effort), review-status emission, and the
+        # secret-scan re-assert (success-gating / best-effort / event->sha). Closes
+        # the test-coverage gap flagged in the molecule-code-reviewer REQUEST_CHANGES.
+        run: bash .gitea/scripts/tests/test_ci_status.sh
 
       - name: Install-jq fail-closed contract (core#2460 / mc#1982 root-fix)
         # CTO-mandated regression test for the install-jq step's

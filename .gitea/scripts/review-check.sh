@@ -87,14 +87,18 @@ fi
 
 OWNER="${REPO%%/*}"
 NAME="${REPO##*/}"
-# Prefer the runner-provided internal Gitea URL (GITHUB_SERVER_URL, e.g.
-# http://molecule-gitea-local:3000 on the self-hosted local runners) so the
-# API calls hit Gitea directly on the internal docker network — bypassing the
-# public Cloudflare edge entirely (no DNS-hijack, no CF-1010 User-Agent
-# self-ban, no single-tunnel 524 crawl SPOF). Fall back to the public host
-# derived from GITEA_HOST when the runner does not export an internal URL.
-GITEA_BASE="${GITHUB_SERVER_URL:-https://${GITEA_HOST}}"
-API="${GITEA_BASE%/}/api/v1"
+# Internal-host-preferred Gitea base derivation, shared with the qa-review /
+# security-review / secret-scan gates via the SSOT lib (unit-tested in
+# tests/test_ci_status.sh: derive_gitea_base). Prefer the runner-provided
+# GITHUB_SERVER_URL (e.g. http://molecule-gitea-local:3000 on the self-hosted
+# local runners) so the API calls hit Gitea directly on the internal docker
+# network — bypassing the public Cloudflare edge entirely (no DNS-hijack, no
+# CF-1010 User-Agent self-ban, no single-tunnel 524 crawl SPOF). Fall back to
+# the public host derived from GITEA_HOST (always set; see the require block
+# above) when the runner does not export an internal URL.
+# shellcheck source=lib/ci-status.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/ci-status.sh"
+API="$(derive_gitea_base)/api/v1"
 
 # Token-in-argv fix (#541): write the Authorization header to a mode-600
 # temp file instead of passing it via curl -H "$AUTH" (which puts the
