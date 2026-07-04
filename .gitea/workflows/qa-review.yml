@@ -197,46 +197,51 @@ jobs:
           REVIEW_CHECK_STRICT: '0'
         run: bash .gitea/scripts/review-check.sh
 
-      # KMS consolidation (#971/#3274 pattern): the explicit status POST
-      # below previously read the per-bot Gitea Actions secret
-      # `STATUS_POST_TOKEN`. We now fetch the consolidated CI_STATUS_TOKEN
-      # from the Infisical SSOT (prod /shared/ci-status) via the CI machine
-      # identity and export it to $GITHUB_ENV. The POST step keeps reading it
-      # under the GITEA_TOKEN env var name it already expects, so the script
-      # is unchanged. The old STATUS_POST_TOKEN Gitea secret is left in place
-      # until a green run validates this path (validate-before-delete).
+      # Resolve the write-scoped CI_STATUS_TOKEN used by the explicit status
+      # POST below. PRIMARY source is the direct `CI_STATUS_TOKEN` Gitea org
+      # Actions secret (present on the local setup) — no external round-trip,
+      # so the emission does NOT fail closed when the Infisical control-plane
+      # is unreachable from the runner. FALLBACK is the Infisical SSOT (prod
+      # /shared/ci-status) over its public Cloudflare hostname, fetched WITH a
+      # CF-accepted User-Agent so CF-1010 cannot edge-ban the request. This
+      # removes the hard dependency on key.moleculesai.app that previously
+      # forced the compensating agent-mirror.
       #
-      # Trust boundary: this job runs on pull_request_target / pull_request_review
-      # with a BASE-ref checkout, so it is the trusted base context and the
-      # INFISICAL_CI_* machine-identity secrets are available (same boundary
-      # that already gated the direct STATUS_POST_TOKEN consumption).
-      - name: Fetch CI_STATUS_TOKEN from Infisical SSOT
+      # Trust boundary: runs on pull_request_target / pull_request_review with a
+      # BASE-ref checkout (trusted base context); the CI_STATUS_TOKEN /
+      # INFISICAL_CI_* secrets are withheld from fork PRs at the runner level.
+      - name: Resolve CI_STATUS_TOKEN (direct Gitea org secret, Infisical fallback)
         if: github.event_name == 'pull_request_review' && always()
         env:
+          CI_STATUS_TOKEN_DIRECT: ${{ secrets.CI_STATUS_TOKEN }}
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
         run: |
           set -uo pipefail
-          BASE="https://key.moleculesai.app"
-          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
-            -H 'Content-Type: application/json' \
-            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
-          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
-          read_secret() {
-            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+          UA='molecule-ci-gate/1.0 (+gitea-api)'
+          CI_STATUS_TOKEN="${CI_STATUS_TOKEN_DIRECT:-}"
+          if [ -n "$CI_STATUS_TOKEN" ]; then
+            echo "::add-mask::$CI_STATUS_TOKEN"
+            echo "CI_STATUS_TOKEN resolved from Gitea org secret (len=${#CI_STATUS_TOKEN})"
+          else
+            BASE="https://key.moleculesai.app"
+            TOK=$(curl -fsS -A "$UA" -X POST "$BASE/api/v1/auth/universal-auth/login" \
+              -H 'Content-Type: application/json' \
+              -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
+            if [ -z "$TOK" ]; then echo "::error::CI_STATUS_TOKEN absent as a Gitea secret AND Infisical login failed — failing closed"; exit 1; fi
+            CI_STATUS_TOKEN=$(curl -fsS -A "$UA" "$BASE/api/v3/secrets/raw/CI_STATUS_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fci-status" \
               -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
-          }
-          CI_STATUS_TOKEN=$(read_secret CI_STATUS_TOKEN %2Fshared%2Fci-status)
-          echo "::add-mask::$CI_STATUS_TOKEN"
-          if [ -z "$CI_STATUS_TOKEN" ]; then
-            echo "::error::Infisical returned empty CI_STATUS_TOKEN at prod /shared/ci-status — failing closed."
-            exit 1
+              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")')
+            echo "::add-mask::$CI_STATUS_TOKEN"
+            if [ -z "$CI_STATUS_TOKEN" ]; then
+              echo "::error::Infisical returned empty CI_STATUS_TOKEN at prod /shared/ci-status — failing closed."
+              exit 1
+            fi
+            echo "CI_STATUS_TOKEN resolved from Infisical fallback (len=${#CI_STATUS_TOKEN})"
           fi
           echo "CI_STATUS_TOKEN=$CI_STATUS_TOKEN" >> "$GITHUB_ENV"
-          echo "CI_STATUS_TOKEN loaded from Infisical (len=${#CI_STATUS_TOKEN})"
 
       - name: Post required status context on pull_request_review
         # Gitea Actions auto-publishes (pull_request_review) context
@@ -254,19 +259,25 @@ jobs:
         if: github.event_name == 'pull_request_review' && always()
         env:
           GITEA_TOKEN: ${{ env.CI_STATUS_TOKEN }}
-          GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
           EVAL_OUTCOME: ${{ steps.eval.outcome }}
         run: |
           set -euo pipefail
+          # Prefer the runner-provided internal Gitea URL (bypasses the public
+          # Cloudflare edge → no DNS-hijack / CF-1010 UA-ban / 524); fall back
+          # to the public host. The CF-accepted UA guards the public path.
+          GITEA_BASE="${GITHUB_SERVER_URL:-https://git.moleculesai.app}"; GITEA_BASE="${GITEA_BASE%/}"
           authfile=$(mktemp)
           chmod 600 "$authfile"
-          printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$authfile"
+          {
+            printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN"
+            printf 'user-agent = "molecule-ci-gate/1.0 (+gitea-api)"\n'
+          } > "$authfile"
 
           prfile=$(mktemp)
           code=$(curl -sS -o "$prfile" -w '%{http_code}' -K "$authfile" \
-            "https://${GITEA_HOST}/api/v1/repos/${REPO}/pulls/${PR_NUMBER}")
+            "${GITEA_BASE}/api/v1/repos/${REPO}/pulls/${PR_NUMBER}")
           if [ "$code" != "200" ]; then
             echo "::error::GET /pulls/${PR_NUMBER} returned HTTP ${code}"
             rm -f "$prfile" "$authfile"
@@ -292,7 +303,7 @@ jobs:
           post_code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
             -K "$authfile" -H "Content-Type: application/json" \
             -d "$body" \
-            "https://${GITEA_HOST}/api/v1/repos/${REPO}/statuses/${head_sha}")
+            "${GITEA_BASE}/api/v1/repos/${REPO}/statuses/${head_sha}")
 
           rm -f "$authfile"
 
