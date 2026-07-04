@@ -63,3 +63,46 @@ class TestMigrationFileRe(unittest.TestCase):
     def test_rejects_no_underscore(self):
         # Naming convention requires <digits>_<name>
         assert ccm.MIGRATION_FILE_RE.match("044.up.sql") is None
+
+
+class TestGiteaGetUserAgent(unittest.TestCase):
+    """Regression: _gitea_get must send a browser-legit User-Agent.
+
+    Without it the Cloudflare edge 1010-bans the default python-urllib UA,
+    _gitea_get returns None, and the cross-PR migration-collision arm silently
+    fails OPEN (two PRs with the same prefix both pass). Found by the
+    2026-07-02 CF-1010 sweep alongside gate-check-v3 (core#3397).
+    """
+
+    def test_gitea_get_sets_browser_user_agent(self):
+        import io
+        import urllib.request as _u
+
+        captured = {}
+
+        class _Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            captured["req"] = req
+            return _Resp(b"{}")
+
+        orig = _u.urlopen
+        _u.urlopen = fake_urlopen
+        try:
+            ccm._gitea_get("repos/molecule-ai/molecule-core")
+        finally:
+            _u.urlopen = orig
+
+        ua = captured["req"].get_header("User-agent")
+        assert ua == "molecule-ci-gate/1.0 (+gitea-api)", (
+            f"expected browser-legit UA, got {ua!r}"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

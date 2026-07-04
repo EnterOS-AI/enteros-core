@@ -90,6 +90,11 @@ def _gitea_get(path: str, params: dict[str, str] | None = None) -> bytes | None:
     if token:
         req.add_header("Authorization", f"token {token}")
     req.add_header("Accept", "application/json")
+    # CF edge 1010-bans the default python-urllib UA (Error 1010: browser
+    # signature banned). Without this header every Gitea read here 403s, so
+    # _gitea_get returns None and the cross-PR collision arm silently fails
+    # OPEN. Match the sibling gate scripts' UA (ci-required-drift / watchdog).
+    req.add_header("User-Agent", "molecule-ci-gate/1.0 (+gitea-api)")
     try:
         # S310 (信任boundary): this function IS the outbound HTTP client for
         # Gitea API calls. The call is intentional and controlled — we build
