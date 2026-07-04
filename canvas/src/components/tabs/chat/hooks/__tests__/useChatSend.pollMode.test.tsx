@@ -69,7 +69,6 @@ describe("useChatSend — poll-mode (external/MCP) queued-200 handling — task 
 
     const { result } = renderHook(() =>
       useChatSend("ws-poll-target", {
-        getHistoryMessages: () => [],
         onUserMessage,
         onAgentMessage,
       }),
@@ -100,7 +99,6 @@ describe("useChatSend — poll-mode (external/MCP) queued-200 handling — task 
 
     const { result } = renderHook(() =>
       useChatSend("ws-poll-target", {
-        getHistoryMessages: () => [],
       }),
     );
 
@@ -127,7 +125,6 @@ describe("useChatSend — poll-mode (external/MCP) queued-200 handling — task 
 
     const { result } = renderHook(() =>
       useChatSend("ws-poll-target", {
-        getHistoryMessages: () => [],
       }),
     );
 
@@ -159,7 +156,6 @@ describe("useChatSend — poll-mode (external/MCP) queued-200 handling — task 
     const onAgentMessage = vi.fn();
     const { result } = renderHook(() =>
       useChatSend("ws-push-early-release", {
-        getHistoryMessages: () => [],
         onAgentMessage,
       }),
     );

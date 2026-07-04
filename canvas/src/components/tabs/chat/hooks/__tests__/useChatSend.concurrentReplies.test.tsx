@@ -51,7 +51,6 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
     const onAgentMessage = vi.fn();
     const { result } = renderHook(() =>
       useChatSend("ws-1", {
-        getHistoryMessages: () => [],
         onAgentMessage,
       }),
     );
@@ -91,7 +90,7 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
       .mockImplementationOnce(() => second.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-1", { getHistoryMessages: () => [] }),
+      useChatSend("ws-1", {}),
     );
 
     await act(async () => {
@@ -125,7 +124,7 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
     });
 
     const { result } = renderHook(() =>
-      useChatSend("ws-poll", { getHistoryMessages: () => [] }),
+      useChatSend("ws-poll", {}),
     );
 
     await act(async () => {
@@ -153,7 +152,7 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
       });
 
     const { result } = renderHook(() =>
-      useChatSend("ws-mixed", { getHistoryMessages: () => [] }),
+      useChatSend("ws-mixed", {}),
     );
 
     await act(async () => {
@@ -187,7 +186,7 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
     apiPostMock.mockImplementationOnce(() => send.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-race", { getHistoryMessages: () => [] }),
+      useChatSend("ws-race", {}),
     );
 
     await act(async () => {
@@ -225,7 +224,7 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
       .mockImplementationOnce(() => second.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-mixed", { getHistoryMessages: () => [] }),
+      useChatSend("ws-mixed", {}),
     );
 
     await act(async () => {
@@ -273,7 +272,7 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
     apiPostMock.mockImplementationOnce(() => send.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-legacy", { getHistoryMessages: () => [] }),
+      useChatSend("ws-legacy", {}),
     );
 
     await act(async () => {
@@ -317,7 +316,7 @@ describe("useChatSend — concurrent replies (core#2725)", () => {
       });
 
     const { result } = renderHook(() =>
-      useChatSend("ws-poll-two", { getHistoryMessages: () => [] }),
+      useChatSend("ws-poll-two", {}),
     );
 
     await act(async () => {
@@ -352,7 +351,7 @@ describe("useChatSend — legacy no-messageId fallback is exact-one-token conser
     apiPostMock.mockImplementationOnce(() => send.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-legacy", { getHistoryMessages: () => [] }),
+      useChatSend("ws-legacy", {}),
     );
 
     await act(async () => {
@@ -392,7 +391,7 @@ describe("useChatSend — legacy no-messageId fallback is exact-one-token conser
       .mockImplementationOnce(() => second.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-legacy-two-inflight", { getHistoryMessages: () => [] }),
+      useChatSend("ws-legacy-two-inflight", {}),
     );
 
     await act(async () => {
@@ -441,7 +440,7 @@ describe("useChatSend — legacy no-messageId fallback is exact-one-token conser
       .mockImplementationOnce(() => second.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-legacy-two-pending", { getHistoryMessages: () => [] }),
+      useChatSend("ws-legacy-two-pending", {}),
     );
 
     await act(async () => {
@@ -489,7 +488,7 @@ describe("useChatSend — legacy no-messageId fallback is exact-one-token conser
     apiPostMock.mockImplementationOnce(() => send.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-queued-late", { getHistoryMessages: () => [] }),
+      useChatSend("ws-queued-late", {}),
     );
 
     await act(async () => {
@@ -524,7 +523,7 @@ describe("useChatSend — legacy no-messageId fallback is exact-one-token conser
     apiPostMock.mockImplementationOnce(() => send.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-524-late", { getHistoryMessages: () => [] }),
+      useChatSend("ws-524-late", {}),
     );
 
     await act(async () => {
@@ -553,7 +552,7 @@ describe("useChatSend — legacy no-messageId fallback is exact-one-token conser
     apiPostMock.mockImplementationOnce(() => send.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-timeout-late", { getHistoryMessages: () => [] }),
+      useChatSend("ws-timeout-late", {}),
     );
 
     await act(async () => {
@@ -583,7 +582,7 @@ describe("useChatSend — legacy no-messageId fallback is exact-one-token conser
     apiPostMock.mockImplementationOnce(() => send.promise);
 
     const { result } = renderHook(() =>
-      useChatSend("ws-messageid-late", { getHistoryMessages: () => [] }),
+      useChatSend("ws-messageid-late", {}),
     );
 
     await act(async () => {
@@ -618,7 +617,6 @@ describe("useChatSend — push-mode reply is not dropped by a racing WS completi
     const onAgentMessage = vi.fn();
     const { result } = renderHook(() =>
       useChatSend("push-echo-ws-race", {
-        getHistoryMessages: () => [],
         onAgentMessage,
       }),
     );
