@@ -9,13 +9,16 @@ name: publish-canvas-image
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
 #   - `continue-on-error: true` on each job (RFC §1 contract).
-#   - Retargeted the image push from GHCR to ECR. GHCR was retired during
-#     the 2026-05-06 Gitea migration, and Gitea's GITHUB_TOKEN cannot
-#     authenticate to ghcr.io.
+#   - Image push targeted registry.moleculesai.app (our self-hosted OCI
+#     registry). GHCR was retired in the 2026-05-06 Gitea migration; ECR was
+#     retired with the AWS account (2026-06-27, no-AWS directive). The build now
+#     runs on ROBOT-1 and publishes via the parallel CHUNKED PUSHER through the
+#     Cloudflare tunnel (a monolithic docker push 413s at the CF ~100MB cap).
 #
 
-# Builds, pushes, and (ordered) deploys the standalone canvas Docker image to
-# ECR whenever a commit lands on main that touches canvas code.
+# Builds on robot-1, publishes (via chunked pusher, through the CF tunnel), and
+# (ordered) re-points :latest for the standalone canvas Docker image on
+# registry.moleculesai.app whenever a commit lands on main that touches canvas.
 #
 # Ordered deploy (core#2226) — mirrors publish-workspace-server-image.yml so the
 # standalone `molecule-ai/canvas` image is deterministic + verifiable, not a
@@ -70,30 +73,25 @@ permissions:
   packages: write
 
 env:
-  # SSOT-Instance-10 (#333): ECR registry triplet (account.dkr.ecr.region.amazonaws.com)
-  # sourced from org/repo var `ECR_REGISTRY` with the current prod-account literal as
-  # bootstrap fallback. When the org var is set, the fallback becomes dead code and
-  # switching accounts/regions is a one-line change at the org level (instead of
-  # touching every workflow). Pattern mirrors `vars.CP_URL || 'literal'` already in
-  # use below in this repo's staging-verify.yml.
-  IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/canvas
+  # CANONICAL content-addressed registry (Cloudflare-fronted, self-hosted Gitea
+  # OCI). ECR was retired with the AWS account (2026-06-27, no-AWS directive);
+  # canvas now publishes to registry.moleculesai.app via the chunked pusher.
+  # Overridable org/repo-wide via MOLECULE_CANVAS_IMAGE without touching this file.
+  IMAGE_NAME: ${{ vars.MOLECULE_CANVAS_IMAGE || 'registry.moleculesai.app/molecule-ai/canvas' }}
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
   # bp-exempt: post-merge image publication side effect; CI / all-required gates source changes.
   build-and-push:
     name: Build & push canvas image
-    # Dedicated publish/release lane (internal#462 / #394 / #399). Ship
-    # path (on: push:main, canvas/**) — reserved capacity so a merged
-    # canvas fix's image build never FIFO-queues behind PR required-CI.
-    # The `publish` label resolves ONLY to the molecule-runner-publish-*
-    # sub-pool (config.publish.yaml). HARD DEPENDENCY: this MUST land
-    # AFTER the publish-lane runners are registered/advertising `publish`
-    # — the earlier #599 `docker` label attempt queued indefinitely with
-    # zero eligible runners precisely because the label was targeted
-    # before any runner advertised it (see #576). The lane is registered
-    # in this rollout (internal#462) so the precondition holds.
-    runs-on: publish
+    # robot-1's 32c dedicated build box (the `robot-1` label is exclusive to that
+    # host's fleet runners) — offloads the heavy Next.js canvas image build off
+    # the local box. `[docker-host, robot-1]` = AND semantics, so it lands ONLY on
+    # robot-1 while satisfying lint-required-workflows-docker-host-pinned
+    # (docker-host is present). The image is `--load`ed into robot-1's daemon and
+    # published to registry.moleculesai.app via the parallel chunked pusher (the
+    # co-deployed root docker-compose then `docker compose pull`s it).
+    runs-on: [docker-host, robot-1]
     timeout-minutes: 45
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
@@ -117,41 +115,41 @@ jobs:
           mkdir -p "$DOCKER_CONFIG/buildx/certs"
           echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
 
-      - name: Log in to ECR
+      # Token that can read the private operator-config repo to fetch the chunked
+      # pusher (below). Sourced from the Infisical SSOT via the CI machine
+      # identity — matches publish-workspace-server-image.yml. FORK SAFETY: this
+      # workflow fires only on push:main + workflow_dispatch (no pull_request), so
+      # the token is never fetchable on an untrusted fork trigger; the conditional
+      # is belt-and-suspenders (Gitea also withholds secrets from forks).
+      - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
         env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-2
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
         run: |
-          set -euo pipefail
-          ECR_REGISTRY="${IMAGE_NAME%%/*}"
-          aws ecr get-login-password --region us-east-2 | \
-            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          AUTO_SYNC_TOKEN=$(curl -fsS "$BASE/api/v3/secrets/raw/AUTO_SYNC_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fdev-utils" \
+            -H "Authorization: Bearer $TOK" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -z "$AUTO_SYNC_TOKEN" ]; then
+            echo "::warning::Infisical returned empty for AUTO_SYNC_TOKEN — the chunked pusher fetch will be skipped (non-fatal)."
+          fi
+          echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
-      - name: Ensure ECR repository exists
-        env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-2
-        run: |
-          set -euo pipefail
-          repo_path="${IMAGE_NAME#*/}"
-          if ! aws ecr describe-repositories --repository-names "${repo_path}" --region us-east-2 >/dev/null 2>&1; then
-            aws ecr create-repository \
-              --repository-name "${repo_path}" \
-              --image-scanning-configuration scanOnPush=true \
-              --region us-east-2 >/dev/null
-          fi
-
       # Health check: verify Docker daemon is accessible before attempting any
       # build steps. This fails loudly at step 1 when the runner's docker.sock
       # is inaccessible rather than silently continuing to the build step
-      # where docker build fails deep in ECR auth with a cryptic error.
+      # where docker build fails with a cryptic error.
       - name: Verify Docker daemon access
         run: |
           set -euo pipefail
@@ -206,13 +204,18 @@ jobs:
           echo "ws_url=${WS_URL}" >> "$GITHUB_OUTPUT"
           echo "image_gen_r2_host=${IMAGE_GEN_R2_HOST}" >> "$GITHUB_OUTPUT"
 
-      - name: Build & push canvas image to ECR
+      # Build the canvas image and `--load` it into robot-1's daemon (single
+      # platform, so load is valid). The registry publish is done separately by
+      # the chunked pusher below (a monolithic `docker push` through CF 413s at
+      # the ~100MB request-body cap).
+      - name: Build canvas image (--load into robot-1 daemon)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: ./canvas
           file: ./canvas/Dockerfile
           platforms: linux/amd64
-          push: true
+          push: false
+          load: true
           build-args: |
             NEXT_PUBLIC_PLATFORM_URL=${{ steps.build_args.outputs.platform_url }}
             NEXT_PUBLIC_WS_URL=${{ steps.build_args.outputs.ws_url }}
@@ -222,37 +225,88 @@ jobs:
             # surfaces GIT_SHA at /buildinfo. Full 40-char SHA (not the
             # 7-char tag) so the fleet redeploy verification can match exactly.
             BUILD_SHA=${{ github.sha }}
-          # Ordered deploy (core#2226): the build job pushes the immutable
-          # per-commit tag + the build-tracking staging-latest + the legacy
-          # back-compat :sha-<sha> tag. It does NOT push :latest — :latest is
-          # the prod-blessed tag and is only re-pointed by promote-canvas after
-          # green main CI, so an unpromoted/red build can never become :latest.
+          # Ordered deploy (core#2226): produce the immutable per-commit tag +
+          # the build-tracking staging-latest + the legacy back-compat :sha-<sha>
+          # tag. NOT :latest — :latest is the prod-blessed tag, only re-pointed by
+          # promote-canvas after green main CI.
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.staging_sha }}
             ${{ env.IMAGE_NAME }}:staging-latest
             ${{ env.IMAGE_NAME }}:sha-${{ steps.tags.outputs.sha }}
-          # Gitea artifact-cache reachability is best-effort on the operator
-          # runner network. Do not let cache export fail an image that already
-          # built and pushed successfully.
           labels: |
             org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI canvas (Next.js 15 + React Flow)
 
-      # Keep the prod ECR storage bill bounded: declare the canonical image
-      # lifecycle policy on the canvas repo we just pushed. Idempotent +
-      # fail-soft (never fails the publish). SSOT JSON lives in the script.
-      - name: Ensure ECR lifecycle policy (canvas)
+      # Publish to registry.moleculesai.app via the PARALLEL CHUNKED PUSHER,
+      # THROUGH the Cloudflare tunnel (SSOT: molecule-ai/operator-config
+      # bin/registry-parallel-push.py). Each blob uploads in <=90MB sequential
+      # contiguous chunks (adaptive across-blob concurrency + resume), so no
+      # PATCH exceeds the CF Free ~100MB cap. DOCUMENTED FALLBACK (kept, not
+      # deleted, until the chunked path is prod-proven): repo var
+      # PUBLISH_PUSH_MODE=localhost-bypass reverts to the pre-migration CF-BYPASS
+      # (push straight to the host's local Gitea OCI endpoint localhost:3200) —
+      # that path requires local-host placement, so using it also means
+      # overriding runs-on to a local docker-host runner.
+      - name: Publish canvas image to registry (chunked pusher through CF tunnel)
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-2
+          STAGING_SHA_TAG: ${{ steps.tags.outputs.staging_sha }}
+          SHA_TAG: sha-${{ steps.tags.outputs.sha }}
+          IMAGE_REPO: molecule-ai/canvas
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          AUTO_SYNC_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
+          PUSHER_REF: ${{ vars.OPERATOR_CONFIG_PUSHER_REF || 'main' }}
+          GITHUB_SERVER_URL: ${{ env.GITHUB_SERVER_URL }}
+          PUBLISH_PUSH_MODE: ${{ vars.PUBLISH_PUSH_MODE || 'chunked-tunnel' }}
+          LOCALHOST_PUSH_HOST: ${{ vars.LOCALHOST_PUSH_HOST || 'localhost:3200' }}
         run: |
           set -uo pipefail
-          # Strip the registry host; pass the bare molecule-ai/<repo> name.
-          REPO_NAME="${IMAGE_NAME#*/}"
-          bash scripts/ops/ensure-ecr-lifecycle.sh "${REPO_NAME}"
+          REG_HOST="${IMAGE_NAME%%/*}"
+          LOCAL_IMAGE="${IMAGE_NAME}:${STAGING_SHA_TAG}"
+          TAGS="${STAGING_SHA_TAG} staging-latest ${SHA_TAG}"
+          if [ -z "${REG_TOKEN:-}" ]; then
+            echo "::warning::MOLECULE_REGISTRY_TOKEN not set — skipping registry push (image built + loaded as ${LOCAL_IMAGE})."
+            exit 0
+          fi
+          echo "::add-mask::$REG_TOKEN"
+
+          # ---- DOCUMENTED CF-BYPASS FALLBACK (localhost:3200) ------------------
+          if [ "${PUBLISH_PUSH_MODE}" = "localhost-bypass" ]; then
+            echo "::notice::PUBLISH_PUSH_MODE=localhost-bypass — pushing via ${LOCALHOST_PUSH_HOST} (CF-bypass; requires local-host placement)."
+            if ! printf '%s' "$REG_TOKEN" | docker login "$LOCALHOST_PUSH_HOST" --username "$REG_USER" --password-stdin >/dev/null 2>&1; then
+              echo "::warning::docker login ${LOCALHOST_PUSH_HOST} failed — is this job on the local Gitea host? (non-fatal)"; exit 0
+            fi
+            for t in $TAGS; do
+              docker tag "$LOCAL_IMAGE" "${LOCALHOST_PUSH_HOST}/${IMAGE_REPO}:${t}"
+              docker push "${LOCALHOST_PUSH_HOST}/${IMAGE_REPO}:${t}" >/dev/null 2>&1 \
+                && echo "::notice::bypass-pushed ${IMAGE_REPO}:${t}" \
+                || echo "::warning::bypass push of ${t} failed (non-fatal)"
+            done
+            exit 0
+          fi
+
+          # ---- PRIMARY: parallel chunked pusher THROUGH the CF tunnel ----------
+          PUSHER="$RUNNER_TEMP/registry-parallel-push.py"
+          url="${GITHUB_SERVER_URL}/api/v1/repos/molecule-ai/operator-config/raw/bin/registry-parallel-push.py?ref=${PUSHER_REF}"
+          if ! curl -fsSL -H "Authorization: token ${AUTO_SYNC_TOKEN}" "$url" -o "$PUSHER"; then
+            echo "::warning::could not fetch the chunked pusher from operator-config@${PUSHER_REF} (needs operator-config PR #364 on that ref). Non-fatal; no registry push this run."
+            exit 0
+          fi
+          rc=0
+          for t in $TAGS; do
+            echo "::group::chunked push ${REG_HOST}/${IMAGE_REPO}:${t}"
+            if python3 "$PUSHER" --image "$LOCAL_IMAGE" --registry "$REG_HOST" \
+                 --repo "$IMAGE_REPO" --tag "$t" --user "$REG_USER"; then
+              echo "::notice::chunked-pushed ${REG_HOST}/${IMAGE_REPO}:${t}"
+            else
+              echo "::warning::chunked push of ${t} failed"; rc=1
+            fi
+            echo "::endgroup::"
+          done
+          [ "$rc" = 0 ] || echo "::warning::one or more chunked pushes failed — investigate before relying on the registry."
+          exit 0
 
   # bp-exempt: post-merge canvas promote side-effect; merge is gated by CI /
   # all-required and this job waits for green push CI on the SHA before acting.
@@ -386,20 +440,25 @@ jobs:
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           STAGING_SHA_TAG: ${{ needs.build-and-push.outputs.staging_sha }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-2
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
         run: |
           set -euo pipefail
           # Fail-safe: if the build job's output didn't propagate, recompute the
           # immutable per-commit tag from the SHA so we never promote a guess.
           SHA_TAG="${STAGING_SHA_TAG:-staging-${GITHUB_SHA::7}}"
-          ECR_REGISTRY="${IMAGE_NAME%%/*}"
-          aws ecr get-login-password --region us-east-2 | \
-            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          REG_HOST="${IMAGE_NAME%%/*}"
+          if [ -z "${REG_TOKEN:-}" ]; then
+            echo "::error::MOLECULE_REGISTRY_TOKEN required to re-point canvas :latest in the registry."
+            exit 1
+          fi
+          echo "::add-mask::$REG_TOKEN"
+          printf '%s' "$REG_TOKEN" | docker login "$REG_HOST" --username "$REG_USER" --password-stdin >/dev/null
 
-          # Digest-level re-tag (no pull/rebuild): :latest becomes byte-identical
-          # to the verified :staging-<sha> for this commit.
+          # Manifest-only re-tag (no pull/rebuild, no blob transfer — well under
+          # the CF 100MB request-body cap, so tunnel-safe without the chunked
+          # pusher): :latest becomes byte-identical to the CI-green :staging-<sha>
+          # that build-and-push chunked-pushed to registry.moleculesai.app.
           docker buildx imagetools create \
             --tag "${IMAGE_NAME}:latest" \
             "${IMAGE_NAME}:${SHA_TAG}"
