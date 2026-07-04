@@ -106,4 +106,41 @@ describe("useChatHistory — My Chat doubling regression", () => {
       "row-8:user",
     ]);
   });
+
+  it("collapses an optimistic bubble into its reconciled DB copy (BUG 2: no duplicate render)", async () => {
+    // The optimistic/live bubble (client-minted UUID id) and its reconciled DB
+    // copy ("<rowID>:user|agent") live in two id-spaces, so the id-keyed merge
+    // never collides them — before the fix BOTH rendered (a stable ×2). The
+    // reconcile must collapse the optimistic copy into the authoritative DB one.
+    apiGetMock.mockResolvedValue({ messages: [], reached_end: true });
+    const { result } = renderHook(() => useChatHistory("ws-opt"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    // Optimistic user + agent bubbles: client-minted ids with NO ":user"/":agent".
+    const optimistic: Msg[] = [
+      { id: "6f1c-uuid-user", role: "user", content: "hello", timestamp: "2026-06-27T00:10:00.000Z" },
+      { id: "9a2b-uuid-agent", role: "agent", content: "hi there", timestamp: "2026-06-27T00:10:01.000Z" },
+    ];
+    act(() => {
+      result.current.setMessages(optimistic as unknown as Parameters<typeof result.current.setMessages>[0]);
+    });
+    expect(result.current.messages).toHaveLength(2);
+
+    // Reconcile brings the persisted DB copies (server ids, same content, ~same time).
+    const dbWindow: Msg[] = [
+      { id: "row-9:user", role: "user", content: "hello", timestamp: "2026-06-27T00:10:00.500Z" },
+      { id: "row-9:agent", role: "agent", content: "hi there", timestamp: "2026-06-27T00:10:01.500Z" },
+    ];
+    apiGetMock.mockResolvedValue({ messages: dbWindow, reached_end: true });
+    await act(async () => {
+      await result.current.reconcile();
+    });
+
+    // Both optimistic bubbles collapsed into their DB copies → exactly 2, all DB ids.
+    expect(result.current.messages).toHaveLength(2);
+    expect(result.current.messages.map((m) => m.id).sort()).toEqual([
+      "row-9:agent",
+      "row-9:user",
+    ]);
+  });
 });
