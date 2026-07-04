@@ -677,6 +677,11 @@ func TestDelegationUpdateStatus_FailedBroadcastsFailureEvent(t *testing.T) {
 	mock.ExpectExec("UPDATE activity_logs").
 		WithArgs("failed", "boom", "550e8400-e29b-41d4-a716-446655440000", "del-xyz").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// MUST-FIX 4: the FAILED branch now emits a delegate_result row
+	// UNCONDITIONALLY (mirroring the COMPLETED branch) so the runtime
+	// harvester needs no status-flip workaround.
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	// DELEGATION_FAILED broadcast
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))

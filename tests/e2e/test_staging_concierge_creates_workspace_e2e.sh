@@ -518,6 +518,81 @@ ok "CANVAS WORKS: GET /requests/pending → 200 (not 404/502/SPA-HTML)"
 ok "═ STEP 2 PASS: tenant canvas/app + proxied API resolve (the controlplane#1012 break is gated)"
 obs_step_end canvas pass "" "routes=workspaces,org_identity,canvas_viewport,requests_pending"
 
+# ─── 2.5 COLD-OPEN (browser-mechanism) — the in-browser canvas slug-header path ─
+# STEP 2 above proves the proxied API resolves under the ADMIN header shape
+# (X-Molecule-Org-Id). It does NOT exercise what the REAL browser sends on a cold
+# open: the canvas derives the org slug from window.location.hostname and attaches
+# it as X-Molecule-Org-Slug on every authed fetch (canvas/src/lib/api.ts
+# platformAuthHeaders + canvas/src/lib/tenant.ts getTenantSlug). On staging's
+# 2-level host <slug>.staging.moleculesai.app the OLD suffix-strip derivation
+# produced "<slug>.staging" (it stripped the default .moleculesai.app suffix),
+# which the CP resolveOrgSlug honors verbatim over the trusted Host →
+# LookupOrgBySlug 404 → the operator's in-browser /workspaces 404 that the
+# admin-bearer STEP 2 never reproduces. This cold-open step replays the BROWSER's
+# exact header on a cold open of the fresh org and asserts:
+#   (a) the FIXED first-label slug ("<slug>") → GET /workspaces 200 + JSON array
+#       (the list a cold open must render) AND /workspaces/<id>/chat-history 200;
+#   (b) the OLD suffix-strip slug ("<slug>.staging", when the host is multi-label)
+#       → 404 — a REGRESSION LOCK so the 2-level-subdomain slug bug cannot return.
+# The tenant bearer + org-id are kept for cross-proxy-mode robustness (the CP
+# rejects a bad slug at resolveOrgSlug BEFORE the tenant is reached, so the slug
+# header is the load-bearing variable under test); Origin mirrors a same-origin
+# canvas XHR. Ref: canvas/src/lib/tenant.ts first-label derivation (core#2509
+# class) + controlplane router resolveOrgSlug.
+obs_step_start cold_open
+log "2.5/6 COLD-OPEN — replaying the browser's X-Molecule-Org-Slug on a cold open of the fresh org..."
+CO_HOST="${TENANT_URL#https://}"; CO_HOST="${CO_HOST%%/*}"
+CO_SLUG_FIRSTLABEL="${CO_HOST%%.*}"        # canvas getTenantSlug() FIXED: leftmost DNS label
+CO_SLUG_OLD="${CO_HOST%.moleculesai.app}"  # OLD suffix-strip of the default .moleculesai.app
+CO_BODY_TMP="$TMPDIR_E2E/cold_open_body"
+# cold_open_call <slug-header> <path> -> echoes the HTTP code; writes body to $CO_BODY_TMP.
+cold_open_call() {
+  local slughdr="$1" path="$2" code
+  set +e
+  code=$(curl -sS --max-time 25 -o "$CO_BODY_TMP" -w '%{http_code}' \
+    -H "Authorization: Bearer $TENANT_TOKEN" -H "X-Molecule-Org-Id: $ORG_ID" \
+    -H "X-Molecule-Org-Slug: $slughdr" -H "Origin: $TENANT_URL" \
+    "$TENANT_URL$path" 2>/dev/null)
+  set -e
+  printf '%s' "${code:-000}"
+}
+# (a) FIXED first-label slug: the cold-open /workspaces list MUST resolve to this
+#     org and return a real, NON-EMPTY JSON array (the concierge platform root the
+#     canvas renders on open). Poll until the concierge lands (installed at
+#     provision; STEP 3 gives it a longer settle) so step (c) has a workspace id.
+co_deadline=$(( $(date +%s) + 120 )); CO_WS_JSON=""; co_code=000; co_trim=""
+while :; do
+  co_code=$(cold_open_call "$CO_SLUG_FIRSTLABEL" /workspaces)
+  CO_WS_JSON=$(cat "$CO_BODY_TMP" 2>/dev/null || echo "")
+  co_trim=$(printf '%s' "$CO_WS_JSON" | tr -d '[:space:]')
+  { [ "$co_code" = "200" ] && [ "${co_trim:0:1}" = "[" ] && [ "$co_trim" != "[]" ]; } && break
+  [ "$(date +%s)" -gt "$co_deadline" ] && fail "COLD-OPEN: GET /workspaces with the canvas first-label slug '$CO_SLUG_FIRSTLABEL' never returned 200 + a NON-EMPTY JSON array within 120s (last http=$co_code body: $(printf '%s' "$CO_WS_JSON" | head -c 160)) — the fresh org's cold-open workspace list does not render"
+  sleep 6
+done
+ok "COLD-OPEN: GET /workspaces (browser slug '$CO_SLUG_FIRSTLABEL') → 200 + non-empty JSON array (list renders)"
+# (b) REGRESSION LOCK: on a multi-label host the OLD suffix-strip derivation differs
+#     from the first label; that buggy slug MUST 404 (the CP must not serve it),
+#     proving the 2-level-subdomain browser-slug bug (the operator's cold-open 404)
+#     stays dead. Skipped on a single-label host (no distinct bad derivation).
+if [ "$CO_SLUG_OLD" != "$CO_SLUG_FIRSTLABEL" ]; then
+  co_bad=$(cold_open_call "$CO_SLUG_OLD" /workspaces)
+  [ "$co_bad" = "404" ] || fail "COLD-OPEN regression-lock: GET /workspaces with the OLD suffix-strip slug '$CO_SLUG_OLD' returned HTTP $co_bad, expected 404. The 2-level-subdomain browser-slug bug (X-Molecule-Org-Slug: <slug>.staging → in-browser /workspaces 404) is NOT closed."
+  ok "COLD-OPEN regression-lock: OLD suffix-strip slug '$CO_SLUG_OLD' → 404 (2-level-subdomain browser-slug bug stays dead)"
+else
+  log "    (single-label host — no distinct suffix-strip derivation to regression-lock)"
+fi
+# (c) chat-history for the first listed workspace (the cold-open chat panel) → 200.
+CO_WID=$(printf '%s' "$CO_WS_JSON" | python3 -c "import json,sys
+try: a=json.load(sys.stdin)
+except Exception: a=[]
+print(a[0].get('id','') if isinstance(a,list) and a and isinstance(a[0],dict) else '')")
+[ -n "$CO_WID" ] || fail "COLD-OPEN: /workspaces returned an EMPTY list on cold open — no workspace to render (expected the concierge platform root at provision)"
+co_ch=$(cold_open_call "$CO_SLUG_FIRSTLABEL" "/workspaces/$CO_WID/chat-history")
+[ "$co_ch" = "200" ] || fail "COLD-OPEN: GET /workspaces/$CO_WID/chat-history with browser slug '$CO_SLUG_FIRSTLABEL' returned HTTP $co_ch, expected 200 — the cold-open chat panel would not load"
+ok "COLD-OPEN: GET /workspaces/$CO_WID/chat-history (browser slug) → 200"
+ok "═ STEP 2.5 PASS: cold-open browser-slug path resolves (the in-browser /workspaces 404 is gated; 2-level-subdomain regression locked)"
+obs_step_end cold_open pass "" "first_label_slug=$CO_SLUG_FIRSTLABEL old_slug=$CO_SLUG_OLD"
+
 # ─── 3. PLATFORM AGENT APPEARS — discover the concierge (kind='platform' root) ─
 obs_step_start concierge_online
 log "3/6 PLATFORM AGENT APPEARS — discovering the concierge (kind='platform' root)..."

@@ -106,7 +106,15 @@ def live_required_contexts():
         import json
         import urllib.request
         url = f"https://{GITEA_HOST}/api/v1/repos/{REPO}/branch_protections"
-        req = urllib.request.Request(url, headers={"Authorization": f"token {GITEA_TOKEN}"})
+        # CF WAF 1010-bans the default Python-urllib UA; send a non-urllib
+        # UA so this BP read reaches Gitea (transport-only).
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"token {GITEA_TOKEN}",
+                "User-Agent": "molecule-ci-gate/1.0 (+gitea-api)",
+            },
+        )
         with urllib.request.urlopen(req, timeout=20) as r:
             data = json.load(r)
         out = set()

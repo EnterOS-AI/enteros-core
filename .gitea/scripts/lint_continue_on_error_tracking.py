@@ -189,6 +189,9 @@ def fetch_issue(slug_kind: str, num: int) -> tuple[str, dict | None]:
         headers={
             "Authorization": f"token {token}",
             "Accept": "application/json",
+            # CF WAF 1010-bans the default Python-urllib UA; send a
+            # non-urllib UA so this reaches Gitea (transport-only).
+            "User-Agent": "molecule-ci-gate/1.0 (+gitea-api)",
         },
     )
     try:

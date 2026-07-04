@@ -10,8 +10,9 @@ name: E2E Workspace Lifecycle (staginge2e)
 # and asserts OBSERVABLE container state (status transitions + serve reachability
 # + url-cleared-on-stop) — not just HTTP 200.
 #
-# ADVISORY-BY-INFRA. It needs a live staging tenant (~30+ min cold EC2 path), so
-# the real run is workflow_dispatch / schedule only — NOT per-PR and NOT a
+# ADVISORY-BY-INFRA. It needs a live staging tenant (a cold molecules-server / local-docker
+# provision, was the ~30+ min cold EC2 path), so the real run is workflow_dispatch / schedule
+# only — NOT per-PR and NOT a
 # required check. Promotion to a required branch-protection context is a separate
 # CTO decision (mirrors the cp internal/staginge2e suite, cp#386, and the
 # peer-visibility flip-to-required pattern, molecule-core#1296).
@@ -25,15 +26,19 @@ name: E2E Workspace Lifecycle (staginge2e)
 # actions/checkout SHA), per-SHA concurrency, pinned GITHUB_SERVER_URL.
 
 on:
+  # group A: staging added alongside main so the compile+skip PR gate runs on both protected
+  # branches. The real lifecycle-staging job (below) provisions on molecules-server (local-docker)
+  # via E2E_PROVIDER and stays dispatch/schedule-only — a 30-60 min cold provision is not a
+  # per-PR cost (the cheap per-PR coverage is the compile+skip gate here + local-provision-e2e).
   push:
-    branches: [main]
+    branches: [main, staging]
     paths:
       - 'workspace-server/internal/handlers/workspace_restart.go'
       - 'workspace-server/internal/handlers/workspace_crud.go'
       - 'workspace-server/internal/staginge2e/**'
       - '.gitea/workflows/e2e-workspace-lifecycle.yml'
   pull_request:
-    branches: [main]
+    branches: [main, staging]
     paths:
       - 'workspace-server/internal/handlers/workspace_restart.go'
       - 'workspace-server/internal/handlers/workspace_crud.go'
@@ -87,7 +92,7 @@ jobs:
 
   # Real STAGING gate: provisions a throwaway tenant, drives the lifecycle
   # endpoints, asserts observable transitions, scoped teardown.
-  # dispatch / schedule only (30+ min cold EC2).
+  # dispatch / schedule only (cold molecules-server / local-docker provision).
   lifecycle-staging:
     name: E2E Workspace Lifecycle (staging)
     runs-on: ubuntu-latest
@@ -95,6 +100,10 @@ jobs:
     timeout-minutes: 60
     env:
       CP_BASE_URL: https://staging-api.moleculesai.app
+      # Compute backend: molecules-server (local-docker). adminCreateOrg in the staginge2e
+      # suite reads E2E_PROVIDER and pins it into the org-create body so the tenant does not
+      # fall back to the CP DefaultProvider (the closed AWS EC2 path).
+      E2E_PROVIDER: molecules-server
       # CP_ADMIN_API_TOKEN now arrives via $GITHUB_ENV from the "Fetch staging CP
       # admin token from Infisical KMS" step below (wave-B staging consumers
       # migration). It is sourced from Infisical CP_ADMIN_API_TOKEN at

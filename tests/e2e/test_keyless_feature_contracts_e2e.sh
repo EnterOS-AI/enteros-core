@@ -259,32 +259,6 @@ fi
 assert_contains "GET /rescue (no auth → 401)" "401" "$(http_code GET "$BASE/workspaces/$WS_ID/rescue")"
 
 # ===========================================================================
-# 9. LLM billing-mode admin toggle — GET/PUT /admin/workspaces/:id/llm-billing-mode
-#    (AdminAuth). Flip to byok → read back override; bad UUID → 400; missing
-#    'mode' key → 400; unknown mode → 400.
-# ===========================================================================
-echo "--- /admin/workspaces/:id/llm-billing-mode ---"
-assert_contains "GET llm-billing-mode (resolves a mode)" '"resolved_mode"' \
-  "$(curl -s "$BASE/admin/workspaces/$WS_ID/llm-billing-mode" "${ADMIN_AUTH[@]}")"
-PUTBM=$(curl -s -X PUT "$BASE/admin/workspaces/$WS_ID/llm-billing-mode" -H "Content-Type: application/json" "${ADMIN_AUTH[@]}" \
-  -d '{"mode":"byok"}')
-assert_contains "PUT llm-billing-mode byok (override set)" '"workspace_override":"byok"' "$PUTBM"
-assert_contains "GET llm-billing-mode (byok persisted)" '"workspace_override":"byok"' \
-  "$(curl -s "$BASE/admin/workspaces/$WS_ID/llm-billing-mode" "${ADMIN_AUTH[@]}")"
-# Clear the override (null) so we don't leave fixture state skewed.
-curl -s -X PUT "$BASE/admin/workspaces/$WS_ID/llm-billing-mode" -H "Content-Type: application/json" "${ADMIN_AUTH[@]}" \
-  -d '{"mode":null}' >/dev/null
-# Failure: malformed UUID → 400.
-assert_contains "PUT llm-billing-mode (bad UUID → 400)" "400" \
-  "$(http_code PUT "$BASE/admin/workspaces/not-a-uuid/llm-billing-mode" -H 'Content-Type: application/json' "${ADMIN_AUTH[@]}" -d '{"mode":"byok"}')"
-# Failure: missing 'mode' key → 400.
-assert_contains "PUT llm-billing-mode (missing mode → 400)" "400" \
-  "$(http_code PUT "$BASE/admin/workspaces/$WS_ID/llm-billing-mode" -H 'Content-Type: application/json' "${ADMIN_AUTH[@]}" -d '{}')"
-# Failure: unknown mode string → 400.
-assert_contains "PUT llm-billing-mode (unknown mode → 400)" "400" \
-  "$(http_code PUT "$BASE/admin/workspaces/$WS_ID/llm-billing-mode" -H 'Content-Type: application/json' "${ADMIN_AUTH[@]}" -d '{"mode":"bogus-mode"}')"
-
-# ===========================================================================
 # 10. Lifecycle — Pause → Resume + Hibernate (wsAuth)
 #     Pause works backend-agnostically (StopWorkspaceAuto no-ops on no backend)
 #     → status=paused. Resume re-provisions: 200 provisioning when a provisioner

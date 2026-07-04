@@ -1622,26 +1622,6 @@ func runtimeUsesAnthropicNativeProxy(runtime string) bool {
 	return strings.EqualFold(strings.TrimSpace(runtime), "claude-code")
 }
 
-// providerFromRegistry looks up a provider by name in the cached embedded
-// providers manifest. It returns the provider and true if found. Used by
-// applyPlatformManagedLLMEnv to project the adapter-specific auth env / base
-// URL (e.g. ANTHROPIC_AUTH_TOKEN for MiniMax on claude-code).
-func providerFromRegistry(name string) (providers.Provider, bool) {
-	if name == "" {
-		return providers.Provider{}, false
-	}
-	manifest, err := providerRegistry()
-	if err != nil || manifest == nil {
-		return providers.Provider{}, false
-	}
-	for _, p := range manifest.Providers {
-		if strings.EqualFold(p.Name, name) {
-			return p, true
-		}
-	}
-	return providers.Provider{}, false
-}
-
 func firstNonEmptyEnv(names ...string) string {
 	for _, name := range names {
 		if v := strings.TrimSpace(os.Getenv(name)); v != "" {

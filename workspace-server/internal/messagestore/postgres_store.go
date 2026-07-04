@@ -98,8 +98,9 @@ func (s *PostgresMessageStore) List(ctx context.Context, workspaceID string, opt
 			rawResponse sql.NullString
 			rawTrace    sql.NullString
 			durationMs  sql.NullInt64
+			rowID       sql.NullString
 		)
-		if err := rows.Scan(&createdAt, &status, &rawRequest, &rawResponse, &rawTrace, &durationMs); err != nil {
+		if err := rows.Scan(&createdAt, &status, &rawRequest, &rawResponse, &rawTrace, &durationMs, &rowID); err != nil {
 			// Skip malformed row, continue. The error is logged at
 			// the caller (handler) layer; an isolated bad row should
 			// not abort the whole page.
@@ -118,7 +119,7 @@ func (s *PostgresMessageStore) List(ctx context.Context, workspaceID string, opt
 			toolTrace = json.RawMessage(rawTrace.String)
 		}
 		before := len(messages)
-		messages = append(messages, activityRowToChatMessages(createdAt, status, requestBody, responseBody, toolTrace, IsInternalSelfMessage)...)
+		messages = append(messages, activityRowToChatMessages(rowID.String, createdAt, status, requestBody, responseBody, toolTrace, IsInternalSelfMessage)...)
 		// If the row produced an agent message with NO explicit tool_trace
 		// but ran long enough to have invoked tools, mark it for
 		// agent_log reconstruction. duration_ms bounds the window
@@ -327,8 +328,14 @@ func (s *PostgresMessageStore) queryActivityRows(ctx context.Context, workspaceI
 	}
 	args = append(args, opts.Limit)
 	limitPlaceholder := fmt.Sprintf("$%d", len(args))
+	// id::text (the activity_logs PK, migration 009 — unique per row and
+	// stable across requests) is SELECTed last so List can mint a
+	// DETERMINISTIC ChatMessage.ID per row. Without a stable per-row id
+	// the store stamped a fresh uuid on every fetch, so the canvas
+	// id-keyed reconcile never collided and re-appended the whole window
+	// each poll — the "My Chat" doubling bug. See deterministicMessageID.
 	query := fmt.Sprintf(`
-		SELECT created_at, status, request_body::text, response_body::text, tool_trace::text, duration_ms
+		SELECT created_at, status, request_body::text, response_body::text, tool_trace::text, duration_ms, id::text
 		FROM activity_logs
 		WHERE %s
 		ORDER BY created_at DESC
@@ -354,7 +361,14 @@ const errInvalidLimit sentinelError = "messagestore: List opts.Limit must be > 0
 //
 // Both bubbles MUST adopt row.created_at as their timestamp. This
 // pins the regression cover for the 2026-04-25 bubble-collapse bug.
+//
+// rowID is the activity_logs row's PK. Each emitted bubble's ID is
+// derived deterministically from it (see deterministicMessageID) so the
+// SAME row yields the SAME ChatMessage.ID on every /chat-history fetch —
+// the property the canvas id-keyed reconcile relies on to dedupe instead
+// of re-appending (the "My Chat" doubling bug).
 func activityRowToChatMessages(
+	rowID string,
 	createdAt time.Time,
 	status string,
 	requestBody json.RawMessage,
@@ -369,7 +383,7 @@ func activityRowToChatMessages(
 	userAttachments := extractFilesFromUserMessage(requestBody)
 	if !internalSelf(userText) && (userText != "" || len(userAttachments) > 0) {
 		out = append(out, ChatMessage{
-			ID:          newMessageID(),
+			ID:          deterministicMessageID(rowID, "user"),
 			Role:        "user",
 			Content:     userText,
 			Attachments: userAttachments,
@@ -386,7 +400,7 @@ func activityRowToChatMessages(
 				role = "system"
 			}
 			out = append(out, ChatMessage{
-				ID:          newMessageID(),
+				ID:          deterministicMessageID(rowID, "agent"),
 				Role:        role,
 				Content:     agentText,
 				Attachments: agentAttachments,
@@ -690,6 +704,27 @@ func bytesTrimSpace(b json.RawMessage) json.RawMessage {
 
 func newMessageID() string {
 	return uuid.New().String()
+}
+
+// deterministicMessageID derives a STABLE per-message id from the
+// activity_logs row id (rowID, the PK — unique per row) and the bubble
+// kind ("user" | "agent"), so repeated GET /chat-history fetches of the
+// same row return the SAME ChatMessage.ID. The canvas reconcile dedupes
+// by id (canvas useChatHistory.mergeReconciledMessages); a fresh random
+// id per fetch made every 10s poll re-append the whole window, doubling
+// "My Chat" (36→72→…). A single activity_logs row emits at most one user
+// bubble and one agent-side bubble, so a per-kind suffix keeps the two
+// ids distinct while stable across requests.
+//
+// Falls back to a random uuid ONLY when rowID is empty (never expected
+// for a real row — id is the PK): an empty rowID shared across rows would
+// otherwise collapse every bubble of that kind into one id, which is
+// worse than a non-stable id.
+func deterministicMessageID(rowID, kind string) string {
+	if rowID == "" {
+		return newMessageID()
+	}
+	return rowID + ":" + kind
 }
 
 // Compile-time assertion: PostgresMessageStore satisfies MessageStore.

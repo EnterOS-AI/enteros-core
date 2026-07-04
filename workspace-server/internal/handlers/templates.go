@@ -432,7 +432,12 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 	// workspaces). Net effect: the canvas Files tab always rendered "0
 	// files / No config files yet" for SaaS workspaces, regardless of
 	// what was actually on disk. See issue #2999.
-	if instanceID != "" {
+	//
+	// isEC2InstanceID gates this on a REAL EC2 id: a molecules-server
+	// (local-docker) workspace persists its container NAME in instance_id,
+	// which must route to the docker-exec path below, not the AWS-only EIC
+	// tunnel. See files_backend_dispatch.go.
+	if isEC2InstanceID(instanceID) {
 		entries, err := listFilesViaEIC(ctx, instanceID, runtime, rootPath, subPath, depth)
 		if err != nil {
 			log.Printf("ListFiles EIC for %s root=%s sub=%s: %v", workspaceID, rootPath, subPath, err)
@@ -584,7 +589,12 @@ func (h *TemplatesHandler) ReadFile(c *gin.Context) {
 	// hermes → /home/ubuntu/.hermes); other allow-listed roots
 	// (`/home`, `/workspace`, `/plugins`) pass through literally so
 	// list/read/write/delete agree on what file a tree row points to.
-	if instanceID != "" {
+	//
+	// isEC2InstanceID gates this on a REAL EC2 id: a molecules-server
+	// (local-docker) workspace persists its container NAME in instance_id,
+	// which must route to the docker-exec path below, not the AWS-only EIC
+	// tunnel. See files_backend_dispatch.go.
+	if isEC2InstanceID(instanceID) {
 		content, err := readFileViaEIC(ctx, instanceID, runtime, rootPath, filePath)
 		if err == nil {
 			c.JSON(http.StatusOK, gin.H{
@@ -691,7 +701,12 @@ func (h *TemplatesHandler) WriteFile(c *gin.Context) {
 	// `?root=` flows through the same per-runtime / literal indirection
 	// as ReadFile so list/read/write/delete agree on what file a tree
 	// row points to.
-	if instanceID != "" {
+	//
+	// isEC2InstanceID gates this on a REAL EC2 id: a molecules-server
+	// (local-docker) workspace persists its container NAME in instance_id,
+	// which must route to the docker-exec path below, not the AWS-only EIC
+	// tunnel. See files_backend_dispatch.go.
+	if isEC2InstanceID(instanceID) {
 		if err := writeFileViaEIC(ctx, instanceID, runtime, rootPath, filePath, []byte(body.Content)); err != nil {
 			log.Printf("WriteFile EIC for %s path=%s: %v", workspaceID, filePath, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to write file: %v", err)})
@@ -790,7 +805,12 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 	// dispatch. Pre-fix this branch was missing — DeleteFile fell through
 	// to local-Docker (no container) + ephemeral-volume (no Docker) and
 	// silently 500'd. See issue #2999.
-	if instanceID != "" {
+	//
+	// isEC2InstanceID gates this on a REAL EC2 id: a molecules-server
+	// (local-docker) workspace persists its container NAME in instance_id,
+	// which must route to the docker-exec path below, not the AWS-only EIC
+	// tunnel. See files_backend_dispatch.go.
+	if isEC2InstanceID(instanceID) {
 		if err := deleteFileViaEIC(ctx, instanceID, runtime, rootPath, filePath); err != nil {
 			log.Printf("DeleteFile EIC for %s root=%s path=%s: %v", workspaceID, rootPath, filePath, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to delete file: %v", err)})

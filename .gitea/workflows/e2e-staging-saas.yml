@@ -1,4 +1,6 @@
-# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
+# RE-ENABLED 2026-07-03: the full-journey canvas gate runs on MOLECULES-SERVER
+# (local-docker, provider='local'); EC2-only jobs stay dormant behind
+# vars.E2E_EC2_ENABLED until a cloud backend returns. (Was DISABLED 2026-06-27.)
 name: E2E Staging SaaS (full lifecycle)
 
 # Ported from .github/workflows/e2e-staging-saas.yml on 2026-05-11 per RFC
@@ -47,7 +49,15 @@ name: E2E Staging SaaS (full lifecycle)
 # the pull_request-trigger removal in PRs #516/#530.
 
 on:
-  # DISABLED 2026-06-27: push/pull_request auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+  # RE-ENABLED 2026-07-03 on MOLECULES-SERVER: push/pull_request restored. The
+  # full-journey canvas gate (`E2E Staging Concierge Creates Workspace`) no longer
+  # provisions EC2 — staging tenants run on the molecules-server (local-docker,
+  # provider='local') backend the CP now defaults to (no-AWS directive), so that
+  # job needs no AWS creds and no EC2 leak-check. The remaining EC2-only jobs
+  # (platform-boot, concierge-user-tasks, workspace-requests, concierge-platform,
+  # plugin-lifecycle) stay DORMANT behind the `E2E_EC2_ENABLED` repo var (unset →
+  # skip) until a cloud EC2 backend is wired again — re-enable by setting
+  # vars.E2E_EC2_ENABLED='1'. (Was DISABLED 2026-06-27 when the AWS account closed.)
   # The schedule/cron trigger was DELETED (no-nightly-e2e rule) — not commented.
   # Trunk-based (Phase 3 of internal#81): main is the only branch.
   #
@@ -63,10 +73,10 @@ on:
   # Per-job gating is moved to the job level (`if:` guards below) so the
   # slow provisioning jobs (e2e-staging-saas, e2e-staging-platform-boot)
   # still skip on docs-only PRs, but the workflow ITSELF is unconditional.
-#   push:
-#     branches: [main]
-#   pull_request:
-#     branches: [main]
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 # Serialize: staging has a finite per-hour org creation quota. Two pushes
@@ -85,6 +95,7 @@ jobs:
   # workflow-only PRs. The actual E2E step only runs when provisioning-
   # critical files change (git-paths filter + if: guard below).
   # All steps use continue-on-error: true so runner issues do not block merge.
+  # bp-exempt: informational PR-shape validation job; not a required gate.
   pr-validate:
     runs-on: ubuntu-latest
     steps:
@@ -111,6 +122,7 @@ jobs:
   # paths. pr-validate remains as the lightweight workflow-shape check for PRs,
   # but it is not a substitute for live staging proof when this workflow or the
   # staging harness changes.
+  # bp-exempt: EC2-only full-lifecycle lane, dormant behind vars.E2E_EC2_ENABLED; not a required gate.
   e2e-staging-saas:
     name: E2E Staging SaaS
     runs-on: ubuntu-latest
@@ -119,7 +131,10 @@ jobs:
     # compliance — see the on: block comment). The pre-#3081 behaviour of firing
     # on path-matched PRs was an optimization; with the lint's no-paths rule in
     # force, the equivalent optimization moves to the job's `if:` guard.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
+    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
+    # the molecules-server canvas gate does not fire these AWS-dead jobs.
+    if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
@@ -326,12 +341,10 @@ jobs:
 
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
-            exit 1
-          fi
-          echo "Staging CP healthy ✓"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$MOLECULE_CP_URL" "workspace"
 
       # core#2675: completion-gated lanes must distinguish "staging LLM proxy
       # down" from "real code bug" with a distinct, machine-readable status
@@ -442,8 +455,9 @@ jobs:
   #   - Token and zone id come from repository secrets ONLY; never hardcoded.
   #   - --min-age-hours is conservative (2h) so in-flight records from a long
   #     E2E run or a recently-started dispatch are never touched.
-  # bp-required: pending — non-required / best-effort cleanup job.
-  # mc#3147 = decision issue; mc#3173 = current governance tracker.
+  # (non-required / best-effort cleanup job. mc#3147 = decision issue;
+  #  mc#3173 = current governance tracker.)
+  # bp-exempt: best-effort DNS cleanup (runs on always()); not a required gate.
   prune-stale-e2e-dns:
     name: Prune stale e2e DNS records
     runs-on: ubuntu-latest
@@ -593,7 +607,8 @@ jobs:
   # pre-merge. This job now exercises a real platform-managed boot on every
   # push-to-main and is the merge gate.
   #
-  # bp-required: now required — added to .gitea/required-contexts.txt by #48
+  # (formerly bp-required; now EC2-dormant behind vars.E2E_EC2_ENABLED — the
+  # authoritative directive is the bp-exempt line directly above the job key.)
   #
   # core#3081 / #48: NO `if:` guard on this job (mirrors
   # e2e-staging-concierge-creates-workspace). The job IS a required status
@@ -605,9 +620,14 @@ jobs:
   # case and exit 0s after a bash -n self-check), and on push/dispatch/cron
   # with E2E_REQUIRE_LIVE=1 (the real staging boot runs and HARD FAILs on
   # missing infra).
+  # bp-exempt: EC2-only, dormant behind vars.E2E_EC2_ENABLED (no cloud backend); not a required gate until re-enabled.
   e2e-staging-platform-boot:
     name: E2E Staging Platform Boot
     runs-on: ubuntu-latest
+    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
+    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
+    # the molecules-server canvas gate does not fire this AWS-dead job.
+    if: vars.E2E_EC2_ENABLED == '1'
     timeout-minutes: 45
     permissions:
       contents: read
@@ -807,12 +827,10 @@ jobs:
 
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
-            exit 1
-          fi
-          echo "Staging CP healthy ✓"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$MOLECULE_CP_URL" "workspace"
 
       - name: Run platform-managed boot E2E (online + completion)
         id: e2e
@@ -888,7 +906,10 @@ jobs:
   e2e-staging-concierge-user-tasks:
     name: E2E Staging Concierge user_tasks
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
+    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
+    # the molecules-server canvas gate does not fire these AWS-dead jobs.
+    if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     timeout-minutes: 30
     permissions:
       contents: read
@@ -967,12 +988,10 @@ jobs:
 
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
-            exit 1
-          fi
-          echo "Staging CP healthy ✓"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$MOLECULE_CP_URL" "workspace"
 
       - name: Run concierge user_tasks E2E
         run: bash tests/e2e/test_staging_concierge_e2e.sh
@@ -1041,7 +1060,10 @@ jobs:
   e2e-staging-workspace-requests:
     name: E2E Staging Workspace Requests (core#2606)
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
+    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
+    # the molecules-server canvas gate does not fire these AWS-dead jobs.
+    if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     timeout-minutes: 35
     permissions:
       contents: read
@@ -1106,12 +1128,10 @@ jobs:
           echo "Admin token present"
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a workspace-requests bug."
-            exit 1
-          fi
-          echo "Staging CP healthy"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$CP_BASE_URL" "workspace-requests"
       - name: Run workspace-requests staginge2e (core#2606)
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceCanRaiseTaskAndApprovalToUser -count=1 -v -timeout 30m
@@ -1136,8 +1156,9 @@ jobs:
   # a silently-missing platform-agent image can NEVER false-green this gate. Runs
   # on push-to-main / workflow_dispatch / cron only (needs live staging infra +
   # a model — never on PR, where pr-validate posts the workflow's PR status).
-  # bp-required: now required — added to .gitea/required-contexts.txt by core#3081
-  # (core#3081 also adds the A2A-probe step in the test script: it reads the
+  # (enforcement sequenced on molecules-server — the authoritative directive is
+  # the `bp-required: pending #3411` line directly above the job key; core#3081
+  # also adds the A2A-probe step in the test script: it reads the
   # concierge's /configs/mcp_servers.yaml via GET /workspaces/:id/files/mcp_servers.yaml
   # and asserts the molecule-platform MCP server is declared with create_workspace.
   # The previous false-green slipped because the proxies were healthy, the
@@ -1156,6 +1177,9 @@ jobs:
   # detects the missing-creds case and exit 0s with a self-check), 1 on
   # push-to-main / dispatch / cron (the real staging test runs and HARD
   # FAILs on missing infra).
+  # bp-required: pending #3411 (molecules-server enforcement sequenced — kept below
+  # the ENFORCED marker in .gitea/required-contexts.txt until a green main run +
+  # creds-less PR/fork path, then BP-PATCH + promote).
   e2e-staging-concierge-creates-workspace:
     name: E2E Staging Concierge Creates Workspace
     runs-on: ubuntu-latest
@@ -1177,11 +1201,13 @@ jobs:
       # path (validate-before-delete). On untrusted-fork PRs the KMS fetch is
       # skipped and MOLECULE_ADMIN_TOKEN stays empty (verify exits 2, same as
       # today); same-repo PRs and push/dispatch/cron source it from Infisical.
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-east-2
-      E2E_AWS_LEAK_CHECK: required
-      E2E_AWS_TERMINATE_LEAKS: '1'
+      # MOLECULES-SERVER (local-docker, provider='local'): the CP provisions the
+      # staging tenant as a local-docker container on the molecules-server host, NOT
+      # an EC2 VM — so this gate needs NO AWS creds and there is NO EC2 to leak.
+      # E2E_AWS_LEAK_CHECK=off makes tests/e2e/lib/aws_leak_check.sh a clean no-op
+      # (the org-level zero-leftover teardown assertion still runs). Re-add the AWS
+      # env + set E2E_AWS_LEAK_CHECK=required only if a cloud EC2 backend returns.
+      E2E_AWS_LEAK_CHECK: 'off'
       # The concierge is platform_managed on SaaS (the CP-exported LLM proxy
       # supplies its model — no BYOK key needed for the concierge itself). The
       # MiniMax key is wired anyway so a staging image that boots the concierge
@@ -1272,28 +1298,24 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "Staging secrets loaded from Infisical (admin_len=${#MOLECULE_ADMIN_TOKEN}, minimax_len=${#E2E_MINIMAX_API_KEY})"
 
-      - name: Verify admin token + AWS creds present
+      - name: Verify admin token present
         run: |
+          # MOLECULES-SERVER: only the CP admin bearer is required (drives provision
+          # + tenant-token + teardown). No AWS creds — the tenant is a local-docker
+          # container on the molecules-server host, not an EC2 VM, so there is no
+          # EC2 leak verification to run.
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN empty (Infisical staging CP_ADMIN_API_TOKEN @ /shared/controlplane-admin)"
             exit 2
           fi
-          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
-            if [ -z "${!var:-}" ]; then
-              echo "::error::$var not set — EC2 leak verification cannot run"
-              exit 2
-            fi
-          done
-          echo "Admin token + AWS creds present ✓"
+          echo "Admin token present ✓ (molecules-server: no AWS creds needed)"
 
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$MOLECULE_CP_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (got HTTP $code). Skipping — not a workspace bug."
-            exit 1
-          fi
-          echo "Staging CP healthy ✓"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$MOLECULE_CP_URL" "workspace"
 
       # core#3081: the A2A-probe (asserting the live concierge's tool list
       # actually contains mcp__molecule-platform__create_workspace, not just
@@ -1415,7 +1437,10 @@ jobs:
   e2e-staging-concierge-platform:
     name: E2E Staging Concierge Platform Agent
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
+    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
+    # the molecules-server canvas gate does not fire these AWS-dead jobs.
+    if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     timeout-minutes: 40
     permissions:
       contents: read
@@ -1486,12 +1511,10 @@ jobs:
           echo "Admin token present"
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a concierge bug."
-            exit 1
-          fi
-          echo "Staging CP healthy"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$CP_BASE_URL" "concierge"
       - name: Run concierge/platform-agent staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestConciergePlatformAgent_Staging -count=1 -v -timeout 35m
@@ -1521,7 +1544,10 @@ jobs:
   e2e-staging-plugin-lifecycle:
     name: E2E Staging Plugin Install Lifecycle
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
+    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
+    # the molecules-server canvas gate does not fire these AWS-dead jobs.
+    if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     timeout-minutes: 45
     permissions:
       contents: read
@@ -1589,12 +1615,10 @@ jobs:
           echo "Admin token present"
       - name: CP staging health preflight
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a plugin-lifecycle bug."
-            exit 1
-          fi
-          echo "Staging CP healthy"
+          # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
+          # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
+          source tests/e2e/lib/cp_health_preflight.sh
+          cp_health_preflight "$CP_BASE_URL" "plugin-lifecycle"
       - name: Run plugin-install-lifecycle staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 40m

@@ -13,6 +13,11 @@
 // recognized as a tenant subdomain. Defaults to `.moleculesai.app` but
 // is overridable via NEXT_PUBLIC_SAAS_HOST_SUFFIX for multi-brand or
 // staging environments.
+//
+// NOTE: this is ONLY the "is this a tenant host?" gate — it is NOT used to
+// EXTRACT the slug. The org slug is the leftmost DNS label (see
+// getTenantSlug), which is correct regardless of how many labels the base has
+// (prod `<slug>.moleculesai.app` OR staging `<slug>.staging.moleculesai.app`).
 export const SaaSHostSuffix =
   process.env.NEXT_PUBLIC_SAAS_HOST_SUFFIX ?? ".moleculesai.app";
 
@@ -50,7 +55,17 @@ export function getTenantSlug(): string {
   if (!host.endsWith(SaaSHostSuffix)) {
     return process.env.NEXT_PUBLIC_DEFAULT_ORG_SLUG ?? "";
   }
-  const slug = host.slice(0, host.length - SaaSHostSuffix.length);
+  // The tenant slug is the FIRST (leftmost) DNS label — NOT a suffix-strip of
+  // SaaSHostSuffix. Suffix-stripping breaks on any multi-label base: on staging
+  // the tenant host is `<slug>.staging.moleculesai.app` while SaaSHostSuffix
+  // defaults to `.moleculesai.app` (the override was wired into nothing), so the
+  // old `host.slice(0, len - suffixLen)` yielded `<slug>.staging` — a nonexistent
+  // slug the canvas then sent as `X-Molecule-Org-Slug: <slug>.staging`, which the
+  // control plane resolves verbatim and 404s (the in-browser /workspaces 404).
+  // The org label is always the leftmost label regardless of base depth, so the
+  // first-label derivation is correct on prod AND staging with no per-env var.
+  // Mirrors the /orgs "Open" link first-label fix (core#2509).
+  const slug = host.split(".")[0];
   if (reservedSubdomains.has(slug)) return "";
   return slug;
 }

@@ -409,7 +409,13 @@ func envOr(k, def string) string {
 // its instance to reach running (provisioning is async).
 func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"slug":%q,"name":%q,"owner_user_id":%q}`, slug, "E2E Workspace Lifecycle", "e2e-runner:"+slug)
+	// Compute backend for the throwaway tenant. Defaults to molecules-server (the local-docker
+	// backend) now that the AWS EC2 path is closed. The canonical cloudprovider SSOT wire id
+	// the CP org-create validates (IsValidRequest) and persists as organizations.provider
+	// "local" (PersistKey); an empty provider would fall back to the CP DefaultProvider (the
+	// closed AWS path). The e2e workflows export E2E_PROVIDER; envOr pins the local default.
+	provider := envOr("E2E_PROVIDER", "molecules-server")
+	body := fmt.Sprintf(`{"slug":%q,"name":%q,"owner_user_id":%q,"provider":%q}`, slug, "E2E Workspace Lifecycle", "e2e-runner:"+slug, provider)
 	status, resp := doJSON(t, "POST", cfg.cpBase+"/cp/admin/orgs", cfg.adminToken, body)
 	if status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("AdminCreate org: HTTP %d: %s", status, resp)

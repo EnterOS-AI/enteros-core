@@ -139,8 +139,16 @@ func setupTestRedis(t *testing.T) *miniredis.Miniredis {
 	if err != nil {
 		t.Fatalf("failed to start miniredis: %v", err)
 	}
-	db.RDB = redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { mr.Close() })
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	db.RDB = client
+	// Close the redis client on cleanup. go-redis v9.19 enables maintenance
+	// notifications by default (MaintNotificationsConfig.Mode == auto), which
+	// starts a per-client circuit-breaker cleanupLoop goroutine. Without an
+	// explicit Close() the client — and its cleanupLoop — leaks for the life of
+	// the test binary; across the whole handlers package that piled up dozens of
+	// live goroutines that showed up in the -race timeout goroutine dump. Close()
+	// shuts the maintnotifications manager down (Shutdown → close(cleanupStop)).
+	t.Cleanup(func() { _ = client.Close(); mr.Close() })
 	return mr
 }
 
@@ -767,15 +775,15 @@ func TestActivityHandler_List(t *testing.T) {
 
 	columns := []string{
 		"id", "workspace_id", "activity_type", "source_id", "target_id", "method",
-		"summary", "request_body", "response_body", "tool_trace", "duration_ms", "status", "error_detail", "created_at",
+		"summary", "request_body", "response_body", "tool_trace", "duration_ms", "status", "error_detail", "created_at", "seq",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("act-1", "ws-1", "a2a_receive", nil, "ws-1", "message/send",
 			"message/send → ws-1", []byte(`{"method":"message/send"}`), []byte(`{"result":"ok"}`),
-			nil, 150, "ok", nil, time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC)).
+			nil, 150, "ok", nil, time.Date(2026, 4, 5, 10, 0, 0, 0, time.UTC), int64(2)).
 		AddRow("act-2", "ws-1", "error", nil, nil, nil,
 			"connection failed", nil, nil,
-			nil, nil, "error", "timeout after 120s", time.Date(2026, 4, 5, 9, 0, 0, 0, time.UTC))
+			nil, nil, "error", "timeout after 120s", time.Date(2026, 4, 5, 9, 0, 0, 0, time.UTC), int64(1))
 
 	mock.ExpectQuery("SELECT id, workspace_id, activity_type").
 		WithArgs("ws-1", 100).
@@ -819,12 +827,12 @@ func TestActivityHandler_ListByType(t *testing.T) {
 
 	columns := []string{
 		"id", "workspace_id", "activity_type", "source_id", "target_id", "method",
-		"summary", "request_body", "response_body", "tool_trace", "duration_ms", "status", "error_detail", "created_at",
+		"summary", "request_body", "response_body", "tool_trace", "duration_ms", "status", "error_detail", "created_at", "seq",
 	}
 	rows := sqlmock.NewRows(columns).
 		AddRow("act-1", "ws-1", "error", nil, nil, nil,
 			"connection failed", nil, nil,
-			nil, nil, "error", "timeout", time.Date(2026, 4, 5, 9, 0, 0, 0, time.UTC))
+			nil, nil, "error", "timeout", time.Date(2026, 4, 5, 9, 0, 0, 0, time.UTC), int64(1))
 
 	mock.ExpectQuery("SELECT id, workspace_id, activity_type").
 		WithArgs("ws-1", "error", 100).
@@ -1115,7 +1123,7 @@ func TestActivityHandler_ListEmpty(t *testing.T) {
 
 	columns := []string{
 		"id", "workspace_id", "activity_type", "source_id", "target_id", "method",
-		"summary", "request_body", "response_body", "tool_trace", "duration_ms", "status", "error_detail", "created_at",
+		"summary", "request_body", "response_body", "tool_trace", "duration_ms", "status", "error_detail", "created_at", "seq",
 	}
 	mock.ExpectQuery("SELECT id, workspace_id, activity_type").
 		WithArgs("ws-empty", 100).
@@ -1149,7 +1157,7 @@ func TestActivityHandler_ListCustomLimit(t *testing.T) {
 
 	columns := []string{
 		"id", "workspace_id", "activity_type", "source_id", "target_id", "method",
-		"summary", "request_body", "response_body", "tool_trace", "duration_ms", "status", "error_detail", "created_at",
+		"summary", "request_body", "response_body", "tool_trace", "duration_ms", "status", "error_detail", "created_at", "seq",
 	}
 	mock.ExpectQuery("SELECT id, workspace_id, activity_type").
 		WithArgs("ws-1", 10).

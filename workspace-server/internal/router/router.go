@@ -500,6 +500,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.GET("/activity", acth.List)
 		wsAuth.GET("/session-search", acth.SessionSearch)
 		wsAuth.POST("/activity", acth.Report)
+		// MUST-FIX 3: durable inbox delivery ack. The runtime inbox poller
+		// POSTs the highest seq it has drained; the cursor gates retention.
+		wsAuth.POST("/activity/ack", acth.Ack)
 		wsAuth.POST("/notify", acth.Notify)
 
 		// Push token registration (mobile)

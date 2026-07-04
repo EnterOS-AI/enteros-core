@@ -635,7 +635,7 @@ func TestPluginInstall_LocalSourceReachesContainerLookup(t *testing.T) {
 	base := t.TempDir()
 	pluginDir := filepath.Join(base, "demo")
 	_ = os.MkdirAll(pluginDir, 0o755)
-	_ = os.WriteFile(filepath.Join(pluginDir, "plugin.yaml"), []byte("name: demo\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(pluginDir, "plugin.yaml"), []byte("name: demo\nversion: 1.0.0\ndescription: demo plugin\n"), 0o644)
 	h := NewPluginsHandler(base, nil, nil)
 
 	w := httptest.NewRecorder()
@@ -858,7 +858,7 @@ func TestResolveAndStage_HappyPath_Local(t *testing.T) {
 	base := t.TempDir()
 	pluginDir := filepath.Join(base, "demo")
 	_ = os.MkdirAll(pluginDir, 0o755)
-	_ = os.WriteFile(filepath.Join(pluginDir, "plugin.yaml"), []byte("name: demo\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(pluginDir, "plugin.yaml"), []byte("name: demo\nversion: 1.0.0\ndescription: demo plugin\n"), 0o644)
 	h := NewPluginsHandler(base, nil, nil)
 
 	res, err := h.resolveAndStage(context.Background(), installRequest{Source: "local://demo"})
@@ -1121,7 +1121,7 @@ func TestPluginDownload_LegacyWorkspaceStreamsTarball(t *testing.T) {
 	if err := os.MkdirAll(pluginRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(pluginRoot, "plugin.yaml"), []byte("name: hello-plugin\nversion: 1.0.0\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(pluginRoot, "plugin.yaml"), []byte("name: hello-plugin\nversion: 1.0.0\ndescription: hello plugin\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(pluginRoot, "rules.md"), []byte("some rules\n"), 0o644); err != nil {
@@ -1250,7 +1250,7 @@ func TestPluginDownload_GithubSchemeStreamsTarball(t *testing.T) {
 		scheme: "github",
 		fetchFn: func(_ context.Context, _ string, dst string) (string, error) {
 			files := map[string]string{
-				"plugin.yaml":             "name: remote-plugin\nversion: 1.0.0\n",
+				"plugin.yaml":             "name: remote-plugin\nversion: 1.0.0\ndescription: remote plugin\n",
 				"skills/x/SKILL.md":       "---\nname: x\n---\n",
 				"adapters/claude_code.py": "from plugins_registry.builtins import AgentskillsAdaptor as Adaptor\n",
 			}

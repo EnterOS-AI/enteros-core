@@ -282,7 +282,7 @@ Practical consequences:
 
 Recommended workflow:
 
-1. **Run E2E in CI**, not in-container. The Gitea Actions self-hosted runner (and the GitHub Actions runner used by mirror repos) has the full Playwright dep set installed and is the supported surface for E2E. Push a branch, let CI run the suite.
+1. **Run E2E in CI**, not in-container. The Gitea Actions self-hosted runner has the full Playwright dep set installed and is the supported surface for E2E. Push a branch, let CI run the suite.
 2. **Local debugging** of a single failing spec is best done on a developer laptop with `npx playwright install-deps` run once.
 3. **In-container iteration** on test logic itself is fine — write specs, lint them, type-check them — just don't expect `playwright test` to actually launch a browser.
 

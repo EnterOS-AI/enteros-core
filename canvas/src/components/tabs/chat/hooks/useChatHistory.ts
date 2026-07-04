@@ -60,9 +60,37 @@ async function loadMessagesFromDB(
  *  missed by the WebSocket path therefore appear in the correct order
  *  without discarding older history the user has already lazy-loaded.
  *
- *  The map-key fallback for messages without an id is a stable tuple of
- *  timestamp+role+content; this path is defensive — chat-history rows
- *  today always carry an id. */
+ *  Why key on `id`, not the (timestamp+role+content) tuple: this
+ *  reconcile re-fetches the same chat-history window every 10s and on
+ *  every WS reconnect. The "My Chat" doubling bug (36→72→…) was caused by
+ *  a backend that minted a FRESH id per row per fetch, so an id-keyed
+ *  merge never collided and re-appended the whole window. That is fixed
+ *  at the source: the store now returns a STABLE per-row id (activity_logs
+ *  PK + bubble kind), so the same logical message keeps the same id across
+ *  fetches and the merge dedupes correctly. Keying on `id` — not the
+ *  tuple — is the SSOT for identity here: two DISTINCT rows that happen to
+ *  share created_at, role and content (e.g. repeated "ok"/"thanks") have
+ *  different ids and must BOTH survive; a tuple key would silently drop
+ *  one. The tuple is retained only as a defensive fallback for a message
+ *  that somehow arrives without an id (never expected for a persisted
+ *  row). */
+/** A reconciled DB bubble id has the shape "<activity_logs rowID>:user|agent"
+ *  (see deterministicMessageID in workspace-server messagestore). Optimistic /
+ *  live bubbles instead carry a client-minted id (the user's client messageId or
+ *  a fresh createMessage UUID) with NO ":user"/":agent" suffix. This predicate
+ *  distinguishes the authoritative persisted copy from the optimistic one. */
+const RECONCILED_ID_RE = /:(?:user|agent)$/;
+function isReconciledDbId(id: string | undefined): boolean {
+  return !!id && RECONCILED_ID_RE.test(id);
+}
+
+// Max clock-skew window (ms) for matching an optimistic bubble to its persisted
+// DB copy by (role, content). Optimistic bubbles are short-lived (replaced by
+// their own DB row on the next ≤10s reconcile), so a generous window is safe and
+// only ever collapses an optimistic entry against a server entry — never two
+// server entries.
+const OPTIMISTIC_COLLAPSE_WINDOW_MS = 60_000;
+
 function mergeReconciledMessages(
   existing: ChatMessage[],
   fetched: ChatMessage[],
@@ -71,7 +99,34 @@ function mergeReconciledMessages(
   const map = new Map<string, ChatMessage>();
   for (const m of existing) map.set(keyOf(m), m);
   for (const m of fetched) map.set(keyOf(m), m);
-  const merged = Array.from(map.values()).sort(
+  let merged = Array.from(map.values());
+
+  // BUG 2 (duplicate render): the optimistic/live bubble and its reconciled DB
+  // copy live in two DIFFERENT id-spaces — client UUID vs "<rowID>:user|agent" —
+  // so the id-keyed merge above never collides them and BOTH render → every
+  // message appeared twice after the first reconcile (a stable ×2, distinct from
+  // the older ×36→×72 reconcile-vs-reconcile doubling). Collapse each OPTIMISTIC
+  // entry into its authoritative DB copy: drop an optimistic (non-reconciled-id)
+  // bubble when a reconciled DB bubble of the same role+content exists within the
+  // clock-skew window. This NEVER drops a reconciled DB bubble, so two DISTINCT
+  // DB rows that share role+content (e.g. two "ok" rows) both survive — the
+  // doubling-test invariant.
+  const dbEntries = merged.filter((m) => isReconciledDbId(m.id));
+  if (dbEntries.length > 0) {
+    merged = merged.filter((m) => {
+      if (isReconciledDbId(m.id)) return true; // authoritative copy: always keep
+      const t = new Date(m.timestamp).getTime();
+      const hasDbCopy = dbEntries.some(
+        (db) =>
+          db.role === m.role &&
+          db.content === m.content &&
+          Math.abs(new Date(db.timestamp).getTime() - t) <= OPTIMISTIC_COLLAPSE_WINDOW_MS,
+      );
+      return !hasDbCopy; // optimistic entry whose DB copy has arrived → drop it
+    });
+  }
+
+  merged.sort(
     (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
   );
   return merged.slice(-MAX_MESSAGES);
