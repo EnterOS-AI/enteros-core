@@ -6,7 +6,7 @@
 // tarballs, etc.) can be added without touching install handlers.
 //
 // The on-disk SHAPE of a plugin (agentskills.io format, MCP server,
-// DeepAgents sub-agent, custom) is a separate concern handled by the
+// sub-agent, custom) is a separate concern handled by the
 // per-runtime adapter layer inside the workspace — see
 // workspace-template/plugins_registry.
 package plugins

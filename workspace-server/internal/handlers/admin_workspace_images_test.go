@@ -253,8 +253,8 @@ func TestTemplateImageRef(t *testing.T) {
 		{
 			name:        "self-hosted Gitea registry",
 			registryEnv: "git.moleculesai.app/molecule-ai",
-			runtime:     "gemini-cli",
-			want:        "git.moleculesai.app/molecule-ai/workspace-template-gemini-cli:latest",
+			runtime:     "crewai",
+			want:        "git.moleculesai.app/molecule-ai/workspace-template-crewai:latest",
 		},
 		{
 			name:        "runtime with hyphen",

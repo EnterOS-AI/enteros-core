@@ -18,9 +18,8 @@ tags:
 kind: env-mutator
 runtimes:
   - claude-code
-  - deepagents
-  - langgraph
-  - autogen
+  - crewai
+  - google-adk
 skills:
   - approval-gate
 contributes:

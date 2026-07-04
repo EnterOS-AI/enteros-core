@@ -11,7 +11,7 @@
 #                                  code-default/config.yaml's `minimax`
 #                                  provider entry).
 #
-#   E2E_OPENAI_API_KEY second  → langgraph + hermes legacy path (kept
+#   E2E_OPENAI_API_KEY second  → hermes legacy path (kept
 #                                  as fallback for operator dispatches
 #                                  that need the OpenAI-shaped
 #                                  HERMES_CUSTOM_* env block).

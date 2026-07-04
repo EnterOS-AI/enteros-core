@@ -218,7 +218,7 @@ describe("ProvisioningTimeout", () => {
         expect(provisionTimeoutForRuntime("claude-code")).toBe(
           DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
         );
-        expect(provisionTimeoutForRuntime("langgraph")).toBe(
+        expect(provisionTimeoutForRuntime("codex")).toBe(
           DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
         );
         expect(provisionTimeoutForRuntime("crewai")).toBe(

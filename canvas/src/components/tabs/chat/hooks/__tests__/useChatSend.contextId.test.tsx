@@ -3,7 +3,7 @@
 // tenant-agent BUG 3 (client half): every chat message MUST carry a STABLE
 // per-conversation `contextId`. Without it the runtime a2a-sdk mints a fresh
 // context_id per request and any session keyed on it (openclaw SessionManager,
-// the native LangGraph thread_id) resets every turn → the agent re-greets.
+// the base RuntimeA2AExecutor's native thread_id) resets every turn → the agent re-greets.
 //
 // The contextId (the session key) is the ONLY continuity signal the client
 // ships. The canvas MUST NOT force-inject prior turns via a
