@@ -135,6 +135,17 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
           OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
+          # CF-1010 fix: call Gitea over the INTERNAL docker-network address, not
+          # the public CF edge. The gate script uses urllib, whose `Python-urllib/*`
+          # User-Agent Cloudflare bans with WAF error 1010 (browser_signature_banned);
+          # that killed the gate before it could evaluate whenever the job landed on
+          # a molecule-net (local) runner — a non-deterministic org-wide RED that was
+          # being worked around by routing jobs to the remote robot-1 pool + repo-admin
+          # elevation. This is the internal service address the runners already use for
+          # checkout/control (GITHUB_SERVER_URL). The status link stays on the public
+          # host via --public-host. Auth is unchanged (same Gitea, same token).
+          GITEA_API_BASE_URL: http://molecule-gitea-local:3000
+          GITEA_PUBLIC_HOST: git.moleculesai.app
         run: |
           set -euo pipefail
           python3 .gitea/scripts/sop-checklist.py \
@@ -142,7 +153,8 @@ jobs:
             --repo "$REPO_NAME" \
             --pr "$PR_NUMBER" \
             --config .gitea/sop-checklist-config.yaml \
-            --gitea-host git.moleculesai.app
+            --gitea-host "$GITEA_API_BASE_URL" \
+            --public-host "$GITEA_PUBLIC_HOST"
 
   # bp-exempt: informational refire handler, not a merge gate. Emits
   # qa-review/security-review status updates on /qa-recheck et al slash commands.
