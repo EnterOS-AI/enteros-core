@@ -213,6 +213,77 @@ func mustCIDR(s string) net.IPNet {
 	return *n
 }
 
+// isExternalAgentURL reports whether agentURL points to an agent that lives
+// outside the platform's own infrastructure for the given workspace. Internal
+// addresses (loopback, RFC-1918/private, link-local, and the workspace's own
+// container DNS name) are treated as in-cluster and are not required to
+// present the platform_inbound_secret on the A2A forward. Public hostnames/IPs
+// are treated as external agents and the platform MUST authenticate with the
+// per-workspace platform_inbound_secret.
+//
+// The container-DNS check is an exact match against ws-<workspaceID> (and the
+// legacy truncated ws-<first12>) rather than a broad `strings.HasPrefix(host,
+// "ws-")` check, so a public hostname like `ws-agent.example.com` is correctly
+// classified as external.
+//
+// Tunnel-hostname threat model (why the `isPlatformTunnelHostname` internal
+// exception is safe): the only non-container/non-IP host treated as internal
+// is a platform-provisioned Cloudflare tunnel hostname of the exact shape
+//
+//	ws-<id>.<appDomain>
+//
+// where <appDomain> is MOLECULE_APP_DOMAIN (default "moleculesai.app", which
+// also covers the "staging.moleculesai.app" subdomain). This is NOT the broad
+// `strings.HasPrefix(host, "ws-")` the original review flagged: it additionally
+// requires the host to be a subdomain UNDER the platform's OWN apex domain
+// (suffix "."+<appDomain>). Only the platform controls DNS there, so an
+// attacker cannot register `ws-<realId>.moleculesai.app` to have their public
+// endpoint mis-classified as internal and skip the platform_inbound_secret; a
+// lookalike such as `ws-<id>.attacker.com` fails the suffix check and is
+// classified external. The suffix check delegated to below (registry.go's
+// isPlatformTunnelHostname) is the single canonical definition reused by the
+// registry validateAgentURL SSRF gate — there is no second copy to drift.
+func isExternalAgentURL(workspaceID, agentURL string) bool {
+	u, err := url.Parse(agentURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	// The workspace's own container DNS name is internal.
+	if host == containerNameForWorkspace(workspaceID) || host == legacyContainerNameForWorkspace(workspaceID) {
+		return false
+	}
+	// Platform-provisioned tunnel hostnames (ws-<id>.<appDomain>) are internal.
+	if isPlatformTunnelHostname(host) {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
+			ip.IsPrivate() || isPrivateOrMetadataIP(ip) {
+			return false
+		}
+		return true
+	}
+	// Any other resolvable hostname is treated as external/public.
+	return true
+}
+
+func containerNameForWorkspace(workspaceID string) string {
+	return "ws-" + workspaceID
+}
+
+func legacyContainerNameForWorkspace(workspaceID string) string {
+	id := workspaceID
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	return "ws-" + id
+}
+
 // validateRelPath checks that a file path is relative and does not escape
 // the destination via absolute paths or ".." traversal. Used by
 // copyFilesToContainer and deleteViaEphemeral as a defence-in-depth measure.

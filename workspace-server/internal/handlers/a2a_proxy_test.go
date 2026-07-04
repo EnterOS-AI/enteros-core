@@ -1797,7 +1797,7 @@ func TestDispatchA2A_BuildRequestError(t *testing.T) {
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 
 	// Malformed URL causes http.NewRequestWithContext to fail.
-	_, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", "http://%%badhost", []byte("{}"), "")
+	_, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", "http://%%badhost", []byte("{}"), "", "")
 	if cancel != nil {
 		cancel()
 	}
@@ -1820,7 +1820,7 @@ func TestDispatchA2A_CanvasTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", srv.URL, []byte(`{}`), "")
+	resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", srv.URL, []byte(`{}`), "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1841,7 +1841,7 @@ func TestDispatchA2A_AgentTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", srv.URL, []byte(`{}`), "ws-caller")
+	resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", srv.URL, []byte(`{}`), "ws-caller", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1870,7 +1870,7 @@ func TestDispatchA2A_ContextDeadline_NoExtraCeiling(t *testing.T) {
 	ctx, ctxCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer ctxCancel()
 
-	resp, cancel, err := handler.dispatchA2A(ctx, "ws-target", srv.URL, []byte(`{}`), "")
+	resp, cancel, err := handler.dispatchA2A(ctx, "ws-target", srv.URL, []byte(`{}`), "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1983,6 +1983,7 @@ func TestDispatchA2A_RejectsUnsafeURL(t *testing.T) {
 		"ws-target",
 		"http://169.254.169.254/latest/meta-data/",
 		[]byte(`{}`),
+		"",
 		"",
 	)
 	if cancel != nil {
@@ -3883,5 +3884,512 @@ func TestProxyA2A_MessageSend_CanDelegateFalse_SelfCall_Allowed(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("self-call with can_delegate=false must NOT be gated, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ==================== core#3319: platform→external-agent /a2a/inbound auth ====================
+
+func TestIsExternalAgentURL(t *testing.T) {
+	const wsID = "abc123def456ghi789"
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"http://ws-abc123def456ghi789:8000/a2a", false},                     // exact container DNS
+		{"http://ws-abc123def456:8000/a2a", false},                           // legacy truncated container DNS (first 12 chars of ID)
+		{"https://ws-abc123def456ghi789.moleculesai.app/a2a", false},         // platform tunnel hostname
+		{"https://ws-abc123def456ghi789.staging.moleculesai.app/a2a", false}, // platform tunnel hostname (staging)
+		{"https://ws-abc123def456ghi789.attacker.com/a2a", true},             // not under platform domain
+		{"http://ws-agent.example.com/a2a/inbound", true},                    // public hostname starting with ws-
+		{"http://127.0.0.1:8000/a2a", false},                                 // loopback
+		{"http://[::1]:8000/a2a", false},                                     // IPv6 loopback
+		{"http://10.0.0.5:8000/a2a", false},                                  // RFC-1918 private
+		{"http://169.254.169.254/a2a", false},                                // metadata link-local
+		{"http://agent.example.com/a2a/inbound", true},                       // public external agent
+		{"https://8.8.8.8/a2a/inbound", true},                                // public IP
+	}
+	for _, tc := range cases {
+		got := isExternalAgentURL(wsID, tc.url)
+		if got != tc.want {
+			t.Errorf("isExternalAgentURL(%q) = %v, want %v", tc.url, got, tc.want)
+		}
+	}
+}
+
+func TestDispatchA2A_InboundSecretHeader(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	const secret = "platform-inbound-secret-xyz"
+	var gotAuth string
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+
+	resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", agentServer.URL, []byte(`{}`), "", secret)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+	if cancel != nil {
+		defer cancel()
+	}
+
+	if gotAuth != "Bearer "+secret {
+		t.Errorf("expected Authorization header %q, got %q", "Bearer "+secret, gotAuth)
+	}
+}
+
+// TestDispatchA2A_InboundVerifierSimulation models an external agent's
+// /a2a/inbound endpoint that rejects unauthenticated or wrong-secret requests
+// and accepts the workspace's platform_inbound_secret. The platform's outbound
+// request must carry the correct bearer for the inbound verifier to allow it.
+func TestDispatchA2A_InboundVerifierSimulation(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	const secret = "platform-inbound-secret-xyz"
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
+			return
+		}
+		if auth != "Bearer "+secret {
+			http.Error(w, `{"error":"invalid secret"}`, http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+
+	cases := []struct {
+		name       string
+		secret     string
+		wantStatus int
+	}{
+		{"unauthenticated", "", http.StatusUnauthorized},
+		{"wrong secret", "wrong-secret", http.StatusForbidden},
+		{"valid secret", secret, http.StatusOK},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, cancel, err := handler.dispatchA2A(context.Background(), "ws-target", agentServer.URL, []byte(`{}`), "", tc.secret)
+			if err != nil {
+				t.Fatalf("unexpected transport error: %v", err)
+			}
+			if cancel != nil {
+				defer cancel()
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("expected status %d, got %d", tc.wantStatus, resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestProxyA2A_ExternalAgent_MissingInboundSecret_Rejected(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	restoreSSRF := setSSRFCheckForTest(false)
+	defer restoreSSRF()
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	const wsID = "ws-external-no-secret"
+	expectBudgetCheck(mock, wsID)
+	mock.ExpectQuery(`SELECT delivery_mode FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("push"))
+	mock.ExpectQuery(`SELECT url, status FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "status"}).AddRow("http://external-agent.example/a2a/inbound", "online"))
+	mock.ExpectQuery(`SELECT platform_inbound_secret FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"platform_inbound_secret"}).AddRow(nil))
+	mock.ExpectExec(`UPDATE workspaces SET platform_inbound_secret`).
+		WithArgs(sqlmock.AnyArg(), wsID).
+		WillReturnError(errors.New("db locked"))
+
+	prevAdmin := os.Getenv("ADMIN_TOKEN")
+	os.Setenv("ADMIN_TOKEN", "admin-secret-3319")
+	defer os.Setenv("ADMIN_TOKEN", prevAdmin)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer admin-secret-3319")
+
+	handler.ProxyA2A(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 when external workspace has no inbound secret, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "inbound auth") {
+		t.Errorf("expected inbound-auth error message, got %s", w.Body.String())
+	}
+}
+
+// TestProxyA2A_InboundAuth_ExternalVerifierSimulation exercises the full
+// ProxyA2A → resolveAgentURL → readOrLazyHealInboundSecret → dispatchA2A chain
+// for an external /a2a/inbound endpoint. It proves that:
+//   - a missing platform_inbound_secret fails closed (503) before any outbound
+//     unauthenticated request is sent;
+//   - a wrong secret is rejected by the external agent (403);
+//   - the correct secret is attached and the request is accepted (200).
+func TestProxyA2A_InboundAuth_ExternalVerifierSimulation(t *testing.T) {
+	const expectedSecret = "agent-expected-secret-3319"
+
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
+			return
+		}
+		if auth != "Bearer "+expectedSecret {
+			http.Error(w, `{"error":"invalid secret"}`, http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+
+	// Use "localhost" as the host so isExternalAgentURL classifies it as
+	// external (it is not the container DNS name or a platform tunnel), while
+	// the HTTP client still resolves it to the httptest server.
+	agentURL := strings.Replace(agentServer.URL, "127.0.0.1", "localhost", 1)
+
+	cases := []struct {
+		name       string
+		dbSecret   interface{} // nil = missing; string = present
+		wantStatus int
+		wantBody   string
+	}{
+		{"unauthenticated", nil, http.StatusServiceUnavailable, "inbound auth"},
+		{"wrong_secret", "wrong-secret", http.StatusForbidden, "invalid secret"},
+		{"valid_secret", expectedSecret, http.StatusOK, ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			setupTestRedis(t)
+			broadcaster := newTestBroadcaster()
+			handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+			waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+			wsID := "ws-external-auth-" + tc.name
+			expectBudgetCheck(mock, wsID)
+			mock.ExpectQuery(`SELECT delivery_mode FROM workspaces WHERE id`).
+				WithArgs(wsID).
+				WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("push"))
+			mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id =`).
+				WithArgs(wsID).
+				WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+			mock.ExpectQuery(`SELECT url, status FROM workspaces WHERE id =`).
+				WithArgs(wsID).
+				WillReturnRows(sqlmock.NewRows([]string{"url", "status"}).AddRow(agentURL, "online"))
+
+			if tc.dbSecret == nil {
+				mock.ExpectQuery(`SELECT platform_inbound_secret FROM workspaces WHERE id =`).
+					WithArgs(wsID).
+					WillReturnRows(sqlmock.NewRows([]string{"platform_inbound_secret"}).AddRow(nil))
+				mock.ExpectExec(`UPDATE workspaces SET platform_inbound_secret`).
+					WithArgs(sqlmock.AnyArg(), wsID).
+					WillReturnError(errors.New("db locked"))
+			} else {
+				mock.ExpectQuery(`SELECT platform_inbound_secret FROM workspaces WHERE id =`).
+					WithArgs(wsID).
+					WillReturnRows(sqlmock.NewRows([]string{"platform_inbound_secret"}).AddRow(tc.dbSecret))
+			}
+
+			if tc.wantStatus == http.StatusOK || tc.wantStatus == http.StatusForbidden {
+				mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Params = gin.Params{{Key: "id", Value: wsID}}
+			c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			handler.ProxyA2A(c)
+			if tc.wantStatus == http.StatusOK || tc.wantStatus == http.StatusForbidden {
+				handler.waitAsyncForTest()
+			}
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("expected status %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+			if tc.wantBody != "" && !strings.Contains(w.Body.String(), tc.wantBody) {
+				t.Errorf("expected body to contain %q, got %s", tc.wantBody, w.Body.String())
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet sqlmock expectations: %v", err)
+			}
+		})
+	}
+}
+
+// TestProxyA2A_InboundAuth_PublicWsPrefixHost_Rejected is the regression guard
+// for the core#3319 security blocker: a public hostname that merely starts with
+// "ws-" (e.g. ws-agent.example.com) must be classified as EXTERNAL, which means
+// the platform must attach platform_inbound_secret. Without a valid secret the
+// proxy fails closed with 503 rather than dispatching an unauthenticated request
+// that the external agent might treat as internal/trusted.
+func TestProxyA2A_InboundAuth_PublicWsPrefixHost_Rejected(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	const wsID = "ws-public-ws-prefix"
+	expectBudgetCheck(mock, wsID)
+	mock.ExpectQuery(`SELECT delivery_mode FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("push"))
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id =`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+	mock.ExpectQuery(`SELECT url, status FROM workspaces WHERE id =`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "status"}).AddRow("http://ws-agent.example.com/a2a/inbound", "online"))
+	mock.ExpectQuery(`SELECT platform_inbound_secret FROM workspaces WHERE id =`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"platform_inbound_secret"}).AddRow(nil))
+	mock.ExpectExec(`UPDATE workspaces SET platform_inbound_secret`).
+		WithArgs(sqlmock.AnyArg(), wsID).
+		WillReturnError(errors.New("db locked"))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.ProxyA2A(c)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for public ws-* host without inbound secret, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "inbound auth") {
+		t.Errorf("expected inbound-auth error message, got %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestProxyA2A_InboundAuth_InternalHost_Accepted pins the no-regression half of
+// core#3319: internal workspace URLs (loopback/container/private) must NOT be
+// forced through the external-agent secret path. The proxy dispatches without
+// reading platform_inbound_secret and without attaching an Authorization header.
+func TestProxyA2A_InboundAuth_InternalHost_Accepted(t *testing.T) {
+	mock := setupTestDB(t)
+	mr := setupTestRedis(t)
+	allowLoopbackForTest(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+	var gotAuth string
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+
+	const wsID = "ws-internal-no-secret"
+	mr.Set(fmt.Sprintf("ws:%s:url", wsID), agentServer.URL)
+	expectBudgetCheck(mock, wsID)
+	mock.ExpectQuery(`SELECT delivery_mode FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("push"))
+	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id =`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+	mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.ProxyA2A(c)
+	handler.waitAsyncForTest()
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for internal host, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotAuth != "" {
+		t.Errorf("internal workspace dispatch must NOT send Authorization header, got %q", gotAuth)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (a platform_inbound_secret query for an internal URL means regression): %v", err)
+	}
+}
+
+// ==================== core#3319 inbound /a2a/inbound auth ====================
+
+// TestReceiveA2AInbound exercises POST /workspaces/:id/a2a/inbound. External
+// agents must present the target workspace's platform_inbound_secret; missing,
+// wrong, or cross-workspace secrets are rejected before any forward to the
+// target workspace happens. A valid secret is accepted and the message is
+// forwarded through ProxyA2A with the consumed Authorization header stripped.
+func TestReceiveA2AInbound(t *testing.T) {
+	var forwardedAuth string
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":"1","result":{}}`)
+	}))
+	defer agentServer.Close()
+
+	cases := []struct {
+		name         string
+		targetWS     string
+		targetSecret string
+		authHeader   string
+		wantStatus   int
+		wantBody     string
+	}{
+		{
+			name:         "no_secret",
+			targetWS:     "ws-inbound",
+			targetSecret: "valid-secret",
+			authHeader:   "",
+			wantStatus:   http.StatusUnauthorized,
+			wantBody:     "missing Authorization",
+		},
+		{
+			name:         "wrong_secret",
+			targetWS:     "ws-inbound",
+			targetSecret: "valid-secret",
+			authHeader:   "Bearer wrong-secret",
+			wantStatus:   http.StatusForbidden,
+			wantBody:     "invalid inbound secret",
+		},
+		{
+			name:         "valid_secret",
+			targetWS:     "ws-inbound",
+			targetSecret: "valid-secret",
+			authHeader:   "Bearer valid-secret",
+			wantStatus:   http.StatusOK,
+		},
+		{
+			name:         "cross_workspace_secret",
+			targetWS:     "ws-inbound-b",
+			targetSecret: "secret-b",
+			authHeader:   "Bearer secret-a",
+			wantStatus:   http.StatusForbidden,
+			wantBody:     "invalid inbound secret",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			mr := setupTestRedis(t)
+			allowLoopbackForTest(t)
+			broadcaster := newTestBroadcaster()
+			handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+			waitForHandlerAsyncBeforeDBCleanup(t, handler)
+
+			forwardedAuth = ""
+
+			mr.Set(fmt.Sprintf("ws:%s:url", tc.targetWS), agentServer.URL)
+
+			if tc.authHeader != "" {
+				mock.ExpectQuery(`SELECT platform_inbound_secret FROM workspaces WHERE id =`).
+					WithArgs(tc.targetWS).
+					WillReturnRows(sqlmock.NewRows([]string{"platform_inbound_secret"}).AddRow(tc.targetSecret))
+			}
+
+			// Expectations below only matter when auth passes and ProxyA2A runs.
+			if tc.wantStatus == http.StatusOK {
+				expectBudgetCheck(mock, tc.targetWS)
+				mock.ExpectQuery(`SELECT delivery_mode FROM workspaces WHERE id`).
+					WithArgs(tc.targetWS).
+					WillReturnRows(sqlmock.NewRows([]string{"delivery_mode"}).AddRow("push"))
+				mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id =`).
+					WithArgs(tc.targetWS).
+					WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("claude-code"))
+				mock.ExpectExec("INSERT INTO activity_logs").WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Params = gin.Params{{Key: "id", Value: tc.targetWS}}
+			c.Request = httptest.NewRequest("POST", "/workspaces/"+tc.targetWS+"/a2a/inbound", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+			if tc.authHeader != "" {
+				c.Request.Header.Set("Authorization", tc.authHeader)
+			}
+
+			handler.ReceiveA2AInbound(c)
+			if tc.wantStatus == http.StatusOK {
+				handler.waitAsyncForTest()
+			}
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("expected status %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+			if tc.wantBody != "" && !strings.Contains(w.Body.String(), tc.wantBody) {
+				t.Errorf("expected body to contain %q, got %s", tc.wantBody, w.Body.String())
+			}
+			if tc.wantStatus == http.StatusOK && forwardedAuth != "" {
+				t.Errorf("inbound Authorization header must not be forwarded to target workspace, got %q", forwardedAuth)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet sqlmock expectations: %v", err)
+			}
+		})
+	}
+}
+
+// TestReceiveA2AInbound_PublicWsPrefixTarget is the regression guard that the
+// inbound endpoint enforces platform_inbound_secret even when the target
+// workspace's resolved URL is a public ws-* hostname. Without the exact/suffix
+// internal-host classification, the downstream proxy might skip the outbound
+// secret too; here we verify the inbound gate rejects the request before any
+// such classification matters.
+func TestReceiveA2AInbound_PublicWsPrefixTarget(t *testing.T) {
+	_ = setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	const wsID = "ws-inbound-public-ws-prefix"
+	// No URL/Redis setup needed: auth runs before resolveAgentURL.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a/inbound", bytes.NewBufferString(`{"jsonrpc":"2.0","method":"message/send","params":{}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.ReceiveA2AInbound(c)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for inbound request without secret, got %d: %s", w.Code, w.Body.String())
 	}
 }
