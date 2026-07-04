@@ -139,10 +139,14 @@ func TestProxyA2A_LargeRequestWithinLimit(t *testing.T) {
 	c.Params = gin.Params{{Key: "id", Value: "ws-large-ok"}}
 
 	// Build a valid JSON-RPC body just under the new 16MB cap.
-	// Include messageId and use the canonical v0.3 "kind" discriminator so
-	// normalizeA2APayload does not add fields during forwarding (which would
-	// change the body length and break the exact-length assertion).
-	prefix := `{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","messageId":"msg-1","parts":[{"kind":"text","text":"`
+	// Include messageId, a contextId, and the canonical v0.3 "kind"
+	// discriminator so neither normalizeA2APayload nor the canvas
+	// session-continuity belt (ensureCanvasSessionContextID) ADD fields during
+	// forwarding — either would change the body length and break the
+	// exact-length assertion. (This is a canvas-origin turn, callerID=="", so
+	// the belt would otherwise inject a contextId; supplying one makes it a
+	// no-op, keeping the test scoped to the truncation contract it covers.)
+	prefix := `{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","messageId":"msg-1","contextId":"ctx-1","parts":[{"kind":"text","text":"`
 	suffix := `"}]}}}`
 	paddingLen := maxProxyRequestBody - len(prefix) - len(suffix)
 	if paddingLen < 0 {
