@@ -380,7 +380,7 @@ fi
 
 # Verify re-imported workspace exists by name — status may be "provisioning",
 # "online", or "failed" depending on runtime availability in the environment
-# (CI has no Docker, so autogen/langgraph containers never come up). The
+# (CI has no Docker, so runtime containers never come up). The
 # round-trip assertion is about bundle fidelity, not provisioning success.
 R=$(curl -s "$BASE/workspaces/$NEW_ID")
 check "Re-imported workspace exists" "\"id\":\"$NEW_ID\"" "$R"

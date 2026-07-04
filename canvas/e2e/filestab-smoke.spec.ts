@@ -25,7 +25,7 @@ test("FilesTab renders after split", async ({ page, request }) => {
   // Create a workspace
   const created = await request
     .post("http://localhost:8080/workspaces", {
-      data: { name: "FilesTab Smoke", tier: 1, runtime: "langgraph" },
+      data: { name: "FilesTab Smoke", tier: 1, runtime: "codex" },
       headers: { "Content-Type": "application/json" },
     })
     .then((r) => r.json());

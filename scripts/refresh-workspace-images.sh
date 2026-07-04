@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # refresh-workspace-images.sh — pull the latest workspace template images
-# from GHCR and recreate any running ws-* containers against the new digest.
+# from our own container registry (registry.moleculesai.app; override with
+# MOLECULE_IMAGE_REGISTRY) and recreate any running ws-* containers against the
+# new digest.
 #
 # This is the local-dev / single-host equivalent of step 5 of the runtime CD
 # chain (see docs/workspace-runtime-package.md). On a SaaS deployment the
@@ -36,6 +38,13 @@ ALL_RUNTIMES=(claude-code codex hermes openclaw)
 RUNTIMES=("${ALL_RUNTIMES[@]}")
 RECREATE=true
 
+# Registry SSOT: default to OUR OWN container registry (the Gitea registry),
+# where every workspace-template-* image lives. Pull auth is the docker-host's
+# standard `docker login registry.moleculesai.app` (a Gitea PAT) — no AWS/ECR
+# credentials. Override with MOLECULE_IMAGE_REGISTRY to point at a mirror (e.g.
+# an ECR host), mirroring the CP/workspace-server RegistryPrefix() env contract.
+REGISTRY_PREFIX="${MOLECULE_IMAGE_REGISTRY:-registry.moleculesai.app/molecule-ai}"
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --runtime) RUNTIMES=("$2"); shift 2;;
@@ -51,7 +60,7 @@ log "pulling latest images for: ${RUNTIMES[*]}"
 PULLED=()
 FAILED=()
 for rt in "${RUNTIMES[@]}"; do
-  IMG="153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/workspace-template-$rt:latest"
+  IMG="${REGISTRY_PREFIX}/workspace-template-$rt:latest"
   if docker pull "$IMG" >/dev/null 2>&1; then
     log "  ✓ $rt"
     PULLED+=("$rt")

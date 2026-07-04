@@ -239,7 +239,6 @@ export function MobileChat({
     clearError,
     releaseSendGuards,
   } = useChatSend(agentId, {
-    getHistoryMessages: () => messages,
     onUserMessage: appendMessageDeduped,
     onAgentMessage: appendMessageDeduped,
   });

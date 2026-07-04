@@ -7,8 +7,8 @@ package handlers
 // The registry (internal/providers) is the SSOT for which models a runtime
 // natively exposes (ModelsForRuntime). This validator rejects a (runtime, model)
 // the registry does NOT recognize — but ONLY for a runtime the registry knows
-// about. For a runtime absent from the first-party registry (langgraph,
-// external, kimi, mock, or a future federated third-party runtime), it fails
+// about. For a runtime absent from the first-party registry (external, kimi,
+// mock, or a future federated third-party runtime), it fails
 // OPEN: the registry can't speak to that runtime's model set, so the existing
 // knownRuntimes gate stays authoritative and this validator does not block.
 // This is the federation-ready contract — first-party runtimes are gated against
@@ -140,7 +140,7 @@ func validateDerivedProviderInRegistry(runtime, model string) (bool, string) {
 	}
 	// DeriveProvider is fail-closed for unknown runtimes. Mirror the
 	// model-side check's federation contract: a runtime the registry does
-	// NOT know (langgraph / external / kimi / mock / federated) is allowed
+	// NOT know (external / kimi / mock / federated) is allowed
 	// to pass through. DeriveProvider's `unknown runtime` error IS that
 	// signal — treat it as fail-open, identical to ModelsForRuntime's
 	// not-found behavior above.

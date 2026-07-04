@@ -775,8 +775,8 @@ func TestSecretsSetModel_UnregisteredModel_422(t *testing.T) {
 }
 
 // TestSecretsSetModel_UnknownRuntimeFailOpen_200 verifies the federation
-// contract: a runtime absent from the registry (langgraph) passes through
-// without validation so non-first-party runtimes are not blocked.
+// contract: a runtime absent from the registry (a federated third-party) passes
+// through without validation so non-first-party runtimes are not blocked.
 func TestSecretsSetModel_UnknownRuntimeFailOpen_200(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -784,7 +784,7 @@ func TestSecretsSetModel_UnknownRuntimeFailOpen_200(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT runtime FROM workspaces WHERE id = \$1`).
 		WithArgs("00000000-0000-0000-0000-000000000004").
-		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("langgraph"))
+		WillReturnRows(sqlmock.NewRows([]string{"runtime"}).AddRow("federated"))
 
 	mock.ExpectExec(`INSERT INTO workspace_secrets[\s\S]*'MODEL'`).
 		WithArgs("00000000-0000-0000-0000-000000000004", sqlmock.AnyArg(), sqlmock.AnyArg()).

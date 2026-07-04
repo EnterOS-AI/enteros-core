@@ -21,8 +21,8 @@ vi.mock("@/lib/theme-provider", () => ({
 
 const mockTemplates = [
   {
-    id: "tpl-langgraph",
-    name: "LangGraph Agent",
+    id: "tpl-codex",
+    name: "Codex Agent",
     description: "Multi-step reasoning with state machines.",
     tier: 2,
   },
@@ -80,7 +80,7 @@ describe("MobileSpawn — render", () => {
     apiGetSpy.mockResolvedValue(mockTemplates);
     render(<MobileSpawn dark={true} onClose={vi.fn()} />);
     await vi.waitFor(() => {
-      expect(document.body.textContent).toContain("LangGraph Agent");
+      expect(document.body.textContent).toContain("Codex Agent");
       expect(document.body.textContent).toContain("Claude Code");
       expect(document.body.textContent).toContain("Hermes");
     });
@@ -182,7 +182,7 @@ describe("MobileSpawn — interaction", () => {
     render(<MobileSpawn dark={true} onClose={onClose} />);
 
     await vi.waitFor(() => {
-      expect(document.body.textContent).toContain("LangGraph Agent");
+      expect(document.body.textContent).toContain("Codex Agent");
     });
 
     // Fill name
@@ -198,7 +198,7 @@ describe("MobileSpawn — interaction", () => {
     await vi.waitFor(() => {
       expect(apiPostSpy).toHaveBeenCalledWith("/workspaces", expect.objectContaining({
         name: "My New Agent",
-        template: "tpl-langgraph", // first template selected by default
+        template: "tpl-codex", // first template selected by default
       }));
     });
   });
@@ -209,7 +209,7 @@ describe("MobileSpawn — interaction", () => {
     render(<MobileSpawn dark={true} onClose={vi.fn()} />);
 
     await vi.waitFor(() => {
-      expect(document.body.textContent).toContain("LangGraph Agent");
+      expect(document.body.textContent).toContain("Codex Agent");
     });
 
     const spawnBtn = Array.from(

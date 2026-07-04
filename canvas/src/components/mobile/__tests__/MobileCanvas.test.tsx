@@ -32,7 +32,7 @@ const mockNodes = [
       status: "online",
       tier: 2,
       parentId: null,
-      runtime: "langgraph",
+      runtime: "codex",
       activeTasks: 0,
       role: "researcher",
     },
@@ -73,7 +73,7 @@ vi.mock("@/store/canvas", () => ({
     return mockNodes;
   }),
   summarizeWorkspaceCapabilities: vi.fn((data: { status?: string; role?: string }) => ({
-    runtime: data.status ? "langgraph" : "unknown",
+    runtime: data.status ? "codex" : "unknown",
     skillCount: 0,
     currentTask: data.role ?? "",
   })),

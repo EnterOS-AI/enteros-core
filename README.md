@@ -248,6 +248,13 @@ The result is not just “an agent that learns.” It is **an organization that 
 - multi-tenant friendly: one plugin install can watch workspaces across multiple Molecule tenants (`MOLECULE_PLATFORM_URLS` per-workspace)
 - install via the standard marketplace flow: `/plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git` → `/plugin install molecule@molecule-channel`, then launch with `claude --dangerously-load-development-channels=plugin:molecule@molecule-channel`
 
+### Self-host a workspace — the `molecules` CLI (via [`molecule-workspace-cli`](https://git.moleculesai.app/molecule-ai/molecule-workspace-cli))
+
+- the OSS `molecule-core` base runs standalone as a **thin CLI wrapper** (`molecules`, v0.2.0) around any runtime (Claude Code / Codex / Hermes / OpenClaw) — the in-container image *is* the CLI in a container, so internal and self-hosted workspaces share one codepath, no fork
+- `molecules login`, then a bare `molecules` starts with a live **runtime x provider x model picker** sourced from the platform SSOT catalog (`GET /cp/runtimes` + `GET /cp/llm-providers`), with an on-box fallback; nothing hardcoded
+- **tokenless install** — the workspace-template repos are PUBLIC, so the runtime binary + rendered config are fetched without a platform token; only a single scoped, revocable workspace key is injected (untrusted-box model)
+- the self-hosted box joins the org mesh as a **first-class agent** (registry, heartbeat, A2A) on the same OSS core
+
 ## Built For Teams That Need More Than A Demo
 
 Molecule AI is especially strong when you need to run:

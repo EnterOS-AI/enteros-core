@@ -30,7 +30,7 @@ func TestBuildBundleConfigFiles_SystemPromptOnly(t *testing.T) {
 func TestBuildBundleConfigFiles_ConfigYamlOnly(t *testing.T) {
 	b := &Bundle{
 		Prompts: map[string]string{
-			"config.yaml": "runtime: langgraph\ntier: 2\n",
+			"config.yaml": "runtime: codex\ntier: 2\n",
 		},
 	}
 	files := buildBundleConfigFiles(b)
@@ -39,7 +39,7 @@ func TestBuildBundleConfigFiles_ConfigYamlOnly(t *testing.T) {
 	}
 	if content, ok := files["config.yaml"]; !ok {
 		t.Fatal("missing config.yaml")
-	} else if string(content) != "runtime: langgraph\ntier: 2\n" {
+	} else if string(content) != "runtime: codex\ntier: 2\n" {
 		t.Errorf("config.yaml content: got %q", string(content))
 	}
 }
@@ -48,7 +48,7 @@ func TestBuildBundleConfigFiles_SystemPromptAndConfigYaml(t *testing.T) {
 	b := &Bundle{
 		SystemPrompt: "Be concise.",
 		Prompts: map[string]string{
-			"config.yaml": "runtime: langgraph\n",
+			"config.yaml": "runtime: codex\n",
 		},
 	}
 	files := buildBundleConfigFiles(b)
@@ -117,7 +117,7 @@ func TestBuildBundleConfigFiles_EmptySystemPrompt(t *testing.T) {
 	b := &Bundle{
 		SystemPrompt: "",
 		Prompts: map[string]string{
-			"config.yaml": "runtime: langgraph\n",
+			"config.yaml": "runtime: codex\n",
 		},
 	}
 	files := buildBundleConfigFiles(b)
@@ -158,13 +158,13 @@ func TestBuildBundleConfigFiles_systemPrompt(t *testing.T) {
 
 func TestBuildBundleConfigFiles_configYaml(t *testing.T) {
 	b := &Bundle{Prompts: map[string]string{
-		"config.yaml": "runtime: langgraph\nmodel: claude-sonnet-4-20250514\n",
+		"config.yaml": "runtime: codex\nmodel: claude-sonnet-4-20250514\n",
 	}}
 	files := buildBundleConfigFiles(b)
 	if len(files) != 1 {
 		t.Fatalf("expected 1 file, got %d", len(files))
 	}
-	if string(files["config.yaml"]) != "runtime: langgraph\nmodel: claude-sonnet-4-20250514\n" {
+	if string(files["config.yaml"]) != "runtime: codex\nmodel: claude-sonnet-4-20250514\n" {
 		t.Errorf("unexpected config.yaml content: %q", files["config.yaml"])
 	}
 }
@@ -172,7 +172,7 @@ func TestBuildBundleConfigFiles_configYaml(t *testing.T) {
 func TestBuildBundleConfigFiles_systemPromptAndConfigYaml(t *testing.T) {
 	b := &Bundle{
 		SystemPrompt: "# System",
-		Prompts:     map[string]string{"config.yaml": "runtime: langgraph"},
+		Prompts:     map[string]string{"config.yaml": "runtime: codex"},
 	}
 	files := buildBundleConfigFiles(b)
 	if len(files) != 2 {

@@ -1,256 +1,65 @@
 name: redeploy-tenants-on-staging
 
-# molecules-server rework (2026-07-03): re-enabled + un-EC2'd.
+# MANUAL rollback / pin path for the local-docker STAGING tenant fleet.
 #
-# History: this workflow rolled the staging tenant fleet by calling the CP
-# admin endpoint /cp/admin/tenants/redeploy-fleet, which fanned out over
-# AWS SSM to one-tenant-per-EC2 boxes. It was DISABLED 2026-06-27 when the
-# AWS account was closed. Staging tenants now run as local Docker containers
-# on the molecules-server host (provider='local', the LocalDocker
-# provisioner — one docker network + published 127.0.0.1:<port> per tenant),
-# so the EC2/SSM path is dead.
+# SUPERSEDED FOR THE AUTO PATH by staging-tenant-cd.yml (2026-07-04): the gated
+# CD pipeline (await-image -> e2e-smoke HARD GATE -> advance-pin ->
+# redeploy-fleet) now owns the automatic staging fleet roll on a staging push.
+# Leaving this workflow ALSO auto-triggering on staging push would roll the fleet
+# a SECOND time, UNGATED, racing the gated pipeline — so the `push:` trigger was
+# removed. This file is retained as the operator's hand-run rollback / pin path
+# (workflow_dispatch), e.g. to roll back to a known-good staging-<sha> after a
+# bad auto-deploy, without waiting on the full gate.
 #
-# This rewrite redeploys the local-docker staging fleet directly over the
-# host Docker socket. Dropped vs the EC2/SSM era:
-#   - AWS creds / EC2 DescribeInstances / SSM RunShellCommand fan-out.
-#   - The CP /cp/admin/tenants/redeploy-fleet call (that endpoint is
-#     SSM-first — see molecule-controlplane internal/provisioner/redeploy.go).
-#   - The GHCR CDN propagation sleep (no GHCR; local registry is immediate).
-#   - The Infisical CP-admin-token fetch (no CP admin call to authenticate).
-# Added:
-#   - A docker-host job that pulls the freshly published staging tenant image
-#     and canary-first + health-gated swaps every running staging tenant
-#     container onto it (preserving env / network / labels / published port,
-#     rolling back on health failure), then recreates the shared staging
-#     canvas app `molecule-staging-app` from the new canvas image.
+# BOTH paths now call the SAME committed swap logic
+# (scripts/deploy/redeploy-staging-fleet.sh) so the canary-first / health-gated /
+# self-rolling-back / SESSION-PRESERVING algorithm lives in exactly one place.
+# Session safety: the script rolls ONLY the STATELESS mol-tenant-* platform
+# containers (cp-env=staging); the session-bearing mol-ws-* agent container + its
+# mol-ws-rtstate-* volume are never touched (and the script asserts every rtstate
+# volume is intact after the roll).
 #
-# Why trigger on canvas/** AND workspace-server/**: the tenant-facing canvas
-# is BAKED INTO the tenant image at /canvas (workspace-server/Dockerfile.tenant
-# stage 2), served by the Go platform's reverse-proxy fallback. So a canvas
-# change only reaches users once the tenant image is rebuilt AND the running
-# tenants are re-created onto it — this workflow closes that gap. A pure
-# workspace-server (Go) change is the same story.
-#
-# Rollback / pin: set the repo/org var STAGING_REDEPLOY_TARGET_TAG to a known
-# good tag (e.g. staging-<sha>) and re-run via workflow_dispatch; unset after.
+# Rollback / pin: set the repo/org var STAGING_REDEPLOY_TARGET_TAG to a
+# known-good tag (e.g. staging-<sha>) and run via workflow_dispatch, OR pass the
+# `image_tag` dispatch input; unset the var afterward.
 
 on:
-  # RE-ENABLED 2026-07-03 (was: workflow_dispatch-only since the 2026-06-27
-  # AWS closure). Auto-roll the staging fleet whenever the tenant image inputs
-  # change on the staging branch.
-  push:
-    branches: [staging]
-    paths:
-      - 'canvas/**'
-      - 'workspace-server/**'
-      - '.gitea/workflows/redeploy-tenants-on-staging.yml'
-  workflow_dispatch:
+  # workflow_dispatch ONLY — the auto path moved to staging-tenant-cd.yml.
+  # No inputs: map (Gitea rejects the workflow if present — lint-workflow-yaml
+  # Rule 1). The roll target is read from the repo/org var
+  # STAGING_REDEPLOY_TARGET_TAG (else defaults to staging-latest).
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
-# Serialize per-branch so two rapid staging pushes' redeploys don't overlap
-# and leave the fleet half-rolled. cancel-in-progress:false — aborting a
-# partial roll is worse than letting it finish (each swap is health-gated +
-# self-rolls-back, so a completed predecessor is always in a good state).
+# Serialize with the gated CD pipeline's fleet roll: share ITS concurrency group
+# so a manual rollback and an auto CD roll never overlap on the same fleet.
 concurrency:
-  group: redeploy-tenants-on-staging
+  group: staging-tenant-cd
   cancel-in-progress: false
 
 env:
-  GITHUB_SERVER_URL: https://git.moleculesai.app
-  # molecules-server image coordinates. Overridable via repo/org vars so the
-  # registry host + image names are never hardcoded (no-hardcoding principle).
   TENANT_IMAGE: ${{ vars.MOLECULE_TENANT_IMAGE || 'registry.moleculesai.app/molecule-ai/molecule-tenant' }}
   CANVAS_APP_IMAGE: ${{ vars.MOLECULE_CANVAS_APP_IMAGE || 'registry.moleculesai.app/molecule-ai/canvas' }}
-  # Moving staging tag the publish workflows advance on each staging build.
-  DEFAULT_TENANT_TAG: staging-latest
-  DEFAULT_CANVAS_TAG: staging-latest
 
 jobs:
   redeploy:
     # docker-host: a self-hosted molecules-server runner whose
     # /var/run/docker.sock is the HOST daemon (so `docker ps` sees the
-    # mol-tenant-* tenant containers + molecule-staging-app). These runners
-    # advertise the `docker-host` label (see the org Actions runner pool).
+    # mol-tenant-* tenant containers + molecule-staging-app).
     runs-on: docker-host
     timeout-minutes: 30
-    env:
-      # Operator pin/rollback: set STAGING_REDEPLOY_TARGET_TAG to override the
-      # moving staging-latest tag with a specific staging-<sha>.
-      TARGET_TAG_OVERRIDE: ${{ vars.STAGING_REDEPLOY_TARGET_TAG || secrets.STAGING_REDEPLOY_TARGET_TAG || '' }}
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Redeploy local-docker staging tenant fleet + shared canvas app
+        env:
+          TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
+          CANVAS_APP_IMAGE: ${{ env.CANVAS_APP_IMAGE }}
         run: |
           set -euo pipefail
-
-          TAG="${TARGET_TAG_OVERRIDE:-$DEFAULT_TENANT_TAG}"
-          IMG="${TENANT_IMAGE}:${TAG}"
-          echo "::notice::Staging tenant redeploy target image = ${IMG}"
-
-          # Pull the target tenant image from the molecules-server registry.
-          # Best-effort: on a single-host setup the tag may already be present
-          # in the local daemon from the publish build.
-          docker pull "$IMG" || echo "::warning::docker pull $IMG failed; using locally-present image if any"
-          if ! docker image inspect "$IMG" >/dev/null 2>&1; then
-            echo "::error::tenant image $IMG not available locally or in registry"
-            exit 1
-          fi
-
-          # Discover the running staging tenant containers by their
-          # provision-time labels (LocalDocker stamps these — see
-          # molecule-controlplane local_docker.go). This is the local-docker
-          # equivalent of the old EC2 DescribeInstances fleet enumeration.
-          mapfile -t TENANTS < <(docker ps \
-            --filter 'label=molecule.local-tenant=1' \
-            --filter 'label=molecule.cp-env=staging' \
-            --format '{{.Names}}' | sort)
-
-          if [ ${#TENANTS[@]} -eq 0 ]; then
-            echo "::warning::no running staging tenant containers found — nothing to roll"
-          else
-            echo "Staging tenants to roll (${#TENANTS[@]}): ${TENANTS[*]}"
-          fi
-
-          # health_gate <container>: probe the tenant's published :8080
-          # /buildinfo through the host loopback. Returns 0 when it answers.
-          health_gate() {
-            local name="$1" port
-            port="$(docker port "$name" 8080/tcp 2>/dev/null | head -1 | sed 's/.*://')"
-            [ -n "$port" ] || return 1
-            for _ in $(seq 1 20); do
-              if curl -fsS --max-time 5 "http://127.0.0.1:${port}/buildinfo" >/dev/null 2>&1; then
-                return 0
-              fi
-              sleep 3
-            done
-            return 1
-          }
-
-          # swap_tenant <container> <image>: recreate the container onto <image>
-          # preserving env / network / labels / extra-hosts / restart policy,
-          # publishing a fresh ephemeral 127.0.0.1 port (the CP resolves the
-          # tenant port dynamically via `docker port`, so a new port is safe).
-          # Health-gates the new container and rolls back on failure.
-          swap_tenant() {
-            local name="$1" image="$2"
-            local bak="${name}-redeploy-bak"
-            local net restart envfile
-            net="$(docker inspect "$name" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')"
-            restart="$(docker inspect "$name" --format '{{.HostConfig.RestartPolicy.Name}}')"
-            envfile="$(mktemp)"
-            # Carry the runtime env verbatim, minus base-image defaults the new
-            # image re-supplies.
-            docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' \
-              | grep -vE '^(PATH|NODE_VERSION|YARN_VERSION)=' > "$envfile"
-            local labelargs=() hostargs=()
-            while IFS= read -r l; do [ -n "$l" ] && labelargs+=( --label "$l" ); done \
-              < <(docker inspect "$name" --format '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{println}}{{end}}' \
-                    | grep -vE '^(org.opencontainers|com.docker)')
-            while IFS= read -r h; do [ -n "$h" ] && hostargs+=( --add-host "$h" ); done \
-              < <(docker inspect "$name" --format '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}')
-
-            docker rename "$name" "$bak"
-            docker stop "$bak" >/dev/null
-
-            if ! docker run -d \
-                  --name "$name" \
-                  --network "$net" \
-                  --restart "${restart:-always}" \
-                  --env-file "$envfile" \
-                  "${labelargs[@]}" "${hostargs[@]}" \
-                  -p 127.0.0.1::8080 \
-                  "$image" >/dev/null 2>/tmp/run.err; then
-              echo "::error::docker run failed for $name:"; cat /tmp/run.err
-              rm -f "$envfile"
-              docker rm -f "$name" 2>/dev/null || true
-              docker rename "$bak" "$name"; docker start "$name" >/dev/null
-              return 1
-            fi
-            rm -f "$envfile"
-
-            if ! health_gate "$name"; then
-              echo "::error::$name failed health gate on $image — rolling back"
-              docker rm -f "$name" 2>/dev/null || true
-              docker rename "$bak" "$name"; docker start "$name" >/dev/null
-              return 1
-            fi
-            docker rm "$bak" >/dev/null 2>&1 || true
-            echo "  ✓ $name rolled to $image"
-            return 0
-          }
-
-          # Canary-first: roll the first tenant, gate it, then fan out. Any
-          # failure aborts the rest and leaves remaining tenants on the prior
-          # image (the self-rolled-back canary included).
-          FAILED=0
-          FIRST=1
-          for t in "${TENANTS[@]}"; do
-            if [ "$FIRST" = 1 ]; then
-              echo "== canary: $t =="
-              swap_tenant "$t" "$IMG" || { echo "::error::canary $t failed — aborting fleet roll"; FAILED=1; break; }
-              FIRST=0
-            else
-              echo "== $t =="
-              swap_tenant "$t" "$IMG" || { FAILED=1; break; }
-            fi
-          done
-
-          # Shared staging canvas app (molecule-staging-app): recreate from the
-          # freshly published canvas image. Separate container (not a tenant),
-          # rolled explicitly. Skipped cleanly when absent.
-          CANVAS_TAG="${TARGET_TAG_OVERRIDE:-$DEFAULT_CANVAS_TAG}"
-          CIMG="${CANVAS_APP_IMAGE}:${CANVAS_TAG}"
-          if docker ps -a --format '{{.Names}}' | grep -qx 'molecule-staging-app'; then
-            echo "== shared canvas app: molecule-staging-app -> ${CIMG} =="
-            docker pull "$CIMG" || echo "::warning::pull $CIMG failed; using local image if present"
-            if docker image inspect "$CIMG" >/dev/null 2>&1; then
-              net="$(docker inspect molecule-staging-app --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')"
-              pbind="$(docker inspect molecule-staging-app --format '{{range $p,$b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}}{{end}}{{end}}')"
-              cenv="$(mktemp)"
-              docker inspect molecule-staging-app --format '{{range .Config.Env}}{{println .}}{{end}}' \
-                | grep -vE '^(PATH|NODE_VERSION|YARN_VERSION|NODE_ENV|HOSTNAME|PORT|NEXT_TELEMETRY_DISABLED)=' > "$cenv"
-              docker rename molecule-staging-app molecule-staging-app-redeploy-bak
-              docker stop molecule-staging-app-redeploy-bak >/dev/null
-              if docker run -d --name molecule-staging-app --network "${net:-molecule-net}" \
-                   --restart unless-stopped --env-file "$cenv" \
-                   -p "${pbind:-3101}:3000" "$CIMG" >/dev/null 2>/tmp/cvrun.err; then
-                sleep 5
-                if curl -fsS --max-time 8 "http://127.0.0.1:${pbind:-3101}/" >/dev/null 2>&1; then
-                  docker rm molecule-staging-app-redeploy-bak >/dev/null 2>&1 || true
-                  echo "  ✓ molecule-staging-app rolled to ${CIMG}"
-                else
-                  echo "::error::molecule-staging-app unhealthy after roll — rolling back"
-                  docker rm -f molecule-staging-app 2>/dev/null || true
-                  docker rename molecule-staging-app-redeploy-bak molecule-staging-app
-                  docker start molecule-staging-app >/dev/null
-                  FAILED=1
-                fi
-              else
-                echo "::error::docker run failed for molecule-staging-app:"; cat /tmp/cvrun.err
-                docker rm -f molecule-staging-app 2>/dev/null || true
-                docker rename molecule-staging-app-redeploy-bak molecule-staging-app
-                docker start molecule-staging-app >/dev/null
-                FAILED=1
-              fi
-              rm -f "$cenv"
-            else
-              echo "::warning::canvas image $CIMG unavailable — skipping molecule-staging-app roll"
-            fi
-          else
-            echo "::notice::molecule-staging-app container not present — skipping shared-app roll"
-          fi
-
-          {
-            echo "## Staging fleet redeploy (molecules-server / local-docker)"
-            echo ""
-            echo "- Tenant image: \`${IMG}\`"
-            echo "- Canvas app image: \`${CIMG}\`"
-            echo "- Tenants rolled: ${#TENANTS[@]}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$FAILED" != 0 ]; then
-            echo "::error::staging fleet redeploy had at least one failure (see log/summary)"
-            exit 1
-          fi
-          echo "::notice::staging fleet + shared canvas app redeploy complete"
+          # Precedence: operator pin var > moving staging-latest.
+          TAG="${{ vars.STAGING_REDEPLOY_TARGET_TAG }}"
+          [ -n "$TAG" ] || TAG="staging-latest"
+          echo "::notice::manual staging fleet redeploy target tag = ${TAG}"
+          bash scripts/deploy/redeploy-staging-fleet.sh --tag "$TAG"
