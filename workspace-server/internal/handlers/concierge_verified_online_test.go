@@ -109,44 +109,46 @@ func TestHeartbeat_PlatformWarming_FlipsOnlineWhenToolReported(t *testing.T) {
 	}
 }
 
-// TestHeartbeat_PlatformWarming_PastGraceMarksFailed proves the bounded warming
-// terminal: a concierge that heartbeats forever in 'provisioning' without ever
-// loading provision_workspace is force-failed once the warming window
-// (managementMCPUnloadedGrace) elapses. The provision-timeout sweeper can't catch
-// it (every heartbeat refreshes updated_at), so this is the only terminal.
-func TestHeartbeat_PlatformWarming_PastGraceMarksFailed(t *testing.T) {
+// TestHeartbeat_PlatformWarming_HealthyLongWarmingHolds proves the DYNAMIC,
+// signal-driven warm-up terminal (core#3082 warm-up determinism): a HEALTHY
+// concierge that has been warming a long time (mcp_unloaded_since well in the
+// past) but has not yet reported provision_workspace is NOT force-failed on a
+// clock — it keeps HOLDING 'provisioning', waiting on the real loaded_mcp_tools
+// signal. This is the deletion of the old 180s managementMCPUnloadedGrace wall-
+// clock FAIL (an arbitrary cutoff that killed healthy concierges whose management
+// MCP was merely slow to connect — the flaky e2e-smoke STEP-4 failure). The only
+// terminals now are HEALTH (fail-fast on conciergeUnhealthy, tested below) and
+// LIVENESS (the provision-timeout sweep, once the box stops heartbeating). Here
+// mcp_unloaded_since is already set, so NO stamp write and NO status flip occur —
+// if the code wrongly failed OR flipped online, an expectation would go unmet.
+func TestHeartbeat_PlatformWarming_HealthyLongWarmingHolds(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewRegistryHandler(newTestBroadcaster())
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
-		WithArgs("ws-warm-timeout").
+		WithArgs("ws-warm-hold-long").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-warm-timeout", 0.0, "", 0, 60, "").
+		WithArgs("ws-warm-hold-long", 0.0, "", 0, 60, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
-		WithArgs(sqlmock.AnyArg(), "ws-warm-timeout").
+		WithArgs(sqlmock.AnyArg(), "ws-warm-hold-long").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// Warming since well past managementMCPUnloadedGrace.
+	// Warming since well past the OLD 180s grace — must STILL hold (no clock fail).
 	sustained := time.Now().Add(-10 * time.Minute)
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
-		WithArgs("ws-warm-timeout").
+		WithArgs("ws-warm-hold-long").
 		WillReturnRows(evalStatusRows("provisioning", "platform", nil, sustained))
 	mock.ExpectQuery("SELECT EXISTS").
-		WithArgs("ws-warm-timeout").
+		WithArgs("ws-warm-hold-long").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
-	// markWorkspaceFailed: WORKSPACE_PROVISION_FAILED broadcast, then the failed UPDATE.
-	failMsg := "platform agent never became verified-ready during warmup (provision_workspace not proven loaded, or held unhealthy); marking failed (core#3082 verified-ready gate)"
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("UPDATE workspaces SET status = .*last_sample_error").
-		WithArgs("ws-warm-timeout", failMsg, models.StatusFailed).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	// NO further writes: mcp_unloaded_since already set (no re-stamp), healthy (no
+	// fail), tool absent (no online flip). Any extra UPDATE would be unmatched.
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"workspace_id":"ws-warm-timeout","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["a2a"]}`
+	body := `{"workspace_id":"ws-warm-hold-long","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["a2a"]}`
 	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -156,7 +158,56 @@ func TestHeartbeat_PlatformWarming_PastGraceMarksFailed(t *testing.T) {
 		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations (warming timeout → failed): %v", err)
+		t.Errorf("unmet sqlmock expectations (healthy long-warming must HOLD, not fail): %v", err)
+	}
+}
+
+// TestHeartbeat_PlatformWarming_UnhealthyLongWarmingStillHolds proves the clock
+// fail is gone even for an UNHEALTHY warming concierge: one that self-reports
+// error_rate ≥ 0.5 AND has been warming well past the old 180s grace is HELD (not
+// promoted, not failed). Holding — rather than force-failing — lets a TRANSIENT
+// unhealth clear on a later heartbeat and then promote, instead of killing a
+// recoverable concierge on a clock. (A genuinely dead box is caught by the
+// liveness sweep once it stops heartbeating.) mcp_unloaded_since is already set,
+// so no re-stamp and no other write occurs.
+func TestHeartbeat_PlatformWarming_UnhealthyLongWarmingStillHolds(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-warm-unhealthy").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-warm-unhealthy", 0.9, "", 0, 60, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+		WithArgs(sqlmock.AnyArg(), "ws-warm-unhealthy").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Unhealthy AND warming since well past the OLD 180s grace — must STILL hold.
+	sustained := time.Now().Add(-10 * time.Minute)
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
+		WithArgs("ws-warm-unhealthy").
+		WillReturnRows(evalStatusRows("provisioning", "platform", nil, sustained))
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs("ws-warm-unhealthy").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	// NO fail, NO re-stamp, NO online flip. Any extra write would be unmatched.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	// error_rate 0.9 ≥ 0.5 → conciergeUnhealthy, but the row is HELD not failed.
+	body := `{"workspace_id":"ws-warm-unhealthy","error_rate":0.9,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["a2a"]}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (unhealthy long-warming must HOLD, not fail): %v", err)
 	}
 }
 
