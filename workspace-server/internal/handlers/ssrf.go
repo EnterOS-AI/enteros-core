@@ -224,10 +224,25 @@ func mustCIDR(s string) net.IPNet {
 // The container-DNS check is an exact match against ws-<workspaceID> (and the
 // legacy truncated ws-<first12>) rather than a broad `strings.HasPrefix(host,
 // "ws-")` check, so a public hostname like `ws-agent.example.com` is correctly
-// classified as external. Platform-provisioned tunnel hostnames
-// (ws-<id>.<appDomain>) are also treated as internal by delegating to
-// isPlatformTunnelHostname, which matches the canonical suffix check used
-// elsewhere in the codebase.
+// classified as external.
+//
+// Tunnel-hostname threat model (why the `isPlatformTunnelHostname` internal
+// exception is safe): the only non-container/non-IP host treated as internal
+// is a platform-provisioned Cloudflare tunnel hostname of the exact shape
+//
+//	ws-<id>.<appDomain>
+//
+// where <appDomain> is MOLECULE_APP_DOMAIN (default "moleculesai.app", which
+// also covers the "staging.moleculesai.app" subdomain). This is NOT the broad
+// `strings.HasPrefix(host, "ws-")` the original review flagged: it additionally
+// requires the host to be a subdomain UNDER the platform's OWN apex domain
+// (suffix "."+<appDomain>). Only the platform controls DNS there, so an
+// attacker cannot register `ws-<realId>.moleculesai.app` to have their public
+// endpoint mis-classified as internal and skip the platform_inbound_secret; a
+// lookalike such as `ws-<id>.attacker.com` fails the suffix check and is
+// classified external. The suffix check delegated to below (registry.go's
+// isPlatformTunnelHostname) is the single canonical definition reused by the
+// registry validateAgentURL SSRF gate — there is no second copy to drift.
 func isExternalAgentURL(workspaceID, agentURL string) bool {
 	u, err := url.Parse(agentURL)
 	if err != nil {

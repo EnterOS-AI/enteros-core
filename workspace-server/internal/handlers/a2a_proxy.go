@@ -546,6 +546,16 @@ func (h *WorkspaceHandler) ReceiveA2AInbound(c *gin.Context) {
 
 	secret, err := wsauth.ReadPlatformInboundSecret(ctx, db.DB, workspaceID)
 	if err != nil {
+		// Deliberate status asymmetry (keep both arms in sync if either changes):
+		//   - ErrNoInboundSecret → 401: the workspace is genuinely not enrolled
+		//     in inbound auth (NULL/empty secret). This is a credential problem
+		//     on the CALLER's side of the trust boundary — from an unauthenticated
+		//     external caller's view it is indistinguishable from a wrong secret,
+		//     so we return an auth error, not a retry hint, and never auto-mint on
+		//     this inbound-receiver path (minting is the platform's job on the
+		//     OUTBOUND dispatch, where proxyA2ARequest lazy-heals + 503s).
+		//   - any other (transient DB) error → 503: retry-worthy, the secret may
+		//     well exist; surfacing 401 here would wrongly imply "not enrolled".
 		if errors.Is(err, wsauth.ErrNoInboundSecret) {
 			log.Printf("ReceiveA2AInbound: no platform_inbound_secret for workspace %s", workspaceID)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace has no inbound secret configured"})
