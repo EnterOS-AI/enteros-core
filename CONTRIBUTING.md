@@ -113,8 +113,8 @@ causing a render loop when any node position changed.
 2. **CI:** the `pr-guards` workflow (calling [molecule-ci `disable-auto-merge-on-push`](https://git.moleculesai.app/molecule-ai/molecule-ci/src/branch/main/.github/workflows/disable-auto-merge-on-push.yml)) fires on every push to an open PR. If auto-merge was already enabled, it's disabled and a comment is posted. You must explicitly re-enable after verifying the new commit.
 
 **Workflow rules that follow from the guards:**
-- Push **all** commits before running `gh pr merge --auto`.
-- If you realize you need another commit after enabling auto-merge: push it, then **re-run** `gh pr merge --auto` — the guard will already have disabled it. The disable + re-enable is the verification step.
+- Push **all** commits before enabling auto-merge on the PR (Gitea's "Merge When Checks Succeed").
+- If you realize you need another commit after enabling auto-merge: push it, then **re-enable** auto-merge — the guard will already have disabled it. The disable + re-enable is the verification step.
 - For changes that depend on each other across PRs (e.g. a build-script change + a workflow that consumes it), prefer a **stack** of PRs (PR-B branched off PR-A's branch, opened only after PR-A is in queue) over amending one in-flight PR.
 
 ### Running Tests
@@ -231,7 +231,7 @@ Code in this repo lands in molecule-core. Some related runtime artifacts
 live in their own repos:
 
 - [`molecule-ai/molecule-ai-workspace-runtime`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-runtime) — Python adapter SDK (`molecule_runtime`) that runs inside containerized Molecule workspaces. Bridges Claude Code SDK / hermes / langgraph / etc. → A2A queue.
-- [`molecule-ai/molecule-external-workspace-sdk`](https://git.moleculesai.app/molecule-ai/molecule-external-workspace-sdk) — `A2AServer` + `RemoteAgentClient` for external agents that register over the public `/registry/register` flow.
+- [`molecule-ai/molecule-ai-sdk`](https://git.moleculesai.app/molecule-ai/molecule-ai-sdk) — `A2AServer` + `RemoteAgentClient` for external agents that register over the public `/registry/register` flow.
 - [`molecule-ai/molecule-mcp-claude-channel`](https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel) — Claude Code channel plugin. Bridges A2A traffic into a running Claude Code session via MCP `notifications/claude/channel`. Polling-based (no tunnel required); install inside Claude Code via `/plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git` → `/plugin install molecule@molecule-channel`, then launch with `claude --dangerously-load-development-channels=plugin:molecule@molecule-channel`.
 
 When extending the **A2A surface** in molecule-core (`workspace-server/internal/handlers/a2a_proxy.go` etc.), consider whether the change has a downstream impact on the runtime SDK or the channel plugin — they're versioned independently but share the wire shape.

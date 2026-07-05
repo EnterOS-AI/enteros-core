@@ -1,3 +1,4 @@
+# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
 name: Staging verify
 
 # Renamed from canary-verify.yml on 2026-05-11 per Hongming directive
@@ -62,10 +63,11 @@ name: Staging verify
 #     are populated.
 
 on:
-  push:
-    branches: [staging]
-    paths:
-      - '.gitea/workflows/publish-workspace-server-image.yml'
+  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+#   push:
+#     branches: [staging]
+#     paths:
+#       - '.gitea/workflows/publish-workspace-server-image.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -91,7 +93,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     outputs:
       sha: ${{ steps.compute.outputs.sha }}
@@ -214,7 +216,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     env:
       SHA: ${{ needs.staging-smoke.outputs.sha }}

@@ -44,7 +44,7 @@ describe("useChatSend — multi-send (core#2697 feature 2)", () => {
 
     const onUserMessage = vi.fn();
     const { result } = renderHook(() =>
-      useChatSend("ws-1", { getHistoryMessages: () => [], onUserMessage }),
+      useChatSend("ws-1", { onUserMessage }),
     );
 
     await act(async () => {
@@ -76,7 +76,7 @@ describe("useChatSend — multi-send (core#2697 feature 2)", () => {
     apiPostMock.mockImplementation(() => new Promise(() => {}));
     const onUserMessage = vi.fn();
     const { result } = renderHook(() =>
-      useChatSend("ws-1", { getHistoryMessages: () => [], onUserMessage }),
+      useChatSend("ws-1", { onUserMessage }),
     );
 
     await act(async () => {
@@ -94,7 +94,7 @@ describe("useChatSend — multi-send (core#2697 feature 2)", () => {
     apiPostMock.mockImplementation(() => new Promise(() => {}));
     const onUserMessage = vi.fn();
     const { result } = renderHook(() =>
-      useChatSend("ws-1", { getHistoryMessages: () => [], onUserMessage }),
+      useChatSend("ws-1", { onUserMessage }),
     );
     await act(async () => {
       await result.current.sendMessage("   ");
@@ -110,7 +110,7 @@ describe("useChatSend — multi-send (core#2697 feature 2)", () => {
     apiPostMock.mockRejectedValueOnce(err);
     const onUserMessage = vi.fn();
     const { result } = renderHook(() =>
-      useChatSend("ws-1", { getHistoryMessages: () => [], onUserMessage }),
+      useChatSend("ws-1", { onUserMessage }),
     );
     await act(async () => {
       await result.current.sendMessage("long migrate task");
@@ -128,7 +128,7 @@ describe("useChatSend — multi-send (core#2697 feature 2)", () => {
     const err = Object.assign(new Error("API POST /workspaces/ws-1/a2a: 522 "), { status: 522 });
     apiPostMock.mockRejectedValueOnce(err);
     const { result } = renderHook(() =>
-      useChatSend("ws-1", { getHistoryMessages: () => [] }),
+      useChatSend("ws-1", {}),
     );
     await act(async () => {
       await result.current.sendMessage("hi");

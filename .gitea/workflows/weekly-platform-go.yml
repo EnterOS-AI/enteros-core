@@ -18,8 +18,6 @@ name: Weekly Platform-Go Surface
 # Why 04:17 UTC on Monday: off-peak, before the weekly sprint cycle starts.
 
 on:
-  schedule:
-    - cron: '17 4 * * 1'  # Mondays at 04:17 UTC
   workflow_dispatch:
 
 permissions:
@@ -31,7 +29,7 @@ jobs:
     name: Weekly Platform-Go Surface
     runs-on: ubuntu-latest
     # continue-on-error: surface only, never block
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     defaults:
       run:

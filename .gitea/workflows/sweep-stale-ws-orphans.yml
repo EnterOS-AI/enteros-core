@@ -42,11 +42,6 @@ name: Sweep stale ws-* workspace orphans (runner host)
 # ubuntu-latest run on a Windows act_runner would inspect the WRONG daemon.
 
 on:
-  schedule:
-    # Hourly. The 2-hour age floor (WS_MAX_AGE_HOURS) is the actual safety
-    # margin against catching an in-flight run; hourly cadence keeps the
-    # worst-case orphan lifetime to ~3h instead of multi-day.
-    - cron: '17 * * * *'
   workflow_dispatch:
 
 # Don't let two sweeps fight over the same daemon. Cron + a manual dispatch

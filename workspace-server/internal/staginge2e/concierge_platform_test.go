@@ -31,9 +31,10 @@ package staginge2e
 //     platform agent (was 401 before validateDiscoveryCaller's admin fallback;
 //     discovery.go). A 401 here is the exact regression this guards.
 //
-//  5. BYOK billing
-//     GET/PUT /admin/workspaces/:id/llm-billing-mode round-trips
-//     (platform_managed → byok → clear), asserting resolved_mode each step.
+//  5. (removed 2026-06-30) BYOK billing-mode round-trip — the per-workspace
+//     llm_billing_mode field and its /admin/workspaces/:id/llm-billing-mode
+//     endpoint were removed; platform-vs-BYOK now derives from the provider
+//     registry, so there is no mode to round-trip.
 //
 //  6. Config-tab endpoint sweep for the platform agent
 //     The per-workspace canvas config tabs (traces / plugins / schedules /
@@ -282,52 +283,11 @@ func TestConciergePlatformAgent_Staging(t *testing.T) {
 		t.Logf("peers admin-auth OK (HTTP %d, %d peer(s), child visible)", hs, len(peers))
 	})
 
-	// ── Feature 5: BYOK billing-mode round-trip ──────────────────────────────
-	t.Run("byok_billing_mode_roundtrip", func(t *testing.T) {
-		base := "https://" + host + "/admin/workspaces/" + ordinaryWS + "/llm-billing-mode"
-
-		// GET current mode — must resolve to a known enum.
-		hs, body := doTenantJSON(t, "GET", base, token, orgID, "")
-		if hs != http.StatusOK {
-			t.Fatalf("GET billing-mode: HTTP %d: %s", hs, body)
-		}
-		got := jsonField(body, "resolved_mode")
-		if got != "platform_managed" && got != "byok" {
-			t.Fatalf("GET billing-mode resolved_mode=%q (want platform_managed|byok): %s", got, body)
-		}
-		t.Logf("initial resolved_mode=%q", got)
-
-		// PUT mode=byok — explicit per-workspace override → resolved byok.
-		hs, body = doTenantJSON(t, "PUT", base, token, orgID, `{"mode":"byok"}`)
-		if hs != http.StatusOK {
-			t.Fatalf("PUT billing-mode byok: HTTP %d: %s", hs, body)
-		}
-		if got := jsonField(body, "resolved_mode"); got != "byok" {
-			t.Fatalf("PUT mode=byok → resolved_mode=%q (want byok): %s", got, body)
-		}
-
-		// GET again — the override persists.
-		hs, body = doTenantJSON(t, "GET", base, token, orgID, "")
-		if hs != http.StatusOK || jsonField(body, "resolved_mode") != "byok" {
-			t.Fatalf("GET after PUT byok: HTTP %d resolved_mode=%q: %s", hs, jsonField(body, "resolved_mode"), body)
-		}
-
-		// PUT mode=null — clears the override (back to derived/default).
-		hs, body = doTenantJSON(t, "PUT", base, token, orgID, `{"mode":null}`)
-		if hs != http.StatusOK {
-			t.Fatalf("PUT billing-mode null (clear): HTTP %d: %s", hs, body)
-		}
-		if got := jsonField(body, "resolved_mode"); got != "platform_managed" && got != "byok" {
-			t.Fatalf("PUT mode=null → resolved_mode=%q (want a known enum): %s", got, body)
-		}
-
-		// An unknown mode string must 400 (validation contract).
-		hs, body = doTenantJSON(t, "PUT", base, token, orgID, `{"mode":"banana"}`)
-		if hs != http.StatusBadRequest {
-			t.Fatalf("PUT mode=banana → HTTP %d (want 400): %s", hs, body)
-		}
-		t.Logf("billing-mode round-trip (platform_managed→byok→clear) + 400 on invalid mode OK")
-	})
+	// Feature 5 (BYOK billing-mode round-trip) was removed 2026-06-30 together
+	// with the per-workspace llm_billing_mode field and the
+	// /admin/workspaces/:id/llm-billing-mode endpoint. Platform-vs-BYOK now
+	// derives purely from the provider registry, so there is no mode to set or
+	// round-trip.
 
 	// ── Feature 6: config-tab endpoint sweep for the concierge ───────────────
 	t.Run("config_tab_sweep_for_concierge", func(t *testing.T) {

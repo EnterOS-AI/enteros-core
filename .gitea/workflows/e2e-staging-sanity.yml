@@ -1,3 +1,12 @@
+# KEPT DORMANT (group A — molecules-server cutover): unlike the other three e2e lanes, this one
+# CANNOT be switched to molecules-server here. It is the self-check that the teardown safety net
+# terminates a leaked *EC2 instance* — E2E_AWS_LEAK_CHECK=required + AWS creds +
+# E2E_AWS_TERMINATE_LEAKS — an AWS-EC2-specific assertion. It also drives the a9f331fa-owned
+# harness tests/e2e/test_staging_full_saas.sh, which hardcodes the org-create body with NO
+# provider knob, so a workflow-env-only switch is impossible without editing that (out-of-scope)
+# harness. It therefore stays workflow_dispatch-only until a9f331fa reworks the leak-check to
+# inspect docker containers instead of EC2 instances; re-enabling push/pull_request now would
+# gate on the intentionally-closed AWS path. See ABSTRACTION-FINDINGS.
 name: E2E Staging Sanity (leak-detection self-check)
 
 # Ported from .github/workflows/e2e-staging-sanity.yml on 2026-05-11 per
@@ -10,17 +19,19 @@ name: E2E Staging Sanity (leak-detection self-check)
 #   - Workflow-level env.GITHUB_SERVER_URL set.
 #   - `continue-on-error: true` on the job (RFC §1 contract).
 #
-# Periodic assertion that the teardown safety nets in e2e-staging-saas
-# and staging-smoke (formerly canary-staging) actually work. Runs the
+# On-demand assertion that the teardown safety nets in e2e-staging-saas
+# actually work (the standalone staging-smoke probe was retired into the
+# e2e-staging-saas gate). Runs the
 # E2E harness with E2E_INTENTIONAL_FAILURE=1, which poisons the tenant
 # admin token after the org is provisioned. The workspace-provision
 # step then fails, the script exits non-zero, and the EXIT trap +
 # workflow always()-step must still tear down cleanly.
 
 on:
-  schedule:
-    - cron: '0 6 * * 1'
-
+  # DISABLED 2026-06-27: AWS account closed; pending local-docker rework. See ABSTRACTION-FINDINGS.
+  # The schedule/cron trigger was DELETED (no-nightly-e2e rule) — not commented.
+  # Manual workflow_dispatch only.
+  workflow_dispatch:
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
@@ -37,7 +48,7 @@ jobs:
     name: Intentional-failure teardown sanity
     runs-on: ubuntu-latest
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     timeout-minutes: 20
 

@@ -8,6 +8,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -522,6 +523,64 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	c.Data(status, "application/json", respBody)
 }
 
+// ReceiveA2AInbound handles POST /workspaces/:id/a2a/inbound.
+//
+// External agents POST A2A JSON-RPC messages here to reach a workspace that
+// lives on the platform. The caller must authenticate with the target
+// workspace's platform_inbound_secret in the Authorization header. After a
+// successful constant-time comparison, the message is forwarded through the
+// same ProxyA2A path used by canvas/peer traffic.
+//
+// The X-Workspace-ID header is stripped before forwarding so the downstream
+// proxy treats this as an inbound/canvas-class request rather than attempting
+// workspace-token validation on a value supplied by an external caller.
+func (h *WorkspaceHandler) ReceiveA2AInbound(c *gin.Context) {
+	workspaceID := c.Param("id")
+	ctx := c.Request.Context()
+
+	bearer := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
+	if bearer == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing Authorization header"})
+		return
+	}
+
+	secret, err := wsauth.ReadPlatformInboundSecret(ctx, db.DB, workspaceID)
+	if err != nil {
+		// Deliberate status asymmetry (keep both arms in sync if either changes):
+		//   - ErrNoInboundSecret → 401: the workspace is genuinely not enrolled
+		//     in inbound auth (NULL/empty secret). This is a credential problem
+		//     on the CALLER's side of the trust boundary — from an unauthenticated
+		//     external caller's view it is indistinguishable from a wrong secret,
+		//     so we return an auth error, not a retry hint, and never auto-mint on
+		//     this inbound-receiver path (minting is the platform's job on the
+		//     OUTBOUND dispatch, where proxyA2ARequest lazy-heals + 503s).
+		//   - any other (transient DB) error → 503: retry-worthy, the secret may
+		//     well exist; surfacing 401 here would wrongly imply "not enrolled".
+		if errors.Is(err, wsauth.ErrNoInboundSecret) {
+			log.Printf("ReceiveA2AInbound: no platform_inbound_secret for workspace %s", workspaceID)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace has no inbound secret configured"})
+			return
+		}
+		log.Printf("ReceiveA2AInbound: failed to read platform_inbound_secret for workspace %s: %v", workspaceID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "inbound auth unavailable"})
+		return
+	}
+
+	if subtle.ConstantTimeCompare([]byte(bearer), []byte(secret)) != 1 {
+		log.Printf("ReceiveA2AInbound: invalid platform_inbound_secret for workspace %s", workspaceID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid inbound secret"})
+		return
+	}
+
+	// Strip any caller-supplied X-Workspace-ID and the consumed Authorization
+	// header so the downstream proxy cannot be coerced into workspace-token
+	// validation using external-controlled values, and so the inbound secret is
+	// not forwarded to the target workspace.
+	c.Request.Header.Del("X-Workspace-ID")
+	c.Request.Header.Del("Authorization")
+	h.ProxyA2A(c)
+}
+
 // checkWorkspaceBudget returns a proxyA2AError with 402 when the workspace has
 // exceeded ANY of its configured per-period budget limits (hourly/daily/weekly/
 // monthly — see budget_periods.go). Per-period spend is the rolling-window sum
@@ -620,6 +679,26 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	}
 	body = normalizedBody
 
+	// Server-side session-continuity belt (concierge double-greeting fix).
+	// A canvas-origin message/send that arrives WITHOUT a message.contextId
+	// makes the runtime a2a-sdk mint a FRESH context_id per request, so any
+	// runtime that keys its native session on it (openclaw's SessionManager,
+	// the base executor's LangGraph thread_id) opens a NEW session every turn
+	// → the agent re-greets with no prior context (the "identical greeting
+	// twice" bug). The canvas client-side fix threads a stable contextId, but
+	// a STALE canvas bundle, a third-party A2A client, or an MCP bridge that
+	// never sends one still resets every turn. Inject a stable, deterministic
+	// contextId derived from the workspace so the session resumes regardless of
+	// client version. A caller-supplied contextId is PRESERVED untouched, so an
+	// updated canvas's "New session" rotation keeps working. Only canvas-origin
+	// turns (anonymous callerID=="" or an authenticated canvas user) — agent-to-
+	// agent and system (warmup) traffic carry their own context semantics.
+	if a2aMethod == "message/send" && (callerID == "" || isCanvasUser) {
+		if rewritten, changed := ensureCanvasSessionContextID(body, workspaceID); changed {
+			body = rewritten
+		}
+	}
+
 	// core#2127 RC 13392: a workspace with can_delegate=false MUST NOT be
 	// able to send a delegation via the raw A2A message/send path. The MCP
 	// tools/list+tools/call+helper gates (PR#3165+#3168) and the REST
@@ -646,6 +725,23 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		}
 	}
 
+	// core#3082 warming gate: a kind=platform concierge in 'provisioning' is UP
+	// but NOT yet VERIFIED able to serve a turn (provision_workspace not loaded).
+	// Dispatching now falls to poll-mode 'queued' and hangs with no reply (the
+	// 675s dead-air the principal hit in test1). Defer a real caller with 503 +
+	// Retry-After (the canvas renders a warming state and auto-retries post-flip,
+	// mirroring the existing hibernation-wake contract). EXEMPT system callers —
+	// system:concierge-warmup MUST reach the runtime DURING warming, it produces
+	// the loaded_mcp_tools capture that drives the verified flip — and self-calls.
+	// Placed AFTER access-control + budget + can_delegate so an unauthorized /
+	// over-budget caller still gets 403/429 first (denial hierarchy preserved),
+	// and BEFORE persist so a deferred call leaves no half-persisted bubble.
+	if !isSystemCaller(callerID) && callerID != workspaceID {
+		if proxyErr := h.conciergeWarmingGate(ctx, workspaceID); proxyErr != nil {
+			return 0, nil, proxyErr
+		}
+	}
+
 	// #2560 (chat UX: persist in-flight exchange across leave/refresh):
 	// write the user message to activity_logs AT RECEIPT — before any of
 	// the downstream short-circuits (poll-mode, mock-runtime, push dispatch)
@@ -659,7 +755,13 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	//
 	// Skipped when the body has no messageId (system callers, legacy
 	// a2a_send payloads) — the completion path remains authoritative.
-	if a2aMethod == "message/send" {
+	//
+	// core#3082: also skip for system callers so the platform-fired warmup turn
+	// (system:concierge-warmup) does NOT leak as a user bubble. The warmup body
+	// carries a messageId (so persistUserMessageAtIngest would otherwise INSERT a
+	// USER_MESSAGE row + broadcast "Platform readiness check — no action needed."),
+	// but a system-initiated self-turn is not a user message.
+	if a2aMethod == "message/send" && !isSystemCaller(callerID) {
 		h.persistUserMessageAtIngest(ctx, workspaceID, callerID, body, a2aMethod)
 	}
 
@@ -758,8 +860,38 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		}
 	}
 
+	// core#3319: external agents (public /a2a/inbound endpoints) must receive
+	// the workspace's platform_inbound_secret in the Authorization header.
+	// Internal container addresses are unchanged. Reuses the same per-workspace
+	// bearer that already gates /internal/* forwards (chat_files.go).
+	inboundSecret := ""
+	if isExternalAgentURL(workspaceID, agentURL) {
+		secret, healed, secretErr := readOrLazyHealInboundSecret(ctx, workspaceID, "ProxyA2A")
+		if secretErr != nil {
+			log.Printf("ProxyA2A: no platform_inbound_secret for external workspace %s: %v", workspaceID, secretErr)
+			return 0, nil, &proxyA2AError{
+				Status: http.StatusServiceUnavailable,
+				Response: gin.H{
+					"error":  "workspace not yet enrolled in inbound auth (RFC #2312)",
+					"detail": "Failed to read platform_inbound_secret. Reprovision the workspace if this persists.",
+				},
+			}
+		}
+		if healed {
+			return 0, nil, &proxyA2AError{
+				Status: http.StatusServiceUnavailable,
+				Response: gin.H{
+					"error":               "workspace re-registering — please retry in 30 seconds",
+					"detail":              "Inbound auth secret was just minted. Workspace will pick it up on its next heartbeat.",
+					"retry_after_seconds": 30,
+				},
+			}
+		}
+		inboundSecret = secret
+	}
+
 	startTime := time.Now()
-	resp, cancelFwd, err := h.dispatchA2A(ctx, workspaceID, agentURL, body, callerID)
+	resp, cancelFwd, err := h.dispatchA2A(ctx, workspaceID, agentURL, body, callerID, inboundSecret)
 	if cancelFwd != nil {
 		defer cancelFwd()
 	}
@@ -967,6 +1099,41 @@ func (h *WorkspaceHandler) SendConciergeWarmupA2A(ctx context.Context, workspace
 	return status, respBody, nil
 }
 
+// conciergeWarmingGate returns a 503 + Retry-After deferral when the target is a
+// kind=platform concierge still HELD in 'provisioning' (warming) — i.e. it is UP
+// but has not yet proven provision_workspace is callable (core#3082). Dispatching
+// to it would fall to poll-mode 'queued' and hang with no reply. The caller-side
+// system/self exemption lives at the call site (the warmup itself MUST get
+// through). Mirrors the hibernation-wake 503 contract (Retry-After + a structured
+// {warming:true} body the canvas can auto-retry on).
+//
+// Fail-OPEN: sql.ErrNoRows returns nil so resolveAgentURL can emit the canonical
+// 404; any other DB error returns nil so a transient lookup failure never blocks
+// legitimate traffic. Non-platform / non-provisioning targets return nil (no-op).
+func (h *WorkspaceHandler) conciergeWarmingGate(ctx context.Context, workspaceID string) *proxyA2AError {
+	var wsKind, wsStatus string
+	err := db.DB.QueryRowContext(ctx,
+		`SELECT kind, status FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&wsKind, &wsStatus)
+	if err != nil {
+		// ErrNoRows → let resolveAgentURL 404; other errors → fail open.
+		return nil
+	}
+	if wsKind != models.KindPlatform || wsStatus != string(models.StatusProvisioning) {
+		return nil
+	}
+	log.Printf("ProxyA2A: deferring caller -> warming platform concierge %s (503 + Retry-After, core#3082)", workspaceID)
+	return &proxyA2AError{
+		Status:  http.StatusServiceUnavailable,
+		Headers: map[string]string{"Retry-After": "5"},
+		Response: gin.H{
+			"error":       "concierge is warming up (verifying management tools) — retry shortly",
+			"warming":     true,
+			"retry_after": 5,
+		},
+	}
+}
+
 // resolveAgentURL returns a routable URL for the target workspace agent. It
 // checks the Redis URL cache first, then falls back to a DB lookup, caching
 // the result on success. When the platform runs inside Docker, 127.0.0.1:<host
@@ -997,9 +1164,16 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 			// Auto-wake hibernated workspace on incoming A2A message (#711).
 			// Re-provision asynchronously and return 503 with a retry hint so
 			// the caller can retry once the workspace is back online (~10s).
+			//
+			// MUST use WakeWorkspace, NOT RestartByID: a hibernated ws's container
+			// is genuinely stopped, and RestartByID → runRestartCycle SELECTs
+			// `status NOT IN (...,'hibernated')` and returns early, so it never
+			// re-provisions — the box would stay hibernated forever (verified live:
+			// "waking" logged + 503 returned, but the workspace never came back).
+			// WakeWorkspace does the hibernated→provisioning claim + re-provision.
 			if status == "hibernated" {
 				log.Printf("ProxyA2A: waking hibernated workspace %s", workspaceID)
-				h.goAsync(func() { h.RestartByID(workspaceID) })
+				h.goAsync(func() { h.WakeWorkspace(workspaceID) })
 				return "", &proxyA2AError{
 					Status:  http.StatusServiceUnavailable,
 					Headers: map[string]string{"Retry-After": "15"},
@@ -1170,6 +1344,59 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 	return marshaledBody, a2aMethod, nil
 }
 
+// canvasSessionContextID is the deterministic, per-workspace conversation id
+// injected as message.contextId for canvas-origin turns that arrive WITHOUT
+// one. Derived SOLELY from the workspace id so it is STABLE across turns and
+// across process restarts — exactly the property runtime session resumption
+// needs. The workspace id is a UUID (dash-delimited, no colons), so the
+// resulting id survives any runtime session-id sanitisation unchanged.
+func canvasSessionContextID(workspaceID string) string {
+	return "canvas-" + workspaceID
+}
+
+// ensureCanvasSessionContextID injects a stable, deterministic contextId into a
+// canvas-origin message/send envelope that lacks one, and reports whether it
+// rewrote the body. It is the server half of the concierge double-greeting fix:
+// without a stable contextId the runtime a2a-sdk mints a fresh context_id per
+// request, resetting any session keyed on it (openclaw's SessionManager, the
+// LangGraph thread_id) → the agent re-greets every turn.
+//
+// A caller-supplied, non-empty contextId is PRESERVED untouched (so an updated
+// canvas's per-conversation id and its "New session" rotation still govern the
+// session). The injection only fills the GAP left by clients that never send
+// one — a stale canvas bundle, a third-party A2A client, or an MCP bridge.
+//
+// Best-effort and non-destructive: any parse/marshal problem returns the
+// original body unchanged (the caller has already run normalizeA2APayload, so
+// a well-formed message/send envelope is expected here).
+func ensureCanvasSessionContextID(body []byte, workspaceID string) ([]byte, bool) {
+	if workspaceID == "" {
+		return body, false
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, false
+	}
+	params, ok := payload["params"].(map[string]interface{})
+	if !ok {
+		return body, false
+	}
+	msg, ok := params["message"].(map[string]interface{})
+	if !ok {
+		return body, false
+	}
+	// Preserve any non-empty caller-supplied contextId.
+	if existing, ok := msg["contextId"].(string); ok && strings.TrimSpace(existing) != "" {
+		return body, false
+	}
+	msg["contextId"] = canvasSessionContextID(workspaceID)
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return rewritten, true
+}
+
 // idleTimeoutDuration is the per-dispatch silence window: if the
 // platform's broadcaster emits no events for this workspace for the
 // full duration, the dispatch ctx is cancelled. Resets on every
@@ -1246,7 +1473,7 @@ func parseIdleTimeoutEnv(v string) time.Duration {
 //
 // Either layer is overridable by the X-Timeout header upstream in
 // ProxyA2A; X-Timeout: 0 explicitly disables the absolute ceiling.
-func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentURL string, body []byte, callerID string) (*http.Response, context.CancelFunc, error) {
+func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentURL string, body []byte, callerID string, inboundSecret string) (*http.Response, context.CancelFunc, error) {
 	// #1483 SSRF defense-in-depth: the primary call path through
 	// proxyA2ARequest → resolveAgentURL already validates via isSafeURL
 	// (a2a_proxy.go:424), but adding the check here closes the gap for
@@ -1309,6 +1536,9 @@ func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentUR
 		return nil, nil, &proxyDispatchBuildError{err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if inboundSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+inboundSecret)
+	}
 	resp, doErr := a2aClient.Do(req)
 	return resp, cancel, doErr
 }

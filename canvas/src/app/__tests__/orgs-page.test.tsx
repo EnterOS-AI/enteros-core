@@ -173,6 +173,32 @@ describe("/orgs — CTAs by status", () => {
     expect(link.href).toBe("https://acme.moleculesai.app/");
   });
 
+  it("running on staging → Open link targets {slug}.staging.moleculesai.app (not the apex)", async () => {
+    // Served from the staging app host; the tenant base domain must be the
+    // staging subdomain, derived from the host — not the prod apex.
+    setLocation("https://app.staging.moleculesai.app/orgs");
+    mockFetchSession.mockResolvedValue(session);
+    mockFetch.mockResolvedValueOnce(
+      okJson({
+        orgs: [
+          {
+            id: "o-1",
+            slug: "acme",
+            name: "Acme",
+            plan: "pro",
+            status: "running",
+            created_at: "",
+            updated_at: "",
+          },
+        ],
+      })
+    );
+    render(<OrgsPage />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+    const link = screen.getByRole("link", { name: /open/i }) as HTMLAnchorElement;
+    expect(link.href).toBe("https://acme.staging.moleculesai.app/");
+  });
+
   it("awaiting_payment → Complete payment link to /pricing?org=<slug>", async () => {
     mockFetchSession.mockResolvedValue(session);
     mockFetch.mockResolvedValueOnce(

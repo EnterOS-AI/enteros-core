@@ -24,10 +24,12 @@
     {"name": "molecule-skill-update-docs", "repo": "molecule-ai/molecule-ai-plugin-molecule-skill-update-docs", "ref": "0919b2e3a91197a702a0b4c068330882eb91572f"},
     {"name": "molecule-workflow-retro", "repo": "molecule-ai/molecule-ai-plugin-molecule-workflow-retro", "ref": "418062bd4416a7785ca1972fed33f685f2dd3114"},
     {"name": "molecule-workflow-triage", "repo": "molecule-ai/molecule-ai-plugin-molecule-workflow-triage", "ref": "fe63415f42d96e1b8ed3ea3bbef3b27fb31c9734"},
-    {"name": "superpowers", "repo": "molecule-ai/molecule-ai-plugin-superpowers", "ref": "b4e56ff9740099c62b8f8cae6619f66eb55c3201"}
+    {"name": "superpowers", "repo": "molecule-ai/molecule-ai-plugin-superpowers", "ref": "b4e56ff9740099c62b8f8cae6619f66eb55c3201"},
+    {"name": "lark-channel", "repo": "molecule-ai/lark-channel-molecule", "ref": "b9b8bf16921ed168995f53207a5751f9780d6b7c"}
   ],
   "workspace_templates": [
     {"name": "claude-code-default", "repo": "molecule-ai/molecule-ai-workspace-template-claude-code", "ref": "950d39a490c12ba0f355ed8ca03b23fda9884823"},
+    {"name": "platform-agent", "repo": "molecule-ai/molecule-ai-workspace-template-platform-agent", "ref": "c227fecb7b75ab34821c432ec7a0a5aee91a5dd2", "runtime": "claude-code", "private": true},
     {"name": "hermes", "repo": "molecule-ai/molecule-ai-workspace-template-hermes", "ref": "ca7e1efafb982f6d97a6a188067fd9198b2f18b7"},
     {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "143e69b56f2530433141f5a87373e8a76578c52e"},
     {"name": "codex", "repo": "molecule-ai/molecule-ai-workspace-template-codex", "ref": "070447a0afdf66ae6f2bb166ac3e2b2884456951"},

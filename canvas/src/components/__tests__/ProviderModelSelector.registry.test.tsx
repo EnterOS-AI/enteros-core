@@ -2,11 +2,10 @@
 //
 // internal#718 P3 (retire-list #4) — when GET /templates serves a
 // registry-backed selectable list (registry_providers + registry_models with
-// display_name / billing_mode / derived provider), the canvas builds the
-// provider catalog FROM that registry data instead of re-inferring vendor
-// from model-id prefixes (VENDOR_LABELS / BARE_VENDOR_PATTERNS / inferVendor).
-// The heuristic path stays only as the fallback for non-registry runtimes /
-// older backends.
+// display_name / derived provider), the canvas builds the provider catalog
+// FROM that registry data instead of re-inferring vendor from model-id
+// prefixes (VENDOR_LABELS / BARE_VENDOR_PATTERNS / inferVendor). The heuristic
+// path stays only as the fallback for non-registry runtimes / older backends.
 
 import { describe, it, expect } from "vitest";
 import {
@@ -16,34 +15,31 @@ import {
 } from "../ProviderModelSelector";
 
 // Mirrors the registry-served claude-code payload from GET /templates
-// (registry_providers / registry_models). display_name + billing_mode come
-// from the registry, NOT from the canvas VENDOR_LABELS map.
+// (registry_providers / registry_models). display_name comes from the
+// registry, NOT from the canvas VENDOR_LABELS map.
 const CLAUDE_CODE_REGISTRY_PROVIDERS: RegistryProvider[] = [
   {
     name: "anthropic-oauth",
     display_name: "Claude Code subscription",
     auth_env: ["CLAUDE_CODE_OAUTH_TOKEN"],
-    billing_mode: "byok",
   },
   {
     name: "anthropic-api",
     display_name: "Anthropic API",
     auth_env: ["ANTHROPIC_API_KEY"],
-    billing_mode: "byok",
   },
   {
     name: "platform",
     display_name: "Platform",
     auth_env: ["ANTHROPIC_API_KEY", "MOLECULE_LLM_USAGE_TOKEN"],
-    billing_mode: "platform_managed",
   },
 ];
 
 const CLAUDE_CODE_REGISTRY_MODELS: RegistryModel[] = [
-  { id: "sonnet", provider: "anthropic-oauth", billing_mode: "byok" },
-  { id: "opus", provider: "anthropic-oauth", billing_mode: "byok" },
-  { id: "claude-opus-4-7", provider: "anthropic-api", billing_mode: "byok" },
-  { id: "anthropic/claude-opus-4-7", provider: "platform", billing_mode: "platform_managed" },
+  { id: "sonnet", provider: "anthropic-oauth" },
+  { id: "opus", provider: "anthropic-oauth" },
+  { id: "claude-opus-4-7", provider: "anthropic-api" },
+  { id: "anthropic/claude-opus-4-7", provider: "platform" },
 ];
 
 describe("buildProviderCatalogFromRegistry", () => {
@@ -76,15 +72,6 @@ describe("buildProviderCatalogFromRegistry", () => {
     expect(oauth!.label).toContain("Claude Code subscription");
   });
 
-  it("carries the registry billing_mode per provider", () => {
-    const catalog = buildProviderCatalogFromRegistry(
-      CLAUDE_CODE_REGISTRY_PROVIDERS,
-      CLAUDE_CODE_REGISTRY_MODELS,
-    );
-    expect(catalog.find((p) => p.vendor === "anthropic-oauth")!.billingMode).toBe("byok");
-    expect(catalog.find((p) => p.vendor === "platform")!.billingMode).toBe("platform_managed");
-  });
-
   it("surfaces the registry auth_env on the provider entry", () => {
     const catalog = buildProviderCatalogFromRegistry(
       CLAUDE_CODE_REGISTRY_PROVIDERS,
@@ -99,7 +86,7 @@ describe("buildProviderCatalogFromRegistry", () => {
     // anthropic-api is a registry provider but has no model in this slice →
     // it should not appear as an empty bucket.
     const models: RegistryModel[] = [
-      { id: "sonnet", provider: "anthropic-oauth", billing_mode: "byok" },
+      { id: "sonnet", provider: "anthropic-oauth" },
     ];
     const catalog = buildProviderCatalogFromRegistry(
       CLAUDE_CODE_REGISTRY_PROVIDERS,

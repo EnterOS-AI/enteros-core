@@ -52,8 +52,8 @@ Three layers, all required:
    the workflow + PR review.
 3. **Agent prompts** — `SHARED_RULES.md` rule (in
    `molecule-ai-org-template-molecule-dev`) tells every agent role to
-   write internal content to `Molecule-AI/internal` directly via `gh repo
-   clone` + commit + PR. This is the prevention-at-source layer.
+   write internal content to `molecule-ai/internal` (on Gitea) directly via
+   `git clone` + commit + PR. This is the prevention-at-source layer.
 
 If you're hitting the CI gate and your file genuinely belongs in this repo,
 edit `FORBIDDEN_PATTERNS` in the workflow with reviewer signoff. Don't
@@ -64,7 +64,8 @@ work around the gate by renaming files.
 ```bash
 # One-time clone (idempotent — re-running is a no-op)
 mkdir -p ~/repos
-test -d ~/repos/internal || gh repo clone Molecule-AI/internal ~/repos/internal
+test -d ~/repos/internal || git clone \
+  https://git.moleculesai.app/molecule-ai/internal.git ~/repos/internal
 
 cd ~/repos/internal
 git pull origin main
@@ -79,7 +80,7 @@ git checkout -b <agent-role>/research-<slug>
 git add research/<slug>.md
 git commit -m "research: add <slug>"
 git push -u origin HEAD
-gh pr create --base main --fill
+# then open a PR against molecule-ai/internal on Gitea (web UI or API)
 ```
 
 Yes, this is more steps than `cd molecule-core && git add research/foo.md`.

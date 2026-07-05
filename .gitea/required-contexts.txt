@@ -49,7 +49,44 @@ security-review / approved
 sop-checklist / all-items-acked
 reserved-path-review / reserved-path-review
 Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
+
+# RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────
+# `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
+# is NO LONGER workflow_dispatch-only: its producer (e2e-staging-saas.yml) was
+# re-enabled on push + pull_request and the job now provisions on the
+# MOLECULES-SERVER (local-docker, provider='local') backend — no AWS creds, no
+# EC2. It runs as a DEPLOY GATE on push-to-main (continue-on-error:false; a
+# cold-open /workspaces failure REDs the run), and its full-journey script now
+# also carries the COLD-OPEN browser-slug assertion (STEP 2.5) that catches the
+# in-browser /workspaces 404 the admin-bearer probe misses.
+#
+# It is kept BELOW the ENFORCED marker (documented-required, not merge-blocking)
+# for now — two conditions gate promotion, per the repo's validate-before-enforce
+# rule (do NOT promote early or the public-repo merge queue freezes):
+#   1. a GREEN molecules-server run of this job on main, and
+#   2. the PR/fork path posts `success` WITHOUT staging creds (E2E_REQUIRE_LIVE=0
+#      PR-mode self-check) so fork PRs — which cannot read the staging admin token
+#      — do not fail-closed and wedge the queue.
+# When both hold, PROMOTE this line above the ENFORCED marker (and delete this
+# block). Until then, per-PR concierge coverage remains via the deterministic
+# `Concierge Creates Workspace Hermetic` gate (above, ENFORCED) and the
+# local-docker `Local Provision Lifecycle E2E (stub)` lane (below); the real
+# tool-use concierge→provision_workspace→GET /workspaces gate also blocks prod
+# via the controlplane local staging→prod e2e gate (CP #1013).
 E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
+
+# pending-#2409 (not yet enforced) ──────────────────────────────────────
+# The local-docker real-tenant provision lane (local-provision-e2e.yml,
+# job "Local Provision Lifecycle E2E (stub)") provisions a REAL workspace
+# via the local Docker provisioner and asserts the full lifecycle
+# (provision → online → restart-survive → proxy-reach → GET /workspaces
+# usability). It runs per-PR + push:main/staging and gates within the
+# workflow (continue-on-error: false). It is DOCUMENTED-required here and
+# is the intended cheap-per-PR replacement for the AWS staging concierge
+# gate; PROMOTE above once the operator confirms docker-host runners
+# reliably provision sibling containers from the host platform binary
+# (#2409 substrate confirmation).
+Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)
 
 # pending-#3159 (not yet enforced) ──────────────────────────────────────
 # The E2E Staging SaaS context below is DOCUMENTED-required but is

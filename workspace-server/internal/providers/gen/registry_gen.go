@@ -16,7 +16,7 @@ const SchemaVersion = 1
 // Fingerprint is a stable content hash of the generated projection (schema
 // version + provider catalog + runtime native sets). It changes iff the
 // registry DATA changes (comment-only YAML edits do not churn it).
-const Fingerprint = "6663a2ca822243a7"
+const Fingerprint = "e092203f1ce0bd46"
 
 // GenProvider is the generated projection of one provider catalog entry —
 // the subset a downstream consumer needs to derive + display a provider.
@@ -103,7 +103,7 @@ var Runtimes = map[string][]GenRuntimeRef{
 	},
 	"hermes": {
 		{Name: "kimi-coding", Models: []string{"kimi-coding/kimi-k2"}},
-		{Name: "platform", Models: []string{"moonshot/kimi-k2.6", "moonshot/kimi-k2.5"}},
+		{Name: "platform", Models: []string{"moonshot/kimi-k2.6", "moonshot/kimi-k2.5", "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
 		{Name: "openrouter", Models: []string{}},
 		{Name: "huggingface", Models: []string{}},
 		{Name: "ai-gateway", Models: []string{}},

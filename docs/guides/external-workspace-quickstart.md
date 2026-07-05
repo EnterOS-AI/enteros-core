@@ -248,7 +248,7 @@ See the [design doc](https://git.moleculesai.app/molecule-ai/internal/src/branch
 
 ## Examples
 
-- **This quickstart's code**: [gist](https://gist.github.com/molecule-ai/external-workspace-quickstart) (forked for your language of choice)
+- **This quickstart's code**: `molecule-ai/examples/external-workspace-quickstart` (forked for your language of choice)
 - **LLM-backed example**: `molecule-ai/examples/external-claude-agent` — a working agent that proxies to Anthropic's API
 - **Scheduled cron example**: `molecule-ai/examples/external-cron-agent` — fires timed outbound messages without needing inbound
 

@@ -67,13 +67,18 @@ name: lint-bp-context-emit-match
 # - ci-required-drift.yml (F2 detector, narrower-scope sibling)
 
 on:
-  schedule:
-    # Daily at 03:31 UTC — off-peak, prime-staggered from other
-    # scheduled jobs (ci-required-drift :00 hourly, lint-coe-tracking
-    # 13:11). At 03:31 the CI fleet is quietest in EMEA hours.
-    - cron: '31 3 * * *'
   workflow_dispatch:
   # No `push` / `pull_request` here — Tier 2g owns PR-time drift.
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.gitea/workflows/**'
+      - '.gitea/scripts/**'
+  push:
+    branches: [main, staging]
+    paths:
+      - '.gitea/workflows/**'
+      - '.gitea/scripts/**'
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app

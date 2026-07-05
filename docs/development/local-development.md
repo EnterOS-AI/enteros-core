@@ -148,7 +148,7 @@ All E2E scripts share `tests/e2e/_lib.sh` helpers and are shellcheck-clean (enfo
 
 ### CI Pipeline
 
-GitHub Actions runs automatically on push to `main` and on PRs (`.github/workflows/ci.yml`):
+Gitea Actions runs automatically on push to `main` and on PRs (`.gitea/workflows/ci.yml`):
 - **platform-build** — Go build, vet, `go test -race` with coverage profiling (25% baseline threshold; setup-go uses module cache)
 - **canvas-build** — npm build, `vitest run` (no `--passWithNoTests` -- tests must exist and pass)
 - **mcp-server-build** — npm build

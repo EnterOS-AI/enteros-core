@@ -7,6 +7,7 @@ import { useTheme } from "@/lib/theme-provider";
 import { api, PLATFORM_URL } from "@/lib/api";
 import { switchOrgUrl } from "@/lib/org-switch";
 import type { ActivityEntry } from "@/types/activity";
+import { CreatePlatformAgentButton } from "./CreatePlatformAgentButton";
 import { Canvas } from "@/components/Canvas";
 import { CommunicationOverlay } from "@/components/CommunicationOverlay";
 import { MessageFlightHome } from "./MessageFlightHome";
@@ -14,7 +15,9 @@ import { ChatTab } from "@/components/tabs/ChatTab";
 import { WorkspacePanelTabs } from "@/components/WorkspacePanelTabs";
 import { SettingsTabs } from "@/components/settings";
 import s from "./Concierge.module.css";
+import ms from "@/components/monitor/Monitor.module.css";
 import { RequestsInbox } from "./RequestsInbox";
+import { MonitorPanel } from "@/components/monitor/MonitorPanel";
 import {
   IcHome, IcOrgMap, IcSettings, IcSearch, IcBell, IcSun, IcMoon, IcChevDown,
   IcQueue, IcCaret, IcMolecule, IcCheck, IcChat,
@@ -347,6 +350,9 @@ export function ConciergeShell() {
           <button data-testid="nav-map" className={`${s.navbtn} ${topView === "map" ? s.active : ""}`} title="Org map" onClick={() => nav("map")}>
             <span className={s.ico}><IcOrgMap /></span><span className={s.lbl}>Org map</span>
           </button>
+          <button data-testid="nav-monitor" className={`${s.navbtn} ${topView === "monitor" ? s.active : ""}`} title="Monitor" onClick={() => nav("monitor")}>
+            <span className={s.ico}><IcQueue /></span><span className={s.lbl}>Monitor</span>
+          </button>
           <div className={s.spacer} />
           <button data-testid="nav-settings" className={`${s.navbtn} ${topView === "settings" ? s.active : ""}`} title="Settings" onClick={() => nav("settings")}>
             <span className={s.ico}><IcSettings /></span><span className={s.lbl}>Settings</span>
@@ -518,6 +524,7 @@ export function ConciergeShell() {
                     <div className={s.greet}>
                       <span className={s.stamp}>✷</span> No platform agent yet
                     </div>
+                    <CreatePlatformAgentButton />
                   </div>
                 </section>
               )}
@@ -531,6 +538,29 @@ export function ConciergeShell() {
                     <Canvas />
                   </main>
                   <CommunicationOverlay />
+                </div>
+              )}
+            </div>
+
+            {/* MONITOR VIEW — the OSS monitoring dashboard, the same panel
+                served standalone at /monitor. Mounted only when active so its
+                pollers/sockets don't run behind the other views. */}
+            <div className={`${s.view} ${topView === "monitor" ? s.active : ""}`}>
+              {topView === "monitor" && (
+                <div className={ms.monitor}>
+                  <div className={ms.scroll}>
+                    <div className={ms.inner}>
+                      <header className={ms.head}>
+                        <h1>Monitor</h1>
+                        <p>
+                          Live agent-to-agent traffic, org topology, and the
+                          human-in-the-loop queue — read straight from this
+                          deployment&apos;s own data.
+                        </p>
+                      </header>
+                      <MonitorPanel />
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
@@ -602,8 +632,12 @@ export function ConciergeShell() {
                           <WorkspacePanelTabs key={platformRoot.id} node={platformRoot} defaultTab="config" idPrefix="concierge-" />
                         </div>
                       ) : (
-                        <div className={s.scardDesc}>
-                          No platform agent yet. Spin one up from Home to configure it.
+                        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                          <div className={s.scardDesc}>
+                            No platform agent yet. Create or repair the org concierge —
+                            it provisions in-place from here, no control plane needed.
+                          </div>
+                          <CreatePlatformAgentButton />
                         </div>
                       )}
                     </div>

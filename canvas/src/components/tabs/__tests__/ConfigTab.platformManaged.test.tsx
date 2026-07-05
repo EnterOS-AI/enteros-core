@@ -68,12 +68,12 @@ beforeEach(() => {
           runtime: "claude-code",
           registry_backed: true,
           registry_providers: [
-            { name: "anthropic-oauth", display_name: "Claude Code subscription", auth_env: ["CLAUDE_CODE_OAUTH_TOKEN"], billing_mode: "byok" },
-            { name: "platform", display_name: "Platform", auth_env: ["MOLECULE_LLM_USAGE_TOKEN"], billing_mode: "platform_managed" },
+            { name: "anthropic-oauth", display_name: "Claude Code subscription", auth_env: ["CLAUDE_CODE_OAUTH_TOKEN"] },
+            { name: "platform", display_name: "Platform", auth_env: ["MOLECULE_LLM_USAGE_TOKEN"] },
           ],
           registry_models: [
-            { id: "sonnet", provider: "anthropic-oauth", billing_mode: "byok" },
-            { id: "moonshot/kimi-k2.6", provider: "platform", billing_mode: "platform_managed" },
+            { id: "sonnet", provider: "anthropic-oauth" },
+            { id: "moonshot/kimi-k2.6", provider: "platform" },
           ],
         },
       ]);

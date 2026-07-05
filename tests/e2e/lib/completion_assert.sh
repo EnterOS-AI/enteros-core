@@ -37,6 +37,15 @@ A2A_ERROR_AS_TEXT_MARKERS=(
   "Exception"
   "error result"
   "MISSING_BYOK_CREDENTIAL"
+  # core: a concierge-CREATED agent whose workspace never received the platform
+  # LLM usage token (MOLECULE_LLM_USAGE_TOKEN) cannot authenticate to the LLM and
+  # surfaces its first turn AS the text "Agent error: Not logged in · Please run
+  # /login". "Agent error" already traps the prefixed form, but pin the BARE
+  # auth-failure signatures too so a future runtime that drops the "Agent error"
+  # wrapper (or emits only the login prompt) still classifies as error-as-text —
+  # this is the exact symptom the created-agent first-turn gate must catch.
+  "Not logged in"
+  "Please run /login"
 )
 
 # a2a_completion_error_marker <agent_text>

@@ -418,7 +418,7 @@ func TestResolveAndStage_HappyPath(t *testing.T) {
 	h := NewPluginsHandler(t.TempDir(), nil, nil).WithSourceResolver(&stubResolver{
 		scheme:  "stub",
 		name:    "my-plugin",
-		content: "name: my-plugin\nversion: 1.0.0\n",
+		content: "name: my-plugin\nversion: 1.0.0\ndescription: a test plugin\n",
 	})
 
 	result, err := h.resolveAndStage(context.Background(), installRequest{Source: "stub://my-plugin"})
@@ -535,7 +535,7 @@ func TestPluginInstall_SHA256Mismatch_AbortsInstall(t *testing.T) {
 // TestPluginInstall_SHA256Match_Succeeds verifies that resolveAndStage succeeds
 // when the caller supplies the correct SHA-256 of the fetched plugin.yaml.
 func TestPluginInstall_SHA256Match_Succeeds(t *testing.T) {
-	content := "name: my-plugin\nversion: 1.0.0\n"
+	content := "name: my-plugin\nversion: 1.0.0\ndescription: a test plugin\n"
 	sum := sha256.Sum256([]byte(content))
 	correctHash := hex.EncodeToString(sum[:])
 
@@ -579,7 +579,7 @@ func TestPluginInstall_PinnedRef_Accepted(t *testing.T) {
 	h := NewPluginsHandler(t.TempDir(), nil, nil).WithSourceResolver(&stubResolver{
 		scheme:  "github",
 		name:    "my-plugin",
-		content: "name: my-plugin\n",
+		content: "name: my-plugin\nversion: 1.0.0\ndescription: a test plugin\n",
 	})
 	result, err := h.resolveAndStage(context.Background(), installRequest{
 		Source: "github://owner/repo#v1.0.0", // pinned — must be accepted
@@ -590,6 +590,237 @@ func TestPluginInstall_PinnedRef_Accepted(t *testing.T) {
 	defer os.RemoveAll(result.StagedDir)
 	if result.PluginName != "my-plugin" {
 		t.Errorf("expected PluginName 'my-plugin', got %q", result.PluginName)
+	}
+}
+
+// ==================== SSOT manifest validation (fail-closed, core#3383 PR-4) ====================
+// Log capture reuses captureLog (workspace_provision_panic_test.go) —
+// process-global log.SetOutput, so these tests must stay non-parallel.
+
+// TestResolveAndStage_SSOTViolations_FailClosed verifies the fail-closed
+// phase of core#3383: a staged plugin.yaml that violates the
+// plugin-manifest SSOT schema (missing description, non-numeric version)
+// aborts the install with 422, cleans up the staging dir, and reports
+// the violations to the caller.
+func TestResolveAndStage_SSOTViolations_FailClosed(t *testing.T) {
+	t.Setenv("MOLECULE_MANIFEST_SSOT_ENFORCE", "") // ensure the default (enforced) path
+	beforeCount := tempDirCount(t)
+
+	h := NewPluginsHandler(t.TempDir(), nil, nil).WithSourceResolver(&stubResolver{
+		scheme:  "stub",
+		name:    "my-plugin",
+		content: "name: my-plugin\nversion: 1.0-beta\n", // missing description + bad version
+	})
+	_, err := h.resolveAndStage(context.Background(), installRequest{Source: "stub://my-plugin"})
+	assertHTTPErrStatus(t, err, http.StatusUnprocessableEntity, "SSOT manifest violations")
+
+	var he *httpErr
+	if errors.As(err, &he) {
+		if !strings.Contains(fmt.Sprintf("%v", he.Body["error"]), "plugin-manifest SSOT schema") {
+			t.Errorf("expected the 422 body to name the SSOT schema, got: %v", he.Body)
+		}
+		if v, ok := he.Body["violations"].([]string); !ok || len(v) == 0 {
+			t.Errorf("expected the 422 body to carry the violations, got: %v", he.Body)
+		}
+	}
+
+	afterCount := tempDirCount(t)
+	if afterCount > beforeCount {
+		t.Errorf("SSOT rejection left %d orphaned staging dir(s)", afterCount-beforeCount)
+	}
+}
+
+// TestResolveAndStage_SSOTViolations_KillSwitchAdvisory verifies the
+// operator escape hatch: with MOLECULE_MANIFEST_SSOT_ENFORCE=off a
+// violating manifest still installs and only the advisory line fires.
+func TestResolveAndStage_SSOTViolations_KillSwitchAdvisory(t *testing.T) {
+	t.Setenv("MOLECULE_MANIFEST_SSOT_ENFORCE", "off")
+	logBuf := captureLog(t)
+
+	h := NewPluginsHandler(t.TempDir(), nil, nil).WithSourceResolver(&stubResolver{
+		scheme:  "stub",
+		name:    "my-plugin",
+		content: "name: my-plugin\nversion: 1.0-beta\n", // missing description + bad version
+	})
+	result, err := h.resolveAndStage(context.Background(), installRequest{Source: "stub://my-plugin"})
+	if err != nil {
+		t.Fatalf("kill-switch must revert SSOT violations to advisory, got: %v", err)
+	}
+	defer os.RemoveAll(result.StagedDir)
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "SSOT manifest validation (advisory)") {
+		t.Errorf("expected the advisory log line to fire, log was: %q", logged)
+	}
+	if !strings.Contains(logged, "violation(s)") {
+		t.Errorf("expected the advisory log line to report violations, log was: %q", logged)
+	}
+}
+
+// noManifestResolver stages a tree WITHOUT plugin.yaml, exercising the
+// missing-manifest advisory branch.
+type noManifestResolver struct{}
+
+func (*noManifestResolver) Scheme() string { return "stub" }
+func (*noManifestResolver) Fetch(_ context.Context, _ string, dst string) (string, error) {
+	if err := os.WriteFile(filepath.Join(dst, "README.md"), []byte("# no manifest"), 0600); err != nil {
+		return "", err
+	}
+	return "my-plugin", nil
+}
+
+// TestResolveAndStage_SSOTMissingManifest_AdvisoryDoesNotBlock verifies the
+// missing-plugin.yaml branch is also advisory-only: logged, never blocking.
+func TestResolveAndStage_SSOTMissingManifest_AdvisoryDoesNotBlock(t *testing.T) {
+	logBuf := captureLog(t)
+
+	h := NewPluginsHandler(t.TempDir(), nil, nil).WithSourceResolver(&noManifestResolver{})
+	result, err := h.resolveAndStage(context.Background(), installRequest{Source: "stub://my-plugin"})
+	if err != nil {
+		t.Fatalf("missing plugin.yaml must not block the install (advisory phase), got: %v", err)
+	}
+	defer os.RemoveAll(result.StagedDir)
+
+	if !strings.Contains(logBuf.String(), "no validatable plugin.yaml in staged tree") {
+		t.Errorf("expected the missing-manifest advisory log line, log was: %q", logBuf.String())
+	}
+}
+
+// TestResolveAndStage_SSOTConformingManifest_NoAdvisoryLine verifies a
+// conforming manifest stays silent — no advisory noise on the happy path.
+func TestResolveAndStage_SSOTConformingManifest_NoAdvisoryLine(t *testing.T) {
+	logBuf := captureLog(t)
+
+	h := NewPluginsHandler(t.TempDir(), nil, nil).WithSourceResolver(&stubResolver{
+		scheme:  "stub",
+		name:    "my-plugin",
+		content: "name: my-plugin\nversion: \"1.0.0\"\ndescription: a conforming plugin\n",
+	})
+	result, err := h.resolveAndStage(context.Background(), installRequest{Source: "stub://my-plugin"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer os.RemoveAll(result.StagedDir)
+
+	if strings.Contains(logBuf.String(), "SSOT manifest validation (advisory)") {
+		t.Errorf("conforming manifest must not log the advisory line, log was: %q", logBuf.String())
+	}
+}
+
+// TestSanitizeSourceForLog pins the credential-stripping contract for
+// advisory log lines: userinfo and query are removed, path/ref stay.
+func TestSanitizeSourceForLog(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"gitea://molecule-ai/my-plugin", "gitea://molecule-ai/my-plugin"},
+		{"github://user:sekret123@github.com/owner/repo#ref", "github://github.com/owner/repo#ref"},
+		{"https://example.com/owner/repo?token=tok_abc", "https://example.com/owner/repo"},
+		{"://not a url", "<unparseable-source>"},
+	}
+	for _, c := range cases {
+		if got := sanitizeSourceForLog(c.in); got != c.want {
+			t.Errorf("sanitizeSourceForLog(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// credentialSourceResolver stages a VIOLATING manifest so the SSOT log
+// line fires, letting the test assert the credential-bearing source is
+// never logged raw.
+type credentialSourceResolver struct{}
+
+func (*credentialSourceResolver) Scheme() string { return "stub" }
+func (*credentialSourceResolver) Fetch(_ context.Context, _ string, dst string) (string, error) {
+	if err := os.WriteFile(filepath.Join(dst, "plugin.yaml"), []byte("name: my-plugin\nversion: 1.0-beta\n"), 0600); err != nil {
+		return "", err
+	}
+	return "my-plugin", nil
+}
+
+// TestResolveAndStage_SSOTFailClosedLog_StripsSourceCredentials verifies
+// embedded credentials in a plugin source never reach the fail-closed
+// rejection log NOR the 422 response body — API responses can land in
+// client logs, proxies, or support bundles, so both surfaces are
+// credential-stripped via sanitizeSourceForLog.
+func TestResolveAndStage_SSOTFailClosedLog_StripsSourceCredentials(t *testing.T) {
+	t.Setenv("MOLECULE_MANIFEST_SSOT_ENFORCE", "") // ensure the default (enforced) path
+	logBuf := captureLog(t)
+
+	h := NewPluginsHandler(t.TempDir(), nil, nil).WithSourceResolver(&credentialSourceResolver{})
+	_, err := h.resolveAndStage(context.Background(),
+		installRequest{Source: "stub://user:sekret123@example.com/my-plugin?token=tok_abc"})
+	assertHTTPErrStatus(t, err, http.StatusUnprocessableEntity, "SSOT violations with credentialed source")
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "SSOT manifest validation FAILED (fail-closed)") {
+		t.Fatalf("expected the fail-closed rejection line to fire, log was: %q", logged)
+	}
+	if strings.Contains(logged, "sekret123") || strings.Contains(logged, "tok_abc") {
+		t.Errorf("credential-bearing source leaked into the rejection log: %q", logged)
+	}
+	body := fmt.Sprintf("%v", err)
+	if strings.Contains(body, "sekret123") || strings.Contains(body, "tok_abc") {
+		t.Errorf("credential-bearing source leaked into the 422 response body: %q", body)
+	}
+}
+
+// symlinkManifestResolver stages plugin.yaml as a symlink — the hostile
+// shape a crafted archive could ship (e.g. pointing at /dev/zero).
+type symlinkManifestResolver struct{}
+
+func (*symlinkManifestResolver) Scheme() string { return "stub" }
+func (*symlinkManifestResolver) Fetch(_ context.Context, _ string, dst string) (string, error) {
+	if err := os.Symlink("/dev/zero", filepath.Join(dst, "plugin.yaml")); err != nil {
+		return "", err
+	}
+	return "my-plugin", nil
+}
+
+// TestResolveAndStage_SSOTSymlinkManifest_RejectedNotRead verifies the
+// advisory pass never follows a symlinked plugin.yaml: it is reported as
+// not validatable (never read) and the install still proceeds.
+func TestResolveAndStage_SSOTSymlinkManifest_RejectedNotRead(t *testing.T) {
+	logBuf := captureLog(t)
+
+	h := NewPluginsHandler(t.TempDir(), nil, nil).WithSourceResolver(&symlinkManifestResolver{})
+	result, err := h.resolveAndStage(context.Background(), installRequest{Source: "stub://my-plugin"})
+	if err != nil {
+		t.Fatalf("symlink manifest must not block the install (advisory phase), got: %v", err)
+	}
+	defer os.RemoveAll(result.StagedDir)
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "not a regular file") {
+		t.Errorf("expected the symlink to be rejected as not a regular file, log was: %q", logged)
+	}
+}
+
+// oversizedManifestResolver stages a plugin.yaml over the advisory read cap.
+type oversizedManifestResolver struct{}
+
+func (*oversizedManifestResolver) Scheme() string { return "stub" }
+func (*oversizedManifestResolver) Fetch(_ context.Context, _ string, dst string) (string, error) {
+	big := make([]byte, advisoryManifestMaxBytes+1)
+	copy(big, []byte("name: my-plugin\n"))
+	if err := os.WriteFile(filepath.Join(dst, "plugin.yaml"), big, 0600); err != nil {
+		return "", err
+	}
+	return "my-plugin", nil
+}
+
+// TestResolveAndStage_SSOTOversizedManifest_CappedNotRead verifies the
+// advisory pass size-caps the manifest read instead of loading it.
+func TestResolveAndStage_SSOTOversizedManifest_CappedNotRead(t *testing.T) {
+	logBuf := captureLog(t)
+
+	h := NewPluginsHandler(t.TempDir(), nil, nil).WithSourceResolver(&oversizedManifestResolver{})
+	result, err := h.resolveAndStage(context.Background(), installRequest{Source: "stub://my-plugin"})
+	if err != nil {
+		t.Fatalf("oversized manifest must not block the install (advisory phase), got: %v", err)
+	}
+	defer os.RemoveAll(result.StagedDir)
+
+	if !strings.Contains(logBuf.String(), "advisory cap") {
+		t.Errorf("expected the oversized manifest to be capped, log was: %q", logBuf.String())
 	}
 }
 

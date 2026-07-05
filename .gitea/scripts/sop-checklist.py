@@ -482,6 +482,10 @@ class GiteaClient:
         headers = {
             "Authorization": f"token {self.token}",
             "Accept": "application/json",
+            # CF WAF in front of git.moleculesai.app 1010-bans the default
+            # Python-urllib UA; send a non-urllib UA so this reaches Gitea
+            # (transport-only — auth/method/semantics unchanged).
+            "User-Agent": "molecule-ci-gate/1.0 (+gitea-api)",
         }
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -903,7 +907,14 @@ _TESTING_CLASS_SLUGS = {"comprehensive-testing", "local-postgres-e2e", "staging-
 # of config drift. Any item in this set MUST NOT have ai_ack_eligible.
 # migration / schema are future-proofing — not yet in config items, but
 # the code guard rejects them proactively (CTO hardening, msg 1388c76f).
-_HUMAN_ONLY_SLUGS = {"root-cause", "no-backwards-compat", "migration", "schema"}
+#
+# root-cause / no-backwards-compat were REMOVED from this carve-out on
+# 2026-07-01 when they were made ai_ack_eligible (agent-resolvable via the
+# ai-sop-ack team). The widening is ADDITIVE: they still require a non-author
+# ack from their configured required_teams — flipping the flag only adds the
+# ai-sop-ack team as an accepted acker; it does not drop the human-team
+# requirement, and it never counts toward qa-review / security-review.
+_HUMAN_ONLY_SLUGS = {"migration", "schema"}
 
 
 def get_ci_status(client: GiteaClient, owner: str, repo: str, sha: str) -> str:

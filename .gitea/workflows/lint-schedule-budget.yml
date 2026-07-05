@@ -1,0 +1,73 @@
+name: Lint schedule budget
+
+# The zero-cron ratchet (principal's rule: NO nightly/scheduled CI).
+#
+# Every test/gate in molecule-core runs PER-PR and/or as the prod-merge gate
+# (push:main/staging) — never on a `schedule:`/`cron:` timer. A scheduled run
+# is how breakage reaches prod uncaught: a red nightly sits unwatched, where a
+# green PR-gate would have frozen the merge. This lint fails the build if ANY
+# `.gitea/workflows/*.yml` declares a live `schedule:` trigger, locking in the
+# zero-schedule state after #3344 (the bulk schedule strip) and the staging-
+# e2e consolidation (this change retired staging-smoke.yml + continuous-synth-
+# e2e.yml into the single e2e-staging-saas full-journey gate).
+#
+# It parses YAML, so commented-out `# schedule:` cruft and prose mentioning
+# "cron" do NOT trip it — only a parser-visible, actually-firing trigger does.
+#
+# Triggers (mirrors lint-workflow-yaml.yml):
+#   - pull_request: pre-merge gate — block a re-added cron before it lands.
+#   - push:main/staging: post-merge regression detection for direct edits.
+#   - workflow_dispatch: manual re-run.
+#
+# NOT a branch-protection-required context (kept out of
+# .gitea/required-contexts.txt) so a future violation surfaces loudly on the
+# offending PR without wedging the merge queue for unrelated changes.
+
+on:
+  pull_request:
+    paths:
+      - '.gitea/workflows/**'
+      - '.gitea/scripts/lint_schedule_budget.py'
+      - 'tests/test_lint_schedule_budget.py'
+  push:
+    branches: [main, staging]
+    paths:
+      - '.gitea/workflows/**'
+      - '.gitea/scripts/lint_schedule_budget.py'
+      - 'tests/test_lint_schedule_budget.py'
+  workflow_dispatch:
+
+# Belt-and-suspenders against runner default
+# (feedback_act_runner_github_server_url).
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ratchet:
+    name: Zero-cron ratchet
+    runs-on: ubuntu-latest
+    # Hard gate (no continue-on-error mask — mc#2654): a re-added schedule
+    # MUST go red. The job is green today (0 active schedule triggers).
+    continue-on-error: false
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Install PyYAML
+        run: pip install --quiet 'PyYAML>=6.0'
+
+      - name: Zero-cron ratchet (no active schedule triggers)
+        run: python3 .gitea/scripts/lint_schedule_budget.py
+
+      - name: Run lint_schedule_budget unit tests
+        run: |
+          pip install --quiet pytest
+          python3 -m pytest tests/test_lint_schedule_budget.py -v

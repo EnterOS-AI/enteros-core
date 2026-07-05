@@ -6,7 +6,6 @@ import { useCanvasStore } from "@/store/canvas";
 import { type ConfigData, DEFAULT_CONFIG, TextInput, NumberInput, Toggle, TagList, Section } from "./config/form-inputs";
 import { parseYaml, toYaml } from "./config/yaml-utils";
 import { SecretsSection } from "./config/secrets-section";
-import { LLMBillingSection } from "./config/llm-billing-section";
 import { ExternalConnectionSection } from "./ExternalConnectionSection";
 import {
   ProviderModelSelector,
@@ -15,11 +14,11 @@ import {
   findProviderForModel,
   isPlatformManagedProvider,
   type SelectorValue,
-  type ProviderEntry,
   type RegistryProvider,
   type RegistryModel,
 } from "../ProviderModelSelector";
 import { isExternalLikeRuntime } from "@/lib/externalRuntimes";
+import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 
 interface Props {
   workspaceId: string;
@@ -267,10 +266,10 @@ interface RuntimeOption {
   // registry-served GET /templates fields (internal#718 P3). When
   // registryBacked is true, the selectable provider+model list is built from
   // the registry (registryProviders/registryModels) — display labels +
-  // billing mode + derived provider come from the provider-registry SSOT, not
-  // the canvas VENDOR_LABELS / billingModeForProvider vocabularies. When
-  // false (non-registry runtime / older backend), the canvas falls back to
-  // the template-served models[] + its inferVendor heuristic.
+  // derived provider come from the provider-registry SSOT, not the canvas
+  // VENDOR_LABELS vocabulary. When false (non-registry runtime / older
+  // backend), the canvas falls back to the template-served models[] + its
+  // inferVendor heuristic.
   registryBacked: boolean;
   registryProviders: RegistryProvider[];
   registryModels: RegistryModel[];
@@ -302,66 +301,6 @@ export function deriveProvidersFromModels(models: ModelSpec[]): string[] {
     }
   }
   return out;
-}
-
-// billingModeForProvider — maps a selected PROVIDER (vendor key) to the
-// LLM billing_mode it implies (internal#703 Gap 2).
-//
-// Today, picking a non-Platform provider in the Config tab writes the
-// credential env (CLAUDE_CODE_OAUTH_TOKEN / vendor key) but leaves
-// llm_billing_mode at its resolved default (`platform_managed`). The CP
-// tenant_config endpoint then keeps injecting the platform proxy base
-// URLs, so the OAuth token / vendor key is never actually used — BYOK
-// silently no-ops (the live SEO-Agent symptom in #703). The workspace-
-// server even hard-blocks vendor-key writes on platform_managed
-// workspaces (secrets.go:87), pointing the user at this exact billing-
-// mode switch. Wiring the provider change to also set billing_mode is
-// the UI half that makes BYOK take (the CP/workspace-server backend half
-// is being fixed in parallel — internal#703 Gap 1).
-//
-// Mapping:
-//   - "platform" (the Platform-managed proxy) OR "" (no explicit
-//     provider override → inherit, defaults to platform) → "platform_managed".
-//   - any other vendor key ("anthropic-oauth" = Claude Code subscription
-//     OAuth, "anthropic" = Anthropic API key, "minimax", "openrouter",
-//     etc.) → "byok".
-//
-// Returns the billing_mode string the PUT body should carry. The valid
-// set is fixed by workspace-server's recognizer (platform_managed | byok
-// | disabled); "disabled" is never auto-selected by a provider choice —
-// it's an explicit operator action via the LLM Billing section.
-export type LLMBillingMode = "platform_managed" | "byok";
-
-export function billingModeForProvider(provider: string): LLMBillingMode {
-  const v = provider.trim().toLowerCase();
-  if (v === "" || v === "platform") return "platform_managed";
-  return "byok";
-}
-
-// billingModeForSelectedProvider — internal#718 P3 (retire-list #5): the
-// billing mode the Config tab shows/sends for the selected PROVIDER, sourced
-// from the registry-served catalog when available rather than the hardcoded
-// billingModeForProvider rule.
-//
-// When the runtime is registry-backed, GET /templates serves each provider's
-// DERIVED billing_mode (platform_managed for the closed platform provider,
-// byok otherwise) on the ProviderEntry. We read it off the catalog so the UI
-// reflects the registry SSOT — the same predicate billing/credential emission
-// keys off the derived provider.
-//
-// Falls back to billingModeForProvider when: no catalog (non-registry runtime
-// / older backend), or the provider string isn't carried by the catalog
-// (e.g. a stale saved value). The fallback keeps the legacy behavior intact
-// for everything the registry doesn't yet speak to.
-export function billingModeForSelectedProvider(
-  provider: string,
-  catalog?: ProviderEntry[],
-): LLMBillingMode {
-  if (catalog && catalog.length > 0) {
-    const entry = catalog.find((p) => p.vendor === provider.trim());
-    if (entry?.billingMode) return entry.billingMode;
-  }
-  return billingModeForProvider(provider);
 }
 
 // Fallback used when /templates can't be fetched (offline, older backend).
@@ -493,6 +432,22 @@ export function ConfigTab({ workspaceId }: Props) {
     return () => clearTimeout(successTimerRef.current);
   }, []);
 
+  // The platform agent (org concierge, kind='platform') legitimately ships NO
+  // editable platform config.yaml: its model is INHERITED from the SSOT default
+  // (MOLECULE_LLM_DEFAULT_MODEL) and seeded as the MODEL/MOLECULE_MODEL container
+  // env by core's ensureConciergeModel — surfaced to this form via
+  // GET /workspaces/:id/model, NOT a template config.yaml. Detect it off the
+  // canvas store node (kind is hydrated by the platform event stream) so we can
+  // suppress the scary "No config.yaml found" red banner (it has none by design)
+  // and render a gentle inherited-model note instead — mirroring the hermes/
+  // own-config handling. The model line still shows the RESOLVED value because
+  // loadConfig mirrors wsMetadataModel (GET /model) into the form regardless of
+  // any (absent or stale-pinned) config.yaml.
+  const isPlatformAgent = useCanvasStore((s) => {
+    const node = s.nodes?.find?.((n) => n.id === workspaceId);
+    return node?.data?.kind === WORKSPACE_KIND.Platform;
+  });
+
   const loadConfig = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -598,7 +553,17 @@ export function ConfigTab({ workspaceId }: Props) {
       // an error. Populate the form from workspace metadata so the user
       // still sees the saved runtime + model.
       const runtimeManagesOwnConfig = RUNTIMES_WITH_OWN_CONFIG.has(wsMetadataRuntime);
-      if (!runtimeManagesOwnConfig) {
+      // The platform agent (org concierge) has no editable config.yaml by design
+      // — its model is inherited from the SSOT default and surfaced via GET
+      // /model (mirrored into the form below). Suppress the red error for it,
+      // exactly like the own-config runtimes. Read kind authoritatively from the
+      // live store (getState) so this is not a stale closure if kind hydrated
+      // after loadConfig was memoised.
+      const nodeKind = useCanvasStore
+        .getState()
+        .nodes?.find?.((n) => n.id === workspaceId)?.data?.kind;
+      const isPlatformAgentWorkspace = nodeKind === WORKSPACE_KIND.Platform;
+      if (!runtimeManagesOwnConfig && !isPlatformAgentWorkspace) {
         setError("No config.yaml found");
       }
       setConfig({
@@ -702,8 +667,8 @@ export function ConfigTab({ workspaceId }: Props) {
   // catalog identity is stable across renders (selector relies on it).
   //
   // internal#718 P3: when the runtime is registry-backed, build the catalog
-  // FROM the registry-served providers/models (display labels + billing +
-  // derived provider from the provider-registry SSOT) instead of re-inferring
+  // FROM the registry-served providers/models (display labels + derived
+  // provider from the provider-registry SSOT) instead of re-inferring
   // vendor from model-id prefixes. Falls back to the inferVendor heuristic
   // for non-registry runtimes / older backends.
   const registryBacked = selectedRuntime?.registryBacked ?? false;
@@ -950,17 +915,6 @@ export function ConfigTab({ workspaceId }: Props) {
       const providerSaveError: string | null = null;
       const providerChanged = false;
 
-      // internal#718 P4 closure: provider → billing_mode linkage is also
-      // RETIRED. P2-B (#1972) moved the billing decision to
-      // ResolveLLMBillingModeDerived, which DERIVES the provider from
-      // (runtime, model) at every read. The canvas can no longer
-      // override it via a separate PUT, by design — the runtime+model
-      // selection IS the billing-mode selection. The
-      // /admin/workspaces/:id/llm-billing-mode endpoint still exists
-      // as the operator override surface (workspaces.llm_billing_mode
-      // column); it is no longer driven by the provider dropdown.
-      const billingModeSaveError: string | null = null;
-
       setOriginalYaml(content);
       if (rawMode) {
         const parsed = parseYaml(content);
@@ -979,18 +933,16 @@ export function ConfigTab({ workspaceId }: Props) {
       } else if (!restart) {
         useCanvasStore.getState().updateNodeData(workspaceId, { needsRestart: !providerWillAutoRestart });
       }
-      // Aggregate partial-save errors. With provider+billing-mode PUTs
-      // retired, only modelSaveError can fire from the secret-mint side
-      // — the provider/billing branches are dead code retained as
-      // constant nils to keep the diff small. They are surfaced
-      // defensively in case a future re-enablement needs the wiring.
+      // Aggregate partial-save errors. With the provider PUT retired, only
+      // modelSaveError can fire from the secret-mint side — the provider
+      // branch is dead code retained as a constant nil to keep the diff
+      // small. It is surfaced defensively in case a future re-enablement
+      // needs the wiring.
       const partialError = providerSaveError
         ? `Other fields saved, but provider update failed: ${providerSaveError}`
-        : billingModeSaveError
-          ? `Provider saved, but switching billing mode failed — your own provider key/OAuth may not take effect until billing mode is set: ${billingModeSaveError}`
-          : modelSaveError
-            ? `Other fields saved, but model update failed: ${modelSaveError}`
-            : null;
+        : modelSaveError
+          ? `Other fields saved, but model update failed: ${modelSaveError}`
+          : null;
       if (partialError) {
         setError(partialError);
       } else {
@@ -1014,7 +966,11 @@ export function ConfigTab({ workspaceId }: Props) {
   const sandboxBackendId = useId();
 
   const providerDirty = provider !== originalProvider;
-  const isDirty = (rawMode ? rawDraft !== originalYaml : toYaml(config) !== originalYaml) || providerDirty;
+  const isDirty = useMemo(() => {
+    if (providerDirty) return true;
+    if (rawMode) return rawDraft !== originalYaml;
+    return toYaml(config) !== originalYaml;
+  }, [providerDirty, rawMode, rawDraft, originalYaml, config]);
   // core#2594: an env-resolved workspace has no stored model. Saving while
   // the model dropdown is still empty can't "wipe" routing (handleSave skips
   // an empty /model PUT), but it is confusing and can stall the user on other
@@ -1458,8 +1414,6 @@ export function ConfigTab({ workspaceId }: Props) {
             </div>
           </Section>
 
-          <LLMBillingSection workspaceId={workspaceId} />
-
           <SecretsSection
             workspaceId={workspaceId}
             requiredEnv={
@@ -1483,6 +1437,14 @@ export function ConfigTab({ workspaceId }: Props) {
           {config.runtime === "hermes"
             ? "Hermes manages its own config at ~/.hermes/config.yaml on the workspace host. Edit it via the Terminal tab or the hermes CLI, not this form."
             : "This runtime manages its own config outside the platform template."}
+        </div>
+      )}
+      {!error && isPlatformAgent && !RUNTIMES_WITH_OWN_CONFIG.has(config.runtime || "") && (
+        <div className="mx-3 mb-2 px-3 py-1.5 bg-surface-sunken/50 border border-line rounded text-xs text-ink-mid">
+          The org concierge inherits its model from the platform default
+          (<code className="font-mono">MOLECULE_LLM_DEFAULT_MODEL</code>). It has
+          no editable config.yaml — the model shown above is the resolved runtime
+          value.
         </div>
       )}
       {!error && isExternalLikeRuntime(config.runtime) && (

@@ -1,4 +1,10 @@
-name: boot-to-registration-e2e (advisory)
+# RE-ENABLED (group A — molecules-server cutover): the AWS account is closed, so this
+# minimal cell now provisions on the molecules-server (local-docker) compute backend via
+# E2E_PROVIDER=molecules-server (canonical wire id; CP persists it as organizations.provider
+# 'local'). push/pull_request on main+staging are restored so it GATES again. Advisory-RED is
+# expected until the local-docker gate + CP health + browser-registration fixes land — then
+# promote its context into .gitea/required-contexts.txt.
+name: boot-to-registration-e2e
 
 # cp#455 — Minimal-cell boot-to-registration e2e.
 # CTO directive 14eb4f07: "build the minimal claude-code+kimi cell,
@@ -28,7 +34,7 @@ name: boot-to-registration-e2e (advisory)
 # Inputs:
 #   runtime        : default claude-code
 #   billing_mode   : default platform_managed (the cp#469-cluster path)
-#   provider       : default platform (vs direct-to-provider)
+#   provider       : molecules-server (local-docker compute backend; was 'platform')
 #   model          : default moonshot/kimi-k2.6 (CTO-specified)
 #
 # PR target: molecule-core (this file). Companion harness extension
@@ -40,15 +46,32 @@ name: boot-to-registration-e2e (advisory)
 # tenant-boot e2e tests in this stage. Stage 2 may move the path.
 
 on:
+  # RE-ENABLED (group A): molecules-server (local-docker) replaces the closed AWS EC2 path,
+  # so the minimal cell provisions at ~zero cloud spend and can gate again. Path-scoped to the
+  # harness + this workflow so unrelated PRs don't spin a real tenant (mirrors the sibling e2e
+  # lanes). schedule/workflow_run stay OFF (no-nightly-e2e rule).
+  push:
+    branches: [main, staging]
+    paths:
+      - 'tests/e2e/test_minimal_boot_cell.sh'
+      - 'tests/e2e/lib/collision-proof-slug.sh'
+      - '.gitea/workflows/boot-to-registration-e2e.yml'
+  pull_request:
+    branches: [main, staging]
+    paths:
+      - 'tests/e2e/test_minimal_boot_cell.sh'
+      - 'tests/e2e/lib/collision-proof-slug.sh'
+      - '.gitea/workflows/boot-to-registration-e2e.yml'
   workflow_dispatch:
   # Note: Gitea 1.22.6 does not support workflow_dispatch.inputs
   # (feedback_gitea_workflow_dispatch_inputs_unsupported). Defaults
   # are hardcoded in the job env below. Stage 2 can add matrix/
   # param support once the Gitea version supports it.
 
-# Advisory: no cron schedule, manual dispatch only. Branch protection
-# doesn't require this — RED on main is expected pre-cp#469-cluster
-# deploy, GREEN signals the cluster is live.
+# No cron schedule. Runs on push/pull_request (main+staging) + manual dispatch.
+# Branch protection doesn't require this yet (not in .gitea/required-contexts.txt) —
+# advisory-RED is expected until the molecules-server local-docker path is green; GREEN
+# then signals the local-docker minimal cell boots + registers.
 permissions:
   contents: read
   # No issue-write; failures surface as red runs in workflow history.
@@ -58,9 +81,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # bp-exempt: advisory e2e — non-gating, manual dispatch only (cp#455 Stage 1)
+  # bp-exempt: runs on push/PR (main+staging) so it GATES, but is NOT yet in
+  # .gitea/required-contexts.txt — advisory-red until the molecules-server local-docker
+  # path + CP health + browser-registration fixes land, then promote it into the required
+  # SSOT (cp#455 Stage 1).
   minimal-cell:
-    name: Minimal cell (claude-code + platform + moonshot/kimi-k2.6)
+    name: Minimal cell (claude-code + molecules-server + SSOT default model)
     runs-on: ubuntu-latest
     # Bounded at 12 min. Wall-clock budget breakdown:
     #   - cold EC2 provision: ~3-4 min (SPOT)
@@ -77,13 +103,18 @@ jobs:
       # E2E_RUNTIME / E2E_MODEL: these literals are now only the FALLBACK. On a
       # trusted event the "Fetch platform defaults from KMS SSOT" step below
       # overrides them with the authoritative Infisical values
-      # (MOLECULE_DEFAULT_RUNTIME / MOLECULE_LLM_DEFAULT_MODEL). This is
-      # BEHAVIOR-NEUTRAL: the staging KMS values equal these literals today, and
-      # if the KMS step is gated off (untrusted ref) these literals stand in.
+      # (MOLECULE_DEFAULT_RUNTIME / MOLECULE_LLM_DEFAULT_MODEL). The fallback model
+      # is the CURRENT SSOT value (minimax/MiniMax-M2.7), NOT a moonshot vendor
+      # const — so an untrusted-ref/local run still tracks the SSOT default.
       E2E_RUNTIME: claude-code
       E2E_BILLING_MODE: platform_managed
-      E2E_PROVIDER: platform
-      E2E_MODEL: moonshot/kimi-k2.6
+      # Compute backend: molecules-server (local-docker). This is the canonical cloudprovider
+      # SSOT wire id the CP org-create validates via IsValidRequest and persists as the DB-legal
+      # organizations.provider 'local' (PersistKey). Was 'platform' (never a valid compute
+      # provider — the closed AWS DefaultProvider path). Orthogonal to E2E_BILLING_MODE, which
+      # stays platform_managed (the LLM proxy/metering arm).
+      E2E_PROVIDER: molecules-server
+      E2E_MODEL: minimax/MiniMax-M2.7
       E2E_RUN_ID: cp455-${{ github.run_id }}
       E2E_PROVISION_TIMEOUT_SECS: '300' # 5 min — fast teardown budget
       MOLECULE_CP_URL: ${{ vars.STAGING_CP_URL || 'https://staging-api.moleculesai.app' }}
@@ -112,15 +143,17 @@ jobs:
       #
       # TRUSTED-REF GATING: molecule-core is a PUBLIC repo. This step consumes
       # the CI machine-identity secrets, so it must only run on a TRUSTED event —
-      # operator workflow_dispatch, or a push to the protected main branch. It
-      # MUST NOT run on an untrusted-fork PR (which could exfiltrate the KMS
-      # token). Today this workflow is dispatch-only, so the guard is a no-op;
-      # it is here as defense-in-depth if a pull_request trigger is ever added.
+      # operator workflow_dispatch, a push to a protected branch (main/staging), or a
+      # SAME-REPO (non-fork) pull_request. It MUST NOT run on an untrusted-fork PR
+      # (which could exfiltrate the KMS token) — a fork PR skips this step, leaving
+      # MOLECULE_ADMIN_TOKEN empty so the "Verify required secrets present" gate below
+      # fails closed (the real provision e2e cannot run from a fork).
       - name: Fetch platform defaults (model+runtime) from KMS SSOT
         id: defaults
         if: >-
           github.event_name == 'workflow_dispatch' ||
-          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+          (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging')) ||
+          (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false)
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}

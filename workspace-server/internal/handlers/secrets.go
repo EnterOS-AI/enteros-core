@@ -49,28 +49,25 @@ func isPlatformManagedDirectLLMBypassKey(key string) bool {
 	return ok
 }
 
-// platformManagedLLMModeForWorkspace replaces the org-level platformManagedLLMMode
-// gate with a per-workspace resolved-mode check (internal#691). The strip-list
-// is enforced ONLY when this specific workspace's resolved mode is
-// platform_managed — a workspace with a byok override is allowed to write its
-// own CLAUDE_CODE_OAUTH_TOKEN / vendor key via the canvas Secrets tab.
+// platformManagedLLMModeForWorkspace reports whether bypass-list (raw vendor)
+// key writes must be blocked for this workspace — true iff the workspace's
+// selected model derives to the closed `platform` provider. The decision is
+// flag-free: it derives the provider from the workspace's (runtime, model)
+// via the registry; a platform-servable model blocks co-stored vendor keys
+// (the proxy serves it and bills the platform), a specific vendor model is a
+// BYOK setup where the customer may write their own key.
 //
-// Default-closed: if the resolver hits a DB error, falls back to
-// platform_managed (the safe-default behavior), so a transient DB failure
-// during a secret write still rejects the bypass-list keys — fail safer not
-// freer. This matches the resolver's documented contract.
+// Default-closed: if the registry is unavailable or the provider cannot be
+// derived (unregistered / ambiguous / no model), block the bypass-list write —
+// fail safer not freer.
 func platformManagedLLMModeForWorkspace(c *gin.Context, workspaceID string) bool {
 	ctx := c.Request.Context()
-	// CTO 2026-06-12 (per-workspace BYOK SSOT) + CR (agent-researcher): block a
-	// vendor-key write whenever it would co-mingle with platform billing. The
-	// MODEL is checked FIRST: a platform-servable model (derives to the closed
-	// `platform` provider; the proxy serves it and bills the platform) blocks
-	// stray vendor-key co-storage REGARDLESS of any (possibly stale/incorrect)
-	// billing override — a platform model must never host a co-stored vendor key.
-	// Only a specific VENDOR model is a BYOK setup where the customer may write
-	// their own key (INCLUDING the first key, before billing has derived byok).
-	// For a vendor model, an explicit platform_managed override still forces the
-	// block (the operator chose managed billing → a vendor key would co-mingle).
+	// Block a vendor-key write whenever it would co-mingle with platform
+	// billing. The MODEL decides: a platform-servable model (derives to the
+	// closed `platform` provider; the proxy serves it and bills the platform)
+	// blocks stray vendor-key co-storage — a platform model must never host a
+	// co-stored vendor key. Only a specific VENDOR model is a BYOK setup where
+	// the customer may write their own key (INCLUDING the first key).
 	runtime, model, authEnv := readWorkspaceDeriveInputs(ctx, workspaceID)
 	manifest, err := providerRegistry()
 	if err != nil || manifest == nil {
@@ -84,27 +81,27 @@ func platformManagedLLMModeForWorkspace(c *gin.Context, workspaceID string) bool
 		return true
 	}
 	if provider.IsPlatform() {
-		// Platform-servable model → block, even under a byok override.
+		// Platform-servable model → block (a platform model must never host a
+		// co-stored vendor key — the proxy serves it and bills the platform).
 		return true
 	}
-	// Vendor model: allow the key write UNLESS an explicit platform_managed
-	// override forces managed billing (then a vendor key would co-mingle).
-	if mode, ok, err := readWorkspaceBillingOverride(ctx, workspaceID); err == nil && ok {
-		return strings.EqualFold(mode, LLMBillingModePlatformManaged)
-	}
+	// Vendor model: allow the key write. With the per-workspace billing-mode
+	// override removed (2026-06-30), the provider selection alone decides — a
+	// specific vendor model is a BYOK setup where the customer supplies their
+	// own key.
 	return false
 }
 
-// rejectPlatformManagedDirectLLMBypassForWorkspace is the per-workspace
-// successor to rejectPlatformManagedDirectLLMBypass (internal#691). The
-// strip-list ONLY applies when this specific workspace resolves to
-// platform_managed; byok/disabled workspaces can write their own vendor keys.
+// rejectPlatformManagedDirectLLMBypassForWorkspace blocks raw vendor-key
+// writes for a workspace whose selected model derives to the closed `platform`
+// provider; a workspace on a specific vendor model (BYOK) can write its own
+// vendor key via the canvas Secrets tab.
 func rejectPlatformManagedDirectLLMBypassForWorkspace(c *gin.Context, workspaceID, key string) bool {
 	if !platformManagedLLMModeForWorkspace(c, workspaceID) || !isPlatformManagedDirectLLMBypassKey(key) {
 		return false
 	}
 	c.JSON(http.StatusBadRequest, gin.H{
-		"error":        "direct vendor key writes are blocked for platform-managed workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead, or set this workspace's billing mode to 'byok' via /admin/workspaces/:id/llm-billing-mode",
+		"error":        "direct vendor key writes are blocked for platform-managed workspaces; use MODEL/LLM_PROVIDER or the platform LLM proxy env instead, or select a specific vendor model so the workspace runs BYOK",
 		"key":          key,
 		"workspace_id": workspaceID,
 	})
@@ -652,10 +649,9 @@ func (h *SecretsHandler) SetGlobal(c *gin.Context) {
 	// shared credential; the provision-time provider-matched strip
 	// (workspace_provision) removes any global cred a given workspace's resolved
 	// provider does not accept, so a platform-managed workspace can never USE a
-	// non-matching global vendor/oauth key. The legacy org-env SetGlobal gate
-	// (keyed off the retired MOLECULE_LLM_BILLING_MODE) is therefore removed;
-	// per-workspace writes still enforce the strip-list via
-	// rejectPlatformManagedDirectLLMBypassForWorkspace.
+	// non-matching global vendor/oauth key. The legacy org-env SetGlobal billing
+	// gate is therefore removed; per-workspace writes still enforce the strip-list
+	// via rejectPlatformManagedDirectLLMBypassForWorkspace.
 
 	encrypted, err := crypto.Encrypt([]byte(body.Value))
 	if err != nil {

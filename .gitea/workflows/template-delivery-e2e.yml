@@ -102,7 +102,16 @@ jobs:
     # unquoted scalar containing a colon.
     name: Template-asset delivery (fresh seo-agent — config+prompts via asset channel, seo-all via plugin reconcile)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Outer job cap. Raised from 30 → 75 because the old 30-min ceiling was
+    # BELOW the e2e script's ~58-min worst case (tenant 900s + TLS 900s +
+    # ws-online 900s + asset-settle 180s + plugin 600s): a slow-but-legit run
+    # hit the ceiling, the runner SIGKILLed the job mid-provision, and the
+    # in-script EXIT trap never completed the DELETE → the already-created org +
+    # tenant container leaked. The binding hang-stop is now the step-level
+    # `timeout-minutes` on "Run template-asset delivery e2e" (65) — a STEP
+    # timeout, unlike a JOB timeout, still runs the subsequent `if: always()`
+    # teardown net. This 75 is the outer bound (setup + 65-min run + teardown).
+    timeout-minutes: 75
     env:
       MOLECULE_CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}
       # MOLECULE_ADMIN_TOKEN (alias for CP_ADMIN_API_TOKEN) now arrives via
@@ -182,6 +191,87 @@ jobs:
             echo "::error::CP_ADMIN_API_TOKEN secret not set — cannot run delivery e2e"
             exit 2
           fi
+      # Mint the org slug BEFORE the e2e provisions anything, and publish it to
+      # $GITHUB_ENV. Two consumers read it: (1) the e2e script, which honors
+      # E2E_TMPL_SLUG instead of minting its own; (2) the always() teardown net
+      # below, which deprovisions THIS EXACT slug. Doing it in a dedicated early
+      # step — which always completes and flushes $GITHUB_ENV — guarantees the
+      # teardown knows the slug even if the e2e step is SIGKILLed mid-provision
+      # before it could export anything itself. Keeps the `e2e-tmpl-` prefix so
+      # slugs.IsEphemeral() / the CP reaper still classify it ephemeral, and
+      # stays within the CP admin slug limit (^[a-z][a-z0-9-]{2,31}$).
+      - name: Mint e2e org slug (teardown target)
+        if: needs.detect-changes.outputs.delivery == 'true'
+        run: |
+          rand=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          slug="e2e-tmpl-${rand}"
+          echo "E2E_TMPL_SLUG=$slug" >> "$GITHUB_ENV"
+          echo "Minted e2e org slug for this run: $slug (always() teardown will target it)"
+      # Step-level timeout (65) is the BINDING hang-stop: a *step* timeout still
+      # runs the `if: always()` teardown net below, so a hung provision cannot
+      # leak the org. Sized above the script's ~58-min worst case so a
+      # slow-but-legit run is not falsely killed.
       - name: Run template-asset delivery e2e
         if: needs.detect-changes.outputs.delivery == 'true'
+        timeout-minutes: 65
         run: bash tests/e2e/test_template_delivery_e2e.sh
+      # ── Teardown safety-net (runs on success, failure, timeout, OR cancel) ──
+      # The e2e script installs its own EXIT/INT/TERM trap, but that trap does
+      # NOT survive a runner SIGKILL (step/job hard timeout, or a cancel), and
+      # the org + tenant container are created at test step 1 — BEFORE the long
+      # provisioning waits — so a mid-provision kill leaks both. This always()
+      # step is the workflow-level backstop the file previously lacked (contrast
+      # e2e-staging-saas.yml): it deprovisions the run's org via the SAME CP path
+      # the trap uses — DELETE /cp/admin/tenants/:slug with the REQUIRED
+      # {"confirm":"<slug>"} body — targeting the exact slug the mint step wrote
+      # to $GITHUB_ENV, so it can never touch another run's tenant. Idempotent:
+      # the endpoint no-ops on an already-purged / never-created org. It NEVER
+      # fails the job (exit 0) so it can't mask the e2e's own pass/fail verdict;
+      # the CP reaper e2e-leak pass remains the last-resort backstop.
+      - name: Teardown safety-net (deprovision e2e-tmpl org on cancel/timeout/failure)
+        if: always() && needs.detect-changes.outputs.delivery == 'true'
+        run: |
+          set +e
+          # MOLECULE_ADMIN_TOKEN (KMS step) and E2E_TMPL_SLUG (mint step) were
+          # written to $GITHUB_ENV by earlier steps, so they are already job-scoped
+          # shell env vars here — read them DIRECTLY rather than re-binding through
+          # `${{ env.* }}` step-env (which is redundant and, if a runner resolves
+          # the expression before the prior step's $GITHUB_ENV commit, could read
+          # empty and skip teardown exactly when it is needed). Direct reads are
+          # unambiguous and survive a mid-run cancel/timeout (the writing steps
+          # ran first). Mirrors the reviewer-recommended shape.
+          slug="${E2E_TMPL_SLUG:-}"
+          token="${MOLECULE_ADMIN_TOKEN:-}"
+          if [ -z "$slug" ]; then
+            echo "::notice::no E2E_TMPL_SLUG recorded — nothing to tear down (no org was minted)."
+            exit 0
+          fi
+          # SAFETY (destructive-selector guard): this net runs `DELETE
+          # /cp/admin/tenants/$slug` with the admin token. slug is normally the
+          # mint step's e2e-tmpl-<8hex>, but validate defensively so a corrupted
+          # or overridden $GITHUB_ENV value can never turn the net into an
+          # arbitrary-tenant deleter. Only ever target a validated ephemeral slug.
+          if ! printf '%s' "$slug" | grep -Eq '^e2e-tmpl-[a-f0-9]{8}$'; then
+            echo "::warning::refusing teardown of non-ephemeral slug '$slug' (must match ^e2e-tmpl-[a-f0-9]{8}$) — skipping admin DELETE."
+            exit 0
+          fi
+          if [ -z "$token" ]; then
+            echo "::warning::teardown: no admin token (fork PR / KMS step skipped) — cannot deprovision $slug. The CP reaper e2e-leak pass is the backstop."
+            exit 0
+          fi
+          echo "Safety-net teardown: deprovisioning org $slug via CP admin delete"
+          # Tempfile-routed -w keeps curl's exit code from polluting the captured
+          # HTTP status (lint-curl-status-capture). confirm body is REQUIRED by
+          # the CP DeleteTenant handler (must equal the URL slug).
+          curl -sS -o /tmp/tmpl-teardown.out -w "%{http_code}" \
+            --max-time 180 -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            -d "{\"confirm\":\"$slug\"}" >/tmp/tmpl-teardown.code
+          code=$(cat /tmp/tmpl-teardown.code 2>/dev/null || echo "000")
+          if [ "$code" = "200" ] || [ "$code" = "204" ] || [ "$code" = "404" ]; then
+            echo "[teardown] deprovisioned $slug (HTTP $code)"
+          else
+            echo "::warning::teardown for $slug returned HTTP $code — the CP reaper e2e-leak pass is the backstop. Body: $(head -c 300 /tmp/tmpl-teardown.out 2>/dev/null)"
+          fi
+          exit 0

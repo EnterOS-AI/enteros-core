@@ -1,0 +1,138 @@
+/* Monitor page styling. Theme tokens are redefined here (scoped under
+   .monitor) exactly like Concierge.module.css's .root port, so the page is
+   self-themed both as the standalone /monitor route AND when mounted inside
+   ConciergeShell (which already provides the same tokens — the redeclare is a
+   harmless no-op there). Tokens key off [data-theme] on <html>. */
+
+.monitor {
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+  --sans: var(--font-hanken), "Hanken Grotesk", system-ui, sans-serif;
+  /* dark (default) */
+  --bg: #08080a; --panel: #0d0d11;
+  --card: #16161d; --card-2: #1b1b23;
+  --hair: rgba(255,255,255,.07); --hair-2: rgba(255,255,255,.11);
+  --tx: #ececf1; --tx-2: #9b9baa; --tx-3: #65656f;
+  --accent: #8b5cf6; --accent-2: #a78bfa; --accent-soft: rgba(139,92,246,.14);
+  --green: #34d399; --green-soft: rgba(52,211,153,.13);
+  --amber: #fbbf24; --grey: #6a6a78; --red: #f87171;
+
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--tx);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100%;
+  width: 100%;
+}
+:global([data-theme="light"]) .monitor {
+  --bg: #f1efe8; --panel: #fbfaf6;
+  --card: #ffffff; --card-2: #faf9f4;
+  --hair: rgba(20,18,12,.10); --hair-2: rgba(20,18,12,.16);
+  --tx: #21201b; --tx-2: #5c5a52; --tx-3: #8e8b81;
+  --accent: #7c3aed; --accent-2: #7c3aed; --accent-soft: rgba(124,58,237,.10);
+  --green: #0f9d63; --green-soft: rgba(15,157,99,.10);
+  --amber: #c98a04; --grey: #a8a59b; --red: #dc4d4d;
+}
+
+.monitor *, .monitor *::before, .monitor *::after { box-sizing: border-box; }
+
+/* When standalone (the /monitor route) we own the full viewport + scroll. */
+.standalone {
+  position: fixed;
+  inset: 0;
+  overflow-y: auto;
+}
+
+.scroll { width: 100%; height: 100%; overflow-y: auto; }
+.inner { max-width: 1100px; margin: 0 auto; padding: 28px 24px 56px; }
+
+.head { margin-bottom: 20px; }
+.head h1 { font-size: 22px; font-weight: 700; margin: 0 0 4px; letter-spacing: -.01em; }
+.head p { font-size: 13px; color: var(--tx-2); margin: 0; max-width: 640px; line-height: 1.5; }
+
+.grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+.row2 { display: grid; grid-template-columns: 1fr; gap: 16px; }
+@media (min-width: 900px) {
+  .row2 { grid-template-columns: 1.1fr 1fr; }
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--hair);
+  border-radius: 14px;
+  padding: 16px 18px;
+}
+.cardHead {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 12px;
+}
+.cardTitle { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
+.cardTitle svg { width: 16px; height: 16px; color: var(--accent-2); }
+.cardSub { font-size: 12px; color: var(--tx-3); }
+
+/* window toggle */
+.toggle { display: inline-flex; gap: 2px; background: var(--card-2); border: 1px solid var(--hair); border-radius: 9px; padding: 2px; }
+.toggleBtn {
+  border: 0; background: transparent; color: var(--tx-2);
+  font-family: var(--sans); font-size: 11.5px; font-weight: 600;
+  padding: 4px 10px; border-radius: 7px; cursor: pointer; letter-spacing: .02em;
+}
+.toggleBtn:hover { color: var(--tx); }
+.toggleBtn.active { background: var(--accent-soft); color: var(--accent-2); }
+
+/* traffic stats row */
+.stats { display: flex; flex-wrap: wrap; gap: 22px; margin-bottom: 14px; }
+.stat { display: flex; flex-direction: column; gap: 2px; }
+.statVal { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.statLbl { font-size: 11px; color: var(--tx-3); text-transform: uppercase; letter-spacing: .06em; }
+
+/* chart */
+.chartWrap { position: relative; width: 100%; }
+.chart { display: block; width: 100%; height: 140px; }
+.chartArea { fill: var(--accent-soft); }
+.chartLine { fill: none; stroke: var(--accent-2); stroke-width: 1.6; stroke-linejoin: round; }
+.chartBase { stroke: var(--hair-2); stroke-width: 1; }
+.emptyOverlay {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+}
+.emptyPill {
+  background: var(--card-2); border: 1px solid var(--hair);
+  color: var(--tx-2); font-size: 12.5px; padding: 7px 13px; border-radius: 999px;
+}
+
+/* topology */
+.counts { display: flex; gap: 12px; margin-bottom: 14px; }
+.countCard {
+  flex: 1; background: var(--card-2); border: 1px solid var(--hair);
+  border-radius: 11px; padding: 12px 14px;
+}
+.countVal { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+.countLbl { font-size: 11px; color: var(--tx-3); text-transform: uppercase; letter-spacing: .06em; margin-top: 5px; }
+
+.tree { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow-y: auto; }
+.treeNode { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 8px; }
+.treeNode:hover { background: var(--card-2); }
+.tdot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 7px; }
+.tname { font-size: 13px; color: var(--tx); }
+.tbadge {
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--accent-2); background: var(--accent-soft); padding: 2px 7px; border-radius: 6px;
+}
+.tagent { font-size: 10px; color: var(--tx-3); background: var(--card-2); padding: 2px 7px; border-radius: 6px; border: 1px solid var(--hair); }
+.trole { font-size: 11px; color: var(--tx-3); }
+
+/* HITL */
+.hitlTabs { display: inline-flex; gap: 2px; background: var(--card-2); border: 1px solid var(--hair); border-radius: 9px; padding: 2px; }
+.hitlTab {
+  border: 0; background: transparent; color: var(--tx-2);
+  font-family: var(--sans); font-size: 12px; font-weight: 600;
+  padding: 5px 12px; border-radius: 7px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+}
+.hitlTab:hover { color: var(--tx); }
+.hitlTab.active { background: var(--accent-soft); color: var(--accent-2); }
+.hitlCount { background: var(--accent); color: #fff; font-size: 10px; border-radius: 999px; padding: 0 6px; min-width: 16px; text-align: center; }
+.hitlBody { margin-top: 12px; }
+
+.empty { font-size: 12.5px; color: var(--tx-3); padding: 14px 4px; line-height: 1.5; }
+.loading { font-size: 12.5px; color: var(--tx-3); padding: 14px 4px; }

@@ -766,6 +766,30 @@ func (h *DelegationHandler) UpdateStatus(c *gin.Context) {
 		// the result instead of holding open an HTTP connection.
 		pushDelegationResultToInbox(ctx, sourceID, delegationID, "completed", body.ResponsePreview, "")
 	} else {
+		// MUST-FIX 4 (delegation framing): emit a delegate_result activity
+		// row on the FAILED branch UNCONDITIONALLY, mirroring the COMPLETED
+		// branch above (and executeDelegation's failure path). Previously an
+		// agent-reported failure wrote NO delegate_result row here — only a
+		// broadcast + a flag-gated inbox push — so when the inbox-push gate
+		// was off the runtime harvester had to fall back to a status-flip
+		// scan of the original 'delegate' row to notice the failure at all.
+		// Writing the row here gives the harvester one uniform, always-present
+		// (delegation_id, status) delegate_result key for BOTH outcomes, so
+		// no status-flip workaround is needed.
+		respJSON, marshalErr := json.Marshal(map[string]interface{}{
+			"error":         body.Error,
+			"delegation_id": delegationID,
+		})
+		if marshalErr != nil {
+			log.Printf("Delegation UpdateStatus %s: json.Marshal failed-result respJSON failed: %v", delegationID, marshalErr)
+		} else {
+			if _, err := db.DB.ExecContext(ctx, `
+				INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, summary, response_body, status, error_detail)
+				VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4::jsonb, 'failed', $5)
+			`, sourceID, sourceID, "Delegation failed ("+textutil.TruncateBytes(body.Error, 80)+")", string(respJSON), body.Error); err != nil {
+				log.Printf("Delegation UpdateStatus: failed-result insert failed for %s: %v", delegationID, err)
+			}
+		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationFailed), sourceID, map[string]interface{}{
 			"delegation_id": delegationID,
 			"error":         body.Error,

@@ -38,7 +38,7 @@ import { MissingKeysModal } from "../MissingKeysModal";
 const defaultProps = {
   open: false,
   missingKeys: ["OPENAI_API_KEY"],
-  runtime: "langgraph",
+  runtime: "codex",
   onKeysAdded: vi.fn(),
   onCancel: vi.fn(),
 };

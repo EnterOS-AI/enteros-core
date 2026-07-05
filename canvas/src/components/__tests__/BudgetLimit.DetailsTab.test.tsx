@@ -76,7 +76,7 @@ function makeData(overrides: Record<string, unknown> = {}) {
     url: "http://localhost:8080",
     parentId: null,
     currentTask: "",
-    runtime: "langgraph",
+    runtime: "codex",
     needsRestart: false,
     budgetLimit: null,
     budgetUsed: null,

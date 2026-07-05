@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { uploadChatFiles, FileTooLargeError } from "../uploads";
 import { createMessage, type ChatMessage, type ChatAttachment } from "../types";
 import { extractFilesFromTask } from "../message-parser";
+import { getConversationId } from "./chatContext";
 
 interface A2APart {
   kind?: string;
@@ -131,7 +132,6 @@ export function mapUploadErrorToReason(e: unknown): string {
 }
 
 export interface UseChatSendOptions {
-  getHistoryMessages: () => ChatMessage[];
   onUserMessage?: (msg: ChatMessage) => void;
   onAgentMessage?: (msg: ChatMessage) => void;
 }
@@ -313,15 +313,6 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
       tokenToMessageIdRef.current.set(myToken, messageId);
       syncSendingState();
 
-      const history = optionsRef.current
-        .getHistoryMessages()
-        .filter((m) => m.role === "user" || m.role === "agent")
-        .slice(-20)
-        .map((m) => ({
-          role: m.role === "user" ? "user" : "agent",
-          parts: [{ kind: "text", text: m.content }],
-        }));
-
       const parts: A2APart[] = [];
       if (trimmed) parts.push({ kind: "text", text: trimmed });
       for (const att of uploaded) {
@@ -345,9 +336,22 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
               message: {
                 role: "user",
                 messageId,
+                // STABLE per-conversation contextId (tenant-agent BUG 3). Without
+                // it the runtime a2a-sdk mints a fresh context_id per request and
+                // any session keyed on it (openclaw's SessionManager, the base
+                // RuntimeA2AExecutor's native thread_id) resets every turn → the agent re-greets.
+                // Persisted per workspace; rotated on "New session".
+                //
+                // NOTE: we deliberately do NOT ship a `metadata: { history }`
+                // blob. Force-injecting recent turns into every request bloated
+                // the prompt and fought the runtime's own native session
+                // (resumed via this contextId). The agent gets continuity from
+                // the resumed session; older/other history is retrieved ONLY
+                // when the agent CHOOSES to call the platform-workspace MCP that
+                // reads the persisted activity_logs — never force-fed here.
+                contextId: getConversationId(workspaceId),
                 parts,
               },
-              metadata: { history },
             },
           },
           // 30min — must exceed the server-side canvas idle watchdog

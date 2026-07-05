@@ -21,8 +21,8 @@ import (
 	"strings"
 	"testing"
 
-	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -34,7 +34,7 @@ import (
 // the 3-step atomic pattern (#819):
 //   - Atomic claim UPDATE returns rowsAffected=1 (workspace was online/degraded + active_tasks=0)
 //   - Name/tier SELECT runs after the claim
-//   - Final UPDATE sets status='hibernated', url=''
+//   - Final UPDATE sets status='hibernated', url=”
 //   - Redis keys ws:{id}, ws:{id}:url, ws:{id}:internal_url are deleted
 //   - WORKSPACE_HIBERNATED event is broadcast (INSERT INTO structure_events)
 func TestHibernateWorkspace_OnlineWorkspace_Success(t *testing.T) {
@@ -82,6 +82,114 @@ func TestHibernateWorkspace_OnlineWorkspace_Success(t *testing.T) {
 		if _, err := mr.Get(key); err == nil {
 			t.Errorf("expected Redis key %q to be deleted, but it still exists", key)
 		}
+	}
+}
+
+// TestHibernateWorkspace_RoutesStopToCPWhenOnlyCPWired is the fail-before/
+// pass-after regression guard for the local-docker-vs-EC2 hibernate gap.
+//
+// On a SaaS / molecules-server tenant the CP provisioner is wired and the local
+// Docker provisioner is nil. Step 2 of HibernateWorkspace MUST route the
+// container stop through StopWorkspaceAuto (which dispatches to cpProv), NOT the
+// old inlined `else if h.provisioner != nil { Stop }` — that branch silently
+// no-op'd here, flipping the row to 'hibernated' + url=” while the container
+// KEPT RUNNING and serving A2A (verified live on staging: container stayed "Up"
+// while GET reported hibernated). This mirrors TestStopWorkspaceAuto_RoutesToCPWhenSet
+// but exercises the HIBERNATE call site specifically. Before the fix cpProv.Stop
+// is never invoked and this fails; after, it is invoked exactly once.
+func TestHibernateWorkspace_RoutesStopToCPWhenOnlyCPWired(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	rec := &trackingCPProv{}
+	handler.SetCPProvisioner(rec) // cpProv wired, local Docker provisioner nil (SaaS/molecules-server shape)
+
+	wsID := "ws-hibernate-cp-stop"
+
+	// Step 1: atomic claim UPDATE succeeds (online/degraded + active_tasks=0).
+	mock.ExpectExec(`UPDATE workspaces`).
+		WithArgs(wsID, models.StatusHibernating).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Post-claim SELECT for name/tier.
+	mock.ExpectQuery(`SELECT name, tier FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier"}).AddRow("CP Agent", 2))
+	// Step 3: final UPDATE to 'hibernated' (fires regardless of stop outcome).
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(models.StatusHibernated, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Broadcaster inserts a structure_events row.
+	mock.ExpectExec(`INSERT INTO structure_events`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	handler.HibernateWorkspace(context.Background(), wsID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+	got := rec.stoppedSnapshot()
+	if len(got) != 1 || got[0] != wsID {
+		t.Fatalf("hibernate must stop the container via cpProv when only CP is wired; "+
+			"expected cpProv.Stop([%q]), got %v — the container would keep running (local-docker-vs-EC2 gap)", wsID, got)
+	}
+}
+
+// TestWakeWorkspace_ClaimsHibernated verifies the auto-wake re-provision path
+// ACTS on a hibernated workspace — the exact case RestartByID/runRestartCycle
+// SELECT-EXCLUDE (`status NOT IN (...,'hibernated')`) and no-op on, which left a
+// genuinely-stopped hibernated ws unable to wake (verified live). WakeWorkspace
+// must issue the atomic hibernated→provisioning claim, then proceed to load the
+// stored provision inputs. We return an error on the load SELECT to stop before
+// the async re-provision, keeping the assertion deterministic — the claim firing
+// against `status = 'hibernated'` is the load-bearing proof.
+func TestWakeWorkspace_ClaimsHibernated(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	handler.SetCPProvisioner(&trackingCPProv{}) // a backend must be wired or WakeWorkspace returns before any DB touch
+
+	wsID := "ws-wake-hib"
+	// Atomic claim: hibernated → provisioning (rowsAffected=1 = we won the claim).
+	mock.ExpectExec(`AND status = 'hibernated'`).
+		WithArgs(models.StatusProvisioning, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Load stored provision inputs — return an error to halt before the async
+	// provisionWorkspaceAuto dispatch (deterministic; the claim already proved it
+	// acts on hibernated instead of early-returning like RestartByID).
+	mock.ExpectQuery(`SELECT name, tier, COALESCE\(runtime`).
+		WithArgs(wsID).
+		WillReturnError(fmt.Errorf("halt-after-claim"))
+
+	handler.WakeWorkspace(wsID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations (WakeWorkspace must claim the hibernated row): %v", err)
+	}
+}
+
+// TestWakeWorkspace_NoOpWhenNotHibernated verifies the atomic claim dedupe: when
+// the row is no longer hibernated (a concurrent wake already claimed it, or it
+// was resumed/removed), rowsAffected=0 and WakeWorkspace returns immediately with
+// no load SELECT, no broadcast, no provision dispatch.
+func TestWakeWorkspace_NoOpWhenNotHibernated(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	handler.SetCPProvisioner(&trackingCPProv{})
+
+	wsID := "ws-wake-nothib"
+	// Claim matches nothing (not hibernated) → rowsAffected=0.
+	mock.ExpectExec(`AND status = 'hibernated'`).
+		WithArgs(models.StatusProvisioning, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	// No further DB expectations — WakeWorkspace must return after a zero-row claim.
+
+	handler.WakeWorkspace(wsID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations (WakeWorkspace must no-op on a non-hibernated row): %v", err)
 	}
 }
 

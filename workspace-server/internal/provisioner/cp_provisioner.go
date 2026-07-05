@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cpurl"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 )
@@ -76,14 +77,11 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 		return nil, fmt.Errorf("MOLECULE_ORG_ID required for control plane provisioner")
 	}
 
-	// Auto-derive control plane URL.
-	baseURL := os.Getenv("CP_PROVISION_URL")
-	if baseURL == "" {
-		baseURL = os.Getenv("MOLECULE_CP_URL")
-	}
-	if baseURL == "" {
-		baseURL = "https://api.moleculesai.app"
-	}
+	// Auto-derive control plane URL via the single CP-URL seam
+	// (internal/cpurl): CP_PROVISION_URL, else MOLECULE_CP_URL, else the
+	// managed default — precedence unchanged. A self-host operator can
+	// redirect the default via MOLECULE_CP_DEFAULT_URL without code edits.
+	baseURL := cpurl.Base(os.Getenv("CP_PROVISION_URL"))
 
 	// CP gates /cp/workspaces/* behind two credentials now:
 	//   1. Shared secret (Authorization: Bearer) — gates the route at

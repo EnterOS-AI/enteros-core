@@ -24,10 +24,6 @@ on:
     branches: [main, staging]
   pull_request:
     branches: [main, staging]
-  schedule:
-    # Nightly at 09:00 UTC. Keeps coverage for the currently non-required
-    # heavy browser lane without spending runner time on every PR.
-    - cron: '0 9 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -47,9 +43,12 @@ jobs:
     # (handlers-postgres-integration). See internal#512 for the class
     # defect.
     runs-on: docker-host
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # mc#2654 mask REMOVED (was continue-on-error: true): the detect-changes
+    # helper only computes the `chat` boolean and has fail-open fallbacks
+    # (labels-api-unavailable / base-missing → chat=true), so a genuine error
+    # here must surface RED, not be masked. Fail-closed so the paths-gate itself
+    # is trustworthy for the now-gating e2e-chat job below.
+    continue-on-error: false
     outputs:
       chat: ${{ steps.decide.outputs.chat }}
       debug: ${{ steps.decide.outputs.debug }}
@@ -139,12 +138,20 @@ jobs:
     # mc#1529 follow-on: docker run/exec for postgres + redis containers.
     # Must land on operator-host Linux (docker-host).
     runs-on: docker-host
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#2654 mask REMOVED — this lane is now FAIL-CLOSED (gating). It runs the
+    # LOCAL platform-server (MOLECULE_ORG_ID unset → the local Docker /
+    # molecules-server provisioner path, main.go:230) + canvas + the in-process
+    # echo runtime entirely on-box: NO EC2, NO remote CP, NO external cloud
+    # dependency, so there is no infra-flake surface to justify an advisory mask.
     #
-    # PROMOTION-READINESS (toward required gate — do NOT flip continue-on-error
-    # without CTO sign-off, that's the irreversible call):
-    #   NOW FAIL-CLOSED:
+    # Empirical basis for the flip (run-log-grep-before-flip, per
+    # lint-pre-flip-continue-on-error): the last real main runs pass green with
+    # NO masked failures — run 430897 "26 passed", run 430812 "26 passed",
+    # run 430653 no-op pass. The prior continue-on-error:true was hiding nothing;
+    # keeping it only let a future regression roll up to a false "success"
+    # (Gitea Quirk #10). Removing it makes a real chat regression go RED.
+    #
+    # Assertions stay honest and fail-closed (unchanged by this flip):
     #     - Postgres/Redis/platform/canvas readiness are already bounded
     #       readiness-polls that hard-fail (and dump logs) at their deadline,
     #       not fixed sleeps — preserved.
@@ -155,13 +162,13 @@ jobs:
     #     - chat-desktop.spec.ts asserts echo-runtime.lastRequest after each
     #       round-trip, so an optimistic client-side render cannot pass without
     #       a real A2A request reaching the server (core#2796 follow-up).
-    #   STILL BLOCKS PROMOTION:
     #     - The "No-op pass" path (detect-changes chat!=true) is a legitimate
-    #       paths-filter skip, but a required gate needs it to be a neutral
-    #       check, not a green "success", so a skipped heavy lane can't be
-    #       mistaken for a passed one.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    #       paths-filter skip that emits SUCCESS — identical to the already-gating
+    #       e2e-api.yml required lane, so it is branch-protection-clean.
+    #
+    # Wiring this context into branch_protections/main (bp-required #1142) stays
+    # an operator step; removing the mask here only stops the masking.
+    continue-on-error: false
     timeout-minutes: 15
     env:
       PG_CONTAINER: pg-e2e-chat-${{ github.run_id }}-${{ github.run_attempt }}

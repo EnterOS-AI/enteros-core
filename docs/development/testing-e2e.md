@@ -48,7 +48,7 @@ Both scripts include a pre-test cleanup that deletes workspaces from previous ru
 
 ## What CI Runs
 
-`.github/workflows/ci.yml` (added 2026-04-13):
+`.gitea/workflows/ci.yml` (added 2026-04-13):
 
 - **e2e-api** — spins up Postgres + Redis via service containers, applies migrations with `docker exec`, builds the platform binary, runs `tests/e2e/test_api.sh`. All 62 checks must pass.
 - **shellcheck** — runs the shellcheck marketplace action against every `tests/e2e/*.sh`.

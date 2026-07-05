@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
-# Live staging E2E — the CP instance-state reconciler heals a terminated EC2.
+# Live staging E2E — the CP instance-state reconciler heals a killed workspace
+# instance. ADAPTED 2026-07-03: the default provider is now MOLECULES-SERVER
+# (local-docker) — the kill primitive is `docker rm -f <container>`, not `aws ec2
+# terminate-instances`. E2E_PROVIDER=aws restores the legacy EC2 path unchanged.
 #
 # Real-infra complement to the deterministic unit tests for core#2261
 # (workspace-server/internal/registry/cp_instance_reconciler.go). Those unit
 # tests pin the reconcile logic against fakes; THIS script proves the loop
 # actually runs in a real tenant's workspace-server and drives the EXISTING
-# offline + auto-heal machinery against real AWS.
+# offline + auto-heal machinery against a real killed instance (docker container
+# on molecules-server; EC2 on aws).
 #
-# Root regression (core#2247): a SaaS workspace whose EC2 is terminated out
-# from under the platform (manual AWS action, spot reclaim, CP reap) fell
-# through every existing liveness pass and kept reading status='online'
-# forever, pointing at a dead instance. The reconciler closes that gap with
-# CPProvisioner.IsRunning and feeds a clean "not running" into onOffline →
-# RestartByID (existing-volume reprovision).
+# Root regression (core#2247): a workspace whose box is killed out from under the
+# platform (manual action, spot reclaim, CP reap; the local-docker analog: the
+# container is `docker rm`'d or OOM-killed) fell through every existing liveness
+# pass and kept reading status='online' forever, pointing at a dead instance. The
+# reconciler closes that gap with CPProvisioner.IsRunning and feeds a clean "not
+# running" into onOffline → RestartByID (existing-volume reprovision).
 #
 # What this test does:
-#   1. Provision a fresh staging org + ONE workspace (same default
-#      runtime/model as the full-saas harness, so it actually boots).
+#   1. Provision a fresh staging org (provider=$E2E_PROVIDER) + ONE workspace
+#      (same default runtime/model as the full-saas harness, so it actually boots).
 #   2. Poll the tenant API until the workspace is status=online; capture its
-#      instance_id.
-#   3. KILL it — terminate that exact EC2 via `aws ec2 terminate-instances`.
+#      instance_id (on molecules-server the instance_id IS the container name).
+#   3. KILL it — `docker rm -f <container>` (molecules-server) or `aws ec2
+#      terminate-instances` (aws) on that exact instance.
 #   4. Assert the reconciler heals it:
 #        PRIMARY (gate)      — within ~180s the workspace status LEAVES
 #                              'online' (the reconciler detected the dead
@@ -40,12 +45,18 @@
 #
 # Auth model + provisioning conventions are copied verbatim from
 # test_staging_full_saas.sh (single MOLECULE_ADMIN_TOKEN → CP admin; per-
-# tenant admin token + X-Molecule-Org-Id header for tenant API). The kill
-# primitive + leak sweep reuse lib/aws_leak_check.sh.
+# tenant admin token + X-Molecule-Org-Id header for tenant API). On the aws path
+# the kill primitive + leak sweep reuse lib/aws_leak_check.sh; on molecules-server
+# they are inline docker (rm -f / ps -a) — see the provider abstraction block.
 #
 # Required env:
 #   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
 #   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway staging CP_ADMIN_API_TOKEN
+#   E2E_PROVIDER           molecules-server (DEFAULT; docker rm -f the container)
+#                          | aws (legacy EC2 terminate-instances). molecules-server
+#                          needs a reachable docker daemon (DOCKER_HOST → the
+#                          molecules-server host; a local stack shares it); aws
+#                          needs AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
 #
 # Optional env (mirrors the full-saas harness where they overlap):
 #   E2E_RUNTIME                        claude-code (default)
@@ -85,6 +96,13 @@ set -euo pipefail
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
 RUNTIME="${E2E_RUNTIME:-claude-code}"
+# Provider knob. molecules-server (local-docker; persisted organizations.provider
+# = "local") is the DEFAULT — this test now kills a docker container instead of an
+# EC2. E2E_PROVIDER=aws restores the legacy AWS path (terminate-instances +
+# aws_leak_check.sh) for when a cloud account returns. The canonical create-org
+# request id is "molecules-server" (NOT "platform" — that is an LLM arm — and NOT
+# the bare "local" alias); IsValidRequest accepts it and it persists as "local".
+PROVIDER="${E2E_PROVIDER:-molecules-server}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}"
 # PRIMARY bound: the reconciler ticks every 60s; it needs one cycle to see
@@ -125,11 +143,102 @@ assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: p
 # shellcheck disable=SC1091
 # shellcheck source=lib/model_slug.sh
 source "$(dirname "$0")/lib/model_slug.sh"
-# AWS kill primitive + leak sweep (e2e_aws_region / e2e_ec2_instances_for_slug /
-# e2e_terminate_instances / e2e_verify_no_ec2_leaks_for_slug).
-# shellcheck disable=SC1091
-# shellcheck source=lib/aws_leak_check.sh
-source "$(dirname "$0")/lib/aws_leak_check.sh"
+# Kill primitive + leak sweep — provider-abstracted. The AWS lib is sourced ONLY
+# on the legacy AWS path (its e2e_* helpers are undefined on the molecules-server
+# path, and every call site is provider-branched below).
+if [ "$PROVIDER" = "aws" ]; then
+  # AWS kill primitive + leak sweep (e2e_aws_region / e2e_ec2_instances_for_slug /
+  # e2e_terminate_instances / e2e_verify_no_ec2_leaks_for_slug).
+  # shellcheck disable=SC1091
+  # shellcheck source=lib/aws_leak_check.sh
+  source "$(dirname "$0")/lib/aws_leak_check.sh"
+fi
+
+# ─── provider abstraction ───────────────────────────────────────────────
+# The reconciler-heal ASSERTIONS (leaves 'online', reprovisions on a new
+# instance_id) are provider-agnostic. Only the three infra primitives differ
+# between an EC2 box and a local-docker container, so they are isolated here:
+#   require_kill_capability          — the runner can kill the workspace instance
+#   kill_workspace_instance <id> <slug>  — the "out-of-band terminate" primitive
+#   verify_no_workspace_leaks <slug> — teardown left no orphan box/container
+#
+# molecules-server (local-docker): the workspace's instance_id IS its docker
+# container name (mol-ws-<slug≤20>-<short12>, wsname SSOT; CP local_docker_
+# workspace.go returns WorkspaceInstance{InstanceID: name}). So `docker rm -f
+# <instance_id>` is the exact analog of `aws ec2 terminate-instances
+# --instance-ids <instance_id>` — the container is gone, its named volumes
+# survive, and the reconciler's CPProvisioner.IsRunning (Healthcheck =
+# `docker inspect -f {{.State.Running}}`) then reads "not running" → onOffline →
+# existing-volume reprovision, exactly like the EC2 path.
+require_kill_capability() {
+  if [ "$PROVIDER" = "aws" ]; then
+    e2e_aws_creds_available || fail "AWS CLI/creds unavailable — cannot terminate the EC2 to exercise the reconciler. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (the CI workflow wires these)."
+    return
+  fi
+  # molecules-server: need a reachable docker daemon (the one CP's local-docker
+  # backend provisioned the container on — a local run shares it; a remote CP
+  # needs DOCKER_HOST to point at the molecules-server host).
+  docker info >/dev/null 2>&1 || fail "docker daemon unreachable — the molecules-server reconciler test kills the workspace CONTAINER. Point DOCKER_HOST at the molecules-server host (a local stack shares the daemon)."
+}
+
+# kill_workspace_instance <instance_id> <slug> — echoes the id(s) it killed.
+kill_workspace_instance() {
+  local instance_id="$1" slug="$2"
+  if [ "$PROVIDER" = "aws" ]; then
+    local region; region=$(e2e_aws_region)
+    if [ -n "$instance_id" ]; then
+      log "    Terminating $instance_id in $region (aws ec2 terminate-instances)..." >&2
+      aws ec2 terminate-instances --region "$region" --instance-ids "$instance_id" >/dev/null \
+        || fail "aws ec2 terminate-instances failed for $instance_id"
+      echo "$instance_id"
+      return
+    fi
+    # Fallback: find by slug tag and terminate.
+    log "    instance_id was empty — falling back to slug-tag describe ($slug)..." >&2
+    local rows killed
+    rows=$(e2e_ec2_instances_for_slug "$slug" 2>/dev/null || echo "")
+    killed=$(echo "$rows" | awk 'NF {print $1}' | sort -u | tr '\n' ' ')
+    [ -n "$killed" ] || fail "No slug-tagged EC2 found for $slug — nothing to terminate"
+    log "    Terminating $killed in $region..." >&2
+    e2e_terminate_instances "$killed" || fail "terminate-instances failed for $killed"
+    echo "$killed"
+    return
+  fi
+  # molecules-server: instance_id is the container name — docker rm -f removes the
+  # container (volumes persist for the existing-volume reprovision heal).
+  [ -n "$instance_id" ] || fail "molecules-server: workspace reported no instance_id (container name) — nothing to docker-kill"
+  log "    docker rm -f $instance_id (out-of-band container kill)..." >&2
+  docker rm -f "$instance_id" >/dev/null 2>&1 \
+    || fail "docker rm -f failed for container $instance_id (already gone? the reconciler needs a real kill to exercise)"
+  echo "$instance_id"
+}
+
+# verify_no_workspace_leaks <slug> — asserts teardown left no orphan box/container.
+# Exit codes mirror e2e_verify_no_ec2_leaks_for_slug: 0 clean, 2 tooling-missing,
+# non-zero (else) leak.
+verify_no_workspace_leaks() {
+  local slug="$1"
+  if [ "$PROVIDER" = "aws" ]; then
+    e2e_verify_no_ec2_leaks_for_slug "$slug"
+    return $?
+  fi
+  # molecules-server: no mol-ws-<slug…> container may survive teardown. Derive the
+  # prefix from the killed container name when we have it (robust vs slug
+  # sanitization/truncation); otherwise match mol-ws-* whose name embeds the slug.
+  docker info >/dev/null 2>&1 || return 2
+  local prefix survivors
+  if [ -n "${ORIGINAL_INSTANCE_ID:-}" ]; then
+    prefix="${ORIGINAL_INSTANCE_ID%-*}"   # mol-ws-<slug≤20>  (drop -<short12>)
+  else
+    prefix="mol-ws-"
+  fi
+  survivors=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -F "$prefix" || true)
+  if [ -n "$survivors" ]; then
+    echo "⚠️  LEAK: molecules-server container(s) survived teardown (prefix=$prefix): $survivors" >&2
+    return 4
+  fi
+  return 0
+}
 
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
 
@@ -184,15 +293,15 @@ cleanup_org() {
     echo "⚠️  LEAK: org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" >&2
     exit 4
   fi
-  local aws_leak_rc=0
-  e2e_verify_no_ec2_leaks_for_slug "$SLUG" || aws_leak_rc=$?
-  if [ "$aws_leak_rc" != "0" ]; then
-    case "$aws_leak_rc" in
+  local leak_rc=0
+  verify_no_workspace_leaks "$SLUG" || leak_rc=$?
+  if [ "$leak_rc" != "0" ]; then
+    case "$leak_rc" in
       2) exit 2 ;;
       *) exit 4 ;;
     esac
   fi
-  ok "Teardown clean — no orphan org or EC2 resources for $SLUG (${elapsed}s)"
+  ok "Teardown clean — no orphan org or workspace box/container for $SLUG (${elapsed}s)"
 
   # Normalize unexpected upstream exit codes to 1 — `set -e` propagates the
   # raw exit code of the failing command (e.g. curl exits 22 under
@@ -229,9 +338,9 @@ admin_call() {
 }
 
 # ─── 1. Create org ──────────────────────────────────────────────────────
-log "1/6 Creating org $SLUG via /cp/admin/orgs..."
+log "1/6 Creating org $SLUG via /cp/admin/orgs (provider=$PROVIDER)..."
 CREATE_RESP=$(admin_call POST /cp/admin/orgs \
-  -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
+  -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\",\"provider\":\"$PROVIDER\"}")
 echo "$CREATE_RESP" | python3 -m json.tool >/dev/null || fail "Org create returned non-JSON: $CREATE_RESP"
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
 [ -z "$ORG_ID" ] && fail "Org create response missing 'id': $CREATE_RESP"
@@ -352,7 +461,7 @@ SECRETS_JSON='{}'
 # proven to create cleanly. (The BYOK key paths below 400'd at create — see
 # the create-failure capture added below — which is why platform is default.)
 if [ "${E2E_LLM_PATH:-platform}" = "platform" ]; then
-  log "    LLM path: PLATFORM-MANAGED (no tenant key; moonshot/kimi-k2.6 via proxy)"
+  log "    LLM path: PLATFORM-MANAGED (no tenant key; SSOT default model via proxy)"
   SECRETS_JSON='{}'
 elif [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then
   SECRETS_JSON=$(python3 -c "import json,os; print(json.dumps({'MINIMAX_API_KEY': os.environ['E2E_MINIMAX_API_KEY']}))")
@@ -435,12 +544,14 @@ while true; do
     fi
     # The workspace is online but the tenant API does not surface instance_id
     # (observed on staging — the DB has it, the API response omits it). After a
-    # short grace, fall back to the AWS workspace-instance tag so the kill step
-    # can proceed. The reconciler reads instance_id from the DB and acts on the
-    # real EC2 regardless of what the API surfaces, so the AWS-tag instance is
-    # the correct kill target. Without this fallback the loop spins to the online
-    # deadline and fails with a misleading "never reached online".
-    if [ $(( $(date +%s) - ONLINE_SINCE )) -ge "$INSTANCE_ID_GRACE_SECS" ]; then
+    # short grace, on the AWS path only, fall back to the AWS workspace-instance
+    # tag so the kill step can proceed. The reconciler reads instance_id from the
+    # DB and acts on the real box regardless of what the API surfaces, so the
+    # AWS-tag instance is the correct kill target. Without this fallback the loop
+    # spins to the online deadline and fails with a misleading "never reached
+    # online". On molecules-server the instance_id (= mol-ws container name) is
+    # always surfaced, so there is no tag-fallback — keep waiting for the API.
+    if [ "$PROVIDER" = "aws" ] && [ $(( $(date +%s) - ONLINE_SINCE )) -ge "$INSTANCE_ID_GRACE_SECS" ]; then
       # ws-tenant-<slug>-<wsid...> is the workspace EC2 (vs tenant-<slug>).
       ORIGINAL_INSTANCE_ID=$(e2e_ec2_instances_for_slug "$SLUG" 2>/dev/null \
         | awk '$2 ~ /^ws-tenant-/ {print $1}' | sort -u | head -1)
@@ -457,31 +568,16 @@ while true; do
 done
 ok "Workspace online (instance_id=$ORIGINAL_INSTANCE_ID)"
 
-# ─── 5. Kill the EC2 ────────────────────────────────────────────────────
-# Terminate the EXACT instance the workspace reported. Prefer the captured
-# instance_id (precise — kills only this workspace's box); fall back to the
-# slug-tag describe if the API didn't surface an id (shouldn't happen — we
-# only break out of the online-wait once instance_id is non-empty).
-log "5/6 KILLING the workspace EC2 to simulate an out-of-band termination..."
-if ! e2e_aws_creds_available; then
-  fail "AWS CLI/creds unavailable — cannot terminate the EC2 to exercise the reconciler. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (the CI workflow wires these)."
-fi
-AWS_REGION_RESOLVED=$(e2e_aws_region)
-if [ -n "$ORIGINAL_INSTANCE_ID" ]; then
-  log "    Terminating $ORIGINAL_INSTANCE_ID in $AWS_REGION_RESOLVED (aws ec2 terminate-instances)..."
-  aws ec2 terminate-instances --region "$AWS_REGION_RESOLVED" --instance-ids "$ORIGINAL_INSTANCE_ID" >/dev/null \
-    || fail "aws ec2 terminate-instances failed for $ORIGINAL_INSTANCE_ID"
-  KILLED_IDS="$ORIGINAL_INSTANCE_ID"
-else
-  # Fallback path — find by slug tag and terminate.
-  log "    instance_id was empty — falling back to slug-tag describe ($SLUG)..."
-  ROWS=$(e2e_ec2_instances_for_slug "$SLUG" 2>/dev/null || echo "")
-  KILLED_IDS=$(echo "$ROWS" | awk 'NF {print $1}' | sort -u | tr '\n' ' ')
-  [ -n "$KILLED_IDS" ] || fail "No slug-tagged EC2 found for $SLUG — nothing to terminate"
-  log "    Terminating $KILLED_IDS in $AWS_REGION_RESOLVED..."
-  e2e_terminate_instances "$KILLED_IDS" || fail "terminate-instances failed for $KILLED_IDS"
-fi
-ok "Terminated EC2: $KILLED_IDS — reconciler should now detect the dead instance"
+# ─── 5. Kill the workspace instance (EC2 terminate → docker rm -f) ───────
+# Kill the EXACT instance the workspace reported. On AWS this is `aws ec2
+# terminate-instances`; on molecules-server it is `docker rm -f <container>` —
+# both remove the box out-of-band (volumes survive) so the reconciler's IsRunning
+# reads "not running" and drives the SAME onOffline → existing-volume heal. The
+# provider-branched primitive lives in kill_workspace_instance (top of file).
+log "5/6 KILLING the workspace instance ($PROVIDER) to simulate an out-of-band termination..."
+require_kill_capability
+KILLED_IDS=$(kill_workspace_instance "$ORIGINAL_INSTANCE_ID" "$SLUG")
+ok "Killed workspace instance: $KILLED_IDS — reconciler should now detect the dead instance"
 
 # ─── 6a. PRIMARY assertion — workspace leaves 'online' ─────────────────
 # This is THE regression gate for core#2261/#2247. The reconciler runs every

@@ -21,12 +21,12 @@ import (
 func newActivityRows() *sqlmock.Rows {
 	cols := []string{
 		"id", "workspace_id", "activity_type", "source_id", "target_id", "method",
-		"summary", "request_body", "response_body", "tool_trace", "duration_ms", "status", "error_detail", "created_at",
+		"summary", "request_body", "response_body", "tool_trace", "duration_ms", "status", "error_detail", "created_at", "seq",
 	}
 	return sqlmock.NewRows(cols).
 		AddRow("act-1", "ws-1", "a2a_send", nil, nil, nil,
 			"sent", nil, nil, nil, nil, "ok", nil,
-			time.Date(2026, 4, 29, 10, 0, 0, 0, time.UTC))
+			time.Date(2026, 4, 29, 10, 0, 0, 0, time.UTC), int64(1))
 }
 
 // TestActivityHandler_SinceSecs_Accepted verifies that a valid since_secs

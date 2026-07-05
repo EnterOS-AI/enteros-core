@@ -37,10 +37,7 @@ name: Sweep stale Cloudflare Tunnels
 # (schedule → hard-fail, dispatch → soft-skip) surfaces it clearly.
 
 on:
-  schedule:
-    # Hourly at :45 — offset from sweep-cf-orphans (:15) so the two
-    # janitors don't issue parallel CF API bursts at the same minute.
-    - cron: '45 * * * *'
+  workflow_dispatch:
 # Don't let two sweeps race the same account.
 concurrency:
   group: sweep-cf-tunnels
@@ -57,7 +54,7 @@ jobs:
     name: Sweep CF tunnels
     runs-on: ubuntu-latest
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     # 30 min cap. Was 5 min on the theory that the only thing that
     # could take >5min is a CF-API hang — but on 2026-05-02 a backlog

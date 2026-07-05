@@ -216,17 +216,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// health check (assertCompletionServes in CP#824) verifies the
 		// cred re-injection landed.
 		wsAdmin.POST("/admin/workspaces/:id/restart", wh.AdminRestart)
-		// Per-workspace LLM billing mode override (internal#691). Used by
-		// CP's /cp/admin/workspaces/:id/llm-billing-mode proxy + (via that
-		// proxy) by the canvas Config-tab "LLM Billing" section. Default-
-		// closed resolver lives in handlers/llm_billing_mode.go.
-		wsAdmin.GET("/admin/workspaces/:id/llm-billing-mode", handlers.GetWorkspaceLLMBillingMode)
 		// SSOT model discovery (core#2608): what runtimes offer, which entries
 		// are platform-billed (no key) vs BYOK (auth_env required). The
 		// concierge's pre-provision lookup; pairs with the create-boundary
 		// MISSING_BYOK_CREDENTIAL hard-reject.
 		wsAdmin.GET("/admin/llm/offered-models", handlers.ListOfferedModels)
-		wsAdmin.PUT("/admin/workspaces/:id/llm-billing-mode", handlers.PutWorkspaceLLMBillingMode)
 		// Proxy to CP's serial-console endpoint so the canvas's "View
 		// Logs" button can render the actual boot trace without handing
 		// the tenant AWS credentials. Admin-gated because console output
@@ -255,6 +249,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// A2A proxy — registered outside the auth group; already enforces CanCommunicate access control.
 	r.POST("/workspaces/:id/a2a", wh.ProxyA2A)
+
+	// core#3319: A2A inbound endpoint for external agents. Authenticates with the
+	// target workspace's platform_inbound_secret before forwarding through ProxyA2A.
+	r.POST("/workspaces/:id/a2a/inbound", wh.ReceiveA2AInbound)
 
 	// A2A queue status lookup (RFC #2331 Tier 1) — registered outside the
 	// workspace auth group because the row's caller_id may be a DIFFERENT
@@ -480,6 +478,19 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		eventsAdmin.GET("/events/:workspaceId", eh.ListByWorkspace)
 	}
 
+	// Monitor — the OSS org-dashboard monitoring API behind the canvas
+	// /monitor page. AdminAuth-gated for the same reason as /events and
+	// /requests/pending: these are cross-workspace org reads (A2A traffic
+	// time-series + topology counts) that leak fleet shape if unauthenticated.
+	// Every number is read straight from local tables (activity_logs,
+	// workspaces) — no synthetic data. The control plane / app only READ these.
+	mh := handlers.NewMonitorHandler(db.DB)
+	{
+		monitorAdmin := r.Group("", middleware.AdminAuth(db.DB))
+		monitorAdmin.GET("/monitor/a2a-traffic", mh.A2ATraffic)
+		monitorAdmin.GET("/monitor/topology-summary", mh.TopologySummary)
+	}
+
 	// Remaining auth-gated workspace sub-routes — appended to wsAuth group declared above.
 	{
 		// Push notifications (mobile)
@@ -493,6 +504,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.GET("/activity", acth.List)
 		wsAuth.GET("/session-search", acth.SessionSearch)
 		wsAuth.POST("/activity", acth.Report)
+		// MUST-FIX 3: durable inbox delivery ack. The runtime inbox poller
+		// POSTs the highest seq it has drained; the cursor gates retention.
+		wsAuth.POST("/activity/ack", acth.Ack)
 		wsAuth.POST("/notify", acth.Notify)
 
 		// Push token registration (mobile)
@@ -560,6 +574,18 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// Called by the control plane at org provision + existing-org backfill.
 		// (RFC docs/design/rfc-platform-agent.md)
 		r.POST("/admin/org/platform-agent", middleware.AdminAuth(db.DB), handlers.InstallPlatformAgent)
+
+		// Platform-agent create/repair — CORE-OWNED, self-contained (NO control-
+		// plane dependency). Derives the platform-agent id IN core
+		// (DeterministicPlatformAgentID from MOLECULE_ORG_ID, else
+		// SelfHostedPlatformAgentID), runs the SAME idempotent install as
+		// POST /admin/org/platform-agent, then triggers the workspace provision via
+		// the local/CP provisioner (RestartByID). Idempotent: a healthy concierge is
+		// a no-op; a missing/degraded one is created/repaired. Powers the canvas
+		// "Create / repair platform agent" button so the OSS canvas brings the
+		// concierge online WITHOUT ever calling a /cp/* endpoint.
+		// (RFC docs/design/rfc-platform-agent.md)
+		r.POST("/admin/org/platform-agent/ensure", middleware.AdminAuth(db.DB), wh.EnsurePlatformAgent)
 
 		// Memory
 		memh := handlers.NewMemoryHandler()

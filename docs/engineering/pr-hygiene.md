@@ -63,7 +63,7 @@ git push -u origin your-branch-clean
 
 ### 4. Target `staging` unless you're doing a staging→main promote
 
-Per branching policy ([feedback memory](../../.claude/projects/-Users-hongming-Documents-GitHub-molecule-monorepo/memory/feedback_no_push_main.md) rule): every change lands on `staging` first. Once validated there, a periodic `chore: sync staging → main` PR promotes the bundle.
+Per branching policy (never push directly to `main`): every change lands on `staging` first. Once validated there, a periodic `chore: sync staging → main` PR promotes the bundle.
 
 Exception: hotfixes that also land on `main` directly with CEO approval.
 

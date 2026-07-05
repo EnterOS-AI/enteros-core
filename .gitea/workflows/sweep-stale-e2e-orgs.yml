@@ -1,3 +1,4 @@
+# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
 name: Sweep stale e2e-* orgs (staging)
 
 # Ported from .github/workflows/sweep-stale-e2e-orgs.yml on 2026-05-11 per RFC
@@ -35,18 +36,21 @@ name: Sweep stale e2e-* orgs (staging)
 # future leak source we haven't yet identified.
 
 on:
-  schedule:
-    # Every 15 min. E2E orgs are short-lived (~8-25 min wall clock from
-    # create to teardown — canary is ~8 min, full SaaS ~25 min). The
-    # previous hourly + 120-min stale threshold meant a leaked tenant
-    # could keep an EC2 alive for up to 2 hours, eating ~2 vCPU per
-    # leak. Tightening the cadence + threshold reduces the worst-case
-    # leak window from 120 min to ~45 min (15-min sweep cadence + 30-min
-    # threshold) without risk of catching in-progress runs (the longest
-    # e2e run is the 25-min canary, well under the 30-min threshold).
-    # See molecule-controlplane#420 for the leak-class accounting that
-    # motivated this tightening.
-    - cron: '*/15 * * * *'
+  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
+#   schedule:
+#     # Every 15 min. E2E orgs are short-lived (~8-25 min wall clock from
+#     # create to teardown — canary is ~8 min, full SaaS ~25 min). The
+#     # previous hourly + 120-min stale threshold meant a leaked tenant
+#     # could keep an EC2 alive for up to 2 hours, eating ~2 vCPU per
+#     # leak. Tightening the cadence + threshold reduces the worst-case
+#     # leak window from 120 min to ~45 min (15-min sweep cadence + 30-min
+#     # threshold) without risk of catching in-progress runs (the longest
+#     # e2e run is the 25-min canary, well under the 30-min threshold).
+#     # See molecule-controlplane#420 for the leak-class accounting that
+#     # motivated this tightening.
+#     - cron: '*/15 * * * *'
+  # DISABLED 2026-06-27: no manual trigger remained after neutralizing auto-triggers; workflow_dispatch added so the workflow stays manually runnable.
+  workflow_dispatch:
 # Don't let two sweeps fight. Cron + workflow_dispatch could overlap
 # on a manual trigger; queue rather than parallel-delete.
 concurrency:

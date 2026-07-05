@@ -316,14 +316,15 @@ func TestHeartbeatHandler_RuntimeEmitsServerPresentButNoLoadedTools_WithinGrace(
 	}
 }
 
-// TestHeartbeatHandler_DegradedNotRecoveredWhileMCPUnloaded verifies Bug B:
-// a platform agent currently 'degraded' with low error_rate must NOT be
-// recovered to online while THIS heartbeat still observes the management MCP
-// as unloaded past the grace window. Without the managementMCPUnloaded guard
-// on the recovery branch, a genuinely MCP-less concierge would oscillate
-// degraded->online forever. The #3082 block has already run on a 'degraded'
-// row (its degrade UPDATE is a no-op since status != 'online'), set
-// managementMCPUnloaded=true, and the recovery branch must be skipped.
+// TestHeartbeatHandler_DegradedNotRecoveredWhileMCPUnloaded verifies Bug B under
+// the core#3082 verified-ready model: a platform agent currently 'degraded' whose
+// THIS-heartbeat loaded_mcp_tools does NOT contain provision_workspace must NOT be
+// recovered to online. The verified-ready gate OWNS all non-online platform
+// transitions: a degraded row with the tool not loaded hits the default HOLD
+// branch and returns BEFORE the generic degraded→online recovery branch ever
+// runs. So no recovery UPDATE, and (because the gate returns before it) the
+// post-online #3082 degrade block is not reached either — the only DB work is the
+// heartbeat columns + loaded_mcp_tools persist + the two evaluateStatus reads.
 func TestHeartbeatHandler_DegradedNotRecoveredWhileMCPUnloaded(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -353,26 +354,15 @@ func TestHeartbeatHandler_DegradedNotRecoveredWhileMCPUnloaded(t *testing.T) {
 		WithArgs("ws-stuck-degraded").
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 
-	mock.ExpectQuery("SELECT plugin_name, source_raw FROM workspace_declared_plugins").
-		WithArgs("ws-stuck-degraded").
-		WillReturnRows(sqlmock.NewRows([]string{"plugin_name", "source_raw"}).
-			AddRow(conciergePlatformMCPName, "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"))
-
-	// The #3082 degrade UPDATE still runs (guarded by status='online' in SQL, so
-	// it is a no-op here) and the WORKSPACE_DEGRADED broadcast fires.
-	mock.ExpectExec("UPDATE workspaces SET status =.*status = 'online'").
-		WithArgs(models.StatusDegraded, "platform agent management MCP declared but not loaded; marking degraded (core#3082)", "ws-stuck-degraded").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("INSERT INTO structure_events").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	// CRITICAL: NO "UPDATE ... SET status=online ... status='degraded'" recovery
-	// UPDATE is expected — the recovery branch is gated on !managementMCPUnloaded.
+	// CRITICAL: the verified-ready gate's default HOLD branch logs and RETURNS for
+	// a degraded+tool-unloaded platform agent. NO listDeclaredPlugins read, NO
+	// degrade UPDATE, NO broadcast, and above all NO "status=online ...
+	// status='degraded'" recovery UPDATE — the row is held degraded.
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	// Functional agent (error_rate 0, no wedge) but management MCP unloaded.
+	// Functional agent (error_rate 0, no wedge) but provision_workspace not loaded.
 	body := `{"workspace_id":"ws-stuck-degraded","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["a2a"]}`
 	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")

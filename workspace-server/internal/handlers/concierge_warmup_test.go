@@ -90,11 +90,56 @@ func newHealthyPlatformHeartbeatRequest(wsID string) (*gin.Context, *httptest.Re
 	return c, w
 }
 
-// TestConciergeWarmup_FiresOnceForPlatformOnline verifies (a): when a
-// kind=platform concierge transitions to / is observed online with its model +
-// management MCP present, the warmup A2A fires exactly once, targeting the
-// concierge's own id with a benign system-caller turn.
-func TestConciergeWarmup_FiresOnceForPlatformOnline(t *testing.T) {
+// expectWarmingPlatformHeartbeat sets up sqlmock for a kind=platform concierge
+// heartbeat in 'provisioning' (warming) whose loaded_mcp_tools does NOT yet
+// contain provision_workspace and which has no prior mcp_unloaded_since stamp.
+// Under the core#3082 verified-ready gate the row HOLDS 'provisioning' (no online
+// flip), stamps the warming window, and the warmup fires DURING warming. This is
+// the state the warmup now drives the capture from.
+func expectWarmingPlatformHeartbeat(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs(wsID, 0.0, "", 0, 60, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// loaded_mcp_tools (["a2a"]) is non-nil, so it is persisted.
+	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+		WithArgs(sqlmock.AnyArg(), wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// evaluateStatus: currentStatus=provisioning, kind=platform, no warming stamp yet.
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
+		WithArgs(wsID).
+		WillReturnRows(evalStatusRows("provisioning", "platform", nil, nil))
+	// platformAgentHasModelSecret: model secret exists.
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	// Warming branch stamps mcp_unloaded_since (first observation). NO online flip,
+	// NO degrade, NO broadcast.
+	mock.ExpectExec("UPDATE workspaces SET mcp_unloaded_since = COALESCE").
+		WithArgs(wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func newWarmingPlatformHeartbeatRequest(wsID string) (*gin.Context, *httptest.ResponseRecorder) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	// mcp_server_present=true but loaded_mcp_tools lacks provision_workspace → the
+	// row is still warming (not yet verified-ready).
+	body := `{"workspace_id":"` + wsID + `","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["a2a"]}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	return c, w
+}
+
+// TestConciergeWarmup_FiresDuringWarming verifies the core#3082 warmup contract:
+// when a kind=platform concierge is WARMING (status='provisioning', model +
+// management MCP present, but provision_workspace not yet loaded), the warmup A2A
+// fires exactly once, targeting the concierge's own id with a benign system-caller
+// turn. The warmup is what drives the per-turn loaded_mcp_tools capture that
+// resolves warming→online — so it MUST fire pre-online, not only when online.
+func TestConciergeWarmup_FiresDuringWarming(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
@@ -103,9 +148,9 @@ func TestConciergeWarmup_FiresOnceForPlatformOnline(t *testing.T) {
 	rec := &warmupRecorder{}
 	handler.SetWarmupSendFunc(rec.send)
 
-	expectHealthyOnlinePlatformHeartbeat(mock, "ws-warmup-fires")
+	expectWarmingPlatformHeartbeat(mock, "ws-warmup-fires")
 
-	c, w := newHealthyPlatformHeartbeatRequest("ws-warmup-fires")
+	c, w := newWarmingPlatformHeartbeatRequest("ws-warmup-fires")
 	handler.Heartbeat(c)
 
 	// Drain the detached warmup goroutine deterministically before asserting.
@@ -188,15 +233,16 @@ func TestConciergeWarmup_DoesNotFireTwiceAcrossHeartbeats(t *testing.T) {
 	rec := &warmupRecorder{}
 	handler.SetWarmupSendFunc(rec.send)
 
-	// Two identical healthy-online heartbeats for the same workspace.
-	expectHealthyOnlinePlatformHeartbeat(mock, "ws-warmup-once")
-	expectHealthyOnlinePlatformHeartbeat(mock, "ws-warmup-once")
+	// Two identical warming heartbeats for the same workspace. The throttle
+	// (conciergeWarmupTimeout) means two back-to-back beats fire the warmup ONCE.
+	expectWarmingPlatformHeartbeat(mock, "ws-warmup-once")
+	expectWarmingPlatformHeartbeat(mock, "ws-warmup-once")
 
-	c1, w1 := newHealthyPlatformHeartbeatRequest("ws-warmup-once")
+	c1, w1 := newWarmingPlatformHeartbeatRequest("ws-warmup-once")
 	handler.Heartbeat(c1)
 	waitGlobalAsyncForTest()
 
-	c2, w2 := newHealthyPlatformHeartbeatRequest("ws-warmup-once")
+	c2, w2 := newWarmingPlatformHeartbeatRequest("ws-warmup-once")
 	handler.Heartbeat(c2)
 	waitGlobalAsyncForTest()
 
@@ -204,7 +250,7 @@ func TestConciergeWarmup_DoesNotFireTwiceAcrossHeartbeats(t *testing.T) {
 		t.Fatalf("expected both heartbeats to 200, got %d and %d", w1.Code, w2.Code)
 	}
 	if got := rec.count(); got != 1 {
-		t.Fatalf("expected warmup to fire exactly once across two heartbeats, got %d", got)
+		t.Fatalf("expected warmup to fire exactly once across two heartbeats (throttle), got %d", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
@@ -224,13 +270,13 @@ func TestConciergeWarmup_SenderErrorDoesNotAffectStatus(t *testing.T) {
 	rec := &warmupRecorder{err: errors.New("warmup boom: connection refused")}
 	handler.SetWarmupSendFunc(rec.send)
 
-	// Same healthy-online expectations. CRUCIALLY: no extra degrade UPDATE and
-	// no extra broadcast are expected — a warmup failure leaves the status path
-	// untouched. ExpectationsWereMet would fail if the warmup error triggered
-	// an unexpected DB write.
-	expectHealthyOnlinePlatformHeartbeat(mock, "ws-warmup-err")
+	// Same warming expectations. CRUCIALLY: no online flip and no extra broadcast
+	// beyond the warming stamp — a warmup send failure leaves the status path
+	// untouched (the row stays 'provisioning'). ExpectationsWereMet would fail if
+	// the warmup error triggered an unexpected DB write.
+	expectWarmingPlatformHeartbeat(mock, "ws-warmup-err")
 
-	c, w := newHealthyPlatformHeartbeatRequest("ws-warmup-err")
+	c, w := newWarmingPlatformHeartbeatRequest("ws-warmup-err")
 	handler.Heartbeat(c)
 	waitGlobalAsyncForTest()
 

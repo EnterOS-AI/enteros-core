@@ -39,10 +39,6 @@ on:
       - 'tests/test_lint_no_coe_on_required.py'
   push:
     branches: [main, staging]
-  schedule:
-    # Daily — catches BP-drift introduced out-of-band (a required context
-    # added to BP whose emitting job already has continue-on-error).
-    - cron: '23 14 * * *'
   workflow_dispatch:
 
 env:

@@ -37,6 +37,22 @@ for f in test_*.sh; do
       violations=$((violations + 1))
     fi
   fi
+  # Wire the zero-leftover VERIFY into the gate: any wrapper that sources the
+  # run-footprint engine (lib/run_footprint.sh) MUST actually call rf_verify —
+  # the REQUIRED post-teardown assertion — AND rf_force_clean (the FINALLY safety
+  # belt). Without this lint a refactor could quietly drop the leak-catch and the
+  # test would go green while the product's teardown silently leaks (exactly the
+  # failure this wrapper exists to prevent).
+  if grep -qE 'run_footprint\.sh' "$f"; then
+    if ! grep -qE '\brf_verify\b' "$f"; then
+      echo "::error file=tests/e2e/$f::sources lib/run_footprint.sh but never calls rf_verify — the zero-leftover VERIFY assertion is REQUIRED. Call rf_verify and FAIL the test when it returns non-zero."
+      violations=$((violations + 1))
+    fi
+    if ! grep -qE '\brf_force_clean\b' "$f"; then
+      echo "::error file=tests/e2e/$f::sources lib/run_footprint.sh but never calls rf_force_clean — the FINALLY safety belt is REQUIRED so the e2e never itself leaks when it catches a teardown bug."
+      violations=$((violations + 1))
+    fi
+  fi
 done
 
 if ! python3 - "$repo_root" <<'PY'

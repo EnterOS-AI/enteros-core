@@ -58,7 +58,7 @@ function makeData() {
     url: "http://localhost:9000",
     parentId: null,
     currentTask: "",
-    runtime: "langgraph",
+    runtime: "codex",
     needsRestart: false,
     budgetLimit: null,
   };

@@ -492,6 +492,20 @@ jobs:
         name: Run E2E bash unit tests (no live infra)
         run: |
           bash tests/e2e/test_model_slug.sh
+          # E2E structured-observability lib (lib/obs.sh). Offline (no Loki /
+          # network): proves JSON escaping, secret redaction, numeric fields,
+          # and the FAIL-SOFT contract — with Loki unreachable AND `set -e`,
+          # every public obs fn still returns 0 so a down obs stack can never
+          # fail or hang an e2e. A regression that makes obs.sh able to abort a
+          # caller goes red on every PR.
+          bash tests/e2e/lib/test_obs_lib_unit.sh
+          # CP /health readiness-poll helper (lib/cp_health_preflight.sh). Offline
+          # (mocked curl, zero real sleeps): proves a cold-start / mid-recreate CP
+          # (000/5xx/non-200) RETRIES to a stable Nx200 streak instead of a
+          # single-shot `--max-time 10` that hard-failed the canary on any blip
+          # (mc#3244). Locks in: cold-start burst retries then succeeds, a mid-flap
+          # resets the streak, persistent non-ready returns 1 (no hang/false green).
+          bash tests/e2e/lib/test_cp_health_preflight.sh
           # molecule-core#1995 (#1994 follow-on): fail-direction proof for
           # the A2A real-completion + byok-routing assertion helpers
           # (lib/completion_assert.sh). Offline (no LLM, no network): it
@@ -519,6 +533,24 @@ jobs:
           # live arm to prove this, so this unit test IS the regression gate:
           # a revert of the zero-validated→RED logic goes red on every PR.
           bash tests/e2e/test_require_live_priority_gate_unit.sh
+          # core#3375: fail-direction proof for the E2E_TMPL_SLUG
+          # destructive-selector guard in test_template_delivery_e2e.sh.
+          # Offline (no CP/network): drives the REAL script with dummy creds and
+          # CP pointed at a closed port — asserts a non-ephemeral override exits 2
+          # with the refusal BEFORE the delete trap / any provision-or-deprovision,
+          # and that a legitimate e2e-tmpl-<8hex> slug clears the guard. A revert
+          # of the guard (re-trusting the raw override) goes red on every PR.
+          bash tests/e2e/test_template_slug_guard.sh
+          # core#2782 boot-cell regression: fail-direction proof for the
+          # collision-proof slug helper (lib/collision-proof-slug.sh). Offline
+          # (pure bash, no CP/network): asserts the helper ALWAYS emits the
+          # 8-char hex uuid anchor — including for the 18-char `cp455-<runtime>-`
+          # prefix used by test_minimal_boot_cell.sh, where there is no room for
+          # the <date>-<run_id> context. A revert to the old `return 1`/empty-suffix
+          # behavior (which produced the collision-UNsafe `cp455-claude-code-`
+          # slug and aborted boot-to-registration BEFORE provisioning) goes red
+          # here on every PR instead of burning a live boot-cell run.
+          bash tests/e2e/test_collision_proof_slug_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Drift guard — KI-013 container/volume naming (SEV #2499)
@@ -709,10 +741,16 @@ jobs:
     # on PRs and is included here — internal#817. If a new always-running
     # CI job is added, add it here too or ci-required-drift F1 will flag it.
     #
-    # Stays on the dedicated `ci-meta` lane (no docker work, so the
-    # docker-host-pin lint does not apply), but now the job is sub-second:
-    # it only inspects already-settled `needs.*.result` values, so it frees
-    # the slot immediately instead of holding it for the whole CI duration.
+    # Runs on the shared robot-1 `ubuntu-latest` pool. Operator directive
+    # (2026-07): CI runs on robot-1; the local box is reserved for the
+    # staging/prod stacks + Gitea registry + genuinely-must-be-local jobs.
+    # This aggregator does NO docker work (so the docker-host-pin lint does
+    # not apply) and is sub-second: it only inspects already-settled
+    # `needs.*.result` values, so it never needed a local lane. All of its
+    # `needs:` already run on `ubuntu-latest`, so co-locating it there removes
+    # the last core-CI job stranded on the local `ci-meta` runner. The emitted
+    # status context (`CI / all-required (<event>)`) is derived from the
+    # job/workflow name, not the runner, so branch protection is unaffected.
     #
     needs:
       - changes
@@ -722,7 +760,7 @@ jobs:
       - python-lint
       - canvas-deploy-status
     continue-on-error: false
-    runs-on: ci-meta
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

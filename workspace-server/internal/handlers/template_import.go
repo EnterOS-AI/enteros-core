@@ -214,7 +214,12 @@ func (h *TemplatesHandler) ReplaceFiles(c *gin.Context) {
 	// (key push + tunnel + install), so up to 10 files is fine; above
 	// that we should reuse the tunnel across multiple writes — tracked
 	// as a follow-up.
-	if instanceID != "" {
+	//
+	// isEC2InstanceID gates this on a REAL EC2 id: a molecules-server
+	// (local-docker) workspace persists its container NAME in instance_id,
+	// which must route to the local-Docker path below, not the AWS-only EIC
+	// tunnel. See files_backend_dispatch.go.
+	if isEC2InstanceID(instanceID) {
 		for relPath, content := range body.Files {
 			// ReplaceFiles is a bulk template-import endpoint — files
 			// always land in the runtime's managed-config dir. Pass

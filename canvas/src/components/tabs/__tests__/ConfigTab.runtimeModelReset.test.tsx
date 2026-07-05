@@ -67,7 +67,7 @@ const TEMPLATES = [
     runtime: "claude-code",
     registry_backed: true,
     registry_providers: [
-      { name: "platform", display_name: "Platform", billing_mode: "platform_managed" },
+      { name: "platform", display_name: "Platform" },
     ],
     registry_models: [
       { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform" },
@@ -80,7 +80,7 @@ const TEMPLATES = [
     runtime: "google-adk",
     registry_backed: true,
     registry_providers: [
-      { name: "platform", display_name: "Platform", billing_mode: "platform_managed" },
+      { name: "platform", display_name: "Platform" },
     ],
     registry_models: [
       { id: "platform:gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "platform" },

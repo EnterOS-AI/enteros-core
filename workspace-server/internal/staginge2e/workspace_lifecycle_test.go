@@ -3,6 +3,7 @@
 package staginge2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -179,11 +180,43 @@ func postLifecycle(t *testing.T, host, token, orgID, wsID, pathAndQuery string) 
 // workspaceStatusAndURL reads the canvas GET /workspaces/:id and returns
 // (status, url). url is "" when the workspace is not routable (paused/hibernated
 // clear it). httpStatus is surfaced so callers can distinguish 404/Gone.
+//
+// CRITICAL — read the TOP-LEVEL url, not the nested agent_card.url. The GET
+// response embeds the agent's self-reported endpoint at agent_card.url, and gin
+// marshals the response map with keys sorted alphabetically, so "agent_card"
+// serializes BEFORE the top-level "url". A naive flat jsonField(body,"url") would
+// therefore match agent_card.url FIRST — and the lifecycle handlers only clear the
+// TOP-LEVEL url on pause/hibernate (agent_card is display identity, retained across
+// pause). That made assertURLCleared read the never-cleared agent_card.url and fail
+// "url never cleared" even though the container WAS stopped and the top-level url
+// WAS cleared (verified live on staging: container GONE, DB workspaces.url=”). Parse
+// the top level with encoding/json so we read the load-bearing routability signal.
 func workspaceStatusAndURL(t *testing.T, host, token, orgID, wsID string) (httpStatus int, status, url string) {
 	t.Helper()
 	u := "https://" + host + "/workspaces/" + wsID
 	hs, body := doTenantJSON(t, "GET", u, token, orgID, "")
-	return hs, jsonField(body, "status"), jsonField(body, "url")
+	return hs, topLevelString(body, "status"), topLevelString(body, "url")
+}
+
+// topLevelString decodes the JSON object in body and returns the TOP-LEVEL string
+// value for key (or "" on any decode error / missing / non-string). Unlike the
+// flat jsonField scanner it never descends into nested objects, so a nested field
+// that happens to share the key name (e.g. agent_card.url) can't shadow the
+// top-level value.
+func topLevelString(body, key string) string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		return ""
+	}
+	raw, ok := m[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return s
 }
 
 // waitForWorkspaceStatus polls the canvas GET until .status == want.
@@ -409,7 +442,13 @@ func envOr(k, def string) string {
 // its instance to reach running (provisioning is async).
 func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"slug":%q,"name":%q,"owner_user_id":%q}`, slug, "E2E Workspace Lifecycle", "e2e-runner:"+slug)
+	// Compute backend for the throwaway tenant. Defaults to molecules-server (the local-docker
+	// backend) now that the AWS EC2 path is closed. The canonical cloudprovider SSOT wire id
+	// the CP org-create validates (IsValidRequest) and persists as organizations.provider
+	// "local" (PersistKey); an empty provider would fall back to the CP DefaultProvider (the
+	// closed AWS path). The e2e workflows export E2E_PROVIDER; envOr pins the local default.
+	provider := envOr("E2E_PROVIDER", "molecules-server")
+	body := fmt.Sprintf(`{"slug":%q,"name":%q,"owner_user_id":%q,"provider":%q}`, slug, "E2E Workspace Lifecycle", "e2e-runner:"+slug, provider)
 	status, resp := doJSON(t, "POST", cfg.cpBase+"/cp/admin/orgs", cfg.adminToken, body)
 	if status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("AdminCreate org: HTTP %d: %s", status, resp)
@@ -464,18 +503,18 @@ func tenantAdminToken(t *testing.T, cfg stagingCfg, slug string) string {
 // tenantCreateWorkspace creates a default-runtime workspace via the tenant
 // ws-server, exercising the full tenant → CP provisioner → EC2 path.
 //
-// De-hardcode (behavior-neutral): the runtime + model FOLLOW the same KMS-
-// injection pattern the de-hardcode lanes use — E2E_RUNTIME / E2E_MODEL are
-// exported by the e2e workflows from the platform default SSOT
-// (MOLECULE_DEFAULT_RUNTIME / MOLECULE_LLM_DEFAULT_MODEL @ /shared/controlplane/llm).
-// When unset (local runs), envOr falls back to the historical literals, so
-// behavior is identical today (runtime=claude-code, model=moonshot/kimi-k2.6).
+// De-hardcode: the runtime + model FOLLOW the same KMS-injection pattern the
+// de-hardcode lanes use — E2E_RUNTIME / E2E_MODEL are exported by the e2e
+// workflows from the platform default SSOT (MOLECULE_DEFAULT_RUNTIME /
+// MOLECULE_LLM_DEFAULT_MODEL @ /shared/controlplane/llm). When unset (local runs),
+// envOr falls back to the CURRENT SSOT value (minimax/MiniMax-M2.7), NOT a
+// moonshot vendor const, so the local fallback tracks the SSOT default.
 func tenantCreateWorkspace(t *testing.T, cfg stagingCfg, host, token, orgID string) string {
 	t.Helper()
 	return tenantCreateWorkspaceWithRuntime(
 		t, cfg, host, token, orgID, "core2332-life-e2e",
 		envOr("E2E_RUNTIME", "claude-code"),
-		envOr("E2E_MODEL", "moonshot/kimi-k2.6"),
+		envOr("E2E_MODEL", "minimax/MiniMax-M2.7"),
 	)
 }
 
@@ -487,8 +526,8 @@ func tenantCreateWorkspaceWithRuntime(t *testing.T, cfg stagingCfg, host, token,
 	t.Helper()
 	url := "https://" + host + "/workspaces"
 	body := fmt.Sprintf(
-		`{"name":%q,"runtime":%q,"tier":%d,"model":%q,"billing_mode":%q,"provider":%q}`,
-		name, runtime, 1, model, "platform_managed", "platform",
+		`{"name":%q,"runtime":%q,"tier":%d,"model":%q,"provider":%q}`,
+		name, runtime, 1, model, "platform",
 	)
 	status, resp := doTenantJSON(t, "POST", url, token, orgID, body)
 	if status != http.StatusCreated && status != http.StatusOK {

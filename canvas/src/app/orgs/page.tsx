@@ -21,6 +21,7 @@ import { useEffect, useState } from "react";
 import { fetchSession, redirectToLogin, signOut, type Session } from "@/lib/auth";
 import { PLATFORM_URL } from "@/lib/api";
 import { formatCredits, pillTone, bannerKind } from "@/lib/credits";
+import { SaaSHostSuffix } from "@/lib/tenant";
 import { TermsGate } from "@/components/TermsGate";
 
 type OrgStatus = "awaiting_payment" | "provisioning" | "running" | "failed" | string;
@@ -299,10 +300,20 @@ function StatusLabel({ status }: { status: OrgStatus }) {
 
 function OrgCTA({ org }: { org: Org }) {
   if (org.status === "running") {
-    const host = typeof window !== "undefined" ? window.location.hostname : "moleculesai.app";
-    const appDomain = host.endsWith(".moleculesai.app")
-      ? host.split(".").slice(-2).join(".")
-      : "moleculesai.app";
+    // Tenant base domain, derived per-env so staging stays on
+    // <slug>.staging.moleculesai.app and never the prod apex. Strip the
+    // leading host label (the current app/tenant subdomain) at runtime — this
+    // is correct whether /orgs is served from the app host (app.<base>) or a
+    // tenant host (<slug>.<base>), and handles multi-label bases like
+    // staging.moleculesai.app that the old last-two-labels heuristic broke.
+    // Guard: the stripped base must contain a dot (so a 2-label apex host like
+    // moleculesai.app doesn't yield <slug>.app — core#2509); otherwise fall
+    // back to the env-configured SaaS host suffix (NEXT_PUBLIC_SAAS_HOST_SUFFIX).
+    const host = typeof window !== "undefined" ? window.location.hostname : "";
+    const stripped = host.includes(".") ? host.split(".").slice(1).join(".") : "";
+    const appDomain = stripped.includes(".")
+      ? stripped
+      : SaaSHostSuffix.replace(/^\./, "");
     const href = `https://${org.slug}.${appDomain}`;
     return (
       <a

@@ -31,24 +31,51 @@ name: contract-ssot-sync
 # readable over the raw endpoint without a token; the gate runs on EVERY context
 # (incl. fork PRs) and is FAIL-CLOSED on a fetch error (non-200 / network) and
 # on canonical drift.
+#
+# WORKSPACE-COMMS SIBLING: this workflow now ALSO runs
+# check-workspace-comms-ssot-sync.sh, which keeps the VENDORED workspace-comms
+# schema copies (workspace-server/internal/models/testdata/workspace-comms/)
+# honest against the molecule-contracts SSOT. Those vendored copies are what the
+# Go PRODUCER gate (workspace-server/internal/models/workspace_comms_ssot_test.go)
+# embeds to assert workspace.go's wire structs (RegisterPayload / HeartbeatPayload
+# / RuntimeMetadata) don't silently drift the contract. Same trust model (public,
+# unauthenticated, fail-closed). The two halves together close the producer loop:
+# Go gate = struct <-> vendored schema; this check = vendored schema <-> SSOT.
+#
+# PLUGIN-MANIFEST SIBLING (core#3383): this workflow ALSO runs
+# check-plugin-manifest-ssot-sync.sh, which keeps the VENDORED plugin-manifest
+# schema (workspace-server/internal/plugins/contracts/plugin-manifest.schema.json,
+# go:embed'ed by internal/plugins/manifest_ssot.go for advisory install-time
+# manifest validation) honest against its LIVE SSOT in molecule-ai-sdk
+# (contracts/plugin-manifest/ -- molecule-contracts is archived; the sdk repo
+# is where this contract lives). Same trust model (public, unauthenticated,
+# fail-closed on fetch error / drift), byte-identical invariant.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
       - 'contracts/mcp-plugin-delivery.contract.json'
+      - 'workspace-server/internal/models/workspace.go'
+      - 'workspace-server/internal/models/testdata/workspace-comms/**'
+      - 'workspace-server/internal/plugins/contracts/plugin-manifest.schema.json'
+      - 'workspace-server/internal/plugins/manifest_ssot.go'
       - '.gitea/scripts/check-contract-ssot-sync.sh'
+      - '.gitea/scripts/check-workspace-comms-ssot-sync.sh'
+      - '.gitea/scripts/check-plugin-manifest-ssot-sync.sh'
       - '.gitea/workflows/contract-ssot-sync.yml'
   push:
     branches: [main]
     paths:
       - 'contracts/mcp-plugin-delivery.contract.json'
+      - 'workspace-server/internal/models/workspace.go'
+      - 'workspace-server/internal/models/testdata/workspace-comms/**'
+      - 'workspace-server/internal/plugins/contracts/plugin-manifest.schema.json'
+      - 'workspace-server/internal/plugins/manifest_ssot.go'
       - '.gitea/scripts/check-contract-ssot-sync.sh'
+      - '.gitea/scripts/check-workspace-comms-ssot-sync.sh'
+      - '.gitea/scripts/check-plugin-manifest-ssot-sync.sh'
       - '.gitea/workflows/contract-ssot-sync.yml'
-  schedule:
-    # Daily at :39 -- catch a molecule-contracts SSOT change that landed without
-    # a paired core mirror re-sync PR (off-zero to spread cron load).
-    - cron: '39 4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -70,3 +97,17 @@ jobs:
 
       - name: Verify mirror == molecule-contracts SSOT (unauthenticated, fail-closed)
         run: bash .gitea/scripts/check-contract-ssot-sync.sh
+
+      # workspace-comms sibling: keep the VENDORED schema copies that the Go
+      # producer gate (workspace_comms_ssot_test.go) embeds in lockstep with the
+      # molecule-contracts SSOT. Same trust model (public, unauthenticated,
+      # fail-closed on fetch error / canonical drift).
+      - name: Verify vendored workspace-comms schemas == molecule-contracts SSOT
+        run: bash .gitea/scripts/check-workspace-comms-ssot-sync.sh
+
+      # plugin-manifest sibling (core#3383): keep the VENDORED schema that
+      # manifest_ssot.go go:embed's (advisory install-time manifest validation)
+      # in lockstep with the LIVE molecule-ai-sdk SSOT. Same trust model
+      # (public, unauthenticated, fail-closed on fetch error / drift).
+      - name: Verify vendored plugin-manifest schema == molecule-ai-sdk SSOT
+        run: bash .gitea/scripts/check-plugin-manifest-ssot-sync.sh

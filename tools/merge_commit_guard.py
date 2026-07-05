@@ -25,6 +25,16 @@ import urllib.request
 
 DEFAULT_SERVER = "https://git.moleculesai.app"
 
+# Cloudflare fronts git.moleculesai.app and its bot-protection returns 403 for
+# the default "Python-urllib/x.y" User-Agent that urllib.request sends. That 403
+# has nothing to do with the token's scope: it fired on every PR-head fetch and
+# tripped the fail-closed api_failures path, so this guard reported a false
+# "could not verify PR #N: 403" on main even when no commit was dropped (the PR
+# head WAS an ancestor). Sending an explicit, non-blocked User-Agent -- the same
+# way the curl-based gate scripts already reach the API -- lets the request
+# through. (core#2641 follow-up.)
+USER_AGENT = "molecule-merge-commit-guard/1.0"
+
 
 def pr_number_from_message(message: str) -> int | None:
     """Extract the PR number from a Gitea merge commit message.
@@ -91,6 +101,9 @@ def pr_head_sha(pr_number: int, repo: str, token: str, server: str) -> str:
         headers={
             "Authorization": f"token {token}",
             "Accept": "application/json",
+            # Avoid the default "Python-urllib/x.y" UA, which Cloudflare 403s
+            # (see USER_AGENT note above).
+            "User-Agent": USER_AGENT,
         },
     )
     with urllib.request.urlopen(req, timeout=30) as response:

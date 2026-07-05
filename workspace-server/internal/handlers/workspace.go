@@ -94,6 +94,12 @@ type WorkspaceHandler struct {
 	// calls made by HibernateWorkspace without requiring a running Docker daemon.
 	// Always nil in production; the real provisioner path is used when nil.
 	stopFnOverride func(ctx context.Context, workspaceID string)
+	// provisionTriggerOverride is set exclusively in tests to intercept the async
+	// provision EnsurePlatformAgent fires (triggerPlatformProvision), so the
+	// create/repair handler can be asserted without standing up a real
+	// provisioner + restart cycle. Always nil in production (the real
+	// goAsync(RestartByID) path runs when nil).
+	provisionTriggerOverride func(workspaceID string)
 	// enqueueA2A is the function handleA2ADispatchError calls to persist a busy
 	// A2A request to a2a_queue. Always EnqueueA2A in production; tests swap it
 	// to assert the passed context is detached from the inbound request (#2930).
@@ -527,7 +533,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// For a runtime the provider registry knows (first-party:
 	// claude-code/codex/hermes/openclaw) this checks the (runtime, model) pair
 	// against the registry's native model set. Fails OPEN for runtimes the
-	// registry doesn't know (langgraph/external/kimi/mock/federated) so
+	// registry doesn't know (external/kimi/mock/federated) so
 	// non-first-party / federated flows are UNCHANGED. Skipped for external
 	// workspaces (the URL is the contract, not the model — see MODEL_REQUIRED
 	// rationale above).
@@ -581,7 +587,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		// invariant — any future drift between `providers:` and `runtimes:`
 		// fails the create with a clear pointer to the missing provider
 		// rather than silently wedging the agent. Fails open for runtimes
-		// the registry doesn't know (langgraph/external/kimi/mock/federated
+		// the registry doesn't know (external/kimi/mock/federated
 		// — the federation contract the model-side check also honors).
 		if ok, why := validateDerivedProviderInRegistry(payload.Runtime, payload.Model); !ok {
 			log.Printf("Create: 422 DERIVED_PROVIDER_NOT_IN_REGISTRY (runtime=%q model=%q): %s [issue #2172 hard-reject]", payload.Runtime, payload.Model, why)
@@ -920,7 +926,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	//       immediately. Legacy flow, preserved for callers that
 	//       don't need the copy-this-snippet UX (org-import, etc.).
 	//   (b) URL omitted             — the operator will install
-	//       molecule-external-workspace-sdk or another A2A server later. We
+	//       molecule-ai-sdk or another A2A server later. We
 	//       mint a workspace_auth_token now and return it alongside
 	//       workspace_id + platform_url so the canvas UI can show
 	//       one copy-paste connection snippet. Status is set to

@@ -49,7 +49,7 @@ function makeNode(overrides: Partial<WorkspaceNodeData> = {}): Node<WorkspaceNod
       lastSampleError: "",
       url: "http://localhost:9000",
       parentId: null,
-      runtime: "langgraph",
+      runtime: "codex",
       currentTask: "",
       budgetLimit: null,
       ...overrides,
@@ -62,7 +62,7 @@ function makeNode(overrides: Partial<WorkspaceNodeData> = {}): Node<WorkspaceNod
 describe("toMobileAgent — basic fields", () => {
   beforeEach(() => {
     mockSummarize.mockReturnValue({
-      runtime: "langgraph",
+      runtime: "codex",
       skills: [],
       skillCount: 0,
       currentTask: "",
@@ -118,8 +118,8 @@ describe("toMobileAgent — basic fields", () => {
   });
 
   it("marks remote=false for non-external runtime", () => {
-    mockSummarize.mockReturnValue({ runtime: "langgraph", skills: [], skillCount: 0, currentTask: "", hasActiveTask: false });
-    const agent = toMobileAgent(makeNode({ runtime: "langgraph" }));
+    mockSummarize.mockReturnValue({ runtime: "codex", skills: [], skillCount: 0, currentTask: "", hasActiveTask: false });
+    const agent = toMobileAgent(makeNode({ runtime: "codex" }));
     expect(agent.remote).toBe(false);
   });
 
@@ -130,7 +130,7 @@ describe("toMobileAgent — basic fields", () => {
   });
 
   it("maps skills count from summarizeWorkspaceCapabilities", () => {
-    mockSummarize.mockReturnValue({ runtime: "langgraph", skills: ["skill1", "skill2"], skillCount: 2, currentTask: "", hasActiveTask: false });
+    mockSummarize.mockReturnValue({ runtime: "codex", skills: ["skill1", "skill2"], skillCount: 2, currentTask: "", hasActiveTask: false });
     const agent = toMobileAgent(makeNode());
     expect(agent.skills).toBe(2);
   });
@@ -148,13 +148,13 @@ describe("toMobileAgent — basic fields", () => {
   });
 
   it("maps role as desc fallback to currentTask", () => {
-    mockSummarize.mockReturnValue({ runtime: "langgraph", skills: [], skillCount: 0, currentTask: "Doing analysis", hasActiveTask: true });
+    mockSummarize.mockReturnValue({ runtime: "codex", skills: [], skillCount: 0, currentTask: "Doing analysis", hasActiveTask: true });
     const agent = toMobileAgent(makeNode({ role: "" }));
     expect(agent.desc).toBe("Doing analysis");
   });
 
   it("uses role as desc when currentTask is empty", () => {
-    mockSummarize.mockReturnValue({ runtime: "langgraph", skills: [], skillCount: 0, currentTask: "", hasActiveTask: false });
+    mockSummarize.mockReturnValue({ runtime: "codex", skills: [], skillCount: 0, currentTask: "", hasActiveTask: false });
     const agent = toMobileAgent(makeNode({ role: "researcher" }));
     expect(agent.desc).toBe("researcher");
   });

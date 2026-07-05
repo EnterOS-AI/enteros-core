@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 )
@@ -346,22 +347,19 @@ func TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered(t *t
 	if runtime != codexRuntime {
 		t.Fatalf("fresh install: runtime=%q, want %q — the INSERT VALUES must use the runtime PARAMETER, not a hardcoded 'claude-code'", runtime, codexRuntime)
 	}
-	if template != "codex-platform-agent" {
-		t.Fatalf("fresh install: template=%q, want %q — the template must map per-runtime (conciergeTemplateForRuntime)", template, "codex-platform-agent")
+	if template != "platform-agent" {
+		t.Fatalf("fresh install: template=%q, want %q — the concierge persona template is runtime-agnostic (conciergeTemplateForRuntime returns 'platform-agent' for every runtime, tenant-agent BUG 1)", template, "platform-agent")
 	}
 
 	// Case 2 (PROVE-FAIL): a re-install (ON CONFLICT path) must NOT revert the
-	// runtime back to claude-code, AND the (runtime, template) pair must stay
-	// MATCHED. We call the DEFAULT-runtime install path on purpose — even when
-	// the re-install requests no specific runtime (empty → default claude-code,
-	// which maps to template 'platform-agent'), the existing 'codex' row must be
-	// PRESERVED for BOTH columns. Against the pre-P3b `ON CONFLICT ... SET runtime
-	// = 'claude-code'` clause the runtime check fails; against head 9e4e5d08
-	// (`... SET ... template = $4`, i.e. the REQUESTED runtime's template) the
-	// runtime is preserved but the template is silently reverted to
-	// 'platform-agent' → a runtime/template MISMATCH (RC 13985). The fix derives
-	// the template on conflict from the PRESERVED (existing) runtime, so this
-	// case only passes once template stays 'codex-platform-agent'.
+	// runtime back to claude-code. The concierge persona template is now RUNTIME-
+	// AGNOSTIC (a single 'platform-agent' entry serves every runtime, tenant-agent
+	// BUG 1), so the (runtime, template) pair can never desync: runtime is PRESERVED
+	// on conflict, template is unconditionally 'platform-agent'. Against the pre-P3b
+	// `ON CONFLICT ... SET runtime = 'claude-code'` clause the runtime check fails.
+	// We call the DEFAULT-runtime install path on purpose to prove the existing
+	// 'codex' runtime survives a default reinstall while the template stays
+	// 'platform-agent'.
 	if err := installPlatformAgent(ctx, conn, platformID, paName, defaultConciergeRuntime); err != nil {
 		t.Fatalf("re-install (default runtime): %v", err)
 	}
@@ -377,10 +375,9 @@ func TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered(t *t
 			runtimeAfterReinstall, codexRuntime)
 	}
 	if wantTemplate := conciergeTemplateForRuntime(codexRuntime); templateAfterReinstall != wantTemplate {
-		t.Fatalf("RC 13985 regression: re-install via the default path desynced the template to %q, "+
-			"want %q (the template MATCHING the PRESERVED runtime %q). The ON CONFLICT clause must "+
-			"derive `template` from the existing `workspaces.runtime`, never stamp the REQUESTED "+
-			"runtime's template — a default reinstall must keep (runtime, template) a matched pair.",
+		t.Fatalf("re-install via the default path changed the concierge template to %q, want %q. "+
+			"The concierge persona template is runtime-agnostic (tenant-agent BUG 1): the ON CONFLICT "+
+			"clause must set `template = 'platform-agent'` unconditionally, and runtime %q must be PRESERVED.",
 			templateAfterReinstall, wantTemplate, codexRuntime)
 	}
 
@@ -403,4 +400,77 @@ func TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered(t *t
 		t.Fatalf("default install path: template=%q, want 'platform-agent' (the claude-code concierge keeps the historical template name)", freshTemplate)
 	}
 	_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, freshID)
+}
+
+// TestIntegration_PlatformAgentInstall_PreservesRemovedFlag is the real-Postgres
+// proof of CR2 RC 14676 fix 2: a re-install of a REMOVED (tombstoned) concierge
+// must PRESERVE status='removed' — the ON CONFLICT upsert must not silently
+// un-delete it. (The deliberate un-tombstone is the ensure handler's explicit
+// reviveRemovedPlatformAgent step, NOT a side-effect of install.) sqlmock can
+// prove install issues no status statement; only real Postgres can prove the
+// post-upsert ROW status, which is what this asserts.
+func TestIntegration_PlatformAgentInstall_PreservesRemovedFlag(t *testing.T) {
+	conn := integrationDB_PlatformAgentInstall(t)
+	ctx := context.Background()
+
+	tag := uuid.New().String()[:8]
+	platformID := uuid.New().String()
+	paName := "Org Concierge removed " + tag
+
+	cleanup := func() {
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name = $1`, paName)
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, platformID)
+	}
+	t.Cleanup(cleanup)
+	cleanup()
+
+	// Seed a platform-agent row, then tombstone it (exactly what CascadeDelete
+	// does: stamp status='removed', leaving kind='platform' + parent_id NULL).
+	if err := installPlatformAgent(ctx, conn, platformID, paName, defaultConciergeRuntime); err != nil {
+		t.Fatalf("seed install: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		`UPDATE workspaces SET status = 'removed' WHERE id = $1`, platformID); err != nil {
+		t.Fatalf("tombstone: %v", err)
+	}
+
+	// Re-install (the ON CONFLICT path) MUST NOT clear the removed flag.
+	if err := installPlatformAgent(ctx, conn, platformID, paName, defaultConciergeRuntime); err != nil {
+		t.Fatalf("re-install of removed row: %v", err)
+	}
+	var status string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT status FROM workspaces WHERE id = $1`, platformID).Scan(&status); err != nil {
+		t.Fatalf("read status after re-install: %v", err)
+	}
+	if status != "removed" {
+		t.Fatalf("re-install un-tombstoned the concierge: status=%q, want 'removed' PRESERVED. "+
+			"The ON CONFLICT upsert must NOT reset status; only the ensure handler's explicit "+
+			"reviveRemovedPlatformAgent step may clear it.", status)
+	}
+
+	// And the deliberate revive DOES clear it (offline) — the explicit un-tombstone.
+	if err := reviveRemovedPlatformAgent(ctx, conn, platformID); err != nil {
+		t.Fatalf("revive: %v", err)
+	}
+	if err := conn.QueryRowContext(ctx,
+		`SELECT status FROM workspaces WHERE id = $1`, platformID).Scan(&status); err != nil {
+		t.Fatalf("read status after revive: %v", err)
+	}
+	if status != string(models.StatusOffline) {
+		t.Fatalf("revive must clear the tombstone to 'offline', got status=%q", status)
+	}
+
+	// Revive is idempotent + scoped: a second revive on a non-removed row is a
+	// strict no-op (0 rows), leaving the status untouched.
+	if err := reviveRemovedPlatformAgent(ctx, conn, platformID); err != nil {
+		t.Fatalf("idempotent revive: %v", err)
+	}
+	if err := conn.QueryRowContext(ctx,
+		`SELECT status FROM workspaces WHERE id = $1`, platformID).Scan(&status); err != nil {
+		t.Fatalf("read status after second revive: %v", err)
+	}
+	if status != string(models.StatusOffline) {
+		t.Fatalf("second revive changed a non-removed row: status=%q, want 'offline' unchanged", status)
+	}
 }

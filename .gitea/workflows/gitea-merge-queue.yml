@@ -32,6 +32,35 @@ on:
     # a dispatch input. See .gitea/scripts/lint-workflow-yaml.py Rule 1 and
     # memory feedback_gitea_workflow_dispatch_inputs_unsupported.
 
+  # EVENT-DRIVEN automerge — completes the dispatch-only -> event-driven
+  # transition begun by the cron strip (pairs #3344). Fire the queue the MOMENT
+  # a PR could become newly mergeable, with NO cron and NO polling:
+  #   - pull_request_review [submitted]: a new approval just landed. Re-run the
+  #     queue so an approved+green PR merges immediately instead of waiting for
+  #     the conductor's in-process pass. On this event the run step below takes
+  #     the LIVE-merge branch (event_name != workflow_dispatch), while a manual
+  #     dispatch still defaults to the safe `--enumerate --dry-run` path.
+  #
+  # The full merge bar is UNCHANGED and still enforced by gitea-merge-queue.py
+  # (genuine non-author approval on the CURRENT head, BP-required CI green, no
+  # open REQUEST_CHANGES, reserved-path author!=merger). This changes only WHEN
+  # the queue runs, never WHETHER a PR merges.
+  #
+  # FORK SAFETY: on a pull_request_review event the job still checks out the
+  # default branch for the queue script (never PR-head), so no attacker code
+  # runs even though the merge-actor token is fetched — the same BASE-ref trust
+  # boundary qa-review.yml / security-review.yml rely on for this exact event.
+  #
+  # NOTE: `status:` / `check_suite:` are deliberately NOT added — Gitea (1.26.4)
+  # does not recognise them as Actions trigger events (verified against
+  # go-gitea modules/actions/github.go: no GithubEvent constant for "status",
+  # "check_suite", or "check_run"), so they would register but fire for ZERO
+  # events — the lint-workflow-yaml Rule 2 silent-no-op failure mode. The
+  # "CI just turned green" re-trigger stays on the conductor in-process pass /
+  # a CI->dispatch bridge; it cannot be a native Gitea event.
+  pull_request_review:
+    types: [submitted]
+
 permissions:
   contents: read
 
@@ -58,11 +87,12 @@ jobs:
         # "Process one queued PR" below. The old Gitea secret stays in place
         # until a green run proves this fetch (validate-before-delete).
         #
-        # FORK SAFETY: this workflow is workflow_dispatch-only (no
-        # pull_request trigger), so the merge-actor token is never fetchable on
-        # an untrusted fork trigger; the queue script is checked out at the
-        # default branch (not a PR head). The conditional below is
-        # belt-and-suspenders should a PR trigger ever be added.
+        # FORK SAFETY: this workflow now also runs on pull_request_review
+        # (event-driven automerge), but the queue script is still checked out
+        # at the default branch (never a PR head), so the merge-actor token is
+        # only ever consumed by trusted base-ref code — even on a fork review
+        # event. The conditional below is the belt-and-suspenders guard for any
+        # pull_request-family trigger.
         id: auto_sync_token
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
         env:
