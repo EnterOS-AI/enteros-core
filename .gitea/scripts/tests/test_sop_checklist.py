@@ -1708,5 +1708,69 @@ class TestMinimalYamlFallbackParsesRealConfig(unittest.TestCase):
         self.assertTrue(sop._yaml_list_item_is_map("required_teams: [qa]"))
 
 
+class TestApplyAckEnforcementPolicy(unittest.TestCase):
+    """OPERATOR RELAX contract (MERGE_REQUIRE_SOP_ACK org var, standing
+    directive until the agent team exists): the FULL ack evaluation always
+    runs; only the POSTed verdict is mapped by apply_ack_enforcement_policy.
+
+    - enforced (var == 'true'): verdict passes through untouched.
+    - advisory (anything else): failure/pending coerce to success with the
+      exact 'ack advisory until agent-team' description prefix; a real
+      success stays untouched (no prefix noise on a genuinely green gate).
+    """
+
+    def test_enforced_failure_passes_through(self):
+        state, desc = sop.apply_ack_enforcement_policy(
+            "failure", "acked: 0/7 — missing: tests", True
+        )
+        self.assertEqual(state, "failure")
+        self.assertEqual(desc, "acked: 0/7 — missing: tests")
+
+    def test_advisory_failure_coerces_to_success_with_prefix(self):
+        state, desc = sop.apply_ack_enforcement_policy(
+            "failure", "acked: 0/7 — missing: tests", False
+        )
+        self.assertEqual(state, "success")
+        self.assertTrue(desc.startswith("ack advisory until agent-team"))
+        # Real verdict preserved for observability.
+        self.assertIn("would be failure", desc)
+        self.assertIn("acked: 0/7", desc)
+
+    def test_advisory_pending_also_coerces(self):
+        # pending wedges Gitea's combined status just like failure; the
+        # advisory relax must clear it too (e.g. the volume-skipped path).
+        state, desc = sop.apply_ack_enforcement_policy(
+            "pending", "[volume-skipped] cap hit", False
+        )
+        self.assertEqual(state, "success")
+        self.assertTrue(desc.startswith("ack advisory until agent-team"))
+        self.assertIn("would be pending", desc)
+
+    def test_success_untouched_in_both_modes(self):
+        for enforced in (True, False):
+            state, desc = sop.apply_ack_enforcement_policy(
+                "success", "acked: 7/7", enforced
+            )
+            self.assertEqual(state, "success")
+            self.assertEqual(desc, "acked: 7/7")
+
+    def test_main_reads_env_var_semantics(self):
+        # The main() wiring treats ONLY the exact (case-insensitive, trimmed)
+        # string 'true' as enforcement. Replicate that expression here so a
+        # refactor that loosens it is caught.
+        for raw, expect_enforced in (
+            ("true", True), ("TRUE", True), (" true ", True),
+            ("false", False), ("", False), ("1", False), ("yes", False),
+        ):
+            with mock.patch.dict(os.environ, {"MERGE_REQUIRE_SOP_ACK": raw}):
+                enforced = (
+                    (os.environ.get("MERGE_REQUIRE_SOP_ACK") or "").strip().lower()
+                    == "true"
+                )
+                self.assertEqual(
+                    enforced, expect_enforced, f"raw={raw!r}"
+                )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

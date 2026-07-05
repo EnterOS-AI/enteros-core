@@ -241,17 +241,53 @@ jobs:
   rollback-pin:
     name: rollback-pin (revert pin if the fleet roll failed)
     needs: [advance-pin, redeploy-fleet]
-    if: failure() && needs.advance-pin.result == 'success'
+    # ALWAYS-RUN + explicit in-job branch (main-status coherence): the old
+    # `if: failure() && needs.advance-pin.result == 'success'` job guard made
+    # Gitea auto-publish a permanent `skipped` commit status for this job on
+    # every GREEN main push (Gitea posts a status for `if:`-false jobs too) —
+    # standing skip-noise on every main HEAD. `always()` runs the job on green
+    # and red paths alike; the single step below branches on the REAL upstream
+    # results:
+    #   - redeploy-fleet success               -> no-op success (no rollback needed)
+    #   - advance-pin not success (gate red)   -> no-op success (nothing to revert)
+    #   - redeploy-fleet failure after advance -> REVERT the pin (the real rollback)
+    # Revert semantics are IDENTICAL to the old guard (revert fires exactly
+    # when the fleet roll failed after a successful pin advance; a cancelled
+    # roll — which the old failure() guard also did NOT revert — stays no-op).
+    # Fail-closed: a FAILED revert still fails this job loudly.
+    if: always()
     runs-on: docker-host
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Revert the staging pin to its pre-roll value
-        if: needs.advance-pin.outputs.old_image != ''
+      - name: Revert the staging pin to its pre-roll value (no-op on green roll)
         env:
+          ADVANCE_RESULT: ${{ needs.advance-pin.result }}
+          REDEPLOY_RESULT: ${{ needs.redeploy-fleet.result }}
+          OLD_IMAGE: ${{ needs.advance-pin.outputs.old_image }}
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
         run: |
-          echo "::warning::fleet roll failed after pin advance — reverting staging pin to ${{ needs.advance-pin.outputs.old_image }}"
-          bash scripts/deploy/advance-staging-tenant-pin.sh --image "${{ needs.advance-pin.outputs.old_image }}"
+          set -euo pipefail
+          if [ "$REDEPLOY_RESULT" = "success" ]; then
+            echo "::notice::fleet roll green — no rollback needed."
+            exit 0
+          fi
+          if [ "$ADVANCE_RESULT" != "success" ]; then
+            echo "::notice::pin never advanced (advance-pin=$ADVANCE_RESULT, redeploy-fleet=$REDEPLOY_RESULT) — nothing to revert."
+            exit 0
+          fi
+          if [ "$REDEPLOY_RESULT" != "failure" ]; then
+            # cancelled / other non-failure terminal state: the old failure()
+            # guard did not revert here either — keep parity, log loudly.
+            echo "::warning::redeploy-fleet ended '$REDEPLOY_RESULT' (not failure) after pin advance — no automatic revert (parity with prior failure()-guard); operator judgement applies."
+            exit 0
+          fi
+          if [ -z "$OLD_IMAGE" ]; then
+            # Parity with the old step-level `if: old_image != ''` skip, but loud.
+            echo "::warning::advance-pin succeeded but exposed no old_image — cannot auto-revert; operator attention needed."
+            exit 0
+          fi
+          echo "::warning::fleet roll failed after pin advance — reverting staging pin to $OLD_IMAGE"
+          bash scripts/deploy/advance-staging-tenant-pin.sh --image "$OLD_IMAGE"
