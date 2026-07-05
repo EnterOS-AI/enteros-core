@@ -43,7 +43,12 @@
 # Env overrides (no-hardcoding):
 #   TENANT_IMAGE       registry.moleculesai.app/molecule-ai/molecule-tenant
 #   CANVAS_APP_IMAGE   registry.moleculesai.app/molecule-ai/canvas
-#   CANVAS_TAG         canvas tag for molecule-staging-app (default: matches --tag/staging-latest)
+#   CANVAS_TAG         canvas tag for the shared canvas app (default: matches --tag/staging-latest)
+#   STAGING_CANVAS_APP_CONTAINER  OPT-IN shared-canvas container to roll (default: EMPTY = skip).
+#                      Do NOT point this at the central staging-app container
+#                      (molecule-staging-app) — that serves the staging console
+#                      (molecule-app), not the per-tenant canvas. See the
+#                      shared-canvas block below.
 #
 # SAFETY: only recreates STATELESS cp-env=<env> platform containers; never
 # removes a named volume; each swap is health-gated + self-rolls-back; --dry-run
@@ -53,6 +58,10 @@ export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 TENANT_IMAGE="${TENANT_IMAGE:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
 CANVAS_APP_IMAGE="${CANVAS_APP_IMAGE:-registry.moleculesai.app/molecule-ai/canvas}"
+# Shared canvas app is OPT-IN (default empty → skipped), mirroring the prod
+# workflow's PROD_CANVAS_APP_CONTAINER. Left empty so the fleet roll never
+# clobbers the central staging-app container.
+STAGING_CANVAS_APP_CONTAINER="${STAGING_CANVAS_APP_CONTAINER:-}"
 CP_ENV="staging"
 IMAGE="" ; TAG="" ; DRY_RUN=0
 
@@ -200,46 +209,63 @@ for t in "${TENANTS[@]}"; do
   fi
 done
 
-# Shared staging canvas app (molecule-staging-app): recreate from the canvas
-# image. Separate container (not a tenant). Skipped cleanly when absent.
-if docker ps -a --format '{{.Names}}' | grep -qx 'molecule-staging-app'; then
-  log "== shared canvas app: molecule-staging-app -> ${CIMG} =="
+# Shared staging canvas app — OPT-IN (default OFF), mirroring the production
+# workflow's PROD_CANVAS_APP_CONTAINER (empty → skip).
+#
+# WHY OPT-IN NOW (regression fix): this step used to UNCONDITIONALLY re-install
+# the canvas image onto the hard-coded container `molecule-staging-app`. But
+# `molecule-staging-app` is the CENTRAL staging console — the CF tunnel routes
+# staging-app.moleculesai.app → :3101 to it, and staging-app is the staging
+# analogue of app.moleculesai.app, which serves the customer console
+# (molecule-app), NOT the per-tenant Org Concierge canvas. So every staging
+# fleet roll clobbered the console with the canvas, and staging-app.moleculesai.app
+# rendered the tenant "Organization" view — the recurring "staging-app
+# recognized as a tenant" regression that kept coming back after each redeploy.
+# The canvas is already baked INTO each mol-tenant-* image and served per-tenant
+# at <slug>.…; a standalone shared-canvas container is not part of the (prod)
+# architecture. Left unset by default so the central staging-app container is
+# never touched. To roll a shared canvas somewhere NON-central, set
+# STAGING_CANVAS_APP_CONTAINER to that container's name.
+if [ -n "${STAGING_CANVAS_APP_CONTAINER}" ] \
+   && docker ps -a --format '{{.Names}}' | grep -qx "${STAGING_CANVAS_APP_CONTAINER}"; then
+  cvc="${STAGING_CANVAS_APP_CONTAINER}"
+  log "== shared canvas app: ${cvc} -> ${CIMG} =="
   docker pull "$CIMG" >/dev/null 2>&1 || log "WARN: pull $CIMG failed; using local image if present"
   if docker image inspect "$CIMG" >/dev/null 2>&1; then
-    net="$(docker inspect molecule-staging-app --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')"
-    pbind="$(docker inspect molecule-staging-app --format '{{range $p,$b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}}{{end}}{{end}}')"
+    net="$(docker inspect "$cvc" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')"
+    pbind="$(docker inspect "$cvc" --format '{{range $p,$b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}}{{end}}{{end}}')"
     cenv="$(mktemp)"
-    docker inspect molecule-staging-app --format '{{range .Config.Env}}{{println .}}{{end}}' \
+    docker inspect "$cvc" --format '{{range .Config.Env}}{{println .}}{{end}}' \
       | grep -vE '^(PATH|NODE_VERSION|YARN_VERSION|NODE_ENV|HOSTNAME|PORT|NEXT_TELEMETRY_DISABLED)=' > "$cenv"
-    docker rename molecule-staging-app molecule-staging-app-redeploy-bak
-    docker stop molecule-staging-app-redeploy-bak >/dev/null
-    if docker run -d --name molecule-staging-app --network "${net:-molecule-net}" \
+    docker rename "$cvc" "${cvc}-redeploy-bak"
+    docker stop "${cvc}-redeploy-bak" >/dev/null
+    if docker run -d --name "$cvc" --network "${net:-molecule-net}" \
          --restart unless-stopped --env-file "$cenv" \
          -p "${pbind:-3101}:3000" "$CIMG" >/dev/null 2>/tmp/cvrun.err; then
       sleep 5
       if curl -fsS --max-time 8 "http://127.0.0.1:${pbind:-3101}/" >/dev/null 2>&1; then
-        docker rm molecule-staging-app-redeploy-bak >/dev/null 2>&1 || true
-        log "  ✓ molecule-staging-app rolled to ${CIMG}"
+        docker rm "${cvc}-redeploy-bak" >/dev/null 2>&1 || true
+        log "  ✓ ${cvc} rolled to ${CIMG}"
       else
-        echo "::error::molecule-staging-app unhealthy after roll — rolling back" >&2
-        docker rm -f molecule-staging-app 2>/dev/null || true
-        docker rename molecule-staging-app-redeploy-bak molecule-staging-app
-        docker start molecule-staging-app >/dev/null
+        echo "::error::${cvc} unhealthy after roll — rolling back" >&2
+        docker rm -f "$cvc" 2>/dev/null || true
+        docker rename "${cvc}-redeploy-bak" "$cvc"
+        docker start "$cvc" >/dev/null
         FAILED=1
       fi
     else
-      echo "::error::docker run failed for molecule-staging-app:" >&2; cat /tmp/cvrun.err >&2
-      docker rm -f molecule-staging-app 2>/dev/null || true
-      docker rename molecule-staging-app-redeploy-bak molecule-staging-app
-      docker start molecule-staging-app >/dev/null
+      echo "::error::docker run failed for ${cvc}:" >&2; cat /tmp/cvrun.err >&2
+      docker rm -f "$cvc" 2>/dev/null || true
+      docker rename "${cvc}-redeploy-bak" "$cvc"
+      docker start "$cvc" >/dev/null
       FAILED=1
     fi
     rm -f "$cenv"
   else
-    log "WARN: canvas image $CIMG unavailable — skipping molecule-staging-app roll"
+    log "WARN: canvas image $CIMG unavailable — skipping ${cvc} roll"
   fi
 else
-  log "molecule-staging-app container not present — skipping shared-app roll"
+  log "shared canvas app roll skipped (STAGING_CANVAS_APP_CONTAINER unset — default; the central staging-app container is left intact)"
 fi
 
 # Session-preservation assertion: every rtstate volume that existed before the
