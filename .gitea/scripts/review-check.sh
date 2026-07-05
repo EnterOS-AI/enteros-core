@@ -87,7 +87,18 @@ fi
 
 OWNER="${REPO%%/*}"
 NAME="${REPO##*/}"
-API="https://${GITEA_HOST}/api/v1"
+# Internal-host-preferred Gitea base derivation, shared with the qa-review /
+# security-review / secret-scan gates via the SSOT lib (unit-tested in
+# tests/test_ci_status.sh: derive_gitea_base). Prefer the runner-provided
+# GITHUB_SERVER_URL (e.g. http://molecule-gitea-local:3000 on the self-hosted
+# local runners) so the API calls hit Gitea directly on the internal docker
+# network — bypassing the public Cloudflare edge entirely (no DNS-hijack, no
+# CF-1010 User-Agent self-ban, no single-tunnel 524 crawl SPOF). Fall back to
+# the public host derived from GITEA_HOST (always set; see the require block
+# above) when the runner does not export an internal URL.
+# shellcheck source=lib/ci-status.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/ci-status.sh"
+API="$(derive_gitea_base)/api/v1"
 
 # Token-in-argv fix (#541): write the Authorization header to a mode-600
 # temp file instead of passing it via curl -H "$AUTH" (which puts the
@@ -96,7 +107,17 @@ API="https://${GITEA_HOST}/api/v1"
 # itself and never appears in the argv of the curl subprocess.
 CURL_AUTH_FILE=$(mktemp "${TMPDIR:-/tmp}/curl-auth.XXXXXX")
 chmod 600 "$CURL_AUTH_FILE"
-printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN" > "$CURL_AUTH_FILE"
+# CF-1010 defense: also pin a Cloudflare-accepted User-Agent for every curl
+# -K call in this script. When the request DOES traverse the public
+# git.moleculesai.app edge (e.g. a host-net runner), Cloudflare's WAF /
+# Bot-Fight otherwise 403-bans a default/blank UA before it ever reaches
+# Gitea (the CF-1010 self-ban that fails these gates closed). Harmless on the
+# internal-host path. Written into the same mode-600 config file so the UA is
+# applied uniformly and never appears in argv.
+{
+  printf 'header = "Authorization: token %s"\n' "$GITEA_TOKEN"
+  printf 'user-agent = "molecule-ci-gate/1.0 (+gitea-api)"\n'
+} > "$CURL_AUTH_FILE"
 
 # Pre-create temp files so cleanup trap can reference them by name
 # (bash trap 'function' EXIT expands variables at trap-fire time, not def time).

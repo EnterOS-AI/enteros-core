@@ -64,23 +64,31 @@ class TestQaReviewDirectTrigger:
         wf = load_workflow("qa-review.yml")
         post = _post_step(wf)
         env = post.get("env", {})
-        # KMS consolidation (#971/#3274): the write-scoped status POST token is
-        # now fetched from the Infisical SSOT (prod /shared/ci-status) and
-        # exported to $GITHUB_ENV as CI_STATUS_TOKEN by the "Fetch
-        # CI_STATUS_TOKEN from Infisical SSOT" step, replacing the old
-        # secrets.STATUS_POST_TOKEN Gitea Actions secret.
-        assert env.get("GITEA_TOKEN") == "${{ env.CI_STATUS_TOKEN }}", (
-            "POST step must use the Infisical-sourced CI_STATUS_TOKEN "
-            "(env.CI_STATUS_TOKEN) for the write-scoped status POST"
+        # PR #3422 (SSOT ci-status lib): the write-scoped token is resolved by
+        # the "Resolve CI_STATUS_TOKEN" step (direct Gitea org secret first,
+        # Infisical prod /shared/ci-status fallback), exported to $GITHUB_ENV
+        # as CI_STATUS_TOKEN, and consumed by emit_review_status under the
+        # CI_STATUS_TOKEN env name (was GITEA_TOKEN pre-lib). Same contract:
+        # the POST step MUST source the write-scoped token from $GITHUB_ENV,
+        # never a broad-scope secret directly.
+        assert env.get("CI_STATUS_TOKEN") == "${{ env.CI_STATUS_TOKEN }}", (
+            "POST step must consume the $GITHUB_ENV-resolved write-scoped "
+            "CI_STATUS_TOKEN (env.CI_STATUS_TOKEN) for the status POST"
         )
 
     def test_post_step_context_name_exact(self):
         """The context POSTed must byte-match the branch-protection requirement."""
         wf = load_workflow("qa-review.yml")
         post = _post_step(wf)
-        run = post.get("run", "")
-        assert '"qa-review / approved (pull_request_target)"' in run, (
-            "POST step must emit exact BP-required context name"
+        # PR #3422: the exact BP context now travels via env.STATUS_CONTEXT into
+        # the SSOT lib's emit_review_status (unit-tested in test_ci_status.sh);
+        # pin BOTH the byte-exact name and the lib call so neither can drift.
+        env = post.get("env", {})
+        assert env.get("STATUS_CONTEXT") == "qa-review / approved (pull_request_target)", (
+            "POST step must emit exact BP-required context name (env.STATUS_CONTEXT)"
+        )
+        assert "emit_review_status" in post.get("run", ""), (
+            "POST step must call the SSOT lib emit_review_status"
         )
 
 
@@ -111,23 +119,31 @@ class TestSecurityReviewDirectTrigger:
         wf = load_workflow("security-review.yml")
         post = _post_step(wf)
         env = post.get("env", {})
-        # KMS consolidation (#971/#3274): the write-scoped status POST token is
-        # now fetched from the Infisical SSOT (prod /shared/ci-status) and
-        # exported to $GITHUB_ENV as CI_STATUS_TOKEN by the "Fetch
-        # CI_STATUS_TOKEN from Infisical SSOT" step, replacing the old
-        # secrets.STATUS_POST_TOKEN Gitea Actions secret.
-        assert env.get("GITEA_TOKEN") == "${{ env.CI_STATUS_TOKEN }}", (
-            "POST step must use the Infisical-sourced CI_STATUS_TOKEN "
-            "(env.CI_STATUS_TOKEN) for the write-scoped status POST"
+        # PR #3422 (SSOT ci-status lib): the write-scoped token is resolved by
+        # the "Resolve CI_STATUS_TOKEN" step (direct Gitea org secret first,
+        # Infisical prod /shared/ci-status fallback), exported to $GITHUB_ENV
+        # as CI_STATUS_TOKEN, and consumed by emit_review_status under the
+        # CI_STATUS_TOKEN env name (was GITEA_TOKEN pre-lib). Same contract:
+        # the POST step MUST source the write-scoped token from $GITHUB_ENV,
+        # never a broad-scope secret directly.
+        assert env.get("CI_STATUS_TOKEN") == "${{ env.CI_STATUS_TOKEN }}", (
+            "POST step must consume the $GITHUB_ENV-resolved write-scoped "
+            "CI_STATUS_TOKEN (env.CI_STATUS_TOKEN) for the status POST"
         )
 
     def test_post_step_context_name_exact(self):
         """The context POSTed must byte-match the branch-protection requirement."""
         wf = load_workflow("security-review.yml")
         post = _post_step(wf)
-        run = post.get("run", "")
-        assert '"security-review / approved (pull_request_target)"' in run, (
-            "POST step must emit exact BP-required context name"
+        # PR #3422: the exact BP context now travels via env.STATUS_CONTEXT into
+        # the SSOT lib's emit_review_status (unit-tested in test_ci_status.sh);
+        # pin BOTH the byte-exact name and the lib call so neither can drift.
+        env = post.get("env", {})
+        assert env.get("STATUS_CONTEXT") == "security-review / approved (pull_request_target)", (
+            "POST step must emit exact BP-required context name (env.STATUS_CONTEXT)"
+        )
+        assert "emit_review_status" in post.get("run", ""), (
+            "POST step must call the SSOT lib emit_review_status"
         )
 
 

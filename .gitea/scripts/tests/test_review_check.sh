@@ -226,6 +226,7 @@ run_review_check() {
     PATH="$FIXTURE_DIR/bin:/tmp:$PATH" \
     GITEA_TOKEN="fixture-token" \
     GITEA_HOST="fixture.local" \
+    GITHUB_SERVER_URL="https://fixture.local" \
     REPO="molecule-ai/molecule-core" \
     PR_NUMBER="999" \
     DEFAULT_BRANCH="main" \
