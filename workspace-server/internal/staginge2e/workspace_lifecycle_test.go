@@ -3,6 +3,7 @@
 package staginge2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -179,11 +180,43 @@ func postLifecycle(t *testing.T, host, token, orgID, wsID, pathAndQuery string) 
 // workspaceStatusAndURL reads the canvas GET /workspaces/:id and returns
 // (status, url). url is "" when the workspace is not routable (paused/hibernated
 // clear it). httpStatus is surfaced so callers can distinguish 404/Gone.
+//
+// CRITICAL — read the TOP-LEVEL url, not the nested agent_card.url. The GET
+// response embeds the agent's self-reported endpoint at agent_card.url, and gin
+// marshals the response map with keys sorted alphabetically, so "agent_card"
+// serializes BEFORE the top-level "url". A naive flat jsonField(body,"url") would
+// therefore match agent_card.url FIRST — and the lifecycle handlers only clear the
+// TOP-LEVEL url on pause/hibernate (agent_card is display identity, retained across
+// pause). That made assertURLCleared read the never-cleared agent_card.url and fail
+// "url never cleared" even though the container WAS stopped and the top-level url
+// WAS cleared (verified live on staging: container GONE, DB workspaces.url=”). Parse
+// the top level with encoding/json so we read the load-bearing routability signal.
 func workspaceStatusAndURL(t *testing.T, host, token, orgID, wsID string) (httpStatus int, status, url string) {
 	t.Helper()
 	u := "https://" + host + "/workspaces/" + wsID
 	hs, body := doTenantJSON(t, "GET", u, token, orgID, "")
-	return hs, jsonField(body, "status"), jsonField(body, "url")
+	return hs, topLevelString(body, "status"), topLevelString(body, "url")
+}
+
+// topLevelString decodes the JSON object in body and returns the TOP-LEVEL string
+// value for key (or "" on any decode error / missing / non-string). Unlike the
+// flat jsonField scanner it never descends into nested objects, so a nested field
+// that happens to share the key name (e.g. agent_card.url) can't shadow the
+// top-level value.
+func topLevelString(body, key string) string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		return ""
+	}
+	raw, ok := m[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return s
 }
 
 // waitForWorkspaceStatus polls the canvas GET until .status == want.
