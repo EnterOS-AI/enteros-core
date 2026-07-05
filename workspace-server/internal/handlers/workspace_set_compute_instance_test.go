@@ -57,7 +57,8 @@ func TestSetComputeInstance_MissingInstanceIs400(t *testing.T) {
 	}
 }
 
-// An unknown provider is rejected (400) — only aws|hetzner|gcp are routable.
+// An unknown provider is rejected (400) — only the cloudprovider SSOT ids
+// (aws|hetzner|gcp|molecules-server) + their aliases are routable.
 func TestSetComputeInstance_BadProviderIs400(t *testing.T) {
 	h, _ := setupBootstrapHandler(t)
 
@@ -72,6 +73,84 @@ func TestSetComputeInstance_BadProviderIs400(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// An empty provider is still rejected (400) — the CP always supplies the org's
+// backend, so a missing one is a malformed request, not "use the default".
+func TestSetComputeInstance_EmptyProviderIs400(t *testing.T) {
+	h, _ := setupBootstrapHandler(t)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
+	c.Request = httptest.NewRequest("POST", "/admin/workspaces/ws-1/set-compute-instance",
+		bytes.NewBufferString(`{"instance_id":"i-1"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.SetComputeInstance(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// #190 regression: the Molecules-Server (local-docker) backend must NOT be
+// rejected. The CP admin re-provision path repoints a local tenant by POSTing
+// provider="local" (the org's DB backend key); the old cloud-only allowlist
+// 400'd it, which surfaced as a cosmetic 500 from the CP even though the box
+// came up fine. The alias "local" normalizes to molecules-server and PERSISTS
+// as the backend key "local" (what the CP teardown routing keys on) — with a
+// local-docker CONTAINER NAME as the instance id, not an EC2 i-* id.
+func TestSetComputeInstance_MoleculesServerLocalRepoint(t *testing.T) {
+	h, mock := setupBootstrapHandler(t)
+
+	// The alias "local" must persist as the SDK backend key "local".
+	mock.ExpectExec(`UPDATE workspaces\s+SET instance_id = \$2`).
+		WithArgs("ws-local", "mol-ws-test5-a9f3044fa3f2", "local").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-local"}}
+	c.Request = httptest.NewRequest("POST", "/admin/workspaces/ws-local/set-compute-instance",
+		bytes.NewBufferString(`{"instance_id":"mol-ws-test5-a9f3044fa3f2","provider":"local"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.SetComputeInstance(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200 for molecules-server (local) repoint, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// The canonical wire id "molecules-server" is accepted too and persists as the
+// same backend key "local" — proving validation/persistence both derive from
+// the SDK SSOT, not a spelling-sensitive local hardcode.
+func TestSetComputeInstance_MoleculesServerCanonicalRepoint(t *testing.T) {
+	h, mock := setupBootstrapHandler(t)
+
+	mock.ExpectExec(`UPDATE workspaces\s+SET instance_id = \$2`).
+		WithArgs("ws-local", "mol-ws-test5-a9f3044fa3f2", "local").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-local"}}
+	c.Request = httptest.NewRequest("POST", "/admin/workspaces/ws-local/set-compute-instance",
+		bytes.NewBufferString(`{"instance_id":"mol-ws-test5-a9f3044fa3f2","provider":"molecules-server"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.SetComputeInstance(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200 for canonical molecules-server repoint, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
 	}
 }
 
