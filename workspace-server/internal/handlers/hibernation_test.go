@@ -136,6 +136,63 @@ func TestHibernateWorkspace_RoutesStopToCPWhenOnlyCPWired(t *testing.T) {
 	}
 }
 
+// TestWakeWorkspace_ClaimsHibernated verifies the auto-wake re-provision path
+// ACTS on a hibernated workspace — the exact case RestartByID/runRestartCycle
+// SELECT-EXCLUDE (`status NOT IN (...,'hibernated')`) and no-op on, which left a
+// genuinely-stopped hibernated ws unable to wake (verified live). WakeWorkspace
+// must issue the atomic hibernated→provisioning claim, then proceed to load the
+// stored provision inputs. We return an error on the load SELECT to stop before
+// the async re-provision, keeping the assertion deterministic — the claim firing
+// against `status = 'hibernated'` is the load-bearing proof.
+func TestWakeWorkspace_ClaimsHibernated(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	handler.SetCPProvisioner(&trackingCPProv{}) // a backend must be wired or WakeWorkspace returns before any DB touch
+
+	wsID := "ws-wake-hib"
+	// Atomic claim: hibernated → provisioning (rowsAffected=1 = we won the claim).
+	mock.ExpectExec(`AND status = 'hibernated'`).
+		WithArgs(models.StatusProvisioning, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Load stored provision inputs — return an error to halt before the async
+	// provisionWorkspaceAuto dispatch (deterministic; the claim already proved it
+	// acts on hibernated instead of early-returning like RestartByID).
+	mock.ExpectQuery(`SELECT name, tier, COALESCE\(runtime`).
+		WithArgs(wsID).
+		WillReturnError(fmt.Errorf("halt-after-claim"))
+
+	handler.WakeWorkspace(wsID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations (WakeWorkspace must claim the hibernated row): %v", err)
+	}
+}
+
+// TestWakeWorkspace_NoOpWhenNotHibernated verifies the atomic claim dedupe: when
+// the row is no longer hibernated (a concurrent wake already claimed it, or it
+// was resumed/removed), rowsAffected=0 and WakeWorkspace returns immediately with
+// no load SELECT, no broadcast, no provision dispatch.
+func TestWakeWorkspace_NoOpWhenNotHibernated(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	handler.SetCPProvisioner(&trackingCPProv{})
+
+	wsID := "ws-wake-nothib"
+	// Claim matches nothing (not hibernated) → rowsAffected=0.
+	mock.ExpectExec(`AND status = 'hibernated'`).
+		WithArgs(models.StatusProvisioning, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	// No further DB expectations — WakeWorkspace must return after a zero-row claim.
+
+	handler.WakeWorkspace(wsID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations (WakeWorkspace must no-op on a non-hibernated row): %v", err)
+	}
+}
+
 // TestHibernateWorkspace_NotEligible_NoOp verifies that when the atomic claim
 // UPDATE returns rowsAffected=0 (workspace not in online/degraded state, or
 // active_tasks > 0), HibernateWorkspace returns immediately — no Stop, no

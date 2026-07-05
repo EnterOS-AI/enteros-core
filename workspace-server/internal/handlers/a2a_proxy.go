@@ -1164,9 +1164,16 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 			// Auto-wake hibernated workspace on incoming A2A message (#711).
 			// Re-provision asynchronously and return 503 with a retry hint so
 			// the caller can retry once the workspace is back online (~10s).
+			//
+			// MUST use WakeWorkspace, NOT RestartByID: a hibernated ws's container
+			// is genuinely stopped, and RestartByID → runRestartCycle SELECTs
+			// `status NOT IN (...,'hibernated')` and returns early, so it never
+			// re-provisions — the box would stay hibernated forever (verified live:
+			// "waking" logged + 503 returned, but the workspace never came back).
+			// WakeWorkspace does the hibernated→provisioning claim + re-provision.
 			if status == "hibernated" {
 				log.Printf("ProxyA2A: waking hibernated workspace %s", workspaceID)
-				h.goAsync(func() { h.RestartByID(workspaceID) })
+				h.goAsync(func() { h.WakeWorkspace(workspaceID) })
 				return "", &proxyA2AError{
 					Status:  http.StatusServiceUnavailable,
 					Headers: map[string]string{"Retry-After": "15"},
