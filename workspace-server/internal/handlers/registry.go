@@ -236,6 +236,16 @@ func (h *RegistryHandler) fireReconcileOnline(ctx context.Context, workspaceID s
 // sustained-missing concierge retries gently (the gate fails on every heartbeat
 // until the MCP lands) rather than re-firing a clone+deliver every beat.
 // nil-safe via the reconcilePlugins check + the empty-id guard.
+func mcpServerPresentPayloadForLog(p *bool) string {
+	if p == nil {
+		return "nil"
+	}
+	if *p {
+		return "true"
+	}
+	return "false"
+}
+
 func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspaceID string) {
 	if h.reconcilePlugins == nil || workspaceID == "" {
 		return
@@ -442,12 +452,24 @@ func (h *RegistryHandler) resolveDeliveryMode(ctx context.Context, workspaceID, 
 // mark a non-root workspace as a platform agent.
 const errPlatformNotRoot = "a platform agent must be the org root (parent_id must be null) and there can be only one per org"
 
-// managementMCPUnloadedGrace is the startup/warmup grace window for the
-// core#3082 management-MCP gate. The gate degrades a platform concierge whose
-// declared management MCP is not present in the heartbeat's loaded_mcp_tools
-// (or whose runtime omits the list entirely) ONLY once the absence has
-// persisted continuously for at least this long — tracked via the
-// workspaces.mcp_unloaded_since timestamp.
+// managementMCPUnloadedGrace is the POST-ONLINE degrade flap-suppression window
+// for the core#3082 management-MCP gate. An ALREADY-ONLINE platform concierge
+// whose declared management MCP goes missing from the heartbeat's
+// loaded_mcp_tools (or whose runtime omits the list entirely) is degraded ONLY
+// once the absence has persisted continuously for at least this long — tracked
+// via the workspaces.mcp_unloaded_since timestamp.
+//
+// SCOPE (core#3082 warm-up determinism): this is NO LONGER a warm-up / readiness
+// terminal. The pre-online WARMING path used to force-FAIL a concierge here at
+// this same wall-clock — an arbitrary cutoff that killed HEALTHY concierges whose
+// management MCP was merely slow to connect. That fail was DELETED: warm-up
+// readiness is now driven by the real signal (dynamic hold until loaded_mcp_tools
+// proves the tool) with health + liveness terminals, and the slow path is
+// eliminated at the source (the runtime image pre-bakes @molecule-ai/mcp-server
+// so the concierge resolves it with zero network pull). This window survives ONLY
+// as the steady-state flap suppressor below: it prevents a single transient
+// absent/partial sample from false-degrading a working ONLINE concierge, while a
+// genuinely-sustained loss still degrades (the RCA#2970 fail-closed intent).
 //
 // Why a grace window: the management MCP connects asynchronously after the
 // agent process starts, and the runtime can only observe its loaded tool list
@@ -1069,11 +1091,29 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// On INSERT (workspace not yet created via POST /workspaces), use ID as name placeholder.
 	// Keep existing URL if provisioner already set a host-accessible one (starts with http://127.0.0.1).
 	//
-	// #73 guard: `WHERE workspaces.status IS DISTINCT FROM 'removed'` prevents
-	// a late heartbeat from a workspace that was just deleted from resurrecting
-	// the row. Without this guard, bulk deletes left tier-3 stragglers because
+	// #73 guard: `WHERE workspaces.status NOT IN ('removed', 'paused',
+	// 'hibernated')` prevents a late register/heartbeat from a workspace that
+	// is deliberately dormant (or was just deleted) from resurrecting the row.
+	// Without the 'removed' arm, bulk deletes left tier-3 stragglers because
 	// the last pre-teardown heartbeat flipped status back to 'online' after
 	// Delete's UPDATE.
+	//
+	// The 'paused'/'hibernated' arms close the workspace-lifecycle e2e-smoke
+	// pause_resume / hibernate_wake race (core#2332): Pause/Hibernate genuinely
+	// STOP the container, but the stop is not instantaneous — the doomed
+	// container (or the freshly re-provisioned one from a just-preceding
+	// Restart) can fire one more /registry/register a few seconds later. Because
+	// the non-platform CASE arm below FORCES status→'online', that lingering
+	// register clobbered the row back to 'online' (with url repopulated) AFTER
+	// Pause/Hibernate parked it. The e2e then saw resume→404 'not found or not
+	// paused' (row was 'online', not 'paused') and hibernate→404 'not in a
+	// hibernatable state'. A deliberately-parked workspace must be inviolable to
+	// container-driven re-register: only the explicit Resume/WakeWorkspace
+	// handlers may transition it out of dormancy. Mirrors the liveness monitor's
+	// existing `NOT IN ('removed','paused','hibernated')` guard
+	// (registry/liveness.go) and the heartbeat's status-preserving CASE.
+	// Resume/Wake set status='provisioning' first, so their post-relaunch
+	// register still promotes provisioning→online normally.
 	// kind ($6) is the raw payload value (validated above; "" = unspecified).
 	// COALESCE(NULLIF($6,''), …) means: an explicit kind wins; an unspecified
 	// kind defaults to 'workspace' for a NEW row and KEEPS the existing kind on
@@ -1131,7 +1171,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			delivery_mode = EXCLUDED.delivery_mode,
 			kind = COALESCE(NULLIF($6, ''), workspaces.kind),
 			updated_at = now()
-		WHERE workspaces.status IS DISTINCT FROM 'removed'
+		WHERE workspaces.status NOT IN ('removed', 'paused', 'hibernated')
 	`, payload.ID, payload.ID, urlForUpsert, agentCardStr, modeForUpsert, payload.Kind)
 	if err != nil {
 		if isPlatformRootViolation(err) {
@@ -1653,7 +1693,10 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				// the existing recovery branch. Guarded against per-heartbeat storms.
 				h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
 			}
-			log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
+			// Observability: emit the deciding inputs + the resulting failed
+			// transition so a future false-fail is diagnosable from logs without
+			// a local repro (SEV1 follow-up to core#3082 / runtime#181).
+			log.Printf("Heartbeat: workspace=%s transition=%s\u2192%s reason=%s has_model=%v mcp_server_present=%v mcp_server_present_payload=%v", payload.WorkspaceID, currentStatus, models.StatusFailed, reason, hasModel, hasMCP, mcpServerPresentPayloadForLog(payload.MCPServerPresent))
 			h.markWorkspaceFailed(ctx, payload.WorkspaceID, msg, reason)
 			return
 		}
@@ -1773,24 +1816,33 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"verified_ready": true, "recovered_from": currentStatus})
 				h.fireReconcileOnline(ctx, payload.WorkspaceID)
 			case currentStatus == string(models.StatusProvisioning):
-				// WARMING / held: hold 'provisioning' but BOUND the wait. Reached when
-				// the tool is not yet proven loaded OR the row is healthy-blocked
-				// (conciergeUnhealthy short-circuited the verified promote above). The
-				// provision-timeout sweeper keys on updated_at, which every heartbeat
-				// refreshes, so it can NEVER catch a heartbeating warming row — this
-				// bounded window is the only terminal for a concierge that heartbeats
-				// forever without ever becoming verified-AND-healthy. Reuse
-				// mcp_unloaded_since + managementMCPUnloadedGrace (180s, already sized
-				// for the cold warmup-turn + capture cycle) so the pre-online fail is
-				// symmetric with the post-online degrade.
+				// WARMING / held. The concierge is held in 'provisioning' (its callers
+				// get the 503 warming-gate) — a DYNAMIC wait on the REAL signals, never a
+				// wall-clock. It leaves 'provisioning' only on a real signal:
 				//
-				// runtime#181 CAVEAT: this bound is what stops a null/empty
-				// loaded_mcp_tools from hanging the row forever — but because the
-				// producer currently under-reports (emits nothing even when the tool
-				// IS loaded; see the verified-gate comment above), a MODERN runtime can
-				// be force-FAILED here at 180s despite a deliverable tool. The legacy
-				// (mcp_server_present==nil) fast-path can't hit this branch; for modern
-				// runtimes the reliable fix is runtime#181, NOT loosening this bound.
+				//   * READY  → the verified-ready case above flips it online the instant a
+				//     heartbeat reports provision_workspace loaded AND the row is healthy.
+				//   * UNHEALTHY → held here (NOT promoted): the earlier switch cases fell
+				//     through because conciergeUnhealthy (runtime wedged / sustained
+				//     error_rate / recent register failure) blocked the verified promote
+				//     (CR2 #14642 gate-before-write). We keep HOLDING rather than failing,
+				//     so a TRANSIENT unhealth (error spike, a single register miss) can
+				//     clear on a later heartbeat and then promote — we do not kill a
+				//     recoverable concierge.
+				//   * DEAD   → a concierge that STOPS heartbeating during warm-up is
+				//     terminated by the provision-timeout sweep (registry/
+				//     provisiontimeout.go) once updated_at goes stale — the real
+				//     "no longer alive" signal, and the ONLY terminal here.
+				//
+				// This DELETES the 180s managementMCPUnloadedGrace warm-up FAIL — an
+				// arbitrary cutoff that force-failed HEALTHY concierges whose management
+				// MCP was merely slow to connect (the flaky e2e-smoke STEP-4 failure). The
+				// slow path it was compensating for is eliminated at the source: the
+				// runtime image now PRE-BAKES @molecule-ai/mcp-server into the npm cache,
+				// so the concierge's `npx --prefer-offline` resolves the management MCP
+				// with ZERO network pull (loads in ~1s), and the runtime enumeration
+				// retries robustly on the real signal with dynamic backoff. mcp_unloaded_since
+				// is still stamped below, for observability only (no longer a fail trigger).
 				now := time.Now()
 				firstUnloaded := mcpUnloadedSince
 				if !firstUnloaded.Valid {
@@ -1799,13 +1851,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 						log.Printf("Heartbeat: failed to stamp warming mcp_unloaded_since for %s: %v", payload.WorkspaceID, err)
 					}
 				}
-				if now.Sub(firstUnloaded.Time) >= managementMCPUnloadedGrace {
-					msg := "platform agent never became verified-ready during warmup (provision_workspace not proven loaded, or held unhealthy); marking failed (core#3082 verified-ready gate)"
-					log.Printf("Heartbeat: %s (workspace=%s warmed %s, provision_workspace_loaded=%v unhealthy=%v)", msg, payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second), provisionToolLoaded, conciergeUnhealthy)
-					h.markWorkspaceFailed(ctx, payload.WorkspaceID, msg, "management_mcp_never_loaded")
-				} else {
-					log.Printf("Heartbeat: platform %s warming, holding provisioning (%s/%s, provision_workspace_loaded=%v unhealthy=%v)", payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second), managementMCPUnloadedGrace, provisionToolLoaded, conciergeUnhealthy)
-				}
+				log.Printf("Heartbeat: platform %s warming, holding provisioning (waiting on loaded_mcp_tools signal; unloaded for %s, provision_workspace_loaded=%v unhealthy=%v) (core#3082)", payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second), provisionToolLoaded, conciergeUnhealthy)
 			default:
 				// Modern runtime in failed/offline/awaiting_agent/degraded that is NOT
 				// promotable this beat — either the tool is not proven loaded OR the
@@ -1873,6 +1919,13 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				msg := fmt.Sprintf("platform agent declared management MCP lookup failed: %v; marking degraded (core#3082)", mErr)
 				log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
 				managementMCPUnloaded = true
+				// Observability: emit the deciding inputs at this demote site (core#3082 / runtime#181 follow-up).
+				// NOTE: in the mErr != nil branch, managementMissing is the zero-value
+				// (false) — the lookup errored before platformAgentManagementMCPLoaded
+				// could assign it. Emit managementMCPUnloaded (set true above) so the
+				// field reflects the actual unloaded-state used by the recovery gate
+				// below. (CR2 #14695 / Researcher #14696 on #3334.)
+				log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=management_mcp_lookup_error mcp_server_present_payload=%v loaded_mcp_tools_count=%d management_mcp_unloaded=%v", payload.WorkspaceID, currentStatus, mcpServerPresentPayloadForLog(payload.MCPServerPresent), len(payload.LoadedMCPTools), managementMCPUnloaded)
 				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
 					log.Printf("Heartbeat: failed to mark %s degraded (management MCP lookup error): %v", payload.WorkspaceID, err)
 				}
@@ -1907,6 +1960,12 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 						msg = "platform agent runtime did not report loaded_mcp_tools on a mcp_server_present=true heartbeat; cannot verify provision_workspace tool is loaded — marking degraded (core#3082)"
 					}
 					log.Printf("Heartbeat: %s (workspace=%s, unloaded for %s)", msg, payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second))
+					// Observability: emit the deciding inputs at this demote site (core#3082 / runtime#181 follow-up).
+					// Emit managementMCPUnloaded (true here, set at line 1701) — the
+				// tool-missing boolean (managementMissing) is already conveyed by
+				// the loaded_mcp_tools_count + absent_tools_list pair right above.
+					// (Consistency with lookup-error branch per CR2 #14695 / Researcher #14696 on #3334.)
+					log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=management_mcp_missing loaded_mcp_tools_count=%d absent_tools_list=%v mcp_unloaded_for=%s grace=%s management_mcp_unloaded=%v", payload.WorkspaceID, currentStatus, len(payload.LoadedMCPTools), absentToolsList, now.Sub(firstUnloaded.Time).Truncate(time.Second), managementMCPUnloadedGrace, managementMCPUnloaded)
 					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
 						log.Printf("Heartbeat: failed to mark %s degraded (management MCP missing): %v", payload.WorkspaceID, err)
 					}
@@ -1954,6 +2013,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if err != nil {
 			log.Printf("Heartbeat: failed to mark %s degraded (wedged): %v", payload.WorkspaceID, err)
 		}
+		// Observability: emit the deciding inputs at this demote site (SEV1 follow-up).
+		log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=runtime_wedged runtime_state=%q error_rate=%v sample_error=%q", payload.WorkspaceID, currentStatus, payload.RuntimeState, payload.ErrorRate, payload.SampleError)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
 			"runtime_state": "wedged",
 			"sample_error":  payload.SampleError,
@@ -1976,6 +2037,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'online'`, models.StatusDegraded, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to mark %s degraded: %v", payload.WorkspaceID, err)
 		}
+		// Observability: emit the deciding inputs at this demote site (SEV1 follow-up).
+		log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=high_error_rate error_rate=%v sample_error=%q", payload.WorkspaceID, currentStatus, payload.ErrorRate, payload.SampleError)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
 			"error_rate":   payload.ErrorRate,
 			"sample_error": payload.SampleError,
@@ -1991,6 +2054,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'online'`, models.StatusDegraded, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to mark %s degraded (register failure): %v", payload.WorkspaceID, err)
 		}
+		// Observability: emit the deciding inputs at this demote site (SEV1 follow-up).
+		log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=register_failure_recent register_failure_recent=%v error_rate=%v", payload.WorkspaceID, currentStatus, hasRecentRegisterFailure, payload.ErrorRate)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
 			"register_failure": true,
 			"sample_error":     "Register failed — workspace auth token may be stale. Restart or reprovision to recover.",
@@ -2021,6 +2086,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'degraded'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s to online: %v", payload.WorkspaceID, err)
 		}
+		// Observability: emit the deciding inputs at this promote site (SEV1 follow-up).
+		log.Printf("Heartbeat: workspace=%s transition=%s\u2192online reason=degraded_recovered error_rate=%v runtime_state=%q register_failure_recent=%v management_mcp_unloaded=%v native_status_mgmt=%v", payload.WorkspaceID, currentStatus, payload.ErrorRate, payload.RuntimeState, hasRecentRegisterFailure, managementMCPUnloaded, nativeStatus)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{})
 		// RFC#2843: reconcile declared plugins on transition-to-online.
 		h.fireReconcileOnline(ctx, payload.WorkspaceID)
@@ -2033,6 +2100,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'offline'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s from offline: %v", payload.WorkspaceID, err)
 		}
+		// Observability: emit the deciding inputs at this promote site (SEV1 follow-up).
+		log.Printf("Heartbeat: workspace=%s transition=%s\u2192online reason=offline_recovered", payload.WorkspaceID, currentStatus)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{})
 		// RFC#2843: reconcile declared plugins on transition-to-online.
 		h.fireReconcileOnline(ctx, payload.WorkspaceID)

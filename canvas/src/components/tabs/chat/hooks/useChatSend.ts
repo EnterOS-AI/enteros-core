@@ -136,6 +136,19 @@ export interface UseChatSendOptions {
   onAgentMessage?: (msg: ChatMessage) => void;
 }
 
+/** Deterministic, window-free id for the agent's push-mode reply to a specific
+ *  user turn (task #187). A single `message/send` yields at most one synchronous
+ *  HTTP reply, so the user turn's client messageId uniquely identifies that
+ *  reply — deriving the bubble id from it gives the agent reply a STABLE
+ *  identity instead of a throwaway `createMessage` UUID. Distinct turns keep
+ *  distinct ids, so genuine repeat replies are never cross-collapsed. The id
+ *  must NOT end in ":user"/":agent" so useChatHistory still classifies it as an
+ *  optimistic (not-yet-persisted) bubble and collapses it into its reconciled DB
+ *  twin by content identity rather than treating it as authoritative. */
+export function stableAgentReplyId(userMessageId: string): string {
+  return `optimistic-agent-reply:${userMessageId}`;
+}
+
 export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -338,8 +351,8 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
                 messageId,
                 // STABLE per-conversation contextId (tenant-agent BUG 3). Without
                 // it the runtime a2a-sdk mints a fresh context_id per request and
-                // any session keyed on it (openclaw's SessionManager, the native
-                // LangGraph thread_id) resets every turn → the agent re-greets.
+                // any session keyed on it (openclaw's SessionManager, the base
+                // RuntimeA2AExecutor's native thread_id) resets every turn → the agent re-greets.
                 // Persisted per workspace; rotated on "New session".
                 //
                 // NOTE: we deliberately do NOT ship a `metadata: { history }`
@@ -404,8 +417,13 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
             (resp?.result ?? {}) as Record<string, unknown>,
           );
           if (replyText || replyFiles.length > 0) {
+            // Stamp a stable, deterministic id derived from THIS turn's
+            // messageId (task #187) so the reply bubble carries a real identity
+            // instead of a random UUID. The reconcile then collapses it into its
+            // persisted DB twin window-free (by content identity), correct even
+            // when the turn outran any fixed clock-skew window.
             optionsRef.current.onAgentMessage?.(
-              createMessage("agent", replyText, replyFiles),
+              createMessage("agent", replyText, replyFiles, undefined, stableAgentReplyId(messageId)),
             );
           }
           finishSendToken(myToken);

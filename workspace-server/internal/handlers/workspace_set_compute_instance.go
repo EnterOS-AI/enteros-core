@@ -7,16 +7,21 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/gin-gonic/gin"
+	sdkcp "go.moleculesai.app/sdk/cloudprovider"
 )
 
 // SetComputeInstanceRequest is the body the control plane POSTs after a
-// cross-cloud migration cutover to repoint the tenant's workspace record at the
-// box on the NEW cloud.
+// re-provision or cross-cloud migration cutover to repoint the tenant's
+// workspace record at the box on the NEW backend.
 type SetComputeInstanceRequest struct {
 	// InstanceID is the workspace's box id on the new provider (an EC2
-	// instance-id for AWS, a Hetzner/GCP server id otherwise).
+	// instance-id for AWS, a Hetzner/GCP server id for those clouds, or the
+	// local-docker CONTAINER NAME for the Molecules-Server backend).
 	InstanceID string `json:"instance_id"`
-	// Provider is the new cloud provider (aws|hetzner|gcp).
+	// Provider is the new backend: any selectable cloudprovider id
+	// (aws|hetzner|gcp|molecules-server) or its aliases (local|docker →
+	// molecules-server). Validated against the shared SDK SSOT, never a
+	// hand-maintained cloud-only allowlist.
 	Provider string `json:"provider"`
 }
 
@@ -58,17 +63,34 @@ func (h *WorkspaceHandler) SetComputeInstance(c *gin.Context) {
 		return
 	}
 	instanceID := strings.TrimSpace(req.InstanceID)
-	provider := strings.ToLower(strings.TrimSpace(req.Provider))
+	reqProvider := strings.ToLower(strings.TrimSpace(req.Provider))
 	if instanceID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "instance_id required"})
 		return
 	}
-	switch provider {
-	case "aws", "hetzner", "gcp":
-	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "provider must be aws|hetzner|gcp"})
+	// The provider is still REQUIRED (the CP always supplies the org's backend),
+	// but it is validated against the shared cloudprovider SSOT — NOT a hardcoded
+	// cloud-only {aws,hetzner,gcp} allowlist. That old allowlist rejected the
+	// Molecules-Server backend (org.provider="local", the CP re-provision path
+	// POSTs provider="local") with a 400, so RepointTenantComputeInstance failed
+	// and the CP admin re-provision returned a cosmetic 500 even though the box
+	// came up fine (#190). Route validation through the SDK so molecules-server /
+	// its aliases (local, docker) are handled correctly and the cloud abstraction
+	// (aws/gcp/hetzner) is preserved unchanged.
+	if reqProvider == "" || !sdkcp.IsValidID(reqProvider) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "provider must be one of " + strings.Join(sdkcp.IDs(), "|") + " (aliases: local, docker → molecules-server)",
+		})
 		return
 	}
+	// Persist the SDK BACKEND KEY (clouds map to themselves; molecules-server and
+	// its aliases map to "local"), which is exactly what the persisted
+	// compute->>'provider' value drives downstream: the tenant CPProvisioner
+	// resolveProvider→Stop/status path forwards it as ?provider= to the CP
+	// Deprovision handler, whose effectiveTeardownProvider routes on backend keys.
+	// So a Molecules-Server workspace lands provider="local" and tears down via
+	// the local backend instead of the absent AWS path.
+	provider, _ := sdkcp.BackendKey(reqProvider)
 
 	// Repoint instance_id + compute.provider only. jsonb_set preserves every
 	// other compute key (sizing, display, data_persistence, …) and creates the
@@ -91,6 +113,6 @@ func (h *WorkspaceHandler) SetComputeInstance(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return
 	}
-	log.Printf("SetComputeInstance: workspace %s repointed → instance=%s provider=%s (cross-cloud migration cutover)", id, instanceID, provider)
+	log.Printf("SetComputeInstance: workspace %s repointed → instance=%s provider=%s (re-provision / cross-cloud cutover)", id, instanceID, provider)
 	c.JSON(http.StatusOK, gin.H{"status": "repointed", "workspace_id": id, "instance_id": instanceID, "provider": provider})
 }

@@ -5,7 +5,7 @@
 // `messageId` and NO `contextId`. The a2a-sdk on the runtime then calls
 // `_check_or_generate_context_id()` and mints a FRESH uuid per request — so any
 // runtime that keys its native session on `context_id` (openclaw's
-// SessionManager, and the base RuntimeA2AExecutor's LangGraph thread_id) opened a
+// SessionManager, and the base RuntimeA2AExecutor's native thread_id) opened a
 // NEW session every turn → the agent re-greeted with no prior context.
 //
 // Threading a stable `contextId` per conversation makes the a2a-sdk REUSE it, so

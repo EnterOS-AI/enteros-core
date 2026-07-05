@@ -620,11 +620,23 @@ func (h *WorkspaceHandler) HibernateWorkspace(ctx context.Context, workspaceID s
 	// ── Step 2: Stop the container ────────────────────────────────────────────
 	// Status is now 'hibernating'; the router rejects new task routing here, so
 	// there is no race window between claiming the row and stopping the container.
+	//
+	// Route through StopWorkspaceAuto — the single source of truth that dispatches
+	// to whichever backend is wired (CP for SaaS/molecules-server, Docker for
+	// self-hosted). Pre-fix this site inlined `else if h.provisioner != nil { Stop }`,
+	// which silently NO-OP'd on a cpProv/molecules-server tenant (h.provisioner==nil):
+	// the row flipped to 'hibernated' + url='' while the container KEPT RUNNING and
+	// serving A2A — the exact local-docker-vs-EC2 gap the Pause path already closed
+	// (see Pause's StopWorkspaceAuto comment) and the same drift class as the
+	// Collapse/Delete EC2 leaks (#2813/#2814). Verified live on staging: hibernate
+	// left the workspace container "Up" while GET reported status=hibernated.
+	// StopWorkspaceAuto returns nil on no-backend (no-op), so Step 3's mark-hibernated
+	// + url-clear bookkeeping still fires regardless — matching Pause's fail-open shape.
 	log.Printf("Hibernate: stopping container for %s (%s)", wsName, workspaceID)
 	if h.stopFnOverride != nil {
 		h.stopFnOverride(ctx, workspaceID)
-	} else if h.provisioner != nil {
-		h.provisioner.Stop(ctx, workspaceID)
+	} else if err := h.StopWorkspaceAuto(ctx, workspaceID); err != nil {
+		log.Printf("Hibernate: stop %s failed: %v — orphan sweeper will reconcile", workspaceID, err)
 	}
 
 	// ── Step 3: Mark fully hibernated ─────────────────────────────────────────
@@ -641,6 +653,74 @@ func (h *WorkspaceHandler) HibernateWorkspace(ctx context.Context, workspaceID s
 		"tier": tier,
 	})
 	log.Printf("Hibernate: workspace %s (%s) is now hibernated", wsName, workspaceID)
+}
+
+// WakeWorkspace re-provisions a HIBERNATED workspace on the auto-wake-on-A2A
+// path (ProxyA2A calls this when an inbound message hits a hibernated ws).
+//
+// Why this exists separately from RestartByID: a hibernated workspace's
+// container is now GENUINELY STOPPED (Hibernate Step 2 routes through
+// StopWorkspaceAuto), so waking MUST re-provision a fresh container — it can no
+// longer piggy-back on a still-running box. But RestartByID → runRestartCycle
+// deliberately SELECTs `status NOT IN ('removed','paused','hibernated')` and
+// returns early for dormant states, so the reactive dead-agent auto-restart
+// never resurrects a deliberately-parked workspace. Pointing the wake path at
+// RestartByID therefore no-op'd: the workspace stayed hibernated forever
+// (verified live — A2A logged "waking" + 503 but the box never came back). The
+// EXPLICIT A2A wake is a different intent than reactive auto-restart, so it gets
+// its own re-provision, mirroring Resume's provision-only relaunch (Resume
+// handles 'paused'; this handles 'hibernated').
+//
+// Atomic claim (status hibernated→provisioning, gated on status='hibernated')
+// dedupes concurrent wake A2As: only the first transitions + provisions; the
+// rest see rowsAffected=0 and no-op (the caller already returned 503 + retry).
+func (h *WorkspaceHandler) WakeWorkspace(workspaceID string) {
+	// Symmetric with RestartByID: at least one backend must be wired. On a
+	// no-backend handler (unit fixtures) this returns before any DB touch.
+	if !h.HasProvisioner() {
+		return
+	}
+	ctx := context.Background()
+
+	// Atomic claim — only one concurrent wake transitions hibernated→provisioning.
+	res, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2 AND status = 'hibernated'`,
+		models.StatusProvisioning, workspaceID)
+	if err != nil {
+		log.Printf("Wake: claim failed for %s: %v", workspaceID, err)
+		return
+	}
+	if n, raErr := res.RowsAffected(); raErr != nil || n == 0 {
+		// Already woken / not hibernated (a concurrent A2A won the claim, or the
+		// ws was resumed/removed meanwhile) — nothing to do.
+		return
+	}
+
+	// Load the stored provision inputs — same shape Resume uses.
+	var wsName, dbRuntime, dbTemplate string
+	var tier int
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT name, tier, COALESCE(runtime, 'claude-code'), COALESCE(template, '') FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&wsName, &tier, &dbRuntime, &dbTemplate); err != nil {
+		log.Printf("Wake: load workspace %s failed: %v", workspaceID, err)
+		return
+	}
+
+	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), workspaceID, map[string]interface{}{
+		"name": wsName, "tier": tier, "runtime": dbRuntime, "template": dbTemplate,
+	})
+
+	// Carry stored compute + template through so the re-provisioned box
+	// re-delivers config.yaml + prompts (identical to Resume's path).
+	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime, Template: dbTemplate})
+	if payload.Template == "" && h.cpProv != nil {
+		if storedTmpl := storedWorkspaceTemplate(ctx, workspaceID); storedTmpl != "" {
+			payload.Template = storedTmpl
+		}
+	}
+
+	log.Printf("Wake: re-provisioning hibernated workspace %s (%s) runtime=%q template=%q", wsName, workspaceID, dbRuntime, dbTemplate)
+	h.provisionWorkspaceAuto(workspaceID, "", nil, payload)
 }
 
 // RestartByID restarts a workspace by ID — for programmatic use (e.g.,

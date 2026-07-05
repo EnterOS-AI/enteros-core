@@ -70,7 +70,7 @@ jobs:
     # of mc#1543; see internal#512 for class defect.
     runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     outputs:
       run: ${{ steps.decide.outputs.run }}
@@ -175,7 +175,7 @@ jobs:
     # beta containers. Must run on operator-host Linux (docker-host).
     runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     timeout-minutes: 30
     steps:
@@ -311,7 +311,19 @@ jobs:
         # surface to keep CI install fast (~3s) vs the full
         # workspace/requirements.txt (~30s).
         if: needs.detect-changes.outputs.run == 'true'
-        run: pip install -r tests/harness/requirements.txt
+        # molecule-ai-workspace-runtime lives ONLY on the Gitea package
+        # registry (it was removed from public PyPI to close the
+        # dependency-confusion shadow), so pip needs the Gitea index as an
+        # EXTRA index. A plain `pip install -r` reaches public PyPI only and
+        # fails "No matching distribution found for
+        # molecule-ai-workspace-runtime>=0.1.78 (from versions: none)" —
+        # which reds this gate on every PR + push. httpx still resolves from
+        # PyPI. Mirrors e2e-api.yml's "Install standalone runtime parser from
+        # Gitea registry" step (proven-green).
+        run: |
+          pip install \
+            --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+            -r tests/harness/requirements.txt
 
       - name: Rebuild cp-stub from source (RC #11812 + RC #11815 narrow fix)
         # Why this step exists: tests/harness/up.sh's \`build\` block is

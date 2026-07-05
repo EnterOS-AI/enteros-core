@@ -297,6 +297,40 @@ func New() (*Provisioner, error) {
 	return &Provisioner{cli: cli, alpineImage: alpineImageDefault}, nil
 }
 
+// NewDockerClientIfReachable returns a Docker client connected to the local
+// daemon (client.FromEnv — the SAME construction New() uses) but ONLY when
+// that daemon actually answers a Ping. It returns (nil, false) when no daemon
+// is reachable.
+//
+// This is the CP-provisioner-mode (MOLECULE_ORG_ID set → prov == nil) escape
+// hatch for the local-docker / molecules-server backend: on that backend the
+// per-org tenant's workspace-server does NOT construct a Provisioner (main.go
+// takes the control-plane branch), yet the mol-ws-* workspace containers run on
+// a docker daemon the tenant CAN reach. Without a docker client the plugins /
+// templates / terminal handlers fall back to the retired AWS EIC SSH path and
+// 90-120s-timeout → 502 (core#182 tie-in). Wiring a real client lets plugin
+// delivery use docker CopyToContainer against the mol-ws-* container instead.
+//
+// Why a live Ping rather than a hardcoded backend flag: it "waits on the real
+// signal" (no-hardcoding-all-dynamic). A genuine cloud tenant (EC2-per-
+// workspace SaaS) has no local daemon → Ping fails → (nil, false) → the AWS
+// EIC path stays unchanged for real "i-<hex>" instance ids. client.FromEnv
+// constructs a client struct even when the daemon is down (errors surface only
+// on first API call), so the Ping is mandatory to distinguish the two backends.
+func NewDockerClientIfReachable(ctx context.Context) (*client.Client, bool) {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, false
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if _, err := cli.Ping(pingCtx); err != nil {
+		_ = cli.Close()
+		return nil, false
+	}
+	return cli, true
+}
+
 // ContainerName returns the Docker container name for a workspace.
 func ContainerName(workspaceID string) string {
 	return fmt.Sprintf("ws-%s", workspaceID)

@@ -17,7 +17,7 @@
 #      because a missing ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
 #      is infra, not platform plumbing.
 #
-# Usage:  WS_HERMES=<id> WS_LANGGRAPH=<id> WS_CLAUDE_CODE=<id> \
+# Usage:  WS_HERMES=<id> WS_CLAUDE_CODE=<id> \
 #           tests/e2e/test_chat_attachments_multiruntime_e2e.sh
 
 set -uo pipefail
@@ -53,7 +53,6 @@ except Exception as e:
 
 has_executor_patched() {
   # For hermes: /app/executor.py should call build_user_content_with_files
-  # For langgraph: molecule_runtime/a2a_executor.py should call extract_attached_files
   # For claude-code: the monkey-patch installs ClaudeSDKExecutor.execute
   #                  as _execute_with_attachments
   local container="$1" runtime="$2"
@@ -62,12 +61,6 @@ has_executor_patched() {
       docker exec "$container" grep -q "build_user_content_with_files" /app/executor.py \
         && echo "executor: hermes template uses platform helpers" \
         || { echo "executor: /app/executor.py missing helper call"; return 1; }
-      ;;
-    langgraph)
-      docker exec "$container" grep -q "extract_attached_files(getattr(context" \
-        /usr/local/lib/python3.11/site-packages/molecule_runtime/a2a_executor.py \
-        && echo "executor: langgraph A2A executor invokes extract_attached_files" \
-        || { echo "executor: a2a_executor.py not patched"; return 1; }
       ;;
     claude-code)
       docker exec "$container" python3 -c '
@@ -154,7 +147,6 @@ check_runtime() {
 }
 
 check_runtime "hermes"      "hermes"      "${WS_HERMES:-}"
-check_runtime "langgraph"   "langgraph"   "${WS_LANGGRAPH:-}"
 check_runtime "claude-code" "claude-code" "${WS_CLAUDE_CODE:-}"
 
 printf "\n=================================================\n"

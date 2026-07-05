@@ -937,7 +937,12 @@ func TestRegister_GuardAgainstResurrectingRemovedRow(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 	// This regex-ish match requires the guard. If the handler ever drops
 	// the clause the test fails because the emitted SQL won't match.
-	mock.ExpectExec("ON CONFLICT.*WHERE workspaces.status IS DISTINCT FROM 'removed'").
+	// core#2332: the guard was widened from a single 'removed' arm to
+	// NOT IN ('removed','paused','hibernated') so a lingering re-register
+	// from a just-stopped container can't resurrect a deliberately-dormant
+	// (paused/hibernated) row to 'online' — the flaky lifecycle e2e-smoke
+	// resume→404 / hibernate→404 root cause.
+	mock.ExpectExec(`ON CONFLICT.*WHERE workspaces.status NOT IN \('removed', 'paused', 'hibernated'\)`).
 		WithArgs("ws-resurrect", "ws-resurrect", "http://localhost:8000", `{"name":"x"}`, "push", "").
 		WillReturnResult(sqlmock.NewResult(0, 0)) // 0 rows affected = correctly guarded
 	mock.ExpectQuery("SELECT url FROM workspaces WHERE id").

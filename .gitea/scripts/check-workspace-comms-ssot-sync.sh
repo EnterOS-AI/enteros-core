@@ -2,12 +2,12 @@
 # SSOT sync-check for the workspace-comms schemas (producer-side comms gate).
 #
 # molecule-core's workspace-server/internal/models/workspace.go is the WIRE
-# AUTHORITY the molecule-contracts `workspace-comms/*.schema.json` SSOT schemas
+# AUTHORITY the molecule-ai-sdk `workspace-comms/*.schema.json` SSOT schemas
 # were DERIVED FROM. The Go gate
 # workspace-server/internal/models/workspace_comms_ssot_test.go asserts those
 # structs stay field-compatible with a VENDORED copy of the schemas at
 # workspace-server/internal/models/testdata/workspace-comms/. This script keeps
-# that vendored copy honest against the molecule-contracts SSOT: it fetches each
+# that vendored copy honest against the molecule-ai-sdk SSOT: it fetches each
 # canonical schema and verifies the vendored copy is the SAME CONTRACT.
 #
 # This is the SAME transitional "vendored copy + sync-check" shape core already
@@ -17,19 +17,19 @@
 # Go gate (struct <-> vendored schema) or this check (vendored schema <-> SSOT)
 # going red.
 #
-# INVARIANT (what reds): each vendored schema and its molecule-contracts SSOT
+# INVARIANT (what reds): each vendored schema and its molecule-ai-sdk SSOT
 # counterpart must be the SAME CONTRACT -- canonical-JSON identical (key-order-
 # and whitespace-normalized via `jq -S -c`), so a pure formatting delta does NOT
 # red but a real content divergence does.
 #
-# AUTH: NONE. molecule-contracts is a PUBLIC repo, so its canonical schemas are
+# AUTH: NONE. molecule-ai-sdk is a PUBLIC repo, so its canonical schemas are
 # readable over the raw endpoint without a token; this runs on EVERY context
 # (incl. fork PRs) and is FAIL-CLOSED on a fetch error (non-200 / network) and on
 # canonical drift.
 set -euo pipefail
 
-# Public raw endpoint base of the molecule-contracts SSOT (overridable for testing).
-SSOT_BASE="${SSOT_BASE:-https://git.moleculesai.app/molecule-ai/molecule-contracts/raw/branch/main/workspace-comms}"
+# Public raw endpoint base of the molecule-ai-sdk SSOT (overridable for testing).
+SSOT_BASE="${SSOT_BASE:-https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/workspace-comms}"
 # Vendored copies in core (relative to repo root; overridable for testing).
 LOCAL_DIR="${LOCAL_DIR:-workspace-server/internal/models/testdata/workspace-comms}"
 
@@ -41,7 +41,7 @@ for name in "${SCHEMAS[@]}"; do
   ssot_url="${SSOT_BASE}/${name}"
 
   if [ ! -f "$local_path" ]; then
-    echo "::error::Vendored workspace-comms schema $local_path is missing -- the Go gate (workspace_comms_ssot_test.go) embeds it; re-sync from molecule-contracts."
+    echo "::error::Vendored workspace-comms schema $local_path is missing -- the Go gate (workspace_comms_ssot_test.go) embeds it; re-sync from molecule-ai-sdk."
     fail=1
     continue
   fi
@@ -52,14 +52,14 @@ for name in "${SCHEMAS[@]}"; do
   curl_status=$?
   set -e
   if [ "$curl_status" -ne 0 ]; then
-    echo "::error::Failed to fetch the molecule-contracts SSOT schema from ${ssot_url} (curl exit $curl_status). Fail-closed."
+    echo "::error::Failed to fetch the molecule-ai-sdk SSOT schema from ${ssot_url} (curl exit $curl_status). Fail-closed."
     rm -f "$tmp"
     fail=1
     continue
   fi
 
   if ! jq -e . "$tmp" >/dev/null 2>&1; then
-    echo "::error::The molecule-contracts SSOT schema ${name} did not parse as JSON. Fail-closed."
+    echo "::error::The molecule-ai-sdk SSOT schema ${name} did not parse as JSON. Fail-closed."
     rm -f "$tmp"
     fail=1
     continue
@@ -72,12 +72,12 @@ for name in "${SCHEMAS[@]}"; do
   fi
 
   if cmp -s <(jq -S -c . "$local_path") <(jq -S -c . "$tmp"); then
-    echo "OK -- vendored ${name} is the SAME CONTRACT as the molecule-contracts SSOT (canonical-JSON identical)."
+    echo "OK -- vendored ${name} is the SAME CONTRACT as the molecule-ai-sdk SSOT (canonical-JSON identical)."
     if ! cmp -s "$local_path" "$tmp"; then
       echo "::notice::Vendored ${name} and the SSOT are the same contract but not raw-byte-identical (formatting differs). Canonical equality is the enforced invariant."
     fi
   else
-    echo "::error::Vendored ${name} DRIFTED from the molecule-contracts SSOT -- NOT the same contract (canonical-JSON differs)."
+    echo "::error::Vendored ${name} DRIFTED from the molecule-ai-sdk SSOT -- NOT the same contract (canonical-JSON differs)."
     echo "Canonical diff (vendored vs SSOT):"
     diff -u <(jq -S -c . "$local_path") <(jq -S -c . "$tmp") || true
     echo "Re-sync: align ${local_path} to ${ssot_url} (the SSOT is canonical -- align the vendored copy to it, never the reverse)."

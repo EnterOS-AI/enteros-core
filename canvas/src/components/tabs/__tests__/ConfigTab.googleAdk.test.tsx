@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 //
 // Regression: project_canvas_runtime_dropdown_ssot_fix — a google-adk
-// workspace's Config tab showed the wrong runtime ("LangGraph (default)"
-// / first option) because a hardcoded frontend allowlist
+// workspace's Config tab showed the wrong runtime (a stale first-option
+// default) because a hardcoded frontend allowlist
 // (SUPPORTED_RUNTIME_VALUES) dropped google-adk from the /templates-derived
 // options even though the backend served it. A Save from that state would
 // PATCH runtime to the wrong value and break the ADK agent.
