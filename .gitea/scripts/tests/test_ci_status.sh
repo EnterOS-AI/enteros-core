@@ -392,6 +392,7 @@ echo "== workflow wiring (regression guard) =="
 QA="$WF_DIR/qa-review.yml"
 SEC="$WF_DIR/security-review.yml"
 SS="$WF_DIR/secret-scan.yml"
+RPR="$WF_DIR/reserved-path-review.yml"
 
 assert_file_contains "W1 qa-review sources ci-status lib"      "$QA"  ".gitea/scripts/lib/ci-status.sh"
 assert_file_contains "W1 qa-review calls resolve_ci_status_token" "$QA" "resolve_ci_status_token"
@@ -406,6 +407,11 @@ assert_file_contains "W3 secret-scan sources ci-status lib"       "$SS"  ".gitea
 assert_file_contains "W3 secret-scan calls reassert_commit_status" "$SS"  "reassert_commit_status"
 assert_file_contains "W3 secret-scan passes CONTEXT_BASE"          "$SS"  "Secret scan / Scan diff for credential-shaped strings"
 
+assert_file_contains "W6 reserved-path-review sources ci-status lib"    "$RPR" ".gitea/scripts/lib/ci-status.sh"
+assert_file_contains "W6 reserved-path-review calls resolve_ci_status_token" "$RPR" "resolve_ci_status_token"
+assert_file_contains "W6 reserved-path-review calls emit_review_status" "$RPR" "emit_review_status"
+assert_file_contains "W6 reserved-path-review passes reserved STATUS_CONTEXT" "$RPR" "reserved-path-review / reserved-path-review (pull_request_target)"
+
 # W5 — review-check.sh (the qa/security evaluator) uses the SSOT derive_gitea_base
 # for its host derivation, so the reviewer's "review-check.sh host-derivation"
 # concern is covered by the D1–D4 cases above (single tested derivation).
@@ -418,6 +424,23 @@ echo
 echo "== W4 secret-scan re-assert is success()-gated =="
 W4=$(awk '/Re-assert Secret scan status/{found=1} found && /if:[[:space:]]*success\(\)/{print "OK"; exit}' "$SS")
 assert_eq "W4 re-assert step has if: success()" "OK" "$W4"
+
+# W7 — no dangling legacy inline-emission fragments may survive in the three
+# review workflows: after the emit_review_status lib call the old inline
+# variables ($post_code / $head_sha / $status_state) are UNSET, so a leftover
+# `if [ "$post_code" ... ]` block would kill the step with `set -u` unbound-var
+# at runtime (found live on qa-review.yml, PR #3422 first revision).
+echo
+echo "== W7 no dangling legacy emission fragments =="
+for wf in "$QA" "$SEC" "$RPR"; do
+  if grep -qE '\$\{?post_code' "$wf"; then
+    echo "  FAIL  W7 $(basename "$wf") still references \$post_code (dangling legacy fragment)"
+    FAIL=$((FAIL + 1)); FAILED_TESTS="${FAILED_TESTS} W7_$(basename "$wf")"
+  else
+    echo "  PASS  W7 $(basename "$wf") has no dangling \$post_code fragment"
+    PASS=$((PASS + 1))
+  fi
+done
 
 echo
 echo "------"

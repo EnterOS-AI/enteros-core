@@ -32,6 +32,7 @@ on:
       - '.gitea/workflows/qa-review.yml'
       - '.gitea/workflows/security-review.yml'
       - '.gitea/workflows/secret-scan.yml'
+      - '.gitea/workflows/reserved-path-review.yml'
   pull_request:
     branches: [main, staging]
     paths:
@@ -47,6 +48,7 @@ on:
       - '.gitea/workflows/qa-review.yml'
       - '.gitea/workflows/security-review.yml'
       - '.gitea/workflows/secret-scan.yml'
+      - '.gitea/workflows/reserved-path-review.yml'
   workflow_dispatch:
 
 env:

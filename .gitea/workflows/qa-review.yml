@@ -258,10 +258,3 @@ jobs:
           # (eval computes, POST writes — never the same cred).
           . .gitea/scripts/lib/ci-status.sh
           emit_review_status
-
-          if [ "$post_code" != "200" ] && [ "$post_code" != "201" ]; then
-            echo "::error::POST /statuses/${head_sha} returned HTTP ${post_code}"
-            exit 1
-          fi
-
-          echo "::notice::posted ${status_state} for context=\"qa-review / approved (pull_request_target)\" on sha=${head_sha}"
