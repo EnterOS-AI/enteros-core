@@ -136,7 +136,7 @@ jobs:
     # the molecules-server canvas gate does not fire these AWS-dead jobs.
     if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     # Raised 45→75: step 10b now exercises pause→resume→online +
     # hibernate→wake→online, each of which RE-PROVISIONS the parent (CP
