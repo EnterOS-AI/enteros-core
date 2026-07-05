@@ -465,7 +465,24 @@ def compute_na_state(
 
 class GiteaClient:
     def __init__(self, host: str, token: str):
-        self.base = f"https://{host}/api/v1"
+        # `host` is the API endpoint the runner uses to reach Gitea. It may be
+        # a bare host (`git.moleculesai.app` → assume https, back-compat) OR a
+        # full base URL with scheme (`http://molecule-gitea-local:3000`).
+        #
+        # CF-1010 fix: the runners reach Gitea over the internal docker network
+        # (`http://molecule-gitea-local:3000`) — plain HTTP, no scheme to force.
+        # The public CF edge (https://git.moleculesai.app) bans this script's
+        # `Python-urllib/*` User-Agent with WAF error 1010 (browser_signature_banned),
+        # killing the gate before it can evaluate whenever the job lands on a
+        # molecule-net runner. Calling the internal host keeps the gate off the
+        # CF edge entirely, matching how the runners already do checkout/control
+        # (GITHUB_SERVER_URL=http://molecule-gitea-local:3000). See
+        # `.gitea/workflows/sop-checklist.yml`.
+        host = host.strip().rstrip("/")
+        if host.startswith("http://") or host.startswith("https://"):
+            self.base = f"{host}/api/v1"
+        else:
+            self.base = f"https://{host}/api/v1"
         self.token = token
         # Cache team-name → team-id resolutions per org.
         self._team_id_cache: dict[tuple[str, str], int | None] = {}
@@ -950,7 +967,26 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repo", required=True)
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--config", default=".gitea/sop-checklist-config.yaml")
-    p.add_argument("--gitea-host", default="git.moleculesai.app")
+    # API endpoint the gate calls. Defaults to the INTERNAL Gitea host so the
+    # gate never touches the CF edge (WAF 1010 bans the urllib UA — see
+    # GiteaClient). The runner injects GITHUB_SERVER_URL=http://molecule-gitea-local:3000;
+    # GITEA_API_BASE_URL lets the workflow override explicitly. Accepts a bare
+    # host or a full scheme://host[:port] base URL.
+    p.add_argument(
+        "--gitea-host",
+        default=(
+            os.environ.get("GITEA_API_BASE_URL")
+            or os.environ.get("GITHUB_SERVER_URL")
+            or "http://molecule-gitea-local:3000"
+        ),
+    )
+    # PUBLIC host used ONLY for the human-facing target_url link on the posted
+    # status (so clicking the check opens the real PR on the CF-fronted host).
+    # NOT used for any API call.
+    p.add_argument(
+        "--public-host",
+        default=os.environ.get("GITEA_PUBLIC_HOST", "git.moleculesai.app"),
+    )
     p.add_argument(
         "--dry-run",
         action="store_true",
@@ -1203,7 +1239,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if state in ("success", "pending") else 1
         return 0
 
-    target_url = f"https://{args.gitea_host}/{args.owner}/{args.repo}/pulls/{args.pr}"
+    # Human-facing link → PUBLIC host (not the internal API host used for calls).
+    target_url = f"https://{args.public_host}/{args.owner}/{args.repo}/pulls/{args.pr}"
     client.post_status(
         args.owner, args.repo, head_sha,
         state=state, context=args.status_context,
