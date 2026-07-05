@@ -214,7 +214,7 @@ jobs:
         env:
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
-          INFISICAL_PROJECT_ID: ${{ secrets.STAGING_INFISICAL_PROJECT_ID }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
           TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
         run: bash scripts/deploy/advance-staging-tenant-pin.sh --tag "${{ needs.await-image.outputs.tag }}"
 
@@ -243,7 +243,7 @@ jobs:
         env:
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
-          INFISICAL_PROJECT_ID: ${{ secrets.STAGING_INFISICAL_PROJECT_ID }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
         run: |
           echo "::warning::fleet roll failed after pin advance — reverting staging pin to ${{ needs.advance-pin.outputs.old_image }}"
           bash scripts/deploy/advance-staging-tenant-pin.sh --image "${{ needs.advance-pin.outputs.old_image }}"
