@@ -21,10 +21,15 @@
 export const SaaSHostSuffix =
   process.env.NEXT_PUBLIC_SAAS_HOST_SUFFIX ?? ".moleculesai.app";
 
-// reservedSubdomains mirrors the control plane's list so we don't
-// accidentally treat canvas-itself subdomains as tenant slugs when the
-// user lands on e.g. app.moleculesai.app directly.
-const reservedSubdomains = new Set([
+// centralHosts are the platform's OWN subdomains — our consoles and API — and
+// must NEVER be treated as a tenant org slug. If the canvas lands on one of
+// these it must derive an empty slug (and not send a bogus X-Molecule-Org-Slug
+// header). This is the canvas-OWNED source of truth for the CENTRAL-host
+// subset; it deliberately does NOT duplicate the control plane's full
+// anti-impersonation blocklist (molecule-controlplane internal/reserved) — the
+// canvas only needs "is this one of our own consoles?". Kept honest by the
+// derivation below + __tests__/tenant.test.ts.
+const centralHosts = [
   "app",
   "www",
   "api",
@@ -34,7 +39,28 @@ const reservedSubdomains = new Set([
   "billing",
   "status",
   "docs",
-]);
+];
+
+// Per-environment console prefixes. The staging console is served at
+// `staging-app.moleculesai.app` and the staging API at
+// `staging-api.moleculesai.app` — i.e. `<prefix>-<centralHost>` directly under
+// the apex, NOT `app.staging.moleculesai.app`. So every central host has an
+// env-prefixed twin that must ALSO be reserved. We DERIVE these (host × prefix)
+// rather than hand-listing `staging-app`/`staging-api`: that way adding a new
+// central host — or a new environment — can never silently forget its staging
+// twin. That forgotten twin is exactly what made staging-app.moleculesai.app
+// resolve to a phantom tenant named "staging-app" and render the org view.
+// Add a new environment here (e.g. "preview") to cover ALL of its consoles.
+const envConsolePrefixes = ["staging"];
+
+// reservedSubdomains = central hosts ∪ their env-prefixed console twins.
+// Single source of truth so the staging consoles cannot drift out of the set.
+const reservedSubdomains = new Set<string>(
+  centralHosts.flatMap((h) => [
+    h,
+    ...envConsolePrefixes.map((prefix) => `${prefix}-${h}`),
+  ]),
+);
 
 /**
  * getTenantSlug returns the tenant slug for the current request.
