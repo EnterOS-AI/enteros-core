@@ -145,6 +145,19 @@ type pluginInfo struct {
 	Author      string   `json:"author"`
 	Tags        []string `json:"tags"`
 	Skills      []string `json:"skills"`
+	// Kind is the plugin's self-declared marketplace kind (plugin.yaml
+	// `kind` — e.g. "channel" for channel bridges like the Lark/Feishu
+	// plugin). Free-form passthrough from the manifest, empty when
+	// undeclared. Agents use it to route capability asks ("connect X
+	// channel") to the right catalog entry without a hardcoded list.
+	Kind string `json:"kind,omitempty"`
+	// Source is the installable source handle for this entry — the exact
+	// string POST /workspaces/:id/plugins accepts. Populated on registry
+	// listings ("local://<dir-name>", derived from the registry entry's
+	// own directory name); omitted on responses that don't carry one
+	// (e.g. ListInstalled, where the install source lives in
+	// workspace_plugins, not the on-box tree).
+	Source string `json:"source,omitempty"`
 	// Runtimes declares which workspace runtimes this plugin ships an adaptor
 	// for. Empty means "unspecified" — the canvas still allows install (the
 	// raw-drop fallback surfaces a warning at install time). Runtime names
@@ -192,6 +205,7 @@ func parseManifestYAML(fallbackName string, data []byte) pluginInfo {
 	info.Version = strDefault(raw, "version", "")
 	info.Description = strDefault(raw, "description", "")
 	info.Author = strDefault(raw, "author", "")
+	info.Kind = strDefault(raw, "kind", "")
 	if tags, ok := raw["tags"].([]interface{}); ok {
 		for _, t := range tags {
 			if s, ok := t.(string); ok {

@@ -386,6 +386,65 @@ func TestParseManifestYAML_MinimalYAML(t *testing.T) {
 	}
 }
 
+// ---------- Kind + Source on the catalog (self-reprovision §5.2 discovery) ----------
+
+const kindTestManifest = `name: molecule-lark-channel
+version: "0.4.0"
+description: Lark/Feishu channel bridge
+kind: channel
+`
+
+func TestParseManifestYAML_PicksUpKind(t *testing.T) {
+	info := parseManifestYAML("lark-channel", []byte(kindTestManifest))
+	if info.Kind != "channel" {
+		t.Errorf("expected kind 'channel', got %q", info.Kind)
+	}
+	// Undeclared kind stays empty (and is omitted from JSON via omitempty).
+	if got := parseManifestYAML("plain", []byte(`version: "1.0"`)).Kind; got != "" {
+		t.Errorf("expected empty kind when undeclared, got %q", got)
+	}
+}
+
+func TestPluginListRegistry_DerivesInstallSourceAndKind(t *testing.T) {
+	dir := t.TempDir()
+	writePlugin(t, dir, "lark-channel", kindTestManifest)
+	writePlugin(t, dir, "bare-plugin", `version: "1.0"`)
+
+	h := NewPluginsHandler(dir, nil, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/plugins", nil)
+	h.ListRegistry(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var plugins []pluginInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &plugins); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	byName := map[string]pluginInfo{}
+	for _, p := range plugins {
+		byName[p.Name] = p
+	}
+	// Every registry row carries its installable local:// handle, derived
+	// from the entry's own directory name — the exact string the install
+	// pipeline's local resolver accepts.
+	if got := byName["lark-channel"].Source; got != "local://lark-channel" {
+		t.Errorf("expected source 'local://lark-channel', got %q", got)
+	}
+	if got := byName["bare-plugin"].Source; got != "local://bare-plugin" {
+		t.Errorf("expected source 'local://bare-plugin', got %q", got)
+	}
+	// Kind is a manifest passthrough; absent stays empty.
+	if got := byName["lark-channel"].Kind; got != "channel" {
+		t.Errorf("expected kind 'channel', got %q", got)
+	}
+	if got := byName["bare-plugin"].Kind; got != "" {
+		t.Errorf("expected empty kind, got %q", got)
+	}
+}
+
 // ---------- Runtime filter on ListRegistry ----------
 
 // writePlugin is a small helper for the runtime-filter tests.
