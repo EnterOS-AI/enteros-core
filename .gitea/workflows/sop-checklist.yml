@@ -117,7 +117,20 @@ jobs:
        (contains(github.event.comment.body, '/sop-ack') ||
         contains(github.event.comment.body, '/sop-revoke') ||
         contains(github.event.comment.body, '/sop-n/a')))
-    runs-on: ubuntu-latest
+    # Completes eb18297b: the gate calls Gitea over the INTERNAL docker-network
+    # address (GITEA_API_BASE_URL=http://molecule-gitea-local:3000, set below),
+    # which resolves ONLY from a runner on `molecule-net`. `ubuntu-latest` is
+    # advertised by the REMOTE robot-1 pool (host-network / off-net), where
+    # `molecule-gitea-local` does not resolve — the job died with
+    # `socket.gaierror: Temporary failure in name resolution` before it could
+    # evaluate (e.g. #3446 head, 2026-07-05). Pin to `ci-meta`, the local
+    # molecule-net runner that serves molecule-ai repos (GITHUB_SERVER_URL is
+    # http://molecule-gitea-local:3000 there), so the internal host is always
+    # reachable and the gate never touches the CF edge (WAF-1010). Verified live:
+    # a molecule-core job on `ci-meta` reaches molecule-gitea-local:3000 (HTTP
+    # 200). This gate is bp-exempt, so if the runner is briefly offline the
+    # status is simply not posted (no merge is blocked).
+    runs-on: ci-meta
     steps:
       - name: Check out BASE ref (trust boundary — never PR-head)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
