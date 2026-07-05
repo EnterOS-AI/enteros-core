@@ -11,11 +11,23 @@
 #   - main-red-watchdog.yml WATCHES the combined commit-status (it does not
 #     itself compile anything).
 # # Core test scope: this runs `go test ./...` from workspace-server/ exactly
-# as ci.yml's blocking gate does (minus the coverage threshold). The
-# runtime/Gitea-auth-dependent tests (manifest_pinning, mcp_plugin_delivery
-# contract) GATE on MOLECULE_GITEA_TOKEN / MOLECULE_WORKSPACE_RUNTIME being
-# set and SKIP when they are absent, so no external infra is needed here and
-# the canary will not false-alarm on them.
+# as ci.yml's blocking gate does (minus the coverage threshold). Two of those
+# tests depend on external infra and are DELIBERATELY fail-closed (they do NOT
+# skip when the infra is absent — an earlier skip path was removed because it
+# masked real regressions / re-introduced the CR2 #12653 false-green):
+#   - manifest_pinning_test.go (RFC #2927) calls the Gitea API to verify every
+#     pinned template SHA is reachable + carries config.yaml. The platform-agent
+#     template repo is PRIVATE, so it returns 404 WITHOUT MOLECULE_GITEA_TOKEN.
+#     (It only skips when Gitea is UNREACHABLE, never on a missing token.)
+#   - mcp_plugin_delivery_contract_test.go exercises the REAL MCPServerAdaptor
+#     from molecule-ai-workspace-runtime; runMCPAdaptorHarness hard-FAILS (never
+#     skips) when the runtime source is absent, so `import molecule_runtime`
+#     must resolve.
+# Therefore the canary MUST provide the SAME environment ci.yml's blocking gate
+# provides: MOLECULE_GITEA_TOKEN (from the Infisical SSOT) and a checked-out +
+# installed molecule-ai-workspace-runtime exported as MOLECULE_WORKSPACE_RUNTIME.
+# Without them the canary FALSE-alarms on a perfectly healthy main (the 404 is
+# missing-auth, not a bad pin; the import error is missing-runtime, not a bug).
 #   This canary actually COMPILES + TESTS the merged main HEAD and turns a
 #   red build into an immediate tracked issue (the issue IS the alarm).
 #
@@ -63,6 +75,75 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
+
+      # ---------------------------------------------------------------------
+      # External-infra setup for the fail-closed contract tests (see header).
+      # Mirrors ci.yml's blocking-gate setup so the canary runs the SAME tests
+      # under the SAME conditions instead of false-alarming on missing infra.
+      # push/workflow_dispatch only (no fork PRs here) — the merge-actor token
+      # is never exposed to an untrusted fork on this workflow.
+      # ---------------------------------------------------------------------
+      - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
+        # Pulls the devops-engineer persona PAT from the Infisical SSOT at
+        # /shared/dev-utils::AUTO_SYNC_TOKEN (environment=prod) — the SAME
+        # source ci.yml uses. Exported to $GITHUB_ENV as AUTO_SYNC_TOKEN (used
+        # as `token:` for the private runtime checkout below) and as
+        # MOLECULE_GITEA_TOKEN (read by the manifest_pinning Go tests so the
+        # PRIVATE platform-agent template repo resolves 200 instead of 404).
+        id: auto_sync_token
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -z "$AUTO_SYNC_TOKEN" ]; then
+            echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils"
+            exit 1
+          fi
+          echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
+          echo "MOLECULE_GITEA_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
+          echo "AUTO_SYNC_TOKEN loaded from Infisical (len=${#AUTO_SYNC_TOKEN})"
+
+      - name: Checkout molecule-ai-workspace-runtime source for contract tests
+        # The MCP-plugin delivery contract test imports the REAL MCPServerAdaptor
+        # from molecule_runtime and hard-FAILS (never skips) when the source is
+        # absent. Check it out as a sibling of the repo root so the test's
+        # PYTHONPATH resolves `import molecule_runtime.*`.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: molecule-ai/molecule-ai-workspace-runtime
+          path: molecule-ai-workspace-runtime
+          token: ${{ env.AUTO_SYNC_TOKEN }}
+
+      - name: Install molecule-ai-workspace-runtime and its Python deps
+        # `pip install .` (no `|| true` — failures must be loud) pulls the
+        # runtime's own deps (notably a2a-sdk, imported at module load) so the
+        # harness child can import molecule_runtime + its dependency chain.
+        working-directory: molecule-ai-workspace-runtime
+        run: |
+          set -euo pipefail
+          if ! python3 -m pip --version >/dev/null 2>&1; then
+            python3 -m ensurepip --upgrade
+          fi
+          python3 -m pip install --upgrade pip
+          python3 -m pip install .
+
+      - name: Export MOLECULE_WORKSPACE_RUNTIME for contract tests
+        run: |
+          echo "MOLECULE_WORKSPACE_RUNTIME=$GITHUB_WORKSPACE/molecule-ai-workspace-runtime" >> "$GITHUB_ENV"
 
       - name: build + vet + test (capture; never fails the job here)
         id: canary
