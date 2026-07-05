@@ -36,6 +36,12 @@ func (h *PluginsHandler) listRegistryFiltered(runtime string) []pluginInfo {
 		if runtime != "" && !info.supportsRuntime(runtime) {
 			continue
 		}
+		// The installable handle for a registry entry is its local://
+		// source, derived from the entry's own directory name — the same
+		// string the install pipeline's local resolver accepts. Lets a
+		// catalog consumer (canvas, mgmt-MCP list_available_plugins) go
+		// straight from a listing row to an install call.
+		info.Source = "local://" + e.Name()
 		plugins = append(plugins, info)
 	}
 	return plugins
