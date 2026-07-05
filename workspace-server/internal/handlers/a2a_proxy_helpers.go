@@ -451,10 +451,18 @@ func (h *WorkspaceHandler) hasRecentHeartbeat(ctx context.Context, workspaceID s
 
 // declareContainerDead is the single point that marks a workspace offline,
 // clears keys, broadcasts OFFLINE, and triggers an async restart.
+//
+// The status guard excludes 'paused'/'hibernated' (not just 'removed'/
+// 'provisioning'): a deliberately-parked workspace's container is EXPECTED to
+// be stopped, so a probe that finds it dead must NOT flip it to 'offline' (nor
+// fire the RestartByID below). Without this, a probe against a dormant
+// workspace could clobber its lifecycle status — the same dormant-state-must-
+// be-inviolable rule the liveness monitor (registry/liveness.go) and the
+// Register upsert already enforce (core#2332 pause_resume / hibernate_wake).
 func (h *WorkspaceHandler) declareContainerDead(ctx context.Context, workspaceID string) bool {
 	log.Printf("ProxyA2A: container for %s is dead — marking offline and triggering restart", workspaceID)
 	h.resetDeadProbe(workspaceID)
-	if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status NOT IN ('removed', 'provisioning')`, models.StatusOffline, workspaceID); err != nil {
+	if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status NOT IN ('removed', 'provisioning', 'paused', 'hibernated')`, models.StatusOffline, workspaceID); err != nil {
 		log.Printf("ProxyA2A: failed to mark workspace %s offline: %v", workspaceID, err)
 	}
 	db.ClearWorkspaceKeys(ctx, workspaceID)
@@ -544,9 +552,12 @@ func (h *WorkspaceHandler) preflightContainerHealth(ctx context.Context, workspa
 	// Container is genuinely not running. Mark offline + trigger restart
 	// (same effect as maybeMarkContainerDead's branch), and return the
 	// structured 503 immediately so the caller skips the forward.
+	// Status guard excludes 'paused'/'hibernated' for the same reason as
+	// declareContainerDead: a dormant workspace's container is intentionally
+	// stopped and must not be offlined/restarted by a probe (core#2332).
 	log.Printf("ProxyA2A preflight: container for %s is not running — marking offline and triggering restart (#36)", workspaceID)
 	if _, dbErr := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status NOT IN ('removed', 'provisioning')`,
+		`UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2 AND status NOT IN ('removed', 'provisioning', 'paused', 'hibernated')`,
 		models.StatusOffline, workspaceID); dbErr != nil {
 		log.Printf("ProxyA2A preflight: failed to mark workspace %s offline: %v", workspaceID, dbErr)
 	}
