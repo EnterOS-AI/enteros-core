@@ -236,6 +236,16 @@ func (h *RegistryHandler) fireReconcileOnline(ctx context.Context, workspaceID s
 // sustained-missing concierge retries gently (the gate fails on every heartbeat
 // until the MCP lands) rather than re-firing a clone+deliver every beat.
 // nil-safe via the reconcilePlugins check + the empty-id guard.
+func mcpServerPresentPayloadForLog(p *bool) string {
+	if p == nil {
+		return "nil"
+	}
+	if *p {
+		return "true"
+	}
+	return "false"
+}
+
 func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspaceID string) {
 	if h.reconcilePlugins == nil || workspaceID == "" {
 		return
@@ -1665,7 +1675,10 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				// the existing recovery branch. Guarded against per-heartbeat storms.
 				h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
 			}
-			log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
+			// Observability: emit the deciding inputs + the resulting failed
+			// transition so a future false-fail is diagnosable from logs without
+			// a local repro (SEV1 follow-up to core#3082 / runtime#181).
+			log.Printf("Heartbeat: workspace=%s transition=%s\u2192%s reason=%s has_model=%v mcp_server_present=%v mcp_server_present_payload=%v", payload.WorkspaceID, currentStatus, models.StatusFailed, reason, hasModel, hasMCP, mcpServerPresentPayloadForLog(payload.MCPServerPresent))
 			h.markWorkspaceFailed(ctx, payload.WorkspaceID, msg, reason)
 			return
 		}
@@ -1888,6 +1901,13 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				msg := fmt.Sprintf("platform agent declared management MCP lookup failed: %v; marking degraded (core#3082)", mErr)
 				log.Printf("Heartbeat: %s (workspace=%s)", msg, payload.WorkspaceID)
 				managementMCPUnloaded = true
+				// Observability: emit the deciding inputs at this demote site (core#3082 / runtime#181 follow-up).
+				// NOTE: in the mErr != nil branch, managementMissing is the zero-value
+				// (false) — the lookup errored before platformAgentManagementMCPLoaded
+				// could assign it. Emit managementMCPUnloaded (set true above) so the
+				// field reflects the actual unloaded-state used by the recovery gate
+				// below. (CR2 #14695 / Researcher #14696 on #3334.)
+				log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=management_mcp_lookup_error mcp_server_present_payload=%v loaded_mcp_tools_count=%d management_mcp_unloaded=%v", payload.WorkspaceID, currentStatus, mcpServerPresentPayloadForLog(payload.MCPServerPresent), len(payload.LoadedMCPTools), managementMCPUnloaded)
 				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
 					log.Printf("Heartbeat: failed to mark %s degraded (management MCP lookup error): %v", payload.WorkspaceID, err)
 				}
@@ -1922,6 +1942,12 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 						msg = "platform agent runtime did not report loaded_mcp_tools on a mcp_server_present=true heartbeat; cannot verify provision_workspace tool is loaded — marking degraded (core#3082)"
 					}
 					log.Printf("Heartbeat: %s (workspace=%s, unloaded for %s)", msg, payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second))
+					// Observability: emit the deciding inputs at this demote site (core#3082 / runtime#181 follow-up).
+					// Emit managementMCPUnloaded (true here, set at line 1701) — the
+				// tool-missing boolean (managementMissing) is already conveyed by
+				// the loaded_mcp_tools_count + absent_tools_list pair right above.
+					// (Consistency with lookup-error branch per CR2 #14695 / Researcher #14696 on #3334.)
+					log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=management_mcp_missing loaded_mcp_tools_count=%d absent_tools_list=%v mcp_unloaded_for=%s grace=%s management_mcp_unloaded=%v", payload.WorkspaceID, currentStatus, len(payload.LoadedMCPTools), absentToolsList, now.Sub(firstUnloaded.Time).Truncate(time.Second), managementMCPUnloadedGrace, managementMCPUnloaded)
 					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
 						log.Printf("Heartbeat: failed to mark %s degraded (management MCP missing): %v", payload.WorkspaceID, err)
 					}
@@ -1969,6 +1995,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if err != nil {
 			log.Printf("Heartbeat: failed to mark %s degraded (wedged): %v", payload.WorkspaceID, err)
 		}
+		// Observability: emit the deciding inputs at this demote site (SEV1 follow-up).
+		log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=runtime_wedged runtime_state=%q error_rate=%v sample_error=%q", payload.WorkspaceID, currentStatus, payload.RuntimeState, payload.ErrorRate, payload.SampleError)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
 			"runtime_state": "wedged",
 			"sample_error":  payload.SampleError,
@@ -1991,6 +2019,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'online'`, models.StatusDegraded, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to mark %s degraded: %v", payload.WorkspaceID, err)
 		}
+		// Observability: emit the deciding inputs at this demote site (SEV1 follow-up).
+		log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=high_error_rate error_rate=%v sample_error=%q", payload.WorkspaceID, currentStatus, payload.ErrorRate, payload.SampleError)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
 			"error_rate":   payload.ErrorRate,
 			"sample_error": payload.SampleError,
@@ -2006,6 +2036,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'online'`, models.StatusDegraded, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to mark %s degraded (register failure): %v", payload.WorkspaceID, err)
 		}
+		// Observability: emit the deciding inputs at this demote site (SEV1 follow-up).
+		log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=register_failure_recent register_failure_recent=%v error_rate=%v", payload.WorkspaceID, currentStatus, hasRecentRegisterFailure, payload.ErrorRate)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
 			"register_failure": true,
 			"sample_error":     "Register failed — workspace auth token may be stale. Restart or reprovision to recover.",
@@ -2036,6 +2068,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'degraded'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s to online: %v", payload.WorkspaceID, err)
 		}
+		// Observability: emit the deciding inputs at this promote site (SEV1 follow-up).
+		log.Printf("Heartbeat: workspace=%s transition=%s\u2192online reason=degraded_recovered error_rate=%v runtime_state=%q register_failure_recent=%v management_mcp_unloaded=%v native_status_mgmt=%v", payload.WorkspaceID, currentStatus, payload.ErrorRate, payload.RuntimeState, hasRecentRegisterFailure, managementMCPUnloaded, nativeStatus)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{})
 		// RFC#2843: reconcile declared plugins on transition-to-online.
 		h.fireReconcileOnline(ctx, payload.WorkspaceID)
@@ -2048,6 +2082,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, updated_at = now() WHERE id = $2 AND status = 'offline'`, models.StatusOnline, payload.WorkspaceID); err != nil {
 			log.Printf("Heartbeat: failed to recover %s from offline: %v", payload.WorkspaceID, err)
 		}
+		// Observability: emit the deciding inputs at this promote site (SEV1 follow-up).
+		log.Printf("Heartbeat: workspace=%s transition=%s\u2192online reason=offline_recovered", payload.WorkspaceID, currentStatus)
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{})
 		// RFC#2843: reconcile declared plugins on transition-to-online.
 		h.fireReconcileOnline(ctx, payload.WorkspaceID)
