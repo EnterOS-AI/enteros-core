@@ -70,7 +70,7 @@ jobs:
     # of mc#1543; see internal#512 for class defect.
     runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     outputs:
       run: ${{ steps.decide.outputs.run }}
@@ -175,7 +175,7 @@ jobs:
     # beta containers. Must run on operator-host Linux (docker-host).
     runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     timeout-minutes: 30
     steps:
