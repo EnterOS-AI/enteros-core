@@ -620,11 +620,23 @@ func (h *WorkspaceHandler) HibernateWorkspace(ctx context.Context, workspaceID s
 	// ── Step 2: Stop the container ────────────────────────────────────────────
 	// Status is now 'hibernating'; the router rejects new task routing here, so
 	// there is no race window between claiming the row and stopping the container.
+	//
+	// Route through StopWorkspaceAuto — the single source of truth that dispatches
+	// to whichever backend is wired (CP for SaaS/molecules-server, Docker for
+	// self-hosted). Pre-fix this site inlined `else if h.provisioner != nil { Stop }`,
+	// which silently NO-OP'd on a cpProv/molecules-server tenant (h.provisioner==nil):
+	// the row flipped to 'hibernated' + url='' while the container KEPT RUNNING and
+	// serving A2A — the exact local-docker-vs-EC2 gap the Pause path already closed
+	// (see Pause's StopWorkspaceAuto comment) and the same drift class as the
+	// Collapse/Delete EC2 leaks (#2813/#2814). Verified live on staging: hibernate
+	// left the workspace container "Up" while GET reported status=hibernated.
+	// StopWorkspaceAuto returns nil on no-backend (no-op), so Step 3's mark-hibernated
+	// + url-clear bookkeeping still fires regardless — matching Pause's fail-open shape.
 	log.Printf("Hibernate: stopping container for %s (%s)", wsName, workspaceID)
 	if h.stopFnOverride != nil {
 		h.stopFnOverride(ctx, workspaceID)
-	} else if h.provisioner != nil {
-		h.provisioner.Stop(ctx, workspaceID)
+	} else if err := h.StopWorkspaceAuto(ctx, workspaceID); err != nil {
+		log.Printf("Hibernate: stop %s failed: %v — orphan sweeper will reconcile", workspaceID, err)
 	}
 
 	// ── Step 3: Mark fully hibernated ─────────────────────────────────────────

@@ -21,8 +21,8 @@ import (
 	"strings"
 	"testing"
 
-	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -34,7 +34,7 @@ import (
 // the 3-step atomic pattern (#819):
 //   - Atomic claim UPDATE returns rowsAffected=1 (workspace was online/degraded + active_tasks=0)
 //   - Name/tier SELECT runs after the claim
-//   - Final UPDATE sets status='hibernated', url=''
+//   - Final UPDATE sets status='hibernated', url=”
 //   - Redis keys ws:{id}, ws:{id}:url, ws:{id}:internal_url are deleted
 //   - WORKSPACE_HIBERNATED event is broadcast (INSERT INTO structure_events)
 func TestHibernateWorkspace_OnlineWorkspace_Success(t *testing.T) {
@@ -82,6 +82,57 @@ func TestHibernateWorkspace_OnlineWorkspace_Success(t *testing.T) {
 		if _, err := mr.Get(key); err == nil {
 			t.Errorf("expected Redis key %q to be deleted, but it still exists", key)
 		}
+	}
+}
+
+// TestHibernateWorkspace_RoutesStopToCPWhenOnlyCPWired is the fail-before/
+// pass-after regression guard for the local-docker-vs-EC2 hibernate gap.
+//
+// On a SaaS / molecules-server tenant the CP provisioner is wired and the local
+// Docker provisioner is nil. Step 2 of HibernateWorkspace MUST route the
+// container stop through StopWorkspaceAuto (which dispatches to cpProv), NOT the
+// old inlined `else if h.provisioner != nil { Stop }` — that branch silently
+// no-op'd here, flipping the row to 'hibernated' + url=” while the container
+// KEPT RUNNING and serving A2A (verified live on staging: container stayed "Up"
+// while GET reported hibernated). This mirrors TestStopWorkspaceAuto_RoutesToCPWhenSet
+// but exercises the HIBERNATE call site specifically. Before the fix cpProv.Stop
+// is never invoked and this fails; after, it is invoked exactly once.
+func TestHibernateWorkspace_RoutesStopToCPWhenOnlyCPWired(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	rec := &trackingCPProv{}
+	handler.SetCPProvisioner(rec) // cpProv wired, local Docker provisioner nil (SaaS/molecules-server shape)
+
+	wsID := "ws-hibernate-cp-stop"
+
+	// Step 1: atomic claim UPDATE succeeds (online/degraded + active_tasks=0).
+	mock.ExpectExec(`UPDATE workspaces`).
+		WithArgs(wsID, models.StatusHibernating).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Post-claim SELECT for name/tier.
+	mock.ExpectQuery(`SELECT name, tier FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier"}).AddRow("CP Agent", 2))
+	// Step 3: final UPDATE to 'hibernated' (fires regardless of stop outcome).
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(models.StatusHibernated, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Broadcaster inserts a structure_events row.
+	mock.ExpectExec(`INSERT INTO structure_events`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	handler.HibernateWorkspace(context.Background(), wsID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+	got := rec.stoppedSnapshot()
+	if len(got) != 1 || got[0] != wsID {
+		t.Fatalf("hibernate must stop the container via cpProv when only CP is wired; "+
+			"expected cpProv.Stop([%q]), got %v — the container would keep running (local-docker-vs-EC2 gap)", wsID, got)
 	}
 }
 
