@@ -116,6 +116,47 @@ func TestPluginInstall_RestartExplicitTrue(t *testing.T) {
 	}
 }
 
+// TestPluginInstall_RestartingReflectsActualScheduling — the "restarting"
+// response field must report what the DELIVERY step actually did, not echo
+// the request: with no restartFunc wired, no restart can ever be scheduled,
+// so the response must say false even though the caller asked for the
+// default restart-on. (The skill-content-only skip shares the same
+// reporting path inside deliverViaDocker; it needs a live docker container
+// to exercise, so the nil-hook case stands in for "delivery decided not to
+// restart".)
+func TestPluginInstall_RestartingReflectsActualScheduling(t *testing.T) {
+	registry := t.TempDir()
+	stagePluginRegistry(t, registry, "browser-automation")
+	stubInstallPluginViaEIC(t, func(ctx context.Context, instanceID, runtime, pluginName, stagedDir string) error {
+		return nil
+	})
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	expectAllowlistAllowAll(mock)
+
+	h := NewPluginsHandler(registry, nil, nil). // restartFunc NOT wired
+							WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
+							WithInstanceIDLookup(func(string) (string, error) { return "i-0e0951a3cfd9bbf75", nil })
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-no-hook"}}
+	c.Request = httptest.NewRequest(
+		"POST", "/workspaces/ws-no-hook/plugins",
+		bytes.NewBufferString(`{"source":"local://browser-automation"}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.Install(c)
+	drainTestAsync()
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if decodeRestarting(t, w) {
+		t.Errorf("restarting = true, want false — no restartFunc is wired, nothing was scheduled")
+	}
+}
+
 func TestPluginInstall_RestartFalseSuppressed(t *testing.T) {
 	w, restarts := driveInstall(t, `{"source":"local://browser-automation","restart":false}`)
 	if w.Code != http.StatusOK {

@@ -391,19 +391,25 @@ func (h *PluginsHandler) resolveAndStage(ctx context.Context, req installRequest
 //  2. instance_id set → SHAPE-routed (isEC2InstanceID, mirrors
 //     files_backend_dispatch.go):
 //     2a. real "i-<hex>" EC2 id (AWS SaaS) → push via EIC SSH to the EC2's
-//         bind-mounted /configs/plugins/<name>/ (template_files_eic.go).
+//     bind-mounted /configs/plugins/<name>/ (template_files_eic.go).
 //     2b. anything else = a local-docker / molecules-server CONTAINER NAME
-//         ("mol-ws-<slug>-<hex>", which the CP local-docker provisioner
-//         persists into instance_id) → docker CopyToContainer straight into
-//         THAT container, when a docker client is wired. NEVER the AWS EIC
-//         path (that 90-120s-times-out with no AWS creds → 502; core#182).
+//     ("mol-ws-<slug>-<hex>", which the CP local-docker provisioner
+//     persists into instance_id) → docker CopyToContainer straight into
+//     THAT container, when a docker client is wired. NEVER the AWS EIC
+//     path (that 90-120s-times-out with no AWS creds → 502; core#182).
 //     2c. local-docker id but no docker client wired → fail LOUD (503),
-//         never a silent 90s AWS EIC timeout.
+//     never a silent 90s AWS EIC timeout.
 //  3. Neither wired → 503. True "no backend" case.
 //
 // The SaaS branch is gated on h.instanceIDLookup so unit tests can keep
 // using NewPluginsHandler without a DB; production wires it in router.go.
-func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID string, r *stageResult) error {
+// The boolean return reports whether a restart was ACTUALLY scheduled —
+// false when the caller suppressed it (restart=false), when the change
+// classified as skill-content-only, or when no restartFunc is wired. The
+// Install handler echoes it as the response's "restarting" field so a
+// SELF-installing agent is never told its session is ending when the
+// delivery deliberately skipped the restart.
+func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID string, r *stageResult) (bool, error) {
 	if containerName := h.findRunningContainer(ctx, workspaceID); containerName != "" {
 		return h.deliverViaDocker(ctx, workspaceID, containerName, r)
 	}
@@ -413,7 +419,7 @@ func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID str
 		if isEC2InstanceID(instanceID) {
 			if err := installPluginViaEIC(ctx, instanceID, runtime, r.PluginName, r.StagedDir); err != nil {
 				log.Printf("Plugin install: EIC push failed for %s → %s: %v", r.PluginName, workspaceID, err)
-				return newHTTPErr(http.StatusBadGateway, gin.H{
+				return false, newHTTPErr(http.StatusBadGateway, gin.H{
 					"error": "failed to deliver plugin to workspace EC2",
 				})
 			}
@@ -421,8 +427,9 @@ func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID str
 				// RFC internal#524 Layer 1: see Docker path above.
 				wsID := workspaceID
 				globalGoAsync(func() { h.restartFunc(wsID) })
+				return true, nil
 			}
-			return nil
+			return false, nil
 		}
 
 		// molecules-server / local-docker backend: instance_id IS the running
@@ -438,20 +445,22 @@ func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID str
 		// "prov==nil and no reachable docker daemon" misconfiguration. Fail
 		// LOUD instead of masking it as a 90s AWS EIC timeout → 502.
 		log.Printf("Plugin install: workspace %s is on the local-docker backend (instance_id=%s) but this server has no docker client; refusing to fall back to AWS EIC", workspaceID, instanceID)
-		return newHTTPErr(http.StatusServiceUnavailable, gin.H{
+		return false, newHTTPErr(http.StatusServiceUnavailable, gin.H{
 			"error": "workspace runs on the local-docker backend but this server has no docker client (prov==nil and no reachable docker daemon)",
 		})
 	}
 
-	return newHTTPErr(http.StatusServiceUnavailable, gin.H{"error": "workspace container not running"})
+	return false, newHTTPErr(http.StatusServiceUnavailable, gin.H{"error": "workspace container not running"})
 }
 
 // deliverViaDocker copies the staged plugin dir into containerName via docker
 // CopyToContainer, chowns it for the agent user (uid 1000), and triggers a
-// restart unless the change is skill-content-only. Shared by the self-host
-// ws-<id> branch and the molecules-server mol-ws-* (instance_id) branch —
-// docker delivery is identical once we know which container to write into.
-func (h *PluginsHandler) deliverViaDocker(ctx context.Context, workspaceID, containerName string, r *stageResult) error {
+// restart unless the change is skill-content-only or the caller suppressed
+// it. Shared by the self-host ws-<id> branch and the molecules-server
+// mol-ws-* (instance_id) branch — docker delivery is identical once we know
+// which container to write into. The boolean reports whether a restart was
+// actually scheduled (see deliverToContainer).
+func (h *PluginsHandler) deliverViaDocker(ctx context.Context, workspaceID, containerName string, r *stageResult) (bool, error) {
 	// Hot-reload classifier (molecule-core#112) — decide BEFORE the
 	// install whether this update can skip restartFunc. SKILL.md
 	// content changes are filesystem-visible to Claude Code on the
@@ -469,7 +478,7 @@ func (h *PluginsHandler) deliverViaDocker(ctx context.Context, workspaceID, cont
 	// refuse to load a plugin dir without it.
 	if err := h.atomicCopyToContainer(ctx, containerName, r.StagedDir, r.PluginName); err != nil {
 		log.Printf("Plugin install: failed to copy %s to %s (container %s): %v", r.PluginName, workspaceID, containerName, err)
-		return newHTTPErr(http.StatusInternalServerError, gin.H{"error": "failed to copy plugin to container"})
+		return false, newHTTPErr(http.StatusInternalServerError, gin.H{"error": "failed to copy plugin to container"})
 	}
 	h.execAsRoot(ctx, containerName, []string{
 		"chown", "-R", "1000:1000", "/configs/plugins/" + r.PluginName,
@@ -484,9 +493,10 @@ func (h *PluginsHandler) deliverViaDocker(ctx context.Context, workspaceID, cont
 			// workspace.go:globalGoAsync).
 			wsID := workspaceID
 			globalGoAsync(func() { h.restartFunc(wsID) })
+			return true, nil
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // lookupSaaSDispatch returns (instance_id, runtime) for SaaS dispatch, or
@@ -633,9 +643,12 @@ func (h *PluginsHandler) ResolveAndStageForApply(ctx context.Context, req instal
 }
 
 // DeliverForApply is the context-based equivalent of deliverToContainer,
-// exposed for the admin plugin drift apply endpoint (core#123).
+// exposed for the admin plugin drift apply endpoint (core#123). The
+// restart-scheduled signal is not consumed here — the drift apply path
+// manages restarts itself via GetRestartFunc.
 func (h *PluginsHandler) DeliverForApply(ctx context.Context, workspaceID string, r *stageResult) error {
-	return h.deliverToContainer(ctx, workspaceID, r)
+	_, err := h.deliverToContainer(ctx, workspaceID, r)
+	return err
 }
 
 // GetRestartFunc returns the pluginsHandler's restartFunc, or nil if not set.
