@@ -4,17 +4,22 @@ name: staging-tenant-cd
 #
 # The deploy half of the tenant auto-update loop, mirroring the control-plane's
 # own gated pipeline (molecule-controlplane/.gitea/workflows/
-# local-cp-deploy-pipeline.yml). A push to `staging` that changes the tenant
-# image sources flows through a STRUCTURALLY-GATED job chain:
+# local-cp-deploy-pipeline.yml), which likewise triggers on push to `main`. The
+# operator model is TRUNK-BASED: every `main` merge is the staging candidate, so
+# a push to `main` that changes the tenant image sources flows through a
+# STRUCTURALLY-GATED job chain:
 #
 #   await-image -> e2e-smoke -> advance-pin -> redeploy-fleet
 #                  ^^^^^^^^^
 #                  HARD GATE (real staging provision + A2A-serve e2e)
 #
 # THE LOOP (build half + deploy half)
-#   publish-workspace-server-image.yml  (BUILD)  — on the same `staging` push,
-#     builds the tenant image and pushes :staging-<sha> + :staging-latest to
-#     registry.moleculesai.app via the chunked pusher.
+#   publish-workspace-server-image.yml  (BUILD)  — already triggers on push:[main]
+#     (and legacy [staging]); on the same `main` push it builds the tenant image
+#     and pushes :staging-<sha> + :staging-latest to registry.moleculesai.app via
+#     the chunked pusher (:staging-<sha> is computed from the head SHA regardless
+#     of branch, so THIS workflow — firing on the same `main` SHA — awaits the
+#     exact per-commit artifact the build produced).
 #   staging-tenant-cd.yml               (THIS)    — awaits that :staging-<sha>
 #     artifact, gates on a real staging e2e, advances the staging image pin, and
 #     rolls the running staging tenant fleet onto it (session-preserving).
@@ -50,8 +55,14 @@ name: staging-tenant-cd
 # the existing e2e-workspace-lifecycle.yml staging job it reuses).
 
 on:
+  # TRUNK-BASED: fire on push to `main` (NOT the abandoned `staging` branch,
+  # which is ~2809 commits behind main, diverged 2026-05-18, and does not even
+  # contain this workflow — so a `push:[staging]` trigger could never fire). This
+  # matches the control-plane deploy (local-cp-deploy-pipeline.yml, push:[main])
+  # and the build half (publish-workspace-server-image.yml, push:[main,staging]),
+  # so every main merge that touches the tenant runs the full staging CD.
   push:
-    branches: [staging]
+    branches: [main]
     paths:
       - 'workspace-server/**'
       - 'canvas/**'
@@ -68,7 +79,7 @@ on:
   workflow_dispatch: {}
 
 # Serialize the WHOLE pipeline GLOBALLY (one static group, NOT keyed on ref) so a
-# workflow_dispatch and a staging push never overlap two fleet rolls / two pin
+# workflow_dispatch and a main push never overlap two fleet rolls / two pin
 # writes. cancel-in-progress:false — never abort an in-flight roll (each swap is
 # health-gated + self-rolls-back, so a completed predecessor is always good).
 concurrency:
