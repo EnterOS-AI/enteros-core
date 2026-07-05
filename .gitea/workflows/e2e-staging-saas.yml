@@ -1431,10 +1431,12 @@ jobs:
         run: |
           # No STAGING_E2E / creds → the suite MUST skip (not pass-with-zero-
           # assertions). go test exit 0 with a SKIP line is the contract.
-          out=$(go test -tags staging_e2e ./internal/staginge2e/ -run TestConciergePlatformAgent -count=1 -v 2>&1)
+          out=$(go test -tags staging_e2e ./internal/staginge2e/ -run 'TestConciergePlatformAgent|TestPlatformAgentMgmtMCP' -count=1 -v 2>&1)
           echo "$out"
           echo "$out" | grep -q "SKIP: TestConciergePlatformAgent_Staging" \
             || { echo "::error::expected a LOUD skip of TestConciergePlatformAgent_Staging without creds"; exit 1; }
+          echo "$out" | grep -q "SKIP: TestPlatformAgentMgmtMCP_Staging" \
+            || { echo "::error::expected a LOUD skip of TestPlatformAgentMgmtMCP_Staging without creds"; exit 1; }
 
   # bp-required: pending #2430
   e2e-staging-concierge-platform:
@@ -1521,8 +1523,20 @@ jobs:
       - name: Run concierge/platform-agent staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestConciergePlatformAgent_Staging -count=1 -v -timeout 35m
+      # Fresh-org platform-agent MANAGEMENT-MCP present+callable gate. The step
+      # above (TestConciergePlatformAgent_Staging) asserts only DB/handler state
+      # and NEVER waits for the concierge to boot online, so a fresh platform
+      # agent that can't load its mgmt MCP still passes it. This one provisions a
+      # fresh org and requires the concierge to reach status=online (RCA #2970
+      # makes that unreachable without mcp_server_present=true) + the
+      # provision_workspace verb loaded — it goes RED on the operator "test14"
+      # fresh-org failure (mgmt-MCP plugin absent) and green once the fleet runs a
+      # runtime that can resolve the CP's presign:// declared plugin sources.
+      - name: Run fresh-org platform-agent mgmt-MCP staginge2e
+        working-directory: workspace-server
+        run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPlatformAgentMgmtMCP_Staging -count=1 -v -timeout 30m
       # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
-      # (e2e-cncrg-* slug), running even on a t.Fatal. The age-guarded
+      # (e2e-cncrg-* / e2e-mcp-* slug), running even on a t.Fatal. The age-guarded
       # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
       # net for a tenant orphaned by a hard runner cancel.
 
