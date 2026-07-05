@@ -1091,11 +1091,29 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// On INSERT (workspace not yet created via POST /workspaces), use ID as name placeholder.
 	// Keep existing URL if provisioner already set a host-accessible one (starts with http://127.0.0.1).
 	//
-	// #73 guard: `WHERE workspaces.status IS DISTINCT FROM 'removed'` prevents
-	// a late heartbeat from a workspace that was just deleted from resurrecting
-	// the row. Without this guard, bulk deletes left tier-3 stragglers because
+	// #73 guard: `WHERE workspaces.status NOT IN ('removed', 'paused',
+	// 'hibernated')` prevents a late register/heartbeat from a workspace that
+	// is deliberately dormant (or was just deleted) from resurrecting the row.
+	// Without the 'removed' arm, bulk deletes left tier-3 stragglers because
 	// the last pre-teardown heartbeat flipped status back to 'online' after
 	// Delete's UPDATE.
+	//
+	// The 'paused'/'hibernated' arms close the workspace-lifecycle e2e-smoke
+	// pause_resume / hibernate_wake race (core#2332): Pause/Hibernate genuinely
+	// STOP the container, but the stop is not instantaneous — the doomed
+	// container (or the freshly re-provisioned one from a just-preceding
+	// Restart) can fire one more /registry/register a few seconds later. Because
+	// the non-platform CASE arm below FORCES status→'online', that lingering
+	// register clobbered the row back to 'online' (with url repopulated) AFTER
+	// Pause/Hibernate parked it. The e2e then saw resume→404 'not found or not
+	// paused' (row was 'online', not 'paused') and hibernate→404 'not in a
+	// hibernatable state'. A deliberately-parked workspace must be inviolable to
+	// container-driven re-register: only the explicit Resume/WakeWorkspace
+	// handlers may transition it out of dormancy. Mirrors the liveness monitor's
+	// existing `NOT IN ('removed','paused','hibernated')` guard
+	// (registry/liveness.go) and the heartbeat's status-preserving CASE.
+	// Resume/Wake set status='provisioning' first, so their post-relaunch
+	// register still promotes provisioning→online normally.
 	// kind ($6) is the raw payload value (validated above; "" = unspecified).
 	// COALESCE(NULLIF($6,''), …) means: an explicit kind wins; an unspecified
 	// kind defaults to 'workspace' for a NEW row and KEEPS the existing kind on
@@ -1153,7 +1171,7 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 			delivery_mode = EXCLUDED.delivery_mode,
 			kind = COALESCE(NULLIF($6, ''), workspaces.kind),
 			updated_at = now()
-		WHERE workspaces.status IS DISTINCT FROM 'removed'
+		WHERE workspaces.status NOT IN ('removed', 'paused', 'hibernated')
 	`, payload.ID, payload.ID, urlForUpsert, agentCardStr, modeForUpsert, payload.Kind)
 	if err != nil {
 		if isPlatformRootViolation(err) {
