@@ -181,6 +181,14 @@ type installRequest struct {
 	// workspace_plugins rows where tracked_ref != 'none' and queues
 	// updates when upstream resolves to a different SHA.
 	Track string `json:"track,omitempty"`
+	// Restart controls the post-install auto-restart (self-reprovision,
+	// design §5.2). nil or true → existing behavior: the workspace restarts
+	// so boot-install re-establishes /configs/plugins from the desired-set
+	// (declared ∪ installed). false → deliver + record ONLY; the caller
+	// owns triggering the restart later (e.g. batching several installs
+	// into one reprovision). A *bool so an absent field is distinguishable
+	// from an explicit false — absent must keep the historical default.
+	Restart *bool `json:"restart,omitempty"`
 }
 
 // stageResult bundles the outputs of resolveAndStage for the caller.
@@ -190,6 +198,12 @@ type stageResult struct {
 	PluginName   string
 	Source       plugins.Source
 	InstalledSHA string // empty for local:// sources (no meaningful upstream)
+	// SuppressRestart carries the caller's restart=false request into the
+	// delivery step (deliverViaDocker / EIC), which owns the restart
+	// decision. Set by Install from installRequest.Restart; never set by
+	// resolveAndStage itself, so the reconcile / drift-apply paths keep
+	// their existing restart behavior (zero value = restart as before).
+	SuppressRestart bool
 }
 
 // resolveAndStage parses a validated request, dispatches to the right
@@ -403,7 +417,7 @@ func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID str
 					"error": "failed to deliver plugin to workspace EC2",
 				})
 			}
-			if h.restartFunc != nil {
+			if h.restartFunc != nil && !r.SuppressRestart {
 				// RFC internal#524 Layer 1: see Docker path above.
 				wsID := workspaceID
 				globalGoAsync(func() { h.restartFunc(wsID) })
@@ -461,7 +475,9 @@ func (h *PluginsHandler) deliverViaDocker(ctx context.Context, workspaceID, cont
 		"chown", "-R", "1000:1000", "/configs/plugins/" + r.PluginName,
 	})
 	if h.restartFunc != nil {
-		if kind == classifyKindSkillContentOnly {
+		if r.SuppressRestart {
+			log.Printf("Plugin install: %s → workspace %s — restart suppressed by caller (restart=false); boot-install picks it up on the next reprovision", r.PluginName, workspaceID)
+		} else if kind == classifyKindSkillContentOnly {
 			log.Printf("Plugin install: %s → workspace %s — SKILL-content-only update, SKIPPING restart", r.PluginName, workspaceID)
 		} else {
 			// RFC internal#524 Layer 1: drain via globalGoAsync (see

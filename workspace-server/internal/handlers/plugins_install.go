@@ -73,6 +73,13 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 	}
 	defer os.RemoveAll(result.StagedDir)
 
+	// Self-reprovision flow (design §5.2): restart defaults ON (nil/true —
+	// the historical behavior). An explicit {"restart": false} delivers +
+	// records only; the caller owns the later restart. Carried on the
+	// stageResult because the delivery step (docker/EIC) owns the restart.
+	restartRequested := req.Restart == nil || *req.Restart
+	result.SuppressRestart = !restartRequested
+
 	// Org plugin allowlist gate (#591).
 	// If the workspace's org has a non-empty allowlist, the plugin must be
 	// on it. An empty allowlist means allow-all (backward compat).
@@ -99,11 +106,16 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 		log.Printf("Plugin install: failed to record %s for %s in workspace_plugins: %v (install succeeded; tracking row missing)", result.PluginName, workspaceID, err)
 	}
 
-	log.Printf("Plugin install: %s via %s → workspace %s (restarting)", result.PluginName, result.Source.Scheme, workspaceID)
+	log.Printf("Plugin install: %s via %s → workspace %s (restarting=%t)", result.PluginName, result.Source.Scheme, workspaceID, restartRequested)
+	// "restarting" tells the caller whether a reprovision was scheduled —
+	// vital for an agent installing on ITSELF (its own session is about to
+	// end; it resumes via the post-reprovision wake note). Best-effort: a
+	// SKILL-content-only update may still skip the restart internally.
 	c.JSON(http.StatusOK, gin.H{
-		"status": "installed",
-		"plugin": result.PluginName,
-		"source": result.Source.Raw(),
+		"status":     "installed",
+		"plugin":     result.PluginName,
+		"source":     result.Source.Raw(),
+		"restarting": restartRequested,
 	})
 }
 
