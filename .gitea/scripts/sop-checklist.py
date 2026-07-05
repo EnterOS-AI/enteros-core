@@ -957,6 +957,31 @@ def render_status(
     return state, " — ".join(desc_parts)
 
 
+def apply_ack_enforcement_policy(
+    state: str, description: str, enforced: bool
+) -> tuple[str, str]:
+    """OPERATOR RELAX (until the agent team exists): map the computed ack
+    verdict onto the POSTed status per the MERGE_REQUIRE_SOP_ACK org var.
+
+    - enforced=True  (MERGE_REQUIRE_SOP_ACK == 'true'): verdict passes through
+      untouched — full enforcement.
+    - enforced=False (var unset / 'false' / anything else): the FULL ack
+      evaluation still runs and its real verdict is preserved inside the
+      description, but the posted state is coerced to success with the
+      'ack advisory until agent-team' prefix, so the gate reports and never
+      blocks while the team that would ack does not exist yet. Flipping the
+      org var to 'true' restores enforcement with zero code change.
+
+    Pure function so the policy is unit-testable (test_sop_checklist.py).
+    """
+    if enforced or state == "success":
+        return state, description
+    return (
+        "success",
+        f"ack advisory until agent-team — would be {state}: {description}",
+    )
+
+
 def is_high_risk(pr: dict[str, Any], cfg: dict[str, Any]) -> bool:
     """Return True when the PR is high-risk per RFC#450 Option C.
 
@@ -1287,6 +1312,23 @@ def main(argv: list[str] | None = None) -> int:
             f"[volume-skipped] comment-cap={max_comments_cap} hit; please file "
             f"a fresh PR with bot-relay history split off (#369). {description}"
         )
+
+    # OPERATOR RELAX: peer-ack enforcement is gated on the org-level Actions
+    # variable MERGE_REQUIRE_SOP_ACK (workflow env; default false/unset =>
+    # ADVISORY). The full evaluation above already ran; only the posted
+    # state/description are mapped here (see apply_ack_enforcement_policy).
+    ack_enforced = (
+        (os.environ.get("MERGE_REQUIRE_SOP_ACK") or "").strip().lower() == "true"
+    )
+    new_state, new_description = apply_ack_enforcement_policy(
+        state, description, ack_enforced
+    )
+    if (new_state, new_description) != (state, description):
+        print(
+            f"::notice::MERGE_REQUIRE_SOP_ACK != 'true' — ack gate is ADVISORY; "
+            f"real verdict was '{state}'"
+        )
+    state, description = new_state, new_description
 
     # Diagnostics to job log.
     print(

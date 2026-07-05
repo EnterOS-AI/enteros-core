@@ -11,11 +11,21 @@ name: E2E Workspace Lifecycle (staginge2e)
 # + url-cleared-on-stop) — not just HTTP 200.
 #
 # ADVISORY-BY-INFRA. It needs a live staging tenant (a cold molecules-server / local-docker
-# provision, was the ~30+ min cold EC2 path), so the real run is workflow_dispatch / schedule
+# provision, was the ~30+ min cold EC2 path), so the real run is workflow_dispatch
 # only — NOT per-PR and NOT a
 # required check. Promotion to a required branch-protection context is a separate
 # CTO decision (mirrors the cp internal/staginge2e suite, cp#386, and the
 # peer-visibility flip-to-required pattern, molecule-core#1296).
+#
+# SPLIT (main-status coherence): the real staging job now lives in its own
+# dispatch-only workflow, e2e-workspace-lifecycle-staging.yml. When it was a
+# job HERE behind `if: workflow_dispatch || schedule`, every push/PR run of
+# this workflow auto-published a `skipped` commit status for it
+# (`E2E Workspace Lifecycle (staginge2e) / E2E Workspace Lifecycle (staging)
+# (push)`) on every main HEAD — permanent skip-noise on the default branch's
+# status surface. A dispatch-only workflow posts NO status on push/PR at all,
+# and posts its REAL verdict when actually dispatched. Same trust model, same
+# suite, zero behavior change for the compile gate below.
 #
 # HONEST GATE — NO continue-on-error mask (feedback_fix_root_not_symptom). The
 # PR job validates that the suite COMPILES under -tags=staging_e2e and SKIPs LOUD
@@ -27,9 +37,10 @@ name: E2E Workspace Lifecycle (staginge2e)
 
 on:
   # group A: staging added alongside main so the compile+skip PR gate runs on both protected
-  # branches. The real lifecycle-staging job (below) provisions on molecules-server (local-docker)
-  # via E2E_PROVIDER and stays dispatch/schedule-only — a 30-60 min cold provision is not a
-  # per-PR cost (the cheap per-PR coverage is the compile+skip gate here + local-provision-e2e).
+  # branches. The real lifecycle-staging job (e2e-workspace-lifecycle-staging.yml) provisions on
+  # molecules-server (local-docker) via E2E_PROVIDER and stays dispatch-only — a 30-60 min cold
+  # provision is not a per-PR cost (the cheap per-PR coverage is the compile+skip gate here +
+  # local-provision-e2e).
   push:
     branches: [main, staging]
     paths:
@@ -89,100 +100,3 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "SKIP: TestWorkspaceLifecycle_Staging" \
             || { echo "::error::expected a LOUD skip of TestWorkspaceLifecycle_Staging without creds"; exit 1; }
-
-  # Real STAGING gate: provisions a throwaway tenant, drives the lifecycle
-  # endpoints, asserts observable transitions, scoped teardown.
-  # dispatch / schedule only (cold molecules-server / local-docker provision).
-  lifecycle-staging:
-    name: E2E Workspace Lifecycle (staging)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    timeout-minutes: 60
-    env:
-      CP_BASE_URL: https://staging-api.moleculesai.app
-      # Compute backend: molecules-server (local-docker). adminCreateOrg in the staginge2e
-      # suite reads E2E_PROVIDER and pins it into the org-create body so the tenant does not
-      # fall back to the CP DefaultProvider (the closed AWS EC2 path).
-      E2E_PROVIDER: molecules-server
-      # CP_ADMIN_API_TOKEN now arrives via $GITHUB_ENV from the "Fetch staging CP
-      # admin token from Infisical KMS" step below (wave-B staging consumers
-      # migration). It is sourced from Infisical CP_ADMIN_API_TOKEN at
-      # staging /shared/controlplane-admin. The old CP_STAGING_ADMIN_API_TOKEN
-      # Gitea Actions secret is left in place until a green run validates this
-      # path (validate-before-delete). The Verify-admin-token gate still
-      # validates CP_ADMIN_API_TOKEN is non-empty.
-      STAGING_E2E: '1'
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: 'stable'
-          # cache:false — the self-hosted runner bind-mounts a persistent
-          # GOCACHE/GOMODCACHE (/var/cache/ci-go-{build,mod}); actions/cache is
-          # redundant and corrupts it by untarring over the bind mount ("File
-          # exists" -> "Failed to restore" -> partial cache -> linker/typecheck
-          # errors on heavy jobs, e.g. test -race link "too many errors" and
-          # go-arch-lint "without types"). Fleet sweep after the cp ci.yml find.
-          cache: false
-          cache-dependency-path: workspace-server/go.sum
-      # KMS wave-B (Gitea-Actions-secrets -> Infisical SSOT): source the staging
-      # CP admin bearer (CP_ADMIN_API_TOKEN @ staging /shared/controlplane-admin)
-      # from Infisical via the CI machine identity instead of the duplicated
-      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret. Exported to $GITHUB_ENV
-      # under the same CP_ADMIN_API_TOKEN name the verify + test steps already read.
-      #
-      # TRUSTED-REF GATING: molecule-core is a PUBLIC repo; this step consumes
-      # the INFISICAL_CI_* machine-identity secrets. This job already only runs on
-      # workflow_dispatch / schedule (job-level `if:` above), so it can never run
-      # with an untrusted-fork PR's code in the tree.
-      - name: Fetch staging CP admin token from Infisical KMS
-        id: kms_admin
-        env:
-          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
-          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
-          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
-        run: |
-          set -uo pipefail
-          BASE="https://key.moleculesai.app"
-          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
-            -H 'Content-Type: application/json' \
-            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
-          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
-          read_secret() {
-            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=$2" \
-              -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
-          }
-          CP_ADMIN_API_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
-          echo "::add-mask::$CP_ADMIN_API_TOKEN"
-          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
-            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
-            exit 1
-          fi
-          echo "CP_ADMIN_API_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
-          echo "CP_ADMIN_API_TOKEN loaded from Infisical staging SSOT (len=${#CP_ADMIN_API_TOKEN})"
-      - name: Verify admin token present
-        run: |
-          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
-            exit 2
-          fi
-          echo "Admin token present"
-      - name: CP staging health preflight
-        run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
-          if [ "$code" != "200" ]; then
-            echo "::error::Staging CP unhealthy (HTTP $code) — infra, not a lifecycle bug. Failing loud per feedback_fix_root_not_symptom."
-            exit 1
-          fi
-          echo "Staging CP healthy"
-      - name: Run workspace-lifecycle staginge2e
-        working-directory: workspace-server
-        run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceLifecycle_Staging -count=1 -v -timeout 50m
-      # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
-      # (runs even on a Fatal). We deliberately do NOT add a broad in-workflow
-      # "sweep all e2e-life-* slugs" net here — that could delete a concurrently
-      # running dispatch's fresh tenant (the slug is not run-id scoped). The
-      # age-guarded `sweep-stale-e2e-orgs` workflow (30-min floor, e2e- prefix)
-      # is the final safety net for a tenant orphaned by a hard runner cancel.
