@@ -672,7 +672,7 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 		t.Setenv("PLATFORM_URL", "http://platform:8080")
 		t.Setenv("MOLECULE_ORG_ID", "org-123")
 		env := map[string]string{}
-		conciergePlatformMCPEnv(env)
+		conciergePlatformMCPEnv(env, "ws-self-1")
 		if env["MOLECULE_API_KEY"] != "admintok" {
 			t.Errorf("MOLECULE_API_KEY = %q, want admintok", env["MOLECULE_API_KEY"])
 		}
@@ -682,12 +682,18 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 		if env["MOLECULE_ORG_ID"] != "org-123" {
 			t.Errorf("MOLECULE_ORG_ID = %q, want org-123", env["MOLECULE_ORG_ID"])
 		}
+		// SELF default for the management MCP (install_plugin /
+		// get_conversation_history): the concierge's own workspace id
+		// must ride the env so "act on MY OWN workspace" works zero-config.
+		if env["MOLECULE_WORKSPACE_ID"] != "ws-self-1" {
+			t.Errorf("MOLECULE_WORKSPACE_ID = %q, want ws-self-1", env["MOLECULE_WORKSPACE_ID"])
+		}
 	})
 
 	t.Run("does not clobber existing values", func(t *testing.T) {
 		t.Setenv("ADMIN_TOKEN", "admintok")
 		env := map[string]string{"MOLECULE_API_KEY": "preset"}
-		conciergePlatformMCPEnv(env)
+		conciergePlatformMCPEnv(env, "ws-self-1")
 		if env["MOLECULE_API_KEY"] != "preset" {
 			t.Errorf("MOLECULE_API_KEY overwritten to %q, want preset preserved", env["MOLECULE_API_KEY"])
 		}
@@ -697,7 +703,7 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 		t.Setenv("MOLECULE_API_URL", "http://explicit:9000")
 		t.Setenv("PLATFORM_URL", "http://platform:8080")
 		env := map[string]string{}
-		conciergePlatformMCPEnv(env)
+		conciergePlatformMCPEnv(env, "ws-self-1")
 		if env["MOLECULE_API_URL"] != "http://explicit:9000" {
 			t.Errorf("MOLECULE_API_URL = %q, want the explicit env", env["MOLECULE_API_URL"])
 		}

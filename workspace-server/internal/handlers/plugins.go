@@ -78,7 +78,10 @@ func (h *PluginsHandler) deliver(ctx context.Context, workspaceID string, r *sta
 	if h.deliverOverride != nil {
 		return h.deliverOverride(ctx, workspaceID, r)
 	}
-	return h.deliverToContainer(ctx, workspaceID, r)
+	// The reconcile callers don't consume the restart-scheduled signal —
+	// only the interactive Install handler echoes it to its caller.
+	_, err := h.deliverToContainer(ctx, workspaceID, r)
+	return err
 }
 
 // NewPluginsHandler constructs a PluginsHandler with the default source

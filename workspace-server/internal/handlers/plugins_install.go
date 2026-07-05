@@ -73,6 +73,12 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 	}
 	defer os.RemoveAll(result.StagedDir)
 
+	// Self-reprovision flow (design §5.2): restart defaults ON (nil/true —
+	// the historical behavior). An explicit {"restart": false} delivers +
+	// records only; the caller owns the later restart. Carried on the
+	// stageResult because the delivery step (docker/EIC) owns the restart.
+	result.SuppressRestart = req.Restart != nil && !*req.Restart
+
 	// Org plugin allowlist gate (#591).
 	// If the workspace's org has a non-empty allowlist, the plugin must be
 	// on it. An empty allowlist means allow-all (backward compat).
@@ -81,7 +87,8 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 		return
 	}
 
-	if err := h.deliverToContainer(ctx, workspaceID, result); err != nil {
+	restartScheduled, err := h.deliverToContainer(ctx, workspaceID, result)
+	if err != nil {
 		var he *httpErr
 		if errors.As(err, &he) {
 			c.JSON(he.Status, he.Body)
@@ -99,11 +106,18 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 		log.Printf("Plugin install: failed to record %s for %s in workspace_plugins: %v (install succeeded; tracking row missing)", result.PluginName, workspaceID, err)
 	}
 
-	log.Printf("Plugin install: %s via %s → workspace %s (restarting)", result.PluginName, result.Source.Scheme, workspaceID)
+	log.Printf("Plugin install: %s via %s → workspace %s (restarting=%t)", result.PluginName, result.Source.Scheme, workspaceID, restartScheduled)
+	// "restarting" reports whether a restart was ACTUALLY scheduled by the
+	// delivery step — vital for an agent installing on ITSELF (its own
+	// session is about to end; it resumes via the post-reprovision wake
+	// note). It is false when the caller sent restart=false, when the
+	// change classified as skill-content-only (hot-reloadable — no restart
+	// needed or scheduled), or when no restart hook is wired.
 	c.JSON(http.StatusOK, gin.H{
-		"status": "installed",
-		"plugin": result.PluginName,
-		"source": result.Source.Raw(),
+		"status":     "installed",
+		"plugin":     result.PluginName,
+		"source":     result.Source.Raw(),
+		"restarting": restartScheduled,
 	})
 }
 
