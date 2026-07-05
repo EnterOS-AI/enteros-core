@@ -151,7 +151,7 @@ func defaultPlatformAgentName() string {
 // non-platform workspace. Best-effort: when ADMIN_TOKEN is unset (pure-local dev
 // with AdminAuth fail-open) the key is simply absent and the MCP — which only
 // runs on the platform-agent image anyway — is unauthenticated locally.
-func conciergePlatformMCPEnv(env map[string]string) {
+func conciergePlatformMCPEnv(env map[string]string, workspaceID string) {
 	setIfAbsent := func(k, v string) {
 		if v == "" {
 			return
@@ -160,6 +160,12 @@ func conciergePlatformMCPEnv(env map[string]string) {
 			env[k] = v
 		}
 	}
+	// The management MCP's SELF default: install_plugin / get_conversation_history
+	// fall back to MOLECULE_WORKSPACE_ID when workspace_id is omitted, making
+	// "act on MY OWN workspace" the zero-config case (self-reprovision §5.2).
+	// Without this the concierge's MCP env never carried its own id and the
+	// SELF default failed closed with INVALID_ARGUMENTS on every live agent.
+	setIfAbsent("MOLECULE_WORKSPACE_ID", workspaceID)
 	setIfAbsent("MOLECULE_API_KEY", os.Getenv("ADMIN_TOKEN"))
 	// The management-mode tool registry (mcp-server >=1.5.0,
 	// src/tools/management/client.ts) authenticates with
@@ -294,8 +300,8 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 		log.Printf("Provisioner: concierge %s could not declare %q plugin (recorded=%d skipped=%d) — management MCP may be absent until next provision", workspaceID, conciergePlatformMCPSource, rec, skip)
 	}
 
-	// 1. Platform-MCP env (org-admin token + platform URL + org id).
-	conciergePlatformMCPEnv(envVars)
+	// 1. Platform-MCP env (org-admin token + platform URL + org id + self id).
+	conciergePlatformMCPEnv(envVars, workspaceID)
 
 	// 2. Compose the concierge's /configs from its ACTUAL (switchable) runtime's
 	//    NATIVE base config + the runtime-agnostic persona, grafted per that
