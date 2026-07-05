@@ -195,9 +195,17 @@ jobs:
             exit 1
           fi
           echo "Staging CP healthy"
-      - name: Run workspace-lifecycle staginge2e (HARD GATE)
+      - name: Run workspace-lifecycle + fresh-org platform-agent mgmt-MCP staginge2e (HARD GATE)
         working-directory: workspace-server
-        run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceLifecycle_Staging -count=1 -v -timeout 50m
+        # TestWorkspaceLifecycle_Staging: a workspace serves A2A across restart/pause/hibernate.
+        # TestPlatformAgentMgmtMCP_Staging: a FRESH org's platform agent reaches online WITH its
+        #   management MCP present + provision_workspace callable (RCA #2970 online contract). The
+        #   lifecycle test only exercises a PLAIN claude-code workspace (no declared plugins), so it
+        #   cannot see a fresh openclaw concierge whose mgmt-MCP plugin never installed — the operator
+        #   "test14" failure (a presign:// declared source the deployed runtime could not resolve).
+        #   This makes the deploy gate go RED on that failure. BOTH must pass to advance the pin +
+        #   roll the fleet (needs-gated, un-bypassable).
+        run: go test -tags staging_e2e ./internal/staginge2e/ -run 'TestWorkspaceLifecycle_Staging|TestPlatformAgentMgmtMCP_Staging' -count=1 -v -timeout 50m
 
   advance-pin:
     name: advance-pin (staging LOCAL_TENANT_IMAGE)
