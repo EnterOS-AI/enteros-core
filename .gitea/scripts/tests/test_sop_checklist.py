@@ -535,10 +535,6 @@ class TestEndToEndAckFlow(unittest.TestCase):
         self.assertIn("body-unfilled: root-cause", desc)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 # ---------------------------------------------------------------------------
 # compute_na_state
 # ---------------------------------------------------------------------------
@@ -1642,3 +1638,75 @@ class TestFailClosedProtectedContext(unittest.TestCase):
             "conclusion, so a runner-dep failure fails the protected "
             "job. Per mc#2141.",
         )
+
+
+# ---------------------------------------------------------------------------
+# Minimal-YAML fallback parser (no-PyYAML runner path)
+# ---------------------------------------------------------------------------
+
+
+class TestMinimalYamlFallbackParsesRealConfig(unittest.TestCase):
+    """Regression: the no-PyYAML fallback (_load_config_minimal) must produce
+    the SAME shape as PyYAML for the real config.
+
+    The gate runtime (sop-checklist.yml) runs the script directly on a runner
+    that may lack PyYAML (the post-DNS-fix ci-meta act container). The prior
+    fallback mis-parsed:
+      * the top-level `high_risk_labels` list of quoted strings into single-key
+        dicts ({'"risk': 'high"'}) → set() in is_high_risk raised
+        `TypeError: unhashable type: 'dict'` on EVERY ci-meta run;
+      * the nested `n/a_gates` map-of-maps flattened one level, silently
+        dropping each gate's `required_teams` (N/A declarations fail-closed).
+
+    CI installs PyYAML (test-ops-scripts.yml), so these only surfaced on the
+    runner — hence this test exercises the fallback parser EXPLICITLY, not the
+    PyYAML-preferring load_config.
+    """
+
+    def setUp(self):
+        # Force the fallback regardless of whether PyYAML is installed here.
+        self.cfg = sop._load_config_minimal(CONFIG_PATH)
+
+    def test_high_risk_labels_parse_as_strings(self):
+        hrl = self.cfg["high_risk_labels"]
+        self.assertTrue(
+            all(isinstance(x, str) for x in hrl),
+            f"expected list[str], got {[type(x).__name__ for x in hrl]}",
+        )
+        self.assertIn("risk:high", hrl)
+        self.assertIn("area:gate-meta", hrl)
+
+    def test_is_high_risk_does_not_crash_on_fallback_config(self):
+        # The exact call site (set(high_risk_labels)) that raised pre-fix.
+        self.assertTrue(sop.is_high_risk({"labels": [{"name": "risk:high"}]}, self.cfg))
+        self.assertFalse(sop.is_high_risk({"labels": [{"name": "area:docs"}]}, self.cfg))
+        self.assertFalse(sop.is_high_risk({"labels": []}, self.cfg))
+
+    def test_na_gates_parse_nested_with_required_teams(self):
+        na = self.cfg["n/a_gates"]
+        self.assertEqual(set(na), {"qa-review", "security-review"})
+        self.assertIsInstance(na["qa-review"], dict)
+        self.assertEqual(
+            na["qa-review"]["required_teams"], ["qa", "security", "engineers"]
+        )
+        self.assertEqual(
+            na["security-review"]["required_teams"], ["security", "managers", "ceo"]
+        )
+
+    def test_items_and_inline_lists_intact_on_fallback(self):
+        items = self.cfg["items"]
+        self.assertEqual(len(items), 9)
+        by = {it["slug"]: it for it in items}
+        self.assertEqual(by["comprehensive-testing"]["required_teams"], ["qa", "engineers"])
+
+    def test_yaml_list_item_is_map_discriminates_quoted_scalar(self):
+        # Quoted scalar / bare scalar are NOT maps; `key: value` IS.
+        self.assertFalse(sop._yaml_list_item_is_map('"risk:high"'))
+        self.assertFalse(sop._yaml_list_item_is_map("'risk:high'"))
+        self.assertFalse(sop._yaml_list_item_is_map("bare-scalar"))
+        self.assertTrue(sop._yaml_list_item_is_map("slug: comprehensive-testing"))
+        self.assertTrue(sop._yaml_list_item_is_map("required_teams: [qa]"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
