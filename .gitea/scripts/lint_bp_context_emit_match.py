@@ -14,11 +14,14 @@ match when:
      job-key) equal to the context's job-part (between ` / ` and
      ` (`).
   3. The workflow's `on:` block includes the context's event-part
-     (in parens at the end), with Gitea's event-name mapping:
-        - `pull_request` and `pull_request_target` BOTH emit
-          `(pull_request)` contexts (verified empirically on
-          molecule-core/main).
+     (in parens at the end), using Gitea's LITERAL event suffix
+     (verified empirically on molecule-core/main PR #3433):
+        - `pull_request` emits `(pull_request)`.
+        - `pull_request_target` emits `(pull_request_target)`.
+        - `pull_request_review` emits `(pull_request_review)`.
         - `push` emits `(push)`.
+     Gitea does NOT collapse `pull_request_target`/`pull_request_review`
+     into `pull_request`; each is its own distinct status context.
 
 A BP context with no emitter blocks merges forever — Gitea treats
 absent-as-`pending`, NOT absent-as-`skipped`-as-`success`. This is
@@ -110,10 +113,32 @@ _CONTEXT_RE = re.compile(
     r"^(?P<workflow>.+?) / (?P<job>.+) \((?P<event>[^)]+)\)$"
 )
 
-# Map a workflow `on:` event-key to the context's event-part. Gitea's
-# emitter convention (verified on molecule-core):
+# Map a workflow `on:` event-key to the context's event-part. Gitea
+# Actions publishes a status context per (workflow, job, event) as
+# `<workflow name> / <job name> (<event>)` using the LITERAL event name
+# — it does NOT collapse `pull_request_target`/`pull_request_review`
+# into `pull_request`. Verified empirically on molecule-core/main PR
+# #3433, which carries all six distinct contexts side by side:
+#   qa-review / approved (pull_request_target)          success
+#   qa-review / approved (pull_request_review)          success
+#   security-review / approved (pull_request_target)    success
+#   security-review / approved (pull_request_review)    success
+#   reserved-path-review / reserved-path-review (pull_request_target)  success
+#   reserved-path-review / reserved-path-review (pull_request_review)  success
+# and by branch_protections/main requiring the `(pull_request_target)`
+# variant (which is genuinely satisfied on every merge).
+#
+# The previous map collapsed `pull_request_target → pull_request`, so
+# the emitter set contained `qa-review / approved (pull_request)` while
+# BP required `qa-review / approved (pull_request_target)` — a spurious
+# set mismatch that flagged all three governance gates as phantom
+# orphans (BP→emitter drift issue #3204) even though each context is
+# genuinely emitted. That was a lint-own modelling bug, NOT a real
+# drift. This map now mirrors Gitea's literal-event-suffix behaviour.
+#
 #   - pull_request          → `(pull_request)`
-#   - pull_request_target   → `(pull_request)` (same surface)
+#   - pull_request_target   → `(pull_request_target)`
+#   - pull_request_review   → `(pull_request_review)`
 #   - push                  → `(push)`
 #   - schedule              → no PR status; scheduled runs don't post
 #     commit-statuses unless the workflow itself does so explicitly.
@@ -122,7 +147,8 @@ _CONTEXT_RE = re.compile(
 #     only).
 _EVENT_MAP = {
     "pull_request": "pull_request",
-    "pull_request_target": "pull_request",
+    "pull_request_target": "pull_request_target",
+    "pull_request_review": "pull_request_review",
     "push": "push",
 }
 

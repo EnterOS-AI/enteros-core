@@ -45,8 +45,9 @@ Test classes (per `feedback_branch_count_before_approving`):
     workflow only emits on `pull_request`. That's NOT a match — the
     BP-required gate would still wedge. Exit 1.
   - test_workflow_event_mapping_pull_request_target — `pull_request_target`
-    in workflow `on:` emits a `(pull_request)` context (Gitea convention).
-    Match counts.
+    in workflow `on:` emits a LITERAL `(pull_request_target)` context (it
+    is NOT collapsed to `(pull_request)`). Regression guard for the
+    BP→emitter drift false-positive on the governance gates (#3204).
   - test_idempotent_issue_filing           — when an issue already exists
     with the canonical title prefix, edit it instead of POSTing a new one
     (idempotency contract — mirrors ci-required-drift).
@@ -323,27 +324,62 @@ def test_context_event_match_required(envset, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# `pull_request_target` in workflow `on:` emits a `(pull_request)` context
-# (Gitea convention — verified empirically on molecule-core).
+# `pull_request_target` in workflow `on:` emits a LITERAL
+# `(pull_request_target)` context (verified empirically on
+# molecule-core/main PR #3433 — Gitea does NOT collapse it to
+# `(pull_request)`). Regression guard for the governance-gate phantom
+# orphan false-positive (#3204).
 # ---------------------------------------------------------------------------
 def test_workflow_event_mapping_pull_request_target(envset, monkeypatch, capsys):
+    # Mirrors the real qa-review governance gate: on: pull_request_target
+    # (+ pull_request_review), job `approved`, BP requires the
+    # `(pull_request_target)` variant.
     _write_wf(
         envset,
-        "secret.yml",
-        "name: Secret scan\non:\n  pull_request_target:\n    branches: [main]\njobs:\n"
-        "  scan:\n    runs-on: x\n    name: Scan diff for credential-shaped strings\n"
-        "    steps:\n      - run: echo hi\n",
+        "qa-review.yml",
+        "name: qa-review\non:\n  pull_request_target:\n    types: [opened]\n"
+        "  pull_request_review:\n    types: [submitted]\njobs:\n"
+        "  approved:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
     )
     m = _import_lint()
     _stub_api(
         monkeypatch,
         m,
         ("ok", {"status_check_contexts": [
-            "Secret scan / Scan diff for credential-shaped strings (pull_request)",
+            # The genuinely-emitted + BP-required variant matches.
+            "qa-review / approved (pull_request_target)",
         ]}),
     )
     rc = m.run()
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# The distinct-suffix contract, negative side: a `pull_request_target`
+# workflow does NOT satisfy a BP context spelled `(pull_request)` — the
+# two are separate status contexts, so a `(pull_request)`-suffixed BP
+# entry against a pull_request_target-only emitter is a genuine orphan.
+# ---------------------------------------------------------------------------
+def test_pull_request_target_does_not_match_pull_request_suffix(
+    envset, monkeypatch, capsys
+):
+    _write_wf(
+        envset,
+        "qa-review.yml",
+        "name: qa-review\non:\n  pull_request_target:\n    types: [opened]\njobs:\n"
+        "  approved:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
+    )
+    m = _import_lint()
+    _stub_api(
+        monkeypatch,
+        m,
+        ("ok", {"status_check_contexts": [
+            # Wrong suffix for a pull_request_target emitter → orphan.
+            "qa-review / approved (pull_request)",
+        ]}),
+    )
+    rc = m.run()
+    assert rc == 1
 
 
 # ---------------------------------------------------------------------------
