@@ -635,21 +635,5 @@ func jsonField(body, key string) string {
 	return rest[:j]
 }
 
-// orgInstanceStatus finds the instance_status for a given slug in a
-// /cp/admin/orgs list response by scanning the object that contains the slug.
-func orgInstanceStatus(listBody, slug string) string {
-	marker := `"slug":"` + slug + `"`
-	i := strings.Index(listBody, marker)
-	if i < 0 {
-		return ""
-	}
-	lo := i - 600
-	if lo < 0 {
-		lo = 0
-	}
-	hi := i + 600
-	if hi > len(listBody) {
-		hi = len(listBody)
-	}
-	return jsonField(listBody[lo:hi], "instance_status")
-}
+// orgInstanceStatus lives in orginstancestatus.go (untagged) so its regression
+// test runs in the normal `go test ./...` gate, not only under -tags staging_e2e.
