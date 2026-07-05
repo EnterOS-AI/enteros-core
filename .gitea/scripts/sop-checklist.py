@@ -697,6 +697,37 @@ def _load_config_minimal(path: str) -> dict[str, Any]:
     return _parse_minimal_yaml(lines)
 
 
+def _yaml_list_item_is_map(content: str) -> bool:
+    """True when a block-list item ``- ...`` is a mapping (``- key: value``)
+    rather than a scalar (``- "quoted:scalar"`` or ``- bare``).
+
+    A ``:`` only opens a mapping when it follows an unquoted key AND is
+    itself followed by whitespace or end-of-line. A colon that lives inside
+    a quoted scalar (e.g. the ``:`` in ``- "risk:high"``) is DATA, not a
+    key/value separator. Without this distinction the minimal parser
+    mis-parsed a top-level list of quoted strings (``high_risk_labels``)
+    into single-key dicts (``{'"risk': 'high"'}``), which then blew up
+    ``set(...)`` in is_high_risk with `TypeError: unhashable type: 'dict'`.
+    """
+    content = content.strip()
+    if not content:
+        return False
+    if content[0] in ("'", '"'):
+        # Fully-quoted scalar — any colon it contains is data.
+        return False
+    in_single = in_double = False
+    for idx, ch in enumerate(content):
+        if ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == ":" and not in_single and not in_double:
+            nxt = content[idx + 1 : idx + 2]
+            if nxt in ("", " ", "\t"):
+                return True
+    return False
+
+
 def _parse_minimal_yaml(lines: list[str]) -> dict[str, Any]:
     """Hand-rolled subset parser. See _load_config_minimal docstring.
 
@@ -748,6 +779,52 @@ def _parse_minimal_yaml(lines: list[str]) -> dict[str, Any]:
             return []
         return [parse_scalar(x.strip()) for x in inner.split(",")]
 
+    def parse_submap(start: int, base_indent: int) -> tuple[dict[str, Any], int]:
+        """Parse a block mapping whose entries are indented past base_indent.
+
+        Recurses for nested maps so a map-of-maps (e.g. the config's
+        ``n/a_gates: {qa-review: {required_teams: [...], description: >- ...}}``)
+        is preserved instead of flattened into one level. Without this, the
+        no-PyYAML fallback mis-parsed n/a_gates and silently dropped each
+        gate's ``required_teams`` (N/A declarations fail-closed on the runner
+        that lacks PyYAML). Handles inline lists, folded scalars, and nested
+        maps — the same value shapes the item parser already supports.
+        """
+        m: dict[str, Any] = {}
+        j = start
+        while j < n and cleaned[j][0] > base_indent:
+            cur_indent, cur_line = cleaned[j]
+            if ":" not in cur_line:
+                j += 1
+                continue
+            k, _, v = cur_line.partition(":")
+            k = k.strip().strip('"').strip("'")
+            v = v.strip()
+            if v == "":
+                # Empty value: a nested map if deeper-indented children follow,
+                # otherwise an empty scalar.
+                if j + 1 < n and cleaned[j + 1][0] > cur_indent:
+                    nested, j = parse_submap(j + 1, cur_indent)
+                    m[k] = nested
+                else:
+                    m[k] = ""
+                    j += 1
+            elif v.startswith(">-") or v.startswith(">"):
+                # Folded scalar continues on subsequent deeper-indented lines.
+                collected: list[str] = []
+                j += 1
+                while j < n and cleaned[j][0] > cur_indent:
+                    collected.append(cleaned[j][1])
+                    j += 1
+                m[k] = " ".join(collected)
+            elif v.startswith("[") and v.endswith("]"):
+                m[k] = parse_inline_list(v)
+                j += 1
+            else:
+                m[k] = parse_scalar(v)
+                j += 1
+        return m, j
+
     while i < n:
         indent, line = cleaned[i]
         if indent != 0:
@@ -769,6 +846,13 @@ def _parse_minimal_yaml(lines: list[str]) -> dict[str, Any]:
                 while i < n and cleaned[i][0] > indent and cleaned[i][1].startswith("- "):
                     item_indent = cleaned[i][0]
                     first_kv = cleaned[i][1][2:].strip()  # strip "- "
+                    if not _yaml_list_item_is_map(first_kv):
+                        # Scalar block-list item, e.g. `- "risk:high"` or
+                        # `- bare`. A ':' inside a quoted scalar is data, not a
+                        # mapping separator — parse the whole thing as a string.
+                        items.append(parse_scalar(first_kv))
+                        i += 1
+                        continue
                     item: dict[str, Any] = {}
                     if ":" in first_kv:
                         k, _, v = first_kv.partition(":")
@@ -819,19 +903,8 @@ def _parse_minimal_yaml(lines: list[str]) -> dict[str, Any]:
                     items.append(item)
                 root[key] = items
             else:
-                # Sub-map.
-                submap: dict[str, Any] = {}
-                while i < n and cleaned[i][0] > indent:
-                    sub_indent, sub_line = cleaned[i]
-                    if ":" in sub_line:
-                        k, _, v = sub_line.partition(":")
-                        k = k.strip().strip('"').strip("'")
-                        v = v.strip()
-                        if v.startswith("[") and v.endswith("]"):
-                            submap[k] = parse_inline_list(v)
-                        else:
-                            submap[k] = parse_scalar(v)
-                    i += 1
+                # Sub-map (may itself be a map-of-maps, e.g. n/a_gates).
+                submap, i = parse_submap(i, indent)
                 root[key] = submap
         else:
             # Inline scalar or list.
@@ -894,7 +967,11 @@ def is_high_risk(pr: dict[str, Any], cfg: dict[str, Any]) -> bool:
     `required_teams_high_risk` are unaffected (the default applies).
     """
     label_set = {(label.get("name") or "") for label in (pr.get("labels") or [])}
-    high_risk_labels = set(cfg.get("high_risk_labels") or [])
+    # Coerce to str defensively: the config loader's PyYAML path yields
+    # strings, but any future parser hiccup that produced non-hashable
+    # entries (e.g. a dict) would otherwise crash set() here. str() keeps
+    # the gate up rather than 500-ing the whole checklist run.
+    high_risk_labels = {str(x) for x in (cfg.get("high_risk_labels") or [])}
     return bool(label_set & high_risk_labels)
 
 
