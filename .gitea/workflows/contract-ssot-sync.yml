@@ -2,20 +2,20 @@ name: contract-ssot-sync
 
 # SSOT sync gate for the MCP-plugin delivery contract (RFC core#3285 §10).
 #
-# molecule-contracts is the PUBLIC SSOT for the cross-repo tool contract
+# molecule-ai-sdk is the PUBLIC SSOT for the cross-repo tool contract
 # (RFC §10: "Contract-repo visibility -- DECIDED: Public"; molecule-contracts#1
 # merged it). Core keeps a local MIRROR at
 # contracts/mcp-plugin-delivery.contract.json -- the producer-side copy the
 # degrade gate derives conciergePlatformMCPRequiredTool from, asserted by
 # TestSSOT_DegradeGateToolDerivesFromContract. This gate chains the mirror to
-# the SSOT: it fetches molecule-contracts' canonical copy over the PUBLIC raw
+# the SSOT: it fetches molecule-ai-sdk's canonical copy over the PUBLIC raw
 # endpoint (no token) and verifies core's mirror is the SAME CONTRACT.
 #
 # RELATIONSHIP TO mcp-plugin-delivery-contract-drift.yml (RFC §7, "one check per
 # invariant"): that gate enforces a DIFFERENT invariant over a DIFFERENT
 # participant set and trust model -- core <-> the PRIVATE template + runtime
 # repos, fetched with an authenticated cross-repo token (AUTO_SYNC_TOKEN). This
-# gate enforces core <-> the PUBLIC molecule-contracts SSOT, unauthenticated.
+# gate enforces core <-> the PUBLIC molecule-ai-sdk SSOT, unauthenticated.
 # The two reds on disjoint defect sets (a template/runtime drift vs an SSOT
 # drift) and therefore do NOT collapse into one job (RFC §7: collapse only
 # same-defect-same-layer checks; keep cross-boundary coverage). This is the
@@ -27,7 +27,7 @@ name: contract-ssot-sync
 # mirrors mcp-plugin-delivery-contract-drift.yml and sync-providers-yaml.yml).
 # The BP-required promotion is a separate post-soak step (needs repo-admin).
 #
-# AUTH: NONE. molecule-contracts is public, so the canonical contract is
+# AUTH: NONE. molecule-ai-sdk is public, so the canonical contract is
 # readable over the raw endpoint without a token; the gate runs on EVERY context
 # (incl. fork PRs) and is FAIL-CLOSED on a fetch error (non-200 / network) and
 # on canonical drift.
@@ -35,7 +35,7 @@ name: contract-ssot-sync
 # WORKSPACE-COMMS SIBLING: this workflow now ALSO runs
 # check-workspace-comms-ssot-sync.sh, which keeps the VENDORED workspace-comms
 # schema copies (workspace-server/internal/models/testdata/workspace-comms/)
-# honest against the molecule-contracts SSOT. Those vendored copies are what the
+# honest against the molecule-ai-sdk SSOT. Those vendored copies are what the
 # Go PRODUCER gate (workspace-server/internal/models/workspace_comms_ssot_test.go)
 # embeds to assert workspace.go's wire structs (RegisterPayload / HeartbeatPayload
 # / RuntimeMetadata) don't silently drift the contract. Same trust model (public,
@@ -89,20 +89,20 @@ jobs:
   # bp-required: pending #3285 -- advisory-first; standalone SSOT-sync gate,
   # not in branch protection yet (promote after a green soak; needs repo-admin).
   ssot-sync:
-    name: Verify core's contract mirror matches the molecule-contracts SSOT
+    name: Verify core's contract mirror matches the molecule-ai-sdk SSOT
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Verify mirror == molecule-contracts SSOT (unauthenticated, fail-closed)
+      - name: Verify mirror == molecule-ai-sdk SSOT (unauthenticated, fail-closed)
         run: bash .gitea/scripts/check-contract-ssot-sync.sh
 
       # workspace-comms sibling: keep the VENDORED schema copies that the Go
       # producer gate (workspace_comms_ssot_test.go) embeds in lockstep with the
-      # molecule-contracts SSOT. Same trust model (public, unauthenticated,
+      # molecule-ai-sdk SSOT. Same trust model (public, unauthenticated,
       # fail-closed on fetch error / canonical drift).
-      - name: Verify vendored workspace-comms schemas == molecule-contracts SSOT
+      - name: Verify vendored workspace-comms schemas == molecule-ai-sdk SSOT
         run: bash .gitea/scripts/check-workspace-comms-ssot-sync.sh
 
       # plugin-manifest sibling (core#3383): keep the VENDORED schema that
