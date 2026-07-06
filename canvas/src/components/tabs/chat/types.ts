@@ -25,6 +25,19 @@ export interface ChatMessage {
   id: string;
   role: "user" | "agent" | "system";
   content: string;
+  /** Sub-classifies a role==="system" message so the two kinds render
+   *  differently:
+   *    - "notice" — an internal self-message (delegation-result wake
+   *      nudge and siblings: heartbeat harvester, cron self-tick, idle
+   *      self-wake). Rendered as a centered, greyed "System" note; NEVER
+   *      a blue user bubble (the bug) and NEVER the red error bubble.
+   *    - "error"  — a failed turn (status=error). Rendered as the
+   *      existing red bubble. Left unset on the error path for
+   *      back-compat; the renderer treats absent/"error" as the error
+   *      style, and only "notice" gets the neutral note.
+   *  Meaningless for role user/agent. Mirrors the Go
+   *  messagestore.ChatMessage.SystemKind wire field. */
+  systemKind?: "notice" | "error";
   /** Attachments sent with or returned alongside this message. */
   attachments?: ChatAttachment[];
   /** Tool-use chain for an agent turn (rehydrated from tool_trace). */

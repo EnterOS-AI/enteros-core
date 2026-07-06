@@ -1,0 +1,128 @@
+name: template-delivery-e2e-staging
+
+# POST-DEPLOY / on-demand full template-delivery e2e against DEPLOYED staging.
+#
+# This is the home of the assertions that INHERENTLY need a live, deployed
+# runtime and therefore CANNOT be a pre-merge PR gate (that coupling was the
+# deploy-ordering deadlock this whole change fixes):
+#   C. config.yaml delivered + REAL via the asset channel
+#   D. prompts/ delivered via the asset channel
+#   E. plugins/seo-all/SKILL.md installed via the POST-ONLINE plugin reconcile
+#      (needs the runtime to actually reach online on a deployed tenant).
+#
+# The per-PR merge gate (template-delivery-e2e.yml) validates C+D on the PR's
+# OWN freshly-built tenant image via the production-shape harness — no deployed
+# dependency, so a delivery-fix PR can green its own gate. The post-online
+# PLUGIN channel (E) is not reproducible pre-deploy (the harness cp-stub never
+# brings a real runtime online), so it lives HERE and runs AFTER a merge has
+# deployed to staging, or on demand.
+#
+# `on: workflow_dispatch` ONLY — never `pull_request`, so it emits NO PR status
+# context (no deadlock, no ["*"]-required SKIPPED-context trap) and adds ZERO
+# new automatic main-red surface. An operator runs it after a delivery change
+# reaches staging to confirm the full end-to-end (incl. plugin reconcile).
+#
+# Runs the SAME script the old per-PR gate ran (tests/e2e/test_template_delivery_e2e.sh),
+# unchanged — no assertion was dropped; it was relocated off the PR critical path.
+
+"on":
+  workflow_dispatch: {}
+
+concurrency:
+  group: template-delivery-e2e-staging
+  cancel-in-progress: false
+
+jobs:
+  # bp-exempt: on-demand post-deploy verification; never a PR merge gate.
+  delivery-staging:
+    name: Template-asset delivery (deployed staging — config+prompts+model + seo-all plugin reconcile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      MOLECULE_CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}
+      E2E_EXPECTED_MODEL: moonshot/kimi-k2.6
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Source the CP admin token from the Infisical SSOT (prod
+      # /shared/controlplane-admin) via the CI machine identity — same KMS
+      # wave-3 pattern the old gate used. workflow_dispatch is operator-trusted,
+      # so no fork gating is needed here.
+      - name: Fetch CP_ADMIN_API_TOKEN from Infisical KMS
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
+          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
+          }
+          CP_ADMIN_API_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
+          echo "::add-mask::$CP_ADMIN_API_TOKEN"
+          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at prod /shared/controlplane-admin — failing closed."
+            exit 1
+          fi
+          echo "MOLECULE_ADMIN_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
+          echo "CP_ADMIN_API_TOKEN loaded from Infisical (len=${#CP_ADMIN_API_TOKEN})"
+
+      - name: Verify required secret present
+        run: |
+          if [ -z "${MOLECULE_ADMIN_TOKEN:-}" ]; then
+            echo "::error::CP_ADMIN_API_TOKEN secret not set — cannot run delivery e2e"
+            exit 2
+          fi
+
+      # Mint the org slug BEFORE the e2e provisions anything so the always()
+      # teardown net can deprovision the exact org even on a mid-provision kill.
+      - name: Mint e2e org slug (teardown target)
+        run: |
+          rand=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          slug="e2e-tmpl-${rand}"
+          echo "E2E_TMPL_SLUG=$slug" >> "$GITHUB_ENV"
+          echo "Minted e2e org slug for this run: $slug (always() teardown will target it)"
+
+      - name: Run template-asset delivery e2e (deployed staging, incl. plugin reconcile)
+        timeout-minutes: 65
+        run: bash tests/e2e/test_template_delivery_e2e.sh
+
+      - name: Teardown safety-net (deprovision e2e-tmpl org on cancel/timeout/failure)
+        if: always()
+        run: |
+          set +e
+          slug="${E2E_TMPL_SLUG:-}"
+          token="${MOLECULE_ADMIN_TOKEN:-}"
+          if [ -z "$slug" ]; then
+            echo "::notice::no E2E_TMPL_SLUG recorded — nothing to tear down."
+            exit 0
+          fi
+          if ! printf '%s' "$slug" | grep -Eq '^e2e-tmpl-[a-f0-9]{8}$'; then
+            echo "::warning::refusing teardown of non-ephemeral slug '$slug' — skipping admin DELETE."
+            exit 0
+          fi
+          if [ -z "$token" ]; then
+            echo "::warning::teardown: no admin token — cannot deprovision $slug. The CP reaper e2e-leak pass is the backstop."
+            exit 0
+          fi
+          echo "Safety-net teardown: deprovisioning org $slug via CP admin delete"
+          curl -sS -o /tmp/tmpl-teardown.out -w "%{http_code}" \
+            --max-time 180 -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" \
+            -d "{\"confirm\":\"$slug\"}" >/tmp/tmpl-teardown.code
+          code=$(cat /tmp/tmpl-teardown.code 2>/dev/null || echo "000")
+          if [ "$code" = "200" ] || [ "$code" = "204" ] || [ "$code" = "404" ]; then
+            echo "[teardown] deprovisioned $slug (HTTP $code)"
+          else
+            echo "::warning::teardown for $slug returned HTTP $code — the CP reaper e2e-leak pass is the backstop. Body: $(head -c 300 /tmp/tmpl-teardown.out 2>/dev/null)"
+          fi
+          exit 0
