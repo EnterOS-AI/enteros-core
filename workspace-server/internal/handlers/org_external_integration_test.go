@@ -68,13 +68,29 @@ files_dir: dev-lead/core-be
 
 	// Step 2: configure git's insteadOf rewrite. The fetcher will try
 	// to clone https://git.moleculesai.app/molecule-ai/test-dev-dept.git;
-	// git rewrites to file://<barePath>.
+	// git rewrites it to file://<barePath>.
+	//
+	// IMPORTANT — rewrite to a `file://` URL, NOT a bare path. The fetcher
+	// clones with `--depth=1` (org_external.go Fetch). When the rewrite
+	// target is a bare filesystem PATH, git takes its "local clone"
+	// optimization: it IGNORES --depth ("warning: --depth is ignored in
+	// local clones; use file:// instead") and hardlink/copies the object
+	// store directly. That copy RACES git's post-push auto-gc/repack and
+	// intermittently dies with `fatal: failed to copy file ... No such
+	// file or directory` — the non-deterministic canary red this test
+	// produced (green in ci.yml's Platform (Go), red in main-canary on the
+	// same SHA). Production NEVER hits this path: the real clone URL is
+	// always remote HTTPS (buildExternalCloneURL → https://…), which uses
+	// git's smart transport. A `file://` URL uses that same smart transport
+	// (pack negotiation, honors --depth, no hardlink copy), so it faithfully
+	// mirrors production AND is race-free — exactly what git's own warning
+	// recommends.
 	//
 	// GIT_CONFIG_COUNT/KEY/VALUE injects config without touching
 	// ~/.gitconfig — process-scoped, no test pollution.
 	geesUrl := "https://git.moleculesai.app/molecule-ai/test-dev-dept.git"
 	t.Setenv("GIT_CONFIG_COUNT", "1")
-	t.Setenv("GIT_CONFIG_KEY_0", "url."+barePath+".insteadOf")
+	t.Setenv("GIT_CONFIG_KEY_0", "url.file://"+barePath+".insteadOf")
 	t.Setenv("GIT_CONFIG_VALUE_0", geesUrl)
 
 	// Step 3: run resolveYAMLIncludes with !external pointing at the
@@ -184,7 +200,9 @@ func TestGitFetcher_RealClone_BadRefFails(t *testing.T) {
 	mustGit(t, workPath, "push", "origin", "main")
 
 	t.Setenv("GIT_CONFIG_COUNT", "1")
-	t.Setenv("GIT_CONFIG_KEY_0", "url."+barePath+".insteadOf")
+	// file:// (not bare path) so --depth=1 uses git's smart transport and
+	// avoids the racy local-clone hardlink copy — see LocalRedirect above.
+	t.Setenv("GIT_CONFIG_KEY_0", "url.file://"+barePath+".insteadOf")
 	t.Setenv("GIT_CONFIG_VALUE_0", "https://git.moleculesai.app/molecule-ai/empty-repo.git")
 
 	rootDir := t.TempDir()
@@ -256,7 +274,9 @@ func TestGitFetcher_DirectFetch_CacheHit(t *testing.T) {
 	mustGit(t, workPath, "push", "origin", "main")
 
 	t.Setenv("GIT_CONFIG_COUNT", "1")
-	t.Setenv("GIT_CONFIG_KEY_0", "url."+barePath+".insteadOf")
+	// file:// (not bare path) so --depth=1 uses git's smart transport and
+	// avoids the racy local-clone hardlink copy — see LocalRedirect above.
+	t.Setenv("GIT_CONFIG_KEY_0", "url.file://"+barePath+".insteadOf")
 	t.Setenv("GIT_CONFIG_VALUE_0", "https://git.moleculesai.app/molecule-ai/direct.git")
 
 	rootDir := t.TempDir()
@@ -335,7 +355,9 @@ func TestGitFetcher_CacheValidatedByCompleteMarker(t *testing.T) {
 	mustGit(t, workPath, "commit", "-m", "seed")
 	mustGit(t, workPath, "push", "origin", "main")
 	t.Setenv("GIT_CONFIG_COUNT", "1")
-	t.Setenv("GIT_CONFIG_KEY_0", "url."+barePath+".insteadOf")
+	// file:// (not bare path) so --depth=1 uses git's smart transport and
+	// avoids the racy local-clone hardlink copy — see LocalRedirect above.
+	t.Setenv("GIT_CONFIG_KEY_0", "url.file://"+barePath+".insteadOf")
 	t.Setenv("GIT_CONFIG_VALUE_0", "https://git.moleculesai.app/molecule-ai/marker-test.git")
 
 	rootDir := t.TempDir()
