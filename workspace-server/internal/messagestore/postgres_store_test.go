@@ -34,7 +34,6 @@ func mustParseTime(t *testing.T, s string) time.Time {
 	return tt
 }
 
-func neverInternal(_ string) bool { return false }
 
 // =====================================================================
 // timestamp preservation (regression cover)
@@ -48,7 +47,7 @@ func TestChatHistory_UserMessageTimestampPinsToCreatedAt(t *testing.T) {
 	created := mustParseTime(t, "2026-04-25T18:00:00Z")
 	body := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"hello from earlier today"}]}}}`)
 
-	msgs := activityRowToChatMessages("row-1", created, "ok", body, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", created, "ok", body, nil, nil)
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 user message, got %d", len(msgs))
 	}
@@ -64,7 +63,7 @@ func TestChatHistory_AgentMessageTimestampPinsToCreatedAt(t *testing.T) {
 	created := mustParseTime(t, "2026-04-25T18:05:00Z")
 	body := json.RawMessage(`{"result":"agent reply"}`)
 
-	msgs := activityRowToChatMessages("row-1", created, "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", created, "ok", nil, body, nil)
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 agent message, got %d", len(msgs))
 	}
@@ -79,8 +78,8 @@ func TestChatHistory_AgentMessageTimestampPinsToCreatedAt(t *testing.T) {
 func TestChatHistory_TwoRowsDistinctTimestamps(t *testing.T) {
 	bodyA := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"first"}]}}}`)
 	bodyB := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"second"}]}}}`)
-	a := activityRowToChatMessages("row-a", mustParseTime(t, "2026-04-25T14:00:00Z"), "ok", bodyA, nil, nil, neverInternal)
-	b := activityRowToChatMessages("row-b", mustParseTime(t, "2026-04-25T21:01:58Z"), "ok", bodyB, nil, nil, neverInternal)
+	a := activityRowToChatMessages("row-a", mustParseTime(t, "2026-04-25T14:00:00Z"), "ok", bodyA, nil, nil)
+	b := activityRowToChatMessages("row-b", mustParseTime(t, "2026-04-25T21:01:58Z"), "ok", bodyB, nil, nil)
 
 	if len(a) != 1 || len(b) != 1 {
 		t.Fatalf("expected 1 message each; got %d and %d", len(a), len(b))
@@ -99,7 +98,7 @@ func TestChatHistory_TwoRowsDistinctTimestamps(t *testing.T) {
 
 func TestChatHistory_EmitsUserMessageWhenRequestHasText(t *testing.T) {
 	body := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"hi agent"}]}}}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
@@ -108,19 +107,59 @@ func TestChatHistory_EmitsUserMessageWhenRequestHasText(t *testing.T) {
 	}
 }
 
-func TestChatHistory_DropsInternalSelfMessages(t *testing.T) {
+// TestChatHistory_SurfacesInternalSelfMessageAsSystem: an internal
+// self-message MUST be surfaced as a distinct system note (role=system,
+// SystemKind="notice"), NOT dropped and NOT rendered as a user bubble.
+// This row carries NO typed marker, so it exercises the legacy
+// text-prefix fallback path (isInternalSelfRequest → IsInternalSelfMessage).
+func TestChatHistory_SurfacesInternalSelfMessageAsSystem(t *testing.T) {
 	body := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"Delegation results are ready..."}]}}}`)
-	predicate := func(t string) bool { return strings.HasPrefix(t, "Delegation results are ready") }
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, predicate)
-	for _, m := range msgs {
-		if m.Role == "user" {
-			t.Errorf("internal-self message rendered as user bubble: %q", m.Content)
-		}
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 system message (surfaced, not dropped), got %d", len(msgs))
+	}
+	if msgs[0].Role != "system" {
+		t.Errorf("internal-self message role=%q want system (must not render as user)", msgs[0].Role)
+	}
+	if msgs[0].SystemKind != "notice" {
+		t.Errorf("internal-self systemKind=%q want notice", msgs[0].SystemKind)
+	}
+	if msgs[0].Content == "" {
+		t.Errorf("internal-self message content was dropped; want it surfaced")
+	}
+}
+
+// TestChatHistory_ClassifiesSelfMessageByMetadataSourceType: the PRIMARY
+// role-based path. A request carrying params.metadata.source_type =
+// "self-harvester" (what the runtime stamps on the delegation-result
+// wake nudge) is classified system/notice by the SSOT marker — NOT by
+// matching the message text. Text here does NOT match any legacy prefix,
+// proving the classification comes from the marker.
+func TestChatHistory_ClassifiesSelfMessageByMetadataSourceType(t *testing.T) {
+	body := json.RawMessage(`{"params":{"metadata":{"source_type":"self-harvester"},"message":{"parts":[{"kind":"text","text":"wake up and check your work"}]}}}`)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 system message, got %d", len(msgs))
+	}
+	if msgs[0].Role != "system" || msgs[0].SystemKind != "notice" {
+		t.Errorf("metadata source_type=self-harvester classified as role=%q kind=%q; want system/notice", msgs[0].Role, msgs[0].SystemKind)
+	}
+}
+
+// TestChatHistory_TaggedNonSelfSourceStaysUser: a message carrying an
+// explicit source_type that is NOT a self-type is a genuine turn and
+// stays role=user even if its text collides with a legacy prefix — the
+// typed marker wins over the deprecated string-match.
+func TestChatHistory_TaggedNonSelfSourceStaysUser(t *testing.T) {
+	body := json.RawMessage(`{"params":{"metadata":{"source_type":"peer"},"message":{"parts":[{"kind":"text","text":"Delegation results are ready..."}]}}}`)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
+	if len(msgs) != 1 || msgs[0].Role != "user" {
+		t.Errorf("tagged non-self source should stay user; got %+v", msgs)
 	}
 }
 
 func TestChatHistory_NoUserMessageWhenRequestBodyNull(t *testing.T) {
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil)
 	for _, m := range msgs {
 		if m.Role == "user" {
 			t.Errorf("emitted user bubble despite null request_body: %+v", m)
@@ -139,7 +178,7 @@ func TestChatHistory_UserAttachmentsHydratedFromRequestBody(t *testing.T) {
 	    }
 	  }
 	}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
 	var user *ChatMessage
 	for i := range msgs {
 		if msgs[i].Role == "user" {
@@ -176,7 +215,7 @@ func TestChatHistory_AttachmentsOnlyUserBubbleWhenTextEmpty(t *testing.T) {
 	    }
 	  }
 	}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 attachments-only bubble, got %d", len(msgs))
 	}
@@ -188,7 +227,10 @@ func TestChatHistory_AttachmentsOnlyUserBubbleWhenTextEmpty(t *testing.T) {
 	}
 }
 
-func TestChatHistory_InternalSelfPredicateSuppressesEvenWithAttachments(t *testing.T) {
+// An internal self-message that carries attachments is still surfaced as
+// a system note (role=system, never user) — the attachments ride along
+// on the system bubble rather than being misattributed to the user.
+func TestChatHistory_InternalSelfWithAttachmentsIsSystemNotUser(t *testing.T) {
 	body := json.RawMessage(`{
 	  "params": {
 	    "message": {
@@ -199,12 +241,12 @@ func TestChatHistory_InternalSelfPredicateSuppressesEvenWithAttachments(t *testi
 	    }
 	  }
 	}`)
-	predicate := func(t string) bool { return strings.HasPrefix(t, "Delegation results are ready") }
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, predicate)
-	for _, m := range msgs {
-		if m.Role == "user" {
-			t.Errorf("internal-self predicate did NOT suppress user bubble despite attachments: %+v", m)
-		}
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 system message, got %d", len(msgs))
+	}
+	if msgs[0].Role != "system" || msgs[0].SystemKind != "notice" {
+		t.Errorf("internal-self-with-attachments role=%q kind=%q; want system/notice (never user)", msgs[0].Role, msgs[0].SystemKind)
 	}
 }
 
@@ -214,7 +256,7 @@ func TestChatHistory_InternalSelfPredicateSuppressesEvenWithAttachments(t *testi
 
 func TestChatHistory_AgentMessageFromResultString(t *testing.T) {
 	body := json.RawMessage(`{"result":"agent says hi"}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil)
 	if len(msgs) != 1 || msgs[0].Role != "agent" || msgs[0].Content != "agent says hi" {
 		t.Errorf("got %+v", msgs)
 	}
@@ -222,7 +264,7 @@ func TestChatHistory_AgentMessageFromResultString(t *testing.T) {
 
 func TestChatHistory_RoleSystemWhenStatusError(t *testing.T) {
 	body := json.RawMessage(`{"result":"delegation failed"}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "error", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "error", nil, body, nil)
 	if len(msgs) != 1 || msgs[0].Role != "system" {
 		t.Errorf("status=error did NOT promote role to system: %+v", msgs)
 	}
@@ -233,7 +275,7 @@ func TestChatHistory_RoleSystemWhenAgentErrorPrefix(t *testing.T) {
 	// itself starts with "agent error", the canvas would still
 	// render system role. Mirror that here.
 	body := json.RawMessage(`{"result":"Agent error: ProcessError(exit=1)"}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil)
 	if len(msgs) != 1 || msgs[0].Role != "system" {
 		t.Errorf("agent-error prefix did NOT promote to system: %+v", msgs)
 	}
@@ -247,7 +289,7 @@ func TestChatHistory_AgentAttachmentsFromResponseBodyParts(t *testing.T) {
 	    {"kind":"file","file":{"name":"build.zip","uri":"workspace:/tmp/build.zip","size":12345}}
 	  ]
 	}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil)
 	var agent *ChatMessage
 	for i := range msgs {
 		if msgs[i].Role == "agent" {
@@ -267,7 +309,7 @@ func TestChatHistory_AgentAttachmentsFromResponseBodyParts(t *testing.T) {
 }
 
 func TestChatHistory_NoAgentMessageWhenResponseBodyNull(t *testing.T) {
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil)
 	for _, m := range msgs {
 		if m.Role == "agent" || m.Role == "system" {
 			t.Errorf("emitted agent/system bubble despite null response_body: %+v", m)
@@ -277,7 +319,7 @@ func TestChatHistory_NoAgentMessageWhenResponseBodyNull(t *testing.T) {
 
 func TestChatHistory_NoAgentMessageWhenResponseHasNoTextNoFiles(t *testing.T) {
 	body := json.RawMessage(`{"unrelated":"metadata"}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil)
 	for _, m := range msgs {
 		if m.Role == "agent" {
 			t.Errorf("emitted agent bubble despite empty content: %+v", m)
@@ -432,7 +474,7 @@ func TestChatHistory_PairedUserAndAgentSameTimestamp(t *testing.T) {
 	created := mustParseTime(t, "2026-04-25T18:00:00Z")
 	req := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"what's 2+2?"}]}}}`)
 	resp := json.RawMessage(`{"result":"4"}`)
-	msgs := activityRowToChatMessages("row-1", created, "ok", req, resp, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", created, "ok", req, resp, nil)
 	if len(msgs) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(msgs))
 	}
@@ -459,7 +501,7 @@ func TestChatHistory_MalformedJSONInRequestBodyReturnsEmpty(t *testing.T) {
 			t.Fatalf("panic on malformed json: %v", r)
 		}
 	}()
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
 	for _, m := range msgs {
 		if m.Role == "user" && (m.Content != "" || len(m.Attachments) > 0) {
 			t.Errorf("malformed JSON yielded a non-empty user bubble: %+v", m)
@@ -476,7 +518,7 @@ func TestChatHistory_V1ProtobufFlatFileShape(t *testing.T) {
 	    ]
 	  }
 	}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil)
 	var agent *ChatMessage
 	for i := range msgs {
 		if msgs[i].Role == "agent" {
@@ -505,7 +547,7 @@ func TestChatHistory_TaskShapeArtifactsExtracted(t *testing.T) {
 	    ]
 	  }
 	}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil)
 	if len(msgs) != 1 || msgs[0].Content != "hermes detail line" {
 		t.Errorf("artifact text not extracted: %+v", msgs)
 	}
@@ -518,7 +560,7 @@ func TestChatHistory_OlderNestedRootTextShape(t *testing.T) {
 	    "parts": [{"root":{"text":"legacy nested text"}}]
 	  }
 	}`)
-	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil, neverInternal)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil)
 	if len(msgs) != 1 || !strings.Contains(msgs[0].Content, "legacy nested text") {
 		t.Errorf("nested root.text not extracted: %+v", msgs)
 	}
@@ -572,7 +614,7 @@ func TestActivityRow_AgentMessageCarriesToolTrace(t *testing.T) {
 		mustParseTime(t, "2026-06-12T00:00:00Z"), "ok",
 		json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"do it"}]}}}`),
 		json.RawMessage(`{"result":"done"}`),
-		trace, neverInternal,
+		trace,
 	)
 	if len(msgs) != 2 {
 		t.Fatalf("want 2 messages (user+agent), got %d", len(msgs))
@@ -816,8 +858,8 @@ func TestActivityRow_MessageIDsAreDeterministicFromRowID(t *testing.T) {
 	req := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}`)
 	resp := json.RawMessage(`{"result":"yo"}`)
 
-	first := activityRowToChatMessages("row-42", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil, neverInternal)
-	second := activityRowToChatMessages("row-42", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil, neverInternal)
+	first := activityRowToChatMessages("row-42", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil)
+	second := activityRowToChatMessages("row-42", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil)
 	if len(first) != 2 || len(second) != 2 {
 		t.Fatalf("want 2 bubbles each, got %d and %d", len(first), len(second))
 	}
@@ -835,7 +877,7 @@ func TestActivityRow_MessageIDsAreDeterministicFromRowID(t *testing.T) {
 		t.Errorf("user and agent bubble share an id %q — would collapse distinct bubbles", first[0].ID)
 	}
 	// Different row → different ids.
-	other := activityRowToChatMessages("row-99", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil, neverInternal)
+	other := activityRowToChatMessages("row-99", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil)
 	if other[0].ID == first[0].ID {
 		t.Errorf("different rows produced the same id %q", other[0].ID)
 	}
@@ -849,7 +891,7 @@ func TestActivityRow_MessageIDsAreDeterministicFromRowID(t *testing.T) {
 func TestActivityRow_EmptyRowIDFallsBackToUniqueID(t *testing.T) {
 	req := json.RawMessage(`{"params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}`)
 	resp := json.RawMessage(`{"result":"yo"}`)
-	msgs := activityRowToChatMessages("", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil, neverInternal)
+	msgs := activityRowToChatMessages("", mustParseTime(t, fixedTimestamp), "ok", req, resp, nil)
 	if len(msgs) != 2 {
 		t.Fatalf("want 2 bubbles, got %d", len(msgs))
 	}

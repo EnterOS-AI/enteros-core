@@ -1,5 +1,10 @@
 import { type ChatMessage, createMessage } from "./types";
-import { extractResponseText, extractRequestText, extractFilesFromTask } from "./message-parser";
+import {
+  extractResponseText,
+  extractRequestText,
+  extractFilesFromTask,
+  isInternalSelfRequest,
+} from "./message-parser";
 
 /** Activity row shape the chat history loader consumes. Only the fields
  *  it actually reads are listed — the platform sends more (id, target_id,
@@ -15,8 +20,12 @@ export interface ActivityRowForHydration {
 /** Map a single activity_logs row to the chat messages it represents.
  *
  *  An a2a_receive row can produce up to two messages:
- *    1. A user-side bubble derived from request_body (the message the
- *       user sent), unless the request was an internal self-message.
+ *    1. A request-side bubble derived from request_body. role="user" for
+ *       a genuine turn; role="system" (systemKind="notice") for an
+ *       internal self-message (delegation-result wake nudge etc.),
+ *       classified by the SSOT params.metadata.source_type marker. These
+ *       are SURFACED as a distinct system note — never dropped, never
+ *       rendered as the user talking to themselves (the bug).
  *    2. An agent-side bubble derived from response_body (text +
  *       file attachments), with role=system when status=error.
  *
@@ -30,7 +39,6 @@ export interface ActivityRowForHydration {
  */
 export function activityRowToMessages(
   row: ActivityRowForHydration,
-  isInternalSelfMessage: (text: string) => boolean,
 ): ChatMessage[] {
   const out: ChatMessage[] = [];
 
@@ -45,14 +53,16 @@ export function activityRowToMessages(
   const userMsg = (row.request_body?.params as Record<string, unknown> | undefined)
     ?.message as Record<string, unknown> | undefined;
   const userAttachments = userMsg ? extractFilesFromTask(userMsg) : [];
-  // Internal-self messages (e.g. heartbeat self-trigger) take precedence
-  // — drop the row even if it carries attachments, since the heartbeat
-  // path doesn't produce attachments anyway and keeping the bubble would
-  // misattribute it to the user.
-  const isInternal = !!userText && isInternalSelfMessage(userText);
-  if (!isInternal && (userText || userAttachments.length > 0)) {
+  // Classify the request side by the SSOT source_type marker (not the
+  // message text). An internal self-message (heartbeat delegation-result
+  // wake nudge and siblings) is surfaced as a centered "System" note —
+  // never dropped, never misattributed to the user — while a genuine
+  // turn renders as the blue user bubble.
+  if (userText || userAttachments.length > 0) {
+    const isInternal = isInternalSelfRequest(row.request_body, userText);
     out.push({
-      ...createMessage("user", userText, userAttachments),
+      ...createMessage(isInternal ? "system" : "user", userText, userAttachments),
+      ...(isInternal ? { systemKind: "notice" as const } : {}),
       timestamp: row.created_at,
     });
   }

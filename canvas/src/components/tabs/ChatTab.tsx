@@ -692,6 +692,19 @@ function MyChatPanel({ workspaceId, data }: Props) {
                 {msg.decision === "rejected" ? "✕" : "✓"} {msg.content}
               </div>
             </div>
+          ) : msg.role === "system" && msg.systemKind === "notice" ? (
+            // Internal self-message (delegation-result wake nudge + siblings):
+            // a distinct, CENTERED, greyed "System" note — NOT the blue/right
+            // user bubble (the bug this fixes) and NOT the red left error
+            // bubble (systemKind !== "notice"). Labeled so it reads as an
+            // automated system event ("agent woken to report"), not the user
+            // or the agent talking.
+            <div key={msg.id} className="flex justify-center my-1">
+              <div className="max-w-[85%] text-[10px] text-ink-mid bg-surface-sunken border border-line/60 rounded-md px-2.5 py-1 dark:bg-zinc-800/60 dark:text-zinc-400 dark:border-zinc-700">
+                <span className="font-semibold uppercase tracking-wide mr-1 opacity-70">System</span>
+                <span className="opacity-90">{msg.content}</span>
+              </div>
+            </div>
           ) : (
           <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
             <div

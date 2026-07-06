@@ -18,6 +18,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/messagestore"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
@@ -1393,6 +1394,18 @@ func broadcastUserMessageFromA2ABody(
 	}
 	if len(attachments) > 0 {
 		payload["attachments"] = attachments
+	}
+	// Role-based classification at the SSOT marker: a self-message (the
+	// heartbeat's delegation-result wake nudge and its siblings) carries
+	// params.metadata.source_type = a self-type. It is NOT a user turn, so
+	// tag the live echo role="system" (systemKind="notice"). The canvas
+	// USER_MESSAGE consumer renders it as a distinct, centered "System"
+	// note instead of a blue user bubble — the bug this fixes. Absent the
+	// marker (genuine user send, peer delegation) the role defaults to
+	// "user" on the client, so this stays a no-op for real chat.
+	if messagestore.IsSelfSourceType(messagestore.RequestSourceType(body)) {
+		payload["role"] = "system"
+		payload["systemKind"] = "notice"
 	}
 	broadcaster.BroadcastOnly(workspaceID, string(events.EventUserMessage), payload)
 }

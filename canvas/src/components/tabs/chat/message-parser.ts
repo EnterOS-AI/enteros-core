@@ -129,6 +129,73 @@ export function extractRequestText(body: Record<string, unknown> | null): string
   return (parts?.[0]?.text as string) || "";
 }
 
+/** SSOT set of A2A params.metadata.source_type markers the runtime
+ *  stamps on messages a workspace sends TO ITSELF as routine wake nudges
+ *  (NOT human-typed turns). Mirrors the runtime's _ROUTINE_SELF_SOURCE_TYPES
+ *  (molecule_runtime/a2a_executor.py) and the server's selfSourceTypes
+ *  (workspace-server/internal/messagestore/postgres_store.go). The
+ *  canonical case is the heartbeat delegation-result harvester
+ *  ("Delegation results are ready …"). */
+export const SELF_SOURCE_TYPES: ReadonlySet<string> = new Set<string>([
+  "self-cron",
+  "self-harvester",
+  "self-idle",
+  "self-scheduler",
+  "self-goal-nudge",
+  "self-delegation-result",
+]);
+
+/** Read the typed source marker the runtime stamps on outbound
+ *  self-messages: request_body.params.metadata.source_type (the sibling
+ *  of params.message, where build_message_send_params places it), with a
+ *  fallback to params.message.metadata.source_type. Returns "" when
+ *  absent (a genuine user send, or a legacy row from before the marker). */
+export function requestSourceType(body: Record<string, unknown> | null): string {
+  if (!body) return "";
+  const params = body.params as Record<string, unknown> | undefined;
+  if (!params) return "";
+  const paramsMeta = params.metadata as Record<string, unknown> | undefined;
+  const fromParams = paramsMeta?.source_type;
+  if (typeof fromParams === "string" && fromParams) return fromParams;
+  const msg = params.message as Record<string, unknown> | undefined;
+  const msgMeta = msg?.metadata as Record<string, unknown> | undefined;
+  const fromMsg = msgMeta?.source_type;
+  if (typeof fromMsg === "string" && fromMsg) return fromMsg;
+  return "";
+}
+
+/** DEPRECATED legacy fallback. Message-text prefixes that mark an
+ *  internal self-trigger, used ONLY to classify rows persisted before the
+ *  typed source_type marker existed. Superseded by requestSourceType /
+ *  SELF_SOURCE_TYPES; do not extend. */
+const INTERNAL_SELF_PREFIXES = ["Delegation results are ready"];
+
+/** True when message text starts with a legacy internal-self prefix.
+ *  DEPRECATED — prefer role-based classification via requestSourceType.
+ *  Retained as the fallback for untagged rows. */
+export function isInternalSelfMessage(text: string): boolean {
+  if (!text) return false;
+  return INTERNAL_SELF_PREFIXES.some((p) => text.startsWith(p));
+}
+
+/** SSOT classifier for "this a2a_receive row is an internal self-message
+ *  (wake nudge), not a user turn." Classifies by the typed source_type
+ *  marker (role-based, travels with the message); falls back to the
+ *  deprecated text-prefix list ONLY for untagged legacy rows. Mirrors the
+ *  server's isInternalSelfRequest. */
+export function isInternalSelfRequest(
+  body: Record<string, unknown> | null,
+  text: string,
+): boolean {
+  const st = requestSourceType(body);
+  if (st) {
+    // A marker is present: trust it exclusively. A tagged non-self
+    // source is a genuine turn even if its text collides with a prefix.
+    return SELF_SOURCE_TYPES.has(st);
+  }
+  return isInternalSelfMessage(text);
+}
+
 /** Extract text from an activity log response_body (multiple possible formats).
  *
  *  Collects from EVERY source — top-level `parts[].text`, `parts[].root.text`

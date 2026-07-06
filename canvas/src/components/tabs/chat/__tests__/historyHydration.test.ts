@@ -2,8 +2,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { activityRowToMessages, type ActivityRowForHydration } from "../historyHydration";
 
-const NEVER_INTERNAL = (_text: string) => false;
-
 function makeRow(overrides: Partial<ActivityRowForHydration> = {}): ActivityRowForHydration {
   return {
     activity_type: "a2a_receive",
@@ -39,7 +37,7 @@ describe("activityRowToMessages", () => {
         created_at: "2026-04-25T18:00:00.000Z",
         request_body: { params: { message: { parts: [{ kind: "text", text: "hello from earlier today" }] } } },
       });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       const user = msgs.find((m) => m.role === "user")!;
       expect(user.timestamp).toBe("2026-04-25T18:00:00.000Z");
       // Negative assertion: the wall clock is set to 2030. If the
@@ -52,7 +50,7 @@ describe("activityRowToMessages", () => {
         created_at: "2026-04-25T18:05:00.000Z",
         response_body: { result: "agent reply" },
       });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       const agent = msgs.find((m) => m.role === "agent")!;
       expect(agent.timestamp).toBe("2026-04-25T18:05:00.000Z");
       expect(agent.timestamp.startsWith("2030")).toBe(false);
@@ -69,14 +67,12 @@ describe("activityRowToMessages", () => {
           created_at: "2026-04-25T14:00:00.000Z",
           request_body: { params: { message: { parts: [{ kind: "text", text: "first" }] } } },
         }),
-        NEVER_INTERNAL,
       );
       const b = activityRowToMessages(
         makeRow({
           created_at: "2026-04-25T21:01:58.000Z",
           request_body: { params: { message: { parts: [{ kind: "text", text: "second" }] } } },
         }),
-        NEVER_INTERNAL,
       );
       expect(a[0].timestamp).toBe("2026-04-25T14:00:00.000Z");
       expect(b[0].timestamp).toBe("2026-04-25T21:01:58.000Z");
@@ -89,27 +85,51 @@ describe("activityRowToMessages", () => {
       const row = makeRow({
         request_body: { params: { message: { parts: [{ kind: "text", text: "hi agent" }] } } },
       });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       expect(msgs).toHaveLength(1);
       expect(msgs[0].role).toBe("user");
       expect(msgs[0].content).toBe("hi agent");
     });
 
-    it("drops user messages flagged as internal self-messages", () => {
+    it("surfaces internal self-messages as a system notice (legacy prefix fallback), never as a user bubble", () => {
       // The heartbeat self-trigger ("Delegation results are ready...")
-      // gets recorded as a canvas-source row but isn't a real user
-      // message — the predicate filters it out so it doesn't render
-      // as the user talking to themselves.
+      // is NOT a real user message. This untagged row (no source_type)
+      // exercises the legacy text-prefix fallback: it must be surfaced as
+      // role=system / systemKind=notice — NOT dropped, NOT a user bubble
+      // (the bug where the user saw the internal prompt as blue/right).
       const row = makeRow({
         request_body: { params: { message: { parts: [{ kind: "text", text: "Delegation results are ready..." }] } } },
       });
-      const msgs = activityRowToMessages(row, (t) => t.startsWith("Delegation results are ready"));
+      const msgs = activityRowToMessages(row);
       expect(msgs.find((m) => m.role === "user")).toBeUndefined();
+      const sys = msgs.find((m) => m.role === "system");
+      expect(sys).toBeDefined();
+      expect(sys!.systemKind).toBe("notice");
+      expect(sys!.content).toContain("Delegation results are ready");
+    });
+
+    it("classifies internal self-messages by the params.metadata.source_type marker (primary path)", () => {
+      // The role-based SSOT path: a row carrying source_type=self-harvester
+      // is classified system/notice by the marker, NOT by the text (which
+      // here does not match any legacy prefix).
+      const row = makeRow({
+        request_body: {
+          params: {
+            metadata: { source_type: "self-harvester" },
+            message: { parts: [{ kind: "text", text: "wake up and check your work" }] },
+          },
+        },
+      });
+      const msgs = activityRowToMessages(row);
+      expect(msgs.find((m) => m.role === "user")).toBeUndefined();
+      const sys = msgs.find((m) => m.role === "system");
+      expect(sys).toBeDefined();
+      expect(sys!.systemKind).toBe("notice");
     });
 
     it("emits no user message when request_body is null", () => {
       const row = makeRow({ request_body: null });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       expect(msgs.find((m) => m.role === "user")).toBeUndefined();
     });
 
@@ -139,7 +159,7 @@ describe("activityRowToMessages", () => {
           },
         },
       });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       const user = msgs.find((m) => m.role === "user")!;
       expect(user.content).toBe("here's the screenshot");
       expect(user.attachments).toEqual([
@@ -162,7 +182,7 @@ describe("activityRowToMessages", () => {
           },
         },
       });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       expect(msgs).toHaveLength(1);
       expect(msgs[0].role).toBe("user");
       expect(msgs[0].content).toBe("");
@@ -170,11 +190,10 @@ describe("activityRowToMessages", () => {
       expect(msgs[0].attachments![0].name).toBe("report.pdf");
     });
 
-    it("internal-self predicate suppresses the row even if it carries attachments", () => {
-      // Defence-in-depth: heartbeat self-trigger never produces
-      // attachments, but if a future internal trigger DID, we still
-      // want to suppress (otherwise it'd render as the user attaching
-      // something they never touched).
+    it("internal-self message with attachments is surfaced as a system notice, never as a user bubble", () => {
+      // Defence-in-depth: if a future internal trigger DID carry
+      // attachments, they ride on the system note rather than being
+      // misattributed to the user (who never touched them).
       const row = makeRow({
         request_body: {
           params: {
@@ -187,15 +206,18 @@ describe("activityRowToMessages", () => {
           },
         },
       });
-      const msgs = activityRowToMessages(row, (t) => t.startsWith("Delegation results are ready"));
+      const msgs = activityRowToMessages(row);
       expect(msgs.find((m) => m.role === "user")).toBeUndefined();
+      const sys = msgs.find((m) => m.role === "system");
+      expect(sys).toBeDefined();
+      expect(sys!.systemKind).toBe("notice");
     });
   });
 
   describe("agent-message extraction", () => {
     it("emits an agent message from response_body.result string", () => {
       const row = makeRow({ response_body: { result: "agent says hi" } });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       expect(msgs).toHaveLength(1);
       expect(msgs[0].role).toBe("agent");
       expect(msgs[0].content).toBe("agent says hi");
@@ -209,7 +231,7 @@ describe("activityRowToMessages", () => {
         status: "error",
         response_body: { result: "delegation failed" },
       });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       expect(msgs[0].role).toBe("system");
     });
 
@@ -226,7 +248,7 @@ describe("activityRowToMessages", () => {
           ],
         },
       });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       const agent = msgs.find((m) => m.role === "agent")!;
       expect(agent.attachments).toEqual([
         { name: "build.zip", uri: "workspace:/tmp/build.zip", size: 12345 },
@@ -235,13 +257,13 @@ describe("activityRowToMessages", () => {
 
     it("emits no agent message when response_body is null", () => {
       const row = makeRow({ response_body: null });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       expect(msgs.find((m) => m.role === "agent" || m.role === "system")).toBeUndefined();
     });
 
     it("emits no agent message when response_body has neither text nor files", () => {
       const row = makeRow({ response_body: { unrelated: "metadata" } });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       expect(msgs.find((m) => m.role === "agent")).toBeUndefined();
     });
   });
@@ -257,7 +279,7 @@ describe("activityRowToMessages", () => {
         request_body: { params: { message: { parts: [{ kind: "text", text: "what's 2+2?" }] } } },
         response_body: { result: "4" },
       });
-      const msgs = activityRowToMessages(row, NEVER_INTERNAL);
+      const msgs = activityRowToMessages(row);
       expect(msgs).toHaveLength(2);
       expect(msgs[0].role).toBe("user");
       expect(msgs[0].content).toBe("what's 2+2?");
