@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -80,6 +81,13 @@ SENTINEL_JOB = env("SENTINEL_JOB", required=False)
 AUDIT_WORKFLOW_PATH = env("AUDIT_WORKFLOW_PATH", required=False)
 CI_WORKFLOW_PATH = env("CI_WORKFLOW_PATH", required=False)
 DRIFT_LABEL = env("DRIFT_LABEL", required=False)
+# Guard F (phantom-gate lint): the enforced-contexts SSOT. Same file the merge
+# queue reads (`.gitea/required-contexts.txt`) — Guard F reuses its ENFORCED
+# parse so there is zero drift between "what the queue enforces" and "what the
+# phantom lint checks".
+ENFORCED_CONTEXTS_FILE = env(
+    "ENFORCED_CONTEXTS_FILE", required=False, default=".gitea/required-contexts.txt"
+)
 
 OWNER, NAME = (REPO.split("/", 1) + [""])[:2] if REPO else ("", "")
 API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
@@ -461,6 +469,230 @@ def all_emitted_contexts(workflows_dir: str = ".gitea/workflows") -> set[str]:
         if isinstance(doc, dict):
             emitted |= workflow_emitted_contexts(doc)
     return emitted
+
+
+# --------------------------------------------------------------------------
+# Guard F — PHANTOM-GATE LINT (regression-prevention-guards.md §Guard F)
+#
+# The meta-blind-spot that let the OTHER gates silently die: a
+# `required-contexts.txt` entry declared ENFORCED (merge-blocking) whose
+# PRODUCER workflow is toggled off (`disabled_manually` / `disabled`) is a
+# PHANTOM GATE. Under the `[*]` all-green BP the disabled workflow never posts
+# its status, so Gitea has nothing to wait on and the merge queue's
+# file-sourced check sees "missing" — the gate looks required while enforcing
+# nothing. F4 (above) only checks a context is EMITTED-BY-SOME-WORKFLOW-YAML;
+# it does NOT check the emitting workflow is ENABLED. Guard F closes that hole.
+# --------------------------------------------------------------------------
+# Matches the merge queue's `_PENDING_MARKER_RE` (gitea-merge-queue.py) EXACTLY
+# so the ENFORCED set Guard F checks is byte-identical to the set the queue
+# enforces — no drift between the two readers of the same SSOT.
+_PENDING_MARKER_RE = re.compile(r"^\s*#\s*pending-#\d+\b", re.IGNORECASE)
+# Event suffixes Gitea appends to a status context. File entries are bare; live
+# contexts / workflow names carry none, so we strip for a like-for-like match.
+_EVENT_SUFFIX_RE = re.compile(
+    r"\s*\((?:push|pull_request|pull_request_target|schedule|workflow_dispatch)\)\s*$"
+)
+
+
+def _strip_event(ctx: str) -> str:
+    """Strip a trailing `(event)` suffix. Mirrors gitea-merge-queue.py so the
+    two SSOT readers normalize identically."""
+    return _EVENT_SUFFIX_RE.sub("", ctx).strip()
+
+
+def load_enforced_file_contexts(path: str) -> list[str]:
+    """Parse `.gitea/required-contexts.txt` → the ENFORCED (event-stripped)
+    contexts, using the SAME rule as the merge queue's
+    `load_enforced_file_contexts`:
+
+      - blank lines and `#` comment lines are ignored;
+      - inline `# ...` trailing comments are stripped;
+      - the FIRST line matching `# pending-#NNNN ...` begins the NOT-YET-
+        ENFORCED tail: that line and everything after it (to EOF) is
+        documentation, never enforced.
+
+    Fail-closed: a missing/unreadable SSOT RAISES (Guard F must not silently
+    pass when it cannot read the very list it guards)."""
+    if not os.path.exists(path):
+        sys.stderr.write(f"::error::Guard F: enforced-contexts SSOT not found: {path}\n")
+        sys.exit(3)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except (OSError, UnicodeError) as exc:
+        sys.stderr.write(
+            f"::error::Guard F: enforced-contexts SSOT {path} unreadable ({exc!r}); "
+            "failing closed rather than passing an unverifiable gate\n"
+        )
+        sys.exit(3)
+    enforced: list[str] = []
+    in_pending_tail = False
+    for raw in lines:
+        if _PENDING_MARKER_RE.match(raw):
+            in_pending_tail = True
+            continue
+        if in_pending_tail:
+            continue
+        body = raw.split("#", 1)[0].strip()
+        if not body:
+            continue
+        stripped = _strip_event(body)
+        if stripped and stripped not in enforced:
+            enforced.append(stripped)
+    return enforced
+
+
+def fetch_workflow_states() -> dict[str, dict[str, str]]:
+    """Return `{workflow.name: {"state": ..., "file": ...}}` for every workflow
+    in the repo via the Gitea Actions API
+    `GET /repos/{owner}/{name}/actions/workflows`.
+
+    `state` is `active`, `disabled_manually`, or `disabled` (auto-disabled by
+    Gitea after repeated failures / inactivity). `file` is the workflow file id
+    (e.g. `e2e-staging-saas.yml`) so the finding can print an actionable
+    re-enable command. `api()` raises ApiError on any non-2xx — a 401/403 (token
+    can't read the Actions API) therefore fails the lint CLOSED rather than
+    passing a gate whose producer-state is unverifiable (same fail-closed
+    contract as the drift detector's protection read)."""
+    _, body = api("GET", f"/repos/{OWNER}/{NAME}/actions/workflows")
+    states: dict[str, dict[str, str]] = {}
+    if isinstance(body, dict):
+        for wf in body.get("workflows") or []:
+            if not isinstance(wf, dict):
+                continue
+            name = wf.get("name")
+            state = wf.get("state")
+            file_id = wf.get("id") if isinstance(wf.get("id"), str) else ""
+            if isinstance(name, str) and name and isinstance(state, str):
+                # If two workflow files share a `name:` (shouldn't happen, but
+                # be defensive), a disabled one must NOT be masked by an active
+                # sibling — retain the worst (non-active) state so the phantom
+                # is never hidden.
+                prev = states.get(name)
+                if prev is not None and prev["state"] != "active" and state == "active":
+                    continue
+                states[name] = {"state": state, "file": file_id}
+    return states
+
+
+def producer_workflow_name(ctx: str, workflow_names: set[str]) -> str | None:
+    """Resolve the producer workflow NAME for a status context.
+
+    Gitea reports a context as `{workflow.name} / {job.name} (event)`. The
+    enforced entries are already event-stripped, so the workflow name is the
+    part before the first ` / ` — but we match against the REAL set of workflow
+    names (longest-prefix) rather than blindly splitting, so a workflow whose
+    name legitimately contains ` / ` (or one that IS the whole context, e.g. a
+    single-status governance context) still resolves. Returns None if no
+    workflow name is a prefix of the context (an enforced context that no
+    workflow can ever emit — itself a phantom class)."""
+    best: str | None = None
+    for name in workflow_names:
+        if ctx == name or ctx.startswith(name + " / "):
+            if best is None or len(name) > len(best):
+                best = name
+    return best
+
+
+def detect_phantom_gates(
+    enforced: list[str], workflow_states: dict[str, dict[str, str]]
+) -> tuple[list[str], dict]:
+    """Guard F core: for every ENFORCED context, assert its producer workflow's
+    Gitea Actions state is `active`. Returns (findings, debug).
+
+    Two failure classes, both PHANTOMS (an enforced gate that cannot post):
+      P1 — producer workflow state != 'active' (disabled_manually / disabled):
+           the enforced context's status is never emitted → silently unenforced
+           under `[*]` while looking required.
+      P2 — no producer workflow resolves for the enforced context at all: an
+           enforced name that NO workflow emits (rename/delete). This overlaps
+           F4 but is checked here too so the phantom lint is self-contained and
+           fail-closed even when BP is `[*]` (F4 reads BP contexts, which are
+           just `["*"]` here, so F4 is dormant — Guard F reads the file SSOT)."""
+    findings: list[str] = []
+    names = set(workflow_states)
+    phantom_disabled: list[tuple[str, str, str, str]] = []
+    phantom_no_producer: list[str] = []
+    ok: list[tuple[str, str]] = []
+    for ctx in enforced:
+        wf = producer_workflow_name(ctx, names)
+        if wf is None:
+            phantom_no_producer.append(ctx)
+            continue
+        meta = workflow_states.get(wf, {})
+        state = meta.get("state", "unknown")
+        file_id = meta.get("file", "") or f"{wf}.yml"
+        if state == "active":
+            ok.append((ctx, wf))
+        else:
+            phantom_disabled.append((ctx, wf, file_id, state))
+    if phantom_disabled:
+        findings.append(
+            "P1 — ENFORCED required-contexts.txt entries whose PRODUCER "
+            "workflow is NOT active (PHANTOM GATE: merge-blocking on paper, "
+            "silently unenforced because the disabled workflow never posts the "
+            "status):\n"
+            + "\n".join(
+                f"  - {ctx}\n      producer: {file_id} (name '{wf}')  state={state}"
+                for ctx, wf, file_id, state in phantom_disabled
+            )
+        )
+    if phantom_no_producer:
+        findings.append(
+            "P2 — ENFORCED required-contexts.txt entries with NO producer "
+            "workflow (no workflow `name:` is a prefix of the context; the "
+            "status can never be posted):\n"
+            + "\n".join(f"  - {ctx}" for ctx in phantom_no_producer)
+        )
+    debug = {
+        "enforced_count": len(enforced),
+        "phantom_disabled": [
+            {"context": c, "producer_file": fi, "producer_name": w, "state": s}
+            for c, w, fi, s in phantom_disabled
+        ],
+        "phantom_no_producer": phantom_no_producer,
+        "ok": [{"context": c, "producer": w} for c, w in ok],
+    }
+    return findings, debug
+
+
+def run_phantom_gate_lint() -> int:
+    """`--phantom-gate-lint` entrypoint. Unlike the drift detector (which files
+    an idempotent issue and exits 0 — the issue IS the alarm), Guard F is a HARD
+    LINT: it EXITS NON-ZERO (red) when any ENFORCED context has a non-active
+    producer, so a toggled-off required gate trips RED at merge time instead of
+    degrading to a silent advisory. This is the meta-guard that guards the
+    gates."""
+    if not (GITEA_TOKEN and GITEA_HOST and REPO):
+        sys.stderr.write(
+            "::error::Guard F: GITEA_TOKEN + GITEA_HOST + REPO are required to "
+            "read workflow states — failing closed\n"
+        )
+        return 2
+    enforced = load_enforced_file_contexts(ENFORCED_CONTEXTS_FILE)
+    states = fetch_workflow_states()
+    findings, debug = detect_phantom_gates(enforced, states)
+    print("::group::Guard F — phantom-gate lint debug")
+    print(json.dumps(debug, indent=2, sort_keys=True))
+    print("::endgroup::")
+    if findings:
+        print(
+            "::error::Guard F FAILED — phantom gate(s) detected. An ENFORCED "
+            "required-contexts.txt entry has a producer workflow that is not "
+            "active, so it is required-on-paper but silently unenforced. Fix: "
+            "re-enable the producer workflow (PUT "
+            f"/repos/{OWNER}/{NAME}/actions/workflows/<file>/enable), or PARK "
+            "the context below a `# pending-#NNNN` marker if it is legitimately "
+            "not yet ready to enforce."
+        )
+        for f in findings:
+            print(f)
+        return 1
+    print(
+        f"::notice::Guard F PASSED — all {len(enforced)} ENFORCED "
+        "required-contexts.txt entries have an active producer workflow."
+    )
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -869,11 +1101,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the `[ci-drift]` issue. Useful for local testing and for "
         "previewing output before turning the workflow loose.",
     )
+    p.add_argument(
+        "--phantom-gate-lint",
+        action="store_true",
+        help="Guard F: assert every ENFORCED required-contexts.txt entry has "
+        "an ACTIVE producer workflow (Gitea Actions state). EXITS NON-ZERO "
+        "(red) on a phantom gate — a required context whose producer workflow "
+        "is disabled. Runs standalone (does not need the drift env contract).",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    # Guard F is a standalone HARD lint that needs only GITEA_TOKEN/HOST/REPO
+    # (+ the enforced-contexts SSOT) — NOT the full drift env contract. Run it
+    # BEFORE _require_runtime_env so it can be invoked without BRANCHES /
+    # SENTINEL_JOB / the audit+ci workflow paths.
+    if args.phantom_gate_lint:
+        return run_phantom_gate_lint()
+
     _require_runtime_env()
 
     for branch in BRANCHES:
