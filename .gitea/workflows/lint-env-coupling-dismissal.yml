@@ -34,6 +34,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # This job is a standalone red-status governance lint, enforced under the
+  # core/main [*] all-green wildcard gate. It is NOT an enumerated branch-
+  # protection required context, so it never freezes the merge queue looking
+  # for a phantom emitter; the review half rides the paired sop-checklist item
+  # `no-flaky-env-coupling`.
+  # bp-exempt: no-flaky/env-coupling governance lint, not a gate context.
   lint:
     name: lint-env-coupling-dismissal
     runs-on: ubuntu-latest
