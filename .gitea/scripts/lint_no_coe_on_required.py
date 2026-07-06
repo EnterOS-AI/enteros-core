@@ -51,6 +51,17 @@ REPO = os.environ.get("REPO", "")
 
 EVENT_SUFFIX = re.compile(r"\s*\((pull_request|push|pull_request_target)\)\s*$")
 
+# The all-green WILDCARD gate. Gitea branch-protection accepts "*" in
+# status_check_contexts to mean "every posted commit status must be
+# success" (the [*] gate rolled out per gate-model-require-all-individually
+# / wildcard-gate-enforces-not-a-bug). "*" is a META-gate, NOT an enumerable
+# job context — no job emits a status literally named "*", so it cannot (and
+# must not) live in the enumerated allowlist: putting it in the merge-queue's
+# enforced list would look for a `*` success on every PR head and freeze the
+# queue. Recognize it here so the live-BP drift check treats it as the
+# sanctioned wildcard rather than "a context missing from the allowlist".
+WILDCARD_CONTEXTS = {"*"}
+
 
 def strip_event(ctx):
     return EVENT_SUFFIX.sub("", ctx).strip()
@@ -138,10 +149,13 @@ def main():
               f"this file is the SSOT for which contexts are merge-required.")
         return 1
 
-    # Optional live-BP drift check (graceful).
+    # Optional live-BP drift check (graceful). The "*" all-green wildcard is
+    # the sanctioned meta-gate, not drift — exclude it from the comparison
+    # (see WILDCARD_CONTEXTS). It is not an enumerable context and must never
+    # be added to the enforced allowlist.
     live = live_required_contexts()
     if live is not None:
-        only_live = live - required
+        only_live = (live - required) - WILDCARD_CONTEXTS
         if only_live:
             print("FAIL: branch-protection required contexts NOT in the checked-in allowlist "
                   f"({REQUIRED_FILE}) — allowlist has drifted from live BP:")
