@@ -12,7 +12,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/gin-gonic/gin"
-	sdkcp "go.moleculesai.app/sdk/cloudprovider"
+	sdkcp "go.moleculesai.app/sdk/gen/go/cloudprovider"
 )
 
 const (
@@ -49,7 +49,7 @@ type workspaceDisplayResponse struct {
 // the canvas renders and the set the backend validates can never disagree.
 //
 // The PROVIDER SET is no longer a hand-maintained mirror of the controlplane
-// list: it DERIVES from the shared SDK SSOT (go.moleculesai.app/sdk/cloudprovider,
+// list: it DERIVES from the shared SDK SSOT (go.moleculesai.app/sdk/gen/go/cloudprovider,
 // CloudIDs — the cloud/billable set, which excludes the local Molecules-Server
 // box that has no per-provider instance types). The per-provider instance-type
 // catalogs (Hetzner cpx*/cax*, GCP e2-*, AWS t3*/m6i*/c6i*) remain core-local

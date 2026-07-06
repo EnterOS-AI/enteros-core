@@ -7,7 +7,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/gin-gonic/gin"
-	sdkcp "go.moleculesai.app/sdk/cloudprovider"
+	sdkcp "go.moleculesai.app/sdk/gen/go/cloudprovider"
 )
 
 // SetComputeInstanceRequest is the body the control plane POSTs after a
