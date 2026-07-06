@@ -40,6 +40,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/codexauth"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/imagewatch"
@@ -233,6 +234,23 @@ func main() {
 	// never drift. Local to the tenant — no CP, no R2 (core-OSS-clean).
 	hostStateDir := provisioner.ResolveWorkspaceStateBaseDir()
 
+	// CORE-served boot-config token delivery (the FINAL, platform-agnostic config
+	// path — no R2, no CP dependency). Dark by default: create the ONE shared
+	// token store only when MOLECULE_BOOT_CONFIG_ENABLE is truthy, and hand the
+	// SAME instance to the mint side (CPProvisioner) and the serve side
+	// (BootConfigHandler, wired in router.Setup) so they cannot drift. When nil,
+	// no token is minted and the boot-config endpoint 404s — byte-identical to a
+	// deployment that never had the feature.
+	var bootTokens *provisioner.BootConfigTokenStore
+	if envx.Bool("MOLECULE_BOOT_CONFIG_ENABLE", false) {
+		ttl := provisioner.BootConfigTokenTTL
+		if d, derr := time.ParseDuration(strings.TrimSpace(os.Getenv("MOLECULE_BOOT_CONFIG_TTL"))); derr == nil && d > 0 {
+			ttl = d
+		}
+		bootTokens = provisioner.NewBootConfigTokenStore(ttl)
+		log.Printf("Boot-config token delivery: ENABLED (ttl=%s) — runtime fetches config from the tenant-server at boot (no R2, no CP)", ttl)
+	}
+
 	var prov *provisioner.Provisioner
 	var cpProv *provisioner.CPProvisioner
 	if os.Getenv("MOLECULE_ORG_ID") != "" {
@@ -242,6 +260,7 @@ func main() {
 		} else {
 			cpProv = cp
 			cpProv.WithHostStateDir(hostStateDir)
+			cpProv.WithBootConfigTokenStore(bootTokens)
 			defer cpProv.Close()
 			log.Println("Provisioner: Control Plane (auto-detected SaaS tenant)")
 		}
@@ -653,7 +672,7 @@ func main() {
 		defer cancel()
 		return refreshTemplates(ctx)
 	}
-	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, hostStateDir, wh, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
+	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, hostStateDir, bootTokens, wh, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
 
 	// Plugin drift sweeper — periodic detection of upstream plugin version drift
 	// (core#123). Scans workspace_plugins rows where tracked_ref != 'none',

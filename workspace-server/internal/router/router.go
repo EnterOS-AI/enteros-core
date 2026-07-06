@@ -38,7 +38,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -886,6 +886,16 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	wsAuth.GET("/files/*path", tmplh.ReadFile)
 	wsAuth.PUT("/files/*path", tmplh.WriteFile)
 	wsAuth.DELETE("/files/*path", tmplh.DeleteFile)
+
+	// CORE-served boot-config fetch (the FINAL, platform-agnostic config path —
+	// no R2, no CP). Registered OUTSIDE the WorkspaceAuth group: the runtime holds
+	// a one-time BOOT token (minted by CPProvisioner into MOLECULE_CONFIG_BOOT_TOKEN,
+	// forwarded verbatim by the CP), NOT a workspace bearer, and the handler does
+	// its own token-store validation + serves the rendered /configs bundle ONCE
+	// from the host-side mirror before invalidating the token. 404s (as if
+	// unrouted) when the feature flag is off (bootTokens nil) — prod byte-identical.
+	bootCfgH := handlers.NewBootConfigHandler(bootTokens, hostStateDir)
+	r.GET("/internal/workspaces/boot-config", bootCfgH.Serve)
 
 	// Rescue read (RFC internal#742 Part 3) — latest post-mortem bundle
 	// for a boot-failed/terminated workspace, so "why won't my agent
