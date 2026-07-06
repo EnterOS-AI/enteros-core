@@ -144,6 +144,25 @@ jobs:
       E2E_PROVIDER: molecules-server
       STAGING_E2E: '1'
       GATE_FORCE_FAIL: ${{ vars.STAGING_TENANT_CD_FORCE_GATE_FAIL }}
+      # Guard B (fresh-org platform-agent CALLABLE gate). The default runtime the
+      # fresh concierge MUST be on — openclaw per the operator directive, so a
+      # default-flip skew (task#225/#226) is caught, not silently passed. Override
+      # via the repo var if the platform default ever changes (de-hardcoded).
+      E2E_DEFAULT_RUNTIME: ${{ vars.MOLECULE_DEFAULT_RUNTIME || 'openclaw' }}
+      # Require the REAL A2A tool-use turn (drive the concierge to actually RUN
+      # provision_workspace and assert the created workspace appears) — not
+      # presence-only. This is the deep "callable" proof that catches a
+      # present-but-not-runnable verb (the flaw that let regressions reach prod).
+      E2E_ASSERT_MGMT_MCP_CALLABLE: '1'
+      # ORDERING GUARD (staged): when the operator flips
+      # STAGING_TENANT_CD_ASSERT_CANDIDATE_SHA=1 (after the CP adopts the advanced
+      # pin so fresh provisions boot the candidate), the gate asserts the tenant it
+      # exercised reports THIS commit's git_sha via /buildinfo — turning "the e2e
+      # ran against the pre-advance pin, not the candidate" from a silent
+      # false-green into a HARD RED. Empty by default so current CD is never
+      # red-by-design; the Go detection guard (assertTenantBuildIsCandidate) is
+      # inert without it.
+      E2E_EXPECT_TENANT_BUILD_SHA: ${{ vars.STAGING_TENANT_CD_ASSERT_CANDIDATE_SHA == '1' && github.sha || '' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Force-fail hook (prove a red gate blocks the fleet roll)
@@ -198,13 +217,17 @@ jobs:
       - name: Run workspace-lifecycle + fresh-org platform-agent mgmt-MCP staginge2e (HARD GATE)
         working-directory: workspace-server
         # TestWorkspaceLifecycle_Staging: a workspace serves A2A across restart/pause/hibernate.
-        # TestPlatformAgentMgmtMCP_Staging: a FRESH org's platform agent reaches online WITH its
-        #   management MCP present + provision_workspace callable (RCA #2970 online contract). The
-        #   lifecycle test only exercises a PLAIN claude-code workspace (no declared plugins), so it
-        #   cannot see a fresh openclaw concierge whose mgmt-MCP plugin never installed — the operator
-        #   "test14" failure (a presign:// declared source the deployed runtime could not resolve).
-        #   This makes the deploy gate go RED on that failure. BOTH must pass to advance the pin +
-        #   roll the fleet (needs-gated, un-bypassable).
+        # TestPlatformAgentMgmtMCP_Staging (Guard B): a FRESH org's platform agent reaches online on
+        #   the EXPECTED default runtime (openclaw — E2E_DEFAULT_RUNTIME) WITH its management MCP
+        #   present AND — because E2E_ASSERT_MGMT_MCP_CALLABLE=1 — a REAL A2A tool-use turn drives it
+        #   to actually RUN provision_workspace and a genuine kind='workspace' row appears (genuinely
+        #   CALLABLE, not presence-only). It also asserts (when E2E_EXPECT_TENANT_BUILD_SHA is set) that
+        #   the tenant it exercised is the DEPLOY CANDIDATE, not a stale pre-advance pin. The lifecycle
+        #   test only exercises a PLAIN workspace (no declared plugins), so it cannot see a fresh
+        #   openclaw concierge whose mgmt-MCP plugin never installed — the operator "test14" failure
+        #   (a presign:// declared source the deployed runtime could not resolve). This makes the
+        #   deploy gate go RED on that failure. BOTH must pass to advance the pin + roll the fleet
+        #   (needs-gated, un-bypassable).
         run: go test -tags staging_e2e ./internal/staginge2e/ -run 'TestWorkspaceLifecycle_Staging|TestPlatformAgentMgmtMCP_Staging' -count=1 -v -timeout 50m
 
   advance-pin:
