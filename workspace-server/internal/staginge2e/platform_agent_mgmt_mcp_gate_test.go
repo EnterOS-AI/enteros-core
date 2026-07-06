@@ -23,7 +23,7 @@ import (
 	"strings"
 	"testing"
 
-	molcontracts "go.moleculesai.app/molecule-contracts/gen/go"
+	molcontracts "go.moleculesai.app/sdk/gen/go/molcontracts"
 )
 
 // requiredVerb is the SSOT management verb id

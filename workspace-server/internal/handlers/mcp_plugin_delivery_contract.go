@@ -4,7 +4,7 @@ package handlers
 //
 // Core now CONSUMES this contract from the molecule-contracts SSOT (RFC
 // molecule-core#3285 §10 "consume, never two copies"): it imports the generated
-// Go binding (go.moleculesai.app/molecule-contracts/gen/go) instead of reading
+// Go binding (go.moleculesai.app/sdk/gen/go/molcontracts) instead of reading
 // its own JSON file. The import IS the link — core's runtime + tests can no
 // longer drift from the SSOT.
 //
@@ -17,7 +17,7 @@ package handlers
 // verb-manifest check, so it is sequenced after the incident).
 
 import (
-	molcontracts "go.moleculesai.app/molecule-contracts/gen/go"
+	molcontracts "go.moleculesai.app/sdk/gen/go/molcontracts"
 )
 
 // MCPPluginDeliveryContract / Port / Runtime are the generated SSOT types,

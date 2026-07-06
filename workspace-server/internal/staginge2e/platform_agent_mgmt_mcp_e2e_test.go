@@ -50,7 +50,7 @@ import (
 	"testing"
 	"time"
 
-	molcontracts "go.moleculesai.app/molecule-contracts/gen/go"
+	molcontracts "go.moleculesai.app/sdk/gen/go/molcontracts"
 )
 
 func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {

@@ -43,7 +43,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	molcontracts "go.moleculesai.app/molecule-contracts/gen/go"
+	molcontracts "go.moleculesai.app/sdk/gen/go/molcontracts"
 	"gopkg.in/yaml.v3"
 )
 
