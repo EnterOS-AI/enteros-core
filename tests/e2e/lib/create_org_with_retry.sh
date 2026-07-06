@@ -24,6 +24,12 @@
 #   create_org_with_retry "$CP_URL" "$ADMIN_TOKEN" "$body_json" || fail "..."
 #   ORG_ID=$(printf '%s' "$CREATE_ORG_RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))')
 
+# CREATE_ORG_RESP is an OUTPUT variable: this lib is sourced and the caller reads
+# it after create_org_with_retry returns. shellcheck can't see the cross-file use,
+# so its SC2034 "appears unused" is a false positive here (same pattern as the
+# sibling e2e libs' REGISTER_RESP / REGISTER_STATUS output vars).
+# shellcheck disable=SC2034
+#
 # Bounded retry budget (transient window during a CP roll is seconds; 6×10s ≈ 1m
 # is a generous safety net that still fails loud on a genuinely-down CP).
 CREATE_ORG_RETRIES="${CREATE_ORG_RETRIES:-6}"
