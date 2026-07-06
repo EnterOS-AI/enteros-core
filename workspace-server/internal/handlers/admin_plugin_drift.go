@@ -155,17 +155,26 @@ func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 	}
 	defer func() { _ = os.RemoveAll(result.StagedDir) }()
 
-	// Deliver to the workspace container.
+	// Deliver to the workspace container. Docker-less tenant (#206): the
+	// docker-push is RETIRED — errNoPushTarget means "deliver by pull". The
+	// declared row already carries the tracked ref, so the restart in step 5 lets
+	// the boot materializer pull the new commit. Skip the push and keep going
+	// (record the new SHA + restart below); no bytes copied in.
 	if err := h.pluginsHandler.DeliverForApply(ctx, entry.WorkspaceID, result); err != nil {
-		var he *httpErr
-		if errors.As(err, &he) {
-			c.JSON(he.Status, gin.H{"error": fmt.Sprintf("plugin deliver failed: %v", he.Body["error"]), "queue_id": queueID})
+		if errors.Is(err, errNoPushTarget) {
+			log.Printf("AdminPluginDrift: apply: docker-less workspace %s/%s — retiring docker-push, re-materialize on restart (pull)",
+				entry.WorkspaceID, entry.PluginName)
+		} else {
+			var he *httpErr
+			if errors.As(err, &he) {
+				c.JSON(he.Status, gin.H{"error": fmt.Sprintf("plugin deliver failed: %v", he.Body["error"]), "queue_id": queueID})
+				return
+			}
+			log.Printf("AdminPluginDrift: apply: deliver failed for %s/%s: %v",
+				entry.WorkspaceID, entry.PluginName, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin deliver failed", "queue_id": queueID})
 			return
 		}
-		log.Printf("AdminPluginDrift: apply: deliver failed for %s/%s: %v",
-			entry.WorkspaceID, entry.PluginName, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin deliver failed", "queue_id": queueID})
-		return
 	}
 
 	// Record the install with the new SHA. This updates installed_sha on the

@@ -269,16 +269,21 @@ func TestPluginInstall_SaaS_PropagatesEICError(t *testing.T) {
 // empty instance_id (e.g. workspace pre-provision, or local-Docker
 // deploy without a running container). The handler MUST 503, not silently
 // dispatch to EIC with an empty instance_id.
-func TestPluginInstall_NoBackends_Returns503(t *testing.T) {
+// TestPluginInstall_NoBackends_DeliversByPull — no docker + empty instance_id
+// (docker-less tenant, #206/#230): the docker-push is RETIRED, so Install
+// delivers by PULL (declare + re-materialize) rather than the old 503 dead-end.
+// EIC must NOT be called.
+func TestPluginInstall_NoBackends_DeliversByPull(t *testing.T) {
 	registry := t.TempDir()
 	stagePluginRegistry(t, registry, "browser-automation")
 
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	stubInstallPluginViaEIC(t, func(ctx context.Context, instanceID, runtime, pluginName, stagedDir string) error {
-		t.Errorf("EIC must not be called when instance_id is empty")
+		t.Errorf("EIC must not be called for the docker-less pull path")
 		return nil
 	})
 
@@ -298,24 +303,26 @@ func TestPluginInstall_NoBackends_Returns503(t *testing.T) {
 
 	h.Install(c)
 
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected 503, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 (pull), got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"delivery":"pull"`) {
+		t.Errorf("expected pull delivery, got: %s", w.Body.String())
 	}
 }
 
-// TestPluginInstall_InstanceLookupError_Returns503 — a DB hiccup on the
-// instance_id lookup must NOT crash or 502; the handler logs and falls
-// through to 503. Same fail-open shape h.runtimeLookup uses (see
-// TestPluginInstall_NoRuntimeLookup_FailsOpen). Pinning this prevents a
-// future "tighten error handling" refactor from quietly converting a DB
-// blip into a five-minute outage on the install endpoint.
-func TestPluginInstall_InstanceLookupError_Returns503(t *testing.T) {
+// TestPluginInstall_InstanceLookupError_DeliversByPull — a DB hiccup on the
+// instance_id lookup must NOT crash or 502; the handler logs, treats it as "no
+// push target", and delivers by PULL (fail-open, docker-push retired). Pinning
+// this prevents a future refactor from quietly turning a DB blip into an outage.
+func TestPluginInstall_InstanceLookupError_DeliversByPull(t *testing.T) {
 	registry := t.TempDir()
 	stagePluginRegistry(t, registry, "browser-automation")
 
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	h := NewPluginsHandler(registry, nil, nil).
 		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
@@ -333,8 +340,11 @@ func TestPluginInstall_InstanceLookupError_Returns503(t *testing.T) {
 
 	h.Install(c)
 
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected 503 on instance-id lookup error, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 (pull) on instance-id lookup error, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"delivery":"pull"`) {
+		t.Errorf("expected pull delivery, got: %s", w.Body.String())
 	}
 }
 

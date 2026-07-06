@@ -88,6 +88,35 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 	}
 
 	restartScheduled, err := h.deliverToContainer(ctx, workspaceID, result)
+	if errors.Is(err, errNoPushTarget) {
+		// Docker-less tenant (#206 / #230): the docker-push into the container is
+		// RETIRED. Deliver by PULL — declare the plugin and re-materialize so the
+		// runtime boot installer pulls it into /configs/plugins/<name>/. The box
+		// does the fetch; the agent never does (runtime-agnostic).
+		scheduled, rmErr := h.reMaterialize(ctx, workspaceID, result.PluginName, result.Source.Raw())
+		if rmErr != nil {
+			var he *httpErr
+			if errors.As(rmErr, &he) {
+				c.JSON(he.Status, he.Body)
+				return
+			}
+			log.Printf("Plugin install: re-materialize declare failed for %s → %s: %v", result.PluginName, workspaceID, rmErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin install failed"})
+			return
+		}
+		if recErr := recordWorkspacePluginInstall(ctx, workspaceID, result.PluginName, result.Source.Raw(), req.Track, result.InstalledSHA); recErr != nil {
+			log.Printf("Plugin install: failed to record %s for %s (pull path): %v", result.PluginName, workspaceID, recErr)
+		}
+		log.Printf("Plugin install (pull): %s via %s → workspace %s (re-materialize, restarting=%t)", result.PluginName, result.Source.Scheme, workspaceID, scheduled)
+		c.JSON(http.StatusOK, gin.H{
+			"status":     "installing",
+			"plugin":     result.PluginName,
+			"source":     result.Source.Raw(),
+			"restarting": scheduled,
+			"delivery":   "pull",
+		})
+		return
+	}
 	if err != nil {
 		var he *httpErr
 		if errors.As(err, &he) {

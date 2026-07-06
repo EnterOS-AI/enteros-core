@@ -30,6 +30,19 @@ const (
 	defaultInstallMaxDirBytes  = 100 * 1024 * 1024 // 100 MiB staged tree
 )
 
+// errNoPushTarget is returned by deliverToContainer when there is NO docker-push
+// target for the workspace — a molecules-server / local-docker tenant whose
+// workspace-server runs INSIDE a container with no docker.sock mounted (#206), so
+// h.docker == nil and the instance_id is a container name (not an i-<hex> EC2 id).
+//
+// The docker-PUSH into the container is RETIRED for these tenants (the operator
+// pull-model target): the old path 503'd (or, before that, hung on AWS EIC ->
+// 502; core#182). Callers now treat this sentinel as "deliver by PULL instead" —
+// they declare the plugin and RE-MATERIALIZE (restart), so the runtime's boot
+// materializer (molecule_runtime.plugin_sources) pulls the declared plugins into
+// /configs/plugins/<name>/ on the next boot. The AGENT never fetches; the box does.
+var errNoPushTarget = errors.New("no docker-push target: deliver by pull (re-materialize)")
+
 // httpErr is the typed error returned by Install helpers. The handler
 // matches it with errors.As and emits the attached status + body. Using
 // a typed error instead of a 5-value tuple keeps helper signatures Go-
@@ -442,15 +455,38 @@ func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID str
 		}
 
 		// Non-EC2 instance id (local-docker) but no docker client wired — the
-		// "prov==nil and no reachable docker daemon" misconfiguration. Fail
-		// LOUD instead of masking it as a 90s AWS EIC timeout → 502.
-		log.Printf("Plugin install: workspace %s is on the local-docker backend (instance_id=%s) but this server has no docker client; refusing to fall back to AWS EIC", workspaceID, instanceID)
-		return false, newHTTPErr(http.StatusServiceUnavailable, gin.H{
-			"error": "workspace runs on the local-docker backend but this server has no docker client (prov==nil and no reachable docker daemon)",
-		})
+		// docker-less tenant (#206: no docker.sock mounted). The docker-PUSH is
+		// RETIRED here: signal the caller to deliver by PULL (re-materialize) so
+		// the runtime's boot materializer pulls the declared plugins. No more 503
+		// dead-end, no AWS EIC 90s→502.
+		log.Printf("Plugin install: workspace %s is docker-less (instance_id=%s, no docker client) — retiring the docker-push, delivering by pull (re-materialize)", workspaceID, instanceID)
+		return false, errNoPushTarget
 	}
 
-	return false, newHTTPErr(http.StatusServiceUnavailable, gin.H{"error": "workspace container not running"})
+	// No running container and no instance id — deliver by pull. The boot
+	// materializer installs the declared plugins on the next (re-)provision.
+	return false, errNoPushTarget
+}
+
+// reMaterialize delivers a plugin by PULL (the docker-less path that replaces the
+// retired docker-push): it records the plugin in the workspace's DECLARED set
+// (workspace_declared_plugins) so the runtime's boot materializer
+// (molecule_runtime.plugin_sources) installs it into /configs/plugins/<name>/,
+// then triggers a restart so that boot runs. The AGENT never fetches; the box
+// pulls its declared plugins itself (runtime-agnostic contract). Returns whether
+// a restart was scheduled. recordDeclaredPlugin no-ops when the DB is unset (unit
+// tests) and enforces the privileged-plugin kind gate (a user can't declare the
+// platform MCP on a non-platform workspace).
+func (h *PluginsHandler) reMaterialize(ctx context.Context, workspaceID, pluginName, source string) (bool, error) {
+	if err := recordDeclaredPlugin(ctx, workspaceID, pluginName, source); err != nil {
+		return false, err
+	}
+	if h.restartFunc != nil {
+		wsID := workspaceID
+		globalGoAsync(func() { h.restartFunc(wsID) })
+		return true, nil
+	}
+	return false, nil
 }
 
 // deliverViaDocker copies the staged plugin dir into containerName via docker
