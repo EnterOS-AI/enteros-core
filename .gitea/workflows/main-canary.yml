@@ -189,6 +189,16 @@ jobs:
           # GITHUB_TOKEN when the org secret isn't set (same pattern as
           # main-red-watchdog.yml + ci-required-drift.yml).
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN || secrets.GITHUB_TOKEN }}
+          # Call the RUNNER-REACHABLE INTERNAL Gitea API, never the CF-fronted
+          # host. Cloudflare returns Error 1010 ("browser signature blocked",
+          # HTTP 403) for the act_runner's signature against git.moleculesai.app,
+          # so the issue-filer itself threw and the CRITICAL main-canary issue
+          # was NEVER filed — silent alarm loss on exactly the failure it exists
+          # to announce (run 440114/job 623479). github.api_url is the internal
+          # instance API base the act_runner injects; prefer it. GITEA_HOST is
+          # kept only for building human-facing browse links (not API calls).
+          # Same remedy shipped for sop-checklist (task #196).
+          GITEA_API_URL: ${{ github.api_url }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
@@ -205,7 +215,12 @@ jobs:
           REPO=os.environ["REPO"]; SHA=os.environ.get("SHA",""); RUN_URL=os.environ.get("RUN_URL","")
           STAGES=os.environ.get("STAGES","(unknown)"); LOG_PATH=os.environ.get("LOG_PATH","")
           OWNER,NAME=(REPO.split("/",1)+[""])[:2]
-          API="https://%s/api/v1" % HOST
+          # Runner-reachable internal API base (github.api_url, e.g.
+          # http://molecule-gitea-local:3000/api/v1). Fall back to the internal
+          # host only — NEVER the CF host, which is what raised the 1010 that
+          # swallowed this alarm. Strip any trailing slash for clean joins.
+          API=(os.environ.get("GITEA_API_URL","").rstrip("/")
+               or "http://molecule-gitea-local:3000/api/v1")
           TITLE="[main-canary] %s: %s" % (REPO, SHA[:10])
 
           def api(method, path, body=None):
