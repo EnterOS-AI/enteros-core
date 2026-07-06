@@ -40,6 +40,9 @@ permissions:
   contents: read
 
 jobs:
+  # This context (runtime-default-flip-gate / flip-gate) fires only on push to
+  # main + workflow_dispatch — never on pull_request — so it is not a PR merge gate.
+  # bp-exempt: push/dispatch coupling EXERCISER (dry-run default; zero writes without RUNTIME_FLIP_APPLY). The hard runtime-default-flip gate is enforced on the apply path (gate-runtime-default-flip.sh self-reverts on red) + staging-tenant-cd.yml e2e-smoke, not this status.
   flip-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 60
