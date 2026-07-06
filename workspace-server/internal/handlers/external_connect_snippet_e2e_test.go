@@ -47,17 +47,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// bannedInternalHosts are the internal-address hostnames a customer-facing
-// connect-snippet URL must NEVER contain. A real external agent off the
-// docker host cannot reach any of them, and exposing one leaks internal
-// topology in a customer-facing response.
-var bannedInternalHosts = []string{
-	"host.docker.internal",
-	"127.0.0.1",
-	"0.0.0.0",
-	"::1",
-	"localhost",
-}
+// bannedInternalHosts (the internal-address hostnames a customer-facing
+// connect-snippet URL must NEVER contain) is defined in external_connection.go
+// as the production SSOT and shared by this test + the leak-lint, so the guard
+// and the assertion can never drift.
 
 // assertPublicSnippetURL fails if value is not a public, portless HTTPS URL
 // free of any internal-address hostname. This is the single assertion the

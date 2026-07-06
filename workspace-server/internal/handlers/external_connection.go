@@ -95,13 +95,18 @@ func BuildExternalConnectionPayload(platformURL, workspaceID, workspaceName, aut
 //  3. Request scheme + Host — last resort, reached only when NEITHER
 //     public-base env is set (pure local dev / a misconfigured deploy).
 func externalPlatformURL(c *gin.Context) string {
-	if v := strings.TrimSpace(os.Getenv("EXTERNAL_PLATFORM_URL")); v != "" {
+	// Each env source is trusted ONLY if it passes isPublicExternalURL. core
+	// does not guarantee either env is public (main.go defaults PLATFORM_URL to
+	// an internal host), so a hostile/in-cluster value must fail the predicate
+	// and fall through rather than be served verbatim as the customer base.
+	if v := strings.TrimSpace(os.Getenv("EXTERNAL_PLATFORM_URL")); v != "" && isPublicExternalURL(v) {
 		return v
 	}
 	// Defense-in-depth: the public PLATFORM_URL the CP also injects. Falls
 	// here BEFORE the request Host so a missing EXTERNAL_PLATFORM_URL never
-	// leaks an internal host into the customer-facing connect snippet.
-	if v := strings.TrimSpace(os.Getenv("PLATFORM_URL")); v != "" {
+	// leaks an internal host into the customer-facing connect snippet — but
+	// only when PLATFORM_URL is itself public (validated above).
+	if v := strings.TrimSpace(os.Getenv("PLATFORM_URL")); v != "" && isPublicExternalURL(v) {
 		return v
 	}
 	scheme := "https"

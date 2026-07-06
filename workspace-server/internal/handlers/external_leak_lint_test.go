@@ -278,4 +278,44 @@ func TestLeakLint_ExternalPlatformURLPrecedence(t *testing.T) {
 			t.Errorf("got %q; want the request-Host fallback only when both envs are empty", got)
 		}
 	})
+
+	// 4. HOSTILE env values must NOT be trusted. core does not guarantee
+	//    PLATFORM_URL is public — cmd/server/main.go defaults it to
+	//    http://host.docker.internal:<port>, and provisioner/platform paths
+	//    carry in-cluster values (http://platform:8080). Trusting such a value
+	//    verbatim would serve an internal / non-HTTPS / ported base as the
+	//    customer-facing URL — the exact leak this endpoint's guard closes,
+	//    now reached BEFORE the request-Host path. isPublicExternalURL must
+	//    reject them and fall through to the request-Host last resort. A
+	//    class-level leak-lint that adds a trust-an-env path MUST exercise it
+	//    with a hostile value or it is not guarding the class it claims to.
+	for _, bad := range []string{
+		"http://platform:8080",              // in-cluster, non-HTTPS, ported
+		"http://host.docker.internal:8080",  // internal host, non-HTTPS, ported
+		"https://host.docker.internal",      // internal host even over HTTPS
+		"http://127.0.0.1:9000",             // loopback
+		"https://acme.moleculesai.app:8443", // public host but a raw port survives
+	} {
+		t.Run("rejects_hostile_platform_url/"+bad, func(t *testing.T) {
+			t.Setenv("EXTERNAL_PLATFORM_URL", "")
+			t.Setenv("PLATFORM_URL", bad)
+			got := externalPlatformURL(ctxWithInternalHost(t))
+			if got == bad {
+				t.Errorf("externalPlatformURL trusted hostile PLATFORM_URL %q verbatim — must reject and fall through", bad)
+			}
+			if got != "https://host.docker.internal:50389" {
+				t.Errorf("got %q; want the request-Host fallback after rejecting hostile PLATFORM_URL %q", got, bad)
+			}
+		})
+	}
+
+	// 5. A hostile EXTERNAL_PLATFORM_URL is likewise rejected, and resolution
+	//    falls through to a *valid* PLATFORM_URL (not straight to the Host).
+	t.Run("rejects_hostile_external_platform_url_then_uses_valid_platform_url", func(t *testing.T) {
+		t.Setenv("EXTERNAL_PLATFORM_URL", "http://platform:8080")
+		t.Setenv("PLATFORM_URL", pub)
+		if got := externalPlatformURL(ctxWithInternalHost(t)); got != pub {
+			t.Errorf("got %q; want %q (hostile EXTERNAL_PLATFORM_URL rejected, valid PLATFORM_URL used)", got, pub)
+		}
+	})
 }
