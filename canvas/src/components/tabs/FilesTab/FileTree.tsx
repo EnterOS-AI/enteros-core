@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, memo } from "react";
+import { useState, useMemo, useCallback, memo } from "react";
 import { type TreeNode, getIcon } from "./tree";
 import { FileTreeContextMenu, type MenuItem } from "./FileTreeContextMenu";
 
@@ -53,7 +53,13 @@ export function FileTree({
   // one place.
   const [hoverDir, setHoverDir] = useState<string | null>(null);
 
-  const openContextMenu = (e: React.MouseEvent, node: TreeNode) => {
+  // Wrapped in useCallback so its identity is stable across local-state
+  // (menu/hoverDir) re-renders. Without this, React.memo(TreeItem) below
+  // never bites: a fresh openContextMenu each render fails the shallow
+  // prop compare on every row, re-rendering the whole tree on each menu
+  // toggle — exactly what this memoization is meant to eliminate. Deps
+  // are the row-action callbacks it closes over; setMenu is setter-stable.
+  const openContextMenu = useCallback((e: React.MouseEvent, node: TreeNode) => {
     e.preventDefault();
     // Items composed per-row so the available actions reflect the
     // node type (files get Open + Download; directories get Delete
@@ -83,7 +89,7 @@ export function FileTree({
       onClick: () => onDelete(node.path),
     });
     setMenu({ x: e.clientX, y: e.clientY, items });
-  };
+  }, [onSelect, onDownload, onDelete, canDelete]);
 
   // Single state lifted to the top-level tree; nested <FileTree>s
   // (rendered for expanded directories below) do NOT instantiate
