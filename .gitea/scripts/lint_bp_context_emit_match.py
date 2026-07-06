@@ -499,6 +499,19 @@ def run() -> int:
 
     bp_set = set(bp_contexts)
 
+    # The all-green WILDCARD gate. Gitea accepts "*" in status_check_contexts
+    # to mean "every posted status must be success" (the [*] gate rolled out
+    # per gate-model-require-all-individually / wildcard-gate-enforces-not-a-
+    # bug). "*" is a META-gate, NOT a real context: no workflow emits a status
+    # literally named "*", and — crucially — it does NOT create a phantom
+    # absent-as-pending block. Gitea does not wait for a status named "*"; it
+    # resolves "*" to "all emitted statuses are success" (empirically verified:
+    # red→405-blocked, all-green→200-merged). So "*" is NOT a merge-forever
+    # orphan and must be excluded from the no-emitter check — otherwise this
+    # lint reds every PR under the wildcard gate (drift issue #3454).
+    WILDCARD_CONTEXTS = {"*"}
+    bp_set -= WILDCARD_CONTEXTS
+
     # 3. Find orphans (BP-side: required but no emitter).
     bp_orphans = sorted(bp_set - all_emitter)
 
