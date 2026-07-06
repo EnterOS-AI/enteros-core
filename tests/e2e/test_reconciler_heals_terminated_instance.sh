@@ -338,9 +338,18 @@ admin_call() {
 }
 
 # ─── 1. Create org ──────────────────────────────────────────────────────
+# create_org_with_retry (SSOT lib) tolerates a TRANSIENT 502/503/504 from the
+# tenant edge during a staging-tenant-cd roll (the create-502 false-ready
+# class) while still failing closed on any 4xx. The shared CP /health preflight
+# is 200 on the surviving instance mid-roll, so it is not the real "ready to
+# create" signal — the create itself must ride out the transport blip.
+# shellcheck source=lib/create_org_with_retry.sh
+source "$(dirname "$0")/lib/create_org_with_retry.sh"
 log "1/6 Creating org $SLUG via /cp/admin/orgs (provider=$PROVIDER)..."
-CREATE_RESP=$(admin_call POST /cp/admin/orgs \
-  -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\",\"provider\":\"$PROVIDER\"}")
+create_org_with_retry "$CP_URL" "$ADMIN_TOKEN" \
+  "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\",\"provider\":\"$PROVIDER\"}" \
+  || fail "Org create failed (non-transient / retries exhausted): $CREATE_ORG_RESP"
+CREATE_RESP="$CREATE_ORG_RESP"
 echo "$CREATE_RESP" | python3 -m json.tool >/dev/null || fail "Org create returned non-JSON: $CREATE_RESP"
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
 [ -z "$ORG_ID" ] && fail "Org create response missing 'id': $CREATE_RESP"
@@ -529,6 +538,9 @@ while true; do
       | python3 -m json.tool 2>/dev/null | sed 's/^/      /' \
       || log "      (could not fetch /workspaces/$WS_ID)"
     log "── END DIAGNOSTIC ──"
+    if [ "$WS_LAST_STATUS" = "online" ]; then
+      fail "Workspace $WS_ID reached status=online but no kill target could be resolved within ${WORKSPACE_ONLINE_TIMEOUT_SECS}s (API omits instance_id; provider=$PROVIDER fallback found no matching instance/container — see diagnostic burst above)"
+    fi
     fail "Workspace $WS_ID never reached status=online within ${WORKSPACE_ONLINE_TIMEOUT_SECS}s (last status=$WS_LAST_STATUS, err=$WS_LAST_ERR; see diagnostic burst above)"
   fi
   WS_STATUS=$(ws_field "$WS_ID" "status")
@@ -543,14 +555,14 @@ while true; do
       break
     fi
     # The workspace is online but the tenant API does not surface instance_id
-    # (observed on staging — the DB has it, the API response omits it). After a
-    # short grace, on the AWS path only, fall back to the AWS workspace-instance
-    # tag so the kill step can proceed. The reconciler reads instance_id from the
-    # DB and acts on the real box regardless of what the API surfaces, so the
-    # AWS-tag instance is the correct kill target. Without this fallback the loop
-    # spins to the online deadline and fails with a misleading "never reached
-    # online". On molecules-server the instance_id (= mol-ws container name) is
-    # always surfaced, so there is no tag-fallback — keep waiting for the API.
+    # (verified live on staging: GET /workspaces/:id has NO instance_id field —
+    # the DB has it, the response omits it, on BOTH providers). After a short
+    # grace we resolve the kill target from the provider's own control surface,
+    # not the optional API field. The reconciler reads instance_id from the DB
+    # and acts on the real box regardless of what the API surfaces, so a
+    # provider-resolved instance is the correct kill target. Without a fallback
+    # the loop spins to the online deadline and fails with a misleading "never
+    # reached online" (last status=online) — the actual regression this fixes.
     if [ "$PROVIDER" = "aws" ] && [ $(( $(date +%s) - ONLINE_SINCE )) -ge "$INSTANCE_ID_GRACE_SECS" ]; then
       # ws-tenant-<slug>-<wsid...> is the workspace EC2 (vs tenant-<slug>).
       ORIGINAL_INSTANCE_ID=$(e2e_ec2_instances_for_slug "$SLUG" 2>/dev/null \
@@ -559,6 +571,26 @@ while true; do
         log "    instance_id not surfaced by API after ${INSTANCE_ID_GRACE_SECS}s — using AWS workspace tag: $ORIGINAL_INSTANCE_ID"
         break
       fi
+    fi
+    # molecules-server (local-docker): the SAME grace-fallback the AWS path has,
+    # resolved from the docker daemon the kill step already uses (require_kill_
+    # capability guarantees it is reachable). The workspace container is named
+    # `mol-ws-<slug≤20>-<short12>` where <short12> is the workspace UUID with
+    # dashes stripped, first 12 hex chars (wsname SSOT; verified live: WS_ID
+    # d32826e3-45e6-… → mol-ws-<slug>-d32826e345e6). An org runs MULTIPLE mol-ws
+    # containers (concierge + this workspace), so we disambiguate on that exact
+    # per-workspace suffix — NEVER a bare slug match that could kill the wrong
+    # box. This is the real ready signal (status=online AND a resolvable kill
+    # target), not the optional API field.
+    if [ "$PROVIDER" != "aws" ] && [ $(( $(date +%s) - ONLINE_SINCE )) -ge "$INSTANCE_ID_GRACE_SECS" ] && docker info >/dev/null 2>&1; then
+      WS_FRAG=$(printf '%s' "$WS_ID" | tr -d '-' | cut -c1-12)
+      ORIGINAL_INSTANCE_ID=$(docker ps --format '{{.Names}}' 2>/dev/null \
+        | grep '^mol-ws-' | grep -F -- "-$WS_FRAG" | head -1)
+      if [ -n "$ORIGINAL_INSTANCE_ID" ]; then
+        log "    instance_id not surfaced by API after ${INSTANCE_ID_GRACE_SECS}s — resolved container from docker: $ORIGINAL_INSTANCE_ID"
+        break
+      fi
+      log "    $WS_ID online but no mol-ws-*-$WS_FRAG container yet (docker) — waiting"
     fi
     log "    $WS_ID online but instance_id not populated yet — waiting"
   fi

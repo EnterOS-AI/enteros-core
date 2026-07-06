@@ -199,6 +199,26 @@ items:
       team member may ack on behalf of an automated public-repo-hygiene scan;
       a non-author human engineers/security/managers/ceo ack also satisfies.
 
+  - slug: no-flaky-env-coupling
+    numeric_alias: 10
+    pr_section_marker: "No flaky / no environmental"
+    required_teams: [engineers]
+    ai_ack_eligible: true
+    description: >-
+      No CI/e2e red in this PR (or referenced in its COE/incident) is dismissed
+      as "flaky" or "environmental." Every red is a DETERMINISTIC coupling bug —
+      one of the five classes (A missing-input / B race / C false-ready /
+      D shared-live-state / E near-capacity-fixed-timeout, see
+      docs/engineering/testing-strategy.md §"No flaky, no environmental") — and
+      is ROOT-FIXED, not tolerated/retried/parked. Any NEW e2e wait polls a REAL
+      signal (+ a 10x safety net you never wait out), never a fixed sleep near
+      capacity; no required producer was disabled to green a red (phantom gate —
+      Guard F). Reviewer confirms the author named the class and fixed the
+      coupling. Agent-resolvable: an ai-sop-ack team member may ack on behalf of
+      the automated lint-env-coupling-dismissal scan when CI is green; a
+      non-author engineer ack also satisfies. Added 2026-07-06 (task#233) to
+      wire the no-flaky/env-coupling operator principle into the governance gate.
+
 # N/A gate declarations (RFC#324 §N/A follow-up).
 # PRs where a gate genuinely does not apply (e.g., pure-infra with no
 # qa surface, or docs-only) can be declared N/A by a non-author peer

@@ -106,6 +106,16 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 
 	// ── pause → resume ──────────────────────────────────────────────────────
 	t.Run("pause_resume", func(t *testing.T) {
+		// Per-subtest online BASELINE (core#3456 finding #6, shared-mutable-
+		// state isolation): the three subtests share ONE workspace sequentially.
+		// Re-establishing a known online+routable baseline at the top of each
+		// converts an upstream subtest's bad exit state from a silent cascade
+		// (e.g. a failed resume leaving the ws not-online → hibernate 404s "not
+		// in a hibernatable state") into an isolated, independently-meaningful
+		// subtest. It is a real-signal wait (breaks instantly when online), not
+		// a tolerate — a genuinely stuck ws still fails loud at the deadline.
+		waitForWorkspaceOnlineRoutable(t, tenantHost, token, orgID, wsID, 15*time.Minute, "pause_resume baseline")
+
 		// pause → paused, container genuinely stopped.
 		status, body := postLifecycle(t, tenantHost, token, orgID, wsID, "/pause")
 		if status != http.StatusOK {
@@ -138,6 +148,12 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 
 	// ── hibernate → wake ────────────────────────────────────────────────────
 	t.Run("hibernate_wake", func(t *testing.T) {
+		// Per-subtest online BASELINE (see pause_resume). Guarantees hibernate
+		// starts from online+routable regardless of how the previous subtest
+		// exited, so /hibernate's online|degraded precondition is met and the
+		// subtest is independently meaningful rather than cascading.
+		waitForWorkspaceOnlineRoutable(t, tenantHost, token, orgID, wsID, 15*time.Minute, "hibernate_wake baseline")
+
 		// hibernate (force, since a fresh online ws may carry no active tasks
 		// but we don't want a transient active_tasks>0 to 409 the test).
 		status, body := postLifecycle(t, tenantHost, token, orgID, wsID, "/hibernate?force=true")
