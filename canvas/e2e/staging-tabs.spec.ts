@@ -70,40 +70,22 @@ const EXPECTED_EXTRA_TABS = ["display", "container-config"] as const;
 // Anything NOT in this set must render real content or the test fails.
 const KNOWN_DEGRADED_TABS = new Set<string>(["terminal", "files"]);
 
-// Tabs whose RENDERED content is produced by the workspace CONTAINER's agent
-// runtime (chat session/history, execution traces, activity/events feed). When
-// the staging workspace agent never boots — the documented #2162 platform-proxy
-// gap: staging tenants carry no CP LLM proxy env, so a platform_managed
-// workspace fail-closes at boot (see staging-setup.ts) — these tabs legitimately
-// surface an unreachable/empty state (e.g. chat shows an "agent unreachable"
-// role="alert"). The harness gates tab-UI RENDERING, not agent content
-// (staging-setup.ts §"Wait for workspace online": "a fully-online agent is NOT
-// required"), so on an offline agent they get the same weaker "renders + no
-// crash" contract as the #1369 SaaS-degraded tabs. Container/DB-backed tabs
-// (config, details, skills, channels, schedule, memory, audit) are served by the
-// tenant platform and keep the strong contract regardless. This auto-restores
-// full strength the moment staging boots a live agent (LLM-proxy-https fix).
-const AGENT_DEPENDENT_TABS = new Set<string>([
-  "chat",
-  "traces",
-  "activity",
-  "events",
-  "memory",
-]);
+// Agent-runtime-backed tabs (chat session/history, execution traces,
+// activity/events feed, memory) previously got a relaxed "renders + no crash"
+// contract when the staging agent failed to boot (the #2162 platform-proxy
+// gap: staging tenants carried no CP LLM proxy env, so a platform_managed
+// workspace fail-closed at boot). That relaxation is GONE: staging-setup.ts now
+// provisions the tenant with provider=molecules-server, which injects the CP
+// LLM proxy env, so the agent boots (status===online is REQUIRED before any
+// spec runs). These tabs therefore keep the full strong "real content"
+// contract like every other non-SaaS-gap tab — the whole point of injecting
+// the proxy was to exercise them against a LIVE agent, not relax them.
 
-// Set by staging-setup.ts: "true" only when the provisioned workspace agent
-// actually booted (status===online). "false" for the tolerated #2162 pre-start
-// credential-abort. Unset (local/non-staging) is treated as online so a live
-// local run keeps the full strong contract.
-const AGENT_ONLINE = process.env.STAGING_AGENT_ONLINE !== "false";
-
-/** A tab gets the weaker "renders + no crash" contract if it is a known SaaS
- *  gap (#1369) OR it is agent-runtime-backed and the agent is offline (#2162). */
+/** A tab gets the weaker "renders + no crash" contract ONLY if it is a known
+ *  SaaS gap (#1369: terminal, files). Every other tab — including the
+ *  agent-runtime-backed ones — must render real content against the live agent. */
 function isDegradedTab(tabId: string): boolean {
-  return (
-    KNOWN_DEGRADED_TABS.has(tabId) ||
-    (!AGENT_ONLINE && AGENT_DEPENDENT_TABS.has(tabId))
-  );
+  return KNOWN_DEGRADED_TABS.has(tabId);
 }
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
@@ -169,10 +151,10 @@ async function assertPanelRendered(page: Page, tabId: string): Promise<void> {
   // ActivityTab). We replace it with a broader, but still SaaS-gap-aware,
   // check: any *visible* alert OR red error banner inside the panel.
   //
-  // Degraded tabs (#1369 SaaS gaps, or agent-dependent tabs on an offline
-  // #2162 staging agent) are allowed an error state — for those we only
-  // require no app-level crash (covered by step 2). For every other tab a
-  // visible error alert is a real regression.
+  // Degraded tabs (#1369 SaaS gaps: terminal, files) are allowed an error
+  // state — for those we only require no app-level crash (covered by step 2).
+  // For every other tab — including the agent-runtime-backed ones, now that
+  // the agent boots — a visible error alert is a real regression.
   if (!isDegradedTab(tabId)) {
     const visibleAlerts = panel.locator('[role="alert"]:visible');
     await expect
@@ -192,10 +174,10 @@ async function assertPanelRendered(page: Page, tabId: string): Promise<void> {
   // fetch+render settles — replacing the implicit "the network finished
   // by now" timing assumption with an explicit polled condition.
   //
-  // Degraded tabs may legitimately be empty (Files in SaaS mode, or an
-  // agent-dependent tab when the #2162 staging agent is offline), so they
-  // are exempt from the non-empty requirement; step 2 still guards them
-  // against a hard crash.
+  // Degraded tabs may legitimately be empty (Files/Terminal in SaaS mode), so
+  // they are exempt from the non-empty requirement; step 2 still guards them
+  // against a hard crash. Agent-runtime-backed tabs are NOT exempt anymore —
+  // the agent is live, so they must render real content.
   if (!isDegradedTab(tabId)) {
     await expect
       .poll(

@@ -23,9 +23,15 @@ export default defineConfig({
   timeout: 120_000,
   expect: { timeout: 15_000 },
   fullyParallel: false,
-  // A transient network blip shouldn't cost us the whole run. Two retries
-  // mean up to 3 attempts — staging flakes fall within that budget.
-  retries: 2,
+  // No blanket retries. Every spec here polls a REAL signal (workspace online,
+  // rendered-bubble stability, panel content via expect.poll) with its own
+  // bounded safety net, so a failure is deterministic — retry-and-hope would
+  // only mask a genuine bug and burn ~6 min each on the single shared staging
+  // runner (the greeting + tabs specs each retried 3× at ~6.1m against a
+  // deterministic missing-input red, wasting ~18 min per spec). A genuinely
+  // transient network class is handled by scoped in-test polls, not a
+  // whole-suite replay.
+  retries: 0,
   // One worker: the setup provisions exactly one org/workspace, and
   // parallel specs would fight over the shared workspace selector state.
   workers: 1,

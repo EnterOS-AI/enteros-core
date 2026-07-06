@@ -36,21 +36,11 @@ test.skip(!STAGING, "CANVAS_E2E_STAGING not set — staging-only suite, not requ
 
 // This is an end-to-end render-dedup guard: it FORCES a slow cold first turn and
 // asserts the ONE greeting the concierge produces renders exactly once. That
-// requires a LIVE agent to answer. On staging the workspace agent does not boot
-// (#2162 platform-proxy gap — staging tenants carry no CP LLM proxy env; see
-// staging-setup.ts), so there is no live turn to render and the composer never
-// enables ("agent unreachable"). The invariant is ALREADY covered deterministically
-// by the companion unit guard (useChatHistory.slowColdGreetingRenderDup.test.tsx),
-// which drives the real merge logic; this browser belt only adds signal when a
-// live agent exists. Skip when the agent is offline — it auto-enables the moment
-// staging boots a live agent (LLM-proxy-https fix). NOT a skip-green mask: setup
-// classifies the offline agent as the tolerated #2162 shape and hard-throws on any
-// other boot failure, so this never hides a real regression.
-const AGENT_ONLINE = process.env.STAGING_AGENT_ONLINE !== "false";
-test.skip(
-  STAGING && !AGENT_ONLINE,
-  "staging workspace agent offline (#2162) — no live turn to render; invariant covered by the useChatHistory unit guard",
-);
+// requires a LIVE agent to answer — which staging now provides: staging-setup.ts
+// provisions the tenant with provider=molecules-server (injecting the CP LLM
+// proxy env) and REQUIRES the agent to reach status===online before any spec
+// runs. The old skip-when-offline path (the #2162 platform-proxy gap) is gone:
+// the agent boots, so this browser belt runs for real against the live turn.
 
 function tenantEnv() {
   const tenantURL = process.env.STAGING_TENANT_URL;
@@ -131,11 +121,68 @@ function duplicateAgentContents(b: { role: string; content: string }[]): string[
 // rendered the persisted copy — i.e. force the exact slow-cold render race.
 const FORCE_SLOW_HOLD_MS = 30_000;
 
+// The DB reconcile that collapses the optimistic + persisted greeting copies
+// runs on a ≤10s cadence (see the useChatHistory reconcile). 12s is one full
+// cycle + margin: the rendered agent-bubble set must hold steady this long
+// before we trust it has settled.
+const RECONCILE_CYCLE_MS = 12_000;
+
+/**
+ * Deterministic replacement for the old blind `waitForTimeout(15_000)` settle.
+ *
+ * The bug is a LATE-arriving duplicate bubble, so a fixed wall-clock wait is a
+ * coupling bug: too short → a late duplicate (or a not-yet-run reconcile) is
+ * MISSED (false green); dependent on backend latency either way. Instead we
+ * poll the REAL rendered DOM until the agent-bubble set is STABLE across a full
+ * reconcile cycle AND every deterministic late-delivery path has had its chance
+ * to land — specifically the forced /a2a hold, whose live copy is delivered
+ * FORCE_SLOW_HOLD_MS after send (the last possible late delivery in this test).
+ * Only then can no further copy appear, so a stable set is trustworthy.
+ *
+ * Real-signal poll: returns the instant both conditions hold — it never waits
+ * out the deadline on the happy path. The deadline is only a ~7× safety net so
+ * a pathological hang fails loud instead of hanging the runner. A late
+ * duplicate simply changes the signature, resets the stability timer, and gets
+ * caught by the assertions on the stabilized set below.
+ */
+async function waitForStableAgentBubbles(
+  page: Page,
+  sentAt: number,
+): Promise<{ role: "user" | "agent"; content: string }[]> {
+  const POLL_MS = 1500;
+  const SAFETY_NET_MS = 5 * 60 * 1000; // ~7× the ~42s late-delivery envelope
+  // No new copy can arrive after the forced hold delivers + one reconcile cycle.
+  const lateDeliveryEnvelopeMs = FORCE_SLOW_HOLD_MS + RECONCILE_CYCLE_MS;
+  const deadline = Date.now() + SAFETY_NET_MS;
+  let lastSig: string | null = null;
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    const rendered = await readRenderedBubbles(page);
+    const sig = JSON.stringify(agentBubbles(rendered).map((m) => m.content));
+    if (sig !== lastSig) {
+      lastSig = sig;
+      stableSince = Date.now();
+    }
+    const stableForMs = Date.now() - stableSince;
+    const sinceSentMs = Date.now() - sentAt;
+    if (stableForMs >= RECONCILE_CYCLE_MS && sinceSentMs >= lateDeliveryEnvelopeMs) {
+      return rendered;
+    }
+    await page.waitForTimeout(POLL_MS);
+  }
+  // Safety net reached (pathological): return the current DOM and let the
+  // assertions below judge it loudly — never silently pass.
+  return readRenderedBubbles(page);
+}
+
 test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no duplicate bubble)", async ({
   page,
   context,
 }) => {
-  test.setTimeout(12 * 60 * 1000);
+  // Safety-net envelope: first-turn poll (≤240s) + stability settle (≤300s) +
+  // page/auth overhead. 15 min is headroom over the happy path (~45-90s), never
+  // waited out on success.
+  test.setTimeout(15 * 60 * 1000);
   const { tenantURL, tenantToken } = tenantEnv();
   await authenticate(context, tenantToken);
 
@@ -202,12 +249,12 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
   const slowTurnForced = firstTurnMs > 3000;
   console.log(`[slow-cold] first-turn latency = ${firstTurnMs}ms (slowTurnForced=${slowTurnForced}, hold=${forcedHoldApplied})`);
 
-  // Let EVERY late delivery path settle: the held HTTP reply, any WS push, AND
-  // one full ≤10s DB reconcile (where mergeReconciledMessages collapses the
-  // optimistic + DB copies on the FIXED bundle; a stale bundle leaves both → 2).
-  await page.waitForTimeout(15_000);
-
-  const rendered = await readRenderedBubbles(page);
+  // Let EVERY late delivery path settle — but on a REAL signal, not a blind
+  // wall-clock wait: poll the rendered DOM until the agent-bubble set is stable
+  // across a full reconcile cycle AND past the forced-hold late-delivery
+  // envelope (see waitForStableAgentBubbles). A late duplicate resets the
+  // stability timer and is caught below instead of being missed by a fixed 15s.
+  const rendered = await waitForStableAgentBubbles(page, t0);
   const agents = agentBubbles(rendered);
   const dups = duplicateAgentContents(rendered);
   console.log(
