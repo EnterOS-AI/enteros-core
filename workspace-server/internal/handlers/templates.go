@@ -67,6 +67,15 @@ type TemplatesHandler struct {
 	// template repo merge can update the tenant catalog without rebuilding
 	// the full tenant image.
 	refreshCache func(ctx *gin.Context) (any, error)
+	// hostStateDir is the base dir of the per-workspace host-side /configs
+	// mirror the CPProvisioner persists at (re)provision (#206 molecules-server:
+	// the tenant has no docker.sock into the runtime container, so the Files API
+	// cannot docker-exec into it — it serves reads from this mirror instead).
+	// MUST be the SAME value handed to CPProvisioner.WithHostStateDir so writer
+	// and reader never drift. Empty disables the mirror (reads fall through to
+	// the legacy container/template-dir path). Resolved once in main via
+	// provisioner.ResolveWorkspaceStateBaseDir.
+	hostStateDir string
 }
 
 // NewTemplatesHandler constructs a TemplatesHandler. wh may be nil for
@@ -85,6 +94,27 @@ func (h *TemplatesHandler) WithCacheDir(cacheDir string) *TemplatesHandler {
 func (h *TemplatesHandler) WithRefreshFunc(fn func(ctx *gin.Context) (any, error)) *TemplatesHandler {
 	h.refreshCache = fn
 	return h
+}
+
+// WithHostStateDir wires the base dir of the per-workspace host-side /configs
+// mirror the Files API serves docker-less reads from (#206 molecules-server).
+// MUST match the value handed to CPProvisioner.WithHostStateDir.
+func (h *TemplatesHandler) WithHostStateDir(dir string) *TemplatesHandler {
+	h.hostStateDir = dir
+	return h
+}
+
+// hostSideConfigsRoot returns the host-side /configs mirror dir for workspaceID
+// when the ?root= is /configs and the mirror feature is enabled, else "". The
+// mirror only carries the /configs tree (config.yaml + prompts/* + secret config
+// files) — the exact bundle the runtime container's /configs is provisioned
+// from — so it is authoritative ONLY for root=/configs. Other roots (/workspace,
+// /home, /plugins) have no host-side mirror and fall through to the legacy path.
+func (h *TemplatesHandler) hostSideConfigsRoot(rootPath, workspaceID string) string {
+	if h.hostStateDir == "" || rootPath != "/configs" {
+		return ""
+	}
+	return provisioner.HostSideConfigsDir(h.hostStateDir, workspaceID)
 }
 
 // modelSpec describes a single supported model on a template: its id (sent
@@ -489,6 +519,72 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 		}
 	}
 
+	// walkConfigTree lists a host-side config directory (the /configs mirror or a
+	// template dir) into the Files-API wire shape, applying the same depth limit,
+	// symlink skip (OFFSEC-010), and noise-file filter. Shared by the
+	// molecules-server host-side mirror and the legacy template-dir fallback so
+	// the two never diverge.
+	walkConfigTree := func(walkRoot string) []fileEntry {
+		var files []fileEntry
+		filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
+			if err != nil || path == walkRoot {
+				return nil
+			}
+			// Skip symlinks to prevent path traversal via malicious symlinks
+			// inside the workspace config directory (OFFSEC-010).
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil
+			}
+			rel, _ := filepath.Rel(walkRoot, path)
+			// Enforce depth limit
+			if strings.Count(rel, string(filepath.Separator))+1 > depth {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			base := filepath.Base(rel)
+			if base == ".git" || base == ".DS_Store" || base == "__pycache__" || base == "node_modules" {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			files = append(files, fileEntry{
+				Path: rel,
+				Size: info.Size(),
+				Dir:  info.IsDir(),
+			})
+			return nil
+		})
+		if files == nil {
+			files = []fileEntry{}
+		}
+		return files
+	}
+
+	// Docker-less molecules-server (#206): list /configs from the host-side
+	// mirror the CPProvisioner persisted at provision. Fixes the empty "[]"
+	// listing a molecules-server tenant returned for /configs even though config
+	// was delivered. Only for root=/configs; other roots have no host-side
+	// mirror and fall through to the template dir.
+	if mirror := h.hostSideConfigsRoot(rootPath, workspaceID); mirror != "" {
+		if fi, statErr := os.Stat(mirror); statErr == nil && fi.IsDir() {
+			walkRoot := mirror
+			if subPath != "" {
+				walkRoot = filepath.Join(mirror, subPath)
+			}
+			if _, err := os.Stat(walkRoot); err == nil {
+				c.JSON(http.StatusOK, walkConfigTree(walkRoot))
+				return
+			}
+			// Mirror present but the requested subpath isn't in it — return empty
+			// rather than falling through to the (unrelated) template dir.
+			c.JSON(http.StatusOK, []fileEntry{})
+			return
+		}
+	}
+
 	// Fallback: host-side template dir (only for templates, not ws-* workspace volumes)
 	configDir := h.resolveTemplateDir(wsName)
 	if configDir == "" {
@@ -504,44 +600,7 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 		c.JSON(http.StatusOK, []fileEntry{})
 		return
 	}
-
-	var files []fileEntry
-	filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil || path == walkRoot {
-			return nil
-		}
-		// Skip symlinks to prevent path traversal via malicious symlinks
-		// inside the workspace config directory (OFFSEC-010).
-		if info.Mode()&os.ModeSymlink != 0 {
-			return nil
-		}
-		rel, _ := filepath.Rel(walkRoot, path)
-		// Enforce depth limit
-		if strings.Count(rel, string(filepath.Separator))+1 > depth {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		base := filepath.Base(rel)
-		if base == ".git" || base == ".DS_Store" || base == "__pycache__" || base == "node_modules" {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		files = append(files, fileEntry{
-			Path: rel,
-			Size: info.Size(),
-			Dir:  info.IsDir(),
-		})
-		return nil
-	})
-
-	if files == nil {
-		files = []fileEntry{}
-	}
-	c.JSON(http.StatusOK, files)
+	c.JSON(http.StatusOK, walkConfigTree(walkRoot))
 }
 
 // ReadFile handles GET /workspaces/:id/files/*path
@@ -627,6 +686,41 @@ func (h *TemplatesHandler) ReadFile(c *gin.Context) {
 				"content": content,
 				"size":    len(content),
 			})
+			return
+		}
+	}
+
+	// Docker-less molecules-server (#206): the tenant has no docker.sock into
+	// the runtime container, so the container `cat` above found nothing and the
+	// legacy path returned a misleading 59-byte "container offline, no template"
+	// 404 even though the config was delivered. Serve the file from the
+	// per-workspace host-side /configs mirror the CPProvisioner persisted at
+	// (re)provision — the SAME rendered bundle the container's /configs volume
+	// is built from (config.yaml + prompts/* + secret config files). Only for
+	// root=/configs; other roots have no host-side mirror. This is the read-back
+	// half of the OSS-clean, R2-free config path (config → volume mount into the
+	// box; read-API → this mirror).
+	if mirror := h.hostSideConfigsRoot(rootPath, workspaceID); mirror != "" {
+		if fi, statErr := os.Stat(mirror); statErr == nil && fi.IsDir() {
+			// validateRelPath already ran at the top of ReadFile; re-validate as
+			// defense-in-depth before joining into the mirror dir.
+			if err := validateRelPath(filePath); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid path"})
+				return
+			}
+			data, rerr := os.ReadFile(filepath.Join(mirror, filePath))
+			if rerr == nil {
+				c.JSON(http.StatusOK, gin.H{
+					"path":    filePath,
+					"content": string(data),
+					"size":    len(data),
+				})
+				return
+			}
+			// The mirror EXISTS for this workspace (config WAS delivered) but the
+			// requested file genuinely isn't in the /configs bundle. Fail loud +
+			// clear — NOT the misleading "container offline, no template" stub.
+			c.JSON(http.StatusNotFound, gin.H{"error": "file not found in workspace /configs"})
 			return
 		}
 	}

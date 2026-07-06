@@ -68,6 +68,41 @@ type CPProvisioner struct {
 	adminToken    string // X-Molecule-Admin-Token — per-tenant identity (controlplane #118/#130)
 	cpAdminAPIKey string // Authorization: Bearer — gates /cp/admin/* (read-only ops routes; distinct secret from sharedSecret)
 	httpClient    *http.Client
+	// hostStateDir is the base dir for the host-side /configs mirror the Files
+	// API serves from when there is no docker.sock into the runtime container
+	// (#206 molecules-server). Empty disables the mirror (config still delivers
+	// to the container via the CP volume mount; only docker-less read-back is
+	// off). Set via WithHostStateDir from main.go so the mirror WRITER
+	// (this provisioner) and the READER (TemplatesHandler) share one value.
+	hostStateDir string
+	// bootTokens, when set, enables CORE-served boot-config token delivery: at
+	// (re)provision the tenant mints a one-time token bound to the workspace and
+	// injects it as MOLECULE_CONFIG_BOOT_TOKEN into the Env map the CP forwards
+	// verbatim to the runtime container, which fetches its config from the
+	// tenant-server (PLATFORM_URL) at boot. nil → feature off (config still
+	// delivered via the legacy /configs volume; the boot endpoint 404s). Set via
+	// WithBootConfigTokenStore from main.go so the mint side (this provisioner)
+	// and the serve side (BootConfigHandler) share ONE store instance.
+	bootTokens *BootConfigTokenStore
+}
+
+// WithHostStateDir sets the base dir for the per-workspace host-side /configs
+// mirror written at provision/reprovision. Returns the provisioner for chaining.
+func (p *CPProvisioner) WithHostStateDir(dir string) *CPProvisioner {
+	if p != nil {
+		p.hostStateDir = dir
+	}
+	return p
+}
+
+// WithBootConfigTokenStore wires the shared one-time boot-token store so Start
+// mints a token per provision and injects MOLECULE_CONFIG_BOOT_TOKEN into the
+// runtime env. Returns the provisioner for chaining. nil store → feature off.
+func (p *CPProvisioner) WithBootConfigTokenStore(s *BootConfigTokenStore) *CPProvisioner {
+	if p != nil {
+		p.bootTokens = s
+	}
+	return p
 }
 
 // NewCPProvisioner creates a provisioner that delegates to the control plane.
@@ -279,6 +314,42 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	configFiles, templateAssets, err := collectCPConfigFiles(cfg)
 	if err != nil {
 		return "", fmt.Errorf("cp provisioner: collect config files: %w", err)
+	}
+
+	// #206 docker-less read-back: persist the SAME rendered bundle into the
+	// per-workspace host-side /configs mirror so the Files API can serve reads
+	// without a docker.sock into the runtime container. Runs on every
+	// (re)provision — so a plugin-install reprovision (or any Save & Restart)
+	// re-syncs the mirror. Best-effort: a mirror-write failure NEVER fails the
+	// provision (config is still delivered to the container via the CP volume
+	// mount); it only degrades docker-less read-back, so we log LOUD and
+	// continue. The mirror is core-OSS-clean: hostside_config.go imports only
+	// os/filepath — no CP, no R2.
+	if p.hostStateDir != "" {
+		if perr := PersistConfigBundleHostSide(p.hostStateDir, cfg.WorkspaceID, configFiles, templateAssets); perr != nil {
+			log.Printf("CPProvisioner.Start: host-side /configs mirror persist for %s FAILED: %v — docker-less Files read-back will 404 for this workspace until the next successful (re)provision (config itself is still delivered to the container via the CP volume mount)", cfg.WorkspaceID, perr)
+		} else if len(configFiles) > 0 || len(templateAssets) > 0 {
+			log.Printf("CPProvisioner.Start: persisted host-side /configs mirror for %s (%d config file(s) + %d asset(s)) at %s — docker-less Files read-back enabled (#206)", cfg.WorkspaceID, len(configFiles), len(templateAssets), HostSideConfigsDir(p.hostStateDir, cfg.WorkspaceID))
+		}
+	}
+
+	// CORE-served boot-config token delivery (the FINAL, platform-agnostic config
+	// path — no R2, no CP dependency). When enabled AND there is a rendered bundle
+	// to serve, mint a one-time boot token bound to this workspace and inject it
+	// into the Env map. The CP forwards every Env key verbatim into the runtime
+	// container, so the box boots with MOLECULE_CONFIG_BOOT_TOKEN and fetches its
+	// config from THIS tenant-server (PLATFORM_URL) — see BootConfigHandler. The
+	// config bytes never touch the CP or R2. Requires the host-side mirror (same
+	// bundle, same dir) — persisted just above. Best-effort: a mint failure logs
+	// loud and falls back to the legacy /configs volume delivery (config still
+	// arrives), never fails the provision.
+	if p.bootTokens != nil && p.hostStateDir != "" && (len(configFiles) > 0 || len(templateAssets) > 0) {
+		if tok, terr := p.bootTokens.Issue(cfg.WorkspaceID); terr != nil {
+			log.Printf("CPProvisioner.Start: mint boot-config token for %s FAILED: %v — box will fall back to legacy /configs delivery", cfg.WorkspaceID, terr)
+		} else {
+			env["MOLECULE_CONFIG_BOOT_TOKEN"] = tok
+			log.Printf("CPProvisioner.Start: minted one-time boot-config token for %s — box will fetch config from the tenant-server (PLATFORM_URL) at boot; no R2, no CP", cfg.WorkspaceID)
+		}
 	}
 
 	// Only forward kind for platform workspaces; omitempty hides it for ordinary
