@@ -131,9 +131,24 @@ func sweepOnlineWorkspaces(ctx context.Context, checker ContainerChecker, onOffl
 
 		log.Printf("Health sweep: container for %s is gone — marking offline", id)
 
+		// The guard MUST exclude the operator-parked states 'paused' and
+		// 'hibernated' (and the in-flight 'hibernating') in addition to
+		// 'removed'/'provisioning'. Otherwise this UPDATE clobbers a
+		// deliberately-parked workspace: the SELECT above runs on a 15s tick
+		// and collects a workspace while it is still 'online'; if a Pause /
+		// Hibernate lands in the window BETWEEN that SELECT and this UPDATE,
+		// the container is (correctly) stopped, IsRunning returns false, and —
+		// without 'paused'/'hibernated' here — the row is flipped
+		// paused/hibernated → offline. That is core#3456: ~300ms after a
+		// verified pause the row silently becomes 'offline', so POST /resume's
+		// `WHERE status='paused'` finds no row and 404s "not found or not
+		// paused" (hibernate_wake then cascades 404 "not in a hibernatable
+		// state"). A parked container is EXPECTED to be stopped, so finding it
+		// dead must NOT resurrect-then-offline it. Mirrors the guards already
+		// used by sweepStaleRemoteWorkspaces (below) and registry/liveness.go.
 		_, err = db.DB.ExecContext(ctx,
 			`UPDATE workspaces SET status = $1, updated_at = now()
-			 WHERE id = $2 AND status NOT IN ('removed', 'provisioning')`,
+			 WHERE id = $2 AND status NOT IN ('removed', 'provisioning', 'paused', 'hibernated', 'hibernating')`,
 			models.StatusOffline, id)
 		if err != nil {
 			log.Printf("Health sweep: failed to mark %s offline: %v", id, err)
