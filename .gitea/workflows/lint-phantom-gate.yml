@@ -1,0 +1,123 @@
+# lint-phantom-gate — Guard F (regression-prevention-guards.md §Guard F).
+#
+# The META-guard that guards the gates. A `.gitea/required-contexts.txt` entry
+# declared ENFORCED (merge-blocking) whose PRODUCER workflow is toggled off
+# (`disabled_manually` / `disabled`) is a PHANTOM GATE: under the `[*]` all-green
+# branch protection the disabled workflow never posts its status, so the gate is
+# required-on-paper but silently enforces NOTHING. This is the blind spot that
+# let the mgmt-MCP / provision regressions reach prod uncaught (the enforced
+# `E2E Staging SaaS ... Concierge Creates Workspace` gate's producer had been
+# disabled since the 2026-06-27 AWS toggle-off).
+#
+# This lint reads the SAME enforced set the merge queue enforces
+# (`load_enforced_file_contexts`, everything above the first `# pending-#NNNN`
+# marker) and, for each entry, asserts its producer workflow's Gitea Actions
+# state is `active`. It FAILS RED on a phantom.
+#
+# TRIGGERS — sequenced enablement (regression-prevention-guards.md + #3467):
+#   - `push: [main]` (regression detector) + `workflow_dispatch` (on-demand)
+#     ONLY. Deliberately NOT `pull_request` yet. Under the `[*]` all-green BP a
+#     `pull_request` run that goes RED blocks the PR from merging; while a
+#     phantom currently EXISTS (e2e-staging-saas is disabled until Guard B /
+#     #3464 re-enables it), a pull_request trigger would RED-block EVERY open PR
+#     the moment this workflow lands on main — a self-inflicted repo-wide wedge.
+#   - So this ships as a push-to-main + dispatch AUDIT gate: it guards MAIN
+#     (where a workflow toggle-off actually happens) and is safe to merge in ANY
+#     order relative to #3464. A red on main here is TRUE signal (a phantom
+#     exists) surfaced to main-red-watchdog; it is NOT a queue-pause (not a
+#     PUSH_REQUIRED_CONTEXT) and NOT a PR-block.
+#   - PROMOTION to a full required PR gate (add `pull_request` + the context to
+#     `.gitea/required-contexts.txt` ENFORCED + flip the directive to
+#     `bp-required: yes`) is the sequenced follow-up in #3467, done ONLY AFTER
+#     the phantom is resolved so Guard F is green.
+#
+# FAIL-BEFORE proof (verified live, HTTPS = CI path): flags
+# `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
+# (producer disabled_manually) RED while the re-enabled hermetic gate PASSES.
+#
+# Behaviour-based gate: the decision logic lives in ci-required-drift.py
+# (`--phantom-gate-lint`) with fail-before/pass-after unit tests in
+# .gitea/scripts/tests/test_phantom_gate_lint.py.
+#
+# IMPORTANT — Gitea parser quirk (feedback_gitea_workflow_dispatch_inputs_unsupported):
+# do NOT add an `inputs:` block to `workflow_dispatch:`.
+
+name: lint-phantom-gate
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read the Actions API (workflow states) + local SSOT file. No writes.
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-phantom-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # New status emission. It is a REAL gate (not bp-exempt) but not yet in BP /
+  # required-contexts.txt: promotion to a required PR gate is sequenced behind
+  # phantom-resolution, so it is acknowledged-pending per
+  # lint-required-context-exists-in-bp (Tier 2g). Directive must stay within
+  # 3 lines of the job key:
+  # bp-required: pending #3467
+  lint-phantom-gate:
+    name: lint-phantom-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repo (we read required-contexts.txt locally)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.12'
+      # PyYAML is imported at module top of ci-required-drift.py; install it even
+      # though the phantom-lint path itself does not parse YAML, so the import
+      # succeeds.
+      - name: Install PyYAML
+        run: python -m pip install --quiet 'PyYAML==6.0.2'
+      # KMS consolidation (mirrors ci-required-drift.yml / lint-required-no-paths.yml):
+      # fetch the consolidated DRIFT_BOT_TOKEN from the Infisical SSOT (prod
+      # /shared/drift-bot) via the CI machine identity. Reading the Actions API
+      # workflow-state list requires an authenticated token; the auto GITHUB_TOKEN
+      # is 401 on this endpoint. molecule-core PRs are same-repo (not forks), so
+      # the INFISICAL_CI_* machine-identity secrets are present on pull_request.
+      - name: Fetch DRIFT_BOT_TOKEN from Infisical SSOT
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
+          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
+          }
+          DRIFT_BOT_TOKEN=$(read_secret DRIFT_BOT_TOKEN %2Fshared%2Fdrift-bot)
+          echo "::add-mask::$DRIFT_BOT_TOKEN"
+          if [ -z "$DRIFT_BOT_TOKEN" ]; then
+            echo "::error::Infisical returned empty DRIFT_BOT_TOKEN at prod /shared/drift-bot — failing closed."
+            exit 1
+          fi
+          echo "DRIFT_BOT_TOKEN=$DRIFT_BOT_TOKEN" >> "$GITHUB_ENV"
+          echo "DRIFT_BOT_TOKEN loaded from Infisical (len=${#DRIFT_BOT_TOKEN})"
+      - name: Run Guard F phantom-gate lint
+        env:
+          # DRIFT_BOT_TOKEN reads the Actions API (workflow states). Same
+          # least-privilege persona as ci-required-drift.yml.
+          GITEA_TOKEN: ${{ env.DRIFT_BOT_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+          ENFORCED_CONTEXTS_FILE: .gitea/required-contexts.txt
+        run: python3 .gitea/scripts/ci-required-drift.py --phantom-gate-lint
