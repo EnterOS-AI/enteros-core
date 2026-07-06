@@ -575,6 +575,14 @@ export function ConfigTab({ workspaceId }: Props) {
         // form falls into the no-config.yaml branch (hermes/external).
         ...(wsMetadataModel ? { runtime_config: { model: wsMetadataModel } } : {}),
         ...(wsMetadataTier !== null ? { tier: wsMetadataTier } : {}),
+        // The platform agent (org concierge) ships no editable config.yaml, so
+        // there is no real version to show — DEFAULT_CONFIG.version ("1.0.0") is
+        // a UI placeholder, NOT the concierge's actual version (it has none; its
+        // identity comes from the platform-agent template + the runtime image).
+        // Surfacing a fake "1.0.0" on the Config tab is a hardcode leak (no SSOT
+        // backs it), so blank it for the concierge rather than imply a version
+        // the platform never declared.
+        ...(isPlatformAgentWorkspace ? { version: "" } : {}),
       } as ConfigData);
       // Same snapshot as the merged-path branch above. Falls back to
       // empty string when neither MODEL_PROVIDER nor a YAML model was

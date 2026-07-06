@@ -1,0 +1,97 @@
+name: E2E External Connect-Snippet + Leak-Lint
+
+# Per-PR CI-E2E lane for the "Connect your external agent" flow + the
+# class-level internal-address leak-lint.
+#
+# WHY ITS OWN LANE
+#   The fix (molecule-controlplane #1050) makes the CP inject the PUBLIC
+#   tunnel URL (EXTERNAL_PLATFORM_URL / PLATFORM_URL) so the connect snippet
+#   the workspace-server returns is the public https://<slug>.moleculesai.app,
+#   never the in-box host.docker.internal published-port address. #1050 added
+#   CP-side unit tests; this lane adds the CORE-side, end-to-end guard the
+#   principal asked for:
+#     • a hermetic E2E that drives the REAL connect-snippet endpoint
+#       (GET /workspaces/:id/external/connection) with the EXACT env the CP
+#       injects and asserts platform_url / registry_endpoint /
+#       heartbeat_endpoint are public HTTPS with NO host.docker.internal /
+#       127.0.0.1 / localhost / raw :<port>
+#       (TestE2E_ExternalConnectSnippet_*); and
+#     • a class-level leak-lint that reds CI even for a NEW external endpoint
+#       added later — it enforces that every BuildExternalConnectionPayload
+#       caller sources its base from the sanitized externalPlatformURL()
+#       chokepoint, that no external_*.go builder hardcodes an internal
+#       address, and that the chokepoint never leaks under the prod env
+#       (TestLeakLint_*).
+#
+#   These tests ALSO run in the required `Platform (Go)` gate (go test ./...),
+#   so a regression reds CI there too; this lane surfaces them as an explicit,
+#   fast, named status context scoped to the handlers package.
+#
+# SCOPE NOTE
+#   The guard is confined to molecule-core's EXTERNAL-facing handlers. The
+#   legit in-box host.docker.internal lives in molecule-controlplane (the
+#   local_docker provisioner / resolveTenantPlatformURL) — a different repo,
+#   never touched here.
+#
+# Gitea port notes (per the .gitea/workflows house style):
+#   - no merge_group (no Gitea merge queue), no workflow_dispatch.inputs,
+#     no environment: blocks; GITHUB_SERVER_URL pinned at workflow level.
+
+on:
+  push:
+    branches: [main, staging]
+    paths:
+      - 'workspace-server/internal/handlers/**'
+      - '.gitea/workflows/e2e-external-connect-snippet.yml'
+  pull_request:
+    branches: [main, staging]
+    paths:
+      - 'workspace-server/internal/handlers/**'
+      - '.gitea/workflows/e2e-external-connect-snippet.yml'
+
+concurrency:
+  group: e2e-connect-snippet-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+jobs:
+  # Real merge-blocking connect-snippet leak gate. main's ["*"] all-green
+  # wildcard already enforces this context; the literal BP enrollment (or
+  # teaching lint_required_context_exists_in_bp.py the "*" wildcard) is #3469.
+  # bp-required: pending #3469
+  connect-snippet-e2e:
+    name: E2E External Connect-Snippet + Leak-Lint
+    runs-on: ubuntu-latest
+    # Real gate — a connect-snippet regression (internal address leaking into
+    # a customer-facing response) must fail this lane. No continue-on-error.
+    continue-on-error: false
+    timeout-minutes: 12
+    defaults:
+      run:
+        working-directory: workspace-server
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+          # cache:false — the self-hosted runner bind-mounts a persistent
+          # GOCACHE/GOMODCACHE; actions/cache corrupts it by untarring over the
+          # bind mount. Same rationale as ci.yml's Platform (Go) job.
+          cache: false
+
+      - name: Resolve Go module deps
+        run: go mod download
+
+      - name: Run connect-snippet E2E + leak-lint
+        # Hermetic: sqlmock + miniredis + gin httptest — no live infra, no
+        # postgres/redis service. -run selects only this lane's tests; the rest
+        # of the handlers suite is exercised by the required Platform (Go) gate.
+        run: |
+          go test -count=1 -timeout 5m -v ./internal/handlers/ \
+            -run '^TestE2E_ExternalConnectSnippet|^TestLeakLint_'
