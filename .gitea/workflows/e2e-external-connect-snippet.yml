@@ -60,6 +60,10 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
+  # Real merge-blocking connect-snippet leak gate. main's ["*"] all-green
+  # wildcard already enforces this context; the literal BP enrollment (or
+  # teaching lint_required_context_exists_in_bp.py the "*" wildcard) is #3469.
+  # bp-required: pending #3469
   connect-snippet-e2e:
     name: E2E External Connect-Snippet + Leak-Lint
     runs-on: ubuntu-latest
