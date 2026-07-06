@@ -14,21 +14,26 @@
 # marker) and, for each entry, asserts its producer workflow's Gitea Actions
 # state is `active`. It FAILS RED on a phantom.
 #
-# WHY it is safe to add now (and self-protecting under `[*]`):
-#   - It runs on `pull_request`, so under `[*]` it must be GREEN for THIS PR to
-#     merge. While a phantom exists (e.g. e2e-staging-saas disabled) it is RED —
-#     which correctly BLOCKS ITS OWN merge until the phantom is resolved. It
-#     does NOT wedge other open PRs, because a workflow on a feature branch only
-#     runs for that branch until it lands on main.
-#   - It therefore CANNOT reach main while any phantom exists → once on main it
-#     is green, and then it guards every future PR (and every push to main
-#     catches a live re-toggle-off).
+# TRIGGERS — sequenced enablement (regression-prevention-guards.md + #3467):
+#   - `push: [main]` (regression detector) + `workflow_dispatch` (on-demand)
+#     ONLY. Deliberately NOT `pull_request` yet. Under the `[*]` all-green BP a
+#     `pull_request` run that goes RED blocks the PR from merging; while a
+#     phantom currently EXISTS (e2e-staging-saas is disabled until Guard B /
+#     #3464 re-enables it), a pull_request trigger would RED-block EVERY open PR
+#     the moment this workflow lands on main — a self-inflicted repo-wide wedge.
+#   - So this ships as a push-to-main + dispatch AUDIT gate: it guards MAIN
+#     (where a workflow toggle-off actually happens) and is safe to merge in ANY
+#     order relative to #3464. A red on main here is TRUE signal (a phantom
+#     exists) surfaced to main-red-watchdog; it is NOT a queue-pause (not a
+#     PUSH_REQUIRED_CONTEXT) and NOT a PR-block.
+#   - PROMOTION to a full required PR gate (add `pull_request` + the context to
+#     `.gitea/required-contexts.txt` ENFORCED + flip the directive to
+#     `bp-required: yes`) is the sequenced follow-up in #3467, done ONLY AFTER
+#     the phantom is resolved so Guard F is green.
 #
-# SEQUENCING (per the guards doc): this lands GREEN only after Guard B
-# (e2e-staging-saas) is re-enabled. Promotion of this context into
-# `.gitea/required-contexts.txt` (belt-and-suspenders with the merge queue) is a
-# follow-up once the workflow is registered on main (a workflow is not in the
-# server's workflow list until it lands on the default branch).
+# FAIL-BEFORE proof (verified live, HTTPS = CI path): flags
+# `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
+# (producer disabled_manually) RED while the re-enabled hermetic gate PASSES.
 #
 # Behaviour-based gate: the decision logic lives in ci-required-drift.py
 # (`--phantom-gate-lint`) with fail-before/pass-after unit tests in
@@ -36,16 +41,10 @@
 #
 # IMPORTANT — Gitea parser quirk (feedback_gitea_workflow_dispatch_inputs_unsupported):
 # do NOT add an `inputs:` block to `workflow_dispatch:`.
-#
-# No `paths:` filter (feedback_path_filtered_workflow_cant_be_required): a
-# required-check workflow that path-filters its `on:` block degrades the merge
-# gate to a silent indefinite pending.
 
 name: lint-phantom-gate
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
   push:
     branches: [main]
   workflow_dispatch:
@@ -55,10 +54,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: lint-phantom-gate-${{ github.event.pull_request.number || github.ref }}
+  group: lint-phantom-gate-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # New status emission. It is a REAL gate (not bp-exempt) but not yet in BP /
+  # required-contexts.txt: promotion to a required PR gate is sequenced behind
+  # phantom-resolution, so it is acknowledged-pending per
+  # lint-required-context-exists-in-bp (Tier 2g). Directive must stay within
+  # 3 lines of the job key:
+  # bp-required: pending #3467
   lint-phantom-gate:
     name: lint-phantom-gate
     runs-on: ubuntu-latest
