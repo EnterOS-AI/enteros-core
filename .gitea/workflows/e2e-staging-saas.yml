@@ -501,44 +501,39 @@ jobs:
       # CF_ZONE_ID names the prune steps already read, so nothing downstream
       # changes.
       #
-      # TRUSTED-REF GATE (molecule-core is a PUBLIC repo): this step reads the CI
-      # Infisical machine-identity secrets, so it must NEVER run with an
-      # untrusted-fork PR's code in the tree. It runs only on protected-branch
-      # push / operator workflow_dispatch / schedule, and on same-repo (non-fork)
-      # PRs. On an untrusted-fork PR it SKIPS cleanly — CF_API_TOKEN/CF_ZONE_ID
-      # stay empty and the dry-run-preview soft-skip below short-circuits the
-      # prune (same as before this migration). Mirrors the trusted-ref gate in
-      # the "Fetch platform model+runtime from KMS SSOT" step in this file.
+      # SAFE-ENABLE (Guard B / regression-prevention-guards.md §Guard F): this
+      # KMS live-creds fetch runs ONLY on push / workflow_dispatch / schedule —
+      # NEVER on pull_request. It MIRRORS the #3464 PR-mode guard on the concierge
+      # job's "Fetch staging secrets from Infisical KMS" step. The prior
+      # `(pull_request && fork==false)` clause treated same-repo PRs as trusted
+      # and drove the live Infisical fetch + `--apply` DNS prune on every same-repo
+      # PR (and could exit 1 on any Infisical/CF blip), reddening this job and
+      # wedging the `[*]` all-green queue once this required workflow is
+      # re-enabled. The live prune is post-run janitorial cleanup that only
+      # follows a real E2E run (push/dispatch/schedule), so on pull_request this
+      # step is simply SKIPPED: CF_API_TOKEN/CF_ZONE_ID stay empty, the
+      # dry-run-preview soft-skip below fires (exit 0), the prune step is gated
+      # off, and the job is cheap + green. Because the step never runs with an
+      # untrusted-fork PR's code in the tree, the CI Infisical machine-identity
+      # secrets are also safe here.
       - name: Fetch CF_API_TOKEN + CF_ZONE_ID from Infisical SSOT
         id: cf_staging_dns_creds
+        if: >-
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch' ||
+          github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
         run: |
           set -uo pipefail
-          # Trusted-ref gate: only protected-branch push / dispatch / schedule,
-          # or a same-repo (non-fork) PR, may read the CI KMS identity. Untrusted
-          # -fork PRs skip; the prune then soft-skips via the empty-token guard.
-          case "${{ github.event_name }}" in
-            push|workflow_dispatch|schedule)
-              is_trusted=true
-              ;;
-            pull_request)
-              if [ "${{ github.event.pull_request.head.repo.fork }}" = "false" ]; then
-                is_trusted=true
-              else
-                is_trusted=false
-              fi
-              ;;
-            *)
-              is_trusted=false
-              ;;
-          esac
-          if [ "$is_trusted" != "true" ]; then
-            echo "Untrusted ref (${{ github.event_name }}, fork PR) — skipping KMS fetch; prune soft-skips via the empty-token guard."
-            exit 0
-          fi
+          # This step only runs on push / workflow_dispatch / schedule (see the
+          # step-level `if:` above), so it never executes with an untrusted-fork
+          # PR's code in the tree — the CI Infisical machine-identity is safe to
+          # read here. On pull_request the step is skipped entirely (cheap green).
+          # If the identity is somehow missing on a trusted ref, soft-skip
+          # (best-effort janitor never blocks the gate).
           if [ -z "${INFISICAL_CI_CLIENT_ID:-}" ] || [ -z "${INFISICAL_CI_CLIENT_SECRET:-}" ] || [ -z "${INFISICAL_PROJECT_ID:-}" ]; then
             echo "::warning::Infisical CI identity secrets missing on a trusted ref — prune will soft-skip (best-effort janitor, never blocks the gate)."
             exit 0
