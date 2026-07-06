@@ -315,18 +315,30 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   // image fields without waiting for a polling timeout.
   // Genuine *infra* provision failure is already caught loud one step
   // earlier at the org level (instance_status === "failed").
+  // Track whether the workspace agent actually BOOTED (status===online) vs.
+  // reached only the tolerated pre-start credential-abort (#2162: no CP LLM
+  // proxy env on staging → the agent process never ran). Exported below as
+  // STAGING_AGENT_ONLINE so agent-dependent specs/assertions relax exactly
+  // when — and only when — the agent is offline (see staging-tabs.spec.ts and
+  // staging-slow-cold-greeting.spec.ts). This is the harness's own already-
+  // documented distinction, surfaced as a signal instead of a warn-and-forget.
+  let agentOnline = false;
   await waitFor<boolean>(
     async () => {
       const r = await jsonFetch(`${tenantURL}/workspaces/${workspaceId}`, {
         headers: tenantAuth,
       });
       if (r.status !== 200) return null;
-      if (r.body?.status === "online") return true;
+      if (r.body?.status === "online") {
+        agentOnline = true;
+        return true;
+      }
       if (r.body?.status === "failed") {
         const uptime = Number(r.body?.uptime_seconds ?? 0);
         const sampleErr = r.body?.last_sample_error;
         const preStartCredentialAbort = uptime === 0 && !sampleErr;
         if (preStartCredentialAbort) {
+          agentOnline = false;
           // Agent never started (no LLM cred on this staging tenant — the
           // expected #2162 platform-proxy gap). The workspace row still
           // renders, which is all the tab-UI test needs. Proceed, but log
@@ -385,6 +397,15 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   process.env.STAGING_TENANT_URL = tenantURL;
   process.env.STAGING_WORKSPACE_ID = workspaceId;
   process.env.STAGING_TENANT_TOKEN = tenantToken;
+  // Whether the workspace agent booted. "false" ONLY for the documented
+  // #2162 pre-start credential-abort (agent process never ran) — any other
+  // failure hard-threw above, so "false" is never a mask for a real boot
+  // regression. Agent-dependent assertions key off this (see specs).
+  process.env.STAGING_AGENT_ONLINE = agentOnline ? "true" : "false";
+  console.log(
+    `[staging-setup] STAGING_AGENT_ONLINE=${process.env.STAGING_AGENT_ONLINE} ` +
+      `(agent ${agentOnline ? "booted" : "offline — #2162 platform-proxy gap, tab-UI still renders"})`,
+  );
   // The ephemeral org's UUID — exported so specs that route through the CP
   // edge can send X-Molecule-Org-Id (workspace-server TenantGuard). The
   // tabs harness (staging-tabs.spec.ts) and the take-control gate
