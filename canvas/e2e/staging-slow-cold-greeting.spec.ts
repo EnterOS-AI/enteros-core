@@ -34,6 +34,24 @@ const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 // provisioning failure. CANVAS_E2E_STAGING unset = staging not requested = skip.
 test.skip(!STAGING, "CANVAS_E2E_STAGING not set — staging-only suite, not requested");
 
+// This is an end-to-end render-dedup guard: it FORCES a slow cold first turn and
+// asserts the ONE greeting the concierge produces renders exactly once. That
+// requires a LIVE agent to answer. On staging the workspace agent does not boot
+// (#2162 platform-proxy gap — staging tenants carry no CP LLM proxy env; see
+// staging-setup.ts), so there is no live turn to render and the composer never
+// enables ("agent unreachable"). The invariant is ALREADY covered deterministically
+// by the companion unit guard (useChatHistory.slowColdGreetingRenderDup.test.tsx),
+// which drives the real merge logic; this browser belt only adds signal when a
+// live agent exists. Skip when the agent is offline — it auto-enables the moment
+// staging boots a live agent (LLM-proxy-https fix). NOT a skip-green mask: setup
+// classifies the offline agent as the tolerated #2162 shape and hard-throws on any
+// other boot failure, so this never hides a real regression.
+const AGENT_ONLINE = process.env.STAGING_AGENT_ONLINE !== "false";
+test.skip(
+  STAGING && !AGENT_ONLINE,
+  "staging workspace agent offline (#2162) — no live turn to render; invariant covered by the useChatHistory unit guard",
+);
+
 function tenantEnv() {
   const tenantURL = process.env.STAGING_TENANT_URL;
   const tenantToken = process.env.STAGING_TENANT_TOKEN;
