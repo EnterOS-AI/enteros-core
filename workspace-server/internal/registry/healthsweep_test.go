@@ -131,6 +131,42 @@ func TestSweepOnlineWorkspaces_RunningContainer(t *testing.T) {
 	}
 }
 
+// TestSweepOnlineWorkspaces_DoesNotClobberParked is the core#3456 regression
+// guard. The offline UPDATE must carry a WHERE guard that excludes the
+// operator-parked states ('paused', 'hibernated', 'hibernating') so a workspace
+// paused/hibernated in the window between the sweep's SELECT and this UPDATE is
+// NOT flipped to 'offline' (which would 404 the subsequent /resume). We pin the
+// exact guard text: the ExpectExec regexp REQUIRES those tokens, so if the guard
+// ever drops 'paused'/'hibernated' the actual SQL won't match the expectation
+// and sqlmock fails the test — catching the regression at the source.
+func TestSweepOnlineWorkspaces_DoesNotClobberParked(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	rows := sqlmock.NewRows([]string{"id"}).AddRow("ws-parked-789")
+	mock.ExpectQuery("SELECT id FROM workspaces WHERE status IN").
+		WillReturnRows(rows)
+
+	// The UPDATE must include the parked-state guard. The regexp asserts the
+	// exact NOT IN set; a regression that drops 'paused'/'hibernated' produces
+	// SQL that fails to match → sqlmock errors on ExpectationsWereMet.
+	mock.ExpectExec(
+		`UPDATE workspaces SET status = .* WHERE id = .* AND status NOT IN \('removed', 'provisioning', 'paused', 'hibernated', 'hibernating'\)`).
+		WithArgs(models.StatusOffline, "ws-parked-789").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	checker := &mockChecker{running: map[string]bool{
+		"ws-parked-789": false, // container stopped (parked) — sweep sees it "gone"
+	}}
+
+	sweepOnlineWorkspaces(context.Background(), checker, func(_ context.Context, _ string) {})
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("core#3456 regression: offline UPDATE did not carry the parked-state guard "+
+			"(paused/hibernated/hibernating must be excluded): %v", err)
+	}
+}
+
 func TestStartHealthSweep_NilChecker(t *testing.T) {
 	// Should return immediately without panicking
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
