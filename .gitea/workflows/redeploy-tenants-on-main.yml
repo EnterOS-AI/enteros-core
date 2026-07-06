@@ -114,6 +114,20 @@ jobs:
             exit 1
           fi
 
+          # Guard B (candidate-identity): resolve the candidate image's git
+          # revision from its OCI label so the health gate below can assert the
+          # ROLLED container is genuinely running THIS candidate — not a stale
+          # image that a silently-failed swap left behind. Best-effort: an image
+          # with no revision label falls back to liveness-only (logged).
+          EXPECT_REV="$(docker image inspect "$IMG" \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)"
+          EXPECT_REV="$(printf '%s' "$EXPECT_REV" | tr -d '[:space:]')"
+          if [ -n "$EXPECT_REV" ]; then
+            echo "::notice::candidate image revision = ${EXPECT_REV} — the health gate will assert each rolled canary/container reports it via /buildinfo"
+          else
+            echo "::warning::candidate image $IMG carries no org.opencontainers.image.revision label — health gate falls back to LIVENESS-ONLY (cannot verify candidate identity)"
+          fi
+
           # Enumerate the running PRODUCTION tenant containers (local-docker
           # equivalent of the old EC2 DescribeInstances fleet enumeration).
           mapfile -t TENANTS < <(docker ps \
@@ -127,13 +141,34 @@ jobs:
             echo "Production tenants to roll (${#TENANTS[@]}): ${TENANTS[*]}"
           fi
 
+          # readiness gate: was /buildinfo-LIVENESS-ONLY (a container answering 200
+          # tells you nothing about WHICH image it runs). Guard B deepens it to a
+          # CANDIDATE-IDENTITY gate: /buildinfo must not only answer, it must report
+          # the candidate's git_sha (EXPECT_REV). This turns the canary swap into a
+          # real "the candidate is actually running" gate BEFORE the fleet fans out
+          # — a swap that silently kept the stale image now REDs the roll instead of
+          # passing a hollow liveness check. (The full A2A provision_workspace
+          # CALLABLE assertion for the prod image is enforced upstream by the
+          # staging gate TestPlatformAgentMgmtMCP_Staging with
+          # E2E_ASSERT_MGMT_MCP_CALLABLE=1, which blocks the prod promote.)
           health_gate() {
-            local name="$1" port
+            local name="$1" port body sha
             port="$(docker port "$name" 8080/tcp 2>/dev/null | head -1 | sed 's/.*://')"
             [ -n "$port" ] || return 1
             for _ in $(seq 1 20); do
-              if curl -fsS --max-time 5 "http://127.0.0.1:${port}/buildinfo" >/dev/null 2>&1; then
-                return 0
+              body="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/buildinfo" 2>/dev/null || true)"
+              if [ -n "$body" ]; then
+                if [ -z "$EXPECT_REV" ]; then
+                  return 0  # liveness-only fallback (no candidate revision to check)
+                fi
+                sha="$(printf '%s' "$body" | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.stdout.write(str(d.get("git_sha","")) if isinstance(d,dict) else "")' 2>/dev/null || true)"
+                case "$EXPECT_REV" in
+                  "$sha"*) return 0 ;;
+                  *) case "$sha" in "$EXPECT_REV"*) return 0 ;; esac ;;
+                esac
+                # answered but wrong image — keep polling briefly (the recreate may
+                # still be finishing), then fail identity below.
+                echo "::warning::$name /buildinfo git_sha='${sha}' != candidate '${EXPECT_REV}' — awaiting candidate"
               fi
               sleep 3
             done
