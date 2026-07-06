@@ -88,6 +88,11 @@ PROFILES: dict[str, dict[str, str]] = {
             r"^workspace-server/internal/provisioner/template_assets\.go$"
             r"|^workspace-server/internal/provisioner/gitea_template_assets\.go$"
             r"|^workspace-server/internal/provisioner/cp_provisioner\.go$"
+            # #206 docker-less read-back surface (host-side /configs mirror +
+            # Files-API serve) — the exact code the PR-build gate exercises.
+            r"|^workspace-server/internal/provisioner/hostside_config\.go$"
+            r"|^workspace-server/internal/handlers/templates\.go$"
+            r"|^workspace-server/internal/router/router\.go$"
             r"|^workspace-server/internal/handlers/platform_agent\.go$"
             r"|^workspace-server/cmd/server/main\.go$"
             r"|^workspace-server/internal/handlers/org_import\.go$"
@@ -99,8 +104,21 @@ PROFILES: dict[str, dict[str, str]] = {
             r"|^workspace-server/internal/handlers/plugins_tracking\.go$"
             r"|^workspace-server/internal/plugins/source\.go$"
             r"|^manifest\.json$"
-            r"|^tests/e2e/test_template_delivery_e2e\.sh$"
-            r"|^\.gitea/workflows/template-delivery-e2e\.yml$"
+            # ROOT-FIX of the deploy-ordering deadlock: the gate's OWN plumbing
+            # is DELIBERATELY excluded from the delivery trigger — the workflow
+            # file `.gitea/workflows/template-delivery-e2e.yml`, the delivery
+            # gate script `tests/harness/template-asset-delivery-gate.sh`, the
+            # harness compose, and the retired deployed-staging script
+            # `tests/e2e/test_template_delivery_e2e.sh` (now dispatch-only in
+            # template-delivery-e2e-staging.yml). Keeping any of them in the
+            # trigger re-created the circular block: a delivery PR could never
+            # green its own gate until deployed, but deploying needed the merge
+            # the red gate blocked — AND a gate-plumbing PR (which changes the
+            # workflow/replay while main still lacks the read-back fix) would
+            # build a stale main image and 59B-fail its own no-op change.
+            # Gate-plumbing changes self-certify via code review; only real
+            # workspace-server delivery-surface changes re-provision + assert
+            # the served /configs bundle (>1KiB, not the 59B stub).
         ),
     },
 }
