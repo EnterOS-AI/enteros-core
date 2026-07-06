@@ -165,6 +165,12 @@ export function useChatSocket(
         const p = msg.payload || {};
         const messageId = (p.message_id as string) || "";
         const content = (p.content as string) || "";
+        // Role-based classification (SSOT): the server tags a self-message
+        // (the heartbeat delegation-result wake nudge and siblings) with
+        // role="system" so it renders as a distinct centered "System" note
+        // rather than a blue user bubble. Absent/other role → "user" (a
+        // genuine cross-device chat echo, unchanged).
+        const isSystem = p.role === "system";
         const rawAttachments = (p.attachments as Array<{
           name?: string;
           uri?: string;
@@ -181,9 +187,10 @@ export function useChatSocket(
           }));
         if (messageId) {
           const ts = new Date().toISOString();
-          const userMsg = Object.freeze({
+          const userMsg: ChatMessage = Object.freeze({
             id: messageId,
-            role: "user" as const,
+            role: isSystem ? ("system" as const) : ("user" as const),
+            ...(isSystem ? { systemKind: "notice" as const } : {}),
             content,
             ...(attachments.length ? { attachments } : {}),
             timestamp: ts,

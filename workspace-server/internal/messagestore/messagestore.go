@@ -96,6 +96,21 @@ type ChatMessage struct {
 	// cleared (core#2636). Raw passthrough of the stored JSON array of
 	// {tool, input} objects; omitted when the row has none.
 	ToolTrace json.RawMessage `json:"tool_trace,omitempty"`
+	// SystemKind sub-classifies a Role=="system" message so the canvas
+	// can render the two distinct kinds of system message differently:
+	//
+	//   - "notice"  — an internal self-message (a delegation-result wake
+	//     nudge and its siblings: heartbeat harvester, cron self-tick,
+	//     idle self-wake, mailbox-kernel self-turns). Rendered as a
+	//     centered, greyed "System" note — NOT a blue user bubble (the
+	//     bug this field fixes) and NOT the red error bubble.
+	//   - "error"   — a failed turn (status=error / "agent error …").
+	//     Rendered as the existing red bubble. Left UNSET on the error
+	//     path for back-compat; the renderer treats absent/"error" as
+	//     the error style, and only "notice" gets the neutral note.
+	//
+	// Omitted for Role=="user"/"agent" (only meaningful for "system").
+	SystemKind string `json:"systemKind,omitempty"`
 }
 
 // ChatAttachment mirrors canvas ChatAttachment / ParsedFilePart.

@@ -37,22 +37,104 @@ func NewPostgresMessageStore(db *sql.DB) *PostgresMessageStore {
 	return &PostgresMessageStore{db: db}
 }
 
-// internalSelfPrefixes — message texts that should be filtered from
-// chat history because they're internal self-triggers (heartbeats,
-// scheduled-task self-fire, delegation-result self-notify), not
-// user-typed messages. Mirrors canvas isInternalSelfMessage.
+// selfSourceTypes is the SSOT set of A2A params.metadata.source_type
+// markers the runtime stamps on messages a workspace sends TO ITSELF as
+// routine wake nudges — NOT human-typed turns. Mirrors the runtime's
+// _ROUTINE_SELF_SOURCE_TYPES (molecule_runtime/a2a_executor.py). The
+// canonical example is the heartbeat delegation-result harvester
+// ("self-harvester" / "self-delegation-result"): on detecting a
+// completed delegation it POSTs "Delegation results are ready. Review
+// them and take appropriate action." back to its own /a2a endpoint to
+// wake the agent (docs/api-protocol/registry-and-heartbeat.md).
 //
-// Centralizing here means a future internal-trigger pattern is added
-// in one place; alternative impls of MessageStore are expected to
-// apply the same filter (or override deliberately).
+// A request carrying one of these markers is classified Role="system"
+// (SystemKind="notice") and SURFACED as a distinct system message — it
+// must never render as a blue user bubble (the bug) nor be silently
+// dropped. The marker travels WITH the message (params.metadata), so the
+// classification is role-based at the source, not inferred from the text.
+var selfSourceTypes = map[string]bool{
+	"self-cron":              true,
+	"self-harvester":         true,
+	"self-idle":              true,
+	"self-scheduler":         true,
+	"self-goal-nudge":        true,
+	"self-delegation-result": true,
+}
+
+// IsSelfSourceType reports whether a params.metadata.source_type marker
+// denotes an internal self-message. Exported so the A2A ingest/broadcast
+// path (handlers.persistUserMessageAtIngest) classifies live messages by
+// the same SSOT rule the history reader uses.
+func IsSelfSourceType(sourceType string) bool {
+	return selfSourceTypes[sourceType]
+}
+
+// RequestSourceType reads the typed source marker the runtime stamps on
+// outbound self-messages: params.metadata.source_type (the sibling of
+// params.message, where build_message_send_params places it). Falls back
+// to params.message.metadata.source_type for any sender that nests the
+// marker on the message itself. Returns "" when absent (a genuine user
+// send, or a legacy row persisted before the marker existed). Exported
+// for the handlers ingest path.
+func RequestSourceType(body json.RawMessage) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var env struct {
+		Params struct {
+			Metadata map[string]any `json:"metadata"`
+			Message  struct {
+				Metadata map[string]any `json:"metadata"`
+			} `json:"message"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return ""
+	}
+	if st, ok := env.Params.Metadata["source_type"].(string); ok && st != "" {
+		return st
+	}
+	if st, ok := env.Params.Message.Metadata["source_type"].(string); ok && st != "" {
+		return st
+	}
+	return ""
+}
+
+// isInternalSelfRequest is the SSOT classifier for "this a2a_receive row
+// is an internal self-message (wake nudge), not a user turn." It
+// classifies by the typed source_type marker (role-based, travels with
+// the message). The internalSelfPrefixes text-match is retained ONLY as a
+// legacy back-compat fallback for rows persisted BEFORE the runtime
+// stamped the marker — every current self-message carries source_type,
+// so the fallback is dead for new rows.
+func isInternalSelfRequest(body json.RawMessage, text string) bool {
+	if st := RequestSourceType(body); st != "" {
+		// A marker is present: trust it exclusively. A tagged message
+		// whose source_type is NOT a self-type is a genuine turn, even
+		// if its text happens to match a legacy prefix.
+		return IsSelfSourceType(st)
+	}
+	// No typed marker (legacy/untagged row) — fall back to the deprecated
+	// text-prefix list.
+	return IsInternalSelfMessage(text)
+}
+
+// internalSelfPrefixes — DEPRECATED legacy fallback. Message texts that
+// mark an internal self-trigger (heartbeat delegation harvester, etc.).
+// Superseded by the typed params.metadata.source_type marker (see
+// selfSourceTypes / isInternalSelfRequest); retained ONLY to classify
+// rows persisted before the marker existed. Do not extend — new
+// internal-trigger kinds are added to selfSourceTypes (and mirrored in
+// the runtime), never here.
 var internalSelfPrefixes = []string{
 	"Delegation results are ready",
 }
 
 // IsInternalSelfMessage reports whether text starts with any registered
 // internal-self prefix. Empty text returns false (legitimate
-// attachments-only bubble). Exported for impls that want to share the
-// same predicate.
+// attachments-only bubble). DEPRECATED: prefer role-based classification
+// via RequestSourceType/IsSelfSourceType; this text-match is the legacy
+// fallback for untagged rows only. Exported for impls that share it.
 func IsInternalSelfMessage(text string) bool {
 	if text == "" {
 		return false
@@ -119,7 +201,7 @@ func (s *PostgresMessageStore) List(ctx context.Context, workspaceID string, opt
 			toolTrace = json.RawMessage(rawTrace.String)
 		}
 		before := len(messages)
-		messages = append(messages, activityRowToChatMessages(rowID.String, createdAt, status, requestBody, responseBody, toolTrace, IsInternalSelfMessage)...)
+		messages = append(messages, activityRowToChatMessages(rowID.String, createdAt, status, requestBody, responseBody, toolTrace)...)
 		// If the row produced an agent message with NO explicit tool_trace
 		// but ran long enough to have invoked tools, mark it for
 		// agent_log reconstruction. duration_ms bounds the window
@@ -354,7 +436,14 @@ const errInvalidLimit sentinelError = "messagestore: List opts.Limit must be > 0
 // activityRowToChatMessages converts ONE activity_logs row into 0-2
 // ChatMessages. Direct port of canvas activityRowToMessages.
 //
-//   - Up to 1 user-side bubble from request_body, unless internal-self.
+//   - Up to 1 request-side bubble from request_body. Role is "user" for
+//     a genuine turn; "system" (SystemKind="notice") for an internal
+//     self-message (delegation-result wake nudge etc.), classified by
+//     the SSOT params.metadata.source_type marker — see
+//     isInternalSelfRequest. Internal self-messages are SURFACED as a
+//     distinct system note, never dropped and never mis-rendered as a
+//     blue user bubble (the bug this replaces the string-prefix
+//     band-aid for).
 //   - Up to 1 agent-side bubble from response_body. Role is "system"
 //     when status='error' OR text starts with "agent error" (case-
 //     insensitive — matches canvas predicate exactly).
@@ -374,17 +463,28 @@ func activityRowToChatMessages(
 	requestBody json.RawMessage,
 	responseBody json.RawMessage,
 	toolTrace json.RawMessage,
-	internalSelf func(string) bool,
 ) []ChatMessage {
 	var out []ChatMessage
 	timestamp := createdAt.UTC().Format(time.RFC3339Nano)
 
 	userText := extractRequestText(requestBody)
 	userAttachments := extractFilesFromUserMessage(requestBody)
-	if !internalSelf(userText) && (userText != "" || len(userAttachments) > 0) {
+	if userText != "" || len(userAttachments) > 0 {
+		role := "user"
+		systemKind := ""
+		if isInternalSelfRequest(requestBody, userText) {
+			// Internal self-message (wake nudge) — classify as a distinct
+			// system note and SURFACE it. Do NOT drop it and do NOT
+			// misattribute it to the user (the pre-fix bug rendered these
+			// as blue user bubbles). "notice" keeps it visually separate
+			// from the red error-system bubble.
+			role = "system"
+			systemKind = "notice"
+		}
 		out = append(out, ChatMessage{
 			ID:          deterministicMessageID(rowID, "user"),
-			Role:        "user",
+			Role:        role,
+			SystemKind:  systemKind,
 			Content:     userText,
 			Attachments: userAttachments,
 			Timestamp:   timestamp,
