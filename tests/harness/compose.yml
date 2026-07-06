@@ -135,6 +135,12 @@ services:
       # harness doesn't exercise memory features, so disable the
       # sidecar via the entrypoint's documented escape hatch.
       MEMORY_PLUGIN_DISABLE: "1"
+      # template-delivery-e2e (#206 read-back gate): OPTIONAL Gitea token so the
+      # tenant's giteaTemplateAssetFetcher can fetch PRIVATE workspace templates
+      # (e.g. seo-agent) at provision time. Empty default => unchanged behaviour
+      # for every existing replay (public templates fetch anonymously). Only the
+      # template-delivery gate sets it (from the CI AUTO_SYNC_TOKEN).
+      MOLECULE_TEMPLATE_REPO_TOKEN: "${MOLECULE_TEMPLATE_REPO_TOKEN:-}"
     networks: [harness-net]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/health || exit 1"]
@@ -203,6 +209,12 @@ services:
       # harness doesn't exercise memory features, so disable the
       # sidecar via the entrypoint's documented escape hatch.
       MEMORY_PLUGIN_DISABLE: "1"
+      # template-delivery-e2e (#206 read-back gate): OPTIONAL Gitea token so the
+      # tenant's giteaTemplateAssetFetcher can fetch PRIVATE workspace templates
+      # (e.g. seo-agent) at provision time. Empty default => unchanged behaviour
+      # for every existing replay (public templates fetch anonymously). Only the
+      # template-delivery gate sets it (from the CI AUTO_SYNC_TOKEN).
+      MOLECULE_TEMPLATE_REPO_TOKEN: "${MOLECULE_TEMPLATE_REPO_TOKEN:-}"
     networks: [harness-net]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/health || exit 1"]

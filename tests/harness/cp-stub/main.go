@@ -173,13 +173,21 @@ func main() {
 			}
 		}
 		// Stub instance id + state — matches the real CP's success-path
-		// contract. EC2 instance ids start with "i-" (the real CP
-		// generates them via EC2 RunInstances; the stub is a stand-in,
-		// but the prefix keeps any future real-CP log-reader from
-		// false-flagging the stub response as malformed). "running"
-		// matches the prod happy path; the harness doesn't await
-		// any state transition.
-		instanceID := "i-stub-" + wsID
+		// contract. The molecules-server (local-docker) backend — the CURRENT
+		// reality since AWS was retired 2026-06-27 — persists the workspace box's
+		// CONTAINER NAME (mol-ws-<...>) as instance_id, NOT an EC2 "i-<hex>" id.
+		// The tenant's Files API routes read-back by this shape: isEC2InstanceID()
+		// (files_backend_dispatch.go) sends any "i-"-prefixed id down the retired
+		// AWS-EIC tunnel (which, with no real EC2, times out ~30s and 500s), while
+		// a non-"i-" id takes the local-docker path → (no docker.sock in the
+		// tenant, #206) → the host-side /configs mirror the CPProvisioner
+		// persisted at provision. The old "i-stub-" value modeled the retired EC2
+		// backend and made the docker-less read-back (#206) untestable in the
+		// harness — every /configs read 500'd on a dead EIC tunnel. Use the
+		// molecules-server container-name shape so the harness faithfully models
+		// the live backend and the read-back reaches the mirror. "running" matches
+		// the prod happy path; the harness doesn't await any state transition.
+		instanceID := "mol-ws-" + wsID
 		state := "running"
 		log.Printf("cp-stub: /cp/workspaces/provision called (count=%d) -> %s (instance_id=%s, state=%s)", provisionCalls.Load(), wsID, instanceID, state)
 		writeJSON(w, 201, map[string]any{

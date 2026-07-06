@@ -1,44 +1,45 @@
 name: template-delivery-e2e
 
-# RFC #2843 regression gate — provisions a fresh tenant + fresh seo-agent and
-# asserts BOTH delivery channels work end to end. This is the gate that would
-# have caught the 2026-06-15 incident family (#2919 model/identity drop + #32
-# skill drop): nothing else in CI provisions a fresh agent and inspects the
-# DELIVERED /configs.
+# RFC #2843 regression gate — asserts a fresh tenant DELIVERS + SERVES BACK the
+# rendered /configs bundle (config.yaml + prompts). This is the gate that would
+# have caught the 2026-06-15 incident family (#2919 model/identity drop, #32
+# skill drop) and the #206 docker-less read-back 59-byte stub.
 #
-# TWO CHANNELS (post-decoupling, RFC #2843 #32):
-#   - TEMPLATE-ASSET channel (provisioning-time): config.yaml + prompts + model.
-#   - DYNAMIC PLUGIN channel (post-online): agent-skills are PLUGINS — the
-#     seo-agent declares seo-all and the post-online reconcile installs it to
-#     /configs/plugins/seo-all/. The e2e asserts the skill arrives via the
-#     PLUGIN channel and NOT the asset channel (negative control).
+# ── ROOT-FIX (deploy-ordering deadlock) ────────────────────────────────────
+# The old gate provisioned against DEPLOYED staging (MOLECULE_CP_URL=
+# staging-api) and asserted config.yaml. That is a class-D ENV-COUPLING bug: a
+# delivery-surface PR could NEVER green its own gate until it was deployed — but
+# deploying needed the merge the red gate blocked (circular). It froze #3478
+# (the #206 read-back fix) and the staging 59B regression with it.
 #
-# STAGED ROLLOUT (now COMPLETE — this gate is merge-blocking):
-#   Phase 1 (done): advisory — asserted the new two-channel contract.
-#   Phase 2a (done, f6155d68): HARDENED the asset-channel assertions (C
-#                  config.yaml, D prompts) to poll within E2E_ASSET_SETTLE_SECS,
-#                  killing the false stub from a transient /configs read
-#                  (`curl: (28) ... 0 bytes`). Banked a green main run, which
-#                  lint-pre-flip-continue-on-error requires before the flip.
-#   Phase 2b (THIS change, mc#2996): FLIP to merge-blocking —
-#                  • continue-on-error removed → a real delivery regression fails;
-#                  • `on: paths:` removed (required workflows must not be
-#                    path-filtered); path-scoping moved to the detect-changes job
-#                    (profile `template-delivery`) and applied per-step;
-#                  • the emitted context is added to .gitea/required-contexts.txt
-#                    and to branch-protection required_status_checks (as
-#                    "... (pull_request)") so a delivery PR cannot merge unless a
-#                    fresh seo-agent provisions and BOTH channels verify.
+# The gate now validates the PR's OWN artifact:
+#   1. Builds the tenant image (workspace-server/Dockerfile.tenant) FROM THIS REF
+#      on robot-1 (`runs-on: [docker-host, robot-1]`) — off the local box.
+#   2. Brings up the production-shape harness (tests/harness) — the SAME image
+#      shipped to prod, running as a real molecules-server tenant (MOLECULE_ORG_ID
+#      set → CPProvisioner, docker-less), talking to the harness cp-stub.
+#   3. Provisions a FRESH seo-agent workspace THROUGH the tenant, then asserts
+#      the tenant SERVES BACK the FULL rendered config.yaml (>1 KiB) + prompts
+#      via the Files API — the #206 host-side /configs mirror read-back. A PR
+#      that regresses delivery serves the 59-byte stub → the gate fails.
+#   4. Tears the harness down (ephemeral; reaper-clean; NO staging org touched,
+#      NO staging pin touched).
+# So the gate validates the PR's CHANGE with no deployed-staging dependency.
 #
-# Cost: provisions ONE throwaway tenant + ONE seo-agent (real EC2), teardown
-# trap deletes the org even on failure. The workflow has NO `on: paths:` filter:
-# a REQUIRED-check workflow must not carry one (lint-required-no-paths.py /
-# feedback_path_filtered_workflow_cant_be_required — a docs-only PR would never
-# emit the context, Gitea reports it `pending`, and the PR wedges forever).
-# Instead the detect-changes job applies the same path-scoping at RUNTIME, and
-# the delivery job's real steps are gated on its output: a non-delivery PR emits
-# SUCCESS cheaply (no provision), while a delivery PR runs the full e2e and
-# BLOCKS on failure. Mirrors the e2e-api / peer-visibility required-gate shape.
+# The post-online PLUGIN channel (seo-all reconcile, assertion E) INHERENTLY
+# needs a live deployed runtime (the harness cp-stub never brings one online),
+# so it CANNOT be a pre-merge PR gate by construction. It is preserved,
+# unchanged, in template-delivery-e2e-staging.yml (`workflow_dispatch`, run
+# post-deploy against staging) — no assertion was dropped, it was relocated off
+# the PR critical path.
+#
+# Required-workflow shape (unchanged): NO `on: paths:` filter (a required check
+# must not be path-filtered — a docs-only PR would wedge forever on an absent
+# context). The detect-changes job applies the delivery path-scoping at RUNTIME
+# (profile `template-delivery`, in detect-changes.py); the delivery job's real
+# steps are gated per-step on its output. A non-delivery PR emits SUCCESS
+# cheaply (no build); a delivery PR runs the full PR-build e2e and BLOCKS on
+# failure. Mirrors e2e-api / peer-visibility / harness-replays.
 
 on:
   workflow_dispatch: {}
@@ -51,20 +52,22 @@ concurrency:
   group: template-delivery-e2e-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: false
 
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
 jobs:
-  # Runtime path-scoping (replaces the removed `on: paths:`). Mirrors the
-  # e2e-api / peer-visibility detect-changes shape. Outputs `delivery=true`
-  # when the diff touches the delivery surface; the gate job runs the real e2e
-  # only then. bp-exempt: helper job; the REQUIRED context is the `delivery`
-  # job below, not this one.
+  # Runtime path-scoping (replaces the removed `on: paths:`). Outputs
+  # `delivery=true` when the diff touches the workspace-server delivery surface;
+  # the gate job runs the real PR-build e2e only then. bp-exempt: helper job;
+  # the REQUIRED context is the `delivery` job below, not this one.
   detect-changes:
-    runs-on: ubuntu-latest
+    runs-on: docker-host
     continue-on-error: false
     outputs:
       delivery: ${{ steps.decide.outputs.delivery }}
       debug: ${{ steps.decide.outputs.debug }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
       - id: decide
@@ -92,65 +95,54 @@ jobs:
   # `needs.detect-changes.outputs.delivery` — a non-delivery PR runs only the
   # no-op step and emits SUCCESS (branch-protection-clean; a job-level `if:`
   # would emit a SKIPPED check run that fails the required-check eval — see
-  # e2e-api.yml's PR#2264 note). A delivery PR runs the full e2e and, with no
-  # continue-on-error, BLOCKS the merge on failure.
-  # bp-required: yes — mc#2996 / RFC#2843 #37: this context is merge-blocking;
-  # branch protection lists "<this> (pull_request)".
+  # e2e-api.yml's PR#2264 note). A delivery PR runs the full PR-build e2e and,
+  # with no continue-on-error, BLOCKS the merge on failure.
+  # bp-required: yes — this context is merge-blocking; branch protection lists
+  # "<this> (pull_request)" (via the ["*"] all-green gate). Name UNCHANGED from
+  # the pre-redesign gate so the required-context identity does not drift (the
+  # asset-channel config+prompts assertions it names are exactly what the
+  # PR-build path asserts; the "seo-all via plugin reconcile" clause moved to
+  # template-delivery-e2e-staging.yml — see this file's header).
   delivery:
     needs: detect-changes
     # No colon in the name — lint-required-context's PyYAML AST parse rejects an
     # unquoted scalar containing a colon.
     name: Template-asset delivery (fresh seo-agent — config+prompts via asset channel, seo-all via plugin reconcile)
-    runs-on: ubuntu-latest
-    # Outer job cap. Raised from 30 → 75 because the old 30-min ceiling was
-    # BELOW the e2e script's ~58-min worst case (tenant 900s + TLS 900s +
-    # ws-online 900s + asset-settle 180s + plugin 600s): a slow-but-legit run
-    # hit the ceiling, the runner SIGKILLed the job mid-provision, and the
-    # in-script EXIT trap never completed the DELETE → the already-created org +
-    # tenant container leaked. The binding hang-stop is now the step-level
-    # `timeout-minutes` on "Run template-asset delivery e2e" (65) — a STEP
-    # timeout, unlike a JOB timeout, still runs the subsequent `if: always()`
-    # teardown net. This 75 is the outer bound (setup + 65-min run + teardown).
+    # robot-1's 32c dedicated build box (`[docker-host, robot-1]` = AND, so it
+    # lands ONLY on robot-1 while satisfying the docker-host-pinned lint). Keeps
+    # the heavy tenant-image build + harness e2e OFF the local molecules-server
+    # box (operator-config#373 local-box SSOT).
+    runs-on: [docker-host, robot-1]
+    # Build (cache-warm minutes; cold ~45) + harness up + provision + read-back.
     timeout-minutes: 75
-    env:
-      MOLECULE_CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}
-      # MOLECULE_ADMIN_TOKEN (alias for CP_ADMIN_API_TOKEN) now arrives via
-      # $GITHUB_ENV from the "Fetch CP_ADMIN_API_TOKEN from Infisical KMS" step
-      # below (wave-3 migration). The "Verify required secret present" step
-      # still validates it is non-empty before the e2e runs.
-      E2E_EXPECTED_MODEL: moonshot/kimi-k2.6
     steps:
       - name: No-op pass (delivery surface unchanged in this diff)
         if: needs.detect-changes.outputs.delivery != 'true'
         run: |
           echo "No delivery-surface changes — gate satisfied without provisioning."
           echo "::notice::template-delivery-e2e no-op pass (detect-changes: ${{ needs.detect-changes.outputs.debug }})."
+
       - if: needs.detect-changes.outputs.delivery == 'true'
-        uses: actions/checkout@v4
-      # KMS wave-3 (Gitea-Actions-secrets -> Infisical SSOT): source the admin
-      # token (consumed here as MOLECULE_ADMIN_TOKEN) from Infisical (prod
-      # /shared/controlplane-admin) via the CI machine identity instead of the
-      # duplicated Gitea Actions secret, mirroring this repo's
-      # boot-to-registration-e2e KMS pattern. Exported to $GITHUB_ENV under the
-      # alias MOLECULE_ADMIN_TOKEN so the verify + e2e steps read it unchanged.
-      # Only runs when the delivery surface changed (the real e2e runs); a
-      # no-op PR never touches the CI identity.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Log detected changes
+        if: needs.detect-changes.outputs.delivery == 'true'
+        run: |
+          echo "::notice::detect-changes debug ${{ needs.detect-changes.outputs.debug }}"
+
+      # AUTO_SYNC_TOKEN (devops-engineer persona PAT) is (a) the cross-repo clone
+      # token for the private workspace-template-* deps in manifest.json, and
+      # (b) wired into the tenant env as MOLECULE_TEMPLATE_REPO_TOKEN so the
+      # tenant's giteaTemplateAssetFetcher can fetch the PRIVATE seo-agent
+      # template at provision time. Sourced from the Infisical SSOT
+      # (/shared/dev-utils, environment=prod) via the CI machine identity.
       #
-      # TRUSTED-REF GATING: molecule-core is a PUBLIC repo; this step consumes
-      # the INFISICAL_CI_* machine-identity secrets, so it must only run on a
-      # TRUSTED event — operator workflow_dispatch, a push to the protected main
-      # branch, or a SAME-REPO pull_request. The pull_request clause uses the
-      # FAIL-CLOSED positive allowlist
-      # (github.event.pull_request.head.repo.full_name == github.repository):
-      # it admits ONLY a same-repo head and fails closed on a fork, a
-      # detached/cross-repo head, OR a missing/null head.repo field (the negative
-      # `head.repo.fork == false` form would FAIL-OPEN on a null `fork`, since
-      # `null == false` coerces TRUE in the expression engine). An untrusted-fork
-      # PR is therefore excluded so it cannot harvest the KMS token. A fork
-      # delivery PR will fail the "Verify required secret present" check below
-      # (loud, not silent) until a maintainer runs it from a trusted ref.
-      - name: Fetch CP_ADMIN_API_TOKEN from Infisical KMS
-        id: cp_admin_token
+      # FORK SAFETY: gated to same-repo events — a fork PR must never harvest the
+      # token. On a fork the step is skipped, the fetch falls back to anonymous
+      # clone (public deps), and the private seo-agent fetch would fail loudly in
+      # the replay (not silently) — a maintainer re-runs from a trusted ref.
+      - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
+        id: auto_sync_token
         if: >-
           needs.detect-changes.outputs.delivery == 'true' &&
           (github.event_name == 'workflow_dispatch' ||
@@ -166,112 +158,94 @@ jobs:
           TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; v=json.load(sys.stdin).get("accessToken"); sys.stdout.write(v if isinstance(v,str) else "")')
-          if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
           read_secret() {
             curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
               -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json; v=json.load(sys.stdin).get("secret",{}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) else "")'
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
           }
-          CP_ADMIN_API_TOKEN=$(read_secret CP_ADMIN_API_TOKEN %2Fshared%2Fcontrolplane-admin)
-          echo "::add-mask::$CP_ADMIN_API_TOKEN"
-          # Masking-control: this required delivery gate must not run against an
-          # empty admin token. Assert NON-EMPTY and FAIL LOUD.
-          if [ -z "$CP_ADMIN_API_TOKEN" ]; then
-            echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at prod /shared/controlplane-admin — failing closed."
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -z "$AUTO_SYNC_TOKEN" ]; then
+            echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils"
             exit 1
           fi
-          # Export under the alias the e2e consumes.
-          echo "MOLECULE_ADMIN_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
-          echo "CP_ADMIN_API_TOKEN loaded from Infisical (len=${#CP_ADMIN_API_TOKEN})"
-      - name: Verify required secret present
+          echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
+          echo "AUTO_SYNC_TOKEN loaded from Infisical (len=${#AUTO_SYNC_TOKEN})"
+
+      # Pre-clone manifest deps before docker compose builds the tenant image
+      # (Dockerfile.tenant COPYs .tenant-bundle-deps/* — private repos can't be
+      # cloned inside the build sandbox). Same pattern as harness-replays.yml.
+      - name: Pre-clone manifest deps
         if: needs.detect-changes.outputs.delivery == 'true'
+        env:
+          MOLECULE_GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
         run: |
-          if [ -z "${MOLECULE_ADMIN_TOKEN:-}" ]; then
-            echo "::error::CP_ADMIN_API_TOKEN secret not set — cannot run delivery e2e"
-            exit 2
+          set -euo pipefail
+          if [ -z "${MOLECULE_GITEA_TOKEN}" ]; then
+            echo "::warning::AUTO_SYNC_TOKEN not set — anonymous clone (public deps only; private seo-agent will fail the read-back assertion loudly on a fork)"
           fi
-      # Mint the org slug BEFORE the e2e provisions anything, and publish it to
-      # $GITHUB_ENV. Two consumers read it: (1) the e2e script, which honors
-      # E2E_TMPL_SLUG instead of minting its own; (2) the always() teardown net
-      # below, which deprovisions THIS EXACT slug. Doing it in a dedicated early
-      # step — which always completes and flushes $GITHUB_ENV — guarantees the
-      # teardown knows the slug even if the e2e step is SIGKILLed mid-provision
-      # before it could export anything itself. Keeps the `e2e-tmpl-` prefix so
-      # slugs.IsEphemeral() / the CP reaper still classify it ephemeral, and
-      # stays within the CP admin slug limit (^[a-z][a-z0-9-]{2,31}$).
-      - name: Mint e2e org slug (teardown target)
+          mkdir -p .tenant-bundle-deps
+          sed '/^[[:space:]]*\/\//d' manifest.json > .manifest-stripped.json
+          bash scripts/clone-manifest.sh \
+            .manifest-stripped.json \
+            .tenant-bundle-deps/workspace-configs-templates \
+            .tenant-bundle-deps/org-templates \
+            .tenant-bundle-deps/plugins
+          ws_count=$(find .tenant-bundle-deps/workspace-configs-templates -mindepth 1 -maxdepth 1 -type d | wc -l)
+          echo "Cloned workspace-configs-templates: $ws_count"
+
+      - name: Install Python deps for replays
         if: needs.detect-changes.outputs.delivery == 'true'
         run: |
-          rand=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
-          slug="e2e-tmpl-${rand}"
-          echo "E2E_TMPL_SLUG=$slug" >> "$GITHUB_ENV"
-          echo "Minted e2e org slug for this run: $slug (always() teardown will target it)"
-      # Step-level timeout (65) is the BINDING hang-stop: a *step* timeout still
-      # runs the `if: always()` teardown net below, so a hung provision cannot
-      # leak the org. Sized above the script's ~58-min worst case so a
-      # slow-but-legit run is not falsely killed.
-      - name: Run template-asset delivery e2e
+          pip install \
+            --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+            -r tests/harness/requirements.txt
+
+      # Build the harness images FROM THIS REF explicitly. `docker compose up`
+      # reuses an existing image and does NOT rebuild on a source change — on a
+      # persistent robot-1 daemon that would test a STALE tenant image. A
+      # cache-aware `build` rebuilds only the layers whose inputs changed (the
+      # COPY of workspace-server source invalidates on any delivery change), so
+      # THIS ref's code is always what runs. GIT_SHA is baked so /buildinfo
+      # reports the served SHA (verify-don't-buy).
+      - name: Build harness images FROM THIS REF (explicit, not up's skip-if-exists)
         if: needs.detect-changes.outputs.delivery == 'true'
-        timeout-minutes: 65
-        run: bash tests/e2e/test_template_delivery_e2e.sh
-      # ── Teardown safety-net (runs on success, failure, timeout, OR cancel) ──
-      # The e2e script installs its own EXIT/INT/TERM trap, but that trap does
-      # NOT survive a runner SIGKILL (step/job hard timeout, or a cancel), and
-      # the org + tenant container are created at test step 1 — BEFORE the long
-      # provisioning waits — so a mid-provision kill leaks both. This always()
-      # step is the workflow-level backstop the file previously lacked (contrast
-      # e2e-staging-saas.yml): it deprovisions the run's org via the SAME CP path
-      # the trap uses — DELETE /cp/admin/tenants/:slug with the REQUIRED
-      # {"confirm":"<slug>"} body — targeting the exact slug the mint step wrote
-      # to $GITHUB_ENV, so it can never touch another run's tenant. Idempotent:
-      # the endpoint no-ops on an already-purged / never-created org. It NEVER
-      # fails the job (exit 0) so it can't mask the e2e's own pass/fail verdict;
-      # the CP reaper e2e-leak pass remains the last-resort backstop.
-      - name: Teardown safety-net (deprovision e2e-tmpl org on cancel/timeout/failure)
+        working-directory: tests/harness
+        env:
+          SECRETS_ENCRYPTION_KEY: build-placeholder
+          GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: docker compose -f compose.yml build tenant-alpha tenant-beta cp-stub
+
+      - name: Bring up harness + run template-asset delivery gate
+        if: needs.detect-changes.outputs.delivery == 'true'
+        timeout-minutes: 20
+        working-directory: tests/harness
+        env:
+          GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Wire the private-template fetch token so the tenant can fetch the
+          # PRIVATE seo-agent template at provision time.
+          MOLECULE_TEMPLATE_REPO_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
+        run: |
+          set -uo pipefail
+          ./up.sh
+          echo "--- buildinfo (served SHA must match this ref) ---"
+          curl -sS -H "Host: harness-tenant-alpha.localhost" http://localhost:8080/buildinfo | head -c 300 || true
+          echo ""
+          echo "--- running template-asset delivery gate ---"
+          bash template-asset-delivery-gate.sh
+
+      - name: Dump tenant logs on failure
+        if: failure() && needs.detect-changes.outputs.delivery == 'true'
+        working-directory: tests/harness
+        env:
+          SECRETS_ENCRYPTION_KEY: dump-logs-placeholder
+        run: |
+          echo "=== docker compose ps ==="; docker compose -f compose.yml ps || true
+          echo "=== tenant-alpha logs (last 200) ==="; docker compose -f compose.yml logs --tail 200 tenant-alpha || true
+          echo "=== cp-stub logs (last 80) ==="; docker compose -f compose.yml logs --tail 80 cp-stub || true
+
+      - name: Force teardown
         if: always() && needs.detect-changes.outputs.delivery == 'true'
-        run: |
-          set +e
-          # MOLECULE_ADMIN_TOKEN (KMS step) and E2E_TMPL_SLUG (mint step) were
-          # written to $GITHUB_ENV by earlier steps, so they are already job-scoped
-          # shell env vars here — read them DIRECTLY rather than re-binding through
-          # `${{ env.* }}` step-env (which is redundant and, if a runner resolves
-          # the expression before the prior step's $GITHUB_ENV commit, could read
-          # empty and skip teardown exactly when it is needed). Direct reads are
-          # unambiguous and survive a mid-run cancel/timeout (the writing steps
-          # ran first). Mirrors the reviewer-recommended shape.
-          slug="${E2E_TMPL_SLUG:-}"
-          token="${MOLECULE_ADMIN_TOKEN:-}"
-          if [ -z "$slug" ]; then
-            echo "::notice::no E2E_TMPL_SLUG recorded — nothing to tear down (no org was minted)."
-            exit 0
-          fi
-          # SAFETY (destructive-selector guard): this net runs `DELETE
-          # /cp/admin/tenants/$slug` with the admin token. slug is normally the
-          # mint step's e2e-tmpl-<8hex>, but validate defensively so a corrupted
-          # or overridden $GITHUB_ENV value can never turn the net into an
-          # arbitrary-tenant deleter. Only ever target a validated ephemeral slug.
-          if ! printf '%s' "$slug" | grep -Eq '^e2e-tmpl-[a-f0-9]{8}$'; then
-            echo "::warning::refusing teardown of non-ephemeral slug '$slug' (must match ^e2e-tmpl-[a-f0-9]{8}$) — skipping admin DELETE."
-            exit 0
-          fi
-          if [ -z "$token" ]; then
-            echo "::warning::teardown: no admin token (fork PR / KMS step skipped) — cannot deprovision $slug. The CP reaper e2e-leak pass is the backstop."
-            exit 0
-          fi
-          echo "Safety-net teardown: deprovisioning org $slug via CP admin delete"
-          # Tempfile-routed -w keeps curl's exit code from polluting the captured
-          # HTTP status (lint-curl-status-capture). confirm body is REQUIRED by
-          # the CP DeleteTenant handler (must equal the URL slug).
-          curl -sS -o /tmp/tmpl-teardown.out -w "%{http_code}" \
-            --max-time 180 -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
-            -H "Authorization: Bearer $token" \
-            -H "Content-Type: application/json" \
-            -d "{\"confirm\":\"$slug\"}" >/tmp/tmpl-teardown.code
-          code=$(cat /tmp/tmpl-teardown.code 2>/dev/null || echo "000")
-          if [ "$code" = "200" ] || [ "$code" = "204" ] || [ "$code" = "404" ]; then
-            echo "[teardown] deprovisioned $slug (HTTP $code)"
-          else
-            echo "::warning::teardown for $slug returned HTTP $code — the CP reaper e2e-leak pass is the backstop. Body: $(head -c 300 /tmp/tmpl-teardown.out 2>/dev/null)"
-          fi
-          exit 0
+        working-directory: tests/harness
+        run: ./down.sh || true
