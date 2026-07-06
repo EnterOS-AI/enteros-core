@@ -1251,21 +1251,23 @@ jobs:
       # secrets. Exported to $GITHUB_ENV under the same MOLECULE_ADMIN_TOKEN /
       # E2E_MINIMAX_API_KEY names the verify + run + teardown steps already read.
       #
-      # TRUSTED-REF GATING: this job has NO job-level `if:` (it is a required
-      # context that must post a status on pull_request too). molecule-core is a
-      # PUBLIC repo, so this step runs only on protected-branch push / operator
-      # workflow_dispatch / schedule, and on same-repo (non-fork) PRs. On an
-      # untrusted-fork PR it SKIPS cleanly — MOLECULE_ADMIN_TOKEN stays empty and
-      # the Verify-admin-token gate exits 2 (PR-mode, E2E_REQUIRE_LIVE=0),
-      # identical to today's fork-PR behaviour.
+      # SAFE-ENABLE (Guard B / regression-prevention-guards.md §Guard F): the
+      # KMS live-staging creds fetch runs ONLY on push / workflow_dispatch /
+      # schedule — NEVER on pull_request. The prior `(pull_request &&
+      # fork==false)` clause loaded live creds on every same-repo PR, which drove
+      # the job PAST the script's PR-mode self-check into a LIVE staging
+      # provision on each PR update — a per-PR staging flood that would wedge the
+      # `[*]` all-green queue once this required workflow is re-enabled. Dropping
+      # the PR clause makes ALL PRs reach the cheap `bash -n` self-check (green,
+      # no live load); the live gate runs on push-to-main + manual dispatch only.
+      # On a PR the token stays empty → Verify-admin-token exits 0 (PR-mode) →
+      # the harness self-checks (bash -n) and exit-0s green.
       - name: Fetch staging secrets from Infisical KMS
         id: kms_staging
         if: >-
           github.event_name == 'push' ||
           github.event_name == 'workflow_dispatch' ||
-          github.event_name == 'schedule' ||
-          (github.event_name == 'pull_request' &&
-           github.event.pull_request.head.repo.fork == false)
+          github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -1308,12 +1310,23 @@ jobs:
           # container on the molecules-server host, not an EC2 VM, so there is no
           # EC2 leak verification to run.
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
+            # SAFE-ENABLE PR-mode: on pull_request the KMS fetch is intentionally
+            # skipped (no live creds on PRs), so an empty token here is EXPECTED
+            # and green — the harness runs its bash -n self-check and exit-0s.
+            # A missing token on push/dispatch/schedule is still a hard error.
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "PR-mode (E2E_REQUIRE_LIVE=0): no MOLECULE_ADMIN_TOKEN — harness will self-check (bash -n) and exit 0 green ✓"
+              exit 0
+            fi
             echo "::error::MOLECULE_ADMIN_TOKEN empty (Infisical staging CP_ADMIN_API_TOKEN @ /shared/controlplane-admin)"
             exit 2
           fi
           echo "Admin token present ✓ (molecules-server: no AWS creds needed)"
 
       - name: CP staging health preflight
+        # SAFE-ENABLE: no live staging call on PRs (they self-check only). Runs
+        # on push/dispatch/schedule, where the real provision follows.
+        if: github.event_name != 'pull_request'
         run: |
           # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
           # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
@@ -1442,10 +1455,24 @@ jobs:
   e2e-staging-concierge-platform:
     name: E2E Staging Concierge Platform Agent
     runs-on: ubuntu-latest
-    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
-    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
-    # the molecules-server canvas gate does not fire these AWS-dead jobs.
-    if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+    # GUARD B (regression-prevention-guards.md §Guard B): DE-GATED from
+    # E2E_EC2_ENABLED. This job runs the fresh-org platform-agent mgmt-MCP
+    # present+callable gate (TestPlatformAgentMgmtMCP_Staging), which provisions
+    # against staging = MOLECULES-SERVER (local-docker, provider='local') — NOT
+    # an EC2 VM. It never needed AWS creds; the blanket E2E_EC2_ENABLED gate
+    # applied at the 2026-06-27 AWS toggle-off left the merged Guard B test
+    # DORMANT (has never once run). Scoped to push / workflow_dispatch / schedule
+    # (mirrors e2e-staging-plugin-lifecycle) so it runs LIVE against staging on
+    # merge-to-main + on-demand dispatch, WITHOUT adding a redundant per-PR Go
+    # compile (the PR-time compile+skip is already owned by the sibling
+    # e2e-staging-concierge-compile-skip job). PROMOTION to a required merge gate
+    # in required-contexts.txt is the sequenced follow-up (task step 4): add a
+    # pull_request cheap-green PR-mode leg + the enforced entry only AFTER a
+    # green, non-flaky live run is verified.
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule'
     timeout-minutes: 40
     permissions:
       contents: read
