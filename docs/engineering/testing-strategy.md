@@ -87,6 +87,66 @@ A bad test:
 - Relies on `time.Sleep` or clock timing to assert order.
 - Asserts `nil == nil` to boost coverage.
 
+## No flaky, no environmental: every CI/e2e red is a deterministic coupling bug
+
+**Status: absolute operator principle. This section is enforced (see [CI gates](#ci-gates)) and part of the SOP-checklist governance gate (`no-flaky-env-coupling`).**
+
+There is **no "flaky"** and **no "environmental."** Every CI or e2e red is a
+*deterministic* bug in how the test is **coupled to its environment** — not an
+act of God. The environment doing environmental things — a staging redeploy
+mid-test, a busy box, a dependency restarting, live state changing under you —
+is **normal and expected**. A correct test tolerates all of it. A test that
+depends on the environment being **fast, quiet, unchanging, or perfectly-timed
+is a broken test.** Fix the coupling; never tolerate the variance.
+
+### The five coupling classes
+
+Every red you are tempted to call "flaky" is one of these. Name the class, then
+root-fix it:
+
+| Class | What it is | The root fix |
+|---|---|---|
+| **A. Missing input** | The test path never injects an env/config the code needs, so the code can't do its job and the assertion fails 100% under that path (e.g. canvas e2e #2162: no `MOLECULE_LLM_*` proxy → agent can't boot → asserting agent content fails). | **Inject the input.** Provide the env/secret/fixture the real code requires. |
+| **B. Race** | A background write or async state transition lands *after* you observed a "done" signal (e.g. dormant-clobber #3456: a status-write lands ~300 ms after verified-paused → resume/hibernate 404). | **Order on the real event**, not wall-clock. Wait for the specific state, or make the write idempotent/ordered. |
+| **C. False-ready** | You gate on the wrong signal — a shared, always-up endpoint (`CP /health`) instead of the *specific* resource's ready signal — so you proceed into the boot window (create-502 → CP#1129). | **Poll the real ready signal** for the exact resource (this org/workspace/route), never a shared liveness proxy. |
+| **D. Shared-live-state collision** | Concurrent e2e runs, or a CD roll, touch the **same** mutable staging object → cross-test interference. | **Isolate state.** Per-run org/workspace/namespace; never assert on a globally-shared mutable. |
+| **E. Near-capacity fixed timeout** | A hard-coded `sleep N` / fixed deadline that passes on a quiet box and reds when staging is slow under load. | **Real-signal poll + a 10× safety net you never wait out.** The success path proceeds *instantly* on the real signal; the net only bounds a true hang. |
+
+### The rule
+
+> A test that depends on the environment being fast, quiet, unchanging, or
+> perfectly-timed is **broken**. Fix the coupling — inject the input,
+> poll the real signal, isolate the state, assert deterministically.
+
+A hard timeout is legitimate **only** as a ~10× safety net you never actually
+wait out: the success path polls the real signal and proceeds the moment it
+appears. A failure *under load* is not "the environment" — it is a deterministic
+bug (a near-capacity timeout, a false-ready gate, or a race). Slow is allowed;
+**fail is not.** Headroom may only ever *slow* a test, never *fail* it.
+
+### Bans
+
+- **Never tolerate variance.** "It usually passes" is an unfixed bug, not a status.
+- **Never retry-and-hope.** Re-running until green hides the coupling; it does not fix it. (Auto-retry as a *diagnostic* is fine; auto-retry as the *fix* is banned.)
+- **Never disable or park a required producer** to make a red go away. An enforced
+  required context whose producer is disabled is a **phantom gate** — it looks
+  green because nothing runs. `Guard F` (the phantom-gate lint) catches this.
+- **Never call a red "flaky" or "environmental"** in a review, PR, or COE to
+  dismiss it without a stated deterministic root cause **and** a fix. The
+  `lint-env-coupling-dismissal` check reds any COE/incident/postmortem doc that
+  uses those words as a dismissal without naming a root cause.
+
+### Gate mechanics you must know
+
+- **`[*]` is a *merge* gate, not a *main-green* guarantee.** The `["*"]`
+  branch-protection wildcard means "every emitted status on the PR head is
+  success before merge." It does **not** promise `main`'s push-context stays
+  green afterward. A red **push-context on `main` is a P-bug to root-fix**, not
+  to tolerate.
+- **`block_on_outdated_branch` MUST be `True`** (done on `core` + `controlplane`):
+  a PR must be re-tested against current `main` before merge, so a green that was
+  computed against a stale base can't land a main-red.
+
 ## Enforcement
 
 ### CI gates
@@ -94,6 +154,7 @@ A bad test:
 - **Go**: `go test ./... -cover` + a pre-commit script that compares coverage to `.coverage-baseline` and fails on drops > 2 points in a tier-1 package.
 - **TypeScript**: `vitest --coverage` with thresholds in `vitest.config.ts`. Fails CI if below.
 - **Python**: `pytest --cov-fail-under=75` in the Python CI job.
+- **No-flaky / env-coupling** (`lint-env-coupling-dismissal`, `.gitea/scripts/lint_env_coupling_dismissal.py`): reds a PR whose COE/incident/postmortem docs dismiss a red as "flaky"/"environmental" without a stated deterministic root cause, and reds a **changed** e2e file that introduces a fixed `sleep`/`setTimeout`/`time.Sleep` without an accompanying real-signal poll. Escape hatch for a genuinely-intended wait: a `lint-allow: env-coupling` marker on the line/near it. The [`no-flaky-env-coupling`](../../.gitea/sop-checklist-config.yaml) SOP-checklist item requires a non-author (or `ai-sop-ack`) peer to confirm the same at review time.
 
 ### Review expectations
 
