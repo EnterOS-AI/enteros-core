@@ -112,9 +112,9 @@ class TestNormalizeSlug(unittest.TestCase):
         )
 
     def test_numeric_shorthand_unknown_returns_empty(self):
-        # "10" is out of range (aliases run 1..9) → empty so caller can flag
+        # "99" is out of range (aliases run 1..N) → empty so caller can flag
         # it as unparseable.
-        self.assertEqual(sop.normalize_slug("10", _numeric_aliases()), "")
+        self.assertEqual(sop.normalize_slug("99", _numeric_aliases()), "")
 
     def test_numeric_without_alias_table_keeps_digits(self):
         # No alias table → return the digits as-is.
@@ -401,7 +401,7 @@ class TestRenderStatus(unittest.TestCase):
             self.items, self._state_with(all_slugs), {s: True for s in all_slugs}
         )
         self.assertEqual(state, "success")
-        self.assertIn("9/9", desc)
+        self.assertIn(f"{len(all_slugs)}/{len(all_slugs)}", desc)
 
     def test_partial_acked_returns_failure(self):
         state, desc = sop.render_status(
@@ -410,7 +410,7 @@ class TestRenderStatus(unittest.TestCase):
             {it["slug"]: True for it in self.items},
         )
         self.assertEqual(state, "failure")
-        self.assertIn("2/9", desc)
+        self.assertIn(f"2/{len(self.items)}", desc)
         self.assertIn("missing", desc)
 
     def test_description_truncates_long_missing_list(self):
@@ -444,7 +444,7 @@ class TestLoadConfig(unittest.TestCase):
     def test_default_config_parses(self):
         cfg = sop.load_config(CONFIG_PATH)
         self.assertIn("items", cfg)
-        self.assertEqual(len(cfg["items"]), 9)
+        self.assertEqual(len(cfg["items"]), 10)
         slugs = {it["slug"] for it in cfg["items"]}
         self.assertEqual(
             slugs,
@@ -458,6 +458,7 @@ class TestLoadConfig(unittest.TestCase):
                 "memory-consulted",
                 "scope-matches-declared",
                 "public-repo-hygiene",
+                "no-flaky-env-coupling",
             },
         )
 
@@ -494,6 +495,7 @@ class TestEndToEndAckFlow(unittest.TestCase):
             _comment("eng-bot", "/sop-ack memory-consulted"),
             _comment("eng-bot", "/sop-ack scope-matches-declared"),
             _comment("sec-bot", "/sop-ack public-repo-hygiene"),
+            _comment("eng-bot", "/sop-ack no-flaky-env-coupling"),
         ]
 
         def probe(slug, users):
@@ -505,7 +507,7 @@ class TestEndToEndAckFlow(unittest.TestCase):
         items_list = list(items.values())
         result_state, desc = sop.render_status(items_list, state, body)
         self.assertEqual(result_state, "success")
-        self.assertIn("9/9", desc)
+        self.assertIn(f"{len(items_list)}/{len(items_list)}", desc)
 
     def test_all_acks_still_fail_when_body_section_unfilled(self):
         items = _items_by_slug()
@@ -520,6 +522,7 @@ class TestEndToEndAckFlow(unittest.TestCase):
             _comment("eng-bot", "/sop-ack memory-consulted"),
             _comment("eng-bot", "/sop-ack scope-matches-declared"),
             _comment("sec-bot", "/sop-ack public-repo-hygiene"),
+            _comment("eng-bot", "/sop-ack no-flaky-env-coupling"),
         ]
 
         def probe(slug, users):
@@ -531,7 +534,7 @@ class TestEndToEndAckFlow(unittest.TestCase):
         items_list = list(items.values())
         result_state, desc = sop.render_status(items_list, state, body)
         self.assertEqual(result_state, "failure")
-        self.assertIn("9/9", desc)
+        self.assertIn(f"{len(items_list)}/{len(items_list)}", desc)
         self.assertIn("body-unfilled: root-cause", desc)
 
 
@@ -1463,7 +1466,7 @@ class TestFailClosedProtectedContext(unittest.TestCase):
             self.ITEMS, self._empty_acked_state(), {s: True for s in self._all_slugs()}
         )
         self.assertEqual(state, "failure", desc)
-        self.assertIn("0/9", desc)
+        self.assertIn(f"0/{len(self.ITEMS)}", desc)
         self.assertNotEqual(state, "success")
 
     def test_only_self_acks_posts_failure(self):
@@ -1695,9 +1698,11 @@ class TestMinimalYamlFallbackParsesRealConfig(unittest.TestCase):
 
     def test_items_and_inline_lists_intact_on_fallback(self):
         items = self.cfg["items"]
-        self.assertEqual(len(items), 9)
+        self.assertEqual(len(items), 10)
         by = {it["slug"]: it for it in items}
         self.assertEqual(by["comprehensive-testing"]["required_teams"], ["qa", "engineers"])
+        # The no-flaky item (added task#233) parses on the minimal fallback too.
+        self.assertEqual(by["no-flaky-env-coupling"]["required_teams"], ["engineers"])
 
     def test_yaml_list_item_is_map_discriminates_quoted_scalar(self):
         # Quoted scalar / bare scalar are NOT maps; `key: value` IS.
