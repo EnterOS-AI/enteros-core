@@ -68,6 +68,22 @@ type CPProvisioner struct {
 	adminToken    string // X-Molecule-Admin-Token — per-tenant identity (controlplane #118/#130)
 	cpAdminAPIKey string // Authorization: Bearer — gates /cp/admin/* (read-only ops routes; distinct secret from sharedSecret)
 	httpClient    *http.Client
+	// hostStateDir is the base dir for the host-side /configs mirror the Files
+	// API serves from when there is no docker.sock into the runtime container
+	// (#206 molecules-server). Empty disables the mirror (config still delivers
+	// to the container via the CP volume mount; only docker-less read-back is
+	// off). Set via WithHostStateDir from main.go so the mirror WRITER
+	// (this provisioner) and the READER (TemplatesHandler) share one value.
+	hostStateDir string
+}
+
+// WithHostStateDir sets the base dir for the per-workspace host-side /configs
+// mirror written at provision/reprovision. Returns the provisioner for chaining.
+func (p *CPProvisioner) WithHostStateDir(dir string) *CPProvisioner {
+	if p != nil {
+		p.hostStateDir = dir
+	}
+	return p
 }
 
 // NewCPProvisioner creates a provisioner that delegates to the control plane.
@@ -279,6 +295,23 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	configFiles, templateAssets, err := collectCPConfigFiles(cfg)
 	if err != nil {
 		return "", fmt.Errorf("cp provisioner: collect config files: %w", err)
+	}
+
+	// #206 docker-less read-back: persist the SAME rendered bundle into the
+	// per-workspace host-side /configs mirror so the Files API can serve reads
+	// without a docker.sock into the runtime container. Runs on every
+	// (re)provision — so a plugin-install reprovision (or any Save & Restart)
+	// re-syncs the mirror. Best-effort: a mirror-write failure NEVER fails the
+	// provision (config is still delivered to the container via the CP volume
+	// mount); it only degrades docker-less read-back, so we log LOUD and
+	// continue. The mirror is core-OSS-clean: hostside_config.go imports only
+	// os/filepath — no CP, no R2.
+	if p.hostStateDir != "" {
+		if perr := PersistConfigBundleHostSide(p.hostStateDir, cfg.WorkspaceID, configFiles, templateAssets); perr != nil {
+			log.Printf("CPProvisioner.Start: host-side /configs mirror persist for %s FAILED: %v — docker-less Files read-back will 404 for this workspace until the next successful (re)provision (config itself is still delivered to the container via the CP volume mount)", cfg.WorkspaceID, perr)
+		} else if len(configFiles) > 0 || len(templateAssets) > 0 {
+			log.Printf("CPProvisioner.Start: persisted host-side /configs mirror for %s (%d config file(s) + %d asset(s)) at %s — docker-less Files read-back enabled (#206)", cfg.WorkspaceID, len(configFiles), len(templateAssets), HostSideConfigsDir(p.hostStateDir, cfg.WorkspaceID))
+		}
 	}
 
 	// Only forward kind for platform workspaces; omitempty hides it for ordinary

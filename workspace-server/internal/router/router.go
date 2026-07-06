@@ -38,7 +38,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -868,7 +868,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// SaaS-aware default tier in Import + ReplaceFiles (#2910 PR-B).
 	tmplh := handlers.NewTemplatesHandler(configsDir, dockerCli, wh).
 		WithCacheDir(templateCacheDir).
-		WithRefreshFunc(refreshTemplates)
+		WithRefreshFunc(refreshTemplates).
+		WithHostStateDir(hostStateDir)
 	// #686: GET /templates lists all template names+metadata from configsDir.
 	// Open access lets unauthenticated callers enumerate org configurations and
 	// installed plugins. AdminAuth-gate it alongside POST /templates/import.

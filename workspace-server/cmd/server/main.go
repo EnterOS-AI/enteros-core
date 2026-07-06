@@ -225,6 +225,14 @@ func main() {
 	//   1. MOLECULE_ORG_ID set → SaaS tenant → control plane provisioner
 	//   2. Docker available     → self-hosted → Docker provisioner
 	//   3. Neither              → provisioner disabled (external agents only)
+	// hostStateDir is the base dir for the per-workspace host-side /configs
+	// mirror the Files API serves docker-less reads from (#206 molecules-server:
+	// the tenant has no docker.sock into the runtime container). Resolved ONCE
+	// here so the mirror WRITER (CPProvisioner.WithHostStateDir) and the READER
+	// (TemplatesHandler, wired in router.Setup) are handed the SAME value and can
+	// never drift. Local to the tenant — no CP, no R2 (core-OSS-clean).
+	hostStateDir := provisioner.ResolveWorkspaceStateBaseDir()
+
 	var prov *provisioner.Provisioner
 	var cpProv *provisioner.CPProvisioner
 	if os.Getenv("MOLECULE_ORG_ID") != "" {
@@ -233,6 +241,7 @@ func main() {
 			log.Printf("Control plane provisioner unavailable: %v", err)
 		} else {
 			cpProv = cp
+			cpProv.WithHostStateDir(hostStateDir)
 			defer cpProv.Close()
 			log.Println("Provisioner: Control Plane (auto-detected SaaS tenant)")
 		}
@@ -644,7 +653,7 @@ func main() {
 		defer cancel()
 		return refreshTemplates(ctx)
 	}
-	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, wh, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
+	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, hostStateDir, wh, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
 
 	// Plugin drift sweeper — periodic detection of upstream plugin version drift
 	// (core#123). Scans workspace_plugins rows where tracked_ref != 'none',
