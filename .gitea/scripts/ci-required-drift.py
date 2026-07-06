@@ -565,6 +565,16 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
         sys.exit(4)
     contexts = set(protection.get("status_check_contexts") or [])
 
+    # The "*" all-green WILDCARD gate is a meta-context, not an enumerable
+    # required check: no workflow emits a status named "*", and it is not in
+    # audit-force-merge's REQUIRED_CHECKS env. Gitea resolves "*" to "all
+    # emitted statuses must pass" (it does NOT wait for a phantom "*" status),
+    # so it is neither an F4 unemitted-orphan nor an F3b env-drift. Drop it
+    # before the drift comparisons so this sentinel does not file perpetual
+    # [ci-drift] noise under the wildcard gate (same class as the fixes to
+    # lint-no-coe-on-required and lint-bp-context-emit-match).
+    contexts.discard("*")
+
     # ----- F1: job exists in CI but not under sentinel.needs -----
     # Post-#1766 contract: the sentinel may deliberately have no `needs:`
     # and instead poll path-relevant statuses dynamically. In that case
