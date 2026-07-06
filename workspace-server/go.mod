@@ -20,7 +20,6 @@ require (
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/stretchr/testify v1.11.1
-	go.moleculesai.app/molecule-contracts v0.0.0-20260627044329-ffd2cf33343a
 	go.moleculesai.app/plugin/gh-identity v0.0.0-20260509010445-788988195fce
 	go.moleculesai.app/sdk/gen/go v0.0.0-20260705232545-96cd78f15045
 	golang.org/x/crypto v0.50.0
