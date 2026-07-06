@@ -31,6 +31,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -42,11 +43,12 @@ const localDockerInstanceID = "mol-ws-test5-a9f3044fa3f2"
 // TestPluginInstall_LocalDocker_DoesNotHitEIC is the load-bearing regression:
 // a workspace whose instance_id is a local-docker CONTAINER NAME must NOT push
 // the plugin over the AWS EIC tunnel. installPluginViaEIC is stubbed to fail
-// the test if it is ever called. With no docker client wired the install fails
-// LOUD (503) rather than the silent 90s EIC timeout → 502.
+// the test if it is ever called. With no docker client wired (docker-less
+// tenant, #206) the docker-push is RETIRED, so the install delivers by PULL
+// (declare + re-materialize) — NOT a 90s EIC hang, NOT the old 503 dead-end.
 //
 // Pre-fix this test FAILS: instance_id != "" routed straight into
-// installPluginViaEIC (the stub fires t.Errorf) and the handler returned 200.
+// installPluginViaEIC (the stub fires t.Errorf).
 func TestPluginInstall_LocalDocker_DoesNotHitEIC(t *testing.T) {
 	registry := t.TempDir()
 	stagePluginRegistry(t, registry, "browser-automation")
@@ -60,6 +62,7 @@ func TestPluginInstall_LocalDocker_DoesNotHitEIC(t *testing.T) {
 	mock, cleanup := withMockDB(t)
 	defer cleanup()
 	expectAllowlistAllowAll(mock)
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// docker == nil (CP-provisioner mode, no reachable daemon in this unit test).
 	h := NewPluginsHandler(registry, nil, nil).
@@ -78,13 +81,13 @@ func TestPluginInstall_LocalDocker_DoesNotHitEIC(t *testing.T) {
 
 	h.Install(c)
 
-	// With no docker client, the local-docker branch fails loud (503) — NOT a
-	// 200 via EIC, and NOT a 90s hang. The key assertion is the stub above.
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 (local-docker, no docker client wired), got %d: %s", w.Code, w.Body.String())
+	// The docker-less tenant delivers by PULL (200), not EIC, not 503. The key
+	// assertion remains the EIC stub above (must never fire).
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (docker-less pull), got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "local-docker") {
-		t.Errorf("503 body should explain the local-docker no-docker-client case; got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), `"delivery":"pull"`) {
+		t.Errorf("body should report pull delivery; got %s", w.Body.String())
 	}
 }
 

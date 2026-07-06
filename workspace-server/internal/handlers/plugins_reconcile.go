@@ -38,6 +38,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"strings"
@@ -134,6 +135,19 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 				workspaceID, stage.PluginName)
 		} else if deliverErr := h.deliver(ctx, workspaceID, stage); deliverErr != nil {
 			stage.cleanup()
+			if errors.Is(deliverErr, errNoPushTarget) {
+				// Docker-less tenant (#206): the docker-push is RETIRED. The plugin
+				// is declared, so the runtime's boot materializer is responsible for
+				// PULLING it into /configs/plugins/<name>/ on boot. We do NOT copy
+				// bytes in, and we do NOT restart here — the boot installer already
+				// ran before this online-transition reconcile, so a restart would
+				// just loop on a genuinely-unfetchable source. The interactive
+				// install path owns the on-demand re-materialize; here we log and
+				// move on (retried on the next transition-to-online).
+				log.Printf("Plugin reconcile: workspace=%s plugin=%s not on box, no docker-push target (docker-less) — pull (boot materializer) is the SSOT; skipping push",
+					workspaceID, d.PluginName)
+				continue
+			}
 			log.Printf("Plugin reconcile: workspace=%s plugin=%s deliver failed: %v",
 				workspaceID, d.PluginName, deliverErr)
 			continue
