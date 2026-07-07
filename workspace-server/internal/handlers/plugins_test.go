@@ -469,7 +469,7 @@ func swapPluginInstallSourceMap(t *testing.T, m map[string]string) func() {
 // boot-installer can actually fetch — NOT the un-fetchable local://<name> the
 // runtime skips. A dir with no manifest entry still falls back to local://.
 func TestPluginListRegistry_UsesManifestSource(t *testing.T) {
-	const larkGitea = "gitea://molecule-ai/lark-channel-molecule#b9e0e9bd8536b6bfbdac17bad8c669c68cc9d952"
+	const larkGitea = "gitea://molecule-ai/lark-channel-molecule#e02201357065452412dba9a3f8cb194996d2d86a"
 	restore := swapPluginInstallSourceMap(t, map[string]string{
 		"lark-channel": larkGitea,
 	})
@@ -533,14 +533,14 @@ func TestLoadPluginInstallSources_ParsesManifest(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "manifest.json")
 	const body = `{"version":1,"plugins":[
-	  {"name":"lark-channel","repo":"molecule-ai/lark-channel-molecule","ref":"b9e0e9bd8536b6bfbdac17bad8c669c68cc9d952"},
+	  {"name":"lark-channel","repo":"molecule-ai/lark-channel-molecule","ref":"e02201357065452412dba9a3f8cb194996d2d86a"},
 	  {"name":"superpowers","repo":"molecule-ai/molecule-ai-plugin-superpowers","ref":"b4e56ff9740099c62b8f8cae6619f66eb55c3201"}
 	],"workspace_templates":[]}`
 	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}
 	got := loadPluginInstallSources(path)
-	if got["lark-channel"] != "gitea://molecule-ai/lark-channel-molecule#b9e0e9bd8536b6bfbdac17bad8c669c68cc9d952" {
+	if got["lark-channel"] != "gitea://molecule-ai/lark-channel-molecule#e02201357065452412dba9a3f8cb194996d2d86a" {
 		t.Errorf("lark-channel source = %q", got["lark-channel"])
 	}
 	if got["superpowers"] != "gitea://molecule-ai/molecule-ai-plugin-superpowers#b4e56ff9740099c62b8f8cae6619f66eb55c3201" {

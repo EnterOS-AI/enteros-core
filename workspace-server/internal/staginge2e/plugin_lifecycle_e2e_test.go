@@ -132,7 +132,7 @@ func TestPluginInstallLifecycle_Staging(t *testing.T) {
 	// real Lark plugin by pinned gitea:// SHA and asserts the install COMPLETES
 	// fast (NOT 502/504, and well under the EIC timeout floor).
 	t.Run("gitea_lark_install_completes_not_502", func(t *testing.T) {
-		const larkSource = "gitea://molecule-ai/lark-channel-molecule#b9b8bf16921ed168995f53207a5751f9780d6b7c"
+		const larkSource = "gitea://molecule-ai/lark-channel-molecule#e02201357065452412dba9a3f8cb194996d2d86a"
 		installBody, _ := json.Marshal(map[string]string{"source": larkSource})
 
 		start := time.Now()
