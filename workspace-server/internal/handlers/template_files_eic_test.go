@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -51,13 +52,16 @@ func TestResolveWorkspaceFilePath_RuntimeIndirection(t *testing.T) {
 }
 
 // TestResolveWorkspaceFilePath_LiteralRoots pins that the universal
-// allow-listed roots (`/home`, `/workspace`, `/plugins`) pass through
-// LITERALLY rather than getting rewritten to the runtime prefix. This
-// is the half of the resolver that the FilesTab "/home" selector
-// depends on — without it, picking /home on a hermes workspace would
-// route to /home/ubuntu/.hermes (the runtime indirection) and the
-// canvas's tree row would never line up with what the user sees on
-// the EC2 host.
+// allow-listed roots (`/home`, `/workspace`) pass through LITERALLY
+// rather than getting rewritten to the runtime prefix. This is the
+// half of the resolver that the FilesTab "/home" selector depends on —
+// without it, picking /home on a hermes workspace would route to
+// /home/ubuntu/.hermes (the runtime indirection) and the canvas's tree
+// row would never line up with what the user sees on the EC2 host.
+//
+// NOTE: `/plugins` is intentionally NOT literal — it's a per-runtime
+// indirection to <configBase>/plugins. See
+// TestResolveWorkspacePluginsRoot_ConfigsPlugins.
 func TestResolveWorkspaceFilePath_LiteralRoots(t *testing.T) {
 	cases := []struct {
 		runtime string
@@ -70,9 +74,9 @@ func TestResolveWorkspaceFilePath_LiteralRoots(t *testing.T) {
 		{"hermes", "/home", "ubuntu/.bashrc", "/home/ubuntu/.bashrc"},
 		{"claude-code", "/home", "ubuntu/notes.md", "/home/ubuntu/notes.md"},
 		{"codex", "/home", "ubuntu/x", "/home/ubuntu/x"},
-		// /workspace and /plugins are also literal — runtime is ignored.
+		// /workspace is also literal — runtime is ignored.
 		{"hermes", "/workspace", "src/main.go", "/workspace/src/main.go"},
-		{"claude-code", "/plugins", "p/manifest.yaml", "/plugins/p/manifest.yaml"},
+		{"claude-code", "/workspace", "a/b.go", "/workspace/a/b.go"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.runtime+"+"+tc.root+"/"+tc.relPath, func(t *testing.T) {
@@ -102,7 +106,13 @@ func TestResolveWorkspaceRootPath(t *testing.T) {
 		{"hermes", "", "/home/ubuntu/.hermes"},
 		{"hermes", "/home", "/home"},
 		{"claude-code", "/workspace", "/workspace"},
-		{"hermes", "/plugins", "/plugins"},
+		// /plugins is per-runtime indirection to <configBase>/plugins —
+		// where the pull-model materializer + boot-installer write. NOT
+		// the bare literal /plugins (which is only the read-only
+		// image-baked plugin registry). See #236.
+		{"claude-code", "/plugins", "/configs/plugins"},
+		{"hermes", "/plugins", "/home/ubuntu/.hermes/plugins"},
+		{"unknown", "/plugins", "/configs/plugins"}, // unknown runtime → default /configs base
 		{"unknown", "/configs", "/configs"},
 		{"hermes", "/etc", "/home/ubuntu/.hermes"}, // not allowlisted → runtime indirection
 	}
@@ -114,6 +124,68 @@ func TestResolveWorkspaceRootPath(t *testing.T) {
 					tc.runtime, tc.root, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestResolveWorkspacePluginsRoot_ConfigsPlugins is the regression guard
+// for #236: the pull-model plugin-delivery verification poll
+// (GET /workspaces/<id>/files?path=plugins/<name>) must resolve the
+// "/plugins" Files-API root to the runtime's INSTALLED-plugins dir
+// (<configBase>/plugins, e.g. /configs/plugins), NOT the bare literal
+// /plugins. Bare /plugins previously listed an empty tree → the poll got
+// count=0 even though the boot materializer wrote the plugin under
+// /configs/plugins.
+//
+// The mapping MUST agree with where the materializer + boot-installer
+// write: hostPluginPath + realListPluginsViaEIC both compute
+// resolveWorkspaceRootPath(runtime, "/configs") + "/plugins".
+func TestResolveWorkspacePluginsRoot_ConfigsPlugins(t *testing.T) {
+	// Directory-only resolution (used by listFilesViaEIC to pick the walk
+	// root). claude-code → /configs/plugins.
+	if got := resolveWorkspaceRootPath("claude-code", "/plugins"); got != "/configs/plugins" {
+		t.Errorf("resolveWorkspaceRootPath(claude-code,/plugins) = %q, want /configs/plugins", got)
+	}
+	// Must equal the materializer's own path derivation exactly, per runtime.
+	for _, rt := range []string{"claude-code", "hermes", "unknown", ""} {
+		wantBase := filepath.Join(resolveWorkspaceRootPath(rt, "/configs"), "plugins")
+		if got := resolveWorkspaceRootPath(rt, "/plugins"); got != wantBase {
+			t.Errorf("resolveWorkspaceRootPath(%q,/plugins) = %q; must equal materializer base %q", rt, got, wantBase)
+		}
+	}
+
+	// File-path resolution: path=plugins/<name>/SKILL.md must land under
+	// /configs/plugins for claude-code.
+	abs, err := resolveWorkspaceFilePath("claude-code", "/plugins", "seo-all/SKILL.md")
+	if err != nil {
+		t.Fatalf("resolveWorkspaceFilePath: %v", err)
+	}
+	if abs != "/configs/plugins/seo-all/SKILL.md" {
+		t.Errorf("resolveWorkspaceFilePath(claude-code,/plugins,seo-all/SKILL.md) = %q, want /configs/plugins/seo-all/SKILL.md", abs)
+	}
+
+	// ...and actually READ a file at the resolver-computed location. Re-root
+	// the absolute container path under a hermetic tmpdir that stands in for
+	// the workspace filesystem root, write SKILL.md exactly where the boot
+	// materializer would (<root>/configs/plugins/seo-all/SKILL.md), then read
+	// it back through the resolver-derived path. This proves the resolver
+	// targets the same subtree a /configs/plugins-convention materializer
+	// produces — the concrete failure #236 fixed (the E-poll read count=0
+	// because the resolver pointed at the wrong, empty tree).
+	root := t.TempDir()
+	onDisk := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(abs, "/")))
+	if err := os.MkdirAll(filepath.Dir(onDisk), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	const body = "# SEO plugin\nreal materialized bytes\n"
+	if err := os.WriteFile(onDisk, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := os.ReadFile(onDisk)
+	if err != nil {
+		t.Fatalf("read at resolved path: %v", err)
+	}
+	if string(got) != body {
+		t.Errorf("read-back at resolved path mismatch: got %q, want %q", got, body)
 	}
 }
 

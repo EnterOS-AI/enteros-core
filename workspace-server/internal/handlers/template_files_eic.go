@@ -13,8 +13,10 @@ package handlers
 //
 // Path translation rules: see resolveWorkspaceFilePath. `/configs`
 // is the per-runtime managed-config indirection (claude-code → /configs,
-// hermes → /home/ubuntu/.hermes); other allow-listed roots (`/home`,
-// `/workspace`, `/plugins`) pass through literally.
+// hermes → /home/ubuntu/.hermes); `/plugins` maps to the runtime's
+// installed-plugins dir (<configBase>/plugins) where the pull-model
+// materializer writes; the remaining allow-listed roots (`/home`,
+// `/workspace`) pass through literally.
 
 import (
 	"bytes"
@@ -65,8 +67,11 @@ var workspaceFilePathPrefix = map[string]string{
 // lands in the runtime's own config dir, even though that dir's
 // absolute path differs per runtime.
 //
-// Any other allow-listed root (`/home`, `/workspace`, `/plugins`) is
-// treated as a LITERAL absolute path on the EC2 host. Those roots are
+// `/plugins` is a per-runtime indirection too: it maps to the runtime's
+// INSTALLED-plugins dir (<configBase>/plugins, e.g. /configs/plugins),
+// where the pull-model materializer + boot-installer write — see
+// resolveWorkspaceRootPath. The remaining allow-listed roots (`/home`,
+// `/workspace`) are treated as LITERAL absolute paths on the EC2 host:
 // universal Linux paths that don't need per-runtime indirection.
 //
 // Restricting the literal pass-through to allowedRoots is the
@@ -95,16 +100,37 @@ func resolveWorkspaceFilePath(runtime, root, relPath string) (string, error) {
 // show one directory while read/write target another.
 func resolveWorkspaceRootPath(runtime, root string) string {
 	root = strings.TrimSpace(root)
-	// "/configs" + empty + unrecognized → runtime's managed-config dir.
-	// The runtime prefix map is the SSOT for that translation.
-	if root == "" || root == "/configs" || !allowedRoots[root] {
+	// configBase is the runtime's MANAGED-config dir — /configs for
+	// claude-code (and any unknown/future runtime), /home/ubuntu/.hermes
+	// for hermes, etc. The runtime prefix map is the SSOT.
+	configBase := func() string {
 		base, ok := workspaceFilePathPrefix[strings.ToLower(strings.TrimSpace(runtime))]
 		if !ok {
 			base = "/configs"
 		}
 		return base
 	}
-	// Literal universal path (`/home`, `/workspace`, `/plugins`).
+	// "/configs" + empty + unrecognized → runtime's managed-config dir.
+	if root == "" || root == "/configs" || !allowedRoots[root] {
+		return configBase()
+	}
+	// "/plugins" is NOT a bare universal path. The pull-model materializer,
+	// the boot-installer, and listPluginsViaEIC all write/read INSTALLED
+	// plugins UNDER the runtime's managed-config dir at <configBase>/plugins
+	// (see hostPluginPath + realListPluginsViaEIC — both compute
+	// resolveWorkspaceRootPath(runtime, "/configs") + "/plugins"). Resolve
+	// the Files-API "/plugins" root to that same tree so browsing/verifying
+	// it sees what the installer produced (/configs/plugins for claude-code)
+	// instead of the bare, empty /plugins. Bare /plugins is only the
+	// read-only image-baked plugin *registry* (PLUGINS_DIR → LocalResolver,
+	// a separate code path never routed through this resolver). Before this,
+	// the pull-model delivery verification poll
+	// (GET /workspaces/<id>/files?path=plugins/<name>) returned count=0 even
+	// though the plugin was materialized under /configs/plugins (#236).
+	if root == "/plugins" {
+		return filepath.Join(configBase(), "plugins")
+	}
+	// Literal universal path (`/home`, `/workspace`).
 	return root
 }
 
