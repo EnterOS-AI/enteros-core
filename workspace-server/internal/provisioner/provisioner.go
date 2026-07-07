@@ -112,7 +112,7 @@ const (
 type WorkspaceConfig struct {
 	WorkspaceID      string
 	TemplatePath     string            // Host path to template dir to copy from (e.g. claude-code-default/)
-        Template         string            // RFC #2948 Phase 1: installed template name, distinct from engine runtime.
+	Template         string            // RFC #2948 Phase 1: installed template name, distinct from engine runtime.
 	TemplateIdentity string            // RFC #2843 #24: opaque token the TemplateAssetFetcher resolves to the template repo+ref (e.g. "claudius-v1.2.3" or a sha). Used by SaaS; ignored by the local-dir TemplatePath path.
 	ConfigFiles      map[string][]byte // Generated config files to write into /configs volume
 	PluginsPath      string            // Host path to plugins directory (mounted at /plugins)
@@ -814,6 +814,13 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// under QEMU emulation (slow but functional — unblocks local
 	// dev + Canvas smoke-testing on M-series Macs). See issue #1875.
 	imgPlatformStr := defaultImagePlatform()
+	if IsLocalBuildImage(image) {
+		// Locally-built images were built for localBuildImagePlatform() —
+		// the create MUST match it, not the registry-pull default (which
+		// pins amd64 on Apple Silicon for GHCR-manifest reasons that do
+		// not apply to a local build). core#3502.
+		imgPlatformStr = localBuildImagePlatform()
+	}
 	imgPlatform := parseOCIPlatform(imgPlatformStr)
 
 	// Log image resolution for debugging stale-image issues, and pull from
@@ -2097,6 +2104,27 @@ func defaultImagePlatform() string {
 	}
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		return "linux/amd64"
+	}
+	return ""
+}
+
+// localBuildImagePlatform resolves the --platform for LOCALLY-BUILT images
+// (RegistryModeLocal) — build AND run sides, so they can never disagree.
+//
+// Unlike defaultImagePlatform, whose darwin/arm64 → linux/amd64 fallback
+// exists because the REGISTRY images ship amd64-only manifests (issue #1875),
+// a local build has no upstream manifest to match: building native is
+// strictly better. The old unconditional linux/amd64 pin made every first
+// build on Apple Silicon run under QEMU emulation, reliably exceeding the
+// 12-minute provision-timeout sweep — a guaranteed cancel loop where the
+// concierge could never come online (core#3502).
+//
+// MOLECULE_IMAGE_PLATFORM still overrides for operators who want forced
+// parity (it then governs registry pulls, local builds, and container-create
+// alike). Empty return = docker host-native.
+func localBuildImagePlatform() string {
+	if v, ok := os.LookupEnv("MOLECULE_IMAGE_PLATFORM"); ok {
+		return v
 	}
 	return ""
 }

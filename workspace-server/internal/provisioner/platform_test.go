@@ -57,8 +57,8 @@ func TestDefaultImagePlatform_AutoDetect(t *testing.T) {
 
 func TestParseOCIPlatform(t *testing.T) {
 	cases := []struct {
-		in     string
-		wantOS string
+		in      string
+		wantOS  string
 		wantCPU string
 		wantNil bool
 	}{
