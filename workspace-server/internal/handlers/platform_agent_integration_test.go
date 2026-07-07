@@ -474,3 +474,118 @@ func TestIntegration_PlatformAgentInstall_PreservesRemovedFlag(t *testing.T) {
 		t.Fatalf("second revive changed a non-removed row: status=%q, want 'offline' unchanged", status)
 	}
 }
+
+// TestIntegration_PlatformAgentInstall_ConciergeBornWithBroadcast pins the
+// org-wide birth default: a freshly-installed concierge (the kind='platform'
+// org root) MUST be provisioned with broadcast_enabled=TRUE so every new org's
+// top orchestrator can POST /broadcast to its team out of the box — no manual
+// PATCH /workspaces/:id/abilities. It also proves the ability stays scoped to
+// the orchestrator: an ordinary sub-agent (kind='workspace', created the way
+// org import / team expand do) is BORN with broadcast_enabled=FALSE (schema
+// default). Finally it proves the birth default does NOT weaken the operator's
+// control — a re-install (the ON CONFLICT path) PRESERVES a deliberately-
+// disabled concierge rather than silently re-enabling it.
+//
+// This is the real-artifact gate: sqlmock cannot prove the column's post-INSERT
+// value, only that an INSERT fired. The broadcast_enabled column lands via
+// migration 20260514120000_workspace_abilities (applied by the workflow's
+// migration replay), so a real Postgres is required.
+func TestIntegration_PlatformAgentInstall_ConciergeBornWithBroadcast(t *testing.T) {
+	conn := integrationDB_PlatformAgentInstall(t)
+	ctx := context.Background()
+
+	tag := uuid.New().String()[:8]
+	prefix := fmt.Sprintf("itest-bcastdefault-%s", tag)
+	platformID := uuid.New().String()
+	subAgentID := uuid.New().String()
+	paName := "Org Concierge bcast " + tag
+
+	cleanup := func() {
+		// Sub-agent (child) first — it references the platform row via parent_id.
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name LIKE $1`, prefix+"%")
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE name = $1`, paName)
+		_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, platformID)
+	}
+	t.Cleanup(cleanup)
+	cleanup()
+
+	// 1. Install the concierge fresh (the create path — a brand-new org).
+	if err := installPlatformAgent(ctx, conn, platformID, paName, defaultConciergeRuntime); err != nil {
+		t.Fatalf("install concierge: %v", err)
+	}
+
+	// 2. The concierge is BORN with broadcast_enabled=TRUE (and is the sole
+	//    kind='platform' org root, so the assertion targets the real concierge).
+	var kind string
+	var conciergeBroadcast bool
+	if err := conn.QueryRowContext(ctx,
+		`SELECT kind, broadcast_enabled FROM workspaces WHERE id = $1`, platformID).
+		Scan(&kind, &conciergeBroadcast); err != nil {
+		t.Fatalf("read concierge row: %v", err)
+	}
+	if kind != "platform" {
+		t.Fatalf("installed concierge kind=%q, want 'platform'", kind)
+	}
+	if !conciergeBroadcast {
+		t.Fatalf("fresh concierge broadcast_enabled=false, want TRUE — the org's top "+
+			"orchestrator must be born able to broadcast to its team without a manual "+
+			"PATCH /workspaces/:id/abilities (birth-default regression)")
+	}
+
+	// 3. An ordinary sub-agent (kind='workspace', the org-import/team-expand
+	//    shape) is BORN with broadcast_enabled=FALSE — broadcast stays an
+	//    orchestrator-only ability. We insert exactly the columns those paths
+	//    set (no broadcast_enabled), so the schema default (FALSE) applies.
+	if _, err := conn.ExecContext(ctx, `
+		INSERT INTO workspaces (id, name, tier, runtime, status, parent_id)
+		VALUES ($1, $2, 2, 'claude-code', 'online', $3)`,
+		subAgentID, prefix+"-subagent", platformID); err != nil {
+		t.Fatalf("seed sub-agent: %v", err)
+	}
+	var subAgentBroadcast bool
+	if err := conn.QueryRowContext(ctx,
+		`SELECT broadcast_enabled FROM workspaces WHERE id = $1`, subAgentID).
+		Scan(&subAgentBroadcast); err != nil {
+		t.Fatalf("read sub-agent row: %v", err)
+	}
+	if subAgentBroadcast {
+		t.Fatalf("sub-agent broadcast_enabled=true, want FALSE — only the concierge/"+
+			"orchestrator should hold broadcast at birth; a sub-agent must not")
+	}
+
+	// 4. A re-install (the idempotent ON CONFLICT path) PRESERVES the TRUE value.
+	if err := installPlatformAgent(ctx, conn, platformID, paName, defaultConciergeRuntime); err != nil {
+		t.Fatalf("re-install concierge: %v", err)
+	}
+	if err := conn.QueryRowContext(ctx,
+		`SELECT broadcast_enabled FROM workspaces WHERE id = $1`, platformID).
+		Scan(&conciergeBroadcast); err != nil {
+		t.Fatalf("read concierge after re-install: %v", err)
+	}
+	if !conciergeBroadcast {
+		t.Fatalf("re-install reset broadcast_enabled to false, want TRUE preserved")
+	}
+
+	// 5. The birth default does NOT override operator intent: if an admin
+	//    deliberately DISABLES broadcast (PATCH /abilities → broadcast_enabled=
+	//    FALSE), a subsequent re-install (ON CONFLICT) must NOT silently
+	//    re-enable it. The ON CONFLICT clause deliberately leaves the column
+	//    alone, exactly like it does for status/runtime.
+	if _, err := conn.ExecContext(ctx,
+		`UPDATE workspaces SET broadcast_enabled = FALSE WHERE id = $1`, platformID); err != nil {
+		t.Fatalf("operator-disable broadcast: %v", err)
+	}
+	if err := installPlatformAgent(ctx, conn, platformID, paName, defaultConciergeRuntime); err != nil {
+		t.Fatalf("re-install after operator-disable: %v", err)
+	}
+	if err := conn.QueryRowContext(ctx,
+		`SELECT broadcast_enabled FROM workspaces WHERE id = $1`, platformID).
+		Scan(&conciergeBroadcast); err != nil {
+		t.Fatalf("read concierge after re-install-post-disable: %v", err)
+	}
+	if conciergeBroadcast {
+		t.Fatalf("re-install re-enabled a deliberately-disabled concierge broadcast_enabled, "+
+			"want FALSE preserved — the ON CONFLICT upsert must not clobber the operator's "+
+			"PATCH /abilities choice (only the fresh-INSERT VALUES sets the birth default)")
+	}
+}

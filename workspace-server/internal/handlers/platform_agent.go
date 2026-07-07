@@ -1484,9 +1484,23 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    (never reverted), but the template is now unconditionally 'platform-agent'
 	//    for both a fresh INSERT ($4) and a reinstall — the (runtime, template) pair
 	//    can no longer desync because there is exactly one concierge template.
+	//
+	//    BROADCAST (org-wide birth default): the concierge is the org's top
+	//    orchestrator — the one workspace whose job is to fan a message out to its
+	//    whole team — so it is BORN with broadcast_enabled=TRUE. This makes every
+	//    newly-created org's concierge able to POST /broadcast out of the box, with
+	//    no manual PATCH /workspaces/:id/abilities. It is scoped to THIS row (the
+	//    kind='platform' org root); ordinary sub-agents are still created elsewhere
+	//    (org import / team expand / bundle import) with the schema default FALSE,
+	//    so broadcast stays an orchestrator-only ability. This is a birth default,
+	//    NOT an auth-gate change: the POST /broadcast handler still re-validates the
+	//    flag per request. Only the fresh-INSERT VALUES sets it; the ON CONFLICT
+	//    clause deliberately does NOT touch broadcast_enabled — like status and
+	//    runtime, a reinstall PRESERVES the row's current value so an operator who
+	//    deliberately disabled broadcast via PATCH is never silently re-enabled.
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id, template)
-		VALUES ($1, $2, 'platform', 0, 'offline', $3, NULL, $4)
+		INSERT INTO workspaces (id, name, kind, tier, status, runtime, parent_id, template, broadcast_enabled)
+		VALUES ($1, $2, 'platform', 0, 'offline', $3, NULL, $4, TRUE)
 		ON CONFLICT (id) DO UPDATE SET
 			kind = 'platform',
 			parent_id = NULL,
