@@ -330,10 +330,19 @@ func TestConciergeWarmup_BodyIsValidA2A(t *testing.T) {
 		`"kind":"text"`,
 		conciergeWarmupText,
 		`"concierge_warmup":true`,
+		// The self-warmup source_type marker MUST be present so the
+		// chat-history reader classifies the row internal (system/notice)
+		// instead of leaking it as a blue user bubble.
+		`"source_type":"self-warmup"`,
 	} {
 		if !bytes.Contains(body, []byte(want)) {
 			t.Errorf("warmup body missing %q; body=%s", want, body)
 		}
+	}
+	// The marker must live at the canonical params.metadata sibling (the
+	// location the reader checks first and that survives normalization).
+	if !bytes.Contains(body, []byte(`"metadata":{"source_type":"self-warmup"}`)) {
+		t.Errorf("warmup body missing params.metadata.source_type marker; body=%s", body)
 	}
 	// Must NOT use the `type`-keyed Part discriminator (v0.3 drops it).
 	if bytes.Contains(body, []byte(`"type":"text"`)) {
@@ -387,5 +396,56 @@ func warmupMessageID(t *testing.T, body []byte) string {
 func TestConciergeWarmup_TimeoutIsBounded(t *testing.T) {
 	if conciergeWarmupTimeout <= 0 || conciergeWarmupTimeout > 5*time.Minute {
 		t.Errorf("conciergeWarmupTimeout=%s is out of the sane (0, 5m] range", conciergeWarmupTimeout)
+	}
+}
+
+// TestConciergeWarmup_FireOnceAfterSuccessfulDelivery pins the fire-once
+// throttle: once a warmup DELIVERS successfully (2xx), it is never re-fired for
+// the rest of the process — even after the conciergeWarmupTimeout window has
+// elapsed. Re-firing only repeated the "Platform readiness check …" row every
+// ~60s (the demo chat leak) without helping the per-turn capture. We clear the
+// time-throttle stamp between fires so ONLY the delivered-guard can suppress the
+// second fire, proving the guard (not just the 60s window) stops the repeat.
+func TestConciergeWarmup_FireOnceAfterSuccessfulDelivery(t *testing.T) {
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+	rec := &warmupRecorder{} // returns 200 → delivered
+	handler.SetWarmupSendFunc(rec.send)
+
+	handler.fireConciergeWarmup(context.Background(), "ws-fireonce")
+	waitGlobalAsyncForTest()
+	if got := rec.count(); got != 1 {
+		t.Fatalf("first fire: want exactly 1 send, got %d", got)
+	}
+	// Simulate the throttle window elapsing so the time-throttle would otherwise
+	// permit another fire; the delivered-guard must still suppress it.
+	handler.warmedConcierges.Delete("ws-fireonce")
+	handler.fireConciergeWarmup(context.Background(), "ws-fireonce")
+	waitGlobalAsyncForTest()
+	if got := rec.count(); got != 1 {
+		t.Errorf("after a successful delivery the warmup must NOT re-fire (fire-once); got %d sends", got)
+	}
+}
+
+// TestConciergeWarmup_RetriesAfterFailedDelivery pins the self-heal path: a
+// warmup that FAILED to deliver is NOT recorded as delivered, so the next cycle
+// (after the throttle window) fires again. This preserves the core#3082
+// retry-until-warmed behavior for a genuinely-cold/transient miss.
+func TestConciergeWarmup_RetriesAfterFailedDelivery(t *testing.T) {
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+	rec := &warmupRecorder{err: errors.New("cold miss")} // non-2xx + error → NOT delivered
+	handler.SetWarmupSendFunc(rec.send)
+
+	handler.fireConciergeWarmup(context.Background(), "ws-retry")
+	waitGlobalAsyncForTest()
+	if got := rec.count(); got != 1 {
+		t.Fatalf("first fire: want 1 send, got %d", got)
+	}
+	handler.warmedConcierges.Delete("ws-retry") // simulate window elapsed
+	handler.fireConciergeWarmup(context.Background(), "ws-retry")
+	waitGlobalAsyncForTest()
+	if got := rec.count(); got != 2 {
+		t.Errorf("a failed delivery must be retried next cycle; got %d sends (want 2)", got)
 	}
 }

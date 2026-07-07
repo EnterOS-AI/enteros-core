@@ -127,6 +127,28 @@ describe("activityRowToMessages", () => {
       expect(sys!.systemKind).toBe("notice");
     });
 
+    it("classifies the concierge warmup (source_type=self-warmup) as a system notice, never a user bubble", () => {
+      // The platform-fired readiness probe carries source_type=self-warmup on
+      // both the params.metadata sibling and the message.metadata fallback. It
+      // is a heartbeat internal that used to leak as a blue user bubble.
+      const row = makeRow({
+        request_body: {
+          params: {
+            metadata: { source_type: "self-warmup" },
+            message: {
+              parts: [{ kind: "text", text: "Platform readiness check — no action needed." }],
+              metadata: { concierge_warmup: true, source_type: "self-warmup" },
+            },
+          },
+        },
+      });
+      const msgs = activityRowToMessages(row);
+      expect(msgs.find((m) => m.role === "user")).toBeUndefined();
+      const sys = msgs.find((m) => m.role === "system");
+      expect(sys).toBeDefined();
+      expect(sys!.systemKind).toBe("notice");
+    });
+
     it("emits no user message when request_body is null", () => {
       const row = makeRow({ request_body: null });
       const msgs = activityRowToMessages(row);

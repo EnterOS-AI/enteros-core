@@ -52,6 +52,12 @@ func NewPostgresMessageStore(db *sql.DB) *PostgresMessageStore {
 // must never render as a blue user bubble (the bug) nor be silently
 // dropped. The marker travels WITH the message (params.metadata), so the
 // classification is role-based at the source, not inferred from the text.
+//
+// "self-warmup" is the platform-fired concierge readiness probe
+// (handlers.buildConciergeWarmupBody / conciergeWarmupSourceType). It is a
+// heartbeat internal ("Platform readiness check — no action needed."), never a
+// human turn, so it is classified system/notice here — it used to leak as a
+// blue user bubble because it carried no source_type marker.
 var selfSourceTypes = map[string]bool{
 	"self-cron":              true,
 	"self-harvester":         true,
@@ -59,6 +65,7 @@ var selfSourceTypes = map[string]bool{
 	"self-scheduler":         true,
 	"self-goal-nudge":        true,
 	"self-delegation-result": true,
+	"self-warmup":            true,
 }
 
 // IsSelfSourceType reports whether a params.metadata.source_type marker
