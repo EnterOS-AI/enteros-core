@@ -1182,29 +1182,45 @@ func ensureCreatedWorkspaceProviderPin(ctx context.Context, workspaceID, runtime
 	log.Printf("Create workspace %s: pinned LLM_PROVIDER=%s for platform-managed model %q (create_workspace child config completeness)", workspaceID, providers.PlatformProviderName, model)
 }
 
-// EnsureSelfHostedPlatformAgent installs the org's platform agent (the concierge,
+// EnsureSelfHostedPlatformAgent seeds the org's platform agent (the concierge,
 // the org root) on a tenant that has no control plane to do it — i.e. self-hosted
 // or local. In SaaS the CP calls InstallPlatformAgent at org-provision time; this
-// is the no-CP equivalent. Idempotent: returns early if a kind='platform' root
-// already exists (a prior boot, or a CP install in a hybrid setup). The CALLER
-// gates this on the MOLECULE_SEED_PLATFORM_AGENT flag (set by the self-hosted
-// docker-compose) so CI harnesses and SaaS tenants are unaffected.
+// is the no-CP equivalent. The CALLER gates this on SelfHostPlatformSeedEnabled()
+// (MOLECULE_ORG_ID unset) — it runs UNCONDITIONALLY on self-host, every boot
+// (core#3496: the org root always exists; the old MOLECULE_SEED_PLATFORM_AGENT
+// opt-in flag is removed). SaaS tenants + CI harnesses set MOLECULE_ORG_ID and
+// never reach here.
+//
+// Thin adapter over the ONE canonical lifecycle flow (platform_agent_flow.go):
+// row-only (no ProvisionTrigger — the boot provision is phase 2,
+// MaybeProvisionPlatformAgentOnBoot, which needs the provisioner that doesn't
+// exist yet at this point in boot). Via the flow's decide step this is also
+// self-healing: a healthy root no-ops ("exists"), a half-installed/failed root
+// re-runs the idempotent install ("repaired") — re-anchoring org tokens and
+// re-parenting drift the old exists-early-return silently ignored.
 func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error {
-	var existing string
-	err := database.QueryRowContext(ctx,
-		`SELECT id FROM workspaces WHERE kind = 'platform' AND parent_id IS NULL LIMIT 1`).Scan(&existing)
-	if err == nil {
-		return nil // platform agent already present — nothing to do
+	out, err := ensurePlatformAgentFlow(ctx, database, ensureFlowOptions{
+		// All defaults: name defaultPlatformAgentName(), runtime
+		// conciergeDefaultRuntime() (MOLECULE_DEFAULT_RUNTIME else claude-code) —
+		// a self-host operator who wants a different runtime sets the env or
+		// switches it post-seed via the standard runtime-change path.
+		//
+		// SkipTombstoned: an unattended boot must never silently un-delete a
+		// deliberately-removed concierge — reviving is an explicit user action
+		// (the ensure endpoint / onboarding scene).
+		SkipTombstoned: true,
+	})
+	if err != nil {
+		return fmt.Errorf("self-host platform-agent seed: %w", err)
 	}
-	if err != sql.ErrNoRows {
-		return fmt.Errorf("check existing platform agent: %w", err)
+	switch {
+	case out.Skipped == "tombstoned":
+		log.Printf("boot: platform-agent self-seed skipped — root %s is tombstoned (deliberate deletion respected; revive via the canvas repair/setup flow)", out.Action.targetID)
+	case out.Action.status != "exists":
+		log.Printf("boot: platform-agent self-seed %s %s (prior_status=%q)",
+			out.Action.status, out.Action.targetID, out.PriorStatus)
 	}
-	log.Printf("boot: no platform agent present — self-seeding %s (self-hosted)", SelfHostedPlatformAgentID)
-	// Self-host seed follows the KMS-resolved platform default runtime
-	// (conciergeDefaultRuntime: MOLECULE_DEFAULT_RUNTIME else 'claude-code'); a
-	// self-host operator who wants a different runtime sets the env or switches it
-	// post-seed via the standard runtime-change path.
-	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, defaultPlatformAgentName(), conciergeDefaultRuntime())
+	return nil
 }
 
 // OrgIdentityResponse is the body of GET /org/identity.
@@ -1265,20 +1281,27 @@ func OrgIdentity(c *gin.Context) {
 // automatically once creds exist.
 //
 // STRICTLY self-host + best-effort:
-//   - The CALLER gates this on MOLECULE_SEED_PLATFORM_AGENT set AND the local
-//     Docker provisioner being active (prov != nil, i.e. MOLECULE_ORG_ID unset).
+//   - The CALLER gates this on SelfHostPlatformSeedEnabled() (MOLECULE_ORG_ID
+//     unset — the removed MOLECULE_SEED_PLATFORM_AGENT flag is gone, core#3496)
+//     AND the local Docker provisioner being active (prov != nil).
 //     SaaS (cpProv) never reaches here.
-//   - It looks up the kind='platform' root; if absent (seed disabled / failed)
-//     it no-ops. If the container is already running (prov.IsRunning) it no-ops.
+//   - It looks up the kind='platform' root; if absent (seed failed) it no-ops.
+//     If the container is already running (prov.IsRunning) it no-ops.
 //   - Otherwise it kicks off ONE provision via the same path the restart
 //     endpoint uses (WorkspaceHandler.RestartByID), which reads the row's
 //     runtime ('claude-code' as seeded) + config and provisions accordingly.
 //
-// On a fresh self-host with no LLM credentials the provision will fail (missing
-// key) and the agent stays 'failed' until the user configures BYOK via
-// Settings — that's expected. This never fatals and never loops: RestartByID is
-// itself debounced/coalesced, and this runs exactly once at boot. Run it in a
-// goroutine so a slow Docker pull doesn't delay the HTTP server coming up.
+// UNCONFIGURED-SKIP (core#3496 D2): a fresh self-host root with NO model signal
+// (no MODEL workspace_secret, no MOLECULE_LLM_DEFAULT_MODEL env) would provision
+// straight into a guaranteed MISSING_MODEL / MISSING_PLATFORM_PROXY abort on
+// every boot. Instead of burning that failed provision, the kick-off is skipped
+// and the root stays parked at 'offline' for the onboarding scene (or a
+// Settings + explicit restart) to configure. Once ANY model signal exists the
+// old behavior applies: a missing/wrong KEY still fails the provision loudly —
+// that's a real error state the user must see. This never fatals and never
+// loops: RestartByID is itself debounced/coalesced, and this runs exactly once
+// at boot. Run it in a goroutine so a slow Docker pull doesn't delay the HTTP
+// server coming up.
 func MaybeProvisionPlatformAgentOnBoot(ctx context.Context, database *sql.DB, prov localProvisionerIsRunning, restartByID func(string)) {
 	if prov == nil || restartByID == nil {
 		return
@@ -1314,6 +1337,10 @@ func MaybeProvisionPlatformAgentOnBoot(ctx context.Context, database *sql.DB, pr
 			log.Printf("boot: concierge %s could not re-declare %q plugin (recorded=%d skipped=%d) — management MCP may be absent until next provision", id, conciergePlatformMCPSource, rec, skip)
 		}
 		go restartByID(id)
+		return
+	}
+	if !platformAgentModelConfigured(ctx, database, id) {
+		log.Printf("boot: platform-agent %s awaiting setup (no MODEL secret, no MOLECULE_LLM_DEFAULT_MODEL) — provision skipped; configure via the onboarding scene or Settings", id)
 		return
 	}
 	log.Printf("boot: platform-agent %s not running (status=%s) — kicking off best-effort provision", id, status)
@@ -1388,10 +1415,26 @@ type installPlatformAgentPayload struct {
 // Idempotently installs the platform agent as the org root for THIS tenant. The
 // control plane calls it at org-provision time (new orgs) and during the
 // existing-org backfill rollout. Safe to call repeatedly.
+//
+// DEPRECATED-FOR-NEW-CALLERS (core#3496): this is the CP's CONTRACT-FROZEN
+// row-only shim over the shared install — it deliberately keeps its historical
+// semantics (caller-supplied id, always-upsert, NO decide step, NO provision
+// trigger) byte-identical for the CP. New callers use POST
+// /admin/org/platform-agent/ensure (the one canonical lifecycle flow). Once the
+// CP migrates to /ensure (tracked CP-side), this endpoint is deleted. The only
+// post-freeze addition is the platform-runtime guard below, which is
+// additive-safe: the CP only ever sends container-backed runtimes.
 func InstallPlatformAgent(c *gin.Context) {
 	var p installPlatformAgentPayload
 	if err := c.ShouldBindJSON(&p); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	// Platform-runtime guard (shared with the ensure flow): an external-like /
+	// mock / unknown runtime on the org root wedges it permanently — the
+	// provision path silently no-ops for those. See platformRuntimeAllowed.
+	if ok, why := platformRuntimeAllowed(p.Runtime); !ok {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": why, "code": "RUNTIME_UNSUPPORTED"})
 		return
 	}
 	name := p.Name

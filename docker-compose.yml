@@ -69,10 +69,10 @@ services:
       # Override to "production" for SaaS/staged deploys; in those modes
       # ADMIN_TOKEN must also be set or every request rejects.
       MOLECULE_ENV: "${MOLECULE_ENV:-development}"
-      # Self-hosted: no control plane to install the org's platform agent
-      # (concierge), so the tenant server seeds it on boot. Idempotent; unset it
-      # if you don't want the auto-seeded Org Concierge root.
-      MOLECULE_SEED_PLATFORM_AGENT: "${MOLECULE_SEED_PLATFORM_AGENT:-true}"
+      # Self-hosted: the platform agent (concierge, the org root) is seeded
+      # UNCONDITIONALLY on boot when MOLECULE_ORG_ID is unset — no opt-in flag
+      # (core#3496; the old MOLECULE_SEED_PLATFORM_AGENT env is removed).
+      # Idempotent; a deliberately deleted concierge is never silently revived.
       # Org display name. Drives the platform-agent name ("<MOLECULE_ORG_NAME>
       # Agent", e.g. "Molecule AI Agent") and the canvas topbar (via the open
       # GET /org/identity route). Empty → legacy "Org Concierge" + no topbar name.

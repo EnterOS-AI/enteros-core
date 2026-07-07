@@ -1,5 +1,52 @@
 basePath: /
 definitions:
+  handlers.AddRequestMessageBody:
+    properties:
+      author_id:
+        type: string
+      author_type:
+        enum:
+        - user
+        - agent
+        type: string
+      body:
+        type: string
+    required:
+    - author_type
+    - body
+    type: object
+  handlers.CreateRequestBody:
+    properties:
+      detail:
+        type: string
+      kind:
+        enum:
+        - task
+        - approval
+        type: string
+      priority:
+        type: integer
+      recipient_id:
+        type: string
+      recipient_type:
+        enum:
+        - user
+        - agent
+        type: string
+      title:
+        type: string
+    required:
+    - kind
+    - recipient_type
+    - title
+    type: object
+  handlers.CreateRequestResponse:
+    properties:
+      request_id:
+        type: string
+      status:
+        type: string
+    type: object
   handlers.CreateScheduleRequest:
     properties:
       cron_expr:
@@ -64,6 +111,25 @@ definitions:
       name:
         description: Name is the org's display name (MOLECULE_ORG_NAME, "" when unset).
         type: string
+      org_id:
+        description: |-
+          OrgID is the org's UUID (MOLECULE_ORG_ID, "" when unset). Empty on a
+          self-hosted stack where no control plane assigns an org id.
+        type: string
+      platform_managed_available:
+        description: |-
+          PlatformManagedAvailable reports whether a Molecule LLM proxy is wired
+          into this workspace-server process — i.e. whether platform_managed billing
+          can actually work. True on SaaS (the CP provisioner exports the proxy base
+          URL + usage token), false on a self-hosted stack (no hosted proxy / no
+          credit ledger). The canvas reads this pre-login to decide whether to offer
+          the "Platform (proxy)" billing option or hide it and default to BYOK.
+        type: boolean
+      slug:
+        description: |-
+          Slug is the org's URL slug (MOLECULE_ORG_SLUG, "" when unset). Empty on
+          a self-hosted stack where no control plane assigns a slug.
+        type: string
     type: object
   handlers.PendingUserTask:
     properties:
@@ -84,6 +150,74 @@ definitions:
       workspace_name:
         type: string
     type: object
+  handlers.RequestMessageRow:
+    properties:
+      author_id:
+        type: string
+      author_type:
+        type: string
+      body:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      request_id:
+        type: string
+    type: object
+  handlers.RequestMutationResponse:
+    properties:
+      request_id:
+        type: string
+      status:
+        type: string
+    type: object
+  handlers.RequestRow:
+    properties:
+      created_at:
+        type: string
+      detail:
+        type: string
+      id:
+        type: string
+      kind:
+        type: string
+      org_id:
+        type: string
+      priority:
+        type: integer
+      recipient_id:
+        type: string
+      recipient_type:
+        type: string
+      requester_id:
+        type: string
+      requester_type:
+        type: string
+      responded_at:
+        type: string
+      responder_id:
+        type: string
+      responder_type:
+        type: string
+      status:
+        type: string
+      title:
+        type: string
+      updated_at:
+        type: string
+      workspace_name:
+        type: string
+    type: object
+  handlers.RequestWithThread:
+    properties:
+      messages:
+        items:
+          $ref: '#/definitions/handlers.RequestMessageRow'
+        type: array
+      request:
+        $ref: '#/definitions/handlers.RequestRow'
+    type: object
   handlers.ResolveUserTaskRequest:
     properties:
       resolved_by:
@@ -102,6 +236,24 @@ definitions:
         type: string
       user_task_id:
         type: string
+    type: object
+  handlers.RespondRequestBody:
+    properties:
+      action:
+        enum:
+        - done
+        - rejected
+        - approved
+        type: string
+      responder_id:
+        type: string
+      responder_type:
+        enum:
+        - user
+        - agent
+        type: string
+    required:
+    - action
     type: object
   handlers.RunNowResponse:
     properties:
@@ -206,16 +358,69 @@ definitions:
       user_task_id:
         type: string
     type: object
+  handlers.ensurePlatformAgentPayload:
+    properties:
+      force:
+        description: |-
+          Force repairs (reinstall + re-provision) even a healthy 'online' concierge —
+          the explicit "repair tool" path. Default false keeps the call idempotent.
+        type: boolean
+      model:
+        description: |-
+          Model, when set, is validated against the effective runtime and written as
+          the MODEL workspace_secret BEFORE the provision trigger fires, so the very
+          first provision resolves this pick instead of racing it (core#3496 — the
+          self-host onboarding scene's create path). Optional + additive: absent
+          keeps today's behavior (the platform default resolution at provision).
+        type: string
+      name:
+        description: Name is the concierge display name; defaults to defaultPlatformAgentName().
+        type: string
+      runtime:
+        description: |-
+          Runtime is the concierge runtime; empty falls back to the platform default
+          (conciergeDefaultRuntime), exactly like the CP-driven install. Used only on
+          a fresh insert — an existing root's runtime is preserved (runtime changes
+          go through the standard PATCH path). Must be a container-backed runtime:
+          external-like/mock/unknown values are rejected 422 (platformRuntimeAllowed).
+        type: string
+    type: object
 host: api.moleculesai.app
 info:
   contact: {}
   description: 'The per-tenant workspace-server HTTP API. Single source of truth for
     workspace/schedule/agent/secrets/files/memory CRUD. Hand-written clients (canvas,
-    molecule-mcp-server, molecule-cli, molecule-ai-sdk) should be replaced by
-    clients generated from this spec — see RFC #1706.'
+    molecule-mcp-server, molecule-cli, molecule-ai-sdk) should be replaced by clients
+    generated from this spec — see RFC #1706.'
   title: Molecule AI Workspace Server API
   version: "1.0"
 paths:
+  /admin/org/platform-agent/ensure:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: optional name/runtime/model/force
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/handlers.ensurePlatformAgentPayload'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "422":
+          description: RUNTIME_UNSUPPORTED or UNREGISTERED_MODEL_FOR_RUNTIME
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Create or repair the org platform agent (concierge), core-only
+      tags:
+      - org
   /org/identity:
     get:
       produces:
@@ -225,9 +430,185 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/handlers.OrgIdentityResponse'
-      summary: Get the org's display name
+      summary: Get the org's display name + billing capability
       tags:
       - org
+  /requests/{requestId}:
+    get:
+      parameters:
+      - description: Request ID
+        in: path
+        name: requestId
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.RequestWithThread'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Get a request with its message thread
+      tags:
+      - requests
+  /requests/{requestId}/cancel:
+    post:
+      parameters:
+      - description: Request ID
+        in: path
+        name: requestId
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.RequestMutationResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Cancel (withdraw) a request
+      tags:
+      - requests
+  /requests/{requestId}/messages:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Request ID
+        in: path
+        name: requestId
+        required: true
+        type: string
+      - description: Message
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AddRequestMessageBody'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/handlers.RequestMutationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Add a message to a request's More-Info thread
+      tags:
+      - requests
+  /requests/{requestId}/respond:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Request ID
+        in: path
+        name: requestId
+        required: true
+        type: string
+      - description: Response
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.RespondRequestBody'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.RequestMutationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Respond to a request (done / rejected / approved)
+      tags:
+      - requests
+  /requests/pending:
+    get:
+      parameters:
+      - description: Filter by kind
+        enum:
+        - task
+        - approval
+        in: query
+        name: kind
+        type: string
+      - description: Filter by org
+        in: query
+        name: org_id
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/handlers.RequestRow'
+            type: array
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: List pending requests across the org (canvas tabs)
+      tags:
+      - requests
   /user-tasks/pending:
     get:
       produces:
@@ -248,6 +629,101 @@ paths:
       summary: List pending user tasks across all workspaces
       tags:
       - user-tasks
+  /workspaces/{id}/requests:
+    get:
+      parameters:
+      - description: Requester workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Filter by status
+        in: query
+        name: status
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/handlers.RequestRow'
+            type: array
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth && OrgSlugAuth: []
+      summary: List a workspace's outgoing requests
+      tags:
+      - requests
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Requester workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Request fields
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateRequestBody'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/handlers.CreateRequestResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth && OrgSlugAuth: []
+      summary: Raise a request (task or approval)
+      tags:
+      - requests
+  /workspaces/{id}/requests/inbox:
+    get:
+      parameters:
+      - description: Recipient workspace ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Filter by status
+        in: query
+        name: status
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/handlers.RequestRow'
+            type: array
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/handlers.ErrorResponse'
+      security:
+      - BearerAuth && OrgSlugAuth: []
+      summary: List a workspace's incoming requests (inbox)
+      tags:
+      - requests
   /workspaces/{id}/schedules:
     get:
       parameters:

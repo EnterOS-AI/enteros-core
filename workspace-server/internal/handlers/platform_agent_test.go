@@ -229,6 +229,11 @@ func TestMaybeProvisionPlatformAgentOnBoot_KicksOffWhenNotRunning(t *testing.T) 
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT id, status FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(bootPlatformID, "failed"))
+	// core#3496 D2: the kick-off first checks for a model signal — a MODEL
+	// workspace_secret here (explicit, not the fail-open path) keeps this the
+	// CONFIGURED-root kick-off test; the unconfigured-skip has its own test.
+	mock.ExpectQuery(`SELECT 1 FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
+		WillReturnRows(sqlmock.NewRows([]string{"?column?"}).AddRow(1))
 
 	prov := &stubBootProv{running: false}
 	done := make(chan string, 1)
