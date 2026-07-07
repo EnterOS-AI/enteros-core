@@ -107,7 +107,7 @@ There is no local "completed" flag: the scene derives its state from the server,
 Env-configured stacks skip the scene entirely. Set these before first boot:
 
 ```bash
-MOLECULE_DEFAULT_RUNTIME=claude-code        # optional — runtime for the seeded agent (default: claude-code)
+MOLECULE_DEFAULT_RUNTIME=openclaw           # optional — runtime for the seeded agent (default: openclaw)
 MOLECULE_LLM_DEFAULT_MODEL=claude-opus-4-8  # bare registry model id for the chosen runtime
 ANTHROPIC_API_KEY=...                       # the provider key matching the chosen model
 ```
