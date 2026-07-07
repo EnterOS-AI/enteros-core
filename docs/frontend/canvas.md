@@ -25,7 +25,30 @@ Molecule AI deliberately avoids explicit edge drawing. The hierarchy comes from 
 
 ## First-Run Experience
 
-Fresh canvases currently use two onboarding surfaces:
+Fresh canvases use two first-run surfaces: the self-host setup scene and the empty state. The old floating bottom-left onboarding wizard is retired — it taught the workspace-era hand-create-workspaces model and is replaced by the scene on the self-host path.
+
+### Self-host setup scene
+
+On self-hosted stacks, first run is a fullscreen, blocking scene that configures the always-present platform agent (**Enter OS Agent**). Design SSOT: [rfc-selfhost-onboarding-scene](../design/rfc-selfhost-onboarding-scene.md).
+
+**Gate.** The scene renders only on positive confirmation of both conditions:
+
+- the deployment is self-host: the tenant slug derives empty **and** `GET /org/identity` (an open route) returns `org_id === ""` — the server-declared check disambiguates SaaS apex/preview hosts that also derive an empty slug
+- the platform agent exists but is unconfigured: the `kind = platform` node has never been online **and** no LLM key is configured
+
+**Fail-closed-to-invisible.** The scene ships in SaaS builds too, so if `/org/identity` errors, times out, or returns anything ambiguous, the canvas renders the normal UI and never blocks. The failure mode of the feature is "scene doesn't appear on self-host", never "SaaS is stuck behind a setup screen".
+
+**Dismissal is derived state, not a flag.** No localStorage: the gate re-derives from server state on every load, so a mid-setup refresh resumes at the correct step, and once the agent has been online the scene never renders again.
+
+**Steps:**
+
+1. **Welcome** — introduces the platform agent; the name is fixed to "Enter OS Agent" (no name input)
+2. **Runtime** — dropdown derived from `GET /templates` (container-backed runtimes only)
+3. **Provider + Model** — two cascading dropdowns constrained to the chosen runtime's registry arms; self-host sees bring-your-own-key options only; upstream changes reset downstream picks; no free-text entry anywhere
+4. **API key** — stored as a global secret; the field name comes from the selected provider's `required_env`/`auth_env`
+5. **Create → progress → handoff** — the key is written first, then one create; on `online` the scene dismisses and the concierge greets first
+
+**SSOT consumption.** The scene consumes only approved shared surfaces — `WORKSPACE_KIND` (`lib/workspace-kind.ts`), the `lib/workspace-status.ts` + `lib/workspace-error-codes.ts` leaf modules, `WS_EVENTS` (`lib/ws-events.ts`), `isExternalLikeRuntime` / `runtimeDisplayName`, and the `/templates` registry fields. It introduces no hardcoded runtime/model lists and no dependency on the legacy vendor heuristic.
 
 ### Empty state
 
@@ -35,17 +58,6 @@ The center panel shows:
 - a `+ Create blank workspace` action
 
 Creating from this panel auto-selects the new workspace and opens the `Chat` tab.
-
-### Onboarding wizard
-
-A dismissible bottom-left wizard walks first-time users through:
-
-1. creating a workspace
-2. opening `Config`
-3. setting an API key
-4. opening `Chat`
-
-The wizard tracks completion in local storage.
 
 ## Core Interactions
 

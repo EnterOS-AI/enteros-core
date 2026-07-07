@@ -33,7 +33,7 @@ That single script:
 
 Total wall-clock: ~30 seconds for a re-run, ~2 minutes for a first run (npm install + docker pulls).
 
-Once the canvas is up: open it, add your model API key in **Config → Secrets & API Keys → Global**, then click a template card or **+ Create blank workspace**.
+Once the canvas is up: open it and complete the first-run setup scene (runtime → provider → model + API key — see Step 5 below). When the **Enter OS Agent** is online, click a template card or **+ Create blank workspace** to grow the org.
 
 ## Manual setup (advanced)
 
@@ -89,7 +89,32 @@ NEXT_PUBLIC_ADMIN_TOKEN=dev-local-admin-token npm run dev   # MUST match ADMIN_T
 
 Open `http://localhost:3000`.
 
-## Step 5: Deploy your first workspace
+## Step 5: First run — set up the platform agent
+
+On a self-hosted stack the platform agent (the org concierge) is seeded automatically at first boot — it always exists, but starts unconfigured. The first time the canvas loads, a fullscreen setup scene appears and blocks everything else until the agent is configured. Four steps:
+
+1. **Welcome** — introduces the platform agent. Its name is fixed to **Enter OS Agent** (you can rename it later via the standard workspace rename).
+2. **Runtime** — a dropdown of the available runtimes, derived from `GET /templates`.
+3. **Provider + Model** — two cascading dropdowns constrained to the chosen runtime; on self-host only bring-your-own-key options appear. Changing an upstream pick resets the downstream ones, and there is no free-text entry — an invalid (runtime, model) pair is unreachable through the UI.
+4. **API key** — the key for the selected provider, stored as a global secret.
+
+The scene writes the key **first**, then configures and provisions the agent in a single create. A progress view follows; on success the scene dismisses into the canvas and the Enter OS Agent greets you first — that greeting is the end of onboarding.
+
+There is no local "completed" flag: the scene derives its state from the server, so a mid-setup refresh resumes at the right step, and once the agent has been online it never shows again.
+
+### Headless / no-UI setup
+
+Env-configured stacks skip the scene entirely. Set these before first boot:
+
+```bash
+MOLECULE_DEFAULT_RUNTIME=claude-code        # optional — runtime for the seeded agent (default: claude-code)
+MOLECULE_LLM_DEFAULT_MODEL=claude-opus-4-8  # bare registry model id for the chosen runtime
+ANTHROPIC_API_KEY=...                       # the provider key matching the chosen model
+```
+
+With a model and its matching provider key in the environment, the concierge converges to `online` on first boot with zero UI — the scene never renders because it sees a configured agent.
+
+## Step 6: Deploy your first workspace
 
 On a fresh canvas, the center empty state shows template cards plus a blank-workspace option.
 
@@ -98,9 +123,7 @@ You can either:
 1. Click a template to provision a ready-made workspace.
 2. Click `+ Create blank workspace`.
 
-At the same time, the bottom-left onboarding wizard appears and guides the first-run flow.
-
-## Step 6: Add an API key
+## Step 7: Add an API key
 
 1. Select the workspace.
 2. Open the `Config` tab.
@@ -111,7 +134,7 @@ At the same time, the bottom-left onboarding wizard appears and guides the first
 
 Global keys are inherited by all workspaces. Workspace keys override globals with the same name.
 
-## Step 7: Send the first message
+## Step 8: Send the first message
 
 1. Open the `Chat` tab.
 2. Send a prompt such as:

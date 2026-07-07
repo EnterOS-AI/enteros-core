@@ -137,7 +137,7 @@ Six runtime adapters ship production-ready on `main`: LangGraph, DeepAgents, Cla
 - 10-tab side panel: Chat, Activity, Details, Skills, Terminal, Config, Files, Memory, Traces, Events
 - Drag-to-nest team building
 - Bundle import/export via drag-and-drop
-- Empty state with template palette + onboarding wizard
+- Empty state with template palette + self-host first-run setup scene
 
 **2. Platform (Go 1.25+ / Gin)**
 - Gin-based REST API + WebSocket hub
@@ -697,7 +697,7 @@ requires:
 - **Drag-to-Nest**: Drag workspace over another → overlap detection → highlight → drop → update `parent_id`
 - **Right-Click Menu**: Open Details/Chat/Terminal, Restart, Duplicate, Export Bundle, Expand/Collapse Team, Extract from Team, Delete
 - **Template Palette**: Empty state shows up to 6 templates + "Create blank workspace"
-- **Onboarding Wizard**: 4-step guided setup tracked in localStorage
+- **First-Run Setup Scene** (self-host): gated fullscreen setup for the platform agent — runtime/provider/model dropdowns + API key; state derived from the server, no localStorage
 
 ### 10-Tab Operations Panel
 
@@ -940,7 +940,7 @@ Postgres + Redis + Langfuse only (for local development without containerized wo
 | Feature | Description |
 |---------|-------------|
 | **A2A streaming response** | Real-time task result delivery via SSE (`message/sendSubscribe`) |
-| **Onboarding wizard** | 4-step guided first-run experience in Canvas |
+| **First-run setup scene** | Gated fullscreen self-host setup that configures the platform agent (runtime, provider, model, API key) |
 | **Global API keys** | Platform-wide secrets with per-workspace override + AES-256 encryption |
 | **Coordinator enforcement** | Team leads cannot do work, only route and aggregate |
 | **Cascade pause/resume** | Pausing a parent cascades to all children; paused children can't be individually resumed |
