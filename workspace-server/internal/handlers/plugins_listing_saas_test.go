@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -111,29 +112,68 @@ func TestListInstalled_SaaS_ListErrorFailsSoftEmpty(t *testing.T) {
 	}
 }
 
-// TestListInstalled_LocalDocker_NoDockerClient_DoesNotRideEIC pins BUG-A /
-// core#182: a local-docker (molecules-server) tenant's instance_id is the
-// mol-ws-* CONTAINER NAME, not an "i-<hex>" EC2 id. On the hardened tenant
-// /platform there is no docker client wired (prov==nil, no reachable daemon),
-// so ListInstalled must return [] FAST — it must NOT fall through to the
-// AWS-only EIC path, which with no AWS creds hangs 90-120s and makes the canvas
-// Plugins tab / concierge config_tab_sweep fail "context deadline exceeded".
-func TestListInstalled_LocalDocker_NoDockerClient_DoesNotRideEIC(t *testing.T) {
-	// docker == nil (hardened tenant) + a local-docker CONTAINER-NAME instance_id.
-	h := NewPluginsHandler(t_TempDirNoop(), nil, nil).
-		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
-		WithInstanceIDLookup(func(string) (string, error) { return "mol-ws-e2e-plgn-abc123", nil })
+// newLocalDockerListHandler builds a ListInstalled handler for a docker-less
+// (hardened) local-docker tenant: nil docker client + a mol-ws-* CONTAINER-NAME
+// instance_id (NOT an "i-<hex>" EC2 id). Any call to listPluginsViaEIC is a
+// test failure — that is the BUG-A 90-120s AWS EIC hang this posture must avoid.
+func newLocalDockerListHandler(t *testing.T) *PluginsHandler {
+	t.Helper()
 	stubListPluginsViaEIC(t, func(context.Context, string, string) ([]string, error) {
 		t.Fatalf("listPluginsViaEIC MUST NOT be called for a local-docker (mol-ws-*) instance_id — that is the 90-120s BUG-A hang")
 		return nil, nil
 	})
+	return NewPluginsHandler(t_TempDirNoop(), nil, nil).
+		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
+		WithInstanceIDLookup(func(string) (string, error) { return "mol-ws-e2e-plgn-abc123", nil })
+}
 
+// TestListInstalled_LocalDocker_ListsFromWorkspacePluginsDB_NotEIC pins BUG-A /
+// core#182: the hardened, docker-less tenant /platform (#206: no docker.sock)
+// can't exec into mol-ws and must NOT ride the AWS EIC path (which with no AWS
+// creds hangs 90-120s → canvas Plugins tab / concierge config_tab_sweep
+// "context deadline exceeded"). Instead it lists from workspace_plugins — the
+// backend-agnostic install SSOT that the pull-mode install path records — so a
+// plugin installed via the pull path (deliverToContainer → errNoPushTarget)
+// reads back correctly and instantly.
+func TestListInstalled_LocalDocker_ListsFromWorkspacePluginsDB_NotEIC(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	mock.ExpectQuery(`SELECT plugin_name, source_raw\s+FROM workspace_plugins`).
+		WithArgs("c7244ed9-f623-4cba-8873-020e5c9fe104").
+		WillReturnRows(sqlmock.NewRows([]string{"plugin_name", "source_raw"}).
+			AddRow("lark-channel-molecule", "gitea://molecule-ai/lark-channel-molecule#abc").
+			AddRow("superpowers", "local://superpowers"))
+
+	h := newLocalDockerListHandler(t)
+	code, plugins := callListInstalled(t, h)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	got := map[string]bool{}
+	for _, p := range plugins {
+		got[p.Name] = true
+	}
+	if !got["lark-channel-molecule"] || !got["superpowers"] {
+		t.Fatalf("docker-less ListInstalled must list workspace_plugins rows; got %+v", plugins)
+	}
+}
+
+// TestListInstalled_LocalDocker_EmptyDB_ReturnsEmpty_NotEIC pins the fast
+// fail-soft empty case (no installed rows) — still 200 [], never an EIC hang.
+func TestListInstalled_LocalDocker_EmptyDB_ReturnsEmpty_NotEIC(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	mock.ExpectQuery(`SELECT plugin_name, source_raw\s+FROM workspace_plugins`).
+		WithArgs("c7244ed9-f623-4cba-8873-020e5c9fe104").
+		WillReturnRows(sqlmock.NewRows([]string{"plugin_name", "source_raw"}))
+
+	h := newLocalDockerListHandler(t)
 	code, plugins := callListInstalled(t, h)
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (fail-soft)", code)
 	}
 	if len(plugins) != 0 {
-		t.Fatalf("got %d plugins, want 0 (no docker client, no EIC): %+v", len(plugins), plugins)
+		t.Fatalf("got %d plugins, want 0: %+v", len(plugins), plugins)
 	}
 }
 

@@ -111,12 +111,29 @@ func (h *PluginsHandler) ListInstalled(c *gin.Context) {
 			return
 		}
 		// Non-EC2 instance id (local-docker) but no docker client wired — the
-		// hardened tenant /platform (prov==nil + no reachable docker daemon).
-		// Return [] FAST (fail-soft, same as the "neither backend" case) rather
-		// than falling through to the 90-120s AWS EIC hang. The push-install
-		// path already fails LOUD (503) in this same posture; the read fails
-		// soft so the canvas Plugins tab renders instantly instead of hanging.
-		log.Printf("ListInstalled: workspace %s on local-docker backend (instance_id=%s) but no docker client; returning empty list (not riding AWS EIC)", workspaceID, instanceID)
+		// hardened, docker-less tenant /platform (#206: no docker.sock, so we
+		// can't exec into mol-ws). We must NOT ride the 90-120s AWS EIC hang.
+		// The install path for this posture is now PULL-mode (deliverToContainer
+		// → errNoPushTarget → declare + record + re-materialize), and the
+		// workspace_plugins DB row is the backend-agnostic install SSOT (written
+		// by the docker, EIC and pull paths alike — see plugins_tracking.go /
+		// listInstalledPlugins). List from there: fast, no EIC, and it reflects
+		// exactly what the boot materializer pulls into /configs/plugins. This
+		// is what makes the readback after a pull-mode install (canvas Plugins
+		// tab / plugin-install-lifecycle e2e) see the plugin.
+		installed, dberr := listInstalledPlugins(ctx, workspaceID)
+		if dberr != nil {
+			log.Printf("ListInstalled: workspace %s docker-less, workspace_plugins read failed: %v (returning empty, not riding AWS EIC)", workspaceID, dberr)
+			c.JSON(http.StatusOK, plugins)
+			return
+		}
+		for _, p := range installed {
+			if validatePluginName(p.PluginName) != nil {
+				continue
+			}
+			plugins = append(plugins, pluginInfo{Name: p.PluginName})
+		}
+		h.annotateRuntimeSupport(workspaceID, plugins)
 		c.JSON(http.StatusOK, plugins)
 		return
 	}
