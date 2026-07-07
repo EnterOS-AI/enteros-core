@@ -238,6 +238,33 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		return fmt.Errorf("failed to create %s: %w", ws.Name, err)
 	}
 
+	// core#2594: persist the resolved template model as the MODEL workspace_secret
+	// so it survives EVERY re-provision path (restart / resume / auto-recover /
+	// re-import), not only the first import provision that carries it in-memory via
+	// payload.Model. This is the org-import companion to WorkspaceHandler.Create's
+	// identical setModelSecret write (workspace.go): both persist the picked model
+	// into the ONE place prepareProvisionContext's loadWorkspaceSecrets reads.
+	//
+	// Without it, org-imported workspaces were the ONLY provision path that never
+	// wrote MODEL. The first provision succeeded (payload.Model was populated from
+	// ws.Model → defaults.Model), but any later provision rebuilds the payload from
+	// the workspaces row — which has NO model column — so payload.Model was empty,
+	// applyRuntimeModelEnv set neither MOLECULE_MODEL nor MODEL, and the universal
+	// MISSING_MODEL gate aborted the workspace ("no resolved model (MISSING_MODEL,
+	// core#2594); refusing the runtime's opaque default"). Persisting here closes
+	// that gap for the whole imported tree, including a Marketing Manager's
+	// nested-child sub-team.
+	//
+	// `model` is guaranteed non-empty at this point (required + resolved at the top
+	// of this function). setModelSecret encrypts iff crypto is enabled (raw
+	// otherwise), matching the workspace_secrets write loop below. Non-fatal: a
+	// failure logs and continues so a transient secret-store blip does not abort the
+	// entire import — the first provision still carries payload.Model, and a later
+	// Save/Restart re-persists via the SecretsHandler endpoints.
+	if err := setModelSecret(ctx, id, model); err != nil {
+		log.Printf("Org import: failed to persist MODEL secret for %s (%q): %v (non-fatal)", ws.Name, model, err)
+	}
+
 	// Canvas layout — absX/absY were computed by the caller using the
 	// subtree-aware grid (childSlotInGrid) so a nested-parent child
 	// doesn't clip into its siblings. Raw YAML canvas coords are only
