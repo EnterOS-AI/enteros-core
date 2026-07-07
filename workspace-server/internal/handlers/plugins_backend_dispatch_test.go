@@ -91,17 +91,36 @@ func TestPluginInstall_LocalDocker_DoesNotHitEIC(t *testing.T) {
 	}
 }
 
-// TestPluginUninstall_LocalDocker_DoesNotHitEIC is the uninstall sibling:
-// a container-name instance_id must NOT reach uninstallPluginViaEIC.
-func TestPluginUninstall_LocalDocker_DoesNotHitEIC(t *testing.T) {
+// TestPluginUninstall_LocalDocker_DeliversByPull is the uninstall sibling of the
+// install pull path (delta A, #206/#230): a docker-less local-docker tenant
+// (instance_id is a container name, no docker client wired) must NOT reach
+// uninstallPluginViaEIC and must NOT 503-dead-end. It delivers the UNINSTALL by
+// PULL — dropping BOTH DB rows (workspace_plugins + workspace_declared_plugins)
+// and restarting so the fresh container's recomputed MOLECULE_DECLARED_PLUGINS
+// omits the plugin.
+//
+// Pre-change this test would FAIL (old code returned 503 for the docker-less
+// uninstall).
+func TestPluginUninstall_LocalDocker_DeliversByPull(t *testing.T) {
 	stubUninstallPluginViaEIC(t, func(_ context.Context, instanceID, _, _ string) error {
 		t.Errorf("uninstallPluginViaEIC called with instanceID=%q for a local-docker workspace; "+
 			"EIC must be gated on a real EC2 id (isEC2InstanceID)", instanceID)
 		return nil
 	})
 
-	// docker == nil; instance_id is a local-docker container name.
-	h := NewPluginsHandler(t.TempDir(), nil, nil).
+	// pullUninstall deletes BOTH DB rows (installed + declared).
+	mock := setupTestDB(t)
+	mock.ExpectExec(`DELETE FROM workspace_plugins WHERE workspace_id`).
+		WithArgs("c7244ed9-f623-4cba-8873-020e5c9fe104", "browser-automation").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM workspace_declared_plugins WHERE workspace_id`).
+		WithArgs("c7244ed9-f623-4cba-8873-020e5c9fe104", "browser-automation").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// docker == nil; instance_id is a local-docker container name. restartFunc
+	// wired so the pull path can schedule the box bounce (restarting=true).
+	restarted := make(chan string, 1)
+	h := NewPluginsHandler(t.TempDir(), nil, func(id string) { restarted <- id }).
 		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
 		WithInstanceIDLookup(func(string) (string, error) { return localDockerInstanceID, nil })
 
@@ -118,11 +137,23 @@ func TestPluginUninstall_LocalDocker_DoesNotHitEIC(t *testing.T) {
 	)
 
 	h.Uninstall(c)
+	drainTestAsync()
 
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 (local-docker, no docker client wired), got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (docker-less pull uninstall), got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "local-docker") {
-		t.Errorf("503 body should explain the local-docker no-docker-client case; got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), `"delivery":"pull"`) {
+		t.Errorf("body should report pull delivery; got %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"status":"uninstalling"`) {
+		t.Errorf("body should report status=uninstalling; got %s", w.Body.String())
+	}
+	select {
+	case <-restarted: // pull uninstall scheduled the restart
+	default:
+		t.Errorf("pull uninstall did not schedule a restart")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("both DB rows must be deleted: %v", err)
 	}
 }

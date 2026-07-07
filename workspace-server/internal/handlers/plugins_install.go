@@ -152,12 +152,24 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 
 // Uninstall handles DELETE /workspaces/:id/plugins/:name — removes a plugin.
 //
-// Dispatch order mirrors Install's deliverToContainer:
+// Dispatch order mirrors Install's deliverToContainer (same shape gates, same
+// PULL-primary policy):
 //
-//  1. Local Docker container up → exec rm -rf via existing helpers.
-//  2. SaaS workspace (instance_id set) → ssh sudo rm -rf via EIC.
-//  3. external runtime → 422 (caller manages its own plugin dir).
-//  4. Neither → 503.
+//  1. external runtime → 422 (caller manages its own plugin dir).
+//  2. Self-host Docker container up (ws-<id>) → exec rm -rf (persistent /configs
+//     needs eager removal — an empty declared-set is a no-op on a fresh boot).
+//  3. SaaS workspace (instance_id set):
+//     3a. real "i-<hex>" EC2 id → ssh sudo rm -rf via EIC.
+//     3b. molecules-server / local-docker container name → PULL uninstall
+//     (delta A): drop BOTH DB rows + restart so the fresh container's
+//     recomputed MOLECULE_DECLARED_PLUGINS omits the plugin. Push (docker
+//     exec rm) only when PLUGIN_DELIVERY_PULL_ONLY=false AND a docker client
+//     is wired.
+//  4. No container + no instance id → PULL uninstall too (symmetric with
+//     Install's empty-instance path).
+//
+// The retired path this replaces: on a docker-less molecules-server tenant the
+// old code 503'd (dead-end) or, before core#182, hung ~90s on AWS EIC → 502.
 func (h *PluginsHandler) Uninstall(c *gin.Context) {
 	workspaceID := c.Param("id")
 	pluginName := c.Param("name")
@@ -185,24 +197,57 @@ func (h *PluginsHandler) Uninstall(c *gin.Context) {
 
 	if instanceID, runtime := h.lookupSaaSDispatch(workspaceID); instanceID != "" {
 		// SHAPE-routed exactly like Install/deliverToContainer + the Files API
-		// (files_backend_dispatch.go). A real "i-<hex>" EC2 id → EIC SSH; a
-		// local-docker CONTAINER NAME ("mol-ws-*") → docker exec into that
-		// container; never route local-docker to the AWS-only EIC path.
+		// (files_backend_dispatch.go). A real "i-<hex>" EC2 id → EIC SSH (gated,
+		// dormant on the No-AWS fleet, kept for rollback).
 		if isEC2InstanceID(instanceID) {
 			h.uninstallViaEIC(ctx, c, workspaceID, pluginName, instanceID, runtime)
 			return
 		}
-		if h.docker != nil {
+		// molecules-server / local-docker backend. DELIVERY POLICY mirrors
+		// deliverToContainer: PULL is the PRIMARY model. Docker-exec rm only when
+		// the operator opted out (PLUGIN_DELIVERY_PULL_ONLY=false) AND a docker
+		// client is wired; never route a container-name id to the AWS EIC path.
+		if deliveryModeForInstance(instanceID) == deliverByPush && h.docker != nil {
 			h.uninstallViaDocker(ctx, c, workspaceID, pluginName, instanceID)
 			return
 		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "workspace runs on the local-docker backend but this server has no docker client (prov==nil and no reachable docker daemon)",
-		})
+		// Pull-only (default) or no docker client wired (#206: no docker.sock) —
+		// deliver the UNINSTALL by PULL. No 503 dead-end, no AWS EIC 90s→502.
+		h.uninstallByPull(ctx, c, workspaceID, pluginName, instanceID)
 		return
 	}
 
-	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace container not running"})
+	// No running container and no instance id — deliver the uninstall by PULL too
+	// (symmetric with Install's empty-instance errNoPushTarget path). The fresh
+	// container rebuilds /configs/plugins from the recomputed desired set.
+	h.uninstallByPull(ctx, c, workspaceID, pluginName, "")
+}
+
+// uninstallByPull is the docker-less UNINSTALL handler (delta A) — the mirror of
+// the Install pull path. It drops the plugin from BOTH DB sets (installed +
+// declared) via pullUninstall and restarts, so the runtime's boot materializer
+// never re-pulls it. Byte-for-byte the same "the box rebuilds /configs from the
+// recomputed env" mechanism boot-declared plugins already use; the AGENT never
+// touches the container.
+//
+// Because the DB deletion IS the uninstall here (no container rm to fall back
+// on), a delete failure surfaces as 500 rather than being swallowed — a
+// surviving declared row would re-materialize the plugin on the next boot.
+func (h *PluginsHandler) uninstallByPull(ctx context.Context, c *gin.Context, workspaceID, pluginName, instanceID string) {
+	scheduled, err := h.pullUninstall(ctx, workspaceID, pluginName)
+	if err != nil {
+		log.Printf("Plugin uninstall (pull): failed to drop DB rows for %s → %s: %v", pluginName, workspaceID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove plugin"})
+		return
+	}
+	log.Printf("Plugin uninstall (pull): %s from workspace %s (instance_id=%s, restarting=%t) — declared+installed rows removed; the box drops it on the next boot",
+		pluginName, workspaceID, instanceID, scheduled)
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "uninstalling",
+		"plugin":     pluginName,
+		"restarting": scheduled,
+		"delivery":   "pull",
+	})
 }
 
 // uninstallViaDocker holds the historical Docker-exec uninstall flow.

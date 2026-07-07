@@ -427,11 +427,25 @@ func TestPluginUninstall_SaaS_PropagatesEICError(t *testing.T) {
 	}
 }
 
-func TestPluginUninstall_NoBackends_Returns503(t *testing.T) {
+// TestPluginUninstall_NoBackends_DeliversByPull — no container + empty
+// instance_id (pre-provision / unknown backend): the uninstall delivers by PULL,
+// symmetric with Install's empty-instance errNoPushTarget path. It drops BOTH DB
+// rows and (with a restartFunc wired) bounces the box; EIC is never called. This
+// replaces the old 503 dead-end so install and uninstall share one PULL-primary
+// model.
+func TestPluginUninstall_NoBackends_DeliversByPull(t *testing.T) {
 	stubUninstallPluginViaEIC(t, func(ctx context.Context, instanceID, runtime, pluginName string) error {
 		t.Errorf("EIC uninstall must not be called with empty instance_id")
 		return nil
 	})
+
+	mock := setupTestDB(t)
+	mock.ExpectExec(`DELETE FROM workspace_plugins WHERE workspace_id`).
+		WithArgs("ws-1", "browser-automation").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM workspace_declared_plugins WHERE workspace_id`).
+		WithArgs("ws-1", "browser-automation").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	h := NewPluginsHandler(t.TempDir(), nil, nil).
 		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
@@ -446,9 +460,16 @@ func TestPluginUninstall_NoBackends_Returns503(t *testing.T) {
 	c.Request = httptest.NewRequest("DELETE", "/workspaces/ws-1/plugins/browser-automation", nil)
 
 	h.Uninstall(c)
+	drainTestAsync()
 
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected 503, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (pull uninstall), got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"delivery":"pull"`) {
+		t.Errorf("expected pull delivery, got: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("both DB rows must be deleted: %v", err)
 	}
 }
 
