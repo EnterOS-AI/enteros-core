@@ -406,6 +406,14 @@ func TestParseManifestYAML_PicksUpKind(t *testing.T) {
 }
 
 func TestPluginListRegistry_DerivesInstallSourceAndKind(t *testing.T) {
+	// Hermetic: an empty source map ⇒ every entry falls back to its
+	// local://<name> handle. Reset it here so the assertion never depends on
+	// the ambient molecule-core/manifest.json that the package init() loads
+	// (which DOES list lark-channel → gitea://…, exercised by the sibling test
+	// TestPluginListRegistry_UsesManifestSource below).
+	restore := swapPluginInstallSourceMap(t, map[string]string{})
+	defer restore()
+
 	dir := t.TempDir()
 	writePlugin(t, dir, "lark-channel", kindTestManifest)
 	writePlugin(t, dir, "bare-plugin", `version: "1.0"`)
@@ -427,9 +435,8 @@ func TestPluginListRegistry_DerivesInstallSourceAndKind(t *testing.T) {
 	for _, p := range plugins {
 		byName[p.Name] = p
 	}
-	// Every registry row carries its installable local:// handle, derived
-	// from the entry's own directory name — the exact string the install
-	// pipeline's local resolver accepts.
+	// With no manifest entry, every registry row falls back to its local://
+	// handle, derived from the entry's own directory name.
 	if got := byName["lark-channel"].Source; got != "local://lark-channel" {
 		t.Errorf("expected source 'local://lark-channel', got %q", got)
 	}
@@ -442,6 +449,105 @@ func TestPluginListRegistry_DerivesInstallSourceAndKind(t *testing.T) {
 	}
 	if got := byName["bare-plugin"].Kind; got != "" {
 		t.Errorf("expected empty kind, got %q", got)
+	}
+}
+
+// swapPluginInstallSourceMap replaces the package-level manifest-derived plugin
+// source map for the duration of a test and returns a restore func. Lets a test
+// pin the catalog's install-source derivation to a known fixture instead of the
+// ambient manifest the package init() loads.
+func swapPluginInstallSourceMap(t *testing.T, m map[string]string) func() {
+	t.Helper()
+	prev := pluginInstallSourceByName
+	pluginInstallSourceByName = m
+	return func() { pluginInstallSourceByName = prev }
+}
+
+// TestPluginListRegistry_UsesManifestSource pins the fix for the "recorded but
+// never loaded" bug: when a plugin has a manifest entry, the catalog offers its
+// REAL fetchable provider source (gitea://…#pinned-ref) — the string the on-box
+// boot-installer can actually fetch — NOT the un-fetchable local://<name> the
+// runtime skips. A dir with no manifest entry still falls back to local://.
+func TestPluginListRegistry_UsesManifestSource(t *testing.T) {
+	const larkGitea = "gitea://molecule-ai/lark-channel-molecule#b9e0e9bd8536b6bfbdac17bad8c669c68cc9d952"
+	restore := swapPluginInstallSourceMap(t, map[string]string{
+		"lark-channel": larkGitea,
+	})
+	defer restore()
+
+	dir := t.TempDir()
+	writePlugin(t, dir, "lark-channel", kindTestManifest)
+	writePlugin(t, dir, "bare-plugin", `version: "1.0"`)
+
+	h := NewPluginsHandler(dir, nil, nil)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/plugins", nil)
+	h.ListRegistry(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var plugins []pluginInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &plugins); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	byName := map[string]pluginInfo{}
+	for _, p := range plugins {
+		byName[p.Name] = p
+	}
+	// lark-channel: manifest entry present → real gitea source (loadable).
+	if got := byName["lark-channel"].Source; got != larkGitea {
+		t.Errorf("expected manifest gitea source %q, got %q", larkGitea, got)
+	}
+	// bare-plugin: no manifest entry → local:// fallback preserved.
+	if got := byName["bare-plugin"].Source; got != "local://bare-plugin" {
+		t.Errorf("expected fallback 'local://bare-plugin', got %q", got)
+	}
+}
+
+// TestPluginSourceURL_ProviderAware locks the provider→scheme derivation and the
+// skip-on-unknown/empty rules the manifest _provider_contract implies.
+func TestPluginSourceURL_ProviderAware(t *testing.T) {
+	cases := []struct {
+		provider, repo, ref, want string
+	}{
+		{"", "molecule-ai/lark-channel-molecule", "b9e0", "gitea://molecule-ai/lark-channel-molecule#b9e0"},
+		{"moleculesai", "o/r", "main", "gitea://o/r#main"},
+		{"github", "o/r", "v1", "github://o/r#v1"},
+		{"", "o/r", "", "gitea://o/r"}, // no ref → box defaults to main
+		{"gitlab", "o/r", "x", ""},     // unknown provider → skip (caller uses local://)
+		{"", "", "x", ""},              // empty repo → skip
+	}
+	for _, tc := range cases {
+		if got := pluginSourceURL(tc.provider, tc.repo, tc.ref); got != tc.want {
+			t.Errorf("pluginSourceURL(%q,%q,%q) = %q, want %q", tc.provider, tc.repo, tc.ref, got, tc.want)
+		}
+	}
+}
+
+// TestLoadPluginInstallSources_ParsesManifest proves the manifest `plugins`
+// array is parsed into name→gitea-source, and a missing/unreadable path yields
+// an empty map (listing degrades to local://, prior behaviour).
+func TestLoadPluginInstallSources_ParsesManifest(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "manifest.json")
+	const body = `{"version":1,"plugins":[
+	  {"name":"lark-channel","repo":"molecule-ai/lark-channel-molecule","ref":"b9e0e9bd8536b6bfbdac17bad8c669c68cc9d952"},
+	  {"name":"superpowers","repo":"molecule-ai/molecule-ai-plugin-superpowers","ref":"b4e56ff9740099c62b8f8cae6619f66eb55c3201"}
+	],"workspace_templates":[]}`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got := loadPluginInstallSources(path)
+	if got["lark-channel"] != "gitea://molecule-ai/lark-channel-molecule#b9e0e9bd8536b6bfbdac17bad8c669c68cc9d952" {
+		t.Errorf("lark-channel source = %q", got["lark-channel"])
+	}
+	if got["superpowers"] != "gitea://molecule-ai/molecule-ai-plugin-superpowers#b4e56ff9740099c62b8f8cae6619f66eb55c3201" {
+		t.Errorf("superpowers source = %q", got["superpowers"])
+	}
+	if empty := loadPluginInstallSources(filepath.Join(dir, "nope.json")); len(empty) != 0 {
+		t.Errorf("missing manifest should yield empty map, got %v", empty)
 	}
 }
 

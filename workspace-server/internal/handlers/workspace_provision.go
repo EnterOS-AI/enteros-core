@@ -779,6 +779,11 @@ func init() {
 	// lookups use the same set of normalized runtime names. Idempotent
 	// — both inits read manifestPath() (cached) and tolerate each other.
 	initTemplateRepoByName()
+	// Populate the catalog plugin → real-source map (gitea://…) from the same
+	// manifest, so GET /plugins offers a source the on-box boot-installer can
+	// fetch instead of the un-fetchable local://<name>. See
+	// pluginInstallSourceByName + plugins_listing.go.
+	initPluginInstallSourceByName()
 }
 
 // yamlQuote emits a YAML double-quoted scalar that safely contains any
