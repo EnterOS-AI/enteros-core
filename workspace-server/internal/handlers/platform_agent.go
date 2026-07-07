@@ -342,7 +342,7 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 			// deliver system-prompt.md for claude-code (its runtime reads that file
 			// by convention).
 			configFiles[conciergePersonaPromptPath] = persona
-			if runtime == defaultConciergeRuntime {
+			if runtime == claudeCodeRuntime {
 				configFiles["system-prompt.md"] = persona
 			}
 		}
@@ -367,8 +367,17 @@ const conciergePersonaPromptPath = "prompts/concierge.md"
 // the "-default" variant; every other runtime's template dir == its name.
 func conciergeBaseTemplateName(runtime string) string {
 	runtime = strings.TrimSpace(runtime)
-	if runtime == "" || runtime == defaultConciergeRuntime {
-		return defaultConciergeRuntime + "-default"
+	if runtime == "" {
+		// Resolve the ACTUAL default (env-aware), not the compiled-in const —
+		// an operator's MOLECULE_DEFAULT_RUNTIME must drive the template pick.
+		runtime = conciergeDefaultRuntime()
+	}
+	// The "-default" suffix is a claude-code-ONLY convention (its baked base
+	// template dir is "claude-code-default"); every other runtime's template
+	// dir == its runtime name. Previously keyed off defaultConciergeRuntime,
+	// which broke the moment the default stopped being claude-code.
+	if runtime == claudeCodeRuntime {
+		return claudeCodeRuntime + "-default"
 	}
 	return runtime
 }
@@ -419,7 +428,7 @@ func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte
 	// Graft the persona per the runtime's convention. claude-code reads
 	// system-prompt.md (delivered separately); every other runtime reads the
 	// prompt_files list, so the persona becomes its sole prompt file.
-	if strings.TrimSpace(runtime) != "" && runtime != defaultConciergeRuntime {
+	if strings.TrimSpace(runtime) != "" && runtime != claudeCodeRuntime {
 		yamlMappingSet(root, "prompt_files", yamlStringSeq(conciergePersonaPromptPath))
 	}
 	out, err := yaml.Marshal(&doc)
@@ -523,22 +532,34 @@ func substituteConciergeName(prompt []byte, name string) []byte {
 	return []byte(strings.ReplaceAll(string(prompt), conciergeNamePlaceholder, name))
 }
 
+// claudeCodeRuntime names the claude-code runtime for its TWO concierge-side
+// conventions that are claude-code-SPECIFIC and not default-runtime-specific
+// (they were previously conflated with defaultConciergeRuntime, which would
+// break the moment the default changed): (a) claude-code reads
+// system-prompt.md instead of a prompt_files list, and (b) its baked base
+// template dir is the "-default" variant ("claude-code-default") while every
+// other runtime's template dir == its runtime name.
+const claudeCodeRuntime = "claude-code"
+
 // defaultConciergeRuntime is the compiled-in FALLBACK runtime for the platform
 // agent (concierge) when no per-org runtime is specified AND the generic KMS
 // platform default env is unset. The platform de-bake (P3b) makes the concierge
 // runtime a PARAMETER (threaded through installPlatformAgent + ensureConciergeModel),
 // so a per-org concierge can run on codex / openclaw / hermes, not only the legacy
-// 'claude-code' image variant. The fallback stays 'claude-code' for backward
-// compatibility (existing installs, self-host seed, OSS/local). platformDefaultModelFallback
-// is validated against the registry FOR THE CHOSEN RUNTIME before being seeded.
+// 'claude-code' image variant. platformDefaultModelFallback is validated
+// against the registry FOR THE CHOSEN RUNTIME before being seeded.
 //
 // SSOT FOLLOW (PR-6 concierge-follows): this const is now only the FALLBACK.
 // conciergeDefaultRuntime resolves the runtime default from the generic KMS env
 // MOLECULE_DEFAULT_RUNTIME (the same SSOT handlers.Create reads via
 // bareCreateDefaultRuntime), falling back to this const when the env is unset.
-// The prod KMS value equals this const ('claude-code'), so the follow is
-// behavior-neutral on prod — no regression.
-const defaultConciergeRuntime = "claude-code"
+//
+// 'openclaw' per the operator ruling 2026-07-07 (core#3496: "openclaw should
+// be the default for now") — this also ALIGNS the compiled-in fallback with
+// the platform KMS default (staging-tenant-cd.yml already defaults
+// MOLECULE_DEFAULT_RUNTIME to 'openclaw'), closing a documented divergence
+// where self-host and SaaS silently seeded different concierge runtimes.
+const defaultConciergeRuntime = "openclaw"
 
 // conciergeDefaultRuntime resolves the concierge's default runtime, honoring the
 // generic KMS platform default env MOLECULE_DEFAULT_RUNTIME (injected at deploy

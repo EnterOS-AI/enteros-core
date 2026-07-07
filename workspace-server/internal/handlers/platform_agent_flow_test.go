@@ -114,7 +114,7 @@ func registryModelForRuntime(t *testing.T, runtime string) string {
 // provision trigger fires, so the very first provision resolves the caller's
 // pick instead of racing it into the platform-default fallback.
 func TestEnsurePlatformAgent_ModelWrittenBeforeProvision(t *testing.T) {
-	model := registryModelForRuntime(t, "claude-code")
+	model := registryModelForRuntime(t, conciergeDefaultRuntime())
 
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
@@ -228,7 +228,7 @@ func TestEnsurePlatformAgent_ModelValidatedAgainstExistingRuntime(t *testing.T) 
 // TestEnsurePlatformAgent_ModelStageError500: a failing MODEL secret write is
 // a 500 "model failed" — and the provision trigger must NOT fire after it.
 func TestEnsurePlatformAgent_ModelStageError500(t *testing.T) {
-	model := registryModelForRuntime(t, "claude-code")
+	model := registryModelForRuntime(t, conciergeDefaultRuntime())
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnError(sql.ErrNoRows)
@@ -433,7 +433,7 @@ func TestEnsurePlatformAgent_MalformedBody400(t *testing.T) {
 // read (needed to validate the model against the row's real runtime) is a
 // lookup-stage 500.
 func TestEnsurePlatformAgent_RuntimeLookupError500(t *testing.T) {
-	model := registryModelForRuntime(t, "claude-code")
+	model := registryModelForRuntime(t, conciergeDefaultRuntime())
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-existing", "failed"))
@@ -454,7 +454,7 @@ func TestEnsurePlatformAgent_RuntimeLookupError500(t *testing.T) {
 // hitting ErrNoRows (row raced away) falls back to the default runtime for
 // model validation and the repair proceeds.
 func TestEnsurePlatformAgent_RuntimeRowGoneFallsToDefault(t *testing.T) {
-	model := registryModelForRuntime(t, "claude-code")
+	model := registryModelForRuntime(t, conciergeDefaultRuntime())
 	mock := setupTestDB(t)
 	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-existing", "failed"))
@@ -556,5 +556,32 @@ func TestEnsurePlatformAgent_NameStageError500(t *testing.T) {
 	}
 	if cap.provisionCalled {
 		t.Error("provision fired after the rename failed")
+	}
+}
+
+// TestConciergeDefaultRuntimeAndTemplateNaming pins the operator ruling
+// (core#3496, 2026-07-07: "openclaw should be the default for now") AND the
+// decoupling it forced: the "-default" template suffix + system-prompt.md
+// delivery are claude-code CONVENTIONS, not default-runtime behavior.
+func TestConciergeDefaultRuntimeAndTemplateNaming(t *testing.T) {
+	t.Setenv("MOLECULE_DEFAULT_RUNTIME", "")
+	if got := conciergeDefaultRuntime(); got != "openclaw" {
+		t.Errorf("conciergeDefaultRuntime() = %q, want openclaw (compiled-in fallback)", got)
+	}
+	cases := map[string]string{
+		"":            "openclaw", // empty resolves via the env-aware default
+		"openclaw":    "openclaw", // non-claude runtimes: dir == name
+		"codex":       "codex",
+		"claude-code": "claude-code-default", // the ONE "-default" convention
+	}
+	for in, want := range cases {
+		if got := conciergeBaseTemplateName(in); got != want {
+			t.Errorf("conciergeBaseTemplateName(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// An operator env override drives the empty-runtime template pick too.
+	t.Setenv("MOLECULE_DEFAULT_RUNTIME", "claude-code")
+	if got := conciergeBaseTemplateName(""); got != "claude-code-default" {
+		t.Errorf(`conciergeBaseTemplateName("") with MOLECULE_DEFAULT_RUNTIME=claude-code = %q, want claude-code-default`, got)
 	}
 }
