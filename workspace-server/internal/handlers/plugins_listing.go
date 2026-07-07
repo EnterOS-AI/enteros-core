@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -68,70 +69,115 @@ func (h *PluginsHandler) ListInstalled(c *gin.Context) {
 	ctx := c.Request.Context()
 	plugins := []pluginInfo{}
 
-	// Dispatch order mirrors Install/Uninstall (plugins_install.go): a local
-	// Docker container wins; otherwise fall back to the SaaS EIC path. Without
-	// the SaaS branch ListInstalled returned [] for EVERY SaaS tenant (no LOCAL
-	// container), so an installed plugin read back as not-installed even though
-	// it was on the box — the "[] readback after a successful install" bug.
+	// Dispatch order mirrors Install/Uninstall/deliverToContainer
+	// (plugins_install.go): a local Docker container wins; otherwise the
+	// instance_id is SHAPE-routed (isEC2InstanceID, files_backend_dispatch.go)
+	// — a real "i-<hex>" EC2 id lists over EIC SSH, a local-docker CONTAINER
+	// NAME lists via docker exec. Without the SaaS branch ListInstalled
+	// returned [] for EVERY SaaS tenant (no LOCAL container), so an installed
+	// plugin read back as not-installed — the "[] readback after a successful
+	// install" bug.
 	if containerName := h.findRunningContainer(ctx, workspaceID); containerName != "" {
-		// List directories in /configs/plugins/
-		output, err := h.execInContainer(ctx, containerName, []string{
-			"sh", "-c", "ls -1 /configs/plugins/ 2>/dev/null || true",
-		})
-		if err != nil {
-			c.JSON(http.StatusOK, plugins)
-			return
-		}
-		for _, name := range strings.Split(output, "\n") {
-			name = strings.TrimSpace(name)
-			if name == "" || validatePluginName(name) != nil {
-				continue
-			}
-			// Try to read manifest from container (safe: name is validated)
-			manifestOutput, err := h.execInContainer(ctx, containerName, []string{
-				"cat", fmt.Sprintf("/configs/plugins/%s/plugin.yaml", name),
-			})
-			if err != nil || manifestOutput == "" {
-				plugins = append(plugins, pluginInfo{Name: name})
-				continue
-			}
-			info := parseManifestYAML(name, []byte(manifestOutput))
-			plugins = append(plugins, info)
-		}
+		plugins = h.listInstalledViaDocker(ctx, containerName)
 		h.annotateRuntimeSupport(workspaceID, plugins)
 		c.JSON(http.StatusOK, plugins)
 		return
 	}
 
-	// SaaS path: list + read manifests over the EIC SSH tunnel.
 	if instanceID, runtime := h.lookupSaaSDispatch(workspaceID); instanceID != "" {
-		names, err := listPluginsViaEIC(ctx, instanceID, runtime)
-		if err != nil {
-			// Couldn't reach the box — return [] (not a 5xx) to match the
-			// local path's fail-soft posture; the canvas treats an empty list
-			// as "none installed / try again", never a hard error.
-			log.Printf("ListInstalled: EIC list failed for %s: %v", workspaceID, err)
+		// SHAPE-routed exactly like Uninstall/deliverToContainer + the Files API
+		// (files_backend_dispatch.go). A real "i-<hex>" EC2 id → EIC SSH list;
+		// a local-docker CONTAINER NAME ("mol-ws-*") → docker exec into that
+		// container; NEVER route a local-docker tenant to the AWS-only EIC path
+		// — with no AWS creds that ssh dance hangs 90-120s, and the canvas
+		// Plugins tab / concierge config_tab_sweep then fails "context deadline
+		// exceeded" (core#182 / BUG-A). Install/Uninstall already shape-route;
+		// the listing path was the last EIC-unconditional caller.
+		if isEC2InstanceID(instanceID) {
+			plugins = h.listInstalledViaEIC(ctx, workspaceID, instanceID, runtime)
+			h.annotateRuntimeSupport(workspaceID, plugins)
 			c.JSON(http.StatusOK, plugins)
 			return
 		}
-		for _, name := range names {
-			if validatePluginName(name) != nil {
-				continue
-			}
-			manifest, mErr := readPluginManifestViaEIC(ctx, instanceID, runtime, name)
-			if mErr != nil || len(manifest) == 0 {
-				plugins = append(plugins, pluginInfo{Name: name})
-				continue
-			}
-			plugins = append(plugins, parseManifestYAML(name, manifest))
+		// molecules-server / local-docker backend: instance_id IS the running
+		// container name on the local docker daemon. List via the SAME docker
+		// primitive the findRunningContainer branch uses (findRunningContainer
+		// looks for "ws-<id>" and never matches the CP's "mol-ws-*" name, so we
+		// key the read on the instance_id container name).
+		if h.docker != nil {
+			plugins = h.listInstalledViaDocker(ctx, instanceID)
+			h.annotateRuntimeSupport(workspaceID, plugins)
+			c.JSON(http.StatusOK, plugins)
+			return
 		}
-		h.annotateRuntimeSupport(workspaceID, plugins)
+		// Non-EC2 instance id (local-docker) but no docker client wired — the
+		// hardened tenant /platform (prov==nil + no reachable docker daemon).
+		// Return [] FAST (fail-soft, same as the "neither backend" case) rather
+		// than falling through to the 90-120s AWS EIC hang. The push-install
+		// path already fails LOUD (503) in this same posture; the read fails
+		// soft so the canvas Plugins tab renders instantly instead of hanging.
+		log.Printf("ListInstalled: workspace %s on local-docker backend (instance_id=%s) but no docker client; returning empty list (not riding AWS EIC)", workspaceID, instanceID)
 		c.JSON(http.StatusOK, plugins)
 		return
 	}
 
 	// Neither backend reachable — empty list (fail-soft, same as before).
 	c.JSON(http.StatusOK, plugins)
+}
+
+// listInstalledViaDocker lists plugins under /configs/plugins/ inside
+// containerName via docker exec, reading each plugin.yaml. Shared by the
+// findRunningContainer branch and the local-docker instance_id branch — the
+// docker read is identical once we know which container to exec into.
+func (h *PluginsHandler) listInstalledViaDocker(ctx context.Context, containerName string) []pluginInfo {
+	plugins := []pluginInfo{}
+	output, err := h.execInContainer(ctx, containerName, []string{
+		"sh", "-c", "ls -1 /configs/plugins/ 2>/dev/null || true",
+	})
+	if err != nil {
+		return plugins
+	}
+	for _, name := range strings.Split(output, "\n") {
+		name = strings.TrimSpace(name)
+		if name == "" || validatePluginName(name) != nil {
+			continue
+		}
+		// Try to read manifest from container (safe: name is validated)
+		manifestOutput, err := h.execInContainer(ctx, containerName, []string{
+			"cat", fmt.Sprintf("/configs/plugins/%s/plugin.yaml", name),
+		})
+		if err != nil || manifestOutput == "" {
+			plugins = append(plugins, pluginInfo{Name: name})
+			continue
+		}
+		plugins = append(plugins, parseManifestYAML(name, []byte(manifestOutput)))
+	}
+	return plugins
+}
+
+// listInstalledViaEIC lists plugins on a SaaS workspace EC2 over the EIC SSH
+// tunnel, reading each plugin.yaml. Returns [] on any tunnel/list error
+// (fail-soft — the canvas treats an empty list as "none installed / try
+// again", never a hard error). Only reached for a real "i-<hex>" EC2 id.
+func (h *PluginsHandler) listInstalledViaEIC(ctx context.Context, workspaceID, instanceID, runtime string) []pluginInfo {
+	plugins := []pluginInfo{}
+	names, err := listPluginsViaEIC(ctx, instanceID, runtime)
+	if err != nil {
+		log.Printf("ListInstalled: EIC list failed for %s: %v", workspaceID, err)
+		return plugins
+	}
+	for _, name := range names {
+		if validatePluginName(name) != nil {
+			continue
+		}
+		manifest, mErr := readPluginManifestViaEIC(ctx, instanceID, runtime, name)
+		if mErr != nil || len(manifest) == 0 {
+			plugins = append(plugins, pluginInfo{Name: name})
+			continue
+		}
+		plugins = append(plugins, parseManifestYAML(name, manifest))
+	}
+	return plugins
 }
 
 // annotateRuntimeSupport stamps each plugin with whether it still supports the

@@ -111,6 +111,32 @@ func TestListInstalled_SaaS_ListErrorFailsSoftEmpty(t *testing.T) {
 	}
 }
 
+// TestListInstalled_LocalDocker_NoDockerClient_DoesNotRideEIC pins BUG-A /
+// core#182: a local-docker (molecules-server) tenant's instance_id is the
+// mol-ws-* CONTAINER NAME, not an "i-<hex>" EC2 id. On the hardened tenant
+// /platform there is no docker client wired (prov==nil, no reachable daemon),
+// so ListInstalled must return [] FAST — it must NOT fall through to the
+// AWS-only EIC path, which with no AWS creds hangs 90-120s and makes the canvas
+// Plugins tab / concierge config_tab_sweep fail "context deadline exceeded".
+func TestListInstalled_LocalDocker_NoDockerClient_DoesNotRideEIC(t *testing.T) {
+	// docker == nil (hardened tenant) + a local-docker CONTAINER-NAME instance_id.
+	h := NewPluginsHandler(t_TempDirNoop(), nil, nil).
+		WithRuntimeLookup(func(string) (string, error) { return "claude-code", nil }).
+		WithInstanceIDLookup(func(string) (string, error) { return "mol-ws-e2e-plgn-abc123", nil })
+	stubListPluginsViaEIC(t, func(context.Context, string, string) ([]string, error) {
+		t.Fatalf("listPluginsViaEIC MUST NOT be called for a local-docker (mol-ws-*) instance_id — that is the 90-120s BUG-A hang")
+		return nil, nil
+	})
+
+	code, plugins := callListInstalled(t, h)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-soft)", code)
+	}
+	if len(plugins) != 0 {
+		t.Fatalf("got %d plugins, want 0 (no docker client, no EIC): %+v", len(plugins), plugins)
+	}
+}
+
 func TestListInstalled_SaaS_RejectsInvalidPluginName(t *testing.T) {
 	h := newSaaSListHandler()
 	stubListPluginsViaEIC(t, func(_ context.Context, _, _ string) ([]string, error) {
