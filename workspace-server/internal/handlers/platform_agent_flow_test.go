@@ -489,3 +489,72 @@ func TestEnsureSelfHostedPlatformAgent_FlowErrorWrapped(t *testing.T) {
 		t.Fatal("want wrapped flow error, got nil")
 	}
 }
+
+// TestEnsurePlatformAgent_ExplicitNameSticksOnExistingRoot: the install upsert
+// preserves name on conflict, so the flow must apply an EXPLICIT caller name
+// (the scene's fixed "Enter OS Agent") to an existing root itself — before the
+// provision trigger, since the {{CONCIERGE_NAME}} substitution reads the row
+// name at provision. Found live in the scratch-stack e2e (core#3496).
+func TestEnsurePlatformAgent_ExplicitNameSticksOnExistingRoot(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-existing", "offline"))
+	mock.ExpectExec(`UPDATE workspaces SET name = \$2, updated_at = now\(\) WHERE id = \$1 AND name IS DISTINCT FROM \$2`).
+		WithArgs("pa-existing", "Enter OS Agent").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	h, cap := ensureTestHandler(t, true)
+	w, body := doEnsureRequest(t, h, `{"name":"Enter OS Agent"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if body["status"] != "repaired" {
+		t.Errorf("status = %v, want repaired", body["status"])
+	}
+	if !cap.provisionCalled {
+		t.Error("provision did not fire after the rename")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("name UPDATE did not run as expected: %v", err)
+	}
+}
+
+// TestEnsurePlatformAgent_DefaultedNameNeverRenames: an empty payload name
+// (boot seed / bare canvas button) must NOT touch an existing root's name.
+func TestEnsurePlatformAgent_DefaultedNameNeverRenames(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-existing", "offline"))
+	// NO ExpectExec: any UPDATE would be unexpected DB activity.
+
+	h, _ := ensureTestHandler(t, true)
+	w, _ := doEnsureRequest(t, h, `{}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected rename on defaulted name: %v", err)
+	}
+}
+
+// TestEnsurePlatformAgent_NameStageError500: a failing rename is a 500 "name
+// failed" and the provision must NOT fire after it.
+func TestEnsurePlatformAgent_NameStageError500(t *testing.T) {
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-existing", "offline"))
+	mock.ExpectExec(`UPDATE workspaces SET name = \$2`).
+		WillReturnError(context.DeadlineExceeded)
+
+	h, cap := ensureTestHandler(t, true)
+	w, body := doEnsureRequest(t, h, `{"name":"Enter OS Agent"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	if body["error"] != "name failed" {
+		t.Errorf("error = %v, want \"name failed\"", body["error"])
+	}
+	if cap.provisionCalled {
+		t.Error("provision fired after the rename failed")
+	}
+}

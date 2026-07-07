@@ -198,12 +198,28 @@ func ensurePlatformAgentFlow(ctx context.Context, database *sql.DB, opts ensureF
 		}
 	}
 
-	name := strings.TrimSpace(opts.Name)
+	callerName := strings.TrimSpace(opts.Name)
+	name := callerName
 	if name == "" {
 		name = defaultPlatformAgentName()
 	}
 	if err := ensureInstallFn(ctx, database, decision.targetID, name, opts.Runtime); err != nil {
 		return out, &flowStageError{Stage: "install", Err: err}
+	}
+
+	// An EXPLICIT caller name must stick on an EXISTING root too: the install
+	// upsert deliberately preserves name on conflict (correct for the CP shim
+	// and the defaulted boot seed), so without this step the onboarding
+	// scene's fixed brand name would silently never apply to the
+	// always-seeded root. Must land BEFORE the provision trigger — the
+	// {{CONCIERGE_NAME}} persona substitution reads the row name at provision.
+	// Defaulted (empty opts.Name) callers never rename.
+	if callerName != "" && found {
+		if _, err := database.ExecContext(ctx,
+			`UPDATE workspaces SET name = $2, updated_at = now() WHERE id = $1 AND name IS DISTINCT FROM $2`,
+			decision.targetID, callerName); err != nil {
+			return out, &flowStageError{Stage: "name", Err: err}
+		}
 	}
 
 	// MODEL secret lands before the provision trigger — see the flow doc.
