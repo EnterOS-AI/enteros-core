@@ -525,20 +525,29 @@ obs_step_end canvas pass "" "routes=workspaces,org_identity,canvas_viewport,requ
 # it as X-Molecule-Org-Slug on every authed fetch (canvas/src/lib/api.ts
 # platformAuthHeaders + canvas/src/lib/tenant.ts getTenantSlug). On staging's
 # 2-level host <slug>.staging.moleculesai.app the OLD suffix-strip derivation
-# produced "<slug>.staging" (it stripped the default .moleculesai.app suffix),
-# which the CP resolveOrgSlug honors verbatim over the trusted Host →
-# LookupOrgBySlug 404 → the operator's in-browser /workspaces 404 that the
-# admin-bearer STEP 2 never reproduces. This cold-open step replays the BROWSER's
-# exact header on a cold open of the fresh org and asserts:
+# produced "<slug>.staging" (it stripped the default .moleculesai.app suffix).
+# The PRE-fix CP resolveOrgSlug honored that bogus header verbatim OVER the
+# trusted Host → LookupOrgBySlug 404 → the operator's in-browser /workspaces 404
+# that the admin-bearer STEP 2 never reproduces. TWO fixes closed it: the canvas
+# now derives the first DNS label (#3408), AND the CP made the trusted Host
+# AUTHORITATIVE over the client X-Molecule-Org-Slug header (controlplane
+# a0ca9507 — unit-pinned in internal/router/resolve_test.go "stale mismatched
+# header, valid host resolves via host"). This cold-open step replays the
+# BROWSER's exact header on a cold open of the fresh org and asserts:
 #   (a) the FIXED first-label slug ("<slug>") → GET /workspaces 200 + JSON array
 #       (the list a cold open must render) AND /workspaces/<id>/chat-history 200;
 #   (b) the OLD suffix-strip slug ("<slug>.staging", when the host is multi-label)
-#       → 404 — a REGRESSION LOCK so the 2-level-subdomain slug bug cannot return.
+#       → STILL 200 — the trusted Host resolves the org and the stale/bogus header
+#       is IGNORED (a valid tenant is never 404'd by a bad client header). This is
+#       a REGRESSION LOCK on the CP host-first repair: if the CP ever regressed to
+#       honoring the header over the Host, this bogus slug would 404 again and the
+#       operator's cold-open /workspaces 404 would return.
 # The tenant bearer + org-id are kept for cross-proxy-mode robustness (the CP
-# rejects a bad slug at resolveOrgSlug BEFORE the tenant is reached, so the slug
-# header is the load-bearing variable under test); Origin mirrors a same-origin
-# canvas XHR. Ref: canvas/src/lib/tenant.ts first-label derivation (core#2509
-# class) + controlplane router resolveOrgSlug.
+# resolves the org from the trusted Host BEFORE the tenant is reached, so the
+# slug header is the load-bearing variable under test — it must NOT flip the
+# outcome); Origin mirrors a same-origin canvas XHR. Ref: canvas/src/lib/tenant.ts
+# first-label derivation (core#2509 class) + controlplane router resolveOrg
+# host-first precedence (a0ca9507).
 obs_step_start cold_open
 log "2.5/6 COLD-OPEN — replaying the browser's X-Molecule-Org-Slug on a cold open of the fresh org..."
 CO_HOST="${TENANT_URL#https://}"; CO_HOST="${CO_HOST%%/*}"
@@ -570,14 +579,18 @@ while :; do
   sleep 6
 done
 ok "COLD-OPEN: GET /workspaces (browser slug '$CO_SLUG_FIRSTLABEL') → 200 + non-empty JSON array (list renders)"
-# (b) REGRESSION LOCK: on a multi-label host the OLD suffix-strip derivation differs
-#     from the first label; that buggy slug MUST 404 (the CP must not serve it),
-#     proving the 2-level-subdomain browser-slug bug (the operator's cold-open 404)
-#     stays dead. Skipped on a single-label host (no distinct bad derivation).
+# (b) REGRESSION LOCK on the CP host-first repair (controlplane a0ca9507): on a
+#     multi-label host the OLD suffix-strip derivation ("<slug>.staging") differs
+#     from the first label. Sending it as X-Molecule-Org-Slug MUST still resolve
+#     200 — the trusted Host is authoritative and the stale/bogus header is
+#     ignored, so a valid tenant is NEVER 404'd by a bad client header. A 404 here
+#     means the CP regressed to header-over-Host and the operator's cold-open
+#     /workspaces 404 has returned. Skipped on a single-label host (no distinct
+#     suffix-strip derivation to exercise).
 if [ "$CO_SLUG_OLD" != "$CO_SLUG_FIRSTLABEL" ]; then
   co_bad=$(cold_open_call "$CO_SLUG_OLD" /workspaces)
-  [ "$co_bad" = "404" ] || fail "COLD-OPEN regression-lock: GET /workspaces with the OLD suffix-strip slug '$CO_SLUG_OLD' returned HTTP $co_bad, expected 404. The 2-level-subdomain browser-slug bug (X-Molecule-Org-Slug: <slug>.staging → in-browser /workspaces 404) is NOT closed."
-  ok "COLD-OPEN regression-lock: OLD suffix-strip slug '$CO_SLUG_OLD' → 404 (2-level-subdomain browser-slug bug stays dead)"
+  [ "$co_bad" = "200" ] || fail "COLD-OPEN regression-lock: GET /workspaces with the OLD suffix-strip slug '$CO_SLUG_OLD' returned HTTP $co_bad, expected 200. The CP must resolve the org from the trusted Host and IGNORE a stale/bogus X-Molecule-Org-Slug header (controlplane a0ca9507 host-first precedence); a non-200 here means the CP regressed to header-over-Host and the 2-level-subdomain in-browser /workspaces 404 has returned."
+  ok "COLD-OPEN regression-lock: OLD suffix-strip slug '$CO_SLUG_OLD' → 200 (trusted Host authoritative; bogus header ignored; 2-level-subdomain 404 stays dead)"
 else
   log "    (single-label host — no distinct suffix-strip derivation to regression-lock)"
 fi
