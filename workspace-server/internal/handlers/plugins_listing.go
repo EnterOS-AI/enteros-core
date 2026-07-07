@@ -37,12 +37,22 @@ func (h *PluginsHandler) listRegistryFiltered(runtime string) []pluginInfo {
 		if runtime != "" && !info.supportsRuntime(runtime) {
 			continue
 		}
-		// The installable handle for a registry entry is its local://
-		// source, derived from the entry's own directory name — the same
-		// string the install pipeline's local resolver accepts. Lets a
-		// catalog consumer (canvas, mgmt-MCP list_available_plugins) go
-		// straight from a listing row to an install call.
-		info.Source = "local://" + e.Name()
+		// The installable handle for a registry entry is its REAL provider
+		// source (e.g. gitea://<owner>/<repo>#<pinned-ref>), derived from the
+		// manifest.json SSOT that also seeds this registry dir. A catalog
+		// consumer (canvas, mgmt-MCP list_available_plugins) passes this
+		// straight to install_plugin, which records it as the workspace's
+		// declared source — and the on-box runtime boot-installer can only
+		// FETCH gitea:// / presign://. The old local://<dir-name> handle was
+		// un-fetchable there ("[plugins] skip unsupported source"), so a
+		// catalog-installed plugin recorded but never loaded. Fall back to
+		// local://<name> for a plugin dir with no manifest entry (a curated
+		// local drop), preserving that escape hatch.
+		if src, ok := pluginInstallSource(e.Name()); ok {
+			info.Source = src
+		} else {
+			info.Source = "local://" + e.Name()
+		}
 		plugins = append(plugins, info)
 	}
 	return plugins

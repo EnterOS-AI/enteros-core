@@ -68,6 +68,12 @@ type manifestEntry struct {
 
 type manifestFile struct {
 	WorkspaceTemplates []manifestEntry `json:"workspace_templates"`
+	// Plugins is the marketplace plugin registry SSOT — the same array
+	// clone-manifest.sh materializes into the on-box plugin registry dir. Each
+	// entry carries the plugin's real provider repo + pinned ref, which the
+	// catalog listing turns into a fetchable install source (gitea://…) instead
+	// of the un-fetchable local://<name> handle. See pluginInstallSourceByName.
+	Plugins []manifestEntry `json:"plugins"`
 }
 
 // joinExternalLikeRuntimesForMessage returns the runtime list as it
@@ -363,6 +369,102 @@ func initTemplateRepoByName() {
 		name := strings.TrimSuffix(e.Name, "-default")
 		templateRepoByName[name] = templateRepoRef{Repo: e.Repo, Ref: e.Ref}
 	}
+}
+
+// pluginInstallSourceByName maps a marketplace plugin's registry name to its
+// canonical installable SOURCE URL, parsed from manifest.json's `plugins`
+// array at boot. It is the fix for the "recorded but never loaded" plugin bug:
+//
+// The catalog listing (plugins_listing.go) previously stamped every entry with
+// `local://<dir-name>`. `local://` is a curated-registry handle the on-box
+// runtime boot-installer (molecule-ai-workspace-runtime plugin_sources._PROVIDERS)
+// does NOT accept — it fetches only `gitea://` / `presign://`. So an agent that
+// installed a catalog entry recorded `local://<name>` in workspace_declared_plugins,
+// and every boot logged `[plugins] skip unsupported source: local://<name>` and
+// the plugin never materialized on disk. Deriving the source from the manifest's
+// real provider repo + pinned ref makes the catalog offer a source the box can
+// actually fetch — the operator principle "the registry holds real provider
+// URLs, never local://".
+//
+// Empty for a plugin dir with no manifest entry (a hand-dropped local plugin) —
+// the listing falls back to `local://<name>` for those, preserving the curated-
+// registry escape hatch. Populated once at boot (init() below), mirroring
+// templateRepoByName; empty in unit tests that don't run the init chain, so the
+// listing's local:// fallback keeps those tests unchanged.
+var pluginInstallSourceByName = make(map[string]string)
+
+// initPluginInstallSourceByName populates pluginInstallSourceByName from
+// manifest.json. Wired into the package init chain alongside
+// initTemplateRepoByName. Idempotent — RESETS the map each call so a manifest
+// that drops a plugin doesn't leave a stale source resolvable.
+func initPluginInstallSourceByName() {
+	pluginInstallSourceByName = loadPluginInstallSources(manifestPath())
+}
+
+// loadPluginInstallSources parses manifest.json's `plugins` array into a
+// name → source-URL map. Provider-aware per the manifest _provider_contract:
+// the default (absent) / "moleculesai" provider resolves to a `gitea://` URL,
+// "github" to `github://`. An entry with an empty repo — or an unknown
+// provider whose scheme the install pipeline doesn't register — is skipped
+// (no map entry), so the listing falls back to `local://<name>` rather than
+// offer an un-fetchable scheme. Never errors: a missing/oversized/unparseable
+// manifest yields an empty map (listing degrades to local://, prior behaviour).
+func loadPluginInstallSources(path string) map[string]string {
+	out := map[string]string{}
+	if path == "" {
+		return out
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	var m manifestFile
+	if err := json.Unmarshal(data, &m); err != nil {
+		return out
+	}
+	for _, e := range m.Plugins {
+		name := strings.TrimSpace(e.Name)
+		if name == "" {
+			continue
+		}
+		if src := pluginSourceURL(e.Provider, strings.TrimSpace(e.Repo), strings.TrimSpace(e.Ref)); src != "" {
+			out[name] = src
+		}
+	}
+	return out
+}
+
+// pluginSourceURL builds the `scheme://<owner>/<repo>[#<ref>]` install source
+// for a manifest plugin entry, honoring the manifest _provider_contract. Only
+// schemes the platform install pipeline registers (gitea, github — see
+// NewPluginsHandler) are emitted; an unknown provider or empty repo yields ""
+// so the caller falls back to local://<name>.
+func pluginSourceURL(provider, repo, ref string) string {
+	if repo == "" {
+		return ""
+	}
+	var scheme string
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "", "moleculesai":
+		scheme = "gitea"
+	case "github":
+		scheme = "github"
+	default:
+		return "" // unknown provider — caller falls back to local://
+	}
+	url := scheme + "://" + repo
+	if ref != "" {
+		url += "#" + ref
+	}
+	return url
+}
+
+// pluginInstallSource returns the manifest-derived install source for a plugin
+// registry name, or ("", false) when the plugin has no manifest entry (caller
+// falls back to local://<name>).
+func pluginInstallSource(name string) (string, bool) {
+	src, ok := pluginInstallSourceByName[name]
+	return src, ok && src != ""
 }
 
 // templateIdentityForRuntime returns the Gitea template identity
