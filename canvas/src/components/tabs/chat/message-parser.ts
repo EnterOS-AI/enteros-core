@@ -135,7 +135,9 @@ export function extractRequestText(body: Record<string, unknown> | null): string
  *  (molecule_runtime/a2a_executor.py) and the server's selfSourceTypes
  *  (workspace-server/internal/messagestore/postgres_store.go). The
  *  canonical case is the heartbeat delegation-result harvester
- *  ("Delegation results are ready …"). */
+ *  ("Delegation results are ready …"). "self-warmup" is the platform-fired
+ *  concierge readiness probe ("Platform readiness check — no action needed."),
+ *  a heartbeat internal that used to leak as a blue user bubble. */
 export const SELF_SOURCE_TYPES: ReadonlySet<string> = new Set<string>([
   "self-cron",
   "self-harvester",
@@ -143,6 +145,7 @@ export const SELF_SOURCE_TYPES: ReadonlySet<string> = new Set<string>([
   "self-scheduler",
   "self-goal-nudge",
   "self-delegation-result",
+  "self-warmup",
 ]);
 
 /** Read the typed source marker the runtime stamps on outbound

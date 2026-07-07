@@ -165,6 +165,19 @@ type RegistryHandler struct {
 	// conciergeWarmupTimeout, two can't be in flight. A CP restart re-warms
 	// (acceptable — a fresh process has no live capture state).
 	warmedConcierges sync.Map
+	// warmedDelivered records concierges whose warmup turn was DELIVERED
+	// successfully (a 2xx from the agent) at least once this process lifetime.
+	// Keyed by workspace ID → true. Once set, fireConciergeWarmup STOPS
+	// re-firing: the warmup exists only to trigger ONE successful turn that runs
+	// the per-turn loaded_mcp_tools capture, so a second, third … fire after a
+	// clean delivery cannot help (an under-emitting loaded_mcp_tools producer,
+	// runtime#181, is not fixed by re-warming) and only spams the chat pane with
+	// a repeating readiness-probe row every conciergeWarmupTimeout — the demo
+	// leak. Real user turns remain the capture fallback and a CP restart clears
+	// this map (a fresh process re-warms once). A warmup that FAILED to deliver
+	// is NOT recorded, so the existing conciergeWarmupTimeout retry still
+	// self-heals a transient/cold miss.
+	warmedDelivered sync.Map
 }
 
 // mcpRecoveryCooldown bounds how often a single concierge's RCA#2970
@@ -269,11 +282,23 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 // a delegation — exactly right for a platform-initiated self-turn.
 const conciergeWarmupCaller = "system:concierge-warmup"
 
-// conciergeWarmupText is the benign user-visible message body of the warmup
-// turn. It is a no-op readiness check — the concierge needs only to RUN a turn
-// (which fires the per-turn loaded_mcp_tools capture); the content is
-// immaterial. Kept short and self-explanatory in case it ever surfaces.
+// conciergeWarmupText is the benign message body of the warmup turn. It is a
+// no-op readiness check — the concierge needs only to RUN a turn (which fires
+// the per-turn loaded_mcp_tools capture); the content is immaterial. It is
+// stamped with conciergeWarmupSourceType so the chat-history reader classifies
+// the row as an internal self-message (system/notice) and it NEVER renders as a
+// blue user bubble — see conciergeWarmupSourceType.
 const conciergeWarmupText = "Platform readiness check — no action needed."
+
+// conciergeWarmupSourceType is the params.metadata.source_type marker stamped on
+// the warmup turn. It is a member of the SSOT self-source-type set
+// (messagestore.selfSourceTypes / canvas message-parser selfSourceTypes /
+// runtime _ROUTINE_SELF_SOURCE_TYPES), so the chat-history reader classifies the
+// warmup a2a_receive row Role="system" (SystemKind="notice") instead of the
+// blue user bubble it used to leak as (the readiness-probe was a heartbeat
+// internal, never a human turn). The value MUST stay in lock-step with the
+// "self-warmup" entry in those three registries.
+const conciergeWarmupSourceType = "self-warmup"
 
 // conciergeWarmupTimeout bounds the warmup A2A POST so the detached goroutine
 // can never leak. A cold first turn (model warmup + MCP enumeration) can take
@@ -299,11 +324,21 @@ func buildConciergeWarmupBody(workspaceID string) ([]byte, error) {
 		"id":      warmupID,
 		"method":  "message/send",
 		"params": map[string]interface{}{
+			// source_type at the params.metadata sibling of message is the
+			// CANONICAL location the reader (messagestore.RequestSourceType)
+			// checks first, and the location proven to survive
+			// normalizeA2APayload + persistence (self-harvester rows on prod
+			// land here). Stamping it marks the warmup row internal so it is
+			// classified system/notice, never a user bubble.
+			"metadata": map[string]interface{}{"source_type": conciergeWarmupSourceType},
 			"message": map[string]interface{}{
 				"role":      "user",
 				"messageId": warmupID,
 				"parts":     []map[string]interface{}{{"kind": "text", "text": conciergeWarmupText}},
-				"metadata":  map[string]interface{}{"concierge_warmup": true},
+				// Mirror source_type on the message.metadata fallback location
+				// too (RequestSourceType checks it second) so classification is
+				// robust regardless of which metadata slot a normalizer keeps.
+				"metadata": map[string]interface{}{"concierge_warmup": true, "source_type": conciergeWarmupSourceType},
 			},
 		},
 	})
@@ -334,6 +369,13 @@ func buildConciergeWarmupBody(workspaceID string) ([]byte, error) {
 // that has its model + management MCP server present (the #3082 gate passed).
 func (h *RegistryHandler) fireConciergeWarmup(ctx context.Context, workspaceID string) {
 	if h.warmupSend == nil || workspaceID == "" {
+		return
+	}
+	// Fire-once: a warmup already DELIVERED successfully this process lifetime is
+	// never re-fired. The one clean turn already ran the per-turn capture; more
+	// fires only repeat the readiness-probe row (the demo chat leak) without
+	// helping. See warmedDelivered. A CP restart clears the map → re-warms once.
+	if _, delivered := h.warmedDelivered.Load(workspaceID); delivered {
 		return
 	}
 	// Throttle: re-fire at most once per conciergeWarmupTimeout. The Load+Store
@@ -372,7 +414,16 @@ func (h *RegistryHandler) fireConciergeWarmup(ctx context.Context, workspaceID s
 			log.Printf("Heartbeat: concierge warmup turn for %s failed (status=%d): %v — best-effort, status unaffected; per-turn capture on a real turn remains the fallback", wsID, status, sErr)
 			return
 		}
-		log.Printf("Heartbeat: concierge warmup turn for %s delivered (status=%d) — per-turn loaded_mcp_tools capture should publish on the next heartbeat", wsID, status)
+		// Delivered cleanly (2xx). Record it so the warmup is not re-fired every
+		// conciergeWarmupTimeout — the single successful turn already drove the
+		// per-turn capture; further fires would only repeat the readiness-probe
+		// chat row. A non-2xx "delivery" (httpx does not raise on 4xx/5xx) means
+		// the agent was NOT woken, so leave warmedDelivered UNset and let the
+		// timeout retry fire again.
+		if status >= 200 && status < 300 {
+			h.warmedDelivered.Store(wsID, true)
+		}
+		log.Printf("Heartbeat: concierge warmup turn for %s delivered (status=%d) — per-turn loaded_mcp_tools capture should publish on the next heartbeat; warmup will not re-fire this process (fire-once)", wsID, status)
 	})
 }
 

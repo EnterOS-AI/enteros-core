@@ -158,6 +158,41 @@ func TestChatHistory_TaggedNonSelfSourceStaysUser(t *testing.T) {
 	}
 }
 
+// TestChatHistory_ClassifiesConciergeWarmupAsSystem pins the concierge
+// readiness-probe warmup leak fix. The platform fires a warmup turn
+// ("Platform readiness check — no action needed.") stamped with
+// params.metadata.source_type = "self-warmup" (handlers.buildConciergeWarmupBody).
+// It is a heartbeat internal, never a human turn, and MUST be classified
+// system/notice — it used to render as a blue user bubble because it carried
+// no source_type marker. The body mirrors the exact shape the warmup builder
+// emits (source_type on BOTH params.metadata and message.metadata).
+func TestChatHistory_ClassifiesConciergeWarmupAsSystem(t *testing.T) {
+	body := json.RawMessage(`{"params":{"metadata":{"source_type":"self-warmup"},"message":{"parts":[{"kind":"text","text":"Platform readiness check — no action needed."}],"metadata":{"concierge_warmup":true,"source_type":"self-warmup"}}}}`)
+	msgs := activityRowToChatMessages("row-warmup", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 system message (surfaced, not dropped), got %d", len(msgs))
+	}
+	if msgs[0].Role != "system" || msgs[0].SystemKind != "notice" {
+		t.Errorf("concierge warmup classified role=%q kind=%q; want system/notice (must NEVER be a user bubble)", msgs[0].Role, msgs[0].SystemKind)
+	}
+}
+
+// TestChatHistory_ClassifiesDelegationResultAsSystem pins the delegation-result
+// notification leak fix. The heartbeat harvester POSTs "Delegation results are
+// ready …" back to the agent stamped with a self-source-type marker; here we
+// use the canonical "self-delegation-result" value. It MUST be classified
+// system/notice by the typed marker, never a user bubble.
+func TestChatHistory_ClassifiesDelegationResultAsSystem(t *testing.T) {
+	body := json.RawMessage(`{"params":{"metadata":{"source_type":"self-delegation-result"},"message":{"parts":[{"kind":"text","text":"Delegation results are ready (from a2a_receive via activity_logs). Review them and take appropriate action."}]}}}`)
+	msgs := activityRowToChatMessages("row-deleg", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 system message, got %d", len(msgs))
+	}
+	if msgs[0].Role != "system" || msgs[0].SystemKind != "notice" {
+		t.Errorf("delegation-result classified role=%q kind=%q; want system/notice (must NEVER be a user bubble)", msgs[0].Role, msgs[0].SystemKind)
+	}
+}
+
 func TestChatHistory_NoUserMessageWhenRequestBodyNull(t *testing.T) {
 	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil)
 	for _, m := range msgs {
