@@ -343,3 +343,37 @@ Phase ordering is the rollout contract:
 *Derived from a read-only multi-agent source audit of `molecule-core`, `molecule-controlplane`,
 `molecule-ai-workspace-runtime`, `molecule-ai-workspace-template-claude-code`, and
 `molecule-mcp-server`. No secret values recorded.*
+
+---
+
+## Addendum (2026-07-07): unconditional self-host seed, one ensure flow, self-host onboarding scene
+
+Design SSOT: [`rfc-selfhost-onboarding-scene.md`](rfc-selfhost-onboarding-scene.md)
+(tracking [#3496](https://git.moleculesai.app/molecule-ai/molecule-core/issues/3496));
+decision record: [ADR-004](../adr/ADR-004-unconditional-concierge-and-one-ensure-flow.md).
+The sections above are retained as written; three things changed:
+
+- **Concierge existence is unconditional on self-host.** The boot seed runs on
+  every start whenever `MOLECULE_ORG_ID` is unset — the opt-in
+  `MOLECULE_SEED_PLATFORM_AGENT` flag is **removed**. The seed is idempotent
+  (existing root ⇒ no-op). On SaaS (org id set) the tenant server still never
+  self-seeds; the CP remains the sole creator, byte-identical to before. An
+  unconfigured root stays `offline` (boot provision skipped) until the
+  first-run scene — or the headless envs `MOLECULE_DEFAULT_RUNTIME` +
+  `MOLECULE_LLM_DEFAULT_MODEL` + a provider key — configures it.
+- **One-flow consolidation.** The concierge lifecycle top-halves (HTTP ensure
+  handler, boot seed, CP install endpoint) collapse onto a single service
+  function, `ensurePlatformAgentFlow` (decide → install → name/model write →
+  optional provision trigger). The HTTP `/ensure` handler and the boot seed
+  are thin adapters over it; the legacy CP install endpoint
+  `POST /admin/org/platform-agent` is a contract-frozen row-only shim over the
+  same flow until the CP migrates to `/ensure`, then it is deleted. The CP
+  contract never changes in the interim.
+- **Platform-runtime guard.** Both AdminAuth endpoints now reject
+  external-like/mock/unknown runtimes for `kind='platform'` with 422 —
+  previously the payload runtime was stamped verbatim, which could wedge a
+  concierge on a runtime the provisioner silently no-ops on.
+
+The self-host first-run UX (gated fullscreen scene: runtime/provider/model
+cascading dropdowns + API key, fixed name "Enter OS Agent") lives entirely in
+the new RFC.
