@@ -68,6 +68,21 @@ export default defineConfig({
         'src/**/*.d.ts',
         'src/types/**',
       ],
+      // Self-host onboarding scene — operator ruling (design SSOT §10.1):
+      // 100% line+branch coverage is a HARD GATE on every file the feature
+      // added. Per-glob thresholds so the gate is scoped to these modules
+      // (the repo-wide baseline gate is tracked separately, #1815).
+      thresholds: {
+        'src/lib/workspace-status.ts': {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        'src/lib/workspace-error-codes.ts': {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        'src/components/onboarding/**': {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+      },
     },
   },
   resolve: {

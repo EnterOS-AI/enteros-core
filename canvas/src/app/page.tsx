@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { ConciergeShell } from "@/components/concierge/ConciergeShell";
 import { MobileApp } from "@/components/mobile/MobileApp";
+import { SelfHostSetupScene } from "@/components/onboarding/SelfHostSetupScene";
 import { Spinner } from "@/components/Spinner";
 import { connectSocket, disconnectSocket } from "@/store/socket";
 import { useCanvasStore } from "@/store/canvas";
@@ -85,9 +86,17 @@ export default function Home() {
     return <PlatformDownDiagnostic />;
   }
 
+  // The self-host first-run gate renders as a fullscreen blocking overlay
+  // ABOVE the desktop/mobile view switch (one scene covers both surfaces).
+  // AuthGate (layout.tsx) wraps this page, so the scene is a sibling gate
+  // inside it. It mounts only on these post-hydration branches — never while
+  // `hydrating` holds the spinner — so it cannot flash before the first
+  // /workspaces hydration completes; its own gate (fail-closed-to-invisible)
+  // keeps it from ever rendering on SaaS/CP-provisioned tenants.
   if (isMobile) {
     return (
       <>
+        <SelfHostSetupScene />
         <MobileApp />
         {hydrationError && (
           <div
@@ -113,6 +122,7 @@ export default function Home() {
 
   return (
     <>
+      <SelfHostSetupScene />
       <ConciergeShell />
       {hydrationError && (
         <div
