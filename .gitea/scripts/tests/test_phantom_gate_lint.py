@@ -220,3 +220,56 @@ def test_fetch_workflow_states_parses_name_state_file():
         "state": "disabled_manually",
         "file": "e2e-staging-saas.yml",
     }
+
+
+# ---------------------------------------------------------------------------
+# Guard F TRIGGER promotion (#3467): the phantom-gate lint must ALSO run on
+# pull_request so a phantom RED-blocks the PR pre-merge (under the `[*]`
+# all-green branch protection) instead of only being detected post-merge on
+# push:[main]. These tests are the fail-before/pass-after proof for the TRIGGER
+# change: drop the pull_request trigger (revert the fix) and
+# test_guard_f_runs_on_pull_request fails; drop push:[main] or workflow_dispatch
+# and test_guard_f_keeps_push_main_and_dispatch fails.
+# ---------------------------------------------------------------------------
+import yaml  # noqa: E402  (grouped with the trigger-regression tests)
+
+_WORKFLOW = (
+    Path(__file__).resolve().parents[2] / "workflows" / "lint-phantom-gate.yml"
+)
+
+
+def _load_on_block():
+    doc = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+    # PyYAML (YAML 1.1) resolves the bare `on:` key to the boolean True, so a
+    # workflow's trigger block can live under either the string "on" or True.
+    if isinstance(doc, dict) and "on" in doc:
+        return doc["on"]
+    if isinstance(doc, dict) and True in doc:
+        return doc[True]
+    raise AssertionError(f"no on: block found in {_WORKFLOW}")
+
+
+def test_guard_f_runs_on_pull_request():
+    """The promotion: Guard F must be triggered on pull_request so a phantom
+    RED-blocks the PR pre-merge, not only post-merge on push:[main]."""
+    on = _load_on_block()
+    assert isinstance(on, dict), f"unexpected on: block shape: {on!r}"
+    assert "pull_request" in on, (
+        "Guard F (lint-phantom-gate) must run on pull_request so a phantom "
+        "required-context RED-blocks the PR BEFORE it merges (not only "
+        "post-merge on push:[main]) — regression-prevention-guards.md §Guard F "
+        "/ #3467."
+    )
+
+
+def test_guard_f_keeps_push_main_and_dispatch():
+    """Promotion is ADDITIVE: the push:[main] regression detector and the
+    on-demand workflow_dispatch trigger must remain."""
+    on = _load_on_block()
+    assert "workflow_dispatch" in on, "on-demand dispatch trigger must remain"
+    push = on.get("push")
+    assert isinstance(push, dict), f"push: trigger must remain a mapping, got {push!r}"
+    assert "main" in (push.get("branches") or []), (
+        "push:[main] regression detector must remain — it guards MAIN, where a "
+        "workflow toggle-off actually lands."
+    )

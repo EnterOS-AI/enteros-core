@@ -14,26 +14,41 @@
 # marker) and, for each entry, asserts its producer workflow's Gitea Actions
 # state is `active`. It FAILS RED on a phantom.
 #
-# TRIGGERS — sequenced enablement (regression-prevention-guards.md + #3467):
-#   - `push: [main]` (regression detector) + `workflow_dispatch` (on-demand)
-#     ONLY. Deliberately NOT `pull_request` yet. Under the `[*]` all-green BP a
-#     `pull_request` run that goes RED blocks the PR from merging; while a
-#     phantom currently EXISTS (e2e-staging-saas is disabled until Guard B /
-#     #3464 re-enables it), a pull_request trigger would RED-block EVERY open PR
-#     the moment this workflow lands on main — a self-inflicted repo-wide wedge.
-#   - So this ships as a push-to-main + dispatch AUDIT gate: it guards MAIN
-#     (where a workflow toggle-off actually happens) and is safe to merge in ANY
-#     order relative to #3464. A red on main here is TRUE signal (a phantom
-#     exists) surfaced to main-red-watchdog; it is NOT a queue-pause (not a
-#     PUSH_REQUIRED_CONTEXT) and NOT a PR-block.
-#   - PROMOTION to a full required PR gate (add `pull_request` + the context to
-#     `.gitea/required-contexts.txt` ENFORCED + flip the directive to
-#     `bp-required: yes`) is the sequenced follow-up in #3467, done ONLY AFTER
-#     the phantom is resolved so Guard F is green.
+# TRIGGERS — PROMOTED to a PR-time gate (regression-prevention-guards.md + #3467):
+#   - `pull_request` — the promotion. Under the `[*]` all-green branch protection
+#     a red status on the PR head blocks the merge, so running Guard F on PRs
+#     makes a phantom (an ENFORCED required-context whose producer is disabled /
+#     missing) RED-BLOCK the PR BEFORE it lands, instead of only being detected
+#     post-merge on push:[main]. This was gated behind "phantom must be resolved
+#     first" (a live phantom would RED-block every open PR = repo-wide wedge);
+#     that precondition now HOLDS — e2e-staging-saas was re-enabled (Guard B /
+#     #3464 landed, task #231/#232) so all ENFORCED producers are `active` and
+#     Guard F is GREEN on main. It is safe to run on every relevant PR because it
+#     PASSES on a clean main and only goes red on a REAL phantom — which SHOULD
+#     block merges until the producer is re-enabled or the context is parked
+#     below a `# pending-#NNNN` marker. Scoped with `paths:` to the files that
+#     can INTRODUCE a phantom in a PR diff (required-contexts.txt SSOT, any
+#     workflow file, the detector script, this test) so it does not run on every
+#     unrelated PR; the out-of-band "producer toggled off via the Actions API"
+#     case (not a file change) stays covered by the push:[main] detector below.
+#   - `push: [main]` — regression detector on the branch where a workflow
+#     toggle-off actually lands. A red on main is TRUE signal surfaced to
+#     main-red-watchdog.
+#   - `workflow_dispatch` — on-demand audit.
+#
+# NOT-A-WEDGE contract: Guard F is NOT listed in `.gitea/required-contexts.txt`
+# and NOT an individual BP context, so the merge queue never WAITS for it; under
+# `[*]` only POSTED statuses are required, so a `paths`-skipped PR (no status
+# posted) is not blocked. A green Guard F is the common case; a red one is a real
+# phantom that SHOULD hold the queue. (The `bp-required: pending #3467` directive
+# stays `pending` — the literal context can never be individually listed while BP
+# is the `[*]` wildcard; the wildcard itself provides the enforcement.)
 #
 # FAIL-BEFORE proof (verified live, HTTPS = CI path): flags
 # `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
 # (producer disabled_manually) RED while the re-enabled hermetic gate PASSES.
+# TRIGGER regression is covered by test_phantom_gate_lint.py
+# (`test_guard_f_runs_on_pull_request` / `test_guard_f_keeps_push_main_and_dispatch`).
 #
 # Behaviour-based gate: the decision logic lives in ci-required-drift.py
 # (`--phantom-gate-lint`) with fail-before/pass-after unit tests in
@@ -45,6 +60,17 @@
 name: lint-phantom-gate
 
 on:
+  # PR-time gate (#3467 promotion). Scoped to the files that can INTRODUCE a
+  # phantom in a PR diff: the enforced-contexts SSOT, any workflow file (a
+  # rename/delete of a producer is a P2 phantom), the detector itself, and this
+  # regression test. Under the `[*]` all-green BP a red here blocks the PR.
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.gitea/required-contexts.txt'
+      - '.gitea/workflows/**'
+      - '.gitea/scripts/ci-required-drift.py'
+      - '.gitea/scripts/tests/test_phantom_gate_lint.py'
   push:
     branches: [main]
   workflow_dispatch:
@@ -58,11 +84,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # New status emission. It is a REAL gate (not bp-exempt) but not yet in BP /
-  # required-contexts.txt: promotion to a required PR gate is sequenced behind
-  # phantom-resolution, so it is acknowledged-pending per
-  # lint-required-context-exists-in-bp (Tier 2g). Directive must stay within
-  # 3 lines of the job key:
+  # REAL gate (not bp-exempt). It now emits on pull_request, so under the `[*]`
+  # wildcard BP its status is merge-blocking. The directive stays `pending` — not
+  # `yes` — because Tier 2g (lint-required-context-exists-in-bp) validates
+  # `bp-required: yes` by requiring the LITERAL context in
+  # branch_protections.status_check_contexts, which is `['*']` here; the wildcard
+  # already enforces it, so the literal listing is intentionally never added.
+  # Directive must stay within 3 lines of the job key:
   # bp-required: pending #3467
   lint-phantom-gate:
     name: lint-phantom-gate
