@@ -26,7 +26,6 @@ import { TemplatePalette } from "./TemplatePalette";
 import { ApprovalBanner } from "./ApprovalBanner";
 import { BundleDropZone } from "./BundleDropZone";
 import { EmptyState } from "./EmptyState";
-import { OnboardingWizard } from "./OnboardingWizard";
 import { SearchDialog } from "./SearchDialog";
 import { Toaster, showToast } from "./Toaster";
 import { Toolbar } from "./Toolbar";
@@ -397,7 +396,6 @@ function CanvasInner() {
 
         {nodes.length === 0 && <EmptyState />}
         <A2ATopologyOverlay />
-        <OnboardingWizard />
         <Toolbar />
         <ApprovalBanner />
         <BundleDropZone />

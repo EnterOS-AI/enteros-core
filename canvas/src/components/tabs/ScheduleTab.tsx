@@ -284,7 +284,7 @@ export function ScheduleTab({ workspaceId }: Props) {
               // Was bg-accent-strong hover:bg-accent — accent is the
               // LIGHTER variant, so this hovered lighter on white text
               // and dropped contrast below AA. Same trap fixed in
-              // OnboardingWizard, ConfirmDialog, ApprovalBanner.
+              // ConfirmDialog, ApprovalBanner.
               className="text-[11px] px-3 py-1 bg-accent text-white rounded hover:bg-accent-strong disabled:opacity-40 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
             >
               {editId ? "Update" : "Create"}

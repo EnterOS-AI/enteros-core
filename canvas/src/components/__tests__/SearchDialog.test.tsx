@@ -40,8 +40,6 @@ vi.mock("@/store/canvas", () => ({
   ),
 }));
 
-const STORAGE_KEY = "molecule-onboarding-complete";
-
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function dispatchKeydown(key: string, meta = false, ctrl = false) {

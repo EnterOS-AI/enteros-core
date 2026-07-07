@@ -115,7 +115,6 @@ vi.mock("../ContextMenu", () => ({ ContextMenu: () => null }));
 vi.mock("../SearchDialog", () => ({ SearchDialog: () => null }));
 vi.mock("../ConfirmDialog", () => ({ ConfirmDialog: () => null }));
 vi.mock("../TemplatePalette", () => ({ TemplatePalette: () => null }));
-vi.mock("../OnboardingWizard", () => ({ OnboardingWizard: () => null }));
 vi.mock("../ApprovalBanner", () => ({ ApprovalBanner: () => null }));
 vi.mock("../BundleDropZone", () => ({ BundleDropZone: () => null }));
 vi.mock("../CreateWorkspaceDialog", () => ({ CreateWorkspaceButton: () => null }));
