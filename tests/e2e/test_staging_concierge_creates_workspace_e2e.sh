@@ -110,25 +110,27 @@
 #      platform-agent image / never came online) — false-green guard
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 # shellcheck disable=SC1091
 # shellcheck source=_lib.sh
-source "$(dirname "$0")/_lib.sh"
+source "$SCRIPT_DIR/_lib.sh"
 # AWS-leak-check lib — same teardown leak assertion the full-SaaS harness uses.
 # shellcheck disable=SC1091
 # shellcheck source=lib/aws_leak_check.sh
-source "$(dirname "$0")/lib/aws_leak_check.sh"
+source "$SCRIPT_DIR/lib/aws_leak_check.sh"
 # Real-completion error-as-text scanner — used to detect the concierge
 # surfacing its tool/LLM error AS a reply ("Agent error …") so a broken agent
 # can't read as "asked but politely declined".
 # shellcheck disable=SC1091
 # shellcheck source=lib/completion_assert.sh
-source "$(dirname "$0")/lib/completion_assert.sh"
+source "$SCRIPT_DIR/lib/completion_assert.sh"
 # SSOT for the platform MCP management tool verb. Sourcing this gives us
 # PLATFORM_MCP_REQUIRED_TOOL and PLATFORM_MCP_REQUIRED_TOOL_ID so the test
 # cannot drift from the real tool name again.
 # shellcheck disable=SC1091
 # shellcheck source=lib/provision_tool_ssot.sh
-source "$(dirname "$0")/lib/provision_tool_ssot.sh"
+source "$SCRIPT_DIR/lib/provision_tool_ssot.sh"
 # Structured observability → Loki/Grafana: every step below emits a tagged
 # event (e2e_run_id + env + git_sha + step + status + duration_secs + error)
 # so a failed run renders as a TIMELINE in the e2e-runs Grafana dashboard
@@ -136,7 +138,7 @@ source "$(dirname "$0")/lib/provision_tool_ssot.sh"
 # stack never fails or slows this gate. See tests/e2e/lib/obs.sh.
 # shellcheck disable=SC1091
 # shellcheck source=lib/obs.sh
-source "$(dirname "$0")/lib/obs.sh"
+source "$SCRIPT_DIR/lib/obs.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
@@ -230,6 +232,112 @@ skip_loud() {
   fi
   [ -n "${OBS_RUN_ID:-}" ] && obs_fail_current skip "$*"
   exit 0
+}
+
+safe_body_preview() {
+  local limit="${2:-400}"
+  { printf '%s' "$1" | redact_secrets | head -c "$limit"; } || true
+}
+
+extract_a2a_text() {
+  python3 "$SCRIPT_DIR/lib/a2a_text_extract.py"
+}
+
+a2a_text_has_expected() {
+  local text="$1"
+  local expected="$2"
+  printf '%s' "$text" | tr '[:lower:]' '[:upper:]' | grep -qF -- "$(printf '%s' "$expected" | tr '[:lower:]' '[:upper:]')"
+}
+
+a2a_queue_id_from_response() {
+  python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+queued = d.get('queued') is True or str(d.get('status') or '').lower() == 'queued'
+qid = d.get('queue_id') or ''
+if queued and isinstance(qid, str):
+    print(qid)
+" 2>/dev/null
+}
+
+a2a_queue_response_body() {
+  python3 -c "
+import json, sys
+try:
+    body = json.load(sys.stdin).get('response_body')
+except Exception:
+    sys.exit(0)
+if body is not None:
+    print(json.dumps(body))
+" 2>/dev/null
+}
+
+poll_a2a_queue_result() {
+  local ws_id="$1"
+  local queue_id="$2"
+  local out_file="$3"
+  local label="$4"
+  local poll_tmp qstatus resp code rc poll_attempt
+  poll_tmp="$TMPDIR_E2E/${label//[^a-zA-Z0-9]/_}_queue"
+
+  for poll_attempt in $(seq 1 30); do
+    : >"$poll_tmp"
+    set +e
+    code=$(tenant_call GET "/workspaces/$ws_id/a2a/queue/$queue_id" \
+      --max-time 30 \
+      -H "X-Workspace-ID: $ws_id" \
+      -o "$poll_tmp" \
+      -w '%{http_code}' \
+      2>/dev/null)
+    rc=$?
+    set -e
+    code=${code:-000}
+    resp=$(cat "$poll_tmp" 2>/dev/null || echo "")
+
+    if [ "$rc" != "0" ] || [ "$code" = "000" ] || [ "$code" = "404" ]; then
+      log "    $label queue poll attempt $poll_attempt/30: curl_rc=$rc http=$code — retrying"
+      sleep 2
+      continue
+    fi
+    if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+      fail "$label queue poll failed (http=$code): $(safe_body_preview "$resp" 400)"
+    fi
+
+    qstatus=$(printf '%s' "$resp" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('status', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+    case "$qstatus" in
+      completed)
+        local response_body
+        response_body=$(printf '%s' "$resp" | a2a_queue_response_body || echo "")
+        if [ -n "$response_body" ]; then
+          printf '%s' "$response_body" >"$out_file"
+          return 0
+        fi
+        ;;
+      failed|dropped)
+        fail "$label queue item $queue_id terminal status=$qstatus: $(safe_body_preview "$resp" 400)"
+        ;;
+      queued|dispatched|in_progress|"")
+        log "    $label queue poll attempt $poll_attempt/30 status=${qstatus:-<empty>} — retrying"
+        sleep 2
+        ;;
+      *)
+        fail "$label queue poll unexpected status=$qstatus: $(safe_body_preview "$resp" 400)"
+        ;;
+    esac
+  done
+
+  fail "$label queue poll timed out waiting for $queue_id to complete"
 }
 
 CURL_COMMON=(-sS --max-time 30)
@@ -751,6 +859,12 @@ for A2A_ATTEMPT in $(seq 1 8); do
   A2A_CODE=${A2A_CODE:-000}
   A2A_RESP=$(cat "$A2A_TMP" 2>/dev/null || echo "")
   if [ "$A2A_RC" = "0" ] && [ "$A2A_CODE" -ge 200 ] && [ "$A2A_CODE" -lt 300 ]; then
+    A2A_QID=$(printf '%s' "$A2A_RESP" | a2a_queue_id_from_response || echo "")
+    if [ -n "$A2A_QID" ]; then
+      log "    create-team A2A queued (queue_id=$A2A_QID); polling durable result"
+      poll_a2a_queue_result "$CONCIERGE_ID" "$A2A_QID" "$A2A_TMP" "create-team A2A"
+      A2A_RESP=$(cat "$A2A_TMP" 2>/dev/null || echo "")
+    fi
     A2A_OK=1
     break
   fi
@@ -765,13 +879,11 @@ if [ "$A2A_OK" != "1" ]; then
   # "agent declined" — distinct from the assertion below.
   fail "A2A POST /workspaces/$CONCIERGE_ID/a2a failed (curl_rc=$A2A_RC, http=$A2A_CODE) after $A2A_ATTEMPT attempt(s): $(echo "$A2A_RESP" | head -c 400)"
 fi
-AGENT_TEXT=$(echo "$A2A_RESP" | python3 -c "
-import sys, json
-try: d = json.load(sys.stdin)
-except Exception: print(''); sys.exit(0)
-parts = (d.get('result') or {}).get('parts', []) if isinstance(d, dict) else []
-print(parts[0].get('text','') if parts else '')" 2>/dev/null || echo "")
+AGENT_TEXT=$(printf '%s' "$A2A_RESP" | extract_a2a_text 2>/dev/null || echo "")
 log "    concierge replied (first 300 chars): $(echo "$AGENT_TEXT" | head -c 300)"
+if [ -z "$AGENT_TEXT" ]; then
+  log "    concierge A2A text extraction empty; response body: $(safe_body_preview "$A2A_RESP" 300)"
+fi
 obs_step_end create_team_a2a pass "" "http_code=$A2A_CODE" "attempts=$A2A_ATTEMPT"
 
 # ─── 6. ASSERT the deterministic side effect: the worker now EXISTS ───────────
@@ -947,7 +1059,7 @@ print(json.dumps({
         'parts': [{'kind': 'text', 'text': os.environ['WORK_PROMPT']}]}}
 }))")
 WORK_TMP="$TMPDIR_E2E/work_out"
-WORK_OK=0; WORK_CODE=000; WORK_RC=1
+WORK_ACCEPTED=0; WORK_OK=0; WORK_CODE=000; WORK_RC=1; WORK_TEXT=""; WORK_RESP=""
 for WORK_ATTEMPT in $(seq 1 8); do
   : >"$WORK_TMP"
   set +e
@@ -957,23 +1069,47 @@ for WORK_ATTEMPT in $(seq 1 8); do
   WORK_RC=$?
   set -e
   WORK_CODE=${WORK_CODE:-000}
-  if [ "$WORK_RC" = "0" ] && [ "$WORK_CODE" -ge 200 ] && [ "$WORK_CODE" -lt 300 ]; then WORK_OK=1; break; fi
+  WORK_RESP=$(cat "$WORK_TMP" 2>/dev/null || echo "")
+  if [ "$WORK_RC" = "0" ] && [ "$WORK_CODE" -ge 200 ] && [ "$WORK_CODE" -lt 300 ]; then
+    WORK_ACCEPTED=1
+    WORK_QID=$(printf '%s' "$WORK_RESP" | a2a_queue_id_from_response || echo "")
+    if [ -n "$WORK_QID" ]; then
+      log "    assign-work A2A queued (queue_id=$WORK_QID); polling durable result"
+      poll_a2a_queue_result "$WORKER_ID" "$WORK_QID" "$WORK_TMP" "assign-work A2A"
+      WORK_RESP=$(cat "$WORK_TMP" 2>/dev/null || echo "")
+    fi
+
+    WORK_TEXT=$(printf '%s' "$WORK_RESP" | extract_a2a_text 2>/dev/null || echo "")
+    log "    team member replied (first 200 chars): $(echo "$WORK_TEXT" | head -c 200)"
+    if hit=$(a2a_completion_error_marker "$WORK_TEXT"); then
+      fail "assign-work — real-completion gate: agent returned an ERROR-AS-TEXT payload (matched '$hit'). Raw: ${WORK_TEXT:0:200}"
+    fi
+    if a2a_text_has_expected "$WORK_TEXT" "$WORK_EXPECT"; then
+      WORK_OK=1
+      break
+    fi
+    if [ "$WORK_ATTEMPT" -lt 8 ]; then
+      if [ -z "$WORK_TEXT" ]; then
+        log "    assign-work attempt $WORK_ATTEMPT/8 returned no extracted text — retrying"
+      else
+        log "    assign-work attempt $WORK_ATTEMPT/8 missing expected token '$WORK_EXPECT' — retrying"
+      fi
+      sleep 15
+      continue
+    fi
+    break
+  fi
   if echo "$WORK_CODE" | grep -Eq '^(502|503|504)$'; then
     log "    assign-work A2A cold-start attempt $WORK_ATTEMPT/8 returned $WORK_CODE — retrying"
     [ "$WORK_ATTEMPT" -lt 8 ] && { sleep 15; continue; }
   fi
   break
 done
-WORK_RESP=$(cat "$WORK_TMP" 2>/dev/null || echo "")
-[ "$WORK_OK" = "1" ] || fail "ASSIGN TEAM WORK: A2A POST to team member $WORKER_ID failed (curl_rc=$WORK_RC, http=$WORK_CODE) after $WORK_ATTEMPT attempt(s): $(echo "$WORK_RESP" | head -c 300)"
+[ "$WORK_ACCEPTED" = "1" ] || fail "ASSIGN TEAM WORK: A2A POST to team member $WORKER_ID failed (curl_rc=$WORK_RC, http=$WORK_CODE) after $WORK_ATTEMPT attempt(s): $(safe_body_preview "$WORK_RESP" 300)"
 ok "Task ACCEPTED by the team member (A2A 2xx)"
-WORK_TEXT=$(echo "$WORK_RESP" | python3 -c "
-import sys, json
-try: d = json.load(sys.stdin)
-except Exception: print(''); sys.exit(0)
-parts = (d.get('result') or {}).get('parts', []) if isinstance(d, dict) else []
-print(parts[0].get('text','') if parts else '')" 2>/dev/null || echo "")
-log "    team member replied (first 200 chars): $(echo "$WORK_TEXT" | head -c 200)"
+if [ "$WORK_OK" != "1" ] && [ -z "$WORK_TEXT" ]; then
+  log "    assign-work A2A text extraction empty; response body: $(safe_body_preview "$WORK_RESP" 300)"
+fi
 # Hard gate: a real (non-error-as-text) round-trip containing the known answer.
 a2a_assert_real_completion "$WORK_TEXT" "$WORK_EXPECT" "assign-work"
 ok "═ STEP 5 PASS: work assigned to the team member round-tripped a real MiniMax completion (got '$WORK_EXPECT')"
