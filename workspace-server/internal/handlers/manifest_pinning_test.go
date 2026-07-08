@@ -28,12 +28,18 @@
 package handlers
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 )
 
 // readRealManifestForPinningTest finds molecule-core/manifest.json by
@@ -69,6 +75,15 @@ var shaPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // check-manifest-repos-exist.sh). A value outside this set is rejected static-
 // ally below — a typo'd provider must fail in CI, not silently mis-resolve.
 var knownProviders = map[string]bool{"": true, "moleculesai": true, "github": true}
+
+const giteaTestUserAgent = "curl/8.4.0"
+
+func setGiteaTestHeaders(req *http.Request, auth string) {
+	req.Header.Set("User-Agent", giteaTestUserAgent)
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+}
 
 // commitLookupURL builds the provider-appropriate single-commit API URL used
 // by the reachability test. Gitea and GitHub expose different paths; resolving
@@ -161,9 +176,7 @@ func TestManifest_RefPinning_AllEntriesAreCommitSHAs(t *testing.T) {
 func giteaReachableForTest() bool {
 	client := &http.Client{Timeout: 3 * time.Second}
 	req, _ := http.NewRequest("GET", "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-ai-workspace-template-claude-code", nil)
-	if auth := giteaBasicAuthForTestProbe(); auth != "" {
-		req.Header.Set("Authorization", auth)
-	}
+	setGiteaTestHeaders(req, giteaBasicAuthForTestProbe())
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -258,7 +271,7 @@ func TestManifest_RefPinning_AllSHAsReachable(t *testing.T) {
 		// (the same one used by the runtime's giteaTemplateAssetFetcher).
 		url := commitLookupURL(e.Provider, e.Repo, e.Ref)
 		req, _ := http.NewRequest("GET", url, nil)
-		req.Header.Set("Authorization", auth)
+		setGiteaTestHeaders(req, auth)
 		resp, err := client.Do(req)
 		if err != nil {
 			t.Errorf("entry %q (%s): ref %q — git commit lookup failed: %v", e.Name, e.Repo, e.Ref, err)
@@ -270,6 +283,97 @@ func TestManifest_RefPinning_AllSHAsReachable(t *testing.T) {
 		} else if resp.StatusCode != 200 {
 			t.Errorf("entry %q (%s): ref %q — Gitea returns HTTP %d", e.Name, e.Repo, e.Ref, resp.StatusCode)
 		}
+	}
+}
+
+func pluginManifestContentsURL(e manifestEntry) (string, bool) {
+	switch e.Provider {
+	case "", "moleculesai":
+		return fmt.Sprintf("https://git.moleculesai.app/api/v1/repos/%s/contents/plugin.yaml?ref=%s", e.Repo, e.Ref), true
+	default:
+		return "", false
+	}
+}
+
+func fetchPinnedPluginManifestForTest(client *http.Client, auth string, e manifestEntry) ([]byte, error) {
+	url, ok := pluginManifestContentsURL(e)
+	if !ok {
+		return nil, fmt.Errorf("unsupported provider %q", e.Provider)
+	}
+	req, _ := http.NewRequest("GET", url, nil)
+	setGiteaTestHeaders(req, auth)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var payload struct {
+		Type     string `json:"type"`
+		Encoding string `json:"encoding"`
+		Content  string `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if payload.Type != "file" || payload.Encoding != "base64" {
+		return nil, fmt.Errorf("unexpected contents payload: type=%q encoding=%q", payload.Type, payload.Encoding)
+	}
+	content := strings.ReplaceAll(payload.Content, "\n", "")
+	decoded, err := base64.StdEncoding.DecodeString(content)
+	if err != nil {
+		return nil, fmt.Errorf("decode base64 content: %w", err)
+	}
+	return decoded, nil
+}
+
+// TestManifest_SuperpowersPinnedManifestValidatesSSOT catches the staging
+// install failure mode where the control-superpowers lifecycle installs the
+// manifest-pinned superpowers plugin, whose plugin.yaml must satisfy the same
+// SDK-owned schema enforced by the install path.
+func TestManifest_SuperpowersPinnedManifestValidatesSSOT(t *testing.T) {
+	if !giteaReachableForTest() {
+		t.Skip("Gitea unreachable (offline CI lane); skipping superpowers plugin-manifest SSOT validation")
+	}
+	data, err := readRealManifestForPinningTest(t)
+	if err != nil {
+		t.Skipf("manifest.json not readable: %v", err)
+	}
+	var m struct {
+		Plugins []manifestEntry `json:"plugins"`
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("manifest parse: %v", err)
+	}
+	if len(m.Plugins) == 0 {
+		t.Fatal("no plugin entries (test invariant broken)")
+	}
+
+	var superpowers manifestEntry
+	for _, e := range m.Plugins {
+		if e.Name == "superpowers" {
+			superpowers = e
+			break
+		}
+	}
+	if superpowers.Name == "" {
+		t.Fatal("manifest.json has no superpowers plugin entry")
+	}
+	if _, ok := pluginManifestContentsURL(superpowers); !ok {
+		t.Fatalf("superpowers plugin uses unsupported provider %q", superpowers.Provider)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	auth := giteaBasicAuthForTest(t)
+	manifest, err := fetchPinnedPluginManifestForTest(client, auth, superpowers)
+	if err != nil {
+		t.Fatalf("superpowers plugin.yaml lookup at ref %q failed: %v", superpowers.Ref, err)
+	}
+	if v := plugins.ValidateManifestSSOT(manifest); len(v) != 0 {
+		t.Fatalf("superpowers pinned plugin.yaml at ref %q violates plugin-manifest SSOT: %s", superpowers.Ref, strings.Join(v, "; "))
 	}
 }
 
@@ -307,7 +411,7 @@ func TestManifest_RefPinning_WorkspaceTemplatesIncludeConfigYAML(t *testing.T) {
 		// (templates have it at the root).
 		url := "https://git.moleculesai.app/api/v1/repos/" + e.Repo + "/git/trees/" + e.Ref + "?recursive=1"
 		req, _ := http.NewRequest("GET", url, nil)
-		req.Header.Set("Authorization", auth)
+		setGiteaTestHeaders(req, auth)
 		resp, err := client.Do(req)
 		if err != nil {
 			t.Errorf("entry %q (%s): tree lookup at %q failed: %v", e.Name, e.Repo, e.Ref, err)
