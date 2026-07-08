@@ -96,8 +96,8 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	}
 	t.Logf("platform agent (concierge) id: %s", platformID)
 
-	// The management-MCP lifecycle verb the concierge MUST load. SSOT:
-	// molecule-contracts — the SAME literal the server-side heartbeat gate matches
+		// The management-MCP lifecycle verb the concierge MUST load. SSOT:
+		// molecule-ai-sdk — the SAME literal the server-side heartbeat gate matches
 	// (handlers.conciergePlatformMCPProvisionWorkspaceTool). Never hardcoded here.
 	requiredTool := "mcp__" + molcontracts.MCPServerName + "__" + molcontracts.RequiredTool
 

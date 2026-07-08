@@ -2,8 +2,7 @@ name: provision-request-ssot-sync
 
 # SSOT sync gate for the provision-request wire contract (RFC core#3285 §10).
 #
-# Sibling of contract-ssot-sync.yml (which guards the mcp-plugin-delivery
-# mirror). molecule-ai-sdk is the PUBLIC SSOT for the cross-repo
+# molecule-ai-sdk is the PUBLIC SSOT for the cross-repo
 # provision-request wire shape (the core -> control-plane
 # POST /cp/workspaces/provision request). Core keeps a local MIRROR at
 # workspace-server/internal/provisioner/provision_request.contract.json -- the

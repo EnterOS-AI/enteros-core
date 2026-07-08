@@ -5,7 +5,8 @@ name: mcp-verb-published-manifest
 #
 # Resolves the ACTUAL tool manifest of the PUBLISHED @molecule-ai/mcp-server
 # build (the build a concierge is delivered) and asserts it satisfies the
-# contract's accepted verb union (required_tools ∪ transitional_tool_aliases).
+# molecule-ai-sdk contract's accepted verb union (required_tools ∪
+# transitional_tool_aliases).
 # This is the layer that would have caught the staging stale-published-build
 # degrade — a published build skewed away from the contract fails HERE, in core
 # CI, BEFORE any tenant provisions a concierge against it.
@@ -42,23 +43,25 @@ name: mcp-verb-published-manifest
 # Actions secret can be retired after a green soak validates this path
 # (validate-before-delete).
 #
-# DEPENDS ON: molecule-core's verb-SSOT PR (feat/3082-mcp-verb-ssot-contract)
-# landing `required_tools` (+ optional `transitional_tool_aliases`) in
-# contracts/mcp-plugin-delivery.contract.json. The checker reads those fields
-# and falls back to the legacy singular `required_tool` if absent, so it is safe
-# to merge AFTER the contract shape lands.
+# CONTRACT SOURCE: molecule-ai-sdk is the public SSOT. The checker fetches
+# contracts/mcp/mcp-plugin-delivery.contract.json from that repo directly; core
+# no longer carries a root-level JSON mirror.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
-      - 'contracts/mcp-plugin-delivery.contract.json'
+      - 'workspace-server/go.mod'
+      - 'workspace-server/go.sum'
+      - 'workspace-server/internal/handlers/mcp_plugin_delivery_contract.go'
       - 'scripts/mcp-verb-manifest-check/**'
       - '.gitea/workflows/mcp-verb-published-manifest.yml'
   push:
     branches: [main, staging]
     paths:
-      - 'contracts/mcp-plugin-delivery.contract.json'
+      - 'workspace-server/go.mod'
+      - 'workspace-server/go.sum'
+      - 'workspace-server/internal/handlers/mcp_plugin_delivery_contract.go'
       - 'scripts/mcp-verb-manifest-check/**'
       - '.gitea/workflows/mcp-verb-published-manifest.yml'
   workflow_dispatch:
@@ -211,5 +214,5 @@ jobs:
 
           cd "${GITHUB_WORKSPACE}"
           node scripts/mcp-verb-manifest-check/check-published-mcp-manifest.mjs \
-            --contract contracts/mcp-plugin-delivery.contract.json \
+            --contract-url https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/mcp/mcp-plugin-delivery.contract.json \
             --install-dir "$WORKDIR"

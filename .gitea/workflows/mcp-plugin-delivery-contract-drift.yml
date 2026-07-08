@@ -2,14 +2,13 @@ name: mcp-plugin-delivery-contract-drift
 
 # Cross-repo drift gate for the MCP-plugin delivery contract (core#3080).
 #
-# The contract file contracts/mcp-plugin-delivery.contract.json is the SSOT
-# shared between molecule-core (producer side),
-# molecule-ai-workspace-template-claude-code (consumer side), and
-# molecule-ai-workspace-runtime (runtime party; its literal drift caused
-# RCA#2970). This workflow fetches the template's and runtime's copies via
-# the Gitea raw endpoint and byte-compares each against core's local copy.
-# RED if any differ — the three repos must stay byte-identical so the drift
-# gate and runtime agree on the same contract.
+# molecule-ai-sdk is the public SSOT for this contract. molecule-core runtime
+# code consumes the generated Go binding (go.moleculesai.app/sdk/gen/go/
+# molcontracts), so core no longer vendors a root-level JSON mirror. This
+# workflow fetches the template's and runtime's contract copies via the Gitea raw
+# endpoint and compares each against the SDK SSOT. RED if any differ — the
+# template/runtime participants must agree with the SDK contract that core
+# consumes.
 #
 # ENFORCEMENT GATING: standalone workflow, NOT a job in ci.yml and NOT in
 # branch protection (soak-then-promote; mirrors sync-providers-yaml.yml).
@@ -22,12 +21,16 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
-      - 'contracts/mcp-plugin-delivery.contract.json'
+      - 'workspace-server/go.mod'
+      - 'workspace-server/go.sum'
+      - 'workspace-server/internal/handlers/mcp_plugin_delivery_contract.go'
       - '.gitea/workflows/mcp-plugin-delivery-contract-drift.yml'
   push:
     branches: [main, staging]
     paths:
-      - 'contracts/mcp-plugin-delivery.contract.json'
+      - 'workspace-server/go.mod'
+      - 'workspace-server/go.sum'
+      - 'workspace-server/internal/handlers/mcp_plugin_delivery_contract.go'
       - '.gitea/workflows/mcp-plugin-delivery-contract-drift.yml'
   workflow_dispatch:
 
@@ -46,6 +49,16 @@ jobs:
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Fetch molecule-ai-sdk contract SSOT
+        env:
+          SDK_CONTRACT_URL: https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/mcp/mcp-plugin-delivery.contract.json
+        run: |
+          set -euo pipefail
+          curl -fsS -A curl/8.4.0 "$SDK_CONTRACT_URL" -o /tmp/sdk-mcp-plugin-delivery.contract.json
+          python3 -c 'import json,sys; json.load(open(sys.argv[1]))' /tmp/sdk-mcp-plugin-delivery.contract.json
+          python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True, separators=(",",":")))' \
+            /tmp/sdk-mcp-plugin-delivery.contract.json > /tmp/sdk-mcp-plugin-delivery.contract.json.canon
 
       - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
         # Bot-token consolidation (secrets->kms). AUTO_SYNC_TOKEN (the
@@ -89,7 +102,7 @@ jobs:
           echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
           echo "AUTO_SYNC_TOKEN loaded from Infisical (len=${#AUTO_SYNC_TOKEN})"
 
-      - name: Fetch template contract and byte-compare
+      - name: Fetch template contract and compare to SDK SSOT
         env:
           AUTO_SYNC_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
           API_ROOT: ${{ github.server_url }}/api/v1
@@ -122,6 +135,7 @@ jobs:
           CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-ai-workspace-template-claude-code/raw/contracts/mcp-plugin-delivery.contract.json?ref=${REF}"
           set +e
           curl -fsS \
+            -A curl/8.4.0 \
             -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
             "${CANON_URL}" -o /tmp/canonical-mcp-plugin-delivery.contract.json
           curl_status=$?
@@ -132,6 +146,7 @@ jobs:
               CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-ai-workspace-template-claude-code/raw/contracts/mcp-plugin-delivery.contract.json?ref=main"
               set +e
               curl -fsS \
+                -A curl/8.4.0 \
                 -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
                 "${CANON_URL}" -o /tmp/canonical-mcp-plugin-delivery.contract.json
               curl_status=$?
@@ -149,16 +164,18 @@ jobs:
               exit 1
             fi
           fi
-          LOCAL=contracts/mcp-plugin-delivery.contract.json
-          if diff -u /tmp/canonical-mcp-plugin-delivery.contract.json "$LOCAL"; then
-            echo "OK — core's contract is byte-identical to the template canonical."
+          python3 -c 'import json,sys; json.load(open(sys.argv[1]))' /tmp/canonical-mcp-plugin-delivery.contract.json
+          python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True, separators=(",",":")))' \
+            /tmp/canonical-mcp-plugin-delivery.contract.json > /tmp/canonical-mcp-plugin-delivery.contract.json.canon
+          if diff -u /tmp/sdk-mcp-plugin-delivery.contract.json.canon /tmp/canonical-mcp-plugin-delivery.contract.json.canon; then
+            echo "OK — template contract is the SAME CONTRACT as the molecule-ai-sdk SSOT."
           else
-            echo "::error::core's mcp-plugin-delivery.contract.json DRIFTED from the template canonical."
-            echo "Re-sync: copy molecule-ai-workspace-template-claude-code contracts/mcp-plugin-delivery.contract.json verbatim over $LOCAL."
+            echo "::error::molecule-ai-workspace-template-claude-code's mcp-plugin-delivery.contract.json DRIFTED from the molecule-ai-sdk SSOT."
+            echo "Re-sync: align the template copy to molecule-ai-sdk contracts/mcp/mcp-plugin-delivery.contract.json (the SDK SSOT is canonical)."
             exit 1
           fi
 
-      - name: Fetch workspace-runtime contract and byte-compare
+      - name: Fetch workspace-runtime contract and compare to SDK SSOT
         env:
           AUTO_SYNC_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
           API_ROOT: ${{ github.server_url }}/api/v1
@@ -191,6 +208,7 @@ jobs:
           CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-ai-workspace-runtime/raw/contracts/mcp-plugin-delivery.contract.json?ref=${REF}"
           set +e
           curl -fsS \
+            -A curl/8.4.0 \
             -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
             "${CANON_URL}" -o /tmp/canonical-runtime-mcp-plugin-delivery.contract.json
           curl_status=$?
@@ -201,6 +219,7 @@ jobs:
               CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-ai-workspace-runtime/raw/contracts/mcp-plugin-delivery.contract.json?ref=main"
               set +e
               curl -fsS \
+                -A curl/8.4.0 \
                 -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
                 "${CANON_URL}" -o /tmp/canonical-runtime-mcp-plugin-delivery.contract.json
               curl_status=$?
@@ -218,11 +237,13 @@ jobs:
               exit 1
             fi
           fi
-          LOCAL=contracts/mcp-plugin-delivery.contract.json
-          if diff -u /tmp/canonical-runtime-mcp-plugin-delivery.contract.json "$LOCAL"; then
-            echo "OK — core's contract is byte-identical to the runtime canonical."
+          python3 -c 'import json,sys; json.load(open(sys.argv[1]))' /tmp/canonical-runtime-mcp-plugin-delivery.contract.json
+          python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True, separators=(",",":")))' \
+            /tmp/canonical-runtime-mcp-plugin-delivery.contract.json > /tmp/canonical-runtime-mcp-plugin-delivery.contract.json.canon
+          if diff -u /tmp/sdk-mcp-plugin-delivery.contract.json.canon /tmp/canonical-runtime-mcp-plugin-delivery.contract.json.canon; then
+            echo "OK — workspace-runtime contract is the SAME CONTRACT as the molecule-ai-sdk SSOT."
           else
-            echo "::error::core's mcp-plugin-delivery.contract.json DRIFTED from the runtime canonical."
-            echo "Re-sync: copy molecule-ai-workspace-runtime contracts/mcp-plugin-delivery.contract.json verbatim over $LOCAL."
+            echo "::error::molecule-ai-workspace-runtime's mcp-plugin-delivery.contract.json DRIFTED from the molecule-ai-sdk SSOT."
+            echo "Re-sync: align the runtime copy to molecule-ai-sdk contracts/mcp/mcp-plugin-delivery.contract.json (the SDK SSOT is canonical)."
             exit 1
           fi

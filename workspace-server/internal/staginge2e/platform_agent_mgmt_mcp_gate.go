@@ -64,7 +64,7 @@ type MgmtMCPProbe struct {
 	// status=online RCA #2970 gate + the CALLABLE proof below.
 	LoadedTools []string
 	// RequiredTool is the fully-qualified management verb id the inventory must
-	// carry: mcp__<MCPServerName>__<RequiredTool> — SSOT from molecule-contracts,
+		// carry: mcp__<MCPServerName>__<RequiredTool> — SSOT from molecule-ai-sdk,
 	// never hardcoded by the caller.
 	RequiredTool string
 	// AssertCallable turns the real-A2A-turn proof into a HARD requirement (the CI

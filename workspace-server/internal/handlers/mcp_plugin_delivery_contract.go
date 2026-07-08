@@ -2,19 +2,11 @@ package handlers
 
 // MCP-plugin delivery contract (core#3080).
 //
-// Core now CONSUMES this contract from the molecule-contracts SSOT (RFC
+// Core consumes this contract from the molecule-ai-sdk SSOT (RFC
 // molecule-core#3285 §10 "consume, never two copies"): it imports the generated
-// Go binding (go.moleculesai.app/sdk/gen/go/molcontracts) instead of reading
-// its own JSON file. The import IS the link — core's runtime + tests can no
+// Go binding (go.moleculesai.app/sdk/gen/go/molcontracts) instead of reading a
+// local JSON mirror. The import is the link, so core's runtime + tests can no
 // longer drift from the SSOT.
-//
-// The on-disk contracts/mcp-plugin-delivery.contract.json is RETAINED only as a
-// CI cross-repo comparison anchor (the template/runtime drift gate + the
-// verb-manifest check still byte-compare against it), kept byte-equal to the
-// SSOT by contract-ssot-sync. Core CODE no longer reads it. Fully removing the
-// JSON — repointing those cross-repo gates straight at the molecule-contracts
-// SSOT — is a deliberate follow-up (one of those gates is the SEV1-relevant
-// verb-manifest check, so it is sequenced after the incident).
 
 import (
 	molcontracts "go.moleculesai.app/sdk/gen/go/molcontracts"
@@ -28,7 +20,7 @@ type (
 	Runtime                   = molcontracts.Runtime
 )
 
-// LoadMCPPluginDeliveryContract returns the contract from the molecule-contracts
+// LoadMCPPluginDeliveryContract returns the contract from the molecule-ai-sdk
 // SSOT binding. The signature (and the always-nil error) is kept so existing
 // callers/tests are unchanged; there is no longer a file to read or fail on.
 func LoadMCPPluginDeliveryContract() (*MCPPluginDeliveryContract, error) {
@@ -37,7 +29,7 @@ func LoadMCPPluginDeliveryContract() (*MCPPluginDeliveryContract, error) {
 }
 
 // MatchesSSOT asserts the contract carries the exact values core depends on.
-// With the binding this is a value-pin: a contract change in molecule-contracts
+// With the binding this is a value-pin: a contract change in molecule-ai-sdk
 // reaches core only via a module bump, and this catches a bumped value that
 // would break the degrade gate or the PORT wiring. Kept as a function (not a
 // method) since the type is now an alias of the imported struct.

@@ -71,12 +71,11 @@ func TestSSOT_DegradeGateToolDerivesFromContract(t *testing.T) {
 	}
 }
 
-// TestMCPPluginDeliveryContract_LoadableFromRepoRoot guards against a moved
-// or missing contract file, which would silently break the cross-repo drift
-// gate and any code that loads the contract at runtime.
-func TestMCPPluginDeliveryContract_LoadableFromRepoRoot(t *testing.T) {
+// TestMCPPluginDeliveryContract_LoadableFromSDK guards the generated SDK
+// binding that replaced the old root-level JSON mirror.
+func TestMCPPluginDeliveryContract_LoadableFromSDK(t *testing.T) {
 	if _, err := LoadMCPPluginDeliveryContract(); err != nil {
-		t.Fatalf("contract must be loadable from repo root: %v", err)
+		t.Fatalf("contract must be loadable from SDK binding: %v", err)
 	}
 }
 

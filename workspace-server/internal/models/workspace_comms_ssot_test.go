@@ -2,79 +2,35 @@ package models
 
 // PRODUCER-side SSOT gate for the workspace<->platform comms contract.
 //
-// Why this exists — the gap this closes
-// -------------------------------------
 // workspace.go's RegisterPayload / HeartbeatPayload / RuntimeMetadata are the
-// WIRE AUTHORITY the molecule-contracts `workspace-comms/*.schema.json` SSOT
-// schemas were DERIVED FROM. But nothing pinned the two together: the only
-// pre-existing comms contract test (registry_payload_contract_test.go) pins
-// core-struct <-> runtime-Python (the CONSUMER side / the bytes the runtime
-// emits), NOT core-struct <-> the SSOT schema. molecule-contracts ships
-// gen/go/workspace_comms_gen.go but core never imports it. So an edit to
-// workspace.go (rename a json tag, add/drop a field, flip a binding:"required")
-// could silently drift the SSOT and no gate would red.
+// WIRE AUTHORITY the molecule-ai-sdk workspace-comms contract was derived from.
+// This gate reflects over those real core structs and compares them with the
+// generated SDK binding in go.moleculesai.app/sdk/gen/go/molcontracts. It keeps
+// the check hermetic/offline while avoiding local JSON schema mirrors in core.
 //
-// This gate closes that: it reflects over the real structs and asserts they are
-// field-compatible with the VENDORED workspace-comms schemas — every schema
-// `required` field has a struct field with the right json tag AND a
-// binding:"required" tag; the struct's json-tagged fields and the schema's
-// request `properties` are the SAME SET (extras OR removals on either side red).
-//
-// Vendored, not fetched (testdata/workspace-comms/*.schema.json): the gate is
-// hermetic/offline so `go test ./...` reds on a real divergence, never a network
-// blip. The vendored copies are kept honest against molecule-contracts by the
-// `contract-ssot-sync` workflow (see that dir's README.md). When the contract
-// changes, re-sync testdata/ from molecule-contracts and update workspace.go.
+// Scope: this gate pins JSON field set and requiredness. It deliberately does
+// not compare Go field types, matching the previous JSON-schema fixture gate.
 
 import (
-	"embed"
 	"encoding/json"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
+
+	molcontracts "go.moleculesai.app/sdk/gen/go/molcontracts"
 )
-
-//go:embed testdata/workspace-comms/register.schema.json
-//go:embed testdata/workspace-comms/heartbeat.schema.json
-//go:embed testdata/workspace-comms/agent-card.schema.json
-var commsSchemaFS embed.FS
-
-// schemaNode is the minimal recursive shape of a JSON-Schema (draft 2020-12)
-// node we need to walk: required[], properties{}, $defs{}, $ref. Everything
-// else (descriptions, types, enums) is irrelevant to the field-set/requiredness
-// gate and is ignored.
-type schemaNode struct {
-	Type       string                `json:"type"`
-	Required   []string              `json:"required"`
-	Properties map[string]schemaNode `json:"properties"`
-	Defs       map[string]schemaNode `json:"$defs"`
-	Ref        string                `json:"$ref"`
-}
-
-func loadSchema(t *testing.T, name string) schemaNode {
-	t.Helper()
-	b, err := commsSchemaFS.ReadFile("testdata/workspace-comms/" + name)
-	if err != nil {
-		t.Fatalf("read vendored schema %s: %v (re-sync testdata/ from molecule-contracts)", name, err)
-	}
-	var n schemaNode
-	if err := json.Unmarshal(b, &n); err != nil {
-		t.Fatalf("parse vendored schema %s: %v", name, err)
-	}
-	return n
-}
 
 // structField is the gate-relevant view of one struct field.
 type structField struct {
-	jsonName       string
-	bindingRequire bool
+	jsonName string
+	required bool
 }
 
 // structJSONFields reflects over a struct type and returns its json-tagged
-// fields keyed by json name, recording whether each carries binding:"required".
-// Fields tagged json:"-" or with no json tag are skipped (not on the wire).
-func structJSONFields(t *testing.T, typ reflect.Type) map[string]structField {
+// fields keyed by json name. The required predicate lets core use
+// binding:"required" while SDK generated types use the absence of ",omitempty".
+func structJSONFields(t *testing.T, typ reflect.Type, required func(reflect.StructField) bool) map[string]structField {
 	t.Helper()
 	if typ.Kind() != reflect.Struct {
 		t.Fatalf("structJSONFields: %s is not a struct", typ)
@@ -86,80 +42,72 @@ func structJSONFields(t *testing.T, typ reflect.Type) map[string]structField {
 		if tag == "" || tag == "-" {
 			continue
 		}
-		jsonName := strings.Split(tag, ",")[0]
+		parts := strings.Split(tag, ",")
+		jsonName := parts[0]
 		if jsonName == "" || jsonName == "-" {
 			continue
 		}
-		binding := f.Tag.Get("binding")
-		req := false
-		for _, part := range strings.Split(binding, ",") {
-			if strings.TrimSpace(part) == "required" {
-				req = true
-			}
-		}
-		out[jsonName] = structField{jsonName: jsonName, bindingRequire: req}
+		out[jsonName] = structField{jsonName: jsonName, required: required(f)}
 	}
 	return out
 }
 
-// checkStructAgainstSchema is the gate predicate. It returns a sorted list of
-// human-readable mismatch messages between a Go struct and a JSON-Schema object
-// node (the `request` sub-schema, or a $defs sub-schema). An EMPTY result means
-// the struct and the schema agree on (a) field set and (b) requiredness.
-//
-// It is a pure function of (struct type, schema node) so the test below can run
-// it against the REAL structs (expect: no mismatches) and against a deliberately
-// drifted struct (expect: mismatches) — proving the gate actually catches drift.
-func checkStructAgainstSchema(t *testing.T, label string, typ reflect.Type, node schemaNode) []string {
+func coreRequired(f reflect.StructField) bool {
+	for _, part := range strings.Split(f.Tag.Get("binding"), ",") {
+		if strings.TrimSpace(part) == "required" {
+			return true
+		}
+	}
+	return false
+}
+
+func sdkRequired(f reflect.StructField) bool {
+	tag := f.Tag.Get("json")
+	for _, part := range strings.Split(tag, ",")[1:] {
+		if strings.TrimSpace(part) == "omitempty" {
+			return false
+		}
+	}
+	return tag != "" && tag != "-"
+}
+
+// checkStructAgainstSDK is the gate predicate. It returns a sorted list of
+// human-readable mismatch messages between a core producer struct and the
+// generated SDK request/definition struct. An empty result means the two agree
+// on field set and requiredness.
+func checkStructAgainstSDK(t *testing.T, label string, coreType, sdkType reflect.Type) []string {
 	t.Helper()
-	fields := structJSONFields(t, typ)
+	coreFields := structJSONFields(t, coreType, coreRequired)
+	sdkFields := structJSONFields(t, sdkType, sdkRequired)
 
 	var problems []string
 
-	schemaProps := map[string]bool{}
-	for name := range node.Properties {
-		schemaProps[name] = true
-	}
-	schemaRequired := map[string]bool{}
-	for _, name := range node.Required {
-		schemaRequired[name] = true
-	}
-
-	// (1) Every schema property must have a struct field (no SSOT-only field
-	// that the producer fails to carry).
-	for name := range schemaProps {
-		if _, ok := fields[name]; !ok {
-			problems = append(problems, label+": schema property "+quote(name)+" has NO matching struct json field (producer drifted: field removed/renamed in workspace.go?)")
+	for name := range sdkFields {
+		if _, ok := coreFields[name]; !ok {
+			problems = append(problems, label+": SDK field "+quote(name)+" has NO matching core json field (producer drifted: field removed/renamed in workspace.go?)")
 		}
 	}
 
-	// (2) Every struct json field must be a schema property (no producer-only
-	// field that silently drifts the SSOT — the core defect this gate closes).
-	for name := range fields {
-		if !schemaProps[name] {
-			problems = append(problems, label+": struct json field "+quote(name)+" is ABSENT from the SSOT schema properties (producer drifted: field added to workspace.go without updating the molecule-contracts schema)")
+	for name := range coreFields {
+		if _, ok := sdkFields[name]; !ok {
+			problems = append(problems, label+": core json field "+quote(name)+" is ABSENT from the SDK contract (producer drifted: field added to workspace.go without updating molecule-ai-sdk)")
 		}
 	}
 
-	// (3) Every schema `required` field must exist as a struct field AND carry
-	// binding:"required" — the schema's requiredness mirrors the Go binding
-	// tags (see the schema descriptions), so a flipped binding tag is drift.
-	for name := range schemaRequired {
-		f, ok := fields[name]
+	for name, sdk := range sdkFields {
+		core, ok := coreFields[name]
 		if !ok {
-			problems = append(problems, label+": schema requires "+quote(name)+" but no struct json field has that name")
 			continue
 		}
-		if !f.bindingRequire {
-			problems = append(problems, label+": schema requires "+quote(name)+` but the struct field lacks binding:"required" (requiredness drift)`)
+		if sdk.required && !core.required {
+			problems = append(problems, label+": SDK requires "+quote(name)+` but the core field lacks binding:"required" (requiredness drift)`)
 		}
 	}
 
-	// (4) Belt-and-suspenders the other way: a struct field tagged
-	// binding:"required" that the schema does NOT mark required is also drift.
-	for name, f := range fields {
-		if f.bindingRequire && schemaProps[name] && !schemaRequired[name] {
-			problems = append(problems, label+": struct field "+quote(name)+` is binding:"required" but the SSOT schema does NOT list it as required (requiredness drift)`)
+	for name, core := range coreFields {
+		sdk, ok := sdkFields[name]
+		if ok && core.required && !sdk.required {
+			problems = append(problems, label+": core field "+quote(name)+` is binding:"required" but the SDK contract does NOT mark it required (requiredness drift)`)
 		}
 	}
 
@@ -169,56 +117,33 @@ func checkStructAgainstSchema(t *testing.T, label string, typ reflect.Type, node
 
 func quote(s string) string { return `"` + s + `"` }
 
-// requestNode pulls the `request` sub-schema out of a register/heartbeat
-// contract schema (which models both `request` and `response`). The Go wire
-// struct is the request body.
-func requestNode(t *testing.T, root schemaNode) schemaNode {
-	t.Helper()
-	req, ok := root.Properties["request"]
-	if !ok {
-		t.Fatal("schema has no properties.request node")
-	}
-	return req
-}
-
 // TestRegisterPayload_MatchesSSOT gates models.RegisterPayload against the
-// vendored register.schema.json request sub-shape.
+// generated SDK register request contract.
 func TestRegisterPayload_MatchesSSOT(t *testing.T) {
-	schema := requestNode(t, loadSchema(t, "register.schema.json"))
-	if got := checkStructAgainstSchema(t, "RegisterPayload", reflect.TypeOf(RegisterPayload{}), schema); len(got) != 0 {
-		t.Fatalf("RegisterPayload drifted from the workspace-comms SSOT register schema:\n  - %s", strings.Join(got, "\n  - "))
+	if got := checkStructAgainstSDK(t, "RegisterPayload", reflect.TypeOf(RegisterPayload{}), reflect.TypeOf(molcontracts.RegisterRequest{})); len(got) != 0 {
+		t.Fatalf("RegisterPayload drifted from the workspace-comms SDK register request:\n  - %s", strings.Join(got, "\n  - "))
 	}
 }
 
 // TestHeartbeatPayload_MatchesSSOT gates models.HeartbeatPayload against the
-// vendored heartbeat.schema.json request sub-shape.
+// generated SDK heartbeat request contract.
 func TestHeartbeatPayload_MatchesSSOT(t *testing.T) {
-	schema := requestNode(t, loadSchema(t, "heartbeat.schema.json"))
-	if got := checkStructAgainstSchema(t, "HeartbeatPayload", reflect.TypeOf(HeartbeatPayload{}), schema); len(got) != 0 {
-		t.Fatalf("HeartbeatPayload drifted from the workspace-comms SSOT heartbeat schema:\n  - %s", strings.Join(got, "\n  - "))
+	if got := checkStructAgainstSDK(t, "HeartbeatPayload", reflect.TypeOf(HeartbeatPayload{}), reflect.TypeOf(molcontracts.HeartbeatRequest{})); len(got) != 0 {
+		t.Fatalf("HeartbeatPayload drifted from the workspace-comms SDK heartbeat request:\n  - %s", strings.Join(got, "\n  - "))
 	}
 }
 
 // TestRuntimeMetadata_MatchesSSOT gates models.RuntimeMetadata against the
-// $defs/runtimeMetadata sub-schema inside heartbeat.schema.json.
+// generated SDK heartbeat runtimeMetadata definition.
 func TestRuntimeMetadata_MatchesSSOT(t *testing.T) {
-	root := loadSchema(t, "heartbeat.schema.json")
-	defNode, ok := root.Defs["runtimeMetadata"]
-	if !ok {
-		t.Fatal("heartbeat schema has no $defs/runtimeMetadata")
-	}
-	if got := checkStructAgainstSchema(t, "RuntimeMetadata", reflect.TypeOf(RuntimeMetadata{}), defNode); len(got) != 0 {
-		t.Fatalf("RuntimeMetadata drifted from the workspace-comms SSOT runtimeMetadata $def:\n  - %s", strings.Join(got, "\n  - "))
+	if got := checkStructAgainstSDK(t, "RuntimeMetadata", reflect.TypeOf(RuntimeMetadata{}), reflect.TypeOf(molcontracts.HeartbeatRuntimeMetadata{})); len(got) != 0 {
+		t.Fatalf("RuntimeMetadata drifted from the workspace-comms SDK runtimeMetadata definition:\n  - %s", strings.Join(got, "\n  - "))
 	}
 }
 
 // TestAgentCard_IsRawMessageWithRequiredName documents the agent_card seam: on
-// the wire it is json.RawMessage (untyped) on all three payload structs, so
-// there is no Go struct to field-compare. We still pin the load-bearing facts
-// from agent-card.schema.json: (a) the field exists on the structs as a raw
-// message, and (b) the SSOT requires a non-empty `name`. If molecule-contracts
-// ever gives agent_card a typed Go shape in core, replace this with a real
-// field gate.
+// the core wire structs it is json.RawMessage (untyped). We still pin the
+// load-bearing SDK fact: the shared card shape requires a non-empty `name`.
 func TestAgentCard_IsRawMessageWithRequiredName(t *testing.T) {
 	rawType := reflect.TypeOf(json.RawMessage(nil))
 	for _, tc := range []struct {
@@ -242,41 +167,47 @@ func TestAgentCard_IsRawMessageWithRequiredName(t *testing.T) {
 		}
 	}
 
-	card := loadSchema(t, "agent-card.schema.json")
-	reqd := map[string]bool{}
-	for _, r := range card.Required {
-		reqd[r] = true
-	}
-	if !reqd["name"] {
-		t.Error("agent-card.schema.json must require `name` (the single load-bearing card field)")
+	for _, tc := range []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{"AgentCard", reflect.TypeOf(molcontracts.AgentCard{})},
+		{"RegisterAgentCard", reflect.TypeOf(molcontracts.RegisterAgentCard{})},
+		{"HeartbeatAgentCard", reflect.TypeOf(molcontracts.HeartbeatAgentCard{})},
+	} {
+		f, ok := tc.typ.FieldByName("Name")
+		if !ok {
+			t.Errorf("%s has no Name field", tc.name)
+			continue
+		}
+		if got := strings.Split(f.Tag.Get("json"), ",")[0]; got != "name" {
+			t.Errorf("%s.Name json tag is %q, expected name", tc.name, got)
+		}
+		if !sdkRequired(f) {
+			t.Errorf("%s.Name must be required in the SDK contract", tc.name)
+		}
 	}
 }
 
-// TestCommsSSOTGate_CatchesDrift PROVES the gate actually reds on a divergence.
-// It builds deliberately-wrong structs and asserts checkStructAgainstSchema
-// flags each drift class. This is the negative case for the gate above: if this
-// test ever passes with an empty problem list, the gate has gone blind.
+// TestCommsSSOTGate_CatchesDrift proves the gate reds on the main drift
+// classes it exists to catch.
 func TestCommsSSOTGate_CatchesDrift(t *testing.T) {
-	registerReq := requestNode(t, loadSchema(t, "register.schema.json"))
+	sdkRegister := reflect.TypeOf(molcontracts.RegisterRequest{})
 
-	// Drift A: a required field's binding:"required" was dropped (someone
-	// "relaxed" id). The SSOT still marks id required -> requiredness drift.
+	// Drift A: a required field's binding:"required" was dropped.
 	type registerReqRelaxed struct {
-		ID           string          `json:"id"` // <- binding:"required" REMOVED
+		ID           string          `json:"id"` // binding:"required" removed
 		URL          string          `json:"url"`
 		AgentCard    json.RawMessage `json:"agent_card" binding:"required"`
 		DeliveryMode string          `json:"delivery_mode,omitempty"`
 		Kind         string          `json:"kind,omitempty"`
 		MCPPresent   *bool           `json:"mcp_server_present,omitempty"`
 	}
-	if got := checkStructAgainstSchema(t, "registerReqRelaxed", reflect.TypeOf(registerReqRelaxed{}), registerReq); len(got) == 0 {
-		t.Fatal("gate BLIND: a dropped binding:\"required\" on id was not caught")
-	} else {
-		t.Logf("drift A (dropped required) correctly caught:\n  - %s", strings.Join(got, "\n  - "))
+	if got := checkStructAgainstSDK(t, "registerReqRelaxed", reflect.TypeOf(registerReqRelaxed{}), sdkRegister); len(got) == 0 {
+		t.Fatal(`gate blind: a dropped binding:"required" on id was not caught`)
 	}
 
-	// Drift B: a producer-only field was added to the struct without updating
-	// the SSOT schema (the headline defect this gate closes).
+	// Drift B: a producer-only field was added without updating the SDK SSOT.
 	type registerReqExtra struct {
 		ID           string          `json:"id" binding:"required"`
 		URL          string          `json:"url"`
@@ -284,40 +215,21 @@ func TestCommsSSOTGate_CatchesDrift(t *testing.T) {
 		DeliveryMode string          `json:"delivery_mode,omitempty"`
 		Kind         string          `json:"kind,omitempty"`
 		MCPPresent   *bool           `json:"mcp_server_present,omitempty"`
-		SneakyNew    string          `json:"sneaky_new_field,omitempty"` // <- not in SSOT
+		Extra        string          `json:"extra_field,omitempty"`
 	}
-	if got := checkStructAgainstSchema(t, "registerReqExtra", reflect.TypeOf(registerReqExtra{}), registerReq); len(got) == 0 {
-		t.Fatal("gate BLIND: a producer-only field absent from the SSOT was not caught")
-	} else {
-		t.Logf("drift B (producer-only extra field) correctly caught:\n  - %s", strings.Join(got, "\n  - "))
+	if got := checkStructAgainstSDK(t, "registerReqExtra", reflect.TypeOf(registerReqExtra{}), sdkRegister); len(got) == 0 {
+		t.Fatal("gate blind: an added producer-only field was not caught")
 	}
 
-	// Drift C: a schema field was renamed away in the struct (id -> identifier).
-	type registerReqRenamed struct {
-		Identifier   string          `json:"identifier" binding:"required"` // <- was "id"
-		URL          string          `json:"url"`
-		AgentCard    json.RawMessage `json:"agent_card" binding:"required"`
-		DeliveryMode string          `json:"delivery_mode,omitempty"`
-		Kind         string          `json:"kind,omitempty"`
-		MCPPresent   *bool           `json:"mcp_server_present,omitempty"`
+	// Drift C: a contract field was removed/renamed in the producer.
+	type registerReqMissing struct {
+		ID           string `json:"id" binding:"required"`
+		URL          string `json:"url"`
+		DeliveryMode string `json:"delivery_mode,omitempty"`
+		Kind         string `json:"kind,omitempty"`
+		MCPPresent   *bool  `json:"mcp_server_present,omitempty"`
 	}
-	if got := checkStructAgainstSchema(t, "registerReqRenamed", reflect.TypeOf(registerReqRenamed{}), registerReq); len(got) == 0 {
-		t.Fatal("gate BLIND: a renamed required field was not caught")
-	} else {
-		t.Logf("drift C (renamed field) correctly caught:\n  - %s", strings.Join(got, "\n  - "))
-	}
-
-	// Sanity: a struct that faithfully mirrors the SSOT request produces NO
-	// problems (the gate is not just always-failing).
-	type registerReqFaithful struct {
-		ID           string          `json:"id" binding:"required"`
-		URL          string          `json:"url"`
-		AgentCard    json.RawMessage `json:"agent_card" binding:"required"`
-		DeliveryMode string          `json:"delivery_mode,omitempty"`
-		Kind         string          `json:"kind,omitempty"`
-		MCPPresent   *bool           `json:"mcp_server_present,omitempty"`
-	}
-	if got := checkStructAgainstSchema(t, "registerReqFaithful", reflect.TypeOf(registerReqFaithful{}), registerReq); len(got) != 0 {
-		t.Fatalf("gate FALSE-POSITIVE: a faithful struct was flagged:\n  - %s", strings.Join(got, "\n  - "))
+	if got := checkStructAgainstSDK(t, "registerReqMissing", reflect.TypeOf(registerReqMissing{}), sdkRegister); len(got) == 0 {
+		t.Fatal("gate blind: a missing contract field was not caught")
 	}
 }

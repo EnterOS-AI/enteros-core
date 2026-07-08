@@ -958,14 +958,10 @@ const conciergePlatformMCPName = "molecule-ai-plugin-molecule-platform-mcp"
 // concierge (which loads provision_workspace and no create_workspace).
 //
 // SSOT (audit 2026-06-25): the gate tool id is COMPOSED from two building blocks,
-// each pinned to the shared contract (contracts/mcp-plugin-delivery.contract.json)
-// by TestSSOT_DegradeGateToolDerivesFromContract — there is NO standalone
-// hardcoded full tool-id and NO independently-spelled verb. The gate and the test
-// share the single `mcp__<server>__<verb>` formula and the same contract source.
-// (The contract file lives at repo root, OUTSIDE this Go module, so the embed
-// directive cannot reach it for a true runtime load; compile-time composition +
-// the dual contract-assertion test is the deployment-safe SSOT enforcement — a
-// drift on either building block vs the contract fails CI before the gate.)
+// each sourced from the generated molecule-ai-sdk binding and pinned by
+// TestSSOT_DegradeGateToolDerivesFromContract — there is NO standalone hardcoded
+// full tool-id and NO independently-spelled verb. The gate and the test share
+// the single `mcp__<server>__<verb>` formula and the same contract source.
 //
 // Note we match the TOOL id, not the plugin/server NAME: the heartbeat's
 // loaded_mcp_tools list carries TOOL identifiers (mcp__<server>__<tool>); a name
