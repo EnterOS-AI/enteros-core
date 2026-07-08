@@ -17,16 +17,18 @@ PASS=0
 FAIL=0
 
 run_case() {
-  local name="$1" list_exit="$2" list_body="$3" expect_delete_sentinel="$4" zone_domain="${5:-}" max_delete_pct="${6:-100}"
+  local name="$1" list_exit="$2" list_body="$3" expect_delete_sentinel="$4" zone_domain="${5:-}" max_delete_pct="${6:-100}" expect_ip_flag="${7:-}"
   local tmp
   tmp=$(mktemp -d -t cf-e2e-prune-fail-closed-XXXXXX)
   local delete_sentinel="$tmp/delete_reached"
+  local curl_args_log="$tmp/curl_args.log"
 
   # URL-aware curl mock. CF token/zone preflight always succeeds. CF DNS list
   # endpoint receives the controlled response. CF DNS delete endpoint writes a
   # sentinel if reached.
   cat > "$tmp/curl" <<'MOCK'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "$CURL_ARGS_LOG"
 url=""
 method="GET"
 while [ "$#" -gt 0 ]; do
@@ -62,13 +64,15 @@ case "$url" in
 esac
 MOCK
   printf '%s\n' "$list_body" > "$tmp/list_body.txt"
-  sed -i "s|__LIST_BODY__|cat \"\$LIST_BODY_FILE\"|g; s|__LIST_EXIT__|$list_exit|g" "$tmp/curl"
+  sed "s|__LIST_BODY__|cat \"\$LIST_BODY_FILE\"|g; s|__LIST_EXIT__|$list_exit|g" "$tmp/curl" > "$tmp/curl.rewritten"
+  mv "$tmp/curl.rewritten" "$tmp/curl"
   chmod +x "$tmp/curl"
 
   local out="$tmp/out" err="$tmp/err"
   # Export paths so the mock script can find the list body file and sentinel.
   export DELETE_SENTINEL="$delete_sentinel"
   export LIST_BODY_FILE="$tmp/list_body.txt"
+  export CURL_ARGS_LOG="$curl_args_log"
   # Default MAX_DELETE_PCT=100 lets the existing happy-path cases delete the
   # single matched record. New hybrid-gate cases override this to 50.
   export MAX_DELETE_PCT="$max_delete_pct"
@@ -106,6 +110,19 @@ MOCK
       case_fail=1
     fi
   fi
+  if [ -n "$expect_ip_flag" ] && ! awk -v flag="$expect_ip_flag" '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i == flag) {
+          found = 1
+        }
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$curl_args_log"; then
+    echo "  ✗ $name: expected curl args to include $expect_ip_flag" >&2
+    case_fail=1
+  fi
 
   if [ "$case_fail" -eq 0 ]; then
     echo "  ✓ $name"
@@ -125,6 +142,7 @@ echo "Test: prune_cf_e2e_dns fail-closed boundary"
 echo
 
 # Bad CF list responses must abort before delete.
+run_case "Cloudflare API calls default to IPv4" 55  '{"success":false,"errors":[{"code":1000}]}'  false-abort "" 100 "-4"
 run_case "CF DNS list returns 500"            55  '{"success":false,"errors":[{"code":1000}]}'  false-abort
 run_case "CF DNS list returns malformed JSON"  0   'this is not json'                              false-abort
 run_case "CF DNS list returns non-array result" 0 '{"success":true,"result":{"id":"rec1"}}'      false-abort

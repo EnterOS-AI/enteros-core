@@ -43,6 +43,10 @@
 #                              is 100% of the matched set (default: 1).
 #   PRUNE_ZONE_DOMAIN=<domain> — comma-separated zone domain(s) to anchor
 #                                matches (default: staging.moleculesai.app).
+#   CF_CURL_IP_FLAG=<curl-arg> — IP mode for Cloudflare API calls. Defaults to
+#                                -4 because the current runner IPv6 egress is
+#                                outside the CF token location allowlist.
+#                                Set to empty to let curl choose.
 #
 # Exit codes:
 #   0  — dry-run completed or prune executed successfully
@@ -115,6 +119,15 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+CF_CURL_IP_FLAG="${CF_CURL_IP_FLAG--4}"
+cf_curl() {
+  if [ -n "$CF_CURL_IP_FLAG" ]; then
+    curl "$CF_CURL_IP_FLAG" "$@"
+  else
+    curl "$@"
+  fi
+}
+
 if ! [[ "$MIN_AGE_HOURS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: PRUNE_MIN_AGE_HOURS/--min-age-hours must be a non-negative integer" >&2
   exit 1
@@ -124,7 +137,7 @@ log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
 # --- Preflight: verify CF token + zone BEFORE any list/delete work ---------
 log "Preflight: verifying CF token + zone..."
-PF_TOKEN_JSON=$(curl -sS -m 10 -H "Authorization: Bearer $CF_API_TOKEN" \
+PF_TOKEN_JSON=$(cf_curl -sS -m 10 -H "Authorization: Bearer $CF_API_TOKEN" \
   "https://api.cloudflare.com/client/v4/user/tokens/verify")
 if ! echo "$PF_TOKEN_JSON" | python3 -c '
 import json, sys
@@ -151,7 +164,7 @@ if status != "active":
 fi
 log "  CF token active ✓"
 
-PF_ZONE_JSON=$(curl -sS -m 10 -H "Authorization: Bearer $CF_API_TOKEN" \
+PF_ZONE_JSON=$(cf_curl -sS -m 10 -H "Authorization: Bearer $CF_API_TOKEN" \
   "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID")
 if ! echo "$PF_ZONE_JSON" | CF_ZONE_ID="$CF_ZONE_ID" python3 -c '
 import json, os, sys
@@ -195,7 +208,7 @@ PAGE=1
 NEXT_PAGE=1
 while [ -n "$NEXT_PAGE" ]; do
   page_file="$PAGES_DIR/page-$(printf '%05d' "$PAGE").json"
-  curl -sS -m 30 -f -H "Authorization: Bearer $CF_API_TOKEN" \
+  cf_curl -sS -m 30 -f -H "Authorization: Bearer $CF_API_TOKEN" \
     "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?per_page=100&page=$NEXT_PAGE" \
     > "$page_file" || {
       log "ERROR: CF DNS list page $NEXT_PAGE failed (non-2xx or network error)."
@@ -393,7 +406,7 @@ DELETED=0
 FAILED=0
 while IFS=$'\t' read -r rid name; do
   [ -n "$rid" ] || continue
-  if curl -sS -m 15 -f -X DELETE \
+  if cf_curl -sS -m 15 -f -X DELETE \
        -H "Authorization: Bearer $CF_API_TOKEN" \
        "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$rid" \
        >/dev/null 2>&1; then
