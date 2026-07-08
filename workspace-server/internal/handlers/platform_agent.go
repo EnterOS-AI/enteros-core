@@ -568,16 +568,21 @@ const defaultConciergeRuntime = "openclaw"
 // uses (runtime_registry.go bareCreateDefaultRuntime), so the concierge follows
 // the one platform-runtime SSOT instead of a second hardcoded literal.
 //
-// FAIL CLOSED on an unknown override (mirrors bareCreateDefaultRuntime): the
-// resolved runtime MUST pass isKnownRuntime; an override naming a runtime the
-// provisioner can't honor is refused and we fall back to the compiled-in known
-// default rather than seed an unprovisionable concierge runtime.
+// FAIL CLOSED on an override the concierge can't run on: the resolved runtime
+// must pass the SAME container-backed guard the ensure/install endpoints apply
+// to an explicit runtime (platformRuntimeAllowed) — NOT just isKnownRuntime.
+// isKnownRuntime accepts external-like/mock meta-runtimes, which have no
+// container for the concierge's provision path; a MOLECULE_DEFAULT_RUNTIME of
+// e.g. 'external' or 'mock' would otherwise stamp an unprovisionable platform
+// root through the empty-runtime (default) path that the explicit-runtime guard
+// never sees (core#3496 review). An override that fails the guard is refused
+// and we fall back to the compiled-in container-backed default.
 func conciergeDefaultRuntime() string {
 	if v := strings.TrimSpace(os.Getenv("MOLECULE_DEFAULT_RUNTIME")); v != "" {
-		if isKnownRuntime(v) {
+		if ok, _ := platformRuntimeAllowed(v); ok {
 			return v
 		}
-		log.Printf("Concierge: MOLECULE_DEFAULT_RUNTIME=%q is not a known runtime; falling back to %q for the platform-agent default", v, defaultConciergeRuntime)
+		log.Printf("Concierge: MOLECULE_DEFAULT_RUNTIME=%q is not a container-backed runtime the concierge can run on; falling back to %q for the platform-agent default", v, defaultConciergeRuntime)
 	}
 	return defaultConciergeRuntime
 }

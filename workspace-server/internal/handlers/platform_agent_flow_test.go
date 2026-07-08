@@ -559,6 +559,31 @@ func TestEnsurePlatformAgent_NameStageError500(t *testing.T) {
 	}
 }
 
+// TestConciergeDefaultRuntime_RejectsNonContainerBackedOverride is the
+// core#3496-review regression: MOLECULE_DEFAULT_RUNTIME resolves through the
+// SAME container-backed guard as an explicit runtime, so a non-container-backed
+// override (external-like/mock/unknown) can NOT reach the concierge via the
+// empty-runtime (default) path — it falls back to the compiled-in default
+// rather than stamping an unprovisionable platform root.
+func TestConciergeDefaultRuntime_RejectsNonContainerBackedOverride(t *testing.T) {
+	for _, bad := range []string{"external", "kimi", "kimi-cli", "mock", "not-a-runtime"} {
+		t.Run(bad, func(t *testing.T) {
+			t.Setenv("MOLECULE_DEFAULT_RUNTIME", bad)
+			got := conciergeDefaultRuntime()
+			if got != defaultConciergeRuntime {
+				t.Errorf("MOLECULE_DEFAULT_RUNTIME=%q → conciergeDefaultRuntime()=%q, want the safe fallback %q (a non-container-backed default must never seed the platform root)", bad, got, defaultConciergeRuntime)
+			}
+			if ok, _ := platformRuntimeAllowed(got); !ok {
+				t.Errorf("resolved default %q fails platformRuntimeAllowed — the fallback itself must be container-backed", got)
+			}
+		})
+	}
+	t.Setenv("MOLECULE_DEFAULT_RUNTIME", "codex")
+	if got := conciergeDefaultRuntime(); got != "codex" {
+		t.Errorf("container-backed override codex not honored: got %q", got)
+	}
+}
+
 // TestConciergeDefaultRuntimeAndTemplateNaming pins the operator ruling
 // (core#3496, 2026-07-07: "openclaw should be the default for now") AND the
 // decoupling it forced: the "-default" template suffix + system-prompt.md
