@@ -32,6 +32,16 @@ mkdir -p "$WORK/bin"
 #   - repo basename is in $PRIVATE_REPOS and the URL is anonymous.
 cat > "$WORK/bin/git" <<'STUB'
 #!/bin/sh
+# Skip global options (`git -c key=val clone …`) that precede the subcommand —
+# clone-manifest.sh invokes `git -c credential.helper= clone` to neutralise a
+# configured credential helper, so the real subcommand is not $1.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
 [ "$1" = "clone" ] || exit 0
 url=""; target=""
 for a in "$@"; do
@@ -42,7 +52,18 @@ repo=$(basename "$url" .git)
 case " ${HARD_FAIL_REPOS:-} " in *" $repo "*) exit 1 ;; esac
 authed=0; case "$url" in *oauth2:*) authed=1 ;; esac
 case " ${PRIVATE_REPOS:-} " in
-    *" $repo "*) [ "$authed" -eq 1 ] || exit 1 ;;
+    *" $repo "*)
+        if [ "$authed" -ne 1 ]; then
+            # Anonymous private clone = real Gitea's 401. Real git would then
+            # block reading a username from the terminal — the hang the user
+            # hit. clone-manifest.sh must export GIT_TERMINAL_PROMPT=0 so git
+            # fast-fails instead. Record a regression marker (deterministic —
+            # no tty-dependent real hang) when that anti-hang env is ABSENT;
+            # the test asserts the marker never appears.
+            [ "${GIT_TERMINAL_PROMPT:-}" = "0" ] || : > "${STUB_PROMPT_MARKER:?}"
+            exit 1
+        fi
+        ;;
 esac
 mkdir -p "$target" && echo stub > "$target/STUB"
 exit 0
@@ -68,7 +89,8 @@ fail() { echo "FAIL: $1"; exit 1; }
 # clone-manifest.sh is run with `bash` (NOT sh): it uses `set -o pipefail`, which
 # dash (the CI runner's /bin/sh) rejects — and production runs it via bash too.
 run() {
-    OUT=$(env "$@" PATH="$WORK/bin:$PATH" \
+    rm -f "$WORK/prompt-marker"
+    OUT=$(env "$@" STUB_PROMPT_MARKER="$WORK/prompt-marker" PATH="$WORK/bin:$PATH" \
         bash "$CLONE_SH" "$WORK/manifest.json" "$WORK/ws" "$WORK/org" "$WORK/plugins" 2>&1)
     rc=$?
     printf '%s\n' "$OUT" > "$WORK/last.out"
@@ -83,7 +105,11 @@ if run -u MOLECULE_GITEA_TOKEN PRIVATE_REPOS="priv-x"; then :; else fail "A: tok
 [ -d "$WORK/ws/priv-x" ] && fail "A: private repo should have been skipped"
 echo "$OUT" | grep -q "skipping 'priv-x'" || fail "A: missing skip warning for priv-x"
 echo "$OUT" | grep -q "2/3 cloned, 1 skipped" || fail "A: summary wrong: $(echo "$OUT" | tail -1)"
-echo "ok A: tokenless → 2 public cloned, 1 marked-private skipped, exit 0"
+# Anti-hang: the tokenless private-repo clone must run with GIT_TERMINAL_PROMPT=0
+# so git fast-fails a 401 instead of blocking on a credential prompt (the
+# dev-start.sh hang). The stub records a marker if that env was absent.
+[ -f "$WORK/prompt-marker" ] && fail "A: GIT_TERMINAL_PROMPT=0 not set for the private clone — dev-start.sh would HANG on the credential prompt"
+echo "ok A: tokenless → 2 public cloned, 1 marked-private skipped, exit 0, no credential-prompt hang"
 
 # --- B. token set → all clone, exit 0 ------------------------------------
 reset
