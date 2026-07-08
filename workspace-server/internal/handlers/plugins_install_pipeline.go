@@ -362,7 +362,7 @@ func (h *PluginsHandler) resolveAndStage(ctx context.Context, req installRequest
 
 	// SSOT manifest validation — FAIL-CLOSED phase of core#3383 (PR-4,
 	// post-soak: 25/25 real org manifests validated clean). A present,
-	// readable plugin.yaml that violates the vendored plugin-manifest
+	// readable plugin.yaml that violates the SDK-owned plugin-manifest
 	// schema now aborts the install with 422, mirroring the
 	// VerifyManifestIntegrity posture above; the kill-switch
 	// MOLECULE_MANIFEST_SSOT_ENFORCE=off reverts to the advisory line.

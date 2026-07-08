@@ -1,37 +1,23 @@
 name: contract-ssot-sync
 
-# SSOT sync gate for the vendored plugin-manifest contract.
+# Retired compatibility workflow.
 #
-# PLUGIN-MANIFEST (core#3383): this workflow runs
-# check-plugin-manifest-ssot-sync.sh, which keeps the VENDORED plugin-manifest
-# schema (workspace-server/internal/plugins/contracts/plugin-manifest.schema.json,
-# go:embed'ed by internal/plugins/manifest_ssot.go for advisory install-time
-# manifest validation) honest against its LIVE SSOT in molecule-ai-sdk
-# (contracts/plugin-manifest/ -- molecule-contracts is archived; the sdk repo
-# is where this contract lives). Same trust model (public, unauthenticated,
-# fail-closed on fetch error / drift), byte-identical invariant.
-#
-# MCP-PLUGIN DELIVERY: core no longer vendors the old root-level JSON mirror.
-# Runtime code imports the generated go.moleculesai.app/sdk/gen/go/molcontracts
-# binding, and cross-repo drift checks compare template/runtime participants
-# directly against the SDK SSOT.
-#
-# WORKSPACE-COMMS: core no longer vendors the old workspace-comms schema mirror.
-# workspace_comms_ssot_test.go compares workspace.go's wire structs directly
-# against generated SDK bindings in go.moleculesai.app/sdk/gen/go/molcontracts.
+# Core no longer vendors the plugin-manifest schema mirror. The install-time
+# manifest validator consumes the generated SDK asset from
+# go.moleculesai.app/sdk/gen/go/molcontracts. Keep this workflow path and context
+# present during the cleanup so protected-path deletion guards see an explicit
+# retirement instead of a silent CI surface removal.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
-      - 'workspace-server/internal/plugins/contracts/plugin-manifest.schema.json'
       - 'workspace-server/internal/plugins/manifest_ssot.go'
       - '.gitea/scripts/check-plugin-manifest-ssot-sync.sh'
       - '.gitea/workflows/contract-ssot-sync.yml'
   push:
     branches: [main]
     paths:
-      - 'workspace-server/internal/plugins/contracts/plugin-manifest.schema.json'
       - 'workspace-server/internal/plugins/manifest_ssot.go'
       - '.gitea/scripts/check-plugin-manifest-ssot-sync.sh'
       - '.gitea/workflows/contract-ssot-sync.yml'
@@ -45,17 +31,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # bp-exempt: transitional vendored plugin-manifest mirror check, not a branch-protection gate.
+  # bp-exempt: retired compatibility context; plugin-manifest mirror moved to SDK generated assets.
   ssot-sync:
     name: Verify vendored plugin-manifest schema matches the molecule-ai-sdk SSOT
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 2
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      # plugin-manifest (core#3383): keep the VENDORED schema that
-      # manifest_ssot.go go:embed's (advisory install-time manifest validation)
-      # in lockstep with the LIVE molecule-ai-sdk SSOT. Same trust model
-      # (public, unauthenticated, fail-closed on fetch error / drift).
-      - name: Verify vendored plugin-manifest schema == molecule-ai-sdk SSOT
-        run: bash .gitea/scripts/check-plugin-manifest-ssot-sync.sh
+      - name: Retired
+        run: echo "plugin-manifest mirror sync is retired; core consumes SDK molcontracts assets."

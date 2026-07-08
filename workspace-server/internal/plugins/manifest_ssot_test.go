@@ -51,10 +51,10 @@ func assertSomeViolationContains(t *testing.T, violations []string, substr strin
 }
 
 func TestManifestSchema_Compiles(t *testing.T) {
-	// Guards vendoring corruption: the embedded SSOT schema must be valid
+	// Guards SDK contract asset corruption: the SSOT schema must be valid
 	// JSON and compile as draft 2020-12.
 	if _, err := compiledManifestSchema(); err != nil {
-		t.Fatalf("embedded plugin-manifest schema failed to compile: %v", err)
+		t.Fatalf("SDK plugin-manifest schema failed to compile: %v", err)
 	}
 }
 

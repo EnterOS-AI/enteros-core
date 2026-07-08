@@ -1,8 +1,6 @@
 package plugins
 
 import (
-	"bytes"
-	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,18 +8,11 @@ import (
 	"sync"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	molcontracts "go.moleculesai.app/sdk/gen/go/molcontracts"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 	"gopkg.in/yaml.v3"
 )
-
-// manifestSchemaJSON is the VENDORED copy of the plugin-manifest SSOT
-// schema (molecule-ai-sdk contracts/plugin-manifest/plugin-manifest.schema.json,
-// see contracts/PROVENANCE.md). Kept in lockstep with the SSOT by
-// .gitea/scripts/check-plugin-manifest-ssot-sync.sh.
-//
-//go:embed contracts/plugin-manifest.schema.json
-var manifestSchemaJSON []byte
 
 // maxManifestViolations bounds the flattened violation list so a
 // pathological manifest can't blow up the advisory log line.
@@ -37,20 +28,20 @@ var (
 // flattenManifestViolations doesn't allocate a printer per violation.
 var violationPrinter = message.NewPrinter(language.English)
 
-// compiledManifestSchema compiles the embedded SSOT schema exactly once.
-// A compile failure can only mean the vendored copy is corrupt (programmer
+// compiledManifestSchema compiles the SDK-owned SSOT schema exactly once.
+// A compile failure can only mean the generated SDK asset is corrupt (programmer
 // error, guarded by TestManifestSchema_Compiles) — returned as an error
 // rather than panicking so the advisory install path stays non-fatal.
 func compiledManifestSchema() (*jsonschema.Schema, error) {
 	manifestSchemaOnce.Do(func() {
-		doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(manifestSchemaJSON))
+		doc, err := jsonschema.UnmarshalJSON(strings.NewReader(molcontracts.PluginManifestSchemaJSON))
 		if err != nil {
-			manifestSchemaErr = fmt.Errorf("embedded plugin-manifest schema is not valid JSON: %w", err)
+			manifestSchemaErr = fmt.Errorf("SDK plugin-manifest schema is not valid JSON: %w", err)
 			return
 		}
 		c := jsonschema.NewCompiler()
 		if err := c.AddResource("plugin-manifest.schema.json", doc); err != nil {
-			manifestSchemaErr = fmt.Errorf("embedded plugin-manifest schema failed to load: %w", err)
+			manifestSchemaErr = fmt.Errorf("SDK plugin-manifest schema failed to load: %w", err)
 			return
 		}
 		manifestSchema, manifestSchemaErr = c.Compile("plugin-manifest.schema.json")
@@ -58,7 +49,7 @@ func compiledManifestSchema() (*jsonschema.Schema, error) {
 	return manifestSchema, manifestSchemaErr
 }
 
-// ValidateManifestSSOT validates plugin.yaml bytes against the vendored
+// ValidateManifestSSOT validates plugin.yaml bytes against the SDK-owned
 // plugin-manifest SSOT schema (JSON-Schema draft 2020-12, core#3383).
 // Returns nil/empty for a conforming manifest; otherwise a bounded list of
 // human-readable violations. Callers decide the enforcement posture — the
