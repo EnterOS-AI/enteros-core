@@ -273,6 +273,10 @@ func (h *MCPHandler) toolDelegateTask(ctx context.Context, callerID string, args
 		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "failed", fmt.Sprintf("A2A proxy returned status %d", status))
 		return "", fmt.Errorf("A2A proxy returned status %d", status)
 	}
+	if msg := extractA2AErrorMessage(body); msg != "" {
+		updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "failed", msg)
+		return "", fmt.Errorf("A2A delegation failed: %s", msg)
+	}
 	updateMCPDelegationStatus(ctx, h.database, callerID, delegationID, "dispatched", "")
 
 	return extractA2AText(body), nil
@@ -339,7 +343,7 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 			return
 		}
 
-		status, _, err := h.proxyA2ARequest(bgCtx, targetID, a2aBody, callerID, true)
+		status, respBody, err := h.proxyA2ARequest(bgCtx, targetID, a2aBody, callerID, true)
 		if err != nil || status < 200 || status >= 300 {
 			var errorDetail string
 			if err != nil {
@@ -350,6 +354,10 @@ func (h *MCPHandler) toolDelegateTaskAsync(ctx context.Context, callerID string,
 				errorDetail = fmt.Sprintf("http_status: %d", status)
 			}
 			updateMCPDelegationStatus(bgCtx, h.database, callerID, delegationID, "failed", errorDetail)
+			return
+		}
+		if msg := extractA2AErrorMessage(respBody); msg != "" {
+			updateMCPDelegationStatus(bgCtx, h.database, callerID, delegationID, "failed", msg)
 			return
 		}
 
@@ -672,4 +680,19 @@ func extractA2AText(body []byte) string {
 		log.Printf("extractA2AText: json.Marshal result failed: %v", marshalErr)
 	}
 	return string(b)
+}
+
+func extractA2AErrorMessage(body []byte) string {
+	var resp struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || resp.Error == nil {
+		return ""
+	}
+	if resp.Error.Message != "" {
+		return resp.Error.Message
+	}
+	return "A2A response contained an error"
 }
