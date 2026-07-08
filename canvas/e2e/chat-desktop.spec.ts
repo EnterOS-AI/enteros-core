@@ -48,11 +48,6 @@ test.describe("Desktop ChatTab", () => {
     await page.goto("/");
     await enterMapView(page);
     await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
-    // Dismiss onboarding guide if present.
-    const skipGuide = page.getByText("Skip guide");
-    if (await skipGuide.isVisible().catch(() => false)) {
-      await skipGuide.click();
-    }
     // Click the workspace node by its exact name label — scoped to the
     // React Flow canvas: ConciergeShell stays mounted (hidden) on the map
     // view and renders a matching wsName div, so an unscoped getByText
@@ -187,10 +182,6 @@ test.describe("Desktop ChatTab — Markdown rendering", () => {
     await page.goto("/");
     await enterMapView(page);
     await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
-    const skipGuide2 = page.getByText("Skip guide");
-    if (await skipGuide2.isVisible().catch(() => false)) {
-      await skipGuide2.click();
-    }
     await page.getByTestId(`workspace-node-${workspaceName}`).click();
     await page.locator('#tab-chat').click();
     await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", { timeout: 5_000 });

@@ -43,10 +43,6 @@ test("FilesTab renders after split", async ({ page, request }) => {
   // Screenshot: landing
   await page.screenshot({ path: "/tmp/filestab-1-landing.png", fullPage: false });
 
-  // Dismiss any onboarding overlay if present (best-effort)
-  const skip = page.getByText(/skip guide/i).first();
-  if (await skip.isVisible().catch(() => false)) await skip.click();
-
   // Click the workspace node — title text is unique
   const node = page.getByText("FilesTab Smoke").first();
   await node.waitFor({ timeout: 10_000 });

@@ -26,12 +26,6 @@ async function openChatPanel(page: Page, workspaceName: string): Promise<void> {
   await enterMapView(page);
   await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
 
-  // Dismiss onboarding guide if present.
-  const skipGuide = page.getByText("Skip guide");
-  if (await skipGuide.isVisible().catch(() => false)) {
-    await skipGuide.click();
-  }
-
   // Scope to the map-side panel (#2587) so we don't accidentally hit the
   // hidden ConciergeShell copy of ChatTab.
   await page.getByTestId(`workspace-node-${workspaceName}`).click();

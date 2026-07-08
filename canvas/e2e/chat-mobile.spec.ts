@@ -43,11 +43,6 @@ test.describe("MobileChat", () => {
     await page.waitForSelector("[data-testid='chat-panel']:visible", { timeout: 15_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
     await expect(page.locator("textarea").first()).toBeEnabled({ timeout: 15_000 });
-    // Dismiss onboarding guide if present.
-    const skipGuide = page.getByText("Skip guide");
-    if (await skipGuide.isVisible().catch(() => false)) {
-      await skipGuide.click();
-    }
   });
 
   test("chat panel loads without error", async ({ page }) => {
