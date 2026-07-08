@@ -514,6 +514,12 @@ jobs:
           # check missed. If a refactor weakens the gate to a shape check,
           # this step goes red on every PR.
           bash tests/e2e/test_completion_assert_unit.sh
+          # A2A response text extraction across the JSON-RPC/task/queue shapes
+          # that the staging harnesses consume. Keeps the concierge-created
+          # workspace gate from false-failing on a completed task whose text
+          # lands under status.message, message, or artifacts instead of
+          # result.parts.
+          bash tests/e2e/test_a2a_text_extract_unit.sh
           # harden/e2e-staging-saas-failclosed: fail-direction proof for the
           # E2E_REQUIRE_LIVE fail-closed-on-skip guard in
           # test_staging_full_saas.sh. Offline (no LLM/network/provisioning):
