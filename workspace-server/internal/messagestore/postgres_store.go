@@ -570,6 +570,8 @@ func extractFilesFromUserMessage(body json.RawMessage) []ChatAttachment {
 //   - {"result": "<text>"}
 //   - {"result": {"parts": [{"kind":"text","text":""}]}}
 //   - {"parts": [{"root": {"text": "..."}}]}             (older nested)
+//   - {"result": {"status": {"message": {"parts": [...]}}}} (task shape)
+//   - {"result": {"message": {"parts": [...]}}}          (alt task shape)
 //   - {"result": {"artifacts": [{"parts": [...]}]}}      (task shape)
 //   - {"task": "<text>"}                                 (fallback)
 //
@@ -601,6 +603,8 @@ func extractChatResponseText(body json.RawMessage) string {
 		var resultObj struct {
 			Parts     []map[string]any  `json:"parts"`
 			Artifacts []json.RawMessage `json:"artifacts"`
+			Status    json.RawMessage   `json:"status"`
+			Message   json.RawMessage   `json:"message"`
 		}
 		if err := json.Unmarshal(asObject.Result, &resultObj); err == nil {
 			if t := joinTextParts(resultObj.Parts); t != "" {
@@ -616,6 +620,28 @@ func extractChatResponseText(body json.RawMessage) string {
 			}
 			if len(rootTexts) > 0 {
 				collected = append(collected, strings.Join(rootTexts, "\n"))
+			}
+			if len(resultObj.Status) > 0 {
+				var status struct {
+					Message struct {
+						Parts []map[string]any `json:"parts"`
+					} `json:"message"`
+				}
+				if err := json.Unmarshal(resultObj.Status, &status); err == nil {
+					if t := joinTextParts(status.Message.Parts); t != "" {
+						collected = append(collected, t)
+					}
+				}
+			}
+			if len(resultObj.Message) > 0 {
+				var msg struct {
+					Parts []map[string]any `json:"parts"`
+				}
+				if err := json.Unmarshal(resultObj.Message, &msg); err == nil {
+					if t := joinTextParts(msg.Parts); t != "" {
+						collected = append(collected, t)
+					}
+				}
 			}
 			for _, raw := range resultObj.Artifacts {
 				var art struct {
@@ -641,12 +667,12 @@ func extractChatResponseText(body json.RawMessage) string {
 func joinTextParts(parts []map[string]any) string {
 	var texts []string
 	for _, p := range parts {
-		isText := false
-		if k, ok := p["kind"].(string); ok && k == "text" {
-			isText = true
-		}
-		if t, ok := p["type"].(string); ok && t == "text" {
-			isText = true
+		kind, hasKind := p["kind"].(string)
+		typ, hasType := p["type"].(string)
+		hasDiscriminator := (hasKind && kind != "") || (hasType && typ != "")
+		isText := true
+		if hasDiscriminator {
+			isText = kind == "text" || typ == "text"
 		}
 		if !isText {
 			continue
