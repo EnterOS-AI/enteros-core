@@ -197,7 +197,7 @@ The result is not just “an agent that learns.” It is **an organization that 
 - Next.js 15 + React Flow + Zustand
 - **warm-paper theme system** — light / dark / follow-system, SSR cookie + nonce'd boot script + ThemeProvider; terminal + code surfaces stay dark unconditionally
 - drag-to-nest team building
-- empty-state deployment + onboarding wizard
+- empty-state deployment + self-host first-run setup scene
 - template palette
 - bundle import/export
 - 10-tab side panel for chat, activity, details, skills, terminal, config, files, memory, traces, and events
@@ -318,10 +318,11 @@ npm run dev
 
 Then open `http://localhost:3000`:
 
-1. Deploy a template or create a blank workspace from the empty state.
-2. Follow the onboarding guide into `Config`.
-3. Add a provider key in `Secrets & API Keys`.
-4. Open `Chat` and send the first task.
+1. First boot seeds the org's platform agent automatically; the canvas opens on a fullscreen first-run scene.
+2. Pick a runtime, provider, and model from the cascading dropdowns and paste the matching API key — the **Enter OS Agent** comes online and greets you.
+3. Chat with it, or deploy a template / blank workspace from the empty state.
+
+Headless (no UI): set `MOLECULE_DEFAULT_RUNTIME` + `MOLECULE_LLM_DEFAULT_MODEL` and the matching provider key in the environment — the agent converges to online on first boot and the scene never renders. (`MOLECULE_SEED_PLATFORM_AGENT` is gone: the concierge is always seeded on self-host.)
 
 ## Documentation Map
 

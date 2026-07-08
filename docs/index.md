@@ -47,7 +47,7 @@ features:
 
 | Area | Current capability |
 |---|---|
-| **Canvas** | Empty-state deployment, onboarding guide, 10-tab side panel, template palette, bundle import/export, drag-to-nest teams, search, activity and trace views |
+| **Canvas** | Empty-state deployment, self-host first-run setup scene, 10-tab side panel, template palette, bundle import/export, drag-to-nest teams, search, activity and trace views |
 | **Platform** | Workspace CRUD, registry, A2A proxy, team expansion, approvals, secrets, global secrets, memory APIs, files API, terminal, viewport persistence, WebSocket fanout |
 | **Runtime** | One workspace image with four shipping adapters on `main`: Claude Code, Codex, Hermes, OpenClaw |
 | **Memory** | v2 plugin (pgvector + FTS) serving scoped agent memories under per-workspace namespaces; key/value workspace memory; session-search recall |
