@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -31,14 +32,21 @@ import (
 //  3. If `molecule-local/workspace-template-<runtime>:<sha12>` already
 //     exists in the local Docker image store, we return immediately.
 //  4. Otherwise: shallow git-clone the repo into the cache dir, then
-//     `docker buildx build --platform=linux/amd64 -t <tag>` on it. We
-//     also tag `:latest` so `docker images` shows a friendly entry.
+//     `docker build [-platform=<override>] -t <tag>` on it (native arch
+//     unless MOLECULE_IMAGE_PLATFORM overrides). We also tag `:latest`
+//     so `docker images` shows a friendly entry.
 //
-// Why amd64 emulation: the provisioner's defaultImagePlatform() forces
-// linux/amd64 on Apple Silicon for parity with the (amd64-only) prod
-// images. Building native arm64 in local-mode would diverge — see the
-// design rationale in Issue #63 and the saved memory
-// `feedback_local_must_mimic_production`.
+// Platform: NATIVE by default (core#3502). The old unconditional
+// linux/amd64 pin — kept for "parity with prod images" — made every
+// first build on Apple Silicon run under QEMU emulation, reliably
+// exceeding the 12-minute provision-timeout sweep: a guaranteed
+// cancel loop where the concierge could never come online. A local
+// build has no upstream manifest to match, so parity buys nothing a
+// QEMU-emulated build actually delivers; operators who want forced
+// parity set MOLECULE_IMAGE_PLATFORM, which governs the build AND the
+// container-create (localBuildImagePlatform keeps them in lockstep).
+// The tag embeds the arch so switching platforms can never serve a
+// stale-arch cache hit.
 //
 // Auth: clone is anonymous (templates are public). If MOLECULE_GITEA_TOKEN
 // is set, we use it via the URL's userinfo — the token is masked in
@@ -100,9 +108,10 @@ type LocalBuildOptions struct {
 	// MOLECULE_GITEA_TOKEN.
 	Token string
 
-	// Platform is the buildx --platform value. Empty = host default;
-	// today we always pass linux/amd64 because the provisioner only
-	// runs amd64 images. Exposed so tests can override.
+	// Platform is the --platform value for the build. Empty = host
+	// native (the default — core#3502); MOLECULE_IMAGE_PLATFORM
+	// overrides it, in lockstep with the container-create side
+	// (localBuildImagePlatform). Exposed so tests can override.
 	Platform string
 
 	// HTTPClient is used for the Gitea-API HEAD-sha lookup. Empty =
@@ -126,7 +135,7 @@ func newDefaultLocalBuildOptions() *LocalBuildOptions {
 		CacheDir:   os.Getenv("MOLECULE_LOCAL_BUILD_CACHE"),
 		RepoPrefix: os.Getenv("MOLECULE_LOCAL_TEMPLATE_REPO_PREFIX"),
 		Token:      os.Getenv("MOLECULE_GITEA_TOKEN"),
-		Platform:   "linux/amd64",
+		Platform:   localBuildImagePlatform(),
 	}
 	if o.CacheDir == "" {
 		if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
@@ -148,12 +157,32 @@ func newDefaultLocalBuildOptions() *LocalBuildOptions {
 
 // LocalImageTag formats the SHA-pinned tag for a runtime. Exported for
 // tests + the provisioner's image-resolution branch.
-func LocalImageTag(runtime, sha string) string {
+//
+// The tag embeds the target ARCH (e.g. `:abc123def456-arm64`) so a machine
+// that switches MOLECULE_IMAGE_PLATFORM (or a repo that changes the default)
+// can never get a stale-arch cache hit — the pre-#3502 tag was arch-blind
+// and the exists-check was tag-only.
+func LocalImageTag(runtime, sha, platform string) string {
 	short := sha
 	if len(short) > 12 {
 		short = short[:12]
 	}
-	return fmt.Sprintf("%s/workspace-template-%s:%s", localImagePrefix, runtime, short)
+	return fmt.Sprintf("%s/workspace-template-%s:%s-%s", localImagePrefix, runtime, short, localImageArchSuffix(platform))
+}
+
+// localImageArchSuffix derives the tag's arch component from a --platform
+// string ("linux/amd64" → "amd64"); empty platform = the host's native arch
+// (what an unpinned docker build produces).
+func localImageArchSuffix(platform string) string {
+	p := strings.TrimSpace(platform)
+	if p == "" {
+		return goruntime.GOARCH
+	}
+	parts := strings.Split(p, "/")
+	if len(parts) >= 2 && parts[1] != "" {
+		return parts[1]
+	}
+	return strings.ReplaceAll(p, "/", "-")
 }
 
 // LocalImageLatestTag returns the floating `:latest` form. Used as a
@@ -161,6 +190,14 @@ func LocalImageTag(runtime, sha string) string {
 // local-mode.
 func LocalImageLatestTag(runtime string) string {
 	return fmt.Sprintf("%s/workspace-template-%s:latest", localImagePrefix, runtime)
+}
+
+// IsLocalBuildImage reports whether an image reference names a locally-built
+// workspace image (the molecule-local/ namespace). The container-create path
+// uses it to pick localBuildImagePlatform() over the registry-pull default —
+// a locally-built image must run as the arch it was built for (core#3502).
+func IsLocalBuildImage(image string) bool {
+	return strings.HasPrefix(image, localImagePrefix+"/")
 }
 
 // EnsureLocalImage is the entry point the provisioner calls before
@@ -237,7 +274,7 @@ func ensureLocalImageWithOpts(ctx context.Context, runtime string, opts *LocalBu
 	if len(sha) < 12 {
 		return "", fmt.Errorf("local-build: Gitea returned a short sha %q for runtime %q (expected ≥12 chars)", sha, runtime)
 	}
-	tag := LocalImageTag(runtime, sha)
+	tag := LocalImageTag(runtime, sha, opts.Platform)
 	latest := LocalImageLatestTag(runtime)
 
 	// 2. Cache hit?

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -58,7 +59,7 @@ func TestEnsureLocalImage_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := "molecule-local/workspace-template-claude-code:abcdef012345"
+	want := "molecule-local/workspace-template-claude-code:abcdef012345-amd64"
 	if tag != want {
 		t.Errorf("tag = %q, want %q", tag, want)
 	}
@@ -435,10 +436,57 @@ func TestParseGiteaBranchHeadSha(t *testing.T) {
 // TestLocalImageTag_ShortSha — caller-supplied SHA gets truncated to
 // 12 chars in the tag so `docker images` output stays readable.
 func TestLocalImageTag_ShortSha(t *testing.T) {
-	got := LocalImageTag("claude-code", "abcdef0123456789abcdef0123456789abcdef01")
-	want := "molecule-local/workspace-template-claude-code:abcdef012345"
+	got := LocalImageTag("claude-code", "abcdef0123456789abcdef0123456789abcdef01", "linux/amd64")
+	want := "molecule-local/workspace-template-claude-code:abcdef012345-amd64"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestLocalImageTag_ArchSuffix — the tag embeds the target arch so switching
+// MOLECULE_IMAGE_PLATFORM can never serve a stale-arch cache hit (core#3502).
+// An empty platform (native build) uses the HOST arch, so that case asserts
+// against goruntime.GOARCH rather than a hardcoded value — the test is
+// host-portable by construction.
+func TestLocalImageTag_ArchSuffix(t *testing.T) {
+	cases := map[string]string{
+		"linux/amd64":    "amd64",
+		"linux/arm64":    "arm64",
+		"linux/arm64/v8": "arm64",
+		"":               goruntime.GOARCH,
+	}
+	for platform, arch := range cases {
+		got := LocalImageTag("hermes", "abcdef0123456789", platform)
+		want := "molecule-local/workspace-template-hermes:abcdef012345-" + arch
+		if got != want {
+			t.Errorf("platform %q: got %q, want %q", platform, got, want)
+		}
+	}
+}
+
+// TestIsLocalBuildImage — the create-path discriminator that keeps a
+// locally-built image running as the arch it was built for.
+func TestIsLocalBuildImage(t *testing.T) {
+	if !IsLocalBuildImage("molecule-local/workspace-template-openclaw:abc-arm64") {
+		t.Error("molecule-local/ image not recognized")
+	}
+	for _, img := range []string{"ghcr.io/molecule-ai/x:1", "molecule-localish/x:1", "postgres:15"} {
+		if IsLocalBuildImage(img) {
+			t.Errorf("%q wrongly classified as local-build", img)
+		}
+	}
+}
+
+// TestLocalBuildImagePlatform — native by default; MOLECULE_IMAGE_PLATFORM
+// overrides BOTH the build and the container-create side (core#3502).
+func TestLocalBuildImagePlatform(t *testing.T) {
+	t.Setenv("MOLECULE_IMAGE_PLATFORM", "")
+	if got := localBuildImagePlatform(); got != "" {
+		t.Errorf("explicit empty env: got %q, want \"\" (docker host-native)", got)
+	}
+	t.Setenv("MOLECULE_IMAGE_PLATFORM", "linux/amd64")
+	if got := localBuildImagePlatform(); got != "linux/amd64" {
+		t.Errorf("env override: got %q, want linux/amd64", got)
 	}
 }
 
@@ -518,6 +566,7 @@ func TestNewDefaultLocalBuildOptions_RespectsEnvOverrides(t *testing.T) {
 	t.Setenv("MOLECULE_LOCAL_BUILD_CACHE", "/var/tmp/molecule-test")
 	t.Setenv("MOLECULE_LOCAL_TEMPLATE_REPO_PREFIX", "https://my.fork/org/tpl-")
 	t.Setenv("MOLECULE_GITEA_TOKEN", "tok-from-env")
+	t.Setenv("MOLECULE_IMAGE_PLATFORM", "linux/riscv64")
 
 	opts := newDefaultLocalBuildOptions()
 	if opts.CacheDir != "/var/tmp/molecule-test" {
@@ -529,8 +578,8 @@ func TestNewDefaultLocalBuildOptions_RespectsEnvOverrides(t *testing.T) {
 	if opts.Token != "tok-from-env" {
 		t.Errorf("Token = %q", opts.Token)
 	}
-	if opts.Platform != "linux/amd64" {
-		t.Errorf("Platform = %q, want linux/amd64", opts.Platform)
+	if opts.Platform != "linux/riscv64" {
+		t.Errorf("Platform = %q, want the MOLECULE_IMAGE_PLATFORM override (native default is covered by TestLocalBuildImagePlatform)", opts.Platform)
 	}
 }
 

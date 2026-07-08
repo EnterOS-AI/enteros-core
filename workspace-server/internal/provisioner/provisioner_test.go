@@ -1752,7 +1752,6 @@ func TestResolveStartWorkspaceHostURL(t *testing.T) {
 	})
 }
 
-
 // TestBuildStartWorkspaceEnv covers the #2851 production-path env injection
 // gap that bit 3 rounds running (Researcher #11798 / #11787 close-out).
 // The provisioner's Start() must inject MOLECULE_WORKSPACE_URL=<host-port>
