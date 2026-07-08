@@ -243,6 +243,10 @@ extract_a2a_text() {
   python3 "$SCRIPT_DIR/lib/a2a_text_extract.py"
 }
 
+extract_chat_history_agent_text() {
+  python3 "$SCRIPT_DIR/lib/chat_history_agent_text.py"
+}
+
 a2a_text_has_expected() {
   local text="$1"
   local expected="$2"
@@ -274,6 +278,21 @@ except Exception:
     sys.exit(0)
 if body is not None:
     print(json.dumps(body))
+" 2>/dev/null
+}
+
+is_push_async_queued_response() {
+  python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+if d.get('delivery_mode') == 'push-async' and str(d.get('status') or '').lower() == 'queued':
+    sys.exit(0)
+sys.exit(1)
 " 2>/dev/null
 }
 
@@ -338,6 +357,48 @@ except Exception:
   done
 
   fail "$label queue poll timed out waiting for $queue_id to complete"
+}
+
+poll_push_async_chat_history() {
+  local ws_id="$1"
+  local out_file="$2"
+  local label="$3"
+  local timeout_secs="${4:-$AGENT_ACT_SECS}"
+  local history_tmp="$TMPDIR_E2E/${label//[^a-zA-Z0-9]/_}_chat_history"
+  local deadline=$(( $(date +%s) + timeout_secs ))
+  local poll_count=0 code rc text
+
+  : >"$out_file"
+  while true; do
+    : >"$history_tmp"
+    set +e
+    code=$(tenant_call GET "/workspaces/$ws_id/chat-history?limit=20" \
+      --max-time 30 \
+      -o "$history_tmp" \
+      -w '%{http_code}' \
+      2>/dev/null)
+    rc=$?
+    set -e
+    code=${code:-000}
+
+    if [ "$rc" = "0" ] && [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+      text=$(cat "$history_tmp" 2>/dev/null | extract_chat_history_agent_text 2>/dev/null || echo "")
+      if [ -n "$text" ]; then
+        printf '%s' "$text" >"$out_file"
+        return 0
+      fi
+    fi
+
+    if [ "$(date +%s)" -gt "$deadline" ]; then
+      log "    $label push-async chat-history poll timed out (last http=$code rc=$rc)"
+      return 1
+    fi
+    poll_count=$((poll_count + 1))
+    if [ $((poll_count % 6)) -eq 0 ]; then
+      log "    $label push-async still waiting for agent reply in chat-history (last http=$code)"
+    fi
+    sleep 5
+  done
 }
 
 CURL_COMMON=(-sS --max-time 30)
@@ -1059,6 +1120,7 @@ print(json.dumps({
         'parts': [{'kind': 'text', 'text': os.environ['WORK_PROMPT']}]}}
 }))")
 WORK_TMP="$TMPDIR_E2E/work_out"
+WORK_CHAT_TEXT_TMP="$TMPDIR_E2E/work_chat_text"
 WORK_ACCEPTED=0; WORK_OK=0; WORK_CODE=000; WORK_RC=1; WORK_TEXT=""; WORK_RESP=""
 for WORK_ATTEMPT in $(seq 1 8); do
   : >"$WORK_TMP"
@@ -1079,7 +1141,18 @@ for WORK_ATTEMPT in $(seq 1 8); do
       WORK_RESP=$(cat "$WORK_TMP" 2>/dev/null || echo "")
     fi
 
-    WORK_TEXT=$(printf '%s' "$WORK_RESP" | extract_a2a_text 2>/dev/null || echo "")
+    WORK_PUSH_ASYNC=0
+    if printf '%s' "$WORK_RESP" | is_push_async_queued_response; then
+      WORK_PUSH_ASYNC=1
+      log "    assign-work A2A returned push-async queued; polling chat-history for the agent reply"
+      if poll_push_async_chat_history "$WORKER_ID" "$WORK_CHAT_TEXT_TMP" "assign-work" "$AGENT_ACT_SECS"; then
+        WORK_TEXT=$(cat "$WORK_CHAT_TEXT_TMP" 2>/dev/null || echo "")
+      else
+        WORK_TEXT=""
+      fi
+    else
+      WORK_TEXT=$(printf '%s' "$WORK_RESP" | extract_a2a_text 2>/dev/null || echo "")
+    fi
     log "    team member replied (first 200 chars): $(echo "$WORK_TEXT" | head -c 200)"
     if hit=$(a2a_completion_error_marker "$WORK_TEXT"); then
       fail "assign-work — real-completion gate: agent returned an ERROR-AS-TEXT payload (matched '$hit'). Raw: ${WORK_TEXT:0:200}"
@@ -1089,6 +1162,9 @@ for WORK_ATTEMPT in $(seq 1 8); do
       break
     fi
     if [ "$WORK_ATTEMPT" -lt 8 ]; then
+      if [ "$WORK_PUSH_ASYNC" = "1" ]; then
+        break
+      fi
       if [ -z "$WORK_TEXT" ]; then
         log "    assign-work attempt $WORK_ATTEMPT/8 returned no extracted text — retrying"
       else
