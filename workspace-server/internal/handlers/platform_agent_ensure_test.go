@@ -193,7 +193,7 @@ func doEnsureRequest(t *testing.T, h *WorkspaceHandler, body string) (*httptest.
 // 200 "exists", NO install, NO provision.
 func TestEnsurePlatformAgent_HealthyNoOp(t *testing.T) {
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-existing", "online"))
 
 	h, cap := ensureTestHandler(t, true)
@@ -229,7 +229,7 @@ func TestEnsurePlatformAgent_CreatesWhenMissing(t *testing.T) {
 	wantID := DeterministicPlatformAgentID("org-create-test")
 
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnError(sql.ErrNoRows)
 
 	h, cap := ensureTestHandler(t, true)
@@ -262,7 +262,7 @@ func TestEnsurePlatformAgent_CreatesWhenMissing(t *testing.T) {
 // IN PLACE (install + provision against the EXISTING id, never a duplicate).
 func TestEnsurePlatformAgent_RepairsDegraded(t *testing.T) {
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-existing", "failed"))
 
 	h, cap := ensureTestHandler(t, true)
@@ -295,7 +295,7 @@ func TestEnsurePlatformAgent_RepairsDegraded(t *testing.T) {
 func TestEnsurePlatformAgent_RepairsRemovedConciergeRevives(t *testing.T) {
 	mock := setupTestDB(t)
 	// The lookup INCLUDES removed roots — it returns the tombstoned concierge.
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-removed", "removed"))
 	// The explicit revive: clear the removed flag (scoped to status='removed').
 	mock.ExpectExec(`UPDATE workspaces SET status = \$2, updated_at = now\(\) WHERE id = \$1 AND status = 'removed'`).
@@ -336,7 +336,7 @@ func TestEnsurePlatformAgent_RepairsRemovedConciergeRevives(t *testing.T) {
 // revive here, sqlmock would flag the unexpected UPDATE.
 func TestEnsurePlatformAgent_NonRemovedRepairDoesNotRevive(t *testing.T) {
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-degraded", "degraded"))
 	// NOTE: no ExpectExec for a revive — a non-removed repair must NOT issue one.
 
@@ -363,7 +363,7 @@ func TestEnsurePlatformAgent_NonRemovedRepairDoesNotRevive(t *testing.T) {
 // not be un-tombstoned must not be reported as provisioning).
 func TestEnsurePlatformAgent_ReviveFailureIs500(t *testing.T) {
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-removed", "removed"))
 	mock.ExpectExec(`UPDATE workspaces SET status = \$2, updated_at = now\(\) WHERE id = \$1 AND status = 'removed'`).
 		WillReturnError(fmt.Errorf("db down"))
@@ -452,7 +452,7 @@ func TestRestartByID_RemovedConciergeSkipped(t *testing.T) {
 // concierge (the explicit repair-tool path).
 func TestEnsurePlatformAgent_ForceRepairsHealthy(t *testing.T) {
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-existing", "online"))
 
 	h, cap := ensureTestHandler(t, true)
@@ -474,7 +474,7 @@ func TestEnsurePlatformAgent_ForceRepairsHealthy(t *testing.T) {
 func TestEnsurePlatformAgent_NoProvisionerStillInstalls(t *testing.T) {
 	t.Setenv("MOLECULE_ORG_ID", "")
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnError(sql.ErrNoRows)
 
 	h, cap := ensureTestHandler(t, false) // no provisioner
@@ -508,7 +508,7 @@ func TestEnsurePlatformAgent_NoProvisionerStillInstalls(t *testing.T) {
 // and does NOT trigger a provision.
 func TestEnsurePlatformAgent_InstallErrorIs500(t *testing.T) {
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnError(sql.ErrNoRows)
 
 	h, cap := ensureTestHandler(t, true)
@@ -527,7 +527,7 @@ func TestEnsurePlatformAgent_InstallErrorIs500(t *testing.T) {
 // handler must treat it as defaults (not a 400).
 func TestEnsurePlatformAgent_EmptyBodyTolerated(t *testing.T) {
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow("pa-existing", "online"))
 
 	h, _ := ensureTestHandler(t, true)
@@ -545,7 +545,7 @@ func TestEnsurePlatformAgent_EmptyBodyTolerated(t *testing.T) {
 // (no install, no provision).
 func TestEnsurePlatformAgent_LookupErrorIs500(t *testing.T) {
 	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT id, COALESCE\(status, ''\) FROM workspaces WHERE kind = 'platform'`).
+	mock.ExpectQuery(`SELECT id, COALESCE\(status::text, ''\) FROM workspaces WHERE kind = 'platform'`).
 		WillReturnError(fmt.Errorf("db down"))
 
 	h, cap := ensureTestHandler(t, true)

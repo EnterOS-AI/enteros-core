@@ -228,6 +228,24 @@ type ensurePlatformAgentPayload struct {
 	Force bool `json:"force"`
 }
 
+// platformRootLookupQuery finds the org's current platform root, INCLUDING
+// tombstoned (status='removed') rows — see the in-handler comment for why.
+//
+// ENUM-SCAN HAZARD (do not "simplify" this query): workspaces.status is the
+// workspace_status Postgres ENUM (migration 043), nullable by schema. The
+// cast to text happens BEFORE the COALESCE on purpose — a bare
+// COALESCE(status, '') makes Postgres coerce the untyped '' literal to the
+// enum type at PARSE time, and the whole query fails with
+//
+//	pq: invalid input value for enum workspace_status: ""
+//
+// even when ZERO rows match. That exact shape shipped in 8cd393187 and broke
+// this endpoint 100% of the time while every sqlmock unit test stayed green
+// (sqlmock regex-matches the SQL text and never plans it). Same class as the
+// registry.go heartbeat scan fix. Pinned against a real Postgres by
+// TestIntegration_PlatformRootLookupEnumSafe.
+const platformRootLookupQuery = `SELECT id, COALESCE(status::text, '') FROM workspaces WHERE kind = 'platform' AND parent_id IS NULL LIMIT 1`
+
 // EnsurePlatformAgent handles POST /admin/org/platform-agent/ensure (AdminAuth).
 //
 // Self-contained, core-only create/repair for the org's platform agent: derives
@@ -254,8 +272,9 @@ func (h *WorkspaceHandler) EnsurePlatformAgent(c *gin.Context) {
 	ctx := c.Request.Context()
 	derivedID := PlatformAgentID()
 
-	// Look up the org's current platform root (if any). COALESCE keeps an
-	// unexpected NULL status from failing the scan.
+	// Look up the org's current platform root (if any). The COALESCE(status::text, '')
+	// keeps a NULL status from failing the scan — and the ::text cast is
+	// load-bearing, see the platformRootLookupQuery doc comment.
 	//
 	// REMOVED/TOMBSTONED ROOTS ARE INCLUDED ON PURPOSE (CR2 RC 14676): the SELECT
 	// deliberately does NOT filter `status != 'removed'`. A deleted concierge
@@ -269,8 +288,7 @@ func (h *WorkspaceHandler) EnsurePlatformAgent(c *gin.Context) {
 	// the returned status and flags a removed root for an explicit revive.
 	var existingID, existingStatus string
 	found := false
-	err := db.DB.QueryRowContext(ctx,
-		`SELECT id, COALESCE(status, '') FROM workspaces WHERE kind = 'platform' AND parent_id IS NULL LIMIT 1`).
+	err := db.DB.QueryRowContext(ctx, platformRootLookupQuery).
 		Scan(&existingID, &existingStatus)
 	switch {
 	case err == nil:
