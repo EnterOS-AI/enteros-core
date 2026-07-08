@@ -34,7 +34,6 @@ func mustParseTime(t *testing.T, s string) time.Time {
 	return tt
 }
 
-
 // =====================================================================
 // timestamp preservation (regression cover)
 //
@@ -585,6 +584,40 @@ func TestChatHistory_TaskShapeArtifactsExtracted(t *testing.T) {
 	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil)
 	if len(msgs) != 1 || msgs[0].Content != "hermes detail line" {
 		t.Errorf("artifact text not extracted: %+v", msgs)
+	}
+}
+
+func TestChatHistory_TaskStatusMessagePartsExtracted(t *testing.T) {
+	// A2A Task shape returned by newer runtimes:
+	// {"result":{"status":{"message":{"parts":[...]}}}}
+	body := json.RawMessage(`{
+	  "result": {
+	    "status": {
+	      "message": {
+	        "parts": [{"kind":"text","text":"391"}]
+	      }
+	    }
+	  }
+	}`)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil)
+	if len(msgs) != 1 || msgs[0].Content != "391" {
+		t.Errorf("status.message.parts text not extracted: %+v", msgs)
+	}
+}
+
+func TestChatHistory_TaskMessagePartsExtracted(t *testing.T) {
+	// Alternate A2A Task shape:
+	// {"result":{"message":{"parts":[...]}}}
+	body := json.RawMessage(`{
+	  "result": {
+	    "message": {
+	      "parts": [{"text":"message-level reply without kind"}]
+	    }
+	  }
+	}`)
+	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, body, nil)
+	if len(msgs) != 1 || msgs[0].Content != "message-level reply without kind" {
+		t.Errorf("message.parts text not extracted: %+v", msgs)
 	}
 }
 
