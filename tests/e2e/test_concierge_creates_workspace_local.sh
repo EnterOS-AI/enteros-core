@@ -24,9 +24,10 @@
 # stack can actually run it, and never false-reds when it can't.
 #
 # To make the local stack able to run this GREEN you need BOTH:
-#   1. A concierge seeded as the kind='platform' root. The self-hosted compose
-#      sets MOLECULE_SEED_PLATFORM_AGENT=1 so the ws-server self-seeds it
-#      (EnsureSelfHostedPlatformAgent) + best-effort provisions it on boot
+#   1. A concierge seeded as the kind='platform' root. The ws-server seeds it
+#      UNCONDITIONALLY on self-host boot (MOLECULE_ORG_ID unset — core#3496;
+#      the old MOLECULE_SEED_PLATFORM_AGENT flag is removed) and best-effort
+#      provisions it once a model signal is configured
 #      (MaybeProvisionPlatformAgentOnBoot).
 #   2. That concierge running on the platform-agent image (so create_workspace
 #      exists) WITH a working model key (e.g. MINIMAX_API_KEY / a BYOK key) so its
@@ -149,8 +150,12 @@ ok "Local stack reachable"
 # ─── 1. Discover the concierge (kind='platform' root) ─────────────────────────
 CONCIERGE_ID=$(find_platform_root)
 if [ -z "$CONCIERGE_ID" ]; then
-  skip_loud "no kind='platform' concierge seeded on the local stack. Set MOLECULE_SEED_PLATFORM_AGENT=1 \
-on the ws-server (self-hosted compose does this) so it self-seeds + provisions the concierge."
+  # core#3496: the ws-server seeds the concierge row UNCONDITIONALLY on
+  # self-host boot (MOLECULE_ORG_ID unset) — a missing platform root on a local
+  # stack is a genuine seed bug now, not a configuration gap. HARD FAIL.
+  echo "FAIL: no kind='platform' concierge on the local stack — the unconditional boot seed" >&2
+  echo "      (EnsureSelfHostedPlatformAgent) should have created it. This is a bug." >&2
+  exit 1
 fi
 ok "Concierge (platform root) = $CONCIERGE_ID"
 

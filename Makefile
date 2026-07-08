@@ -60,10 +60,12 @@ e2e-peer-visibility: ## Run the LOCAL peer-visibility MCP gate vs the running st
 # FUNCTIONAL local proof that the org concierge actually DOES org-management:
 # send it a natural-language A2A request and assert it really CREATES a workspace
 # via its platform MCP (create_workspace) — the deterministic side effect, not a
-# REST 200. SKIPs LOUD (exit 0) unless the local concierge is seeded, online, and
-# running on the platform-agent image (so create_workspace exists). To run it
-# green locally: seed the concierge (MOLECULE_SEED_PLATFORM_AGENT=1) on the
-# platform-agent image WITH a model key. See the script header for the contract.
+# REST 200. The concierge row is seeded unconditionally on self-host boot
+# (core#3496 — a MISSING concierge is a hard FAIL now, not a skip); the script
+# still SKIPs LOUD (exit 0) when the stack can't run the functional leg (not
+# online / not on the platform-agent image / no model key). To run it green
+# locally: configure a model + key (onboarding scene, Settings, or
+# MOLECULE_LLM_DEFAULT_MODEL + a provider key in env). See the script header.
 e2e-concierge-creates-workspace: ## Prove the concierge actually creates a workspace via its platform MCP (skips loud if not runnable).
 	bash tests/e2e/test_concierge_creates_workspace_local.sh
 

@@ -147,13 +147,17 @@ func main() {
 		}
 	}
 
-	// Self-hosted platform-agent seed. With no control plane present to install
-	// the org's concierge (SaaS leaves it to the CP at org-provision time), the
-	// tenant server seeds it itself when MOLECULE_SEED_PLATFORM_AGENT is set —
-	// the self-hosted docker-compose sets it, while CI harnesses + SaaS tenants
-	// leave it unset (so e2e empty-DB assertions and the CP path are unaffected).
-	// Idempotent + best-effort — never fatal.
-	if v := os.Getenv("MOLECULE_SEED_PLATFORM_AGENT"); v == "true" || v == "1" {
+	// Self-hosted platform-agent seed — UNCONDITIONAL on self-host (core#3496,
+	// operator ruling 2026-07-07: "the first agent and manager agent should
+	// always be the concierge"). With no control plane present to install the
+	// org's concierge, the tenant server seeds the row itself on EVERY boot —
+	// the old MOLECULE_SEED_PLATFORM_AGENT opt-in flag is removed. The gate is
+	// MOLECULE_ORG_ID: SaaS/CP tenants and CI harnesses always set it and never
+	// self-seed (byte-identical to their old flag-unset behavior); a tombstoned
+	// root is respected, never silently revived. Idempotent + best-effort —
+	// never fatal. Row-only: the boot provision is phase 2 below, after the
+	// provisioner exists.
+	if handlers.SelfHostPlatformSeedEnabled() {
 		if err := handlers.EnsureSelfHostedPlatformAgent(context.Background(), db.DB); err != nil {
 			log.Printf("boot: platform-agent self-seed failed (non-fatal): %v", err)
 		}
@@ -372,15 +376,18 @@ func main() {
 	// exist, kick off a best-effort provision so a self-hosted concierge comes
 	// online automatically once LLM creds exist.
 	//
-	// Guarded to self-host ONLY: same MOLECULE_SEED_PLATFORM_AGENT flag as the
-	// seed AND prov != nil (local Docker active ⇒ MOLECULE_ORG_ID unset). The
-	// SaaS path (cpProv != nil ⇒ prov == nil) never triggers — the CP owns
-	// concierge provisioning there. Best-effort + non-fatal + runs once: on a
-	// fresh self-host with no creds the provision fails and the agent stays
-	// 'failed' until BYOK is configured via Settings; RestartByID is itself
-	// debounced so this can't loop. Runs in a goroutine inside the helper so a
-	// slow image pull never delays the HTTP server.
-	if v := os.Getenv("MOLECULE_SEED_PLATFORM_AGENT"); (v == "true" || v == "1") && prov != nil {
+	// Guarded to self-host ONLY: SelfHostPlatformSeedEnabled() (MOLECULE_ORG_ID
+	// unset — same gate as the phase-1 seed; the old flag is removed, core#3496)
+	// AND prov != nil (local Docker active). The SaaS path (cpProv != nil ⇒
+	// prov == nil) never triggers — the CP owns concierge provisioning there.
+	// Best-effort + non-fatal + runs once: an UNCONFIGURED root (no model
+	// signal) is parked at 'offline' for the onboarding scene instead of
+	// burning a guaranteed-failed provision (D2 posture, inside the helper);
+	// a configured root with a missing/wrong key still fails loudly — a real
+	// error state the user must see. RestartByID is itself debounced so this
+	// can't loop. Runs in a goroutine inside the helper so a slow image pull
+	// never delays the HTTP server.
+	if handlers.SelfHostPlatformSeedEnabled() && prov != nil {
 		handlers.MaybeProvisionPlatformAgentOnBoot(context.Background(), db.DB, prov, wh.RestartByID)
 	}
 

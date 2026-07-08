@@ -342,7 +342,7 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 			// deliver system-prompt.md for claude-code (its runtime reads that file
 			// by convention).
 			configFiles[conciergePersonaPromptPath] = persona
-			if runtime == defaultConciergeRuntime {
+			if runtime == claudeCodeRuntime {
 				configFiles["system-prompt.md"] = persona
 			}
 		}
@@ -367,8 +367,17 @@ const conciergePersonaPromptPath = "prompts/concierge.md"
 // the "-default" variant; every other runtime's template dir == its name.
 func conciergeBaseTemplateName(runtime string) string {
 	runtime = strings.TrimSpace(runtime)
-	if runtime == "" || runtime == defaultConciergeRuntime {
-		return defaultConciergeRuntime + "-default"
+	if runtime == "" {
+		// Resolve the ACTUAL default (env-aware), not the compiled-in const —
+		// an operator's MOLECULE_DEFAULT_RUNTIME must drive the template pick.
+		runtime = conciergeDefaultRuntime()
+	}
+	// The "-default" suffix is a claude-code-ONLY convention (its baked base
+	// template dir is "claude-code-default"); every other runtime's template
+	// dir == its runtime name. Previously keyed off defaultConciergeRuntime,
+	// which broke the moment the default stopped being claude-code.
+	if runtime == claudeCodeRuntime {
+		return claudeCodeRuntime + "-default"
 	}
 	return runtime
 }
@@ -419,7 +428,7 @@ func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte
 	// Graft the persona per the runtime's convention. claude-code reads
 	// system-prompt.md (delivered separately); every other runtime reads the
 	// prompt_files list, so the persona becomes its sole prompt file.
-	if strings.TrimSpace(runtime) != "" && runtime != defaultConciergeRuntime {
+	if strings.TrimSpace(runtime) != "" && runtime != claudeCodeRuntime {
 		yamlMappingSet(root, "prompt_files", yamlStringSeq(conciergePersonaPromptPath))
 	}
 	out, err := yaml.Marshal(&doc)
@@ -523,22 +532,34 @@ func substituteConciergeName(prompt []byte, name string) []byte {
 	return []byte(strings.ReplaceAll(string(prompt), conciergeNamePlaceholder, name))
 }
 
+// claudeCodeRuntime names the claude-code runtime for its TWO concierge-side
+// conventions that are claude-code-SPECIFIC and not default-runtime-specific
+// (they were previously conflated with defaultConciergeRuntime, which would
+// break the moment the default changed): (a) claude-code reads
+// system-prompt.md instead of a prompt_files list, and (b) its baked base
+// template dir is the "-default" variant ("claude-code-default") while every
+// other runtime's template dir == its runtime name.
+const claudeCodeRuntime = "claude-code"
+
 // defaultConciergeRuntime is the compiled-in FALLBACK runtime for the platform
 // agent (concierge) when no per-org runtime is specified AND the generic KMS
 // platform default env is unset. The platform de-bake (P3b) makes the concierge
 // runtime a PARAMETER (threaded through installPlatformAgent + ensureConciergeModel),
 // so a per-org concierge can run on codex / openclaw / hermes, not only the legacy
-// 'claude-code' image variant. The fallback stays 'claude-code' for backward
-// compatibility (existing installs, self-host seed, OSS/local). platformDefaultModelFallback
-// is validated against the registry FOR THE CHOSEN RUNTIME before being seeded.
+// 'claude-code' image variant. platformDefaultModelFallback is validated
+// against the registry FOR THE CHOSEN RUNTIME before being seeded.
 //
 // SSOT FOLLOW (PR-6 concierge-follows): this const is now only the FALLBACK.
 // conciergeDefaultRuntime resolves the runtime default from the generic KMS env
 // MOLECULE_DEFAULT_RUNTIME (the same SSOT handlers.Create reads via
 // bareCreateDefaultRuntime), falling back to this const when the env is unset.
-// The prod KMS value equals this const ('claude-code'), so the follow is
-// behavior-neutral on prod — no regression.
-const defaultConciergeRuntime = "claude-code"
+//
+// 'openclaw' per the operator ruling 2026-07-07 (core#3496: "openclaw should
+// be the default for now") — this also ALIGNS the compiled-in fallback with
+// the platform KMS default (staging-tenant-cd.yml already defaults
+// MOLECULE_DEFAULT_RUNTIME to 'openclaw'), closing a documented divergence
+// where self-host and SaaS silently seeded different concierge runtimes.
+const defaultConciergeRuntime = "openclaw"
 
 // conciergeDefaultRuntime resolves the concierge's default runtime, honoring the
 // generic KMS platform default env MOLECULE_DEFAULT_RUNTIME (injected at deploy
@@ -547,16 +568,21 @@ const defaultConciergeRuntime = "claude-code"
 // uses (runtime_registry.go bareCreateDefaultRuntime), so the concierge follows
 // the one platform-runtime SSOT instead of a second hardcoded literal.
 //
-// FAIL CLOSED on an unknown override (mirrors bareCreateDefaultRuntime): the
-// resolved runtime MUST pass isKnownRuntime; an override naming a runtime the
-// provisioner can't honor is refused and we fall back to the compiled-in known
-// default rather than seed an unprovisionable concierge runtime.
+// FAIL CLOSED on an override the concierge can't run on: the resolved runtime
+// must pass the SAME container-backed guard the ensure/install endpoints apply
+// to an explicit runtime (platformRuntimeAllowed) — NOT just isKnownRuntime.
+// isKnownRuntime accepts external-like/mock meta-runtimes, which have no
+// container for the concierge's provision path; a MOLECULE_DEFAULT_RUNTIME of
+// e.g. 'external' or 'mock' would otherwise stamp an unprovisionable platform
+// root through the empty-runtime (default) path that the explicit-runtime guard
+// never sees (core#3496 review). An override that fails the guard is refused
+// and we fall back to the compiled-in container-backed default.
 func conciergeDefaultRuntime() string {
 	if v := strings.TrimSpace(os.Getenv("MOLECULE_DEFAULT_RUNTIME")); v != "" {
-		if isKnownRuntime(v) {
+		if ok, _ := platformRuntimeAllowed(v); ok {
 			return v
 		}
-		log.Printf("Concierge: MOLECULE_DEFAULT_RUNTIME=%q is not a known runtime; falling back to %q for the platform-agent default", v, defaultConciergeRuntime)
+		log.Printf("Concierge: MOLECULE_DEFAULT_RUNTIME=%q is not a container-backed runtime the concierge can run on; falling back to %q for the platform-agent default", v, defaultConciergeRuntime)
 	}
 	return defaultConciergeRuntime
 }
@@ -1178,29 +1204,45 @@ func ensureCreatedWorkspaceProviderPin(ctx context.Context, workspaceID, runtime
 	log.Printf("Create workspace %s: pinned LLM_PROVIDER=%s for platform-managed model %q (create_workspace child config completeness)", workspaceID, providers.PlatformProviderName, model)
 }
 
-// EnsureSelfHostedPlatformAgent installs the org's platform agent (the concierge,
+// EnsureSelfHostedPlatformAgent seeds the org's platform agent (the concierge,
 // the org root) on a tenant that has no control plane to do it — i.e. self-hosted
 // or local. In SaaS the CP calls InstallPlatformAgent at org-provision time; this
-// is the no-CP equivalent. Idempotent: returns early if a kind='platform' root
-// already exists (a prior boot, or a CP install in a hybrid setup). The CALLER
-// gates this on the MOLECULE_SEED_PLATFORM_AGENT flag (set by the self-hosted
-// docker-compose) so CI harnesses and SaaS tenants are unaffected.
+// is the no-CP equivalent. The CALLER gates this on SelfHostPlatformSeedEnabled()
+// (MOLECULE_ORG_ID unset) — it runs UNCONDITIONALLY on self-host, every boot
+// (core#3496: the org root always exists; the old MOLECULE_SEED_PLATFORM_AGENT
+// opt-in flag is removed). SaaS tenants + CI harnesses set MOLECULE_ORG_ID and
+// never reach here.
+//
+// Thin adapter over the ONE canonical lifecycle flow (platform_agent_flow.go):
+// row-only (no ProvisionTrigger — the boot provision is phase 2,
+// MaybeProvisionPlatformAgentOnBoot, which needs the provisioner that doesn't
+// exist yet at this point in boot). Via the flow's decide step this is also
+// self-healing: a healthy root no-ops ("exists"), a half-installed/failed root
+// re-runs the idempotent install ("repaired") — re-anchoring org tokens and
+// re-parenting drift the old exists-early-return silently ignored.
 func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error {
-	var existing string
-	err := database.QueryRowContext(ctx,
-		`SELECT id FROM workspaces WHERE kind = 'platform' AND parent_id IS NULL LIMIT 1`).Scan(&existing)
-	if err == nil {
-		return nil // platform agent already present — nothing to do
+	out, err := ensurePlatformAgentFlow(ctx, database, ensureFlowOptions{
+		// All defaults: name defaultPlatformAgentName(), runtime
+		// conciergeDefaultRuntime() (MOLECULE_DEFAULT_RUNTIME else claude-code) —
+		// a self-host operator who wants a different runtime sets the env or
+		// switches it post-seed via the standard runtime-change path.
+		//
+		// SkipTombstoned: an unattended boot must never silently un-delete a
+		// deliberately-removed concierge — reviving is an explicit user action
+		// (the ensure endpoint / onboarding scene).
+		SkipTombstoned: true,
+	})
+	if err != nil {
+		return fmt.Errorf("self-host platform-agent seed: %w", err)
 	}
-	if err != sql.ErrNoRows {
-		return fmt.Errorf("check existing platform agent: %w", err)
+	switch {
+	case out.Skipped == "tombstoned":
+		log.Printf("boot: platform-agent self-seed skipped — root %s is tombstoned (deliberate deletion respected; revive via the canvas repair/setup flow)", out.Action.targetID)
+	case out.Action.status != "exists":
+		log.Printf("boot: platform-agent self-seed %s %s (prior_status=%q)",
+			out.Action.status, out.Action.targetID, out.PriorStatus)
 	}
-	log.Printf("boot: no platform agent present — self-seeding %s (self-hosted)", SelfHostedPlatformAgentID)
-	// Self-host seed follows the KMS-resolved platform default runtime
-	// (conciergeDefaultRuntime: MOLECULE_DEFAULT_RUNTIME else 'claude-code'); a
-	// self-host operator who wants a different runtime sets the env or switches it
-	// post-seed via the standard runtime-change path.
-	return installPlatformAgent(ctx, database, SelfHostedPlatformAgentID, defaultPlatformAgentName(), conciergeDefaultRuntime())
+	return nil
 }
 
 // OrgIdentityResponse is the body of GET /org/identity.
@@ -1261,20 +1303,27 @@ func OrgIdentity(c *gin.Context) {
 // automatically once creds exist.
 //
 // STRICTLY self-host + best-effort:
-//   - The CALLER gates this on MOLECULE_SEED_PLATFORM_AGENT set AND the local
-//     Docker provisioner being active (prov != nil, i.e. MOLECULE_ORG_ID unset).
+//   - The CALLER gates this on SelfHostPlatformSeedEnabled() (MOLECULE_ORG_ID
+//     unset — the removed MOLECULE_SEED_PLATFORM_AGENT flag is gone, core#3496)
+//     AND the local Docker provisioner being active (prov != nil).
 //     SaaS (cpProv) never reaches here.
-//   - It looks up the kind='platform' root; if absent (seed disabled / failed)
-//     it no-ops. If the container is already running (prov.IsRunning) it no-ops.
+//   - It looks up the kind='platform' root; if absent (seed failed) it no-ops.
+//     If the container is already running (prov.IsRunning) it no-ops.
 //   - Otherwise it kicks off ONE provision via the same path the restart
 //     endpoint uses (WorkspaceHandler.RestartByID), which reads the row's
 //     runtime ('claude-code' as seeded) + config and provisions accordingly.
 //
-// On a fresh self-host with no LLM credentials the provision will fail (missing
-// key) and the agent stays 'failed' until the user configures BYOK via
-// Settings — that's expected. This never fatals and never loops: RestartByID is
-// itself debounced/coalesced, and this runs exactly once at boot. Run it in a
-// goroutine so a slow Docker pull doesn't delay the HTTP server coming up.
+// UNCONFIGURED-SKIP (core#3496 D2): a fresh self-host root with NO model signal
+// (no MODEL workspace_secret, no MOLECULE_LLM_DEFAULT_MODEL env) would provision
+// straight into a guaranteed MISSING_MODEL / MISSING_PLATFORM_PROXY abort on
+// every boot. Instead of burning that failed provision, the kick-off is skipped
+// and the root stays parked at 'offline' for the onboarding scene (or a
+// Settings + explicit restart) to configure. Once ANY model signal exists the
+// old behavior applies: a missing/wrong KEY still fails the provision loudly —
+// that's a real error state the user must see. This never fatals and never
+// loops: RestartByID is itself debounced/coalesced, and this runs exactly once
+// at boot. Run it in a goroutine so a slow Docker pull doesn't delay the HTTP
+// server coming up.
 func MaybeProvisionPlatformAgentOnBoot(ctx context.Context, database *sql.DB, prov localProvisionerIsRunning, restartByID func(string)) {
 	if prov == nil || restartByID == nil {
 		return
@@ -1310,6 +1359,10 @@ func MaybeProvisionPlatformAgentOnBoot(ctx context.Context, database *sql.DB, pr
 			log.Printf("boot: concierge %s could not re-declare %q plugin (recorded=%d skipped=%d) — management MCP may be absent until next provision", id, conciergePlatformMCPSource, rec, skip)
 		}
 		go restartByID(id)
+		return
+	}
+	if !platformAgentModelConfigured(ctx, database, id) {
+		log.Printf("boot: platform-agent %s awaiting setup (no MODEL secret, no MOLECULE_LLM_DEFAULT_MODEL) — provision skipped; configure via the onboarding scene or Settings", id)
 		return
 	}
 	log.Printf("boot: platform-agent %s not running (status=%s) — kicking off best-effort provision", id, status)
@@ -1384,10 +1437,26 @@ type installPlatformAgentPayload struct {
 // Idempotently installs the platform agent as the org root for THIS tenant. The
 // control plane calls it at org-provision time (new orgs) and during the
 // existing-org backfill rollout. Safe to call repeatedly.
+//
+// DEPRECATED-FOR-NEW-CALLERS (core#3496): this is the CP's CONTRACT-FROZEN
+// row-only shim over the shared install — it deliberately keeps its historical
+// semantics (caller-supplied id, always-upsert, NO decide step, NO provision
+// trigger) byte-identical for the CP. New callers use POST
+// /admin/org/platform-agent/ensure (the one canonical lifecycle flow). Once the
+// CP migrates to /ensure (tracked CP-side), this endpoint is deleted. The only
+// post-freeze addition is the platform-runtime guard below, which is
+// additive-safe: the CP only ever sends container-backed runtimes.
 func InstallPlatformAgent(c *gin.Context) {
 	var p installPlatformAgentPayload
 	if err := c.ShouldBindJSON(&p); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	// Platform-runtime guard (shared with the ensure flow): an external-like /
+	// mock / unknown runtime on the org root wedges it permanently — the
+	// provision path silently no-ops for those. See platformRuntimeAllowed.
+	if ok, why := platformRuntimeAllowed(p.Runtime); !ok {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": why, "code": "RUNTIME_UNSUPPORTED"})
 		return
 	}
 	name := p.Name

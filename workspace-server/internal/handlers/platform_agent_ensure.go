@@ -221,20 +221,38 @@ type ensurePlatformAgentPayload struct {
 	// Name is the concierge display name; defaults to defaultPlatformAgentName().
 	Name string `json:"name"`
 	// Runtime is the concierge runtime; empty falls back to the platform default
-	// (conciergeDefaultRuntime), exactly like the CP-driven install.
+	// (conciergeDefaultRuntime), exactly like the CP-driven install. Used only on
+	// a fresh insert — an existing root's runtime is preserved (runtime changes
+	// go through the standard PATCH path). Must be a container-backed runtime:
+	// external-like/mock/unknown values are rejected 422 (platformRuntimeAllowed).
 	Runtime string `json:"runtime"`
+	// Model, when set, is validated against the effective runtime and written as
+	// the MODEL workspace_secret BEFORE the provision trigger fires, so the very
+	// first provision resolves this pick instead of racing it (core#3496 — the
+	// self-host onboarding scene's create path). Optional + additive: absent
+	// keeps today's behavior (the platform default resolution at provision).
+	Model string `json:"model"`
 	// Force repairs (reinstall + re-provision) even a healthy 'online' concierge —
 	// the explicit "repair tool" path. Default false keeps the call idempotent.
 	Force bool `json:"force"`
 }
 
-// platformRootLookupQuery finds the org's current platform root, INCLUDING
-// tombstoned (status='removed') rows — see the in-handler comment for why.
+// platformRootLookupQuery finds the org's current platform root.
+//
+// REMOVED/TOMBSTONED ROOTS ARE INCLUDED ON PURPOSE (CR2 RC 14676): the SELECT
+// deliberately does NOT filter `status != 'removed'`. A deleted concierge
+// keeps kind='platform' + parent_id IS NULL (CascadeDelete only stamps
+// status='removed'), and the partial unique index uniq_workspaces_one_platform_root
+// forbids a SECOND platform row — so the ONLY way to restore a removed
+// concierge is to find the tombstone and revive it IN PLACE. Filtering removed
+// rows out would make repair report "created" against a fresh id that the
+// unique index then rejects. decideEnsureAction reads the returned status and
+// flags a removed root for an explicit revive.
 //
 // ENUM-SCAN HAZARD (do not "simplify" this query): workspaces.status is the
 // workspace_status Postgres ENUM (migration 043), nullable by schema. The
 // cast to text happens BEFORE the COALESCE on purpose — a bare
-// COALESCE(status, '') makes Postgres coerce the untyped '' literal to the
+// COALESCE(status, ”) makes Postgres coerce the untyped ” literal to the
 // enum type at PARSE time, and the whole query fails with
 //
 //	pq: invalid input value for enum workspace_status: ""
@@ -257,8 +275,9 @@ const platformRootLookupQuery = `SELECT id, COALESCE(status::text, '') FROM work
 //	@Tags		org
 //	@Accept		json
 //	@Produce	json
-//	@Param		body	body	ensurePlatformAgentPayload	false	"optional name/runtime/force"
+//	@Param		body	body	ensurePlatformAgentPayload	false	"optional name/runtime/model/force"
 //	@Success	200	{object}	map[string]interface{}
+//	@Failure	422	{object}	map[string]interface{}	"RUNTIME_UNSUPPORTED or UNREGISTERED_MODEL_FOR_RUNTIME"
 //	@Router		/admin/org/platform-agent/ensure [post]
 func (h *WorkspaceHandler) EnsurePlatformAgent(c *gin.Context) {
 	var p ensurePlatformAgentPayload
@@ -269,92 +288,51 @@ func (h *WorkspaceHandler) EnsurePlatformAgent(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
-	derivedID := PlatformAgentID()
-
-	// Look up the org's current platform root (if any). The COALESCE(status::text, '')
-	// keeps a NULL status from failing the scan — and the ::text cast is
-	// load-bearing, see the platformRootLookupQuery doc comment.
-	//
-	// REMOVED/TOMBSTONED ROOTS ARE INCLUDED ON PURPOSE (CR2 RC 14676): the SELECT
-	// deliberately does NOT filter `status != 'removed'`. A deleted concierge
-	// keeps kind='platform' + parent_id IS NULL (CascadeDelete only stamps
-	// status='removed'), and the partial unique index uniq_workspaces_one_platform_root
-	// (over kind WHERE kind='platform') forbids a SECOND platform row — so the
-	// ONLY way to restore a removed concierge is to find this tombstone and revive
-	// it IN PLACE. Filtering removed rows out here would make repair report
-	// "created" against a fresh id that the unique index then rejects, i.e. repair
-	// would fail for exactly the case it exists to handle. decideEnsureAction reads
-	// the returned status and flags a removed root for an explicit revive.
-	var existingID, existingStatus string
-	found := false
-	err := db.DB.QueryRowContext(ctx, platformRootLookupQuery).
-		Scan(&existingID, &existingStatus)
-	switch {
-	case err == nil:
-		found = true
-	case errors.Is(err, sql.ErrNoRows):
-		found = false
-	default:
-		log.Printf("EnsurePlatformAgent: platform-root lookup failed: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "lookup failed"})
-		return
-	}
-
-	decision := decideEnsureAction(derivedID, existingID, existingStatus, found, p.Force, h.HasProvisioner())
-
-	// Healthy + not forced -> idempotent no-op.
-	if decision.status == "exists" {
-		c.JSON(http.StatusOK, gin.H{
-			"status":            "exists",
-			"platform_agent_id": decision.targetID,
-			"kind":              models.KindPlatform,
-			"agent_status":      existingStatus,
-			"provisioning":      false,
-		})
-		return
-	}
-
-	// Create or repair: run the idempotent install (upsert + re-parent), then
-	// trigger the provision. installPlatformAgent maps an empty runtime to the
-	// platform default and is safe to re-run.
-	name := strings.TrimSpace(p.Name)
-	if name == "" {
-		name = defaultPlatformAgentName()
-	}
-	if err := ensureInstallFn(ctx, db.DB, decision.targetID, name, p.Runtime); err != nil {
-		log.Printf("EnsurePlatformAgent: install failed (id=%s): %v", decision.targetID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "install failed"})
-		return
-	}
-
-	// Explicit revive: a repair of a REMOVED (tombstoned) concierge must clear the
-	// removed flag, on purpose, before the provision. installPlatformAgent above
-	// PRESERVES status on its upsert — an ordinary CP install / self-host re-seed
-	// must never silently un-delete a concierge — and RestartByID SKIPS a removed
-	// row, so without this deliberate step the provision below would be a no-op and
-	// the concierge would stay deleted. Scoped (in reviveRemovedPlatformAgent) to
-	// status='removed', so it is the un-tombstone and nothing else.
-	if decision.revive {
-		if err := reviveRemovedPlatformAgent(ctx, db.DB, decision.targetID); err != nil {
-			log.Printf("EnsurePlatformAgent: revive failed (id=%s): %v", decision.targetID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "revive failed"})
+	// Thin adapter over the ONE canonical lifecycle flow (platform_agent_flow.go)
+	// — the decide/install/model/revive/provision pipeline lives there so the
+	// boot seed and this endpoint cannot drift (core#3496). The response wire
+	// contract below is byte-identical to the pre-flow handler for every
+	// previously-possible request; 422 is new and only reachable via the new
+	// runtime guard / model field.
+	out, err := ensurePlatformAgentFlow(c.Request.Context(), db.DB, ensureFlowOptions{
+		Name:             p.Name,
+		Runtime:          p.Runtime,
+		Model:            p.Model,
+		Force:            p.Force,
+		HasProvisioner:   h.HasProvisioner(),
+		ProvisionTrigger: h.triggerPlatformProvision,
+	})
+	if err != nil {
+		var reject *flowReject
+		if errors.As(err, &reject) {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": reject.Message, "code": reject.Code})
 			return
 		}
-		log.Printf("EnsurePlatformAgent: revived tombstoned platform agent %s (cleared removed flag)", decision.targetID)
+		var stage *flowStageError
+		if errors.As(err, &stage) {
+			log.Printf("EnsurePlatformAgent: %s failed (id=%s): %v", stage.Stage, out.Action.targetID, stage.Err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": stage.Stage + " failed"})
+			return
+		}
+		// COVERAGE-EXEMPT (defensive, unreachable by construction): the flow
+		// only returns *flowReject or *flowStageError today — this fallback
+		// exists so a future flow edit that introduces a third error type
+		// degrades to a 500 instead of a panic/nil-dereference. Cannot be
+		// exercised without breaking the flow's own error contract.
+		log.Printf("EnsurePlatformAgent: flow failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "ensure failed"})
+		return
 	}
 
-	if decision.provision {
-		h.triggerPlatformProvision(decision.targetID)
+	if out.Action.status != "exists" {
+		log.Printf("EnsurePlatformAgent: %s platform agent %s (provision=%v, model_set=%v, prior_status=%q)",
+			out.Action.status, out.Action.targetID, out.Action.provision, strings.TrimSpace(p.Model) != "", out.PriorStatus)
 	}
-
-	log.Printf("EnsurePlatformAgent: %s platform agent %s (provision=%v, prior_status=%q)",
-		decision.status, decision.targetID, decision.provision, existingStatus)
 	c.JSON(http.StatusOK, gin.H{
-		"status":            decision.status,
-		"platform_agent_id": decision.targetID,
+		"status":            out.Action.status,
+		"platform_agent_id": out.Action.targetID,
 		"kind":              models.KindPlatform,
-		"agent_status":      existingStatus,
-		"provisioning":      decision.provision,
+		"agent_status":      out.PriorStatus,
+		"provisioning":      out.Action.provision && out.Action.status != "exists",
 	})
 }

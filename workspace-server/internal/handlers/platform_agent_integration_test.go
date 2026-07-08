@@ -381,8 +381,13 @@ func TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered(t *t
 			templateAfterReinstall, wantTemplate, codexRuntime)
 	}
 
-	// Case 3: the default-runtime install path seeds 'claude-code' on a FRESH row
-	// (backward compatibility for self-host seed + CP callers that send no runtime).
+	// Case 3: the default-runtime install path seeds the compiled-in default
+	// runtime on a FRESH row (backward compatibility for self-host seed + CP
+	// callers that send no runtime). The default is 'openclaw' as of the
+	// 2026-07-07 operator ruling (defaultConciergeRuntime); asserting against
+	// the const rather than a literal keeps this correct across future default
+	// flips. The persona template stays 'platform-agent' for EVERY runtime
+	// (runtime-agnostic, tenant-agent BUG 1).
 	freshID := uuid.New().String()
 	freshName := "Org Concierge fresh " + tag
 	if err := installPlatformAgent(ctx, conn, freshID, freshName, defaultConciergeRuntime); err != nil {
@@ -393,11 +398,11 @@ func TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered(t *t
 		`SELECT runtime, COALESCE(template, '') FROM workspaces WHERE id = $1`, freshID).Scan(&freshRuntime, &freshTemplate); err != nil {
 		t.Fatalf("read fresh runtime/template: %v", err)
 	}
-	if freshRuntime != "claude-code" {
-		t.Fatalf("default install path: runtime=%q, want 'claude-code'", freshRuntime)
+	if freshRuntime != defaultConciergeRuntime {
+		t.Fatalf("default install path: runtime=%q, want %q (the compiled-in default)", freshRuntime, defaultConciergeRuntime)
 	}
 	if freshTemplate != "platform-agent" {
-		t.Fatalf("default install path: template=%q, want 'platform-agent' (the claude-code concierge keeps the historical template name)", freshTemplate)
+		t.Fatalf("default install path: template=%q, want 'platform-agent' (runtime-agnostic concierge template)", freshTemplate)
 	}
 	_, _ = conn.ExecContext(ctx, `DELETE FROM workspaces WHERE id = $1`, freshID)
 }

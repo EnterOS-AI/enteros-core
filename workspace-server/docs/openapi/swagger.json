@@ -12,6 +12,46 @@
     "host": "api.moleculesai.app",
     "basePath": "/",
     "paths": {
+        "/admin/org/platform-agent/ensure": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "org"
+                ],
+                "summary": "Create or repair the org platform agent (concierge), core-only",
+                "parameters": [
+                    {
+                        "description": "optional name/runtime/model/force",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ensurePlatformAgentPayload"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "422": {
+                        "description": "RUNTIME_UNSUPPORTED or UNREGISTERED_MODEL_FOR_RUNTIME",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
         "/org/identity": {
             "get": {
                 "produces": [
@@ -20,12 +60,291 @@
                 "tags": [
                     "org"
                 ],
-                "summary": "Get the org's display name",
+                "summary": "Get the org's display name + billing capability",
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/handlers.OrgIdentityResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/requests/pending": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "requests"
+                ],
+                "summary": "List pending requests across the org (canvas tabs)",
+                "parameters": [
+                    {
+                        "enum": [
+                            "task",
+                            "approval"
+                        ],
+                        "type": "string",
+                        "description": "Filter by kind",
+                        "name": "kind",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by org",
+                        "name": "org_id",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/handlers.RequestRow"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/requests/{requestId}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "requests"
+                ],
+                "summary": "Get a request with its message thread",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Request ID",
+                        "name": "requestId",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.RequestWithThread"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/requests/{requestId}/cancel": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "requests"
+                ],
+                "summary": "Cancel (withdraw) a request",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Request ID",
+                        "name": "requestId",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.RequestMutationResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/requests/{requestId}/messages": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "requests"
+                ],
+                "summary": "Add a message to a request's More-Info thread",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Request ID",
+                        "name": "requestId",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Message",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AddRequestMessageBody"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.RequestMutationResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/requests/{requestId}/respond": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "requests"
+                ],
+                "summary": "Respond to a request (done / rejected / approved)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Request ID",
+                        "name": "requestId",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Response",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.RespondRequestBody"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.RequestMutationResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
                         }
                     }
                 }
@@ -52,6 +371,157 @@
                             "type": "array",
                             "items": {
                                 "$ref": "#/definitions/handlers.PendingUserTask"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/workspaces/{id}/requests": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth \u0026\u0026 OrgSlugAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "requests"
+                ],
+                "summary": "List a workspace's outgoing requests",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Requester workspace ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by status",
+                        "name": "status",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/handlers.RequestRow"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth \u0026\u0026 OrgSlugAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "requests"
+                ],
+                "summary": "Raise a request (task or approval)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Requester workspace ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Request fields",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CreateRequestBody"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CreateRequestResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/workspaces/{id}/requests/inbox": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth \u0026\u0026 OrgSlugAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "requests"
+                ],
+                "summary": "List a workspace's incoming requests (inbox)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Recipient workspace ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by status",
+                        "name": "status",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/handlers.RequestRow"
                             }
                         }
                     },
@@ -671,6 +1141,75 @@
         }
     },
     "definitions": {
+        "handlers.AddRequestMessageBody": {
+            "type": "object",
+            "required": [
+                "author_type",
+                "body"
+            ],
+            "properties": {
+                "author_id": {
+                    "type": "string"
+                },
+                "author_type": {
+                    "type": "string",
+                    "enum": [
+                        "user",
+                        "agent"
+                    ]
+                },
+                "body": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.CreateRequestBody": {
+            "type": "object",
+            "required": [
+                "kind",
+                "recipient_type",
+                "title"
+            ],
+            "properties": {
+                "detail": {
+                    "type": "string"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": [
+                        "task",
+                        "approval"
+                    ]
+                },
+                "priority": {
+                    "type": "integer"
+                },
+                "recipient_id": {
+                    "type": "string"
+                },
+                "recipient_type": {
+                    "type": "string",
+                    "enum": [
+                        "user",
+                        "agent"
+                    ]
+                },
+                "title": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.CreateRequestResponse": {
+            "type": "object",
+            "properties": {
+                "request_id": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.CreateScheduleRequest": {
             "type": "object",
             "required": [
@@ -768,6 +1307,18 @@
                 "name": {
                     "description": "Name is the org's display name (MOLECULE_ORG_NAME, \"\" when unset).",
                     "type": "string"
+                },
+                "org_id": {
+                    "description": "OrgID is the org's UUID (MOLECULE_ORG_ID, \"\" when unset). Empty on a\nself-hosted stack where no control plane assigns an org id.",
+                    "type": "string"
+                },
+                "platform_managed_available": {
+                    "description": "PlatformManagedAvailable reports whether a Molecule LLM proxy is wired\ninto this workspace-server process — i.e. whether platform_managed billing\ncan actually work. True on SaaS (the CP provisioner exports the proxy base\nURL + usage token), false on a self-hosted stack (no hosted proxy / no\ncredit ledger). The canvas reads this pre-login to decide whether to offer\nthe \"Platform (proxy)\" billing option or hide it and default to BYOK.",
+                    "type": "boolean"
+                },
+                "slug": {
+                    "description": "Slug is the org's URL slug (MOLECULE_ORG_SLUG, \"\" when unset). Empty on\na self-hosted stack where no control plane assigns a slug.",
+                    "type": "string"
                 }
             }
         },
@@ -800,6 +1351,110 @@
                 }
             }
         },
+        "handlers.RequestMessageRow": {
+            "type": "object",
+            "properties": {
+                "author_id": {
+                    "type": "string"
+                },
+                "author_type": {
+                    "type": "string"
+                },
+                "body": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "request_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.RequestMutationResponse": {
+            "type": "object",
+            "properties": {
+                "request_id": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.RequestRow": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "type": "string"
+                },
+                "detail": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "kind": {
+                    "type": "string"
+                },
+                "org_id": {
+                    "type": "string"
+                },
+                "priority": {
+                    "type": "integer"
+                },
+                "recipient_id": {
+                    "type": "string"
+                },
+                "recipient_type": {
+                    "type": "string"
+                },
+                "requester_id": {
+                    "type": "string"
+                },
+                "requester_type": {
+                    "type": "string"
+                },
+                "responded_at": {
+                    "type": "string"
+                },
+                "responder_id": {
+                    "type": "string"
+                },
+                "responder_type": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                },
+                "title": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                },
+                "workspace_name": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.RequestWithThread": {
+            "type": "object",
+            "properties": {
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/handlers.RequestMessageRow"
+                    }
+                },
+                "request": {
+                    "$ref": "#/definitions/handlers.RequestRow"
+                }
+            }
+        },
         "handlers.ResolveUserTaskRequest": {
             "type": "object",
             "required": [
@@ -826,6 +1481,32 @@
                 },
                 "user_task_id": {
                     "type": "string"
+                }
+            }
+        },
+        "handlers.RespondRequestBody": {
+            "type": "object",
+            "required": [
+                "action"
+            ],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "done",
+                        "rejected",
+                        "approved"
+                    ]
+                },
+                "responder_id": {
+                    "type": "string"
+                },
+                "responder_type": {
+                    "type": "string",
+                    "enum": [
+                        "user",
+                        "agent"
+                    ]
                 }
             }
         },
@@ -979,6 +1660,27 @@
                     "type": "string"
                 },
                 "user_task_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.ensurePlatformAgentPayload": {
+            "type": "object",
+            "properties": {
+                "force": {
+                    "description": "Force repairs (reinstall + re-provision) even a healthy 'online' concierge —\nthe explicit \"repair tool\" path. Default false keeps the call idempotent.",
+                    "type": "boolean"
+                },
+                "model": {
+                    "description": "Model, when set, is validated against the effective runtime and written as\nthe MODEL workspace_secret BEFORE the provision trigger fires, so the very\nfirst provision resolves this pick instead of racing it (core#3496 — the\nself-host onboarding scene's create path). Optional + additive: absent\nkeeps today's behavior (the platform default resolution at provision).",
+                    "type": "string"
+                },
+                "name": {
+                    "description": "Name is the concierge display name; defaults to defaultPlatformAgentName().",
+                    "type": "string"
+                },
+                "runtime": {
+                    "description": "Runtime is the concierge runtime; empty falls back to the platform default\n(conciergeDefaultRuntime), exactly like the CP-driven install. Used only on\na fresh insert — an existing root's runtime is preserved (runtime changes\ngo through the standard PATCH path). Must be a container-backed runtime:\nexternal-like/mock/unknown values are rejected 422 (platformRuntimeAllowed).",
                     "type": "string"
                 }
             }
