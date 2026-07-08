@@ -77,9 +77,9 @@ STUB_DIR="$(cd "$(dirname "$0")/stub-runtime" && pwd)"
 RUNTIME="claude-code"
 
 # The provisioner's RegistryModeLocal resolves runtime=claude-code by checking
-# the local image store for molecule-local/workspace-template-claude-code:<sha12>
-# (the Gitea HEAD sha12 of the template repo's `main` branch — see
-# provisioner/localbuild.go EnsureLocalImage). If that tag is missing it
+# the local image store for molecule-local/workspace-template-claude-code:<sha12>-<arch>
+# (the Gitea HEAD sha12 of the template repo's `main` branch plus the same arch
+# suffix as provisioner/localbuild.go LocalImageTag). If that tag is missing it
 # clones+builds the real 2.5GB template (slow + can OOM-kill in CI). We pre-tag
 # our chosen image to that EXACT cache tag so the cache-check (dockerHasTag)
 # hits and resolves to our image with no clone/build.
@@ -314,11 +314,12 @@ fi
 # Step 1 — build/tag the image the provisioner will resolve to.
 # ----------------------------------------------------------------------------
 echo "--- Step 1: resolve runtime image to the chosen target ---"
-# Resolve the EXACT cache tag the provisioner will look up: <repo>:<gitea-HEAD-
-# sha12>. Discover the sha from the Gitea branch API (same source the provisioner
-# uses). An explicit CACHE_TAG env overrides discovery; if Gitea is unreachable
-# AND no override is set, bail loudly — silently tagging the wrong sha would let
-# the provisioner clone+build the real 2.5GB template (slow / OOM).
+# Resolve the EXACT cache tag the provisioner will look up:
+# <repo>:<gitea-HEAD-sha12>-<arch>. Discover the sha from the Gitea branch API
+# (same source the provisioner uses). An explicit CACHE_TAG env overrides
+# discovery; if Gitea is unreachable AND no override is set, bail loudly —
+# silently tagging the wrong sha would let the provisioner clone+build the real
+# 2.5GB template (slow / OOM).
 if [ -n "${CACHE_TAG:-}" ]; then
   echo "Using operator-pinned CACHE_TAG=$CACHE_TAG"
 else
@@ -330,10 +331,17 @@ except Exception:
   print('')" 2>/dev/null)
   if [ -z "$CACHE_SHA" ]; then
     echo "ERROR: could not resolve the template HEAD sha from $GITEA_BRANCH_API"
-    echo "       set CACHE_TAG=$CACHE_REPO:<sha12> explicitly (the tag the provisioner expects)."
+    echo "       set CACHE_TAG=$CACHE_REPO:<sha12>-<arch> explicitly (the tag the provisioner expects)."
     exit 2
   fi
-  CACHE_TAG="${CACHE_REPO}:${CACHE_SHA}"
+  CACHE_ARCH_SUFFIX="${MOLECULE_IMAGE_PLATFORM:-}"
+  if [ -n "$CACHE_ARCH_SUFFIX" ]; then
+    CACHE_ARCH_SUFFIX="${CACHE_ARCH_SUFFIX#*/}"
+    CACHE_ARCH_SUFFIX="${CACHE_ARCH_SUFFIX//\//-}"
+  else
+    CACHE_ARCH_SUFFIX="$(go env GOARCH)"
+  fi
+  CACHE_TAG="${CACHE_REPO}:${CACHE_SHA}-${CACHE_ARCH_SUFFIX}"
   echo "Resolved provisioner cache tag: $CACHE_TAG (gitea HEAD sha)"
 fi
 
