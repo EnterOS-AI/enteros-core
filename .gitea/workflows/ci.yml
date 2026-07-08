@@ -520,6 +520,11 @@ jobs:
           # lands under status.message, message, or artifacts instead of
           # result.parts.
           bash tests/e2e/test_a2a_text_extract_unit.sh
+          # Push-async A2A replies complete via chat-history instead of the
+          # synchronous HTTP body. This keeps the concierge-created workspace
+          # gate load-bearing while avoiding duplicate task sends after the
+          # canvas cap returns `{status:"queued",delivery_mode:"push-async"}`.
+          bash tests/e2e/test_chat_history_agent_text_unit.sh
           # harden/e2e-staging-saas-failclosed: fail-direction proof for the
           # E2E_REQUIRE_LIVE fail-closed-on-skip guard in
           # test_staging_full_saas.sh. Offline (no LLM/network/provisioning):
