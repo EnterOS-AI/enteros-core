@@ -45,6 +45,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # bp-exempt: transitional vendored plugin-manifest mirror check, not a branch-protection gate.
   ssot-sync:
     name: Verify vendored plugin-manifest schema matches the molecule-ai-sdk SSOT
     runs-on: ubuntu-latest
