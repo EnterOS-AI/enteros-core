@@ -577,7 +577,14 @@ jobs:
         if: env.CF_API_TOKEN != '' && env.CF_ZONE_ID != ''
         run: |
           set -euo pipefail
+          set +e
           ./scripts/ops/prune_cf_e2e_dns.sh --apply --min-age-hours 2
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::best-effort Cloudflare DNS prune failed with rc=$rc; leaving cleanup to sweep-stale-e2e-orgs/manual janitor and keeping this non-gating job green."
+          fi
+          exit 0
 
   # ── PLATFORM-MANAGED BOOT REGRESSION (moonshot/kimi NOT_CONFIGURED) ──────────
   #

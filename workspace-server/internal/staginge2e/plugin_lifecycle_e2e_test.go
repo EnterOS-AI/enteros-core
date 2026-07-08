@@ -114,10 +114,10 @@ func TestPluginInstallLifecycle_Staging(t *testing.T) {
 		t.Logf("ListInstalled returned %q after install (EIC readback OK)", pluginName)
 
 		// And the agent must actually SERVE — online-row + a live A2A reply.
-		if served, code := serveProbe(t, host, token, orgID, wsID); !served {
-			t.Fatalf("agent did not serve A2A after plugin install (code=%d) — "+
-				"the install-triggered restart left it un-serveable (#159 self-heal regression)", code)
-		}
+		// The status/url row can lead the A2A listener by a few seconds after an
+		// install-triggered restart, so use the same warmup-tolerant assertion as
+		// the workspace lifecycle gate instead of a one-shot probe.
+		assertServes(t, host, token, orgID, wsID, "post-plugin-install")
 		t.Logf("agent served A2A after install — stayed online through the restart")
 	})
 
