@@ -850,28 +850,70 @@ func (h *OrgHandler) planTopLevelImport(ctx context.Context, roots []OrgWorkspac
 	return slots
 }
 
-// lookupPlatformAgentAnchor returns the org's platform-agent root id and its
-// canvas position (x, y), or found=false when the org has no platform agent.
+// lookupPlatformAgentAnchor returns the CALLER/import org's platform-agent root
+// id and its canvas position (x, y), or found=false when the org has no platform
+// agent to nest under.
 //
-// The platform agent is the single kind='platform' AND parent_id IS NULL row
-// (the org root; platform_agent.go). Its canvas coordinates live on
-// canvas_layouts (a LEFT JOIN with COALESCE(..., 0) so a platform agent without
-// a layout row anchors the imported subtree at origin rather than failing).
+// SCOPING (core#3510 review): the anchor is resolved deterministically by the
+// canonical PlatformAgentID() id — DeterministicPlatformAgentID(MOLECULE_ORG_ID)
+// on a CP-provisioned/SaaS tenant, else the fixed SelfHostedPlatformAgentID on
+// self-host/local. That is the SAME id every real install path seeds the
+// concierge under (ensurePlatformAgentFlow's derivedID := PlatformAgentID(), the
+// CP install, EnsureSelfHostedPlatformAgent), so it targets THIS org's concierge
+// precisely. A bare `WHERE kind='platform' AND parent_id IS NULL LIMIT 1` is
+// multi-root-unsafe: workspaces has no org_id on that predicate, so in a DB with
+// more than one platform/tenant root it could attach the imported org under an
+// ARBITRARY platform root rather than the caller's. `status != 'removed'` mirrors
+// the org-scope / defaultCreateParentID SSOT so a tombstoned concierge is never
+// used as an anchor.
 //
-// found is false on sql.ErrNoRows (no concierge) AND on any query error — the
-// caller then places the import at root, so a transient DB hiccup degrades to
-// the historical behavior instead of breaking the import.
+// FALLBACK (historical): when the deterministic id doesn't resolve to a live
+// platform row — a legacy concierge seeded before the derived-id contract, or a
+// hand-migrated DB — we fall back to the structural single platform root
+// (kind='platform', parent_id NULL, not removed). A per-org tenant DB holds at
+// most one such row (uniq_workspaces_one_platform_root), so LIMIT 1 is
+// unambiguous there. If neither resolves (no concierge / any DB error) found is
+// false and the caller places the import at root — a transient DB hiccup or a
+// concierge-less org degrades to the historical behavior instead of breaking the
+// import.
+//
+// Canvas coordinates live on canvas_layouts (LEFT JOIN + COALESCE(..., 0) so a
+// platform agent without a layout row anchors the imported subtree at origin
+// rather than failing).
 func lookupPlatformAgentAnchor(ctx context.Context) (id string, x, y float64, found bool) {
-	err := db.DB.QueryRowContext(ctx, `
+	// Primary: org-scoped by the deterministic PlatformAgentID() anchor.
+	if anchorID := PlatformAgentID(); anchorID != "" {
+		if gotID, gx, gy, ok := scanPlatformAnchor(ctx, `
+			SELECT w.id, COALESCE(cl.x, 0), COALESCE(cl.y, 0)
+			FROM workspaces w
+			LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
+			WHERE w.id = $1 AND w.kind = 'platform' AND w.status != 'removed'
+			LIMIT 1
+		`, anchorID); ok {
+			return gotID, gx, gy, true
+		}
+	}
+	// Fallback: the org's structural single platform root (historical behavior).
+	return scanPlatformAnchor(ctx, `
 		SELECT w.id, COALESCE(cl.x, 0), COALESCE(cl.y, 0)
 		FROM workspaces w
 		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
-		WHERE w.kind = 'platform' AND w.parent_id IS NULL
+		WHERE w.kind = 'platform' AND w.parent_id IS NULL AND w.status != 'removed'
 		LIMIT 1
-	`).Scan(&id, &x, &y)
+	`)
+}
+
+// scanPlatformAnchor runs a platform-agent anchor SELECT (id + COALESCE'd canvas
+// x,y) and returns found=false on sql.ErrNoRows AND on any query error, so a
+// transient DB hiccup degrades to the caller's root-placement fallback instead
+// of breaking the import. args carries the query's positional parameters (the
+// primary lookup passes the PlatformAgentID() anchor; the structural fallback
+// passes none).
+func scanPlatformAnchor(ctx context.Context, query string, args ...interface{}) (id string, x, y float64, found bool) {
+	err := db.DB.QueryRowContext(ctx, query, args...).Scan(&id, &x, &y)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			log.Printf("Org import: platform-agent anchor lookup failed: %v — importing top-level workspaces at root", err)
+			log.Printf("Org import: platform-agent anchor lookup failed: %v — falling back to root placement", err)
 		}
 		return "", 0, 0, false
 	}
