@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # SSOT sync-check for the provision-request wire contract (RFC core#3285 §10).
 #
-# Sibling of check-contract-ssot-sync.sh (which guards the mcp-plugin-delivery
-# mirror). Same mechanism, different contract: molecule-ai-sdk is the PUBLIC
-# SSOT for the cross-repo provision-request wire shape, and core keeps a local
-# MIRROR at workspace-server/internal/provisioner/provision_request.contract.json
-# -- the producer-side copy that provision_request_contract_test.go pins
+# molecule-ai-sdk is the PUBLIC SSOT for the cross-repo provision-request wire
+# shape, and core keeps a local MIRROR at
+# workspace-server/internal/provisioner/provision_request.contract.json -- the
+# producer-side copy that provision_request_contract_test.go pins
 # cpProvisionRequest's json tags against. This check keeps that mirror honest
 # against the SSOT: it fetches molecule-ai-sdk' canonical copy and verifies
 # core's mirror is the SAME CONTRACT.

@@ -6,8 +6,8 @@
  * WHY THIS EXISTS
  * ───────────────
  * molecule-core's online/degraded gate marks a concierge healthy only when the
- * management MCP surfaces a known workspace-creation verb, derived from
- * `contracts/mcp-plugin-delivery.contract.json`
+ * management MCP surfaces a known workspace-creation verb, derived from the
+ * molecule-ai-sdk MCP-plugin delivery contract
  * (`mcp__<mcp_server_name>__<verb>` for verb ∈ required_tools ∪
  * transitional_tool_aliases). The verb is PRODUCED by a SEPARATE repo
  * (@molecule-ai/mcp-server) and DELIVERED as a PUBLISHED npm build. Nothing
@@ -55,8 +55,12 @@
  *
  * Usage:
  *   node check-published-mcp-manifest.mjs \
- *     --contract <path/to/mcp-plugin-delivery.contract.json> \
+ *     --contract-url <https://.../mcp-plugin-delivery.contract.json> \
  *     --install-dir <dir containing node_modules/@molecule-ai/mcp-server>
+ *
+ * For hermetic local tests, `--contract <path/to/mcp-plugin-delivery.contract.json>`
+ * is still accepted. CI uses `--contract-url` so molecule-core no longer carries
+ * a root-level JSON mirror.
  *
  * DEPENDS ON: molecule-core's verb-SSOT PR (feat/3082-mcp-verb-ssot-contract)
  * landing `required_tools` + `transitional_tool_aliases` in the contract. This
@@ -94,15 +98,30 @@ function warn(msg) {
   console.error(`::warning::${msg}`);
 }
 
-const contractPath = arg("--contract", "contracts/mcp-plugin-delivery.contract.json");
+const defaultContractURL =
+  "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/mcp/mcp-plugin-delivery.contract.json";
+const contractPath = arg("--contract", "");
+const contractURL = arg("--contract-url", contractPath ? "" : defaultContractURL);
 const installDir = arg("--install-dir", process.cwd());
 
 // ── Load the contract ─────────────────────────────────────────────────────
 let contract;
 try {
-  contract = JSON.parse(readFileSync(contractPath, "utf8"));
+  if (contractPath && contractURL) {
+    fail(`Pass only one of --contract or --contract-url, not both.`);
+  }
+  if (contractURL) {
+    const res = await fetch(contractURL, { headers: { "User-Agent": "curl/8.4.0" } });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    }
+    contract = await res.json();
+  } else {
+    contract = JSON.parse(readFileSync(contractPath, "utf8"));
+  }
 } catch (e) {
-  fail(`Cannot read contract at ${contractPath}: ${e.message}`);
+  const source = contractURL || contractPath;
+  fail(`Cannot read contract from ${source}: ${e.message}`);
 }
 
 const serverName = contract.mcp_server_name;

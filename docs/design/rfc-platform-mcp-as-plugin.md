@@ -135,8 +135,8 @@ a fresh **claude-code** concierge installs it + gains `create_workspace`, and th
 >   `.claude/settings.json`).
 > - **Generalize the identity gate** — ask the active adapter "is the management MCP wired?" instead
 >   of reading `.claude/settings.json` (today's read fail-closes codex/hermes offline = #3159).
-> - **Update the delivery contract** — `mcp-plugin-delivery.contract.json` pins the claude path as
->   SSOT with a drift test; it must become per-runtime or the new adapters fail it.
+> - **Update the delivery contract** — the molecule-ai-sdk MCP-plugin delivery contract pins the
+>   runtime-specific render surfaces as SSOT; core consumes it through generated SDK bindings.
 > - **Proven by §5b** (per-runtime render tests + local docker MCP-visibility harness).
 
 **Blocker before the image can retire:** the plugin repo fetch must be reliable. As of 2026-06-23 the

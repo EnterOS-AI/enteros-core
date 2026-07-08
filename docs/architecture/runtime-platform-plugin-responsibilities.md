@@ -53,15 +53,12 @@ unreferenced serializes (`omitempty`) identically to a correctly-warming-up one 
 that is how a half-wired producer silently degrades every concierge (the
 2026-06-25 incident).
 
-> **Current state vs target.** Today the required tool id is a Go **literal
-> constant** (`conciergePlatformMCPCreateWorkspaceTool`) guarded by a contract
-> **drift test**, and `contracts/mcp-plugin-delivery.contract.json` pins the
-> management **server name** + the **status-field** shape — it does **not** yet
-> pin the full tool id, and the runtime does not derive it (it enumerates the
-> live MCP). **Target** (guardrail/SSOT workstream, in progress): pin the full
-> id `mcp__molecule-platform__create_workspace` in the contract and have core's
-> gate **derive** it, so a rename on either side fails the (blocking) drift
-> check rather than agreeing by convention.
+> **Current state.** The required tool id is composed in Go from the generated
+> molecule-ai-sdk contract binding (`molcontracts.MCPServerName` +
+> `molcontracts.RequiredTool`). Core's gate derives
+> `mcp__molecule-platform__provision_workspace` from that binding, while the
+> runtime enumerates the live MCP tools. A rename on either side fails the
+> contract tests / drift checks instead of passing by convention.
 
 ## 2. Plugin → Runtime: per-runtime rendering
 

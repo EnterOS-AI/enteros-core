@@ -12,10 +12,8 @@
 # keeps that vendored copy honest against the SSOT: it fetches the canonical
 # schema and verifies the vendored copy is BYTE-IDENTICAL.
 #
-# This is the SAME transitional "vendored copy + sync-check" shape core
-# already uses for the MCP-plugin-delivery mirror (check-contract-ssot-sync.sh)
-# and the workspace-comms schemas (check-workspace-comms-ssot-sync.sh); it is
-# the plugin-manifest sibling. Together with the Go embed it closes the loop:
+# This is the SAME transitional "vendored copy + sync-check" shape core uses for
+# the provision-request contract. Together with the Go embed it closes the loop:
 # the install validator can't silently run against a drifted contract without
 # this check going red.
 #
