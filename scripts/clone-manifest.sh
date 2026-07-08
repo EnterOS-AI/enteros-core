@@ -77,19 +77,31 @@ clone_one_with_retry() {
     local tdir="$1" name="$2" url="$3" display="$4" ref="$5"
     local attempt=1 max_attempts="${6:-3}" backoff
 
+    # NEVER prompt for credentials. A `private: true` repo cloned WITHOUT its
+    # token 401s, and without these git blocks forever on an interactive
+    # username/password prompt — a fresh tokenless `dev-start.sh` hangs
+    # indefinitely on the first private template instead of failing fast into
+    # the missing-creds SKIP the caller is built for. GIT_TERMINAL_PROMPT=0
+    # turns the 401 into an immediate non-zero exit; the empty credential
+    # helper (-c) neutralises a configured helper (osxkeychain, etc.) that
+    # would otherwise re-inject a stale/absent credential and re-hang. Both
+    # are inherited by git's transport children (git-remote-https).
+    local git_clone='git -c credential.helper= clone'
+    export GIT_TERMINAL_PROMPT=0
+
     while : ; do
         # A killed attempt can leave a partial directory behind; git clone
         # refuses a non-empty target, so wipe it before each try.
         rm -rf "$tdir/$name"
 
         if [ "$ref" = "main" ]; then
-            if git clone --depth=1 -q "$url" "$tdir/$name"; then return 0; fi
+            if $git_clone --depth=1 -q "$url" "$tdir/$name"; then return 0; fi
         elif echo "$ref" | grep -qE '^[0-9a-f]{40}$'; then
             # Pinned SHA (RFC #2927 manifest ref-pinning): `--branch <sha>` fails
             # with "Remote branch <sha> not found" because git's --branch only
             # resolves named refs. Clone the full repo (no --depth so the SHA
             # is reachable in history) then check out the pinned SHA.
-            if git clone -q "$url" "$tdir/$name" \
+            if $git_clone -q "$url" "$tdir/$name" \
                 && (cd "$tdir/$name" && git checkout -q "$ref"); then
                 # Drop .git after checkout — we only need the tree (matches
                 # the post-clone .git strip below in clone_category).
@@ -97,7 +109,7 @@ clone_one_with_retry() {
                 return 0
             fi
         else
-            if git clone --depth=1 -q --branch "$ref" "$url" "$tdir/$name"; then return 0; fi
+            if $git_clone --depth=1 -q --branch "$ref" "$url" "$tdir/$name"; then return 0; fi
         fi
 
         if [ "$attempt" -ge "$max_attempts" ]; then

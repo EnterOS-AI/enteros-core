@@ -24,6 +24,15 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"
 cat > "$WORK/bin/git" <<'STUB'
 #!/bin/sh
+# Skip global options (`git -c key=val clone …`) — clone-manifest.sh invokes
+# `git -c credential.helper= clone`, so the subcommand is not $1.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
 if [ "$1" = "clone" ]; then
     target=""
     for a in "$@"; do
