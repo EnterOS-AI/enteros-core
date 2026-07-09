@@ -7,11 +7,12 @@ name: staging-tenant-cd
 # local-cp-deploy-pipeline.yml), which likewise triggers on push to `main`. The
 # operator model is TRUNK-BASED: every `main` merge is the staging candidate, so
 # a push to `main` that changes the tenant image sources flows through a
-# STRUCTURALLY-GATED job chain:
+# STRUCTURALLY-GATED, provider-agnostic job chain:
 #
-#   await-image -> advance-pin -> reload-cp-candidate -> e2e-smoke -> redeploy-fleet
-#                                                    ^^^^^^^^^
-#                                                    HARD GATE (real staging provision + A2A-serve e2e)
+#   await-image -> advance-pin -> redeploy-fleet -> e2e-smoke
+#                                      ^                  ^
+#                                      |                  HARD GATE (real staging A2A-serve e2e)
+#                                      candidate roll: canary-first + /buildinfo health gate
 #
 # THE LOOP (build half + deploy half)
 #   publish-workspace-server-image.yml  (BUILD)  — already triggers on push:[main]
@@ -21,19 +22,20 @@ name: staging-tenant-cd
 #     of branch, so THIS workflow — firing on the same `main` SHA — awaits the
 #     exact per-commit artifact the build produced).
 #   staging-tenant-cd.yml               (THIS)    — awaits that :staging-<sha>
-#     artifact, advances the staging image pin, reloads staging CP so fresh
-#     provisions boot the candidate image, gates on a real staging e2e, and
-#     rolls the running staging tenant fleet onto it (session-preserving).
+#     artifact, advances the staging image pin, rolls the running staging tenant
+#     fleet onto it (session-preserving, canary-first, /buildinfo health-gated),
+#     and gates the deployed staging surface with a real staging e2e.
 # The two coordinate through the immutable per-commit :staging-<sha> tag, so the
 # deploy never rolls onto a half-built image and never races the build.
 #
 # WHY STRUCTURALLY GATED (un-bypassable)
-#   redeploy-fleet `needs: e2e-smoke` which `needs: reload-cp-candidate` which
-#   `needs: advance-pin` which `needs: await-image`. The gate intentionally
-#   reloads staging CP before e2e so fresh provisions exercise the candidate
-#   image, not the previously pinned image. If anything after advance-pin fails
-#   or is skipped, rollback-pin restores the old pin and reloads staging CP back
-#   to that old image. There is no continue-on-error on any gating job.
+#   e2e-smoke `needs: redeploy-fleet` which `needs: advance-pin` which `needs:
+#   await-image`. The tenant-image CD path deliberately does NOT deploy/reload
+#   the control-plane host: that is provider-specific infrastructure work and
+#   belongs behind its own provider adapter, outside this tenant-image CI. If
+#   anything after advance-pin fails or is skipped, rollback-pin restores the old
+#   pin and rerolls the staging tenant fleet back to that old image. There is no
+#   continue-on-error on any gating job.
 #
 # SESSION PRESERVATION
 #   redeploy-fleet delegates to scripts/deploy/redeploy-staging-fleet.sh, which
@@ -69,7 +71,6 @@ on:
       - '.gitea/workflows/staging-tenant-cd.yml'
       - 'scripts/deploy/redeploy-staging-fleet.sh'
       - 'scripts/deploy/advance-staging-tenant-pin.sh'
-      - 'scripts/deploy/reload-staging-controlplane.sh'
   # NOTE: no `workflow_dispatch.inputs:` — Gitea rejects the whole workflow if an
   # inputs: map is present (feedback_gitea_workflow_dispatch_inputs_unsupported,
   # enforced by lint-workflow-yaml). Operator overrides are read from repo/org
@@ -134,9 +135,40 @@ jobs:
           docker image inspect "$IMAGE" --format 'present {{.Id}}' >/dev/null
           echo "::notice::tenant image present + pullable: $IMAGE"
 
+  advance-pin:
+    name: advance-pin (staging LOCAL_TENANT_IMAGE)
+    needs: [await-image]
+    runs-on: docker-host
+    timeout-minutes: 10
+    outputs:
+      old_image: ${{ steps.advance.outputs.old_image }}
+      new_image: ${{ steps.advance.outputs.new_image }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Advance the staging tenant-image pin in Infisical
+        id: advance
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
+        run: bash scripts/deploy/advance-staging-tenant-pin.sh --tag "${{ needs.await-image.outputs.tag }}"
+
+  redeploy-fleet:
+    name: redeploy-fleet (roll staging tenants, session-preserving)
+    needs: [advance-pin, await-image]
+    runs-on: docker-host
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Roll the staging tenant fleet onto the gate-proven image
+        env:
+          TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
+        run: bash scripts/deploy/redeploy-staging-fleet.sh --tag "${{ needs.await-image.outputs.tag }}"
+
   e2e-smoke:
     name: e2e-smoke (staging real provision + A2A HARD GATE)
-    needs: [await-image, reload-cp-candidate]
+    needs: [redeploy-fleet]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -154,18 +186,13 @@ jobs:
       # presence-only. This is the deep "callable" proof that catches a
       # present-but-not-runnable verb (the flaw that let regressions reach prod).
       E2E_ASSERT_MGMT_MCP_CALLABLE: '1'
-      # Candidate guard: push-triggered deploys must prove the fresh tenant they
-      # exercised reports THIS commit's git_sha via /buildinfo. Manual rollback
-      # dispatches can target an arbitrary STAGING_TENANT_CD_IMAGE_TAG, so those
-      # stay exempt unless an operator separately asserts candidate SHA.
-      E2E_EXPECT_TENANT_BUILD_SHA: ${{ vars.STAGING_TENANT_CD_IMAGE_TAG == '' && github.sha || (vars.STAGING_TENANT_CD_ASSERT_CANDIDATE_SHA == '1' && github.sha || '') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Force-fail hook (prove a red gate blocks the fleet roll)
+      - name: Force-fail hook (prove a red gate rolls back the fleet)
         run: |
           set -euo pipefail
           if [ "${GATE_FORCE_FAIL:-0}" = "1" ]; then
-            echo "::error::GATE_FORCE_FAIL=1 — gate forced RED; this MUST roll back the staging pin/CP reload and skip redeploy-fleet."
+            echo "::error::GATE_FORCE_FAIL=1 — gate forced RED; this MUST roll back the staging pin and tenant fleet."
             exit 1
           fi
           echo "gate not forced — running the real e2e"
@@ -217,108 +244,49 @@ jobs:
         #   the EXPECTED default runtime (openclaw — E2E_DEFAULT_RUNTIME) WITH its management MCP
         #   present AND — because E2E_ASSERT_MGMT_MCP_CALLABLE=1 — a REAL A2A tool-use turn drives it
         #   to actually RUN provision_workspace and a genuine kind='workspace' row appears (genuinely
-        #   CALLABLE, not presence-only). It also asserts (when E2E_EXPECT_TENANT_BUILD_SHA is set) that
-        #   the tenant it exercised is the DEPLOY CANDIDATE, not a stale pre-advance pin. The lifecycle
-        #   test only exercises a PLAIN workspace (no declared plugins), so it cannot see a fresh
-        #   openclaw concierge whose mgmt-MCP plugin never installed — the operator "test14" failure
-        #   (a presign:// declared source the deployed runtime could not resolve). This makes the
-        #   deploy gate go RED on that failure. BOTH must pass to advance the pin + roll the fleet
-        #   (needs-gated, un-bypassable).
+        #   CALLABLE, not presence-only). The lifecycle test only exercises a PLAIN workspace (no
+        #   declared plugins), so it cannot see a fresh openclaw concierge whose mgmt-MCP plugin never
+        #   installed — the operator "test14" failure (a presign:// declared source the deployed
+        #   runtime could not resolve). This makes the deploy gate go RED on that failure. BOTH must
+        #   pass after the fleet roll (needs-gated, un-bypassable).
         run: go test -tags staging_e2e ./internal/staginge2e/ -run 'TestWorkspaceLifecycle_Staging|TestPlatformAgentMgmtMCP_Staging' -count=1 -v -timeout 50m
-
-  advance-pin:
-    name: advance-pin (staging LOCAL_TENANT_IMAGE)
-    needs: [await-image]
-    runs-on: docker-host
-    timeout-minutes: 10
-    outputs:
-      old_image: ${{ steps.advance.outputs.old_image }}
-      new_image: ${{ steps.advance.outputs.new_image }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Advance the staging tenant-image pin in Infisical
-        id: advance
-        env:
-          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
-          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
-          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
-          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
-        run: bash scripts/deploy/advance-staging-tenant-pin.sh --tag "${{ needs.await-image.outputs.tag }}"
-
-  # bp-exempt: staging-only post-merge deploy step; rollback-pin restores the old pin/reload on red candidate paths.
-  reload-cp-candidate:
-    name: reload-cp-candidate (staging CP adopts candidate pin)
-    needs: [advance-pin, await-image]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Install Railway CLI
-        run: |
-          npm install -g @railway/cli@4.59.0 --prefix "$RUNNER_TEMP/railway-cli"
-          echo "$RUNNER_TEMP/railway-cli/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/railway-cli/bin/railway" --version
-      - name: Reload staging control plane onto the candidate tenant image
-        env:
-          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
-          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
-          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
-          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
-        run: bash scripts/deploy/reload-staging-controlplane.sh --tag "${{ needs.await-image.outputs.tag }}"
-
-  redeploy-fleet:
-    name: redeploy-fleet (roll staging tenants, session-preserving)
-    needs: [e2e-smoke, await-image]
-    runs-on: docker-host
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Roll the staging tenant fleet onto the gate-proven image
-        env:
-          TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
-        run: bash scripts/deploy/redeploy-staging-fleet.sh --tag "${{ needs.await-image.outputs.tag }}"
 
   rollback-pin:
     name: rollback-pin (revert pin if the fleet roll failed)
-    needs: [advance-pin, reload-cp-candidate, e2e-smoke, redeploy-fleet]
+    needs: [advance-pin, redeploy-fleet, e2e-smoke]
     # ALWAYS-RUN + explicit in-job branch (main-status coherence). Because this
-    # workflow now advances the pin before the e2e gate, any failure/skipped path
-    # after advance-pin must restore the old pin and reload staging CP back onto
-    # it. Green fleet roll is the only no-op path.
+    # workflow advances the pin before the fleet roll, any failure/skipped path
+    # after advance-pin must restore the old pin and reroll staging tenants back
+    # onto it. Green fleet roll + e2e is the only no-op path.
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: docker-host
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Install Railway CLI
-        run: |
-          npm install -g @railway/cli@4.59.0 --prefix "$RUNNER_TEMP/railway-cli"
-          echo "$RUNNER_TEMP/railway-cli/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/railway-cli/bin/railway" --version
-      - name: Revert the staging pin and CP reload on failed candidate path
+      - name: Revert the staging pin and fleet on failed candidate path
         env:
           ADVANCE_RESULT: ${{ needs.advance-pin.result }}
-          RELOAD_RESULT: ${{ needs.reload-cp-candidate.result }}
-          E2E_RESULT: ${{ needs.e2e-smoke.result }}
           REDEPLOY_RESULT: ${{ needs.redeploy-fleet.result }}
+          E2E_RESULT: ${{ needs.e2e-smoke.result }}
           OLD_IMAGE: ${{ needs.advance-pin.outputs.old_image }}
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+          TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
         run: |
           set -euo pipefail
           if [ "$ADVANCE_RESULT" != "success" ]; then
             echo "::notice::pin never advanced (advance-pin=$ADVANCE_RESULT) — nothing to revert."
             exit 0
           fi
-          if [ "$RELOAD_RESULT" = "success" ] && [ "$E2E_RESULT" = "success" ] && [ "$REDEPLOY_RESULT" = "success" ]; then
-            echo "::notice::candidate gate + fleet roll green — no rollback needed."
+          if [ "$REDEPLOY_RESULT" = "success" ] && [ "$E2E_RESULT" = "success" ]; then
+            echo "::notice::candidate fleet roll + e2e green — no rollback needed."
             exit 0
           fi
           if [ -z "$OLD_IMAGE" ]; then
             echo "::warning::advance-pin succeeded but exposed no old_image — cannot auto-revert; operator attention needed."
             exit 0
           fi
-          echo "::warning::candidate path failed after pin advance (reload=$RELOAD_RESULT e2e=$E2E_RESULT redeploy=$REDEPLOY_RESULT) — reverting staging pin to $OLD_IMAGE"
+          echo "::warning::candidate path failed after pin advance (redeploy=$REDEPLOY_RESULT e2e=$E2E_RESULT) — reverting staging pin and fleet to $OLD_IMAGE"
           bash scripts/deploy/advance-staging-tenant-pin.sh --image "$OLD_IMAGE"
-          bash scripts/deploy/reload-staging-controlplane.sh --image "$OLD_IMAGE"
+          bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"

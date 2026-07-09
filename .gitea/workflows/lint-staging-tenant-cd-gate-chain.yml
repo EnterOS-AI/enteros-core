@@ -4,14 +4,15 @@ name: lint-staging-tenant-cd-gate-chain
 # same behavior-based (needs-graph) approach as the control-plane's
 # lint_deploy_gate_chain.py, encoding the tenant CD contract:
 #
-#   - e2e-smoke      needs (transitively) await-image
-#   - advance-pin    needs (transitively) e2e-smoke
+#   - advance-pin    needs (transitively) await-image
 #   - redeploy-fleet needs (transitively) advance-pin
+#   - e2e-smoke      needs (transitively) redeploy-fleet
 #   - no continue-on-error on any gating job or step
+#   - no provider-specific CP deploy/reload adapter in tenant-image CI
 #
-# A future edit that drops the e2e-smoke -> redeploy-fleet path, or masks a gate
-# failure with continue-on-error, FAILS this lint — so "the staging tenant fleet
-# is never rolled on a red e2e gate" stays mechanical, not a convention.
+# A future edit that drops the redeploy-fleet -> e2e-smoke path, masks a gate
+# failure with continue-on-error, or reintroduces Railway/other provider-specific
+# CP deploy wiring into this tenant-image workflow FAILS this lint.
 #
 # No paths: filter — a genuine gate, runs on every PR (merge-blocking via
 # ci / all-required).
