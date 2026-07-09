@@ -4,30 +4,33 @@ un-gated.
 
 The gated staging tenant CD lives at .gitea/workflows/staging-tenant-cd.yml:
 
-    await-image -> advance-pin -> reload-cp-candidate -> e2e-smoke -> redeploy-fleet
+    await-image -> advance-pin -> redeploy-fleet -> e2e-smoke
 
 It is enforced INTRA-workflow by Gitea `needs:` (a red upstream job skips every
-downstream job). The pin advances before e2e so the real staging smoke exercises
-the candidate image; rollback-pin must always run and restore the old pin + CP
-reload whenever any candidate-path job fails or is skipped. That gate runs on
-`push` to staging (post-merge), so it cannot itself be a pre-merge
+downstream job). The pin advances before the local-docker staging fleet rolls to
+the candidate image; e2e-smoke then validates the deployed staging surface.
+rollback-pin must always run and restore the old pin + fleet image whenever any
+candidate-path job fails or is skipped. CP-host redeploys are provider-owned and
+must not be wired into this tenant-image CI path. That gate runs on
+`push` to main (post-merge), so it cannot itself be a pre-merge
 branch-protection context — but the INVARIANTS that make it a real gate CAN be
 checked statically, pre-merge, and made merge-blocking via `ci / all-required`.
 
 This lint is that mechanical guard. It fails the build if anyone:
 
   1. breaks the gate chain — advance-pin must `needs:` await-image,
-     reload-cp-candidate must `needs:` advance-pin, e2e-smoke must `needs:`
-     reload-cp-candidate, and redeploy-fleet must `needs:` e2e-smoke
-     (transitively, so the fleet can never roll while the e2e gate is red); OR
+     redeploy-fleet must `needs:` advance-pin, and e2e-smoke must `needs:`
+     redeploy-fleet (transitively, so e2e never validates a pre-roll fleet); OR
   2. breaks rollback coverage — rollback-pin must `needs:` every candidate-path
      job and run under `if: always()`; OR
   3. adds `continue-on-error: true` to any gating job (advance-pin,
-     reload-cp-candidate, e2e-smoke, redeploy-fleet, rollback-pin) OR to any
-     step inside one — continue-on-error rolls a failed step up to a SUCCESS job
-     status (Gitea Quirk #10 / mc#1982), which would let a downstream
-     `needs:`-dependent job run despite a real failure, silently re-opening the
-     ungated fleet roll this gate closes.
+     e2e-smoke, redeploy-fleet, rollback-pin) OR to any step inside one —
+     continue-on-error rolls a failed step up to a SUCCESS job status (Gitea
+     Quirk #10 / mc#1982), which would let a downstream `needs:`-dependent job
+     run despite a real failure, silently re-opening the ungated fleet roll this
+     gate closes; OR
+  4. reintroduces provider-specific CP deploy wiring (Railway CLI/tokens or the
+     legacy reload-cp-candidate job) into this tenant-image CI path.
 
 Behavior-based (parses the YAML `needs:` graph), not grep-by-name: a job rename
 that keeps the edges is fine; dropping an edge is the failure.
@@ -57,25 +60,30 @@ def workflow_path():
 # its upstream is red.
 REQUIRED_EDGES = [
     ("advance-pin", "await-image"),
-    ("reload-cp-candidate", "advance-pin"),
-    ("e2e-smoke", "reload-cp-candidate"),
-    ("redeploy-fleet", "e2e-smoke"),
+    ("redeploy-fleet", "advance-pin"),
+    ("e2e-smoke", "redeploy-fleet"),
 ]
 
 # Jobs whose failure MUST skip everything downstream — so continue-on-error
 # (which masks a failure as success) is forbidden on them.
 GATING_JOBS = [
     "advance-pin",
-    "reload-cp-candidate",
-    "e2e-smoke",
     "redeploy-fleet",
+    "e2e-smoke",
     "rollback-pin",
 ]
 ROLLBACK_NEEDS = [
     "advance-pin",
-    "reload-cp-candidate",
-    "e2e-smoke",
     "redeploy-fleet",
+    "e2e-smoke",
+]
+FORBIDDEN_JOB_KEYS = ["reload-cp-candidate"]
+FORBIDDEN_CI_MARKERS = [
+    "@railway/cli",
+    "railway ",
+    "railway\t",
+    "RAILWAY_",
+    "reload-staging-controlplane.sh",
 ]
 
 
@@ -131,6 +139,22 @@ def steps_of(job):
     return steps if isinstance(steps, list) else []
 
 
+def values_contain(value, markers):
+    if isinstance(value, str):
+        return [m for m in markers if m in value]
+    if isinstance(value, dict):
+        hits = []
+        for v in value.values():
+            hits.extend(values_contain(v, markers))
+        return hits
+    if isinstance(value, list):
+        hits = []
+        for v in value:
+            hits.extend(values_contain(v, markers))
+        return hits
+    return []
+
+
 def main():
     workflow = workflow_path()
     if not os.path.isfile(workflow):
@@ -149,8 +173,7 @@ def main():
     for jk in GATING_JOBS + ["await-image"]:
         if jk not in jobs:
             fails.append(f"gate job `{jk}` is missing from {workflow} — the "
-                         f"await-image→advance-pin→reload-cp-candidate→"
-                         f"e2e-smoke→redeploy-fleet "
+                         f"await-image→advance-pin→redeploy-fleet→e2e-smoke "
                          f"chain is broken.")
 
     # 2. The chain edges must hold (transitively).
@@ -172,7 +195,7 @@ def main():
             fails.append(
                 f"`rollback-pin` does not directly `needs:` {missing} in "
                 f"{workflow} — it would not have every candidate-path result "
-                f"available and may fail to restore the old staging pin/CP reload.")
+                f"available and may fail to restore the old staging pin/fleet image.")
         if not always_if(rollback):
             fails.append(
                 f"`rollback-pin` must use `if: always()` in {workflow} so it "
@@ -200,6 +223,27 @@ def main():
                     f"(Gitea Quirk #10 / mc#1982) and let the downstream roll run "
                     f"despite a red gate. Remove it.")
 
+    # 6. Tenant-image CI must stay provider-agnostic. CP-host deploy/reload code
+    # belongs behind provider adapters outside this workflow.
+    for jk in FORBIDDEN_JOB_KEYS:
+        if jk in jobs:
+            fails.append(
+                f"`{jk}` is present in {workflow} — staging tenant CI must not "
+                f"perform provider-specific CP deploy/reload work. Keep provider "
+                f"adapters out of this workflow.")
+    for jk, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        for idx, step in enumerate(steps_of(job)):
+            if not isinstance(step, dict):
+                continue
+            hits = sorted(set(values_contain(step, FORBIDDEN_CI_MARKERS)))
+            if hits:
+                fails.append(
+                    f"`{jk}` step {idx} contains provider-specific deploy marker(s) "
+                    f"{hits} in {workflow}. Railway or other CP-host deploy "
+                    f"adapters must not be required by staging tenant CI.")
+
     if fails:
         print("FAIL: staging tenant CD gate chain is not enforced:")
         for f in fails:
@@ -207,13 +251,13 @@ def main():
         print()
         print("The gate is enforced by the needs: graph in")
         print(f"  {workflow}. Keep await-image→advance-pin→"
-              "reload-cp-candidate→e2e-smoke→redeploy-fleet")
+              "redeploy-fleet→e2e-smoke")
         print("  wired via needs:, and never continue-on-error a gating job.")
         return 1
 
     print("OK: staging tenant CD gate chain enforced — "
-          "await-image -> advance-pin -> reload-cp-candidate -> "
-          "e2e-smoke -> redeploy-fleet, with rollback-pin coverage"
+          "await-image -> advance-pin -> redeploy-fleet -> e2e-smoke, "
+          "with rollback-pin coverage and provider-agnostic CI"
           " (needs: edges intact, no continue-on-error at job or step level).")
     return 0
 

@@ -49,6 +49,10 @@
 #                      (molecule-staging-app) — that serves the staging console
 #                      (molecule-app), not the per-tenant canvas. See the
 #                      shared-canvas block below.
+#   EXPECTED_BUILD_SHA optional expected /buildinfo.git_sha. Defaults to the
+#                      suffix of --tag staging-<sha>.
+#   HEALTH_GATE_ATTEMPTS / HEALTH_GATE_SLEEP_SECS tune /buildinfo polling
+#                      (defaults: 20 attempts, 3s sleep).
 #
 # SAFETY: only recreates STATELESS cp-env=<env> platform containers; never
 # removes a named volume; each swap is health-gated + self-rolls-back; --dry-run
@@ -83,9 +87,16 @@ if [ -z "$IMAGE" ]; then
   [ -n "$TAG" ] || TAG="staging-latest"
   IMAGE="${TENANT_IMAGE}:${TAG}"
 fi
+EXPECTED_BUILD_SHA="${EXPECTED_BUILD_SHA:-}"
+if [ -z "$EXPECTED_BUILD_SHA" ] && printf '%s' "${TAG:-}" | grep -Eq '^staging-[0-9a-fA-F]{7,40}$'; then
+  EXPECTED_BUILD_SHA="${TAG#staging-}"
+fi
+HEALTH_GATE_ATTEMPTS="${HEALTH_GATE_ATTEMPTS:-20}"
+HEALTH_GATE_SLEEP_SECS="${HEALTH_GATE_SLEEP_SECS:-3}"
 CANVAS_TAG="${CANVAS_TAG:-${TAG:-staging-latest}}"
 CIMG="${CANVAS_APP_IMAGE}:${CANVAS_TAG}"
 log "target tenant image = ${IMAGE}  (cp-env=${CP_ENV}, dry_run=${DRY_RUN})"
+[ -z "$EXPECTED_BUILD_SHA" ] || log "expected tenant /buildinfo git_sha prefix = ${EXPECTED_BUILD_SHA}"
 
 docker info >/dev/null 2>&1 || { echo "FATAL: docker daemon not reachable (need /var/run/docker.sock)" >&2; exit 1; }
 
@@ -133,18 +144,49 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
+build_sha_matches() {
+  local got expected
+  got="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  expected="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  [ -n "$got" ] && [ -n "$expected" ] || return 1
+  case "$got" in
+    "$expected"*) return 0;;
+  esac
+  case "$expected" in
+    "$got"*) return 0;;
+  esac
+  return 1
+}
+
+json_git_sha() {
+  sed -n 's/.*"git_sha"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
 # health_gate <container>: probe the tenant's published :8080 /buildinfo through
-# the host loopback. Returns 0 when it answers.
+# the host loopback. Returns 0 when it answers and, for staging-<sha> rolls,
+# reports the candidate git_sha.
 health_gate() {
-  local name="$1" port
+  local name="$1" port body got last=""
   port="$(docker port "$name" 8080/tcp 2>/dev/null | head -1 | sed 's/.*://')"
   [ -n "$port" ] || return 1
-  for _ in $(seq 1 20); do
-    if curl -fsS --max-time 5 "http://127.0.0.1:${port}/buildinfo" >/dev/null 2>&1; then
-      return 0
+  for _ in $(seq 1 "$HEALTH_GATE_ATTEMPTS"); do
+    body="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/buildinfo" 2>/dev/null || true)"
+    if [ -n "$body" ]; then
+      got="$(printf '%s' "$body" | json_git_sha | head -1)"
+      last="$got"
+      if [ -z "$EXPECTED_BUILD_SHA" ]; then
+        return 0
+      fi
+      if build_sha_matches "$got" "$EXPECTED_BUILD_SHA"; then
+        log "  ${name} /buildinfo git_sha=${got} matches ${EXPECTED_BUILD_SHA}"
+        return 0
+      fi
     fi
-    sleep 3
+    sleep "$HEALTH_GATE_SLEEP_SECS"
   done
+  if [ -n "$EXPECTED_BUILD_SHA" ]; then
+    echo "::error::$name /buildinfo git_sha=${last:-<empty>} did not match expected ${EXPECTED_BUILD_SHA}" >&2
+  fi
   return 1
 }
 
