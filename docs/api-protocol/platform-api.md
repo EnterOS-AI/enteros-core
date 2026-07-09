@@ -259,7 +259,11 @@ Invalid `depth` or traversal paths return 400.
 |---|---|---|
 | `WS` | `/ws` | Live events for canvas clients and workspaces |
 
-Canvas clients receive the global event stream. Workspaces connect with `X-Workspace-ID` and receive filtered events based on communication rules.
+Authenticated Canvas clients receive the global event stream using a verified
+CP session, org token, or admin bearer (browser clients transport the bearer in
+the `molecule-auth.<hex>` WebSocket subprotocol). Workspaces connect with
+`X-Workspace-ID` plus a bearer bound to that workspace and receive filtered
+events based on communication rules. Anonymous upgrades are rejected.
 
 ## A2A Proxy Behavior
 

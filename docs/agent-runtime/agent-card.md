@@ -72,7 +72,11 @@ When a workspace's skills change at runtime:
 3. Platform stores the updated card, writes `AGENT_CARD_UPDATED` event
 4. Platform broadcasts via WebSocket to **all subscribers** — both canvas clients and peer workspaces
 
-Both canvas clients and workspace agents subscribe to the same platform WebSocket at `/ws`. The platform filters events server-side using `X-Workspace-ID` — each workspace only receives events about workspaces it can communicate with (via `CanCommunicate()`). Canvas clients receive all events (no workspace ID header).
+Both canvas clients and workspace agents subscribe to the authenticated
+platform WebSocket at `/ws`. Workspace agents send `X-Workspace-ID` and a
+matching workspace bearer; the platform then filters events server-side via
+`CanCommunicate()`. Authenticated Canvas clients omit the workspace ID and
+receive all events. Anonymous clients cannot upgrade to the global stream.
 
 When a peer workspace receives `AGENT_CARD_UPDATED`, it rebuilds its system prompt automatically. When the canvas receives it, it updates the node's skill badges.
 
