@@ -65,6 +65,10 @@ on:
       - 'canvas/**'
       - 'manifest.json'
       - '.gitea/workflows/publish-workspace-server-image.yml'
+      - '.gitea/workflows/staging-tenant-cd.yml'
+      - 'scripts/deploy/advance-staging-tenant-pin.sh'
+      - 'scripts/deploy/reload-staging-controlplane.sh'
+      - 'scripts/deploy/redeploy-staging-fleet.sh'
   workflow_dispatch:
 
 permissions:
