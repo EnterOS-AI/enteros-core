@@ -155,8 +155,8 @@ jobs:
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 0:5432 postgres:16 >/dev/null
-          PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^0\.0\.0\.0:/ {print $2; exit}')
+            -p 127.0.0.1::5432 postgres:16 >/dev/null
+          PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$PG_PORT" ] && PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$PG_PORT" ]; then echo "::error::no host port for $PG_CONTAINER"; docker logs "$PG_CONTAINER" || true; exit 1; fi
           echo "DATABASE_URL=postgres://dev:dev@127.0.0.1:${PG_PORT}/molecule?sslmode=disable" >> "$GITHUB_ENV"
@@ -169,8 +169,8 @@ jobs:
       - name: Start Redis (docker, ephemeral host port)
         run: |
           docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 0:6379 redis:7 >/dev/null
-          REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^0\.0\.0\.0:/ {print $2; exit}')
+          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$REDIS_PORT" ] && REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$REDIS_PORT" ]; then echo "::error::no host port for $REDIS_CONTAINER"; docker logs "$REDIS_CONTAINER" || true; exit 1; fi
           echo "REDIS_URL=redis://127.0.0.1:${REDIS_PORT}" >> "$GITHUB_ENV"
@@ -488,8 +488,8 @@ jobs:
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
           docker run -d --name "$PG_CONTAINER" \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 0:5432 postgres:16 >/dev/null
-          PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^0\.0\.0\.0:/ {print $2; exit}')
+            -p 127.0.0.1::5432 postgres:16 >/dev/null
+          PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$PG_PORT" ] && PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$PG_PORT" ]; then echo "::error::no host port"; docker logs "$PG_CONTAINER" || true; exit 1; fi
           echo "DATABASE_URL=postgres://dev:dev@127.0.0.1:${PG_PORT}/molecule?sslmode=disable" >> "$GITHUB_ENV"
@@ -502,8 +502,8 @@ jobs:
       - name: Start Redis (docker, ephemeral host port)
         run: |
           docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 0:6379 redis:7 >/dev/null
-          REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^0\.0\.0\.0:/ {print $2; exit}')
+          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           [ -z "$REDIS_PORT" ] && REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
           if [ -z "$REDIS_PORT" ]; then echo "::error::no host port"; docker logs "$REDIS_CONTAINER" || true; exit 1; fi
           echo "REDIS_URL=redis://127.0.0.1:${REDIS_PORT}" >> "$GITHUB_ENV"

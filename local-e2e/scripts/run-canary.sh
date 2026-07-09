@@ -9,7 +9,7 @@
 #
 # Optional env:
 #   CANARY_RUN_ID   — disambiguator for parallel CI runs (default: random)
-#   RUNTIME_PORT    — host port for runtime :8000 (default: 18000)
+#   RUNTIME_PORT    — host port for runtime :8000 (default: free port, preferring 18000)
 #   KEEP_RUNNING    — set =1 to leave containers up for post-mortem
 #
 # Exit codes:
@@ -32,8 +32,37 @@ HARNESS_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 ARTIFACTS_DIR="$HARNESS_ROOT/artifacts"
 mkdir -p "$ARTIFACTS_DIR"
 
-export CANARY_RUN_ID="${CANARY_RUN_ID:-$(uuidgen 2>/dev/null | tr A-Z a-z | tr -d - | cut -c1-12 || date +%s)}"
-export RUNTIME_PORT="${RUNTIME_PORT:-18000}"
+pick_port() {
+    local preferred="$1"
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' "$preferred"
+        return
+    fi
+    python3 - "$preferred" <<'PY'
+import socket, sys
+pref = int(sys.argv[1])
+def free(port):
+    for fam, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        try:
+            s.bind((addr, port))
+        except OSError:
+            s.close()
+            return False
+        s.close()
+    return True
+if free(pref):
+    print(pref)
+else:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    print(s.getsockname()[1])
+    s.close()
+PY
+}
+
+export CANARY_RUN_ID="${CANARY_RUN_ID:-$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d - | cut -c1-12 || date +%s)}"
+export RUNTIME_PORT="${RUNTIME_PORT:-$(pick_port 18000)}"
 export TEMPLATE_IMAGE
 COMPOSE_PROJECT="canary-${CANARY_RUN_ID}"
 COMPOSE_FILE="$HARNESS_ROOT/docker-compose.yml"
@@ -41,17 +70,18 @@ COMPOSE_FILE="$HARNESS_ROOT/docker-compose.yml"
 log() { printf "\n=== [%s] %s ===\n" "$(date +%H:%M:%S)" "$*"; }
 
 # ----------------------------------------------------------- cleanup hook
+# shellcheck disable=SC2329
 cleanup() {
     local rc=$?
     if [ "${KEEP_RUNNING:-0}" = "1" ]; then
         log "KEEP_RUNNING=1 — leaving containers up (project=$COMPOSE_PROJECT)"
-        return $rc
+        return "$rc"
     fi
     log "Tearing down compose project $COMPOSE_PROJECT"
     # On non-zero exit, capture logs FIRST. Per feedback_image_promote_is_
     # not_user_live: dump state from the actually-running container, not
     # an inferred pipeline state.
-    if [ $rc -ne 0 ]; then
+    if [ "$rc" -ne 0 ]; then
         log "Canary FAILED — dumping artifacts to $ARTIFACTS_DIR"
         docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" logs \
             --no-color --tail=200 runtime \
@@ -63,12 +93,13 @@ cleanup() {
             > "$ARTIFACTS_DIR/session-store.txt" 2>&1 || true
     fi
     docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" down --volumes --remove-orphans >/dev/null 2>&1 || true
-    return $rc
+    return "$rc"
 }
 trap cleanup EXIT
 
 # ------------------------------------------------------ stack bring-up
 log "Building cp_sim image"
+docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" down --volumes --remove-orphans >/dev/null 2>&1 || true
 docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" build cp_sim
 
 log "Pulling runtime image: $TEMPLATE_IMAGE"
