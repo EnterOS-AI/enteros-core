@@ -278,11 +278,15 @@ func TestStart_SendsAdminTokenAsHeaderAndLegacyBootEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	// The admin token stays as the CP REQUEST auth header (tenant→CP identity)…
 	if sawAdminHeader != "tenant-admin-secret" {
 		t.Fatalf("X-Molecule-Admin-Token = %q, want tenant-admin-secret", sawAdminHeader)
 	}
-	if got := body.Env["ADMIN_TOKEN"]; got != "tenant-admin-secret" {
-		t.Fatalf("ADMIN_TOKEN env = %q; want tenant-admin-secret until scoped boot token lands", got)
+	// …but WS-B: it is NEVER forwarded into the workspace env (CP #1217 rejects a
+	// forwarded ADMIN_TOKEN; CP injects its own for platform-kind, WS-A boot token
+	// for ordinary).
+	if got, ok := body.Env["ADMIN_TOKEN"]; ok {
+		t.Fatalf("WS-B: ADMIN_TOKEN must NOT be forwarded into workspace env, got %q", got)
 	}
 	if body.Env["CUSTOM"] != "ok" {
 		t.Fatalf("CUSTOM env var = %q, want ok", body.Env["CUSTOM"])
