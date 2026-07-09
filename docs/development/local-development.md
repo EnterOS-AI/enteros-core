@@ -39,28 +39,33 @@ If you still see `ghcr.io/molecule-ai/...` in the boot log, double-check `env | 
 ## Starting the Stack
 
 ```bash
-docker compose up
+./scripts/dev-start.sh
 ```
 
 This starts:
 
 | Service | Port | Description |
 |---------|------|-------------|
-| Postgres | internal only | Primary database |
-| Redis | internal only | Ephemeral state |
-| Platform (Go) | `:8080` | Control plane API |
-| Canvas (Next.js) | `:3000` | Visual frontend |
-| Langfuse web | `:3001` (host) / `:3000` (internal) | Observability UI |
-| Langfuse worker | — | Background processing |
+| Postgres | selected `127.0.0.1` port, usually `:5432` | Primary database |
+| Redis | selected `127.0.0.1` port, usually `:6379` | Ephemeral state |
+| MinIO | selected `127.0.0.1` ports, usually `:9000` / `:9001` | Local SDK object-store backend |
+| Platform (Go) | selected `127.0.0.1` port, usually `:8080` | Control plane API |
+| Canvas (Next.js) | selected `127.0.0.1` port, usually `:3000` | Visual frontend |
+| Langfuse web | selected `127.0.0.1` port, usually `:3001` / `:3000` internal | Observability UI |
 | ClickHouse | — | Langfuse dependency |
+| Temporal | selected `127.0.0.1` ports, usually `:7233` / `:8233` | Workflow engine + UI |
 
 Each workspace container is provisioned **on demand** by the platform when a user creates or imports one.
 
 Langfuse uses a dedicated `langfuse` Postgres database. The compose stack creates it automatically before starting the Langfuse service, so it does not conflict with the platform's `molecule` schema.
 
+`dev-start.sh` cleans stale local containers before selecting ports, rewrites
+loopback-local `DATABASE_URL`/`REDIS_URL` values to the current run's ports, and
+prints the exact URLs in its readiness banner.
+
 ### Infrastructure Only
 
-To start just Postgres, Redis, and Langfuse (no application code):
+To start just Postgres, Redis, MinIO, ClickHouse, and Temporal (no application code):
 
 ```bash
 docker compose -f docker-compose.infra.yml up
@@ -156,7 +161,9 @@ Gitea Actions runs automatically on push to `main` and on PRs (`.gitea/workflows
 - **e2e-api** (added 2026-04-13) — Postgres + Redis service containers, migrations applied via `docker exec`, `tests/e2e/test_api.sh` must pass 62/62
 - **shellcheck** (added 2026-04-13) — lints every `tests/e2e/*.sh`
 
-Postgres and Redis are not exposed to the host -- use `docker compose exec postgres psql` or `docker compose exec redis redis-cli` for direct access.
+Local compose services are loopback-bound. Use the URLs printed by
+`scripts/dev-start.sh`, or `docker compose exec postgres psql` /
+`docker compose exec redis redis-cli` for container-network access.
 
 ## Utility Scripts
 

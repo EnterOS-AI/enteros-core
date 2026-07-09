@@ -28,6 +28,38 @@ BUILD=1
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+pick_port() {
+  local preferred="$1"
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "$preferred"
+    return
+  fi
+  python3 - "$preferred" <<'PY'
+import socket, sys
+pref = int(sys.argv[1])
+def free(port):
+    for fam, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        try:
+            s.bind((addr, port))
+        except OSError:
+            s.close()
+            return False
+        s.close()
+    return True
+if free(pref):
+    print(pref)
+else:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    print(s.getsockname()[1])
+    s.close()
+PY
+}
+
+TENANT_HOST_PORT="${TENANT_HOST_PORT:-$(pick_port 18080)}"
+MEMORY_PLUGIN_HOST_PORT="${MEMORY_PLUGIN_HOST_PORT:-$(pick_port 19100)}"
+
 SUF="local-$$"
 NET="smoke-net-${SUF}"; PGV="smoke-pgv-${SUF}"; RED="smoke-redis-${SUF}"; TEN="smoke-tenant-${SUF}"
 cleanup() { docker rm -f "$TEN" "$PGV" "$RED" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; }
@@ -90,13 +122,13 @@ docker run -d --rm --name "$TEN" --network "$NET" \
   -e DATABASE_URL="postgres://smoke:smoketest@${PGV}:5432/smoke?sslmode=disable" \
   -e REDIS_URL="redis://${RED}:6379" \
   -e MEMORY_PLUGIN_URL="http://localhost:9100" -e MEMORY_PLUGIN_LISTEN_ADDR=":9100" \
-  -p 18080:8080 -p 19100:9100 \
+  -p "127.0.0.1:${TENANT_HOST_PORT}:8080" -p "127.0.0.1:${MEMORY_PLUGIN_HOST_PORT}:9100" \
   "${IMAGE}" >/dev/null
 
-echo ">> Polling platform ${HEALTH_PATH} (180s budget) ..."
+echo ">> Polling platform ${HEALTH_PATH} on 127.0.0.1:${TENANT_HOST_PORT} (180s budget) ..."
 code=000
 for _ in $(seq 1 90); do
-  code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:18080${HEALTH_PATH}" 2>/dev/null || echo 000)
+  code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${TENANT_HOST_PORT}${HEALTH_PATH}" 2>/dev/null || echo 000)
   [ "$code" = "200" ] && break
   sleep 2
 done
@@ -110,10 +142,15 @@ echo "PASS: platform ${HEALTH_PATH} = 200"
 echo ">> Polling memory-plugin sidecar /v1/health ..."
 sc=000
 for _ in $(seq 1 30); do
-  sc=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://localhost:19100/v1/health" 2>/dev/null || echo 000)
+  sc=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${MEMORY_PLUGIN_HOST_PORT}/v1/health" 2>/dev/null || echo 000)
   [ "$sc" = "200" ] && break
   sleep 2
 done
-[ "$sc" = "200" ] && echo "PASS: memory-plugin /v1/health = 200" || { echo "FAIL: memory-plugin /v1/health = ${sc}"; exit 1; }
+if [ "$sc" = "200" ]; then
+  echo "PASS: memory-plugin /v1/health = 200"
+else
+  echo "FAIL: memory-plugin /v1/health = ${sc}"
+  exit 1
+fi
 
 echo ">> SMOKE PASSED."

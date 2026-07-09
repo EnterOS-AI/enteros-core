@@ -31,19 +31,29 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$ROOT/.env"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-molecule-core}"
+export COMPOSE_PROJECT_NAME
+PLATFORM_PID=
+CANVAS_PID=
+
+cleanup_dev_stack() {
+    # Stop containers from prior dev-start runs before port selection. Keep
+    # named volumes so the local DB/object-store state survives restarts.
+    docker compose -f "$ROOT/docker-compose.yml" down --remove-orphans >/dev/null 2>&1 || true
+    docker compose -f "$ROOT/docker-compose.infra.yml" down --remove-orphans >/dev/null 2>&1 || true
+    docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
+}
 
 cleanup() {
     echo ""
     echo "==> Shutting down..."
-    kill $PLATFORM_PID $CANVAS_PID 2>/dev/null || true
-    # Use setup.sh's compose file (full infra) since that's what we
-    # brought up. `down` keeps named volumes by default — call with
-    # --volumes here only if you want a clean slate (we don't, since
-    # idempotent re-runs are the usual case).
-    docker compose -f "$ROOT/docker-compose.infra.yml" down 2>/dev/null || true
-    # Langfuse runs via `docker run` (not compose — network-ownership conflict),
-    # so `compose down` misses it; remove it explicitly or it lingers.
-    docker rm -f molecule-core-langfuse-1 2>/dev/null || true
+    if [ -n "${PLATFORM_PID:-}" ]; then
+        kill "$PLATFORM_PID" 2>/dev/null || true
+    fi
+    if [ -n "${CANVAS_PID:-}" ]; then
+        kill "$CANVAS_PID" 2>/dev/null || true
+    fi
+    cleanup_dev_stack
     echo "    Done."
 }
 trap cleanup EXIT INT TERM
@@ -139,6 +149,9 @@ fi
 if [ -z "${MOLECULE_TEMPLATE_REPO_TOKEN:-}" ] && [ -n "${MOLECULE_GITEA_TOKEN:-}" ]; then
     export MOLECULE_TEMPLATE_REPO_TOKEN="$MOLECULE_GITEA_TOKEN"
 fi
+
+echo "==> Cleaning up previous local dev containers"
+cleanup_dev_stack
 
 # ─────────────────────────────────────────── dynamic host ports (no hijack)
 #
@@ -332,7 +345,7 @@ echo "==> Starting Langfuse (trace UI on :${MOLECULE_LANGFUSE_HOST_PORT})"
 wait_for_langfuse_clickhouse_native
 docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
 if docker run -d --name molecule-core-langfuse-1 --network molecule-core-net \
-  --network-alias langfuse-web -p "${MOLECULE_LANGFUSE_HOST_PORT}:3000" \
+  --network-alias langfuse-web -p "127.0.0.1:${MOLECULE_LANGFUSE_HOST_PORT}:3000" \
   -e DATABASE_URL="postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@postgres:5432/langfuse" \
   -e CLICKHOUSE_URL="http://langfuse-clickhouse:8123" \
   -e CLICKHOUSE_MIGRATION_URL="clickhouse://langfuse:${CLICKHOUSE_PASSWORD:-langfuse-dev}@langfuse-clickhouse:9000" \

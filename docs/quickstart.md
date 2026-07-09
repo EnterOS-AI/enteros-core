@@ -25,11 +25,12 @@ cd molecule-core
 That single script:
 
 1. Generates an `ADMIN_TOKEN` into `.env` (first run only — preserved on re-runs) and exports the matching `NEXT_PUBLIC_ADMIN_TOKEN` so the canvas authenticates with it. Auth is **fail-closed in every environment** (including local dev) — there is no dev-mode fail-open; the canvas reaches admin/workspace routes only because it sends this bearer.
-2. Brings up Postgres, Redis, Langfuse, ClickHouse, and Temporal via `infra/scripts/setup.sh`
+2. Cleans up stale local dev containers, chooses free loopback host ports, then brings up Postgres, Redis, MinIO, ClickHouse, and Temporal via `infra/scripts/setup.sh`
 3. Populates the workspace template + plugin registry from `manifest.json`
-4. Builds and starts the platform on `http://localhost:8080`
-5. Installs canvas deps (first run) and starts the canvas on `http://localhost:3000`
-6. Prints next-step instructions and tails both processes — `Ctrl-C` tears everything down
+4. Starts Langfuse web on the selected `127.0.0.1` port after ClickHouse is ready
+5. Builds and starts the platform on the selected `127.0.0.1` port
+6. Installs canvas deps (first run) and starts the canvas on the selected `127.0.0.1` port
+7. Prints the exact URLs and tails both processes — `Ctrl-C` tears everything down while preserving named volumes
 
 Total wall-clock: ~30 seconds for a re-run, ~2 minutes for a first run (npm install + docker pulls).
 
@@ -54,7 +55,9 @@ Recommended:
 ./infra/scripts/setup.sh
 ```
 
-That brings up Postgres, Redis, Langfuse, ClickHouse, and Temporal.
+That brings up Postgres, Redis, MinIO, ClickHouse, and Temporal. When invoked
+through `scripts/dev-start.sh`, their host ports are selected dynamically and
+bound to `127.0.0.1`.
 
 If you only want the raw compose flow:
 
