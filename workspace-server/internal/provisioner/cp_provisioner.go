@@ -268,10 +268,17 @@ type cpProvisionResponse struct {
 //
 // Fail-safe: a nil cfg.WorkspaceSecretKeys yields wsAuthored=false for every
 // key, so a missing provenance map strips ALL SCM-write tokens rather than
-// leaking them. adminToken is the legacy platform-controlled boot credential;
-// keep it until the scoped boot-token workstream replaces it.
-func buildCPTenantEnv(cfg WorkspaceConfig, adminToken string) map[string]string {
-	env := make(map[string]string, len(cfg.EnvVars)+1)
+// leaking them.
+//
+// WS-B: the tenant platform NO LONGER forwards its own ADMIN_TOKEN into the
+// workspace env. The control plane rejects a forwarded bare ADMIN_TOKEN (its
+// #1217 privileged-env guard) AND injects the tenant admin token itself — only
+// for a platform-kind (concierge) box — while an ordinary box authenticates its
+// pre-register boot with the scoped MOLECULE_BOOT_TOKEN the CP mints (WS-A).
+// Forwarding ADMIN_TOKEN here both 400-failed the delegated provision and
+// over-privileged every ordinary box; deleting it reconciles core with #1217.
+func buildCPTenantEnv(cfg WorkspaceConfig) map[string]string {
+	env := make(map[string]string, len(cfg.EnvVars))
 	for k, v := range cfg.EnvVars {
 		if isPrivilegedWorkspaceEnvKey(k) {
 			log.Printf("CPProvisioner.Start: dropped privileged credential %q from tenant workspace env", k)
@@ -287,18 +294,16 @@ func buildCPTenantEnv(cfg WorkspaceConfig, adminToken string) map[string]string 
 		}
 		env[k] = v
 	}
-	if adminToken != "" {
-		env["ADMIN_TOKEN"] = adminToken
-	}
 	return env
 }
 
 // Start provisions a workspace by calling the control plane → EC2.
 func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
 	// p.adminToken is read from os.Getenv("ADMIN_TOKEN") at provisioner creation
-	// and is used both as CP request authentication and, temporarily, as the
-	// workspace boot credential. The handoff design requires a scoped boot token
-	// to land before this legacy env handoff can be retired.
+	// and is used ONLY as CP request authentication (the X-Molecule-Admin-Token
+	// header below). WS-B: it is no longer forwarded into the workspace env — the
+	// CP owns admin delivery (platform-kind only) and WS-A's scoped boot token is
+	// the ordinary box's pre-register bearer.
 	//
 	// Forensic #145 hardening: tenant workspaces run on EC2 via this path, so
 	// the SCM-write-token denylist (see buildContainerEnv) is enforced here
@@ -307,7 +312,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// tenant container regardless of whether ADMIN_TOKEN is set. Extracted to
 	// buildCPTenantEnv so the strip/exempt logic is unit-testable without
 	// standing up the CP HTTP round-trip.
-	env := buildCPTenantEnv(cfg, p.adminToken)
+	env := buildCPTenantEnv(cfg)
 	// Collect template files and generated configs, with OFFSEC-010 guards:
 	// - Rejects symlinks at the template root (prevents bypass via symlink traversal)
 	// - Skips symlinks during WalkDir (prevents /etc/passwd etc. inclusion)

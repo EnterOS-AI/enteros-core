@@ -975,27 +975,46 @@ func TestCPProvisionerEnv_StripsSCMWriteTokens(t *testing.T) {
 	}
 }
 
-func TestBuildContainerEnv_InjectsLegacyAdminTokenUntilBootTokenLands(t *testing.T) {
+// TestBuildContainerEnv_AdminTokenGatedToPlatformKind pins WS-B on the
+// local-docker path: only a platform-kind (concierge) box carries the tenant
+// ADMIN_TOKEN; an ordinary box carries none (its pre-register bearer is WS-A's
+// scoped MOLECULE_BOOT_TOKEN). Caller-supplied privileged env is stripped on both.
+func TestBuildContainerEnv_AdminTokenGatedToPlatformKind(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "tenant-admin-secret")
-	cfg := WorkspaceConfig{
-		WorkspaceID:  "ws-local",
-		PlatformURL:  "http://platform:8080",
-		Runtime:      "claude-code",
-		EnvVars:      map[string]string{"ADMIN_TOKEN": "caller-admin", "MOLECULE_ADMIN_TOKEN": "caller-admin-2", "CUSTOM": "ok"},
-		TemplatePath: t.TempDir(),
+	cfgFor := func(kind string) WorkspaceConfig {
+		return WorkspaceConfig{
+			WorkspaceID:  "ws-local",
+			PlatformURL:  "http://platform:8080",
+			Runtime:      "claude-code",
+			Kind:         kind,
+			EnvVars:      map[string]string{"ADMIN_TOKEN": "caller-admin", "MOLECULE_ADMIN_TOKEN": "caller-admin-2", "CUSTOM": "ok"},
+			TemplatePath: t.TempDir(),
+		}
 	}
-	got := buildContainerEnv(cfg)
-	if !envContains(got, "ADMIN_TOKEN=tenant-admin-secret") {
-		t.Fatalf("expected platform-controlled ADMIN_TOKEN boot env until scoped boot token lands: %v", got)
+
+	// Ordinary box: NO tenant admin token at all.
+	ord := buildContainerEnv(cfgFor(""))
+	if envContainsPrefix(ord, "ADMIN_TOKEN=") {
+		t.Fatalf("WS-B: ordinary box must NOT carry ADMIN_TOKEN, got %v", ord)
 	}
-	if envContains(got, "ADMIN_TOKEN=caller-admin") {
-		t.Fatalf("caller-supplied ADMIN_TOKEN must be stripped, got %v", got)
+	if !envContains(ord, "CUSTOM=ok") {
+		t.Fatalf("expected ordinary env vars to pass through: %v", ord)
 	}
-	if envContainsPrefix(got, "MOLECULE_ADMIN_TOKEN=") {
-		t.Fatalf("caller-supplied MOLECULE_ADMIN_TOKEN must be stripped, got %v", got)
+
+	// Platform (concierge) box: keeps the platform-controlled ADMIN_TOKEN.
+	plat := buildContainerEnv(cfgFor(WorkspaceKindPlatform))
+	if !envContains(plat, "ADMIN_TOKEN=tenant-admin-secret") {
+		t.Fatalf("concierge (platform) box must keep ADMIN_TOKEN, got %v", plat)
 	}
-	if !envContains(got, "CUSTOM=ok") {
-		t.Fatalf("expected ordinary env vars to pass through: %v", got)
+
+	// Caller-supplied privileged env is stripped regardless of kind.
+	for _, got := range [][]string{ord, plat} {
+		if envContains(got, "ADMIN_TOKEN=caller-admin") {
+			t.Fatalf("caller-supplied ADMIN_TOKEN must be stripped, got %v", got)
+		}
+		if envContainsPrefix(got, "MOLECULE_ADMIN_TOKEN=") {
+			t.Fatalf("caller-supplied MOLECULE_ADMIN_TOKEN must be stripped, got %v", got)
+		}
 	}
 }
 
@@ -1084,7 +1103,7 @@ func TestBuildCPTenantEnv_ForensicGuardProvenance(t *testing.T) {
 				EnvVars:             tt.envVars,
 				WorkspaceSecretKeys: tt.workspaceKeys,
 			}
-			got := buildCPTenantEnv(cfg, "")
+			got := buildCPTenantEnv(cfg)
 
 			for _, k := range tt.wantStrippedKeys {
 				if v, ok := got[k]; ok {
@@ -1100,10 +1119,12 @@ func TestBuildCPTenantEnv_ForensicGuardProvenance(t *testing.T) {
 	}
 }
 
-// TestBuildCPTenantEnv_InjectsLegacyAdminTokenUntilBootTokenLands asserts the
-// platform-controlled admin bearer remains the temporary boot credential while
-// caller-supplied admin env is still stripped.
-func TestBuildCPTenantEnv_InjectsLegacyAdminTokenUntilBootTokenLands(t *testing.T) {
+// TestBuildCPTenantEnv_NeverForwardsAdminToken pins WS-B on the SaaS-delegate
+// path: the tenant platform must NOT forward ADMIN_TOKEN (bare or caller-supplied)
+// to the control plane — the CP rejects a forwarded ADMIN_TOKEN (#1217) and owns
+// admin delivery itself (platform-kind only; WS-A boot token for ordinary boxes).
+// Caller-supplied privileged + SCM-write env is still stripped.
+func TestBuildCPTenantEnv_NeverForwardsAdminToken(t *testing.T) {
 	cfg := WorkspaceConfig{
 		WorkspaceID: "ws-tenant",
 		EnvVars: map[string]string{
@@ -1113,9 +1134,9 @@ func TestBuildCPTenantEnv_InjectsLegacyAdminTokenUntilBootTokenLands(t *testing.
 			"CUSTOM":               "ok",
 		},
 	}
-	got := buildCPTenantEnv(cfg, "tenant-admin-secret")
-	if got["ADMIN_TOKEN"] != "tenant-admin-secret" {
-		t.Errorf("ADMIN_TOKEN env = %q; want platform-controlled tenant-admin-secret until scoped boot token lands", got["ADMIN_TOKEN"])
+	got := buildCPTenantEnv(cfg)
+	if _, ok := got["ADMIN_TOKEN"]; ok {
+		t.Errorf("WS-B: buildCPTenantEnv must never forward ADMIN_TOKEN (CP #1217 rejects it): %v", got)
 	}
 	if _, ok := got["MOLECULE_ADMIN_TOKEN"]; ok {
 		t.Errorf("caller-supplied MOLECULE_ADMIN_TOKEN must be stripped: %v", got)

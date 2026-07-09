@@ -1102,11 +1102,18 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 	} else if pat, hasPAT := cfg.EnvVars["GH_PAT"]; hasPAT && pat != "" {
 		env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", pat))
 	}
-	// TODO(workspace-privilege-token-handoff): replace this legacy bootstrap
-	// bearer with a scoped, per-workspace boot token before removing it. The
-	// runtime still depends on the platform-controlled ADMIN_TOKEN during boot.
-	if adminToken := os.Getenv("ADMIN_TOKEN"); adminToken != "" {
-		env = append(env, fmt.Sprintf("ADMIN_TOKEN=%s", adminToken))
+	// WS-B: only the platform-kind (concierge) box gets the tenant ADMIN_TOKEN.
+	// An ordinary agent box must NOT carry the tenant admin credential (least
+	// privilege — founder ruling 2026-07-08); it authenticates its pre-register
+	// boot with the scoped MOLECULE_BOOT_TOKEN (WS-A). The concierge keeps it
+	// (its management MCP + boot path); gating here is a no-op for the concierge
+	// and drops it only for ordinary boxes. Removing it for ordinary boxes is
+	// safe ONLY because WS-A's boot token now covers their boot bearer — the
+	// exact prerequisite #3577 was missing when it re-broke boot.
+	if cfg.Kind == WorkspaceKindPlatform {
+		if adminToken := os.Getenv("ADMIN_TOKEN"); adminToken != "" {
+			env = append(env, fmt.Sprintf("ADMIN_TOKEN=%s", adminToken))
+		}
 	}
 	// Langfuse tracing (SSOT reproducibility): when the platform has Langfuse
 	// keys in its env, inject them into EVERY workspace container so the shared
