@@ -1102,6 +1102,12 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 	} else if pat, hasPAT := cfg.EnvVars["GH_PAT"]; hasPAT && pat != "" {
 		env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", pat))
 	}
+	// TODO(workspace-privilege-token-handoff): replace this legacy bootstrap
+	// bearer with a scoped, per-workspace boot token before removing it. The
+	// runtime still depends on the platform-controlled ADMIN_TOKEN during boot.
+	if adminToken := os.Getenv("ADMIN_TOKEN"); adminToken != "" {
+		env = append(env, fmt.Sprintf("ADMIN_TOKEN=%s", adminToken))
+	}
 	return env
 }
 

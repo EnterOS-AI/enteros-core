@@ -248,7 +248,7 @@ func TestStart_HappyPath(t *testing.T) {
 	}
 }
 
-func TestStart_SendsAdminTokenOnlyAsProvisionHeader(t *testing.T) {
+func TestStart_SendsAdminTokenAsHeaderAndLegacyBootEnv(t *testing.T) {
 	var sawAdminHeader string
 	var body cpProvisionRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -281,8 +281,8 @@ func TestStart_SendsAdminTokenOnlyAsProvisionHeader(t *testing.T) {
 	if sawAdminHeader != "tenant-admin-secret" {
 		t.Fatalf("X-Molecule-Admin-Token = %q, want tenant-admin-secret", sawAdminHeader)
 	}
-	if got := body.Env["ADMIN_TOKEN"]; got != "" {
-		t.Fatalf("ADMIN_TOKEN leaked into provision env payload: %q", got)
+	if got := body.Env["ADMIN_TOKEN"]; got != "tenant-admin-secret" {
+		t.Fatalf("ADMIN_TOKEN env = %q; want tenant-admin-secret until scoped boot token lands", got)
 	}
 	if body.Env["CUSTOM"] != "ok" {
 		t.Fatalf("CUSTOM env var = %q, want ok", body.Env["CUSTOM"])
