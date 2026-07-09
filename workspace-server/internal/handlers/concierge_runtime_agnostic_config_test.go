@@ -16,16 +16,16 @@ import (
 // concierge.
 //
 // The concierge (kind=platform) runs on its org's SWITCHABLE default runtime
-// (MOLECULE_DEFAULT_RUNTIME; default openclaw). Pre-fix, the single
+// (MOLECULE_DEFAULT_RUNTIME; default hermes). Pre-fix, the single
 // platform-agent template config.yaml pinned `runtime: claude-code`, so a
 // concierge on ANY other runtime received a config whose top-level runtime
 // contradicted the requested one — runtimeSeedMismatchAbort refused the launch
-// and the concierge (including the default openclaw one) got no persona.
+// and the concierge (including the default hermes one) got no persona.
 //
 // The fix composes the concierge's /configs/config.yaml from its ACTUAL
 // runtime's native base template + grafts the runtime-agnostic persona per that
 // runtime's convention. These tests assert, for a concierge on runtime in
-// {openclaw(default), claude-code, codex, google-adk}:
+// {hermes(default), openclaw, claude-code, codex, google-adk}:
 //   - the seeded config.yaml declares the concierge's ACTUAL runtime (so
 //     runtimeSeedMismatchAbort does NOT fire),
 //   - runtime_config.required_env is neutralized to [] (platform-managed),
@@ -64,6 +64,13 @@ func writeConciergeBaseFixtures(t *testing.T, configsDir string) {
 			"runtime_config:\n" +
 			"  model: gpt-5.5\n" +
 			"  required_env: [OPENAI_API_KEY, CODEX_AUTH_JSON]\n",
+		"hermes/config.yaml": "name: Hermes Agent\n" +
+			"runtime: hermes\n" +
+			"prompt_files:\n" +
+			"- system-prompt.md\n" +
+			"runtime_config:\n" +
+			"  model: minimax/MiniMax-M2.7\n" +
+			"  required_env: [MINIMAX_API_KEY]\n",
 		"google-adk/config.yaml": "name: Google ADK Agent\n" +
 			"runtime: google-adk\n" +
 			"prompt_files:\n" +
@@ -120,6 +127,7 @@ func TestComposeConciergeRuntimeConfig_RuntimeAgnostic(t *testing.T) {
 		runtime         string
 		wantPersonaFile string // "" means system-prompt.md convention (claude-code)
 	}{
+		{"hermes", conciergePersonaPromptPath},
 		{"openclaw", conciergePersonaPromptPath},
 		{"claude-code", ""},
 		{"codex", conciergePersonaPromptPath},

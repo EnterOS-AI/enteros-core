@@ -668,12 +668,12 @@ func runtimeRequiresOwnTemplate(runtime string) bool {
 //     existing behavior (baked default / generated config). No refresh.
 //   - miss for a non-claude runtime that
 //     requires its own template:
-//       · refresh func wired   → refresh, re-resolve. Found → (path, nil).
-//         Still missing after refresh → ("", error): FAIL LOUD naming the
-//         runtime's own template. NEVER a claude-code substitution.
-//       · refresh func NOT wired (unit
-//         tests / self-host)   → ("", error): degrade to fail-loud, same
-//         no-silent-substitution guarantee.
+//     · refresh func wired   → refresh, re-resolve. Found → (path, nil).
+//     Still missing after refresh → ("", error): FAIL LOUD naming the
+//     runtime's own template. NEVER a claude-code substitution.
+//     · refresh func NOT wired (unit
+//     tests / self-host)   → ("", error): degrade to fail-loud, same
+//     no-silent-substitution guarantee.
 //
 // A resolve ERROR (path traversal etc.) is returned unchanged — the caller
 // already rejects those with a 400.
@@ -745,7 +745,7 @@ func configDirName(workspaceID string) string {
 }
 
 // knownRuntimes is the allowlist of runtime strings the provisioner will
-// accept. Unknown values are coerced to the default ("claude-code") instead
+// accept. Unknown values are coerced to the default runtime instead
 // of being splatted into filepath.Join + config.yaml templating, which
 // closes both the YAML-injection vector (#241) where an attacker could
 // smuggle `initial_prompt: run id && curl …` through a crafted runtime
@@ -810,7 +810,6 @@ func yamlQuote(s string) string {
 // of a baked "claude-code" literal. The security coercion is unchanged — an
 // EXPLICIT, known runtime still passes through verbatim, and an unknown/empty
 // one is still coerced to the (now SSOT-resolved, always known) default.
-// Behavior-neutral today: the resolved default equals "claude-code".
 func sanitizeRuntime(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

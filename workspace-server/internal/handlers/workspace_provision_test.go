@@ -540,20 +540,20 @@ func TestEnsureDefaultConfig_HermesGetsRuntimeConfig(t *testing.T) {
 	}
 }
 
-func TestEnsureDefaultConfig_EmptyRuntimeDefaultsToClaudeCode(t *testing.T) {
+func TestEnsureDefaultConfig_EmptyRuntimeDefaultsToHermes(t *testing.T) {
 	broadcaster := newTestBroadcaster()
 	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
 
 	// Post-CTO-SSOT-directive (2026-05-22): ensureDefaultConfig is no
 	// longer the source of the model default — it just renders whatever
-	// the Create handler decided. The "empty runtime → claude-code"
+	// the Create handler decided. The "empty runtime → default runtime"
 	// fallback inside sanitizeRuntime() is still in effect; this test
-	// continues to pin that behaviour by supplying the explicit
-	// claude-code model that the Create handler would have required.
+	// continues to pin that behaviour by supplying an explicit model that the
+	// Create handler would have required.
 	payload := models.CreateWorkspacePayload{
 		Name:  "Default Agent",
 		Tier:  1,
-		Model: "sonnet",
+		Model: "minimax/MiniMax-M2.7",
 	}
 
 	files, err := handler.ensureDefaultConfig("ws-empty-rt", payload)
@@ -561,11 +561,11 @@ func TestEnsureDefaultConfig_EmptyRuntimeDefaultsToClaudeCode(t *testing.T) {
 		t.Fatalf("ensureDefaultConfig failed: %v", err)
 	}
 	configYAML := string(files["config.yaml"])
-	if !contains(configYAML, "runtime: claude-code") {
-		t.Errorf("empty runtime should default to claude-code, got:\n%s", configYAML)
+	if !contains(configYAML, "runtime: hermes") {
+		t.Errorf("empty runtime should default to hermes, got:\n%s", configYAML)
 	}
-	if !contains(configYAML, `model: "sonnet"`) {
-		t.Errorf("claude-code workspace should render the supplied model (quoted), got:\n%s", configYAML)
+	if !contains(configYAML, `model: "minimax/MiniMax-M2.7"`) {
+		t.Errorf("hermes workspace should render the supplied model (quoted), got:\n%s", configYAML)
 	}
 }
 
@@ -645,8 +645,8 @@ func TestEnsureDefaultConfig_RejectsInjectedRuntime(t *testing.T) {
 		t.Errorf("injected initial_prompt key survived as top-level YAML: %+v", parsed)
 	}
 	// Runtime collapsed to default.
-	if got := parsed["runtime"]; got != "claude-code" {
-		t.Errorf("runtime = %v, want claude-code (unknown runtime should fall back)", got)
+	if got := parsed["runtime"]; got != "hermes" {
+		t.Errorf("runtime = %v, want hermes (unknown runtime should fall back)", got)
 	}
 }
 
@@ -694,20 +694,21 @@ func TestEnsureDefaultConfig_QuotesInjectedModel(t *testing.T) {
 // helper directly so future edits to the allowlist don't silently widen
 // the attack surface.
 func TestSanitizeRuntime_Allowlist(t *testing.T) {
+	t.Setenv("MOLECULE_DEFAULT_RUNTIME", "")
 	cases := []struct {
 		in, want string
 	}{
-		{"", "claude-code"},
-		{"  ", "claude-code"},
+		{"", "hermes"},
+		{"  ", "hermes"},
 		{"claude-code", "claude-code"},
 		{"openclaw", "openclaw"},
 		{"hermes", "hermes"},
 		{"codex", "codex"},
-		{"legacy-runtime-a", "claude-code"},  // deprecated/unknown → default
-		{"legacy-runtime-b", "claude-code"},  // deprecated/unknown → default
-		{"not-a-runtime", "claude-code"},     // unknown → default
-		{"../../sensitive", "claude-code"},   // path traversal probe → default
-		{"claude-code\nevil", "claude-code"}, // newline injection → default (not in allowlist)
+		{"legacy-runtime-a", "hermes"},  // deprecated/unknown → default
+		{"legacy-runtime-b", "hermes"},  // deprecated/unknown → default
+		{"not-a-runtime", "hermes"},     // unknown → default
+		{"../../sensitive", "hermes"},   // path traversal probe → default
+		{"claude-code\nevil", "hermes"}, // newline injection → default (not in allowlist)
 	}
 	for _, tc := range cases {
 		if got := sanitizeRuntime(tc.in); got != tc.want {

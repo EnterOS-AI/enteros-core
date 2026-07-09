@@ -77,11 +77,12 @@ const SAMPLE_TEMPLATES = [
     id: "hermes",
     name: "Hermes",
     runtime: "hermes",
-    model: "openai/gpt-4o",
+    model: "minimax/MiniMax-M2.7",
     providers: ["openai", "anthropic", "platform"],
     models: [
       { id: "openai/gpt-4o", name: "GPT-4o", required_env: ["OPENAI_API_KEY"] },
       { id: "anthropic/claude-sonnet-4-5", name: "Claude Sonnet 4.5", required_env: ["ANTHROPIC_API_KEY"] },
+      { id: "minimax/MiniMax-M2.7", name: "MiniMax M2.7", provider: "platform", required_env: [] },
       { id: "moonshot/kimi-k2.6", name: "Kimi K2.6", provider: "platform", required_env: [] },
     ],
   },
@@ -251,9 +252,9 @@ describe("CreateWorkspaceDialog", () => {
       volume: { root_gb: 30 },
       display: { mode: "none" },
     });
-    expect(body.model).toBe("moonshot/kimi-k2.6");
+    expect(body.model).toBe("minimax/MiniMax-M2.7");
     expect(body.llm_provider).toBe("platform");
-    expect(body.runtime).toBe("claude-code");
+    expect(body.runtime).toBe("hermes");
     expect(body.secrets).toBeUndefined();
   });
 
@@ -263,14 +264,15 @@ describe("CreateWorkspaceDialog", () => {
     const runtimeSelect = screen.getByLabelText("Runtime") as HTMLSelectElement;
     const runtimeTexts = Array.from(runtimeSelect.options).map((o) => o.text.trim());
     expect(runtimeTexts).toEqual([
+      "Hermes",
       "Claude Code",
       "OpenAI Codex CLI",
       "Google ADK",
-      "Hermes",
       "OpenClaw",
     ]);
     expect(runtimeTexts).not.toContain("SEO Agent");
 
+    await setRuntime("claude-code");
     await waitFor(() => {
       const templateSelect = screen.getByLabelText("Workspace Template") as HTMLSelectElement;
       const templateTexts = Array.from(templateSelect.options).map((o) => o.text.trim());
@@ -307,7 +309,7 @@ describe("CreateWorkspaceDialog", () => {
 
     await waitFor(() => expect(mockPost).toHaveBeenCalled());
     const body = mockPost.mock.calls[0][1] as Record<string, unknown>;
-    expect(body.model).toBe("moonshot/kimi-k2.6");
+    expect(body.model).toBe("minimax/MiniMax-M2.7");
     expect(body.llm_provider).toBe("platform");
     expect(body.compute).toEqual({
       instance_type: "t3.xlarge",
@@ -437,6 +439,7 @@ describe("CreateWorkspaceDialog", () => {
 
   it("sends BYOK API key secrets when API key auth mode is selected", async () => {
     await openDialog();
+    await setRuntime("claude-code");
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "BYOK Agent" },
     });
@@ -459,6 +462,7 @@ describe("CreateWorkspaceDialog", () => {
 
   it("sends Claude OAuth token separately from platform-managed mode", async () => {
     await openDialog();
+    await setRuntime("claude-code");
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "OAuth Agent" },
     });
@@ -484,6 +488,7 @@ describe("CreateWorkspaceDialog", () => {
 
   it("lists all Claude Code subscription aliases for blank workspaces", async () => {
     await openDialog();
+    await setRuntime("claude-code");
 
     fireEvent.change(document.querySelector("[data-testid='provider-select']") as HTMLSelectElement, {
       target: { value: "anthropic-oauth|CLAUDE_CODE_OAUTH_TOKEN" },
@@ -543,7 +548,7 @@ describe("CreateWorkspaceDialog — dynamic runtime provider picker", () => {
       expect(providerSelect.value).toBe("platform|");
     });
     const modelSelect = document.querySelector("[data-testid='model-select']") as HTMLSelectElement;
-    expect(modelSelect.value).toBe("moonshot/kimi-k2.6");
+    expect(modelSelect.value).toBe("minimax/MiniMax-M2.7");
   });
 
   it("prompts for the provider credential required by the selected Hermes model", async () => {
@@ -606,6 +611,7 @@ describe("CreateWorkspaceDialog — dynamic runtime provider picker", () => {
 
   it("does NOT include secrets field when provider is platform-managed", async () => {
     await openDialog();
+    await setRuntime("claude-code");
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Normal Agent" },
     });
@@ -696,6 +702,7 @@ describe("CreateWorkspaceDialog — registry-backed provider catalog (RFC#340 Fi
 
   it("shows the Platform provider bucket for the registry-backed claude-code runtime", async () => {
     await openDialog();
+    await setRuntime("claude-code");
     const providerSelect = await waitFor(() => {
       const sel = document.querySelector("[data-testid='provider-select']") as HTMLSelectElement;
       expect(sel).toBeTruthy();
@@ -713,6 +720,7 @@ describe("CreateWorkspaceDialog — registry-backed provider catalog (RFC#340 Fi
 
   it("sends llm_provider: platform (not moonshot) for moonshot/kimi-k2.6", async () => {
     await openDialog();
+    await setRuntime("claude-code");
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Kimi Agent" },
     });
@@ -735,6 +743,7 @@ describe("CreateWorkspaceDialog — registry-backed provider catalog (RFC#340 Fi
 
   it("buckets MiniMax-M2.7 under its derived provider and sends llm_provider: minimax", async () => {
     await openDialog();
+    await setRuntime("claude-code");
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "MiniMax Agent" },
     });
@@ -771,6 +780,7 @@ describe("CreateWorkspaceDialog — registry-backed provider catalog (RFC#340 Fi
       return SAMPLE_WORKSPACES as any;
     });
     await openDialog();
+    await setRuntime("claude-code");
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Registry Platform Agent" },
     });
@@ -894,6 +904,7 @@ describe("CreateWorkspaceDialog — platform-managed credential suppression (#22
 
   it("platform-managed provider with a declared auth env requires NO credential, hides the key field, and sends NO secret", async () => {
     await openDialog();
+    await setRuntime("claude-code");
     await setTemplate("platform-managed-test");
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "Platform Agent" },
@@ -920,6 +931,7 @@ describe("CreateWorkspaceDialog — platform-managed credential suppression (#22
 
   it("BYOK provider still requires a credential and renders the key field (no-regression)", async () => {
     await openDialog();
+    await setRuntime("claude-code");
     await setTemplate("byok-only-test");
     fireEvent.change(screen.getByPlaceholderText("e.g. SEO Agent"), {
       target: { value: "BYOK Agent" },

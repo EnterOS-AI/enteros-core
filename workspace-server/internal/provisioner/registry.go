@@ -29,16 +29,14 @@ var knownRuntimes = []string{
 // doesn't specify a runtime AND the MOLECULE_DEFAULT_RUNTIME env override is
 // unset/empty/unknown. It is also the OSS default for self-hosted operators who
 // run without the platform KMS-injected override.
-const defaultRuntimeFallback = "claude-code"
+const defaultRuntimeFallback = "hermes"
 
 // defaultRuntime resolves the platform default runtime, honoring the
 // MOLECULE_DEFAULT_RUNTIME env override (KMS SSOT, injected at deploy time)
 // over the compiled-in defaultRuntimeFallback const.
 //
-// De-hardcode (behavior-neutral): the override's staging KMS value equals the
-// old literal ("claude-code"), and unset/local falls back to the same literal,
-// so no behavior changes today. A later platform-default flip is a separate,
-// deliberate KMS edit — not a code change.
+// The env override remains the SSOT for managed deployments; this compiled
+// fallback is the local/self-host default when no operator value is present.
 //
 // FAIL CLOSED on an unknown override: the resolved runtime MUST be in the
 // canonical knownRuntimes allowlist (IsKnownRuntime). An override that names a
@@ -64,8 +62,7 @@ func defaultRuntime() string {
 // deploy time) over the compiled-in defaultRuntimeFallback, fail-closed on an
 // unknown override (see defaultRuntime). Lower-level callers outside this
 // package (e.g. internal/bundle) use this to FOLLOW the one platform-runtime
-// SSOT instead of baking a second "claude-code" literal. Behavior-neutral today:
-// the prod/staging KMS value equals the fallback, and unset/local resolves to it.
+// SSOT instead of baking a second runtime literal.
 func DefaultRuntime() string {
 	return defaultRuntime()
 }

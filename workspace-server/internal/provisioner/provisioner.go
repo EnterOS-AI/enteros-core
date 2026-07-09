@@ -118,7 +118,7 @@ type WorkspaceConfig struct {
 	PluginsPath      string            // Host path to plugins directory (mounted at /plugins)
 	WorkspacePath    string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
 	Tier             int
-	Runtime          string // "claude-code" (default), "codex", "hermes", "openclaw", etc.
+	Runtime          string // "hermes" (default), "claude-code", "codex", "openclaw", etc.
 	InstanceType     string // Optional CP EC2 instance type override (SaaS only)
 	DiskGB           int32  // Optional CP root volume size override in GiB (SaaS only)
 	DataPersistence  string // internal#734: "persist"|"ephemeral"|"" — durable-data choice forwarded to CP (SaaS only)

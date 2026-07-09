@@ -64,8 +64,7 @@ func Import(
 	// Extract runtime from config.yaml in the bundle. The fallback (when the
 	// bundle's config.yaml carries no runtime) FOLLOWS the platform default
 	// SSOT (MOLECULE_DEFAULT_RUNTIME, KMS-injected) via provisioner.DefaultRuntime
-	// instead of a baked "claude-code" literal. Behavior-neutral today: the
-	// resolved default equals "claude-code".
+	// instead of a baked runtime literal.
 	bundleRuntime := provisioner.DefaultRuntime()
 	if configYaml, ok := b.Prompts["config.yaml"]; ok {
 		for _, line := range strings.Split(configYaml, "\n") {

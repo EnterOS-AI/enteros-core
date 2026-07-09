@@ -308,7 +308,7 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	//    runtime's convention. This is the GENERAL fix for the #2027
 	//    runtime-seed-mismatch abort (BUG: the single platform-agent template
 	//    config.yaml pins `runtime: claude-code`, so a concierge whose row
-	//    declares any OTHER runtime — including the default openclaw — received a
+	//    declares any OTHER runtime — including the default hermes — received a
 	//    config whose top-level runtime contradicted the requested one; the
 	//    provision aborted and the concierge got no persona). The concierge runs
 	//    on the plain per-runtime image (selectImage: kind=platform →
@@ -554,12 +554,10 @@ const claudeCodeRuntime = "claude-code"
 // MOLECULE_DEFAULT_RUNTIME (the same SSOT handlers.Create reads via
 // bareCreateDefaultRuntime), falling back to this const when the env is unset.
 //
-// 'openclaw' per the operator ruling 2026-07-07 (core#3496: "openclaw should
-// be the default for now") — this also ALIGNS the compiled-in fallback with
-// the platform KMS default (staging-tenant-cd.yml already defaults
-// MOLECULE_DEFAULT_RUNTIME to 'openclaw'), closing a documented divergence
-// where self-host and SaaS silently seeded different concierge runtimes.
-const defaultConciergeRuntime = "openclaw"
+// 'hermes' is the product default for fresh platform agents. Managed deploys can
+// still override it through MOLECULE_DEFAULT_RUNTIME; local/self-host boots use
+// this fallback when no operator value is present.
+const defaultConciergeRuntime = "hermes"
 
 // conciergeDefaultRuntime resolves the concierge's default runtime, honoring the
 // generic KMS platform default env MOLECULE_DEFAULT_RUNTIME (injected at deploy
@@ -1223,7 +1221,8 @@ func ensureCreatedWorkspaceProviderPin(ctx context.Context, workspaceID, runtime
 func EnsureSelfHostedPlatformAgent(ctx context.Context, database *sql.DB) error {
 	out, err := ensurePlatformAgentFlow(ctx, database, ensureFlowOptions{
 		// All defaults: name defaultPlatformAgentName(), runtime
-		// conciergeDefaultRuntime() (MOLECULE_DEFAULT_RUNTIME else claude-code) —
+		// conciergeDefaultRuntime() (MOLECULE_DEFAULT_RUNTIME else the compiled-in
+		// Hermes fallback) —
 		// a self-host operator who wants a different runtime sets the env or
 		// switches it post-seed via the standard runtime-change path.
 		//
@@ -1427,8 +1426,8 @@ type installPlatformAgentPayload struct {
 	// Name is the display name; defaults to "Org Concierge" when omitted.
 	Name string `json:"name"`
 	// Runtime is the concierge's runtime (P3b). Optional; defaults to
-	// claude-code when omitted so existing CP callers that don't send it keep
-	// the legacy behavior. A CP that wants a codex/openclaw concierge passes it.
+	// conciergeDefaultRuntime() when omitted. A CP that wants an explicit runtime
+	// passes it.
 	Runtime string `json:"runtime"`
 }
 
@@ -1482,7 +1481,8 @@ func InstallPlatformAgent(c *gin.Context) {
 func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, name, runtime string) error {
 	// P3b: the concierge runtime is a parameter. An empty runtime (legacy callers,
 	// self-host seed) falls back to the KMS-resolved platform default
-	// (conciergeDefaultRuntime: MOLECULE_DEFAULT_RUNTIME else 'claude-code'). The
+	// (conciergeDefaultRuntime: MOLECULE_DEFAULT_RUNTIME else the compiled-in
+	// fallback). The
 	// resolved runtime is what the INSERT below stamps into workspaces.runtime
 	// ($3) and what conciergeTemplateForRuntime maps to the template ($4), so the
 	// asset fetcher pulls the right platform-agent identity.

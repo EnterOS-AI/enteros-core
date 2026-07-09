@@ -303,7 +303,7 @@ func TestDeriveProviderMatrix_KnownTrickyForms(t *testing.T) {
 		{"hermes anthropic/ -> byok-anthropic NOT platform", "hermes", "anthropic/claude-opus-4-7", nil, "byok-anthropic", false},
 		{"hermes gemini/ -> byok-gemini", "hermes", "gemini/gemini-2.5-pro", nil, "byok-gemini", false},
 		{"hermes openai: -> byok-openai", "hermes", "openai:gpt-4o", nil, "byok-openai", false},
-		{"hermes minimax: -> byok-minimax", "hermes", "minimax:MiniMax-M2", nil, "byok-minimax", false},
+		{"hermes minimax: -> byok-minimax", "hermes", "minimax:MiniMax-M2.7", nil, "byok-minimax", false},
 		// --- codex BYOK minimax token-plan id routes via the narrow codex- leg --
 		{"codex codex-minimax- -> byok-minimax", "codex", "codex-minimax-m2.7", nil, "byok-minimax", false},
 		// --- codex gpt-* default (no auth) -> openai-subscription (first arm) ---

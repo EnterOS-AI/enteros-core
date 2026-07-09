@@ -37,9 +37,8 @@ func ListOfferedModels(c *gin.Context) {
 	if runtime == "" {
 		// An explicit ?runtime= query wins; only the unset fallback FOLLOWS the
 		// platform default SSOT (MOLECULE_DEFAULT_RUNTIME, KMS-injected) via
-		// bareCreateDefaultRuntime instead of a baked "claude-code" literal so
-		// discovery stays aligned with the create/billing default. Behavior-
-		// neutral today: resolves to "claude-code".
+		// bareCreateDefaultRuntime instead of a baked runtime literal so
+		// discovery stays aligned with the create/billing default.
 		runtime = bareCreateDefaultRuntime()
 	}
 	m, err := providerRegistry()
