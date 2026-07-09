@@ -56,7 +56,7 @@ interface TemplateSpec {
   registry_models?: RegistryModel[];
 }
 
-const DEFAULT_RUNTIME = "claude-code";
+const DEFAULT_RUNTIME = "hermes";
 
 // Human-readable labels for cloud-provider IDs. Provider ordering and
 // instance-type allowlists are SSOT from GET /compute/metadata; labels are
@@ -69,10 +69,10 @@ const PROVIDER_LABELS: Record<string, string> = {
 const providerLabel = (id: string): string => PROVIDER_LABELS[id] ?? id;
 
 const RUNTIME_OPTIONS = [
+  { value: "hermes", label: "Hermes" },
   { value: "claude-code", label: "Claude Code" },
   { value: "codex", label: "OpenAI Codex CLI" },
   { value: "google-adk", label: "Google ADK" },
-  { value: "hermes", label: "Hermes" },
   { value: "openclaw", label: "OpenClaw" },
 ];
 const BASE_RUNTIME_TEMPLATE_IDS = new Set(["claude-code-default", "codex", "google-adk", "hermes", "openclaw"]);
@@ -191,11 +191,12 @@ export function CreateWorkspaceButton() {
   );
 
   const handleRuntimeChange = useCallback((nextRuntime: string) => {
+    if (nextRuntime === runtime) return;
     setRuntime(nextRuntime);
     setTemplate("");
     setLLMSelection({ providerId: "", model: "", envVars: [] });
     setLLMSecret("");
-  }, []);
+  }, [runtime]);
 
   // Resolve the selected workspace template from /templates. Runtime is
   // deliberately separate: "SEO Agent" is a workspace template, not a

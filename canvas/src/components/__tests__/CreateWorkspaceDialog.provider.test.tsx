@@ -25,6 +25,14 @@ const mockPost = vi.mocked(api.post);
 
 const SAMPLE_TEMPLATES = [
   {
+    id: "hermes",
+    name: "Hermes Agent",
+    runtime: "hermes",
+    model: "minimax/MiniMax-M2.7",
+    providers: ["platform", "minimax"],
+    models: [{ id: "minimax/MiniMax-M2.7", name: "MiniMax M2.7", provider: "platform", required_env: [] }],
+  },
+  {
     id: "claude-code-default",
     name: "Claude Code Agent",
     runtime: "claude-code",

@@ -361,14 +361,14 @@ func TestWorkspaceCreate_DBInsertError(t *testing.T) {
 	// Transaction begins, workspace INSERT fails, transaction is rolled back.
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Failing Agent", nil, 3, "claude-code", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Failing Agent", nil, 3, "hermes", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnError(sql.ErrConnDone)
 	mock.ExpectRollback()
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Failing Agent","model":"anthropic:claude-opus-4-7"}`
+	body := `{"name":"Failing Agent","model":"minimax/MiniMax-M2.7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -392,9 +392,9 @@ func TestWorkspaceCreate_DefaultsApplied(t *testing.T) {
 	// Transaction wraps the workspace INSERT (no secrets in this request).
 	mock.ExpectBegin()
 	// Expect workspace INSERT with defaulted tier=3 (Privileged — the
-	// handler default in workspace.go), runtime="claude-code"
+	// handler default in workspace.go), runtime="hermes"
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Default Agent", nil, 3, "claude-code", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Default Agent", nil, 3, "hermes", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO workspace_secrets").
@@ -414,7 +414,7 @@ func TestWorkspaceCreate_DefaultsApplied(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Default Agent","model":"anthropic:claude-opus-4-7"}`
+	body := `{"name":"Default Agent","model":"minimax/MiniMax-M2.7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -549,7 +549,7 @@ func TestWorkspaceCreate_SecretPersistFails_RollsBack(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	body := `{"name":"Rollback Agent","model":"anthropic:claude-opus-4-7","secrets":{"OPENAI_API_KEY":"sk-fail"}}`
+	body := `{"name":"Rollback Agent","runtime":"claude-code","model":"anthropic:claude-opus-4-7","secrets":{"ANTHROPIC_API_KEY":"sk-fail"}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -2061,18 +2061,18 @@ func TestWorkspaceCreate_188_TemplateConfigNoRuntimeKey_FailsClosed(t *testing.T
 	}
 }
 
-// Pre-2026-05-22 this test guarded "bare {name} → claude-code 201" — the
+// Pre-2026-05-22 this test guarded "bare {name} → default runtime 201" — the
 // regression check for controlplane#188 (where an explicit runtime that
-// failed to resolve must NOT silently substitute claude-code) had a sibling
-// to ensure the LEGITIMATE bare default still landed on claude-code.
+// failed to resolve must NOT silently substitute the default runtime) had a
+// sibling to ensure the LEGITIMATE bare default still landed on the compiled-in
+// default.
 //
 // Post-CTO-SSOT-directive (2026-05-22) bare body is 422 MODEL_REQUIRED
-// before reaching the claude-code branch — the gate runs AFTER the
-// claude-code-default assignment so the error body still surfaces
-// runtime=claude-code (helps the caller see "ok, claude-code WOULD have
+// before reaching provisioning — the gate runs AFTER the default-runtime
+// assignment so the error body still surfaces runtime=hermes (helps the caller
+// see "ok, hermes WOULD have
 // been the runtime, but you still owe me a model"). The bare-body
-// claude-code 201 path no longer exists; what we guard now is the
-// 422-shape diagnostic.
+// 201 path no longer exists; what we guard now is the 422-shape diagnostic.
 //
 // Bare-body-with-explicit-model 201 (the new "legitimate default" path)
 // is covered by TestWorkspaceCreate in handlers_test.go — no need to
@@ -2096,8 +2096,8 @@ func TestWorkspaceCreate_188_NoTemplateNoRuntime_NowMODEL_REQUIRED(t *testing.T)
 	if !bytes.Contains(w.Body.Bytes(), []byte(`"code":"MODEL_REQUIRED"`)) {
 		t.Errorf("bare-body create: expected code=MODEL_REQUIRED in body, got %s", w.Body.String())
 	}
-	if !bytes.Contains(w.Body.Bytes(), []byte(`"runtime":"claude-code"`)) {
-		t.Errorf("bare-body create: expected runtime=\"claude-code\" in 422 body (the gate runs AFTER the default assignment so the diagnostic surfaces what runtime WOULD have been used), got %s", w.Body.String())
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"runtime":"hermes"`)) {
+		t.Errorf("bare-body create: expected runtime=\"hermes\" in 422 body (the gate runs AFTER the default assignment so the diagnostic surfaces what runtime WOULD have been used), got %s", w.Body.String())
 	}
 }
 

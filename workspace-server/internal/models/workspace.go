@@ -249,7 +249,7 @@ type CreateWorkspacePayload struct {
 	// such as claude-code need a bare model id plus explicit provider slug;
 	// hermes can still derive provider from slash-prefixed model ids.
 	LLMProvider string `json:"llm_provider"`
-	Runtime     string `json:"runtime"`  // "claude-code" (default), "codex", etc.
+	Runtime     string `json:"runtime"`  // "hermes" (default), "claude-code", "codex", etc.
 	External    bool   `json:"external"` // true = no Docker container, just a registered URL
 	URL         string `json:"url"`      // for external workspaces: the A2A endpoint URL (push mode only — omit for poll)
 	// DeliveryMode: "push" (default) sends inbound A2A to URL synchronously;

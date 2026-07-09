@@ -393,7 +393,7 @@ func TestWorkspaceCreate(t *testing.T) {
 	// Default tier is 3 (Privileged) — see workspace.go create-handler comment.
 	// delivery_mode defaults to "push" when payload omits it (#2339).
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "claude-code", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Test Agent", nil, 3, "hermes", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect transaction commit (no secrets in this payload)
@@ -418,10 +418,10 @@ func TestWorkspaceCreate(t *testing.T) {
 	// Note: model is now required at the Create boundary (CTO 2026-05-22
 	// SSOT directive — see feedback_workspace_model_required_no_platform_default_dynamic_credential_intake
 	// and TestCreate_ModelRequired_Returns422). This test happens to take
-	// the bare-defaults path (no template, no runtime → claude-code), so
-	// the body must declare an explicit model. Using a claude-code-compatible
-	// id; the test doesn't exercise model semantics beyond presence.
-	body := `{"name":"Test Agent","model":"anthropic:claude-opus-4-7","canvas":{"x":100,"y":200}}`
+	// the bare-defaults path (no template, no runtime → hermes), so the body
+	// must declare an explicit model. Use a Hermes platform-managed model so the
+	// test exercises the actual default runtime.
+	body := `{"name":"Test Agent","model":"minimax/MiniMax-M2.7","canvas":{"x":100,"y":200}}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -472,7 +472,7 @@ func TestWorkspaceCreate_ReturnsAuthToken_201(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Token Holder", nil, 3, "claude-code", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Token Holder", nil, 3, "hermes", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO canvas_layouts").
@@ -489,7 +489,7 @@ func TestWorkspaceCreate_ReturnsAuthToken_201(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Token Holder","model":"anthropic:claude-opus-4-7"}`
+	body := `{"name":"Token Holder","model":"minimax/MiniMax-M2.7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 

@@ -60,8 +60,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	// Apply defaults. Explicit ws.Runtime wins, then the org template's
 	// defaults.Runtime; only the final unset fallback FOLLOWS the platform
 	// default SSOT (MOLECULE_DEFAULT_RUNTIME, KMS-injected) via
-	// bareCreateDefaultRuntime instead of a baked "claude-code" literal.
-	// Behavior-neutral today: the resolved default equals "claude-code".
+	// bareCreateDefaultRuntime instead of a baked runtime literal.
 	runtime := ws.Runtime
 	if runtime == "" {
 		runtime = defaults.Runtime

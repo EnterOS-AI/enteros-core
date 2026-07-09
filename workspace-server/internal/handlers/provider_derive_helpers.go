@@ -59,7 +59,8 @@ var providerRegistry = func() (*providers.Manifest, error) {
 // DeriveProvider needs. Best-effort: any read error returns whatever was
 // gathered (the caller fails closed on incomplete inputs). The model is the
 // MODEL workspace_secret (the canvas-picked id, written by setModelSecret /
-// Create); runtime is the workspaces.runtime column (defaults claude-code).
+// Create); runtime is the workspaces.runtime column (defaults to the platform
+// default runtime on new rows).
 // availableAuthEnv is the subset of secret KEYS that are recognized provider
 // auth-env names (never values), so DeriveProvider's auth-env tie-break can fire
 // the same way it does on the provision path.
@@ -76,8 +77,8 @@ func readWorkspaceDeriveInputs(ctx context.Context, workspaceID string) (runtime
 	if runtime == "" {
 		// Mirror the DB column default so an unset runtime still derives. The
 		// default FOLLOWS the platform default SSOT (MOLECULE_DEFAULT_RUNTIME,
-		// KMS-injected) via bareCreateDefaultRuntime instead of a baked
-		// "claude-code" literal. Behavior-neutral today: resolves to "claude-code".
+		// KMS-injected) via bareCreateDefaultRuntime instead of a baked runtime
+		// literal.
 		runtime = bareCreateDefaultRuntime()
 	}
 

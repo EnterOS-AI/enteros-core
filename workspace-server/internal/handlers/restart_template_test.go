@@ -296,23 +296,23 @@ func TestResolveRestartTemplate_CWE22_TraversalRuntime_FallsThrough(t *testing.T
 }
 
 // TestResolveRestartTemplate_CWE22_TraversalRuntime_CannotOverrideKnownRuntime
-// verifies that even if a claude-code-default template exists, a traversal
-// string in dbRuntime resolves claude-code-default (the safe default) rather
+// verifies that even if a hermes-default template exists, a traversal string in
+// dbRuntime resolves hermes-default (the safe default) rather
 // than any attacker-chosen path.  The attacker gains no additional access.
 func TestResolveRestartTemplate_CWE22_TraversalRuntime_CannotOverrideKnownRuntime(t *testing.T) {
-	root := newTemplateDir(t, "claude-code-default")
+	root := newTemplateDir(t, "hermes-default")
 
 	path, label := resolveRestartTemplate(root, "Some Workspace", "../../../etc", "", restartTemplateInput{
 		ApplyTemplate: true,
 	})
-	// Must resolve to claude-code-default (the safe default after sanitizeRuntime),
-	// not to an escaped path
-	expected := filepath.Join(root, "claude-code-default")
+	// Must resolve to hermes-default (the safe default after sanitizeRuntime),
+	// not to an escaped path.
+	expected := filepath.Join(root, "hermes-default")
 	if path != expected {
-		t.Errorf("traversal runtime must resolve to claude-code-default; got path=%q", path)
+		t.Errorf("traversal runtime must resolve to hermes-default; got path=%q", path)
 	}
-	if label != "claude-code-default" {
-		t.Errorf("label must be claude-code-default; got %q", label)
+	if label != "hermes-default" {
+		t.Errorf("label must be hermes-default; got %q", label)
 	}
 }
 
@@ -367,4 +367,3 @@ func TestResolveRestartTemplate_ExplicitBodyTemplateOverridesPersistedTemplate(t
 		t.Errorf("explicit body template must win; expected label %q, got %q", "hermes", label)
 	}
 }
-

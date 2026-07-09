@@ -308,7 +308,7 @@ func TestIntegration_PlatformAgentInstall_StatusNotOnline(t *testing.T) {
 //	         'claude-code' ...`) this assertion FAILS; against the P3b clause
 //	         (runtime omitted from the conflict SET) it passes. This is the
 //	         prove-fail core of item 3.
-//	Case 3 — the default-runtime install path still seeds 'claude-code', so the
+//	Case 3 — the default-runtime install path still seeds the compiled-in default, so the
 //	         backward-compatible callers (self-host seed, CP without runtime) are
 //	         unaffected.
 func TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered(t *testing.T) {
@@ -383,10 +383,9 @@ func TestIntegration_PlatformAgentInstall_RuntimeIsParameterAndNotClobbered(t *t
 
 	// Case 3: the default-runtime install path seeds the compiled-in default
 	// runtime on a FRESH row (backward compatibility for self-host seed + CP
-	// callers that send no runtime). The default is 'openclaw' as of the
-	// 2026-07-07 operator ruling (defaultConciergeRuntime); asserting against
-	// the const rather than a literal keeps this correct across future default
-	// flips. The persona template stays 'platform-agent' for EVERY runtime
+	// callers that send no runtime). Asserting against the const rather than a
+	// literal keeps this correct across future default flips. The persona
+	// template stays 'platform-agent' for EVERY runtime
 	// (runtime-agnostic, tenant-agent BUG 1).
 	freshID := uuid.New().String()
 	freshName := "Org Concierge fresh " + tag

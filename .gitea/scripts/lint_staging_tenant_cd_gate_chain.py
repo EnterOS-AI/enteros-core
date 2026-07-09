@@ -23,13 +23,16 @@ This lint is that mechanical guard. It fails the build if anyone:
      redeploy-fleet (transitively, so e2e never validates a pre-roll fleet); OR
   2. breaks rollback coverage — rollback-pin must `needs:` every candidate-path
      job and run under `if: always()`; OR
-  3. adds `continue-on-error: true` to any gating job (advance-pin,
+  3. lets e2e-smoke run without binding E2E_EXPECT_TENANT_BUILD_SHA on normal
+     push runs — without it, the staginge2e candidate-build guard silently skips
+     and can validate the pre-roll fleet; OR
+  4. adds `continue-on-error: true` to any gating job (advance-pin,
      e2e-smoke, redeploy-fleet, rollback-pin) OR to any step inside one —
      continue-on-error rolls a failed step up to a SUCCESS job status (Gitea
      Quirk #10 / mc#1982), which would let a downstream `needs:`-dependent job
      run despite a real failure, silently re-opening the ungated fleet roll this
      gate closes; OR
-  4. reintroduces provider-specific CP deploy wiring (Railway CLI/tokens or the
+  5. reintroduces provider-specific CP deploy wiring (Railway CLI/tokens or the
      legacy reload-cp-candidate job) into this tenant-image CI path.
 
 Behavior-based (parses the YAML `needs:` graph), not grep-by-name: a job rename
@@ -201,7 +204,20 @@ def main():
                 f"`rollback-pin` must use `if: always()` in {workflow} so it "
                 f"runs after failed or skipped candidate-path jobs.")
 
-    # 4. No continue-on-error on a gating job.
+    # 4. e2e-smoke must bind the expected candidate SHA before the staging e2e.
+    # The e2e has a local-run skip mode when the variable is absent; in this
+    # workflow absence would let the hard gate validate a stale/pre-roll fleet.
+    e2e = jobs.get("e2e-smoke")
+    if isinstance(e2e, dict):
+        env_hits = values_contain(e2e.get("env", {}), ["E2E_EXPECT_TENANT_BUILD_SHA"])
+        step_hits = values_contain(steps_of(e2e), ["E2E_EXPECT_TENANT_BUILD_SHA"])
+        if not env_hits and not step_hits:
+            fails.append(
+                f"`e2e-smoke` never binds E2E_EXPECT_TENANT_BUILD_SHA in {workflow} "
+                f"— staginge2e would skip its tenant /buildinfo candidate-SHA "
+                f"guard and could validate a stale fleet.")
+
+    # 5. No continue-on-error on a gating job.
     for jk in GATING_JOBS:
         job = jobs.get(jk)
         if isinstance(job, dict) and coe_true(job):
@@ -210,7 +226,7 @@ def main():
                 f"step would roll up to SUCCESS (Gitea Quirk #10 / mc#1982) and "
                 f"let the downstream roll run despite a red gate. Remove it.")
 
-    # 5. No continue-on-error on any step inside a gating job.
+    # 6. No continue-on-error on any step inside a gating job.
     for jk in GATING_JOBS:
         job = jobs.get(jk)
         if not isinstance(job, dict):
@@ -223,7 +239,7 @@ def main():
                     f"(Gitea Quirk #10 / mc#1982) and let the downstream roll run "
                     f"despite a red gate. Remove it.")
 
-    # 6. Tenant-image CI must stay provider-agnostic. CP-host deploy/reload code
+    # 7. Tenant-image CI must stay provider-agnostic. CP-host deploy/reload code
     # belongs behind provider adapters outside this workflow.
     for jk in FORBIDDEN_JOB_KEYS:
         if jk in jobs:

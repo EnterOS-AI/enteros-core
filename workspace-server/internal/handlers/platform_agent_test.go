@@ -648,6 +648,12 @@ func TestConciergeDefaultRuntime_EnvWinsOverConstAndBindsIntoInstall(t *testing.
 		mock.ExpectExec(`INSERT INTO workspaces`).
 			WithArgs(platformID, paName, nonDefaultRuntime, wantTemplate).
 			WillReturnResult(sqlmock.NewResult(0, 1))
+		// Step 1b: the privileged management MCP declaration must be written
+		// before provisioning reads desiredPluginSources() and stamps
+		// MOLECULE_DECLARED_PLUGINS.
+		mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+			WithArgs(platformID, conciergePlatformMCPName, conciergePlatformMCPSource).
+			WillReturnResult(sqlmock.NewResult(0, 1))
 		// Step 2: capture old roots: none in this fixture.
 		mock.ExpectQuery(`SELECT id FROM workspaces WHERE parent_id IS NULL AND id <>`).
 			WithArgs(platformID).

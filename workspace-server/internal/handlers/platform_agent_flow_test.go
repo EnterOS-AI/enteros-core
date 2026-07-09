@@ -584,19 +584,20 @@ func TestConciergeDefaultRuntime_RejectsNonContainerBackedOverride(t *testing.T)
 	}
 }
 
-// TestConciergeDefaultRuntimeAndTemplateNaming pins the operator ruling
-// (core#3496, 2026-07-07: "openclaw should be the default for now") AND the
-// decoupling it forced: the "-default" template suffix + system-prompt.md
-// delivery are claude-code CONVENTIONS, not default-runtime behavior.
+// TestConciergeDefaultRuntimeAndTemplateNaming pins the product default runtime
+// and the decoupling it relies on: the "-default" template suffix +
+// system-prompt.md delivery are claude-code CONVENTIONS, not default-runtime
+// behavior.
 func TestConciergeDefaultRuntimeAndTemplateNaming(t *testing.T) {
 	t.Setenv("MOLECULE_DEFAULT_RUNTIME", "")
-	if got := conciergeDefaultRuntime(); got != "openclaw" {
-		t.Errorf("conciergeDefaultRuntime() = %q, want openclaw (compiled-in fallback)", got)
+	if got := conciergeDefaultRuntime(); got != "hermes" {
+		t.Errorf("conciergeDefaultRuntime() = %q, want hermes (compiled-in fallback)", got)
 	}
 	cases := map[string]string{
-		"":            "openclaw", // empty resolves via the env-aware default
-		"openclaw":    "openclaw", // non-claude runtimes: dir == name
+		"":            "hermes", // empty resolves via the env-aware default
+		"openclaw":    "openclaw",
 		"codex":       "codex",
+		"hermes":      "hermes",              // non-claude runtimes: dir == name
 		"claude-code": "claude-code-default", // the ONE "-default" convention
 	}
 	for in, want := range cases {

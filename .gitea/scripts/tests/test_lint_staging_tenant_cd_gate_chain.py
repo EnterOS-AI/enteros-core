@@ -47,6 +47,7 @@ def test_accepts_provider_agnostic_fleet_gate(tmp_path: Path):
           e2e-smoke:
             needs: [redeploy-fleet]
             steps:
+              - run: echo "E2E_EXPECT_TENANT_BUILD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
               - run: go test -tags staging_e2e ./internal/staginge2e/
           rollback-pin:
             needs: [advance-pin, redeploy-fleet, e2e-smoke]
@@ -88,6 +89,7 @@ def test_rejects_railway_reload_in_staging_tenant_ci(tmp_path: Path):
           e2e-smoke:
             needs: [redeploy-fleet]
             steps:
+              - run: echo "E2E_EXPECT_TENANT_BUILD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
               - run: go test -tags staging_e2e ./internal/staginge2e/
           rollback-pin:
             needs: [advance-pin, reload-cp-candidate, redeploy-fleet, e2e-smoke]
@@ -136,3 +138,38 @@ def test_requires_e2e_after_fleet_roll(tmp_path: Path):
 
     assert result.returncode == 1
     assert "`e2e-smoke` does not (transitively) `needs:` `redeploy-fleet`" in result.stdout
+
+
+def test_requires_e2e_candidate_build_sha_guard(tmp_path: Path):
+    workflow = write_workflow(
+        tmp_path,
+        """
+        jobs:
+          await-image:
+            steps:
+              - run: echo image ready
+          advance-pin:
+            needs: [await-image]
+            steps:
+              - run: bash scripts/deploy/advance-staging-tenant-pin.sh --tag staging-deadbee
+          redeploy-fleet:
+            needs: [advance-pin]
+            steps:
+              - run: bash scripts/deploy/redeploy-staging-fleet.sh --tag staging-deadbee
+          e2e-smoke:
+            needs: [redeploy-fleet]
+            steps:
+              - run: go test -tags staging_e2e ./internal/staginge2e/
+          rollback-pin:
+            needs: [advance-pin, redeploy-fleet, e2e-smoke]
+            if: always()
+            steps:
+              - run: echo rollback
+        """,
+    )
+
+    result = run_lint(workflow)
+
+    assert result.returncode == 1
+    assert "E2E_EXPECT_TENANT_BUILD_SHA" in result.stdout
+    assert "candidate-SHA guard" in result.stdout

@@ -66,6 +66,20 @@ const TEMPLATES = [
     registry_models: [{ id: "gpt-5.4", provider: "openai-api" }],
   },
   {
+    id: "tpl-hermes",
+    name: "Hermes",
+    runtime: "hermes",
+    registry_backed: true,
+    registry_providers: [
+      { name: "byok-minimax", display_name: "MiniMax", auth_env: ["MINIMAX_API_KEY"] },
+      { name: "platform", display_name: "Platform", auth_env: [] },
+    ],
+    registry_models: [
+      { id: "minimax:MiniMax-M2.7", provider: "byok-minimax" },
+      { id: "minimax/MiniMax-M2.7", provider: "platform" },
+    ],
+  },
+  {
     // Legacy (non-registry) template whose only provider declares NO auth
     // env — exercises the buildProviderCatalog fallback + the key-less step 4.
     id: "tpl-openclaw",
@@ -82,7 +96,7 @@ function platformNode(data: Record<string, unknown> = {}) {
     data: {
       kind: "platform",
       status: "offline",
-      runtime: "claude-code",
+      runtime: "hermes",
       lastSampleError: "",
       name: "Org Concierge",
       ...data,
@@ -229,7 +243,7 @@ describe("gate matrix", () => {
   });
 
   it("never renders when an LLM key is already configured", async () => {
-    routeApi({ secrets: [{ key: "ANTHROPIC_API_KEY", has_value: true }] });
+    routeApi({ secrets: [{ key: "MINIMAX_API_KEY", has_value: true }] });
     render(<SelfHostSetupScene />);
     await flush();
     expect(screen.queryByTestId("selfhost-setup-scene")).toBeNull();
@@ -283,11 +297,11 @@ describe("runtime step + cascade", () => {
     await flush();
     fireEvent.click(screen.getByTestId("scene-continue"));
     const select = screen.getByTestId("scene-runtime-select") as HTMLSelectElement;
-    expect(select.value).toBe("claude-code");
+    expect(select.value).toBe("hermes");
     const optionValues = Array.from(select.querySelectorAll("option")).map(
       (o) => o.value,
     );
-    expect(optionValues).toEqual(["", "claude-code", "codex", "openclaw"]);
+    expect(optionValues).toEqual(["", "claude-code", "codex", "hermes", "openclaw"]);
   });
 
   it("leaves the runtime unselected (Continue disabled) when the root's runtime is not offerable", async () => {
@@ -308,6 +322,9 @@ describe("runtime step + cascade", () => {
     render(<SelfHostSetupScene />);
     await flush();
     fireEvent.click(screen.getByTestId("scene-continue")); // → 2
+    fireEvent.change(screen.getByTestId("scene-runtime-select"), {
+      target: { value: "claude-code" },
+    });
     fireEvent.click(screen.getByTestId("scene-continue")); // → 3 (claude-code)
 
     // Pick Anthropic (2 models → explicit pick required), then a model.
@@ -363,7 +380,7 @@ describe("back navigation", () => {
     expect(screen.getByTestId("scene-step-runtime")).toBeTruthy();
     expect(
       (screen.getByTestId("scene-runtime-select") as HTMLSelectElement).value,
-    ).toBe("claude-code");
+    ).toBe("hermes");
     fireEvent.click(screen.getByTestId("scene-back")); // 2 → 1
     expect(screen.getByTestId("scene-step-welcome")).toBeTruthy();
   });
@@ -379,11 +396,11 @@ describe("API-key step", () => {
     await walkToKeyStep();
     const input = screen.getByTestId("scene-key-input") as HTMLInputElement;
     expect(input.type).toBe("password");
-    expect(scene().textContent).toContain("ANTHROPIC_API_KEY");
+    expect(scene().textContent).toContain("MINIMAX_API_KEY");
     expect(
       (screen.getByTestId("scene-continue") as HTMLButtonElement).disabled,
     ).toBe(true);
-    fireEvent.change(input, { target: { value: "sk-ant-" + "a".repeat(95) } });
+    fireEvent.change(input, { target: { value: "minimax-key" } });
     expect(screen.queryByTestId("scene-key-format-hint")).toBeNull();
     expect(
       (screen.getByTestId("scene-continue") as HTMLButtonElement).disabled,
@@ -394,7 +411,7 @@ describe("API-key step", () => {
     routeApi();
     render(<SelfHostSetupScene />);
     await flush();
-    await walkToKeyStep();
+    await walkToKeyStep({ runtime: "claude-code" });
     fireEvent.change(screen.getByTestId("scene-key-input"), {
       target: { value: "not-a-key" },
     });
@@ -439,7 +456,7 @@ describe("wire order", () => {
     const { calls } = routeApi();
     render(<SelfHostSetupScene />);
     await flush();
-    await walkToReviewWithKey("sk-ant-key");
+    await walkToReviewWithKey("minimax-key");
     await act(async () => {
       fireEvent.click(screen.getByTestId("scene-configure"));
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -448,12 +465,12 @@ describe("wire order", () => {
       {
         method: "PUT",
         path: "/settings/secrets",
-        body: { key: "ANTHROPIC_API_KEY", value: "sk-ant-key" },
+        body: { key: "MINIMAX_API_KEY", value: "minimax-key" },
       },
       {
         method: "POST",
         path: "/admin/org/platform-agent/ensure",
-        body: { name: "Enter OS Agent", model: "claude-opus-4-7", force: true },
+        body: { name: "Enter OS Agent", model: "minimax:MiniMax-M2.7", force: true },
       },
     ]);
     expect(screen.getByTestId("scene-progress")).toBeTruthy();
@@ -549,7 +566,7 @@ describe("error states", () => {
     expect(calls[calls.length - 1]).toEqual({
       method: "POST",
       path: "/admin/org/platform-agent/ensure",
-      body: { name: "Enter OS Agent", model: "claude-opus-4-7", force: true },
+      body: { name: "Enter OS Agent", model: "minimax:MiniMax-M2.7", force: true },
     });
     expect(screen.getByTestId("scene-progress")).toBeTruthy();
   });
@@ -569,7 +586,7 @@ describe("error states", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(screen.getByTestId("scene-error").textContent).toContain(
-      "That model isn't available for Claude Code — pick one from the list.",
+      "That model isn't available for Hermes — pick one from the list.",
     );
   });
 
@@ -671,7 +688,7 @@ describe("provision watch", () => {
     // Provider label comes verbatim from the catalog (incl. its model-count
     // decoration) — the §8 copy names the provider the user actually picked.
     expect(banner.textContent).toContain(
-      "The API key for Anthropic API (2 models) is missing or didn't match — re-enter it.",
+      "The API key for MiniMax is missing or didn't match — re-enter it.",
     );
     // The session already wrote this key once → "already configured" state.
     const input = screen.getByTestId("scene-key-input") as HTMLInputElement;
@@ -684,7 +701,7 @@ describe("provision watch", () => {
     fireEvent.click(screen.getByTestId("scene-back"));
     // Re-enter a corrected key → retry converges: PUT fires again.
     fireEvent.change(screen.getByTestId("scene-key-input"), {
-      target: { value: "sk-ant-corrected" },
+      target: { value: "minimax-corrected" },
     });
     fireEvent.click(screen.getByTestId("scene-continue"));
     // Reset the failed node so the fresh watch doesn't immediately re-fail.
@@ -698,8 +715,8 @@ describe("provision watch", () => {
     });
     expect(calls.map((c) => c.method)).toEqual(["PUT", "POST"]);
     expect(calls[0].body).toEqual({
-      key: "ANTHROPIC_API_KEY",
-      value: "sk-ant-corrected",
+      key: "MINIMAX_API_KEY",
+      value: "minimax-corrected",
     });
   });
 

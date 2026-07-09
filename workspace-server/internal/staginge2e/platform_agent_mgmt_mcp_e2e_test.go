@@ -10,7 +10,7 @@ package staginge2e
 // WHY THIS EXISTS (operator "test14" — a fresh staging org whose platform agent
 // instantly failed):
 //
-//	The pre-existing staging gates provision a PLAIN default-runtime (claude-code)
+//	The pre-existing staging gates provision a PLAIN default-runtime workspace
 //	workspace with NO declared plugins (TestWorkspaceLifecycle_Staging) or drive
 //	the concierge WITHOUT waiting for it to boot online (TestConciergePlatformAgent
 //	_Staging asserts only DB/handler state — kind/parent_id/config-tab auth). A
@@ -96,27 +96,18 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	}
 	t.Logf("platform agent (concierge) id: %s", platformID)
 
-		// The management-MCP lifecycle verb the concierge MUST load. SSOT:
-		// molecule-ai-sdk — the SAME literal the server-side heartbeat gate matches
+	// The management-MCP lifecycle verb the concierge MUST load. SSOT:
+	// molecule-ai-sdk — the SAME literal the server-side heartbeat gate matches
 	// (handlers.conciergePlatformMCPProvisionWorkspaceTool). Never hardcoded here.
 	requiredTool := "mcp__" + molcontracts.MCPServerName + "__" + molcontracts.RequiredTool
 
-	// The DEFAULT runtime the fresh concierge MUST be on. The operator ruled the
-	// platform default runtime is **claude-code** (reconciled 2026-07-07: live
-	// Infisical prod AND staging MOLECULE_DEFAULT_RUNTIME read claude-code; the CP
-	// secretguard value-contract Guard C (#1203) expects claude-code; and core's
-	// own SSOT agrees — provisioner/registry.go defaultRuntimeFallback and
-	// handlers/runtime_registry.go bareCreateDefaultRuntimeFallback are both
-	// "claude-code", and handlers/platform_agent.go pins the concierge to
-	// claude-code). The stale "openclaw" fallback here was the SOLE remaining
-	// contradiction and made this gate false-RED whenever E2E_DEFAULT_RUNTIME was
-	// not exported into the CI env (it fell back to openclaw while staging
-	// correctly provisions claude-code). De-hardcoded via E2E_DEFAULT_RUNTIME,
-	// which the deploy path exports from the SSOT (MOLECULE_DEFAULT_RUNTIME @
-	// /shared/controlplane). The gate stays default-specific so a real
-	// default-flip skew (task#225/#226/test123) onto the WRONG runtime is still
+	// The DEFAULT runtime the fresh concierge MUST be on. De-hardcoded via
+	// E2E_DEFAULT_RUNTIME, which the deploy path exports from the SSOT
+	// (MOLECULE_DEFAULT_RUNTIME @ /shared/controlplane). The fallback mirrors the
+	// compiled-in product default for local/manual runs. The gate stays
+	// default-specific so a real default-flip skew onto the WRONG runtime is still
 	// caught, not silently passed.
-	expectedRuntime := envOr("E2E_DEFAULT_RUNTIME", "claude-code")
+	expectedRuntime := envOr("E2E_DEFAULT_RUNTIME", "hermes")
 
 	// Whether to require the REAL A2A callable turn (the deep proof) vs the
 	// online/presence-only assertion. The deploy gate sets

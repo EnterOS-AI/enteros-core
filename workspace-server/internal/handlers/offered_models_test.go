@@ -13,7 +13,7 @@ package handlers
 // ?runtime=claude-code, but the file offered_models.go has its own
 // branches that are not pinned:
 //
-//   1. Empty / missing ?runtime query defaults to "claude-code"
+//   1. Empty / missing ?runtime query defaults to the platform default runtime
 //   2. Unknown runtime returns 404 with structured "unknown runtime" body
 //   3. providerRegistry load error returns 503
 //   4. Model list is emitted in alphabetic order regardless of
@@ -100,10 +100,9 @@ func callListOfferedModels(t *testing.T, query string) *httptest.ResponseRecorde
 	return w
 }
 
-// TestListOfferedModels_DefaultRuntime: an empty / missing ?runtime
-// query must default to "claude-code" (the production default for
-// the enterprise agent fleet). Agents that hit the endpoint with no
-// query get the claude-code menu.
+// TestListOfferedModels_DefaultRuntime: an empty / missing ?runtime query must
+// default to Hermes, matching the bare-create runtime fallback. Agents that hit
+// the endpoint with no query get the Hermes menu.
 func TestListOfferedModels_DefaultRuntime(t *testing.T) {
 	withSwappedProviderRegistry(t, offeredModelsTestManifest(), nil, func() {
 		w := callListOfferedModels(t, "")
@@ -117,12 +116,11 @@ func TestListOfferedModels_DefaultRuntime(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("parse: %v", err)
 		}
-		if resp.Runtime != "claude-code" {
-			t.Errorf("default runtime must be claude-code, got %q", resp.Runtime)
+		if resp.Runtime != "hermes" {
+			t.Errorf("default runtime must be hermes, got %q", resp.Runtime)
 		}
-		// We have 4 distinct model ids for claude-code: zulu, alpha, mike, claude-sonnet-4-6.
-		if len(resp.Models) != 4 {
-			t.Errorf("expected 4 models for claude-code, got %d: %+v", len(resp.Models), resp.Models)
+		if len(resp.Models) != 1 {
+			t.Errorf("expected 1 model for hermes, got %d: %+v", len(resp.Models), resp.Models)
 		}
 	})
 }

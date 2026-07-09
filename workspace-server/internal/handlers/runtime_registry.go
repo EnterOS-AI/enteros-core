@@ -283,15 +283,14 @@ func isKnownRuntime(runtime string) bool {
 
 // bareCreateDefaultRuntimeFallback is the compiled-in default runtime for a
 // bare create (no template, no runtime) — the OSS / unset-override fallback.
-const bareCreateDefaultRuntimeFallback = "claude-code"
+const bareCreateDefaultRuntimeFallback = "hermes"
 
 // bareCreateDefaultRuntime resolves the default runtime for the bare-create
 // path (handlers.Create), honoring the MOLECULE_DEFAULT_RUNTIME env override
 // (KMS SSOT, injected at deploy time) over the compiled-in fallback.
 //
-// De-hardcode (behavior-neutral): the override's staging KMS value equals the
-// old literal ("claude-code"), and unset/local falls back to the same literal,
-// so no behavior changes today.
+// The env override remains the SSOT for managed deployments; this compiled
+// fallback is the local/self-host default when no operator value is present.
 //
 // FAIL CLOSED on an unknown override: the resolved runtime MUST pass
 // isKnownRuntime (the runtime_registry allowlist). An override naming a runtime

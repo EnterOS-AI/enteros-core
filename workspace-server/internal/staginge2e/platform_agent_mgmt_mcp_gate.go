@@ -19,7 +19,7 @@ package staginge2e
 //
 // WHAT IT ENCODES (the philosophy, as a hard gate): a fresh org's concierge is
 // only "OK to fan out to the fleet" when ALL hold on the deploy-candidate combo:
-//   - it is on the EXPECTED default runtime (openclaw) — catches the default-flip
+//   - it is on the EXPECTED default runtime (hermes) — catches the default-flip
 //     skew that put a fresh org on a stale/other runtime (task#225/#226/test123);
 //   - it reached status=online — RCA #2970 makes online UNREACHABLE unless the
 //     management MCP is present (fail-closed heartbeat);
@@ -43,8 +43,8 @@ import (
 type MgmtMCPProbe struct {
 	// ExpectedRuntime is the platform default runtime the fresh concierge MUST be
 	// on. De-hardcoded via E2E_DEFAULT_RUNTIME from the KMS SSOT
-	// (MOLECULE_DEFAULT_RUNTIME); "openclaw" per the operator directive. Empty
-	// disables the runtime check (local convenience only).
+	// (MOLECULE_DEFAULT_RUNTIME); empty disables the runtime check (local
+	// convenience only).
 	ExpectedRuntime string
 	// ObservedRuntime is the concierge's actual runtime as surfaced by the tenant
 	// (best-effort — see observedRuntime). Empty = the tenant does not surface the
@@ -64,7 +64,7 @@ type MgmtMCPProbe struct {
 	// status=online RCA #2970 gate + the CALLABLE proof below.
 	LoadedTools []string
 	// RequiredTool is the fully-qualified management verb id the inventory must
-		// carry: mcp__<MCPServerName>__<RequiredTool> — SSOT from molecule-ai-sdk,
+	// carry: mcp__<MCPServerName>__<RequiredTool> — SSOT from molecule-ai-sdk,
 	// never hardcoded by the caller.
 	RequiredTool string
 	// AssertCallable turns the real-A2A-turn proof into a HARD requirement (the CI
@@ -91,7 +91,7 @@ func EvaluateMgmtMCPCallable(p MgmtMCPProbe) (ok bool, reason string) {
 	//    false-failing on a field the API may not expose.
 	if p.ExpectedRuntime != "" && p.ObservedRuntime != "" && p.ObservedRuntime != p.ExpectedRuntime {
 		return false, fmt.Sprintf(
-			"platform agent is on runtime %q but the gate expected the default %q — a default-runtime flip/skew put the fresh org on the wrong runtime (the gate must exercise the operator default, openclaw)",
+			"platform agent is on runtime %q but the gate expected the default %q — a default-runtime flip/skew put the fresh org on the wrong runtime (the gate must exercise the operator default)",
 			p.ObservedRuntime, p.ExpectedRuntime)
 	}
 

@@ -401,6 +401,10 @@ func TestInstallPlatformAgent_PreservesRemovedStatusOnConflict(t *testing.T) {
 	//    absent from it.
 	mock.ExpectExec(`INSERT INTO workspaces .*ON CONFLICT \(id\) DO UPDATE SET\s+kind = 'platform',\s+parent_id = NULL,\s+template = 'platform-agent'`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// 1b. declare the privileged management MCP without changing status.
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+		WithArgs("pa-removed", conciergePlatformMCPName, conciergePlatformMCPSource).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	// 2. capture old roots — none.
 	mock.ExpectQuery(`SELECT id FROM workspaces WHERE parent_id IS NULL AND id <> \$1 FOR UPDATE`).
 		WithArgs("pa-removed").

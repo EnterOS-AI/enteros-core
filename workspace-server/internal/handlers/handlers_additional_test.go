@@ -33,7 +33,7 @@ func TestWorkspaceCreate_WithParentID(t *testing.T) {
 	// Default tier is 3 (Privileged) — see workspace.go create-handler comment.
 	// delivery_mode defaults to "push" when payload omits it (#2339).
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Child Agent", nil, 3, "claude-code", "", &parentID, nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Child Agent", nil, 3, "hermes", "", &parentID, nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO workspace_secrets").
@@ -48,7 +48,7 @@ func TestWorkspaceCreate_WithParentID(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Child Agent","model":"anthropic:claude-opus-4-7","parent_id":"parent-ws-123"}`
+	body := `{"name":"Child Agent","model":"minimax/MiniMax-M2.7","parent_id":"parent-ws-123"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -81,7 +81,7 @@ func TestWorkspaceCreate_DefaultsParentToPlatformRoot(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Team Member", nil, 3, "claude-code", "", rootID, nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Team Member", nil, 3, "hermes", "", rootID, nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO workspace_secrets").WillReturnResult(sqlmock.NewResult(0, 1))
@@ -90,7 +90,7 @@ func TestWorkspaceCreate_DefaultsParentToPlatformRoot(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Team Member","model":"anthropic:claude-opus-4-7"}`
+	body := `{"name":"Team Member","model":"minimax/MiniMax-M2.7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
@@ -118,7 +118,7 @@ func TestWorkspaceCreate_NoPlatformRoot_KeepsNullParent(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO workspaces").
-		WithArgs(sqlmock.AnyArg(), "Bootstrap Root", nil, 3, "claude-code", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
+		WithArgs(sqlmock.AnyArg(), "Bootstrap Root", nil, 3, "hermes", "", (*string)(nil), nil, "none", (*int64)(nil), models.DefaultMaxConcurrentTasks, "push").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectExec("INSERT INTO workspace_secrets").WillReturnResult(sqlmock.NewResult(0, 1))
@@ -127,7 +127,7 @@ func TestWorkspaceCreate_NoPlatformRoot_KeepsNullParent(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Bootstrap Root","model":"anthropic:claude-opus-4-7"}`
+	body := `{"name":"Bootstrap Root","model":"minimax/MiniMax-M2.7"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
