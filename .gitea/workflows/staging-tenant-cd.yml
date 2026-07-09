@@ -22,9 +22,10 @@ name: staging-tenant-cd
 #     of branch, so THIS workflow — firing on the same `main` SHA — awaits the
 #     exact per-commit artifact the build produced).
 #   staging-tenant-cd.yml               (THIS)    — awaits that :staging-<sha>
-#     artifact, advances the staging image pin, rolls the running staging tenant
-#     fleet onto it (session-preserving, canary-first, /buildinfo health-gated),
-#     and gates the deployed staging surface with a real staging e2e.
+#     artifact, advances the staging tenant-image DB pin through the control
+#     plane, rolls the running staging tenant fleet onto it (session-preserving,
+#     canary-first, /buildinfo health-gated), and gates the deployed staging
+#     surface with a real staging e2e.
 # The two coordinate through the immutable per-commit :staging-<sha> tag, so the
 # deploy never rolls onto a half-built image and never races the build.
 #
@@ -136,16 +137,17 @@ jobs:
           echo "::notice::tenant image present + pullable: $IMAGE"
 
   advance-pin:
-    name: advance-pin (staging LOCAL_TENANT_IMAGE)
+    name: advance-pin (staging tenant image DB pin)
     needs: [await-image]
     runs-on: docker-host
     timeout-minutes: 10
     outputs:
       old_image: ${{ steps.advance.outputs.old_image }}
+      old_git_sha: ${{ steps.advance.outputs.old_git_sha }}
       new_image: ${{ steps.advance.outputs.new_image }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Advance the staging tenant-image pin in Infisical
+      - name: Promote the staging tenant-image pin in controlplane
         id: advance
         env:
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
@@ -177,10 +179,10 @@ jobs:
       STAGING_E2E: '1'
       GATE_FORCE_FAIL: ${{ vars.STAGING_TENANT_CD_FORCE_GATE_FAIL }}
       # Guard B (fresh-org platform-agent CALLABLE gate). The default runtime the
-      # fresh concierge MUST be on — openclaw per the operator directive, so a
-      # default-flip skew (task#225/#226) is caught, not silently passed. Override
-      # via the repo var if the platform default ever changes (de-hardcoded).
-      E2E_DEFAULT_RUNTIME: ${{ vars.MOLECULE_DEFAULT_RUNTIME || 'openclaw' }}
+      # fresh concierge MUST be on — Hermes is the product default, so a
+      # default-flip skew is caught, not silently passed. Override via the repo
+      # var if the platform default ever changes (de-hardcoded).
+      E2E_DEFAULT_RUNTIME: ${{ vars.MOLECULE_DEFAULT_RUNTIME || 'hermes' }}
       # Require the REAL A2A tool-use turn (drive the concierge to actually RUN
       # provision_workspace and assert the created workspace appears) — not
       # presence-only. This is the deep "callable" proof that catches a
@@ -254,7 +256,7 @@ jobs:
         #   present AND — because E2E_ASSERT_MGMT_MCP_CALLABLE=1 — a REAL A2A tool-use turn drives it
         #   to actually RUN provision_workspace and a genuine kind='workspace' row appears (genuinely
         #   CALLABLE, not presence-only). The lifecycle test only exercises a PLAIN workspace (no
-        #   declared plugins), so it cannot see a fresh openclaw concierge whose mgmt-MCP plugin never
+        #   declared plugins), so it cannot see a fresh Hermes concierge whose mgmt-MCP plugin never
         #   installed — the operator "test14" failure (a presign:// declared source the deployed
         #   runtime could not resolve). This makes the deploy gate go RED on that failure. BOTH must
         #   pass after the fleet roll (needs-gated, un-bypassable).
@@ -278,10 +280,12 @@ jobs:
           REDEPLOY_RESULT: ${{ needs.redeploy-fleet.result }}
           E2E_RESULT: ${{ needs.e2e-smoke.result }}
           OLD_IMAGE: ${{ needs.advance-pin.outputs.old_image }}
+          OLD_GIT_SHA: ${{ needs.advance-pin.outputs.old_git_sha }}
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
         run: |
           set -euo pipefail
           if [ "$ADVANCE_RESULT" != "success" ]; then
@@ -297,5 +301,10 @@ jobs:
             exit 0
           fi
           echo "::warning::candidate path failed after pin advance (redeploy=$REDEPLOY_RESULT e2e=$E2E_RESULT) — reverting staging pin and fleet to $OLD_IMAGE"
-          bash scripts/deploy/advance-staging-tenant-pin.sh --image "$OLD_IMAGE"
-          bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"
+          if [ -n "$OLD_GIT_SHA" ]; then
+            bash scripts/deploy/advance-staging-tenant-pin.sh --image "$OLD_IMAGE" --git-sha "$OLD_GIT_SHA"
+            EXPECTED_BUILD_SHA="$OLD_GIT_SHA" bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"
+          else
+            bash scripts/deploy/advance-staging-tenant-pin.sh --image "$OLD_IMAGE"
+            bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"
+          fi

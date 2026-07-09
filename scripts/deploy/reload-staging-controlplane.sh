@@ -3,7 +3,9 @@
 #
 # The tenant-image CI path must stay provider-agnostic; it should not install a
 # vendor CLI or require vendor tokens. This wrapper exists for hand-run/operator
-# paths that still need to refresh a CP host after LOCAL_TENANT_IMAGE changes.
+# paths that still need to refresh a CP host after a legacy LOCAL_TENANT_IMAGE
+# change. The normal staging tenant CD path now promotes the molecule-tenant DB
+# pin through the CP admin API, so fresh provisions do not need a CP restart.
 #
 # Usage:
 #   reload-staging-controlplane.sh --tag staging-<sha>

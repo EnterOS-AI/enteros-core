@@ -8,10 +8,9 @@
 # For a Railway-hosted staging control plane, project a STAGING tenant image into
 # Railway and recreate the staging control plane so fresh provisions read it.
 #
-# Durable pin movement belongs to advance-staging-tenant-pin.sh (Infisical
-# /shared/controlplane::LOCAL_TENANT_IMAGE). This helper projects that chosen
-# image into the running Railway staging environment and redeploys
-# molecule-cp-staging so its in-memory TenantImage matches.
+# Legacy LOCAL_TENANT_IMAGE projection belongs here. The normal staging tenant
+# CD path promotes the molecule-tenant DB pin through the CP admin API and does
+# not require a Railway environment projection or CP restart.
 #
 # Usage:
 #   reload-staging-controlplane-railway.sh --image registry.../molecule-tenant:staging-<sha>
