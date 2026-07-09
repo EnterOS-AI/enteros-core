@@ -272,6 +272,10 @@ type cpProvisionResponse struct {
 func buildCPTenantEnv(cfg WorkspaceConfig) map[string]string {
 	env := make(map[string]string, len(cfg.EnvVars))
 	for k, v := range cfg.EnvVars {
+		if isPrivilegedWorkspaceEnvKey(k) {
+			log.Printf("CPProvisioner.Start: dropped privileged credential %q from tenant workspace env", k)
+			continue
+		}
 		if isSCMWriteTokenKey(k) {
 			_, wsAuthored := cfg.WorkspaceSecretKeys[k] // nil map → false (fail-safe)
 			if !wsAuthored {

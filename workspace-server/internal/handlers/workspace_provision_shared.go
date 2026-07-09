@@ -270,6 +270,15 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	// on the auto-restart path (where the overlay is what introduces the files).
 	configFiles = h.applyConciergeProvisionConfig(ctx, workspaceID, templatePath, configFiles, envVars, payload.Name)
 
+	if forbidden := findPrivilegedTenantAdminEnvKeys(envVars); len(forbidden) > 0 {
+		msg := formatForbiddenTenantEnvError(forbidden)
+		log.Printf("Provisioner: ABORT workspace=%s — privileged tenant admin env keys present after provision env assembly: %v", workspaceID, forbidden)
+		return nil, &provisionAbort{
+			Msg:   msg,
+			Extra: map[string]interface{}{"error": msg, "forbidden_env_keys": forbidden, "source": "final_env"},
+		}
+	}
+
 	// core#2594: universal MODEL fail-closed gate. Runs AFTER every model-setting
 	// path (create payload → stored MODEL secret via applyRuntimeModelEnv → the
 	// concierge's declared model via applyConciergeProvisionConfig) and is the

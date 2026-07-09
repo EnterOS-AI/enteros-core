@@ -904,12 +904,15 @@ func TestBuildContainerEnv_DoesNotInjectAdminToken(t *testing.T) {
 		WorkspaceID:  "ws-local",
 		PlatformURL:  "http://platform:8080",
 		Runtime:      "claude-code",
-		EnvVars:      map[string]string{"CUSTOM": "ok"},
+		EnvVars:      map[string]string{"ADMIN_TOKEN": "caller-admin", "MOLECULE_ADMIN_TOKEN": "caller-admin-2", "CUSTOM": "ok"},
 		TemplatePath: t.TempDir(),
 	}
 	got := buildContainerEnv(cfg)
 	if envContainsPrefix(got, "ADMIN_TOKEN=") {
 		t.Fatalf("ADMIN_TOKEN leaked into local workspace container env: %v", got)
+	}
+	if envContainsPrefix(got, "MOLECULE_ADMIN_TOKEN=") {
+		t.Fatalf("MOLECULE_ADMIN_TOKEN leaked into local workspace container env: %v", got)
 	}
 	if !envContains(got, "CUSTOM=ok") {
 		t.Fatalf("expected ordinary env vars to pass through: %v", got)
@@ -1023,14 +1026,25 @@ func TestBuildCPTenantEnv_ForensicGuardProvenance(t *testing.T) {
 func TestBuildCPTenantEnv_DoesNotInjectAdminToken(t *testing.T) {
 	cfg := WorkspaceConfig{
 		WorkspaceID: "ws-tenant",
-		EnvVars:     map[string]string{"GITEA_TOKEN": "stripme"},
+		EnvVars: map[string]string{
+			"ADMIN_TOKEN":          "caller-admin",
+			"MOLECULE_ADMIN_TOKEN": "caller-admin-2",
+			"GITEA_TOKEN":          "stripme",
+			"CUSTOM":               "ok",
+		},
 	}
 	got := buildCPTenantEnv(cfg)
 	if _, ok := got["ADMIN_TOKEN"]; ok {
 		t.Errorf("ADMIN_TOKEN leaked into tenant workspace env: %v", got)
 	}
+	if _, ok := got["MOLECULE_ADMIN_TOKEN"]; ok {
+		t.Errorf("MOLECULE_ADMIN_TOKEN leaked into tenant workspace env: %v", got)
+	}
 	if _, ok := got["GITEA_TOKEN"]; ok {
 		t.Errorf("GITEA_TOKEN must still be stripped")
+	}
+	if got["CUSTOM"] != "ok" {
+		t.Errorf("ordinary env var CUSTOM = %q, want ok", got["CUSTOM"])
 	}
 }
 

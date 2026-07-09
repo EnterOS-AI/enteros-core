@@ -195,6 +195,25 @@ func findForbiddenTenantEnvKeys(envVars map[string]string) []string {
 	return found
 }
 
+// findPrivilegedTenantAdminEnvKeys scans the final env-set for tenant admin /
+// control-plane admin key names. Unlike the broader RFC#523 global-secret check,
+// these keys have no workspace-authored exception: normal workspaces must never
+// receive tenant admin credentials, regardless of whether a late hook or config
+// path introduced the name.
+func findPrivilegedTenantAdminEnvKeys(envVars map[string]string) []string {
+	if len(envVars) == 0 {
+		return []string{}
+	}
+	found := make([]string, 0)
+	for _, key := range []string{"ADMIN_TOKEN", "MOLECULE_ADMIN_TOKEN", "CP_ADMIN_API_TOKEN", "CP_ADMIN_TOKEN"} {
+		if _, ok := envVars[key]; ok {
+			found = append(found, key)
+		}
+	}
+	sort.Strings(found)
+	return found
+}
+
 // findForbiddenTenantEnvKeysFromGlobals is the provenance-aware
 // variant used by RFC#523 Layer 1 in prepareProvisionContext. It
 // restricts the forbidden-key scan to keys whose value originated
