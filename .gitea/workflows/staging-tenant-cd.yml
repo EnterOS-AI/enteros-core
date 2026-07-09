@@ -136,6 +136,7 @@ jobs:
           docker image inspect "$IMAGE" --format 'present {{.Id}}' >/dev/null
           echo "::notice::tenant image present + pullable: $IMAGE"
 
+  # bp-exempt: post-merge staging CD job; gated by this workflow's needs/rollback chain, not PR branch protection.
   advance-pin:
     name: advance-pin (staging tenant image DB pin)
     needs: [await-image]
