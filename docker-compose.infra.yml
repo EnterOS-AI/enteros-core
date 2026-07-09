@@ -62,6 +62,49 @@ services:
       timeout: 5s
       retries: 10
 
+  # Local object-store backend for the SDK object-store/workspace-data SSOT.
+  # MinIO is S3-compatible, path-style, and stands in for the per-tenant
+  # platform-proxy backend used by workspace snapshot/restore and migration
+  # work. The workspace box never receives these credentials.
+  # digest-pinned 2026-07-09 (manifest-list sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e)
+  minio:
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-molecule-dev-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-molecule-dev-minio-password}
+    ports:
+      - "127.0.0.1:${MOLECULE_MINIO_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${MOLECULE_MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+    networks:
+      - molecule-core-net
+    restart: unless-stopped
+
+  # One-shot bucket bootstrap. Kept behind a profile so the normal compose `up`
+  # does not leave an exited helper container; infra/scripts/setup.sh runs it
+  # after MinIO is reachable.
+  # digest-pinned 2026-07-09 (manifest-list sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727)
+  minio-init:
+    profiles: ["tools"]
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-molecule-dev-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-molecule-dev-minio-password}
+      MOLECULE_WORKSPACE_DATA_BUCKET: ${MOLECULE_WORKSPACE_DATA_BUCKET:-molecule-workspace-data}
+    networks:
+      - molecule-core-net
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" >/dev/null 2>&1; do
+          sleep 1
+        done
+        mc mb --ignore-existing "local/$${MOLECULE_WORKSPACE_DATA_BUCKET}" >/dev/null
+
   # digest-pinned 2026-05-10 (sha256:5b296e0ba1da74efea3143c773ddd60245f249fb7c72eb1d866c2d6ebc759fbe, linux/amd64)
   langfuse-clickhouse:
     image: clickhouse/clickhouse-server@sha256:5b296e0ba1da74efea3143c773ddd60245f249fb7c72eb1d866c2d6ebc759fbe
@@ -121,4 +164,5 @@ networks:
 volumes:
   pgdata:
   redisdata:
+  miniodata:
   clickhousedata:

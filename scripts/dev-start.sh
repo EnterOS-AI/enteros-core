@@ -191,10 +191,13 @@ MOLECULE_PG_HOST_PORT=${MOLECULE_PG_HOST_PORT:-$(pick_port 5432)}
 MOLECULE_REDIS_HOST_PORT=${MOLECULE_REDIS_HOST_PORT:-$(pick_port 6379)}
 MOLECULE_TEMPORAL_HOST_PORT=${MOLECULE_TEMPORAL_HOST_PORT:-$(pick_port 7233)}
 MOLECULE_TEMPORAL_UI_HOST_PORT=${MOLECULE_TEMPORAL_UI_HOST_PORT:-$(pick_port 8233)}
+MOLECULE_MINIO_HOST_PORT=${MOLECULE_MINIO_HOST_PORT:-$(pick_port 9000)}
+MOLECULE_MINIO_CONSOLE_HOST_PORT=${MOLECULE_MINIO_CONSOLE_HOST_PORT:-$(pick_port 9001)}
 PLATFORM_PORT=$(pick_port 8080)
 CANVAS_PORT=$(pick_port 3000)
 export MOLECULE_PG_HOST_PORT MOLECULE_REDIS_HOST_PORT \
-       MOLECULE_TEMPORAL_HOST_PORT MOLECULE_TEMPORAL_UI_HOST_PORT
+       MOLECULE_TEMPORAL_HOST_PORT MOLECULE_TEMPORAL_UI_HOST_PORT \
+       MOLECULE_MINIO_HOST_PORT MOLECULE_MINIO_CONSOLE_HOST_PORT
 
 # App→infra connection URLs. Override empty or loopback-local URLs from an
 # earlier dev-start run; respect a deliberate non-local URL.
@@ -206,6 +209,23 @@ esac
 case "${REDIS_URL:-}" in
     ""|*localhost:*|*127.0.0.1:*|*\[::1\]:*|*::1:*)
         export REDIS_URL="redis://127.0.0.1:${MOLECULE_REDIS_HOST_PORT}"
+        ;;
+esac
+
+# SDK object-store/workspace-data SSOT local backend. MinIO is the local
+# S3-compatible adapter behind MOLECULE_OBJECT_STORE_BACKEND=minio. Keep these
+# credentials host/platform-side only; workspace boxes must receive only
+# platform auth or presigned/proxy URLs, never object-store credentials.
+export MOLECULE_OBJECT_STORE_BACKEND="${MOLECULE_OBJECT_STORE_BACKEND:-minio}"
+export MOLECULE_OBJECT_STORE_REGION="${MOLECULE_OBJECT_STORE_REGION:-us-east-1}"
+export MOLECULE_WORKSPACE_DATA_BUCKET="${MOLECULE_WORKSPACE_DATA_BUCKET:-molecule-workspace-data}"
+export MINIO_ROOT_USER="${MINIO_ROOT_USER:-${MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID:-molecule-dev-minio}}"
+export MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-${MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY:-molecule-dev-minio-password}}"
+export MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID="${MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID:-$MINIO_ROOT_USER}"
+export MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY="${MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY:-$MINIO_ROOT_PASSWORD}"
+case "${MOLECULE_WORKSPACE_DATA_ENDPOINT:-}" in
+    ""|http://localhost:*|http://127.0.0.1:*|http://\[::1\]:*|http://::1:*)
+        export MOLECULE_WORKSPACE_DATA_ENDPOINT="http://127.0.0.1:${MOLECULE_MINIO_HOST_PORT}"
         ;;
 esac
 
@@ -228,6 +248,7 @@ echo "==> Host ports (dynamic — conventional when free, else ephemeral):"
 echo "    Postgres   127.0.0.1:${MOLECULE_PG_HOST_PORT}"
 echo "    Redis      127.0.0.1:${MOLECULE_REDIS_HOST_PORT}"
 echo "    Temporal   127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT} (gRPC) / ${MOLECULE_TEMPORAL_UI_HOST_PORT} (UI)"
+echo "    MinIO      http://127.0.0.1:${MOLECULE_MINIO_HOST_PORT} (S3 API) / ${MOLECULE_MINIO_CONSOLE_HOST_PORT} (console)"
 echo "    Platform   ${NEXT_PUBLIC_PLATFORM_URL}"
 echo "    Canvas     http://127.0.0.1:${CANVAS_PORT}"
 
@@ -441,14 +462,17 @@ cat <<EOF
   Postgres:  127.0.0.1:${MOLECULE_PG_HOST_PORT}   (\$DATABASE_URL exported)
   Redis:     127.0.0.1:${MOLECULE_REDIS_HOST_PORT}
   Temporal:  127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT} (gRPC)
+  MinIO:     127.0.0.1:${MOLECULE_MINIO_HOST_PORT} (S3 API, bucket: ${MOLECULE_WORKSPACE_DATA_BUCKET})
 
   Auth:      fail-closed — canvas uses the dev ADMIN_TOKEN (see .env)
   Logs:      /tmp/molecule-platform.log · /tmp/molecule-canvas.log
              docker logs molecule-core-langfuse-1   (trace sink)
+             docker logs molecule-core-minio-1      (object store)
 
   Ports are dynamic: the conventional port is used when free, else a free
   one is picked so nothing on your machine is hijacked. Every URL above is
-  exported for you (DATABASE_URL, REDIS_URL, LANGFUSE_*, CORS_ORIGINS,
+  exported for you (DATABASE_URL, REDIS_URL, LANGFUSE_*,
+  MOLECULE_OBJECT_STORE_*, MOLECULE_WORKSPACE_DATA_*, CORS_ORIGINS,
   NEXT_PUBLIC_*). psql in with:  psql "\$DATABASE_URL"
 
   First run:
