@@ -179,10 +179,13 @@ jobs:
 
   # bp-exempt: informational refire handler, not a merge gate. Emits
   # qa-review/security-review status updates on /qa-recheck et al slash commands.
+  #
+  # Keep this job free of a job-level `if:`. `main` currently uses wildcard
+  # branch protection (`status_check_contexts: ["*"]`), so a skipped job still
+  # publishes a blocking commit status. Running the job and letting the steps
+  # no-op on pull_request_target gives that lifecycle context a real success
+  # while slash-command refires remain guarded below.
   review-refire:
-    if: |
-      github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request != null
     runs-on: ubuntu-latest
     steps:
       - name: Classify comment
