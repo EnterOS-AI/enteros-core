@@ -975,7 +975,7 @@ func TestCPProvisionerEnv_StripsSCMWriteTokens(t *testing.T) {
 	}
 }
 
-func TestBuildContainerEnv_DoesNotInjectAdminToken(t *testing.T) {
+func TestBuildContainerEnv_InjectsLegacyAdminTokenUntilBootTokenLands(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "tenant-admin-secret")
 	cfg := WorkspaceConfig{
 		WorkspaceID:  "ws-local",
@@ -985,11 +985,14 @@ func TestBuildContainerEnv_DoesNotInjectAdminToken(t *testing.T) {
 		TemplatePath: t.TempDir(),
 	}
 	got := buildContainerEnv(cfg)
-	if envContainsPrefix(got, "ADMIN_TOKEN=") {
-		t.Fatalf("ADMIN_TOKEN leaked into local workspace container env: %v", got)
+	if !envContains(got, "ADMIN_TOKEN=tenant-admin-secret") {
+		t.Fatalf("expected platform-controlled ADMIN_TOKEN boot env until scoped boot token lands: %v", got)
+	}
+	if envContains(got, "ADMIN_TOKEN=caller-admin") {
+		t.Fatalf("caller-supplied ADMIN_TOKEN must be stripped, got %v", got)
 	}
 	if envContainsPrefix(got, "MOLECULE_ADMIN_TOKEN=") {
-		t.Fatalf("MOLECULE_ADMIN_TOKEN leaked into local workspace container env: %v", got)
+		t.Fatalf("caller-supplied MOLECULE_ADMIN_TOKEN must be stripped, got %v", got)
 	}
 	if !envContains(got, "CUSTOM=ok") {
 		t.Fatalf("expected ordinary env vars to pass through: %v", got)
@@ -1081,7 +1084,7 @@ func TestBuildCPTenantEnv_ForensicGuardProvenance(t *testing.T) {
 				EnvVars:             tt.envVars,
 				WorkspaceSecretKeys: tt.workspaceKeys,
 			}
-			got := buildCPTenantEnv(cfg)
+			got := buildCPTenantEnv(cfg, "")
 
 			for _, k := range tt.wantStrippedKeys {
 				if v, ok := got[k]; ok {
@@ -1097,10 +1100,10 @@ func TestBuildCPTenantEnv_ForensicGuardProvenance(t *testing.T) {
 	}
 }
 
-// TestBuildCPTenantEnv_DoesNotInjectAdminToken asserts the tenant admin bearer
-// remains CP request authentication only; it must not be copied into the
-// workspace container env.
-func TestBuildCPTenantEnv_DoesNotInjectAdminToken(t *testing.T) {
+// TestBuildCPTenantEnv_InjectsLegacyAdminTokenUntilBootTokenLands asserts the
+// platform-controlled admin bearer remains the temporary boot credential while
+// caller-supplied admin env is still stripped.
+func TestBuildCPTenantEnv_InjectsLegacyAdminTokenUntilBootTokenLands(t *testing.T) {
 	cfg := WorkspaceConfig{
 		WorkspaceID: "ws-tenant",
 		EnvVars: map[string]string{
@@ -1110,12 +1113,12 @@ func TestBuildCPTenantEnv_DoesNotInjectAdminToken(t *testing.T) {
 			"CUSTOM":               "ok",
 		},
 	}
-	got := buildCPTenantEnv(cfg)
-	if _, ok := got["ADMIN_TOKEN"]; ok {
-		t.Errorf("ADMIN_TOKEN leaked into tenant workspace env: %v", got)
+	got := buildCPTenantEnv(cfg, "tenant-admin-secret")
+	if got["ADMIN_TOKEN"] != "tenant-admin-secret" {
+		t.Errorf("ADMIN_TOKEN env = %q; want platform-controlled tenant-admin-secret until scoped boot token lands", got["ADMIN_TOKEN"])
 	}
 	if _, ok := got["MOLECULE_ADMIN_TOKEN"]; ok {
-		t.Errorf("MOLECULE_ADMIN_TOKEN leaked into tenant workspace env: %v", got)
+		t.Errorf("caller-supplied MOLECULE_ADMIN_TOKEN must be stripped: %v", got)
 	}
 	if _, ok := got["GITEA_TOKEN"]; ok {
 		t.Errorf("GITEA_TOKEN must still be stripped")

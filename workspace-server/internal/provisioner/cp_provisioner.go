@@ -268,9 +268,10 @@ type cpProvisionResponse struct {
 //
 // Fail-safe: a nil cfg.WorkspaceSecretKeys yields wsAuthored=false for every
 // key, so a missing provenance map strips ALL SCM-write tokens rather than
-// leaking them.
-func buildCPTenantEnv(cfg WorkspaceConfig) map[string]string {
-	env := make(map[string]string, len(cfg.EnvVars))
+// leaking them. adminToken is the legacy platform-controlled boot credential;
+// keep it until the scoped boot-token workstream replaces it.
+func buildCPTenantEnv(cfg WorkspaceConfig, adminToken string) map[string]string {
+	env := make(map[string]string, len(cfg.EnvVars)+1)
 	for k, v := range cfg.EnvVars {
 		if isPrivilegedWorkspaceEnvKey(k) {
 			log.Printf("CPProvisioner.Start: dropped privileged credential %q from tenant workspace env", k)
@@ -286,15 +287,18 @@ func buildCPTenantEnv(cfg WorkspaceConfig) map[string]string {
 		}
 		env[k] = v
 	}
+	if adminToken != "" {
+		env["ADMIN_TOKEN"] = adminToken
+	}
 	return env
 }
 
 // Start provisions a workspace by calling the control plane → EC2.
 func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
 	// p.adminToken is read from os.Getenv("ADMIN_TOKEN") at provisioner creation
-	// and is used only as CP request authentication. It is intentionally not
-	// included in the workspace container env; normal workspaces receive their
-	// per-workspace bearer from /registry/register after boot.
+	// and is used both as CP request authentication and, temporarily, as the
+	// workspace boot credential. The handoff design requires a scoped boot token
+	// to land before this legacy env handoff can be retired.
 	//
 	// Forensic #145 hardening: tenant workspaces run on EC2 via this path, so
 	// the SCM-write-token denylist (see buildContainerEnv) is enforced here
@@ -303,7 +307,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// tenant container regardless of whether ADMIN_TOKEN is set. Extracted to
 	// buildCPTenantEnv so the strip/exempt logic is unit-testable without
 	// standing up the CP HTTP round-trip.
-	env := buildCPTenantEnv(cfg)
+	env := buildCPTenantEnv(cfg, p.adminToken)
 	// Collect template files and generated configs, with OFFSEC-010 guards:
 	// - Rejects symlinks at the template root (prevents bypass via symlink traversal)
 	// - Skips symlinks during WalkDir (prevents /etc/passwd etc. inclusion)
