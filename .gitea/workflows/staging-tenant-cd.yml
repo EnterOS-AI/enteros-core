@@ -237,6 +237,15 @@ jobs:
             exit 1
           fi
           echo "Staging CP healthy"
+      - name: Bind candidate build SHA for tenant /buildinfo guard
+        run: |
+          set -euo pipefail
+          if [ -n "${{ vars.STAGING_TENANT_CD_IMAGE_TAG }}" ]; then
+            echo "::notice::STAGING_TENANT_CD_IMAGE_TAG override set; skipping strict candidate SHA bind because the override may not be this workflow SHA."
+            exit 0
+          fi
+          echo "E2E_EXPECT_TENANT_BUILD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+          echo "::notice::candidate-build guard expects tenant /buildinfo git_sha=$GITHUB_SHA"
       - name: Run workspace-lifecycle + fresh-org platform-agent mgmt-MCP staginge2e (HARD GATE)
         working-directory: workspace-server
         # TestWorkspaceLifecycle_Staging: a workspace serves A2A across restart/pause/hibernate.

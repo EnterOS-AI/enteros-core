@@ -1560,6 +1560,20 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 		return fmt.Errorf("upsert platform agent: %w", err)
 	}
 
+	// 1b. Declare the privileged org-management MCP in the SAME transaction as
+	// the concierge row. Provisioning reads workspace_declared_plugins to stamp
+	// MOLECULE_DECLARED_PLUGINS; if this row is missing, first boot has no
+	// desired plugin source and non-Claude runtimes come up without
+	// mcp__molecule-platform__provision_workspace.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO workspace_declared_plugins (workspace_id, plugin_name, source_raw)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (workspace_id, plugin_name)
+		DO UPDATE SET source_raw = EXCLUDED.source_raw, updated_at = NOW()
+	`, platformID, conciergePlatformMCPName, conciergePlatformMCPSource); err != nil {
+		return fmt.Errorf("declare platform mcp plugin: %w", err)
+	}
+
 	// 2. Capture the org's other current roots (everything at parent_id IS NULL
 	//    except the platform agent itself). In a one-org tenant DB this is the
 	//    single team root; the query tolerates 0 (already installed) or N.
