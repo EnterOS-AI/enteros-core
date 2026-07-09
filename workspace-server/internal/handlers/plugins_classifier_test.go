@@ -119,3 +119,39 @@ func TestShQuote(t *testing.T) {
 		}
 	}
 }
+
+func TestPluginInstallCanSkipRestart(t *testing.T) {
+	tests := []struct {
+		name       string
+		pluginName string
+		kind       string
+		want       bool
+	}{
+		{
+			name:       "ordinary skill-only plugin can hot reload",
+			pluginName: "careful-bash",
+			kind:       classifyKindSkillContentOnly,
+			want:       true,
+		},
+		{
+			name:       "ordinary cold plugin must restart",
+			pluginName: "careful-bash",
+			kind:       classifyKindCold,
+			want:       false,
+		},
+		{
+			name:       "platform MCP must restart even when diff is skill-only",
+			pluginName: conciergePlatformMCPName,
+			kind:       classifyKindSkillContentOnly,
+			want:       false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pluginInstallCanSkipRestart(tt.pluginName, tt.kind); got != tt.want {
+				t.Fatalf("pluginInstallCanSkipRestart(%q, %q) = %v, want %v",
+					tt.pluginName, tt.kind, got, tt.want)
+			}
+		})
+	}
+}

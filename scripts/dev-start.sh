@@ -36,7 +36,66 @@ export COMPOSE_PROJECT_NAME
 PLATFORM_PID=
 CANVAS_PID=
 
+process_cwd() {
+    # $1 = pid. Prints the process cwd, or nothing when the process vanished.
+    lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+}
+
+repo_dev_pid_matches() {
+    # $1 = pid. Only processes whose cwd is one of dev-start's app dirs belong
+    # to this repo-local stack; do not kill unrelated localhost services.
+    cwd=$(process_cwd "$1" || true)
+    case "$cwd" in
+        "$ROOT/workspace-server"|"$ROOT/canvas")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+cleanup_repo_host_processes() {
+    # Stop stale host-side dev-start children from prior runs. Docker cleanup
+    # alone is insufficient: `go run ./cmd/server` and `next dev` are host
+    # processes, and stale listeners on :8080/:3000 can make a new dynamic stack
+    # look ready while the browser is still pointed at yesterday's server.
+    command -v lsof >/dev/null 2>&1 || return 0
+
+    pids=$(
+        {
+            lsof -nP -iTCP -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p//p'
+            if command -v pgrep >/dev/null 2>&1; then
+                pgrep -f 'go run ./cmd/server|next dev --turbopack|next dev' 2>/dev/null || true
+            fi
+        } | sort -u
+    )
+    [ -n "$pids" ] || return 0
+
+    killed=0
+    for pid in $pids; do
+        [ "$pid" != "$$" ] || continue
+        if repo_dev_pid_matches "$pid"; then
+            pkill -TERM -P "$pid" 2>/dev/null || true
+            kill -TERM "$pid" 2>/dev/null || true
+            killed=1
+        fi
+    done
+
+    [ "$killed" -eq 0 ] && return 0
+    sleep 1
+
+    for pid in $pids; do
+        [ "$pid" != "$$" ] || continue
+        if kill -0 "$pid" 2>/dev/null && repo_dev_pid_matches "$pid"; then
+            pkill -KILL -P "$pid" 2>/dev/null || true
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
 cleanup_dev_stack() {
+    cleanup_repo_host_processes
     # Stop containers from prior dev-start runs before port selection. Keep
     # named volumes so the local DB/object-store state survives restarts.
     docker compose -f "$ROOT/docker-compose.yml" down --remove-orphans >/dev/null 2>&1 || true

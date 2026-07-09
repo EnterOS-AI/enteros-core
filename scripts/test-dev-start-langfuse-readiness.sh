@@ -46,6 +46,7 @@ function_body() {
 compose_project_line=$(line_of '^COMPOSE_PROJECT_NAME="\$\{COMPOSE_PROJECT_NAME:-molecule-core\}"')
 cleanup_fn_line=$(line_of '^cleanup_dev_stack\(\) \{')
 cleanup_call_line=$(line_of '^echo "==> Cleaning up previous local dev containers"')
+host_cleanup_fn_line=$(line_of '^cleanup_repo_host_processes\(\) \{')
 pick_port_line=$(line_of '^pick_port\(\) \{')
 # shellcheck disable=SC2016
 setup_line=$(line_of '^"\$ROOT/infra/scripts/setup\.sh"$')
@@ -63,6 +64,7 @@ wait_http_line=$(line_of '^wait_for_langfuse_http$')
 banner_line=$(line_of 'Molecule AI dev environment ready')
 
 [ "$compose_project_line" -lt "$cleanup_fn_line" ] || fail "COMPOSE_PROJECT_NAME must be stable before cleanup runs"
+[ "$host_cleanup_fn_line" -lt "$cleanup_fn_line" ] || fail "repo host-process cleanup must be defined before cleanup_dev_stack"
 [ "$cleanup_call_line" -lt "$pick_port_line" ] || fail "dev-start.sh must clean stale local containers before choosing dynamic ports"
 [ "$token_file_line" -lt "$setup_line" ] || fail "local Gitea token bootstrap must happen before setup.sh clones private repos"
 [ "$template_token_line" -lt "$setup_line" ] || fail "MOLECULE_TEMPLATE_REPO_TOKEN export must happen before platform/infra startup"
@@ -84,6 +86,8 @@ if grep -q 'MOLECULE_GITEA_TOKEN=.*>> "\$ENV_FILE' "$DEV_START"; then
 fi
 
 cleanup_body=$(function_body cleanup_dev_stack)
+printf '%s\n' "$cleanup_body" | grep -Fq 'cleanup_repo_host_processes' \
+  || fail "cleanup must stop stale repo-local platform/canvas host processes"
 printf '%s\n' "$cleanup_body" | grep -Fq 'docker-compose.yml" down --remove-orphans' \
   || fail "cleanup must tear down the full compose stack, including platform fallback containers"
 printf '%s\n' "$cleanup_body" | grep -Fq 'docker-compose.infra.yml" down --remove-orphans' \
@@ -93,6 +97,23 @@ printf '%s\n' "$cleanup_body" | grep -Fq 'docker rm -f molecule-core-langfuse-1'
 if printf '%s\n' "$cleanup_body" | grep -Eq -- '--volumes|-v( |$)'; then
   fail "cleanup must not delete named volumes by default"
 fi
+
+host_cleanup_body=$(function_body cleanup_repo_host_processes)
+repo_match_body=$(function_body repo_dev_pid_matches)
+printf '%s\n' "$host_cleanup_body" | grep -Fq 'lsof -nP -iTCP -sTCP:LISTEN' \
+  || fail "host cleanup must include stale listener PIDs, not just go/next parent wrappers"
+printf '%s\n' "$host_cleanup_body" | grep -Fq 'pgrep -f' \
+  || fail "host cleanup must include go run / next dev parent wrappers"
+printf '%s\n' "$host_cleanup_body" | grep -Fq 'repo_dev_pid_matches' \
+  || fail "host cleanup must filter candidate PIDs through repo cwd scoping"
+printf '%s\n' "$repo_match_body" | grep -Fq 'ROOT/workspace-server' \
+  || fail "host cleanup must be cwd-scoped to the repo workspace-server"
+printf '%s\n' "$repo_match_body" | grep -Fq 'ROOT/canvas' \
+  || fail "host cleanup must be cwd-scoped to the repo canvas"
+printf '%s\n' "$host_cleanup_body" | grep -Fq 'pkill -TERM -P' \
+  || fail "host cleanup must terminate child listener processes before parents"
+printf '%s\n' "$host_cleanup_body" | grep -Fq 'kill -KILL' \
+  || fail "host cleanup must force-kill stubborn stale repo-local processes"
 
 ch_body=$(function_body wait_for_langfuse_clickhouse_native)
 printf '%s\n' "$ch_body" | grep -q 'clickhouse-client' \
