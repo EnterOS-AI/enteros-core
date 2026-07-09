@@ -801,7 +801,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// "*Registry doesn't implement SourceResolver" build break (core#228).
 	// Use of pluginResolver here is intentionally read-side only.
 	_ = pluginResolver
-	plgh := handlers.NewPluginsHandler(pluginsDir, dockerCli, wh.RestartByID).
+	plgh := handlers.NewPluginsHandler(pluginsDir, dockerCli, wh.RestartByIDAfterMutation).
 		WithRuntimeLookup(runtimeLookup).
 		WithInstanceIDLookup(instanceIDLookup)
 	// RFC#2843 #32: wire the post-online declared-plugin reconcile into the

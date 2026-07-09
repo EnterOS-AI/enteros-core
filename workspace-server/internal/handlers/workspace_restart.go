@@ -729,12 +729,34 @@ func (h *WorkspaceHandler) WakeWorkspace(workspaceID string) {
 // in-flight runner picks up the pending request after its current cycle
 // completes, so writes that committed mid-restart are guaranteed to land.
 func (h *WorkspaceHandler) RestartByID(workspaceID string) {
+	h.restartByID(workspaceID, true)
+}
+
+// RestartByIDAfterMutation restarts a workspace after the platform has made an
+// explicit state change that the running container cannot observe without a
+// reprovision, such as plugin delivery into /configs/plugins.
+//
+// It intentionally bypasses RestartByID's self-fire debounce while preserving
+// coalescing and the provision gate. Probe/reactive callers must keep using
+// RestartByID so container-health self-fire loops still drop inside the
+// debounce window.
+func (h *WorkspaceHandler) RestartByIDAfterMutation(workspaceID string) {
+	h.restartByID(workspaceID, false)
+}
+
+func (h *WorkspaceHandler) restartByID(workspaceID string, useSelfFireDebounce bool) {
+	restartByIDWithCycle(workspaceID, h.HasProvisioner(), useSelfFireDebounce, func() {
+		h.runRestartCycle(workspaceID)
+	})
+}
+
+func restartByIDWithCycle(workspaceID string, hasProvisioner bool, useSelfFireDebounce bool, cycle func()) {
 	// At least one of the two provisioners must be wired. Pre-fix this
 	// short-circuited on h.provisioner==nil alone, which silently disabled
 	// reactive auto-restart on every SaaS tenant (where the local Docker
 	// provisioner is intentionally nil). The runRestartCycle below now
 	// branches on which one is set for the Stop call.
-	if !h.HasProvisioner() {
+	if !hasProvisioner {
 		return
 	}
 	// Self-fire debounce: drop (not coalesce) successive RestartByID calls
@@ -749,13 +771,13 @@ func (h *WorkspaceHandler) RestartByID(workspaceID string) {
 	// handler in workspace_restart.go's Restart() bypasses this path and
 	// calls RestartWorkspaceAutoOpts directly, so user-initiated restart
 	// clicks are unaffected.
-	if shouldDebounceRestart(workspaceID) {
+	if useSelfFireDebounce && shouldDebounceRestart(workspaceID) {
 		restartByIDDropCounter.Add(1)
 		log.Printf("RestartByID: %s — dropped (within %s self-fire debounce window; total dropped=%d)",
 			workspaceID, RestartDebounceWindow, restartByIDDropCounter.Load())
 		return
 	}
-	coalesceRestart(workspaceID, func() { h.runRestartCycle(workspaceID) })
+	coalesceRestart(workspaceID, cycle)
 }
 
 // shouldDebounceRestart reports whether the most recent cycle for this
