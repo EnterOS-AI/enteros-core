@@ -5,10 +5,11 @@ import {
   markDeleted,
   wasRecentlyDeleted,
 } from "../deleteTombstones";
+import { FALLBACK_POLL_MS } from "../socket-constants";
 
-// Tombstone TTL is hardcoded at 10s in the module — these tests freeze
-// time so the GC + read-time expiry can be exercised deterministically
-// without sleeping.
+// Tombstone TTL follows the socket fallback poll cadence — these tests freeze
+// time so the GC + read-time expiry can be exercised deterministically without
+// sleeping.
 
 describe("deleteTombstones (#2069)", () => {
   beforeEach(() => {
@@ -33,10 +34,10 @@ describe("deleteTombstones (#2069)", () => {
     expect(wasRecentlyDeleted("never-deleted")).toBe(false);
   });
 
-  it("expires tombstones after the 10s TTL", () => {
+  it("expires tombstones after the fallback-poll TTL", () => {
     markDeleted(["root-1"]);
     expect(wasRecentlyDeleted("root-1")).toBe(true);
-    vi.advanceTimersByTime(9_999);
+    vi.advanceTimersByTime(FALLBACK_POLL_MS - 1);
     expect(wasRecentlyDeleted("root-1")).toBe(true);
     vi.advanceTimersByTime(2);
     expect(wasRecentlyDeleted("root-1")).toBe(false);
