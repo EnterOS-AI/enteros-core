@@ -12,7 +12,7 @@ tags: [onboarding, quickstart, audio]
 
 Getting started with Molecule AI takes about five minutes.
 
-First, clone the repo and run the setup script. It boots Postgres, Redis, Langfuse, and Temporal — everything the platform needs to run.
+First, clone the repo and run the setup script. It boots Postgres, Redis, MinIO, and Langfuse — everything the platform needs to run.
 
 Then start the workspace server on port 8080, and the canvas UI on port 3000. Open your browser to localhost 3000.
 

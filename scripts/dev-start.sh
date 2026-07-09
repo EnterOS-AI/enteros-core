@@ -3,8 +3,8 @@
 #
 # What it does (in order):
 #   1. Generates ADMIN_TOKEN into .env if missing (closes #684 fail-open)
-#   2. Runs infra/scripts/setup.sh (postgres + redis + langfuse + clickhouse
-#      + temporal + populates template/plugin registry from manifest.json)
+#   2. Runs infra/scripts/setup.sh (postgres + redis + minio + langfuse +
+#      clickhouse + populates template/plugin registry from manifest.json)
 #   3. Starts the platform (Go :8080), waits for /health
 #   4. Starts the canvas (Next.js :3000), waits for HTTP 200
 #   5. Prints a readiness banner with API-key add instructions
@@ -261,14 +261,11 @@ PY
 
 MOLECULE_PG_HOST_PORT=${MOLECULE_PG_HOST_PORT:-$(pick_port 5432)}
 MOLECULE_REDIS_HOST_PORT=${MOLECULE_REDIS_HOST_PORT:-$(pick_port 6379)}
-MOLECULE_TEMPORAL_HOST_PORT=${MOLECULE_TEMPORAL_HOST_PORT:-$(pick_port 7233)}
-MOLECULE_TEMPORAL_UI_HOST_PORT=${MOLECULE_TEMPORAL_UI_HOST_PORT:-$(pick_port 8233)}
 MOLECULE_MINIO_HOST_PORT=${MOLECULE_MINIO_HOST_PORT:-$(pick_port 9000)}
 MOLECULE_MINIO_CONSOLE_HOST_PORT=${MOLECULE_MINIO_CONSOLE_HOST_PORT:-$(pick_port 9001)}
 PLATFORM_PORT=$(pick_port 8080)
 CANVAS_PORT=$(pick_port 3000)
 export MOLECULE_PG_HOST_PORT MOLECULE_REDIS_HOST_PORT \
-       MOLECULE_TEMPORAL_HOST_PORT MOLECULE_TEMPORAL_UI_HOST_PORT \
        MOLECULE_MINIO_HOST_PORT MOLECULE_MINIO_CONSOLE_HOST_PORT
 
 # App→infra connection URLs. Override empty or loopback-local URLs from an
@@ -319,7 +316,6 @@ export MOLECULE_WORKSPACE_ADVERTISE_HOST=127.0.0.1
 echo "==> Host ports (dynamic — conventional when free, else ephemeral):"
 echo "    Postgres   127.0.0.1:${MOLECULE_PG_HOST_PORT}"
 echo "    Redis      127.0.0.1:${MOLECULE_REDIS_HOST_PORT}"
-echo "    Temporal   127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT} (gRPC) / ${MOLECULE_TEMPORAL_UI_HOST_PORT} (UI)"
 echo "    MinIO      http://127.0.0.1:${MOLECULE_MINIO_HOST_PORT} (S3 API) / ${MOLECULE_MINIO_CONSOLE_HOST_PORT} (console)"
 echo "    Platform   ${NEXT_PUBLIC_PLATFORM_URL}"
 echo "    Canvas     http://127.0.0.1:${CANVAS_PORT}"
@@ -527,13 +523,11 @@ cat <<EOF
   Canvas:    http://127.0.0.1:${CANVAS_PORT}
   Langfuse:  ${LANGFUSE_HOST}   (LLM traces)
              login: dev@molecule.local / dev-langfuse-pw
-  Temporal:  http://127.0.0.1:${MOLECULE_TEMPORAL_UI_HOST_PORT}   (workflow UI)
 
   ── Backing services (dynamic ports; URLs wired for you) ───
   Platform:  ${NEXT_PUBLIC_PLATFORM_URL}   (API, loopback-bound in dev)
   Postgres:  127.0.0.1:${MOLECULE_PG_HOST_PORT}   (\$DATABASE_URL exported)
   Redis:     127.0.0.1:${MOLECULE_REDIS_HOST_PORT}
-  Temporal:  127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT} (gRPC)
   MinIO:     127.0.0.1:${MOLECULE_MINIO_HOST_PORT} (S3 API, bucket: ${MOLECULE_WORKSPACE_DATA_BUCKET})
 
   Auth:      fail-closed — canvas uses the dev ADMIN_TOKEN (see .env)

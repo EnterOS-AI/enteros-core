@@ -53,7 +53,6 @@ This starts:
 | Canvas (Next.js) | selected `127.0.0.1` port, usually `:3000` | Visual frontend |
 | Langfuse web | selected `127.0.0.1` port, usually `:3001` / `:3000` internal | Observability UI |
 | ClickHouse | — | Langfuse dependency |
-| Temporal | selected `127.0.0.1` ports, usually `:7233` / `:8233` | Workflow engine + UI |
 
 Each workspace container is provisioned **on demand** by the platform when a user creates or imports one.
 
@@ -65,7 +64,7 @@ prints the exact URLs in its readiness banner.
 
 ### Infrastructure Only
 
-To start just Postgres, Redis, MinIO, ClickHouse, and Temporal (no application code):
+To start just Postgres, Redis, MinIO, ClickHouse, and Langfuse (no application code):
 
 ```bash
 docker compose -f docker-compose.infra.yml up

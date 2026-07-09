@@ -1,6 +1,6 @@
 -- 20260417000000_workflow_checkpoints.up.sql
 --
--- Temporal checkpoint persistence layer (#788 / parent #583).
+-- Legacy checkpoint persistence layer (#788 / parent #583).
 -- Stores step-level progress for long-running workflows so they can
 -- resume after a crash or restart without replaying completed steps.
 

@@ -123,40 +123,6 @@ services:
       timeout: 5s
       retries: 10
 
-  # dev-only: no-auth on 0.0.0.0:7233; production must gate via mTLS or API key
-  # digest-pinned 2026-05-10 (sha256:9ce78f5a7ba7169acb659a8bb7a174a64251c3bfe1553d1fefdd669a59d41df5, linux/amd64)
-  temporal:
-    image: temporalio/auto-setup@sha256:9ce78f5a7ba7169acb659a8bb7a174a64251c3bfe1553d1fefdd669a59d41df5
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DB: postgres12
-      DB_PORT: 5432
-      POSTGRES_USER: ${POSTGRES_USER:-dev}
-      POSTGRES_PWD: ${POSTGRES_PASSWORD:-dev}
-      POSTGRES_SEEDS: postgres
-      DBNAME: temporal
-      VISIBILITY_DBNAME: temporal_visibility
-    ports:
-      - "127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT:-7233}:7233"
-    healthcheck:
-      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  # digest-pinned 2026-05-10 (sha256:7be8d6e41d4846ccb718c4f35956c9557512f8085e94a73954286a4e95113703, linux/amd64)
-  temporal-ui:
-    image: temporalio/ui@sha256:7be8d6e41d4846ccb718c4f35956c9557512f8085e94a73954286a4e95113703
-    depends_on:
-      - temporal
-    environment:
-      TEMPORAL_ADDRESS: temporal:7233
-      TEMPORAL_CORS_ORIGINS: http://localhost:8233
-    ports:
-      - "127.0.0.1:${MOLECULE_TEMPORAL_UI_HOST_PORT:-8233}:8080"
-
 networks:
   molecule-core-net:
     name: molecule-core-net

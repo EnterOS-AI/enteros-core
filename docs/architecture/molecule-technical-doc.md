@@ -75,7 +75,7 @@ Six runtime adapters ship production-ready on `main`: LangGraph, DeepAgents, Cla
 
 | Category | Examples | How Molecule AI Differs |
 |----------|---------|---------------------|
-| Workflow builders | n8n, Windmill, Temporal | Molecule AI models **roles**, not tasks |
+| Workflow builders | n8n, Windmill, durable workflow engines | Molecule AI models **roles**, not tasks |
 | Agent frameworks | LangGraph, CrewAI, AutoGen | Molecule AI sits **above** frameworks as runtime adapters |
 | Coding agents | Claude Code, Cursor, Codex | Molecule AI runs coding agents as **workspace roles** alongside other types |
 | Chat UIs | ChatGPT, Claude.ai | Molecule AI is **operational infrastructure**, not a conversation interface |
@@ -741,7 +741,6 @@ requires:
 | `sandbox.py` | Code execution (subprocess or Docker backend) | sandbox access |
 | `telemetry.py` | OpenTelemetry span creation and tracing | trace emission |
 | `security_scan.py` | CVE and security scanning (pip-audit/Snyk) | security audit |
-| `temporal_workflow.py` | Temporal.io workflow integration | workflow engine |
 | `a2a_tools.py` | A2A delegation helpers and route resolution | delegate/receive |
 
 ### Built-In MCP Tools (from `.mcp.json`)

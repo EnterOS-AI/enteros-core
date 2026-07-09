@@ -86,8 +86,9 @@ type ChannelBroadcaster interface {
 // NativeSchedulerCheck returns true when the workspace's adapter has
 // declared `provides_native_scheduler=True` in its capabilities. The
 // scheduler skips polling-and-firing for these workspaces — the SDK
-// runs the schedule itself (Temporal, Durable Functions, etc.) and the
-// platform's polling would cause double-fire on every restart.
+// runs the schedule itself (external workflow engines, Durable Functions,
+// sidecar daemons, etc.) and platform polling would cause double-fire on every
+// restart.
 //
 // Wired at construction by the router (production) or tests. nil is
 // allowed and treated as "no override" for every workspace, preserving
@@ -279,7 +280,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 			continue
 		}
 		// Skip workspaces whose adapter owns scheduling natively (e.g.
-		// SDKs with built-in cron / Temporal-style workflows). Without
+		// SDKs with built-in cron / workflow-engine schedules). Without
 		// this skip, the platform's polling would fire the same
 		// schedule twice — once natively in the SDK, once via this
 		// loop. The skip drops only the FIRE; the schedule row stays

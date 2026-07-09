@@ -632,17 +632,6 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.POST("/artifacts/fork", arth.Fork)
 		wsAuth.POST("/artifacts/token", arth.Token)
 
-		// Temporal workflow checkpoints — step-level persistence for resumable
-		// workflows (#788, #837, parent #583). WorkspaceAuth on wsAuth ensures each
-		// workspace can only read/write its own checkpoints.
-		// NOTE: /checkpoints/latest must be registered BEFORE /checkpoints/:wfid
-		// so Gin's static-segment resolution takes precedence over the wildcard.
-		cpth := handlers.NewCheckpointsHandler(db.DB)
-		wsAuth.POST("/checkpoints", cpth.Upsert)
-		wsAuth.GET("/checkpoints/latest", cpth.Latest)
-		wsAuth.GET("/checkpoints/:wfid", cpth.List)
-		wsAuth.DELETE("/checkpoints/:wfid", cpth.Delete)
-
 		// MCP bridge — opencode / Claude Code integration (#800).
 		// Exposes A2A delegation, peer discovery, and workspace operations as a
 		// remote MCP server over HTTP (Streamable HTTP + SSE transports).
