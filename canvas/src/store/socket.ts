@@ -1,6 +1,7 @@
 import { useCanvasStore } from "./canvas";
 import { deriveWsBaseUrl } from "@/lib/ws-url";
 import { emitSocketEvent } from "./socket-events";
+import { FALLBACK_POLL_MS } from "./socket-constants";
 
 // If explicit WS_URL is set, use it as-is (may include custom path).
 // Otherwise derive base + append /ws.
@@ -57,14 +58,7 @@ export class RehydrateDedup {
   }
 }
 
-/** Cadence for the HTTP fallback rehydrate that runs while the WS is
- *  in connecting/disconnected limbo. 10s is short enough that the user
- *  sees STARTING → ONLINE within one tick after the platform finishes
- *  provisioning, but long enough to not pound /workspaces if the
- *  network truly is down. The dedup gate inside rehydrate() collapses
- *  this against the post-onopen rehydrate, so reconnect doesn't pay
- *  for a duplicate fetch. */
-export const FALLBACK_POLL_MS = 10_000;
+export { FALLBACK_POLL_MS } from "./socket-constants";
 
 /** Maximum time to wait for a WebSocket handshake before giving up and
  *  scheduling a reconnect. Without this the browser can leave a socket in

@@ -6,40 +6,41 @@ import (
 	"testing"
 )
 
-// sync_canonical_test.go — hermetic half of the canonical↔synced-copy drift
-// gate (internal#718 P2-A).
+// sync_canonical_test.go — hermetic drift backstop pinning the SSOT registry
+// the binary embeds (internal#718 P2-A).
 //
-// molecule-core's providers.yaml is a SYNCED COPY of the canonical SSOT in
-// molecule-controlplane internal/providers/providers.yaml. The live cross-repo
-// byte-compare lives in the sync-providers-yaml CI workflow (it fetches the
-// canonical from CP and diffs). This test is the HERMETIC backstop: it pins the
-// sha256 of the embedded synced copy to the value the canonical produced at sync
-// time, so a HAND-EDIT of core's copy (or a partial sync) flips red locally and
-// in `go test ./...` even when CI cannot reach controlplane.
+// The provider/model/runtime registry SSOT is the SDK: core no longer keeps its
+// own providers.yaml copy — `embeddedYAML` is sourced from
+// go.moleculesai.app/sdk/gen/go/llmregistry (embedded from the SDK's
+// contracts/llm-registry/llm-registry.yaml). This test pins the sha256 of that
+// embedded registry so an UNEXPECTED change to the SDK content the binary links
+// (a bad module bump, a local replace pointing at drifted content) flips red
+// locally and in `go test ./...` — a hermetic check that needs no network.
 //
-// When the canonical legitimately changes, the sync procedure is:
-//  1. Copy controlplane internal/providers/providers.yaml verbatim over this
-//     copy.
-//  2. `go generate ./...` to regenerate the artifact (verify-providers-gen).
-//  3. Update canonicalProvidersYAMLSHA256 below to the new sha (the failure
-//     message prints the observed sha to paste in).
+// When the SDK registry legitimately changes, the procedure is:
+//  1. Bump the go.moleculesai.app/sdk/gen/go dependency to the version carrying
+//     the new registry (or update the local replace).
+//  2. Update canonicalRegistrySHA256 below to the new sha (the failure message
+//     prints the observed sha to paste in).
 // The deliberate constant bump is the human checkpoint that a registry change
-// was consciously re-synced into core, not silently forked.
+// was consciously adopted from the SDK SSOT, not silently pulled in.
 
-// canonicalProvidersYAMLSHA256 is the sha256 of the canonical providers.yaml as
-// synced from molecule-controlplane. Bumped deliberately on each re-sync (see
-// file doc). Cross-checked live by the sync-providers-yaml CI workflow.
-const canonicalProvidersYAMLSHA256 = "6074a3285922fc5d30a7cfed168622dbdb1173315f0c7d9249c428fcb938de77"
+// canonicalRegistrySHA256 is the sha256 of the SDK llm-registry.yaml the binary
+// embeds via llmregistry.RawYAML. Bumped deliberately on each SDK registry
+// adoption (see file doc).
+const canonicalRegistrySHA256 = "ff538be1e1fdb1cdb468b6e7fa725d32dde13590509b57003dcf187ebac99937"
 
 func TestSyncedYAMLMatchesCanonicalSHA(t *testing.T) {
 	sum := sha256.Sum256(embeddedYAML)
 	got := hex.EncodeToString(sum[:])
-	if got != canonicalProvidersYAMLSHA256 {
-		t.Fatalf("embedded providers.yaml sha256 = %s, pinned canonical = %s\n"+
-			"If you intentionally re-synced the canonical from molecule-controlplane, "+
-			"update canonicalProvidersYAMLSHA256 to %s and regenerate (`go generate ./...`).\n"+
-			"If you did NOT mean to edit core's copy, revert it — the canonical SSOT is "+
-			"molecule-controlplane internal/providers/providers.yaml, not this synced copy.",
-			got, canonicalProvidersYAMLSHA256, got)
+	if got != canonicalRegistrySHA256 {
+		t.Fatalf("embedded SDK registry sha256 = %s, pinned = %s\n"+
+			"If you intentionally adopted a new SDK registry (bumped "+
+			"go.moleculesai.app/sdk/gen/go or its replace), update "+
+			"canonicalRegistrySHA256 to %s.\n"+
+			"If you did NOT expect the embedded registry to change, check the SDK "+
+			"dependency — the canonical SSOT is the SDK's llm-registry.yaml, which "+
+			"core derives from (it keeps no local copy).",
+			got, canonicalRegistrySHA256, got)
 	}
 }

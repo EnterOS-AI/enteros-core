@@ -11,7 +11,7 @@
  * trigger React Flow re-renders. (#2069)
  */
 
-import { FALLBACK_POLL_MS } from "./socket";
+import { FALLBACK_POLL_MS } from "./socket-constants";
 
 const TOMBSTONE_TTL_MS = FALLBACK_POLL_MS;
 

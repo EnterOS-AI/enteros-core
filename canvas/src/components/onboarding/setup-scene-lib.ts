@@ -34,6 +34,12 @@ export interface SceneTemplateRow {
   id?: string;
   name?: string;
   runtime?: string;
+  /** Runtime's human label from the provider registry SSOT
+   *  (providers.yaml runtimes.<rt>.display_name). The runtime picker labels
+   *  by this — NOT by `name`, which is the *template* name and collides when
+   *  two templates share a runtime (e.g. platform-agent + seo-agent both
+   *  claude-code, which used to surface the runtime as "SEO Agent"). */
+  runtime_display_name?: string;
   models?: SelectorModel[];
   registry_backed?: boolean;
   registry_providers?: RegistryProvider[];
@@ -83,7 +89,11 @@ export function bucketTemplatesByRuntime(
       (o.registryBacked ? 1000 : 0) + o.models.length;
     const candidate: SceneRuntimeOption = {
       value: v,
-      label: r.name || v,
+      // Label from the registry runtime display_name (SSOT), NOT the template
+      // name — two templates can share a runtime, so `r.name` would surface a
+      // template (e.g. "SEO Agent") as the runtime. Fall back to the runtime
+      // slug when the registry has no display_name for it.
+      label: r.runtime_display_name || v,
       models,
       registryBacked,
       registryProviders,

@@ -1,50 +1,32 @@
 name: sync-providers-yaml
 
-# Cross-repo canonical↔synced-copy drift gate (internal#718 P2-A, CTO
-# 2026-05-27 "Distribution = SDK via codegen + verify-CI", multi-repo branch:
-# "codegen-checked-into-each-repo + verify-CI").
+# Historical workflow name retained for continuity. Molecule-core no longer
+# carries a synced providers.yaml copy: the provider/model/runtime registry SSOT
+# is now the SDK module (`go.moleculesai.app/sdk/gen/go/llmregistry`), and core
+# derives its embedded registry from that package.
 #
-# The canonical provider-registry SSOT is molecule-controlplane
-# internal/providers/providers.yaml. molecule-core has NO Go module dependency
-# on controlplane, so instead of importing it we carry a SYNCED COPY at
-# workspace-server/internal/providers/providers.yaml and gate it.
-#
-# This workflow fetches the canonical providers.yaml from controlplane (via the
-# Gitea raw endpoint, read-only) and byte-compares it against core's synced
-# copy. RED if they differ — meaning the canonical moved and core's copy must be
-# re-synced (copy verbatim + `go generate ./...` + bump
-# canonicalProvidersYAMLSHA256 in sync_canonical_test.go).
-#
-# Pairs with:
-#   * sync_canonical_test.go — hermetic sha pin (catches a hand-edit of core's
-#     copy even with no network); runs in the normal `go test ./...`.
-#   * verify-providers-gen.yml — artifact ↔ synced-copy drift.
-#
-# ENFORCEMENT GATING: standalone workflow, NOT a job in ci.yml and NOT in
-# branch protection (same soak-then-promote posture as verify-providers-gen).
-# It is intentionally absent from ci.yml's job set so the ci-required-drift
-# sentinel does not fire on it.
-#
-# AUTH: uses AUTO_SYNC_TOKEN (the existing cross-repo read token used to sync
-# template/provider content from sibling repos). If the secret is absent:
-#   * Trusted contexts (push to main/staging, schedule, same-repo PR,
-#     workflow_dispatch): hard ::error:: + exit 1 (#2158 — silent
-#     fail-open was masking live canonical drift from the daily schedule).
-#   * Untrusted fork PRs: soft ::warning:: + exit 0 (forks cannot receive
-#     secrets, so a hard-fail here would block every fork PR).
-# The hermetic sha pin in sync_canonical_test.go is the always-on backstop
-# for hand-edits of core's synced copy regardless of AUTO_SYNC_TOKEN state.
+# This standalone gate verifies the SDK-registry adoption surface:
+#   * no local workspace-server/internal/providers/providers.yaml has reappeared,
+#   * the hermetic SDK registry sha pin still matches the module in go.mod, and
+#   * the checked-in provider projection is regenerated from the SDK-backed
+#     loader.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
-      - 'workspace-server/internal/providers/providers.yaml'
+      - 'workspace-server/go.mod'
+      - 'workspace-server/go.sum'
+      - 'workspace-server/internal/providers/**'
+      - 'workspace-server/cmd/gen-providers/**'
       - '.gitea/workflows/sync-providers-yaml.yml'
   push:
     branches: [main, staging]
     paths:
-      - 'workspace-server/internal/providers/providers.yaml'
+      - 'workspace-server/go.mod'
+      - 'workspace-server/go.sum'
+      - 'workspace-server/internal/providers/**'
+      - 'workspace-server/cmd/gen-providers/**'
       - '.gitea/workflows/sync-providers-yaml.yml'
   workflow_dispatch:
 
@@ -59,111 +41,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # bp-required: pending #718 — soak-then-promote, not in BP yet.
+  # bp-required: pending #718 - soak-then-promote, not in BP yet.
   compare:
-    name: Compare synced providers.yaml against controlplane canonical
+    name: Verify SDK registry dependency
     runs-on: ubuntu-latest
     timeout-minutes: 6
+    defaults:
+      run:
+        working-directory: workspace-server
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: 'stable'
+          cache: false
 
-      - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
-        # Bot-token consolidation (secrets->kms). AUTO_SYNC_TOKEN (the
-        # devops-engineer persona PAT, used here as a read-only cross-repo
-        # token to fetch the controlplane canonical providers.yaml) is now
-        # pulled from the Infisical SSOT at /shared/dev-utils::AUTO_SYNC_TOKEN
-        # (environment=prod) instead of the duplicated `secrets.AUTO_SYNC_TOKEN`
-        # Gitea secret. Exported to $GITHUB_ENV and consumed as env.* by the
-        # compare step below, which keeps its own trusted-context detection: on
-        # a fork PR this fetch is skipped, env.* is empty, and the compare step
-        # soft-skips (untrusted) while the hermetic sha pin remains the backstop.
-        # The old Gitea secret stays in place until a green run proves this
-        # fetch (validate-before-delete).
-        #
-        # FORK SAFETY: gated to same-repo PRs only so a fork PR can never
-        # harvest the merge-actor token. Gitea also withholds secrets from forks
-        # at the runner level (defense in depth).
-        id: auto_sync_token
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
-        env:
-          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
-          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
-          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
-        run: |
-          set -uo pipefail
-          BASE="https://key.moleculesai.app"
-          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
-            -H 'Content-Type: application/json' \
-            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
-          read_secret() {
-            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
-              -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
-          }
-          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
-          echo "::add-mask::$AUTO_SYNC_TOKEN"
-          if [ -z "$AUTO_SYNC_TOKEN" ]; then
-            echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils"
-            exit 1
-          fi
-          echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
-          echo "AUTO_SYNC_TOKEN loaded from Infisical (len=${#AUTO_SYNC_TOKEN})"
-
-      - name: Fetch canonical providers.yaml from controlplane and byte-compare
-        env:
-          AUTO_SYNC_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
-          API_ROOT: ${{ github.server_url }}/api/v1
+      - name: Verify SDK registry adoption
         run: |
           set -euo pipefail
-          # Trusted-context detection (per #2158): AUTO_SYNC_TOKEN absence
-          # is a hard failure on contexts that *should* have the secret
-          # (push to main/staging, schedule, same-repo PRs, workflow_dispatch).
-          # Fork PRs cannot receive secrets, so the soft warning is preserved
-          # for that one untrusted case. The hermetic sha pin in
-          # sync_canonical_test.go remains the always-on backstop for
-          # hand-edits of core's synced copy.
-          case "${{ github.event_name }}" in
-            push|schedule|workflow_dispatch)
-              is_trusted=true
-              ;;
-            pull_request)
-              if [ "${{ github.event.pull_request.head.repo.fork }}" = "false" ]; then
-                is_trusted=true
-              else
-                is_trusted=false
-              fi
-              ;;
-            *)
-              # Unknown event type — treat as trusted to avoid silent failures
-              # on a future event we haven't enumerated.
-              is_trusted=true
-              ;;
-          esac
-          if [ -z "${AUTO_SYNC_TOKEN:-}" ]; then
-            if [ "$is_trusted" = "true" ]; then
-              echo "::error::AUTO_SYNC_TOKEN secret missing on trusted context (${{ github.event_name }}). Live cross-repo canonical-drift detection cannot run — this would silently mask a controlplane-side providers.yaml change from going red on the daily schedule and on same-repo PRs. Provision AUTO_SYNC_TOKEN (read scope on molecule-controlplane) to restore detection."
-              exit 1
-            fi
-            echo "::warning::AUTO_SYNC_TOKEN secret missing on untrusted fork PR — skipping the live cross-repo compare (forks cannot receive secrets)."
-            echo "The hermetic sha pin (sync_canonical_test.go) still gates hand-edits of core's copy."
-            exit 0
-          fi
-          CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-controlplane/raw/internal/providers/providers.yaml?ref=main"
-          # Use the /raw endpoint: it returns the file bytes directly. (The
-          # /contents endpoint ignores Accept: application/vnd.gitea.raw on
-          # Gitea 1.22.6 and returns the JSON+base64 envelope, which made this
-          # diff a permanent false RED.)
-          curl -fsS \
-            -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
-            "${CANON_URL}" -o /tmp/canonical-providers.yaml
-          LOCAL=workspace-server/internal/providers/providers.yaml
-          if diff -u /tmp/canonical-providers.yaml "$LOCAL"; then
-            echo "OK — core's synced providers.yaml is byte-identical to the controlplane canonical."
-          else
-            echo "::error::core's synced providers.yaml DRIFTED from the controlplane canonical (SSOT)."
-            echo "Re-sync: copy controlplane internal/providers/providers.yaml verbatim over"
-            echo "  $LOCAL, run 'go generate ./...' in workspace-server/, and bump"
-            echo "  canonicalProvidersYAMLSHA256 in internal/providers/sync_canonical_test.go."
+          if [ -e internal/providers/providers.yaml ]; then
+            echo "::error::internal/providers/providers.yaml must not exist. Core derives the registry from go.moleculesai.app/sdk/gen/go/llmregistry."
             exit 1
           fi
+          go test -count=1 ./internal/providers -run '^TestSyncedYAMLMatchesCanonicalSHA$'
+          go run ./cmd/gen-providers -check
+          echo "OK - core is using the SDK registry module and the projection is in sync."
