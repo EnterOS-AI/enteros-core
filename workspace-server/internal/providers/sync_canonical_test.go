@@ -28,7 +28,7 @@ import (
 // canonicalRegistrySHA256 is the sha256 of the SDK llm-registry.yaml the binary
 // embeds via llmregistry.RawYAML. Bumped deliberately on each SDK registry
 // adoption (see file doc).
-const canonicalRegistrySHA256 = "e70f13cfc926798decd1b90f06e11494914be1e39f48672a3c5055e61ca0d2a1"
+const canonicalRegistrySHA256 = "afe74510fc295278a6e26922a832798c6d36f18cf026cdfae40cac0c48526395"
 
 func TestSyncedYAMLMatchesCanonicalSHA(t *testing.T) {
 	sum := sha256.Sum256(embeddedYAML)

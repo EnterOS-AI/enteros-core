@@ -48,20 +48,20 @@ var _ provisioner.LocalProvisionerAPI = (*execReadStubProv)(nil)
 // only the workspaces.runtime DB column (not the running container's
 // /configs/config.yaml), so on restart the DB column is the SSOT. Pre-fix, the
 // container's stale template-default config.yaml ("claude-code") won over the
-// switched DB runtime ("google-adk") AND stomped the DB column — so a switched
+// switched DB runtime ("hermes") AND stomped the DB column — so a switched
 // runtime box was never re-provisioned.
 //
-// Here the DB runtime is "google-adk" while the container config.yaml still
-// declares "claude-code"; the restart must re-provision with "google-adk".
+// Here the DB runtime is "hermes" while the container config.yaml still
+// declares "claude-code"; the restart must re-provision with "hermes".
 func TestRestartRuntimeFromConfig_DBRuntimeWinsOverStaleConfig(t *testing.T) {
 	h := &WorkspaceHandler{
 		provisioner: &execReadStubProv{configYAML: "runtime: claude-code\nmodel: x\n"},
 	}
 
-	got := h.restartRuntimeFromConfig(context.Background(), "ws-1", "adk-test", "google-adk", false)
+	got := h.restartRuntimeFromConfig(context.Background(), "ws-1", "hermes-test", "hermes", false)
 
-	if got != "google-adk" {
-		t.Fatalf("restartRuntimeFromConfig returned %q; want the DB SSOT runtime %q (the stale config.yaml=claude-code must NOT win)", got, "google-adk")
+	if got != "hermes" {
+		t.Fatalf("restartRuntimeFromConfig returned %q; want the DB SSOT runtime %q (the stale config.yaml=claude-code must NOT win)", got, "hermes")
 	}
 }
 
@@ -72,10 +72,10 @@ func TestRestartRuntimeFromConfig_ApplyTemplateShortCircuits(t *testing.T) {
 	// ExecRead would panic if reached; apply_template=true must short-circuit.
 	h := &WorkspaceHandler{provisioner: &execReadStubProv{}}
 
-	got := h.restartRuntimeFromConfig(context.Background(), "ws-1", "adk-test", "google-adk", true)
+	got := h.restartRuntimeFromConfig(context.Background(), "ws-1", "hermes-test", "hermes", true)
 
-	if got != "google-adk" {
-		t.Fatalf("restartRuntimeFromConfig (apply_template) returned %q; want %q", got, "google-adk")
+	if got != "hermes" {
+		t.Fatalf("restartRuntimeFromConfig (apply_template) returned %q; want %q", got, "hermes")
 	}
 }
 
@@ -84,10 +84,10 @@ func TestRestartRuntimeFromConfig_ApplyTemplateShortCircuits(t *testing.T) {
 func TestRestartRuntimeFromConfig_NilProvisionerReturnsDB(t *testing.T) {
 	h := &WorkspaceHandler{provisioner: nil}
 
-	got := h.restartRuntimeFromConfig(context.Background(), "ws-1", "adk-test", "google-adk", false)
+	got := h.restartRuntimeFromConfig(context.Background(), "ws-1", "hermes-test", "hermes", false)
 
-	if got != "google-adk" {
-		t.Fatalf("restartRuntimeFromConfig (nil provisioner) returned %q; want %q", got, "google-adk")
+	if got != "hermes" {
+		t.Fatalf("restartRuntimeFromConfig (nil provisioner) returned %q; want %q", got, "hermes")
 	}
 }
 
@@ -95,12 +95,12 @@ func TestRestartRuntimeFromConfig_NilProvisionerReturnsDB(t *testing.T) {
 // case: when config.yaml agrees with the DB, the DB runtime is returned.
 func TestRestartRuntimeFromConfig_MatchingConfigReturnsDB(t *testing.T) {
 	h := &WorkspaceHandler{
-		provisioner: &execReadStubProv{configYAML: "runtime: google-adk\n"},
+		provisioner: &execReadStubProv{configYAML: "runtime: hermes\n"},
 	}
 
-	got := h.restartRuntimeFromConfig(context.Background(), "ws-1", "adk-test", "google-adk", false)
+	got := h.restartRuntimeFromConfig(context.Background(), "ws-1", "hermes-test", "hermes", false)
 
-	if got != "google-adk" {
-		t.Fatalf("restartRuntimeFromConfig returned %q; want %q", got, "google-adk")
+	if got != "hermes" {
+		t.Fatalf("restartRuntimeFromConfig returned %q; want %q", got, "hermes")
 	}
 }

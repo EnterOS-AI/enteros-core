@@ -109,17 +109,6 @@ func runtimeListContains(s []string, v string) bool {
 	return false
 }
 
-// TestAllRuntimes_IncludesGoogleADK is the direct regression for
-// controlplane#578: a google-adk pin promote/redeploy is accepted CP-side, so
-// the tenant image-refresh allowlist MUST also accept google-adk or the image
-// fix never deploys (tenant returned 400 "unknown runtime"). google-adk lives
-// in the providers SSOT, so the derived AllRuntimes must contain it.
-func TestAllRuntimes_IncludesGoogleADK(t *testing.T) {
-	if !runtimeListContains(AllRuntimes, "google-adk") {
-		t.Fatalf("AllRuntimes must include google-adk (controlplane#578 drift); got %v", AllRuntimes)
-	}
-}
-
 // TestAllRuntimes_MatchesProvidersSSOT is the drift guard. AllRuntimes is
 // derived from providers.LoadManifest().Runtimes — assert it equals exactly the
 // runtime keys the providers manifest (mirrored from CP's providers.yaml)
@@ -179,9 +168,8 @@ func TestImageRefreshFallbackMatchesSSOT(t *testing.T) {
 }
 
 // TestRefresh_RejectsUnknownRuntime asserts a genuinely unknown runtime still
-// 400s (the guard isn't removed) AND that the 400 body lists google-adk in
-// known_runtimes (proving the allowlist now advertises it). This exercises the
-// gin handler's reject branch, which runs entirely before any Docker call.
+// 400s and that the 400 body lists the supported runtime set. This exercises
+// the gin handler's reject branch, which runs entirely before any Docker call.
 func TestRefresh_RejectsUnknownRuntime(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -207,8 +195,11 @@ func TestRefresh_RejectsUnknownRuntime(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode 400 body: %v (raw=%s)", err, rec.Body.String())
 	}
-	if !runtimeListContains(body.KnownRuntimes, "google-adk") {
-		t.Errorf("400 known_runtimes must advertise google-adk (controlplane#578); got %v", body.KnownRuntimes)
+	if runtimeListContains(body.KnownRuntimes, "google-adk") {
+		t.Errorf("400 known_runtimes must not advertise retired google-adk; got %v", body.KnownRuntimes)
+	}
+	if !runtimeListContains(body.KnownRuntimes, "hermes") {
+		t.Errorf("400 known_runtimes must advertise hermes; got %v", body.KnownRuntimes)
 	}
 }
 
@@ -233,10 +224,10 @@ func TestGHCRAuthHeader_TrimsWhitespace(t *testing.T) {
 
 func TestTemplateImageRef(t *testing.T) {
 	cases := []struct {
-		name           string
-		registryEnv    string
-		runtime        string
-		want           string
+		name        string
+		registryEnv string
+		runtime     string
+		want        string
 	}{
 		{
 			name:        "default registry prefix",

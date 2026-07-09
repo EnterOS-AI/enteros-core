@@ -25,7 +25,7 @@ import (
 // The fix composes the concierge's /configs/config.yaml from its ACTUAL
 // runtime's native base template + grafts the runtime-agnostic persona per that
 // runtime's convention. These tests assert, for a concierge on runtime in
-// {hermes(default), openclaw, claude-code, codex, google-adk}:
+// {hermes(default), openclaw, claude-code, codex}:
 //   - the seeded config.yaml declares the concierge's ACTUAL runtime (so
 //     runtimeSeedMismatchAbort does NOT fire),
 //   - runtime_config.required_env is neutralized to [] (platform-managed),
@@ -71,13 +71,6 @@ func writeConciergeBaseFixtures(t *testing.T, configsDir string) {
 			"runtime_config:\n" +
 			"  model: minimax/MiniMax-M2.7\n" +
 			"  required_env: [MINIMAX_API_KEY]\n",
-		"google-adk/config.yaml": "name: Google ADK Agent\n" +
-			"runtime: google-adk\n" +
-			"prompt_files:\n" +
-			"  - system-prompt.md\n" +
-			"runtime_config:\n" +
-			"  model: platform:gemini-2.5-pro\n" +
-			"  required_env: []\n",
 		"platform-agent/prompts/concierge.md": "# You are {{CONCIERGE_NAME}} — the Org Concierge\n\nYou orchestrate the org.\n",
 	}
 	for rel, content := range fixtures {
@@ -131,7 +124,6 @@ func TestComposeConciergeRuntimeConfig_RuntimeAgnostic(t *testing.T) {
 		{"openclaw", conciergePersonaPromptPath},
 		{"claude-code", ""},
 		{"codex", conciergePersonaPromptPath},
-		{"google-adk", conciergePersonaPromptPath},
 	}
 	for _, tc := range cases {
 		t.Run(tc.runtime, func(t *testing.T) {
@@ -204,7 +196,6 @@ func TestApplyConciergeProvisionConfig_ComposesRuntimeNativeConfigForEveryRuntim
 		{"openclaw", "minimax/MiniMax-M2.7"},
 		{"claude-code", "moonshot/kimi-k2.6"},
 		{"codex", "minimax/MiniMax-M2.7"},
-		{"google-adk", "platform:gemini-2.5-pro"},
 	}
 
 	for _, tc := range cases {

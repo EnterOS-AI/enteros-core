@@ -13,10 +13,10 @@ func TestParseTopLevelRuntime(t *testing.T) {
 		want string
 	}{
 		{"top-level claude-code", "name: x\nruntime: claude-code\ntier: 2\n", "claude-code"},
-		{"top-level google-adk", "runtime: google-adk\n", "google-adk"},
-		{"quoted value", `runtime: "google-adk"` + "\n", "google-adk"},
+		{"top-level hermes", "runtime: hermes\n", "hermes"},
+		{"quoted value", `runtime: "hermes"` + "\n", "hermes"},
 		{"single-quoted value", "runtime: 'codex'\n", "codex"},
-		{"ignores runtime_config nested model", "runtime: google-adk\nruntime_config:\n  model: vertex:gemini-2.5-pro\n", "google-adk"},
+		{"ignores runtime_config nested model", "runtime: hermes\nruntime_config:\n  model: minimax/MiniMax-M2.7\n", "hermes"},
 		{"runtime_config only, no top-level runtime", "name: y\nruntime_config:\n  model: x\n", ""},
 		{"indented runtime is not top-level", "wrapper:\n  runtime: claude-code\n", ""},
 		{"empty", "", ""},
@@ -34,9 +34,9 @@ func TestParseTopLevelRuntime(t *testing.T) {
 func TestSeededConfigRuntime(t *testing.T) {
 	// in-memory configFiles wins over template dir.
 	t.Run("from configFiles", func(t *testing.T) {
-		cf := map[string][]byte{"config.yaml": []byte("runtime: google-adk\n")}
-		if got := seededConfigRuntime("/nonexistent", cf); got != "google-adk" {
-			t.Fatalf("got %q, want google-adk", got)
+		cf := map[string][]byte{"config.yaml": []byte("runtime: hermes\n")}
+		if got := seededConfigRuntime("/nonexistent", cf); got != "hermes" {
+			t.Fatalf("got %q, want hermes", got)
 		}
 	})
 
@@ -63,16 +63,16 @@ func TestSeededConfigRuntime(t *testing.T) {
 }
 
 func TestRuntimeSeedMismatchAbort(t *testing.T) {
-	adkCfg := map[string][]byte{"config.yaml": []byte("runtime: google-adk\n")}
+	hermesCfg := map[string][]byte{"config.yaml": []byte("runtime: hermes\n")}
 	ccCfg := map[string][]byte{"config.yaml": []byte("name: Claude Code Agent\nruntime: claude-code\n")}
 
 	t.Run("mismatch fails loud (the #2027 demo bug)", func(t *testing.T) {
-		// requested google-adk, but seeding the claude-code-default config.
-		abort := runtimeSeedMismatchAbort("google-adk", "", ccCfg)
+		// requested hermes, but seeding the claude-code-default config.
+		abort := runtimeSeedMismatchAbort("hermes", "", ccCfg)
 		if abort == nil {
-			t.Fatal("expected abort for google-adk requested but claude-code seeded, got nil")
+			t.Fatal("expected abort for hermes requested but claude-code seeded, got nil")
 		}
-		if abort.Extra["requested_runtime"] != "google-adk" || abort.Extra["seeded_runtime"] != "claude-code" {
+		if abort.Extra["requested_runtime"] != "hermes" || abort.Extra["seeded_runtime"] != "claude-code" {
 			t.Fatalf("abort.Extra mismatch: %+v", abort.Extra)
 		}
 		if abort.Extra["issue"] != "2027" {
@@ -81,7 +81,7 @@ func TestRuntimeSeedMismatchAbort(t *testing.T) {
 	})
 
 	t.Run("match is allowed", func(t *testing.T) {
-		if abort := runtimeSeedMismatchAbort("google-adk", "", adkCfg); abort != nil {
+		if abort := runtimeSeedMismatchAbort("hermes", "", hermesCfg); abort != nil {
 			t.Fatalf("expected no abort when seeded runtime matches, got %q", abort.Msg)
 		}
 	})
@@ -93,7 +93,7 @@ func TestRuntimeSeedMismatchAbort(t *testing.T) {
 	})
 
 	t.Run("indeterminate seed is allowed (CP mode, no local config bytes)", func(t *testing.T) {
-		if abort := runtimeSeedMismatchAbort("google-adk", "", nil); abort != nil {
+		if abort := runtimeSeedMismatchAbort("hermes", "", nil); abort != nil {
 			t.Fatalf("expected no abort when seeded runtime is indeterminate, got %q", abort.Msg)
 		}
 	})

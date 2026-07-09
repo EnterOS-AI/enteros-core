@@ -210,56 +210,12 @@ func TestMatchesModelZeroValue(t *testing.T) {
 	}
 }
 
-// TestGoogleADKRuntimeRegistered locks the providers.yaml SSOT entry for the
-// google-adk runtime (Gemini via Vertex AI, keyless ADC). The runtime picker
-// + GET /templates enrichment read this matrix as SSOT; a missing entry
-// silently degrades the ADK runtime's model/provider surface. See
-// project_canvas_runtime_dropdown_ssot_fix.
-func TestGoogleADKRuntimeRegistered(t *testing.T) {
-	m, err := LoadManifest()
-	if err != nil {
-		t.Fatalf("LoadManifest() error = %v", err)
-	}
-	models, err := m.ModelsForRuntime("google-adk")
-	if err != nil {
-		t.Fatalf("ModelsForRuntime(google-adk) error = %v", err)
-	}
-	hasModel := false
-	for _, id := range models {
-		if id == "gemini-2.5-pro" {
-			hasModel = true
-		}
-	}
-	if !hasModel {
-		t.Errorf("google-adk models missing gemini-2.5-pro; got %v", models)
-	}
-	provs, err := m.ProvidersForRuntime("google-adk")
-	if err != nil {
-		t.Fatalf("ProvidersForRuntime(google-adk) error = %v", err)
-	}
-	hasProv := false
-	for _, p := range provs {
-		if p.Name == "google" {
-			hasProv = true
-		}
-	}
-	if !hasProv {
-		t.Errorf("google-adk providers missing google vendor; got %d providers", len(provs))
-	}
-}
-
 // TestVertexProviderRegistered locks the keyless Vertex provider variant in the
-// providers.yaml SSOT. google-adk serves platform-managed Gemini via the LLM
-// proxy -> Vertex AI with server-side WIF (no on-box key); the registry must
-// still model the keyless "vertex" provider (auth_env GOOGLE_APPLICATION_CREDENTIALS,
-// ^vertex: namespace) as a first-class entry distinct from the API-key "google"
-// vendor, so the proxy can still route/bill any Vertex-upstream request that
-// carries a `vertex:` id. The TRANSITIONAL `vertex:` arm on the google-adk
-// RUNTIME (the selectable model set) was removed in cp#514 now that templates
-// default to `platform:`; the runtime offers only the `platform` + API-key
-// `google` arms. A saved `vertex:gemini-*` model still RESOLVES harmlessly via
-// this standalone provider (it is just no longer offered as a new selection).
-// See project_canvas_runtime_dropdown_ssot_fix + cp#514.
+// providers.yaml SSOT. Vertex AI remains a provider/proxy concept even though
+// the google-adk runtime is retired: the registry must still model the keyless
+// "vertex" provider (auth_env GOOGLE_APPLICATION_CREDENTIALS, ^vertex:
+// namespace) as a first-class entry distinct from the API-key "google" vendor,
+// so proxy-side Vertex routing can stay explicit.
 func TestVertexProviderRegistered(t *testing.T) {
 	ps, err := Load()
 	if err != nil {
@@ -296,32 +252,8 @@ func TestVertexProviderRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadManifest() error = %v", err)
 	}
-	provs, err := m.ProvidersForRuntime("google-adk")
-	if err != nil {
-		t.Fatalf("ProvidersForRuntime(google-adk) error = %v", err)
-	}
-	names := map[string]bool{}
-	for _, p := range provs {
-		names[p.Name] = true
-	}
-	// cp#514: the transitional `vertex` arm was dropped from the google-adk
-	// runtime. The runtime keeps the platform-managed default + the API-key
-	// google arm; the standalone `vertex` PROVIDER (asserted above) survives
-	// for ^vertex: resolution but is no longer a selectable runtime arm.
-	if names["vertex"] {
-		t.Errorf("google-adk runtime should NOT offer the transitional vertex arm (removed cp#514); got %v", names)
-	}
-	if !names["platform"] {
-		t.Errorf("google-adk runtime should keep the platform-managed arm; got %v", names)
-	}
-	if !names["google"] {
-		t.Errorf("google-adk runtime should keep the API-key google arm; got %v", names)
-	}
-	models, _ := m.ModelsForRuntime("google-adk")
-	for _, id := range models {
-		if id == "vertex:gemini-2.5-pro" {
-			t.Errorf("google-adk models should NOT include vertex:gemini-2.5-pro (removed cp#514); got %v", models)
-		}
+	if _, err := m.ProvidersForRuntime("google-adk"); err == nil {
+		t.Fatal("retired google-adk runtime must not be present in the runtime matrix")
 	}
 }
 

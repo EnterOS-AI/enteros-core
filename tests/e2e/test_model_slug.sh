@@ -75,16 +75,6 @@ assert_eq "seo-agent + MiniMax key → bare MiniMax model (==claude-code)" "$got
 got=$(unset E2E_MODEL_SLUG E2E_MINIMAX_API_KEY; E2E_ANTHROPIC_API_KEY="sk-ant-test" pick_model_slug seo-agent)
 assert_eq "seo-agent + Anthropic key → Anthropic model (==claude-code)" "$got" "claude-sonnet-4-6"
 
-# ── google-adk (Gemini) ──
-# AI-Studio BYOK arm → bare gemini-2.5-pro (providers.yaml runtimes.google-adk
-# `google` arm). The platform/Vertex arm is selected via E2E_LLM_PATH=platform
-# (a platform: id), not this dispatch. Pin the bare form so a drift to the
-# platform id (which would change billing/route) is caught.
-run_test "google-adk → AI-Studio bare gemini id"                  google-adk  "gemini-2.5-pro"
-
-got=$(E2E_MODEL_SLUG="google_genai:gemini-2.5-pro" pick_model_slug google-adk)
-assert_eq "google-adk + E2E_MODEL_SLUG override (adapter spelling)" "$got" "google_genai:gemini-2.5-pro"
-
 # ── Fallback for unknown runtime ──
 # Picks slash-form (hermes-shaped) since hermes is the historical
 # default and most third-party runtimes behave hermes-like. Pinning

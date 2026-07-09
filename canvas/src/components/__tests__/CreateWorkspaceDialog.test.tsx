@@ -267,7 +267,6 @@ describe("CreateWorkspaceDialog", () => {
       "Hermes",
       "Claude Code",
       "OpenAI Codex CLI",
-      "Google ADK",
       "OpenClaw",
     ]);
     expect(runtimeTexts).not.toContain("SEO Agent");

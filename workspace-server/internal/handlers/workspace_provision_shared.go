@@ -329,7 +329,7 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	// runtime's workspace template wasn't in the tenant cache at provision time
 	// (or sanitizeRuntime coerced an unknown runtime), seeding silently fell
 	// back to the claude-code-default template: the image+env said e.g.
-	// google-adk but the seeded config said claude-code, so the agent booted
+	// hermes but the seeded config said claude-code, so the agent booted
 	// mislabeled and personaless yet looked 'online' and returned canned
 	// non-answers. Refusing loudly turns that silent wrong-agent into a visible
 	// WORKSPACE_PROVISION_FAILED the operator can act on.

@@ -72,10 +72,9 @@ const RUNTIME_OPTIONS = [
   { value: "hermes", label: "Hermes" },
   { value: "claude-code", label: "Claude Code" },
   { value: "codex", label: "OpenAI Codex CLI" },
-  { value: "google-adk", label: "Google ADK" },
   { value: "openclaw", label: "OpenClaw" },
 ];
-const BASE_RUNTIME_TEMPLATE_IDS = new Set(["claude-code-default", "codex", "google-adk", "hermes", "openclaw"]);
+const BASE_RUNTIME_TEMPLATE_IDS = new Set(["claude-code-default", "codex", "hermes", "openclaw"]);
 const DEFAULT_HEADLESS_ROOT_GB = 30;
 const DEFAULT_DISPLAY_ROOT_GB = 80;
 
