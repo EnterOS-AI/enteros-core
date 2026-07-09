@@ -42,6 +42,8 @@ func TestIsForbiddenTenantEnvKey_ExactMatches(t *testing.T) {
 		// Control-plane admin tokens.
 		{"CP_ADMIN_API_TOKEN", true},
 		{"CP_ADMIN_TOKEN", true},
+		{"ADMIN_TOKEN", true},
+		{"MOLECULE_ADMIN_TOKEN", true},
 
 		// Control-plane shared/provision + encryption + source + cloud
 		// secrets (security-audit M5/H1/C2/H2/L1/H8). The systemic break the

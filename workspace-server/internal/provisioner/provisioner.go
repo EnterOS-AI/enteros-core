@@ -1012,6 +1012,18 @@ func isSCMWriteTokenKey(key string) bool {
 	return ok
 }
 
+var privilegedWorkspaceEnvKeys = map[string]struct{}{
+	"ADMIN_TOKEN":          {},
+	"MOLECULE_ADMIN_TOKEN": {},
+	"CP_ADMIN_API_TOKEN":   {},
+	"CP_ADMIN_TOKEN":       {},
+}
+
+func isPrivilegedWorkspaceEnvKey(key string) bool {
+	_, ok := privilegedWorkspaceEnvKeys[key]
+	return ok
+}
+
 // buildContainerEnv assembles the initial environment variables injected
 // into every workspace container.
 //
@@ -1048,6 +1060,10 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 	// when a user explicitly sets them we preserve the value.
 	var explicitGHToken, explicitGitHubToken string
 	for k, v := range cfg.EnvVars {
+		if isPrivilegedWorkspaceEnvKey(k) {
+			log.Printf("buildContainerEnv: dropped privileged credential %q from workspace env", k)
+			continue
+		}
 		if k == "GH_TOKEN" {
 			explicitGHToken = v
 			continue
@@ -1085,12 +1101,6 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", explicitGitHubToken))
 	} else if pat, hasPAT := cfg.EnvVars["GH_PAT"]; hasPAT && pat != "" {
 		env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", pat))
-	}
-	// Inject ADMIN_TOKEN from the platform server's environment so workspace
-	// containers can call /admin/liveness and other admin-gated endpoints
-	// (core#831). cp_provisioner.go handles this separately for SaaS tenants.
-	if adminToken := os.Getenv("ADMIN_TOKEN"); adminToken != "" {
-		env = append(env, fmt.Sprintf("ADMIN_TOKEN=%s", adminToken))
 	}
 	return env
 }

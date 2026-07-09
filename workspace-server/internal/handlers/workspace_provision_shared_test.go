@@ -33,6 +33,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/pkg/provisionhook"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
@@ -44,6 +45,19 @@ import (
 // Add an entry only with a one-line justification.
 var provisionExemptFunctions = map[string]string{
 	"provisionWorkspace": "thin wrapper that delegates to provisionWorkspaceOpts; the delegate mints",
+}
+
+type testEnvMutator struct {
+	name  string
+	key   string
+	value string
+}
+
+func (m testEnvMutator) Name() string { return m.name }
+
+func (m testEnvMutator) MutateEnv(_ context.Context, _ string, env map[string]string) error {
+	env[m.key] = m.value
+	return nil
 }
 
 // TestProvisionFunctions_AllCallMintWorkspaceSecrets asserts every
@@ -1739,5 +1753,43 @@ func TestPrepareProvisionContext_NoModelFailsClosed(t *testing.T) {
 	}
 	if code, _ := abort.Extra["code"].(string); code != "MISSING_MODEL" {
 		t.Fatalf("abort.Extra[code] = %v, want MISSING_MODEL", abort.Extra["code"])
+	}
+}
+
+func TestPrepareProvisionContext_LatePrivilegedAdminEnvFailsClosed(t *testing.T) {
+	const wsID = "ws-late-admin-token"
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "platform-proxy-token")
+
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+
+	reg := provisionhook.NewRegistry()
+	reg.Register(testEnvMutator{name: "late-admin-token", key: "ADMIN_TOKEN", value: "must-not-reach-runtime"})
+
+	handler := NewWorkspaceHandler(&captureBroadcaster{}, nil, "http://localhost:8080", t.TempDir())
+	handler.SetEnvMutators(reg)
+	payload := models.CreateWorkspacePayload{
+		Name:    "late-admin-token",
+		Runtime: "claude-code",
+		Model:   "platform/kimi-k2.6",
+		Tier:    1,
+	}
+	prepared, abort := handler.prepareProvisionContext(
+		context.Background(), wsID, "/nonexistent", nil, payload, false)
+
+	if abort == nil {
+		t.Fatalf("expected final privileged env abort, got success (prepared=%v)", prepared)
+	}
+	if got, _ := abort.Extra["source"].(string); got != "final_env" {
+		t.Fatalf("abort source = %v, want final_env", abort.Extra["source"])
+	}
+	keys, _ := abort.Extra["forbidden_env_keys"].([]string)
+	if len(keys) != 1 || keys[0] != "ADMIN_TOKEN" {
+		t.Fatalf("forbidden keys = %#v, want [ADMIN_TOKEN]", abort.Extra["forbidden_env_keys"])
 	}
 }

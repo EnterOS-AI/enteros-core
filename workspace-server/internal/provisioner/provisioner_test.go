@@ -898,6 +898,27 @@ func TestCPProvisionerEnv_StripsSCMWriteTokens(t *testing.T) {
 	}
 }
 
+func TestBuildContainerEnv_DoesNotInjectAdminToken(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "tenant-admin-secret")
+	cfg := WorkspaceConfig{
+		WorkspaceID:  "ws-local",
+		PlatformURL:  "http://platform:8080",
+		Runtime:      "claude-code",
+		EnvVars:      map[string]string{"ADMIN_TOKEN": "caller-admin", "MOLECULE_ADMIN_TOKEN": "caller-admin-2", "CUSTOM": "ok"},
+		TemplatePath: t.TempDir(),
+	}
+	got := buildContainerEnv(cfg)
+	if envContainsPrefix(got, "ADMIN_TOKEN=") {
+		t.Fatalf("ADMIN_TOKEN leaked into local workspace container env: %v", got)
+	}
+	if envContainsPrefix(got, "MOLECULE_ADMIN_TOKEN=") {
+		t.Fatalf("MOLECULE_ADMIN_TOKEN leaked into local workspace container env: %v", got)
+	}
+	if !envContains(got, "CUSTOM=ok") {
+		t.Fatalf("expected ordinary env vars to pass through: %v", got)
+	}
+}
+
 // TestBuildCPTenantEnv_ForensicGuardProvenance pins the forensic #145
 // provenance-aware guard on the tenant-EC2 path (CPProvisioner.Start →
 // buildCPTenantEnv). The guard strips SCM-write tokens UNLESS they are
@@ -983,9 +1004,7 @@ func TestBuildCPTenantEnv_ForensicGuardProvenance(t *testing.T) {
 				EnvVars:             tt.envVars,
 				WorkspaceSecretKeys: tt.workspaceKeys,
 			}
-			// adminToken empty so the guard's behaviour is isolated; ADMIN_TOKEN
-			// injection is covered separately below.
-			got := buildCPTenantEnv(cfg, "")
+			got := buildCPTenantEnv(cfg)
 
 			for _, k := range tt.wantStrippedKeys {
 				if v, ok := got[k]; ok {
@@ -1001,19 +1020,31 @@ func TestBuildCPTenantEnv_ForensicGuardProvenance(t *testing.T) {
 	}
 }
 
-// TestBuildCPTenantEnv_AdminTokenInjected asserts ADMIN_TOKEN is injected when
-// the provisioner carries one, and is never subject to the SCM-write strip.
-func TestBuildCPTenantEnv_AdminTokenInjected(t *testing.T) {
+// TestBuildCPTenantEnv_DoesNotInjectAdminToken asserts the tenant admin bearer
+// remains CP request authentication only; it must not be copied into the
+// workspace container env.
+func TestBuildCPTenantEnv_DoesNotInjectAdminToken(t *testing.T) {
 	cfg := WorkspaceConfig{
 		WorkspaceID: "ws-tenant",
-		EnvVars:     map[string]string{"GITEA_TOKEN": "stripme"},
+		EnvVars: map[string]string{
+			"ADMIN_TOKEN":          "caller-admin",
+			"MOLECULE_ADMIN_TOKEN": "caller-admin-2",
+			"GITEA_TOKEN":          "stripme",
+			"CUSTOM":               "ok",
+		},
 	}
-	got := buildCPTenantEnv(cfg, "admin-secret")
-	if got["ADMIN_TOKEN"] != "admin-secret" {
-		t.Errorf("ADMIN_TOKEN = %q; want admin-secret", got["ADMIN_TOKEN"])
+	got := buildCPTenantEnv(cfg)
+	if _, ok := got["ADMIN_TOKEN"]; ok {
+		t.Errorf("ADMIN_TOKEN leaked into tenant workspace env: %v", got)
+	}
+	if _, ok := got["MOLECULE_ADMIN_TOKEN"]; ok {
+		t.Errorf("MOLECULE_ADMIN_TOKEN leaked into tenant workspace env: %v", got)
 	}
 	if _, ok := got["GITEA_TOKEN"]; ok {
-		t.Errorf("GITEA_TOKEN must still be stripped alongside ADMIN_TOKEN injection")
+		t.Errorf("GITEA_TOKEN must still be stripped")
+	}
+	if got["CUSTOM"] != "ok" {
+		t.Errorf("ordinary env var CUSTOM = %q, want ok", got["CUSTOM"])
 	}
 }
 
@@ -1135,6 +1166,15 @@ func assertNoSCMWriteToken(t *testing.T, env []string, scmTokens []string) {
 func envContains(env []string, want string) bool {
 	for _, e := range env {
 		if e == want {
+			return true
+		}
+	}
+	return false
+}
+
+func envContainsPrefix(env []string, prefix string) bool {
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
 			return true
 		}
 	}
