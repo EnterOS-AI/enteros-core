@@ -23,6 +23,23 @@ The platform uses the caller identity to enforce hierarchy-based access rules.
 
 ## Breaking Changes
 
+### Infrastructure PATCH authorization (2026-07-09)
+
+`PATCH /workspaces/:id` distinguishes cosmetic self-maintenance from changes to
+the infrastructure that contains an agent:
+
+| Fields | Accepted credential |
+|---|---|
+| `name`, `role`, `x`, `y`, `collapsed` | Workspace bearer, org token, `ADMIN_TOKEN`, or verified control-plane session |
+| `tier`, `parent_id`, `runtime`, `workspace_dir`, `compute` | `ADMIN_TOKEN` or verified control-plane session only |
+
+An unauthorized infrastructure PATCH is rejected as a whole before validation
+or database work with HTTP `403` and code
+`WORKSPACE_INFRASTRUCTURE_AUTH_REQUIRED`. Callers must not retry it with a
+workspace or org token. This prevents an agent from promoting itself to a
+host-privileged tier or changing its runtime, host mount, topology, or compute
+backend.
+
 ### PR #701 — Input validation, route auth, UUID safety (2026-04-17)
 
 **Affects:** `PATCH /workspaces/:id`, `GET /workspaces/:id`, `DELETE /workspaces/:id`, `GET /templates`, `GET /org/templates`
@@ -66,7 +83,7 @@ Violations return `400 Bad Request` with `{ "error": "<field> must be at most N 
 | `POST` | `/workspaces` | Create and provision a workspace |
 | `GET` | `/workspaces` | List workspaces with inline canvas layout data |
 | `GET` | `/workspaces/:id` | Get one workspace |
-| `PATCH` | `/workspaces/:id` | Update workspace fields. **Requires workspace bearer token (WorkspaceAuth).** Validates `name` (≤255), `role` (≤1000), `model`/`runtime` (≤100 chars); `name` and `role` reject newlines and YAML-special chars (`{}[]|>*&!`). `:id` must be a valid UUID. See [Breaking Changes](#breaking-changes). |
+| `PATCH` | `/workspaces/:id` | Update workspace fields. **Requires `WorkspaceAuth`.** Workspace bearers are limited to cosmetic fields; infrastructure fields require `ADMIN_TOKEN` or a verified control-plane session. Validates `name` (≤255), `role` (≤1000), `model`/`runtime` (≤100 chars); `name` and `role` reject newlines and YAML-special chars (`{}[]|>*&!`). `:id` must be a valid UUID. See [Breaking Changes](#breaking-changes). |
 | `DELETE` | `/workspaces/:id` | Remove workspace |
 | `POST` | `/workspaces/:id/restart` | Restart workspace (reads runtime from container config.yaml before stop — detects runtime changes) |
 | `POST` | `/workspaces/:id/pause` | Pause workspace |

@@ -128,6 +128,21 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		return
 	}
 
+	// Workspace bearers are deliberately allowed to maintain cosmetic state,
+	// but they must never rewrite the infrastructure that contains them. In
+	// particular, tier=4 enables host PID/network access and the Docker socket
+	// on the next provision. Require a human control-plane session or the
+	// tenant's ADMIN_TOKEN for every infrastructure field, and reject a mixed
+	// request as a whole before validation or database work.
+	if fields := workspaceInfrastructurePatchFields(body); len(fields) > 0 && !callerCanEditWorkspaceInfrastructure(c) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":  "workspace infrastructure fields require admin or verified control-plane authentication",
+			"code":   "WORKSPACE_INFRASTRUCTURE_AUTH_REQUIRED",
+			"fields": fields,
+		})
+		return
+	}
+
 	// #685/#688: validate string fields for length and injection safety.
 	strField := func(key string) string {
 		if v, ok := body[key]; ok {
@@ -199,9 +214,8 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Auth is fully enforced at the router layer (WorkspaceAuth middleware, #680).
-	// WorkspaceAuth validates that the caller holds a valid bearer token for this
-	// specific workspace — no additional auth gate is needed here.
+	// Authentication is enforced at the router layer. Field-level authorization
+	// above narrows workspace bearers to cosmetic self-updates.
 
 	// #120: guard — return 404 for nonexistent workspace IDs instead of
 	// silently applying zero-row UPDATEs and returning 200.
@@ -497,6 +511,21 @@ func (h *WorkspaceHandler) Update(c *gin.Context) {
 		resp["model"] = resetModel
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+func workspaceInfrastructurePatchFields(body map[string]interface{}) []string {
+	fields := make([]string, 0, 5)
+	for _, field := range []string{"tier", "parent_id", "runtime", "workspace_dir", "compute"} {
+		if _, ok := body[field]; ok {
+			fields = append(fields, field)
+		}
+	}
+	return fields
+}
+
+func callerCanEditWorkspaceInfrastructure(c *gin.Context) bool {
+	credentialClass := c.GetString("caller_credential_class")
+	return credentialClass == "admin-token" || credentialClass == "cp-session"
 }
 
 // validateWorkspaceDir checks that a workspace_dir path is safe to bind-mount.
