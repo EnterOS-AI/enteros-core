@@ -477,9 +477,13 @@ func (h *PluginsHandler) deliverToContainer(ctx context.Context, workspaceID str
 // a restart was scheduled. recordDeclaredPlugin no-ops when the DB is unset (unit
 // tests) and enforces the privileged-plugin kind gate (a user can't declare the
 // platform MCP on a non-platform workspace).
-func (h *PluginsHandler) reMaterialize(ctx context.Context, workspaceID, pluginName, source string) (bool, error) {
+func (h *PluginsHandler) reMaterialize(ctx context.Context, workspaceID, pluginName, source string, suppressRestart bool) (bool, error) {
 	if err := recordDeclaredPlugin(ctx, workspaceID, pluginName, source); err != nil {
 		return false, err
+	}
+	if suppressRestart {
+		log.Printf("Plugin install (pull): %s → workspace %s — restart suppressed by caller (restart=false); boot-install picks it up on the next reprovision", pluginName, workspaceID)
+		return false, nil
 	}
 	if h.restartFunc != nil {
 		wsID := workspaceID

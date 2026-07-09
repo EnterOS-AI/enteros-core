@@ -209,6 +209,83 @@ func TestApplyTierConfig_Tier1_NoGlobalPlugins(t *testing.T) {
 	}
 }
 
+func TestBuildContainerEnv_LangfusePassthrough(t *testing.T) {
+	has := func(env []string, want string) bool {
+		for _, e := range env {
+			if e == want {
+				return true
+			}
+		}
+		return false
+	}
+	hasKey := func(env []string, prefix string) bool {
+		for _, e := range env {
+			if len(e) >= len(prefix) && e[:len(prefix)] == prefix {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("injects langfuse into the agent with the docker-network host", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		env := buildContainerEnv(WorkspaceConfig{WorkspaceID: "x", Runtime: "claude-code"})
+		if !has(env, "LANGFUSE_PUBLIC_KEY=pk-lf-test") || !has(env, "LANGFUSE_SECRET_KEY=sk-lf-test") {
+			t.Errorf("langfuse keys not injected: %v", env)
+		}
+		// Agent must reach langfuse over the docker net, NOT the platform host URL.
+		if !has(env, "LANGFUSE_HOST=http://langfuse-web:3000") {
+			t.Errorf("expected container-network LANGFUSE_HOST, got %v", env)
+		}
+	})
+
+	t.Run("no-op when platform has no langfuse keys", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "")
+		t.Setenv("LANGFUSE_SECRET_KEY", "")
+		env := buildContainerEnv(WorkspaceConfig{WorkspaceID: "x", Runtime: "claude-code"})
+		if hasKey(env, "LANGFUSE_") {
+			t.Errorf("expected no LANGFUSE_* when keys unset, got %v", env)
+		}
+	})
+
+	t.Run("workspace-secret LANGFUSE_HOST override wins", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+		env := buildContainerEnv(WorkspaceConfig{
+			WorkspaceID: "x", Runtime: "claude-code",
+			EnvVars: map[string]string{"LANGFUSE_HOST": "http://custom:3000"},
+		})
+		if !has(env, "LANGFUSE_HOST=http://custom:3000") {
+			t.Errorf("workspace override should win, got %v", env)
+		}
+		if has(env, "LANGFUSE_HOST=http://langfuse-web:3000") {
+			t.Errorf("passthrough must not also add the default host when overridden: %v", env)
+		}
+		if !has(env, "LANGFUSE_PUBLIC_KEY=pk-lf-test") || !has(env, "LANGFUSE_SECRET_KEY=sk-lf-test") {
+			t.Errorf("platform keys should still be injected when only LANGFUSE_HOST is overridden: %v", env)
+		}
+	})
+
+	t.Run("workspace-secret langfuse keys win over platform keys", func(t *testing.T) {
+		t.Setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-platform")
+		t.Setenv("LANGFUSE_SECRET_KEY", "sk-lf-platform")
+		env := buildContainerEnv(WorkspaceConfig{
+			WorkspaceID: "x", Runtime: "claude-code",
+			EnvVars: map[string]string{
+				"LANGFUSE_PUBLIC_KEY": "pk-lf-workspace",
+				"LANGFUSE_SECRET_KEY": "sk-lf-workspace",
+			},
+		})
+		if !has(env, "LANGFUSE_PUBLIC_KEY=pk-lf-workspace") || !has(env, "LANGFUSE_SECRET_KEY=sk-lf-workspace") {
+			t.Errorf("workspace langfuse keys missing: %v", env)
+		}
+		if has(env, "LANGFUSE_PUBLIC_KEY=pk-lf-platform") || has(env, "LANGFUSE_SECRET_KEY=sk-lf-platform") {
+			t.Errorf("platform keys should not override workspace langfuse keys: %v", env)
+		}
+	})
+}
+
 func TestApplyTierConfig_Tier2_Standard(t *testing.T) {
 	configMount := "ws-abc123-configs:/configs"
 	hc := baseHostConfig("")

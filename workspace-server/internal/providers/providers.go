@@ -16,10 +16,10 @@
 package providers
 
 import (
-	_ "embed"
 	"fmt"
 	"regexp"
 
+	"go.moleculesai.app/sdk/gen/go/llmregistry"
 	"gopkg.in/yaml.v3"
 )
 
@@ -38,8 +38,13 @@ const schemaVersion = 1
 // external conformance tooling read the same constant the loader enforces.
 func SchemaVersion() int { return schemaVersion }
 
-//go:embed providers.yaml
-var embeddedYAML []byte
+// embeddedYAML is the canonical provider/model/runtime registry, sourced from
+// the SDK SSOT (go.moleculesai.app/sdk/gen/go/llmregistry, embedded from
+// contracts/llm-registry/llm-registry.yaml). Core no longer keeps its own
+// providers.yaml copy — it DERIVES the registry from the SDK. The parse +
+// validation + RFC #340 native-matrix checks below are unchanged; only the
+// byte SOURCE moved to the single SSOT.
+var embeddedYAML = llmregistry.RawYAML
 
 // Protocol is the wire format the proxy speaks to a provider's upstream.
 type Protocol string
@@ -133,6 +138,11 @@ type RuntimeProviderRef struct {
 
 // RuntimeNativeSet is the native provider+model matrix for a single runtime.
 type RuntimeNativeSet struct {
+	// DisplayName is the human label for this runtime in the canvas runtime
+	// picker (e.g. "Claude Code", "OpenClaw"). SSOT for the runtime's label so
+	// the onboarding scene never has to borrow a template's name. Optional:
+	// callers fall back to the runtime key when empty.
+	DisplayName string `yaml:"display_name"`
 	// Providers is the runtime's native provider set (each with its exact
 	// model ids). Exactly the set the canvas may offer and the proxy may
 	// route for this runtime — no more, no fewer.

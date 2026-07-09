@@ -24,6 +24,20 @@ services:
       NEXTAUTH_SECRET: ${LANGFUSE_SECRET:-changeme-langfuse-secret}
       NEXTAUTH_URL: http://localhost:3001
       SALT: ${LANGFUSE_SALT:-changeme-langfuse-salt}
+      TELEMETRY_ENABLED: "false"
+      # Headless bootstrap (langfuse v2): seed a deterministic org/project/user
+      # + API keys on first boot so local dev needs no interactive signup. The
+      # same keys are wired to the agent (producer) and the platform /traces
+      # proxy (reader) by dev-start.sh. Override via env if desired.
+      LANGFUSE_INIT_ORG_ID: molecule
+      LANGFUSE_INIT_ORG_NAME: Molecule
+      LANGFUSE_INIT_PROJECT_ID: molecule-local
+      LANGFUSE_INIT_PROJECT_NAME: "Molecule Local"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-pk-lf-0000000000000000000000000000000000000001}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-sk-lf-0000000000000000000000000000000000000002}
+      LANGFUSE_INIT_USER_EMAIL: dev@molecule.local
+      LANGFUSE_INIT_USER_NAME: Dev
+      LANGFUSE_INIT_USER_PASSWORD: dev-langfuse-pw
     ports:
       - "3001:3000"
     networks:

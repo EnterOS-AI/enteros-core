@@ -41,6 +41,9 @@ cleanup() {
     # --volumes here only if you want a clean slate (we don't, since
     # idempotent re-runs are the usual case).
     docker compose -f "$ROOT/docker-compose.infra.yml" down 2>/dev/null || true
+    # Langfuse runs via `docker run` (not compose — network-ownership conflict),
+    # so `compose down` misses it; remove it explicitly or it lingers.
+    docker rm -f molecule-core-langfuse-1 2>/dev/null || true
     echo "    Done."
 }
 trap cleanup EXIT INT TERM
@@ -122,6 +125,111 @@ set +a
 # the browser authenticates. Exported for the `npm run dev` child below.
 export NEXT_PUBLIC_ADMIN_TOKEN="$ADMIN_TOKEN"
 
+# ─────────────────────────────────────────── dynamic host ports (no hijack)
+#
+# A FIXED host port is a landmine on a dev's own machine. If they already run
+# Postgres/Redis on the conventional port, publishing our container there does
+# NOT fail — Docker's wildcard bind coexists with their service, and our app,
+# connecting to `localhost:<port>`, silently lands on THEIR Postgres (their
+# private DB) instead of ours. No error, just wrong — and possibly written-to —
+# data. (On macOS it's worse: `localhost` resolves to ::1 first, so even a
+# v6-only local Postgres wins.)
+#
+# So we allocate a free host port PER published service — preferring the
+# conventional port when it is genuinely free on BOTH IPv4 and IPv6, else an
+# OS-assigned ephemeral port — publish Docker there, and build every
+# connection URL from the chosen port using 127.0.0.1 (never `localhost`).
+# dev-start.sh OWNS these URLs for the local stack; export any of the
+# MOLECULE_*_HOST_PORT vars (or a non-local DATABASE_URL/REDIS_URL) yourself to
+# override.
+pick_port() {
+    # $1 = preferred port. Echoes it when free on IPv4 AND IPv6, else a free
+    # ephemeral port. Degrades to the preferred port if python3 is absent.
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$1" <<'PY'
+import socket, sys
+pref = int(sys.argv[1])
+def free(port):
+    for fam, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        try:
+            s.bind((addr, port))
+        except OSError:
+            s.close()
+            return False
+        s.close()
+    return True
+if free(pref):
+    print(pref)
+else:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    print(s.getsockname()[1])
+    s.close()
+PY
+    else
+        echo "$1"
+    fi
+}
+
+MOLECULE_PG_HOST_PORT=${MOLECULE_PG_HOST_PORT:-$(pick_port 5432)}
+MOLECULE_REDIS_HOST_PORT=${MOLECULE_REDIS_HOST_PORT:-$(pick_port 6379)}
+MOLECULE_TEMPORAL_HOST_PORT=${MOLECULE_TEMPORAL_HOST_PORT:-$(pick_port 7233)}
+MOLECULE_TEMPORAL_UI_HOST_PORT=${MOLECULE_TEMPORAL_UI_HOST_PORT:-$(pick_port 8233)}
+PLATFORM_PORT=$(pick_port 8080)
+CANVAS_PORT=$(pick_port 3000)
+export MOLECULE_PG_HOST_PORT MOLECULE_REDIS_HOST_PORT \
+       MOLECULE_TEMPORAL_HOST_PORT MOLECULE_TEMPORAL_UI_HOST_PORT
+
+# App→infra connection URLs. Override empty OR the conventional-localhost
+# defaults (the .env.example landmine); respect a deliberate remote URL.
+case "${DATABASE_URL:-}" in
+    ""|*localhost:5432*|*127.0.0.1:5432*)
+        export DATABASE_URL="postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@127.0.0.1:${MOLECULE_PG_HOST_PORT}/${POSTGRES_DB:-molecule}?sslmode=disable"
+        ;;
+esac
+case "${REDIS_URL:-}" in
+    ""|*localhost:6379*|*127.0.0.1:6379*)
+        export REDIS_URL="redis://127.0.0.1:${MOLECULE_REDIS_HOST_PORT}"
+        ;;
+esac
+
+# Platform listen port + the canvas's cross-origin view of it. The canvas
+# talks to the platform from the browser, so CORS must allow the canvas
+# origin and the browser needs the platform's real port (both dynamic).
+export NEXT_PUBLIC_PLATFORM_URL="http://127.0.0.1:${PLATFORM_PORT}"
+export NEXT_PUBLIC_WS_URL="ws://127.0.0.1:${PLATFORM_PORT}/ws"
+export CORS_ORIGINS="http://localhost:${CANVAS_PORT},http://127.0.0.1:${CANVAS_PORT}"
+
+# Agent A2A reachability (macOS): the provisioner publishes each agent
+# container's port on 127.0.0.1 (IPv4). Its default advertise host is
+# "localhost", which macOS resolves to ::1 (IPv6) FIRST — so the host-run
+# platform's A2A proxy dials [::1]:<port> and gets connection-refused (502 on
+# chat). Pin the advertise host to 127.0.0.1 so the proxy hits the IPv4 port
+# the container actually publishes. Port stays dynamic; only the host is fixed.
+export MOLECULE_WORKSPACE_ADVERTISE_HOST=127.0.0.1
+
+echo "==> Host ports (dynamic — conventional when free, else ephemeral):"
+echo "    Postgres   127.0.0.1:${MOLECULE_PG_HOST_PORT}"
+echo "    Redis      127.0.0.1:${MOLECULE_REDIS_HOST_PORT}"
+echo "    Temporal   127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT} (gRPC) / ${MOLECULE_TEMPORAL_UI_HOST_PORT} (UI)"
+echo "    Platform   ${NEXT_PUBLIC_PLATFORM_URL}"
+echo "    Canvas     http://127.0.0.1:${CANVAS_PORT}"
+
+# ─────────────────────────────────────────── LLM tracing (Langfuse)
+# Langfuse is the trace SINK. The platform's /traces proxy READS it (host URL,
+# dynamic port); the shared runtime PRODUCES traces and reaches it over the
+# Docker network (container URL, stable). Deterministic seeded keys (see the
+# langfuse container bootstrap after setup.sh). Keys in the platform env make
+# buildContainerEnv inject them into every agent (SSOT producer wiring).
+MOLECULE_LANGFUSE_HOST_PORT=${MOLECULE_LANGFUSE_HOST_PORT:-$(pick_port 3001)}
+export MOLECULE_LANGFUSE_HOST_PORT
+export LANGFUSE_PUBLIC_KEY="${LANGFUSE_PUBLIC_KEY:-pk-lf-0000000000000000000000000000000000000001}"
+export LANGFUSE_SECRET_KEY="${LANGFUSE_SECRET_KEY:-sk-lf-0000000000000000000000000000000000000002}"
+export LANGFUSE_HOST="http://127.0.0.1:${MOLECULE_LANGFUSE_HOST_PORT}"          # platform reader (host)
+export MOLECULE_WORKSPACE_LANGFUSE_HOST="http://langfuse-web:3000"             # agent producer (docker net)
+echo "    Langfuse   ${LANGFUSE_HOST}  (traces UI + platform /traces proxy)"
+
 # ─────────────────────────────────────────────── 2. infra + templates
 
 # Use setup.sh (not raw docker-compose) so the template registry gets
@@ -130,6 +238,34 @@ export NEXT_PUBLIC_ADMIN_TOKEN="$ADMIN_TOKEN"
 # the friction this script exists to eliminate.
 echo "==> Running infra/scripts/setup.sh (infra + template registry)"
 "$ROOT/infra/scripts/setup.sh"
+
+# ─────────────────────────────────────────── Langfuse web (trace UI + API)
+# setup.sh brings up the Langfuse deps (clickhouse + langfuse-db-init) but NOT
+# the web app (it lives in docker-compose.yml, whose network ownership
+# conflicts with infra's external net). Run it directly on molecule-core-net
+# with a `langfuse-web` alias so agents resolve it, seeded with a deterministic
+# project + keys. clickhouse password mirrors docker-compose.infra.yml's
+# ${CLICKHOUSE_PASSWORD:-langfuse-dev}; the migration URL embeds it.
+echo "==> Starting Langfuse (trace UI on :${MOLECULE_LANGFUSE_HOST_PORT})"
+docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
+docker run -d --name molecule-core-langfuse-1 --network molecule-core-net \
+  --network-alias langfuse-web -p "${MOLECULE_LANGFUSE_HOST_PORT}:3000" \
+  -e DATABASE_URL="postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@postgres:5432/langfuse" \
+  -e CLICKHOUSE_URL="http://langfuse-clickhouse:8123" \
+  -e CLICKHOUSE_MIGRATION_URL="clickhouse://langfuse:${CLICKHOUSE_PASSWORD:-langfuse-dev}@langfuse-clickhouse:9000" \
+  -e CLICKHOUSE_USER="langfuse" -e CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-langfuse-dev}" \
+  -e NEXTAUTH_SECRET="${LANGFUSE_SECRET:-changeme-langfuse-secret}" \
+  -e NEXTAUTH_URL="${LANGFUSE_HOST}" -e SALT="${LANGFUSE_SALT:-changeme-langfuse-salt}" \
+  -e TELEMETRY_ENABLED="false" \
+  -e LANGFUSE_INIT_ORG_ID="molecule" -e LANGFUSE_INIT_ORG_NAME="Molecule" \
+  -e LANGFUSE_INIT_PROJECT_ID="molecule-local" -e LANGFUSE_INIT_PROJECT_NAME="Molecule Local" \
+  -e LANGFUSE_INIT_PROJECT_PUBLIC_KEY="${LANGFUSE_PUBLIC_KEY}" \
+  -e LANGFUSE_INIT_PROJECT_SECRET_KEY="${LANGFUSE_SECRET_KEY}" \
+  -e LANGFUSE_INIT_USER_EMAIL="dev@molecule.local" -e LANGFUSE_INIT_USER_NAME="Dev" \
+  -e LANGFUSE_INIT_USER_PASSWORD="dev-langfuse-pw" \
+  langfuse/langfuse@sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d >/dev/null 2>&1 \
+  && echo "    Langfuse container started (first boot ~15-30s)" \
+  || echo "    ✗ Langfuse failed to start (tracing UI unavailable; agents fail-open)"
 
 # ─────────────────────────────────────────────── 3. platform
 #
@@ -149,9 +285,10 @@ echo "==> Running infra/scripts/setup.sh (infra + template registry)"
 # (fallback) or fail loud with explicit install guidance.
 
 if command -v go >/dev/null 2>&1; then
-    echo "==> Starting Platform (Go :8080)"
+    echo "==> Starting Platform (Go :${PLATFORM_PORT})"
     cd "$ROOT/workspace-server"
-    go run ./cmd/server > /tmp/molecule-platform.log 2>&1 &
+    # PORT inline (not exported) so the canvas child below doesn't inherit it.
+    PORT="$PLATFORM_PORT" go run ./cmd/server > /tmp/molecule-platform.log 2>&1 &
     PLATFORM_PID=$!
 else
     echo "==> Go not found on PATH — falling back to docker-compose platform service"
@@ -159,8 +296,11 @@ else
     cd "$ROOT"
     # Bring up just the platform service from docker-compose.yml. infra/setup.sh
     # already brought up postgres+redis+etc on docker-compose.infra.yml; this
-    # adds the platform container on top, mapped to :8080 so the rest of this
-    # script's wait-for-/health loop works unchanged.
+    # adds the platform container on top. docker-compose.yml already reads
+    # dynamic ports via ${PLATFORM_PUBLISH_PORT}/${PLATFORM_PORT}; publish the
+    # container on the same dynamic host port we chose above so the
+    # wait-for-/health loop (127.0.0.1:$PLATFORM_PORT) matches.
+    export PLATFORM_PORT PLATFORM_PUBLISH_PORT="$PLATFORM_PORT"
     docker compose up -d --build platform > /tmp/molecule-platform.log 2>&1 || {
         echo "    ✗ docker compose up platform failed — see /tmp/molecule-platform.log"
         echo "    Either install Go 1.25+ (https://go.dev/dl/) and rerun, or fix the docker fallback."
@@ -174,7 +314,7 @@ echo "    Waiting for Platform /health..."
 PLATFORM_READY=0
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
          21 22 23 24 25 26 27 28 29 30; do
-    if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
+    if curl -sf "http://127.0.0.1:${PLATFORM_PORT}/health" >/dev/null 2>&1; then
         echo "    Platform ready (t+${i}s)"
         PLATFORM_READY=1
         break
@@ -188,20 +328,23 @@ fi
 
 # ─────────────────────────────────────────────── 4. canvas
 
-echo "==> Starting Canvas (Next.js :3000)"
+echo "==> Starting Canvas (Next.js :${CANVAS_PORT})"
 cd "$ROOT/canvas"
 if [ ! -d node_modules ]; then
     echo "    First-run: npm install (~30-60s)"
     npm install
 fi
-npm run dev > /tmp/molecule-canvas.log 2>&1 &
+# Invoke Next directly with the dynamic port — package.json's dev script pins
+# `-p 3000`, which would override a PORT env var. NEXT_PUBLIC_* / CORS_ORIGINS
+# were exported above so the browser bundle and the platform's CORS agree.
+./node_modules/.bin/next dev --turbopack -p "$CANVAS_PORT" > /tmp/molecule-canvas.log 2>&1 &
 CANVAS_PID=$!
 
 echo "    Waiting for Canvas HTTP 200..."
 CANVAS_READY=0
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
          21 22 23 24 25 26 27 28 29 30; do
-    code=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:3000/ 2>/dev/null || echo "0")
+    code=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:${CANVAS_PORT}/" 2>/dev/null || echo "0")
     if [ "$code" = "200" ]; then
         echo "    Canvas ready (t+${i}s)"
         CANVAS_READY=1
@@ -221,20 +364,35 @@ cat <<EOF
 ═══════════════════════════════════════════════════════════
   Molecule AI dev environment ready
 
-  Canvas:   http://localhost:3000
-  Platform: http://localhost:8080  (bound to loopback in dev)
-  Auth:     fail-closed — canvas authenticates with the dev ADMIN_TOKEN
-            (ADMIN_TOKEN + NEXT_PUBLIC_ADMIN_TOKEN, see .env)
-  Logs:     /tmp/molecule-platform.log
-            /tmp/molecule-canvas.log
+  ── Open in a browser ─────────────────────────────────────
+  Canvas:    http://127.0.0.1:${CANVAS_PORT}
+  Langfuse:  ${LANGFUSE_HOST}   (LLM traces)
+             login: dev@molecule.local / dev-langfuse-pw
+  Temporal:  http://127.0.0.1:${MOLECULE_TEMPORAL_UI_HOST_PORT}   (workflow UI)
 
-  Next steps:
-    1. Open http://localhost:3000 in a browser.
-    2. Add your model API key in
-         Config → Secrets & API Keys → Global
-       (skip if ANTHROPIC_API_KEY / OPENAI_API_KEY is already
-        set in .env — the platform inherits it.)
-    3. Click a template card or "+ Create blank workspace".
+  ── Backing services (dynamic ports; URLs wired for you) ───
+  Platform:  ${NEXT_PUBLIC_PLATFORM_URL}   (API, loopback-bound in dev)
+  Postgres:  127.0.0.1:${MOLECULE_PG_HOST_PORT}   (\$DATABASE_URL exported)
+  Redis:     127.0.0.1:${MOLECULE_REDIS_HOST_PORT}
+  Temporal:  127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT} (gRPC)
+
+  Auth:      fail-closed — canvas uses the dev ADMIN_TOKEN (see .env)
+  Logs:      /tmp/molecule-platform.log · /tmp/molecule-canvas.log
+             docker logs molecule-core-langfuse-1   (trace sink)
+
+  Ports are dynamic: the conventional port is used when free, else a free
+  one is picked so nothing on your machine is hijacked. Every URL above is
+  exported for you (DATABASE_URL, REDIS_URL, LANGFUSE_*, CORS_ORIGINS,
+  NEXT_PUBLIC_*). psql in with:  psql "\$DATABASE_URL"
+
+  First run:
+    1. Open the Canvas. On a fresh self-host DB a fullscreen setup scene
+       configures the platform agent (runtime · provider · model · key);
+       an already-configured stack goes straight to the workspace.
+    2. Chat with your platform agent (the org concierge) in My Chat.
+    3. See exactly what's sent to the LLM — consolidated system prompt,
+       tool calls, inputs/outputs — in the Langfuse UI above (or the
+       canvas Traces tab, per workspace).
 
   Press Ctrl-C to stop all services.
 ═══════════════════════════════════════════════════════════

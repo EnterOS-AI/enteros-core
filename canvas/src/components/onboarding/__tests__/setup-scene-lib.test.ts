@@ -65,7 +65,7 @@ describe("PLATFORM_AGENT_NAME", () => {
 describe("bucketTemplatesByRuntime", () => {
   it("buckets rows by runtime, honoring displayable:false and skipping blank/external-like runtimes", () => {
     const out = bucketTemplatesByRuntime([
-      { id: "a", name: "Claude Code", runtime: "claude-code", models: [{ id: "m1" }] },
+      { id: "a", name: "Claude Code", runtime: "claude-code", runtime_display_name: "Claude Code", models: [{ id: "m1" }] },
       { id: "b", runtime: "  " }, // blank after trim → skipped
       { id: "c", runtime: undefined }, // absent → skipped
       { id: "d", name: "Hidden", runtime: "codex", displayable: false }, // opt-out
@@ -111,8 +111,34 @@ describe("bucketTemplatesByRuntime", () => {
       },
     ]);
     expect(out).toHaveLength(1);
-    expect(out[0].label).toBe("Rich");
+    // Label comes from the runtime registry (runtime_display_name), NOT the
+    // template name; neither row carries one here, so it falls back to the
+    // runtime id. The richer row winning is proven by registryBacked.
+    expect(out[0].label).toBe("claude-code");
     expect(out[0].registryBacked).toBe(true);
+  });
+
+  it("labels a runtime by its registry display_name, never a template name (SEO-agent regression)", () => {
+    // Two templates share the claude-code runtime; one is the private
+    // "SEO Agent". The runtime picker must show "Claude Code" (the registry
+    // display_name), NOT whichever template wins the bucket — the bug where
+    // claude-code surfaced as "SEO Agent".
+    const out = bucketTemplatesByRuntime([
+      { id: "concierge", name: "Platform Agent (Org Concierge)", runtime: "claude-code", runtime_display_name: "Claude Code", models: [{ id: "m1" }] },
+      {
+        id: "seo",
+        name: "SEO Agent",
+        runtime: "claude-code",
+        runtime_display_name: "Claude Code",
+        registry_backed: true,
+        registry_models: [{ id: "claude-opus-4-8", provider: "anthropic-api" }],
+        registry_providers: [{ name: "anthropic-api" }],
+      },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].value).toBe("claude-code");
+    expect(out[0].label).toBe("Claude Code");
+    expect(out[0].label).not.toBe("SEO Agent");
   });
 
   it("keeps the first row on a score tie (no churn between equal templates)", () => {
@@ -120,7 +146,10 @@ describe("bucketTemplatesByRuntime", () => {
       { id: "first", name: "First", runtime: "codex", models: [{ id: "m1" }] },
       { id: "second", name: "Second", runtime: "codex", models: [{ id: "m2" }] },
     ]);
-    expect(out[0].label).toBe("First");
+    // First row wins the tie — proven by its models surviving (the label is
+    // now runtime-derived and identical for both rows, so it can't witness
+    // which row won).
+    expect(out[0].models).toEqual([{ id: "m1" }]);
   });
 
   it("treats registry_backed=true with zero registry models as NOT registry-backed", () => {

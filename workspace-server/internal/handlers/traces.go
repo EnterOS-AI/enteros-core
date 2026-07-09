@@ -74,8 +74,11 @@ func (h *TracesHandler) List(c *gin.Context) {
 		return
 	}
 
-	// Fetch traces from Langfuse, filtered by workspace tag or name
-	url := fmt.Sprintf("%s/api/public/traces?limit=20&orderBy=timestamp&orderDir=desc&tags=%s",
+	// Fetch traces from Langfuse, filtered by workspace tag or name.
+	// Langfuse's public API expects orderBy as a single "<column>.<dir>" token
+	// (e.g. timestamp.desc); the older "orderBy=timestamp&orderDir=desc" spelling
+	// 400s ("orderBy.order Required"), which silently emptied the Traces tab.
+	url := fmt.Sprintf("%s/api/public/traces?limit=20&orderBy=timestamp.desc&tags=%s",
 		cfg.Host, workspaceID)
 
 	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", url, nil)

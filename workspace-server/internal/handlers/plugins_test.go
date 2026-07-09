@@ -846,6 +846,52 @@ func TestPluginInstall_DockerlessTenantDeliversByPull(t *testing.T) {
 	}
 }
 
+func TestPluginInstall_DockerlessTenantRestartFalseSuppressesPullRestart(t *testing.T) {
+	mock := setupTestDB(t)
+	expectAllowlistAllowAll(mock)
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	base := t.TempDir()
+	pluginDir := filepath.Join(base, "demo")
+	_ = os.MkdirAll(pluginDir, 0o755)
+	_ = os.WriteFile(filepath.Join(pluginDir, "plugin.yaml"), []byte("name: demo\nversion: 1.0.0\ndescription: demo plugin\n"), 0o644)
+	restarted := make(chan string, 1)
+	h := NewPluginsHandler(base, nil, func(id string) { restarted <- id })
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws"}}
+	c.Request = httptest.NewRequest("POST", "/x",
+		bytes.NewBufferString(`{"source":"local://demo","restart":false}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.Install(c)
+	drainTestAsync()
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("docker-less install should deliver by pull (200), got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Status     string `json:"status"`
+		Delivery   string `json:"delivery"`
+		Restarting bool   `json:"restarting"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, w.Body.String())
+	}
+	if resp.Status != "installing" || resp.Delivery != "pull" {
+		t.Errorf("want status=installing delivery=pull, got status=%q delivery=%q", resp.Status, resp.Delivery)
+	}
+	if resp.Restarting {
+		t.Errorf("want restarting=false for restart:false on pull delivery")
+	}
+	select {
+	case id := <-restarted:
+		t.Errorf("restartFunc fired for restart:false on pull delivery: %s", id)
+	default:
+	}
+}
+
 func TestPluginInstall_InvalidSourceString(t *testing.T) {
 	h := NewPluginsHandler(t.TempDir(), nil, nil)
 	w := httptest.NewRecorder()
