@@ -4,25 +4,30 @@ un-gated.
 
 The gated staging tenant CD lives at .gitea/workflows/staging-tenant-cd.yml:
 
-    await-image -> e2e-smoke -> advance-pin -> redeploy-fleet
+    await-image -> advance-pin -> reload-cp-candidate -> e2e-smoke -> redeploy-fleet
 
 It is enforced INTRA-workflow by Gitea `needs:` (a red upstream job skips every
-downstream job, so a failed staging e2e means the fleet is never rolled and the
-image pin is never advanced). That gate runs on `push` to staging (post-merge),
-so it cannot itself be a pre-merge branch-protection context — but the INVARIANTS
-that make it a real gate CAN be checked statically, pre-merge, and made
-merge-blocking via `ci / all-required`.
+downstream job). The pin advances before e2e so the real staging smoke exercises
+the candidate image; rollback-pin must always run and restore the old pin + CP
+reload whenever any candidate-path job fails or is skipped. That gate runs on
+`push` to staging (post-merge), so it cannot itself be a pre-merge
+branch-protection context — but the INVARIANTS that make it a real gate CAN be
+checked statically, pre-merge, and made merge-blocking via `ci / all-required`.
 
 This lint is that mechanical guard. It fails the build if anyone:
 
-  1. breaks the gate chain — e2e-smoke must `needs:` await-image, advance-pin
-     must `needs:` e2e-smoke, redeploy-fleet must `needs:` advance-pin
+  1. breaks the gate chain — advance-pin must `needs:` await-image,
+     reload-cp-candidate must `needs:` advance-pin, e2e-smoke must `needs:`
+     reload-cp-candidate, and redeploy-fleet must `needs:` e2e-smoke
      (transitively, so the fleet can never roll while the e2e gate is red); OR
-  2. adds `continue-on-error: true` to any gating job (e2e-smoke, advance-pin,
-     redeploy-fleet) OR to any step inside one — continue-on-error rolls a
-     failed step up to a SUCCESS job status (Gitea Quirk #10 / mc#1982), which
-     would let a downstream `needs:`-dependent job run despite a real failure,
-     silently re-opening the ungated fleet roll this gate closes.
+  2. breaks rollback coverage — rollback-pin must `needs:` every candidate-path
+     job and run under `if: always()`; OR
+  3. adds `continue-on-error: true` to any gating job (advance-pin,
+     reload-cp-candidate, e2e-smoke, redeploy-fleet, rollback-pin) OR to any
+     step inside one — continue-on-error rolls a failed step up to a SUCCESS job
+     status (Gitea Quirk #10 / mc#1982), which would let a downstream
+     `needs:`-dependent job run despite a real failure, silently re-opening the
+     ungated fleet roll this gate closes.
 
 Behavior-based (parses the YAML `needs:` graph), not grep-by-name: a job rename
 that keeps the edges is fine; dropping an edge is the failure.
@@ -51,14 +56,27 @@ def workflow_path():
 # load-bearing gate edges: each downstream stage must not be reachable while
 # its upstream is red.
 REQUIRED_EDGES = [
-    ("e2e-smoke", "await-image"),
-    ("advance-pin", "e2e-smoke"),
-    ("redeploy-fleet", "advance-pin"),
+    ("advance-pin", "await-image"),
+    ("reload-cp-candidate", "advance-pin"),
+    ("e2e-smoke", "reload-cp-candidate"),
+    ("redeploy-fleet", "e2e-smoke"),
 ]
 
 # Jobs whose failure MUST skip everything downstream — so continue-on-error
 # (which masks a failure as success) is forbidden on them.
-GATING_JOBS = ["e2e-smoke", "advance-pin", "redeploy-fleet"]
+GATING_JOBS = [
+    "advance-pin",
+    "reload-cp-candidate",
+    "e2e-smoke",
+    "redeploy-fleet",
+    "rollback-pin",
+]
+ROLLBACK_NEEDS = [
+    "advance-pin",
+    "reload-cp-candidate",
+    "e2e-smoke",
+    "redeploy-fleet",
+]
 
 
 def load_jobs(path):
@@ -103,6 +121,11 @@ def coe_true(job):
     return coe is True or (isinstance(coe, str) and coe.strip().lower() == "true")
 
 
+def always_if(job):
+    value = job.get("if", "")
+    return isinstance(value, str) and value.strip() == "always()"
+
+
 def steps_of(job):
     steps = job.get("steps")
     return steps if isinstance(steps, list) else []
@@ -126,7 +149,8 @@ def main():
     for jk in GATING_JOBS + ["await-image"]:
         if jk not in jobs:
             fails.append(f"gate job `{jk}` is missing from {workflow} — the "
-                         f"await-image→e2e-smoke→advance-pin→redeploy-fleet "
+                         f"await-image→advance-pin→reload-cp-candidate→"
+                         f"e2e-smoke→redeploy-fleet "
                          f"chain is broken.")
 
     # 2. The chain edges must hold (transitively).
@@ -139,7 +163,22 @@ def main():
                 f"in {workflow} — a red `{upstream}` would NOT skip "
                 f"`{downstream}`, so the gate can be bypassed.")
 
-    # 3. No continue-on-error on a gating job.
+    # 3. Rollback must cover every post-pin path and must always run.
+    rollback = jobs.get("rollback-pin")
+    if isinstance(rollback, dict):
+        direct_needs = set(needs_of(rollback))
+        missing = [need for need in ROLLBACK_NEEDS if need not in direct_needs]
+        if missing:
+            fails.append(
+                f"`rollback-pin` does not directly `needs:` {missing} in "
+                f"{workflow} — it would not have every candidate-path result "
+                f"available and may fail to restore the old staging pin/CP reload.")
+        if not always_if(rollback):
+            fails.append(
+                f"`rollback-pin` must use `if: always()` in {workflow} so it "
+                f"runs after failed or skipped candidate-path jobs.")
+
+    # 4. No continue-on-error on a gating job.
     for jk in GATING_JOBS:
         job = jobs.get(jk)
         if isinstance(job, dict) and coe_true(job):
@@ -148,7 +187,7 @@ def main():
                 f"step would roll up to SUCCESS (Gitea Quirk #10 / mc#1982) and "
                 f"let the downstream roll run despite a red gate. Remove it.")
 
-    # 4. No continue-on-error on any step inside a gating job.
+    # 5. No continue-on-error on any step inside a gating job.
     for jk in GATING_JOBS:
         job = jobs.get(jk)
         if not isinstance(job, dict):
@@ -167,13 +206,14 @@ def main():
             print(f"  - {f}")
         print()
         print("The gate is enforced by the needs: graph in")
-        print(f"  {workflow}. Keep await-image→e2e-smoke→advance-pin→"
-              "redeploy-fleet")
+        print(f"  {workflow}. Keep await-image→advance-pin→"
+              "reload-cp-candidate→e2e-smoke→redeploy-fleet")
         print("  wired via needs:, and never continue-on-error a gating job.")
         return 1
 
     print("OK: staging tenant CD gate chain enforced — "
-          "await-image -> " + " -> ".join(GATING_JOBS) +
+          "await-image -> advance-pin -> reload-cp-candidate -> "
+          "e2e-smoke -> redeploy-fleet, with rollback-pin coverage"
           " (needs: edges intact, no continue-on-error at job or step level).")
     return 0
 

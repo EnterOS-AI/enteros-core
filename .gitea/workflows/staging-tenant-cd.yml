@@ -9,9 +9,9 @@ name: staging-tenant-cd
 # a push to `main` that changes the tenant image sources flows through a
 # STRUCTURALLY-GATED job chain:
 #
-#   await-image -> e2e-smoke -> advance-pin -> redeploy-fleet
-#                  ^^^^^^^^^
-#                  HARD GATE (real staging provision + A2A-serve e2e)
+#   await-image -> advance-pin -> reload-cp-candidate -> e2e-smoke -> redeploy-fleet
+#                                                    ^^^^^^^^^
+#                                                    HARD GATE (real staging provision + A2A-serve e2e)
 #
 # THE LOOP (build half + deploy half)
 #   publish-workspace-server-image.yml  (BUILD)  — already triggers on push:[main]
@@ -21,20 +21,19 @@ name: staging-tenant-cd
 #     of branch, so THIS workflow — firing on the same `main` SHA — awaits the
 #     exact per-commit artifact the build produced).
 #   staging-tenant-cd.yml               (THIS)    — awaits that :staging-<sha>
-#     artifact, gates on a real staging e2e, advances the staging image pin, and
+#     artifact, advances the staging image pin, reloads staging CP so fresh
+#     provisions boot the candidate image, gates on a real staging e2e, and
 #     rolls the running staging tenant fleet onto it (session-preserving).
 # The two coordinate through the immutable per-commit :staging-<sha> tag, so the
 # deploy never rolls onto a half-built image and never races the build.
 #
 # WHY STRUCTURALLY GATED (un-bypassable)
-#   redeploy-fleet `needs: advance-pin` which `needs: e2e-smoke` which
-#   `needs: await-image`. Gitea `needs:` skips every downstream job when an
-#   upstream is red, so a failed staging e2e SKIPS the pin advance AND the fleet
-#   roll — the fleet is only ever rolled on a green gate. There is no
-#   continue-on-error on any gating job (that would mask a red step as success),
-#   and the invariant is enforced statically by
-#   lint-staging-tenant-cd-gate-chain.yml. If the e2e gate fails AFTER the pin
-#   was advanced (it can't — advance-pin needs e2e-smoke), rollback-pin reverts.
+#   redeploy-fleet `needs: e2e-smoke` which `needs: reload-cp-candidate` which
+#   `needs: advance-pin` which `needs: await-image`. The gate intentionally
+#   reloads staging CP before e2e so fresh provisions exercise the candidate
+#   image, not the previously pinned image. If anything after advance-pin fails
+#   or is skipped, rollback-pin restores the old pin and reloads staging CP back
+#   to that old image. There is no continue-on-error on any gating job.
 #
 # SESSION PRESERVATION
 #   redeploy-fleet delegates to scripts/deploy/redeploy-staging-fleet.sh, which
@@ -70,6 +69,7 @@ on:
       - '.gitea/workflows/staging-tenant-cd.yml'
       - 'scripts/deploy/redeploy-staging-fleet.sh'
       - 'scripts/deploy/advance-staging-tenant-pin.sh'
+      - 'scripts/deploy/reload-staging-controlplane.sh'
   # NOTE: no `workflow_dispatch.inputs:` — Gitea rejects the whole workflow if an
   # inputs: map is present (feedback_gitea_workflow_dispatch_inputs_unsupported,
   # enforced by lint-workflow-yaml). Operator overrides are read from repo/org
@@ -136,7 +136,7 @@ jobs:
 
   e2e-smoke:
     name: e2e-smoke (staging real provision + A2A HARD GATE)
-    needs: await-image
+    needs: [await-image, reload-cp-candidate]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -154,22 +154,18 @@ jobs:
       # presence-only. This is the deep "callable" proof that catches a
       # present-but-not-runnable verb (the flaw that let regressions reach prod).
       E2E_ASSERT_MGMT_MCP_CALLABLE: '1'
-      # ORDERING GUARD (staged): when the operator flips
-      # STAGING_TENANT_CD_ASSERT_CANDIDATE_SHA=1 (after the CP adopts the advanced
-      # pin so fresh provisions boot the candidate), the gate asserts the tenant it
-      # exercised reports THIS commit's git_sha via /buildinfo — turning "the e2e
-      # ran against the pre-advance pin, not the candidate" from a silent
-      # false-green into a HARD RED. Empty by default so current CD is never
-      # red-by-design; the Go detection guard (assertTenantBuildIsCandidate) is
-      # inert without it.
-      E2E_EXPECT_TENANT_BUILD_SHA: ${{ vars.STAGING_TENANT_CD_ASSERT_CANDIDATE_SHA == '1' && github.sha || '' }}
+      # Candidate guard: push-triggered deploys must prove the fresh tenant they
+      # exercised reports THIS commit's git_sha via /buildinfo. Manual rollback
+      # dispatches can target an arbitrary STAGING_TENANT_CD_IMAGE_TAG, so those
+      # stay exempt unless an operator separately asserts candidate SHA.
+      E2E_EXPECT_TENANT_BUILD_SHA: ${{ vars.STAGING_TENANT_CD_IMAGE_TAG == '' && github.sha || (vars.STAGING_TENANT_CD_ASSERT_CANDIDATE_SHA == '1' && github.sha || '') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Force-fail hook (prove a red gate blocks the fleet roll)
         run: |
           set -euo pipefail
           if [ "${GATE_FORCE_FAIL:-0}" = "1" ]; then
-            echo "::error::GATE_FORCE_FAIL=1 — gate forced RED; this MUST skip advance-pin + redeploy-fleet."
+            echo "::error::GATE_FORCE_FAIL=1 — gate forced RED; this MUST roll back the staging pin/CP reload and skip redeploy-fleet."
             exit 1
           fi
           echo "gate not forced — running the real e2e"
@@ -232,7 +228,7 @@ jobs:
 
   advance-pin:
     name: advance-pin (staging LOCAL_TENANT_IMAGE)
-    needs: [e2e-smoke, await-image]
+    needs: [await-image]
     runs-on: docker-host
     timeout-minutes: 10
     outputs:
@@ -249,9 +245,30 @@ jobs:
           TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
         run: bash scripts/deploy/advance-staging-tenant-pin.sh --tag "${{ needs.await-image.outputs.tag }}"
 
+  # bp-exempt: staging-only post-merge deploy step; rollback-pin restores the old pin/reload on red candidate paths.
+  reload-cp-candidate:
+    name: reload-cp-candidate (staging CP adopts candidate pin)
+    needs: [advance-pin, await-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Railway CLI
+        run: |
+          npm install -g @railway/cli@4.59.0 --prefix "$RUNNER_TEMP/railway-cli"
+          echo "$RUNNER_TEMP/railway-cli/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/railway-cli/bin/railway" --version
+      - name: Reload staging control plane onto the candidate tenant image
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+          TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
+        run: bash scripts/deploy/reload-staging-controlplane.sh --tag "${{ needs.await-image.outputs.tag }}"
+
   redeploy-fleet:
     name: redeploy-fleet (roll staging tenants, session-preserving)
-    needs: [advance-pin, await-image]
+    needs: [e2e-smoke, await-image]
     runs-on: docker-host
     timeout-minutes: 30
     steps:
@@ -263,29 +280,26 @@ jobs:
 
   rollback-pin:
     name: rollback-pin (revert pin if the fleet roll failed)
-    needs: [advance-pin, redeploy-fleet]
-    # ALWAYS-RUN + explicit in-job branch (main-status coherence): the old
-    # `if: failure() && needs.advance-pin.result == 'success'` job guard made
-    # Gitea auto-publish a permanent `skipped` commit status for this job on
-    # every GREEN main push (Gitea posts a status for `if:`-false jobs too) —
-    # standing skip-noise on every main HEAD. `always()` runs the job on green
-    # and red paths alike; the single step below branches on the REAL upstream
-    # results:
-    #   - redeploy-fleet success               -> no-op success (no rollback needed)
-    #   - advance-pin not success (gate red)   -> no-op success (nothing to revert)
-    #   - redeploy-fleet failure after advance -> REVERT the pin (the real rollback)
-    # Revert semantics are IDENTICAL to the old guard (revert fires exactly
-    # when the fleet roll failed after a successful pin advance; a cancelled
-    # roll — which the old failure() guard also did NOT revert — stays no-op).
-    # Fail-closed: a FAILED revert still fails this job loudly.
+    needs: [advance-pin, reload-cp-candidate, e2e-smoke, redeploy-fleet]
+    # ALWAYS-RUN + explicit in-job branch (main-status coherence). Because this
+    # workflow now advances the pin before the e2e gate, any failure/skipped path
+    # after advance-pin must restore the old pin and reload staging CP back onto
+    # it. Green fleet roll is the only no-op path.
     if: always()
-    runs-on: docker-host
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Revert the staging pin to its pre-roll value (no-op on green roll)
+      - name: Install Railway CLI
+        run: |
+          npm install -g @railway/cli@4.59.0 --prefix "$RUNNER_TEMP/railway-cli"
+          echo "$RUNNER_TEMP/railway-cli/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/railway-cli/bin/railway" --version
+      - name: Revert the staging pin and CP reload on failed candidate path
         env:
           ADVANCE_RESULT: ${{ needs.advance-pin.result }}
+          RELOAD_RESULT: ${{ needs.reload-cp-candidate.result }}
+          E2E_RESULT: ${{ needs.e2e-smoke.result }}
           REDEPLOY_RESULT: ${{ needs.redeploy-fleet.result }}
           OLD_IMAGE: ${{ needs.advance-pin.outputs.old_image }}
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
@@ -293,24 +307,18 @@ jobs:
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
         run: |
           set -euo pipefail
-          if [ "$REDEPLOY_RESULT" = "success" ]; then
-            echo "::notice::fleet roll green — no rollback needed."
-            exit 0
-          fi
           if [ "$ADVANCE_RESULT" != "success" ]; then
-            echo "::notice::pin never advanced (advance-pin=$ADVANCE_RESULT, redeploy-fleet=$REDEPLOY_RESULT) — nothing to revert."
+            echo "::notice::pin never advanced (advance-pin=$ADVANCE_RESULT) — nothing to revert."
             exit 0
           fi
-          if [ "$REDEPLOY_RESULT" != "failure" ]; then
-            # cancelled / other non-failure terminal state: the old failure()
-            # guard did not revert here either — keep parity, log loudly.
-            echo "::warning::redeploy-fleet ended '$REDEPLOY_RESULT' (not failure) after pin advance — no automatic revert (parity with prior failure()-guard); operator judgement applies."
+          if [ "$RELOAD_RESULT" = "success" ] && [ "$E2E_RESULT" = "success" ] && [ "$REDEPLOY_RESULT" = "success" ]; then
+            echo "::notice::candidate gate + fleet roll green — no rollback needed."
             exit 0
           fi
           if [ -z "$OLD_IMAGE" ]; then
-            # Parity with the old step-level `if: old_image != ''` skip, but loud.
             echo "::warning::advance-pin succeeded but exposed no old_image — cannot auto-revert; operator attention needed."
             exit 0
           fi
-          echo "::warning::fleet roll failed after pin advance — reverting staging pin to $OLD_IMAGE"
+          echo "::warning::candidate path failed after pin advance (reload=$RELOAD_RESULT e2e=$E2E_RESULT redeploy=$REDEPLOY_RESULT) — reverting staging pin to $OLD_IMAGE"
           bash scripts/deploy/advance-staging-tenant-pin.sh --image "$OLD_IMAGE"
+          bash scripts/deploy/reload-staging-controlplane.sh --image "$OLD_IMAGE"
