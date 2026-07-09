@@ -130,10 +130,10 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 		// works on both sides of the wire.
 		sharedSecret = os.Getenv("PROVISION_SHARED_SECRET")
 	}
-	// ADMIN_TOKEN is injected into the tenant container at provision
-	// time by the control plane (see provisioner/ec2.go Secrets Manager
-	// bootstrap path). Without it, post-#118 CP rejects every
-	// /cp/workspaces/* call with 401.
+	// ADMIN_TOKEN authenticates this tenant platform to the control plane via
+	// X-Molecule-Admin-Token. It must never be copied into an ordinary workspace
+	// box env; workspaces authenticate to the tenant platform with their
+	// per-workspace bearer after registration.
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	// CP_ADMIN_API_TOKEN gates /cp/admin/* (distinct from the provision
 	// shared secret so a compromised tenant's provision creds can't read
@@ -268,10 +268,9 @@ type cpProvisionResponse struct {
 //
 // Fail-safe: a nil cfg.WorkspaceSecretKeys yields wsAuthored=false for every
 // key, so a missing provenance map strips ALL SCM-write tokens rather than
-// leaking them. adminToken, when non-empty, is injected as ADMIN_TOKEN (it is
-// never an SCM-write key, so the guard never touches it).
-func buildCPTenantEnv(cfg WorkspaceConfig, adminToken string) map[string]string {
-	env := make(map[string]string, len(cfg.EnvVars)+1)
+// leaking them.
+func buildCPTenantEnv(cfg WorkspaceConfig) map[string]string {
+	env := make(map[string]string, len(cfg.EnvVars))
 	for k, v := range cfg.EnvVars {
 		if isSCMWriteTokenKey(k) {
 			_, wsAuthored := cfg.WorkspaceSecretKeys[k] // nil map → false (fail-safe)
@@ -283,18 +282,15 @@ func buildCPTenantEnv(cfg WorkspaceConfig, adminToken string) map[string]string 
 		}
 		env[k] = v
 	}
-	if adminToken != "" {
-		env["ADMIN_TOKEN"] = adminToken
-	}
 	return env
 }
 
 // Start provisions a workspace by calling the control plane → EC2.
 func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
-	// Inject ADMIN_TOKEN into the workspace container env so the agent can call
-	// /admin/liveness and other admin-gated platform endpoints (core#831).
-	// p.adminToken is read from os.Getenv("ADMIN_TOKEN") at provisioner creation;
-	// it is also used for CP→platform HTTP auth but those are separate concerns.
+	// p.adminToken is read from os.Getenv("ADMIN_TOKEN") at provisioner creation
+	// and is used only as CP request authentication. It is intentionally not
+	// included in the workspace container env; normal workspaces receive their
+	// per-workspace bearer from /registry/register after boot.
 	//
 	// Forensic #145 hardening: tenant workspaces run on EC2 via this path, so
 	// the SCM-write-token denylist (see buildContainerEnv) is enforced here
@@ -303,7 +299,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// tenant container regardless of whether ADMIN_TOKEN is set. Extracted to
 	// buildCPTenantEnv so the strip/exempt logic is unit-testable without
 	// standing up the CP HTTP round-trip.
-	env := buildCPTenantEnv(cfg, p.adminToken)
+	env := buildCPTenantEnv(cfg)
 	// Collect template files and generated configs, with OFFSEC-010 guards:
 	// - Rejects symlinks at the template root (prevents bypass via symlink traversal)
 	// - Skips symlinks during WalkDir (prevents /etc/passwd etc. inclusion)

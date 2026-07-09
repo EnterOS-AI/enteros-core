@@ -1086,12 +1086,6 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 	} else if pat, hasPAT := cfg.EnvVars["GH_PAT"]; hasPAT && pat != "" {
 		env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", pat))
 	}
-	// Inject ADMIN_TOKEN from the platform server's environment so workspace
-	// containers can call /admin/liveness and other admin-gated endpoints
-	// (core#831). cp_provisioner.go handles this separately for SaaS tenants.
-	if adminToken := os.Getenv("ADMIN_TOKEN"); adminToken != "" {
-		env = append(env, fmt.Sprintf("ADMIN_TOKEN=%s", adminToken))
-	}
 	return env
 }
 

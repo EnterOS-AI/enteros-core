@@ -248,6 +248,47 @@ func TestStart_HappyPath(t *testing.T) {
 	}
 }
 
+func TestStart_SendsAdminTokenOnlyAsProvisionHeader(t *testing.T) {
+	var sawAdminHeader string
+	var body cpProvisionRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAdminHeader = r.Header.Get("X-Molecule-Admin-Token")
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"instance_id":"i-abc123","state":"pending"}`)
+	}))
+	defer srv.Close()
+
+	p := &CPProvisioner{
+		baseURL:    srv.URL,
+		orgID:      "org-1",
+		adminToken: "tenant-admin-secret",
+		httpClient: srv.Client(),
+	}
+
+	_, err := p.Start(context.Background(), WorkspaceConfig{
+		WorkspaceID: "ws-1",
+		Runtime:     "claude-code",
+		Tier:        2,
+		PlatformURL: "http://tenant",
+		EnvVars:     map[string]string{"CUSTOM": "ok"},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if sawAdminHeader != "tenant-admin-secret" {
+		t.Fatalf("X-Molecule-Admin-Token = %q, want tenant-admin-secret", sawAdminHeader)
+	}
+	if got := body.Env["ADMIN_TOKEN"]; got != "" {
+		t.Fatalf("ADMIN_TOKEN leaked into provision env payload: %q", got)
+	}
+	if body.Env["CUSTOM"] != "ok" {
+		t.Fatalf("CUSTOM env var = %q, want ok", body.Env["CUSTOM"])
+	}
+}
+
 func TestStart_SendsTemplateAndGeneratedConfigFiles(t *testing.T) {
 	tmpl := t.TempDir()
 	if err := os.WriteFile(filepath.Join(tmpl, "config.yaml"), []byte("name: template\n"), 0o600); err != nil {

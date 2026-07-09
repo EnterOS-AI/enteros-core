@@ -78,8 +78,10 @@ var forbiddenTenantEnvKeys = map[string]struct{}{
 	"BITBUCKET_TOKEN": {},
 
 	// Control-plane admin tokens.
-	"CP_ADMIN_API_TOKEN": {},
-	"CP_ADMIN_TOKEN":     {},
+	"CP_ADMIN_API_TOKEN":   {},
+	"CP_ADMIN_TOKEN":       {},
+	"ADMIN_TOKEN":          {},
+	"MOLECULE_ADMIN_TOKEN": {},
 
 	// Control-plane shared/provision secrets (security-audit M5). One
 	// fleet-wide value gating /cp/workspaces/* + re-served by
