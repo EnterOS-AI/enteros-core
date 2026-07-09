@@ -161,6 +161,28 @@ class TestRefireScriptContextName:
         )
 
 
+class TestSopChecklistReviewRefireLifecycleStatus:
+    """The review-refire job must not publish a skipped lifecycle status."""
+
+    def test_review_refire_has_no_job_level_if(self):
+        wf = load_workflow("sop-checklist.yml")
+        job = wf["jobs"]["review-refire"]
+
+        assert "if" not in job, (
+            "review-refire must not use a job-level if: wildcard branch "
+            "protection treats the skipped pull_request_target status as "
+            "merge-blocking. Keep slash-command guards on the steps instead."
+        )
+
+    def test_review_refire_work_stays_step_guarded(self):
+        wf = load_workflow("sop-checklist.yml")
+        rendered = str(wf["jobs"]["review-refire"])
+
+        assert "steps.classify.outputs.run_qa == 'true'" in rendered
+        assert "steps.classify.outputs.run_security == 'true'" in rendered
+        assert "Fetch CI_STATUS_TOKEN from Infisical SSOT" in rendered
+
+
 class TestRefireTokenSeparation:
     """The /qa-recheck + /security-recheck backstop must also use STATUS_POST_TOKEN."""
 

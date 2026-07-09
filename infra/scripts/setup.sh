@@ -56,10 +56,12 @@ echo "    notify-keyspace-events = $KEA"
 # handle it.
 
 echo "==> Infrastructure ready!"
-echo "    Postgres: localhost:5432"
-echo "    Redis:    localhost:6379"
+# Host ports may be remapped dynamically by dev-start.sh (see MOLECULE_*_HOST_PORT)
+# so a dev's own services aren't hijacked; reflect the effective values here.
+echo "    Postgres: 127.0.0.1:${MOLECULE_PG_HOST_PORT:-5432}"
+echo "    Redis:    127.0.0.1:${MOLECULE_REDIS_HOST_PORT:-6379}"
 echo "    Langfuse: localhost:3001"
-echo "    Temporal: localhost:7233 (gRPC) / localhost:8233 (UI)"
+echo "    Temporal: 127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT:-7233} (gRPC) / 127.0.0.1:${MOLECULE_TEMPORAL_UI_HOST_PORT:-8233} (UI)"
 echo ""
 echo "    Next: cd workspace-server && go run ./cmd/server"
 echo "          (the platform applies pending migrations on first boot)"

@@ -8,7 +8,10 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-molecule}
     command: ["postgres", "-c", "wal_level=logical"]
     ports:
-      - "5432:5432"
+      # Host port is dynamic (dev-start.sh picks a free one and injects the
+      # matching DATABASE_URL) so a dev's own Postgres on 5432 is never
+      # silently hijacked. Falls back to 5432 when the var is unset.
+      - "${MOLECULE_PG_HOST_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
@@ -47,7 +50,7 @@ services:
     image: redis@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
     command: ["redis-server", "--notify-keyspace-events", "KEA"]
     ports:
-      - "6379:6379"
+      - "${MOLECULE_REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
     networks:
@@ -92,7 +95,7 @@ services:
       DBNAME: temporal
       VISIBILITY_DBNAME: temporal_visibility
     ports:
-      - "7233:7233"
+      - "${MOLECULE_TEMPORAL_HOST_PORT:-7233}:7233"
     healthcheck:
       test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
       interval: 10s
@@ -108,7 +111,7 @@ services:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_CORS_ORIGINS: http://localhost:8233
     ports:
-      - "8233:8080"
+      - "${MOLECULE_TEMPORAL_UI_HOST_PORT:-8233}:8080"
 
 networks:
   molecule-core-net:

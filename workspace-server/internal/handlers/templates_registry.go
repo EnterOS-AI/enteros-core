@@ -63,6 +63,11 @@ func enrichFromRegistry(summary *templateSummary, runtime string) {
 		return
 	}
 
+	// Runtime display label from the registry SSOT (providers.yaml
+	// runtimes.<rt>.display_name). Empty is fine — the canvas falls back to
+	// the runtime slug rather than a template name.
+	summary.RuntimeDisplayName = m.Runtimes[runtime].DisplayName
+
 	// SSOT filter (the BLOCKER): when no Molecule LLM proxy is wired into this
 	// process the platform_managed billing path cannot inject a credential, so
 	// the closed `platform` provider (and every model that derives to it) is

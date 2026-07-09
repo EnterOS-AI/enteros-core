@@ -249,6 +249,12 @@ skills: []
 	if got.Runtime != "hermes" {
 		t.Errorf("Runtime: want hermes, got %q", got.Runtime)
 	}
+	// RuntimeDisplayName is projected from the registry SSOT
+	// (providers.yaml runtimes.hermes.display_name) so the canvas runtime
+	// picker labels by the runtime's identity, not a template name.
+	if got.RuntimeDisplayName != "Hermes" {
+		t.Errorf("RuntimeDisplayName: want Hermes, got %q", got.RuntimeDisplayName)
+	}
 	if got.Model != "nous-hermes-3-70b" {
 		t.Errorf("Model: want nous-hermes-3-70b (from runtime_config.model), got %q", got.Model)
 	}

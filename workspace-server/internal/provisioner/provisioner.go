@@ -1108,7 +1108,63 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 	if adminToken := os.Getenv("ADMIN_TOKEN"); adminToken != "" {
 		env = append(env, fmt.Sprintf("ADMIN_TOKEN=%s", adminToken))
 	}
+	// Langfuse tracing (SSOT reproducibility): when the platform has Langfuse
+	// keys in its env, inject them into EVERY workspace container so the shared
+	// runtime's tracing producer emits — no per-workspace secret needed. The
+	// agent reaches Langfuse over the Docker network, so its HOST is the
+	// container-network URL (MOLECULE_WORKSPACE_LANGFUSE_HOST, default
+	// http://langfuse-web:3000), NOT the platform's host-published one. A
+	// workspace_secrets override still wins (assembled above from cfg.EnvVars).
+	if pk, sk := os.Getenv("LANGFUSE_PUBLIC_KEY"), os.Getenv("LANGFUSE_SECRET_KEY"); pk != "" && sk != "" {
+		host := os.Getenv("MOLECULE_WORKSPACE_LANGFUSE_HOST")
+		if host == "" {
+			host = "http://langfuse-web:3000"
+		}
+		// A workspace/global-secret LANGFUSE_HOST that points at the platform
+		// HOST's loopback (127.0.0.1 / localhost / ::1 — the host-published
+		// Langfuse UI port) is UNREACHABLE from inside the workspace container,
+		// so the tracing producer silently fails ("Unexpected error … contact
+		// support"). Rewrite such a value to the container-network URL. A
+		// non-loopback override (a real cloud.langfuse.com or internal DNS) is
+		// a deliberate external target and is left untouched. Duplicate env
+		// keys resolve last-wins in the container runtime, so appending here
+		// overrides earlier cfg.EnvVars only when the earlier value is absent
+		// or unusable.
+		existing, set := cfg.EnvVars["LANGFUSE_HOST"]
+		if v, ok := cfg.EnvVars["LANGFUSE_PUBLIC_KEY"]; !ok || strings.TrimSpace(v) == "" {
+			env = append(env, fmt.Sprintf("LANGFUSE_PUBLIC_KEY=%s", pk))
+		}
+		if v, ok := cfg.EnvVars["LANGFUSE_SECRET_KEY"]; !ok || strings.TrimSpace(v) == "" {
+			env = append(env, fmt.Sprintf("LANGFUSE_SECRET_KEY=%s", sk))
+		}
+		if !set || isLoopbackHostURL(existing) {
+			env = append(env, fmt.Sprintf("LANGFUSE_HOST=%s", host))
+		}
+	}
 	return env
+}
+
+// isLoopbackHostURL reports whether a URL's host resolves to the local loopback
+// (127.0.0.0/8, localhost, or ::1). Such a URL is reachable from the platform
+// host but never from a sibling workspace container, so it must be rewritten to
+// the container-network Langfuse endpoint before injection.
+func isLoopbackHostURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	h := u.Hostname() // strips port and [] from IPv6
+	if h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // Per-tier resource defaults. Configurable via TIERn_MEMORY_MB and

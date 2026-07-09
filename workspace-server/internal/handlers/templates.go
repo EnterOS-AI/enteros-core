@@ -168,13 +168,19 @@ type providerRegistryEntry struct {
 }
 
 type templateSummary struct {
-	ID          string      `json:"id"`
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	Tier        int         `json:"tier"`
-	Runtime     string      `json:"runtime"`
-	Model       string      `json:"model"`
-	Models      []modelSpec `json:"models,omitempty"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Tier        int    `json:"tier"`
+	Runtime     string `json:"runtime"`
+	// RuntimeDisplayName is the runtime's human label from the provider
+	// registry (providers.yaml runtimes.<rt>.display_name) — the SSOT for the
+	// onboarding scene's runtime-picker label, so it never has to borrow this
+	// template's Name. Empty when the runtime is not registry-known; the
+	// canvas falls back to the runtime slug.
+	RuntimeDisplayName string      `json:"runtime_display_name,omitempty"`
+	Model              string      `json:"model"`
+	Models             []modelSpec `json:"models,omitempty"`
 	// RequiredEnv mirrors runtime_config.required_env from the template's
 	// config.yaml — the AND-required env vars the template declares at the
 	// runtime level (separate from per-model required_env). The canvas

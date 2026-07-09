@@ -28,12 +28,23 @@ package handlers
 // the global endpoint matches the keys all operator-host secrets are
 // issued against. See RFC internal#417 §Phase 1 for the regional
 // ambiguity table.
+//
+// Every entry MUST carry the provider's OpenAI-compatible version segment
+// (/v1, /openai/v1, /v2). The in-workspace adapters build the request URL
+// by appending the fixed path (openai-compat -> {base}/chat/completions;
+// anthropic-compat consumes a SEPARATE ANTHROPIC_BASE_URL). A version-less
+// base makes the openai-compat runtimes (openclaw) POST
+// api.minimax.io/chat/completions -> 404 (HTML error page) -> FailoverError,
+// which silently bricks openclaw's DEFAULT MiniMax model. The canonical
+// MiniMax OpenAI-compat surface is api.minimax.io/v1/chat/completions, so
+// the base must be api.minimax.io/v1 — matching providers.yaml's
+// `minimax` base_url_template and adapter_base's registry default.
 var ProviderBaseURLDefaults = map[string]string{
 	"OPENAI_BASE_URL":     "https://api.openai.com/v1",
 	"GROQ_BASE_URL":       "https://api.groq.com/openai/v1",
 	"OPENROUTER_BASE_URL": "https://openrouter.ai/api/v1",
 	"QIANFAN_BASE_URL":    "https://qianfan.baidubce.com/v2",
-	"MINIMAX_BASE_URL":    "https://api.minimax.io",
+	"MINIMAX_BASE_URL":    "https://api.minimax.io/v1",
 	"MOONSHOT_BASE_URL":   "https://api.moonshot.ai/v1",
 }
 

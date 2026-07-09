@@ -28,9 +28,10 @@ func repoRoot(t *testing.T) string {
 
 // TestArtifactInSync is the drift gate's Go-test counterpart: the checked-in
 // internal/providers/gen/registry_gen.go MUST byte-equal a fresh render. If a
-// future edit changes providers.yaml without regenerating, OR hand-edits the
-// artifact, this flips red — the same signal the verify-providers-gen CI
-// workflow emits, but caught locally by `go test ./...` too.
+// future edit bumps the SDK registry dependency without regenerating, OR
+// hand-edits the artifact, this flips red — the same signal the
+// verify-providers-gen CI workflow emits, but caught locally by `go test ./...`
+// too.
 func TestArtifactInSync(t *testing.T) {
 	generated, err := render()
 	if err != nil {
@@ -42,7 +43,7 @@ func TestArtifactInSync(t *testing.T) {
 		t.Fatalf("read checked-in artifact %s: %v (run `go generate ./...` and commit)", artifactPath, err)
 	}
 	if !bytes.Equal(onDisk, generated) {
-		t.Fatalf("DRIFT: %s is out of sync with providers.yaml.\n"+
+		t.Fatalf("DRIFT: %s is out of sync with the SDK registry.\n"+
 			"Run `go generate ./...` (or `go run ./cmd/gen-providers`) and commit the result.", defaultOutPath)
 	}
 }
@@ -80,8 +81,8 @@ func TestDriftGateCatchesMutation(t *testing.T) {
 		}
 	})
 
-	// Mutate the ON-DISK artifact (simulating a hand-edit / a providers.yaml
-	// change that wasn't regenerated).
+	// Mutate the ON-DISK artifact (simulating a hand-edit / SDK registry
+	// dependency change that wasn't regenerated).
 	mutated := append(append([]byte(nil), original...), []byte("\n// injected drift\n")...)
 	if err := os.WriteFile(artifactPath, mutated, 0o644); err != nil {
 		t.Fatalf("write mutated artifact: %v", err)

@@ -46,7 +46,7 @@ var runtimeNativeProviders = map[string][]string{
 	// claude-code's anthropic oauth+api split; platform openai via the proxy
 	// Responses surface. cp#529 adds the byok-minimax name-only arm so the
 	// template's BYOK MiniMax token-plan id (codex-minimax-m2.7) resolves.
-	"codex":    {"openai-subscription", "openai-api", "platform", "byok-minimax"},
+	"codex": {"openai-subscription", "openai-api", "platform", "byok-minimax"},
 	"openclaw": {"kimi-coding", "platform", "openrouter", "custom",
 		// cp#529 dedicated BYOK-vendor name-only arms (openai:/minimax:/groq:).
 		"byok-openai", "byok-minimax", "groq"},
@@ -156,10 +156,12 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 		// api.kimi.com/coding gateway) + platform-managed kimi (moonshot/) +
 		// platform-managed MiniMax (task #83, CTO 2026-06-24): openclaw's
 		// platform arm now also carries the slash-form `minimax/...` platform
-		// ids (the platform default), distinct from its BYOK colon-form below.
+		// ids (the platform default), distinct from its BYOK colon-form models.
 		"openclaw": {
 			"moonshot:kimi-k2.6", "moonshot:kimi-k2.5",
 			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
+			// minimax via tenant BYOK key (self-host onboarding default)
+			"minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed",
 			// minimax via platform proxy (task #83 platform default)
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 		},

@@ -93,7 +93,7 @@ func (h *PluginsHandler) Install(c *gin.Context) {
 		// RETIRED. Deliver by PULL — declare the plugin and re-materialize so the
 		// runtime boot installer pulls it into /configs/plugins/<name>/. The box
 		// does the fetch; the agent never does (runtime-agnostic).
-		scheduled, rmErr := h.reMaterialize(ctx, workspaceID, result.PluginName, result.Source.Raw())
+		scheduled, rmErr := h.reMaterialize(ctx, workspaceID, result.PluginName, result.Source.Raw(), result.SuppressRestart)
 		if rmErr != nil {
 			var he *httpErr
 			if errors.As(rmErr, &he) {
