@@ -3,20 +3,18 @@ name: verify-providers-gen
 # Provider-registry SSOT enforcement gate — molecule-core side (internal#718
 # P2-A, CTO 2026-05-27 "Distribution = SDK via codegen + verify-CI").
 #
-# The canonical schema SSOT is molecule-controlplane
-# internal/providers/providers.yaml. molecule-core carries a SYNCED COPY at
-# workspace-server/internal/providers/providers.yaml (kept in sync by the
-# companion sync-providers-yaml.yml gate), and cmd/gen-providers emits the
+# The canonical registry SSOT is the SDK package
+# go.moleculesai.app/sdk/gen/go/llmregistry. molecule-core derives the registry
+# through internal/providers.LoadManifest and cmd/gen-providers emits the
 # checked-in Go projection workspace-server/internal/providers/gen/registry_gen.go.
 #
 # This workflow regenerates the artifact into the working tree and fails RED if
 # it differs from what is committed — catching BOTH:
-#   * a providers.yaml (synced-copy) change that wasn't followed by `go generate ./...`, and
+#   * an SDK registry module bump that wasn't followed by `go generate ./...`, and
 #   * a hand-edit of the generated artifact (it carries a DO NOT EDIT header).
 #
-# It is the molecule-core mirror of molecule-controlplane's verify-providers-gen
-# workflow. Together with sync-providers-yaml (canonical↔synced-copy drift) it
-# closes the codegen-checked-into-each-repo + verify-CI loop the RFC mandates.
+# Together with sync-providers-yaml (now the SDK registry adoption gate), it
+# keeps the checked-in projection in lockstep with the SDK registry dependency.
 #
 # ENFORCEMENT GATING (deliberate, per dev-SOP "implementation gating"):
 # this is a STANDALONE workflow, NOT a job inside ci.yml, and is NOT yet in any
@@ -89,7 +87,7 @@ jobs:
           cache: false
           cache-dependency-path: workspace-server/go.sum
 
-      - name: Verify generated artifact is in sync with providers.yaml
+      - name: Verify generated artifact is in sync with SDK registry
         run: |
           set -euo pipefail
           # -check regenerates in memory and byte-compares against the
@@ -97,7 +95,7 @@ jobs:
           # single source of the gate's verdict — the same code path
           # `go test ./cmd/gen-providers` exercises.
           if ! go run ./cmd/gen-providers -check; then
-            echo "::error::workspace-server/internal/providers/gen/registry_gen.go is stale (drifted from providers.yaml)."
+            echo "::error::workspace-server/internal/providers/gen/registry_gen.go is stale (drifted from the SDK registry module)."
             echo "Regenerate and commit it (run from repo root):"
             echo "  make gen          # native (needs a local Go toolchain)"
             echo "  make gen-docker   # Docker only — no local Go needed"
@@ -112,11 +110,11 @@ jobs:
           # this and the step above ever disagree, the gate is suspect.
           go generate ./...
           if ! git diff --quiet -- internal/providers/gen/registry_gen.go; then
-            echo "::error::workspace-server/internal/providers/gen/registry_gen.go drifted from providers.yaml."
+            echo "::error::workspace-server/internal/providers/gen/registry_gen.go drifted from the SDK registry module."
             echo "Regenerate and commit it. No local Go? Use Docker (run from repo root):"
             echo "  make gen          # native (needs a local Go toolchain)"
             echo "  make gen-docker   # Docker only — no local Go needed"
             git --no-pager diff -- internal/providers/gen/registry_gen.go | head -80
             exit 1
           fi
-          echo "OK — generated providers artifact is in sync with the schema SSOT."
+          echo "OK — generated providers artifact is in sync with the SDK registry SSOT."
