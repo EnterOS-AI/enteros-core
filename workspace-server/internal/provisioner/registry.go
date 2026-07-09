@@ -20,7 +20,6 @@ const defaultRegistryPrefix = "ghcr.io/molecule-ai"
 var knownRuntimes = []string{
 	"claude-code",
 	"codex",
-	"google-adk",
 	"hermes",
 	"openclaw",
 }

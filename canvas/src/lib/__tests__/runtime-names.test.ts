@@ -14,7 +14,6 @@ describe("runtimeDisplayName", () => {
   it.each([
     ["claude-code", "Claude Code"],
     ["codex", "Codex"],
-    ["google-adk", "Google ADK"],
     ["hermes", "Hermes"],
     ["openclaw", "OpenClaw"],
     ["crewai", "CrewAI"],

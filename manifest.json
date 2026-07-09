@@ -33,13 +33,11 @@
     {"name": "hermes", "repo": "molecule-ai/molecule-ai-workspace-template-hermes", "ref": "ca7e1efafb982f6d97a6a188067fd9198b2f18b7"},
     {"name": "openclaw", "repo": "molecule-ai/molecule-ai-workspace-template-openclaw", "ref": "0e76a281e93d338f05ed7468cf95047a9d87bae4"},
     {"name": "codex", "repo": "molecule-ai/molecule-ai-workspace-template-codex", "ref": "070447a0afdf66ae6f2bb166ac3e2b2884456951"},
-    {"name": "google-adk", "repo": "molecule-ai/molecule-ai-workspace-template-google-adk", "ref": "3f9fd7ef6ea4dd912bb65446607f3c3c991ea76e"},
     {"name": "seo-agent", "repo": "molecule-ai/molecule-ai-workspace-template-seo-agent", "ref": "f6a18eb4716a040fb24c5fb79830c50c5368a2da", "runtime": "claude-code", "private": true}
   ],
   "org_templates": [
     {"name": "mini-company", "repo": "molecule-ai/molecule-ai-org-template-mini-company", "ref": "a12d50695c4406dee245c1c2263c3505095fd87f"},
     {"name": "molecule-dev", "repo": "molecule-ai/molecule-ai-org-template-molecule-dev", "ref": "990d7b23f65dadd7afe05958a77eeb74082b4feb"},
-    {"name": "molecule-worker-gemini", "repo": "molecule-ai/molecule-ai-org-template-molecule-worker-gemini", "ref": "1d1205a8711a3bec8f6a8ddd087fc4ae430e2395"},
     {"name": "ux-ab-lab", "repo": "molecule-ai/molecule-ai-org-template-ux-ab-lab", "ref": "76fe4821153cc35b3f073f6e4f18f766f5f3a251"}
   ]
 }

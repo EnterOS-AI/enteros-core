@@ -50,22 +50,22 @@ func NewWorkspaceImageService(docker *dockerclient.Client) *WorkspaceImageServic
 // NOT a second hand-maintained list.
 //
 // Why derive instead of hardcode (controlplane#578): the old hardcoded slice
-// here ({claude-code, codex, hermes, openclaw}) silently DRIFTED from CP, which
-// already accepts `google-adk` for pin-promote/redeploy. A google-adk pin would
-// be accepted CP-side, then this tenant's POST /admin/workspace-images/refresh
-// ?runtime=google-adk rejected it 400 ("unknown runtime"), so google-adk image
-// fixes never deployed. Deriving from the manifest makes the tenant allowlist
-// and the CP allowlist provably the same set — they can't drift again.
+// here silently drifted from CP's runtime pin-promote/redeploy allowlist. A
+// runtime pin could be accepted CP-side, then this tenant's
+// POST /admin/workspace-images/refresh?runtime=<name> rejected it 400
+// ("unknown runtime"), so image fixes never deployed. Deriving from the
+// manifest makes the tenant allowlist and the CP allowlist provably the same
+// set — they can't drift again.
 //
 // imageRefreshFallbackRuntimes is used ONLY if the embedded providers manifest
 // fails to load (which would be a build/CI failure caught by the providers
 // package's own tests, never a healthy prod). It preserves the historical
-// behavior — plus google-adk — so a manifest regression can never take the
-// refresh endpoint fully offline. Kept in lockstep with the providers.yaml
+// behavior so a manifest regression can never take the refresh endpoint fully
+// offline. Kept in lockstep with the providers.yaml
 // `runtimes:` keys; the drift guard in admin_workspace_images_test.go asserts
 // the two match.
 var imageRefreshFallbackRuntimes = []string{
-	"claude-code", "codex", "google-adk", "hermes", "openclaw",
+	"claude-code", "codex", "hermes", "openclaw",
 }
 
 // AllRuntimes is computed once at package init from the providers SSOT.

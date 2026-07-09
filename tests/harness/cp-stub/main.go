@@ -230,7 +230,6 @@ func main() {
 				"hermes",
 				"openclaw",
 				"codex",
-				"google-adk",
 				"seo-agent",
 			},
 			"llm_endpoints": map[string]string{

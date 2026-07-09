@@ -80,7 +80,7 @@ The asset channel is **never** a secrets transport; the secrets channel is
 
 1. Mint (or reuse from the per-persona Infisical SSOT) a **read-only** Gitea PAT
    with repo-read scope on the template repos:
-   `molecule-ai/molecule-ai-workspace-template-{claude-code,hermes,openclaw,codex,google-adk,seo-agent}`.
+   `molecule-ai/molecule-ai-workspace-template-{claude-code,hermes,openclaw,codex,seo-agent}`.
    Do **not** use a founder PAT or a workspace-admin token.
 2. Store it in Infisical SSOT and project it to the workspace-server env as
    `MOLECULE_TEMPLATE_REPO_TOKEN`. Roll **staging first**, validate, then prod.

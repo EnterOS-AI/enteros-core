@@ -191,7 +191,7 @@ func giteaReachableForTest() bool {
 // and internal/provisioner/localbuild.go read MOLECULE_GITEA_TOKEN as
 // the SSOT token for private templates):
 //  1. MOLECULE_GITEA_TOKEN — bearer token (matches runtime; gives
-//     access to private repos like molecule-ai-workspace-template-google-adk
+//     access to private repos like molecule-ai-workspace-template-seo-agent
 //     and molecule-ai-workspace-template-seo-agent).
 //  2. GIT_HTTP_USERNAME + GIT_HTTP_PASSWORD — basic auth (legacy
 //     CI path; some jobs set these for git clone URLs).

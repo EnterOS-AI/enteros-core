@@ -5,10 +5,9 @@
 > provisioner's `knownRuntimes`, and the "PR #379" cited below is unrelated (a
 > CI-workflow-cleanup PR, not a gemini-cli adapter). Do not follow this as-is.
 >
-> **For Gemini on Molecule, use the real `google-adk` runtime instead** — see
-> [`google-adk-runtime.md`](./google-adk-runtime.md) (ADK engine + Gemini on
-> Vertex AI/AI Studio), implemented in PR
-> [`molecule-ai-workspace-template-google-adk#1`](https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-google-adk) per RFC `internal#730`.
+> **For Gemini on Molecule, use a maintained runtime such as `hermes` or
+> `openclaw` with the Gemini BYOK provider path.** The former `google-adk`
+> runtime has been retired from the supported runtime set.
 > This gemini-cli page is retained only until it's either implemented for real or removed.
 
 Molecule AI now ships a `gemini-cli` runtime adapter alongside the existing `claude-code` adapter. This tutorial walks you from zero to a running Gemini agent workspace in under five minutes.

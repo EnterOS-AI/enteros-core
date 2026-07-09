@@ -19,7 +19,7 @@ kind: env-mutator
 runtimes:
   - claude-code
   - crewai
-  - google-adk
+  - hermes
 skills:
   - approval-gate
 contributes:

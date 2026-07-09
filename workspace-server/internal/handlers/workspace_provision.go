@@ -453,7 +453,7 @@ func templateIdentityOrEmpty(id string, ok bool) string {
 // arrive via the asset channel. (agent-skills/seo-all is no longer carried
 // here at all — RFC#2843 #32: skills are plugins, installed post-online.)
 // Falls back to runtime for the common case where runtime==template name
-// (hermes/codex/openclaw/google-adk), and to "" when neither resolves (external
+// (hermes/codex/openclaw), and to "" when neither resolves (external
 // runtimes — collectCPConfigFiles treats empty identity as "skip the fetcher").
 func templateIdentityForTemplateOrRuntime(template, runtime string) string {
 	if t := strings.TrimSpace(template); t != "" {
@@ -636,7 +636,7 @@ func resolveWorkspaceTemplatePath(configsDir, cacheDir, template string) (string
 // runtimeRequiresOwnTemplate reports whether a runtime MUST be seeded from
 // its own workspace template (i.e. a cache-miss must never silently degrade
 // to a runtime-default / claude-code-shaped config). True for a KNOWN,
-// template-backed, non-claude-code runtime — e.g. google-adk / hermes /
+// template-backed, non-claude-code runtime — e.g. hermes /
 // codex / openclaw. False for claude-code (its `-default` template is baked
 // into the image, and a generated default config is correct), for
 // external-like meta-runtimes (no template repo), for "mock" (virtual, no
