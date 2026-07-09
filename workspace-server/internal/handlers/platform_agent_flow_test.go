@@ -30,7 +30,6 @@ func TestPlatformRuntimeAllowed(t *testing.T) {
 		{"", true},
 		{"claude-code", true},
 		{"codex", true},
-		{"google-adk", true},
 		{"hermes", true},
 		{"openclaw", true},
 		{"external", false},

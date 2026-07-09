@@ -16,7 +16,7 @@ const SchemaVersion = 1
 // Fingerprint is a stable content hash of the generated projection (schema
 // version + provider catalog + runtime native sets). It changes iff the
 // registry DATA changes (comment-only YAML edits do not churn it).
-const Fingerprint = "fcb296df3172d346"
+const Fingerprint = "8257c9c5785d6fc6"
 
 // GenProvider is the generated projection of one provider catalog entry —
 // the subset a downstream consumer needs to derive + display a provider.
@@ -96,10 +96,6 @@ var Runtimes = map[string][]GenRuntimeRef{
 		{Name: "openai-api", Models: []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"}},
 		{Name: "platform", Models: []string{"openai/gpt-5.4", "openai/gpt-5.4-mini", "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3"}},
 		{Name: "byok-minimax", Models: []string{}},
-	},
-	"google-adk": {
-		{Name: "platform", Models: []string{"platform:gemini-2.5-pro", "platform:gemini-2.5-flash"}},
-		{Name: "google", Models: []string{"gemini-2.5-pro", "gemini-2.5-flash", "google_genai:gemini-2.5-pro", "google_genai:gemini-2.5-flash"}},
 	},
 	"hermes": {
 		{Name: "kimi-coding", Models: []string{"kimi-coding/kimi-k2"}},

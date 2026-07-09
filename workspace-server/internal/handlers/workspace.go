@@ -1020,7 +1020,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	if payload.Template != "" {
 		// internal#3211: resolveTemplateWithRefreshOnMiss auto-refreshes the
 		// template cache on a MISS for a runtime that REQUIRES its own
-		// template (a KNOWN non-claude-code runtime — google-adk/hermes/codex/
+		// template (a KNOWN non-claude-code runtime — hermes/codex/
 		// openclaw) and re-resolves. On a persistent miss it returns a LOUD
 		// error and we fail-closed here — we NEVER fall through to a
 		// runtime-default / claude-code-shaped config for such a runtime. The

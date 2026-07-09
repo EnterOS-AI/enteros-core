@@ -497,7 +497,7 @@ func (h *WorkspaceHandler) restartRuntimeFromConfig(ctx context.Context, id, wsN
 	//
 	// Pre-fix this function let a config.yaml runtime that differed from the DB
 	// WIN, and even stomped the DB column back to the config value. That
-	// silently reverted a switched runtime (e.g. google-adk → claude-code) on
+	// silently reverted a switched runtime (e.g. hermes -> claude-code) on
 	// every plain "Restart" click, so a switched-runtime box was never built.
 	if h.provisioner == nil || applyTemplate {
 		return dbRuntime

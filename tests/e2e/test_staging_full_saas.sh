@@ -24,19 +24,13 @@
 #
 # Optional env:
 #   E2E_RUNTIME                  hermes (default) | claude-code | codex | openclaw
-#                                | seo-agent | google-adk
+#                                | seo-agent
 #                                  - seo-agent: a claude-code-adapter template
 #                                    VARIANT (not a distinct registry runtime).
 #                                    Selected via the `template` field (config.yaml
 #                                    resolves runtime=claude-code); reuses the
 #                                    same MiniMax/claude-code key path. See the
 #                                    TEMPLATE derivation + SECRETS_JSON block.
-#                                  - google-adk: Gemini. The AI-Studio-keyed BYOK
-#                                    path (E2E_GOOGLE_API_KEY) is staging-
-#                                    exercisable here; the keyless Vertex PROD
-#                                    path needs WIF (see header note + the CTO
-#                                    flag in the PR body) and is selected via
-#                                    E2E_LLM_PATH=platform + a platform: model.
 #   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold EC2 budget)
 #   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (60 min — hermes
 #                                cold-boot worst-case + slack). Raised from
@@ -757,24 +751,6 @@ print(json.dumps({
     'ANTHROPIC_API_KEY': k,
 }))
 ")
-elif [ -n "${E2E_GOOGLE_API_KEY:-}" ]; then
-  # google-adk AI-Studio BYOK path. The `google` provider entry
-  # (providers.yaml:401-413) reads GEMINI_API_KEY / GOOGLE_API_KEY and dials
-  # generativelanguage.googleapis.com — the tenant's OWN key, distinct from the
-  # keyless-Vertex PROD path (which routes through the CP proxy + server-side
-  # WIF and carries NO tenant credential). This branch exercises google-adk
-  # being PROVISIONED AT ALL on staging; the Vertex-specific WIF path is flagged
-  # for the CTO (needs extra provisioning) and is NOT reachable here. Inject
-  # under both env names the provider accepts so the adapter resolves regardless
-  # of which one it reads first.
-  SECRETS_JSON=$(python3 -c "
-import json, os
-k = os.environ['E2E_GOOGLE_API_KEY']
-print(json.dumps({
-    'GOOGLE_API_KEY': k,
-    'GEMINI_API_KEY': k,
-}))
-")
 elif [ -n "${E2E_OPENAI_API_KEY:-}" ]; then
   SECRETS_JSON=$(python3 -c "
 import json, os
@@ -997,12 +973,6 @@ PARENT_RESP=$(tenant_call POST /workspaces \
 set -e
 # Surface the workspace-create error CLEARLY instead of dying on a Python
 # KeyError when the response has no 'id'. The load-bearing cases this names:
-#   - google-adk: RUNTIME_UNSUPPORTED 422 if google-adk is absent from the
-#     deployed manifest.json's workspace_templates (the Create-handler
-#     allowlist is manifest-derived — runtime_registry.go). google-adk is in
-#     providers.yaml + provisioner/registry.go + registry_gen but NOT (yet) in
-#     manifest.json, so it cannot be provisioned by `runtime` until the
-#     manifest gains it. Flagged for the CTO — this arm REDS until then.
 #   - seo-agent: an "invalid template" 400 if the seo-agent template isn't
 #     present in the tenant's configs/cache dir (template-cache refresh gap).
 PARENT_ID=$(echo "$PARENT_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")

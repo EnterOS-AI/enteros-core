@@ -309,9 +309,6 @@ func TestDeriveProviderMatrix_KnownTrickyForms(t *testing.T) {
 		// --- codex gpt-* default (no auth) -> openai-subscription (first arm) ---
 		{"codex gpt default -> openai-subscription", "codex", "gpt-5.5", nil, "openai-subscription", false},
 		{"codex gpt with OPENAI_API_KEY -> openai-api", "codex", "gpt-5.5", []string{"OPENAI_API_KEY"}, "openai-api", false},
-		// --- google-adk platform vs BYOK google split -------------------------
-		{"google-adk platform: -> platform", "google-adk", "platform:gemini-2.5-pro", nil, "platform", false},
-		{"google-adk bare gemini -> google (BYOK)", "google-adk", "gemini-2.5-pro", nil, "google", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

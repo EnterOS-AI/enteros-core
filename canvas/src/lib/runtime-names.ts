@@ -6,7 +6,7 @@
 // independently-maintained list that is free to drift:
 //   1. The CP runtime catalog (molecule-controlplane
 //      internal/providers/runtimes.yaml) — the template-backed runtimes a
-//      workspace can run on: claude-code, codex, google-adk, hermes, openclaw,
+//      workspace can run on: claude-code, codex, hermes, openclaw,
 //      and crewai. Canvas surfaces the short brand label; the catalog's
 //      display_name is the long form (e.g. "CrewAI Agent" → "CrewAI",
 //      "Claude Code Agent" → "Claude Code").
@@ -25,7 +25,6 @@ const RUNTIME_NAMES: Record<string, string> = {
   // CP runtime catalog (runtimes.yaml) — template-backed runtimes.
   "claude-code": "Claude Code",
   codex: "Codex",
-  "google-adk": "Google ADK",
   hermes: "Hermes",
   openclaw: "OpenClaw",
   crewai: "CrewAI",

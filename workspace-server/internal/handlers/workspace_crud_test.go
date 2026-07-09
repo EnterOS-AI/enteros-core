@@ -641,9 +641,9 @@ func TestUpdate_Runtime_RegisteredModelForRuntime_Passes(t *testing.T) {
 // model_was_reset:true + the new model.
 //
 // Repro shape from the bug report: model "moonshot/kimi-k2.6" (a claude-code
-// platform id, NOT registered for google-adk) + switch runtime to google-adk.
+// platform id, NOT registered for codex) + switch runtime to codex.
 // Pre-fix: 422, runtime stays claude-code. Post-fix: model resets to
-// google-adk's default ("platform:gemini-2.5-pro"), runtime becomes google-adk.
+// codex's default ("gpt-5.5"), runtime becomes codex.
 func TestUpdate_Runtime_IncompatibleModel_AutoResetsToDefault(t *testing.T) {
 	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	mock, r := setupWorkspaceCrudTest(t)
@@ -654,26 +654,26 @@ func TestUpdate_Runtime_IncompatibleModel_AutoResetsToDefault(t *testing.T) {
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	// Current model = moonshot/kimi-k2.6 (a claude-code platform id). It is
-	// NOT registered for google-adk → orphaned → auto-reset fires.
+	// NOT registered for codex -> orphaned -> auto-reset fires.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
 	// Auto-reset + runtime UPDATE are ONE atomic tx (CR2 review 13597): the
 	// model-reset INSERT and the runtime UPDATE commit-or-rollback together.
-	// google-adk's first registered model is "platform:gemini-2.5-pro"
+	// codex's first registered model is "gpt-5.5"
 	// (registry_gen.go). Tests run with encryption disabled, so the encrypted
 	// value is the plaintext bytes and the version is the plaintext version (0).
 	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO workspace_secrets`).
-		WithArgs(wsID, []byte("platform:gemini-2.5-pro"), 0).
+		WithArgs(wsID, []byte("gpt-5.5"), 0).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// The runtime change is then persisted in the SAME tx — NO rollback.
 	mock.ExpectExec(`UPDATE workspaces\s+SET runtime = \$2`).
-		WithArgs(wsID, "google-adk").
+		WithArgs(wsID, "codex").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
-	body := map[string]interface{}{"runtime": "google-adk"}
+	body := map[string]interface{}{"runtime": "codex"}
 	b, _ := json.Marshal(body)
 	req, _ := http.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
@@ -690,8 +690,8 @@ func TestUpdate_Runtime_IncompatibleModel_AutoResetsToDefault(t *testing.T) {
 	if resp["model_was_reset"] != true {
 		t.Errorf("expected model_was_reset=true, got %v (body=%s)", resp["model_was_reset"], w.Body.String())
 	}
-	if resp["model"] != "platform:gemini-2.5-pro" {
-		t.Errorf("expected reset model=platform:gemini-2.5-pro, got %v", resp["model"])
+	if resp["model"] != "gpt-5.5" {
+		t.Errorf("expected reset model=gpt-5.5, got %v", resp["model"])
 	}
 	// Both the model-reset INSERT and the runtime UPDATE must have fired —
 	// this asserts there was NO rollback (the runtime change is persisted).
@@ -701,7 +701,7 @@ func TestUpdate_Runtime_IncompatibleModel_AutoResetsToDefault(t *testing.T) {
 }
 
 // TestUpdate_Runtime_ClaudeCode_IncompatibleModel_AutoResetsToDefault is the
-// reverse direction: google-adk → claude-code with an orphaned google model.
+// reverse direction: codex -> claude-code with an orphaned Codex model.
 // claude-code's default registered model is "sonnet" (registry_gen.go).
 func TestUpdate_Runtime_ClaudeCode_IncompatibleModel_AutoResetsToDefault(t *testing.T) {
 	wsID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -712,10 +712,10 @@ func TestUpdate_Runtime_ClaudeCode_IncompatibleModel_AutoResetsToDefault(t *test
 	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	// gemini-2.5-pro is a google-adk model, NOT registered for claude-code.
+	// gpt-5.5 is a codex model, NOT registered for claude-code.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("gemini-2.5-pro"), 0))
+		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("gpt-5.5"), 0))
 	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO workspace_secrets`).
 		WithArgs(wsID, []byte("sonnet"), 0).
@@ -756,7 +756,7 @@ func TestUpdate_Runtime_ClaudeCode_IncompatibleModel_AutoResetsToDefault(t *test
 // model/runtime dual-state this change exists to prevent.
 //
 // We drive it with the same orphaned-model repro (claude-code MODEL ->
-// google-adk runtime) but make the runtime UPDATE error inside the tx. sqlmock
+// codex runtime) but make the runtime UPDATE error inside the tx. sqlmock
 // asserts: Begin fired, the INSERT fired, the UPDATE was attempted and errored,
 // then Rollback (NOT Commit) fired — i.e. neither write persisted.
 func TestUpdate_Runtime_AutoReset_RuntimeUpdateFails_RollsBack(t *testing.T) {
@@ -768,24 +768,24 @@ func TestUpdate_Runtime_AutoReset_RuntimeUpdateFails_RollsBack(t *testing.T) {
 	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM workspaces WHERE id = \$1\)`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	// Orphaned model → auto-reset to google-adk's default fires.
+	// Orphaned model -> auto-reset to codex's default fires.
 	mock.ExpectQuery(`SELECT encrypted_value, encryption_version FROM workspace_secrets WHERE workspace_id = \$1 AND key = 'MODEL'`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}).AddRow([]byte("moonshot/kimi-k2.6"), 0))
 	mock.ExpectBegin()
 	// The model-reset INSERT succeeds...
 	mock.ExpectExec(`INSERT INTO workspace_secrets`).
-		WithArgs(wsID, []byte("platform:gemini-2.5-pro"), 0).
+		WithArgs(wsID, []byte("gpt-5.5"), 0).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// ...but the runtime UPDATE FAILS. The tx must roll back — NOT commit.
 	mock.ExpectExec(`UPDATE workspaces\s+SET runtime = \$2`).
-		WithArgs(wsID, "google-adk").
+		WithArgs(wsID, "codex").
 		WillReturnError(fmt.Errorf("simulated runtime UPDATE failure"))
 	// Rollback (not Commit) is the load-bearing assertion: the model-reset
 	// INSERT is undone with it, so the MODEL secret is NOT left changed.
 	mock.ExpectRollback()
 
-	body := map[string]interface{}{"runtime": "google-adk"}
+	body := map[string]interface{}{"runtime": "codex"}
 	b, _ := json.Marshal(body)
 	req, _ := http.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
