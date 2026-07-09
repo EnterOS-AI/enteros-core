@@ -31,7 +31,7 @@ func TestCreate_BYOKModelNoCredential_422(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Doomed","model":"claude-sonnet-4-6"}`
+	body := `{"name":"Doomed","runtime":"claude-code","model":"claude-sonnet-4-6"}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 

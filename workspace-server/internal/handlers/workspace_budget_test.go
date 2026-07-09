@@ -154,7 +154,7 @@ func TestWorkspaceBudget_Create_WithLimit(t *testing.T) {
 			"Budgeted Agent",                 // name
 			nil,                              // role
 			3,                                // tier (default, workspace.go create-handler)
-			"claude-code",                    // runtime
+			"hermes",                         // runtime
 			"",                               // template
 			(*string)(nil),                   // parent_id
 			nil,                              // workspace_dir
@@ -177,7 +177,7 @@ func TestWorkspaceBudget_Create_WithLimit(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	body := `{"name":"Budgeted Agent","model":"anthropic:claude-opus-4-7","budget_limit":1000}`
+	body := `{"name":"Budgeted Agent","model":"minimax/MiniMax-M2.7","budget_limit":1000}`
 	c.Request = httptest.NewRequest("POST", "/workspaces", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	handler.Create(c)

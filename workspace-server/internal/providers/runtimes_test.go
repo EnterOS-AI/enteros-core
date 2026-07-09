@@ -137,6 +137,8 @@ func TestModelsForRuntime_ExactModelIDs(t *testing.T) {
 		"hermes": {
 			"kimi-coding/kimi-k2",
 			"moonshot/kimi-k2.6", "moonshot/kimi-k2.5",
+			// minimax via tenant BYOK key (self-host onboarding default)
+			"minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed", "minimax:MiniMax-M3",
 			// minimax via platform proxy (task #83 platform default)
 			"minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7-highspeed", "minimax/MiniMax-M3",
 		},

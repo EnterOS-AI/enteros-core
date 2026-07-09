@@ -92,10 +92,10 @@ func resolveRestartTemplate(configsDir, wsName, dbRuntime, dbTemplate string, bo
 	// "../../../etc" and, if a directory matching that path existed on the
 	// host, load an arbitrary host directory as the workspace template.
 	//
-	// sanitizeRuntime applies an allowlist of known runtimes; any unknown
-	// value (including traversal strings) is remapped to "claude-code".  The
-	// attacker cannot choose an arbitrary host path — they can at most
-	// trigger application of the claude-code-default template.
+	// sanitizeRuntime applies an allowlist of known runtimes; any unknown value
+	// (including traversal strings) is remapped to the compiled-in default
+	// runtime. The attacker cannot choose an arbitrary host path — they can at
+	// most trigger application of that runtime's default template.
 	if body.ApplyTemplate && dbRuntime != "" {
 		safeRuntime := sanitizeRuntime(dbRuntime)
 		runtimeTemplate := filepath.Join(configsDir, safeRuntime+"-default")

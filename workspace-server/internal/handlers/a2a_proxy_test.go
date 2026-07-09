@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -4051,6 +4052,9 @@ func TestProxyA2A_ExternalAgent_MissingInboundSecret_Rejected(t *testing.T) {
 //   - a wrong secret is rejected by the external agent (403);
 //   - the correct secret is attached and the request is accepted (200).
 func TestProxyA2A_InboundAuth_ExternalVerifierSimulation(t *testing.T) {
+	restoreSSRF := setSSRFCheckForTest(false)
+	t.Cleanup(restoreSSRF)
+
 	const expectedSecret = "agent-expected-secret-3319"
 
 	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4069,10 +4073,22 @@ func TestProxyA2A_InboundAuth_ExternalVerifierSimulation(t *testing.T) {
 	}))
 	defer agentServer.Close()
 
-	// Use "localhost" as the host so isExternalAgentURL classifies it as
-	// external (it is not the container DNS name or a platform tunnel), while
-	// the HTTP client still resolves it to the httptest server.
-	agentURL := strings.Replace(agentServer.URL, "127.0.0.1", "localhost", 1)
+	targetHost := strings.TrimSuffix(strings.TrimPrefix(agentServer.URL, "http://"), "/")
+	prevClient := a2aClient
+	a2aClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("tcp", targetHost)
+			},
+			ResponseHeaderTimeout: 180 * time.Second,
+		},
+	}
+	t.Cleanup(func() { a2aClient = prevClient })
+
+	// Use a public-looking hostname so isExternalAgentURL classifies the target
+	// as external while the test transport above deterministically dials the
+	// local httptest server.
+	agentURL := "http://external-agent.test"
 
 	cases := []struct {
 		name       string
