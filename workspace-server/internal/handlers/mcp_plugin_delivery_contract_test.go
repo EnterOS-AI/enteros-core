@@ -23,9 +23,9 @@ func TestMCPPluginDeliveryContract_MatchesSSOT(t *testing.T) {
 	// MatchesSSOT asserts the scalar fields AND the #3159 extensions: the
 	// MCP-wiring PORT symbol names (port.hook/impl/present_probe/dispatch/
 	// resolver_default) and the per-runtime native delivery surfaces
-	// (claude_code/codex implemented, gemini/hermes declared-but-todo). A drift
-	// in any of these — e.g. the PORT being collapsed back into a hard-coded
-	// Claude write, or a runtime silently dropping out — fails here.
+	// (claude_code/codex/openclaw/hermes implemented). A drift in any of these
+	// — e.g. the PORT being collapsed back into a hard-coded Claude write, or a
+	// runtime silently dropping out — fails here.
 	if diffs := MatchesSSOT(c); len(diffs) > 0 {
 		for _, d := range diffs {
 			t.Errorf("contract SSOT drift: %s", d)
