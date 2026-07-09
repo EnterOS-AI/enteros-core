@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # clone-manifest.sh — clone all repos listed in manifest.json into their
 # target directories. Replaces hardcoded git-clone lines in Dockerfiles.
 #
@@ -26,7 +26,9 @@
 #   The token (when set) never enters the Docker image: this script runs
 #   in the trusted CI context BEFORE `docker buildx build`, populates
 #   .tenant-bundle-deps/, then `Dockerfile.tenant` COPYs from there with
-#   the .git directories already stripped (see line ~67 below).
+#   the .git directories already stripped. Each cloned tree keeps only a
+#   token-free `.molecule-manifest-source` marker so future runs can tell
+#   whether the populated directory still matches manifest.json.
 
 set -euo pipefail
 
@@ -92,7 +94,7 @@ clone_one_with_retry() {
     while : ; do
         # A killed attempt can leave a partial directory behind; git clone
         # refuses a non-empty target, so wipe it before each try.
-        rm -rf "$tdir/$name"
+        rm -rf "${tdir:?}/${name:?}"
 
         if [ "$ref" = "main" ]; then
             if $git_clone --depth=1 -q "$url" "$tdir/$name"; then return 0; fi
@@ -127,6 +129,16 @@ clone_one_with_retry() {
     done
 }
 
+manifest_meta_value() {
+    local provider="$1" repo="$2" ref="$3"
+    printf 'provider=%s\nrepo=%s\nref=%s' "$provider" "$repo" "$ref"
+}
+
+write_manifest_meta() {
+    local dir="$1" provider="$2" repo="$3" ref="$4"
+    manifest_meta_value "$provider" "$repo" "$ref" > "$dir/.molecule-manifest-source"
+}
+
 clone_category() {
     local category="$1"
     local target_dir="$2"
@@ -151,17 +163,6 @@ clone_category() {
         # provider names the SCM host the repo path resolves against
         # (see manifest.json _provider_contract). Absent ⇒ moleculesai.
         provider=$(echo "$MANIFEST_JSON" | jq -r ".${category}[$i].provider // \"moleculesai\"")
-
-        # Idempotent: skip if the target already looks populated. Lets the
-        # README quickstart rerun setup.sh safely without having to delete
-        # already-cloned repos. A directory with any entries counts as
-        # populated; empty dirs reclone (may exist from a prior failed run).
-        if [ -d "$target_dir/$name" ] && [ -n "$(ls -A "$target_dir/$name" 2>/dev/null || true)" ]; then
-            echo "  skipping $target_dir/$name (already populated)"
-            CLONED=$((CLONED + 1))
-            i=$((i + 1))
-            continue
-        fi
 
         # Resolve the provider to its git host + read-token env var. The
         # discriminator names our HOST IDENTITY, not the server software,
@@ -190,6 +191,36 @@ clone_category() {
             display_url="$clone_url"
         fi
 
+        # Idempotent, but ref-aware: these target directories are manifest-
+        # managed generated trees and intentionally have .git stripped after
+        # clone. A plain "already populated" skip lets an old tree survive
+        # forever after manifest.json advances. The token-free marker records
+        # the provider/repo/ref that produced the tree; only an exact match is a
+        # cache hit. Legacy populated trees with no marker are refreshed once.
+        if [ -d "$target_dir/$name" ] && [ -n "$(ls -A "$target_dir/$name" 2>/dev/null || true)" ]; then
+            meta_file="$target_dir/$name/.molecule-manifest-source"
+            expected_meta="$(manifest_meta_value "$provider" "$repo" "$ref")"
+            actual_meta="$(cat "$meta_file" 2>/dev/null || true)"
+            if [ "$actual_meta" = "$expected_meta" ]; then
+                echo "  skipping $target_dir/$name (manifest ref unchanged: $ref)"
+                CLONED=$((CLONED + 1))
+                i=$((i + 1))
+                continue
+            fi
+            if [ -d "$target_dir/$name/.git" ] && [ -n "$(git -C "$target_dir/$name" status --porcelain 2>/dev/null || true)" ]; then
+                echo "::error::manifest target '$target_dir/$name' has local git changes; refusing to replace stale checkout for $display_url (ref=$ref)" >&2
+                exit 1
+            fi
+            if [ "$private" = "true" ] && [ -z "$token" ]; then
+                echo "  ⚠ keeping stale '$target_dir/$name' — manifest marker is missing/changed, but repo is private and no $provider token is set. Set the token and rerun to refresh." >&2
+                CLONED=$((CLONED + 1))
+                i=$((i + 1))
+                continue
+            fi
+            echo "  refreshing $target_dir/$name (manifest ref changed or marker missing; ref=$ref)"
+            rm -rf "${target_dir:?}/${name:?}"
+        fi
+
         echo "  cloning $display_url -> $target_dir/$name (ref=$ref)"
         # Strict vs best-effort is decided PER ENTRY by whether we hold this
         # entry's provider token (resolved above): with the token, any clone
@@ -199,6 +230,7 @@ clone_category() {
             # Token present for this provider → genuine clone. Retry transient
             # flakes; a final failure is a real error and must abort the build.
             if clone_one_with_retry "$target_dir" "$name" "$clone_url" "$display_url" "$ref" 3; then
+                write_manifest_meta "$target_dir/$name" "$provider" "$repo" "$ref"
                 CLONED=$((CLONED + 1))
             else
                 echo "::error::clone failed for '$name' ($display_url) with a $provider token set — genuine failure, not a missing-creds skip" >&2
@@ -212,11 +244,12 @@ clone_category() {
             # non-auth Gitea error — is a GENUINE error and must still abort,
             # so a real outage can never be silently swallowed as a skip.
             if clone_one_with_retry "$target_dir" "$name" "$clone_url" "$display_url" "$ref" 1; then
+                write_manifest_meta "$target_dir/$name" "$provider" "$repo" "$ref"
                 CLONED=$((CLONED + 1))
             elif [ "$private" = "true" ]; then
                 echo "  ⚠ skipping '$name' — marked private and no $provider token is set (set it to include this repo). Bootstrap continues with a reduced template palette." >&2
                 SKIPPED=$((SKIPPED + 1))
-                rm -rf "$target_dir/$name"   # drop any partial dir so a later token-backed run re-clones cleanly
+                rm -rf "${target_dir:?}/${name:?}"   # drop any partial dir so a later token-backed run re-clones cleanly
             else
                 echo "::error::clone failed for PUBLIC repo '$name' ($display_url) — genuine failure (not a missing-creds skip). Check the manifest ref / network / repo existence. (If this repo is actually private, mark it \"private\": true in manifest.json.)" >&2
                 exit 1

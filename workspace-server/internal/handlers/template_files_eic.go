@@ -48,7 +48,9 @@ import (
 // `/configs` is root-owned (cloud-init runs as root); the SSH-as-ubuntu
 // install command at the call site below uses `sudo` to write into it.
 var workspaceFilePathPrefix = map[string]string{
+	"codex":       "/home/ubuntu/.codex",
 	"hermes":      "/home/ubuntu/.hermes",
+	"openclaw":    "/home/ubuntu/.openclaw",
 	"claude-code": "/configs",
 	"external":    "/opt/configs",
 	// Default for unknown / future runtimes is /configs — matches the
