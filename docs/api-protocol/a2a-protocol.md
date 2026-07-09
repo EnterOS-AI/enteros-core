@@ -211,14 +211,18 @@ On completion, the task returns artifacts:
 
 The canvas (browser) cannot reach Docker-internal agent URLs directly. The platform provides `POST /workspaces/:id/a2a` as a proxy:
 
-1. Canvas sends JSON-RPC to the platform proxy
-2. Proxy resolves the agent's host-accessible URL from Redis cache (falls back to DB)
-3. If the request lacks a `jsonrpc` field, the proxy wraps it in a JSON-RPC 2.0 envelope with a generated UUID
-4. If `params.message.messageId` is missing, the proxy injects one (required by a2a-sdk)
-5. Proxy forwards the request to the agent (120s timeout, 10MB response limit)
-6. Agent response is returned to the caller
+1. The caller presents a workspace bearer, verified control-plane session, `ADMIN_TOKEN`, org token, or the target-bound external inbound secret.
+2. For workspace callers, the platform derives the source workspace from the bearer. `X-Workspace-ID`, when supplied, must match that identity.
+3. The proxy enforces hierarchy and same-org access before resolving the target.
+4. The proxy resolves the agent's host-accessible URL from Redis cache (falls back to DB).
+5. If the request lacks a `jsonrpc` field, the proxy wraps it in a JSON-RPC 2.0 envelope with a generated UUID.
+6. If `params.message.messageId` is missing, the proxy injects one (required by a2a-sdk).
+7. The proxy forwards the request to the agent and returns the response.
 
-This proxy is the **only** way the canvas communicates with agents. Workspace-to-workspace communication is direct (no proxy).
+Missing, revoked, tokenless legacy, forged-self, mismatched-header, and auth
+datastore-error cases fail closed before dispatch. Supported canvas and
+workspace clients use this authenticated proxy; a raw direct call to a
+discovered agent URL is outside the platform authorization boundary.
 
 ## Key Properties
 
@@ -227,8 +231,8 @@ This proxy is the **only** way the canvas communicates with agents. Workspace-to
 - **On-demand:** Workspaces discover peers when needed, not at startup
 - **Opaque execution:** The caller doesn't know (or care) what's inside the callee
 - **Interoperable:** Any A2A-compliant agent from any framework can plug in
-- **Direct:** Workspace-to-workspace messages go direct; canvas uses platform proxy
-- **MVP auth:** Discovery-time only; post-MVP adds signed tokens
+- **Source-bound auth:** Workspace bearer ownership is the authoritative caller identity
+- **Fail-closed:** Invalid credentials and auth lookup failures never downgrade to canvas traffic
 
 ## Related Docs
 

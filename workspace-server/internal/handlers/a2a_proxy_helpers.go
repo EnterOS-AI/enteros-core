@@ -996,6 +996,55 @@ func injectCanvasUserIdentity(body []byte, ident *canvasIdentity) ([]byte, error
 	return out, nil
 }
 
+const a2aInboundAuthenticatedContextKey = "a2a_inbound_authenticated"
+
+// authenticateA2AHTTPCaller returns the server-authenticated caller identity.
+// X-Workspace-ID is only a claim: for workspace callers it must match the
+// presented workspace bearer's owner. Human callers must present a verified
+// CP session, ADMIN_TOKEN, or org token. The external inbound endpoint sets a
+// private Gin context marker only after validating and consuming the target's
+// inbound secret.
+func authenticateA2AHTTPCaller(ctx context.Context, c *gin.Context, claimedCallerID string) (callerID string, isCanvasUser bool, err error) {
+	if authenticated, _ := c.Get(a2aInboundAuthenticatedContextKey); authenticated == true {
+		return claimedCallerID, false, nil
+	}
+
+	if middleware.IsVerifiedCanvasSession(c) {
+		return claimedCallerID, true, nil
+	}
+
+	tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
+	if tok == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing caller auth token"})
+		return "", false, errInvalidCallerToken
+	}
+
+	adminSecret := os.Getenv("ADMIN_TOKEN")
+	if adminSecret != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(adminSecret)) == 1 {
+		return claimedCallerID, true, nil
+	}
+
+	workspaceID, workspaceErr := wsauth.WorkspaceFromToken(ctx, db.DB, tok)
+	if workspaceErr == nil {
+		if claimedCallerID != "" && claimedCallerID != workspaceID {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "caller ID does not match workspace auth token"})
+			return "", false, errInvalidCallerToken
+		}
+		if err := wsauth.ValidateToken(ctx, db.DB, workspaceID, tok); err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid caller auth token"})
+			return "", false, err
+		}
+		return workspaceID, false, nil
+	}
+
+	if _, _, _, orgErr := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); orgErr == nil {
+		return claimedCallerID, true, nil
+	}
+
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid caller auth token"})
+	return "", false, workspaceErr
+}
+
 // On auth failure this writes the 401 via c and returns an error so the
 // handler aborts without running the proxy.
 func validateCallerToken(ctx context.Context, c *gin.Context, callerID string) (isCanvasUser bool, err error) {
@@ -1006,21 +1055,6 @@ func validateCallerToken(ctx context.Context, c *gin.Context, callerID string) (
 		return true, nil
 	}
 
-	hasLive, dbErr := wsauth.HasAnyLiveToken(ctx, db.DB, callerID)
-	if dbErr != nil {
-		// Fail-open here matches the heartbeat path — A2A caller auth is
-		// defense-in-depth on top of access-control hierarchy, not the
-		// sole gate on the secret material. A DB hiccup shouldn't take
-		// the whole A2A path down.
-		log.Printf("wsauth: caller HasAnyLiveToken(%s) failed: %v — allowing A2A", callerID, dbErr)
-		return false, nil
-	}
-	if !hasLive {
-		// Tokenless, non-canvas-user workspace — legacy / pre-upgrade peer.
-		// Grandfather it through (its next /registry/register mints its
-		// first token, after which it lands in the hasLive=true branch).
-		return false, nil
-	}
 	tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
 	if tok == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing caller auth token"})

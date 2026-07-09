@@ -1031,6 +1031,7 @@ func TestIntegration_A2AQueueStatus_CallerMatchesCallerID(t *testing.T) {
 	c, w := newTestGinContext()
 	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: qid}}
 	c.Request.Header.Set("X-Workspace-ID", callerID)
+	c.Set(a2aInboundAuthenticatedContextKey, true)
 	wh.GetA2AQueueStatus(c)
 
 	if w.Code != http.StatusOK {
@@ -1063,6 +1064,7 @@ func TestIntegration_A2AQueueStatus_CallerMatchesWorkspaceID(t *testing.T) {
 	c, w := newTestGinContext()
 	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: qid}}
 	c.Request.Header.Set("X-Workspace-ID", wsID)
+	c.Set(a2aInboundAuthenticatedContextKey, true)
 	wh.GetA2AQueueStatus(c)
 
 	if w.Code != http.StatusOK {
@@ -1087,7 +1089,8 @@ func TestIntegration_A2AQueueStatus_OrgTokenBypass(t *testing.T) {
 	wh := &WorkspaceHandler{broadcaster: noOpEmitter{}}
 	c, w := newTestGinContext()
 	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: qid}}
-	c.Set("org_token_id", "test-org-token")
+	t.Setenv("ADMIN_TOKEN", "test-admin-token")
+	c.Request.Header.Set("Authorization", "Bearer test-admin-token")
 	wh.GetA2AQueueStatus(c)
 
 	if w.Code != http.StatusOK {
@@ -1107,6 +1110,7 @@ func TestIntegration_A2AQueueStatus_MismatchedCaller(t *testing.T) {
 	c, w := newTestGinContext()
 	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: qid}}
 	c.Request.Header.Set("X-Workspace-ID", otherWS)
+	c.Set(a2aInboundAuthenticatedContextKey, true)
 	wh.GetA2AQueueStatus(c)
 
 	if w.Code != http.StatusForbidden {
@@ -1141,6 +1145,7 @@ func TestIntegration_A2AQueueStatus_NonExistentQueueID(t *testing.T) {
 	c, w := newTestGinContext()
 	c.Params = gin.Params{{Key: "id", Value: wsID}, {Key: "queue_id", Value: uuid.New().String()}}
 	c.Request.Header.Set("X-Workspace-ID", callerID)
+	c.Set(a2aInboundAuthenticatedContextKey, true)
 	wh.GetA2AQueueStatus(c)
 
 	if w.Code != http.StatusNotFound {

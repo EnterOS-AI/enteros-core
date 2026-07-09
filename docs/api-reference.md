@@ -53,7 +53,8 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | POST | /workspaces/:id/restart | workspace.go |
 | POST | /workspaces/:id/pause | workspace.go (stops container, status→paused) |
 | POST | /workspaces/:id/resume | workspace.go (re-provisions paused workspace) |
-| POST | /workspaces/:id/a2a | workspace.go |
+| POST | /workspaces/:id/a2a | workspace.go — requires a source-bound workspace bearer or verified human/inbound credential; optional `X-Workspace-ID` must match bearer ownership |
+| GET | /workspaces/:id/a2a/queue/:queue_id | a2a_queue_status.go — same authentication as A2A send, followed by queue sender/target ownership check |
 | POST | /workspaces/:id/delegate | delegation.go (async fire-and-forget) |
 | GET | /workspaces/:id/delegations | delegation.go (list delegation status) |
 | GET/POST | /workspaces/:id/schedules | schedules.go (cron CRUD) |

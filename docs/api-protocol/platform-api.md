@@ -267,7 +267,10 @@ Canvas clients receive the global event stream. Workspaces connect with `X-Works
 
 It currently:
 
-- enforces access control via `CanCommunicate` for agent-to-agent calls (workspace caller IDs from `X-Workspace-ID`); canvas requests, self-calls, and system callers (`webhook:*`, `system:*`, `test:*`) bypass
+- authenticates every public HTTP request before dispatch; workspace identity is derived from the bearer and an optional `X-Workspace-ID` must match it
+- accepts human traffic only through a verified control-plane session, `ADMIN_TOKEN`, or org token; authenticated external inbound traffic uses the target-bound inbound secret
+- rejects tokenless legacy, invalid/revoked bearer, forged-self, and auth datastore-error requests instead of treating them as canvas traffic
+- enforces `CanCommunicate` and same-org isolation for authenticated workspace-to-workspace calls; verified human and server-side system calls bypass hierarchy
 - normalizes incoming JSON into JSON-RPC 2.0
 - injects `messageId` when missing
 - applies different timeout rules for browser-initiated vs workspace-initiated calls

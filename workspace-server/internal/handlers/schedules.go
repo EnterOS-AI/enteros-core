@@ -461,12 +461,12 @@ type ScheduleHealthResponse struct {
 //
 // Auth rules (mirrors the A2A proxy pattern):
 //   - X-Workspace-ID header is required to identify the caller.
-//   - If the caller workspace has any live tokens, the Authorization: Bearer
-//     header must carry that caller's own valid token (lazy-bootstrap: legacy
-//     workspaces with no tokens are grandfathered through).
+//   - The Authorization bearer must authenticate the caller workspace, or be
+//     a verified human admin/session credential. There is no tokenless legacy
+//     or self-call exception.
 //   - registry.CanCommunicate(callerID, workspaceID) must return true.
-//   - System callers (webhook:*, system:*, test:*) bypass token + access checks.
-//   - Self-calls (callerID == workspaceID) are always allowed.
+//   - System caller prefixes supplied through HTTP are rejected.
+//   - Self-calls skip hierarchy checks only after bearer authentication.
 //
 // Prompt and cron_expr are intentionally absent from the response.
 func (h *ScheduleHandler) Health(c *gin.Context) {
@@ -479,22 +479,21 @@ func (h *ScheduleHandler) Health(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "X-Workspace-ID header required"})
 		return
 	}
+	if isSystemCaller(callerID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid caller ID"})
+		return
+	}
 
 	// Validate the caller's own bearer token (Phase 30.5 contract).
-	// Skip for system callers and self-calls, same as the A2A proxy.
 	// Post-RFC#637: canvas users may read schedule health too.
-	isCanvasUser := false
-	if !isSystemCaller(callerID) && callerID != workspaceID {
-		var err error
-		isCanvasUser, err = validateCallerToken(ctx, c, callerID)
-		if err != nil {
-			return // response already written with 401
-		}
+	isCanvasUser, err := validateCallerToken(ctx, c, callerID)
+	if err != nil {
+		return // response already written with 401
 	}
 
 	// CanCommunicate gate — only peers in the org hierarchy may read health.
 	// Canvas users (human operators) bypass this gate.
-	if callerID != workspaceID && !isSystemCaller(callerID) && !isCanvasUser {
+	if callerID != workspaceID && !isCanvasUser {
 		if !registry.CanCommunicate(callerID, workspaceID) {
 			log.Printf("ScheduleHealth: access denied %s → %s", callerID, workspaceID)
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
@@ -532,4 +531,3 @@ func (h *ScheduleHandler) Health(c *gin.Context) {
 
 	c.JSON(http.StatusOK, schedules)
 }
-

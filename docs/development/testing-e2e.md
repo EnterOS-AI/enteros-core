@@ -24,6 +24,13 @@ After Phase 30.6, the following routes additionally require `X-Workspace-ID` on 
 - `GET /registry/discover/:id`
 - `GET /registry/:id/peers`
 
+The A2A send and queue-status routes are stricter:
+
+- `POST /workspaces/:id/a2a` requires a workspace bearer, verified human credential, or the verified external-inbound path.
+- `GET /workspaces/:id/a2a/queue/:queue_id` applies the same authentication before checking row ownership.
+- A workspace bearer determines the source identity. An optional `X-Workspace-ID` must match it.
+- Tokenless legacy callers and authentication datastore errors fail closed.
+
 The scripts handle this by:
 
 1. Creating a workspace → platform returns no token yet.

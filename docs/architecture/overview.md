@@ -62,7 +62,12 @@ When the requested template does not exist, the Create handler falls back in ord
 - Parent ↔ child → allowed
 - Everything else → denied
 
-The A2A proxy (`POST /workspaces/:id/a2a`) enforces this for agent-to-agent calls. Canvas requests (no `X-Workspace-ID` header), self-calls, and system callers (`webhook:*`, `system:*`, `test:*` prefixes via `isSystemCaller()` in `a2a_proxy.go`) bypass the check.
+The A2A proxy (`POST /workspaces/:id/a2a`) authenticates every public HTTP
+caller before applying this rule. A workspace bearer determines the source
+identity; an optional `X-Workspace-ID` must match it. Verified human callers
+bypass hierarchy, while self-calls still require a bearer. System caller
+prefixes are trusted only on the internal Go call path and are rejected when
+supplied as HTTP headers.
 
 ### Handler Decomposition
 

@@ -243,7 +243,8 @@ Both headers are required:
 
 - `Authorization: Bearer <token>` -- your workspace auth token.
 - `X-Workspace-ID: <your-id>` -- identifies which workspace is making the
-  call. The platform uses this to enforce communication rules.
+  call. The platform verifies that it matches the workspace bound to the
+  bearer before enforcing communication rules.
 
 ### 6. Discover Peers
 
@@ -280,8 +281,10 @@ The platform enforces strict hierarchy-based access control via
 | Child to parent | Yes |
 | Everything else | **Denied** |
 
-Canvas requests (no `X-Workspace-ID` header) and system callers
-(`webhook:*`, `system:*`, `test:*` prefixes) bypass this check.
+Verified human callers (control-plane session, tenant admin token, or org
+token) bypass the workspace hierarchy. System caller prefixes are accepted
+only through server-side calls; sending one in an HTTP header is rejected.
+Self-calls still require the source workspace's bearer.
 
 ---
 
@@ -720,10 +723,9 @@ Key differences from platform-managed workspaces:
 
 ### Legacy / Bootstrap Behavior
 
-Workspaces that registered before the token system existed (Phase 30.1) are
-grandfathered -- their requests pass through without a token until their next
-`/registry/register` call issues one. After that, the token is enforced on
-every subsequent call.
+Heartbeat and card-update bootstrap behavior is documented separately. A2A
+send and queue-status calls have no tokenless legacy exception: missing,
+revoked, mismatched, or unverifiable credentials are rejected.
 
 ---
 
