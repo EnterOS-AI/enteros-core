@@ -125,6 +125,21 @@ set +a
 # the browser authenticates. Exported for the `npm run dev` child below.
 export NEXT_PUBLIC_ADMIN_TOKEN="$ADMIN_TOKEN"
 
+# Local private repo access for template/plugin bootstrap. This stays in the
+# process env only: do not persist it to .env and do not print the value. The
+# token lets setup.sh clone private manifest entries and lets the platform pass
+# scoped GIT_HTTP_* credentials to the org concierge's management-MCP plugin
+# boot-install path. Contributors without this file still get the existing
+# reduced public-template bootstrap.
+if [ -z "${MOLECULE_GITEA_TOKEN:-}" ] && [ -r "$HOME/.molecule-ai/gitea-token" ]; then
+    MOLECULE_GITEA_TOKEN=$(tr -d '\r\n' < "$HOME/.molecule-ai/gitea-token")
+    export MOLECULE_GITEA_TOKEN
+    echo "==> Using local Molecule Gitea token for private template/plugin repos"
+fi
+if [ -z "${MOLECULE_TEMPLATE_REPO_TOKEN:-}" ] && [ -n "${MOLECULE_GITEA_TOKEN:-}" ]; then
+    export MOLECULE_TEMPLATE_REPO_TOKEN="$MOLECULE_GITEA_TOKEN"
+fi
+
 # ─────────────────────────────────────────── dynamic host ports (no hijack)
 #
 # A FIXED host port is a landmine on a dev's own machine. If they already run
@@ -181,15 +196,15 @@ CANVAS_PORT=$(pick_port 3000)
 export MOLECULE_PG_HOST_PORT MOLECULE_REDIS_HOST_PORT \
        MOLECULE_TEMPORAL_HOST_PORT MOLECULE_TEMPORAL_UI_HOST_PORT
 
-# App→infra connection URLs. Override empty OR the conventional-localhost
-# defaults (the .env.example landmine); respect a deliberate remote URL.
+# App→infra connection URLs. Override empty or loopback-local URLs from an
+# earlier dev-start run; respect a deliberate non-local URL.
 case "${DATABASE_URL:-}" in
-    ""|*localhost:5432*|*127.0.0.1:5432*)
+    ""|*localhost:*|*127.0.0.1:*|*\[::1\]:*|*::1:*)
         export DATABASE_URL="postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@127.0.0.1:${MOLECULE_PG_HOST_PORT}/${POSTGRES_DB:-molecule}?sslmode=disable"
         ;;
 esac
 case "${REDIS_URL:-}" in
-    ""|*localhost:6379*|*127.0.0.1:6379*)
+    ""|*localhost:*|*127.0.0.1:*|*\[::1\]:*|*::1:*)
         export REDIS_URL="redis://127.0.0.1:${MOLECULE_REDIS_HOST_PORT}"
         ;;
 esac
@@ -239,6 +254,52 @@ echo "    Langfuse   ${LANGFUSE_HOST}  (traces UI + platform /traces proxy)"
 echo "==> Running infra/scripts/setup.sh (infra + template registry)"
 "$ROOT/infra/scripts/setup.sh"
 
+wait_for_langfuse_clickhouse_native() {
+    echo "    Waiting for Langfuse ClickHouse native port..."
+    i=1
+    while [ "$i" -le 60 ]; do
+        if docker compose -f "$ROOT/docker-compose.infra.yml" exec -T langfuse-clickhouse \
+            clickhouse-client --user langfuse --password "${CLICKHOUSE_PASSWORD:-langfuse-dev}" \
+            --query 'SELECT 1' >/dev/null 2>&1; then
+            echo "    Langfuse ClickHouse ready (t+${i}s)"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "    ✗ Langfuse ClickHouse native port did not become ready in 60s"
+    echo "      Check: docker logs molecule-core-langfuse-clickhouse-1"
+    return 1
+}
+
+wait_for_langfuse_http() {
+    echo "    Waiting for Langfuse HTTP..."
+    i=1
+    while [ "$i" -le 90 ]; do
+        running=$(docker inspect -f '{{.State.Running}}' molecule-core-langfuse-1 2>/dev/null || echo false)
+        if [ "$running" != "true" ]; then
+            echo "    ✗ Langfuse exited before becoming ready — last logs:"
+            docker logs --tail 80 molecule-core-langfuse-1 2>&1 | sed 's/^/      /'
+            return 1
+        fi
+
+        code=$(curl -s -o /dev/null -w "%{http_code}" "$LANGFUSE_HOST/" 2>/dev/null || true)
+        case "$code" in
+            2*|3*)
+                echo "    Langfuse ready (t+${i}s)"
+                return 0
+                ;;
+        esac
+
+        sleep 1
+        i=$((i + 1))
+    done
+
+    echo "    ✗ Langfuse did not respond in 90s — last logs:"
+    docker logs --tail 80 molecule-core-langfuse-1 2>&1 | sed 's/^/      /'
+    return 1
+}
+
 # ─────────────────────────────────────────── Langfuse web (trace UI + API)
 # setup.sh brings up the Langfuse deps (clickhouse + langfuse-db-init) but NOT
 # the web app (it lives in docker-compose.yml, whose network ownership
@@ -247,8 +308,9 @@ echo "==> Running infra/scripts/setup.sh (infra + template registry)"
 # project + keys. clickhouse password mirrors docker-compose.infra.yml's
 # ${CLICKHOUSE_PASSWORD:-langfuse-dev}; the migration URL embeds it.
 echo "==> Starting Langfuse (trace UI on :${MOLECULE_LANGFUSE_HOST_PORT})"
+wait_for_langfuse_clickhouse_native
 docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
-docker run -d --name molecule-core-langfuse-1 --network molecule-core-net \
+if docker run -d --name molecule-core-langfuse-1 --network molecule-core-net \
   --network-alias langfuse-web -p "${MOLECULE_LANGFUSE_HOST_PORT}:3000" \
   -e DATABASE_URL="postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@postgres:5432/langfuse" \
   -e CLICKHOUSE_URL="http://langfuse-clickhouse:8123" \
@@ -263,9 +325,13 @@ docker run -d --name molecule-core-langfuse-1 --network molecule-core-net \
   -e LANGFUSE_INIT_PROJECT_SECRET_KEY="${LANGFUSE_SECRET_KEY}" \
   -e LANGFUSE_INIT_USER_EMAIL="dev@molecule.local" -e LANGFUSE_INIT_USER_NAME="Dev" \
   -e LANGFUSE_INIT_USER_PASSWORD="dev-langfuse-pw" \
-  langfuse/langfuse@sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d >/dev/null 2>&1 \
-  && echo "    Langfuse container started (first boot ~15-30s)" \
-  || echo "    ✗ Langfuse failed to start (tracing UI unavailable; agents fail-open)"
+  langfuse/langfuse@sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d >/dev/null 2>&1; then
+    echo "    Langfuse container started (first boot ~15-30s)"
+else
+    echo "    ✗ Langfuse failed to start"
+    exit 1
+fi
+wait_for_langfuse_http
 
 # ─────────────────────────────────────────────── 3. platform
 #
