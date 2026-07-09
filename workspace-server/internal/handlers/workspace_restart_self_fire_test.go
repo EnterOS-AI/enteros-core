@@ -195,6 +195,32 @@ func TestRestartByID_DebounceSilentDrop(t *testing.T) {
 	}
 }
 
+func TestRestartByIDAfterMutation_BypassesSelfFireDebounce(t *testing.T) {
+	const wsID = "self-fire-ws-mutation-restart"
+	resetSelfFireState(wsID)
+
+	sv, _ := restartStates.LoadOrStore(wsID, &restartState{})
+	state := sv.(*restartState)
+	state.mu.Lock()
+	state.restartStartedAt = time.Now()
+	state.running = false
+	state.mu.Unlock()
+
+	var calls atomic.Int32
+	restartByIDWithCycle(wsID, true, true, func() { calls.Add(1) })
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("debounced restart should not run cycle, got %d", got)
+	}
+	if got := restartByIDDropCounter.Load(); got != 1 {
+		t.Fatalf("debounced restart should increment drop counter once, got %d", got)
+	}
+
+	restartByIDWithCycle(wsID, true, false, func() { calls.Add(1) })
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("mutation restart must bypass self-fire debounce and run once, got %d", got)
+	}
+}
+
 // TestRestartByID_DebounceExpiresAfterWindow — outside the window, the
 // debounce must release: a legitimate later restart (e.g. user clicked
 // Restart again after waiting) must proceed to coalesceRestart. We
