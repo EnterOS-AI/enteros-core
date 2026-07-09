@@ -10,10 +10,10 @@ import (
 
 // TestResolveWorkspaceFilePath_RuntimeIndirection pins the
 // `?root="/configs"` (or empty / unrecognized) → runtime managed-config
-// dir behavior. Hermes uses /home/ubuntu/.hermes; claude-code uses
-// /configs; unknowns fall back to /configs. This indirection is the
-// reason hermes Config-tab edits land in the right place even though
-// the canvas only ever sends `?root=/configs`. Changing it without a
+// dir behavior. Hermes, Codex, and OpenClaw use runtime-owned dotdirs;
+// claude-code uses /configs; unknowns fall back to /configs. This indirection
+// is the reason runtime-native Config-tab edits land in the right place even
+// though the canvas only ever sends `?root=/configs`. Changing it without a
 // migration shim silently orphans previously-saved files.
 func TestResolveWorkspaceFilePath_RuntimeIndirection(t *testing.T) {
 	cases := []struct {
@@ -27,6 +27,8 @@ func TestResolveWorkspaceFilePath_RuntimeIndirection(t *testing.T) {
 		{"hermes", "/configs", "nested/a.yaml", "/home/ubuntu/.hermes/nested/a.yaml"},
 		{"hermes", "", "config.yaml", "/home/ubuntu/.hermes/config.yaml"},     // empty root → runtime indirection
 		{"hermes", "/etc", "config.yaml", "/home/ubuntu/.hermes/config.yaml"}, // out-of-allowlist → runtime indirection
+		{"codex", "/configs", "config.toml", "/home/ubuntu/.codex/config.toml"},
+		{"openclaw", "/configs", "openclaw.json", "/home/ubuntu/.openclaw/openclaw.json"},
 		// claude-code (and any future containerized runtime) lands at /configs —
 		// the path user-data creates and bind-mounts into the container. Pre-fix
 		// this fell through to /opt/configs which doesn't exist on workspace EC2s
@@ -102,6 +104,8 @@ func TestResolveWorkspaceRootPath(t *testing.T) {
 		want    string
 	}{
 		{"hermes", "/configs", "/home/ubuntu/.hermes"},
+		{"codex", "/configs", "/home/ubuntu/.codex"},
+		{"openclaw", "/configs", "/home/ubuntu/.openclaw"},
 		{"claude-code", "/configs", "/configs"},
 		{"hermes", "", "/home/ubuntu/.hermes"},
 		{"hermes", "/home", "/home"},
@@ -112,6 +116,8 @@ func TestResolveWorkspaceRootPath(t *testing.T) {
 		// image-baked plugin registry). See #236.
 		{"claude-code", "/plugins", "/configs/plugins"},
 		{"hermes", "/plugins", "/home/ubuntu/.hermes/plugins"},
+		{"codex", "/plugins", "/home/ubuntu/.codex/plugins"},
+		{"openclaw", "/plugins", "/home/ubuntu/.openclaw/plugins"},
 		{"unknown", "/plugins", "/configs/plugins"}, // unknown runtime → default /configs base
 		{"unknown", "/configs", "/configs"},
 		{"hermes", "/etc", "/home/ubuntu/.hermes"}, // not allowlisted → runtime indirection

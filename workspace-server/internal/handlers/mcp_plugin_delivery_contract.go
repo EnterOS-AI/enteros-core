@@ -66,11 +66,14 @@ func MatchesSSOT(c *MCPPluginDeliveryContract) []string {
 		diffs = append(diffs, "descriptor is empty — must pin the runtime-agnostic descriptor SSOT")
 	}
 
-	// Per-runtime native delivery surfaces. claude_code/codex must be present and
-	// implemented; hermes must be declared but flagged todo.
+	// Per-runtime native delivery surfaces for platform-capable runtimes. Each
+	// must be present and implemented so the platform MCP is written into the
+	// file the active runtime actually reads.
 	wantRuntimes := map[string]Runtime{
 		"claude_code": {SettingsPath: "/configs/.claude/settings.json", Format: "json", Key: "mcpServers", Renderer: "mcp_render.render_claude_settings", Status: "implemented"},
 		"codex":       {SettingsPath: "~/.codex/config.toml", Format: "toml", Table: "mcp_servers", Renderer: "mcp_render.render_codex_config", Status: "implemented"},
+		"openclaw":    {SettingsPath: "~/.openclaw/openclaw.json", Format: "json", KeyPath: "mcp.servers", Renderer: "mcp_render.render_openclaw_config", Status: "implemented"},
+		"hermes":      {SettingsPath: "~/.hermes/config.yaml", Format: "yaml", Key: "mcp_servers", Renderer: "mcp_render.render_hermes_config", Status: "implemented"},
 	}
 	for name, want := range wantRuntimes {
 		got, ok := c.Runtimes[name]
@@ -81,22 +84,10 @@ func MatchesSSOT(c *MCPPluginDeliveryContract) []string {
 		eq("runtimes."+name+".settings_path", got.SettingsPath, want.SettingsPath)
 		eq("runtimes."+name+".format", got.Format, want.Format)
 		eq("runtimes."+name+".key", got.Key, want.Key)
+		eq("runtimes."+name+".key_path", got.KeyPath, want.KeyPath)
 		eq("runtimes."+name+".table", got.Table, want.Table)
 		eq("runtimes."+name+".renderer", got.Renderer, want.Renderer)
 		eq("runtimes."+name+".status", got.Status, want.Status)
-	}
-	for _, name := range []string{"hermes"} {
-		got, ok := c.Runtimes[name]
-		if !ok {
-			diffs = append(diffs, "runtimes missing declared-todo runtime "+name)
-			continue
-		}
-		if got.Status == "implemented" {
-			diffs = append(diffs, "runtimes."+name+".status claims implemented, but its renderer is a fail-loud stub (expected a todo-* status)")
-		}
-		if got.Renderer == "" {
-			diffs = append(diffs, "runtimes."+name+".renderer is empty")
-		}
 	}
 	return diffs
 }

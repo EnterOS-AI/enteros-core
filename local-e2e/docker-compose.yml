@@ -34,7 +34,7 @@ services:
       # zero of them. Leave guard ON (do NOT set MOLECULE_TENANT_GUARD_DISABLE)
       # so we exercise the prod entrypoint code path verbatim.
     ports:
-      - "${RUNTIME_PORT:-18000}:8000"
+      - "127.0.0.1:${RUNTIME_PORT:-18000}:8000"
     healthcheck:
       # /agent-card is the universal A2A discovery endpoint — every template
       # exposes it. /health varies per template.

@@ -84,6 +84,61 @@ assert_logged "https://oauth2:gtok${AT}git.moleculesai.app/molecule-ai/tmpl-defa
 assert_logged "https://oauth2:ghtok${AT}github.com/molecule-ai/tmpl-gh.git"
 echo "ok: default → git.moleculesai.app (gtok); github → github.com (ghtok)"
 
+: > "$LOG"
+run_clone || fail "clone-manifest.sh exited non-zero on an unchanged populated manifest"
+[ ! -s "$LOG" ] || fail "unchanged populated manifest should not reclone entries"
+grep -qxF "provider=moleculesai" "$WORK/ws/tmpl-default/.molecule-manifest-source" \
+  || fail "default manifest marker missing provider"
+grep -qxF "repo=molecule-ai/tmpl-default" "$WORK/ws/tmpl-default/.molecule-manifest-source" \
+  || fail "default manifest marker missing repo"
+grep -qxF "ref=main" "$WORK/ws/tmpl-default/.molecule-manifest-source" \
+  || fail "default manifest marker missing ref"
+if grep -R "gtok\\|ghtok" "$WORK/ws/tmpl-default/.molecule-manifest-source" "$WORK/ws/tmpl-gh/.molecule-manifest-source"; then
+    fail "manifest marker must not persist provider tokens"
+fi
+echo "ok: populated dirs skip only when manifest marker matches, without persisting tokens"
+
+cat > "$WORK/manifest.json" <<'JSON'
+{
+  "version": 1,
+  "plugins": [],
+  "workspace_templates": [
+    {"name": "tmpl-default", "repo": "molecule-ai/tmpl-default", "ref": "feature"},
+    {"name": "tmpl-gh", "repo": "molecule-ai/tmpl-gh", "ref": "main", "provider": "github"}
+  ],
+  "org_templates": []
+}
+JSON
+: > "$LOG"
+run_clone || fail "clone-manifest.sh exited non-zero after a manifest ref change"
+assert_logged "https://oauth2:gtok${AT}git.moleculesai.app/molecule-ai/tmpl-default.git"
+if grep -qxF "https://oauth2:ghtok${AT}github.com/molecule-ai/tmpl-gh.git" "$LOG"; then
+    fail "unchanged github entry should not reclone when another entry changes"
+fi
+grep -qxF "ref=feature" "$WORK/ws/tmpl-default/.molecule-manifest-source" \
+  || fail "ref-changed entry did not refresh its manifest marker"
+echo "ok: changed manifest ref refreshes only the stale entry"
+
+cat > "$WORK/manifest.json" <<'JSON'
+{
+  "version": 1,
+  "plugins": [],
+  "workspace_templates": [
+    {"name": "legacy", "repo": "molecule-ai/legacy", "ref": "main"}
+  ],
+  "org_templates": []
+}
+JSON
+mkdir -p "$WORK/ws/legacy"
+printf 'old\n' > "$WORK/ws/legacy/OLD"
+: > "$LOG"
+run_clone || fail "clone-manifest.sh exited non-zero on a legacy markerless dir"
+assert_logged "https://oauth2:gtok${AT}git.moleculesai.app/molecule-ai/legacy.git"
+[ ! -e "$WORK/ws/legacy/OLD" ] || fail "legacy markerless dir should be replaced, not reused"
+grep -qxF "repo=molecule-ai/legacy" "$WORK/ws/legacy/.molecule-manifest-source" \
+  || fail "legacy refresh did not write manifest marker"
+echo "ok: legacy populated dirs without manifest markers refresh once"
+
 # --- unknown provider must fail-closed -----------------------------------
 cat > "$WORK/manifest.json" <<'JSON'
 {

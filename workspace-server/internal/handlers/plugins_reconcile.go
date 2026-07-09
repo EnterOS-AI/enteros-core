@@ -45,6 +45,8 @@ import (
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
+	"github.com/pelletier/go-toml/v2"
+	"gopkg.in/yaml.v3"
 )
 
 // ReconcileFunc installs any declared-but-missing plugins for a workspace
@@ -188,12 +190,13 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 // skipped, only a confirmed-present one is deduped.
 //
 // For the concierge's management MCP (molecule-ai-plugin-molecule-platform-mcp),
-// file presence is not enough. The executor's runtime config
-// (/configs/.claude/settings.json) must actually contain the molecule-platform
-// MCP server entry; on a de-baked SaaS box the plugin files can be present while
-// the runtime config was generated before the plugin landed, so a restart is
-// required. This check uses EIC / docker exec, never the nil local-Docker
-// provisioner backend, so SaaS tenants without a Docker daemon still recover.
+// file presence is not enough. The executor's native runtime MCP config
+// (Claude settings.json, Codex config.toml, OpenClaw openclaw.json, Hermes
+// config.yaml, etc.) must actually contain the molecule-platform server entry;
+// on a de-baked SaaS box the plugin files can be present while the runtime
+// config was generated before the plugin landed, so a restart is required.
+// This check uses EIC / docker exec, never the nil local-Docker provisioner
+// backend, so SaaS tenants without a Docker daemon still recover.
 func (h *PluginsHandler) pluginPresentOnBox(ctx context.Context, workspaceID, pluginName string) bool {
 	var containerName, instanceID, runtime string
 	// Local Docker path: if the workspace container is running, read its
@@ -230,12 +233,12 @@ func (h *PluginsHandler) pluginPresentOnBox(ctx context.Context, workspaceID, pl
 }
 
 // managementMCPRuntimeConfigPresent reports whether the executor's runtime
-// config already references the molecule-platform MCP server. This closes the
-// post-de-bake gap where plugin files exist on disk but the runtime config
-// (/configs/.claude/settings.json) was generated before they landed, so the
-// concierge stays degraded with loaded_mcp_tools empty. Probes via the same
-// Docker/EIC primitives pluginPresentOnBox uses — no local provisioner backend
-// required.
+// config already references the molecule-platform MCP server. This closes both
+// the post-de-bake gap where plugin files exist on disk but the runtime config
+// was generated before they landed, and the cross-runtime gap where a healthy
+// non-Claude concierge was mis-read through Claude's settings.json path. Probes
+// via the same Docker/EIC primitives pluginPresentOnBox uses — no local
+// provisioner backend required.
 // readRuntimeConfigViaEIC is the testable hook for reading a runtime-config
 // file from a SaaS workspace EC2. Production uses readFileViaEIC; tests stub it
 // to avoid standing up AWS EIC tunnels.
@@ -243,26 +246,117 @@ var readRuntimeConfigViaEIC = func(ctx context.Context, instanceID, runtime, rel
 	return readFileViaEIC(ctx, instanceID, runtime, "/configs", relPath)
 }
 
+type managementMCPConfigProbe struct {
+	containerPath string
+	eicRuntime    string
+	eicRelPath    string
+	hasServer     func([]byte) bool
+}
+
+var managementMCPConfigProbes = map[string]managementMCPConfigProbe{
+	"claude_code": {
+		containerPath: "/configs/.claude/settings.json",
+		eicRuntime:    "claude-code",
+		eicRelPath:    ".claude/settings.json",
+		hasServer:     claudeConfigHasPlatformMCP,
+	},
+	"codex": {
+		containerPath: "/home/agent/.codex/config.toml",
+		eicRuntime:    "codex",
+		eicRelPath:    "config.toml",
+		hasServer:     codexConfigHasPlatformMCP,
+	},
+	"openclaw": {
+		containerPath: "/home/agent/.openclaw/openclaw.json",
+		eicRuntime:    "openclaw",
+		eicRelPath:    "openclaw.json",
+		hasServer:     openclawConfigHasPlatformMCP,
+	},
+	"hermes": {
+		containerPath: "/home/agent/.hermes/config.yaml",
+		eicRuntime:    "hermes",
+		eicRelPath:    "config.yaml",
+		hasServer:     hermesConfigHasPlatformMCP,
+	},
+}
+
+func managementMCPConfigProbeFor(runtime string) (managementMCPConfigProbe, bool) {
+	key := strings.ToLower(strings.TrimSpace(runtime))
+	key = strings.ReplaceAll(key, "-", "_")
+	if key == "" {
+		key = "claude_code" // preserves the legacy behavior when runtime lookup is not wired.
+	}
+	probe, ok := managementMCPConfigProbes[key]
+	return probe, ok
+}
+
 func (h *PluginsHandler) managementMCPRuntimeConfigPresent(ctx context.Context, workspaceID, containerName, instanceID, runtime string) bool {
-	const settingsRelPath = ".claude/settings.json"
+	if strings.TrimSpace(runtime) == "" && h.runtimeLookup != nil && workspaceID != "" {
+		if rt, err := h.runtimeLookup(workspaceID); err == nil {
+			runtime = rt
+		}
+	}
+	probe, ok := managementMCPConfigProbeFor(runtime)
+	if !ok {
+		return false
+	}
 	var data []byte
 	var err error
 	if containerName != "" {
 		var out string
-		out, err = h.execInContainer(ctx, containerName, []string{"cat", "/configs/" + settingsRelPath})
+		out, err = h.execInContainer(ctx, containerName, []string{"cat", probe.containerPath})
 		data = []byte(out)
 	} else if instanceID != "" {
-		data, err = readRuntimeConfigViaEIC(ctx, instanceID, runtime, settingsRelPath)
+		data, err = readRuntimeConfigViaEIC(ctx, instanceID, probe.eicRuntime, probe.eicRelPath)
 	} else {
 		return false
 	}
 	if err != nil || len(data) == 0 {
 		return false
 	}
+	return probe.hasServer(data)
+}
+
+func claudeConfigHasPlatformMCP(data []byte) bool {
 	var cfg struct {
 		MCPServers map[string]json.RawMessage `json:"mcpServers"`
 	}
 	if json.Unmarshal(data, &cfg) != nil {
+		return false
+	}
+	_, ok := cfg.MCPServers[conciergePlatformMCPServerName]
+	return ok
+}
+
+func codexConfigHasPlatformMCP(data []byte) bool {
+	var cfg struct {
+		MCPServers map[string]map[string]any `toml:"mcp_servers"`
+	}
+	if toml.Unmarshal(data, &cfg) != nil {
+		return false
+	}
+	_, ok := cfg.MCPServers[conciergePlatformMCPServerName]
+	return ok
+}
+
+func openclawConfigHasPlatformMCP(data []byte) bool {
+	var cfg struct {
+		MCP struct {
+			Servers map[string]json.RawMessage `json:"servers"`
+		} `json:"mcp"`
+	}
+	if json.Unmarshal(data, &cfg) != nil {
+		return false
+	}
+	_, ok := cfg.MCP.Servers[conciergePlatformMCPServerName]
+	return ok
+}
+
+func hermesConfigHasPlatformMCP(data []byte) bool {
+	var cfg struct {
+		MCPServers map[string]any `yaml:"mcp_servers"`
+	}
+	if yaml.Unmarshal(data, &cfg) != nil {
 		return false
 	}
 	_, ok := cfg.MCPServers[conciergePlatformMCPServerName]

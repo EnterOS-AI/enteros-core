@@ -526,7 +526,7 @@ func (h *PluginsHandler) deliverViaDocker(ctx context.Context, workspaceID, cont
 	if h.restartFunc != nil {
 		if r.SuppressRestart {
 			log.Printf("Plugin install: %s → workspace %s — restart suppressed by caller (restart=false); boot-install picks it up on the next reprovision", r.PluginName, workspaceID)
-		} else if kind == classifyKindSkillContentOnly {
+		} else if pluginInstallCanSkipRestart(r.PluginName, kind) {
 			log.Printf("Plugin install: %s → workspace %s — SKILL-content-only update, SKIPPING restart", r.PluginName, workspaceID)
 		} else {
 			// RFC internal#524 Layer 1: drain via globalGoAsync (see
@@ -537,6 +537,13 @@ func (h *PluginsHandler) deliverViaDocker(ctx context.Context, workspaceID, cont
 		}
 	}
 	return false, nil
+}
+
+func pluginInstallCanSkipRestart(pluginName, kind string) bool {
+	if pluginName == conciergePlatformMCPName {
+		return false
+	}
+	return kind == classifyKindSkillContentOnly
 }
 
 // lookupSaaSDispatch returns (instance_id, runtime) for SaaS dispatch, or

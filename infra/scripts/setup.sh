@@ -44,6 +44,16 @@ until docker compose -f "$ROOT_DIR/docker-compose.infra.yml" exec -T redis redis
 done
 echo "    Redis is ready."
 
+echo "==> Waiting for MinIO..."
+until curl -fsS "http://127.0.0.1:${MOLECULE_MINIO_HOST_PORT:-9000}/minio/health/ready" >/dev/null 2>&1; do
+  sleep 1
+done
+echo "    MinIO is ready."
+
+echo "==> Ensuring MinIO workspace-data bucket..."
+docker compose -f "$ROOT_DIR/docker-compose.infra.yml" run --rm minio-init >/dev/null
+echo "    MinIO bucket ready: ${MOLECULE_WORKSPACE_DATA_BUCKET:-molecule-workspace-data}"
+
 echo "==> Verifying Redis KEA config..."
 KEA=$(docker compose -f "$ROOT_DIR/docker-compose.infra.yml" exec -T redis redis-cli config get notify-keyspace-events | tail -1)
 echo "    notify-keyspace-events = $KEA"
@@ -60,7 +70,8 @@ echo "==> Infrastructure ready!"
 # so a dev's own services aren't hijacked; reflect the effective values here.
 echo "    Postgres: 127.0.0.1:${MOLECULE_PG_HOST_PORT:-5432}"
 echo "    Redis:    127.0.0.1:${MOLECULE_REDIS_HOST_PORT:-6379}"
-echo "    Langfuse: localhost:3001"
+echo "    MinIO:    127.0.0.1:${MOLECULE_MINIO_HOST_PORT:-9000} (S3 API) / 127.0.0.1:${MOLECULE_MINIO_CONSOLE_HOST_PORT:-9001} (console)"
+echo "    Langfuse: localhost:${MOLECULE_LANGFUSE_HOST_PORT:-3001}"
 echo "    Temporal: 127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT:-7233} (gRPC) / 127.0.0.1:${MOLECULE_TEMPORAL_UI_HOST_PORT:-8233} (UI)"
 echo ""
 echo "    Next: cd workspace-server && go run ./cmd/server"

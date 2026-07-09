@@ -28,8 +28,9 @@ docker network rm molecule-core-net 2>/dev/null || true
 echo "  cleaned"
 
 echo "=== POPULATE MANIFEST DIRS ==="
-# Idempotent: clone-manifest.sh skips dirs that already have content, so a
-# re-nuke after templates are populated is a fast no-op (a few stat calls).
+# Idempotent: clone-manifest.sh skips dirs whose manifest-source marker still
+# matches manifest.json, so a re-nuke after templates are current is a fast
+# no-op (a few stat calls) while stale/markerless checkouts self-refresh.
 # Skip with a clear warning if jq is missing — installing it is a one-time
 # step documented in the README quickstart.
 if command -v jq >/dev/null 2>&1; then

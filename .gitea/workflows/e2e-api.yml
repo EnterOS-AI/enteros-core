@@ -49,7 +49,7 @@ name: E2E API Smoke Test
 #         redis-e2e-api-${RUN_ID}-${RUN_ATTEMPT}
 #      `${RUN_ID}-${RUN_ATTEMPT}` is unique even across reruns of the
 #      same run_id.
-#   2. Ephemeral host port per run (`-p 0:5432`), then read the actual
+#   2. Ephemeral host port per run (`-p 127.0.0.1::5432`), then read the actual
 #      bound port via `docker port` and export DATABASE_URL/REDIS_URL
 #      pointing at it. No fixed host-port → no port collision.
 #   3. `127.0.0.1` (NOT `localhost`) in URLs — IPv6 first-resolve was
@@ -278,15 +278,15 @@ jobs:
           # so it cannot kill a sibling run's postgres. (Pre-fix the
           # name was static and this rm hit other runs' containers.)
           docker rm -f "$PG_CONTAINER" 2>/dev/null || true
-          # `-p 0:5432` requests an ephemeral host port; we read it back
+          # `-p 127.0.0.1::5432` requests an ephemeral host port; we read it back
           # below and export DATABASE_URL.
           docker run -d --name "$PG_CONTAINER" \
             -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
-            -p 0:5432 postgres:16 >/dev/null
+            -p 127.0.0.1::5432 postgres:16 >/dev/null
           # Resolve the host-side port assignment. `docker port` prints
           # `0.0.0.0:NNNN` (and on host-net runners may also print an
           # IPv6 line — take the first IPv4 line).
-          PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^0\.0\.0\.0:/ {print $2; exit}')
+          PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           if [ -z "$PG_PORT" ]; then
             # Fallback: any first line. Some Docker versions print only
             # one line.
@@ -316,8 +316,8 @@ jobs:
         if: needs.detect-changes.outputs.api == 'true'
         run: |
           docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-          docker run -d --name "$REDIS_CONTAINER" -p 0:6379 redis:7 >/dev/null
-          REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^0\.0\.0\.0:/ {print $2; exit}')
+          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
           if [ -z "$REDIS_PORT" ]; then
             REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
           fi

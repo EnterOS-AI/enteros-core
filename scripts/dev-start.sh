@@ -31,19 +31,88 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$ROOT/.env"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-molecule-core}"
+export COMPOSE_PROJECT_NAME
+PLATFORM_PID=
+CANVAS_PID=
+
+process_cwd() {
+    # $1 = pid. Prints the process cwd, or nothing when the process vanished.
+    lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+}
+
+repo_dev_pid_matches() {
+    # $1 = pid. Only processes whose cwd is one of dev-start's app dirs belong
+    # to this repo-local stack; do not kill unrelated localhost services.
+    cwd=$(process_cwd "$1" || true)
+    case "$cwd" in
+        "$ROOT/workspace-server"|"$ROOT/canvas")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+cleanup_repo_host_processes() {
+    # Stop stale host-side dev-start children from prior runs. Docker cleanup
+    # alone is insufficient: `go run ./cmd/server` and `next dev` are host
+    # processes, and stale listeners on :8080/:3000 can make a new dynamic stack
+    # look ready while the browser is still pointed at yesterday's server.
+    command -v lsof >/dev/null 2>&1 || return 0
+
+    pids=$(
+        {
+            lsof -nP -iTCP -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p//p'
+            if command -v pgrep >/dev/null 2>&1; then
+                pgrep -f 'go run ./cmd/server|next dev --turbopack|next dev' 2>/dev/null || true
+            fi
+        } | sort -u
+    )
+    [ -n "$pids" ] || return 0
+
+    killed=0
+    for pid in $pids; do
+        [ "$pid" != "$$" ] || continue
+        if repo_dev_pid_matches "$pid"; then
+            pkill -TERM -P "$pid" 2>/dev/null || true
+            kill -TERM "$pid" 2>/dev/null || true
+            killed=1
+        fi
+    done
+
+    [ "$killed" -eq 0 ] && return 0
+    sleep 1
+
+    for pid in $pids; do
+        [ "$pid" != "$$" ] || continue
+        if kill -0 "$pid" 2>/dev/null && repo_dev_pid_matches "$pid"; then
+            pkill -KILL -P "$pid" 2>/dev/null || true
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+cleanup_dev_stack() {
+    cleanup_repo_host_processes
+    # Stop containers from prior dev-start runs before port selection. Keep
+    # named volumes so the local DB/object-store state survives restarts.
+    docker compose -f "$ROOT/docker-compose.yml" down --remove-orphans >/dev/null 2>&1 || true
+    docker compose -f "$ROOT/docker-compose.infra.yml" down --remove-orphans >/dev/null 2>&1 || true
+    docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
+}
 
 cleanup() {
     echo ""
     echo "==> Shutting down..."
-    kill $PLATFORM_PID $CANVAS_PID 2>/dev/null || true
-    # Use setup.sh's compose file (full infra) since that's what we
-    # brought up. `down` keeps named volumes by default — call with
-    # --volumes here only if you want a clean slate (we don't, since
-    # idempotent re-runs are the usual case).
-    docker compose -f "$ROOT/docker-compose.infra.yml" down 2>/dev/null || true
-    # Langfuse runs via `docker run` (not compose — network-ownership conflict),
-    # so `compose down` misses it; remove it explicitly or it lingers.
-    docker rm -f molecule-core-langfuse-1 2>/dev/null || true
+    if [ -n "${PLATFORM_PID:-}" ]; then
+        kill "$PLATFORM_PID" 2>/dev/null || true
+    fi
+    if [ -n "${CANVAS_PID:-}" ]; then
+        kill "$CANVAS_PID" 2>/dev/null || true
+    fi
+    cleanup_dev_stack
     echo "    Done."
 }
 trap cleanup EXIT INT TERM
@@ -125,6 +194,24 @@ set +a
 # the browser authenticates. Exported for the `npm run dev` child below.
 export NEXT_PUBLIC_ADMIN_TOKEN="$ADMIN_TOKEN"
 
+# Local private repo access for template/plugin bootstrap. This stays in the
+# process env only: do not persist it to .env and do not print the value. The
+# token lets setup.sh clone private manifest entries and lets the platform pass
+# scoped GIT_HTTP_* credentials to the org concierge's management-MCP plugin
+# boot-install path. Contributors without this file still get the existing
+# reduced public-template bootstrap.
+if [ -z "${MOLECULE_GITEA_TOKEN:-}" ] && [ -r "$HOME/.molecule-ai/gitea-token" ]; then
+    MOLECULE_GITEA_TOKEN=$(tr -d '\r\n' < "$HOME/.molecule-ai/gitea-token")
+    export MOLECULE_GITEA_TOKEN
+    echo "==> Using local Molecule Gitea token for private template/plugin repos"
+fi
+if [ -z "${MOLECULE_TEMPLATE_REPO_TOKEN:-}" ] && [ -n "${MOLECULE_GITEA_TOKEN:-}" ]; then
+    export MOLECULE_TEMPLATE_REPO_TOKEN="$MOLECULE_GITEA_TOKEN"
+fi
+
+echo "==> Cleaning up previous local dev containers"
+cleanup_dev_stack
+
 # ─────────────────────────────────────────── dynamic host ports (no hijack)
 #
 # A FIXED host port is a landmine on a dev's own machine. If they already run
@@ -176,21 +263,41 @@ MOLECULE_PG_HOST_PORT=${MOLECULE_PG_HOST_PORT:-$(pick_port 5432)}
 MOLECULE_REDIS_HOST_PORT=${MOLECULE_REDIS_HOST_PORT:-$(pick_port 6379)}
 MOLECULE_TEMPORAL_HOST_PORT=${MOLECULE_TEMPORAL_HOST_PORT:-$(pick_port 7233)}
 MOLECULE_TEMPORAL_UI_HOST_PORT=${MOLECULE_TEMPORAL_UI_HOST_PORT:-$(pick_port 8233)}
+MOLECULE_MINIO_HOST_PORT=${MOLECULE_MINIO_HOST_PORT:-$(pick_port 9000)}
+MOLECULE_MINIO_CONSOLE_HOST_PORT=${MOLECULE_MINIO_CONSOLE_HOST_PORT:-$(pick_port 9001)}
 PLATFORM_PORT=$(pick_port 8080)
 CANVAS_PORT=$(pick_port 3000)
 export MOLECULE_PG_HOST_PORT MOLECULE_REDIS_HOST_PORT \
-       MOLECULE_TEMPORAL_HOST_PORT MOLECULE_TEMPORAL_UI_HOST_PORT
+       MOLECULE_TEMPORAL_HOST_PORT MOLECULE_TEMPORAL_UI_HOST_PORT \
+       MOLECULE_MINIO_HOST_PORT MOLECULE_MINIO_CONSOLE_HOST_PORT
 
-# App→infra connection URLs. Override empty OR the conventional-localhost
-# defaults (the .env.example landmine); respect a deliberate remote URL.
+# App→infra connection URLs. Override empty or loopback-local URLs from an
+# earlier dev-start run; respect a deliberate non-local URL.
 case "${DATABASE_URL:-}" in
-    ""|*localhost:5432*|*127.0.0.1:5432*)
+    ""|*localhost:*|*127.0.0.1:*|*\[::1\]:*|*::1:*)
         export DATABASE_URL="postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@127.0.0.1:${MOLECULE_PG_HOST_PORT}/${POSTGRES_DB:-molecule}?sslmode=disable"
         ;;
 esac
 case "${REDIS_URL:-}" in
-    ""|*localhost:6379*|*127.0.0.1:6379*)
+    ""|*localhost:*|*127.0.0.1:*|*\[::1\]:*|*::1:*)
         export REDIS_URL="redis://127.0.0.1:${MOLECULE_REDIS_HOST_PORT}"
+        ;;
+esac
+
+# SDK object-store/workspace-data SSOT local backend. MinIO is the local
+# S3-compatible adapter behind MOLECULE_OBJECT_STORE_BACKEND=minio. Keep these
+# credentials host/platform-side only; workspace boxes must receive only
+# platform auth or presigned/proxy URLs, never object-store credentials.
+export MOLECULE_OBJECT_STORE_BACKEND="${MOLECULE_OBJECT_STORE_BACKEND:-minio}"
+export MOLECULE_OBJECT_STORE_REGION="${MOLECULE_OBJECT_STORE_REGION:-us-east-1}"
+export MOLECULE_WORKSPACE_DATA_BUCKET="${MOLECULE_WORKSPACE_DATA_BUCKET:-molecule-workspace-data}"
+export MINIO_ROOT_USER="${MINIO_ROOT_USER:-${MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID:-molecule-dev-minio}}"
+export MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-${MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY:-molecule-dev-minio-password}}"
+export MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID="${MOLECULE_WORKSPACE_DATA_ACCESS_KEY_ID:-$MINIO_ROOT_USER}"
+export MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY="${MOLECULE_WORKSPACE_DATA_SECRET_ACCESS_KEY:-$MINIO_ROOT_PASSWORD}"
+case "${MOLECULE_WORKSPACE_DATA_ENDPOINT:-}" in
+    ""|http://localhost:*|http://127.0.0.1:*|http://\[::1\]:*|http://::1:*)
+        export MOLECULE_WORKSPACE_DATA_ENDPOINT="http://127.0.0.1:${MOLECULE_MINIO_HOST_PORT}"
         ;;
 esac
 
@@ -213,6 +320,7 @@ echo "==> Host ports (dynamic — conventional when free, else ephemeral):"
 echo "    Postgres   127.0.0.1:${MOLECULE_PG_HOST_PORT}"
 echo "    Redis      127.0.0.1:${MOLECULE_REDIS_HOST_PORT}"
 echo "    Temporal   127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT} (gRPC) / ${MOLECULE_TEMPORAL_UI_HOST_PORT} (UI)"
+echo "    MinIO      http://127.0.0.1:${MOLECULE_MINIO_HOST_PORT} (S3 API) / ${MOLECULE_MINIO_CONSOLE_HOST_PORT} (console)"
 echo "    Platform   ${NEXT_PUBLIC_PLATFORM_URL}"
 echo "    Canvas     http://127.0.0.1:${CANVAS_PORT}"
 
@@ -239,6 +347,52 @@ echo "    Langfuse   ${LANGFUSE_HOST}  (traces UI + platform /traces proxy)"
 echo "==> Running infra/scripts/setup.sh (infra + template registry)"
 "$ROOT/infra/scripts/setup.sh"
 
+wait_for_langfuse_clickhouse_native() {
+    echo "    Waiting for Langfuse ClickHouse native port..."
+    i=1
+    while [ "$i" -le 60 ]; do
+        if docker compose -f "$ROOT/docker-compose.infra.yml" exec -T langfuse-clickhouse \
+            clickhouse-client --user langfuse --password "${CLICKHOUSE_PASSWORD:-langfuse-dev}" \
+            --query 'SELECT 1' >/dev/null 2>&1; then
+            echo "    Langfuse ClickHouse ready (t+${i}s)"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "    ✗ Langfuse ClickHouse native port did not become ready in 60s"
+    echo "      Check: docker logs molecule-core-langfuse-clickhouse-1"
+    return 1
+}
+
+wait_for_langfuse_http() {
+    echo "    Waiting for Langfuse HTTP..."
+    i=1
+    while [ "$i" -le 90 ]; do
+        running=$(docker inspect -f '{{.State.Running}}' molecule-core-langfuse-1 2>/dev/null || echo false)
+        if [ "$running" != "true" ]; then
+            echo "    ✗ Langfuse exited before becoming ready — last logs:"
+            docker logs --tail 80 molecule-core-langfuse-1 2>&1 | sed 's/^/      /'
+            return 1
+        fi
+
+        code=$(curl -s -o /dev/null -w "%{http_code}" "$LANGFUSE_HOST/" 2>/dev/null || true)
+        case "$code" in
+            2*|3*)
+                echo "    Langfuse ready (t+${i}s)"
+                return 0
+                ;;
+        esac
+
+        sleep 1
+        i=$((i + 1))
+    done
+
+    echo "    ✗ Langfuse did not respond in 90s — last logs:"
+    docker logs --tail 80 molecule-core-langfuse-1 2>&1 | sed 's/^/      /'
+    return 1
+}
+
 # ─────────────────────────────────────────── Langfuse web (trace UI + API)
 # setup.sh brings up the Langfuse deps (clickhouse + langfuse-db-init) but NOT
 # the web app (it lives in docker-compose.yml, whose network ownership
@@ -247,9 +401,10 @@ echo "==> Running infra/scripts/setup.sh (infra + template registry)"
 # project + keys. clickhouse password mirrors docker-compose.infra.yml's
 # ${CLICKHOUSE_PASSWORD:-langfuse-dev}; the migration URL embeds it.
 echo "==> Starting Langfuse (trace UI on :${MOLECULE_LANGFUSE_HOST_PORT})"
+wait_for_langfuse_clickhouse_native
 docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
-docker run -d --name molecule-core-langfuse-1 --network molecule-core-net \
-  --network-alias langfuse-web -p "${MOLECULE_LANGFUSE_HOST_PORT}:3000" \
+if docker run -d --name molecule-core-langfuse-1 --network molecule-core-net \
+  --network-alias langfuse-web -p "127.0.0.1:${MOLECULE_LANGFUSE_HOST_PORT}:3000" \
   -e DATABASE_URL="postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@postgres:5432/langfuse" \
   -e CLICKHOUSE_URL="http://langfuse-clickhouse:8123" \
   -e CLICKHOUSE_MIGRATION_URL="clickhouse://langfuse:${CLICKHOUSE_PASSWORD:-langfuse-dev}@langfuse-clickhouse:9000" \
@@ -263,9 +418,13 @@ docker run -d --name molecule-core-langfuse-1 --network molecule-core-net \
   -e LANGFUSE_INIT_PROJECT_SECRET_KEY="${LANGFUSE_SECRET_KEY}" \
   -e LANGFUSE_INIT_USER_EMAIL="dev@molecule.local" -e LANGFUSE_INIT_USER_NAME="Dev" \
   -e LANGFUSE_INIT_USER_PASSWORD="dev-langfuse-pw" \
-  langfuse/langfuse@sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d >/dev/null 2>&1 \
-  && echo "    Langfuse container started (first boot ~15-30s)" \
-  || echo "    ✗ Langfuse failed to start (tracing UI unavailable; agents fail-open)"
+  langfuse/langfuse@sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d >/dev/null 2>&1; then
+    echo "    Langfuse container started (first boot ~15-30s)"
+else
+    echo "    ✗ Langfuse failed to start"
+    exit 1
+fi
+wait_for_langfuse_http
 
 # ─────────────────────────────────────────────── 3. platform
 #
@@ -375,14 +534,17 @@ cat <<EOF
   Postgres:  127.0.0.1:${MOLECULE_PG_HOST_PORT}   (\$DATABASE_URL exported)
   Redis:     127.0.0.1:${MOLECULE_REDIS_HOST_PORT}
   Temporal:  127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT} (gRPC)
+  MinIO:     127.0.0.1:${MOLECULE_MINIO_HOST_PORT} (S3 API, bucket: ${MOLECULE_WORKSPACE_DATA_BUCKET})
 
   Auth:      fail-closed — canvas uses the dev ADMIN_TOKEN (see .env)
   Logs:      /tmp/molecule-platform.log · /tmp/molecule-canvas.log
              docker logs molecule-core-langfuse-1   (trace sink)
+             docker logs molecule-core-minio-1      (object store)
 
   Ports are dynamic: the conventional port is used when free, else a free
   one is picked so nothing on your machine is hijacked. Every URL above is
-  exported for you (DATABASE_URL, REDIS_URL, LANGFUSE_*, CORS_ORIGINS,
+  exported for you (DATABASE_URL, REDIS_URL, LANGFUSE_*,
+  MOLECULE_OBJECT_STORE_*, MOLECULE_WORKSPACE_DATA_*, CORS_ORIGINS,
   NEXT_PUBLIC_*). psql in with:  psql "\$DATABASE_URL"
 
   First run:

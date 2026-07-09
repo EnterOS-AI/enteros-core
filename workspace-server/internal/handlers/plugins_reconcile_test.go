@@ -262,6 +262,7 @@ func TestReconcile_PlatformMCP_RuntimeConfigAlreadyPresent_NoOp(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(mgmtDir, "plugin.yaml"), []byte("name: "+conciergePlatformMCPName+"\n"), 0o644)
 
 	h.instanceIDLookup = func(string) (string, error) { return "i-123", nil }
+	h.runtimeLookup = func(string) (string, error) { return "claude-code", nil }
 
 	origManifest := readPluginManifestViaEIC
 	readPluginManifestViaEIC = func(ctx context.Context, instanceID, runtime, pluginName string) ([]byte, error) {
@@ -288,6 +289,187 @@ func TestReconcile_PlatformMCP_RuntimeConfigAlreadyPresent_NoOp(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+func TestReconcile_PlatformMCPOpenClawRuntimeConfigAlreadyPresent_NoOp(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	h, delivered := newReconcileHandler(t)
+
+	mgmtDir := filepath.Join(h.pluginsDir, conciergePlatformMCPName)
+	if err := os.MkdirAll(mgmtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(mgmtDir, "plugin.yaml"), []byte("name: "+conciergePlatformMCPName+"\n"), 0o644)
+
+	h.instanceIDLookup = func(string) (string, error) { return "i-openclaw", nil }
+	h.runtimeLookup = func(string) (string, error) { return "openclaw", nil }
+
+	origManifest := readPluginManifestViaEIC
+	readPluginManifestViaEIC = func(ctx context.Context, instanceID, runtime, pluginName string) ([]byte, error) {
+		return []byte("name: " + conciergePlatformMCPName + "\n"), nil
+	}
+	defer func() { readPluginManifestViaEIC = origManifest }()
+
+	origSettings := readRuntimeConfigViaEIC
+	readRuntimeConfigViaEIC = func(ctx context.Context, instanceID, runtime, relPath string) ([]byte, error) {
+		if runtime != "openclaw" {
+			t.Fatalf("runtime = %q, want openclaw", runtime)
+		}
+		if relPath != "openclaw.json" {
+			t.Fatalf("relPath = %q, want openclaw.json", relPath)
+		}
+		return []byte(`{"mcp":{"servers":{"molecule-platform":{"command":"npx"}}}}`), nil
+	}
+	defer func() { readRuntimeConfigViaEIC = origSettings }()
+
+	expectDeclared(mock,
+		[]DeclaredPlugin{{PluginName: conciergePlatformMCPName, SourceRaw: "local://" + conciergePlatformMCPName}},
+		[]string{conciergePlatformMCPName},
+	)
+	// No INSERT expected.
+
+	h.ReconcileWorkspacePlugins(context.Background(), "ws-openclaw-ok")
+
+	if len(*delivered) != 0 {
+		t.Fatalf("OpenClaw management MCP already in native runtime config must be a no-op, got %v", *delivered)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+func TestManagementMCPConfigProbeParsesRuntimeNativeShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		runtime string
+		data    []byte
+		want    bool
+	}{
+		{
+			name:    "claude settings json",
+			runtime: "claude-code",
+			data:    []byte(`{"mcpServers":{"molecule-platform":{"command":"/opt/molecule-mcp-server"}}}`),
+			want:    true,
+		},
+		{
+			name:    "codex toml",
+			runtime: "codex",
+			data: []byte(`# >>> molecule-mcp:molecule-platform >>>
+[mcp_servers.molecule-platform]
+command = "npx"
+args = ["-y", "@molecule-ai/mcp-server"]
+# <<< molecule-mcp:molecule-platform <<<
+`),
+			want: true,
+		},
+		{
+			name:    "openclaw json",
+			runtime: "openclaw",
+			data:    []byte(`{"mcp":{"servers":{"molecule-platform":{"command":"npx"}}}}`),
+			want:    true,
+		},
+		{
+			name:    "hermes yaml",
+			runtime: "hermes",
+			data: []byte(`mcp_servers:
+  molecule-platform:
+    command: npx
+`),
+			want: true,
+		},
+		{
+			name:    "openclaw does not accept claude shape",
+			runtime: "openclaw",
+			data:    []byte(`{"mcpServers":{"molecule-platform":{"command":"npx"}}}`),
+			want:    false,
+		},
+		{
+			name:    "hermes malformed yaml",
+			runtime: "hermes",
+			data:    []byte(`mcp_servers: [`),
+			want:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			probe, ok := managementMCPConfigProbeFor(tc.runtime)
+			if !ok {
+				t.Fatalf("no management MCP config probe for runtime %q", tc.runtime)
+			}
+			if got := probe.hasServer(tc.data); got != tc.want {
+				t.Fatalf("probe.hasServer(%q) = %v, want %v", tc.runtime, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestManagementMCPRuntimeConfigPresentReadsNativeRuntimePaths(t *testing.T) {
+	cases := []struct {
+		name        string
+		runtime     string
+		wantRuntime string
+		wantRelPath string
+		data        []byte
+	}{
+		{
+			name:        "claude",
+			runtime:     "claude-code",
+			wantRuntime: "claude-code",
+			wantRelPath: ".claude/settings.json",
+			data:        []byte(`{"mcpServers":{"molecule-platform":{"command":"/opt/molecule-mcp-server"}}}`),
+		},
+		{
+			name:        "codex",
+			runtime:     "codex",
+			wantRuntime: "codex",
+			wantRelPath: "config.toml",
+			data: []byte(`# >>> molecule-mcp:molecule-platform >>>
+[mcp_servers.molecule-platform]
+command = "npx"
+# <<< molecule-mcp:molecule-platform <<<
+`),
+		},
+		{
+			name:        "openclaw",
+			runtime:     "openclaw",
+			wantRuntime: "openclaw",
+			wantRelPath: "openclaw.json",
+			data:        []byte(`{"mcp":{"servers":{"molecule-platform":{"command":"npx"}}}}`),
+		},
+		{
+			name:        "hermes",
+			runtime:     "hermes",
+			wantRuntime: "hermes",
+			wantRelPath: "config.yaml",
+			data: []byte(`mcp_servers:
+  molecule-platform:
+    command: npx
+`),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewPluginsHandler(t.TempDir(), nil, nil).
+				WithRuntimeLookup(func(string) (string, error) { return tc.runtime, nil })
+
+			orig := readRuntimeConfigViaEIC
+			readRuntimeConfigViaEIC = func(ctx context.Context, instanceID, runtime, relPath string) ([]byte, error) {
+				if runtime != tc.wantRuntime {
+					t.Fatalf("runtime = %q, want %q", runtime, tc.wantRuntime)
+				}
+				if relPath != tc.wantRelPath {
+					t.Fatalf("relPath = %q, want %q", relPath, tc.wantRelPath)
+				}
+				return tc.data, nil
+			}
+			defer func() { readRuntimeConfigViaEIC = orig }()
+
+			if !h.managementMCPRuntimeConfigPresent(context.Background(), "ws-1", "", "i-1", "") {
+				t.Fatal("expected runtime config to contain molecule-platform")
+			}
+		})
 	}
 }
 

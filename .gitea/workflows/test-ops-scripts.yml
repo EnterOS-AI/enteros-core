@@ -137,3 +137,10 @@ jobs:
           command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
           # bash, not sh (see tolerant step above): clone-manifest.sh needs pipefail.
           bash scripts/test-clone-manifest-provider.sh
+
+      - name: dev-start.sh Langfuse readiness contract (network-free)
+        # Regression lock for local dev bootstrap truthfulness:
+        # ClickHouse's HTTP health can pass before the native migration port is
+        # usable, so dev-start.sh must wait for that path before starting
+        # Langfuse and must not print the ready banner until Langfuse HTTP works.
+        run: bash scripts/test-dev-start-langfuse-readiness.sh
