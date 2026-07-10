@@ -18,7 +18,6 @@ tags:
 kind: env-mutator
 runtimes:
   - claude-code
-  - crewai
   - hermes
 skills:
   - approval-gate

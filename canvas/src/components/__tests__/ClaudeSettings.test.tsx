@@ -234,7 +234,7 @@ describe("ConfigTab — Claude Settings section rendering", () => {
   });
 
   it("does NOT show Claude Settings section for non-claude runtime/model", async () => {
-    setupMock("name: Bot\nruntime: crewai\nmodel: openai:gpt-4o\n");
+    setupMock("name: Bot\nruntime: codex\nmodel: openai:gpt-4o\n");
     render(<ConfigTab workspaceId="ws-1" />);
     // Wait for load (config.yaml fetch resolves) then check absence
     await screen.findByText("General"); // loaded
