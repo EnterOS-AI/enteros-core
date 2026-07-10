@@ -64,7 +64,7 @@ No other platform Go changes are required for the minimal adapter shell. The `ru
 Add `hermes` to the adapter build loop so `build-all.sh` (and the `build-all.sh claude-code`-style single-runtime path) includes it:
 
 ```bash
-ADAPTERS=(langgraph claude_code openclaw deepagents crewai autogen hermes)
+ADAPTERS=(langgraph claude_code openclaw deepagents autogen hermes)
 ```
 
 ---

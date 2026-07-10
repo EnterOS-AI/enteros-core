@@ -27,7 +27,7 @@ The platform consists of four distinct systems:
        A2A HTTP (JSON-RPC 2.0) — direct workspace-to-workspace
 +-----------------------------------------------------------+
 |  workspace/  pluggable workspace runtime          |
-|  LangGraph / DeepAgents / Claude Code / CrewAI / AutoGen   |
+|  LangGraph / DeepAgents / Claude Code / AutoGen            |
 |  / OpenClaw + a2a-sdk                                      |
 +-----------------------------------------------------------+
        |
