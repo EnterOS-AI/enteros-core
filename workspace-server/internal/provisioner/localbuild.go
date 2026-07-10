@@ -13,10 +13,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // Local-build mode: clone the workspace-template-<runtime> repo from Gitea
@@ -276,6 +278,23 @@ func ensureLocalImageWithOpts(ctx context.Context, runtime string, opts *LocalBu
 	}
 	tag := LocalImageTag(runtime, sha, opts.Platform)
 	latest := LocalImageLatestTag(runtime)
+
+	// Cache-key note (RUNTIME_VERSION pin, #53 hardening): the tag is keyed on
+	// runtime+HEAD-sha+arch — deliberately NOT on the .runtime-version pin. That
+	// pin is only knowable AFTER the clone, so folding it into the tag here
+	// (pre-clone, on the fast cache-hit path) would force a clone on every call
+	// just to compute the key, defeating the git-free cache-hit path entirely.
+	// Sha-keying is already version-correct because the pin never changes
+	// independently of the sha: the propagation bot bumps .runtime-version by
+	// COMMITTING it to the template repo's main branch, which moves HEAD → a new
+	// sha → a new tag → a rebuild that re-reads the fresh pin. A .runtime-version
+	// change at the SAME sha is not a state the SSOT flow can produce (the file
+	// lives in the repo; changing it IS a commit). So the RUNTIME_VERSION
+	// build-arg only needs to cache-bust the pip layer WITHIN a build (which it
+	// does), not the outer image tag. If that invariant is ever broken (e.g. a
+	// pin injected out-of-band without a commit), fold the resolved version into
+	// the tag AFTER the clone — but that is a contortion the current flow does
+	// not warrant.
 
 	// 2. Cache hit?
 	hasFn := opts.dockerHasTag
@@ -552,9 +571,12 @@ func maskTokenInString(s, token string) string {
 // auto-promotes to BuildKit when available, falling back to v1
 // otherwise (still produces an amd64 image via QEMU).
 func dockerBuildProd(ctx context.Context, opts *LocalBuildOptions, contextDir, tag string) error {
-	args := dockerBuildArgs(opts, contextDir, tag)
-	if v := readRuntimeVersionPin(contextDir); v != "" {
-		log.Printf("local-build: pinning RUNTIME_VERSION=%s from .runtime-version for %s", v, tag)
+	// Read the .runtime-version pin ONCE and thread the single resolved value
+	// through both the log line and the build-arg so they can never drift.
+	runtimeVersion := readRuntimeVersionPin(contextDir)
+	args := dockerBuildArgs(opts, contextDir, tag, runtimeVersion)
+	if runtimeVersion != "" {
+		log.Printf("local-build: pinning RUNTIME_VERSION=%s from .runtime-version for %s", runtimeVersion, tag)
 	}
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
@@ -583,13 +605,18 @@ func dockerBuildProd(ctx context.Context, opts *LocalBuildOptions, contextDir, t
 // imports a script absent from the stale runtime → exit 127). Absent/unreadable
 // .runtime-version falls through to the Dockerfile/requirements pin (same
 // graceful behavior as publish).
-func dockerBuildArgs(opts *LocalBuildOptions, contextDir, tag string) []string {
+//
+// runtimeVersion is the ALREADY-resolved pin (from readRuntimeVersionPin),
+// passed in rather than re-read here so the file is read exactly ONCE per build
+// — the caller (dockerBuildProd) logs the same value it forwards, so the log
+// line and the build-arg can never drift.
+func dockerBuildArgs(opts *LocalBuildOptions, contextDir, tag, runtimeVersion string) []string {
 	args := []string{"build"}
 	if opts.Platform != "" {
 		args = append(args, "--platform="+opts.Platform)
 	}
-	if v := readRuntimeVersionPin(contextDir); v != "" {
-		args = append(args, "--build-arg", "RUNTIME_VERSION="+v)
+	if runtimeVersion != "" {
+		args = append(args, "--build-arg", "RUNTIME_VERSION="+runtimeVersion)
 	}
 	args = append(args,
 		"-t", tag,
@@ -599,24 +626,103 @@ func dockerBuildArgs(opts *LocalBuildOptions, contextDir, tag string) []string {
 	return args
 }
 
-// readRuntimeVersionPin returns the trimmed first line of
-// <contextDir>/.runtime-version, or "" when the file is absent, unreadable, or
-// empty. Mirrors the publish-image workflow's resolve-version step
-// (`head -n1 .runtime-version | tr -d '[:space:]'`) so a local build pins the
-// EXACT runtime the pushed image does — the .runtime-version file is the SSOT
-// (propagation-bot–synced from each runtime release; #53), consumed identically
-// by prod publish and local-build. Never returns an error: an absent pin falls
-// through to the Dockerfile/requirements default, exactly as publish does.
+// runtimeVersionPinRE is a deliberately permissive "version-ish" gate applied
+// to the normalized pin before it is forwarded to `pip install ==${...}`. It
+// accepts a leading digit followed by dot/alnum/`+`/`-`/`_`/`.` runs — enough
+// to pass PEP 440 releases (0.3.115), pre/post/dev suffixes (1.2.0rc1,
+// 1.2.0.post1, 1.2.0.dev3), and local versions (1.2.0+cpu). It exists only to
+// REJECT obvious garbage (a stray word, a path, an unresolved `${VAR}`) that
+// would hard-fail pip; a value that clears it is handed straight through, so
+// the ultimate arbiter of validity stays pip/the package index, exactly as in
+// prod (the resolve-version step forwards the raw first line untouched).
+var runtimeVersionPinRE = regexp.MustCompile(`^[0-9][0-9A-Za-z.+_-]*$`)
+
+// readRuntimeVersionPin resolves the RUNTIME_VERSION build-arg from
+// <contextDir>/.runtime-version, or "" when there is no usable pin (falls
+// through to the Dockerfile/requirements default, exactly as the publish path
+// does). The .runtime-version file is the SSOT (propagation-bot–synced from each
+// runtime release; #53), consumed identically by prod publish and local-build.
+//
+// Prod parity: the publish-image workflow's resolve-version step does
+// `head -n1 .runtime-version | tr -d '[:space:]'` — take the FIRST line and
+// strip ALL whitespace (not just leading/trailing). We mirror that exactly so a
+// pin with internal or trailing whitespace resolves identically local vs prod.
+//
+// Beyond prod parity we add two guards that keep a local build resilient
+// WITHOUT silently shipping a stale runtime:
+//
+//   - A present-but-unreadable file (permissions, IO error) is NOT conflated
+//     with "absent": os.IsNotExist returns "" quietly (the legit no-pin case),
+//     but any OTHER read error is logged LOUDLY with the path+error and returns
+//     "". Silently swallowing it would omit the build-arg and reship the stale
+//     pip layer with zero signal — the very cache-trap #53 closed.
+//   - The value is normalized to a bare version so a documented SSOT form never
+//     hard-fails pip: an `<runtime>@<version>` form keeps the part after the
+//     LAST `@`, and a single leading `v` is stripped. If the result is not
+//     version-ish (empty / not matching runtimeVersionPinRE) we log LOUDLY and
+//     return "" rather than forward garbage to `pip install ==${...}`.
+//
+// Never returns an error: the build stays resilient (an absent/garbage pin just
+// falls through to the Dockerfile default) but a genuine miss is always visible.
 func readRuntimeVersionPin(contextDir string) string {
-	b, err := os.ReadFile(filepath.Join(contextDir, ".runtime-version"))
+	path := filepath.Join(contextDir, ".runtime-version")
+	b, err := os.ReadFile(path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			// Present but unreadable — DO NOT conflate with absent. Log loudly
+			// so the omitted pin (and the stale-layer risk it carries) is
+			// visible; stay resilient by falling through to the default.
+			log.Printf("local-build: WARNING: .runtime-version present but unreadable at %s: %v — RUNTIME_VERSION pin omitted, build will use the Dockerfile/requirements default (stale-runtime risk; fix the file perms/IO)", path, err)
+		}
 		return ""
 	}
+	// First line only, then strip ALL whitespace (prod: head -n1 | tr -d '[:space:]').
 	line := string(b)
 	if i := strings.IndexByte(line, '\n'); i >= 0 {
 		line = line[:i]
 	}
-	return strings.TrimSpace(line)
+	raw := stripAllWhitespace(line)
+	if raw == "" {
+		// Empty pin = legit no-pin case (empty/blank file); quiet fall-through.
+		return ""
+	}
+	v := normalizeRuntimeVersionPin(raw)
+	if !runtimeVersionPinRE.MatchString(v) {
+		log.Printf("local-build: WARNING: .runtime-version at %s holds a non-version-ish value %q (normalized %q) — RUNTIME_VERSION pin omitted rather than forwarding garbage to pip; build will use the Dockerfile/requirements default", path, raw, v)
+		return ""
+	}
+	return v
+}
+
+// stripAllWhitespace removes every unicode-space rune, mirroring prod's
+// `tr -d '[:space:]'` (which deletes spaces/tabs/newlines/CR/FF/VT). Used so a
+// .runtime-version with internal or trailing whitespace normalizes identically
+// local vs prod.
+func stripAllWhitespace(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// normalizeRuntimeVersionPin coerces a documented SSOT pin form to the bare
+// version pip expects:
+//   - `<runtime>@<version>` → the part after the LAST `@` (so `hermes@1.2.0`
+//     and even `a@b@1.2.0` resolve to `1.2.0`).
+//   - a single leading `v` is stripped (`v1.2.0` → `1.2.0`).
+//
+// A value already bare passes through unchanged. Validation (version-ish check)
+// happens in the caller AFTER this normalization.
+func normalizeRuntimeVersionPin(s string) string {
+	if i := strings.LastIndexByte(s, '@'); i >= 0 {
+		s = s[i+1:]
+	}
+	if len(s) >= 2 && (s[0] == 'v' || s[0] == 'V') {
+		s = s[1:]
+	}
+	return s
 }
 
 // dockerHasTagProd returns true iff the given tag exists in the local

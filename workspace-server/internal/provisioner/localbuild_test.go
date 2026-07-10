@@ -1,9 +1,11 @@
 package provisioner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -776,6 +778,22 @@ func TestReadRuntimeVersionPin(t *testing.T) {
 		{"first_line_only", "0.3.117\n# a trailing comment line\n", true, "0.3.117"},
 		{"empty_file", "\n", true, ""},
 		{"absent_file", "", false, ""},
+		// Prod parity: `tr -d '[:space:]'` strips ALL whitespace, including
+		// INTERNAL whitespace, from the first line — not just leading/trailing.
+		{"internal_whitespace_stripped", "0.3 .118\t\n", true, "0.3.118"},
+		{"tabs_and_spaces_internal", "\t0. 3 .119 \n", true, "0.3.119"},
+		// Normalization: documented SSOT forms coerce to a bare version.
+		{"at_form_runtime_prefixed", "hermes@0.3.120\n", true, "0.3.120"},
+		{"at_form_multiple_ats", "a@b@0.3.121\n", true, "0.3.121"},
+		{"v_prefix_stripped", "v0.3.122\n", true, "0.3.122"},
+		{"at_and_v_combined", "hermes@v0.3.123\n", true, "0.3.123"},
+		{"pep440_local_version", "1.2.0+cpu\n", true, "1.2.0+cpu"},
+		{"pep440_prerelease", "1.2.0rc1\n", true, "1.2.0rc1"},
+		// Garbage / non-version-ish → omit rather than forward to pip.
+		{"garbage_word", "notaversion\n", true, ""},
+		{"garbage_unresolved_var", "${RUNTIME_VERSION}\n", true, ""},
+		{"garbage_path", "/etc/passwd\n", true, ""},
+		{"lone_v_after_strip", "v\n", true, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -792,20 +810,80 @@ func TestReadRuntimeVersionPin(t *testing.T) {
 	}
 }
 
-func TestDockerBuildArgs_RuntimeVersionPin(t *testing.T) {
-	t.Run("forwards RUNTIME_VERSION build-arg when .runtime-version present", func(t *testing.T) {
-		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, ".runtime-version"), []byte("0.3.115\n"), 0o644); err != nil {
-			t.Fatal(err)
+// TestReadRuntimeVersionPin_UnreadableFailsLoud asserts finding #1: a present-
+// but-unreadable .runtime-version must NOT be conflated with "absent" — it
+// returns "" (stay resilient) but logs LOUDLY (with the path) so the omitted
+// pin, and the stale-runtime risk it carries, is visible in logs rather than a
+// silent miss (the cache-trap #53 closed).
+func TestReadRuntimeVersionPin_UnreadableFailsLoud(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — chmod 0 does not deny reads")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".runtime-version")
+	if err := os.WriteFile(path, []byte("0.3.115\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Deny reads so os.ReadFile returns a permission error (present, not absent).
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+
+	logged := captureLog(t, func() {
+		if got := readRuntimeVersionPin(dir); got != "" {
+			t.Errorf("readRuntimeVersionPin on unreadable file = %q, want \"\" (resilient fall-through)", got)
 		}
-		args := dockerBuildArgs(&LocalBuildOptions{}, dir, "img:tag")
+	})
+	if !strings.Contains(logged, "WARNING") {
+		t.Errorf("expected a loud WARNING log for an unreadable pin, got: %q", logged)
+	}
+	if !strings.Contains(logged, path) {
+		t.Errorf("expected the log to name the path %q, got: %q", path, logged)
+	}
+}
+
+// TestReadRuntimeVersionPin_AbsentIsQuiet asserts the complement of finding #1:
+// a genuinely-absent file (os.IsNotExist) is the legit no-pin case and must NOT
+// log a warning — only an OTHER read error is loud.
+func TestReadRuntimeVersionPin_AbsentIsQuiet(t *testing.T) {
+	dir := t.TempDir() // no .runtime-version written
+	logged := captureLog(t, func() {
+		if got := readRuntimeVersionPin(dir); got != "" {
+			t.Errorf("readRuntimeVersionPin(absent) = %q, want \"\"", got)
+		}
+	})
+	if strings.Contains(logged, "WARNING") {
+		t.Errorf("absent .runtime-version must be quiet (legit no-pin case), got log: %q", logged)
+	}
+}
+
+// TestReadRuntimeVersionPin_GarbageIsLoud asserts finding #3: a non-version-ish
+// value is omitted (not forwarded to pip) AND logged loudly.
+func TestReadRuntimeVersionPin_GarbageIsLoud(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".runtime-version"), []byte("notaversion\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logged := captureLog(t, func() {
+		if got := readRuntimeVersionPin(dir); got != "" {
+			t.Errorf("readRuntimeVersionPin(garbage) = %q, want \"\" (do not forward to pip)", got)
+		}
+	})
+	if !strings.Contains(logged, "WARNING") {
+		t.Errorf("expected a loud WARNING for a non-version-ish pin, got: %q", logged)
+	}
+}
+
+func TestDockerBuildArgs_RuntimeVersionPin(t *testing.T) {
+	t.Run("forwards RUNTIME_VERSION build-arg when version resolved", func(t *testing.T) {
+		args := dockerBuildArgs(&LocalBuildOptions{}, "/ctx", "img:tag", "0.3.115")
 		if !argsHavePair(args, "--build-arg", "RUNTIME_VERSION=0.3.115") {
 			t.Fatalf("expected `--build-arg RUNTIME_VERSION=0.3.115` in %v", args)
 		}
 	})
-	t.Run("no RUNTIME_VERSION build-arg when .runtime-version absent (falls through)", func(t *testing.T) {
-		dir := t.TempDir()
-		args := dockerBuildArgs(&LocalBuildOptions{}, dir, "img:tag")
+	t.Run("no RUNTIME_VERSION build-arg when version empty (falls through)", func(t *testing.T) {
+		args := dockerBuildArgs(&LocalBuildOptions{}, "/ctx", "img:tag", "")
 		for _, a := range args {
 			if strings.HasPrefix(a, "RUNTIME_VERSION=") {
 				t.Fatalf("unexpected RUNTIME_VERSION build-arg in %v", args)
@@ -813,11 +891,7 @@ func TestDockerBuildArgs_RuntimeVersionPin(t *testing.T) {
 		}
 	})
 	t.Run("platform and version both forwarded", func(t *testing.T) {
-		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, ".runtime-version"), []byte("0.3.115"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		args := dockerBuildArgs(&LocalBuildOptions{Platform: "linux/amd64"}, dir, "img:tag")
+		args := dockerBuildArgs(&LocalBuildOptions{Platform: "linux/amd64"}, "/ctx", "img:tag", "0.3.115")
 		if !argsHave(args, "--platform=linux/amd64") {
 			t.Errorf("platform not forwarded: %v", args)
 		}
@@ -825,6 +899,63 @@ func TestDockerBuildArgs_RuntimeVersionPin(t *testing.T) {
 			t.Errorf("version not forwarded: %v", args)
 		}
 	})
+}
+
+// TestDockerBuildProd_SingleReadLogMatchesBuildArg asserts finding #4: the file
+// is read ONCE and the SAME resolved value appears in BOTH the "pinning" log
+// line and the RUNTIME_VERSION build-arg — no log-vs-build-arg drift.
+//
+// dockerBuildProd shells out to real docker (fails in a bare sandbox), but it
+// emits the "pinning RUNTIME_VERSION=…" log line BEFORE the exec, so we capture
+// the REAL log line the production path emits and assert it carries the
+// normalized value. We independently assert dockerBuildArgs produces the same
+// value for the same input — since dockerBuildProd feeds BOTH from one
+// readRuntimeVersionPin call, matching values here prove they cannot drift.
+func TestDockerBuildProd_SingleReadLogMatchesBuildArg(t *testing.T) {
+	dir := t.TempDir()
+	// `@`+`v` form so we also prove the LOGGED value is the NORMALIZED one, not
+	// the raw file contents — i.e. log and build-arg share one resolution.
+	if err := os.WriteFile(filepath.Join(dir, ".runtime-version"), []byte("hermes@v0.3.130\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The resolved value both the log line and the build-arg must carry.
+	resolved := readRuntimeVersionPin(dir)
+	if resolved != "0.3.130" {
+		t.Fatalf("precondition: readRuntimeVersionPin = %q, want 0.3.130", resolved)
+	}
+	args := dockerBuildArgs(&LocalBuildOptions{}, dir, "img:tag", resolved)
+	if !argsHavePair(args, "--build-arg", "RUNTIME_VERSION=0.3.130") {
+		t.Fatalf("build-arg does not carry the resolved pin: %v", args)
+	}
+	// Capture the REAL log line dockerBuildProd emits. The subsequent docker
+	// exec errors (no daemon) — irrelevant; we only assert the pre-exec log.
+	logged := captureLog(t, func() {
+		_ = dockerBuildProd(context.Background(), &LocalBuildOptions{}, dir, "img:tag")
+	})
+	if !strings.Contains(logged, "RUNTIME_VERSION=0.3.130") {
+		t.Errorf("log line does not carry the resolved pin 0.3.130, got: %q", logged)
+	}
+}
+
+// captureLog redirects the standard logger to a buffer for the duration of fn
+// and returns everything it wrote. Not parallel-safe (mutates the global logger),
+// so callers that use it must NOT t.Parallel().
+func captureLog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	origOut := log.Writer()
+	origFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(origOut)
+		log.SetFlags(origFlags)
+	}()
+	fn()
+	return buf.String()
 }
 
 func argsHave(args []string, want string) bool {
