@@ -119,10 +119,11 @@ type LocalBuildOptions struct {
 	// primary gate — max time with ZERO output before the process is killed
 	// as wedged. Ceiling is the absolute wall-clock backstop. Zero on either
 	// = use the package default (buildStallGrace() / buildCeiling(),
-	// env-overridable). The caller (Start) narrows Ceiling to the effective
-	// per-runtime provision timeout so a runtime declaring 30m is not capped
-	// at the old fixed 3m. Exposed so tests can drive the runner with tiny
-	// values.
+	// env-overridable). EnsureLocalImage sets Ceiling from the provision ctx's
+	// deadline (which handlers.dockerProvisionTimeout has already set to the
+	// per-runtime provision_timeout_seconds, floored at 12m), so a runtime
+	// declaring 30m is not capped at the 12m default. Exposed so tests can
+	// drive the runner with tiny values.
 	StallGrace time.Duration
 	Ceiling    time.Duration
 
@@ -244,7 +245,33 @@ func IsLocalBuildImage(image string) bool {
 // or docker calls. The Gitea HEAD lookup is the only network call on
 // the cache-hit path.
 func EnsureLocalImage(ctx context.Context, runtime string) (string, error) {
-	return ensureLocalImageWithOpts(ctx, runtime, newDefaultLocalBuildOptions())
+	opts := newDefaultLocalBuildOptions()
+	// The provision ctx already carries the per-runtime absolute deadline
+	// (handlers.dockerProvisionTimeout = max(provision_timeout_seconds, 12m),
+	// so hermes = 30m). Derive the stall-runner's ceiling FROM that deadline
+	// so the per-runtime window actually reaches the build — otherwise the
+	// runner's own 12m default backstop fires first and a 12–30m hermes build
+	// is killed at 12m despite its declared 30m. Paths with no deadline (the
+	// bundle importer) keep the buildCeiling() default.
+	if c := ceilingFromCtxDeadline(ctx); c > 0 {
+		opts.Ceiling = c
+	}
+	return ensureLocalImageWithOpts(ctx, runtime, opts)
+}
+
+// ceilingFromCtxDeadline returns the stall-runner ceiling implied by ctx's
+// deadline: the remaining time-to-deadline when ctx has one (so the per-runtime
+// provision window already on the ctx reaches the build), else 0 meaning "no
+// ctx-implied ceiling — keep the option default". The ctx is the single source
+// of truth for the absolute cap; the derived ceiling just gives it a clear
+// typed error (errBuildCeiling) rather than a bare context-cancel.
+func ceilingFromCtxDeadline(ctx context.Context) time.Duration {
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining > 0 {
+			return remaining
+		}
+	}
+	return 0
 }
 
 // ensureLocalImageHook is the seam Start() calls into. Production code
@@ -546,15 +573,23 @@ func gitCloneProd(ctx context.Context, opts *LocalBuildOptions, runtime, dest st
 		// On parse failure we silently fall through to the public URL —
 		// better to attempt the anonymous clone than to refuse outright.
 	}
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", "--branch=main", "--single-branch", cloneURL, dest)
+	// --progress FORCES git to emit its "Receiving objects: NN%" meter even
+	// though stderr is a pipe, not a TTY (git suppresses it on a pipe by
+	// default). Without it a healthy-but-slow clone is silent for its whole
+	// transfer, so the stall gate degrades to a blind wall-clock and a large
+	// clone running past the grace is false-killed. The meter is \r-delimited,
+	// which the runner's chunk reader handles fine (the old line scanner would
+	// have accumulated it into one over-cap line).
+	cmd := exec.CommandContext(ctx, "git", "clone", "--progress", "--depth=1", "--branch=main", "--single-branch", cloneURL, dest)
 	// Drop git's askpass prompts so we fail-fast on auth errors instead
 	// of hanging waiting for an interactive password.
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/bin/echo")
-	// Same progress-driven runner as the build: a shallow clone of a large
-	// template repo streams git's progress meter, so a genuinely-progressing
-	// clone is never killed, while a clone hung on an unreachable host is
-	// reaped after the stall grace (the askpass drop already covers the
-	// interactive-auth hang; this covers the network-black-hole hang).
+	// Same progress-driven runner as the build: with --progress a
+	// genuinely-progressing clone streams git's meter (resetting the no-output
+	// clock), so it is never killed, while a clone hung on an unreachable host
+	// emits nothing and is reaped after the stall grace (the askpass drop
+	// already covers the interactive-auth hang; this covers the
+	// network-black-hole hang).
 	out, err := runStreamingCommand(ctx, cmd, opts.stallGrace(), opts.ceiling())
 	if err != nil {
 		// Mask the token in any error string git emits via stderr — git

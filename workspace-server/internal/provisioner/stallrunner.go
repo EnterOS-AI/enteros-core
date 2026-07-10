@@ -1,7 +1,6 @@
 package provisioner
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -119,26 +118,56 @@ func DefaultProvisionCeiling() time.Duration {
 	return buildCeiling()
 }
 
-// runStreamingCommand runs cmd, streaming its merged stdout+stderr
-// line-by-line, and returns the FULL captured output plus an error.
+const (
+	// maxCapturedOutput bounds the retained build/clone output so a
+	// pathologically chatty build can't grow the capture buffer without
+	// limit. We keep the TAIL — a failing `docker build` / `git clone` prints
+	// the actionable error at the END — dropping the oldest bytes once over
+	// the cap. (The old cmd.CombinedOutput path was itself unbounded, so this
+	// is a robustness improvement, not a regression.)
+	maxCapturedOutput = 4 * 1024 * 1024
+	// capturedOutputSlack lets the buffer run this far past the cap before a
+	// trim, so the O(n) tail-copy amortizes over ~1 MiB of new output rather
+	// than firing on every 32 KiB chunk once over the cap.
+	capturedOutputSlack = 1 * 1024 * 1024
+)
+
+// appendCapped appends p to buf, then trims buf from the FRONT if it has grown
+// past maxCapturedOutput+capturedOutputSlack, leaving the last maxCapturedOutput
+// bytes. The caller holds the buffer's mutex.
+func appendCapped(buf *bytes.Buffer, p []byte) {
+	buf.Write(p)
+	if buf.Len() <= maxCapturedOutput+capturedOutputSlack {
+		return
+	}
+	b := buf.Bytes()
+	tail := append([]byte(nil), b[len(b)-maxCapturedOutput:]...)
+	buf.Reset()
+	buf.Write(tail)
+}
+
+// runStreamingCommand runs cmd, streaming its merged stdout+stderr in chunks,
+// and returns the (tail-capped) captured output plus an error.
 //
 // Gates (whichever fires first):
-//   - stallGrace: no output line for this long → kill, return errBuildStalled.
+//   - stallGrace: no output for this long      → kill, return errBuildStalled.
 //   - ceiling:    total elapsed exceeds this   → kill, return errBuildCeiling.
 //   - ctx:        parent ctx cancelled          → kill, return ctx.Err().
 //   - normal:     process exits on its own      → return its exit error (or nil).
 //
 // stallGrace<=0 disables the stall gate; ceiling<=0 disables the ceiling
-// gate (ctx and normal exit still apply). The returned output is always the
-// bytes captured so far, so callers can mask + surface it in the error
-// message exactly as the old cmd.CombinedOutput() path did.
+// gate (ctx and normal exit still apply). The returned output is the bytes
+// captured so far (last maxCapturedOutput bytes), so callers can mask +
+// surface it in the error message like the old cmd.CombinedOutput() path did.
 //
 // Reaping: the command is Start()ed (not Run()) and always Wait()ed for in
 // this function — even on a kill — so no zombie/defunct child is left. The
 // single reader goroutine drains the pipe to EOF (which happens once the
 // process dies and its stdout/stderr fds close), and we join it before
 // returning, so there is no goroutine leak and the returned buffer is
-// complete + race-free.
+// complete + race-free. The reader reads raw CHUNKS (not lines) so an
+// over-long single line can never stop it draining and wedge Wait() — see the
+// reader goroutine below.
 func runStreamingCommand(ctx context.Context, cmd *exec.Cmd, stallGrace, ceiling time.Duration) ([]byte, error) {
 	// Merge stdout+stderr into one pipe so ordering is preserved and a
 	// single reader drains both — matching CombinedOutput's semantics.
@@ -173,27 +202,42 @@ func runStreamingCommand(ctx context.Context, cmd *exec.Cmd, stallGrace, ceiling
 		return time.Since(lastSeen)
 	}
 
-	// Reader goroutine: drain the merged pipe to EOF, appending to buf and
-	// resetting the progress clock on every line. EOF arrives once the
-	// process exits and the write end closes (we close pw right after Wait).
+	// Reader goroutine: drain the merged pipe to EOF in fixed-size CHUNKS,
+	// appending to buf and resetting the progress clock on every read. EOF
+	// arrives once the process exits and the write end closes (we close pw
+	// right after Wait).
+	//
+	// Chunked (not line-scanned) on purpose. A bufio.Scanner stops — with
+	// ErrTooLong — on a single line longer than its buffer cap, and once it
+	// stops draining `pr` the os/exec-internal stdout copier (present because
+	// cmd.Stdout/Stderr is an *io.PipeWriter, not an *os.File) blocks FOREVER
+	// on its `pw.Write` (an io.Pipe write blocks until a reader consumes it).
+	// cmd.Wait() waits on that copier, so Wait never returns — and NO kill can
+	// rescue it: SIGKILL closes the child's fd, but the copier is stuck on the
+	// WRITE side holding bytes it already read, so it never observes the close.
+	// A single build/clone line over the old 1 MiB cap (a base64 blob in a RUN
+	// echo, a minified asset, `--progress=plain`'s wide lines, git's
+	// \r-delimited meter) would therefore wedge the whole provision goroutine
+	// permanently — the exact hang this runner exists to prevent. Reading raw
+	// chunks never stops until EOF, so the pipe is always drained and Wait()
+	// can always complete. Any byte activity counts as progress, which is the
+	// correct stall signal independent of line structure.
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
-		sc := bufio.NewScanner(pr)
-		// Allow long single lines (BuildKit can emit wide progress lines);
-		// 1 MiB is far above any realistic build line.
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			line := sc.Bytes()
-			mu.Lock()
-			buf.Write(line)
-			buf.WriteByte('\n')
-			lastSeen = time.Now()
-			mu.Unlock()
+		chunk := make([]byte, 32*1024)
+		for {
+			n, rerr := pr.Read(chunk)
+			if n > 0 {
+				mu.Lock()
+				appendCapped(&buf, chunk[:n])
+				lastSeen = time.Now()
+				mu.Unlock()
+			}
+			if rerr != nil {
+				return // io.EOF (write end closed + drained) or pipe closed
+			}
 		}
-		// A scanner error (e.g. line-too-long) is not fatal to the build
-		// verdict — the process's own exit status is the source of truth.
-		// We simply stop draining; the io.Pipe read end is closed below.
 	}()
 
 	// killReason is set by the monitor before it kills, so the main
@@ -244,27 +288,32 @@ func runStreamingCommand(ctx context.Context, cmd *exec.Cmd, stallGrace, ceiling
 	// we wait for waitCh to fire — a nil channel blocks forever in select.
 	ctxDone := ctx.Done()
 
+	// finish closes the write end (so the reader sees EOF), joins the reader so
+	// buf is complete, and returns the captured output with either the
+	// deliberate kill reason (if the monitor killed the process) or the
+	// process's own exit error.
+	finish := func(werr error) ([]byte, error) {
+		_ = pw.Close()
+		<-readerDone
+		_ = pr.Close()
+
+		mu.Lock()
+		out := append([]byte(nil), buf.Bytes()...)
+		mu.Unlock()
+
+		if reason := getKillReason(); reason != nil {
+			// We killed it deliberately — surface the mechanism, not the
+			// resulting "signal: killed".
+			return out, reason
+		}
+		return out, werr
+	}
+
 	// Monitor loop: races normal exit against the stall/ceiling/ctx gates.
 	for {
 		select {
 		case werr := <-waitCh:
-			// Process exited (naturally or because we killed it). Close the
-			// write end so the reader sees EOF, then join it so buf is
-			// complete before we read it.
-			_ = pw.Close()
-			<-readerDone
-			_ = pr.Close()
-
-			mu.Lock()
-			out := append([]byte(nil), buf.Bytes()...)
-			mu.Unlock()
-
-			if reason := getKillReason(); reason != nil {
-				// We killed it deliberately — surface the mechanism, not
-				// the resulting "signal: killed".
-				return out, reason
-			}
-			return out, werr
+			return finish(werr)
 
 		case <-ctxDone:
 			kill(ctx.Err())
@@ -272,6 +321,16 @@ func runStreamingCommand(ctx context.Context, cmd *exec.Cmd, stallGrace, ceiling
 			// The waitCh case fires once the kill lands and reaps the process.
 
 		case <-ticker.C:
+			// Prefer a real exit over a stall/ceiling verdict: if the process
+			// has ALREADY exited, take that path instead of SIGKILLing a
+			// corpse and mislabeling a clean (exit-0) build whose final step
+			// happened to be quiet for longer than the grace. Non-blocking, so
+			// a still-running process falls through to the gate checks below.
+			select {
+			case werr := <-waitCh:
+				return finish(werr)
+			default:
+			}
 			if ceiling > 0 && time.Now().After(deadline) {
 				kill(fmt.Errorf("%w %s", errBuildCeiling, ceiling))
 				continue
