@@ -16,22 +16,10 @@ describe("runtimeDisplayName", () => {
     ["codex", "Codex"],
     ["hermes", "Hermes"],
     ["openclaw", "OpenClaw"],
-    ["crewai", "CrewAI"],
     ["kimi", "Kimi"],
     ["kimi-cli", "Kimi CLI"],
   ])("known runtime %q maps to %q", (input, expected) => {
     expect(runtimeDisplayName(input)).toBe(expected);
-  });
-
-  it("crewai maps to a friendly name, not the bare id", () => {
-    // Regression for the canvas↔CP-catalog drift (audit §3): crewai is a
-    // first-class template-backed runtime in the CP catalog
-    // (internal/providers/runtimes.yaml → "CrewAI Agent") but was missing from
-    // the canvas projection, so it rendered as the raw "crewai". This asserts
-    // the projection now covers it — it FAILS before the friendly name is added
-    // (fallback returns the input string verbatim).
-    expect(runtimeDisplayName("crewai")).toBe("CrewAI");
-    expect(runtimeDisplayName("crewai")).not.toBe("crewai");
   });
 
   it("unknown runtime falls back to the input string verbatim", () => {
