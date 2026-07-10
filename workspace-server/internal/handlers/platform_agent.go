@@ -161,8 +161,13 @@ func defaultPlatformAgentName() string {
 func resolveConciergeAdminCredential(ctx context.Context, workspaceID string) string {
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	orgID := strings.TrimSpace(os.Getenv("MOLECULE_ORG_ID"))
-	if orgID == "" {
-		return adminToken // no org-token anchor (self-host/local) — keep break-glass
+	// A managed org token must anchor to a real org UUID (org_api_tokens.org_id is
+	// a uuid column, so a non-UUID would fail the mint query). No/non-UUID org id —
+	// self-host, local dev, or the cp-stub replay harness (MOLECULE_ORG_ID is
+	// "harness-org-alpha") — means there is no org-token anchor: keep the break-glass
+	// ADMIN_TOKEN and skip the mint entirely (no failed query, no noise).
+	if _, err := uuid.Parse(orgID); err != nil {
+		return adminToken
 	}
 	owner := "system:concierge:" + workspaceID
 	plaintext, newID, err := orgtoken.Issue(ctx, db.DB, "concierge (auto-rotated)", owner, orgID, orgtoken.AuditLogRequestContext{})

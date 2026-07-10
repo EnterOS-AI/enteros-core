@@ -743,6 +743,16 @@ func TestResolveConciergeAdminCredential_FallsBackToAdminToken(t *testing.T) {
 			t.Fatalf("want empty, got %q", got)
 		}
 	})
+	t.Run("non-UUID org id → break-glass (no mint attempt; harness/self-host)", func(t *testing.T) {
+		// The cp-stub replay harness uses MOLECULE_ORG_ID="harness-org-alpha"; the
+		// org_api_tokens.org_id uuid column would reject it, so we must NOT attempt
+		// the mint — fall back cleanly, no failed query.
+		t.Setenv("ADMIN_TOKEN", "break-glass-root")
+		t.Setenv("MOLECULE_ORG_ID", "harness-org-alpha")
+		if got := resolveConciergeAdminCredential(context.Background(), "ws-x"); got != "break-glass-root" {
+			t.Fatalf("non-UUID org id: want ADMIN_TOKEN fallback (no mint), got %q", got)
+		}
+	})
 }
 
 // TestApplyConciergeProvisionConfig_OnlyPlatformGetsOrgMCP locks the security
