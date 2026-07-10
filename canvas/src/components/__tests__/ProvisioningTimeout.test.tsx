@@ -221,7 +221,7 @@ describe("ProvisioningTimeout", () => {
         expect(provisionTimeoutForRuntime("codex")).toBe(
           DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
         );
-        expect(provisionTimeoutForRuntime("crewai")).toBe(
+        expect(provisionTimeoutForRuntime("openclaw")).toBe(
           DEFAULT_RUNTIME_PROFILE.provisionTimeoutMs,
         );
       });

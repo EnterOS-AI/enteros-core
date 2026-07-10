@@ -46,9 +46,9 @@ import { ConfigTab } from "../ConfigTab";
 
 function wireApi(templates: Array<{ id: string; name?: string; runtime?: string; models?: unknown[]; displayable?: boolean }>) {
   apiGet.mockImplementation((path: string) => {
-    if (path === "/workspaces/ws-crewai") return Promise.resolve({ runtime: "crewai" });
-    if (path === "/workspaces/ws-crewai/model") return Promise.resolve({ model: "crew-model" });
-    if (path === "/workspaces/ws-crewai/files/config.yaml") return Promise.resolve({ content: "name: crew\nruntime: crewai\n" });
+    if (path === "/workspaces/ws-hermes") return Promise.resolve({ runtime: "hermes" });
+    if (path === "/workspaces/ws-hermes/model") return Promise.resolve({ model: "hermes-model" });
+    if (path === "/workspaces/ws-hermes/files/config.yaml") return Promise.resolve({ content: "name: hermes-agent\nruntime: hermes\n" });
     if (path === "/templates") return Promise.resolve(templates);
     return Promise.reject(new Error(`unmocked api.get: ${path}`));
   });
@@ -64,24 +64,24 @@ describe("ConfigTab — runtime dropdown is /templates-driven", () => {
   it("shows a backend-served runtime selected in the runtime dropdown (#ssot-fix)", async () => {
     wireApi([
       { id: "claude-code", name: "Claude Code", runtime: "claude-code", models: [] },
-      { id: "crewai", name: "CrewAI", runtime: "crewai", models: [] },
+      { id: "hermes", name: "Hermes", runtime: "hermes", models: [] },
     ]);
-    render(<ConfigTab workspaceId="ws-crewai" />);
+    render(<ConfigTab workspaceId="ws-hermes" />);
     const select = await waitFor(() => screen.getByRole("combobox", { name: /runtime/i }));
-    expect((select as HTMLSelectElement).value).toBe("crewai");
+    expect((select as HTMLSelectElement).value).toBe("hermes");
     const opts = Array.from((select as HTMLSelectElement).options).map((o) => o.value);
-    expect(opts).toContain("crewai");
+    expect(opts).toContain("hermes");
   });
 
   it("hides a template flagged displayable:false", async () => {
     wireApi([
-      { id: "crewai", name: "CrewAI", runtime: "crewai", models: [] },
+      { id: "hermes", name: "Hermes", runtime: "hermes", models: [] },
       { id: "legacy", name: "Legacy", runtime: "legacy", models: [], displayable: false },
     ]);
-    render(<ConfigTab workspaceId="ws-crewai" />);
+    render(<ConfigTab workspaceId="ws-hermes" />);
     const select = await waitFor(() => screen.getByRole("combobox", { name: /runtime/i }));
     const opts = Array.from((select as HTMLSelectElement).options).map((o) => o.value);
-    expect(opts).toContain("crewai");
+    expect(opts).toContain("hermes");
     expect(opts).not.toContain("legacy");
   });
 });

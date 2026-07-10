@@ -51,7 +51,7 @@ Molecule AI is an **org-native control plane for heterogeneous AI agent teams**.
 - **Canvas-based visual team building** with drag-to-nest hierarchy
 - **Comprehensive control plane operations** — registry, heartbeats, lifecycle, approvals, secrets, traces, bundles
 
-Six runtime adapters ship production-ready on `main`: LangGraph, DeepAgents, Claude Code, CrewAI, AutoGen, OpenClaw.
+Five runtime adapters ship production-ready on `main`: LangGraph, DeepAgents, Claude Code, AutoGen, OpenClaw.
 
 ---
 
@@ -76,7 +76,7 @@ Six runtime adapters ship production-ready on `main`: LangGraph, DeepAgents, Cla
 | Category | Examples | How Molecule AI Differs |
 |----------|---------|---------------------|
 | Workflow builders | n8n, Windmill, Temporal | Molecule AI models **roles**, not tasks |
-| Agent frameworks | LangGraph, CrewAI, AutoGen | Molecule AI sits **above** frameworks as runtime adapters |
+| Agent frameworks | LangGraph, AutoGen | Molecule AI sits **above** frameworks as runtime adapters |
 | Coding agents | Claude Code, Cursor, Codex | Molecule AI runs coding agents as **workspace roles** alongside other types |
 | Chat UIs | ChatGPT, Claude.ai | Molecule AI is **operational infrastructure**, not a conversation interface |
 
@@ -107,7 +107,7 @@ Six runtime adapters ship production-ready on `main`: LangGraph, DeepAgents, Cla
 ┌─────────────────────────────────────────────────────────────┐
 │ Workspace Runtime (Python 3.11+ Docker image)               │
 │ Pluggable adapters: LangGraph, DeepAgents, Claude Code,     │
-│ CrewAI, AutoGen, OpenClaw                                   │
+│ AutoGen, OpenClaw                                           │
 │ A2A protocol server · heartbeat · skills · HMA memory       │
 └─────────────────────────────────────────────────────────────┘
           │
@@ -791,7 +791,6 @@ workspace/
 │   ├── langgraph/adapter.py
 │   ├── deepagents/adapter.py
 │   ├── claude_code/adapter.py
-│   ├── crewai/adapter.py
 │   ├── autogen/adapter.py
 │   └── openclaw/adapter.py
 ├── tools/                     # 14 tool files
@@ -1013,7 +1012,7 @@ Analysis of 8 OSS agent projects (from `oss-agent-growth-research.md`):
   screen rec    top comment       Major YouTuber             3 commands max
 ```
 
-Every Tier 1 launch (Open Interpreter, CrewAI) had all four elements.
+Every Tier 1 launch (Open Interpreter) had all four elements.
 
 ### Documentation Best Practice (Diataxis Model)
 

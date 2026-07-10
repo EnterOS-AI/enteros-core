@@ -6,10 +6,9 @@
 // independently-maintained list that is free to drift:
 //   1. The CP runtime catalog (molecule-controlplane
 //      internal/providers/runtimes.yaml) — the template-backed runtimes a
-//      workspace can run on: claude-code, codex, hermes, openclaw,
-//      and crewai. Canvas surfaces the short brand label; the catalog's
-//      display_name is the long form (e.g. "CrewAI Agent" → "CrewAI",
-//      "Claude Code Agent" → "Claude Code").
+//      workspace can run on: claude-code, codex, hermes, and openclaw.
+//      Canvas surfaces the short brand label; the catalog's display_name
+//      is the long form (e.g. "Claude Code Agent" → "Claude Code").
 //   2. The external-like / BYO-compute meta-runtimes — kimi and kimi-cli — the
 //      set defined in ./externalRuntimes.ts, itself a mirror of the backend
 //      externalLikeRuntimes SSOT (workspace-server
@@ -17,7 +16,7 @@
 //      container or template repo (operator brings the compute).
 // A runtime missing here renders its raw id (see runtimeDisplayName), so a gap
 // is only cosmetic — but keeping this in step with the two SSOTs above avoids a
-// silent label drift (crewai previously rendered as the bare "crewai").
+// silent label drift (an unmapped runtime rendering as its bare id).
 
 import { WORKSPACE_KIND } from "@/lib/workspace-kind";
 
@@ -27,7 +26,6 @@ const RUNTIME_NAMES: Record<string, string> = {
   codex: "Codex",
   hermes: "Hermes",
   openclaw: "OpenClaw",
-  crewai: "CrewAI",
   // External-like / BYO-compute meta-runtimes (SSOT: ./externalRuntimes.ts).
   kimi: "Kimi",
   "kimi-cli": "Kimi CLI",
