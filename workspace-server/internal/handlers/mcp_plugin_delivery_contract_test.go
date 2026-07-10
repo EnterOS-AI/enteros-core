@@ -85,6 +85,10 @@ func TestMCPPluginDeliveryContract_LoadableFromSDK(t *testing.T) {
 // the delivery seam: the adaptor must route the molecule-platform descriptor
 // through ctx.register_mcp_server and must NOT write /configs/.claude/settings.json
 // directly (the legacy path that bypasses the PORT).
+//
+// ADR-004 moved runtime-specific rendering into each adapter/template. Core
+// therefore owns this port-level assertion only; native Codex TOML rendering is
+// covered by the Codex template's adapter conformance and management-MCP tests.
 func TestMCPPluginDeliveryContract_MCPServerAdaptorRoutesThroughPort(t *testing.T) {
 	contract, err := LoadMCPPluginDeliveryContract()
 	if err != nil {
@@ -162,96 +166,6 @@ print("RECORDER=" + json.dumps(recorded))
 	claudeSettings := filepath.Join(configsDir, rel)
 	if _, err := os.Stat(claudeSettings); err == nil {
 		t.Errorf("MCPServerAdaptor wrote %s directly — it bypassed the PORT (#3159 regression)", contract.SettingsPath)
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("stat %s: %v", claudeSettings, err)
-	}
-}
-
-// TestMCPPluginDeliveryContract_CodexRoutesToCodexConfig is the codex-runtime
-// regression for #3159. It installs the REAL MCPServerAdaptor with runtime
-// "codex" and a spy that renders via the codex renderer, then asserts the codex
-// native config ($HOME/.codex/config.toml) declares [mcp_servers.molecule-platform]
-// with env MOLECULE_MCP_MODE=management — and that NO /configs/.claude/settings.json
-// was produced. This catches the exact #3159 bug class: a hard-coded Claude
-// write would mis-wire a codex concierge (MCP written to a file codex never
-// reads), leaving provision_workspace absent.
-func TestMCPPluginDeliveryContract_CodexRoutesToCodexConfig(t *testing.T) {
-	contract, err := LoadMCPPluginDeliveryContract()
-	if err != nil {
-		t.Fatalf("load contract: %v", err)
-	}
-
-	pyScript := `
-import asyncio, json, sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from molecule_runtime.plugins_registry.builtins import MCPServerAdaptor
-from molecule_runtime.plugins_registry.protocol import InstallContext
-from molecule_runtime.mcp_render import render_for_runtime
-
-plugin_root = Path(sys.argv[2])
-configs_dir = Path(sys.argv[3])
-configs_dir.mkdir(parents=True, exist_ok=True)
-
-recorded = []
-
-async def main():
-    # codex PORT: the active codex renderer writes ~/.codex/config.toml. HOME is
-    # pinned to a temp dir by the Go harness so the codex renderer's $HOME lookup
-    # lands inside the sandbox.
-    def register_mcp_server(name, spec):
-        recorded.append({"name": name, "spec": spec})
-        render_for_runtime("codex", str(configs_dir), name, spec)
-
-    ctx = InstallContext(
-        configs_dir=configs_dir,
-        workspace_id="test-ws",
-        runtime="codex",
-        plugin_root=plugin_root,
-        register_mcp_server=register_mcp_server,
-    )
-    adaptor = MCPServerAdaptor("molecule-platform-mcp", "codex")
-    await adaptor.install(ctx)
-
-asyncio.run(main())
-print("RECORDER=" + json.dumps(recorded))
-`
-
-	configsDir := t.TempDir()
-	pluginRoot := t.TempDir()
-	homeDir := t.TempDir()
-	writePlatformFragment(t, contract, pluginRoot)
-
-	// Pin HOME so the codex renderer's ~/.codex/config.toml lands in the sandbox.
-	stdout := runMCPAdaptorHarness(t, pyScript, pluginRoot, configsDir, []string{"HOME=" + homeDir})
-
-	// The PORT must have been called (same keystone guard, codex side).
-	recorded := parseRecorder(t, stdout)
-	if len(recorded) != 1 || recorded[0].Name != "molecule-platform" {
-		t.Fatalf("codex: register_mcp_server PORT not called with the platform server: recorded=%v", recorded)
-	}
-
-	// codex native config must declare [mcp_servers.molecule-platform] + env.
-	codexConfig := filepath.Join(homeDir, ".codex", "config.toml")
-	tomlBytes, err := os.ReadFile(codexConfig)
-	if err != nil {
-		t.Fatalf("codex config not produced at %s: %v\n"+
-			"A hard-coded Claude write (the #3159 bug) would mis-wire a codex concierge.", codexConfig, err)
-	}
-	toml := string(tomlBytes)
-	if !strings.Contains(toml, "[mcp_servers.molecule-platform]") {
-		t.Errorf("codex config missing [mcp_servers.molecule-platform] table:\n%s", toml)
-	}
-	if !strings.Contains(toml, "[mcp_servers.molecule-platform.env]") || !strings.Contains(toml, `MOLECULE_MCP_MODE = "management"`) {
-		t.Errorf("codex config missing env MOLECULE_MCP_MODE=management:\n%s", toml)
-	}
-
-	// And the Claude settings.json must be ABSENT — proving the MCP did NOT get
-	// mis-routed to the Claude file on a codex runtime.
-	rel := strings.TrimPrefix(contract.SettingsPath, "/configs/")
-	claudeSettings := filepath.Join(configsDir, rel)
-	if _, err := os.Stat(claudeSettings); err == nil {
-		t.Errorf("codex runtime produced %s — the MCP was mis-routed to the Claude file (#3159 regression)", contract.SettingsPath)
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("stat %s: %v", claudeSettings, err)
 	}
