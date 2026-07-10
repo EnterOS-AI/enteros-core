@@ -687,6 +687,14 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 		if env["MOLECULE_API_KEY"] != "admintok" {
 			t.Errorf("MOLECULE_API_KEY = %q, want admintok", env["MOLECULE_API_KEY"])
 		}
+		// ENFORCEMENT (molecule-ai-sdk contracts/credentials): the concierge's
+		// org-admin credential MUST be set under the canonical MOLECULE_ORG_API_KEY
+		// — the strict name the mcp-server management client reads. Renaming it
+		// (or dropping it) re-breaks the concierge management tools (AUTH_ERROR
+		// "MOLECULE_ORG_API_KEY is not set"). Distinct from MOLECULE_API_KEY (preflight).
+		if env["MOLECULE_ORG_API_KEY"] != "admintok" {
+			t.Errorf("MOLECULE_ORG_API_KEY = %q, want admintok (canonical org-api-key per contracts/credentials)", env["MOLECULE_ORG_API_KEY"])
+		}
 		if env["MOLECULE_API_URL"] != "http://platform:8080" {
 			t.Errorf("MOLECULE_API_URL = %q, want platform url fallback", env["MOLECULE_API_URL"])
 		}
