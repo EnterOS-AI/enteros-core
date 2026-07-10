@@ -7,7 +7,7 @@
 # in the trusted CI context (or operator host) by
 # `scripts/clone-manifest.sh` into `.tenant-bundle-deps/` and COPYed in.
 # The reason: post-2026-05-06, every workspace-template-* repo on Gitea
-# (codex, crewai) plus all 7
+# (codex, hermes) plus all 7
 # org-template-* repos are private, so the Docker build can't `git clone`
 # from inside the build context — there's no auth path that doesn't leak
 # the Gitea token into an image layer. Pre-cloning keeps the token in

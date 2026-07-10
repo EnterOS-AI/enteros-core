@@ -50,7 +50,7 @@ const TEMPLATES = [
     registry_models: [{ id: "gpt-5.4", provider: "openai-api" }],
   },
   // displayable:false must NEVER surface in the runtime dropdown (A4).
-  { id: "tpl-hidden", name: "Hidden", runtime: "crewai", displayable: false },
+  { id: "tpl-hidden", name: "Hidden", runtime: "hermes", displayable: false },
 ];
 
 interface RecordedCall {

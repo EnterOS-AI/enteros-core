@@ -16,7 +16,7 @@ First, clone the repo and run the setup script. It boots Postgres, Redis, MinIO,
 
 Then start the workspace server on port 8080, and the canvas UI on port 3000. Open your browser to localhost 3000.
 
-You land on the canvas — an empty org. The first thing to do is deploy a template. Pick LangGraph, Claude Code, CrewAI — or start blank. The template provisions a workspace and puts it on the canvas.
+You land on the canvas — an empty org. The first thing to do is deploy a template. Pick LangGraph, Claude Code, Hermes — or start blank. The template provisions a workspace and puts it on the canvas.
 
 Open the chat tab. Send the agent a task. Watch it work.
 

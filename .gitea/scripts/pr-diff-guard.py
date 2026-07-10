@@ -12,6 +12,7 @@ so rebasing a stale branch to a clean, narrow diff will clear the guard.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -30,6 +31,37 @@ PROTECTED_PATHS = (
 DEFAULT_MAX_CHANGED_FILES = int(os.environ.get("DIFFGUARD_MAX_CHANGED_FILES", "100"))
 DEFAULT_MAX_DELETIONS = int(os.environ.get("DIFFGUARD_MAX_DELETIONS", "5000"))
 DEFAULT_MAX_INSERTIONS = int(os.environ.get("DIFFGUARD_MAX_INSERTIONS", "10000"))
+PROTECTED_DELETION_OVERRIDE_LABEL = "diff-guard:pm-approved"
+
+
+def protected_deletion_override_active(
+    event_path: str | os.PathLike[str] | None = None,
+) -> bool:
+    """Return whether the trusted PR event carries the PM override label."""
+    raw_path = (
+        os.fspath(event_path)
+        if event_path is not None
+        else os.environ.get("GITHUB_EVENT_PATH", "")
+    )
+    if not raw_path:
+        return False
+
+    try:
+        with open(raw_path, encoding="utf-8") as event_file:
+            event = json.load(event_file)
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        print(
+            "::warning::could not read diff-guard event labels; "
+            f"failing closed: {exc}"
+        )
+        return False
+
+    labels = event.get("pull_request", {}).get("labels", [])
+    return any(
+        isinstance(label, dict)
+        and label.get("name") == PROTECTED_DELETION_OVERRIDE_LABEL
+        for label in labels
+    )
 
 
 def git(*args: str) -> str:
@@ -66,7 +98,10 @@ def main() -> int:
     try:
         merge_base = git("merge-base", f"origin/{base_ref}", head_sha).strip()
     except subprocess.CalledProcessError:
-        print(f"::warning::no merge base with origin/{base_ref}; falling back to direct diff")
+        print(
+            f"::warning::no merge base with origin/{base_ref}; "
+            "falling back to direct diff"
+        )
         merge_base = f"origin/{base_ref}"
 
     # Diff stat.
@@ -112,7 +147,8 @@ def main() -> int:
         failures.append(
             f"deletions (-{deletions}) exceeds threshold ({DEFAULT_MAX_DELETIONS})"
         )
-    if protected_deletions:
+    protected_deletion_override = protected_deletion_override_active()
+    if protected_deletions and not protected_deletion_override:
         failures.append(
             f"deleted {len(protected_deletions)} protected path(s): "
             + ", ".join(protected_deletions[:10])
@@ -123,13 +159,19 @@ def main() -> int:
     print(f"Deleted files: {len(deleted_files)}")
     if protected_deletions:
         print(f"Protected-path deletions: {len(protected_deletions)}")
+    if protected_deletions and protected_deletion_override:
+        print(
+            f"::notice::protected-path deletion check overridden by "
+            f"{PROTECTED_DELETION_OVERRIDE_LABEL}; size thresholds remain enforced"
+        )
 
     if failures:
         print("::error::PR diff guard failed:")
         for f in failures:
             print(f"  - {f}")
         print(
-            "If this diff is intentional, split the PR or request a threshold override from the PM."
+            "If this diff is intentional, split the PR or ask a PM to apply "
+            f"the {PROTECTED_DELETION_OVERRIDE_LABEL} label."
         )
         return 1
 

@@ -11,7 +11,7 @@ OSS contributors who run `molecule-core` locally do **not** need to authenticate
 
 **First-provision build time:** 5–10 min on Apple Silicon (amd64 emulation). Subsequent provisions hit the cache and start in seconds. Cache is invalidated automatically when the template repo's HEAD moves.
 
-**Currently mirrored on Gitea:** `claude-code`, `hermes`, `langgraph`, `autogen`. Other runtimes (`crewai`, `deepagents`, `codex`, `gemini-cli`, `openclaw`) fail with an actionable "not mirrored to Gitea" error pointing at the missing repo.
+**Currently mirrored on Gitea:** `claude-code`, `hermes`, `langgraph`, `autogen`. Other runtimes (`deepagents`, `codex`, `gemini-cli`, `openclaw`) fail with an actionable "not mirrored to Gitea" error pointing at the missing repo.
 
 **Production tenants are unaffected** — every prod tenant sets `MOLECULE_IMAGE_REGISTRY` to its private ECR mirror via Railway env / EC2 user-data, so the SaaS pull path stays identical.
 

@@ -8,12 +8,13 @@ name: PR Diff Guard
 on:
   pull_request:
     branches: [main, staging]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
 
 jobs:
-  # bp-required: pending #2875
+  # bp-required: yes
   # New gate; wiring into branch protection will follow once it has
   # green history and the thresholds are calibrated.
   diff-guard:
