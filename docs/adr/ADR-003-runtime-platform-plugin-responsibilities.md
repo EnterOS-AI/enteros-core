@@ -1,9 +1,19 @@
 # ADR-003: Runtime adapts to the platform; the plugin adapts to each runtime
 
-**Status:** Accepted — committed architecture
+**Status:** Accepted — committed architecture (§2 dispatch-location superseded by [ADR-004](/adr/ADR-004-sdk-owns-adapter-contract-and-registry))
 **Date:** 2026-06-25
 **Supersedes context:** RFC `rfc-platform-mcp-as-plugin` §2b/§3.4 (platform-MCP-as-plugin, de-bake)
 **Related incident:** 2026-06-25 fleet-wide concierge `degraded` (half-wired `loaded_mcp_tools` producer)
+
+> **⚠ Superseded in part by ADR-004.** The two-layer, opposite-direction split
+> (runtime adapts to platform; plugin adapts to each runtime) STANDS. What
+> changes: §2 placed the per-runtime renderers/readers/present-probes in the
+> **shared engine** (`molecule_runtime/mcp_render.py` `_RUNTIME_SPECS`/
+> `_RUNTIME_READERS`, `persona_render._RUNTIME_PERSONA`). ADR-004 moves the
+> per-runtime *shape* into the **adapter socket** (SDK-owned contract + official
+> registry) so the shared engine holds **zero** runtime-specific code and names no
+> runtime. Read ADR-004 before touching the dispatch tables — they are being
+> deleted, not extended.
 
 ## Context
 
