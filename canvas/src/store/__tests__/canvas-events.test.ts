@@ -1121,3 +1121,103 @@ describe("handleCanvasEvent – liveAnnouncement", () => {
     expect(state.liveAnnouncement ?? "").toBe("");
   });
 });
+
+// ---------------------------------------------------------------------------
+// BOOT_STEP — "Enter OS" boot sequence
+// ---------------------------------------------------------------------------
+
+describe("handleCanvasEvent – BOOT_STEP", () => {
+  function bootMsg(
+    workspaceId: string,
+    payload: Record<string, unknown>
+  ): WSMessage {
+    return makeMsg({ event: "BOOT_STEP", workspace_id: workspaceId, payload });
+  }
+
+  it("appends a valid boot step to the workspace node's bootSteps", () => {
+    const node = makeNode("ws-1", { status: "provisioning" });
+    const { get, set, state } = makeStore([node]);
+
+    handleCanvasEvent(
+      bootMsg("ws-1", {
+        step: 1,
+        total: 8,
+        key: "PWR",
+        label: "Provision compute",
+        status: "running",
+        message: "allocating container…",
+      }),
+      get,
+      set
+    );
+
+    const steps = state.nodes[0].data.bootSteps;
+    expect(steps).toHaveLength(1);
+    expect(steps![0]).toEqual({
+      step: 1,
+      total: 8,
+      key: "PWR",
+      label: "Provision compute",
+      status: "running",
+      message: "allocating container…",
+    });
+  });
+
+  it("merges a running→ok transition in place (latest status per step wins)", () => {
+    const node = makeNode("ws-1", {
+      status: "provisioning",
+      bootSteps: [
+        { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running" },
+      ],
+    });
+    const { get, set, state } = makeStore([node]);
+
+    handleCanvasEvent(
+      bootMsg("ws-1", { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "ok" }),
+      get,
+      set
+    );
+
+    const steps = state.nodes[0].data.bootSteps!;
+    expect(steps).toHaveLength(1);
+    expect(steps[0].status).toBe("ok");
+  });
+
+  it("keeps distinct steps separate and ordered by arrival", () => {
+    const node = makeNode("ws-1", { status: "provisioning" });
+    const { get, set, state } = makeStore([node]);
+
+    handleCanvasEvent(bootMsg("ws-1", { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "ok" }), get, set);
+    handleCanvasEvent(bootMsg("ws-1", { step: 2, total: 8, key: "RT", label: "Start runtime", status: "running" }), get, set);
+
+    const steps = state.nodes[0].data.bootSteps!;
+    expect(steps.map((s) => s.step)).toEqual([1, 2]);
+    expect(steps.map((s) => s.status)).toEqual(["ok", "running"]);
+  });
+
+  it("drops malformed steps (bad status / out-of-range / missing fields)", () => {
+    const node = makeNode("ws-1", { status: "provisioning" });
+    const { get, set, state } = makeStore([node]);
+
+    // bad status
+    handleCanvasEvent(bootMsg("ws-1", { step: 1, total: 8, key: "PWR", label: "x", status: "bogus" }), get, set);
+    // step < 1
+    handleCanvasEvent(bootMsg("ws-1", { step: 0, total: 8, key: "PWR", label: "x", status: "ok" }), get, set);
+    // total < step
+    handleCanvasEvent(bootMsg("ws-1", { step: 5, total: 3, key: "PWR", label: "x", status: "ok" }), get, set);
+    // missing key
+    handleCanvasEvent(bootMsg("ws-1", { step: 1, total: 8, label: "x", status: "ok" }), get, set);
+
+    expect(state.nodes[0].data.bootSteps ?? []).toHaveLength(0);
+  });
+
+  it("drops a BOOT_STEP for an unknown workspace (indeterminate-boot fallback)", () => {
+    const { get, set, state } = makeStore([]);
+    handleCanvasEvent(
+      bootMsg("ws-missing", { step: 1, total: 8, key: "PWR", label: "x", status: "ok" }),
+      get,
+      set
+    );
+    expect(state.nodes).toHaveLength(0);
+  });
+});

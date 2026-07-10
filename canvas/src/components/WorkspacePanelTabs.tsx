@@ -24,6 +24,8 @@ import { EventsTab } from "./tabs/EventsTab";
 import { ActivityTab } from "./tabs/ActivityTab";
 import { ScheduleTab } from "./tabs/ScheduleTab";
 import { ChannelsTab } from "./tabs/ChannelsTab";
+import { BootSequenceScreen } from "./BootSequenceScreen";
+import { WORKSPACE_STATUS } from "@/lib/workspace-status";
 
 /**
  * Canonical workspace tab set — the SAME ids/labels/icons the map's
@@ -99,6 +101,17 @@ export function WorkspacePanelTabs({ node, activeTab, onTabChange, defaultTab = 
 
   const workspaceId = node.id;
   const data = node.data;
+
+  // "Enter OS" boot sequence — while the workspace is provisioning, replace
+  // the whole tab content with the watchdog-driven boot screen. It renders
+  // the ordered boot steps as 3D keycaps (data-driven off data.bootSteps,
+  // degrading to a generic indeterminate boot when no BOOT_STEP events have
+  // arrived), an overall progress bar, and a live watchdog log; on
+  // status→online it fades to hand back to the tabs below. Any other status
+  // (online / failed / degraded / paused / …) renders the tabs as today.
+  if (data.status === WORKSPACE_STATUS.Provisioning) {
+    return <BootSequenceScreen node={node} />;
+  }
 
   return (
     <>
