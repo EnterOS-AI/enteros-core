@@ -114,6 +114,18 @@ type LocalBuildOptions struct {
 	// (localBuildImagePlatform). Exposed so tests can override.
 	Platform string
 
+	// StallGrace / Ceiling govern the progress-driven runner that wraps the
+	// `docker build` + `git clone` (stallrunner.go). StallGrace is the
+	// primary gate — max time with ZERO output before the process is killed
+	// as wedged. Ceiling is the absolute wall-clock backstop. Zero on either
+	// = use the package default (buildStallGrace() / buildCeiling(),
+	// env-overridable). The caller (Start) narrows Ceiling to the effective
+	// per-runtime provision timeout so a runtime declaring 30m is not capped
+	// at the old fixed 3m. Exposed so tests can drive the runner with tiny
+	// values.
+	StallGrace time.Duration
+	Ceiling    time.Duration
+
 	// HTTPClient is used for the Gitea-API HEAD-sha lookup. Empty =
 	// http.DefaultClient with a 30s timeout.
 	HTTPClient *http.Client
@@ -130,12 +142,32 @@ type LocalBuildOptions struct {
 	checkTool func(tool string) error
 }
 
+// stallGrace / ceiling return the effective runner gates, defaulting to the
+// package (env-overridable) values when a field is unset. Keeping the
+// fall-through here means a zero-valued LocalBuildOptions (e.g. a test that
+// only sets the seams) still gets sane production gates unless it opts in.
+func (o *LocalBuildOptions) stallGrace() time.Duration {
+	if o.StallGrace > 0 {
+		return o.StallGrace
+	}
+	return buildStallGrace()
+}
+
+func (o *LocalBuildOptions) ceiling() time.Duration {
+	if o.Ceiling > 0 {
+		return o.Ceiling
+	}
+	return buildCeiling()
+}
+
 func newDefaultLocalBuildOptions() *LocalBuildOptions {
 	o := &LocalBuildOptions{
 		CacheDir:   os.Getenv("MOLECULE_LOCAL_BUILD_CACHE"),
 		RepoPrefix: os.Getenv("MOLECULE_LOCAL_TEMPLATE_REPO_PREFIX"),
 		Token:      os.Getenv("MOLECULE_GITEA_TOKEN"),
 		Platform:   localBuildImagePlatform(),
+		StallGrace: buildStallGrace(),
+		Ceiling:    buildCeiling(),
 	}
 	if o.CacheDir == "" {
 		if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
@@ -518,7 +550,12 @@ func gitCloneProd(ctx context.Context, opts *LocalBuildOptions, runtime, dest st
 	// Drop git's askpass prompts so we fail-fast on auth errors instead
 	// of hanging waiting for an interactive password.
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/bin/echo")
-	out, err := cmd.CombinedOutput()
+	// Same progress-driven runner as the build: a shallow clone of a large
+	// template repo streams git's progress meter, so a genuinely-progressing
+	// clone is never killed, while a clone hung on an unreachable host is
+	// reaped after the stall grace (the askpass drop already covers the
+	// interactive-auth hang; this covers the network-black-hole hang).
+	out, err := runStreamingCommand(ctx, cmd, opts.stallGrace(), opts.ceiling())
 	if err != nil {
 		// Mask the token in any error string git emits via stderr — git
 		// occasionally echoes the URL verbatim on failure.
@@ -558,7 +595,13 @@ func dockerBuildProd(ctx context.Context, opts *LocalBuildOptions, contextDir, t
 	}
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
-	out, err := cmd.CombinedOutput()
+	// Progress-driven runner (stallrunner.go): stream the build, reset a
+	// no-output clock on every line, and kill on a real stall or the
+	// absolute ceiling — NOT on a fixed 3-min wall clock. A cold build that
+	// legitimately runs long (large pip/apt layer, QEMU cross-arch) streams
+	// output the whole time and is never killed; a wedged build (network
+	// black hole) is killed after opts.stallGrace() with a clear message.
+	out, err := runStreamingCommand(ctx, cmd, opts.stallGrace(), opts.ceiling())
 	if err != nil {
 		// Sanitize defensive — docker build output shouldn't contain a
 		// token, but maskTokenInString is a no-op when token is empty.

@@ -90,7 +90,18 @@ const (
 	// DefaultPort is the port the A2A server listens on inside the container.
 	DefaultPort = "8000"
 
-	// ProvisionTimeout is how long to wait for first heartbeat before marking as failed.
+	// ProvisionTimeout bounds the SaaS/CP provision context (cpProv.Start —
+	// the EC2-launch API call, which returns quickly; the long cold-boot is
+	// owned by the CP bootstrap-watcher + the registry provision-timeout
+	// sweep, not this ctx) and the short DB-lookup nudge at
+	// buildProvisionerConfig. It is deliberately NO LONGER the cap on the
+	// LOCAL docker-build path: a cold `docker build` can legitimately run
+	// past 3 min, so the Docker-mode + bundle-import call sites now derive
+	// their deadline from the per-runtime provision timeout (floored at 12m,
+	// see handlers.dockerProvisionTimeout / provisioner.DefaultProvisionCeiling)
+	// and the build itself is guarded by the progress-driven stall runner
+	// (stallrunner.go). Capping real builds at 3 min here bricked a hermes
+	// concierge provision even though hermes declares a 30-min window.
 	ProvisionTimeout = 3 * time.Minute
 
 	// WorkspaceKindPlatform mirrors models.KindPlatform — the org-level

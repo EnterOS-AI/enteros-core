@@ -30,6 +30,35 @@ var instanceIDPersistRetryAttempts = 3
 // attempt: 100ms → 200ms → 400ms. Total stall ≤ 700ms.
 var instanceIDPersistRetryBaseDelay = 100 * time.Millisecond
 
+// dockerProvisionCeilingFloor is the sane lower bound on the Docker-mode
+// provision context, applied even when a runtime declares a shorter (or no)
+// provision_timeout_seconds. The Docker-mode ctx bounds prov.Start → the
+// local `docker build` / clone (a cold first build can legitimately run for
+// several minutes), so it must NOT inherit the old fixed 3-min
+// provisioner.ProvisionTimeout, which killed real builds mid-flight (the
+// hermes-concierge brick). 12 min matches registry.DefaultProvisioningTimeout
+// (the row-level sweep window) so the build ctx can never outlive the sweep.
+const dockerProvisionCeilingFloor = 12 * time.Minute
+
+// dockerProvisionTimeout resolves the absolute deadline for the Docker-mode
+// provision context. It is the MAX of the per-runtime
+// provision_timeout_seconds (the same manifest value the sweep + canvas read
+// via ProvisionTimeoutSecondsForRuntime) and dockerProvisionCeilingFloor, so
+// a runtime declaring a long window (hermes = 30 min) reaches the build
+// ceiling instead of being capped at 3 min, while a runtime that declares
+// nothing (or something short) still gets a sane 12-min floor. This is the
+// absolute backstop; the stall-grace inside the runner (stallrunner.go) is
+// the primary progress gate.
+func (h *WorkspaceHandler) dockerProvisionTimeout(runtime string) time.Duration {
+	d := dockerProvisionCeilingFloor
+	if secs := h.ProvisionTimeoutSecondsForRuntime(runtime); secs > 0 {
+		if perRuntime := time.Duration(secs) * time.Second; perRuntime > d {
+			d = perRuntime
+		}
+	}
+	return d
+}
+
 // logProvisionPanic is the deferred recover at the top of every provision
 // goroutine. Without it, a panic inside provisionWorkspaceOpts /
 // provisionWorkspaceCP propagates up the goroutine stack and crashes the
@@ -82,8 +111,16 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	log.Printf("Provisioner: goroutine entered for %s (runtime=%s, mode=docker)", workspaceID, payload.Runtime)
 	defer h.logProvisionPanic(workspaceID, "docker")
 
-	ctx, cancel := context.WithTimeout(context.Background(), provisioner.ProvisionTimeout)
+	// Docker-mode ctx bounds prov.Start → the local `docker build` / clone.
+	// Use the per-runtime provision timeout (floored at 12 min), NOT the
+	// fixed 3-min provisioner.ProvisionTimeout, so a legitimately-slow cold
+	// build is not killed mid-flight (the hermes-concierge brick). The
+	// progress-driven runner inside the build (stallrunner.go) is the primary
+	// gate; this ctx is the absolute backstop.
+	provTimeout := h.dockerProvisionTimeout(payload.Runtime)
+	ctx, cancel := context.WithTimeout(context.Background(), provTimeout)
 	defer cancel()
+	log.Printf("Provisioner: docker-mode provision ctx for %s bounded at %s (runtime=%s)", workspaceID, provTimeout, payload.Runtime)
 
 	prepared, abort := h.prepareProvisionContext(ctx, workspaceID, templatePath, configFiles, payload, resetClaudeSession)
 	if prepared == nil {

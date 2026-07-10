@@ -97,7 +97,14 @@ func Import(
 					log.Printf("bundle/importer: PANIC during provision start for %s: %v", wsID, r)
 				}
 			}()
-			provCtx, cancel := context.WithTimeout(context.Background(), provisioner.ProvisionTimeout)
+			// Bounds prov.Start → the local `docker build` / clone. Use the
+			// build ceiling (env-overridable, default 12m), NOT the fixed
+			// 3-min provisioner.ProvisionTimeout that killed real cold builds
+			// mid-flight. The progress-driven runner inside the build
+			// (stallrunner.go) is the primary gate; this ctx is the backstop.
+			// The importer runs below handlers so it has no per-runtime
+			// provision_timeout_seconds lookup — the default ceiling suffices.
+			provCtx, cancel := context.WithTimeout(context.Background(), provisioner.DefaultProvisionCeiling())
 			defer cancel()
 			url, err := prov.Start(provCtx, cfg)
 			if err != nil {
