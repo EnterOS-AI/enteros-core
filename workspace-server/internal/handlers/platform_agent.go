@@ -39,6 +39,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/providers"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/gin-gonic/gin"
@@ -144,14 +145,60 @@ func defaultPlatformAgentName() string {
 // any other runtime template. See substituteConciergeName below for
 // the only remaining per-instance identity step.)
 
+// resolveConciergeAdminCredential returns the org-admin credential the concierge's
+// management MCP authenticates with. WS-C: the concierge is an AGENT, so it carries
+// a MANAGED org token (named, revocable, audited) rather than the tenant's raw
+// break-glass ADMIN_TOKEN (the un-managed root — see wsauth AdminAuth tiers). An
+// org token grants the identical admin surface, so the MCP works the same, but the
+// concierge's standing admin is now revocable and shows up in the org-token list.
+//
+// Rotates on every provision: mints a fresh token, then revokes every PRIOR live
+// concierge token for this workspace (keyed on a deterministic created_by marker),
+// so the credential can't accumulate against the mint ceiling and a replaced box's
+// token dies. Falls back to the raw ADMIN_TOKEN when there is no org anchor
+// (self-host/local — MOLECULE_ORG_ID unset) or the mint fails: the concierge must
+// never boot without an admin credential.
+func resolveConciergeAdminCredential(ctx context.Context, workspaceID string) string {
+	adminToken := os.Getenv("ADMIN_TOKEN")
+	orgID := strings.TrimSpace(os.Getenv("MOLECULE_ORG_ID"))
+	// A managed org token must anchor to a real org UUID (org_api_tokens.org_id is
+	// a uuid column, so a non-UUID would fail the mint query). No/non-UUID org id —
+	// self-host, local dev, or the cp-stub replay harness (MOLECULE_ORG_ID is
+	// "harness-org-alpha") — means there is no org-token anchor: keep the break-glass
+	// ADMIN_TOKEN and skip the mint entirely (no failed query, no noise).
+	if _, err := uuid.Parse(orgID); err != nil {
+		return adminToken
+	}
+	owner := "system:concierge:" + workspaceID
+	plaintext, newID, err := orgtoken.Issue(ctx, db.DB, "concierge (auto-rotated)", owner, orgID, orgtoken.AuditLogRequestContext{})
+	if err != nil {
+		log.Printf("concierge %s: managed org-token mint failed (%v) — falling back to break-glass ADMIN_TOKEN", workspaceID, err)
+		return adminToken
+	}
+	// Revoke every prior live concierge token for this workspace (all but the one
+	// just minted) so exactly one stays live. Best-effort: a revoke failure just
+	// leaves a stale token for the next provision to clean up.
+	if toks, lerr := orgtoken.List(ctx, db.DB); lerr == nil {
+		for _, t := range toks {
+			if t.CreatedBy == owner && t.ID != newID {
+				if _, rerr := orgtoken.Revoke(ctx, db.DB, t.ID, orgtoken.AuditLogRequestContext{}, owner); rerr != nil {
+					log.Printf("concierge %s: revoke stale org-token %s: %v", workspaceID, t.ID, rerr)
+				}
+			}
+		}
+	}
+	return plaintext
+}
+
 // conciergePlatformMCPEnv injects the env the platform MCP child reads at spawn
-// (RFC §5.5/§5.6). The org-admin token is ADMIN_TOKEN on self-host; the platform
-// URL is the in-cluster PLATFORM_URL (e.g. http://platform:8080). Existing
+// (RFC §5.5/§5.6). orgAdminCred is the org-admin bearer — a managed org token on
+// SaaS, else the raw ADMIN_TOKEN (see resolveConciergeAdminCredential); the
+// platform URL is the in-cluster PLATFORM_URL (e.g. http://platform:8080). Existing
 // values in env win, so an operator/CP override is never clobbered. No-op for a
-// non-platform workspace. Best-effort: when ADMIN_TOKEN is unset (pure-local dev
-// with AdminAuth fail-open) the key is simply absent and the MCP — which only
-// runs on the platform-agent image anyway — is unauthenticated locally.
-func conciergePlatformMCPEnv(env map[string]string, workspaceID string) {
+// non-platform workspace. Best-effort: when orgAdminCred is empty (pure-local dev
+// with AdminAuth fail-open) the key is simply absent and the MCP — which only runs
+// on the platform-agent image anyway — is unauthenticated locally.
+func conciergePlatformMCPEnv(env map[string]string, workspaceID, orgAdminCred string) {
 	setIfAbsent := func(k, v string) {
 		if v == "" {
 			return
@@ -166,7 +213,7 @@ func conciergePlatformMCPEnv(env map[string]string, workspaceID string) {
 	// Without this the concierge's MCP env never carried its own id and the
 	// SELF default failed closed with INVALID_ARGUMENTS on every live agent.
 	setIfAbsent("MOLECULE_WORKSPACE_ID", workspaceID)
-	setIfAbsent("MOLECULE_API_KEY", os.Getenv("ADMIN_TOKEN"))
+	setIfAbsent("MOLECULE_API_KEY", orgAdminCred)
 	// The management-mode tool registry (mcp-server >=1.5.0,
 	// src/tools/management/client.ts) authenticates with
 	// MOLECULE_ORG_API_KEY — a distinct env from the connectivity-preflight
@@ -175,7 +222,7 @@ func conciergePlatformMCPEnv(env map[string]string, workspaceID string) {
 	// install/restart curls), so wire it under both names. Verified live on
 	// the agents-team pilot: with only MOLECULE_API_KEY set, every
 	// management tool returns AUTH_ERROR.
-	setIfAbsent("MOLECULE_ORG_API_KEY", os.Getenv("ADMIN_TOKEN"))
+	setIfAbsent("MOLECULE_ORG_API_KEY", orgAdminCred)
 	// MOLECULE_API_URL: prefer an explicit env, else the in-cluster platform URL.
 	apiURL := os.Getenv("MOLECULE_API_URL")
 	if apiURL == "" {
@@ -301,7 +348,9 @@ func (h *WorkspaceHandler) applyConciergeProvisionConfig(
 	}
 
 	// 1. Platform-MCP env (org-admin token + platform URL + org id + self id).
-	conciergePlatformMCPEnv(envVars, workspaceID)
+	//    WS-C: the concierge authenticates with a MANAGED, rotated org token
+	//    (revocable/audited), not the raw break-glass ADMIN_TOKEN.
+	conciergePlatformMCPEnv(envVars, workspaceID, resolveConciergeAdminCredential(ctx, workspaceID))
 
 	// 2. Compose the concierge's /configs from its ACTUAL (switchable) runtime's
 	//    NATIVE base config + the runtime-agnostic persona, grafted per that

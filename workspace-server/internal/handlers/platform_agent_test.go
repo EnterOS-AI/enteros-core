@@ -683,7 +683,7 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 		t.Setenv("PLATFORM_URL", "http://platform:8080")
 		t.Setenv("MOLECULE_ORG_ID", "org-123")
 		env := map[string]string{}
-		conciergePlatformMCPEnv(env, "ws-self-1")
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
 		if env["MOLECULE_API_KEY"] != "admintok" {
 			t.Errorf("MOLECULE_API_KEY = %q, want admintok", env["MOLECULE_API_KEY"])
 		}
@@ -704,7 +704,7 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 	t.Run("does not clobber existing values", func(t *testing.T) {
 		t.Setenv("ADMIN_TOKEN", "admintok")
 		env := map[string]string{"MOLECULE_API_KEY": "preset"}
-		conciergePlatformMCPEnv(env, "ws-self-1")
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
 		if env["MOLECULE_API_KEY"] != "preset" {
 			t.Errorf("MOLECULE_API_KEY overwritten to %q, want preset preserved", env["MOLECULE_API_KEY"])
 		}
@@ -714,9 +714,43 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 		t.Setenv("MOLECULE_API_URL", "http://explicit:9000")
 		t.Setenv("PLATFORM_URL", "http://platform:8080")
 		env := map[string]string{}
-		conciergePlatformMCPEnv(env, "ws-self-1")
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
 		if env["MOLECULE_API_URL"] != "http://explicit:9000" {
 			t.Errorf("MOLECULE_API_URL = %q, want the explicit env", env["MOLECULE_API_URL"])
+		}
+	})
+}
+
+// TestResolveConciergeAdminCredential_FallsBackToAdminToken pins the WS-C
+// fail-safe: with no org anchor (self-host / local, MOLECULE_ORG_ID unset) there
+// is no managed-org-token mint, so the concierge keeps the break-glass ADMIN_TOKEN
+// — it must NEVER boot without an admin credential. The managed-token mint + rotate
+// happy path runs against a real DB (orgtoken primitives are sqlmock-tested in
+// internal/orgtoken; the concierge provision path is covered by the
+// concierge-creates-workspace e2e).
+func TestResolveConciergeAdminCredential_FallsBackToAdminToken(t *testing.T) {
+	t.Run("no org id → break-glass ADMIN_TOKEN", func(t *testing.T) {
+		t.Setenv("ADMIN_TOKEN", "break-glass-root")
+		t.Setenv("MOLECULE_ORG_ID", "")
+		if got := resolveConciergeAdminCredential(context.Background(), "ws-x"); got != "break-glass-root" {
+			t.Fatalf("no org id: want ADMIN_TOKEN fallback, got %q", got)
+		}
+	})
+	t.Run("no org id + no admin token → empty (local dev, MCP unauthenticated)", func(t *testing.T) {
+		t.Setenv("ADMIN_TOKEN", "")
+		t.Setenv("MOLECULE_ORG_ID", "")
+		if got := resolveConciergeAdminCredential(context.Background(), "ws-x"); got != "" {
+			t.Fatalf("want empty, got %q", got)
+		}
+	})
+	t.Run("non-UUID org id → break-glass (no mint attempt; harness/self-host)", func(t *testing.T) {
+		// The cp-stub replay harness uses MOLECULE_ORG_ID="harness-org-alpha"; the
+		// org_api_tokens.org_id uuid column would reject it, so we must NOT attempt
+		// the mint — fall back cleanly, no failed query.
+		t.Setenv("ADMIN_TOKEN", "break-glass-root")
+		t.Setenv("MOLECULE_ORG_ID", "harness-org-alpha")
+		if got := resolveConciergeAdminCredential(context.Background(), "ws-x"); got != "break-glass-root" {
+			t.Fatalf("non-UUID org id: want ADMIN_TOKEN fallback (no mint), got %q", got)
 		}
 	})
 }
