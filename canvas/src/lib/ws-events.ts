@@ -31,6 +31,11 @@ export const WS_EVENTS = {
   RequestCreated: "REQUEST_CREATED",
   RequestResponded: "REQUEST_RESPONDED",
   RequestMessage: "REQUEST_MESSAGE",
+  // --- "Enter OS" boot sequence (mirrored from events/types.go) ---
+  // A single BOOT_STEP carries the whole per-step boot animation; the
+  // canvas appends each to the workspace node's `bootSteps` array while
+  // the workspace is `provisioning`. Presentation-only + broadcast-only.
+  BootStep: "BOOT_STEP",
 } as const;
 
 /** The event-name string union — the values of WS_EVENTS. */

@@ -32,6 +32,7 @@ func TestAllEventTypes_IsSnapshot(t *testing.T) {
 		"AGENT_REPLACED",
 		"APPROVAL_ESCALATED",
 		"APPROVAL_REQUESTED",
+		"BOOT_STEP",
 		"CHANNEL_MESSAGE",
 		"CRON_EXECUTED",
 		"CRON_SKIPPED",

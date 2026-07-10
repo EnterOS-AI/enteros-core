@@ -534,6 +534,13 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		cssh := handlers.NewChatSessionHandler(broadcaster)
 		wsAuth.POST("/chat-session/new", cssh.NewSession)
 
+		// Boot sequence ("Enter OS") — the runtime POSTs one BOOT_STEP per
+		// cold-boot phase while the workspace is `provisioning`; the handler
+		// validates it and BroadcastOnly's it to the canvas boot screen.
+		// Same wsAuth bearer trust boundary as /activity + /notify.
+		beh := handlers.NewBootEventHandler(broadcaster)
+		wsAuth.POST("/boot-event", beh.Report)
+
 		// Config
 		cfgh := handlers.NewConfigHandler()
 		wsAuth.GET("/config", cfgh.Get)

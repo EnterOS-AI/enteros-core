@@ -25,6 +25,7 @@
 @import "../styles/theme-tokens.css";
 @import "../styles/settings-panel.css";
 @import "../styles/org-deploy.css";
+@import "../styles/boot-sequence.css";
 
 /*
  * Warm-paper semantic tokens — light defaults via @theme, dark

@@ -1,6 +1,6 @@
 import type { Node, Edge } from "@xyflow/react";
 import type { WSMessage } from "./socket";
-import type { WorkspaceNodeData } from "./canvas";
+import type { WorkspaceNodeData, BootStep } from "./canvas";
 import { extractResponseText, extractFilesFromTask } from "@/components/tabs/chat/message-parser";
 
 // ---------------------------------------------------------------------------
@@ -497,6 +497,52 @@ export function handleCanvasEvent(
             : n
         ),
         liveAnnouncement: `${failedName} provisioning failed`,
+      });
+      break;
+    }
+
+    case "BOOT_STEP": {
+      // "Enter OS" boot sequence — append/merge one boot step onto the
+      // workspace node so BootSequenceScreen can render its per-step keycap
+      // animation. Presentation-only; no status flip (WORKSPACE_ONLINE
+      // still drives the transition to chat). If the workspace node isn't
+      // in the store yet (a BOOT_STEP raced ahead of WORKSPACE_PROVISIONING)
+      // we drop it — the boot screen degrades to indeterminate until the
+      // provisioning node lands, which is the graceful no-events fallback.
+      const bootNode = nodes.find((n) => n.id === msg.workspace_id);
+      if (!bootNode) break;
+      const rawStep = msg.payload.step;
+      const rawTotal = msg.payload.total;
+      const rawStatus = msg.payload.status;
+      // Defensive parse: a malformed broadcast (missing/out-of-range fields)
+      // must not corrupt the keycap layout. Reject anything that isn't a
+      // usable step rather than rendering a broken "0/8" or a blank keycap.
+      const step = typeof rawStep === "number" ? rawStep : NaN;
+      const total = typeof rawTotal === "number" ? rawTotal : NaN;
+      const key = typeof msg.payload.key === "string" ? msg.payload.key : "";
+      const label = typeof msg.payload.label === "string" ? msg.payload.label : "";
+      const status =
+        rawStatus === "running" || rawStatus === "ok" || rawStatus === "failed"
+          ? rawStatus
+          : null;
+      if (!Number.isFinite(step) || step < 1 || !Number.isFinite(total) || total < step || !key || !label || !status) {
+        break;
+      }
+      const message = typeof msg.payload.message === "string" ? msg.payload.message : undefined;
+      const incoming: BootStep = { step, total, key, label, status, message };
+      set({
+        nodes: nodes.map((n) => {
+          if (n.id !== msg.workspace_id) return n;
+          const prev = (n.data.bootSteps ?? []) as BootStep[];
+          // Latest status per `step` wins: a step goes running → ok/failed,
+          // so replace an existing entry at the same index in place (keeps
+          // keycap identity stable) rather than appending a duplicate.
+          const idx = prev.findIndex((s) => s.step === incoming.step);
+          const next = idx >= 0
+            ? prev.map((s, i) => (i === idx ? incoming : s))
+            : [...prev, incoming];
+          return { ...n, data: { ...n.data, bootSteps: next } };
+        }),
       });
       break;
     }

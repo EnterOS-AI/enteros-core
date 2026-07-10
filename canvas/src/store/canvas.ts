@@ -149,6 +149,35 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
    *  re-apply the runtime-default template instead of reusing the old
    *  config volume. UI-only, cleared after restart. */
   applyTemplateOnRestart?: boolean;
+  /** "Enter OS" boot-sequence steps, appended by the BOOT_STEP WS handler
+   *  while the workspace is `provisioning`. Drives BootSequenceScreen's
+   *  per-step keycap animation + watchdog log. Absent/empty until the
+   *  runtime emits its first BOOT_STEP — the boot screen degrades to a
+   *  generic indeterminate boot when there are none. Cleared implicitly
+   *  once the workspace leaves `provisioning` (the screen unmounts).
+   *  Latest status per `step` wins (a step goes running → ok/failed). */
+  bootSteps?: BootStep[];
+}
+
+/** One boot-sequence step, mirrored from the Go BOOT_STEP wire payload
+ *  (workspace-server/internal/events/types.go EventBootStep). The canvas
+ *  renders N keycaps from the received steps; `key` is the short keycap
+ *  legend, `label` the human name, `status` drives the press/glow/pop
+ *  animation, and `message` is the watchdog log line (the red failure
+ *  reason when status === "failed"). */
+export interface BootStep {
+  /** 1-based index of this step in the boot plan. */
+  step: number;
+  /** Total steps in the boot plan (>= step). */
+  total: number;
+  /** Short keycap legend, e.g. "PWR" / "RT" / "MCP". */
+  key: string;
+  /** Human-readable step name. */
+  label: string;
+  /** running | ok | failed. */
+  status: "running" | "ok" | "failed";
+  /** Optional log line; the failure reason when status === "failed". */
+  message?: string;
 }
 
 export type PanelTab = "details" | "skills" | "chat" | "terminal" | "display" | "container-config" | "config" | "schedule" | "channels" | "files" | "memory" | "traces" | "events" | "activity" | "audit";
