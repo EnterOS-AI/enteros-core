@@ -232,22 +232,31 @@ func conciergePlatformMCPEnv(env map[string]string, workspaceID, orgAdminCred st
 	setIfAbsent("MOLECULE_ORG_ID", os.Getenv("MOLECULE_ORG_ID"))
 
 	// Authenticate the on-box plugin boot-install's gitea fetch (core#3065).
-	// The concierge declares its management MCP as a PRIVATE gitea:// plugin
-	// (molecule-ai-plugin-molecule-platform-mcp). The runtime's boot-install
-	// fetches it via curl + ~/.netrc, which setup-gitea-netrc.sh builds from
-	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD. The concierge has no per-persona git
-	// token (applyAgentGitHTTPCreds no-ops for it), so without these the fetch is
-	// UNAUTHENTICATED → 404 on the private repo → plugin never installs → no
-	// create_workspace (verified live post-#872). Use the read-only
-	// MOLECULE_TEMPLATE_REPO_TOKEN the box already holds for fetching template/
-	// plugin repos, in the SAME basic-auth shape the Go gitea resolver uses (the
-	// PAT as the username + literal "x-oauth-basic" password — see
-	// plugins/gitea.go resolveURL). setIfAbsent so an operator-supplied GIT_HTTP_*
-	// or a real persona token still wins.
+	// The concierge declares its management MCP as a gitea:// plugin
+	// (molecule-ai-plugin-molecule-platform-mcp). That repo is PUBLIC, so the
+	// box's git-native boot-install clones it ANONYMOUSLY — its per-host git
+	// credential-helper fires only on a 401, which a public repo never returns, so
+	// no token is ever sent to it (this is the token-on-public 401-poison fix).
+	// The GIT_HTTP_* wiring below is therefore NOT needed for the mgmt-MCP; it is
+	// kept as back-compat for OTHER, genuinely-private plugin/template fetches — a
+	// private repo's 401 triggers the helper with these creds. Derived from the
+	// read-only MOLECULE_TEMPLATE_REPO_TOKEN the box holds, in the basic-auth shape
+	// the resolver uses (PAT as username + literal "x-oauth-basic" password).
+	// setIfAbsent so an operator-supplied GIT_HTTP_* / persona token still wins.
 	if tok := strings.TrimSpace(os.Getenv("MOLECULE_TEMPLATE_REPO_TOKEN")); tok != "" {
 		setIfAbsent("GIT_HTTP_USERNAME", tok)
 		setIfAbsent("GIT_HTTP_PASSWORD", "x-oauth-basic")
 	}
+
+	// Thread the plugin registry/SCM base to the box so its boot-install fetches
+	// the management-MCP plugin (conciergePlatformMCPSource) from a CONFIGURABLE
+	// host — a mirror / airgap / self-host Gitea — instead of a baked
+	// git.moleculesai.app. The gitea:// source carries no host; the box resolves it
+	// against this base. Fleet-wide default (defaultPluginRegistryBase), NOT a
+	// per-tenant surface. setIfAbsent so an operator-supplied value on the box env
+	// still wins. The repo is PUBLIC, so this needs no credential of its own — the
+	// GIT_HTTP_* wiring above is for OTHER private plugin/template fetches.
+	setIfAbsent(conciergePluginRegistryEnvVar, pluginRegistryBase())
 }
 
 // applyConciergeProvisionConfig is the provision-time hook for the platform
@@ -994,19 +1003,70 @@ func conciergeModelIsPlatformManaged(runtime, model string) bool {
 // a defense-in-depth refusal for this PRIVILEGED name on any non-platform
 // workspace. The post-online reconcile + boot-install then install it.
 //
-// conciergePlatformMCPSource MUST be a gitea:// source, not a bare name: the
-// box's boot-install (runtime-image entrypoint) ONLY fetches gitea:// sources
-// and SKIPS anything else ("skip unsupported source"). A bare name parses to the
-// `local` scheme, which only resolves plugins baked into the image — and this is
-// a brand-new Gitea-only plugin repo, so a bare name would never be fetched.
+// conciergePlatformMCPRepoPath is the fleet-fixed owner/repo of the management-MCP
+// plugin. It is HOST-agnostic on purpose: it names WHICH repo, never WHERE it is
+// served. The registry/SCM host is threaded to the box out-of-band via
+// MOLECULE_PLUGIN_REGISTRY (see pluginRegistryBase + conciergePlatformMCPEnv), so a
+// self-host / mirror / airgap overrides the host WITHOUT editing this source.
+const conciergePlatformMCPRepoPath = "molecule-ai/molecule-ai-plugin-molecule-platform-mcp"
+
+// conciergePlatformMCPRef is the pinned ref the box fetches. It MUST stay set: the
+// gitea resolver rejects an unpinned spec in production (PLUGIN_ALLOW_UNPINNED is
+// unset by default — see plugins/gitea.go), so an unpinned source would record the
+// declaration but then FAIL to fetch at boot-install time → no management MCP, no
+// create_workspace. #main matches the established seo-all convention.
+const conciergePlatformMCPRef = "main"
+
+// conciergePlatformMCPSource is the source-contract string recorded into
+// workspace_declared_plugins and consumed by the box boot-install. It is kept in
+// gitea:// wire form (NOT a full URL) for a deliberate reason:
 //
-// It MUST also carry a pinned #ref: the gitea resolver rejects an unpinned spec
-// in production (PLUGIN_ALLOW_UNPINNED is unset by default — see plugins/gitea.go),
-// so an unpinned source would record the declaration but then FAIL to fetch at
-// boot-install time → no management MCP, no create_workspace. #main matches the
-// established seo-all convention (gitea.go example). The #ref does NOT affect
+//   - REGISTRY-CONFIGURABLE / provider-agnostic: the gitea:// scheme carries NO
+//     host. Both the older and the updated box resolvers resolve gitea://owner/repo
+//     against a configurable registry base — the platform default git.moleculesai.app
+//     OR the MOLECULE_PLUGIN_REGISTRY this handler now threads into the box env — so
+//     the host is no longer hardcoded and a mirror/airgap install just sets that env.
+//     Because the host lives in the box env, this constant does not read it and can
+//     stay a compile-time const (the 3 call sites are unchanged).
+//
+//   - ROLLOUT-SAFE back-compat: EVERY box image already understands gitea:// (the
+//     boot-install "ONLY fetches gitea:// sources" today), whereas a full URL is only
+//     understood by the updated resolver. Emitting gitea:// keeps the concierge's
+//     management MCP working on not-yet-updated boxes mid-rollout; the updated box
+//     "handles both", so this can flip to a full `{registry}/…#ref` URL once the
+//     fleet is fully on the new image.
+//
+// A bare name is NOT acceptable: it parses to the `local` scheme (image-baked
+// plugins only) and this is a Gitea-only repo. The #ref does NOT affect
 // PluginNameFromSource, so conciergePlatformMCPName below is unchanged.
-const conciergePlatformMCPSource = "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"
+const conciergePlatformMCPSource = "gitea://" + conciergePlatformMCPRepoPath + "#" + conciergePlatformMCPRef
+
+// conciergePluginRegistryEnvVar names the box-facing env var that carries the
+// SCM/registry base the plugin boot-install fetches plugin repos from. Setting it
+// fleet-wide (or per self-host deployment) overrides the platform default WITHOUT
+// touching any recorded source string — it is the single knob that makes concierge
+// plugin sourcing provider-agnostic for mirror / airgap installs. This is a
+// fleet-wide default, NOT a per-tenant SCM surface.
+const conciergePluginRegistryEnvVar = "MOLECULE_PLUGIN_REGISTRY"
+
+// defaultPluginRegistryBase is the SaaS platform SCM origin used when no registry
+// override is configured.
+const defaultPluginRegistryBase = "https://git.moleculesai.app"
+
+// pluginRegistryBase resolves the registry/SCM base the box should fetch plugin
+// repos from. Precedence: an explicit MOLECULE_PLUGIN_REGISTRY, then the gitea
+// resolver's own MOLECULE_GITEA_BASE_URL (so a self-host that already configured
+// its Gitea origin gets a consistent plugin registry for free — one knob, no
+// drift), then the SaaS default. Always returns a non-empty value.
+func pluginRegistryBase() string {
+	if v := strings.TrimSpace(os.Getenv(conciergePluginRegistryEnvVar)); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("MOLECULE_GITEA_BASE_URL")); v != "" {
+		return v
+	}
+	return defaultPluginRegistryBase
+}
 
 // conciergePlatformMCPName is the install NAME plugins.PluginNameFromSource
 // derives from the gitea:// source above (the repo segment, no subpath). It is

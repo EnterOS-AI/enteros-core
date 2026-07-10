@@ -95,6 +95,11 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 		return
 	}
 
+	// A platform concierge reconcile can run while it is provisioning and after
+	// each transition to online. Deliver missing bytes in either state, but do
+	// not let reconcile restart the concierge and create a provisioning loop.
+	suppressRestart := platformConciergeReconcileShouldSkipRestart(ctx, workspaceID)
+
 	var installedCount, skipped int
 	for _, d := range declared {
 		if installed[d.PluginName] {
@@ -135,24 +140,33 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 		if h.pluginPresentOnBox(ctx, workspaceID, stage.PluginName) {
 			log.Printf("Plugin reconcile: workspace=%s plugin=%s already on box (boot-installed) — recording tracking row only, no re-deliver/restart",
 				workspaceID, stage.PluginName)
-		} else if deliverErr := h.deliver(ctx, workspaceID, stage); deliverErr != nil {
-			stage.cleanup()
-			if errors.Is(deliverErr, errNoPushTarget) {
-				// Docker-less tenant (#206): the docker-push is RETIRED. The plugin
-				// is declared, so the runtime's boot materializer is responsible for
-				// PULLING it into /configs/plugins/<name>/ on boot. We do NOT copy
-				// bytes in, and we do NOT restart here — the boot installer already
-				// ran before this online-transition reconcile, so a restart would
-				// just loop on a genuinely-unfetchable source. The interactive
-				// install path owns the on-demand re-materialize; here we log and
-				// move on (retried on the next transition-to-online).
-				log.Printf("Plugin reconcile: workspace=%s plugin=%s not on box, no docker-push target (docker-less) — pull (boot materializer) is the SSOT; skipping push",
-					workspaceID, d.PluginName)
+		} else {
+			// Platform concierge lifecycle guard: preserve idempotent delivery,
+			// but leave any required restart to an explicit operator action.
+			if suppressRestart {
+				stage.SuppressRestart = true
+				log.Printf("Plugin reconcile: workspace=%s plugin=%s not on box during platform concierge provisioning/online lifecycle — delivering WITHOUT automatic restart",
+					workspaceID, stage.PluginName)
+			}
+			if deliverErr := h.deliver(ctx, workspaceID, stage); deliverErr != nil {
+				stage.cleanup()
+				if errors.Is(deliverErr, errNoPushTarget) {
+					// Docker-less tenant (#206): the docker-push is RETIRED. The plugin
+					// is declared, so the runtime's boot materializer is responsible for
+					// PULLING it into /configs/plugins/<name>/ on boot. We do NOT copy
+					// bytes in, and we do NOT restart here — the boot installer already
+					// ran before this online-transition reconcile, so a restart would
+					// just loop on a genuinely-unfetchable source. The interactive
+					// install path owns the on-demand re-materialize; here we log and
+					// move on (retried on the next transition-to-online).
+					log.Printf("Plugin reconcile: workspace=%s plugin=%s not on box, no docker-push target (docker-less) — pull (boot materializer) is the SSOT; skipping push",
+						workspaceID, d.PluginName)
+					continue
+				}
+				log.Printf("Plugin reconcile: workspace=%s plugin=%s deliver failed: %v",
+					workspaceID, d.PluginName, deliverErr)
 				continue
 			}
-			log.Printf("Plugin reconcile: workspace=%s plugin=%s deliver failed: %v",
-				workspaceID, d.PluginName, deliverErr)
-			continue
 		}
 		stage.cleanup()
 

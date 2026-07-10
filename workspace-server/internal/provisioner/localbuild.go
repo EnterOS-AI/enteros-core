@@ -552,15 +552,10 @@ func maskTokenInString(s, token string) string {
 // auto-promotes to BuildKit when available, falling back to v1
 // otherwise (still produces an amd64 image via QEMU).
 func dockerBuildProd(ctx context.Context, opts *LocalBuildOptions, contextDir, tag string) error {
-	args := []string{"build"}
-	if opts.Platform != "" {
-		args = append(args, "--platform="+opts.Platform)
+	args := dockerBuildArgs(opts, contextDir, tag)
+	if v := readRuntimeVersionPin(contextDir); v != "" {
+		log.Printf("local-build: pinning RUNTIME_VERSION=%s from .runtime-version for %s", v, tag)
 	}
-	args = append(args,
-		"-t", tag,
-		"-f", filepath.Join(contextDir, "Dockerfile"),
-		contextDir,
-	)
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
 	out, err := cmd.CombinedOutput()
@@ -570,6 +565,58 @@ func dockerBuildProd(ctx context.Context, opts *LocalBuildOptions, contextDir, t
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(maskTokenInString(string(out), opts.Token)))
 	}
 	return nil
+}
+
+// dockerBuildArgs assembles the `docker build …` argv. Extracted from
+// dockerBuildProd so the RUNTIME_VERSION SSOT-pin behavior can be asserted in a
+// unit test without shelling out to docker.
+//
+// SSOT runtime pin: forward the template's .runtime-version as the
+// RUNTIME_VERSION build-arg, exactly as the publish-image workflow's
+// resolve-version step does — so a locally-built image installs the SAME runtime
+// the pushed image does (one SSOT, .runtime-version, consumed identically local +
+// prod). The ARG value also KEYS the pip layer's build cache, so a version change
+// cache-busts a stale runtime instead of docker silently serving an old cached
+// layer. Without this the local build ships whatever the cache holds — the
+// RUNTIME_VERSION cache-trap (#53) that breaks any template delegating to a
+// runtime-shipped helper (e.g. the mgmt-MCP prebake, #54: a delegating RUN that
+// imports a script absent from the stale runtime → exit 127). Absent/unreadable
+// .runtime-version falls through to the Dockerfile/requirements pin (same
+// graceful behavior as publish).
+func dockerBuildArgs(opts *LocalBuildOptions, contextDir, tag string) []string {
+	args := []string{"build"}
+	if opts.Platform != "" {
+		args = append(args, "--platform="+opts.Platform)
+	}
+	if v := readRuntimeVersionPin(contextDir); v != "" {
+		args = append(args, "--build-arg", "RUNTIME_VERSION="+v)
+	}
+	args = append(args,
+		"-t", tag,
+		"-f", filepath.Join(contextDir, "Dockerfile"),
+		contextDir,
+	)
+	return args
+}
+
+// readRuntimeVersionPin returns the trimmed first line of
+// <contextDir>/.runtime-version, or "" when the file is absent, unreadable, or
+// empty. Mirrors the publish-image workflow's resolve-version step
+// (`head -n1 .runtime-version | tr -d '[:space:]'`) so a local build pins the
+// EXACT runtime the pushed image does — the .runtime-version file is the SSOT
+// (propagation-bot–synced from each runtime release; #53), consumed identically
+// by prod publish and local-build. Never returns an error: an absent pin falls
+// through to the Dockerfile/requirements default, exactly as publish does.
+func readRuntimeVersionPin(contextDir string) string {
+	b, err := os.ReadFile(filepath.Join(contextDir, ".runtime-version"))
+	if err != nil {
+		return ""
+	}
+	line := string(b)
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	return strings.TrimSpace(line)
 }
 
 // dockerHasTagProd returns true iff the given tag exists in the local

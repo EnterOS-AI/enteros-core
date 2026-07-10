@@ -1020,6 +1020,32 @@ func (h *WorkspaceHandler) cpStopWithRetryErr(ctx context.Context, workspaceID, 
 	return lastErr
 }
 
+// isLiveWarmingPlatformConcierge is the pure decision for the core#3082 warming
+// guard in runRestartCycle: refuse to auto-restart a kind=platform concierge
+// that is ALREADY warming (status=provisioning with a LIVE container). Returns
+// false — allow the restart — for the FIRST provision (no container running
+// yet: running=false, so the concierge can boot), for non-platform workspaces,
+// for any non-provisioning status, and (fail-open) on an IsRunning probe error.
+func isLiveWarmingPlatformConcierge(kind, status string, running bool, probeErr error) bool {
+	return probeErr == nil &&
+		running &&
+		kind == models.KindPlatform &&
+		status == string(models.StatusProvisioning)
+}
+
+// workspaceIsRunning probes whichever lifecycle backend is active. Production
+// wires exactly one backend, but prefer the local provisioner if a test fixture
+// supplies both, matching the existing A2A health-probe behavior.
+func (h *WorkspaceHandler) workspaceIsRunning(ctx context.Context, workspaceID string) (bool, error) {
+	if h.provisioner != nil {
+		return h.provisioner.IsRunning(ctx, workspaceID)
+	}
+	if h.cpProv != nil {
+		return h.cpProv.IsRunning(ctx, workspaceID)
+	}
+	return false, nil
+}
+
 // runRestartCycle does the actual stop+provision work for one restart
 // iteration. Synchronous (waits for provisionWorkspace to complete) so the
 // outer pending-flag loop in RestartByID can correctly coalesce — if this
@@ -1048,11 +1074,11 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	gate.Lock()
 	defer gate.Unlock()
 
-	var wsName, status, dbRuntime, dbTemplate string
+	var wsName, status, dbRuntime, dbTemplate, dbKind string
 	var tier int
 	err := db.DB.QueryRowContext(ctx,
-		`SELECT name, status, tier, COALESCE(runtime, 'claude-code'), COALESCE(template, '') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
-	).Scan(&wsName, &status, &tier, &dbRuntime, &dbTemplate)
+		`SELECT name, status, tier, COALESCE(runtime, 'claude-code'), COALESCE(template, ''), COALESCE(kind, 'workspace') FROM workspaces WHERE id = $1 AND status NOT IN ('removed', 'paused', 'hibernated')`, workspaceID,
+	).Scan(&wsName, &status, &tier, &dbRuntime, &dbTemplate, &dbKind)
 	if err != nil {
 		return // includes paused/hibernated — don't auto-restart those
 	}
@@ -1067,6 +1093,38 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// Don't auto-restart if any ancestor is paused
 	if paused, _ := isParentPaused(ctx, workspaceID); paused {
 		return
+	}
+
+	// core#3082 WARMING GUARD — the runtime-agnostic chokepoint that makes a
+	// platform concierge actually reach `online`. A kind=platform concierge that
+	// is ALREADY warming (status=provisioning with a LIVE container) must NOT be
+	// auto-restarted: a restart interrupts its boot, and because the
+	// restart-trigger paths (plugin-reconcile, coalesceRestart's pending-drain,
+	// the trailing restart-context probe) re-fire on a cadence SHORTER than a
+	// slow runtime's cold-boot (hermes ~60–90s vs the ~35s restart cadence), it
+	// spins a SELF-PERPETUATING restart loop the concierge never escapes — it
+	// never reaches the online flip. This single guard neutralizes EVERY
+	// restart-trigger path at once (superseding the per-reconcile
+	// SuppressRestart guard, which remains as defense-in-depth).
+	//
+	// Warming is then bounded by existing lifecycle signals, never a wall-clock
+	// restart:
+	//   * READY  → the verified-ready gate (registry.go Heartbeat) flips it
+	//     online the instant a heartbeat reports provision_workspace loaded.
+	//   * TIMEOUT → the provisioning timeout sweep marks a concierge failed
+	//     when it does not become ready within the runtime-specific deadline.
+	//
+	// The FIRST provision is deliberately NOT guarded: no container is running
+	// yet, so IsRunning=false and we fall through to create it — that is how the
+	// concierge boots. Only a re-provision of an already-live warming concierge
+	// is refused. Fail-open on a probe error (proceed as before) so a backend
+	// blip never wedges a genuinely-needed restart.
+	if status == string(models.StatusProvisioning) && dbKind == models.KindPlatform && h.HasProvisioner() {
+		running, runErr := h.workspaceIsRunning(ctx, workspaceID)
+		if isLiveWarmingPlatformConcierge(dbKind, status, running, runErr) {
+			log.Printf("Auto-restart: SKIPPING %s (%s) — kind=platform still WARMING (provisioning, container live); not resetting the boot. Warming ends on the verified-ready gate or the provisioning timeout (core#3082).", wsName, workspaceID)
+			return
+		}
 	}
 
 	// If still provisioning, brief wait so container exists for Stop()

@@ -183,6 +183,39 @@ func listDeclaredPlugins(ctx context.Context, workspaceID string) ([]DeclaredPlu
 // present here as "installed" and skips it — the DB record is the backend-
 // agnostic install SSOT (written by both the Docker and EIC install paths),
 // so the reconcile doesn't need to exec into the container to diff.
+// platformConciergeReconcileShouldSkipRestart reports whether a plugin-reconcile
+// of a kind=platform concierge must DELIVER WITHOUT restarting it. True for a
+// platform concierge in `provisioning` (warming) OR `online` (just promoted) —
+// the concierge's whole fragile lifecycle window.
+//
+// Why BOTH statuses, not just provisioning: the reconcile fires on EVERY
+// transition-to-online (registry.fireReconcileOnline), and pluginPresentOnBox()
+// false-negatives for some runtimes (hermes reads /home/agent/.hermes/config.yaml,
+// which doesn't reflect the freshly-boot-installed plugin) — so on each online
+// beat the reconcile RE-DELIVERS and (without this guard) fires
+// RestartByIDAfterMutation, which knocks the just-online concierge back to
+// `provisioning`. It reboots, verifies ready, goes online, the reconcile fires
+// again → an online↔provisioning bounce every ~36s the concierge never escapes
+// (observed live 2026-07-09). The boot-install already owns delivery; the
+// reconcile's copy is idempotent and harmless — only the restart is destructive.
+// So for the org-root concierge we NEVER auto-restart from the reconcile: a
+// genuine plugin-change restart of the concierge must be a DELIBERATE explicit
+// restart, not an auto-reconcile side effect. Fail-open: any query error returns
+// false (restart as before) so a DB blip never masks a needed restart.
+func platformConciergeReconcileShouldSkipRestart(ctx context.Context, workspaceID string) bool {
+	if db.DB == nil {
+		return false
+	}
+	var kind, status string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT kind, status FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&kind, &status); err != nil {
+		return false
+	}
+	return kind == models.KindPlatform &&
+		(status == string(models.StatusProvisioning) || status == string(models.StatusOnline))
+}
+
 func listInstalledPluginNames(ctx context.Context, workspaceID string) (map[string]bool, error) {
 	out := map[string]bool{}
 	if db.DB == nil {

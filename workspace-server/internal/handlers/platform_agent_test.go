@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
@@ -727,6 +728,87 @@ func TestConciergePlatformMCPEnv(t *testing.T) {
 			t.Errorf("MOLECULE_API_URL = %q, want the explicit env", env["MOLECULE_API_URL"])
 		}
 	})
+
+	// The concierge box must carry MOLECULE_PLUGIN_REGISTRY so its boot-install
+	// fetches the management-MCP plugin from a CONFIGURABLE SCM host, not a baked
+	// git.moleculesai.app. Default on SaaS; overridable for mirror/airgap.
+	t.Run("threads MOLECULE_PLUGIN_REGISTRY default to the box", func(t *testing.T) {
+		t.Setenv(conciergePluginRegistryEnvVar, "")
+		t.Setenv("MOLECULE_GITEA_BASE_URL", "")
+		env := map[string]string{}
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
+		if env[conciergePluginRegistryEnvVar] != defaultPluginRegistryBase {
+			t.Errorf("%s = %q, want SaaS default %q", conciergePluginRegistryEnvVar, env[conciergePluginRegistryEnvVar], defaultPluginRegistryBase)
+		}
+	})
+
+	t.Run("MOLECULE_PLUGIN_REGISTRY override flows to the box (mirror/airgap)", func(t *testing.T) {
+		t.Setenv(conciergePluginRegistryEnvVar, "https://gitea.internal.corp")
+		env := map[string]string{}
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
+		if env[conciergePluginRegistryEnvVar] != "https://gitea.internal.corp" {
+			t.Errorf("%s = %q, want the configured override", conciergePluginRegistryEnvVar, env[conciergePluginRegistryEnvVar])
+		}
+	})
+
+	t.Run("does not clobber a MOLECULE_PLUGIN_REGISTRY already on the box env", func(t *testing.T) {
+		t.Setenv(conciergePluginRegistryEnvVar, "https://platform-default")
+		env := map[string]string{conciergePluginRegistryEnvVar: "https://box-preset"}
+		conciergePlatformMCPEnv(env, "ws-self-1", "admintok")
+		if env[conciergePluginRegistryEnvVar] != "https://box-preset" {
+			t.Errorf("%s overwritten to %q, want box preset preserved", conciergePluginRegistryEnvVar, env[conciergePluginRegistryEnvVar])
+		}
+	})
+}
+
+// TestPluginRegistryBase pins the registry-base precedence: an explicit
+// MOLECULE_PLUGIN_REGISTRY wins, else the gitea resolver's MOLECULE_GITEA_BASE_URL
+// (one knob for a self-host that already configured its Gitea origin), else the
+// SaaS default. This is the single de-hardcode knob for provider-agnostic plugin
+// sourcing (mirror/airgap).
+func TestPluginRegistryBase(t *testing.T) {
+	t.Run("explicit MOLECULE_PLUGIN_REGISTRY wins", func(t *testing.T) {
+		t.Setenv(conciergePluginRegistryEnvVar, "https://registry.example")
+		t.Setenv("MOLECULE_GITEA_BASE_URL", "https://gitea.example")
+		if got := pluginRegistryBase(); got != "https://registry.example" {
+			t.Fatalf("got %q, want explicit registry", got)
+		}
+	})
+	t.Run("falls back to MOLECULE_GITEA_BASE_URL", func(t *testing.T) {
+		t.Setenv(conciergePluginRegistryEnvVar, "")
+		t.Setenv("MOLECULE_GITEA_BASE_URL", "https://gitea.example")
+		if got := pluginRegistryBase(); got != "https://gitea.example" {
+			t.Fatalf("got %q, want gitea base fallback", got)
+		}
+	})
+	t.Run("falls back to the SaaS default", func(t *testing.T) {
+		t.Setenv(conciergePluginRegistryEnvVar, "")
+		t.Setenv("MOLECULE_GITEA_BASE_URL", "")
+		if got := pluginRegistryBase(); got != defaultPluginRegistryBase {
+			t.Fatalf("got %q, want %q", got, defaultPluginRegistryBase)
+		}
+	})
+}
+
+// TestConciergePlatformMCPSourceForm pins the wire form of the recorded plugin
+// source: a host-agnostic gitea:// spec composed from the fixed repo path + ref
+// (no baked git.moleculesai.app), whose derived install name still equals the
+// entitlement-gated conciergePlatformMCPName. Guards against a refactor that bakes
+// a host back into the source or drifts the name derivation.
+func TestConciergePlatformMCPSourceForm(t *testing.T) {
+	if want := "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"; conciergePlatformMCPSource != want {
+		t.Fatalf("conciergePlatformMCPSource = %q, want %q", conciergePlatformMCPSource, want)
+	}
+	if strings.Contains(conciergePlatformMCPSource, "git.moleculesai.app") {
+		t.Errorf("conciergePlatformMCPSource must not bake an SCM host: %q", conciergePlatformMCPSource)
+	}
+	name, err := plugins.PluginNameFromSource(conciergePlatformMCPSource)
+	if err != nil {
+		t.Fatalf("PluginNameFromSource(%q): %v", conciergePlatformMCPSource, err)
+	}
+	if name != conciergePlatformMCPName {
+		t.Errorf("derived install name %q != conciergePlatformMCPName %q — reconcile/entitlement would break", name, conciergePlatformMCPName)
+	}
 }
 
 // TestResolveConciergeAdminCredential_FallsBackToAdminToken pins the WS-C

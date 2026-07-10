@@ -662,7 +662,7 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 			"activity_logs", "workspace_secrets",
 			"workspace_channels", "workspace_config", "workspace_memory",
 			"workspace_token_usage", "approval_requests", "audit_events",
-			"workflow_checkpoints", "workspace_artifacts", "agents",
+			"workspace_artifacts", "agents",
 			"workspace_auth_tokens", "workspace_schedules", "canvas_layouts",
 		} {
 			if _, err := db.DB.ExecContext(ctx,

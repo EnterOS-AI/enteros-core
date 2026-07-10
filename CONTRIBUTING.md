@@ -31,7 +31,7 @@ git config core.hooksPath .githooks
 # Copy and edit .env (generate ADMIN_TOKEN + SECRETS_ENCRYPTION_KEY)
 cp .env.example .env
 
-# Start infrastructure (Postgres, Redis, Langfuse, Temporal)
+# Start infrastructure (Postgres, Redis, MinIO, Langfuse)
 ./infra/scripts/setup.sh
 
 # Build and run the platform — applies pending migrations on first boot

@@ -1,4 +1,4 @@
-# Include infra services (Temporal, Langfuse) so `docker compose up` starts the full stack.
+# Include infra services so `docker compose up` starts the local stack.
 include:
   - docker-compose.infra.yml
 

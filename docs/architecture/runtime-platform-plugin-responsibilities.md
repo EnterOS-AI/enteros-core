@@ -4,6 +4,15 @@
 > This page is the single canonical statement of *who adapts to whom*. If you are
 > wiring a new runtime, a new plugin, or anything the online/degraded gate reads,
 > start here.
+>
+> **⚠ §2 (where per-runtime renderers/readers/present-probes live) is superseded by
+> [ADR-004](/adr/ADR-004-sdk-owns-adapter-contract-and-registry):** the per-runtime
+> *shape* moves OUT of the shared engine (`_RUNTIME_SPECS`/`_RUNTIME_READERS`/
+> `_RUNTIME_PERSONA`) INTO the SDK-owned **adapter socket** + official registry, so
+> the shared engine holds **zero** runtime-specific code. The two-layer split below
+> still holds; only the dispatch location changes. **Do not add a runtime to the
+> engine dispatch tables — they are being deleted.** Add an adapter that implements
+> the socket instead.
 
 Molecule runs the **same agent code across many runtimes** (claude-code, codex,
 hermes, openclaw, gemini-cli, …) and exposes the **same capabilities** (the

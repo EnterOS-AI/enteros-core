@@ -170,33 +170,7 @@ assert_contains "PATCH /budget (unknown period → 400)" "400" \
 assert_contains "GET /budget (no auth → 401)" "401" "$(http_code GET "$BASE/workspaces/$WS_ID/budget")"
 
 # ===========================================================================
-# 4. Checkpoints — POST/GET/DELETE /workspaces/:id/checkpoints* (wsAuth)
-#    Fully self-contained CRUD over workflow_checkpoints (#788). Upsert → latest
-#    → list-by-wfid → delete → 404. Failure modes: missing workflow_id → 400,
-#    empty latest → 404.
-# ===========================================================================
-echo "--- /checkpoints ---"
-WFID="kl-wf-$$"
-CP=$(curl -s -X POST "$BASE/workspaces/$WS_ID/checkpoints" -H "Content-Type: application/json" "${AUTH[@]}" \
-  -d "{\"workflow_id\":\"$WFID\",\"step_name\":\"step-a\",\"step_index\":1,\"payload\":{\"k\":\"v\"}}")
-assert_contains "POST /checkpoints (upsert → id + workflow_id)" "\"workflow_id\":\"$WFID\"" "$CP"
-assert_contains "GET /checkpoints/latest (200 newest)" "\"workflow_id\":\"$WFID\"" \
-  "$(curl -s "$BASE/workspaces/$WS_ID/checkpoints/latest" "${AUTH[@]}")"
-assert_contains "GET /checkpoints/:wfid (lists the step)" '"step_name":"step-a"' \
-  "$(curl -s "$BASE/workspaces/$WS_ID/checkpoints/$WFID" "${AUTH[@]}")"
-DEL=$(curl -s -X DELETE "$BASE/workspaces/$WS_ID/checkpoints/$WFID" "${AUTH[@]}")
-assert_contains "DELETE /checkpoints/:wfid (deleted count)" '"deleted":1' "$DEL"
-assert_contains "GET /checkpoints/:wfid (after delete → 404)" "404" \
-  "$(http_code GET "$BASE/workspaces/$WS_ID/checkpoints/$WFID" "${AUTH[@]}")"
-# Failure: missing workflow_id → 400 (binding:required).
-assert_contains "POST /checkpoints (missing workflow_id → 400)" "400" \
-  "$(http_code POST "$BASE/workspaces/$WS_ID/checkpoints" -H 'Content-Type: application/json' "${AUTH[@]}" -d '{"step_name":"x"}')"
-# Failure: no bearer → 401.
-assert_contains "POST /checkpoints (no auth → 401)" "401" \
-  "$(http_code POST "$BASE/workspaces/$WS_ID/checkpoints" -H 'Content-Type: application/json' -d '{"workflow_id":"x","step_name":"y"}')"
-
-# ===========================================================================
-# 5. Audit — GET /workspaces/:id/audit (wsAuth)
+# 4. Audit — GET /workspaces/:id/audit (wsAuth)
 #    EU AI Act ledger query (#594). Fresh ws → empty events, total 0,
 #    chain_valid null (AUDIT_LEDGER_SALT unset). Failure: bad RFC3339 from → 400.
 # ===========================================================================
@@ -209,7 +183,7 @@ assert_contains "GET /audit (bad 'from' → 400)" "400" \
 assert_contains "GET /audit (no auth → 401)" "401" "$(http_code GET "$BASE/workspaces/$WS_ID/audit")"
 
 # ===========================================================================
-# 6. Traces — GET /workspaces/:id/traces (wsAuth)
+# 5. Traces — GET /workspaces/:id/traces (wsAuth)
 #    Langfuse proxy (#590). No LANGFUSE_* configured → 200 [] (graceful empty),
 #    never a 5xx. Failure: no auth → 401.
 # ===========================================================================
@@ -222,7 +196,7 @@ assert_contains "GET /traces (empty list)" '[]' "$TR_BODY"
 assert_contains "GET /traces (no auth → 401)" "401" "$(http_code GET "$BASE/workspaces/$WS_ID/traces")"
 
 # ===========================================================================
-# 7. Session search — GET /workspaces/:id/session-search (wsAuth)
+# 6. Session search — GET /workspaces/:id/session-search (wsAuth)
 #    Searches activity_logs. Seed one activity row, then assert q-filter finds
 #    it and a non-matching q returns []. Failure: no auth → 401.
 # ===========================================================================
@@ -237,7 +211,7 @@ assert_contains "GET /session-search (no auth → 401)" "401" \
   "$(http_code GET "$BASE/workspaces/$WS_ID/session-search?q=x")"
 
 # ===========================================================================
-# 8. Rescue — GET /workspaces/:id/rescue (wsAuth)
+# 7. Rescue — GET /workspaces/:id/rescue (wsAuth)
 #    RFC internal#742. Fail-CLOSED contract: the e2e-api job has no
 #    MOLECULE_ORG_ID, so the handler returns 503 platform_misconfigured rather
 #    than leaking cross-org. That fail-closed behaviour IS the keyless contract
@@ -259,7 +233,7 @@ fi
 assert_contains "GET /rescue (no auth → 401)" "401" "$(http_code GET "$BASE/workspaces/$WS_ID/rescue")"
 
 # ===========================================================================
-# 10. Lifecycle — Pause → Resume + Hibernate (wsAuth)
+# 8. Lifecycle — Pause → Resume + Hibernate (wsAuth)
 #     Pause works backend-agnostically (StopWorkspaceAuto no-ops on no backend)
 #     → status=paused. Resume re-provisions: 200 provisioning when a provisioner
 #     is wired (the e2e-api host has Docker), or 503 provisioner-not-available
