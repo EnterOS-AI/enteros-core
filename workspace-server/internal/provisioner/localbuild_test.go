@@ -757,3 +757,90 @@ func TestProvisionerStartUsesLocalBuild_SaaSMode(t *testing.T) {
 
 // silence unused warning if we ever drop fmt usage
 var _ = fmt.Sprintf
+
+// --- RUNTIME_VERSION SSOT pin (#53): local build must forward .runtime-version ---
+// Regression coverage for the RUNTIME_VERSION cache-trap that broke templates
+// delegating to a runtime-shipped helper (mgmt-MCP prebake, #54). The local build
+// must pin the SAME runtime the pushed image does, sourced from .runtime-version
+// (the propagation-bot SSOT), exactly like the publish-image resolve-version step.
+
+func TestReadRuntimeVersionPin(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		write   bool
+		want    string
+	}{
+		{"present", "0.3.115\n", true, "0.3.115"},
+		{"leading_trailing_whitespace", "  0.3.116 \n", true, "0.3.116"},
+		{"first_line_only", "0.3.117\n# a trailing comment line\n", true, "0.3.117"},
+		{"empty_file", "\n", true, ""},
+		{"absent_file", "", false, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if c.write {
+				if err := os.WriteFile(filepath.Join(dir, ".runtime-version"), []byte(c.content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := readRuntimeVersionPin(dir); got != c.want {
+				t.Errorf("readRuntimeVersionPin(%q) = %q, want %q", c.name, got, c.want)
+			}
+		})
+	}
+}
+
+func TestDockerBuildArgs_RuntimeVersionPin(t *testing.T) {
+	t.Run("forwards RUNTIME_VERSION build-arg when .runtime-version present", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, ".runtime-version"), []byte("0.3.115\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		args := dockerBuildArgs(&LocalBuildOptions{}, dir, "img:tag")
+		if !argsHavePair(args, "--build-arg", "RUNTIME_VERSION=0.3.115") {
+			t.Fatalf("expected `--build-arg RUNTIME_VERSION=0.3.115` in %v", args)
+		}
+	})
+	t.Run("no RUNTIME_VERSION build-arg when .runtime-version absent (falls through)", func(t *testing.T) {
+		dir := t.TempDir()
+		args := dockerBuildArgs(&LocalBuildOptions{}, dir, "img:tag")
+		for _, a := range args {
+			if strings.HasPrefix(a, "RUNTIME_VERSION=") {
+				t.Fatalf("unexpected RUNTIME_VERSION build-arg in %v", args)
+			}
+		}
+	})
+	t.Run("platform and version both forwarded", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, ".runtime-version"), []byte("0.3.115"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		args := dockerBuildArgs(&LocalBuildOptions{Platform: "linux/amd64"}, dir, "img:tag")
+		if !argsHave(args, "--platform=linux/amd64") {
+			t.Errorf("platform not forwarded: %v", args)
+		}
+		if !argsHavePair(args, "--build-arg", "RUNTIME_VERSION=0.3.115") {
+			t.Errorf("version not forwarded: %v", args)
+		}
+	})
+}
+
+func argsHave(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+func argsHavePair(args []string, flag, val string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag && args[i+1] == val {
+			return true
+		}
+	}
+	return false
+}
