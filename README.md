@@ -297,10 +297,8 @@ cp .env.example .env
 # production hardening knobs (ADMIN_TOKEN, SECRETS_ENCRYPTION_KEY, etc.).
 
 ./infra/scripts/setup.sh
-# Boots Postgres (:5432), Redis (:6379), Langfuse (:3001),
-# and Temporal (:7233 gRPC, :8233 UI) on the shared
-# `molecule-core-net` Docker network. Temporal runs with
-# no auth on localhost — dev-only; production must gate it.
+# Boots Postgres (:5432), Redis (:6379), MinIO (:9000/:9001),
+# and Langfuse (:3001) on the shared `molecule-core-net` Docker network.
 #
 # Also populates the template/plugin registry by cloning every repo
 # listed in manifest.json into workspace-configs-templates/,

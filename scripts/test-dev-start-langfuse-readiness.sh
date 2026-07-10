@@ -155,12 +155,6 @@ grep -Fq '127.0.0.1:${MOLECULE_PG_HOST_PORT:-5432}:5432' "$COMPOSE" \
 # shellcheck disable=SC2016
 grep -Fq '127.0.0.1:${MOLECULE_REDIS_HOST_PORT:-6379}:6379' "$COMPOSE" \
   || fail "Redis must be loopback-bound in local dev"
-# shellcheck disable=SC2016
-grep -Fq '127.0.0.1:${MOLECULE_TEMPORAL_HOST_PORT:-7233}:7233' "$COMPOSE" \
-  || fail "Temporal gRPC must be loopback-bound in local dev"
-# shellcheck disable=SC2016
-grep -Fq '127.0.0.1:${MOLECULE_TEMPORAL_UI_HOST_PORT:-8233}:8080' "$COMPOSE" \
-  || fail "Temporal UI must be loopback-bound in local dev"
 grep -Fq 'MOLECULE_WORKSPACE_DATA_BUCKET' "$COMPOSE" \
   || fail "MinIO bootstrap must use the workspace-data bucket env"
 grep -Eq '^  miniodata:' "$COMPOSE" \
