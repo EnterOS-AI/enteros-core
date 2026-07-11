@@ -107,6 +107,44 @@ const (
 
 	// Auth / credentials.
 	EventExternalCredentialsRotated EventType = "EXTERNAL_CREDENTIALS_ROTATED"
+
+	// Boot sequence — the per-step "Enter OS" boot animation the canvas
+	// renders while a workspace is `provisioning`. The runtime emits these
+	// as it walks its cold-boot checklist (provision compute → start
+	// runtime → wire transport → install plugins → load identity → connect
+	// management MCP → enumerate tools → go online), so the canvas can
+	// replace the opaque provisioning spinner with a watchdog-driven,
+	// per-step keycap animation that fails LOUDLY (shows the failing step's
+	// reason) instead of hanging.
+	//
+	// One event type carries the whole family — a single BOOT_STEP with a
+	// {step,total,key,label,status,message} payload is cleaner than one
+	// event per boot phase and lets the runtime add/reorder steps without a
+	// server or canvas release. The canvas is data-driven off the payload.
+	//
+	// Wire payload (BOOT_STEP) — the shape the runtime emitter MUST send;
+	// the ingestion handler (boot_event.go) validates it and the canvas
+	// store appends it to the workspace node's `bootSteps` array:
+	//
+	//	{
+	//	  "step":    3,           // 1-based index of this step (>=1)
+	//	  "total":   8,           // total steps in the boot plan (>= step)
+	//	  "key":     "MCP",       // short keycap legend (<=8 chars), e.g. PWR/RT/MCP
+	//	  "label":   "Connect management MCP",  // human step name
+	//	  "status":  "running",   // one of: running | ok | failed
+	//	  "message": "launching npx @molecule-ai/mcp-server…"  // optional log line;
+	//	                          // on status=failed this is the red failure reason
+	//	}
+	//
+	// Terminal signal: the runtime marks the LAST step status=ok (its
+	// "go online" phase) and then flips the workspace row to `online`,
+	// which emits the existing WORKSPACE_ONLINE — the canvas uses THAT to
+	// fade the boot screen into chat. BOOT_STEP is presentation-only and is
+	// broadcast-only (not persisted in structure_events): a mid-boot page
+	// reload re-derives the step list from the workspace status + any
+	// replayed steps, so there's nothing to persist. If NO BOOT_STEP events
+	// arrive, the canvas degrades to a generic indeterminate boot.
+	EventBootStep EventType = "BOOT_STEP"
 )
 
 // AllEventTypes lists every constant in this file. Used by the
@@ -128,6 +166,7 @@ var AllEventTypes = []EventType{
 	EventAgentReplaced,
 	EventApprovalEscalated,
 	EventApprovalRequested,
+	EventBootStep,
 	EventChannelMessage,
 	EventCronExecuted,
 	EventCronSkipped,
