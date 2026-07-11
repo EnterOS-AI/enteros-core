@@ -51,7 +51,7 @@ Usage: ./scripts/dev-start.sh [--fresh]
               object-store state, and any already-built runtime images.
               Idempotent: safe to re-run.
 
-  --fresh     (aliases: --remove-volumes, -V) FULL reset before starting.
+  --fresh     (alias: --remove-volumes) FULL reset before starting.
               This is DESTRUCTIVE:
                 • tears down the compose stack AND its named volumes
                   (WIPES local Postgres / MinIO / Langfuse state and your
@@ -71,7 +71,7 @@ USAGE
 
 for arg in "$@"; do
     case "$arg" in
-        --fresh|--remove-volumes|-V) FRESH=1 ;;
+        --fresh|--remove-volumes) FRESH=1 ;;
         -h|--help) print_usage; exit 0 ;;
         # Fail loud on unknown flags — the whole point of this parser is that a
         # mistyped/unsupported flag (e.g. --fresh before it existed) must NOT be
@@ -148,41 +148,66 @@ cleanup_dev_stack() {
 }
 
 # rm_by_filter DESC — delete docker objects a `docker ... --format {{...}}` +
-# grep pipeline selects, WITHOUT xargs -r (a GNU-ism BSD/macOS xargs rejects):
-# only invoke the remover when the selection is non-empty. $1 = human label,
-# $2 = the listing command, $3 = the grep pattern, $4 = the remove command.
+# grep -E pipeline selects, WITHOUT xargs -r (a GNU-ism BSD/macOS xargs rejects):
+# only invoke the remover when the selection is non-empty. $1 = human label
+# (printed, so a destructive reset reports what it touched and a per-item
+# removal failure is visible instead of silently leaving a partial wipe),
+# $2 = the listing command, $3 = the ERE grep pattern, $4 = the remove command.
 rm_by_filter() {
-    _sel=$(eval "$2" 2>/dev/null | grep "$3" 2>/dev/null || true)
+    _label="$1"
+    _sel=$(eval "$2" 2>/dev/null | grep -E "$3" 2>/dev/null || true)
     [ -n "$_sel" ] || return 0
-    echo "$_sel" | while IFS= read -r _item; do
-        [ -n "$_item" ] && eval "$4 \"$_item\"" >/dev/null 2>&1 || true
+    echo "    --fresh: removing $(printf '%s\n' "$_sel" | grep -c .) $_label"
+    printf '%s\n' "$_sel" | while IFS= read -r _item; do
+        [ -n "$_item" ] || continue
+        eval "$4 \"$_item\"" >/dev/null 2>&1 \
+            || echo "    WARN: failed to remove $_label: $_item" >&2
     done
 }
 
 fresh_reset() {
-    # --fresh (opt-in only; NEVER runs on the exit trap). Unlike cleanup_dev_stack
-    # — which keeps named volumes so DB/object-store state survives an ordinary
-    # restart — this WIPES that state plus the locally-built runtime images, so
-    # onboarding and every template image rebuild from a clean slate. Mirrors the
-    # nuke portion of scripts/nuke-and-rebuild.sh and adds the template-image +
-    # build-clone-cache purge (the piece that otherwise strands a stale
-    # molecule-local/workspace-template-*:<sha> image behind a green boot).
+    # --fresh (opt-in only; NEVER runs on the exit trap — see cleanup()). Unlike
+    # cleanup_dev_stack — which keeps named volumes so DB/object-store state
+    # survives an ordinary restart — this WIPES that state plus the locally-built
+    # runtime images, so onboarding and every template image rebuild from a clean
+    # slate. Mirrors the nuke portion of scripts/nuke-and-rebuild.sh and adds the
+    # template-image + build-clone-cache purge (the piece that otherwise strands a
+    # stale molecule-local/workspace-template-*:<sha> image behind a green boot).
     echo "==> --fresh: FULL reset — WIPING local DB / object-store / onboarding state"
     cleanup_repo_host_processes
     # Compose stack + named volumes (postgres/redis/minio/langfuse/clickhouse).
-    docker compose -f "$ROOT/docker-compose.yml" down -v --remove-orphans >/dev/null 2>&1 || true
-    docker compose -f "$ROOT/docker-compose.infra.yml" down -v --remove-orphans >/dev/null 2>&1 || true
+    # Surface a failure rather than silently claiming a clean slate below: if a
+    # `down -v` errors (e.g. a broken compose plugin on the go-run boot path), the
+    # named volumes are NOT wiped and the operator must not be told otherwise.
+    docker compose -f "$ROOT/docker-compose.yml" down -v --remove-orphans >/dev/null 2>&1 \
+        || echo "    WARN: 'docker compose -f docker-compose.yml down -v' failed — local DB/Redis volumes may persist" >&2
+    docker compose -f "$ROOT/docker-compose.infra.yml" down -v --remove-orphans >/dev/null 2>&1 \
+        || echo "    WARN: 'docker compose -f docker-compose.infra.yml down -v' failed — MinIO/Langfuse volumes may persist" >&2
     docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
-    # Dynamically-spawned ws-* workspace containers + volumes are NOT in compose,
-    # so `down -v` leaves them behind (ghost containers Canvas can't see).
-    rm_by_filter "ws containers" "docker ps -a --format '{{.Names}}'" "^ws-" "docker rm -f"
-    rm_by_filter "ws volumes"    "docker volume ls --format '{{.Name}}'" "^ws-" "docker volume rm"
+    # Dynamically-spawned ws-<uuid> workspace containers + volumes are NOT in
+    # compose, so `down -v` leaves them behind. Scope to the workspace-UUID name
+    # shape (ws-<8hex>-<4hex>-<4hex>-…) — NOT a bare `ws-` prefix, which would also
+    # match an unrelated project's `ws-*` object (e.g. `ws-frontend-cache`) on the
+    # same host and destroy its data.
+    _ws_re='^ws-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-'
+    rm_by_filter "workspace containers" "docker ps -a --format '{{.Names}}'" "$_ws_re" "docker rm -f"
+    rm_by_filter "workspace volumes"    "docker volume ls --format '{{.Name}}'" "$_ws_re" "docker volume rm"
     docker network rm molecule-core-net >/dev/null 2>&1 || true
-    # Locally-built runtime template images + the localbuild clone cache, so the
-    # next provision rebuilds each template (hermes, etc.) from current source
-    # rather than reusing a stale molecule-local/workspace-template-*:<sha> tag.
+    # Locally-built runtime template images (the whole molecule-local/ namespace is
+    # synthetic local-build output) so the next provision rebuilds each template
+    # from current source rather than reusing a stale :<sha> tag.
     rm_by_filter "template images" "docker images --format '{{.Repository}}:{{.Tag}}'" "^molecule-local/" "docker rmi -f"
-    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/molecule/workspace-template-build" 2>/dev/null || true
+    # Clone/build cache. localbuild.go uses MOLECULE_LOCAL_BUILD_CACHE verbatim when
+    # set, else ${XDG_CACHE_HOME:-$HOME/.cache}/molecule/… , else $TMPDIR/molecule/… —
+    # clear every branch so an operator who set the override (or runs without HOME)
+    # still gets a real clean slate instead of the stale-image trap --fresh exists
+    # to eliminate.
+    for _cache in \
+        "${MOLECULE_LOCAL_BUILD_CACHE:-}" \
+        "${XDG_CACHE_HOME:-$HOME/.cache}/molecule/workspace-template-build" \
+        "${TMPDIR:-/tmp}/molecule/workspace-template-build"; do
+        [ -n "$_cache" ] && rm -rf "$_cache" 2>/dev/null || true
+    done
     echo "    reset complete — re-onboarding from a clean slate"
 }
 
