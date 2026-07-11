@@ -5,6 +5,12 @@ name: PR Diff Guard
 # ~55k deletions). Runs on every PR and fails when configured size or
 # protected-path deletion thresholds are exceeded.
 
+concurrency:
+  # Auto-cancel a superseded run: a newer commit/event supersedes the old
+  # one instead of leaving it queued forever (root fix for waiting-run pileup).
+  # PR events group by PR number; push events group by ref.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 on:
   # The override path needs trusted API credentials to verify who applied the
   # label. Run base-branch code only; never execute the PR's version of the

@@ -8,6 +8,12 @@ name: design-token-drift
 # the shared token set has been green for a week and APP_SSOT_READ_TOKEN is
 # provisioned, promote to required.
 
+concurrency:
+  # Auto-cancel a superseded run: a newer commit/event supersedes the old
+  # one instead of leaving it queued forever (root fix for waiting-run pileup).
+  # PR events group by PR number; push events group by ref.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 on:
   push:
     branches: [main, staging]
