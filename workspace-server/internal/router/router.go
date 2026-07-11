@@ -824,6 +824,12 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		adminAuth := r.Group("", middleware.AdminAuth(db.DB))
 		adminAuth.GET("/admin/plugin-updates-pending", driftH.ListPending)
 		adminAuth.POST("/admin/plugin-updates/:id/apply", driftH.Apply)
+		// fix (c): fragment-merge trigger — the CP fleet fan-out calls this per
+		// tenant so a changed plugin fragment propagates promptly to running
+		// concierges (content-aware reconcile + deliberate restart of the boxes
+		// whose fragment actually moved) instead of waiting for the next
+		// natural online-beat reconcile.
+		adminAuth.POST("/admin/plugin-fragment-changed", driftH.FragmentChanged)
 	}
 
 	// Admin — GitHub App installation token refresh (issue #547).

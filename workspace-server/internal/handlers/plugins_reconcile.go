@@ -255,6 +255,25 @@ func (h *PluginsHandler) pluginFragmentStale(ctx context.Context, sourceRaw, ins
 	return true
 }
 
+// PluginFragmentStaleForWorkspace reports whether a specific installed plugin on
+// a workspace is behind its branch tip. Exported for the fragment-changed
+// trigger (fix (c)), which uses it to decide — BEFORE firing the reconcile
+// (which re-records the SHA) — whether a box's fragment actually moved and so
+// warrants a deliberate restart. Fail-closed to not-stale on any load error,
+// missing row, immutable pin, or unchanged tip (same posture as
+// pluginFragmentStale), so the trigger never restarts a box that didn't change.
+func (h *PluginsHandler) PluginFragmentStaleForWorkspace(ctx context.Context, workspaceID, pluginName string) bool {
+	installed, err := listInstalledPluginRecords(ctx, workspaceID)
+	if err != nil {
+		return false
+	}
+	rec, ok := installed[pluginName]
+	if !ok {
+		return false
+	}
+	return h.pluginFragmentStale(ctx, rec.SourceRaw, rec.InstalledSHA)
+}
+
 // pluginPresentOnBox reports whether the plugin is already installed on the
 // workspace box — e.g. delivered by the runtime-image boot-install
 // (RFC#2843 #32) before this online-transition reconcile runs. Used to skip the
