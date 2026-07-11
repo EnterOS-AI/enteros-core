@@ -221,6 +221,50 @@ func TestRestartByIDAfterMutation_BypassesSelfFireDebounce(t *testing.T) {
 	}
 }
 
+// TestTriggerPlatformProvision_BypassesSelfFireDebounce pins the WIRING of the
+// platform-agent ensure path (the fix for the concierge onboarding race): when a
+// user enters their LLM key ~seconds after a credential-less concierge boot fails,
+// the canvas fires EnsurePlatformAgent -> triggerPlatformProvision. That call MUST
+// route through RestartByIDAfterMutation (bypasses the self-fire debounce), not the
+// plain debounced RestartByID — otherwise the re-provision lands inside the 1m
+// self-fire window of the just-failed attempt and is silently DROPPED, stranding
+// the concierge `failed` until a manual retry.
+//
+// We reproduce the exact race: a cycle is in-flight (running=true, stamped now =
+// inside the debounce window). The mutation variant bypasses the debounce and
+// reaches coalesceRestart, which — seeing running=true — sets pending=true and
+// returns (coalesced, NOT dropped, no heavy cycle). A regression to the debounced
+// RestartByID would instead increment the drop counter and never coalesce.
+func TestTriggerPlatformProvision_BypassesSelfFireDebounce(t *testing.T) {
+	const wsID = "platform-agent-onboarding-race"
+	resetSelfFireState(wsID)
+
+	// In-flight + inside the debounce window (the just-failed credential-less boot).
+	finish := markRestarting(wsID)
+	defer finish()
+
+	h := newSelfFireHandler(t)
+	h.provisioner = &preflightLocalProv{running: true} // HasProvisioner()==true
+	// override left nil so the REAL triggerPlatformProvision body runs — the wiring
+	// under test.
+	h.triggerPlatformProvision(wsID)
+	h.waitAsyncForTest()
+
+	if got := restartByIDDropCounter.Load(); got != 0 {
+		t.Fatalf("onboarding ensure must NOT be dropped by the self-fire debounce "+
+			"(triggerPlatformProvision must use RestartByIDAfterMutation); drop counter=%d", got)
+	}
+	sv, _ := restartStates.Load(wsID)
+	st := sv.(*restartState)
+	st.mu.Lock()
+	pending := st.pending
+	st.mu.Unlock()
+	if !pending {
+		t.Fatal("mutation restart must reach coalesceRestart and set pending=true " +
+			"(coalesced with the in-flight cycle), proving it bypassed the self-fire debounce")
+	}
+}
+
 // TestRestartByID_DebounceExpiresAfterWindow — outside the window, the
 // debounce must release: a legitimate later restart (e.g. user clicked
 // Restart again after waiting) must proceed to coalesceRestart. We
