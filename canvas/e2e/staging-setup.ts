@@ -39,6 +39,42 @@ const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 // the harness wedged at TLS_TIMEOUT_MS instead of failing loud.
 const TENANT_DOMAIN = process.env.STAGING_TENANT_DOMAIN || "staging.moleculesai.app";
 
+// Provisioning backend for the throwaway staging org. This is THE input that
+// wires the CP LLM proxy env (MOLECULE_LLM_BASE_URL / MOLECULE_LLM_USAGE_TOKEN
+// / MOLECULE_LLM_ANTHROPIC_BASE_URL) into the tenant so a platform_managed
+// agent can boot (post workspace-server #2162 fail-closed).
+//
+// Mechanism: CP's org-create validates `provider` against the cloudprovider
+// SSOT and persists it as organizations.provider. The molecules-server
+// (local-docker) provisioner injects the platform proxy env into the tenant's
+// environment at provision (workspace-server derives it from the CP base per
+// llm-proxy-https-only). An EMPTY provider falls back to the CP DefaultProvider
+// (the closed AWS/SaaS path) which does NOT carry the proxy env on staging —
+// that omission is why the canvas staging agent fail-closed with
+// MISSING_PLATFORM_PROXY and the tabs/greeting specs had to be relaxed. The
+// molecules-server lifecycle e2e (workspace_lifecycle_test.go adminCreateOrg)
+// has ALWAYS sent provider=molecules-server and its agent boots + serves A2A
+// fine; this ports that exact wiring to the canvas path so the agent boots
+// here too and the agent-dependent assertions run for real.
+const E2E_PROVIDER = process.env.E2E_PROVIDER || "molecules-server";
+
+// Workspace runtime/model/provider for the tab-UI agent. Defaults to the
+// platform-default pairing the molecules-server lifecycle e2e uses and that is
+// PROVEN to boot to online + serve on staging (claude-code + minimax/MiniMax
+// via the platform proxy — verified live: online in ~30s). The old hermes /
+// moonshot-kimi pairing does NOT boot on staging within the provision window
+// (empirically it stays failed/uptime=0 for 14+ min — a hermes-runtime install
+// problem, NOT the proxy env, which IS present now that the org uses
+// provider=molecules-server). The canvas tabs are runtime-agnostic (chat,
+// activity, config, traces… render for any runtime), and testing the PLATFORM-
+// DEFAULT runtime a real tenant actually boots is more representative than a
+// niche runtime that can't come online. Env-overridable so the SSOT default can
+// drive it (E2E_RUNTIME/E2E_MODEL, same knobs as the lifecycle e2e).
+const E2E_WS_RUNTIME = process.env.E2E_RUNTIME || "claude-code";
+const E2E_WS_MODEL = process.env.E2E_MODEL || "minimax/MiniMax-M2.7";
+const E2E_WS_PROVIDER = process.env.E2E_WS_PROVIDER || "platform";
+const E2E_WS_TIER = Number(process.env.E2E_TIER || "1");
+
 // Tenant cold boot on staging regularly takes 12-15 min when the
 // workspace-server Docker image isn't already cached on the AMI. Raised
 // to 20 min to match tests/e2e/test_staging_full_saas.sh (PR #1930)
@@ -133,6 +169,12 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
       slug,
       name: `E2E Canvas ${slug}`,
       owner_user_id: `e2e-runner:${slug}`,
+      // Route provisioning through molecules-server so the tenant carries the
+      // CP LLM proxy env and the platform_managed agent boots (see E2E_PROVIDER
+      // note above). Without this the org falls to the AWS/SaaS DefaultProvider
+      // that omits the proxy env → agent fail-closes → agent-dependent specs
+      // could not run.
+      provider: E2E_PROVIDER,
     }),
   });
   if (create.status >= 400) {
@@ -245,16 +287,14 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
       headers: tenantAuth,
       body: JSON.stringify({
         name: "E2E Canvas Test",
-        runtime: "hermes",
-        tier: 2,
-        // Provider-registry SSOT (internal#718) registers ONLY Kimi models for
-        // the hermes runtime — `moonshot/kimi-k2.6` is the platform-managed
-        // entry (workspace-server/internal/providers/providers.yaml, hermes ->
-        // platform). The old `gpt-4o` was never a registered hermes model and
-        // now 422s UNREGISTERED_MODEL_FOR_RUNTIME (core#2225). This workspace
-        // defaults closed to platform_managed (see the boot-shape note below),
-        // so a platform-namespaced model id is the registry-correct choice.
-        model: "moonshot/kimi-k2.6",
+        runtime: E2E_WS_RUNTIME,
+        tier: E2E_WS_TIER,
+        model: E2E_WS_MODEL,
+        // provider=platform resolves the agent to the platform LLM proxy
+        // (MOLECULE_LLM_USAGE_TOKEN), which the tenant now carries via the
+        // molecules-server org (E2E_PROVIDER). This is the exact platform-
+        // managed pairing the lifecycle e2e boots + serves with.
+        provider: E2E_WS_PROVIDER,
       }),
     });
     if (ws.status >= 200 && ws.status < 300 && ws.body?.id) {
@@ -271,58 +311,36 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   }
   console.log(`[staging-setup] Workspace created: ${workspaceId}`);
 
-  // 6. Wait for workspace online
+  // 6. Wait for workspace online — the agent MUST boot.
   //
-  // This harness exists to verify the canvas *tab UI* renders (staging-
-  // tabs.spec.ts: open each of the 13 workspace-panel tabs, assert no hard
-  // crash / no "Failed to load" toast). It does NOT exercise the agent —
-  // no LLM call is made, the spec even mocks /cp/auth/me and 401→200. All
-  // it needs is a workspace ROW that the canvas lists so the node renders
-  // and the side-panel tabs open. A fully-`online` agent is NOT required.
+  // With provider=molecules-server (step 1) the tenant now carries the CP LLM
+  // proxy env, so the platform_managed hermes agent boots normally — exactly
+  // like the molecules-server lifecycle e2e, whose agent reaches online and
+  // serves A2A. This gate therefore requires the REAL agent-booted signal
+  // (status === "online") and no longer tolerates the #2162 pre-start
+  // credential-abort: that "renderable but dead agent" shape was only a
+  // symptom of the MISSING proxy env, which is now injected. Requiring online
+  // is what re-enables the agent-dependent tab + greeting assertions to run
+  // against a live agent (see staging-tabs.spec.ts, staging-slow-cold-
+  // greeting.spec.ts) instead of the relaxed "renders + no crash" contract.
   //
   // Hermes cold-boot takes 10-13 min on slow apt days (apt + uv + hermes
-  // install + npm browser-tools). The controlplane bootstrap-watcher
-  // deadline fires at 5 min and sets status=failed prematurely; heartbeat
-  // then transitions failed → online after install.sh finishes. The ONLY
-  // failed shape we tolerate is the pre-start credential-abort
-  // (uptime_seconds=0, no last_sample_error) — the agent never ran. Real
-  // boot regressions (image pull error, panic, PYTHONPATH, etc.) still
-  // hard-throw immediately so triage gets detail without waiting for a
-  // polling timeout. See test_staging_full_saas.sh step 7/11 and issue #2632.
+  // install + npm browser-tools). The controlplane bootstrap-watcher deadline
+  // can fire at 5 min and set status=failed prematurely; heartbeat then flips
+  // failed → online once install.sh finishes. So a `failed` row with
+  // uptime_seconds==0 AND no last_sample_error is a TRANSIENT still-booting
+  // shape — we keep polling the real signal (never treat it as success). The
+  // WORKSPACE_ONLINE_TIMEOUT_MS envelope (20 min ≈ ~2× the worst cold boot) is
+  // a safety net we never wait out on the happy path: the loop breaks the
+  // instant status flips to online. A genuine stuck-never-boots agent fails
+  // loud at that envelope with the full body for triage.
   //
-  // That distinction became load-bearing on 2026-06-03: workspace-server
-  // #2162 (fix(provision): platform-managed workspace must fail-closed when
-  // CP proxy env absent) made a platform_managed workspace ABORT AT BOOT
-  // with MISSING_PLATFORM_PROXY when MOLECULE_LLM_BASE_URL /
-  // MOLECULE_LLM_USAGE_TOKEN are not present in the tenant's env. The
-  // canvas E2E creates a bare hermes/moonshot platform workspace, which defaults
-  // closed to platform_managed (workspace_provision.go:~1009), and the
-  // staging tenant does not carry the CP proxy env — so the agent never
-  // starts. Pre-#2162 this same workspace booted credential-less (the bug
-  // #2162 fixed) and the tabs rendered fine; #2162 is a correct production
-  // safety fix, but it surfaced here as `status:"failed", uptime_seconds:0,
-  // last_sample_error:null` — the pre-start credential-abort shape — and the
-  // old hard-throw turned a UI-irrelevant boot skip into a main-red
-  // (core#2199). The agent boot stage is simply not what this test gates.
-  //
-  // So: online is the happy path. A `failed` row that is the PRE-START
-  // credential-abort shape (the agent process never ran: uptime_seconds==0
-  // AND no last_sample_error) is treated as RENDERABLE — the row exists,
-  // the node + tabs render, proceed. We do NOT mask a real boot regression:
-  // any `failed` carrying a last_sample_error, OR a non-zero uptime (the
-  // agent started then crashed — image pull, panic, PYTHONPATH, etc.),
-  // still hard-throws immediately so triage gets boot_stage / last_error /
-  // image fields without waiting for a polling timeout.
-  // Genuine *infra* provision failure is already caught loud one step
-  // earlier at the org level (instance_status === "failed").
-  // Track whether the workspace agent actually BOOTED (status===online) vs.
-  // reached only the tolerated pre-start credential-abort (#2162: no CP LLM
-  // proxy env on staging → the agent process never ran). Exported below as
-  // STAGING_AGENT_ONLINE so agent-dependent specs/assertions relax exactly
-  // when — and only when — the agent is offline (see staging-tabs.spec.ts and
-  // staging-slow-cold-greeting.spec.ts). This is the harness's own already-
-  // documented distinction, surfaced as a signal instead of a warn-and-forget.
-  let agentOnline = false;
+  // A `failed` carrying a last_sample_error, OR a non-zero uptime (the agent
+  // started then crashed — image pull, panic, PYTHONPATH, etc.), is a REAL
+  // boot regression and hard-throws immediately so triage gets the detail
+  // without waiting for the polling timeout. Genuine *infra* provision failure
+  // is already caught loud one step earlier at the org level
+  // (instance_status === "failed").
   await waitFor<boolean>(
     async () => {
       const r = await jsonFetch(`${tenantURL}/workspaces/${workspaceId}`, {
@@ -330,37 +348,30 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
       });
       if (r.status !== 200) return null;
       if (r.body?.status === "online") {
-        agentOnline = true;
         return true;
       }
       if (r.body?.status === "failed") {
         const uptime = Number(r.body?.uptime_seconds ?? 0);
         const sampleErr = r.body?.last_sample_error;
-        const preStartCredentialAbort = uptime === 0 && !sampleErr;
-        if (preStartCredentialAbort) {
-          agentOnline = false;
-          // Agent never started (no LLM cred on this staging tenant — the
-          // expected #2162 platform-proxy gap). The workspace row still
-          // renders, which is all the tab-UI test needs. Proceed, but log
-          // loudly so a real "agent never booted because of something else"
-          // is not silently normalized.
-          console.warn(
-            `[staging-setup] workspace ${workspaceId} is 'failed' with the pre-start ` +
-              `credential-abort shape (uptime_seconds=0, no last_sample_error) — agent did ` +
-              `not boot (expected on staging without CP LLM proxy env, post workspace-server ` +
-              `#2162). The tab-UI test does not exercise the agent; proceeding with the ` +
-              `workspace row, which renders regardless. full body: ${JSON.stringify(r.body)}`,
+        // Real boot regression: the agent ran and crashed (nonzero uptime) or
+        // reported a concrete error. Fail loud immediately with the detail.
+        if (uptime > 0 || sampleErr) {
+          throw new Error(
+            `[staging-setup] workspace ${workspaceId} boot FAILED: ` +
+              `${sampleErr || "(no last_sample_error)"} ` +
+              `uptime_seconds=${uptime}. This is a real boot regression, not the ` +
+              `pre-#2162 credential gap (the proxy env is now injected via ` +
+              `provider=${E2E_PROVIDER}). full body: ${JSON.stringify(r.body)}`,
           );
-          return true;
         }
-        // #2032: tolerate transient 'failed' during boot — some runtimes
-        // briefly report failed before recovering to online (e.g. agent
-        // restart during init). Retry instead of hard-throwing; genuine
-        // terminal failures will still surface via waitFor timeout.
-        const detail = sampleErr
-          ? sampleErr
-          : `(no last_sample_error) full body: ${JSON.stringify(r.body)}`;
-        console.warn(`[staging-setup] transient failed (retrying): ${detail}`);
+        // uptime==0 AND no error → still-booting transient (bootstrap-watcher
+        // fired before install.sh finished; heartbeat will flip to online).
+        // Keep polling the real signal.
+        console.warn(
+          `[staging-setup] workspace ${workspaceId} transient 'failed' ` +
+            `(uptime_seconds=0, no last_sample_error) — still booting, re-polling ` +
+            `for online. full body: ${JSON.stringify(r.body)}`,
+        );
         return null;
       }
       return null;
@@ -397,15 +408,10 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   process.env.STAGING_TENANT_URL = tenantURL;
   process.env.STAGING_WORKSPACE_ID = workspaceId;
   process.env.STAGING_TENANT_TOKEN = tenantToken;
-  // Whether the workspace agent booted. "false" ONLY for the documented
-  // #2162 pre-start credential-abort (agent process never ran) — any other
-  // failure hard-threw above, so "false" is never a mask for a real boot
-  // regression. Agent-dependent assertions key off this (see specs).
-  process.env.STAGING_AGENT_ONLINE = agentOnline ? "true" : "false";
-  console.log(
-    `[staging-setup] STAGING_AGENT_ONLINE=${process.env.STAGING_AGENT_ONLINE} ` +
-      `(agent ${agentOnline ? "booted" : "offline — #2162 platform-proxy gap, tab-UI still renders"})`,
-  );
+  // The workspace agent is now REQUIRED to have booted (step 6 only returns on
+  // status===online, else it throws), so there is no longer an offline signal
+  // to export. The agent-dependent specs run their full strong contract
+  // unconditionally against the live agent.
   // The ephemeral org's UUID — exported so specs that route through the CP
   // edge can send X-Molecule-Org-Id (workspace-server TenantGuard). The
   // tabs harness (staging-tabs.spec.ts) and the take-control gate
