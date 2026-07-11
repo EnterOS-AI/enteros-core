@@ -51,7 +51,8 @@ Usage: ./scripts/dev-start.sh [--fresh]
               object-store state, and any already-built runtime images.
               Idempotent: safe to re-run.
 
-  --fresh     FULL reset before starting. This is DESTRUCTIVE:
+  --fresh     (aliases: --remove-volumes, -V) FULL reset before starting.
+              This is DESTRUCTIVE:
                 • tears down the compose stack AND its named volumes
                   (WIPES local Postgres / MinIO / Langfuse state and your
                   onboarding config — you re-onboard from scratch);
@@ -70,7 +71,7 @@ USAGE
 
 for arg in "$@"; do
     case "$arg" in
-        --fresh) FRESH=1 ;;
+        --fresh|--remove-volumes|-V) FRESH=1 ;;
         -h|--help) print_usage; exit 0 ;;
         # Fail loud on unknown flags — the whole point of this parser is that a
         # mistyped/unsupported flag (e.g. --fresh before it existed) must NOT be

@@ -45,7 +45,11 @@ function_body() {
 # shellcheck disable=SC2016
 compose_project_line=$(line_of '^COMPOSE_PROJECT_NAME="\$\{COMPOSE_PROJECT_NAME:-molecule-core\}"')
 cleanup_fn_line=$(line_of '^cleanup_dev_stack\(\) \{')
-cleanup_call_line=$(line_of '^echo "==> Cleaning up previous local dev containers"')
+# Unanchored: #3946 moved this echo inside the `if [ "$FRESH" ]; …; else` branch
+# (the non-fresh path), so it is now indented. The ordering invariant it stands
+# for — stale containers are cleaned before dynamic ports are chosen — is
+# unchanged; only its column-0 position moved.
+cleanup_call_line=$(line_of 'Cleaning up previous local dev containers')
 host_cleanup_fn_line=$(line_of '^cleanup_repo_host_processes\(\) \{')
 pick_port_line=$(line_of '^pick_port\(\) \{')
 # shellcheck disable=SC2016
@@ -245,3 +249,26 @@ grep -REq -- '-p 127\.0\.0\.1::6379' "$WORKFLOWS_DIR" \
   || fail "CI workflows should use loopback-bound ephemeral Redis publishes"
 
 echo "PASS: CI docker Postgres/Redis publishes are loopback-bound ephemeral ports"
+
+# --fresh full-reset (opt-in, DESTRUCTIVE): must wipe named volumes AND purge the
+# stale-image trap (locally-built template images + the localbuild clone cache),
+# but ONLY on explicit opt-in. The exit-trap keeping volumes is asserted above
+# (cleanup_dev_stack has no -v); this is its counterpart — the wipe lives in a
+# SEPARATE fresh_reset run once at startup, never on Ctrl-C.
+fresh_body=$(function_body fresh_reset)
+[ -n "$fresh_body" ] || fail "--fresh must be implemented by a fresh_reset function"
+printf '%s\n' "$fresh_body" | grep -Eq -- '(down -v|down --volumes|--volumes|-v( |$))' \
+  || fail "fresh_reset must tear down named volumes (down -v) — the point of --fresh"
+printf '%s\n' "$fresh_body" | grep -Fq 'workspace-template-build' \
+  || fail "fresh_reset must clear the localbuild template-build clone cache (stale-image trap)"
+printf '%s\n' "$fresh_body" | grep -Fq 'molecule-local/' \
+  || fail "fresh_reset must remove locally-built template images so they rebuild from source"
+
+# All three flag spellings arm the same reset; unknown flags must still fail loud
+# (no silent swallow — the original --fresh-was-ignored bug).
+grep -Fq -- '--fresh|--remove-volumes|-V) FRESH=1' "$DEV_START" \
+  || fail "--fresh, --remove-volumes and -V must all set FRESH=1"
+grep -Fq "unknown option '" "$DEV_START" \
+  || fail "arg parser must fail loud on an unknown flag, not silently swallow it"
+
+echo "PASS: dev-start.sh --fresh (aka --remove-volumes/-V) is a full opt-in reset; exit-trap keeps data"
