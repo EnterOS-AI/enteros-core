@@ -19,6 +19,12 @@ name: manifest-entry-existence-check
 #
 # Related: #2183 (incident), #2184 (fix), #2185 (this gate).
 
+concurrency:
+  # Auto-cancel a superseded run: a newer commit/event supersedes the old
+  # one instead of leaving it queued forever (root fix for waiting-run pileup).
+  # PR events group by PR number; push events group by ref.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 on:
   pull_request:
     branches: [main, staging]

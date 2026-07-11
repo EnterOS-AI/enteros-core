@@ -30,6 +30,12 @@ name: Lint workflow YAML (Gitea-1.22.6-hostile shapes)
 # defects are triaged. The push-trigger ensures we catch regressions
 # even if the pull_request gate is bypassed by branch-protection drift.
 
+concurrency:
+  # Auto-cancel a superseded run: a newer commit/event supersedes the old
+  # one instead of leaving it queued forever (root fix for waiting-run pileup).
+  # PR events group by PR number; push events group by ref.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 on:
   pull_request:
     paths:

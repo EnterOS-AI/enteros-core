@@ -62,6 +62,12 @@ name: Staging verify
 #     MOLECULE_STAGING_ADMIN_TOKENS / MOLECULE_STAGING_CP_SHARED_SECRET
 #     are populated.
 
+concurrency:
+  # Auto-cancel a superseded run: a newer commit/event supersedes the old
+  # one instead of leaving it queued forever (root fix for waiting-run pileup).
+  # PR events group by PR number; push events group by ref.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 on:
   # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
 #   push:
