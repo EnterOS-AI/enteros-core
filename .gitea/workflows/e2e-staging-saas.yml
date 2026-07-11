@@ -125,19 +125,17 @@ jobs:
   # paths. pr-validate remains as the lightweight workflow-shape check for PRs,
   # but it is not a substitute for live staging proof when this workflow or the
   # staging harness changes.
-  # bp-exempt: EC2-only full-lifecycle lane, dormant behind vars.E2E_EC2_ENABLED; not a required gate.
+  # bp-exempt: full-lifecycle lane on molecules-server (local-docker); EC2 is a one-line knob (vars.E2E_EC2_ENABLED). Not a required gate.
   e2e-staging-saas:
     name: E2E Staging SaaS
     runs-on: ubuntu-latest
-    # core#3081: gate the slow full-lifecycle job to push/dispatch/cron now
-    # that the workflow's `paths:` filter has been removed (lint-required-no-paths
-    # compliance — see the on: block comment). The pre-#3081 behaviour of firing
-    # on path-matched PRs was an optimization; with the lint's no-paths rule in
-    # force, the equivalent optimization moves to the job's `if:` guard.
-    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
-    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
-    # the molecules-server canvas gate does not fire these AWS-dead jobs.
-    if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+    # UN-PINNED from EC2 onto MOLECULES-SERVER (local-docker, provider='local'):
+    # the job-level `if: vars.E2E_EC2_ENABLED == '1' && (...)` guard is REMOVED so
+    # this provider-agnostic scenario (test_staging_full_saas.sh drives the CP admin
+    # API; the backend is the CP's provider config) runs on push against the working
+    # local-docker backend instead of being EC2-gated-skipped. On pull_request it
+    # self-checks green (E2E_REQUIRE_LIVE=0 + per-step PR gating below). EC2 remains
+    # a one-line knob via the E2E_AWS_LEAK_CHECK provider knob in the env block.
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
@@ -165,10 +163,16 @@ jobs:
       # Gitea Actions secret is left in place until a green run validates this
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates MOLECULE_ADMIN_TOKEN is non-empty.
+      # AWS creds stay wired (empty/unused when the secret is unset + leak=off) so
+      # enabling EC2 is one line — set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets).
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-east-2
-      E2E_AWS_LEAK_CHECK: required
+      # provider knob: default molecules-server (local-docker, leak-check no-op);
+      # set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets, already wired below) to run
+      # the SAME scenario against an EC2-backed staging CP with the leak-check
+      # enforced — one-line enable.
+      E2E_AWS_LEAK_CHECK: ${{ vars.E2E_EC2_ENABLED == '1' && 'required' || 'off' }}
       E2E_AWS_TERMINATE_LEAKS: '1'
       # MiniMax is the PRIMARY LLM auth path post-2026-05-04. Switched
       # from hermes+OpenAI default after #2578 (the staging OpenAI key
@@ -226,11 +230,15 @@ jobs:
       # full mode (this job). Set `off` to skip the ~2x-reprovision cost on an
       # ad-hoc dispatch. The timeout-minutes above is sized for this being on.
       E2E_LIFECYCLE: auto
-      # Fail-closed-on-skip: in CI the harness MUST prove ≥1 full
-      # provision→online→A2A cycle. If it reaches the end having validated
-      # nothing (a future short-circuit / skip path), it exits 5 rather than
-      # reporting a false green. Mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE.
-      E2E_REQUIRE_LIVE: '1'
+      # Fail-closed-on-skip, gated by event (mirrors e2e-staging-concierge-creates-workspace):
+      #   pull_request: 0 → PRs carry no staging creds; the harness runs a bash -n
+      #                  self-check and exit-0s green (the KMS creds-fetch below is
+      #                  push-only, so the token stays empty on PR).
+      #   push / dispatch / schedule: 1 → the harness MUST prove ≥1 full
+      #                  provision→online→A2A cycle live on molecules-server, else it
+      #                  exits 5 rather than reporting a false green. Mirrors CP
+      #                  serving-e2e SERVING_E2E_REQUIRE_LIVE.
+      E2E_REQUIRE_LIVE: ${{ github.event_name == 'pull_request' && '0' || '1' }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -243,12 +251,14 @@ jobs:
       # secrets. Exported to $GITHUB_ENV under the same MOLECULE_ADMIN_TOKEN /
       # E2E_MINIMAX_API_KEY names the verify + run + teardown steps already read.
       #
-      # TRUSTED-REF GATING: this job's job-level `if:` already restricts it to
-      # push / workflow_dispatch / schedule (never pull_request), so the
-      # INFISICAL_CI_* machine-identity secrets can never be reached by an
-      # untrusted-fork PR run.
+      # SECURITY (public repo): the KMS live-creds fetch runs ONLY on push /
+      # workflow_dispatch / schedule — NEVER on pull_request, so the INFISICAL_CI_*
+      # machine-identity secrets can never be reached with forked PR code in the
+      # tree. On pull_request this step is SKIPPED: the token stays empty, the
+      # Verify-admin-token gate exits 0 (PR-mode) and the harness self-checks green.
       - name: Fetch staging secrets from Infisical KMS
         id: kms_staging
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -286,19 +296,34 @@ jobs:
 
       - name: Verify admin token present
         run: |
+          # PR-mode: the KMS creds-fetch above is push-only, so on pull_request the
+          # token is EXPECTED empty and green — the harness runs its bash -n
+          # self-check and exit-0s. A missing token on push/dispatch/schedule stays
+          # a hard error. Leak-check is a no-op on molecules-server (leak=off), so
+          # AWS creds are only required when E2E_EC2_ENABLED=1 pins leak=required.
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "PR-mode (E2E_REQUIRE_LIVE=0): no MOLECULE_ADMIN_TOKEN — harness will self-check (bash -n) and exit 0 green ✓"
+              exit 0
+            fi
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
             exit 2
           fi
-          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
-            if [ -z "${!var:-}" ]; then
-              echo "::error::$var not set — EC2 leak verification cannot run"
-              exit 2
-            fi
-          done
+          if [ "${E2E_AWS_LEAK_CHECK}" = "required" ]; then
+            for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+              if [ -z "${!var:-}" ]; then
+                echo "::error::$var not set — EC2 leak verification (E2E_AWS_LEAK_CHECK=required) cannot run"
+                exit 2
+              fi
+            done
+          fi
           echo "Admin token present ✓"
 
       - name: Verify LLM key present
+        # PR-mode: the LLM keys arrive via the push-only KMS fetch (MiniMax) /
+        # secrets (Anthropic/OpenAI); on pull_request they are empty and this live
+        # preflight is skipped. The harness self-check (bash -n) is the PR gate.
+        if: github.event_name != 'pull_request'
         run: |
           # Per-runtime key check — claude-code uses MiniMax; hermes /
           # codex (operator-dispatched only) use OpenAI. Hard-fail
@@ -343,6 +368,9 @@ jobs:
           echo "LLM key present ✓ (runtime=${E2E_RUNTIME}, key=${required_secret_name}, len=${#required_secret_value})"
 
       - name: CP staging health preflight
+        # PR-mode: no live staging call on PRs (they self-check only). Runs on
+        # push/dispatch/schedule, where the real provision follows.
+        if: github.event_name != 'pull_request'
         run: |
           # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
           # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
@@ -357,11 +385,17 @@ jobs:
       # other 3 completion-gated lanes in a follow-up commit (the file's
       # 5 nearly-identical job blocks are mechanically derivable).
       - name: LLM proxy preflight (DEP-DOWN:staging-llm)
+        # PR-mode: live LLM-proxy probe skipped on PRs (self-check only).
+        if: github.event_name != 'pull_request'
         run: |
           # shellcheck source=lib/llm_proxy_preflight.sh
           source tests/e2e/lib/llm_proxy_preflight.sh
           llm_proxy_preflight
 
+      # No `if:` — on pull_request the harness runs its bash -n self-check
+      # (E2E_REQUIRE_LIVE=0 + empty token) and exit-0s green; on push/dispatch/
+      # schedule it runs the real live journey on molecules-server. Mirrors the
+      # exemplar e2e-staging-concierge-creates-workspace Run step.
       - name: Run full-lifecycle E2E
         id: e2e
         run: bash tests/e2e/test_staging_full_saas.sh
@@ -373,7 +407,8 @@ jobs:
       # cancellation and attempts the delete a second time. The admin
       # DELETE endpoint is idempotent so double-invoking is safe.
       - name: Teardown safety net (runs on cancel/failure)
-        if: always()
+        # PR-mode: never curl live staging from a PR (no token; public repo).
+        if: always() && github.event_name != 'pull_request'
         env:
           # Sourced from Infisical (staging /shared/controlplane-admin) via the
           # "Fetch staging secrets from Infisical KMS" job step above.
@@ -517,10 +552,9 @@ jobs:
       # secrets are also safe here.
       - name: Fetch CF_API_TOKEN + CF_ZONE_ID from Infisical SSOT
         id: cf_staging_dns_creds
-        if: >-
-          github.event_name == 'push' ||
-          github.event_name == 'workflow_dispatch' ||
-          github.event_name == 'schedule'
+        # Flattened to a single physical line: Gitea act_runner may not treat
+        # embedded YAML newlines in a folded `if:` as whitespace (push-path eval risk).
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -624,14 +658,16 @@ jobs:
   # case and exit 0s after a bash -n self-check), and on push/dispatch/cron
   # with E2E_REQUIRE_LIVE=1 (the real staging boot runs and HARD FAILs on
   # missing infra).
-  # bp-exempt: EC2-only, dormant behind vars.E2E_EC2_ENABLED (no cloud backend); not a required gate until re-enabled.
+  # bp-exempt: platform-managed boot lane on molecules-server (local-docker); EC2 is a one-line knob (vars.E2E_EC2_ENABLED). Not a required gate.
   e2e-staging-platform-boot:
     name: E2E Staging Platform Boot
     runs-on: ubuntu-latest
-    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
-    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
-    # the molecules-server canvas gate does not fire this AWS-dead job.
-    if: vars.E2E_EC2_ENABLED == '1'
+    # UN-PINNED from EC2 onto MOLECULES-SERVER (local-docker, provider='local'):
+    # the job-level `if: vars.E2E_EC2_ENABLED == '1'` guard is REMOVED so this
+    # provider-agnostic platform-managed-boot scenario runs on push against the
+    # working local-docker backend instead of being EC2-gated-skipped. On
+    # pull_request it self-checks green (E2E_REQUIRE_LIVE=0 + per-step PR gating).
+    # EC2 remains a one-line knob via the E2E_AWS_LEAK_CHECK provider knob below.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -646,10 +682,16 @@ jobs:
       # green run validates this path (validate-before-delete). On untrusted-fork
       # PRs the KMS fetch is skipped and MOLECULE_ADMIN_TOKEN stays empty; the
       # PR-mode (E2E_REQUIRE_LIVE=0) Verify-admin-token gate exits 0 as before.
+      # AWS creds stay wired (empty/unused when the secret is unset + leak=off) so
+      # enabling EC2 is one line — set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets).
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-east-2
-      E2E_AWS_LEAK_CHECK: required
+      # provider knob: default molecules-server (local-docker, leak-check no-op);
+      # set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets, already wired below) to run
+      # the SAME scenario against an EC2-backed staging CP with the leak-check
+      # enforced — one-line enable.
+      E2E_AWS_LEAK_CHECK: ${{ vars.E2E_EC2_ENABLED == '1' && 'required' || 'off' }}
       E2E_AWS_TERMINATE_LEAKS: '1'
       # The regression combo: claude-code + platform-managed + moonshot/kimi-k2.6.
       # NO E2E_*_API_KEY is set — platform-managed billing is owned by Molecule via
@@ -715,6 +757,12 @@ jobs:
       # Mirrors the trusted-ref gate in mcp-plugin-delivery-contract-drift.yml.
       - name: Fetch platform model+runtime from KMS SSOT
         id: kms_llm_defaults
+        # SECURITY (public repo): the KMS live-creds fetch runs ONLY on push /
+        # workflow_dispatch / schedule — NEVER on pull_request (not even same-repo
+        # PRs), so the INFISICAL_CI_* machine-identity can never be reached with a
+        # PR's code in the tree. On pull_request this step is SKIPPED; the job then
+        # runs the harness PR-mode self-check (E2E_REQUIRE_LIVE=0) and exit-0s green.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -724,6 +772,8 @@ jobs:
           # Trusted-ref gate: only protected-branch push / dispatch / schedule, or
           # a same-repo (non-fork) PR, may read the CI KMS identity. Untrusted-fork
           # PRs skip and fall back to the in-file literals (behavior-identical).
+          # NOTE: the step-level `if:` above already excludes ALL pull_request
+          # events; this inner case is retained as defense-in-depth.
           case "${{ github.event_name }}" in
             push|workflow_dispatch|schedule)
               is_trusted=true
@@ -807,12 +857,16 @@ jobs:
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
             exit 2
           fi
-          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
-            if [ -z "${!var:-}" ]; then
-              echo "::error::$var not set — EC2 leak verification cannot run"
-              exit 2
-            fi
-          done
+          # Leak-check is a no-op on molecules-server (leak=off), so AWS creds are
+          # only required when E2E_EC2_ENABLED=1 pins E2E_AWS_LEAK_CHECK=required.
+          if [ "${E2E_AWS_LEAK_CHECK}" = "required" ]; then
+            for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+              if [ -z "${!var:-}" ]; then
+                echo "::error::$var not set — EC2 leak verification (E2E_AWS_LEAK_CHECK=required) cannot run"
+                exit 2
+              fi
+            done
+          fi
           echo "Admin token present ✓"
 
       - name: Assert NO BYOK key leaks into the platform run
@@ -830,18 +884,25 @@ jobs:
           echo "Platform-managed path: no tenant LLM key required ✓"
 
       - name: CP staging health preflight
+        # PR-mode: no live staging call on PRs (they self-check only). Runs on
+        # push/dispatch/schedule, where the real provision follows.
+        if: github.event_name != 'pull_request'
         run: |
           # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
           # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
           source tests/e2e/lib/cp_health_preflight.sh
           cp_health_preflight "$MOLECULE_CP_URL" "workspace"
 
+      # No `if:` — on pull_request the harness runs its bash -n self-check
+      # (E2E_REQUIRE_LIVE=0 + empty token) and exit-0s green; on push/dispatch/
+      # schedule it runs the real platform-managed boot on molecules-server.
       - name: Run platform-managed boot E2E (online + completion)
         id: e2e
         run: bash tests/e2e/test_staging_full_saas.sh
 
       - name: Teardown safety net (runs on cancel/failure)
-        if: always()
+        # PR-mode: never curl live staging from a PR (no token; public repo).
+        if: always() && github.event_name != 'pull_request'
         env:
           # Sourced from Infisical (staging /shared/controlplane-admin) via the
           # "Fetch platform model+runtime from KMS SSOT" job step above.
@@ -910,10 +971,14 @@ jobs:
   e2e-staging-concierge-user-tasks:
     name: E2E Staging Concierge user_tasks
     runs-on: ubuntu-latest
-    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
-    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
-    # the molecules-server canvas gate does not fire these AWS-dead jobs.
-    if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+    # UN-PINNED from EC2 onto MOLECULES-SERVER (local-docker, provider='local'):
+    # the job-level `if: vars.E2E_EC2_ENABLED == '1' && (...)` guard is REMOVED so
+    # this provider-agnostic scenario (test_staging_concierge_e2e.sh drives the CP
+    # admin API) runs on push against the working local-docker backend instead of
+    # being EC2-gated-skipped. NOTE: this harness has no PR-mode self-check, so on
+    # pull_request the live Run step is gated off and a bash -n self-check step
+    # (below) keeps the job terminal-green. EC2 stays a one-line knob via the
+    # E2E_AWS_LEAK_CHECK provider knob below.
     timeout-minutes: 30
     permissions:
       contents: read
@@ -926,13 +991,24 @@ jobs:
       # Gitea Actions secret is left in place until a green run validates this
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates MOLECULE_ADMIN_TOKEN is non-empty.
+      # AWS creds stay wired (empty/unused when the secret is unset + leak=off) so
+      # enabling EC2 is one line — set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets).
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-east-2
-      E2E_AWS_LEAK_CHECK: required
+      # provider knob: default molecules-server (local-docker, leak-check no-op);
+      # set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets, already wired below) to run
+      # the SAME scenario against an EC2-backed staging CP with the leak-check
+      # enforced — one-line enable.
+      E2E_AWS_LEAK_CHECK: ${{ vars.E2E_EC2_ENABLED == '1' && 'required' || 'off' }}
       E2E_AWS_TERMINATE_LEAKS: '1'
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
+      # PR-aware fail-closed guard (mirrors exemplar). On pull_request the live Run
+      # step is gated off and a bash -n self-check keeps the job green; on push it
+      # runs live. (The concierge_e2e harness itself has no REQUIRE_LIVE handling —
+      # this var documents the invariant and is harmless/unused by the script.)
+      E2E_REQUIRE_LIVE: ${{ github.event_name == 'pull_request' && '0' || '1' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -940,16 +1016,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      # KMS wave-B (Gitea-Actions-secrets -> Infisical SSOT): source the staging
-      # CP admin bearer (CP_ADMIN_API_TOKEN @ staging /shared/controlplane-admin)
-      # from Infisical via the CI machine identity instead of the duplicated
-      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret. Exported to $GITHUB_ENV
-      # under the same MOLECULE_ADMIN_TOKEN name the verify + run + teardown steps
-      # read. This job's job-level `if:` already restricts it to
-      # push / workflow_dispatch / schedule (never pull_request), so the
-      # INFISICAL_CI_* identity is never reachable from an untrusted-fork PR.
+      # SECURITY (public repo): the KMS live-creds fetch runs ONLY on push /
+      # workflow_dispatch / schedule — NEVER on pull_request, so the INFISICAL_CI_*
+      # machine-identity can never be reached with forked PR code in the tree. On
+      # pull_request this step is SKIPPED: the token stays empty, the live Run step
+      # is gated off, and the bash -n self-check step keeps the job terminal-green.
       - name: Fetch staging CP admin token from Infisical KMS
         id: kms_admin
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -978,19 +1052,47 @@ jobs:
 
       - name: Verify admin token + AWS creds present
         run: |
+          # PR-mode: the KMS creds-fetch above is push-only, so on pull_request the
+          # token is EXPECTED empty and green — the live Run step is gated off and
+          # the bash -n self-check step is the PR gate. A missing token on
+          # push/dispatch/schedule stays a hard error.
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "PR-mode: no MOLECULE_ADMIN_TOKEN — live boot gated off; bash -n self-check is the PR gate ✓"
+              exit 0
+            fi
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
             exit 2
           fi
-          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
-            if [ -z "${!var:-}" ]; then
-              echo "::error::$var not set — EC2 leak verification cannot run"
-              exit 2
-            fi
-          done
-          echo "Admin token + AWS creds present ✓"
+          # Leak-check is a no-op on molecules-server (leak=off), so AWS creds are
+          # only required when E2E_EC2_ENABLED=1 pins E2E_AWS_LEAK_CHECK=required.
+          if [ "${E2E_AWS_LEAK_CHECK}" = "required" ]; then
+            for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+              if [ -z "${!var:-}" ]; then
+                echo "::error::$var not set — EC2 leak verification (E2E_AWS_LEAK_CHECK=required) cannot run"
+                exit 2
+              fi
+            done
+          fi
+          echo "Admin token present ✓"
+
+      # PR-mode self-check: the concierge_e2e harness hard-fails on an empty
+      # MOLECULE_ADMIN_TOKEN (no built-in PR-mode), so on pull_request we do NOT run
+      # it live. This bash -n step is the PR gate — it proves the harness is
+      # syntactically clean and exit-0s green. The real live journey runs on
+      # push/dispatch/schedule via the gated Run step below.
+      - name: PR-mode self-check (bash -n)
+        if: github.event_name == 'pull_request'
+        run: |
+          if ! bash -n tests/e2e/test_staging_concierge_e2e.sh; then
+            echo "::error::PR-mode self-check FAILED: bash -n on test_staging_concierge_e2e.sh returned non-zero — script has a syntax error"
+            exit 1
+          fi
+          echo "PR-mode self-check PASSED: test_staging_concierge_e2e.sh is bash-clean (live journey runs on push-to-main) ✓"
 
       - name: CP staging health preflight
+        # PR-mode: no live staging call on PRs (self-check only).
+        if: github.event_name != 'pull_request'
         run: |
           # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
           # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
@@ -998,10 +1100,14 @@ jobs:
           cp_health_preflight "$MOLECULE_CP_URL" "workspace"
 
       - name: Run concierge user_tasks E2E
+        # PR-mode: gated off (harness hard-fails on empty token); the bash -n
+        # self-check above is the PR gate. Runs live on push/dispatch/schedule.
+        if: github.event_name != 'pull_request'
         run: bash tests/e2e/test_staging_concierge_e2e.sh
 
       - name: Teardown safety net (runs on cancel/failure)
-        if: always()
+        # PR-mode: never curl live staging from a PR (no token; public repo).
+        if: always() && github.event_name != 'pull_request'
         env:
           # Sourced from Infisical (staging /shared/controlplane-admin) via the
           # "Fetch staging CP admin token from Infisical KMS" job step above.
@@ -1064,10 +1170,14 @@ jobs:
   e2e-staging-workspace-requests:
     name: E2E Staging Workspace Requests (core#2606)
     runs-on: ubuntu-latest
-    # EC2-only job — DORMANT until a cloud backend returns. Gate behind the
-    # E2E_EC2_ENABLED repo var (unset → skip) so re-enabling push/pull_request for
-    # the molecules-server canvas gate does not fire these AWS-dead jobs.
-    if: vars.E2E_EC2_ENABLED == '1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+    # UN-PINNED from EC2 onto MOLECULES-SERVER (local-docker, provider='local'):
+    # the job-level `if: vars.E2E_EC2_ENABLED == '1' && (...)` guard is REMOVED so
+    # this provider-agnostic Go staginge2e (drives the CP admin API) runs on push
+    # against the working local-docker backend instead of being EC2-gated-skipped.
+    # This job has NO AWS creds and no leak-check (nothing to un-pin there). On
+    # pull_request the KMS fetch is skipped → CP_ADMIN_API_TOKEN empty →
+    # requireStagingEnv t.Skips LOUD (go test exit 0, green) — a compile+skip that
+    # keeps the job terminal-green; the live run happens on push/dispatch/schedule.
     timeout-minutes: 35
     permissions:
       contents: read
@@ -1088,16 +1198,14 @@ jobs:
           go-version: 'stable'
           cache: false
           cache-dependency-path: workspace-server/go.sum
-      # KMS wave-B (Gitea-Actions-secrets -> Infisical SSOT): source the staging
-      # CP admin bearer (CP_ADMIN_API_TOKEN @ staging /shared/controlplane-admin)
-      # from Infisical via the CI machine identity instead of the duplicated
-      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret. Exported to $GITHUB_ENV
-      # under the same CP_ADMIN_API_TOKEN name the verify + test steps read. This
-      # job's job-level `if:` already restricts it to push / workflow_dispatch /
-      # schedule (never pull_request), so the INFISICAL_CI_* identity is never
-      # reachable from an untrusted-fork PR.
+      # SECURITY (public repo): the KMS live-creds fetch runs ONLY on push /
+      # workflow_dispatch / schedule — NEVER on pull_request, so the INFISICAL_CI_*
+      # machine-identity can never be reached with forked PR code in the tree. On
+      # pull_request this step is SKIPPED: CP_ADMIN_API_TOKEN stays empty and
+      # requireStagingEnv t.Skips the go test LOUD (exit 0, green compile+skip).
       - name: Fetch staging CP admin token from Infisical KMS
         id: kms_admin
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -1125,17 +1233,30 @@ jobs:
           echo "CP_ADMIN_API_TOKEN loaded from Infisical staging SSOT (len=${#CP_ADMIN_API_TOKEN})"
       - name: Verify admin token present
         run: |
+          # PR-mode: the KMS creds-fetch above is push-only, so on pull_request the
+          # token is EXPECTED empty and green — requireStagingEnv t.Skips the go
+          # test LOUD (compile+skip). A missing token on push/dispatch/schedule
+          # stays a hard error.
           if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "PR-mode: no CP_ADMIN_API_TOKEN — go test will requireStagingEnv-skip LOUD (compile+skip, exit 0 green) ✓"
+              exit 0
+            fi
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
             exit 2
           fi
           echo "Admin token present"
       - name: CP staging health preflight
+        # PR-mode: no live staging call on PRs (the go test self-skips green).
+        if: github.event_name != 'pull_request'
         run: |
           # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
           # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
           source tests/e2e/lib/cp_health_preflight.sh
           cp_health_preflight "$CP_BASE_URL" "workspace-requests"
+      # No `if:` — on pull_request CP_ADMIN_API_TOKEN is empty so requireStagingEnv
+      # t.Skips LOUD (go test compiles then exit-0s green); on push/dispatch/
+      # schedule it runs the real live journey on molecules-server.
       - name: Run workspace-requests staginge2e (core#2606)
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceCanRaiseTaskAndApprovalToUser -count=1 -v -timeout 30m
@@ -1265,10 +1386,9 @@ jobs:
       # the harness self-checks (bash -n) and exit-0s green.
       - name: Fetch staging secrets from Infisical KMS
         id: kms_staging
-        if: >-
-          github.event_name == 'push' ||
-          github.event_name == 'workflow_dispatch' ||
-          github.event_name == 'schedule'
+        # Flattened to a single physical line: Gitea act_runner may not treat
+        # embedded YAML newlines in a folded `if:` as whitespace (push-path eval risk).
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -1346,7 +1466,10 @@ jobs:
         run: bash tests/e2e/test_staging_concierge_creates_workspace_e2e.sh
 
       - name: Teardown safety net (runs on cancel/failure)
-        if: always()
+        # PR-mode: never curl live staging from a PR (the KMS fetch is push-only, so
+        # ADMIN_TOKEN is empty on PR and this would otherwise send an unauthenticated
+        # request to the live staging CP). Zero live-staging traffic from a PR.
+        if: always() && github.event_name != 'pull_request'
         env:
           # Sourced from Infisical (staging /shared/controlplane-admin) via the
           # "Fetch staging secrets from Infisical KMS" job step above.
@@ -1470,10 +1593,13 @@ jobs:
     # in required-contexts.txt is the sequenced follow-up (task step 4): add a
     # pull_request cheap-green PR-mode leg + the enforced entry only AFTER a
     # green, non-flaky live run is verified.
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'schedule'
+    # UN-PINNED: the job-level push-only `if:` is REMOVED (was folded, now
+    # converted the same way as the un-pinned scenarios) so the job also runs on
+    # pull_request. On PR the KMS fetch is skipped → CP_ADMIN_API_TOKEN empty →
+    # requireStagingEnv t.Skips LOUD (go test compile+skip, exit 0 green); the live
+    # run stays on push/dispatch/schedule. The sibling e2e-staging-concierge-compile
+    # -skip already owns a redundant PR compile of the same tests, so this is a
+    # cheap green on PR.
     timeout-minutes: 40
     permissions:
       contents: read
@@ -1500,16 +1626,14 @@ jobs:
           # go-arch-lint "without types"). Fleet sweep after the cp ci.yml find.
           cache: false
           cache-dependency-path: workspace-server/go.sum
-      # KMS wave-B (Gitea-Actions-secrets -> Infisical SSOT): source the staging
-      # CP admin bearer (CP_ADMIN_API_TOKEN @ staging /shared/controlplane-admin)
-      # from Infisical via the CI machine identity instead of the duplicated
-      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret. Exported to $GITHUB_ENV
-      # under the same CP_ADMIN_API_TOKEN name the verify + test steps read. This
-      # job's job-level `if:` already restricts it to push / workflow_dispatch /
-      # schedule (never pull_request), so the INFISICAL_CI_* identity is never
-      # reachable from an untrusted-fork PR.
+      # SECURITY (public repo): the KMS live-creds fetch runs ONLY on push /
+      # workflow_dispatch / schedule — NEVER on pull_request, so the INFISICAL_CI_*
+      # machine-identity can never be reached with forked PR code in the tree. On
+      # pull_request this step is SKIPPED: CP_ADMIN_API_TOKEN stays empty and
+      # requireStagingEnv t.Skips the go tests LOUD (exit 0, green compile+skip).
       - name: Fetch staging CP admin token from Infisical KMS
         id: kms_admin
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -1537,17 +1661,30 @@ jobs:
           echo "CP_ADMIN_API_TOKEN loaded from Infisical staging SSOT (len=${#CP_ADMIN_API_TOKEN})"
       - name: Verify admin token present
         run: |
+          # PR-mode: the KMS creds-fetch above is push-only, so on pull_request the
+          # token is EXPECTED empty and green — requireStagingEnv t.Skips the go
+          # tests LOUD (compile+skip). A missing token on push/dispatch/schedule
+          # stays a hard error.
           if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "PR-mode: no CP_ADMIN_API_TOKEN — go tests will requireStagingEnv-skip LOUD (compile+skip, exit 0 green) ✓"
+              exit 0
+            fi
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
             exit 2
           fi
           echo "Admin token present"
       - name: CP staging health preflight
+        # PR-mode: no live staging call on PRs (the go tests self-skip green).
+        if: github.event_name != 'pull_request'
         run: |
           # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
           # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
           source tests/e2e/lib/cp_health_preflight.sh
           cp_health_preflight "$CP_BASE_URL" "concierge"
+      # No `if:` — on pull_request CP_ADMIN_API_TOKEN is empty so requireStagingEnv
+      # t.Skips LOUD (go test compiles then exit-0s green); live on push/dispatch/
+      # schedule.
       - name: Run concierge/platform-agent staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestConciergePlatformAgent_Staging -count=1 -v -timeout 35m
@@ -1594,11 +1731,12 @@ jobs:
     # install rides docker CopyToContainer into the mol-ws-* container, NOT the
     # AWS EIC path. This job was previously EC2-dormant (E2E_EC2_ENABLED) which
     # is exactly why the local-docker plugin-install 502 (core#182) reached prod
-    # uncaught. Runs on push-to-main / dispatch / cron (never pull_request, where
-    # the KMS token fetch is skipped and the admin-token verify would exit 2);
-    # requireStagingEnv skips LOUD if creds are absent. Mirrors the live
-    # molecules-server gate e2e-staging-concierge-creates-workspace.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    # uncaught. UN-PINNED: the job-level push-only `if:` is REMOVED (converted the
+    # same way as the un-pinned scenarios) so the job also runs on pull_request. On
+    # PR the KMS token fetch is skipped → CP_ADMIN_API_TOKEN empty →
+    # requireStagingEnv skips LOUD (go test compile+skip, exit 0 green); the live
+    # run stays on push/dispatch/schedule. Mirrors the live molecules-server gate
+    # e2e-staging-concierge-creates-workspace.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -1622,16 +1760,14 @@ jobs:
           # actions/cache corrupts it.
           cache: false
           cache-dependency-path: workspace-server/go.sum
-      # KMS wave-B (Gitea-Actions-secrets -> Infisical SSOT): source the staging
-      # CP admin bearer (CP_ADMIN_API_TOKEN @ staging /shared/controlplane-admin)
-      # from Infisical via the CI machine identity instead of the duplicated
-      # CP_STAGING_ADMIN_API_TOKEN Gitea Actions secret. Exported to $GITHUB_ENV
-      # under the same CP_ADMIN_API_TOKEN name the verify + test steps read. This
-      # job's job-level `if:` already restricts it to push / workflow_dispatch /
-      # schedule (never pull_request), so the INFISICAL_CI_* identity is never
-      # reachable from an untrusted-fork PR.
+      # SECURITY (public repo): the KMS live-creds fetch runs ONLY on push /
+      # workflow_dispatch / schedule — NEVER on pull_request, so the INFISICAL_CI_*
+      # machine-identity can never be reached with forked PR code in the tree. On
+      # pull_request this step is SKIPPED: CP_ADMIN_API_TOKEN stays empty and
+      # requireStagingEnv t.Skips the go test LOUD (exit 0, green compile+skip).
       - name: Fetch staging CP admin token from Infisical KMS
         id: kms_admin
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -1659,17 +1795,30 @@ jobs:
           echo "CP_ADMIN_API_TOKEN loaded from Infisical staging SSOT (len=${#CP_ADMIN_API_TOKEN})"
       - name: Verify admin token present
         run: |
+          # PR-mode: the KMS creds-fetch above is push-only, so on pull_request the
+          # token is EXPECTED empty and green — requireStagingEnv t.Skips the go
+          # test LOUD (compile+skip). A missing token on push/dispatch/schedule
+          # stays a hard error.
           if [ -z "$CP_ADMIN_API_TOKEN" ]; then
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "PR-mode: no CP_ADMIN_API_TOKEN — go test will requireStagingEnv-skip LOUD (compile+skip, exit 0 green) ✓"
+              exit 0
+            fi
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
             exit 2
           fi
           echo "Admin token present"
       - name: CP staging health preflight
+        # PR-mode: no live staging call on PRs (the go test self-skips green).
+        if: github.event_name != 'pull_request'
         run: |
           # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
           # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).
           source tests/e2e/lib/cp_health_preflight.sh
           cp_health_preflight "$CP_BASE_URL" "plugin-lifecycle"
+      # No `if:` — on pull_request CP_ADMIN_API_TOKEN is empty so requireStagingEnv
+      # t.Skips LOUD (go test compiles then exit-0s green); live on push/dispatch/
+      # schedule.
       - name: Run plugin-install-lifecycle staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 55m
