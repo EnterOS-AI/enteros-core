@@ -179,11 +179,9 @@ jobs:
       E2E_PROVIDER: molecules-server
       STAGING_E2E: '1'
       GATE_FORCE_FAIL: ${{ vars.STAGING_TENANT_CD_FORCE_GATE_FAIL }}
-      # Guard B (fresh-org platform-agent CALLABLE gate). The default runtime the
-      # fresh concierge MUST be on — Hermes is the product default, so a
-      # default-flip skew is caught, not silently passed. Override via the repo
-      # var if the platform default ever changes (de-hardcoded).
-      E2E_DEFAULT_RUNTIME: ${{ vars.MOLECULE_DEFAULT_RUNTIME || 'hermes' }}
+      # E2E_DEFAULT_RUNTIME is exported by the Infisical step below from the same
+      # optional /shared/controlplane selector the deployed CP consumes. When the
+      # selector is absent, both CP and this gate use the Hermes product fallback.
       # Require the REAL A2A tool-use turn (drive the concierge to actually RUN
       # provision_workspace and assert the created workspace appears) — not
       # presence-only. This is the deep "callable" proof that catches a
@@ -217,12 +215,15 @@ jobs:
         run: |
           set -uo pipefail
           BASE="https://key.moleculesai.app"
-          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+          # Cloudflare rejects some default client signatures; use the platform's
+          # canonical accepted User-Agent on every Infisical request.
+          TOK=$(curl -fsS -A curl/8.4.0 -X POST "$BASE/api/v1/auth/universal-auth/login" \
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
             | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
           if [ -z "$TOK" ]; then echo "::error::Infisical accessToken empty - failing closed"; exit 1; fi
-          CP_ADMIN_API_TOKEN=$(curl -fsS "$BASE/api/v3/secrets/raw/CP_ADMIN_API_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fcontrolplane-admin" \
+          echo "::add-mask::$TOK"
+          CP_ADMIN_API_TOKEN=$(curl -fsS -A curl/8.4.0 "$BASE/api/v3/secrets/raw/CP_ADMIN_API_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fcontrolplane-admin" \
             -H "Authorization: Bearer $TOK" \
             | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
           echo "::add-mask::$CP_ADMIN_API_TOKEN"
@@ -230,8 +231,40 @@ jobs:
             echo "::error::Infisical returned empty CP_ADMIN_API_TOKEN at staging /shared/controlplane-admin — failing closed."
             exit 1
           fi
+
+          # Resolve the expected concierge runtime from the same optional KMS
+          # selector the control plane consumes. A missing secret means the
+          # compiled Hermes product fallback; transport/auth/server failures are
+          # not equivalent to "unset" and fail the deploy gate closed.
+          runtime_body=$(mktemp)
+          trap 'rm -f "$runtime_body"' EXIT
+          runtime_status=$(curl -sS -A curl/8.4.0 -o "$runtime_body" -w "%{http_code}" \
+            "$BASE/api/v3/secrets/raw/MOLECULE_DEFAULT_RUNTIME?workspaceId=$INFISICAL_PROJECT_ID&environment=staging&secretPath=%2Fshared%2Fcontrolplane" \
+            -H "Authorization: Bearer $TOK")
+          case "$runtime_status" in
+            200)
+              MOLECULE_DEFAULT_RUNTIME=$(python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v.strip() if isinstance(v,str) else "")' < "$runtime_body")
+              if [ -z "$MOLECULE_DEFAULT_RUNTIME" ]; then
+                echo "::error::Infisical returned an empty MOLECULE_DEFAULT_RUNTIME value at staging /shared/controlplane — failing closed."
+                exit 1
+              fi
+              ;;
+            404)
+              MOLECULE_DEFAULT_RUNTIME=""
+              ;;
+            *)
+              echo "::error::Infisical MOLECULE_DEFAULT_RUNTIME lookup returned HTTP $runtime_status — failing closed."
+              exit 1
+              ;;
+          esac
+
+          E2E_DEFAULT_RUNTIME="${MOLECULE_DEFAULT_RUNTIME:-hermes}"
           echo "CP_ADMIN_API_TOKEN=$CP_ADMIN_API_TOKEN" >> "$GITHUB_ENV"
+          echo "E2E_DEFAULT_RUNTIME=$E2E_DEFAULT_RUNTIME" >> "$GITHUB_ENV"
           echo "CP_ADMIN_API_TOKEN loaded from Infisical staging SSOT (len=${#CP_ADMIN_API_TOKEN})"
+          echo "Expected concierge runtime resolved from Infisical staging SSOT: $E2E_DEFAULT_RUNTIME"
+          rm -f "$runtime_body"
+          trap - EXIT
       - name: CP staging health preflight
         run: |
           code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$CP_BASE_URL/health")
@@ -253,7 +286,7 @@ jobs:
         working-directory: workspace-server
         # TestWorkspaceLifecycle_Staging: a workspace serves A2A across restart/pause/hibernate.
         # TestPlatformAgentMgmtMCP_Staging (Guard B): a FRESH org's platform agent reaches online on
-        #   the EXPECTED default runtime (openclaw — E2E_DEFAULT_RUNTIME) WITH its management MCP
+        #   the EXPECTED default runtime (E2E_DEFAULT_RUNTIME) WITH its management MCP
         #   present AND — because E2E_ASSERT_MGMT_MCP_CALLABLE=1 — a REAL A2A tool-use turn drives it
         #   to actually RUN provision_workspace and a genuine kind='workspace' row appears (genuinely
         #   CALLABLE, not presence-only). The lifecycle test only exercises a PLAIN workspace (no
