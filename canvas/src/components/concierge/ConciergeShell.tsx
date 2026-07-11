@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCanvasStore, type TopView } from "@/store/canvas";
 import { WORKSPACE_KIND } from "@/lib/workspace-kind";
+import { WORKSPACE_STATUS } from "@/lib/workspace-status";
 import { useTheme } from "@/lib/theme-provider";
 import { api, PLATFORM_URL } from "@/lib/api";
 import { switchOrgUrl } from "@/lib/org-switch";
@@ -13,6 +14,7 @@ import { CommunicationOverlay } from "@/components/CommunicationOverlay";
 import { MessageFlightHome } from "./MessageFlightHome";
 import { ChatTab } from "@/components/tabs/ChatTab";
 import { WorkspacePanelTabs } from "@/components/WorkspacePanelTabs";
+import { BootSequenceScreen } from "@/components/BootSequenceScreen";
 import { SettingsTabs } from "@/components/settings";
 import s from "./Concierge.module.css";
 import ms from "@/components/monitor/Monitor.module.css";
@@ -326,6 +328,21 @@ export function ConciergeShell() {
         )}
       </div>
     );
+  }
+
+  // Enter OS boot sequence — while the org concierge (the platform root) is
+  // still `provisioning`, show the fullscreen boot sequence (design: boot
+  // steps → ENTER → concierge chat). BootSequenceScreen was previously wired
+  // ONLY into WorkspacePanelTabs (map workspaces); the concierge renders
+  // through this shell and is excluded from the org map (Toolbar kind-filter),
+  // so it needs its own hook here. Falls through to the normal shell the
+  // moment the root reports online — the runtime POSTs one BOOT_STEP per phase
+  // to /workspaces/:id/boot-event, which the screen animates as keycaps.
+  if (
+    platformRoot &&
+    platformRoot.data.status === WORKSPACE_STATUS.Provisioning
+  ) {
+    return <BootSequenceScreen node={platformRoot} />;
   }
 
   return (
