@@ -127,7 +127,14 @@ func (h *TerminalHandler) HandleDiagnose(c *gin.Context) {
 	}
 
 	var res diagnoseResult
-	if instanceID != "" {
+	// Shape-route on the EC2-vs-local BACKEND, not on instance_id presence.
+	// The local-docker (molecules-server) provisioner persists the CONTAINER
+	// NAME (mol-ws-<slug>-<hex>) into instance_id — non-empty but NOT an
+	// i--prefixed EC2 id — so a raw `!= ""` check wrongly sent every
+	// local-docker workspace down the EIC/ssh path and broke canvas terminal
+	// diagnose on molecules-server. Mirror the Files API fix (#2999): branch
+	// on isEC2InstanceID so local-docker workspaces get diagnoseLocal.
+	if isEC2InstanceID(instanceID) {
 		res = h.diagnoseRemote(ctx, workspaceID, instanceID)
 	} else {
 		res = h.diagnoseLocal(ctx, workspaceID)
