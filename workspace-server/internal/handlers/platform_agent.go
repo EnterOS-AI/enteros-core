@@ -839,12 +839,11 @@ func (h *WorkspaceHandler) ensureConciergeModel(ctx context.Context, workspaceID
 		return
 	}
 
-	// Seed the container env (precedence MOLECULE_MODEL > MODEL in the runtime).
 	// applyRuntimeModelEnv already ran with an empty payload model for the
-	// concierge (no stored MODEL on first boot), so set both canonical names
-	// here so this provision actually runs the seeded default.
-	envVars["MOLECULE_MODEL"] = model
-	envVars["MODEL"] = model
+	// concierge (no stored MODEL on first boot). Run the shared mapper again now
+	// that the model is resolved so this provision gets both canonical names and
+	// any runtime-specific contract (for example HERMES_DEFAULT_MODEL).
+	applyRuntimeModelEnv(envVars, runtime, model)
 
 	// Persist so GET /workspaces/:id/model returns it (Config tab visibility) and
 	// the next provision's readStoredModelSecret takes the respect-existing path.
@@ -903,12 +902,10 @@ func (h *WorkspaceHandler) reconcileExistingConciergeModel(ctx context.Context, 
 		log.Printf("Provisioner: concierge %s SSOT model %q has no derivable registry provider for runtime %q (%s) — keeping current %q", workspaceID, resolved, runtime, why, existing)
 		return
 	}
-	// Overwrite the frozen platform default to the SSOT. Update BOTH canonical env
-	// names (applyRuntimeModelEnv set them to the OLD value) so the new default
-	// takes effect THIS provision and a stale MOLECULE_MODEL can never out-rank the
-	// fresh MODEL (runtime precedence is MOLECULE_MODEL > MODEL — the split fix).
-	envVars["MODEL"] = resolved
-	envVars["MOLECULE_MODEL"] = resolved
+	// Overwrite the frozen platform default to the SSOT. Re-run the shared mapper
+	// so BOTH canonical names and any runtime-specific name that still carries the
+	// old model are updated for this provision.
+	applyRuntimeModelEnv(envVars, runtime, resolved)
 	if setErr := setModelSecret(ctx, workspaceID, resolved); setErr != nil {
 		log.Printf("Provisioner: concierge %s persist reconciled MODEL secret failed: %v (env still updated for this provision)", workspaceID, setErr)
 	} else {
