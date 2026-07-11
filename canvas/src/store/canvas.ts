@@ -170,7 +170,7 @@ export interface BootStep {
   step: number;
   /** Total steps in the boot plan (>= step). */
   total: number;
-  /** Short keycap legend, e.g. "PWR" / "RT" / "MCP". */
+  /** Short keycap legend, e.g. "PLG" / "RT" / "MCP" (see DEFAULT_BOOT_PLAN). */
   key: string;
   /** Human-readable step name. */
   label: string;

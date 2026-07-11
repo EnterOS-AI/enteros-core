@@ -30,18 +30,26 @@ import { WORKSPACE_STATUS } from "@/lib/workspace-status";
  */
 
 /** Default ordered boot plan — the sensible fallback keycap set when the
- *  runtime hasn't emitted BOOT_STEP events yet (indeterminate boot) and the
- *  reference ordering the runtime emitter should follow. `key` is the short
- *  keycap legend; `label` the human name. */
+ *  runtime hasn't emitted BOOT_STEP events yet (indeterminate boot).
+ *
+ *  SSOT: this MUST byte-mirror the runtime's emit_boot_step call sites
+ *  (molecule-ai-workspace-runtime molecule_runtime/main.py) in wall-clock
+ *  order — same `key`, same `label`, same 1..8 index. The runtime is the
+ *  canonical source (each step fires at the real boot phase); this array is
+ *  the pre-events fallback + the per-index placeholder legend the streaming
+ *  path falls back on (see `keys` useMemo below). A drift between the two
+ *  means a placeholder keycap renders a DIFFERENT legend than the step that
+ *  later lands on it, so keep them aligned. `key` is the short keycap legend;
+ *  `label` the human name. */
 const DEFAULT_BOOT_PLAN: { key: string; label: string }[] = [
-  { key: "PWR", label: "Provision compute" },
-  { key: "RT", label: "Start runtime" },
-  { key: "A2A", label: "Wire transport" },
   { key: "PLG", label: "Install plugins" },
   { key: "ID", label: "Load identity" },
-  { key: "MCP", label: "Connect management MCP" },
+  { key: "RT", label: "Start runtime" },
+  { key: "MCP", label: "Management MCP" },
   { key: "TOOL", label: "Enumerate tools" },
-  { key: "NET", label: "Go online" },
+  { key: "A2A", label: "Wire transport" },
+  { key: "NET", label: "Register" },
+  { key: "ONLINE", label: "Go online" },
 ];
 
 /** A single log line rendered in the watchdog terminal. */
