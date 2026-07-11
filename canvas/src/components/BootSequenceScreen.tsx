@@ -168,9 +168,11 @@ export function BootSequenceScreen({ node }: Props) {
     if (additions.length > 0) setLog((prev) => [...prev, ...additions]);
   }, [haveEvents, bootSteps]);
 
-  // Auto-scroll the log to the newest line.
+  // Auto-scroll the log to the newest line. `scrollIntoView` is optional-called
+  // because it is not implemented in every environment (jsdom, some embedded
+  // webviews) — a missing method must not crash the boot screen.
   useEffect(() => {
-    logEndRef.current?.scrollIntoView({ block: "nearest" });
+    logEndRef.current?.scrollIntoView?.({ block: "nearest" });
   }, [log]);
 
   // ── ENTER OS strike → fade ─────────────────────────────────────────────

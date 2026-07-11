@@ -913,7 +913,9 @@ describe("derived-state resume", () => {
     render(<SelfHostSetupScene />);
     await flush();
     expect(screen.getByTestId("scene-progress")).toBeTruthy();
-    expect(scene().textContent).toContain("Setting up");
+    // The watching view now hands off to the Enter OS boot sequence (keycaps +
+    // watchdog log) rather than a bare "Setting up" spinner card.
+    expect(scene().textContent).toContain("Booting");
   });
 
   it("root failed → resumes into the humanized error view; Adjust setup restarts the form", async () => {
