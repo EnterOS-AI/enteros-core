@@ -184,15 +184,28 @@ func decideEnsureAction(derivedID, existingID, existingStatus string, existingFo
 var ensureInstallFn = installPlatformAgent
 
 // triggerPlatformProvision fires the async workspace provision for the platform
-// agent via the SAME RestartByID path the boot-seed + admin restart use (serves
-// both the local Docker and CP/EC2 backends; debounced/coalesced so a
-// double-trigger is safe). provisionTriggerOverride is set only in tests.
+// agent (serves both the local Docker and CP/EC2 backends). provisionTrigger-
+// Override is set only in tests.
+//
+// It routes through RestartByIDAfterMutation — the MUTATION variant that bypasses
+// RestartByID's self-fire debounce — because EnsurePlatformAgent only fires this
+// when the concierge's provisioning inputs have DELIBERATELY changed (onboarding
+// key/model entry, admin repair, boot-seed): an explicit state change the failed
+// container can only pick up on a reprovision, which is exactly what the mutation
+// variant is for. The plain RestartByID path (used here previously) would DROP the
+// re-provision if a just-failed attempt was within the 1m self-fire debounce
+// window — the onboarding race where a user enters their LLM key ~seconds after
+// the credential-less boot fails, the ensure fires, and the debounce silently
+// swallows it, leaving the concierge stuck `failed` until a manual retry. The
+// self-fire debounce protection is for reactive health-probe loops
+// (maybeMarkContainerDead / preflightContainerHealth), not for config-driven
+// ensures; coalescing (preserved by the mutation variant) still bounds thrash.
 func (h *WorkspaceHandler) triggerPlatformProvision(id string) {
 	if h.provisionTriggerOverride != nil {
 		h.provisionTriggerOverride(id)
 		return
 	}
-	h.goAsync(func() { h.RestartByID(id) })
+	h.goAsync(func() { h.RestartByIDAfterMutation(id) })
 }
 
 // reviveRemovedPlatformAgent clears the 'removed' tombstone on the platform-agent
