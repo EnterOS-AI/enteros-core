@@ -18,10 +18,12 @@
 #                                     fallback). This is exactly the half-wired-
 #                                     tenant break controlplane#1012 fixes.
 #   STEP 3  PLATFORM AGENT APPEARS    the concierge auto-installs; assert it is
-#                                     present + online. The loaded_mcp_tools
-#                                     inventory is ADVISORY (skip, not gate) until
-#                                     the runtime#181 heartbeat producer lands — it
-#                                     does NOT gate the created-agent auth check.
+#                                     present + online, then HARD-GATE its
+#                                     loaded_mcp_tools inventory (poll-then-fail):
+#                                     it MUST report provision_workspace or the
+#                                     gate fails. runtime#181 heartbeat producer
+#                                     landed 2026-06-25. Defense-in-depth ON TOP OF
+#                                     the created-agent auth check (both must hold).
 #   STEP 4  CREATE A TEAM             drive a real A2A message (MiniMax) asking the
 #                                     concierge to create a team member; assert the
 #                                     DETERMINISTIC side effect — the workspace
@@ -68,8 +70,9 @@
 #
 # The old step 4.5 asked the LLM to SELF-REPORT its tool list; that flaked because
 # the LLM can omit provision_workspace even when the tool is loaded. This version
-# removes that probe and relies on the real side-effect plus an optional
-# `loaded_mcp_tools` inventory guard (core#3082) once the runtime producer lands.
+# removes that probe and relies on the real side-effect PLUS a HARD-GATE
+# `loaded_mcp_tools` inventory guard (core#3082) — the runtime#181 producer landed
+# 2026-06-25, so §4.5 now polls-then-fails on an absent/incomplete inventory.
 #
 # WHAT MUST BE LIVE for this to pass GREEN (else it SKIPs LOUD, never false-red):
 #   • The org's concierge must be installed as the kind='platform' root AND
@@ -89,6 +92,9 @@
 # Optional env:
 #   E2E_PROVISION_TIMEOUT_SECS    default 900 (15 min cold tenant EC2 budget)
 #   E2E_CONCIERGE_ONLINE_SECS     default 900 (concierge boot-to-online budget)
+#   E2E_MCP_TOOLS_SECS            default 240 (STEP 4.5 poll budget for the
+#                                 loaded_mcp_tools heartbeat to publish
+#                                 provision_workspace before the HARD FAIL)
 #   E2E_AGENT_ACT_SECS            default 420 (LLM think+tool-call budget after we
 #                                 send the message — generous for nondeterminism)
 #   E2E_KEEP_ORG                  1 → skip teardown (debugging only)
@@ -817,30 +823,32 @@ done
 ok "Concierge online + routable (url assigned)"
 obs_step_end concierge_online pass "" "concierge_id=$CONCIERGE_ID"
 
-# ─── 4.5. loaded_mcp_tools inventory check (core#3082) — ADVISORY, NOT A GATE ──
+# ─── 4.5. loaded_mcp_tools inventory check (core#3082) — HARD GATE (never-skip) ─
 obs_step_start mcp_tools
-# The concierge runtime SHOULD report `loaded_mcp_tools` on its heartbeat with
-# the platform management `${PLATFORM_MCP_REQUIRED_TOOL}` tool in it. That field
-# is produced by the runtime#181 heartbeat producer, which has NOT landed on
-# staging yet — so the field is absent today.
+# The concierge runtime reports `loaded_mcp_tools` on its heartbeat with the
+# platform management `${PLATFORM_MCP_REQUIRED_TOOL}` tool in it. That field is
+# produced by the runtime#181 heartbeat producer, which LANDED 2026-06-25
+# ("fix(core#3082): wire loaded_mcp_tools producer at init"). A healthy staging
+# concierge reports ~46 loaded_mcp_tools INCLUDING $(required_provision_tool_id)
+# (RCA 2026-07-11). The tools load at init INDEPENDENTLY of the separate #64
+# model-billing bug (they are present regardless of the LLM model), so this check
+# is safe to enforce now and does not depend on the #64 fix.
 #
-# DECOUPLING (core — the created-agent auth escape): this check used to
-# skip_loud, which EXITS the whole script (exit 5 under E2E_REQUIRE_LIVE=1).
-# Because the create-team (STEP 4) + created-agent AUTH + real-first-turn
-# (STEP 5) steps run AFTER this point, an absent loaded_mcp_tools field
-# skip_loud-EXITED before they ever ran — so the gate NEVER exercised the
-# concierge-CREATED team member, and the "agent-created workspace has no
-# MOLECULE_LLM_USAGE_TOKEN → 'Not logged in'" bug class escaped to prod.
+# NEVER-SKIP (owner directive: "loaded_mcp_tools should never be skipped" on a
+# prod-deploy hard gate). We POLL for the field to populate (a cold concierge can
+# publish its heartbeat a few seconds after it flips online, so we do not
+# single-shot read + false-fail), then HARD FAIL if loaded_mcp_tools is still
+# absent/empty OR does not contain the required provision tool. A concierge that
+# boots with no management-MCP tools can never pass this gate.
 #
-# That coupling is wrong: loaded_mcp_tools is the MCP-tools heartbeat PRODUCER
-# (runtime#181); the created-agent auth check is the LLM USAGE TOKEN — a
-# DIFFERENT, INDEPENDENT concern. So this inventory check is now ADVISORY
-# (never exits): when the field is present we confirm the required tool; when it
-# is absent or missing the tool we LOG + CONTINUE to the runtime#181-INDEPENDENT
-# created-agent auth gate below (STEP 4→5), which is the real false-green guard
-# now. (Promote this back to a hard assertion once runtime#181 lands — see
-# the loaded_mcp_tools-present branch, which is already enforced.)
-log "3.5/6 PLATFORM AGENT APPEARS — loaded_mcp_tools inventory check (ADVISORY until runtime#181 lands; does NOT gate the created-agent auth check)..."
+# This is defense-in-depth ON TOP OF — not a replacement for — the created-agent
+# AUTH + real-first-turn gates below (STEP 4→5), which exercise the LLM USAGE
+# TOKEN, a DIFFERENT concern. Both must hold. (Historical note: this check briefly
+# skip_loud/continued while runtime#181 was pending; that decoupling was to avoid
+# an EXIT before STEP 4→5 ran. Now that the producer has landed we POLL-then-FAIL
+# in place, so both the MCP-inventory gate AND the auth gate run and both hold.)
+MCP_TOOLS_SECS="${E2E_MCP_TOOLS_SECS:-240}"
+log "3.5/6 PLATFORM AGENT APPEARS — loaded_mcp_tools inventory HARD GATE (poll ≤${MCP_TOOLS_SECS}s for $(required_provision_tool_id); runtime#181 producer landed 2026-06-25)..."
 
 # concierge_loaded_mcp_tools_json: echo the concierge's `loaded_mcp_tools`
 # field as a JSON array, or "" if the field is missing/unreadable.
@@ -855,18 +863,34 @@ if not isinstance(tools, list): print(''); sys.exit(0)
 print(json.dumps(tools))"
 }
 
-LOADED_TOOLS=$(concierge_loaded_mcp_tools_json)
-if [ -n "$LOADED_TOOLS" ] && [ "$LOADED_TOOLS" != "[]" ]; then
-  if [ "$(loaded_mcp_tools_has_required "$LOADED_TOOLS")" = "yes" ]; then
-    ok "loaded_mcp_tools inventory confirms $(required_provision_tool_id)"
-  else
-    # ADVISORY (skip, not gate): keep this skip_loud-flavored — i.e. NOT a hard
-    # fail — until runtime#181 lands, but DO NOT exit (that would re-couple the
-    # created-agent auth gate below to the unrelated MCP-tools producer).
-    log "    ⏭️  ADVISORY (skip, not gate): loaded_mcp_tools present but $(required_provision_tool_id) not reported — runtime#181 heartbeat producer incomplete. CONTINUING to the runtime#181-INDEPENDENT created-agent auth gate (STEP 4→5). Tools: $(echo "$LOADED_TOOLS" | head -c 400)"
+# Poll until the required tool is present, or the budget is exhausted. We keep the
+# last non-empty inventory read so a HARD FAIL can report what WAS loaded.
+mcp_deadline=$(( $(date +%s) + MCP_TOOLS_SECS ))
+LOADED_TOOLS=""
+mcp_ok=0
+while :; do
+  CUR_TOOLS=$(concierge_loaded_mcp_tools_json)
+  [ -n "$CUR_TOOLS" ] && [ "$CUR_TOOLS" != "[]" ] && LOADED_TOOLS="$CUR_TOOLS"
+  if [ -n "$CUR_TOOLS" ] && [ "$CUR_TOOLS" != "[]" ] \
+     && [ "$(loaded_mcp_tools_has_required "$CUR_TOOLS")" = "yes" ]; then
+    mcp_ok=1
+    break
   fi
+  [ "$(date +%s)" -ge "$mcp_deadline" ] && break
+  sleep 8
+done
+
+if [ "$mcp_ok" = "1" ]; then
+  ok "loaded_mcp_tools inventory confirms $(required_provision_tool_id)"
+elif [ -n "$LOADED_TOOLS" ] && [ "$LOADED_TOOLS" != "[]" ]; then
+  # Field populated but the required tool never appeared within budget: the
+  # concierge booted with a management-MCP that is missing provision_workspace.
+  fail "loaded_mcp_tools present but $(required_provision_tool_id) not reported within ${MCP_TOOLS_SECS}s — the concierge's management MCP did not expose the provision tool. HARD GATE (never-skip): runtime#181 producer landed 2026-06-25; a healthy concierge reports ~46 tools incl. this one. Tools: $(echo "$LOADED_TOOLS" | head -c 400)"
 else
-  log "    ⏭️  ADVISORY (skip, not gate): loaded_mcp_tools absent/empty — runtime#181 heartbeat producer has not landed. CONTINUING to the runtime#181-INDEPENDENT created-agent auth gate (STEP 4→5)."
+  # Field absent/empty for the whole budget: the mgmt-MCP tools failed to load at
+  # init (broken concierge boot). runtime#181 producer landed 2026-06-25, so an
+  # empty inventory is a real failure, not a not-yet-landed producer.
+  fail "loaded_mcp_tools absent/empty after ${MCP_TOOLS_SECS}s — the concierge reported NO management-MCP tools. HARD GATE (never-skip): runtime#181 producer landed 2026-06-25 and a healthy concierge reports ~46 tools incl. $(required_provision_tool_id); an empty inventory means the mgmt-MCP failed to load at init."
 fi
 
 # Pre-state: the worker MUST NOT exist yet (so its later appearance is causally
