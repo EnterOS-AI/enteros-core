@@ -116,7 +116,12 @@ func (h *TerminalHandler) HandleConnect(c *gin.Context) {
 			workspaceID).Scan(&instanceID)
 	}
 
-	if instanceID != "" {
+	// Shape-route on the EC2-vs-local BACKEND (isEC2InstanceID), not on
+	// instance_id presence: the local-docker provisioner persists the
+	// container name into instance_id, so a raw `!= ""` check wrongly routed
+	// every molecules-server workspace's terminal through EIC/ssh. Mirror the
+	// Files API fix (#2999) — local-docker workspaces attach via docker exec.
+	if isEC2InstanceID(instanceID) {
 		h.handleRemoteConnect(c, workspaceID, instanceID)
 		return
 	}

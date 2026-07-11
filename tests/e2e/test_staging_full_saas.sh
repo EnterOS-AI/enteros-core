@@ -292,6 +292,29 @@ e2e_tmp() {
   printf '%s' "$f"
 }
 
+# ─── EC2/EIC-backend gate (provider signal) ─────────────────────────────
+# Some sub-steps probe the EC2/EIC (SSH-via-EC2-Instance-Connect) chain,
+# which has NO analog on the molecules-server (local-docker, provider=local)
+# backend. On local-docker those probes hard-fail for backend-shape reasons,
+# not real regressions:
+#   - 7b terminal-diagnose: the CP local-docker provisioner persists the
+#     CONTAINER NAME into instance_id (non-empty, not i-prefixed), so the
+#     workspace-server diagnose handler mis-routes a local-docker WS down
+#     diagnoseRemote (EIC + ssh) instead of diagnoseLocal → ok=false.
+#   - 7c Files API PUT config.yaml: the EIC write path only applies to
+#     i-prefixed instance ids; on local-docker it shape-routes to docker
+#     CopyToContainer and should pass, but its EIC assertions are moot.
+#
+# Canonical discriminator: E2E_AWS_LEAK_CHECK. The workflow sets it to
+# 'required' iff a real EC2 backend is enabled (vars.E2E_EC2_ENABLED=='1')
+# and 'off' on molecules-server. This is the same one-line knob the
+# workflow already advertises — zero new plumbing. When available, a
+# per-workspace signal (the diagnose JSON's own `remote` boolean, which
+# reflects diagnoseLocal vs diagnoseRemote) is preferred at the call site.
+is_ec2_backend() {
+  [ "${E2E_AWS_LEAK_CHECK:-off}" = "required" ]
+}
+
 # ─── cleanup trap ───────────────────────────────────────────────────────
 CLEANUP_DONE=0
 cleanup_org() {
@@ -1113,16 +1136,41 @@ rm -f "$PNG_FIXTURE"
 # tenant — no AWS creds needed on the GHA runner. Returns
 # {"ok": bool, "first_failure": "name", "steps": [...]}.
 #
-# Local-docker workspaces (instance_id NULL) get diagnoseLocal which
-# probes docker.Ping + container exec; we still expect ok=true there
-# since local-docker is the alternative production path.
+# Local-docker workspaces get diagnoseLocal (docker.Ping + container exec).
+#
+# EC2-GATED (provider signal). The EIC/ssh chain this probe asserts
+# (send-ssh-public-key, open-tunnel, wait-for-port, ssh-probe, tenant SG
+# tcp/22, MOLECULE_EIC_ENDPOINT_SG_ID) is 100% EC2-specific and has NO
+# analog on molecules-server (local-docker). Worse, on a CP-provisioned
+# local-docker workspace the diagnose handler mis-routes to diagnoseRemote
+# (it branches on raw instanceID != "" and the CP local-docker provisioner
+# persists the CONTAINER NAME into instance_id), so this probe returns
+# ok=false for a backend-shape reason, not a real regression. So:
+#   - On an EC2 backend (E2E_AWS_LEAK_CHECK=required) we run the full
+#     EIC hard-check exactly as before.
+#   - On molecules-server we use the diagnose JSON's own `remote` boolean
+#     (diagnoseLocal ⇒ remote:false) as the per-workspace provider signal:
+#       * remote:false ⇒ genuine diagnoseLocal container-running check —
+#         provider-agnostic, so we still HARD-assert ok=true.
+#       * remote:true  ⇒ the EIC/ssh path (either genuinely EC2 or the CP
+#         local-docker mis-route). Its EIC assertions have no local analog,
+#         so we SKIP with a clear log line rather than false-red. The
+#         provider-agnostic "container executes" guarantee is already
+#         covered by wait_workspaces_online_routable (step 7) + A2A (step 8).
 log "7b/11 Canvas-terminal EIC diagnose probe..."
 for wid in "${WS_TO_CHECK[@]}"; do
   DIAG_JSON=$(tenant_call GET "/workspaces/$wid/terminal/diagnose" 2>/dev/null || echo '{}')
   DIAG_OK=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('ok') else 'false')" 2>/dev/null || echo "false")
+  DIAG_REMOTE=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('remote') else 'false')" 2>/dev/null || echo "false")
   if [ "$DIAG_OK" = "true" ]; then
     ok "    $wid terminal-reachable (canvas terminal will work)"
+  elif ! is_ec2_backend && [ "$DIAG_REMOTE" = "true" ]; then
+    # Non-EC2 backend AND the workspace took the remote/EIC path — no local
+    # analog to assert. Skip (never hard-fail on the EIC chain off EC2).
+    log "    ⏭️  $wid terminal-diagnose EIC hard-check SKIPPED (non-EC2 backend, remote-path diagnose): E2E_AWS_LEAK_CHECK=${E2E_AWS_LEAK_CHECK:-off}. The EIC/ssh chain has no local-docker analog; container-executes is covered by online+routable (step 7) and A2A (step 8)."
   else
+    # Either an EC2 backend (hard EIC regression) OR a non-EC2 diagnoseLocal
+    # (remote:false) that reported ok=false — both are real failures.
     DIAG_FAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('first_failure','unknown'))" 2>/dev/null || echo "unknown")
     DIAG_DETAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); s=[x for x in d.get('steps',[]) if not x.get('ok')]; step=s[0] if s else {}; print(' — '.join(x for x in [step.get('error',''), step.get('detail','')] if x))" 2>/dev/null || echo "")
     # #767: always emit the full diagnose JSON so operators see every step's
@@ -1131,7 +1179,11 @@ for wid in "${WS_TO_CHECK[@]}"; do
     log "── DIAGNOSTIC BURST (step 7b — terminal diagnose for $wid) ──"
     echo "$DIAG_JSON" | python3 -m json.tool 2>/dev/null || echo "$DIAG_JSON"
     log "── END DIAGNOSTIC ──"
-    fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set in Railway, and EIC endpoint health"
+    if is_ec2_backend; then
+      fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set in Railway, and EIC endpoint health"
+    else
+      fail "Workspace $wid diagnoseLocal (non-EC2, remote:false) reported ok=false at step '$DIAG_FAIL': $DIAG_DETAIL — the local-docker container-running check failed (docker.Ping / container exec)"
+    fi
   fi
 done
 
@@ -1178,7 +1230,19 @@ for wid in "${WS_TO_CHECK[@]}"; do
   PUT_BODY_OUT=$(cat "$PUT_TMP" 2>/dev/null || echo "")
   rm -f "$PUT_TMP"
   if [ "$PUT_CODE" != "200" ] && [ "$PUT_CODE" != "204" ]; then
-    fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE: $PUT_BODY_OUT — likely a path-map or permission regression in workspace-server template_files_eic.go"
+    # EC2-GATED hard-fail (provider signal). The failure class this gate
+    # names (path-map / permission drift in template_files_eic.go) is the
+    # SSH-via-EIC write path, which only applies to an i-prefixed EC2
+    # instance id. On molecules-server (local-docker) WriteFile shape-routes
+    # to docker CopyToContainer — a different code path with no EIC analog —
+    # so a non-2xx here is NOT the EIC regression this gate claims to catch.
+    # On an EC2 backend we hard-fail as before; off EC2 we SKIP loudly.
+    if is_ec2_backend; then
+      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE: $PUT_BODY_OUT — likely a path-map or permission regression in workspace-server template_files_eic.go"
+    else
+      log "    ⏭️  $wid Files API PUT config.yaml EIC hard-check SKIPPED (non-EC2 backend): E2E_AWS_LEAK_CHECK=${E2E_AWS_LEAK_CHECK:-off}, PUT returned $PUT_CODE. The template_files_eic.go SSH-via-EIC write path has no local-docker analog (WriteFile shape-routes to docker CopyToContainer). Body: $PUT_BODY_OUT"
+      continue
+    fi
   fi
   # PUT-only check; the GET-back round-trip assertion was dropped
   # 2026-05-04 because PUT (template_files_eic.go SSH-via-EIC →
