@@ -237,6 +237,55 @@ func resolveLatestSHA(ctx context.Context, resolver PluginResolver, sourceRaw, t
 	return resolvedSHA, nil
 }
 
+// ResolveSourceSHA resolves the CURRENT upstream SHA of the ref ALREADY
+// embedded in a source_raw's #fragment — a branch tip for a track=none pin
+// (e.g. "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main").
+// It is the content-aware sibling of resolveLatestSHA: where the drift sweeper
+// SUBSTITUTES a tracked_ref (tag:/sha:), this keeps the source's own branch
+// fragment so the online-transition reconcile can detect that a moving branch
+// tip has advanced past the SHA it installed (plugins_reconcile.go — fix (b),
+// the case the sweeper's `tracked_ref != 'none'` filter never covers).
+//
+// Returns ("", nil) — deliberately NOT an error — when the source carries no
+// ref fragment (unpinned or local://): such a source has no moving tip, so the
+// caller must treat it as up-to-date rather than churn. Reuses the same
+// --depth=1 fetch + rev-parse machinery (Gitea/GithubResolver.ResolveRef) the
+// sweeper already trusts, bounded by ResolveRefDeadline.
+func ResolveSourceSHA(ctx context.Context, resolver PluginResolver, sourceRaw string) (string, error) {
+	// Strip the scheme prefix to get the raw spec the resolver expects
+	// (e.g. "molecule-ai/repo#main"), keeping the source's OWN #fragment.
+	spec := sourceRaw
+	for _, scheme := range resolver.Schemes() {
+		if strings.HasPrefix(spec, scheme+"://") {
+			spec = strings.TrimPrefix(spec, scheme+"://")
+			break
+		}
+	}
+	// No ref fragment → unpinned/local: no moving tip to chase. Report
+	// "not resolvable" (empty, no error) so the caller never re-delivers on it.
+	if !strings.Contains(spec, "#") {
+		return "", nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, ResolveRefDeadline)
+	defer cancel()
+
+	// gitea:// sources (the concierge management-MCP fragment) need the
+	// GiteaResolver — PAT auth + the right host; the GithubResolver would 404.
+	if strings.HasPrefix(sourceRaw, "gitea://") {
+		sha, err := NewGiteaResolver().ResolveRef(ctx, spec)
+		if err != nil {
+			return "", fmt.Errorf("resolve %s: %w", spec, err)
+		}
+		return sha, nil
+	}
+	sha, err := NewGithubResolver().ResolveRef(ctx, spec)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", spec, err)
+	}
+	return sha, nil
+}
+
 // queueDriftEntry inserts a pending drift entry into plugin_update_queue.
 // ON CONFLICT (workspace_id, plugin_name) WHERE status = 'pending' DO NOTHING
 // makes this idempotent — re-drift while a row is already pending is a no-op.

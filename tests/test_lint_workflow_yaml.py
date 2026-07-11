@@ -34,6 +34,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / ".gitea" / "scripts" / "lint-workflow-yaml.py"
+STAGING_TENANT_CD = REPO_ROOT / ".gitea" / "workflows" / "staging-tenant-cd.yml"
 
 
 def _run_lint(workflow_dir: Path) -> subprocess.CompletedProcess:
@@ -703,6 +704,26 @@ def test_ci_change_detector_docs_and_meta_scripts_do_not_trigger_surfaces():
         "python": False,
         "scripts": False,
     }
+
+
+def test_staging_tenant_cd_runtime_expectation_uses_controlplane_infisical_ssot():
+    text = STAGING_TENANT_CD.read_text(encoding="utf-8")
+
+    # A repo variable is a competing mutable source and can drift from what the
+    # deployed control plane actually stamps on a fresh concierge.
+    assert "vars.MOLECULE_DEFAULT_RUNTIME" not in text
+
+    # The gate must fetch the exact optional selector consumed by the control
+    # plane, then export the compiled product fallback only when it is absent.
+    runtime_lookups = [
+        line for line in text.splitlines() if "raw/MOLECULE_DEFAULT_RUNTIME?" in line
+    ]
+    assert len(runtime_lookups) == 1
+    assert "secretPath=%2Fshared%2Fcontrolplane\"" in runtime_lookups[0]
+    assert "controlplane-admin" not in runtime_lookups[0]
+    assert 'echo "::add-mask::$TOK"' in text
+    assert 'E2E_DEFAULT_RUNTIME="${MOLECULE_DEFAULT_RUNTIME:-hermes}"' in text
+    assert 'echo "E2E_DEFAULT_RUNTIME=$E2E_DEFAULT_RUNTIME" >> "$GITHUB_ENV"' in text
 
 
 def test_ci_platform_go_steps_are_path_scoped_on_all_events():

@@ -10,6 +10,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -178,11 +179,6 @@ func listDeclaredPlugins(ctx context.Context, workspaceID string) ([]DeclaredPlu
 	return out, rows.Err()
 }
 
-// listInstalledPluginNames returns the set of plugin names already recorded as
-// installed for a workspace (workspace_plugins). The reconcile treats a name
-// present here as "installed" and skips it — the DB record is the backend-
-// agnostic install SSOT (written by both the Docker and EIC install paths),
-// so the reconcile doesn't need to exec into the container to diff.
 // platformConciergeReconcileShouldSkipRestart reports whether a plugin-reconcile
 // of a kind=platform concierge must DELIVER WITHOUT restarting it. True for a
 // platform concierge in `provisioning` (warming) OR `online` (just promoted) —
@@ -216,34 +212,86 @@ func platformConciergeReconcileShouldSkipRestart(ctx context.Context, workspaceI
 		(status == string(models.StatusProvisioning) || status == string(models.StatusOnline))
 }
 
-func listInstalledPluginNames(ctx context.Context, workspaceID string) (map[string]bool, error) {
-	out := map[string]bool{}
+// installedPluginRecord is one workspace_plugins row as the online-transition
+// reconcile needs it: the recorded source and the SHA that source resolved to
+// at install time. InstalledSHA is empty for local:// sources and pre-migration
+// rows (NULL) — the reconcile treats an empty SHA as "no content baseline" and
+// never re-delivers on it.
+type installedPluginRecord struct {
+	SourceRaw    string
+	InstalledSHA string
+}
+
+// listInstalledPluginRecords returns the installed plugin set for a workspace
+// keyed by plugin_name, carrying source_raw + installed_sha. The reconcile uses
+// KEY presence as the "installed in DB" signal (the DB record is the backend-
+// agnostic install SSOT, written by both the Docker and EIC install paths) and
+// the installed_sha to detect a content change on a branch-pinned (track=none)
+// plugin whose upstream tip has moved — the drift sweeper only chases tag:/sha:
+// pins, so a moving branch would otherwise never re-deliver (fix (b)).
+func listInstalledPluginRecords(ctx context.Context, workspaceID string) (map[string]installedPluginRecord, error) {
+	out := map[string]installedPluginRecord{}
 	if db.DB == nil {
 		return out, nil
 	}
-	rows, err := db.DB.QueryContext(ctx, `
-		SELECT plugin_name FROM workspace_plugins WHERE workspace_id = $1
-	`, workspaceID)
+	rows, err := db.DB.QueryContext(ctx,
+		`SELECT plugin_name, source_raw, installed_sha FROM workspace_plugins WHERE workspace_id = $1`,
+		workspaceID)
 	if err != nil {
-		return nil, fmt.Errorf("listInstalledPluginNames: query: %w", err)
+		return nil, fmt.Errorf("listInstalledPluginRecords: query: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var name string
-		if scanErr := rows.Scan(&name); scanErr != nil {
-			return nil, fmt.Errorf("listInstalledPluginNames: scan: %w", scanErr)
+		var name, sourceRaw string
+		var sha sql.NullString
+		if scanErr := rows.Scan(&name, &sourceRaw, &sha); scanErr != nil {
+			return nil, fmt.Errorf("listInstalledPluginRecords: scan: %w", scanErr)
 		}
-		out[name] = true
+		out[name] = installedPluginRecord{SourceRaw: sourceRaw, InstalledSHA: sha.String}
+	}
+	return out, rows.Err()
+}
+
+// listWorkspacesDeclaringPlugin returns the IDs of RECONCILABLE workspaces that
+// DECLARE a given plugin — the local fan-out target of the fragment-changed
+// trigger (fix (c)). Only online/provisioning workspaces are returned: an
+// offline box has no running container/instance to reconcile into, and its
+// boot-installer re-pulls the fragment on the next boot anyway. Status literals
+// mirror models.StatusOnline / StatusProvisioning. Ordered for a stable response.
+func listWorkspacesDeclaringPlugin(ctx context.Context, pluginName string) ([]string, error) {
+	if db.DB == nil {
+		return nil, nil
+	}
+	rows, err := db.DB.QueryContext(ctx, `
+		SELECT wdp.workspace_id
+		  FROM workspace_declared_plugins wdp
+		  JOIN workspaces w ON w.id = wdp.workspace_id
+		 WHERE wdp.plugin_name = $1
+		   AND w.status IN ('online', 'provisioning')
+		 ORDER BY wdp.workspace_id
+	`, pluginName)
+	if err != nil {
+		return nil, fmt.Errorf("listWorkspacesDeclaringPlugin: query: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			return nil, fmt.Errorf("listWorkspacesDeclaringPlugin: scan: %w", scanErr)
+		}
+		out = append(out, id)
 	}
 	return out, rows.Err()
 }
 
 // listInstalledPlugins returns the installed plugin set for a workspace as
 // (plugin_name, source_raw) pairs from workspace_plugins. Unlike
-// listInstalledPluginNames (which the reconcile uses for a present/absent diff),
-// this carries the source so the boot-install desired-set can re-fetch a
-// user-installed plugin that the template never declared (RFC#2843 #42). A row
-// with an empty source_raw is skipped — it can't be re-fetched on boot.
+// listInstalledPluginRecords (which the reconcile keys by name + carries the
+// installed_sha for content-staleness), this ordered slice feeds the
+// boot-install desired-set so it can re-fetch a user-installed plugin that the
+// template never declared (RFC#2843 #42). A row with an empty source_raw is
+// skipped — it can't be re-fetched on boot.
 func listInstalledPlugins(ctx context.Context, workspaceID string) ([]DeclaredPlugin, error) {
 	if db.DB == nil {
 		return nil, nil

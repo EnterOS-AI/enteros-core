@@ -8,12 +8,14 @@ package handlers
 //   POST /admin/plugin-updates/:id/apply — apply a queued drift update
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
@@ -28,6 +30,77 @@ type AdminPluginDriftHandler struct {
 // NewAdminPluginDriftHandler constructs a handler wired to the plugins handler.
 func NewAdminPluginDriftHandler(ph *PluginsHandler) *AdminPluginDriftHandler {
 	return &AdminPluginDriftHandler{pluginsHandler: ph}
+}
+
+// FragmentChanged handles POST /admin/plugin-fragment-changed.
+//
+// Fix (c): the trigger a fragment repo fires (via the CP fleet fan-out) on
+// merge-to-main so a changed plugin fragment propagates PROMPTLY to running
+// concierges instead of waiting for the next natural online-beat reconcile. For
+// each reconcilable workspace DECLARING the plugin it fires the (content-aware,
+// fix (b)) reconcile to deliver the new bytes, then — ONLY for a box whose
+// fragment was actually stale AND whose reconcile deferred the restart (the
+// concierge lifecycle guard) — restarts it so the running mgmt-MCP relaunches
+// with the new command/env. Non-concierge plugins already get their restart
+// from the reconcile's own classifier, so they are never double-restarted.
+//
+// Fire-and-forget per workspace (202 Accepted): a slow/offline box never blocks
+// the response, and the natural online-beat reconcile still backstops any box
+// this trigger misses (webhook = latency optimization, not a correctness
+// dependency).
+func (h *AdminPluginDriftHandler) FragmentChanged(c *gin.Context) {
+	var req struct {
+		PluginName string `json:"plugin_name"`
+		Source     string `json:"source"` // optional, informational
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.PluginName) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "plugin_name is required"})
+		return
+	}
+	if h.pluginsHandler == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "plugins handler not wired"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	pluginName := strings.TrimSpace(req.PluginName)
+	workspaceIDs, err := listWorkspacesDeclaringPlugin(ctx, pluginName)
+	if err != nil {
+		log.Printf("AdminPluginDrift: fragment-changed: list workspaces declaring %q failed: %v", pluginName, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve affected workspaces"})
+		return
+	}
+
+	for _, id := range workspaceIDs {
+		wsID := id
+		// Detach: the request ctx ends when this handler returns, well before a
+		// clone+deliver(+restart) completes. Mirror registry.fireReconcileOnline.
+		globalGoAsync(func() {
+			bg := context.WithoutCancel(ctx)
+			// Capture BEFORE the reconcile re-records the SHA: was this box's
+			// fragment actually stale, and did the reconcile defer its restart
+			// (concierge lifecycle guard)? Both must hold for us to restart —
+			// a non-concierge stale plugin is restarted by the reconcile itself,
+			// and an unchanged box needs no restart at all.
+			stale := h.pluginsHandler.PluginFragmentStaleForWorkspace(bg, wsID, pluginName)
+			restartDeferred := platformConciergeReconcileShouldSkipRestart(bg, wsID)
+
+			h.pluginsHandler.ReconcileWorkspacePlugins(bg, wsID)
+
+			if stale && restartDeferred {
+				if restart := h.pluginsHandler.GetRestartFunc(); restart != nil {
+					log.Printf("AdminPluginDrift: fragment-changed: restarting workspace=%s to pick up updated fragment %s", wsID, pluginName)
+					restart(wsID)
+				}
+			}
+		})
+	}
+
+	log.Printf("AdminPluginDrift: fragment-changed plugin=%s — reconciling %d workspace(s)", pluginName, len(workspaceIDs))
+	c.JSON(http.StatusAccepted, gin.H{
+		"plugin_name": pluginName,
+		"reconciling": len(workspaceIDs),
+	})
 }
 
 // ListPending handles GET /admin/plugin-updates-pending.
@@ -46,12 +119,12 @@ func (h *AdminPluginDriftHandler) ListPending(c *gin.Context) {
 
 // Apply handles POST /admin/plugin-updates/:id/apply.
 //
-// 1. Reads the queue entry and verifies it's still pending.
-// 2. Reads the workspace_plugins row to get the plugin's source.
-// 3. Re-installs the plugin from source_raw (re-fetch from upstream at the
-//    same tracked ref — the drift was caused by upstream moving).
-// 4. Marks the queue entry as applied.
-// 5. Triggers workspace restart.
+//  1. Reads the queue entry and verifies it's still pending.
+//  2. Reads the workspace_plugins row to get the plugin's source.
+//  3. Re-installs the plugin from source_raw (re-fetch from upstream at the
+//     same tracked ref — the drift was caused by upstream moving).
+//  4. Marks the queue entry as applied.
+//  5. Triggers workspace restart.
 //
 // Idempotent: if the entry is already 'applied', returns 200 with the
 // workspace_id and plugin_name so callers can still poll for confirmation.
@@ -68,8 +141,8 @@ func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 	var entry struct {
 		WorkspaceID string `json:"workspace_id"`
 		PluginName  string `json:"plugin_name"`
-		TrackedRef string `json:"tracked_ref"`
-		Status     string `json:"status"`
+		TrackedRef  string `json:"tracked_ref"`
+		Status      string `json:"status"`
 	}
 	err := db.DB.QueryRowContext(ctx, `
 		SELECT workspace_id, plugin_name, tracked_ref, status
@@ -89,19 +162,19 @@ func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 	if entry.Status == "applied" {
 		// Idempotent — already applied.
 		c.JSON(http.StatusOK, gin.H{
-			"status":        "already_applied",
-			"workspace_id":   entry.WorkspaceID,
-			"plugin_name":   entry.PluginName,
-			"message":       "drift update was already applied",
+			"status":       "already_applied",
+			"workspace_id": entry.WorkspaceID,
+			"plugin_name":  entry.PluginName,
+			"message":      "drift update was already applied",
 		})
 		return
 	}
 
 	if entry.Status == "dismissed" {
 		c.JSON(http.StatusConflict, gin.H{
-			"error":       "queue entry was dismissed",
+			"error":        "queue entry was dismissed",
 			"workspace_id": entry.WorkspaceID,
-			"plugin_name": entry.PluginName,
+			"plugin_name":  entry.PluginName,
 		})
 		return
 	}
@@ -114,7 +187,7 @@ func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 	`, entry.WorkspaceID, entry.PluginName).Scan(&sourceRaw)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{
-			"error":       "workspace_plugins row not found — plugin may have been uninstalled",
+			"error":        "workspace_plugins row not found — plugin may have been uninstalled",
 			"workspace_id": entry.WorkspaceID,
 			"plugin_name":  entry.PluginName,
 		})
@@ -143,7 +216,7 @@ func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 		var he *httpErr
 		if errors.As(instErr, &he) {
 			c.JSON(he.Status, gin.H{
-				"error": fmt.Sprintf("plugin install failed: %v", he.Body["error"]),
+				"error":    fmt.Sprintf("plugin install failed: %v", he.Body["error"]),
 				"queue_id": queueID,
 			})
 			return
@@ -213,7 +286,7 @@ func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 	log.Printf("AdminPluginDrift: applied drift update for %s/%s (queue_id=%s)",
 		entry.WorkspaceID, entry.PluginName, queueID)
 	c.JSON(http.StatusOK, gin.H{
-		"status":       "applied",
+		"status":        "applied",
 		"workspace_id":  entry.WorkspaceID,
 		"plugin_name":   entry.PluginName,
 		"installed_sha": result.InstalledSHA,

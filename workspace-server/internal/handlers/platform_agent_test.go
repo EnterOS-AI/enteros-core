@@ -1023,7 +1023,7 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 	t.Run("fresh platform agent with NO stored model gets the declared model seeded + persisted", func(t *testing.T) {
 		mock := setupTestDB(t)
 		mock.ExpectQuery(kindQuery).WithArgs("ws-fresh").
-			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "claude-code"))
+			WillReturnRows(sqlmock.NewRows([]string{"kind", "runtime"}).AddRow("platform", "hermes"))
 		// No MODEL row yet (first boot) → readStoredModelSecret returns "".
 		mock.ExpectQuery(modelSelQuery).WithArgs("ws-fresh").
 			WillReturnRows(sqlmock.NewRows([]string{"encrypted_value", "encryption_version"}))
@@ -1062,6 +1062,13 @@ func TestApplyConciergeProvisionConfig_SeedsModel(t *testing.T) {
 		}
 		if env["MOLECULE_MODEL"] != platformDefaultModelFallback {
 			t.Errorf("fresh concierge did not seed MOLECULE_MODEL=%q; got %q", platformDefaultModelFallback, env["MOLECULE_MODEL"])
+		}
+		// Hermes does not consume the generic MODEL names directly. Its boot
+		// contract reads HERMES_DEFAULT_MODEL before falling back to the base
+		// image config, so a late concierge seed must populate that runtime-
+		// specific name in the same provision.
+		if env["HERMES_DEFAULT_MODEL"] != platformDefaultModelFallback {
+			t.Errorf("fresh Hermes concierge did not seed HERMES_DEFAULT_MODEL=%q; got %q (env=%v) — Hermes would fall back to its baked model", platformDefaultModelFallback, env["HERMES_DEFAULT_MODEL"], env)
 		}
 		// Companion provider pin: the concierge can't run a turn without it
 		// (moonshot/… derives a non-registry provider name → adapter fail-closes).
@@ -1338,12 +1345,21 @@ func TestEnsureConciergeModel_ReconcilesPlatformManagedToSSOT(t *testing.T) {
 			WithArgs("ws-recon", sqlmock.AnyArg(), sqlmock.AnyArg()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
-		// Simulate applyRuntimeModelEnv having already run with the stale stored model.
-		env := map[string]string{"MODEL": "moonshot/kimi-k2.6", "MOLECULE_MODEL": "moonshot/kimi-k2.6"}
-		h.ensureConciergeModel(context.Background(), "ws-recon", "claude-code", env)
+		// Simulate applyRuntimeModelEnv having already run with the stale stored
+		// Hermes model. Reconcile must update the runtime-specific name too; leaving
+		// it stale makes Hermes ignore the corrected generic MODEL values.
+		env := map[string]string{
+			"MODEL":                "moonshot/kimi-k2.6",
+			"MOLECULE_MODEL":       "moonshot/kimi-k2.6",
+			"HERMES_DEFAULT_MODEL": "moonshot/kimi-k2.6",
+		}
+		h.ensureConciergeModel(context.Background(), "ws-recon", "hermes", env)
 
 		if env["MODEL"] != ssot || env["MOLECULE_MODEL"] != ssot {
 			t.Fatalf("platform-managed default not reconciled to SSOT; env=%v (want both %q)", env, ssot)
+		}
+		if env["HERMES_DEFAULT_MODEL"] != ssot {
+			t.Fatalf("Hermes runtime-specific model remained stale after SSOT reconcile; got %q want %q (env=%v)", env["HERMES_DEFAULT_MODEL"], ssot, env)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet sqlmock expectations (reconciled MODEL not persisted): %v", err)
