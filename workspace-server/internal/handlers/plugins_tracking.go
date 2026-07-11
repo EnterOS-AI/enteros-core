@@ -252,6 +252,39 @@ func listInstalledPluginRecords(ctx context.Context, workspaceID string) (map[st
 	return out, rows.Err()
 }
 
+// listWorkspacesDeclaringPlugin returns the IDs of RECONCILABLE workspaces that
+// DECLARE a given plugin — the local fan-out target of the fragment-changed
+// trigger (fix (c)). Only online/provisioning workspaces are returned: an
+// offline box has no running container/instance to reconcile into, and its
+// boot-installer re-pulls the fragment on the next boot anyway. Status literals
+// mirror models.StatusOnline / StatusProvisioning. Ordered for a stable response.
+func listWorkspacesDeclaringPlugin(ctx context.Context, pluginName string) ([]string, error) {
+	if db.DB == nil {
+		return nil, nil
+	}
+	rows, err := db.DB.QueryContext(ctx, `
+		SELECT wdp.workspace_id
+		  FROM workspace_declared_plugins wdp
+		  JOIN workspaces w ON w.id = wdp.workspace_id
+		 WHERE wdp.plugin_name = $1
+		   AND w.status IN ('online', 'provisioning')
+		 ORDER BY wdp.workspace_id
+	`, pluginName)
+	if err != nil {
+		return nil, fmt.Errorf("listWorkspacesDeclaringPlugin: query: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			return nil, fmt.Errorf("listWorkspacesDeclaringPlugin: scan: %w", scanErr)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // listInstalledPlugins returns the installed plugin set for a workspace as
 // (plugin_name, source_raw) pairs from workspace_plugins. Unlike
 // listInstalledPluginRecords (which the reconcile keys by name + carries the
