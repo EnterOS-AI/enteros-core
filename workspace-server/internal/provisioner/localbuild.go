@@ -114,6 +114,19 @@ type LocalBuildOptions struct {
 	// (localBuildImagePlatform). Exposed so tests can override.
 	Platform string
 
+	// StallGrace / Ceiling govern the progress-driven runner that wraps the
+	// `docker build` + `git clone` (stallrunner.go). StallGrace is the
+	// primary gate — max time with ZERO output before the process is killed
+	// as wedged. Ceiling is the absolute wall-clock backstop. Zero on either
+	// = use the package default (buildStallGrace() / buildCeiling(),
+	// env-overridable). EnsureLocalImage sets Ceiling from the provision ctx's
+	// deadline (which handlers.dockerProvisionTimeout has already set to the
+	// per-runtime provision_timeout_seconds, floored at 12m), so a runtime
+	// declaring 30m is not capped at the 12m default. Exposed so tests can
+	// drive the runner with tiny values.
+	StallGrace time.Duration
+	Ceiling    time.Duration
+
 	// HTTPClient is used for the Gitea-API HEAD-sha lookup. Empty =
 	// http.DefaultClient with a 30s timeout.
 	HTTPClient *http.Client
@@ -130,12 +143,32 @@ type LocalBuildOptions struct {
 	checkTool func(tool string) error
 }
 
+// stallGrace / ceiling return the effective runner gates, defaulting to the
+// package (env-overridable) values when a field is unset. Keeping the
+// fall-through here means a zero-valued LocalBuildOptions (e.g. a test that
+// only sets the seams) still gets sane production gates unless it opts in.
+func (o *LocalBuildOptions) stallGrace() time.Duration {
+	if o.StallGrace > 0 {
+		return o.StallGrace
+	}
+	return buildStallGrace()
+}
+
+func (o *LocalBuildOptions) ceiling() time.Duration {
+	if o.Ceiling > 0 {
+		return o.Ceiling
+	}
+	return buildCeiling()
+}
+
 func newDefaultLocalBuildOptions() *LocalBuildOptions {
 	o := &LocalBuildOptions{
 		CacheDir:   os.Getenv("MOLECULE_LOCAL_BUILD_CACHE"),
 		RepoPrefix: os.Getenv("MOLECULE_LOCAL_TEMPLATE_REPO_PREFIX"),
 		Token:      os.Getenv("MOLECULE_GITEA_TOKEN"),
 		Platform:   localBuildImagePlatform(),
+		StallGrace: buildStallGrace(),
+		Ceiling:    buildCeiling(),
 	}
 	if o.CacheDir == "" {
 		if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
@@ -212,7 +245,33 @@ func IsLocalBuildImage(image string) bool {
 // or docker calls. The Gitea HEAD lookup is the only network call on
 // the cache-hit path.
 func EnsureLocalImage(ctx context.Context, runtime string) (string, error) {
-	return ensureLocalImageWithOpts(ctx, runtime, newDefaultLocalBuildOptions())
+	opts := newDefaultLocalBuildOptions()
+	// The provision ctx already carries the per-runtime absolute deadline
+	// (handlers.dockerProvisionTimeout = max(provision_timeout_seconds, 12m),
+	// so hermes = 30m). Derive the stall-runner's ceiling FROM that deadline
+	// so the per-runtime window actually reaches the build — otherwise the
+	// runner's own 12m default backstop fires first and a 12–30m hermes build
+	// is killed at 12m despite its declared 30m. Paths with no deadline (the
+	// bundle importer) keep the buildCeiling() default.
+	if c := ceilingFromCtxDeadline(ctx); c > 0 {
+		opts.Ceiling = c
+	}
+	return ensureLocalImageWithOpts(ctx, runtime, opts)
+}
+
+// ceilingFromCtxDeadline returns the stall-runner ceiling implied by ctx's
+// deadline: the remaining time-to-deadline when ctx has one (so the per-runtime
+// provision window already on the ctx reaches the build), else 0 meaning "no
+// ctx-implied ceiling — keep the option default". The ctx is the single source
+// of truth for the absolute cap; the derived ceiling just gives it a clear
+// typed error (errBuildCeiling) rather than a bare context-cancel.
+func ceilingFromCtxDeadline(ctx context.Context) time.Duration {
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining > 0 {
+			return remaining
+		}
+	}
+	return 0
 }
 
 // ensureLocalImageHook is the seam Start() calls into. Production code
@@ -514,11 +573,24 @@ func gitCloneProd(ctx context.Context, opts *LocalBuildOptions, runtime, dest st
 		// On parse failure we silently fall through to the public URL —
 		// better to attempt the anonymous clone than to refuse outright.
 	}
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", "--branch=main", "--single-branch", cloneURL, dest)
+	// --progress FORCES git to emit its "Receiving objects: NN%" meter even
+	// though stderr is a pipe, not a TTY (git suppresses it on a pipe by
+	// default). Without it a healthy-but-slow clone is silent for its whole
+	// transfer, so the stall gate degrades to a blind wall-clock and a large
+	// clone running past the grace is false-killed. The meter is \r-delimited,
+	// which the runner's chunk reader handles fine (the old line scanner would
+	// have accumulated it into one over-cap line).
+	cmd := exec.CommandContext(ctx, "git", "clone", "--progress", "--depth=1", "--branch=main", "--single-branch", cloneURL, dest)
 	// Drop git's askpass prompts so we fail-fast on auth errors instead
 	// of hanging waiting for an interactive password.
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/bin/echo")
-	out, err := cmd.CombinedOutput()
+	// Same progress-driven runner as the build: with --progress a
+	// genuinely-progressing clone streams git's meter (resetting the no-output
+	// clock), so it is never killed, while a clone hung on an unreachable host
+	// emits nothing and is reaped after the stall grace (the askpass drop
+	// already covers the interactive-auth hang; this covers the
+	// network-black-hole hang).
+	out, err := runStreamingCommand(ctx, cmd, opts.stallGrace(), opts.ceiling())
 	if err != nil {
 		// Mask the token in any error string git emits via stderr — git
 		// occasionally echoes the URL verbatim on failure.
@@ -558,7 +630,13 @@ func dockerBuildProd(ctx context.Context, opts *LocalBuildOptions, contextDir, t
 	}
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
-	out, err := cmd.CombinedOutput()
+	// Progress-driven runner (stallrunner.go): stream the build, reset a
+	// no-output clock on every line, and kill on a real stall or the
+	// absolute ceiling — NOT on a fixed 3-min wall clock. A cold build that
+	// legitimately runs long (large pip/apt layer, QEMU cross-arch) streams
+	// output the whole time and is never killed; a wedged build (network
+	// black hole) is killed after opts.stallGrace() with a clear message.
+	out, err := runStreamingCommand(ctx, cmd, opts.stallGrace(), opts.ceiling())
 	if err != nil {
 		// Sanitize defensive — docker build output shouldn't contain a
 		// token, but maskTokenInString is a no-op when token is empty.
