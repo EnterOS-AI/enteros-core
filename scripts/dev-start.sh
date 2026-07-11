@@ -20,12 +20,18 @@
 #                                   manually)
 #
 # Usage:
-#   ./scripts/dev-start.sh
+#   ./scripts/dev-start.sh            # incremental (data + images preserved)
+#   ./scripts/dev-start.sh --fresh    # FULL reset: wipe DB/object-store +
+#                                     # onboarding state, delete locally-built
+#                                     # template images + build cache, rebuild
+#                                     # from scratch. Re-onboard from zero.
+#   ./scripts/dev-start.sh --help
 #   # Open http://localhost:3000, add your model API key in
 #   # Config → Secrets & API Keys, then create your first workspace.
 #
-# Idempotent: re-running picks up where the last run left off (existing
-# .env is preserved, npm install skipped if node_modules present, etc).
+# Idempotent (without --fresh): re-running picks up where the last run left off
+# (existing .env is preserved, npm install skipped if node_modules present,
+# local DB/object-store state survives, already-built images are reused).
 
 set -e
 
@@ -35,6 +41,43 @@ COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-molecule-core}"
 export COMPOSE_PROJECT_NAME
 PLATFORM_PID=
 CANVAS_PID=
+FRESH=0
+
+print_usage() {
+    cat <<'USAGE'
+Usage: ./scripts/dev-start.sh [--fresh]
+
+  (no args)   Incremental start — reuses the existing .env, local DB /
+              object-store state, and any already-built runtime images.
+              Idempotent: safe to re-run.
+
+  --fresh     FULL reset before starting. This is DESTRUCTIVE:
+                • tears down the compose stack AND its named volumes
+                  (WIPES local Postgres / MinIO / Langfuse state and your
+                  onboarding config — you re-onboard from scratch);
+                • removes dynamically-spawned ws-* workspace containers/volumes;
+                • deletes locally-built molecule-local/workspace-template-*
+                  images and clears the template build-clone cache, so every
+                  runtime image (hermes, etc.) rebuilds from current source
+                  instead of reusing a cached tag;
+                • on the docker-compose platform fallback, rebuilds the core
+                  image with --no-cache (on the default `go run` path the core
+                  always recompiles from source anyway).
+
+  -h, --help  Show this help.
+USAGE
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --fresh) FRESH=1 ;;
+        -h|--help) print_usage; exit 0 ;;
+        # Fail loud on unknown flags — the whole point of this parser is that a
+        # mistyped/unsupported flag (e.g. --fresh before it existed) must NOT be
+        # silently swallowed and leave the dev thinking it took effect.
+        *) echo "dev-start.sh: unknown option '$arg' (try --help)" >&2; exit 2 ;;
+    esac
+done
 
 process_cwd() {
     # $1 = pid. Prints the process cwd, or nothing when the process vanished.
@@ -101,6 +144,45 @@ cleanup_dev_stack() {
     docker compose -f "$ROOT/docker-compose.yml" down --remove-orphans >/dev/null 2>&1 || true
     docker compose -f "$ROOT/docker-compose.infra.yml" down --remove-orphans >/dev/null 2>&1 || true
     docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
+}
+
+# rm_by_filter DESC — delete docker objects a `docker ... --format {{...}}` +
+# grep pipeline selects, WITHOUT xargs -r (a GNU-ism BSD/macOS xargs rejects):
+# only invoke the remover when the selection is non-empty. $1 = human label,
+# $2 = the listing command, $3 = the grep pattern, $4 = the remove command.
+rm_by_filter() {
+    _sel=$(eval "$2" 2>/dev/null | grep "$3" 2>/dev/null || true)
+    [ -n "$_sel" ] || return 0
+    echo "$_sel" | while IFS= read -r _item; do
+        [ -n "$_item" ] && eval "$4 \"$_item\"" >/dev/null 2>&1 || true
+    done
+}
+
+fresh_reset() {
+    # --fresh (opt-in only; NEVER runs on the exit trap). Unlike cleanup_dev_stack
+    # — which keeps named volumes so DB/object-store state survives an ordinary
+    # restart — this WIPES that state plus the locally-built runtime images, so
+    # onboarding and every template image rebuild from a clean slate. Mirrors the
+    # nuke portion of scripts/nuke-and-rebuild.sh and adds the template-image +
+    # build-clone-cache purge (the piece that otherwise strands a stale
+    # molecule-local/workspace-template-*:<sha> image behind a green boot).
+    echo "==> --fresh: FULL reset — WIPING local DB / object-store / onboarding state"
+    cleanup_repo_host_processes
+    # Compose stack + named volumes (postgres/redis/minio/langfuse/clickhouse).
+    docker compose -f "$ROOT/docker-compose.yml" down -v --remove-orphans >/dev/null 2>&1 || true
+    docker compose -f "$ROOT/docker-compose.infra.yml" down -v --remove-orphans >/dev/null 2>&1 || true
+    docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
+    # Dynamically-spawned ws-* workspace containers + volumes are NOT in compose,
+    # so `down -v` leaves them behind (ghost containers Canvas can't see).
+    rm_by_filter "ws containers" "docker ps -a --format '{{.Names}}'" "^ws-" "docker rm -f"
+    rm_by_filter "ws volumes"    "docker volume ls --format '{{.Name}}'" "^ws-" "docker volume rm"
+    docker network rm molecule-core-net >/dev/null 2>&1 || true
+    # Locally-built runtime template images + the localbuild clone cache, so the
+    # next provision rebuilds each template (hermes, etc.) from current source
+    # rather than reusing a stale molecule-local/workspace-template-*:<sha> tag.
+    rm_by_filter "template images" "docker images --format '{{.Repository}}:{{.Tag}}'" "^molecule-local/" "docker rmi -f"
+    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/molecule/workspace-template-build" 2>/dev/null || true
+    echo "    reset complete — re-onboarding from a clean slate"
 }
 
 cleanup() {
@@ -209,8 +291,12 @@ if [ -z "${MOLECULE_TEMPLATE_REPO_TOKEN:-}" ] && [ -n "${MOLECULE_GITEA_TOKEN:-}
     export MOLECULE_TEMPLATE_REPO_TOKEN="$MOLECULE_GITEA_TOKEN"
 fi
 
-echo "==> Cleaning up previous local dev containers"
-cleanup_dev_stack
+if [ "$FRESH" -eq 1 ]; then
+    fresh_reset
+else
+    echo "==> Cleaning up previous local dev containers"
+    cleanup_dev_stack
+fi
 
 # ─────────────────────────────────────────── dynamic host ports (no hijack)
 #
@@ -456,11 +542,24 @@ else
     # container on the same dynamic host port we chose above so the
     # wait-for-/health loop (127.0.0.1:$PLATFORM_PORT) matches.
     export PLATFORM_PORT PLATFORM_PUBLISH_PORT="$PLATFORM_PORT"
-    docker compose up -d --build platform > /tmp/molecule-platform.log 2>&1 || {
-        echo "    ✗ docker compose up platform failed — see /tmp/molecule-platform.log"
-        echo "    Either install Go 1.25+ (https://go.dev/dl/) and rerun, or fix the docker fallback."
-        exit 1
-    }
+    if [ "$FRESH" -eq 1 ]; then
+        echo "    --fresh: rebuilding platform image with --no-cache"
+        docker compose build --no-cache platform > /tmp/molecule-platform.log 2>&1 || {
+            echo "    ✗ docker compose build --no-cache platform failed — see /tmp/molecule-platform.log"
+            exit 1
+        }
+        docker compose up -d platform >> /tmp/molecule-platform.log 2>&1 || {
+            echo "    ✗ docker compose up platform failed — see /tmp/molecule-platform.log"
+            echo "    Either install Go 1.25+ (https://go.dev/dl/) and rerun, or fix the docker fallback."
+            exit 1
+        }
+    else
+        docker compose up -d --build platform > /tmp/molecule-platform.log 2>&1 || {
+            echo "    ✗ docker compose up platform failed — see /tmp/molecule-platform.log"
+            echo "    Either install Go 1.25+ (https://go.dev/dl/) and rerun, or fix the docker fallback."
+            exit 1
+        }
+    fi
     # PLATFORM_PID is unset on this path; cleanup() handles that with `kill ... 2>/dev/null || true`.
     PLATFORM_PID=
 fi
