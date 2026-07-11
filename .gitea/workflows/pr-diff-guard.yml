@@ -12,12 +12,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 on:
-  pull_request:
+  # The override path needs trusted API credentials to verify who applied the
+  # label. Run base-branch code only; never execute the PR's version of the
+  # guard while the workflow token is in scope.
+  pull_request_target:
     branches: [main, staging]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
+  issues: read
+  pull-requests: read
 
 jobs:
   # bp-required: yes
@@ -30,11 +35,19 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
           # Full history is required to compute the merge-base against origin/main.
           fetch-depth: 0
+
+      - name: Fetch PR head without checking it out
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
 
       - name: Run PR diff guard
         env:
           PR_BASE_REF: ${{ github.base_ref }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITEA_SERVER_URL: ${{ github.server_url }}
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .gitea/scripts/pr-diff-guard.py
