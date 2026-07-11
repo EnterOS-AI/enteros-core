@@ -50,11 +50,13 @@ func expectDeclared(mock sqlmock.Sqlmock, declared []DeclaredPlugin, installed [
 	mock.ExpectQuery(`SELECT plugin_name, source_raw\s+FROM workspace_declared_plugins`).
 		WillReturnRows(dRows)
 
-	iRows := sqlmock.NewRows([]string{"plugin_name"})
+	iRows := sqlmock.NewRows([]string{"plugin_name", "source_raw", "installed_sha"})
 	for _, n := range installed {
-		iRows.AddRow(n)
+		// Name-only callers carry no source/SHA baseline → installed_sha NULL,
+		// so pluginFragmentStale short-circuits to not-stale (behavior preserved).
+		iRows.AddRow(n, "", nil)
 	}
-	mock.ExpectQuery(`SELECT plugin_name FROM workspace_plugins WHERE workspace_id`).
+	mock.ExpectQuery(`SELECT plugin_name, source_raw, installed_sha FROM workspace_plugins WHERE workspace_id`).
 		WillReturnRows(iRows)
 }
 

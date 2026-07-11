@@ -61,6 +61,12 @@ type ReconcileFunc func(ctx context.Context, workspaceID string)
 // default) still bounds each individual install inside this budget.
 const reconcileDeadline = 10 * time.Minute
 
+// resolveSourceSHA is the testable seam for re-resolving a branch-pinned
+// plugin's current upstream SHA. Production is plugins.ResolveSourceSHA (a
+// --depth=1 fetch + rev-parse against the source's own #branch fragment);
+// tests stub it to assert staleness handling without real git operations.
+var resolveSourceSHA = plugins.ResolveSourceSHA
+
 // ReconcileWorkspacePlugins is the production ReconcileFunc. It is exported so
 // the router can wire it into RegistryHandler.SetReconcileFunc.
 //
@@ -89,7 +95,7 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 		return // common case: workspace declares no plugins
 	}
 
-	installed, err := listInstalledPluginNames(ctx, workspaceID)
+	installed, err := listInstalledPluginRecords(ctx, workspaceID)
 	if err != nil {
 		log.Printf("Plugin reconcile: workspace=%s list installed failed: %v", workspaceID, err)
 		return
@@ -102,17 +108,32 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 
 	var installedCount, skipped int
 	for _, d := range declared {
-		if installed[d.PluginName] {
+		presentButStale := false
+		if rec, ok := installed[d.PluginName]; ok {
 			// Stale-row guard: the workspace_plugins row may survive a fresh
 			// image boot or de-baked box where /configs/plugins is empty. Trust
 			// the row ONLY when the plugin is also confirmed present on the box.
 			if h.pluginPresentOnBox(ctx, workspaceID, d.PluginName) {
-				skipped++
-				continue // installed in DB and present on box — idempotent no-op
+				// Content-aware reconcile (fix (b)): a present, DB-recorded plugin
+				// is normally an idempotent no-op — UNLESS it is branch-pinned
+				// (track=none) and its upstream tip has advanced past the SHA we
+				// installed. The drift sweeper only chases tag:/sha: pins, so a
+				// moving branch (e.g. the concierge management-MCP fragment on
+				// #main) would otherwise never propagate a merged change without a
+				// full reboot. Re-deliver when — and only when — the fragment moved.
+				if !h.pluginFragmentStale(ctx, d.SourceRaw, rec.InstalledSHA) {
+					skipped++
+					continue // installed, present, and up-to-date — idempotent no-op
+				}
+				presentButStale = true
+				log.Printf("Plugin reconcile: workspace=%s plugin=%s present but fragment moved (installed_sha stale) — re-delivering",
+					workspaceID, d.PluginName)
+				// Fall through to (re)delivery so the new fragment bytes land.
+			} else {
+				log.Printf("Plugin reconcile: workspace=%s plugin=%s installed-row present but not on box — re-delivering",
+					workspaceID, d.PluginName)
+				// Fall through to (re)delivery so the MCP actually lands in settings.json.
 			}
-			log.Printf("Plugin reconcile: workspace=%s plugin=%s installed-row present but not on box — re-delivering",
-				workspaceID, d.PluginName)
-			// Fall through to (re)delivery so the MCP actually lands in settings.json.
 		}
 
 		// Track value: a tag:/sha: ref opts the plugin into drift tracking;
@@ -137,7 +158,11 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 		// (boot-install disabled/failed, or a non-boot-install path) — the
 		// safety net. pluginPresentOnBox is conservative (false on any
 		// uncertainty) so a genuinely-missing install is never silently skipped.
-		if h.pluginPresentOnBox(ctx, workspaceID, stage.PluginName) {
+		//
+		// A plugin flagged presentButStale above bypasses this dedup: its bytes
+		// ARE on the box, but they are the OLD fragment, so we must deliver the
+		// re-staged (current) bytes rather than merely re-record the tracking row.
+		if !presentButStale && h.pluginPresentOnBox(ctx, workspaceID, stage.PluginName) {
 			log.Printf("Plugin reconcile: workspace=%s plugin=%s already on box (boot-installed) — recording tracking row only, no re-deliver/restart",
 				workspaceID, stage.PluginName)
 		} else {
@@ -191,6 +216,43 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 		log.Printf("Plugin reconcile: workspace=%s complete — installed=%d skipped(already-present)=%d declared=%d",
 			workspaceID, installedCount, skipped, len(declared))
 	}
+}
+
+// pluginFragmentStale reports whether a present, DB-recorded plugin's installed
+// content is behind its source — the signal fix (b) uses to re-deliver a
+// branch-pinned fragment whose upstream tip has moved. It returns true ONLY for
+// a branch-pinned (track=none) source whose current upstream SHA differs from
+// the recorded installed SHA — the case the drift sweeper (tag:/sha: only)
+// structurally never covers.
+//
+// Fail-CLOSED to not-stale on every uncertainty so a transient fetch blip, a
+// NULL/empty baseline, or an immutable tag/sha pin never triggers a churny
+// re-deliver (and never an online↔provisioning restart bounce):
+//   - installedSHA == ""            → no content baseline to compare against
+//   - trackFromSource != "none"     → tag:/sha: pin, owned by the drift sweeper
+//   - resolve error / empty result  → self-heals on a later beat, never churn
+//
+// Cost note: this adds one --depth=1 fetch per present branch-pinned plugin per
+// reconcile. The reconcile fires on transition-to-online (not a tight loop), and
+// the set is small (chiefly the concierge management-MCP + any user branch pins),
+// so the cost is bounded; a TTL cache is a documented follow-up if it ever bites.
+func (h *PluginsHandler) pluginFragmentStale(ctx context.Context, sourceRaw, installedSHA string) bool {
+	if installedSHA == "" {
+		return false // no baseline — can't tell if it moved; never churn
+	}
+	if trackFromSource(sourceRaw) != "none" {
+		return false // tag:/sha: pin is immutable and owned by the drift sweeper
+	}
+	cur, err := resolveSourceSHA(ctx, h.sources, sourceRaw)
+	if err != nil || cur == "" {
+		return false // transient resolve failure — self-heals next beat, never churn
+	}
+	if cur == installedSHA {
+		return false // up-to-date
+	}
+	log.Printf("Plugin reconcile: fragment change detected source=%s installed=%s upstream=%s",
+		sourceRaw, shortSHA(installedSHA), shortSHA(cur))
+	return true
 }
 
 // pluginPresentOnBox reports whether the plugin is already installed on the
