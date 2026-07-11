@@ -20,16 +20,123 @@ class ProtectedDeletionOverrideTest(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         return path
 
-    def test_pm_approved_label_enables_override(self):
+    def write_approvers(self, *logins):
+        directory = tempfile.TemporaryDirectory()
+        path = pathlib.Path(directory.name) / "approvers.txt"
+        path.write_text("\n".join(logins) + "\n", encoding="utf-8")
+        self.addCleanup(directory.cleanup)
+        return path
+
+    def test_pm_approved_label_from_authorized_actor_enables_override(self):
         path = self.write_event(
             {
+                "repository": {"full_name": "molecule-ai/molecule-core"},
                 "pull_request": {
+                    "number": 123,
                     "labels": [{"name": "diff-guard:pm-approved"}],
                 }
             }
         )
+        timeline = [
+            {
+                "id": 10,
+                "type": "label",
+                "label": {"name": "diff-guard:pm-approved"},
+                "user": {"login": "product-owner"},
+            }
+        ]
 
-        self.assertTrue(pr_diff_guard.protected_deletion_override_active(path))
+        self.assertTrue(
+            pr_diff_guard.protected_deletion_override_active(
+                path,
+                timeline_fetcher=lambda _event: timeline,
+                approvers_path=self.write_approvers(
+                    "product-owner", "product-manager"
+                ),
+            )
+        )
+
+    def test_pm_approved_label_from_unauthorized_actor_fails_closed(self):
+        path = self.write_event(
+            {
+                "repository": {"full_name": "molecule-ai/molecule-core"},
+                "pull_request": {
+                    "number": 123,
+                    "labels": [{"name": "diff-guard:pm-approved"}],
+                },
+            }
+        )
+        timeline = [
+            {
+                "id": 10,
+                "type": "label",
+                "label": {"name": "diff-guard:pm-approved"},
+                "user": {"login": "release-bot"},
+            }
+        ]
+
+        self.assertFalse(
+            pr_diff_guard.protected_deletion_override_active(
+                path,
+                timeline_fetcher=lambda _event: timeline,
+                approvers_path=self.write_approvers("product-owner"),
+            )
+        )
+
+    def test_label_removal_after_authorized_application_fails_closed(self):
+        path = self.write_event(
+            {
+                "repository": {"full_name": "molecule-ai/molecule-core"},
+                "pull_request": {
+                    "number": 123,
+                    "labels": [{"name": "diff-guard:pm-approved"}],
+                },
+            }
+        )
+        timeline = [
+            {
+                "id": 10,
+                "type": "label",
+                "label": {"name": "diff-guard:pm-approved"},
+                "user": {"login": "product-owner"},
+            },
+            {
+                "id": 11,
+                "type": "unlabel",
+                "label": {"name": "diff-guard:pm-approved"},
+                "user": {"login": "product-owner"},
+            },
+        ]
+
+        self.assertFalse(
+            pr_diff_guard.protected_deletion_override_active(
+                path,
+                timeline_fetcher=lambda _event: timeline,
+                approvers_path=self.write_approvers("product-owner"),
+            )
+        )
+
+    def test_timeline_api_failure_fails_closed(self):
+        path = self.write_event(
+            {
+                "repository": {"full_name": "molecule-ai/molecule-core"},
+                "pull_request": {
+                    "number": 123,
+                    "labels": [{"name": "diff-guard:pm-approved"}],
+                },
+            }
+        )
+
+        def fail_fetch(_event):
+            raise OSError("timeline unavailable")
+
+        self.assertFalse(
+            pr_diff_guard.protected_deletion_override_active(
+                path,
+                timeline_fetcher=fail_fetch,
+                approvers_path=self.write_approvers("product-owner"),
+            )
+        )
 
     def test_unrelated_label_does_not_enable_override(self):
         path = self.write_event(

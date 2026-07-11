@@ -1,0 +1,4 @@
+# Human accounts authorized to approve protected-path deletions.
+# This file is consumed from the trusted base branch by pull_request_target.
+hongming
+cui

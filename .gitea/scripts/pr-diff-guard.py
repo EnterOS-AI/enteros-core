@@ -16,6 +16,10 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
+from pathlib import Path
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 
 PROTECTED_PATHS = (
@@ -32,12 +36,75 @@ DEFAULT_MAX_CHANGED_FILES = int(os.environ.get("DIFFGUARD_MAX_CHANGED_FILES", "1
 DEFAULT_MAX_DELETIONS = int(os.environ.get("DIFFGUARD_MAX_DELETIONS", "5000"))
 DEFAULT_MAX_INSERTIONS = int(os.environ.get("DIFFGUARD_MAX_INSERTIONS", "10000"))
 PROTECTED_DELETION_OVERRIDE_LABEL = "diff-guard:pm-approved"
+PM_APPROVERS_PATH = Path(__file__).parents[1] / "diff-guard-pm-approvers.txt"
+
+
+def load_pm_approvers(path: str | os.PathLike[str]) -> set[str]:
+    """Load the base-branch allowlist of human Gitea logins."""
+    with open(path, encoding="utf-8") as approvers_file:
+        return {
+            line.casefold()
+            for raw_line in approvers_file
+            if (line := raw_line.strip()) and not line.startswith("#")
+        }
+
+
+def fetch_pr_timeline(event: dict[str, object]) -> list[dict[str, object]]:
+    """Fetch the trusted issue timeline used to identify the label actor."""
+    server_url = os.environ.get("GITEA_SERVER_URL", "").rstrip("/")
+    token = os.environ.get("GITEA_TOKEN", "")
+    repository = event.get("repository", {})
+    pull_request = event.get("pull_request", {})
+    if not isinstance(repository, dict) or not isinstance(pull_request, dict):
+        raise ValueError("event is missing repository or pull_request metadata")
+
+    full_name = repository.get("full_name") or os.environ.get("GITHUB_REPOSITORY", "")
+    pr_number = pull_request.get("number") or event.get("number")
+    if not server_url or not token or not isinstance(full_name, str) or not pr_number:
+        raise ValueError("timeline API configuration is incomplete")
+
+    try:
+        owner, repo = full_name.split("/", 1)
+        pr_number = int(pr_number)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid repository or pull request metadata") from exc
+
+    timeline: list[dict[str, object]] = []
+    for page in range(1, 21):
+        url = (
+            f"{server_url}/api/v1/repos/{quote(owner, safe='')}/"
+            f"{quote(repo, safe='')}/issues/{pr_number}/timeline?limit=100&page={page}"
+        )
+        request = Request(
+            url,
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/json",
+                "User-Agent": "curl/8.4.0",
+            },
+        )
+        with urlopen(request, timeout=10) as response:  # noqa: S310 - fixed Gitea host
+            page_items = json.load(response)
+        if not isinstance(page_items, list):
+            raise ValueError("timeline API returned a non-list response")
+        if not all(isinstance(item, dict) for item in page_items):
+            raise ValueError("timeline API returned a malformed event")
+        timeline.extend(page_items)
+        if len(page_items) < 100:
+            return timeline
+
+    raise ValueError("timeline API exceeded the 2,000-event safety bound")
 
 
 def protected_deletion_override_active(
     event_path: str | os.PathLike[str] | None = None,
+    *,
+    timeline_fetcher: Callable[
+        [dict[str, object]], list[dict[str, object]]
+    ] = fetch_pr_timeline,
+    approvers_path: str | os.PathLike[str] = PM_APPROVERS_PATH,
 ) -> bool:
-    """Return whether the trusted PR event carries the PM override label."""
+    """Return whether an authorized PM most recently applied the override."""
     raw_path = (
         os.fspath(event_path)
         if event_path is not None
@@ -56,12 +123,69 @@ def protected_deletion_override_active(
         )
         return False
 
-    labels = event.get("pull_request", {}).get("labels", [])
-    return any(
+    if not isinstance(event, dict):
+        print("::warning::diff-guard event is not an object; failing closed")
+        return False
+
+    pull_request = event.get("pull_request", {})
+    if not isinstance(pull_request, dict):
+        print("::warning::diff-guard event has no pull request; failing closed")
+        return False
+    labels = pull_request.get("labels", [])
+    label_present = isinstance(labels, list) and any(
         isinstance(label, dict)
         and label.get("name") == PROTECTED_DELETION_OVERRIDE_LABEL
         for label in labels
     )
+    if not label_present:
+        return False
+
+    try:
+        authorized_actors = load_pm_approvers(approvers_path)
+    except OSError as exc:
+        print(f"::warning::could not read PM approver policy; failing closed: {exc}")
+        return False
+    if not authorized_actors:
+        print("::warning::PM approver policy is empty; protected-path override fails closed")
+        return False
+
+    try:
+        timeline = timeline_fetcher(event)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"::warning::could not verify diff-guard label actor; failing closed: {exc}")
+        return False
+    if not isinstance(timeline, list):
+        print("::warning::diff-guard timeline is malformed; failing closed")
+        return False
+
+    label_events = [
+        item
+        for item in timeline
+        if isinstance(item, dict)
+        and isinstance(item.get("label"), dict)
+        and item["label"].get("name") == PROTECTED_DELETION_OVERRIDE_LABEL
+        and item.get("type") in {"label", "unlabel"}
+    ]
+    if not label_events or not all(isinstance(item.get("id"), int) for item in label_events):
+        print("::warning::no valid diff-guard label event found; failing closed")
+        return False
+
+    latest = max(label_events, key=lambda item: item["id"])
+    if latest.get("type") != "label":
+        print("::warning::latest diff-guard label event is removal; failing closed")
+        return False
+
+    actor = latest.get("user", {})
+    login = actor.get("login", "") if isinstance(actor, dict) else ""
+    if not isinstance(login, str) or login.casefold() not in authorized_actors:
+        print(
+            "::warning::diff-guard label was not applied by an authorized PM; "
+            "failing closed"
+        )
+        return False
+
+    print(f"::notice::verified {PROTECTED_DELETION_OVERRIDE_LABEL} actor: {login}")
+    return True
 
 
 def git(*args: str) -> str:
