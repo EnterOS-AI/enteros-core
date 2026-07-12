@@ -39,6 +39,7 @@ import {
   type SelectorValue,
 } from "@/components/ProviderModelSelector";
 import { Spinner } from "@/components/Spinner";
+import { BootSequenceScreen } from "@/components/BootSequenceScreen";
 import {
   defaultGateDeps,
   evaluateSelfHostSetupGate,
@@ -206,6 +207,14 @@ export function SelfHostSetupScene() {
   // ── Provision watch: primary = the store's socket-driven status ──
   const storeStatus = useCanvasStore((s) => platformStatusOf(s.nodes));
   const storeLastError = useCanvasStore((s) => platformErrorOf(s.nodes));
+  // The platform root node itself — handed to BootSequenceScreen so the watching
+  // phase renders the real Enter OS boot (keycaps + watchdog log) instead of a
+  // bare spinner. Same node the concierge shell boots from (#3942); the scene
+  // stays mounted, so a Failed status still flips to the error card below and an
+  // Online status still auto-dismisses into the concierge shell.
+  const platformNode = useCanvasStore(
+    (s) => s.nodes.find((n) => n.data.kind === WORKSPACE_KIND.Platform) ?? null,
+  );
   useEffect(() => {
     if (phase.kind !== "watching") return;
     if (storeStatus === WORKSPACE_STATUS.Online) {
@@ -327,6 +336,42 @@ export function SelfHostSetupScene() {
   }, [visible, step, phase.kind]);
 
   if (!visible) return null;
+
+  // While the platform agent provisions, hand the whole screen to the Enter OS
+  // boot sequence (the same one the concierge shell boots from, #3942) rather
+  // than shadowing it with a bare spinner. Gated on the node existing so the
+  // brief pre-node window (and node-less tests) still falls through to the
+  // spinner card. `scene-progress` / `scene-slow-hint` markers are preserved so
+  // the phase + slow-hint contracts hold.
+  if (phase.kind === "watching" && platformNode) {
+    return (
+      <div
+        ref={containerRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="selfhost-setup-title"
+        data-testid="selfhost-setup-scene"
+        tabIndex={-1}
+        className="fixed inset-0 z-[10000] bg-surface"
+      >
+        <h1 id="selfhost-setup-title" className="sr-only">
+          Set up your platform agent
+        </h1>
+        <div data-testid="scene-progress" className="h-full">
+          <BootSequenceScreen node={platformNode} />
+        </div>
+        {slowHint && (
+          <p
+            data-testid="scene-slow-hint"
+            className="absolute inset-x-0 bottom-4 text-center text-[11px] text-ink-mid leading-relaxed px-4"
+          >
+            Still provisioning — pulling the runtime image can take a few minutes
+            on first boot.
+          </p>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div
