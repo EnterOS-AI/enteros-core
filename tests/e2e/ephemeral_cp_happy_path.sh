@@ -92,14 +92,42 @@ BOOT_ENV_FILE="$(mktemp)"; chmod 600 "$BOOT_ENV_FILE"
   [ -n "${MINIMAX_API_KEY:-}" ] && echo "MINIMAX_API_KEY=${MINIMAX_API_KEY}"
 } >> "$BOOT_ENV_FILE"
 
+# Throwaway Postgres (started just below). The CP's `up` requires an EXTERNAL PG
+# — it creates a fresh per-run database on it and does NOT stand up its own. The
+# runner owns the PG lifecycle so `up` gets a DB in BOTH CI and local (local == CI).
+PG_CTR=""
 cleanup() {
   local rc=$?
   echo "[proof] tearing down ephemeral CP namespace ${NS}..." >&2
   "$CP_EPHEMERAL_SCRIPT" down --ns "$NS" >/dev/null 2>&1 || echo "[proof] (down non-zero — the standing reaper will collect it)" >&2
+  if [ -n "${PG_CTR:-}" ]; then docker rm -f "$PG_CTR" >/dev/null 2>&1 || true; fi
   rm -f "$BOOT_ENV_FILE" 2>/dev/null || true
   exit "$rc"
 }
 trap cleanup EXIT INT TERM
+
+# --- ephemeral throwaway Postgres --------------------------------------------
+# postgres:16 on an ephemeral host port; `up` reaches it via --pg-container
+# (docker exec psql — the runner image has no host psql client) and injects a
+# per-run DATABASE_URL into the CP. Mirrors the CP-side gate's PG step exactly.
+PG_CTR="pg-${NS}"
+PG_SUPERPASS="ephemeral-pr-pg"
+docker rm -f "$PG_CTR" >/dev/null 2>&1 || true
+docker run -d --name "$PG_CTR" \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD="$PG_SUPERPASS" \
+  -e POSTGRES_DB=postgres \
+  -p 127.0.0.1:0:5432 postgres:16 >/dev/null \
+  || { echo "FATAL: could not start ephemeral Postgres container ${PG_CTR}" >&2; exit 1; }
+PG_PORT="$(docker port "$PG_CTR" 5432/tcp | awk -F: '/127\.0\.0\.1:/ {print $2; exit}')"
+[ -n "$PG_PORT" ] || PG_PORT="$(docker port "$PG_CTR" 5432/tcp | head -1 | awk -F: '{print $NF}')"
+[ -n "$PG_PORT" ] || { echo "FATAL: no host port for ${PG_CTR}" >&2; docker logs "$PG_CTR" 2>&1 | tail -20 >&2 || true; exit 1; }
+pg_ready=""
+for _ in $(seq 1 30); do
+  if docker exec "$PG_CTR" pg_isready -U postgres >/dev/null 2>&1; then pg_ready=1; break; fi
+  sleep 1
+done
+[ -n "$pg_ready" ] || { echo "FATAL: ephemeral Postgres ${PG_CTR} never became ready" >&2; docker logs "$PG_CTR" 2>&1 | tail -20 >&2 || true; exit 1; }
+echo "[proof] ephemeral PG ${PG_CTR} ready on 127.0.0.1:${PG_PORT}" >&2
 
 echo "[proof] spinning up throwaway CP (baseline ${CP_IMAGE}) provisioning tenant ${TENANT_IMAGE} in ${NS}..." >&2
 # `up` prints CP_BASE_URL= / CP_BASE_URL_HOST= / NS= on stdout (log() → stderr),
@@ -107,7 +135,10 @@ echo "[proof] spinning up throwaway CP (baseline ${CP_IMAGE}) provisioning tenan
 CP_BASE_URL=""
 # Capture first, then eval — avoids nested double-quotes inside "$(...)" which
 # misparse on older bash (bash 3.2). up() prints CP_BASE_URL=/NS= on stdout.
-up_output=$("$CP_EPHEMERAL_SCRIPT" up --ns "$NS" --image "$CP_IMAGE" --boot-env-file "$BOOT_ENV_FILE")
+up_output=$("$CP_EPHEMERAL_SCRIPT" up --ns "$NS" --image "$CP_IMAGE" \
+  --pg-host 127.0.0.1 --pg-port "$PG_PORT" --pg-container "$PG_CTR" \
+  --pg-superuser postgres --pg-superpass "$PG_SUPERPASS" \
+  --boot-env-file "$BOOT_ENV_FILE")
 eval "$up_output"
 [ -n "${CP_BASE_URL:-}" ] || { echo "FATAL: ephemeral CP up did not emit CP_BASE_URL (see its FATAL above)" >&2; exit 1; }
 echo "[proof] ephemeral CP serving at ${CP_BASE_URL}" >&2
