@@ -918,7 +918,11 @@ describe("derived-state resume", () => {
     expect(scene().textContent).toContain("Booting");
   });
 
-  it("watching with no platform node falls back to the spinner card (+ slow hint)", async () => {
+  it("a transient node drop mid-watch KEEPS the boot sequence (no flicker to spinner)", async () => {
+    // Regression (#15): the platform-node selector returns null when a store
+    // update transiently ships a nodes array lacking the Platform node. The
+    // scene holds the last-known node so the boot UI does NOT drop back to the
+    // bare spinner card mid-provision.
     vi.useFakeTimers();
     routeApi();
     seedNodes([platformNode({ status: "provisioning" })]);
@@ -927,12 +931,41 @@ describe("derived-state resume", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
     // node present → the boot sequence renders (the `&& platformNode` true side).
-    expect(scene().textContent).toContain("Booting");
-    // node vanishes mid-watch → the guard's false side: fall through to the bare
-    // spinner card instead of handing BootSequenceScreen a null node.
+    expect(screen.getByTestId("boot-sequence-screen")).toBeTruthy();
+    // node vanishes mid-watch (transient churn) → the last-known node keeps the
+    // boot sequence on screen instead of flickering to the spinner card.
     await act(async () => {
       seedNodes([]);
     });
+    expect(screen.getByTestId("boot-sequence-screen")).toBeTruthy();
+    expect(scene().textContent).toContain("Booting");
+    // The slow-provision hint still overlays the boot sequence past the
+    // threshold (the early-return path preserves it).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SLOW_PROVISION_HINT_MS);
+    });
+    expect(screen.getByTestId("scene-slow-hint")).toBeTruthy();
+  });
+
+  it("watching with NO platform node ever seen falls back to the spinner card (+ slow hint)", async () => {
+    // The node-less-from-start path (never any Platform node this session):
+    // there is nothing to hold, so the guard's false side falls through to the
+    // bare spinner card rather than handing BootSequenceScreen a null node.
+    vi.useFakeTimers();
+    const { state } = routeApi();
+    seedNodes([]); // no platform root at any point → rootId=null, node never seen
+    state.workspaces = [{ id: "root-1", kind: "platform", status: "provisioning" }];
+    render(<SelfHostSetupScene />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    // Walk the form and configure so we enter the watching phase with no node.
+    await walkToReviewWithKey("sk-openai-key", { runtime: "codex" });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("scene-configure"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.queryByTestId("boot-sequence-screen")).toBeNull();
     expect(screen.getByTestId("scene-progress")).toBeTruthy();
     expect(scene().textContent).toContain("Provisioning");
     // and the card's own slow-provision hint still fires past the threshold.
@@ -984,6 +1017,102 @@ describe("derived-state resume", () => {
     expect(screen.getByTestId("scene-step-welcome")).toBeTruthy();
     // No localStorage involvement anywhere in the scene.
     expect(Object.keys(localStorage)).toHaveLength(0);
+  });
+});
+
+// ── Watching-phase boot failure + focus trap (#7, #8) ───────────────────────
+
+describe("watching-phase boot failure + a11y", () => {
+  it("a failed BOOT_STEP (presentation-only, status still provisioning) flips to the error/retry card (#8)", async () => {
+    // BootSequenceScreen paints its own red "Boot failed" banner off a failed
+    // boot step, but the node's aggregate status is still `provisioning` — the
+    // step is presentation-only. Without the scene detecting it, the user is
+    // stranded on a dead red screen. The scene must flip to its retry card.
+    routeApi();
+    seedNodes([platformNode({ status: "provisioning" })]);
+    render(<SelfHostSetupScene />);
+    await flush();
+    // Resumed straight into the boot sequence (still provisioning).
+    expect(screen.getByTestId("boot-sequence-screen")).toBeTruthy();
+    // A boot step fails while the node status stays `provisioning`.
+    await act(async () => {
+      seedNodes([
+        platformNode({
+          status: "provisioning",
+          bootSteps: [
+            { step: 3, total: 8, key: "RT", label: "Start runtime", status: "failed", message: "runtime crashed on boot" },
+          ],
+        }),
+      ]);
+    });
+    // The scene left the boot screen for its own error/retry card, carrying the
+    // step's message as the humanized reason.
+    expect(screen.queryByTestId("boot-sequence-screen")).toBeNull();
+    const error = screen.getByTestId("scene-error");
+    expect(error.textContent).toContain("runtime crashed on boot");
+    expect(screen.getByTestId("scene-retry")).toBeTruthy();
+  });
+
+  it("boot steps present but none failed keep the boot screen (no false error flip) (#8)", async () => {
+    // The `.find(failed) ?? null` path: a non-empty bootSteps array with only
+    // running/ok steps must NOT flip to the error card — the boot screen stays.
+    routeApi();
+    seedNodes([
+      platformNode({
+        status: "provisioning",
+        bootSteps: [
+          { step: 1, total: 8, key: "PLG", label: "Install plugins", status: "ok" },
+          { step: 2, total: 8, key: "ID", label: "Load identity", status: "running" },
+        ],
+      }),
+    ]);
+    render(<SelfHostSetupScene />);
+    await flush();
+    expect(screen.getByTestId("boot-sequence-screen")).toBeTruthy();
+    expect(screen.queryByTestId("scene-error")).toBeNull();
+  });
+
+  it("a failed BOOT_STEP with no message falls back to the step label (#8)", async () => {
+    routeApi();
+    seedNodes([platformNode({ status: "provisioning" })]);
+    render(<SelfHostSetupScene />);
+    await flush();
+    await act(async () => {
+      seedNodes([
+        platformNode({
+          status: "provisioning",
+          bootSteps: [
+            { step: 4, total: 8, key: "MCP", label: "Management MCP", status: "failed" },
+          ],
+        }),
+      ]);
+    });
+    expect(screen.getByTestId("scene-error").textContent).toContain(
+      "Boot failed at Management MCP",
+    );
+  });
+
+  it("the watching boot screen has the focus-trap handler wired (#7)", async () => {
+    // Regression (#7): the watching early-return container omitted the
+    // onKeyDown focus-trap handler the main modal return has, so the trap was
+    // dead the whole provision window. While provisioning the boot screen's
+    // ENTER OS key is disabled, so the focusable set is empty and the trap
+    // preventDefaults the Tab. If the handler were missing (the regression),
+    // the keydown would go unhandled and NOT be defaultPrevented.
+    routeApi();
+    seedNodes([platformNode({ status: "provisioning" })]);
+    render(<SelfHostSetupScene />);
+    await flush();
+    const dialog = scene();
+    expect(screen.getByTestId("boot-sequence-screen")).toBeTruthy();
+    const tab = new KeyboardEvent("keydown", {
+      key: "Tab",
+      bubbles: true,
+      cancelable: true,
+    });
+    dialog.dispatchEvent(tab);
+    // The handler ran and trapped the Tab (empty focusable set → preventDefault).
+    expect(tab.defaultPrevented).toBe(true);
   });
 });
 
