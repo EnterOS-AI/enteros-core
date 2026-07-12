@@ -1,0 +1,164 @@
+name: E2E Ephemeral CP Happy Path
+
+# RFC "one pre-merge ephemeral gate" §04 — the one-scenario PROOF (advisory).
+#
+# Runs the CORE happy-path (test_staging_full_saas.sh) against a THROWAWAY CP it
+# spins up itself, with THIS PR's tenant image substituted in and the RELEASED
+# controlplane as the baseline — NO shared staging, NO post-merge dependency.
+# This validates the SDK-owned-happy-path model (the happy-path E2E is a
+# cross-boundary contract both repos run against an ephemeral CP).
+#
+# ADVISORY during the proof soak. The migration end-state — move the contract
+# into the SDK, wire both repos, flip to required, demote the E2E Staging jobs —
+# is tracked in the RFC. Do NOT renew this mask silently.
+#
+# Reuses the CP repo's ephemeral spin-up plumbing (scripts/deploy/pr-ephemeral-cp.sh),
+# the shared harness the RFC generalizes.
+
+"on":
+  pull_request:
+    branches: [main]
+    paths:
+      - 'workspace-server/**'
+      - 'tests/e2e/test_staging_full_saas.sh'
+      - 'tests/e2e/ephemeral_cp_happy_path.sh'
+      - 'tests/e2e/lib/**'
+      - '.gitea/workflows/e2e-ephemeral-happy-path.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'workspace-server/**'
+      - 'tests/e2e/test_staging_full_saas.sh'
+      - 'tests/e2e/ephemeral_cp_happy_path.sh'
+      - 'tests/e2e/lib/**'
+      - '.gitea/workflows/e2e-ephemeral-happy-path.yml'
+
+concurrency:
+  # Serialize on the shared docker-host runner (same reasoning as harness-replays):
+  # the ephemeral CP + tenant + per-run PG bind host resources; overlapping runs
+  # cross-wire. Queue, never cancel (a cancel mid-run would leak the namespace —
+  # the standing reaper would eventually collect it, but queueing is cleaner).
+  group: e2e-ephemeral-happy-path-runner
+  cancel-in-progress: false
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+  # The released controlplane image the ephemeral CP boots from (the BASELINE in
+  # the image-substitution matrix — a core PR tests its tenant against a stable CP).
+  CP_BASELINE_IMAGE: registry.moleculesai.app/molecule-ai/controlplane:staging-latest
+
+jobs:
+  # bp-exempt: advisory proof gate (RFC §04). CI / all-required is the merge aggregate.
+  happy-path:
+    name: E2E Ephemeral CP Happy Path
+    # docker-host: needs a real docker.sock + molecule-core-net to spin the CP,
+    # its Postgres, and the provisioned tenant (same runner class as harness-replays).
+    runs-on: docker-host
+    continue-on-error: true
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # e2e creds from the Infisical SSOT: the MiniMax LLM key (the SAME key the
+      # post-merge gate uses; RFC finding D moves it to a low-value e2e path later)
+      # and AUTO_SYNC_TOKEN (devops-engineer PAT) to clone the CP spin-up plumbing.
+      # FORK SAFETY: same-repo PRs only — a fork must never harvest these.
+      - name: Fetch e2e creds from Infisical SSOT
+        id: creds
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          [ -n "$TOK" ] || { echo "::error::Infisical login returned empty accessToken"; exit 1; }
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane)
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+          echo "::add-mask::$MINIMAX_API_KEY"
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          echo "MINIMAX_API_KEY=$MINIMAX_API_KEY" >> "$GITHUB_ENV"
+          echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
+          echo "creds loaded (minimax len=${#MINIMAX_API_KEY}, sync len=${#AUTO_SYNC_TOKEN})"
+
+      # The shared spin-up plumbing (RFC §04): pr-ephemeral-cp.sh lives in the CP
+      # repo today; clone it read-only. (When the harness is generalized this
+      # becomes a vendored/shared action, not a clone.)
+      - name: Clone controlplane for the ephemeral spin-up plumbing
+        if: env.AUTO_SYNC_TOKEN != ''
+        run: |
+          set -euo pipefail
+          rm -rf .cp-ephemeral
+          git clone --depth 1 \
+            "https://oauth2:${AUTO_SYNC_TOKEN}@git.moleculesai.app/molecule-ai/molecule-controlplane.git" \
+            .cp-ephemeral
+          chmod +x .cp-ephemeral/scripts/deploy/pr-ephemeral-cp.sh
+          echo "cloned pr-ephemeral-cp.sh"
+
+      # Pre-clone manifest deps so Dockerfile.tenant's COPY of .tenant-bundle-deps
+      # resolves (identical to harness-replays' pre-clone).
+      - name: Pre-clone manifest deps
+        if: env.AUTO_SYNC_TOKEN != ''
+        env:
+          MOLECULE_GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tenant-bundle-deps
+          sed '/^[[:space:]]*\/\//d' manifest.json > .manifest-stripped.json
+          bash scripts/clone-manifest.sh \
+            .manifest-stripped.json \
+            .tenant-bundle-deps/workspace-configs-templates \
+            .tenant-bundle-deps/org-templates \
+            .tenant-bundle-deps/plugins
+          echo "manifest deps cloned"
+
+      # Build THIS PR's tenant image (the UNDER-TEST side of the substitution).
+      - name: Build PR tenant image
+        if: env.AUTO_SYNC_TOKEN != ''
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            -f workspace-server/Dockerfile.tenant \
+            --build-arg GIT_SHA="${HEAD_SHA}" \
+            -t "molecule-tenant:pr-${HEAD_SHA:0:8}" \
+            .
+          echo "TENANT_IMAGE=molecule-tenant:pr-${HEAD_SHA:0:8}" >> "$GITHUB_ENV"
+
+      # Pull the released CP baseline (the OTHER side of the substitution).
+      - name: Pull baseline controlplane image
+        if: env.AUTO_SYNC_TOKEN != ''
+        run: |
+          set -euo pipefail
+          docker pull "${CP_BASELINE_IMAGE}"
+          echo "pulled ${CP_BASELINE_IMAGE}"
+
+      # The proof: full-saas against the throwaway CP, zero staging creds.
+      - name: Run core happy-path against an ephemeral CP
+        if: env.AUTO_SYNC_TOKEN != ''
+        env:
+          CP_IMAGE: ${{ env.CP_BASELINE_IMAGE }}
+          TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
+          CP_EPHEMERAL_SCRIPT: ${{ github.workspace }}/.cp-ephemeral/scripts/deploy/pr-ephemeral-cp.sh
+          MINIMAX_API_KEY: ${{ env.MINIMAX_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          E2E_RUNTIME: hermes
+        run: bash tests/e2e/ephemeral_cp_happy_path.sh
+
+      # Fork-PR fallback: no creds → loud skip, never a silent green.
+      - name: Fork PR — advisory skip (no e2e creds)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true
+        run: |
+          echo "::notice::Fork PR — ephemeral-CP happy-path proof skipped (no e2e creds by design). The post-merge run covers it."

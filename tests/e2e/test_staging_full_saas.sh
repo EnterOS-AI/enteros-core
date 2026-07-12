@@ -588,7 +588,14 @@ case "$CP_HOST" in
   *)             DERIVED_DOMAIN="$CP_HOST" ;;
 esac
 TENANT_DOMAIN="${MOLECULE_TENANT_DOMAIN:-$DERIVED_DOMAIN}"
-TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
+# MOLECULE_TENANT_URL override — the EPHEMERAL-CP path (RFC "one pre-merge gate"
+# §04). Staging front-doors each tenant at its own subdomain (slug.<domain>); an
+# ephemeral CP instead routes tenant traffic by the X-Molecule-Org-Id header
+# (which tenant_call already sends) when hit at the CP base URL directly — the
+# SAME pattern the CP-side gate uses (local-cp-staging-e2e-gate.sh: hit
+# CP_BASE_URL with the org header). So the ephemeral runner points this at the
+# throwaway CP; default (unset) keeps the exact staging subdomain behavior.
+TENANT_URL="${MOLECULE_TENANT_URL:-https://$SLUG.$TENANT_DOMAIN}"
 log "    TENANT_URL=$TENANT_URL"
 
 # ─── 3. Retrieve per-tenant admin token ────────────────────────────────
