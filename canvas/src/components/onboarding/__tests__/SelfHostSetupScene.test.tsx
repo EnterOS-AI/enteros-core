@@ -918,6 +918,48 @@ describe("derived-state resume", () => {
     expect(scene().textContent).toContain("Booting");
   });
 
+  it("watching with no platform node falls back to the spinner card (+ slow hint)", async () => {
+    vi.useFakeTimers();
+    routeApi();
+    seedNodes([platformNode({ status: "provisioning" })]);
+    render(<SelfHostSetupScene />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    // node present → the boot sequence renders (the `&& platformNode` true side).
+    expect(scene().textContent).toContain("Booting");
+    // node vanishes mid-watch → the guard's false side: fall through to the bare
+    // spinner card instead of handing BootSequenceScreen a null node.
+    await act(async () => {
+      seedNodes([]);
+    });
+    expect(screen.getByTestId("scene-progress")).toBeTruthy();
+    expect(scene().textContent).toContain("Provisioning");
+    // and the card's own slow-provision hint still fires past the threshold.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SLOW_PROVISION_HINT_MS);
+    });
+    expect(screen.getByTestId("scene-slow-hint")).toBeTruthy();
+  });
+
+  it("surfaces the slow-provision hint over the boot sequence after the threshold", async () => {
+    vi.useFakeTimers();
+    routeApi();
+    seedNodes([platformNode({ status: "provisioning" })]);
+    render(<SelfHostSetupScene />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    // resumed straight into the boot sequence (node present), hint not yet shown
+    expect(scene().textContent).toContain("Booting");
+    expect(screen.queryByTestId("scene-slow-hint")).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SLOW_PROVISION_HINT_MS);
+    });
+    // the §8 slow-provision hint overlays the boot sequence (early-return path)
+    expect(screen.getByTestId("scene-slow-hint")).toBeTruthy();
+  });
+
   it("root failed → resumes into the humanized error view; Adjust setup restarts the form", async () => {
     routeApi();
     seedNodes([
