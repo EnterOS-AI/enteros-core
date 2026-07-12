@@ -19,12 +19,18 @@ import (
 // maxExecOutput limits container exec output to 5MB to prevent OOM.
 const maxExecOutput = 5 * 1024 * 1024
 
-// localConfigsBase is the on-disk root the Files API writes to when this
-// process runs INSIDE the workspace container (molecules-server / local-docker
-// tenant, no docker socket). The config volume is mounted at /configs inside
-// the container, so writing there directly is the local equivalent of the
-// docker CopyToContainer(dest="/configs") path.
-const localConfigsBase = "/configs"
+// Docker-less config sink (molecules-server / local-docker tenant, #206): when
+// this process runs INSIDE the workspace container with NO docker.sock, the
+// Files API can neither docker-exec into a sibling runtime container nor write
+// to `/configs` at its OWN filesystem root — the workspace-server runs as the
+// non-root `canvas` user, so `mkdir /configs` fails with "permission denied"
+// (the earlier assumption that `/configs` is a writable local mount was wrong;
+// Dockerfile.tenant never creates it). The docker-less SINK is instead the
+// per-workspace HOST-SIDE MIRROR `<hostStateDir>/<wsid>/configs` — the SAME dir
+// the docker-less Files-API READ path serves from (hostSideConfigsRoot /
+// bootconfig.go / provisioner.HostSideConfigsDir). Writing there keeps PUT/GET
+// consistent and persists the bundle for re-delivery. See writeViaEphemeral /
+// deleteViaEphemeral below.
 
 // containedJoin joins relPath under base and refuses anything that escapes
 // base after cleaning (absolute paths, ".." traversal). It is the os.*
@@ -190,15 +196,18 @@ func (h *TemplatesHandler) copyFilesToContainer(ctx context.Context, containerNa
 
 // writeViaEphemeral writes files to a named volume using an ephemeral Alpine container.
 // Used when the workspace container is offline (e.g., during provisioning).
-func (h *TemplatesHandler) writeViaEphemeral(ctx context.Context, volumeName string, files map[string]string) error {
+func (h *TemplatesHandler) writeViaEphemeral(ctx context.Context, volumeName, workspaceID string, files map[string]string) error {
 	if h.docker == nil {
-		// No docker client → this process runs inside the workspace container
-		// on a molecules-server (local-docker) tenant. The config volume is
-		// mounted locally at /configs, so write each file straight to disk
-		// under that base, with the same path-traversal containment the
-		// CopyToContainer path enforces. This is what makes config.yaml
-		// Save&Restart work on the default provider (no docker socket).
-		return writeFilesLocal(localConfigsBase, files)
+		// No docker client → molecules-server (local-docker) tenant. Write to the
+		// per-workspace HOST-SIDE MIRROR (the same dir the docker-less READ path
+		// serves from), NOT `/configs` at the fs root (unwritable to `canvas` and
+		// inconsistent with reads). This is what makes config.yaml Save&Restart
+		// work on the default provider (no docker socket).
+		mirror := h.hostSideConfigsRoot("/configs", workspaceID)
+		if mirror == "" {
+			return fmt.Errorf("docker-less config write unavailable: no host-side configs mirror for workspace %q (hostStateDir empty)", workspaceID)
+		}
+		return writeFilesLocal(mirror, files)
 	}
 
 	// Create ephemeral container mounting the volume
@@ -228,7 +237,7 @@ func (h *TemplatesHandler) writeViaEphemeral(ctx context.Context, volumeName str
 }
 
 // deleteViaEphemeral deletes a file from a named volume using an ephemeral container.
-func (h *TemplatesHandler) deleteViaEphemeral(ctx context.Context, volumeName, filePath string) error {
+func (h *TemplatesHandler) deleteViaEphemeral(ctx context.Context, volumeName, workspaceID, filePath string) error {
 	// CWE-78/CWE-22: exec form binds rm to the /configs volume regardless
 	// of path traversal in filePath. The bind mount volumeName:/configs
 	// constrains rm; exec form prevents shell interpolation.
@@ -245,11 +254,15 @@ func (h *TemplatesHandler) deleteViaEphemeral(ctx context.Context, volumeName, f
 		return err
 	}
 	if h.docker == nil {
-		// No docker client → local-docker tenant, /configs is mounted locally.
-		// Delete straight from disk within the same contained base. The
+		// No docker client → local-docker tenant. Delete from the per-workspace
+		// host-side mirror (same sink as the write path), not `/configs`. The
 		// validateRelPath guard above already blocks ".." / absolute paths;
-		// containedJoin re-verifies the resolved path stays under /configs.
-		return deleteFileLocal(localConfigsBase, filePath)
+		// containedJoin re-verifies the resolved path stays under the mirror.
+		mirror := h.hostSideConfigsRoot("/configs", workspaceID)
+		if mirror == "" {
+			return fmt.Errorf("docker-less config delete unavailable: no host-side configs mirror for workspace %q (hostStateDir empty)", workspaceID)
+		}
+		return deleteFileLocal(mirror, filePath)
 	}
 
 	resp, err := h.docker.ContainerCreate(ctx, &container.Config{

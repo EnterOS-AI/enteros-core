@@ -848,7 +848,7 @@ func (h *TemplatesHandler) WriteFile(c *gin.Context) {
 	// Container offline — write via ephemeral container mounting the config volume
 	volName := provisioner.ConfigVolumeName(workspaceID)
 	singleFile := map[string]string{filePath: body.Content}
-	if err := h.writeViaEphemeral(ctx, volName, singleFile); err != nil {
+	if err := h.writeViaEphemeral(ctx, volName, workspaceID, singleFile); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to write file: %v", err)})
 		return
 	}
@@ -955,7 +955,7 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 
 	// Container offline — delete via ephemeral container
 	volName := provisioner.ConfigVolumeName(workspaceID)
-	if err := h.deleteViaEphemeral(ctx, volName, filePath); err != nil {
+	if err := h.deleteViaEphemeral(ctx, volName, workspaceID, filePath); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to delete: %v", err)})
 		return
 	}
