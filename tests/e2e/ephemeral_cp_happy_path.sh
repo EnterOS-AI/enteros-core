@@ -203,16 +203,19 @@ run_scenario() {
 # mol-net-${NS}, so a network filter catches them (or reveals none were launched).
 dump_diagnostics() {
   echo "── DIAGNOSTIC BURST (ephemeral CP ${NS}) ─────────────────────────────" >&2
-  echo "[diag] containers on mol-net-${NS}:" >&2
-  docker ps -a --filter "network=mol-net-${NS}" \
-    --format '  {{.Names}}  {{.Image}}  {{.Status}}' >&2 2>/dev/null || true
+  echo "[diag] ALL docker containers (name / image / status / networks):" >&2
+  docker ps -a --format '  {{.Names}}  {{.Image}}  {{.Status}}  nets={{.Networks}}' >&2 2>/dev/null || true
   echo "[diag] CP logs (molecule-cp-${NS}, tail 200):" >&2
   docker logs --tail 200 "molecule-cp-${NS}" 2>&1 | sed 's/^/  cp| /' >&2 \
     || echo "  (no CP container molecule-cp-${NS})" >&2
+  # Tenant containers: the local-docker provisioner names them mol-tenant-* and
+  # may publish them to the host (NOT on mol-net-${NS}), so match by name too, not
+  # just the leg network. Concurrency is serialized so these are ours.
   local c
-  for c in $(docker ps -a --filter "network=mol-net-${NS}" --format '{{.Names}}' 2>/dev/null); do
+  for c in $( { docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^mol-tenant-|^ws-' ;
+               docker ps -a --filter "network=mol-net-${NS}" --format '{{.Names}}' 2>/dev/null ; } | sort -u); do
     case "$c" in "molecule-cp-${NS}"|"pg-${NS}") continue ;; esac
-    echo "[diag] tenant container ${c} logs (tail 200):" >&2
+    echo "[diag] tenant/workspace container ${c} logs (tail 200):" >&2
     docker logs --tail 200 "$c" 2>&1 | sed "s/^/  ${c}| /" >&2 || true
   done
   echo "── END DIAGNOSTIC BURST ──────────────────────────────────────────────" >&2
