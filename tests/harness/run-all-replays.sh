@@ -45,6 +45,28 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Clean slate BEFORE booting. The CI runner (docker-host) is warm and shared:
+# a prior run that exited with KEEP_UP=1, or a crashed run whose EXIT-trap
+# teardown didn't complete, leaves stale containers + volumes under the fixed
+# `harness` compose project. `docker compose up -d` would REUSE them and run the
+# replays against a stale tenant binary + a drifted DB (RCA 2026-07-12, main run
+# 477499: seed OK, then tenant-isolation 404 / empty /workspaces against a
+# foreign /buildinfo git_sha 054c6167). Tear down first so every run starts from
+# nothing. Idempotent + safe when nothing is up.
+#
+# NOTE this is intentionally INDEPENDENT of KEEP_UP: CI sets KEEP_UP=1 (so the
+# post-run failure dump can read containers) yet STILL needs this pre-boot wipe,
+# so gating on KEEP_UP would defeat hermeticity. A LOCAL debug session that did
+# `KEEP_UP=1 ./run-all-replays.sh` to inspect state, then re-runs, can preserve
+# that kept state with `PRESERVE_HARNESS=1` — a dedicated opt-out CI never sets.
+if [ "${PRESERVE_HARNESS:-0}" = "1" ]; then
+    echo "[run-all] PRESERVE_HARNESS=1 — SKIPPING pre-boot clean slate; reusing whatever is currently up."
+    echo "[run-all]   (debug affordance; run ./down.sh yourself to reset. CI never sets this.)"
+else
+    echo "[run-all] pre-boot clean slate — removing any leftover harness containers + volumes (set PRESERVE_HARNESS=1 to keep a KEEP_UP debug stack)..."
+    ./down.sh >/dev/null 2>&1 || echo "[run-all] (nothing to tear down)"
+fi
+
 echo "[run-all] booting harness..."
 if [ "${REBUILD:-0}" = "1" ]; then
     ./up.sh --rebuild

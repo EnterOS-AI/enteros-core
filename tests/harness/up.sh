@@ -35,11 +35,29 @@ if [ -z "${SECRETS_ENCRYPTION_KEY:-}" ]; then
 fi
 
 if [ "$REBUILD" = true ]; then
-    docker compose -f compose.yml build --no-cache tenant cp-stub
+    # Full clean rebuild — use when a base image or a dep (not just the Go
+    # source) changed. Service names are tenant-alpha / tenant-beta (there is no
+    # bare `tenant` service — the old `build ... tenant` here was a latent bug
+    # that never fired because CI called ./up.sh WITHOUT --rebuild).
+    docker compose -f compose.yml build --no-cache tenant-alpha tenant-beta cp-stub
+else
+    # Default: a CACHE-ENABLED build so the tenant + cp-stub images ALWAYS
+    # match the current checkout. Docker's layer cache busts automatically
+    # when the workspace-server source (COPY layer) or the GIT_SHA build-arg
+    # changes, so this is a fast near-no-op when nothing changed — but it
+    # GUARANTEES we never boot a stale image left by a prior/concurrent run
+    # on the shared docker-host CI runner. (RCA 2026-07-12, main run 477499:
+    # `up -d` reused a KEEP_UP'd prior run's tenant image, git_sha 054c6167,
+    # producing org-swapped TenantGuard + empty /workspaces replay failures.)
+    docker compose -f compose.yml build tenant-alpha tenant-beta cp-stub
 fi
 
 echo "[harness] starting redis + cp-stub + tenant-alpha + tenant-beta + cf-proxy ..."
-docker compose -f compose.yml up -d --wait
+# --force-recreate + --remove-orphans: NEVER reuse a container left running by a
+# prior/concurrent run under the fixed `harness` compose project on this shared
+# runner. Combined with the pre-boot ./down.sh in run-all-replays.sh, this makes
+# each run hermetic — the replays always hit THIS checkout's freshly-built tenant.
+docker compose -f compose.yml up -d --force-recreate --remove-orphans --wait
 
 # Sudo-free reachability: cf-proxy/nginx routes by Host header to the
 # right tenant container (matches production CF tunnel: same URL,
