@@ -67,6 +67,30 @@ NS="pr-${PR_NUMBER:-0}-$(printf '%s' "${HEAD_SHA:-local0000}" | cut -c1-8)-hp"
 case "$NS" in pr-*) : ;; *) echo "FATAL: namespace must start with pr- (got '$NS')" >&2; exit 2 ;; esac
 STATE_FILE="${EPHEMERAL_STATE_FILE:-${TMPDIR:-/tmp}/ephemeral-cp-${NS}.env}"
 
+# ── DIND mode (EPHEMERAL_DIND=1) — the CI posture (mc#4081 / task#78) ────────
+# The whole topology (PG, CP, tenants, workspaces) runs inside a per-job
+# DISPOSABLE docker:dind daemon (tests/harness/dind.sh, the harness-replays
+# pattern): the caller sets DOCKER_HOST at the dind BEFORE invoking this runner,
+# and one `docker rm -fv` destroys everything atomically — even on cancel. This
+# is the structural fix for the SHARED docker-host interference that killed the
+# gate's first CI runs (the host-loopback docker-proxy died mid-run with every
+# container healthy) and for the cross-run tenant leaks (`down` only sweeps the
+# leg network). Inside the dind:
+#   * published ports must bind 0.0.0.0 (the dind pre-forwards its FIXED :8080
+#     to the job's host loopback at create time — dind.sh exports it as $BASE;
+#     host.docker.internal inside the dind = the dind's own gateway, which a
+#     loopback bind would refuse — the same Linux lesson as CP#1526);
+#   * the CP publishes on the dind's fixed :8080 (CP_PUBLISH_ADDR, CP#1549) and
+#     the caller-visible URL is the dind forward (CP_HOST_BASE_OVERRIDE=$BASE).
+# Local default stays DIRECT (no dind — fast laptop iteration); run
+# `bash tests/harness/dind.sh up` first + EPHEMERAL_DIND=1 for CI parity.
+if [ "${EPHEMERAL_DIND:-}" = "1" ]; then
+  PUBLISH_BIND="0.0.0.0"
+  [ -n "${BASE:-}" ] || { echo "FATAL: EPHEMERAL_DIND=1 but \$BASE is unset — start tests/harness/dind.sh up first (it exports BASE=the dind's forwarded :8080)" >&2; exit 2; }
+else
+  PUBLISH_BIND="127.0.0.1"
+fi
+
 rand_hex() { python3 -c 'import secrets;print(secrets.token_hex(32))'; }
 # 32 random bytes, base64-encoded (44 chars). REQUIRED for SECRETS_ENCRYPTION_KEY:
 # the tenant's parser (workspace-server/internal/crypto/aes.go loadKeyFromEnv)
@@ -118,7 +142,7 @@ start_pg() {
   docker run -d --name "$PG_CTR" \
     -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD="$PG_SUPERPASS" \
     -e POSTGRES_DB=postgres \
-    -p 127.0.0.1:0:5432 postgres:16 >/dev/null \
+    -p "${PUBLISH_BIND}:0:5432" postgres:16 >/dev/null \
     || { echo "FATAL: could not start ephemeral Postgres container ${PG_CTR}" >&2; exit 1; }
   PG_PORT="$(docker port "$PG_CTR" 5432/tcp | awk -F: '/127\.0\.0\.1:/ {print $2; exit}')"
   [ -n "$PG_PORT" ] || PG_PORT="$(docker port "$PG_CTR" 5432/tcp | head -1 | awk -F: '{print $NF}')"
@@ -218,6 +242,14 @@ boot_cp() {
   } >> "$boot_env"
 
   echo "[proof] spinning up throwaway CP (baseline ${CP_IMAGE}) provisioning tenant ${TENANT_IMAGE} in ${NS}..." >&2
+  # DIND mode: the CP must bind the dind's fixed :8080 on ALL interfaces
+  # (CP_PUBLISH_ADDR, CP#1549 allowlist) and the caller-visible URL is the
+  # dind's pre-forwarded host-loopback port (CP_HOST_BASE_OVERRIDE=$BASE from
+  # dind.sh) — `up`'s boot verify then proves reach THROUGH the forward.
+  if [ "${EPHEMERAL_DIND:-}" = "1" ]; then
+    export CP_PUBLISH_ADDR="0.0.0.0:8080"
+    export CP_HOST_BASE_OVERRIDE="$BASE"
+  fi
   # `up` prints CP_BASE_URL= / CP_BASE_URL_HOST= / NS= on stdout (log() → stderr).
   # Capture first, then eval — avoids nested double-quotes inside "$(...)".
   local up_output

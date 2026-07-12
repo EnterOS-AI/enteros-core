@@ -64,6 +64,25 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Per-job DISPOSABLE dind (tests/harness/dind.sh — the harness-replays
+      # pattern, task#78): the WHOLE topology (PG, CP, tenants, workspaces,
+      # image builds) lives inside a nested daemon and dies with one atomic
+      # `docker rm -fv`, even on cancel. This is the structural fix for the
+      # shared docker-host interference that killed the gate's first CI runs
+      # (host-loopback docker-proxy dying mid-run with every container healthy;
+      # mc#4081) AND for cross-run tenant leaks (pr-ephemeral-cp.sh `down` only
+      # sweeps the leg network — per-org-net tenants leaked). dind.sh exports
+      # DOCKER_HOST (all subsequent docker/build steps target the dind) and
+      # BASE = the dind's pre-forwarded :8080, which becomes the caller-visible
+      # CP URL (the runner passes it via CP_HOST_BASE_OVERRIDE, CP#1549).
+      # Trade-off: no shared layer cache — each run rebuilds/pulls fresh into
+      # the dind (hermetic > fast during the soak; a cache volume can come later).
+      - name: Start disposable dind
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        env:
+          DIND_NS: ${{ github.run_id }}-ephemeral
+        run: bash tests/harness/dind.sh up
+
       # e2e creds from the Infisical SSOT: the MiniMax LLM key (the SAME key the
       # post-merge gate uses; RFC finding D moves it to a low-value e2e path later)
       # and AUTO_SYNC_TOKEN (devops-engineer PAT) to clone the CP spin-up plumbing.
@@ -168,7 +187,23 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           E2E_RUNTIME: hermes
+          # DIND mode — everything inside the disposable daemon; $BASE/$DOCKER_HOST
+          # come from the "Start disposable dind" step via GITHUB_ENV.
+          EPHEMERAL_DIND: "1"
         run: bash tests/e2e/ephemeral_cp_happy_path.sh
+
+      # Atomic teardown: one rm destroys the entire nested topology (CP, PG,
+      # tenants, workspaces, volumes, networks, built images) — even after a
+      # cancel that skipped every other cleanup. Leaks structurally impossible.
+      - name: Teardown dind
+        # always() so a cancelled/failed run still reaps its dind — but gated on
+        # the same non-fork condition as the start step (an ungated always()
+        # step on the fork no-op path was exactly the template-delivery chdir
+        # failure, core#4057).
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        env:
+          DIND_NS: ${{ github.run_id }}-ephemeral
+        run: bash tests/harness/dind.sh down
 
       # Fork-PR fallback: no creds → loud skip, never a silent green.
       - name: Fork PR — advisory skip (no e2e creds)

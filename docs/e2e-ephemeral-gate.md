@@ -1,0 +1,115 @@
+# The Ephemeral-CP Happy-Path Gate
+
+*RFC "one pre-merge ephemeral gate" §04 — as built. Landed 2026-07-12
+(core #4036 → `2efd5e6d8`; dind mode core #4116; CP enablers #1526 + #1549).
+Advisory during the soak — the flip-to-required plan lives in **mc#4081**.*
+
+## What it is
+
+A per-PR gate that spins up a **throwaway control-plane**, provisions a
+**fresh tenant** on it, runs the core happy path (org → tenant → workspace →
+live A2A LLM completion) with **zero shared staging**, and tears everything
+down. It is the pre-merge replacement for the post-merge `E2E Staging
+Platform Boot` lane: the class of bug that used to appear only after merge
+(because PRs ran `bash -n` self-checks while only `push[main]` ran live) now
+reds on the PR.
+
+One entry point — **local == CI**:
+
+| Where | Command |
+|---|---|
+| Laptop (fast, direct) | `make e2e-ephemeral-happy-path` (or `bash local-e2e/ephemeral-cp-happy-path.sh all`) |
+| Laptop, phase-by-phase | `… boot` → `… scenario` (repeatable ~90s) → `… down` |
+| Laptop, CI parity (dind) | `bash tests/harness/dind.sh up` → `EPHEMERAL_DIND=1 … all` |
+| CI | `.gitea/workflows/e2e-ephemeral-happy-path.yml` (path-scoped, advisory, per-job dind) |
+
+The image-substitution matrix: a **core** PR tests `molecule-tenant:pr-<sha>`
+(built from the PR) against `controlplane:baseline-dockerprov` (built from CP
+main, `Dockerfile.dockerprov` — the multi-stage image that ships the `docker`
+CLI the local-docker provisioner shells out to).
+
+## The topology contract (every line is a debugged failure)
+
+The runner (`tests/e2e/ephemeral_cp_happy_path.sh`) assembles a boot-env that
+makes the CP **fully self-contained**. Each element below was added after a
+live failure — do not remove one without re-running the gate locally:
+
+1. **`SECRETS_ENCRYPTION_KEY` = base64(32B), never hex-64.** The tenant parser
+   (`workspace-server/internal/crypto/aes.go`) accepts "32 bytes raw or
+   base64"; a 64-char hex key is valid base64 alphabet and decodes to 48
+   bytes → the tenant fatals at birth. The CP's own parser accepts hex, so
+   only tenants die — symptom: `Tenant provisioning timed out (last: )`.
+2. **`MOLECULE_TOPO_CP_APP_DOMAIN=lvh.me` + `LOCAL_TENANT_URL_TEMPLATE=
+   http://{slug}.lvh.me:8080`.** The CP's provision-readiness canary probes
+   the public tenant route; on the staging domain it dials the *real* edge
+   (404 for a throwaway org → provision marked failed). `lvh.me` is public
+   wildcard DNS → `127.0.0.1`, so the probe loops back into **this CP's own
+   wildcard proxy** and exercises the same Host→slug→org→proxy→tenant chain
+   staging uses, minus the CF edge. `hostSlugFromRequest` requires the Host
+   suffix to equal the app domain — the two values must agree.
+3. **`CP_BASE_URL` + `MOLECULE_TOPO_CP_BASE_URL` = `http://controlplane:8080`
+   (self-referential).** CP `tenant_config.go` delivers
+   `MOLECULE_CP_URL := os.Getenv("CP_BASE_URL")`; unset → it delivers `""`,
+   the tenant's boot refresh blanks its injected URL, and `cpurl.Base()`
+   falls through to the managed default — the ephemeral tenant sent its
+   workspace-provision POST **to prod** (401). Fail-open filed as **CP #1515**.
+   The topo base also feeds `LLMProxyBaseURL` (workspace LLM egress).
+4. **`E2E_LLM_PATH=platform` + `E2E_MODE=smoke` + `E2E_AWS_LEAK_CHECK=off`.**
+   The gate mirrors the Platform Boot lane exactly: hermes' default
+   `minimax/MiniMax-M2.7` (slash form) is platform-managed; completions flow
+   workspace → tenant proxy env → this CP's `/cp/internal/llm` proxy →
+   `api.minimax.io` with the CP's own `MINIMAX_API_KEY`. (`pick_model_slug`
+   has **no** hermes MiniMax-BYOK arm — a stray key routes to
+   `openai/gpt-4o` → `MISSING_BYOK_CREDENTIAL`.) Smoke skips the full-matrix
+   extras (memory plugin — see core #4114 — delegation, lifecycle), which
+   remain the staging BYOK job's coverage.
+5. **`LOCAL_TENANT_BIND_ADDR=0.0.0.0`** (CP #1526). On Linux, a
+   `127.0.0.1`-bound host port is unreachable from inside a container
+   (`host.docker.internal` = the gateway IP, which a loopback bind refuses);
+   Docker Desktop/macOS special-cases it — the canonical local-vs-CI
+   divergence this gate exists to surface, caught on its first CI run.
+6. **`seed_workspace_image`.** The CP's local-docker workspace provisioner
+   runs the **bare tag** `workspace-template-<runtime>:latest` (self-host
+   store model) — pull the registry ref and retag before boot.
+
+## DIND mode (the CI posture)
+
+The gate's first CI runs on the shared docker-host died to **runner
+interference**: the host-loopback docker-proxy for the CP's published port
+stopped answering mid-run while every container stayed healthy, and
+`pr-ephemeral-cp.sh down` (leg-network sweep only) leaked per-org-net tenants
+across runs. Per the no-sweepers principle, the fix is structural: the CI job
+runs the **whole topology inside a per-job disposable `docker:27-dind`**
+(`tests/harness/dind.sh`, the harness-replays pattern from core #4057). One
+atomic `docker rm -fv` destroys everything — even on cancel.
+
+Inside the dind (`EPHEMERAL_DIND=1`):
+- published ports bind `0.0.0.0` (inside the dind, `host.docker.internal` is
+  the dind's own gateway — the CP #1526 lesson one level down);
+- the CP publishes the dind's **fixed :8080** (`CP_PUBLISH_ADDR`, CP #1549),
+  pre-forwarded to the job's host loopback at dind-create time;
+- the caller-visible URL is that forward (`CP_HOST_BASE_OVERRIDE=$BASE`), so
+  `up`'s boot verify proves reach *through* the forward.
+
+## Failure diagnosis
+
+On failure the runner emits a **run-scoped** diagnostic burst: the CP's logs
+plus every container created *after* our CP (`docker ps --filter since=`) —
+never a host-wide name grep, which on a shared runner picks up leaked
+crash-looping containers from other runs and misdirects the RCA (it did).
+
+## Roadmap (mc#4081)
+
+1. Soak: ≥5 consecutive green dind runs.
+2. Flip `continue-on-error: true → false`; the context joins the merge gate.
+3. Move the happy-path contract into `molecule-ai-sdk` (task #74) so core,
+   CP, and the SDK run the *same* gate — then demote the corresponding
+   post-merge E2E Staging jobs (per the verify-live-PR-coverage-first rule).
+
+## Bugs this gate caught before ever gating anything
+
+CP #1515 (empty `CP_BASE_URL` routes tenants to prod, fail-open) · CP #1526
+(Linux loopback publish) · CP #1530 (CP-side gate never ran; wedged every CP
+PR) · core #4065-gap (interrupt-ack arriving via the queue) · the
+settling-URL SSRF race · core #4114 (staging memory plugin, unmasked) ·
+runtime #284 (fresh parent auto-runs a 90-iteration task).
