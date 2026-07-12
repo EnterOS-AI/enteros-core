@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -17,6 +18,69 @@ import (
 
 // maxExecOutput limits container exec output to 5MB to prevent OOM.
 const maxExecOutput = 5 * 1024 * 1024
+
+// localConfigsBase is the on-disk root the Files API writes to when this
+// process runs INSIDE the workspace container (molecules-server / local-docker
+// tenant, no docker socket). The config volume is mounted at /configs inside
+// the container, so writing there directly is the local equivalent of the
+// docker CopyToContainer(dest="/configs") path.
+const localConfigsBase = "/configs"
+
+// containedJoin joins relPath under base and refuses anything that escapes
+// base after cleaning (absolute paths, ".." traversal). It is the os.*
+// counterpart of the "escapes destPath" guard in copyFilesToContainer and the
+// validateRelPath check in deleteViaEphemeral: the joined, cleaned absolute
+// path MUST stay inside base. Returns the safe absolute path or an error.
+func containedJoin(base, relPath string) (string, error) {
+	clean := filepath.Clean(relPath)
+	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes %s: %s", base, relPath)
+	}
+	joined := filepath.Join(base, clean)
+	// Defence-in-depth: after the join, the resolved path must remain within
+	// base. Guards against platform-specific filepath.Join behaviour where a
+	// relative name containing ".." could still climb out of base.
+	baseClean := filepath.Clean(base)
+	if joined != baseClean && !strings.HasPrefix(joined, baseClean+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes %s: %s", base, relPath)
+	}
+	return joined, nil
+}
+
+// writeFilesLocal writes each file directly to disk under base, creating
+// parent directories as needed. Every destination is run through containedJoin
+// so a ".." or absolute name can never escape base (typically /configs).
+// Used on the docker-less local-docker path (writeViaEphemeral fallback).
+func writeFilesLocal(base string, files map[string]string) error {
+	for name, content := range files {
+		dst, err := containedJoin(base, name)
+		if err != nil {
+			return fmt.Errorf("unsafe file path: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return fmt.Errorf("failed to create parent dir for %s: %w", name, err)
+		}
+		if err := os.WriteFile(dst, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("failed to write %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// deleteFileLocal removes a single file under base, refusing any path that
+// escapes base. Mirrors `rm -f`: a missing file is not an error, matching the
+// docker/EIC delete paths' "deleted or didn't exist" semantics. Used on the
+// docker-less local-docker path (deleteViaEphemeral fallback).
+func deleteFileLocal(base, relPath string) error {
+	dst, err := containedJoin(base, relPath)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to delete %s: %w", relPath, err)
+	}
+	return nil
+}
 
 // findContainer finds a running container for the workspace.
 // Checks provisioner name, full ID, and DB workspace name (same candidates as terminal handler).
@@ -128,7 +192,13 @@ func (h *TemplatesHandler) copyFilesToContainer(ctx context.Context, containerNa
 // Used when the workspace container is offline (e.g., during provisioning).
 func (h *TemplatesHandler) writeViaEphemeral(ctx context.Context, volumeName string, files map[string]string) error {
 	if h.docker == nil {
-		return fmt.Errorf("docker not available")
+		// No docker client → this process runs inside the workspace container
+		// on a molecules-server (local-docker) tenant. The config volume is
+		// mounted locally at /configs, so write each file straight to disk
+		// under that base, with the same path-traversal containment the
+		// CopyToContainer path enforces. This is what makes config.yaml
+		// Save&Restart work on the default provider (no docker socket).
+		return writeFilesLocal(localConfigsBase, files)
 	}
 
 	// Create ephemeral container mounting the volume
@@ -175,7 +245,11 @@ func (h *TemplatesHandler) deleteViaEphemeral(ctx context.Context, volumeName, f
 		return err
 	}
 	if h.docker == nil {
-		return fmt.Errorf("docker not available")
+		// No docker client → local-docker tenant, /configs is mounted locally.
+		// Delete straight from disk within the same contained base. The
+		// validateRelPath guard above already blocks ".." / absolute paths;
+		// containedJoin re-verifies the resolved path stays under /configs.
+		return deleteFileLocal(localConfigsBase, filePath)
 	}
 
 	resp, err := h.docker.ContainerCreate(ctx, &container.Config{
