@@ -478,13 +478,24 @@ func TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T
 }
 
 // Test that a delegation where Redis cannot be reached still routes to failure
-// (not panic). proxyA2ARequest falls back to DB URL lookup when Redis is down.
+// (not panic) when the target is genuinely unreachable. proxyA2ARequest falls
+// back to DB URL lookup when Redis is down.
+//
+// The target is put in a TERMINAL state (failed) so its missing URL is a real
+// dead end → hard 503 → delegation fails. A URL-less target in a
+// recoverable-settling state instead ENQUEUES; that path is covered by
+// TestIntegration_ExecuteDelegation_SettlingTarget_Enqueues.
 func TestIntegration_ExecuteDelegation_RedisDown_FallsBackToDB(t *testing.T) {
 	allowLoopbackForTest(t)
 	conn := integrationDB(t)
 	cleanup := setupIntegrationFixtures(t, conn)
 	defer cleanup()
 	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
+
+	// Terminal target: no URL AND not self-recovering → genuinely unreachable.
+	if _, err := conn.Exec(`UPDATE workspaces SET status = 'failed' WHERE id = $1::uuid`, integrationTestTargetID); err != nil {
+		t.Fatalf("failed to set target status=failed: %v", err)
+	}
 
 	// Set up miniredis so db.RDB is non-nil, but do NOT cache any URL.
 	// resolveAgentURL skips Redis and falls back to DB, which also has no URL.
@@ -516,6 +527,55 @@ func TestIntegration_ExecuteDelegation_RedisDown_FallsBackToDB(t *testing.T) {
 	}
 	if errDet == "" {
 		t.Error("error_detail should be set on failure due to unreachable target")
+	}
+}
+
+// A delegation to a URL-less target in a recoverable-settling state
+// (provisioning / awaiting_agent) must be ENQUEUED for durable drain when the
+// workspace comes online — NOT dropped as failed. Pins the
+// classWorkspaceSettling enqueue path added to resolveAgentURL /
+// proxyA2ARequest so a config-PUT restart flap (or any mid-restart window) no
+// longer loses the turn.
+func TestIntegration_ExecuteDelegation_SettlingTarget_Enqueues(t *testing.T) {
+	allowLoopbackForTest(t)
+	conn := integrationDB(t)
+	cleanup := setupIntegrationFixtures(t, conn)
+	defer cleanup()
+	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
+
+	// Recoverable-settling target: no URL, status=provisioning (as during a
+	// mid-restart re-provision). resolveAgentURL falls back to the DB, sees no
+	// URL + a settling status, and enqueues instead of hard-503-dropping.
+	if _, err := conn.Exec(`UPDATE workspaces SET status = 'provisioning', url = NULL WHERE id = $1::uuid`, integrationTestTargetID); err != nil {
+		t.Fatalf("failed to set target status=provisioning: %v", err)
+	}
+
+	mr := setupTestRedis(t)
+	defer mr.Close()
+
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	a2aBody, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": "1", "method": "message/send",
+		"params": map[string]interface{}{
+			"message": map[string]interface{}{
+				"role":  "user",
+				"parts": []map[string]string{{"type": "text", "text": "do work"}},
+			},
+		},
+	})
+	runWithTimeout(t, 30*time.Second, func(ctx context.Context) {
+		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody)
+	})
+
+	status, _, errDet := readDelegationRow(t, conn)
+	if status != "dispatched" {
+		t.Errorf("status: want dispatched (settling target enqueued for durable drain), got %q", status)
+	}
+	if errDet != "" {
+		t.Errorf("error_detail should be empty when enqueued (not a failure): got %q", errDet)
 	}
 }
 
