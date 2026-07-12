@@ -813,127 +813,39 @@ fi
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
-# ─── BYOK vendor-key split (secret-write gate is derived, not opt-in) ───
-# Every vendor-key arm above (MiniMax / Anthropic / Google / OpenAI-hermes)
-# writes one or more keys that workspace-server's secret-write gate —
-# rejectPlatformManagedDirectLLMBypassForWorkspace in
-# workspace-server/internal/handlers/secrets.go — BLOCKS while the workspace's
-# DERIVED provider is the closed `platform` arm. platform-vs-BYOK is no longer a
-# stored, opt-in-able mode: the per-workspace `llm_billing_mode` override + its
-# PUT/GET /admin/workspaces/:id/llm-billing-mode endpoint were DELETED 2026-06-30
-# (881b3f6f1, internal#718). The gate now keys off providers.DeriveProvider →
-# IsPlatform: a workspace whose chosen MODEL derives a byok provider IS byok, so
-# its vendor-key write is allowed directly — no opt-in call, and none is possible
-# (the endpoint 404s).
+# ─── BYOK vendor keys ship in the CREATE payload (no defer, no opt-in) ──
+# Every vendor-key arm above (MiniMax / Anthropic / OpenAI-hermes) builds
+# SECRETS_JSON holding ONLY that arm's own vendor key(s); the PLATFORM
+# path (E2E_LLM_PATH=platform) builds SECRETS_JSON='{}'. We ship SECRETS_JSON
+# verbatim in the POST /workspaces create payload for EVERY arm — no create-vs-
+# defer split, no post-create opt-in write. Why this is correct AND robust:
 #
-# The strip-list (secrets.go platformManagedDirectLLMBypassKeys) includes
-# MINIMAX_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY/_BASE_URL,
-# HERMES_CUSTOM_API_KEY/_BASE_URL, etc. Controlplane also validates BYOK creds at
-# CREATE time (POST /workspaces → MISSING_BYOK_CREDENTIAL if the vendor key for a
-# byok model slug is absent), so the MiniMax arm ships MINIMAX_API_KEY in the
-# CREATE payload (create-time byok signal) and DEFERRED_SECRETS_JSON is '{}'.
+#   - Controlplane validates BYOK creds at CREATE time (POST /workspaces →
+#     MISSING_BYOK_CREDENTIAL when a byok model slug's vendor key is absent from
+#     the payload). A key present at create is the create-time byok signal for
+#     EVERY arm, not just MiniMax. The old strip-list DEFERRED some keys to a
+#     post-create write, which risked that create reject: the MiniMax arm was
+#     patched around it (7c657011) but the Anthropic arm still deferred
+#     ANTHROPIC_API_KEY and hit the SAME failure. Shipping every arm's key at
+#     create closes that whole class.
+#   - workspace-server's secret-write gate
+#     (rejectPlatformManagedDirectLLMBypassForWorkspace, secrets.go) blocks a
+#     byok key only while the workspace's DERIVED provider is the closed
+#     `platform` arm. platform-vs-BYOK is no longer a stored, opt-in-able mode:
+#     the per-workspace `llm_billing_mode` override + its PUT/GET
+#     /admin/workspaces/:id/llm-billing-mode endpoint were DELETED 2026-06-30
+#     (881b3f6f1, internal#718). The gate now keys off providers.DeriveProvider →
+#     IsPlatform, evaluated at create from the model slug in the payload: a byok
+#     model derives byok, so its key is accepted at create. The PLATFORM path
+#     ships no key, so the gate has nothing to block and the workspace stays
+#     platform_managed (the moonshot/kimi NOT_CONFIGURED regression guard —
+#     deliberately untouched).
 #
-# For any arm that still defers strip-listed keys we:
-#   1. create the workspace (create-time byok validation accepts the byok model),
-#   2. write the deferred vendor key(s) directly — the derived-provider gate
-#      allows the write because the model derives a byok provider,
-# then continue. The #1994 byok-routing guard (8c) then confirms — via the
-# required real-completion milestone on an online workspace — that byok routing
-# actually served a real LLM response. NOT masked.
-#
-# The PLATFORM path (E2E_LLM_PATH=platform) produces SECRETS_JSON='{}', so it
-# carries NO strip-listed key → CREATE_SECRETS_JSON stays '{}' and no opt-in
-# fires. It remains platform_managed (the moonshot/kimi NOT_CONFIGURED
-# regression guard) — deliberately untouched.
-#
-# Keep this strip-list BYTE-IN-SYNC with secrets.go platformManagedDirectLLMBypassKeys.
-# EXCEPTION (7c657011): MINIMAX_API_KEY is intentionally NOT stripped. Controlplane
-# now validates BYOK model credentials at create-time (POST /workspaces) and returns
-# MISSING_BYOK_CREDENTIAL if the vendor key is absent from the create payload for a
-# BYOK model slug (MiniMax-M2.x). Stripping it here caused
-#   runs 352760/job 476956 + 352743/job 476924 @ main SHA 15872306
-# to fail at create, before the deferred write could run. Other MiniMax arms
-# (no MINIMAX_API_KEY in SECRETS_JSON) are unaffected; non-MiniMax arms are
-# unaffected (they never set MINIMAX_API_KEY in the first place). For the MiniMax
-# arm, MINIMAX_API_KEY now lands in CREATE_SECRETS_JSON, so DEFERRED_SECRETS_JSON
-# is '{}' and byok_opt_in_and_write_deferred becomes a no-op — controlplane's
-# create-time gate treats a vendor key in the payload as the byok signal.
-BYOK_STRIP_KEYS="AI_GATEWAY_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ARCEEAI_API_KEY CLAUDE_CODE_OAUTH_TOKEN CODEX_AUTH_JSON DASHSCOPE_API_KEY DEEPSEEK_API_KEY GEMINI_API_KEY GLM_API_KEY HERMES_CUSTOM_API_KEY HERMES_CUSTOM_BASE_URL HF_TOKEN KIMI_API_KEY KIMI_CN_API_KEY MINIMAX_CN_API_KEY NOUS_API_KEY OPENAI_API_KEY OPENAI_BASE_URL OPENROUTER_API_KEY XAI_API_KEY ZAI_API_KEY"
-# Split SECRETS_JSON into CREATE_SECRETS_JSON (gate-safe, written at create)
-# and DEFERRED_SECRETS_JSON (strip-listed keys, written AFTER byok opt-in).
-# Emit the two JSON blobs on SEPARATE LINES (not space-separated) — a value or
-# a json.dumps default separator contains spaces, which whitespace-`read` would
-# mangle. read -r line1 → CREATE, line2 → DEFERRED.
-{
-  read -r CREATE_SECRETS_JSON
-  read -r DEFERRED_SECRETS_JSON
-} < <(
-  BYOK_STRIP_KEYS="$BYOK_STRIP_KEYS" E2E_WS_SECRETS="$SECRETS_JSON" python3 -c "
-import json, os
-strip = set(os.environ['BYOK_STRIP_KEYS'].split())
-d = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
-create = {k: v for k, v in d.items() if k not in strip}
-deferred = {k: v for k, v in d.items() if k in strip}
-print(json.dumps(create))
-print(json.dumps(deferred))
-"
-)
-# Defensive: if the split somehow produced empty (read failure), treat as
-# no-deferred so we never PUT byok on a workspace that has no vendor key.
-[ -n "$DEFERRED_SECRETS_JSON" ] || DEFERRED_SECRETS_JSON='{}'
-[ -n "$CREATE_SECRETS_JSON" ] || CREATE_SECRETS_JSON='{}'
-if [ "$DEFERRED_SECRETS_JSON" != "{}" ]; then
-  log "    BYOK opt-in required — deferring vendor key(s) until after billing-mode=byok"
-fi
-
-# byok_opt_in_and_write_deferred <workspace_id>
-#   For the byok arms (DEFERRED_SECRETS_JSON non-empty): PUT billing-mode=byok
-#   on the workspace, then write each deferred strip-listed secret (now allowed
-#   by the secret-write gate). No-op for the platform/no-key path. See the
-#   BYOK-opt-in block above + secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace.
-byok_opt_in_and_write_deferred() {
-  local _id="$1"
-  if [ "$DEFERRED_SECRETS_JSON" = "{}" ]; then
-    return 0
-  fi
-  # NO explicit opt-in PUT anymore. The per-workspace `llm_billing_mode`
-  # override + its PUT/GET /admin/workspaces/:id/llm-billing-mode endpoint were
-  # DELETED 2026-06-30 (881b3f6f1, internal#718): platform-vs-BYOK is now DERIVED
-  # deterministically from the chosen model's provider via the providers.yaml
-  # SSOT (providers.DeriveProvider -> IsPlatform). There is no stored mode to opt
-  # into — a workspace whose model derives a non-platform provider IS byok, and
-  # the secret-write gate (secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace)
-  # keys off that derived provider. So for a byok-model workspace the deferred
-  # vendor-key write is allowed directly; no opt-in call is needed (and the old
-  # endpoint would 404 → the HTML-page red this replaces).
-  #
-  # Write each deferred strip-listed secret one-per-call (the Set endpoint
-  # takes {key,value}). The gate passes because the workspace's model derives a
-  # byok provider. Bodies are built in Python (env-only) so secret values never
-  # hit a command line.
-  local _keys _k _sec_body _sec_tmp _sec_code _sec_out
-  _keys=$(echo "$DEFERRED_SECRETS_JSON" | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin).keys()))")
-  while IFS= read -r _k; do
-    [ -n "$_k" ] || continue
-    _sec_body=$(BYOK_K="$_k" E2E_WS_DEFERRED="$DEFERRED_SECRETS_JSON" python3 -c "
-import json, os
-d = json.loads(os.environ['E2E_WS_DEFERRED'])
-print(json.dumps({'key': os.environ['BYOK_K'], 'value': d[os.environ['BYOK_K']]}))
-")
-    _sec_tmp=$(mktemp -t synth_byok_secret.XXXXXX)
-    _sec_code=$(printf '%s' "$_sec_body" | tenant_call POST "/workspaces/$_id/secrets" \
-      -H "Content-Type: application/json" \
-      -d @- \
-      -o "$_sec_tmp" -w '%{http_code}' 2>/dev/null || echo "000")
-    if [ "$_sec_code" != "200" ] && [ "$_sec_code" != "201" ] && [ "$_sec_code" != "204" ]; then
-      _sec_out=$(cat "$_sec_tmp" 2>/dev/null | sanitize_http_body)
-      rm -f "$_sec_tmp"
-      fail "byok vendor-key write: POST /workspaces/$_id/secrets ($_k) returned $_sec_code: $_sec_out — the secret-write gate should allow it because the workspace's model derives a byok provider (secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace, derived post-881b3f6f1)."
-    fi
-    rm -f "$_sec_tmp"
-  done <<< "$_keys"
-  ok "    $_id byok vendor key(s) written (derived-provider gate allowed the direct write)"
-}
+# The deleted opt-in flow (create platform_managed → PUT billing-mode=byok →
+# write the deferred key) is what the strip-list + a post-create write existed to
+# serve. With the mode derived, that machinery is vestigial and removed. The
+# #1994 byok-routing guard (8c) independently proves the key actually routes byok
+# (MOLECULE_LLM_USAGE_TOKEN absent on the parent), so nothing is masked.
 
 # ─── runtime → provision-selector resolution ────────────────────────────
 # Most runtimes are selected directly by the `runtime` field. seo-agent is
@@ -961,7 +873,7 @@ build_create_payload() {
   E2E_WS_RUNTIME="$RUNTIME" \
   E2E_WS_TEMPLATE="$PROVISION_TEMPLATE" \
   E2E_WS_MODEL="$MODEL_SLUG" \
-  E2E_WS_SECRETS="$CREATE_SECRETS_JSON" \
+  E2E_WS_SECRETS="$SECRETS_JSON" \
   python3 -c "
 import json, os
 secrets = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
@@ -1015,9 +927,8 @@ if [ -z "$PARENT_ID" ]; then
   fail "Parent workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$PARENT_RESP" | sanitize_http_body)"
 fi
 log "    PARENT_ID=$PARENT_ID"
-# BYOK arms only: opt the workspace into byok, then write the deferred vendor
-# key(s). No-op for the platform/no-key path. (See the BYOK opt-in block.)
-byok_opt_in_and_write_deferred "$PARENT_ID"
+# BYOK vendor key(s) shipped in the create payload above — nothing to write
+# post-create (see the "BYOK vendor keys ship in the CREATE payload" block).
 
 # ─── 6. Provision child (full mode only) ────────────────────────────────
 CHILD_ID=""
@@ -1036,8 +947,8 @@ if [ "$MODE" = "full" ]; then
     fail "Child workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$CHILD_RESP" | sanitize_http_body)"
   fi
   log "    CHILD_ID=$CHILD_ID"
-  # Same BYOK opt-in as the parent — the child also carries the vendor key(s).
-  byok_opt_in_and_write_deferred "$CHILD_ID"
+  # The child's create payload carried the same vendor key(s) — nothing to
+  # write post-create (see the parent's create above).
 else
   log "6/11 Canary mode — skipping child workspace"
 fi
@@ -1752,50 +1663,66 @@ live_milestone a2a_roundtrip
 # resolved_mode read (GET …/llm-billing-mode) is gone (probing it returned an HTML
 # 404 — the red this replaces).
 #
-# The DISCRIMINATING live signal we assert instead: a byok parent MUST carry its
-# OWN vendor key at WORKSPACE scope, readable via GET /workspaces/:id/secrets
-# (SecretsHandler.List → [{key, scope, has_value}]). This is NOT tautological with
-# the 8b completion: a #1994-regressed workspace baked platform_managed would
-# route through the platform proxy and STILL return a real completion (draining the
-# platform key) WITHOUT ever persisting the customer's key workspace-scoped — 8b
-# would stay green while this probe goes RED. If the byok vendor key is present at
-# workspace scope AND the model derives a byok provider (unit-guarded by
-# no_billing_mode_env_test.go), the derive rule routes byok, not platform. The
-# provisioner fail-close (workspace_provision_shared.go: aborts a byok provision
-# lacking a usable cred) is the source-level backstop. Only meaningful when the
-# parent carries a byok credential (the no-key path is legitimately
-# platform_managed — the CTO default).
+# The DISCRIMINATING live signal we assert instead is the PLATFORM CP-proxy usage
+# token, MOLECULE_LLM_USAGE_TOKEN: it is injected into a workspace's container env
+# ONLY when the workspace routes through the platform LLM proxy. A correctly-routed
+# BYOK workspace uses its OWN vendor key and MUST NOT carry it. We read that token's
+# env-key PRESENCE (boolean/name-list observability, a06a52eb — value NEVER read)
+# off GET /workspaces/:id — the same signal test_staging_concierge_creates_workspace
+# uses for the inverse (platform members MUST carry it). This is NOT tautological
+# with 8b or with mere vendor-key persistence: a #1994-regressed byok workspace
+# baked platform_managed KEEPS its workspace-scoped vendor key AND returns a real
+# completion (draining the platform key) — 8b and a secret-row probe BOTH stay green
+# — yet it carries MOLECULE_LLM_USAGE_TOKEN, so only THIS probe goes red. Only
+# meaningful when the parent carries a byok credential (the no-key path is
+# legitimately platform_managed — the CTO default).
 if [ -n "${E2E_MINIMAX_API_KEY:-}" ] || [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
   # Which byok vendor key did this arm ship? (matches the SECRETS_JSON branch.)
   if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then _byok_key="MINIMAX_API_KEY"; else _byok_key="ANTHROPIC_API_KEY"; fi
   set +e
-  SECRETS_RESP=$(tenant_call GET "/workspaces/$PARENT_ID/secrets" 2>/dev/null)
-  SECRETS_RC=$?
+  WS_OBJ=$(tenant_call GET "/workspaces/$PARENT_ID" 2>/dev/null)
+  WS_RC=$?
   set -e
-  if [ "$SECRETS_RC" != "0" ] || [ -z "$SECRETS_RESP" ]; then
-    fail "byok-routing guard (#1994): GET /workspaces/$PARENT_ID/secrets failed (rc=$SECRETS_RC). Body: $(printf '%s' "${SECRETS_RESP:0:200}" | sanitize_http_body)"
+  if [ "$WS_RC" != "0" ] || [ -z "$WS_OBJ" ]; then
+    fail "byok-routing guard (#1994): GET /workspaces/$PARENT_ID failed (rc=$WS_RC). Body: $(printf '%s' "${WS_OBJ:0:200}" | sanitize_http_body)"
   fi
-  # Is the arm's own vendor key persisted at WORKSPACE scope? (env-only Python so
-  # no secret value — we only read key NAMES here — is ever built into a command.)
-  _has_byok=$(printf '%s' "$SECRETS_RESP" | BYOK_KEY="$_byok_key" python3 -c "
-import json, os, sys
-key = os.environ['BYOK_KEY']
+  # env-key PRESENCE ONLY of the platform CP-proxy token (never its value): present
+  # on a byok workspace == it is on the platform proxy == the #1994 misroute.
+  _plat_tok=$(printf '%s' "$WS_OBJ" | python3 -c "
+import json, sys
+KEY = 'MOLECULE_LLM_USAGE_TOKEN'
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print('parse_error'); sys.exit(0)
-if not isinstance(d, list):
-    print('not_a_list'); sys.exit(0)
-for s in d:
-    if isinstance(s, dict) and s.get('key') == key and s.get('scope') == 'workspace':
-        print('yes'); sys.exit(0)
-print('no')
+    print('unobservable'); sys.exit(0)
+if not isinstance(d, dict):
+    print('unobservable'); sys.exit(0)
+for f in ('llm_usage_token_present', 'has_llm_usage_token', 'llm_auth_present', 'platform_llm_auth_present'):
+    v = d.get(f)
+    if isinstance(v, bool):
+        print('present' if v else 'absent'); sys.exit(0)
+for f in ('provisioned_env_keys', 'container_env_keys', 'env_keys', 'llm_env_keys'):
+    v = d.get(f)
+    if isinstance(v, list):
+        print('present' if KEY in v else 'absent'); sys.exit(0)
+ep = d.get('env_key_presence')
+if isinstance(ep, dict) and KEY in ep:
+    print('present' if bool(ep[KEY]) else 'absent'); sys.exit(0)
+print('unobservable')
 " 2>/dev/null || echo "probe_error")
-  case "$_has_byok" in
-    yes)
-      ok "8c.  byok-routing guard (#1994): parent ($RUNTIME/$MODEL_SLUG) carries its own '$_byok_key' at WORKSPACE scope (GET /secrets) → the model derives a byok provider with the customer's key present, so it routes BYOK, not the platform proxy. #1994 stays fixed." ;;
+  case "$_plat_tok" in
+    absent)
+      ok "8c.  byok-routing guard (#1994): byok parent ($RUNTIME/$MODEL_SLUG) carries NO platform CP-proxy token (MOLECULE_LLM_USAGE_TOKEN absent) → routing BYOK on its own '$_byok_key', not the platform proxy. #1994 stays fixed." ;;
+    present)
+      fail "byok-routing guard TRIPPED (#1994 regression): byok parent $PARENT_ID has the PLATFORM CP-proxy token MOLECULE_LLM_USAGE_TOKEN injected → it is routing through the platform LLM proxy and draining the platform key instead of its own '$_byok_key'. A byok workspace must NOT carry the platform usage token."
+      ;;
     *)
-      fail "byok-routing guard (#1994): parent workspace $PARENT_ID does NOT carry its own vendor key '$_byok_key' at workspace scope (secrets probe='$_has_byok'). A byok arm whose vendor key is not persisted workspace-scoped would derive/route through the PLATFORM proxy and drain the platform LLM key — the exact #1994 regression (8b's completion can stay green via the proxy). Raw: $(printf '%s' "${SECRETS_RESP:0:300}" | sanitize_http_body)" ;;
+      # env-presence field (a06a52eb) not exposed on this build — cannot read
+      # routing directly. Do NOT claim a pass: corroborated only by 8b's real
+      # completion (which a proxy-misroute would also satisfy). Land the field to
+      # promote this to a hard gate.
+      log "8c.  byok-routing guard ADVISORY — GET /workspaces/$PARENT_ID exposes no MOLECULE_LLM_USAGE_TOKEN env-presence field (a06a52eb not landed here; probe='$_plat_tok'). Cannot directly confirm byok routing; NOT a pass."
+      ;;
   esac
 else
   log "8c.  byok-routing guard skipped — parent carries no own-vendor key (OpenAI/no-key path is legitimately platform_managed)."

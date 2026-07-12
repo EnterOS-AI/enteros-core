@@ -20,9 +20,11 @@
 #   2. provider_liveness_matrix    — per-offered-provider cheap completion
 #      probe, providers sourced from the providers.yaml SSOT runtimes block.
 #   (The #1994 byok-routing guard moved to test_staging_full_saas.sh step 8c and
-#    asserts a live signal — the byok parent's own vendor key at workspace scope
-#    via GET /workspaces/:id/secrets — after its resolved_mode endpoint was
-#    deleted 2026-06-30; the old assert_byok_not_platform_proxy helper is gone.)
+#    asserts a live signal — the platform CP-proxy token MOLECULE_LLM_USAGE_TOKEN
+#    must be ABSENT on the byok parent (present == routing through the platform
+#    proxy == the #1994 misroute), read as env-key presence via GET /workspaces/:id
+#    — after its resolved_mode endpoint was deleted 2026-06-30; the old
+#    assert_byok_not_platform_proxy helper is gone.)
 #
 # Conventions: reuses the host script's fail()/ok()/log() + tenant_call().
 # Source this AFTER those are defined. BASH 4+.
@@ -313,5 +315,8 @@ provider_liveness_matrix() {
 # GET /admin/workspaces/:id/llm-billing-mode — an endpoint DELETED 2026-06-30
 # (881b3f6f1). platform-vs-BYOK is now DERIVED from the model provider, and the
 # #1994 byok-routing guard (test_staging_full_saas.sh step 8c) now asserts a LIVE
-# signal instead: the byok parent carries its own vendor key at workspace scope
-# via GET /workspaces/:id/secrets. Do not reintroduce a resolved_mode reader.
+# signal instead: the platform CP-proxy token MOLECULE_LLM_USAGE_TOKEN must be
+# ABSENT on the byok parent (workspace_provision.go injects it into a container's
+# env only on the platform path; present on a byok parent == the #1994 misroute),
+# read as env-key presence via GET /workspaces/:id. Do not reintroduce a
+# resolved_mode reader.
