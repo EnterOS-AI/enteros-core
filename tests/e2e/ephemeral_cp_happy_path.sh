@@ -55,6 +55,28 @@ BOOT_ENV_FILE="$(mktemp)"; chmod 600 "$BOOT_ENV_FILE"
   echo "MOLECULE_DEFAULT_PROVIDER=molecules-server"
   echo "MOLECULE_AWS_ENABLED=false"
   echo "MOLECULE_DEFAULT_RUNTIME=${RUNTIME}"
+  # MOLECULE_ENV=e2e is a REAL provisioning env: the CP does NOT boot-fetch from
+  # Infisical and FAIL-CLOSES at boot unless the full MOLECULE_TOPO_* staging-mirror
+  # set is injected (controlplane cmd/server/bootsecrets.go requireE2ETopologyInjected
+  # over internal/envs RequiredTopologyKeys). These are the NON-SECRET staging-mirror
+  # topology labels the CP ships as envs.E2EStagingMirrorTopology(); MOLECULE_AWS_ENABLED
+  # =false above means none are ever dialed — they only satisfy the boot assertion and
+  # set CP appDomain=staging.moleculesai.app (used for slug routing below).
+  echo "MOLECULE_TOPO_AWS_ACCOUNT_ID=004947743811"
+  echo "MOLECULE_TOPO_AWS_REGION=us-east-2"
+  echo "MOLECULE_TOPO_AWS_VPC_ID=vpc-0f35ce782265b34dd"
+  echo "MOLECULE_TOPO_AWS_SUBNET_ID=subnet-0bf1813c16efe69c6"
+  echo "MOLECULE_TOPO_AWS_SECURITY_GROUP_ID=sg-0996f755348630e6d"
+  echo "MOLECULE_TOPO_AWS_TENANT_INSTANCE_PROFILE=MoleculeTenantEICRole-staging"
+  echo "MOLECULE_TOPO_AWS_WORKSPACE_INSTANCE_PROFILE=MoleculeTenantEICRole-staging"
+  echo "MOLECULE_TOPO_AWS_TENANT_AMI=ami-09cdbb1de48dd8f3c"
+  echo "MOLECULE_TOPO_AWS_TENANT_IMAGE=004947743811.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/platform-tenant:latest"
+  echo "MOLECULE_TOPO_AWS_ECR_REGISTRY=004947743811.dkr.ecr.us-east-2.amazonaws.com"
+  echo "MOLECULE_TOPO_CF_ZONE=moleculesai.app"
+  echo "MOLECULE_TOPO_CF_ZONE_ID=a034108eda16d131ef7f766b923ef464"
+  echo "MOLECULE_TOPO_CF_TENANT_SUBDOMAIN_SUFFIX=staging.moleculesai.app"
+  echo "MOLECULE_TOPO_CP_APP_DOMAIN=staging.moleculesai.app"
+  echo "MOLECULE_TOPO_CP_BASE_URL=https://staging-api.moleculesai.app"
   # `up` creates the network as mol-net-${NS}; the CP provisions tenants onto it.
   echo "LOCAL_TENANT_SHARED_NETWORK=mol-net-${NS}"
   echo "LOCAL_TENANT_CP_URL=http://controlplane:8080"
@@ -90,13 +112,18 @@ eval "$up_output"
 [ -n "${CP_BASE_URL:-}" ] || { echo "FATAL: ephemeral CP up did not emit CP_BASE_URL (see its FATAL above)" >&2; exit 1; }
 echo "[proof] ephemeral CP serving at ${CP_BASE_URL}" >&2
 
-# Run the core happy-path against the ephemeral CP. tenant_call already sends
-# X-Molecule-Org-Id, so MOLECULE_TENANT_URL=CP_BASE_URL routes to the tenant via
-# the CP (same as the CP-side gate). Zero staging creds: the admin token is the
-# throwaway one baked into the ephemeral CP.
+# Run the core happy-path against the ephemeral CP. The CP wildcard proxy routes
+# tenants by SLUG (Host / X-Molecule-Org-Slug), NOT by X-Molecule-Org-Id (the CP
+# injects that toward the tenant). MOLECULE_TENANT_URL=CP_BASE_URL sends tenant
+# traffic at the CP; MOLECULE_TENANT_ROUTE_DOMAIN makes full-saas attach
+# Host=<slug>.<domain> + X-Molecule-Org-Slug so the CP routes it to the provisioned
+# tenant — exactly as scripts/deploy/local-cp-staging-e2e-gate.sh does. The domain
+# must match the CP appDomain injected above (staging.moleculesai.app). Zero staging
+# creds: the admin token is the throwaway one baked into the ephemeral CP.
 echo "[proof] running core happy-path (full-saas, runtime=${RUNTIME}) against the ephemeral CP — zero staging creds..." >&2
 MOLECULE_CP_URL="${CP_BASE_URL}" \
 MOLECULE_TENANT_URL="${CP_BASE_URL}" \
+MOLECULE_TENANT_ROUTE_DOMAIN="staging.moleculesai.app" \
 MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
 E2E_REQUIRE_LIVE=1 \
 E2E_RUNTIME="${RUNTIME}" \

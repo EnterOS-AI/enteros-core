@@ -43,9 +43,13 @@ concurrency:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
-  # The released controlplane image the ephemeral CP boots from (the BASELINE in
-  # the image-substitution matrix — a core PR tests its tenant against a stable CP).
-  CP_BASELINE_IMAGE: registry.moleculesai.app/molecule-ai/controlplane:staging-latest
+  # The controlplane BASELINE in the image-substitution matrix — a core PR tests
+  # its tenant against a stable CP. Built locally from the cloned CP main (below)
+  # using Dockerfile.dockerprov: the local-docker provisioner shells out to the
+  # `docker` CLI, which the distroless/static ROOT Dockerfile lacks. main == the
+  # released baseline, and building is self-contained (no dependency on a published
+  # tag — there is no controlplane:staging-latest).
+  CP_BASELINE_IMAGE: controlplane:baseline-dockerprov
 
 jobs:
   # bp-exempt: advisory proof gate (RFC §04). CI / all-required is the merge aggregate.
@@ -136,13 +140,21 @@ jobs:
             .
           echo "TENANT_IMAGE=molecule-tenant:pr-${HEAD_SHA:0:8}" >> "$GITHUB_ENV"
 
-      # Pull the released CP baseline (the OTHER side of the substitution).
-      - name: Pull baseline controlplane image
+      # Build the CP baseline (the OTHER side of the substitution) from the cloned
+      # CP main using Dockerfile.dockerprov — the multi-stage image that ships the
+      # `docker` CLI the local-docker tenant provisioner shells out to. The root
+      # Dockerfile is distroless/static with NO docker CLI, so a CP built from it
+      # cannot provision tenants. main == the released baseline; self-contained (no
+      # published :staging-latest tag to depend on).
+      - name: Build baseline controlplane image (Dockerfile.dockerprov)
         if: env.AUTO_SYNC_TOKEN != ''
         run: |
           set -euo pipefail
-          docker pull "${CP_BASELINE_IMAGE}"
-          echo "pulled ${CP_BASELINE_IMAGE}"
+          docker build \
+            -f .cp-ephemeral/Dockerfile.dockerprov \
+            -t "${CP_BASELINE_IMAGE}" \
+            .cp-ephemeral
+          echo "built ${CP_BASELINE_IMAGE} from cloned CP main (Dockerfile.dockerprov)"
 
       # The proof: full-saas against the throwaway CP, zero staging creds.
       - name: Run core happy-path against an ephemeral CP

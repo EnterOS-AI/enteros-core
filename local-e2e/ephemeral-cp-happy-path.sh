@@ -39,11 +39,14 @@ CP_EPHEMERAL_SCRIPT="${CP_EPHEMERAL_SCRIPT:-$ROOT/../molecule-controlplane/scrip
 
 # --- 2. baseline CP image (the OTHER side of the substitution) ----------------
 # Default: build the sibling controlplane so the dev needs no registry pull.
+# MUST use Dockerfile.dockerprov (multi-stage, ships the `docker` CLI): the CP's
+# local-docker provisioner shells out to `docker` to launch tenants, which the
+# distroless/static ROOT Dockerfile lacks — a CP built from it cannot provision.
 if [ -z "${CP_IMAGE:-}" ]; then
   CP_REPO="$(cd "$(dirname "$CP_EPHEMERAL_SCRIPT")/../.." && pwd)"
   CP_IMAGE="controlplane:local-baseline"
-  echo "[local] CP_IMAGE unset — building baseline ${CP_IMAGE} from ${CP_REPO} ..."
-  docker build -t "$CP_IMAGE" "$CP_REPO"
+  echo "[local] CP_IMAGE unset — building baseline ${CP_IMAGE} from ${CP_REPO} (Dockerfile.dockerprov) ..."
+  docker build -f "$CP_REPO/Dockerfile.dockerprov" -t "$CP_IMAGE" "$CP_REPO"
 fi
 
 # --- 3. tenant image UNDER TEST — your working tree ---------------------------

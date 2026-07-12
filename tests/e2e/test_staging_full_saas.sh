@@ -589,14 +589,33 @@ case "$CP_HOST" in
 esac
 TENANT_DOMAIN="${MOLECULE_TENANT_DOMAIN:-$DERIVED_DOMAIN}"
 # MOLECULE_TENANT_URL override — the EPHEMERAL-CP path (RFC "one pre-merge gate"
-# §04). Staging front-doors each tenant at its own subdomain (slug.<domain>); an
-# ephemeral CP instead routes tenant traffic by the X-Molecule-Org-Id header
-# (which tenant_call already sends) when hit at the CP base URL directly — the
-# SAME pattern the CP-side gate uses (local-cp-staging-e2e-gate.sh: hit
-# CP_BASE_URL with the org header). So the ephemeral runner points this at the
-# throwaway CP; default (unset) keeps the exact staging subdomain behavior.
+# §04). Staging front-doors each tenant at its own subdomain (slug.<domain>) so the
+# Host alone routes. An ephemeral CP has no per-tenant subdomain — it is one
+# throwaway container whose wildcard proxy resolves the tenant by SLUG. So the
+# ephemeral runner points this at the throwaway CP base URL; default (unset) keeps
+# the exact staging subdomain behavior.
 TENANT_URL="${MOLECULE_TENANT_URL:-https://$SLUG.$TENANT_DOMAIN}"
 log "    TENANT_URL=$TENANT_URL"
+
+# ── ephemeral-CP tenant ROUTING headers ──────────────────────────────────
+# The CP wildcard proxy resolves the tenant by SLUG — resolveOrg() reads the
+# Host-derived slug OR the X-Molecule-Org-Slug fallback (controlplane
+# internal/router/router.go). X-Molecule-Org-Id is NOT a routing input (the CP
+# INJECTS it toward the tenant). So when MOLECULE_TENANT_URL points at the CP base
+# URL we carry the routing slug the SAME way the CP-side gate does
+# (local-cp-staging-e2e-gate.sh: Host: <slug>.<suffix> + X-Molecule-Org-Slug: <slug>).
+# The runner knows the app domain but not our per-run SLUG (minted above), so build
+# the Host here from SLUG + MOLECULE_TENANT_ROUTE_DOMAIN. Default unset ⇒ no extra
+# headers ⇒ exact staging behavior.
+TENANT_ROUTE_HOST="${MOLECULE_TENANT_ROUTE_HOST:-}"
+if [ -z "$TENANT_ROUTE_HOST" ] && [ -n "${MOLECULE_TENANT_ROUTE_DOMAIN:-}" ]; then
+  TENANT_ROUTE_HOST="$SLUG.$MOLECULE_TENANT_ROUTE_DOMAIN"
+fi
+TENANT_ROUTE_HDRS=()
+if [ -n "$TENANT_ROUTE_HOST" ]; then
+  TENANT_ROUTE_HDRS=(-H "Host: $TENANT_ROUTE_HOST" -H "X-Molecule-Org-Slug: $SLUG")
+  log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG (ephemeral-CP slug routing)"
+fi
 
 # ─── 3. Retrieve per-tenant admin token ────────────────────────────────
 log "3/11 Fetching per-tenant admin token..."
@@ -622,7 +641,17 @@ TENANT_HOST="${TENANT_URL#http*://}"
 TENANT_HOST="${TENANT_HOST%%/*}"
 TENANT_HOST="${TENANT_HOST%%:*}"
 while true; do
-  if curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1; then
+  # When routing by slug-header (ephemeral CP), /health is answered by the CP's
+  # OWN global handler for every Host, so it can NEVER prove the tenant is up —
+  # that would stamp tenant_online without reaching the tenant (false-green).
+  # Probe /org/identity (an open, tenant-owned handler the CP proxies through)
+  # WITH the routing headers, mirroring local-cp-staging-e2e-gate.sh's tenant
+  # readiness probe. Staging (empty TENANT_ROUTE_HDRS) keeps the /health check.
+  if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+    if curl -sSfk --max-time 5 "${TENANT_ROUTE_HDRS[@]}" -H "X-Molecule-Org-Id: $ORG_ID" "$TENANT_URL/org/identity" >/dev/null 2>&1; then
+      break
+    fi
+  elif curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1; then
     break
   fi
   if [ "$(date +%s)" -gt "$TLS_DEADLINE" ]; then
@@ -655,9 +684,14 @@ tenant_call() {
   local path="$1"; shift
   # X-Molecule-Org-Id is REQUIRED — tenant guard 404s anything without
   # it (it does NOT 403, to hide tenant existence from org scanners).
+  # TENANT_ROUTE_HDRS is empty in staging (Host-subdomain routes); on an
+  # ephemeral CP it carries Host=<slug>.<domain> + X-Molecule-Org-Slug so the
+  # CP wildcard proxy routes this to the tenant (X-Molecule-Org-Id is NOT a
+  # routing input — it's the tenant-guard identity header).
   curl "${CURL_COMMON[@]}" -X "$method" "$TENANT_URL$path" \
     -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     "$@"
 }
 
@@ -995,6 +1029,7 @@ for wid in "${WS_TO_CHECK[@]}"; do
   UP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$wid/chat/uploads" \
     -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     -F "files=@$PNG_FIXTURE;filename=e2e-smoke.png;type=image/png" \
     -o "$UP_TMP" \
     -w '%{http_code}' \
@@ -1036,6 +1071,7 @@ walk(d)
   DL_CODE=$(curl "${CURL_COMMON[@]}" "$TENANT_URL/workspaces/$wid/chat/download?path=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DOWNLOAD_PATH")" \
     -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     -o "$DL_TMP" \
     -w '%{http_code}' \
     2>/dev/null || echo "000")
@@ -2056,6 +2092,7 @@ print(json.dumps({
     DELEG_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
       -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
+      "${TENANT_ROUTE_HDRS[@]}" \
       -H "X-Source-Workspace-Id: $PARENT_ID" \
       -H "Content-Type: application/json" \
       -d "$DELEG_PAYLOAD" \
