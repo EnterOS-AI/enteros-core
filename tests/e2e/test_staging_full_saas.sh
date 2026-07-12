@@ -349,7 +349,12 @@ cleanup_org() {
   if [ "$CLEANUP_DONE" = "1" ]; then return 0; fi
   CLEANUP_DONE=1
 
-  rm -f "${E2E_TMP_FILES[@]}" 2>/dev/null || true
+  # ${arr[@]:-} — bash 3.2 (macOS) errors on EMPTY-array expansion under
+  # `set -u` ("E2E_TMP_FILES[@]: unbound variable"), turning a fully-PASSED
+  # run into rc=1 inside this trap (`|| true` does NOT save it: the shell
+  # aborts on the expansion itself, before rm runs). bash 4.4+ (CI) is fine —
+  # this is a local==CI portability guard.
+  rm -f "${E2E_TMP_FILES[@]:-}" 2>/dev/null || true
 
   if [ "${E2E_KEEP_ORG:-0}" = "1" ]; then
     log "E2E_KEEP_ORG=1 — skipping teardown. Manually delete $SLUG when done."
