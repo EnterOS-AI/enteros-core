@@ -350,11 +350,12 @@ func TestEnsureManagedTenantLLMEnv_RetriesThroughRowCommitRace(t *testing.T) {
 	}
 }
 
-// TestEnsureManagedTenantLLMEnv_FatalsOnPersistentMiss: if the CP never delivers
-// the LLM env within the window (genuine misconfig, not a transient race),
-// ensureManagedTenantLLMEnv returns non-nil so the caller fatals — cp#469's
-// fail-loud guarantee is preserved, only deferred past the retry window.
-func TestEnsureManagedTenantLLMEnv_FatalsOnPersistentMiss(t *testing.T) {
+// TestEnsureManagedTenantLLMEnv_FatalsOnPersistentFetchFailure: if the fetch
+// keeps FAILING (401/network) for the whole window (CP never commits the row, or
+// is down), ensureManagedTenantLLMEnv returns non-nil so the caller fatals — and
+// the error carries the REAL fetch cause (401), not a generic MISSING_CP_LLM_ENV
+// (code-review #4: the fatal must name the mechanism).
+func TestEnsureManagedTenantLLMEnv_FatalsOnPersistentFetchFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized) // ALWAYS 401
 	}))
@@ -371,10 +372,83 @@ func TestEnsureManagedTenantLLMEnv_FatalsOnPersistentMiss(t *testing.T) {
 
 	err := ensureManagedTenantLLMEnv()
 	if err == nil {
-		t.Fatal("expected non-nil verdict on a persistent miss (must still fatal upstream), got nil")
+		t.Fatal("expected non-nil verdict on a persistent fetch failure (must still fatal upstream), got nil")
+	}
+	// The verdict must name the real cause (the 401), not the generic assertion.
+	if !strings.Contains(err.Error(), "did not succeed") || !strings.Contains(err.Error(), "401") {
+		t.Errorf("expected the error to carry the real fetch cause (…did not succeed…: cp returned 401), got: %v", err)
+	}
+}
+
+// TestEnsureManagedTenantLLMEnv_FailsFastOnDeterministic200Incomplete: a fetch
+// that SUCCEEDS (200) but still lacks a required LLM key is CP-side drift, NOT
+// the row-commit race — retrying cannot fix it. ensureManagedTenantLLMEnv must
+// fatal IMMEDIATELY with MISSING_CP_LLM_ENV, NOT burn the whole retry window
+// (code-review #3). We prove "fast" by giving a LONG window and asserting the
+// call returns well under it.
+func TestEnsureManagedTenantLLMEnv_FailsFastOnDeterministic200Incomplete(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		// 200 with only 3 of the 4 required keys — deterministic drift, every time.
+		fmt.Fprint(w, `{"MOLECULE_LLM_USAGE_TOKEN":"tok","MOLECULE_LLM_USAGE_URL":"https://llm/u","MOLECULE_LLM_BASE_URL":"https://llm"}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-drift")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	t.Setenv("MOLECULE_CP_CONFIG_RETRY_WINDOW", "")
+	for _, k := range requiredLLMEnvVars {
+		t.Setenv(k, "")
+	}
+	// A LONG window: if the code wrongly retried a deterministic 200, this test
+	// would take ~30s. The fast-fail must return in well under a second.
+	withFastRetry(t, 30*time.Second, time.Second)
+
+	start := time.Now()
+	err := ensureManagedTenantLLMEnv()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected MISSING_CP_LLM_ENV on a deterministic partial-200, got nil")
 	}
 	if !strings.Contains(err.Error(), "MISSING_CP_LLM_ENV") {
-		t.Errorf("expected MISSING_CP_LLM_ENV, got: %v", err)
+		t.Errorf("expected MISSING_CP_LLM_ENV (the missing key named), got: %v", err)
+	}
+	if elapsed > time.Second {
+		t.Errorf("deterministic partial-200 must fail FAST (no window burn); took %v", elapsed)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("deterministic partial-200 must NOT retry; want 1 CP call, got %d", got)
+	}
+}
+
+// TestResolveCPConfigRetryWindow: the MOLECULE_CP_CONFIG_RETRY_WINDOW override is
+// honored only for a VALID positive duration; invalid / zero / negative values
+// are REJECTED (fall back to the default), never silently applied — a "0" must
+// NOT disable the retry (code-review #1/#2).
+func TestResolveCPConfigRetryWindow(t *testing.T) {
+	withFastRetry(t, 90*time.Second, time.Second) // default window under test
+	cases := []struct {
+		name, env string
+		want      time.Duration
+	}{
+		{"unset → default", "", 90 * time.Second},
+		{"valid → honored", "45s", 45 * time.Second},
+		{"zero → rejected (must NOT disable retry)", "0", 90 * time.Second},
+		{"zero-dur → rejected", "0s", 90 * time.Second},
+		{"negative → rejected", "-5s", 90 * time.Second},
+		{"unitless typo → rejected", "45", 90 * time.Second},
+		{"garbage → rejected", "soon", 90 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("MOLECULE_CP_CONFIG_RETRY_WINDOW", c.env)
+			if got := resolveCPConfigRetryWindow(); got != c.want {
+				t.Errorf("MOLECULE_CP_CONFIG_RETRY_WINDOW=%q → %v, want %v", c.env, got, c.want)
+			}
+		})
 	}
 }
 

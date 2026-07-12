@@ -162,58 +162,105 @@ func assertManagedTenantHasLLMEnv() error {
 
 // cpConfigRetryWindow / cpConfigRetryInterval bound how long a freshly-
 // provisioned managed tenant retries the CP config fetch before giving up.
-// Package vars (not consts) so tests can shrink the window. Overridable via
-// MOLECULE_CP_CONFIG_RETRY_WINDOW (Go duration, e.g. "45s") for ops tuning.
+// Package vars (not consts) so tests can shrink them. Interval is a short poll
+// (the row commits within ms–seconds of the first miss). Window is overridable
+// via MOLECULE_CP_CONFIG_RETRY_WINDOW (Go duration, e.g. "45s") for ops tuning.
 var (
 	cpConfigRetryWindow   = 90 * time.Second
-	cpConfigRetryInterval = 3 * time.Second
+	cpConfigRetryInterval = 1 * time.Second
 )
 
+// resolveCPConfigRetryWindow returns the retry window, honoring a valid
+// MOLECULE_CP_CONFIG_RETRY_WINDOW override. Invalid or non-positive values are
+// REJECTED and LOGGED (never silently applied) — a "0" or a unit-less typo must
+// not silently disable the retry (which would reinstate the very row-commit-race
+// fatal this exists to prevent). Reads into a local (no mutation of the shared
+// package var, so repeat/concurrent calls are idempotent).
+func resolveCPConfigRetryWindow() time.Duration {
+	window := cpConfigRetryWindow
+	v := os.Getenv("MOLECULE_CP_CONFIG_RETRY_WINDOW")
+	if v == "" {
+		return window
+	}
+	switch d, err := time.ParseDuration(v); {
+	case err != nil:
+		log.Printf("CP env refresh: ignoring invalid MOLECULE_CP_CONFIG_RETRY_WINDOW=%q (%v) — using default %s", v, err, window)
+	case d <= 0:
+		log.Printf("CP env refresh: ignoring non-positive MOLECULE_CP_CONFIG_RETRY_WINDOW=%q — using default %s", v, window)
+	default:
+		window = d
+	}
+	return window
+}
+
 // ensureManagedTenantLLMEnv fetches the CP-delivered env (refreshEnvFromCP) and,
-// for a MANAGED SaaS tenant whose required LLM-proxy env is still missing
-// afterward, retries the fetch for a bounded window before returning the final
-// assertion verdict. The caller fatals on a non-nil return (cp#469 — a managed
-// tenant must not boot with broken proxy creds).
+// for a MANAGED SaaS tenant whose required LLM-proxy env is still missing,
+// RETRIES the fetch — but ONLY while it keeps FAILING (401 / network), which is
+// the org_instances row-commit race — until it succeeds or a bounded window
+// elapses. The caller fatals on a non-nil return (cp#469 — a managed tenant must
+// not boot with broken proxy creds).
 //
-// Why the retry: on a FRESH provision the tenant can boot and call
-// GET /cp/tenants/config BEFORE the CP has committed the org_instances row that
-// carries this tenant's admin_token — the CP's token lookup then 401s and the
-// LLM env is never delivered. A slow backend (EC2, minutes to boot) always has
-// the row committed first and never sees this; a fast backend (local-docker,
-// seconds) races and loses. Retrying lets the row commit, then the fetch
-// succeeds. A PERSISTENT miss (genuine misconfig) still fatals loudly once the
-// window elapses — the fail-loud guarantee is preserved, only deferred.
+// Why retry ONLY on fetch failure: on a FRESH provision the tenant can boot and
+// call GET /cp/tenants/config BEFORE the CP commits the org_instances row that
+// carries this tenant's admin_token — the token lookup 401s and no env is
+// delivered. A slow backend (EC2) always has the row committed first; a fast one
+// (local-docker) races and loses. Retrying lets the row commit, then the fetch
+// succeeds. But a fetch that SUCCEEDS (200) yet still lacks the required LLM env
+// is NOT the race — the CP is up and answered; it is deterministic CP-side drift
+// (e.g. one key dropped) that retrying cannot fix. We fatal on that IMMEDIATELY
+// with its cause rather than burn the window. A persistent fetch failure fatals
+// loudly once the window elapses, carrying the real fetch error (401 / connection
+// refused), not a generic MISSING_CP_LLM_ENV.
 //
-// Non-managed / self-host tenants (no MOLECULE_ORG_ID or ADMIN_TOKEN) return nil
-// on the first assertion and never enter the retry loop — byte-identical to the
-// prior single-shot behavior.
+// Blocks boot up to the window on a persistent fetch failure (before the HTTP
+// listener starts — the cp#469 fail-loud contract requires the LLM env present
+// before serving). Non-managed / self-host tenants (no MOLECULE_ORG_ID or
+// ADMIN_TOKEN) return nil on the first assertion and never enter the loop.
 func ensureManagedTenantLLMEnv() error {
-	if v := os.Getenv("MOLECULE_CP_CONFIG_RETRY_WINDOW"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
-			cpConfigRetryWindow = d
+	ferr := refreshEnvFromCP()
+	if ferr != nil {
+		log.Printf("CP env refresh: %v", ferr)
+	}
+	if assertManagedTenantHasLLMEnv() == nil {
+		return nil // fast path (self-host: the assertion is a no-op → nil)
+	}
+	if ferr == nil {
+		// CP answered 200 but the required LLM env is still missing → deterministic
+		// drift, NOT the row-commit race. Retrying cannot fix it; fatal now with
+		// this cause (do not burn the window).
+		return assertManagedTenantHasLLMEnv()
+	}
+
+	// Fetch failed on the first try — likely the row-commit race (401 until the CP
+	// commits our row). Retry until it succeeds or the window elapses.
+	window := resolveCPConfigRetryWindow()
+	log.Printf("CP env refresh: first fetch failed (%v) — retrying up to %s (CP org_instances row-commit race)", ferr, window)
+	deadline := time.Now().Add(window)
+	lastErr := ferr
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
 		}
-	}
-
-	if err := refreshEnvFromCP(); err != nil {
-		log.Printf("CP env refresh: %v (continuing with baked-in env)", err)
-	}
-	if err := assertManagedTenantHasLLMEnv(); err == nil {
-		return nil
-	}
-
-	log.Printf("CP env refresh: managed-tenant LLM env not ready after first fetch — retrying up to %s (CP org_instances row-commit race)", cpConfigRetryWindow)
-	deadline := time.Now().Add(cpConfigRetryWindow)
-	for time.Now().Before(deadline) {
-		time.Sleep(cpConfigRetryInterval)
+		sleep := cpConfigRetryInterval
+		if remaining < sleep {
+			sleep = remaining // never overshoot the window (also handles window < interval)
+		}
+		time.Sleep(sleep)
 		if err := refreshEnvFromCP(); err != nil {
+			lastErr = err
 			log.Printf("CP env refresh retry: %v", err)
 			continue
 		}
-		if assertManagedTenantHasLLMEnv() == nil {
+		// Fetch now succeeds — the row committed.
+		if err := assertManagedTenantHasLLMEnv(); err == nil {
 			log.Printf("CP env refresh: LLM env delivered on retry")
 			return nil
+		} else {
+			// 200 but still incomplete → deterministic drift; stop retrying.
+			return err
 		}
 	}
-	// Window elapsed — return the final verdict (fatal upstream if still missing).
-	return assertManagedTenantHasLLMEnv()
+	// Window elapsed with the fetch never succeeding — fatal with the real cause.
+	return fmt.Errorf("CP config fetch did not succeed within %s: %w", window, lastErr)
 }
