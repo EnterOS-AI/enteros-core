@@ -76,8 +76,15 @@ permissions:
   contents: read
   # No issue-write; failures surface as red runs in workflow history.
 
+# Per-SHA grouping (mirrors e2e-api.yml). Each run provisions its OWN isolated
+# cell (slug `cp455-<run_id>`), so two commits' runs never corrupt each other.
+# A STATIC group would make a newer main push cancel the older commit's run, and
+# on Gitea 1.22.6 a superseded same-group run is CANCELLED (not queued) even
+# with cancel-in-progress:false (status-reaper.yml 69-72), stamping a cancel-red
+# that wedges the `[*]` queue. cancel-in-progress:false so a teardown is never
+# aborted mid-flight.
 concurrency:
-  group: boot-to-registration-e2e
+  group: boot-to-registration-e2e-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: false
 
 jobs:

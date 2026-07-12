@@ -54,11 +54,16 @@ on:
   #   paths: [ ...same as push... ]
   workflow_dispatch:
 
-# Serialize against itself: staging has a finite per-hour org-creation quota,
-# and a cancelled run mid-teardown leaks EC2. cancel-in-progress: false
-# mirrors e2e-staging-saas.yml.
+# Per-SHA grouping (mirrors e2e-api.yml). Each run provisions its OWN isolated
+# tenant (`e2e-rec-<date>-<run_id>`), so overlapping runs never corrupt each
+# other — the finite staging org-creation quota is a throttling cost only. A
+# STATIC group would make a newer main push cancel the older commit's run, and
+# on Gitea 1.22.6 a superseded same-group run is CANCELLED (not queued) even
+# with cancel-in-progress:false (status-reaper.yml 69-72), stamping a cancel-red
+# that wedges the `[*]` queue. cancel-in-progress:false so a cancelled run never
+# aborts a teardown mid-flight (EC2/container leak guard).
 concurrency:
-  group: e2e-staging-reconciler
+  group: e2e-staging-reconciler-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: false
 
 env:

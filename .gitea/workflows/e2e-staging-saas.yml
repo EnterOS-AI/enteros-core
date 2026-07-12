@@ -82,12 +82,20 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Serialize: staging has a finite per-hour org creation quota. Two pushes
-# landing in quick succession should queue, not race. `cancel-in-progress:
-# false` mirrors e2e-api.yml — GitHub would otherwise cancel the running
-# teardown step and leave orphan EC2s.
+# Per-SHA grouping (mirrors e2e-api.yml / local-provision-e2e.yml). This job
+# is a status-reporting deploy gate, NOT a shared-fleet mutator: every run
+# provisions its OWN isolated org (slug `e2e-<date>-<run_id>`, see E2E_RUN_ID
+# below), so two commits' runs never corrupt each other's data. A STATIC group
+# would make a newer main push cancel the older commit's in-flight run — and on
+# Gitea 1.22.6 a superseded same-group run is CANCELLED (not queued) even with
+# cancel-in-progress:false (status-reaper.yml lines 69-72, DB-verified
+# 2026-05-12), stamping a cancel-red that wedges the `[*]` merge queue. Per-SHA
+# gives each commit its own group so neither cancels the other. cancel-in-
+# progress:false keeps a teardown from being aborted mid-run (orphan-leak guard).
+# The finite staging org-creation quota is a throttling cost, not a corruption
+# risk (isolated orgs), so it does NOT justify the static-group cancel-red.
 concurrency:
-  group: e2e-staging-saas
+  group: e2e-staging-saas-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: false
 
 env:
