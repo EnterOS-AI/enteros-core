@@ -4,7 +4,7 @@
 # use this Makefile; CI calls docker compose / go test directly so the
 # Makefile can evolve without breaking the build.
 
-.PHONY: help dev up down logs build test e2e-peer-visibility e2e-concierge-creates-workspace e2e-ephemeral-happy-path openapi-spec openapi-spec-check gen gen-docker gen-check gen-check-docker
+.PHONY: help dev up down logs build test e2e-peer-visibility e2e-concierge-creates-workspace e2e-ephemeral-happy-path e2e-ephemeral-boot e2e-ephemeral-scenario e2e-ephemeral-down openapi-spec openapi-spec-check gen gen-docker gen-check gen-check-docker
 
 # ─── Provider-registry SSOT codegen (internal#718) ─────────────────────
 # The Go module lives in workspace-server/. The checked-in artifact
@@ -76,7 +76,20 @@ e2e-concierge-creates-workspace: ## Prove the concierge actually creates a works
 # sibling molecule-controlplane checkout (or CP_EPHEMERAL_SCRIPT / CP_IMAGE set).
 # See local-e2e/ephemeral-cp-happy-path.sh for the overridable env.
 e2e-ephemeral-happy-path: ## Run the FULL happy path against a throwaway CP locally (same gate as CI; no staging).
-	bash local-e2e/ephemeral-cp-happy-path.sh
+	bash local-e2e/ephemeral-cp-happy-path.sh all
+
+# MODULAR PHASES — pinpoint a failing scenario step without the full rebuild+boot.
+# Boot ONCE (~minutes: build CP+tenant, boot CP, migrate), then re-run the
+# scenario as many times as you like (~2 min each) while you fix; tear down when
+# done. `scenario`/`down` NEVER rebuild — they attach to the standing CP.
+e2e-ephemeral-boot: ## Boot a throwaway CP and LEAVE IT UP (prints how to run the scenario/down).
+	bash local-e2e/ephemeral-cp-happy-path.sh boot
+
+e2e-ephemeral-scenario: ## Re-run full-saas against the standing CP (fast, repeatable — no rebuild).
+	bash local-e2e/ephemeral-cp-happy-path.sh scenario
+
+e2e-ephemeral-down: ## Tear down the standing throwaway CP + its Postgres.
+	bash local-e2e/ephemeral-cp-happy-path.sh down
 
 # ─── OpenAPI spec generation (RFC #1706, Phase 1) ─────────────────────
 # Regenerate workspace-server/docs/openapi/swagger.{yaml,json} from
