@@ -45,7 +45,11 @@ function_body() {
 # shellcheck disable=SC2016
 compose_project_line=$(line_of '^COMPOSE_PROJECT_NAME="\$\{COMPOSE_PROJECT_NAME:-molecule-core\}"')
 cleanup_fn_line=$(line_of '^cleanup_dev_stack\(\) \{')
-cleanup_call_line=$(line_of '^echo "==> Cleaning up previous local dev containers"')
+# Unanchored: #3946 moved this echo inside the `if [ "$FRESH" ]; …; else` branch
+# (the non-fresh path), so it is now indented. The ordering invariant it stands
+# for — stale containers are cleaned before dynamic ports are chosen — is
+# unchanged; only its column-0 position moved.
+cleanup_call_line=$(line_of 'Cleaning up previous local dev containers')
 host_cleanup_fn_line=$(line_of '^cleanup_repo_host_processes\(\) \{')
 pick_port_line=$(line_of '^pick_port\(\) \{')
 # shellcheck disable=SC2016
@@ -245,3 +249,64 @@ grep -REq -- '-p 127\.0\.0\.1::6379' "$WORKFLOWS_DIR" \
   || fail "CI workflows should use loopback-bound ephemeral Redis publishes"
 
 echo "PASS: CI docker Postgres/Redis publishes are loopback-bound ephemeral ports"
+
+# --fresh full-reset (opt-in, DESTRUCTIVE): must wipe named volumes AND purge the
+# stale-image trap (locally-built template images + the localbuild clone cache),
+# but ONLY on explicit opt-in. Each assertion below pins the SPECIFIC command, not
+# a substring that a comment could satisfy, so it fails on the exact regression.
+fresh_body=$(function_body fresh_reset)
+[ -n "$fresh_body" ] || fail "--fresh must be implemented by a fresh_reset function"
+
+# BOTH compose stacks must be down -v'd: the MinIO object-store volume (miniodata)
+# is declared only in docker-compose.infra.yml, so wiping only the main stack
+# silently preserves object-store state --fresh promises to wipe.
+printf '%s\n' "$fresh_body" | grep -Eq 'docker-compose\.yml" down -v' \
+  || fail "fresh_reset must 'down -v' the main compose stack (DB/Redis volumes)"
+printf '%s\n' "$fresh_body" | grep -Eq 'docker-compose\.infra\.yml" down -v' \
+  || fail "fresh_reset must 'down -v' the infra compose stack (miniodata/Langfuse volumes)"
+
+# Template-image purge: match the actual rm_by_filter command (label + rmi), not
+# the bare 'molecule-local/' substring, which also appears in comments.
+printf '%s\n' "$fresh_body" | grep -Eq 'rm_by_filter "template images".*docker rmi -f' \
+  || fail "fresh_reset must purge molecule-local template images via rm_by_filter ... docker rmi -f"
+
+# Build-clone cache: clear the default path AND the MOLECULE_LOCAL_BUILD_CACHE
+# override localbuild.go honors first (else the stale-image trap survives --fresh).
+printf '%s\n' "$fresh_body" | grep -Fq 'workspace-template-build' \
+  || fail "fresh_reset must clear the default localbuild clone cache"
+printf '%s\n' "$fresh_body" | grep -Fq 'MOLECULE_LOCAL_BUILD_CACHE' \
+  || fail "fresh_reset must also clear the MOLECULE_LOCAL_BUILD_CACHE override dir"
+
+# ws-* purge must be UUID-scoped, not a bare '^ws-' that deletes an unrelated
+# project's ws-* container/volume on the same host.
+printf '%s\n' "$fresh_body" | grep -Fq '^ws-[0-9a-f]' \
+  || fail "fresh_reset ws-* purge must be scoped to the workspace-UUID shape, not a bare ^ws- prefix"
+if printf '%s\n' "$fresh_body" | grep -Eq '"\^ws-"'; then
+  fail "fresh_reset must NOT use a bare '^ws-' filter (deletes unrelated host ws-* objects)"
+fi
+
+# The destructive wipe must NEVER fire on Ctrl-C: the exit-trap handler cleanup()
+# must invoke cleanup_dev_stack (volume-preserving), never fresh_reset.
+cleanup_trap_body=$(function_body cleanup)
+if printf '%s\n' "$cleanup_trap_body" | grep -Fq 'fresh_reset'; then
+  fail "exit-trap cleanup() must NOT call fresh_reset — --fresh wipe must never fire on Ctrl-C"
+fi
+
+# fresh_reset must run before dynamic port selection on the --fresh path (same
+# ordering invariant the non-fresh cleanup echo already guards above).
+fresh_call_line=$(line_of '^[[:space:]]+fresh_reset$')
+[ "$fresh_call_line" -lt "$pick_port_line" ] \
+  || fail "fresh_reset must run before dynamic host-port selection on the --fresh path"
+
+# Both flag spellings arm the reset (matched independently, not as one literal so
+# a harmless reorder doesn't break the test); unknown flags must still fail loud.
+for _spell in '--fresh' '--remove-volumes'; do
+  awk '/^for arg in "\$@"; do$/{f=1} f{print} f&&/^done$/{exit}' "$DEV_START" \
+    | grep -Fq -- "$_spell" || fail "arg parser must accept $_spell"
+done
+awk '/^for arg in "\$@"; do$/{f=1} f{print} f&&/^done$/{exit}' "$DEV_START" \
+  | grep -Fq 'FRESH=1' || fail "the fresh flags must set FRESH=1"
+grep -Fq "unknown option '" "$DEV_START" \
+  || fail "arg parser must fail loud on an unknown flag, not silently swallow it"
+
+echo "PASS: dev-start.sh --fresh (aka --remove-volumes) is a full opt-in reset; exit-trap keeps data"
