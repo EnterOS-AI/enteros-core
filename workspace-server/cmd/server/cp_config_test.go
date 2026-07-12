@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -298,5 +299,202 @@ func TestRefreshEnvFromCP_ClientTimeoutFiresOnSlowUpstream(t *testing.T) {
 	errStr := err.Error()
 	if !strings.Contains(errStr, "timeout") && !strings.Contains(errStr, "deadline") {
 		t.Errorf("error should mention timeout/deadline (the client.Timeout path), got: %v", err)
+	}
+}
+
+// withFastRetry shrinks the CP-config retry cadence for a test and restores it.
+func withFastRetry(t *testing.T, window, interval time.Duration) {
+	t.Helper()
+	savedW, savedI := cpConfigRetryWindow, cpConfigRetryInterval
+	cpConfigRetryWindow, cpConfigRetryInterval = window, interval
+	t.Cleanup(func() { cpConfigRetryWindow, cpConfigRetryInterval = savedW, savedI })
+}
+
+// TestEnsureManagedTenantLLMEnv_RetriesThroughRowCommitRace: a freshly-
+// provisioned tenant can hit GET /cp/tenants/config BEFORE the CP commits its
+// org_instances row (the admin_token lookup 401s). ensureManagedTenantLLMEnv
+// must RETRY until the row lands (200 + LLM keys) rather than fatal on the first
+// 401 — the exact failure the ephemeral-CP happy-path proof surfaced (fast
+// local-docker provisioning exposes the race that slow EC2 boot masks).
+func TestEnsureManagedTenantLLMEnv_RetriesThroughRowCommitRace(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// First two calls race the CP row-commit → 401 (no org_instances row
+		// yet); the third lands after the row commits → 200 with the LLM env.
+		if atomic.AddInt32(&calls, 1) < 3 {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"MOLECULE_LLM_USAGE_TOKEN":"tok","MOLECULE_LLM_USAGE_URL":"https://llm/u","MOLECULE_LLM_BASE_URL":"https://llm","MOLECULE_LLM_ANTHROPIC_BASE_URL":"https://llm/a"}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-race")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	t.Setenv("MOLECULE_CP_CONFIG_RETRY_WINDOW", "") // use the package-var window below
+	for _, k := range requiredLLMEnvVars {
+		t.Setenv(k, "")
+	}
+	withFastRetry(t, 5*time.Second, 20*time.Millisecond)
+
+	if err := ensureManagedTenantLLMEnv(); err != nil {
+		t.Fatalf("expected success after retrying through the 401 row-commit race, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got < 3 {
+		t.Errorf("expected >=3 CP calls (2x401 then 200), got %d — retry did not engage", got)
+	}
+	if got := os.Getenv("MOLECULE_LLM_USAGE_TOKEN"); got != "tok" {
+		t.Errorf("LLM env not applied after retry: MOLECULE_LLM_USAGE_TOKEN=%q", got)
+	}
+}
+
+// TestEnsureManagedTenantLLMEnv_FatalsOnPersistentFetchFailure: if the fetch
+// keeps FAILING (401/network) for the whole window (CP never commits the row, or
+// is down), ensureManagedTenantLLMEnv returns non-nil so the caller fatals — and
+// the error carries the REAL fetch cause (401), not a generic MISSING_CP_LLM_ENV
+// (code-review #4: the fatal must name the mechanism).
+func TestEnsureManagedTenantLLMEnv_FatalsOnPersistentFetchFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized) // ALWAYS 401
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-bad")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	t.Setenv("MOLECULE_CP_CONFIG_RETRY_WINDOW", "")
+	for _, k := range requiredLLMEnvVars {
+		t.Setenv(k, "")
+	}
+	withFastRetry(t, 100*time.Millisecond, 20*time.Millisecond)
+
+	err := ensureManagedTenantLLMEnv()
+	if err == nil {
+		t.Fatal("expected non-nil verdict on a persistent fetch failure (must still fatal upstream), got nil")
+	}
+	// The verdict must name the real cause (the 401), not the generic assertion.
+	if !strings.Contains(err.Error(), "did not succeed") || !strings.Contains(err.Error(), "401") {
+		t.Errorf("expected the error to carry the real fetch cause (…did not succeed…: cp returned 401), got: %v", err)
+	}
+}
+
+// TestEnsureManagedTenantLLMEnv_FailsFastOnDeterministic200Incomplete: a fetch
+// that SUCCEEDS (200) but still lacks a required LLM key is CP-side drift, NOT
+// the row-commit race — retrying cannot fix it. ensureManagedTenantLLMEnv must
+// fatal IMMEDIATELY with MISSING_CP_LLM_ENV, NOT burn the whole retry window
+// (code-review #3). We prove "fast" by giving a LONG window and asserting the
+// call returns well under it.
+func TestEnsureManagedTenantLLMEnv_FailsFastOnDeterministic200Incomplete(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		// 200 with only 3 of the 4 required keys — deterministic drift, every time.
+		fmt.Fprint(w, `{"MOLECULE_LLM_USAGE_TOKEN":"tok","MOLECULE_LLM_USAGE_URL":"https://llm/u","MOLECULE_LLM_BASE_URL":"https://llm"}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-drift")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	t.Setenv("MOLECULE_CP_CONFIG_RETRY_WINDOW", "")
+	for _, k := range requiredLLMEnvVars {
+		t.Setenv(k, "")
+	}
+	// A LONG window: if the code wrongly retried a deterministic 200, this test
+	// would take ~30s. The fast-fail must return in well under a second.
+	withFastRetry(t, 30*time.Second, time.Second)
+
+	start := time.Now()
+	err := ensureManagedTenantLLMEnv()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected MISSING_CP_LLM_ENV on a deterministic partial-200, got nil")
+	}
+	if !strings.Contains(err.Error(), "MISSING_CP_LLM_ENV") {
+		t.Errorf("expected MISSING_CP_LLM_ENV (the missing key named), got: %v", err)
+	}
+	if elapsed > time.Second {
+		t.Errorf("deterministic partial-200 must fail FAST (no window burn); took %v", elapsed)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("deterministic partial-200 must NOT retry; want 1 CP call, got %d", got)
+	}
+}
+
+// TestResolveCPConfigRetryWindow: the MOLECULE_CP_CONFIG_RETRY_WINDOW override is
+// honored only for a VALID positive duration; invalid / zero / negative values
+// are REJECTED (fall back to the default), never silently applied — a "0" must
+// NOT disable the retry (code-review #1/#2).
+func TestResolveCPConfigRetryWindow(t *testing.T) {
+	withFastRetry(t, 90*time.Second, time.Second) // default window under test
+	cases := []struct {
+		name, env string
+		want      time.Duration
+	}{
+		{"unset → default", "", 90 * time.Second},
+		{"valid → honored", "45s", 45 * time.Second},
+		{"zero → rejected (must NOT disable retry)", "0", 90 * time.Second},
+		{"zero-dur → rejected", "0s", 90 * time.Second},
+		{"negative → rejected", "-5s", 90 * time.Second},
+		{"unitless typo → rejected", "45", 90 * time.Second},
+		{"garbage → rejected", "soon", 90 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("MOLECULE_CP_CONFIG_RETRY_WINDOW", c.env)
+			if got := resolveCPConfigRetryWindow(); got != c.want {
+				t.Errorf("MOLECULE_CP_CONFIG_RETRY_WINDOW=%q → %v, want %v", c.env, got, c.want)
+			}
+		})
+	}
+}
+
+// TestEnsureManagedTenantLLMEnv_NotManagedNoRetry: self-hosted (no orgID/token)
+// returns nil immediately and never enters the retry loop — a long window must
+// NOT delay a self-host boot.
+func TestEnsureManagedTenantLLMEnv_NotManagedNoRetry(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "")
+	t.Setenv("ADMIN_TOKEN", "")
+	t.Setenv("MOLECULE_CP_CONFIG_RETRY_WINDOW", "")
+	withFastRetry(t, 30*time.Second, time.Second) // would hang if the loop ran
+
+	start := time.Now()
+	if err := ensureManagedTenantLLMEnv(); err != nil {
+		t.Fatalf("self-hosted must return nil, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("self-hosted must NOT enter the retry loop; took %v", elapsed)
+	}
+}
+
+// TestEnsureManagedTenantLLMEnv_HappyPathNoRetry: when the first fetch already
+// delivers all LLM keys, ensureManagedTenantLLMEnv returns nil after exactly one
+// CP call — no retry latency on the common path.
+func TestEnsureManagedTenantLLMEnv_HappyPathNoRetry(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"MOLECULE_LLM_USAGE_TOKEN":"tok","MOLECULE_LLM_USAGE_URL":"https://llm/u","MOLECULE_LLM_BASE_URL":"https://llm","MOLECULE_LLM_ANTHROPIC_BASE_URL":"https://llm/a"}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MOLECULE_ORG_ID", "org-happy")
+	t.Setenv("ADMIN_TOKEN", "admin-tok")
+	t.Setenv("MOLECULE_CP_URL", srv.URL)
+	t.Setenv("MOLECULE_CP_CONFIG_RETRY_WINDOW", "")
+	for _, k := range requiredLLMEnvVars {
+		t.Setenv(k, "")
+	}
+	withFastRetry(t, 5*time.Second, 20*time.Millisecond)
+
+	if err := ensureManagedTenantLLMEnv(); err != nil {
+		t.Fatalf("happy path must succeed, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("happy path must make exactly 1 CP call (no retry), got %d", got)
 	}
 }

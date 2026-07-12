@@ -106,17 +106,17 @@ func main() {
 	// env we were provisioned with. Older SaaS tenants predate PR #53
 	// and can arrive here with MOLECULE_CP_SHARED_SECRET unset; this
 	// is how they heal without SSH.
-	if err := refreshEnvFromCP(); err != nil {
-		log.Printf("CP env refresh: %v (continuing with baked-in env)", err)
-	}
-
-	// Managed-tenant boot assertion (cp#469 — tenant proxy-env delivery).
-	// If we're a managed SaaS tenant (orgID + adminToken set), all required
-	// LLM proxy env vars must be present after refresh. Missing keys block
-	// the tenant from booting with broken LLM creds — silent-fail is worse
-	// than a loud refusal. Self-hosted (no orgID/adminToken) short-circuits
-	// inside the assertion, so this never fires for dev.
-	if err := assertManagedTenantHasLLMEnv(); err != nil {
+	// Managed-tenant boot (cp#469 — tenant proxy-env delivery): fetch the
+	// CP-delivered env (incl. the required LLM proxy creds) via refreshEnvFromCP,
+	// retrying a transient startup 401 for a bounded window. A freshly-provisioned
+	// tenant can call the CP BEFORE it commits our org_instances row (the token
+	// lookup 401s and the LLM env is never delivered) — a race fast backends
+	// (local-docker) hit and slow ones (EC2) mask. A managed SaaS tenant that
+	// still lacks the required LLM proxy vars after the retry window fatals loudly
+	// — silent-fail is worse than a loud refusal. Self-hosted (no orgID/adminToken)
+	// short-circuits inside and never retries — byte-identical to before. The
+	// refresh also heals older tenants whose MOLECULE_CP_SHARED_SECRET is unset.
+	if err := ensureManagedTenantLLMEnv(); err != nil {
 		log.Fatalf("Managed tenant boot assertion: %v", err)
 	}
 
