@@ -209,6 +209,19 @@ jobs:
       # COPY of workspace-server source invalidates on any delivery change), so
       # THIS ref's code is always what runs. GIT_SHA is baked so /buildinfo
       # reports the served SHA (verify-don't-buy).
+      - name: Start disposable dind (per-job isolation — task #78)
+        # Same pattern as harness-replays.yml: run the harness stack inside a
+        # throwaway docker:dind so a cancelled/SIGKILLed run can't orphan harness-*
+        # containers/volumes on the shared host and concurrent runs can't collide
+        # on the fixed compose project/ports. dind.sh exports DOCKER_HOST (every
+        # `docker compose` below targets the ISOLATED daemon) + BASE/CP_STUB_BASE
+        # (the buildinfo curl + template-asset-delivery-gate.sh reach the nested
+        # harness via host-loopback forwards) + HARNESS_BIND_ADDR. Torn down in the
+        # always() step at the end.
+        if: needs.detect-changes.outputs.delivery == 'true'
+        working-directory: tests/harness
+        run: bash dind.sh up
+
       - name: Build harness images FROM THIS REF (explicit, not up's skip-if-exists)
         if: needs.detect-changes.outputs.delivery == 'true'
         working-directory: tests/harness
@@ -230,7 +243,7 @@ jobs:
           set -uo pipefail
           ./up.sh
           echo "--- buildinfo (served SHA must match this ref) ---"
-          curl -sS -H "Host: harness-tenant-alpha.localhost" http://localhost:8080/buildinfo | head -c 300 || true
+          curl -sS -H "Host: harness-tenant-alpha.localhost" "${BASE:-http://localhost:8080}/buildinfo" | head -c 300 || true
           echo ""
           echo "--- running template-asset delivery gate ---"
           bash template-asset-delivery-gate.sh
@@ -249,3 +262,12 @@ jobs:
         if: always() && needs.detect-changes.outputs.delivery == 'true'
         working-directory: tests/harness
         run: ./down.sh || true
+
+      - name: Teardown dind (destroys the whole harness topology atomically)
+        # LAST step — the dump + ./down.sh steps above run against DOCKER_HOST=dind.
+        # Removing the single dind destroys every nested container/volume/network in
+        # one atomic op on the HOST daemon (dind.sh down unsets DOCKER_HOST).
+        # always(): a no-op if no dind was started.
+        if: always()
+        working-directory: tests/harness
+        run: bash dind.sh down
