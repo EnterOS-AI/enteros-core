@@ -82,9 +82,11 @@ start_pg() {
   [ -n "$PG_PORT" ] || PG_PORT="$(docker port "$PG_CTR" 5432/tcp | head -1 | awk -F: '{print $NF}')"
   [ -n "$PG_PORT" ] || { echo "FATAL: no host port for ${PG_CTR}" >&2; docker logs "$PG_CTR" 2>&1 | tail -20 >&2 || true; exit 1; }
   local ready=""
+  # wait_for: poll the REAL ready signal (pg_isready); the 30x 1s loop is a
+  # safety deadline we break out of the instant PG is ready, never wait out.
   for _ in $(seq 1 30); do
     if docker exec "$PG_CTR" pg_isready -U postgres >/dev/null 2>&1; then ready=1; break; fi
-    sleep 1
+    sleep 1  # wait_for: pg_isready backoff (real-signal poll above, not a fixed timer)
   done
   [ -n "$ready" ] || { echo "FATAL: ephemeral Postgres ${PG_CTR} never became ready" >&2; docker logs "$PG_CTR" 2>&1 | tail -20 >&2 || true; exit 1; }
   echo "[proof] ephemeral PG ${PG_CTR} ready on 127.0.0.1:${PG_PORT}" >&2
