@@ -1440,11 +1440,22 @@ except Exception:
           sleep 10
           continue
         fi
-      elif echo "$safe_body" | grep -Eqi 'workspace agent unreachable|connection refused|workspace agent busy|native_session|restarting|restart triggered'; then
+      elif echo "$safe_body" | grep -Eqi 'workspace agent unreachable|connection refused|workspace agent busy|native_session|restarting|restart triggered|workspace has no URL|has no URL|"status" *: *"provisioning"|provisioning'; then
         echo "    $label A2A agent-origin $code attempt $attempt/12: $safe_body" >&2
         if [ "$attempt" -lt 12 ]; then
           # Agent restart/cold-start can take tens of seconds; keep polling,
           # but do NOT treat this as an edge-gateway transient eligible for skip.
+          #
+          # The `workspace has no URL` / `"status":"provisioning"` 503 is the
+          # config.yaml-PUT restart flap: step 7c PUTs config.yaml, which
+          # triggers a workspace restart; step 7d's routing-recovery poll can
+          # observe the PRE-restart online state and pass ~1s later, then the
+          # restart flips the workspace back to provisioning (no URL) just as
+          # this A2A send fires (RCA of run 480639, 2026-07-12: 7d online at
+          # 11:21:57 → 503 provisioning at 11:22:12). Treat it as the same
+          # "workspace not ready, come back" class as `restarting`: keep polling
+          # (30s) until the restart settles and the URL returns. A workspace
+          # genuinely stuck in provisioning still exhausts the budget → RED.
           sleep 30
           continue
         fi
