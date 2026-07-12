@@ -36,6 +36,11 @@
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Shared docker-teardown helpers (mol_rm_by_filter / mol_purge_ws_objects,
+# UUID-scoped + xargs-free) — also used by scripts/nuke-and-rebuild.sh.
+# shellcheck source=scripts/lib/docker-reset.sh
+# shellcheck disable=SC1091
+. "$ROOT/scripts/lib/docker-reset.sh"
 ENV_FILE="$ROOT/.env"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-molecule-core}"
 export COMPOSE_PROJECT_NAME
@@ -147,32 +152,15 @@ cleanup_dev_stack() {
     docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
 }
 
-# rm_by_filter DESC — delete docker objects a `docker ... --format {{...}}` +
-# grep -E pipeline selects, WITHOUT xargs -r (a GNU-ism BSD/macOS xargs rejects):
-# only invoke the remover when the selection is non-empty. $1 = human label
-# (printed, so a destructive reset reports what it touched and a per-item
-# removal failure is visible instead of silently leaving a partial wipe),
-# $2 = the listing command, $3 = the ERE grep pattern, $4 = the remove command.
-rm_by_filter() {
-    _label="$1"
-    _sel=$(eval "$2" 2>/dev/null | grep -E "$3" 2>/dev/null || true)
-    [ -n "$_sel" ] || return 0
-    echo "    --fresh: removing $(printf '%s\n' "$_sel" | grep -c .) $_label"
-    printf '%s\n' "$_sel" | while IFS= read -r _item; do
-        [ -n "$_item" ] || continue
-        eval "$4 \"$_item\"" >/dev/null 2>&1 \
-            || echo "    WARN: failed to remove $_label: $_item" >&2
-    done
-}
-
 fresh_reset() {
     # --fresh (opt-in only; NEVER runs on the exit trap — see cleanup()). Unlike
     # cleanup_dev_stack — which keeps named volumes so DB/object-store state
     # survives an ordinary restart — this WIPES that state plus the locally-built
     # runtime images, so onboarding and every template image rebuild from a clean
-    # slate. Mirrors the nuke portion of scripts/nuke-and-rebuild.sh and adds the
-    # template-image + build-clone-cache purge (the piece that otherwise strands a
-    # stale molecule-local/workspace-template-*:<sha> image behind a green boot).
+    # slate. Shares the ws-* purge helper (mol_purge_ws_objects) with
+    # scripts/nuke-and-rebuild.sh and adds the template-image + build-clone-cache
+    # purge (the piece that otherwise strands a stale
+    # molecule-local/workspace-template-*:<sha> image behind a green boot).
     echo "==> --fresh: FULL reset — WIPING local DB / object-store / onboarding state"
     cleanup_repo_host_processes
     # Compose stack + named volumes (postgres/redis/minio/langfuse/clickhouse).
@@ -184,19 +172,14 @@ fresh_reset() {
     docker compose -f "$ROOT/docker-compose.infra.yml" down -v --remove-orphans >/dev/null 2>&1 \
         || echo "    WARN: 'docker compose -f docker-compose.infra.yml down -v' failed — MinIO/Langfuse volumes may persist" >&2
     docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
-    # Dynamically-spawned ws-<uuid> workspace containers + volumes are NOT in
-    # compose, so `down -v` leaves them behind. Scope to the workspace-UUID name
-    # shape (ws-<8hex>-<4hex>-<4hex>-…) — NOT a bare `ws-` prefix, which would also
-    # match an unrelated project's `ws-*` object (e.g. `ws-frontend-cache`) on the
-    # same host and destroy its data.
-    _ws_re='^ws-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-'
-    rm_by_filter "workspace containers" "docker ps -a --format '{{.Names}}'" "$_ws_re" "docker rm -f"
-    rm_by_filter "workspace volumes"    "docker volume ls --format '{{.Name}}'" "$_ws_re" "docker volume rm"
+    # Dynamically-spawned ws-<uuid> workspace containers + volumes (UUID-scoped so
+    # an unrelated project's ws-* object on the same host is never touched).
+    mol_purge_ws_objects
     docker network rm molecule-core-net >/dev/null 2>&1 || true
     # Locally-built runtime template images (the whole molecule-local/ namespace is
     # synthetic local-build output) so the next provision rebuilds each template
     # from current source rather than reusing a stale :<sha> tag.
-    rm_by_filter "template images" "docker images --format '{{.Repository}}:{{.Tag}}'" "^molecule-local/" "docker rmi -f"
+    mol_rm_by_filter "template images" "docker images --format '{{.Repository}}:{{.Tag}}'" "^molecule-local/" "docker rmi -f"
     # Clone/build cache. localbuild.go uses MOLECULE_LOCAL_BUILD_CACHE verbatim when
     # set, else ${XDG_CACHE_HOME:-$HOME/.cache}/molecule/… , else $TMPDIR/molecule/… —
     # clear every branch so an operator who set the override (or runs without HOME)
@@ -568,24 +551,24 @@ else
     # container on the same dynamic host port we chose above so the
     # wait-for-/health loop (127.0.0.1:$PLATFORM_PORT) matches.
     export PLATFORM_PORT PLATFORM_PUBLISH_PORT="$PLATFORM_PORT"
+    # Truncate the log once, then APPEND both steps so the --fresh from-scratch
+    # build transcript is preserved above the up output (a bare `>` on the up
+    # would clobber it) while a normal run still starts from an empty log.
+    : > /tmp/molecule-platform.log
     if [ "$FRESH" -eq 1 ]; then
+        # --fresh: force a from-scratch image first; the shared `up --build` below
+        # is then a fast cache hit rather than a duplicated up + failure handler.
         echo "    --fresh: rebuilding platform image with --no-cache"
-        docker compose build --no-cache platform > /tmp/molecule-platform.log 2>&1 || {
+        docker compose build --no-cache platform >> /tmp/molecule-platform.log 2>&1 || {
             echo "    ✗ docker compose build --no-cache platform failed — see /tmp/molecule-platform.log"
             exit 1
         }
-        docker compose up -d platform >> /tmp/molecule-platform.log 2>&1 || {
-            echo "    ✗ docker compose up platform failed — see /tmp/molecule-platform.log"
-            echo "    Either install Go 1.25+ (https://go.dev/dl/) and rerun, or fix the docker fallback."
-            exit 1
-        }
-    else
-        docker compose up -d --build platform > /tmp/molecule-platform.log 2>&1 || {
-            echo "    ✗ docker compose up platform failed — see /tmp/molecule-platform.log"
-            echo "    Either install Go 1.25+ (https://go.dev/dl/) and rerun, or fix the docker fallback."
-            exit 1
-        }
     fi
+    docker compose up -d --build platform >> /tmp/molecule-platform.log 2>&1 || {
+        echo "    ✗ docker compose up platform failed — see /tmp/molecule-platform.log"
+        echo "    Either install Go 1.25+ (https://go.dev/dl/) and rerun, or fix the docker fallback."
+        exit 1
+    }
     # PLATFORM_PID is unset on this path; cleanup() handles that with `kill ... 2>/dev/null || true`.
     PLATFORM_PID=
 fi

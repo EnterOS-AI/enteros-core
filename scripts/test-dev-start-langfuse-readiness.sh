@@ -19,6 +19,8 @@ LOCAL_CANARY="$ROOT/local-e2e/scripts/run-canary.sh"
 LOCAL_TENANT_SMOKE="$ROOT/scripts/local-tenant-smoke.sh"
 WORKFLOWS_DIR="$ROOT/.gitea/workflows"
 SETUP="$ROOT/infra/scripts/setup.sh"
+RESET_LIB="$ROOT/scripts/lib/docker-reset.sh"
+NUKE="$ROOT/scripts/nuke-and-rebuild.sh"
 
 fail() {
   echo "FAIL: $1" >&2
@@ -265,10 +267,10 @@ printf '%s\n' "$fresh_body" | grep -Eq 'docker-compose\.yml" down -v' \
 printf '%s\n' "$fresh_body" | grep -Eq 'docker-compose\.infra\.yml" down -v' \
   || fail "fresh_reset must 'down -v' the infra compose stack (miniodata/Langfuse volumes)"
 
-# Template-image purge: match the actual rm_by_filter command (label + rmi), not
-# the bare 'molecule-local/' substring, which also appears in comments.
-printf '%s\n' "$fresh_body" | grep -Eq 'rm_by_filter "template images".*docker rmi -f' \
-  || fail "fresh_reset must purge molecule-local template images via rm_by_filter ... docker rmi -f"
+# Template-image purge: match the actual mol_rm_by_filter command (label + rmi),
+# not the bare 'molecule-local/' substring, which also appears in comments.
+printf '%s\n' "$fresh_body" | grep -Eq 'mol_rm_by_filter "template images".*docker rmi -f' \
+  || fail "fresh_reset must purge molecule-local template images via mol_rm_by_filter ... docker rmi -f"
 
 # Build-clone cache: clear the default path AND the MOLECULE_LOCAL_BUILD_CACHE
 # override localbuild.go honors first (else the stale-image trap survives --fresh).
@@ -277,13 +279,43 @@ printf '%s\n' "$fresh_body" | grep -Fq 'workspace-template-build' \
 printf '%s\n' "$fresh_body" | grep -Fq 'MOLECULE_LOCAL_BUILD_CACHE' \
   || fail "fresh_reset must also clear the MOLECULE_LOCAL_BUILD_CACHE override dir"
 
-# ws-* purge must be UUID-scoped, not a bare '^ws-' that deletes an unrelated
-# project's ws-* container/volume on the same host.
-printf '%s\n' "$fresh_body" | grep -Fq '^ws-[0-9a-f]' \
-  || fail "fresh_reset ws-* purge must be scoped to the workspace-UUID shape, not a bare ^ws- prefix"
-if printf '%s\n' "$fresh_body" | grep -Eq '"\^ws-"'; then
-  fail "fresh_reset must NOT use a bare '^ws-' filter (deletes unrelated host ws-* objects)"
-fi
+# ws-* purge is delegated to the shared, UUID-scoped mol_purge_ws_objects helper.
+printf '%s\n' "$fresh_body" | grep -Fq 'mol_purge_ws_objects' \
+  || fail "fresh_reset must purge ws-* via the shared mol_purge_ws_objects helper"
+
+# Shared lib: the ws-* filter MUST be UUID-scoped, never a bare '^ws-' prefix
+# (which would delete an unrelated project's ws-* object on the same host).
+[ -f "$RESET_LIB" ] || fail "scripts/lib/docker-reset.sh (shared teardown helpers) must exist"
+grep -Eq "MOL_WS_UUID_RE='\^ws-\[0-9a-f\]\{8\}" "$RESET_LIB" \
+  || fail "docker-reset.sh MOL_WS_UUID_RE must be scoped to ^ws-<8hex>-…, not a bare ^ws-"
+grep -Fq 'mol_purge_ws_objects()' "$RESET_LIB" \
+  || fail "docker-reset.sh must define mol_purge_ws_objects"
+# The purge helper must FILTER WITH $MOL_WS_UUID_RE — not an inline pattern. Pins
+# the scope to the (audited) variable, so a broadened literal like "^ws-.*" that
+# slips past the literal check below still fails this assertion.
+# shellcheck disable=SC2016  # grepping for the LITERAL text "$MOL_WS_UUID_RE"
+grep -Fq '"$MOL_WS_UUID_RE"' "$RESET_LIB" \
+  || fail "mol_purge_ws_objects must pass \$MOL_WS_UUID_RE as the filter (not an inline ^ws- pattern)"
+# Neither reset script/lib may reintroduce a bare '^ws-' literal (a quoted
+# '^ws-'/"^ws-" — the buggy prefix) or GNU-only 'xargs -r'. Anchored with ^[^#]*
+# so a quoted '^ws-' or 'xargs -r' in COMMENT prose can't false-fire; only real
+# code (before any #) is checked.
+for _f in "$DEV_START" "$NUKE" "$RESET_LIB"; do
+  if grep -Eq "^[^#]*[\"']\^ws-[\"']" "$_f"; then
+    fail "$(basename "$_f") uses a bare '^ws-' literal in code (must be the scoped MOL_WS_UUID_RE)"
+  fi
+  # Match piped USAGE (`| xargs -r`) in code, not backtick prose in comments.
+  if grep -Eq "^[^#]*\| *xargs +-r" "$_f"; then
+    fail "$(basename "$_f") pipes into 'xargs -r' (BSD/macOS xargs rejects it)"
+  fi
+done
+
+# nuke-and-rebuild.sh must reuse the shared helper, not its old buggy inline purge.
+[ -f "$NUKE" ] || fail "scripts/nuke-and-rebuild.sh must exist"
+grep -Fq 'docker-reset.sh' "$NUKE" \
+  || fail "nuke-and-rebuild.sh must source the shared scripts/lib/docker-reset.sh"
+grep -Fq 'mol_purge_ws_objects' "$NUKE" \
+  || fail "nuke-and-rebuild.sh must purge ws-* via mol_purge_ws_objects (UUID-scoped)"
 
 # The destructive wipe must NEVER fire on Ctrl-C: the exit-trap handler cleanup()
 # must invoke cleanup_dev_stack (volume-preserving), never fresh_reset.

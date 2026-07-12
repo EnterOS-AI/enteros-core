@@ -19,11 +19,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Shared docker-teardown helpers (mol_purge_ws_objects) — same UUID-scoped,
+# xargs-free purge scripts/dev-start.sh --fresh uses.
+# shellcheck source=scripts/lib/docker-reset.sh
+# shellcheck disable=SC1091
+. "$ROOT/scripts/lib/docker-reset.sh"
 
 echo "=== NUKE ==="
 docker compose -f "$ROOT/docker-compose.yml" down -v 2>/dev/null || true
-docker ps -a --format "{{.Names}}" | grep "^ws-" | xargs -r docker rm -f 2>/dev/null || true
-docker volume ls --format "{{.Name}}" | grep "^ws-" | xargs -r docker volume rm 2>/dev/null || true
+# Dynamically-spawned ws-<uuid> workspace containers + volumes (NOT in compose).
+# Scoped to the workspace-UUID name shape — a bare `^ws-` prefix (the prior form)
+# would also delete an unrelated project's ws-* object on the same host, and its
+# `xargs -r` is a GNU-ism BSD/macOS xargs rejects.
+mol_purge_ws_objects
 docker network rm molecule-core-net 2>/dev/null || true
 echo "  cleaned"
 
