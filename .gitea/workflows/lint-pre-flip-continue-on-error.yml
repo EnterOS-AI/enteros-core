@@ -133,6 +133,13 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # Last 5 commits on the base branch is the spec default.
-          RECENT_COMMITS_N: '5'
+          # Window over recent base-branch commits to find the flipped job's
+          # last (push) run. Bumped 5→12: paths-filtered workflows (e.g.
+          # lint-continue-on-error-tracking, which runs on push only when
+          # `.gitea/workflows/**` changes) may not have run in the last 5
+          # main commits, and this gate FAILS CLOSED on checked_commits==0
+          # ("cannot verify flip") — a 5-commit window would block a genuine
+          # green-on-main flip and wedge the [*] queue. 12 reaches such runs
+          # while staying a single un-paginated /commits page.
+          RECENT_COMMITS_N: '12'
         run: python3 .gitea/scripts/lint_pre_flip_continue_on_error.py

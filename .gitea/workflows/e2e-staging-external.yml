@@ -46,9 +46,14 @@ name: E2E Staging External Runtime
 # tests/e2e/test_staging_external_runtime.sh and are exercised per-PR/push
 # (paths filter above) once the local-docker rework restores the auto-triggers.
 #
-# Concurrency: serialized so two staging pushes don't fight for the
-# same EC2 quota window. cancel-in-progress=false so a half-rolled
-# tenant always finishes its teardown.
+# Concurrency: per-SHA (mirrors e2e-api.yml). Each run provisions its OWN
+# isolated tenant (`e2e-ext-<date>-<run_id>`), so two commits' runs never
+# corrupt each other — the shared staging quota is a throttling cost, not a
+# corruption risk. A STATIC group would make a newer main push cancel the older
+# commit's run, and on Gitea 1.22.6 a superseded same-group run is CANCELLED
+# (not queued) even with cancel-in-progress:false (status-reaper.yml 69-72),
+# stamping a cancel-red that wedges the `[*]` queue. cancel-in-progress:false so
+# a half-rolled tenant always finishes its teardown.
 
 on:
   # RE-ENABLED (group A): molecules-server (local-docker) replaces the closed AWS EC2 path.
@@ -80,7 +85,7 @@ on:
       - '.gitea/workflows/e2e-staging-external.yml'
   workflow_dispatch:
 concurrency:
-  group: e2e-staging-external
+  group: e2e-staging-external-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: false
 
 permissions:
