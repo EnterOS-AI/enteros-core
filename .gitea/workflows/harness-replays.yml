@@ -335,6 +335,19 @@ jobs:
             --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
             -r tests/harness/requirements.txt
 
+      - name: Start disposable dind (per-job isolation — task #78)
+        # Run the ENTIRE harness stack inside a throwaway docker:dind so a
+        # cancelled/SIGKILLed run can't orphan harness-* containers/volumes on the
+        # shared host, and two concurrent runs can't collide on the fixed compose
+        # project/ports — the chronic non-hermetic "Harness Replays" reds. dind.sh
+        # exports DOCKER_HOST (every `docker compose` below targets the ISOLATED
+        # daemon), BASE + CP_STUB_BASE (the replay curls reach the nested harness
+        # via host-loopback port forwards off the dind), and HARNESS_BIND_ADDR.
+        # Feasibility proven by dind-smoke.yml; torn down in the always() step.
+        if: needs.detect-changes.outputs.run == 'true'
+        working-directory: tests/harness
+        run: bash dind.sh up
+
       - name: Rebuild cp-stub from source (RC #11812 + RC #11815 narrow fix)
         # Why this step exists: tests/harness/up.sh's \`build\` block is
         # gated by \`--rebuild\` (no default rebuild), so without an
@@ -429,3 +442,17 @@ jobs:
         if: always() && needs.detect-changes.outputs.run == 'true'
         working-directory: tests/harness
         run: ./down.sh || true
+
+      - name: Teardown dind (destroys the whole harness topology atomically)
+        # MUST be the LAST step — the dump + `./down.sh` steps above run against
+        # DOCKER_HOST=dind (the harness lives inside it). Removing the single dind
+        # container then destroys every nested container/volume/network/image in
+        # one atomic op, on the HOST daemon (dind.sh down unsets DOCKER_HOST). On a
+        # SIGKILLed job this may not run, but the only leftover is ONE uniquely-
+        # named dind-harness-* container — trivial to reap, vs the open-ended
+        # harness-*/postgres/redis set today. Gated like Force teardown on
+        # run=='true': the no-op path never starts a dind (nothing to reap) and its
+        # checkout lacks the tests/harness cwd this step chdirs into.
+        if: always() && needs.detect-changes.outputs.run == 'true'
+        working-directory: tests/harness
+        run: bash dind.sh down

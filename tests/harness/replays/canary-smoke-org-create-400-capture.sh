@@ -81,7 +81,7 @@ HTTP_CODE=$(curl -sS --fail-with-body --max-time 30 \
     -w "%{http_code}" \
     -H "Authorization: Bearer ${ALPHA_ADMIN_TOKEN}" \
     -H "Content-Type: application/json" \
-    -X POST "http://localhost:9090/cp/admin/orgs" \
+    -X POST "${CP_STUB_BASE:-http://localhost:9090}/cp/admin/orgs" \
     -d "{\"slug\":\"$ORG_CREATE_400_CAPTURE_SLUG\",\"name\":\"replay-bad-org\"}" \
     || true)
 # Reset the exit-code from the curl --fail-with-body so set -e
