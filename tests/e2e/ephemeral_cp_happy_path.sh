@@ -195,6 +195,15 @@ boot_cp() {
     # `up` creates the network as mol-net-${NS}; the CP provisions tenants onto it.
     echo "LOCAL_TENANT_SHARED_NETWORK=mol-net-${NS}"
     echo "LOCAL_TENANT_CP_URL=http://controlplane:8080"
+    # LINUX containerized-CP posture (CP #1526): tenant ports must publish on
+    # 0.0.0.0 — a 127.0.0.1-bound host port is unreachable from inside the CP
+    # container on Linux (host.docker.internal = the gateway IP, which a
+    # loopback bind does not accept), so the CP's tenant health probe times
+    # out every provision (observed on this gate's first two CI runs; the
+    # same run is green on macOS, where Docker Desktop special-cases
+    # host.docker.internal to reach loopback binds). Ignored by CPs without
+    # the knob; strict {127.0.0.1,0.0.0.0} allowlist on the CP side.
+    echo "LOCAL_TENANT_BIND_ADDR=0.0.0.0"
     # THROWAWAY crown jewels (RFC finding #1-A): the CP + DB are disposable, so
     # these only need to be self-consistent for the life of the run.
     echo "CP_ADMIN_API_TOKEN=${CP_ADMIN_API_TOKEN}"
