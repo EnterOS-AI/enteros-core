@@ -77,16 +77,13 @@ on:
   # slow provisioning jobs (e2e-staging-saas, e2e-staging-platform-boot)
   # still skip on docs-only PRs, but the workflow ITSELF is unconditional.
   #
-  # RFC "One Pre-Merge Ephemeral Gate" Phase 4 — the push[main] (POST-MERGE)
-  # trigger is RETIRED 2026-07-11. It was redding main against the shared/dead
-  # staging infra AFTER the SHA already landed. The SaaS full-lifecycle + boot
-  # logic is now validated PRE-merge by (a) the now-REQUIRED per-PR ephemeral
-  # gate (molecule-controlplane pr-ephemeral-cp-gate, local-docker matrix) and
-  # (b) this workflow's own `pull_request` run (E2E Staging Concierge Creates
-  # Workspace, still in required-contexts.txt). A real regression can no longer
-  # reach main (the required pre-merge gate blocks it), so the post-merge run
-  # added only main-red, no coverage. `workflow_dispatch` stays for manual
-  # staging verification.
+  # NOTE (2026-07-11): a premature RFC-Phase-4 retire of this push[main] trigger
+  # was REVERTED. The jobs here only `bash -n` on pull_request (E2E_REQUIRE_LIVE=0);
+  # the LIVE staging run is push-only. So this push trigger IS the live coverage —
+  # it cannot be retired until the per-PR ephemeral gate is PROVEN green (soak) and
+  # the current push-failure is confirmed to be dead-infra, not a real regression.
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
