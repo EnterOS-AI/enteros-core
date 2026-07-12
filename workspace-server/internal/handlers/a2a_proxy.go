@@ -829,6 +829,19 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 
 	agentURL, proxyErr := h.resolveAgentURL(ctx, workspaceID)
 	if proxyErr != nil {
+		// A transiently-settling target (provisioning / mid-restart /
+		// awaiting_agent) has no URL yet, but the message must not be dropped.
+		// Mirror the busy path: enqueue for durable drain when the workspace
+		// comes back online, returning 202 {queued:true, queue_id} instead of a
+		// hard 503 that silently loses the turn (RCA: config.yaml-PUT restart
+		// flap dropped the step-8 A2A in run 480639). Only the recoverable-
+		// transient class is enqueued; on enqueue failure fall back to the
+		// original 503 so callers still retry.
+		if proxyErr.Classification == classWorkspaceSettling {
+			if _, status, respBody := h.enqueueBusyA2A(ctx, workspaceID, callerID, body, a2aMethod, 0, logActivity); status != 0 {
+				return status, respBody, nil
+			}
+		}
 		return 0, nil, proxyErr
 	}
 
@@ -1139,6 +1152,28 @@ func (h *WorkspaceHandler) conciergeWarmingGate(ctx context.Context, workspaceID
 // the result on success. When the platform runs inside Docker, 127.0.0.1:<host
 // port> is rewritten to the container's Docker-bridge hostname (host-side
 // platforms keep the original URL because the bridge name wouldn't resolve).
+// classWorkspaceSettling tags a resolveAgentURL 503 whose target has no URL
+// only because it is in a transient, self-recovering lifecycle state. The A2A
+// proxy routes this class into the durable busy-enqueue path instead of
+// dropping the turn with a hard 503. See proxyA2AError.Classification.
+const classWorkspaceSettling = "workspace_settling"
+
+// isRecoverableSettlingStatus reports whether a URL-less workspace is in a
+// transient state that will self-resolve to online (so an inbound A2A should be
+// queued for drain) rather than a terminal/parked state (where queuing would
+// leak until TTL because the box will not come back on its own). A mid-restart
+// re-provision is status='provisioning' (runRestartCycle), and awaiting_agent
+// is up-but-agent-registering; both settle to online. failed/offline/paused/
+// hibernated/hibernating/removed are intentionally excluded.
+func isRecoverableSettlingStatus(status string) bool {
+	switch models.WorkspaceStatus(status) {
+	case models.StatusProvisioning, models.StatusAwaitingAgent:
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID string) (string, *proxyA2AError) {
 	agentURL, err := db.GetCachedURL(ctx, workspaceID)
 	if err != nil {
@@ -1184,10 +1219,20 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 					},
 				}
 			}
-			return "", &proxyA2AError{
+			// A URL-less workspace in a transient, self-recovering state
+			// (provisioning — which also covers a mid-restart re-provision — or
+			// awaiting_agent) has NOT failed: its URL materializes when it
+			// settles. Tag it so the caller enqueues the A2A for durable drain
+			// (mirroring the busy path) rather than hard-503-dropping the turn.
+			// Terminal / parked states stay unclassified → hard 503.
+			settlingErr := &proxyA2AError{
 				Status:   http.StatusServiceUnavailable,
 				Response: gin.H{"error": "workspace has no URL", "status": status},
 			}
+			if isRecoverableSettlingStatus(status) {
+				settlingErr.Classification = classWorkspaceSettling
+			}
+			return "", settlingErr
 		}
 		agentURL = urlNullable.String
 		_ = db.CacheURL(ctx, workspaceID, agentURL)
