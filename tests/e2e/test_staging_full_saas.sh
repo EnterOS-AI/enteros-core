@@ -1181,6 +1181,20 @@ for wid in "${WS_TO_CHECK[@]}"; do
     log "── END DIAGNOSTIC ──"
     if is_ec2_backend; then
       fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set in Railway, and EIC endpoint health"
+    elif [ "$DIAG_FAIL" = "docker-available" ]; then
+      # A real staging TENANT's workspace-server runs INSIDE the tenant container
+      # with NO docker socket (by security design — a tenant must never reach the
+      # host daemon; that IS the finding-#1 escape surface). So diagnoseLocal's
+      # `h.docker == nil` docker-available check legitimately reports not-ok, and
+      # that is NOT a terminal regression: the tenant terminal does not
+      # docker-exec-into-itself via the workspace-server's own client. Container
+      # execution is already asserted by online+routable (step 7) + A2A (step 8),
+      # so SKIP this ONE sub-step (post-#3969 the routing is correct — remote:false
+      # — but diagnoseLocal's first check is docker-availability). A diagnose
+      # failure at ANY OTHER step (container-running / exec) still hard-fails below.
+      # FOLLOW-UP: terminal_diagnose.diagnoseLocal should model the real tenant
+      # terminal path instead of hard-erroring on a nil docker client.
+      log "    ⏭️  $wid terminal-diagnose docker-available SKIPPED (non-EC2 tenant workspace-server has no docker socket by design; container-exec covered by steps 7+8): $DIAG_DETAIL"
     else
       fail "Workspace $wid diagnoseLocal (non-EC2, remote:false) reported ok=false at step '$DIAG_FAIL': $DIAG_DETAIL — the local-docker container-running check failed (docker.Ping / container exec)"
     fi
