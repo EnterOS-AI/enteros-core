@@ -297,6 +297,13 @@ type dockerClient interface {
 type Provisioner struct {
 	cli         dockerClient
 	alpineImage string // overridable in tests; production uses the digest-pinned default
+	// alpineEnsureOnce bounds the throwaway-helper image acquisition to ONE
+	// inspect+pull per process: the alpine helper is digest-pinned + immutable,
+	// so re-inspecting/re-pulling it before every VolumeHasFile/ReadFromVolume/
+	// WriteAuthTokenToVolume/migrate would add a daemon round-trip to hot/boot
+	// paths — and on a registry-unreachable host would turn each call into a
+	// per-call pull-timeout instead of a single one.
+	alpineEnsureOnce sync.Once
 }
 
 // New creates a new Provisioner connected to the local Docker daemon.
@@ -847,28 +854,12 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	//      contents are by definition immutable.
 	// The pull is best-effort: if it fails (network, auth, rate limit) the
 	// subsequent ContainerCreate still surfaces the actionable error below.
-	imgInspect, imgErr := p.cli.ImageInspect(ctx, image)
-	moving := imageTagIsMoving(image)
-	switch {
-	case imgErr != nil:
-		if imgPlatformStr != "" {
-			log.Printf("Provisioner: image %s not present locally (%v) — attempting pull (platform=%s)", image, imgErr, imgPlatformStr)
-		} else {
-			log.Printf("Provisioner: image %s not present locally (%v) — attempting pull", image, imgErr)
-		}
-	case moving:
-		log.Printf("Provisioner: image %s present locally (ID: %s, created: %s) but tag is moving — re-pulling to refresh",
-			image, imgInspect.ID[:19], imgInspect.Created[:19])
-	default:
+	imgInspect, moving, imgErr := p.ensureImagePresent(ctx, image, imgPlatformStr)
+	if imgErr == nil && !moving {
+		// Already-present pinned image: ensureImagePresent stayed quiet, so log
+		// which snapshot we are about to create from (stale-image debugging).
 		log.Printf("Provisioner: creating %s from image %s (ID: %s, created: %s)",
-			name, image, imgInspect.ID[:19], imgInspect.Created[:19])
-	}
-	if imgErr != nil || moving {
-		if perr := pullImageAndDrain(ctx, p.cli, image, imgPlatformStr); perr != nil {
-			log.Printf("Provisioner: image pull for %s failed: %v (falling through to create)", image, perr)
-		} else {
-			log.Printf("Provisioner: pulled %s", image)
-		}
+			name, image, clip(imgInspect.ID, 19), clip(imgInspect.Created, 19))
 	}
 
 	// Create and start container. If the image still isn't available,
@@ -1514,6 +1505,10 @@ func (p *Provisioner) ExecRead(ctx context.Context, containerName, filePath stri
 // ReadFromVolume reads a file from a Docker named volume using a throwaway container.
 // Used as a fallback when ExecRead fails (container already stopped).
 func (p *Provisioner) ReadFromVolume(ctx context.Context, volumeName, filePath string) ([]byte, error) {
+	// Ensure the pinned helper image is present (once/process) — the SDK
+	// ContainerCreate does not auto-pull, so this self-heals a host that has
+	// not pulled it yet without re-inspecting on every call.
+	p.ensureAlpineImage(ctx)
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
 		Image: p.alpineImage,
 		Cmd:   []string{"cat", "/vol/" + filePath},
@@ -1585,6 +1580,8 @@ func (p *Provisioner) WriteAuthTokenToVolume(ctx context.Context, workspaceID, t
 		return ErrNoBackend
 	}
 	volName := p.resolveConfigVolumeName(ctx, workspaceID)
+	// Ensure the pinned helper image is present (once/process; no SDK auto-pull).
+	p.ensureAlpineImage(ctx)
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
 		Image: p.alpineImage,
 		Cmd:   []string{"sh", "-c", writeAuthTokenVolumeCmd()},
@@ -1673,6 +1670,7 @@ func (p *Provisioner) migrateVolumeIfNeeded(ctx context.Context, newName, legacy
 	// The trailing test guards against silent empty copies (e.g. legacy
 	// volume unexpectedly bare) which would leave the workspace without
 	// its config on restart.  Core#2545.
+	p.ensureAlpineImage(ctx) // self-heal a missing pinned helper image, once/process
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
 		Image: p.alpineImage,
 		Cmd:   []string{"sh", "-c", "cp -a /legacy/. /new/ && test -n \"$(ls -A /new/)\""},
@@ -2020,6 +2018,7 @@ func (p *Provisioner) VolumeHasFile(ctx context.Context, workspaceID, relPath st
 	if _, err := p.cli.VolumeInspect(ctx, volName); err != nil {
 		return false, nil
 	}
+	p.ensureAlpineImage(ctx) // self-heal a missing pinned helper image, once/process
 	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
 		Image: p.alpineImage,
 		Cmd:   []string{"test", "-f", "/vol/" + relPath},
@@ -2162,6 +2161,68 @@ func pullImageAndDrain(ctx context.Context, cli dockerImageClient, ref, platform
 		return fmt.Errorf("drain pull stream: %w", err)
 	}
 	return nil
+}
+
+// ensureImagePresent acquires `image` locally before a ContainerCreate. Unlike
+// the `docker run` CLI, the SDK ContainerCreate does NOT auto-pull a missing
+// image, so a host that has not pulled `image` (e.g. a fresh localbuild box that
+// lacks the digest-pinned alpine helper image) would otherwise fail the create
+// with an opaque "No such image". This applies the SAME acquire-before-create
+// discipline the workspace-container path uses: pull-on-miss, plus re-pull when
+// the tag is MOVING (:latest / untagged / :staging …) so a stale local snapshot
+// is refreshed.
+//
+// Pinned refs (@sha256 / semver) that are already present are NEVER re-pulled —
+// they are immutable — so this is "ensure-PRESENT", not "pull-latest": it never
+// undermines the platform's deliberate image pinning (RUNTIME_VERSION pins, the
+// digest-pinned alpine helper, localbuild `:<sha>` tags).
+//
+// Best-effort: a pull failure logs and returns; the caller's ContainerCreate
+// still surfaces the actionable error. Returns the pre-pull inspect, whether the
+// ref is a moving tag, and the inspect error — so a caller can gate its own
+// create-context log without re-scanning the ref.
+func (p *Provisioner) ensureImagePresent(ctx context.Context, image, platformStr string) (dockerimage.InspectResponse, bool, error) {
+	imgInspect, imgErr := p.cli.ImageInspect(ctx, image)
+	moving := imageTagIsMoving(image)
+	switch {
+	case imgErr != nil:
+		if platformStr != "" {
+			log.Printf("Provisioner: image %s not present locally (%v) — attempting pull (platform=%s)", image, imgErr, platformStr)
+		} else {
+			log.Printf("Provisioner: image %s not present locally (%v) — attempting pull", image, imgErr)
+		}
+	case moving:
+		log.Printf("Provisioner: image %s present locally (ID: %s, created: %s) but tag is moving — re-pulling to refresh",
+			image, clip(imgInspect.ID, 19), clip(imgInspect.Created, 19))
+	}
+	if imgErr != nil || moving {
+		if perr := pullImageAndDrain(ctx, p.cli, image, platformStr); perr != nil {
+			log.Printf("Provisioner: image pull for %s failed: %v (falling through to create)", image, perr)
+		} else {
+			log.Printf("Provisioner: pulled %s", image)
+		}
+	}
+	return imgInspect, moving, imgErr
+}
+
+// ensureAlpineImage ensures the digest-pinned throwaway-helper image is present,
+// AT MOST ONCE per process. The image is immutable, so a single inspect+pull
+// suffices; this keeps the per-call helper paths (VolumeHasFile, ReadFromVolume,
+// WriteAuthTokenToVolume, migrate) from adding a daemon round-trip — or a
+// per-call pull-timeout on a registry-unreachable host — to every invocation.
+func (p *Provisioner) ensureAlpineImage(ctx context.Context) {
+	p.alpineEnsureOnce.Do(func() {
+		p.ensureImagePresent(ctx, p.alpineImage, "")
+	})
+}
+
+// clip returns s[:n] without panicking on a shorter-than-n string (daemon-
+// supplied image ID/Created fields are normally long, but never slice raw).
+func clip(s string, n int) string {
+	if len(s) < n {
+		return s
+	}
+	return s[:n]
 }
 
 // defaultImagePlatform picks the Docker image platform string used for
