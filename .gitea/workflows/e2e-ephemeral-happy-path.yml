@@ -58,6 +58,7 @@ jobs:
     # docker-host: needs a real docker.sock + molecule-core-net to spin the CP,
     # its Postgres, and the provisioned tenant (same runner class as harness-replays).
     runs-on: docker-host
+    # mc#4081 — advisory soak; flip to REQUIRED per the RFC §04 end-state.
     continue-on-error: true
     timeout-minutes: 40
     steps:
