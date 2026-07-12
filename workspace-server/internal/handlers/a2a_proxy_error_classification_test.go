@@ -15,6 +15,39 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// ==================== workspace_settling classification ====================
+
+// A URL-less workspace in a transient, self-recovering state must be enqueued
+// (mirroring the busy path), not hard-503-dropped. This pins the recoverable
+// whitelist so nobody accidentally adds a terminal/parked state (which would
+// queue A2A turns to a box that never drains, leaking until TTL). RCA:
+// config.yaml-PUT restart flap dropped the step-8 A2A in staging run 480639.
+func TestIsRecoverableSettlingStatus(t *testing.T) {
+	recoverable := []string{"provisioning", "awaiting_agent"}
+	terminalOrParked := []string{
+		"online", "offline", "degraded", "failed", "removed",
+		"paused", "hibernated", "hibernating", "", "bogus",
+	}
+	for _, s := range recoverable {
+		if !isRecoverableSettlingStatus(s) {
+			t.Errorf("status %q must be treated as recoverable-settling (→ enqueue A2A), got false", s)
+		}
+	}
+	for _, s := range terminalOrParked {
+		if isRecoverableSettlingStatus(s) {
+			t.Errorf("status %q must NOT be treated as recoverable-settling (→ hard 503, never queue), got true", s)
+		}
+	}
+}
+
+// The classification constant must match the value proxyA2ARequest checks; a
+// typo would silently disable the enqueue routing and re-drop messages.
+func TestClassWorkspaceSettling_Value(t *testing.T) {
+	if classWorkspaceSettling != "workspace_settling" {
+		t.Fatalf("classWorkspaceSettling drifted: got %q want %q", classWorkspaceSettling, "workspace_settling")
+	}
+}
+
 // ==================== proxyA2AError.Error() with classification ====================
 
 func TestProxyA2AError_Classification_SuffixesMessage(t *testing.T) {
