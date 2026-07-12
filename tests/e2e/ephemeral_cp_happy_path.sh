@@ -253,8 +253,13 @@ load_state() {
 # X-Molecule-Org-Slug so the CP routes it to the provisioned tenant. Zero staging
 # creds: the admin token is the throwaway one baked into the ephemeral CP.
 #
-# E2E_LLM_PATH=platform — the gate mirrors the staging `E2E Staging Platform
-# Boot` lane, which is precisely the lane it exists to replace pre-merge:
+# E2E_LLM_PATH=platform + E2E_MODE=smoke — the gate mirrors the staging `E2E
+# Staging Platform Boot` lane, which is precisely the lane it exists to replace
+# pre-merge. smoke runs the happy-path core (provision → tenant online →
+# workspace online+routable → A2A real completion, steps 2/4/7/8b) and SKIPS
+# the full-matrix extras (memory plugin — needs MEMORY_PLUGIN_URL infra the
+# ephemeral env doesn't stand up — delegation matrix, lifecycle), exactly as
+# Platform Boot does; those stay the staging BYOK job's coverage.
 # workspace provisioned with NO tenant key, model = the hermes default
 # minimax/MiniMax-M2.7 (SLASH form = PLATFORM-managed per CTO task#83; the
 # CP LLM proxy bills, required_env=[]), completion flows workspace → tenant
@@ -273,6 +278,8 @@ run_scenario() {
   E2E_REQUIRE_LIVE=1 \
   E2E_RUNTIME="${RUNTIME}" \
   E2E_LLM_PATH=platform \
+  E2E_AWS_LEAK_CHECK=off \
+  E2E_MODE=smoke \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
     bash "$HERE/test_staging_full_saas.sh"
 }

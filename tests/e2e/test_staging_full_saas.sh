@@ -1370,6 +1370,26 @@ try:
 except Exception:
     print('')" 2>/dev/null || echo "")
             if [ -n "$resp" ]; then
+              # The interrupt-ack can arrive THROUGH THE QUEUE too: with the
+              # settling/busy→enqueue path (core#4069) the send is queued, the
+              # drain dispatches it to a mid-task agent, and the agent's
+              # synchronous interrupt-ack becomes the queue item's durable
+              # response_body — bypassing the synchronous elif below (found by
+              # the ephemeral gate: PONG failed at +28s with the ack via a
+              # COMPLETED queue item). Same treatment: re-send bounded for the
+              # real reply; a wedged agent still exhausts the budget → RED.
+              if a2a_is_interrupt_ack "$resp"; then
+                interrupt_ack_count=$((interrupt_ack_count + 1))
+                if [ "$interrupt_ack_count" -le "$max_interrupt_ack" ]; then
+                  echo "    $label interrupt-ack via queue item $qid (agent mid-task) — re-sending for the real reply (${interrupt_ack_count}/${max_interrupt_ack}), backing off ${interrupt_ack_backoff}s" >&2
+                  qid=""
+                  rm -f "$poll_tmp"
+                  sleep "$interrupt_ack_backoff"
+                  continue 2
+                fi
+                rm -f "$poll_tmp" "$tmp"
+                fail "$label agent never produced a real reply after ${interrupt_ack_count} interrupt-acknowledgement(s) (~$((max_interrupt_ack * interrupt_ack_backoff))s, last via queue): it accepted the message and interrupted its current task but never yielded a follow-up turn (likely wedged mid-task). Last ack: $(printf '%s' "$resp" | sanitize_http_body | head -c 300)"
+              fi
               code=200
               break 2
             fi
@@ -1483,7 +1503,7 @@ except Exception:
           sleep 10
           continue
         fi
-      elif echo "$safe_body" | grep -Eqi 'workspace agent unreachable|connection refused|workspace agent busy|native_session|restarting|restart triggered|workspace has no URL|has no URL|"status" *: *"provisioning"|provisioning'; then
+      elif echo "$safe_body" | grep -Eqi 'workspace agent unreachable|connection refused|workspace agent busy|native_session|restarting|restart triggered|workspace has no URL|has no URL|"status" *: *"provisioning"|provisioning|not publicly routable'; then
         echo "    $label A2A agent-origin $code attempt $attempt/12: $safe_body" >&2
         if [ "$attempt" -lt 12 ]; then
           # Agent restart/cold-start can take tens of seconds; keep polling,
@@ -1499,6 +1519,14 @@ except Exception:
           # "workspace not ready, come back" class as `restarting`: keep polling
           # (30s) until the restart settles and the URL returns. A workspace
           # genuinely stuck in provisioning still exhausts the budget → RED.
+          #
+          # `workspace URL is not publicly routable` (502) is the sibling race
+          # on the URL's FORM rather than its presence: ~1s after online, the
+          # workspace row can still carry a URL shape the tenant's SSRF guard
+          # (a2a_proxy.go isSafeURL) rejects, until the workspace's own
+          # registration/heartbeat lands the routable form (observed on the
+          # ephemeral gate: identical send 1s post-online PONGed in one run and
+          # 502'd in the next). Same settling class, same bounded retry.
           sleep 30
           continue
         fi
