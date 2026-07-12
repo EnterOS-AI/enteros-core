@@ -76,8 +76,17 @@ on:
   # Per-job gating is moved to the job level (`if:` guards below) so the
   # slow provisioning jobs (e2e-staging-saas, e2e-staging-platform-boot)
   # still skip on docs-only PRs, but the workflow ITSELF is unconditional.
-  push:
-    branches: [main]
+  #
+  # RFC "One Pre-Merge Ephemeral Gate" Phase 4 — the push[main] (POST-MERGE)
+  # trigger is RETIRED 2026-07-11. It was redding main against the shared/dead
+  # staging infra AFTER the SHA already landed. The SaaS full-lifecycle + boot
+  # logic is now validated PRE-merge by (a) the now-REQUIRED per-PR ephemeral
+  # gate (molecule-controlplane pr-ephemeral-cp-gate, local-docker matrix) and
+  # (b) this workflow's own `pull_request` run (E2E Staging Concierge Creates
+  # Workspace, still in required-contexts.txt). A real regression can no longer
+  # reach main (the required pre-merge gate blocks it), so the post-merge run
+  # added only main-red, no coverage. `workflow_dispatch` stays for manual
+  # staging verification.
   pull_request:
     branches: [main]
   workflow_dispatch:
