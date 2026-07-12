@@ -254,6 +254,9 @@ fi
 # shellcheck source=lib/model_slug.sh
 source "$(dirname "$0")/lib/model_slug.sh"
 # shellcheck disable=SC1091
+# shellcheck source=lib/workspace_env_presence.sh
+source "$(dirname "$0")/lib/workspace_env_presence.sh"
+# shellcheck disable=SC1091
 # shellcheck source=lib/aws_leak_check.sh
 source "$(dirname "$0")/lib/aws_leak_check.sh"
 # shellcheck disable=SC1091
@@ -1663,53 +1666,31 @@ live_milestone a2a_roundtrip
 # resolved_mode read (GET …/llm-billing-mode) is gone (probing it returned an HTML
 # 404 — the red this replaces).
 #
-# The DISCRIMINATING live signal we assert instead is the PLATFORM CP-proxy usage
-# token, MOLECULE_LLM_USAGE_TOKEN: it is injected into a workspace's container env
-# ONLY when the workspace routes through the platform LLM proxy. A correctly-routed
-# BYOK workspace uses its OWN vendor key and MUST NOT carry it. We read that token's
-# env-key PRESENCE (boolean/name-list observability, a06a52eb — value NEVER read)
-# off GET /workspaces/:id — the same signal test_staging_concierge_creates_workspace
-# uses for the inverse (platform members MUST carry it). This is NOT tautological
-# with 8b or with mere vendor-key persistence: a #1994-regressed byok workspace
-# baked platform_managed KEEPS its workspace-scoped vendor key AND returns a real
-# completion (draining the platform key) — 8b and a secret-row probe BOTH stay green
-# — yet it carries MOLECULE_LLM_USAGE_TOKEN, so only THIS probe goes red. Only
-# meaningful when the parent carries a byok credential (the no-key path is
-# legitimately platform_managed — the CTO default).
-if [ -n "${E2E_MINIMAX_API_KEY:-}" ] || [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
-  # Which byok vendor key did this arm ship? (matches the SECRETS_JSON branch.)
-  if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then _byok_key="MINIMAX_API_KEY"; else _byok_key="ANTHROPIC_API_KEY"; fi
-  set +e
-  WS_OBJ=$(tenant_call GET "/workspaces/$PARENT_ID" 2>/dev/null)
-  WS_RC=$?
-  set -e
-  if [ "$WS_RC" != "0" ] || [ -z "$WS_OBJ" ]; then
-    fail "byok-routing guard (#1994): GET /workspaces/$PARENT_ID failed (rc=$WS_RC). Body: $(printf '%s' "${WS_OBJ:0:200}" | sanitize_http_body)"
-  fi
-  # env-key PRESENCE ONLY of the platform CP-proxy token (never its value): present
-  # on a byok workspace == it is on the platform proxy == the #1994 misroute.
-  _plat_tok=$(printf '%s' "$WS_OBJ" | python3 -c "
-import json, sys
-KEY = 'MOLECULE_LLM_USAGE_TOKEN'
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print('unobservable'); sys.exit(0)
-if not isinstance(d, dict):
-    print('unobservable'); sys.exit(0)
-for f in ('llm_usage_token_present', 'has_llm_usage_token', 'llm_auth_present', 'platform_llm_auth_present'):
-    v = d.get(f)
-    if isinstance(v, bool):
-        print('present' if v else 'absent'); sys.exit(0)
-for f in ('provisioned_env_keys', 'container_env_keys', 'env_keys', 'llm_env_keys'):
-    v = d.get(f)
-    if isinstance(v, list):
-        print('present' if KEY in v else 'absent'); sys.exit(0)
-ep = d.get('env_key_presence')
-if isinstance(ep, dict) and KEY in ep:
-    print('present' if bool(ep[KEY]) else 'absent'); sys.exit(0)
-print('unobservable')
-" 2>/dev/null || echo "probe_error")
+# The DISCRIMINATING signal is the PLATFORM CP-proxy usage token,
+# MOLECULE_LLM_USAGE_TOKEN: workspace_provision.go injects it into a workspace's
+# container env ONLY on the platform route, so a correctly-routed BYOK workspace
+# (using its OWN vendor key) MUST NOT carry it; a #1994-regressed one baked
+# platform_managed WOULD. We read its env-key PRESENCE (never the value) off
+# GET /workspaces/:id via the shared workspace_platform_llm_token_presence probe —
+# the same signal test_staging_concierge_creates_workspace uses for the inverse.
+# Not tautological with 8b: a misrouted workspace returns a real completion too.
+#
+# DORMANT UNTIL a06a52eb (core #4042): that env-presence field is NOT yet exposed
+# by the workspace API, so the probe returns `unobservable` on the current build
+# and this gate is ADVISORY — #1994 has NO live workspace-API gate until a06a52eb
+# lands. The structure is correct, so it flips to a HARD gate automatically once
+# the field appears. present->fail / absent->ok / unobservable->advisory. Every
+# byok arm (MiniMax / Anthropic / OpenAI-hermes) is checked; only the genuine
+# platform/no-key path (E2E_LLM_PATH=platform) is legitimately platform_managed.
+if [ "${E2E_LLM_PATH:-}" != "platform" ] && { [ -n "${E2E_MINIMAX_API_KEY:-}" ] || [ -n "${E2E_ANTHROPIC_API_KEY:-}" ] || [ -n "${E2E_OPENAI_API_KEY:-}" ]; }; then
+  # Mirror the SECRETS_JSON precedence: E2E_LLM_PATH=platform is provisioned
+  # platform-managed (SECRETS_JSON='{}') EVEN IF a stray E2E_*_API_KEY leaks into
+  # the runner env, so it must NOT enter the byok branch (finding 2). Which byok
+  # vendor key did this arm ship? (matches the SECRETS_JSON branch.)
+  if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then _byok_key="MINIMAX_API_KEY"
+  elif [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then _byok_key="ANTHROPIC_API_KEY"
+  else _byok_key="OPENAI_API_KEY"; fi
+  _plat_tok=$(workspace_platform_llm_token_presence "$PARENT_ID")
   case "$_plat_tok" in
     absent)
       ok "8c.  byok-routing guard (#1994): byok parent ($RUNTIME/$MODEL_SLUG) carries NO platform CP-proxy token (MOLECULE_LLM_USAGE_TOKEN absent) → routing BYOK on its own '$_byok_key', not the platform proxy. #1994 stays fixed." ;;
@@ -1717,15 +1698,14 @@ print('unobservable')
       fail "byok-routing guard TRIPPED (#1994 regression): byok parent $PARENT_ID has the PLATFORM CP-proxy token MOLECULE_LLM_USAGE_TOKEN injected → it is routing through the platform LLM proxy and draining the platform key instead of its own '$_byok_key'. A byok workspace must NOT carry the platform usage token."
       ;;
     *)
-      # env-presence field (a06a52eb) not exposed on this build — cannot read
-      # routing directly. Do NOT claim a pass: corroborated only by 8b's real
-      # completion (which a proxy-misroute would also satisfy). Land the field to
-      # promote this to a hard gate.
-      log "8c.  byok-routing guard ADVISORY — GET /workspaces/$PARENT_ID exposes no MOLECULE_LLM_USAGE_TOKEN env-presence field (a06a52eb not landed here; probe='$_plat_tok'). Cannot directly confirm byok routing; NOT a pass."
+      # a06a52eb env-presence not exposed on this build → the probe is DORMANT.
+      # Do NOT claim #1994 coverage: 8b's completion does NOT distinguish routing
+      # (a proxy-misroute completes too). Advisory until a06a52eb lands (core #4042).
+      log "8c.  byok-routing guard DORMANT (advisory) — MOLECULE_LLM_USAGE_TOKEN presence not observable via GET /workspaces/$PARENT_ID (core a06a52eb env-presence not landed; probe='$_plat_tok'). #1994 has NO live gate until a06a52eb (core #4042); NOT a pass."
       ;;
   esac
 else
-  log "8c.  byok-routing guard skipped — parent carries no own-vendor key (OpenAI/no-key path is legitimately platform_managed)."
+  log "8c.  byok-routing guard skipped — parent carries no own-vendor key (E2E_LLM_PATH=platform / no-key path is legitimately platform_managed)."
 fi
 
 # ─── 8d. Per-offered-provider liveness matrix (SSOT-driven, #1994 class) ─

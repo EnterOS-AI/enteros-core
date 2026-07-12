@@ -131,6 +131,11 @@ source "$SCRIPT_DIR/lib/aws_leak_check.sh"
 # shellcheck disable=SC1091
 # shellcheck source=lib/completion_assert.sh
 source "$SCRIPT_DIR/lib/completion_assert.sh"
+# Shared PRESENCE-ONLY probe for the platform CP-proxy token — the SAME field
+# contract full-SaaS 8c uses (one place to update when core a06a52eb lands, #4042).
+# shellcheck disable=SC1091
+# shellcheck source=lib/workspace_env_presence.sh
+source "$SCRIPT_DIR/lib/workspace_env_presence.sh"
 # SSOT for the platform MCP management tool verb. Sourcing this gives us
 # PLATFORM_MCP_REQUIRED_TOOL and PLATFORM_MCP_REQUIRED_TOOL_ID so the test
 # cannot drift from the real tool name again.
@@ -1025,30 +1030,10 @@ obs_step_end create_team_verify pass "" "worker_id=$WORKER_ID" "worker_kind=${WO
 obs_step_start created_agent_auth_presence
 log "4.6/6 CREATED-AGENT LLM AUTH — presence-check MOLECULE_LLM_USAGE_TOKEN on member $WORKER_ID (key presence only, value NEVER read)..."
 
-# created_agent_llm_token_presence: echoes present|absent|unobservable. Reads
-# ONLY presence/boolean signals — it must NEVER echo a secret value.
-created_agent_llm_token_presence() {
-  tenant_call GET "/workspaces/$WORKER_ID" 2>/dev/null | python3 -c '
-import sys, json
-KEY = "MOLECULE_LLM_USAGE_TOKEN"
-try: d = json.load(sys.stdin)
-except Exception: print("unobservable"); sys.exit(0)
-if not isinstance(d, dict): print("unobservable"); sys.exit(0)
-# a06a52eb env-presence observability (boolean — presence, NOT value):
-for f in ("llm_usage_token_present","has_llm_usage_token","llm_auth_present","platform_llm_auth_present"):
-    v = d.get(f)
-    if isinstance(v, bool):
-        print("present" if v else "absent"); sys.exit(0)
-# array-of-present-env-key NAMES (names only, never values):
-for f in ("provisioned_env_keys","container_env_keys","env_keys","llm_env_keys"):
-    v = d.get(f)
-    if isinstance(v, list):
-        print("present" if KEY in v else "absent"); sys.exit(0)
-ep = d.get("env_key_presence")
-if isinstance(ep, dict) and KEY in ep:
-    print("present" if bool(ep[KEY]) else "absent"); sys.exit(0)
-print("unobservable")'
-}
+# The primary env-presence probe (present|absent|unobservable) now lives in the
+# shared lib/workspace_env_presence.sh as workspace_platform_llm_token_presence —
+# ONE field contract used by both this test and full-SaaS 8c (hardened per
+# code-review #4032; dormant until core a06a52eb, #4042). Called at the case below.
 
 # Secondary surface: the secrets KEY list (has_value flag, never the value) — in
 # case the fix lands the token as a workspace_secret rather than a pure env var.
@@ -1064,7 +1049,7 @@ if not isinstance(rows, list): print("unobservable"); sys.exit(0)
 print("yes" if any(isinstance(r, dict) and r.get("key") == KEY for r in rows) else "no")'
 }
 
-AUTH_PRESENCE=$(created_agent_llm_token_presence)
+AUTH_PRESENCE=$(workspace_platform_llm_token_presence "$WORKER_ID")
 if [ "$AUTH_PRESENCE" = "unobservable" ] && [ "$(created_agent_token_key_in_secrets)" = "yes" ]; then
   AUTH_PRESENCE=present
 fi
