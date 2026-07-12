@@ -97,9 +97,11 @@ expect_fail "wrong content without token fails" \
 # The old assert_byok_not_platform_proxy(resolved_mode-json) helper + these
 # synthetic unit cases were REMOVED 2026-07-11 with the deleted
 # /admin/workspaces/:id/llm-billing-mode endpoint (881b3f6f1). The #1994 guard
-# now lives in test_staging_full_saas.sh step 8c and asserts a LIVE signal (the
-# byok parent's own vendor key at workspace scope via GET /workspaces/:id/secrets),
-# which cannot be exercised against fabricated JSON in this pure-unit file.
+# now lives in test_staging_full_saas.sh step 8c and asserts the ABSENCE of the
+# platform CP-proxy token MOLECULE_LLM_USAGE_TOKEN on the byok parent via
+# GET /workspaces/:id (presence-only — value never read; dormant until core
+# a06a52eb, #4042). Its probe is the shared lib/workspace_env_presence.sh, which
+# HAS its own offline unit test: lib/test_workspace_env_presence_unit.sh.
 
 # ---- a2a_completion_error_marker (the scanner under the gate) ----
 if hit=$(a2a_completion_error_marker "all good PINEAPPLE"); then

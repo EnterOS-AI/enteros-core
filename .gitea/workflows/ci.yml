@@ -514,6 +514,13 @@ jobs:
           # check missed. If a refactor weakens the gate to a shape check,
           # this step goes red on every PR.
           bash tests/e2e/test_completion_assert_unit.sh
+          # #1994 byok-routing presence-probe (lib/workspace_env_presence.sh) —
+          # the shared MOLECULE_LLM_USAGE_TOKEN presence contract used by 8c +
+          # the concierge auth gate. Offline: stubs tenant_call and locks the
+          # hardened field-shape handling (code-review #4032 findings 3-5:
+          # ambiguous fields dropped, list-of-dicts handled, non-bool map values
+          # -> unobservable). If a refactor re-weakens the probe, this goes red.
+          bash tests/e2e/lib/test_workspace_env_presence_unit.sh
           # A2A response text extraction across the JSON-RPC/task/queue shapes
           # that the staging harnesses consume. Keeps the concierge-created
           # workspace gate from false-failing on a completed task whose text
