@@ -144,45 +144,60 @@ func TestDeleteFileLocal_ContainedAndTolerant(t *testing.T) {
 	}
 }
 
-// TestWriteViaEphemeral_NilDocker_UsesLocalPath confirms writeViaEphemeral no
-// longer errors "docker not available" when h.docker is nil, and that traversal
-// is still rejected on that path (defence in depth via containedJoin).
-func TestWriteViaEphemeral_NilDocker_UsesLocalPath(t *testing.T) {
-	h := &TemplatesHandler{docker: nil}
-	// A traversal name must be rejected (not silently written, not "docker
-	// not available"). We can't assert a successful write to /configs in a
-	// unit test (not writable / not present), but the rejection proves we
-	// took the local path rather than the old docker-nil early return.
-	err := h.writeViaEphemeral(context.Background(), "ws-vol", map[string]string{"../escape": "x"})
+// TestWriteViaEphemeral_NilDocker_UsesHostSideMirror confirms the docker-less
+// write targets the per-workspace HOST-SIDE MIRROR (<hostStateDir>/<wsid>/configs)
+// — NOT `/configs` at the fs root, which is unwritable to the non-root `canvas`
+// user (the `mkdir /configs: permission denied` staging regression this fixes) —
+// and that traversal is still rejected on that path (containedJoin).
+func TestWriteViaEphemeral_NilDocker_UsesHostSideMirror(t *testing.T) {
+	mirrorBase := t.TempDir()
+	h := (&TemplatesHandler{docker: nil}).WithHostStateDir(mirrorBase)
+	const wsID = "ws-write-0001"
+
+	// Positive: a normal file lands in the host-side mirror, proving the
+	// docker-less write no longer touches the unwritable fs root.
+	if err := h.writeViaEphemeral(context.Background(), "ws-vol", wsID, map[string]string{"config.yaml": "ok: true"}); err != nil {
+		t.Fatalf("docker-less write to host-side mirror failed: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(mirrorBase, wsID, "configs", "config.yaml"))
+	if err != nil {
+		t.Fatalf("config.yaml not written to host-side mirror: %v", err)
+	}
+	if string(got) != "ok: true" {
+		t.Errorf("mirror content = %q, want %q", got, "ok: true")
+	}
+
+	// Negative: a traversal name must be rejected (not silently written, not
+	// "docker not available").
+	err = h.writeViaEphemeral(context.Background(), "ws-vol", wsID, map[string]string{"../escape": "x"})
 	if err == nil {
 		t.Fatalf("expected traversal rejection on local path, got nil")
 	}
 	if strings.Contains(err.Error(), "docker not available") {
-		t.Errorf("writeViaEphemeral still returns 'docker not available' — FIX #2 regressed: %v", err)
+		t.Errorf("writeViaEphemeral still returns 'docker not available': %v", err)
 	}
 	if !strings.Contains(err.Error(), "escapes") && !strings.Contains(err.Error(), "unsafe") {
 		t.Errorf("expected containment error, got %v", err)
 	}
 }
 
-// TestDeleteViaEphemeral_NilDocker_UsesLocalPath confirms the docker-nil delete
-// path is contained (validateRelPath + containedJoin) and no longer short-
-// circuits on "docker not available" for a safe path.
-func TestDeleteViaEphemeral_NilDocker_UsesLocalPath(t *testing.T) {
-	h := &TemplatesHandler{docker: nil}
+// TestDeleteViaEphemeral_NilDocker_UsesHostSideMirror confirms the docker-nil
+// delete path is contained (validateRelPath + containedJoin), targets the
+// host-side mirror, and honors rm -f semantics (missing file = nil).
+func TestDeleteViaEphemeral_NilDocker_UsesHostSideMirror(t *testing.T) {
+	h := (&TemplatesHandler{docker: nil}).WithHostStateDir(t.TempDir())
+	const wsID = "ws-delete-0001"
 
 	// Traversal → rejected by validateRelPath before any filesystem touch.
-	if err := h.deleteViaEphemeral(context.Background(), "ws-vol", "../../etc/passwd"); err == nil {
+	if err := h.deleteViaEphemeral(context.Background(), "ws-vol", wsID, "../../etc/passwd"); err == nil {
 		t.Errorf("expected traversal rejection")
 	} else if strings.Contains(err.Error(), "docker not available") {
 		t.Errorf("traversal returned 'docker not available' instead of a path error: %v", err)
 	}
 
-	// Safe path against the real /configs base: either succeeds (rm -f on a
-	// missing file is nil) or fails for a filesystem reason — but must NOT be
-	// the old "docker not available" short-circuit.
-	err := h.deleteViaEphemeral(context.Background(), "ws-vol", "definitely-absent-file.tmp")
-	if err != nil && strings.Contains(err.Error(), "docker not available") {
-		t.Errorf("safe delete still returns 'docker not available' — FIX #2 regressed: %v", err)
+	// Safe path against the mirror base: rm -f on a missing file is nil, and must
+	// NOT be the old "docker not available" short-circuit.
+	if err := h.deleteViaEphemeral(context.Background(), "ws-vol", wsID, "definitely-absent-file.tmp"); err != nil {
+		t.Errorf("safe delete of missing file should be nil, got %v", err)
 	}
 }

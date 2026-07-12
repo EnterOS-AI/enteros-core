@@ -20,8 +20,11 @@ import (
 
 func TestDeleteViaEphemeral_F1085_RejectsTraversal(t *testing.T) {
 	// TemplatesHandler with nil docker — validation runs before any Docker call.
-	h := &TemplatesHandler{docker: nil}
+	// hostStateDir is set so safe paths reach the docker-less host-side-mirror
+	// delete (rm -f semantics) rather than the "no mirror" guard.
+	h := (&TemplatesHandler{docker: nil}).WithHostStateDir(t.TempDir())
 	ctx := context.Background()
+	const wsID = "ws-f1085-0001"
 
 	tests := []struct {
 		label      string
@@ -126,7 +129,7 @@ func TestDeleteViaEphemeral_F1085_RejectsTraversal(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.label, func(t *testing.T) {
-			err := h.deleteViaEphemeral(ctx, tc.volumeName, tc.filePath)
+			err := h.deleteViaEphemeral(ctx, tc.volumeName, wsID, tc.filePath)
 			if tc.wantErr {
 				if err == nil {
 					t.Errorf("want non-nil error, got nil")

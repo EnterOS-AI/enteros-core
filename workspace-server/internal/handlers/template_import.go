@@ -297,7 +297,7 @@ func (h *TemplatesHandler) ReplaceFiles(c *gin.Context) {
 	// restarted containers (#151). Surface the error so the caller retries
 	// when Docker is available instead of believing the change persisted.
 	volName := provisioner.ConfigVolumeName(workspaceID)
-	if err := h.writeViaEphemeral(ctx, volName, body.Files); err != nil {
+	if err := h.writeViaEphemeral(ctx, volName, workspaceID, body.Files); err != nil {
 		log.Printf("ReplaceFiles: writeViaEphemeral failed for %s (workspace %s offline): %v", wsName, workspaceID, err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace offline — retry after it starts"})
 		return
