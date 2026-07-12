@@ -246,10 +246,14 @@ services:
         condition: service_healthy
       tenant-beta:
         condition: service_healthy
-    # Bind to 127.0.0.1 only — hardcoded ADMIN_TOKENs make 0.0.0.0
-    # exposure unsafe even on a local network.
+    # Bind to 127.0.0.1 by default — hardcoded ADMIN_TOKENs make 0.0.0.0
+    # exposure unsafe on a shared HOST daemon/network. Overridable via
+    # HARNESS_BIND_ADDR: CI sets it to 0.0.0.0 ONLY when the whole stack runs
+    # inside a per-job docker:dind (dind.sh), where 0.0.0.0 is the dind's own
+    # isolated netns (not the shared host) and is required so the dind's
+    # published :8080 forward can reach cf-proxy. Default (unset) is unchanged.
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${HARNESS_BIND_ADDR:-127.0.0.1}:8080:8080"
     networks: [harness-net]
 
 networks:
