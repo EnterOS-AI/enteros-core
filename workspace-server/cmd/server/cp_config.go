@@ -159,3 +159,61 @@ func assertManagedTenantHasLLMEnv() error {
 	}
 	return nil
 }
+
+// cpConfigRetryWindow / cpConfigRetryInterval bound how long a freshly-
+// provisioned managed tenant retries the CP config fetch before giving up.
+// Package vars (not consts) so tests can shrink the window. Overridable via
+// MOLECULE_CP_CONFIG_RETRY_WINDOW (Go duration, e.g. "45s") for ops tuning.
+var (
+	cpConfigRetryWindow   = 90 * time.Second
+	cpConfigRetryInterval = 3 * time.Second
+)
+
+// ensureManagedTenantLLMEnv fetches the CP-delivered env (refreshEnvFromCP) and,
+// for a MANAGED SaaS tenant whose required LLM-proxy env is still missing
+// afterward, retries the fetch for a bounded window before returning the final
+// assertion verdict. The caller fatals on a non-nil return (cp#469 — a managed
+// tenant must not boot with broken proxy creds).
+//
+// Why the retry: on a FRESH provision the tenant can boot and call
+// GET /cp/tenants/config BEFORE the CP has committed the org_instances row that
+// carries this tenant's admin_token — the CP's token lookup then 401s and the
+// LLM env is never delivered. A slow backend (EC2, minutes to boot) always has
+// the row committed first and never sees this; a fast backend (local-docker,
+// seconds) races and loses. Retrying lets the row commit, then the fetch
+// succeeds. A PERSISTENT miss (genuine misconfig) still fatals loudly once the
+// window elapses — the fail-loud guarantee is preserved, only deferred.
+//
+// Non-managed / self-host tenants (no MOLECULE_ORG_ID or ADMIN_TOKEN) return nil
+// on the first assertion and never enter the retry loop — byte-identical to the
+// prior single-shot behavior.
+func ensureManagedTenantLLMEnv() error {
+	if v := os.Getenv("MOLECULE_CP_CONFIG_RETRY_WINDOW"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			cpConfigRetryWindow = d
+		}
+	}
+
+	if err := refreshEnvFromCP(); err != nil {
+		log.Printf("CP env refresh: %v (continuing with baked-in env)", err)
+	}
+	if err := assertManagedTenantHasLLMEnv(); err == nil {
+		return nil
+	}
+
+	log.Printf("CP env refresh: managed-tenant LLM env not ready after first fetch — retrying up to %s (CP org_instances row-commit race)", cpConfigRetryWindow)
+	deadline := time.Now().Add(cpConfigRetryWindow)
+	for time.Now().Before(deadline) {
+		time.Sleep(cpConfigRetryInterval)
+		if err := refreshEnvFromCP(); err != nil {
+			log.Printf("CP env refresh retry: %v", err)
+			continue
+		}
+		if assertManagedTenantHasLLMEnv() == nil {
+			log.Printf("CP env refresh: LLM env delivered on retry")
+			return nil
+		}
+	}
+	// Window elapsed — return the final verdict (fatal upstream if still missing).
+	return assertManagedTenantHasLLMEnv()
+}
