@@ -212,9 +212,29 @@ export function SelfHostSetupScene() {
   // bare spinner. Same node the concierge shell boots from (#3942); the scene
   // stays mounted, so a Failed status still flips to the error card below and an
   // Online status still auto-dismisses into the concierge shell.
-  const platformNode = useCanvasStore(
+  const livePlatformNode = useCanvasStore(
     (s) => s.nodes.find((n) => n.data.kind === WORKSPACE_KIND.Platform) ?? null,
   );
+  // Hold the last-known platform node so a TRANSIENT store update that drops
+  // the Platform node (a mid-provision nodes-array churn) does not flicker the
+  // boot UI back to the bare spinner. Only ever advances to a newer node; it
+  // never re-nulls once a node has been seen this session.
+  const lastPlatformNodeRef = useRef<typeof livePlatformNode>(null);
+  if (livePlatformNode) lastPlatformNodeRef.current = livePlatformNode;
+  const platformNode = livePlatformNode ?? lastPlatformNodeRef.current;
+
+  // A mid-boot FAILED boot step (BootSequenceScreen paints its own red "Boot
+  // failed" banner off this, but a BOOT_STEP is presentation-only — the node's
+  // aggregate status may still read `provisioning`). Without this the user is
+  // stranded on a dead red boot screen with no retry, so the scene detects a
+  // failed step and flips to its own error/retry card. The step's `message`
+  // becomes the humanized reason (falling back to the step label).
+  const failedBootStep = useCanvasStore((s) => {
+    const node = s.nodes.find((n) => n.data.kind === WORKSPACE_KIND.Platform);
+    const steps = node?.data.bootSteps;
+    if (!Array.isArray(steps)) return null;
+    return steps.find((st) => st.status === "failed") ?? null;
+  });
   useEffect(() => {
     if (phase.kind !== "watching") return;
     if (storeStatus === WORKSPACE_STATUS.Online) {
@@ -225,8 +245,18 @@ export function SelfHostSetupScene() {
     }
     if (storeStatus === WORKSPACE_STATUS.Failed) {
       applyFailure(null, storeLastError);
+      return;
     }
-  }, [phase.kind, storeStatus, storeLastError, applyFailure]);
+    // Presentation-only BOOT_STEP failure (no aggregate status flip): still a
+    // dead-end for the user, so flip to the error/retry card ourselves.
+    if (failedBootStep !== null) {
+      applyFailure(
+        null,
+        failedBootStep.message ??
+          `Boot failed at ${failedBootStep.label}.`,
+      );
+    }
+  }, [phase.kind, storeStatus, storeLastError, failedBootStep, applyFailure]);
 
   // Raw socket subscription for the provision-abort CODE — the store keeps
   // only the error text; WORKSPACE_PROVISION_FAILED's payload carries the
@@ -352,12 +382,18 @@ export function SelfHostSetupScene() {
         aria-labelledby="selfhost-setup-title"
         data-testid="selfhost-setup-scene"
         tabIndex={-1}
+        onKeyDown={(e) => handleFocusTrapKeyDown(containerRef.current!, e)}
         className="fixed inset-0 z-[10000] bg-surface"
       >
         <h1 id="selfhost-setup-title" className="sr-only">
           Set up your platform agent
         </h1>
         <div data-testid="scene-progress" className="h-full">
+          {/* No onEnter here: the Online watch above auto-dismisses the scene
+              into the concierge shell the instant the root reports online, so
+              the ENTER OS key never needs a manual handler in this mount. Left
+              handler-less, BootSequenceScreen renders the key non-interactive
+              (#9) — it never looks clickable with nothing behind it. */}
           <BootSequenceScreen node={platformNode} />
         </div>
         {slowHint && (

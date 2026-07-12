@@ -74,9 +74,18 @@ interface KeyView {
 interface Props {
   /** The provisioning workspace node whose boot sequence to render. */
   node: Node<WorkspaceNodeData>;
+  /**
+   * Optional handler for the armed "ENTER OS" key. In the tab/shell mounts
+   * (WorkspacePanelTabs / ConciergeShell) the caller swaps content itself once
+   * the workspace reports online, so the key is a visual affordance with no
+   * handler. In the self-host setup scene there is no such parent, so the
+   * scene passes an explicit dismiss handler here. When omitted, the key is
+   * rendered non-interactive (never clickable) so it never looks clickable
+   * with nothing behind it. */
+  onEnter?: () => void;
 }
 
-export function BootSequenceScreen({ node }: Props) {
+export function BootSequenceScreen({ node, onEnter }: Props) {
   const data = node.data;
   const bootSteps = useMemo<BootStep[]>(
     () => (Array.isArray(data.bootSteps) ? data.bootSteps : []),
@@ -189,7 +198,14 @@ export function BootSequenceScreen({ node }: Props) {
     setHit(false);
   }, [online]);
 
+  // Visually "armed" (lit) the moment the workspace is online, before the
+  // strike/fade — the tab/shell mounts rely on this window for the ENTER OS
+  // motion. Interactivity is a separate axis: the key is only clickable when
+  // an onEnter handler exists (the setup scene). In the tab/shell mounts the
+  // caller swaps content itself, so the key stays a non-interactive affordance
+  // rather than a dead button that merely looks clickable.
   const armed = online && !hit;
+  const interactive = armed && onEnter !== undefined;
 
   const runtime = data.runtime || "runtime";
   const statusLabel = failed
@@ -348,11 +364,12 @@ export function BootSequenceScreen({ node }: Props) {
       {/* ENTER OS key */}
       <button
         type="button"
-        disabled={!armed}
+        disabled={!interactive}
+        onClick={interactive ? onEnter : undefined}
         aria-label={armed ? "Enter OS — workspace ready" : failed ? "Boot failed" : "Enter OS — locked, boot in progress"}
         className={`mol-boot-enter w-full flex items-center justify-center gap-3.5 px-5 py-4 rounded-[14px] font-mono text-[16px] font-extrabold tracking-[0.14em] border ${
           armed
-            ? "is-armed text-ink border-accent/60 cursor-pointer"
+            ? `is-armed text-ink border-accent/60 ${interactive ? "cursor-pointer" : "cursor-default"}`
             : hit
               ? "is-hit text-ink border-accent/60"
               : "text-ink-soft border-line cursor-not-allowed"
