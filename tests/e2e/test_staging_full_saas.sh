@@ -1238,12 +1238,47 @@ wait_workspaces_online_routable "7d/11 Waiting for workspace(s) to recover routi
 # result is available. Handles curl rc 28 / http 000 / 404 retryable while the
 # queue row is still materializing, and transient 502/503/504 cold-start.
 # Prints the final A2A JSON-RPC response body to stdout; logs to stderr.
+#
+# Detect the runtime's synchronous interrupt-acknowledgement. When an A2A
+# message/send lands on an agent that is mid-turn (a freshly-provisioned
+# parent is often still working its boot/child-notification task —
+# "iteration 1/90"), the native_session SDK (claude-agent-sdk / hermes) does
+# NOT reject the request as busy: it INTERRUPTS its current turn and returns a
+# clean 200 with an ack — "⚡ Interrupting current task (iteration N/M). I'll
+# respond to your message shortly." — in place of the requested answer, which
+# it produces on its NEXT turn. Because the ack is a clean 200 (not an
+# upstream timeout), it bypasses the busy→enqueue durable path in
+# a2a_proxy_helpers.go and passes straight through to the caller. The ack is
+# benign (message accepted), NOT an error payload, so the caller must re-send
+# to collect the real reply rather than assert content against the ack.
+a2a_is_interrupt_ack() {
+  local body="$1" txt
+  txt=$(printf '%s' "$body" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    r=d.get('result') or {}
+    parts=r.get('parts') or []
+    # task-shaped responses carry text under result.status.message.parts
+    if not parts:
+        parts=((r.get('status') or {}).get('message') or {}).get('parts') or []
+    print(' '.join(p.get('text','') for p in parts if isinstance(p,dict)))
+except Exception:
+    print('')" 2>/dev/null || echo "")
+  # Fall back to the raw body when the shape doesn't parse — the signature
+  # phrase is distinctive enough that a raw match won't false-positive on a
+  # real answer.
+  [ -z "$txt" ] && txt="$body"
+  printf '%s' "$txt" | grep -qiE "Interrupting current task|respond to your message shortly"
+}
+
 a2a_send_or_poll_queue() {
   local ws_id="$1"; shift
   local payload="$1"; shift
   local label="$1"
   local tmp qid resp code rc attempt poll_attempt poll_tmp
   local a2a_gateway_error_seen=0 last_qstatus="" queue_poll_count=0
+  local interrupt_ack_count=0 max_interrupt_ack=6 interrupt_ack_backoff=12
   tmp=$(mktemp -t a2a_poll.XXXXXX)
   qid=""
 
@@ -1368,6 +1403,23 @@ except Exception:
           echo "    $label A2A queued (queue_id=$qid); switching to poll" >&2
           continue
         fi
+      elif a2a_is_interrupt_ack "$resp"; then
+        # Synchronous interrupt-ack (agent was mid-turn). The message WAS
+        # accepted and the current task interrupted; the real answer lands on
+        # the agent's next turn, which this request did not carry. Re-send to
+        # collect it: on re-send the agent is idle (→ synchronous real answer)
+        # or still draining the interrupt (→ upstream-busy → the durable
+        # enqueue+poll path above). Bounded and spaced so a genuinely wedged
+        # agent (interrupt accepted, never yields a follow-up turn) still
+        # fails RED instead of being masked as a pass on the ack text.
+        interrupt_ack_count=$((interrupt_ack_count + 1))
+        if [ "$interrupt_ack_count" -le "$max_interrupt_ack" ]; then
+          echo "    $label interrupt-ack (agent mid-task) — re-sending for the real reply (${interrupt_ack_count}/${max_interrupt_ack}), backing off ${interrupt_ack_backoff}s" >&2
+          sleep "$interrupt_ack_backoff"
+          continue
+        fi
+        rm -f "$tmp"
+        fail "$label agent never produced a real reply after ${interrupt_ack_count} interrupt-acknowledgement(s) (~$((max_interrupt_ack * interrupt_ack_backoff))s): it accepted the message and interrupted its current task but never yielded a follow-up turn (likely wedged mid-task). Last ack: $(printf '%s' "$resp" | sanitize_http_body | head -c 300)"
       else
         break
       fi
