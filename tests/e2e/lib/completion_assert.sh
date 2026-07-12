@@ -188,12 +188,26 @@ offered_platform_models_for_runtime() {
   local runtime="$1"
   local yaml_path="${PROVIDERS_YAML_PATH:-}"
   if [ -z "$yaml_path" ]; then
-    # This lib lives at tests/e2e/lib/ -> repo root is three dirs up
-    # (lib -> e2e -> tests -> repo-root).
-    yaml_path="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/workspace-server/internal/providers/providers.yaml"
+    # SSOT INVERSION (2026-07-08): the providers/models/runtimes registry moved
+    # to the vendored SDK (go.moleculesai.app/sdk/gen/go/llmregistry, embedded
+    # from llm-registry.yaml). The old in-repo copy at
+    # workspace-server/internal/providers/providers.yaml was DELETED, so this
+    # probe silently hard-failed on main until now. Resolve the SDK module dir
+    # dynamically (version-independent; `go list -m` works — the workflow sets up
+    # Go) and read its canonical llm-registry.yaml. Same schema:
+    # runtimes.<rt>.providers[name=platform].models. Fall back to the legacy
+    # in-repo path for older checkouts (pre-inversion branches).
+    local repo_root sdk_dir
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+    sdk_dir="$(cd "$repo_root/workspace-server" 2>/dev/null && go list -m -f '{{.Dir}}' go.moleculesai.app/sdk/gen/go 2>/dev/null || true)"
+    if [ -n "$sdk_dir" ] && [ -f "$sdk_dir/llmregistry/llm-registry.yaml" ]; then
+      yaml_path="$sdk_dir/llmregistry/llm-registry.yaml"
+    else
+      yaml_path="$repo_root/workspace-server/internal/providers/providers.yaml"
+    fi
   fi
   if [ ! -f "$yaml_path" ]; then
-    log "    [provider-matrix] providers.yaml SSOT not found at $yaml_path"
+    log "    [provider-matrix] providers registry SSOT not found (SDK llm-registry.yaml via 'go list -m go.moleculesai.app/sdk/gen/go', nor legacy providers.yaml at $yaml_path)"
     return 1
   fi
   RUNTIME_REF="$runtime" python3 - "$yaml_path" <<'PY'
