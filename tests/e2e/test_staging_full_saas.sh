@@ -1748,30 +1748,54 @@ live_milestone a2a_roundtrip
 # `llm_billing_mode` override + its GET/PUT /admin/workspaces/:id/llm-billing-mode
 # endpoint were DELETED 2026-06-30 (881b3f6f1, internal#718). platform-vs-BYOK is
 # no longer a stored, readable mode — it is DERIVED deterministically from the
-# model's provider (providers.DeriveProvider → IsPlatform). That makes the #1994
-# stored-mode regression STRUCTURALLY IMPOSSIBLE, and it is enforced at the source
-# by (a) the provisioner fail-close — workspace_provision_shared.go aborts a
-# non-platform (byok) provision that lacks a usable cred, so a byok parent that
-# reached `workspace_online` necessarily routed byok WITH a real cred — and (b) the
-# Go architectural guard no_billing_mode_env_test.go (no source reads a stored
-# mode). There is NO live endpoint exposing derived routing, so the old
-# resolved_mode read (GET …/llm-billing-mode) is gone — probing it returned an
-# HTML 404, the red this replaces.
+# model's provider (providers.DeriveProvider → IsPlatform), so the old
+# resolved_mode read (GET …/llm-billing-mode) is gone (probing it returned an HTML
+# 404 — the red this replaces).
 #
-# What we still assert END-TO-END: this byok parent completed a REAL, deterministic
-# LLM round-trip (the required `a2a_roundtrip` milestone, stamped at 8b after
-# a2a_assert_real_completion) USING that own vendor key. A byok cred that actually
-# served a real completion — on a workspace that only reached online because the
-# fail-close let it — is the observable proof the byok path works end-to-end;
-# together they cover the #1994 class without the removed endpoint. Only meaningful
-# when the parent carries a byok credential (the no-key path is legitimately
+# The DISCRIMINATING live signal we assert instead: a byok parent MUST carry its
+# OWN vendor key at WORKSPACE scope, readable via GET /workspaces/:id/secrets
+# (SecretsHandler.List → [{key, scope, has_value}]). This is NOT tautological with
+# the 8b completion: a #1994-regressed workspace baked platform_managed would
+# route through the platform proxy and STILL return a real completion (draining the
+# platform key) WITHOUT ever persisting the customer's key workspace-scoped — 8b
+# would stay green while this probe goes RED. If the byok vendor key is present at
+# workspace scope AND the model derives a byok provider (unit-guarded by
+# no_billing_mode_env_test.go), the derive rule routes byok, not platform. The
+# provisioner fail-close (workspace_provision_shared.go: aborts a byok provision
+# lacking a usable cred) is the source-level backstop. Only meaningful when the
+# parent carries a byok credential (the no-key path is legitimately
 # platform_managed — the CTO default).
 if [ -n "${E2E_MINIMAX_API_KEY:-}" ] || [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
-  case " $LIVE_MILESTONES " in
-    *" a2a_roundtrip "*)
-      ok "8c.  byok-routing guard: parent ($RUNTIME/$MODEL_SLUG) proved a real BYOK completion (a2a_roundtrip) on an online workspace → byok routing holds. The #1994 stored-mode regression is structurally impossible post-881b3f6f1 (derived provider + provisioner fail-close + no_billing_mode_env_test.go)." ;;
+  # Which byok vendor key did this arm ship? (matches the SECRETS_JSON branch.)
+  if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then _byok_key="MINIMAX_API_KEY"; else _byok_key="ANTHROPIC_API_KEY"; fi
+  set +e
+  SECRETS_RESP=$(tenant_call GET "/workspaces/$PARENT_ID/secrets" 2>/dev/null)
+  SECRETS_RC=$?
+  set -e
+  if [ "$SECRETS_RC" != "0" ] || [ -z "$SECRETS_RESP" ]; then
+    fail "byok-routing guard (#1994): GET /workspaces/$PARENT_ID/secrets failed (rc=$SECRETS_RC). Body: $(printf '%s' "${SECRETS_RESP:0:200}" | sanitize_http_body)"
+  fi
+  # Is the arm's own vendor key persisted at WORKSPACE scope? (env-only Python so
+  # no secret value — we only read key NAMES here — is ever built into a command.)
+  _has_byok=$(printf '%s' "$SECRETS_RESP" | BYOK_KEY="$_byok_key" python3 -c "
+import json, os, sys
+key = os.environ['BYOK_KEY']
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print('parse_error'); sys.exit(0)
+if not isinstance(d, list):
+    print('not_a_list'); sys.exit(0)
+for s in d:
+    if isinstance(s, dict) and s.get('key') == key and s.get('scope') == 'workspace':
+        print('yes'); sys.exit(0)
+print('no')
+" 2>/dev/null || echo "probe_error")
+  case "$_has_byok" in
+    yes)
+      ok "8c.  byok-routing guard (#1994): parent ($RUNTIME/$MODEL_SLUG) carries its own '$_byok_key' at WORKSPACE scope (GET /secrets) → the model derives a byok provider with the customer's key present, so it routes BYOK, not the platform proxy. #1994 stays fixed." ;;
     *)
-      fail "byok-routing guard (#1994): parent carries a byok vendor key but the required real-completion milestone 'a2a_roundtrip' did NOT fire (reached:${LIVE_MILESTONES:-<none>}) — the byok LLM path did not serve a verified response, so byok routing is unproven." ;;
+      fail "byok-routing guard (#1994): parent workspace $PARENT_ID does NOT carry its own vendor key '$_byok_key' at workspace scope (secrets probe='$_has_byok'). A byok arm whose vendor key is not persisted workspace-scoped would derive/route through the PLATFORM proxy and drain the platform LLM key — the exact #1994 regression (8b's completion can stay green via the proxy). Raw: $(printf '%s' "${SECRETS_RESP:0:300}" | sanitize_http_body)" ;;
   esac
 else
   log "8c.  byok-routing guard skipped — parent carries no own-vendor key (OpenAI/no-key path is legitimately platform_managed)."
