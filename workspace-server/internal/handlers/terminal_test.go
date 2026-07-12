@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -11,7 +13,23 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
+
+// stubNoLocalShell forces localShellCommand to report "no shell", so the
+// docker-nil local path lands on a deterministic 503 ("no shell available")
+// instead of attempting a WebSocket upgrade that can't complete in a plain
+// httptest request. Tests that only want to assert ROUTING (reached the local
+// branch, not remote/401/403) use this so the 503 stays a stable, meaningful
+// signal after the handleLocalShellConnect change. Restored on cleanup.
+func stubNoLocalShell(t *testing.T) {
+	t.Helper()
+	prev := localShellCommand
+	localShellCommand = func() ([]string, error) { return nil, errNoShellForTest }
+	t.Cleanup(func() { localShellCommand = prev })
+}
+
+var errNoShellForTest = fmt.Errorf("no shell (test stub)")
 
 // TestHandleConnect_RoutesToRemote asserts HandleConnect picks the CP path
 // when the workspace row carries an instance_id. The WS upgrade fails in
@@ -43,14 +61,16 @@ func TestHandleConnect_RoutesToRemote(t *testing.T) {
 func TestHandleConnect_RoutesToLocal(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
+	stubNoLocalShell(t)
 
 	// DB: workspace row with NULL instance_id → COALESCE returns "".
 	mock.ExpectQuery("SELECT COALESCE").
 		WithArgs("ws-local").
 		WillReturnRows(sqlmock.NewRows([]string{"instance_id"}).AddRow(""))
 
-	// nil docker client: local path errors early with 503 rather than
-	// trying to inspect containers. Confirms we took the local branch.
+	// nil docker client: local path now routes to the local-shell handler
+	// (in-container shell). With localShellCommand stubbed to "no shell", it
+	// deterministically 503s — which still confirms we took the local branch.
 	h := NewTerminalHandler(nil)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -115,6 +135,7 @@ func TestTerminalConnect_KI005_RejectsUnauthorizedCrossWorkspace(t *testing.T) {
 func TestKI005_SelfAccess_AlwaysAllowed(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
+	stubNoLocalShell(t)
 
 	mock.ExpectQuery("SELECT COALESCE").
 		WithArgs("ws-self").
@@ -144,6 +165,7 @@ func TestKI005_SelfAccess_AlwaysAllowed(t *testing.T) {
 func TestKI005_CanCommunicatePeer_Allowed(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
+	stubNoLocalShell(t)
 
 	// DB: caller workspace row for token validation.
 	mock.ExpectQuery("SELECT t.id, t.workspace_id").
@@ -263,6 +285,7 @@ func TestKI005_TokenMismatch_Unauthorized(t *testing.T) {
 func TestKI005_NoXWorkspaceIDHeader_LegacyAllowed(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
+	stubNoLocalShell(t)
 
 	// DB: no instance_id → local Docker path.
 	mock.ExpectQuery("SELECT COALESCE").
@@ -345,6 +368,7 @@ func TestSSHCommandCmd_BuildsArgv(t *testing.T) {
 // fast-path returns true when callerID == targetID.
 func TestTerminalConnect_KI005_AllowsOwnTerminal(t *testing.T) {
 	mock := setupTestDB(t)
+	stubNoLocalShell(t)
 	mock.ExpectQuery("SELECT COALESCE").
 		WithArgs("ws-alice").
 		WillReturnRows(sqlmock.NewRows([]string{"instance_id"}).AddRow(""))
@@ -377,6 +401,7 @@ func TestTerminalConnect_KI005_AllowsOwnTerminal(t *testing.T) {
 // We assert they get the nil-docker 503 instead of 403.
 func TestTerminalConnect_KI005_SkipsCheckWithoutHeader(t *testing.T) {
 	mock := setupTestDB(t)
+	stubNoLocalShell(t)
 	mock.ExpectQuery("SELECT COALESCE").
 		WithArgs("ws-any").
 		WillReturnRows(sqlmock.NewRows([]string{"instance_id"}).AddRow(""))
@@ -437,6 +462,7 @@ func TestTerminalConnect_KI005_RejectsInvalidToken(t *testing.T) {
 // return true before we fall through to the Docker path.
 func TestTerminalConnect_KI005_AllowsSiblingWorkspace(t *testing.T) {
 	mock := setupTestDB(t)
+	stubNoLocalShell(t)
 	prev := canCommunicateCheck
 	canCommunicateCheck = func(callerID, targetID string) bool {
 		// Simulate sibling: same parent
@@ -481,6 +507,7 @@ func TestTerminalConnect_KI005_AllowsSiblingWorkspace(t *testing.T) {
 // workspace_auth_tokens, so ValidateToken would always fail for them.
 func TestKI005_OrgToken_SkipsValidateToken(t *testing.T) {
 	mock := setupTestDB(t) // no ValidateToken ExpectQuery — none should fire
+	stubNoLocalShell(t)
 	mock.ExpectQuery("SELECT COALESCE").
 		WithArgs("ws-target").
 		WillReturnRows(sqlmock.NewRows([]string{"instance_id"}).AddRow(""))
@@ -666,4 +693,104 @@ func TestSendSSHPublicKeyImpl_PassesAZ(t *testing.T) {
 	if !strings.Contains(got, "--availability-zone us-east-2b") {
 		t.Errorf("send-ssh-public-key args missing AZ; got %q", got)
 	}
+}
+
+// TestLocalShellCommand_PrefersBashThenSh verifies the shell resolver returns
+// the first available shell in bash→sh preference order, mirroring the
+// docker-exec fallback. On any POSIX CI box /bin/sh exists, so we always get a
+// non-empty argv; when /bin/bash is present it must be chosen first.
+func TestLocalShellCommand_PrefersBashThenSh(t *testing.T) {
+	argv, err := localShellCommand()
+	if err != nil {
+		t.Fatalf("localShellCommand: unexpected error on a POSIX host: %v", err)
+	}
+	if len(argv) == 0 {
+		t.Fatalf("localShellCommand returned empty argv")
+	}
+	if argv[0] != "/bin/bash" && argv[0] != "/bin/sh" {
+		t.Errorf("localShellCommand chose %q, want /bin/bash or /bin/sh", argv[0])
+	}
+	if _, statErr := os.Stat("/bin/bash"); statErr == nil {
+		if argv[0] != "/bin/bash" {
+			t.Errorf("localShellCommand chose %q but /bin/bash exists — bash must win", argv[0])
+		}
+	}
+}
+
+// TestHandleLocalConnect_NilDocker_DoesNotServiceUnavailable is the core
+// regression guard for FIX #1: on a molecules-server (local-docker) tenant the
+// workspace-server runs inside the workspace container with NO docker client,
+// and the canvas terminal must NOT 503 "Docker not available". Instead it must
+// route to the local-shell path. We assert the response is anything BUT the old
+// 503 (a real ws upgrade can't complete against a plain httptest request, so
+// the handler returns without writing a 503).
+func TestHandleLocalConnect_NilDocker_DoesNotServiceUnavailable(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	mock.ExpectQuery("SELECT COALESCE").
+		WithArgs("ws-local-shell").
+		WillReturnRows(sqlmock.NewRows([]string{"instance_id"}).AddRow(""))
+
+	h := NewTerminalHandler(nil) // nil docker → in-container local-shell path
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-local-shell"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-local-shell/terminal", nil)
+
+	h.HandleConnect(c)
+
+	if w.Code == http.StatusServiceUnavailable &&
+		strings.Contains(w.Body.String(), "Docker not available") {
+		t.Errorf("nil-docker local terminal still 503s 'Docker not available' — FIX #1 regressed: %s", w.Body.String())
+	}
+}
+
+// TestHandleLocalShellConnect_GivesWorkingShell drives the docker-nil local
+// path end-to-end over a real WebSocket: it connects, runs a command in the
+// spawned PTY shell, and asserts the shell's output comes back over the socket.
+// This proves the in-container terminal actually works on a molecules-server
+// tenant (the canvas terminal was fully broken before FIX #1).
+func TestHandleLocalShellConnect_GivesWorkingShell(t *testing.T) {
+	if _, err := localShellCommand(); err != nil {
+		t.Skipf("no local shell on this host: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	h := NewTerminalHandler(nil)
+	r.GET("/ws/:id/terminal", func(c *gin.Context) {
+		h.handleLocalShellConnect(c, c.Param("id"))
+	})
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws/ws-x/terminal"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Origin": {"http://localhost:3000"}})
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer conn.Close()
+
+	const marker = "MOLECULE_LOCAL_SHELL_OK_9931"
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("echo "+marker+"\n")); err != nil {
+		t.Fatalf("ws write: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	_ = conn.SetReadDeadline(deadline)
+	var got strings.Builder
+	for time.Now().Before(deadline) {
+		_, data, rErr := conn.ReadMessage()
+		if rErr != nil {
+			break
+		}
+		got.WriteString(string(data))
+		// The marker echoes twice (terminal echo of the typed line + the echo
+		// command's own stdout). One occurrence on its own line is enough proof
+		// the PTY ran the command.
+		if strings.Contains(got.String(), marker) {
+			return
+		}
+	}
+	t.Fatalf("did not observe %q in local shell output; got: %q", marker, got.String())
 }

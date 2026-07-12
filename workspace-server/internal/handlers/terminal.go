@@ -18,10 +18,10 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
+	"github.com/creack/pty"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
-	"github.com/creack/pty"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
@@ -130,10 +130,15 @@ func (h *TerminalHandler) HandleConnect(c *gin.Context) {
 }
 
 // handleLocalConnect attaches to a Docker container running on this
-// tenant's Docker daemon. Original behavior preserved exactly.
+// tenant's Docker daemon. When no Docker client is available it means this
+// process runs INSIDE the workspace container on a molecules-server
+// (local-docker) tenant — by security design the tenant never gets a docker
+// socket into the host daemon (that is the container-escape surface). In that
+// mode "the container" IS this process's own container, so we hand out a shell
+// on THIS filesystem via a local PTY instead of docker-exec.
 func (h *TerminalHandler) handleLocalConnect(c *gin.Context, workspaceID string) {
 	if h.docker == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Docker not available"})
+		h.handleLocalShellConnect(c, workspaceID)
 		return
 	}
 
@@ -263,14 +268,122 @@ func (h *TerminalHandler) handleLocalConnect(c *gin.Context, workspaceID string)
 	<-done
 }
 
+// localShellCommand builds the argv for the local login shell handed to the
+// canvas terminal when this process runs inside the workspace container with
+// no docker socket (molecules-server / local-docker tenant). Bash first for
+// tab-completion + history, /bin/sh as the POSIX fallback — mirroring the
+// shell-fallback the docker-exec path (handleLocalConnect) uses. Exposed as a
+// var so tests can assert the fallback ordering without spawning a real PTY.
+var localShellCommand = func() ([]string, error) {
+	for _, shell := range []string{"/bin/bash", "/bin/sh"} {
+		if _, err := os.Stat(shell); err == nil {
+			return []string{shell}, nil
+		}
+	}
+	return nil, fmt.Errorf("no shell found (/bin/bash, /bin/sh)")
+}
+
+// handleLocalShellConnect gives the canvas terminal a shell on THIS process's
+// own container filesystem. Used on molecules-server (local-docker) tenants
+// where the workspace-server runs inside the workspace container and — by
+// security design — has no docker client to exec into a sibling container.
+// The container the caller wants to reach IS the one this process lives in,
+// so a local PTY running the login shell is the faithful equivalent of the
+// docker-exec `/bin/bash`→`/bin/sh` session the Docker path opens.
+//
+// All HandleConnect auth (KI-005 canCommunicateCheck + token binding) has
+// already run before dispatch, so this path is reached only for an authorized
+// caller. The websocket upgrade, the stdout→ws / ws→stdin bridge, and the
+// idle timeout (terminalSessionTimeout) mirror handleLocalConnect exactly.
+func (h *TerminalHandler) handleLocalShellConnect(c *gin.Context, workspaceID string) {
+	ctx := c.Request.Context()
+
+	argv, err := localShellCommand()
+	if err != nil {
+		log.Printf("Terminal local shell for ws=%s: %v", workspaceID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no shell available in workspace"})
+		return
+	}
+
+	conn, err := termUpgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Printf("Terminal WebSocket upgrade error (local shell): %v", err)
+		return
+	}
+	defer conn.Close()
+
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Env = os.Environ()
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		log.Printf("Terminal local shell pty.Start for ws=%s: %v", workspaceID, err)
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("Error: failed to create shell session\r\n"))
+		return
+	}
+	defer func() { _ = ptmx.Close() }()
+
+	// Bridge: PTY → WebSocket.
+	// goAsync-exempt (RFC internal#524 Layer 2.2): per-WebSocket I/O bridge —
+	// lifetime is the connection, not a request. The handler blocks on `done`
+	// below, so the goroutine is drained synchronously. No db.DB access.
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Terminal: PANIC in local-shell PTY bridge: %v", r)
+			}
+			close(done)
+		}()
+		buf := make([]byte, 4096)
+		for {
+			n, rErr := ptmx.Read(buf)
+			if n > 0 {
+				if wErr := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); wErr != nil {
+					return
+				}
+			}
+			if rErr != nil {
+				if rErr != io.EOF {
+					log.Printf("Terminal local-shell read error: %v", rErr)
+				}
+				_ = conn.WriteMessage(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+				return
+			}
+		}
+	}()
+
+	// Bridge: WebSocket → PTY (stdin). Reset the idle read deadline on each
+	// keystroke, exactly like the docker-exec path.
+	for {
+		_, msg, rErr := conn.ReadMessage()
+		if rErr != nil {
+			break
+		}
+		if _, wErr := ptmx.Write(msg); wErr != nil {
+			break
+		}
+		conn.SetReadDeadline(time.Now().Add(terminalSessionTimeout))
+	}
+
+	// Close the PTY so the blocked Read above returns and the bridge goroutine
+	// exits; then reap the shell process.
+	_ = ptmx.Close()
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	_ = cmd.Wait()
+	<-done
+}
+
 // eicSSHOptions bundles the per-session inputs for spawning the EIC tunnel
 // and the ssh client that rides on top of it. Fields are plain data so
 // tests can stub the two factories below without fighting exec.Cmd.
 type eicSSHOptions struct {
-	InstanceID    string
-	OSUser        string
-	Region        string
-	LocalPort     int
+	InstanceID     string
+	OSUser         string
+	Region         string
+	LocalPort      int
 	PrivateKeyPath string
 }
 
