@@ -19,8 +19,10 @@
 #      (CONTAINS the expected token AND NOT an error-as-text payload).
 #   2. provider_liveness_matrix    — per-offered-provider cheap completion
 #      probe, providers sourced from the providers.yaml SSOT runtimes block.
-#   3. assert_byok_not_platform_proxy — #1994 regression guard: a
-#      byok-resolving workspace must NOT resolve to platform_managed.
+#   (The #1994 byok-routing guard moved to test_staging_full_saas.sh step 8c and
+#    asserts a live signal — the byok parent's own vendor key at workspace scope
+#    via GET /workspaces/:id/secrets — after its resolved_mode endpoint was
+#    deleted 2026-06-30; the old assert_byok_not_platform_proxy helper is gone.)
 #
 # Conventions: reuses the host script's fail()/ok()/log() + tenant_call().
 # Source this AFTER those are defined. BASH 4+.
@@ -306,35 +308,10 @@ provider_liveness_matrix() {
   return 0
 }
 
-# assert_byok_not_platform_proxy <billing_mode_json> <context_label>
-#   #1994 regression guard. Given the JSON body from
-#   GET /admin/workspaces/:id/llm-billing-mode (same derived resolver the
-#   provision-time strip gate uses), asserts the workspace resolves to BYOK
-#   and NOT platform_managed. A regression of #1994 (byok workspace baked to
-#   platform_managed → routed through the platform proxy → platform LLM key
-#   drained) flips resolved_mode to "platform_managed" and trips this gate.
-#   Calls fail() (exits) on violation.
-assert_byok_not_platform_proxy() {
-  local body="$1"
-  local ctx="${2:-byok-guard}"
-  local mode prov
-  mode=$(printf '%s' "$body" | python3 -c "import json,sys
-try: print(json.load(sys.stdin).get('resolved_mode',''))
-except Exception: print('')" 2>/dev/null || echo "")
-  prov=$(printf '%s' "$body" | python3 -c "import json,sys
-try:
-    d=json.load(sys.stdin); v=d.get('provider_selection')
-    print(v if v is not None else '')
-except Exception: print('')" 2>/dev/null || echo "")
-
-  if [ -z "$mode" ]; then
-    fail "$ctx — byok-routing guard: could not read resolved_mode from billing-mode response. Raw: ${body:0:200}"
-  fi
-  if [ "$mode" = "platform_managed" ]; then
-    fail "$ctx — byok-routing guard TRIPPED (#1994 regression): a byok-configured workspace resolved to 'platform_managed' (provider_selection=$prov) → it would route through the platform proxy and drain the platform LLM key. Expected resolved_mode=byok. Raw: ${body:0:200}"
-  fi
-  if [ "$mode" != "byok" ]; then
-    fail "$ctx — byok-routing guard: unexpected resolved_mode='$mode' (expected 'byok'). provider_selection=$prov. Raw: ${body:0:200}"
-  fi
-  ok "$ctx — byok-routing guard: workspace resolves byok (provider_selection=$prov), NOT platform-proxy. #1994 stays fixed."
-}
+# NOTE: the old assert_byok_not_platform_proxy(<billing_mode_json>) helper was
+# REMOVED 2026-07-11. It read `resolved_mode` from
+# GET /admin/workspaces/:id/llm-billing-mode — an endpoint DELETED 2026-06-30
+# (881b3f6f1). platform-vs-BYOK is now DERIVED from the model provider, and the
+# #1994 byok-routing guard (test_staging_full_saas.sh step 8c) now asserts a LIVE
+# signal instead: the byok parent carries its own vendor key at workspace scope
+# via GET /workspaces/:id/secrets. Do not reintroduce a resolved_mode reader.

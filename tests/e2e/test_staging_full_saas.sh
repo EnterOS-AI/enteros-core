@@ -813,39 +813,33 @@ fi
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
-# ─── BYOK opt-in split (secret-write gate requires explicit byok) ───────
+# ─── BYOK vendor-key split (secret-write gate is derived, not opt-in) ───
 # Every vendor-key arm above (MiniMax / Anthropic / Google / OpenAI-hermes)
 # writes one or more keys that workspace-server's secret-write gate —
 # rejectPlatformManagedDirectLLMBypassForWorkspace in
-# workspace-server/internal/handlers/secrets.go — STRIPS/BLOCKS while a
-# workspace's resolved billing mode is platform_managed (the org/CTO default).
+# workspace-server/internal/handlers/secrets.go — BLOCKS while the workspace's
+# DERIVED provider is the closed `platform` arm. platform-vs-BYOK is no longer a
+# stored, opt-in-able mode: the per-workspace `llm_billing_mode` override + its
+# PUT/GET /admin/workspaces/:id/llm-billing-mode endpoint were DELETED 2026-06-30
+# (881b3f6f1, internal#718). The gate now keys off providers.DeriveProvider →
+# IsPlatform: a workspace whose chosen MODEL derives a byok provider IS byok, so
+# its vendor-key write is allowed directly — no opt-in call, and none is possible
+# (the endpoint 404s).
+#
 # The strip-list (secrets.go platformManagedDirectLLMBypassKeys) includes
 # MINIMAX_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY/_BASE_URL,
-# HERMES_CUSTOM_API_KEY/_BASE_URL, etc. A bare vendor key in the CREATE payload
-# does NOT auto-derive byok: at create time no auth-env is present yet, so the
-# resolver derives platform_managed and the write is rejected. The resolver's
-# org rung was retired (internal#718 P2-B) — ResolveLLMBillingMode now ignores
-# the org default — so the ONLY way to opt a workspace into byok is an explicit
-# per-workspace override via PUT /admin/workspaces/:id/llm-billing-mode.
+# HERMES_CUSTOM_API_KEY/_BASE_URL, etc. Controlplane also validates BYOK creds at
+# CREATE time (POST /workspaces → MISSING_BYOK_CREDENTIAL if the vendor key for a
+# byok model slug is absent), so the MiniMax arm ships MINIMAX_API_KEY in the
+# CREATE payload (create-time byok signal) and DEFERRED_SECRETS_JSON is '{}'.
 #
-# Real evidence — staging job 295385 (main f1558b54), AFTER #2311/#2312 made
-# bare `MiniMax-M2.7` registry-valid: parent-create passed model validation but
-# FAILED with
-#   {"error":"direct vendor key writes are blocked for platform-managed
-#    workspaces; ... or set this workspace's billing mode to 'byok' via
-#    /admin/workspaces/:id/llm-billing-mode","key":"MINIMAX_API_KEY"}
-# That 400 is INTENDED product behavior, not a product bug. The e2e must mirror
-# the real BYOK user flow: opt the workspace into byok FIRST, then write the key.
-#
-# Mechanism: per-workspace override (NOT org-default), because the org rung is
-# retired — an org-create billing field could not satisfy this gate even if
-# /cp/admin/orgs accepted one. So for any arm that ships strip-listed keys we:
-#   1. create the workspace WITHOUT those keys (create succeeds platform_managed),
-#   2. PUT billing-mode=byok on that workspace id (per-tenant admin token),
-#   3. write the deferred strip-listed keys (now allowed by the gate),
-# then continue. The #1994 byok-routing guard (8c) then sees a LEGITIMATELY
-# byok workspace (explicit override) and still validates real routing — NOT
-# masked.
+# For any arm that still defers strip-listed keys we:
+#   1. create the workspace (create-time byok validation accepts the byok model),
+#   2. write the deferred vendor key(s) directly — the derived-provider gate
+#      allows the write because the model derives a byok provider,
+# then continue. The #1994 byok-routing guard (8c) then confirms — via the
+# required real-completion milestone on an online workspace — that byok routing
+# actually served a real LLM response. NOT masked.
 #
 # The PLATFORM path (E2E_LLM_PATH=platform) produces SECRETS_JSON='{}', so it
 # carries NO strip-listed key → CREATE_SECRETS_JSON stays '{}' and no opt-in
@@ -902,23 +896,21 @@ byok_opt_in_and_write_deferred() {
   if [ "$DEFERRED_SECRETS_JSON" = "{}" ]; then
     return 0
   fi
-  # Explicit byok opt-in (per-workspace override).
-  local _bm_resp _bm_mode
-  set +e
-  _bm_resp=$(tenant_call PUT "/admin/workspaces/$_id/llm-billing-mode" \
-    -H "Content-Type: application/json" \
-    -d '{"mode":"byok"}' 2>/dev/null)
-  local _bm_rc=$?
-  set -e
-  if [ "$_bm_rc" != "0" ]; then
-    fail "byok opt-in: PUT /admin/workspaces/$_id/llm-billing-mode {mode:byok} failed (rc=$_bm_rc). Raw: $(printf '%s' "$_bm_resp" | sanitize_http_body)"
-  fi
-  _bm_mode=$(echo "$_bm_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resolved_mode',''))" 2>/dev/null || echo "")
-  [ "$_bm_mode" = "byok" ] || fail "byok opt-in: workspace $_id resolved_mode='$_bm_mode' after PUT mode=byok (want byok). Raw: $(printf '%s' "$_bm_resp" | sanitize_http_body)"
-
+  # NO explicit opt-in PUT anymore. The per-workspace `llm_billing_mode`
+  # override + its PUT/GET /admin/workspaces/:id/llm-billing-mode endpoint were
+  # DELETED 2026-06-30 (881b3f6f1, internal#718): platform-vs-BYOK is now DERIVED
+  # deterministically from the chosen model's provider via the providers.yaml
+  # SSOT (providers.DeriveProvider -> IsPlatform). There is no stored mode to opt
+  # into — a workspace whose model derives a non-platform provider IS byok, and
+  # the secret-write gate (secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace)
+  # keys off that derived provider. So for a byok-model workspace the deferred
+  # vendor-key write is allowed directly; no opt-in call is needed (and the old
+  # endpoint would 404 → the HTML-page red this replaces).
+  #
   # Write each deferred strip-listed secret one-per-call (the Set endpoint
-  # takes {key,value}). The gate now passes because resolved=byok. Bodies are
-  # built in Python (env-only) so secret values never hit a command line.
+  # takes {key,value}). The gate passes because the workspace's model derives a
+  # byok provider. Bodies are built in Python (env-only) so secret values never
+  # hit a command line.
   local _keys _k _sec_body _sec_tmp _sec_code _sec_out
   _keys=$(echo "$DEFERRED_SECRETS_JSON" | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin).keys()))")
   while IFS= read -r _k; do
@@ -936,11 +928,11 @@ print(json.dumps({'key': os.environ['BYOK_K'], 'value': d[os.environ['BYOK_K']]}
     if [ "$_sec_code" != "200" ] && [ "$_sec_code" != "201" ] && [ "$_sec_code" != "204" ]; then
       _sec_out=$(cat "$_sec_tmp" 2>/dev/null | sanitize_http_body)
       rm -f "$_sec_tmp"
-      fail "byok vendor-key write: POST /workspaces/$_id/secrets ($_k) returned $_sec_code: $_sec_out — secret-write gate should allow it after the byok opt-in (secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace)."
+      fail "byok vendor-key write: POST /workspaces/$_id/secrets ($_k) returned $_sec_code: $_sec_out — the secret-write gate should allow it because the workspace's model derives a byok provider (secrets.go rejectPlatformManagedDirectLLMBypassForWorkspace, derived post-881b3f6f1)."
     fi
     rm -f "$_sec_tmp"
   done <<< "$_keys"
-  ok "    $_id byok opt-in + deferred vendor key(s) written"
+  ok "    $_id byok vendor key(s) written (derived-provider gate allowed the direct write)"
 }
 
 # ─── runtime → provision-selector resolution ────────────────────────────
@@ -1746,28 +1738,65 @@ a2a_assert_real_completion "$KA_TEXT" "PINEAPPLE" "A2A known-answer (parent, $RU
 live_milestone a2a_roundtrip
 
 # ─── 8c. byok-routing regression guard (#1994) ─────────────────────────
-# The parent was provisioned with the customer's OWN vendor key
-# (MINIMAX_API_KEY / ANTHROPIC_API_KEY in SECRETS_JSON) → it must resolve
-# BYOK, not platform_managed. #1994 was exactly the inverse: a byok
-# workspace baked platform_managed on (re-)provision → routed through the
-# platform proxy → drained the platform LLM key. We read the SAME derived
-# resolver the provision-time strip gate uses
-# (GET /admin/workspaces/:id/llm-billing-mode) and assert resolved_mode!=
-# platform_managed. A regression flips it RED.
+# The parent was provisioned with the customer's OWN vendor key (MINIMAX_API_KEY
+# / ANTHROPIC_API_KEY in SECRETS_JSON) → it must route BYOK, never through the
+# platform proxy. #1994 was the inverse: a byok workspace baked platform_managed
+# on (re-)provision → routed through the platform proxy → drained the platform
+# LLM key.
 #
-# Only meaningful when the parent actually carries a byok credential; the
-# OpenAI/hermes path uses a different env shape, and the no-key path is
-# legitimately platform_managed (the CTO default). Gate on the same
-# E2E_*_API_KEY presence the SECRETS_JSON branch keyed off.
+# HOW THIS IS GUARDED NOW (rewritten 2026-07-11): the per-workspace
+# `llm_billing_mode` override + its GET/PUT /admin/workspaces/:id/llm-billing-mode
+# endpoint were DELETED 2026-06-30 (881b3f6f1, internal#718). platform-vs-BYOK is
+# no longer a stored, readable mode — it is DERIVED deterministically from the
+# model's provider (providers.DeriveProvider → IsPlatform), so the old
+# resolved_mode read (GET …/llm-billing-mode) is gone (probing it returned an HTML
+# 404 — the red this replaces).
+#
+# The DISCRIMINATING live signal we assert instead: a byok parent MUST carry its
+# OWN vendor key at WORKSPACE scope, readable via GET /workspaces/:id/secrets
+# (SecretsHandler.List → [{key, scope, has_value}]). This is NOT tautological with
+# the 8b completion: a #1994-regressed workspace baked platform_managed would
+# route through the platform proxy and STILL return a real completion (draining the
+# platform key) WITHOUT ever persisting the customer's key workspace-scoped — 8b
+# would stay green while this probe goes RED. If the byok vendor key is present at
+# workspace scope AND the model derives a byok provider (unit-guarded by
+# no_billing_mode_env_test.go), the derive rule routes byok, not platform. The
+# provisioner fail-close (workspace_provision_shared.go: aborts a byok provision
+# lacking a usable cred) is the source-level backstop. Only meaningful when the
+# parent carries a byok credential (the no-key path is legitimately
+# platform_managed — the CTO default).
 if [ -n "${E2E_MINIMAX_API_KEY:-}" ] || [ -n "${E2E_ANTHROPIC_API_KEY:-}" ]; then
+  # Which byok vendor key did this arm ship? (matches the SECRETS_JSON branch.)
+  if [ -n "${E2E_MINIMAX_API_KEY:-}" ]; then _byok_key="MINIMAX_API_KEY"; else _byok_key="ANTHROPIC_API_KEY"; fi
   set +e
-  BILLING_RESP=$(tenant_call GET "/admin/workspaces/$PARENT_ID/llm-billing-mode" 2>/dev/null)
-  BILLING_RC=$?
+  SECRETS_RESP=$(tenant_call GET "/workspaces/$PARENT_ID/secrets" 2>/dev/null)
+  SECRETS_RC=$?
   set -e
-  if [ "$BILLING_RC" != "0" ] || [ -z "$BILLING_RESP" ]; then
-    fail "byok-routing guard: GET /admin/workspaces/$PARENT_ID/llm-billing-mode failed (rc=$BILLING_RC). Body: ${BILLING_RESP:0:200}"
+  if [ "$SECRETS_RC" != "0" ] || [ -z "$SECRETS_RESP" ]; then
+    fail "byok-routing guard (#1994): GET /workspaces/$PARENT_ID/secrets failed (rc=$SECRETS_RC). Body: $(printf '%s' "${SECRETS_RESP:0:200}" | sanitize_http_body)"
   fi
-  assert_byok_not_platform_proxy "$BILLING_RESP" "byok-guard (parent, $RUNTIME/$MODEL_SLUG)"
+  # Is the arm's own vendor key persisted at WORKSPACE scope? (env-only Python so
+  # no secret value — we only read key NAMES here — is ever built into a command.)
+  _has_byok=$(printf '%s' "$SECRETS_RESP" | BYOK_KEY="$_byok_key" python3 -c "
+import json, os, sys
+key = os.environ['BYOK_KEY']
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print('parse_error'); sys.exit(0)
+if not isinstance(d, list):
+    print('not_a_list'); sys.exit(0)
+for s in d:
+    if isinstance(s, dict) and s.get('key') == key and s.get('scope') == 'workspace':
+        print('yes'); sys.exit(0)
+print('no')
+" 2>/dev/null || echo "probe_error")
+  case "$_has_byok" in
+    yes)
+      ok "8c.  byok-routing guard (#1994): parent ($RUNTIME/$MODEL_SLUG) carries its own '$_byok_key' at WORKSPACE scope (GET /secrets) → the model derives a byok provider with the customer's key present, so it routes BYOK, not the platform proxy. #1994 stays fixed." ;;
+    *)
+      fail "byok-routing guard (#1994): parent workspace $PARENT_ID does NOT carry its own vendor key '$_byok_key' at workspace scope (secrets probe='$_has_byok'). A byok arm whose vendor key is not persisted workspace-scoped would derive/route through the PLATFORM proxy and drain the platform LLM key — the exact #1994 regression (8b's completion can stay green via the proxy). Raw: $(printf '%s' "${SECRETS_RESP:0:300}" | sanitize_http_body)" ;;
+  esac
 else
   log "8c.  byok-routing guard skipped — parent carries no own-vendor key (OpenAI/no-key path is legitimately platform_managed)."
 fi

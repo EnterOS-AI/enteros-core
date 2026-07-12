@@ -93,17 +93,13 @@ expect_fail "empty text fails" \
 expect_fail "wrong content without token fails" \
   a2a_assert_real_completion "Reply with exactly the word PINEAPPLE and nothing else." "BANANA" "unit"
 
-# ---- assert_byok_not_platform_proxy (#1994 guard) ----
-expect_pass "byok resolution passes the guard" \
-  assert_byok_not_platform_proxy '{"resolved_mode":"byok","provider_selection":"minimax","source":"derived_provider"}' "unit"
-# DECISIVE: a platform_managed resolution on a byok workspace = the #1994
-# regression. MUST fail.
-expect_fail "platform_managed resolution trips the #1994 guard" \
-  assert_byok_not_platform_proxy '{"resolved_mode":"platform_managed","provider_selection":"platform","source":"derived_provider"}' "unit"
-expect_fail "missing resolved_mode trips the guard" \
-  assert_byok_not_platform_proxy '{"provider_selection":"x"}' "unit"
-expect_fail "disabled mode trips the guard (not byok)" \
-  assert_byok_not_platform_proxy '{"resolved_mode":"disabled"}' "unit"
+# ---- (#1994 byok-routing guard) ----
+# The old assert_byok_not_platform_proxy(resolved_mode-json) helper + these
+# synthetic unit cases were REMOVED 2026-07-11 with the deleted
+# /admin/workspaces/:id/llm-billing-mode endpoint (881b3f6f1). The #1994 guard
+# now lives in test_staging_full_saas.sh step 8c and asserts a LIVE signal (the
+# byok parent's own vendor key at workspace scope via GET /workspaces/:id/secrets),
+# which cannot be exercised against fabricated JSON in this pure-unit file.
 
 # ---- a2a_completion_error_marker (the scanner under the gate) ----
 if hit=$(a2a_completion_error_marker "all good PINEAPPLE"); then
