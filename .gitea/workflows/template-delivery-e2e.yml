@@ -266,8 +266,9 @@ jobs:
       - name: Teardown dind (destroys the whole harness topology atomically)
         # LAST step — the dump + ./down.sh steps above run against DOCKER_HOST=dind.
         # Removing the single dind destroys every nested container/volume/network in
-        # one atomic op on the HOST daemon (dind.sh down unsets DOCKER_HOST).
-        # always(): a no-op if no dind was started.
-        if: always()
+        # one atomic op on the HOST daemon (dind.sh down unsets DOCKER_HOST). Gated
+        # like Force teardown on delivery=='true': the no-op path never starts a
+        # dind (nothing to reap), and its checkout lacks the tests/harness cwd.
+        if: always() && needs.detect-changes.outputs.delivery == 'true'
         working-directory: tests/harness
         run: bash dind.sh down

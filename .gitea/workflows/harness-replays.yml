@@ -450,8 +450,9 @@ jobs:
         # one atomic op, on the HOST daemon (dind.sh down unsets DOCKER_HOST). On a
         # SIGKILLed job this may not run, but the only leftover is ONE uniquely-
         # named dind-harness-* container — trivial to reap, vs the open-ended
-        # harness-*/postgres/redis set today. always() (not gated on run flag): if
-        # no dind was started this is a safe no-op.
-        if: always()
+        # harness-*/postgres/redis set today. Gated like Force teardown on
+        # run=='true': the no-op path never starts a dind (nothing to reap) and its
+        # checkout lacks the tests/harness cwd this step chdirs into.
+        if: always() && needs.detect-changes.outputs.run == 'true'
         working-directory: tests/harness
         run: bash dind.sh down
