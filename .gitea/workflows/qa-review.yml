@@ -108,10 +108,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
-  pull_request_review:
-    types: [submitted]
+  # TURNED OFF (CTO directive, 2026-07-11/12): the qa/security "approved" gates
+  # are meaningless ceremony (bot self-approval; branch protection already has
+  # required_approvals=0). They were `disabled_manually` via the Actions API,
+  # but Gitea STILL fires `pull_request_target` workflows in that state, so every
+  # PR re-posted a failing `qa-review / approved` status and wedged merge under
+  # BP ['*'] — forcing a controlled relax on each PR. Dropping the PR triggers
+  # (dispatch-only) is the durable off-switch: no context is posted, nothing to
+  # wedge. Re-enable by restoring the two triggers below.
+  workflow_dispatch:
 
 permissions:
   contents: read
