@@ -45,6 +45,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Clean slate BEFORE booting. The CI runner (docker-host) is warm and shared:
+# a prior run that exited with KEEP_UP=1, or a crashed run whose EXIT-trap
+# teardown didn't complete, leaves stale containers + volumes under the fixed
+# `harness` compose project. `docker compose up -d` would REUSE them and run the
+# replays against a stale tenant binary + a drifted DB (RCA 2026-07-12, main run
+# 477499: seed OK, then tenant-isolation 404 / empty /workspaces against a
+# foreign /buildinfo git_sha 054c6167). Tear down first so every run starts from
+# nothing. Idempotent + safe when nothing is up. Runs regardless of KEEP_UP
+# (KEEP_UP only governs POST-run teardown, not this PRE-run clean slate).
+echo "[run-all] pre-boot clean slate — removing any leftover harness containers + volumes..."
+./down.sh >/dev/null 2>&1 || echo "[run-all] (nothing to tear down)"
+
 echo "[run-all] booting harness..."
 if [ "${REBUILD:-0}" = "1" ]; then
     ./up.sh --rebuild

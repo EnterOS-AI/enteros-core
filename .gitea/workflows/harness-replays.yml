@@ -50,10 +50,20 @@ name: Harness Replays
       - 'tests/harness/**'
       - '.gitea/workflows/harness-replays.yml'
 concurrency:
-  # Per-SHA grouping. Per-ref kept hitting the auto-promote-staging
-  # cancellation deadlock — see e2e-api.yml's concurrency block for
-  # the 2026-04-28 incident that codified this pattern.
-  group: harness-replays-${{ github.event.pull_request.head.sha || github.sha }}
+  # SERIALIZE every harness run on the shared docker-host runner. The harness
+  # binds FIXED host ports (cf-proxy :8080, cp-stub :9090) and a FIXED compose
+  # project (`harness` → container names harness-tenant-alpha-1, ...). Two runs
+  # for DIFFERENT commits (a main-push + a PR, or two pushes) that overlap on the
+  # runner CROSS-WIRE: `docker compose up -d` reuses the other run's containers,
+  # so the replays hit a stale tenant binary — RCA 2026-07-12 (main run 477499):
+  # foreign /buildinfo git_sha 054c6167, org-swapped TenantGuard (alpha creds 404
+  # at alpha but 200 at beta), empty /workspaces. Per-SHA grouping (the prior
+  # value) did NOT prevent this — it only dedupes re-runs of the SAME commit.
+  # A single runner-wide group makes overlapping runs QUEUE instead of collide.
+  # cancel-in-progress stays false: cancelling mid-run would kill a boot and leak
+  # the KEEP_UP containers (that cancellation was the 2026-04-28 auto-promote
+  # deadlock this file guarded against — queueing, not cancelling, is safe).
+  group: harness-replays-runner
   cancel-in-progress: false
 
 env:
@@ -372,6 +382,16 @@ jobs:
         working-directory: tests/harness
         env:
           KEEP_UP: "1"
+          # Bake the REAL commit sha into the tenant image (GIT_SHA is the
+          # Dockerfile build-arg consumed by compose) AND tell the buildinfo
+          # canary to expect it (HARNESS_GIT_SHA). Together they turn a stale or
+          # cross-wired tenant image into a fast, honest red in
+          # buildinfo-stale-image.sh — instead of the confusing org-swap / empty
+          # /workspaces downstream failures that a stale image caused on main run
+          # 477499 (RCA 2026-07-12). up.sh now always (cache-)builds the tenant,
+          # so this sha is compiled into the running binary.
+          GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HARNESS_GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: ./run-all-replays.sh
 
       - name: Dump compose logs on failure

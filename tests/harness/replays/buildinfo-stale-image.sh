@@ -47,6 +47,24 @@ if [ "$ACTUAL_SHA" = "dev" ]; then
     exit 1
 fi
 if [ "$ACTUAL_SHA" != "$EXPECTED_FROM_HARNESS" ]; then
+    if [ "$EXPECTED_FROM_HARNESS" != "harness" ]; then
+        # CI injects the real commit sha as HARNESS_GIT_SHA (and as the GIT_SHA
+        # build-arg baked into the tenant). A mismatch here means the running
+        # tenant is NOT the image built from this checkout — a stale or
+        # cross-wired container reused from a prior/concurrent run on the shared
+        # docker-host runner. That silently corrupts EVERY downstream replay
+        # (org-swapped TenantGuard, empty /workspaces — RCA 2026-07-12 run
+        # 477499), so FAIL FAST + LOUD here rather than let the confusing
+        # downstream failures obscure the real cause. Hermeticity is enforced by
+        # run-all-replays.sh (pre-boot ./down.sh) + up.sh (build + --force-recreate);
+        # if this still fires, that enforcement regressed.
+        echo "[replay] FAIL: /buildinfo git_sha='$ACTUAL_SHA' != expected '$EXPECTED_FROM_HARNESS'."
+        echo "[replay]       The running tenant image is STALE / not built from this checkout —"
+        echo "[replay]       a prior or concurrent harness run's container is being reused."
+        exit 1
+    fi
+    # Local dev without GIT_SHA injection (HARNESS_GIT_SHA defaults to 'harness'):
+    # keep this a soft warning so a plain `./up.sh` (no --rebuild) still runs.
     echo "[replay] WARN: /buildinfo returned '$ACTUAL_SHA' but harness was built with GIT_SHA='$EXPECTED_FROM_HARNESS'"
     echo "[replay]       Image may be cached from a previous run. Run ./up.sh --rebuild to force a fresh build."
 fi
