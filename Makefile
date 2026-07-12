@@ -4,7 +4,7 @@
 # use this Makefile; CI calls docker compose / go test directly so the
 # Makefile can evolve without breaking the build.
 
-.PHONY: help dev up down logs build test e2e-peer-visibility e2e-concierge-creates-workspace openapi-spec openapi-spec-check gen gen-docker gen-check gen-check-docker
+.PHONY: help dev up down logs build test e2e-peer-visibility e2e-concierge-creates-workspace e2e-ephemeral-happy-path e2e-ephemeral-boot e2e-ephemeral-scenario e2e-ephemeral-down openapi-spec openapi-spec-check gen gen-docker gen-check gen-check-docker
 
 # ─── Provider-registry SSOT codegen (internal#718) ─────────────────────
 # The Go module lives in workspace-server/. The checked-in artifact
@@ -68,6 +68,28 @@ e2e-peer-visibility: ## Run the LOCAL peer-visibility MCP gate vs the running st
 # MOLECULE_LLM_DEFAULT_MODEL + a provider key in env). See the script header.
 e2e-concierge-creates-workspace: ## Prove the concierge actually creates a workspace via its platform MCP (skips loud if not runnable).
 	bash tests/e2e/test_concierge_creates_workspace_local.sh
+
+# RFC "one pre-merge ephemeral gate" (§04): run the FULL cross-boundary happy
+# path against a THROWAWAY CP this target spins up itself — same runner CI uses
+# (tests/e2e/ephemeral_cp_happy_path.sh), against your working-tree tenant image.
+# No shared staging, no CI wait: validate before you push. Needs docker + a
+# sibling molecule-controlplane checkout (or CP_EPHEMERAL_SCRIPT / CP_IMAGE set).
+# See local-e2e/ephemeral-cp-happy-path.sh for the overridable env.
+e2e-ephemeral-happy-path: ## Run the FULL happy path against a throwaway CP locally (same gate as CI; no staging).
+	bash local-e2e/ephemeral-cp-happy-path.sh all
+
+# MODULAR PHASES — pinpoint a failing scenario step without the full rebuild+boot.
+# Boot ONCE (~minutes: build CP+tenant, boot CP, migrate), then re-run the
+# scenario as many times as you like (~2 min each) while you fix; tear down when
+# done. `scenario`/`down` NEVER rebuild — they attach to the standing CP.
+e2e-ephemeral-boot: ## Boot a throwaway CP and LEAVE IT UP (prints how to run the scenario/down).
+	bash local-e2e/ephemeral-cp-happy-path.sh boot
+
+e2e-ephemeral-scenario: ## Re-run full-saas against the standing CP (fast, repeatable — no rebuild).
+	bash local-e2e/ephemeral-cp-happy-path.sh scenario
+
+e2e-ephemeral-down: ## Tear down the standing throwaway CP + its Postgres.
+	bash local-e2e/ephemeral-cp-happy-path.sh down
 
 # ─── OpenAPI spec generation (RFC #1706, Phase 1) ─────────────────────
 # Regenerate workspace-server/docs/openapi/swagger.{yaml,json} from
