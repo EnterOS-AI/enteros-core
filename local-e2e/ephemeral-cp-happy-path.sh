@@ -85,7 +85,10 @@ resolve_minimax_key() {
     # shellcheck disable=SC1090
     [ -f "$HOME/.molecule-ai/ops.sh" ] && source "$HOME/.molecule-ai/ops.sh" 2>/dev/null || true
     if command -v mol_secret >/dev/null 2>&1; then
-      MINIMAX_API_KEY="$(mol_secret /shared/controlplane MINIMAX_API_KEY 2>/dev/null || true)"
+      # mol_secret signature is KEY [secretPath] [env] — key FIRST (a reversed
+      # arg order here silently returned empty and the scenario ran keyless,
+      # falling to the openai/gpt-4o no-key default → MISSING_BYOK_CREDENTIAL).
+      MINIMAX_API_KEY="$(mol_secret MINIMAX_API_KEY /shared/controlplane 2>/dev/null || true)"
     fi
   fi
   [ -n "${MINIMAX_API_KEY:-}" ] || echo "[local] WARN: no MINIMAX_API_KEY (LLM legs will fail) — continuing so provision/online still runs."

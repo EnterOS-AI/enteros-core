@@ -46,7 +46,19 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CMD="${1:-all}"
 
 RUNTIME="${E2E_RUNTIME:-hermes}"
-ROUTE_DOMAIN="staging.moleculesai.app"   # MUST match MOLECULE_TOPO_CP_APP_DOMAIN below
+# The ephemeral env's app domain. lvh.me is public wildcard DNS → 127.0.0.1
+# (industry-standard loopback wildcard), which makes the CP's provision-readiness
+# canary SELF-CONTAINED: its public-route leg (3) probes
+# http://<slug>.lvh.me:8080/workspaces from INSIDE the CP container → DNS
+# 127.0.0.1 → the CP's own :8080 → hostSlugFromRequest strips ".lvh.me"
+# (== appDomain) → resolveOrg → the CP wildcard proxy → the tenant's WorkspaceAuth
+# answers 401 → publicRouteRegistered passes. That genuinely EXERCISES the same
+# Host→slug→org→proxy→tenant chain staging uses (minus the CF edge) instead of
+# dialing the REAL staging.moleculesai.app edge, which can never resolve a
+# throwaway org (observed: canary leg 3 got 404 from live staging → CP marked
+# the provision failed at ~30s). MUST match MOLECULE_TOPO_CP_APP_DOMAIN +
+# LOCAL_TENANT_URL_TEMPLATE below.
+ROUTE_DOMAIN="lvh.me"
 
 # Throwaway per-run namespace (must start with pr- — pr-ephemeral-cp.sh refuses
 # to touch a non-ephemeral namespace). Deterministic in PR_NUMBER/HEAD_SHA so the
@@ -56,12 +68,42 @@ case "$NS" in pr-*) : ;; *) echo "FATAL: namespace must start with pr- (got '$NS
 STATE_FILE="${EPHEMERAL_STATE_FILE:-${TMPDIR:-/tmp}/ephemeral-cp-${NS}.env}"
 
 rand_hex() { python3 -c 'import secrets;print(secrets.token_hex(32))'; }
+# 32 random bytes, base64-encoded (44 chars). REQUIRED for SECRETS_ENCRYPTION_KEY:
+# the tenant's parser (workspace-server/internal/crypto/aes.go loadKeyFromEnv)
+# accepts ONLY "32 bytes raw or base64-encoded" — a 64-char hex key IS valid
+# base64 alphabet and decodes to 48 bytes, so the tenant FATALs at boot
+# ("decoded to 48 bytes (expected 32)") while the CP (whose parseKey accepts
+# hex OR base64) boots fine. base64(32 bytes) satisfies BOTH parsers.
+rand_b64_32() { python3 -c 'import secrets,base64;print(base64.b64encode(secrets.token_bytes(32)).decode())'; }
 
 require_boot_env() {
   : "${CP_IMAGE:?required — the baseline controlplane image}"
   : "${TENANT_IMAGE:?required — this PRs workspace-server/tenant image}"
   : "${CP_EPHEMERAL_SCRIPT:?required — path to pr-ephemeral-cp.sh}"
   [ -x "$CP_EPHEMERAL_SCRIPT" ] || { echo "FATAL: CP_EPHEMERAL_SCRIPT not executable: $CP_EPHEMERAL_SCRIPT" >&2; exit 2; }
+}
+
+# ── seed_workspace_image: put the runtime's template image in the LOCAL docker
+# store under its BARE tag. The CP's local-docker workspace provisioner runs
+# `docker run workspace-template-<runtime>:latest` (imageregistry.go
+# localRuntimeTag — the self-host model expects the tag pre-seeded in the local
+# store; on molecules-server the deploy pipeline seeds it). A bare tag can't be
+# pulled from docker.io, so an unseeded host fails workspace provisioning with
+# "docker run: Unable to find image". Pull our registry ref and retag — same
+# mechanics as scripts/refresh-workspace-images.sh, scoped to the ONE runtime
+# the gate exercises.
+seed_workspace_image() {
+  local rt="${RUNTIME}"
+  local bare="workspace-template-${rt}:latest"
+  if docker image inspect "$bare" >/dev/null 2>&1; then
+    echo "[proof] workspace image ${bare} already present" >&2
+    return 0
+  fi
+  local ref="${MOLECULE_IMAGE_REGISTRY:-registry.moleculesai.app/molecule-ai}/workspace-template-${rt}:latest"
+  echo "[proof] seeding ${bare} from ${ref} (one-time pull)..." >&2
+  docker pull "$ref" >&2 || { echo "FATAL: cannot pull ${ref} — the CP cannot provision ${rt} workspaces without it" >&2; exit 1; }
+  docker tag "$ref" "$bare"
+  echo "[proof] seeded ${bare}" >&2
 }
 
 # ── start_pg: throwaway postgres:16 on an ephemeral host port ────────────────
@@ -125,14 +167,39 @@ boot_cp() {
     echo "MOLECULE_TOPO_CF_ZONE_ID=a034108eda16d131ef7f766b923ef464"
     echo "MOLECULE_TOPO_CF_TENANT_SUBDOMAIN_SUFFIX=staging.moleculesai.app"
     echo "MOLECULE_TOPO_CP_APP_DOMAIN=${ROUTE_DOMAIN}"
-    echo "MOLECULE_TOPO_CP_BASE_URL=https://staging-api.moleculesai.app"
+    # SELF-REFERENTIAL CP base URL — NOT the staging mirror. Two delivery paths
+    # flow from these into the tenant and would otherwise point the ephemeral
+    # tenant at a LIVE environment:
+    #   1. /cp/tenants/config delivers MOLECULE_CP_URL := os.Getenv("CP_BASE_URL")
+    #      (controlplane tenant_config.go). With CP_BASE_URL unset it delivered
+    #      "" — the tenant's boot refresh BLANKED its injected MOLECULE_CP_URL
+    #      and cpurl.Base() fell through to the managed default
+    #      https://api.moleculesai.app: the ephemeral tenant sent its workspace
+    #      provision POST to PROD and died on a 401 (observed: "cp provisioner:
+    #      provision failed (401): <unstructured body, 0 bytes>", plus the
+    #      concierge's platform-default-model fetch 401).
+    #   2. MOLECULE_TOPO_CP_BASE_URL → molEnv.CP.BaseURL → LLMProxyBaseURL →
+    #      the MOLECULE_LLM_* proxy env injected into tenant+workspaces. On the
+    #      staging value, workspace LLM traffic would egress to the REAL
+    #      staging-api instead of THIS CP's /cp/internal/llm proxy.
+    # http://controlplane:8080 is the CP's own alias on the shared docker
+    # network — every consumer (tenant, workspaces) lives on that network.
+    echo "MOLECULE_TOPO_CP_BASE_URL=http://controlplane:8080"
+    echo "CP_BASE_URL=http://controlplane:8080"
+    # Canary public-route leg (3) loop-back — see the ROUTE_DOMAIN comment. The
+    # template WINS over the https://<slug>.<domain> default in publicTenantURL,
+    # so the canary probes http://<slug>.lvh.me:8080 (DNS→127.0.0.1 = the CP's
+    # own loopback, :8080 = the CP itself) and traverses the REAL wildcard-proxy
+    # routing chain to the tenant instead of the unreachable staging edge.
+    echo "LOCAL_TENANT_URL_TEMPLATE=http://{slug}.${ROUTE_DOMAIN}:8080"
     # `up` creates the network as mol-net-${NS}; the CP provisions tenants onto it.
     echo "LOCAL_TENANT_SHARED_NETWORK=mol-net-${NS}"
     echo "LOCAL_TENANT_CP_URL=http://controlplane:8080"
     # THROWAWAY crown jewels (RFC finding #1-A): the CP + DB are disposable, so
     # these only need to be self-consistent for the life of the run.
     echo "CP_ADMIN_API_TOKEN=${CP_ADMIN_API_TOKEN}"
-    echo "SECRETS_ENCRYPTION_KEY=$(rand_hex)"
+    # base64(32B), NOT hex — the tenant refuses to boot on a hex key (see rand_b64_32).
+    echo "SECRETS_ENCRYPTION_KEY=$(rand_b64_32)"
     echo "PROVISION_SHARED_SECRET=$(rand_hex)"
     # IMAGE SUBSTITUTION: the CP provisions tenants with THIS PR's tenant image.
     echo "LOCAL_TENANT_IMAGE=${TENANT_IMAGE}"
@@ -185,6 +252,18 @@ load_state() {
 # MOLECULE_TENANT_ROUTE_DOMAIN makes full-saas attach Host=<slug>.<domain> +
 # X-Molecule-Org-Slug so the CP routes it to the provisioned tenant. Zero staging
 # creds: the admin token is the throwaway one baked into the ephemeral CP.
+#
+# E2E_LLM_PATH=platform — the gate mirrors the staging `E2E Staging Platform
+# Boot` lane, which is precisely the lane it exists to replace pre-merge:
+# workspace provisioned with NO tenant key, model = the hermes default
+# minimax/MiniMax-M2.7 (SLASH form = PLATFORM-managed per CTO task#83; the
+# CP LLM proxy bills, required_env=[]), completion flows workspace → tenant
+# proxy env → THIS ephemeral CP's /cp/internal/llm proxy → api.minimax.io with
+# the CP's own MINIMAX_API_KEY (injected via the boot-env). The BYOK matrix is
+# the staging BYOK job's coverage, not this gate's. NOTE: hermes' harness model
+# map has no MiniMax BYOK arm (pick_model_slug hermes → openai/gpt-4o), so a
+# stray E2E_MINIMAX_API_KEY here would go BYOK-openai and 422 — the platform
+# arm also deliberately ignores E2E_*_API_KEY for exactly this class of drift.
 run_scenario() {
   echo "[proof] running core happy-path (full-saas, runtime=${RUNTIME}) against the ephemeral CP — zero staging creds..." >&2
   MOLECULE_CP_URL="${CP_BASE_URL}" \
@@ -193,7 +272,7 @@ run_scenario() {
   MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
   E2E_REQUIRE_LIVE=1 \
   E2E_RUNTIME="${RUNTIME}" \
-  E2E_MINIMAX_API_KEY="${MINIMAX_API_KEY:-}" \
+  E2E_LLM_PATH=platform \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
     bash "$HERE/test_staging_full_saas.sh"
 }
@@ -205,19 +284,27 @@ run_scenario() {
 # mol-net-${NS}, so a network filter catches them (or reveals none were launched).
 dump_diagnostics() {
   echo "── DIAGNOSTIC BURST (ephemeral CP ${NS}) ─────────────────────────────" >&2
-  echo "[diag] ALL docker containers (name / image / status / networks):" >&2
+  echo "[diag] HOST-WIDE container listing (context only — may include LEAKED" >&2
+  echo "[diag] containers from other runs on this shared runner; logs below are" >&2
+  echo "[diag] scoped to THIS run):" >&2
   docker ps -a --format '  {{.Names}}  {{.Image}}  {{.Status}}  nets={{.Networks}}' >&2 2>/dev/null || true
   echo "[diag] CP logs (molecule-cp-${NS}, tail 200):" >&2
   docker logs --tail 200 "molecule-cp-${NS}" 2>&1 | sed 's/^/  cp| /' >&2 \
     || echo "  (no CP container molecule-cp-${NS})" >&2
-  # Tenant containers: the local-docker provisioner names them mol-tenant-* and
-  # may publish them to the host (NOT on mol-net-${NS}), so match by name too, not
-  # just the leg network. Concurrency is serialized so these are ours.
+  # Tenant/workspace containers — scoped to THIS RUN. The old name-only grep
+  # (mol-tenant-*/ws-*) assumed "concurrency is serialized so these are ours";
+  # FALSE on a shared runner: cancelled/crashed past runs leak crash-looping
+  # containers whose logs then pollute the dump (a stale ws-* box's
+  # FileNotFoundError misdirected a real RCA on 2026-07-12). Scope with docker's
+  # `since=` filter — only containers created AFTER our own CP container exists
+  # (the CP is the first thing `up` creates, and it provisions everything else)
+  # — intersected with the provisioner name shapes, plus anything explicitly on
+  # our leg network.
   local c
-  for c in $( { docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^mol-tenant-|^ws-' ;
+  for c in $( { docker ps -a --filter "since=molecule-cp-${NS}" --format '{{.Names}}' 2>/dev/null | grep -E '^mol-tenant-|^ws-|^mol-ws-' ;
                docker ps -a --filter "network=mol-net-${NS}" --format '{{.Names}}' 2>/dev/null ; } | sort -u); do
     case "$c" in "molecule-cp-${NS}"|"pg-${NS}") continue ;; esac
-    echo "[diag] tenant/workspace container ${c} logs (tail 200):" >&2
+    echo "[diag] tenant/workspace container ${c} logs (tail 200, created after our CP):" >&2
     docker logs --tail 200 "$c" 2>&1 | sed "s/^/  ${c}| /" >&2 || true
   done
   echo "── END DIAGNOSTIC BURST ──────────────────────────────────────────────" >&2
@@ -247,6 +334,7 @@ EOF
 case "$CMD" in
   all)
     require_boot_env
+    seed_workspace_image
     trap 'rc=$?; if [ -n "${KEEP_UP:-}" ]; then print_reattach; else teardown; fi; exit "$rc"' EXIT INT TERM
     start_pg
     boot_cp
@@ -262,6 +350,7 @@ case "$CMD" in
     ;;
   boot)
     require_boot_env
+    seed_workspace_image
     start_pg
     boot_cp
     write_state
