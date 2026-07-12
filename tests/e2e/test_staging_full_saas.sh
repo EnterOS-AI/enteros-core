@@ -46,7 +46,14 @@
 #                                 workflow checkout)
 #   E2E_AWS_LEAK_CHECK           auto (default) | required | off
 #                                required in CI so teardown cannot report
-#                                clean while slug-tagged EC2 remains alive
+#                                clean while slug-tagged EC2 remains alive.
+#                                Backend classification (see is_ec2_backend):
+#                                ONLY an explicit 'off' is treated as the
+#                                non-EC2 (local-docker) backend and earns the
+#                                EIC hard-check skips. 'required', the default
+#                                'auto', and an unset value all fail SAFE to
+#                                the EC2 backend so the EIC hard checks stay on
+#                                — never silently dropped on a real EC2 run.
 #   E2E_AWS_TERMINATE_LEAKS      1 → terminate slug-tagged leaked EC2 before
 #                                exiting 4
 #   E2E_INTENTIONAL_FAILURE      1 → poison tenant token mid-run so the
@@ -311,8 +318,21 @@ e2e_tmp() {
 # workflow already advertises — zero new plumbing. When available, a
 # per-workspace signal (the diagnose JSON's own `remote` boolean, which
 # reflects diagnoseLocal vs diagnoseRemote) is preferred at the call site.
+#
+# FAIL-SAFE semantics (fixes a coverage hole): ONLY an explicit 'off'
+# classifies the run as non-EC2 (and thus eligible to SKIP the EIC hard
+# checks). Every other value — 'required', the DOCUMENTED default 'auto',
+# an unset var, or any unknown token — is treated as EC2 so the EIC hard
+# checks STAY ON. The old test (== 'required') mis-classified the
+# documented default 'auto' (and an unset var) as non-EC2, silently
+# dropping ALL EIC hard-checks on a real EC2 run left at default. We do
+# not try to resolve 'auto' to the true backend here (no cheap, in-repo
+# signal — the tenant CP GET's instance_id shape is owned by another
+# repo); instead 'auto' fails safe toward keeping coverage. A real
+# local-docker run must set E2E_AWS_LEAK_CHECK=off explicitly (as the
+# workflow already does) to earn the non-EC2 skips.
 is_ec2_backend() {
-  [ "${E2E_AWS_LEAK_CHECK:-off}" = "required" ]
+  [ "${E2E_AWS_LEAK_CHECK:-auto}" != "off" ]
 }
 
 # ─── cleanup trap ───────────────────────────────────────────────────────
@@ -1251,11 +1271,41 @@ for wid in "${WS_TO_CHECK[@]}"; do
     # to docker CopyToContainer — a different code path with no EIC analog —
     # so a non-2xx here is NOT the EIC regression this gate claims to catch.
     # On an EC2 backend we hard-fail as before; off EC2 we SKIP loudly.
+    #
+    # NARROWED (fixes a coverage hole): the non-EC2 skip is gated on the
+    # SPECIFIC docker-less-tenant signal, mirroring 7b's `docker-available`
+    # narrowing — NOT on "any non-2xx". A real staging tenant's
+    # workspace-server runs INSIDE the tenant container with NO docker socket
+    # (#206, by security design). WriteFile's non-EIC dispatch therefore
+    # falls through findContainer (h.docker==nil ⇒ "") to writeViaEphemeral,
+    # whose first act is `if h.docker == nil { return "docker not available" }`
+    # — surfaced by the handler as HTTP 500 {"error":"failed to write file:
+    # docker not available"} (workspace-server container_files.go:130-131,
+    # templates.go:851-853). That is the ONLY non-2xx we skip.
+    #
+    # Everything else stays a HARD FAIL even off EC2, because it points at a
+    # real outage this step exists to catch, not a backend-shape mismatch:
+    #   - 000 → CP/tenant unreachable (curl rc!=0 / connection refused).
+    #   - 5xx WITHOUT the docker-not-available marker → a genuine config-write
+    #     regression (e.g. writeViaEphemeral failed AFTER the docker check).
+    #   - 4xx (400/401/403/404/…) → auth/route/validation regression.
     if is_ec2_backend; then
       fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE: $PUT_BODY_OUT — likely a path-map or permission regression in workspace-server template_files_eic.go"
-    else
-      log "    ⏭️  $wid Files API PUT config.yaml EIC hard-check SKIPPED (non-EC2 backend): E2E_AWS_LEAK_CHECK=${E2E_AWS_LEAK_CHECK:-off}, PUT returned $PUT_CODE. The template_files_eic.go SSH-via-EIC write path has no local-docker analog (WriteFile shape-routes to docker CopyToContainer). Body: $PUT_BODY_OUT"
+    elif [ "$PUT_CODE" != "000" ] && \
+         { [ "$PUT_CODE" -ge 500 ] 2>/dev/null; } && \
+         printf '%s' "$PUT_BODY_OUT" | grep -qi 'docker not available'; then
+      # Non-EC2 tenant, 5xx, body carries the docker-less signal — the
+      # WriteFile docker-exec dispatch has no local analog on a socket-less
+      # tenant. Config-write coverage for this backend is provided by the
+      # container reading /configs/config.yaml directly via bind-mount at
+      # boot (asserted by online+routable step 7). SKIP this ONE sub-step.
+      log "    ⏭️  $wid Files API PUT config.yaml EIC hard-check SKIPPED (non-EC2 socket-less tenant; docker-not-available): E2E_AWS_LEAK_CHECK=${E2E_AWS_LEAK_CHECK:-auto}, PUT returned $PUT_CODE. The template_files_eic.go SSH-via-EIC write path has no local-docker analog and the docker-exec fallback needs a docker socket the tenant lacks by design (#206). Body: $PUT_BODY_OUT"
       continue
+    else
+      # 000 (unreachable) or 5xx-without-marker or any 4xx → a real outage /
+      # regression, NOT a backend-shape mismatch. Hard-fail so this gate
+      # keeps catching what it exists to catch even off EC2.
+      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (non-EC2 backend, NOT the docker-not-available socket-less signal): $PUT_BODY_OUT — a 000 means CP/tenant unreachable; a 5xx without 'docker not available' is a genuine config-write regression; a 4xx is an auth/route/validation regression. This is a real failure, not a local-docker shape mismatch."
     fi
   fi
   # PUT-only check; the GET-back round-trip assertion was dropped
