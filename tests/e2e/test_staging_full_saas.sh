@@ -2005,9 +2005,18 @@ print(json.dumps({
   # parseable activity shape. We do NOT assert count>0 (the parent may
   # legitimately have 0 events this early — that's a real, valid state), but
   # we DO require the call to have actually succeeded and returned valid JSON.
+  # The workspace id is a PATH param, not a query param: the route is
+  # /workspaces/:id/activity (router.go:269 groups wsAuth under /workspaces/:id;
+  # ActivityHandler.List reads c.Param("id")). This used to call
+  # `/activity?workspace_id=...`, which is not a route AT ALL — it 404s to the
+  # canvas SPA and the assertion reported HTML from a JSON endpoint. It would
+  # have failed on staging too; nobody ever saw it because step 9 (memory) 503'd
+  # and aborted the run BEFORE 9b on every staging pass. The ephemeral gate is
+  # the first environment to get past memory (core#4166 bundles the sidecar),
+  # so it is the first to actually reach this call.
   ACTIVITY_TMP=$(e2e_tmp /tmp/e2e_activity.XXXXXX)
   set +e
-  ACTIVITY_CODE=$(tenant_call GET "/activity?workspace_id=$PARENT_ID&limit=5" \
+  ACTIVITY_CODE=$(tenant_call GET "/workspaces/$PARENT_ID/activity?limit=5" \
     -o "$ACTIVITY_TMP" -w "%{http_code}" 2>/dev/null)
   ACTIVITY_RC=$?
   set -e
@@ -2114,19 +2123,53 @@ print(json.dumps({
     }
 }))
 ")
+  # Caller identity. The proxy reads exactly ONE header for this
+  # (a2a_proxy.go: `callerID := c.GetHeader("X-Workspace-ID")`), and callerID is
+  # what becomes activity_logs.source_id (callerIDToSourceID). This step used to
+  # send `X-Source-Workspace-Id`, which NO Go code reads — grep the tree for it
+  # and you get zero hits. So callerID was "", source_id was NULL, and "child
+  # records parent as source" could never be true. It never failed because the
+  # assertion below was soft-logged; fail-closing it is what finally surfaced it.
+  #
+  # Mint the PARENT's OWN workspace token instead of reusing the tenant admin
+  # token. With an admin/org bearer the proxy classifies the call as a canvas
+  # user (isGenuineCanvasUser) and BYPASSES both CanCommunicate and the
+  # can_delegate gate — the step would go green without ever exercising the
+  # peer-auth path it claims to test. With the parent's own token the real
+  # agent→agent contract runs end to end: the token must bind to callerID
+  # (validateCallerToken), CanCommunicate(parent→child) must allow it, same-org
+  # must hold, and can_delegate must be true.
+  PT_TMP=$(e2e_tmp /tmp/e2e_parent_tok.XXXXXX)
+  set +e
+  PT_CODE=$(tenant_call POST "/admin/workspaces/$PARENT_ID/tokens" \
+    -o "$PT_TMP" -w '%{http_code}' 2>/dev/null)
+  set -e
+  PT_CODE=${PT_CODE:-000}
+  PARENT_WS_TOKEN=$(python3 -c "
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get('auth_token', ''))
+except Exception:
+    print('')
+" "$PT_TMP" 2>/dev/null || echo "")
+  rm -f "$PT_TMP"
+  if [ -z "$PARENT_WS_TOKEN" ]; then
+    fail "Could not mint the parent workspace's auth token (POST /admin/workspaces/\$PARENT_ID/tokens http=$PT_CODE). Without it the delegation call can only run as an admin/canvas caller, which bypasses CanCommunicate + can_delegate and would fake-pass this step."
+  fi
+
   DELEG_TMP=$(mktemp -t deleg_a2a.XXXXXX)
   for DELEG_ATTEMPT in $(seq 1 12); do
     : >"$DELEG_TMP"
     set +e
-    # Raw curl (not tenant_call) because this call carries an extra
-    # X-Source-Workspace-Id header. Must still send X-Molecule-Org-Id
+    # Raw curl (not tenant_call) because this call authenticates as the PARENT
+    # workspace, not as the tenant admin. Must still send X-Molecule-Org-Id
     # or TenantGuard 404s — previously missing, caused section 10 to
     # fail rc=22 despite everything upstream being correct (2026-04-21).
     DELEG_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
-      -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
+      -H "Authorization: Bearer $PARENT_WS_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
       "${TENANT_ROUTE_HDRS[@]}" \
-      -H "X-Source-Workspace-Id: $PARENT_ID" \
+      -H "X-Workspace-ID: $PARENT_ID" \
       -H "Content-Type: application/json" \
       -d "$DELEG_PAYLOAD" \
       -o "$DELEG_TMP" \
@@ -2186,7 +2229,12 @@ except Exception:
   while true; do
     CHILD_ACT_TMP=$(e2e_tmp /tmp/e2e_child_act.XXXXXX)
     set +e
-    CHILD_ACT_CODE=$(tenant_call GET "/activity?workspace_id=$CHILD_ID&limit=20" \
+    # Same bug as 9b: the workspace id is a PATH param. `/activity?workspace_id=`
+    # is not a registered route — it 404s to the canvas SPA, whose HTML never
+    # contains $PARENT_ID, so this loop polled a 404 for the full 60s and then
+    # hard-failed with "delegation-provenance pipeline regression". The pipeline
+    # was fine; the URL was not.
+    CHILD_ACT_CODE=$(tenant_call GET "/workspaces/$CHILD_ID/activity?limit=20" \
       -o "$CHILD_ACT_TMP" -w "%{http_code}" 2>/dev/null)
     set -e
     CHILD_ACT_LASTCODE=${CHILD_ACT_CODE:-000}
@@ -2224,10 +2272,48 @@ fi
 # cycles don't disturb the earlier assertions. Skips are LOUD (logged), and
 # any broken transition hard-fails — never a silent pass.
 if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
-  log "10b/11 Lifecycle transitions: pause→resume→online, hibernate→resume(wake) on parent $PARENT_ID..."
+  # Run the lifecycle on a LEAF workspace, not the parent.
+  #
+  # Pause and Resume refuse to act on a workspace with live descendants unless
+  # ?cascade=true (workspace_restart.go: 409 + the descendant list) — a deliberate
+  # guard, so pausing a parent cannot silently orphan its running children. In
+  # full mode the parent ALWAYS has a child (step 6 creates one), so "pause the
+  # parent" could never have succeeded: this step was dead on arrival. Nobody saw
+  # it for the same reason nobody saw the dead /activity route — staging aborted
+  # at step 9 (memory) before ever reaching 10b, on every run.
+  #
+  # The child is a leaf, so it exercises the SAME state machine (pause → resume →
+  # hibernate → auto-wake) with no cascade semantics in the way. The cascade guard
+  # itself is pinned by its own negative assertion below — strictly more coverage
+  # than this step has ever had.
+  # CHILD_ID is guaranteed non-empty here: 10b is full-mode-only, and full mode
+  # hard-fails at step 6 if the child create returned no id. No fallback — a
+  # `${CHILD_ID:-$LIFECYCLE_WS}` self-reference would abort under `set -u`, and a
+  # `${CHILD_ID:-$PARENT_ID}` fallback would silently pause the PARENT, which is
+  # the exact thing this step must never do.
+  LIFECYCLE_WS="$CHILD_ID"
+  log "10b/11 Lifecycle transitions: pause→resume→online, hibernate→resume(wake) on leaf $LIFECYCLE_WS..."
+
+  # ── negative gate: the cascade guard must REFUSE to pause a parent with a live
+  # child. If it ever regressed, a parent pause would strand its running children
+  # and nothing else in this suite would notice.
+  if [ -n "$CHILD_ID" ]; then
+    CASC_TMP=$(e2e_tmp /tmp/e2e_cascade.XXXXXX)
+    set +e
+    CASC_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/pause" \
+      -o "$CASC_TMP" -w '%{http_code}' 2>/dev/null)
+    set -e
+    CASC_CODE=${CASC_CODE:-000}
+    CASC_BODY=$(cat "$CASC_TMP" 2>/dev/null || echo "")
+    rm -f "$CASC_TMP"
+    if [ "$CASC_CODE" != "409" ] || ! printf '%s' "$CASC_BODY" | grep -q "descendants"; then
+      fail "Cascade guard: POST /workspaces/\$PARENT_ID/pause (no ?cascade) must be REFUSED with 409 + the descendant list while child $CHILD_ID is live — got http=$CASC_CODE. A regression here lets a parent pause strand its running children. Body: $(printf '%s' "$CASC_BODY" | sanitize_http_body | head -c 200)"
+    fi
+    ok "    cascade guard: parent pause refused while a child is live (HTTP 409)"
+  fi
 
   lifecycle_status() {  # echoes the live workspace status
-    tenant_call GET "/workspaces/$PARENT_ID" 2>/dev/null \
+    tenant_call GET "/workspaces/$LIFECYCLE_WS" 2>/dev/null \
       | python3 -c "import json,sys; print(json.load(sys.stdin).get('status') or '')" 2>/dev/null || echo ""
   }
   # Bounded readiness-poll for a target status — same fail-closed shape as
@@ -2238,7 +2324,7 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
     deadline=$(( $(date +%s) + timeout ))
     while true; do
       cur=$(lifecycle_status)
-      if [ "$cur" != "$last" ]; then log "    parent status → ${cur:-<empty>}"; last="$cur"; fi
+      if [ "$cur" != "$last" ]; then log "    leaf status → ${cur:-<empty>}"; last="$cur"; fi
       [ "$cur" = "$target" ] && return 0
       if [ "$(date +%s)" -gt "$deadline" ]; then
         log "    [lifecycle] $label never reached '$target' within ${timeout}s (last='$cur')"
@@ -2249,30 +2335,30 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   }
 
   # ── pause → paused ──
-  PAUSE_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/pause" 2>/dev/null || echo '{}')
+  PAUSE_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/pause" 2>/dev/null || echo '{}')
   PAUSE_STATUS=$(echo "$PAUSE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
   [ "$PAUSE_STATUS" = "paused" ] || fail "Pause: POST /pause returned status='$PAUSE_STATUS' (expected 'paused'). Body: ${PAUSE_RESP:0:200}"
   # Poll the DB-backed status — the response body could lie; the GET proves the row.
-  wait_status "paused" 120 "pause" || fail "Pause: workspace $PARENT_ID never settled at status=paused (DB row) — Pause handler / CP stop regression (workspace_restart.go Pause)."
+  wait_status "paused" 120 "pause" || fail "Pause: workspace $LIFECYCLE_WS never settled at status=paused (DB row) — Pause handler / CP stop regression (workspace_restart.go Pause)."
   ok "    pause → paused (DB-verified)"
 
   # ── resume → provisioning → online ──
-  RESUME_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/resume" 2>/dev/null || echo '{}')
+  RESUME_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/resume" 2>/dev/null || echo '{}')
   RESUME_STATUS=$(echo "$RESUME_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
   [ "$RESUME_STATUS" = "provisioning" ] || fail "Resume: POST /resume returned status='$RESUME_STATUS' (expected 'provisioning'). Body: ${RESUME_RESP:0:200}"
   # Resume re-provisions from the preserved config volume; reuse the same
   # online+routable readiness boundary the initial boot used (no fresh EC2
   # cold-start, but CP re-provision + heartbeat recovery can still take minutes).
-  wait_workspaces_online_routable "    Waiting for parent to return online after resume (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)..." "$PARENT_ID"
+  wait_workspaces_online_routable "    Waiting for the leaf workspace to return online after resume (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)..." "$LIFECYCLE_WS"
   ok "    resume → provisioning → online (DB-verified)"
 
   # ── hibernate → hibernated ──
-  HIB_RESP=$(tenant_call POST "/workspaces/$PARENT_ID/hibernate?force=true" 2>/dev/null || echo '{}')
+  HIB_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate?force=true" 2>/dev/null || echo '{}')
   HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
   [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate: POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
   # The handler runs the claim→stop→'hibernated' sequence; poll the DB row to
   # confirm it landed on 'hibernated' (not stuck mid-'hibernating').
-  wait_status "hibernated" 120 "hibernate" || fail "Hibernate: workspace $PARENT_ID never settled at status=hibernated (DB row) — Hibernate handler / CP stop regression (workspace_restart.go HibernateWorkspace)."
+  wait_status "hibernated" 120 "hibernate" || fail "Hibernate: workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) — Hibernate handler / CP stop regression (workspace_restart.go HibernateWorkspace)."
   ok "    hibernate → hibernated (DB-verified)"
 
   # ── resume-from-hibernate via auto-wake on next A2A ──
@@ -2281,7 +2367,7 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   # A2A and assert the workspace returns to online. We accept transient cold
   # 5xx during wake (same edge class the PONG probe tolerates) and poll the
   # status to the online boundary rather than asserting on the single A2A code.
-  log "    Hibernate auto-wake: sending A2A to wake hibernated parent..."
+  log "    Hibernate auto-wake: sending A2A to wake the hibernated leaf..."
   WAKE_PAYLOAD=$(python3 -c "
 import json, uuid
 print(json.dumps({
@@ -2301,7 +2387,7 @@ print(json.dumps({
   for WAKE_ATTEMPT in $(seq 1 12); do
     : >"$WAKE_TMP"
     set +e
-    WAKE_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/a2a" \
+    WAKE_CODE=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/a2a" \
       --max-time 90 \
       -H "Content-Type: application/json" \
       -d "$WAKE_PAYLOAD" \
@@ -2326,7 +2412,7 @@ print(json.dumps({
   # The auto-wake contract is the STATUS transition (hibernated → online), not
   # the A2A body content — assert the live DB row, the real readiness signal.
   wait_status "online" "$WORKSPACE_ONLINE_TIMEOUT_SECS" "hibernate-wake" \
-    || fail "Hibernate auto-wake: parent $PARENT_ID never returned to status=online after a wake A2A (last A2A http=$WAKE_CODE) — auto-wake-on-message regression (a hibernated ws must re-provision on the next A2A)."
+    || fail "Hibernate auto-wake: workspace $LIFECYCLE_WS never returned to status=online after a wake A2A (last A2A http=$WAKE_CODE) — auto-wake-on-message regression (a hibernated ws must re-provision on the next A2A)."
   ok "    hibernate → online via auto-wake A2A (DB-verified)"
   ok "Lifecycle transitions passed: pause→resume→online + hibernate→wake→online"
 else

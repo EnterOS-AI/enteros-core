@@ -122,7 +122,12 @@ except Exception as e:
 
     log "Recent activity logs for $ws_id:"
     local activity_json
-    activity_json=$(tenant_call GET "/activity?workspace_id=$ws_id&limit=20" 2>/dev/null || echo '[]')
+    # The workspace id is a PATH param: `/activity?workspace_id=` is not a route,
+    # it 404s to the canvas SPA. The HTML then failed the json.load below, so this
+    # diagnostic printed "(activity JSON parse error)" INSTEAD of the activity log
+    # — on every failure it was ever asked to explain. A diagnostic that quietly
+    # drops its best evidence is worse than no diagnostic: it looks like it looked.
+    activity_json=$(tenant_call GET "/workspaces/$ws_id/activity?limit=20" 2>/dev/null || echo '[]')
     {
       printf '%s\n' "$activity_json" | python3 -c "
 import json, sys

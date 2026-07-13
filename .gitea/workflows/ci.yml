@@ -488,6 +488,33 @@ jobs:
         name: Lint cleanup-trap hygiene (RFC #2873)
         run: bash tests/e2e/lint_cleanup_traps.sh
 
+      # Runs when EITHER side of the contract moves: the e2e scripts (scripts)
+      # or the router that serves them (platform). A route rename in
+      # workspace-server is exactly how a call goes dead without anyone noticing.
+      - if: ${{ needs.changes.outputs.scripts == 'true' || needs.changes.outputs.platform == 'true' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: ${{ needs.changes.outputs.scripts == 'true' || needs.changes.outputs.platform == 'true' }}
+        name: Assert the e2e speaks a contract the tenant implements (routes + headers)
+        # The e2e suite called `GET /activity?workspace_id=<id>` in THREE places.
+        # That route does not exist — the tenant serves /workspaces/:id/activity
+        # and reads the id from the PATH — so the call 404'd to the canvas SPA and
+        # a JSON assertion got Next.js HTML back. Step 10 then polled that 404 for
+        # 60s and hard-failed as a "delegation-provenance pipeline regression".
+        # The pipeline was fine; the URL was not. (The third was in a shared
+        # DIAGNOSTIC helper, which had therefore been printing a JSON parse error
+        # instead of the activity log on every failure it was asked to explain.)
+        #
+        # Step 10 also sent `X-Source-Workspace-Id` to identify the delegating
+        # parent. No Go code reads that header; the proxy reads X-Workspace-ID, and
+        # that value is what becomes activity_logs.source_id. So the caller was
+        # anonymous and the assertion it fed could not ever hold.
+        #
+        # All of it survived because those steps had NEVER RUN: on staging, step 9
+        # (memory) 503'd and aborted the run before reaching them, every time. A
+        # wrong URL or a header nobody reads should not cost a live 5-minute
+        # provision to discover, and neither may impersonate a product regression.
+        run: python3 tests/e2e/lib/assert_e2e_tenant_contract.py
+
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Run E2E bash unit tests (no live infra)
         run: |

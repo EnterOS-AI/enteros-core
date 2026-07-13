@@ -136,7 +136,12 @@ jobs:
     #
     # Net: the gate runs on every PR that could conceivably affect the happy path,
     # and a red BLOCKS the merge.
-    timeout-minutes: 40
+    # 75, not 40: the gate now runs E2E_MODE=full (the memory sidecar is bundled
+    # as of core#4166, which was the ONLY reason it was pinned to smoke). full
+    # adds a child workspace, two more live LLM completions and two re-provisions.
+    # 75 is what the staging BYOK lane it replaces already budgets. A too-tight
+    # timeout would surface as a timeout, not as the honest failure underneath.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 

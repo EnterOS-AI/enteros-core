@@ -382,13 +382,29 @@ load_state() {
 # X-Molecule-Org-Slug so the CP routes it to the provisioned tenant. Zero staging
 # creds: the admin token is the throwaway one baked into the ephemeral CP.
 #
-# E2E_LLM_PATH=platform + E2E_MODE=smoke — the gate mirrors the staging `E2E
-# Staging Platform Boot` lane, which is precisely the lane it exists to replace
-# pre-merge. smoke runs the happy-path core (provision → tenant online →
-# workspace online+routable → A2A real completion, steps 2/4/7/8b) and SKIPS
-# the full-matrix extras (memory plugin — needs MEMORY_PLUGIN_URL infra the
-# ephemeral env doesn't stand up — delegation matrix, lifecycle), exactly as
-# Platform Boot does; those stay the staging BYOK job's coverage.
+# E2E_MODE defaults to FULL (2026-07-13). It used to be pinned to `smoke`, whose
+# stated reason was: "memory plugin — needs MEMORY_PLUGIN_URL infra the ephemeral
+# env doesn't stand up". THAT REASON IS DEAD, and leaving the pin would have
+# silently capped this gate at the happy-path core forever:
+#
+#   * core#4166 makes the memory sidecar BUNDLED and default-ON — the tenant
+#     defaults MEMORY_PLUGIN_URL to its own loopback sidecar and starts it
+#     whenever DATABASE_URL is set (workspace-server/entrypoint-tenant.sh), and
+#     the binary is baked into Dockerfile.tenant. No external URL, no extra infra.
+#   * the CP's local-docker provisioner already injects DATABASE_URL against a
+#     PGVECTOR postgres, and already runs a per-tenant REDIS sibling.
+#
+# So `full` needs NOTHING the ephemeral env lacks — only TIME (+1 child workspace,
+# +2 LLM completions, 2 re-provisions), which is why the CI timeout went to 75m.
+# full adds, on top of smoke's provision → tenant online → workspace online+
+# routable → A2A completion: the child workspace, HMA memories (step 9), peers +
+# activity (9b), KV memory (9c), the delegation matrix (10), and the
+# pause/resume/hibernate/wake lifecycle (10b — E2E_LIFECYCLE defaults to `auto`).
+#
+# That is the whole of `E2E Staging SaaS`'s coverage except its BYOK LLM leg (this
+# gate runs the PLATFORM leg — see below), and it is what lets the post-merge
+# staging lanes be retired instead of merely duplicated. Override with
+# E2E_MODE=smoke for a fast local loop.
 # workspace provisioned with NO tenant key, model = the hermes default
 # minimax/MiniMax-M2.7 (SLASH form = PLATFORM-managed per CTO task#83; the
 # CP LLM proxy bills, required_env=[]), completion flows workspace → tenant
@@ -400,6 +416,21 @@ load_state() {
 # arm also deliberately ignores E2E_*_API_KEY for exactly this class of drift.
 run_scenario() {
   echo "[proof] running core happy-path (full-saas, runtime=${RUNTIME}) against the ephemeral CP — zero staging creds..." >&2
+  # E2E_WORKSPACE_ONLINE_TIMEOUT_SECS bounds the SCRIPT's waits, not just the job.
+  # test_staging_full_saas.sh defaults WORKSPACE_ONLINE_TIMEOUT_SECS to 3600 (sized for
+  # a real EC2 cold boot), and full mode spends that budget THREE times on independent
+  # deadlines: step 7 boot, the 10b resume, and the 10b hibernate-wake. 3×3600s = 180
+  # min of legally-waiting script against a 75-min job cap — so a wedged re-provision
+  # would be killed by the runner with the named `fail` never printed and the diagnostic
+  # burst never collected. An opaque runner kill is exactly the un-readable red this
+  # gate exists to abolish. 900s is generous for a local docker re-provision (observed
+  # ~10s) while keeping every arm of the scenario inside the job budget.
+  #
+  # NOTE: keep this comment ABOVE the command. A comment placed between the
+  # backslash-continued env assignments below terminates the logical line — `#` would
+  # swallow the rest of it, severing the env prefix from the `bash` call, and the
+  # scenario would run with no admin token and no E2E_REQUIRE_LIVE. Shellcheck catches
+  # it as SC2034 ("appears unused"), which is what those assignments become.
   MOLECULE_CP_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
@@ -408,8 +439,9 @@ run_scenario() {
   E2E_RUNTIME="${RUNTIME}" \
   E2E_LLM_PATH=platform \
   E2E_AWS_LEAK_CHECK=off \
-  E2E_MODE=smoke \
+  E2E_MODE="${E2E_MODE:-full}" \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
+  E2E_WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}" \
     bash "$HERE/test_staging_full_saas.sh"
 }
 
