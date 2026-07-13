@@ -26,7 +26,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 |--------|------|---------|
 | GET | /health | inline |
 | GET | /metrics | metrics.Handler() — Prometheus text format; no auth, scrape-safe |
-| POST/GET/PATCH/DELETE | /workspaces[/:id] | workspace.go — `GET /workspaces`, `POST /workspaces`, and `DELETE /workspaces/:id` require `AdminAuth`. `DELETE /workspaces/:id` also requires `X-Confirm-Name: <workspace name>`; cascading deletes still require `?confirm=true`. `PATCH /workspaces/:id` enforces field-level authz: cosmetic fields (name, role, x, y, canvas) pass through; sensitive fields (tier, parent_id, runtime, workspace_dir) require a valid bearer token when any live token exists. |
+| POST/GET/PATCH/DELETE | /workspaces[/:id] | workspace.go — `GET /workspaces`, `POST /workspaces`, and `DELETE /workspaces/:id` require `AdminAuth`. `DELETE /workspaces/:id` also requires `X-Confirm-Name: <workspace name>`; cascading deletes still require `?confirm=true`. `PATCH /workspaces/:id` always requires `WorkspaceAuth`, then applies field-level authorization: workspace bearers may update cosmetic fields (`name`, `role`, `x`, `y`, `collapsed`); infrastructure fields (`tier`, `parent_id`, `runtime`, `workspace_dir`, `compute`) require `ADMIN_TOKEN` or a verified control-plane session. Org and workspace tokens receive `403 WORKSPACE_INFRASTRUCTURE_AUTH_REQUIRED` for those fields. |
 | GET/PATCH | /workspaces/:id/config | workspace.go |
 | GET/POST | /workspaces/:id/memory | workspace.go |
 | DELETE | /workspaces/:id/memory/:key | workspace.go |

@@ -77,6 +77,8 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 			// activity, traces, delegations with a single admin credential.
 			adminSecret := os.Getenv("ADMIN_TOKEN")
 			if adminSecret != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(adminSecret)) == 1 {
+				c.Set("caller_is_admin_token", true)
+				c.Set("caller_credential_class", "admin-token")
 				c.Next()
 				return
 			}
@@ -96,6 +98,7 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 				if orgID != "" {
 					c.Set("org_id", orgID)
 				}
+				c.Set("caller_credential_class", "org-token")
 				c.Next()
 				return
 			} else if !errors.Is(err, orgtoken.ErrInvalidToken) {
@@ -107,6 +110,7 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace auth token"})
 				return
 			}
+			c.Set("caller_credential_class", "workspace-token")
 			c.Next()
 			return
 		}
@@ -117,6 +121,7 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 			if ok, _, userID := VerifiedCPSession(cookieHeader); ok {
 				c.Set("cp_session_actor", cpSessionActor(cookieHeader))
 				c.Set("cp_session_user_id", userID)
+				c.Set("caller_credential_class", "cp-session")
 				c.Next()
 				return
 			}

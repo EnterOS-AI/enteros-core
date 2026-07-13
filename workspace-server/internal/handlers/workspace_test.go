@@ -942,6 +942,7 @@ func TestWorkspaceUpdate_MultipleFields(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "cccccccc-0005-0000-0000-000000000000"}}
+	c.Set("caller_credential_class", "admin-token")
 
 	body := `{"name":"Updated Agent","role":"manager","tier":3}`
 	c.Request = httptest.NewRequest("PATCH", "/workspaces/ws-multi", bytes.NewBufferString(body))
@@ -993,6 +994,7 @@ func TestWorkspaceUpdate_RuntimeField(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "cccccccc-0006-0000-0000-000000000000"}}
+	c.Set("caller_credential_class", "admin-token")
 
 	body := `{"runtime":"claude-code"}`
 	c.Request = httptest.NewRequest("PATCH", "/workspaces/ws-rt", bytes.NewBufferString(body))
@@ -1036,6 +1038,7 @@ func TestWorkspaceUpdate_RuntimeField_DBErrorReturnsServerError(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "cccccccc-0006-0000-0000-000000000001"}}
+	c.Set("caller_credential_class", "admin-token")
 
 	body := `{"runtime":"hermes"}`
 	c.Request = httptest.NewRequest("PATCH", "/workspaces/ws-rt", bytes.NewBufferString(body))
@@ -1570,13 +1573,10 @@ func TestWorkspaceUpdate_CosmeticField_NoBearer_FailOpen_NoTokens(t *testing.T) 
 	}
 }
 
-// TestWorkspaceUpdate_SensitiveField_AuthEnforcedByMiddleware documents the #680 fix:
-// auth for PATCH /workspaces/:id is now enforced by WorkspaceAuth middleware (router
-// layer), not inside the handler. The handler processes sensitive fields (tier,
-// parent_id, runtime, workspace_dir) directly — WorkspaceAuth has already verified
-// the caller holds a valid bearer token for this specific workspace before the handler
-// runs. No in-handler wsauth DB probe fires.
-func TestWorkspaceUpdate_SensitiveField_AuthEnforcedByMiddleware(t *testing.T) {
+// TestWorkspaceUpdate_SensitiveField_AdminContextAllowed documents the field-level
+// authorization boundary. WorkspaceAuth records the verified credential class;
+// the handler permits infrastructure fields only for ADMIN_TOKEN or CP sessions.
+func TestWorkspaceUpdate_SensitiveField_AdminContextAllowed(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	broadcaster := newTestBroadcaster()
@@ -1593,10 +1593,11 @@ func TestWorkspaceUpdate_SensitiveField_AuthEnforcedByMiddleware(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "cccccccc-000e-0000-0000-000000000000"}}
+	c.Set("caller_credential_class", "admin-token")
 	c.Request = httptest.NewRequest("PATCH", "/workspaces/cccccccc-000e-0000-0000-000000000000",
 		bytes.NewBufferString(`{"tier":3}`))
 	c.Request.Header.Set("Content-Type", "application/json")
-	// WorkspaceAuth middleware would have validated the bearer before this runs.
+	// WorkspaceAuth middleware would have recorded the admin credential class.
 	handler.Update(c)
 
 	if w.Code != http.StatusOK {

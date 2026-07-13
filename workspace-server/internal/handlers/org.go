@@ -782,13 +782,21 @@ func (h *OrgHandler) Import(c *gin.Context) {
 	log.Printf("org_import: provision concurrency cap=%d (env MOLECULE_PROVISION_CONCURRENCY=%q)",
 		concurrency, os.Getenv("MOLECULE_PROVISION_CONCURRENCY"))
 
-	// Recursively create workspaces. Root workspaces keep their YAML
-	// canvas coords; children are positioned by createWorkspaceTree
-	// using subtree-aware grid slots (children that are themselves
-	// parents get a bigger slot so they don't overflow into siblings).
-	for _, ws := range tmpl.Workspaces {
-		// Root: relX/relY == absX/absY (no parent to be relative to).
-		if err := h.createWorkspaceTree(ws, nil, ws.Canvas.X, ws.Canvas.Y, ws.Canvas.X, ws.Canvas.Y, tmpl.Defaults, orgBaseDir, &results, provisionSem); err != nil {
+	// Recursively create workspaces. The imported org is nested UNDER the
+	// org's platform agent (the concierge) so its top-level workspaces become
+	// a CHILD subtree of the platform-agent root instead of bare roots
+	// (siblings of it). planTopLevelImport resolves each top-level workspace's
+	// parent + canvas coords: children of the platform agent, laid out in the
+	// same subtree-aware grid regular children use, when a platform agent
+	// exists; a root-level fallback (parent_id NULL at the template's own
+	// canvas coords) when the org has no concierge. See core#3510.
+	//
+	// results[0] remains the FIRST top-level workspace either way, so the
+	// global-memories seeding below still attaches to it.
+	slots := h.planTopLevelImport(c.Request.Context(), tmpl.Workspaces)
+	for i, ws := range tmpl.Workspaces {
+		s := slots[i]
+		if err := h.createWorkspaceTree(ws, s.parentID, s.absX, s.absY, s.relX, s.relY, tmpl.Defaults, orgBaseDir, &results, provisionSem); err != nil {
 			createErr = err
 			break
 		}

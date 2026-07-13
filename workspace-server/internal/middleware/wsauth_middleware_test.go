@@ -140,6 +140,9 @@ func TestWorkspaceAuth_VerifiedTenantSessionCookie_AllowsCanvas(t *testing.T) {
 
 	r := gin.New()
 	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		if got := c.GetString("caller_credential_class"); got != "cp-session" {
+			t.Errorf("caller_credential_class = %q, want cp-session", got)
+		}
 		if _, ok := c.Get("cp_session_actor"); !ok {
 			t.Errorf("cp_session_actor was not set")
 		}
@@ -223,6 +226,35 @@ func TestWorkspaceAuth_C8_MemoriesCommit_NoBearer_Returns401(t *testing.T) {
 	}
 }
 
+func TestWorkspaceAuth_AdminToken_SetsCredentialClass(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "admin-secret")
+	mockDB, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	r := gin.New()
+	r.PATCH("/workspaces/:id", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		if got := c.GetString("caller_credential_class"); got != "admin-token" {
+			t.Errorf("caller_credential_class = %q, want admin-token", got)
+		}
+		if value, ok := c.Get("caller_is_admin_token"); !ok || value != true {
+			t.Errorf("caller_is_admin_token = %v, %v; want true, true", value, ok)
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPatch, "/workspaces/ws-admin", nil)
+	req.Header.Set("Authorization", "Bearer admin-secret")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("admin token: expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // TestWorkspaceAuth_InvalidBearer_Returns401 — wrong token must be rejected.
 func TestWorkspaceAuth_InvalidBearer_Returns401(t *testing.T) {
 	mockDB, mock, err := sqlmock.New()
@@ -282,7 +314,12 @@ func TestWorkspaceAuth_ValidBearer_Passes(t *testing.T) {
 	r := gin.New()
 	r.POST("/workspaces/:id/memories",
 		WorkspaceAuth(mockDB),
-		func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+		func(c *gin.Context) {
+			if got := c.GetString("caller_credential_class"); got != "workspace-token" {
+				t.Errorf("caller_credential_class = %q, want workspace-token", got)
+			}
+			c.JSON(http.StatusOK, gin.H{"ok": true})
+		})
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/workspaces/ws-enrolled/memories", nil)

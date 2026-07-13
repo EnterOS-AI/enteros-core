@@ -48,6 +48,7 @@ The platform uses `ADMIN_TOKEN` as the bearer credential for admin-gated endpoin
 | `GET /admin/liveness` | `Authorization: Bearer <ADMIN_TOKEN>` |
 | `POST /org/import` | `Authorization: Bearer <ADMIN_TOKEN>` |
 | `POST /admin/workspaces/:id/tokens` | `Authorization: Bearer <ADMIN_TOKEN>`; plaintext token returned once |
+| `PATCH /workspaces/:id` infrastructure fields (`tier`, `parent_id`, `runtime`, `workspace_dir`, `compute`) | `Authorization: Bearer <ADMIN_TOKEN>` or a verified control-plane session; workspace and org tokens are rejected |
 
 Missing or invalid bearer → **401 in every environment** (fail-closed; no
 dev-mode fail-open). If the auth datastore is unreachable, auth-gated routes

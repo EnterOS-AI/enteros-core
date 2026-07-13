@@ -277,6 +277,9 @@ func TestWorkspaceAuth_OrgToken_SetsAllContextKeys(t *testing.T) {
 
 	r := gin.New()
 	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		if got := c.GetString("caller_credential_class"); got != "org-token" {
+			t.Errorf("caller_credential_class: got %q, want org-token", got)
+		}
 		id, ok := c.Get("org_token_id")
 		if !ok {
 			t.Errorf("org_token_id not set")

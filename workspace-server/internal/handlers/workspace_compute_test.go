@@ -268,6 +268,7 @@ func TestWorkspaceUpdate_WithCompute_PersistsComputeJSONAndRequiresRestart(t *te
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Set("caller_credential_class", "admin-token")
 	body := `{
 		"compute":{
 			"instance_type":"t3.xlarge",
@@ -304,6 +305,7 @@ func TestWorkspaceUpdate_WithInvalidCompute_ReturnsBadRequest(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	c.Set("caller_credential_class", "admin-token")
 	body := `{"compute":{"instance_type":"p4d.24xlarge"}}`
 	c.Request = httptest.NewRequest("PATCH", "/workspaces/"+wsID, bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
