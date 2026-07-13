@@ -12,7 +12,14 @@ import (
 	"strings"
 	"testing"
 
+	"context"
+	"errors"
 	"github.com/gin-gonic/gin"
+	"io"
+	"net"
+	"net/url"
+	"os"
+	"syscall"
 )
 
 // ==================== workspace_settling classification ====================
@@ -81,9 +88,9 @@ func TestProxyA2AError_Classification_SuffixesMessage(t *testing.T) {
 		{
 			name: "upstream_dead with restarting message",
 			err: &proxyA2AError{
-				Status:   http.StatusServiceUnavailable,
-				Response: gin.H{"error": "workspace agent unreachable — container restart triggered"},
-				Headers:  map[string]string{"Retry-After": "15"},
+				Status:         http.StatusServiceUnavailable,
+				Response:       gin.H{"error": "workspace agent unreachable — container restart triggered"},
+				Headers:        map[string]string{"Retry-After": "15"},
 				Classification: "upstream_dead",
 			},
 			wantContains: []string{"container restart triggered", "upstream_dead"},
@@ -307,3 +314,69 @@ func TestUpstreamDead_ConstructionSites(t *testing.T) {
 // any of them, the test file will fail to compile — that is intentional,
 // it forces whoever removes the dependency to also update the test.
 var _ = http.StatusOK
+
+// TestIsAgentRestartingError pins the #4147 predicate: a DIAL refusal means
+// nothing is listening on the agent port.
+//
+// The regression it guards: a config.yaml PUT restarts the agent inside a
+// live container, but never touches the workspace row — status stays "online"
+// with a cached URL. #4069's settling check classifies by DB STATUS, so it is
+// structurally blind to this; the failure is at the TRANSPORT layer. Before
+// the fix, ECONNREFUSED matched none of isUpstreamBusyError's shapes
+// (DeadlineExceeded / Canceled / EOF / "connection reset") and fell through to
+// a terminal 502 — LOSING the caller's message instead of queueing it.
+func TestIsAgentRestartingError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// The real shape: net/http wraps the dial failure in *url.Error ->
+		// *net.OpError -> *os.SyscallError -> syscall.ECONNREFUSED.
+		{"wrapped ECONNREFUSED (the real dial shape)", &url.Error{
+			Op:  "Post",
+			URL: "http://c27e1eb2e46c:8000/a2a",
+			Err: &net.OpError{
+				Op:  "dial",
+				Net: "tcp",
+				Err: os.NewSyscallError("connect", syscall.ECONNREFUSED),
+			},
+		}, true},
+		{"bare ECONNREFUSED", syscall.ECONNREFUSED, true},
+		// Some transports surface it untyped — the substring fallback.
+		{"untyped connection refused", errors.New("dial tcp 127.0.0.1:8000: connect: connection refused"), true},
+
+		{"nil", nil, false},
+		// Must NOT swallow the busy family — these are a DIFFERENT class and
+		// must keep their own classification (#3056).
+		{"EOF is busy, not restarting", io.EOF, false},
+		{"connection reset is busy, not restarting", errors.New("read: connection reset by peer"), false},
+		{"deadline exceeded is busy, not restarting", context.DeadlineExceeded, false},
+		// A genuinely dead agent is handled by the container-dead branch.
+		{"no such host is not a restart", errors.New("dial tcp: lookup nope: no such host"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAgentRestartingError(tc.err); got != tc.want {
+				t.Errorf("isAgentRestartingError(%v) = %v, want %v — a refused dial to a LIVE "+
+					"container is the agent restarting; it must enqueue (202) and drain on the next "+
+					"heartbeat, never hard-502 and lose the message (#4147)", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAgentRestartingIsNotBusy pins that the two predicates stay DISJOINT.
+// #3056's rule is that these classifications must not be conflated, so
+// monitoring can tell a restart window from backpressure. If a future edit
+// folds ECONNREFUSED into isUpstreamBusyError, this reds.
+func TestAgentRestartingIsNotBusy(t *testing.T) {
+	refused := errors.New("dial tcp 10.0.0.5:8000: connect: connection refused")
+	if !isAgentRestartingError(refused) {
+		t.Fatal("setup: expected a restarting-shaped error")
+	}
+	if isUpstreamBusyError(refused) {
+		t.Error("connection-refused is classified BUSY as well as RESTARTING — the two classes " +
+			"must stay disjoint so monitoring can distinguish a settling agent from a mid-turn one (#3056/#4147)")
+	}
+}
