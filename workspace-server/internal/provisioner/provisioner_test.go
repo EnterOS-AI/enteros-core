@@ -3,6 +3,8 @@ package provisioner
 import (
 	"archive/tar"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -11,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/volume"
@@ -1614,9 +1615,51 @@ func TestMigrateVolumeIfNeeded_ExistingTruncatedVolume(t *testing.T) {
 	}
 
 	p := &Provisioner{cli: cli, alpineImage: "alpine"}
-	workspaceID := "test-migrate-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	// legacyConfigVolumeName TRUNCATES the workspace ID to 12 chars, so the
+	// nonce must live in the FIRST 12 characters or it is discarded. The old ID
+	// was "test-migrate-"+nanos — and "test-migrate" is itself exactly 12 chars,
+	// so every run resolved to the same legacy volume, ws-test-migrate-configs.
+	// This test drives a REAL Docker daemon, which CI shares across concurrently
+	// running jobs: two runs would collide on that one name, one run's seed
+	// container pinning the volume while the other's migration tried to remove it
+	// ("volume is in use"), leaving the legacy volume behind and failing step 3.
+	//
+	// Random, not PID+time: concurrent CI jobs run in separate containers with
+	// their own PID namespaces, so two of them can BOTH be pid 7 — and a clock
+	// only separates them down to whatever resolution survives the truncation.
+	// 48 bits of randomness in the first 12 chars needs no such argument.
+	//
+	// The ID must also be LONGER than 12 chars, or the truncation is a no-op and
+	// legacyName == newName — there would be nothing to migrate and this test
+	// would assert nothing. 16 hex chars: unique within the truncation window,
+	// and long enough that the legacy and new names genuinely differ.
+	var nonceRaw [8]byte
+	if _, randErr := rand.Read(nonceRaw[:]); randErr != nil {
+		t.Fatalf("generate volume-name nonce: %v", randErr)
+	}
+	nonce := hex.EncodeToString(nonceRaw[:]) // 16 hex chars > the 12-char truncation
+	workspaceID := nonce
 	legacyName := legacyConfigVolumeName(workspaceID)
 	newName := ConfigVolumeName(workspaceID)
+
+	// Guard the two properties the setup above depends on, so a future rename
+	// fails here — loudly and locally — instead of as a mystery cross-job race on
+	// a shared CI daemon, or as a test that silently asserts nothing.
+	//
+	// (a) the nonce SURVIVES the truncation, so concurrent runs get distinct
+	//     volumes.
+	if !strings.HasPrefix(legacyName, "ws-"+nonce[:8]) {
+		t.Fatalf("legacy volume name %q dropped the uniqueness nonce %q: the 12-char "+
+			"truncation ate it, so concurrent CI runs would collide on one volume", legacyName, nonce)
+	}
+	// (b) the truncation actually TRUNCATES. If the ID were <=12 chars the legacy
+	//     and new names would be identical, there would be nothing to migrate, and
+	//     the assertions below would pass vacuously.
+	if legacyName == newName {
+		t.Fatalf("legacy and new volume names are both %q — the workspace ID (%q) no longer "+
+			"exceeds the 12-char truncation, so this test would assert nothing", legacyName, workspaceID)
+	}
 
 	// Cleanup before and after (defensive — avoid pollution on retries).
 	_ = cli.VolumeRemove(ctx, legacyName, true)
