@@ -37,18 +37,51 @@ def _post_step(workflow: dict) -> dict:
     raise AssertionError("No explicit POST status step found")
 
 
+PR_SHAPED_TRIGGERS = ("pull_request", "pull_request_target", "pull_request_review")
+
+
+def assert_review_trigger_contract(on: dict, name: str) -> None:
+    """The qa/security approved-gates have TWO coherent states. Assert whichever
+    one the file is actually in — and fail on an incoherent mix.
+
+    OFF (current — CTO directive 2026-07-11/12, core#4067): DISPATCH-ONLY, with
+    no PR-shaped trigger at all. This is not laziness, it is the only durable
+    off-switch: Gitea fires a `pull_request_target` workflow even when it has
+    been `disabled_manually` via the Actions API, so a lingering PR trigger
+    re-posts a FAILING `<gate> / approved` context on every PR and wedges merge
+    under branch protection ['*'] — forcing a controlled BP relax on each one.
+    Dropping the triggers posts no context, so there is nothing to wedge.
+
+    ON: if a PR trigger comes back, it must be `pull_request_review` carrying
+    `submitted` — otherwise an APPROVED review never fires the gate that branch
+    protection is waiting on, which is the #2020 stale-context wedge.
+
+    This test used to assert ON unconditionally. It had been RED on main since
+    core#4067 and nobody saw it, because test-ops-scripts.yml is path-filtered to
+    scripts/** and .gitea/scripts/** and nothing had touched those since. Encode
+    the real contract instead of the dead one.
+    """
+    present = [t for t in PR_SHAPED_TRIGGERS if t in on]
+    if not present:
+        return  # OFF, and coherently so.
+    assert "pull_request_review" in on, (
+        f"{name} has PR-shaped trigger(s) {present} but NOT pull_request_review: "
+        "an APPROVED review cannot fire the gate, while pull_request_target still "
+        "posts a failing context on every PR. That is the #2020 wedge. Either add "
+        "pull_request_review (ON) or drop all PR triggers (OFF, dispatch-only)."
+    )
+    types = on["pull_request_review"].get("types", [])
+    assert "submitted" in types, (
+        f"{name}: pull_request_review must include 'submitted' or an APPROVED "
+        "review does not fire the gate"
+    )
+
+
 class TestQaReviewDirectTrigger:
     def test_trigger_is_pull_request_review_submitted(self):
         wf = load_workflow("qa-review.yml")
         # PyYAML parses bare 'on' as boolean True.
-        on = wf[True]
-        assert "pull_request_review" in on, (
-            "qa-review must trigger on pull_request_review"
-        )
-        types = on["pull_request_review"].get("types", [])
-        assert "submitted" in types, (
-            "pull_request_review must include 'submitted' type"
-        )
+        assert_review_trigger_contract(wf[True], "qa-review.yml")
 
     def test_job_guard_has_no_review_state_check(self):
         wf = load_workflow("qa-review.yml")
@@ -96,14 +129,7 @@ class TestSecurityReviewDirectTrigger:
     def test_trigger_is_pull_request_review_submitted(self):
         wf = load_workflow("security-review.yml")
         # PyYAML parses bare 'on' as boolean True.
-        on = wf[True]
-        assert "pull_request_review" in on, (
-            "security-review must trigger on pull_request_review"
-        )
-        types = on["pull_request_review"].get("types", [])
-        assert "submitted" in types, (
-            "pull_request_review must include 'submitted' type"
-        )
+        assert_review_trigger_contract(wf[True], "security-review.yml")
 
     def test_job_guard_has_no_review_state_check(self):
         wf = load_workflow("security-review.yml")

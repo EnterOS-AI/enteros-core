@@ -117,18 +117,34 @@ class TestStaleHeadDiagnostic:
     """
 
     def test_local_checkout_has_pull_request_review_trigger(self):
-        """Local files (the ones in this checkout) must contain the trigger.
+        """The checkout must be in a COHERENT trigger state — not necessarily ON.
 
-        This is the baseline: if the checkout itself is stale, every PR cut
-        from it will also be stale.
+        This asserted the trigger was PRESENT, because auto-fire on APPROVED was
+        the contract when #2159 was written. It is not any more: core#4067 (CTO
+        directive, 2026-07-11/12) made the qa/security approved-gates
+        DISPATCH-ONLY, deliberately dropping the PR triggers, because Gitea fires
+        `pull_request_target` even for a `disabled_manually` workflow — so the
+        trigger's mere presence re-posted a failing context and wedged every PR.
+
+        So absence is now the CORRECT state, and demanding presence made this test
+        red on main from the day #4067 landed. It went unnoticed for two days
+        because test-ops-scripts.yml is path-filtered to scripts/** and
+        .gitea/scripts/**, and nothing touched those paths in between — a
+        path-filtered gate hiding a real red, which is its own lesson.
+
+        What still matters is COHERENCE, so that is what we assert: either the
+        gates auto-fire (trigger present in BOTH), or they are off in BOTH. A
+        half-restored state — one gate firing, the other not — is the actual bug
+        this file exists to catch.
         """
         diag = _diagnose_local()
-        missing = [n for n, ok in diag["triggers"].items() if not ok]
-        if missing:
-            pytest.fail(
-                f"Local checkout is missing pull_request_review trigger in: {missing}. "
-                f"This branch cannot produce PRs that auto-fire."
-            )
+        states = diag["triggers"]  # {workflow: bool(trigger present)}
+        assert len(set(states.values())) == 1, (
+            "qa-review and security-review DISAGREE on the pull_request_review "
+            f"trigger: {states}. They are one gate pair and must be enabled or "
+            "disabled together — a half-on pair means one posts a required "
+            "context that the other never satisfies."
+        )
 
     @pytest.mark.skipif(not GITEA_TOKEN, reason="GITEA_TOKEN not set")
     @pytest.mark.skipif(not PR_NUMBER, reason="PR_NUMBER not set")

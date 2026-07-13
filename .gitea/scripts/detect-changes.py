@@ -48,6 +48,29 @@ PROFILES: dict[str, dict[str, str]] = {
     "e2e-api": {
         "api": r"^workspace-server/|^tests/e2e/|^\.gitea/workflows/e2e-api\.yml$",
     },
+    # ── e2e-ephemeral: the ONE profile that is INVERTED, on purpose ──────────
+    #
+    # Every other profile above is an ALLOW-list: "run only if a changed path
+    # matches." That encodes a bet — that we can enumerate everything able to
+    # break the lane. For the ephemeral happy-path gate we LOST that bet: its
+    # `on: paths:` filter listed workspace-server/, three e2e scripts and
+    # tests/e2e/lib/, but the workflow also RUNS `bash tests/harness/dind.sh`
+    # (the per-job isolation the gate's correctness depends on) — and
+    # tests/harness/** was NOT in the filter. A PR editing the gate's own
+    # harness therefore did not run the gate.
+    #
+    # So this profile is a DENY-list: run UNLESS every changed path is provably
+    # inert. The negative lookahead matches any path that is NOT docs/** and NOT
+    # a *.md — so `any(...)` in classify() is True the moment ONE substantive
+    # file is touched, and False only for a docs-only diff.
+    #
+    # The point is the DIRECTION OF THE FAILURE. Forget a path in an allow-list
+    # and the gate silently does not run: a coverage hole that ships bugs.
+    # Forget one here and the gate runs when it needn't: ~6 wasted minutes.
+    # Only one of those two mistakes is allowed to be the cheap one.
+    "e2e-ephemeral": {
+        "happy": r"^(?!docs/)(?!.*\.md$)",
+    },
     # #1296: the E2E Peer Visibility gate is being flipped to a REQUIRED
     # status check. A required-check workflow may NOT carry an `on: paths:`
     # filter (lint-required-no-paths.py / feedback_path_filtered_workflow_

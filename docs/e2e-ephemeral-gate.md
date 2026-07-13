@@ -2,7 +2,9 @@
 
 *RFC "one pre-merge ephemeral gate" §04 — as built. Landed 2026-07-12
 (core #4036 → `2efd5e6d8`; dind mode core #4116; CP enablers #1526 + #1549).
-Advisory during the soak — the flip-to-required plan lives in **mc#4081**.*
+GATING as of 2026-07-13: the mc#4081 soak is complete (12 consecutive green
+dind runs on main) and `continue-on-error` is gone — a red happy path now
+BLOCKS the merge.*
 
 ## What it is
 
@@ -21,7 +23,7 @@ One entry point — **local == CI**:
 | Laptop (fast, direct) | `make e2e-ephemeral-happy-path` (or `bash local-e2e/ephemeral-cp-happy-path.sh all`) |
 | Laptop, phase-by-phase | `… boot` → `… scenario` (repeatable ~90s) → `… down` |
 | Laptop, CI parity (dind) | `bash tests/harness/dind.sh up` → `EPHEMERAL_DIND=1 … all` |
-| CI | `.gitea/workflows/e2e-ephemeral-happy-path.yml` (path-scoped, advisory, per-job dind) |
+| CI | `.gitea/workflows/e2e-ephemeral-happy-path.yml` (path-scoped, **gating**, per-job dind) |
 
 The image-substitution matrix: a **core** PR tests `molecule-tenant:pr-<sha>`
 (built from the PR) against `controlplane:baseline-dockerprov` (built from CP
@@ -100,13 +102,26 @@ crash-looping containers from other runs and misdirects the RCA (it did).
 
 ## Roadmap (mc#4081)
 
-1. Soak: ≥5 consecutive green dind runs.
-2. Flip `continue-on-error: true → false`; the context joins the merge gate.
-3. Move the happy-path contract into `molecule-ai-sdk` (task #74) so core,
+1. ~~Soak: ≥5 consecutive green dind runs.~~ **DONE** — 12 consecutive green on
+   main (`ed6209ac`..`8b35a673`, 2026-07-11..13). The only non-green entries in
+   that window are `not run` (diff missed the paths filter), not failures.
+2. ~~Flip `continue-on-error: true → false`.~~ **DONE 2026-07-13.** When the gate
+   runs, a red happy path now blocks the merge: main's branch protection is the
+   wildcard `['*']`, so every context that reports must be green.
+3. **OPEN — the honest residual.** The workflow still has `paths:` filters, so on
+   a PR that touches none of them it does not fire and posts *no* context. That
+   is why it is still `bp-exempt` and absent from `.gitea/required-contexts.txt`:
+   a path-filtered *required* context reports `pending` forever and wedges the PR
+   (`lint-required-no-paths` exists for exactly that). Verified harmless under the
+   current wildcard BP — `b5252bc4` / `f9723fe0` never fired it, posted no context,
+   and merged clean. To close it: drop the paths filter, adopt the always-fire +
+   `detect-changes` no-op shape the other required lanes use, then add the context
+   to `.gitea/required-contexts.txt`.
+4. Move the happy-path contract into `molecule-ai-sdk` (task #74) so core,
    CP, and the SDK run the *same* gate — then demote the corresponding
    post-merge E2E Staging jobs (per the verify-live-PR-coverage-first rule).
 
-## Bugs this gate caught before ever gating anything
+## Bugs this gate caught before it could gate anything
 
 CP #1515 (empty `CP_BASE_URL` routes tenants to prod, fail-open) · CP #1526
 (Linux loopback publish) · CP #1530 (CP-side gate never ran; wedged every CP

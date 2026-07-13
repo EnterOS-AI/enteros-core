@@ -98,3 +98,4 @@ Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)
 # #48 (RCA molecule-controlplane #878→#885): real platform-managed boot is
 # the intended merge gate.
 E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot
+E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path

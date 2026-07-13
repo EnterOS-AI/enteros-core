@@ -1,6 +1,6 @@
 name: E2E Ephemeral CP Happy Path
 
-# RFC "one pre-merge ephemeral gate" §04 — the one-scenario PROOF (advisory).
+# RFC "one pre-merge ephemeral gate" §04 — the one-scenario PROOF (GATING).
 #
 # Runs the CORE happy-path (test_staging_full_saas.sh) against a THROWAWAY CP it
 # spins up itself, with THIS PR's tenant image substituted in and the RELEASED
@@ -8,30 +8,39 @@ name: E2E Ephemeral CP Happy Path
 # This validates the SDK-owned-happy-path model (the happy-path E2E is a
 # cross-boundary contract both repos run against an ephemeral CP).
 #
-# ADVISORY during the proof soak. The migration end-state — move the contract
-# into the SDK, wire both repos, flip to required, demote the E2E Staging jobs —
-# is tracked in the RFC. Do NOT renew this mask silently.
+# GATING as of 2026-07-13: the mc#4081 soak is complete (12 consecutive green
+# dind runs on main) and `continue-on-error` is gone — a red happy path BLOCKS.
+# It also ALWAYS fires (no paths filter), so it can be — and is — a required
+# context. What remains of the migration end-state: move the contract into the
+# SDK (task #74), wire both repos, then demote the post-merge E2E Staging jobs.
 #
 # Reuses the CP repo's ephemeral spin-up plumbing (scripts/deploy/pr-ephemeral-cp.sh),
 # the shared harness the RFC generalizes.
 
+# NO `paths:` FILTER — deliberately. Two reasons, both learned the hard way.
+#
+# 1. It was WRONG. The old filter listed workspace-server/, three e2e scripts and
+#    tests/e2e/lib/ — but this workflow RUNS `bash tests/harness/dind.sh`, the
+#    per-job isolation its correctness depends on, and tests/harness/** was NOT
+#    in the list. A PR editing the gate's own harness did not run the gate. A
+#    paths filter is a standing bet that we can enumerate everything able to
+#    break provisioning; we lost that bet on the gate's own plumbing.
+#
+# 2. A path-filtered workflow can never be a REQUIRED context: it does not fire
+#    on an unrelated diff, so the context reports `pending` forever and wedges
+#    the PR (lint-required-no-paths.py / feedback_path_filtered_workflow_cant_be_
+#    required). Always firing is the price of being a real gate.
+#
+# The scoping moves INSIDE, to the always-running job, as an INVERTED profile
+# (detect-changes.py "e2e-ephemeral"): run unless the diff is provably inert
+# (docs-only). Forget a path there and the gate runs when it needn't — six
+# wasted minutes. Forget one in a paths filter and the gate silently does not
+# run — a hole that ships bugs. Only one of those is allowed to be cheap.
 "on":
   pull_request:
     branches: [main]
-    paths:
-      - 'workspace-server/**'
-      - 'tests/e2e/test_staging_full_saas.sh'
-      - 'tests/e2e/ephemeral_cp_happy_path.sh'
-      - 'tests/e2e/lib/**'
-      - '.gitea/workflows/e2e-ephemeral-happy-path.yml'
   push:
     branches: [main]
-    paths:
-      - 'workspace-server/**'
-      - 'tests/e2e/test_staging_full_saas.sh'
-      - 'tests/e2e/ephemeral_cp_happy_path.sh'
-      - 'tests/e2e/lib/**'
-      - '.gitea/workflows/e2e-ephemeral-happy-path.yml'
 
 concurrency:
   # Keyed per-PR, like every sibling E2E lane. This was ONCE a global,
@@ -69,14 +78,64 @@ env:
   CP_BASELINE_IMAGE: controlplane:baseline-dockerprov
 
 jobs:
-  # bp-exempt: advisory proof gate (RFC §04). CI / all-required is the merge aggregate.
+  # bp-exempt: emits no merge-required context of its own; it only tells the
+  # happy-path job whether the diff can possibly touch the happy path.
+  detect:
+    runs-on: docker-host
+    continue-on-error: false
+    outputs:
+      happy: ${{ steps.decide.outputs.happy }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - id: decide
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          # The "e2e-ephemeral" profile is INVERTED (see detect-changes.py):
+          # `happy` is true unless EVERY changed path is provably inert
+          # (docs/**, *.md). Default is RUN.
+          python3 .gitea/scripts/detect-changes.py \
+            --profile e2e-ephemeral \
+            --event-name "${{ github.event_name }}" \
+            --pr-base-sha "$PR_BASE_SHA" \
+            --base-ref "$PR_BASE_REF" \
+            --push-before "$PUSH_BEFORE" || {
+            # Script crash: FAIL OPEN — run the gate rather than silently skip a
+            # potentially-breaking PR. Same posture as e2e-api.yml.
+            echo "happy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
   happy-path:
+    needs: detect
     name: E2E Ephemeral CP Happy Path
     # docker-host: needs a real docker.sock + molecule-core-net to spin the CP,
     # its Postgres, and the provisioned tenant (same runner class as harness-replays).
     runs-on: docker-host
-    # mc#4081 — advisory soak; flip to REQUIRED per the RFC §04 end-state.
-    continue-on-error: true
+    #
+    # ── GATING as of 2026-07-13 (mc#4081 soak COMPLETE) ────────────────────────
+    # `continue-on-error: true` is GONE. It used to mean a RED happy path still
+    # posted SUCCESS — the gate could observe the bug class it was built for, but
+    # never stop it. A guard that cannot fail is not a guard.
+    #
+    # The RFC §04 exit criterion was >=5 consecutive green dind runs. Actual: 12
+    # consecutive green on main (ed6209ac..8b35a673, 2026-07-11..13); the only
+    # non-green entries in that window are `not run` — commits whose diff missed
+    # the paths filter — not failures.
+    #
+    # It ALWAYS FIRES. The `paths:` filter is gone (see the header): it was a bet
+    # that we could enumerate everything able to break provisioning, and it was
+    # already wrong — tests/harness/dind.sh, the isolation harness this very
+    # workflow runs, was not in it. Scoping now lives in the INVERTED
+    # detect-changes profile "e2e-ephemeral": run unless the diff is provably
+    # inert (docs-only), which no-ops but STILL POSTS the context.
+    #
+    # Net: the gate runs on every PR that could conceivably affect the happy path,
+    # and a red BLOCKS the merge.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -95,7 +154,7 @@ jobs:
       # Trade-off: no shared layer cache — each run rebuilds/pulls fresh into
       # the dind (hermetic > fast during the soak; a cache volume can come later).
       - name: Start disposable dind
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         env:
           DIND_NS: ${{ github.run_id }}-ephemeral
         run: bash tests/harness/dind.sh up
@@ -106,7 +165,7 @@ jobs:
       # FORK SAFETY: same-repo PRs only — a fork must never harvest these.
       - name: Fetch e2e creds from Infisical SSOT
         id: creds
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -136,7 +195,7 @@ jobs:
       # repo today; clone it read-only. (When the harness is generalized this
       # becomes a vendored/shared action, not a clone.)
       - name: Clone controlplane for the ephemeral spin-up plumbing
-        if: env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
         run: |
           set -euo pipefail
           rm -rf .cp-ephemeral
@@ -149,7 +208,7 @@ jobs:
       # Pre-clone manifest deps so Dockerfile.tenant's COPY of .tenant-bundle-deps
       # resolves (identical to harness-replays' pre-clone).
       - name: Pre-clone manifest deps
-        if: env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
         env:
           MOLECULE_GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
         run: |
@@ -165,7 +224,7 @@ jobs:
 
       # Build THIS PR's tenant image (the UNDER-TEST side of the substitution).
       - name: Build PR tenant image
-        if: env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
@@ -184,7 +243,7 @@ jobs:
       # cannot provision tenants. main == the released baseline; self-contained (no
       # published :staging-latest tag to depend on).
       - name: Build baseline controlplane image (Dockerfile.dockerprov)
-        if: env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
         run: |
           set -euo pipefail
           docker build \
@@ -195,7 +254,7 @@ jobs:
 
       # The proof: full-saas against the throwaway CP, zero staging creds.
       - name: Run core happy-path against an ephemeral CP
-        if: env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
         env:
           CP_IMAGE: ${{ env.CP_BASELINE_IMAGE }}
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
@@ -217,7 +276,7 @@ jobs:
         # the same non-fork condition as the start step (an ungated always()
         # step on the fork no-op path was exactly the template-delivery chdir
         # failure, core#4057).
-        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        if: always() && (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         env:
           DIND_NS: ${{ github.run_id }}-ephemeral
         run: bash tests/harness/dind.sh down
@@ -227,3 +286,13 @@ jobs:
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true
         run: |
           echo "::notice::Fork PR — ephemeral-CP happy-path proof skipped (no e2e creds by design). The post-merge run covers it."
+
+      # The context MUST still be posted when we skip, or a docs-only PR would
+      # sit at `pending` forever the moment this joins required-contexts.txt.
+      # This is the whole reason the scoping lives here and not in `on: paths:`.
+      - name: No-op — diff is docs-only, the happy path cannot be affected
+        if: needs.detect.outputs.happy == 'false'
+        run: |
+          echo "Every changed path is inert (docs/** or *.md)."
+          echo "The ephemeral happy-path topology cannot be affected by this diff, so it was not spun up."
+          echo "This context is GREEN so the required check is satisfied without burning ~6min + a live LLM call."
