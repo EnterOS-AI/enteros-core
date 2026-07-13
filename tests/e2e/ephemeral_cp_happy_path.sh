@@ -107,6 +107,74 @@ require_boot_env() {
   [ -x "$CP_EPHEMERAL_SCRIPT" ] || { echo "FATAL: CP_EPHEMERAL_SCRIPT not executable: $CP_EPHEMERAL_SCRIPT" >&2; exit 2; }
 }
 
+# ── host_docker / pull_via_host: get an image into the CURRENT docker store
+# without paying a registry pull per job.
+#
+# Under EPHEMERAL_DIND=1 every job gets a BRAND-NEW nested daemon with an empty
+# image store, so a plain `docker pull` re-fetches the image from the registry on
+# EVERY run. Two things break because of that:
+#
+#   1. Docker Hub's ANONYMOUS pull limit. postgres:16 came from docker.io with no
+#      credentials, so a busy day exhausted the quota and the gate died with
+#      "toomanyrequests: You have reached your unauthenticated pull rate limit"
+#      before the happy path ran a single step. That reds every PR at once and
+#      has nothing to do with any PR's diff.
+#   2. Cold-pull latency. The 4.5GB workspace-template pull stalled ~29min mid
+#      layer on one run — a 40min gate that is almost entirely download.
+#
+# The HOST daemon (the one dind.sh itself talks to in order to launch the dind)
+# keeps its image cache ACROSS jobs. So: resolve the image on the host once, then
+# stream it into the nested daemon over docker save|load. Steady state is zero
+# registry traffic per job; a cache-cold host pays exactly one pull, amortized
+# over every later job on that runner.
+#
+# This is not new host access — dind.sh already uses the host daemon to start the
+# dind. When DOCKER_HOST is unset we are already talking to the host, so the
+# helper degrades to a plain pull and the non-dind path is byte-identical.
+host_docker() {
+  env -u DOCKER_HOST -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH docker "$@"
+}
+
+# A cached copy is only authoritative for a ref that CANNOT drift, i.e. one
+# pinned by digest. Every other ref is a moving tag — above all
+# workspace-template-<rt>:latest, which CI re-pushes on every merge to core.
+# Trusting a host-cached copy of a moving tag would pin each runner to whichever
+# build it happened to cache FIRST, so two runners would silently run the gate
+# against different tenant images and a PR's result would depend on where it
+# landed. That is precisely the cross-job shared state this dind work exists to
+# eliminate — a cache that skips resolution is just the old shared daemon wearing
+# a different hat. So: moving tags are ALWAYS re-resolved against the registry.
+#
+# This costs a manifest round-trip, not a download: the host's layer cache still
+# satisfies every unchanged layer, so the steady-state cost of correctness here
+# is one HEAD-sized request. And the refs we pull are on OUR registry, never
+# Docker Hub, so no anonymous rate limit applies to that round-trip.
+ref_is_digest_pinned() {
+  case "$1" in *@sha256:*) return 0 ;; *) return 1 ;; esac
+}
+
+pull_via_host() {
+  local ref="$1"
+  # Not running against a nested daemon: plain pull, unchanged behaviour.
+  if [ -z "${DOCKER_HOST:-}" ]; then
+    if ref_is_digest_pinned "$ref" && docker image inspect "$ref" >/dev/null 2>&1; then
+      echo "[proof] ${ref} is digest-pinned and already local — no registry pull" >&2
+      return 0
+    fi
+    docker pull "$ref" >&2
+    return $?
+  fi
+  # Nested: resolve on the HOST (its layer cache survives across jobs)...
+  if ref_is_digest_pinned "$ref" && host_docker image inspect "$ref" >/dev/null 2>&1; then
+    echo "[proof] host cache HIT for digest-pinned ${ref} — no registry pull" >&2
+  else
+    echo "[proof] resolving ${ref} on the host daemon (moving tag → always re-resolve; unchanged layers come from the host cache)..." >&2
+    host_docker pull "$ref" >&2 || return 1
+  fi
+  # ...then stream it into the nested daemon. Bytes move host→dind, not net→dind.
+  host_docker save "$ref" | docker load >&2 || return 1
+}
+
 # ── seed_workspace_image: put the runtime's template image in the LOCAL docker
 # store under its BARE tag. The CP's local-docker workspace provisioner runs
 # `docker run workspace-template-<runtime>:latest` (imageregistry.go
@@ -116,16 +184,25 @@ require_boot_env() {
 # "docker run: Unable to find image". Pull our registry ref and retag — same
 # mechanics as scripts/refresh-workspace-images.sh, scoped to the ONE runtime
 # the gate exercises.
+#
+# We do NOT skip this when the bare tag already exists in the store. `:latest` is
+# a moving tag, so "already present" says nothing about WHICH build is present —
+# honouring a leftover tag makes the gate's verdict depend on the runner's
+# history. The opt-out is explicit: set WORKSPACE_IMAGE_PRESEEDED=1 when you have
+# deliberately put a locally BUILT template under the bare tag and want the gate
+# to exercise that instead of the published one.
 seed_workspace_image() {
   local rt="${RUNTIME}"
   local bare="workspace-template-${rt}:latest"
-  if docker image inspect "$bare" >/dev/null 2>&1; then
-    echo "[proof] workspace image ${bare} already present" >&2
+  if [ -n "${WORKSPACE_IMAGE_PRESEEDED:-}" ]; then
+    docker image inspect "$bare" >/dev/null 2>&1 \
+      || { echo "FATAL: WORKSPACE_IMAGE_PRESEEDED=1 but ${bare} is not in the docker store" >&2; exit 1; }
+    echo "[proof] WORKSPACE_IMAGE_PRESEEDED=1 — using the ${bare} already in the store, not the published one" >&2
     return 0
   fi
   local ref="${MOLECULE_IMAGE_REGISTRY:-registry.moleculesai.app/molecule-ai}/workspace-template-${rt}:latest"
-  echo "[proof] seeding ${bare} from ${ref} (one-time pull)..." >&2
-  docker pull "$ref" >&2 || { echo "FATAL: cannot pull ${ref} — the CP cannot provision ${rt} workspaces without it" >&2; exit 1; }
+  echo "[proof] seeding ${bare} from ${ref}..." >&2
+  pull_via_host "$ref" || { echo "FATAL: cannot obtain ${ref} — the CP cannot provision ${rt} workspaces without it" >&2; exit 1; }
   docker tag "$ref" "$bare"
   echo "[proof] seeded ${bare}" >&2
 }
@@ -136,13 +213,24 @@ seed_workspace_image() {
 # exec psql — the runner image has no host psql client) and via
 # host.docker.internal:<port> from the CP container. Sets PG_CTR / PG_PORT.
 PG_CTR=""; PG_PORT=""; PG_SUPERPASS="ephemeral-pr-pg"
+# Mirrored into OUR registry, digest-identical to Hub's postgres:16. Hub caps
+# ANONYMOUS pulls (~100/6h per IP), and a fresh dind has an EMPTY image store —
+# so pulling this from Hub on every job is what exhausted the quota and killed
+# the gate before step 1. Override with PG_IMAGE=postgres:16 to go back to Hub.
+PG_IMAGE="${PG_IMAGE:-registry.moleculesai.app/molecule-ai/postgres:16}"
 start_pg() {
   PG_CTR="pg-${NS}"
   docker rm -f "$PG_CTR" >/dev/null 2>&1 || true
+  # Seed via the host cache: a bare `docker run postgres:16` inside a fresh dind
+  # pulls from Docker Hub ANONYMOUSLY on every job, and that quota runs out
+  # ("toomanyrequests: unauthenticated pull rate limit") — reding every open PR
+  # at once, before the happy path executes a single step.
+  pull_via_host "$PG_IMAGE" \
+    || { echo "FATAL: could not obtain ${PG_IMAGE} for ${PG_CTR}" >&2; exit 1; }
   docker run -d --name "$PG_CTR" \
     -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD="$PG_SUPERPASS" \
     -e POSTGRES_DB=postgres \
-    -p "${PUBLISH_BIND}:0:5432" postgres:16 >/dev/null \
+    -p "${PUBLISH_BIND}:0:5432" "$PG_IMAGE" >/dev/null \
     || { echo "FATAL: could not start ephemeral Postgres container ${PG_CTR}" >&2; exit 1; }
   PG_PORT="$(docker port "$PG_CTR" 5432/tcp | awk -F: '/127\.0\.0\.1:/ {print $2; exit}')"
   [ -n "$PG_PORT" ] || PG_PORT="$(docker port "$PG_CTR" 5432/tcp | head -1 | awk -F: '{print $NF}')"

@@ -33,8 +33,26 @@
 #     --build-arg GIT_SHA=<sha> --build-arg NEXT_PUBLIC_PLATFORM_URL= \
 #     --push .
 
+# ── Base images come from OUR registry, not Docker Hub ───────────────
+# Docker Hub caps ANONYMOUS pulls (~100/6h per IP) and CI pulls these base
+# layers on every cold build. Per-job dind (#4116) removed the shared layer
+# cache, so we blew through the cap and every gate died before running a single
+# step ("toomanyrequests: You have reached your unauthenticated pull rate
+# limit"), for reasons unrelated to any PR's diff.
+#
+# registry.moleculesai.app is ours and has no such cap. The images below were
+# mirrored into it with `docker buildx imagetools create`, which copies the
+# manifest byte-for-byte — so the SAME @sha256 pins below resolve verbatim
+# against our registry. Identical digests, identical bytes, no re-pinning, and
+# the supply-chain guarantee of a digest pin is unchanged. Verified anonymously
+# (the CI runners need no registry credential for these).
+#
+# Override to build against Docker Hub (or any mirror):
+#   --build-arg BASE_IMAGE_REGISTRY=docker.io/library
+ARG BASE_IMAGE_REGISTRY=registry.moleculesai.app/molecule-ai
+
 # ── Stage 1: Go platform binary ──────────────────────────────────────
-FROM golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c AS go-builder
+FROM ${BASE_IMAGE_REGISTRY}/golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c AS go-builder
 WORKDIR /app
 COPY workspace-server/go.mod workspace-server/go.sum ./
 # github-app-auth plugin removed 2026-05-07 (#157): per-agent Gitea
@@ -83,7 +101,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # delete entirely in a future cleanup PR.
 
 # ── Stage 2: Canvas Next.js standalone ────────────────────────────────
-FROM node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb AS canvas-builder
+ARG BASE_IMAGE_REGISTRY
+FROM ${BASE_IMAGE_REGISTRY}/node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb AS canvas-builder
 WORKDIR /canvas
 COPY canvas/package.json canvas/package-lock.json* ./
 RUN npm install
@@ -107,7 +126,8 @@ ENV NEXT_PUBLIC_IMAGE_GEN_R2_HOST=$NEXT_PUBLIC_IMAGE_GEN_R2_HOST
 RUN npm run build
 
 # ── Stage 3: Runtime ──────────────────────────────────────────────────
-FROM node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb
+ARG BASE_IMAGE_REGISTRY
+FROM ${BASE_IMAGE_REGISTRY}/node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb
 RUN apk add --no-cache ca-certificates git tzdata openssh-client aws-cli
 
 # Non-root runtime for the Node.js canvas process.

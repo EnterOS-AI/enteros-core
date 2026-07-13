@@ -1,4 +1,23 @@
-FROM node:22-alpine@sha256:cb15fca92530d7ac113467696cf1001208dac49c3c64355fd1348c11a88ddf8f AS builder
+# Base images come from OUR registry, not Docker Hub.
+#
+# WHY: Hub's ANONYMOUS pull limit (~100/6h per IP) is shared by every CI job on
+# the runner and we hold NO Hub credentials. When it is spent, EVERY open PR
+# reds at once on `429 Too Many Requests ... /v2/library/...` — a failure with
+# no relationship to any PR's diff. registry.moleculesai.app mirrors these and
+# has no such limit.
+#
+# The digests below are the MIRROR's, and for most images they DIFFER from the
+# Hub digest they replace. That is not a content change: `docker push` of a
+# single-platform image re-wraps the manifest, so the digest of the WRAPPER
+# moves while every layer digest stays identical. A Hub digest that happens to
+# name a child manifest (golang, node:20, nginx) survives verbatim; one that
+# named Hub's multi-arch INDEX (alpine, node:22, python) cannot, and had to be
+# re-pinned. Do not "restore" the Hub digests — they do not exist in the mirror.
+#
+# Override (e.g. to refresh the mirror from upstream):
+#   --build-arg BASE_IMAGE_REGISTRY=docker.io/library
+ARG BASE_IMAGE_REGISTRY=registry.moleculesai.app/molecule-ai
+FROM ${BASE_IMAGE_REGISTRY}/node:22-alpine@sha256:d1c1bd9c83aa925a17a60442e9cf7f31e801643d55d99083383a0c760567404b AS builder
 WORKDIR /app
 COPY package.json package-lock.json* ./
 # `npm ci` (not `install`) for lockfile-exact reproducibility.
@@ -23,7 +42,8 @@ ENV NEXT_PUBLIC_ADMIN_TOKEN=$NEXT_PUBLIC_ADMIN_TOKEN
 ENV NEXT_PUBLIC_IMAGE_GEN_R2_HOST=$NEXT_PUBLIC_IMAGE_GEN_R2_HOST
 RUN npm run build
 
-FROM node:22-alpine@sha256:cb15fca92530d7ac113467696cf1001208dac49c3c64355fd1348c11a88ddf8f
+ARG BASE_IMAGE_REGISTRY
+FROM ${BASE_IMAGE_REGISTRY}/node:22-alpine@sha256:d1c1bd9c83aa925a17a60442e9cf7f31e801643d55d99083383a0c760567404b
 WORKDIR /app
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static

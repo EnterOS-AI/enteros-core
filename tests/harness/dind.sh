@@ -26,7 +26,11 @@
 
 set -uo pipefail
 CMD="${1:-}"
-DIND_IMAGE="${DIND_IMAGE:-docker:27-dind}"
+# Mirrored into OUR registry (digest-identical to Hub's docker:27-dind) so a
+# cold runner never spends Docker Hub's ~100/6h ANONYMOUS pull budget just to
+# start the nested daemon. Hub's cap reds every open PR at once when it trips.
+# Override with DIND_IMAGE=docker:27-dind to go back to Hub.
+DIND_IMAGE="${DIND_IMAGE:-registry.moleculesai.app/molecule-ai/docker:27-dind}"
 # Run-scoped, deterministic name so `down` finds it without carrying state.
 NS="${DIND_NS:-${GITHUB_RUN_ID:-local}-${GITHUB_JOB:-harness}}"
 DIND="dind-harness-${NS}"
