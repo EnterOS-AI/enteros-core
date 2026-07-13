@@ -15,11 +15,59 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"sync"
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/google/uuid"
 )
+
+// restartContextPending holds the workspaces whose post-restart boot turn has
+// been SCHEDULED but not yet finished. It exists to make that boot turn
+// EXCLUSIVE: an agent has one session, and while the platform is feeding it
+// the restart-context message, no caller's turn may be dispatched into the
+// same session.
+//
+// The race it closes (ephemeral-CP gate run 493034, and the class the #4147
+// comment in a2a_proxy_helpers.go predicted):
+//
+//	20:44:50  A2AQueue: enqueued <id> for <ws>      (agent busy — restarting)
+//	20:44:54  A2AQueue drain: DISPATCHING <id> → agent
+//	20:44:55  restart-context: delivered to <ws>    ← 1s AFTER the dispatch
+//	20:45:06  drain returns → caller's reply is the RESTART-CONTEXT's answer:
+//	          "Workspace restarted and ready. What would you like me to help with?"
+//
+// Both the drain (registry.Heartbeat → DrainQueueForWorkspace, gated on
+// ActiveTasks < maxConcurrent) and sendRestartContext (gated on online + fresh
+// heartbeat) are woken by the SAME heartbeat, with nothing ordering them. The
+// agent's single session then serves the two overlapping turns, and the caller's
+// POST comes back holding the boot turn's text. The caller cannot tell it was
+// not answered — a wrong answer, silently. That is strictly worse than a retry,
+// which is the whole reason the queue exists.
+//
+// So: mark BEFORE the goroutine is spawned (a mark inside it would leave exactly
+// the window we are closing), and clear on EVERY exit path (deliver, drop, or
+// panic) via defer. The queued item is not lost while the gate is up — it stays
+// queued and drains on the next heartbeat, once the agent is genuinely idle.
+// sendRestartContext is bounded by its own context timeout, so the gate cannot
+// wedge the queue indefinitely.
+var restartContextPending sync.Map // workspaceID -> struct{}
+
+func markRestartContextPending(workspaceID string) {
+	restartContextPending.Store(workspaceID, struct{}{})
+}
+
+func clearRestartContextPending(workspaceID string) {
+	restartContextPending.Delete(workspaceID)
+}
+
+// restartContextInFlight reports whether a post-restart boot turn is scheduled
+// or running for workspaceID. The A2A queue drain consults this so a caller's
+// turn never interleaves with the platform's own.
+func restartContextInFlight(workspaceID string) bool {
+	_, ok := restartContextPending.Load(workspaceID)
+	return ok
+}
 
 // restartContextOnlineTimeout bounds how long we wait for a workspace
 // to re-register after restart before dropping the context message.
@@ -257,6 +305,12 @@ func buildRestartA2APayload(text string) ([]byte, error) {
 // dropped — the restart itself is already considered successful at
 // this point.
 func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartContextData) {
+	// Release the drain gate on EVERY exit path — delivered, dropped, or
+	// panicking. A leaked gate would stall this workspace's queue until the
+	// process restarts, so this defer is load-bearing, not hygiene.
+	// (The gate is SET by the caller, before the goroutine is spawned.)
+	defer clearRestartContextPending(workspaceID)
+
 	// Detach from any request context — this runs after the HTTP
 	// response is flushed.
 	ctx, cancel := context.WithTimeout(context.Background(), restartContextOnlineTimeout+30*time.Second)

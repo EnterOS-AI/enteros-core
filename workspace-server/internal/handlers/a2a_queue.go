@@ -457,6 +457,17 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 	if capacity <= 0 {
 		return
 	}
+	// The agent has ONE session. While the platform's post-restart boot turn is
+	// in flight, dispatching a caller's turn into that same session means the
+	// caller's POST comes back holding the BOOT TURN's answer ("Workspace
+	// restarted and ready...") — a wrong answer the caller cannot distinguish
+	// from a right one. Hold off: the item stays queued and drains on the next
+	// heartbeat, once the agent is genuinely idle. Nothing is lost, and a loud
+	// wait beats a quiet lie. See restartContextPending (restart_context.go).
+	if restartContextInFlight(workspaceID) {
+		log.Printf("A2AQueue drain: workspace %s has a restart-context boot turn in flight — deferring drain to the next heartbeat", workspaceID)
+		return
+	}
 	for i := 0; i < capacity; i++ {
 		item, err := DequeueNext(ctx, workspaceID)
 		if err != nil {

@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -943,5 +944,103 @@ func TestDropStaleQueueItems_DBError(t *testing.T) {
 	// Error message must include the function name per the wrapped fmt.Errorf.
 	if !strings.Contains(err.Error(), "DropStaleQueueItems") {
 		t.Errorf("error = %v; want wrapped error mentioning DropStaleQueueItems", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_RestartContextInFlight_DefersDrain pins the fix for
+// the boot-turn/drain collision (ephemeral-CP gate run 493034).
+//
+// An agent has ONE session. The post-restart boot turn (sendRestartContext) and
+// the queue drain are both woken by the same heartbeat, so before this gate they
+// could overlap: the drain dispatched a caller's queued message, the platform
+// then posted its restart-context prompt into the same session, and the caller's
+// POST came back holding the BOOT TURN's answer ("Workspace restarted and
+// ready...") instead of its own. The caller cannot tell it was not answered.
+//
+// The contract, both directions in one test:
+//   - while the boot turn is in flight, the drain dispatches NOTHING (and the
+//     item is NOT consumed — it must survive to be drained later);
+//   - once the boot turn completes, the very same item drains normally.
+//
+// Mutation check: drop the restartContextInFlight guard in DrainQueueForWorkspace
+// and the first assertion fails (agent sees 1 request during the boot turn).
+func TestDrainQueueForWorkspace_RestartContextInFlight_DefersDrain(t *testing.T) {
+	item := drainItem("ws-bootturn")
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+
+	var agentHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&agentHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"result":{"status":"ok"}}`)
+	}))
+	defer srv.Close()
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	// Declare the queue expectations UP FRONT, before the gated drain. This is
+	// load-bearing for the mutation to bite: if they were only declared after the
+	// gated drain, then removing the guard would make that drain hit an
+	// *unexpected* DequeueNext, error out, and return without ever reaching the
+	// agent — agentHits would still be 0 and the test would pass against the bug
+	// it exists to catch. A drainable queue is what makes "0 hits" mean the GUARD
+	// stopped it, not an incidental DB error.
+	expectDequeueNextOk(mock, item)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectCompleted(mock, item.ID, `{"result":{"status":"ok"}}`)
+
+	// ── boot turn in flight → the drain must not touch the agent.
+	markRestartContextPending(item.WorkspaceID)
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+	if got := atomic.LoadInt32(&agentHits); got != 0 {
+		t.Fatalf("drain dispatched %d request(s) into the agent while its restart-context "+
+			"boot turn was in flight — the caller would have received the boot turn's "+
+			"answer instead of its own; want 0", got)
+	}
+
+	// ── boot turn done → the same item drains normally (nothing was lost).
+	clearRestartContextPending(item.WorkspaceID)
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if got := atomic.LoadInt32(&agentHits); got != 1 {
+		t.Errorf("after the boot turn completed the queued item must drain: agent got %d request(s), want 1", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestSendRestartContext_ClearsPendingGate: the gate must be released on EVERY
+// exit path, including the early "never came online" drop. A leaked gate would
+// stall that workspace's queue for the life of the process — turning a transient
+// boot hiccup into a permanently deaf agent. Here the workspace never reaches
+// online, so sendRestartContext takes its earliest return.
+func TestSendRestartContext_ClearsPendingGate(t *testing.T) {
+	const wsID = "ws-gate-leak"
+	markRestartContextPending(wsID)
+	if !restartContextInFlight(wsID) {
+		t.Fatal("precondition: gate should be set")
+	}
+	t.Cleanup(func() { clearRestartContextPending(wsID) })
+
+	// Not online / no such workspace → sendRestartContext drops the message and
+	// returns. Whatever path it takes, the defer must clear the gate.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() { _ = recover() }() // a panic must still not leak the gate
+		h := &WorkspaceHandler{}
+		h.sendRestartContext(wsID, restartContextData{RestartAt: time.Now()})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(90 * time.Second):
+		t.Fatal("sendRestartContext did not return — the drain gate would be held indefinitely")
+	}
+
+	if restartContextInFlight(wsID) {
+		t.Error("restart-context gate LEAKED after sendRestartContext returned — this workspace's " +
+			"A2A queue would never drain again")
 	}
 }

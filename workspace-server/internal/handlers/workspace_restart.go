@@ -482,6 +482,11 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	h.goAsync(func() {
 		h.RestartWorkspaceAutoOpts(context.Background(), id, templatePath, configFiles, payload, resetClaudeSession)
 	})
+	// Claim the agent's session for the boot turn BEFORE spawning the sender:
+	// the drain is woken by the same heartbeat, so marking inside the goroutine
+	// would leave open the very window this closes. Cleared by sendRestartContext's
+	// defer on every exit path. See restartContextPending in restart_context.go.
+	markRestartContextPending(id)
 	h.goAsync(func() { h.sendRestartContext(id, restartData) })
 
 	c.JSON(http.StatusOK, gin.H{"status": "provisioning", "config_dir": configLabel, "reset_session": resetClaudeSession})
@@ -1237,6 +1242,9 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// Tracked via h.goAsync so tests can wait for it via h.asyncWG before
 	// closing the sqlmock. Without this, untracked goroutines hit the restored
 	// mock and cause "was not expected" errors in parallel CI execution (mc#1264).
+	// Same session claim as the Restart handler above — set before the spawn so
+	// the drain woken by this restart's first heartbeat already sees the gate.
+	markRestartContextPending(workspaceID)
 	h.goAsync(func() { h.sendRestartContext(workspaceID, restartData) })
 }
 
