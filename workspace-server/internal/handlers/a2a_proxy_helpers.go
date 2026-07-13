@@ -198,6 +198,46 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 		// non-native callers enqueue here. The native_session SDK's own
 		// in-flight POST stays unaffected; the queued item drains on the
 		// next post-idle heartbeat.
+		// #4147 follow-up (staging run 486390): a RESTARTING agent must NOT be
+		// enqueued — it takes the retryable 503 below instead.
+		//
+		// Enqueue is right for a BUSY agent: it is mid-turn, and heartbeat-gated
+		// drain (registry.go Heartbeat, ActiveTasks < maxConcurrent) fires only
+		// once that turn ends, so the queued item lands on an IDLE agent.
+		//
+		// A restarting agent breaks that assumption. A freshly-booted agent
+		// reports ActiveTasks=0 while it is still producing its own FIRST turn,
+		// so the drain dispatches into that boot turn and the queue captures the
+		// BOOT TURN'S output as the item's response_body. Staging saw exactly
+		// that: the A2A ping was queued, drained, and answered with
+		//   "Workspace restarted and ready. LLM_PROVIDER and MODEL env vars are
+		//    now available. What would you like me to help with?"
+		// instead of the requested PONG. A wrong answer is worse than a loud
+		// retry — the caller cannot tell it was not answered.
+		//
+		// The 503 below carries "workspace agent restarting", which the A2A
+		// callers already treat as a bounded-retry settling class (the same
+		// class as "not publicly routable" / "provisioning"). That is all #4147
+		// ever needed: the ORIGINAL bug was that ECONNREFUSED surfaced as
+		// {"error":"failed to reach workspace agent"} — a body matching NO
+		// retryable pattern — so callers gave up after one attempt. Fixing the
+		// classification is sufficient; routing into the queue was not.
+		if agentRestarting {
+			if logActivity {
+				h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
+			}
+			return 0, nil, &proxyA2AError{
+				Status:  http.StatusServiceUnavailable,
+				Headers: map[string]string{"Retry-After": strconv.Itoa(busyRetryAfterSeconds)},
+				Response: gin.H{
+					"error":       "workspace agent restarting — retry after a short backoff",
+					"busy":        true,
+					"retry_after": busyRetryAfterSeconds,
+				},
+				Classification: classWorkspaceSettling,
+			}
+		}
+
 		idempotencyKey := extractIdempotencyKey(body)
 		// Honor params.expires_in_seconds when the caller specifies one. Zero
 		// (the unset default) → expiresAt = nil → infinite TTL preserved by
