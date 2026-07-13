@@ -20,6 +20,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -234,6 +235,47 @@ func isUpstreamBusyError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "EOF") ||
 		strings.Contains(msg, "connection reset")
+}
+
+// isAgentRestartingError reports whether a forward-call failure is a
+// DIAL-level refusal — nothing is listening on the agent port.
+//
+// When the workspace CONTAINER is alive (maybeMarkContainerDead said so) and
+// the dial is refused, the agent PROCESS inside it is (re)starting. The
+// canonical trigger is a config.yaml PUT: it restarts the agent, but never
+// touches the workspace row — status stays "online" and the cached URL stays
+// populated. So for a few seconds the platform advertises the workspace as
+// online and routable while nothing is listening.
+//
+// #4069's settling check (isRecoverableSettlingStatus) cannot see this: it
+// classifies by DB STATUS (provisioning / awaiting_agent), and this failure
+// is at the TRANSPORT layer with status=online. It closed the "no URL yet"
+// half of settling; this is the "URL exists, agent not listening yet" half.
+//
+// Without this, the caller gets a hard 502 and the message is LOST — not
+// queued, not retried. That hits real callers, not just CI: a peer agent
+// delegating to a workspace mid-config-change, or a canvas message right
+// after a settings save (#4147, caught by the ephemeral gate on #4126).
+//
+// Deliberately NOT folded into isUpstreamBusyError: "busy" means the agent is
+// mid-turn on its single-threaded loop, "restarting" means it is not there
+// yet. The classifications are kept distinct so monitoring can tell
+// backpressure from a restart window (the #3056 rule).
+//
+// ECONNREFUSED is the shape a restarting listener produces. A *dead* agent
+// that never returns is handled upstream by the container-dead branch (503 +
+// restart); a queued item that never drains expires on its TTL.
+func isAgentRestartingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	// Not every transport wraps the syscall errno with an errors.Is hook
+	// (the dial error can arrive as a bare *net.OpError), so keep the
+	// substring fallback — same pattern as isUpstreamBusyError above.
+	return strings.Contains(err.Error(), "connection refused")
 }
 
 // isUpstreamDeadStatus returns true when the upstream HTTP status indicates

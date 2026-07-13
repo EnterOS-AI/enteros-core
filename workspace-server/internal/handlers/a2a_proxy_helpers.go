@@ -155,7 +155,25 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 	// `if proxyErr != nil` branch doesn't fire. Returning a proxyA2AError
 	// with 202 status here was the original cycle 53 bug — callers saw
 	// proxyErr != nil and logged "delegation failed: proxy a2a error".
-	if isUpstreamBusyError(err) {
+	// #4147: a DIAL-refused error on a container we can POSITIVELY confirm is
+	// alive means the agent process inside it is (re)starting — e.g. a
+	// config.yaml PUT restarts the agent while the workspace row still reads
+	// status=online with a cached URL. That is a settling window, not a dead
+	// agent, and it takes the SAME enqueue-and-drain path as a busy agent:
+	// queue the message, drain it on the next heartbeat once the agent is
+	// listening again. Before this, ECONNREFUSED matched none of
+	// isUpstreamBusyError's shapes (DeadlineExceeded / Canceled / EOF /
+	// "connection reset") and fell through to the terminal 502 below, LOSING
+	// the message.
+	//
+	// The liveness guard is load-bearing, NOT a formality: dead==false does not
+	// mean "alive". maybeMarkContainerDead early-returns dead=false for an
+	// external-like runtime (we don't own that compute) and when no provisioner
+	// is configured (we cannot look) — there it means UNKNOWN. Firing the
+	// restart branch on "unknown" would silently queue messages to a
+	// permanently-dead agent forever instead of surfacing the honest 502.
+	agentRestarting := isAgentRestartingError(err) && h.containerLivenessIsVerifiable(ctx, workspaceID)
+	if isUpstreamBusyError(err) || agentRestarting {
 		// #1684 / Reno Stars: native_session adapters previously took a
 		// 503-no-enqueue path here, on the assumption that the SDK owned
 		// an inbound queue and the platform a2a_queue would double-buffer.
@@ -223,19 +241,28 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 		if logActivity {
 			h.logA2AFailure(ctx, workspaceID, callerID, body, a2aMethod, err, durationMs)
 		}
+		// 2026-06-19 a2a RCA (#3056): distinguish "agent mid-turn, retry with
+		// backoff" from "agent dead, restart triggered" and "transport blip
+		// after a 2xx body" so monitoring doesn't count transient backpressure
+		// as a fleet outage. #4147 adds the fourth member of that family: the
+		// agent is RESTARTING (dial refused, container alive) — a settling
+		// window, not backpressure. Keeping them distinct is the whole point
+		// of the rule, so classify on which predicate actually matched.
+		classification := "busy_retryable"
+		errMsg := "workspace agent busy — retry after a short backoff"
+		if agentRestarting {
+			classification = classWorkspaceSettling
+			errMsg = "workspace agent restarting — retry after a short backoff"
+		}
 		return 0, nil, &proxyA2AError{
 			Status:  http.StatusServiceUnavailable,
 			Headers: map[string]string{"Retry-After": strconv.Itoa(busyRetryAfterSeconds)},
 			Response: gin.H{
-				"error":       "workspace agent busy — retry after a short backoff",
+				"error":       errMsg,
 				"busy":        true,
 				"retry_after": busyRetryAfterSeconds,
 			},
-			// 2026-06-19 a2a RCA (#3056): distinguish "agent mid-turn,
-			// retry with backoff" from "agent dead, restart triggered"
-			// and "transport blip after a 2xx body" so monitoring
-			// doesn't count transient backpressure as a fleet outage.
-			Classification: "busy_retryable",
+			Classification: classification,
 		}
 	}
 	if logActivity {
@@ -284,13 +311,13 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 //
 // #2929 hardening: do NOT recycle a recently-alive workspace on a single
 // transient A2A 503 / IsRunning flake. We guard the restart with:
-//   1. A widened self-fire guard that also covers the post-restart settle
-//      window (not just a restart currently in-flight).
-//   2. A re-probe delay after a lone IsRunning=false before trusting it.
-//   3. A recent-heartbeat / fresh-post-restart-heartbeat check. When
-//      transport-liveness is green we enqueue the request (202 queued)
-//      instead of clearing the workspace URL and restarting.
-//   4. Treat IsRunning transport errors as "assume alive" instead of dead.
+//  1. A widened self-fire guard that also covers the post-restart settle
+//     window (not just a restart currently in-flight).
+//  2. A re-probe delay after a lone IsRunning=false before trusting it.
+//  3. A recent-heartbeat / fresh-post-restart-heartbeat check. When
+//     transport-liveness is green we enqueue the request (202 queued)
+//     instead of clearing the workspace URL and restarting.
+//  4. Treat IsRunning transport errors as "assume alive" instead of dead.
 //
 // Returns (dead, httpStatus, responseBody). When httpStatus is non-zero the
 // caller must return that response directly (e.g., 202 Accepted queued).
@@ -1499,4 +1526,31 @@ func numericSizeFromAny(v interface{}) (int64, bool) {
 		return int64(n), true
 	}
 	return 0, false
+}
+
+// containerLivenessIsVerifiable reports whether maybeMarkContainerDead's
+// dead==false actually MEANS "the container is alive".
+//
+// In general it does NOT. maybeMarkContainerDead early-returns dead=false when
+// the runtime is external-like (the platform does not own that compute) and
+// when no provisioner is configured (it cannot look) — in both cases dead=false
+// means UNKNOWN, not alive.
+//
+// The #4147 restart branch must only fire on positive evidence: a refused dial
+// to a container we KNOW is up is an agent mid-restart (enqueue and drain). A
+// refused dial to a workspace whose liveness we cannot check may be a
+// permanently-dead agent, and queueing there would swallow the caller's message
+// forever instead of surfacing the honest 502.
+func (h *WorkspaceHandler) containerLivenessIsVerifiable(ctx context.Context, workspaceID string) bool {
+	if !h.HasProvisioner() {
+		return false
+	}
+	var wsRuntime string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(runtime, 'claude-code') FROM workspaces WHERE id = $1`,
+		workspaceID,
+	).Scan(&wsRuntime); err != nil {
+		return false
+	}
+	return !isExternalLikeRuntime(wsRuntime)
 }
