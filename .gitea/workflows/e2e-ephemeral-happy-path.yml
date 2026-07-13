@@ -34,12 +34,29 @@ name: E2E Ephemeral CP Happy Path
       - '.gitea/workflows/e2e-ephemeral-happy-path.yml'
 
 concurrency:
-  # Serialize on the shared docker-host runner (same reasoning as harness-replays):
-  # the ephemeral CP + tenant + per-run PG bind host resources; overlapping runs
-  # cross-wire. Queue, never cancel (a cancel mid-run would leak the namespace —
-  # the standing reaper would eventually collect it, but queueing is cleaner).
-  group: e2e-ephemeral-happy-path-runner
-  cancel-in-progress: false
+  # Keyed per-PR, like every sibling E2E lane. This was ONCE a global,
+  # unkeyed group ("e2e-ephemeral-happy-path-runner") because the pre-dind
+  # topology bound host resources and overlapping runs cross-wired. The dind
+  # (#4116) removed that constraint: each run gets its own nested daemon, its
+  # containers are namespaced by DIND_NS=<run_id>, and the dind's ports are
+  # published on EPHEMERAL host ports (-p 127.0.0.1::8080). Concurrent runs
+  # cannot collide, so the runner pool — not a workflow-level group — is the
+  # right place to bound parallelism.
+  #
+  # The global group was actively harmful (#4122): it was the only unkeyed
+  # group among the heavy E2E lanes, and its cross-PR queue is where the
+  # phantom jobs came from — a queue entry that never gets a runner, posts
+  # "Waiting to run" onto a context an EXECUTED job already resolved green,
+  # and then reds it as "Has been cancelled". That made the mc#4081 soak
+  # unconvergeable (a ghost can red a genuine pass) and, at volume, serialized
+  # every open PR into a multi-hour backlog on one slot.
+  #
+  # cancel-in-progress is now safe (it was not before): a superseded run's
+  # entire topology is one `docker rm -fv` of its dind, so a cancel cannot
+  # leak a half-torn-down namespace. A new push supersedes its own older run
+  # instead of queueing behind it (the RFC's finding-#2 shape).
+  group: e2e-ephemeral-happy-path-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
