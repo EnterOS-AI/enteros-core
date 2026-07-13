@@ -103,6 +103,84 @@ export function contentSimilarity(a: string, b: string): number {
   return inter / (sa.size + sb.size - inter);
 }
 
+/**
+ * The agent greetings that are NOT legitimate, over an ORDERED transcript.
+ *
+ * Counting "every agent bubble that looks like a greeting" is WRONG, and it was
+ * a real false RED (run 487714): a user who literally types "hi" a second time
+ * gets a perfectly correct conversational reply — "Hey! 👋 How can I help you
+ * today?" — which is short, bullet-free and starts with "Hey", so isPureGreeting
+ * classifies it as a greeting. Nothing is broken; the concierge answered the
+ * message it was sent. Because "My Chat" is one long-lived conversation, a naive
+ * count over the whole transcript then sees two "greetings" and fails.
+ *
+ * The two things that ARE the bug:
+ *   1. The SAME greeting comes back — the opening greeting rendered twice (a
+ *      client render/persistence race) or re-sent verbatim on a later turn.
+ *      Caught by similarity to the opening greeting.
+ *   2. The concierge GREETS INSTEAD OF ANSWERING — a greeting-shaped reply to a
+ *      SUBSTANTIVE user turn. This is the arm that actually catches the
+ *      missing-stable-contextId re-greet, which re-greets on EVERY turn and so
+ *      necessarily lands on a substantive one.
+ *
+ * So a later greeting is legitimate only when it is not a repeat of the opening
+ * greeting AND the user's own preceding turn was itself a greeting. The repeat
+ * check is applied FIRST, so a duplicated greeting is a violation even when the
+ * user did just say "hi".
+ *
+ * On the LIMITS of check 1 — do not overclaim it: contentSimilarity is Jaccard
+ * over token sets, and two SHORT greetings share almost no tokens, so a re-greet
+ * that is reworded rather than repeated scores far below the threshold ("Hey
+ * there! 👋 I'm the org concierge — your front door..." vs "Hey there! Welcome
+ * aboard — how can I help?" scores 0.03). Check 1 catches a REPEAT, not a
+ * reword. A reworded greeting in reply to a user's literal "hi" is therefore
+ * accepted — which is correct, because it is indistinguishable from a genuine
+ * answer. A reworded greeting on any substantive turn is still caught by
+ * check 2, which is what makes the re-greet bug detectable at all.
+ *
+ * @param opts.openingIsExpected  true (default) for a FULL transcript: the
+ *        first agent greeting is the expected opening one and is never
+ *        returned. Pass false for a WINDOWED transcript whose real opening
+ *        greeting lies outside the window — then the first greeting we see gets
+ *        no free pass and must justify itself like any other, so a re-greet
+ *        inside the window is not swallowed as "the opening".
+ */
+export function unexpectedGreetings(
+  messages: SimpleMessage[],
+  opts: { openingIsExpected?: boolean; threshold?: number } = {},
+): SimpleMessage[] {
+  const openingIsExpected = opts.openingIsExpected ?? true;
+  const threshold = opts.threshold ?? 0.7;
+  const bad: SimpleMessage[] = [];
+  // The first greeting seen doubles as the similarity anchor for later ones,
+  // whether or not it gets the "expected opening" free pass.
+  let anchor: SimpleMessage | null = null;
+  let lastUser: SimpleMessage | null = null;
+
+  for (const m of messages) {
+    if (m.role === "user") {
+      lastUser = m;
+      continue;
+    }
+    if (m.role !== "agent" || !isPureGreeting(m.content)) continue;
+
+    const isFirst = anchor === null;
+    if (isFirst) anchor = m;
+
+    // The opening greeting of a fresh chat is expected exactly once.
+    if (isFirst && openingIsExpected) continue;
+
+    // (1) the same greeting again — always a violation, even in reply to "hi".
+    if (!isFirst && contentSimilarity(anchor!.content, m.content) >= threshold) {
+      bad.push(m);
+      continue;
+    }
+    // (2) greeted instead of answering a substantive turn.
+    if (lastUser === null || !isPureGreeting(lastUser.content)) bad.push(m);
+  }
+  return bad;
+}
+
 /** Group messages by (role, normalized content) and return any content that
  *  appears more than once — the literal duplicate-message symptom. Trivial
  *  acks (< 3 normalized chars) are ignored so a genuine repeated "ok"/"hi"
@@ -155,11 +233,18 @@ export function checkConciergeInvariants(
       "NO_GREETING: the concierge never greeted — a fresh My Chat must open with exactly one greeting.",
     );
   }
-  // Invariant 2: no re-greet-every-turn. More than one bare greeting means the
-  // agent greeted again instead of answering — the exact re-greet symptom.
-  if (greetingCount > 1) {
+  // Invariant 2: no re-greet. A greeting after the opening one is a violation
+  // when it REPEATS the opening greeting, or when it answers a substantive user
+  // turn with a greeting. A greeting-shaped reply to a user who themselves just
+  // said "hi" is a correct answer, not a re-greet — see unexpectedGreetings.
+  // requireGreeting=false means "an arbitrary window", i.e. the real opening
+  // greeting may lie OUTSIDE it — so no greeting in the window gets the
+  // expected-opening free pass, or a re-greet would be swallowed as the opening.
+  const reGreets = unexpectedGreetings(messages, { openingIsExpected: requireGreeting });
+  if (reGreets.length > 0) {
+    const shown = reGreets.map((g) => `"${g.content.slice(0, 60)}"`).join("; ");
     violations.push(
-      `RE_GREET: ${greetingCount} greeting messages found (expected exactly 1). The concierge re-greeted instead of continuing the conversation — the missing-stable-contextId bug.`,
+      `RE_GREET: ${reGreets.length} unexpected greeting message(s) — the concierge repeated its greeting or greeted instead of answering (the missing-stable-contextId bug): ${shown}`,
     );
   }
 

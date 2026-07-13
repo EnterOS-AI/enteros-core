@@ -44,6 +44,7 @@ import { test, expect, type Page, type BrowserContext, type APIRequestContext } 
 import {
   checkConciergeInvariants,
   isPureGreeting,
+  unexpectedGreetings,
   findDuplicates,
   type SimpleMessage,
 } from "../src/lib/conciergeChatInvariants";
@@ -333,9 +334,17 @@ test.describe("concierge greeting — rendered My Chat (UI)", () => {
     // the store wouldn't show). Scoped to agent bubbles so an unrelated user
     // re-send can't false-fail the render check (the full role+content dedupe
     // is enforced deterministically by the stored-session spec).
+    // "My Chat" is ONE long-lived conversation, so this transcript also carries
+    // the earlier spec's turns. Counting every greeting-SHAPED agent bubble over
+    // it is wrong: the user types 'hi' here a second time, and the concierge's
+    // correct reply to that ("Hey! 👋 How can I help you today?") is short and
+    // starts with "Hey", so a naive count sees two greetings and false-REDs
+    // (run 487714). What must not happen is the GREETING ITSELF coming back —
+    // rendered twice, or re-sent instead of an answer. unexpectedGreetings is
+    // the SSOT for that distinction; it is order-aware over user turns.
     const rendered = await readRenderedBubbles(page);
     const agentBubbles = rendered.filter((m) => m.role === "agent");
-    const greetingBubbles = agentBubbles.filter((m) => isPureGreeting(m.content));
+    const reGreets = unexpectedGreetings(rendered);
     const agentDuplicates = findDuplicates(agentBubbles);
     const dump = JSON.stringify(
       rendered.map((m) => ({ role: m.role, content: m.content.slice(0, 80) })),
@@ -343,11 +352,11 @@ test.describe("concierge greeting — rendered My Chat (UI)", () => {
       2,
     );
     expect(
-      greetingBubbles.length,
-      `expected EXACTLY ONE rendered greeting bubble, got ${greetingBubbles.length} — a ` +
-        `doubled greeting is the bug this guards.\ngreetings: ${JSON.stringify(greetingBubbles)}\n` +
-        `rendered: ${dump}`,
-    ).toBe(1);
+      reGreets.length,
+      `the concierge greeting came back ${reGreets.length} extra time(s) — it was either ` +
+        `rendered twice or re-sent instead of an answer, the bug this guards.\n` +
+        `unexpected: ${JSON.stringify(reGreets)}\nrendered: ${dump}`,
+    ).toBe(0);
     expect(
       agentDuplicates.length,
       `a duplicate AGENT bubble rendered (same content twice): ` +

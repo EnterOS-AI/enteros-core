@@ -12,6 +12,8 @@ import {
   checkConciergeInvariants,
   isPureGreeting,
   isReGreet,
+  unexpectedGreetings,
+  contentSimilarity,
   findDuplicates,
   type SimpleMessage,
 } from "../conciergeChatInvariants";
@@ -44,6 +46,109 @@ describe("isPureGreeting", () => {
     expect(isPureGreeting(CAPABILITY_ANSWER)).toBe(false); // long + bullet list
     expect(isPureGreeting(SIGNOFF_ANSWER)).toBe(false); // help offer is a sign-off, not an opener
     expect(isPureGreeting("Sam! You just told me a minute ago. 😄")).toBe(false);
+  });
+});
+
+// The transcript that FALSE-REDDED the Canvas tabs E2E on main (run 487714).
+// "My Chat" is one long-lived conversation, so by the time the render spec runs
+// it already carries the previous spec's turns. The user types 'hi' a SECOND
+// time and the concierge answers it correctly — a short reply that happens to
+// open with "Hey". Counting greeting-SHAPED bubbles saw two greetings and
+// failed; nothing was actually wrong.
+const REPLY_TO_A_SECOND_HI = "Hey! 👋 How can I help you today?";
+const ACCUMULATED_MY_CHAT: SimpleMessage[] = [
+  { role: "user", content: "hi" },
+  { role: "agent", content: GREETING },
+  { role: "user", content: "what can you do?" },
+  { role: "agent", content: CAPABILITY_ANSWER },
+  { role: "user", content: "hi" },
+  { role: "agent", content: REPLY_TO_A_SECOND_HI },
+];
+
+describe("unexpectedGreetings — a greeting-shaped ANSWER is not a re-greet", () => {
+  it("does not flag the concierge answering a user who literally said 'hi' again", () => {
+    // The regression: this exact transcript must be CLEAN.
+    expect(unexpectedGreetings(ACCUMULATED_MY_CHAT)).toEqual([]);
+    expect(checkConciergeInvariants(ACCUMULATED_MY_CHAT).ok).toBe(true);
+    // ...and it is only clean because of the user turn — not because the reply
+    // stopped looking like a greeting. Guard that the premise still holds.
+    expect(isPureGreeting(REPLY_TO_A_SECOND_HI)).toBe(true);
+  });
+
+  it("STILL flags the same greeting coming back — even in reply to a user's 'hi'", () => {
+    // The duplicate-render / re-greet bug: the OPENING greeting itself returns.
+    // A preceding user 'hi' must NOT excuse it — the repeat check comes first.
+    const bug: SimpleMessage[] = [
+      ...ACCUMULATED_MY_CHAT.slice(0, 4),
+      { role: "user", content: "hi" },
+      { role: "agent", content: GREETING },
+    ];
+    expect(unexpectedGreetings(bug)).toHaveLength(1);
+    expect(checkConciergeInvariants(bug).ok).toBe(false);
+  });
+
+  it("STILL flags greeting instead of ANSWERING a substantive question", () => {
+    const bug: SimpleMessage[] = [
+      { role: "user", content: "hi" },
+      { role: "agent", content: GREETING },
+      { role: "user", content: "list my workspaces" },
+      { role: "agent", content: "Hi! 👋 What would you like to do?" },
+    ];
+    expect(unexpectedGreetings(bug)).toHaveLength(1);
+    expect(checkConciergeInvariants(bug).ok).toBe(false);
+  });
+
+  it("STILL flags the greeting rendered twice back-to-back (no user turn between)", () => {
+    const bug: SimpleMessage[] = [
+      { role: "user", content: "hi" },
+      { role: "agent", content: GREETING },
+      { role: "agent", content: GREETING },
+    ];
+    expect(unexpectedGreetings(bug)).toHaveLength(1);
+  });
+
+  // The similarity check catches a REPEAT, not a REWORD — pin that limit
+  // honestly rather than claiming a guarantee the code does not provide.
+  // Jaccard over token sets is near-zero for two short greetings.
+  it("similarity does NOT catch a REWORDED greeting (a repeat check, not a reword check)", () => {
+    const reworded = "Hey there! Welcome aboard — how can I help?";
+    expect(contentSimilarity(GREETING, reworded)).toBeLessThan(0.7);
+    // ...so after a user's literal 'hi' it is accepted — correct, because it is
+    // indistinguishable from a genuine answer.
+    expect(
+      unexpectedGreetings([
+        { role: "user", content: "hi" },
+        { role: "agent", content: GREETING },
+        { role: "user", content: "hi" },
+        { role: "agent", content: reworded },
+      ]),
+    ).toEqual([]);
+    // ...but on a SUBSTANTIVE turn it is still caught by check (2). This is the
+    // arm that makes the missing-stable-contextId re-greet detectable, since
+    // that bug re-greets on EVERY turn and so necessarily lands on one.
+    expect(
+      unexpectedGreetings([
+        { role: "user", content: "hi" },
+        { role: "agent", content: GREETING },
+        { role: "user", content: "list my workspaces" },
+        { role: "agent", content: reworded },
+      ]),
+    ).toHaveLength(1);
+  });
+
+  // A WINDOWED transcript's real opening greeting lies outside the window, so
+  // the first greeting in it must NOT get the expected-opening free pass — or a
+  // genuine re-greet would be swallowed as "the opening".
+  it("windowed transcript (requireGreeting:false): a re-greet is not swallowed as the opening", () => {
+    const window: SimpleMessage[] = [
+      { role: "user", content: "list my workspaces" },
+      { role: "agent", content: "Hello! What would you like to do?" },
+    ];
+    // Full-transcript semantics would treat that as the expected opening.
+    expect(unexpectedGreetings(window)).toEqual([]);
+    // Windowed semantics must flag it — it greeted instead of answering.
+    expect(unexpectedGreetings(window, { openingIsExpected: false })).toHaveLength(1);
+    expect(checkConciergeInvariants(window, { requireGreeting: false }).ok).toBe(false);
   });
 });
 
