@@ -218,6 +218,7 @@ func TestWorkspaceUpdate_ParentID(t *testing.T) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: "dddddddd-0001-0000-0000-000000000000"}}
+	c.Set("caller_credential_class", "admin-token")
 	body := `{"parent_id":"dddddddd-0002-0000-0000-000000000000"}`
 	c.Request = httptest.NewRequest("PATCH", "/workspaces/ws-child", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")

@@ -37,6 +37,7 @@ func newPatchContext(t *testing.T, id, body string) (*gin.Context, *httptest.Res
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: id}}
+	c.Set("caller_credential_class", "admin-token")
 	req := httptest.NewRequest("PATCH", "/workspaces/"+id, bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	c.Request = req

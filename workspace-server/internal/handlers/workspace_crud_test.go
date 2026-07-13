@@ -35,6 +35,12 @@ func setupWorkspaceCrudTest(t *testing.T) (sqlmock.Sqlmock, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
 	mock := setupTestDB(t)
 	r := gin.New()
+	// Handler tests bypass WorkspaceAuth. Model an ADMIN_TOKEN-authenticated
+	// request so infrastructure PATCH cases exercise their intended behavior.
+	r.Use(func(c *gin.Context) {
+		c.Set("caller_credential_class", "admin-token")
+		c.Next()
+	})
 	return mock, r
 }
 
