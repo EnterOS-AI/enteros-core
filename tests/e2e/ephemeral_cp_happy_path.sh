@@ -418,7 +418,149 @@ run_scenario() {
 # otherwise tears the CP down (all mode) and leaves nothing to inspect. The CP
 # is molecule-cp-${NS}; the local-docker provisioner launches tenants onto
 # mol-net-${NS}, so a network filter catches them (or reveals none were launched).
+
+# ── tenant log collector ───────────────────────────────────────────────────
+# WHY THIS EXISTS, and why dump_diagnostics alone was not enough.
+#
+# dump_diagnostics used to read tenant logs with `docker logs` at failure time.
+# It captured ZERO tenant log lines on precisely the failures that needed them,
+# because the tenant container was already GONE by then: test_staging_full_saas.sh
+# tears the ORG down as soon as a step fails ("Tearing down org …" → CP
+# `admin delete-tenant` → the tenant container is removed) and only THEN returns
+# non-zero to us. The CP log tail in the dump literally showed `admin
+# delete-tenant … completed` ABOVE the (empty) tenant section.
+#
+# So the gate destroyed its own evidence. A tenant that provisions but never
+# becomes ready ("local-docker concierge: tenant … not ready", org stuck at
+# status=provisioning to the timeout) reported THAT it failed while making it
+# structurally impossible to see WHY — it forced a CP regression to be reverted
+# on timeline evidence alone (2026-07-13) rather than read.
+#
+# Reordering the teardown would be fragile: the teardown lives in the INNER
+# script, and any future caller that tears down on its own reintroduces the bug.
+# Instead, FOLLOW each tenant's logs into a file from the moment the container
+# appears. `docker logs -f` keeps streaming until the container dies, and the
+# file outlives the container — so the log survives no matter who tears down
+# first, or in what order.
+TENANT_LOG_DIR=""
+COLLECTOR_PID=""
+COLLECTOR_RAN=""   # set once a collector is actually launched — see dump_diagnostics
+
+start_tenant_log_collector() {
+  TENANT_LOG_DIR="$(mktemp -d 2>/dev/null)" || {
+    # Do NOT fail the run for this — but say so loudly, because a silent failure
+    # here is indistinguishable, in the dump, from "no tenant was ever created",
+    # and that ambiguity is the exact thing this collector exists to remove.
+    TENANT_LOG_DIR=""
+    echo "[proof] ⚠ mktemp -d failed — tenant logs will NOT be captured this run." >&2
+    return 0
+  }
+  (
+    # Poll for tenant/workspace containers belonging to THIS run and attach a
+    # follower to each exactly once. Scoping is identical to the dump below:
+    # `since=` our own CP (so leaked containers from other runs on this shared
+    # runner can't pollute us) intersected with the provisioner name shapes,
+    # plus anything on our leg network.
+    while :; do
+      for c in $( { docker ps -a --filter "since=molecule-cp-${NS}" --format '{{.Names}}' 2>/dev/null | grep -E '^mol-tenant-|^ws-|^mol-ws-' ;
+                    docker ps -a --filter "network=mol-net-${NS}" --format '{{.Names}}' 2>/dev/null ; } | sort -u ); do
+        case "$c" in "molecule-cp-${NS}"|"pg-${NS}"|"") continue ;; esac
+        [ -e "${TENANT_LOG_DIR}/${c}.following" ] && continue
+        # `docker ps -a` also lists containers in CREATED state — and `docker
+        # logs -f` on one of those returns IMMEDIATELY with zero bytes rather
+        # than waiting for it to start. Marking such a container as followed
+        # would pin an empty file for the rest of the run and reproduce exactly
+        # the bug this collector fixes: a confident "FULL log" header over
+        # nothing. Wait for it to leave `created`; we re-poll every second.
+        case "$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null)" in
+          ""|created) continue ;;
+        esac
+        : > "${TENANT_LOG_DIR}/${c}.following"
+        # -f streams until the container dies; the file keeps the output after
+        # the container is removed. This is the whole point.
+        docker logs -f --timestamps "$c" >"${TENANT_LOG_DIR}/${c}.log" 2>&1 &
+        # Record the follower's PID so stop_tenant_log_collector can reap it.
+        # Job control is off in a non-interactive shell, so the followers are
+        # NOT in their own process group — `kill -- -PID` would not reach them.
+        echo "$!" >>"${TENANT_LOG_DIR}/followers.pids"
+      done
+      sleep 1
+    done
+    # stderr → a file, not /dev/null: if docker itself is unreachable from the
+    # collector, that must show up in the dump instead of masquerading as "no
+    # tenant was ever created".
+  ) >/dev/null 2>"${TENANT_LOG_DIR}/collector.err" &
+  COLLECTOR_PID=$!
+  COLLECTOR_RAN=1
+  # Record the dir in the reattach state so a LATER `$0 down` — a different
+  # shell, which never saw this variable — can still delete it. Without this, a
+  # `scenario` run that dies before its trap orphans a /tmp dir of tenant logs.
+  # Rewrite rather than append: repeated `scenario` runs share one state file.
+  if [ -f "$STATE_FILE" ]; then
+    grep -v '^TENANT_LOG_DIR=' "$STATE_FILE" >"${STATE_FILE}.tmp" 2>/dev/null || true
+    echo "TENANT_LOG_DIR=${TENANT_LOG_DIR}" >>"${STATE_FILE}.tmp"
+    mv "${STATE_FILE}.tmp" "$STATE_FILE" 2>/dev/null || rm -f "${STATE_FILE}.tmp"
+    chmod 600 "$STATE_FILE" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# A follower is `docker logs -f`. PIDs in followers.pids are append-only and a
+# dead follower's PID is recyclable, so NEVER kill one blind — on a long run in
+# a small PID namespace that lands on an unrelated process (plausibly the very
+# `pr-ephemeral-cp.sh down` teardown is about to run).
+_is_live_follower() {
+  local p="$1"
+  [ -n "$p" ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  case "$(ps -o comm= -p "$p" 2>/dev/null)" in
+    *docker*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+stop_tenant_log_collector() {
+  [ -n "$COLLECTOR_PID" ] && { kill "$COLLECTOR_PID" 2>/dev/null || true; wait "$COLLECTOR_PID" 2>/dev/null || true; }
+  COLLECTOR_PID=""
+  # Reap the `docker logs -f` followers the collector spawned. They exit on
+  # their own once their container dies, but a still-running tenant would leave
+  # one attached — kill them so the files are complete and nothing lingers.
+  if [ -n "$TENANT_LOG_DIR" ] && [ -f "${TENANT_LOG_DIR}/followers.pids" ]; then
+    local p killed=""
+    while read -r p; do
+      _is_live_follower "$p" || continue
+      kill "$p" 2>/dev/null || true
+      killed="${killed} ${p}"
+    done <"${TENANT_LOG_DIR}/followers.pids"
+    # They are children of the (now dead) subshell, not of us, so `wait` can't
+    # see them. Poll until they're gone — otherwise dump_diagnostics reads the
+    # files microseconds after SIGTERM and can lose the last partial line.
+    local spins=0 alive=1
+    while [ -n "$killed" ] && [ "$alive" -eq 1 ] && [ "$spins" -lt 30 ]; do
+      alive=0
+      for p in $killed; do kill -0 "$p" 2>/dev/null && alive=1; done
+      [ "$alive" -eq 1 ] && sleep 0.1
+      spins=$((spins + 1))
+    done
+    rm -f "${TENANT_LOG_DIR}/followers.pids"
+  fi
+}
+
+# Remove the captured logs. KEEP_UP means "I want to poke at this run" — so keep
+# them, and say where they are, rather than deleting the evidence under the user.
+cleanup_tenant_log_dir() {
+  [ -n "$TENANT_LOG_DIR" ] || return 0
+  if [ -n "${KEEP_UP:-}" ]; then
+    echo "[proof]    captured tenant logs: ${TENANT_LOG_DIR}  (removed by '$0 down')" >&2
+    return 0
+  fi
+  rm -rf "$TENANT_LOG_DIR" 2>/dev/null || true
+  TENANT_LOG_DIR=""
+}
+
 dump_diagnostics() {
+  # Stop following first, so every follower has flushed before we read.
+  stop_tenant_log_collector
   echo "── DIAGNOSTIC BURST (ephemeral CP ${NS}) ─────────────────────────────" >&2
   echo "[diag] HOST-WIDE container listing (context only — may include LEAKED" >&2
   echo "[diag] containers from other runs on this shared runner; logs below are" >&2
@@ -427,31 +569,71 @@ dump_diagnostics() {
   echo "[diag] CP logs (molecule-cp-${NS}, tail 200):" >&2
   docker logs --tail 200 "molecule-cp-${NS}" 2>&1 | sed 's/^/  cp| /' >&2 \
     || echo "  (no CP container molecule-cp-${NS})" >&2
-  # Tenant/workspace containers — scoped to THIS RUN. The old name-only grep
-  # (mol-tenant-*/ws-*) assumed "concurrency is serialized so these are ours";
-  # FALSE on a shared runner: cancelled/crashed past runs leak crash-looping
-  # containers whose logs then pollute the dump (a stale ws-* box's
-  # FileNotFoundError misdirected a real RCA on 2026-07-12). Scope with docker's
-  # `since=` filter — only containers created AFTER our own CP container exists
-  # (the CP is the first thing `up` creates, and it provisions everything else)
-  # — intersected with the provisioner name shapes, plus anything explicitly on
-  # our leg network.
-  local c
-  for c in $( { docker ps -a --filter "since=molecule-cp-${NS}" --format '{{.Names}}' 2>/dev/null | grep -E '^mol-tenant-|^ws-|^mol-ws-' ;
-               docker ps -a --filter "network=mol-net-${NS}" --format '{{.Names}}' 2>/dev/null ; } | sort -u); do
-    case "$c" in "molecule-cp-${NS}"|"pg-${NS}") continue ;; esac
-    echo "[diag] tenant/workspace container ${c} logs (tail 200, created after our CP):" >&2
-    docker logs --tail 200 "$c" 2>&1 | sed "s/^/  ${c}| /" >&2 || true
-  done
+
+  # Tenant/workspace logs — read from the COLLECTOR'S FILES, not from `docker
+  # logs`. The containers are typically already deleted by the inner script's
+  # org teardown; the files are what survive.
+  local n=0 f c lines
+  if [ -n "$TENANT_LOG_DIR" ] && [ -d "$TENANT_LOG_DIR" ]; then
+    for f in "$TENANT_LOG_DIR"/*.log; do
+      [ -e "$f" ] || continue
+      c="$(basename "$f" .log)"
+      n=$((n + 1))
+      lines="$(wc -l <"$f" 2>/dev/null | tr -d ' ')"; lines="${lines:-0}"
+      # Cap the emission. A tenant crash-looping for the full provision timeout
+      # can run to tens of thousands of lines, and burying the CI log is its own
+      # kind of losing the evidence. Head AND tail: boot failures show up at the
+      # top, give-up failures at the bottom.
+      if [ "$lines" -le 800 ]; then
+        echo "[diag] tenant/workspace container ${c} — FULL log (${lines} lines), streamed from creation" >&2
+        echo "[diag]   (captured live; the container itself is usually already torn down)" >&2
+        sed "s/^/  ${c}| /" "$f" >&2 || true
+      else
+        echo "[diag] tenant/workspace container ${c} — ${lines} lines, streamed from creation" >&2
+        echo "[diag]   (captured live; showing the first 200 and last 600 lines)" >&2
+        head -n 200 "$f" | sed "s/^/  ${c}| /" >&2 || true
+        echo "  ${c}| ……… $((lines - 800)) lines elided ………" >&2
+        tail -n 600 "$f" | sed "s/^/  ${c}| /" >&2 || true
+      fi
+    done
+    if [ -s "${TENANT_LOG_DIR}/collector.err" ]; then
+      echo "[diag] the log collector itself reported errors:" >&2
+      sed 's/^/  collector| /' "${TENANT_LOG_DIR}/collector.err" >&2 || true
+    fi
+  fi
+  if [ "$n" -eq 0 ]; then
+    if [ -z "$COLLECTOR_RAN" ]; then
+      # Do NOT claim an RCA we cannot support. No collector ran, so we have no
+      # evidence either way — saying "provisioning failed before any tenant" here
+      # would be a fabricated finding, which is worse than an honest gap.
+      echo "[diag] NO tenant logs were captured — THE COLLECTOR NEVER RAN (see the ⚠ above)." >&2
+      echo "[diag] This says NOTHING about whether a tenant was created. Do not read it as a cause." >&2
+    else
+      echo "[diag] NO tenant/workspace container was ever observed for this run." >&2
+      echo "[diag] The collector polled for the whole run and saw none, so this is most" >&2
+      echo "[diag] likely the finding itself: provisioning failed BEFORE any tenant" >&2
+      echo "[diag] container was created — look at the CP logs above, not at a tenant." >&2
+      echo "[diag] (Caveat: a container created AND removed inside a single 1s poll gap" >&2
+      echo "[diag]  would also be missed. Check the CP log for a create it then rolled back.)" >&2
+    fi
+  fi
   echo "── END DIAGNOSTIC BURST ──────────────────────────────────────────────" >&2
 }
 
 teardown() {
   echo "[proof] tearing down ephemeral CP namespace ${NS}..." >&2
+  # Idempotent: dump_diagnostics already stopped it on the failure path.
+  stop_tenant_log_collector
   if [ -n "${CP_EPHEMERAL_SCRIPT:-}" ] && [ -x "${CP_EPHEMERAL_SCRIPT:-}" ]; then
     "$CP_EPHEMERAL_SCRIPT" down --ns "$NS" >/dev/null 2>&1 || echo "[proof] (down non-zero — the standing reaper will collect it)" >&2
   fi
   if [ -n "${PG_CTR:-}" ]; then docker rm -f "$PG_CTR" >/dev/null 2>&1 || true; fi
+  # KEEP_UP is never set on the teardown path (`all` skips teardown entirely
+  # under it), and `down` is the explicit "I'm finished" verb — so drop the
+  # logs unconditionally here, including a dir a previous `scenario` recorded
+  # in the state file and could not clean up from its own shell.
+  [ -n "$TENANT_LOG_DIR" ] && rm -rf "$TENANT_LOG_DIR" 2>/dev/null || true
+  TENANT_LOG_DIR=""
   rm -f "$STATE_FILE" 2>/dev/null || true
 }
 
@@ -471,16 +653,23 @@ case "$CMD" in
   all)
     require_boot_env
     seed_workspace_image
-    trap 'rc=$?; if [ -n "${KEEP_UP:-}" ]; then print_reattach; else teardown; fi; exit "$rc"' EXIT INT TERM
+    trap 'rc=$?; stop_tenant_log_collector; if [ -n "${KEEP_UP:-}" ]; then print_reattach; cleanup_tenant_log_dir; else teardown; fi; exit "$rc"' EXIT INT TERM
     start_pg
     boot_cp
     write_state    # so `KEEP_UP=1 … all` (or a mid-run peek) can attach a scenario
+    # Follow tenant logs from BEFORE the first tenant exists. run_scenario may
+    # delete the tenant within seconds of a failure, so there is no later point
+    # at which we could still read it. NOT started in `boot` mode: that leaves
+    # the CP up and exits, which would orphan the collector.
+    start_tenant_log_collector
     run_scenario; rc=$?
     if [ "$rc" -eq 0 ]; then
       echo "[proof] ✅ core happy-path PASSED against an ephemeral CP — the SDK-owned-gate model holds with zero shared staging." >&2
     else
       echo "[proof] ❌ core happy-path FAILED (rc=$rc) against the ephemeral CP — read the full-saas output above for the failing step." >&2
-      dump_diagnostics   # CP + tenant logs BEFORE the trap tears the CP down
+      # CP logs live; tenant logs come from the collector's FILES — run_scenario
+      # has already deleted the tenant containers by the time we get here.
+      dump_diagnostics
     fi
     exit "$rc"   # trap tears down (or, with KEEP_UP=1, leaves it up + prints reattach)
     ;;
@@ -494,12 +683,22 @@ case "$CMD" in
     ;;
   scenario)
     load_state
+    # This trap is NOT optional. Bash makes an async command ignore SIGINT when
+    # job control is off, so without it a Ctrl-C on the (advertised, run-it-many-
+    # times) scenario loop kills this shell and leaves the collector polling
+    # `docker ps` once a second FOREVER, plus its followers. `down` cannot reap
+    # them — it's a different shell. The trap kills by PID, which does reach them.
+    trap 'rc=$?; stop_tenant_log_collector; cleanup_tenant_log_dir; exit "$rc"' EXIT INT TERM
+    # Same reason as in `all`: the tenant is deleted on failure before we regain
+    # control, so following must start BEFORE run_scenario, not after it fails.
+    start_tenant_log_collector
     run_scenario; rc=$?
     if [ "$rc" -eq 0 ]; then
+      stop_tenant_log_collector
       echo "[proof] ✅ scenario PASSED against standing CP ${CP_BASE_URL}." >&2
     else
       echo "[proof] ❌ scenario FAILED (rc=$rc) — the CP is still UP (${CP_BASE_URL}); fix and re-run '$0 scenario'." >&2
-      dump_diagnostics
+      dump_diagnostics   # stops the collector and prints the captured tenant logs
     fi
     exit "$rc"
     ;;
