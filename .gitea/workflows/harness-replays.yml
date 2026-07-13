@@ -50,20 +50,37 @@ name: Harness Replays
       - 'tests/harness/**'
       - '.gitea/workflows/harness-replays.yml'
 concurrency:
-  # SERIALIZE every harness run on the shared docker-host runner. The harness
-  # binds FIXED host ports (cf-proxy :8080, cp-stub :9090) and a FIXED compose
-  # project (`harness` → container names harness-tenant-alpha-1, ...). Two runs
-  # for DIFFERENT commits (a main-push + a PR, or two pushes) that overlap on the
-  # runner CROSS-WIRE: `docker compose up -d` reuses the other run's containers,
-  # so the replays hit a stale tenant binary — RCA 2026-07-12 (main run 477499):
-  # foreign /buildinfo git_sha 054c6167, org-swapped TenantGuard (alpha creds 404
-  # at alpha but 200 at beta), empty /workspaces. Per-SHA grouping (the prior
-  # value) did NOT prevent this — it only dedupes re-runs of the SAME commit.
-  # A single runner-wide group makes overlapping runs QUEUE instead of collide.
-  # cancel-in-progress stays false: cancelling mid-run would kill a boot and leak
-  # the KEEP_UP containers (that cancellation was the 2026-04-28 auto-promote
-  # deadlock this file guarded against — queueing, not cancelling, is safe).
-  group: harness-replays-runner
+  # Keyed per-PR. This was a single runner-wide group ("harness-replays-runner")
+  # because the harness bound FIXED host ports (cf-proxy :8080, cp-stub :9090)
+  # and a FIXED compose project (`harness` → harness-tenant-alpha-1, ...), so two
+  # overlapping runs CROSS-WIRED: `docker compose up -d` reused the other run's
+  # containers and the replays hit a stale tenant binary — RCA 2026-07-12 (main
+  # run 477499): foreign /buildinfo git_sha, org-swapped TenantGuard, empty
+  # /workspaces. Per-SHA grouping did not prevent that, so the group was widened
+  # to runner-wide.
+  #
+  # The per-job dind (the "Start disposable dind" step below, task #78) removed
+  # that constraint — its own comment says so: the whole harness stack now runs
+  # inside a throwaway daemon "so ... two concurrent runs can't collide on the
+  # fixed compose project/ports". The fixed :8080/:9090 are now INSIDE the dind;
+  # dind.sh publishes them on EPHEMERAL host ports (-p 127.0.0.1::8080) and
+  # namespaces the dind itself per run (NS defaults to GITHUB_RUN_ID-GITHUB_JOB).
+  # Concurrent runs cannot collide on a port or a container name any more, so the
+  # runner-wide group is obsolete — and it is actively harmful (#4122).
+  #
+  # #4122: a global, unkeyed group is where the phantom jobs come from. Observed
+  # on this very workflow (run 485591, jobs 706309/706310): cancelled with
+  # runner="-" and started_at=1970-01-01 — queue entries that NEVER executed, yet
+  # they post `failure — Has been cancelled` and red the PR. The ephemeral gate
+  # had the identical shape and the identical symptom; keying it per-PR (#4146)
+  # fixed it. This is the second and last PR-triggered, docker-host, unkeyed group
+  # in the repo.
+  #
+  # cancel-in-progress deliberately STAYS false (unlike #4146): cancelling mid-run
+  # could still kill a boot and leak the KEEP_UP containers — the 2026-04-28
+  # auto-promote deadlock this file guards against. Keying alone removes the
+  # CROSS-PR queue that mints the ghosts; same-PR runs still queue, which is safe.
+  group: harness-replays-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 env:
