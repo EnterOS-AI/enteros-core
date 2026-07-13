@@ -40,12 +40,85 @@ CANVAS_PID=$!
 # without that var ships, the sidecar simply doesn't start and the
 # tenant boots without memory — loud but recoverable, same posture as
 # any other required env missing.
+# >>> memory-sidecar-boot (extracted verbatim by entrypoint_tenant_memory_test.go
+# — keep these markers; the test drives THIS code, not a copy of it)
 MEMORY_PLUGIN_PID=""
-memory_plugin_wanted=""
-if [ -n "$MEMORY_PLUGIN_URL" ]; then
-  memory_plugin_wanted=1
+
+# ── ON BY DEFAULT (task #4114) ───────────────────────────────────────────────
+# The sidecar is BUNDLED IN THIS IMAGE and its address is a CONSTANT — loopback
+# :9100. Nothing about it is deployment-specific, so there is nothing for an
+# environment to configure. Requiring every provisioner to re-declare that
+# constant is drift by construction, and it drifted: the cloud user-data paths
+# set it (CP sharedTenantEnvLines -> bootstrap.go, guarded by a test across the
+# three rendered user-datas), while the local-docker provisioner never did. Those
+# tenants booted with NO memory sidecar, and since #1747 removed the silent
+# agent_memories SQL fallback, every memory call answers
+# 503 "memory plugin is not configured". That is the staging E2E red.
+#
+# Defaulting it HERE — in the one place that owns the sidecar — means no
+# provisioner, and no environment (staging included), has to know the constant.
+# The CP-side injections stay valid; they now just re-state the same value.
+#
+# Note the pgvector prerequisite is already satisfied on the paths that matter:
+# LocalDocker.pgImage() defaults to pgvector/pgvector:pg16, and prod/EC2 uses the
+# same. The 2026-05-05 "extension vector is not available" incident is handled by
+# the DEGRADE arm below, not by leaving memory off everywhere.
+MEMORY_PLUGIN_BUNDLED_URL="http://localhost:9100"
+if [ -z "$MEMORY_PLUGIN_URL" ]; then
+  MEMORY_PLUGIN_URL="$MEMORY_PLUGIN_BUNDLED_URL"
 fi
-if [ -z "$MEMORY_PLUGIN_DISABLE" ] && [ -n "$memory_plugin_wanted" ] && [ -n "$DATABASE_URL" ]; then
+export MEMORY_PLUGIN_URL
+
+# ── Which sidecar is this, and who owns its health? ──────────────────────────
+# BUNDLED (loopback URL): the plugin binary in THIS image, which we start below.
+# EXTERNAL (any other URL): a plugin the operator runs elsewhere — we must not
+# start a sidecar nobody dials, and must not touch their URL.
+#
+# Note what this is NOT keyed on: whether anyone SET MEMORY_PLUGIN_URL. That was
+# the first cut of this change and it was wrong. The control plane sets it on
+# EVERY cloud tenant already (controlplane tenant_container_env.go:46 and
+# ec2.go:2811 both emit MEMORY_PLUGIN_URL='http://localhost:9100'), so set-ness
+# carries no operator intent — it is this same constant, restated. Keying
+# fatal-vs-degrade on it would have made the DEGRADE arm below DEAD CODE on
+# precisely the fleet that motivated it: EC2/Hetzner/GCP is where the 2026-05-05
+# `extension "vector" is not available` crash-loop actually happened.
+memory_plugin_is_bundled=""
+case "$MEMORY_PLUGIN_URL" in
+  http://localhost:*|http://127.0.0.1:*|https://localhost:*|https://127.0.0.1:*)
+    memory_plugin_is_bundled=1 ;;
+esac
+
+# memory_plugin_off: make the platform see "not configured" rather than let it
+# dial a sidecar that is not there. /platform reads MEMORY_PLUGIN_URL at boot
+# (internal/memory/wiring.Build) — empty means the bundle is nil and the memory
+# endpoints answer a clean 503 with a clear reason, instead of failing on a
+# refused connection to :9100. Only ever called for a BUNDLED sidecar — blanking
+# an EXTERNAL url would silently disable an operator's own memory service.
+memory_plugin_off() {
+  MEMORY_PLUGIN_URL=""
+  export MEMORY_PLUGIN_URL
+  memory_plugin_is_bundled=""
+}
+
+# EXTERNAL is tested FIRST, before MEMORY_PLUGIN_DISABLE. MEMORY_PLUGIN_DISABLE
+# only ever means "do not start the BUNDLED sidecar" — when the URL points at an
+# external plugin there is no sidecar to skip, and blanking the URL would
+# silently disable the operator's own memory service. That combination is not
+# hypothetical: it is the DOCUMENTED way to run an external plugin (Dockerfile:
+# "Set MEMORY_PLUGIN_DISABLE=1 to force-skip the sidecar even with cutover env
+# set (e.g. running the plugin externally on a separate host)"). Testing DISABLE
+# first would violate the invariant stated on memory_plugin_off above.
+if [ -z "$memory_plugin_is_bundled" ]; then
+  echo "memory-plugin: MEMORY_PLUGIN_URL=$MEMORY_PLUGIN_URL is not loopback — treating it as an EXTERNAL plugin: no sidecar started, URL left untouched." >&2
+elif [ -n "$MEMORY_PLUGIN_DISABLE" ]; then
+  echo "memory-plugin: MEMORY_PLUGIN_DISABLE set — bundled sidecar skipped; memory endpoints will 503." >&2
+  memory_plugin_off
+elif [ -z "$DATABASE_URL" ]; then
+  echo "memory-plugin: DATABASE_URL is empty — sidecar skipped; memory endpoints will 503." >&2
+  memory_plugin_off
+fi
+
+if [ -n "$memory_plugin_is_bundled" ]; then
   # Schema isolation (issue #1733): when defaulting from the tenant
   # DATABASE_URL we co-locate the plugin's tables under a dedicated
   # `memory_plugin` schema so they never collide with platform-tenant
@@ -76,7 +149,9 @@ if [ -z "$MEMORY_PLUGIN_DISABLE" ] && [ -n "$memory_plugin_wanted" ] && [ -n "$D
   : "${MEMORY_PLUGIN_LISTEN_ADDR:=:9100}"
   export MEMORY_PLUGIN_DATABASE_URL MEMORY_PLUGIN_LISTEN_ADDR
   echo "memory-plugin: starting sidecar on $MEMORY_PLUGIN_LISTEN_ADDR" >&2
-  /memory-plugin &
+  # MEMORY_PLUGIN_BIN is an indirection for tests only (the regression test in
+  # entrypoint_tenant_memory_test.go points it at a stub). Prod is /memory-plugin.
+  "${MEMORY_PLUGIN_BIN:-/memory-plugin}" &
   MEMORY_PLUGIN_PID=$!
   # Wait up to 30s for /v1/health. Boot failure is fatal so a misconfigured
   # tenant crash-loops instead of silently serving cutover traffic against
@@ -106,13 +181,36 @@ req.on("timeout", () => { req.destroy(); process.exit(1); });
     sleep 1
   done
   if [ "$ready" != "1" ]; then
-    echo "memory-plugin: ❌ /v1/health never returned 200 after 30s — aborting boot. Check DATABASE_URL reachability + pgvector extension + migrations." >&2
+    # A sick sidecar is fatal only if someone SAID memory is required.
+    #
+    # MEMORY_PLUGIN_REQUIRED=1 — an operator declared memory load-bearing for
+    # this deployment, so a broken plugin must crash-loop rather than quietly
+    # serve without it.
+    #
+    # Otherwise — memory is on because WE turned it on, not because the tenant
+    # asked. Do not brick it: kill the sidecar, blank the URL so /platform
+    # reports a clean "not configured" 503, and boot. A tenant serving
+    # everything-but-memory beats a tenant that will not start at all. This is
+    # what makes on-by-default safe on a Postgres without pgvector (the
+    # 2026-05-05 `extension "vector" is not available` incident).
+    #
+    # The requirement is a SEPARATE flag on purpose: MEMORY_PLUGIN_URL cannot
+    # express it, because the CP already sets that URL on every cloud tenant (see
+    # above), so inferring "required" from it would fire on the whole fleet.
     kill "$MEMORY_PLUGIN_PID" 2>/dev/null || true
-    kill "$CANVAS_PID" 2>/dev/null || true
-    exit 1
+    MEMORY_PLUGIN_PID=""
+    if [ -n "${MEMORY_PLUGIN_REQUIRED:-}" ]; then
+      echo "memory-plugin: ❌ /v1/health never returned 200 after 30s and MEMORY_PLUGIN_REQUIRED is set — aborting boot. Check DATABASE_URL reachability + pgvector extension + migrations." >&2
+      kill "$CANVAS_PID" 2>/dev/null || true
+      exit 1
+    fi
+    echo "memory-plugin: ⚠️  /v1/health never returned 200 after 30s — DEGRADING: tenant boots WITHOUT memory and memory endpoints will 503. Check DATABASE_URL reachability + pgvector extension + migrations. (Set MEMORY_PLUGIN_REQUIRED=1 to make this fatal, or MEMORY_PLUGIN_DISABLE=1 to skip the sidecar entirely.)" >&2
+    memory_plugin_off
+  else
+    echo "memory-plugin: ✅ sidecar healthy on :$health_port" >&2
   fi
-  echo "memory-plugin: ✅ sidecar healthy on :$health_port" >&2
 fi
+# <<< memory-sidecar-boot
 
 # Start Go platform in foreground-ish (we trap signals)
 # CANVAS_PROXY_URL tells the platform to proxy unmatched routes to Canvas.

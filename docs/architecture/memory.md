@@ -53,7 +53,8 @@ It is useful for structured per-workspace state and optional TTL entries. It is 
 
 This is the production-direction backend, behind the RFC #2728 HTTP
 contract. The plugin runs as a sidecar on each tenant EC2 (auto-spawned
-by `entrypoint-tenant.sh` when `MEMORY_PLUGIN_URL` is set), owns its
+by `entrypoint-tenant.sh`, which defaults `MEMORY_PLUGIN_URL` to the
+bundled sidecar so no provisioner or environment has to set it), owns its
 own tables under the `memory_plugin` schema, and serves:
 
 - `POST /workspaces/:id/v2/memories` (canvas `MemoryInspectorPanel`)
