@@ -237,6 +237,39 @@ func isUpstreamBusyError(err error) bool {
 		strings.Contains(msg, "connection reset")
 }
 
+// isAgentConnectionDroppedError reports whether a forward-call failure is the
+// OTHER restart shape: the agent accepted the connection and then closed it
+// without replying, because the process was torn down mid-request.
+//
+// This is the same event as isAgentRestartingError — a restarting agent — seen a
+// few milliseconds earlier, before the listener finished going away. Callers must
+// treat the two identically (retryable settling, never enqueue); they are kept as
+// separate predicates only so the transport shape stays legible at the call site.
+//
+// Note the overlap with isUpstreamBusyError, which ALSO matches EOF/reset. That
+// overlap is why this exists: on its own, the busy classifier swallowed the EOF
+// restart shape and enqueued it into a heartbeat-gated drain that cannot fire
+// while the agent is coming up (staging run 487314). A genuinely busy agent does
+// NOT drop the connection — the runtime answers with a structured busy response
+// when its inbox is at capacity — so a dropped connection means the process went
+// away, not that it is working. The busy classifier keeps DeadlineExceeded and
+// Canceled, which are the real "alive but slow" shapes.
+//
+// The caller MUST still gate this on containerLivenessIsVerifiable: a dropped
+// connection from a container we cannot inspect is indistinguishable from a dead
+// agent, and there the honest 502 is correct.
+func isAgentConnectionDroppedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "connection reset")
+}
+
 // isAgentRestartingError reports whether a forward-call failure is a
 // DIAL-level refusal — nothing is listening on the agent port.
 //

@@ -172,7 +172,34 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 	// is configured (we cannot look) — there it means UNKNOWN. Firing the
 	// restart branch on "unknown" would silently queue messages to a
 	// permanently-dead agent forever instead of surfacing the honest 502.
-	agentRestarting := isAgentRestartingError(err) && h.containerLivenessIsVerifiable(ctx, workspaceID)
+	// A restart has TWO transport shapes, and which one the caller sees is a race
+	// with the agent's teardown:
+	//
+	//	listener already gone            -> dial refused        -> ECONNREFUSED
+	//	listener accepts, then the
+	//	process dies mid-request         -> connection closes   -> EOF / reset
+	//
+	// Both are the SAME event (the canonical trigger is a config.yaml PUT, which
+	// restarts the agent). #4175 barred the enqueue for the ECONNREFUSED shape
+	// only, so the EOF shape kept falling through to isUpstreamBusyError — which
+	// matches "EOF" and "connection reset" — and got ENQUEUED into a drain that is
+	// heartbeat-gated and therefore cannot fire while the agent is still coming up.
+	// That is staging run 487314 ("A2A parent queue poll timed out"), and it is why
+	// the identical code passed on run 487386: pure timing.
+	//
+	// Reclassifying EOF does NOT weaken real backpressure. A genuinely busy agent
+	// does not drop the connection — the runtime returns a structured busy
+	// RESPONSE when its inbox is at capacity (runtime_inbox.py: "caller should emit
+	// a busy backpressure response"). A closed connection means the process went
+	// away, not that it is working. Deadline/Canceled stay in the busy class, so a
+	// slow-but-alive turn still enqueues exactly as before.
+	//
+	// Both shapes remain gated on containerLivenessIsVerifiable: "not dead" must
+	// not be confused with "unknown". For an external-like runtime, or with no
+	// provisioner to ask, we cannot tell a restart from a corpse, and the honest
+	// 502 is still correct.
+	agentRestarting := (isAgentRestartingError(err) || isAgentConnectionDroppedError(err)) &&
+		h.containerLivenessIsVerifiable(ctx, workspaceID)
 	if isUpstreamBusyError(err) || agentRestarting {
 		// #1684 / Reno Stars: native_session adapters previously took a
 		// 503-no-enqueue path here, on the assumption that the SDK owned
