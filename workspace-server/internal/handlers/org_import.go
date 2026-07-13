@@ -772,6 +772,153 @@ skipProvision:
 	return h.recurseChildrenForImport(ws, id, absX, absY, defaults, orgBaseDir, results, provisionSem)
 }
 
+// topLevelImportSlot describes where one imported top-level workspace is
+// anchored: its parent (a pointer to the platform-agent id, or nil for the
+// no-concierge fallback) and its absolute + parent-relative canvas
+// coordinates. createWorkspaceTree consumes these exactly as it does for a
+// recursed child: parentID → workspaces.parent_id, absX/absY → canvas_layouts,
+// relX/relY → the broadcast payload's parent-relative x/y.
+type topLevelImportSlot struct {
+	parentID   *string
+	absX, absY float64
+	relX, relY float64
+}
+
+// planTopLevelImport decides how an org template's top-level workspaces are
+// anchored during /org/import.
+//
+// The org's platform agent (the concierge) IS the org root — the single
+// kind='platform' AND parent_id IS NULL row (see platform_agent.go +
+// org_scope.go, which walks the parent_id chain to that one NULL-parent root
+// to scope an org). When it is present, the imported top-level workspaces are
+// nested UNDER it as children: parent_id = the platform-agent id, positioned in
+// the SAME subtree-aware grid regular children use (childSlotInGrid over
+// sizeOfSubtree), relative to the platform agent's own canvas position. A
+// single shared *string is used for parentID across all top-level workspaces —
+// they all have the same parent — mirroring recurseChildrenForImport's
+// `&parentID` pattern.
+//
+// core#3510: the top-level loop previously always passed parent_id = nil, so an
+// imported org landed as SIBLINGS of the platform agent (each imported root
+// counted as its own org root under the parent_id-chain org scoping) instead of
+// a child subtree of the concierge.
+//
+// When the org has NO platform agent (an edge-case org provisioned without a
+// concierge) — or the lookup errors — it falls back to the historical behavior:
+// each top-level workspace stays at ROOT (parent_id NULL) at its own template
+// canvas coordinates. Imports on such orgs are never broken.
+func (h *OrgHandler) planTopLevelImport(ctx context.Context, roots []OrgWorkspace) []topLevelImportSlot {
+	slots := make([]topLevelImportSlot, len(roots))
+
+	platformID, platX, platY, hasPlatform := lookupPlatformAgentAnchor(ctx)
+	if !hasPlatform {
+		// Fallback: no concierge to nest under. Roots keep their YAML canvas
+		// coords and land at parent_id NULL (relX/relY == absX/absY, as a root
+		// has no parent to be relative to).
+		for i, ws := range roots {
+			slots[i] = topLevelImportSlot{
+				parentID: nil,
+				absX:     ws.Canvas.X, absY: ws.Canvas.Y,
+				relX: ws.Canvas.X, relY: ws.Canvas.Y,
+			}
+		}
+		return slots
+	}
+
+	// Nest under the platform agent. Position the imported roots in the same
+	// subtree-aware grid regular children use so a nested-parent root doesn't
+	// clip into its siblings.
+	siblingSizes := make([]nodeSize, len(roots))
+	for i, ws := range roots {
+		siblingSizes[i] = sizeOfSubtree(ws)
+	}
+	// One addressable copy shared by every top-level workspace (they share the
+	// single platform-agent parent) — same shape as recurseChildrenForImport.
+	pid := platformID
+	for i := range roots {
+		slotX, slotY := childSlotInGrid(i, siblingSizes)
+		slots[i] = topLevelImportSlot{
+			parentID: &pid,
+			// abs = platform-agent origin + grid slot; rel = the slot itself
+			// (parent-relative), exactly like childAbsX := absX + slotX with
+			// slotX/slotY as the relative coords in recurseChildrenForImport.
+			absX: platX + slotX, absY: platY + slotY,
+			relX: slotX, relY: slotY,
+		}
+	}
+	return slots
+}
+
+// lookupPlatformAgentAnchor returns the CALLER/import org's platform-agent root
+// id and its canvas position (x, y), or found=false when the org has no platform
+// agent to nest under.
+//
+// SCOPING (core#3510 review): the anchor is resolved deterministically by the
+// canonical PlatformAgentID() id — DeterministicPlatformAgentID(MOLECULE_ORG_ID)
+// on a CP-provisioned/SaaS tenant, else the fixed SelfHostedPlatformAgentID on
+// self-host/local. That is the SAME id every real install path seeds the
+// concierge under (ensurePlatformAgentFlow's derivedID := PlatformAgentID(), the
+// CP install, EnsureSelfHostedPlatformAgent), so it targets THIS org's concierge
+// precisely. A bare `WHERE kind='platform' AND parent_id IS NULL LIMIT 1` is
+// multi-root-unsafe: workspaces has no org_id on that predicate, so in a DB with
+// more than one platform/tenant root it could attach the imported org under an
+// ARBITRARY platform root rather than the caller's. `status != 'removed'` mirrors
+// the org-scope / defaultCreateParentID SSOT so a tombstoned concierge is never
+// used as an anchor.
+//
+// FALLBACK (historical): when the deterministic id doesn't resolve to a live
+// platform row — a legacy concierge seeded before the derived-id contract, or a
+// hand-migrated DB — we fall back to the structural single platform root
+// (kind='platform', parent_id NULL, not removed). A per-org tenant DB holds at
+// most one such row (uniq_workspaces_one_platform_root), so LIMIT 1 is
+// unambiguous there. If neither resolves (no concierge / any DB error) found is
+// false and the caller places the import at root — a transient DB hiccup or a
+// concierge-less org degrades to the historical behavior instead of breaking the
+// import.
+//
+// Canvas coordinates live on canvas_layouts (LEFT JOIN + COALESCE(..., 0) so a
+// platform agent without a layout row anchors the imported subtree at origin
+// rather than failing).
+func lookupPlatformAgentAnchor(ctx context.Context) (id string, x, y float64, found bool) {
+	// Primary: org-scoped by the deterministic PlatformAgentID() anchor.
+	if anchorID := PlatformAgentID(); anchorID != "" {
+		if gotID, gx, gy, ok := scanPlatformAnchor(ctx, `
+			SELECT w.id, COALESCE(cl.x, 0), COALESCE(cl.y, 0)
+			FROM workspaces w
+			LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
+			WHERE w.id = $1 AND w.kind = 'platform' AND w.status != 'removed'
+			LIMIT 1
+		`, anchorID); ok {
+			return gotID, gx, gy, true
+		}
+	}
+	// Fallback: the org's structural single platform root (historical behavior).
+	return scanPlatformAnchor(ctx, `
+		SELECT w.id, COALESCE(cl.x, 0), COALESCE(cl.y, 0)
+		FROM workspaces w
+		LEFT JOIN canvas_layouts cl ON cl.workspace_id = w.id
+		WHERE w.kind = 'platform' AND w.parent_id IS NULL AND w.status != 'removed'
+		LIMIT 1
+	`)
+}
+
+// scanPlatformAnchor runs a platform-agent anchor SELECT (id + COALESCE'd canvas
+// x,y) and returns found=false on sql.ErrNoRows AND on any query error, so a
+// transient DB hiccup degrades to the caller's root-placement fallback instead
+// of breaking the import. args carries the query's positional parameters (the
+// primary lookup passes the PlatformAgentID() anchor; the structural fallback
+// passes none).
+func scanPlatformAnchor(ctx context.Context, query string, args ...interface{}) (id string, x, y float64, found bool) {
+	err := db.DB.QueryRowContext(ctx, query, args...).Scan(&id, &x, &y)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("Org import: platform-agent anchor lookup failed: %v — falling back to root placement", err)
+		}
+		return "", 0, 0, false
+	}
+	return id, x, y, true
+}
+
 // migrateRuntimeSchedulesFromRemovedPredecessor re-points runtime-created
 // schedules (source='runtime') from the most-recent removed predecessor of the
 // same agent onto newID. Recreating an agent mints a NEW workspace id (the
