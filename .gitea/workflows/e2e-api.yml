@@ -362,29 +362,129 @@ jobs:
           # let the LIVE Slack-webhook send path + Telegram discover path target
           # the local mock upstreams that tests/e2e/test_channels_e2e.sh binds,
           # so the outbound serialize+POST is provable in CI (was unit-mock-only).
-          # Inert in prod/staging — those deploys never set these. The fixed
-          # loopback ports MUST match the script's E2E_CHANNELS_*_PORT defaults.
-          echo "MOLECULE_CHANNELS_TEST_WEBHOOK_BASE=http://127.0.0.1:18099/" >> "$GITHUB_ENV"
-          echo "MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE=http://127.0.0.1:18098" >> "$GITHUB_ENV"
-          echo "Channels test seam configured (webhook+telegram mock bases on fixed loopback ports)."
+          # Inert in prod/staging — those deploys never set these.
+          #
+          # The mock ports are PROBED, not fixed — see the "Pick ephemeral ports"
+          # step below, which probes them together with the platform's own port.
+          # They used to be hardcoded 18099/18098, which is a shared mutable
+          # resource on a shared runner: two concurrent jobs on this host-network
+          # act_runner both bound them and the loser died with `Errno 98 Address
+          # already in use` — a red that says nothing about the code under test.
+          echo "Admin token configured; channels mock bases are set by the port-probe step below."
       - name: Build platform
         if: needs.detect-changes.outputs.api == 'true'
         working-directory: workspace-server
         run: go build -o platform-server ./cmd/server
-      - name: Pick platform port
+      - name: Pick ephemeral ports (platform + channels mocks)
         if: needs.detect-changes.outputs.api == 'true'
         run: |
-          PLATFORM_PORT=$(python3 - <<'PY'
-          import socket
+          # Three ports: the platform's listener, and the two channels mock
+          # upstreams (Slack webhook + Telegram Bot API) that the LIVE send /
+          # discover paths are pointed at via the production-inert test seam.
+          #
+          # The two MOCK ports are NOT taken from bind(0). This is the subtle part.
+          #
+          # bind(0) draws from the kernel's EPHEMERAL range (ip_local_port_range,
+          # typically 32768-60999) — which is the SAME pool the kernel draws
+          # OUTBOUND SOURCE PORTS from. The platform binds its port seconds later,
+          # but the mocks are not bound until the channels step, MINUTES and six
+          # e2e suites later. In that window every loopback connection this job
+          # makes (platform→postgres, platform→redis, every curl in the preceding
+          # suites) can be assigned our reserved mock port as its source port —
+          # and a listener then CANNOT bind it: verified on Linux, an ESTABLISHED
+          # socket holding 127.0.0.1:P makes bind(P) fail EADDRINUSE, and
+          # SO_REUSEADDR does NOT relax that (it only relaxes TIME_WAIT). The mock
+          # would die with the very `Errno 98` this step exists to remove.
+          #
+          # The old fixed 18099/18098 were immune to that — they sit BELOW the
+          # ephemeral range. Their only flaw was being the SAME for every job.
+          # So keep what was right about them (below the ephemeral range, where no
+          # outbound source port and no other job's bind(0) can ever land) and fix
+          # what was wrong (make them unique per run). A run-derived offset into a
+          # low band, bind-tested for actual freeness.
+          #
+          # The band is ASSERTED to be below the live ip_local_port_range rather
+          # than assumed — a runner with a rewritten sysctl fails loudly here
+          # instead of flaking later.
+          #
+          # Both consumers get the ports from this one probe: the platform dials
+          # MOLECULE_CHANNELS_TEST_* (inherited from $GITHUB_ENV when it starts,
+          # two steps down); the script derives its bind ports FROM those same
+          # bases. They cannot drift.
+          #
+          # unset first: these are generic names, the step inherits the whole job
+          # env, and `eval "$(...)"` FAILS OPEN (if python dies, eval of an empty
+          # string returns 0). Without the unset, an inherited value would satisfy
+          # the guard below and we would silently proceed on a stale port.
+          unset PLATFORM_PORT WEBHOOK_PORT TELEGRAM_PORT
+          eval "$(python3 - <<'PY'
+          import os, socket, sys
 
-          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-              s.bind(("127.0.0.1", 0))
-              print(s.getsockname()[1])
+          # The mock band: below the ephemeral range on any sane Linux.
+          BAND_LO, BAND_HI = 18000, 19999
+          try:
+              lo, hi = (int(x) for x in
+                        open("/proc/sys/net/ipv4/ip_local_port_range").read().split())
+          except Exception:
+              lo, hi = 32768, 60999          # kernel default
+          if not (BAND_HI < lo or BAND_LO > hi):
+              sys.stderr.write(
+                  f"mock port band {BAND_LO}-{BAND_HI} OVERLAPS the ephemeral range "
+                  f"{lo}-{hi}; an outbound source port could steal a mock port\n")
+              sys.exit(1)
+
+          def hold(port):
+              """Bind and HOLD the port; None if it is not actually free."""
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              try:
+                  s.bind(("127.0.0.1", port))
+              except OSError:
+                  s.close()
+                  return None
+              return s
+
+          # Run-derived start offset: two concurrent jobs begin their scan at
+          # different places, so they do not race for the same slot.
+          run = int(os.environ.get("GITHUB_RUN_ID") or 0) * 31 \
+              + int(os.environ.get("GITHUB_RUN_ATTEMPT") or 1)
+          span = BAND_HI - BAND_LO + 1
+
+          socks, ports = [], []
+          for i in range(span):
+              s = hold(BAND_LO + (run + i) % span)
+              if s is not None:
+                  socks.append(s)
+                  ports.append(s.getsockname()[1])
+                  if len(ports) == 2:
+                      break
+          if len(ports) < 2:
+              sys.stderr.write(f"no free port pair in {BAND_LO}-{BAND_HI}\n")
+              sys.exit(1)
+
+          # The platform's port stays ephemeral: it binds within seconds, and a
+          # band disjoint from the mocks' means the two can never collide.
+          plat = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          plat.bind(("127.0.0.1", 0))
+          print(f"PLATFORM_PORT={plat.getsockname()[1]}")
+          print(f"WEBHOOK_PORT={ports[0]}")
+          print(f"TELEGRAM_PORT={ports[1]}")
+          for s in socks + [plat]:            # released only once all are known
+              s.close()
           PY
-          )
+          )"
+          for v in PLATFORM_PORT WEBHOOK_PORT TELEGRAM_PORT; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] || { echo "::error::port probe failed — $v is empty (see the probe's stderr above)"; exit 1; }
+          done
           echo "PORT=${PLATFORM_PORT}" >> "$GITHUB_ENV"
           echo "BASE=http://127.0.0.1:${PLATFORM_PORT}" >> "$GITHUB_ENV"
-          echo "Platform host port: ${PLATFORM_PORT}"
+          # Channels e2e test seam (core#2332 P1.10) — inert in prod/staging, which
+          # never set these. These bases are the SINGLE source of truth for the mock
+          # ports: the script parses its bind ports out of them rather than being
+          # told the ports separately, so there is no second copy to drift.
+          echo "MOLECULE_CHANNELS_TEST_WEBHOOK_BASE=http://127.0.0.1:${WEBHOOK_PORT}/" >> "$GITHUB_ENV"
+          echo "MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE=http://127.0.0.1:${TELEGRAM_PORT}" >> "$GITHUB_ENV"
+          echo "Ports — platform: ${PLATFORM_PORT} (ephemeral), channels mocks: ${WEBHOOK_PORT}/${TELEGRAM_PORT} (reserved band)"
       - name: Kill stale platform-server before start (issue #1046)
         if: needs.detect-changes.outputs.api == 'true'
         run: |
@@ -519,7 +619,8 @@ jobs:
         # ?purge=true removes the target's durable child data while a sibling
         # survives. E2E_REQUIRE_LIVE=1 ⇒ a missing/regressed seam is RED, not a
         # silent skip. The platform inherits the MOLECULE_CHANNELS_TEST_* bases
-        # from $GITHUB_ENV; the script's mock ports match them (18099/18098).
+        # from $GITHUB_ENV, and the script binds its mocks on the matching
+        # E2E_CHANNELS_*_PORT from the same $GITHUB_ENV — one probe, both sides.
         if: needs.detect-changes.outputs.api == 'true'
         env:
           E2E_REQUIRE_LIVE: '1'

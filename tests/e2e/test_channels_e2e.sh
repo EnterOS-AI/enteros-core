@@ -36,8 +36,9 @@
 #   MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE  (Telegram Bot API base)
 #
 # These must be present in the PLATFORM process env (the workflow exports
-# them via $GITHUB_ENV before "Start platform"), pointing at the fixed
-# loopback ports this script binds its mocks on. If they are absent the
+# them via $GITHUB_ENV before "Start platform"), pointing at the SAME loopback
+# ports this script binds its mocks on — in CI both come from one probe (the
+# workflow's "Pick ephemeral ports" step). If they are absent the
 # platform rejects the mock URLs; under E2E_REQUIRE_LIVE=1 that is a hard
 # RED (the seam regressed / the workflow wiring broke), otherwise a LOUD
 # SKIP for ad-hoc local runs that didn't export them.
@@ -49,6 +50,14 @@
 #   MOLECULE_ADMIN_TOKEN       (admin bearer; matches the platform's ADMIN_TOKEN)
 #   E2E_CHANNELS_WEBHOOK_PORT  18099   (mock Slack webhook upstream)
 #   E2E_CHANNELS_TELEGRAM_PORT 18098   (mock Telegram Bot API upstream)
+#
+#   The 18099/18098 defaults are for a LOCAL run, where you are the only one on
+#   the box. CI must NOT use them: concurrent jobs share the act_runner's network
+#   namespace, so a fixed port is a shared mutable resource and the second job to
+#   bind dies with `Errno 98 Address already in use`. .gitea/workflows/e2e-api.yml
+#   probes a free port pair and passes it here AND to the platform's
+#   MOLECULE_CHANNELS_TEST_* bases — the two must agree or the mock never sees
+#   the send.
 #   E2E_REQUIRE_LIVE           0        (1 = seam-absent is RED, not skip)
 
 set -uo pipefail
@@ -56,9 +65,45 @@ set -uo pipefail
 # shellcheck disable=SC1091
 source "$(dirname "$0")/_lib.sh"   # sets BASE default + admin/token helpers
 
-WEBHOOK_PORT="${E2E_CHANNELS_WEBHOOK_PORT:-18099}"
-TELEGRAM_PORT="${E2E_CHANNELS_TELEGRAM_PORT:-18098}"
 REQUIRE_LIVE="${E2E_REQUIRE_LIVE:-0}"
+IDENTITY_PATH="/__e2e_id"
+
+# ONE fact, ONE direction. The mock port is not told to us twice.
+#
+# When the platform was started with the test-seam bases (CI always does this),
+# those bases ARE the truth: they are what the platform will dial. So we parse
+# our bind port straight out of them instead of being handed the port in a
+# second env var that could disagree — there is no second copy to drift.
+#
+# With no bases in the env (a bare local run), fall back to the historical fixed
+# ports. Those are safe on your own box and, being below the kernel's ephemeral
+# range, they are also immune to being stolen as an outbound source port. Their
+# only flaw was being the same for every CI job — which is what CI's per-run
+# probe fixes.
+port_from_base() {
+  printf '%s' "$1" | sed -n 's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^:/]*:\([0-9][0-9]*\).*#\1#p'
+}
+
+if [ -n "${MOLECULE_CHANNELS_TEST_WEBHOOK_BASE:-}" ]; then
+  WEBHOOK_PORT="$(port_from_base "$MOLECULE_CHANNELS_TEST_WEBHOOK_BASE")"
+  [ -n "$WEBHOOK_PORT" ] || {
+    echo "FATAL: no port in MOLECULE_CHANNELS_TEST_WEBHOOK_BASE='${MOLECULE_CHANNELS_TEST_WEBHOOK_BASE}'" >&2
+    echo "       The platform dials that URL; we must bind the SAME port or the two halves disagree." >&2
+    exit 2
+  }
+else
+  WEBHOOK_PORT="${E2E_CHANNELS_WEBHOOK_PORT:-18099}"
+fi
+
+if [ -n "${MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE:-}" ]; then
+  TELEGRAM_PORT="$(port_from_base "$MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE")"
+  [ -n "$TELEGRAM_PORT" ] || {
+    echo "FATAL: no port in MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE='${MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE}'" >&2
+    exit 2
+  }
+else
+  TELEGRAM_PORT="${E2E_CHANNELS_TELEGRAM_PORT:-18098}"
+fi
 
 # The base prefixes the PLATFORM must have been started with. We assert the
 # adapter accepted a URL under these — proving the platform's env matches.
@@ -96,8 +141,11 @@ loud_skip() {
     echo "  $reason"
     echo "This is a HARD FAILURE — the platform was not started with the"
     echo "channels test seam env (MOLECULE_CHANNELS_TEST_WEBHOOK_BASE /"
-    echo "MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE) on the fixed loopback"
-    echo "ports, or the seam regressed. Fix the workflow wiring or the seam."
+    echo "MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE), or it was started with"
+    echo "bases that DISAGREE with the ports this script binds its mocks on"
+    echo "(expected: $WEBHOOK_BASE and $TELEGRAM_BASE), or the seam regressed."
+    echo "In CI both sides come from one probe — a disagreement means that"
+    echo "probe failed. Fix the workflow wiring or the seam."
     echo "============================================================"
     cleanup
     exit 1
@@ -147,6 +195,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 WORK_DIR = os.environ["MOCK_WORK_DIR"]
 WEBHOOK_PORT = int(os.environ["MOCK_WEBHOOK_PORT"])
 TELEGRAM_PORT = int(os.environ["MOCK_TELEGRAM_PORT"])
+# Proves to the readiness gate that the listener on the port is OURS. Without
+# it, any foreign listener that happened to grab the port would answer the
+# readiness curl and the run would proceed against someone else's process.
+MOCK_NONCE = os.environ["MOCK_NONCE"]
+IDENTITY_PATH = "/__e2e_id"
+
+
+def send_identity(h):
+    payload = MOCK_NONCE.encode()
+    h.send_response(200)
+    h.send_header("Content-Type", "text/plain")
+    h.send_header("Content-Length", str(len(payload)))
+    h.end_headers()
+    h.wfile.write(payload)
 
 BOT_USERNAME = "e2e_mock_bot"
 CHAT_ID = -1009876543210
@@ -156,6 +218,12 @@ CHAT_NAME = "E2E Mock Group"
 class SlackHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # silence
         pass
+
+    def do_GET(self):
+        if self.path == IDENTITY_PATH:
+            return send_identity(self)
+        self.send_response(404)
+        self.end_headers()
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0") or "0")
@@ -221,32 +289,59 @@ class TelegramHandler(BaseHTTPRequestHandler):
         self._route()
 
     def do_GET(self):
+        if self.path == IDENTITY_PATH:
+            return send_identity(self)
         self._route()
 
 
 def serve(port, handler):
-    ThreadingHTTPServer(("127.0.0.1", port), handler).serve_forever()
+    try:
+        ThreadingHTTPServer(("127.0.0.1", port), handler).serve_forever()
+    except OSError as exc:
+        # Name the real cause. A bind failure here means something ELSE on this
+        # shared runner holds the port — not a channels-seam regression. The
+        # Telegram server runs in a thread, so os._exit (not sys.exit) is what
+        # actually takes the process down and lets the bash side notice.
+        sys.stderr.write(
+            f"mock: CANNOT BIND 127.0.0.1:{port}: {exc}\n"
+            "mock: the port was taken by another process on this runner.\n")
+        sys.stderr.flush()
+        os._exit(98)
 
 
 t = threading.Thread(target=serve, args=(TELEGRAM_PORT, TelegramHandler), daemon=True)
 t.start()
 serve(WEBHOOK_PORT, SlackHandler)
 PY
+  # A nonce only OUR mock can echo. The readiness gate used to curl the PORT and
+  # accept any HTTP response — so a foreign listener that had grabbed the port
+  # made a DEAD mock look healthy, and the run then failed further downstream as
+  # "the channels seam regressed", sending the next reader into the Go send path
+  # to debug what was actually a port collision. Identity, not liveness-of-port.
+  MOCK_NONCE="mock-$$-${RANDOM}${RANDOM}"
   MOCK_WORK_DIR="$WORK_DIR" MOCK_WEBHOOK_PORT="$WEBHOOK_PORT" \
-    MOCK_TELEGRAM_PORT="$TELEGRAM_PORT" \
+    MOCK_TELEGRAM_PORT="$TELEGRAM_PORT" MOCK_NONCE="$MOCK_NONCE" \
     python3 "$WORK_DIR/mock.py" &
   MOCK_PID=$!
-  # Wait for both ports to accept connections (fail loudly if they never do).
   local up=0
   for _ in $(seq 1 50); do
-    if curl -s -o /dev/null "http://127.0.0.1:${WEBHOOK_PORT}/" \
-       && curl -s -o /dev/null "http://127.0.0.1:${TELEGRAM_PORT}/botX/getMe"; then
+    if ! kill -0 "$MOCK_PID" 2>/dev/null; then
+      echo "FATAL: the mock upstream process DIED during startup." >&2
+      echo "       Its stderr is above. 'CANNOT BIND' there means another process on" >&2
+      echo "       this shared runner holds ${WEBHOOK_PORT}/${TELEGRAM_PORT} — a port" >&2
+      echo "       collision, NOT a channels-seam regression." >&2
+      cleanup
+      exit 2
+    fi
+    if [ "$(curl -s "http://127.0.0.1:${WEBHOOK_PORT}${IDENTITY_PATH}" 2>/dev/null)" = "$MOCK_NONCE" ] \
+       && [ "$(curl -s "http://127.0.0.1:${TELEGRAM_PORT}${IDENTITY_PATH}" 2>/dev/null)" = "$MOCK_NONCE" ]; then
       up=1; break
     fi
     sleep 0.1
   done
   if [ "$up" != "1" ]; then
-    echo "FATAL: mock upstream did not come up on ports $WEBHOOK_PORT/$TELEGRAM_PORT" >&2
+    echo "FATAL: the mock upstream never answered with OUR identity on ${WEBHOOK_PORT}/${TELEGRAM_PORT}." >&2
+    echo "       If something IS listening there, it is not ours — the port was stolen." >&2
     cleanup
     exit 2
   fi
