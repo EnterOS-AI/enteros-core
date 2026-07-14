@@ -149,3 +149,21 @@ jobs:
           REPO: ${{ github.repository }}
           ENFORCED_CONTEXTS_FILE: .gitea/required-contexts.txt
         run: python3 .gitea/scripts/ci-required-drift.py --phantom-gate-lint
+
+      # Guard G — the INVERSE of Guard F, and the one that actually wedges.
+      #
+      # Guard F: an ENFORCED context whose producer is disabled → required on
+      #          paper, silently unenforced. (Nothing blocks; protection is a lie.)
+      # Guard G: a DISABLED workflow that still fires on PR events → it keeps
+      #          posting statuses Gitea will not let you rerun
+      #          (400 "workflow is disabled"), so under the `[*]` branch
+      #          protection the PR is stuck with no API path out.
+      #
+      # Runs in the same job to reuse the DRIFT_BOT_TOKEN fetched above — the
+      # Actions API workflow-state read is the same call both guards need.
+      - name: Run Guard G — disabled workflows must not still fire on PR events
+        env:
+          GITEA_TOKEN: ${{ env.DRIFT_BOT_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+        run: python3 .gitea/scripts/ci-required-drift.py --disabled-pr-emitter-lint

@@ -656,6 +656,139 @@ def detect_phantom_gates(
     return findings, debug
 
 
+def workflow_pr_triggers(doc: Any) -> list[str]:
+    """The PR-lifecycle events a workflow doc declares: `pull_request` and/or
+    `pull_request_target`.
+
+    NOTE the YAML 1.1 booleanization trap: PyYAML parses the bare key `on:` as
+    the BOOLEAN `True`, not the string `"on"`. A guard that only looked up
+    `doc["on"]` would silently see nothing on EVERY workflow in this repo and
+    pass vacuously. Check both keys."""
+    if not isinstance(doc, dict):
+        return []
+    on = doc.get("on", doc.get(True))
+    if isinstance(on, str):
+        keys = [on]
+    elif isinstance(on, list):
+        keys = [k for k in on if isinstance(k, str)]
+    elif isinstance(on, dict):
+        keys = [k for k in on if isinstance(k, str)]
+    else:
+        return []
+    return [k for k in ("pull_request", "pull_request_target") if k in keys]
+
+
+def detect_disabled_pr_emitters(
+    workflow_states: dict[str, dict[str, str]],
+    workflows_dir: str = ".gitea/workflows",
+) -> tuple[list[str], dict]:
+    """Guard G: a workflow whose Gitea Actions state is NOT `active` must NOT
+    still declare `pull_request` / `pull_request_target` triggers.
+
+    Guard F catches the phantom in one direction (an ENFORCED context whose
+    producer is disabled → required-on-paper, never posted). Guard G catches the
+    OTHER direction, which is worse because it WEDGES:
+
+      Disabling a workflow in the Gitea Actions config does NOT stop
+      `pull_request_target` from firing it. It only blocks manual rerun/dispatch.
+      So a disabled workflow keeps posting commit statuses, and when one of its
+      runs ends `failure` — or `cancelled`, which posts `failure` with zero logs
+      — that status is UNCLEARABLE: `POST /actions/runs/<id>/rerun` answers
+        400 {"message":"workflow <file> is disabled"}
+      and under main's `['*']` wildcard branch protection every reported context
+      must be success. The PR is stuck with no API path out.
+
+    Observed live on 2026-07-13 (gate-check-v3 + sop-checklist wedged core#4126,
+    #4173, #4263, #4305). Escaping it needed a PR-body PATCH to force a fresh
+    `edited` event — a workaround, not a fix.
+
+    A workflow that is off must be OFF: either delete it, or drop its PR
+    triggers so it stops emitting statuses."""
+    import glob as _glob
+
+    findings: list[str] = []
+    offenders: list[dict[str, Any]] = []
+    checked: list[dict[str, str]] = []
+
+    # file id -> state, for the workflows Gitea reports as not-active.
+    inactive_files = {
+        (meta.get("file") or "").strip(): meta.get("state", "unknown")
+        for meta in workflow_states.values()
+        if meta.get("state") != "active"
+    }
+    inactive_files.pop("", None)
+
+    for path in sorted(_glob.glob(os.path.join(workflows_dir, "*.yml"))):
+        file_id = os.path.basename(path)
+        state = inactive_files.get(file_id)
+        if state is None:
+            continue  # active (or unknown to Gitea) — not Guard G's business
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError):
+            # Fail CLOSED: an unparseable disabled workflow could be firing PR
+            # events and we cannot prove otherwise.
+            findings.append(
+                f"G0 — could not parse disabled workflow {file_id} (state={state}); "
+                "cannot prove it does not still fire on PR events — failing closed."
+            )
+            continue
+        triggers = workflow_pr_triggers(doc)
+        checked.append({"file": file_id, "state": state, "pr_triggers": ",".join(triggers)})
+        if triggers:
+            offenders.append({"file": file_id, "state": state, "triggers": triggers})
+
+    if offenders:
+        findings.append(
+            "G1 — DISABLED workflows that still declare PR triggers. Gitea fires "
+            "`pull_request_target` on a disabled workflow anyway, so these keep "
+            "posting commit statuses that CANNOT be rerun (`rerun` → 400 "
+            '"workflow is disabled") and therefore WEDGE the PR under the `[*]` '
+            "branch protection:\n"
+            + "\n".join(
+                f"  - {o['file']}  state={o['state']}  triggers={'+'.join(o['triggers'])}"
+                for o in offenders
+            )
+            + "\n    Fix: delete the workflow, or remove its pull_request / "
+            "pull_request_target triggers so it stops emitting statuses. If it is "
+            "meant to gate, RE-ENABLE it instead (a disabled gate is not a gate)."
+        )
+
+    return findings, {"offenders": offenders, "checked": checked}
+
+
+def run_disabled_pr_emitter_lint() -> int:
+    """`--disabled-pr-emitter-lint` entrypoint (Guard G). HARD lint: exits
+    non-zero so a wedge-producing disabled workflow is caught at PR time instead
+    of after it has already jammed someone's merge."""
+    if not (GITEA_TOKEN and GITEA_HOST and REPO):
+        sys.stderr.write(
+            "::error::Guard G: GITEA_TOKEN + GITEA_HOST + REPO are required to "
+            "read workflow states — failing closed\n"
+        )
+        return 2
+    states = fetch_workflow_states()
+    findings, debug = detect_disabled_pr_emitters(states)
+    print("::group::Guard G — disabled-workflow PR-emitter lint debug")
+    print(json.dumps(debug, indent=2, sort_keys=True))
+    print("::endgroup::")
+    if findings:
+        print(
+            "::error::Guard G FAILED — a DISABLED workflow still fires on PR "
+            "events. It will keep posting merge-blocking statuses that cannot be "
+            "rerun through the API, wedging PRs with no way out."
+        )
+        for f in findings:
+            print(f)
+        return 1
+    print(
+        f"::notice::Guard G PASSED — {len(debug['checked'])} disabled workflow(s) "
+        "checked; none still fire on pull_request / pull_request_target."
+    )
+    return 0
+
+
 def run_phantom_gate_lint() -> int:
     """`--phantom-gate-lint` entrypoint. Unlike the drift detector (which files
     an idempotent issue and exits 0 — the issue IS the alarm), Guard F is a HARD
@@ -1109,6 +1242,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(red) on a phantom gate — a required context whose producer workflow "
         "is disabled. Runs standalone (does not need the drift env contract).",
     )
+    p.add_argument(
+        "--disabled-pr-emitter-lint",
+        action="store_true",
+        help="Guard G: assert no DISABLED workflow still declares pull_request / "
+        "pull_request_target triggers. Gitea fires them anyway, and the resulting "
+        "statuses cannot be rerun (400 'workflow is disabled'), so they wedge PRs "
+        "under the `[*]` branch protection. EXITS NON-ZERO on an offender. Runs "
+        "standalone (does not need the drift env contract).",
+    )
     return p.parse_args(argv)
 
 
@@ -1120,6 +1262,10 @@ def main(argv: list[str] | None = None) -> int:
     # SENTINEL_JOB / the audit+ci workflow paths.
     if args.phantom_gate_lint:
         return run_phantom_gate_lint()
+
+    # Guard G is standalone for the same reason as Guard F.
+    if args.disabled_pr_emitter_lint:
+        return run_disabled_pr_emitter_lint()
 
     _require_runtime_env()
 

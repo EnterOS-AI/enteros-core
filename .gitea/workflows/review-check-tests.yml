@@ -33,22 +33,20 @@ on:
       - '.gitea/workflows/security-review.yml'
       - '.gitea/workflows/secret-scan.yml'
       - '.gitea/workflows/reserved-path-review.yml'
-  pull_request:
-    branches: [main, staging]
-    paths:
-      - '.gitea/scripts/review-check.sh'
-      - '.gitea/scripts/_approval_validator.py'
-      - '.gitea/scripts/_review_check_filter.py'
-      - '.gitea/scripts/lib/ci-status.sh'
-      - '.gitea/scripts/tests/test_review_check.sh'
-      - '.gitea/scripts/tests/test_ci_status.sh'
-      - '.gitea/scripts/tests/_review_check_fixture.py'
-      - '.gitea/scripts/tests/test_approval_validator.py'
-      - '.gitea/workflows/review-check-tests.yml'
-      - '.gitea/workflows/qa-review.yml'
-      - '.gitea/workflows/security-review.yml'
-      - '.gitea/workflows/secret-scan.yml'
-      - '.gitea/workflows/reserved-path-review.yml'
+  # `pull_request` REMOVED 2026-07-13 (task #97, Guard G).
+  #
+  # This workflow is `disabled_manually`, and Gitea fires PR events on a disabled
+  # workflow ANYWAY — disabling only blocks rerun/dispatch. So it posted a PR
+  # status that could never be rerun (400 "workflow is disabled"), which under
+  # main's `['*']` branch protection wedges the PR with no API path out.
+  #
+  # This one was especially nasty: its paths filter included
+  # `.gitea/workflows/reserved-path-review.yml`, so ANY PR touching the
+  # reserved-path gate — including the one that fixes it (task #89) — would fire
+  # this disabled workflow and jam itself. Guard G caught it; I had not noticed.
+  #
+  # Still runs on push:[main, staging] + workflow_dispatch, so the tests are not
+  # lost. Restore this trigger only together with re-enabling the workflow.
   workflow_dispatch:
 
 env:

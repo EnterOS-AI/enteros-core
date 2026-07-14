@@ -88,11 +88,30 @@ concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
-# bp-required: yes  ← emits sop-checklist / all-items-acked (pull_request)
+# bp-required: NO (task #97) — this workflow is disabled_manually and its
+# pull_request_target trigger has been removed, so it no longer emits
+# `sop-checklist / all-items-acked` on PRs at all. Leaving the old
+# `bp-required: yes` marker here would have claimed an emitter that does not
+# emit. Restore the marker together with the trigger if the ceremony is revived.
 
 on:
-  pull_request_target:
-    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+  # `pull_request_target` REMOVED 2026-07-13 (task #97) — same reason as
+  # gate-check-v3.yml, see the long note there.
+  #
+  # This workflow is `disabled_manually` (CTO directive 2026-07-11: the SOP/review
+  # ceremony gates are off). Gitea fires `pull_request_target` on a disabled
+  # workflow ANYWAY, so it kept posting
+  #     sop-checklist / all-items-acked (pull_request_target)
+  #     sop-checklist / review-refire (pull_request_target)
+  # and a failed/cancelled run of it could not be rerun
+  #     -> 400 {"message":"workflow sop-checklist.yml is disabled"}
+  # which wedges the PR under the `['*']` branch protection. Seen on core#4305.
+  #
+  # `issue_comment` is retained: the slash-command surface (/sop-ack, /sop-revoke,
+  # /sop-n/a) is how the ceremony would be driven if it were re-enabled, and a
+  # comment event does not post a PR-blocking status on its own.
+  #
+  # To restore the gate: re-enable the workflow AND restore this trigger.
   issue_comment:
     types: [created]   # NOT [created, edited, deleted] — Gitea 1.22.6 holds a runner slot
     # at job-parsing time, before job-level if: guards run. edited/deleted events

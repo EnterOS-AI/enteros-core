@@ -41,11 +41,19 @@ Secret scan / Scan diff for credential-shaped strings
 template-delivery-e2e / Template-asset delivery (fresh seo-agent — config+prompts via asset channel, seo-all via plugin reconcile)
 # SOP/review ceremony gates REMOVED from the required set 2026-07-11 (CTO
 # directive: bot-operated review/SOP acks were meaningless ceremony). Their
-# producer workflows (qa-review, security-review, sop-checklist,
-# reserved-path-review) are disabled_manually, so keeping them here made them
-# phantom gates — required-on-paper but silently unenforced (lint-phantom-gate
-# Guard F). Real protection stays: CI ['*'] + secret-scan. To restore the
-# ceremony, re-enable the producer workflows AND re-add the four contexts below.
+# producer workflows (qa-review, security-review, sop-checklist, gate-check-v3)
+# are disabled_manually, so keeping them here made them phantom gates —
+# required-on-paper but silently unenforced (lint-phantom-gate Guard F). Real
+# protection stays: CI ['*'] + secret-scan. To restore the ceremony, re-enable
+# the producer workflows AND re-add their contexts below AND restore the
+# pull_request_target triggers that task #97 removed (all three, or you get
+# either a phantom gate or a wedge).
+#
+# CORRECTION 2026-07-13: this list used to name `reserved-path-review` among the
+# disabled producers. That was WRONG — reserved-path-review is ACTIVE and has
+# been gating all along. Believing the stale claim cost real time while
+# debugging the wedge in task #89; the Gitea Actions API is the SSOT for
+# workflow state, not this comment.
 Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 
 # RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────
