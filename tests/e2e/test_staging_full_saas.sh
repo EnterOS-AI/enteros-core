@@ -859,6 +859,29 @@ print(json.dumps({
 ")
 fi
 
+# Idle-digest sub-step (task #219): with E2E_IDLE_DIGEST_CHECK=on (the
+# ephemeral gate), inject the shrunken fire interval so the contract-driven
+# idle digest can arm + fire within the run. Additive NON-LLM env only — it can
+# never flip the platform-managed path to BYOK (the guard above is about keys).
+# MOLECULE_MAILBOX_KERNEL=1 is explicit until the native-default runtime
+# (mailbox kernel default ON) propagates into the template image pins; drop the
+# line then so this gate proves the DEFAULT, not the flag.
+if [ "${E2E_IDLE_DIGEST_CHECK:-}" = "on" ]; then
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
+import json, os
+s = json.loads(os.environ['SECRETS_JSON_IN'])
+s['MOLECULE_MAILBOX_KERNEL'] = '1'
+s['MOLECULE_IDLE_FIRE_SECONDS'] = os.environ.get('E2E_IDLE_FIRE_SECONDS', '30')
+# Deterministic digest content: the goal-state provider seeds goal.yaml from
+# this env at boot (runtime bootstrap_from_env, source=env-bootstrap). No LLM
+# tool-call round-trip — the platform-managed model acked GOALSET twice in CI
+# without invoking the tool, so an A2A seed is an unacceptable flake source.
+s['MOLECULE_IDLE_GOAL'] = 'Keep the e2e pipeline green; pull the next backlog item when idle.'
+print(json.dumps(s))
+")
+  log "    idle-digest check ON: MOLECULE_IDLE_FIRE_SECONDS=${E2E_IDLE_FIRE_SECONDS:-30} injected into workspace secrets"
+fi
+
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
@@ -1216,6 +1239,10 @@ CONFIG_PAYLOAD="${CONFIG_MARKER}
 name: synth-canary
 runtime: ${RUNTIME}
 "
+# (Idle-digest goal seeding happens via an A2A goal-set turn after step 8 —
+# an idle_prompt line here proved ineffective on the ephemeral topology: the
+# files-API PUT does not reboot the workspace, so the boot-time
+# migrate_from_config never re-runs. Caught by this gate's own first run.)
 for wid in "${WS_TO_CHECK[@]}"; do
   PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'content': sys.stdin.read()}))" <<< "$CONFIG_PAYLOAD")
   # Capture body to a tempfile so curl's -w '%{http_code}' is the only
@@ -1801,6 +1828,12 @@ if [ -z "$KA_TEXT" ]; then
 fi
 # CORE GATE: contains PINEAPPLE (real round-trip) AND no error-as-text.
 a2a_assert_real_completion "$KA_TEXT" "PINEAPPLE" "A2A known-answer (parent, $RUNTIME/$MODEL_SLUG)"
+
+# ─── 8c retired: the goal is now seeded DETERMINISTICALLY at provision time
+# via the MOLECULE_IDLE_GOAL workspace secret (runtime goal-state
+# bootstrap_from_env). The prior A2A "call goal_set" seed acked GOALSET twice
+# in CI without the tool ever persisting a goal — LLM tool-follow is not a
+# gate-grade mechanism. The fire assertion in the wrapper is unchanged.
 # Real, deterministic LLM round-trip proven — the load-bearing milestone for
 # the fail-closed-on-skip guard. Stamped AFTER a2a_assert_real_completion (not
 # after the looser PONG check) so the milestone means a verified completion,
@@ -2442,6 +2475,51 @@ print(json.dumps({
   ok "Lifecycle transitions passed: pause→resume→online + hibernate→wake→online"
 else
   log "10b/11 Lifecycle transitions skipped (MODE=$MODE, E2E_LIFECYCLE=${E2E_LIFECYCLE:-auto}) — pause/resume/hibernate only run in full mode with E2E_LIFECYCLE!=off."
+fi
+
+# ─── 10c. Idle-digest soak (task #219, E2E_IDLE_DIGEST_CHECK=on only) ──
+# Leave the fleet IDLE long enough for the contract-driven idle digest to
+# arm + fire (the interval was shrunken at provision time above). The fire is
+# ASSERTED by the ephemeral wrapper from the streamed container log files —
+# the containers are gone by the time the wrapper regains control, so the
+# soak must happen HERE, while the workspaces are alive.
+if [ "${E2E_IDLE_DIGEST_CHECK:-}" = "on" ]; then
+  _IDLE_SOAK_SECS=$(( ${E2E_IDLE_FIRE_SECONDS:-30} * 3 + 30 ))
+  log "10c/11 Idle-digest soak: fleet idle for ${_IDLE_SOAK_SECS}s so the digest can fire (assertion = wrapper log-grep)."
+  sleep "$_IDLE_SOAK_SECS"
+  ok "    idle-digest soak window complete"
+  # Diagnosability (ephemeral topology only — the scenario shares the dind, so
+  # the live workspace containers are exec-able HERE, before the trap tears the
+  # org down; staging has no docker and skips silently). Dumps the exact two
+  # facts the fire assertion depends on: did the MOLECULE_IDLE_* env reach the
+  # container, and did goal-state seed goal.yaml. Keys are non-secret; values
+  # are the fire interval and the goal text.
+  if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
+    _ID_FIRED=""
+    for _idc in $(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true); do
+      _idenv=$(docker exec "$_idc" sh -c 'env | grep -E "^MOLECULE_(IDLE|MAILBOX)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
+      _idgoal=$(docker exec "$_idc" sh -c 'cat /workspace/.molecule/idle-prompt/providers/goal-state/goal.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 240)
+      log "    [idle-digest diag] $_idc env: ${_idenv:-none}"
+      log "    [idle-digest diag] $_idc goal.yaml: ${_idgoal:-ABSENT}"
+      # FIRE evidence, robust to container replacement (CP re-provisions under
+      # the SAME name, so a log follower keyed on the name misses the
+      # replacement — proven in run 496595 where the fire's print was never
+      # captured while goal.yaml's last_included_at recorded it durably):
+      #   (a) the CURRENT container's live docker log has the fired line, OR
+      #   (b) the durable goal.yaml carries last_included_at (written by
+      #       on_included only after a successful digest post).
+      if docker logs "$_idc" 2>&1 | grep -q "Idle digest: fired"; then
+        _ID_FIRED="$_idc"
+      elif printf '%s' "$_idgoal" | grep -q "last_included_at"; then
+        _ID_FIRED="$_idc (durable last_included_at)"
+      fi
+    done
+    if [ -n "$_ID_FIRED" ]; then
+      ok "    idle-digest FIRED (evidence: $_ID_FIRED)"
+    else
+      fail "Idle digest never fired on any workspace within the soak window — env + goal diagnostics above name the broken leg (task #219 sub-step)."
+    fi
+  fi
 fi
 
 # ─── 11. Teardown runs via trap ────────────────────────────────────────

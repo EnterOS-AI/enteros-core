@@ -442,7 +442,45 @@ run_scenario() {
   E2E_MODE="${E2E_MODE:-full}" \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}" \
+  E2E_IDLE_DIGEST_CHECK="${E2E_IDLE_DIGEST_CHECK:-on}" \
+  E2E_IDLE_FIRE_SECONDS="${E2E_IDLE_FIRE_SECONDS:-30}" \
     bash "$HERE/test_staging_full_saas.sh"
+}
+
+# ── idle-digest sub-step assertion (task #219) — RETIRED as the gating check:
+# the CP re-provisions replacement containers under the SAME name, and the
+# collector followers are name-keyed, so a replacement's log (where the fired
+# line can land) is never captured (run 496595). The AUTHORITATIVE assert now
+# lives in full-saas step 10c (live docker logs + durable goal.yaml
+# last_included_at, while the org is still alive). Kept for ad-hoc use. ─────
+# full-saas step 10c soaked the fleet idle with a shrunken
+# MOLECULE_IDLE_FIRE_SECONDS; the runtime must have ARMED the contract-driven
+# digest loop and FIRED a digest. Asserted from the collector's streamed log
+# FILES — the workspace containers are already gone when we regain control.
+# This is a SUB-STEP gate: it reds the digest wiring specifically, on a
+# scenario that has otherwise already passed, with its own reachable fail arms
+# (no arm line = boot wiring broken; armed-but-never-fired = fire path broken).
+assert_idle_digest() {
+  [ "${E2E_IDLE_DIGEST_CHECK:-on}" = "on" ] || { echo "[proof] idle-digest check OFF (E2E_IDLE_DIGEST_CHECK=${E2E_IDLE_DIGEST_CHECK})." >&2; return 0; }
+  if [ -z "$TENANT_LOG_DIR" ] || [ ! -d "$TENANT_LOG_DIR" ]; then
+    echo "[proof] ❌ idle-digest: no tenant log capture dir — the collector never ran, cannot prove the digest fired." >&2
+    return 1
+  fi
+  local armed fired
+  armed=$(grep -l "Idle digest: contract-driven digest loop armed" "$TENANT_LOG_DIR"/*.log 2>/dev/null | head -1)
+  fired=$(grep -l "Idle digest: fired" "$TENANT_LOG_DIR"/*.log 2>/dev/null | head -1)
+  if [ -z "$armed" ]; then
+    echo "[proof] ❌ idle-digest: NO workspace log contains the digest-loop ARM line — the mailbox-kernel idle digest did not come up on boot (task #219)." >&2
+    return 1
+  fi
+  if [ -z "$fired" ]; then
+    echo "[proof] ❌ idle-digest: loop ARMED ($(basename "$armed")) but NEVER FIRED within the soak window — fire path broken (delta gate / skip check / poster)." >&2
+    grep -h "Idle digest:" "$TENANT_LOG_DIR"/*.log 2>/dev/null | tail -10 | sed 's/^/[proof]    /' >&2
+    return 1
+  fi
+  echo "[proof] ✅ idle-digest: contract-driven digest ARMED + FIRED ($(basename "$fired"))" >&2
+  grep -h "Idle digest:" "$TENANT_LOG_DIR"/*.log 2>/dev/null | tail -5 | sed 's/^/[proof]    /' >&2
+  return 0
 }
 
 # ── dump_diagnostics: on a scenario failure, surface the CP + tenant container
@@ -697,7 +735,8 @@ case "$CMD" in
     run_scenario; rc=$?
     if [ "$rc" -eq 0 ]; then
       echo "[proof] ✅ core happy-path PASSED against an ephemeral CP — the SDK-owned-gate model holds with zero shared staging." >&2
-    else
+    fi
+    if [ "$rc" -ne 0 ]; then
       echo "[proof] ❌ core happy-path FAILED (rc=$rc) against the ephemeral CP — read the full-saas output above for the failing step." >&2
       # CP logs live; tenant logs come from the collector's FILES — run_scenario
       # has already deleted the tenant containers by the time we get here.
@@ -728,7 +767,8 @@ case "$CMD" in
     if [ "$rc" -eq 0 ]; then
       stop_tenant_log_collector
       echo "[proof] ✅ scenario PASSED against standing CP ${CP_BASE_URL}." >&2
-    else
+    fi
+    if [ "$rc" -ne 0 ]; then
       echo "[proof] ❌ scenario FAILED (rc=$rc) — the CP is still UP (${CP_BASE_URL}); fix and re-run '$0 scenario'." >&2
       dump_diagnostics   # stops the collector and prints the captured tenant logs
     fi
