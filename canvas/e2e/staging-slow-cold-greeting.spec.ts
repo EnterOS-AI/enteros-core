@@ -188,9 +188,9 @@ async function waitForStableAgentBubbles(
     }
     await page.waitForTimeout(POLL_MS);
   }
-  // Safety net reached (pathological): return the current DOM and let the
-  // assertions below judge it loudly — never silently pass.
-  return readRenderedBubbles(page);
+  throw new Error(
+    `agent bubbles did not stabilize within ${opts.safetyNetMs}ms`,
+  );
 }
 
 test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no duplicate bubble)", async ({
@@ -209,15 +209,16 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
   });
 
   // The baseline below is only meaningful once the cold chat-history load has
-  // actually COME BACK. Snapshotting it mid-flight would baseline an empty (or
-  // partial) transcript, and the history bubbles would then land AFTER our send
-  // and masquerade as extra replies to our "hi" — a false RED of the very guard
-  // this spec exists to make trustworthy. So we watch for the real response
-  // rather than assuming it beat us here.
-  let chatHistoryLoaded = false;
-  page.on("response", (r) => {
-    if (/\/chat-history/.test(r.url())) chatHistoryLoaded = true;
-  });
+  // actually COME BACK. Register this before navigation so a fast response
+  // cannot race past the listener. We await it before starting the stability
+  // window; a boolean response listener could flip after a DOM poll but before
+  // that poll returned, accepting an empty pre-response baseline.
+  const chatHistoryResponse = page.waitForResponse(
+    (response) =>
+      response.request().method() === "GET" &&
+      /\/chat-history(?:\?|$)/.test(response.url()),
+    { timeout: 120_000 },
+  );
 
   // FORCE the slow cold turn deterministically: hold the concierge /a2a reply so
   // the live copy is delivered ~30s after the persisted copy — independent of
@@ -234,7 +235,9 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
   await context.route("**/workspaces/*/a2a", async (route) => {
     let resp;
     try {
-      resp = await route.fetch();
+      // The outer 240s cold-turn budget is the safety net; Playwright defaults
+      // route.fetch() to 30s, which would abandon and replay a healthy slow turn.
+      resp = await route.fetch({ timeout: 0 });
     } catch {
       return route.fallback();
     }
@@ -255,6 +258,12 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
   const myChat = chatPanel.locator("#chat-tab-my-chat");
   if (await myChat.count()) await myChat.click();
 
+  const historyResponse = await chatHistoryResponse;
+  expect(
+    historyResponse.ok(),
+    `chat-history failed with HTTP ${historyResponse.status()}`,
+  ).toBeTruthy();
+
   const composer = page.locator('textarea[aria-label="Message to agent"]');
   await expect(composer, "chat composer not present").toBeVisible({ timeout: 30_000 });
 
@@ -270,14 +279,14 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
   // "My Chat" is ONE long-lived conversation on a shared org, so on a cold open
   // this already renders the earlier staging specs' turns. Those bubbles are not
   // ours and must not be counted as replies to our "hi" (that is exactly what
-  // false-RED'd run 499907). Wait for /chat-history to have actually RESPONDED
-  // and for the rendered set to then STOP changing across a full reconcile
-  // cycle — a baseline snapshotted mid-load would let a straggler history bubble
-  // land after the send and masquerade as a second reply.
+  // false-RED'd run 499907). The response was awaited above; now require the
+  // rendered set to STOP changing across a full reconcile cycle. A baseline
+  // snapshotted mid-render would let a straggler history bubble land after the
+  // send and masquerade as a second reply.
   const baseline = agentBubbles(
     await waitForStableAgentBubbles(page, {
       stableForMs: RECONCILE_CYCLE_MS, // spans a full reconcile cycle
-      readyAt: () => (chatHistoryLoaded ? Date.now() : null), // no baseline before history lands
+      readyAt: () => 0, // the history response was awaited before this poll began
       safetyNetMs: 120_000,
     }),
   );
@@ -306,14 +315,17 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
   expect(firstCopyAt, "concierge never produced a NEW agent bubble within 240s").toBeGreaterThan(0);
   const firstTurnMs = firstCopyAt - t0;
 
-  // Fail FAST (not after the 5-min settle) if the interception never fired: the
-  // client must POST /workspaces/{id}/a2a — if it did not, this spec is
-  // measuring nothing and the whole forced-race premise is void.
-  expect(
-    forcedHoldApplied,
-    "the /a2a hold never fired — the client did not POST /workspaces/*/a2a, so the " +
-      "slow-turn race was never forced and a green result would prove nothing",
-  ).toBeTruthy();
+  // Fail promptly (not after the 5-min settle) if the interception never fired.
+  // The persisted copy can win a narrow race against route.fetch() completing,
+  // so poll the real hold signal instead of snapshotting its boolean once.
+  await expect
+    .poll(() => forcedHoldApplied, {
+      message:
+        "the /a2a hold never fired — the client did not POST /workspaces/*/a2a, " +
+        "so the slow-turn race was never forced and a green result would prove nothing",
+      timeout: 30_000,
+    })
+    .toBe(true);
 
   // ─── Settle: wait out every late-delivery path, on a REAL signal ───────────
   // The last possible copy is the HELD live reply; nothing can arrive after it
