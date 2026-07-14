@@ -82,6 +82,11 @@
 #                                swallows the lifecycle) exits 5 rather than
 #                                reporting a false green. Mirrors CP
 #                                serving-e2e's SERVING_E2E_REQUIRE_LIVE.
+#   E2E_IDLE_DIGEST_TIMEOUT_SECS default 360. When the ephemeral lane enables
+#                                the idle-digest assertion, poll durable fire
+#                                evidence for this long. This must cover both
+#                                the idle threshold and the runtime's real A2A/
+#                                LLM completion latency; it is not a cadence.
 #
 # Exit codes:
 #   0  happy path
@@ -160,6 +165,9 @@ esac
 # shellcheck source=lib/collision-proof-slug.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
+# shellcheck source=lib/idle_digest_wait.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/idle_digest_wait.sh"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
@@ -2477,48 +2485,65 @@ else
   log "10b/11 Lifecycle transitions skipped (MODE=$MODE, E2E_LIFECYCLE=${E2E_LIFECYCLE:-auto}) — pause/resume/hibernate only run in full mode with E2E_LIFECYCLE!=off."
 fi
 
-# ─── 10c. Idle-digest soak (task #219, E2E_IDLE_DIGEST_CHECK=on only) ──
-# Leave the fleet IDLE long enough for the contract-driven idle digest to
-# arm + fire (the interval was shrunken at provision time above). The fire is
-# ASSERTED by the ephemeral wrapper from the streamed container log files —
-# the containers are gone by the time the wrapper regains control, so the
-# soak must happen HERE, while the workspaces are alive.
+# ─── 10c. Idle-digest poll (task #219, E2E_IDLE_DIGEST_CHECK=on only) ──
+# Poll while the workspaces are alive until the digest has actually completed.
+# The runtime posts the digest through a real synchronous A2A/LLM call; that
+# completion can legitimately outlive a fixed `fire_seconds * N` sleep. Durable
+# goal-state (`last_included_at`) is the authoritative witness across container
+# replacement, with the current container log retained as a second signal.
 if [ "${E2E_IDLE_DIGEST_CHECK:-}" = "on" ]; then
-  _IDLE_SOAK_SECS=$(( ${E2E_IDLE_FIRE_SECONDS:-30} * 3 + 30 ))
-  log "10c/11 Idle-digest soak: fleet idle for ${_IDLE_SOAK_SECS}s so the digest can fire (assertion = wrapper log-grep)."
-  sleep "$_IDLE_SOAK_SECS"
-  ok "    idle-digest soak window complete"
-  # Diagnosability (ephemeral topology only — the scenario shares the dind, so
-  # the live workspace containers are exec-able HERE, before the trap tears the
-  # org down; staging has no docker and skips silently). Dumps the exact two
-  # facts the fire assertion depends on: did the MOLECULE_IDLE_* env reach the
-  # container, and did goal-state seed goal.yaml. Keys are non-secret; values
-  # are the fire interval and the goal text.
-  if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
+  _IDLE_TIMEOUT_SECS="${E2E_IDLE_DIGEST_TIMEOUT_SECS:-360}"
+  _IDLE_POLL_SECS="${E2E_IDLE_DIGEST_POLL_SECS:-10}"
+
+  # The enabled assertion requires the ephemeral topology's shared Docker
+  # daemon. A missing CLI/socket is a broken gate, not permission to skip it.
+  if idle_digest_require_docker; then
     _ID_FIRED=""
-    for _idc in $(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true); do
-      _idenv=$(docker exec "$_idc" sh -c 'env | grep -E "^MOLECULE_(IDLE|MAILBOX)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
-      _idgoal=$(docker exec "$_idc" sh -c 'cat /workspace/.molecule/idle-prompt/providers/goal-state/goal.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 240)
-      log "    [idle-digest diag] $_idc env: ${_idenv:-none}"
-      log "    [idle-digest diag] $_idc goal.yaml: ${_idgoal:-ABSENT}"
-      # FIRE evidence, robust to container replacement (CP re-provisions under
-      # the SAME name, so a log follower keyed on the name misses the
-      # replacement — proven in run 496595 where the fire's print was never
-      # captured while goal.yaml's last_included_at recorded it durably):
-      #   (a) the CURRENT container's live docker log has the fired line, OR
-      #   (b) the durable goal.yaml carries last_included_at (written by
-      #       on_included only after a successful digest post).
-      if docker logs "$_idc" 2>&1 | grep -q "Idle digest: fired"; then
-        _ID_FIRED="$_idc"
-      elif printf '%s' "$_idgoal" | grep -q "last_included_at"; then
-        _ID_FIRED="$_idc (durable last_included_at)"
-      fi
-    done
-    if [ -n "$_ID_FIRED" ]; then
+
+    idle_digest_probe() {
+      local _idc
+      _ID_FIRED=""
+      while IFS= read -r _idc; do
+        [ -n "$_idc" ] || continue
+        # Container logs are useful when the same container survives. Durable
+        # goal state survives CP-driven replacement under the same name and is
+        # written only after a successful digest post.
+        if docker logs "$_idc" 2>&1 | grep -F "Idle digest: fired" >/dev/null; then
+          _ID_FIRED="$_idc (runtime log)"
+          return 0
+        fi
+        if docker exec "$_idc" sh -c \
+          'grep -Eq "^last_included_at:[[:space:]]*[^[:space:]]" /workspace/.molecule/idle-prompt/providers/goal-state/goal.yaml' \
+          >/dev/null 2>&1; then
+          _ID_FIRED="$_idc (durable last_included_at)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    idle_digest_diagnostics() {
+      local _idc _idenv _idgoal
+      while IFS= read -r _idc; do
+        [ -n "$_idc" ] || continue
+        _idenv=$(docker exec "$_idc" sh -c 'env | grep -E "^MOLECULE_(IDLE|MAILBOX)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
+        _idgoal=$(docker exec "$_idc" sh -c 'cat /workspace/.molecule/idle-prompt/providers/goal-state/goal.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 500)
+        log "    [idle-digest diag] $_idc env: ${_idenv:-none}"
+        log "    [idle-digest diag] $_idc goal.yaml: ${_idgoal:-ABSENT}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+    }
+
+    log "10c/11 Idle-digest: polling durable completion evidence for up to ${_IDLE_TIMEOUT_SECS}s (fire threshold=${E2E_IDLE_FIRE_SECONDS:-30}s; poll=${_IDLE_POLL_SECS}s)."
+    if idle_digest_wait "$_IDLE_TIMEOUT_SECS" "$_IDLE_POLL_SECS" idle_digest_probe; then
       ok "    idle-digest FIRED (evidence: $_ID_FIRED)"
     else
-      fail "Idle digest never fired on any workspace within the soak window — env + goal diagnostics above name the broken leg (task #219 sub-step)."
+      idle_digest_diagnostics
+      fail "Idle digest never completed within ${_IDLE_TIMEOUT_SECS}s — env + durable goal diagnostics above name the broken leg (task #219 sub-step)."
     fi
+
+    unset -f idle_digest_probe idle_digest_diagnostics
+  else
+    fail "E2E_IDLE_DIGEST_CHECK=on requires a usable Docker CLI and daemon to inspect completion evidence."
   fi
 fi
 
