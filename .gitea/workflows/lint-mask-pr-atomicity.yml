@@ -107,7 +107,11 @@ jobs:
     # let the pre-flip gate accept a paths-filtered workflow's PR-event runs (or
     # a wider commit window) as proof. Then this flips in one line.
     #
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # mc#4344: the pre-flip gate cannot bless this flip — this workflow is paths-filtered,
+    # so it never runs on a main PUSH, and main-push run-logs are the ONLY proof that gate
+    # accepts. Not a red suite; a structurally unsatisfiable precondition. The lint is GREEN.
+    # (Was mc#2654, which is CLOSED — lint-continue-on-error-tracking Tier 2e correctly red'd
+    # it: a mask must cite an OPEN tracker, or it is an excuse with no owner.)
     continue-on-error: true
     steps:
       - name: Check out PR head with full history (need base SHA blobs)
