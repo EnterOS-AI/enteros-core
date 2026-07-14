@@ -962,8 +962,22 @@ fi
 # workspace"). set +e / `|| true` keeps the 22 from tripping `set -e`; curl
 # still WROTE the body to stdout (that's what --fail-with-body does), so
 # PARENT_RESP holds the 422 JSON and the id-check below surfaces WHY.
+#
+# Capture the RESPONSE HEADERS too (-D), because the body alone has repeatedly
+# been useless here: this create intermittently returns a 503 with a COMPLETELY
+# EMPTY body, ~1s after step 4 declared the tenant reachable (run 496830, main
+# 6ff307d6d, "E2E Staging Platform Boot"; and 3 fresh tenants in run 494525).
+# An empty-body 503 is the tell that it did NOT come from the Go handler — that
+# would emit JSON — so it is being synthesised by something in front of the app
+# (CF edge / tenant ingress / the app's own listener not yet accepting). The
+# headers are the only thing that can distinguish those: `server:`, `cf-ray:`,
+# and the HTTP status line name the responder. Without them this red is
+# permanently un-RCA-able, which is how it survived this long.
+PARENT_HDRS=$(mktemp)
+E2E_TMP_FILES+=("$PARENT_HDRS")
 set +e
 PARENT_RESP=$(tenant_call POST /workspaces \
+  -D "$PARENT_HDRS" \
   -H "Content-Type: application/json" \
   -d "$(build_create_payload 'E2E Parent')")
 set -e
@@ -973,7 +987,10 @@ set -e
 #     present in the tenant's configs/cache dir (template-cache refresh gap).
 PARENT_ID=$(echo "$PARENT_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
 if [ -z "$PARENT_ID" ]; then
-  fail "Parent workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$PARENT_RESP" | sanitize_http_body)"
+  fail "Parent workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}).
+Response body: $(printf '%s' "$PARENT_RESP" | sanitize_http_body)
+Response headers (who answered? an empty body + 503 here means it was NOT the Go handler — check 'server:' / 'cf-ray:'):
+$(sanitize_http_body < "$PARENT_HDRS")"
 fi
 log "    PARENT_ID=$PARENT_ID"
 # BYOK vendor key(s) shipped in the create payload above — nothing to write
