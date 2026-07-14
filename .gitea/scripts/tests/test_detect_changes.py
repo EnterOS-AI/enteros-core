@@ -11,13 +11,22 @@ filter shipped with:
        heavy job took its no-op arm, and `CI / all-required` reported SUCCESS
        having run zero tests.
 
-  C5 — the `peer-visibility` allow-list omitted internal/router/router.go,
+  C5 — the `peer-visibility` allow-list omits internal/router/router.go,
        cmd/server/main.go, internal/registry/ and internal/orgtoken/: a route
        rename or a registry/token regression in any of them breaks the literal
        list_peers assertion while the required gate silently no-ops.
 
-Every test below FAILS against the pre-fix allow-list module and PASSES against
-the deny-list one — that is what makes them a gate rather than a description.
+C2 is FIXED here. C5 is confirmed but deliberately NOT fixed here — see the
+`xfail(strict=True)` block below and the `peer-visibility` header in
+detect-changes.py. Inverting that profile turns a REQUIRED, docker-host E2E
+whose real arm has never once run (50/50 recent jobs took the no-op arm) into
+an every-PR gate; under branch protection `status_check_contexts=['*']` a single
+red there freezes the merge queue. It lands in the follow-up, after the real arm
+is proven green.
+
+Every C2 test below FAILS against the pre-fix allow-list module and PASSES
+against the deny-list one — that is what makes them a gate rather than a
+description.
 """
 
 from __future__ import annotations
@@ -41,7 +50,11 @@ PROFILES = detect_changes.PROFILES
 # inert"), not allow-lists ("run only if a changed path matches"). The other
 # profiles (handlers-postgres, e2e-api, template-delivery) are deliberately
 # scoped and are out of scope here.
-DENY_PROFILES = ("ci", "e2e-ephemeral", "peer-visibility")
+#
+# `peer-visibility` BELONGS in this tuple and is not in it yet — that is C5,
+# held for the follow-up (see the module docstring). The xfail block below is
+# what keeps that debt visible and self-enforcing.
+DENY_PROFILES = ("ci", "e2e-ephemeral")
 
 # The lanes of the `ci` profile that actually gate a job in ci.yml. `python` is
 # excluded on purpose: the `Python Lint & Test` job (ci.yml:698) consumes no
@@ -86,8 +99,13 @@ def test_ci_machinery_change_runs_every_gating_lane(path: str) -> None:
         assert out[lane] is True, f"{path} did not trigger ci lane {lane}: {out}"
 
 
-def test_no_deny_profile_is_blind_to_its_own_workflow() -> None:
-    """A gate must see a change to the workflow that defines it."""
+def test_no_gate_is_blind_to_its_own_workflow() -> None:
+    """A gate must see a change to the workflow that defines it.
+
+    This is also the mechanism that lets THIS PR prove the peer-visibility real
+    arm green: it edits e2e-peer-visibility.yml, which the profile matches, so
+    the gate fires its real (non-no-op) arm on this very PR.
+    """
     assert classify("e2e-ephemeral", [".gitea/workflows/e2e-ephemeral-happy-path.yml"])["happy"]
     assert classify("peer-visibility", [".gitea/workflows/e2e-peer-visibility.yml"])["peervis"]
 
@@ -101,7 +119,6 @@ def test_a_brand_new_top_level_tree_is_not_invisible() -> None:
     out = classify("ci", ["sdk/client.go"])
     for lane in CI_GATING_LANES:
         assert out[lane] is True, f"new tree sdk/ invisible to ci lane {lane}: {out}"
-    assert classify("peer-visibility", ["sdk/client.go"])["peervis"] is True
 
 
 def test_dotgitea_scripts_is_not_matched_by_the_old_anchored_scripts_pattern() -> None:
@@ -113,24 +130,53 @@ def test_dotgitea_scripts_is_not_matched_by_the_old_anchored_scripts_pattern() -
 
 
 # ---------------------------------------------------------------------------
-# C5 — the peer-visibility surface
+# C5 — the peer-visibility surface (CONFIRMED HOLE, held for the follow-up)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
     "path",
     [
-        # The four surfaces the allow-list OMITTED.
-        "workspace-server/internal/router/router.go",
-        "workspace-server/cmd/server/main.go",
-        "workspace-server/internal/registry/registry.go",
-        "workspace-server/internal/orgtoken/orgtoken.go",
-        # ...and the ones it named, which must keep working.
         "workspace-server/internal/handlers/mcp.go",
         "workspace-server/internal/handlers/mcp_tools.go",
         "workspace-server/internal/wsauth/token.go",
         "workspace-server/internal/middleware/auth.go",
         "tests/e2e/test_peer_visibility_mcp_local.sh",
         "tests/e2e/lib/peer_visibility_assert.sh",
+        ".gitea/workflows/e2e-peer-visibility.yml",
+    ],
+)
+def test_peer_visibility_sees_the_paths_its_allowlist_names(path: str) -> None:
+    """The coverage the allow-list DOES have must keep working."""
+    assert classify("peer-visibility", [path])["peervis"] is True, (
+        f"{path} did not trigger the required E2E Peer Visibility gate"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "C5 — KNOWN, CONFIRMED coverage hole, held for the follow-up PR. The "
+        "peer-visibility allow-list cannot see the route table, the binary's "
+        "wiring, the peer hierarchy or the org-token path, yet the gate boots "
+        "the whole binary and a regression in any of them breaks the literal "
+        "list_peers assertion. Fix = `deny_list()` in detect-changes.py. It is "
+        "NOT applied here because that promotes a REQUIRED docker-host E2E "
+        "whose real arm has never run green (50/50 recent jobs = no-op arm) to "
+        "every-PR, and under BP status_check_contexts=['*'] one red there "
+        "wedges the merge queue. strict=True on purpose: when the follow-up "
+        "inverts the profile these XPASS and the suite goes RED, forcing this "
+        "marker to be deleted. Do not 'fix' this by naming the four paths — "
+        "that only moves the hole."
+    ),
+)
+@pytest.mark.parametrize(
+    "path",
+    [
+        # The four surfaces the allow-list OMITS.
+        "workspace-server/internal/router/router.go",
+        "workspace-server/cmd/server/main.go",
+        "workspace-server/internal/registry/registry.go",
+        "workspace-server/internal/orgtoken/orgtoken.go",
         # The gate boots the whole binary: any package in it can break it.
         "workspace-server/internal/handlers/delegation.go",
         "workspace-server/internal/provisioner/cp_provisioner.go",

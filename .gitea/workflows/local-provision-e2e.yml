@@ -234,25 +234,21 @@ jobs:
         working-directory: workspace-server
         run: go build -o platform-server ./cmd/server
 
-      - name: Kill stale platform-server before start (issue #1046)
-        run: |
-          # Dynamic port allocation (see #2450) eliminates the fixed-port race
-          # that caused this gate to red when a prior run left a zombie process.
-          # We still sweep by process name to avoid leaking platform-server
-          # processes on the shared runner.
-          killed=0
-          for pid in $(grep -l "platform-serve" /proc/[0-9]*/comm 2>/dev/null); do
-            kpid="${pid%/comm}"; kpid="${kpid##*/}"
-            cmdline=$(cat "/proc/${kpid}/cmdline" 2>/dev/null | tr '\0' ' ')
-            if echo "$cmdline" | grep -q "platform-server"; then
-              echo "Killing stale platform-server pid ${kpid}: ${cmdline}"
-              kill "$kpid" 2>/dev/null || true
-              killed=$((killed + 1))
-            fi
-          done
-          if [ "$killed" -gt 0 ]; then echo "Killed $killed stale platform-server process(es)."; else echo "No platform-server-named process found."; fi
-          sleep 1
-
+      # The "Kill stale platform-server before start" step here is DELETED. Its
+      # own comment conceded the point: "Dynamic port allocation (see #2450)
+      # eliminates the fixed-port race... We still sweep by process name to
+      # avoid leaking platform-server processes on the shared runner." That is a
+      # SWEEPER standing in for a leak fix — and it swept processes it did not
+      # own. e2e-api, e2e-peer-visibility, e2e-chat and this lane share the
+      # `docker-host` runner and demonstrably overlap across PRs, so a host-wide
+      # kill-by-name reaches into a concurrent PR's live run and kills ITS
+      # platform-server mid-test. A required context then reds on a PR that
+      # changed nothing, and under branch protection status_check_contexts=['*']
+      # the merge queue freezes.
+      #
+      # The leak itself is now fixed where it happens: the server runs under
+      # `timeout`, so an orphan from a hard-cancelled run reaps ITSELF. Nothing
+      # signals a process it did not start.
       - name: Start platform (background)
         working-directory: workspace-server
         run: |
@@ -260,8 +256,14 @@ jobs:
           # DATABASE_URL/REDIS_URL/ADMIN_TOKEN/MOLECULE_ENV are inherited from
           # $GITHUB_ENV. PLATFORM_URL is also passed explicitly because
           # $GITHUB_ENV propagation can be flaky on act_runner (#2468 RCA).
+          #
+          # `timeout` bound == this job's own timeout-minutes (15): the clock
+          # starts here, after checkout/docker/go-build, so it can never fire
+          # during a healthy run — the job is already dead by then. It reaps only
+          # OUR child, never a foreign run's process.
           echo "starting platform with PLATFORM_URL=${PLATFORM_URL:-<fallback>} PORT=$PORT BIND_ADDR=0.0.0.0"
-          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" ./platform-server > platform.log 2>&1 &
+          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" \
+            timeout --signal=TERM --kill-after=30s 15m ./platform-server > platform.log 2>&1 &
           echo $! > platform.pid
 
       - name: Wait for /health (+ migrations applied)
@@ -563,29 +565,21 @@ jobs:
         working-directory: workspace-server
         run: go build -o platform-server ./cmd/server
 
-      - name: Kill stale platform-server before start (issue #1046)
-        run: |
-          # Dynamic port allocation (see #2450) eliminates the fixed-port race.
-          # We still sweep by process name to avoid leaking platform-server
-          # processes on the shared runner.
-          killed=0
-          for pid in $(grep -l "platform-serve" /proc/[0-9]*/comm 2>/dev/null); do
-            kpid="${pid%/comm}"; kpid="${kpid##*/}"
-            cmdline=$(cat "/proc/${kpid}/cmdline" 2>/dev/null | tr '\0' ' ')
-            if echo "$cmdline" | grep -q "platform-server"; then
-              echo "Killing stale platform-server pid ${kpid}: ${cmdline}"
-              kill "$kpid" 2>/dev/null || true
-              killed=$((killed + 1))
-            fi
-          done
-          if [ "$killed" -gt 0 ]; then echo "Killed $killed stale platform-server process(es)."; else echo "No platform-server-named process found."; fi
-          sleep 1
-
+      # Host-wide "Kill stale platform-server" sweep DELETED here too — same
+      # reasoning as the first job in this file (see the note above the other
+      # "Start platform" step): the port is already dynamic, so the sweep bought
+      # nothing, and on the shared `docker-host` runner it killed concurrent
+      # PRs' platform-servers, reddening required contexts on unrelated PRs and
+      # wedging the ['*'] merge queue.
       - name: Start platform (background)
         working-directory: workspace-server
         run: |
+          # `timeout` bound == this job's own timeout-minutes (30). Reaps only
+          # our own orphan if the job is hard-cancelled before the `always()`
+          # stop step; cannot fire during a healthy run.
           echo "starting platform with PLATFORM_URL=${PLATFORM_URL:-<fallback>} PORT=$PORT BIND_ADDR=0.0.0.0"
-          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" ./platform-server > platform.log 2>&1 &
+          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" \
+            timeout --signal=TERM --kill-after=30s 30m ./platform-server > platform.log 2>&1 &
           echo $! > platform.pid
 
       - name: Wait for /health (+ migrations applied)

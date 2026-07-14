@@ -110,8 +110,8 @@ PROFILES: dict[str, dict[str, str]] = {
     "e2e-api": {
         "api": r"^workspace-server/|^tests/e2e/|^\.gitea/workflows/e2e-api\.yml$",
     },
-    # ── e2e-ephemeral: INVERTED (the original deny-list; `ci` and
-    # `peer-visibility` now follow it) ───────────────────────────────────────
+    # ── e2e-ephemeral: INVERTED (the original deny-list; `ci` now follows it;
+    # `peer-visibility` is queued to, see its header below) ──────────────────
     #
     # The remaining allow-list profiles encode a bet — that we can enumerate
     # everything able to break the lane. For the ephemeral happy-path gate we
@@ -134,33 +134,52 @@ PROFILES: dict[str, dict[str, str]] = {
     "e2e-ephemeral": {
         "happy": deny_list(),
     },
-    # ── peer-visibility: INVERTED (was an allow-list; see #C5) ──────────────
+    # ── peer-visibility: STILL AN ALLOW-LIST, and it has a KNOWN coverage hole
     #
     # #1296 moved the E2E Peer Visibility path-scoping out of the workflow's
     # `on: paths:` (a REQUIRED check may not carry one — lint-required-no-
     # paths.py / feedback_path_filtered_workflow_cant_be_required) and into
     # this profile, applied per-step inside the always-running job. It was
-    # carried over as an ALLOW-list naming handlers/mcp.go, mcp_tools.go,
-    # middleware/, registry.go, workspace.go, workspace_provision.go, wsauth/,
-    # four e2e scripts and the workflow file.
+    # carried over as the ALLOW-list below.
     #
-    # That list OMITTED internal/router/router.go, cmd/server/main.go,
-    # internal/registry/ and internal/orgtoken/ — i.e. the route table that
-    # serves list_peers, the binary's wiring, the peer-hierarchy source and the
+    # C5 (OPEN — tracked by the follow-up issue; DO NOT close by editing this
+    # list): the list OMITS internal/router/router.go, cmd/server/main.go,
+    # internal/registry/ and internal/orgtoken/ — the route table that serves
+    # list_peers, the binary's wiring, the peer-hierarchy source and the
     # org-token validation the MCP call authenticates with. A route rename or a
     # registry/token regression in any of them breaks the literal list_peers
-    # assertion this gate exists to protect, and the gate would have silently
-    # no-op'd (SUCCESS, zero coverage) on the very PR that broke it. Exactly the
-    # hazard the e2e-ephemeral header above names.
+    # assertion this gate exists to protect, and the gate silently no-ops
+    # (SUCCESS, zero coverage) on the very PR that broke it. Adding those four
+    # paths would only move the hole: the gate boots the WHOLE binary, so any
+    # package in it can break it. The fix is `deny_list()`, same as
+    # e2e-ephemeral — see test_detect_changes.py's xfail block.
     #
-    # Nothing enumerable is trustworthy here: the gate boots the WHOLE
-    # workspace-server binary and provisions real workspaces, so any package in
-    # it — plus the driving scripts, the harness, the manifest and the workflow
-    # itself — can break it. So it takes the same deny-list as e2e-ephemeral:
-    # run unless the diff is provably inert (prose). Cheap to do: the real
-    # (non-no-op) job runs 20-115s on the docker-host runner.
+    # It is NOT inverted in this PR, on purpose. Inverting it promotes a
+    # REQUIRED, continue-on-error-free, docker-host E2E from "runs on ~10
+    # enumerated paths" to "runs on EVERY non-prose PR" — and its real arm is
+    # DORMANT: over a 3000-task scan of the Actions API, all 50 `E2E Peer
+    # Visibility` jobs finished in 6-40s (the no-op arm; the real docker-host
+    # e2e lanes take 164-171s). Flipping a per-PR mandatory gate on with zero
+    # green real-arm runs, under branch protection status_check_contexts=['*'],
+    # risks wedging the whole merge queue. The inversion lands in the follow-up
+    # once this PR's own run has proven the real arm green (this PR edits
+    # e2e-peer-visibility.yml, which IS in the allow-list below, so it fires
+    # the real arm on itself).
     "peer-visibility": {
-        "peervis": deny_list(),
+        "peervis": (
+            r"^workspace-server/internal/handlers/mcp\.go$"
+            r"|^workspace-server/internal/handlers/mcp_tools\.go$"
+            r"|^workspace-server/internal/middleware/"
+            r"|^workspace-server/internal/handlers/registry\.go$"
+            r"|^workspace-server/internal/handlers/workspace\.go$"
+            r"|^workspace-server/internal/handlers/workspace_provision\.go$"
+            r"|^workspace-server/internal/wsauth/"
+            r"|^tests/e2e/test_peer_visibility_mcp_staging\.sh$"
+            r"|^tests/e2e/test_peer_visibility_token_mint_staging\.sh$"
+            r"|^tests/e2e/test_peer_visibility_mcp_local\.sh$"
+            r"|^tests/e2e/lib/peer_visibility_assert\.sh$"
+            r"|^\.gitea/workflows/e2e-peer-visibility\.yml$"
+        ),
     },
     # mc#2996 / RFC#2843 #37: the template-delivery e2e is being flipped to a
     # REQUIRED status check. A required-check workflow may NOT carry an `on:
