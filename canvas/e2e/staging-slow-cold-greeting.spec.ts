@@ -208,6 +208,17 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
     if (m.type() === "error") console.log(`[console-error] ${m.text()}`);
   });
 
+  // The baseline below is only meaningful once the cold chat-history load has
+  // actually COME BACK. Snapshotting it mid-flight would baseline an empty (or
+  // partial) transcript, and the history bubbles would then land AFTER our send
+  // and masquerade as extra replies to our "hi" — a false RED of the very guard
+  // this spec exists to make trustworthy. So we watch for the real response
+  // rather than assuming it beat us here.
+  let chatHistoryLoaded = false;
+  page.on("response", (r) => {
+    if (/\/chat-history/.test(r.url())) chatHistoryLoaded = true;
+  });
+
   // FORCE the slow cold turn deterministically: hold the concierge /a2a reply so
   // the live copy is delivered ~30s after the persisted copy — independent of
   // backend warmth (a warm cache would otherwise give a fast turn that hides the
@@ -259,13 +270,14 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
   // "My Chat" is ONE long-lived conversation on a shared org, so on a cold open
   // this already renders the earlier staging specs' turns. Those bubbles are not
   // ours and must not be counted as replies to our "hi" (that is exactly what
-  // false-RED'd run 499907). Wait for the history load to STOP changing — a
-  // baseline snapshotted mid-load would let a straggler history bubble land
-  // after the send and masquerade as a second reply.
+  // false-RED'd run 499907). Wait for /chat-history to have actually RESPONDED
+  // and for the rendered set to then STOP changing across a full reconcile
+  // cycle — a baseline snapshotted mid-load would let a straggler history bubble
+  // land after the send and masquerade as a second reply.
   const baseline = agentBubbles(
     await waitForStableAgentBubbles(page, {
       stableForMs: RECONCILE_CYCLE_MS, // spans a full reconcile cycle
-      readyAt: () => Date.now(), // nothing to wait for: history is all there is
+      readyAt: () => (chatHistoryLoaded ? Date.now() : null), // no baseline before history lands
       safetyNetMs: 120_000,
     }),
   );
