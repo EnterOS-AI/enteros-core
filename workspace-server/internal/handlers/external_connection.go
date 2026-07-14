@@ -32,7 +32,60 @@ const authTokenPlaceholder = "{{AUTH_TOKEN}}"
 // re-show path (GET .../external/connection returns auth_token=""). It must
 // stay visibly non-runnable: stamping "" there yields a snippet that LOOKS
 // complete and 401s with no clue why.
+//
+// BUT "visibly non-runnable" is NOT enough on its own, and believing it was is
+// how the bug below shipped. The marker is only self-evidently useless for
+// snippets that use the token INLINE (a curl bearer, an exported env var): you
+// run it, it 401s, nothing is lost. For the snippets that PERSIST the token —
+// the Claude Code channel .env, the Kimi env file, `claude mcp add`,
+// `openclaw mcp set` — the marker is just a string, so the script runs happily
+// and OVERWRITES the operator's working credential with a dead one. The token is
+// shown ONCE, so the real one is then unrecoverable: they must rotate.
+//
+// Concretely, before the guard below: an operator with a working channel reopens
+// the modal (GET → auth_token="" → marker) and re-pastes the block; the merge
+// script filters out their real {id, platform_url} entry and pushes
+// {"token":"<ROTATE_TO_REVEAL_TOKEN>"}. Their channel starts 401ing and the only
+// copy of the token is gone.
+//
+// So every snippet that WRITES a credential must ALSO fail closed on the marker.
+// See tokenGuard* below; the invariant is pinned by
+// TestReshowSnippets_ThatPersistCredentials_RefuseToRun.
 const tokenUnavailableMarker = "<ROTATE_TO_REVEAL_TOKEN>"
+
+// tokenGuardNeedle is the substring every refusal guard matches the stamped
+// token against. Kept separate from tokenUnavailableMarker's angle brackets so
+// the guard survives a shell/JSON quoting change to the marker itself.
+const tokenGuardNeedle = "ROTATE_TO_REVEAL_TOKEN"
+
+// tokenGuardSentinel appears in EVERY refusal guard (the shell one below and
+// the JS one inside the channel snippet). The invariant test greps for THIS,
+// not for tokenGuardNeedle: the marker itself contains the needle, so a
+// needle-presence check would pass vacuously on a completely unguarded snippet.
+const tokenGuardSentinel = "molecule: this block has NO TOKEN"
+
+// tokenGuardShell is prepended to every SHELL snippet that persists the
+// credential. It must NOT `exit` — these blocks are pasted into an interactive
+// shell, and exiting would close the operator's terminal. It sets
+// MOLECULE_TOKEN_OK, and each persisting command is wrapped in a test of it, so
+// a marker-stamped paste is a NO-OP that explains itself and touches nothing.
+const tokenGuardShell = `# ── refuse to run without a real token ────────────────────────────────
+# The token is shown ONCE. If you re-opened this dialog, the block below
+# carries a placeholder instead of your token. Pasting it anyway would
+# OVERWRITE your working credential with a dead one and you would have to
+# rotate to recover. So: if the token is missing, every step below is
+# skipped and nothing on disk is touched.
+MOLECULE_TOKEN_OK=1
+case "{{AUTH_TOKEN}}" in
+  *ROTATE_TO_REVEAL_TOKEN*)
+    MOLECULE_TOKEN_OK=0
+    echo "molecule: this block has NO TOKEN (it was re-shown; the token is displayed only once)." >&2
+    echo "molecule: click Rotate to mint a new one, then copy the block again." >&2
+    echo "molecule: nothing was changed — your existing config is untouched." >&2
+    ;;
+esac
+
+`
 
 // externalSnippetTemplates — SSOT for the operator-facing snippets.
 // Adding a snippet here auto-enrolls it in BuildExternalConnectionPayload
@@ -47,6 +100,17 @@ var externalSnippetTemplates = map[string]string{
 	"codex_snippet":               externalCodexTemplate,
 	"openclaw_snippet":            externalOpenClawTemplate,
 	"kimi_snippet":                externalKimiTemplate,
+}
+
+// snippetsExemptFromTokenGuard — the ONLY snippets allowed to render without a
+// refusal guard on the re-show path, each with the reason it is safe. Every
+// other snippet must carry tokenGuardSentinel; that is enforced by
+// TestReshowSnippets_RefuseToRunWithoutAToken, which fails on any new
+// unlisted, unguarded snippet. Adding a key here is a deliberate, reviewable
+// act — it is the assertion "running this with a dead token destroys nothing".
+var snippetsExemptFromTokenGuard = map[string]string{
+	"curl_register_template": "one-shot inline request: a dead token 401s, nothing is written or replaced",
+	"python_snippet":         "source file pasted into an editor, not executed by the paste; the marker is visible in the file and no existing credential is overwritten",
 }
 
 // BuildExternalConnectionPayload assembles the gin.H payload that the
@@ -317,6 +381,17 @@ const fs = require("fs"), os = require("os");
 const p = os.homedir() + "/.claude/channels/molecule/.env";
 const KEY = "MOLECULE_WORKSPACES_JSON=";
 const entry = JSON.parse(process.env.MOLECULE_WS_ENTRY);
+// REFUSE to write without a real token. The token is shown ONCE; on the
+// re-show path the modal stamps a placeholder here. Writing it would REPLACE
+// this workspace's live entry below (filter+push) with a dead credential, and
+// the real one is then unrecoverable — rotate-only. Exiting here only ends
+// this bun process, never the operator's shell. Nothing on disk is touched.
+if (String(entry.token).includes("ROTATE_TO_REVEAL_TOKEN")) {
+  console.error("molecule: this block has NO TOKEN (it was re-shown; the token is displayed only once).");
+  console.error("molecule: click Rotate to mint a new one, then copy the block again.");
+  console.error("molecule: nothing was written — your existing .env is untouched.");
+  process.exit(1);
+}
 const lines = fs.existsSync(p) ? fs.readFileSync(p, "utf8").split("\n").filter((l) => l.trim()) : [];
 const cur = lines.find((l) => l.startsWith(KEY));
 let arr = [];
@@ -425,7 +500,7 @@ claude --dangerously-load-development-channels plugin:molecule@molecule-channel
 //
 // Origin/WAF: handled automatically by platform_auth.auth_headers()
 // in the wheel — operator doesn't need to configure anything.
-const externalUniversalMcpTemplate = `# Universal MCP — standalone register + heartbeat + outbound platform tools
+const externalUniversalMcpTemplate = tokenGuardShell + `# Universal MCP — standalone register + heartbeat + outbound platform tools
 # for any MCP-aware runtime (Claude Code, hermes, codex, etc.).
 # Pair with the Claude Code or Python SDK tab if your runtime needs
 # inbound A2A delivery (canvas messages → agent conversation turns).
@@ -452,11 +527,16 @@ pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pyp
 # 2. Wire molecule-mcp into your agent's MCP config. Claude Code:
 #    NOTE the server name is workspace-specific ("{{MCP_SERVER_NAME}}") so
 #    multiple molecule workspaces co-exist in one Claude Code session.
+#    ` + "`claude mcp add`" + ` OVERWRITES the entry for this server name, so a
+#    tokenless re-show paste would replace a working credential with a dead
+#    one — hence the MOLECULE_TOKEN_OK guard at the top of this block.
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 claude mcp add {{MCP_SERVER_NAME}} -s user -- env \
   WORKSPACE_ID={{WORKSPACE_ID}} \
   PLATFORM_URL={{PLATFORM_URL}} \
   MOLECULE_WORKSPACE_TOKEN="{{AUTH_TOKEN}}" \
   molecule-mcp
+fi
 
 # molecule-mcp registers the workspace + heartbeats every 20s in a
 # daemon thread, then runs the MCP stdio loop. Same env-var contract
@@ -555,7 +635,7 @@ if __name__ == "__main__":
 // NousResearch/hermes-agent#17751 (merged 2026-04-30) and falls back
 // to the legacy ``register_platform_adapter`` shape on older forks —
 // same wheel installs cleanly on stock or patched hermes-agent.
-const externalHermesChannelTemplate = `# Hermes channel — bridges this workspace's A2A traffic into your
+const externalHermesChannelTemplate = tokenGuardShell + `# Hermes channel — bridges this workspace's A2A traffic into your
 # hermes-agent session. No tunnel/public URL needed (long-poll based,
 # same shape as the Claude Code channel).
 #
@@ -574,10 +654,15 @@ const externalHermesChannelTemplate = `# Hermes channel — bridges this workspa
 pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
 pip install 'git+https://git.moleculesai.app/molecule-ai/hermes-channel-molecule.git'
 
-# 2. Export the workspace credentials:
+# 2. Export the workspace credentials. Guarded: ` + "`hermes gateway --replace`" + `
+#    below REPLACES a running gateway, so exporting a placeholder token and
+#    restarting would take a working channel offline with no way back to the
+#    real token (it is shown once).
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 export MOLECULE_WORKSPACE_ID={{WORKSPACE_ID}}
 export MOLECULE_PLATFORM_URL={{PLATFORM_URL}}
 export MOLECULE_WORKSPACE_TOKEN="{{AUTH_TOKEN}}"
+fi
 
 # 3. Edit ~/.hermes/config.yaml — under your existing top-level
 #    gateway: block, add a plugin_platforms entry. The platform key
@@ -597,8 +682,10 @@ export MOLECULE_WORKSPACE_TOKEN="{{AUTH_TOKEN}}"
 #    rejects duplicate top-level keys, so a second gateway: block
 #    will silently break hermes config loading.
 
-# 4. Restart the hermes gateway:
+# 4. Restart the hermes gateway (skipped without a real token — see above):
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 hermes gateway --replace
+fi
 
 # Inbound canvas messages + peer A2A now arrive as MessageEvents —
 # same dispatch path Telegram/Discord/Slack use. The agent replies via
@@ -640,7 +727,7 @@ hermes gateway --replace
 // inbound notifications/* into the active session as Op::UserInput),
 // the bridge daemon becomes redundant — the wired MCP server in
 // step 2 will deliver push natively. Until then, run both.
-const externalCodexTemplate = `# Codex external setup — outbound tools (MCP) + inbound push (bridge).
+const externalCodexTemplate = tokenGuardShell + `# Codex external setup — outbound tools (MCP) + inbound push (bridge).
 # For operators whose external agent is a codex CLI (@openai/codex)
 # session.
 #
@@ -703,12 +790,17 @@ mkdir -p ~/.codex
 #    upstream at openai/codex#17543; when that lands, the bridge
 #    becomes redundant).
 
+#    Guarded: a placeholder token here would start a daemon that 401s in a
+#    loop against the inbox — and if one is already running, you would be
+#    left believing the new one works.
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 mkdir -p ~/.codex-channel-molecule
 WORKSPACE_ID="{{WORKSPACE_ID}}" \
 PLATFORM_URL="{{PLATFORM_URL}}" \
 MOLECULE_WORKSPACE_TOKEN="{{AUTH_TOKEN}}" \
 nohup codex-channel-molecule >> ~/.codex-channel-molecule/daemon.log 2>&1 &
 disown
+fi
 
 # 4. Run codex itself for interactive use — molecule tools are
 #    available to the agent, and the bridge wakes a non-interactive
@@ -742,7 +834,7 @@ codex
 // Includes register + heartbeat + inbound activity polling + reply via
 // /notify. No public URL needed (NAT-safe). Operators paste once and run
 // in a background terminal or via launchd.
-const externalKimiTemplate = `# Kimi CLI external setup — register + heartbeat + inbound poll + reply.
+const externalKimiTemplate = tokenGuardShell + `# Kimi CLI external setup — register + heartbeat + inbound poll + reply.
 # For operators whose external agent is a Kimi CLI session.
 # No public URL needed; runs behind NAT in poll mode.
 
@@ -755,6 +847,9 @@ pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pyp
 #    on. The env file is rewritten every run (that is the credential-
 #    refresh path after a rotate); the bridge script is written ONLY if it
 #    doesn't exist yet, so the reply logic you edit below survives a re-run.
+#    The env file is REWRITTEN in place, so a tokenless re-show paste would
+#    replace a working credential with a dead one — hence the guard.
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 mkdir -p ~/.molecule-ai/kimi-{{WORKSPACE_ID}}
 chmod 700 ~/.molecule-ai/kimi-{{WORKSPACE_ID}}
 cat > ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/env <<'EOF'
@@ -763,6 +858,7 @@ PLATFORM_URL={{PLATFORM_URL}}
 MOLECULE_WORKSPACE_TOKEN={{AUTH_TOKEN}}
 EOF
 chmod 600 ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/env
+fi
 
 [ -f ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py ] || cat > ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py <<'PYEOF'
 #!/usr/bin/env python3
@@ -902,7 +998,7 @@ python3 ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py
 #   Documentation: https://doc.moleculesai.app/docs/guides/external-agent-registration
 `
 
-const externalOpenClawTemplate = `# OpenClaw MCP config — outbound tool path. For operators whose
+const externalOpenClawTemplate = tokenGuardShell + `# OpenClaw MCP config — outbound tool path. For operators whose
 # external agent is an openclaw session.
 #
 # This wires the molecule platform's A2A MCP server into openclaw's
@@ -949,7 +1045,11 @@ pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pyp
 # heartbeat — pointing openclaw at it leaves the canvas showing this
 # workspace as awaiting_agent (OFFLINE) within 60-90s even while
 # tools work.
+# ` + "`openclaw mcp set`" + ` OVERWRITES the entry for this server name, so a
+# tokenless re-show paste would replace a working credential with a dead one —
+# hence the MOLECULE_TOKEN_OK guard at the top of this block.
 WORKSPACE_TOKEN="{{AUTH_TOKEN}}"
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 openclaw mcp set {{MCP_SERVER_NAME}} "$(cat <<EOF
 {
   "command": "molecule-mcp",
@@ -962,6 +1062,7 @@ openclaw mcp set {{MCP_SERVER_NAME}} "$(cat <<EOF
 }
 EOF
 )"
+fi
 
 # 4. Start the openclaw gateway as a durable background process.
 #    A bare '&' dies when the terminal closes; nohup + log file keeps
