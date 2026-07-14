@@ -409,6 +409,38 @@ JSON
 )
 RESP=$(admin_curl -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d "$CREATE_BODY")
 WSID=$(ws_field "$RESP" "id")
+
+# RECORD WHAT WE OWN, THE MOMENT WE OWN IT.
+#
+# This runs on a SHARED docker-host daemon, concurrently with other PRs' runs of this
+# same workflow (the concurrency group is per-SHA, so it serialises a SHA against
+# itself and nothing else). The teardown therefore has to know which ws-* containers
+# are OURS.
+#
+# It used to infer that by exclusion: snapshot the ws-* containers at job start, then
+# delete anything not in that snapshot. But "not in my baseline" is not "mine" — a run
+# that starts AFTER ours creates containers that are, by construction, absent from our
+# baseline. So our teardown would find another run's LIVE workspace, classify it as our
+# own leak, and `docker rm -f` it. That is #4346, and it took down a real run: the
+# victim's container simply stopped existing mid-restart, with no error anywhere in its
+# provisioning path (last_sample_error=<none>, container_running=<none>) — which is
+# indistinguishable from a platform bug and reads exactly like a flake.
+#
+# The POST above has already told us the id, and the container is named ws-<id>. So we
+# know precisely what we own. Positive identity, recorded here rather than inferred
+# later. The id lands in the manifest BEFORE the container exists, so a crash at any
+# point after this line still leaves us able to clean up exactly our own container and
+# nobody else's.
+#
+# (If the runner itself is SIGKILLed before teardown runs, nothing here executes at
+# all — that is what the age-guarded sweep-stale-ws-orphans.yml janitor is for. That is
+# the right layer for it: it is time-based, so it cannot delete a container that is
+# still in use.)
+if [ -n "${E2E_WS_MANIFEST:-}" ] && [ -n "$WSID" ]; then
+  echo "$WSID" >> "$E2E_WS_MANIFEST"
+  echo "recorded owned workspace in manifest: $WSID"
+fi
+
 if [ -z "$WSID" ]; then
   fail "create returned no workspace id" "$RESP"
   echo "=== Results: $PASS passed, $((FAIL+1)) failed ==="

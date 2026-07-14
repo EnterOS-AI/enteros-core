@@ -31,25 +31,33 @@ on:
     paths:
       - 'scripts/**'
       - '.gitea/scripts/**'
-      # test_managed_flags_wiring.py asserts that every workflow STEP rolling the
-      # staging fleet wires STAGING_TENANT_FLAGS in. Without this path, a PR that
-      # edits ONLY a workflow — deleting that env: line, i.e. the exact mutation the
-      # test exists to catch — runs neither this guard nor ci.yml's (whose `scripts`
-      # filter is also blind to .gitea/workflows/). The guard was unreachable for its
-      # own threat model.
+      # #4322: test_managed_flags_wiring.py asserts every workflow STEP rolling the
+      # staging fleet wires STAGING_TENANT_FLAGS in — so ALL workflow files must run it,
+      # else a PR deleting that env: line (the exact mutation the test catches) runs no
+      # guard. The `.gitea/workflows/**` glob covers that (and test-ops-scripts.yml +
+      # local-provision-e2e.yml).
+      # #4346: the ws-teardown guard also asserts on the e2e driver script, which is NOT
+      # under .gitea/workflows/, so it needs its own path — else a PR reverting the
+      # teardown to the sweep that deletes a concurrent run's live container runs no
+      # guard. A guard CI does not run on the files it guards is not a guard.
       - '.gitea/workflows/**'
+      - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
   pull_request:
     branches: [main, staging]
     paths:
       - 'scripts/**'
       - '.gitea/scripts/**'
-      # test_managed_flags_wiring.py asserts that every workflow STEP rolling the
-      # staging fleet wires STAGING_TENANT_FLAGS in. Without this path, a PR that
-      # edits ONLY a workflow — deleting that env: line, i.e. the exact mutation the
-      # test exists to catch — runs neither this guard nor ci.yml's (whose `scripts`
-      # filter is also blind to .gitea/workflows/). The guard was unreachable for its
-      # own threat model.
+      # #4322: test_managed_flags_wiring.py asserts every workflow STEP rolling the
+      # staging fleet wires STAGING_TENANT_FLAGS in — so ALL workflow files must run it,
+      # else a PR deleting that env: line (the exact mutation the test catches) runs no
+      # guard. The `.gitea/workflows/**` glob covers that (and test-ops-scripts.yml +
+      # local-provision-e2e.yml).
+      # #4346: the ws-teardown guard also asserts on the e2e driver script, which is NOT
+      # under .gitea/workflows/, so it needs its own path — else a PR reverting the
+      # teardown to the sweep that deletes a concurrent run's live container runs no
+      # guard. A guard CI does not run on the files it guards is not a guard.
       - '.gitea/workflows/**'
+      - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
