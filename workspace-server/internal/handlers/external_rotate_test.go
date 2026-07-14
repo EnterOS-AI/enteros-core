@@ -279,22 +279,22 @@ func TestBuildExternalConnectionPayload_StampsPlaceholders(t *testing.T) {
 	if strings.Contains(mcp, "{{MCP_SERVER_NAME}}") {
 		t.Errorf("universal_mcp_snippet still contains literal {{MCP_SERVER_NAME}}")
 	}
-	// {{PLATFORM_URL}} + {{WORKSPACE_ID}} placeholders must be substituted
-	// out of every snippet — if any snippet still contains a literal
-	// "{{PLATFORM_URL}}" or "{{WORKSPACE_ID}}", a future template author
-	// forgot to use the placeholder convention and operators see broken
-	// snippets.
-	for _, k := range []string{
-		"curl_register_template", "python_snippet",
-		"claude_code_channel_snippet", "universal_mcp_snippet",
-		"hermes_channel_snippet", "codex_snippet", "openclaw_snippet",
-	} {
+	// Every placeholder must be substituted out of every snippet — if any
+	// snippet still contains a literal "{{PLATFORM_URL}}", "{{WORKSPACE_ID}}"
+	// or "{{AUTH_TOKEN}}", a future template author forgot to use the
+	// placeholder convention (or forgot to teach stamp() about a new one) and
+	// operators see broken snippets.
+	//
+	// The loop ranges over externalSnippetTemplates rather than a
+	// hand-maintained list of keys: a hand-maintained list is the same
+	// "author must remember to add a row" failure mode that let the canvas
+	// fixture drift (#79). New snippet → automatically covered here.
+	for k := range externalSnippetTemplates {
 		v, _ := got[k].(string)
-		if strings.Contains(v, "{{PLATFORM_URL}}") {
-			t.Errorf("%s still contains literal {{PLATFORM_URL}}", k)
-		}
-		if strings.Contains(v, "{{WORKSPACE_ID}}") {
-			t.Errorf("%s still contains literal {{WORKSPACE_ID}}", k)
+		for _, ph := range []string{"{{PLATFORM_URL}}", "{{WORKSPACE_ID}}", "{{AUTH_TOKEN}}"} {
+			if strings.Contains(v, ph) {
+				t.Errorf("%s still contains literal %s", k, ph)
+			}
 		}
 	}
 }
@@ -374,22 +374,31 @@ func TestBuildExternalConnectionPayload_McpServerNameUniquePerWorkspace(t *testi
 //     `openclaw mcp set <same-name>` overwrites.
 //   - hermes: ~/.hermes/config.yaml gateway.plugin_platforms.<key>:
 //     YAML rejects duplicate mapping keys.
-//   - kimi: ~/.molecule-ai/kimi-<slug>/ per-workspace dir — single
-//     "kimi-workspace" dir would have both workspaces' envs collide.
 //
-// All four must therefore stamp the workspace-specific
-// {{MCP_SERVER_NAME}} slug. This test catches a future template author
-// who introduces a new runtime tab without plumbing the slug.
+// The first three key an MCP-host config namespace by NAME, so they must
+// stamp the workspace-specific {{MCP_SERVER_NAME}} slug. This test catches a
+// future template author who introduces a new runtime tab without plumbing it.
+//
+//   - kimi is the exception: it registers no MCP server-name entry anywhere,
+//     it just needs a private directory. So it keys on {{WORKSPACE_ID}}, which
+//     is unique BY CONSTRUCTION. The name-slug is NOT: mcpServerNameForWorkspace
+//     documents that two identically-named workspaces slugify identically
+//     (external_connection.go:144-148) — which for kimi meant workspace B's
+//     `cat > .../env` silently overwriting workspace A's credentials in a
+//     shared kimi-molecule-<same-slug>/ dir. Slug-keying is a collision the
+//     other three tolerate (the config format itself errors or overwrites
+//     loudly); kimi's dir is the one place it silently destroys data.
 func TestBuildExternalConnectionPayload_AllRuntimeSnippetsAreWorkspaceUnique(t *testing.T) {
 	got := BuildExternalConnectionPayload("https://p.test", "id-a", "my-bot", "tok")
 
-	// Per-template literal that proves the slug was stamped through.
+	// Per-template literal that proves the per-workspace key was stamped through.
 	wantPerSnippet := map[string]string{
-		"universal_mcp_snippet": "claude mcp add molecule-my-bot ",
-		"codex_snippet":         "[mcp_servers.molecule-my-bot]",
-		"openclaw_snippet":      "openclaw mcp set molecule-my-bot ",
+		"universal_mcp_snippet":  "claude mcp add molecule-my-bot ",
+		"codex_snippet":          "[mcp_servers.molecule-my-bot]",
+		"openclaw_snippet":       "openclaw mcp set molecule-my-bot ",
 		"hermes_channel_snippet": "          molecule-my-bot:",
-		"kimi_snippet":          "~/.molecule-ai/kimi-molecule-my-bot",
+		// Workspace-ID-keyed, not slug-keyed — see the note above.
+		"kimi_snippet": "~/.molecule-ai/kimi-id-a",
 	}
 	for key, needle := range wantPerSnippet {
 		v, _ := got[key].(string)

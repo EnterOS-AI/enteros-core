@@ -194,8 +194,15 @@ Do not reintroduce `molecule-core/workspace/` or vendored `molecule_runtime/`
 copies in consumers. Core and templates consume the published runtime package
 from the Gitea package registry.
 
-For local external MCP agents, multi-workspace config is
-`MOLECULE_WORKSPACES=[{"id":"...","token":"...","platform_url":"..."}]`.
+For local external MCP agents, the multi-workspace config key is
+`MOLECULE_WORKSPACES_JSON` (that is the name `parseWorkspaceTargets` in
+`@molecule-ai/mcp-server` actually reads — there is no `MOLECULE_WORKSPACES`).
+The shape is documented once, canonically, in
+[docs/guides/external-agent-registration.md](docs/guides/external-agent-registration.md#multiple-workspaces-from-one-local-mcp-bridge);
+the operator-facing snippet is generated from
+`workspace-server/internal/handlers/external_connection.go`. Do not restate the
+shape in a new place — a second copy is how the key name drifts, and a snippet
+built against the wrong key fails silently.
 `platform_url` selects the tenant; `org_id` is not part of this config.
 Workspace IDs can differ across orgs.
 

@@ -245,7 +245,7 @@ The result is not just “an agent that learns.” It is **an organization that 
 - Claude Code plugin that bridges Molecule A2A traffic into a local Claude Code session via MCP
 - subscribe to one or more workspaces; peer messages surface as conversation turns; replies route back through Molecule's A2A
 - no tunnel, no public endpoint — the plugin self-registers each watched workspace as `delivery_mode=poll` and long-polls `/activity?since_id=…`
-- multi-tenant friendly: one plugin install can watch workspaces across multiple Molecule tenants (`MOLECULE_PLATFORM_URLS` per-workspace)
+- multi-tenant friendly: one plugin install can watch workspaces across multiple Molecule tenants — each workspace carries its own tenant URL in the `MOLECULE_WORKSPACES_JSON` array ([canonical shape](docs/guides/external-agent-registration.md#multiple-workspaces-from-one-local-mcp-bridge))
 - install via the standard marketplace flow: `/plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git` → `/plugin install molecule@molecule-channel`, then launch with `claude --dangerously-load-development-channels=plugin:molecule@molecule-channel`
 
 ### Self-host a workspace — the `molecules` CLI (via [`molecule-workspace-cli`](https://git.moleculesai.app/molecule-ai/molecule-workspace-cli))

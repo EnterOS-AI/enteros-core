@@ -133,59 +133,19 @@ export function ExternalConnectModal({ info, onClose }: Props) {
 
   if (!info) return null;
 
-  // Python snippet is stamped server-side with workspace_id +
-  // platform_url but leaves AUTH_TOKEN as a "<paste …>" placeholder
-  // (that's what we're showing in the modal). Fill in the real
-  // token here so the snippet the operator copies is truly ready-to-run.
-  const filledPython = info.python_snippet.replace(
-    'AUTH_TOKEN    = "<paste from create response>"',
-    `AUTH_TOKEN    = "${info.auth_token}"`,
-  );
-  const filledCurl = info.curl_register_template.replace(
-    'WORKSPACE_AUTH_TOKEN="<paste from create response>"',
-    `WORKSPACE_AUTH_TOKEN="${info.auth_token}"`,
-  );
-  // The channel snippet asks the operator to paste the auth_token into
-  // the .env file's MOLECULE_WORKSPACE_TOKENS field. Stamp it server-side
-  // here so the copy-paste-block is truly ready-to-run.
-  const filledChannel = info.claude_code_channel_snippet?.replace(
-    'MOLECULE_WORKSPACE_TOKENS=<paste auth_token from create response>',
-    `MOLECULE_WORKSPACE_TOKENS=${info.auth_token}`,
-  );
-  // Universal MCP snippet uses MOLECULE_WORKSPACE_TOKEN as the env-var
-  // name passed through to molecule-mcp via `claude mcp add ... -- env
-  // MOLECULE_WORKSPACE_TOKEN=...`. The placeholder must match the
-  // template's literal — pre-2026-04-30 polish this looked for
-  // WORKSPACE_AUTH_TOKEN (carryover from the curl tab), which silently
-  // skipped the substitution and left "<paste from create response>"
-  // visible in the operator's clipboard.
-  const filledUniversalMcp = info.universal_mcp_snippet?.replace(
-    'MOLECULE_WORKSPACE_TOKEN="<paste from create response>"',
-    `MOLECULE_WORKSPACE_TOKEN="${info.auth_token}"`,
-  );
-  // Hermes channel snippet uses MOLECULE_WORKSPACE_TOKEN (same env-var
-  // name as Universal MCP). Stamp the auth_token in so the operator's
-  // copy-paste is fully ready-to-run.
-  const filledHermes = info.hermes_channel_snippet?.replace(
-    'MOLECULE_WORKSPACE_TOKEN="<paste from create response>"',
-    `MOLECULE_WORKSPACE_TOKEN="${info.auth_token}"`,
-  );
-  // Codex + OpenClaw snippets carry the placeholder inside the
-  // generated config block (TOML / JSON respectively). Stamp the
-  // token in so the copy-paste is one less manual edit.
-  const filledCodex = info.codex_snippet?.replace(
-    'MOLECULE_WORKSPACE_TOKEN = "<paste from create response>"',
-    `MOLECULE_WORKSPACE_TOKEN = "${info.auth_token}"`,
-  );
-  const filledOpenClaw = info.openclaw_snippet?.replace(
-    'WORKSPACE_TOKEN="<paste from create response>"',
-    `WORKSPACE_TOKEN="${info.auth_token}"`,
-  );
-  // Kimi snippet carries the placeholder inside the shell heredoc.
-  const filledKimi = info.kimi_snippet?.replace(
-    'MOLECULE_WORKSPACE_TOKEN=<paste from create response>',
-    `MOLECULE_WORKSPACE_TOKEN=${info.auth_token}`,
-  );
+  // The server stamps EVERY value, including the auth_token
+  // ({{AUTH_TOKEN}} in external_connection.go stamp()). The modal does NO
+  // credential fix-up: string-matching a server-owned template from the
+  // client is unfixable in principle — a template edit silently orphans the
+  // needle with no compile error and no test failure (#79).
+  const filledPython = info.python_snippet;
+  const filledCurl = info.curl_register_template;
+  const filledChannel = info.claude_code_channel_snippet;
+  const filledUniversalMcp = info.universal_mcp_snippet;
+  const filledHermes = info.hermes_channel_snippet;
+  const filledCodex = info.codex_snippet;
+  const filledOpenClaw = info.openclaw_snippet;
+  const filledKimi = info.kimi_snippet;
 
   // Build the tab list once so both the tab bar and keyboard handler
   // share the same ordered array. Computed here (after all filled* vars)

@@ -42,11 +42,13 @@ on:
     branches: [main, staging]
     paths:
       - 'workspace-server/internal/handlers/**'
+      - 'canvas/src/components/__tests__/__fixtures__/**'
       - '.gitea/workflows/e2e-external-connect-snippet.yml'
   pull_request:
     branches: [main, staging]
     paths:
       - 'workspace-server/internal/handlers/**'
+      - 'canvas/src/components/__tests__/__fixtures__/**'
       - '.gitea/workflows/e2e-external-connect-snippet.yml'
 
 concurrency:
@@ -92,6 +94,35 @@ jobs:
         # Hermetic: sqlmock + miniredis + gin httptest — no live infra, no
         # postgres/redis service. -run selects only this lane's tests; the rest
         # of the handlers suite is exercised by the required Platform (Go) gate.
+        #
+        # Two leak classes, same class-level shape (both read the fields off the
+        # RESPONSE, so a snippet added later is gated automatically):
+        #   • internal ADDRESS  — TestE2E_ExternalConnectSnippet_PublicHTTPSNoInternal
+        #                         / _DefenseInDepthPlatformURL / TestLeakLint_*
+        #   • CREDENTIAL (#79)  — TestE2E_ExternalConnectSnippet_CredentialStampedAtHTTPBoundary
+        #                         (mint path: every snippet carries the minted token,
+        #                          no "<paste …>", no "{{…}}")
+        #                         / _ReshowStaysVisiblyIncomplete (re-show path keeps
+        #                          <ROTATE_TO_REVEAL_TOKEN> at the credential site)
         run: |
           go test -count=1 -timeout 5m -v ./internal/handlers/ \
             -run '^TestE2E_ExternalConnectSnippet|^TestLeakLint_'
+
+      - name: Canvas golden fixture is real server output (not a hand-copy)
+        # The canvas modal's vitest suite asserts against
+        # canvas/src/components/__tests__/__fixtures__/external-connection.golden.json.
+        # That file MUST be live BuildExternalConnectionPayload output — a
+        # hand-written fixture is derived from the code under test, so its fail
+        # arm is unreachable by construction, which is precisely how #79 shipped
+        # green. Regenerate + diff: a stale fixture (or an unregenerated template
+        # edit) reds here.
+        run: |
+          MOLECULE_UPDATE_GOLDEN=1 go test -count=1 ./internal/handlers/ \
+            -run '^TestWriteExternalConnectionGolden$'
+          cd "${GITHUB_WORKSPACE}"
+          git diff --exit-code -- canvas/src/components/__tests__/__fixtures__/external-connection.golden.json \
+            || {
+              echo "::error::canvas golden fixture is stale — run:"
+              echo "  cd workspace-server && MOLECULE_UPDATE_GOLDEN=1 go test ./internal/handlers/ -run TestWriteExternalConnectionGolden"
+              exit 1
+            }
