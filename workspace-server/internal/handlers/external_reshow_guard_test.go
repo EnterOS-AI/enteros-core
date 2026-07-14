@@ -38,6 +38,7 @@ var credentialPersistVerbs = []string{
 	"cat > ",            // kimi env file (heredoc)
 	"tee ",              // any redirect-free write
 	"gateway --replace", // hermes: kills the running gateway, restarts on the new token
+	"save_token(",       // Python SDK: overwrites ~/.molecule/<workspace>/.auth_token
 }
 
 // snippetPersistsCredential reports whether a rendered snippet contains a
@@ -111,6 +112,152 @@ func TestReshowSnippets_RefuseToRunWithoutAToken(t *testing.T) {
 	}
 }
 
+// TestShellReshowSnippets_SkipEveryExecutableStep executes each guarded shell
+// snippet with a marker token, an empty HOME, and a PATH containing no external
+// commands. A credential-only guard is insufficient: installers, mkdir, bridge
+// file writes, and runtime starts must also be skipped when the dialog is
+// re-shown without a token. With `set -eu`, reaching any executable command is
+// an immediate failure; the empty HOME assertion catches built-in redirections.
+func TestShellReshowSnippets_SkipEveryExecutableStep(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash not on PATH: %v", err)
+	}
+	p := BuildExternalConnectionPayload("https://app.example.com", "ws-abc123", "My Agent", "")
+	guarded := []string{
+		"claude_code_channel_snippet",
+		"universal_mcp_snippet",
+		"hermes_channel_snippet",
+		"codex_snippet",
+		"openclaw_snippet",
+		"kimi_snippet",
+	}
+
+	for _, key := range guarded {
+		t.Run(key, func(t *testing.T) {
+			home := t.TempDir()
+			snippet := p[key].(string)
+			cmd := exec.Command(bash, "-eu")
+			cmd.Env = []string{"HOME=" + home, "PATH=/molecule-no-external-commands"}
+			cmd.Stdin = strings.NewReader("set -o pipefail\n" + snippet)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("marker-stamped snippet reached an executable step instead of skipping the whole setup: %v\n%s", err, out)
+			}
+			entries, err := os.ReadDir(home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("marker-stamped snippet changed HOME; entries=%v", entries)
+			}
+		})
+	}
+}
+
+// TestRuntimeInstallFailure_SkipsDependentSetup models an interactive paste
+// where mktemp/pip fails. A bare failing command does not stop an interactive
+// shell, so each template must explicitly suppress bridge installs, config
+// writes, and agent starts, then return non-zero with actionable output.
+func TestRuntimeInstallFailure_SkipsDependentSetup(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash not on PATH: %v", err)
+	}
+	p := BuildExternalConnectionPayload("https://app.example.com", "ws-abc123", "My Agent", "wst_live_TOKEN")
+	runtimeBacked := []string{
+		"universal_mcp_snippet",
+		"hermes_channel_snippet",
+		"codex_snippet",
+		"openclaw_snippet",
+		"kimi_snippet",
+	}
+
+	for _, key := range runtimeBacked {
+		t.Run(key, func(t *testing.T) {
+			bin := t.TempDir()
+			mktempStub := filepath.Join(bin, "mktemp")
+			if err := os.WriteFile(mktempStub, []byte("#!/bin/sh\nexit 42\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(bash)
+			cmd.Env = []string{"HOME=" + t.TempDir(), "PATH=" + bin}
+			cmd.Stdin = strings.NewReader(p[key].(string))
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("runtime install failure returned success; output:\n%s", out)
+			}
+			output := string(out)
+			if !strings.Contains(output, "runtime install failed; config and agent startup were skipped") {
+				t.Fatalf("failure was not actionable or did not prove dependent setup was skipped:\n%s", output)
+			}
+			if strings.Contains(output, "command not found") {
+				t.Fatalf("a dependent command ran after runtime install failed:\n%s", output)
+			}
+		})
+	}
+}
+
+// TestPythonSnippet_ReshowRefusesBeforeSavingToken executes the re-show render
+// as a script. The SDK's save_token call overwrites the cached credential, so
+// the visible marker must abort before that method is reached.
+func TestPythonSnippet_ReshowRefusesBeforeSavingToken(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal("python3 is required to execute the operator-facing Python snippet")
+	}
+	p := BuildExternalConnectionPayload("https://app.example.com", "ws-abc123", "My Agent", "")
+	snippet := p["python_snippet"].(string)
+
+	const harness = `
+import sys
+import types
+
+class FakeClient:
+    saved = False
+    def __init__(self, workspace_id, **kwargs):
+        self.workspace_id = workspace_id
+    def save_token(self, token):
+        FakeClient.saved = True
+    def attach_inbound_server(self, server):
+        pass
+    def register(self):
+        pass
+    def load_platform_inbound_secret(self):
+        return "inbound-secret"
+    def run_heartbeat_loop(self):
+        return "stopped"
+
+class FakeServer:
+    def __init__(self, **kwargs):
+        pass
+    def start_in_background(self):
+        pass
+    def stop(self):
+        pass
+
+sdk = types.ModuleType("molecule_external_workspace")
+sdk.RemoteAgentClient = FakeClient
+sdk.A2AServer = FakeServer
+sys.modules["molecule_external_workspace"] = sdk
+
+try:
+    exec(compile(sys.stdin.read(), "python_snippet", "exec"), {"__name__": "__main__"})
+except RuntimeError as exc:
+    if "molecule: this block has NO TOKEN" not in str(exc):
+        raise
+else:
+    raise AssertionError("marker-stamped Python snippet did not refuse to run")
+
+if FakeClient.saved:
+    raise AssertionError("marker-stamped Python snippet overwrote the cached token")
+`
+	cmd := exec.Command(python, "-c", harness)
+	cmd.Stdin = strings.NewReader(snippet)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("marker-stamped Python snippet did not refuse before save_token: %v\n%s", err, out)
+	}
+}
+
 // TestTokenGuards_MatchTheMarkerActuallyStamped closes the drift between the
 // guard's needle and the marker it is supposed to catch: change
 // tokenUnavailableMarker without changing the guards and every guard becomes a
@@ -127,6 +274,9 @@ func TestTokenGuards_MatchTheMarkerActuallyStamped(t *testing.T) {
 	}
 	if !strings.Contains(externalChannelTemplate, tokenGuardNeedle) || !strings.Contains(externalChannelTemplate, tokenGuardSentinel) {
 		t.Errorf("the channel snippet's JS guard must both test for %q and emit %q", tokenGuardNeedle, tokenGuardSentinel)
+	}
+	if !strings.Contains(externalPythonTemplate, tokenGuardNeedle) || !strings.Contains(externalPythonTemplate, tokenGuardSentinel) {
+		t.Errorf("the Python snippet's guard must both test for %q and emit %q", tokenGuardNeedle, tokenGuardSentinel)
 	}
 }
 

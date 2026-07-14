@@ -1,17 +1,16 @@
 'use client';
 
-// ExternalConnectionSection — credential lifecycle controls for runtime=external
-// workspaces. Surfaced inside ConfigTab when the workspace's runtime is
-// "external"; ignored for hermes/claude-code/etc. (those have their own
-// restart-mints-token path).
+// ExternalConnectionSection — credential lifecycle controls for external-like
+// workspaces. ConfigTab currently surfaces it for external, kimi, and kimi-cli;
+// container-backed runtimes use their restart-mints-token path instead.
 //
 // Two affordances:
 //
 //   1. "Show connection info" (read-only)
 //        Fetches GET /workspaces/:id/external/connection. Returns the
-//        connect block (PLATFORM_URL, WORKSPACE_ID, all 7 snippets) WITH
-//        auth_token="". The modal masks the token field and labels it
-//        "rotate to reveal a new token — current token is unrecoverable".
+//        connect block (PLATFORM_URL, WORKSPACE_ID, all 8 snippets) WITH
+//        auth_token="". The modal explains that the live token remains active
+//        and the Fields tab renders the omitted value as "(missing)".
 //
 //   2. "Rotate credentials" (destructive)
 //        POST /workspaces/:id/external/rotate. Revokes any prior live

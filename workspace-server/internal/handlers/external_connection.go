@@ -85,6 +85,32 @@ case "{{AUTH_TOKEN}}" in
     ;;
 esac
 
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
+`
+
+// externalWorkspaceRuntimeInstall keeps every runtime-backed operator snippet
+// on the same reproducible install path. The private Gitea registry does not
+// proxy public PyPI dependencies, while --extra-index-url would let a public
+// package shadow the private name. Download the pinned private wheel without
+// dependencies, then let public PyPI resolve only that local wheel's deps.
+const externalWorkspaceRuntimeInstall = `RUNTIME_INSTALL_STATUS=0
+RUNTIME_DOWNLOAD="$(mktemp -d)" || RUNTIME_INSTALL_STATUS=$?
+if [ "$RUNTIME_INSTALL_STATUS" -eq 0 ]; then
+  python3 -m pip download --no-deps --dest "$RUNTIME_DOWNLOAD" \
+    --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+    molecules-workspace-runtime==0.4.4 &&
+  python3 -m pip install --index-url https://pypi.org/simple/ \
+    "$RUNTIME_DOWNLOAD"/molecules_workspace_runtime-*.whl
+  RUNTIME_INSTALL_STATUS=$?
+fi
+if [ -n "$RUNTIME_DOWNLOAD" ]; then
+  rm -rf "$RUNTIME_DOWNLOAD"
+fi
+if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
+  MOLECULE_TOKEN_OK=0
+  echo "molecule: runtime install failed; config and agent startup were skipped." >&2
+  echo "molecule: fix the pip error above, then paste this block again." >&2
+fi
 `
 
 // externalSnippetTemplates — SSOT for the operator-facing snippets.
@@ -105,10 +131,10 @@ var externalSnippetTemplates = map[string]string{
 // snippetsWithoutEnvKeyContract — snippets whose credential site is NOT an env var,
 // so the SDK credentials contract's env-key taxonomy does not apply to it.
 //
-// Exactly one qualifies: the python snippet's `AUTH_TOKEN = "…"` is a module-level
-// constant handed straight to RemoteAgentClient(auth_token=…). No process ever reads
-// an env var by that name, so requiring it to be a contract-declared key would be
-// cargo-culting the rule rather than applying it.
+// Exactly one qualifies: the python snippet's `AUTH_TOKEN = "…"` is a
+// module-level constant persisted through client.save_token(AUTH_TOKEN). No
+// process reads an env var by that name, so requiring it to be a
+// contract-declared key would be cargo-culting the rule rather than applying it.
 //
 // The exemption's PREMISE is itself asserted (see
 // TestSnippetCredentials_ConformToSDKCredentialsContract): an exempt snippet may not
@@ -116,7 +142,7 @@ var externalSnippetTemplates = map[string]string{
 // and the exemption stops being true.
 var snippetsWithoutEnvKeyContract = map[string]string{
 	"python_snippet": "python source: the credential is a module-level constant passed to " +
-		"RemoteAgentClient(auth_token=...), never an env var a runtime reads",
+		"client.save_token(...), never an env var a runtime reads",
 }
 
 // snippetsExemptFromTokenGuard — the ONLY snippets allowed to render without a
@@ -127,7 +153,6 @@ var snippetsWithoutEnvKeyContract = map[string]string{
 // act — it is the assertion "running this with a dead token destroys nothing".
 var snippetsExemptFromTokenGuard = map[string]string{
 	"curl_register_template": "one-shot inline request: a dead token 401s, nothing is written or replaced",
-	"python_snippet":         "source file pasted into an editor, not executed by the paste; the marker is visible in the file and no existing credential is overwritten",
 }
 
 // BuildExternalConnectionPayload assembles the gin.H payload that the
@@ -367,7 +392,7 @@ curl -fsS -X POST "{{PLATFORM_URL}}/registry/register" \
 // lives at git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel — polling
 // based, no tunnel required (uses /workspaces/:id/activity?since_secs=,
 // platform-side support shipped in #2300).
-const externalChannelTemplate = `# Claude Code channel — bridges this workspace's A2A traffic into your
+const externalChannelTemplate = tokenGuardShell + `# Claude Code channel — bridges this workspace's A2A traffic into your
 # Claude Code session. No tunnel/public URL needed (polling-based).
 #
 # Prereq: Bun 1.3+ installed (channel plugins are Bun scripts).
@@ -496,11 +521,12 @@ claude --dangerously-load-development-channels plugin:molecule@molecule-channel
 #     • "Inbound messages not arriving" — stderr should show
 #       "molecule channel: connected — watching N workspace(s)";
 #       verify ~/.claude/channels/molecule/.env shape is MOLECULE_WORKSPACES_JSON.
+fi
 `
 
 // externalUniversalMcpTemplate — runtime-agnostic standalone path.
 // Ships as the `molecule-mcp` console script in the
-// molecule-ai-workspace-runtime wheel published to the Gitea package registry.
+// molecules-workspace-runtime wheel published to the Gitea package registry.
 // Any MCP-aware runtime (Claude Code, hermes, codex, third-party)
 // registers it once and gets the same 8 universal tools that
 // container-bound runtimes use today: delegate_task, list_peers,
@@ -509,18 +535,18 @@ claude --dangerously-load-development-channels plugin:molecule@molecule-channel
 // Standalone: the binary itself handles register-on-startup +
 // continuous heartbeats (daemon thread, 20s cadence). No separate
 // SDK or channel process needed to keep the workspace online. The
-// only thing it does NOT yet do is poll inbound A2A messages — for
-// runtimes that need their agent to react to canvas messages or
-// peer-initiated tasks, pair with the Claude Code channel tab
-// (poll-based inbound delivery into a Claude Code session) or the
-// Python SDK tab (push-mode inbound + heartbeat).
+// only thing it does NOT yet do is poll inbound A2A messages. Claude Code can
+// use its channel tab; other runtimes need their own bridge. The Python SDK tab
+// is an authenticated push-server example to build that bridge on, not a
+// turnkey adapter into an arbitrary runtime session.
 //
 // Origin/WAF: handled automatically by platform_auth.auth_headers()
 // in the wheel — operator doesn't need to configure anything.
 const externalUniversalMcpTemplate = tokenGuardShell + `# Universal MCP — standalone register + heartbeat + outbound platform tools
 # for any MCP-aware runtime (Claude Code, hermes, codex, etc.).
-# Pair with the Claude Code or Python SDK tab if your runtime needs
-# inbound A2A delivery (canvas messages → agent conversation turns).
+# Claude Code can pair this with its channel tab for inbound turns. For other
+# runtimes, the Python SDK tab is an authenticated push-server starting point;
+# connect its handler to your runtime's session API to build an inbound bridge.
 #
 # Multi-workspace: MCP supports many servers per Claude Code session.
 # This snippet uses a workspace-specific server name ({{MCP_SERVER_NAME}})
@@ -539,7 +565,8 @@ const externalUniversalMcpTemplate = tokenGuardShell + `# Universal MCP — stan
 
 # 1. Install the workspace runtime wheel (once per machine — safe to
 #    re-run; subsequent workspaces share the same wheel):
-pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
+` + externalWorkspaceRuntimeInstall + `
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 
 # 2. Wire molecule-mcp into your agent's MCP config. Claude Code:
 #    NOTE the server name is workspace-specific ("{{MCP_SERVER_NAME}}") so
@@ -566,7 +593,7 @@ fi
 # needed when calling tools through the MCP server.
 
 # Need help?
-#   Where to install: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/molecule-ai-workspace-runtime/
+#   Where to install: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/molecules-workspace-runtime/
 #   Documentation: https://doc.moleculesai.app/docs/guides/external-agent-registration
 #   Common errors:
 #     • "Tools not appearing in your agent" — run ` + "`claude mcp list`" + ` (or
@@ -578,54 +605,84 @@ fi
 #     • "ConnectionRefused / DNS error on first call" — PLATFORM_URL must
 #       include the scheme (https://) and have NO trailing slash. Verify
 #       with: curl ${PLATFORM_URL}/healthz
+fi
+[ "$RUNTIME_INSTALL_STATUS" -eq 0 ]
+fi
 `
 
 // externalPythonTemplate uses molecule-ai-sdk's RemoteAgentClient +
-// A2AServer. Until the SDK is published to the Gitea package registry the
-// snippet pins git+main.
-const externalPythonTemplate = `# pip install 'git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@main'
+// A2AServer from the published Gitea package registry.
+const externalPythonTemplate = `# Install the pinned private SDK wheel, then resolve only its public
+# dependencies from PyPI. Using the private registry as pip's sole install
+# index cannot resolve PyYAML/requests; an unrestricted extra-index would
+# reintroduce dependency-confusion risk for the private package name.
+# SDK_DOWNLOAD="$(mktemp -d)"
+# python3 -m pip download --no-deps --dest "$SDK_DOWNLOAD" \
+#   --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+#   molecule-ai-sdk==0.5.2
+# python3 -m pip install --index-url https://pypi.org/simple/ \
+#   "$SDK_DOWNLOAD"/molecule_ai_sdk-*.whl
+# rm -rf "$SDK_DOWNLOAD"
 # (installs as molecule-ai-sdk, imports as molecule_external_workspace — the names intentionally differ)
 
-import asyncio
 from molecule_external_workspace import RemoteAgentClient, A2AServer
 
 WORKSPACE_ID  = "{{WORKSPACE_ID}}"
 PLATFORM_URL  = "{{PLATFORM_URL}}"
 AUTH_TOKEN    = "{{AUTH_TOKEN}}"
 INBOUND_URL   = "https://your-agent.example.com/a2a/inbound"  # your public HTTPS endpoint
+LOCAL_HOST = "127.0.0.1"
+LOCAL_PORT = 8080  # stable target for ngrok / Cloudflare Tunnel / reverse proxy
 
-async def handle(request: dict) -> dict:
-    # request has parts, message, task_id, idempotency_key
-    text = "".join(p.get("text", "") for p in request.get("parts", []) if p.get("type") == "text")
-    return {"parts": [{"type": "text", "text": f"echo: {text}"}]}
+if "ROTATE_TO_REVEAL_TOKEN" in AUTH_TOKEN:
+    raise RuntimeError("molecule: this block has NO TOKEN; rotate to reveal one before running it")
 
-async def main():
+def handle(request: dict) -> dict:
+    # A2A v0.3 JSON-RPC: text parts live under params.message.parts and use
+    # "kind" as the discriminator (not the legacy "type" key).
+    message = request.get("params", {}).get("message", {})
+    parts = message.get("parts", [])
+    text = "".join(p.get("text", "") for p in parts if p.get("kind") == "text")
+    return {"parts": [{"kind": "text", "text": f"echo: {text}"}]}
+
+def main():
     client = RemoteAgentClient(
         workspace_id=WORKSPACE_ID,
         platform_url=PLATFORM_URL,
-        auth_token=AUTH_TOKEN,
     )
+    client.save_token(AUTH_TOKEN)
     server = A2AServer(
         agent_id=client.workspace_id,
         inbound_url=INBOUND_URL,
         message_handler=handle,
+        host=LOCAL_HOST,
+        port=LOCAL_PORT,
     )
-    server.start_in_background()
+    client.attach_inbound_server(server)
     client.reported_url = INBOUND_URL
-    client.register()                         # one-shot announcement
-    await client.run_heartbeat_loop_async()   # keeps the workspace online
+    client.register()
+    if not client.load_platform_inbound_secret():
+        raise RuntimeError("platform did not provide inbound auth; refusing to start unauthenticated A2A server")
+    server.start_in_background()       # fail-closed from the first request
+    try:
+        client.run_heartbeat_loop()    # keeps the workspace online
+    finally:
+        server.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
 
 # Need help?
-#   Where to install: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/molecule-ai-workspace-runtime/
+#   Where to install: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/molecule-ai-sdk/
 #   Documentation: https://doc.moleculesai.app/docs/guides/external-agent-registration
 #   Common errors:
 #     • 401 from /heartbeat — AUTH_TOKEN expired or wrong workspace_id.
-#       Tokens shown only once at create time; re-create to get a fresh one.
-#     • AGENT_URL not reachable from platform — public HTTPS URL required
-#       for inbound A2A. Use ngrok or Cloudflare Tunnel if behind NAT.
+#       Use Canvas → External Connection → Rotate credentials to revoke the
+#       old token and mint a replacement without recreating the workspace.
+#     • INBOUND_URL not reachable from platform — map the public HTTPS URL
+#       to the stable loopback listener at 127.0.0.1:8080. For example,
+#       run "ngrok http 8080" and set INBOUND_URL to the HTTPS URL it prints,
+#       or configure the equivalent Cloudflare Tunnel / reverse-proxy route.
 `
 
 // externalHermesChannelTemplate — install snippet for operators whose
@@ -668,8 +725,14 @@ const externalHermesChannelTemplate = tokenGuardShell + `# Hermes channel — br
 # also supported via the plugin's dual-mode fallback.
 #
 # 1. Install the runtime + plugin:
-pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
-pip install 'git+https://git.moleculesai.app/molecule-ai/hermes-channel-molecule.git'
+` + externalWorkspaceRuntimeInstall + `
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
+python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/hermes-channel-molecule.git@1e5db15e7dc63a67ed9c96c9b85c3856b9b6eaa1'
+RUNTIME_INSTALL_STATUS=$?
+if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
+  MOLECULE_TOKEN_OK=0
+  echo "molecule: Hermes plugin install failed; config and gateway restart were skipped." >&2
+fi
 
 # 2. Export the workspace credentials. Guarded: ` + "`hermes gateway --replace`" + `
 #    below REPLACES a running gateway, so exporting a placeholder token and
@@ -721,6 +784,9 @@ fi
 #     • Plugin not discovered after install — pip show hermes-channel-molecule
 #       to confirm install. Some hermes builds need ` + "`hermes plugin reload`" + `
 #       before the new platform_plugins entry takes effect.
+fi
+[ "$RUNTIME_INSTALL_STATUS" -eq 0 ]
+fi
 `
 
 // externalCodexTemplate — for operators whose external agent is a
@@ -756,10 +822,17 @@ const externalCodexTemplate = tokenGuardShell + `# Codex external setup — outb
 # overwrite the first. Re-running this snippet for another workspace
 # ADDS a sibling table instead.
 
-# 1. Install codex CLI, the workspace runtime, and the bridge daemon:
-npm install -g @openai/codex@latest
-pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
-pip install codex-channel-molecule
+# 1. Install the workspace runtime, codex CLI, and bridge daemon:
+` + externalWorkspaceRuntimeInstall + `
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
+npm install -g @openai/codex@latest && \
+  python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/codex-channel-molecule.git@61b46ba868822e05fb4b30eb53a35baa29a8eb6c'
+RUNTIME_INSTALL_STATUS=$?
+if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
+  MOLECULE_TOKEN_OK=0
+  echo "molecule: Codex or bridge install failed; config and agent startup were skipped." >&2
+fi
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 
 # 2. Wire the molecule MCP server into codex's config.toml — this is
 #    the OUTBOUND path (codex calls list_peers / delegate_task /
@@ -837,6 +910,10 @@ codex
 #     • Canvas messages don't wake codex — step 3 (codex-channel-molecule
 #       bridge daemon) is required for inbound push. Check
 #       pgrep -f codex-channel-molecule and tail ~/.codex-channel-molecule/daemon.log.
+fi
+fi
+[ "$RUNTIME_INSTALL_STATUS" -eq 0 ]
+fi
 `
 
 // externalOpenClawTemplate — for operators whose external agent is an
@@ -882,7 +959,8 @@ const externalKimiTemplate = tokenGuardShell + `# Kimi CLI external setup — re
 # No public URL needed; runs behind NAT in poll mode.
 
 # 1. Install the workspace runtime wheel (provides HTTP client):
-pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime
+` + externalWorkspaceRuntimeInstall + `
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 
 # 2. Save credentials and the bridge script. The config dir is keyed by
 #    WORKSPACE_ID (unique by construction) — NOT by the workspace-name
@@ -1076,11 +1154,15 @@ python3 ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py
 #     -H "Content-Type: application/json" \
 #     -d '{"message":"Hello from Kimi"}'
 #
-# For push-mode inbound A2A (instead of polling), pair with the Python SDK
-# tab — but that requires a public HTTPS endpoint (ngrok / Cloudflare Tunnel).
+# For push-mode inbound A2A, use the Python SDK tab as an authenticated server
+# starting point, then connect its handler to Kimi. It requires a public HTTPS
+# endpoint (ngrok / Cloudflare Tunnel) and is not a turnkey Kimi bridge.
 #
 # Need help?
 #   Documentation: https://doc.moleculesai.app/docs/guides/external-agent-registration
+fi
+[ "$RUNTIME_INSTALL_STATUS" -eq 0 ]
+fi
 `
 
 const externalOpenClawTemplate = tokenGuardShell + `# OpenClaw MCP config — outbound tool path. For operators whose
@@ -1092,8 +1174,9 @@ const externalOpenClawTemplate = tokenGuardShell + `# OpenClaw MCP config — ou
 # running openclaw run is not wired here yet — the platform-side
 # openclaw template (template-openclaw) implements the full
 # sessions.steer push path; an external setup would need the same
-# bridge daemon the template uses. For inbound delivery on an
-# external machine today, pair with the Python SDK tab.
+# bridge daemon the template uses. The Python SDK tab is an authenticated
+# echo-server starting point for implementing that runtime-specific bridge;
+# it does not steer an OpenClaw session by itself.
 #
 # Multi-workspace: each workspace registers under a workspace-specific
 # MCP server name ("{{MCP_SERVER_NAME}}"). openclaw keys MCP servers by
@@ -1102,13 +1185,19 @@ const externalOpenClawTemplate = tokenGuardShell + `# OpenClaw MCP config — ou
 # Re-run this snippet for another workspace to ADD a sibling entry
 # instead.
 
-# 1. Install openclaw CLI + the workspace runtime wheel:
-#    The version pin (>=0.1.999) ensures the "molecule-mcp" console
-#    script is present — it is what keeps the workspace ALIVE on canvas
-#    (register-on-startup + 20s heartbeat). Older versions only ship
-#    a2a_mcp_server which does not heartbeat.
+# 1. Install the pinned workspace runtime wheel + openclaw CLI. The
+#    canonical 0.4.4 package includes the "molecule-mcp" console script,
+#    which keeps the workspace ALIVE on canvas (register-on-startup +
+#    20s heartbeat).
+` + externalWorkspaceRuntimeInstall + `
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 npm install -g openclaw@latest
-pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ "molecule-ai-workspace-runtime>=0.1.999"
+RUNTIME_INSTALL_STATUS=$?
+if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
+  MOLECULE_TOKEN_OK=0
+  echo "molecule: OpenClaw install failed; config and agent startup were skipped." >&2
+fi
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 
 # 2. Onboard openclaw against your model provider (one-time setup).
 #    --non-interactive needs an explicit --provider + --model so it
@@ -1168,4 +1257,8 @@ openclaw agent --message "list my peers"
 #     • ` + "`openclaw mcp set`" + ` rejected — the heredoc generates JSON;
 #       verify with ` + "`jq < ~/.openclaw/mcp/{{MCP_SERVER_NAME}}.json`" + ` and re-run
 #       ` + "`openclaw mcp set`" + ` if the file is malformed.
+fi
+fi
+[ "$RUNTIME_INSTALL_STATUS" -eq 0 ]
+fi
 `

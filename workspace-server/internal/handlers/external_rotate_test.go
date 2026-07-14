@@ -314,8 +314,8 @@ func TestBuildExternalConnectionPayload_TrimsTrailingSlash(t *testing.T) {
 }
 
 func TestBuildExternalConnectionPayload_BlankAuthTokenIsAllowed(t *testing.T) {
-	// Re-show path: auth_token="" is the contract; the modal masks the
-	// field and labels it "rotate to reveal a new token".
+	// Re-show path: auth_token="" is the contract; the modal explains that
+	// the live token remains active and rotation is the recovery path.
 	got := BuildExternalConnectionPayload("https://platform.test", "ws-7", "", "")
 	if got["auth_token"] != "" {
 		t.Errorf("blank token must propagate as \"\"; got %v", got["auth_token"])
