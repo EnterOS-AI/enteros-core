@@ -160,6 +160,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		}
 		c.JSON(200, gin.H{"subsystems": out})
 	})
+	registerNativeChannelCutoverInventoryRoute(r, db.DB)
 
 	// Prometheus metrics — exempt from rate limiter via separate registration
 	// (registered before Use(limiter) takes effect on this specific route — the
@@ -172,7 +173,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.GET("/workspaces/:id", wh.Get)
 
 	// C1 + C20: workspace list and life-cycle mutations gated behind AdminAuth.
-	// Fail-open when no tokens exist anywhere (fresh install / pre-Phase-30).
+	// Authentication fails closed in every environment, including fresh installs.
 	// Blocks:
 	//   C1   — unauthenticated GET /workspaces (workspace topology exposure)
 	//   C20  — unauthenticated DELETE /workspaces/:id (mass-deletion attack)
@@ -263,9 +264,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.GET("/workspaces/:id/a2a/queue/:queue_id", wh.GetA2AQueueStatus)
 
 	// Auth-gated workspace sub-routes — ALL /workspaces/:id/* paths except /a2a.
-	// Fix A (Cycle 5): single WorkspaceAuth middleware blocks C2-C5, C7-C9, C12, C13
-	// by requiring a valid bearer token for any workspace that has one on file.
-	// Legacy workspaces (no token) are grandfathered to allow rolling upgrades.
+	// Fix A (Cycle 5): single fail-closed WorkspaceAuth middleware blocks
+	// C2-C5, C7-C9, C12, and C13 unless the caller presents a valid scoped
+	// credential or verified control-plane session.
 	wsAuth := r.Group("/workspaces/:id", middleware.WorkspaceAuth(db.DB))
 	{
 		// #680: PATCH /workspaces/:id moved under WorkspaceAuth (#680 IDOR fix).
