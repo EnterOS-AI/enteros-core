@@ -2,32 +2,18 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { api } from "@/lib/api";
-import type { AuditEntry, AuditResponse } from "@/types/audit";
+import type { AuditEvent, AuditResponse } from "@/types/audit";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-type EventFilter = "all" | AuditEntry["event_type"];
-
-// Contrast note: text is rendered on near-black bg (bg-*-950/40). Every text
-// color below is chosen to pass WCAG 2.1 AA 4.5:1 on that background:
-//   blue-300   ( delegation ) ≈ 8.8:1
-//   violet-300 ( decision   ) ≈ 9.5:1
-//   yellow-200 ( gate       ) ≈ 11.5:1
-//   orange-300 ( hitl       ) ≈ 9.1:1
-const BADGE_COLORS: Record<AuditEntry["event_type"], { text: string; bg: string; border: string }> = {
-  delegation: { text: "text-blue-300",   bg: "bg-blue-950/40",   border: "border-blue-800/40" },
-  decision:   { text: "text-violet-300", bg: "bg-violet-950/40", border: "border-violet-800/40" },
-  gate:       { text: "text-yellow-200", bg: "bg-yellow-950/40", border: "border-yellow-800/40" },
-  hitl:       { text: "text-orange-300", bg: "bg-orange-950/40", border: "border-orange-800/40" },
+// Keep badge text light on the near-black badge backgrounds. The same color
+// tokens are already used by the Canvas dark theme for readable status text.
+const BADGE_COLORS: Record<string, { text: string; bg: string; border: string }> = {
+  task_start: { text: "text-blue-300",    bg: "bg-blue-950/40",    border: "border-blue-800/40" },
+  llm_call:   { text: "text-violet-300",  bg: "bg-violet-950/40",  border: "border-violet-800/40" },
+  tool_call:  { text: "text-yellow-200",  bg: "bg-yellow-950/40",  border: "border-yellow-800/40" },
+  task_end:   { text: "text-emerald-300", bg: "bg-emerald-950/40", border: "border-emerald-800/40" },
 };
-
-const FILTERS: { id: EventFilter; label: string }[] = [
-  { id: "all",        label: "All" },
-  { id: "delegation", label: "Delegation" },
-  { id: "decision",   label: "Decision" },
-  { id: "gate",       label: "Gate" },
-  { id: "hitl",       label: "HITL" },
-];
 
 const AUDIT_LIMIT = 50;
 
@@ -55,20 +41,19 @@ interface Props {
  * AuditTrailPanel — side-panel tab showing the workspace audit ledger.
  *
  * Features:
- * - Color-coded event-type badges (delegation/decision/gate/hitl)
- * - chain_valid=false tamper ⚠ indicator
- * - Event-type filter bar
- * - Cursor-based "Load more" pagination
+ * - Color-coded operation badges
+ * - Ledger-level chain_valid=false tamper warning
+ * - Offset-based "Load more" pagination
  * - Relative timestamps refreshed every 30 s
  * - Empty state with icon
  */
 export function AuditTrailPanel({ workspaceId }: Props) {
-  const [entries, setEntries] = useState<AuditEntry[]>([]);
-  const [cursor, setCursor] = useState<string | null>(null);
+  const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [total, setTotal] = useState(0);
+  const [chainValid, setChainValid] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<EventFilter>("all");
   // Relative-time "now" — refreshed every 30 s to keep labels current
   const [now, setNow] = useState(() => Date.now());
 
@@ -80,53 +65,58 @@ export function AuditTrailPanel({ workspaceId }: Props) {
   // ── URL builder (stable between renders when inputs unchanged) ─────────────
 
   const buildUrl = useCallback(
-    (cursorParam?: string | null): string => {
+    (offset = 0): string => {
       const params = new URLSearchParams();
       params.set("limit", String(AUDIT_LIMIT));
-      if (filter !== "all") params.set("event_type", filter);
-      if (cursorParam) params.set("cursor", cursorParam);
+      if (offset > 0) params.set("offset", String(offset));
       return `/workspaces/${workspaceId}/audit?${params.toString()}`;
     },
-    [workspaceId, filter]
+    [workspaceId]
   );
 
-  // ── Initial load (and on filter change) ───────────────────────────────────
+  // ── Initial load ───────────────────────────────────────────────────────────
 
-  const loadEntries = useCallback(async () => {
+  const loadEvents = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const data = await api.get<AuditResponse>(buildUrl());
-      setEntries(data.entries ?? []);
-      setCursor(data.cursor ?? null);
+      setEvents(data.events ?? []);
+      setTotal(data.total ?? 0);
+      setChainValid(data.chain_valid ?? null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load audit trail");
-      setEntries([]);
-      setCursor(null);
+      setEvents([]);
+      setTotal(0);
+      setChainValid(null);
     } finally {
       setLoading(false);
     }
   }, [buildUrl]);
 
   useEffect(() => {
-    loadEntries();
-  }, [loadEntries]);
+    loadEvents();
+  }, [loadEvents]);
 
   // ── Pagination (append next page) ─────────────────────────────────────────
 
   const loadMore = useCallback(async () => {
-    if (!cursor || loadingMore) return;
+    if (loadingMore || events.length >= total) return;
     setLoadingMore(true);
     try {
-      const data = await api.get<AuditResponse>(buildUrl(cursor));
-      setEntries((prev) => [...prev, ...(data.entries ?? [])]);
-      setCursor(data.cursor ?? null);
+      const data = await api.get<AuditResponse>(buildUrl(events.length));
+      setEvents((prev) => [...prev, ...(data.events ?? [])]);
+      setTotal(data.total ?? total);
+      // Offset pages intentionally return chain_valid=null; retain the verdict
+      // computed for the first page rather than replacing it with "unknown".
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load more entries");
     } finally {
       setLoadingMore(false);
     }
-  }, [cursor, loadingMore, buildUrl]);
+  }, [events.length, total, loadingMore, buildUrl]);
+
+  const hasMore = events.length < total;
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -140,27 +130,13 @@ export function AuditTrailPanel({ workspaceId }: Props) {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Filter bar */}
+      {/* Ledger header */}
       <div className="px-4 py-2.5 border-b border-line/40 flex items-center gap-1 overflow-x-auto shrink-0">
-        {FILTERS.map((f) => (
-          <button
-            type="button"
-            key={f.id}
-            onClick={() => setFilter(f.id)}
-            aria-pressed={filter === f.id}
-            className={`px-2 py-1 text-[10px] rounded-md font-medium transition-all shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-surface ${
-              filter === f.id
-                ? "bg-surface-card text-ink ring-1 ring-zinc-600"
-                : "text-ink-mid hover:text-ink-mid hover:bg-surface-card/60"
-            }`}
-          >
-            {f.label}
-          </button>
-        ))}
+        <span className="text-[10px] font-medium text-ink-mid">Stored audit events</span>
         <div className="flex-1" />
         <button
           type="button"
-          onClick={loadEntries}
+          onClick={loadEvents}
           className="px-2 py-1 text-[10px] bg-surface-card hover:bg-surface-card text-ink-mid rounded transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
           aria-label="Refresh audit trail"
         >
@@ -178,27 +154,45 @@ export function AuditTrailPanel({ workspaceId }: Props) {
         </div>
       )}
 
+      {chainValid === false && (
+        <div
+          role="alert"
+          className="mx-4 mt-3 px-3 py-2 bg-red-950/30 border border-red-800/40 rounded text-xs text-bad shrink-0"
+        >
+          Audit chain integrity check failed. One or more ledger events may have been tampered with.
+        </div>
+      )}
+
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4">
-        {entries.length === 0 ? (
+        {error && events.length === 0 ? (
+          /* Failed state is distinct from a successful empty ledger. */
+          <div className="flex flex-col items-center justify-center py-16 gap-3 text-center">
+            <span className="text-4xl text-ink-mid" aria-hidden="true">!</span>
+            <p className="text-sm font-medium text-ink-mid">Audit events unavailable</p>
+            <p className="text-[11px] text-ink-mid max-w-[200px] leading-relaxed">
+              Refresh the audit trail to try again.
+            </p>
+          </div>
+        ) : events.length === 0 ? (
           /* Empty state */
           <div className="flex flex-col items-center justify-center py-16 gap-3 text-center">
             <span className="text-4xl text-ink-mid" aria-hidden="true">⊟</span>
             <p className="text-sm font-medium text-ink-mid">No audit events yet</p>
             <p className="text-[11px] text-ink-mid max-w-[200px] leading-relaxed">
-              Delegation, decision, gate, and human-in-the-loop events will appear here.
+              No stored audit events are available for this workspace.
             </p>
           </div>
         ) : (
           <>
             <div className="space-y-1.5" role="list" aria-label="Audit events">
-              {entries.map((entry) => (
+              {events.map((entry) => (
                 <AuditEntryRow key={entry.id} entry={entry} now={now} />
               ))}
             </div>
 
             {/* Load more */}
-            {cursor && (
+            {hasMore && (
               <div className="mt-4 flex justify-center">
                 <button
                   type="button"
@@ -213,8 +207,8 @@ export function AuditTrailPanel({ workspaceId }: Props) {
 
             {/* Entry count footer */}
             <p className="mt-3 text-center text-[9px] text-ink-mid">
-              {entries.length} event{entries.length !== 1 ? "s" : ""} loaded
-              {cursor ? " · more available" : " · all loaded"}
+              {events.length} of {total} event{total !== 1 ? "s" : ""} loaded
+              {hasMore ? " · more available" : " · all loaded"}
             </p>
           </>
         )}
@@ -226,7 +220,7 @@ export function AuditTrailPanel({ workspaceId }: Props) {
 // ── AuditEntryRow sub-component ───────────────────────────────────────────────
 
 export interface AuditEntryRowProps {
-  entry: AuditEntry;
+  entry: AuditEvent;
   now: number;
 }
 
@@ -235,7 +229,7 @@ export interface AuditEntryRowProps {
  * Exported so tests can render it in isolation without the full panel.
  */
 export function AuditEntryRow({ entry, now }: AuditEntryRowProps) {
-  const badge = BADGE_COLORS[entry.event_type] ?? {
+  const badge = BADGE_COLORS[entry.operation] ?? {
     text: "text-ink-mid",
     bg: "bg-surface-card/40",
     border: "border-line/40",
@@ -246,41 +240,31 @@ export function AuditEntryRow({ entry, now }: AuditEntryRowProps) {
       role="listitem"
       className="rounded-lg border border-line/60 bg-surface-sunken/50 px-3 py-2.5 space-y-1.5"
     >
-      {/* Header row: badge · actor · tamper flag · timestamp */}
+      {/* Header row: operation · agent · timestamp */}
       <div className="flex items-center gap-2">
-        {/* Event-type badge */}
+        {/* Operation badge */}
         <span
           className={`shrink-0 text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded border ${badge.text} ${badge.bg} ${badge.border}`}
         >
-          {entry.event_type}
+          {entry.operation}
         </span>
 
-        {/* Actor name */}
+        {/* Agent ID */}
         <span className="text-[10px] text-ink-mid truncate flex-1 min-w-0 font-mono">
-          {entry.actor}
+          {entry.agent_id}
         </span>
-
-        {/* Tamper warning — only rendered when chain is invalid */}
-        {!entry.chain_valid && (
-          <span
-            className="shrink-0 text-[11px] text-bad font-bold leading-none"
-            title="Chain integrity check failed — this entry may have been tampered with"
-            aria-label="Chain integrity warning: tampered entry"
-            role="img"
-          >
-            ⚠
-          </span>
-        )}
 
         {/* Relative timestamp */}
         <span className="shrink-0 text-[9px] text-ink-mid">
-          {formatAuditRelativeTime(entry.created_at, now)}
+          {formatAuditRelativeTime(entry.timestamp, now)}
         </span>
       </div>
 
-      {/* Summary text */}
+      {/* Non-sensitive operation context. Hashes and HMACs stay out of the UI. */}
       <p className="text-[11px] text-ink-mid leading-relaxed break-words">
-        {entry.summary}
+        {entry.model_used ?? `Session ${entry.session_id}`}
+        {entry.human_oversight_flag ? " · human oversight" : ""}
+        {entry.risk_flag ? " · risk flagged" : ""}
       </p>
     </div>
   );
