@@ -1418,13 +1418,50 @@ func (h *WorkspaceHandler) persistUserMessageAtIngest(
 	// behind the persist-success gate.
 	hook()
 
-	// Cross-device sync (core#2697). After the user message is durably
-	// persisted, broadcast a USER_MESSAGE event so every other device
-	// connected to this workspace renders the bubble in real time.
-	// Origin device already optimistically added the message via
-	// onUserMessage; on the WS echo the same id, the client-side id-
-	// based dedup collapses the duplicate (only the first writer wins).
-	broadcastUserMessageFromA2ABody(h.broadcaster, workspaceID, messageId, body)
+	// Cross-device sync (core#2697), for CANVAS-ORIGINATED turns only.
+	// After the user's message is durably persisted, broadcast a
+	// USER_MESSAGE event so every other device connected to this
+	// workspace renders the bubble in real time. Origin device already
+	// optimistically added the message via onUserMessage; on the WS echo
+	// of the same id, the client-side id-based dedup collapses the
+	// duplicate (only the first writer wins).
+	//
+	// isChatHistoryVisible is the gate: USER_MESSAGE draws a bubble in
+	// "My Chat", the HUMAN-facing tab, so it may only fire for rows that
+	// My Chat will actually serve on reload. A peer agent's message is
+	// not a user turn — it belongs in Agent Comms (fed by the
+	// ACTIVITY_LOGGED hook above), and it is already excluded from
+	// chat-history by source_id. Broadcasting it anyway put agent-to-
+	// agent traffic in the operator's own conversation, where it also
+	// vanished on reload because chat-history never had it.
+	if isChatHistoryVisible(callerID) {
+		broadcastUserMessageFromA2ABody(h.broadcaster, workspaceID, messageId, body)
+	}
+}
+
+// isChatHistoryVisible reports whether an a2a_receive row written for
+// this caller will be served by GET /chat-history — i.e. whether it is a
+// HUMAN turn in "My Chat" rather than agent-to-agent traffic.
+//
+// It is deliberately expressed in terms of callerIDToSourceID rather than
+// re-deriving the condition, because the reader's rule IS source_id:
+// messagestore.PostgresMessageStore.queryActivityRows selects
+// `activity_type = 'a2a_receive' AND source_id IS NULL`. A canvas send
+// carries no caller workspace (the canvas authenticates with the org/admin
+// token and sets no X-Workspace-ID) so its row has source_id NULL; a peer
+// agent authenticates as itself, so its row carries source_id = <peer>.
+// Sharing the function means the live path and the history path cannot
+// disagree about what "a message in My Chat" means.
+//
+// They have now disagreed twice. core#3082 fixed the same leak for system
+// callers (the platform-fired warmup turn rendered as a blue user bubble)
+// by special-casing isSystemCaller at the persist call site — but peer
+// agents were never covered, so an A2A message from another workspace kept
+// rendering in the human's chat. This predicate covers BOTH classes at
+// once: callerIDToSourceID already normalizes system callers to NULL, and
+// any caller that is a real workspace is, by definition, not the human.
+func isChatHistoryVisible(callerID string) bool {
+	return callerIDToSourceID(callerID) == nil
 }
 
 // readUsageMap extracts input_tokens / output_tokens from the "usage" key of m.
@@ -1495,8 +1532,10 @@ func broadcastUserMessageFromA2ABody(
 	// tag the live echo role="system" (systemKind="notice"). The canvas
 	// USER_MESSAGE consumer renders it as a distinct, centered "System"
 	// note instead of a blue user bubble — the bug this fixes. Absent the
-	// marker (genuine user send, peer delegation) the role defaults to
-	// "user" on the client, so this stays a no-op for real chat.
+	// marker the role defaults to "user" on the client, so this stays a
+	// no-op for a real user send. (A PEER agent's message never reaches
+	// here: the caller gates on isChatHistoryVisible, because a peer turn
+	// is Agent Comms traffic, not a bubble in the human's chat.)
 	if messagestore.IsSelfSourceType(messagestore.RequestSourceType(body)) {
 		payload["role"] = "system"
 		payload["systemKind"] = "notice"

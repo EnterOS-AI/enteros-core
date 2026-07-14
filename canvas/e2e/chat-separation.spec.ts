@@ -101,12 +101,14 @@ test.describe("Chat Sub-Tabs", () => {
   let cleanup: () => Promise<void> = async () => {};
   let workspaceId = "";
   let workspaceName = "";
+  let workspaceAuthToken = "";
 
   test.beforeAll(async () => {
     const echo = await startEchoRuntime();
     const ws = await seedWorkspace(echo.baseURL);
     workspaceId = ws.id;
     workspaceName = ws.name;
+    workspaceAuthToken = ws.authToken;
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 
     cleanup = async () => {
@@ -155,6 +157,83 @@ test.describe("Chat Sub-Tabs", () => {
     // Switch to Agent Comms.
     await panel.getByRole("tab", { name: "Agent Comms" }).click();
     await expect(panel.locator("textarea").first()).not.toBeVisible();
+  });
+
+  // THE separation assertion (incident 2026-07-12, enter-os / CEO Assistant).
+  //
+  // Every other test in this describe checks the SHELL — that the two sub-tabs
+  // exist, switch, and keep an input box. None of them checked the CONTENT: that
+  // an agent's message actually lands in Agent Comms and NOT in the human's My
+  // Chat. So when the workspace-server broadcast a USER_MESSAGE frame for EVERY
+  // inbound A2A message — peer agents included — a peer's reply rendered as a
+  // blue user bubble in the operator's own conversation and the suite stayed
+  // green. A gate that checks the tabs but never the routing is not a gate.
+  //
+  // Two properties are load-bearing here and neither can be dropped:
+  //   1. The panel is ALREADY OPEN when the message is posted. The leak was a
+  //      LIVE WebSocket frame (ChatTab's onUserMessageBroadcast); it never
+  //      survived a reload, because GET /chat-history correctly excludes rows
+  //      with a non-NULL source_id. Post-then-open would silently pass against
+  //      the buggy build.
+  //   2. The message is posted through the REAL A2A proxy with a workspace
+  //      bearer (postA2AMessage "agent"), so the server derives a caller
+  //      workspace and writes source_id — the exact non-canvas caller class the
+  //      broadcast gate keys on. A stubbed WS frame would prove nothing.
+  test("an agent-sourced message lands in Agent Comms, NOT in My Chat", async ({ page }) => {
+    const panel = panelLocator(page);
+    const text = `peer-agent traffic ${Date.now()}`;
+
+    // BOTH sub-panels are always mounted (ChatTab hides the inactive one with a
+    // `hidden` class so its aria-controls target keeps existing). So a locator
+    // scoped to the chat panel matches text in EITHER sub-tab — useless for a
+    // test whose whole question is "which sub-tab is it in?". Scope to the two
+    // panel ids, and match EXACTLY, so the agent's "Echo: <text>" reply cannot
+    // satisfy an assertion about the message itself.
+    const myChat = panel.locator("#chat-panel-my-chat");
+    const agentComms = panel.locator("#chat-panel-agent-comms");
+    const exact = (scope: typeof myChat, t: string) => scope.getByText(t, { exact: true });
+
+    // My Chat is open and its socket is live — the exact state the operator was
+    // in when the peer's message appeared in their chat.
+    await expect(panel.getByRole("tab", { name: "My Chat" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await postA2AMessage(workspaceId, "agent", text, workspaceAuthToken);
+
+    // It must show up in Agent Comms...
+    await panel.getByRole("tab", { name: "Agent Comms" }).click();
+    await expect(
+      exact(agentComms, text).first(),
+      "an agent-to-agent message did not reach Agent Comms — the panel that exists to show it",
+    ).toBeVisible({ timeout: 15_000 });
+
+    // ...and must NOT be in the human's chat. Checked AFTER Agent Comms has
+    // rendered it, so the message has demonstrably arrived at the client: a
+    // still-in-flight message would make this assertion pass vacuously.
+    //
+    // toHaveCount(0), not not.toBeVisible(): the My Chat panel is display:none
+    // while Agent Comms is selected, so "not visible" would be trivially true
+    // even for a leaked bubble sitting in its DOM. Absence is the claim.
+    await panel.getByRole("tab", { name: "My Chat" }).click();
+    await expect(
+      exact(myChat, text),
+      "agent-to-agent traffic was injected into the human's My Chat — it renders as if the " +
+        "user typed it, then vanishes on reload because chat-history excludes source_id=<agent>. " +
+        "The live USER_MESSAGE broadcast must apply the same rule as the chat-history reader " +
+        "(workspace-server: isChatHistoryVisible / source_id IS NULL).",
+    ).toHaveCount(0);
+
+    // The other half of the exchange: the agent's REPLY to that message is just
+    // as much agent-to-agent traffic. If only the inbound side were suppressed,
+    // the human would see a reply to a message they never saw — a conversation
+    // with one side missing.
+    await expect(
+      myChat.getByText(`Echo: ${text}`),
+      "the agent's REPLY to a peer's message leaked into the human's My Chat — the inbound " +
+        "message is correctly hidden, so the operator sees a reply to a message that was " +
+        "never shown to them",
+    ).toHaveCount(0);
   });
 
   test("switching back to My Chat preserves messages", async ({ page }) => {
