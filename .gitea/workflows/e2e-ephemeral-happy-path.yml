@@ -12,20 +12,37 @@ name: E2E Ephemeral CP Happy Path
 # (branch protection on main is status_check_contexts=['*'], so every POSTED
 # context must be success). It also ALWAYS fires (no paths filter).
 #
-# ENFORCED as of 2026-07-14: the context is now ABOVE the first `# pending-`
-# marker in .gitea/required-contexts.txt, so gitea-merge-queue.py additionally
-# requires it to be PRESENT and green on the PR head. Those are two different
-# guarantees and the second one was missing:
+# PROMOTED (but NOT YET LIVE) as of 2026-07-14. Read this carefully before you
+# rely on it — the honest state is narrower than it looks.
+#
+# The context is now ABOVE the first `# pending-` marker in
+# .gitea/required-contexts.txt, which is where gitea-merge-queue.py's
+# `enforced_file_contexts` check (step 4b) reads its list. The INTENT is the
+# second of two different guarantees:
 #
 #   BP ['*']            → a posted RED blocks.       Blind to a context that never posts.
-#   required-contexts   → a MISSING context blocks.  This is the new half.
+#   required-contexts   → a MISSING context blocks.  The half we do not have.
 #
-# It matters because "never posts" is reachable: narrow the `on:` filter, disable
-# the workflow, rename the job, or have the run cancelled while still queued —
-# and BP sees a clean board and merges. The line was appended to the END of
-# required-contexts.txt in #4271, which landed it under `# pending-#3159`, i.e.
-# in the DOCUMENTED-but-not-enforced half. The commit said "make it REQUIRED";
-# the file said otherwise, and the file is what the merge queue reads.
+# "Never posts" is reachable — narrow the `on:` filter, disable the workflow,
+# rename the job, or have the run cancelled while still queued — and BP sees a
+# clean board and merges with the gate silently absent.
+#
+# BUT step 4b IS CURRENTLY UNREACHABLE (task #118). Step 4 runs first and checks
+# branch protection's own context list, and BP on main is `['*']`. The queue
+# treats '*' as a LITERAL context name, looks it up among the posted statuses,
+# does not find it, and returns `wait` — on every PR, even a fully green one:
+#
+#   required_contexts_green(all_green_statuses, ['*']) -> (False, ['*=missing'])
+#
+# There is no wildcard expansion anywhere in gitea-merge-queue.py. So the file's
+# enforcement is inert for ALL of its entries, not just this one, and every merge
+# on main is in fact performed by a human, not the queue actor.
+#
+# The promotion is therefore CORRECT AND NECESSARY BUT NOT YET OPERATIVE: it is
+# the right line in the right place, and it starts working the moment #118 lands.
+# What actually protects this gate TODAY is BP ['*'] on a posted red, plus the
+# fail-closed arms and the runtime sentinel below. Do not cite this block as
+# proof that a missing context blocks a merge. It does not. Yet.
 #
 # NOT-yet-true, so do not read comfort into the above: this gate is still
 # NONDETERMINISTIC (task #99 — it has gone red on main since the flip, e.g.
@@ -346,7 +363,9 @@ jobs:
           # DIND mode — everything inside the disposable daemon; $BASE/$DOCKER_HOST
           # come from the "Start disposable dind" step via GITHUB_ENV.
           EPHEMERAL_DIND: "1"
-        run: bash tests/e2e/ephemeral_cp_happy_path.sh
+        run: |
+          bash tests/e2e/ephemeral_cp_happy_path.sh
+          echo "GATE_ARM=proof" >> "$GITHUB_ENV"
 
       # Atomic teardown: one rm destroys the entire nested topology (CP, PG,
       # tenants, workspaces, volumes, networks, built images) — even after a
@@ -360,6 +379,25 @@ jobs:
         env:
           DIND_NS: ${{ github.run_id }}-ephemeral
         run: bash tests/harness/dind.sh down
+
+      # THE CATCH-ALL. A job whose every step SKIPS still SUCCEEDS — and this
+      # context is a required one, so a green with no arm run is a silent hole.
+      # That is not hypothetical: the guard suite for this very file passed
+      # `5 OK` against a workflow whose proof step was `if: false`. Shape-matching
+      # step conditions cannot catch that; a runtime sentinel can.
+      #
+      # Exactly one arm must have run: `proof` (the gate) or `noop` (docs-only).
+      # The fork arm exits 1 and never reaches here.
+      - name: Assert an arm actually ran (no silent green)
+        if: always() && !cancelled()
+        run: |
+          set -euo pipefail
+          ARM="${GATE_ARM:-}"
+          if [ -z "$ARM" ]; then
+            echo "::error::NO ARM RAN. Every step in this job skipped, so the job would have posted SUCCESS on a REQUIRED context having proved nothing. Some `if:` condition is wrong — the gate did not run, and it did not honestly no-op either."
+            exit 1
+          fi
+          echo "arm=$ARM"
 
       # Fork PR + code diff: FAIL. A fork gets no e2e creds by design, so the gate
       # cannot run — and a gate that cannot observe its subject must not report
@@ -388,3 +426,4 @@ jobs:
           echo "Every changed path is inert (docs/** or *.md)."
           echo "The ephemeral happy-path topology cannot be affected by this diff, so it was not spun up."
           echo "This context is GREEN so the required check is satisfied without burning ~6min + a live LLM call."
+          echo "GATE_ARM=noop" >> "$GITHUB_ENV"

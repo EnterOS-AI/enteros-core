@@ -38,6 +38,8 @@ exits 0 on an enforced context is a silent, permanent hole.
 
 import re
 import unittest
+
+import yaml
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -121,79 +123,123 @@ class TestEphemeralGateIsEnforced(unittest.TestCase):
         )
 
     def test_gating_job_has_no_continue_on_error(self):
-        """Negative control: add `continue-on-error: true` to happy-path -> this reds."""
-        text = code_only(WORKFLOW.read_text())
-        happy = text.split("\n  happy-path:", 1)[1]
-        # Only the job's own keys, i.e. up to the first step.
-        job_header = happy.split("\n    steps:", 1)[0]
-        self.assertNotIn(
-            "continue-on-error: true",
-            job_header,
-            "The happy-path job is masked with continue-on-error: true. Task #113 "
-            "proved the mask does not even suppress the commit status under BP "
-            "['*'] — so it buys nothing and lies to the reader about whether this "
-            "gate can fail.",
+        """Negative control: add `continue-on-error: true` to happy-path -> this reds.
+
+        Parsed, not string-matched: `continue-on-error: ${{ true }}` is just as much a
+        mask, and a substring check for the literal `true` misses it.
+        """
+        wf = yaml.safe_load(WORKFLOW.read_text())
+        coe = wf["jobs"]["happy-path"].get("continue-on-error", False)
+        self.assertIn(
+            coe,
+            (False, None),
+            f"The happy-path job sets continue-on-error={coe!r}. Task #113 proved the "
+            "mask does not even suppress the commit status under BP ['*'] — it buys "
+            "nothing and lies to the reader about whether this gate can fail.",
         )
 
     def test_no_arm_can_exit_green_without_running_the_gate(self):
-        """The property, not the shape: every non-running arm must FAIL, not skip.
+        """The property, not the shape.
 
-        Negative control: revert the fork step to `::notice::` with no `exit 1`, or
-        delete the empty-secret check in the creds step -> this reds.
+        A Gitea job whose every step SKIPS still SUCCEEDS. So on a REQUIRED
+        context, "the gate did not run" and "the gate passed" are the same commit
+        status unless something at RUNTIME says otherwise.
 
-        Both of these were real: the fork arm posted SUCCESS on an enforced context
-        with a cheerful notice, and the creds step succeeded on an EMPTY Infisical
-        value while every downstream step was gated on `env.AUTO_SYNC_TOKEN != ''`
-        and therefore skipped. Either one turns the gate green having proved
-        nothing — an Infisical rotation would have silently disarmed the lane.
+        The first version of this test string-matched step conditions, and an
+        adversarial review broke it in one line: set the proof step to `if: false`
+        and the guard still reported `5 OK` while the job posted SUCCESS having
+        spun up nothing. Shape-matching cannot express "some arm ran" — there is
+        always another way to skip every arm.
+
+        So the workflow now stamps GATE_ARM at runtime and a final `if: always()`
+        step FAILS when no arm stamped it. This test asserts that machinery exists
+        and is wired to every arm. Negative controls, all performed:
+          - proof step `if: false`            -> sentinel step fails the job (runtime)
+          - delete the sentinel step          -> this test reds
+          - drop the stamp from either arm    -> this test reds
         """
-        text = code_only(WORKFLOW.read_text())
+        wf = yaml.safe_load(WORKFLOW.read_text())
+        steps = wf["jobs"]["happy-path"]["steps"]
 
-        # The fork arm must fail closed on a code diff.
-        fork_steps = [
-            b
-            for b in text.split("\n      - name:")
-            if "head.repo.fork == true" in b.split("run:", 1)[0]
+        def run_of(s):
+            return s.get("run") or ""
+
+        # (a) The two GREEN-capable arms must each stamp a distinct GATE_ARM.
+        proof = [s for s in steps if "ephemeral_cp_happy_path.sh" in run_of(s)]
+        self.assertEqual(len(proof), 1, "expected exactly one proof step")
+        self.assertIn(
+            "GATE_ARM=proof",
+            run_of(proof[0]),
+            "The proof step does not stamp GATE_ARM=proof, so nothing at runtime can "
+            "tell whether the gate actually ran. `if: false` on this step would post a "
+            "GREEN required context with zero coverage.",
+        )
+
+        # The proof step's `if:` must be the REAL run-arm condition. A constant
+        # (`if: false`) is caught at runtime by the sentinel, but catching it here
+        # too means you learn at test time instead of burning a CI run.
+        proof_if = str(proof[0].get("if", ""))
+        self.assertIn(
+            "needs.detect.outputs.happy",
+            proof_if,
+            f"The proof step's condition is {proof_if!r} — it does not depend on the "
+            "detect output, so it is not the run-arm condition. A constant-false `if:` "
+            "here means the gate never runs.",
+        )
+
+        noop = [s for s in steps if "GATE_ARM=noop" in run_of(s)]
+        self.assertEqual(
+            len(noop), 1,
+            "The docs-only no-op arm does not stamp GATE_ARM=noop. Without it the "
+            "sentinel cannot distinguish 'honestly no-op'd' from 'every arm skipped'.",
+        )
+
+        # (b) The catch-all must exist, run unconditionally, and be able to FAIL.
+        sentinel = [
+            s for s in steps
+            if "GATE_ARM" in run_of(s) and "exit 1" in run_of(s) and "::error::" in run_of(s)
         ]
         self.assertTrue(
-            fork_steps,
-            "No fork-PR arm found at all. A fork gets no e2e creds, so it must have "
-            "an arm — and that arm must FAIL, not silently green.",
+            sentinel,
+            "No catch-all sentinel step. A job whose every step skips SUCCEEDS — on a "
+            "required context that is a silent, permanent hole. Add an `if: always()` "
+            "step that fails when GATE_ARM is unset.",
         )
-        for step in fork_steps:
-            self.assertIn(
-                "exit 1",
-                step,
-                "The fork-PR arm exits 0. Its context is merge-queue REQUIRED, so "
-                "that is a GREEN required check on a PR the gate never ran against. "
-                "A gate that cannot observe its subject must not report success.",
+        cond = str(sentinel[0].get("if", ""))
+        self.assertIn(
+            "always()",
+            cond,
+            "The sentinel is not `if: always()`, so it can be skipped by the very "
+            "condition bug it exists to catch.",
+        )
+
+        # (c) The fork arm must FAIL, not print-and-pass. Check the last effective
+        #     command, not a substring: `echo "would exit 1"` must not satisfy this.
+        fork = [
+            s for s in steps
+            if "head.repo.fork == true" in str(s.get("if", ""))
+        ]
+        self.assertTrue(fork, "No fork-PR arm — a fork gets no creds, so it needs one.")
+        for s in fork:
+            lines = [l.strip() for l in run_of(s).splitlines() if l.strip()]
+            self.assertTrue(
+                lines and lines[-1] == "exit 1",
+                "The fork arm does not END in a bare `exit 1`. Its context is REQUIRED, "
+                "so anything that exits 0 is a green check on a PR the gate never ran.",
             )
 
-        # The creds step must fail closed on an EMPTY secret value, and no step may
-        # re-introduce a skip-guard that turns empty creds into a silent green.
-        self.assertNotIn(
-            "env.AUTO_SYNC_TOKEN != ''",
-            "\n".join(
-                l for l in text.splitlines() if l.strip().startswith("if:")
-            ),
-            "A step is gated on `env.AUTO_SYNC_TOKEN != ''`. That is the skip-guard "
-            "that made empty Infisical creds produce a GREEN required context with "
-            "zero coverage. Fail closed in the creds step instead — never skip.",
-        )
-        self.assertRegex(
-            text,
-            r'\[ -n "\$AUTO_SYNC_TOKEN" \]',
-            "The creds step does not assert AUTO_SYNC_TOKEN is non-empty. "
-            "`curl -f` does not fire when Infisical returns an empty VALUE (renamed "
-            "key, moved secretPath, blank secret), so the step would succeed with "
-            "no credential.",
-        )
-        self.assertRegex(
-            text,
-            r'\[ -n "\$MINIMAX_API_KEY" \]',
-            "The creds step does not assert MINIMAX_API_KEY is non-empty — the gate "
-            "would spin up a CP it cannot drive an LLM turn against.",
-        )
+        # (d) NO step may be skip-guarded on a secret being non-empty — for ANY var.
+        #     The original hole was `env.AUTO_SYNC_TOKEN != ''`; forbidding only that
+        #     literal string just moves the hole to the next variable.
+        for s in steps:
+            cond = str(s.get("if", ""))
+            self.assertNotRegex(
+                cond,
+                r"env\.[A-Z_]*(TOKEN|KEY|SECRET)[A-Z_]*\s*!=\s*''",
+                f"Step {s.get('name')!r} is skip-guarded on a secret being non-empty. "
+                "That turns 'the credential is missing' into 'the required check is "
+                "GREEN'. Fail closed in the creds step instead — never skip.",
+            )
 
     def test_controlplane_baseline_is_pinned(self):
         """Negative control: replace the fetch with `git clone` of main -> this reds.

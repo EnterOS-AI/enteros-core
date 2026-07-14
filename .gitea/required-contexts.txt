@@ -76,6 +76,33 @@ Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 # nondeterminism (task #99) is NOT a reason to park this line. Fix #99; do not
 # hide the context. Parking a flaky-but-real gate is how a gate becomes a
 # decoration.
+#
+# ⚠ AND NOW THE PART THIS FILE HAS TO ADMIT ABOUT ITSELF (task #118).
+#
+# NONE of the entries above are actually enforced right now — not this one, not
+# `CI / all-required`, not `Secret scan`. The header says the merge queue enforces
+# everything above the first pending marker. That is the DESIGN. It is not what
+# the code does.
+#
+# gitea-merge-queue.py evaluates branch protection FIRST (step 4), and BP on main
+# is `status_check_contexts: ["*"]`. The queue treats '*' as a LITERAL context
+# name and looks for a posted status called "*". There is none, so:
+#
+#   required_contexts_green(<every status green>, ['*']) -> (False, ['*=missing'])
+#
+# It returns `wait` — on every PR, including a fully green one. Step 4b, the
+# `enforced_file_contexts` check that reads THIS FILE, sits after step 4 and is
+# therefore unreachable. There is no wildcard expansion anywhere in the script.
+# (Second, independent blocker: the three GOVERNANCE_REQUIRED_CONTEXTS producers
+# — qa-review, security-review, sop-checklist — are all `disabled_manually`, so
+# those contexts never post either.)
+#
+# Which is why every merge on main is performed by a human account, never by the
+# queue actor. This file has been documentation, not enforcement, the whole time.
+#
+# So: keep curating it — it is the SSOT and it becomes live the moment #118 lands
+# — but do NOT cite "it's in required-contexts.txt" as proof that a missing
+# context blocks a merge. Today, only BP ['*'] on a POSTED red actually blocks.
 E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path
 
 # RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────
