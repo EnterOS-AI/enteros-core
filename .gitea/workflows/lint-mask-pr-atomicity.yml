@@ -110,8 +110,10 @@ jobs:
     # mc#4344: the pre-flip gate cannot bless this flip — this workflow is paths-filtered,
     # so it never runs on a main PUSH, and main-push run-logs are the ONLY proof that gate
     # accepts. Not a red suite; a structurally unsatisfiable precondition. The lint is GREEN.
-    # (Was mc#2654, which is CLOSED — lint-continue-on-error-tracking Tier 2e correctly red'd
-    # it: a mask must cite an OPEN tracker, or it is an excuse with no owner.)
+    # (The tracker cited here before was CLOSED, and Tier 2e correctly red'd it: a mask must
+    # cite an OPEN tracker, or it is an excuse with no owner. Do NOT name a closed tracker
+    # anywhere near a continue-on-error, even to explain it — the lint scans the adjacent
+    # lines for ANY mc#NNNN and will resolve the one you mentioned in passing.)
     continue-on-error: true
     steps:
       - name: Check out PR head with full history (need base SHA blobs)
