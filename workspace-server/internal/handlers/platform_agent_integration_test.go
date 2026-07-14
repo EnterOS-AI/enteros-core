@@ -707,7 +707,41 @@ func TestIntegration_PlatformAgentInstall_RefusesToDisplaceOnlinePlatformRoot(t 
 			"must roll back entirely", foreignID)
 	}
 
-	// ── Case 2: foreign id vs a NOT-online root → the repair path still works ──
+	// ── Case 2: foreign id vs a DEGRADED root → ALSO refused ───────────────
+	//
+	// This is the case the first version of the guard got wrong. It probed
+	// `status = 'online'` alone, so a DEGRADED root fell straight through to the
+	// destructive step-0 downgrade. A degraded concierge is NOT a dead one: it has
+	// a real, running container and is merely failing its health probe — which is
+	// why registry/cp_instance_reconciler.go:168 and :294, healthsweep, hibernation
+	// and wedged_agent all define the live set as IN ('online','degraded'). Row-only
+	// installing over it orphans the container and leaves the org with a concierge
+	// that has none: the exact destruction this guard exists to prevent, reachable
+	// through a narrower window.
+	//
+	// Negative control: this case FAILS against the `status = 'online'` predicate
+	// (install returns nil, liveID is demoted to kind='workspace') and passes only
+	// with IN ('online','degraded').
+	if _, err := conn.ExecContext(ctx,
+		`UPDATE workspaces SET status = 'degraded' WHERE id = $1`, liveID); err != nil {
+		t.Fatalf("mark root degraded: %v", err)
+	}
+	err = installPlatformAgent(ctx, conn, foreignID, foreignName, defaultConciergeRuntime)
+	if !errors.As(err, &conflict) {
+		t.Fatalf("installing foreign id %s over a DEGRADED platform root must ALSO return "+
+			"*platformRootConflictError — a degraded concierge still has a running container, "+
+			"so a row-only install orphans it; got err=%v", foreignID, err)
+	}
+	if kind, status, found := readKindStatus(t, liveID); !found || kind != "platform" || status != "degraded" {
+		t.Fatalf("the DEGRADED concierge was damaged by a refused install: "+
+			"found=%v kind=%q status=%q (want kind=platform status=degraded)", found, kind, status)
+	}
+	if _, _, found := readKindStatus(t, foreignID); found {
+		t.Fatalf("the refused install still wrote the foreign row %s — the transaction "+
+			"must roll back entirely", foreignID)
+	}
+
+	// ── Case 3: foreign id vs a NOT-live root → the repair path still works ──
 	if _, err := conn.ExecContext(ctx,
 		`UPDATE workspaces SET status = 'failed' WHERE id = $1`, liveID); err != nil {
 		t.Fatalf("mark root failed: %v", err)
@@ -723,7 +757,7 @@ func TestIntegration_PlatformAgentInstall_RefusesToDisplaceOnlinePlatformRoot(t 
 		t.Fatalf("repair install did not downgrade the broken root %s (kind=%q)", liveID, kind)
 	}
 
-	// ── Case 3: same id on an ONLINE root → plain idempotent upsert (the CP path) ──
+	// ── Case 4: same id on an ONLINE root → plain idempotent upsert (the CP path) ──
 	if _, err := conn.ExecContext(ctx,
 		`UPDATE workspaces SET status = 'online' WHERE id = $1`, foreignID); err != nil {
 		t.Fatalf("mark root online: %v", err)

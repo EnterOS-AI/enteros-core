@@ -396,7 +396,7 @@ func TestInstallPlatformAgent_PreservesRemovedStatusOnConflict(t *testing.T) {
 	//     displace one — demoting a live concierge and upserting a container-less
 	//     row it never provisions would destroy the org's concierge. No live root
 	//     here, so the install proceeds to the downgrade below.
-	mock.ExpectQuery(`SELECT id FROM workspaces.*AND status = 'online'`).
+	mock.ExpectQuery(`SELECT id FROM workspaces.*AND status IN \('online', 'degraded'\)`).
 		WithArgs("pa-removed").
 		WillReturnError(sql.ErrNoRows)
 	// 0b. downgrade any other platform root (no-op here, still issued).

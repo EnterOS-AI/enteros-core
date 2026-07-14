@@ -1658,14 +1658,29 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    The CP is unaffected: it always supplies the canonical derived id, which
 	//    equals the existing root's id, so `id <> $1` excludes it and neither the
 	//    downgrade nor this guard ever fires. The guard's ONLY reachable arm is
-	//    the destructive one it exists to stop. A root that is NOT online (offline
-	//    / failed / provisioning / removed) is still repairable in place, so the
-	//    legitimate non-canonical-id recovery the downgrade was written for keeps
-	//    working.
+	//    the destructive one it exists to stop.
+	//
+	//    LIVE = status IN ('online','degraded') — NOT 'online' alone. This guard
+	//    originally probed `status = 'online'`, and the comment here enumerated the
+	//    safe-to-repair states as "offline / failed / provisioning / removed",
+	//    silently omitting 'degraded'. That omission was the whole bug: a DEGRADED
+	//    concierge has a real, running container — it is merely failing its health
+	//    probe — so displacing it with a row-only install (this endpoint never
+	//    provisions) orphans that container and leaves the org with a concierge that
+	//    has none. Exactly the destruction the guard exists to prevent, just in a
+	//    narrower window.
+	//
+	//    ('online','degraded') is the codebase's canonical container-backed
+	//    predicate, not a value invented here — see registry/cp_instance_reconciler.go
+	//    :168 and :294, registry/healthsweep.go, registry/hibernation.go,
+	//    registry/wedged_agent.go. Guard the PROPERTY (has a container that a row-only
+	//    install would orphan), never one status literal that happens to be the state
+	//    you saw while debugging.
 	var liveRootID string
 	err = tx.QueryRowContext(ctx, `
 		SELECT id FROM workspaces
-		WHERE kind = 'platform' AND parent_id IS NULL AND id <> $1 AND status = 'online'
+		WHERE kind = 'platform' AND parent_id IS NULL AND id <> $1
+		  AND status IN ('online', 'degraded')
 		LIMIT 1
 	`, platformID).Scan(&liveRootID)
 	switch {
