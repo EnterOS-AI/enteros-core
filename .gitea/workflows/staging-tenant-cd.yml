@@ -105,10 +105,17 @@ jobs:
     steps:
       - name: Resolve target tag
         id: resolve
+        env:
+          # Pre-existing shell-injection sink, fixed while hardening this file. A
+          # ${{ }} expansion inside a run: body is spliced in as SHELL CODE, and these
+          # jobs run on `docker-host` — privileged, with the docker socket. Passed as
+          # an env VALUE and read as a shell variable instead. Pinned by
+          # test_the_repo_var_is_never_interpolated_into_shell_code.
+          STAGING_TENANT_CD_IMAGE_TAG: ${{ vars.STAGING_TENANT_CD_IMAGE_TAG }}
         run: |
           set -euo pipefail
-          if [ -n "${{ vars.STAGING_TENANT_CD_IMAGE_TAG }}" ]; then
-            TAG="${{ vars.STAGING_TENANT_CD_IMAGE_TAG }}"
+          if [ -n "${STAGING_TENANT_CD_IMAGE_TAG-}" ]; then
+            TAG="${STAGING_TENANT_CD_IMAGE_TAG}"
           else
             TAG="staging-${GITHUB_SHA::7}"
           fi
@@ -167,7 +174,30 @@ jobs:
       - name: Roll the staging tenant fleet onto the gate-proven image
         env:
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
-        run: bash scripts/deploy/redeploy-staging-fleet.sh --tag "${{ needs.await-image.outputs.tag }}"
+          # STAGING_TENANT_FLAGS is the SSOT for the managed rollout flags (see
+          # MANAGED_FLAG_KEYS in redeploy-staging-fleet.sh). The script strips every
+          # managed key from the inherited tenant env and re-applies only what
+          # TENANT_FLAGS names, so a call site that omits it silently turns those
+          # flags OFF across the fleet. Empty is the correct default (flags dark);
+          # an operator turns a flag on by setting this repo var, NOT by hand-setting
+          # env on a container — that would be sticky forever, which is the drift
+          # this whole mechanism replaces.
+          #
+          # Interpolated into `env:` (a VALUE), never into the `run:` body: a
+          # ${{ }} expansion inside run: is spliced in as SHELL CODE, so a var value
+          # of `x"; touch /tmp/PWNED; echo "` would execute on this runner — and this
+          # job is `runs-on: docker-host`, i.e. privileged with the docker socket.
+          STAGING_TENANT_FLAGS: ${{ vars.STAGING_TENANT_FLAGS }}
+        # `${STAGING_TENANT_FLAGS-}` — the shell, not the templater, supplies the
+        # default. An undefined repo var may arrive as an OMITTED env entry rather
+        # than an empty one, and the script now FAILS CLOSED on an unset
+        # TENANT_FLAGS; without this `-` default, a repo that has never created the
+        # var would have every staging CD roll hard-abort. The call site declares
+        # its flag state explicitly, which is exactly what the fail-closed check asks
+        # for.
+        run: |
+          TENANT_FLAGS="${STAGING_TENANT_FLAGS-}" \
+            bash scripts/deploy/redeploy-staging-fleet.sh --tag "${{ needs.await-image.outputs.tag }}"
 
   e2e-smoke:
     name: e2e-smoke (staging real provision + A2A HARD GATE)
@@ -274,9 +304,12 @@ jobs:
           fi
           echo "Staging CP healthy"
       - name: Bind candidate build SHA for tenant /buildinfo guard
+        env:
+          # See "Resolve target tag" above — env: value, not run:-body interpolation.
+          STAGING_TENANT_CD_IMAGE_TAG: ${{ vars.STAGING_TENANT_CD_IMAGE_TAG }}
         run: |
           set -euo pipefail
-          if [ -n "${{ vars.STAGING_TENANT_CD_IMAGE_TAG }}" ]; then
+          if [ -n "${STAGING_TENANT_CD_IMAGE_TAG-}" ]; then
             echo "::notice::STAGING_TENANT_CD_IMAGE_TAG override set; skipping strict candidate SHA bind because the override may not be this workflow SHA."
             exit 0
           fi
@@ -320,8 +353,17 @@ jobs:
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
           TENANT_IMAGE_NAME: ${{ env.TENANT_IMAGE }}
+          # Roll BACK with the same declared flag state we roll FORWARD with, or a
+          # failed candidate would ALSO (invisibly) end an in-flight burn-in.
+          # In `env:`, not `export ... ${{ }}` in the body — see the roll step above.
+          STAGING_TENANT_FLAGS: ${{ vars.STAGING_TENANT_FLAGS }}
         run: |
           set -euo pipefail
+          # Defined for BOTH redeploy invocations below. The shell supplies the
+          # default so an undefined repo var can never hard-abort the rollback —
+          # the one path you least want to fail is the one that undoes a bad deploy.
+          TENANT_FLAGS="${STAGING_TENANT_FLAGS-}"
+          export TENANT_FLAGS
           if [ "$ADVANCE_RESULT" != "success" ]; then
             echo "::notice::pin never advanced (advance-pin=$ADVANCE_RESULT) — nothing to revert."
             exit 0

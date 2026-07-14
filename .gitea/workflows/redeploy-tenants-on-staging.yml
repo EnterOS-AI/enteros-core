@@ -56,10 +56,20 @@ jobs:
         env:
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
           CANVAS_APP_IMAGE: ${{ env.CANVAS_APP_IMAGE }}
+          # Same SSOT as staging-tenant-cd.yml. A manual redeploy that omitted this
+          # would strip the managed flags off the fleet — turning an in-flight
+          # burn-in off, silently, from a button that says "redeploy".
+          STAGING_TENANT_FLAGS: ${{ vars.STAGING_TENANT_FLAGS }}
+          # Pre-existing injection sink, fixed here because it is the same shape as
+          # the one review caught above and sits three lines away: a ${{ }} expansion
+          # inside a run: body is spliced in as SHELL CODE, on a privileged
+          # docker-host runner. Passed as an env VALUE instead.
+          STAGING_REDEPLOY_TARGET_TAG: ${{ vars.STAGING_REDEPLOY_TARGET_TAG }}
         run: |
           set -euo pipefail
           # Precedence: operator pin var > moving staging-latest.
-          TAG="${{ vars.STAGING_REDEPLOY_TARGET_TAG }}"
+          TAG="${STAGING_REDEPLOY_TARGET_TAG-}"
           [ -n "$TAG" ] || TAG="staging-latest"
           echo "::notice::manual staging fleet redeploy target tag = ${TAG}"
-          bash scripts/deploy/redeploy-staging-fleet.sh --tag "$TAG"
+          TENANT_FLAGS="${STAGING_TENANT_FLAGS-}" \
+            bash scripts/deploy/redeploy-staging-fleet.sh --tag "$TAG"

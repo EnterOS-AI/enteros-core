@@ -31,13 +31,25 @@ on:
     paths:
       - 'scripts/**'
       - '.gitea/scripts/**'
-      - '.gitea/workflows/test-ops-scripts.yml'
+      # test_managed_flags_wiring.py asserts that every workflow STEP rolling the
+      # staging fleet wires STAGING_TENANT_FLAGS in. Without this path, a PR that
+      # edits ONLY a workflow — deleting that env: line, i.e. the exact mutation the
+      # test exists to catch — runs neither this guard nor ci.yml's (whose `scripts`
+      # filter is also blind to .gitea/workflows/). The guard was unreachable for its
+      # own threat model.
+      - '.gitea/workflows/**'
   pull_request:
     branches: [main, staging]
     paths:
       - 'scripts/**'
       - '.gitea/scripts/**'
-      - '.gitea/workflows/test-ops-scripts.yml'
+      # test_managed_flags_wiring.py asserts that every workflow STEP rolling the
+      # staging fleet wires STAGING_TENANT_FLAGS in. Without this path, a PR that
+      # edits ONLY a workflow — deleting that env: line, i.e. the exact mutation the
+      # test exists to catch — runs neither this guard nor ci.yml's (whose `scripts`
+      # filter is also blind to .gitea/workflows/). The guard was unreachable for its
+      # own threat model.
+      - '.gitea/workflows/**'
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app

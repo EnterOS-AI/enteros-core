@@ -84,6 +84,12 @@ def run_script(tmp_path: Path, git_sha: str, tag: str) -> subprocess.CompletedPr
     env["STAGING_CANVAS_APP_CONTAINER"] = ""
     env["HEALTH_GATE_ATTEMPTS"] = "1"
     env["HEALTH_GATE_SLEEP_SECS"] = "0"
+    # The script FAILS CLOSED on an unset TENANT_FLAGS: it strips every managed
+    # rollout flag from the inherited tenant env and re-applies only what this
+    # names, so a caller that never declares it would silently turn those flags off
+    # across the fleet. Empty = "all managed flags dark", which is what these tests
+    # want. See test_fleet_roll_refuses_to_run_without_declared_flag_state below.
+    env["TENANT_FLAGS"] = ""
     return subprocess.run(
         ["bash", str(SCRIPT), "--tag", tag],
         cwd=ROOT,
@@ -109,3 +115,29 @@ def test_fleet_roll_rejects_buildinfo_mismatching_staging_tag(tmp_path: Path):
     assert result.returncode == 1
     assert "git_sha=badcafe1234567890 did not match expected deadbee" in result.stdout
     assert "canary mol-tenant-canary failed" in result.stdout
+
+
+def test_fleet_roll_refuses_to_run_without_declared_flag_state(tmp_path: Path):
+    """UNSET TENANT_FLAGS must abort the roll, not default to empty.
+
+    The script strips every managed rollout flag from the inherited tenant env and
+    re-applies only what TENANT_FLAGS declares. A call site that forgets it does not
+    inherit the old behaviour — it silently turns those flags OFF on every tenant,
+    which would end an in-flight staging burn-in with no log line. Defaulting to
+    empty here is the bug; aborting is the fix.
+    """
+    bindir = write_fake_bin(tmp_path, git_sha="deadbee1234567890")
+    env = os.environ.copy()
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["TENANT_IMAGE"] = "registry.example/molecule-tenant"
+    env["STAGING_CANVAS_APP_CONTAINER"] = ""
+    env.pop("TENANT_FLAGS", None)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--tag", "staging-deadbee"],
+        cwd=ROOT, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+    )
+
+    assert result.returncode == 1, result.stdout
+    assert "TENANT_FLAGS is not set" in result.stdout
