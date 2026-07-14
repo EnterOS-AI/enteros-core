@@ -4,8 +4,9 @@ THE BUG THIS LOCKS OUT
 ----------------------
 `e2e-api`, `local-provision-e2e`, `e2e-peer-visibility` and `e2e-chat` all boot a
 real `platform-server` on the SHARED `docker-host` runner, and they demonstrably
-run concurrently across different PRs. Four of those lanes carried a pre-start
-step that scanned /proc and killed ANY process whose cmdline contained
+run concurrently across different PRs. THREE of them (e2e-api, e2e-peer-visibility
+and local-provision-e2e, the last one twice — four steps in all) carried a
+pre-start step that scanned /proc and killed ANY process whose cmdline contained
 "platform-server":
 
     for pid in $(grep -l "platform-serve" /proc/[0-9]*/comm 2>/dev/null); do
