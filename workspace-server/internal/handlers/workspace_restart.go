@@ -348,8 +348,8 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	// pipeline, which calls issueAndInjectToken → RevokeAllForWorkspace.
 	// That silently destroyed the operator's local bearer token on every
 	// "Restart" click, leaving them with a 401-spamming poller and no
-	// platform-side recovery path short of regenerating from the canvas
-	// Tokens tab. Auto-restart already short-circuits external (see
+	// platform-side recovery path short of minting a replacement bearer under
+	// Settings → Workspace Tokens. Auto-restart already short-circuits external (see
 	// runRestartCycle below). Mirror that here so manual + automatic
 	// behavior agree, and surface a clear message instead of silently
 	// no-op'ing — the canvas can show the operator that the fix is on
