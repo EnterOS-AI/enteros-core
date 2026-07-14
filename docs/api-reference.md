@@ -12,9 +12,9 @@ This document describes the REST API exposed by the Molecule AI workspace server
 
 Three middleware classes gate server-side routes:
 
-- **`AdminAuth`** — strict bearer-only. Required for any route that can leak prompts/memory, create/mutate workspaces, or expose ops intel. Lazy-bootstrap fail-open when no live tokens exist globally.
-- **`WorkspaceAuth`** — binds a bearer token to a specific workspace `:id`. A token for workspace A cannot be used against workspace B's sub-routes.
-- **`CanvasOrBearer`** — accepts a bearer token OR a request Origin matching `CORS_ORIGINS`. Used only for cosmetic routes with zero data/security impact (currently `PUT /canvas/viewport` only). Do not extend to routes that leak data or create resources.
+- **`AdminAuth`** — fail-closed in every environment. Accepts a verified control-plane session or a valid org/admin credential (with the documented deprecated workspace-token fallback only when `ADMIN_TOKEN` is unset). Auth datastore failures return `503`; there is no zero-token bootstrap bypass.
+- **`WorkspaceAuth`** — fail-closed. Accepts a verified control-plane session, an org/admin credential, or a live bearer bound to the target workspace `:id`; a per-workspace token for workspace A cannot access workspace B.
+- **`CanvasOrBearer`** — accepts a valid bearer or, when the combined canvas proxy is active, a same-origin `Referer`/`Host` or exact `Origin`/`Host` match. It never uses the configured `CORS_ORIGINS` allowlist as authentication. Use it only for cosmetic routes with zero data/security impact (currently `PUT /canvas/viewport`).
 
 Full contract: `docs/runbooks/admin-auth.md`.
 
@@ -39,6 +39,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | PUT/POST | /settings/secrets | secrets.go — set a global secret `{key, value}`; auto-restarts every non-paused/non-removed/non-external workspace that does not shadow the key with a workspace-level override |
 | DELETE | /settings/secrets/:key | secrets.go — delete a global secret; same auto-restart fan-out as PUT/POST |
 | POST | /admin/workspaces/:id/tokens | admin_workspace_tokens.go — mint a real workspace bearer token; requires `AdminAuth`; plaintext is returned once |
+| GET | /admin/cutovers/native-channels/inventory | native_channel_cutover_inventory.go — temporary `AdminAuth`-only, count-only evidence for the native-channel-to-plugin cutover; see `docs/runbooks/native-channel-cutover-inventory.md`; removed by molecule-core#4267 after evidence acceptance |
 | GET/POST/DELETE | /admin/secrets[/:key] | secrets.go — legacy aliases for /settings/secrets |
 | WS | /workspaces/:id/terminal | terminal.go |
 | POST/GET | /workspaces/:id/approvals | approvals.go |
@@ -69,7 +70,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | POST | /webhooks/:type | channels.go (incoming social webhook) |
 | GET/PUT/DELETE | /workspaces/:id/files[/*path] | templates.go |
 | GET | /canvas/viewport | viewport.go — open, no auth required (cosmetic, bootstrap-friendly) |
-| PUT | /canvas/viewport | viewport.go — `CanvasOrBearer` middleware; accepts bearer OR Origin matching `CORS_ORIGINS`. Cosmetic-only route — worst case viewport corruption, recovered by page refresh. |
+| PUT | /canvas/viewport | viewport.go — `CanvasOrBearer`; accepts a valid bearer or, on the combined canvas proxy, a same-origin `Referer`/`Host` or exact `Origin`/`Host` match. It does not authenticate from the `CORS_ORIGINS` allowlist. Cosmetic-only route — worst case viewport corruption, recovered by page refresh. |
 | GET | /templates | templates.go |
 | POST | /templates/import | templates.go — `AdminAuth` required |
 | POST | /registry/register | registry.go |
