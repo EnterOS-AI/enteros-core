@@ -102,6 +102,23 @@ var externalSnippetTemplates = map[string]string{
 	"kimi_snippet":                externalKimiTemplate,
 }
 
+// snippetsWithoutEnvKeyContract — snippets whose credential site is NOT an env var,
+// so the SDK credentials contract's env-key taxonomy does not apply to it.
+//
+// Exactly one qualifies: the python snippet's `AUTH_TOKEN = "…"` is a module-level
+// constant handed straight to RemoteAgentClient(auth_token=…). No process ever reads
+// an env var by that name, so requiring it to be a contract-declared key would be
+// cargo-culting the rule rather than applying it.
+//
+// The exemption's PREMISE is itself asserted (see
+// TestSnippetCredentials_ConformToSDKCredentialsContract): an exempt snippet may not
+// read the value out of the environment. The moment it does, it IS env-key-bearing
+// and the exemption stops being true.
+var snippetsWithoutEnvKeyContract = map[string]string{
+	"python_snippet": "python source: the credential is a module-level constant passed to " +
+		"RemoteAgentClient(auth_token=...), never an env var a runtime reads",
+}
+
 // snippetsExemptFromTokenGuard — the ONLY snippets allowed to render without a
 // refusal guard on the re-show path, each with the reason it is safe. Every
 // other snippet must carry tokenGuardSentinel; that is enforced by
@@ -304,7 +321,7 @@ func slugifyForMcpName(s string, maxLen int) string {
 
 // externalCurlTemplate — zero-dependency register snippet. Placeholders:
 //   - {{PLATFORM_URL}}, {{WORKSPACE_ID}}   — filled server-side
-//   - $WORKSPACE_AUTH_TOKEN                — env var, operator sets
+//   - $MOLECULE_WORKSPACE_TOKEN                — env var, operator sets
 //   - $AGENT_URL                           — env var, operator's public HTTPS endpoint
 //
 // SSRF filter rejects private IPs at register time, so AGENT_URL must
@@ -314,7 +331,7 @@ func slugifyForMcpName(s string, maxLen int) string {
 // register; keeping the workspace alive wants a real loop, so point
 // operators at the Python snippet for long-lived setups.
 const externalCurlTemplate = `# Replace AGENT_URL with YOUR agent's public HTTPS endpoint, then run:
-export WORKSPACE_AUTH_TOKEN="{{AUTH_TOKEN}}"
+export MOLECULE_WORKSPACE_TOKEN="{{AUTH_TOKEN}}"
 export AGENT_URL="https://your-agent.example.com"
 
 # NOTE on the "Origin" header below: hosted SaaS tenants run behind an
@@ -323,7 +340,7 @@ export AGENT_URL="https://your-agent.example.com"
 # /registry/register is currently allowed without Origin, but setting
 # it preemptively keeps your snippet working if the WAF rules expand.
 curl -fsS -X POST "{{PLATFORM_URL}}/registry/register" \
-  -H "Authorization: Bearer $WORKSPACE_AUTH_TOKEN" \
+  -H "Authorization: Bearer $MOLECULE_WORKSPACE_TOKEN" \
   -H "Origin: {{PLATFORM_URL}}" \
   -H "Content-Type: application/json" \
   -d '{
@@ -339,7 +356,7 @@ curl -fsS -X POST "{{PLATFORM_URL}}/registry/register" \
 # Need help?
 #   Documentation: https://doc.moleculesai.app/docs/guides/external-agent-registration
 #   Common errors:
-#     • 401 / 403 on register — WORKSPACE_AUTH_TOKEN must be the value
+#     • 401 / 403 on register — MOLECULE_WORKSPACE_TOKEN must be the value
 #       shown at workspace create. Tokens are shown only once.
 `
 
@@ -1048,7 +1065,7 @@ pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pyp
 # ` + "`openclaw mcp set`" + ` OVERWRITES the entry for this server name, so a
 # tokenless re-show paste would replace a working credential with a dead one —
 # hence the MOLECULE_TOKEN_OK guard at the top of this block.
-WORKSPACE_TOKEN="{{AUTH_TOKEN}}"
+MOLECULE_WORKSPACE_TOKEN="{{AUTH_TOKEN}}"
 if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 openclaw mcp set {{MCP_SERVER_NAME}} "$(cat <<EOF
 {
@@ -1057,7 +1074,7 @@ openclaw mcp set {{MCP_SERVER_NAME}} "$(cat <<EOF
   "env": {
     "WORKSPACE_ID": "{{WORKSPACE_ID}}",
     "PLATFORM_URL": "{{PLATFORM_URL}}",
-    "MOLECULE_WORKSPACE_TOKEN": "$WORKSPACE_TOKEN"
+    "MOLECULE_WORKSPACE_TOKEN": "$MOLECULE_WORKSPACE_TOKEN"
   }
 }
 EOF

@@ -126,3 +126,85 @@ jobs:
               echo "  cd workspace-server && MOLECULE_UPDATE_GOLDEN=1 go test ./internal/handlers/ -run TestWriteExternalConnectionGolden"
               exit 1
             }
+
+      - name: node must be present (the merge-script test EXECUTES the snippet)
+        # TestChannelMergeScript_* runs the channel snippet's bun/node script for real
+        # against a seeded .env — a substring assertion cannot tell a merge from a
+        # clobber (see below). The Go test t.Skip()s when node is absent, which is right
+        # for a laptop and WRONG here: a skipped credential-destruction test that reports
+        # green is worse than no test. So fail the lane loudly instead of skipping quietly.
+        run: |
+          command -v node >/dev/null 2>&1 || {
+            echo "::error::node is not on PATH. The channel merge-script test would t.Skip(),"
+            echo "::error::silently dropping the only executed proof that a re-shown snippet"
+            echo "::error::cannot destroy a live credential (core#4315). Install node on the runner."
+            exit 1
+          }
+          node --version
+
+      - name: Re-show refusal guards — a re-shown snippet must not destroy a live credential
+        # core#4315. On the re-show path auth_token="" and every credential site carries
+        # <ROTATE_TO_REVEAL_TOKEN>. The old gate asserted only that the marker was PRESENT
+        # ("visibly non-runnable") — true for snippets that use the token inline (a bearer
+        # 401s, nothing is lost), FALSE for the ones that PERSIST it: the channel .env
+        # merge, `claude mcp add`, `openclaw mcp set`, the kimi env file,
+        # `hermes gateway --replace`. To those the marker is just a string, so the script
+        # runs and REPLACES the operator's working credential with a dead one. The token is
+        # shown once ⇒ unrecoverable.
+        #
+        #   TestReshowSnippets_RefuseToRunWithoutAToken   every persisting snippet carries a guard
+        #   TestChannelMergeScript_*                      EXECUTES the merge script under node:
+        #                                                 the marker run must exit non-zero and
+        #                                                 leave a seeded .env byte-identical; the
+        #                                                 real-token run must be append-safe across
+        #                                                 workspaces and idempotent across a rotate
+        #   TestShellSnippets_ParseUnderBash              bash -n every shell snippet, both renders
+        #                                                 (an unbalanced `fi` in a guard is invisible
+        #                                                 to every other test in the package)
+        #   TestTokenGuards_MatchTheMarkerActuallyStamped changing the marker without the guards
+        #                                                 turns every guard into dead code that
+        #                                                 still passes a presence check
+        run: |
+          go test -count=1 -timeout 5m -v ./internal/handlers/ \
+            -run '^TestReshowSnippets_|^TestChannelMergeScript_|^TestShellSnippets_|^TestTokenGuards_'
+
+      - name: Snippet credentials conform to the SDK credentials contract (SSOT)
+        # The credential/privilege SSOT is molecule-ai-sdk contracts/credentials. Its own
+        # schema has said since sdk#78 that "core/runtime/mcp-server vendor it and a drift
+        # gate fails CI on a name mismatch" — in core, that gate never existed. So nothing
+        # stopped a snippet from teaching an operator a credential env-key name the platform
+        # does not read, which is the exact bug the contract exists to prevent (the concierge
+        # AUTH_ERROR: three repos, three names for one credential, nothing forcing agreement).
+        #
+        # Runs against the VENDORED copy, so it is hermetic; the step below proves the
+        # vendored copy still matches the SDK's main.
+        run: |
+          go test -count=1 -timeout 5m -v ./internal/handlers/ \
+            -run '^TestSnippetGuards_PinnedToSDKCredentialsContract$|^TestSnippetCredentials_'
+
+      - name: Vendored SDK credentials contract has not drifted from SDK main
+        # The pin above is only as good as the copy it pins to. Re-fetch the SSOT and diff:
+        # if the SDK moved (a new alias, a changed marker), this reds and the fix is a
+        # re-vendor PR — the copy is never allowed to quietly rot into a fiction.
+        #
+        # Fetch-only, no credentials: the contract is a public raw file. UA curl/8.4.0 —
+        # Cloudflare 403s the python UA.
+        env:
+          SDK_CREDENTIALS_CONTRACT_URL: https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/credentials/credentials.contract.json
+          VENDORED: internal/handlers/testdata/sdk-credentials.contract.json
+        run: |
+          set -euo pipefail
+          curl -fsS -A curl/8.4.0 "$SDK_CREDENTIALS_CONTRACT_URL" -o /tmp/sdk-credentials.contract.json
+          # Compare canonicalised JSON so formatting alone never reds the lane.
+          canon() { python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True, indent=2))' "$1"; }
+          canon /tmp/sdk-credentials.contract.json > /tmp/sdk.canon
+          canon "$VENDORED"                        > /tmp/vendored.canon
+          if ! diff -u /tmp/vendored.canon /tmp/sdk.canon; then
+            echo "::error::${VENDORED} has drifted from molecule-ai-sdk main."
+            echo "::error::Re-vendor it (and re-read the diff — a changed marker or a withdrawn"
+            echo "::error::alias changes what the snippets are allowed to say):"
+            echo "::error::  curl -fsS -A curl/8.4.0 ${SDK_CREDENTIALS_CONTRACT_URL} \\"
+            echo "::error::    -o workspace-server/${VENDORED}"
+            exit 1
+          fi
+          echo "vendored credentials contract matches SDK main"
