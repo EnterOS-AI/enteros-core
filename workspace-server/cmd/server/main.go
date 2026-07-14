@@ -611,6 +611,10 @@ func main() {
 	// terminal forward-only protection so concurrent UpdateStatus calls
 	// are not clobbered. Defaults: 5min interval, 10min stale threshold;
 	// override via DELEGATION_SWEEPER_INTERVAL_S / DELEGATION_STUCK_THRESHOLD_S.
+	// Shout if the two delegation flags are half-flipped: LEDGER_WRITE on with
+	// INBOX_PUSH off makes the sweeper terminalize delegations that then vanish
+	// from the caller's "awaiting reply" list with no reply ever sent (#4314).
+	handlers.WarnOnPartialDelegationRollout()
 	delegSweeper := handlers.NewDelegationSweeper(nil, nil)
 	go supervised.RunWithRecover(ctx, "delegation-sweeper", delegSweeper.Start)
 

@@ -197,6 +197,13 @@ func EnqueueA2A(
 	// ON CONFLICT — only true CONSTRAINTs work for that). On conflict we
 	// then look up the existing row's id so the caller always receives a
 	// valid queue entry reference.
+	//ssot:allow-status-set a2a_queue is a DIFFERENT table with its own, smaller status
+	// vocabulary — CHECK (status IN ('queued','dispatched','completed','dropped','failed')).
+	// It has no in_progress and no stuck. This is that table's "still active" set, not a
+	// copy of the delegations vocabulary, and it must NOT be derived from
+	// DelegationInFlightStates: doing so would silently widen a2a_queue's idempotency
+	// predicate to states its own CHECK constraint forbids. Conflating these two
+	// vocabularies is what produced #4314 in the first place.
 	err = db.DB.QueryRowContext(ctx, `
 		INSERT INTO a2a_queue (workspace_id, caller_id, priority, body, method, idempotency_key, expires_at)
 		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
@@ -208,6 +215,7 @@ func EnqueueA2A(
 
 	if errors.Is(err, sql.ErrNoRows) && idempotencyKey != "" {
 		// Conflict — look up the existing active row and use its id.
+		//ssot:allow-status-set a2a_queue's own active-row set — see the INSERT above.
 		err = db.DB.QueryRowContext(ctx, `
 			SELECT id FROM a2a_queue
 			WHERE workspace_id = $1 AND idempotency_key = $2
@@ -618,15 +626,26 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 		log.Printf("a2aQueue stitch %s: json.Marshal respJSON failed: %v", delegationID, marshalErr)
 		return
 	}
+	// AND status = 'queued' pins this to the PLACEHOLDER row that executeDelegation
+	// wrote. Without it the UPDATE also matches the sweeper's own terminal
+	// delegate_result row (same workspace/type/method/target/delegation_id), so a
+	// late drain would silently rewrite a "Delegation failed" notice into
+	// "completed" — leaving activity_logs saying completed while `delegations` says
+	// failed, permanently disagreeing, with the caller having been told both.
+	//
+	// It also makes the stitch idempotent: a replayed drain matches zero rows and
+	// skips the ledger terminalization below instead of double-applying it.
 	res, err := db.DB.ExecContext(ctx, `
 		UPDATE activity_logs
 		   SET status        = 'completed',
 		       summary       = $1,
 		       response_body = $2::jsonb
 		 WHERE workspace_id   = $3
+		   AND activity_type  = 'delegation'
 		   AND method         = 'delegate_result'
 		   AND target_id      = $4
 		   AND response_body->>'delegation_id' = $5
+		   AND status         = 'queued'
 	`, "Delegation completed ("+textutil.TruncateBytes(responseText, 80)+")", string(respJSON),
 		sourceID, targetID, delegationID)
 	if err != nil {
@@ -642,7 +661,45 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 		log.Printf("A2AQueue drain stitch: no delegate_result row for delegation %s (queued-row may not exist yet)", delegationID)
 		return
 	}
+	// TERMINALIZE THE LEDGER TOO — not just the activity_logs row.
+	//
+	// The drain path used to flip only activity_logs, leaving the `delegations`
+	// row at 'queued' FOREVER. The sweeper selects
+	// status IN ('queued','dispatched','in_progress'), so a delegation that
+	// SUCCEEDED here stayed in the sweeper's candidate set until its 6h deadline
+	// and was then marked 'failed' — and, once the sweeper notifies (#4316), the
+	// caller's agent would be told a delegation that completed six hours ago had
+	// failed. The forward-only terminal guard in delegation_ledger.go does not
+	// help: it only protects rows the normal path terminalized, and this path
+	// never did, so the guard was vacuous exactly where it was needed.
+	//
+	// It is also the direct cause of the digest counting a drained-completed
+	// delegation as "awaiting a reply" for six hours (#4314).
+	authority := recordLedgerStatus(ctx, delegationID, "completed", "", responseText)
 	log.Printf("A2AQueue drain stitch: delegation %s queued → completed (%d chars)", delegationID, len(responseText))
+
+	// AND TELL THE CALLER. This is the queued-drain path — the delegation whose
+	// target was settling/restarting when the message was sent, so the platform HELD
+	// it in a2a_queue and is only now delivering the answer. It is the scenario the
+	// caller is most likely to have been left hanging on.
+	//
+	// Every other terminal transition emits exactly one delegate_result into the
+	// caller's inbox (the single-reply-authority contract). This one did not — the
+	// drained answer landed in the ledger and in the canvas feed, but never in the
+	// caller's inbox. On main that was merely wrong-but-VISIBLE: the row stayed
+	// 'queued', so the digest still listed the delegation as awaiting a reply.
+	// Terminalizing it correctly without also replying would have made it INVISIBLE
+	// — the row leaves the in-flight set and nothing ever tells the caller. Fixing
+	// the ledger alone would have converted a visible bug into a silent one.
+	//
+	// Gate: mayReply() is true when WE terminalized this row (we own the single
+	// reply) OR when the ledger cannot arbitrate at all — dark, or no row — in which
+	// case nobody else will speak and we must. See ReplyAuthority. It preserves
+	// behaviour — with no ledger there is no CAS to arbitrate on, and the drain is
+	// the only writer on this path anyway.
+	if mayReply(authority) {
+		pushDelegationResultToInbox(ctx, sourceID, targetID, delegationID, "completed", responseText, "")
+	}
 
 	// Broadcast DELEGATION_COMPLETE so the canvas chat feed flips the
 	// "⏸ queued" line to "✓ completed" in real time. Without this the

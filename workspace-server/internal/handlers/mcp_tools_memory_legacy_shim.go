@@ -147,7 +147,8 @@ func (h *MCPHandler) commitMemoryLegacyShim(ctx context.Context, workspaceID str
 
 // recallMemoryLegacyShim mirrors commitMemoryLegacyShim for reads.
 // Returns JSON in the legacy "memory entries" shape:
-//   [{"id":"...","content":"...","scope":"...","created_at":"..."}, ...]
+//
+//	[{"id":"...","content":"...","scope":"...","created_at":"..."}, ...]
 func (h *MCPHandler) recallMemoryLegacyShim(ctx context.Context, workspaceID string, args map[string]interface{}) (string, error) {
 	query, _ := args["query"].(string)
 	scope, _ := args["scope"].(string)

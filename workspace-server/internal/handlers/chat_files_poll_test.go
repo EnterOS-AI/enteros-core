@@ -189,26 +189,27 @@ func expectUploadPollTxRollback(mock sqlmock.Sqlmock) {
 //
 // Positional args (LogActivity uses ExecContext with 13 positional params
 // since #2560 added message_id for idempotent upserts):
-//   $1 workspace_id, $2 activity_type, $3 source_id, $4 target_id,
-//   $5 method, $6 summary, $7 request_body, $8 response_body,
-//   $9 tool_trace, $10 duration_ms, $11 status, $12 error_detail,
-//   $13 message_id.
+//
+//	$1 workspace_id, $2 activity_type, $3 source_id, $4 target_id,
+//	$5 method, $6 summary, $7 request_body, $8 response_body,
+//	$9 tool_trace, $10 duration_ms, $11 status, $12 error_detail,
+//	$13 message_id.
 func expectActivityInsertWithTypeAndMethod(mock sqlmock.Sqlmock, workspaceID, activityType, method string) {
 	mock.ExpectExec(`INSERT INTO activity_logs`).
 		WithArgs(
-			workspaceID,             // $1 workspace_id
-			activityType,            // $2 activity_type ← pinned
-			sqlmock.AnyArg(),        // $3 source_id
-			sqlmock.AnyArg(),        // $4 target_id (workspaceID, but already covered)
-			method,                  // $5 method ← pinned
-			sqlmock.AnyArg(),        // $6 summary
-			sqlmock.AnyArg(),        // $7 request_body
-			sqlmock.AnyArg(),        // $8 response_body
-			sqlmock.AnyArg(),        // $9 tool_trace
-			sqlmock.AnyArg(),        // $10 duration_ms
-			sqlmock.AnyArg(),        // $11 status
-			sqlmock.AnyArg(),        // $12 error_detail
-			sqlmock.AnyArg(),        // $13 message_id
+			workspaceID,      // $1 workspace_id
+			activityType,     // $2 activity_type ← pinned
+			sqlmock.AnyArg(), // $3 source_id
+			sqlmock.AnyArg(), // $4 target_id (workspaceID, but already covered)
+			method,           // $5 method ← pinned
+			sqlmock.AnyArg(), // $6 summary
+			sqlmock.AnyArg(), // $7 request_body
+			sqlmock.AnyArg(), // $8 response_body
+			sqlmock.AnyArg(), // $9 tool_trace
+			sqlmock.AnyArg(), // $10 duration_ms
+			sqlmock.AnyArg(), // $11 status
+			sqlmock.AnyArg(), // $12 error_detail
+			sqlmock.AnyArg(), // $13 message_id
 		).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 }

@@ -444,11 +444,11 @@ func (h *ChannelHandler) Discover(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"bot_username":                  result.BotUsername,
-		"chats":                         result.Chats,
-		"can_read_all_group_messages":   result.CanReadAllGroupMessages,
-		"privacy_warning":               warning,
-		"hint":                          hint,
+		"bot_username":                result.BotUsername,
+		"chats":                       result.Chats,
+		"can_read_all_group_messages": result.CanReadAllGroupMessages,
+		"privacy_warning":             warning,
+		"hint":                        hint,
 	})
 }
 

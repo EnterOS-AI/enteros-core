@@ -69,10 +69,10 @@ func TestCallerIDToSourceID_RealWorkspaceUUIDStillPreserved(t *testing.T) {
 	// accidentally collapsed real UUIDs to NULL; this case is the
 	// one that would have caught that.
 	cases := []string{
-		"ws-1",                                    // op-style id
-		"01234567-89ab-cdef-0123-456789abcdef",   // uuid
-		"agent-dev-b",                             // agent id (not a system prefix)
-		"canvas_user",                             // canvas user placeholder
+		"ws-1",                                 // op-style id
+		"01234567-89ab-cdef-0123-456789abcdef", // uuid
+		"agent-dev-b",                          // agent id (not a system prefix)
+		"canvas_user",                          // canvas user placeholder
 	}
 	for _, c := range cases {
 		t.Run(c, func(t *testing.T) {
@@ -103,9 +103,9 @@ func TestCallerIDToSourceID_EmptyString(t *testing.T) {
 // through unchanged.
 func TestNilIfEmpty_NoSystemCallerNormalization(t *testing.T) {
 	cases := []string{
-		"system:foo",                              // would-be method name
-		"webhook:github",                          // would-be method name
-		"channel:slack:C0123",                     // would-be channel id
+		"system:foo",          // would-be method name
+		"webhook:github",      // would-be method name
+		"channel:slack:C0123", // would-be channel id
 	}
 	for _, c := range cases {
 		t.Run(c, func(t *testing.T) {
@@ -342,10 +342,11 @@ func TestParseUsageFromA2AResponse_MissingTokensInUsageObject(t *testing.T) {
 // L296) calls ProxyA2ARequest with callerID="system:restart-context",
 // the synthetic non-UUID callerID must NOT be inserted into the
 // UUID-typed activity_logs.source_id column. The path is:
-//   sendRestartContext → ProxyA2ARequest(..., "system:restart-context", ...)
-//     → persistUserMessageAtIngest(..., "system:restart-context", ...)
-//       → LogActivityWithResult({SourceID: callerIDToSourceID("system:restart-context")})
-//         → activity_logs INSERT with SourceID = NULL
+//
+//	sendRestartContext → ProxyA2ARequest(..., "system:restart-context", ...)
+//	  → persistUserMessageAtIngest(..., "system:restart-context", ...)
+//	    → LogActivityWithResult({SourceID: callerIDToSourceID("system:restart-context")})
+//	      → activity_logs INSERT with SourceID = NULL
 //
 // The fix (#2701) introduced the scoped helper callerIDToSourceID
 // which returns nil for any system-caller prefix (matching

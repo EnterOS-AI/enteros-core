@@ -15,8 +15,8 @@ import (
 // Pricing constants — Claude Sonnet default rates (USD per token).
 // Callers with different models should override via env vars in a future phase.
 const (
-	tokenCostPerInputToken  = 0.000003  // $3 / 1M input tokens
-	tokenCostPerOutputToken = 0.000015  // $15 / 1M output tokens
+	tokenCostPerInputToken  = 0.000003 // $3 / 1M input tokens
+	tokenCostPerOutputToken = 0.000015 // $15 / 1M output tokens
 )
 
 // MetricsHandler serves GET /workspaces/:id/metrics.

@@ -6,8 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 

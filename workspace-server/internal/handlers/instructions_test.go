@@ -643,7 +643,7 @@ func TestInstructionsResolve_GlobalThenWorkspace(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	var out struct {
-		WorkspaceID   string `json:"workspace_id"`
+		WorkspaceID  string `json:"workspace_id"`
 		Instructions string `json:"instructions"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
@@ -1136,6 +1136,7 @@ func TestInstructionsHandler_List_ScanErrorContinues(t *testing.T) {
 //   - renames the resolver's SELECT columns
 //   - moves the resolver to a different package
 //   - changes the response shape
+//
 // could silently break the directive delivery path. The test catches
 // the regression at unit-test time, BEFORE the runtime fetches an
 // empty string and the concierge goes silent again.
@@ -1171,7 +1172,7 @@ func TestInstructionsResolve_PicksUpAckFirstSeed(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	var out struct {
-		WorkspaceID   string `json:"workspace_id"`
+		WorkspaceID  string `json:"workspace_id"`
 		Instructions string `json:"instructions"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
@@ -1223,10 +1224,11 @@ func TestInstructionsResolve_PicksUpAckFirstSeed(t *testing.T) {
 // on those three columns) so a future contributor who adds the seed
 // and reaches for `ON CONFLICT (scope, scope_target, title)` is
 // forced to choose between:
-//   (a) adding a unique constraint migration first (this test would
-//       still pass; the seed's `ON CONFLICT` would be valid), OR
-//   (b) keeping the seed's idempotency via `WHERE NOT EXISTS`
-//       (current state of #2730's up.sql).
+//
+//	(a) adding a unique constraint migration first (this test would
+//	    still pass; the seed's `ON CONFLICT` would be valid), OR
+//	(b) keeping the seed's idempotency via `WHERE NOT EXISTS`
+//	    (current state of #2730's up.sql).
 //
 // Without this pin, the regression is silent until the migration
 // actually runs in CI / staging / production.

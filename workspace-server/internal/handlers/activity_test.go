@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 )
 
@@ -263,10 +263,10 @@ func TestActivityList_PeerIDRejectsNonUUID(t *testing.T) {
 
 	for _, bad := range []string{
 		"not-a-uuid",
-		"%27%20OR%201%3D1%20--",                          // URL-encoded ' OR 1=1 --
-		"11111111-2222-3333-4444",                        // truncated
-		"11111111-2222-3333-4444-555555555555-extra",     // overlong
-		"11111111-2222-3333-4444-55555555555G",           // non-hex
+		"%27%20OR%201%3D1%20--",                      // URL-encoded ' OR 1=1 --
+		"11111111-2222-3333-4444",                    // truncated
+		"11111111-2222-3333-4444-555555555555-extra", // overlong
+		"11111111-2222-3333-4444-55555555555G",       // non-hex
 	} {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
@@ -368,9 +368,9 @@ func TestActivityList_BeforeTSRejectsInvalidFormat(t *testing.T) {
 
 	for _, bad := range []string{
 		"yesterday",
-		"2026-05-01",                            // missing time component
-		"2026-05-01%2000%3A00%3A00",             // URL-encoded space instead of T
-		"%27%20OR%201%3D1%20--",                 // URL-encoded SQL injection
+		"2026-05-01",                // missing time component
+		"2026-05-01%2000%3A00%3A00", // URL-encoded space instead of T
+		"%27%20OR%201%3D1%20--",     // URL-encoded SQL injection
 	} {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)

@@ -138,16 +138,16 @@ func TestChatUpload_WorkspaceNotInDB(t *testing.T) {
 // TestChatUpload_NoInboundSecret_LazyHeal pins the lazy-heal flow
 // added 2026-04-30 alongside the SaaS shared-prepare refactor:
 //
-//   1. Reading the workspace's platform_inbound_secret returns NULL
-//      (legacy row from before RFC #2312).
-//   2. Handler MUST call wsauth.IssuePlatformInboundSecret (an UPDATE
-//      on the workspaces row) to backfill the secret, so the next
-//      upload after the workspace's heartbeat picks it up succeeds
-//      without operator action.
-//   3. Response is 503 with retry_after_seconds=30 — the workspace's
-//      local /configs/.platform_inbound_secret is also empty, so the
-//      forward this request would do still fails. The user retries
-//      after the next register response delivers the new secret.
+//  1. Reading the workspace's platform_inbound_secret returns NULL
+//     (legacy row from before RFC #2312).
+//  2. Handler MUST call wsauth.IssuePlatformInboundSecret (an UPDATE
+//     on the workspaces row) to backfill the secret, so the next
+//     upload after the workspace's heartbeat picks it up succeeds
+//     without operator action.
+//  3. Response is 503 with retry_after_seconds=30 — the workspace's
+//     local /configs/.platform_inbound_secret is also empty, so the
+//     forward this request would do still fails. The user retries
+//     after the next register response delivers the new secret.
 //
 // Pre-fix (before the lazy-heal): handlers returned 503 with
 // "Reprovision the workspace" — accurate, but every legacy workspace
@@ -279,7 +279,7 @@ func TestChatUpload_PollModeEmptyURL(t *testing.T) {
 //
 // Three of three external workspaces in the user's tenant had this
 // shape (home hermes / runner mac mini / mac laptop, all
-// runtime=external + url='' + delivery_mode=NULL).
+// runtime=external + url=” + delivery_mode=NULL).
 func TestChatUpload_NullModeEmptyURL(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -891,6 +891,7 @@ func TestChatDownload_RejectsNonHTTPScheme(t *testing.T) {
 		t.Errorf("expected 400 for file:// scheme in download, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
 // ---------- core#2129 RC 13395/CR2: redirect + DNS-rebind bypass ----------
 
 // safeWorkspaceURLServer is a tiny upstream that 302-redirects every request
@@ -1008,4 +1009,3 @@ func TestChatUpload_RedirectToMetadata_NotFollowed(t *testing.T) {
 		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
-

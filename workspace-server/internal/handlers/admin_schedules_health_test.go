@@ -328,7 +328,7 @@ func TestAdminSchedulesHealth_MultipleWorkspaces(t *testing.T) {
 	handler := NewAdminSchedulesHealthHandler()
 
 	now := time.Now()
-	recentRun := now.Add(-1 * time.Minute)  // within 2h threshold → ok
+	recentRun := now.Add(-1 * time.Minute) // within 2h threshold → ok
 	nextRun := now.Add(59 * time.Minute)
 
 	mock.ExpectQuery(`SELECT\s+w\.id`).

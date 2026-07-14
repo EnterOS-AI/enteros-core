@@ -635,22 +635,22 @@ if __name__ == "__main__":
 //
 // The plugin (molecule-ai/hermes-channel-molecule on Gitea) is a hermes
 // platform adapter that:
-//   1. Spawns ``python -m molecule_runtime.a2a_mcp_server`` as a
-//      stdio MCP subprocess (separate from any hermes-side MCP
-//      client connection).
-//   2. Long-polls ``wait_for_message`` on the platform's inbox.
-//   3. Dispatches each inbound activity into the hermes gateway as a
-//      MessageEvent — same code path Telegram/Discord use.
-//   4. Outbound replies route via ``send_message_to_user`` (canvas
-//      user) or ``delegate_task`` (peer agent) MCP tool calls.
+//  1. Spawns “python -m molecule_runtime.a2a_mcp_server“ as a
+//     stdio MCP subprocess (separate from any hermes-side MCP
+//     client connection).
+//  2. Long-polls “wait_for_message“ on the platform's inbox.
+//  3. Dispatches each inbound activity into the hermes gateway as a
+//     MessageEvent — same code path Telegram/Discord use.
+//  4. Outbound replies route via “send_message_to_user“ (canvas
+//     user) or “delegate_task“ (peer agent) MCP tool calls.
 //
 // Result: hermes gets push parity with Claude Code / codex / openclaw —
 // canvas messages and peer A2A arrive as conversation turns mid-session,
-// not just at the start of a new ``hermes`` invocation.
+// not just at the start of a new “hermes“ invocation.
 //
-// Plugin uses the upstream ``register_platform`` API shipped by
+// Plugin uses the upstream “register_platform“ API shipped by
 // NousResearch/hermes-agent#17751 (merged 2026-04-30) and falls back
-// to the legacy ``register_platform_adapter`` shape on older forks —
+// to the legacy “register_platform_adapter“ shape on older forks —
 // same wheel installs cleanly on stock or patched hermes-agent.
 const externalHermesChannelTemplate = tokenGuardShell + `# Hermes channel — bridges this workspace's A2A traffic into your
 # hermes-agent session. No tunnel/public URL needed (long-poll based,

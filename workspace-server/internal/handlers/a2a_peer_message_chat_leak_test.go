@@ -81,7 +81,7 @@ func TestPeerAgentMessage_IsNotBroadcastIntoMyChat(t *testing.T) {
 	emitter := &capturingEmitter{}
 	handler := NewWorkspaceHandler(emitter, nil, "http://localhost:8080", t.TempDir())
 
-	const wsID = "11111111-1111-1111-1111-111111111111"  // the CEO Assistant
+	const wsID = "11111111-1111-1111-1111-111111111111"   // the CEO Assistant
 	const peerID = "22222222-2222-2222-2222-222222222222" // the peer agent
 
 	expectIngestRow(mock, wsID)

@@ -182,8 +182,8 @@ func TestVerifyAuditChain_ValidChain(t *testing.T) {
 
 	ev2 := auditEventRow{
 		ID: "e2", Timestamp: ts.Add(time.Second), AgentID: "a", SessionID: "s",
-		Operation:   "task_end",
-		PrevHMAC:    strPtr(ev1.HMAC),
+		Operation: "task_end",
+		PrevHMAC:  strPtr(ev1.HMAC),
 	}
 	ev2.HMAC = makeAuditHMAC(t, key, &ev2)
 

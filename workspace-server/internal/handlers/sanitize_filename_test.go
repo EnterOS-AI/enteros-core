@@ -29,10 +29,10 @@ func TestSanitizeFilename_StripsPathTraversal(t *testing.T) {
 
 func TestSanitizeFilename_ReplacesUnsafeChars(t *testing.T) {
 	cases := map[string]string{
-		"hello world.pdf":     "hello_world.pdf",
-		"weird;chars!?.txt":   "weird_chars__.txt",
-		"中文.docx":             "__.docx", // non-ASCII → underscore (each rune)
-		"file (1).pdf":        "file__1_.pdf",
+		"hello world.pdf":   "hello_world.pdf",
+		"weird;chars!?.txt": "weird_chars__.txt",
+		"中文.docx":           "__.docx", // non-ASCII → underscore (each rune)
+		"file (1).pdf":      "file__1_.pdf",
 	}
 	for in, want := range cases {
 		if got := handlers.SanitizeFilename(in); got != want {

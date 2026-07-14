@@ -38,9 +38,9 @@ import (
 	"os"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // integrationDB_Tokens opens the integration PG connection, wipes our

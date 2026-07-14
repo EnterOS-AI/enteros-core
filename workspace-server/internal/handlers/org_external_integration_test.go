@@ -24,12 +24,12 @@ import (
 // TestGitFetcher_RealClone_LocalRedirect proves the production
 // gitFetcher round-trips correctly against a real git repository.
 // Steps:
-//   1. Set up a local bare-git repo with workspace content.
-//   2. Configure git's `insteadOf` to rewrite the gitea URL → local path
-//      via GIT_CONFIG_COUNT/KEY/VALUE env vars (process-scoped).
-//   3. Run resolveYAMLIncludes with !external pointing at the gitea URL.
-//   4. Assert: cache dir populated; content materialized; path rewrite
-//      applied; second invocation hits cache (no second clone).
+//  1. Set up a local bare-git repo with workspace content.
+//  2. Configure git's `insteadOf` to rewrite the gitea URL → local path
+//     via GIT_CONFIG_COUNT/KEY/VALUE env vars (process-scoped).
+//  3. Run resolveYAMLIncludes with !external pointing at the gitea URL.
+//  4. Assert: cache dir populated; content materialized; path rewrite
+//     applied; second invocation hits cache (no second clone).
 func TestGitFetcher_RealClone_LocalRedirect(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skipf("git binary not found: %v", err)

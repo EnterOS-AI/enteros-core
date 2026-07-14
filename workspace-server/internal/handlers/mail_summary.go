@@ -27,7 +27,8 @@ package handlers
 //                       rows through the same inbox, so the same floor covers
 //                       them).
 //   sent_awaiting_reply delegations THIS workspace sent (caller_id) still in a
-//                       non-terminal status (queued|dispatched|in_progress).
+//                       non-terminal status — DERIVED from
+//                       DelegationInFlightStates (incl. `stuck`).
 //   overdue             the sent_awaiting_reply subset older than
 //                       ?overdue_after_seconds (default 21600 = 6h — the
 //                       "target agent may have an issue" warning the digest
@@ -128,11 +129,16 @@ func (h *MailSummaryHandler) Summary(c *gin.Context) {
 	// Sent-awaiting-reply + the overdue subset, oldest first. One indexed scan
 	// (idx_delegations_caller_created); ages computed DB-side so the handler
 	// has no clock skew vs created_at.
+	// The IN-list is DERIVED (delegation_ledger.go), never hand-typed. This very
+	// query with a hand-typed list IS bug #4314: the sweeper writes `stuck`, the
+	// list didn't have it, and a wedged delegation silently dropped out of the
+	// caller's "awaiting reply" count — hiding the one case the ⚠ warning exists to
+	// surface. `stuck` is IN-FLIGHT: the target has not answered.
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT delegation_id, callee_id,
 		       EXTRACT(EPOCH FROM (now() - created_at))::bigint AS age_seconds
 		FROM delegations
-		WHERE caller_id = $1 AND status IN ('queued','dispatched','in_progress')
+		WHERE caller_id = $1 AND status IN (`+sqlInFlightStates()+`)
 		ORDER BY created_at ASC`,
 		wsID)
 	if err != nil {
