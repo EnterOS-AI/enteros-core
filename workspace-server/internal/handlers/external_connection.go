@@ -713,12 +713,11 @@ const externalHermesChannelTemplate = tokenGuardShell + `# Hermes channel — br
 # hermes-agent session. No tunnel/public URL needed (long-poll based,
 # same shape as the Claude Code channel).
 #
-# Multi-workspace: each workspace's plugin_platforms entry is keyed by a
-# workspace-specific slug ("{{MCP_SERVER_NAME}}") so two molecule
-# workspaces can coexist in one hermes config — YAML rejects duplicate
-# mapping keys, so re-using the same "molecule:" key for a second
-# workspace would silently overwrite the first. Re-running this snippet
-# for another workspace ADDS a sibling entry instead.
+# The plugin registers the fixed Hermes platform name "molecule" and reads
+# one workspace identity from the environment. One Hermes gateway therefore
+# connects to one Molecule workspace. To connect another workspace, run a
+# separate Hermes gateway with its own config directory and environment;
+# inventing a workspace-specific platform key is silently ignored by Hermes.
 #
 # Prereq: a hermes-agent install on the target machine. Latest builds
 # (post #17751) ship the platform-plugin API natively; older ones are
@@ -737,30 +736,34 @@ fi
 # 2. Export the workspace credentials. Guarded: ` + "`hermes gateway --replace`" + `
 #    below REPLACES a running gateway, so exporting a placeholder token and
 #    restarting would take a working channel offline with no way back to the
-#    real token (it is shown once).
+#    real token (it is shown once). These exports affect this shell; if Hermes
+#    runs under a service manager, persist the same three values in that
+#    service's environment before restarting it.
 if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 export MOLECULE_WORKSPACE_ID={{WORKSPACE_ID}}
 export MOLECULE_PLATFORM_URL={{PLATFORM_URL}}
 export MOLECULE_WORKSPACE_TOKEN="{{AUTH_TOKEN}}"
 fi
 
-# 3. Edit ~/.hermes/config.yaml — under your existing top-level
-#    gateway: block, add a plugin_platforms entry. The platform key
-#    ({{MCP_SERVER_NAME}}) is workspace-specific so multiple molecule
-#    workspaces coexist; re-using the same key for a second workspace
-#    would silently overwrite the first (YAML duplicate-key collapse):
+# 3. Edit ~/.hermes/config.yaml. Current Hermes refuses non-bundled pip
+#    plugins unless they are explicitly enabled, and both current and legacy
+#    Hermes read platform configuration from gateway.platforms (the similarly
+#    named internal storage field is NOT a YAML key). Merge these entries into any
+#    existing plugins.enabled list and gateway.platforms map:
 #
+#      plugins:
+#        enabled:
+#          - molecule
 #      gateway:
 #        # ...your existing gateway settings...
-#        plugin_platforms:
-#          {{MCP_SERVER_NAME}}:
+#        platforms:
+#          molecule:
 #            enabled: true
-#            workspace_id: {{WORKSPACE_ID}}
 #
-#    If you don't yet have a gateway: block, create one with just
-#    that plugin_platforms entry. Don't append blindly — YAML
-#    rejects duplicate top-level keys, so a second gateway: block
-#    will silently break hermes config loading.
+#    Do not append duplicate plugins: or gateway: keys; YAML duplicate-key
+#    collapse can silently discard the working configuration. On current
+#    Hermes, ` + "`hermes plugins enable molecule`" + ` is the CLI equivalent
+#    of adding molecule to plugins.enabled.
 
 # 4. Restart the hermes gateway (skipped without a real token — see above):
 if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
@@ -782,8 +785,8 @@ fi
 #       duplicate-key in config.yaml is the most common cause; the
 #       gateway: block must appear exactly once.
 #     • Plugin not discovered after install — pip show hermes-channel-molecule
-#       to confirm install. Some hermes builds need ` + "`hermes plugin reload`" + `
-#       before the new platform_plugins entry takes effect.
+#       to confirm install, then run ` + "`hermes plugins enable molecule`" + `
+#       (current Hermes) or verify gateway.platforms.molecule is enabled.
 fi
 [ "$RUNTIME_INSTALL_STATUS" -eq 0 ]
 fi

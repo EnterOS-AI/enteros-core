@@ -372,12 +372,16 @@ func TestBuildExternalConnectionPayload_McpServerNameUniquePerWorkspace(t *testi
 //     either breaks parsing or overwrites the first table.
 //   - openclaw: ~/.openclaw/mcp/<name>.json — file is keyed by <name>,
 //     `openclaw mcp set <same-name>` overwrites.
-//   - hermes: ~/.hermes/config.yaml gateway.plugin_platforms.<key>:
-//     YAML rejects duplicate mapping keys.
 //
-// The first three key an MCP-host config namespace by NAME, so they must
+// The three MCP hosts above key a config namespace by NAME, so they must
 // stamp the workspace-specific {{MCP_SERVER_NAME}} slug. This test catches a
 // future template author who introduces a new runtime tab without plumbing it.
+//
+//   - hermes is intentionally NOT in that set. Its plugin registers the fixed
+//     platform name `molecule`, and hermes reads it from
+//     gateway.platforms.molecule. One hermes gateway therefore connects to one
+//     Molecule workspace; inventing a workspace-specific platform key makes
+//     hermes silently ignore the config.
 //
 //   - kimi is the exception: it registers no MCP server-name entry anywhere,
 //     it just needs a private directory. So it keys on {{WORKSPACE_ID}}, which
@@ -393,10 +397,9 @@ func TestBuildExternalConnectionPayload_AllRuntimeSnippetsAreWorkspaceUnique(t *
 
 	// Per-template literal that proves the per-workspace key was stamped through.
 	wantPerSnippet := map[string]string{
-		"universal_mcp_snippet":  "claude mcp add molecule-my-bot ",
-		"codex_snippet":          "[mcp_servers.molecule-my-bot]",
-		"openclaw_snippet":       "openclaw mcp set molecule-my-bot ",
-		"hermes_channel_snippet": "          molecule-my-bot:",
+		"universal_mcp_snippet": "claude mcp add molecule-my-bot ",
+		"codex_snippet":         "[mcp_servers.molecule-my-bot]",
+		"openclaw_snippet":      "openclaw mcp set molecule-my-bot ",
 		// Workspace-ID-keyed, not slug-keyed — see the note above.
 		"kimi_snippet": "~/.molecule-ai/kimi-id-a",
 	}
@@ -419,6 +422,31 @@ func TestBuildExternalConnectionPayload_AllRuntimeSnippetsAreWorkspaceUnique(t *
 		v, _ := got[k].(string)
 		if strings.Contains(v, "{{MCP_SERVER_NAME}}") {
 			t.Errorf("%s still contains literal {{MCP_SERVER_NAME}}", k)
+		}
+	}
+}
+
+// TestBuildExternalConnectionPayload_HermesUsesRegisteredPlatformKey keeps the
+// generated config aligned with both current hermes-agent and the legacy
+// platform-plugin branch. Both parse plugin entries from
+// gateway.platforms.<registered-name>; plugin_platforms is an internal struct
+// field, not a YAML key. The plugin registers exactly `molecule`, so a
+// workspace-specific key would also be ignored.
+func TestBuildExternalConnectionPayload_HermesUsesRegisteredPlatformKey(t *testing.T) {
+	got := BuildExternalConnectionPayload("https://p.test", "id-a", "my-bot", "tok")
+	hermes, _ := got["hermes_channel_snippet"].(string)
+
+	for _, required := range []string{
+		"plugins:\n#        enabled:\n#          - molecule",
+		"platforms:\n#          molecule:\n#            enabled: true",
+	} {
+		if !strings.Contains(hermes, required) {
+			t.Errorf("hermes snippet missing current config block %q:\n%s", required, hermes)
+		}
+	}
+	for _, forbidden := range []string{"plugin_platforms", "molecule-my-bot:"} {
+		if strings.Contains(hermes, forbidden) {
+			t.Errorf("hermes snippet contains unsupported config key %q:\n%s", forbidden, hermes)
 		}
 	}
 }
