@@ -17,16 +17,15 @@
 # this can sync into structure_events from Loki via a backfill job —
 # the structured JSON shape is forward-compatible.
 #
-# Logic in `.gitea/scripts/audit-force-merge.sh` per the same script-
-# extract pattern as sop-checklist.
+# Logic in `.gitea/scripts/audit-force-merge.sh` per the standard
+# script-extract pattern.
 
 name: audit-force-merge
 
-# pull_request_target loads from the base branch — same security model
-# as sop-checklist. Without this, an attacker could rewrite the
-# workflow on a PR and skip the audit emission for their own
-# force-merge. See `.gitea/workflows/sop-checklist.yml` for the full
-# rationale.
+# pull_request_target loads the workflow definition from the base branch,
+# not the PR head. Without this, an attacker could rewrite the workflow on a
+# PR and skip the audit emission for their own force-merge. (This is the same
+# base-branch-load security model the now-retired sop-checklist workflow used.)
 concurrency:
   # Auto-cancel a superseded run: a newer commit/event supersedes the old
   # one instead of leaving it queued forever (root fix for waiting-run pileup).
@@ -76,8 +75,7 @@ jobs:
                 "Secret scan / Scan diff for credential-shaped strings (pull_request)"
               ],
               "staging": [
-                "CI / all-required (pull_request)",
-                "sop-checklist / all-items-acked (pull_request)"
+                "CI / all-required (pull_request)"
               ]
             }
         run: bash .gitea/scripts/audit-force-merge.sh

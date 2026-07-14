@@ -39,9 +39,10 @@ queue. This script provides the missing serialized policy in user space:
 
 Authoritative gates (fail-closed):
   - The REQUIRED status contexts come from BRANCH PROTECTION
-    (`status_check_contexts`) PLUS the hardcoded governance checks
-    (qa-review, security-review, sop-checklist). If branch protection
-    cannot be enumerated, the queue HOLDS (does not merge blindly).
+    (`status_check_contexts`). If branch protection cannot be enumerated,
+    the queue HOLDS (does not merge blindly). (The old uniform SOP gate —
+    qa-review/security-review/sop-checklist — was removed 2026-07-14; see
+    GOVERNANCE_REQUIRED_CONTEXTS below.)
   - NON-required reds (E2E Chat, Staging SaaS, ci-arm64-advisory, any
     continue-on-error job) MUST NOT block. They are reported, never gating.
   - `force_merge=true` is used ONLY when the merge is blocked *solely* by
@@ -106,9 +107,10 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-# SSOT fail-closed approval predicate (SEV-1 internal#812). review-check.sh
-# consumes the same module via _review_check_filter.py — do NOT duplicate
-# the predicate here. See _approval_validator.py for the fail-closed contract.
+# SSOT fail-closed approval predicate (SEV-1 internal#812). This is now the
+# sole consumer of the module (the review-check.sh chain was removed with the
+# SOP review gate 2026-07-14) — do NOT duplicate the predicate here. See
+# _approval_validator.py for the fail-closed contract.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _approval_validator import classify_reviews as _classify_reviews_ssot  # noqa: E402
 
@@ -168,11 +170,14 @@ OPT_OUT_LABELS = {
 # Verified against the lint-bp-context-emit-match test which already
 # asserts (pull_request_target) for these names. No requirement
 # dropped; just a name correction.
-GOVERNANCE_REQUIRED_CONTEXTS = [
-    "qa-review / approved (pull_request_target)",
-    "security-review / approved (pull_request_target)",
-    "sop-checklist / all-items-acked (pull_request_target)",
-]
+# SOP review-gate contexts (qa-review / security-review / sop-checklist) were
+# fully removed 2026-07-14 (CTO directive): the producing workflows are deleted
+# and no PR emits these contexts anymore, so keeping them here would make every
+# merge wait forever on phantom-required checks. The peer-approval floor
+# (REVIEWER_SET + REQUIRED_APPROVALS, see below) and reserved-path-review remain
+# the review gates. Kept as an (empty) list so the concat sites below are a
+# harmless no-op and re-adding a uniform governance context is a one-line change.
+GOVERNANCE_REQUIRED_CONTEXTS: list[str] = []
 
 # --------------------------------------------------------------------------
 # CRITICAL fail-closed contexts (RCA: core PR #1676 merged 2026-06-24 with
@@ -209,10 +214,7 @@ CRITICAL_REQUIRED_CONTEXT_PREFIXES = [
 
 REQUIRED_CONTEXTS_RAW = _env(
     "REQUIRED_CONTEXTS",
-    default=(
-        "CI / all-required (pull_request),"
-        "sop-checklist / all-items-acked (pull_request)"
-    ),
+    default="CI / all-required (pull_request)",
 )
 # --------------------------------------------------------------------------
 # Enforced-contexts SSOT file (internal#3181 — close the BP↔allowlist gap)
@@ -289,11 +291,10 @@ REVIEWER_SET = {
     ).split(",")
     if name.strip()
 }
-# CTO 2026-07-14: the genuine-peer floor is ONE approval. This matches the
-# documented design in .gitea/security-reviewer.md (`required_approvals = 1`);
-# the previous default of 2 was drift and, combined with the dead REVIEWER_SET
-# above and the actual review practice (<=1 general review per PR, 0/14 recent
-# merges had 2 distinct peer approvals), made the queue unable to merge anything.
+# CTO 2026-07-14: the genuine-peer floor is ONE approval. The previous default
+# of 2 was drift and, combined with the dead REVIEWER_SET above and the actual
+# review practice (<=1 general review per PR, 0/14 recent merges had 2 distinct
+# peer approvals), made the queue unable to merge anything.
 # Branch protection's value still wins when it is a valid int >= this floor
 # (see the fail-closed clamp in branch-protection parsing).
 REQUIRED_APPROVALS_DEFAULT = int(_env("REQUIRED_APPROVALS", default="1") or "1")
@@ -1540,11 +1541,11 @@ def evaluate_merge_readiness(
             f"need {effective_required_approvals}",
         )
 
-    # 4) Every REQUIRED status context must be green. This includes both
-    #    branch-protection-required contexts AND the hardcoded governance checks
-    #    (qa-review, security-review, sop-checklist). NON-required reds (E2E
-    #    Chat, Staging SaaS, ci-arm64-advisory, continue-on-error jobs) are NOT
-    #    consulted here and must not block.
+    # 4) Every REQUIRED status context must be green (the branch-protection
+    #    status_check_contexts set; the old uniform SOP governance checks were
+    #    removed 2026-07-14). NON-required reds (E2E Chat, Staging SaaS,
+    #    ci-arm64-advisory, continue-on-error jobs) are NOT consulted here and
+    #    must not block.
     latest = latest_statuses_by_context(pr_status.get("statuses") or [])
     ok, missing_or_bad = required_contexts_green(latest, required_contexts)
     if not ok:
