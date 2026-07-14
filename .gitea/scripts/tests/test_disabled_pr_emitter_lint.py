@@ -160,3 +160,116 @@ def test_the_repo_itself_is_clean(tmp_path):
         "a disabled workflow in .gitea/workflows still declares a PR trigger and "
         f"will wedge PRs: {debug['offenders']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The four fail-OPEN gaps found reviewing Guard G after it landed (core#4309).
+# Each was a door the guard did not look at, so each is a way the wedge it exists
+# to prevent could still happen while the guard reported GREEN.
+# ---------------------------------------------------------------------------
+def test_issue_comment_on_a_disabled_workflow_is_RED(tmp_path):
+    """THE LIVE ONE. core#4309 dropped `pull_request_target` from sop-checklist but
+    KEPT `issue_comment`, reasoning that "a comment event does not post a PR-blocking
+    status on its own". That is false:
+
+      - a PR IS an issue in the Gitea API, so a PR comment fires the workflow;
+      - sop-checklist's `all-items-acked` runs on /sop-ack and POSTs a commit status;
+      - its `review-refire` job has NO job-level `if:` — it runs on EVERY comment and
+        reports its own status context regardless;
+      - the workflow is disabled, so a red/cancelled run of it can never be rerun.
+
+    So any comment on any PR could re-wedge it. The workflow disabled to STOP the
+    wedge could still cause it.
+
+    MUTATION: drop "issue_comment" from PR_STATUS_EVENTS -> this test FAILS.
+    """
+    wf_dir = _write(
+        tmp_path,
+        "sop-checklist.yml",
+        "name: sop-checklist\non:\n  issue_comment:\n    types: [created]\njobs:\n  x:\n    runs-on: ubuntu-latest\n",
+    )
+    states = {"sop-checklist": {"file": "sop-checklist.yml", "state": "disabled_manually"}}
+    findings, debug = drift.detect_disabled_pr_emitters(states, workflows_dir=wf_dir)
+    assert findings, "a disabled workflow firing on issue_comment can still post an unrerunnable status on a PR head"
+    assert debug["offenders"][0]["triggers"] == ["issue_comment"]
+
+
+def test_pull_request_review_events_are_checked(tmp_path):
+    """`pull_request_review` / `pull_request_review_comment` fire in PR context and
+    post on the PR head just like pull_request does — reserved-path-review is built
+    on exactly that. A disabled workflow carrying them wedges identically.
+
+    MUTATION: drop them from PR_STATUS_EVENTS -> this test FAILS.
+    """
+    for event in ("pull_request_review", "pull_request_review_comment"):
+        wf_dir = _write(
+            tmp_path,
+            "w.yml",
+            f"name: w\non:\n  {event}:\n    types: [submitted]\njobs:\n  x:\n    runs-on: ubuntu-latest\n",
+        )
+        states = {"w": {"file": "w.yml", "state": "disabled_manually"}}
+        findings, _ = drift.detect_disabled_pr_emitters(states, workflows_dir=wf_dir)
+        assert findings, f"a disabled workflow firing on {event} was not caught"
+
+
+def test_dot_yaml_workflows_are_not_invisible(tmp_path):
+    """Gitea reads BOTH *.yml and *.yaml. The guard globbed only *.yml, so a `.yaml`
+    workflow was the one file an author could add that Guard G would never look at —
+    a hole nothing in the repo exercised, which is exactly why it would have survived
+    until it mattered.
+
+    MUTATION: glob only "*.yml" in workflow_files() -> this test FAILS.
+    """
+    wf_dir = _write(
+        tmp_path,
+        "sneaky.yaml",
+        "name: sneaky\non:\n  pull_request_target:\n    types: [opened]\njobs:\n  x:\n    runs-on: ubuntu-latest\n",
+    )
+    states = {"sneaky": {"file": "sneaky.yaml", "state": "disabled_manually"}}
+    findings, _ = drift.detect_disabled_pr_emitters(states, workflows_dir=wf_dir)
+    assert findings, "a disabled .yaml workflow firing on PR events was invisible to the guard"
+
+
+def test_unjoinable_api_response_fails_CLOSED(tmp_path):
+    """The whole guard keys off workflow_states. If that dict is empty — or stops
+    carrying the `file` field the guard joins on (an API shape change, a token that
+    lost Actions scope) — the loop finds nothing not-active, reports zero findings,
+    and PASSES.
+
+    A guard whose PASS arm is what a broken input produces is not a guard: it would
+    report GREEN while inspecting ZERO workflows, exactly when it is blind.
+
+    MUTATION: delete the G2 reachability check -> this test FAILS.
+    """
+    wf_dir = _write(
+        tmp_path,
+        "real.yml",
+        "name: real\non:\n  pull_request_target:\n    types: [opened]\njobs:\n  x:\n    runs-on: ubuntu-latest\n",
+    )
+    # Shape drift: the API answers, but with no `file` key to join on.
+    states = {"real": {"name": "real", "state": "disabled_manually"}}
+    findings, debug = drift.detect_disabled_pr_emitters(states, workflows_dir=wf_dir)
+    assert findings and findings[0].startswith("G2"), (
+        "an unjoinable Actions-API response must fail CLOSED, not silently inspect "
+        f"nothing and pass (findings={findings})"
+    )
+    assert debug["joinable"] == 0
+
+    # ...and the empty-response case.
+    findings, _ = drift.detect_disabled_pr_emitters({}, workflows_dir=wf_dir)
+    assert findings and findings[0].startswith("G2")
+
+
+def test_a_clean_repo_still_passes_and_is_not_vacuous(tmp_path):
+    """The G2 guard must not fire when the join genuinely works — otherwise it is
+    just a permanent red. A joinable response with an ACTIVE workflow is GREEN, and
+    the debug proves the guard actually looked at something."""
+    wf_dir = _write(
+        tmp_path,
+        "ok.yml",
+        "name: ok\non:\n  pull_request:\n    types: [opened]\njobs:\n  x:\n    runs-on: ubuntu-latest\n",
+    )
+    states = {"ok": {"file": "ok.yml", "state": "active"}}
+    findings, debug = drift.detect_disabled_pr_emitters(states, workflows_dir=wf_dir)
+    assert findings == []
+    assert debug["joinable"] == 1, "the guard must prove it joined, not just find nothing"

@@ -453,10 +453,10 @@ def all_emitted_contexts(workflows_dir: str = ".gitea/workflows") -> set[str]:
     aggregator safe at the repo level: it only covers CI's own jobs, but
     F4 guarantees the cross-workflow required contexts it CANNOT cover
     are real and present."""
-    import glob as _glob
-
     emitted: set[str] = set()
-    for path in sorted(_glob.glob(os.path.join(workflows_dir, "*.yml"))):
+    # Both extensions — see workflow_files(). Globbing only *.yml made a `.yaml`
+    # workflow invisible to this guard too.
+    for path in workflow_files(workflows_dir):
         try:
             with open(path, encoding="utf-8") as f:
                 doc = yaml.safe_load(f)
@@ -656,9 +656,28 @@ def detect_phantom_gates(
     return findings, debug
 
 
+# Every event that can fire a workflow IN THE CONTEXT OF AN OPEN PR and therefore
+# get it to post a commit status on the PR head.
+#
+# The original Guard G checked only pull_request / pull_request_target, which left
+# the wedge reachable by three other doors. The one that mattered: sop-checklist was
+# left DISABLED but still carrying `issue_comment` (its SOP-ack trigger) — so any
+# comment on any PR still fired it, it still posted a merge-blocking status, and the
+# status still could not be rerun (400 "workflow is disabled"). The workflow that
+# core#4309 disabled to STOP the wedge could still cause it. A guard that checks two
+# of five doors is a guard you believe you have.
+PR_STATUS_EVENTS = (
+    "pull_request",
+    "pull_request_target",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "issue_comment",  # fires on PR comments — a PR IS an issue in the Gitea API
+)
+
+
 def workflow_pr_triggers(doc: Any) -> list[str]:
-    """The PR-lifecycle events a workflow doc declares: `pull_request` and/or
-    `pull_request_target`.
+    """The PR-context events a workflow doc declares — anything that can make it
+    post a status on a PR head (see PR_STATUS_EVENTS).
 
     NOTE the YAML 1.1 booleanization trap: PyYAML parses the bare key `on:` as
     the BOOLEAN `True`, not the string `"on"`. A guard that only looked up
@@ -675,7 +694,23 @@ def workflow_pr_triggers(doc: Any) -> list[str]:
         keys = [k for k in on if isinstance(k, str)]
     else:
         return []
-    return [k for k in ("pull_request", "pull_request_target") if k in keys]
+    return [k for k in PR_STATUS_EVENTS if k in keys]
+
+
+def workflow_files(workflows_dir: str) -> list[str]:
+    """Every workflow file on disk.
+
+    Both extensions: Gitea reads `*.yml` AND `*.yaml`, and a guard that globbed
+    only `*.yml` would skip a `.yaml` workflow entirely — i.e. the one file an
+    author could add without the guard ever looking at it. Nothing in the repo uses
+    `.yaml` today, which is exactly why the gap would have gone unnoticed until it
+    mattered."""
+    import glob as _glob
+
+    out: list[str] = []
+    for ext in ("*.yml", "*.yaml"):
+        out.extend(_glob.glob(os.path.join(workflows_dir, ext)))
+    return sorted(out)
 
 
 def detect_disabled_pr_emitters(
@@ -704,11 +739,11 @@ def detect_disabled_pr_emitters(
 
     A workflow that is off must be OFF: either delete it, or drop its PR
     triggers so it stops emitting statuses."""
-    import glob as _glob
-
     findings: list[str] = []
     offenders: list[dict[str, Any]] = []
     checked: list[dict[str, str]] = []
+
+    on_disk = workflow_files(workflows_dir)
 
     # file id -> state, for the workflows Gitea reports as not-active.
     inactive_files = {
@@ -718,7 +753,38 @@ def detect_disabled_pr_emitters(
     }
     inactive_files.pop("", None)
 
-    for path in sorted(_glob.glob(os.path.join(workflows_dir, "*.yml"))):
+    # G2 — REACHABILITY. Everything below keys off `workflow_states`, so if that
+    # dict is empty (or stops carrying the `file` key the guard joins on), the loop
+    # simply finds nothing not-active, reports zero findings, and PASSES. A guard
+    # whose pass arm is what a broken input produces is not a guard.
+    #
+    # The repo demonstrably has workflow files on disk. If Gitea reports none of
+    # them, the API shape or the token's scope has changed — fail CLOSED and say so,
+    # rather than emit a green that means "I could not look".
+    known_files = {
+        (meta.get("file") or "").strip()
+        for meta in workflow_states.values()
+        if (meta.get("file") or "").strip()
+    }
+    on_disk_ids = {os.path.basename(p) for p in on_disk}
+    if on_disk_ids and not (known_files & on_disk_ids):
+        findings.append(
+            "G2 — the Actions API returned NO workflow that matches any of the "
+            f"{len(on_disk_ids)} workflow files on disk "
+            f"(api_reported={len(workflow_states)}, joinable=0). Guard G joins on the "
+            "`file` field, so with no join key it inspects nothing and would report "
+            "GREEN while inspecting ZERO workflows. Failing closed instead: the API "
+            "shape or the token scope has changed and this guard is blind."
+        )
+        return findings, {
+            "offenders": [],
+            "checked": [],
+            "api_reported": len(workflow_states),
+            "on_disk": len(on_disk_ids),
+            "joinable": 0,
+        }
+
+    for path in on_disk:
         file_id = os.path.basename(path)
         state = inactive_files.get(file_id)
         if state is None:
@@ -741,21 +807,29 @@ def detect_disabled_pr_emitters(
 
     if offenders:
         findings.append(
-            "G1 — DISABLED workflows that still declare PR triggers. Gitea fires "
-            "`pull_request_target` on a disabled workflow anyway, so these keep "
-            "posting commit statuses that CANNOT be rerun (`rerun` → 400 "
-            '"workflow is disabled") and therefore WEDGE the PR under the `[*]` '
-            "branch protection:\n"
+            "G1 — DISABLED workflows that still declare PR-context triggers. Gitea "
+            "fires PR events on a disabled workflow ANYWAY (disabling only blocks "
+            "rerun/dispatch), so these keep posting commit statuses that CANNOT be "
+            'rerun (`rerun` → 400 "workflow is disabled") and therefore WEDGE the PR '
+            "under the `[*]` branch protection:\n"
             + "\n".join(
                 f"  - {o['file']}  state={o['state']}  triggers={'+'.join(o['triggers'])}"
                 for o in offenders
             )
-            + "\n    Fix: delete the workflow, or remove its pull_request / "
-            "pull_request_target triggers so it stops emitting statuses. If it is "
-            "meant to gate, RE-ENABLE it instead (a disabled gate is not a gate)."
+            + "\n    Fix: delete the workflow, or remove EVERY trigger in "
+            + f"{{{', '.join(PR_STATUS_EVENTS)}}} so it stops emitting statuses on a PR. "
+            "If it is meant to gate, RE-ENABLE it instead (a disabled gate is not a "
+            "gate). Note `issue_comment`: a PR IS an issue, so a comment fires the "
+            "workflow and it posts on the PR head just the same."
         )
 
-    return findings, {"offenders": offenders, "checked": checked}
+    return findings, {
+        "offenders": offenders,
+        "checked": checked,
+        "api_reported": len(workflow_states),
+        "on_disk": len(on_disk),
+        "joinable": len(known_files & on_disk_ids),
+    }
 
 
 def run_disabled_pr_emitter_lint() -> int:

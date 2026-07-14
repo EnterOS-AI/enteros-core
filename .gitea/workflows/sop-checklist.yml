@@ -107,16 +107,30 @@ on:
   #     -> 400 {"message":"workflow sop-checklist.yml is disabled"}
   # which wedges the PR under the `['*']` branch protection. Seen on core#4305.
   #
-  # `issue_comment` is retained: the slash-command surface (/sop-ack, /sop-revoke,
-  # /sop-n/a) is how the ceremony would be driven if it were re-enabled, and a
-  # comment event does not post a PR-blocking status on its own.
+  # `issue_comment` REMOVED 2026-07-14. When #4309 dropped `pull_request_target` it
+  # KEPT `issue_comment`, on the reasoning that "a comment event does not post a
+  # PR-blocking status on its own". That reasoning was WRONG, and it left the very
+  # wedge #4309 set out to close still reachable — just through a different door:
   #
-  # To restore the gate: re-enable the workflow AND restore this trigger.
-  issue_comment:
-    types: [created]   # NOT [created, edited, deleted] — Gitea 1.22.6 holds a runner slot
-    # at job-parsing time, before job-level if: guards run. edited/deleted events
-    # occupied ~1,300 runner-slot-hours/day on this workflow alone during the
-    # 2026-05-16 freeze. Per PR #1345 fix.
+  #   - a PR IS an issue in the Gitea API, so a comment on a PR fires this workflow;
+  #   - `all-items-acked` runs on a /sop-ack | /sop-revoke | /sop-n/a comment and
+  #     POSTs a commit status on the PR head;
+  #   - `review-refire` has NO job-level `if:` at all, so it runs on EVERY comment
+  #     and reports its own status context regardless;
+  #   - under main's `['*']` branch protection every reported context must be
+  #     success — and because the workflow is `disabled_manually`, a failed or
+  #     cancelled run of it CANNOT be rerun
+  #         POST /actions/runs/<id>/rerun → 400 {"message":"workflow ... is disabled"}
+  #     so any comment on any PR could re-wedge it with no API path out.
+  #
+  # A disabled workflow must fire on NOTHING that can post to a PR head. The
+  # slash-command surface is dead anyway while the workflow is disabled — it cannot
+  # be dispatched or rerun. Guard G (--disabled-pr-emitter-lint) now enforces this
+  # across ALL five PR-context events, not just the two it originally checked.
+  #
+  # To restore the gate: re-enable the workflow AND restore `pull_request_target` +
+  # `issue_comment` together.
+  workflow_dispatch:
 
 permissions:
   contents: read
