@@ -66,19 +66,53 @@ Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 # also carries the COLD-OPEN browser-slug assertion (STEP 2.5) that catches the
 # in-browser /workspaces 404 the admin-bearer probe misses.
 #
-# It is kept BELOW the ENFORCED marker (documented-required, not merge-blocking)
-# for now — two conditions gate promotion, per the repo's validate-before-enforce
-# rule (do NOT promote early or the public-repo merge queue freezes):
-#   1. a GREEN molecules-server run of this job on main, and
-#   2. the PR/fork path posts `success` WITHOUT staging creds (E2E_REQUIRE_LIVE=0
-#      PR-mode self-check) so fork PRs — which cannot read the staging admin token
-#      — do not fail-closed and wedge the queue.
-# When both hold, PROMOTE this line above the ENFORCED marker (and delete this
-# block). Until then, per-PR concierge coverage remains via the deterministic
-# `Concierge Creates Workspace Hermetic` gate (above, ENFORCED) and the
-# local-docker `Local Provision Lifecycle E2E (stub)` lane (below); the real
-# tool-use concierge→provision_workspace→GET /workspaces gate also blocks prod
-# via the controlplane local staging→prod e2e gate (CP #1013).
+# CORRECTION 2026-07-14 — this block used to claim: "It is kept BELOW the ENFORCED
+# marker (documented-required, not merge-blocking)". THAT WAS FALSE. The line is
+# physically ABOVE the first `# pending-#NNNN` marker, and gitea-merge-queue.py
+# (_PENDING_MARKER_RE) enforces everything above that marker regardless of the
+# prose around it. So this context has been merge-blocking all along, while the
+# file said it wasn't. The file lied about its own enforcement.
+#
+# Worse, its promotion condition #2 was: "the PR/fork path posts `success` WITHOUT
+# staging creds (E2E_REQUIRE_LIVE=0 PR-mode self-check)". That is a VACUOUS PASS
+# written down as a requirement. Enforcement is evaluated on the PR HEAD, so an
+# enforced context whose PR arm always succeeds — by running `bash -n` on a shell
+# script and exiting 0 — enforces exactly nothing. It was a merge gate that could
+# not fail a merge.
+#
+# PARKED 2026-07-14 (moved BELOW the marker — see the pending-#86 block).
+#
+# My first attempt at fixing the vacuity was to make the PR arm REAL: enable the
+# Infisical KMS fetch on same-repo PRs so E2E_REQUIRE_LIVE=1 could run the live
+# concierge E2E where enforcement is actually evaluated. Code review killed it,
+# correctly. That change put the staging CP_ADMIN_API_TOKEN — cross-tenant admin
+# over every staging org, tenant-DELETE included — into a job whose very next step
+# executes tests/e2e/test_staging_concierge_creates_workspace_e2e.sh FROM THE PR'S
+# OWN TREE. Anyone able to push a branch could have edited that script to exfiltrate
+# the token. A branch push is not a review. It also re-added the exact
+# `(pull_request && fork==false)` clause the Guard-B block in the producer says was
+# removed because it drove a live staging provision on EVERY PR push.
+#
+# The real lesson: this gate cannot be honestly enforced on a pull request. Proving
+# it requires live staging credentials, and live credentials must never sit in a job
+# that runs PR-authored code. Making the vacuous gate "real" that way trades a fake
+# gate for a credential-exfil path — a strictly worse deal.
+#
+# So it goes below the marker: enforced NOWHERE it cannot prove anything, and kept
+# as the post-merge DEPLOY gate it genuinely is (green 5/5 on recent main pushes).
+# Real per-PR coverage of this journey is the EPHEMERAL-CP gate (task #86), which
+# needs no shared-staging credential at all because it stands up its own throwaway
+# control plane. That is the correct home for "pull, not after push".
+
+# pending-#86 (not yet enforced) ────────────────────────────────────────
+# The staging concierge journey. DOCUMENTED-required, NOT merge-blocking, and it
+# must stay that way until per-PR coverage comes from the ephemeral-CP gate (#86)
+# rather than from shared staging. Enforcing it on the PR head is only possible by
+# handing PR-authored code the staging admin token — see the long note above. It
+# runs live on push/dispatch/schedule as the deploy gate; its PR arm is a `bash -n`
+# self-check that proves nothing, which is FINE precisely because nothing below this
+# marker gates a merge. Do NOT promote this line without first moving the coverage
+# to the ephemeral gate.
 E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
 
 # pending-#2409 (not yet enforced) ──────────────────────────────────────
