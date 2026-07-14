@@ -16,17 +16,25 @@ filter shipped with:
        rename or a registry/token regression in any of them breaks the literal
        list_peers assertion while the required gate silently no-ops.
 
-C2 is FIXED here. C5 is confirmed but deliberately NOT fixed here — see the
-`xfail(strict=True)` block below and the `peer-visibility` header in
-detect-changes.py. Inverting that profile turns a REQUIRED, docker-host E2E
-whose real arm has never once run (50/50 recent jobs took the no-op arm) into
-an every-PR gate; under branch protection `status_check_contexts=['*']` a single
-red there freezes the merge queue. It lands in the follow-up, after the real arm
-is proven green.
+Both are FIXED here, by inverting each profile to a DENY-list.
 
-Every C2 test below FAILS against the pre-fix allow-list module and PASSES
-against the deny-list one — that is what makes them a gate rather than a
-description.
+On the safety of flipping `peer-visibility` — a REQUIRED, continue-on-error-free
+docker-host E2E — on for every PR, under branch protection
+`status_check_contexts=['*']` where one red freezes the merge queue:
+
+  * its real arm is PROVEN GREEN — 5 recent real-arm runs, 5/5 "GATE PASSED"
+    (2 on PR#4316, 3 on PR#4332). Classified by READING THE JOB LOGS, not by
+    inferring from duration: the real arm finishes in 30-45s (warm GOCACHE
+    bind-mount + pre-pulled images), so it looks just like the no-op arm on a
+    duration histogram. Do not repeat that mistake when re-evaluating this;
+  * the cross-run wedge is fixed at source — the host-wide /proc sweeps that
+    killed concurrent PRs' platform-servers are deleted, and
+    test_no_host_wide_process_sweep.py fails the build if one comes back;
+  * the marginal cost is ~35s: the job already runs on every PR (it is the
+    always-running required-context emitter); only its STEPS were path-gated.
+
+Every test below FAILS against the pre-fix allow-list module and PASSES against
+the deny-list one — that is what makes them a gate rather than a description.
 """
 
 from __future__ import annotations
@@ -51,10 +59,7 @@ PROFILES = detect_changes.PROFILES
 # profiles (handlers-postgres, e2e-api, template-delivery) are deliberately
 # scoped and are out of scope here.
 #
-# `peer-visibility` BELONGS in this tuple and is not in it yet — that is C5,
-# held for the follow-up (see the module docstring). The xfail block below is
-# what keeps that debt visible and self-enforcing.
-DENY_PROFILES = ("ci", "e2e-ephemeral")
+DENY_PROFILES = ("ci", "e2e-ephemeral", "peer-visibility")
 
 # The lanes of the `ci` profile that actually gate a job in ci.yml. `python` is
 # excluded on purpose: the `Python Lint & Test` job (ci.yml:698) consumes no
@@ -136,6 +141,12 @@ def test_dotgitea_scripts_is_not_matched_by_the_old_anchored_scripts_pattern() -
 @pytest.mark.parametrize(
     "path",
     [
+        # The four surfaces the OLD allow-list omitted — this is C5.
+        "workspace-server/internal/router/router.go",
+        "workspace-server/cmd/server/main.go",
+        "workspace-server/internal/registry/registry.go",
+        "workspace-server/internal/orgtoken/orgtoken.go",
+        # ...and the ones it named, which must keep working.
         "workspace-server/internal/handlers/mcp.go",
         "workspace-server/internal/handlers/mcp_tools.go",
         "workspace-server/internal/wsauth/token.go",
@@ -143,41 +154,9 @@ def test_dotgitea_scripts_is_not_matched_by_the_old_anchored_scripts_pattern() -
         "tests/e2e/test_peer_visibility_mcp_local.sh",
         "tests/e2e/lib/peer_visibility_assert.sh",
         ".gitea/workflows/e2e-peer-visibility.yml",
-    ],
-)
-def test_peer_visibility_sees_the_paths_its_allowlist_names(path: str) -> None:
-    """The coverage the allow-list DOES have must keep working."""
-    assert classify("peer-visibility", [path])["peervis"] is True, (
-        f"{path} did not trigger the required E2E Peer Visibility gate"
-    )
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C5 — KNOWN, CONFIRMED coverage hole, held for the follow-up PR. The "
-        "peer-visibility allow-list cannot see the route table, the binary's "
-        "wiring, the peer hierarchy or the org-token path, yet the gate boots "
-        "the whole binary and a regression in any of them breaks the literal "
-        "list_peers assertion. Fix = `deny_list()` in detect-changes.py. It is "
-        "NOT applied here because that promotes a REQUIRED docker-host E2E "
-        "whose real arm has never run green (50/50 recent jobs = no-op arm) to "
-        "every-PR, and under BP status_check_contexts=['*'] one red there "
-        "wedges the merge queue. strict=True on purpose: when the follow-up "
-        "inverts the profile these XPASS and the suite goes RED, forcing this "
-        "marker to be deleted. Do not 'fix' this by naming the four paths — "
-        "that only moves the hole."
-    ),
-)
-@pytest.mark.parametrize(
-    "path",
-    [
-        # The four surfaces the allow-list OMITS.
-        "workspace-server/internal/router/router.go",
-        "workspace-server/cmd/server/main.go",
-        "workspace-server/internal/registry/registry.go",
-        "workspace-server/internal/orgtoken/orgtoken.go",
-        # The gate boots the whole binary: any package in it can break it.
+        # The gate boots the WHOLE binary and provisions real workspaces, so any
+        # package in it can break the literal list_peers assertion. Enumerating
+        # "the ones that matter" is the bet that lost; do not re-take it.
         "workspace-server/internal/handlers/delegation.go",
         "workspace-server/internal/provisioner/cp_provisioner.go",
         "manifest.json",
