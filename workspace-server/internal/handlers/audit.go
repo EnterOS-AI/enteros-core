@@ -2,8 +2,9 @@ package handlers
 
 // AuditHandler implements GET /workspaces/:id/audit.
 //
-// EU AI Act Annex III compliance endpoint — queries the append-only HMAC-chained
-// audit event log for a workspace and optionally verifies the HMAC chain inline.
+// It queries stored HMAC-linked audit event rows for a workspace and optionally
+// verifies the returned rows inline. This is a read-only surface; event
+// production is owned separately.
 //
 // Route (behind WorkspaceAuth middleware):
 //
@@ -24,17 +25,15 @@ package handlers
 //	    "events":      [...],     // slice of audit event rows
 //	    "total":       N,         // total matching rows (ignoring limit/offset)
 //	    "chain_valid": true|false|null
-//	    // null when AUDIT_LEDGER_SALT is not configured on the platform side
+//	    // null when verification is unavailable for this query
 //	}
 //
 // Chain verification
 // ------------------
 // When AUDIT_LEDGER_SALT is set, the handler re-derives the PBKDF2 key and
-// verifies every HMAC in the result set (scoped to the queried agent_id, in
-// chronological order).  Returns null when the salt is absent so operators
-// know to use the Python CLI instead:
-//
-//	python -m molecule_audit.verify --agent-id <id>
+// verifies every HMAC in the result set (scoped to each queried agent_id, in
+// chronological order). It returns null when the salt is absent or when
+// pagination/session/lower-time filters omit possible chain predecessors.
 //
 // Environment variables:
 //
@@ -60,7 +59,8 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
-// pbkdf2 parameters — must match molecule_audit/ledger.py exactly.
+// PBKDF2 parameters are part of the stored audit-event signing contract. Any
+// future producer must use these values and computeAuditHMAC's canonical form.
 var (
 	auditPBKDF2Salt       = []byte("molecule-audit-ledger-v1")
 	auditPBKDF2Iterations = 210_000
@@ -213,11 +213,12 @@ func (h *AuditHandler) Query(c *gin.Context) {
 	}
 
 	// Chain verification (inline when AUDIT_LEDGER_SALT is set) ------------
-	// Paginated views cannot verify chain integrity — earlier events are absent
-	// from the result set so any verdict would be misleading. Return null to
-	// signal "not computed" rather than false (which would imply tampering).
+	// A non-zero offset, session filter, or lower time bound can omit earlier
+	// events in an agent's chain. Return null instead of a misleading verdict.
+	// agent_id selects complete per-agent chains; an upper time bound and limit
+	// retain a verifiable prefix when offset is zero.
 	var chainValid *bool
-	if offset == 0 {
+	if offset == 0 && sessionID == "" && fromStr == "" {
 		chainValid = verifyAuditChain(events)
 	}
 
@@ -230,7 +231,7 @@ func (h *AuditHandler) Query(c *gin.Context) {
 
 // scanAuditRows reads all rows from a *sql.Rows into a slice.
 func scanAuditRows(rows *sql.Rows) ([]auditEventRow, error) {
-	var result []auditEventRow
+	result := make([]auditEventRow, 0)
 	for rows.Next() {
 		var ev auditEventRow
 		if err := rows.Scan(
@@ -261,7 +262,7 @@ func scanAuditRows(rows *sql.Rows) ([]auditEventRow, error) {
 // verifyAuditChain verifies the HMAC chain across the supplied events.
 //
 // Returns nil when AUDIT_LEDGER_SALT is not configured (chain_valid: null in
-// the response — use the Python CLI to verify in that case).
+// the response).
 // Returns a pointer to true/false otherwise.
 func verifyAuditChain(events []auditEventRow) *bool {
 	key := getAuditHMACKey()

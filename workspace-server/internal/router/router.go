@@ -1007,9 +1007,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.POST("/channels/discover", middleware.AdminAuth(db.DB), chh.Discover)
 	r.POST("/webhooks/:type", chh.Webhook)
 
-	// Audit — EU AI Act Annex III compliance endpoint (#594).
-	// Returns append-only HMAC-chained agent event log with optional inline
-	// chain verification when AUDIT_LEDGER_SALT is configured.
+	// Audit ledger read surface (#594). Returns stored HMAC-linked agent events
+	// with optional inline chain verification when AUDIT_LEDGER_SALT is set.
+	// Event production is a separate runtime responsibility.
 	audh := handlers.NewAuditHandler()
 	wsAuth.GET("/audit", audh.Query)
 

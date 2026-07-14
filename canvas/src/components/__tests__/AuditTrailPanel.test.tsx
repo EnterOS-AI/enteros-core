@@ -1,23 +1,16 @@
 // @vitest-environment jsdom
 /**
- * AuditTrailPanel tests — issue #753
+ * AuditTrailPanel contract tests.
  *
- * Split into three suites:
- *  1. formatAuditRelativeTime — pure helper (no mocks needed)
- *  2. AuditEntryRow — entry renderer: badges, tamper flag, timestamp, summary
- *  3. AuditTrailPanel — component integration: loading, empty state, entries,
- *                        filter bar, pagination, error handling
+ * The response fixtures intentionally match AuditHandler.Query so a Canvas
+ * model drift (field names, pagination, or chain scope) fails here.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, cleanup, fireEvent, act } from "@testing-library/react";
 
-// ── Mocks (hoisted before imports) ────────────────────────────────────────────
-
 vi.mock("@/lib/api", () => ({
   api: { get: vi.fn() },
 }));
-
-// ── Imports (after mocks) ─────────────────────────────────────────────────────
 
 import { api } from "@/lib/api";
 import {
@@ -25,343 +18,222 @@ import {
   AuditEntryRow,
   AuditTrailPanel,
 } from "../AuditTrailPanel";
-import type { AuditEntry } from "@/types/audit";
+import type { AuditEvent, AuditResponse } from "@/types/audit";
 
 const mockGet = vi.mocked(api.get);
+const NOW = 1_745_000_000_000;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-const NOW = 1_745_000_000_000; // fixed "now" for deterministic tests
-
-function makeEntry(overrides: Partial<AuditEntry> = {}): AuditEntry {
+function makeEvent(overrides: Partial<AuditEvent> = {}): AuditEvent {
   return {
-    id: "entry-1",
+    id: "audit-1",
+    timestamp: new Date(NOW - 120_000).toISOString(),
+    agent_id: "research-agent",
+    session_id: "session-1",
+    operation: "tool_call",
+    input_hash: null,
+    output_hash: null,
+    model_used: "browser.open",
+    human_oversight_flag: false,
+    risk_flag: false,
+    prev_hmac: null,
+    hmac: "test-hmac",
     workspace_id: "ws-a",
-    event_type: "delegation",
-    actor: "research-agent",
-    summary: "Delegated SEO analysis to marketing-agent",
-    chain_valid: true,
-    created_at: new Date(NOW - 120_000).toISOString(), // 2 min ago
     ...overrides,
   };
 }
 
 function makeResponse(
-  entries: AuditEntry[],
-  cursor: string | null = null
-) {
-  return { entries, cursor };
+  events: AuditEvent[],
+  total = events.length,
+  chainValid: boolean | null = true
+): AuditResponse {
+  return { events, total, chain_valid: chainValid };
 }
-
-// ── Suite 1: formatAuditRelativeTime ─────────────────────────────────────────
 
 describe("formatAuditRelativeTime", () => {
   it("returns 'just now' when diff < 60 s", () => {
     expect(formatAuditRelativeTime(new Date(NOW - 30_000).toISOString(), NOW)).toBe("just now");
   });
 
-  it("returns 'Xm ago' for minute-scale diffs", () => {
+  it("returns minutes for minute-scale diffs", () => {
     expect(formatAuditRelativeTime(new Date(NOW - 3 * 60_000).toISOString(), NOW)).toBe("3m ago");
   });
 
-  it("returns 'Xh ago' for hour-scale diffs", () => {
+  it("returns hours for hour-scale diffs", () => {
     expect(formatAuditRelativeTime(new Date(NOW - 2 * 3_600_000).toISOString(), NOW)).toBe("2h ago");
   });
 
-  it("returns a locale date string for diffs >= 24 h", () => {
-    const ts = new Date(NOW - 25 * 3_600_000).toISOString();
-    const result = formatAuditRelativeTime(ts, NOW);
-    // Should be a locale-formatted date, not "Xh ago"
+  it("returns a locale date for diffs of at least one day", () => {
+    const result = formatAuditRelativeTime(new Date(NOW - 25 * 3_600_000).toISOString(), NOW);
     expect(result).not.toMatch(/ago/);
     expect(result.length).toBeGreaterThan(0);
   });
 });
 
-// ── Suite 2: AuditEntryRow ────────────────────────────────────────────────────
-
-describe("AuditEntryRow — badge colors", () => {
+describe("AuditEntryRow", () => {
   afterEach(() => cleanup());
 
-  it("renders the delegation badge", () => {
-    render(<AuditEntryRow entry={makeEntry({ event_type: "delegation" })} now={NOW} />);
-    expect(screen.getByText("delegation")).toBeTruthy();
-  });
+  it.each(["task_start", "llm_call", "tool_call", "task_end"])(
+    "renders the %s operation badge",
+    (operation) => {
+      render(<AuditEntryRow entry={makeEvent({ operation })} now={NOW} />);
+      expect(screen.getByText(operation)).toBeTruthy();
+    }
+  );
 
-  it("renders the decision badge", () => {
-    render(<AuditEntryRow entry={makeEntry({ event_type: "decision" })} now={NOW} />);
-    expect(screen.getByText("decision")).toBeTruthy();
-  });
-
-  it("renders the gate badge", () => {
-    render(<AuditEntryRow entry={makeEntry({ event_type: "gate" })} now={NOW} />);
-    expect(screen.getByText("gate")).toBeTruthy();
-  });
-
-  it("renders the hitl badge", () => {
-    render(<AuditEntryRow entry={makeEntry({ event_type: "hitl" })} now={NOW} />);
-    expect(screen.getByText("hitl")).toBeTruthy();
-  });
-});
-
-describe("AuditEntryRow — content", () => {
-  afterEach(() => cleanup());
-
-  it("displays actor name", () => {
-    render(<AuditEntryRow entry={makeEntry({ actor: "my-research-agent" })} now={NOW} />);
-    expect(screen.getByText("my-research-agent")).toBeTruthy();
-  });
-
-  it("displays summary text", () => {
-    render(<AuditEntryRow entry={makeEntry({ summary: "Approved budget allocation" })} now={NOW} />);
-    expect(screen.getByText("Approved budget allocation")).toBeTruthy();
-  });
-
-  it("shows relative timestamp", () => {
-    render(<AuditEntryRow entry={makeEntry({ created_at: new Date(NOW - 2 * 60_000).toISOString() })} now={NOW} />);
+  it("renders the agent, model/tool, and relative timestamp", () => {
+    render(
+      <AuditEntryRow
+        entry={makeEvent({ agent_id: "agent-alpha", model_used: "claude-sonnet" })}
+        now={NOW}
+      />
+    );
+    expect(screen.getByText("agent-alpha")).toBeTruthy();
+    expect(screen.getByText("claude-sonnet")).toBeTruthy();
     expect(screen.getByText("2m ago")).toBeTruthy();
   });
 
-  it("does NOT render tamper warning when chain_valid is true", () => {
-    render(<AuditEntryRow entry={makeEntry({ chain_valid: true })} now={NOW} />);
-    expect(screen.queryByRole("img", { name: /tamper/i })).toBeNull();
+  it("falls back to the session ID when model_used is null", () => {
+    render(
+      <AuditEntryRow
+        entry={makeEvent({ model_used: null, session_id: "session-fallback" })}
+        now={NOW}
+      />
+    );
+    expect(screen.getByText("Session session-fallback")).toBeTruthy();
   });
 
-  it("renders ⚠ tamper warning when chain_valid is false", () => {
-    render(<AuditEntryRow entry={makeEntry({ chain_valid: false })} now={NOW} />);
-    const warning = screen.getByRole("img", { name: /tamper/i });
-    expect(warning).toBeTruthy();
-    expect(warning.textContent).toContain("⚠");
+  it("surfaces oversight and risk flags without rendering ledger secrets", () => {
+    render(
+      <AuditEntryRow
+        entry={makeEvent({
+          human_oversight_flag: true,
+          risk_flag: true,
+          input_hash: "private-input-hash",
+          hmac: "private-ledger-hmac",
+        })}
+        now={NOW}
+      />
+    );
+    expect(screen.getByText(/human oversight/)).toBeTruthy();
+    expect(screen.getByText(/risk flagged/)).toBeTruthy();
+    expect(screen.queryByText("private-input-hash")).toBeNull();
+    expect(screen.queryByText("private-ledger-hmac")).toBeNull();
   });
 });
 
-// ── Suite 3: AuditTrailPanel component ───────────────────────────────────────
-
-describe("AuditTrailPanel — loading and empty state", () => {
+describe("AuditTrailPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
   });
+
   afterEach(() => {
     vi.useRealTimers();
     cleanup();
   });
 
-  it("shows loading state while fetch is in-flight", async () => {
-    // Never resolve to keep loading state
+  it("shows loading state while the request is in flight", () => {
     mockGet.mockReturnValue(new Promise(() => {}));
     render(<AuditTrailPanel workspaceId="ws-a" />);
-    expect(screen.getByText("Loading audit trail…")).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toMatch(/loading audit trail/i);
   });
 
-  it("shows empty state when entries array is empty", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse([]) as any);
+  it("renders the canonical events/total/chain_valid handler envelope", async () => {
+    mockGet.mockResolvedValue(makeResponse([
+      makeEvent({ agent_id: "agent-from-handler", operation: "tool_call" }),
+    ]));
+
+    render(<AuditTrailPanel workspaceId="ws-a" />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText("agent-from-handler")).toBeTruthy();
+    expect(screen.getByText("tool_call")).toBeTruthy();
+    expect(screen.getByText("browser.open")).toBeTruthy();
+    expect(screen.getByText(/1 of 1 event loaded.*all loaded/i)).toBeTruthy();
+  });
+
+  it("shows an honest empty state for an empty events array", async () => {
+    mockGet.mockResolvedValue(makeResponse([], 0, null));
     render(<AuditTrailPanel workspaceId="ws-a" />);
     await act(async () => { await Promise.resolve(); });
     expect(screen.getByText("No audit events yet")).toBeTruthy();
+    expect(screen.getByText("No stored audit events are available for this workspace.")).toBeTruthy();
   });
 
-  it("shows descriptive empty state copy", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse([]) as any);
+  it("shows one ledger warning when the handler reports an invalid chain", async () => {
+    mockGet.mockResolvedValue(makeResponse([makeEvent()], 1, false));
     render(<AuditTrailPanel workspaceId="ws-a" />);
     await act(async () => { await Promise.resolve(); });
-    expect(screen.getByText(/Delegation, decision, gate/i)).toBeTruthy();
-  });
-});
-
-describe("AuditTrailPanel — entries", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-    cleanup();
+    expect(screen.getByRole("alert").textContent).toMatch(/integrity check failed/i);
   });
 
-  it("renders all returned entries", async () => {
-    const entries = [
-      makeEntry({ id: "e1", actor: "agent-alpha" }),
-      makeEntry({ id: "e2", actor: "agent-beta" }),
-    ];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse(entries) as any);
+  it("does not claim tampering when chain verification is unavailable", async () => {
+    mockGet.mockResolvedValue(makeResponse([makeEvent()], 1, null));
     render(<AuditTrailPanel workspaceId="ws-a" />);
     await act(async () => { await Promise.resolve(); });
-    expect(screen.getByText("agent-alpha")).toBeTruthy();
-    expect(screen.getByText("agent-beta")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("renders tamper warning for chain_valid=false entry", async () => {
-    const entries = [makeEntry({ id: "e1", chain_valid: false })];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse(entries) as any);
-    render(<AuditTrailPanel workspaceId="ws-a" />);
-    await act(async () => { await Promise.resolve(); });
-    expect(screen.getByRole("img", { name: /tamper/i })).toBeTruthy();
-  });
-
-  it("shows entry count footer", async () => {
-    const entries = [makeEntry({ id: "e1" }), makeEntry({ id: "e2" })];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse(entries) as any);
-    render(<AuditTrailPanel workspaceId="ws-a" />);
-    await act(async () => { await Promise.resolve(); });
-    expect(screen.getByText(/2 events loaded/)).toBeTruthy();
-  });
-
-  it("shows 'all loaded' when cursor is null", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse([makeEntry()], null) as any);
-    render(<AuditTrailPanel workspaceId="ws-a" />);
-    await act(async () => { await Promise.resolve(); });
-    expect(screen.getByText(/all loaded/)).toBeTruthy();
-  });
-});
-
-describe("AuditTrailPanel — pagination", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-    cleanup();
-  });
-
-  it("shows 'Load more' button when cursor is non-null", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse([makeEntry()], "cursor-abc") as any);
-    render(<AuditTrailPanel workspaceId="ws-a" />);
-    await act(async () => { await Promise.resolve(); });
-    expect(screen.getByRole("button", { name: /load more/i })).toBeTruthy();
-  });
-
-  it("does NOT show 'Load more' when cursor is null", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse([makeEntry()], null) as any);
-    render(<AuditTrailPanel workspaceId="ws-a" />);
-    await act(async () => { await Promise.resolve(); });
-    expect(screen.queryByRole("button", { name: /load more/i })).toBeNull();
-  });
-
-  it("appends entries and updates cursor when 'Load more' is clicked", async () => {
-    const page1 = [makeEntry({ id: "e1", actor: "alpha" })];
-    const page2 = [makeEntry({ id: "e2", actor: "beta" })];
+  it("paginates with offset and never sends unsupported cursor/event_type params", async () => {
     mockGet
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      .mockResolvedValueOnce(makeResponse(page1, "cursor-next") as any)
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      .mockResolvedValueOnce(makeResponse(page2, null) as any);
+      .mockResolvedValueOnce(makeResponse([makeEvent({ id: "audit-1", agent_id: "alpha" })], 2))
+      .mockResolvedValueOnce(makeResponse([makeEvent({ id: "audit-2", agent_id: "beta" })], 2, null));
 
     render(<AuditTrailPanel workspaceId="ws-a" />);
     await act(async () => { await Promise.resolve(); });
-
-    expect(screen.getByText("alpha")).toBeTruthy();
-    expect(screen.queryByText("beta")).toBeNull();
-
-    const loadMoreBtn = screen.getByRole("button", { name: /load more/i });
-    fireEvent.click(loadMoreBtn);
+    fireEvent.click(screen.getByRole("button", { name: /load more/i }));
     await act(async () => { await Promise.resolve(); });
 
     expect(screen.getByText("alpha")).toBeTruthy();
     expect(screen.getByText("beta")).toBeTruthy();
-    // Cursor is now null — Load more should disappear
     expect(screen.queryByRole("button", { name: /load more/i })).toBeNull();
+
+    const firstPath = mockGet.mock.calls[0][0] as string;
+    const secondPath = mockGet.mock.calls[1][0] as string;
+    expect(firstPath).toContain("limit=50");
+    expect(firstPath).not.toContain("cursor=");
+    expect(firstPath).not.toContain("event_type=");
+    expect(secondPath).toContain("offset=1");
+    expect(secondPath).not.toContain("cursor=");
+    expect(secondPath).not.toContain("event_type=");
   });
 
-  it("second page request includes cursor param", async () => {
-    const page1 = [makeEntry({ id: "e1" })];
+  it("refreshes from offset zero and replaces the loaded page", async () => {
     mockGet
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      .mockResolvedValueOnce(makeResponse(page1, "cursor-xyz") as any)
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      .mockResolvedValueOnce(makeResponse([], null) as any);
+      .mockResolvedValueOnce(makeResponse([makeEvent({ agent_id: "before-refresh" })]))
+      .mockResolvedValueOnce(makeResponse([makeEvent({ id: "audit-2", agent_id: "after-refresh" })]));
 
     render(<AuditTrailPanel workspaceId="ws-a" />);
     await act(async () => { await Promise.resolve(); });
-
-    fireEvent.click(screen.getByRole("button", { name: /load more/i }));
+    fireEvent.click(screen.getByRole("button", { name: /refresh audit trail/i }));
     await act(async () => { await Promise.resolve(); });
 
-    // Second call should include cursor=cursor-xyz
-    const secondCallPath = mockGet.mock.calls[1][0] as string;
-    expect(secondCallPath).toContain("cursor=cursor-xyz");
-  });
-});
-
-describe("AuditTrailPanel — filter bar", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-    cleanup();
+    expect(screen.queryByText("before-refresh")).toBeNull();
+    expect(screen.getByText("after-refresh")).toBeTruthy();
+    expect(mockGet.mock.calls[1][0]).not.toContain("offset=");
   });
 
-  it("renders all five filter buttons", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse([]) as any);
-    render(<AuditTrailPanel workspaceId="ws-a" />);
-    await act(async () => { await Promise.resolve(); });
-    expect(screen.getByRole("button", { name: /^All$/i })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^Delegation$/i })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^Decision$/i })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^Gate$/i })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^HITL$/i })).toBeTruthy();
-  });
-
-  it("includes event_type param when a type filter is active", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse([]) as any);
-    render(<AuditTrailPanel workspaceId="ws-a" />);
-    await act(async () => { await Promise.resolve(); });
-
-    const delegationBtn = screen.getByRole("button", { name: /^Delegation$/i });
-    fireEvent.click(delegationBtn);
-    await act(async () => { await Promise.resolve(); });
-
-    // Second API call should include event_type=delegation
-    const lastCallPath = mockGet.mock.calls[mockGet.mock.calls.length - 1][0] as string;
-    expect(lastCallPath).toContain("event_type=delegation");
-  });
-
-  it("omits event_type param when 'All' filter is active", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse([]) as any);
-    render(<AuditTrailPanel workspaceId="ws-a" />);
-    await act(async () => { await Promise.resolve(); });
-
-    const firstCallPath = mockGet.mock.calls[0][0] as string;
-    expect(firstCallPath).not.toContain("event_type");
-  });
-});
-
-describe("AuditTrailPanel — error handling", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-    cleanup();
-  });
-
-  it("shows error banner when fetch fails", async () => {
+  it("shows the API error without misrepresenting it as an empty success", async () => {
     mockGet.mockRejectedValue(new Error("Network timeout"));
     render(<AuditTrailPanel workspaceId="ws-a" />);
     await act(async () => { await Promise.resolve(); });
-    expect(screen.getByText("Network timeout")).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain("Network timeout");
+    expect(screen.getByText("Audit events unavailable")).toBeTruthy();
+    expect(screen.queryByText("No audit events yet")).toBeNull();
   });
 
-  it("still renders empty state (not error) on successful empty response", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockGet.mockResolvedValue(makeResponse([]) as any);
+  it("keeps existing events when loading the next page fails", async () => {
+    mockGet
+      .mockResolvedValueOnce(makeResponse([makeEvent({ agent_id: "already-loaded" })], 2))
+      .mockRejectedValueOnce(new Error("Next page failed"));
+
     render(<AuditTrailPanel workspaceId="ws-a" />);
     await act(async () => { await Promise.resolve(); });
-    expect(screen.queryByText(/Network/)).toBeNull();
-    expect(screen.getByText("No audit events yet")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /load more/i }));
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText("already-loaded")).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain("Next page failed");
   });
 });
