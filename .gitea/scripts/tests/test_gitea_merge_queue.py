@@ -198,6 +198,12 @@ def test_wildcard_ready_pr_with_a_red_waits_end_to_end():
     decision = mq.evaluate_merge_readiness(**kwargs)
     assert decision.ready is False
     assert decision.action == "wait"
+    # Assert the REASON names the actual red, not just that it waited. The old
+    # buggy code ALSO returned wait here (via `*=missing`), so an action-only
+    # assertion passes against the bug too — it must fail closed for the RIGHT
+    # reason (the E2E Chat failure), which only the fixed '*' sweep produces.
+    assert "E2E Chat / E2E Chat (pull_request)=failure" in decision.reason
+    assert "*=missing" not in decision.reason
 
 
 def test_wildcard_green_but_enforced_file_context_missing_waits():
