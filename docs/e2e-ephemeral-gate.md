@@ -4,7 +4,9 @@
 (core #4036 → `2efd5e6d8`; dind mode core #4116; CP enablers #1526 + #1549).
 GATING as of 2026-07-13: the mc#4081 soak is complete (12 consecutive green
 dind runs on main) and `continue-on-error` is gone — a red happy path now
-BLOCKS the merge.*
+BLOCKS the merge. FULL MODE as of core #4274 (2026-07-13): the gate no longer
+runs `smoke`, so steps 9b/10/10b (activity, delegation provenance, cascade
+guard, pause/resume/hibernate lifecycle) execute pre-merge.*
 
 ## What it is
 
@@ -56,15 +58,23 @@ live failure — do not remove one without re-running the gate locally:
    falls through to the managed default — the ephemeral tenant sent its
    workspace-provision POST **to prod** (401). Fail-open filed as **CP #1515**.
    The topo base also feeds `LLMProxyBaseURL` (workspace LLM egress).
-4. **`E2E_LLM_PATH=platform` + `E2E_MODE=smoke` + `E2E_AWS_LEAK_CHECK=off`.**
+4. **`E2E_LLM_PATH=platform` + `E2E_MODE=full` + `E2E_AWS_LEAK_CHECK=off`.**
    The gate mirrors the Platform Boot lane exactly: hermes' default
    `minimax/MiniMax-M2.7` (slash form) is platform-managed; completions flow
    workspace → tenant proxy env → this CP's `/cp/internal/llm` proxy →
    `api.minimax.io` with the CP's own `MINIMAX_API_KEY`. (`pick_model_slug`
    has **no** hermes MiniMax-BYOK arm — a stray key routes to
-   `openai/gpt-4o` → `MISSING_BYOK_CREDENTIAL`.) Smoke skips the full-matrix
-   extras (memory plugin — see core #4114 — delegation, lifecycle), which
-   remain the staging BYOK job's coverage.
+   `openai/gpt-4o` → `MISSING_BYOK_CREDENTIAL`.)
+
+   **`E2E_MODE` was `smoke` until core #4274 (2026-07-13); it is now `full`.**
+   Smoke skipped steps 9b/10/10b — activity log, delegation provenance, cascade
+   guard, and the pause/resume/hibernate lifecycle — which made the gate a
+   strictly NARROWER lane than the post-merge staging job it is meant to replace.
+   That is not a theoretical gap: a dead `/activity?workspace_id=` route reached
+   main *through a green gate* because the gate never executed the step that
+   calls it. A gate that runs less than the lane it replaces cannot replace it.
+   The reason for `smoke` (rotten full-matrix infra, core #4114) was fixed and
+   the pin outlived it.
 5. **`LOCAL_TENANT_BIND_ADDR=0.0.0.0`** (CP #1526). On Linux, a
    `127.0.0.1`-bound host port is unreachable from inside a container
    (`host.docker.internal` = the gateway IP, which a loopback bind refuses);
@@ -108,18 +118,39 @@ crash-looping containers from other runs and misdirects the RCA (it did).
 2. ~~Flip `continue-on-error: true → false`.~~ **DONE 2026-07-13.** When the gate
    runs, a red happy path now blocks the merge: main's branch protection is the
    wildcard `['*']`, so every context that reports must be green.
-3. **OPEN — the honest residual.** The workflow still has `paths:` filters, so on
-   a PR that touches none of them it does not fire and posts *no* context. That
-   is why it is still `bp-exempt` and absent from `.gitea/required-contexts.txt`:
-   a path-filtered *required* context reports `pending` forever and wedges the PR
-   (`lint-required-no-paths` exists for exactly that). Verified harmless under the
-   current wildcard BP — `b5252bc4` / `f9723fe0` never fired it, posted no context,
-   and merged clean. To close it: drop the paths filter, adopt the always-fire +
-   `detect-changes` no-op shape the other required lanes use, then add the context
-   to `.gitea/required-contexts.txt`.
-4. Move the happy-path contract into `molecule-ai-sdk` (task #74) so core,
-   CP, and the SDK run the *same* gate — then demote the corresponding
-   post-merge E2E Staging jobs (per the verify-live-PR-coverage-first rule).
+3. ~~Drop the `paths:` filter; adopt always-fire + `detect-changes`; add the
+   context to `.gitea/required-contexts.txt`.~~ **DONE** (task #85). The context
+   `E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path` is now listed in
+   `.gitea/required-contexts.txt` and fires on every PR.
+4. **OPEN — the real residual.** Move the happy-path contract into
+   `molecule-ai-sdk` (task #74) so core, CP, and the SDK run the *same* gate —
+   then demote the corresponding post-merge E2E Staging jobs (task #86).
+
+   **Do not execute the demotion half as written yet.** Two findings from
+   2026-07-13/14 bound it:
+
+   * **The gate has a coverage hole the staging lane does not** (task #92).
+     `POST /hibernate?force=true` was a no-op that answered
+     `200 {"status":"hibernated"}` (core #4293). Staging reproduced it
+     DETERMINISTICALLY, 2/2, on different tenants. The gate passed 10b hibernate
+     both *before and after* the fix — under dind the resumed workspace has no
+     boot turn still in flight, so `active_tasks` is 0 and the buggy
+     `AND active_tasks = 0` claim matches anyway. The gate hibernates an idle
+     workspace and calls it covered; `force` only means anything when the
+     workspace is busy. Until 10b force-hibernates a *genuinely busy* workspace
+     and asserts `active_tasks > 0` first, this class is uncovered here.
+   * **The lane being demoted is itself measuring the wrong binary** (task #93).
+     `e2e-staging-saas.yml` and `publish-workspace-server-image.yml` both trigger
+     on `push: [main]` and race, so the staging e2e provisions tenants from the
+     PREVIOUS commit's image. It cannot validate a workspace-server change in the
+     commit that triggered it. That is an argument *for* this gate (which builds
+     the PR's own image and is the only lane testing the code under review) — but
+     it also means the post-push lanes are not the trustworthy safety net they
+     look like, so "keep them just in case" is not a real fallback either.
+
+   Per `feedback_verify_live_pr_coverage_before_retiring_postmerge`: prove the
+   PR path covers the class LIVE before retiring the post-merge lane that covers
+   it today. #92 is that proof for the lifecycle class, and it is not done.
 
 ## Bugs this gate caught before it could gate anything
 
@@ -128,3 +159,11 @@ CP #1515 (empty `CP_BASE_URL` routes tenants to prod, fail-open) · CP #1526
 PR) · core #4065-gap (interrupt-ack arriving via the queue) · the
 settling-URL SSRF race · core #4114 (staging memory plugin, unmasked) ·
 runtime #284 (fresh parent auto-runs a 90-iteration task).
+
+Since full mode (#4274): core #4293 — `POST /hibernate?force=true` skipped the
+handler's active-tasks 409 but never reached the atomic claim's
+`active_tasks = 0` predicate, so it stopped nothing and still answered
+`200 {"status":"hibernated"}`. A cost-control endpoint that silently did nothing
+and reported success. Note the honest asterisk: full mode is what put a
+*lifecycle* step in front of a real tenant, but the bug was caught by the
+post-merge STAGING lane, not by this gate — see Roadmap 4 / task #92.
