@@ -323,20 +323,60 @@ jobs:
       - if: needs.detect-changes.outputs.handlers == 'true'
         name: Run integration tests
         run: |
+          set -uo pipefail
           # INTEGRATION_DB_URL is exported by the start-postgres step;
           # points at the per-run bridge IP, not 127.0.0.1, so concurrent
           # workflow runs don't fight over a host-net 5432 port.
-          go test -tags=integration -timeout 5m -v ./internal/handlers/ -run "^TestIntegration_"
+          #
+          # Anti-vacuous-gate guard. `go test` exits 0 — reporting SUCCESS on
+          # this ENFORCED, merge-blocking context — in THREE distinct
+          # zero-coverage situations, all verified locally:
+          #   1. the -run regex matches nothing (tests renamed/deleted):
+          #      "ok ... [no tests to run]", $? == 0
+          #   2. the `integration` build tag is dropped/typo'd, so the tagged
+          #      files vanish from the build: also "[no tests to run]" (or
+          #      "[no test files]" for a fully-tagged package), $? == 0
+          #   3. the suite skips wholesale (e.g. no INTEGRATION_DB_URL — every
+          #      TestIntegration_ starts with a t.Skip guard): $? == 0
+          # In all three the PASS arm is exactly what a BROKEN or ABSENT input
+          # produces. Require >0 "--- PASS:" lines (needs -v) and fail closed.
+          LOG=$(mktemp)
+          rc=0
+          go test -tags=integration -timeout 5m -v ./internal/handlers/ -run "^TestIntegration_" 2>&1 | tee "$LOG" || rc=$?
+          npass=$(grep -c -E '^[[:space:]]*--- PASS: ' "$LOG" || true)
+          echo "handlers ^TestIntegration_: ${npass} test(s) actually ran and passed"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if [ "${npass:-0}" -eq 0 ]; then
+            echo "::error::Handlers integration gate ran ZERO tests (0 '--- PASS:' lines) but go test still exited 0. A gate that runs no tests must NEVER report success. Check the -run regex ^TestIntegration_, the integration build tag on workspace-server/internal/handlers/*_integration_test.go, and that the suite did not skip wholesale on a missing INTEGRATION_DB_URL."
+            exit 1
+          fi
 
       - if: needs.detect-changes.outputs.handlers == 'true'
         name: Run scheduler integration tests (#2149)
         run: |
+          set -uo pipefail
           # #2149: real-PG regression coverage for the scheduler firing loop
           # (tick → A2A fire → write-back of last_run_at/next_run_at/run_count/
           # activity_logs jsonb incl. invalid-UTF-8 sanitization + sweepPhantomBusy).
           # Reuses the same migrated Postgres (workspace_schedules / activity_logs
           # / workspaces all landed by the migration replay step above).
-          go test -tags=integration -timeout 5m -v ./internal/scheduler/ -run "^TestIntegration_"
+          #
+          # Anti-vacuous-gate guard — same three zero-coverage exit-0 paths as
+          # the handlers step above; see that comment for the full enumeration.
+          LOG=$(mktemp)
+          rc=0
+          go test -tags=integration -timeout 5m -v ./internal/scheduler/ -run "^TestIntegration_" 2>&1 | tee "$LOG" || rc=$?
+          npass=$(grep -c -E '^[[:space:]]*--- PASS: ' "$LOG" || true)
+          echo "scheduler ^TestIntegration_: ${npass} test(s) actually ran and passed"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if [ "${npass:-0}" -eq 0 ]; then
+            echo "::error::Scheduler integration gate ran ZERO tests (0 '--- PASS:' lines) but go test still exited 0. A gate that runs no tests must NEVER report success. Check the -run regex ^TestIntegration_, the integration build tag on workspace-server/internal/scheduler/scheduler_integration_test.go, and that the suite did not skip wholesale on a missing INTEGRATION_DB_URL."
+            exit 1
+          fi
 
       - if: needs.detect-changes.outputs.handlers == 'true'
         name: Migration replay-from-scratch gate (#2150)
@@ -361,9 +401,27 @@ jobs:
           createdb -h "${PG_HOST}" -U postgres molecule_replay 2>/dev/null || \
             psql -h "${PG_HOST}" -U postgres -d molecule \
               -c "CREATE DATABASE molecule_replay" >/dev/null 2>&1 || true
+
+          # Anti-vacuous-gate guard — same three zero-coverage exit-0 paths as
+          # the handlers step above; see that comment for the full enumeration.
+          # This one matters most: the whole POINT of this step is "the chain
+          # replays", and a silently-zero-test run would assert precisely
+          # nothing while turning the merge-blocking context green.
+          set -uo pipefail
+          LOG=$(mktemp)
+          rc=0
           INTEGRATION_DB_URL="postgres://postgres:test@${PG_HOST}:5432/molecule_replay?sslmode=disable" \
             go test -tags=integration -timeout 5m -v ./internal/db/ \
-              -run '^TestIntegration_Migration|^TestIntegration_InitPostgres'
+              -run '^TestIntegration_Migration|^TestIntegration_InitPostgres' 2>&1 | tee "$LOG" || rc=$?
+          npass=$(grep -c -E '^[[:space:]]*--- PASS: ' "$LOG" || true)
+          echo "db replay-from-scratch: ${npass} test(s) actually ran and passed"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if [ "${npass:-0}" -eq 0 ]; then
+            echo "::error::Migration replay-from-scratch gate ran ZERO tests (0 '--- PASS:' lines) but go test still exited 0. A gate that runs no tests must NEVER report success. Check the -run regex, the integration build tag on workspace-server/internal/db/postgres_replay_integration_test.go, and that the suite did not skip wholesale on a missing INTEGRATION_DB_URL."
+            exit 1
+          fi
 
       - if: failure() && needs.detect-changes.outputs.handlers == 'true'
         name: Diagnostic dump on failure

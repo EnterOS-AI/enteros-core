@@ -649,61 +649,91 @@ def _classify_ci_change(*paths: str) -> dict[str, bool]:
     }
 
 
-def test_ci_change_detector_workflow_only_edits_do_not_trigger_heavy_surfaces():
+def test_ci_change_detector_workflow_edits_DO_trigger_heavy_surfaces():
+    """C2 regression gate — this test used to assert the BUG.
+
+    Its previous name was `..._workflow_only_edits_do_not_trigger_heavy_surfaces`
+    and it asserted all-False for a workflow-only edit. That is precisely the
+    vacuous-gate hole: the `ci` profile's allow-list matched nothing under
+    `.gitea/` (`^scripts/` is anchored and does NOT match `.gitea/scripts/`), so
+    a PR touching only the CI machinery reported platform=false canvas=false
+    python=false scripts=false, every heavy job took its no-op arm, and
+    `CI / all-required` reported SUCCESS having run ZERO tests. The one thing CI
+    could not see change was CI itself — and this test blessed it.
+
+    The profile is now a DENY-list, so the CI machinery is visible to CI.
+    """
     assert _classify_ci_change(".gitea/workflows/ci.yml") == {
-        "platform": False,
-        "canvas": False,
-        "python": False,
-        "scripts": False,
+        "platform": True,
+        "canvas": True,
+        "python": False,   # `python` is ^workspace/ and gates no job (see detect-changes.py)
+        "scripts": True,
     }
     assert _classify_ci_change(".github/workflows/ci.yml") == {
-        "platform": False,
-        "canvas": False,
-        "python": False,
-        "scripts": False,
-    }
-
-
-def test_ci_change_detector_narrow_surface_edits_only_trigger_their_surface():
-    assert _classify_ci_change("workspace-server/internal/handlers/foo.go") == {
         "platform": True,
-        "canvas": False,
-        "python": False,
-        "scripts": False,
-    }
-    assert _classify_ci_change("canvas/app/page.tsx") == {
-        "platform": False,
         "canvas": True,
-        "python": False,
-        "scripts": False,
-    }
-    assert _classify_ci_change("workspace/a2a_mcp_server.py") == {
-        "platform": False,
-        "canvas": False,
-        "python": True,
-        "scripts": False,
-    }
-    assert _classify_ci_change("tests/e2e/test_model_slug.sh") == {
-        "platform": False,
-        "canvas": False,
         "python": False,
         "scripts": True,
     }
 
 
-def test_ci_change_detector_docs_and_meta_scripts_do_not_trigger_surfaces():
+def test_ci_change_detector_honours_each_lane_s_inert_set():
+    """A deny-list must still SKIP what is provably inert, or it is just
+    run-everything. Each claim below is a promise about what the job reads.
+    """
+    # Go lane: canvas/ is NOT inert for it — external_connection_test.go reads
+    # ../../../canvas/src/components/__tests__/__fixtures__/*.golden.json, so a
+    # canvas fixture edit can (and must) go red in `go test`.
+    assert _classify_ci_change("canvas/app/page.tsx")["platform"] is True
+
+    # canvas lane: its job is `npm ci && npm run build && vitest run` inside
+    # canvas/, and no canvas source reads outside canvas/ — so a Go-only change
+    # must NOT pay for it.
+    assert _classify_ci_change("workspace-server/internal/handlers/foo.go")["canvas"] is False
+
+    # shellcheck lane: reads no Go and no TS.
+    assert _classify_ci_change("workspace-server/internal/handlers/foo.go")["scripts"] is False
+    assert _classify_ci_change("canvas/app/page.tsx")["scripts"] is False
+
+    # ...but it does own the e2e/ops shell surface.
+    assert _classify_ci_change("tests/e2e/test_model_slug.sh")["scripts"] is True
+
+    # `python` stays the literal "the retired workspace/ tree came back" signal.
+    assert _classify_ci_change("workspace/a2a_mcp_server.py")["python"] is True
+    assert _classify_ci_change("workspace-server/internal/handlers/foo.go")["python"] is False
+
+
+def test_ci_change_detector_skips_prose_but_NOT_meta_scripts():
+    """Docs-only stays free; the CI machinery does not.
+
+    This test also used to assert the C2 bug — it required
+    `.gitea/scripts/lint-workflow-yaml.py` to trigger NOTHING. A change to the
+    linters, the merge queue, the required-contexts list or the change detector
+    itself is exactly the change most able to break CI, so it must run CI.
+    """
     assert _classify_ci_change("README.md") == {
         "platform": False,
         "canvas": False,
         "python": False,
         "scripts": False,
     }
-    assert _classify_ci_change(".gitea/scripts/lint-workflow-yaml.py") == {
+    assert _classify_ci_change("docs/architecture/adr-004.md") == {
         "platform": False,
         "canvas": False,
         "python": False,
         "scripts": False,
     }
+
+    # The CI machinery IS visible to CI now (C2).
+    for meta in (
+        ".gitea/scripts/lint-workflow-yaml.py",
+        ".gitea/scripts/detect-changes.py",
+        ".gitea/scripts/gitea-merge-queue.py",
+        ".gitea/required-contexts.txt",
+    ):
+        out = _classify_ci_change(meta)
+        assert out["platform"] is True, f"{meta} still invisible to the Go lane: {out}"
+        assert out["scripts"] is True, f"{meta} still invisible to the shell lane: {out}"
 
 
 def test_staging_tenant_cd_runtime_expectation_uses_controlplane_infisical_ssot():

@@ -643,7 +643,7 @@ func TestConciergeDefaultRuntime_EnvWinsOverConstAndBindsIntoInstall(t *testing.
 		// refuses to displace one — demoting a live concierge and upserting a
 		// container-less row it never provisions would destroy the org's
 		// concierge. No live root here, so the install proceeds.
-		mock.ExpectQuery(`SELECT id FROM workspaces.*AND status = 'online'`).
+		mock.ExpectQuery(`SELECT id FROM workspaces.*AND status IN \('online', 'degraded'\)`).
 			WithArgs(platformID).
 			WillReturnError(sql.ErrNoRows)
 		// Step 0b: downgrade any other platform root ($1 = platformID).

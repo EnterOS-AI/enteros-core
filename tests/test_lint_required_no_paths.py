@@ -158,32 +158,65 @@ def test_parse_context_unparseable_returns_none(lint_module):
 
 
 # --------------------------------------------------------------------------
-# workflow-name → file resolution
+# context → (workflow file, job) resolution
 # --------------------------------------------------------------------------
-def test_resolve_workflow_file_matches_name_attr(lint_module):
-    """Resolution scans workflows/*.yml for a `name:` matching the
-    context's workflow_name. Filename is NOT the source of truth — the
-    `name:` attribute is, because Gitea's context format uses
-    `name:` (not the filename).
+# `resolve_workflow_file(workflow_name)` is GONE. It resolved a context only as
+# far as its WORKFLOW, but the properties this lint checks (a paths filter, a
+# no-op arm) are per-JOB: one workflow can carry both a gated required job and
+# an ungated helper. `build_job_index()` replaces it, keying every job in every
+# workflow under the exact string Gitea posts as the status context
+# ("{workflow name} / {job name-or-key}") so an enforced context resolves to the
+# JOB it actually names.
+def test_build_job_index_keys_on_workflow_name_attr_not_filename(lint_module):
+    """The index keys on the `name:` attribute, NOT the filename — Gitea's
+    context format uses `name:`, so keying on the filename would fail to
+    resolve every context whose workflow name differs from its file.
     """
     _write_workflow(
         lint_module.WORKFLOWS_DIR,
         "some-file.yml",
         "name: Secret scan\non:\n  pull_request:\n    types: [opened]\njobs:\n  scan:\n    runs-on: ubuntu-latest\n",
     )
-    p = lint_module.resolve_workflow_file("Secret scan")
-    assert p is not None
-    assert p.name == "some-file.yml"
+    idx = lint_module.build_job_index()
+    assert "Secret scan / scan" in idx, f"context not resolved; index keys: {sorted(idx)}"
+    path, job_key, _job = idx["Secret scan / scan"]
+    assert path.name == "some-file.yml"
+    assert job_key == "scan"
 
 
-def test_resolve_workflow_file_returns_none_when_missing(lint_module):
-    """No matching `name:` found → None."""
+def test_build_job_index_prefers_job_name_over_job_key(lint_module):
+    """Gitea posts the job's `name:` when it has one, and falls back to the
+    job KEY when it does not. The index must match that, or an enforced
+    context whose job is renamed silently resolves to nothing — and an
+    unresolvable context is a gate this lint cannot check.
+    """
+    _write_workflow(
+        lint_module.WORKFLOWS_DIR,
+        "wf.yml",
+        "name: WF\non:\n  pull_request: {}\njobs:\n"
+        "  build:\n    name: Build It\n    runs-on: ubuntu-latest\n"
+        "  bare:\n    runs-on: ubuntu-latest\n",
+    )
+    idx = lint_module.build_job_index()
+    assert "WF / Build It" in idx  # job has name: -> Gitea posts the name
+    assert "WF / bare" in idx      # job has no name: -> Gitea posts the key
+
+
+def test_build_job_index_omits_contexts_with_no_matching_job(lint_module):
+    """A context naming a workflow that does not exist resolves to nothing.
+
+    The lint must then WARN and count it as unresolved rather than silently
+    treating it as clean — an enforced context it cannot find is exactly the
+    blind spot this file exists to police.
+    """
     _write_workflow(
         lint_module.WORKFLOWS_DIR,
         "other.yml",
         "name: Other\non:\n  pull_request: {}\njobs:\n  x:\n    runs-on: ubuntu-latest\n",
     )
-    assert lint_module.resolve_workflow_file("Secret scan") is None
+    idx = lint_module.build_job_index()
+    assert "Secret scan / scan" not in idx
+    assert "Other / x" in idx
 
 
 # --------------------------------------------------------------------------
@@ -352,19 +385,57 @@ def test_workflow_on_event_with_null_value_passes(lint_module):
 # --------------------------------------------------------------------------
 # End-to-end lint (main) — required-checks fan-out
 # --------------------------------------------------------------------------
-def test_no_required_workflows_succeeds(lint_module, monkeypatch, capsys):
-    """Empty status_check_contexts → exit 0, no findings reported."""
-    stub = _make_stub_api({
-        ("GET", "/repos/owner/repo/branch_protections/main"): (
-            200,
-            {"status_check_contexts": []},
-        ),
-    })
-    monkeypatch.setattr(lint_module, "api", stub)
-    rc = lint_module.run()
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "no required contexts" in out.lower() or "0 required" in out.lower()
+def test_unenumerable_required_set_fails_closed(lint_module, tmp_path):
+    """REGRESSION LOCK. This test used to be `test_no_required_workflows_succeeds`
+    and asserted the exact bug the lint was built to prevent — in its own words,
+    "Empty status_check_contexts -> exit 0, no findings reported."
+
+    That is a vacuous pass written down as the expected result. The lint used to
+    read its required set from branch_protections.status_check_contexts. On this
+    repo that value is `["*"]` (the all-green wildcard), `"*"` does not parse as
+    `<workflow> / <job>`, so ZERO workflows resolved and the lint printed
+    "OK - all 0 resolvable required workflow(s) clean" and exited 0. The guard
+    against green-by-no-op had itself become a green-by-no-op, and this test kept
+    it that way.
+
+    The enforced set is now sourced from the checked-in SSOT
+    (.gitea/required-contexts.txt, entries above the first `# pending-#NNNN`
+    marker). An enforced set it cannot ENUMERATE means the lint can prove nothing,
+    so it must go RED, not green.
+    """
+    missing = tmp_path / "does-not-exist.txt"
+    with pytest.raises(SystemExit) as exc:
+        lint_module.load_enforced_contexts(str(missing))
+    assert exc.value.code == 3, (
+        "an unenumerable enforced set must FAIL CLOSED — a lint that cannot see "
+        f"its own subject must never report success (got exit {exc.value.code})"
+    )
+
+
+def test_enforced_set_stops_at_the_pending_marker(lint_module, tmp_path):
+    """The SSOT's own contract: entries AT OR BELOW the first `# pending-#NNNN`
+    marker are documented-required but NOT enforced. Reading past the marker
+    would make this lint block on contexts the merge queue itself does not
+    enforce; stopping short of it would silently drop real gates.
+    """
+    ssot = tmp_path / "required-contexts.txt"
+    ssot.write_text(
+        "# ── ENFORCED ──\n"
+        "CI / all-required\n"
+        "Secret scan / Scan diff for credential-shaped strings (pull_request)\n"
+        "\n"
+        "# pending-#2409 (not yet enforced) ─────\n"
+        "Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)\n",
+        encoding="utf-8",
+    )
+    got = lint_module.load_enforced_contexts(str(ssot))
+    assert got == [
+        "CI / all-required",
+        "Secret scan / Scan diff for credential-shaped strings",  # event suffix stripped
+    ], got
+    assert not any("Local Provision" in c for c in got), (
+        "read past the `# pending-` marker — parked contexts are not enforced"
+    )
 
 
 def test_required_workflow_no_paths_passes(lint_module, monkeypatch, capsys):
