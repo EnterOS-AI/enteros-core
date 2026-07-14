@@ -56,6 +56,28 @@ template-delivery-e2e / Template-asset delivery (fresh seo-agent — config+prom
 # workflow state, not this comment.
 Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 
+# PROMOTED 2026-07-14 — the per-PR ephemeral-CP gate (task #85 → #114).
+#
+# It was added by #4271, whose commit message said "make it REQUIRED" — but the
+# line was APPENDED to the end of this file, which landed it under
+# `# pending-#3159`, i.e. in the documented-but-NOT-enforced half. For a day the
+# file disagreed with the commit that wrote it, and the file is what
+# gitea-merge-queue.py reads.
+#
+# The gap that leaves is not academic. Branch protection on main is
+# status_check_contexts=['*'], which requires every POSTED context to be green —
+# so a RED happy path already blocked. What ['*'] cannot see is a context that
+# never posts AT ALL: narrow the `on:` filter, disable the workflow, rename the
+# job, or let the run be cancelled while still queued, and the board is clean and
+# the merge proceeds. Enforcement here is the other half — PRESENT and green, or
+# no merge. That is the half that makes a gate un-deletable by accident.
+#
+# Promotion adds no new red exposure (a red already blocked), so the gate's known
+# nondeterminism (task #99) is NOT a reason to park this line. Fix #99; do not
+# hide the context. Parking a flaky-but-real gate is how a gate becomes a
+# decoration.
+E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path
+
 # RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────
 # `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
 # is NO LONGER workflow_dispatch-only: its producer (e2e-staging-saas.yml) was
@@ -140,4 +162,3 @@ Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)
 # #48 (RCA molecule-controlplane #878→#885): real platform-managed boot is
 # the intended merge gate.
 E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot
-E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path

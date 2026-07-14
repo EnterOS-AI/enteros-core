@@ -8,11 +8,34 @@ name: E2E Ephemeral CP Happy Path
 # This validates the SDK-owned-happy-path model (the happy-path E2E is a
 # cross-boundary contract both repos run against an ephemeral CP).
 #
-# GATING as of 2026-07-13: the mc#4081 soak is complete (12 consecutive green
-# dind runs on main) and `continue-on-error` is gone — a red happy path BLOCKS.
-# It also ALWAYS fires (no paths filter), so it can be — and is — a required
-# context. What remains of the migration end-state: move the contract into the
-# SDK (task #74), wire both repos, then demote the post-merge E2E Staging jobs.
+# GATING as of 2026-07-13: `continue-on-error` is gone — a red happy path BLOCKS
+# (branch protection on main is status_check_contexts=['*'], so every POSTED
+# context must be success). It also ALWAYS fires (no paths filter).
+#
+# ENFORCED as of 2026-07-14: the context is now ABOVE the first `# pending-`
+# marker in .gitea/required-contexts.txt, so gitea-merge-queue.py additionally
+# requires it to be PRESENT and green on the PR head. Those are two different
+# guarantees and the second one was missing:
+#
+#   BP ['*']            → a posted RED blocks.       Blind to a context that never posts.
+#   required-contexts   → a MISSING context blocks.  This is the new half.
+#
+# It matters because "never posts" is reachable: narrow the `on:` filter, disable
+# the workflow, rename the job, or have the run cancelled while still queued —
+# and BP sees a clean board and merges. The line was appended to the END of
+# required-contexts.txt in #4271, which landed it under `# pending-#3159`, i.e.
+# in the DOCUMENTED-but-not-enforced half. The commit said "make it REQUIRED";
+# the file said otherwise, and the file is what the merge queue reads.
+#
+# NOT-yet-true, so do not read comfort into the above: this gate is still
+# NONDETERMINISTIC (task #99 — it has gone red on main since the flip, e.g.
+# 5593d7a43). Enforcement is deliberate anyway: a flaky red already blocked via
+# BP ['*'], so promotion adds no new exposure — it only closes the silent hole.
+# Fix the flake in #99; do not park the context to hide it.
+#
+# What remains of the migration end-state: move the contract into the SDK
+# (task #74), wire both repos, then demote the post-merge E2E Staging jobs
+# (task #86 — gated on #92/#93, NOT done).
 #
 # Reuses the CP repo's ephemeral spin-up plumbing (scripts/deploy/pr-ephemeral-cp.sh),
 # the shared harness the RFC generalizes.
@@ -77,8 +100,24 @@ env:
   # tag — there is no controlplane:staging-latest).
   CP_BASELINE_IMAGE: controlplane:baseline-dockerprov
 
+  # The controlplane tree the baseline image is built FROM, PINNED (task #116).
+  #
+  # This used to be a `git clone --depth 1` of the CP's moving `main`, which made
+  # a FOREIGN repo's HEAD a gate on core: any CP commit could red this — now
+  # ENFORCED — context on every open core PR at once, and no core author could see
+  # the cause in their own diff or revert it. With the context merge-queue-required,
+  # that is not a red, it is a FROZEN QUEUE.
+  #
+  # TO BUMP: `git ls-remote https://git.moleculesai.app/molecule-ai/molecule-controlplane.git refs/heads/main`
+  # and paste the SHA here, in its own PR, so the CP change is reviewed as what it
+  # is — a change to what gates core.
+  CP_EPHEMERAL_REF: bcb3d8859952a01e7d55b3a44e0b4d8c65ad7fac
+
 jobs:
-  # bp-exempt: emits no merge-required context of its own; it only tells the
+  # Emits no context listed in required-contexts.txt — but it DOES post
+  # `E2E Ephemeral CP Happy Path / detect`, and under BP ['*'] every posted
+  # context blocks on red. There is no advisory tier here (proven in task #113:
+  # `continue-on-error` does not suppress the status). It only tells the
   # happy-path job whether the diff can possibly touch the happy path.
   detect:
     runs-on: docker-host
@@ -117,15 +156,16 @@ jobs:
     # its Postgres, and the provisioned tenant (same runner class as harness-replays).
     runs-on: docker-host
     #
-    # ── GATING as of 2026-07-13 (mc#4081 soak COMPLETE) ────────────────────────
-    # `continue-on-error: true` is GONE. It used to mean a RED happy path still
+    # ── GATING as of 2026-07-13 ────────────────────────────────────────────────
+    # The continue-on-error mask is GONE. It used to mean a RED happy path still
     # posted SUCCESS — the gate could observe the bug class it was built for, but
     # never stop it. A guard that cannot fail is not a guard.
     #
-    # The RFC §04 exit criterion was >=5 consecutive green dind runs. Actual: 12
-    # consecutive green on main (ed6209ac..8b35a673, 2026-07-11..13); the only
-    # non-green entries in that window are `not run` — commits whose diff missed
-    # the paths filter — not failures.
+    # The RFC §04 exit criterion was >=5 consecutive green dind runs, and the
+    # pre-flip soak cleared it. Do NOT read that as "this lane is stable": POST-flip
+    # it has gone red on main (5593d7a43, 2026-07-14), and task #99 tracks the
+    # nondeterminism. The honest state is: real gate, known flaky, flake tracked and
+    # being fixed at source — not masked, not parked.
     #
     # It ALWAYS FIRES. The `paths:` filter is gone (see the header): it was a bet
     # that we could enumerate everything able to break provisioning, and it was
@@ -190,6 +230,26 @@ jobs:
           }
           MINIMAX_API_KEY=$(read_secret MINIMAX_API_KEY %2Fshared%2Fcontrolplane)
           AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+
+          # FAIL CLOSED on an empty secret VALUE, not just a failed login.
+          #
+          # `read_secret` prints "" when the key is absent, renamed, moved to another
+          # secretPath, or readable-but-empty — and curl -f does not fire, so the step
+          # used to SUCCEED with empty creds. Every step below was then gated on
+          # `env.AUTO_SYNC_TOKEN != ''`, so all of them SKIPPED, and the job posted
+          # SUCCESS having spun up nothing. A required context, green, zero coverage:
+          # exactly the vacuity this gate exists to delete, inside the gate itself.
+          # An Infisical rotation would have silently disarmed the whole lane.
+          #
+          # A gate that cannot observe its subject must not report success.
+          missing=""
+          [ -n "$MINIMAX_API_KEY" ]  || missing="$missing MINIMAX_API_KEY(/shared/controlplane)"
+          [ -n "$AUTO_SYNC_TOKEN" ]  || missing="$missing AUTO_SYNC_TOKEN(/shared/dev-utils)"
+          if [ -n "$missing" ]; then
+            echo "::error::Infisical returned an EMPTY value for:$missing — refusing to report success on a gate that cannot run. Check the key name/secretPath in the Infisical SSOT; do NOT re-add a skip-guard."
+            exit 1
+          fi
+
           echo "::add-mask::$MINIMAX_API_KEY"
           echo "::add-mask::$AUTO_SYNC_TOKEN"
           echo "MINIMAX_API_KEY=$MINIMAX_API_KEY" >> "$GITHUB_ENV"
@@ -197,23 +257,38 @@ jobs:
           echo "creds loaded (minimax len=${#MINIMAX_API_KEY}, sync len=${#AUTO_SYNC_TOKEN})"
 
       # The shared spin-up plumbing (RFC §04): pr-ephemeral-cp.sh lives in the CP
-      # repo today; clone it read-only. (When the harness is generalized this
-      # becomes a vendored/shared action, not a clone.)
-      - name: Clone controlplane for the ephemeral spin-up plumbing
-        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
+      # repo today; fetch it read-only AT THE PINNED SHA (see CP_EPHEMERAL_REF).
+      # (When the harness is generalized this becomes a vendored/shared action.)
+      #
+      # `fetch <sha>` rather than `clone`, so the pin is what comes down the wire —
+      # a shallow clone of `main` would drag main's tip across regardless of what we
+      # check out afterwards.
+      - name: Fetch controlplane at the PINNED ref (ephemeral spin-up plumbing)
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         run: |
           set -euo pipefail
           rm -rf .cp-ephemeral
-          git clone --depth 1 \
-            "https://oauth2:${AUTO_SYNC_TOKEN}@git.moleculesai.app/molecule-ai/molecule-controlplane.git" \
-            .cp-ephemeral
+          mkdir -p .cp-ephemeral
+          git -C .cp-ephemeral init -q
+          git -C .cp-ephemeral remote add origin \
+            "https://oauth2:${AUTO_SYNC_TOKEN}@git.moleculesai.app/molecule-ai/molecule-controlplane.git"
+          git -C .cp-ephemeral fetch -q --depth 1 origin "${CP_EPHEMERAL_REF}"
+          git -C .cp-ephemeral checkout -q FETCH_HEAD
+
+          # The pin is only a pin if we assert we landed on it.
+          GOT="$(git -C .cp-ephemeral rev-parse HEAD)"
+          [ "$GOT" = "${CP_EPHEMERAL_REF}" ] || {
+            echo "::error::controlplane checkout is ${GOT}, expected the pinned ${CP_EPHEMERAL_REF}. Refusing to build the CP baseline from an unpinned tree — that is how a foreign repo's HEAD silently becomes a gate on core."
+            exit 1
+          }
+
           chmod +x .cp-ephemeral/scripts/deploy/pr-ephemeral-cp.sh
-          echo "cloned pr-ephemeral-cp.sh"
+          echo "fetched pr-ephemeral-cp.sh at pinned CP ${CP_EPHEMERAL_REF}"
 
       # Pre-clone manifest deps so Dockerfile.tenant's COPY of .tenant-bundle-deps
       # resolves (identical to harness-replays' pre-clone).
       - name: Pre-clone manifest deps
-        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         env:
           MOLECULE_GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
         run: |
@@ -229,7 +304,7 @@ jobs:
 
       # Build THIS PR's tenant image (the UNDER-TEST side of the substitution).
       - name: Build PR tenant image
-        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
@@ -248,7 +323,7 @@ jobs:
       # cannot provision tenants. main == the released baseline; self-contained (no
       # published :staging-latest tag to depend on).
       - name: Build baseline controlplane image (Dockerfile.dockerprov)
-        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         run: |
           set -euo pipefail
           docker build \
@@ -259,7 +334,7 @@ jobs:
 
       # The proof: full-saas against the throwaway CP, zero staging creds.
       - name: Run core happy-path against an ephemeral CP
-        if: (needs.detect.outputs.happy != 'false') && env.AUTO_SYNC_TOKEN != ''
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         env:
           CP_IMAGE: ${{ env.CP_BASELINE_IMAGE }}
           TENANT_IMAGE: ${{ env.TENANT_IMAGE }}
@@ -286,11 +361,23 @@ jobs:
           DIND_NS: ${{ github.run_id }}-ephemeral
         run: bash tests/harness/dind.sh down
 
-      # Fork-PR fallback: no creds → loud skip, never a silent green.
-      - name: Fork PR — advisory skip (no e2e creds)
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true
+      # Fork PR + code diff: FAIL. A fork gets no e2e creds by design, so the gate
+      # cannot run — and a gate that cannot observe its subject must not report
+      # success. This step used to `::notice::` and exit 0, i.e. post GREEN on an
+      # ENFORCED context having proved nothing, with "the post-merge run covers it"
+      # as the excuse. Post-merge is exactly what this gate exists to stop relying
+      # on. Merging a fork PR now requires a maintainer to re-run it from a
+      # same-repo branch, which is the honest cost of not handing creds to
+      # PR-authored code.
+      #
+      # Gated on `happy != 'false'` so a DOCS-ONLY fork PR still takes the no-op
+      # green arm below rather than being failed for a diff that cannot break
+      # anything.
+      - name: Fork PR — cannot run the gate, so it cannot pass
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true && needs.detect.outputs.happy != 'false'
         run: |
-          echo "::notice::Fork PR — ephemeral-CP happy-path proof skipped (no e2e creds by design). The post-merge run covers it."
+          echo "::error::Fork PR — the ephemeral-CP happy path cannot run (a fork gets no e2e creds by design), so this REQUIRED context cannot honestly be green. Re-run this change from a same-repo branch to get coverage."
+          exit 1
 
       # The context MUST still be posted when we skip, or a docs-only PR would
       # sit at `pending` forever the moment this joins required-contexts.txt.
