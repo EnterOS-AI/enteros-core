@@ -41,6 +41,12 @@ on:
       # teardown to the sweep that deletes a concurrent run's live container runs no
       # guard. A guard CI does not run on the files it guards is not a guard.
       - '.gitea/workflows/**'
+      # #114: test_ephemeral_gate_is_enforced.py asserts the ephemeral-CP gate's
+      # context sits ABOVE the first `# pending-` marker (i.e. is merge-queue
+      # enforced, not merely documented). The mutation it exists to catch — moving
+      # that line back down into the parked half — touches ONLY this file, so
+      # without this path the guard would not run on the very diff it guards.
+      - '.gitea/required-contexts.txt'
       - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
   pull_request:
     branches: [main, staging]
@@ -57,6 +63,12 @@ on:
       # teardown to the sweep that deletes a concurrent run's live container runs no
       # guard. A guard CI does not run on the files it guards is not a guard.
       - '.gitea/workflows/**'
+      # #114: test_ephemeral_gate_is_enforced.py asserts the ephemeral-CP gate's
+      # context sits ABOVE the first `# pending-` marker (i.e. is merge-queue
+      # enforced, not merely documented). The mutation it exists to catch — moving
+      # that line back down into the parked half — touches ONLY this file, so
+      # without this path the guard would not run on the very diff it guards.
+      - '.gitea/required-contexts.txt'
       - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
 
 env:
