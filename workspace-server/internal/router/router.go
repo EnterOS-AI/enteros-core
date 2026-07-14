@@ -604,6 +604,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 		// Secrets (auto-restart workspace after secret change)
 		sech := handlers.NewSecretsHandler(wh.RestartByID)
+		// Idle-digest mail counts (task #219 phase-2, D5): counts + overdue
+		// list over the platform ledgers; detail stays behind the
+		// communication MCP tools. Read-only, workspace-scoped.
+		mailh := handlers.NewMailSummaryHandler()
+		wsAuth.GET("/mail/summary", mailh.Summary)
 		wsAuth.GET("/secrets", sech.List)
 		// Phase 30.2 — decrypted values pull, token-gated. Canvas uses List
 		// (keys + metadata only); remote agents use Values to bootstrap env.
