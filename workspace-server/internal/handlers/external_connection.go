@@ -851,6 +851,32 @@ codex
 // Includes register + heartbeat + inbound activity polling + reply via
 // /notify. No public URL needed (NAT-safe). Operators paste once and run
 // in a background terminal or via launchd.
+//
+// Two defects this template used to have, both of which lied to the operator:
+//
+//  1. The bridge script was written `[ -f … ] || cat > …`. Never clobbering the
+//     operator's edits is right (the reply logic is a stub they are meant to
+//     rewrite) — but the consequence was that once they had ANY kimi_bridge.py, a
+//     platform FIX to that script could never reach them: no copy of the current
+//     version existed on their disk, and nothing told them a newer one was out.
+//     Now the current script is written to kimi_bridge.py.dist every run and
+//     installed as kimi_bridge.py only when absent, so edits survive AND upgrades
+//     are visible + diffable.
+//
+//  2. `[ -s …/kimi_bridge.py ] && echo "already exists — left untouched"` sat AFTER
+//     the line that creates the file, so the file always existed by the time the
+//     test ran. It printed "already exists — left untouched" on the FIRST run too,
+//     about a file it had just written. A message that is true no matter what
+//     happened tells you nothing about what happened. It now distinguishes the three
+//     real cases (installed / current / kept-yours-and-here-is-the-diff).
+//
+// It also warns on an already-running bridge: the config dir was re-keyed from the
+// workspace-NAME slug to the WORKSPACE_ID, so an operator who set up before that
+// change still has a bridge polling out of a directory this snippet never mentions.
+// Re-running would silently leave them with TWO bridges long-polling one inbox —
+// every inbound message processed twice, the user answered twice.
+//
+// Pinned by TestKimiSnippet_ShipsTheCurrentBridgeAndTellsTheTruth.
 const externalKimiTemplate = tokenGuardShell + `# Kimi CLI external setup — register + heartbeat + inbound poll + reply.
 # For operators whose external agent is a Kimi CLI session.
 # No public URL needed; runs behind NAT in poll mode.
@@ -862,8 +888,8 @@ pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pyp
 #    WORKSPACE_ID (unique by construction) — NOT by the workspace-name
 #    slug, which two identically-named workspaces share and would collide
 #    on. The env file is rewritten every run (that is the credential-
-#    refresh path after a rotate); the bridge script is written ONLY if it
-#    doesn't exist yet, so the reply logic you edit below survives a re-run.
+#    refresh path after a rotate); the bridge script is handled in step 3, which
+#    never clobbers your edits but DOES ship you the current version to diff.
 #    The env file is REWRITTEN in place, so a tokenless re-show paste would
 #    replace a working credential with a dead one — hence the guard.
 if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
@@ -877,7 +903,18 @@ EOF
 chmod 600 ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/env
 fi
 
-[ -f ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py ] || cat > ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py <<'PYEOF'
+# 3. The bridge script. Written to kimi_bridge.py.dist EVERY run, and installed as
+#    kimi_bridge.py only if you don't already have one.
+#
+#    Why .dist: you are meant to EDIT kimi_bridge.py (the reply logic near the
+#    bottom is a stub), so re-running must never clobber your edits. But the old
+#    ` + "`[ -f ] || cat >`" + ` form meant the opposite failure: once you had ANY
+#    kimi_bridge.py, a platform fix to this script could never reach you — there was
+#    no version of it on your disk to compare against, and nothing told you a newer
+#    one existed. Shipping the current one alongside yours gives you both: your edits
+#    survive, and you can actually see what changed.
+mkdir -p ~/.molecule-ai/kimi-{{WORKSPACE_ID}}
+cat > ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py.dist <<'PYEOF'
 #!/usr/bin/env python3
 """Kimi bridge — keeps workspace online and polls for canvas messages."""
 import json, logging, time
@@ -982,9 +1019,40 @@ def main():
 if __name__ == "__main__":
     main()
 PYEOF
-[ -s ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py ] && \
-  echo "molecule: kimi_bridge.py already exists — left untouched (credentials refreshed)"
-chmod +x ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py
+
+# Install it if you have none; otherwise leave YOURS alone and say whether it is
+# current.
+KIMI_DIR=~/.molecule-ai/kimi-{{WORKSPACE_ID}}
+if [ ! -f "$KIMI_DIR/kimi_bridge.py" ]; then
+  cp "$KIMI_DIR/kimi_bridge.py.dist" "$KIMI_DIR/kimi_bridge.py"
+  echo "molecule: installed kimi_bridge.py (edit the reply logic near the bottom)"
+elif cmp -s "$KIMI_DIR/kimi_bridge.py" "$KIMI_DIR/kimi_bridge.py.dist"; then
+  echo "molecule: kimi_bridge.py is current — unchanged"
+else
+  echo "molecule: kept YOUR kimi_bridge.py (it differs from the version this platform ships)." >&2
+  echo "molecule: the current one is $KIMI_DIR/kimi_bridge.py.dist — diff it if you want the fixes:" >&2
+  echo "molecule:   diff -u $KIMI_DIR/kimi_bridge.py $KIMI_DIR/kimi_bridge.py.dist" >&2
+fi
+chmod +x "$KIMI_DIR/kimi_bridge.py"
+
+# One bridge per workspace. If a bridge is ALREADY polling this workspace, starting
+# a second one double-processes every inbound message: both long-poll the same
+# inbox, both wake kimi, and the user gets two replies.
+#
+# This bites hardest across the config-dir re-key. The dir used to be keyed by the
+# workspace-NAME slug and is now keyed by WORKSPACE_ID (two same-named workspaces
+# collided on the old scheme). An operator who set up before that change still has a
+# bridge running out of the OLD directory — invisible to every path check here,
+# because the path it runs from no longer exists in this snippet. Re-running would
+# quietly leave them with two.
+KIMI_RUNNING=$(pgrep -f 'kimi_bridge\.py' 2>/dev/null | tr '\n' ' ')
+if [ -n "$KIMI_RUNNING" ]; then
+  echo "molecule: a kimi bridge is ALREADY running (pid(s):$KIMI_RUNNING)." >&2
+  echo "molecule: two bridges on one workspace double-process every inbound message." >&2
+  echo "molecule: if that is an older bridge for THIS workspace (the config dir was" >&2
+  echo "molecule: re-keyed from the name-slug to the workspace id), stop it first:" >&2
+  echo "molecule:   pkill -f kimi_bridge.py" >&2
+fi
 
 # 3. Start the bridge (run in a persistent terminal or via launchd):
 python3 ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py

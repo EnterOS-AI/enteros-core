@@ -370,3 +370,64 @@ func hasEntry(entries []map[string]string, id, token string) bool {
 	}
 	return false
 }
+
+// TestKimiSnippet_ShipsTheCurrentBridgeAndTellsTheTruth pins two defects that made
+// the kimi snippet quietly lie to the operator.
+//
+//  1. STALE BRIDGE. The script was written with `[ -f … ] || cat > …`, so once an
+//     operator had ANY kimi_bridge.py, no platform fix to it could ever reach them:
+//     there was no copy of the current version on their disk to compare against, and
+//     nothing told them a newer one existed. It now ships kimi_bridge.py.dist EVERY
+//     run and installs it only when absent — edits survive AND upgrades are visible.
+//
+//  2. TAUTOLOGICAL MESSAGE. `[ -s …/kimi_bridge.py ] && echo "already exists — left
+//     untouched"` sat AFTER the line that creates the file, so the file always
+//     existed by the time the test ran. It printed "already exists — left untouched"
+//     on the FIRST run too, about a file it had just written. A message that is true
+//     no matter what happened conveys nothing about what happened.
+func TestKimiSnippet_ShipsTheCurrentBridgeAndTellsTheTruth(t *testing.T) {
+	p := BuildExternalConnectionPayload("https://app.example.com", "ws-abc123", "My Agent", "wst_live_TESTTOKEN")
+	kimi, _ := p["kimi_snippet"].(string)
+
+	if strings.Contains(kimi, "] || cat > ") {
+		t.Error("the kimi bridge script is back to `[ -f … ] || cat >`: an operator who already " +
+			"has a kimi_bridge.py can then NEVER receive a platform fix to it, and has no copy of " +
+			"the current version to diff against")
+	}
+	if !strings.Contains(kimi, "kimi_bridge.py.dist") {
+		t.Error("the kimi snippet no longer ships kimi_bridge.py.dist — the operator's edits are " +
+			"preserved but upgrades become invisible again")
+	}
+	if !strings.Contains(kimi, "cmp -s") {
+		t.Error("the kimi snippet must COMPARE the installed bridge against the shipped one; " +
+			"without that it cannot tell the operator whether theirs is current")
+	}
+
+	// The message must distinguish the three real cases. If it cannot be false, it is
+	// not information.
+	for _, want := range []string{
+		"installed kimi_bridge.py", // first run
+		"is current — unchanged",   // re-run, unmodified
+		"kept YOUR kimi_bridge.py", // re-run, operator edited it
+	} {
+		if !strings.Contains(kimi, want) {
+			t.Errorf("the kimi snippet cannot report the %q case — the old message was true in "+
+				"every case and therefore told the operator nothing", want)
+		}
+	}
+	if strings.Contains(kimi, "already exists — left untouched") {
+		t.Error("the tautological echo is back: it sits after the file is created, so it fires " +
+			"even on a first run about a file it just wrote")
+	}
+
+	// Duplicate-bridge warning. The config dir was re-keyed from the workspace-NAME
+	// slug to the WORKSPACE_ID, so an operator who set up before that change still has
+	// a bridge running out of a directory this snippet never mentions. Re-running would
+	// leave them with TWO bridges long-polling one inbox — every inbound message
+	// processed twice, the user answered twice.
+	if !strings.Contains(kimi, "pgrep -f") || !strings.Contains(kimi, "pkill -f kimi_bridge.py") {
+		t.Error("the kimi snippet must detect an already-running bridge and tell the operator to " +
+			"stop it: after the config-dir re-key, an orphaned bridge from the OLD name-slug " +
+			"directory keeps polling, and a second bridge double-processes every inbound message")
+	}
+}
