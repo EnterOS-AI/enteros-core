@@ -27,7 +27,7 @@ name: E2E Ephemeral CP Happy Path
 # rename the job, or have the run cancelled while still queued — and BP sees a
 # clean board and merges with the gate silently absent.
 #
-# BUT step 4b IS CURRENTLY UNREACHABLE (task #118). Step 4 runs first and checks
+# BUT step 4b IS CURRENTLY UNREACHABLE (#4363). Step 4 runs first and checks
 # branch protection's own context list, and BP on main is `['*']`. The queue
 # treats '*' as a LITERAL context name, looks it up among the posted statuses,
 # does not find it, and returns `wait` — on every PR, even a fully green one:
@@ -39,7 +39,7 @@ name: E2E Ephemeral CP Happy Path
 # on main is in fact performed by a human, not the queue actor.
 #
 # The promotion is therefore CORRECT AND NECESSARY BUT NOT YET OPERATIVE: it is
-# the right line in the right place, and it starts working the moment #118 lands.
+# the right line in the right place, and it starts working the moment #4363 lands.
 # What actually protects this gate TODAY is BP ['*'] on a posted red, plus the
 # fail-closed arms and the runtime sentinel below. Do not cite this block as
 # proof that a missing context blocks a merge. It does not. Yet.

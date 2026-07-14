@@ -5,16 +5,28 @@
 #      (CI cannot always read branch_protections; when a repo-admin token
 #      is present the lint also live-cross-checks against BP and fails when
 #      live BP has a context NOT in this list).
-#   2. THE MERGE QUEUE (gitea-merge-queue.py, the bot that actually performs
-#      merges via the operator conductor tick) now ENFORCES every entry
-#      ABOVE the `# pending-` marker below: each must be `success` on the PR
-#      head before the PR can merge, fail-closed and event-suffix-insensitive
-#      — REGARDLESS of whether the entry is in branch-protection
-#      status_check_contexts. This closes the gap where a context listed
-#      here but absent from BP was treated as a non-required ADVISORY red
-#      and force_merge=true bypassed it (PR#3181 merged with
-#      `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates
-#      Workspace` RED for exactly this reason).
+#   2. THE MERGE QUEUE (gitea-merge-queue.py) is DESIGNED to enforce every
+#      entry ABOVE the `# pending-` marker below: each must be `success` on
+#      the PR head before the PR can merge, fail-closed and event-suffix-
+#      insensitive — REGARDLESS of whether the entry is in branch-protection
+#      status_check_contexts. That closes the gap where a context listed here
+#      but absent from BP was treated as a non-required ADVISORY red and
+#      force_merge=true bypassed it (PR#3181 merged with `E2E Staging SaaS
+#      (full lifecycle) / E2E Staging Concierge Creates Workspace` RED for
+#      exactly this reason).
+#
+#      ⚠ IT DOES NOT DO THIS TODAY (#4363). The check that reads this file
+#      (step 4b) sits behind a branch-protection check (step 4) that ALWAYS
+#      FAILS: BP on main is status_check_contexts=['*'], the queue treats '*'
+#      as a LITERAL context name, finds no posted status called "*", and
+#      returns `wait` — on every PR, including a fully green one. Step 4b is
+#      unreachable, so NONE of the entries below are enforced by the queue.
+#      Every merge on main is performed by a human, not the queue actor.
+#
+#      This file is still the SSOT and still worth curating — lint-no-coe-on-
+#      required (1) does read it, and (2) goes live the moment #4363 lands.
+#      But do NOT cite "it's above the marker" as proof that a MISSING context
+#      blocks a merge. Today only BP ['*'] on a POSTED red blocks.
 #
 # Form: "<workflow name> / <job name>" (event suffix stripped — the gate
 # strips `(pull_request)` / `(push)` / `(pull_request_target)` on both
@@ -77,7 +89,7 @@ Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 # hide the context. Parking a flaky-but-real gate is how a gate becomes a
 # decoration.
 #
-# ⚠ AND NOW THE PART THIS FILE HAS TO ADMIT ABOUT ITSELF (task #118).
+# ⚠ AND NOW THE PART THIS FILE HAS TO ADMIT ABOUT ITSELF (#4363).
 #
 # NONE of the entries above are actually enforced right now — not this one, not
 # `CI / all-required`, not `Secret scan`. The header says the merge queue enforces
@@ -100,7 +112,7 @@ Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 # Which is why every merge on main is performed by a human account, never by the
 # queue actor. This file has been documentation, not enforcement, the whole time.
 #
-# So: keep curating it — it is the SSOT and it becomes live the moment #118 lands
+# So: keep curating it — it is the SSOT and it becomes live the moment #4363 lands
 # — but do NOT cite "it's in required-contexts.txt" as proof that a missing
 # context blocks a merge. Today, only BP ['*'] on a POSTED red actually blocks.
 E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path
