@@ -390,8 +390,8 @@ curl -fsS -X POST "{{PLATFORM_URL}}/registry/register" \
 // remote dev VM); routes the workspace's A2A traffic into the running
 // Claude Code session as conversation turns via MCP. The plugin source
 // lives at git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel — polling
-// based, no tunnel required (uses /workspaces/:id/activity?since_secs=,
-// platform-side support shipped in #2300).
+// based, no tunnel required (bounded since_secs cold start, then a persisted
+// since_id cursor in steady state).
 const externalChannelTemplate = tokenGuardShell + `# Claude Code channel — bridges this workspace's A2A traffic into your
 # Claude Code session. No tunnel/public URL needed (polling-based).
 #
@@ -1070,12 +1070,20 @@ def poll_inbound(client, url, ws, tok, since_id):
     # the extra fields in your reply logic — e.g. address the sender by
     # peer_name rather than UUID, or Read attached files via the workspace:
     # URIs in attachments[].
-    params = {"since_secs": "30", "limit": "50", "include": "peer_info"}
+    params = {"limit": "50", "include": "peer_info"}
     if since_id:
         params["since_id"] = since_id
+    else:
+        params["since_secs"] = "30"
     r = client.get(f"{url}/workspaces/{ws}/activity", params=params, headers=hdrs(url, tok))
     r.raise_for_status()
     return r.json()
+
+def order_activity_items(items, since_id):
+    """Normalize /activity into chronological order without mutating it."""
+    # Cursor reads are ASC. A no-cursor recent feed is DESC, so reverse only
+    # the bounded cold-start page; the final processed id is then the newest.
+    return list(items) if since_id else list(reversed(items))
 
 def send_reply(client, url, ws, tok, text):
     r = client.post(f"{url}/workspaces/{ws}/notify", json={"message": text}, headers=hdrs(url, tok))
@@ -1108,7 +1116,9 @@ def main():
                     last_beat = time.time()
 
                 # Poll for new canvas messages
-                items = poll_inbound(c, purl, ws, tok, since_id)
+                items = order_activity_items(
+                    poll_inbound(c, purl, ws, tok, since_id), since_id
+                )
                 for item in items:
                     since_id = item["id"]
                     src = item.get("source_id")

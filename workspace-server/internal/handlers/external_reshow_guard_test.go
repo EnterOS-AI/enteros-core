@@ -659,3 +659,98 @@ func TestKimiSnippet_ShipsTheCurrentBridgeAndTellsTheTruth(t *testing.T) {
 			"directory keeps polling, and a second bridge double-processes every inbound message")
 	}
 }
+
+// TestKimiSnippet_CursorPollingIsChronological executes the Python bridge
+// extracted from the rendered operator snippet. GET /activity returns a
+// newest-first feed when since_secs is used without a cursor, but cursor reads
+// are oldest-first. The bridge must normalize only the cold-start response and
+// leave since_secs off steady-state cursor requests; otherwise it replies in
+// reverse, persists the oldest id, replays newer rows, and can lose rows after
+// a poll outage longer than the time window.
+func TestKimiSnippet_CursorPollingIsChronological(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal("python3 is required to execute the rendered Kimi bridge")
+	}
+
+	p := BuildExternalConnectionPayload(
+		"https://app.example.com",
+		"ws-abc123",
+		"My Agent",
+		"wst_live_TESTTOKEN",
+	)
+	kimi, _ := p["kimi_snippet"].(string)
+	const open = "<<'PYEOF'\n"
+	const close = "\nPYEOF\n"
+	start := strings.Index(kimi, open)
+	if start < 0 {
+		t.Fatal("rendered Kimi snippet no longer contains the bridge PYEOF heredoc")
+	}
+	rest := kimi[start+len(open):]
+	end := strings.Index(rest, close)
+	if end < 0 {
+		t.Fatal("rendered Kimi bridge PYEOF heredoc is unterminated")
+	}
+	bridge := rest[:end]
+
+	const harness = `
+import sys
+import types
+
+httpx = types.ModuleType("httpx")
+httpx.Client = object
+sys.modules["httpx"] = httpx
+
+namespace = {"__name__": "kimi_bridge_test"}
+exec(compile(sys.stdin.read(), "kimi_bridge.py", "exec"), namespace)
+
+class Response:
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return [
+            {"id": "newest"},
+            {"id": "middle"},
+            {"id": "oldest"},
+        ]
+
+class Client:
+    def __init__(self):
+        self.params = None
+    def get(self, url, params, headers):
+        self.params = params
+        return Response()
+
+client = Client()
+cold = namespace["poll_inbound"](client, "https://app.example.com", "ws-abc123", "token", "")
+if client.params.get("since_secs") != "30" or "since_id" in client.params:
+    raise AssertionError(f"cold-start params are not bounded since_secs-only: {client.params!r}")
+ordered = namespace["order_activity_items"](cold, "")
+ids = [item["id"] for item in ordered]
+if ids != ["oldest", "middle", "newest"]:
+    raise AssertionError(f"cold-start order is not chronological: {ids!r}")
+cursor = ""
+for item in ordered:
+    cursor = item["id"]
+if cursor != "newest":
+    raise AssertionError(f"cold-start persisted cursor would be {cursor!r}, want newest")
+
+steady_rows = [
+    {"id": "oldest"},
+    {"id": "middle"},
+    {"id": "newest"},
+]
+namespace["poll_inbound"](client, "https://app.example.com", "ws-abc123", "token", "middle")
+if client.params.get("since_id") != "middle" or "since_secs" in client.params:
+    raise AssertionError(f"steady-state params are not cursor-only: {client.params!r}")
+steady = namespace["order_activity_items"](steady_rows, "middle")
+if [item["id"] for item in steady] != ["oldest", "middle", "newest"]:
+    raise AssertionError("cursor response order was changed")
+`
+
+	cmd := exec.Command(python, "-c", harness)
+	cmd.Stdin = strings.NewReader(bridge)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rendered Kimi bridge violates cursor polling semantics: %v\n%s", err, out)
+	}
+}
