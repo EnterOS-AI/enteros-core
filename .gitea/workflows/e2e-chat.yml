@@ -348,17 +348,29 @@ jobs:
           export PLAYWRIGHT_BASE_URL="http://localhost:${CANVAS_PORT}"
 
           # REQUIRE-LIVE guard (mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE):
-          # this lane reached here only because detect-changes said chat==true,
-          # so it MUST actually execute the round-trip specs. `pipefail` makes
-          # a real test failure (playwright non-zero) abort here under `set -e`;
-          # passWithNoTests:false makes a zero-match selection non-zero too. The
-          # explicit grep below is belt-and-braces: assert the list reporter
-          # printed an executed-count summary, so a silent all-skip / no-op can
-          # never report green.
+          # this lane always runs now, so it MUST actually execute the round-trip
+          # specs. `pipefail` makes a real test failure (playwright non-zero) abort
+          # here under `set -e`; passWithNoTests:false makes a zero-match selection
+          # non-zero too. The assertions below are belt-and-braces.
           npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts e2e/chat-separation.spec.ts \
             --reporter=list 2>&1 | tee /tmp/pw-chat.out
-          if ! grep -qE '[0-9]+ (passed|failed|skipped)' /tmp/pw-chat.out; then
-            echo "::error::E2E Chat REQUIRE-LIVE: chat==true but Playwright reported no executed tests — specs missing or all-skipped, refusing to report green."
+          # The guard used to be `grep -qE '[0-9]+ (passed|failed|skipped)'` — which
+          # ACCEPTED `skipped` as proof of execution, while its own comment claimed
+          # "a silent all-skip can never report green". It could: an all-skipped run
+          # prints "27 skipped", satisfies the alternation, and posts SUCCESS having
+          # asserted nothing. Same green-by-no-op class this lane was un-vacuumed to
+          # kill, hiding inside the anti-vacuity check itself.
+          #
+          # Now: require a POSITIVE pass count, and refuse any skip. The three chat
+          # specs declare 27 tests and ZERO test.skip/test.fixme, so a `skipped` in
+          # the summary means someone added a conditional skip — that must be loud,
+          # not silently subtracted from this lane's coverage.
+          if ! grep -qE '[0-9]+ passed' /tmp/pw-chat.out; then
+            echo "::error::E2E Chat REQUIRE-LIVE: Playwright reported no PASSED tests — specs missing, all-skipped, or a zero-match selection. A gate that executes nothing must not report success."
+            exit 1
+          fi
+          if grep -qE '[0-9]+ skipped' /tmp/pw-chat.out; then
+            echo "::error::E2E Chat REQUIRE-LIVE: $(grep -oE '[0-9]+ skipped' /tmp/pw-chat.out) — the chat specs declare no test.skip/test.fixme, so a skip here is silently removed coverage on the only per-PR chat gate. Remove the skip, or delete the test outright so its loss is visible in the diff."
             exit 1
           fi
 

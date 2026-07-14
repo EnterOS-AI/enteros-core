@@ -1379,19 +1379,7 @@ jobs:
       #   push / dispatch / schedule: 1 → the real staging test runs and
       #                  HARD FAILs (exit 5) on a missing platform-agent
       #                  image / never-online concierge / no creds.
-      # LIVE ON PULL REQUESTS TOO — 2026-07-14. This context is ENFORCED
-      # (merge-blocking) in .gitea/required-contexts.txt, and enforcement is
-      # evaluated on the PR HEAD. It used to be `pull_request && '0'`, which meant
-      # the enforced gate's ONLY reachable PR outcome was the harness's own
-      # PR-mode arm: `bash -n` on a shell script, then `exit 0`. A merge-blocking
-      # gate that, on the one event where it blocks, checks nothing but shell
-      # syntax. It could never fail a PR, so it enforced nothing.
-      #
-      # Now: live on push/dispatch/schedule AND on same-repo pull_request. A FORK
-      # PR still gets 0 (it cannot hold the staging credential — see the
-      # fail-closed token check below, which fails a NON-fork PR with no token and
-      # loudly skips a fork one).
-      E2E_REQUIRE_LIVE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true) && '0' || '1' }}
+      E2E_REQUIRE_LIVE: ${{ github.event_name == 'pull_request' && '0' || '1' }}
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
     steps:
@@ -1428,12 +1416,7 @@ jobs:
         id: kms_staging
         # Flattened to a single physical line: Gitea act_runner may not treat
         # embedded YAML newlines in a folded `if:` as whitespace (push-path eval risk).
-        # Same-repo PRs DO fetch the credential now (2026-07-14). This context is
-        # ENFORCED; without the token its PR arm degrades to `bash -n` and the gate
-        # enforces nothing on the only event where it blocks. molecule-core PRs are
-        # same-repo, so the CI machine identity IS present. A FORK PR is excluded —
-        # it cannot hold the secret — and lands on the loud-skip arm below.
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
@@ -1476,34 +1459,23 @@ jobs:
           # container on the molecules-server host, not an EC2 VM, so there is no
           # EC2 leak verification to run.
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
-            # FAIL-CLOSED (2026-07-14). This used to exit 0 GREEN on any
-            # pull_request, on the reasoning that PRs carry no live creds. But this
-            # context is ENFORCED (merge-blocking) and enforcement is evaluated on
-            # the PR HEAD — so that arm made the gate's only reachable PR outcome
-            # `bash -n` on a shell script. A merge gate that, on the one event where
-            # it can block, checks nothing but shell syntax, enforces nothing.
-            #
-            # A FORK PR genuinely cannot hold the staging credential. It gets a LOUD
-            # skip, not a silent green: the message says plainly that this gate did
-            # not run and a maintainer must re-run it from a same-repo branch.
-            if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
-              echo "::warning::FORK PR — no staging credential is available to an untrusted fork, so the ENFORCED concierge gate CANNOT run here. This is NOT a pass: a maintainer must re-run this from a same-repo branch before merging. See task #103."
+            # SAFE-ENABLE PR-mode: on pull_request the KMS fetch is intentionally
+            # skipped (no live creds on PRs), so an empty token here is EXPECTED
+            # and green — the harness runs its bash -n self-check and exit-0s.
+            # A missing token on push/dispatch/schedule is still a hard error.
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "PR-mode (E2E_REQUIRE_LIVE=0): no MOLECULE_ADMIN_TOKEN — harness will self-check (bash -n) and exit 0 green ✓"
               exit 0
             fi
-            # Same-repo PR, push, dispatch, schedule: the credential MUST be there.
-            # Empty means the Infisical fetch above failed or the machine identity is
-            # misconfigured — an operator gap, and one worth blocking on. A gate that
-            # cannot reach its subject must not report success.
-            echo "::error::MOLECULE_ADMIN_TOKEN empty (Infisical staging CP_ADMIN_API_TOKEN @ /shared/controlplane-admin). This gate is ENFORCED and cannot prove anything without it — failing closed rather than reporting a green that tested nothing."
+            echo "::error::MOLECULE_ADMIN_TOKEN empty (Infisical staging CP_ADMIN_API_TOKEN @ /shared/controlplane-admin)"
             exit 2
           fi
-          echo "Admin token present ✓ (molecules-server: no AWS creds needed) — running the LIVE concierge E2E."
+          echo "Admin token present ✓ (molecules-server: no AWS creds needed)"
 
       - name: CP staging health preflight
-        # Runs on same-repo PRs too now — the real provision follows on a PR as
-        # well, so the preflight that guards it must also run. Only a FORK PR (no
-        # credential, loud-skipped above) sits this out.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        # SAFE-ENABLE: no live staging call on PRs (they self-check only). Runs
+        # on push/dispatch/schedule, where the real provision follows.
+        if: github.event_name != 'pull_request'
         run: |
           # Poll to a stable Nx200 streak; a cold-start / mid-recreate CP
           # (000/5xx/non-200) is a RETRY, not a canary red (mc#3244).

@@ -80,15 +80,39 @@ Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 # script and exiting 0 — enforces exactly nothing. It was a merge gate that could
 # not fail a merge.
 #
-# FIXED (2026-07-14): the producer now runs the REAL live concierge E2E on
-# same-repo pull requests (E2E_REQUIRE_LIVE=1, Infisical fetch enabled for
-# non-forks, fail-closed on an absent token). A FORK PR — which genuinely cannot
-# hold the staging credential — gets a LOUD ::warning:: skip that says the gate did
-# not run and a maintainer must re-run it from a same-repo branch, rather than a
-# silent green.
+# PARKED 2026-07-14 (moved BELOW the marker — see the pending-#86 block).
 #
-# Safe to enforce for real: this job is green on every recent main push (5/5
-# checked). It was never broken — it just never ran where enforcement happens.
+# My first attempt at fixing the vacuity was to make the PR arm REAL: enable the
+# Infisical KMS fetch on same-repo PRs so E2E_REQUIRE_LIVE=1 could run the live
+# concierge E2E where enforcement is actually evaluated. Code review killed it,
+# correctly. That change put the staging CP_ADMIN_API_TOKEN — cross-tenant admin
+# over every staging org, tenant-DELETE included — into a job whose very next step
+# executes tests/e2e/test_staging_concierge_creates_workspace_e2e.sh FROM THE PR'S
+# OWN TREE. Anyone able to push a branch could have edited that script to exfiltrate
+# the token. A branch push is not a review. It also re-added the exact
+# `(pull_request && fork==false)` clause the Guard-B block in the producer says was
+# removed because it drove a live staging provision on EVERY PR push.
+#
+# The real lesson: this gate cannot be honestly enforced on a pull request. Proving
+# it requires live staging credentials, and live credentials must never sit in a job
+# that runs PR-authored code. Making the vacuous gate "real" that way trades a fake
+# gate for a credential-exfil path — a strictly worse deal.
+#
+# So it goes below the marker: enforced NOWHERE it cannot prove anything, and kept
+# as the post-merge DEPLOY gate it genuinely is (green 5/5 on recent main pushes).
+# Real per-PR coverage of this journey is the EPHEMERAL-CP gate (task #86), which
+# needs no shared-staging credential at all because it stands up its own throwaway
+# control plane. That is the correct home for "pull, not after push".
+
+# pending-#86 (not yet enforced) ────────────────────────────────────────
+# The staging concierge journey. DOCUMENTED-required, NOT merge-blocking, and it
+# must stay that way until per-PR coverage comes from the ephemeral-CP gate (#86)
+# rather than from shared staging. Enforcing it on the PR head is only possible by
+# handing PR-authored code the staging admin token — see the long note above. It
+# runs live on push/dispatch/schedule as the deploy gate; its PR arm is a `bash -n`
+# self-check that proves nothing, which is FINE precisely because nothing below this
+# marker gates a merge. Do NOT promote this line without first moving the coverage
+# to the ephemeral gate.
 E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
 
 # pending-#2409 (not yet enforced) ──────────────────────────────────────
