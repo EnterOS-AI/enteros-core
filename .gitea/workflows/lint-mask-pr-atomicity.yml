@@ -107,13 +107,18 @@ jobs:
     # let the pre-flip gate accept a paths-filtered workflow's PR-event runs (or
     # a wider commit window) as proof. Then this flips in one line.
     #
-    # mc#4344: the pre-flip gate cannot bless this flip — this workflow is paths-filtered,
-    # so it never runs on a main PUSH, and main-push run-logs are the ONLY proof that gate
-    # accepts. Not a red suite; a structurally unsatisfiable precondition. The lint is GREEN.
-    # (The tracker cited here before was CLOSED, and Tier 2e correctly red'd it: a mask must
-    # cite an OPEN tracker, or it is an excuse with no owner. Do NOT name a closed tracker
-    # anywhere near a continue-on-error, even to explain it — the lint scans the adjacent
-    # lines for ANY mc#NNNN and will resolve the one you mentioned in passing.)
+    # The pre-flip gate cannot bless this flip: this workflow is paths-filtered, so it never
+    # runs on a main PUSH — and main-push run-logs are the ONLY proof that gate accepts. Not a
+    # red suite (the lint is GREEN); a structurally unsatisfiable precondition.
+    #
+    # Two things the tracking lint taught us the hard way, recorded so nobody repeats them:
+    #   1. The tracker must be OPEN. A mask citing a closed one is an excuse with no owner.
+    #   2. Do NOT name a closed tracker anywhere near a continue-on-error, even to explain
+    #      it — the lint scans the ADJACENT lines for any mc#NNNN and resolves every one it
+    #      finds, including the one you only mentioned in passing.
+    # The reference below must stay WITHIN 2 LINES of the directive or Tier 2e reds it.
+    #
+    # mc#4344: pre-flip catch-22 blocks removing this mask; see the issue for definition-of-done.
     continue-on-error: true
     steps:
       - name: Check out PR head with full history (need base SHA blobs)
