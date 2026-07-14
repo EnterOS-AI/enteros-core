@@ -42,4 +42,32 @@ jobs:
       - run: go mod download
 
       - name: Run concierge creates-workspace hermetic tests
-        run: go test -timeout 5m -v ./internal/handlers/ -run '^TestConciergeCreatesWorkspace_Hermetic' -count=1
+        run: |
+          set -uo pipefail
+          # Anti-vacuous-gate guard.
+          #
+          # `go test -run <regex>` EXITS 0 WHEN THE REGEX MATCHES NOTHING:
+          #   testing: warning: no tests to run
+          #   ok  .../internal/handlers  0.47s [no tests to run]
+          #   $? == 0
+          # So without this guard the PASS arm of this ENFORCED, merge-blocking
+          # context is EXACTLY what an ABSENT test produces — rename or delete
+          # TestConciergeCreatesWorkspace_Hermetic and the gate turns green while
+          # covering nothing.
+          #
+          # Fix: run with -v, then require at least one "--- PASS:" line. Zero
+          # means the regex matched nothing, the package failed to yield tests,
+          # or the suite skipped wholesale — all of which must fail CLOSED.
+          # (Same shape as the >0-collected assertion in test-ops-scripts.yml.)
+          LOG=$(mktemp)
+          rc=0
+          go test -timeout 5m -v ./internal/handlers/ -run '^TestConciergeCreatesWorkspace_Hermetic' -count=1 2>&1 | tee "$LOG" || rc=$?
+          npass=$(grep -c -E '^[[:space:]]*--- PASS: ' "$LOG" || true)
+          echo "concierge hermetic: ${npass} test(s) actually ran and passed"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if [ "${npass:-0}" -eq 0 ]; then
+            echo "::error::Concierge hermetic gate ran ZERO tests (0 '--- PASS:' lines) but go test still exited 0. A gate that runs no tests must NEVER report success. Check that ^TestConciergeCreatesWorkspace_Hermetic still names a real test in workspace-server/internal/handlers/."
+            exit 1
+          fi
