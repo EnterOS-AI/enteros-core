@@ -10,6 +10,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
+	"gopkg.in/yaml.v3"
 )
 
 // external_rotate_test.go — coverage for the credential-rotate +
@@ -379,7 +380,7 @@ func TestBuildExternalConnectionPayload_McpServerNameUniquePerWorkspace(t *testi
 //
 //   - hermes is intentionally NOT in that set. Its plugin registers the fixed
 //     platform name `molecule`, and hermes reads it from
-//     gateway.platforms.molecule. One hermes gateway therefore connects to one
+//     top-level platforms.molecule. One hermes gateway therefore connects to one
 //     Molecule workspace; inventing a workspace-specific platform key makes
 //     hermes silently ignore the config.
 //
@@ -428,25 +429,58 @@ func TestBuildExternalConnectionPayload_AllRuntimeSnippetsAreWorkspaceUnique(t *
 
 // TestBuildExternalConnectionPayload_HermesUsesRegisteredPlatformKey keeps the
 // generated config aligned with both current hermes-agent and the legacy
-// platform-plugin branch. Both parse plugin entries from
-// gateway.platforms.<registered-name>; plugin_platforms is an internal struct
-// field, not a YAML key. The plugin registers exactly `molecule`, so a
+// platform-plugin branch. Both parse plugin entries from the top-level
+// platforms.<registered-name>; plugin_platforms is an internal struct field,
+// not a YAML key. The plugin registers exactly `molecule`, so a
 // workspace-specific key would also be ignored.
 func TestBuildExternalConnectionPayload_HermesUsesRegisteredPlatformKey(t *testing.T) {
 	got := BuildExternalConnectionPayload("https://p.test", "id-a", "my-bot", "tok")
 	hermes, _ := got["hermes_channel_snippet"].(string)
 
-	for _, required := range []string{
-		"plugins:\n#        enabled:\n#          - molecule",
-		"platforms:\n#          molecule:\n#            enabled: true",
-	} {
-		if !strings.Contains(hermes, required) {
-			t.Errorf("hermes snippet missing current config block %q:\n%s", required, hermes)
+	var configLines []string
+	inConfig := false
+	for _, line := range strings.Split(hermes, "\n") {
+		if line == "#      plugins:" {
+			inConfig = true
 		}
+		if !inConfig {
+			continue
+		}
+		if line == "#" {
+			break
+		}
+		if !strings.HasPrefix(line, "#      ") {
+			t.Fatalf("unexpected Hermes config example line %q", line)
+		}
+		configLines = append(configLines, strings.TrimPrefix(line, "#      "))
 	}
-	for _, forbidden := range []string{"plugin_platforms", "molecule-my-bot:"} {
-		if strings.Contains(hermes, forbidden) {
-			t.Errorf("hermes snippet contains unsupported config key %q:\n%s", forbidden, hermes)
-		}
+	if len(configLines) == 0 {
+		t.Fatal("Hermes snippet has no YAML config example")
+	}
+
+	var config struct {
+		Plugins struct {
+			Enabled []string `yaml:"enabled"`
+		} `yaml:"plugins"`
+		Platforms map[string]struct {
+			Enabled bool `yaml:"enabled"`
+		} `yaml:"platforms"`
+		Gateway         map[string]any `yaml:"gateway"`
+		PluginPlatforms map[string]any `yaml:"plugin_platforms"`
+	}
+	if err := yaml.Unmarshal([]byte(strings.Join(configLines, "\n")), &config); err != nil {
+		t.Fatalf("Hermes config example is invalid YAML: %v", err)
+	}
+	if len(config.Gateway) != 0 {
+		t.Error("Hermes platforms must be top-level, not nested under gateway")
+	}
+	if len(config.PluginPlatforms) != 0 {
+		t.Error("Hermes config must not use the internal plugin_platforms field name")
+	}
+	if len(config.Plugins.Enabled) != 1 || config.Plugins.Enabled[0] != "molecule" {
+		t.Errorf("Hermes plugins.enabled = %#v, want [molecule]", config.Plugins.Enabled)
+	}
+	if molecule, ok := config.Platforms["molecule"]; !ok || !molecule.Enabled {
+		t.Errorf("Hermes top-level platforms.molecule = %#v, want enabled", molecule)
 	}
 }

@@ -315,6 +315,84 @@ func TestShellSnippets_ParseUnderBash(t *testing.T) {
 	}
 }
 
+// TestRenderedRuntimeSnippets_StopAfterConfigurationFailure executes the
+// operator-facing shell, with installs stubbed successful and a runtime
+// configuration/start command stubbed failed. A later help block or
+// install-status check must not turn that real failure back into exit 0, and
+// no dependent agent/gateway command may run after its configuration failed.
+func TestRenderedRuntimeSnippets_StopAfterConfigurationFailure(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash not on PATH: %v", err)
+	}
+
+	stubDir := t.TempDir()
+	const stub = `#!/usr/bin/env bash
+name="${0##*/}"
+printf '%s %s\n' "$name" "$*" >> "$CALL_LOG"
+if [[ "$name $*" == *"$FAIL_NEEDLE"* ]]; then
+  exit 42
+fi
+exit 0
+`
+	for _, name := range []string{"python3", "npm", "bun", "claude", "hermes", "openclaw", "codex", "codex-channel-molecule"} {
+		if err := os.WriteFile(filepath.Join(stubDir, name), []byte(stub), 0o755); err != nil {
+			t.Fatalf("write %s stub: %v", name, err)
+		}
+	}
+
+	payload := BuildExternalConnectionPayload("https://app.example.com", "ws-abc123", "My Agent", "wst_live_TESTTOKEN")
+	for _, tc := range []struct {
+		name       string
+		field      string
+		failNeedle string
+		mustNotRun []string
+	}{
+		{name: "Claude channel config", field: "claude_code_channel_snippet", failNeedle: "bun -e", mustNotRun: []string{"claude --dangerously-load-development-channels"}},
+		{name: "universal MCP", field: "universal_mcp_snippet", failNeedle: "claude mcp add"},
+		{name: "Hermes", field: "hermes_channel_snippet", failNeedle: "hermes gateway --replace"},
+		{name: "OpenClaw", field: "openclaw_snippet", failNeedle: "openclaw mcp set", mustNotRun: []string{"openclaw gateway", "openclaw agent"}},
+		{name: "OpenClaw agent", field: "openclaw_snippet", failNeedle: "openclaw agent"},
+		{name: "Codex agent", field: "codex_snippet", failNeedle: "codex "},
+		{name: "Kimi bridge", field: "kimi_snippet", failNeedle: "kimi_bridge.py"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := filepath.Join(t.TempDir(), "calls.log")
+			snippet, ok := payload[tc.field].(string)
+			if !ok {
+				t.Fatalf("payload field %s is not a string", tc.field)
+			}
+			home := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(home, ".openclaw"), 0o700); err != nil {
+				t.Fatalf("create OpenClaw config dir: %v", err)
+			}
+			cmd := exec.Command(bash, "-c", snippet)
+			cmd.Env = append(os.Environ(),
+				"PATH="+stubDir+":"+os.Getenv("PATH"),
+				"HOME="+home,
+				"CALL_LOG="+logPath,
+				"FAIL_NEEDLE="+tc.failNeedle,
+			)
+			out, runErr := cmd.CombinedOutput()
+			if runErr == nil {
+				t.Errorf("rendered snippet exited 0 after %s failed; output:\n%s", tc.failNeedle, out)
+			}
+			calls, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatalf("read command log: %v", err)
+			}
+			if !strings.Contains(string(calls), tc.failNeedle) {
+				t.Fatalf("failure command was not reached; calls:\n%s", calls)
+			}
+			for _, forbidden := range tc.mustNotRun {
+				if strings.Contains(string(calls), forbidden) {
+					t.Errorf("dependent command %q ran after configuration failed; calls:\n%s", forbidden, calls)
+				}
+			}
+		})
+	}
+}
+
 // channelMergeScript extracts the bun/node script the channel snippet pipes
 // into `bun -e` so the test can EXECUTE it. Pulling it out of the rendered
 // snippet (not a copy) is the point: a copy would drift, and a drifted copy is

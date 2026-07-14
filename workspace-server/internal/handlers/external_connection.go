@@ -397,6 +397,7 @@ const externalChannelTemplate = tokenGuardShell + `# Claude Code channel — bri
 #
 # Prereq: Bun 1.3+ installed (channel plugins are Bun scripts).
 #   bun --version    # must print a version (1.3.x or newer)
+CHANNEL_SETUP_STATUS=0
 #
 # 1. Inside Claude Code, install the channel plugin. The plugin lives in
 #    Molecule's own Gitea marketplace (not Anthropic's default), so a
@@ -447,7 +448,19 @@ fs.renameSync(p + ".tmp", p);
 console.log("molecule: .env now holds " + arr.length + " workspace(s)");
 JS
 )"
+CHANNEL_SETUP_STATUS=$?
+if [ "$CHANNEL_SETUP_STATUS" -ne 0 ]; then
+  MOLECULE_TOKEN_OK=0
+  echo "molecule: Claude channel config update failed; Claude startup was skipped." >&2
+fi
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 chmod 600 ~/.claude/channels/molecule/.env
+CHANNEL_SETUP_STATUS=$?
+if [ "$CHANNEL_SETUP_STATUS" -ne 0 ]; then
+  MOLECULE_TOKEN_OK=0
+  echo "molecule: Claude channel config permissions could not be secured; Claude startup was skipped." >&2
+fi
+fi
 
 # (Legacy single-platform shape — MOLECULE_PLATFORM_URL + comma-separated
 # MOLECULE_WORKSPACE_IDS + MOLECULE_WORKSPACE_TOKENS — is still supported
@@ -458,7 +471,10 @@ chmod 600 ~/.claude/channels/molecule/.env
 #    VALUE of --dangerously-load-development-channels — NOT a separate
 #    --channels flag (that flag does not exist in current Claude Code;
 #    passing it errors with "entries must be tagged: --channels").
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 claude --dangerously-load-development-channels plugin:molecule@molecule-channel
+CHANNEL_SETUP_STATUS=$?
+fi
 
 # You should see on stderr:
 #   molecule channel: connected — watching N workspace(s) across M platform(s)
@@ -521,6 +537,7 @@ claude --dangerously-load-development-channels plugin:molecule@molecule-channel
 #     • "Inbound messages not arriving" — stderr should show
 #       "molecule channel: connected — watching N workspace(s)";
 #       verify ~/.claude/channels/molecule/.env shape is MOLECULE_WORKSPACES_JSON.
+[ "$CHANNEL_SETUP_STATUS" -eq 0 ]
 fi
 `
 
@@ -580,6 +597,11 @@ claude mcp add {{MCP_SERVER_NAME}} -s user -- env \
   PLATFORM_URL={{PLATFORM_URL}} \
   MOLECULE_WORKSPACE_TOKEN="{{AUTH_TOKEN}}" \
   molecule-mcp
+RUNTIME_INSTALL_STATUS=$?
+if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
+  MOLECULE_TOKEN_OK=0
+  echo "molecule: Claude MCP configuration failed; no usable server entry was created." >&2
+fi
 fi
 
 # molecule-mcp registers the workspace + heartbeats every 20s in a
@@ -747,20 +769,18 @@ fi
 
 # 3. Edit ~/.hermes/config.yaml. Current Hermes refuses non-bundled pip
 #    plugins unless they are explicitly enabled, and both current and legacy
-#    Hermes read platform configuration from gateway.platforms (the similarly
+#    Hermes read platform configuration from top-level platforms (the similarly
 #    named internal storage field is NOT a YAML key). Merge these entries into any
-#    existing plugins.enabled list and gateway.platforms map:
+#    existing plugins.enabled list and top-level platforms map:
 #
 #      plugins:
 #        enabled:
 #          - molecule
-#      gateway:
-#        # ...your existing gateway settings...
-#        platforms:
-#          molecule:
-#            enabled: true
+#      platforms:
+#        molecule:
+#          enabled: true
 #
-#    Do not append duplicate plugins: or gateway: keys; YAML duplicate-key
+#    Do not append duplicate plugins: or platforms: keys; YAML duplicate-key
 #    collapse can silently discard the working configuration. On current
 #    Hermes, ` + "`hermes plugins enable molecule`" + ` is the CLI equivalent
 #    of adding molecule to plugins.enabled.
@@ -768,6 +788,11 @@ fi
 # 4. Restart the hermes gateway (skipped without a real token — see above):
 if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 hermes gateway --replace
+RUNTIME_INSTALL_STATUS=$?
+if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
+  MOLECULE_TOKEN_OK=0
+  echo "molecule: Hermes gateway restart failed; inspect ~/.hermes/gateway.log before retrying." >&2
+fi
 fi
 
 # Inbound canvas messages + peer A2A now arrive as MessageEvents —
@@ -786,7 +811,7 @@ fi
 #       gateway: block must appear exactly once.
 #     • Plugin not discovered after install — pip show hermes-channel-molecule
 #       to confirm install, then run ` + "`hermes plugins enable molecule`" + `
-#       (current Hermes) or verify gateway.platforms.molecule is enabled.
+#       (current Hermes) or verify platforms.molecule is enabled.
 fi
 [ "$RUNTIME_INSTALL_STATUS" -eq 0 ]
 fi
@@ -899,6 +924,10 @@ fi
 #    available to the agent, and the bridge wakes a non-interactive
 #    codex turn for any inbound canvas/peer message:
 codex
+RUNTIME_INSTALL_STATUS=$?
+if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
+  echo "molecule: Codex exited with an error; inspect its output before retrying." >&2
+fi
 
 # Need help?
 #   Documentation: https://doc.moleculesai.app/docs/guides/external-agent-registration
@@ -1137,6 +1166,10 @@ fi
 
 # 3. Start the bridge (run in a persistent terminal or via launchd):
 python3 ~/.molecule-ai/kimi-{{WORKSPACE_ID}}/kimi_bridge.py
+RUNTIME_INSTALL_STATUS=$?
+if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
+  echo "molecule: Kimi bridge exited with an error; inspect the output before retrying." >&2
+fi
 
 # What the script does:
 #   • Registers the workspace in poll mode (no public URL needed)
@@ -1239,18 +1272,30 @@ openclaw mcp set {{MCP_SERVER_NAME}} "$(cat <<EOF
 }
 EOF
 )"
+RUNTIME_INSTALL_STATUS=$?
+if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
+  MOLECULE_TOKEN_OK=0
+  echo "molecule: OpenClaw MCP configuration failed; gateway and agent startup were skipped." >&2
+fi
 fi
 
 # 4. Start the openclaw gateway as a durable background process.
 #    A bare '&' dies when the terminal closes; nohup + log file keeps
 #    the gateway alive across logout. For systemd-managed hosts,
-#    register a unit instead.
+#    register a unit instead. This step and the agent turn are skipped if
+#    the MCP configuration above failed.
+if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 nohup openclaw gateway --dev --port 18789 --bind loopback \
   > ~/.openclaw/gateway.log 2>&1 &
 disown
 
 # 5. Run an agent turn — molecule tools are now available:
 openclaw agent --message "list my peers"
+RUNTIME_INSTALL_STATUS=$?
+if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
+  echo "molecule: OpenClaw agent turn failed; inspect the gateway log before retrying." >&2
+fi
+fi
 
 # Need help?
 #   Documentation: https://doc.moleculesai.app/docs/guides/external-agent-registration
