@@ -37,13 +37,27 @@ two gates. Binding `security-review` to `core-security` makes the security gate 
 for the one-time roster action that makes this diversity *enforced* rather than
 merely *available*.
 
-`core-security` is deliberately **NOT** in the merge-queue `REVIEWER_SET`
-(`{agent-reviewer, agent-researcher, agent-reviewer-cr2}`, see
-`.gitea/scripts/gitea-merge-queue.py`). Its security `APPROVE` clears the
-`security-review` *status gate* but does **not** by itself satisfy the merge
-floor (`required_approvals = 1`). A merge still needs, on top of a clean
-security review, one genuine `REVIEWER_SET` peer approval and a distinct
-non-author merger. **Security review is a gate, not a merge authorization.**
+The `security-review` *status gate* and the merge-queue `REVIEWER_SET` *floor*
+are two separate things. `security-review` is team-keyed to team `security`
+(id 21) and is cleared by a genuine non-author `core-security` approval — that
+is a **gate**, and it stays orthogonal to the QA lens regardless of the peer
+floor below.
+
+Separately, the merge-queue enforces a genuine-peer floor of
+`required_approvals = 1` from accounts in `REVIEWER_SET`. **CTO 2026-07-14:**
+`REVIEWER_SET` is the union of the review, management, and owner teams
+(`code-reviewers`/`qa`/`security`/`managers`/`Owners`) — reviewers, managers,
+and owners may all satisfy it. This *widened* the earlier rule (which excluded
+owner accounts and named only `{agent-reviewer, agent-researcher,
+agent-reviewer-cr2}`): those three accounts were driven by no automation and
+produced **0** genuine approvals across 29 merges, so the floor was
+unsatisfiable and every merge fell through to a manual owner/admin path. Because
+`core-security` is now inside `REVIEWER_SET`, its approval **can** count toward
+the floor — but a merge still needs a distinct non-author merger, and the
+`security-review` gate remains a separate required judgement.
+See `.gitea/scripts/gitea-merge-queue.py` for the roster + the team-keyed
+follow-up (making `REVIEWER_SET` resolve from team membership instead of a login
+list, once the merge-actor token's org:read scope is confirmed).
 
 ---
 

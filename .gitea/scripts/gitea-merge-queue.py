@@ -262,21 +262,41 @@ PUSH_REQUIRED_CONTEXTS_RAW = _env(
 
 # Recognised official-reviewer set. A merge requires this many DISTINCT genuine
 # approvals (not stale/dismissed, on the current head sha) from accounts in
-# this set. The set is the real agents-team reviewer roster; founder/CTO-agent
-# accounts are intentionally excluded so the queue cannot be satisfied by a
-# human/owner approval alone — it must be a genuine peer review.
+# this set.
+#
+# CTO 2026-07-14: the peer roster is the union of the review, management, and
+# owner teams — reviewers, managers, and owners may all satisfy the floor.
+# The prior default {agent-reviewer,agent-researcher,agent-reviewer-cr2} was
+# a login list of three accounts that no automation drives; they produced 0
+# genuine approvals across 29 merges, so the floor was unsatisfiable and EVERY
+# merge fell through to a manual owner/admin path (the queue was dead). This
+# default is the current membership of teams code-reviewers/qa/security/
+# managers/Owners. It is still a LOGIN list (not team-resolved) so the queue
+# needs no org-team read scope to run; the trade-off is that it drifts as team
+# membership changes — tracked as a follow-up to make this team-keyed (SSOT),
+# which requires confirming the merge-actor token's org:read scope first.
 REVIEWER_SET = {
     name.strip()
     for name in _env(
         "REVIEWER_SET",
-        default="agent-reviewer,agent-researcher,agent-reviewer-cr2",
+        default=(
+            "molecule-code-reviewer,core-qa,core-security,"          # reviewers (code-reviewers/qa/security)
+            "core-lead,cp-lead,dev-lead,app-lead,sdk-lead,"          # management
+            "infra-lead,release-manager,pm,agent-pm,"               # management
+            "hongming,cui,hongming-personal,hongming-pc2,"          # owners
+            "claude-ceo-assistant,hongming-ceo-delegated"           # owner/delegate
+        ),
     ).split(",")
     if name.strip()
 }
-# Default mirrors molecule-core branch protection (required_approvals: 2). The
-# authoritative value is read from branch protection at runtime; this is only
-# the fallback when BP does not specify one.
-REQUIRED_APPROVALS_DEFAULT = int(_env("REQUIRED_APPROVALS", default="2") or "2")
+# CTO 2026-07-14: the genuine-peer floor is ONE approval. This matches the
+# documented design in .gitea/security-reviewer.md (`required_approvals = 1`);
+# the previous default of 2 was drift and, combined with the dead REVIEWER_SET
+# above and the actual review practice (<=1 general review per PR, 0/14 recent
+# merges had 2 distinct peer approvals), made the queue unable to merge anything.
+# Branch protection's value still wins when it is a valid int >= this floor
+# (see the fail-closed clamp in branch-protection parsing).
+REQUIRED_APPROVALS_DEFAULT = int(_env("REQUIRED_APPROVALS", default="1") or "1")
 
 # --------------------------------------------------------------------------
 # Runtime-bump auto-merge exemption (RFC internal#131 PR-A, dispatch 9c2e9c88)
