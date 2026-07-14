@@ -69,12 +69,18 @@ name: E2E API Smoke Test
 # 2318) shows Postgres ready in 3s, Redis in 1s, Platform in 1s when
 # they DO come up. Timeouts are not the bottleneck; not bumped.
 #
-# Item #1046 (fixed 2026-05-14): Stale platform-server from cancelled runs
-#   lingers on :8080 after "Stop platform" step is skipped (workflow cancelled
-#   before reaching line 335). Added a pre-start "Kill stale platform-server"
-#   step (line 286) that scans /proc for zombie platform-server processes
-#   and kills them before the port probe or bind. Makes the ephemeral port
-#   probe + start sequence deterministic.
+# Item #1046 (fixed 2026-05-14, SUPERSEDED — see below): Stale platform-server
+#   from cancelled runs lingers on :8080 after the "Stop platform" step is
+#   skipped (workflow cancelled). The fix was a pre-start step that scanned
+#   /proc for platform-server-named processes and killed them.
+#
+#   That fix is now REMOVED. Its premise died when this lane moved to an
+#   ephemeral port (it binds :0; nothing can hold "our" port), and on the shared
+#   `docker-host` runner the sweep was killing CONCURRENT runs' platform-servers
+#   — reddening required contexts on unrelated PRs, which under branch
+#   protection status_check_contexts=['*'] wedges the merge queue. The leak is
+#   now closed at the source instead: the server runs under `timeout`, so a
+#   hard-cancelled run's orphan self-reaps. No cross-run signalling anywhere.
 #
 # Item explicitly NOT fixed here: failing test `Status back online`
 # fails because the platform's langgraph workspace template image
@@ -485,42 +491,49 @@ jobs:
           echo "MOLECULE_CHANNELS_TEST_WEBHOOK_BASE=http://127.0.0.1:${WEBHOOK_PORT}/" >> "$GITHUB_ENV"
           echo "MOLECULE_CHANNELS_TEST_TELEGRAM_API_BASE=http://127.0.0.1:${TELEGRAM_PORT}" >> "$GITHUB_ENV"
           echo "Ports — platform: ${PLATFORM_PORT} (ephemeral), channels mocks: ${WEBHOOK_PORT}/${TELEGRAM_PORT} (reserved band)"
-      - name: Kill stale platform-server before start (issue #1046)
-        if: needs.detect-changes.outputs.api == 'true'
-        run: |
-          # Concurrent runs on the same host-network act_runner can leave a
-          # zombie platform-server from a cancelled/timeout run. Cancelled
-          # runs never reach the "Stop platform" step (line 335), so the
-          # old process lingers. Kill it before the ephemeral port probe
-          # or start so the port is definitively free.
-          #
-          # /proc scan — works on any Linux without pkill/lsof/ss.
-          # comm field is truncated to 15 chars: "platform-serve" matches
-          # "platform-server". Verify with cmdline to avoid false positives.
-          killed=0
-          for pid in $(grep -l "platform-serve" /proc/[0-9]*/comm 2>/dev/null); do
-            kpid="${pid%/comm}"
-            kpid="${kpid##*/}"
-            cmdline=$(cat "/proc/${kpid}/cmdline" 2>/dev/null | tr '\0' ' ')
-            if echo "$cmdline" | grep -q "platform-server"; then
-              echo "Killing stale platform-server pid ${kpid}: ${cmdline}"
-              kill "$kpid" 2>/dev/null || true
-              killed=$((killed + 1))
-            fi
-          done
-          if [ "$killed" -gt 0 ]; then
-            sleep 2
-            echo "Killed $killed stale process(es); port(s) released."
-          else
-            echo "No stale platform-server found."
-          fi
+      # NOTE (issue #1046 / #82 / #83): there used to be a "Kill stale
+      # platform-server before start" step here that scanned /proc and killed
+      # ANY process whose cmdline contained "platform-server" — host-wide, not
+      # run-scoped. It is DELETED, not narrowed, for two independent reasons:
+      #
+      #   1. It protected nothing. #1046's rationale was "kill it before the
+      #      port probe so the port is definitively free" — written when this
+      #      lane hard-coded :8080. The lane now picks an EPHEMERAL port (the
+      #      probe above binds :0 and takes what the kernel gives it), so a
+      #      leftover process cannot hold "our" port. e2e-chat.yml boots a
+      #      platform-server on this same runner with no sweep at all, and is
+      #      green — the sweep is dead weight.
+      #
+      #   2. It was actively destructive. e2e-api, local-provision-e2e,
+      #      e2e-peer-visibility and e2e-chat all run on the shared `docker-host`
+      #      runner and demonstrably run CONCURRENTLY across different PRs. A
+      #      host-wide sweep therefore reaches into another PR's live run and
+      #      kills ITS platform-server mid-test, reddening a required context on
+      #      an unrelated PR. Under branch protection status_check_contexts=['*']
+      #      that wedges the merge queue. This is the repo's non-hermetic
+      #      shared-runner mode, and the sweep WAS the mechanism.
+      #
+      # The leak it was compensating for (a hard-cancelled run whose `always()`
+      # stop step never ran) is now closed at the SOURCE, per-run, with zero
+      # reach outside this job: the server is started under `timeout` (below),
+      # so an orphan self-reaps. No job may ever again signal a process it did
+      # not itself start — see .gitea/scripts/tests/test_no_host_wide_process_sweep.py.
       - name: Start platform (background)
         if: needs.detect-changes.outputs.api == 'true'
         working-directory: workspace-server
         run: |
           # DATABASE_URL + REDIS_URL exported by the start-postgres /
           # start-redis steps point at this run's per-run host ports.
-          ./platform-server > platform.log 2>&1 &
+          #
+          # `timeout` bound == this job's own timeout-minutes (15). It can never
+          # fire during a healthy run: the clock starts here, AFTER checkout,
+          # docker boot and `go build`, so the job is already dead by the time it
+          # elapses. Its only job is to reap the server if the runner hard-kills
+          # this job before the `always()` "Stop platform" step runs. Signals
+          # only OUR child, never a foreign run's process. `timeout` forwards
+          # TERM to the child and exits with its status, so the /health wait's
+          # `kill -0` early-exit detection below is unchanged.
+          timeout --signal=TERM --kill-after=30s 15m ./platform-server > platform.log 2>&1 &
           echo $! > platform.pid
       - name: Wait for /health (with migration completion gate)
         # Issue #2205: 30 one-second probes is insufficient when the migration
