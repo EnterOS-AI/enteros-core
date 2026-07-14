@@ -610,6 +610,10 @@ jobs:
           # slug and aborted boot-to-registration BEFORE provisioning) goes red
           # here on every PR instead of burning a live boot-cell run.
           bash tests/e2e/test_collision_proof_slug_unit.sh
+          # core#4370: bounded idle-digest evidence polling and fail-closed
+          # Docker preflight. Offline: proves missing Docker or an unreachable
+          # daemon cannot silently skip E2E_IDLE_DIGEST_CHECK=on.
+          bash tests/e2e/test_idle_digest_wait_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Drift guard — KI-013 container/volume naming (SEV #2499)
