@@ -183,8 +183,8 @@ try:
     from molecule_runtime import a2a_response
 except ModuleNotFoundError as exc:
     raise SystemExit(
-        'molecule-ai-workspace-runtime is required for poll-mode parser '
-        'coverage; install it from the Gitea package registry before running '
+        'molecules-workspace-runtime is required for poll-mode parser '
+        'coverage; run scripts/install-workspace-runtime.sh before running '
         'this E2E'
     ) from exc
 data = json.loads(r'''$A2A_RESP''')

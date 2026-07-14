@@ -379,18 +379,12 @@ jobs:
         # surface to keep CI install fast (~3s) vs the full
         # workspace/requirements.txt (~30s).
         if: needs.detect-changes.outputs.run == 'true'
-        # molecule-ai-workspace-runtime lives ONLY on the Gitea package
-        # registry (it was removed from public PyPI to close the
-        # dependency-confusion shadow), so pip needs the Gitea index as an
-        # EXTRA index. A plain `pip install -r` reaches public PyPI only and
-        # fails "No matching distribution found for
-        # molecule-ai-workspace-runtime>=0.1.78 (from versions: none)" —
-        # which reds this gate on every PR + push. httpx still resolves from
-        # PyPI. Mirrors e2e-api.yml's "Install standalone runtime parser from
-        # Gitea registry" step (proven-green).
+        # The canonical molecules-workspace-runtime wheel is private while its
+        # dependencies are public. Install it through the split-index helper;
+        # never expose the private package name to --extra-index-url.
         run: |
-          pip install \
-            --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+          bash scripts/install-workspace-runtime.sh
+          python3 -m pip install --index-url https://pypi.org/simple/ \
             -r tests/harness/requirements.txt
 
       - name: Start disposable dind (per-job isolation — task #78)
