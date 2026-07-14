@@ -2358,7 +2358,15 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate: POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
   # The handler runs the claim→stop→'hibernated' sequence; poll the DB row to
   # confirm it landed on 'hibernated' (not stuck mid-'hibernating').
-  wait_status "hibernated" 120 "hibernate" || fail "Hibernate: workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) — Hibernate handler / CP stop regression (workspace_restart.go HibernateWorkspace)."
+  #
+  # Do NOT trust the 200 above on its own. This is the step that caught core#4292:
+  # ?force=true skipped the handler's active-tasks 409 but never reached the atomic
+  # claim's `active_tasks = 0` predicate, so the claim matched no row, nothing was
+  # stopped, and the handler still answered 200 {"status":"hibernated"} — satisfying
+  # the HIB_STATUS assertion above while the workspace stayed online and billing.
+  # The DB row is the only witness that cannot be talked out of the truth. Keep this
+  # assertion even if the response check looks redundant: it is not.
+  wait_status "hibernated" 120 "hibernate" || fail "Hibernate: workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) even though POST /hibernate?force=true answered '$HIB_STATUS'. The API claimed success and the row disagrees — suspect a no-op hibernate (atomic claim matched no row) before suspecting the container stop."
   ok "    hibernate → hibernated (DB-verified)"
 
   # ── resume-from-hibernate via auto-wake on next A2A ──

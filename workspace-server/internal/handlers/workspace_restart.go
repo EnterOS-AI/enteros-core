@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -527,6 +528,11 @@ func (h *WorkspaceHandler) restartRuntimeFromConfig(ctx context.Context, id, wsN
 	return dbRuntime
 }
 
+// errHibernateNotClaimed reports that the atomic claim matched no row: the
+// workspace left online/degraded before the claim landed, or (without ?force=true)
+// it had tasks in flight. Nothing was stopped and nothing was written.
+var errHibernateNotClaimed = errors.New("workspace not claimable for hibernation")
+
 // Hibernate handles POST /workspaces/:id/hibernate
 // Manually puts a running workspace into hibernation — useful for immediate
 // cost savings without waiting for the idle timer. The workspace auto-wakes
@@ -552,7 +558,8 @@ func (h *WorkspaceHandler) Hibernate(c *gin.Context) {
 	// #822: reject hibernation when active tasks are in flight unless caller
 	// passes ?force=true. Prevents operator from accidentally killing a
 	// mid-task agent.
-	if activeTasks > 0 && c.Query("force") != "true" {
+	force := c.Query("force") == "true"
+	if activeTasks > 0 && !force {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":        "workspace has active tasks; use ?force=true to terminate them",
 			"active_tasks": activeTasks,
@@ -563,7 +570,30 @@ func (h *WorkspaceHandler) Hibernate(c *gin.Context) {
 		log.Printf("[WARN] force-hibernating workspace %s (%s) with %d active tasks", id, wsName, activeTasks)
 	}
 
-	h.HibernateWorkspace(ctx, id)
+	// Report what actually happened. Pre-fix this called HibernateWorkspace (which
+	// returns nothing) and then answered 200 {"status":"hibernated"} unconditionally
+	// — so every no-op arm of the atomic claim (active tasks under ?force=true, or a
+	// concurrent pause/restart/hibernate that moved the row out of online/degraded)
+	// reported success while the container kept running and billing.
+	if err := h.hibernateWorkspace(ctx, id, force); err != nil {
+		// Only errHibernateNotClaimed means "nothing happened". Every other error
+		// is a genuine failure, and at least one of them (a Step 3 UPDATE error)
+		// fires AFTER the container has already been stopped — reporting that as a
+		// 409 "it left the online state before the claim landed" would be a fresh
+		// lie in the opposite direction, and would misdirect whoever debugs it next.
+		if !errors.Is(err, errHibernateNotClaimed) {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":        "hibernation failed partway — the workspace may be stopped with its row left mid-transition; re-check its status before retrying",
+				"workspace_id": id,
+			})
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{
+			"error":        "workspace could not be hibernated — it was no longer online/degraded-and-idle when the claim landed (a concurrent pause, restart, or hibernation, or a heartbeat that raised active_tasks since the eligibility check)",
+			"workspace_id": id,
+		})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"status": "hibernated"})
 }
 
@@ -587,29 +617,57 @@ func (h *WorkspaceHandler) Hibernate(c *gin.Context) {
 //
 //  3. Final UPDATE to 'hibernated': records the completed hibernation.
 func (h *WorkspaceHandler) HibernateWorkspace(ctx context.Context, workspaceID string) {
+	// Idle-timer entry point (registry.HibernateHandler). Never forces: the monitor
+	// only ever selects rows that are already active_tasks == 0.
+	_ = h.hibernateWorkspace(ctx, workspaceID, false)
+}
+
+// hibernateWorkspace is HibernateWorkspace with an explicit force flag and a real
+// error return.
+//
+// force=true drops the `active_tasks = 0` predicate from the atomic claim. Without
+// that, ?force=true was a lie: the HTTP handler skipped its own 409 and called in,
+// but the claim below still demanded active_tasks = 0, matched no row, and returned
+// silently — leaving the workspace online and running while the API answered 200
+// {"status":"hibernated"}. Caught live on staging (e2e 10b, run 494525): hibernate
+// on a just-resumed workspace whose boot turn was still in flight sat at
+// status=online for 120s with no error anywhere.
+//
+// errHibernateNotClaimed lets the caller answer truthfully instead of guessing.
+func (h *WorkspaceHandler) hibernateWorkspace(ctx context.Context, workspaceID string, force bool) error {
 	// ── Step 1: Atomic claim ──────────────────────────────────────────────────
 	// The UPDATE acts as a DB-level advisory lock: only one concurrent caller
 	// can transition the row from online/degraded → hibernating.  The
-	// active_tasks = 0 predicate ensures we never interrupt a running task.
-	result, err := db.DB.ExecContext(ctx, `
+	// active_tasks = 0 predicate ensures we never interrupt a running task —
+	// which is exactly what an explicit ?force=true asks us to do, so force
+	// drops it (the container stop in Step 2 is what "terminates them" means).
+	claim := `
 		UPDATE workspaces
 		SET    status = $2, updated_at = now()
 		WHERE  id = $1
 		  AND  status IN ('online', 'degraded')
-		  AND  active_tasks = 0`, workspaceID, models.StatusHibernating)
+		  AND  active_tasks = 0`
+	if force {
+		claim = `
+		UPDATE workspaces
+		SET    status = $2, updated_at = now()
+		WHERE  id = $1
+		  AND  status IN ('online', 'degraded')`
+	}
+	result, err := db.DB.ExecContext(ctx, claim, workspaceID, models.StatusHibernating)
 	if err != nil {
 		log.Printf("Hibernate: atomic claim failed for %s: %v", workspaceID, err)
-		return
+		return err
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		log.Printf("Hibernate: RowsAffected error for %s: %v", workspaceID, err)
-		return
+		return err
 	}
 	if rowsAffected == 0 {
-		// Either already hibernating/hibernated/paused/removed, or active_tasks > 0 —
-		// safe to abort without side-effects.
-		return
+		// Either already hibernating/hibernated/paused/removed, or (non-force)
+		// active_tasks > 0 — safe to abort without side-effects.
+		return errHibernateNotClaimed
 	}
 
 	// Fetch name/tier for logging and event broadcast (after the claim, so we
@@ -645,11 +703,17 @@ func (h *WorkspaceHandler) HibernateWorkspace(ctx context.Context, workspaceID s
 	}
 
 	// ── Step 3: Mark fully hibernated ─────────────────────────────────────────
+	// active_tasks is zeroed here, not just on the force path: Step 2 stopped the
+	// container, so whatever it was running is gone. Leaving a force-hibernated row
+	// at active_tasks > 0 would strand it — the idle monitor only ever selects
+	// active_tasks = 0, so the workspace could never be auto-hibernated again after
+	// its next wake, silently forfeiting the cost saving hibernation exists for. On
+	// the non-force path the claim already proved active_tasks = 0, so this is a no-op.
 	if _, err = db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`,
+		`UPDATE workspaces SET status = $1, url = '', active_tasks = 0, updated_at = now() WHERE id = $2`,
 		models.StatusHibernated, workspaceID); err != nil {
 		log.Printf("Hibernate: failed to mark hibernated for %s: %v", workspaceID, err)
-		return
+		return err
 	}
 
 	db.ClearWorkspaceKeys(ctx, workspaceID)
@@ -658,6 +722,7 @@ func (h *WorkspaceHandler) HibernateWorkspace(ctx context.Context, workspaceID s
 		"tier": tier,
 	})
 	log.Printf("Hibernate: workspace %s (%s) is now hibernated", wsName, workspaceID)
+	return nil
 }
 
 // WakeWorkspace re-provisions a HIBERNATED workspace on the auto-wake-on-A2A

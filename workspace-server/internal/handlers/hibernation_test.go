@@ -15,10 +15,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
@@ -473,5 +475,204 @@ func TestHibernateHandler_DBError_Returns500(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ?force=true must actually force (staging e2e 10b, run 494525)
+//
+// The bug: the HTTP handler skipped its own 409 when ?force=true, logged
+// "force-hibernating ... with N active tasks", then called HibernateWorkspace —
+// whose atomic claim still demanded `active_tasks = 0`. The claim matched no row,
+// HibernateWorkspace returned silently (it returned nothing at all), and the
+// handler answered 200 {"status":"hibernated"} regardless. The workspace stayed
+// online and kept running, and the API said it hadn't.
+//
+// Why the pre-existing unit test (TestHibernateHandler_ActiveTasks_ForceTrue_Returns200)
+// stayed green through all of it: sqlmock does not evaluate a WHERE clause. It
+// returned rowsAffected=1 for the claim no matter what the predicate said, so the
+// test mocked away the exact thing that was broken. The only property sqlmock CAN
+// observe here is the claim's SQL text — so that is what these tests assert on.
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestHibernateWorkspace_Force_ClaimDropsActiveTasksPredicate pins the fix: with
+// force=true the atomic claim must NOT carry `AND active_tasks = 0`. The regex is
+// anchored at the end of the (whitespace-stripped) query, so the pre-fix claim —
+// which always appended `AND active_tasks = 0` — fails to match and the test fails.
+func TestHibernateWorkspace_Force_ClaimDropsActiveTasksPredicate(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	handler.stopFnOverride = func(_ context.Context, _ string) {}
+
+	wsID := "ws-force-claim"
+
+	// Anchored: the claim must END at the status predicate. No active_tasks gate.
+	mock.ExpectExec(`WHERE id = \$1 AND status IN \('online', 'degraded'\)$`).
+		WithArgs(wsID, models.StatusHibernating).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT name, tier FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier"}).AddRow("Forced", 1))
+	mock.ExpectExec(`UPDATE workspaces SET status =`).
+		WithArgs(models.StatusHibernated, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO structure_events`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := handler.hibernateWorkspace(context.Background(), wsID, true); err != nil {
+		t.Fatalf("force hibernate returned error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// TestHibernateWorkspace_NonForce_ClaimKeepsActiveTasksPredicate is the other half
+// of the guard: force=false must STILL refuse to interrupt a running task. Without
+// this, "make force work" could be mis-fixed by dropping the predicate outright and
+// every idle-timer hibernation would start killing live agents mid-task (#822).
+func TestHibernateWorkspace_NonForce_ClaimKeepsActiveTasksPredicate(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	var stopCalls int32
+	handler.stopFnOverride = func(_ context.Context, _ string) { atomic.AddInt32(&stopCalls, 1) }
+
+	wsID := "ws-noforce-claim"
+
+	mock.ExpectExec(`AND status IN \('online', 'degraded'\) AND active_tasks = 0$`).
+		WithArgs(wsID, models.StatusHibernating).
+		WillReturnResult(sqlmock.NewResult(0, 0)) // busy workspace: claim matches nothing
+
+	err := handler.hibernateWorkspace(context.Background(), wsID, false)
+	if !errors.Is(err, errHibernateNotClaimed) {
+		t.Fatalf("want errHibernateNotClaimed for an unclaimable workspace, got %v", err)
+	}
+	if got := atomic.LoadInt32(&stopCalls); got != 0 {
+		t.Errorf("stop called %d times; want 0 — a non-forced hibernate must never interrupt a running task", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// TestHibernateWorkspace_ZeroesActiveTasks pins the second-order leak: Step 2 stops
+// the container, so a force-hibernated row must not keep a stale active_tasks > 0.
+// If it did, the idle monitor (which only ever selects active_tasks = 0) could never
+// auto-hibernate that workspace again after its next wake — silently forfeiting the
+// cost saving hibernation exists for.
+func TestHibernateWorkspace_ZeroesActiveTasks(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	handler.stopFnOverride = func(_ context.Context, _ string) {}
+
+	wsID := "ws-zero-active"
+
+	mock.ExpectExec(`UPDATE workspaces`).
+		WithArgs(wsID, models.StatusHibernating).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT name, tier FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier"}).AddRow("Zeroed", 1))
+	// The mark-hibernated UPDATE must clear active_tasks.
+	mock.ExpectExec(`SET status = \$1, url = '', active_tasks = 0`).
+		WithArgs(models.StatusHibernated, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO structure_events`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := handler.hibernateWorkspace(context.Background(), wsID, true); err != nil {
+		t.Fatalf("force hibernate returned error: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// TestHibernateHandler_ClaimNoOp_Returns409_NotFalse200 pins the lie itself. When the
+// claim lands on no row (the workspace left online/degraded under us — a concurrent
+// pause, restart, or hibernation), the handler must say so. Pre-fix it answered
+// 200 {"status":"hibernated"} on this exact path, so a caller — human or e2e — was
+// told a workspace had been hibernated while it was still online and still billing.
+func TestHibernateHandler_ClaimNoOp_Returns409_NotFalse200(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	var stopCalls int32
+	handler.stopFnOverride = func(_ context.Context, _ string) { atomic.AddInt32(&stopCalls, 1) }
+
+	wsID := "ws-claim-noop"
+
+	mock.ExpectQuery(`SELECT name, tier, active_tasks FROM workspaces WHERE id = .* AND status IN`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "active_tasks"}).AddRow("Racy", 1, 0))
+	// Between the eligibility SELECT and the claim, someone paused the workspace.
+	mock.ExpectExec(`UPDATE workspaces`).
+		WithArgs(wsID, models.StatusHibernating).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	w := hibernateRequest(t, handler, wsID)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("want 409 when the claim matched no row, got %d: %s — a no-op hibernation must never report success", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"status":"hibernated"`) {
+		t.Errorf("body claims the workspace is hibernated when nothing was stopped: %s", w.Body.String())
+	}
+	if got := atomic.LoadInt32(&stopCalls); got != 0 {
+		t.Errorf("stop called %d times; want 0", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// TestHibernateHandler_StopThenDBError_Returns500_NotFalse409 pins the other
+// direction of the same lie. If Step 3's mark-hibernated UPDATE fails, Step 2 has
+// ALREADY stopped the container — the workspace really is down, with its row wedged
+// mid-transition at 'hibernating'. Collapsing that into the 409 ("it left the
+// online state before the claim landed — nothing happened") would assert the exact
+// opposite of the truth and misdirect whoever debugs it next. Only
+// errHibernateNotClaimed may become a 409; everything else is a 500.
+func TestHibernateHandler_StopThenDBError_Returns500_NotFalse409(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	handler := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+
+	var stopCalls int32
+	handler.stopFnOverride = func(_ context.Context, _ string) { atomic.AddInt32(&stopCalls, 1) }
+
+	wsID := "ws-step3-dberr"
+
+	mock.ExpectQuery(`SELECT name, tier, active_tasks FROM workspaces WHERE id = .* AND status IN`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier", "active_tasks"}).AddRow("Wedged", 1, 0))
+	mock.ExpectExec(`UPDATE workspaces`). // claim succeeds
+						WithArgs(wsID, models.StatusHibernating).
+						WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT name, tier FROM workspaces WHERE id`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "tier"}).AddRow("Wedged", 1))
+	// Step 3 blows up — but the container is already stopped by now.
+	mock.ExpectExec(`SET status = \$1, url = '', active_tasks = 0`).
+		WithArgs(models.StatusHibernated, wsID).
+		WillReturnError(fmt.Errorf("connection reset by peer"))
+
+	w := hibernateRequest(t, handler, wsID)
+
+	if got := atomic.LoadInt32(&stopCalls); got != 1 {
+		t.Fatalf("stop called %d times; want 1 — this test is only meaningful if the container was actually stopped", got)
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500 after a post-stop failure, got %d: %s — a stopped workspace must never be reported as 'nothing happened'", w.Code, w.Body.String())
 	}
 }
