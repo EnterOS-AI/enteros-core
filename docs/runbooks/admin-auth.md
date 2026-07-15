@@ -1,18 +1,29 @@
 # Admin Authentication Runbook
 
-## Auth is fail-CLOSED in every environment — `ADMIN_TOKEN` is the bootstrap credential
+## Strict admin/workspace auth is fail-CLOSED — `ADMIN_TOKEN` is the bootstrap credential
 
-Per the CTO "nothing should be fail-open" directive, **every** auth path on the
-workspace-server fails closed — there is no dev-mode / zero-token / DB-outage
-hatch that grants access. This includes:
+Per the CTO "nothing should be fail-open" directive, the strict middleware
+surfaces have no dev-mode / zero-token / DB-outage hatch that grants access.
+This includes:
 
 - `AdminAuth` and `WorkspaceAuth` (admin + per-workspace routes),
-- `CanvasOrBearer` (the cosmetic `PUT /canvas/viewport` route), and
-- `validateDiscoveryCaller` (`/registry/:id/peers`, `/registry/discover/:id`).
+- the public A2A send/queue classifier (apart from its explicitly gated
+  combined self-host/dev same-origin Canvas path).
 
-Consequence for **bootstrap**: a brand-new self-hosted / dev install has **no
-DB-backed tokens yet**, and there is no longer a fail-open that lets the first
-request through. The **only** way to reach admin routes (and to mint the first
+`CanvasOrBearer` is not a security boundary: on the combined tenant proxy it
+accepts a forgeable same-origin header heuristic and is therefore restricted to
+the cosmetic `PUT /canvas/viewport` route.
+
+`validateDiscoveryCaller` is different: workspaces with no live token remain
+legacy/bootstrap-compatible, while token-enrolled callers must authenticate
+and datastore errors fail closed with `503`. Registry heartbeat and card update
+have their own documented transition behavior, including an availability-first
+datastore-error branch. Do not copy either compatibility exception onto a new
+route.
+
+Consequence for **admin bootstrap**: a brand-new self-hosted / dev install has
+no DB-backed tokens yet, and there is no zero-token pass through admin
+middleware. The **only** way to reach admin routes (and to mint the first
 workspace token via `POST /admin/workspaces/:id/tokens`) is to set `ADMIN_TOKEN`
 in the platform environment and present it as the bearer. This is the "local
 mimics production" principle: there is no zero-config bootstrap.

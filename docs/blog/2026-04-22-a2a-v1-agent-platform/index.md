@@ -27,7 +27,7 @@ Here's the core difference that matters for enterprise buyers.
 
 Most platforms: A2A as an integration layer on top of existing architecture. The agent registry, routing, and auth live above the protocol. A2A messages are translated, proxied, and sometimes transformed as they pass through. Governance is a policy on top of the integration, not a property of the protocol.
 
-Molecule AI: A2A as the operating system, everything else built on top. The agent hierarchy *is* the routing table. The org structure *is* the communication topology. Per-workspace bearer tokens and `X-Workspace-ID` enforcement are protocol-level requirements on every authenticated call — not conventions that a misconfigured integration can bypass.
+Molecule AI: A2A as the operating system, everything else built on top. The agent hierarchy *is* the routing table. The org structure *is* the communication topology. Per-workspace bearer authentication and source-bound `X-Workspace-ID` validation are enforced by the platform — not conventions that a misconfigured integration can bypass. On A2A, the bearer owner is authoritative and an optional workspace claim must match it.
 
 When governance is protocol-native, it doesn't disappear the moment an agent runs outside your Docker network. It doesn't depend on whether your integration layer correctly applied the right headers. It's enforced at the transport layer, every call, always.
 
@@ -38,8 +38,13 @@ Molecule AI's A2A implementation isn't a feature — it's the foundation. Here's
 **1. The A2A proxy is live in production.**
 Every workspace-to-workspace message is routed through the A2A proxy, which enforces auth tokens and workspace scoping on every call. This isn't a roadmap item. It shipped in Phase 30 and has been operational since GA.
 
-**2. Per-workspace 256-bit bearer tokens enforced at every authenticated route.**
-The platform stores only the SHA-256 hash of each token. Every request to any authenticated endpoint requires both the token and a matching `X-Workspace-ID` header — enforced as protocol, not as policy. Tokens are revocable with immediate effect on the next request. This model works for agents running in the same data center and agents running on a different cloud provider.
+**2. Source-bound per-workspace 256-bit bearer authentication.**
+The platform stores only the SHA-256 hash of each token. Workspace-authenticated
+routes validate the bearer according to their endpoint contract. For A2A send
+and queue status, the platform derives the caller from that bearer;
+`X-Workspace-ID` is optional and is rejected if it does not match. Tokens are
+revocable with immediate effect on the next request. This model works for agents
+running in the same data center and agents running on a different cloud provider.
 
 **3. Any A2A-compatible agent joins without code changes.**
 External agents — agents running on-premises, on a different cloud, or behind a NAT — register via a standard A2A call and participate in the fleet canvas with full feature parity. They receive a remote badge but have access to all canvas features: real-time status, task assignment, inter-agent chat, and audit trail. The registration flow requires no changes to the agent's existing code.
@@ -124,13 +129,13 @@ Before A2A as a native capability, hybrid cloud agent deployments required per-c
 With protocol-native A2A, you get:
 
 - **One canvas, any infrastructure.** Agents running on AWS, GCP, on-premises, and in the platform's Docker network appear on the same fleet canvas, with the same monitoring, task assignment, and inter-agent communication.
-- **Governance that travels.** Per-workspace auth tokens and `X-Workspace-ID` enforcement apply regardless of where the agent runs. A compliance team reviewing access patterns sees the same data for a cloud agent and an on-premises agent.
+- **Governance that travels.** Per-workspace auth and source binding apply regardless of where the agent runs. On A2A calls, the server derives identity from the bearer and validates any optional `X-Workspace-ID` claim. A compliance team reviewing access patterns sees the same data for a cloud agent and an on-premises agent.
 - **Audit trail that survives.** Immutable `structure_events` records provisioning, hierarchy changes, and health state transitions for every agent, including external agents, in an append-only log.
 - **Org-scoped keys with delegation attribution.** Each integration has a named, revocable API key. Every A2A delegation made with that key carries the `org:keyId` prefix in the audit log — giving you a complete chain of custody back to the system or human that initiated it.
 - **CloudTrail-compatible architecture.** The same AWS IAM-based authentication used by EC2 Instance Connect Endpoint extends to the delegation API. For teams already running Molecule AI on AWS, A2A audit entries integrate with your existing CloudTrail logging without additional instrumentation.
 
 ## Ready to Register an External Agent?
 
-Molecule AI's external agent registration is production-ready. Documentation is live at [External Agent Registration Guide](https://docs.molecule.ai/docs/guides/external-agent-registration). The npm package for the MCP server is available at [`@molecule-ai/mcp-server`](https://www.npmjs.com/package/@molecule-ai/mcp-server).
+Molecule AI's external agent registration is production-ready. Documentation is live at the [External Agent Registration Guide](/docs/guides/external-agent-registration). The npm package for the MCP server is available at [`@molecule-ai/mcp-server`](https://www.npmjs.com/package/@molecule-ai/mcp-server).
 
-Read the full [A2A v1.0 protocol spec](https://git.moleculesai.app/molecule-ai/molecule-core/src/branch/main/docs/api-protocol/a2a-protocol.md) on GitHub.
+Read the full [A2A v1.0 protocol spec](https://git.moleculesai.app/molecule-ai/molecule-core/src/branch/main/docs/api-protocol/a2a-protocol.md) in Gitea.
