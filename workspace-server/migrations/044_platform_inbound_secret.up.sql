@@ -33,11 +33,12 @@
 -- every call (defeating the purpose) or a separate plaintext store
 -- (defeating the simplicity).
 --
--- Encryption at rest: this column relies on Postgres-volume / disk
--- encryption (Railway-managed, AES-256). Application-layer encryption
--- via the existing SECRETS_ENCRYPTION_KEY pathway (workspace_secrets) is
--- a defense-in-depth follow-up — tracked separately so this migration
--- stays additive.
+-- Historical deployment note (when this migration landed): this column relied
+-- on Railway-managed Postgres-volume / disk encryption (AES-256).
+-- Railway is retired and this immutable migration is not current operating
+-- guidance. Application-layer encryption via the existing
+-- SECRETS_ENCRYPTION_KEY pathway (workspace_secrets) was recorded as a
+-- defense-in-depth follow-up so the schema change itself stayed additive.
 --
 -- Workspace-side delivery: the plaintext is written into
 -- /configs/.platform_inbound_secret at provision time alongside the

@@ -3,56 +3,39 @@ name: E2E Ephemeral CP Happy Path
 # RFC "one pre-merge ephemeral gate" §04 — the one-scenario PROOF (GATING).
 #
 # Runs the CORE happy-path (test_staging_full_saas.sh) against a THROWAWAY CP it
-# spins up itself, with THIS PR's tenant image substituted in and the RELEASED
-# controlplane as the baseline — NO shared staging, NO post-merge dependency.
-# This validates the SDK-owned-happy-path model (the happy-path E2E is a
-# cross-boundary contract both repos run against an ephemeral CP).
+# spins up itself, with THIS PR's tenant image substituted in and a PINNED
+# controlplane commit as the baseline — NO shared staging, NO post-merge
+# dependency. This validates the intended cross-boundary happy-path contract;
+# moving that contract into the SDK so both repos consume one implementation is
+# still tracked separately (task #74).
 #
 # GATING as of 2026-07-13: `continue-on-error` is gone — a red happy path BLOCKS
 # (branch protection on main is status_check_contexts=['*'], so every POSTED
 # context must be success). It also ALWAYS fires (no paths filter).
 #
-# PROMOTED (but NOT YET LIVE) as of 2026-07-14. Read this carefully before you
-# rely on it — the honest state is narrower than it looks.
-#
-# The context is now ABOVE the first `# pending-` marker in
-# .gitea/required-contexts.txt, which is where gitea-merge-queue.py's
-# `enforced_file_contexts` check (step 4b) reads its list. The INTENT is the
-# second of two different guarantees:
+# PRESENCE-REQUIRED as of #4363/#4381 (2026-07-14). Two independent checks
+# protect different failure modes:
 #
 #   BP ['*']            → a posted RED blocks.       Blind to a context that never posts.
-#   required-contexts   → a MISSING context blocks.  The half we do not have.
+#   required-contexts   → a MISSING context blocks.  Enforced by the merge queue.
 #
-# "Never posts" is reachable — narrow the `on:` filter, disable the workflow,
-# rename the job, or have the run cancelled while still queued — and BP sees a
-# clean board and merges with the gate silently absent.
+# The queue now evaluates branch-protection globs with Gitea semantics and
+# fails closed when a glob matches no posted contexts, so its subsequent
+# `.gitea/required-contexts.txt` check is reachable. This context sits above the
+# first `# pending-` marker there; narrowing `on:`, disabling/renaming the job,
+# or otherwise failing to post the context therefore holds the merge.
 #
-# BUT step 4b IS CURRENTLY UNREACHABLE (#4363). Step 4 runs first and checks
-# branch protection's own context list, and BP on main is `['*']`. The queue
-# treats '*' as a LITERAL context name, looks it up among the posted statuses,
-# does not find it, and returns `wait` — on every PR, even a fully green one:
-#
-#   required_contexts_green(all_green_statuses, ['*']) -> (False, ['*=missing'])
-#
-# There is no wildcard expansion anywhere in gitea-merge-queue.py. So the file's
-# enforcement is inert for ALL of its entries, not just this one, and every merge
-# on main is in fact performed by a human, not the queue actor.
-#
-# The promotion is therefore CORRECT AND NECESSARY BUT NOT YET OPERATIVE: it is
-# the right line in the right place, and it starts working the moment #4363 lands.
-# What actually protects this gate TODAY is BP ['*'] on a posted red, plus the
-# fail-closed arms and the runtime sentinel below. Do not cite this block as
-# proof that a missing context blocks a merge. It does not. Yet.
-#
-# NOT-yet-true, so do not read comfort into the above: this gate is still
-# NONDETERMINISTIC (task #99 — it has gone red on main since the flip, e.g.
+# Presence enforcement does not make the scenario deterministic. Task #99
+# tracks known flakiness (it has gone red on main since the flip, e.g.
 # 5593d7a43). Enforcement is deliberate anyway: a flaky red already blocked via
 # BP ['*'], so promotion adds no new exposure — it only closes the silent hole.
 # Fix the flake in #99; do not park the context to hide it.
 #
 # What remains of the migration end-state: move the contract into the SDK
 # (task #74), wire both repos, then demote the post-merge E2E Staging jobs
-# (task #86 — gated on #92/#93, NOT done).
+# (task #86). Task #92's busy force-hibernate proof is still open: step 10b
+# currently proves force-hibernate only after the leaf is idle, so the demotion
+# is therefore NOT done.
 #
 # Reuses the CP repo's ephemeral spin-up plumbing (scripts/deploy/pr-ephemeral-cp.sh),
 # the shared harness the RFC generalizes.
@@ -110,11 +93,11 @@ concurrency:
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
   # The controlplane BASELINE in the image-substitution matrix — a core PR tests
-  # its tenant against a stable CP. Built locally from the cloned CP main (below)
-  # using Dockerfile.dockerprov: the local-docker provisioner shells out to the
-  # `docker` CLI, which the distroless/static ROOT Dockerfile lacks. main == the
-  # released baseline, and building is self-contained (no dependency on a published
-  # tag — there is no controlplane:staging-latest).
+  # its tenant against a stable CP. Built locally from the pinned CP checkout
+  # below using Dockerfile.dockerprov: the local-docker provisioner shells out to the
+  # `docker` CLI, which the distroless/static ROOT Dockerfile lacks. The exact
+  # reviewed ref below is the baseline, and building is self-contained (no
+  # dependency on a published tag — there is no controlplane:staging-latest).
   CP_BASELINE_IMAGE: controlplane:baseline-dockerprov
 
   # The controlplane tree the baseline image is built FROM, PINNED (task #116).
@@ -128,7 +111,7 @@ env:
   # TO BUMP: `git ls-remote https://git.moleculesai.app/molecule-ai/molecule-controlplane.git refs/heads/main`
   # and paste the SHA here, in its own PR, so the CP change is reviewed as what it
   # is — a change to what gates core.
-  CP_EPHEMERAL_REF: bcb3d8859952a01e7d55b3a44e0b4d8c65ad7fac
+  CP_EPHEMERAL_REF: f6457ba5e2ef958b3815860fb728d14d488d77c8
 
 jobs:
   # Emits no context listed in required-contexts.txt — but it DOES post
@@ -208,8 +191,8 @@ jobs:
       # `docker rm -fv`, even on cancel. This is the structural fix for the
       # shared docker-host interference that killed the gate's first CI runs
       # (host-loopback docker-proxy dying mid-run with every container healthy;
-      # mc#4081) AND for cross-run tenant leaks (pr-ephemeral-cp.sh `down` only
-      # sweeps the leg network — per-org-net tenants leaked). dind.sh exports
+      # mc#4081) AND for cross-run tenant leaks (an early `down` implementation
+      # swept only the leg network, so per-org-net tenants leaked). dind.sh exports
       # DOCKER_HOST (all subsequent docker/build steps target the dind) and
       # BASE = the dind's pre-forwarded :8080, which becomes the caller-visible
       # CP URL (the runner passes it via CP_HOST_BASE_OVERRIDE, CP#1549).
@@ -333,12 +316,12 @@ jobs:
             .
           echo "TENANT_IMAGE=molecule-tenant:pr-${HEAD_SHA:0:8}" >> "$GITHUB_ENV"
 
-      # Build the CP baseline (the OTHER side of the substitution) from the cloned
-      # CP main using Dockerfile.dockerprov — the multi-stage image that ships the
+      # Build the CP baseline (the OTHER side of the substitution) from the pinned
+      # CP checkout using Dockerfile.dockerprov — the multi-stage image that ships the
       # `docker` CLI the local-docker tenant provisioner shells out to. The root
       # Dockerfile is distroless/static with NO docker CLI, so a CP built from it
-      # cannot provision tenants. main == the released baseline; self-contained (no
-      # published :staging-latest tag to depend on).
+      # cannot provision tenants. The reviewed CP_EPHEMERAL_REF is the baseline;
+      # this is self-contained (no published :staging-latest tag to depend on).
       - name: Build baseline controlplane image (Dockerfile.dockerprov)
         if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
         run: |
@@ -347,7 +330,7 @@ jobs:
             -f .cp-ephemeral/Dockerfile.dockerprov \
             -t "${CP_BASELINE_IMAGE}" \
             .cp-ephemeral
-          echo "built ${CP_BASELINE_IMAGE} from cloned CP main (Dockerfile.dockerprov)"
+          echo "built ${CP_BASELINE_IMAGE} from pinned CP ${CP_EPHEMERAL_REF} (Dockerfile.dockerprov)"
 
       # The proof: full-saas against the throwaway CP, zero staging creds.
       - name: Run core happy-path against an ephemeral CP

@@ -3,20 +3,24 @@
 #
 # Runs the CORE happy-path scenario (test_staging_full_saas.sh) against a
 # THROWAWAY control-plane it spins up itself — NOT shared staging. This is the
-# one-scenario proof of the SDK-owned happy-path model: prove full-saas runs
-# against an ephemeral CP with ZERO staging creds, image-substituted so the
-# TENANT is THIS PR's build and the CP is the released baseline.
+# core-owned implementation of the intended shared happy-path contract: prove
+# full-saas runs against an ephemeral CP with ZERO staging creds,
+# image-substituted so the TENANT is THIS PR's build and the CP is a
+# caller-selected baseline.
 #
-# IMAGE SUBSTITUTION (core PR): CP = released baseline (CP_IMAGE); tenant = THIS
-# PR's workspace-server build (TENANT_IMAGE), fed to the CP's local-docker
-# provisioner via LOCAL_TENANT_IMAGE. (A controlplane PR does the inverse.)
+# IMAGE SUBSTITUTION (core PR): CP = caller-supplied baseline (CP_IMAGE); tenant
+# = THIS PR's workspace-server build (TENANT_IMAGE), fed to the CP's local-docker
+# provisioner via LOCAL_TENANT_IMAGE. CI builds CP_IMAGE from the workflow's
+# pinned CP_EPHEMERAL_REF; the local wrapper builds it from the selected sibling
+# checkout. (A controlplane PR does the inverse.)
 #
 # Reuses the CP's ephemeral spin-up plumbing (pr-ephemeral-cp.sh) — the shared
-# harness the RFC generalizes. No shared staging, no post-merge dependency.
+# harness the RFC generalizes. No shared staging, no post-merge dependency. The
+# SDK migration is still open; this core-owned script remains the implementation.
 #
-# RUNS LOCALLY == RUNS IN CI (RFC design tenet): this is the SINGLE entry point.
-# CI (.gitea/workflows/e2e-ephemeral-happy-path.yml) is a thin wrapper that
-# supplies images + creds; devs run the SAME gate on their machine with
+# RUNS LOCALLY AND IN CI (RFC design tenet): this is the SINGLE scenario entry
+# point. CI (.gitea/workflows/e2e-ephemeral-happy-path.yml) supplies pinned
+# images, creds, and dind; devs run the same scenario on direct Docker with
 # `make e2e-ephemeral-happy-path` — validate the full happy path before pushing.
 #
 # ── MODULAR PHASES — iterate a failing step WITHOUT the full rebuild+boot ─────
@@ -74,8 +78,9 @@ STATE_FILE="${EPHEMERAL_STATE_FILE:-${TMPDIR:-/tmp}/ephemeral-cp-${NS}.env}"
 # and one `docker rm -fv` destroys everything atomically — even on cancel. This
 # is the structural fix for the SHARED docker-host interference that killed the
 # gate's first CI runs (the host-loopback docker-proxy died mid-run with every
-# container healthy) and for the cross-run tenant leaks (`down` only sweeps the
-# leg network). Inside the dind:
+# container healthy) and for historical cross-run tenant leaks (an early `down`
+# implementation only swept the leg network). The pinned helper now removes all
+# non-self containers on the exact namespace network; inside the dind:
 #   * published ports must bind 0.0.0.0 (the dind pre-forwards its FIXED :8080
 #     to the job's host loopback at create time — dind.sh exports it as $BASE;
 #     host.docker.internal inside the dind = the dind's own gateway, which a
@@ -694,7 +699,9 @@ teardown() {
   # Idempotent: dump_diagnostics already stopped it on the failure path.
   stop_tenant_log_collector
   if [ -n "${CP_EPHEMERAL_SCRIPT:-}" ] && [ -x "${CP_EPHEMERAL_SCRIPT:-}" ]; then
-    "$CP_EPHEMERAL_SCRIPT" down --ns "$NS" >/dev/null 2>&1 || echo "[proof] (down non-zero — the standing reaper will collect it)" >&2
+    "$CP_EPHEMERAL_SCRIPT" down --ns "$NS" >/dev/null 2>&1 ||
+      echo "[proof] (down non-zero — cleanup may be incomplete; CI's outer dind teardown" \
+        "still removes its disposable daemon, but a direct local run must inspect namespace ${NS})" >&2
   fi
   if [ -n "${PG_CTR:-}" ]; then docker rm -f "$PG_CTR" >/dev/null 2>&1 || true; fi
   # KEEP_UP is never set on the teardown path (`all` skips teardown entirely

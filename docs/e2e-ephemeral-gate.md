@@ -13,24 +13,27 @@ guard, pause/resume/hibernate lifecycle) execute pre-merge.*
 A per-PR gate that spins up a **throwaway control-plane**, provisions a
 **fresh tenant** on it, runs the core happy path (org → tenant → workspace →
 live A2A LLM completion) with **zero shared staging**, and tears everything
-down. It is the pre-merge replacement for the post-merge `E2E Staging
-Platform Boot` lane: the class of bug that used to appear only after merge
-(because PRs ran `bash -n` self-checks while only `push[main]` ran live) now
-reds on the PR.
+down. It is the intended pre-merge successor to the post-merge `E2E Staging
+Platform Boot` lane: failures within its proven coverage can now red the PR
+instead of appearing only after merge. The post-merge lane remains active
+until the residuals in [Roadmap](#roadmap-mc4081) are closed.
 
-One entry point — **local == CI**:
+One scenario runner, with local and CI launch wrappers:
 
 | Where | Command |
 |---|---|
 | Laptop (fast, direct) | `make e2e-ephemeral-happy-path` (or `bash local-e2e/ephemeral-cp-happy-path.sh all`) |
 | Laptop, phase-by-phase | `… boot` → `… scenario` (repeatable ~90s) → `… down` |
-| Laptop, CI parity (dind) | `bash tests/harness/dind.sh up` → `EPHEMERAL_DIND=1 … all` |
-| CI | `.gitea/workflows/e2e-ephemeral-happy-path.yml` (path-scoped, **gating**, per-job dind) |
+| Laptop, dind-topology parity | `bash tests/harness/dind.sh up` → `EPHEMERAL_DIND=1 … all` |
+| CI | `.gitea/workflows/e2e-ephemeral-happy-path.yml` (always posts, internally scoped, **gating**, per-job dind) |
 
 The image-substitution matrix: a **core** PR tests `molecule-tenant:pr-<sha>`
 (built from the PR) against `controlplane:baseline-dockerprov` (built from CP
-main, `Dockerfile.dockerprov` — the multi-stage image that ships the `docker`
-CLI the local-docker provisioner shells out to).
+at the workflow's exact `CP_EPHEMERAL_REF`, using `Dockerfile.dockerprov` — the
+multi-stage image that ships the `docker` CLI the local-docker provisioner
+shells out to). The local wrapper exercises the same scenario but defaults to
+the current sibling CP checkout and direct Docker; select that pinned checkout
+and dind explicitly when exact CI-launch parity is required.
 
 ## The topology contract (every line is a debugged failure)
 
@@ -59,7 +62,9 @@ live failure — do not remove one without re-running the gate locally:
    workspace-provision POST **to prod** (401). Fail-open filed as **CP #1515**.
    The topo base also feeds `LLMProxyBaseURL` (workspace LLM egress).
 4. **`E2E_LLM_PATH=platform` + `E2E_MODE=full` + `E2E_AWS_LEAK_CHECK=off`.**
-   The gate mirrors the Platform Boot lane exactly: hermes' default
+   The gate shares the Platform Boot lane's platform-managed LLM path, but not
+   its runtime or scenario breadth: this gate pins Hermes in full mode, while
+   Platform Boot uses its configured runtime in smoke mode. Hermes' default
    `minimax/MiniMax-M2.7` (slash form) is platform-managed; completions flow
    workspace → tenant proxy env → this CP's `/cp/internal/llm` proxy →
    `api.minimax.io` with the CP's own `MINIMAX_API_KEY`. (`pick_model_slug`
@@ -88,10 +93,10 @@ live failure — do not remove one without re-running the gate locally:
 
 The gate's first CI runs on the shared docker-host died to **runner
 interference**: the host-loopback docker-proxy for the CP's published port
-stopped answering mid-run while every container stayed healthy, and
-`pr-ephemeral-cp.sh down` (leg-network sweep only) leaked per-org-net tenants
-across runs. Per the no-sweepers principle, the fix is structural: the CI job
-runs the **whole topology inside a per-job disposable `docker:27-dind`**
+stopped answering mid-run while every container stayed healthy. An early
+`pr-ephemeral-cp.sh down` implementation also swept only the leg network and
+leaked per-org-net tenants across runs. Per the no-sweepers principle, the fix
+is structural: the CI job runs the **whole topology inside a per-job disposable `docker:27-dind`**
 (`tests/harness/dind.sh`, the harness-replays pattern from core #4057). One
 atomic `docker rm -fv` destroys everything — even on cancel.
 
@@ -126,31 +131,26 @@ crash-looping containers from other runs and misdirects the RCA (it did).
    `molecule-ai-sdk` (task #74) so core, CP, and the SDK run the *same* gate —
    then demote the corresponding post-merge E2E Staging jobs (task #86).
 
-   **Do not execute the demotion half as written yet.** Two findings from
-   2026-07-13/14 bound it:
+   **Do not execute the demotion half yet.** Two current boundaries remain:
 
-   * **The gate has a coverage hole the staging lane does not** (task #92).
-     `POST /hibernate?force=true` was a no-op that answered
-     `200 {"status":"hibernated"}` (core #4293). Staging reproduced it
-     DETERMINISTICALLY, 2/2, on different tenants. The gate passed 10b hibernate
-     both *before and after* the fix — under dind the resumed workspace has no
-     boot turn still in flight, so `active_tasks` is 0 and the buggy
-     `AND active_tasks = 0` claim matches anyway. The gate hibernates an idle
-     workspace and calls it covered; `force` only means anything when the
-     workspace is busy. Until 10b force-hibernates a *genuinely busy* workspace
-     and asserts `active_tasks > 0` first, this class is uncovered here.
-   * **The lane being demoted is itself measuring the wrong binary** (task #93).
-     `e2e-staging-saas.yml` and `publish-workspace-server-image.yml` both trigger
-     on `push: [main]` and race, so the staging e2e provisions tenants from the
-     PREVIOUS commit's image. It cannot validate a workspace-server change in the
-     commit that triggered it. That is an argument *for* this gate (which builds
-     the PR's own image and is the only lane testing the code under review) — but
-     it also means the post-push lanes are not the trustworthy safety net they
-     look like, so "keep them just in case" is not a real fallback either.
+   * **Busy force-hibernate coverage is still open** (task #92; PR #4384).
+     Step 10b resumes the leaf, calls `/hibernate?force=true`, and verifies both
+     the response and the durable `hibernated` row. It does **not** start a
+     long-running turn, wait for `active_tasks > 0`, or prove that non-force
+     hibernate returns 409 first. The current green path therefore proves an
+     idle force-hibernate transition, not the force-on-busy class that exposed
+     core #4293.
+   * **Binary identity is now explicit in the gated staging-CD path, but not in
+     the legacy push lane** (task #93). `staging-tenant-cd.yml` waits for the
+     immutable `:staging-<sha>` artifact, advances the staging pin, rolls the
+     fleet canary-first, checks `/buildinfo` against that SHA, and then runs its
+     hard E2E. The independent `e2e-staging-saas.yml` push run still has no
+     ordering edge against that rollout, so do not treat that legacy run alone
+     as proof of the triggering SHA.
 
-   Per `feedback_verify_live_pr_coverage_before_retiring_postmerge`: prove the
-   PR path covers the class LIVE before retiring the post-merge lane that covers
-   it today. #92 is that proof for the lifecycle class, and it is not done.
+   Prove the PR path covers each class live and deterministically before
+   retiring its post-merge coverage. Task #92 must add the busy witness and make
+   it mandatory before this lifecycle residual is closed.
 
 ## Bugs this gate caught before it could gate anything
 
