@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import sys
 from pathlib import Path
 
@@ -161,18 +162,6 @@ def test_wildcard_plus_literal_dedupes_a_double_flag():
     assert bad == ["CI / all-required (pull_request)=failure"]
 
 
-def test_non_required_red_present_is_false_under_wildcard():
-    # Defense in depth for the force_merge path: under "*", nothing is
-    # "non-required", so force must never be justified by a "non-required red".
-    # A literal reading here would call this red non-required -> force=True ->
-    # force_merge bypasses Gitea BP. Fail closed.
-    latest = mq.latest_statuses_by_context([
-        {"context": "CI / all-required (pull_request)", "status": "success"},
-        {"context": "some advisory / lint (pull_request)", "status": "failure"},
-    ])
-    assert mq._non_required_red_present(latest, ["*"]) is False
-
-
 def test_wildcard_ready_pr_merges_end_to_end():
     # THE POINT: with the production ['*'] required set and an all-green head,
     # the queue now reaches decision.ready — i.e. the bot would actually merge.
@@ -180,7 +169,6 @@ def test_wildcard_ready_pr_merges_end_to_end():
     decision = mq.evaluate_merge_readiness(**_ready_kwargs(required_contexts=["*"]))
     assert decision.action == "merge", decision.reason
     assert decision.ready is True
-    assert decision.force is False
 
 
 def test_wildcard_ready_pr_with_a_red_waits_end_to_end():
@@ -454,7 +442,6 @@ def test_merge_decision_requires_main_green_pr_green_and_current_base():
 
     assert decision.ready is True
     assert decision.action == "merge"
-    assert decision.force is False  # no non-required reds present
 
 
 def test_behind_main_but_mergeable_pr_merges_directly():
@@ -680,8 +667,9 @@ def test_removed_sop_contexts_do_not_block_merge():
 
 
 def test_non_required_advisory_red_does_not_block_merge():
-    # Governance checks are green; only advisory non-required reds (Staging SaaS)
-    # are present → PR is still mergeable with force_merge bypassing the advisory.
+    # Governance checks are green; only an actually non-required advisory red
+    # is present, so evaluation proceeds. The write still uses Gitea's normal
+    # protected merge endpoint; no administrator override is available.
     pr_status = {
         "state": "failure",  # combined polluted by advisory non-required reds
         "statuses": [
@@ -696,7 +684,6 @@ def test_non_required_advisory_red_does_not_block_merge():
     decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
     assert decision.ready is True
     assert decision.action == "merge"
-    assert decision.force is True
 
 
 def test_failing_required_context_blocks_even_with_approvals():
@@ -709,17 +696,15 @@ def test_failing_required_context_blocks_even_with_approvals():
     decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
     assert decision.ready is False
     assert decision.action == "wait"
-    assert decision.force is False
     # all-required IS a CRITICAL fail-closed context (RCA core#1676); a failing
-    # all-required is now caught by the step-0 critical guard (an even stronger
-    # block — force_merge cannot bypass it).
+    # all-required is caught by the step-0 critical guard.
     assert "required context" in decision.reason.lower()
 
 
 # --------------------------------------------------------------------------
 # CRITICAL fail-closed contexts (RCA core#1676 — merged with
 # CI/Platform(Go)=failure AND CI/all-required=skipped onto a red main; the
-# force_merge path swept these up as "non-required reds" and bypassed them).
+# former force-merge path swept these up as "non-required reds" and bypassed them).
 # --------------------------------------------------------------------------
 
 def _rca_1676_statuses():
@@ -744,10 +729,9 @@ def test_critical_contexts_block_helper_flags_1676():
     assert "CI / all-required" in joined
 
 
-def test_critical_guard_blocks_1676_even_force_merge_path():
-    # mergeable=True + genuine approvals is the EXACT force_merge precondition
-    # that let #1676 through. The step-0 critical guard must block it anyway,
-    # and the decision must NOT be a (forced) merge.
+def test_critical_guard_blocks_1676_former_force_regression():
+    # mergeable=True + genuine approvals reproduces the old fail-open shape
+    # that let #1676 through. The step-0 critical guard must still block it.
     decision = mq.evaluate_merge_readiness(
         **_ready_kwargs(
             pr_status=_rca_1676_statuses(),
@@ -759,7 +743,6 @@ def test_critical_guard_blocks_1676_even_force_merge_path():
     )
     assert decision.ready is False
     assert decision.action == "wait"
-    assert decision.force is False
     assert "CRITICAL" in decision.reason
 
 
@@ -979,6 +962,58 @@ def test_evaluate_merge_readiness_floor_does_not_break_runtime_bump_exemption():
 
 
 # --------------------------------------------------------------------------
+# Gitea merge/update write contracts
+# --------------------------------------------------------------------------
+
+def test_merge_pull_uses_lowercase_gitea_contract_and_exact_head(monkeypatch):
+    """The live Gitea schema requires lowercase JSON keys. Pinning the head
+    also prevents a reviewed decision from merging a branch that moved between
+    the final status read and the merge POST.
+    """
+    captured = {}
+
+    def fake_api(method, path, *, body=None, query=None, expect_json=True):
+        captured.update(
+            method=method,
+            path=path,
+            body=body,
+            query=query,
+            expect_json=expect_json,
+        )
+        return 200, None
+
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+    monkeypatch.setattr(mq, "api", fake_api)
+
+    head_sha = "a" * 40
+    mq.merge_pull(123, dry_run=False, head_commit_id=head_sha)
+
+    assert captured == {
+        "method": "POST",
+        "path": "/repos/molecule-ai/molecule-core/pulls/123/merge",
+        "body": {
+            "do": "merge",
+            "merge_title_field": "Merge PR #123 via Gitea merge queue",
+            "merge_message_field": (
+                "Serialized merge by gitea-merge-queue after current-main, "
+                "genuine approvals, and required CI checks were green."
+            ),
+            "head_commit_id": head_sha,
+        },
+        "query": None,
+        "expect_json": False,
+    }
+
+
+def test_merge_pull_exposes_no_admin_force_override():
+    """The queue must have no call surface that can request Gitea's
+    administrator branch-protection override.
+    """
+    assert "force" not in inspect.signature(mq.merge_pull).parameters
+
+
+# --------------------------------------------------------------------------
 # Fix 2: HOL — a permanent merge error HOLDS the PR (applies HOLD_LABEL)
 # --------------------------------------------------------------------------
 
@@ -1034,7 +1069,7 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
          "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
     ])
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls["merge_attempts"] += 1
         raise mq.MergePermissionError("POST /merge -> HTTP 405: User not allowed to merge PR")
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
@@ -1073,6 +1108,54 @@ def test_hold_pr_is_best_effort_when_queue_token_cannot_write_issues(monkeypatch
     # No exception: process_once can continue scanning later candidates.
     mq.hold_pr(100, "normal merge refused; no bypass attempted", dry_run=False)
     assert calls == ["label", "comment"]
+
+
+def test_successful_branch_update_comment_is_best_effort(monkeypatch, capsys):
+    """A queue token with write:repository but no write:issue can refresh a
+    stale branch. The optional follow-up comment must not turn that successful
+    update into a red queue tick.
+    """
+    calls = {"update_attempts": 0, "merge_attempts": 0, "hold_label": None}
+    _stale_pr_update_409_monkeypatch(
+        monkeypatch,
+        queued_issues=[
+            {"number": 4403, "pull_request": {}, "labels": [],
+             "created_at": "2026-07-15T00:00:00Z"},
+        ],
+        calls=calls,
+    )
+
+    def successful_update(pr_number, *, dry_run):
+        calls["update_attempts"] += 1
+
+    def forbidden_comment(*args, **kwargs):
+        raise mq.ApiError(
+            "POST /issues/4403/comments -> HTTP 403: write:issue required"
+        )
+
+    monkeypatch.setattr(mq, "update_pull", successful_update)
+    monkeypatch.setattr(mq, "post_comment", forbidden_comment)
+
+    assert mq.process_once(dry_run=False) == 0
+    assert calls["update_attempts"] == 1
+    assert calls["merge_attempts"] == 0
+    assert "could not post branch-update comment" in capsys.readouterr().err
+
+
+def test_successful_branch_update_comment_absorbs_transport_failure(
+    monkeypatch, capsys
+):
+    def unavailable_comment(*args, **kwargs):
+        raise mq.urllib.error.URLError("temporary DNS failure")
+
+    monkeypatch.setattr(mq, "post_comment", unavailable_comment)
+
+    mq.post_branch_update_comment_best_effort(
+        4403,
+        "branch refreshed; waiting for CI",
+        dry_run=False,
+    )
+    assert "could not post branch-update comment" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------
@@ -1132,8 +1215,9 @@ def _fully_ready_process_once_monkeypatch(monkeypatch, mergeable, calls):
          "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
     ])
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls["merge_attempts"] += 1
+        calls["merge_head_commit_id"] = head_commit_id
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
 
     def fake_add_label(pr_number, label_name, *, dry_run):
@@ -1192,6 +1276,7 @@ def test_process_once_merges_when_mergeable_is_true(monkeypatch):
 
     assert rc == 0
     assert calls["merge_attempts"] == 1
+    assert calls["merge_head_commit_id"] == "a" * 40
     assert calls["hold_label"] is None
 
 
@@ -1555,7 +1640,7 @@ def _stale_pr_update_409_monkeypatch(monkeypatch, queued_issues, calls):
         )
     monkeypatch.setattr(mq, "update_pull", fake_update)
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls["merge_attempts"] += 1
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
 
@@ -1813,7 +1898,7 @@ def _wire_ready_process_once(monkeypatch, *, issues, pr_payload, calls):
          "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
     ])
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls["merged"] = pr_number
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
     monkeypatch.setattr(mq, "update_pull", lambda *a, **k: calls.__setitem__("updated", True))
@@ -2003,7 +2088,7 @@ def _wire_multi_candidate_process_once(monkeypatch, *, issues, pulls, reviews, c
     )
     monkeypatch.setattr(mq, "get_pull_reviews", lambda n: reviews[n])
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls.setdefault("merged", [])
         calls["merged"].append(pr_number)
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
@@ -3629,7 +3714,6 @@ def test_enforced_file_red_blocks_merge_not_forced_over():
     )
     assert decision.ready is False
     assert decision.action == "wait"
-    assert decision.force is False
     assert "enforced required-contexts.txt" in decision.reason
 
 
@@ -3688,10 +3772,10 @@ def test_parked_pending_context_does_not_block(tmp_path):
         enforced_file_contexts=enforced,
     )
     # Only "CI / all-required" is enforced from the file; it is green, and the
-    # parked red is treated as a non-required advisory red (force bypass).
+    # parked red is treated as a genuinely non-required advisory status. The
+    # eventual write still uses the normal protected endpoint.
     assert decision.ready is True
     assert decision.action == "merge"
-    assert decision.force is True  # advisory red present → force bypass
 
 
 # ==========================================================================
@@ -3775,7 +3859,7 @@ def _live_recheck_process_once_monkeypatch(
          "official": True, "stale": False, "dismissed": False, "commit_id": head_sha},
     ])
 
-    def fake_merge(pr_number, *, dry_run, force=False):
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
         calls["merge_attempts"] += 1
     monkeypatch.setattr(mq, "merge_pull", fake_merge)
     monkeypatch.setattr(mq, "add_label_by_name", lambda *a, **k: None)
