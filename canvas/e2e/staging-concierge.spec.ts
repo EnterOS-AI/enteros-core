@@ -46,6 +46,7 @@
  */
 
 import { test, expect, type Page, type BrowserContext } from "@playwright/test";
+import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -208,7 +209,9 @@ async function loadConcierge(page: Page, tenantURL: string): Promise<void> {
   page.on("console", (msg) => {
     if (msg.type() === "error") console.log(`[e2e/console-error] ${msg.text()}`);
   });
-  await page.goto(tenantURL, { waitUntil: "domcontentloaded" });
+  await gotoWithNetworkChangeRetry(page, tenantURL, {
+    waitUntil: "domcontentloaded",
+  });
 
   // The canvas store hydrates /workspaces before the desktop shell paints.
   // Wait for the concierge nav rail OR the hydration-error banner — whichever

@@ -52,6 +52,7 @@
  */
 
 import { test, expect } from "@playwright/test";
+import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -170,7 +171,9 @@ test.describe("staging desktop take-control (real noVNC path)", () => {
     //    accepts the upgrade (a browser WS can't set Authorization). We
     //    navigate to the tenant origin first purely to anchor the Origin
     //    header; we don't need the canvas bundle to hydrate.
-    await page.goto(tenantURL, { waitUntil: "domcontentloaded" });
+    await gotoWithNetworkChangeRetry(page, tenantURL, {
+      waitUntil: "domcontentloaded",
+    });
 
     // Reproduce DisplayTab.tsx:459-466 (displayWebSocketConnection): resolve
     // session_url against the tenant origin, pull the token out of the

@@ -9,7 +9,7 @@ const spec = readFileSync(
 describe("slow-cold greeting browser harness", () => {
   it("does not apply Playwright's 30s default timeout to the 240s cold turn", () => {
     const start = spec.indexOf('context.route("**/workspaces/*/a2a"');
-    const end = spec.indexOf("await page.goto", start);
+    const end = spec.indexOf("await gotoWithNetworkChangeRetry", start);
     const slowTurnInterceptor = spec.slice(start, end);
 
     expect(start).toBeGreaterThan(-1);

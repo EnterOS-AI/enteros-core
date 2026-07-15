@@ -41,6 +41,7 @@
  */
 
 import { test, expect, type Page, type BrowserContext, type APIRequestContext } from "@playwright/test";
+import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
 import {
   checkConciergeInvariants,
   isPureGreeting,
@@ -264,7 +265,9 @@ test.describe("concierge greeting — rendered My Chat (UI)", () => {
     page.on("console", (m) => {
       if (m.type() === "error") console.log(`[e2e/console-error] ${m.text()}`);
     });
-    await page.goto(tenantURL, { waitUntil: "domcontentloaded" });
+    await gotoWithNetworkChangeRetry(page, tenantURL, {
+      waitUntil: "domcontentloaded",
+    });
     await page.waitForSelector('[data-testid="nav-home"], [data-testid="hydration-error"]', {
       timeout: 45_000,
     });

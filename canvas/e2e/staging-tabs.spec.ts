@@ -31,6 +31,7 @@
  */
 
 import { test, expect, type Page } from "@playwright/test";
+import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
 
 // Tab ids as declared in canvas/src/components/SidePanel.tsx TABS.
 //
@@ -360,7 +361,9 @@ test.describe("staging canvas tabs", () => {
     // would hang until its 45s default timeout. "domcontentloaded"
     // returns as soon as the HTML is parsed; React hydration + the
     // selector wait below is what actually gates ready-for-interaction.
-    await page.goto(tenantURL, { waitUntil: "domcontentloaded" });
+    await gotoWithNetworkChangeRetry(page, tenantURL, {
+      waitUntil: "domcontentloaded",
+    });
 
     // The staging canvas now hydrates the concierge shell first.
     // Wait for the left-nav rail (concierge shell landmark) or the
