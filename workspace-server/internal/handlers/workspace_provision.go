@@ -1928,15 +1928,15 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 		return
 	}
 
-	// Persist the backing instance id so later operations (terminal via
-	// EIC+SSH, live logs, debug introspection) can resolve workspace → EC2
-	// without re-asking CP on every request.
+	// Persist the opaque backing instance id so later operations (provider-
+	// specific terminal access, live logs, debug introspection) can resolve a
+	// workspace to its provider compute without re-asking CP on every request.
 	//
 	// Bounded retry with exponential backoff: a transient DB blip must not
 	// orphan a healthy running instance. If all retries fail, mark the
 	// workspace failed and record the instance_id in the broadcast event +
-	// last_sample_error so an operator/reaper can reconcile later. The live
-	// EC2 is NOT terminated — it may contain valuable state. (#1)
+	// last_sample_error so an operator/reaper can reconcile later. The running
+	// provider compute is NOT terminated — it may contain valuable state. (#1)
 	var persistErr error
 	delay := instanceIDPersistRetryBaseDelay
 	for attempt := 1; attempt <= instanceIDPersistRetryAttempts; attempt++ {
@@ -1955,10 +1955,10 @@ func (h *WorkspaceHandler) provisionWorkspaceCP(workspaceID, templatePath string
 		}
 	}
 	if persistErr != nil {
-		log.Printf("CPProvisioner: CRITICAL persist instance_id failed for %s after %d attempts: %v — EC2 instance %s is RUNNING but UNTRACKED. Operator must manually reconcile or remove the workspace to trigger orphan cleanup.", workspaceID, instanceIDPersistRetryAttempts, persistErr, machineID)
+		log.Printf("CPProvisioner: CRITICAL persist instance_id failed for %s after %d attempts: %v — provider instance %s is RUNNING but UNTRACKED. Operator must manually reconcile or remove the workspace to trigger orphan cleanup.", workspaceID, instanceIDPersistRetryAttempts, persistErr, machineID)
 		// Server-only log already captures the raw error above; broadcast gets
 		// safe fields only (no client-visible DB error). Security: RC 9378.
-		h.markProvisionFailed(ctx, workspaceID, "instance_id persist failed after retry — EC2 untracked", map[string]interface{}{
+		h.markProvisionFailed(ctx, workspaceID, "instance_id persist failed after retry — provider compute untracked", map[string]interface{}{
 			"instance_id": machineID,
 			"attempts":    instanceIDPersistRetryAttempts,
 		})

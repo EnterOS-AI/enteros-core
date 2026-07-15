@@ -342,32 +342,16 @@ func (h *WorkspaceHandler) handleA2ADispatchError(ctx context.Context, workspace
 }
 
 // maybeMarkContainerDead runs the reactive health check after a forward error.
-// If the workspace's compute (Docker container OR EC2 instance) is no longer
+// If the workspace's compute (local Docker container or CP-managed provider
+// compute) is no longer
 // running (and the workspace isn't external), it marks the workspace offline,
 // clears Redis state, broadcasts WORKSPACE_OFFLINE, and triggers an async
 // restart. Returns true when the compute was found dead.
 //
 // Provisioner selection (mutually exclusive in production):
 //   - h.provisioner != nil  → local Docker deployment; IsRunning does docker inspect.
-//   - h.cpProv != nil       → SaaS / EC2 deployment; IsRunning calls CP's
-//     /cp/workspaces/:id/status to read the EC2 state.
-//
-// Pre-fix this function ONLY consulted h.provisioner — for SaaS tenants
-// (h.provisioner=nil, h.cpProv=set) it short-circuited to false on every
-// call, so a dead EC2 agent would propagate upstream 502/503/504 to canvas
-// with no auto-recovery and Cloudflare in front would mask the response with
-// its own error page. The 2026-04-30 hongmingwang.moleculesai.app
-// canvas-chat-to-dead-workspace incident traces to exactly this gap.
-// maybeMarkContainerDead runs the reactive health check after a forward error.
-// If the workspace's compute (Docker container OR EC2 instance) is no longer
-// running (and the workspace isn't external), it marks the workspace offline,
-// clears Redis state, broadcasts WORKSPACE_OFFLINE, and triggers an async
-// restart. Returns true when the compute was found dead.
-//
-// Provisioner selection (mutually exclusive in production):
-//   - h.provisioner != nil  → local Docker deployment; IsRunning does docker inspect.
-//   - h.cpProv != nil       → SaaS / EC2 deployment; IsRunning calls CP's
-//     /cp/workspaces/:id/status to read the EC2 state.
+//   - h.cpProv != nil       → hosted provider deployment; IsRunning calls CP's
+//     /cp/workspaces/:id/status to read the provider state.
 //
 // Pre-fix this function ONLY consulted h.provisioner — for SaaS tenants
 // (h.provisioner=nil, h.cpProv=set) it short-circuited to false on every
@@ -477,7 +461,7 @@ func (h *WorkspaceHandler) maybeMarkContainerDead(ctx context.Context, workspace
 	}
 
 	// No recent/fresh heartbeat and not in the settle window: preserve the
-	// pre-#2929 immediate-dead behavior so dead EC2 instances still recover
+	// pre-#2929 immediate-dead behavior so dead provider compute still recovers
 	// on the first failed request (hongmingwang incident recovery path).
 	if !settling {
 		return h.declareContainerDead(ctx, workspaceID), 0, nil

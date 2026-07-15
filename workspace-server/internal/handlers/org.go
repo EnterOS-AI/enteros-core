@@ -33,10 +33,9 @@ const workspaceCreatePacingMs = 2000
 // defaultProvisionConcurrency is the fallback cap for parallel
 // workspace-provision goroutines when MOLECULE_PROVISION_CONCURRENCY
 // is unset. Originally a hard constant of 3 (PR #1084) calibrated for
-// Docker-mode workspaces. The constant is now a default — operators
-// running on EC2 (where each provision is a RunInstances call AWS
-// happily parallelises) typically want a much higher cap, while
-// Docker-mode dev environments still prefer the conservative 3.
+// Docker-mode workspaces. The constant is now a default — hosted providers
+// that support parallel starts may use a higher cap, while Docker-mode dev
+// environments still prefer the conservative 3.
 //
 // 3 keeps the existing Docker-mode behavior. SaaS deployments override
 // via env (see resolveProvisionConcurrency below).
@@ -47,9 +46,9 @@ const defaultProvisionConcurrency = 3
 //
 //   - unset / empty / non-numeric → defaultProvisionConcurrency (3)
 //   - "0"                          → unlimited (a very large cap;
-//     practically no semaphore — used on
-//     SaaS where AWS RunInstances is the
-//     rate-limiter, not us)
+//     practically no semaphore — useful when
+//     the upstream provider supplies its own
+//     rate limits and quotas)
 //   - any positive integer N       → N
 //   - negative integer             → defaultProvisionConcurrency (3),
 //     log warning so operator notices
@@ -80,8 +79,8 @@ func resolveProvisionConcurrency() int {
 	if n == 0 {
 		// Unlimited semantics — use a large but finite cap so the
 		// chan-based semaphore stays a no-op. 1M is well past any
-		// realistic org-import size; AWS RunInstances rate-limit and
-		// account vCPU quota are the real backpressure here.
+		// realistic org-import size; upstream provider rate limits and
+		// resource quotas supply the backpressure in this mode.
 		return 1 << 20
 	}
 	return n
@@ -775,7 +774,7 @@ func (h *OrgHandler) Import(c *gin.Context) {
 	// Semaphore limits concurrent provision goroutines (#1084).
 	// Cap is configurable via MOLECULE_PROVISION_CONCURRENCY:
 	//   unset → 3 (Docker-mode default)
-	//   "0"   → effectively unlimited (SaaS / EC2 backend)
+	//   "0"   → effectively unlimited (hosted provider backend)
 	//   N>0   → exactly N
 	// See resolveProvisionConcurrency for the full env-parse contract.
 	concurrency := resolveProvisionConcurrency()

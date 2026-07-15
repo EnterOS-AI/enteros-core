@@ -1882,8 +1882,8 @@ func (m *mockResolver) Fetch(_ context.Context, _, _ string) (string, error) {
 // TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed asserts that
 // when cpProv.Start succeeds but the DB UPDATE for instance_id fails on ALL
 // retry attempts, the handler marks the workspace failed WITHOUT terminating
-// the live EC2. The orphaned instance_id is recorded in the broadcast event
-// for operator reconciliation. Regression test for ticket #1.
+// the running provider compute. The orphaned instance_id is recorded in the
+// broadcast event for operator reconciliation. Regression test for ticket #1.
 func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 	// Shrink retry backoff so the test doesn't stall.
 	prevDelay := instanceIDPersistRetryBaseDelay
@@ -1944,8 +1944,8 @@ func TestProvisionWorkspaceCP_InstanceIDPersistFail_MarksFailed(t *testing.T) {
 	if cap.lastData == nil {
 		t.Fatal("expected RecordAndBroadcast to capture data on persist failure; got nothing")
 	}
-	if got := cap.lastData["error"]; got != "instance_id persist failed after retry — EC2 untracked" {
-		t.Errorf("broadcast error message = %q, want 'instance_id persist failed after retry — EC2 untracked'", got)
+	if got := cap.lastData["error"]; got != "instance_id persist failed after retry — provider compute untracked" {
+		t.Errorf("broadcast error message = %q, want 'instance_id persist failed after retry — provider compute untracked'", got)
 	}
 	if got := cap.lastData["instance_id"]; got != "i-12345" {
 		t.Errorf("broadcast instance_id = %v, want 'i-12345'", got)
