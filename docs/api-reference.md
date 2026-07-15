@@ -54,7 +54,8 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | POST | /workspaces/:id/restart | workspace.go |
 | POST | /workspaces/:id/pause | workspace.go (stops container, status→paused) |
 | POST | /workspaces/:id/resume | workspace.go (re-provisions paused workspace) |
-| POST | /workspaces/:id/a2a | workspace.go |
+| POST | /workspaces/:id/a2a | workspace.go — requires a source-bound workspace bearer or verified human/inbound credential; optional `X-Workspace-ID` must match bearer ownership. Combined self-host/dev Canvas requests may use same-origin only when CP session verification is unconfigured. |
+| GET | /workspaces/:id/a2a/queue/:queue_id | a2a_queue_status.go — same authentication as A2A send, followed by queue sender/target ownership check |
 | POST | /workspaces/:id/delegate | delegation.go (async fire-and-forget) |
 | GET | /workspaces/:id/delegations | delegation.go (list delegation status) |
 | GET/POST | /workspaces/:id/schedules | schedules.go (cron CRUD) |
@@ -76,8 +77,8 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | POST | /registry/register | registry.go |
 | POST | /registry/heartbeat | registry.go — requires `Authorization: Bearer <token>` once a workspace has any live token on file (legacy workspaces grandfathered) |
 | POST | /registry/update-card | registry.go — requires `Authorization: Bearer <token>` once a workspace has any live token on file |
-| GET | /registry/discover/:id | discovery.go — requires `X-Workspace-ID` + bearer token on the caller side |
-| GET | /registry/:id/peers | discovery.go — requires `X-Workspace-ID` + bearer token on the caller side |
+| GET | /registry/discover/:id | discovery.go — requires `X-Workspace-ID`; token-enrolled workspace callers present their own bearer, while admin/org/session credentials are also accepted; auth datastore errors fail closed |
+| GET | /registry/:id/peers | discovery.go — path `:id` identifies the caller; same credential contract as discovery, with no `X-Workspace-ID` required |
 | POST | /registry/check-access | discovery.go |
 | GET | /plugins | plugins.go (list registry; supports `?runtime=` filter) |
 | GET | /plugins/sources | plugins.go (list registered install-source schemes) |

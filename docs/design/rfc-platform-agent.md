@@ -76,8 +76,9 @@ subsystem.
   `workspace-server/internal/handlers/org_scope.go` resolves it with a recursive CTE (`orgRootID`) and
   `sameOrg()` compares two workspaces' resolved roots for tenant isolation (#1953/OFFSEC-015).
 - **A2A authorization is hierarchy-based.** `workspace-server/internal/registry/access.go:CanCommunicate`
-  permits self / siblings / ancestor↔descendant. Root-level rows are "siblings" but every routing path
-  is additionally gated by `sameOrg()`.
+  permits self / siblings sharing a non-NULL parent / ancestor↔descendant. It
+  denies unrelated root-level rows and disjoint subtrees; routing also retains
+  `sameOrg()` as a defense-in-depth tenant boundary.
 - **No participant-kind discriminator.** `workspaces.role` is a free-form string; the user is implicit
   (`activity_logs.source_id IS NULL`). `migrations/001_workspaces.sql`.
 - **Runtime injects MCP servers** in the claude-code executor's `mcp_servers` dict — today exactly one

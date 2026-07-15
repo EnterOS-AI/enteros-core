@@ -114,7 +114,7 @@ func TestProxyA2A_RestartingAgent_EOFShape_MustNotBeEnqueued(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/"+wsID+"/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	time.Sleep(100 * time.Millisecond)
 
 	if enqueueCalled {

@@ -812,9 +812,9 @@ func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, calle
 	})
 
 	// Broadcast A2A_RESPONSE for the CANVAS (so the reply reaches the frontend
-	// over WS, not just inline) — both the anonymous canvas (callerID == "")
-	// AND the authenticated canvas user (isCanvasUser, non-empty callerID via
-	// X-Workspace-ID + validateCallerToken). core#2751: the cap-and-queue path
+	// over WS, not just inline) — both the local same-origin canvas
+	// (callerID == "") and a verified human caller (isCanvasUser; an optional
+	// claimed callerID may be present). core#2751: the cap-and-queue path
 	// returns {queued} for canvas users and depends on THIS broadcast to
 	// deliver the reply. Safe on the synchronous path too — the canvas already
 	// receives both the inline HTTP reply and this WS event, and
@@ -896,32 +896,6 @@ func callerIDToSourceID(callerID string) *string {
 	return &callerID
 }
 
-// validateCallerToken enforces the Phase 30.5 auth-token contract on the
-// caller of an A2A proxy request. Same lazy-bootstrap shape as
-// registry.requireWorkspaceToken: if the caller workspace has any live
-// token on file, the Authorization header is mandatory and must match;
-// if the caller has zero live tokens, they're grandfathered through
-// (their next /registry/register will mint their first token, after
-// which this branch never fires again for them).
-//
-// Post-RFC#637 addition: a request may instead be carrying a HUMAN's
-// canvas-user identity (e.g. the 344a2623-… identity workspace from the
-// RFC#637 rollout). That human sits OUTSIDE the workspace org hierarchy, so
-// the returned isCanvasUser flag lets the A2A proxy bypass CanCommunicate for
-// it. Canvas-user classification is decided by isGenuineCanvasUser using
-// NON-FORGEABLE credentials only (see that function) — never by the caller's
-// X-Workspace-ID alone, and never by a bare same-origin Host/Referer in a
-// SaaS image (those are forgeable; see middleware.IsSameOriginCanvas).
-//
-// #1673: this canvas-user check is now evaluated BEFORE the HasAnyLiveToken
-// peer-token contract. Previously it lived only in the !hasLive branch, so a
-// canvas-user identity workspace that had acquired live tokens fell into the
-// hasLive=true branch, which demands a bearer the canvas frontend never sends
-// → silent 401 → the message was dropped before logA2AReceiveQueued wrote the
-// activity_logs row, breaking canvas chat for poll-mode workspaces. A genuine
-// canvas user is identified by the human's session/admin/org credential, which
-// is independent of whether the identity workspace happens to hold peer tokens.
-//
 // canvasIdentity carries the authenticated human identity for a canvas_user
 // A2A message. Status is either "AUTHENTICATED" (UserID and Email are set) or
 // "UNAUTHENTICATED" (the session could not be resolved to a real user).
@@ -996,102 +970,90 @@ func injectCanvasUserIdentity(body []byte, ident *canvasIdentity) ([]byte, error
 	return out, nil
 }
 
-// On auth failure this writes the 401 via c and returns an error so the
-// handler aborts without running the proxy.
-func validateCallerToken(ctx context.Context, c *gin.Context, callerID string) (isCanvasUser bool, err error) {
-	// Genuine canvas-user identity? Decided independently of the caller
-	// workspace's token state (the #1673 fix) and using only non-forgeable
-	// signals (the #1944 escalation guard).
-	if isGenuineCanvasUser(ctx, c) {
-		return true, nil
+const a2aInboundAuthenticatedContextKey = "a2a_inbound_authenticated"
+
+// authenticateA2AHTTPCaller returns the server-authenticated caller identity.
+// X-Workspace-ID is only a claim: for workspace callers it must match the
+// presented workspace bearer's owner. Human callers use a verified CP session,
+// ADMIN_TOKEN, or org token. Self-hosted/dev also preserves the same-origin
+// Canvas fallback only when CP session verification is unconfigured; SaaS
+// never accepts that forgeable signal. The external inbound endpoint sets a
+// private Gin context marker only after validating and consuming the target's
+// inbound secret. Missing, revoked, tokenless-legacy, and datastore-error cases
+// fail closed.
+func authenticateA2AHTTPCaller(ctx context.Context, c *gin.Context, claimedCallerID string) (callerID string, isCanvasUser bool, err error) {
+	if authenticated, _ := c.Get(a2aInboundAuthenticatedContextKey); authenticated == true {
+		return claimedCallerID, false, nil
 	}
 
-	hasLive, dbErr := wsauth.HasAnyLiveToken(ctx, db.DB, callerID)
-	if dbErr != nil {
-		// Fail-open here matches the heartbeat path — A2A caller auth is
-		// defense-in-depth on top of access-control hierarchy, not the
-		// sole gate on the secret material. A DB hiccup shouldn't take
-		// the whole A2A path down.
-		log.Printf("wsauth: caller HasAnyLiveToken(%s) failed: %v — allowing A2A", callerID, dbErr)
-		return false, nil
+	if middleware.IsVerifiedCanvasSession(c) {
+		return claimedCallerID, true, nil
 	}
-	if !hasLive {
-		// Tokenless, non-canvas-user workspace — legacy / pre-upgrade peer.
-		// Grandfather it through (its next /registry/register mints its
-		// first token, after which it lands in the hasLive=true branch).
-		return false, nil
+	// Self-hosted/dev has no control-plane session verifier. Preserve the
+	// existing local Canvas contract only for a request that actually came from
+	// the same-origin Canvas proxy. SaaS always skips this forgeable fallback.
+	if !middleware.CPSessionConfigured() && middleware.IsSameOriginCanvas(c) {
+		return claimedCallerID, true, nil
 	}
+
 	tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
 	if tok == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing caller auth token"})
-		return false, errInvalidCallerToken
+		return "", false, errInvalidCallerToken
 	}
-	if err := wsauth.ValidateToken(ctx, db.DB, callerID, tok); err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid caller auth token"})
+
+	adminSecret := os.Getenv("ADMIN_TOKEN")
+	if adminSecret != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(adminSecret)) == 1 {
+		return claimedCallerID, true, nil
+	}
+
+	workspaceID, workspaceErr := wsauth.WorkspaceFromToken(ctx, db.DB, tok)
+	if workspaceErr == nil {
+		if claimedCallerID != "" && claimedCallerID != workspaceID {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "caller ID does not match workspace auth token"})
+			return "", false, errCallerIdentityMismatch
+		}
+		if err := wsauth.ValidateToken(ctx, db.DB, workspaceID, tok); err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid caller auth token"})
+			return "", false, err
+		}
+		return workspaceID, false, nil
+	}
+
+	if _, _, _, orgErr := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); orgErr == nil {
+		return claimedCallerID, true, nil
+	}
+
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid caller auth token"})
+	return "", false, workspaceErr
+}
+
+// validateCallerToken is the compatibility wrapper used by schedule-health.
+// It delegates to the same classifier as A2A send and queue status so those
+// public surfaces cannot drift into different auth rules. On failure the
+// classifier writes the response before returning the error.
+func validateCallerToken(ctx context.Context, c *gin.Context, callerID string) (isCanvasUser bool, err error) {
+	authenticatedCallerID, isCanvasUser, err := authenticateA2AHTTPCaller(ctx, c, callerID)
+	if err != nil {
 		return false, err
 	}
-	return false, nil
+	if !isCanvasUser && authenticatedCallerID != callerID {
+		// authenticateA2AHTTPCaller already enforces this binding. Keep the
+		// defensive check here so future classifier changes cannot make the
+		// compatibility wrapper less strict than the primary A2A path.
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "caller ID does not match workspace auth token"})
+		return false, errCallerIdentityMismatch
+	}
+	return isCanvasUser, nil
 }
 
-// isGenuineCanvasUser reports whether the request is a real human acting
-// through the canvas UI (RFC#637 canvas-user identity), as opposed to a peer
-// workspace agent. A true result lets the A2A proxy bypass CanCommunicate, so
-// it MUST only accept signals an attacker on the platform network cannot forge:
-//
-//   - A control-plane-verified canvas session: the WorkOS session cookie is
-//     confirmed upstream to belong to a MEMBER of THIS tenant's org
-//     (middleware.IsVerifiedCanvasSession → /cp/auth/tenant-member). This is
-//     the production SaaS canvas path.
-//   - An Authorization: Bearer matching ADMIN_TOKEN (break-glass / molecli).
-//   - An Authorization: Bearer matching a live org_api_tokens row (user-minted
-//     org-scoped API token).
-//
-// Deliberately NOT accepted as a canvas-user signal in a SaaS image:
-//
-//   - A bare same-origin Host/Referer/Origin (middleware.IsSameOriginCanvas).
-//     Those headers are trivially forgeable by any container on the Docker
-//     network, and the combined-tenant image (CANVAS_PROXY_URL set) is exactly
-//     where a forged Referer + an arbitrary X-Workspace-ID could otherwise
-//     bypass CanCommunicate and reach cross-workspace A2A — the PR #1944
-//     privilege escalation. Same-origin is only honored as a fallback when CP
-//     session verification is NOT configured (self-hosted / dev), a
-//     single-tenant topology with no cross-tenant boundary to escalate across;
-//     even there the org hierarchy still owns intra-org routing.
-//
-// Note this classification is about the human's credential, not the caller
-// workspace's X-Workspace-ID — so it never trusts an attacker-supplied caller
-// ID, and it is independent of whether that workspace holds peer tokens.
-func isGenuineCanvasUser(ctx context.Context, c *gin.Context) bool {
-	// Production SaaS: control-plane-verified org-member session cookie.
-	if middleware.IsVerifiedCanvasSession(c) {
-		return true
-	}
-
-	if tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization")); tok != "" {
-		adminSecret := os.Getenv("ADMIN_TOKEN")
-		if adminSecret != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(adminSecret)) == 1 {
-			return true
-		}
-		if _, _, _, err := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); err == nil {
-			return true
-		}
-	}
-
-	// Self-hosted / dev fallback ONLY: when upstream session verification is
-	// not configured there is no verified-cookie signal to use, and the
-	// deployment is single-tenant, so the forgeable same-origin check is an
-	// acceptable canvas signal. In SaaS (CP session configured) this branch is
-	// skipped, closing the forged-same-origin escalation.
-	if !middleware.CPSessionConfigured() && middleware.IsSameOriginCanvas(c) {
-		return true
-	}
-	return false
-}
-
-// errInvalidCallerToken is a sentinel for validateCallerToken's "missing
-// token" branch so the handler-level guard can detect it without string
-// matching (the wsauth errors are typed for the invalid case).
+// errInvalidCallerToken is the sentinel for a missing A2A caller credential.
 var errInvalidCallerToken = errors.New("missing caller auth token")
+
+// errCallerIdentityMismatch distinguishes a source-binding rejection from a
+// generic credential or datastore failure. Tests assert this sentinel so the
+// binding guard cannot disappear behind an unrelated 401.
+var errCallerIdentityMismatch = errors.New("caller identity does not match authenticated workspace")
 
 // extractToolTrace pulls metadata.tool_trace from an A2A JSON-RPC response.
 // Returns nil when absent or malformed — callers can pass it straight through.

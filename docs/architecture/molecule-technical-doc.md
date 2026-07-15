@@ -84,7 +84,7 @@ Five runtime adapters ship production-ready on `main`: LangGraph, DeepAgents, Cl
 
 ## 3. System Architecture
 
-> **Workspace placement contract:** every Molecule org runs as a fully isolated tenant on its own EC2, with workspace-server, memory plugin, Postgres, and Redis all co-located. The platform (controlplane on Railway) handles provisioning, billing, and DNS only — it never holds tenant data. See [`workspace-placement.md`](workspace-placement.md) for the formal RFC.
+> **Workspace placement contract:** every Molecule org runs as a fully isolated tenant on its own EC2, with workspace-server, memory plugin, Postgres, and Redis all co-located. The cross-tenant control plane handles provisioning, billing, and DNS and does not hold tenant data. The tenant-local workspace-server may still proxy A2A traffic. See [`workspace-placement.md`](workspace-placement.md) for the formal RFC.
 
 ### System Boundary Diagram
 
@@ -124,7 +124,7 @@ Five runtime adapters ship production-ready on `main`: LangGraph, DeepAgents, Cl
 | Canvas ↔ Platform | HTTP REST + WebSocket | UI operations + real-time event fanout |
 | Platform ↔ Postgres | TCP | Source of truth for all durable state |
 | Platform ↔ Redis | TCP | Ephemeral state (liveness TTL), caching, pub/sub |
-| Workspace ↔ Workspace | HTTP (A2A JSON-RPC 2.0) | Direct peer-to-peer, **platform not in data path** |
+| Workspace ↔ Workspace | HTTP (A2A JSON-RPC 2.0) | Direct after discovery, or through the authenticated tenant platform proxy |
 | Workspace → Langfuse | HTTP | Automatic OpenTelemetry tracing |
 | Docker Network | `molecule-core-net` | Internal-only by default, no exposed DB/Redis ports |
 
@@ -254,23 +254,28 @@ All three layers call `onWorkspaceOffline()` → broadcast `WORKSPACE_OFFLINE` +
 
 ### Hierarchy = Topology
 
-The `CanCommunicate()` function is the single source of truth for all access control.
+The `CanCommunicate()` function is the source of truth for workspace hierarchy
+eligibility. Authentication and the separate `sameOrg()` tenant boundary still
+apply on routes that expose tenant data.
 
 | Direction | Allowed | Example |
 |-----------|---------|---------|
-| Sibling ↔ Sibling | **YES** | Marketing Agent ↔ Developer PM |
-| Parent → Child | **YES** | Developer PM → Frontend Agent |
-| Child → Parent | **YES** | Frontend Agent → Developer PM |
-| Skip levels | **NO** | Frontend Agent → Business Core (403) |
-| Cross-team | **NO** | Frontend Agent → Operations Team (403) |
+| Same-parent sibling ↔ sibling | **YES** | Marketing Agent ↔ Developer PM |
+| Ancestor → descendant (any depth) | **YES** | Business Core → Frontend Agent |
+| Descendant → ancestor (any depth) | **YES** | Auto Test → Developer PM |
+| Unrelated roots | **NO** | Tenant A root → Tenant B root (403) |
+| Disjoint subtrees | **NO** | Frontend Agent → Operations Team (403) |
 
 ### Access Check Algorithm
 
 ```
-IF caller.parent_id == target.parent_id → ALLOW (siblings)
-ELIF both parent_id IS NULL → ALLOW (root-level siblings)
-ELIF caller.ID == target.parent_id → ALLOW (parent→child)
-ELIF target.ID == caller.parent_id → ALLOW (child→parent)
+IF caller.ID == target.ID → ALLOW (self)
+ELIF caller.parent_id != NULL AND caller.parent_id == target.parent_id
+  → ALLOW (same non-root-parent siblings)
+ELIF caller appears anywhere on target's parent chain
+  → ALLOW (ancestor→descendant)
+ELIF target appears anywhere on caller's parent chain
+  → ALLOW (descendant→ancestor)
 ELSE → DENY (403 Forbidden)
 ```
 
@@ -392,10 +397,16 @@ This same logic governs: A2A delegation, memory scope enforcement, activity visi
 
 ### Discovery Flow
 
-1. Caller queries `GET /registry/discover/:targetId` with `X-Workspace-ID` header
-2. Platform validates `CanCommunicate(caller, target)` — returns 403 if denied
-3. Returns Docker-internal URL (workspace caller) or host-mapped URL (Canvas/external caller)
-4. Caller sends A2A message **directly** to target (peer-to-peer)
+1. Caller queries `GET /registry/discover/:targetId` with the required
+   `X-Workspace-ID` and its bearer when token-enrolled.
+2. Platform validates the discovery credential and
+   `CanCommunicate(caller, target)` — returns 403 if denied.
+3. Platform returns the reachable URL appropriate to the caller and target
+   runtimes (an external target's registered URL or a local target's
+   Docker-internal URL).
+4. Caller sends A2A message **directly** to target (peer-to-peer). Canvas,
+   external inbound, queue fallback, and server-side delegation instead use
+   the authenticated platform proxy.
 5. Target processes task and responds
 
 ### Task State Machine
@@ -409,8 +420,8 @@ submitted → working → completed
 
 ### Authentication
 
-- **MVP (current)**: Discovery-time validation only. Direct A2A calls are unauthenticated (acceptable for self-hosted Docker network isolation).
-- **Post-MVP**: Platform-issued short-lived signed tokens scoped to caller/target pair.
+- **Direct peer transport**: Discovery-time `CanCommunicate()` authorization; subsequent peer-to-peer requests remain outside the platform data path.
+- **Platform proxy transport**: Source-bound workspace bearer (or a privileged verified human/inbound credential), with hierarchy reapplied before dispatch. Self-host/dev same-origin Canvas is accepted only when CP session verification is unconfigured.
 
 ---
 
@@ -857,7 +868,9 @@ On workspace create: (1) check template folder → (2) try `{runtime}-default` �
 
 ### 5. Hierarchy-Driven Everything
 
-`CanCommunicate()` is the single source of truth. All operational concerns (communication, memory, access, approvals, event visibility) derive from the same hierarchy.
+`CanCommunicate()` is the hierarchy-eligibility source of truth. Operational
+surfaces derive their workspace relationship from that hierarchy while
+retaining route authentication and any tenant-specific `sameOrg()` boundary.
 
 ---
 
@@ -1028,7 +1041,7 @@ Every Tier 1 launch (Open Interpreter) had all four elements.
 
 ### Hard Design Constraints
 
-1. **Platform never routes agent messages** — A2A is strictly peer-to-peer
+1. **Keep A2A transports explicit** — direct peer calls bypass the platform data path; Canvas, inbound, queue fallback, and server-side delegation use the authenticated platform proxy
 2. **Postgres is fact source, Redis is cache** — Redis loss is fully recoverable
 3. **`structure_events` is append-only** — Never UPDATE, never DELETE
 4. **`workspace-template` has no business logic** — Logic lives in `workspace-configs-templates/`

@@ -220,7 +220,10 @@ a2a delegate <workspace_id> <task>  # Send task to a peer
 a2a info                           # Show workspace info
 ```
 
-Both approaches use the same backend: platform registry for discovery, A2A protocol for messaging, and access control enforcement (parent↔child, siblings only).
+Both approaches use the same backend: platform registry for discovery, A2A
+protocol for messaging, and access control enforcement (same non-root-parent
+siblings and ancestor↔descendant at any depth; unrelated roots and disjoint
+subtrees are denied).
 
 ## Memory Tools
 
