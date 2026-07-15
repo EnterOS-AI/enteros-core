@@ -38,10 +38,9 @@ Authoritative gates (fail-closed):
     GOVERNANCE_REQUIRED_CONTEXTS below.)
   - NON-required reds (E2E Chat, Staging SaaS, ci-arm64-advisory, any
     continue-on-error job) MUST NOT block. They are reported, never gating.
-  - `force_merge=true` is used ONLY when the merge is blocked *solely* by
-    missing-but-non-required advisory contexts (required are green + genuine
-    approvals present). It is NEVER used to bypass a failing REQUIRED context
-    or missing approvals.
+  - Every merge uses Gitea's normal protected endpoint with the reviewed head
+    SHA pinned. The queue never requests Gitea's administrator force override;
+    Gitea re-checks branch protection and approvals at write time.
 
 Auto-discovery (opt-OUT, label-optional):
   The queue is SELF-SUSTAINING — a ready PR does NOT need a human (or an agent)
@@ -177,7 +176,7 @@ GOVERNANCE_REQUIRED_CONTEXTS: list[str] = []
 # `CI / Platform (Go) = failure` AND `CI / all-required = skipped`, turning
 # main RED. Same class as #3181.)
 # --------------------------------------------------------------------------
-# These two contexts MUST be green before ANY merge, INCLUDING a force_merge.
+# These two contexts MUST be green before ANY merge.
 # They are checked here UNCONDITIONALLY and INDEPENDENTLY of whatever branch
 # protection happens to enumerate in status_check_contexts — the #1676 gap was
 # precisely that when BP did NOT list these (or listed a different suffix),
@@ -217,7 +216,7 @@ REQUIRED_CONTEXTS_RAW = _env(
 # lint_no_coe_on_required.py, and the merge gate derived its required set
 # ONLY from branch-protection `status_check_contexts`. So a context listed
 # in the file but ABSENT from BP was NOT merge-blocking — it was classified
-# as a non-required advisory red and force_merge=true bypassed it. That is
+# as a non-required advisory red and the former force-merge path bypassed it. That is
 # exactly how PR#3181 merged with `E2E Staging SaaS (full lifecycle) /
 # E2E Staging Concierge Creates Workspace` RED (in the file, not in BP).
 #
@@ -501,11 +500,6 @@ class MergeDecision:
     ready: bool
     action: str
     reason: str
-    # When ready is True, force indicates the merge is blocked SOLELY by
-    # missing-but-non-required governance contexts (required are green +
-    # genuine approvals present), so force_merge=true is justified to bypass
-    # ONLY those non-required contexts. Defaults False.
-    force: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1574,33 +1568,6 @@ def pr_has_current_base(pr: dict, commits: list[dict], main_sha: str) -> bool:
     return pr_contains_base_sha(commits, main_sha)
 
 
-def _non_required_red_present(
-    latest: dict[str, dict],
-    required_contexts: list[str],
-) -> bool:
-    """True if any NON-required context is non-success.
-
-    Such reds are the governance/SOP/advisory checks Gitea may still treat as
-    "missing required context" at merge time even though branch protection does
-    not require them. Their presence is what justifies force_merge=true (we
-    have already verified every REQUIRED context is green and approvals are
-    genuine, so force only bypasses these non-required reds).
-    """
-    # Determine required membership with the same Gitea glob grammar as step
-    # 4. Treat an invalid pattern as fail-closed: never use force_merge when we
-    # cannot prove a red context is outside branch protection.
-    try:
-        required_matchers = [_compile_gitea_glob(p) for p in required_contexts]
-    except GiteaGlobCompileError:
-        return False
-    for context, status in latest.items():
-        if any(m.fullmatch(context) for m in required_matchers):
-            continue
-        if status_state(status) != "success":
-            return True
-    return False
-
-
 def _context_base_name(context: str) -> str:
     """Strip the trailing ` (pull_request*)` / ` (push)` event suffix from a
     Gitea status context, returning the stable base name.
@@ -1624,9 +1591,7 @@ def critical_contexts_block(latest: dict[str, dict]) -> list[str]:
 
     Returns a list of human-readable block reasons; an EMPTY list means every
     critical context is provably green. A NON-empty list means the merge MUST
-    be refused (this gates the normal AND the force_merge path — see
-    evaluate_merge_readiness, which calls this BEFORE any merge decision incl.
-    force).
+    be refused (evaluate_merge_readiness calls this before any merge decision).
 
     Fail-closed semantics (RCA core#1676):
       * A critical context that is failure/error/skipped/missing → BLOCK.
@@ -1642,8 +1607,8 @@ def critical_contexts_block(latest: dict[str, dict]) -> list[str]:
     proven green).
     """
     # Fail-closed empty-guard (core#4363 follow-up). This step-0 backstop is
-    # the last line of defense against a vacuous merge: it gates BOTH the normal
-    # and the force_merge path. If CRITICAL_REQUIRED_CONTEXT_PREFIXES parses to
+    # the last line of defense against a vacuous merge. If
+    # CRITICAL_REQUIRED_CONTEXT_PREFIXES parses to
     # an empty set (env var set to "" / whitespace / all-comma), the loop below
     # would iterate nothing and return [] — a fail-OPEN that lets a PR with no
     # posted CI sail through step 0. `push_required_contexts()` raises on its
@@ -1696,14 +1661,12 @@ def evaluate_merge_readiness(
     enforced_file_contexts: list[str] | None = None,
     block_on_outdated_branch: bool = False,
 ) -> MergeDecision:
-    # 0) CRITICAL fail-closed guard (RCA core#1676). Before ANY other gate —
-    #    and BEFORE step 5 computes the force_merge flag — the PR head's
+    # 0) CRITICAL fail-closed guard (RCA core#1676). Before ANY other gate, the PR head's
     #    critical contexts (CI / Platform (Go), CI / all-required) MUST be
     #    green. This is checked UNCONDITIONALLY, independent of branch
-    #    protection's status_check_contexts, so a force_merge can NEVER bypass
-    #    a red/skipped Platform(Go) or a skipped all-required. #1676 merged red
-    #    because these fell out of the BP-required set and were then swept up
-    #    as "non-required reds" and force-merged. There is no exemption from
+    #    protection's status_check_contexts. #1676 merged red because these
+    #    fell out of the BP-required set and the former force path bypassed
+    #    them. There is no exemption from
     #    this gate — runtime-bump exemption only bypasses the APPROVALS bar,
     #    never a red required CI status.
     pr_latest_critical = latest_statuses_by_context(pr_status.get("statuses") or [])
@@ -1711,8 +1674,8 @@ def evaluate_merge_readiness(
     if critical_block:
         return MergeDecision(
             False, "wait",
-            "CRITICAL required context(s) not green (fail-closed, force_merge "
-            "cannot bypass): " + "; ".join(critical_block),
+            "CRITICAL required context(s) not green (fail-closed): "
+            + "; ".join(critical_block),
         )
 
     # 1) Main's push-required contexts must be green. Combined state can be
@@ -1777,8 +1740,8 @@ def evaluate_merge_readiness(
     #    red" exemption here: a red E2E Chat / Staging SaaS / ci-arm64-advisory /
     #    continue-on-error job all block, exactly like any other posted red
     #    (core#4363). Do NOT re-add an advisory-skip branch to
-    #    required_contexts_green — that is precisely the force_merge-bypasses-BP
-    #    hole (PR#3181 class) the wildcard expansion closed. A genuinely advisory
+    #    required_contexts_green — that recreates the PR#3181 fail-open class.
+    #    A genuinely advisory
     #    check must carry NO commit status (or be excluded from BP), not be
     #    skipped here.
     latest = latest_statuses_by_context(pr_status.get("statuses") or [])
@@ -1790,7 +1753,7 @@ def evaluate_merge_readiness(
     #     (internal#3181). This is the SSOT-as-ENFORCED fix: the file is the
     #     documented "required to merge" set, but historically the gate read
     #     ONLY branch protection, so a file entry absent from BP was treated
-    #     as a non-required advisory red and force_merge=true bypassed it —
+    #     as a non-required advisory red and the former force path bypassed it —
     #     exactly how PR#3181 merged with `E2E Staging SaaS (full lifecycle) /
     #     E2E Staging Concierge Creates Workspace` RED.
     #
@@ -1800,8 +1763,7 @@ def evaluate_merge_readiness(
     #     loader excludes the tail) and are therefore NOT enforced — the
     #     sequencing escape hatch that keeps a known-red, tracked check from
     #     freezing the whole queue. Fail-closed: a red/missing enforced context
-    #     returns `wait`, so the flow NEVER reaches the force_merge path below
-    #     for it. This runs AFTER step 4 so a BP-required red is reported first.
+    #     returns `wait`. This runs AFTER step 4 so a BP-required red is reported first.
     # `enforced_file_contexts` here is ALWAYS a real (possibly empty) list:
     # a read FAILURE was converted to an EnforcedContextsUnavailable hold at
     # the call site BEFORE this function runs (RC 13618), so reaching here
@@ -1846,17 +1808,8 @@ def evaluate_merge_readiness(
     #    is caught by POST-merge main CI (step 1's pause backstop) rather than
     #    pre-merge.
     #
-    #    force is legacy: it was justified ONLY for a missing-but-non-required
-    #    governance red (required green + approvals genuine). Under the wildcard
-    #    BP set ("*") there is NO non-required red — every posted red already
-    #    WAITed at step 4 — so _non_required_red_present() returns False and
-    #    `force` is always False here (it fail-closes on "*"; see its body). The
-    #    call is retained only so a future LITERAL-context BP set keeps the old
-    #    behaviour; force_merge is NEVER used to bypass a failing required
-    #    context or an approval shortfall.
     if mergeable is True:
-        force = _non_required_red_present(latest, required_contexts)
-        return MergeDecision(True, "merge", "ready", force=force)
+        return MergeDecision(True, "merge", "ready")
 
     # 6) NOT (yet) mergeable. TRI-STATE, fail-closed — never merge on an unknown.
     #    We MUST distinguish "still computing" (None/missing) from a "definitive
@@ -2036,6 +1989,25 @@ def post_comment(pr_number: int, body: str, *, dry_run: bool) -> None:
     api("POST", f"/repos/{OWNER}/{NAME}/issues/{pr_number}/comments", body={"body": body})
 
 
+def post_branch_update_comment_best_effort(
+    pr_number: int, body: str, *, dry_run: bool
+) -> None:
+    """Report a successful branch refresh without making it a queue gate.
+
+    AUTO_SYNC_TOKEN intentionally has repository-write but not issue-write
+    scope. Updating a branch is the state transition; the comment is only
+    observability. A 403 here must therefore stay visible while allowing the
+    successful queue tick to finish green.
+    """
+    try:
+        post_comment(pr_number, body, dry_run=dry_run)
+    except (ApiError, urllib.error.URLError, TimeoutError) as exc:
+        sys.stderr.write(
+            f"::warning::could not post branch-update comment to PR "
+            f"#{pr_number}: {exc}; branch update remains successful\n"
+        )
+
+
 def update_pull(pr_number: int, *, dry_run: bool) -> None:
     print(f"::notice::updating PR #{pr_number} with base branch via style={UPDATE_STYLE}")
     if dry_run:
@@ -2131,22 +2103,22 @@ def hold_pr(pr_number: int, hold_note: str, *, dry_run: bool) -> None:
         )
 
 
-def merge_pull(pr_number: int, *, dry_run: bool, force: bool = False) -> None:
+def merge_pull(
+    pr_number: int,
+    *,
+    dry_run: bool,
+    head_commit_id: str,
+) -> None:
     payload: dict[str, Any] = {
-        "Do": "merge",
-        "MergeTitleField": f"Merge PR #{pr_number} via Gitea merge queue",
-        "MergeMessageField": (
+        "do": "merge",
+        "merge_title_field": f"Merge PR #{pr_number} via Gitea merge queue",
+        "merge_message_field": (
             "Serialized merge by gitea-merge-queue after current-main, "
             "genuine approvals, and required CI checks were green."
         ),
+        "head_commit_id": head_commit_id,
     }
-    if force:
-        # force_merge bypasses ONLY missing-but-non-required governance
-        # contexts. The caller has already verified required contexts are green
-        # and genuine approvals are present, so this never bypasses a failing
-        # required context or an approval shortfall.
-        payload["force_merge"] = True
-    print(f"::notice::merging PR #{pr_number}{' (force_merge: non-required reds)' if force else ''}")
+    print(f"::notice::merging PR #{pr_number} through the normal protected endpoint")
     if dry_run:
         return
     try:
@@ -2355,7 +2327,7 @@ def process_once(*, dry_run: bool = False) -> int:
                 )
                 hold_pr(pr_number, hold_note, dry_run=dry_run)
                 continue  # held — keep scanning for a mergeable candidate
-            post_comment(
+            post_branch_update_comment_best_effort(
                 pr_number,
                 (
                     f"merge-queue: updated this branch with `{WATCH_BRANCH}` at "
@@ -2383,21 +2355,30 @@ def process_once(*, dry_run: bool = False) -> int:
             # so a genuinely-ready PR behind it can still merge this tick. One
             # extra GET, only for the single candidate about to merge.
             head_sha = ctx.get("head_sha")
-            if isinstance(head_sha, str) and head_sha:
-                regressions = live_premerge_status_regressions(
-                    head_sha,
-                    required_contexts=contexts,
-                    enforced_file_contexts=enforced_file_contexts,
+            if not isinstance(head_sha, str) or not head_sha:
+                print(
+                    f"::notice::PR #{pr_number} SKIPPED: exact head SHA is "
+                    "missing; refusing an unpinned merge request"
                 )
-                if regressions:
-                    print(
-                        f"::notice::PR #{pr_number} SKIPPED: live pre-merge "
-                        f"re-check found {', '.join(regressions)} "
-                        "(snapshot was stale)"
-                    )
-                    continue  # skip — keep scanning for a still-ready candidate
+                continue
+            regressions = live_premerge_status_regressions(
+                head_sha,
+                required_contexts=contexts,
+                enforced_file_contexts=enforced_file_contexts,
+            )
+            if regressions:
+                print(
+                    f"::notice::PR #{pr_number} SKIPPED: live pre-merge "
+                    f"re-check found {', '.join(regressions)} "
+                    "(snapshot was stale)"
+                )
+                continue  # skip — keep scanning for a still-ready candidate
             try:
-                merge_pull(pr_number, dry_run=dry_run, force=decision.force)
+                merge_pull(
+                    pr_number,
+                    dry_run=dry_run,
+                    head_commit_id=head_sha,
+                )
             except MergePermissionError as exc:
                 # Normal merge refusal (HTTP 403/404/405). Never bypass it.
                 # Best-effort HOLD this PR and CONTINUE scanning. The token may
