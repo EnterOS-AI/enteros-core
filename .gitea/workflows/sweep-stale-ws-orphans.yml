@@ -35,7 +35,7 @@ name: Sweep stale ws-* workspace orphans (runner host)
 # (lifecycle-real timeout-minutes: 30), so a 2-hour floor is well clear of any
 # legitimately-running workspace.
 #
-# SUBSTRATE: runs on `docker-host` (the operator-host molecule-runner-* lane)
+# SUBSTRATE: runs on the self-hosted `docker-host` lane
 # because that is where the ws-<uuid> containers are provisioned and where the
 # molecule-core-net bridge + docker.sock live (same constraint as
 # local-provision-e2e.yml + handlers-postgres-integration.yml). A bare
@@ -59,7 +59,7 @@ env:
 jobs:
   sweep:
     name: Sweep ws-* orphans
-    # Pin to docker-host: the orphans live on the operator-host runner daemon
+    # Pin to docker-host: the orphans live on the selected runner daemon
     # (where local-provision-e2e.yml provisions them). A ubuntu-latest Windows
     # act_runner would target the wrong docker daemon. See SUBSTRATE above.
     runs-on: docker-host

@@ -268,7 +268,7 @@ comment_body() {
 
 Auto-merge is armed, but main's branch protection requires 1 review and no human has approved. Until someone reviews, the staging→main promote chain is wedged and downstream consumers (canvas builds, tenant redeploys) won't see new code.
 
-**Action**: a human reviewer on \`@Molecule-AI/maintainers\` should approve this PR (or mark it as not ready and close).
+**Action**: a human reviewer on \`@molecule-ai/maintainers\` should approve this PR (or mark it as not ready and close).
 
 Detected by \`scripts/check-stale-promote-pr.sh\` per issue #2975.
 EOF

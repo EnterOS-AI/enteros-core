@@ -57,8 +57,8 @@ on:
     # `edited` is included because the rule depends on PR_BODY: a user
     # may add `Paired: #NNN` after first push to satisfy the lint. The
     # rerun on `edited` lets the PR turn green without an empty
-    # commit. Gitea 1.22.6 fires `edited` on body changes — verified
-    # via gitea-source/models/issues/pull_list.go::triggerNewPRWebhook.
+    # commit. The repository webhook contract includes `edited` for body
+    # changes; the original behavior was source-verified during the 1.22.6 era.
     paths:
       - '.gitea/workflows/ci.yml'
       - '.gitea/scripts/lint_mask_pr_atomicity.py'

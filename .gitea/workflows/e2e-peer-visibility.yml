@@ -40,7 +40,7 @@ name: E2E Peer Visibility (literal MCP list_peers)
 # actually land. It is intentionally NOT in branch_protections — see PR
 # body for the required-vs-not decision + flip tracking issue.
 #
-# Gitea 1.22.6 / act_runner notes honored:
+# Repository runner-compatibility notes honored:
 #   - No cross-repo `uses:` (feedback_gitea_cross_repo_uses_blocked). The
 #     actions/checkout SHA is the one e2e-staging-canvas.yml already uses
 #     successfully (a mirrored SHA — see #1277/PR#1292 root-cause).
@@ -52,8 +52,8 @@ name: E2E Peer Visibility (literal MCP list_peers)
 #   - pr-validate posts a status under the same check name so a
 #     workflow-only PR is not silently statusless and the context is
 #     flip-to-required-ready (mirrors e2e-staging-saas.yml's proven shape;
-#     real EC2-provisioning E2E is push/dispatch/cron only — it is 30+ min
-#     and cannot run per-PR-update).
+#     the live-staging arm remains push/dispatch only and does not run on
+#     every PR update).
 #
 # LOCAL BACKEND (added 2026-05-15 — feedback_local_must_mimic_production,
 # feedback_mandatory_local_e2e_before_ship, feedback_local_test_before_
@@ -61,7 +61,7 @@ name: E2E Peer Visibility (literal MCP list_peers)
 # --------------------------------------------------------------------
 # The standing rule is that the local prod-mimic stack runs a MANDATORY
 # local-Postgres E2E BEFORE staging E2E. A staging-only peer-visibility
-# gate caught regressions late + expensively (cold EC2).
+# gate caught regressions late and expensively through live provisioning.
 #
 # UN-DORMANTED 2026-07-04: the local assertion is no longer a separate
 # non-required `peer-visibility-local` job that was SKIPPED on every
@@ -72,7 +72,7 @@ name: E2E Peer Visibility (literal MCP list_peers)
 # tests/e2e/test_peer_visibility_mcp_local.sh) against the local
 # docker-compose stack — built + booted exactly like e2e-api.yml's proven
 # E2E API Smoke Test job (ephemeral pg/redis ports, go build, background
-# platform-server). Local boot is minutes (not the 30+ min cold-EC2 path),
+# platform-server). Local boot is minutes and avoids live tenant provisioning,
 # so the REAL molecules-server/local-docker list_peers gate now fires
 # per-PR — closing the dormancy where a peer-visibility-code PR merged
 # with zero real coverage.
@@ -467,7 +467,7 @@ jobs:
         # secrets from Infisical KMS" step above (exported to $GITHUB_ENV).
         run: |
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
           fi
           echo "Admin token present"

@@ -1,94 +1,64 @@
 # Constraints & Rules
 
-Key design rules and invariants that must be followed throughout the codebase.
+This page is a source-of-truth index for current Core boundaries. Historical
+MVP rules such as an unauthenticated API, event-sourced workspace state, or a
+destructive team-expansion lifecycle no longer describe the checked-in server.
 
-## 1. Keep Direct and Proxied A2A Paths Distinct
+## Authentication and Authorization
 
-Peer runtimes can send A2A messages **directly** after discovery, so the
-platform is not in that data path. Canvas, external inbound, queue fallback,
-and server-side delegation use the platform's A2A proxy. Do not describe the
-direct discovery boundary as if it authenticated the separate proxy route.
+There is no blanket "open API" rule. `workspace-server/internal/router/router.go`
+defines authentication per route with `WorkspaceAuth`, `AdminAuth`, verified
+control-plane sessions, and the smaller set of intentionally public surfaces.
+Infrastructure fields such as `parent_id`, `tier`, and `runtime` require admin
+or verified control-plane authority even after workspace authentication. See
+[Platform API](../api-protocol/platform-api.md) for the current route matrix.
 
-## 2. Postgres Is Source of Truth, Redis Is Ephemeral
+## Authoritative State and Events
 
-If Redis is wiped, workspaces re-register on next heartbeat and state is restored. Nothing critical lives only in Redis.
+- Postgres domain tables are authoritative. `workspaces` owns current workspace
+  state; `canvas_layouts`, `activity_logs`, schedules, and other domain tables
+  own their respective data.
+- Redis supports caches, liveness, and event fanout. It is not the durable
+  source of workspace state.
+- `structure_events` is append-only, but records selected lifecycle and audit
+  operations only. It is not a complete replay source. See
+  [Event Log](../architecture/event-log.md).
 
-## 3. structure_events Is Append-Only
+## Hierarchy and Communication
 
-Never `UPDATE` or `DELETE` rows in this table. The `workspaces` table is the mutable projection. See [Event Log](../architecture/event-log.md).
+`workspaces.parent_id` defines team hierarchy and feeds peer discovery and
+`CanCommunicate()` authorization. Create or reparent workspace rows to change
+the hierarchy. Canvas `collapsed` state only hides or shows existing
+descendants; the old destructive `/expand` and `/collapse` routes are retired.
+See [Communication Rules](../api-protocol/communication-rules.md) and
+[Platform API — Team hierarchy](../api-protocol/platform-api.md#team-hierarchy).
 
-## 4. workspace-template Is Generic
+## Provisioning Boundary
 
-It contains **no business logic**. All business logic lives in `workspace-configs-templates/`. The template reads config files at startup — it does not know what kind of workspace it is until it loads config.
+Core owns workspace lifecycle and selects the configured backend through the
+dispatchers in `workspace-server/internal/handlers/workspace_dispatchers.go`.
+Tier controls workspace capability and isolation; it does not select Docker
+versus the control-plane backend. Runtime implementation and configuration are
+owned by the maintained workspace-runtime and template repositories.
 
-## 5. Bundles Do Not Contain Secrets
+## Secrets and Bundles
 
-API keys, passwords, and credentials are **never** serialized into bundle JSON. The provisioner injects them from the host environment when spinning up a workspace container.
+Bundles must not serialize API keys, passwords, or credentials. Secret handlers
+use AES-GCM when `SECRETS_ENCRYPTION_KEY` is configured and production boot
+fails closed without it; non-production mode still permits explicit version-0
+plaintext storage for local compatibility. Secrets are injected at the runtime
+boundary. See [Bundle System](../agent-runtime/bundle-system.md) and [Secrets
+Key Custody](../architecture/secrets-key-custody.md).
 
-## 6. Authentication Is Route-Specific and Fail-Closed
+## HTTP Security Headers
 
-The platform API is not open. Administrative routes use strict admin or
-verified control-plane-session authentication; workspace routes bind bearer
-tokens to workspace identity; org tokens authorize their configured org
-surface. The public A2A proxy derives a workspace caller from its bearer and
-accepts `X-Workspace-ID` only as a matching optional claim. Never add a
-fail-open authentication branch to these strict surfaces. Registry heartbeat
-and card update retain a separately documented legacy/bootstrap availability
-exception; do not copy that transition behavior to another route.
+The server-wide security-header middleware lives in
+`workspace-server/internal/middleware/securityheaders.go`. Route middleware and
+the router remain authoritative for authentication; headers are not an auth
+substitute.
 
-## 7. org_id Is Omitted from MVP Schema
+## Validation
 
-Removed entirely for MVP simplicity. Added in the SaaS migration for multi-tenancy.
-
-## 8. Tier Determines Provisioner, Not Behavior
-
-The workspace code is the same regardless of tier. The tier only affects how the workspace is deployed:
-- Docker flags
-- host access level and isolation boundary
-- Resource allocation
-
-See [Workspace Tiers](../architecture/workspace-tiers.md).
-
-## 9. The Hierarchy IS the Topology
-
-There is no manual connection wiring. Communication is derived from the `parent_id` hierarchy:
-- Siblings sharing a non-root parent can talk to each other
-- Any ancestor can talk to any descendant (and vice versa)
-- Unrelated roots and disjoint subtrees cannot communicate
-
-The org chart IS the access control policy. See [Communication Rules](../api-protocol/communication-rules.md).
-
-## 10. A2A Authentication Depends on the Transport
-
-Direct peer calls remain outside the platform data path after discovery-time
-`CanCommunicate()` authorization. The platform proxy is different: workspace
-callers require a source-bound bearer and the proxy reapplies hierarchy before
-dispatch. See [A2A Protocol — Authentication](../api-protocol/a2a-protocol.md#authentication-between-workspaces).
-
-## 11. Secrets in Postgres, Encrypted
-
-Workspace secrets (API keys, credentials) are stored in Postgres with AES-256-GCM encryption at the application layer. The tenant's `SECRETS_ENCRYPTION_KEY` is provisioned at boot by the control plane, which holds the master key material in AWS KMS (envelope encryption, dual-mode with a static-key fallback for dev). Full custody chain in [secrets-key-custody.md](../architecture/secrets-key-custody.md). Secrets are never included in bundles, never logged, never exposed via API responses.
-
-## 12. Last-Write-Wins for MVP
-
-Concurrent canvas modifications from multiple clients use last-write-wins. No optimistic locking or CRDTs for MVP.
-
-## 13. Security Headers on All Responses
-
-The platform applies HTTP security headers via middleware (`workspace-server/internal/middleware/securityheaders.go`):
-- `X-Content-Type-Options: nosniff`
-- `X-Frame-Options: DENY`
-- `X-XSS-Protection: 1; mode=block`
-
-These are applied after CORS middleware on every response.
-
-## 14. No Exposed Database Ports
-
-Postgres and Redis must not expose host ports. They communicate exclusively over the internal Docker network (`molecule-core-net`). Use `docker compose exec` for direct access during development.
-
-## Related Docs
-
-- [SaaS Upgrade Path](../product/saas-upgrade.md) — How auth and multi-tenancy are added
-- [Bundle System](../agent-runtime/bundle-system.md) — Why bundles exclude secrets
-- [Event Log](../architecture/event-log.md) — The append-only rule
-- [Communication Rules](../api-protocol/communication-rules.md) — Hierarchy = access control
+When a rule here conflicts with implementation, verify against the router,
+middleware, handler, migration, and event-type sources, then update this page
+in the same change.

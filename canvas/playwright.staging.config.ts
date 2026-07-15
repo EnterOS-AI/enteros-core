@@ -6,7 +6,7 @@
  *   - Retries + timeouts can be longer (staging is remote + shared)
  *   - baseURL is dynamic (set by globalSetup → STAGING_TENANT_URL)
  *
- * Invoked by the e2e-staging-canvas GH Actions workflow:
+ * Invoked by the e2e-staging-canvas Gitea Actions workflow:
  *   npx playwright test --config=playwright.staging.config.ts
  */
 
@@ -18,8 +18,8 @@ export default defineConfig({
   // unit specs (chat-separation, filestab-smoke, etc.) stay on the local
   // config so they don't hit staging.
   testMatch: /staging-.*\.spec\.ts/,
-  // Global setup provisions the org; budget generously because EC2 boot
-  // is ~5 min and can drift to 10+ on cold AMI days.
+  // Global setup provisions the org and a real workspace host; keep the
+  // suite budget independent of provider-specific cold-boot latency.
   timeout: 120_000,
   expect: { timeout: 15_000 },
   fullyParallel: false,

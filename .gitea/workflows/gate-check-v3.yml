@@ -42,10 +42,8 @@ on:
   # Guard G (ci-required-drift.py --disabled-pr-emitter-lint) now fails RED if a
   # disabled workflow still declares a PR trigger.
   #
-  # NOTE: `workflow_dispatch.inputs` block intentionally omitted.
-  # Gitea 1.22.6 parser rejects `workflow_dispatch.inputs.X` with
-  # "unknown on type" — it mis-treats the inputs sub-keys as top-level
-  # `on:` event types. Dropping the inputs block restores parsing.
+  # `workflow_dispatch.inputs` is intentionally omitted under the repository's
+  # flat-dispatch policy.
   # Manual dispatch from the Gitea UI works without the inputs schema
   # (github.event.inputs.X returns empty); the script falls back to
   # iterating all open PRs when PR_NUMBER is empty.
@@ -62,8 +60,8 @@ on:
 # NO `cancel-in-progress` (defaults to false). Per
 # `feedback_janitor_supersede_must_group_by_workflow_id`, cancelling
 # in-flight runs of any required-check-shaped workflow risks the
-# dismiss_stale_approvals + empty-commit-rerun dance (Gitea 1.22.6 has
-# no REST rerun). The gate-check is `continue-on-error: true` +
+# dismiss_stale_approvals + exact-head rerun policy. The gate-check is
+# `continue-on-error: true` +
 # idempotent (POST/PATCH gate-check comment by context) so sequential
 # ticks are strictly safe.
 concurrency:

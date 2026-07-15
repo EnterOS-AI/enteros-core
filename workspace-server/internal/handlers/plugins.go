@@ -85,7 +85,7 @@ func (h *PluginsHandler) deliver(ctx context.Context, workspaceID string, r *sta
 }
 
 // NewPluginsHandler constructs a PluginsHandler with the default source
-// registry (local + github resolvers). Deployments can add more schemes
+// registry (local, GitHub, and authenticated Gitea resolvers). Deployments can add more schemes
 // via WithSourceResolver before routes are wired — e.g. a private
 // enterprise registry or ClawHub. Logs the effective install limits
 // exactly once per process on first construction.

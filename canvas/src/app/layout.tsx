@@ -208,7 +208,7 @@ export default async function RootLayout({
                   url: SITE_URL,
                   logo: `${SITE_URL}/molecule-icon.png`,
                   sameAs: [
-                    "https://github.com/molecule-ai",
+                    "https://git.moleculesai.app/molecule-ai",
                     "https://x.com/moleculeai",
                   ],
                 },

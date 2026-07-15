@@ -3,8 +3,8 @@
 #
 # Validates the full chain shipped in:
 #   - NousResearch/hermes-agent#18775           (upstream patch)
-#   - Molecule-AI/hermes-platform-molecule-a2a  (plugin)
-#   - Molecule-AI/molecule-ai-workspace-template-hermes#32 (workspace
+#   - molecule-ai/hermes-platform-molecule-a2a  (plugin)
+#   - molecule-ai/molecule-ai-workspace-template-hermes#32 (workspace
 #     template — Dockerfile bakes plugin in, executor uses /a2a/inbound)
 #
 # Test flow:

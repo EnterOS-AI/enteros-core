@@ -129,18 +129,13 @@ services:
       GITHUB_APP_ID: "${GITHUB_APP_ID:-}"
       GITHUB_APP_INSTALLATION_ID: "${GITHUB_APP_INSTALLATION_ID:-}"
       GITHUB_APP_PRIVATE_KEY_FILE: "/secrets/github-app.pem"
-      # ADMIN_TOKEN — required to fully close issue #684 (AdminAuth bearer bypass, PR #729).
-      # When set, only this exact value is accepted on all /admin/* and /approvals/* routes;
-      # workspace bearer tokens are no longer accepted as admin credentials.
-      # Unset (default) → backward-compat fallback: any valid workspace token passes AdminAuth
-      # (same behaviour as before PR #729, still vulnerable to #684).
+      # ADMIN_TOKEN is the bootstrap/break-glass admin credential. Verified CP
+      # sessions and org API tokens are also accepted; when ADMIN_TOKEN is set,
+      # workspace bearer tokens are rejected on admin routes. Leaving it unset
+      # retains the deprecated workspace-token fallback after bootstrap.
       # Generate: openssl rand -base64 32
-      # Store in fly secrets / deployment env — NEVER commit the actual value.
+      # Store in the deployment secret manager — NEVER commit the actual value.
       ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
-      # Workspace hibernation default (issue #724 / PR #724). Sets platform-wide idle
-      # threshold (minutes); per-workspace column takes precedence. Leave empty to
-      # rely on per-workspace config only (current behaviour — global-default code pending).
-      HIBERNATION_IDLE_MINUTES: "${HIBERNATION_IDLE_MINUTES:-}"
       # Plugin supply chain hardening (issue #768 / PR #775). Never set in production.
       PLUGIN_ALLOW_UNPINNED: "${PLUGIN_ALLOW_UNPINNED:-}"
       # Force ImagePull/ContainerCreate to request linux/amd64 manifests
@@ -152,24 +147,15 @@ services:
       # Override to "" or another platform when the templates start shipping
       # multi-arch (then this hardcoded amd64 becomes unnecessary).
       MOLECULE_IMAGE_PLATFORM: "${MOLECULE_IMAGE_PLATFORM:-linux/amd64}"
-      # GHCR auth for the workspace-images refresh endpoint
-      # (POST /admin/workspace-images/refresh). When set, the platform's
-      # Docker SDK ImagePull on private workspace-template-* images
-      # succeeds without per-host `docker login`. GHCR_USER is the GitHub
-      # username; GHCR_TOKEN is a fine-grained PAT with `read:packages`
-      # on the Molecule-AI org. Both unset → endpoint can only pull
-      # public images (current state for all 8 templates).
+      # Unset keeps the normal local clone-and-build path. Set this to a real
+      # registry prefix only for a registry-backed self-host; it also enables
+      # the explicit POST /admin/workspace-images/refresh maintenance endpoint.
+      MOLECULE_IMAGE_REGISTRY: "${MOLECULE_IMAGE_REGISTRY:-}"
+      # Legacy-named optional basic-auth inputs for that endpoint. They are
+      # sent to the host selected above; the current Gitea template images are
+      # anonymously pullable, so both normally remain unset.
       GHCR_USER: "${GHCR_USER:-}"
       GHCR_TOKEN: "${GHCR_TOKEN:-}"
-      # Auto-refresh workspace-template-* images. The watcher polls GHCR
-      # every 5 min; when a digest moves, it pulls and force-recreates any
-      # matching ws-* containers (existing /admin/workspace-images/refresh
-      # logic). Closes the runtime CD chain: merge → containers running
-      # new code, no operator step. Default ON for local dev because that's
-      # where the runtime → ws iteration loop is tightest. Set to "false"
-      # if you don't want the platform to mutate ws-* containers behind
-      # your back during a long-running test.
-      IMAGE_AUTO_REFRESH: "${IMAGE_AUTO_REFRESH:-true}"
     volumes:
       - ./workspace-configs-templates:/configs
       # NOTE: the empty host ./org-templates is intentionally NOT mounted over
@@ -186,10 +172,9 @@ services:
       # Per-role persona credentials (molecule-core#242 local surface).
       # Sourced at workspace creation time by org_import.go::loadPersonaEnvFile
       # when a workspace.yaml carries `role: <name>`. The host-side dir is
-      # populated by the operator-host bootstrap kit (28 dev-tree personas);
-      # /etc/molecule-bootstrap/personas is the in-container path the
-      # platform expects (matches the prod tenant-EC2 path so the same code
-      # works in both modes).
+      # populated from this machine's domain-based agent setup;
+      # /etc/molecule-bootstrap/personas is the legacy in-container path the
+      # platform still reads in local-compose mode.
       #
       # Read-only mount — workspace-server only reads, never writes here.
       # If the host dir is empty/missing the platform's loadPersonaEnvFile
@@ -219,8 +204,7 @@ services:
     # Reproducible deploy: pin CANVAS_IMAGE_TAG to the immutable per-commit tag
     # the ordered deploy produced, e.g.
     #   CANVAS_IMAGE_TAG=staging-<sha> docker compose pull canvas && docker compose up -d canvas
-    # This makes a tenant/host deploy reproducible (resolves the standing
-    # `TODO: pin canvas ECR image digest`). Unset it and the default `latest`
+    # This makes a tenant/host deploy reproducible. Unset it and the default `latest`
     # is the prod-blessed tag the ordered deploy keeps pointed at the last
     # green build — still deterministic vs. the old raw `:latest`.
     #
@@ -233,7 +217,7 @@ services:
     #
     # Registry: OUR OWN container registry (the Gitea registry). Pull auth is a
     # standard `docker login registry.moleculesai.app` with a Gitea PAT
-    # (GITEA_USER/GITEA_TOKEN) — no AWS/ECR credentials required. The image is
+    # (GITEA_USER/GITEA_TOKEN). The image is
     # overridable for a mirror via MOLECULE_CANVAS_IMAGE (mirrors the SSOT var
     # the redeploy workflows already read); default is our registry.
     # Local dev keeps working via the `build:` context below (docker compose build canvas).

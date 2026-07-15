@@ -36,7 +36,7 @@
 #
 # AUTH MODEL (mirrors tests/e2e/test_staging_full_saas.sh)
 # --------------------------------------------------------
-#   Single MOLECULE_ADMIN_TOKEN (= CP_ADMIN_API_TOKEN on Railway staging)
+#   Single MOLECULE_ADMIN_TOKEN (= staging CP_ADMIN_API_TOKEN from Infisical)
 #   drives: POST /cp/admin/orgs (provision), GET
 #   /cp/admin/orgs/:slug/admin-token (per-tenant token), DELETE
 #   /cp/admin/tenants/:slug (teardown). The per-tenant admin token drives
@@ -46,12 +46,12 @@
 #   token-mint routes are used in this E2E (feedback_no_dev_only_routes_in_e2e).
 #
 # Required env:
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway staging CP_ADMIN_API_TOKEN
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical /shared/controlplane-admin
 # Optional env:
 #   MOLECULE_CP_URL        default https://staging-api.moleculesai.app
 #   E2E_RUN_ID             slug suffix; CI passes ${GITHUB_RUN_ID}
 #   PV_RUNTIMES            space list; default "hermes openclaw claude-code"
-#   E2E_PROVISION_TIMEOUT_SECS  default 1800 (hermes/openclaw cold EC2 budget)
+#   E2E_PROVISION_TIMEOUT_SECS  default 1800 (hermes/openclaw cold-provision budget)
 #   E2E_MINIMAX_API_KEY / E2E_ANTHROPIC_API_KEY / E2E_OPENAI_API_KEY
 #                          DEPRECATED for this script — platform-managed models
 #                          use the CP LLM proxy; direct vendor keys are blocked
@@ -79,7 +79,7 @@ set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/peer_visibility_assert.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug
 # now comes from make_collision_proof_slug below; the old suffix
 # var is dead.
@@ -197,8 +197,8 @@ ORG_ID=$(echo "$CREATE" | python3 -c "import sys,json; print(json.load(sys.stdin
 [ -n "$ORG_ID" ] || fail "org creation failed: $(echo "$CREATE" | head -c 300)"
 log "    ORG_ID=$ORG_ID"
 
-# ─── 2. Wait for tenant EC2 + DNS ──────────────────────────────────────
-log "2/6 waiting for tenant instance_status=running (cold EC2 + cloudflared)..."
+# ─── 2. Wait for tenant environment + DNS ──────────────────────────────
+log "2/6 waiting for tenant instance_status=running (provider + routing)..."
 DEADLINE=$(( $(date +%s) + PROVISION_TIMEOUT_SECS ))
 while true; do
   [ "$(date +%s)" -gt "$DEADLINE" ] && fail "tenant never came up within ${PROVISION_TIMEOUT_SECS}s"

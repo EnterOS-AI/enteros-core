@@ -34,11 +34,9 @@ name: zone-count-drift guardrail
 on:
   workflow_dispatch:
 
-# IMPORTANT — Gitea 1.22.6 parser quirk per
-# `feedback_gitea_workflow_dispatch_inputs_unsupported`: do NOT add an
-# `inputs:` block here. Gitea 1.22.6 rejects the whole workflow as
-# "unknown on type" when `workflow_dispatch.inputs.X` is present. Revisit
-# when Gitea is upgraded to 1.26+.
+# Repository policy keeps this dispatch flat (no `inputs:`) until shared
+# callers and lint fixtures are migrated together. The live server is already
+# on 1.26; do not describe this as a pending server upgrade.
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app

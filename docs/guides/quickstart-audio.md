@@ -1,6 +1,6 @@
 ---
 title: "Molecule AI Quick Start — Audio Guide"
-description: "Audio walkthrough of the Molecule AI quick start — from platform setup to your first agent on the canvas."
+description: "Audio walkthrough of the current Molecule AI local quick start, workspace creation, chat, and hierarchy controls."
 tags: [onboarding, quickstart, audio]
 ---
 
@@ -10,20 +10,26 @@ tags: [onboarding, quickstart, audio]
 
 ---
 
-Getting started with Molecule AI takes about five minutes.
+Getting started with Molecule AI locally takes about five minutes.
 
-First, clone the repo and run the setup script. It boots Postgres, Redis, MinIO, and Langfuse — everything the platform needs to run.
+Clone the core repository and run the development start script. It creates the
+local environment file when needed and brings up the workspace server, Canvas,
+and supporting services. Open the Canvas URL printed by the script; it chooses
+another available port when port three thousand is already in use.
 
-Then start the workspace server on port 8080, and the canvas UI on port 3000. Open your browser to localhost 3000.
+On first run, choose the server configuration appropriate for your environment.
+Then create a workspace from Canvas. Pick one of the runtime templates that is
+actually enabled in your deployment, give the workspace a role, and wait for it
+to register.
 
-You land on the canvas — an empty org. The first thing to do is deploy a template. Pick LangGraph, Claude Code, Hermes — or start blank. The template provisions a workspace and puts it on the canvas.
+Open chat and send the workspace a small task. A successful response proves the
+UI, platform API, registry, and selected runtime can communicate end to end.
 
-Open the chat tab. Send the agent a task. Watch it work.
+To organize more workspaces, create or drag them under a parent. The stored
+parent I D defines both the org-chart hierarchy and peer-communication policy.
+Expand Team View and Collapse Team View only change what Canvas displays; they
+do not create, delete, or move workspaces.
 
-Now the part that matters: the org structure. Workspaces nest. A PM workspace can have researcher, QA, and data-pipeline workspaces as children. The PM dispatches tasks; the children report back. That's A2A — the agent-to-agent protocol that makes multi-agent orchestration work.
-
-When you're ready to expand: hit expand, pick a template, the platform provisions the workspace, it registers and appears on the canvas. You govern from one place.
-
-That's Molecule AI. One canvas. One org chart. One audit trail. Agents that run anywhere.
-
-Find the full docs at moleculesai dot A I.
+That is Molecule AI: provider-independent agent runtimes, one live Canvas, and
+an authenticated workspace hierarchy. Use the documentation in the source
+repository for the current operational reference.

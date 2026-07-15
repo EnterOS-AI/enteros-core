@@ -3,6 +3,7 @@
 # Everything via platform API — no manual file edits.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLATFORM="${1:-http://localhost:8080}"
 OR_KEY="${OPENAI_API_KEY:-${OPENROUTER_API_KEY:?Set OPENAI_API_KEY or OPENROUTER_API_KEY env var}}"
 PASS=0
@@ -181,7 +182,7 @@ R=$(curl -s "$PLATFORM/workspaces/$DEV_ID/files" | python3 -c "import sys,json; 
 check "Developer has OpenClaw files" "SOUL.md" "$R"
 
 # Verify NO ws-* dirs on host
-HOST_WS=$(find /Users/hongming/Documents/GitHub/molecule-monorepo/workspace-configs-templates -maxdepth 1 -name 'ws-*' -type d 2>/dev/null | wc -l | tr -d ' ')
+HOST_WS=$(find "$ROOT/workspace-configs-templates" -maxdepth 1 -name 'ws-*' -type d 2>/dev/null | wc -l | tr -d ' ')
 check "No ws-* dirs on host" "0" "$HOST_WS"
 
 # -------------------------------------------------------

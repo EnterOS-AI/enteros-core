@@ -19,8 +19,9 @@ package handlers
 // History:
 //   - PR #2811 introduced provisionWorkspaceAuto + HasProvisioner gate
 //     (closed the org-import SaaS-skip silent-drop bug class).
-//   - PR #2824 added StopWorkspaceAuto (closed the team-collapse +
-//     workspace-delete EC2-leak class — issues #2813, #2814).
+//   - PR #2824 added StopWorkspaceAuto (closed EC2 leaks in the
+//     then-present team-collapse path and workspace delete — issues
+//     #2813, #2814). The destructive team-collapse handler was later retired.
 //   - PR #2843 + #2846 + #2847 + #2848 added RestartWorkspaceAuto +
 //     RestartWorkspaceAutoOpts + provisionWorkspaceAutoSync and
 //     migrated the four workspace_restart.go dispatch sites.
@@ -83,13 +84,14 @@ func (h *WorkspaceHandler) DefaultTier() int {
 // when a backend was kicked off, false when neither is wired.
 //
 // Single source of truth for "start provisioning a workspace" across
-// every caller (Create, OrgHandler.createWorkspaceTree, TeamHandler.Expand,
-// future paths). Centralized routing here means callers don't repeat
+// every caller (Create, org import, provider switch, resume, and bulk
+// resume paths). Centralized routing here means callers don't repeat
 // the "Docker vs CP" decision and can't drift on it.
 //
 // Self-marks-failed on the no-backend path: pre-2026-05-05 the false
-// return was silent, and any caller that forgot to handle it (TeamHandler
-// pre-#2367, OrgHandler.createWorkspaceTree pre-this-fix) silently
+// return was silent, and historical callers that forgot to handle it (the
+// now-retired TeamHandler before #2367 and OrgHandler.createWorkspaceTree
+// before its fix) silently
 // dropped workspaces — they sat in 'provisioning' for 10 min until the
 // sweeper marked them failed with the misleading "container started but
 // never called /registry/register" message. Marking failed inside Auto
@@ -246,9 +248,9 @@ func (h *WorkspaceHandler) provisionWorkspaceAutoSyncLocked(workspaceID, templat
 // Single source of truth for "stop a workspace" — symmetric with
 // provisionWorkspaceAuto. Pre-2026-05-05 the stop side had no Auto
 // dispatcher and every caller wrote `if h.provisioner != nil { Stop }`,
-// which silently leaked EC2s on SaaS:
-//   - team.go:208 (Collapse) — issue #2813
-//   - workspace_crud.go:432 (stopAndRemove during Delete) — issue #2814
+// which silently leaked EC2s on SaaS. Historical examples were the former
+// team.go collapse call site (#2813) and the old workspace_crud.go
+// stopAndRemove delete call site (#2814).
 //
 // Both bugs reproduced for ~6 months. The pattern is the same drift
 // class as the org-import provision bug closed by PR #2811.

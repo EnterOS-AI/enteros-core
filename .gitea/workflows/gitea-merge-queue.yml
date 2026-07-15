@@ -1,10 +1,11 @@
 name: gitea-merge-queue
 
-# External serialized merge queue for Gitea 1.22.6.
+# External serialized merge queue for this repository's exact-head approval,
+# status, and stale-review policy.
 #
-# Gitea's `pull_auto_merge` table is not a real merge queue: it does not
-# serialize green PRs against a freshly-tested latest main. This workflow runs
-# the user-space queue bot, one PR per tick, using the non-bypass merge actor.
+# Gitea's `pull_auto_merge` does not implement this repository's exact-head,
+# one-at-a-time validation policy. This workflow runs the user-space queue bot,
+# one PR per tick, using the non-bypass merge actor.
 #
 # Queue contract:
 #   - auto-discovery (default): any open same-repo PR is considered — no
@@ -23,11 +24,8 @@ on:
   # The queue bot still processes one PR per tick, but no longer occupies
   # one of the shared Actions runners just to poll.
   workflow_dispatch:
-    # NOTE: deliberately NO `inputs:` block. Gitea 1.22.6 mis-parses
-    # `on.workflow_dispatch.inputs` keys as sibling event types and silently
-    # rejects the ENTIRE workflow (`[W] ignore invalid workflow: unknown on
-    # type: map[...]`), which would DISABLE the merge queue instead of adding a
-    # safe dispatch. The dry-run knob is therefore derived from the step-level
+    # Deliberately no `inputs:` block under the repository's flat-dispatch
+    # policy. The dry-run knob is derived from the step-level
     # `DRY_RUN` env var below (default "true" = safe evaluate-only) rather than
     # a dispatch input. See .gitea/scripts/lint-workflow-yaml.py Rule 1 and
     # memory feedback_gitea_workflow_dispatch_inputs_unsupported.
@@ -178,8 +176,8 @@ jobs:
           # bare `CI / all-required`. Gitea treats absent contexts as pending, not
           # skipped; requiring the bare name silently blocks all merges (issue #1473).
           PUSH_REQUIRED_CONTEXTS: CI / all-required (push)
-          # Safe-by-default dry-run knob. Replaces the Gitea-1.22.6-unsupported
-          # `workflow_dispatch.inputs.dry_run`. DEFAULT "true" => a manual
+          # Safe-by-default dry-run knob under the flat-dispatch policy.
+          # DEFAULT "true" => a manual
           # dispatch evaluates every candidate and prints a readiness summary
           # WITHOUT merging (`--enumerate --dry-run`). Flip to "false" (edit
           # here, or wire to a repo/org Actions variable) ONLY to deliberately

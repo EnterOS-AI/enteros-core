@@ -4,8 +4,9 @@ name: Block internal-flavored paths
 # RFC internal#219 §1 sweep.
 #
 # Differences from the GitHub version:
-#   - Dropped `merge_group: { types: [checks_requested] }` (Gitea has no
-#     merge queue; no `gh-readonly-queue/...` refs).
+#   - Omitted GitHub's `merge_group: { types: [checks_requested] }`; this
+#     repository uses its serialized Gitea queue and has no
+#     `gh-readonly-queue/...` refs.
 #   - Workflow-level env.GITHUB_SERVER_URL set per
 #     feedback_act_runner_github_server_url.
 #   - `continue-on-error: true` on the job (RFC §1 contract — surface

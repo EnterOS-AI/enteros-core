@@ -4,8 +4,8 @@
 #
 # Problem: when `CI / all-required (pull_request)` reports failure due to
 # a propagation/timing race despite all required sub-jobs being success,
-# branch protection blocks the merge. Operators currently recover manually
-# per docs/runbooks/ci-umbrella-stale-compensating-status.md.
+# branch protection blocks the merge. This workflow is the current automated
+# recovery path; the retired operator-host manual runbook no longer applies.
 #
 # This workflow automates that recovery: it scans open PRs and posts a
 # compensating success status when the umbrella is stale but all sub-jobs
@@ -26,10 +26,8 @@ name: umbrella-reaper
 #
 # This keeps the compensation cadence but stops a maintenance bot from
 # consuming Gitea Actions runner slots during PR merge waves.
-# Gitea 1.22.6 parser quirk per
-# `feedback_gitea_workflow_dispatch_inputs_unsupported`: do NOT add an
-# `inputs:` block here. Gitea 1.22.6 rejects the whole workflow as
-# "unknown on type" when `workflow_dispatch.inputs.X` is present.
+# Repository policy keeps this dispatch flat (no `inputs:`) until shared
+# callers and lint fixtures are migrated together.
 on:
   workflow_dispatch:
 
@@ -37,8 +35,8 @@ permissions:
   contents: read
 
 # NOTE: NO `concurrency:` block is intentional — same reasoning as
-# status-reaper.yml. Gitea 1.22.6 doesn't honor cancel-in-progress for
-# queued ticks; the POST is idempotent so concurrent ticks are safe.
+# status-reaper.yml. Historical runner behavior cancelled queued ticks; the
+# POST is idempotent, so concurrent dispatches remain safe.
 
 jobs:
   reap:

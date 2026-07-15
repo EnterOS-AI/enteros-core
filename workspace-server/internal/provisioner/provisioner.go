@@ -61,10 +61,9 @@ var ErrUnresolvableRuntime = errors.New("provisioner: requested runtime has no r
 // pre-build step on the tenant host.
 //
 // The registry prefix is determined by RegistryPrefix() in registry.go;
-// defaults to ghcr.io/molecule-ai (upstream OSS) and is overridden via the
-// MOLECULE_IMAGE_REGISTRY env var in production tenants that mirror to
-// AWS ECR or another registry. The map is computed at package init and
-// captures whatever prefix was active then.
+// it defaults to registry.moleculesai.app/molecule-ai and can be overridden
+// with MOLECULE_IMAGE_REGISTRY for self-hosted/private registries. The map is
+// computed at package init and captures whatever prefix was active then.
 //
 // Legacy local-build path (`docker build -t workspace-template:<runtime>`
 // via scripts/build-images.sh) is still supported for development:
@@ -1081,8 +1080,8 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		// agent that forges an approval has no token to act on it. A
 		// latent path exists (loadPersonaEnvFile merges a per-role
 		// persona `GITEA_TOKEN` into cfg.EnvVars when MOLECULE_PERSONA_ROOT
-		// is set on a tenant host); it is inert today (persona dirs are
-		// operator-host-only) but unguarded. Strip SCM-write tokens here
+		// is mounted); it must remain safe regardless of where that persona
+		// directory is sourced. Strip SCM-write tokens here
 		// by construction so the invariant holds regardless of whether
 		// that path ever becomes reachable.
 		if isSCMWriteTokenKey(k) {
@@ -2110,15 +2109,15 @@ func imageTagIsMoving(image string) bool {
 
 // runtimeTagFromImage extracts the runtime name from a workspace-template
 // image reference for use in user-facing error hints. Handles both the
-// legacy local tag (`workspace-template:<runtime>`) and the current GHCR
-// form (`ghcr.io/molecule-ai/workspace-template-<runtime>:<tag>`). Falls
-// back to the full image string if the shape is unrecognised.
+// legacy local tag (`workspace-template:<runtime>`) and the current registry
+// form (`<registry>/workspace-template-<runtime>:<tag>`). Falls back to the
+// full image string if the shape is unrecognised.
 func runtimeTagFromImage(image string) string {
 	const legacyPrefix = "workspace-template:"
 	if strings.HasPrefix(image, legacyPrefix) {
 		return image[len(legacyPrefix):]
 	}
-	// GHCR form: strip everything before and including "workspace-template-",
+	// Registry form: strip everything before and including "workspace-template-",
 	// then drop the :<tag> suffix.
 	const ghcrInfix = "workspace-template-"
 	if i := strings.Index(image, ghcrInfix); i >= 0 {

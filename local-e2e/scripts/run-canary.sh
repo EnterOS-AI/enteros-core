@@ -4,7 +4,7 @@
 # .gitea/workflows/session-continuity-e2e.yml.
 #
 # Usage:
-#   TEMPLATE_IMAGE=ghcr.io/molecule-ai/workspace-template-hermes:latest \
+#   TEMPLATE_IMAGE=registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest \
 #       ./local-e2e/scripts/run-canary.sh
 #
 # Optional env:

@@ -181,9 +181,8 @@ pull_via_host() {
 # localRuntimeTag — the self-host model expects the tag pre-seeded in the local
 # store; on molecules-server the deploy pipeline seeds it). A bare tag can't be
 # pulled from docker.io, so an unseeded host fails workspace provisioning with
-# "docker run: Unable to find image". Pull our registry ref and retag — same
-# mechanics as scripts/refresh-workspace-images.sh, scoped to the ONE runtime
-# the gate exercises.
+# "docker run: Unable to find image". Pull our registry ref and retag it for
+# the one runtime the gate exercises.
 #
 # We do NOT skip this when the bare tag already exists in the store. `:latest` is
 # a moving tag, so "already present" says nothing about WHICH build is present —

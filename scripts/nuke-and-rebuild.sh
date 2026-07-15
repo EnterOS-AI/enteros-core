@@ -57,5 +57,8 @@ echo "=== REBUILD ==="
 docker compose -f "$ROOT/docker-compose.yml" up -d --build
 echo "  platform + canvas up"
 
-echo "=== POST-REBUILD SETUP ==="
-bash "$ROOT/scripts/post-rebuild-setup.sh"
+echo "=== RESET COMPLETE ==="
+echo "  Open http://127.0.0.1:3000 and complete the first-run flow."
+echo "  Add tenant credentials through Canvas Settings."
+echo "  Automation may use authenticated PUT /settings/secrets; do not write"
+echo "  global_secrets rows directly."

@@ -8,10 +8,8 @@ import { getTenantSlug } from "./tenant";
 export const PLATFORM_URL =
   process.env.NEXT_PUBLIC_PLATFORM_URL ?? "http://localhost:8080";
 
-// 35s is long enough for the slowest server-side path (EIC SSH
-// tunnel for tenant EC2 file operations, bounded server-side by
-// `eicFileOpTimeout = 30 * time.Second` in
-// workspace-server/internal/handlers/template_files_eic.go) so the
+// 35s is long enough for the slowest server-side path, including the
+// bounded legacy remote-host file-operation fallback, so the
 // canvas surfaces the server's real error instead of aborting first
 // with a generic timeout. Shorter values caused "Save & Restart" to
 // time out at the client before the backend returned its 5xx. The
@@ -33,7 +31,7 @@ export interface RequestOptions {
  *
  * SaaS cross-origin shape:
  *  - `X-Molecule-Org-Slug` — derived from `window.location.hostname`
- *    by `getTenantSlug()`. Control plane uses it for fly-replay
+ *    by `getTenantSlug()`. The platform uses it to validate tenant
  *    routing. Empty on localhost / non-tenant hosts — safe to omit.
  *  - `Authorization: Bearer <token>` — `NEXT_PUBLIC_ADMIN_TOKEN` baked
  *    into the canvas build (see canvas/Dockerfile L8/L11). Required by

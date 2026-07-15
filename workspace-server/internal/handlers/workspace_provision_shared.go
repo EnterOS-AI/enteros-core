@@ -180,14 +180,14 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	// PR template-claude-code#30 + mc#1525 left open: the askpass binary
 	// + GIT_ASKPASS env are wired in-image, but until now no code path
 	// in workspace-server actually read the persona's git token from
-	// the operator-host bootstrap dir and exported it as
+// the configured persona directory and exported it as
 	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD. Without this, the askpass
 	// helper invokes with an empty password env and git fails the
 	// auth challenge in ~500ms (live-verified for Dev-A/Dev-B
 	// 2026-05-18 ~23:55Z).
 	//
 	// Runs AFTER applyAgentGitIdentity so workspace_secrets named
-	// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD (operator-supplied,
+// GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD (user-supplied,
 	// loaded earlier by loadWorkspaceSecrets) win over the
 	// persona-file default. Uses payload.Role as the persona key —
 	// this matches the slug-form convention agent-dev-a /
@@ -246,11 +246,12 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	if payload.Role != "" {
 		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
 	}
-	// PARENT_ID is consumed by workspace/coordinator.py to track the
-	// parent-child relationship at runtime. Sourced from payload so
-	// every provision path that knows about a parent (currently:
-	// TeamHandler.Expand) injects it without having to thread env
-	// through provisioner.WorkspaceConfig manually.
+	// PARENT_ID is retained as a legacy environment compatibility field.
+	// Current checked-in runtimes do not consume it; authoritative hierarchy
+	// lives in workspaces.parent_id and is exposed through platform APIs.
+	// Keep sourcing the value from payload for older external images that may
+	// still expect the environment variable, without treating it as a current
+	// runtime coordination contract.
 	if payload.ParentID != nil && *payload.ParentID != "" {
 		envVars["PARENT_ID"] = *payload.ParentID
 	}

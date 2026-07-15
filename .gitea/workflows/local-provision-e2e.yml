@@ -32,7 +32,7 @@ name: Local Provision Lifecycle E2E
 # operator ever moves these to a runner WITHOUT docker.sock access for the
 # platform binary, this lane will red — keep it on `docker-host`.
 #
-# Both jobs pin `runs-on: docker-host` (Linux operator-host runners with the
+# Both jobs pin `runs-on: docker-host` (self-hosted Linux runners with the
 # molecule-core-net bridge + a working docker.sock). The bare `ubuntu-latest`
 # label is also advertised by the Windows act_runner, where docker.sock-bound
 # steps fail non-deterministically — see lint-required-workflows-docker-host-
@@ -412,8 +412,8 @@ jobs:
     # promotion-criteria issue. This is a GENUINELY-advisory real-MiniMax lane:
     # it stays masked until the docker-host runner pool reliably builds the
     # template + reaches api.minimax.io AND MOLECULE_STAGING_MINIMAX_API_KEY is
-    # stably available (per-workflow run history is API-blind on Gitea 1.22.6, so
-    # green cannot be confirmed to unmask) — re-tracked, not unmasked. Two prior
+    # stably available. The current review has not established the required
+    # clean-window evidence, so the mask is re-tracked rather than unmasked. Two prior
     # renewal trackers aged past the 14d cap and were superseded (their numbers
     # are intentionally NOT repeated within 2 lines of the directive below —
     # lint-continue-on-error-tracking matches the FIRST tracker in that window).

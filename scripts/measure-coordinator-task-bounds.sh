@@ -28,7 +28,8 @@
 # - It does NOT simulate a coordinator hang via runtime modification.
 #   Instead, it drives a real coordinator with a synthesis-heavy task
 #   and observes the duration the platform tolerates.
-# - It does NOT clean up on failure. Use scripts/cleanup-rogue-workspaces.sh.
+# - It attempts exact-ID cleanup on exit. If that cleanup fails, delete only
+#   the emitted workspace IDs through the authenticated workspace API.
 #
 # What "bug confirmed" looks like (per Issue 4)
 # ---------------------------------------------
@@ -70,7 +71,7 @@
 #   The script deletes both workspaces it created on EXIT (success,
 #   failure, or interrupt). Set KEEP_WORKSPACES=1 to skip cleanup when
 #   you need to inspect the workspaces afterward — but remember to
-#   delete them by hand or chain `cleanup-rogue-workspaces.sh`.
+#   delete those exact workspace IDs by hand through the authenticated API.
 #
 set -euo pipefail
 
@@ -166,7 +167,7 @@ cleanup() {
     [ -z "$id" ] && continue
     # Capture HTTP status separately from response body so a 401/403/5xx
     # surfaces as a `cleanup_failed` event instead of a silent leak. The
-    # operator can then re-run cleanup-rogue-workspaces.sh with fresh
+    # operator can then delete the emitted exact workspace ID with fresh
     # credentials. ADMIN_TOKEN expiry mid-run is the realistic failure
     # mode here; without this we'd swallow it under `>/dev/null 2>&1`.
     code=$(api -o /dev/null -w '%{http_code}' -X DELETE "$PLATFORM/workspaces/$id" 2>/dev/null || echo "curl_err")
@@ -175,7 +176,7 @@ cleanup() {
       # success since the post-condition (workspace absent) holds.
       emit "cleanup_deleted" "{\"workspace_id\":\"$id\",\"http_code\":\"$code\"}"
     else
-      emit "cleanup_failed" "{\"workspace_id\":\"$id\",\"http_code\":\"$code\",\"hint\":\"workspace may be leaked — re-run cleanup-rogue-workspaces.sh\"}"
+      emit "cleanup_failed" "{\"workspace_id\":\"$id\",\"http_code\":\"$code\",\"hint\":\"workspace may be leaked — delete this exact workspace ID through the authenticated API\"}"
     fi
   done
 }

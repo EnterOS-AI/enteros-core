@@ -5,13 +5,13 @@ import type { MetadataRoute } from "next";
 // surface for search crawlers + AI training pipelines.
 //
 // Scope deliberately narrow:
-//   - Apex landing, pricing, and the (currently single) blog post.
+//   - Apex landing and pricing. Retired marketing posts are not indexed.
 //   - Authed app routes are excluded — they're disallowed in robots.ts
 //     and would appear as "Please sign in" wall to a crawler.
 //
 // `lastModified` uses a build-time timestamp rather than per-route
 // fs.stat so the same value applies regardless of where the build
-// runs (Vercel/Railway/local). When we add CMS-backed blog content,
+// runs (CI-hosted or local). If current CMS-backed content is added,
 // swap to a per-entry timestamp from the source-of-truth metadata.
 const SITE_URL =
   process.env.NEXT_PUBLIC_SITE_URL ?? "https://app.moleculesai.app";
@@ -31,12 +31,6 @@ export default function sitemap(): MetadataRoute.Sitemap {
       lastModified: BUILD_DATE,
       changeFrequency: "weekly",
       priority: 0.9,
-    },
-    {
-      url: `${SITE_URL}/blog/2026-04-20-chrome-devtools-mcp`,
-      lastModified: new Date("2026-04-20"),
-      changeFrequency: "monthly",
-      priority: 0.6,
     },
   ];
 }

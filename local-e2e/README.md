@@ -57,7 +57,7 @@ this keeps the harness lean per the CTO directive.
 
 ```bash
 # from molecule-core repo root:
-export TEMPLATE_IMAGE=ghcr.io/molecule-ai/workspace-template-hermes:latest
+export TEMPLATE_IMAGE=registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest
 ./local-e2e/scripts/run-canary.sh
 ```
 

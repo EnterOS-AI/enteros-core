@@ -226,7 +226,7 @@ def test_go_and_canvas_only_changes_do_not_run_the_shellcheck_lane() -> None:
 def test_e2e_script_change_still_runs_the_shellcheck_lane() -> None:
     assert classify("ci", ["tests/e2e/test_chat.sh"])["scripts"] is True
     assert classify("ci", ["infra/scripts/setup.sh"])["scripts"] is True
-    assert classify("ci", ["scripts/promote-tenant-image.sh"])["scripts"] is True
+    assert classify("ci", ["scripts/refresh-workspace-images.sh"])["scripts"] is True
 
 
 def test_tests_harness_change_runs_the_ephemeral_gate() -> None:

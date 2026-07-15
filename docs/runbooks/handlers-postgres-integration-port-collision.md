@@ -1,6 +1,8 @@
 # Runbook — Handlers Postgres Integration port-collision substrate
 
-**Status:** Resolved 2026-05-08 (PR for class B Hongming-owned CICD red sweep).
+**Status:** Historical incident, resolved 2026-05-08. The named operator host
+was decommissioned on 2026-06-28; use this page only for the host-network
+service-container failure pattern, not for current machine access.
 
 ## Symptom
 
@@ -23,8 +25,7 @@ cleanup ran.
 
 ## Root cause
 
-Our Gitea act_runner (operator host `5.78.80.188`,
-`/opt/molecule/runners/config.yaml`) sets:
+The runner configuration at the time set:
 
 ```yaml
 container:
@@ -48,7 +49,7 @@ garbage-collects them as soon as they exit. By the time the migrations
 step runs `pg_isready` / `psql`, the container is gone and connection
 refused.
 
-Reproduction (operator host):
+Historical reproduction on a host-network Docker runner:
 
 ```bash
 docker run --rm -d --name pg-A --network host \
@@ -122,8 +123,8 @@ host-network runner config. Translate using this same pattern:
 4. Read back the bridge IP via `docker inspect` and export as a step env.
 5. `if: always()` cleanup step at the end.
 
-If the count of such workflows grows, factor into a composite action
-(`./.github/actions/sibling-postgres`) so the substrate logic lives
+If the count of such workflows grows, factor into a reusable Gitea action
+under `.gitea/actions/` so the substrate logic lives
 in one place.
 
 ## Related

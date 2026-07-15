@@ -1,5 +1,11 @@
 # Multi-Tenant Agent Platform: SaaS Federation with Molecule AI
 
+> **Historical tutorial (April 2026).** The AWS, EC2, Neon, and former
+> control-plane provisioning instructions below predate the off-AWS rebuild and
+> are not current operational guidance. See
+> [Current Technical Reference](../../architecture/molecule-technical-doc.md)
+> for the supported architecture.
+
 This tutorial walks through setting up a multi-tenant AI agent platform using Molecule AI's SaaS federation layer. You'll provision workspaces for multiple customers from a single control plane, with per-tenant database isolation, credential separation, and agent fleet visualization.
 
 **What this covers:**

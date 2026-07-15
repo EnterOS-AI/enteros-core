@@ -1,12 +1,14 @@
-name: Lint workflow YAML (Gitea-1.22.6-hostile shapes)
+name: Lint workflow YAML (repository compatibility policy)
 
 # Tier-2 hard-gate lint (RFC internal#219 §1, charter §SOP-N rule (m)).
-# Catches six Gitea-1.22.6-hostile workflow-YAML shapes BEFORE they reach
-# `main`. Each rule maps to a documented incident in saved memory:
+# Enforces repository workflow-policy shapes before they reach `main`. Rules 1
+# and 2 originated on Gitea 1.22.6; the current server supports more syntax,
+# but adoption requires an explicit fleet/status migration rather than an
+# incidental workflow edit.
 #
 #   1. workflow_dispatch.inputs   — feedback_gitea_workflow_dispatch_inputs_unsupported
 #                                   (2026-05-11 PyPI freeze 24h)
-#   2. on: workflow_run           — task #81 (Gitea 1.22.6 lacks the event)
+#   2. on: workflow_run           — not yet adopted by the status/reaper topology
 #   3. name: containing "/"       — breaks status-context tokenization
 #   4. cross-file name collision  — status-reaper rev1 fail-loud class
 #   5. cross-repo uses: org/r/p@r — feedback_gitea_cross_repo_uses_blocked
@@ -56,6 +58,9 @@ env:
 
 jobs:
   lint:
+    # Compatibility status name: branch protection and audit tooling consume
+    # this exact historical label. The lint itself enforces current repository
+    # policy, as documented above; rename only through a coordinated BP change.
     name: Lint workflow YAML for Gitea-1.22.6-hostile shapes
     runs-on: ubuntu-latest
     # UNMASKED 2026-07-14 (was `continue-on-error: true`, the RFC #219 §1
@@ -68,7 +73,7 @@ jobs:
     # against this tree:
     #   $ python3 .gitea/scripts/lint-workflow-yaml.py
     #   ::notice::lint-workflow-yaml: 84 workflow file(s) checked, no fatal
-    #     Gitea-1.22.6-hostile shapes. (0 heuristic warning(s) emitted.)  -> exit 0
+    #     repository-policy violations. (0 heuristic warning(s) emitted.)  -> exit 0
     #   $ python3 -m pytest tests/test_lint_workflow_yaml.py -q  -> all pass
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2

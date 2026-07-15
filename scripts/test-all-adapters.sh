@@ -2,6 +2,7 @@
 # E2E test: all maintained adapters — create one agent per runtime, test A2A
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLATFORM="${1:-http://localhost:8080}"
 OPENAI_KEY="${OPENAI_API_KEY:?Set OPENAI_API_KEY env var}"
 PASS=0
@@ -158,7 +159,7 @@ check "Alice sees 3 peers" "3 peers" "$R"
 # --- Isolation ---
 echo ""
 echo "--- Step 6: Verify isolation ---"
-HOST_WS=$(find /Users/hongming/Documents/GitHub/molecule-monorepo/workspace-configs-templates -maxdepth 1 -name 'ws-*' -type d 2>/dev/null | wc -l | tr -d ' ')
+HOST_WS=$(find "$ROOT/workspace-configs-templates" -maxdepth 1 -name 'ws-*' -type d 2>/dev/null | wc -l | tr -d ' ')
 check "No ws-* dirs on host" "0" "$HOST_WS"
 
 # --- Cleanup ---

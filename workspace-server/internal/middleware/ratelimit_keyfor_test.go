@@ -39,6 +39,7 @@ func newTestLimiterForKeyFor(t *testing.T, rate int) *gin.Engine {
 // through the same upstream proxy IP gets its own bucket because the
 // CP attaches the org-id header.
 func TestKeyFor_OrgIdHeaderTrumpsBearerAndIP(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "org-aaa")
 	gin.SetMode(gin.TestMode)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -53,6 +54,29 @@ func TestKeyFor_OrgIdHeaderTrumpsBearerAndIP(t *testing.T) {
 	got := rl.keyFor(c)
 	if got != "org:org-aaa" {
 		t.Errorf("keyFor with org-id header: got %q, want %q", got, "org:org-aaa")
+	}
+}
+
+// A caller can set X-Molecule-Org-Id itself, so it is only a trustworthy
+// bucket key when it matches the tenant identity configured on this process.
+// Otherwise rotating forged org IDs would create an unlimited stream of fresh
+// buckets before TenantGuard rejects the request.
+func TestKeyFor_ForgedOrgIDFallsBackToBearer(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "org-real")
+	gin.SetMode(gin.TestMode)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	rl := NewRateLimiter(2, 5*time.Second, ctx)
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/x", nil)
+	c.Request.RemoteAddr = "10.0.0.1:1234"
+	c.Request.Header.Set("X-Molecule-Org-Id", "org-forged")
+	c.Request.Header.Set("Authorization", "Bearer secret-token-abc")
+
+	want := fmt.Sprintf("tok:%x", sha256.Sum256([]byte("secret-token-abc")))
+	if got := rl.keyFor(c); got != want {
+		t.Fatalf("keyFor with forged org header = %q, want bearer bucket %q", got, want)
 	}
 }
 
@@ -110,16 +134,11 @@ func TestKeyFor_IPFallbackWhenNoOrgIdNoBearer(t *testing.T) {
 	}
 }
 
-// TestRateLimit_TwoOrgsSameIP_IndependentBuckets — the load-bearing
-// regression test for issue #59. Two tenants behind the same upstream
-// proxy must NOT share a bucket; the production SaaS-plane outage was
-// every tenant collapsing to the proxy IP and saturating one bucket.
-//
-// Mutation invariant: removing the org-id branch from keyFor — say,
-// returning "ip:" + c.ClientIP() unconditionally — collapses both
-// tenants back into one bucket and this test fails on the 3rd
-// request because it would 429 instead of 200.
-func TestRateLimit_TwoOrgsSameIP_IndependentBuckets(t *testing.T) {
+// Untrusted org headers cannot be rotated to manufacture fresh buckets. A
+// tenant workspace-server has one configured MOLECULE_ORG_ID; when this test
+// leaves it unset, both forged values must fall back to the same source-IP
+// bucket.
+func TestRateLimit_ForgedOrgHeadersCannotRotateIPBucket(t *testing.T) {
 	r := newTestLimiterForKeyFor(t, 2)
 
 	exhaust := func(orgID string) {
@@ -137,25 +156,15 @@ func TestRateLimit_TwoOrgsSameIP_IndependentBuckets(t *testing.T) {
 	}
 
 	exhaust("org-aaa")
-	// org-aaa is now at 0 tokens. org-bbb's bucket must be FRESH.
+	// The bucket is now exhausted. Rotating the untrusted header must not open a
+	// fresh bucket.
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
 	req.RemoteAddr = "10.0.0.1:1234"
 	req.Header.Set("X-Molecule-Org-Id", "org-bbb")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("org-bbb on same IP must have its own bucket: got %d, want 200 (issue #59 regression)", w.Code)
-	}
-
-	// Confirm org-aaa is still throttled — proves we're not just opening
-	// the gate to everyone.
-	req = httptest.NewRequest(http.MethodGet, "/x", nil)
-	req.RemoteAddr = "10.0.0.1:1234"
-	req.Header.Set("X-Molecule-Org-Id", "org-aaa")
-	w = httptest.NewRecorder()
-	r.ServeHTTP(w, req)
 	if w.Code != http.StatusTooManyRequests {
-		t.Errorf("org-aaa exhausted bucket: want 429, got %d", w.Code)
+		t.Fatalf("rotated forged org header bypassed IP bucket: got %d, want 429", w.Code)
 	}
 }
 
@@ -201,6 +210,7 @@ func TestRateLimit_TwoTokensSameIP_IndependentBuckets(t *testing.T) {
 // test above proves we don't collapse ACROSS orgs; this one proves
 // we DO collapse WITHIN one org.)
 func TestRateLimit_SameOrgDifferentTokens_SharedBucket(t *testing.T) {
+	t.Setenv("MOLECULE_ORG_ID", "org-shared")
 	r := newTestLimiterForKeyFor(t, 2)
 
 	for _, tok := range []string{"token-1", "token-2"} {

@@ -2,10 +2,12 @@ name: Sweep stale Cloudflare Tunnels
 
 # Ported from .github/workflows/sweep-cf-tunnels.yml on 2026-05-11 per RFC
 # internal#219 §1 sweep. Differences from the GitHub version:
-#   - Dropped `workflow_dispatch.inputs` (Gitea 1.22.6 parser rejects them
-#     per feedback_gitea_workflow_dispatch_inputs_unsupported).
-#   - Dropped `merge_group:` (no Gitea merge queue).
-#   - Dropped `environment:` blocks (Gitea has no environments).
+#   - Kept flat `workflow_dispatch` (no `inputs`) under repository policy;
+#     dispatch callers pass parameters through the established env/var path.
+#   - Omitted GitHub's `merge_group:` trigger; this repository uses its
+#     serialized Gitea queue plus pull-request/push status gates.
+#   - Omitted `environment:` blocks; this repository's approval and secret
+#     gates do not depend on Actions environments.
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
 #   - `continue-on-error: true` on each job (RFC §1 contract).
@@ -30,7 +32,7 @@ name: Sweep stale Cloudflare Tunnels
 # orphans by design) refuses to nuke past the threshold.
 #
 # Secrets: CF_API_TOKEN (preferred CI-scoped name) or CLOUDFLARE_API_TOKEN
-# (operator-host canonical name) are accepted — the workflow falls back
+# (legacy canonical name) are accepted — the workflow falls back
 # automatically. Same for CF_ACCOUNT_ID / CLOUDFLARE_ACCOUNT_ID. Confirmed
 # existing per issue #425 §425 audit. CP_ADMIN_API_TOKEN and
 # CP_STAGING_ADMIN_API_TOKEN are unconfirmed — if missing, the verify step

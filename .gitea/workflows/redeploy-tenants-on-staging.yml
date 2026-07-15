@@ -25,8 +25,8 @@ name: redeploy-tenants-on-staging
 
 on:
   # workflow_dispatch ONLY — the auto path moved to staging-tenant-cd.yml.
-  # No inputs: map (Gitea rejects the workflow if present — lint-workflow-yaml
-  # Rule 1). The roll target is read from the repo/org var
+  # No inputs map under the repository's flat-dispatch policy. The roll target
+  # is read from the repo/org var
   # STAGING_REDEPLOY_TARGET_TAG (else defaults to staging-latest).
   workflow_dispatch: {}
 

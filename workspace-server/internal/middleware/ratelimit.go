@@ -4,6 +4,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,10 +16,11 @@ import (
 // RateLimiter implements a token bucket rate limiter keyed by tenant
 // identity (org id, then bearer token, then client IP — see keyFor).
 type RateLimiter struct {
-	mu       sync.Mutex
-	buckets  map[string]*bucket
-	rate     int // tokens per interval
-	interval time.Duration
+	mu          sync.Mutex
+	buckets     map[string]*bucket
+	rate        int // tokens per interval
+	interval    time.Duration
+	tenantOrgID string // only this configured routing header is trusted as a bucket key
 }
 
 type bucket struct {
@@ -30,9 +32,10 @@ type bucket struct {
 // Pass a context to stop the cleanup goroutine on shutdown.
 func NewRateLimiter(rate int, interval time.Duration, ctx context.Context) *RateLimiter {
 	rl := &RateLimiter{
-		buckets:  make(map[string]*bucket),
-		rate:     rate,
-		interval: interval,
+		buckets:     make(map[string]*bucket),
+		rate:        rate,
+		interval:    interval,
+		tenantOrgID: strings.TrimSpace(os.Getenv("MOLECULE_ORG_ID")),
 	}
 	go func() {
 		defer recoverPanic("ratelimit: bucket cleanup")
@@ -59,9 +62,9 @@ func NewRateLimiter(rate int, interval time.Duration, ctx context.Context) *Rate
 
 // keyFor returns the bucket identifier for this request. Priority:
 //
-//  1. X-Molecule-Org-Id header — when present (CP-routed SaaS traffic),
-//     isolates tenants from each other regardless of the upstream proxy IP
-//     they all share.
+//  1. X-Molecule-Org-Id header — only when it exactly matches this process's
+//     configured MOLECULE_ORG_ID. This keeps hosted tenant traffic in one
+//     bucket without trusting a caller-controlled routing header.
 //  2. SHA-256 of Authorization Bearer token — when present (per-workspace
 //     bearer, ADMIN_TOKEN, org-scoped API token). On a per-tenant Caddy
 //     box where the org-id header isn't attached, this still distinguishes
@@ -75,21 +78,15 @@ func NewRateLimiter(rate int, interval time.Duration, ctx context.Context) *Rate
 // are UUIDs ("org:..."), token hashes are 64-char hex ("tok:..."), IPs
 // contain dots/colons ("ip:...").
 //
-// Security note on X-Molecule-Org-Id spoofing: the rate limiter runs
-// BEFORE TenantGuard, so the org-id value here is unvalidated. A caller
-// reaching workspace-server directly could spoof the header to drain
-// another org's bucket. In production this surface is closed by the
-// CP/Caddy front: tenant SGs reject :8080 from the public internet, and
-// CP rewrites the header to the verified org. If a future deployment
-// exposes :8080 directly, validate the org-id (e.g. against
-// MOLECULE_ORG_ID) before keying on it, or move this middleware after
-// TenantGuard. The token-hash and IP fallbacks are unspoofable.
+// An absent or mismatched org header falls through to token/IP keying. The
+// limiter runs before TenantGuard, so accepting arbitrary header values here
+// would let a caller rotate fake org IDs to create unlimited fresh buckets.
 //
 // Issue #59 — replaces the previous IP-only keying that silently
 // collapsed all canvas traffic into one bucket once #179 disabled
 // proxy-header trust. See the issue for the deployment-shape analysis.
 func (rl *RateLimiter) keyFor(c *gin.Context) string {
-	if orgID := strings.TrimSpace(c.GetHeader("X-Molecule-Org-Id")); orgID != "" {
+	if orgID := strings.TrimSpace(c.GetHeader("X-Molecule-Org-Id")); rl.tenantOrgID != "" && orgID == rl.tenantOrgID {
 		return "org:" + orgID
 	}
 	if tok := bearerFromHeader(c.GetHeader("Authorization")); tok != "" {

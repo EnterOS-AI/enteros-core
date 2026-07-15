@@ -1,5 +1,12 @@
 # RFC: Org-level Platform Agent — a tenant-resident concierge
 
+> **Historical RFC snapshot.** This document records the proposal and its
+> superseded alternatives; it is not the source of truth for the currently
+> shipped topology, runtime wiring, or deployment process. Verify current
+> behavior in code and use
+> [Current Technical Reference](../architecture/molecule-technical-doc.md) for
+> user-facing documentation.
+
 **Perspective:** CTO + Backend Engineer + DevOps
 **Status:** Draft — pre-implementation, **CTO sign-off required before any implementation PR**
 **Scope:** `molecule-core` (workspace-server), `molecule-controlplane`, workspace runtime, `molecule-app`

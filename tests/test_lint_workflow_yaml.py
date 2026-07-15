@@ -1,8 +1,10 @@
-"""Tests for `.gitea/scripts/lint-workflow-yaml.py` — Gitea-1.22.6-hostile shape lint.
+"""Tests for `.gitea/scripts/lint-workflow-yaml.py` repository policy.
 
-Hard-gate (Tier-2) lint that catches workflow YAML shapes Gitea 1.22.6
-silently rejects, so they never reach `main`. The six anti-patterns are
-documented in saved memory; this test suite is the structural enforcement.
+Hard-gate (Tier-2) lint that prevents workflow shapes this repository has not
+adopted from reaching `main`. Some fixtures preserve exact Gitea 1.22.6
+incident shapes as legacy compatibility evidence; they are not claims about
+the live server's current capabilities. The six anti-patterns are documented
+in saved memory; this test suite is the structural enforcement.
 
 Per-rule positive (anti-pattern present -> exit 1) + negative (clean -> exit 0)
 cases, plus a multi-file collision case and an aggregation case.
@@ -14,7 +16,7 @@ Dependencies: stdlib + PyYAML. No network.
 
 Cross-links:
 - feedback_gitea_workflow_dispatch_inputs_unsupported (rule 1)
-- internal task #81 (rule 2 — workflow_run unsupported)
+- internal task #81 (rule 2 — workflow_run repository migration)
 - feedback_workflow_name_with_slash_breaks_parsing (rule 3, if filed)
 - feedback_gitea_cross_repo_uses_blocked (rule 5)
 - feedback_act_runner_github_server_url (rule 6)
@@ -55,7 +57,7 @@ def _write(workflow_dir: Path, name: str, content: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Rule 1 — workflow_dispatch.inputs (Gitea 1.22.6 parser rejects)
+# Rule 1 — legacy flat-dispatch repository policy
 # ---------------------------------------------------------------------------
 
 WD_INPUTS_BAD = """
@@ -103,7 +105,7 @@ def test_rule1_workflow_dispatch_inputs_passes_when_absent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Rule 2 — workflow_run event (not supported on Gitea 1.22.6)
+# Rule 2 — workflow_run not yet adopted by this repository
 # ---------------------------------------------------------------------------
 
 WF_RUN_BAD = """
@@ -248,7 +250,7 @@ def test_rule4_name_collision_passes_when_names_distinct(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Rule 5 — cross-repo `uses: org/repo/...@ref` (blocked on 1.22.6)
+# Rule 5 — cross-repo `uses: org/repo/...@ref` (blocked by repository policy)
 # ---------------------------------------------------------------------------
 
 CROSS_REPO_BAD = """

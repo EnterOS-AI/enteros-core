@@ -538,7 +538,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// Inject secrets from persona env + .env files as workspace secrets.
 		// Resolution (later overrides earlier):
 		//   0. Persona env (per-role bootstrap creds; only when ws.Role is set
-		//      and the operator-host bootstrap dir ships a matching file)
+//      and the configured persona directory has a matching file)
 		//   1. Org root .env (shared defaults)
 		//   2. Workspace-specific .env (per-workspace overrides)
 		// Each line: KEY=VALUE → stored as encrypted workspace secret.
@@ -997,8 +997,8 @@ func (h *OrgHandler) migrateRuntimeSchedulesFromRemovedPredecessor(ctx context.C
 // lookupExistingChild returns the id of an existing workspace under
 // (parent_id, name) if any, with idempotency-friendly semantics:
 //   - parent_id IS NOT DISTINCT FROM matches NULL too (root workspaces)
-//   - status='removed' rows are ignored — collapsed teams or deleted
-//     workspaces shouldn't block a re-import
+//   - status='removed' rows are ignored — workspaces removed by deletion or
+//     import reconciliation shouldn't block a re-import
 //
 // On sql.ErrNoRows: returns ("", false, nil) — caller should INSERT.
 // On a real DB error: returns ("", false, err) — caller propagates.

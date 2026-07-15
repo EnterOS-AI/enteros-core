@@ -73,7 +73,7 @@ func applyAgentGitIdentity(envVars map[string]string, workspaceName string) {
 // credential.helper picks up the persona credentials already present in
 // the container env (GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD, or
 // GITEA_USER / GITEA_TOKEN as fallback — the latter pair is what
-// loadPersonaEnvFile delivers from the operator-host bootstrap kit).
+// loadPersonaEnvFile delivers from the configured persona directory).
 //
 // Idempotent: if GIT_ASKPASS is already set (e.g. by an operator-
 // supplied workspace_secret or an env-mutator plugin), the existing
@@ -95,7 +95,7 @@ func applyGitAskpass(envVars map[string]string) {
 }
 
 // applyAgentGitHTTPCreds reads the persona's HTTPS git credential from
-// the operator-host bootstrap dir and injects it as GIT_HTTP_USERNAME /
+// the configured persona directory and injects it as GIT_HTTP_USERNAME /
 // GIT_HTTP_PASSWORD so the in-container askpass helper can emit it on
 // git's auth challenge.
 //
@@ -118,7 +118,7 @@ func applyGitAskpass(envVars map[string]string) {
 // the container env on any future provisioner refactor.
 //
 // Idempotent: existing GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD keys are
-// preserved. Operator-supplied workspace_secrets win over the persona
+// preserved. User-supplied workspace_secrets win over the persona
 // token file by virtue of running BEFORE this helper in
 // prepareProvisionContext.
 //

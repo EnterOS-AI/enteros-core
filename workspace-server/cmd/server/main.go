@@ -43,7 +43,6 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/imagewatch"
 	memwiring "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/memory/wiring"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/middleware"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
@@ -649,18 +648,6 @@ func main() {
 	// Channel Manager — social channel integrations (Telegram, Slack, etc.)
 	channelMgr := channels.NewManager(wh, broadcaster)
 	go supervised.RunWithRecover(ctx, "channel-manager", channelMgr.Start)
-
-	// Image auto-refresh — closes the runtime CD chain to "merge → containers
-	// running new code" with no human in between. Polls GHCR for digest
-	// changes on workspace-template-* :latest tags and invokes the same
-	// refresh logic /admin/workspace-images/refresh exposes. Opt-in:
-	// SaaS deploys whose pipeline already pulls every release should leave
-	// it off (would be redundant work). Self-hosters get true zero-touch.
-	if prov != nil && strings.EqualFold(os.Getenv("IMAGE_AUTO_REFRESH"), "true") {
-		svc := handlers.NewWorkspaceImageService(prov.DockerClient())
-		watcher := imagewatch.New(svc)
-		go supervised.RunWithRecover(ctx, "image-auto-refresh", watcher.Run)
-	}
 
 	// Wire channel manager into scheduler for auto-posting cron output to Slack
 	cronSched.SetChannels(channelMgr)

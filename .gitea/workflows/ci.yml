@@ -5,19 +5,18 @@
 # (feedback_gitea_actions_migration_audit_pattern) was performed against this
 # port:
 #
-#   1. YAML — dropped `merge_group` trigger (no Gitea merge queue); no
-#      `workflow_dispatch.inputs` to drop (Gitea 1.22.6 rejects those —
-#      feedback_gitea_workflow_dispatch_inputs_unsupported); no `environment:`
-#      blocks; kept `runs-on: ubuntu-latest` (Gitea runner pool advertises
-#      this label per agent_labels in action_runner table). Workflow-level
-#      env.GITHUB_SERVER_URL set as belt-and-suspenders against runner
+#   1. YAML — omitted GitHub's `merge_group` trigger because this repository
+#      uses its serialized Gitea queue; retained the flat-dispatch policy (no
+#      `workflow_dispatch.inputs`) and omitted `environment:` coupling; kept
+#      `runs-on: ubuntu-latest` because the runner pool advertises this label.
+#      Workflow-level env.GITHUB_SERVER_URL is set as belt-and-suspenders against runner
 #      defaults (feedback_act_runner_github_server_url).
 #
-#   2. Cache — `actions/upload-artifact@v3.2.2` was already pinned to v3 for
-#      Gitea act_runner v0.6 compatibility (a comment in the original called
-#      this out). v4+ is incompatible with Gitea 1.22.x. No `actions/cache`
-#      usage to audit. `actions/setup-python@v6` `cache: pip` is left in
-#      place — works against Gitea's built-in cache server when runner.cache
+#   2. Cache — `actions/upload-artifact@v3.2.2` remains the protocol validated
+#      against this repository's runner fleet; upgrade only after an end-to-end
+#      artifact round trip. No `actions/cache` usage to audit.
+#      `actions/setup-python@v6` `cache: pip` is left in place — it works
+#      against Gitea's built-in cache server when runner.cache
 #      is configured (currently is, /opt/molecule/runners/config.yaml).
 #
 #   3. Token — workflow uses no custom dispatch tokens. The auto-injected
@@ -45,8 +44,8 @@ on:
     branches: [main, staging]
   pull_request:
     branches: [main, staging]
-  # `merge_group` (GitHub merge-queue trigger) dropped — Gitea has no merge
-  # queue. The .github/ original retains it; this Gitea-side copy drops it.
+  # GitHub's `merge_group` trigger is intentionally omitted. This repository's
+  # serialized Gitea queue advances PRs using pull-request and push statuses.
 
 # Cancel in-progress CI runs when a new commit arrives on the same ref.
 # Stale runs queue up otherwise. PR refs and main/staging refs each get
@@ -446,12 +445,10 @@ jobs:
         run: npx vitest run --coverage
       - name: Upload coverage summary as artifact
         if: ${{ needs.changes.outputs.canvas == 'true' }}
-        # Pinned to v3 for Gitea act_runner v0.6 compatibility — v4+ uses
-        # the GHES 3.10+ artifact protocol that Gitea 1.22.x does NOT
-        # implement, surfacing as `GHESNotSupportedError: @actions/artifact
-        # v2.0.0+, upload-artifact@v4+ and download-artifact@v4+ are not
-        # currently supported on GHES`. Drop this pin when Gitea ships
-        # the v4 protocol (tracked: post-Gitea-1.23 followup).
+        # Pinned to v3 because it is the artifact protocol validated across
+        # this repository's current runner fleet. Upgrade only after a v4
+        # upload/download round trip passes end to end; the legacy
+        # incompatibility surfaced as `GHESNotSupportedError`.
         uses: actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2
         with:
           name: canvas-coverage-${{ github.run_id }}
@@ -624,33 +621,12 @@ jobs:
         run: bash .gitea/scripts/lint-e2e-ki013-container-names.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
-        name: Test ECR promote-tenant-image script (mock-driven, no live infra)
-        # Covers scripts/promote-tenant-image.sh — the codified
-        # :staging-latest → :latest ECR promote + tenant fleet redeploy
-        # closing molecule-ai/molecule-core#660. 40 mock-driven cases
-        # exercise every exit path (preflight, snapshot, promote, redeploy
-        # 403→SSM-refresh, verify, rollback). No live AWS/CP/SSM calls.
-        run: |
-          bash scripts/test-promote-tenant-image.sh
-
-      - if: ${{ needs.changes.outputs.scripts == 'true' }}
-        name: Drift guard — KI-013 container/volume naming (SEV #2499)
-        # KI-013 removed 12-char UUID truncation from container/volume names.
-        # E2E scripts must use FULL workspace IDs. This fail-closed guard
-        # prevents regressions where a new/modified script reintroduces the
-        # old truncated-name pattern (the root cause of SEV #2499).
-        run: bash .gitea/scripts/lint-e2e-ki013-container-names.sh
-
-      - if: ${{ needs.changes.outputs.scripts == 'true' }}
-        name: Shellcheck promote-tenant-image script
+        name: Shellcheck current deployment helpers
         # scripts/ is excluded from the bulk shellcheck pass above (legacy
-        # SC3040/SC3043 cleanup pending). Run shellcheck explicitly on
-        # the promote script + its test harness so regressions there are
-        # caught by the required check.
+        # SC3040/SC3043 cleanup pending). Keep the active local-docker staging
+        # rollout helper and its fail-closed flag tests covered explicitly.
         run: |
           shellcheck --severity=warning \
-            scripts/promote-tenant-image.sh \
-            scripts/test-promote-tenant-image.sh \
             scripts/deploy/redeploy-staging-fleet.sh \
             scripts/deploy/tests/test-managed-flags.sh
 
@@ -707,8 +683,8 @@ jobs:
           printf '\n> Posted automatically by CI · commit `%s` · [publish workflow](%s)\n' \
             "$COMMIT_SHA" "$RUN_URL" >> /tmp/deploy-status.md
 
-          # Gitea has no commit-comments API; write to GITHUB_STEP_SUMMARY, which
-          # both GitHub and Gitea Actions render as the run's summary page.
+          # This lane records deployment status in GITHUB_STEP_SUMMARY rather
+          # than mutating commit discussion; Gitea Actions renders the summary.
           cat /tmp/deploy-status.md >> "$GITHUB_STEP_SUMMARY"
 
   # Python Lint & Test — required check, always runs.
@@ -791,9 +767,10 @@ jobs:
     # (`if: needs.changes.outputs.* != 'true'`) rather than at the JOB level.
     # A per-step-gated job always reaches a terminal SUCCESS (it no-ops its
     # expensive steps but the job itself still completes), so it is never
-    # `skipped`. Plain `needs:` (WITHOUT `if: always()`) works correctly on
-    # Gitea 1.22.6 / act_runner v0.6.1 — only `needs:` + `if: always()` is
-    # broken (feedback_gitea_needs_works_only_ifalways_broken). We therefore
+    # `skipped`. Repository compatibility policy retains plain `needs:`
+    # (WITHOUT `if: always()`). The legacy Gitea 1.22.6 / act_runner v0.6.1
+    # incident showed `needs:` + `if: always()` could bypass this gate
+    # (feedback_gitea_needs_works_only_ifalways_broken). We therefore
     # use plain `needs:` + an explicit per-need result check (NOT
     # `if: always()`); if any need fails/errors, Gitea never starts this job
     # and BP sees `CI / all-required` go red via the failed dependency

@@ -73,7 +73,7 @@ export const plans: Plan[] = [
     price: "$99/month",
     features: [
       "Unlimited workspaces",
-      "Dedicated Fly Machine per tenant",
+      "Dedicated tenant environment",
       "Cross-workspace A2A audit log",
       "Priority support (24h)",
       "25M LLM tokens / month included",

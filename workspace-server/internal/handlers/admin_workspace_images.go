@@ -23,18 +23,13 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
-// WorkspaceImageService is the production-side end of the runtime CD chain.
-// It (1) pulls workspace template images from GHCR via the Docker SDK and
-// (2) recreates running ws-* containers so they adopt the new image.
+// WorkspaceImageService is an explicit, single-host maintenance utility. It
+// pulls workspace template images from the configured registry and can remove
+// matching ws-* containers so the local provisioner recreates them later.
 //
-// Two callers:
-//   - AdminWorkspaceImagesHandler — POST /admin/workspace-images/refresh, the
-//     manual end-of-chain trigger documented in
-//     docs/workspace-runtime-package.md.
-//   - imagewatch.Watcher — the auto-refresh goroutine that polls GHCR
-//     digests and invokes Refresh when an image changes upstream. This is
-//     what closes the chain to "merge → containers running new code" with
-//     no human in between.
+// It is not the managed runtime rollout path: managed launches are selected by
+// control-plane image pins, and a template publish does not prove that an
+// already-running workspace changed image.
 type WorkspaceImageService struct {
 	docker *dockerclient.Client
 }
@@ -92,8 +87,7 @@ func loadImageRefreshRuntimes() []string {
 	return out
 }
 
-// RefreshResult is the per-call outcome surfaced to HTTP callers AND logged
-// by the auto-refresh watcher.
+// RefreshResult is the per-call outcome surfaced to the admin HTTP caller.
 type RefreshResult struct {
 	Pulled    []string `json:"pulled"`
 	Failed    []string `json:"failed"`
@@ -102,31 +96,26 @@ type RefreshResult struct {
 
 // TemplateImageRef returns the canonical image ref for a runtime's template,
 // using the configured registry (provisioner.RegistryPrefix()) and the
-// moving `:latest` tag. Single source of truth shared with imagewatch.
+// moving `:latest` tag.
 //
-// Defaults to ghcr.io/molecule-ai/workspace-template-<runtime>:latest
-// (upstream OSS). When MOLECULE_IMAGE_REGISTRY is set in the environment
-// (typically the AWS ECR mirror in production), this returns the prefixed
-// equivalent so admin operations and image-watch checks hit the same
-// registry the provisioner pulls from.
+// Defaults to registry.moleculesai.app/molecule-ai/workspace-template-
+// <runtime>:latest. MOLECULE_IMAGE_REGISTRY may select an operator-controlled
+// mirror for a registry-backed self-host.
 func TemplateImageRef(runtime string) string {
 	return fmt.Sprintf("%s/workspace-template-%s:latest", provisioner.RegistryPrefix(), runtime)
 }
 
-// ghcrAuthHeader returns the base64-encoded JSON auth payload Docker's
+// registryAuthHeader returns the base64-encoded JSON auth payload Docker's
 // ImagePull expects in PullOptions.RegistryAuth, or empty string when no
-// GHCR_USER/GHCR_TOKEN env is set (lets public images pull through and lets
-// ECR's credential-helper-driven flow take over without a stale GHCR
-// payload masking it).
+// legacy GHCR_USER/GHCR_TOKEN pair is set. The names are retained only for
+// compatibility; the payload is sent to the host selected by
+// MOLECULE_IMAGE_REGISTRY.
 //
 // The Docker SDK doesn't read ~/.docker/config.json — every authenticated
 // pull needs an explicit RegistryAuth string. The serveraddress field is
 // resolved from provisioner.RegistryHost() so it tracks MOLECULE_IMAGE_REGISTRY
-// when the operator points the platform at a private mirror (e.g. ECR).
-// Leaving it hardcoded to "ghcr.io" caused the engine to match the wrong
-// auth entry post-suspension when MOLECULE_IMAGE_REGISTRY was flipped to
-// the AWS ECR mirror (RFC #229).
-func ghcrAuthHeader() string {
+// when the operator points the platform at a private mirror.
+func registryAuthHeader() string {
 	user := strings.TrimSpace(os.Getenv("GHCR_USER"))
 	token := strings.TrimSpace(os.Getenv("GHCR_TOKEN"))
 	if user == "" || token == "" {
@@ -139,13 +128,14 @@ func ghcrAuthHeader() string {
 	}
 	js, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("workspace-images: failed to marshal GHCR auth: %v", err)
+		log.Printf("workspace-images: failed to marshal registry auth: %v", err)
 		return ""
 	}
 	return base64.StdEncoding.EncodeToString(js)
 }
 
-// Refresh pulls the requested runtimes' template images from GHCR and (if
+// Refresh pulls the requested runtimes' template images from the configured
+// registry and (if
 // recreate) force-removes any matching ws-* containers so the platform
 // re-provisions them on next interaction.
 //
@@ -155,7 +145,7 @@ func ghcrAuthHeader() string {
 // containers at all (caller should surface that as 500).
 func (s *WorkspaceImageService) Refresh(ctx context.Context, runtimes []string, recreate bool) (RefreshResult, error) {
 	res := RefreshResult{Pulled: []string{}, Failed: []string{}, Recreated: []string{}}
-	auth := ghcrAuthHeader()
+	auth := registryAuthHeader()
 
 	pullCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
@@ -245,6 +235,10 @@ func (s *WorkspaceImageService) Refresh(ctx context.Context, runtimes []string, 
 //	?runtime=claude-code   (optional; default = all runtimes in AllRuntimes)
 //	&recreate=true|false   (default true; false = pull only)
 //
+// The endpoint is available only when MOLECULE_IMAGE_REGISTRY selects a real
+// registry. Unset-registry self-hosts use the Gitea clone-and-build path, so a
+// remote pull here would update a different image source than provisioning.
+//
 // Returns JSON {pulled: [...], failed: [...], recreated: [...]}
 type AdminWorkspaceImagesHandler struct {
 	svc *WorkspaceImageService
@@ -252,12 +246,6 @@ type AdminWorkspaceImagesHandler struct {
 
 func NewAdminWorkspaceImagesHandler(docker *dockerclient.Client) *AdminWorkspaceImagesHandler {
 	return &AdminWorkspaceImagesHandler{svc: NewWorkspaceImageService(docker)}
-}
-
-// Service exposes the underlying refresh logic so the auto-refresh watcher
-// in cmd/server can share the exact code path the HTTP handler uses.
-func (h *AdminWorkspaceImagesHandler) Service() *WorkspaceImageService {
-	return h.svc
 }
 
 func (h *AdminWorkspaceImagesHandler) Refresh(c *gin.Context) {
@@ -279,12 +267,18 @@ func (h *AdminWorkspaceImagesHandler) Refresh(c *gin.Context) {
 		}
 		runtimes = []string{r}
 	}
+	if provisioner.Resolve().Mode != provisioner.RegistryModeSaaS {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "workspace image refresh is unavailable in local-build mode; set MOLECULE_IMAGE_REGISTRY to use a registry-backed self-host",
+		})
+		return
+	}
 	recreate := c.DefaultQuery("recreate", "true") == "true"
 
 	res, err := h.svc.Refresh(c.Request.Context(), runtimes, recreate)
-	authStatus := "no GHCR auth (public images only)"
-	if ghcrAuthHeader() != "" {
-		authStatus = "GHCR_USER/GHCR_TOKEN auth"
+	authStatus := "anonymous registry pull"
+	if registryAuthHeader() != "" {
+		authStatus = "configured registry basic auth"
 	}
 	log.Printf("workspace-images/refresh: pulled=%d failed=%d recreated=%d (%s)",
 		len(res.Pulled), len(res.Failed), len(res.Recreated), authStatus)

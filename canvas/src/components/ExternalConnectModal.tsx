@@ -42,7 +42,7 @@ export interface ExternalConnectionInfo {
   universal_mcp_snippet?: string;
   // Hermes channel snippet — for operators whose external agent IS a
   // hermes-agent session. Routes A2A traffic into the hermes gateway
-  // via the molecule-channel plugin (Molecule-AI/hermes-channel-molecule).
+  // via the molecule-channel plugin (molecule-ai/hermes-channel-molecule).
   // Long-poll based (no tunnel) — same UX shape as the Claude Code
   // channel tab. Gives hermes true push parity. Optional for backward
   // compat with platforms that haven't shipped this PR yet.

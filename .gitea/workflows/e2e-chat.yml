@@ -59,7 +59,7 @@ jobs:
   e2e-chat:
     name: E2E Chat
     # mc#1529 follow-on: docker run/exec for postgres + redis containers.
-    # Must land on operator-host Linux (docker-host).
+    # Must land on the self-hosted Linux docker-host lane.
     runs-on: docker-host
     # mc#2654 mask REMOVED — this lane is now FAIL-CLOSED (gating). It runs the
     # LOCAL platform-server (MOLECULE_ORG_ID unset → the local Docker /
@@ -308,7 +308,7 @@ jobs:
           # real route the specs navigate to (`/?m=chat`) and require a 2xx,
           # which only happens once Turbopack has finished the first
           # compile. The previous 30s budget was also too tight for a cold
-          # Turbopack first-compile on a loaded operator-host runner — the
+          # Turbopack first-compile on a loaded docker-host runner — the
           # `Canvas did not start in 30s` flake. Raise to 120s (job
           # timeout-minutes is 15, so this is comfortably bounded) and probe
           # every 2s.

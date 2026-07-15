@@ -43,11 +43,10 @@ How it works (one PR tick):
   3. Pull the last N commits of the target branch (PR base), fetch
      combined commit-status per commit, scan ``statuses[]`` for
      contexts matching ANY of the flipped jobs. For each match,
-     fetch the actual run log via the web-UI route
-     ``{server_url}/{repo}/actions/runs/{run_id}/jobs/{job_idx}/logs``
-     (per memory ``reference_gitea_actions_log_fetch`` — Gitea 1.22.6
-     lacks REST ``/actions/runs/*`` endpoints; the web-UI route is the
-     only working path; see ``reference_gitea_1_22_6_lacks_rest_rerun_endpoints``).
+     fetch the actual run log via the raw web-UI job-log route
+     ``{server_url}/{repo}/actions/runs/{run_id}/jobs/{job_idx}/logs``.
+     The current Actions REST API supplies run metadata and reruns elsewhere;
+     this gate retains the web route because it returns raw job logs directly.
   4. Grep each log for the Go-test failure markers ``--- FAIL`` /
      ``FAIL\\s+<package>`` AND the bash-step error sentinel
      ``::error::``. If ANY recent log shows any of these AND the
@@ -430,9 +429,7 @@ def combined_status(sha: str) -> dict:
 
 
 def _entry_state(s: dict) -> str:
-    """Per-entry state — Gitea 1.22.6 schema asymmetry: top-level
-    uses ``state``, per-entry uses ``status``. Defensive fallback per
-    main-red-watchdog.py line 233."""
+    """Read both legacy per-entry ``status`` and newer ``state`` shapes."""
     return s.get("status") or s.get("state") or ""
 
 
@@ -440,10 +437,9 @@ def fetch_log(target_url: str) -> str | None:
     """Fetch a job log given its web-UI ``target_url`` (e.g.
     ``/molecule-ai/molecule-core/actions/runs/13494/jobs/0``).
 
-    Per ``reference_gitea_actions_log_fetch``: append ``/logs`` to the
-    job route. Per ``reference_gitea_1_22_6_lacks_rest_rerun_endpoints``:
-    Gitea 1.22.6 lacks the REST ``/api/v1/.../actions/runs/*`` path; the
-    web-UI route is the only working endpoint until 1.24+.
+    Append ``/logs`` to the job route. The web log route is retained because
+    it returns the raw job log directly; the current Actions REST API is used
+    elsewhere for run metadata and reruns.
 
     Returns the log text on success, ``None`` on 404 / log-pruned /
     network error (caller treats None as "log unavailable, warn-not-fail").

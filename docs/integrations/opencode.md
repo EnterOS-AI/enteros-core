@@ -64,7 +64,7 @@ When opencode connects to the Molecule MCP endpoint, the agent gains access to:
   "tool": "delegate_task",
   "arguments": {
     "target": "research-lead",
-    "task": "Summarise the last 7 days of commits in Molecule-AI/molecule-core"
+    "task": "Summarise the last 7 days of commits in molecule-ai/molecule-core"
   }
 }
 ```

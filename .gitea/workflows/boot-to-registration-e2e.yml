@@ -10,9 +10,7 @@ name: boot-to-registration-e2e
 # CTO directive 14eb4f07: "build the minimal claude-code+kimi cell,
 # it should now go GREEN since the fix is live."
 #
-# Stage 1 of 5-stage rollout. Reuses the dispatch-only EC2
-# provisioning path from test_staging_full_saas.sh but reduced to
-# the minimum boot-to-registration surface:
+# Minimal molecules-server cell reduced to the boot-to-registration surface:
 #
 #   1. Provision request accepted; workspace transitions to booting/running
 #   2. Controlplane receives /registry/register for that workspace_id
@@ -24,9 +22,9 @@ name: boot-to-registration-e2e
 # (888efceb) + PR #2167 merge, cell should turn GREEN. THAT green
 # is the cluster-proof signal.
 #
-# Cost controls (mandatory):
-#   - SPOT instances (tagged run_id/workspace_id for cost attribution)
-#   - Fast teardown (~3-5 min wall-clock) even on assertion failure
+# Isolation controls:
+#   - A run-scoped local-docker org/workspace identity
+#   - Bounded teardown even on assertion failure
 #   - Structured per-cell results JSON (runtime/provider/model/
 #     billing_mode/workspace_id/register_status/completion_status/
 #     teardown_status/elapsed_seconds)
@@ -63,10 +61,8 @@ on:
       - 'tests/e2e/lib/collision-proof-slug.sh'
       - '.gitea/workflows/boot-to-registration-e2e.yml'
   workflow_dispatch:
-  # Note: Gitea 1.22.6 does not support workflow_dispatch.inputs
-  # (feedback_gitea_workflow_dispatch_inputs_unsupported). Defaults
-  # are hardcoded in the job env below. Stage 2 can add matrix/
-  # param support once the Gitea version supports it.
+  # Repository policy keeps dispatch flat. Defaults are hardcoded in the job
+  # env below; parameterization needs a deliberate caller/fixture migration.
 
 # No cron schedule. Runs on push/pull_request (main+staging) + manual dispatch.
 # Branch protection doesn't require this yet (not in .gitea/required-contexts.txt) —
@@ -78,9 +74,9 @@ permissions:
 
 # Per-SHA grouping (mirrors e2e-api.yml). Each run provisions its OWN isolated
 # cell (slug `cp455-<run_id>`), so two commits' runs never corrupt each other.
-# A STATIC group would make a newer main push cancel the older commit's run, and
-# on Gitea 1.22.6 a superseded same-group run is CANCELLED (not queued) even
-# with cancel-in-progress:false (status-reaper.yml 69-72), stamping a cancel-red
+# A STATIC group would make a newer main push cancel the older commit's run. A
+# legacy runner incident showed a superseded same-group run could be CANCELLED
+# (not queued) even with cancel-in-progress:false, stamping a cancel-red
 # that wedges the `[*]` queue. cancel-in-progress:false so a teardown is never
 # aborted mid-flight.
 concurrency:
@@ -95,17 +91,11 @@ jobs:
   minimal-cell:
     name: Minimal cell (claude-code + molecules-server + SSOT default model)
     runs-on: ubuntu-latest
-    # Bounded at 12 min. Wall-clock budget breakdown:
-    #   - cold EC2 provision: ~3-4 min (SPOT)
-    #   - /registry/register wait: ~30s
-    #   - completion call: ~10s
-    #   - teardown: ~30-60s
-    #   - tail headroom: ~6-7 min
+    # Bounded at 12 min for local-docker provision, registration, completion,
+    # teardown, and runner headroom.
     timeout-minutes: 12
     env:
-      # Hardcoded defaults — Gitea 1.22.6 does not support workflow_dispatch.inputs
-      # (feedback_gitea_workflow_dispatch_inputs_unsupported). Stage 2 can add
-      # matrix/param support once the Gitea version supports it.
+      # Hardcoded defaults under the repository's flat-dispatch policy.
       #
       # E2E_RUNTIME / E2E_MODEL: these literals are now only the FALLBACK. On a
       # trusted event the "Fetch platform defaults from KMS SSOT" step below
@@ -211,7 +201,7 @@ jobs:
         run: |
           if [ -z "${MOLECULE_ADMIN_TOKEN:-}" ]; then
             echo "::error::CP_STAGING_ADMIN_API_TOKEN secret missing — minimal-cell e2e cannot run"
-            echo "::error::Set it at Settings → Secrets and Variables → Actions; pull from staging-CP's CP_ADMIN_API_TOKEN env in Railway."
+            echo "::error::Provision CP_ADMIN_API_TOKEN from Infisical staging /shared/controlplane-admin through the CI identity."
             exit 1
           fi
 
@@ -281,7 +271,7 @@ jobs:
             echo "### Next steps"
             echo ""
             echo "1. Check the harness output above for the assertion that failed"
-            echo "2. If assertion 1 fails: provision path broken — check CP admin API + EC2 quota"
+            echo "2. If assertion 1 fails: provision path broken — check CP admin API + molecules-server capacity"
             echo "3. If assertion 2 fails: /registry/register path broken — check workspace-server boot"
             echo "4. If assertion 3 fails: LLM proxy / completion path broken — check cp#469 cluster"
             echo "5. If assertion 4 fails: teardown trap broken — leak risk, fix immediately"

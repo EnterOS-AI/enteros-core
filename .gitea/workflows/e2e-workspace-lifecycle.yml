@@ -11,7 +11,7 @@ name: E2E Workspace Lifecycle (staginge2e)
 # + url-cleared-on-stop) — not just HTTP 200.
 #
 # ADVISORY-BY-INFRA. It needs a live staging tenant (a cold molecules-server / local-docker
-# provision, was the ~30+ min cold EC2 path), so the real run is workflow_dispatch
+# provision, historically included a ~30+ min cold-provider path), so the real run is workflow_dispatch
 # only — NOT per-PR and NOT a
 # required check. Promotion to a required branch-protection context is a separate
 # CTO decision (mirrors the cp internal/staginge2e suite, cp#386, and the
@@ -32,7 +32,7 @@ name: E2E Workspace Lifecycle (staginge2e)
 # without creds (the suite's contract) — a broken test file fails at PR time. The
 # real assertion runs on dispatch/cron with staging creds.
 #
-# Gitea 1.22.6 / act_runner notes honored: no cross-repo uses (mirrored
+# Repository runner-compatibility notes honored: no cross-repo uses (mirrored
 # actions/checkout SHA), per-SHA concurrency, pinned GITHUB_SERVER_URL.
 
 on:

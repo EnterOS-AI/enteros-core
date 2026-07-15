@@ -268,7 +268,7 @@ export function ProvisioningTimeout({
 
   const [consoleFor, setConsoleFor] = useState<string | null>(null);
   const handleViewLogs = useCallback((workspaceId: string) => {
-    // Open the EC2 console modal — this is the boot-trace log, which
+    // Open the workspace boot-log modal — this is the host bootstrap trace, which
     // is what the user actually wants to see when provisioning is
     // stuck (the terminal tab is post-boot, useless if the agent
     // runtime never started). The modal closes over itself if the

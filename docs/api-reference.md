@@ -54,8 +54,8 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | POST | /workspaces/:id/restart | workspace.go |
 | POST | /workspaces/:id/pause | workspace.go (stops container, status→paused) |
 | POST | /workspaces/:id/resume | workspace.go (re-provisions paused workspace) |
-| POST | /workspaces/:id/a2a | workspace.go — requires a source-bound workspace bearer or verified human/inbound credential; optional `X-Workspace-ID` must match bearer ownership. Combined self-host/dev Canvas requests may use same-origin only when CP session verification is unconfigured. |
-| GET | /workspaces/:id/a2a/queue/:queue_id | a2a_queue_status.go — same authentication as A2A send, followed by queue sender/target ownership check |
+| POST | /workspaces/:id/a2a | a2a_proxy.go — requires a source-bound workspace bearer or verified human/inbound credential; optional `X-Workspace-ID` must match bearer ownership. Combined self-host/dev Canvas requests may use same-origin only when CP session verification is unconfigured. |
+| GET | /workspaces/:id/a2a/queue/:queue_id | a2a_queue_status.go — same authentication as A2A send, followed by queue sender/target ownership checks |
 | POST | /workspaces/:id/delegate | delegation.go (async fire-and-forget) |
 | GET | /workspaces/:id/delegations | delegation.go (list delegation status) |
 | GET/POST | /workspaces/:id/schedules | schedules.go (cron CRUD) |
@@ -94,7 +94,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | GET | /events | events.go — `AdminAuth` required |
 | GET | /events/:workspaceId | events.go — `AdminAuth` required |
 | GET | /admin/liveness | inline — `AdminAuth` required. Returns per-subsystem `supervised.Snapshot()` ages; use to check health of scheduler/heartbeat goroutines |
-| GET | /ws | socket.go — authenticated WebSocket; verified CP session/org/admin credential for the global stream, or `X-Workspace-ID` plus matching workspace bearer for a filtered stream |
+| GET | /ws | socket.go — Canvas requires a verified tenant session, org token, or `ADMIN_TOKEN`; workspace subscribers require `X-Workspace-ID` plus a bearer bound to that workspace |
 
 ---
 

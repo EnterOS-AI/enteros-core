@@ -17,8 +17,8 @@
 #     the guard, this fails — even if unit tests on local source pass.
 #
 # Phases:
-#   A. Confirm an installed molecule-runtime version that contains the
-#      #2481 fix (>= 0.1.78).
+#   A. Confirm an installed current runtime distribution that contains the
+#      #2481 fix (molecules-workspace-runtime >= 0.4.5).
 #   B. Call `_build_channel_notification` with peer_id="../../foo" and
 #      assert (1) meta["peer_id"] == "", (2) no agent_card_url field,
 #      (3) no peer_name/peer_role.
@@ -60,15 +60,21 @@ if [ -z "$INSTALLED" ]; then
 fi
 echo "[replay]   installed version: $INSTALLED"
 
-# 0.1.78 is the first published version after #2481 merged to staging.
-# Compare via Python distutils-style version sort (works across patch
-# bumps without sed-fragility).
+# 0.4.5 is the current canonical distribution baseline containing #2481.
+# Compare the numeric semantic-version core with the Python standard library;
+# the replay deliberately installs the runtime with --no-deps, so importing a
+# third-party version parser here would make the guard depend on ambient state.
 HAS_FIX=$(python3 -c "
-from packaging.version import parse
-print('yes' if parse('$INSTALLED') >= parse('0.1.78') else 'no')
+import re
+def core(value):
+    match = re.match(r'^(\\d+)\\.(\\d+)\\.(\\d+)', value)
+    if not match:
+        raise SystemExit(2)
+    return tuple(int(part) for part in match.groups())
+print('yes' if core('$INSTALLED') >= core('0.4.5') else 'no')
 " 2>/dev/null || echo "unknown")
 if [ "$HAS_FIX" != "yes" ]; then
-    echo "[replay] FAIL A: installed $INSTALLED < 0.1.78 (the version that shipped the #2481 fix)."
+    echo "[replay] FAIL A: installed $INSTALLED < 0.4.5 (current canonical baseline)."
     echo "         Upgrade from the repo root: bash scripts/install-workspace-runtime.sh"
     exit 2
 fi

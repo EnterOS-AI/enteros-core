@@ -18,8 +18,8 @@
 // transitions (status + serve reachability) — not just HTTP 200. Teardown is
 // t.Cleanup-driven (admin DELETE /cp/admin/tenants).
 //
-// Run them from the operator host (or CI on dispatch/schedule) where the
-// staging CP admin surface + tenant DNS are reachable.
+// Run them in CI or from an authenticated workstation where the staging
+// control-plane admin surface and tenant DNS are reachable.
 //
 // This suite is advisory-by-infra: it needs a live staging tenant, so it is
 // NOT a merge-blocking required check. Promotion to required is a separate CTO

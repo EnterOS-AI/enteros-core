@@ -2,9 +2,8 @@
 # sweep-cf-tunnels.sh — safe, targeted sweep of Cloudflare Tunnels
 # whose corresponding tenant no longer exists.
 #
-# Why this exists: CP's tenant-delete cascade removes the DNS record
-# (caught by sweep-cf-orphans.sh as a backstop) but does NOT delete
-# the underlying Cloudflare Tunnel. Each E2E provision creates one
+# Why this exists: CP's tenant-delete cascade removes tenant routing state but
+# can leave the underlying Cloudflare Tunnel. Each E2E provision creates one
 # Tunnel named `tenant-<slug>`; without cleanup these accumulate
 # indefinitely on the account, consuming the account's tunnel quota
 # and cluttering the Cloudflare dashboard.
@@ -12,7 +11,7 @@
 # Observed 2026-04-30: dozens of `tenant-e2e-canvas-*` tunnels in
 # Down state with zero replicas, weeks past their tenant's deletion.
 #
-# This script is a parallel-shape janitor to sweep-cf-orphans.sh:
+# This tunnel-specific janitor:
 #   1. Query CP admin API to enumerate live org slugs (prod + staging)
 #   2. Enumerate Cloudflare Tunnels via the account-scoped API
 #   3. For each tunnel matching `tenant-<slug>`, check if <slug>
@@ -48,8 +47,8 @@ set -euo pipefail
 DRY_RUN=1
 # Tenant tunnels are short-lived by design — most of them at any
 # given moment are orphans from finished E2E runs. The default is
-# tuned higher than sweep-cf-orphans (50%) to reflect that the
-# steady-state for tenant-* tunnels is mostly-orphan, not mostly-live.
+# tuned for the fact that the steady-state for short-lived tenant-* tunnels can
+# be mostly orphaned after E2E teardown.
 MAX_DELETE_PCT="${MAX_DELETE_PCT:-90}"
 
 for arg in "$@"; do
@@ -73,7 +72,7 @@ need() {
     exit 1
   fi
 }
-# Fallback: operator-host canonical names → CI-scoped names.
+# Fallback: legacy canonical names → CI-scoped names.
 # The workflow YAML already maps both, but direct script invocation
 # (e.g. local ops) may only have the canonical names set.
 CF_API_TOKEN="${CF_API_TOKEN:-${CLOUDFLARE_API_TOKEN:-}}"

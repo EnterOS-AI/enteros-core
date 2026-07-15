@@ -1,9 +1,9 @@
 # Internal content policy
 
-The `Molecule-AI/molecule-core` repo is **public**. Anything internal
+The `molecule-ai/molecule-core` repo on Gitea is **public**. Anything internal
 (positioning, competitive briefs, sales playbooks, PMM/press drip, draft
 campaigns, raw research notes, ops runbooks, retrospectives) lives in
-**`Molecule-AI/internal`**.
+**`molecule-ai/internal`**.
 
 This page is the canonical decision tree.
 
@@ -13,15 +13,15 @@ This page is the canonical decision tree.
 
 | If the artifact is… | Put it in… |
 |---|---|
-| Competitive brief, market analysis, raw research notes | `Molecule-AI/internal/research/` |
-| PMM positioning draft, sales playbook, press release pre-publish | `Molecule-AI/internal/marketing/` |
-| Draft campaign asset (still iterating, not yet customer-visible) | `Molecule-AI/internal/marketing/campaigns/` |
-| Roadmap discussion, planning doc, retrospective | `Molecule-AI/internal/PLAN.md` or `Molecule-AI/internal/retrospectives/` |
-| Runbook, ops procedure, incident postmortem | `Molecule-AI/internal/runbooks/` |
-| **Public-ready** blog post (final draft, ready to ship to docs site) | `Molecule-AI/molecule-core/docs/blog/` |
-| **Public-ready** tutorial / quickstart | `Molecule-AI/molecule-core/docs/tutorials/` |
-| Public DevRel content (code samples, demos for users) | `Molecule-AI/molecule-core/docs/devrel/` |
-| API reference, architecture docs for external developers | `Molecule-AI/molecule-core/docs/api/` |
+| Competitive brief, market analysis, raw research notes | `molecule-ai/internal/research/` |
+| PMM positioning draft, sales playbook, press release pre-publish | `molecule-ai/internal/marketing/` |
+| Draft campaign asset (still iterating, not yet customer-visible) | `molecule-ai/internal/marketing/campaigns/` |
+| Roadmap discussion, planning doc, retrospective | `molecule-ai/internal/PLAN.md` or `molecule-ai/internal/retrospectives/` |
+| Runbook, ops procedure, incident postmortem | `molecule-ai/internal/runbooks/` |
+| **Public-ready** blog post (final draft, ready to ship to docs site) | `molecule-ai/molecule-core/docs/blog/` |
+| **Public-ready** tutorial / quickstart | `molecule-ai/molecule-core/docs/tutorials/` |
+| Public DevRel content (code samples, demos for users) | `molecule-ai/molecule-core/docs/devrel/` |
+| API reference, architecture docs for external developers | `molecule-ai/molecule-core/docs/api/` |
 | Code, tests, infrastructure | wherever is appropriate inside this repo |
 
 **Rule of thumb:** *"Would I be comfortable if a competitor / journalist / customer

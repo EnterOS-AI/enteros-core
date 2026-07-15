@@ -51,7 +51,7 @@
 set -uo pipefail
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 RUNTIME="${E2E_RUNTIME:-claude-code}"
 BILLING_MODE="${E2E_BILLING_MODE:-platform_managed}"
 PROVIDER="${E2E_PROVIDER:-platform}"

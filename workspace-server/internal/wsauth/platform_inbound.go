@@ -75,9 +75,9 @@ type inboundSecretCacheEntry struct {
 //     small per-entry footprint (<200 bytes) and that workspace deletion
 //     is operator-rare on the platform.
 //
-// Single-replica process safety: workspace-server runs as a single
-// Railway service today, so the cache is process-local and consistent
-// with itself. If the deployment ever fans out across replicas, an
+// Single-replica process safety: each tenant workspace-server currently runs
+// as one service process, so the cache is process-local and consistent with
+// itself. If a deployment fans out across replicas, an
 // operator-rotation propagates per-replica TTL-bounded — there is no
 // shared write log.
 //

@@ -19,7 +19,7 @@
 //	  go test -tags=integration ./internal/db/ -run '^TestIntegration_Migration|^TestIntegration_InitPostgres'
 //
 // In CI these run on .gitea/workflows/handlers-postgres-integration.yml,
-// which already provisions a real Postgres on the operator-host bridge and
+// which already provisions a real Postgres on its isolated CI network and
 // triggers on workspace-server/migrations/** changes — the exact blast
 // radius this gate must cover.
 //

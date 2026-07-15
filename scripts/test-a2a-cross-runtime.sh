@@ -3,6 +3,7 @@
 # Tests cross-runtime peer messaging between two different agent infras.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLATFORM="${1:-http://localhost:8080}"
 OPENAI_KEY="${OPENAI_API_KEY:?Set OPENAI_API_KEY env var before running this test}"
 PASS=0
@@ -215,7 +216,7 @@ check "Bob -> Alice allowed" "true" "$R"
 echo ""
 echo "--- Step 10: Verify isolation ---"
 
-HOST_WS=$(find /Users/hongming/Documents/GitHub/molecule-monorepo/workspace-configs-templates -maxdepth 1 -name 'ws-*' -type d 2>/dev/null | wc -l | tr -d ' ')
+HOST_WS=$(find "$ROOT/workspace-configs-templates" -maxdepth 1 -name 'ws-*' -type d 2>/dev/null | wc -l | tr -d ' ')
 check "No ws-* dirs on host" "0" "$HOST_WS"
 
 echo ""

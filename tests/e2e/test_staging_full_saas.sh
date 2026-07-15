@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Full-lifecycle SaaS E2E against staging.
 #
-# Creates a fresh org per run (unique slug), waits for tenant EC2 +
-# cloudflared provisioning, exercises every major workspace-level API
+# Creates a fresh org per run (unique slug), waits for tenant provisioning,
+# exercises every major workspace-level API
 # (register, heartbeat, A2A, delegation, HMA memory, activity, peers),
-# then tears the whole org down and asserts that every cloud artefact
-# (EC2, SG, Cloudflare tunnel, DNS record, DB rows) is gone. A leaked
-# resource at teardown is a CI failure.
+# then tears the whole org down and asserts that provider resources, DNS, and
+# database rows are gone. Legacy EC2-specific checks run only when that backend
+# is explicitly selected; current staging uses the molecules-server backend.
 #
 # Auth model:
-#   Single MOLECULE_ADMIN_TOKEN (= CP_ADMIN_API_TOKEN on Railway staging)
+#   Single MOLECULE_ADMIN_TOKEN (= staging CP_ADMIN_API_TOKEN from Infisical)
 #   drives everything:
 #     - POST /cp/admin/orgs to provision (no WorkOS session scraping)
 #     - GET  /cp/admin/orgs/:slug/admin-token to retrieve the per-tenant
@@ -20,7 +20,7 @@
 #
 # Required env:
 #   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway CP_ADMIN_API_TOKEN
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical
 #
 # Optional env:
 #   E2E_RUNTIME                  hermes (default) | claude-code | codex | openclaw
@@ -31,7 +31,7 @@
 #                                    resolves runtime=claude-code); reuses the
 #                                    same MiniMax/claude-code key path. See the
 #                                    TEMPLATE derivation + SECRETS_JSON block.
-#   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold EC2 budget)
+#   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold-provision budget)
 #   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS  default 3600 (60 min — hermes
 #                                cold-boot worst-case + slack). Raised from
 #                                1800 (#1646) because flaky tenant-provisioning
@@ -252,7 +252,7 @@ fi
 # Beyond here we are running for real: REQUIRE_LIVE=1 OR ADMIN_TOKEN is set.
 # A real run with no admin token is a HARD FAIL (was the `:?` default before #48).
 if [ -z "${ADMIN_TOKEN}" ]; then
-  fail "MOLECULE_ADMIN_TOKEN required (Railway staging CP_ADMIN_API_TOKEN) — a non-PR run (E2E_REQUIRE_LIVE=${REQUIRE_LIVE}) needs staging creds"
+  fail "MOLECULE_ADMIN_TOKEN required (staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin) — a non-PR run (E2E_REQUIRE_LIVE=${REQUIRE_LIVE}) needs staging creds"
 fi
 
 # Per-runtime model slug dispatch — see lib/model_slug.sh for the rationale.
@@ -1148,7 +1148,7 @@ rm -f "$PNG_FIXTURE"
 #   - tenantIngressRules / workspaceIngressRules (CP)
 #   - eicSSHIngressRule helper (CP)
 #   - AuthorizeIngress source-group support (CP awsapi)
-#   - MOLECULE_EIC_ENDPOINT_SG_ID Railway env
+#   - MOLECULE_EIC_ENDPOINT_SG_ID legacy EC2-backend environment
 #   - handleRemoteConnect's send-ssh-public-key/open-tunnel/ssh chain
 # surfaces within ~20 min of merge instead of waiting for a user report.
 #
@@ -1202,7 +1202,7 @@ for wid in "${WS_TO_CHECK[@]}"; do
     echo "$DIAG_JSON" | python3 -m json.tool 2>/dev/null || echo "$DIAG_JSON"
     log "── END DIAGNOSTIC ──"
     if is_ec2_backend; then
-      fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set in Railway, and EIC endpoint health"
+      fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set for the legacy EC2 backend, and EIC endpoint health"
     elif [ "$DIAG_FAIL" = "docker-available" ]; then
       # A real staging TENANT's workspace-server runs INSIDE the tenant container
       # with NO docker socket (by security design — a tenant must never reach the
