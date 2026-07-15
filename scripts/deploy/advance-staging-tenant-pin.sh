@@ -81,7 +81,17 @@ resolve_digest() {
   case "$IMAGE" in
     *@sha256:*) printf '%s\n' "${IMAGE##*@}"; return 0;;
   esac
-  docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null | head -1 || true
+  # Jobs carrying this script may run on a different Gitea runner from the
+  # upstream image-availability gate. The registry tag is the shared handoff;
+  # a previous runner's Docker cache is not. Pull on this runner before
+  # inspecting so digest resolution is independent and cannot reuse a stale
+  # local tag.
+  log "pulling $IMAGE on this runner before digest resolution"
+  if ! docker pull "$IMAGE" >/dev/null; then
+    echo "FATAL: cannot pull $IMAGE on this runner for digest resolution" >&2
+    return 1
+  fi
+  docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null | head -1
 }
 
 DIGEST="$(resolve_digest | tr '[:upper:]' '[:lower:]' | xargs)"
