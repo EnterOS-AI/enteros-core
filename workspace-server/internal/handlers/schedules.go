@@ -48,10 +48,43 @@ type HistoryEntry struct {
 	Request     json.RawMessage `json:"request" swaggertype:"object"`
 }
 
-type ScheduleHandler struct{}
+type ScheduleHandler struct {
+	// httpClient forwards volume-mode CRUD to the workspace runtime's
+	// /internal/schedules API. Broken out so tests can inject an
+	// httptest.Server-backed client. nil → lazily built with the SSRF-safe
+	// dialer (same guard as the chat-file / A2A forwards).
+	httpClient *http.Client
+}
 
 func NewScheduleHandler() *ScheduleHandler {
 	return &ScheduleHandler{}
+}
+
+// forwardClient returns the SSRF-safe client used for volume-mode forwards,
+// lazily constructing the default. The dialer re-applies isSafeURL at connect
+// time (DNS-rebind defence), matching chat_files/a2a_proxy.
+func (h *ScheduleHandler) forwardClient() *http.Client {
+	if h.httpClient != nil {
+		return h.httpClient
+	}
+	h.httpClient = &http.Client{
+		Timeout: scheduleForwardTimeout,
+		Transport: &http.Transport{
+			DialContext:         safeDialer().DialContext,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
+	return h.httpClient
+}
+
+// computeNextRunSafe wraps cronspec.ComputeNextRun with the current time in the
+// schedule's timezone. Returned in UTC (cronspec's contract).
+func computeNextRunSafe(cronExpr, tz string) (time.Time, error) {
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return cronspec.ComputeNextRun(cronExpr, tz, time.Now().In(loc))
 }
 
 type ScheduleResponse struct {
@@ -85,6 +118,11 @@ type ScheduleResponse struct {
 func (h *ScheduleHandler) List(c *gin.Context) {
 	workspaceID := c.Param("id")
 	ctx := c.Request.Context()
+
+	if scheduleBackendIsVolume(workspaceID) {
+		h.listVolume(c, workspaceID)
+		return
+	}
 
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT id, workspace_id, name, cron_expr, timezone, prompt, enabled,
@@ -157,6 +195,12 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 
 	if body.Timezone == "" {
 		body.Timezone = "UTC"
+	}
+
+	if scheduleBackendIsVolume(workspaceID) {
+		// The runtime store validates cron + timezone + caps itself.
+		h.createVolume(c, workspaceID, body)
+		return
 	}
 
 	// Validate timezone
@@ -241,6 +285,12 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 		body.Prompt = &clean
 	}
 
+	if scheduleBackendIsVolume(workspaceID) {
+		// scheduleID is the grid entry name in the volume model.
+		h.updateVolume(c, workspaceID, scheduleID, body)
+		return
+	}
+
 	// If cron_expr or timezone changed, revalidate and recompute next_run
 	var nextRunAt *time.Time
 	if body.CronExpr != nil || body.Timezone != nil {
@@ -321,6 +371,11 @@ func (h *ScheduleHandler) Delete(c *gin.Context) {
 	workspaceID := c.Param("id") // #113: bind to owning workspace to prevent IDOR
 	ctx := c.Request.Context()
 
+	if scheduleBackendIsVolume(workspaceID) {
+		h.deleteVolume(c, workspaceID, scheduleID)
+		return
+	}
+
 	result, err := db.DB.ExecContext(ctx,
 		`DELETE FROM workspace_schedules WHERE id = $1 AND workspace_id = $2`,
 		scheduleID, workspaceID)
@@ -358,6 +413,14 @@ func (h *ScheduleHandler) RunNow(c *gin.Context) {
 	scheduleID := c.Param("scheduleId")
 	workspaceID := c.Param("id")
 	ctx := c.Request.Context()
+
+	if scheduleBackendIsVolume(workspaceID) {
+		// The trigger daemon fires the turn as a self-scheduler system turn
+		// (RFC §1.1) — the platform does not hand a prompt back for the client
+		// to fire. Response carries fired_by:"daemon" so Canvas skips /a2a.
+		h.runNowVolume(c, workspaceID, scheduleID)
+		return
+	}
 
 	var prompt string
 	err := db.DB.QueryRowContext(ctx,

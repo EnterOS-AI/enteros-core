@@ -564,6 +564,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// requires an explicit X-Workspace-ID plus that workspace's source-bound
 		// bearer; verified human credentials bypass hierarchy. Issue #249.
 		r.GET("/workspaces/:id/schedules/health", schedh.Health)
+		// P3-live cutover: copy a workspace's runtime-source schedules from the
+		// core DB into its volume grid (idempotent). AdminAuth — an ops action
+		// run once per workspace after its trigger plugin goes live.
+		r.POST("/admin/workspaces/:id/schedules/migrate-to-volume", middleware.AdminAuth(db.DB), schedh.MigrateToVolume)
 
 		// Budget — per-workspace spend ceiling and current usage (#541).
 		// GET stays on wsAuth — a workspace agent reading its own budget is legitimate.

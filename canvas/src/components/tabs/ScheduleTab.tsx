@@ -164,17 +164,27 @@ export function ScheduleTab({ workspaceId }: Props) {
 
   const handleRunNow = async (sched: Schedule) => {
     try {
-      const result = await api.post<{ prompt: string }>(`/workspaces/${workspaceId}/schedules/${sched.id}/run`, {});
-      await api.post(`/workspaces/${workspaceId}/a2a`, {
-        method: "message/send",
-        params: {
-          message: {
-            role: "user",
-            messageId: `manual-cron-${Date.now()}`,
-            parts: [{ kind: "text", text: result.prompt }],
+      const result = await api.post<{ prompt?: string; fired_by?: string }>(
+        `/workspaces/${workspaceId}/schedules/${sched.id}/run`,
+        {},
+      );
+      // Volume-authoritative workspaces: the trigger daemon already fired the
+      // turn as a self-scheduler system turn (result.fired_by === "daemon").
+      // Firing /a2a here too would double-fire — and as a role:user turn, which
+      // is exactly the impersonation the trigger move fixes. Only the legacy
+      // core-DB path hands a prompt back for the client to fire.
+      if (result.fired_by !== "daemon" && result.prompt) {
+        await api.post(`/workspaces/${workspaceId}/a2a`, {
+          method: "message/send",
+          params: {
+            message: {
+              role: "user",
+              messageId: `manual-cron-${Date.now()}`,
+              parts: [{ kind: "text", text: result.prompt }],
+            },
           },
-        },
-      });
+        });
+      }
       fetchSchedules();
     } catch {
       setError("Failed to run schedule");
