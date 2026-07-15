@@ -59,6 +59,7 @@ def test_runtime_harnesses_use_current_distribution_name() -> None:
     dependency_surfaces = (
         ".gitea/workflows/e2e-api.yml",
         ".gitea/workflows/harness-replays.yml",
+        "scripts/install-workspace-runtime.sh",
         "tests/harness/requirements.txt",
     )
 
@@ -74,16 +75,27 @@ def test_runtime_harnesses_use_current_distribution_name() -> None:
     )
 
     replay_workflow = (ROOT / ".gitea/workflows/harness-replays.yml").read_text()
+    installer = (ROOT / "scripts/install-workspace-runtime.sh").read_text()
     requirements = (ROOT / "tests/harness/requirements.txt").read_text()
+    requirement_entries = [
+        line.strip()
+        for line in requirements.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
     executable_replay_lines = [
-        line for line in replay_workflow.splitlines() if not line.lstrip().startswith("#")
+        line
+        for text in (replay_workflow, installer)
+        for line in text.splitlines()
+        if not line.lstrip().startswith("#")
     ]
     assert not any("--extra-index-url" in line for line in executable_replay_lines)
     assert "--extra-index-url" not in requirements
-    assert "--index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/" in replay_workflow
-    assert "pip download --no-deps" in replay_workflow
-    assert '"$RUNTIME_DOWNLOAD"/molecules_workspace_runtime-*.whl' in replay_workflow
-    assert "molecules-workspace-runtime" not in requirements
+    assert "bash scripts/install-workspace-runtime.sh" in replay_workflow
+    assert 'PRIVATE_INDEX="https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/"' in installer
+    assert "pip download --no-deps" in installer
+    assert '"molecules-workspace-runtime==${RUNTIME_VERSION}"' in installer
+    assert '"$PYTHON_BIN" -m pip install --index-url "$PUBLIC_INDEX" "${wheels[0]}"' in installer
+    assert not any("molecules-workspace-runtime" in line for line in requirement_entries)
 
 
 def test_local_e2e_scripts_have_no_retired_checkout_path() -> None:
@@ -98,3 +110,28 @@ def test_local_e2e_scripts_have_no_retired_checkout_path() -> None:
         if "/Users/hongming/Documents/GitHub" in (ROOT / path).read_text()
     ]
     assert not stale, "local E2E scripts must resolve the repo dynamically: " + ", ".join(stale)
+
+
+def test_tenant_canvas_does_not_bake_admin_token_into_public_js() -> None:
+    tenant_build_surfaces = (
+        "workspace-server/Dockerfile.tenant",
+        ".gitea/workflows/publish-workspace-server-image.yml",
+    )
+    leaked = []
+    for path in tenant_build_surfaces:
+        executable_lines = [
+            line
+            for line in (ROOT / path).read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if any("NEXT_PUBLIC_ADMIN_TOKEN" in line for line in executable_lines):
+            leaked.append(path)
+
+    assert not leaked, (
+        "tenant Canvas builds must authenticate with verified sessions or "
+        "deliberately supplied credentials, not a tenant admin secret baked "
+        "into public JavaScript; found: " + ", ".join(leaked)
+    )
+
+    dev_start = (ROOT / "scripts/dev-start.sh").read_text()
+    assert "canvas image baked with the matching NEXT_PUBLIC_ADMIN_TOKEN" not in dev_start

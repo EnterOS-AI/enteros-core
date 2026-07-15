@@ -249,7 +249,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAdmin.POST("/admin/memories/import", adminMemH.Import)
 	}
 
-	// A2A proxy — registered outside the auth group; already enforces CanCommunicate access control.
+	// A2A proxy — registered outside the shared auth group because workspace and
+	// privileged Canvas callers use different credential contracts. ProxyA2A
+	// authenticates the public request itself, binds workspace bearer ownership,
+	// then applies CanCommunicate to workspace-to-workspace calls.
 	r.POST("/workspaces/:id/a2a", wh.ProxyA2A)
 
 	// core#3319: A2A inbound endpoint for external agents. Authenticates with the

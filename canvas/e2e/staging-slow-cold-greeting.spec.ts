@@ -15,9 +15,10 @@
  * id "<rowid>:agent") and the live HTTP reply (client-ts, a random UUID) are
  * more than ~3s apart — appendMessageDeduped's 3s window then can't collapse
  * them, and (pre-fix) neither could the id-keyed reconcile merge, so BOTH
- * rendered. The fix (15032a31) collapses them in mergeReconciledMessages within
- * a 60s window. So this spec FORCES the two copies apart by holding the /a2a
- * HTTP reply ~30s, letting the ≤10s DB reconcile render the persisted copy
+ * rendered. The current fix collapses the optimistic and authoritative copies
+ * by stable content identity with count-based one-to-one matching, independent
+ * of elapsed time. This spec still FORCES the two copies apart by holding the
+ * /a2a HTTP reply ~30s, letting the ≤10s DB reconcile render the persisted copy
  * first, then asserting a single rendered reply AFTER the reconcile settles.
  *
  * ── THE TWO THINGS THIS SPEC GOT WRONG BEFORE (run 499907, both fixed here) ──

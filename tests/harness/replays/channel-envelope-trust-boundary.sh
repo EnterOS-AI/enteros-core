@@ -5,12 +5,11 @@
 # at both the envelope builder and the agent_card_url builder.
 #
 # Why this matters:
-#   - Unit tests in workspace/tests/ run against local source. They
-#     prove the fix works in source. They DO NOT prove the published
-#     wheel contains the fix.
-#   - The wheel rewriter (scripts/build_runtime_package.py) renames
-#     symbols + paths. Any rewrite drift could silently strip the
-#     guard from the shipped artifact.
+#   - Unit tests in the workspace-runtime repository prove the fix in that
+#     source tree. They do not prove the package currently installed here
+#     contains it.
+#   - The runtime repository's package builder can change imports and paths.
+#     Packaging drift could therefore omit the guard from the shipped artifact.
 #   - This replay imports from `molecule_runtime.a2a_mcp_server` (the
 #     wheel-rewritten path), exercises the actual published code, and
 #     asserts the envelope shape. If the wheel build ever ships without
@@ -83,9 +82,9 @@ echo "[replay]   ✓ contains #2481 trust-boundary fix"
 # ─── Phase B-E: in-process assertions against the installed wheel ──────
 # We don't need WORKSPACE_ID/PLATFORM_URL/MOLECULE_WORKSPACE_TOKEN to
 # import the module — the env validation only fires at console-script
-# entry. We use molecule_runtime.* (the wheel-rewritten import path)
-# rather than workspace.a2a_mcp_server (local source) so this exercises
-# the SHIPPED code.
+# entry. We import `molecule_runtime.*` from the installed distribution rather
+# than relying on any repository-local runtime source, so this exercises the
+# shipped code.
 echo ""
 echo "[replay] B-E. exercising _build_channel_notification + _agent_card_url_for from the installed wheel..."
 
