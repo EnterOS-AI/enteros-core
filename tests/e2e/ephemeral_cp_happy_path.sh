@@ -435,6 +435,14 @@ run_scenario() {
   # swallow the rest of it, severing the env prefix from the `bash` call, and the
   # scenario would run with no admin token and no E2E_REQUIRE_LIVE. Shellcheck catches
   # it as SC2034 ("appears unused"), which is what those assignments become.
+  #
+  # E2E_SCHEDULER_CHECK defaults OFF (unlike the idle-digest check, which is a native
+  # runtime loop present in every image). The scheduler autonomous-fire step (10d)
+  # needs the ephemeral runtime pin to boot-install the molecule-scheduler kind:trigger
+  # plugin from gitea and carry the trigger scaffold — capabilities that ship with the
+  # runtime image, not core. Flip E2E_SCHEDULER_CHECK=on here once the pinned runtime
+  # image the ephemeral CP provisions is confirmed to carry them; until then the step
+  # stays dark so it can't red a gate on a capability the image doesn't yet have.
   MOLECULE_CP_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
@@ -448,6 +456,8 @@ run_scenario() {
   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}" \
   E2E_IDLE_DIGEST_CHECK="${E2E_IDLE_DIGEST_CHECK:-on}" \
   E2E_IDLE_FIRE_SECONDS="${E2E_IDLE_FIRE_SECONDS:-30}" \
+  E2E_SCHEDULER_CHECK="${E2E_SCHEDULER_CHECK:-off}" \
+  E2E_TRIGGER_POLL_SECONDS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
     bash "$HERE/test_staging_full_saas.sh"
 }
 

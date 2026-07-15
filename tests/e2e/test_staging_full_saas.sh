@@ -885,6 +885,25 @@ print(json.dumps(s))
   log "    idle-digest check ON: MOLECULE_IDLE_FIRE_SECONDS=${E2E_IDLE_FIRE_SECONDS:-30} injected into workspace secrets"
 fi
 
+# Scheduler autonomous-fire sub-step (P5c): with E2E_SCHEDULER_CHECK=on, declare
+# the molecule-scheduler kind:trigger plugin so the workspace boot-installs it
+# (per-workspace delivery — the runtime arms the daemon when the plugin is
+# present), and shrink the poll so a `* * * * *` schedule fires within the run.
+# Additive NON-LLM env only — same platform-managed guard rationale as the idle
+# block above. The plugin source is the public repo, fetched anonymously at boot.
+if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
+import json, os
+s = json.loads(os.environ['SECRETS_JSON_IN'])
+src = os.environ.get('E2E_SCHEDULER_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.1.0')
+existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
+s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
+s['MOLECULE_TRIGGER_POLL_SECONDS'] = os.environ.get('E2E_TRIGGER_POLL_SECONDS', '10')
+print(json.dumps(s))
+")
+  log "    scheduler check ON: declared molecule-scheduler + MOLECULE_TRIGGER_POLL_SECONDS=${E2E_TRIGGER_POLL_SECONDS:-10}"
+fi
+
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
@@ -2556,6 +2575,97 @@ if [ "${E2E_IDLE_DIGEST_CHECK:-}" = "on" ]; then
     unset -f idle_digest_probe idle_digest_diagnostics
   else
     fail "E2E_IDLE_DIGEST_CHECK=on requires a usable Docker CLI and daemon to inspect completion evidence."
+  fi
+fi
+
+# ─── 10d. Scheduler autonomous-fire (task #37, E2E_SCHEDULER_CHECK=on only) ──
+# End-to-end proof of scheduler-as-trigger-plugin (RFC): the workspace declared
+# the molecule-scheduler kind:trigger plugin at provision (secret-injection block
+# above), so it boot-installed the plugin and armed the trigger daemon. This step
+# creates a once-a-minute schedule through the SAME tenant API a user would, then
+# waits for the daemon to autonomously FIRE it — exercising the full chain:
+#   declare → boot-install → arm daemon → advertise `scheduler` capability →
+#   create routes to the runtime volume grid → daemon polls grid → self-schedules
+#   a turn (writes schedule-history.json + logs "fired schedule").
+# The whole step is behind E2E_SCHEDULER_CHECK so it stays dark until the
+# ephemeral runtime pin carries plugin boot-install + the trigger scaffold; once
+# on, its fail arms are REACHABLE (create-4xx and never-fired are distinct hard
+# failures, each with capability/grid/health diagnostics).
+if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
+  _SCHED_TIMEOUT_SECS="${E2E_SCHEDULER_TIMEOUT_SECS:-360}"
+  _SCHED_POLL_SECS="${E2E_SCHEDULER_POLL_SECS:-10}"
+  # A run-unique name so the durable history/grid probe can't match a stale entry
+  # from another run sharing a recycled container, and so the fired-log grep is
+  # unambiguous. Bounded + cron-safe (no spaces/quotes).
+  _SCHED_NAME="e2e-fire-${E2E_RUN_ID:-local}"
+
+  if idle_digest_require_docker; then
+    # Create the schedule via the tenant API (the exact path Canvas uses). A
+    # `* * * * *` cron fires at the top of every minute; combined with the
+    # injected MOLECULE_TRIGGER_POLL_SECONDS the daemon evaluates it within the
+    # poll window. A non-2xx here is a REACHABLE fail arm (routing/plugin/auth).
+    log "10d/11 Scheduler: creating '* * * * *' schedule '$_SCHED_NAME' on $PARENT_ID via the tenant API..."
+    _SCHED_TMP=$(mktemp)
+    _SCHED_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/schedules" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"$_SCHED_NAME\",\"cron_expr\":\"* * * * *\",\"timezone\":\"UTC\",\"prompt\":\"E2E scheduler self-fire probe — reply OK.\"}" \
+      -o "$_SCHED_TMP" -w '%{http_code}' 2>/dev/null) || true
+    _SCHED_BODY=$(cat "$_SCHED_TMP" 2>/dev/null | sanitize_http_body); rm -f "$_SCHED_TMP"
+    if ! echo "$_SCHED_CODE" | grep -Eq '^2[0-9][0-9]$'; then
+      fail "Scheduler: create schedule returned http=$_SCHED_CODE (expected 2xx): ${_SCHED_BODY:0:300}. A 5xx/failed-forward here means the workspace did NOT advertise the native-scheduler capability — the molecule-scheduler plugin never boot-installed / the daemon never armed, so create fell through to the retired DB path. Check MOLECULE_DECLARED_PLUGINS reached the container and the trigger scaffold is present in the runtime pin."
+    fi
+    ok "    schedule created (http=$_SCHED_CODE) — routed to the runtime volume grid"
+
+    _SCHED_FIRED=""
+    scheduler_fire_probe() {
+      local _sc
+      _SCHED_FIRED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        # Container log: the daemon logs `fired schedule '<name>'` (scheduler.py).
+        if docker logs "$_sc" 2>&1 | grep -F "fired schedule '$_SCHED_NAME'" >/dev/null; then
+          _SCHED_FIRED="$_sc (runtime log)"
+          return 0
+        fi
+        # Durable: schedule-history.json on the persisted config volume carries a
+        # {"name":"<name>","status":"fired"} entry, written only after a real
+        # self-scheduled turn — survives CP-driven container replacement.
+        if docker exec "$_sc" sh -c \
+          "grep -Fq '\"name\": \"$_SCHED_NAME\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          >/dev/null 2>&1; then
+          _SCHED_FIRED="$_sc (durable schedule-history.json)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    scheduler_diagnostics() {
+      local _sc _grid _health _hist _caps
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _caps=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DECLARED_PLUGINS|TRIGGER)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
+        log "    [scheduler diag] $_sc env: ${_caps:-none}"
+        log "    [scheduler diag] $_sc grid: ${_grid:-ABSENT (create never reached the volume — capability/routing gap)}"
+        log "    [scheduler diag] $_sc health: ${_health:-ABSENT (daemon never wrote a heartbeat — not armed)}"
+        log "    [scheduler diag] $_sc history: ${_hist:-ABSENT (no schedule ever fired)}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+    }
+
+    log "    Scheduler: polling fire evidence for up to ${_SCHED_TIMEOUT_SECS}s (poll=${_SCHED_POLL_SECS}s)."
+    if idle_digest_wait "$_SCHED_TIMEOUT_SECS" "$_SCHED_POLL_SECS" scheduler_fire_probe; then
+      ok "    scheduler autonomously FIRED '$_SCHED_NAME' (evidence: $_SCHED_FIRED)"
+    else
+      scheduler_diagnostics
+      fail "Scheduler never fired '$_SCHED_NAME' within ${_SCHED_TIMEOUT_SECS}s — the grid/health/history diagnostics above name the broken leg: ABSENT grid = create didn't reach the volume (capability not advertised); ABSENT health = daemon not armed (plugin didn't boot-install); grid+health present but no history = daemon armed but the trigger lane never delivered (self-scheduler turn path)."
+    fi
+
+    unset -f scheduler_fire_probe scheduler_diagnostics
+  else
+    fail "E2E_SCHEDULER_CHECK=on requires a usable Docker CLI and daemon to inspect fire evidence."
   fi
 fi
 

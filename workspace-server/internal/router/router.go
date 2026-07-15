@@ -568,6 +568,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// core DB into its volume grid (idempotent). AdminAuth — an ops action
 		// run once per workspace after its trigger plugin goes live.
 		r.POST("/admin/workspaces/:id/schedules/migrate-to-volume", middleware.AdminAuth(db.DB), schedh.MigrateToVolume)
+		// Per-workspace scheduler delivery (P5b): declare molecule-scheduler for
+		// every workspace that already has schedules (stranded post-P4). AdminAuth;
+		// DRY-RUN by default, ?apply=true to declare + arm. One-shot remediation.
+		r.POST("/admin/schedules/backfill-plugin", middleware.AdminAuth(db.DB), schedh.BackfillSchedulerPlugin)
 
 		// Budget — per-workspace spend ceiling and current usage (#541).
 		// GET stays on wsAuth — a workspace agent reading its own budget is legitimate.
