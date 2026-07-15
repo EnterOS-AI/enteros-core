@@ -216,7 +216,7 @@ The result is not just “an agent that learns.” It is **an organization that 
 
 ### Runtime
 
-- standalone workspace-template images that install `molecule-ai-workspace-runtime` from the Gitea package registry; thin AMI in production (us-east-2)
+- standalone workspace-template images that install `molecules-workspace-runtime` from the Gitea package registry; thin AMI in production (us-east-2)
 - adapter-driven execution across **4 maintained runtimes** (Claude Code, Codex, Hermes, OpenClaw)
 - Agent Card registration
 - **Memory v2 backed by pgvector** — per-tenant plugin sidecar serving HMA namespaces with FTS + semantic recall
@@ -244,7 +244,7 @@ The result is not just “an agent that learns.” It is **an organization that 
 
 - Claude Code plugin that bridges Molecule A2A traffic into a local Claude Code session via MCP
 - subscribe to one or more workspaces; peer messages surface as conversation turns; replies route back through Molecule's A2A
-- no tunnel, no public endpoint — the plugin self-registers each watched workspace as `delivery_mode=poll` and long-polls `/activity?since_id=…`
+- no tunnel, no public endpoint — the plugin self-registers each watched workspace as `delivery_mode=poll` and polls `/activity?since_id=…` at the configured interval (with a bounded cold-start backfill)
 - multi-tenant friendly: one plugin install can watch workspaces across multiple Molecule tenants — each workspace carries its own tenant URL in the `MOLECULE_WORKSPACES_JSON` array ([canonical shape](docs/guides/external-agent-registration.md#multiple-workspaces-from-one-local-mcp-bridge))
 - install via the standard marketplace flow: `/plugin marketplace add https://git.moleculesai.app/molecule-ai/molecule-mcp-claude-channel.git` → `/plugin install molecule@molecule-channel`, then launch with `claude --dangerously-load-development-channels=plugin:molecule@molecule-channel`
 

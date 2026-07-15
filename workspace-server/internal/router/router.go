@@ -298,8 +298,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.POST("/broadcast", broadcastH.Broadcast)
 
 		// External-workspace credential lifecycle (issue #319 follow-up to
-		// the Create flow). Both endpoints reject runtime ≠ external with
-		// 400 — see external_rotate.go for the rationale.
+		// the Create flow). Both endpoints accept external-like BYO-compute
+		// runtimes and reject container-backed runtimes with 400 — see
+		// external_rotate.go for the rationale.
 		//
 		//   POST .../external/rotate     — mint fresh token, revoke prior,
 		//                                  return ExternalConnectionInfo
@@ -665,8 +666,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	}
 
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
-	// Fix (Cycle 7): protected by AdminAuth — any valid workspace bearer token grants access.
-	// Fail-open when no tokens exist (fresh install / pre-Phase-30 upgrade).
+	// Protected by strict AdminAuth: a missing or invalid bearer is rejected in
+	// every environment, including fresh installs, and datastore errors fail closed.
 	{
 		adminAuth := r.Group("", middleware.AdminAuth(db.DB))
 		sechGlobal := handlers.NewSecretsHandler(wh.RestartByID)
@@ -698,8 +699,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// Admin — cross-workspace schedule health monitoring (issue #618).
 	// Lets cron-audit agents and operators detect silent schedule failures
 	// across all workspaces without holding individual workspace bearer tokens.
-	// AdminAuth mirrors the /admin/liveness gate — fail-open on fresh install,
-	// strict bearer-only once any token exists.
+	// AdminAuth mirrors the /admin/liveness gate: strict bearer-only and
+	// fail-closed in every environment, including fresh installs.
 	{
 		asHealth := handlers.NewAdminSchedulesHealthHandler()
 		r.GET("/admin/schedules/health", middleware.AdminAuth(db.DB), asHealth.Health)
