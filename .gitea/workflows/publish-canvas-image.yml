@@ -2,8 +2,7 @@ name: publish-canvas-image
 
 # Ported from .github/workflows/publish-canvas-image.yml on 2026-05-11 per RFC
 # internal#219 §1 sweep. Differences from the GitHub version:
-#   - Kept flat `workflow_dispatch` (no `inputs`) under repository policy;
-#     dispatch callers pass parameters through the established env/var path.
+#   - Keeps `workflow_dispatch` for manual rebuilds, without custom inputs.
 #   - Omitted GitHub's `merge_group:` trigger; this repository uses its
 #     serialized Gitea queue plus pull-request/push status gates.
 #   - Omitted `environment:` blocks; this repository's approval and secret
@@ -65,8 +64,8 @@ on:
       - 'canvas/**'
       - '.gitea/workflows/publish-canvas-image.yml'
   workflow_dispatch:
-  # Manual rebuilds use this explicit reviewed dispatch or a normal source
-  # change; there is no host-side push-button build path.
+  # Manual rebuilds use repository secrets/defaults; this trigger intentionally
+  # exposes no custom input surface.
 
 permissions:
   contents: read
@@ -175,20 +174,17 @@ jobs:
 
       - name: Resolve build args
         id: build_args
-        # Priority: workflow_dispatch input > repo secret > hardcoded default.
+        # The declared workflow contract is repository secret > hardcoded default.
+        # workflow_dispatch intentionally declares no custom inputs, so there is
+        # no API-input override path.
         # NEXT_PUBLIC_* env vars are baked into the JS bundle at build time by
         # Next.js — they cannot be changed at runtime without a full rebuild.
         # For local docker-compose deployments the defaults (localhost:8080)
         # work as-is; production deployments should set CANVAS_PLATFORM_URL
         # and CANVAS_WS_URL as repository secrets.
-        #
-        # Inputs are passed via env vars (not direct ${{ }} interpolation) to
-        # prevent shell injection from workflow_dispatch string inputs.
         shell: bash
         env:
-          INPUT_PLATFORM_URL: ${{ github.event.inputs.platform_url }}
           SECRET_PLATFORM_URL: ${{ secrets.CANVAS_PLATFORM_URL }}
-          INPUT_WS_URL: ${{ github.event.inputs.ws_url }}
           SECRET_WS_URL: ${{ secrets.CANVAS_WS_URL }}
           # Exact generated-image R2 origin baked into the CSP img-src at build
           # time (config, not a secret — it is a public CSP directive value).
@@ -196,8 +192,8 @@ jobs:
           # R2 bucket + account so a single value is correct for both.
           VAR_IMAGE_GEN_R2_HOST: ${{ vars.IMAGE_GEN_R2_HOST }}
         run: |
-          PLATFORM_URL="${INPUT_PLATFORM_URL:-${SECRET_PLATFORM_URL:-http://localhost:8080}}"
-          WS_URL="${INPUT_WS_URL:-${SECRET_WS_URL:-ws://localhost:8080/ws}}"
+          PLATFORM_URL="${SECRET_PLATFORM_URL:-http://localhost:8080}"
+          WS_URL="${SECRET_WS_URL:-ws://localhost:8080/ws}"
           IMAGE_GEN_R2_HOST="${VAR_IMAGE_GEN_R2_HOST:-https://molecule-workspace-data.bfa4e604e168a938e565600b27e2828c.r2.cloudflarestorage.com}"
 
           echo "platform_url=${PLATFORM_URL}" >> "$GITHUB_OUTPUT"

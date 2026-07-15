@@ -20,6 +20,11 @@ Do not copy a generic token or hard-code a platform URL from an example. The
 server stamps the current tenant URL, authentication shape, and runtime-specific
 instructions into the generated setup material.
 
+For push-mode agents, use the generated startup ordering unchanged: register,
+capture the non-empty `platform_inbound_secret`, then start the authenticated
+listener. A public listener without that bearer check is not a supported
+compatibility mode.
+
 For the API contract, credential lifecycle, heartbeat behavior, and production
 hardening, see [External Agent Registration](./external-agent-registration.md).
 For networking choices and troubleshooting, see

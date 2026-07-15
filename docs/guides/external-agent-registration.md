@@ -49,6 +49,15 @@ Python snippet (`RemoteAgentClient` and `A2AServer`) and persist the issued toke
 through the SDK's supported token-storage path. Do not use removed helpers such
 as `fetch_inbound()` from older tutorials.
 
+Push delivery must fail closed. Registration and heartbeats deliver a separate,
+non-empty `platform_inbound_secret`; Core sends it on each push as an
+`Authorization: Bearer` credential. The generated Python snippet attaches the
+server, registers, verifies that this secret was captured, and only then starts
+`A2AServer` on its literal `/a2a/inbound` route. A hand-written push server must
+persist the secret, compare the bearer in constant time, and reject missing or
+incorrect auth before reading or dispatching the request body. Never start a
+public listener when the secret is empty.
+
 ## Secrets
 
 Workspace-authenticated external processes read merged plaintext values from:

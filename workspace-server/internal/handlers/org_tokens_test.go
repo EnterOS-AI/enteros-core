@@ -439,6 +439,31 @@ func TestOrgTokenHandler_Create_NameTooLong400(t *testing.T) {
 	}
 }
 
+func TestOrgTokenHandler_Create_PastExpiry400(t *testing.T) {
+	h, _, cleanup := setupOrgTokenTest(t)
+	defer cleanup()
+
+	// A verified human session skips the agent approval gate, so this reaches
+	// the token-layer expiry validation without any approval SQL.
+	c, w := buildCtx("POST", "/org/tokens", `{"name":"already-expired","expires_at":"2020-01-01T00:00:00Z"}`)
+	c.Set("cp_session_actor", actorSession)
+	c.Set("cp_session_user_id", "u_expiry_test")
+	h.Create(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("past expires_at must be a caller-visible 400, got %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !strings.Contains(body.Error, "expires_at") {
+		t.Errorf("error should identify expires_at, got %q", body.Error)
+	}
+}
+
 func TestOrgTokenHandler_Create_EmptyBodyOK(t *testing.T) {
 	h, mock, cleanup := setupOrgTokenTest(t)
 	defer cleanup()

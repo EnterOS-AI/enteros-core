@@ -318,14 +318,16 @@ func New() (*Provisioner, error) {
 // per-org tenant's workspace-server does NOT construct a Provisioner (main.go
 // takes the control-plane branch), yet the mol-ws-* workspace containers run on
 // a docker daemon the tenant CAN reach. Without a docker client the plugins /
-// templates / terminal handlers fall back to the retired AWS EIC SSH path and
-// 90-120s-timeout → 502 (core#182 tie-in). Wiring a real client lets plugin
-// delivery use docker CopyToContainer against the mol-ws-* container instead.
+// templates / terminal handlers can fall into the retained legacy AWS EIC SSH
+// compatibility path and 90-120s-timeout → 502 (core#182 tie-in). Wiring a real
+// client lets plugin delivery use docker CopyToContainer against the mol-ws-*
+// container instead.
 //
 // Why a live Ping rather than a hardcoded backend flag: it "waits on the real
-// signal" (no-hardcoding-all-dynamic). A genuine cloud tenant (EC2-per-
-// workspace SaaS) has no local daemon → Ping fails → (nil, false) → the AWS
-// EIC path stays unchanged for real "i-<hex>" instance ids. client.FromEnv
+// signal" (no-hardcoding-all-dynamic). A legacy remote instance has no local
+// daemon → Ping fails → (nil, false), preserving compatibility for existing
+// "i-<hex>" instance ids. Managed local-Docker tenants expose the local daemon.
+// client.FromEnv
 // constructs a client struct even when the daemon is down (errors surface only
 // on first API call), so the Ping is mandatory to distinguish the two backends.
 func NewDockerClientIfReachable(ctx context.Context) (*client.Client, bool) {
@@ -722,7 +724,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// the SHA-pinned tag of the freshly-built image before ContainerCreate.
 	//
 	// Pinned overrides (cfg.Image set, e.g. via CP's runtime_image_pins for
-	// production thin-AMI launches) bypass this path — they pin a digest
+	// managed launches) bypass this path — they pin a digest
 	// the operator chose explicitly.
 	if cfg.Image == "" && cfg.Runtime != "" {
 		if src := Resolve(); src.Mode == RegistryModeLocal {

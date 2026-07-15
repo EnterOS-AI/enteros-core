@@ -83,7 +83,7 @@ jobs:
       # is never exposed to an untrusted fork on this workflow.
       # ---------------------------------------------------------------------
       - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
-        # Pulls the devops-engineer persona PAT from the Infisical SSOT at
+        # Pulls the scoped cross-repo token from the Infisical SSOT at
         # /shared/dev-utils::AUTO_SYNC_TOKEN (environment=prod) — the SAME
         # source ci.yml uses. Exported to $GITHUB_ENV as AUTO_SYNC_TOKEN (used
         # as `token:` for the private runtime checkout below) and as

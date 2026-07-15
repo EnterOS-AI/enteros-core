@@ -45,9 +45,9 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
-        # Bot-token consolidation (secrets->kms). AUTO_SYNC_TOKEN (the
-        # devops-engineer persona PAT, used here as a cross-repo read token for
-        # the manifest-entry existence check) is now pulled from the Infisical
+        # Secret-source consolidation (Infisical SSOT). AUTO_SYNC_TOKEN is used
+        # here as a cross-repo read token for the manifest-entry existence check
+        # and is pulled from the Infisical
         # SSOT at /shared/dev-utils::AUTO_SYNC_TOKEN (environment=prod) instead
         # of the duplicated `secrets.AUTO_SYNC_TOKEN` Gitea secret. Exported to
         # $GITHUB_ENV and consumed as env.* below. The old Gitea secret stays

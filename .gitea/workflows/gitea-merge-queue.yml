@@ -77,8 +77,8 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
 
       - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
-        # Bot-token consolidation (secrets->kms). The devops-engineer persona
-        # PAT (the non-bypass merge actor) is now pulled from the Infisical
+        # Secret-source consolidation (Infisical SSOT). The scoped non-bypass
+        # merge credential is pulled from the Infisical
         # SSOT at /shared/dev-utils::AUTO_SYNC_TOKEN (environment=prod) instead
         # of the duplicated `secrets.AUTO_SYNC_TOKEN` Gitea Actions secret.
         # Exported to $GITHUB_ENV as AUTO_SYNC_TOKEN and consumed as env.* by
@@ -120,8 +120,8 @@ jobs:
 
       - name: Process one queued PR
         env:
-          # AUTO_SYNC_TOKEN is the devops-engineer persona PAT. It is the
-          # non-bypass merge actor allowed by branch protection. Now sourced
+          # AUTO_SYNC_TOKEN is the scoped non-bypass merge credential allowed
+          # by branch protection. It is sourced
           # from the Infisical SSOT by the fetch step above (exported to
           # $GITHUB_ENV as AUTO_SYNC_TOKEN -> hence env.* here).
           GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}

@@ -130,7 +130,7 @@ jobs:
         run: |
           echo "::notice::detect-changes debug ${{ needs.detect-changes.outputs.debug }}"
 
-      # AUTO_SYNC_TOKEN (devops-engineer persona PAT) is (a) the cross-repo clone
+      # AUTO_SYNC_TOKEN is (a) the scoped cross-repo clone
       # token for the private workspace-template-* deps in manifest.json, and
       # (b) wired into the tenant env as MOLECULE_TEMPLATE_REPO_TOKEN so the
       # tenant's giteaTemplateAssetFetcher can fetch the PRIVATE seo-agent

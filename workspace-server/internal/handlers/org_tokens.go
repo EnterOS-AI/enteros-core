@@ -24,9 +24,10 @@ import (
 //
 // Sibling of TokenHandler (workspace-scoped); deliberately kept
 // separate because the admin surface is wider — an org token can
-// mint/revoke other org tokens, escalate workspace perms, etc. —
+// request/revoke other org tokens, manage workspace permissions, etc. —
 // and conflating them with workspace tokens makes revoke UX
-// confusing.
+// confusing. Bearer-authenticated mint requests are approval-gated;
+// verified human-session mints proceed directly.
 type OrgTokenHandler struct{}
 
 func NewOrgTokenHandler() *OrgTokenHandler {
@@ -142,6 +143,10 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 
 	plaintext, id, err := orgtoken.IssueWithExpiry(c.Request.Context(), db.DB, req.Name, createdBy, orgID, req.ExpiresAt, orgtoken.AuditLogRequestContextFromGin(c))
 	if err != nil {
+		if errors.Is(err, orgtoken.ErrPastExpiry) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "expires_at must be in the future"})
+			return
+		}
 		if errors.Is(err, orgtoken.ErrMintCeilingExceeded) {
 			c.JSON(http.StatusTooManyRequests, gin.H{"error": "org api token mint ceiling exceeded"})
 			return

@@ -4,34 +4,36 @@
 # single container. Go reverse-proxies unknown routes to canvas.
 #
 # Templates + plugins are NOT cloned at build time. They are pre-cloned
-# in a trusted CI or local build context by
+# in a trusted CI or explicitly prepared local context by
 # `scripts/clone-manifest.sh` into `.tenant-bundle-deps/` and COPYed in.
-# The reason: the manifest can include private template, plugin, or org
-# dependencies, so the Docker build cannot safely rely on unauthenticated
-# clones or pass a Gitea token into an image layer. Public template repos use
-# the same path for one deterministic build contract. Pre-cloning keeps any token in
-# the CI environment only; the resulting image carries the cloned trees
-# with `.git` already stripped (see clone-manifest.sh).
+# The reason: the manifest mixes public workspace templates with dependencies
+# that may require authenticated Gitea access. Cloning from inside the Docker
+# build would either make those dependencies unavailable or risk leaking a
+# token into an image layer. Pre-cloning also resolves the pinned refs before
+# the build; the resulting image carries the trees with `.git` already stripped
+# (see clone-manifest.sh).
 #
 # Build context: repo root, with `.tenant-bundle-deps/` populated by:
 #
-#     MOLECULE_GITEA_TOKEN=<persona-PAT> scripts/clone-manifest.sh \
+#     MOLECULE_GITEA_TOKEN=<scoped-Gitea-read-token> scripts/clone-manifest.sh \
 #       manifest.json \
 #       .tenant-bundle-deps/workspace-configs-templates \
 #       .tenant-bundle-deps/org-templates \
 #       .tenant-bundle-deps/plugins
 #
 # In CI this happens in publish-workspace-server-image.yml's "Pre-clone
-# manifest deps" step (uses AUTO_SYNC_TOKEN = devops-engineer persona).
-# A manual build whose manifest contains private dependencies must likewise
-# supply a narrowly read-scoped Gitea token to clone-manifest.sh without
-# copying it into the image context or build args.
+# manifest deps" step, using a scoped cross-repo token fetched from Infisical.
+# For a local build, obtain an equivalent scoped token through the supported
+# domain/Infisical path and populate `.tenant-bundle-deps/` before building.
 #
 #   docker buildx build --platform linux/amd64 \
 #     -f workspace-server/Dockerfile.tenant \
-#     -t <registry>/molecule-ai/platform-tenant:<immutable-tag> \
+#     -t registry.moleculesai.app/molecule-ai/molecule-tenant:<sha> \
 #     --build-arg GIT_SHA=<sha> --build-arg NEXT_PUBLIC_PLATFORM_URL= \
-#     --push .
+#     --load .
+#
+# Publishing is workflow-owned because the Cloudflare-fronted registry needs
+# the repository's chunked pusher for large layers.
 
 # ── Base images come from OUR registry, not Docker Hub ───────────────
 # Docker Hub caps ANONYMOUS pulls (~100/6h per IP) and CI pulls these base
@@ -153,7 +155,7 @@ COPY workspace-server/migrations /migrations
 COPY manifest.json /app/manifest.json
 
 # Templates + plugins (pre-cloned by scripts/clone-manifest.sh in the
-# trusted build context, .git already stripped — see
+# trusted CI or prepared local context, .git already stripped — see
 # .tenant-bundle-deps/ in the build context). The Gitea token used to
 # clone them never enters this image.
 COPY .tenant-bundle-deps/workspace-configs-templates /workspace-configs-templates

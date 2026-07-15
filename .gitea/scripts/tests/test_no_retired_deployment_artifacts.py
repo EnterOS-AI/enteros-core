@@ -27,6 +27,7 @@ def test_retired_deployment_artifacts_are_absent() -> None:
         "scripts/test-cross-agent-chat.sh",
         "scripts/test-hermes-plugin-e2e.sh",
         "scripts/test-team-e2e.sh",
+        "scripts/wheel_smoke.py",
         "tests/e2e/test_claude_code_e2e.sh",
         ".gitea/workflows/staging-verify.yml",
         ".gitea/workflows/sweep-aws-secrets.yml",
@@ -193,9 +194,71 @@ def test_current_build_and_ci_comments_match_gitea_public_template_reality() -> 
     )
 
 
+def test_current_deployment_comments_do_not_overclaim_rollout() -> None:
+    canvas_publish = (
+        ROOT / ".gitea/workflows/publish-canvas-image.yml"
+    ).read_text()
+    tenant_publish = (
+        ROOT / ".gitea/workflows/publish-workspace-server-image.yml"
+    ).read_text()
+    local_redeploy = (
+        ROOT / ".gitea/workflows/redeploy-tenants-on-main.yml"
+    ).read_text()
+
+    assert "github.event.inputs.platform_url" not in canvas_publish
+    assert "github.event.inputs.ws_url" not in canvas_publish
+    assert "No post-promotion tenant redeploy is guaranteed" in tenant_publish
+    assert "guarantees at least one redeploy" not in tenant_publish
+    assert "fresh production provisions now resolve" not in tenant_publish
+    assert "Production tenants now run as local Docker containers" not in local_redeploy
+    assert "not an inventory or rollout of the entire production tenant set" in local_redeploy
+
+
+def test_active_skill_and_runtime_guidance_matches_current_contracts() -> None:
+    skill_guide = (ROOT / "docs/guides/skill-catalog.md").read_text()
+    contributing = (ROOT / "CONTRIBUTING.md").read_text()
+    selfhost_rfc = (
+        ROOT / "docs/design/rfc-selfhost-onboarding-scene.md"
+    ).read_text()
+
+    fictional_commands = (
+        "molecule skills install",
+        "molecule skills upgrade",
+        "molecule skills list",
+        "molecule skills init",
+        "molecule skills bundle",
+        "molecule skills uninstall",
+    )
+    assert not any(command in skill_guide for command in fictional_commands)
+    assert "scripts/*.py" in skill_guide
+    assert "does **not** import a `tools/` directory" in skill_guide
+    assert "MOLECULE_WORKSPACES`" in contributing
+    assert "MOLECULE_WORKSPACES_JSON`" in contributing
+    assert "there is no `MOLECULE_WORKSPACES`" not in contributing
+    assert "the compiled **hermes** fallback" in selfhost_rfc
+    assert "MOLECULE_DEFAULT_RUNTIME` else **openclaw**" not in selfhost_rfc
+
+
+def test_external_push_guidance_requires_fail_closed_inbound_auth() -> None:
+    registration = (
+        ROOT / "docs/guides/external-agent-registration.md"
+    ).read_text()
+    quickstart = (
+        ROOT / "docs/guides/external-workspace-quickstart.md"
+    ).read_text()
+
+    for text in (registration, quickstart):
+        assert "platform_inbound_secret" in text
+    assert "constant time" in registration
+    assert "before reading or dispatching the request body" in registration
+    assert "Never start a" in registration
+    assert "public listener when the secret is empty" in registration
+
+
 def test_current_comments_do_not_point_at_retired_runner_or_runtime_tree() -> None:
     workflow_needles = (
         "/opt/molecule/runners/config.yaml",
+        "devops-engineer persona",
         "operator-host runners",
         "operator host's docker daemon",
     )
