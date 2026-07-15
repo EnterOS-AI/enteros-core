@@ -242,7 +242,7 @@ func waitForWorkspaceOnline(ctx context.Context, workspaceID string, timeout tim
 // across through the row update). Returns false on timeout or DB error.
 //
 // This is the Layer 2 gate for the 2026-05-19 ws-server self-fire restart
-// loop fix. status='online' can flip while url='' is still in place (the
+// loop fix. status='online' can flip while url=” is still in place (the
 // status update happens in /registry/register; url is set at the same
 // time but the read here may see a transient interleaving) and pre-fix
 // the trailing restart-context probe could fire against a half-registered

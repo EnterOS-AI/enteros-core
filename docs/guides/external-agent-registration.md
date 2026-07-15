@@ -290,13 +290,20 @@ Self-calls still require the source workspace's bearer.
 
 ## Multiple Workspaces From One Local MCP Bridge
 
+<a id="multi-workspace-config"></a>
+
+**This is the canonical multi-workspace config section. Other guides link
+here — do not restate the shape elsewhere; a second copy is how the key name
+drifts.**
+
 The standalone runtime package includes `molecule-mcp`, a local MCP bridge for
 external agents such as Claude Code, Codex, Hermes, and other tools that run
 outside the platform container fleet. One local bridge can serve multiple
-external workspaces by setting `MOLECULE_WORKSPACES`:
+external workspaces by setting `MOLECULE_WORKSPACES_JSON` — a JSON **array** of
+`{id, token, platform_url}` objects:
 
-```json
-[
+```bash
+export MOLECULE_WORKSPACES_JSON='[
   {
     "id": "workspace-id-local-to-hongming-org",
     "token": "...",
@@ -307,8 +314,24 @@ external workspaces by setting `MOLECULE_WORKSPACES`:
     "token": "...",
     "platform_url": "https://agents-team.moleculesai.app"
   }
-]
+]'
 ```
+
+`MOLECULE_WORKSPACES_JSON` is the name the bridge actually reads
+(`parseWorkspaceTargets` in `@molecule-ai/mcp-server`). There is no
+`MOLECULE_WORKSPACES` key — earlier revisions of these guides invented it, and
+a config file using that name is silently ignored.
+
+The Claude Code channel plugin reads the same array from
+`~/.claude/channels/molecule/.env`. The snippet in the workspace's **Connect
+your external agent** modal writes it for you, and MERGES into whatever is
+already on disk — so connecting a second workspace does not evict the first.
+
+A legacy single-platform shape (`MOLECULE_PLATFORM_URL` +
+comma-separated `MOLECULE_WORKSPACE_IDS` / `MOLECULE_WORKSPACE_TOKENS`, with
+optional `MOLECULE_PLATFORM_URLS` for one URL per workspace) is still parsed
+for back-compat. Prefer the JSON array: it is the only shape that keeps each
+workspace's tenant URL attached to its own token.
 
 `platform_url` is the tenant routing key. The bridge registers, heartbeats,
 polls inboxes, and sends outbound A2A calls against the URL attached to the

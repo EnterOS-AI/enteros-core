@@ -154,7 +154,7 @@ bug (a near-capacity timeout, a false-ready gate, or a race). Slow is allowed;
 - **Go**: `go test ./... -cover` + a pre-commit script that compares coverage to `.coverage-baseline` and fails on drops > 2 points in a tier-1 package.
 - **TypeScript**: `vitest --coverage` with thresholds in `vitest.config.ts`. Fails CI if below.
 - **Python**: `pytest --cov-fail-under=75` in the Python CI job.
-- **No-flaky / env-coupling** (`lint-env-coupling-dismissal`, `.gitea/scripts/lint_env_coupling_dismissal.py`): reds a PR whose COE/incident/postmortem docs dismiss a red as "flaky"/"environmental" without a stated deterministic root cause, and reds a **changed** e2e file that introduces a fixed `sleep`/`setTimeout`/`time.Sleep` without an accompanying real-signal poll. Escape hatch for a genuinely-intended wait: a `lint-allow: env-coupling` marker on the line/near it. The [`no-flaky-env-coupling`](../../.gitea/sop-checklist-config.yaml) SOP-checklist item requires a non-author (or `ai-sop-ack`) peer to confirm the same at review time.
+- **No-flaky / env-coupling** (`lint-env-coupling-dismissal`, `.gitea/scripts/lint_env_coupling_dismissal.py`): reds a PR whose COE/incident/postmortem docs dismiss a red as "flaky"/"environmental" without a stated deterministic root cause, and reds a **changed** e2e file that introduces a fixed `sleep`/`setTimeout`/`time.Sleep` without an accompanying real-signal poll. Escape hatch for a genuinely-intended wait: a `lint-allow: env-coupling` marker on the line/near it. (The paired `no-flaky-env-coupling` SOP-checklist item was retired 2026-07-14 with the rest of the SOP review ceremony; the `lint-env-coupling-dismissal` CI check remains the live enforcement.)
 
 ### Review expectations
 

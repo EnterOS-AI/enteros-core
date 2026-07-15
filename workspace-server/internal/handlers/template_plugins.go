@@ -135,7 +135,6 @@ func seedTemplatePlugins(ctx context.Context, workspaceID string, sources []stri
 	return recorded, skipped
 }
 
-
 // parseTemplatePluginsFromBytes parses the  list from raw config.yaml
 // bytes — the SaaS sibling of parseTemplatePlugins. On a fresh SaaS tenant the
 // template config arrives via the Gitea asset channel (not a local dir), so the

@@ -48,7 +48,7 @@ func TestBroadcast_OrgScopedRecipients(t *testing.T) {
 	// 3. Org-scoped recipient query — MUST include org filter so ws-b-child is NOT included.
 	// The query joins on org_chain.root_id = orgRootID, which scopes to Org-A only.
 	mock.ExpectQuery(`WITH RECURSIVE org_chain AS`).
-		WithArgs(senderID, senderID). // orgRootID, senderID (EXCLUDED)
+		WithArgs(senderID, senderID).                                    // orgRootID, senderID (EXCLUDED)
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(wsAChild)) // only Org-A child
 
 	// Activity log inserts

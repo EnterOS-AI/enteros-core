@@ -24,12 +24,12 @@ import (
 // cover the SQL drift surface; here we only care about the handler's
 // 4xx/5xx mapping and side-effect ordering.
 type fakeStorage struct {
-	rows         map[uuid.UUID]pendinguploads.Record
-	getErr       error // forced error from Get (overrides rows lookup)
-	ackErr       error // forced error from Ack
-	markErr      error // forced error from MarkFetched
-	markFetched  []uuid.UUID
-	ackCalls     []uuid.UUID
+	rows        map[uuid.UUID]pendinguploads.Record
+	getErr      error // forced error from Get (overrides rows lookup)
+	ackErr      error // forced error from Ack
+	markErr     error // forced error from MarkFetched
+	markFetched []uuid.UUID
+	ackCalls    []uuid.UUID
 }
 
 func newFakeStorage() *fakeStorage {

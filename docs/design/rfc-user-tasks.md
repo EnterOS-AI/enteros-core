@@ -105,5 +105,6 @@ count. Replaces the interim schedules wiring.
 
 Phase 0 migration ships idempotently (`IF NOT EXISTS`). Backend + MCP tool +
 canvas wiring land together behind the concierge Home (already gated as the new
-UI). Full molecule-core SOP gate applies (tier label + qa-review +
-security-review + green CI).
+UI). The molecule-core merge gate applies (green CI `['*']` + secret-scan, plus
+reserved-path-review when a reserved path is touched; the qa-review /
+security-review / sop-checklist ceremony was retired 2026-07-11/14).

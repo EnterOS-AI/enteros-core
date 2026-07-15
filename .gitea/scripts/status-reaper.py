@@ -165,13 +165,16 @@ PULL_REQUEST_REVIEW_SUFFIX = " (pull_request_review)"
 # shadows may be compensated when the trusted `(pull_request_target)` variant is
 # green. This is an EXACT active allowlist — every other workflow is preserved,
 # even if it has no `push:` trigger, to avoid masking real failures.
-GOVERNANCE_SHADOW_ALLOWLIST = frozenset(
-    {"sop-checklist", "qa-review", "security-review"}
-)
+GOVERNANCE_SHADOW_ALLOWLIST: frozenset[str] = frozenset()
 # Retired workflows whose historical shadow contexts still appear on old commits
 # and must remain compensatable even though the workflow YAML has been removed.
 # They are treated as known non-push when absent from the trigger map.
-GOVERNANCE_SHADOW_RETIRED_ALLOWLIST = frozenset({"sop-tier-check"})
+# sop-checklist/qa-review/security-review moved here 2026-07-14 when the SOP
+# review gate was fully removed (their YAMLs deleted) — old commits may still
+# carry those shadow contexts, so they stay compensatable via the retired path.
+GOVERNANCE_SHADOW_RETIRED_ALLOWLIST = frozenset(
+    {"sop-tier-check", "sop-checklist", "qa-review", "security-review"}
+)
 
 # --------------------------------------------------------------------------
 # Conductor snapshot (operator-config#158)

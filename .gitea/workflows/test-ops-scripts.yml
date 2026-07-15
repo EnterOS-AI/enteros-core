@@ -8,7 +8,9 @@ name: Ops Scripts Tests
 #   - on.paths references .gitea/workflows/test-ops-scripts.yml (this
 #     file) instead of the .github/ one.
 #   - Workflow-level env.GITHUB_SERVER_URL set.
-#   - `continue-on-error: true` on the job (RFC §1 contract).
+#   - (WAS: `continue-on-error: true` on the job, RFC §1 contract. REMOVED
+#     2026-07-14 — see the job comment below. This lane is the meta-gate; a mask
+#     on it made every OTHER gate unverifiable.)
 #
 # Runs the unittest suite for scripts/ on every PR + push that touches
 # anything under scripts/ or .gitea/scripts/. Kept separate from the main CI
@@ -29,13 +31,45 @@ on:
     paths:
       - 'scripts/**'
       - '.gitea/scripts/**'
-      - '.gitea/workflows/test-ops-scripts.yml'
+      # #4322: test_managed_flags_wiring.py asserts every workflow STEP rolling the
+      # staging fleet wires STAGING_TENANT_FLAGS in — so ALL workflow files must run it,
+      # else a PR deleting that env: line (the exact mutation the test catches) runs no
+      # guard. The `.gitea/workflows/**` glob covers that (and test-ops-scripts.yml +
+      # local-provision-e2e.yml).
+      # #4346: the ws-teardown guard also asserts on the e2e driver script, which is NOT
+      # under .gitea/workflows/, so it needs its own path — else a PR reverting the
+      # teardown to the sweep that deletes a concurrent run's live container runs no
+      # guard. A guard CI does not run on the files it guards is not a guard.
+      - '.gitea/workflows/**'
+      # #114: test_ephemeral_gate_is_enforced.py asserts the ephemeral-CP gate's
+      # context sits ABOVE the first `# pending-` marker (i.e. is merge-queue
+      # enforced, not merely documented). The mutation it exists to catch — moving
+      # that line back down into the parked half — touches ONLY this file, so
+      # without this path the guard would not run on the very diff it guards.
+      - '.gitea/required-contexts.txt'
+      - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
   pull_request:
     branches: [main, staging]
     paths:
       - 'scripts/**'
       - '.gitea/scripts/**'
-      - '.gitea/workflows/test-ops-scripts.yml'
+      # #4322: test_managed_flags_wiring.py asserts every workflow STEP rolling the
+      # staging fleet wires STAGING_TENANT_FLAGS in — so ALL workflow files must run it,
+      # else a PR deleting that env: line (the exact mutation the test catches) runs no
+      # guard. The `.gitea/workflows/**` glob covers that (and test-ops-scripts.yml +
+      # local-provision-e2e.yml).
+      # #4346: the ws-teardown guard also asserts on the e2e driver script, which is NOT
+      # under .gitea/workflows/, so it needs its own path — else a PR reverting the
+      # teardown to the sweep that deletes a concurrent run's live container runs no
+      # guard. A guard CI does not run on the files it guards is not a guard.
+      - '.gitea/workflows/**'
+      # #114: test_ephemeral_gate_is_enforced.py asserts the ephemeral-CP gate's
+      # context sits ABOVE the first `# pending-` marker (i.e. is merge-queue
+      # enforced, not merely documented). The mutation it exists to catch — moving
+      # that line back down into the parked half — touches ONLY this file, so
+      # without this path the guard would not run on the very diff it guards.
+      - '.gitea/required-contexts.txt'
+      - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
@@ -48,9 +82,33 @@ jobs:
   test:
     name: Ops scripts (unittest)
     runs-on: ubuntu-latest
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # continue-on-error REMOVED 2026-07-14. mc#3436 asked for exactly this:
+    # "pre-existing continue-on-error mask; root-fix and remove, do not renew
+    # silently."
+    #
+    # This is the META-GATE, and it was the most consequential mask in the repo.
+    # It is the ONLY PR lane that tests `.gitea/scripts/**` — 31 test files
+    # covering detect-changes.py, all-required-check.sh, ci-required-drift.py, the
+    # phantom-gate lint, the approval validator, and gitea-merge-queue.py itself:
+    # the machinery that enforces every OTHER gate. Masked, it could not fail.
+    #
+    # And it COMPOUNDED. The `ci` profile in detect-changes.py matches
+    #   ^workspace-server/  ^canvas/  ^workspace/  ^tests/e2e/  ^scripts/  ^infra/scripts/
+    # — none of which match `.gitea/` (note `^scripts/` is anchored and does NOT
+    # match `.gitea/scripts/`). So a PR touching ONLY the CI machinery makes every
+    # profile false, every heavy job takes its no-op arm, and `CI / all-required`
+    # reports SUCCESS having run zero tests. The one lane that DID cover those
+    # files was this one — and it was forbidden from going red.
+    #
+    # Net: the merge queue and the gate scripts were the one thing CI could not
+    # see change. That is how the other vacuous gates survived, including the
+    # canvas lane that was green-by-no-op for a month while failing 3/3
+    # (core#4321 / core#4323).
+    #
+    # Verified green BEFORE unmasking (a mask must never be removed from a red
+    # suite — that wedges the repo): `python -m pytest .gitea/scripts/tests -q`
+    # => 611 passed, 2 skipped, 75 subtests passed. Removing the mask blocks
+    # nothing that was passing; it only stops a future break sliding through.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0

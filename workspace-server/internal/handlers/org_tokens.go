@@ -140,7 +140,7 @@ func (h *OrgTokenHandler) Create(c *gin.Context) {
 
 	createdBy, orgID := orgTokenActor(c)
 
-		plaintext, id, err := orgtoken.IssueWithExpiry(c.Request.Context(), db.DB, req.Name, createdBy, orgID, req.ExpiresAt, orgtoken.AuditLogRequestContextFromGin(c))
+	plaintext, id, err := orgtoken.IssueWithExpiry(c.Request.Context(), db.DB, req.Name, createdBy, orgID, req.ExpiresAt, orgtoken.AuditLogRequestContextFromGin(c))
 	if err != nil {
 		if errors.Is(err, orgtoken.ErrMintCeilingExceeded) {
 			c.JSON(http.StatusTooManyRequests, gin.H{"error": "org api token mint ceiling exceeded"})

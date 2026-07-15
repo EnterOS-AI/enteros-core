@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 // TestCreateRestartGate_SharedAcrossCreateAndRestart: pre-fix, only
@@ -285,9 +285,9 @@ func TestCreateRestartGate_RestartCycleDoesNotDeadlock(t *testing.T) {
 // control: a "naive" call to the UNLOCKED variant from inside an
 // already-held gate would deadlock (the test asserts the deadlock
 // with a timeout). Together with the previous test, this proves:
-//   1. The Locked variant does NOT deadlock under a held gate.
-//   2. The unlocked variant DOES deadlock under a held gate (it
-//      tries to re-lock the same non-reentrant mutex).
+//  1. The Locked variant does NOT deadlock under a held gate.
+//  2. The unlocked variant DOES deadlock under a held gate (it
+//     tries to re-lock the same non-reentrant mutex).
 //
 // This guards against a future refactor that accidentally removes
 // the Locked/Unlocked split: the negative control would START

@@ -1525,6 +1525,25 @@ type localProvisionerIsRunning interface {
 	IsRunning(ctx context.Context, workspaceID string) (bool, error)
 }
 
+// platformRootConflictError is returned by installPlatformAgent when the caller
+// asked to install a platform root under an id that differs from the org's
+// CURRENT, ONLINE one. Honouring it would demote a live concierge and put a
+// container-less row in its place (this install never provisions), destroying
+// the org's concierge with no path back. The caller gets 409 and the id of the
+// root that is actually serving, so it can either target that id or go through
+// POST /admin/org/platform-agent/ensure, which repairs in place.
+type platformRootConflictError struct {
+	ExistingID  string
+	RequestedID string
+}
+
+func (e *platformRootConflictError) Error() string {
+	return fmt.Sprintf(
+		"refusing to displace the ONLINE platform root %s with %s: this install is row-only "+
+			"(it never provisions), so the org would be left with a concierge that has no container",
+		e.ExistingID, e.RequestedID)
+}
+
 type installPlatformAgentPayload struct {
 	// ID is the platform agent's workspace id (a deterministic uuidv5 the
 	// control plane derives per org). Required.
@@ -1569,6 +1588,20 @@ func InstallPlatformAgent(c *gin.Context) {
 		name = defaultPlatformAgentName()
 	}
 	if err := installPlatformAgent(c.Request.Context(), db.DB, p.ID, name, p.Runtime); err != nil {
+		// A foreign id aimed at a LIVE concierge is a caller error, not a server
+		// fault: answer 409 with the id that is actually serving. Additive-safe for
+		// the frozen CP contract — the CP always sends the canonical id, which IS
+		// the existing root's id, so this arm is unreachable for it.
+		var conflict *platformRootConflictError
+		if errors.As(err, &conflict) {
+			log.Printf("InstallPlatformAgent: %v", conflict)
+			c.JSON(http.StatusConflict, gin.H{
+				"error":             conflict.Error(),
+				"code":              "PLATFORM_ROOT_ONLINE",
+				"platform_agent_id": conflict.ExistingID,
+			})
+			return
+		}
 		log.Printf("InstallPlatformAgent: %v (id=%s)", err, p.ID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "install failed"})
 		return
@@ -1608,6 +1641,57 @@ func installPlatformAgent(ctx context.Context, database *sql.DB, platformID, nam
 	//    platform agent (defense-in-depth: covers pathological cases where a
 	//    platform root was created with a non-canonical id, e.g. test fixtures
 	//    or a prior failed migration).
+	//
+	//    ...but ONLY when the root it displaces is not a LIVE concierge. This
+	//    install is row-only: it never provisions (see the handler's frozen
+	//    contract), so demoting an ONLINE root and upserting a container-less one
+	//    in its place leaves the org with a concierge that has no container and
+	//    no path to getting one — the canvas resolves the new root, its status
+	//    never reaches 'online', and the composer is disabled forever. One POST
+	//    with a foreign id permanently destroys a working org concierge.
+	//
+	//    This is not hypothetical: it is what canvas/e2e/staging-concierge.spec.ts
+	//    did to every staging E2E org from 2026-06-11 (when the downgrade above
+	//    replaced the uniq_workspaces_one_platform_root COLLISION that used to
+	//    reject a foreign id loudly) until this guard.
+	//
+	//    The CP is unaffected: it always supplies the canonical derived id, which
+	//    equals the existing root's id, so `id <> $1` excludes it and neither the
+	//    downgrade nor this guard ever fires. The guard's ONLY reachable arm is
+	//    the destructive one it exists to stop.
+	//
+	//    LIVE = status IN ('online','degraded') — NOT 'online' alone. This guard
+	//    originally probed `status = 'online'`, and the comment here enumerated the
+	//    safe-to-repair states as "offline / failed / provisioning / removed",
+	//    silently omitting 'degraded'. That omission was the whole bug: a DEGRADED
+	//    concierge has a real, running container — it is merely failing its health
+	//    probe — so displacing it with a row-only install (this endpoint never
+	//    provisions) orphans that container and leaves the org with a concierge that
+	//    has none. Exactly the destruction the guard exists to prevent, just in a
+	//    narrower window.
+	//
+	//    ('online','degraded') is the codebase's canonical container-backed
+	//    predicate, not a value invented here — see registry/cp_instance_reconciler.go
+	//    :168 and :294, registry/healthsweep.go, registry/hibernation.go,
+	//    registry/wedged_agent.go. Guard the PROPERTY (has a container that a row-only
+	//    install would orphan), never one status literal that happens to be the state
+	//    you saw while debugging.
+	var liveRootID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id FROM workspaces
+		WHERE kind = 'platform' AND parent_id IS NULL AND id <> $1
+		  AND status IN ('online', 'degraded')
+		LIMIT 1
+	`, platformID).Scan(&liveRootID)
+	switch {
+	case err == nil:
+		return &platformRootConflictError{ExistingID: liveRootID, RequestedID: platformID}
+	case errors.Is(err, sql.ErrNoRows):
+		// No live foreign root — the downgrade below is safe.
+	default:
+		return fmt.Errorf("probe existing platform root: %w", err)
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE workspaces SET kind = 'workspace', updated_at = now()
 		WHERE kind = 'platform' AND parent_id IS NULL AND id <> $1

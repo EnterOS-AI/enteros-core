@@ -16,6 +16,10 @@
 #   CP_ADMIN_API_TOKEN, or INFISICAL_CLIENT_ID / INFISICAL_CLIENT_SECRET /
 #   INFISICAL_PROJECT_ID so the script can fetch CP_ADMIN_API_TOKEN from
 #   staging /shared/controlplane-admin.
+#   The Infisical universal-auth creds (CLIENT_ID/SECRET/PROJECT_ID) are ALSO
+#   required to write the LOCAL_TENANT_IMAGE boot SSOT below. To advance only the
+#   DB pin with a pre-supplied CP_ADMIN_API_TOKEN and no Infisical creds, pass
+#   SKIP_SSOT_WRITE=1 (a conscious skip; the CP boot default may then drift).
 #
 # GITHUB_OUTPUT:
 #   old_image old_digest old_git_sha new_image new_digest new_git_sha
@@ -25,7 +29,17 @@ export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 CP_BASE_URL="${CP_BASE_URL:-https://staging-api.moleculesai.app}"
 INFISICAL_BASE="${INFISICAL_BASE:-https://key.moleculesai.app}"
 INFISICAL_ENV="${INFISICAL_ENV:-staging}"
-INFISICAL_PATH="${INFISICAL_PATH:-/shared/controlplane-admin}"
+INFISICAL_PATH="${INFISICAL_PATH:-/shared/controlplane-admin}"   # CP admin token
+# The tenant-app image the control plane reads at BOOT (LOCAL_TENANT_IMAGE). This
+# is a SECOND, independent SSOT from the runtime_image_pins DB row: the DB pin
+# makes FRESH provisions dynamic (no CP restart), but LOCAL_TENANT_IMAGE is the
+# default a rebooted / freshly-provisioned CP falls back to. Rolling the pin but
+# leaving this stale is EXACTLY how prod broke every fresh org (the pin was fixed
+# on running containers, never written back to the boot SSOT — see
+# molecule-controlplane/scripts/deploy/local-cp-prod-pin-promote.sh). So this
+# script now writes BOTH, on every path, and verifies the write landed.
+CP_SSOT_PATH="${CP_SSOT_PATH:-/shared/controlplane}"
+SSOT_SECRET_NAME="${SSOT_SECRET_NAME:-LOCAL_TENANT_IMAGE}"
 TENANT_IMAGE_NAME="${TENANT_IMAGE_NAME:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
 TEMPLATE_NAME="molecule-tenant"
 IMAGE=""
@@ -76,31 +90,68 @@ if ! printf '%s' "$DIGEST" | grep -Eq '^sha256:[a-f0-9]{64}$'; then
   exit 1
 fi
 
+# One shared Infisical universal-auth access token, used for BOTH the CP-admin
+# token read AND the LOCAL_TENANT_IMAGE write below. Fails LOUD on any failure —
+# it never returns an empty token as if it succeeded, because a silent auth no-op
+# is precisely how the prod pin write went stale without anyone noticing.
+#
+# It is deliberately ECHO-FREE (emits no ::add-mask:: or any other stdout): the
+# caller runs it in the PARENT shell and masks the token itself. Emitting a
+# workflow command from here would be captured — and corrupt the value — whenever
+# a caller runs it inside a command substitution (e.g. CP_TOKEN="$(fetch_cp_token)").
+INFISICAL_ACCESS_TOKEN=""
+infisical_login() {
+  [ -n "$INFISICAL_ACCESS_TOKEN" ] && return 0
+  for v in INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID; do
+    [ -n "${!v:-}" ] || { echo "FATAL: $v is required for Infisical access (set the universal-auth creds, or pass CP_ADMIN_API_TOKEN with SKIP_SSOT_WRITE=1 to run without Infisical)" >&2; exit 2; }
+  done
+  INFISICAL_ACCESS_TOKEN="$("${CURL[@]}" -X POST "$INFISICAL_BASE/api/v1/auth/universal-auth/login" \
+    -H 'Content-Type: application/json' \
+    -d "{\"clientId\":\"$INFISICAL_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CLIENT_SECRET\"}" \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.stdout.write(d.get("accessToken") or "")')"
+  [ -n "$INFISICAL_ACCESS_TOKEN" ] || { echo "FATAL: Infisical auth returned empty accessToken" >&2; exit 1; }
+}
+
+# Mask a secret in CI logs. Safe to call in the parent shell (stdout is the job
+# log the runner scans for workflow commands) — never inside a substitution.
+mask() { [ -n "${GITHUB_ACTIONS:-}${GITEA_ACTIONS:-}" ] && [ -n "${1:-}" ] && echo "::add-mask::$1"; return 0; }
+
 fetch_cp_token() {
   if [ -n "${CP_ADMIN_API_TOKEN:-}" ]; then
     printf '%s' "$CP_ADMIN_API_TOKEN"
     return 0
   fi
-  for v in INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID; do
-    [ -n "${!v:-}" ] || { echo "FATAL: $v is required when CP_ADMIN_API_TOKEN is unset" >&2; exit 2; }
-  done
+  # INFISICAL_ACCESS_TOKEN was set by the up-front login in the parent shell, so
+  # this is a cached no-op: it never logs in twice and — being echo-free — never
+  # pollutes this command substitution's stdout.
+  infisical_login
   enc_path="$(printf '%s' "$INFISICAL_PATH" | sed 's#/#%2F#g')"
-  tok="$("${CURL[@]}" -X POST "$INFISICAL_BASE/api/v1/auth/universal-auth/login" \
-    -H 'Content-Type: application/json' \
-    -d "{\"clientId\":\"$INFISICAL_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CLIENT_SECRET\"}" \
-    | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.stdout.write(d.get("accessToken") or "")')"
-  [ -n "$tok" ] || { echo "FATAL: Infisical auth returned empty accessToken" >&2; exit 1; }
   cp_token="$("${CURL[@]}" "$INFISICAL_BASE/api/v3/secrets/raw/CP_ADMIN_API_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=$INFISICAL_ENV&secretPath=$enc_path" \
-    -H "Authorization: Bearer $tok" \
+    -H "Authorization: Bearer $INFISICAL_ACCESS_TOKEN" \
     | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.stdout.write(((d.get("secret") or {}).get("secretValue")) or "")')"
   [ -n "$cp_token" ] || { echo "FATAL: Infisical returned empty CP_ADMIN_API_TOKEN" >&2; exit 1; }
   printf '%s' "$cp_token"
 }
 
-CP_TOKEN="$(fetch_cp_token)"
-if [ -n "${GITHUB_ACTIONS:-}${GITEA_ACTIONS:-}" ]; then
-  echo "::add-mask::$CP_TOKEN"
+# --- Up-front auth: assert + log in BEFORE any mutation, so we never half-apply --
+# Infisical creds are needed if EITHER the CP admin token must be fetched (no
+# CP_ADMIN_API_TOKEN) OR the LOCAL_TENANT_IMAGE write will run (not skipped). Doing
+# the login here, in the parent shell, means: (a) missing creds fail loud BEFORE
+# the DB pin is touched (a CP_ADMIN_API_TOKEN-only caller that forgot Infisical
+# creds no longer aborts mid-promote — it is told up front to add creds or set
+# SKIP_SSOT_WRITE=1); (b) INFISICAL_ACCESS_TOKEN is set ONCE in the parent and
+# reused by both the CP-token read and the SSOT write (no double login); and
+# (c) it is masked in a context whose stdout is the job log, not a capture.
+need_infisical=0
+[ -z "${CP_ADMIN_API_TOKEN:-}" ] && need_infisical=1
+[ "${SKIP_SSOT_WRITE:-0}" != "1" ] && need_infisical=1
+if [ "$need_infisical" = "1" ]; then
+  infisical_login
+  mask "$INFISICAL_ACCESS_TOKEN"
 fi
+
+CP_TOKEN="$(fetch_cp_token)"
+mask "$CP_TOKEN"
 
 cp_json() {
   local method="$1" path="$2" body="${3:-}"
@@ -114,6 +165,67 @@ cp_json() {
       -H "Authorization: Bearer $CP_TOKEN"
   fi
 }
+
+# ---- LOCAL_TENANT_IMAGE (the CP boot-default SSOT) read/write ----
+inf_get_raw() {  # <secretName> -> its value, or '' if absent/404 (never errors)
+  local name="$1" enc
+  enc="$(printf '%s' "$CP_SSOT_PATH" | sed 's#/#%2F#g')"
+  { "${CURL[@]}" "$INFISICAL_BASE/api/v3/secrets/raw/$name?workspaceId=$INFISICAL_PROJECT_ID&environment=$INFISICAL_ENV&secretPath=$enc" \
+      -H "Authorization: Bearer $INFISICAL_ACCESS_TOKEN" 2>/dev/null || true; } \
+    | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    sys.stdout.write(((d.get("secret") or {}).get("secretValue")) or "")
+except Exception:
+    pass'
+}
+
+write_ssot_pin() {  # reconcile Infisical LOCAL_TENANT_IMAGE to the rolled ref
+  local ref="$1" before after body verb
+  if [ "${SKIP_SSOT_WRITE:-0}" = "1" ]; then
+    log "SKIP_SSOT_WRITE=1 — leaving $SSOT_SECRET_NAME untouched (conscious skip; the CP boot default may drift from the live fleet)"
+    return 0
+  fi
+  infisical_login   # cached no-op (token was set up front); echo-free
+  before="$(inf_get_raw "$SSOT_SECRET_NAME")"
+  if [ "$before" = "$ref" ]; then
+    log "SSOT ok: $SSOT_SECRET_NAME already = $ref ($INFISICAL_ENV $CP_SSOT_PATH)"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    log "DRY-RUN: would set $SSOT_SECRET_NAME = $ref (was ${before:-<unset>}; $INFISICAL_ENV $CP_SSOT_PATH)"
+    return 0
+  fi
+  body="$(python3 -c 'import json,sys; print(json.dumps({"workspaceId":sys.argv[1],"environment":sys.argv[2],"secretPath":sys.argv[3],"secretValue":sys.argv[4]}))' \
+    "$INFISICAL_PROJECT_ID" "$INFISICAL_ENV" "$CP_SSOT_PATH" "$ref")"
+  # Pick the verb from whether the secret already exists (we just read it): an
+  # existing key is a PATCH (update), an absent one a POST (create). We deliberately
+  # do NOT fall PATCH->POST — a transient PATCH failure on an existing key would then
+  # POST and get a false "already exists" 4xx that masks the real error. An HTTP 2xx
+  # is not trusted either: the value is read back below and asserted (verify, never
+  # assume; a write that REPORTS success without landing is the worst failure mode).
+  [ -n "$before" ] && verb=PATCH || verb=POST
+  "${CURL[@]}" -X "$verb" "$INFISICAL_BASE/api/v3/secrets/raw/$SSOT_SECRET_NAME" \
+    -H "Authorization: Bearer $INFISICAL_ACCESS_TOKEN" -H 'Content-Type: application/json' \
+    -d "$body" >/dev/null \
+    || { echo "FATAL: $verb of $SSOT_SECRET_NAME to Infisical $INFISICAL_ENV $CP_SSOT_PATH failed" >&2; exit 1; }
+  after="$(inf_get_raw "$SSOT_SECRET_NAME")"
+  if [ "$after" != "$ref" ]; then
+    echo "FATAL: $SSOT_SECRET_NAME write did not take — is '${after:-<empty>}', expected '$ref' ($INFISICAL_ENV $CP_SSOT_PATH)" >&2
+    exit 1
+  fi
+  log "SSOT written + verified: $SSOT_SECRET_NAME ${before:-<unset>} -> $ref ($INFISICAL_ENV $CP_SSOT_PATH)"
+}
+
+# The ref recorded as LOCAL_TENANT_IMAGE is exactly the image the fleet rolled to.
+# IMAGE is always a fully-qualified, pullable reference — `<name>:<tag>` (from
+# --tag or --image name:tag) or `<name>@sha256:<digest>` (from --image name@digest)
+# — so it is recorded verbatim. We deliberately do NOT reconstruct a `:staging-<sha>`
+# tag from a digest+git-sha: that would guess a prefix the real tag may not use
+# (e.g. a `main-<sha>` build), writing an unpullable ref and re-breaking fresh-org
+# boot — the very drift this script exists to prevent.
+SSOT_REF="$IMAGE"
 
 pins="$(cp_json GET /cp/admin/runtime-image)"
 read -r OLD_DIGEST OLD_GIT_SHA < <(printf '%s' "$pins" | python3 -c '
@@ -152,13 +264,18 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
 fi
 
 if [ "$OLD_DIGEST" = "$DIGEST" ] && [ "${OLD_GIT_SHA:-}" = "${GIT_SHA:-}" ]; then
-  log "pin already at target — no write needed"
+  # DB pin is already at target, but the boot-default SSOT drifts INDEPENDENTLY
+  # (it is exactly the state staging is in now: pin current, LOCAL_TENANT_IMAGE
+  # stale). Reconcile it here too — write_ssot_pin no-ops if already correct.
+  log "DB pin already at target — reconciling the CP boot-default SSOT"
+  write_ssot_pin "$SSOT_REF"
   echo "OLD_IMAGE=${OLD_IMAGE}"; echo "NEW_IMAGE=${IMAGE}"
   exit 0
 fi
 
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY-RUN: would promote $TEMPLATE_NAME ${OLD_DIGEST:-<unset>} -> $DIGEST"
+  log "DRY-RUN: would set $SSOT_SECRET_NAME = $SSOT_REF ($INFISICAL_ENV $CP_SSOT_PATH)"
   echo "OLD_IMAGE=${OLD_IMAGE}"; echo "NEW_IMAGE=${IMAGE}"
   exit 0
 fi
@@ -181,4 +298,7 @@ if [ "$now_digest" != "$DIGEST" ]; then
   exit 1
 fi
 log "pin promoted via CP admin API: $TEMPLATE_NAME ${OLD_DIGEST:-<unset>} -> $DIGEST"
+# Write the SECOND SSOT (the CP boot default) to match. Both must move together;
+# a DB-pin roll without this is the exact drift that broke prod fresh-org signup.
+write_ssot_pin "$SSOT_REF"
 echo "OLD_IMAGE=${OLD_IMAGE}"; echo "NEW_IMAGE=${IMAGE}"

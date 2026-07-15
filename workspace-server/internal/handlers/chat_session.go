@@ -124,9 +124,9 @@ func (h *ChatSessionHandler) NewSession(c *gin.Context) {
 	// (clearing an already-cleared view is a no-op).
 	if h.broadcaster != nil {
 		h.broadcaster.BroadcastOnly(workspaceID, string(events.EventSessionReset), map[string]interface{}{
-			"workspace_id":          workspaceID,
+			"workspace_id":            workspaceID,
 			"chat_session_started_at": marker.Format(time.RFC3339Nano),
-			"prev_marker_set":       prevMarker.Valid,
+			"prev_marker_set":         prevMarker.Valid,
 		})
 	}
 

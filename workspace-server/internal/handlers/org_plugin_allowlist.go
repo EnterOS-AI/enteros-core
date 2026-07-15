@@ -249,8 +249,8 @@ func (h *OrgPluginAllowlistHandler) GetAllowlist(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"org_id":   orgID,
-		"plugins":  entries,
+		"org_id":    orgID,
+		"plugins":   entries,
 		"allow_all": len(entries) == 0,
 	})
 }

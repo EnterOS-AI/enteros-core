@@ -1,14 +1,24 @@
 ---
-title: "How Molecule AI's Audit Ledger Works: HMAC Chains and the Fix That Made It Production-Ready"
+title: "Audit Ledger Design: HMAC Chains and a Historical Verification Fix"
 date: 2026-04-21
 slug: audit-chain-verification
-description: "Every agent decision logged, chained with HMAC-SHA256, and verified tamper-evident. Here's the architecture behind Molecule AI's audit trail — and the panic bug fix that shipped in PR #1339."
+description: "The historical HMAC-linked audit-event design and the verification panic fix that shipped in PR #1339."
 tags: [security, audit, HMAC, enterprise, compliance]
 ---
 
-# How Molecule AI's Audit Ledger Works: HMAC Chains and the Fix That Made It Production-Ready
+# Audit Ledger Design: HMAC Chains and a Historical Verification Fix
 
-Every time an agent in your Molecule AI org does something — delegates a task, calls a tool, reads a secret, or makes an external API call — that event is written to an append-only audit log. That log is chained with HMAC-SHA256 so that any tampering with past entries is detectable, provable, and logged.
+> **Current status (July 14, 2026):** Core still contains the `audit_events`
+> schema and authenticated read/verifier endpoint, but the in-Core Python
+> producer described by this article was removed during the workspace-runtime
+> split. The active standalone runtime and templates do not currently write
+> these rows. This article documents the historical design and verification
+> fix; it is not a claim that current agent work is being recorded in this
+> ledger. The restore-or-retire decision is tracked internally.
+
+The April 2026 in-Core runtime implementation wrote selected agent execution
+events to an HMAC-SHA256-linked audit table so changes to stored entries could
+be detected during verification.
 
 This post explains how that system works and what changed in PR #1339.
 
@@ -20,13 +30,14 @@ A standard audit log is a list of events with timestamps. It's useful for debugg
 
 For production multi-agent systems, that matters. Your compliance team needs to know: *did that agent actually call the API it was supposed to call, or did it skip the approval step?* A plain log can't answer that with confidence.
 
-Molecule AI's audit ledger is built to answer that question.
+The audit-ledger design was built to answer that question.
 
 ---
 
 ## HMAC-SHA256 chain architecture
 
-The audit ledger is an **append-only, chain-verified log**. Each entry contains:
+The historical producer treated the ledger as an **append-only, HMAC-linked
+log**. Each entry contains:
 
 - The event data (who did what, when, what the result was)
 - An HMAC-SHA256 of the current entry, signed with a server-side secret
@@ -47,29 +58,17 @@ If you change *any* past entry, its HMAC changes. That breaks the chain at the n
 
 ## Verifying the chain
 
-`verifyAuditChain` walks the log from the beginning, recomputing each HMAC and comparing it against the stored value. If every entry verifies, the chain is intact — no tampering.
+`verifyAuditChain` walks the supplied rows in chronological order, recomputing
+each HMAC and comparing it against the stored value. The API only returns a
+verdict when the query can represent a complete chain prefix.
 
-If an entry fails to verify, the function returns `false`. Your observability stack picks this up and can alert, halt, or log the discrepancy. The audit trail isn't just a record of what happened — it's a proof that the record hasn't been altered.
+If an entry fails to verify, the function returns `false`. A caller can use
+that verdict to alert or log the discrepancy. A `true` verdict only covers the
+rows the endpoint was able to verify; it does not prove that all expected
+agent actions were emitted.
 
-This is what compliance auditors want: not a log, but a **tamper-evident log with cryptographic guarantees**.
-
----
-
-## What org-scoped keys add
-
-Org-scoped API keys are the attribution layer on top of the integrity layer.
-
-Each org key carries a name, a hash, and a prefix. Every authenticated call carries that prefix in the audit row:
-
-```
-org-token:mole_a1b2 POST /workspaces/ws_abc123/secrets 200 3ms
-```
-
-Combined with the HMAC chain, you get two guarantees simultaneously:
-1. **Integrity** — the audit log hasn't been tampered with (HMAC chain)
-2. **Attribution** — you know exactly which named key (and therefore which integration) made each call (org API keys)
-
-For teams running SOC 2 or ISO 27001, this is the difference between "here's a log" and "here's a cryptographically verifiable, attributable record of everything that happened."
+With an owned producer and signing-key contract, this design can make persisted
+rows tamper-evident. It cannot prove that every expected action was emitted.
 
 ---
 
@@ -106,15 +105,11 @@ The panic is gone. The integrity guarantee holds.
 
 ---
 
-## What this means for production deployments
+## What the fix guarantees
 
-If you're running Molecule AI in a production environment:
-
-- **The audit log is tamper-evident by construction.** You can verify the chain integrity programmatically at any point and alert on failures.
-- **Org-scoped keys give you per-integration attribution.** A compromised CI key is identifiable, revocable, and its entire call history is reconstructable.
-- **PR #1339 ensures the verification pass itself is hardened.** Corrupt rows — whether from a bug, a migration, or an attack — are handled gracefully, not catastrophically.
-
-The combination of HMAC chain + org-scoped key attribution + immediate revocation is the foundation of Molecule AI's production trust model for enterprise teams.
+PR #1339 hardens the verification function for rows that already exist:
+short or corrupt HMAC strings produce a failed verdict instead of crashing the
+verification process. It does not provide or validate a current event producer.
 
 ---
 
@@ -122,7 +117,7 @@ The combination of HMAC chain + org-scoped key attribution + immediate revocatio
 
 - [Org-scoped API keys guide](/docs/guides/org-api-keys) — mint your first named key
 - [Architecture: Org API Keys](/docs/architecture/org-api-keys) — the full design
-- [Platform API Reference](/docs/api-reference) — audit log endpoints
+- [Platform API contract](../../api-protocol/platform-api.md) — current read-endpoint fields and pagination
 
 ---
 

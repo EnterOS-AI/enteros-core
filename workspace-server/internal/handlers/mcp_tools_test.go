@@ -262,7 +262,7 @@ func TestUpdateMCPDelegationStatus_Success(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Should not panic, should not error
-	updateMCPDelegationStatus(context.Background(), mockDB, "ws-src", "del-789", "completed", "")
+	updateMCPDelegationStatus(context.Background(), mockDB, mcpSyncRoute, "ws-src", "del-789", "completed", "")
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestUpdateMCPDelegationStatus_WithErrorDetail(t *testing.T) {
 		WithArgs("failed", "timeout", "ws-src", "del-000").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	updateMCPDelegationStatus(context.Background(), mockDB, "ws-src", "del-000", "failed", "timeout")
+	updateMCPDelegationStatus(context.Background(), mockDB, mcpSyncRoute, "ws-src", "del-000", "failed", "timeout")
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestUpdateMCPDelegationStatus_DBError_LoggedNotReturned(t *testing.T) {
 
 	// Function returns no value — error is logged, not propagated.
 	// Verify it does not panic.
-	updateMCPDelegationStatus(context.Background(), mockDB, "ws-src", "del-abc", "failed", "connection refused")
+	updateMCPDelegationStatus(context.Background(), mockDB, mcpSyncRoute, "ws-src", "del-abc", "failed", "connection refused")
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
 	}

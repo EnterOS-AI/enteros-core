@@ -324,25 +324,33 @@ jobs:
           echo "PORT=${PLATFORM_PORT}" >> "$GITHUB_ENV"
           echo "BASE=http://127.0.0.1:${PLATFORM_PORT}" >> "$GITHUB_ENV"
           echo "Platform host port: ${PLATFORM_PORT}"
-      - name: (local) Kill stale platform-server before start
-        if: needs.changes.outputs.peervis == 'true'
-        run: |
-          killed=0
-          for pid in $(grep -l "platform-serve" /proc/[0-9]*/comm 2>/dev/null); do
-            kpid="${pid%/comm}"; kpid="${kpid##*/}"
-            cmdline=$(cat "/proc/${kpid}/cmdline" 2>/dev/null | tr '\0' ' ')
-            if echo "$cmdline" | grep -q "platform-server"; then
-              echo "Killing stale platform-server pid ${kpid}"
-              kill "$kpid" 2>/dev/null || true; killed=$((killed + 1))
-            fi
-          done
-          [ "$killed" -gt 0 ] && sleep 2 || true
-          echo "stale-kill done ($killed killed)"
+      # The "(local) Kill stale platform-server before start" step that lived
+      # here is DELETED. It scanned /proc and killed ANY process whose cmdline
+      # contained "platform-server" — host-wide, not run-scoped. On the shared
+      # `docker-host` runner (e2e-api, local-provision-e2e, e2e-chat and this
+      # lane all land on it, and demonstrably overlap across PRs) that sweep
+      # reached into a CONCURRENT PR's live run and killed its platform-server
+      # mid-test — a required context going red on a PR that changed nothing,
+      # which under branch protection status_check_contexts=['*'] wedges the
+      # whole merge queue. This lane is the most dangerous host of that sweep:
+      # it is required, has no continue-on-error, and is queued to run on every
+      # PR, which would take the interference from rare to universal.
+      #
+      # It also protected nothing: the port is ephemeral (the probe above binds
+      # :0), so no leftover process can hold it. The orphan-leak it was
+      # compensating for is closed at the source by `timeout` below.
       - name: (local) Start platform (background)
         if: needs.changes.outputs.peervis == 'true'
         working-directory: workspace-server
         run: |
-          ./platform-server > platform.log 2>&1 &
+          # `timeout` bound == this job's own timeout-minutes (60), so it can
+          # never fire during a healthy run (the clock starts here, after
+          # checkout/docker/go-build; the job is already dead by then). It exists
+          # solely so a hard-cancelled run's server reaps ITSELF instead of being
+          # swept up by some other run. Signals only our own child. TERM is
+          # forwarded to the child and `timeout` exits with its status, so the
+          # /health wait's `kill -0` early-exit detection still works.
+          timeout --signal=TERM --kill-after=30s 60m ./platform-server > platform.log 2>&1 &
           echo $! > platform.pid
       - name: (local) Wait for /health
         if: needs.changes.outputs.peervis == 'true'

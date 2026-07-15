@@ -95,7 +95,37 @@ func newConnectSnippetRouter(wh *WorkspaceHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.GET("/workspaces/:id/external/connection", wh.GetExternalConnection)
+	// The mint path. Create and Rotate return the SAME payload (both call
+	// BuildExternalConnectionPayload with a freshly-minted token); rotate is
+	// the one that is drivable hermetically, so it is the HTTP boundary the
+	// credential-stamping gate below uses.
+	r.POST("/workspaces/:id/external/rotate", wh.RotateExternalCredentials)
 	return r
+}
+
+// snippetFieldsOf returns the operator-facing snippet/template fields of a
+// decoded connection payload — the fields whose whole purpose is to be
+// copy-pasted into a terminal. Derived from the response itself (not a
+// hand-kept list) so a NEW snippet is covered by the assertions below the
+// moment it ships.
+func snippetFieldsOf(t *testing.T, conn map[string]interface{}) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for k, v := range conn {
+		if !strings.HasSuffix(k, "_snippet") && !strings.HasSuffix(k, "_template") {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok {
+			t.Errorf("connection field %q is %T, want string", k, v)
+			continue
+		}
+		out[k] = s
+	}
+	if len(out) == 0 {
+		t.Fatal("connection payload carried NO snippet fields — the endpoint shape changed")
+	}
+	return out
 }
 
 // callConnectSnippet drives the endpoint and returns the decoded
@@ -195,6 +225,109 @@ func TestE2E_ExternalConnectSnippet_DefenseInDepthPlatformURL(t *testing.T) {
 	}
 	for _, field := range []string{"platform_url", "registry_endpoint", "heartbeat_endpoint"} {
 		assertPublicSnippetURL(t, field, asString(t, conn, field))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock: %v", err)
+	}
+}
+
+// TestE2E_ExternalConnectSnippet_CredentialStampedAtHTTPBoundary is the
+// credential half of this lane's leak-lint — the same class-level shape the
+// internal-ADDRESS guard above has, applied to the CREDENTIAL.
+//
+// The bug (#79): the operator was handed a snippet whose token field was the
+// literal "<paste auth_token from create response>". The token was stamped
+// client-side by hand-copied string.replace() needles in the canvas; when a
+// template changed, the needle silently stopped matching and the placeholder
+// shipped. The server now owns the stamp ({{AUTH_TOKEN}}), and this asserts
+// it at the HTTP boundary the canvas actually calls: EVERY snippet field of
+// the minted-token response must carry the minted token verbatim and no
+// unsubstituted placeholder of any kind.
+//
+// Class-level: the fields are read off the RESPONSE, so a snippet added later
+// is gated automatically.
+func TestE2E_ExternalConnectSnippet_CredentialStampedAtHTTPBoundary(t *testing.T) {
+	const publicURL = "https://acme.moleculesai.app"
+	t.Setenv("EXTERNAL_PLATFORM_URL", publicURL)
+	t.Setenv("PLATFORM_URL", "")
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	wh := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	// Rotate = revoke + mint, then the same payload Create returns.
+	expectExternalRuntimeLookup(mock, "ws-ext", "external", "my-bot")
+	mock.ExpectExec(`UPDATE workspace_auth_tokens`).
+		WithArgs("ws-ext").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO workspace_auth_tokens`).
+		WithArgs("ws-ext", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/workspaces/ws-ext/external/rotate", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	newConnectSnippetRouter(wh).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST external/rotate: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Connection map[string]interface{} `json:"connection"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode connection payload: %v (body=%s)", err, w.Body.String())
+	}
+
+	token := asString(t, body.Connection, "auth_token")
+	if token == "" {
+		t.Fatal("mint path returned an empty auth_token — nothing to stamp")
+	}
+	for field, snippet := range snippetFieldsOf(t, body.Connection) {
+		if strings.Contains(snippet, "<paste") {
+			t.Errorf("%s ships an unsubstituted human placeholder (\"<paste …>\") to the operator — "+
+				"this is exactly #79. Credential sites must be {{AUTH_TOKEN}}, stamped server-side.", field)
+		}
+		if strings.Contains(snippet, "{{") {
+			t.Errorf("%s ships an unsubstituted {{PLACEHOLDER}} — teach stamp() about it", field)
+		}
+		if !strings.Contains(snippet, token) {
+			t.Errorf("%s does not contain the minted auth_token — the operator cannot run it "+
+				"without hand-editing the credential in", field)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock: %v", err)
+	}
+}
+
+// TestE2E_ExternalConnectSnippet_ReshowStaysVisiblyIncomplete pins the OTHER
+// arm of the credential class at the HTTP boundary: the read-only re-show
+// (GET .../external/connection) mints nothing and returns auth_token="".
+// Its snippets must stay visibly non-runnable — an empty string at the
+// credential site produces a snippet that LOOKS complete and 401s with no
+// clue why.
+func TestE2E_ExternalConnectSnippet_ReshowStaysVisiblyIncomplete(t *testing.T) {
+	const publicURL = "https://acme.moleculesai.app"
+	t.Setenv("EXTERNAL_PLATFORM_URL", publicURL)
+	t.Setenv("PLATFORM_URL", "")
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	wh := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	expectExternalRuntimeLookup(mock, "ws-ext", "external", "my-bot")
+
+	conn := callConnectSnippet(t, wh, "ws-ext", "host.docker.internal:50389")
+	if got := conn["auth_token"]; got != "" {
+		t.Fatalf("re-show path must NOT mint; auth_token = %v", got)
+	}
+	for field, snippet := range snippetFieldsOf(t, conn) {
+		if !strings.Contains(snippet, tokenUnavailableMarker) {
+			t.Errorf("%s: re-show snippet must carry %q at the credential site so the operator "+
+				"sees the token is missing; got a snippet without it", field, tokenUnavailableMarker)
+		}
+		if strings.Contains(snippet, "{{") {
+			t.Errorf("%s ships an unsubstituted {{PLACEHOLDER}}", field)
+		}
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock: %v", err)

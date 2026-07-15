@@ -540,14 +540,15 @@ func lookupUploadDeliveryMode(c *gin.Context, ctx context.Context, workspaceID s
 
 // unsafeFilenameChars matches every character that isn't in the safe
 // alphanumeric + dot/dash/underscore set. Mirrors the Python regex
-// _UNSAFE_FILENAME_CHARS in workspace/internal_chat_uploads.py — drift
+// _UNSAFE_FILENAME_CHARS in the standalone runtime's
+// molecule_runtime/internal_chat_uploads.py — drift
 // here would mean canvas-emitted URIs differ between push and poll
 // paths for the same upload.
 var unsafeFilenameChars = regexp.MustCompile(`[^a-zA-Z0-9._\-]`)
 
 // SanitizeFilename reduces a user-supplied filename to a safe form.
-// Behaviorally identical to sanitize_filename in workspace/
-// internal_chat_uploads.py. Exported so tests in other packages can
+// Behaviorally identical to sanitize_filename in the standalone runtime's
+// molecule_runtime/internal_chat_uploads.py. Exported so tests in other packages can
 // pin behavior parity, and so a future shared library can move both
 // implementations behind one source of truth.
 func SanitizeFilename(name string) string {
@@ -608,7 +609,7 @@ type uploadedFile struct {
 // Phase 3 metrics will hook these structured logs.
 func (h *ChatFilesHandler) uploadPollMode(c *gin.Context, ctx context.Context, workspaceID string) {
 	// Parse multipart with the same per-file/per-form limits the
-	// workspace-side handler uses (workspace/internal_chat_uploads.py:
+	// standalone runtime handler uses (molecule_runtime/internal_chat_uploads.py:
 	// max_files=64, max_fields=32). gin's MultipartForm does not
 	// expose those limits directly — the underlying ParseMultipartForm
 	// caps memory at 32 MB by default and spills to disk. For poll-

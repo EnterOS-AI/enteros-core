@@ -160,6 +160,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		}
 		c.JSON(200, gin.H{"subsystems": out})
 	})
+	registerNativeChannelCutoverInventoryRoute(r, db.DB)
 
 	// Prometheus metrics — exempt from rate limiter via separate registration
 	// (registered before Use(limiter) takes effect on this specific route — the
@@ -172,7 +173,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.GET("/workspaces/:id", wh.Get)
 
 	// C1 + C20: workspace list and life-cycle mutations gated behind AdminAuth.
-	// Fail-open when no tokens exist anywhere (fresh install / pre-Phase-30).
+	// Authentication fails closed in every environment, including fresh installs.
 	// Blocks:
 	//   C1   — unauthenticated GET /workspaces (workspace topology exposure)
 	//   C20  — unauthenticated DELETE /workspaces/:id (mass-deletion attack)
@@ -263,9 +264,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.GET("/workspaces/:id/a2a/queue/:queue_id", wh.GetA2AQueueStatus)
 
 	// Auth-gated workspace sub-routes — ALL /workspaces/:id/* paths except /a2a.
-	// Fix A (Cycle 5): single WorkspaceAuth middleware blocks C2-C5, C7-C9, C12, C13
-	// by requiring a valid bearer token for any workspace that has one on file.
-	// Legacy workspaces (no token) are grandfathered to allow rolling upgrades.
+	// Fix A (Cycle 5): single fail-closed WorkspaceAuth middleware blocks
+	// C2-C5, C7-C9, C12, and C13 unless the caller presents a valid scoped
+	// credential or verified control-plane session.
 	wsAuth := r.Group("/workspaces/:id", middleware.WorkspaceAuth(db.DB))
 	{
 		// #680: PATCH /workspaces/:id moved under WorkspaceAuth (#680 IDOR fix).
@@ -297,8 +298,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.POST("/broadcast", broadcastH.Broadcast)
 
 		// External-workspace credential lifecycle (issue #319 follow-up to
-		// the Create flow). Both endpoints reject runtime ≠ external with
-		// 400 — see external_rotate.go for the rationale.
+		// the Create flow). Both endpoints accept external-like BYO-compute
+		// runtimes and reject container-backed runtimes with 400 — see
+		// external_rotate.go for the rationale.
 		//
 		//   POST .../external/rotate     — mint fresh token, revoke prior,
 		//                                  return ExternalConnectionInfo
@@ -604,6 +606,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 		// Secrets (auto-restart workspace after secret change)
 		sech := handlers.NewSecretsHandler(wh.RestartByID)
+		// Idle-digest mail counts (task #219 phase-2, D5): counts + overdue
+		// list over the platform ledgers; detail stays behind the
+		// communication MCP tools. Read-only, workspace-scoped.
+		mailh := handlers.NewMailSummaryHandler()
+		wsAuth.GET("/mail/summary", mailh.Summary)
 		wsAuth.GET("/secrets", sech.List)
 		// Phase 30.2 — decrypted values pull, token-gated. Canvas uses List
 		// (keys + metadata only); remote agents use Values to bootstrap env.
@@ -659,8 +666,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	}
 
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
-	// Fix (Cycle 7): protected by AdminAuth — any valid workspace bearer token grants access.
-	// Fail-open when no tokens exist (fresh install / pre-Phase-30 upgrade).
+	// Protected by strict AdminAuth: a missing or invalid bearer is rejected in
+	// every environment, including fresh installs, and datastore errors fail closed.
 	{
 		adminAuth := r.Group("", middleware.AdminAuth(db.DB))
 		sechGlobal := handlers.NewSecretsHandler(wh.RestartByID)
@@ -692,8 +699,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// Admin — cross-workspace schedule health monitoring (issue #618).
 	// Lets cron-audit agents and operators detect silent schedule failures
 	// across all workspaces without holding individual workspace bearer tokens.
-	// AdminAuth mirrors the /admin/liveness gate — fail-open on fresh install,
-	// strict bearer-only once any token exists.
+	// AdminAuth mirrors the /admin/liveness gate: strict bearer-only and
+	// fail-closed in every environment, including fresh installs.
 	{
 		asHealth := handlers.NewAdminSchedulesHealthHandler()
 		r.GET("/admin/schedules/health", middleware.AdminAuth(db.DB), asHealth.Health)
@@ -1001,9 +1008,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.POST("/channels/discover", middleware.AdminAuth(db.DB), chh.Discover)
 	r.POST("/webhooks/:type", chh.Webhook)
 
-	// Audit — EU AI Act Annex III compliance endpoint (#594).
-	// Returns append-only HMAC-chained agent event log with optional inline
-	// chain verification when AUDIT_LEDGER_SALT is configured.
+	// Audit ledger read surface (#594). Returns stored HMAC-linked agent events
+	// with optional inline chain verification when AUDIT_LEDGER_SALT is set.
+	// Event production is a separate runtime responsibility.
 	audh := handlers.NewAuditHandler()
 	wsAuth.GET("/audit", audh.Query)
 

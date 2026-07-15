@@ -131,22 +131,14 @@ The agent appears on the canvas with a **purple REMOTE badge** within seconds. F
 
 For local MCP-driven agents, use the standalone runtime's `molecule-mcp`
 entrypoint. A single local bridge can serve multiple external workspaces by
-setting `MOLECULE_WORKSPACES`:
+setting `MOLECULE_WORKSPACES_JSON` to a JSON array of `{id, token,
+platform_url}` objects.
 
-```json
-[
-  {
-    "id": "workspace-id-local-to-acme",
-    "token": "...",
-    "platform_url": "https://acme.moleculesai.app"
-  },
-  {
-    "id": "different-workspace-id-local-to-ops",
-    "token": "...",
-    "platform_url": "https://ops.moleculesai.app"
-  }
-]
-```
+The shape is documented once, canonically, in
+[external-agent-registration.md → Multiple Workspaces From One Local MCP
+Bridge](./external-agent-registration.md#multiple-workspaces-from-one-local-mcp-bridge).
+It is deliberately NOT restated here — a second copy of an env-var name is how
+the name drifts out of sync with what the bridge actually reads.
 
 `platform_url` selects the tenant for registration, heartbeat, inbox polling,
 and outbound A2A routing. `org_id` is not required in this config, and the

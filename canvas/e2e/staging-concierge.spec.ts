@@ -18,19 +18,26 @@
  * cmd/server/main.go), so without it the concierge shell falls back to
  * roots[0] as a *pseudo*-platform surface and the platform-specific
  * behaviours (root tag, hidden-from-map) can't be asserted. So this spec
- * installs one via the SAME admin endpoint the control plane uses at
- * org-provision time — POST /admin/org/platform-agent (AdminAuth, accepts the
- * per-tenant admin bearer that global setup already exports). Installing it
- * re-parents the provisioned hermes workspace UNDER the platform agent
- * (handlers/platform_agent.go installPlatformAgent), giving us a real
- * platform ROOT + a real child workspace — exactly the topology the concierge
- * Home tree and Org-map filter are built to handle.
+ * ENSURES one via POST /admin/org/platform-agent/ensure (AdminAuth, accepts the
+ * per-tenant admin bearer that global setup already exports) — the endpoint
+ * that derives the canonical id and repairs the org's existing concierge in
+ * place. That gives us a real platform ROOT + a real child workspace — exactly
+ * the topology the concierge Home tree and Org-map filter are built to handle.
  *
- * This install mutates the shared tenant (re-parents the workspace). It is the
- * LAST staging spec alphabetically among the topology-touching ones, and
+ * It must be /ensure and NOT the raw POST /admin/org/platform-agent: the raw
+ * install takes a caller-supplied id and DOWNGRADES whatever platform root does
+ * not match it, without ever provisioning the replacement. This spec used to
+ * call it with a made-up uuid, which silently destroyed the org's live
+ * concierge for every spec that ran after it — see ensurePlatformAgent below.
+ *
+ * The ensure mutates the shared tenant (it may re-parent the workspace). Other
+ * staging specs must therefore not assume this one leaves the org untouched.
  * staging-tabs / staging-display read the workspace by id (not by root-ness),
  * so the re-parent does not break them; Playwright runs workers=1 in file
- * order, and the install is idempotent.
+ * order, and the ensure is idempotent (a healthy concierge is a pure no-op).
+ * NOTE staging-slow-cold-greeting.spec.ts sorts AFTER this file and DOES need a
+ * live concierge — whatever this spec does to the org root, it must leave it
+ * online.
  *
  * Auth model is identical to staging-tabs.spec.ts: feed the per-tenant admin
  * token as an Authorization: Bearer header on every browser request, mock
@@ -66,55 +73,85 @@ function tenantEnv() {
   return { tenantURL, tenantToken, workspaceId, orgID };
 }
 
-// A fixed, valid uuid for the installed platform agent. Any valid uuid works
-// (the install upserts on this id); reusing one constant keeps re-runs
-// idempotent on the same row. Chosen out of the e2e namespace so it can't
-// collide with a CP-derived org id.
-const PLATFORM_AGENT_ID = "e2e0c1e2-0000-4000-a000-000000c0ce0e";
-const PLATFORM_AGENT_NAME = "E2E Concierge";
-
 /**
- * Idempotently install the platform-agent (concierge) row on the shared
- * tenant so the concierge shell resolves a REAL kind='platform' root. Uses
- * the per-tenant admin bearer + org-id headers, same as staging-display.spec.
- * Tolerant of a pre-existing install (the endpoint is idempotent) and of a
- * backend that predates the endpoint (404/405) — in that degraded case the
- * spec proceeds against the roots[0] fallback and the two platform-specific
- * assertions self-document why they're loosened.
+ * Ensure the org has a REAL kind='platform' root, and report its id + name.
+ *
+ * This spec used to POST a hardcoded uuid to the RAW install endpoint
+ * (`POST /admin/org/platform-agent`) on the theory that "any valid uuid works —
+ * the install upserts on this id". That was true until core bae6a1cdb
+ * (2026-06-11), which taught the raw install to DOWNGRADE any platform root
+ * whose id differs from the caller's before upserting. From then on, this
+ * spec's foreign uuid demoted the org's real, ONLINE concierge to an ordinary
+ * workspace and put a row with no container in its place — and the raw install
+ * never provisions, so nothing ever brought that replacement up. Every spec
+ * that ran after this one inherited a concierge that could never reach 'online'
+ * (staging-slow-cold-greeting: "concierge composer never enabled").
+ *
+ * `/ensure` is the non-destructive endpoint: it derives the canonical id,
+ * repairs the EXISTING root in place (never displaces it), no-ops when healthy,
+ * and returns the id that is actually serving. We take the name from the row
+ * itself rather than asserting one, because the concierge is the CP's to name.
  */
-async function installPlatformAgent(
+async function ensurePlatformAgent(
   page: Page,
   tenantURL: string,
   tenantToken: string,
   orgID: string | undefined,
-): Promise<{ installed: boolean }> {
+): Promise<{ installed: boolean; name: string }> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${tenantToken}`,
     "Content-Type": "application/json",
   };
   if (orgID) headers["X-Molecule-Org-Id"] = orgID;
-  const resp = await page.request.post(`${tenantURL}/admin/org/platform-agent`, {
+  const resp = await page.request.post(`${tenantURL}/admin/org/platform-agent/ensure`, {
     headers,
-    data: { id: PLATFORM_AGENT_ID, name: PLATFORM_AGENT_NAME },
+    data: {},
   });
   const status = resp.status();
-  if (status >= 200 && status < 300) {
-    console.log(`[staging-concierge] platform agent installed (HTTP ${status})`);
-    return { installed: true };
-  }
+
   // Endpoint absent on an older backend — proceed against the fallback root.
   if (status === 404 || status === 405) {
     console.warn(
-      `[staging-concierge] POST /admin/org/platform-agent returned ${status} — ` +
-        `backend predates the platform-agent endpoint. Proceeding against the ` +
-        `roots[0] concierge fallback; the platform-root / map-hidden assertions ` +
-        `are loosened accordingly.`,
+      `[staging-concierge] POST /admin/org/platform-agent/ensure returned ${status} — ` +
+        `backend predates the ensure endpoint. Proceeding against the roots[0] ` +
+        `concierge fallback; the platform-root / map-hidden assertions are ` +
+        `loosened accordingly.`,
     );
-    return { installed: false };
+    return { installed: false, name: "" };
   }
-  throw new Error(
-    `POST /admin/org/platform-agent ${status}: ${await resp.text().catch(() => "")}`,
+  if (status < 200 || status >= 300) {
+    throw new Error(
+      `POST /admin/org/platform-agent/ensure ${status}: ${await resp.text().catch(() => "")}`,
+    );
+  }
+
+  const body = (await resp.json()) as { status?: string; platform_agent_id?: string };
+  const id = body.platform_agent_id ?? "";
+  if (!id) {
+    throw new Error(
+      `POST /admin/org/platform-agent/ensure 200 but returned no platform_agent_id: ` +
+        JSON.stringify(body),
+    );
+  }
+
+  // Read the concierge's REAL display name off the row. The map-hidden
+  // assertion keys on it, and hardcoding a name here would only re-introduce
+  // the same class of bug: a test constant asserted against live org state.
+  const wsResp = await page.request.get(`${tenantURL}/workspaces/${id}`, { headers });
+  if (!wsResp.ok()) {
+    throw new Error(
+      `GET /workspaces/${id} ${wsResp.status()} — ensure reported this as the org's ` +
+        `platform root, so it must be readable`,
+    );
+  }
+  const name = ((await wsResp.json()) as { name?: string }).name ?? "";
+  if (!name) throw new Error(`platform root ${id} has no name`);
+
+  console.log(
+    `[staging-concierge] platform agent ensured (HTTP ${status}, ` +
+      `action=${body.status ?? "?"}, id=${id}, name=${JSON.stringify(name)})`,
   );
+  return { installed: true, name };
 }
 
 /**
@@ -201,10 +238,12 @@ async function navTo(page: Page, view: "home" | "map" | "settings"): Promise<voi
 }
 
 // ── shared per-spec setup ──────────────────────────────────────────────────
-// Each test gets a freshly-authenticated context + an installed platform
-// agent. Install lives in beforeEach (idempotent) so any single test can run
-// in isolation (`--grep`), not only in whole-file order.
+// Each test gets a freshly-authenticated context + an ensured platform agent.
+// The ensure lives in beforeEach (idempotent, and a no-op when the concierge is
+// healthy) so any single test can run in isolation (`--grep`), not only in
+// whole-file order.
 let platformInstalled = false;
+let platformAgentName = "";
 
 test.beforeEach(async ({ page, context }) => {
   const { tenantURL, tenantToken, workspaceId, orgID } = tenantEnv();
@@ -228,8 +267,9 @@ test.beforeEach(async ({ page, context }) => {
     );
   });
   await authenticate(context, tenantToken, workspaceId);
-  const { installed } = await installPlatformAgent(page, tenantURL, tenantToken, orgID);
+  const { installed, name } = await ensurePlatformAgent(page, tenantURL, tenantToken, orgID);
   platformInstalled = installed;
+  platformAgentName = name;
 });
 
 /* ───────────────────────── 1. Concierge shell / nav ──────────────────────── */
@@ -394,10 +434,10 @@ test.describe("concierge Org map", () => {
     // carries its name. WorkspaceNode's aria-label is "<name> workspace —
     // <status>" — assert none matches the platform agent name. This is the
     // real behaviour stripPlatformRootForMap implements (Canvas.tsx /
-    // canvas-topology.ts). Only meaningful when we actually installed one.
+    // canvas-topology.ts). Only meaningful when we actually resolved one.
     if (platformInstalled) {
       const platformNode = page.locator(
-        `[data-testid^="workspace-node-"][aria-label^="${PLATFORM_AGENT_NAME} workspace"]`,
+        `[data-testid^="workspace-node-"][aria-label^="${platformAgentName} workspace"]`,
       );
       await expect(
         platformNode,

@@ -19,8 +19,29 @@
 name: gate-check-v3
 
 on:
-  pull_request_target:
-    types: [opened, edited, synchronize, reopened]
+  # `pull_request_target` REMOVED 2026-07-13 (task #97).
+  #
+  # This workflow is `disabled_manually` in the Gitea Actions config — the CTO
+  # directive of 2026-07-11 turned the review/SOP ceremony gates off (see
+  # .gitea/required-contexts.txt: "bot-operated review/SOP acks were meaningless
+  # ceremony"). But disabling a workflow in Gitea does NOT stop
+  # `pull_request_target` from firing it. It only blocks manual rerun/dispatch.
+  #
+  # So this kept posting `gate-check-v3 / gate-check (pull_request_target)` on
+  # every PR, and when a run ended `failure` — or `cancelled`, which posts
+  # `failure` with zero logs — that status was UNCLEARABLE:
+  #     POST /actions/runs/<id>/rerun
+  #       -> 400 {"message":"workflow gate-check-v3.yml is disabled"}
+  # while main's `['*']` wildcard branch protection demands every reported
+  # context be success. core#4126 sat wedged on exactly this; the only escape was
+  # PATCHing the PR body to force a fresh `edited` event.
+  #
+  # A gate that is off must be OFF. With the PR trigger gone it emits no status
+  # and cannot wedge anything. To restore the ceremony: re-enable the workflow in
+  # the Actions config AND restore this trigger (both, or you get the wedge back).
+  # Guard G (ci-required-drift.py --disabled-pr-emitter-lint) now fails RED if a
+  # disabled workflow still declares a PR trigger.
+  #
   # NOTE: `workflow_dispatch.inputs` block intentionally omitted.
   # Gitea 1.22.6 parser rejects `workflow_dispatch.inputs.X` with
   # "unknown on type" — it mis-treats the inputs sub-keys as top-level

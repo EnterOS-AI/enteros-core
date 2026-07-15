@@ -1,7 +1,8 @@
 """Tests for `.gitea/scripts/_approval_validator.py`.
 
-Locks the fail-closed review contract used by both the merge queue and
-review-check.sh. The regression in molecule-core#3066 showed that a
+Locks the fail-closed review contract used by the merge queue (its sole
+consumer since the review-check.sh chain was removed with the SOP review
+gate 2026-07-14). The regression in molecule-core#3066 showed that a
 dismissed/superseded REQUEST_CHANGES review could block an otherwise-ready
 PR when the reducer did not (a) take the latest review per user and (b)
 explicitly drop `dismissed` / `official=false` rows.

@@ -64,19 +64,21 @@ def test_required_contexts_green_rejects_missing_and_pending():
     ]
 
 
-def test_required_contexts_green_rejects_volume_skipped():
-    """volume-skipped pending is a partial view, not a genuine soft-fail.
+def test_required_contexts_green_rejects_pending_with_descriptive_prefix():
+    """A required context left `pending` is a partial view, not a soft-fail.
 
-    Per sop-checklist.py:1179-1187, volume_skipped posts pending with a
-    '[volume-skipped]' prefix. The merge queue must NOT treat this as an
-    acceptable soft-fail — the gate did not finish evaluating.
+    A gate can post `pending` with a human-readable description prefix (e.g. a
+    `[volume-skipped]` note when it capped its own work). The merge queue must
+    NOT treat any such pending required context as an acceptable soft-fail —
+    the gate did not finish evaluating. Proven here against a real required
+    context so the guard tracks the live required set.
     """
     latest = mq.latest_statuses_by_context([
         {"context": "CI / all-required (pull_request)", "status": "success"},
         {
-            "context": "sop-checklist / all-items-acked (pull_request_target)",
+            "context": "Secret scan / Scan diff for credential-shaped strings (pull_request)",
             "status": "pending",
-            "description": "[volume-skipped] comment-cap=1000 hit; please file ...",
+            "description": "[volume-skipped] cap hit; please file ...",
         },
     ])
 
@@ -84,12 +86,140 @@ def test_required_contexts_green_rejects_volume_skipped():
         latest,
         [
             "CI / all-required (pull_request)",
-            "sop-checklist / all-items-acked (pull_request_target)",
+            "Secret scan / Scan diff for credential-shaped strings (pull_request)",
         ],
     )
 
     assert ok is False
-    assert "sop-checklist / all-items-acked (pull_request_target)=pending" in missing_or_bad
+    assert (
+        "Secret scan / Scan diff for credential-shaped strings (pull_request)=pending"
+        in missing_or_bad
+    )
+
+
+# ── core#4363: BP wildcard "*" handling ─────────────────────────────────────
+# Production branch protection on main is status_check_contexts=['*']. Until this
+# fix, required_contexts_green treated "*" as a LITERAL context name, so it
+# returned (False, ["*=missing"]) on EVERY PR — even a fully green one — and the
+# merge queue decided `wait` on all of them. The bot merged nothing; humans did
+# every merge. These tests exercise the ['*'] path the existing suite never did
+# (its _ready_kwargs uses a literal required_contexts list).
+
+
+def test_wildcard_all_posted_green_is_green():
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "success"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is True, bad
+    assert bad == []
+
+
+def test_wildcard_waits_on_any_posted_red():
+    # Negative control: with "*", ANY posted non-success blocks — there is no
+    # advisory tier (matches BP ['*'] and task #113).
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "failure"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["E2E Chat / E2E Chat (pull_request)=failure"]
+
+
+def test_wildcard_waits_on_any_posted_pending():
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["E2E Chat / E2E Chat (pull_request)=pending"]
+
+
+def test_wildcard_with_zero_posted_is_vacuously_green_at_this_layer():
+    # With NO posted statuses, "*" has nothing to reject -> green at THIS layer.
+    # That is intentional and safe ONLY because the PRESENCE of specific contexts
+    # is enforced separately by step 4b (enforced_file_contexts from
+    # .gitea/required-contexts.txt). See test_wildcard_green_but_enforced_file_
+    # context_missing_waits below for the composition.
+    ok, bad = mq.required_contexts_green({}, ["*"])
+    assert ok is True
+    assert bad == []
+
+
+def test_wildcard_plus_literal_dedupes_a_double_flag():
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "failure"},
+    ])
+    ok, bad = mq.required_contexts_green(
+        latest, ["*", "CI / all-required (pull_request)"]
+    )
+    assert ok is False
+    # flagged by both the wildcard sweep and the literal check -> listed ONCE
+    assert bad == ["CI / all-required (pull_request)=failure"]
+
+
+def test_non_required_red_present_is_false_under_wildcard():
+    # Defense in depth for the force_merge path: under "*", nothing is
+    # "non-required", so force must never be justified by a "non-required red".
+    # A literal reading here would call this red non-required -> force=True ->
+    # force_merge bypasses Gitea BP. Fail closed.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "some advisory / lint (pull_request)", "status": "failure"},
+    ])
+    assert mq._non_required_red_present(latest, ["*"]) is False
+
+
+def test_wildcard_ready_pr_merges_end_to_end():
+    # THE POINT: with the production ['*'] required set and an all-green head,
+    # the queue now reaches decision.ready — i.e. the bot would actually merge.
+    # Before the fix this returned action="wait" forever.
+    decision = mq.evaluate_merge_readiness(**_ready_kwargs(required_contexts=["*"]))
+    assert decision.action == "merge", decision.reason
+    assert decision.ready is True
+    assert decision.force is False
+
+
+def test_wildcard_ready_pr_with_a_red_waits_end_to_end():
+    # Negative control on the whole decision: same ['*'] set, but a red in the PR
+    # head statuses -> the bot must WAIT, never merge.
+    kwargs = _ready_kwargs(required_contexts=["*"])
+    kwargs["pr_status"] = {
+        "state": "failure",
+        "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
+            {"context": "E2E Chat / E2E Chat (pull_request)", "status": "failure"},
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(**kwargs)
+    assert decision.ready is False
+    assert decision.action == "wait"
+    # Assert the REASON names the actual red, not just that it waited. The old
+    # buggy code ALSO returned wait here (via `*=missing`), so an action-only
+    # assertion passes against the bug too — it must fail closed for the RIGHT
+    # reason (the E2E Chat failure), which only the fixed '*' sweep produces.
+    assert "E2E Chat / E2E Chat (pull_request)=failure" in decision.reason
+    assert "*=missing" not in decision.reason
+
+
+def test_wildcard_green_but_enforced_file_context_missing_waits():
+    # THE CROWN JEWEL: step 4b (.gitea/required-contexts.txt presence check) is
+    # now REACHABLE. All BP-posted contexts are green ('*' passes), but a
+    # required-contexts.txt entry never posted at all -> the queue must WAIT.
+    # Before the fix, step 4 returned wait first and this check was dead code.
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            required_contexts=["*"],
+            enforced_file_contexts=["E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path"],
+        )
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "enforced" in decision.reason.lower() or "ephemeral" in decision.reason.lower()
 
 
 def test_choose_next_pr_sorts_by_queue_label_timestamp_then_number():
@@ -133,10 +263,9 @@ def test_pr_needs_update_when_base_sha_absent_from_commits():
 def _ready_kwargs(**overrides):
     """Default kwargs for a fully-ready merge; override per test.
 
-    Includes the uniform governance checks (qa-review, security-review,
-    sop-checklist) as required contexts and green statuses, matching the
-    behaviour of process_once which merges GOVERNANCE_REQUIRED_CONTEXTS
-    with branch-protection contexts.
+    The uniform SOP governance gate (qa-review/security-review/sop-checklist)
+    was removed 2026-07-14, so the ready baseline is just branch-protection
+    required contexts (GOVERNANCE_REQUIRED_CONTEXTS is now empty).
     """
     base = dict(
         main_status={
@@ -150,16 +279,10 @@ def _ready_kwargs(**overrides):
                 # CRITICAL fail-closed contexts (RCA core#1676) — a genuinely
                 # ready PR has these green; the step-0 guard requires them.
                 {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
-                {"context": "qa-review / approved (pull_request_target)", "status": "success"},
-                {"context": "security-review / approved (pull_request_target)", "status": "success"},
-                {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
             ],
         },
         required_contexts=[
             "CI / all-required (pull_request)",
-            "qa-review / approved (pull_request_target)",
-            "security-review / approved (pull_request_target)",
-            "sop-checklist / all-items-acked (pull_request_target)",
         ],
         required_approvals=2,
         approvers={"agent-reviewer-cr2", "agent-researcher"},
@@ -366,46 +489,24 @@ def test_merge_blocked_when_insufficient_genuine_approvals():
     assert "insufficient genuine approvals" in decision.reason
 
 
-def test_governance_red_blocks_merge():
-    # Uniform gate: qa-review, security-review, sop-checklist are ALWAYS
-    # required. If any of them fail/pending, the PR is blocked.
+def test_removed_sop_contexts_do_not_block_merge():
+    # Regression for the 2026-07-14 SOP-gate removal: qa-review /
+    # security-review / sop-checklist are no longer required, so a PR that is
+    # otherwise ready (BP-required CI green, genuine approvals, mergeable) must
+    # merge even if those now-orphan contexts are red — they are non-required
+    # noise and must never block. (Before removal these were a uniform gate.)
     pr_status = {
-        "state": "failure",
+        "state": "success",
         "statuses": [
             {"context": "CI / all-required (pull_request)", "status": "success"},
             {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "failure"},
             {"context": "security-review / approved (pull_request_target)", "status": "pending"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "failure"},
-            {"context": "Staging SaaS / e2e (pull_request)", "status": "failure"},
         ],
     }
     decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
-    assert decision.ready is False
-    assert decision.action == "wait"
-    assert "required contexts not green" in decision.reason
-
-
-def test_non_required_red_does_not_block_merge():
-    # Uniform gate flip (CTO #2407): qa-review, security-review, sop-checklist
-    # are REQUIRED for ALL PRs. A PR with these failing/pending must NOT be
-    # force-mergeable, even if BP-required CI is green and approvals are genuine.
-    pr_status = {
-        "state": "failure",
-        "statuses": [
-            {"context": "CI / all-required (pull_request)", "status": "success"},
-            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
-            {"context": "qa-review / approved (pull_request)", "status": "failure"},
-            {"context": "security-review / approved (pull_request)", "status": "pending"},
-            {"context": "sop-checklist / all-items-acked (pull_request)", "status": "failure"},
-            {"context": "Staging SaaS / e2e (pull_request)", "status": "failure"},
-        ],
-    }
-    decision = mq.evaluate_merge_readiness(**_ready_kwargs(pr_status=pr_status))
-    assert decision.ready is False
-    assert decision.action == "wait"
-    assert "required contexts not green" in decision.reason
-    assert decision.force is False
+    assert decision.ready is True, decision.reason
 
 
 def test_non_required_advisory_red_does_not_block_merge():

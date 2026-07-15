@@ -207,7 +207,7 @@ func TestQueueStatusByID_NULLResponseBodyScan(t *testing.T) {
 	mock := setupTestDB(t)
 	queueID := "queue-null-resp"
 
-	mock.ExpectQuery(`SELECT\s+q\.id,\s+q\.workspace_id,\s+q\.status,\s+q\.priority,\s+q\.attempts,\s+q\.last_error,\s+q\.enqueued_at::text,\s+q\.dispatched_at::text,\s+q\.completed_at::text,\s+q\.expires_at::text,\s+COALESCE\(\s+q\.response_body::text,\s+\(\s+SELECT al\.response_body::text\s+FROM activity_logs al\s+WHERE al\.method = 'delegate_result'\s+AND al\.target_id = q\.workspace_id\s+AND al\.workspace_id = q\.caller_id\s+AND al\.response_body->>'delegation_id' = \(q\.body->'params'->'message'->'metadata'->>'delegation_id'\)\s+LIMIT 1\s+\)\s+\)\s+FROM a2a_queue q\s+WHERE q\.id = \$1`).
+	mock.ExpectQuery(`SELECT\s+q\.id,\s+q\.workspace_id,\s+q\.status,\s+q\.priority,\s+q\.attempts,\s+q\.last_error,\s+q\.enqueued_at::text,\s+q\.dispatched_at::text,\s+q\.completed_at::text,\s+q\.expires_at::text,\s+COALESCE\(\s+q\.response_body::text,\s+\(\s+SELECT al\.response_body::text\s+FROM activity_logs al\s+WHERE al\.activity_type = 'delegation'\s+AND al\.method = 'delegate_result'\s+AND al\.target_id = q\.workspace_id\s+AND al\.workspace_id = q\.caller_id\s+AND al\.response_body->>'delegation_id' = \(q\.body->'params'->'message'->'metadata'->>'delegation_id'\)\s+ORDER BY al\.created_at DESC\s+LIMIT 1\s+\)\s+\)\s+FROM a2a_queue q\s+WHERE q\.id = \$1`).
 		WithArgs(queueID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "workspace_id", "status", "priority", "attempts",

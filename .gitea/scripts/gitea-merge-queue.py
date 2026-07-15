@@ -39,9 +39,10 @@ queue. This script provides the missing serialized policy in user space:
 
 Authoritative gates (fail-closed):
   - The REQUIRED status contexts come from BRANCH PROTECTION
-    (`status_check_contexts`) PLUS the hardcoded governance checks
-    (qa-review, security-review, sop-checklist). If branch protection
-    cannot be enumerated, the queue HOLDS (does not merge blindly).
+    (`status_check_contexts`). If branch protection cannot be enumerated,
+    the queue HOLDS (does not merge blindly). (The old uniform SOP gate —
+    qa-review/security-review/sop-checklist — was removed 2026-07-14; see
+    GOVERNANCE_REQUIRED_CONTEXTS below.)
   - NON-required reds (E2E Chat, Staging SaaS, ci-arm64-advisory, any
     continue-on-error job) MUST NOT block. They are reported, never gating.
   - `force_merge=true` is used ONLY when the merge is blocked *solely* by
@@ -106,9 +107,10 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-# SSOT fail-closed approval predicate (SEV-1 internal#812). review-check.sh
-# consumes the same module via _review_check_filter.py — do NOT duplicate
-# the predicate here. See _approval_validator.py for the fail-closed contract.
+# SSOT fail-closed approval predicate (SEV-1 internal#812). This is now the
+# sole consumer of the module (the review-check.sh chain was removed with the
+# SOP review gate 2026-07-14) — do NOT duplicate the predicate here. See
+# _approval_validator.py for the fail-closed contract.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _approval_validator import classify_reviews as _classify_reviews_ssot  # noqa: E402
 
@@ -168,11 +170,14 @@ OPT_OUT_LABELS = {
 # Verified against the lint-bp-context-emit-match test which already
 # asserts (pull_request_target) for these names. No requirement
 # dropped; just a name correction.
-GOVERNANCE_REQUIRED_CONTEXTS = [
-    "qa-review / approved (pull_request_target)",
-    "security-review / approved (pull_request_target)",
-    "sop-checklist / all-items-acked (pull_request_target)",
-]
+# SOP review-gate contexts (qa-review / security-review / sop-checklist) were
+# fully removed 2026-07-14 (CTO directive): the producing workflows are deleted
+# and no PR emits these contexts anymore, so keeping them here would make every
+# merge wait forever on phantom-required checks. The peer-approval floor
+# (REVIEWER_SET + REQUIRED_APPROVALS, see below) and reserved-path-review remain
+# the review gates. Kept as an (empty) list so the concat sites below are a
+# harmless no-op and re-adding a uniform governance context is a one-line change.
+GOVERNANCE_REQUIRED_CONTEXTS: list[str] = []
 
 # --------------------------------------------------------------------------
 # CRITICAL fail-closed contexts (RCA: core PR #1676 merged 2026-06-24 with
@@ -209,10 +214,7 @@ CRITICAL_REQUIRED_CONTEXT_PREFIXES = [
 
 REQUIRED_CONTEXTS_RAW = _env(
     "REQUIRED_CONTEXTS",
-    default=(
-        "CI / all-required (pull_request),"
-        "sop-checklist / all-items-acked (pull_request)"
-    ),
+    default="CI / all-required (pull_request)",
 )
 # --------------------------------------------------------------------------
 # Enforced-contexts SSOT file (internal#3181 — close the BP↔allowlist gap)
@@ -262,21 +264,40 @@ PUSH_REQUIRED_CONTEXTS_RAW = _env(
 
 # Recognised official-reviewer set. A merge requires this many DISTINCT genuine
 # approvals (not stale/dismissed, on the current head sha) from accounts in
-# this set. The set is the real agents-team reviewer roster; founder/CTO-agent
-# accounts are intentionally excluded so the queue cannot be satisfied by a
-# human/owner approval alone — it must be a genuine peer review.
+# this set.
+#
+# CTO 2026-07-14: the peer roster is the union of the review, management, and
+# owner teams — reviewers, managers, and owners may all satisfy the floor.
+# The prior default {agent-reviewer,agent-researcher,agent-reviewer-cr2} was
+# a login list of three accounts that no automation drives; they produced 0
+# genuine approvals across 29 merges, so the floor was unsatisfiable and EVERY
+# merge fell through to a manual owner/admin path (the queue was dead). This
+# default is the current membership of teams code-reviewers/qa/security/
+# managers/Owners. It is still a LOGIN list (not team-resolved) so the queue
+# needs no org-team read scope to run; the trade-off is that it drifts as team
+# membership changes — tracked as a follow-up to make this team-keyed (SSOT),
+# which requires confirming the merge-actor token's org:read scope first.
 REVIEWER_SET = {
     name.strip()
     for name in _env(
         "REVIEWER_SET",
-        default="agent-reviewer,agent-researcher,agent-reviewer-cr2",
+        default=(
+            "molecule-code-reviewer,core-qa,core-security,"          # reviewers (code-reviewers/qa/security)
+            "core-lead,cp-lead,dev-lead,app-lead,sdk-lead,"          # management
+            "infra-lead,release-manager,pm,agent-pm,"               # management
+            "hongming,cui,hongming-personal,hongming-pc2,"          # owners
+            "claude-ceo-assistant,hongming-ceo-delegated"           # owner/delegate
+        ),
     ).split(",")
     if name.strip()
 }
-# Default mirrors molecule-core branch protection (required_approvals: 2). The
-# authoritative value is read from branch protection at runtime; this is only
-# the fallback when BP does not specify one.
-REQUIRED_APPROVALS_DEFAULT = int(_env("REQUIRED_APPROVALS", default="2") or "2")
+# CTO 2026-07-14: the genuine-peer floor is ONE approval. The previous default
+# of 2 was drift and, combined with the dead REVIEWER_SET above and the actual
+# review practice (<=1 general review per PR, 0/14 recent merges had 2 distinct
+# peer approvals), made the queue unable to merge anything.
+# Branch protection's value still wins when it is a valid int >= this floor
+# (see the fail-closed clamp in branch-protection parsing).
+REQUIRED_APPROVALS_DEFAULT = int(_env("REQUIRED_APPROVALS", default="1") or "1")
 
 # --------------------------------------------------------------------------
 # Runtime-bump auto-merge exemption (RFC internal#131 PR-A, dispatch 9c2e9c88)
@@ -630,12 +651,42 @@ def required_contexts_green(
     latest_statuses: dict[str, dict],
     contexts: list[str],
 ) -> tuple[bool, list[str]]:
+    # Gitea branch protection uses the wildcard "*" in status_check_contexts to
+    # mean "every POSTED commit status must be success" — NOT a context literally
+    # named "*". Reading it literally (`latest_statuses.get("*")` -> None ->
+    # "missing") made this return (False, ["*=missing"]) for EVERY PR, including a
+    # fully green one — so the queue decided `wait` on all of them and step 4b
+    # (the `.gitea/required-contexts.txt` presence check) was never reached. The
+    # queue thus merged nothing, and every merge on main was performed by a human
+    # (core#4363). Expand "*" to Gitea's real semantics.
+    #
+    # A "*" set is a SUPERSET check (all posted must be green), and a literal
+    # entry is a PRESENCE check (that named context must be posted AND green) —
+    # the two compose: "*" catches any posted red; literal names catch a context
+    # that never posted. Both are evaluated; results are de-duped so a context
+    # flagged by both branches is reported once.
     missing_or_bad: list[str] = []
+    seen: set[str] = set()
+
+    def _flag(ctx: str, state: str) -> None:
+        if ctx in seen:
+            return
+        seen.add(ctx)
+        missing_or_bad.append(f"{ctx}={state or 'missing'}")
+
+    if "*" in contexts:
+        for ctx, status in latest_statuses.items():
+            state = status_state(status or {})
+            if state != "success":
+                _flag(ctx, state)
+
     for context in contexts:
-        status = latest_statuses.get(context)
-        state = status_state(status or {})
+        if context == "*":
+            continue
+        state = status_state(latest_statuses.get(context) or {})
         if state != "success":
-            missing_or_bad.append(f"{context}={state or 'missing'}")
+            _flag(context, state)
+
     return not missing_or_bad, missing_or_bad
 
 
@@ -1359,6 +1410,15 @@ def _non_required_red_present(
     have already verified every REQUIRED context is green and approvals are
     genuine, so force only bypasses these non-required reds).
     """
+    # Under a wildcard required set ("*"), EVERY posted context is required, so
+    # there is no such thing as a "non-required red" and force_merge must never
+    # be justified this way. Defense in depth: step 4 (required_contexts_green)
+    # already WAITs on any posted red once "*" is expanded, so we should never
+    # reach here with a red present — but a literal reading of "*" here would
+    # classify every red as "non-required", set force=True, and force_merge would
+    # bypass Gitea's own BP. Fail closed. (core#4363)
+    if "*" in required_contexts:
+        return False
     required = set(required_contexts)
     for context, status in latest.items():
         if context in required:
@@ -1520,11 +1580,11 @@ def evaluate_merge_readiness(
             f"need {effective_required_approvals}",
         )
 
-    # 4) Every REQUIRED status context must be green. This includes both
-    #    branch-protection-required contexts AND the hardcoded governance checks
-    #    (qa-review, security-review, sop-checklist). NON-required reds (E2E
-    #    Chat, Staging SaaS, ci-arm64-advisory, continue-on-error jobs) are NOT
-    #    consulted here and must not block.
+    # 4) Every REQUIRED status context must be green (the branch-protection
+    #    status_check_contexts set; the old uniform SOP governance checks were
+    #    removed 2026-07-14). NON-required reds (E2E Chat, Staging SaaS,
+    #    ci-arm64-advisory, continue-on-error jobs) are NOT consulted here and
+    #    must not block.
     latest = latest_statuses_by_context(pr_status.get("statuses") or [])
     ok, missing_or_bad = required_contexts_green(latest, required_contexts)
     if not ok:

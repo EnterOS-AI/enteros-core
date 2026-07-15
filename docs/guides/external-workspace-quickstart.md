@@ -138,23 +138,14 @@ The `id` field is your workspace ID — remember it.
 ## Optional — one local MCP bridge, multiple tenants
 
 If your local agent runtime uses `molecule-mcp`, one process can serve more
-than one external workspace:
+than one external workspace — set `MOLECULE_WORKSPACES_JSON` to a JSON array of
+`{id, token, platform_url}` objects.
 
-```bash
-export MOLECULE_WORKSPACES='[
-  {
-    "id": "workspace-id-local-to-you-org",
-    "token": "...",
-    "platform_url": "https://you.moleculesai.app"
-  },
-  {
-    "id": "different-workspace-id-local-to-team-org",
-    "token": "...",
-    "platform_url": "https://team.moleculesai.app"
-  }
-]'
-molecule-mcp
-```
+The shape is documented once, canonically, in
+[external-agent-registration.md → Multiple Workspaces From One Local MCP
+Bridge](./external-agent-registration.md#multiple-workspaces-from-one-local-mcp-bridge).
+It is deliberately NOT restated here: a second copy of an env-var name is how
+the name drifts out of sync with what the bridge actually reads.
 
 Use the workspace ID and token returned by each tenant. The IDs may differ
 across orgs. `org_id` is not required here because `platform_url` selects the

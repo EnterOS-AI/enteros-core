@@ -137,10 +137,10 @@ func TestLedgerSetStatus_QueuedToDispatched(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("queued"))
 
 	mock.ExpectExec(`UPDATE delegations`).
-		WithArgs("d-1", "dispatched", "", "").
+		WithArgs("d-1", "dispatched", "", "", "queued"). // $5 = CAS on the observed status
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := l.SetStatus(context.Background(), "d-1", "dispatched", "", ""); err != nil {
+	if _, err := l.SetStatus(context.Background(), "d-1", "dispatched", "", ""); err != nil {
 		t.Errorf("unexpected: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -158,10 +158,10 @@ func TestLedgerSetStatus_QueuedToInProgress_SkipsDispatched(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("queued"))
 
 	mock.ExpectExec(`UPDATE delegations`).
-		WithArgs("d-1", "in_progress", "", "").
+		WithArgs("d-1", "in_progress", "", "", "queued").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := l.SetStatus(context.Background(), "d-1", "in_progress", "", ""); err != nil {
+	if _, err := l.SetStatus(context.Background(), "d-1", "in_progress", "", ""); err != nil {
 		t.Errorf("unexpected: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -178,10 +178,10 @@ func TestLedgerSetStatus_InProgressToCompleted_StoresResult(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("in_progress"))
 
 	mock.ExpectExec(`UPDATE delegations`).
-		WithArgs("d-1", "completed", "", "answer text").
+		WithArgs("d-1", "completed", "", "answer text", "in_progress").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := l.SetStatus(context.Background(), "d-1", "completed", "", "answer text"); err != nil {
+	if _, err := l.SetStatus(context.Background(), "d-1", "completed", "", "answer text"); err != nil {
 		t.Errorf("unexpected: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -198,7 +198,7 @@ func TestLedgerSetStatus_TerminalForwardOnly(t *testing.T) {
 		WithArgs("d-done").
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("completed"))
 
-	err := l.SetStatus(context.Background(), "d-done", "failed", "post-hoc error", "")
+	_, err := l.SetStatus(context.Background(), "d-done", "failed", "post-hoc error", "")
 	if !errors.Is(err, ErrInvalidTransition) {
 		t.Errorf("expected ErrInvalidTransition, got %v", err)
 	}
@@ -218,7 +218,7 @@ func TestLedgerSetStatus_SameStatusReplay_NoUpdate(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("completed"))
 
 	// No ExpectExec — UPDATE must not fire.
-	if err := l.SetStatus(context.Background(), "d-1", "completed", "", ""); err != nil {
+	if _, err := l.SetStatus(context.Background(), "d-1", "completed", "", ""); err != nil {
 		t.Errorf("same-status replay should be no-op, got err: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -237,7 +237,7 @@ func TestLedgerSetStatus_SameStatusReplay_FillsMissingDetail(t *testing.T) {
 		WithArgs("d-1", "agent returned empty response", "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := l.SetStatus(context.Background(), "d-1", "failed", "agent returned empty response", ""); err != nil {
+	if _, err := l.SetStatus(context.Background(), "d-1", "failed", "agent returned empty response", ""); err != nil {
 		t.Errorf("same-status detail fill should succeed, got err: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -256,7 +256,7 @@ func TestLedgerSetStatus_MissingRowIsNoOp(t *testing.T) {
 		WithArgs("d-missing").
 		WillReturnRows(sqlmock.NewRows([]string{"status"})) // empty
 
-	if err := l.SetStatus(context.Background(), "d-missing", "completed", "", "ok"); err != nil {
+	if _, err := l.SetStatus(context.Background(), "d-missing", "completed", "", "ok"); err != nil {
 		t.Errorf("missing row should be no-op; got err: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -268,7 +268,7 @@ func TestLedgerSetStatus_RejectsEmptyDelegationID(t *testing.T) {
 	mock := setupTestDB(t)
 	l := NewDelegationLedger(nil)
 
-	if err := l.SetStatus(context.Background(), "", "completed", "", ""); err == nil {
+	if _, err := l.SetStatus(context.Background(), "", "completed", "", ""); err == nil {
 		t.Errorf("expected error for empty delegation_id")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -280,7 +280,7 @@ func TestLedgerSetStatus_RejectsEmptyStatus(t *testing.T) {
 	mock := setupTestDB(t)
 	l := NewDelegationLedger(nil)
 
-	if err := l.SetStatus(context.Background(), "d-1", "", "", ""); err == nil {
+	if _, err := l.SetStatus(context.Background(), "d-1", "", "", ""); err == nil {
 		t.Errorf("expected error for empty status")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -317,16 +317,32 @@ func TestLedgerHeartbeat_EmptyIDIsNoOp(t *testing.T) {
 
 // ---------- Allowed-transition table ----------
 
-// TestAllowedTransitionsTableShape pins the lifecycle map: every starting
-// state must have at least one outbound transition, and every terminal
-// state (completed/failed/stuck) must be ABSENT from the map keys (forward-
-// only enforcement). Catches accidental edits that re-add an outbound edge
-// from a terminal state.
+// TestAllowedTransitionsTableShape pins the lifecycle map: every starting state
+// must have at least one outbound transition, and every TERMINAL state must be
+// ABSENT from the map keys (forward-only enforcement).
+//
+// TERMINAL IS {completed, failed}. `stuck` used to be in this list and is not
+// any more — deliberately, and it is the crux of #4316.
+//
+// `stuck` means "the target stopped heartbeating", which is NOT the same as "this
+// delegation is dead". a2a_proxy enqueues to a2a_queue precisely when the target
+// is settling/restarting (i.e. not heartbeating), and queue rows are infinite-TTL
+// by default: the platform is DESIGNED to hold the message across a long target
+// outage and deliver it on the target's next beat. Terminalizing on a 10-minute
+// heartbeat gap killed exactly the delegations the queue was keeping alive — and
+// then, when the target came back and the drain tried to mark it completed, the
+// forward-only guard rejected the transition and the ledger was left permanently
+// reporting `stuck` for a delegation that had SUCCEEDED.
 func TestAllowedTransitionsTableShape(t *testing.T) {
-	for _, terminal := range []string{"completed", "failed", "stuck"} {
+	for _, terminal := range []string{"completed", "failed"} {
 		if _, has := allowedTransitions[terminal]; has {
 			t.Errorf("terminal state %q must not appear as transition source", terminal)
 		}
+	}
+	if _, has := allowedTransitions["stuck"]; !has {
+		t.Error("`stuck` MUST have outbound transitions: a wedged target can come back " +
+			"(-> completed via the a2a_queue drain) or be killed by the deadline (-> failed). " +
+			"Making it terminal corrupts the ledger and lies to the caller.")
 	}
 	for src, dests := range allowedTransitions {
 		if len(dests) == 0 {

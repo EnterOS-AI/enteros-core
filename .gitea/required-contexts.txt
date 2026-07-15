@@ -5,16 +5,26 @@
 #      (CI cannot always read branch_protections; when a repo-admin token
 #      is present the lint also live-cross-checks against BP and fails when
 #      live BP has a context NOT in this list).
-#   2. THE MERGE QUEUE (gitea-merge-queue.py, the bot that actually performs
-#      merges via the operator conductor tick) now ENFORCES every entry
-#      ABOVE the `# pending-` marker below: each must be `success` on the PR
-#      head before the PR can merge, fail-closed and event-suffix-insensitive
-#      — REGARDLESS of whether the entry is in branch-protection
-#      status_check_contexts. This closes the gap where a context listed
-#      here but absent from BP was treated as a non-required ADVISORY red
-#      and force_merge=true bypassed it (PR#3181 merged with
-#      `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates
-#      Workspace` RED for exactly this reason).
+#   2. THE MERGE QUEUE (gitea-merge-queue.py) is DESIGNED to enforce every
+#      entry ABOVE the `# pending-` marker below: each must be `success` on
+#      the PR head before the PR can merge, fail-closed and event-suffix-
+#      insensitive — REGARDLESS of whether the entry is in branch-protection
+#      status_check_contexts. That closes the gap where a context listed here
+#      but absent from BP was treated as a non-required ADVISORY red and
+#      force_merge=true bypassed it (PR#3181 merged with `E2E Staging SaaS
+#      (full lifecycle) / E2E Staging Concierge Creates Workspace` RED for
+#      exactly this reason).
+#
+#      ENFORCED FOR REAL as of #4363 (2026-07-14). This block previously
+#      warned that step 4b was unreachable dead code — the queue treated BP's
+#      status_check_contexts=['*'] as a LITERAL context name, so step 4
+#      (required_contexts_green) returned `wait` on every PR and step 4b never
+#      ran. #4363 fixed the '*' handling (it now means "every POSTED context
+#      must be success"), so step 4b IS reached and the entries above the
+#      `# pending-` marker are now genuinely presence-required at merge time.
+#      A context listed here that never posts now BLOCKS the merge — which is
+#      the whole point. (That fix also un-jammed the autonomous merge queue;
+#      before it, every merge on main was performed by a human.)
 #
 # Form: "<workflow name> / <job name>" (event suffix stripped — the gate
 # strips `(pull_request)` / `(push)` / `(pull_request_target)` on both
@@ -41,12 +51,57 @@ Secret scan / Scan diff for credential-shaped strings
 template-delivery-e2e / Template-asset delivery (fresh seo-agent — config+prompts via asset channel, seo-all via plugin reconcile)
 # SOP/review ceremony gates REMOVED from the required set 2026-07-11 (CTO
 # directive: bot-operated review/SOP acks were meaningless ceremony). Their
-# producer workflows (qa-review, security-review, sop-checklist,
-# reserved-path-review) are disabled_manually, so keeping them here made them
-# phantom gates — required-on-paper but silently unenforced (lint-phantom-gate
-# Guard F). Real protection stays: CI ['*'] + secret-scan. To restore the
-# ceremony, re-enable the producer workflows AND re-add the four contexts below.
+# producer workflows (qa-review, security-review, sop-checklist, gate-check-v3)
+# are disabled_manually, so keeping them here made them phantom gates —
+# required-on-paper but silently unenforced (lint-phantom-gate Guard F). Real
+# protection stays: CI ['*'] + secret-scan. To restore the ceremony, re-enable
+# the producer workflows AND re-add their contexts below AND restore the
+# pull_request_target triggers that task #97 removed (all three, or you get
+# either a phantom gate or a wedge).
+#
+# CORRECTION 2026-07-13: this list used to name `reserved-path-review` among the
+# disabled producers. That was WRONG — reserved-path-review is ACTIVE and has
+# been gating all along. Believing the stale claim cost real time while
+# debugging the wedge in task #89; the Gitea Actions API is the SSOT for
+# workflow state, not this comment.
 Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
+
+# PROMOTED 2026-07-14 — the per-PR ephemeral-CP gate (task #85 → #114).
+#
+# It was added by #4271, whose commit message said "make it REQUIRED" — but the
+# line was APPENDED to the end of this file, which landed it under
+# `# pending-#3159`, i.e. in the documented-but-NOT-enforced half. For a day the
+# file disagreed with the commit that wrote it, and the file is what
+# gitea-merge-queue.py reads.
+#
+# The gap that leaves is not academic. Branch protection on main is
+# status_check_contexts=['*'], which requires every POSTED context to be green —
+# so a RED happy path already blocked. What ['*'] cannot see is a context that
+# never posts AT ALL: narrow the `on:` filter, disable the workflow, rename the
+# job, or let the run be cancelled while still queued, and the board is clean and
+# the merge proceeds. Enforcement here is the other half — PRESENT and green, or
+# no merge. That is the half that makes a gate un-deletable by accident.
+#
+# Promotion adds no new red exposure (a red already blocked), so the gate's known
+# nondeterminism (task #99) is NOT a reason to park this line. Fix #99; do not
+# hide the context. Parking a flaky-but-real gate is how a gate becomes a
+# decoration.
+#
+# ENFORCEMENT HISTORY (#4363, resolved 2026-07-14).
+#
+# This block used to warn that NONE of the entries above were actually enforced:
+# gitea-merge-queue.py evaluated branch protection first (step 4), BP on main is
+# status_check_contexts=['*'], and the queue treated '*' as a LITERAL context
+# name — required_contexts_green(<all green>, ['*']) returned (False, ['*=missing'])
+# on every PR, so it decided `wait` on all of them and step 4b (the check that
+# reads THIS file) was unreachable. The bot merged nothing; humans did every merge.
+#
+# #4363 fixed the '*' handling to mean "every POSTED context must be success",
+# which is Gitea's real semantics. Step 4b is now reached, so the entries above
+# the marker are genuinely presence-required: a listed context that never posts
+# now BLOCKS the merge. (The GOVERNANCE_REQUIRED_CONTEXTS second-blocker was
+# already resolved separately — that list is now empty.)
+E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path
 
 # RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────
 # `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
@@ -58,19 +113,53 @@ Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 # also carries the COLD-OPEN browser-slug assertion (STEP 2.5) that catches the
 # in-browser /workspaces 404 the admin-bearer probe misses.
 #
-# It is kept BELOW the ENFORCED marker (documented-required, not merge-blocking)
-# for now — two conditions gate promotion, per the repo's validate-before-enforce
-# rule (do NOT promote early or the public-repo merge queue freezes):
-#   1. a GREEN molecules-server run of this job on main, and
-#   2. the PR/fork path posts `success` WITHOUT staging creds (E2E_REQUIRE_LIVE=0
-#      PR-mode self-check) so fork PRs — which cannot read the staging admin token
-#      — do not fail-closed and wedge the queue.
-# When both hold, PROMOTE this line above the ENFORCED marker (and delete this
-# block). Until then, per-PR concierge coverage remains via the deterministic
-# `Concierge Creates Workspace Hermetic` gate (above, ENFORCED) and the
-# local-docker `Local Provision Lifecycle E2E (stub)` lane (below); the real
-# tool-use concierge→provision_workspace→GET /workspaces gate also blocks prod
-# via the controlplane local staging→prod e2e gate (CP #1013).
+# CORRECTION 2026-07-14 — this block used to claim: "It is kept BELOW the ENFORCED
+# marker (documented-required, not merge-blocking)". THAT WAS FALSE. The line is
+# physically ABOVE the first `# pending-#NNNN` marker, and gitea-merge-queue.py
+# (_PENDING_MARKER_RE) enforces everything above that marker regardless of the
+# prose around it. So this context has been merge-blocking all along, while the
+# file said it wasn't. The file lied about its own enforcement.
+#
+# Worse, its promotion condition #2 was: "the PR/fork path posts `success` WITHOUT
+# staging creds (E2E_REQUIRE_LIVE=0 PR-mode self-check)". That is a VACUOUS PASS
+# written down as a requirement. Enforcement is evaluated on the PR HEAD, so an
+# enforced context whose PR arm always succeeds — by running `bash -n` on a shell
+# script and exiting 0 — enforces exactly nothing. It was a merge gate that could
+# not fail a merge.
+#
+# PARKED 2026-07-14 (moved BELOW the marker — see the pending-#86 block).
+#
+# My first attempt at fixing the vacuity was to make the PR arm REAL: enable the
+# Infisical KMS fetch on same-repo PRs so E2E_REQUIRE_LIVE=1 could run the live
+# concierge E2E where enforcement is actually evaluated. Code review killed it,
+# correctly. That change put the staging CP_ADMIN_API_TOKEN — cross-tenant admin
+# over every staging org, tenant-DELETE included — into a job whose very next step
+# executes tests/e2e/test_staging_concierge_creates_workspace_e2e.sh FROM THE PR'S
+# OWN TREE. Anyone able to push a branch could have edited that script to exfiltrate
+# the token. A branch push is not a review. It also re-added the exact
+# `(pull_request && fork==false)` clause the Guard-B block in the producer says was
+# removed because it drove a live staging provision on EVERY PR push.
+#
+# The real lesson: this gate cannot be honestly enforced on a pull request. Proving
+# it requires live staging credentials, and live credentials must never sit in a job
+# that runs PR-authored code. Making the vacuous gate "real" that way trades a fake
+# gate for a credential-exfil path — a strictly worse deal.
+#
+# So it goes below the marker: enforced NOWHERE it cannot prove anything, and kept
+# as the post-merge DEPLOY gate it genuinely is (green 5/5 on recent main pushes).
+# Real per-PR coverage of this journey is the EPHEMERAL-CP gate (task #86), which
+# needs no shared-staging credential at all because it stands up its own throwaway
+# control plane. That is the correct home for "pull, not after push".
+
+# pending-#86 (not yet enforced) ────────────────────────────────────────
+# The staging concierge journey. DOCUMENTED-required, NOT merge-blocking, and it
+# must stay that way until per-PR coverage comes from the ephemeral-CP gate (#86)
+# rather than from shared staging. Enforcing it on the PR head is only possible by
+# handing PR-authored code the staging admin token — see the long note above. It
+# runs live on push/dispatch/schedule as the deploy gate; its PR arm is a `bash -n`
+# self-check that proves nothing, which is FINE precisely because nothing below this
+# marker gates a merge. Do NOT promote this line without first moving the coverage
+# to the ephemeral gate.
 E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
 
 # pending-#2409 (not yet enforced) ──────────────────────────────────────
@@ -98,4 +187,3 @@ Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)
 # #48 (RCA molecule-controlplane #878→#885): real platform-managed boot is
 # the intended merge gate.
 E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot
-E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path

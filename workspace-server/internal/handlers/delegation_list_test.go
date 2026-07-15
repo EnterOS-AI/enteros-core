@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 // ---------- listDelegationsFromLedger ----------

@@ -488,6 +488,20 @@ jobs:
         name: Lint cleanup-trap hygiene (RFC #2873)
         run: bash tests/e2e/lint_cleanup_traps.sh
 
+      # Managed tenant rollout flags must stay REVERSIBLE. Tenant env is inherited
+      # by copy on every redeploy, so a flag that isn't stripped-and-reapplied is
+      # sticky forever — you could turn a fleet-behaviour flag ON and never be able
+      # to turn it back OFF. That is not a burn-in, and a rollback that can't roll
+      # the flag back is not a rollback.
+      #
+      # This drives the REAL redeploy script against a fake docker and asserts on
+      # the --env-file `docker run` is handed. An earlier version probed the strip
+      # function in isolation and was vacuous: deleting the line that CALLED it left
+      # the test green.
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Managed tenant flags are reversible (rollback safety)
+        run: bash scripts/deploy/tests/test-managed-flags.sh
+
       # Runs when EITHER side of the contract moves: the e2e scripts (scripts)
       # or the router that serves them (platform). A route rename in
       # workspace-server is exactly how a call goes dead without anyone noticing.
@@ -596,6 +610,10 @@ jobs:
           # slug and aborted boot-to-registration BEFORE provisioning) goes red
           # here on every PR instead of burning a live boot-cell run.
           bash tests/e2e/test_collision_proof_slug_unit.sh
+          # core#4370: bounded idle-digest evidence polling and fail-closed
+          # Docker preflight. Offline: proves missing Docker or an unreachable
+          # daemon cannot silently skip E2E_IDLE_DIGEST_CHECK=on.
+          bash tests/e2e/test_idle_digest_wait_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Drift guard — KI-013 container/volume naming (SEV #2499)
@@ -632,7 +650,9 @@ jobs:
         run: |
           shellcheck --severity=warning \
             scripts/promote-tenant-image.sh \
-            scripts/test-promote-tenant-image.sh
+            scripts/test-promote-tenant-image.sh \
+            scripts/deploy/redeploy-staging-fleet.sh \
+            scripts/deploy/tests/test-managed-flags.sh
 
   # mc#959 root-fix (sre)
 

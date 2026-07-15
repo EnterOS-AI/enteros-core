@@ -89,11 +89,36 @@ jobs:
     name: lint-mask-pr-atomicity
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Phase 3 (RFC #219 §1): surface broken shapes without blocking
-    # PRs. Follow-up PR flips this to `false` once recent runs on main
-    # are confirmed clean (eat-our-own-dogfood discipline mirrors
-    # PR#673's same-shape comment). Tracking: mc#3436.
-    # mc#2654: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
+    # MASK RETAINED — and here the blocker is STRUCTURAL, not a red job.
+    # Locally this lint is green (lint exit 0 + `pytest
+    # tests/test_lint_mask_pr_atomicity.py` all pass), but the repo's own
+    # pre-flip gate (lint_pre_flip_continue_on_error.py) refuses the flip with
+    # "no runs of 'lint-mask-pr-atomicity / lint-mask-pr-atomicity (push)' found
+    # in the last 5 commits on main — cannot verify flip".
+    #
+    # That is not a fluke: this workflow is PATHS-FILTERED to `.gitea/workflows/
+    # ci.yml` & friends, so it almost never fires on a push to main. The
+    # pre-flip gate only accepts evidence from main-PUSH runs within the last
+    # RECENT_COMMITS_N (=5) commits. A paths-filtered lint structurally cannot
+    # produce that evidence, so its mask can NEVER be removed through the gate
+    # — a catch-22. Un-masking anyway would RED a required context on every PR.
+    #
+    # Recorded in MASK_WAIVERS in lint_no_coe_on_required.py; follow-up filed to
+    # let the pre-flip gate accept a paths-filtered workflow's PR-event runs (or
+    # a wider commit window) as proof. Then this flips in one line.
+    #
+    # The pre-flip gate cannot bless this flip: this workflow is paths-filtered, so it never
+    # runs on a main PUSH — and main-push run-logs are the ONLY proof that gate accepts. Not a
+    # red suite (the lint is GREEN); a structurally unsatisfiable precondition.
+    #
+    # Two things the tracking lint taught us the hard way, recorded so nobody repeats them:
+    #   1. The tracker must be OPEN. A mask citing a closed one is an excuse with no owner.
+    #   2. Do NOT name a closed tracker anywhere near a continue-on-error, even to explain
+    #      it — the lint scans the ADJACENT lines for any mc#NNNN and resolves every one it
+    #      finds, including the one you only mentioned in passing.
+    # The reference below must stay WITHIN 2 LINES of the directive or Tier 2e reds it.
+    #
+    # mc#4344: pre-flip catch-22 blocks removing this mask; see the issue for definition-of-done.
     continue-on-error: true
     steps:
       - name: Check out PR head with full history (need base SHA blobs)
