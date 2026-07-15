@@ -29,7 +29,8 @@ package staginge2e
 // / adminCreateOrg / adminDeleteTenant / tenantAdminToken / tenantCreateWorkspace
 // / waitForWorkspaceOnlineRoutable / waitForWorkspaceStatus / doTenantJSON /
 // serveProbe / jsonField). NOTHING here re-implements org provisioning or
-// teardown — t.Cleanup-driven admin DELETE guarantees no leaked tenant.
+// teardown; the shared harness schedules an exact-slug admin DELETE before it
+// waits for provisioning, and logs teardown failures for follow-up.
 //
 // Guarded by the staging_e2e build tag + STAGING_E2E=1 (requireStagingEnv).
 
@@ -49,7 +50,6 @@ func TestPluginInstallLifecycle_Staging(t *testing.T) {
 
 	// --- Step 1: provision throwaway org + tenant (reused scaffolding) ---
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	host := slug + "." + cfg.subdomainSuffix
 	token := tenantAdminToken(t, cfg, slug)
 	waitForHTTP(t, host, http.StatusOK, 10*time.Minute, "tenant /health ready")

@@ -17,9 +17,9 @@ import (
 // / hibernate) coverage.
 //
 // What it proves that the handler unit tests (httptest in
-// internal/handlers/*_test.go) cannot: that against a REAL EC2-backed tenant
-// workspace, the lifecycle endpoints actually transition the CONTAINER state
-// and recover — not just flip a DB flag or return HTTP 200.
+// internal/handlers/*_test.go) cannot: that against a real staging tenant on
+// the configured compute provider, the lifecycle endpoints actually transition
+// the container state and recover — not just flip a DB flag or return HTTP 200.
 //
 // Pipeline:
 //
@@ -41,7 +41,7 @@ import (
 //     pause (POST /pause):
 //     → paused, AND the container is genuinely stopped — observed via the
 //     tenant API as: url cleared + the workspace no longer serves A2A
-//     (a stopped EC2/container is unreachable; a mere flag would still serve).
+//     (a stopped container is unreachable; a mere flag would still serve).
 //     resume (POST /resume):
 //     paused → provisioning → online + serveable again.
 //
@@ -63,7 +63,6 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 
 	// --- Step 1: provision org via admin API ---
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	t.Logf("org created: org_id=%s", orgID)
 
 	// --- Step 1b: acquire tenant admin token + wait for tenant TLS ready ---
@@ -341,8 +340,8 @@ func assertServes(t *testing.T, host, token, orgID, wsID, why string) {
 }
 
 // assertNotServing requires the workspace to STOP serving A2A within timeout —
-// the observable proxy (via the tenant API, no AWS/SSM access in core) that the
-// container is genuinely stopped, not merely flagged paused/hibernated.
+// the observable proxy available through the tenant API that the container is
+// genuinely stopped, not merely flagged paused/hibernated.
 //
 // NOTE: a hibernated workspace auto-wakes on the NEXT A2A message — so a single
 // probe could itself trigger a wake. We therefore look for the workspace to be
@@ -350,12 +349,11 @@ func assertServes(t *testing.T, host, token, orgID, wsID, why string) {
 // stopped; we do not retry-poll the probe (that would wake it). A live-and-
 // serving container returns 2xx immediately, which is the regression we catch.
 //
-// TODO(core#2332): the strongest "container stopped" signal is the EC2/Docker
-// state itself (instance stopped), which is only observable from the CP side
-// (AWS/SSM) — not reachable from the core ws-server module without importing the
-// CP client surface. This asserts the strongest signal available here (url
-// cleared + immediate non-serve). If/when a CP-side admin endpoint surfaces the
-// instance power-state to the tenant API, tighten this to assert it directly.
+// TODO(core#2332): the strongest "container stopped" signal is the provider's
+// actual container/process state, which is owned by the CP/provisioner and is
+// not exposed to this tenant ws-server test. This asserts the strongest signal
+// available here (url cleared + immediate non-serve). If a CP-side admin
+// endpoint surfaces provider state to the tenant API, tighten this assertion.
 func assertNotServing(t *testing.T, host, token, orgID, wsID string, why string) {
 	t.Helper()
 	// The status/url already settled to stopped before this is called. One
@@ -454,8 +452,11 @@ func envOr(k, def string) string {
 	return def
 }
 
-// adminCreateOrg provisions a throwaway org via the CP admin API and waits for
-// its instance to reach running (provisioning is async).
+// adminCreateOrg provisions a throwaway org via the CP admin API, immediately
+// registers exact-slug cleanup, and then waits for its instance to reach
+// running (provisioning is async). Cleanup must be registered here rather than
+// by callers: a provisioning timeout calls t.Fatalf before this function
+// returns, so caller-owned cleanup would never be installed.
 func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	t.Helper()
 	// Compute backend for the throwaway tenant. Defaults to molecules-server (the local-docker
@@ -469,6 +470,10 @@ func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	if status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("AdminCreate org: HTTP %d: %s", status, resp)
 	}
+	// A 200/201 means the server accepted the exact slug. Schedule targeted
+	// cleanup before parsing the response so a malformed success body still
+	// triggers a teardown attempt.
+	registerTenantCleanup(t, cfg, slug)
 	id := jsonField(resp, "id")
 	if id == "" {
 		t.Fatalf("AdminCreate org: no id in response: %s", resp)
@@ -484,6 +489,11 @@ func adminCreateOrg(t *testing.T, cfg stagingCfg, slug string) (orgID string) {
 	}
 	t.Fatalf("org %s did not reach instance_status=running within timeout", slug)
 	return ""
+}
+
+func registerTenantCleanup(t *testing.T, cfg stagingCfg, slug string) {
+	t.Helper()
+	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 }
 
 func adminDeleteTenant(t *testing.T, cfg stagingCfg, slug string) {
@@ -517,7 +527,8 @@ func tenantAdminToken(t *testing.T, cfg stagingCfg, slug string) string {
 }
 
 // tenantCreateWorkspace creates a default-runtime workspace via the tenant
-// ws-server, exercising the full tenant → CP provisioner → EC2 path.
+// ws-server, exercising the full tenant → CP provisioner → configured-provider
+// path (currently molecules-server/local Docker in staging).
 //
 // De-hardcode: the runtime + model FOLLOW the same KMS-injection pattern the
 // de-hardcode lanes use — E2E_RUNTIME / E2E_MODEL are exported by the e2e

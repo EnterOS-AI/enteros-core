@@ -29,7 +29,6 @@ func TestWorkspaceCanRaiseTaskAndApprovalToUser(t *testing.T) {
 	t.Logf("workspace-requests: slug=%s", slug)
 
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	adminToken := tenantAdminToken(t, cfg, slug)
 	tenantHost := slug + "." + cfg.subdomainSuffix
 	waitForHTTP(t, tenantHost, http.StatusOK, 10*time.Minute, "tenant /health ready")
@@ -71,7 +70,6 @@ func TestExternalRuntimeWorkspaceCanRaiseTaskAndApproval(t *testing.T) {
 	t.Logf("external-runtime requests: slug=%s", slug)
 
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	adminToken := tenantAdminToken(t, cfg, slug)
 	tenantHost := slug + "." + cfg.subdomainSuffix
 	waitForHTTP(t, tenantHost, http.StatusOK, 10*time.Minute, "tenant /health ready")
@@ -148,7 +146,6 @@ func TestWorkspaceRequestMoreInfoFlipsToInfoRequested(t *testing.T) {
 	t.Logf("more-info: slug=%s", slug)
 
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	adminToken := tenantAdminToken(t, cfg, slug)
 	tenantHost := slug + "." + cfg.subdomainSuffix
 	waitForHTTP(t, tenantHost, http.StatusOK, 10*time.Minute, "tenant /health ready")
