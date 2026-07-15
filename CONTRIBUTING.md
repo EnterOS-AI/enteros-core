@@ -183,7 +183,6 @@ stages 3–4) are merge-blocking and partly live in CP's deploy pipeline.
 | python-lint | pytest with coverage |
 | e2e-api | Full API test suite (62 tests) |
 | shellcheck | Shell script linting |
-| review-check-tests | `review-check.sh` evaluator regression suite (13 scenarios) |
 | ops-scripts | Python unittest suite for `scripts/*.py` |
 
 ### Workspace runtime SSOT
@@ -208,11 +207,12 @@ Workspace IDs can differ across orgs.
 
 ## Local Testing
 
-### review-check.sh
+### CI ops-script suite
 ```bash
-bash .gitea/scripts/tests/test_review_check.sh
+python3 -m pytest .gitea/scripts/tests/ -q
+bash .gitea/scripts/tests/test_ci_status.sh
 ```
-Runs the full regression suite against a fixture HTTP server. No network access required.
+Runs the governance/merge-queue script regression suites. No network access required.
 
 ## Code Style
 

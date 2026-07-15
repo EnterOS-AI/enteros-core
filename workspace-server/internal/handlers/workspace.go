@@ -1420,7 +1420,7 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 		return
 	}
 
-	// #2429: workspaces with status='removed' return 410 Gone (not 200)
+	// Workspaces with status='removed' return 410 Gone (not 200)
 	// so callers fail loudly at startup instead of after 60s of revoked-
 	// token heartbeats. The audit-trail consumers that need the body of
 	// a removed workspace opt in via ?include_removed=true.
@@ -1446,7 +1446,7 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 			body := gin.H{
 				"error": "workspace removed",
 				"id":    id,
-				"hint":  "Regenerate workspace + token from the canvas → Tokens tab",
+				"hint":  "Create a replacement workspace in Canvas, then open Settings → Workspace Tokens → + New Token",
 			}
 			if removedAt.IsZero() {
 				body["removed_at"] = nil

@@ -3,14 +3,13 @@
 SSOT fail-closed approval validator (SEV-1 internal#812).
 
 This module is the SINGLE source of truth for whether a Gitea review counts
-as a "genuine" approval. Both consumers must call into it — they MUST NOT
+as a "genuine" approval. Every consumer must call into it — they MUST NOT
 duplicate the predicate:
 
-  - .gitea/scripts/gitea-merge-queue.py (Python) — imports directly.
-  - .gitea/scripts/review-check.sh (bash, jq) — calls the Python helper
-    at .gitea/scripts/_review_check_filter.py, which in turn calls this
-    module. There is no separate jq / bash copy of the predicate; a
-    reviewer who wants to weaken the gate has to weaken this one file.
+  - .gitea/scripts/gitea-merge-queue.py (Python) — imports directly. This is
+    now the sole consumer: the second consumer chain (review-check.sh ->
+    _review_check_filter.py) was removed with the SOP review gate 2026-07-14.
+    A reviewer who wants to weaken the gate still has to weaken this one file.
 
 # The fail-closed contract
 
@@ -130,8 +129,8 @@ def is_genuine_approval(
 
     When `reviewer_set` is provided, the review's `user.login` must be in
     the set (the merge-queue uses this to count only "recognised"
-    reviewers for the 2-genuine floor; review-check.sh applies its own
-    team-membership probe separately and so does not pass a set).
+    reviewers for the genuine-approval floor). When omitted, no login
+    filtering is applied.
     """
     if not isinstance(review, dict):
         return False

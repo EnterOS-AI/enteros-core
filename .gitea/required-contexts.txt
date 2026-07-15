@@ -5,16 +5,26 @@
 #      (CI cannot always read branch_protections; when a repo-admin token
 #      is present the lint also live-cross-checks against BP and fails when
 #      live BP has a context NOT in this list).
-#   2. THE MERGE QUEUE (gitea-merge-queue.py, the bot that actually performs
-#      merges via the operator conductor tick) now ENFORCES every entry
-#      ABOVE the `# pending-` marker below: each must be `success` on the PR
-#      head before the PR can merge, fail-closed and event-suffix-insensitive
-#      — REGARDLESS of whether the entry is in branch-protection
-#      status_check_contexts. This closes the gap where a context listed
-#      here but absent from BP was treated as a non-required ADVISORY red
-#      and force_merge=true bypassed it (PR#3181 merged with
-#      `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates
-#      Workspace` RED for exactly this reason).
+#   2. THE MERGE QUEUE (gitea-merge-queue.py) is DESIGNED to enforce every
+#      entry ABOVE the `# pending-` marker below: each must be `success` on
+#      the PR head before the PR can merge, fail-closed and event-suffix-
+#      insensitive — REGARDLESS of whether the entry is in branch-protection
+#      status_check_contexts. That closes the gap where a context listed here
+#      but absent from BP was treated as a non-required ADVISORY red and
+#      force_merge=true bypassed it (PR#3181 merged with `E2E Staging SaaS
+#      (full lifecycle) / E2E Staging Concierge Creates Workspace` RED for
+#      exactly this reason).
+#
+#      ENFORCED FOR REAL as of #4363 (2026-07-14). This block previously
+#      warned that step 4b was unreachable dead code — the queue treated BP's
+#      status_check_contexts=['*'] as a LITERAL context name, so step 4
+#      (required_contexts_green) returned `wait` on every PR and step 4b never
+#      ran. #4363 fixed the '*' handling (it now means "every POSTED context
+#      must be success"), so step 4b IS reached and the entries above the
+#      `# pending-` marker are now genuinely presence-required at merge time.
+#      A context listed here that never posts now BLOCKS the merge — which is
+#      the whole point. (That fix also un-jammed the autonomous merge queue;
+#      before it, every merge on main was performed by a human.)
 #
 # Form: "<workflow name> / <job name>" (event suffix stripped — the gate
 # strips `(pull_request)` / `(push)` / `(pull_request_target)` on both
@@ -55,6 +65,43 @@ template-delivery-e2e / Template-asset delivery (fresh seo-agent — config+prom
 # debugging the wedge in task #89; the Gitea Actions API is the SSOT for
 # workflow state, not this comment.
 Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
+
+# PROMOTED 2026-07-14 — the per-PR ephemeral-CP gate (task #85 → #114).
+#
+# It was added by #4271, whose commit message said "make it REQUIRED" — but the
+# line was APPENDED to the end of this file, which landed it under
+# `# pending-#3159`, i.e. in the documented-but-NOT-enforced half. For a day the
+# file disagreed with the commit that wrote it, and the file is what
+# gitea-merge-queue.py reads.
+#
+# The gap that leaves is not academic. Branch protection on main is
+# status_check_contexts=['*'], which requires every POSTED context to be green —
+# so a RED happy path already blocked. What ['*'] cannot see is a context that
+# never posts AT ALL: narrow the `on:` filter, disable the workflow, rename the
+# job, or let the run be cancelled while still queued, and the board is clean and
+# the merge proceeds. Enforcement here is the other half — PRESENT and green, or
+# no merge. That is the half that makes a gate un-deletable by accident.
+#
+# Promotion adds no new red exposure (a red already blocked), so the gate's known
+# nondeterminism (task #99) is NOT a reason to park this line. Fix #99; do not
+# hide the context. Parking a flaky-but-real gate is how a gate becomes a
+# decoration.
+#
+# ENFORCEMENT HISTORY (#4363, resolved 2026-07-14).
+#
+# This block used to warn that NONE of the entries above were actually enforced:
+# gitea-merge-queue.py evaluated branch protection first (step 4), BP on main is
+# status_check_contexts=['*'], and the queue treated '*' as a LITERAL context
+# name — required_contexts_green(<all green>, ['*']) returned (False, ['*=missing'])
+# on every PR, so it decided `wait` on all of them and step 4b (the check that
+# reads THIS file) was unreachable. The bot merged nothing; humans did every merge.
+#
+# #4363 fixed the '*' handling to mean "every POSTED context must be success",
+# which is Gitea's real semantics. Step 4b is now reached, so the entries above
+# the marker are genuinely presence-required: a listed context that never posts
+# now BLOCKS the merge. (The GOVERNANCE_REQUIRED_CONTEXTS second-blocker was
+# already resolved separately — that list is now empty.)
+E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path
 
 # RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────
 # `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
@@ -140,4 +187,3 @@ Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)
 # #48 (RCA molecule-controlplane #878→#885): real platform-managed boot is
 # the intended merge gate.
 E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot
-E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path

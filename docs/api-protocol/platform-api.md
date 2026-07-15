@@ -91,6 +91,53 @@ Violations return `400 Bad Request` with `{ "error": "<field> must be at most N 
 | `POST` | `/workspaces/:id/a2a` | Proxy A2A request to the target workspace (synchronous, enforces hierarchy access control via `X-Workspace-ID`) |
 | `POST` | `/workspaces/:id/delegate` | Async delegation — fire-and-forget, returns delegation_id |
 | `GET` | `/workspaces/:id/delegations` | List delegation status (pending/completed/failed) |
+| `GET` | `/workspaces/:id/audit` | Read the workspace's stored HMAC-linked audit events. **Requires `WorkspaceAuth`.** |
+
+### Audit ledger
+
+`GET /workspaces/:id/audit` is offset-paginated. It accepts `agent_id`,
+`session_id`, RFC 3339 `from`/`to` bounds, `limit` (default 100, maximum 500),
+and `offset` (default 0). The response contract is:
+
+```json
+{
+  "events": [
+    {
+      "id": "audit-event-id",
+      "timestamp": "2026-04-17T12:00:00Z",
+      "agent_id": "agent-id",
+      "session_id": "session-id",
+      "operation": "tool_call",
+      "input_hash": null,
+      "output_hash": null,
+      "model_used": "browser.open",
+      "human_oversight_flag": false,
+      "risk_flag": false,
+      "prev_hmac": null,
+      "hmac": "hex-encoded-hmac",
+      "workspace_id": "workspace-uuid"
+    }
+  ],
+  "total": 1,
+  "chain_valid": true
+}
+```
+
+Events use `timestamp`, `agent_id`, and `operation`; the endpoint does not emit
+the structure-event fields `created_at`, `actor`, or `event_type`. The table
+schema defines `task_start`, `llm_call`, `tool_call`, and `task_end` operations.
+`chain_valid` is `null` when the server cannot compute a verdict, including
+when `AUDIT_LEDGER_SALT` is unset or when `offset`, `session_id`, or `from`
+could omit chain predecessors. Clients must distinguish that state from
+`false`, which means verification detected a mismatch in a complete chain
+prefix returned by the endpoint.
+Successful empty responses return `"events": []`. Canvas deliberately does not
+render the hash and HMAC integrity values returned in each event.
+
+This endpoint is a read surface; it does not create audit events. The active
+runtime currently has no `audit_events` producer. Restoring runtime emission or
+retiring this orphaned surface requires a separate product decision; the read
+endpoint alone is not evidence that current agent actions are being recorded.
 
 ### Async Delegation
 

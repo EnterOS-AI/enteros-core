@@ -148,18 +148,27 @@ jobs:
           UPDATE_STYLE: merge
           # Recognised official-reviewer set. A merge needs >= required_approvals
           # DISTINCT genuine official approvals from these accounts on the
-          # CURRENT head sha (not stale/dismissed). The required_approvals count
-          # itself is read from branch protection at runtime.
-          REVIEWER_SET: agent-reviewer,agent-researcher,agent-reviewer-cr2
+          # CURRENT head sha (not stale/dismissed).
+          # CTO 2026-07-14: reviewers + management + owners may all satisfy the
+          # floor (union of teams code-reviewers/qa/security/managers/Owners).
+          # The prior {agent-reviewer,agent-researcher,agent-reviewer-cr2} were
+          # undriven accounts that produced 0 genuine approvals across 29 merges,
+          # so the queue could never auto-merge. See gitea-merge-queue.py for the
+          # full rationale + the team-keyed follow-up. Keep this in sync with the
+          # script default until it is team-resolved.
+          REVIEWER_SET: molecule-code-reviewer,core-qa,core-security,core-lead,cp-lead,dev-lead,app-lead,sdk-lead,infra-lead,release-manager,pm,agent-pm,hongming,cui,hongming-personal,hongming-pc2,claude-ceo-assistant,hongming-ceo-delegated
           # NOTE: REQUIRED_CONTEXTS is no longer the authoritative PR gate. The
           # queue now reads the required status contexts from BRANCH PROTECTION
           # (status_check_contexts) so non-required governance reds (qa-review,
           # security-review, sop-checklist when not branch-required,
           # E2E Chat, Staging SaaS) cannot block a merge.
           # If branch protection cannot be enumerated the queue HOLDS
-          # (fail-closed). REQUIRED_APPROVALS below is only a fallback used when
-          # branch protection does not specify required_approvals.
-          REQUIRED_APPROVALS: "2"
+          # (fail-closed). REQUIRED_APPROVALS is the genuine-peer floor; BP wins
+          # when it specifies a valid int >= this value.
+          # CTO 2026-07-14: floor = 1 (matches .gitea/security-reviewer.md's
+          # documented required_approvals=1; the prior 2 was drift that, with the
+          # dead REVIEWER_SET, wedged the queue).
+          REQUIRED_APPROVALS: "1"
           # Push-side required contexts. Checking CI / all-required (push)
           # explicitly instead of the combined state avoids false-pause when
           # non-blocking jobs (continue-on-error: true) have failed — those

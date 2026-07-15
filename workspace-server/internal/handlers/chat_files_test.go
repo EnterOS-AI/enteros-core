@@ -10,9 +10,9 @@ package handlers
 //   * forward shape (Authorization, Content-Type, body)
 //   * pass-through of the workspace's status + body
 //
-// Path-safety + sanitization that lived on the platform pre-#2312 is
-// now the workspace-side handler's concern; covered in the Python
-// suite (workspace/tests/test_internal_chat_uploads.py).
+// Path-safety + sanitization that lived on the platform pre-#2312 is now the
+// standalone runtime handler's concern; Core keeps its poll-mode parity cases
+// in sanitize_filename_test.go.
 
 import (
 	"bytes"

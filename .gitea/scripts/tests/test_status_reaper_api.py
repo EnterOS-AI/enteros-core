@@ -503,8 +503,16 @@ def test_reap_compensates_retired_sop_tier_check_when_missing_from_trigger_map(m
 def test_reap_preserves_active_governance_shadow_when_missing_from_trigger_map(monkeypatch):
     """Active governance workflows must be explicitly known-no-push in the trigger
     map. If the parser/discovery misses them, the reaper must fail-closed and
-    preserve their shadow rather than auto-green it."""
+    preserve their shadow rather than auto-green it.
+
+    The real SOP names were retired 2026-07-14 (GOVERNANCE_SHADOW_ALLOWLIST is
+    now empty), so this property is exercised against a monkeypatched active
+    entry — it asserts the *mechanism*, independent of current membership."""
     mod = load_reaper()
+    # Synthetic ACTIVE governance workflow (in the active allowlist, NOT retired)
+    # so the preserve-when-missing mechanism is tested independent of the real
+    # membership (which is empty after the SOP-gate removal).
+    monkeypatch.setattr(mod, "GOVERNANCE_SHADOW_ALLOWLIST", frozenset({"synthetic-gov"}))
     posted = []
     monkeypatch.setattr(
         mod,
@@ -515,16 +523,16 @@ def test_reap_preserves_active_governance_shadow_when_missing_from_trigger_map(m
     )
 
     counters = mod.reap(
-        # Deliberately omit qa-review from the trigger map.
+        # Deliberately omit synthetic-gov from the trigger map.
         {},
         {
             "statuses": [
                 {
-                    "context": "qa-review / approved (pull_request_review)",
+                    "context": "synthetic-gov / approved (pull_request_review)",
                     "status": "failure",
                 },
                 {
-                    "context": "qa-review / approved (pull_request_target)",
+                    "context": "synthetic-gov / approved (pull_request_target)",
                     "status": "success",
                 },
             ],

@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
 # jq-install.sh
 #
-# Library used by .gitea/workflows/review-check-tests.yml (and any
-# other workflow that needs jq on a Gitea Actions ubuntu-latest
-# runner) to install jq fail-closed: if BOTH the apt-get install
-# AND the GitHub-binary fallback fail, the function returns non-zero
-# and emits a `::error::` line — so the workflow step fails loud
-# and the job fails loud, NOT a silent continue that defers the
-# failure to the test step.
+# Generic library for any workflow that needs jq on a Gitea Actions
+# ubuntu-latest runner. Installs jq fail-closed: if BOTH the apt-get
+# install AND the GitHub-binary fallback fail, the function returns
+# non-zero and emits a `::error::` line — so the workflow step fails
+# loud and the job fails loud, NOT a silent continue that defers the
+# failure downstream.
 #
-# Replaces the prior inline `continue-on-error: true` mask in
-# review-check-tests.yml (mc#1982) that was root-fixed by core#2460
-# (commit 8caff364). That commit removed the `continue-on-error: true`
-# on the install step and added `exit 1` on both-fail, but the
-# logic stayed embedded in the YAML `run:` block and was therefore
-# untestable. This library extracts the logic so the fail-closed
-# contract can be unit-tested (see tests/test_jq_install.sh).
+# Extracted (core#2460, commit 8caff364) from a prior inline
+# `continue-on-error: true` mask (mc#1982) that let the jq install
+# fail silently. Pulling the logic out of the YAML `run:` block makes
+# the fail-closed contract unit-testable (see tests/test_jq_install.sh).
+# NOTE: the original consumer (review-check-tests.yml) was removed with
+# the SOP review gate 2026-07-14; this stays as a generic reusable helper.
 #
 # IDEMPOTENT: re-sourcing this file is a clean no-op. The deploy
 # pipeline may `source` it from multiple job steps; tests source
@@ -47,8 +45,8 @@ __JQ_INSTALL_SH_SOURCED=1
 # the fail-closed contract that #2460 / mc#1982 root-fix
 # establishes. A regression that swallows either install failure
 # (e.g. by re-adding `continue-on-error: true` upstream, or by
-# downgrading the ::error:: to ::warning::) would let the
-# review-check.sh regression suite silently "pass" with no jq
+# downgrading the ::error:: to ::warning::) would let a downstream
+# jq-dependent regression suite silently "pass" with no jq
 # available — the SEV-1 failure mode.
 install_jq() {
   local apt_bin="${JQ_INSTALL_APT_GET:-apt-get}"
@@ -82,6 +80,6 @@ install_jq() {
   # (The pre-#2460 emit was `::warning::` + silent continue; that
   # masked install failures and deferred the failure to the test
   # step, making diagnostics harder. See mc#1982 root-fix.)
-  echo "::error::jq install failed — apt-get and GitHub download both failed. review-check.sh regression tests cannot run without jq."
+  echo "::error::jq install failed — apt-get and GitHub download both failed. jq-dependent workflow steps cannot run without jq."
   return 1
 }
