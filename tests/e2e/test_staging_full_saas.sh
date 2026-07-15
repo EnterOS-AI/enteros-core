@@ -2429,8 +2429,8 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   # guard and atomic claim read — so the witness and the decision agree).
   _hib_busy_drive() {
     local sleep_secs="${E2E_HIBERNATE_BUSY_SLEEP_SECS:-180}"
-    local wait_secs="${E2E_HIBERNATE_BUSY_WAIT_SECS:-120}"
-    local busy_payload deadline cur
+    local wait_secs="${E2E_HIBERNATE_BUSY_WAIT_SECS:-150}"
+    local busy_payload deadline cur bd_tmp bd_code bd_qid bd_attempt
     busy_payload=$(python3 -c "
 import json, uuid
 secs = ${sleep_secs}
@@ -2443,14 +2443,39 @@ print(json.dumps({
             f'command and wait for it to finish: sleep {secs}. Then reply with the single '
             'token BUSYDONE. Do nothing else.'}]}}}))
 ")
-    # POST and do NOT poll the queue to completion — leave the turn in flight.
-    tenant_call POST "/workspaces/$LIFECYCLE_WS/a2a" --max-time 30 \
-      -H "Content-Type: application/json" \
-      -d "$busy_payload" -o /dev/null -w '%{http_code}' >/dev/null 2>&1 || true
+    # Send the long turn, retrying the transient post-resume 5xx ("agent
+    # restarting" / "waking") the same way the wake path does — the leaf has just
+    # come back from resume, so its agent may still be booting. Do NOT drain the
+    # queue: we want the turn left in flight. Log the send outcome (queue_id) so a
+    # soak run shows whether the turn was even accepted.
+    bd_tmp=$(mktemp -t hib_busy.XXXXXX)
+    for bd_attempt in $(seq 1 8); do
+      : >"$bd_tmp"
+      bd_code=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/a2a" --max-time 30 \
+        -H "Content-Type: application/json" \
+        -d "$busy_payload" -o "$bd_tmp" -w '%{http_code}' 2>/dev/null || echo 000)
+      if [ "$bd_code" -ge 200 ] 2>/dev/null && [ "$bd_code" -lt 300 ] 2>/dev/null; then
+        bd_qid=$(python3 -c "import json,sys; d=json.load(open('$bd_tmp')); print(d.get('queue_id') or d.get('id') or '')" 2>/dev/null || echo "")
+        log "    busy-drive A2A accepted (http=$bd_code queue_id=${bd_qid:-<none>}) — long turn in flight"
+        break
+      fi
+      if echo "$bd_code" | grep -Eq '^(502|503|504)$' && [ "$bd_attempt" -lt 8 ]; then
+        log "    busy-drive A2A attempt $bd_attempt/8: http=$bd_code (agent restarting) — backing off 15s"
+        sleep 15
+        continue
+      fi
+      log "    busy-drive A2A send got http=$bd_code (non-retryable): $(cat "$bd_tmp" 2>/dev/null | sanitize_http_body | head -c 160)"
+      break
+    done
+    rm -f "$bd_tmp"
+    # Poll active_tasks over several heartbeats (~30s cadence). Log EACH reading so
+    # a soak run shows whether the count ever leaves 0 (distinguishes "agent never
+    # ran the turn" from "turn ran but active_tasks not reported / too brief").
     deadline=$(( $(date +%s) + wait_secs ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
       cur=$(tenant_call GET "/workspaces/$LIFECYCLE_WS" 2>/dev/null \
         | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('active_tasks') or 0))" 2>/dev/null || echo 0)
+      log "    busy-drive poll: active_tasks=${cur:-?} (want >0)"
       if [ "${cur:-0}" -gt 0 ] 2>/dev/null; then
         log "    active_tasks=$cur — workspace is genuinely busy"
         return 0
