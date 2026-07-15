@@ -8,12 +8,14 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -82,15 +84,7 @@ func (h *ChannelHandler) List(c *gin.Context) {
 		if err := channels.DecryptSensitiveFields(config); err != nil {
 			log.Printf("Channels: decrypt config on list for channel %s: %v", id, err)
 		}
-		// Mask bot_token in list response
-		if _, ok := config["bot_token"]; ok {
-			token, _ := config["bot_token"].(string)
-			if len(token) > 8 {
-				config["bot_token"] = token[:4] + "..." + token[len(token)-4:]
-			} else {
-				config["bot_token"] = "***"
-			}
-		}
+		channels.RedactSensitiveFields(config)
 
 		var allowed []string
 		if err := json.Unmarshal(allowedJSON, &allowed); err != nil {
@@ -153,7 +147,7 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 		return
 	}
 
-	// #319: encrypt sensitive fields (bot_token, webhook_secret) before
+	// Encrypt credential-bearing config fields before
 	// persisting. Exactly one call here; duplicate removed in this PR.
 	// Validation above ran against plaintext; storage is ciphertext.
 	if err := channels.EncryptSensitiveFields(body.Config); err != nil {
@@ -220,9 +214,9 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 	// COALESCE-based update
 	var configArg, allowedArg interface{}
 	if body.Config != nil {
-		// #319: re-encrypt sensitive fields on every config update — the
-		// PATCH body carries plaintext (client already had them plaintext in
-		// List response's unmasked path or typed fresh).
+		// Re-encrypt sensitive fields on every config update. Canvas currently
+		// updates enabled state separately, so a config update carries freshly
+		// supplied plaintext rather than a redacted List response.
 		if err := channels.EncryptSensitiveFields(body.Config); err != nil {
 			log.Printf("Channels: encrypt update for workspace %s: %v", workspaceID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "encrypt failed"})
@@ -361,10 +355,14 @@ func (h *ChannelHandler) Test(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": "test message sent"})
 }
 
-// matchesChatID returns true if chatID is in the channel's comma-separated chat_id list.
-// Exact match — avoids the substring-match bug of SQL LIKE.
+// matchesChatID returns true if chatID is in the channel's comma-separated
+// chat_id list. Slack names the same routing field channel_id, so that key is
+// used as a fallback. Exact matching avoids the substring bug of SQL LIKE.
 func matchesChatID(config map[string]interface{}, chatID string) bool {
 	raw, _ := config["chat_id"].(string)
+	if raw == "" {
+		raw, _ = config["channel_id"].(string)
+	}
 	if raw == "" {
 		return false
 	}
@@ -463,30 +461,82 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 		return
 	}
 
-	// Discord: verify Ed25519 signature BEFORE the body is consumed by ParseWebhook.
-	// The app_public_key is the Discord application's public key (not a secret —
-	// it's a PUBLIC key and therefore stored in plaintext in channel_config).
-	// We look it up from the DB (first enabled Discord channel with the field set)
-	// and fall back to the DISCORD_APP_PUBLIC_KEY env var for self-hosted setups
-	// that prefer global configuration. Fail closed: no key configured → 401.
-	// verifyDiscordSignature restores r.Body after reading so ParseWebhook below
-	// can still read the payload.
-	if channelType == "discord" {
-		pubKey := discordPublicKey(ctx)
-		if pubKey == "" || !verifyDiscordSignature(c.Request, pubKey) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid signature"})
-			return
+	// Load all enabled rows before parsing. Public webhook authentication is
+	// row-bound: a request signed for one app/bot must never become eligible for
+	// another row merely because it names that row's chat ID in an untrusted
+	// payload.
+	rows, err := db.DB.QueryContext(ctx, `
+		SELECT id, workspace_id, channel_type, channel_config, enabled, allowed_users
+		FROM workspace_channels
+		WHERE channel_type = $1 AND enabled = true
+	`, channelType)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "channel lookup failed"})
+		return
+	}
+	defer rows.Close()
+
+	var configuredRows []channels.ChannelRow
+	for rows.Next() {
+		var row channels.ChannelRow
+		var configJSON, allowedJSON []byte
+		if err := rows.Scan(&row.ID, &row.WorkspaceID, &row.ChannelType, &configJSON, &row.Enabled, &allowedJSON); err != nil {
+			continue
 		}
+		if err := json.Unmarshal(configJSON, &row.Config); err != nil {
+			log.Printf("Channels: unmarshal config for webhook row %s: %v", row.ID, err)
+			row.Config = map[string]interface{}{}
+		}
+		if err := json.Unmarshal(allowedJSON, &row.AllowedUsers); err != nil {
+			log.Printf("Channels: unmarshal allowed_users for webhook row %s: %v", row.ID, err)
+			row.AllowedUsers = []string{}
+		}
+		if err := channels.DecryptSensitiveFields(row.Config); err != nil {
+			log.Printf("Channels: decrypt webhook row %s: %v", row.ID, err)
+			continue
+		}
+		configuredRows = append(configuredRows, row)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Channels: %s webhook rows.Err: %v", channelType, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "channel lookup failed"})
+		return
 	}
 
-	// For webhooks, we need to find the channel by type and match by chat_id in the message
-	// Parse the webhook first to get the chat_id
-	msg, err := adapter.ParseWebhook(c, nil)
+	rawBody, err := readPublicWebhookBody(c.Request)
+	if err != nil {
+		if errors.Is(err, errPublicWebhookBodyTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "webhook body too large"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "webhook body read failed"})
+		return
+	}
+
+	authenticatedRows := authenticateWebhookCandidates(channelType, c.Request, rawBody, configuredRows, time.Now())
+	if len(authenticatedRows) == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "webhook authentication failed"})
+		return
+	}
+
+	// Parse only after authentication and pass the same authenticated row's
+	// decrypted config so adapters retain a defense-in-depth credential check.
+	c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
+	msg, err := adapter.ParseWebhook(c, authenticatedRows[0].Config)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "webhook parse failed"})
 		return
 	}
+	// Slack and Lark URL-verification handshakes write their challenge response
+	// directly. Do not append a generic receiver response to that protocol body.
+	if c.Writer.Written() {
+		return
+	}
 	if msg == nil {
+		if channelType == "discord" && c.GetInt("discord_interaction_type") == 1 {
+			c.JSON(http.StatusOK, gin.H{"type": 1})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"status": "ignored"}) // Non-message update
 		return
 	}
@@ -510,53 +560,15 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 		}
 	}
 
-	// Look up channels by type and find one whose chat_id list contains msg.ChatID.
-	rows, err := db.DB.QueryContext(ctx, `
-		SELECT id, workspace_id, channel_type, channel_config, enabled, allowed_users
-		FROM workspace_channels
-		WHERE channel_type = $1 AND enabled = true
-	`, channelType)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "channel lookup failed"})
-		return
-	}
-	defer rows.Close()
-
+	// Route only within the credential-authenticated subset. This is the
+	// security boundary that prevents cross-app/channel signature confusion.
 	var ch channels.ChannelRow
 	var candidates []channels.ChannelRow
 	found := false
-	for rows.Next() {
-		var row channels.ChannelRow
-		var configJSON, allowedJSON []byte
-		if err := rows.Scan(&row.ID, &row.WorkspaceID, &row.ChannelType, &configJSON, &row.Enabled, &allowedJSON); err != nil {
-			continue
-		}
-		if err := json.Unmarshal(configJSON, &row.Config); err != nil {
-			log.Printf("Channels: unmarshal config for webhook row %s: %v", row.ID, err)
-			row.Config = map[string]interface{}{}
-		}
-		if err := json.Unmarshal(allowedJSON, &row.AllowedUsers); err != nil {
-			log.Printf("Channels: unmarshal allowed_users for webhook row %s: %v", row.ID, err)
-			row.AllowedUsers = []string{}
-		}
-		if err := channels.DecryptSensitiveFields(row.Config); err != nil {
-			log.Printf("Channels: decrypt webhook row %s: %v", row.ID, err)
-			continue
-		}
-
-		if expectedSecret, _ := row.Config["webhook_secret"].(string); expectedSecret != "" {
-			receivedSecret := c.GetHeader("X-Telegram-Bot-Api-Secret-Token")
-			if subtle.ConstantTimeCompare([]byte(receivedSecret), []byte(expectedSecret)) != 1 {
-				continue
-			}
-		}
-
+	for _, row := range authenticatedRows {
 		if matchesChatID(row.Config, msg.ChatID) {
 			candidates = append(candidates, row)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("Channels: telegram webhook rows.Err: %v", err)
 	}
 
 	if targetSlug != "" {
@@ -582,6 +594,14 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 					names = append(names, "["+strings.ToLower(strings.ReplaceAll(u, " ", "-"))+"]")
 				}
 			}
+			if channelType == "discord" {
+				content := "Unknown agent [" + targetSlug + "]."
+				if len(names) > 0 {
+					content += " Available agents: " + strings.Join(names, ", ")
+				}
+				discordInteractionMessage(c, content)
+				return
+			}
 			c.JSON(http.StatusOK, gin.H{
 				"status":          "unknown_agent",
 				"requested_slug":  targetSlug,
@@ -596,6 +616,10 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 	}
 
 	if !found {
+		if channelType == "discord" {
+			discordInteractionMessage(c, "No Molecule AI channel is configured for this Discord channel.")
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"status": "no_channel"})
 		return
 	}
@@ -607,52 +631,97 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 	globalGoAsync(func() {
 		bgCtx := context.Background()
 		if err := h.manager.HandleInbound(bgCtx, ch, msg); err != nil {
-			log.Printf("Channels: async HandleInbound error for workspace %s: %v", ch.WorkspaceID[:12], err)
+			log.Printf("Channels: async HandleInbound error for workspace %s: %v", shortID(ch.WorkspaceID), err)
 		}
 	})
 
+	if channelType == "discord" {
+		discordInteractionMessage(c, "Request accepted. The agent response will be posted to this channel.")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"status": "accepted"})
 }
 
-// discordPublicKey returns the Ed25519 public key to use for Discord request
-// signature verification. It queries the DB for the first enabled Discord
-// channel whose config contains a non-empty app_public_key (stored in
-// plaintext — it is a PUBLIC key and is not in the sensitiveFields list),
-// then falls back to the DISCORD_APP_PUBLIC_KEY environment variable.
-//
-// Returns "" when no key is configured, which causes the caller to reject
-// the incoming request with 401 (fail-closed behaviour).
-func discordPublicKey(ctx context.Context) string {
-	var pubKey string
-	row := db.DB.QueryRowContext(ctx, `
-		SELECT COALESCE(channel_config->>'app_public_key', '')
-		FROM workspace_channels
-		WHERE channel_type = 'discord' AND enabled = true
-		  AND channel_config->>'app_public_key' IS NOT NULL
-		  AND channel_config->>'app_public_key' != ''
-		LIMIT 1
-	`)
-	_ = row.Scan(&pubKey)
-	if pubKey != "" {
-		return pubKey
+const maxPublicWebhookBody = 1 << 20
+
+var errPublicWebhookBodyTooLarge = errors.New("public webhook body too large")
+
+// readPublicWebhookBody caps all public webhook requests at 1 MiB and restores
+// the body so provider adapters can parse the exact bytes that were signed.
+func readPublicWebhookBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
 	}
-	return os.Getenv("DISCORD_APP_PUBLIC_KEY")
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxPublicWebhookBody+1))
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if len(body) > maxPublicWebhookBody {
+		return nil, errPublicWebhookBodyTooLarge
+	}
+	return body, nil
 }
 
-// verifyDiscordSignature verifies a Discord Interactions request using the
-// Ed25519 signature scheme described in Discord's Interactions documentation.
-// Discord signs the concatenation of the X-Signature-Timestamp header and the
-// raw request body with the application's private key; we verify with the
-// public key stored in channel_config or DISCORD_APP_PUBLIC_KEY.
-//
-// The function reads r.Body in full and then replaces it with a bytes.Reader
-// over the same bytes so that subsequent callers (adapter.ParseWebhook) can
-// still read the body.
-//
-// Returns false when any required header is missing, when pubKeyHex cannot
-// be hex-decoded to a 32-byte Ed25519 public key, when the signature header
-// cannot be decoded, or when the Ed25519 verification itself fails.
-func verifyDiscordSignature(r *http.Request, pubKeyHex string) bool {
+// authenticateWebhookCandidates returns only rows whose own configured
+// credential authenticates this request. Authentication precedes parsing, and
+// later chat matching is restricted to this subset.
+func authenticateWebhookCandidates(channelType string, r *http.Request, body []byte, rows []channels.ChannelRow, now time.Time) []channels.ChannelRow {
+	authenticated := make([]channels.ChannelRow, 0, len(rows))
+	for _, row := range rows {
+		switch channelType {
+		case "slack":
+			signingSecret, _ := row.Config["signing_secret"].(string)
+			if channels.VerifySlackSignature(
+				body,
+				r.Header.Get("X-Slack-Request-Timestamp"),
+				r.Header.Get("X-Slack-Signature"),
+				signingSecret,
+				now,
+			) {
+				authenticated = append(authenticated, row)
+			}
+		case "lark":
+			verifyToken, _ := row.Config["verify_token"].(string)
+			if channels.VerifyLarkWebhookToken(body, verifyToken) {
+				authenticated = append(authenticated, row)
+			}
+		case "telegram":
+			expectedSecret, _ := row.Config["webhook_secret"].(string)
+			receivedSecret := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+			if expectedSecret != "" && subtle.ConstantTimeCompare([]byte(receivedSecret), []byte(expectedSecret)) == 1 {
+				authenticated = append(authenticated, row)
+			}
+		case "discord":
+			publicKey, _ := row.Config["public_key"].(string)
+			if publicKey == "" {
+				publicKey, _ = row.Config["app_public_key"].(string)
+			}
+			if publicKey == "" {
+				publicKey = os.Getenv("DISCORD_APP_PUBLIC_KEY")
+			}
+			if verifyDiscordSignatureBody(r, publicKey, body) {
+				authenticated = append(authenticated, row)
+			}
+		}
+	}
+	return authenticated
+}
+
+// discordInteractionMessage returns a valid immediate Discord interaction
+// callback. Replies from the agent are delivered asynchronously through the
+// configured outbound webhook, so this acknowledgement is ephemeral.
+func discordInteractionMessage(c *gin.Context, content string) {
+	c.JSON(http.StatusOK, gin.H{
+		"type": 4,
+		"data": gin.H{
+			"content": content,
+			"flags":   64,
+		},
+	})
+}
+
+func verifyDiscordSignatureBody(r *http.Request, pubKeyHex string, body []byte) bool {
 	sig := r.Header.Get("X-Signature-Ed25519")
 	ts := r.Header.Get("X-Signature-Timestamp")
 	if sig == "" || ts == "" || pubKeyHex == "" {
@@ -663,19 +732,33 @@ func verifyDiscordSignature(r *http.Request, pubKeyHex string) bool {
 	if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
 		return false
 	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return false
-	}
-	// Restore body so adapter.ParseWebhook can read it.
-	r.Body = io.NopCloser(bytes.NewReader(body))
-
 	sigBytes, err := hex.DecodeString(sig)
-	if err != nil {
+	if err != nil || len(sigBytes) != ed25519.SignatureSize {
 		return false
 	}
 
-	msg := append([]byte(ts), body...)
-	return ed25519.Verify(pubKeyBytes, msg, sigBytes)
+	signedPayload := make([]byte, 0, len(ts)+len(body))
+	signedPayload = append(signedPayload, ts...)
+	signedPayload = append(signedPayload, body...)
+	return ed25519.Verify(pubKeyBytes, signedPayload, sigBytes)
+}
+
+// verifyDiscordSignature verifies a Discord Interactions request using the
+// Ed25519 signature scheme described in Discord's Interactions documentation.
+// Discord signs the concatenation of the X-Signature-Timestamp header and the
+// raw request body with the application's private key; we verify with the
+// public key stored in channel_config or DISCORD_APP_PUBLIC_KEY.
+//
+// The function reads at most the shared 1 MiB webhook limit and then replaces
+// r.Body with the same bytes so subsequent parsing sees the signed payload.
+//
+// Returns false when any required header is missing, when pubKeyHex cannot
+// be hex-decoded to a 32-byte Ed25519 public key, when the signature header
+// cannot be decoded, or when the Ed25519 verification itself fails.
+func verifyDiscordSignature(r *http.Request, pubKeyHex string) bool {
+	body, err := readPublicWebhookBody(r)
+	if err != nil {
+		return false
+	}
+	return verifyDiscordSignatureBody(r, pubKeyHex, body)
 }

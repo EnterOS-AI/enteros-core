@@ -442,13 +442,15 @@ func (m *Manager) SendOutbound(ctx context.Context, channelID string, text strin
 		return fmt.Errorf("no adapter for %s", ch.ChannelType)
 	}
 
-	chatIDRaw, _ := ch.Config["chat_id"].(string)
-	if chatIDRaw == "" {
-		return fmt.Errorf("no chat_id configured for channel %s", channelID)
+	destinations, err := outboundDestinations(ch)
+	if err != nil {
+		return err
 	}
 
-	// Send to all configured chat IDs (comma-separated)
-	for _, cid := range splitChatIDs(chatIDRaw) {
+	// Telegram can fan out to comma-separated chat IDs. Slack Bot API uses
+	// channel_id. Discord, Lark, and Slack Incoming Webhooks encode their
+	// destination in webhook_url and therefore receive one empty destination.
+	for _, cid := range destinations {
 		if err := adapter.SendMessage(ctx, ch.Config, cid, text); err != nil {
 			log.Printf("Channels: outbound send to %s failed: %v", cid, err)
 		}
@@ -475,6 +477,24 @@ func (m *Manager) SendOutbound(ctx context.Context, channelID string, text strin
 	}
 
 	return nil
+}
+
+func outboundDestinations(ch ChannelRow) ([]string, error) {
+	raw, _ := ch.Config["chat_id"].(string)
+	if ch.ChannelType == "slack" {
+		raw, _ = ch.Config["channel_id"].(string)
+	}
+	if destinations := splitChatIDs(raw); len(destinations) > 0 {
+		return destinations, nil
+	}
+
+	if webhookURL, _ := ch.Config["webhook_url"].(string); webhookURL != "" {
+		switch ch.ChannelType {
+		case "discord", "lark", "slack":
+			return []string{""}, nil
+		}
+	}
+	return nil, fmt.Errorf("no outbound destination configured for channel %s", ch.ID)
 }
 
 // BroadcastToWorkspaceChannels sends a message to ALL enabled channels
@@ -508,7 +528,7 @@ func (m *Manager) BroadcastToWorkspaceChannels(ctx context.Context, workspaceID,
 		var channelID string
 		if rows.Scan(&channelID) == nil {
 			if sendErr := m.SendOutbound(ctx, channelID, text); sendErr != nil {
-				log.Printf("Channels: broadcast to %s failed: %v", channelID[:12], sendErr)
+				log.Printf("Channels: broadcast to %s failed: %v", truncID(channelID), sendErr)
 			}
 		}
 	}

@@ -130,17 +130,36 @@ assert_contains "GET /terminal/diagnose (no auth → 401)" "401" \
 
 # ===========================================================================
 # 2. Webhooks (public) — POST /webhooks/:type
-#    Public, no auth. telegram adapter: empty update body → (nil,nil) → 200
-#    ignored; non-JSON → parse error → 400; unknown type → 404.
+#    The route is public at HTTP middleware level, but provider credentials are
+#    mandatory. Prove Telegram's row-bound secret header end to end without a
+#    real Bot API call: webhook_secret selects webhook mode, so manager reload
+#    does not start long polling.
 # ===========================================================================
 echo "--- /webhooks/:type ---"
-BC=$(body_and_code POST "$BASE/webhooks/telegram" -H "Content-Type: application/json" -d '{}')
+
+# No configured Telegram row/secret: fail closed before payload parsing.
+assert_contains "POST /webhooks/telegram (no configured credential → 401)" "401" \
+  "$(http_code POST "$BASE/webhooks/telegram" -H 'Content-Type: application/json' -d '{}')"
+
+TG_WEBHOOK_SECRET="e2e_webhook_secret_123"
+TG_BOT_TOKEN="424242:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+TG_CREATE=$(curl -s -X POST "$BASE/workspaces/$WS_ID/channels" "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d "{\"channel_type\":\"telegram\",\"config\":{\"bot_token\":\"$TG_BOT_TOKEN\",\"chat_id\":\"-1009876543210\",\"webhook_secret\":\"$TG_WEBHOOK_SECRET\"},\"enabled\":true}")
+assert_contains "POST /channels (Telegram webhook-mode row created)" '"channel_type":"telegram"' "$TG_CREATE"
+
+BC=$(body_and_code POST "$BASE/webhooks/telegram" \
+  -H "Content-Type: application/json" \
+  -H "X-Telegram-Bot-Api-Secret-Token: $TG_WEBHOOK_SECRET" \
+  -d '{}')
 WH_CODE=$(printf '%s' "$BC" | tail -n1)
 WH_BODY=$(printf '%s' "$BC" | sed '$d')
-assert_contains "POST /webhooks/telegram (non-message update → 200)" "200" "$WH_CODE"
-assert_contains "POST /webhooks/telegram (status ignored)" '"status":"ignored"' "$WH_BODY"
-assert_contains "POST /webhooks/telegram (bad JSON → 400)" "400" \
-  "$(http_code POST "$BASE/webhooks/telegram" -H 'Content-Type: application/json' -d 'not-json')"
+assert_contains "POST /webhooks/telegram (matching secret → 200)" "200" "$WH_CODE"
+assert_contains "POST /webhooks/telegram (authenticated non-message ignored)" '"status":"ignored"' "$WH_BODY"
+assert_contains "POST /webhooks/telegram (wrong secret → 401)" "401" \
+  "$(http_code POST "$BASE/webhooks/telegram" -H 'Content-Type: application/json' -H 'X-Telegram-Bot-Api-Secret-Token: wrong' -d '{}')"
+assert_contains "POST /webhooks/telegram (authenticated bad JSON → 400)" "400" \
+  "$(http_code POST "$BASE/webhooks/telegram" -H 'Content-Type: application/json' -H "X-Telegram-Bot-Api-Secret-Token: $TG_WEBHOOK_SECRET" -d 'not-json')"
 assert_contains "POST /webhooks/<unknown> (→ 404)" "404" \
   "$(http_code POST "$BASE/webhooks/nope-not-a-channel" -H 'Content-Type: application/json' -d '{}')"
 

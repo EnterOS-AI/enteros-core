@@ -722,6 +722,18 @@ skipProvision:
 			continue
 		}
 
+		// Match ChannelHandler.Create/Update: production channel credentials
+		// must be encrypted before channel_config reaches Postgres. Validate
+		// first because adapters need the plaintext shape, then encrypt the
+		// known secret fields in place while leaving routing identifiers usable.
+		if err := channels.EncryptSensitiveFields(expandedConfig); err != nil {
+			skipChannel(ch.Type, "channel config encryption failed")
+			// Do not log expandedConfig: it still contains the imported secrets
+			// when encryption fails.
+			log.Printf("Org import: skipping %s channel for %s — config encryption failed: %v", ch.Type, ws.Name, err)
+			continue
+		}
+
 		configJSON, err := json.Marshal(expandedConfig)
 		if err != nil {
 			log.Printf("Org import: failed to marshal config for %s channel: %v", ch.Type, err)

@@ -198,8 +198,8 @@ func newLarkRequest(body string) *gin.Context {
 
 func TestLarkAdapter_ParseWebhook_URLVerification(t *testing.T) {
 	a := &LarkAdapter{}
-	c := newLarkRequest(`{"type":"url_verification","challenge":"abc123","token":""}`)
-	msg, err := a.ParseWebhook(c, map[string]interface{}{})
+	c := newLarkRequest(`{"type":"url_verification","challenge":"abc123","token":"right"}`)
+	msg, err := a.ParseWebhook(c, map[string]interface{}{"verify_token": "right"})
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -233,7 +233,7 @@ func TestLarkAdapter_ParseWebhook_TextMessage(t *testing.T) {
 	a := &LarkAdapter{}
 	body := `{
         "schema": "2.0",
-        "header": {"event_type": "im.message.receive_v1", "token": ""},
+		"header": {"event_type": "im.message.receive_v1", "token": "right"},
         "event": {
             "sender": {"sender_id": {"open_id": "ou_xxx", "user_id": "u_yyy"}},
             "message": {
@@ -245,7 +245,7 @@ func TestLarkAdapter_ParseWebhook_TextMessage(t *testing.T) {
             }
         }
     }`
-	msg, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{})
+	msg, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{"verify_token": "right"})
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -276,7 +276,7 @@ func TestLarkAdapter_ParseWebhook_PrefersOpenIDWhenUserIDMissing(t *testing.T) {
 	a := &LarkAdapter{}
 	body := `{
         "schema": "2.0",
-        "header": {"event_type": "im.message.receive_v1"},
+		"header": {"event_type": "im.message.receive_v1", "token": "right"},
         "event": {
             "sender": {"sender_id": {"open_id": "ou_xxx"}},
             "message": {
@@ -287,7 +287,7 @@ func TestLarkAdapter_ParseWebhook_PrefersOpenIDWhenUserIDMissing(t *testing.T) {
             }
         }
     }`
-	msg, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{})
+	msg, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{"verify_token": "right"})
 	if err != nil || msg == nil {
 		t.Fatalf("expected msg, got err=%v msg=%v", err, msg)
 	}
@@ -298,8 +298,8 @@ func TestLarkAdapter_ParseWebhook_PrefersOpenIDWhenUserIDMissing(t *testing.T) {
 
 func TestLarkAdapter_ParseWebhook_NonMessageEvent(t *testing.T) {
 	a := &LarkAdapter{}
-	body := `{"schema":"2.0","header":{"event_type":"im.message.reaction.created_v1"},"event":{}}`
-	msg, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{})
+	body := `{"schema":"2.0","header":{"event_type":"im.message.reaction.created_v1","token":"right"},"event":{}}`
+	msg, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{"verify_token": "right"})
 	if err != nil {
 		t.Errorf("non-message event should return nil/nil, got err=%v", err)
 	}
@@ -312,13 +312,13 @@ func TestLarkAdapter_ParseWebhook_NonTextMessageType(t *testing.T) {
 	a := &LarkAdapter{}
 	body := `{
         "schema": "2.0",
-        "header": {"event_type": "im.message.receive_v1"},
+		"header": {"event_type": "im.message.receive_v1", "token": "right"},
         "event": {
             "sender": {"sender_id": {"open_id": "ou_x"}},
             "message": {"message_id":"m","chat_id":"c","message_type":"image","content":"{}"}
         }
     }`
-	msg, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{})
+	msg, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{"verify_token": "right"})
 	if err != nil {
 		t.Errorf("non-text message should return nil/nil, got err=%v", err)
 	}
@@ -345,7 +345,7 @@ func TestLarkAdapter_ParseWebhook_EventTokenMismatch(t *testing.T) {
 
 func TestLarkAdapter_ParseWebhook_MalformedJSON(t *testing.T) {
 	a := &LarkAdapter{}
-	_, err := a.ParseWebhook(newLarkRequest(`{not valid json`), map[string]interface{}{})
+	_, err := a.ParseWebhook(newLarkRequest(`{not valid json`), map[string]interface{}{"verify_token": "right"})
 	if err == nil {
 		t.Error("expected error for malformed JSON")
 	}
@@ -355,13 +355,13 @@ func TestLarkAdapter_ParseWebhook_TextMessageMalformedContent(t *testing.T) {
 	a := &LarkAdapter{}
 	body := `{
         "schema": "2.0",
-        "header": {"event_type": "im.message.receive_v1"},
+		"header": {"event_type": "im.message.receive_v1", "token": "right"},
         "event": {
             "sender": {"sender_id": {"open_id": "ou_x"}},
             "message": {"message_id":"m","chat_id":"c","message_type":"text","content":"not-json"}
         }
     }`
-	_, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{})
+	_, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{"verify_token": "right"})
 	if err == nil {
 		t.Error("expected error for malformed content")
 	}
@@ -371,13 +371,13 @@ func TestLarkAdapter_ParseWebhook_EmptyText(t *testing.T) {
 	a := &LarkAdapter{}
 	body := `{
         "schema": "2.0",
-        "header": {"event_type": "im.message.receive_v1"},
+		"header": {"event_type": "im.message.receive_v1", "token": "right"},
         "event": {
             "sender": {"sender_id": {"open_id": "ou_x"}},
             "message": {"message_id":"m","chat_id":"c","message_type":"text","content":"{\"text\":\"\"}"}
         }
     }`
-	msg, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{})
+	msg, err := a.ParseWebhook(newLarkRequest(body), map[string]interface{}{"verify_token": "right"})
 	if err != nil || msg != nil {
 		t.Errorf("empty text should return nil/nil, got err=%v msg=%+v", err, msg)
 	}
@@ -402,14 +402,13 @@ func TestRegistry_HasLark(t *testing.T) {
 	}
 }
 
-// TestLark_ConfigSchema locks in the contract: Lark exposes a required +
-// sensitive webhook_url and an optional + sensitive verify_token, in that
-// order. Canvas renders the connect-form from this list so the order and
-// required/sensitive flags are observable surface.
+// TestLark_ConfigSchema locks in the outbound webhook plus optional inbound
+// chat/token fields. Canvas renders the connect-form from this list so the
+// order and required/sensitive flags are observable surface.
 func TestLark_ConfigSchema(t *testing.T) {
 	schema := (&LarkAdapter{}).ConfigSchema()
-	if len(schema) != 2 {
-		t.Fatalf("expected 2 fields, got %d", len(schema))
+	if len(schema) != 3 {
+		t.Fatalf("expected 3 fields, got %d", len(schema))
 	}
 	want := []struct {
 		key       string
@@ -417,6 +416,7 @@ func TestLark_ConfigSchema(t *testing.T) {
 		sensitive bool
 	}{
 		{"webhook_url", true, true},
+		{"chat_id", false, false},
 		{"verify_token", false, true},
 	}
 	for i, w := range want {
