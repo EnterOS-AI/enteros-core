@@ -16,8 +16,8 @@
 #       (e.g. https://demo-tenant.staging.moleculesai.app)
 #   - $OPENROUTER_API_KEY (or $HERMES_API_KEY) for non-claude runtimes
 #   - $OPENAI_API_KEY for claude-code peer
-#   - SaaS edge requires Origin header — see auto-memory
-#       reference_saas_waf_origin_header.md
+#   - $TENANT_ADMIN_TOKEN for hosted tenants, or ADMIN_TOKEN /
+#       MOLECULE_ADMIN_TOKEN for localhost
 #
 # Run:
 #   PLATFORM=https://my-tenant.staging.moleculesai.app \
@@ -27,24 +27,49 @@
 #   SKIP_HERMES=1 SKIP_OPENCLAW=1 ./scripts/test-all-runtimes-a2a-e2e.sh
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../tests/e2e/_lib.sh
+source "$ROOT/tests/e2e/_lib.sh"
 PLATFORM="${PLATFORM:-${1:-http://localhost:8080}}"
+PLATFORM="${PLATFORM%/}"
 HERMES_PROVIDER_KEY="${OPENROUTER_API_KEY:-${HERMES_API_KEY:-}}"
 PEER_OPENAI_KEY="${OPENAI_API_KEY:-}"
-# SaaS auth chain — TENANT_ADMIN_TOKEN + TENANT_ORG_ID required when
-# hitting *.moleculesai.app (per-tenant ADMIN_TOKEN, NOT
-# CP_ADMIN_API_TOKEN). Optional for localhost.
+# SaaS auth chain — TENANT_ADMIN_TOKEN is required when hitting a tenant domain
+# (per-tenant ADMIN_TOKEN, NOT CP_ADMIN_API_TOKEN). TENANT_ORG_ID is optional
+# when the domain router already supplies it.
 TENANT_ADMIN_TOKEN="${TENANT_ADMIN_TOKEN:-}"
 TENANT_ORG_ID="${TENANT_ORG_ID:-}"
 EXTRA_HEADERS=()
 case "$PLATFORM" in
   https://*.moleculesai.app|https://*.moleculesai.app/*)
+    if [ -z "$TENANT_ADMIN_TOKEN" ]; then
+      echo "FAIL: TENANT_ADMIN_TOKEN is required for a hosted tenant" >&2
+      exit 2
+    fi
     EXTRA_HEADERS+=("-H" "Origin: $PLATFORM")
-    [ -n "$TENANT_ADMIN_TOKEN" ] && EXTRA_HEADERS+=("-H" "Authorization: Bearer $TENANT_ADMIN_TOKEN")
+    EXTRA_HEADERS+=("-H" "Authorization: Bearer $TENANT_ADMIN_TOKEN")
     [ -n "$TENANT_ORG_ID" ] && EXTRA_HEADERS+=("-H" "X-Molecule-Org-Id: $TENANT_ORG_ID")
+    ;;
+  http://localhost:*|http://127.0.0.1:*|http://\[::1\]:*)
+    # The supported dev-start path writes a deterministic fail-closed
+    # ADMIN_TOKEN to .env. Reuse it when the caller did not export a token.
+    LOCAL_ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
+    if [ -z "$LOCAL_ADMIN_TOKEN" ] && [ -f "$ROOT/.env" ]; then
+      LOCAL_ADMIN_TOKEN=$(e2e_read_dotenv_value ADMIN_TOKEN "$ROOT/.env" || true)
+    fi
+    if [ -n "$LOCAL_ADMIN_TOKEN" ]; then
+      EXTRA_HEADERS+=("-H" "Authorization: Bearer $LOCAL_ADMIN_TOKEN")
+    elif [ "${E2E_ALLOW_SAME_ORIGIN_FALLBACK:-}" = "1" ]; then
+      # Explicit contract-test opt-in for a combined-tenant local server.
+      EXTRA_HEADERS+=("-H" "Origin: $PLATFORM")
+    else
+      echo "FAIL: ADMIN_TOKEN or MOLECULE_ADMIN_TOKEN is required for localhost" >&2
+      exit 2
+    fi
     ;;
 esac
 
-if [ -z "$HERMES_PROVIDER_KEY" ] && [ -z "${SKIP_HERMES:-}${SKIP_CODEX:-}${SKIP_OPENCLAW:-}" ]; then
+if [ -z "$HERMES_PROVIDER_KEY" ] && { [ -z "${SKIP_HERMES:-}" ] || [ -z "${SKIP_CODEX:-}" ] || [ -z "${SKIP_OPENCLAW:-}" ]; }; then
   echo "FAIL: set OPENROUTER_API_KEY or HERMES_API_KEY for non-claude runtimes"
   exit 2
 fi
@@ -143,7 +168,7 @@ echo "=========================================="
 echo ""
 
 # -------------------------------------------------------
-# 1. Provision the five runtimes (skip via SKIP_* flags)
+# 1. Provision the four runtimes (skip via SKIP_* flags)
 # -------------------------------------------------------
 echo "--- 1. Provision workspaces ---"
 if [ -z "${SKIP_CLAUDE_CODE:-}" ]; then

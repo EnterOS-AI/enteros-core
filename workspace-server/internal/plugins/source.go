@@ -7,8 +7,8 @@
 //
 // The on-disk SHAPE of a plugin (agentskills.io format, MCP server,
 // sub-agent, custom) is a separate concern handled by the
-// per-runtime adapter layer inside the workspace — see
-// workspace-template/plugins_registry.
+// standalone workspace runtime — see molecule-ai-workspace-runtime/
+// plugins_registry.
 package plugins
 
 import (

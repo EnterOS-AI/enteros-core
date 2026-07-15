@@ -1,22 +1,22 @@
-# DISABLED 2026-06-27: AWS account closed; pending local-docker rework (see ABSTRACTION-FINDINGS).
 name: Sweep stale e2e-* orgs (staging)
 
 # Ported from .github/workflows/sweep-stale-e2e-orgs.yml on 2026-05-11 per RFC
 # internal#219 §1 sweep. Differences from the GitHub version:
-#   - Dropped `workflow_dispatch.inputs` (Gitea 1.22.6 parser rejects them
-#     per feedback_gitea_workflow_dispatch_inputs_unsupported).
-#   - Dropped `merge_group:` (no Gitea merge queue).
-#   - Dropped `environment:` blocks (Gitea has no environments).
+#   - Kept flat `workflow_dispatch` (no `inputs`) under repository policy;
+#     dispatch callers pass parameters through the established env/var path.
+#   - Omitted GitHub's `merge_group:` trigger; this repository uses its
+#     serialized Gitea queue plus pull-request/push status gates.
+#   - Omitted `environment:` blocks; this repository's approval and secret
+#     gates do not depend on Actions environments.
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
 #   - `continue-on-error: true` on each job (RFC §1 contract).
 #
 
-# Janitor for staging tenants left behind when E2E cleanup didn't run:
-# CI cancellations, runner crashes, transient AWS errors mid-cascade,
-# bash trap missed (signal 9), etc. Without this loop, every failed
-# teardown leaks an EC2 + DNS + DB row until manual ops cleanup —
-# 2026-04-23 staging hit the 64 vCPU AWS quota from ~27 such orphans.
+# Manual janitor for staging tenants left behind when E2E cleanup did not run:
+# CI cancellation, runner crash, provider error mid-cascade, or a missed bash
+# trap. Without a catch-up delete, failed teardown can leak local/provider
+# compute, tunnel/DNS state, and a DB row.
 #
 # Why not rely on per-test-run teardown:
 #   - Per-run teardown is best-effort by definition. Any process death
@@ -30,26 +30,12 @@ name: Sweep stale e2e-* orgs (staging)
 #   - This sweep is the catch-all that converges staging back to clean
 #     regardless of which specific path leaked.
 #
-# The PROPER fix is making CP cleanup transactional + verify-after-
-# terminate (filed separately as cleanup-correctness work). This
-# workflow is the safety net that catches everything else AND any
-# future leak source we haven't yet identified.
+# The owning E2E's authenticated teardown is the primary path. This manual
+# workflow is an exact-prefix catch-up tool, not a scheduled production janitor.
 
 on:
-  # DISABLED 2026-06-27: push/pull_request/schedule/workflow_run auto-triggers commented out below (AWS account closed); manual workflow_dispatch only. See ABSTRACTION-FINDINGS.
-#   schedule:
-#     # Every 15 min. E2E orgs are short-lived (~8-25 min wall clock from
-#     # create to teardown — canary is ~8 min, full SaaS ~25 min). The
-#     # previous hourly + 120-min stale threshold meant a leaked tenant
-#     # could keep an EC2 alive for up to 2 hours, eating ~2 vCPU per
-#     # leak. Tightening the cadence + threshold reduces the worst-case
-#     # leak window from 120 min to ~45 min (15-min sweep cadence + 30-min
-#     # threshold) without risk of catching in-progress runs (the longest
-#     # e2e run is the 25-min canary, well under the 30-min threshold).
-#     # See molecule-controlplane#420 for the leak-class accounting that
-#     # motivated this tightening.
-#     - cron: '*/15 * * * *'
-  # DISABLED 2026-06-27: no manual trigger remained after neutralizing auto-triggers; workflow_dispatch added so the workflow stays manually runnable.
+  # Deliberately manual: callers inspect the dry-run candidate list before any
+  # destructive catch-up. Normal E2E cleanup remains automatic in its owner.
   workflow_dispatch:
 # Don't let two sweeps fight. Cron + workflow_dispatch could overlap
 # on a manual trigger; queue rather than parallel-delete.
@@ -70,10 +56,9 @@ jobs:
     # NOTE: Phase 3 (RFC #219 §1) `continue-on-error: true` removed
     # 2026-05-11. The "surface broken workflows without blocking"
     # rationale was correctly applied to advisory/lint workflows but
-    # wrong for this janitor — silent failure here masks real-money
-    # tenant leaks. Hongming observed 15 leaked EC2 in molecule-canary
-    # (004947743811) us-east-2 at 11:05Z 2026-05-11 because the sweep
-    # had been exiting 2 every tick and the failure was swallowed.
+    # wrong for this janitor — silent failure here masks real resource leaks.
+    # Historical AWS incidents established the fail-loud requirement; the same
+    # rule applies to the current provider backend.
     # See `feedback_strict_root_only_after_class_a` — critical janitors
     # must fail loud. A follow-up `notify-failure` step below also
     # surfaces breakage to ops even if branch-protection wiring is
@@ -313,5 +298,5 @@ jobs:
         # triage loop.
         if: failure()
         run: |
-          echo "::error::sweep-stale-e2e-orgs FAILED — staging tenants are LEAKING. See prior step logs. Common causes: (a) CP_STAGING_ADMIN_API_TOKEN secret missing/rotated, (b) staging-api.moleculesai.app 5xx, (c) safety-cap tripped (CP admin API returning malformed orgs). Manual cleanup of leaked EC2 + DNS may be required while this is broken."
+          echo "::error::sweep-stale-e2e-orgs FAILED — staging tenants may be leaking. See prior step logs. Common causes: (a) staging admin token missing/rotated, (b) staging-api.moleculesai.app 5xx, (c) safety cap tripped. Use the CP's targeted tenant cleanup and verify provider/tunnel/DNS state; do not run a broad production cleanup."
           exit 1

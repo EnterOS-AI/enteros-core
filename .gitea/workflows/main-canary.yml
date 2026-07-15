@@ -45,8 +45,7 @@ name: main-canary
 on:
   push:
     branches: [main]
-  # NOTE: bare workflow_dispatch — NO `inputs:` block (Gitea 1.22.6 rejects
-  # workflow_dispatch.inputs; see lint-workflow-yaml.py Rule 1).
+  # Bare workflow_dispatch under the repository's flat-dispatch policy.
   workflow_dispatch:
 
 concurrency:

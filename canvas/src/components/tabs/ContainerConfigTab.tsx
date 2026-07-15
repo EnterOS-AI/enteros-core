@@ -158,7 +158,7 @@ export function ContainerConfigTab({ workspaceId, data }: Props) {
           // internal#734: omit when "auto" so the wire/default behavior is unchanged.
           ...(form.dataPersistence ? { data_persistence: form.dataPersistence } : {}),
           // Cloud backend: send the (possibly switched) provider. Omit for the
-          // default (aws) so a non-switching AWS save keeps the wire unchanged;
+          // legacy wire default (aws) so a non-switching AWS save stays unchanged;
           // a switch TO aws (omit) vs FROM aws (explicit) both register correctly
           // because the workspace-server normalizes ""→aws when diffing.
           ...(normalizeProvider(form.provider) !== "aws" ? { provider: normalizeProvider(form.provider) } : {}),

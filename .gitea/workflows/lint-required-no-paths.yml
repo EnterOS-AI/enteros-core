@@ -8,7 +8,7 @@
 # Why this exists:
 #   A required-check workflow with a paths filter silently degrades the
 #   merge gate. If a PR's diff doesn't touch the filter, the workflow
-#   never fires; Gitea (1.22.6) reports the required context as
+#   never fires; this repository's protection gate keeps the required context
 #   `pending` (NOT `skipped == success`), so the PR cannot merge. For a
 #   docs-only PR against `paths: ['**.go']`, the PR is wedged forever.
 #
@@ -31,8 +31,8 @@
 #   Self-evident from this file: only `pull_request` types + no paths.
 #
 # Auth:
-#   `GET /repos/.../branch_protections/{branch}` requires repo-admin
-#   role in Gitea 1.22.6. The workflow-default `GITHUB_TOKEN` is
+#   The token used for `GET /repos/.../branch_protections/{branch}` needs
+#   repo-admin access. The workflow-default `GITHUB_TOKEN` is
 #   non-admin (read-only), so we re-use `DRIFT_BOT_TOKEN` (same persona
 #   that powers `ci-required-drift.yml` — verified working there).
 #   If `DRIFT_BOT_TOKEN` becomes unavailable, the script exits 0 with a
@@ -45,10 +45,8 @@
 #   changes (block-scalar vs flow-style), or moving `paths:` between
 #   `pull_request:` and `pull_request_target:` all still detect.
 #
-# IMPORTANT — Gitea 1.22.6 parser quirk per
-# `feedback_gitea_workflow_dispatch_inputs_unsupported`: do NOT add an
-# `inputs:` block to `workflow_dispatch:` — Gitea 1.22.6 rejects the
-# entire workflow as "unknown on type" and it registers for ZERO events.
+# Repository policy keeps `workflow_dispatch` flat (no `inputs:`) until shared
+# callers and lint fixtures are migrated together.
 
 name: lint-required-no-paths
 

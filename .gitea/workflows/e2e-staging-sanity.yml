@@ -13,7 +13,8 @@ name: E2E Staging Sanity (leak-detection self-check)
 # RFC internal#219 §1 sweep.
 #
 # Differences from the GitHub version:
-#   - Dropped `workflow_dispatch:` (Gitea 1.22.6 finicky on bare dispatch).
+#   - Retains only manual `workflow_dispatch` while the AWS-specific harness is
+#     dormant; no parser capability is implied by this trigger choice.
 #   - `actions/github-script@v9` issue-open block replaced with curl
 #     calls to the Gitea REST API (/api/v1/repos/.../issues|comments).
 #   - Workflow-level env.GITHUB_SERVER_URL set.

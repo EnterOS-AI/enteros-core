@@ -17,10 +17,10 @@ interface ConsoleResponse {
   instance_id?: string;
 }
 
-// ConsoleModal renders the EC2 serial console output for a workspace.
+// ConsoleModal renders the provider-supplied boot log for a workspace.
 // Used by the "View Logs" button on failed/stuck workspaces so operators
-// can see the actual cloud-init + runtime startup trace without SSH or
-// AWS console access. The tenant platform proxies to the control plane;
+// can see the actual host bootstrap + runtime startup trace without direct
+// host access. The tenant platform proxies to the control plane;
 // this component just consumes GET /workspaces/:id/console.
 export function ConsoleModal({ workspaceId, workspaceName, open, onClose }: Props) {
   const [output, setOutput] = useState<string | null>(null);
@@ -57,14 +57,14 @@ export function ConsoleModal({ workspaceId, workspaceName, open, onClose }: Prop
       .catch((e) => {
         if (ignore) return;
         // 501 = deployment without a control plane (local docker-compose).
-        // 404 = EC2 instance has been terminated. Match with word-boundary
+        // 404 = the provider host has been terminated. Match with word-boundary
         // regex so a status code appearing inside an unrelated number
         // ("15012") doesn't false-match.
         const msg = e instanceof Error ? e.message : "Failed to load console output";
         if (/\b501\b/.test(msg)) {
           setError("Console output is only available on cloud (SaaS) deployments.");
         } else if (/\b404\b/.test(msg)) {
-          setError("No EC2 instance found for this workspace — it may have been terminated.");
+          setError("No workspace host found — it may have been terminated.");
         } else {
           setError(msg);
         }
@@ -104,7 +104,7 @@ export function ConsoleModal({ workspaceId, workspaceName, open, onClose }: Prop
         <div className="flex items-center justify-between px-4 py-3 border-b border-line">
           <div>
             <h3 id="console-modal-title" className="text-sm font-semibold text-ink">
-              EC2 console output
+              Workspace boot logs
             </h3>
             {workspaceName && (
               <div className="text-[11px] text-ink-mid mt-0.5 truncate max-w-[600px]">

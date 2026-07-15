@@ -643,7 +643,7 @@ func TestProxyA2A_WorkspaceNoURL(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-nourl/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected 503, got %d: %s", w.Code, w.Body.String())
@@ -689,7 +689,7 @@ func TestProxyA2A_AgentUnreachable(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-dead/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	time.Sleep(100 * time.Millisecond)
 
 	if w.Code != http.StatusBadGateway {

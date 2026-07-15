@@ -1267,9 +1267,10 @@ func TestCanvasOrBearer_TokensExist_WrongOrigin_Returns401(t *testing.T) {
 // TestCanvasOrBearer_TokensExist_ForgeableOrigin_NoBearer_FailsClosed pins the
 // removal of the cross-origin Origin-match cosmetic path
 // (harden/no-fail-open-auth). A no-bearer request whose forgeable Origin header
-// matches CORS_ORIGINS used to pass; it now 401s. The canvas always sends a
-// bearer (NEXT_PUBLIC_ADMIN_TOKEN), so legitimate traffic is unaffected, and a
-// curl that forges Origin can no longer reach even a cosmetic route.
+// matches CORS_ORIGINS used to pass; it now 401s. Legitimate traffic uses a
+// verified session, a valid bearer, or the narrowly-gated combined-tenant
+// same-origin path, and a curl that forges Origin can no longer reach even a
+// cosmetic route.
 //
 // Watch-it-fail: restore `if canvasOriginAllowed(c.GetHeader("Origin")) {
 // c.Next(); return }` in CanvasOrBearer → this flips 401→200 and fails.
@@ -1701,8 +1702,8 @@ func TestAdminAuth_684_AdminTokenNotSet_FallsBackToWorkspaceToken(t *testing.T) 
 // SaaS tenants boot with ADMIN_TOKEN set but an empty tokens table —
 // without this guard, an anonymous caller can POST /org/import or
 // /workspaces before the first real user and pre-empt the instance.
-// Fail-open is only acceptable when ADMIN_TOKEN is also unset
-// (self-hosted dev with zero auth configured).
+// An unset ADMIN_TOKEN does not create a bearer-less bootstrap path either;
+// fresh installs fail closed in every environment.
 func TestAdminAuth_C4_AdminTokenSet_FreshInstall_FailsClosed(t *testing.T) {
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {

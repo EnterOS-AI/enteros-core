@@ -1,19 +1,18 @@
 'use client';
 
-// ExternalConnectModal — shown once after creating a runtime="external"
-// workspace. Surfaces the workspace_auth_token + ready-to-paste snippets
-// so the operator can hand them to whoever runs their off-host agent
-// without piecing together the register payload from docs.
+// ExternalConnectModal — shown after create, credential rotation, or read-only
+// re-show for an external-like workspace. Create/rotate payloads include the
+// newly minted workspace_auth_token; re-show deliberately omits it. The same
+// ready-to-paste snippets are used across those paths.
 //
 // Security posture:
-//   - The auth_token is visible once. After the modal closes, the value
-//     is unrecoverable (the /workspaces/:id read endpoints never echo it).
-//     UI warns the operator before they dismiss.
+//   - A newly minted auth_token is visible once. Read endpoints never echo it;
+//     operators recover by rotating credentials, which revokes the old token.
 //   - A "copy to clipboard" button uses the navigator.clipboard API which
 //     is same-origin and requires user gesture — no cross-origin leak.
-//   - Snippets use placeholders for the operator's own public URL
-//     ($AGENT_URL). They ARE NOT filled in server-side because the
-//     server doesn't know where the operator's agent will live.
+//   - Push-mode snippets use placeholders for the operator's own public URL
+//     (AGENT_URL / INBOUND_URL). They ARE NOT filled in server-side because
+//     the server doesn't know where the operator's agent will live.
 
 import { useCallback, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
@@ -35,24 +34,21 @@ export interface ExternalConnectionInfo {
   // omits the field; tab is hidden if empty).
   claude_code_channel_snippet?: string;
   // Universal MCP snippet — runtime-agnostic outbound tool path via
-  // the `molecule-mcp` console script in the
-  // molecule-ai-workspace-runtime PyPI wheel. Works with any MCP-aware
-  // agent runtime (Claude Code, hermes, codex, third-party). Outbound-
-  // only: pair with claude_code_channel or python tabs for heartbeat
-  // + inbound. Optional for backward compat with platforms that
-  // haven't shipped PR #2413 yet.
+  // the `molecule-mcp` console script in the molecules-workspace-runtime
+  // wheel. Works with any MCP-aware agent runtime and owns standalone
+  // register + heartbeat. Runtime-specific inbound delivery still needs a
+  // channel/bridge; the Python tab is an authenticated server example, not a
+  // turnkey bridge into an arbitrary runtime session.
   universal_mcp_snippet?: string;
   // Hermes channel snippet — for operators whose external agent IS a
   // hermes-agent session. Routes A2A traffic into the hermes gateway
-  // via the molecule-channel plugin (Molecule-AI/hermes-channel-molecule).
+  // via the molecule-channel plugin (molecule-ai/hermes-channel-molecule).
   // Long-poll based (no tunnel) — same UX shape as the Claude Code
   // channel tab. Gives hermes true push parity. Optional for backward
   // compat with platforms that haven't shipped this PR yet.
   hermes_channel_snippet?: string;
-  // Codex MCP config snippet — wires the molecule MCP server into
-  // ~/.codex/config.toml so codex agents can call platform tools.
-  // Outbound-tools-only today (codex's MCP client doesn't route
-  // notifications/*); push parity would need a separate bridge daemon.
+  // Codex setup snippet — wires outbound MCP tools and installs the
+  // codex-channel-molecule long-poll bridge for inbound turns.
   codex_snippet?: string;
   // OpenClaw MCP config snippet — wires molecule MCP + starts the
   // openclaw gateway on loopback. Outbound-tools-only today; push
@@ -169,9 +165,19 @@ export function ExternalConnectModal({ info, onClose }: Props) {
             Connect your external agent
           </Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-ink-mid">
-            Paste the snippet below into your agent&apos;s deployment. The
-            auth token is shown <span className="text-warm">only once</span>
-            {" "}— save it somewhere safe before closing this dialog.
+            {info.auth_token ? (
+              <>
+                Paste the snippet below into your agent&apos;s deployment. The
+                auth token is shown <span className="text-warm">only once</span>
+                {" "}— save it somewhere safe before closing this dialog.
+              </>
+            ) : (
+              <>
+                These connection details were re-shown without the token. Your
+                current token remains active; rotate credentials to mint a
+                replacement only if you no longer have it.
+              </>
+            )}
           </Dialog.Description>
 
           {/* Tabs */}
@@ -289,7 +295,7 @@ export function ExternalConnectModal({ info, onClose }: Props) {
               {filledUniversalMcp && (
                 <SnippetBlock
                   value={filledUniversalMcp}
-                  label="Universal MCP — standalone register + heartbeat + tools for any MCP-aware runtime (Claude Code, hermes, codex). Pair with Python or Claude Code tab if you need inbound A2A delivery."
+                  label="Universal MCP — standalone register + heartbeat + tools for any MCP-aware runtime. Inbound delivery needs a runtime-specific channel or bridge; the Python tab is a starting point for implementing one."
                   copyKey="mcp"
                   copied={copiedKey === "mcp"}
                   onCopy={() => copy(filledUniversalMcp, "mcp")}
@@ -327,7 +333,7 @@ export function ExternalConnectModal({ info, onClose }: Props) {
               {filledCodex && (
                 <SnippetBlock
                   value={filledCodex}
-                  label="Codex MCP config — wires the molecule MCP server into ~/.codex/config.toml. Outbound tools today; inbound A2A push needs the Python SDK tab paired in (codex's MCP runtime doesn't route arbitrary notifications/* yet)."
+                  label="Codex setup — wires outbound MCP tools into ~/.codex/config.toml and runs codex-channel-molecule for inbound long-poll delivery."
                   copyKey="codex"
                   copied={copiedKey === "codex"}
                   onCopy={() => copy(filledCodex, "codex")}
@@ -346,7 +352,7 @@ export function ExternalConnectModal({ info, onClose }: Props) {
               {filledOpenClaw && (
                 <SnippetBlock
                   value={filledOpenClaw}
-                  label="OpenClaw MCP config — wires the molecule MCP server via openclaw mcp set + starts the gateway on loopback. Outbound tools today; inbound A2A push on an external openclaw needs the Python SDK tab paired in (a sessions.steer bridge daemon is future work)."
+                  label="OpenClaw MCP config — wires outbound tools and starts the gateway on loopback. The Python tab is an authenticated echo-server starting point for a sessions.steer bridge, not a turnkey OpenClaw bridge."
                   copyKey="openclaw"
                   copied={copiedKey === "openclaw"}
                   onCopy={() => copy(filledOpenClaw, "openclaw")}
@@ -403,7 +409,7 @@ export function ExternalConnectModal({ info, onClose }: Props) {
               onClick={onClose}
               className="px-4 py-2 text-sm rounded-lg bg-surface-card hover:bg-surface-card text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
             >
-              I&apos;ve saved it — close
+              {info.auth_token ? "I've saved it — close" : "Close"}
             </button>
           </div>
         </Dialog.Content>

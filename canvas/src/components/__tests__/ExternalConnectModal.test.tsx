@@ -95,6 +95,14 @@ describe("ExternalConnectModal — render conditions", () => {
     expect(screen.getByText(/save it somewhere safe before closing/i)).toBeTruthy();
     expect(screen.getAllByText(/only once/i).length).toBeGreaterThan(0);
   });
+
+  it("explains the tokenless re-show path without claiming a token is visible", () => {
+    renderAndFlush({ ...defaultInfo, auth_token: "" });
+    expect(screen.getByText(/re-shown without the token/i)).toBeTruthy();
+    expect(screen.getByText(/rotate credentials to mint a replacement/i)).toBeTruthy();
+    expect(screen.queryByText(/save it somewhere safe before closing/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /^close$/i })).toBeTruthy();
+  });
 });
 
 describe("ExternalConnectModal — default tab selection", () => {

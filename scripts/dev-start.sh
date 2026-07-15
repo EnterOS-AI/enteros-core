@@ -228,9 +228,11 @@ trap cleanup EXIT INT TERM
 #   NEXT_PUBLIC_ADMIN_TOKEN    — same value, baked into the canvas bundle so
 #                                the browser sends the matching bearer.
 #
-# For SaaS the platform is provisioned with a random ADMIN_TOKEN + the
-# canvas image baked with the matching NEXT_PUBLIC_ADMIN_TOKEN, plus
-# MOLECULE_ENV=production. Same shape, stronger secret.
+# This matching `NEXT_PUBLIC_ADMIN_TOKEN` pair is local-development-only.
+# Production/SaaS Canvas must not bake the tenant `ADMIN_TOKEN` into public
+# JavaScript. Browser requests authenticate with a verified control-plane
+# session or a deliberately supplied org/admin credential; the server still
+# runs with `MOLECULE_ENV=production` and fail-closed route middleware.
 if [ -f "$ENV_FILE" ] && grep -q '^MOLECULE_ENV=' "$ENV_FILE"; then
     echo "==> Reusing MOLECULE_ENV from existing .env"
 else

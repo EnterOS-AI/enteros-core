@@ -20,10 +20,9 @@ SUM_URL="https://example.com/summarizer-agent"
 # Tier-2b (wsauth_middleware.go:250) REJECTS workspace bearer tokens on admin
 # routes when ADMIN_TOKEN is set, so admin calls MUST send the exact ADMIN_TOKEN
 # value — which the e2e-api CI job exports here as MOLECULE_ADMIN_TOKEN. acurl =
-# "admin curl": it always sends the platform admin bearer (if one is set).
-#
-# Guarded if-set: a fresh self-hosted/dev platform with no ADMIN_TOKEN fail-opens
-# (devmode.go:50), so sending no bearer still works there.
+# "admin curl": it sends the platform admin bearer. Fresh self-hosted/dev
+# platforms also fail closed and need this bootstrap credential.
+e2e_require_admin_token
 ADMIN_BEARER="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
 ADMIN_AUTH=()
 [ -n "$ADMIN_BEARER" ] && ADMIN_AUTH=(-H "Authorization: Bearer $ADMIN_BEARER")
@@ -66,9 +65,8 @@ check "GET /health" '"status":"ok"' "$R"
 R=$(acurl "$BASE/workspaces")
 check "GET /workspaces (empty)" '[]' "$R"
 
-# Test 3: Create workspace A. POST /workspaces is AdminAuth-gated (router.go:166);
-# send the admin bearer (acurl). On a fail-open dev platform acurl sends nothing
-# and the create still works.
+# Test 3: Create workspace A. POST /workspaces is AdminAuth-gated; send the
+# required admin bearer through acurl.
 R=$(acurl -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Echo Agent","tier":1,"runtime":"external","external":true}')
 check "POST /workspaces (create echo)" '"status":"awaiting_agent"' "$R"
 ECHO_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
@@ -357,8 +355,8 @@ R=$(e2e_gated_admin_op "$ECHO_ID" acurl -X DELETE "$BASE/workspaces/$ECHO_ID?con
 check "Delete before re-import" '"status":"removed"' "$R"
 
 # Both workspaces are now deleted. The platform-level ADMIN_TOKEN env is still
-# set, so admin routes still require the admin bearer (fail-open does NOT
-# re-engage just because the token table emptied) — keep using acurl's bearer.
+# set, so admin routes still require the admin bearer after the token table is
+# emptied — keep using acurl's bearer.
 R=$(acurl "$BASE/workspaces")
 COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
 check "All workspaces deleted (count=0)" "0" "$COUNT"

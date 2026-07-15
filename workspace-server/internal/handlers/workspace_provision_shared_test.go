@@ -68,8 +68,8 @@ func (m testEnvMutator) MutateEnv(_ context.Context, _ string, env map[string]st
 // Behavior-based — drift-resistant. A future provision function with
 // any name still trips this gate as long as it calls one of the
 // provisioner Start methods. This replaces an earlier name-list
-// version (PR #2366) that missed TeamHandler.Expand (issue #2367) —
-// the bug that motivated the upgrade.
+// version (PR #2366) that missed the then-present TeamHandler.Expand
+// (issue #2367) — a historical bug in a handler that has since been retired.
 //
 // Same shape as the audit-coverage gate from #335 (#2343 PR-5).
 //
@@ -245,14 +245,12 @@ func TestMintWorkspaceSecrets_PersistsInboundSecretInSaaSMode(t *testing.T) {
 	}
 }
 
-// TestPrepareProvisionContext_ParentIDInjection pins the PARENT_ID env
-// contract added in #2367: when payload.ParentID is set (currently only
-// TeamHandler.Expand populates it), prepareProvisionContext MUST
-// surface it as envVars["PARENT_ID"] so workspace/coordinator.py can
-// read it on startup. Pre-fix #2367 the env was set inline in
-// TeamHandler.Expand on cfg.EnvVars; the refactor moved it into the
-// shared prepare so any future provision path with a parent_id
-// inherits it automatically.
+// TestPrepareProvisionContext_ParentIDInjection pins legacy PARENT_ID
+// compatibility: when payload.ParentID is set, prepareProvisionContext
+// surfaces it as envVars["PARENT_ID"] for older external images. No current
+// checked-in runtime consumes this variable; workspaces.parent_id and the
+// platform APIs are authoritative. The shared prepare path preserves the
+// legacy field consistently for any provision request carrying a parent ID.
 func TestPrepareProvisionContext_ParentIDInjection(t *testing.T) {
 	cases := []struct {
 		name      string

@@ -1,5 +1,10 @@
 # Hermes Agent — Adapter Reconnaissance
 
+> **Historical research snapshot.** Versions, stars, supported backends, and
+> comparative claims below were captured at the stated reconnaissance date and
+> may have changed. Current integration behavior lives in the workspace runtime
+> and Hermes template repositories.
+
 Reconnaissance of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) (v0.8.0, 68,713 ⭐, MIT) for potential Molecule AI adapter integration.
 
 > **Status:** Design-only recon — no implementation.

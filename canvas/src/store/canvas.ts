@@ -141,7 +141,7 @@ export interface WorkspaceNodeData extends Record<string, unknown> {
    *  builds — that fallthrough is treated as "push" to match
    *  ws-server's `lookupDeliveryMode` default. */
   deliveryMode?: string;
-  /** Desired EC2/container shape persisted in workspaces.compute. Applied
+  /** Desired workspace-host/container shape persisted in workspaces.compute. Applied
    *  at next restart/reprovision, and used to determine Display tab
    *  availability. */
   compute?: WorkspaceCompute;

@@ -130,8 +130,8 @@ func readBodyWithLimit(r io.Reader, limit int, kind string) ([]byte, error) {
 //     policy after DNS resolution and before connect, closing the rebinding
 //     window between resolveAgentURL's preflight and the actual TCP dial. Its
 //     10s connect timeout also bounds black-holed workspace targets. When a
-//     workspace's EC2 black-holes TCP connects (instance terminated mid-flight,
-//     security group flipped, NACL bug), the OS default is 75s on Linux / 21s
+//     workspace provider endpoint black-holes TCP connects (compute terminated
+//     mid-flight or its network policy changed), the OS default is 75s on Linux / 21s
 //     on macOS — long enough that Cloudflare's ~100s edge timeout can fire first
 //     and surface a generic 502 page to canvas. 10s is well above realistic
 //     intra-region latencies and well below CF's edge timeout.
@@ -324,8 +324,8 @@ func isAgentRestartingError(err error) bool {
 //
 //   - 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout: standard
 //     proxy-layer "upstream is broken" codes (Cloudflare, ELB, agent tunnel).
-//   - 521 Web Server Is Down: Cloudflare can't open TCP to origin (most
-//     direct dead-EC2 signal).
+//   - 521 Web Server Is Down: Cloudflare cannot open TCP to the workspace
+//     origin (the most direct dead-provider-endpoint signal).
 //   - 522 Connection Timed Out: Cloudflare opened TCP but no response within
 //     ~15s — typical of SG/NACL flap or agent process hung.
 //   - 523 Origin Is Unreachable: Cloudflare can't route to origin (DNS or
@@ -458,28 +458,7 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 		return
 	}
 
-	callerID := c.GetHeader("X-Workspace-ID")
-
-	// #2306: when X-Workspace-ID isn't set, derive callerID from the bearer
-	// token's owning workspace. External callers (third-party SDKs, the
-	// channel plugin, etc.) authenticate purely via bearer and frequently
-	// don't set the header — without this, activity_logs.source_id ends up
-	// NULL and downstream consumers (notification peer_id, "Agent Comms by
-	// peer" tab, analytics) can't identify the sender. The bearer is the
-	// authoritative caller identity per the wsauth contract; the header is
-	// just a display/routing hint that must agree with it.
-	//
-	// Skip when an org-level token is in play (canvas/admin path) — those
-	// tokens grant org-wide access and don't bind to a single workspace.
-	if callerID == "" {
-		if _, isOrg := c.Get("org_token_id"); !isOrg {
-			if tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization")); tok != "" {
-				if wsID, err := wsauth.WorkspaceFromToken(ctx, db.DB, tok); err == nil {
-					callerID = wsID
-				}
-			}
-		}
-	}
+	claimedCallerID := c.GetHeader("X-Workspace-ID")
 
 	// #761 SECURITY: reject requests where the client-supplied X-Workspace-ID
 	// contains a system-caller prefix. isSystemCaller() bypasses both token
@@ -488,35 +467,21 @@ func (h *WorkspaceHandler) ProxyA2A(c *gin.Context) {
 	// (ProxyA2ARequest), never to HTTP header values. Legitimate system callers
 	// (webhooks, scheduler, restart_context) call proxyA2ARequest directly and
 	// never go through this HTTP handler.
-	if isSystemCaller(callerID) {
+	if isSystemCaller(claimedCallerID) {
 		log.Printf("security: system-caller prefix forge attempt — remote=%q header=%q",
-			c.ClientIP(), callerID)
+			c.ClientIP(), claimedCallerID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "invalid caller ID"})
 		return
 	}
 
-	// Phase 30.5 — validate the caller's auth token when the caller IS
-	// a workspace (not canvas or a system caller). Canvas requests have
-	// no X-Workspace-ID so they bypass this check (the existing
-	// access-control layer already trusts them). System callers
-	// (webhook:* / system:* / test:*) only reach proxyA2ARequest via
-	// the server-side ProxyA2ARequest wrapper, never via this HTTP path.
-	//
-	// The bind is strict: the token must match `callerID`, not
-	// `workspaceID` (the target). A compromised token from workspace A
-	// must never authenticate calls from A pretending to be B.
-	//
-	// Post-RFC#637: canvas users now send X-Workspace-ID (their identity
-	// workspace). validateCallerToken detects canvas/admin auth on a
-	// tokenless workspace and returns isCanvasUser=true so the proxy can
-	// bypass CanCommunicate (human users sit outside the hierarchy).
-	isCanvasUser := false
-	if callerID != "" && callerID != workspaceID && !isSystemCaller(callerID) {
-		var err error
-		isCanvasUser, err = validateCallerToken(ctx, c, callerID)
-		if err != nil {
-			return // response already written with 401
-		}
+	// Authenticate before treating the request as canvas or workspace traffic.
+	// X-Workspace-ID is only a claim; a workspace bearer must resolve to the
+	// same source identity. Verified human and inbound credentials are the only
+	// non-workspace paths. Missing, revoked, tokenless-legacy, and DB-error
+	// cases all fail closed.
+	callerID, isCanvasUser, err := authenticateA2AHTTPCaller(ctx, c, claimedCallerID)
+	if err != nil {
+		return // response already written
 	}
 
 	// core#2691: attach the authenticated human sender's identity to canvas_user
@@ -659,6 +624,7 @@ func (h *WorkspaceHandler) ReceiveA2AInbound(c *gin.Context) {
 	// not forwarded to the target workspace.
 	c.Request.Header.Del("X-Workspace-ID")
 	c.Request.Header.Del("Authorization")
+	c.Set(a2aInboundAuthenticatedContextKey, true)
 	h.ProxyA2A(c)
 }
 
@@ -715,14 +681,11 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 			}
 		}
 
-		// #1953 cross-tenant isolation. CanCommunicate alone does NOT enforce
-		// org boundaries: its "root-level siblings — both have no parent" rule
-		// treats every tenant's org root as a sibling, so a caller that is an
-		// org root could resolve and route a2a to another tenant's org root
-		// (and resolveAgentURL accepts ANY workspace id with no org check).
-		// Gate on the SAME parent_id-chain org scoping the OFFSEC-015 broadcast
-		// fix uses: reject before resolveAgentURL when caller and target are in
-		// different orgs. Fail-closed — a DB error denies cross-org routing.
+		// #1953 cross-tenant isolation. CanCommunicate currently rejects unrelated
+		// roots and disjoint subtrees, but sameOrg remains a defense-in-depth tenant
+		// boundary independent of hierarchy policy. Gate before resolveAgentURL
+		// (which accepts any workspace ID) using the same parent-chain org scoping
+		// as the OFFSEC-015 broadcast fix. Fail closed on lookup errors.
 		ok, err := sameOrg(ctx, db.DB, callerID, workspaceID)
 		if err != nil {
 			log.Printf("ProxyA2A: org-scope check failed %s → %s: %v — denying", callerID, workspaceID, err)
@@ -1637,7 +1600,8 @@ func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentUR
 		b = concrete
 	}
 	// Per-workspace idle-timeout override (capability primitive #2 —
-	// see workspace/adapter_base.py:idle_timeout_override). The
+	// see molecule-ai-workspace-runtime/molecule_runtime/adapter_base.py:
+	// idle_timeout_override). The
 	// adapter declares a longer/shorter window than the platform
 	// default in its heartbeat; the heartbeat handler stashes it in
 	// runtimeOverrides; we honor it here. Falls through to the global

@@ -286,7 +286,7 @@ export function ContextMenu() {
       ? [
           { label: "Arrange Children", icon: "▦", action: handleArrangeChildren },
           {
-            label: contextMenu.nodeData.collapsed ? "Expand Team" : "Collapse Team",
+            label: contextMenu.nodeData.collapsed ? "Expand Team View" : "Collapse Team View",
             icon: contextMenu.nodeData.collapsed ? "▽" : "◁",
             action: handleCollapse,
           },

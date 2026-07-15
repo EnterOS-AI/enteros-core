@@ -250,13 +250,13 @@ describe("ContextMenu — keyboard accessibility", () => {
     expect(labels.some((l) => l.includes("Restart"))).toBe(true);
   });
 
-  it("'Collapse Team' is still present when the workspace HAS children", () => {
+  it("'Collapse Team View' is present when an expanded workspace has children", () => {
     // Mark a child belonging to ws-1 so hasChildren() returns true.
     mockStore.nodes = [{ id: "child-1", data: { parentId: "ws-1" } }];
     render(<ContextMenu />);
     const items = screen.getAllByRole("menuitem");
     const labels = items.map((el) => el.textContent?.trim() ?? "");
-    expect(labels.some((l) => /Collapse Team|Expand Team/.test(l))).toBe(true);
+    expect(screen.getByRole("menuitem", { name: "Collapse Team View" })).toBeTruthy();
     expect(labels.some((l) => l.includes("Arrange Children"))).toBe(true);
     expect(labels.some((l) => l.includes("Zoom to Team"))).toBe(true);
     // Cleanup for other tests.

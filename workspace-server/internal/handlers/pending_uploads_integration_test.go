@@ -15,7 +15,7 @@
 //   INTEGRATION_DB_URL="postgres://postgres:test@localhost:55432/molecule?sslmode=disable" \
 //     go test -tags=integration ./internal/handlers/ -run Integration_PendingUploads
 //
-// CI (.github/workflows/handlers-postgres-integration.yml) runs this on
+// CI (.gitea/workflows/handlers-postgres-integration.yml) runs this on
 // every PR that touches workspace-server/internal/handlers/** OR
 // workspace-server/migrations/**.
 //

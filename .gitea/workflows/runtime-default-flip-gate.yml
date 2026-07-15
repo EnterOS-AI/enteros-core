@@ -11,8 +11,8 @@ name: runtime-default-flip-gate
 # E2E_ASSERT_MGMT_MCP_CALLABLE=1 (a REAL A2A provision_workspace turn on the
 # proposed runtime), KEEPS the flip on GREEN and REVERTS it on RED.
 #
-# Gitea rejects a workflow that declares workflow_dispatch.inputs, so the proposed
-# value is read from repo/org VARS (set the var, dispatch, then unset):
+# Repository policy keeps dispatch flat, so the proposed value is read from
+# repo/org VARS (set the var, dispatch, then unset):
 #   RUNTIME_FLIP_PROPOSED_RUNTIME  e.g. openclaw   (default-runtime flip)
 #   RUNTIME_FLIP_KEY / RUNTIME_FLIP_VALUE          (arbitrary pin key/value)
 #   RUNTIME_FLIP_APPLY=1                           (WRITE + gate; default: dry-run/plan-only)

@@ -40,8 +40,8 @@ jobs:
     timeout-minutes: 5
     # Phase-1 advisory gate (decision issue: mc#3089). Two prior renewal
     # trackers aged past the 14d cap and were superseded; this is the current
-    # one. Per-workflow run history is API-blind on Gitea 1.22.6, so green
-    # cannot be confirmed to unmask here — re-tracked, not unmasked.
+    # one. The current review has not established the required clean-window
+    # evidence, so the mask is re-tracked rather than unmasked.
     # (Do not put superseded tracker numbers within 2 lines of the directive:
     # lint-continue-on-error-tracking matches the FIRST tracker in that window.)
     continue-on-error: true  # mc#3616: 2026-07-09 renewal, expires 2026-07-23 — Phase 1 advisory design-token drift gate; promote to required (flip false) after 1w green + APP_SSOT_READ_TOKEN provisioned, else open a successor tracker (per mc#3089).

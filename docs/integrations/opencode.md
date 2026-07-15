@@ -1,96 +1,102 @@
-# Molecule AI + opencode Integration
+# Molecule AI + OpenCode integration
 
-> **opencode** is an AI coding agent ([opencode.ai](https://opencode.ai)) that supports remote MCP servers via `opencode.json`. This guide shows how to wire it to your Molecule AI workspace.
+OpenCode can connect to a workspace's authenticated Streamable HTTP MCP
+endpoint. The exact tool list is server-controlled and may be filtered by the
+workspace's `can_delegate` setting and platform feature flags.
 
 ## Prerequisites
 
-- A running Molecule platform (`MOLECULE_MCP_URL` — e.g. `https://api.molecule.ai`)
-- A workspace-scoped bearer token (`MOLECULE_MCP_TOKEN`) issued via the platform API
+- A tenant base URL such as `https://<tenant-slug>.moleculesai.app`, or
+  `http://localhost:8080` for self-hosted development.
+- The target workspace UUID.
+- A workspace bearer returned by the platform. Never put it in the URL or
+  commit it to `opencode.json`.
 
-## 1. Declare Molecule as a remote MCP server
+## 1. Mint a workspace bearer
 
-Create (or extend) `opencode.json` in your project root:
+An administrator can bootstrap a bearer for an existing workspace:
+
+```bash
+export MOLECULE_MCP_URL='https://<tenant-slug>.moleculesai.app'
+export WORKSPACE_ID='<workspace-uuid>'
+export ADMIN_TOKEN='<tenant-admin-token>'
+
+MOLECULE_MCP_TOKEN=$(
+  curl -fsS -X POST \
+    "$MOLECULE_MCP_URL/admin/workspaces/$WORKSPACE_ID/tokens" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+  | jq -r '.auth_token'
+)
+export MOLECULE_MCP_TOKEN
+```
+
+The plaintext token is returned once. A caller that already has a workspace
+bearer may rotate through `POST /workspaces/:id/tokens` with that existing
+bearer. Token creation has no per-token `mcp:read` or `mcp:delegate` scope
+payload; authorization is bound to the workspace and enforced by
+`WorkspaceAuth`, tool filtering, and the MCP rate limiter.
+
+## 2. Configure OpenCode
+
+OpenCode's current configuration key is `mcp` (not the older `mcpServers`
+shape), and environment interpolation uses `{env:NAME}`:
 
 ```json
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "molecule": {
       "type": "remote",
-      "url": "${MOLECULE_MCP_URL}/workspaces/${WORKSPACE_ID}/mcp",
-      "headers": { "Authorization": "Bearer ${MOLECULE_MCP_TOKEN}" },
-      "description": "Molecule AI A2A orchestration — delegate_task, list_peers, check_task_status"
+      "url": "{env:MOLECULE_MCP_URL}/workspaces/{env:WORKSPACE_ID}/mcp",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer {env:MOLECULE_MCP_TOKEN}"
+      }
     }
   }
 }
 ```
 
-> ⚠️ **Never embed the token in the URL** (e.g. `?token=...`). Always use the `Authorization: Bearer` header. URL-embedded tokens appear in server logs, browser history, and Git history if the file is committed.
-
-A pre-configured template is available at `org-templates/molecule-dev/opencode.json`.
-
-## 2. Obtain a workspace-scoped token
-
-```bash
-curl -X POST https://$MOLECULE_MCP_URL/workspaces/$WORKSPACE_ID/tokens \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "opencode-agent", "scopes": ["mcp:read", "mcp:delegate"]}'
-```
-
-Store the returned token as `MOLECULE_MCP_TOKEN` in your `.env` (see `.env.example`).
+The platform also exposes
+`GET /workspaces/:id/mcp/stream` for the backwards-compatible SSE transport;
+new clients should use the POST endpoint above.
 
 ## 3. Available tools
 
-When opencode connects to the Molecule MCP endpoint, the agent gains access to:
+OpenCode discovers tools through MCP `tools/list`; do not maintain a fixed
+client-side allowlist. The current bridge includes these groups:
 
-| Tool | Description |
-|------|-------------|
-| `list_peers` | Discover available workspaces in your org |
-| `delegate_task` | Send a task to a peer workspace and wait for the result |
-| `delegate_task_async` | Fire-and-forget task delegation; returns a `task_id` |
-| `check_task_status` | Poll an async delegation by `task_id` |
-| `commit_memory` | Persist information to LOCAL or TEAM memory scope |
-| `recall_memory` | Search previously committed memories |
+- topology and delegation: `list_peers`, `get_workspace_info`,
+  `delegate_task`, `delegate_task_async`, and `check_task_status`;
+- user-action tasks: `request_user_action`, `list_user_tasks`,
+  `update_user_task`, and `delete_user_task`; and
+- memory: the compatibility `commit_memory`/`recall_memory` pair plus the
+  namespace-aware v2 search, summary, list, and forget tools.
 
-### Restricted tools
+`delegate_task` and `delegate_task_async` disappear when the workspace has
+`can_delegate=false`. `send_message_to_user` is absent unless the platform
+explicitly sets `MOLECULE_MCP_ALLOW_SEND_MESSAGE=true`.
 
-- **`send_message_to_user`** — disabled for remote MCP callers by default; requires explicit opt-in via `MOLECULE_MCP_ALLOW_SEND_MESSAGE=true`
-- **GLOBAL memory scope** — `commit_memory` with `scope: GLOBAL` is blocked for external agents; LOCAL and TEAM scopes are available
+## 4. Security and lifecycle
 
-## 4. Example: delegate a research task
+- `WorkspaceAuth` binds the bearer to the `:id` workspace before MCP dispatch.
+- The bridge rate-limits calls per token.
+- GLOBAL writes are rejected on the compatibility memory tools; v2 namespace
+  access is resolved server-side and content passes the SAFE-T1201 redactor.
+- Revoke a token by listing `GET /workspaces/:id/tokens` with a valid
+  workspace bearer, then calling
+  `DELETE /workspaces/:id/tokens/:tokenId` with the same bearer.
+- Treat any bearer committed to source control or pasted into a persistent
+  channel as burned and rotate it.
 
-```json
-{
-  "tool": "delegate_task",
-  "arguments": {
-    "target": "research-lead",
-    "task": "Summarise the last 7 days of commits in Molecule-AI/molecule-core"
-  }
-}
-```
-
-opencode sends this tool call to the Molecule MCP endpoint. The platform routes it to your `research-lead` workspace and streams the response back.
-
-## 5. Security notes
-
-### SAFE-T1401 — org topology exposure
-`list_peers` returns the full set of workspace names and roles visible to your workspace. This is intentional: provisioned agents need to know their peers to delegate effectively. Be aware that any opencode agent with a valid `MOLECULE_MCP_TOKEN` can enumerate your org topology.
-
-### SAFE-T1201 — tool surface audit pending
-The full `@molecule-ai/mcp-server` npm package exposes additional tools beyond those listed above. These are pending a SAFE-T1201 security audit (tracked in #747 follow-on) and **must not be exposed to external agents in production** until that audit completes.
-
-### Token scoping
-Issue tokens with the minimum required scopes (`mcp:read`, `mcp:delegate`). Rotate tokens regularly. Revoke via `DELETE /workspaces/:id/tokens/:token_id`.
-
-## 6. Environment variables
-
-Add to your `.env`:
+## Environment variables
 
 ```bash
-MOLECULE_MCP_URL=https://api.molecule.ai   # or http://localhost:8080 for local dev
-MOLECULE_MCP_TOKEN=                         # workspace-scoped bearer token from step 2
-WORKSPACE_ID=                               # UUID of the agent workspace opencode acts as
-                                            # find it in Canvas sidebar or GET /workspaces
+MOLECULE_MCP_URL=https://<tenant-slug>.moleculesai.app
+MOLECULE_MCP_TOKEN=
+WORKSPACE_ID=
 ```
 
-See `.env.example` for the canonical reference.
+See [OpenCode's MCP server documentation](https://opencode.ai/docs/mcp-servers/)
+for the client configuration format and [the platform API](../api-protocol/platform-api.md)
+for Molecule routes.

@@ -5,8 +5,7 @@ import "os"
 // localImagePrefix is the synthetic registry hostname used for images
 // that the local-build path produces. It is intentionally NOT a real
 // hostname — Docker won't try to pull it from the network (no DNS
-// resolution path), and the workspace-image-refresh / image-watch
-// paths short-circuit on it.
+// resolution path).
 //
 // Tag scheme: `molecule-local/workspace-template-<runtime>:<tag>` where
 // `<tag>` is either the 12-char Gitea HEAD sha for SHA-pinned references
@@ -30,9 +29,9 @@ type RegistryMode string
 const (
 	// RegistryModeSaaS — pull workspace-template-* images from a real
 	// container registry whose URL is in `MOLECULE_IMAGE_REGISTRY`.
-	// Used by every prod tenant (env injected via Railway / EC2
-	// user-data) and any self-hosted operator who has mirrored the
-	// images to their own GHCR/ECR/Harbor.
+	// Registry-backed self-hosts may use Molecule's Gitea registry or an
+	// operator-controlled mirror. Managed image selection happens in the
+	// control plane and is separate from this local Docker provisioner.
 	RegistryModeSaaS RegistryMode = "saas"
 
 	// RegistryModeLocal — clone the workspace-template-<runtime> repo
@@ -40,8 +39,8 @@ const (
 	// (`https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-<runtime>`)
 	// and `docker build` the image locally. Used by OSS contributors
 	// who run `go run ./workspace-server/cmd/server` without setting
-	// MOLECULE_IMAGE_REGISTRY. Closes the post-2026-05-06 GHCR-403 gap
-	// (Task #194 / Issue #63).
+	// MOLECULE_IMAGE_REGISTRY, keeping local development independent of a
+	// remote container registry (Task #194 / Issue #63).
 	RegistryModeLocal RegistryMode = "local"
 )
 
@@ -49,8 +48,7 @@ const (
 // by Resolve(); read by:
 //   - the provisioner Start() path — branches on Mode for clone+build
 //     vs pull
-//   - admin_workspace_images.go — skips remote pull in local mode
-//   - imagewatch.Watcher — short-circuits in local mode (no GHCR poll)
+//   - admin_workspace_images.go — rejects remote pull in local-build mode
 //
 // SaaS-mode .Prefix matches the existing RegistryPrefix() return value;
 // local-mode .Prefix is the synthetic `molecule-local`.

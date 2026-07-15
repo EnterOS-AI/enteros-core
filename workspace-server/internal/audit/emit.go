@@ -1,19 +1,17 @@
 // Package audit emits structured, single-line JSON audit-log records for
 // user-initiated actions on a workspace (secret set/delete, file
-// create/delete, A2A send, chat turn, …). Records ship to Loki via the
-// tenant Vector pipeline using two transports, in this order:
+// create/delete, A2A send, chat turn, …). The emitter writes two local
+// transports, in this order; whether an environment forwards them to Loki is
+// deployment configuration, not a guarantee made by this package:
 //
 //  1. A `audit:` prefixed line on the standard logger. This is the
-//     primary transport — tenant Vector already tails the
-//     molecule-tenant container's stdout (see
-//     /usr/local/bin/tenant-vector.yaml.tmpl on operator-host), so the
-//     event reaches Loki with no Vector-side change.
+//     primary transport. A deployed log collector can tail the tenant
+//     container's stdout and forward these records.
 //
 //  2. A best-effort append to /var/log/molecule-audit.jsonl on the
 //     tenant container's writable rootfs. This is the durable local
 //     artifact for forensic queries when Loki is unreachable, and is
-//     the future file-source target for Phase 2 (RFC internal#562 Step
-//     1, dedicated audit shipping channel).
+//     a possible file-source target for a configured audit shipper.
 //
 // Both transports are best-effort and run on the request goroutine.
 // Per RFC: emit MUST NOT fail the user's request. Any I/O error is

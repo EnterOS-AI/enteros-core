@@ -75,15 +75,10 @@ func NewRateLimiter(rate int, interval time.Duration, ctx context.Context) *Rate
 // are UUIDs ("org:..."), token hashes are 64-char hex ("tok:..."), IPs
 // contain dots/colons ("ip:...").
 //
-// Security note on X-Molecule-Org-Id spoofing: the rate limiter runs
-// BEFORE TenantGuard, so the org-id value here is unvalidated. A caller
-// reaching workspace-server directly could spoof the header to drain
-// another org's bucket. In production this surface is closed by the
-// CP/Caddy front: tenant SGs reject :8080 from the public internet, and
-// CP rewrites the header to the verified org. If a future deployment
-// exposes :8080 directly, validate the org-id (e.g. against
-// MOLECULE_ORG_ID) before keying on it, or move this middleware after
-// TenantGuard. The token-hash and IP fallbacks are unspoofable.
+// Security note: this middleware runs before TenantGuard/authentication, so
+// both the org header and bearer-shaped string are unverified at this point.
+// A complete pre-auth identity/IP limiting design is tracked in internal#1037;
+// do not apply a partial header-only fix that leaves bearer rotation open.
 //
 // Issue #59 — replaces the previous IP-only keying that silently
 // collapsed all canvas traffic into one bucket once #179 disabled

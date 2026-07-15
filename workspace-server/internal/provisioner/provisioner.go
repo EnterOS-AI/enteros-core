@@ -61,17 +61,12 @@ var ErrUnresolvableRuntime = errors.New("provisioner: requested runtime has no r
 // pre-build step on the tenant host.
 //
 // The registry prefix is determined by RegistryPrefix() in registry.go;
-// defaults to ghcr.io/molecule-ai (upstream OSS) and is overridden via the
-// MOLECULE_IMAGE_REGISTRY env var in production tenants that mirror to
-// AWS ECR or another registry. The map is computed at package init and
-// captures whatever prefix was active then.
+// it defaults to registry.moleculesai.app/molecule-ai and can be overridden
+// with MOLECULE_IMAGE_REGISTRY for self-hosted/private registries. The map is
+// computed at package init and captures whatever prefix was active then.
 //
-// Legacy local-build path (`docker build -t workspace-template:<runtime>`
-// via scripts/build-images.sh) is still supported for development:
-// when a bare `workspace-template:<runtime>` image is present locally,
-// Docker's image resolver matches it before any pull is attempted. Set
-// the env var WORKSPACE_IMAGE_LOCAL_OVERRIDE=1 (enforced by callers) to
-// short-circuit pulls entirely if needed.
+// Local development uses registry_mode.go's manifest-backed source-build path;
+// there is no in-core workspace-template tree or build-images helper.
 var RuntimeImages = computeRuntimeImages()
 
 // DefaultImage is the fallback workspace Docker image. Computed via RegistryPrefix() so the prefix
@@ -91,7 +86,7 @@ const (
 	DefaultPort = "8000"
 
 	// ProvisionTimeout bounds the SaaS/CP provision context (cpProv.Start —
-	// the EC2-launch API call, which returns quickly; the long cold-boot is
+	// the provider provision API call, which returns quickly; the long cold-boot is
 	// owned by the CP bootstrap-watcher + the registry provision-timeout
 	// sweep, not this ctx) and the short DB-lookup nudge at
 	// buildProvisionerConfig. It is deliberately NO LONGER the cap on the
@@ -130,7 +125,7 @@ type WorkspaceConfig struct {
 	WorkspacePath    string            // Host path to bind-mount as /workspace (if empty, uses Docker named volume)
 	Tier             int
 	Runtime          string // "hermes" (default), "claude-code", "codex", "openclaw", etc.
-	InstanceType     string // Optional CP EC2 instance type override (SaaS only)
+	InstanceType     string // Optional provider machine/instance type override (SaaS only)
 	DiskGB           int32  // Optional CP root volume size override in GiB (SaaS only)
 	DataPersistence  string // internal#734: "persist"|"ephemeral"|"" — durable-data choice forwarded to CP (SaaS only)
 	Provider         string // multi-provider RFC: ""/"aws"|"hetzner"|"gcp" compute backend for the workspace box (per-workspace; distinct from LLM/model provider). Forwarded to CP.
@@ -156,11 +151,9 @@ type WorkspaceConfig struct {
 	// and returns the asset file map. nil = no provider wired
 	// (self-host default; falls through to the local TemplatePath
 	// path for the config bundle). For SaaS workspaces, main.go
-	// wires a real impl (Gitea shallow clone). When the fetcher
-	// is set, it MERGES with cfg.ConfigFiles (caller wins on
-	// conflict, like the prior PersistedBundleProvider pattern
-	// in #2831 PIECE 1) so the existing TemplatePath+ConfigFiles
-	// path keeps working for callers that don't opt in.
+	// wires a real implementation backed by the Gitea archive API. Fetched
+	// files remain separate from cfg.ConfigFiles on the CP request wire; the
+	// control plane consumes both fields and materializes their union.
 	TemplateAssetFetcher TemplateAssetFetcher
 
 	// Kind is the workspace kind: "" / "workspace" (ordinary) or "platform"
@@ -404,9 +397,8 @@ const LabelInstance = "molecule.platform.instance"
 // every workspace template creates and drops to via `gosu agent` before
 // exec'ing the runtime (the a2a_mcp_server runs under this uid). The value is
 // fixed at 1000:1000 across all templates — see:
-//   - workspace-configs-templates/claude-code-default/Dockerfile (`useradd -u 1000 ... agent`)
-//   - workspace-configs-templates/hermes/Dockerfile               (`useradd -u 1000 ... agent`)
-//   - workspace/entrypoint.sh                                     (`exec gosu agent` — "uid 1000")
+//   - standalone workspace-template Dockerfiles (`useradd -u 1000 ... agent`)
+//   - their entrypoint/start scripts             (`exec gosu agent` — "uid 1000")
 //
 // Files the platform injects into /configs AFTER the entrypoint's
 // `chown -R agent:agent /configs` (the post-start #418 re-injection and the
@@ -824,7 +816,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 
 	// Resolve the target image platform once so the pull and the
 	// container-create use the same value. On an Apple Silicon dev
-	// laptop the GHCR workspace-template-* images only ship a
+	// laptop the published workspace-template-* images only ship a
 	// linux/amd64 manifest today; without an explicit platform the
 	// daemon asks for linux/arm64/v8 and ImagePull returns
 	// "no matching manifest for linux/arm64/v8 in the manifest list
@@ -835,14 +827,14 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	if IsLocalBuildImage(image) {
 		// Locally-built images were built for localBuildImagePlatform() —
 		// the create MUST match it, not the registry-pull default (which
-		// pins amd64 on Apple Silicon for GHCR-manifest reasons that do
+		// pins amd64 on Apple Silicon for registry-manifest reasons that do
 		// not apply to a local build). core#3502.
 		imgPlatformStr = localBuildImagePlatform()
 	}
 	imgPlatform := parseOCIPlatform(imgPlatformStr)
 
 	// Log image resolution for debugging stale-image issues, and pull from
-	// GHCR so tenant hosts don't need a pre-build step anymore. Two cases
+	// the configured registry so hosts do not need a pre-build step. Two cases
 	// trigger a pull:
 	//   1. Image not present locally — historical behavior (pull-on-miss).
 	//   2. Image present locally AND tag is moving (`:latest`, no tag,
@@ -870,7 +862,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	if err != nil {
 		if isImageNotFoundErr(err) {
 			return "", fmt.Errorf(
-				"docker image %q not found after pull attempt — verify GHCR visibility for %s and that the tenant has internet access (underlying error: %w)",
+				"docker image %q not found after pull attempt — verify registry access for %s and that the host can reach the configured registry (underlying error: %w)",
 				image, runtimeTagFromImage(image), err,
 			)
 		}
@@ -1081,8 +1073,8 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 		// agent that forges an approval has no token to act on it. A
 		// latent path exists (loadPersonaEnvFile merges a per-role
 		// persona `GITEA_TOKEN` into cfg.EnvVars when MOLECULE_PERSONA_ROOT
-		// is set on a tenant host); it is inert today (persona dirs are
-		// operator-host-only) but unguarded. Strip SCM-write tokens here
+		// is mounted); it must remain safe regardless of where that persona
+		// directory is sourced. Strip SCM-write tokens here
 		// by construction so the invariant holds regardless of whether
 		// that path ever becomes reachable.
 		if isSCMWriteTokenKey(k) {
@@ -2048,8 +2040,8 @@ func (p *Provisioner) VolumeHasFile(ctx context.Context, workspaceID, relPath st
 // available locally." The daemon wraps this message in a generic
 // SystemError type without exposing a typed sentinel, so we fall back
 // to substring match on the known messages emitted by moby. Used by
-// Start() to rewrite opaque ContainerCreate failures into actionable
-// "run build-all.sh" hints. Issue #117.
+// Start() to rewrite opaque ContainerCreate failures into actionable registry
+// or local-image diagnostics. Issue #117.
 func isImageNotFoundErr(err error) bool {
 	if err == nil {
 		return false
@@ -2110,15 +2102,15 @@ func imageTagIsMoving(image string) bool {
 
 // runtimeTagFromImage extracts the runtime name from a workspace-template
 // image reference for use in user-facing error hints. Handles both the
-// legacy local tag (`workspace-template:<runtime>`) and the current GHCR
-// form (`ghcr.io/molecule-ai/workspace-template-<runtime>:<tag>`). Falls
-// back to the full image string if the shape is unrecognised.
+// legacy local tag (`workspace-template:<runtime>`) and the current registry
+// form (`<registry>/workspace-template-<runtime>:<tag>`). Falls back to the
+// full image string if the shape is unrecognised.
 func runtimeTagFromImage(image string) string {
 	const legacyPrefix = "workspace-template:"
 	if strings.HasPrefix(image, legacyPrefix) {
 		return image[len(legacyPrefix):]
 	}
-	// GHCR form: strip everything before and including "workspace-template-",
+	// Registry form: strip everything before and including "workspace-template-",
 	// then drop the :<tag> suffix.
 	const ghcrInfix = "workspace-template-"
 	if i := strings.Index(image, ghcrInfix); i >= 0 {
@@ -2229,8 +2221,8 @@ func clip(s string, n int) string {
 // `ImagePull` + `ContainerCreate` on the workspace-template-* images.
 //
 // Empty result means "use the daemon default" — the common case on
-// linux/amd64 hosts (CI, SaaS EC2, Linux dev machines). On Apple Silicon
-// the GHCR workspace-template-* images ship a single linux/amd64
+// linux/amd64 hosts (CI, hosted Linux, Linux dev machines). On Apple Silicon
+// the published workspace-template-* images ship a single linux/amd64
 // manifest today, so the daemon's native linux/arm64/v8 request misses
 // with "no matching manifest". Forcing linux/amd64 pulls the amd64
 // manifest and lets Docker Desktop run it under QEMU emulation. Slow

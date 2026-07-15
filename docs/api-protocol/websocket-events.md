@@ -1,6 +1,24 @@
 # WebSocket Events
 
-The canvas subscribes to the platform's WebSocket at `/ws` and receives real-time structure events as JSON messages.
+The canvas subscribes to the platform's WebSocket at `/ws` and receives real-time lifecycle and activity events as JSON messages. The event taxonomy is defined in `workspace-server/internal/events/types.go`.
+
+## Authentication
+
+Authentication completes before the HTTP connection upgrades:
+
+- Canvas clients use a verified control-plane tenant-member session cookie, an
+  org-scoped token, or `ADMIN_TOKEN`. Because browser WebSocket constructors
+  cannot set `Authorization`, Canvas offers both
+  `molecule-auth.<hex-encoded-token>` and the non-secret `molecule-ws` sentinel
+  in `Sec-WebSocket-Protocol`. The server uses the credential-bearing offer for
+  authentication, then selects and echoes only `molecule-ws`, so browser
+  negotiation succeeds without reflecting the secret.
+- Workspace agents send `X-Workspace-ID` plus
+  `Authorization: Bearer <workspace-token>`. The bearer must belong to that
+  exact workspace.
+
+Anonymous connections are rejected. A workspace bearer cannot subscribe to the
+global Canvas stream.
 
 ## Message Format
 
@@ -109,7 +127,7 @@ User deleted the workspace. Node removed from canvas.
   "workspace_id": "ws-abc-123",
   "timestamp": "2026-03-30T12:10:00Z",
   "payload": {
-    "forwarded_to": null
+    "cascade_deleted": 0
   }
 }
 ```
@@ -150,59 +168,12 @@ Workspace republished its Agent Card (new skill added, description changed, capa
 }
 ```
 
-### WORKSPACE_EXPANDED
-
-Workspace expanded into a team of sub-workspaces.
-
-```json
-{
-  "event": "WORKSPACE_EXPANDED",
-  "workspace_id": "ws-abc-123",
-  "timestamp": "2026-03-30T12:00:00Z",
-  "payload": {
-    "sub_workspace_ids": [
-      "ws-frontend-001",
-      "ws-backend-001",
-      "ws-qa-001"
-    ]
-  }
-}
-```
-
-### WORKSPACE_COLLAPSED
-
-Team collapsed back to a single agent. Sub-workspaces are stopped and removed.
-
-```json
-{
-  "event": "WORKSPACE_COLLAPSED",
-  "workspace_id": "ws-abc-123",
-  "timestamp": "2026-03-30T12:00:00Z",
-  "payload": {
-    "removed_sub_workspace_ids": [
-      "ws-frontend-001",
-      "ws-backend-001",
-      "ws-qa-001"
-    ]
-  }
-}
-```
-
-### WORKSPACE_MOVED
-
-Workspace moved to a new parent (dragged into a different team on canvas).
-
-```json
-{
-  "event": "WORKSPACE_MOVED",
-  "workspace_id": "ws-abc-123",
-  "timestamp": "2026-03-30T12:00:00Z",
-  "payload": {
-    "old_parent_id": "ws-team-a",
-    "new_parent_id": "ws-team-b"
-  }
-}
-```
+Hierarchy changes do not have dedicated `WORKSPACE_EXPANDED`,
+`WORKSPACE_COLLAPSED`, or `WORKSPACE_MOVED` events. A team is the current set
+of workspace rows linked by `parent_id`; clients create or reparent those rows
+through the HTTP API and rehydrate current topology from `GET /workspaces`.
+The Canvas `collapsed` flag only hides or shows descendants and is persisted in
+`canvas_layouts` through `PATCH /workspaces/:id`.
 
 ### AGENT_ASSIGNED
 
@@ -300,18 +271,26 @@ Both canvas clients and workspace agents subscribe to the same WebSocket endpoin
 
 | Subscriber | Identifies via | Receives | Purpose |
 |------------|---------------|----------|---------|
-| Canvas client | No header (unrestricted) | All events | UI updates |
-| Workspace agent | `X-Workspace-ID` header | Filtered — only events about reachable peers | System prompt rebuilds |
+| Canvas client | Verified control-plane session cookie, org bearer token, or `ADMIN_TOKEN`; no `X-Workspace-ID` | All tenant events | UI updates |
+| Workspace agent | `X-Workspace-ID` plus a bearer token issued to that workspace | Filtered — only events about reachable peers | System prompt rebuilds |
 
 The platform filters server-side using `CanCommunicate()` — each workspace only receives events about workspaces it can talk to.
+
+The tenant-wide Canvas feed is an admin surface. A same-origin or allowlisted
+`Origin` header is not authentication, and an unauthenticated upgrade is
+rejected. Same-origin browser clients do not need a custom header: the browser
+includes the Canvas session cookie in the WebSocket handshake, and the tenant
+platform verifies that session with the control plane before upgrading.
+Per-workspace tokens cannot open the tenant-wide feed.
 
 ## Event Flow
 
 ```
-Structure change occurs
+Event-producing operation occurs
       |
       v
-Platform writes event to structure_events (Postgres)
+Platform records the event in structure_events, or uses BroadcastOnly
+for event families whose authoritative data lives elsewhere
       |
       v
 Platform publishes to Redis pub/sub (events:broadcast)

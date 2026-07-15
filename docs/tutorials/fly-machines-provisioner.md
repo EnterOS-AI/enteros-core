@@ -1,5 +1,11 @@
 # Provisioning Workspaces on Fly Machines (CONTAINER_BACKEND=flyio)
 
+> **Historical tutorial (April 2026).** This GHCR/Fly provisioner path predates
+> the off-AWS rebuild and is not a current deployment runbook. See
+> [Current Technical Reference](../architecture/molecule-technical-doc.md) and
+> [Workspace Placement](../architecture/workspace-placement.md). The commands
+> below are preserved only as a record of the former implementation.
+
 Molecule AI can provision agent workspaces on [Fly Machines](https://fly.io/docs/machines/) instead of local Docker containers. When `CONTAINER_BACKEND=flyio` is set, every `POST /workspaces` creates a Fly Machine and boots the workspace agent inside it — with tier-based resource limits, env-var injection, and A2A registration handled automatically. The platform manages the workspace (lifecycle, auth, routing); Fly manages the machine it runs on.
 
 > **Scope note (PR #501):** Workspace images must already be published to GHCR before provisioning. The `delete` and `restart` platform endpoints are not yet fully wired to the Fly provisioner — use `flyctl machine stop/destroy` for teardown until a follow-up PR lands.

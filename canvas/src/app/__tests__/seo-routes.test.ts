@@ -46,14 +46,14 @@ describe("robots.ts", () => {
 });
 
 describe("sitemap.ts", () => {
-  it("includes apex, pricing, and the live blog post", () => {
+  it("includes current public pages and excludes the retired blog post", () => {
     const entries = sitemap();
     const urls = entries.map((e) => e.url);
     expect(urls.some((u) => u.endsWith("/"))).toBe(true);
     expect(urls.some((u) => u.endsWith("/pricing"))).toBe(true);
     expect(
       urls.some((u) => u.includes("/blog/2026-04-20-chrome-devtools-mcp")),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("does NOT include authed/app routes", () => {

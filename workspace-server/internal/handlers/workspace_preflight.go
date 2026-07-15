@@ -11,7 +11,8 @@ import (
 // requiredEnvSchema is the subset of config.yaml we read to decide which env
 // vars must be present before a container launch. It maps the YAML path
 // `runtime_config.required_env: [...]` which is the same shape the workspace
-// adapter's preflight reads inside the container (workspace/preflight.py).
+// adapter's preflight reads inside the container
+// (molecule-ai-workspace-runtime/molecule_runtime/preflight.py).
 //
 // Mirroring the check server-side lets us fail fast with a readable error
 // instead of letting the container crash-loop and the workspace sit in

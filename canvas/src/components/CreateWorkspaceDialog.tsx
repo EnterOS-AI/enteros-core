@@ -62,7 +62,7 @@ const DEFAULT_RUNTIME = "hermes";
 // instance-type allowlists are SSOT from GET /compute/metadata; labels are
 // pure UI chrome and live next to the only consumer (#2489).
 const PROVIDER_LABELS: Record<string, string> = {
-  aws: "AWS (default)",
+  aws: "AWS",
   gcp: "GCP",
   hetzner: "Hetzner",
 };
@@ -96,8 +96,10 @@ export function CreateWorkspaceButton() {
   const [displayRootGB, setDisplayRootGB] = useState(String(DEFAULT_DISPLAY_ROOT_GB));
   const [displayResolution, setDisplayResolution] = useState("1920x1080");
   // Cloud/compute backend for the workspace box (multi-provider, per-workspace).
-  // "aws" default; "gcp"/"hetzner" route to the matching CP WorkspaceProvisioner
-  // (a non-tenant-cloud box is reached over a per-workspace tunnel, runtime#95).
+  // The offline fallback starts with AWS; a successful metadata fetch selects
+  // the first provider returned by the deployment. GCP/Hetzner route to the
+  // matching CP WorkspaceProvisioner (a non-tenant-cloud box is reached over a
+  // per-workspace tunnel, runtime#95).
   const [cloudProvider, setCloudProvider] = useState("aws");
   // SSOT provider + instance-type metadata from GET /compute/metadata. Starts from
   // the offline fallback and is replaced once the fetch resolves; on fetch error we
@@ -135,10 +137,10 @@ export function CreateWorkspaceButton() {
   });
   const [llmSecret, setLLMSecret] = useState("");
 
-  // Tier picker: on SaaS every workspace gets its own EC2 VM (Full Access
-  // by construction), so we hide the T1/T2/T3 Docker-sandbox tiers and
-  // lock to T4 — the full-host access tier. The EC2 size is controlled by
-  // the compute profile below. On self-hosted we still offer T1/T2/T3
+  // Tier picker: hosted workspaces run on dedicated full-access hosts, so
+  // we hide the T1/T2/T3 Docker-sandbox tiers and lock to T4. The
+  // provider-specific host size is controlled by the compute profile below.
+  // On self-hosted we still offer T1/T2/T3
   // because the Docker-
   // sandbox distinction is a real choice there; T4 is available too for
   // operators who want the full-host tier.
@@ -162,8 +164,8 @@ export function CreateWorkspaceButton() {
   // read_write workspace mount + Docker daemon access most templates
   // expect to do real work. T1 sandboxed and T2 standard are kept as
   // explicit opt-ins for low-trust agents. SaaS still defaults to T4
-  // because every SaaS workspace gets its own EC2 (sibling VMs, no
-  // shared blast radius — see isSaaSTenant() / tier picker hide logic).
+  // because hosted workspaces have dedicated hosts rather than a shared
+  // Docker sandbox (see isSaaSTenant() / tier picker hide logic).
   const defaultTier = isSaaS ? 4 : 3;
   const [tier, setTier] = useState(defaultTier);
 

@@ -32,7 +32,8 @@ import (
 // last alive" (correct behavior; the workspace will get the same
 // timeouts when it comes back).
 //
-// See workspace/adapter_base.py:idle_timeout_override and project
+// See molecule-ai-workspace-runtime/molecule_runtime/adapter_base.py:
+// idle_timeout_override and project
 // memory `project_runtime_native_pluggable.md`.
 var runtimeOverrides runtimeOverrideCache
 
@@ -113,7 +114,8 @@ func (c *runtimeOverrideCache) IdleTimeout(workspaceID string) (time.Duration, b
 //
 // The wire-name keys (heartbeat, scheduler, session, status_mgmt, retry,
 // activity_decoration, channel_dispatch) match RuntimeCapabilities.to_dict()
-// in workspace/adapter_base.py — keep in sync there.
+// in molecule-ai-workspace-runtime/molecule_runtime/adapter_base.py — keep in
+// sync there.
 func (c *runtimeOverrideCache) SetCapabilities(workspaceID string, caps map[string]bool) {
 	if workspaceID == "" {
 		return

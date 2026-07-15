@@ -8,6 +8,11 @@ TIMEOUT="${A2A_TIMEOUT:-120}"  # seconds per A2A call (override via A2A_TIMEOUT 
 
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
+e2e_load_local_admin_token
+ADMIN_AUTH=()
+HUMAN_AUTH=()
+e2e_admin_auth_args ADMIN_AUTH
+e2e_human_auth_args HUMAN_AUTH || exit 2
 # molecule-core#1995 (#1994 follow-on): real-completion assertion helpers.
 # Adds a NEGATIVE error-as-text check on top of the shape checks below, so a
 # broken agent that returns its error AS a text part
@@ -56,6 +61,7 @@ a2a_send() {
   local ws_id="$1"
   local text="$2"
   curl -s --max-time "$TIMEOUT" -X POST "$BASE/workspaces/$ws_id/a2a" \
+    ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} \
     -H "Content-Type: application/json" \
     -d "{
       \"method\": \"message/send\",
@@ -72,7 +78,7 @@ echo "=== A2A End-to-End Tests (Free Model: google/gemini-2.5-flash) ==="
 echo ""
 
 # --- Setup: find or create workspaces ---
-ECHO_ID=$(curl -s "$BASE/workspaces" | python3 -c "
+ECHO_ID=$(curl -s "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} | python3 -c "
 import sys, json
 ws = json.load(sys.stdin)
 for w in ws:
@@ -81,7 +87,7 @@ for w in ws:
 else:
     print('')
 ")
-SEO_ID=$(curl -s "$BASE/workspaces" | python3 -c "
+SEO_ID=$(curl -s "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} | python3 -c "
 import sys, json
 ws = json.load(sys.stdin)
 for w in ws:
@@ -136,6 +142,7 @@ echo ""
 echo "--- Test 3: Auto JSON-RPC envelope wrapping ---"
 # Send bare method+params (no jsonrpc/id fields) — proxy should wrap it
 R=$(curl -s --max-time "$TIMEOUT" -X POST "$BASE/workspaces/$ECHO_ID/a2a" \
+  ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} \
   -H "Content-Type: application/json" \
   -d '{"method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"Bare request test"}]}}}')
 check "Bare request gets wrapped and works" '"result"' "$R"
@@ -146,6 +153,7 @@ echo ""
 # ========================================
 echo "--- Test 4: Full JSON-RPC 2.0 envelope ---"
 R=$(curl -s --max-time "$TIMEOUT" -X POST "$BASE/workspaces/$ECHO_ID/a2a" \
+  ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":"custom-id-123","method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"Full envelope test"}]}}}')
 check "Full envelope returns result" '"result"' "$R"
@@ -157,6 +165,7 @@ echo ""
 # ========================================
 echo "--- Test 5: Invalid method ---"
 R=$(curl -s --max-time 10 -X POST "$BASE/workspaces/$ECHO_ID/a2a" \
+  ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} \
   -H "Content-Type: application/json" \
   -d '{"method":"nonexistent/method","params":{}}')
 check "Invalid method returns JSON-RPC error" '"error"' "$R"
@@ -168,9 +177,10 @@ echo ""
 # ========================================
 echo "--- Test 6: Offline workspace ---"
 # Create a workspace but don't provision it
-R=$(curl -s -X POST "$BASE/workspaces" -H "Content-Type: application/json" -d '{"name":"Offline Test","tier":1,"runtime":"external","external":true}')
+R=$(curl -s -X POST "$BASE/workspaces" ${ADMIN_AUTH[@]+"${ADMIN_AUTH[@]}"} -H "Content-Type: application/json" -d '{"name":"Offline Test","tier":1,"runtime":"external","external":true}')
 OFFLINE_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 R=$(curl -s --max-time 10 -X POST "$BASE/workspaces/$OFFLINE_ID/a2a" \
+  ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} \
   -H "Content-Type: application/json" \
   -d '{"method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"test"}]}}}')
 check "Offline workspace returns error" '"error"' "$R"
@@ -183,6 +193,7 @@ echo ""
 # ========================================
 echo "--- Test 7: Nonexistent workspace ---"
 R=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -X POST "$BASE/workspaces/00000000-0000-0000-0000-000000000000/a2a" \
+  ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} \
   -H "Content-Type: application/json" \
   -d '{"method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"test"}]}}}')
 check "Nonexistent workspace returns 404" "404" "$R"

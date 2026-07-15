@@ -68,7 +68,7 @@ export const DEFAULT_RUNTIME_PROFILE: Required<
  * is wrong for this runtime. Unexplained numbers rot.
  *
  * Empty today — `hermes` previously lived here at 720_000ms, but
- * Molecule-AI/molecule-ai-workspace-template-hermes now declares the
+ * molecule-ai/molecule-ai-workspace-template-hermes now declares the
  * value in its config.yaml manifest, so the value flows through the
  * server (workspace API → WorkspaceData.provision_timeout_ms → resolver
  * overrides) instead of being canvas-hardcoded. New runtimes that need

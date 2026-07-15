@@ -264,23 +264,17 @@ CROSS_CODE=$(printf '%s' "$CROSS_RESP" | tail -n1)
 check_eq "B's URL with A's file_id returns 404" "404" "$CROSS_CODE"
 
 # B's bearer hitting A's URL → 401 (wsAuth pins bearer to :id). This is the
-# strictest cross-workspace check: a presented-but-wrong bearer is rejected
-# in EVERY platform posture (dev-mode fail-open only triggers when no bearer
-# is presented at all — invalid tokens always 401).
+# strictest cross-workspace check: a presented-but-wrong bearer is rejected in
+# every platform posture.
 WRONG_BEARER=$(curl -s -w '\n%{http_code}' --max-time "$TIMEOUT" \
   -H "Authorization: Bearer $TOK_B" \
   "$BASE/workspaces/$WS_A/pending-uploads/$PROBE_FID/content")
 WRONG_CODE=$(printf '%s' "$WRONG_BEARER" | tail -n1)
 check_eq "B's bearer on A's URL returns 401" "401" "$WRONG_CODE"
 
-# NB: a fully bearerless request to /pending-uploads/:fid/content returns
-# 401 ONLY when the platform has MOLECULE_ENV != development (production /
-# staging). On local-dev with MOLECULE_ENV=development the wsauth middleware
-# fail-opens for bearerless requests so the canvas at :3000 can talk to the
-# platform at :8080 without per-call token plumbing — see middleware/
-# devmode.go. The strict bearerless-401 contract is covered by the wsauth
-# unit + middleware tests; we don't reassert it here because the result
-# depends on platform posture, not the poll-mode upload contract.
+# A fully bearerless request also returns 401 in every environment. The strict
+# bearerless contract is covered by the WorkspaceAuth unit/middleware tests;
+# this phase focuses on cross-workspace token binding.
 
 # ---------- Phase 9: invalid file_id rejected at the URL parser ----------
 echo ""

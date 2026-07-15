@@ -56,13 +56,12 @@ type blockedRange struct {
 	label string
 }
 
-// saasMode reports whether this tenant platform is running in SaaS cross-EC2
-// mode, where workspaces live on sibling EC2s in the same VPC and register
-// themselves by their RFC-1918 VPC-private IP (typically 172.31.x.x on AWS
-// default VPCs). In that shape, the SSRF hardening that blocks RFC-1918
-// addresses would reject every legitimate workspace registration — the
-// control plane provisioned these instances, so their intra-VPC URLs are
-// trusted by construction.
+// saasMode reports whether this tenant platform is managed by the Molecule
+// control plane. Managed workspaces can register with provider-private
+// RFC-1918 addresses; applying the public-address-only SSRF blocklist would
+// reject those legitimate registrations. The control plane provisions and
+// records these workspace endpoints, so the managed path validates them under
+// its separate trust boundary.
 //
 // Resolution order:
 //  1. MOLECULE_DEPLOY_MODE set — explicit operator flag is authoritative.

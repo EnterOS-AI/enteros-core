@@ -207,8 +207,8 @@ func loadWorkspaceEnv(orgBaseDir, filesDir string) map[string]string {
 
 // loadPersonaEnvFile merges per-role persona credentials into out. The file
 // lives at $MOLECULE_PERSONA_ROOT/<role>/env (default
-// /etc/molecule-bootstrap/personas) and is populated by the operator-host
-// bootstrap kit — one persona per dev-tree role, each carrying the role's
+// /etc/molecule-bootstrap/personas). A deployment may populate one directory
+// per dev-tree role, each carrying the role's
 // Gitea identity (GITEA_USER, GITEA_TOKEN, GITEA_TOKEN_SCOPES,
 // GITEA_USER_EMAIL, GITEA_SSH_KEY_PATH).
 //

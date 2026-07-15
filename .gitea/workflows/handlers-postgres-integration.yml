@@ -2,10 +2,12 @@ name: Handlers Postgres Integration
 
 # Ported from .github/workflows/handlers-postgres-integration.yml on 2026-05-11 per RFC
 # internal#219 §1 sweep. Differences from the GitHub version:
-#   - Dropped `workflow_dispatch.inputs` (Gitea 1.22.6 parser rejects them
-#     per feedback_gitea_workflow_dispatch_inputs_unsupported).
-#   - Dropped `merge_group:` (no Gitea merge queue).
-#   - Dropped `environment:` blocks (Gitea has no environments).
+#   - Kept flat `workflow_dispatch` (no `inputs`) under repository policy;
+#     dispatch callers pass parameters through the established env/var path.
+#   - Omitted GitHub's `merge_group:` trigger; this repository uses its
+#     serialized Gitea queue plus pull-request/push status gates.
+#   - Omitted `environment:` blocks; this repository's approval and secret
+#     gates do not depend on Actions environments.
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
 #   - `continue-on-error: true` on each job (RFC §1 contract).
@@ -27,8 +29,8 @@ name: Handlers Postgres Integration
 #
 # Why this workflow does NOT use `services: postgres:` (Class B fix)
 # ------------------------------------------------------------------
-# Our act_runner config has `container.network: host` (operator host
-# /opt/molecule/runners/config.yaml), which act_runner applies to BOTH
+# The self-hosted Docker runner uses `container.network: host`, which
+# act_runner applies to BOTH
 # the job container AND every service container. With host-net, two
 # concurrent runs of this workflow both try to bind 0.0.0.0:5432 — the
 # second postgres FATALs with `could not create any TCP/IP sockets:
@@ -49,13 +51,13 @@ name: Handlers Postgres Integration
 # UNIQUE name per run — `pg-handlers-${RUN_ID}-${RUN_ATTEMPT}` — and
 # read its bridge IP via `docker inspect`. A host-net job container
 # can reach a bridge-net container directly via the bridge IP (verified
-# manually on operator host 2026-05-08).
+# on the former runner fleet in May 2026 and preserved by current CI).
 #
 # Trade-offs vs. the original `services:` shape:
 #   + No host-port collision; N parallel runs share the bridge cleanly
 #   + `if: always()` cleanup runs even on test-step failure
 #   - One more step in the workflow (+~3 lines)
-#   - Requires `molecule-core-net` to exist on the operator host
+#   - Requires `molecule-core-net` to exist on the selected runner host
 #     (it does; declared in docker-compose.yml + docker-compose.infra.yml)
 #
 # Class B Hongming-owned CICD red sweep, 2026-05-08.
@@ -78,7 +80,7 @@ jobs:
   detect-changes:
     name: detect-changes
     # mc#1529 §1: pin to `docker-host` so the integration job runs on the
-    # operator-host runners (molecule-runner-*), which carry the
+    # self-hosted Docker runners, which carry the
     # `molecule-core-net` bridge network this workflow depends on. PC2
     # runners (hongming-pc-runner-*) also advertise ubuntu-latest but
     # don't have that network — the previous `runs-on: ubuntu-latest`
@@ -139,7 +141,7 @@ jobs:
   integration:
     name: Handlers Postgres Integration
     needs: detect-changes
-    # mc#1529 §1: must run on operator-host (where `molecule-core-net`
+    # mc#1529 §1: must run on the docker-host lane (where `molecule-core-net`
     # exists). See detect-changes for the full routing rationale.
     runs-on: docker-host
     # Real cost is ~30s-to-few-min (postgres cache + build + suites);
@@ -154,7 +156,7 @@ jobs:
       # bridge network. ${RUN_ID}-${RUN_ATTEMPT} is unique even across
       # workflow_dispatch reruns of the same run_id.
       PG_NAME: pg-handlers-${{ github.run_id }}-${{ github.run_attempt }}
-      # Bridge network already exists on the operator host (declared
+      # Bridge network already exists on the selected runner host (declared
       # in docker-compose.yml + docker-compose.infra.yml).
       PG_NETWORK: molecule-core-net
     defaults:
@@ -189,11 +191,11 @@ jobs:
         name: Start sibling Postgres on bridge network
         working-directory: .
         run: |
-          # Sanity: the bridge network must exist on the operator host.
+          # Sanity: the bridge network must exist on the selected runner host.
           # Hard-fail loud if it doesn't — easier to spot than a silent
           # auto-create that diverges from the rest of the stack.
           if ! docker network inspect "${PG_NETWORK}" >/dev/null 2>&1; then
-            echo "::error::Bridge network '${PG_NETWORK}' missing on operator host. Re-run docker-compose.infra.yml or check ops handbook."
+            echo "::error::Bridge network '${PG_NETWORK}' missing on docker-host runner. Check the runner bootstrap and incident handbook."
             exit 1
           fi
 

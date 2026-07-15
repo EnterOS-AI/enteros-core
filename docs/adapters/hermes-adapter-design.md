@@ -1,5 +1,9 @@
 # Hermes Adapter — Shell Design Spec
 
+> **Historical pre-implementation design.** The adapter layout and image model
+> below were superseded by the current standalone workspace runtime and Hermes
+> template repositories. Do not use this document as current build guidance.
+
 **Perspective:** DevOps Engineer + Backend Engineer  
 **Status:** Draft — pre-implementation  
 **Hermes source:** `NousResearch/hermes-agent` (~61k ⭐)  

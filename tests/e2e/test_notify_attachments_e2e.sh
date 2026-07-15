@@ -29,9 +29,9 @@ FAIL=0
 WSID=""
 
 # GET /workspaces (list) and POST /workspaces (create) are AdminAuth-gated
-# (router.go:165-166). The e2e-api CI job sets ADMIN_TOKEN on the platform
-# (fail-open OFF) and exports MOLECULE_ADMIN_TOKEN here, so these calls need the
-# admin bearer. Guarded if-set so a fail-open dev platform still works.
+# (router.go). The e2e-api CI job sets ADMIN_TOKEN on the platform and exports
+# MOLECULE_ADMIN_TOKEN here, so these calls send the matching admin bearer.
+e2e_require_admin_token
 ADMIN_AUTH=()
 e2e_admin_auth_args ADMIN_AUTH
 

@@ -46,6 +46,8 @@
  */
 
 import { test, expect } from "@playwright/test";
+import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
+import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -256,10 +258,14 @@ test.describe("staging desktop take-control — reconnect + lease renewal (core#
   }
 
   test.beforeEach(async ({ context }) => {
-    const { tenantToken, orgID } = resolveTenant();
+    const { tenantURL, tenantToken, orgID } = resolveTenant();
     await context.setExtraHTTPHeaders({
       Authorization: `Bearer ${tenantToken}`,
       ...(orgID ? { "X-Molecule-Org-Id": orgID } : {}),
+    });
+    await installStagingWebSocketAuth(context, {
+      token: tenantToken,
+      tenantURL,
     });
   });
 
@@ -298,7 +304,9 @@ test.describe("staging desktop take-control — reconnect + lease renewal (core#
     expect(firstToken.length, "first token should be non-empty").toBeGreaterThan(0);
 
     // Anchor Origin to the tenant so the same-origin-canvas WS upgrade is accepted.
-    await page.goto(tenantURL, { waitUntil: "domcontentloaded" });
+    await gotoWithNetworkChangeRetry(page, tenantURL, {
+      waitUntil: "domcontentloaded",
+    });
 
     // 2. Establish the live WS on the FIRST token — proves the session is real.
     const initial = await openDisplayWs(page, firstUrl);

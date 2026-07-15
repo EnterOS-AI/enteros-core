@@ -12,8 +12,8 @@
  *
  * Required env:
  *   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
- *   MOLECULE_ADMIN_TOKEN   CP admin bearer (Railway staging
- *                          CP_ADMIN_API_TOKEN). Drives provision +
+ *   MOLECULE_ADMIN_TOKEN   CP admin bearer sourced from Infisical staging
+ *                          /shared/controlplane-admin. Drives provision +
  *                          tenant-token retrieval + teardown via a
  *                          single credential.
  *   STAGING_TENANT_DOMAIN  default: staging.moleculesai.app — the
@@ -30,9 +30,8 @@ import { join } from "path";
 const CP_URL = process.env.MOLECULE_CP_URL || "https://staging-api.moleculesai.app";
 const ADMIN_TOKEN = process.env.MOLECULE_ADMIN_TOKEN;
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
-// Tenant DNS zone for staging. CP provisioner registers DNS as
-// `<slug>.staging.moleculesai.app` (see internal/provisioner/ec2.go's
-// EC2 provisioner: DNS log line). The previous default of plain
+// Tenant DNS zone for staging. The configured CP provider registers DNS as
+// `<slug>.staging.moleculesai.app`. The previous default of plain
 // `moleculesai.app` matched prod tenant naming and silently broke
 // every staging E2E at the TLS readiness step — DNS literally didn't
 // resolve, fetch threw NXDOMAIN, waitFor saw null on every poll, and
@@ -139,7 +138,7 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   }
   if (!ADMIN_TOKEN) {
     throw new Error(
-      "MOLECULE_ADMIN_TOKEN required (Railway staging CP_ADMIN_API_TOKEN)",
+      "MOLECULE_ADMIN_TOKEN required (Infisical staging /shared/controlplane-admin)",
     );
   }
 
@@ -455,7 +454,7 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
       throw new Error(
         `STAGING_DISPLAY_SLUG=${displaySlug} not found in /cp/admin/orgs — the ` +
           `standing desktop org for the take-control gate does not exist. Provision ` +
-          `it (one always-on desktop EC2) or unset STAGING_DISPLAY_SLUG/` +
+          `it as a standing desktop-capable tenant or unset STAGING_DISPLAY_SLUG/` +
           `STAGING_DISPLAY_WORKSPACE_ID to skip the gate.`,
       );
     }

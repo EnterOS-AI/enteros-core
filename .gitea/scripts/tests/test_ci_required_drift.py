@@ -281,7 +281,7 @@ def test_detect_drift_no_f1_when_needs_empty_even_with_jobs():
 # F4 — cross-workflow required-context emitter existence
 # (closes the `CI / all-required` name-vs-coverage hole: the sentinel is
 #  fail-closed over CI's own jobs but CANNOT cover sibling required
-#  workflows — Gitea has no cross-workflow `needs:` — so F4 guarantees each
+#  workflows in this repository's topology, so F4 guarantees each
 #  BP-required context still has a live emitting workflow.)
 # ---------------------------------------------------------------------------
 

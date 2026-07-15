@@ -2,8 +2,8 @@
  * Tenant slug derivation for SaaS-mode canvas.
  *
  * When canvas is served at <slug>.moleculesai.app the org slug comes from
- * the browser's hostname. When served anywhere else (localhost, Vercel
- * preview URL, direct vercel.app) we fall back to a configured slug
+ * the browser's hostname. When served anywhere else (localhost, a preview
+ * host, or another self-hosted domain) we fall back to a configured slug
  * (NEXT_PUBLIC_DEFAULT_ORG_SLUG) or an empty string — API calls without
  * a slug hit the control plane's non-tenant routes.
  */
@@ -101,7 +101,7 @@ export function getTenantSlug(): string {
  * SaaS tenant (served at <slug>.moleculesai.app). Use for client-side
  * UX branches that should behave differently on SaaS vs self-hosted —
  * e.g. the workspace tier picker hides T1/T2/T3 sandbox tiers because
- * every SaaS workspace gets its own EC2 VM (inherently T4 Full Access).
+ * hosted workspaces run on dedicated full-access workspace hosts (T4).
  *
  * SSR-safe: returns false on the server to avoid hydration drift; call
  * sites should tolerate a flip from false→true on first client render.

@@ -359,8 +359,8 @@ jobs:
 
       # Tighten the loop: deterministically kick the matching redeploy AFTER the
       # fresh image exists. redeploy-tenants-on-* also self-trigger on this same
-      # push, but on Gitea 1.22.6 (no workflow_run) that sibling run can start
-      # BEFORE this build finishes and pull the prior tag; this dispatch
+      # push, and that independent sibling run can start BEFORE this build
+      # finishes and pull the prior tag; this explicit dispatch
       # guarantees at least one redeploy runs against the just-published image.
       # Best-effort + non-fatal: if it fails, the sibling push-trigger still
       # covers the deploy (belt-and-suspenders, eventual consistency).

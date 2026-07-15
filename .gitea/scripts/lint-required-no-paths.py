@@ -51,8 +51,8 @@ merge gate:
 
   - If the PR's diff doesn't match the `paths:` glob, the workflow
     never fires.
-  - Gitea (1.22.6) reports the required context as `pending` (never as
-    `skipped == success`), so the PR cannot merge.
+  - This repository's protection gate keeps the missing required context
+    `pending` (never `skipped == success`), so the PR cannot merge.
   - For a docs-only PR against `paths: ['**.go']`, the PR is
     blocked forever — no human action can produce a green.
 
@@ -72,7 +72,7 @@ Sources of truth:
   - `branch_protections/<branch>` `status_check_contexts` (the merge gate)
   - `.gitea/workflows/*.yml` `name:` + `on:` (the workflow set)
 
-Context-format note (Gitea 1.22.6):
+Repository context-format note:
   Status-check contexts are formatted `{workflow_name} / {job_name_or_key} ({event})`.
   We parse the workflow_name prefix and walk `.gitea/workflows/*.yml` for
   a file whose `name:` attr matches. (The filename is NOT the source of
@@ -106,9 +106,9 @@ Exit codes:
       is a HARD gate on a protected context — it MUST NOT green when it
       cannot verify.
 
-Auth note: `GET /repos/.../branch_protections/{branch}` requires
-repo-admin role in Gitea 1.22.6. The workflow-default `GITHUB_TOKEN`
-is non-admin; we re-use `DRIFT_BOT_TOKEN` (same persona that powers
+Auth note: the token used for `GET /repos/.../branch_protections/{branch}`
+needs repo-admin access. The workflow-default `GITHUB_TOKEN` is non-admin;
+we re-use `DRIFT_BOT_TOKEN` (same persona that powers
 ci-required-drift.yml). A 401/403 from a missing-scope token is an
 AUTH FAILURE that FAILS CLOSED (exit 4) — fix the token, not the
 lint. Only an authenticated 404 (genuinely-absent protection) is a

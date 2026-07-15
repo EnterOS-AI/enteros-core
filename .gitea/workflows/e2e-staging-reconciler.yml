@@ -18,9 +18,10 @@ name: E2E Staging Reconciler (heals killed workspace instance)
 # tests/e2e/test_reconciler_heals_terminated_instance.sh for the assertion
 # contract + timeouts.
 #
-# Modeled on e2e-staging-saas.yml. Same secrets + same Gitea-port caveats:
-#   - Dropped workflow_dispatch.inputs (Gitea 1.22.6 parser rejects them).
-#   - Dropped merge_group / environment (no Gitea equivalent).
+# Modeled on e2e-staging-saas.yml. Same secrets + same repository policy:
+#   - Kept flat workflow_dispatch (no inputs); callers use env/vars.
+#   - Omitted GitHub merge_group and environment coupling; this repository
+#     uses its serialized Gitea queue and explicit approval/secret gates.
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
 #
@@ -57,9 +58,9 @@ on:
 # Per-SHA grouping (mirrors e2e-api.yml). Each run provisions its OWN isolated
 # tenant (`e2e-rec-<date>-<run_id>`), so overlapping runs never corrupt each
 # other — the finite staging org-creation quota is a throttling cost only. A
-# STATIC group would make a newer main push cancel the older commit's run, and
-# on Gitea 1.22.6 a superseded same-group run is CANCELLED (not queued) even
-# with cancel-in-progress:false (status-reaper.yml 69-72), stamping a cancel-red
+# STATIC group would make a newer main push cancel the older commit's run. A
+# legacy runner incident showed superseded same-group runs could be CANCELLED
+# (not queued) even with cancel-in-progress:false, stamping a cancel-red
 # that wedges the `[*]` queue. cancel-in-progress:false so a cancelled run never
 # aborts a teardown mid-flight (EC2/container leak guard).
 concurrency:
@@ -100,8 +101,8 @@ jobs:
     env:
       MOLECULE_CP_URL: https://staging-api.moleculesai.app
       # Single admin-bearer secret drives provision + tenant-token retrieval +
-      # teardown (= Railway staging CP_ADMIN_API_TOKEN). Same secret name the
-      # saas workflow canonicalised to under internal#322.
+      # teardown. The bearer is sourced from Infisical staging
+      # /shared/controlplane-admin, matching the other live-staging workflows.
       # MOLECULE_ADMIN_TOKEN now arrives via $GITHUB_ENV from the "Fetch platform
       # model+runtime from KMS SSOT" step below (wave-B staging consumers
       # migration extends that same fetch). It is sourced from Infisical
@@ -244,7 +245,7 @@ jobs:
       - name: Verify required secrets + kill capability present
         run: |
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
           fi
           if [ "${E2E_PROVIDER:-molecules-server}" = "aws" ]; then

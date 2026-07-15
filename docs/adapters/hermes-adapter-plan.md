@@ -1,5 +1,9 @@
 # Hermes Adapter — Implementation Plan
 
+> **Historical implementation plan.** The proposed in-core adapter, fallback
+> image, and PR sequence below were superseded by the current workspace runtime
+> package and Hermes template repository. Retained for provenance only.
+
 **Author:** Dev Lead  
 **Date:** 2026-04-13  
 **Branch convention:** `feat/hermes-adapter-<step>` for each PR below  
