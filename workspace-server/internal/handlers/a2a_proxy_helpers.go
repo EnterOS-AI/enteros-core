@@ -812,9 +812,9 @@ func (h *WorkspaceHandler) logA2ASuccess(ctx context.Context, workspaceID, calle
 	})
 
 	// Broadcast A2A_RESPONSE for the CANVAS (so the reply reaches the frontend
-	// over WS, not just inline) — both the anonymous canvas (callerID == "")
-	// AND the authenticated canvas user (isCanvasUser, non-empty callerID via
-	// X-Workspace-ID + validateCallerToken). core#2751: the cap-and-queue path
+	// over WS, not just inline) — both the local same-origin canvas
+	// (callerID == "") and a verified human caller (isCanvasUser; an optional
+	// claimed callerID may be present). core#2751: the cap-and-queue path
 	// returns {queued} for canvas users and depends on THIS broadcast to
 	// deliver the reply. Safe on the synchronous path too — the canvas already
 	// receives both the inline HTTP reply and this WS event, and

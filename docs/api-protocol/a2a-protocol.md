@@ -1,10 +1,16 @@
 # A2A Protocol (Inter-Workspace Communication)
 
-Workspaces talk to each other **directly** via A2A (Agent-to-Agent protocol) — the platform is not in the message path.
+Molecule supports two A2A (Agent-to-Agent protocol) transports: runtimes can
+call a discovered peer **directly**, or callers can use the platform's
+authenticated A2A proxy.
 
 ## How It Works
 
-Every workspace is an A2A server. The platform is an A2A client when it needs to communicate with workspaces. Workspaces communicate with each other directly — the platform only handles discovery.
+Every workspace is an A2A server. For direct peer transport, the platform
+authorizes discovery and returns a reachable URL, then leaves the message path.
+For Canvas, external inbound, queue fallback, and server-side delegation, the
+platform proxy authenticates, authorizes, forwards the request, and relays the
+response.
 
 ```
 Business Core (A2A client)  ->  Developer PM (A2A server)
@@ -16,16 +22,20 @@ Business Core (A2A client)  ->  Developer PM (A2A server)
 
 How Business Core finds Developer PM's URL:
 
-1. Business Core asks platform: `GET /registry/discover/developer-pm-id` with `X-Workspace-ID` header
-2. Platform checks `CanCommunicate()` for the caller/target pair
-3. Platform resolves the URL:
-   - **Workspace caller** (has `X-Workspace-ID`): returns Docker-internal URL from `ws:{id}:internal_url` Redis key — containers can reach each other by hostname on the Docker network
-   - **Canvas/external** (no header): returns host-mapped URL from `ws:{id}:url` Redis key — the ephemeral `127.0.0.1:PORT` bound by the provisioner
-4. If cache miss, platform reads from Postgres, refreshes cache
+1. Business Core asks the platform: `GET /registry/discover/developer-pm-id`
+   with its required `X-Workspace-ID` claim and its bearer when token-enrolled.
+2. The platform validates the discovery credential and checks
+   `CanCommunicate()` for the caller/target pair.
+3. The platform returns the URL appropriate to the target and caller runtime:
+   an external target's registered URL, or a Docker-internal URL for a local
+   workspace target.
+4. On a cache miss, the platform reads from Postgres and refreshes the cache.
 5. Business Core sends A2A JSON-RPC message **directly** to Developer PM
 6. Developer PM processes the task and responds
 
-The platform is **only** involved in URL resolution. The actual task messages go workspace-to-workspace.
+For this direct transport, the platform is involved only in authenticated URL
+resolution. The separate proxy transport remains in the request and response
+path as described below.
 
 ## Message Format
 
@@ -63,15 +73,17 @@ On-demand fits naturally with how agents work — an agent only needs to know ab
 
 ## Authentication Between Workspaces
 
-**Direct peer transport:** The platform validates `CanCommunicate()` when
-workspace A calls `GET /registry/discover/:id` (using `X-Workspace-ID`). Once A
-has B's URL, a direct request to B's agent server does not pass through the
-platform's HTTP A2A authenticator.
+**Direct peer transport:** The platform validates the discovery caller and
+`CanCommunicate()` when workspace A calls `GET /registry/discover/:id`. That
+route requires `X-Workspace-ID`; an enrolled workspace also presents its own
+bearer. Once A has B's URL, a direct request to B's agent server does not pass
+through the platform's HTTP A2A authenticator.
 
-This is acceptable for MVP because:
-- All workspaces are provisioned by the same platform on trusted infrastructure
-- Docker network isolation (`molecule-core-net`) limits who can reach workspace endpoints
-- The tool is self-hosted — the operator controls the network
+Direct transport therefore relies on the target network's trust boundary after
+discovery. It is appropriate only when peer endpoints are isolated accordingly
+(for example, a self-hosted Docker network controlled by one operator). Use the
+platform proxy when the caller needs current source authentication and
+hierarchy enforcement on each request.
 
 **Known gap:** Once workspace A caches workspace B's URL, nothing stops A from calling B directly even after the hierarchy changes and A is no longer supposed to reach B. The cached URL remains valid until the container is restarted or the URL changes.
 

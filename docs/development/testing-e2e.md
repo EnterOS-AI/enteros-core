@@ -19,10 +19,16 @@ After Phase 30.1, the following routes require `Authorization: Bearer <token>` o
 - `POST /registry/heartbeat`
 - `POST /registry/update-card`
 
-After Phase 30.6, the following routes additionally require `X-Workspace-ID` on the caller side (bearer token validated, fail-open on DB hiccup):
+After Phase 30.6, discovery caller identity is endpoint-specific:
 
-- `GET /registry/discover/:id`
-- `GET /registry/:id/peers`
+- `GET /registry/discover/:id` requires `X-Workspace-ID`.
+- `GET /registry/:id/peers` uses the path `:id` as caller identity and does not
+  require `X-Workspace-ID`.
+
+For both routes, enrolled workspace callers present a matching bearer; admin,
+org, and verified control-plane session credentials are also accepted. Legacy
+workspaces with no live token remain bootstrap-compatible, but authentication
+datastore errors fail closed with `503`.
 
 The A2A send and queue-status routes are stricter:
 

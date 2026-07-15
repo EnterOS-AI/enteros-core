@@ -77,8 +77,8 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | POST | /registry/register | registry.go |
 | POST | /registry/heartbeat | registry.go — requires `Authorization: Bearer <token>` once a workspace has any live token on file (legacy workspaces grandfathered) |
 | POST | /registry/update-card | registry.go — requires `Authorization: Bearer <token>` once a workspace has any live token on file |
-| GET | /registry/discover/:id | discovery.go — requires `X-Workspace-ID` + bearer token on the caller side |
-| GET | /registry/:id/peers | discovery.go — requires `X-Workspace-ID` + bearer token on the caller side |
+| GET | /registry/discover/:id | discovery.go — requires `X-Workspace-ID`; token-enrolled workspace callers present their own bearer, while admin/org/session credentials are also accepted; auth datastore errors fail closed |
+| GET | /registry/:id/peers | discovery.go — path `:id` identifies the caller; same credential contract as discovery, with no `X-Workspace-ID` required |
 | POST | /registry/check-access | discovery.go |
 | GET | /plugins | plugins.go (list registry; supports `?runtime=` filter) |
 | GET | /plugins/sources | plugins.go (list registered install-source schemes) |

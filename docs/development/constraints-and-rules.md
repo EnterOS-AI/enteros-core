@@ -25,9 +25,16 @@ It contains **no business logic**. All business logic lives in `workspace-config
 
 API keys, passwords, and credentials are **never** serialized into bundle JSON. The provisioner injects them from the host environment when spinning up a workspace container.
 
-## 6. No Auth for MVP
+## 6. Authentication Is Route-Specific and Fail-Closed
 
-The platform API has no authentication. All endpoints are open. This is intentional — the project follows the n8n Community Edition model. Auth is added in a separate SaaS wrapper (`molecule-cloud`).
+The platform API is not open. Administrative routes use strict admin or
+verified control-plane-session authentication; workspace routes bind bearer
+tokens to workspace identity; org tokens authorize their configured org
+surface. The public A2A proxy derives a workspace caller from its bearer and
+accepts `X-Workspace-ID` only as a matching optional claim. Never add a
+fail-open authentication branch to these strict surfaces. Registry heartbeat
+and card update retain a separately documented legacy/bootstrap availability
+exception; do not copy that transition behavior to another route.
 
 ## 7. org_id Is Omitted from MVP Schema
 
@@ -45,9 +52,9 @@ See [Workspace Tiers](../architecture/workspace-tiers.md).
 ## 9. The Hierarchy IS the Topology
 
 There is no manual connection wiring. Communication is derived from the `parent_id` hierarchy:
-- Siblings can talk to each other
-- Parents can talk to children (and vice versa)
-- No skipping levels
+- Siblings sharing a non-root parent can talk to each other
+- Any ancestor can talk to any descendant (and vice versa)
+- Unrelated roots and disjoint subtrees cannot communicate
 
 The org chart IS the access control policy. See [Communication Rules](../api-protocol/communication-rules.md).
 

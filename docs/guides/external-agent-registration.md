@@ -258,14 +258,14 @@ curl http://localhost:8080/registry/discover/<your-workspace-id> \
   -H "Authorization: Bearer <auth_token>" \
   -H "X-Workspace-ID: <your-workspace-id>"
 
-# List peers (siblings + parent + children)
+# List direct peers (same-parent siblings + parent + children)
 curl http://localhost:8080/registry/<your-workspace-id>/peers \
-  -H "Authorization: Bearer <auth_token>" \
-  -H "X-Workspace-ID: <your-workspace-id>"
+  -H "Authorization: Bearer <auth_token>"
 ```
 
-The peers endpoint returns workspaces that your agent is allowed to
-communicate with, based on the hierarchy rules below.
+The peers endpoint returns the direct topology view. It does not recursively
+list distant ancestors or descendants even though those pairs are allowed by
+the hierarchy rules below.
 
 ---
 
@@ -277,11 +277,10 @@ The platform enforces strict hierarchy-based access control via
 | Relationship | Allowed |
 |---|---|
 | Same workspace (self-call) | Yes |
-| Siblings (same `parent_id`) | Yes |
-| Root-level siblings (both `parent_id` is NULL) | Yes |
-| Parent to child | Yes |
-| Child to parent | Yes |
-| Everything else | **Denied** |
+| Siblings sharing the same non-NULL `parent_id` | Yes |
+| Ancestor to descendant (any depth) | Yes |
+| Descendant to ancestor (any depth) | Yes |
+| Unrelated roots or disjoint subtrees | **Denied** |
 
 Verified human callers (control-plane session, tenant admin token, or org
 token) bypass the workspace hierarchy. System caller prefixes are accepted
@@ -748,7 +747,7 @@ Key differences from platform-managed workspaces:
 | `POST /registry/update-card` | `Authorization: Bearer <token>` | -- |
 | `POST /workspaces/:target/a2a` | `Authorization: Bearer <token>` | `X-Workspace-ID: <your-id>` -- if supplied, it must match the bearer owner |
 | `GET /registry/discover/:id` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` | -- |
-| `GET /registry/:id/peers` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` | -- |
+| `GET /registry/:id/peers` | `Authorization: Bearer <token>` | -- |
 
 ### Legacy / Bootstrap Behavior
 
@@ -800,11 +799,12 @@ delete the workspace and re-create it.
 
 ### Cannot send A2A messages (403 or communication denied)
 
-**Cause:** The `CanCommunicate` check failed -- your workspace is not a
-sibling, parent, or child of the target.
+**Cause:** The `CanCommunicate` check failed -- the target is neither a
+same-nonroot-parent sibling nor an ancestor/descendant of your workspace.
 
-**Fix:** Check the hierarchy. Use `GET /registry/<your-id>/peers` to see
-which workspaces you can reach. If needed, move your workspace under the
+**Fix:** Check the hierarchy. `GET /registry/<your-id>/peers` shows direct
+siblings, children, and the parent; inspect the parent chain for more distant
+allowed ancestors/descendants. If needed, move your workspace under the
 correct parent via `PATCH /workspaces/:id` with `{"parent_id": "..."}`.
 
 ### Agent card not showing on canvas

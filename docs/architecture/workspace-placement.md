@@ -4,7 +4,7 @@ Status: Accepted (implicit since 2026-05; formalized 2026-05-24)
 Owners: hongming (CTO), cui (CEO)
 Tracking: #1793
 
-This RFC formalizes the architecture decision that has been implicit in the system since the post-suspension rebuild: **each Molecule AI org is one isolated tenant on its own EC2 instance**, with every functional surface (workspace-server, memory plugin, Postgres, Redis, canvas) co-located on that instance. The platform's role is provisioning, billing, and the cross-tenant control plane — never the data path.
+This RFC formalizes the architecture decision that has been implicit in the system since the post-suspension rebuild: **each Molecule AI org is one isolated tenant on its own EC2 instance**, with every functional surface (workspace-server, memory plugin, Postgres, Redis, canvas) co-located on that instance. The cross-tenant control plane handles provisioning and billing and is never in the tenant data path; the tenant-local workspace-server can still provide the authenticated A2A proxy.
 
 The implementation already follows this pattern in every direction we look (provisioner, memory v2 cutover, tenant entrypoint, controlplane user-data, even the OSS deploy story). Writing it down so it stays that way.
 

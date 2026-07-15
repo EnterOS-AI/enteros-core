@@ -38,11 +38,15 @@ Neither Deep Agents nor LangGraph provide AI models — they call whatever provi
 The Agent-to-Agent protocol (Google, Linux Foundation) is the standard for agent-to-agent communication. Key properties:
 
 - Every workspace is an A2A server and can be an A2A client
-- Workspaces communicate **directly** without routing through the platform
+- Peer runtimes can communicate **directly** after authenticated discovery
+- Canvas, external inbound, queue fallback, and server-side delegation use the
+  authenticated platform proxy
 - Uses JSON-RPC 2.0 over HTTP — any language can implement it
 - Any A2A-compliant agent from any framework can plug in
 
-The platform only handles discovery (resolving workspace URLs) and registry (knowing what workspaces exist).
+For direct peer calls the platform handles discovery and registry, then leaves
+the message path. For proxied calls it authenticates the caller, enforces the
+current hierarchy, forwards the request, and relays the response.
 
 ## Docker
 

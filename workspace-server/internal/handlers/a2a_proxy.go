@@ -681,14 +681,11 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 			}
 		}
 
-		// #1953 cross-tenant isolation. CanCommunicate alone does NOT enforce
-		// org boundaries: its "root-level siblings — both have no parent" rule
-		// treats every tenant's org root as a sibling, so a caller that is an
-		// org root could resolve and route a2a to another tenant's org root
-		// (and resolveAgentURL accepts ANY workspace id with no org check).
-		// Gate on the SAME parent_id-chain org scoping the OFFSEC-015 broadcast
-		// fix uses: reject before resolveAgentURL when caller and target are in
-		// different orgs. Fail-closed — a DB error denies cross-org routing.
+		// #1953 cross-tenant isolation. CanCommunicate currently rejects unrelated
+		// roots and disjoint subtrees, but sameOrg remains a defense-in-depth tenant
+		// boundary independent of hierarchy policy. Gate before resolveAgentURL
+		// (which accepts any workspace ID) using the same parent-chain org scoping
+		// as the OFFSEC-015 broadcast fix. Fail closed on lookup errors.
 		ok, err := sameOrg(ctx, db.DB, callerID, workspaceID)
 		if err != nil {
 			log.Printf("ProxyA2A: org-scope check failed %s → %s: %v — denying", callerID, workspaceID, err)

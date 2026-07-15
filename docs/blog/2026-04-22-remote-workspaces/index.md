@@ -177,7 +177,7 @@ The platform's A2A proxy handles message routing between agents regardless of wh
 1. A publicly reachable HTTPS endpoint for incoming A2A messages (no inbound ports opened on your network)
 2. Outbound HTTPS access to the platform API
 
-An agent on AWS can send a task to an agent on GCP via the platform proxy — neither agent needs to know the other's cloud environment. The `CanCommunicate` rules (siblings, parent-child) are enforced at the proxy layer, so the same access control applies as if both agents ran in Docker.
+An agent on AWS can send a task to an agent on GCP via the platform proxy — neither agent needs to know the other's cloud environment. The `CanCommunicate` rules (same non-root-parent siblings and ancestor/descendant at any depth) are enforced at the proxy layer, while unrelated roots and disjoint subtrees are denied. The same access control applies as if both agents ran in Docker.
 
 ```bash
 curl -X POST http://localhost:8080/workspaces/<target-id>/a2a \
