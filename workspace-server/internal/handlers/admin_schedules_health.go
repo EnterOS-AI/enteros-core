@@ -7,8 +7,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cronspec"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 )
 
 // AdminSchedulesHealthHandler serves GET /admin/schedules/health — a cross-workspace
@@ -43,11 +43,11 @@ type adminScheduleHealth struct {
 // Exported as a package-level function so it can be unit-tested independently
 // from the handler.
 func computeStaleThreshold(cronExpr, tz string, now time.Time) (time.Duration, error) {
-	t1, err := scheduler.ComputeNextRun(cronExpr, tz, now)
+	t1, err := cronspec.ComputeNextRun(cronExpr, tz, now)
 	if err != nil {
 		return 0, err
 	}
-	t2, err := scheduler.ComputeNextRun(cronExpr, tz, t1)
+	t2, err := cronspec.ComputeNextRun(cronExpr, tz, t1)
 	if err != nil {
 		return 0, err
 	}
