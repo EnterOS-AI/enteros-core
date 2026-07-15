@@ -179,8 +179,8 @@ jobs:
       # so the emission does NOT fail closed when the Infisical control-plane
       # is unreachable from the runner. FALLBACK is the Infisical SSOT (prod
       # /shared/ci-status) over its public Cloudflare hostname, fetched WITH a
-      # CF-accepted User-Agent so CF-1010 cannot edge-ban the request. Same
-      # SSOT lib + contract as qa-review / security-review (#3422).
+      # exact curl/8.4.0 User-Agent so CF-1010 cannot edge-ban the request. The
+      # shared library keeps this resolution and emission contract testable.
       #
       # Trust boundary: this job runs on pull_request_target with a BASE-ref
       # checkout (security model above), so it is the trusted base context; the
@@ -220,7 +220,7 @@ jobs:
         run: |
           set -euo pipefail
           # SSOT emission (unit-tested: .gitea/scripts/tests/test_ci_status.sh):
-          # internal-host-preferred base (CF-UA-guarded), GET PR head sha, map the
+          # canonical-domain base (CF-UA-guarded), GET PR head sha, map the
           # eval outcome → posted state, POST the BP-required STATUS_CONTEXT. Token
           # arrives via $GITHUB_ENV as the write-scoped CI_STATUS_TOKEN resolved
           # above; the eval step stays on its own read-scoped token (eval computes,
