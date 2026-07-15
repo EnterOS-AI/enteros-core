@@ -98,6 +98,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fnmatch
 import json
 import os
 import re
@@ -647,24 +648,44 @@ def latest_statuses_by_context(statuses: list[dict]) -> dict[str, dict]:
     return latest
 
 
+def _is_glob(pattern: str) -> bool:
+    """A required-context entry is a Gitea GLOB (superset check) iff it
+    contains a `*` or `?` wildcard. Everything else is a literal PRESENCE
+    check. We deliberately do NOT treat `[...]` as a glob trigger: real
+    Gitea status contexts contain `(` `)` and other punctuation but never
+    the wildcard metacharacters, so keying only on `*`/`?` avoids
+    misreading a literal context name that happens to contain a bracket."""
+    return "*" in pattern or "?" in pattern
+
+
 def required_contexts_green(
     latest_statuses: dict[str, dict],
     contexts: list[str],
 ) -> tuple[bool, list[str]]:
-    # Gitea branch protection uses the wildcard "*" in status_check_contexts to
-    # mean "every POSTED commit status must be success" — NOT a context literally
-    # named "*". Reading it literally (`latest_statuses.get("*")` -> None ->
-    # "missing") made this return (False, ["*=missing"]) for EVERY PR, including a
-    # fully green one — so the queue decided `wait` on all of them and step 4b
-    # (the `.gitea/required-contexts.txt` presence check) was never reached. The
-    # queue thus merged nothing, and every merge on main was performed by a human
-    # (core#4363). Expand "*" to Gitea's real semantics.
+    # Gitea branch protection uses GLOB patterns in status_check_contexts —
+    # most importantly the bare "*" ("every POSTED commit status must be
+    # success"), but also narrower forms like "CI /*". Reading a glob
+    # literally (`latest_statuses.get("*")` -> None -> "missing") made this
+    # return (False, ["*=missing"]) for EVERY PR, including a fully green one —
+    # so the queue decided `wait` on all of them and step 4b (the
+    # `.gitea/required-contexts.txt` presence check) was never reached. The
+    # queue thus merged nothing, and every merge on main was performed by a
+    # human (core#4363).
     #
-    # A "*" set is a SUPERSET check (all posted must be green), and a literal
-    # entry is a PRESENCE check (that named context must be posted AND green) —
-    # the two compose: "*" catches any posted red; literal names catch a context
-    # that never posted. Both are evaluated; results are de-duped so a context
-    # flagged by both branches is reported once.
+    # Each entry is matched with Gitea's real semantics:
+    #   * a GLOB pattern (contains */?) is a SUPERSET check — it matches every
+    #     posted context via fnmatch and requires all matches to be `success`.
+    #     A glob that matches ZERO posted contexts is fail-closed: we cannot
+    #     prove any required gate ran, so it WAITs (`<pattern>=no-match`). This
+    #     closes the pre-#4363-followup vacuous-green hole where "*" over an
+    #     empty status set returned green (safety then rested entirely on the
+    #     step-0 critical backstop + step-4b presence check; now this layer
+    #     itself refuses to bless an empty board).
+    #   * a LITERAL entry (no wildcard) is a PRESENCE check — that exact named
+    #     context must be posted AND `success`.
+    # Results are de-duped so a context flagged by more than one pattern is
+    # reported once. (core#4363 + follow-up: glob-generalized, fail-closed on
+    # empty match.)
     missing_or_bad: list[str] = []
     seen: set[str] = set()
 
@@ -674,18 +695,24 @@ def required_contexts_green(
         seen.add(ctx)
         missing_or_bad.append(f"{ctx}={state or 'missing'}")
 
-    if "*" in contexts:
-        for ctx, status in latest_statuses.items():
-            state = status_state(status or {})
+    for pattern in contexts:
+        if _is_glob(pattern):
+            matches = [c for c in latest_statuses if fnmatch.fnmatchcase(c, pattern)]
+            if not matches:
+                # Fail-closed: a required glob that matches nothing cannot be
+                # shown green. (Bare "*" over an empty board lands here too —
+                # a mergeable PR always has posted CI, so this never freezes a
+                # real merge, but it refuses to vacuously pass a blank board.)
+                _flag(pattern, "no-match")
+                continue
+            for ctx in matches:
+                state = status_state(latest_statuses.get(ctx) or {})
+                if state != "success":
+                    _flag(ctx, state)
+        else:
+            state = status_state(latest_statuses.get(pattern) or {})
             if state != "success":
-                _flag(ctx, state)
-
-    for context in contexts:
-        if context == "*":
-            continue
-        state = status_state(latest_statuses.get(context) or {})
-        if state != "success":
-            _flag(context, state)
+                _flag(pattern, state)
 
     return not missing_or_bad, missing_or_bad
 
@@ -958,6 +985,7 @@ def is_runtime_bump_exempt(
     required_contexts: list[str],
     latest_runtime_v_tag: str | None,
     rc_active: bool,
+    posted_contexts: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Decide whether a PR is a qualifying runtime-bump eligible for the
     auto-merge exemption. Returns (exempt, reason).
@@ -1073,21 +1101,40 @@ def is_runtime_bump_exempt(
             f"!= latest runtime-v tag={latest_runtime_v_tag!r}",
         )
 
-    # CONDITION 2a: GATE-ADEQUACY (CI side). At least one of the
-    # required contexts (case-insensitive substring match against
-    # RUNTIME_PROVISION_SMOKE_CONTEXTS) must be in the loaded
-    # required_contexts set. Empty required_contexts → fail-closed.
-    if not required_contexts:
-        return False, "required_contexts is empty (no CI gate to verify against)"
-    required_contexts_lower = [c.lower() for c in required_contexts]
+    # CONDITION 2a: GATE-ADEQUACY (CI side). At least one runtime-provision/
+    # compat smoke context (a job that provisions + runs a workspace on the
+    # new runtime — NOT static build/lint) must be REQUIRED, so that "all
+    # required green" (GUARD 4) actually proves the bump safe.
+    #
+    # Under a wildcard BP set ("*"), the BP literals name no contexts, so the
+    # adequacy check must consult the contexts ACTUALLY posted on the PR head:
+    # under "*" every posted context is required-to-be-green, so a smoke
+    # context that ran (is posted) is genuinely a required gate. A smoke job
+    # that never ran is simply absent from the posted set → adequacy fails →
+    # fall back to the 2-genuine path (fail-closed). Without this, ["*"] can
+    # NEVER satisfy adequacy (`'runtime-provision-smoke' in '*'` is False), so
+    # the exemption is dead and every bump PR waits forever for human approvals
+    # (core#4363 made this reachable; before it the queue never got here).
+    if "*" in required_contexts:
+        adequacy_contexts = list(posted_contexts or [])
+        adequacy_src = "posted contexts (wildcard BP)"
+    else:
+        adequacy_contexts = list(required_contexts)
+        adequacy_src = "required_contexts"
+    if not adequacy_contexts:
+        return (
+            False,
+            f"no CI gate to verify adequacy against ({adequacy_src} is empty)",
+        )
+    adequacy_lower = [c.lower() for c in adequacy_contexts]
     has_runtime_smoke = any(
         any(smoke in ctx for smoke in RUNTIME_PROVISION_SMOKE_CONTEXTS)
-        for ctx in required_contexts_lower
+        for ctx in adequacy_lower
     )
     if not has_runtime_smoke:
         return (
             False,
-            f"required_contexts has no runtime-provision/compat smoke "
+            f"{adequacy_src} has no runtime-provision/compat smoke "
             f"(looked for any of: {sorted(RUNTIME_PROVISION_SMOKE_CONTEXTS)})",
         )
 
@@ -1468,6 +1515,22 @@ def critical_contexts_block(latest: dict[str, dict]) -> list[str]:
     not present at all in the statuses, that is ALSO a block (missing == not
     proven green).
     """
+    # Fail-closed empty-guard (core#4363 follow-up). This step-0 backstop is
+    # the last line of defense against a vacuous merge: it gates BOTH the normal
+    # and the force_merge path. If CRITICAL_REQUIRED_CONTEXT_PREFIXES parses to
+    # an empty set (env var set to "" / whitespace / all-comma), the loop below
+    # would iterate nothing and return [] — a fail-OPEN that lets a PR with no
+    # posted CI sail through step 0. `push_required_contexts()` raises on its
+    # empty parse for exactly this reason; the critical set must be just as
+    # unforgiving. BLOCK rather than pass vacuously.
+    if not CRITICAL_REQUIRED_CONTEXT_PREFIXES:
+        return [
+            "CRITICAL_REQUIRED_CONTEXT_PREFIXES parsed to an empty set — the "
+            "step-0 critical backstop would pass vacuously for ANY PR (incl. one "
+            "with no posted CI). Merge gate HOLDS (fail-closed). Set at least the "
+            "default 'CI / Platform (Go),CI / all-required'."
+        ]
+
     # Map base-name -> set of observed states for that base name.
     observed: dict[str, list[str]] = {}
     for context, status in latest.items():
@@ -1582,9 +1645,15 @@ def evaluate_merge_readiness(
 
     # 4) Every REQUIRED status context must be green (the branch-protection
     #    status_check_contexts set; the old uniform SOP governance checks were
-    #    removed 2026-07-14). NON-required reds (E2E Chat, Staging SaaS,
-    #    ci-arm64-advisory, continue-on-error jobs) are NOT consulted here and
-    #    must not block.
+    #    removed 2026-07-14). Under the production wildcard BP set ("*"),
+    #    "required" means EVERY POSTED context — so there is NO "non-required
+    #    red" exemption here: a red E2E Chat / Staging SaaS / ci-arm64-advisory /
+    #    continue-on-error job all block, exactly like any other posted red
+    #    (core#4363). Do NOT re-add an advisory-skip branch to
+    #    required_contexts_green — that is precisely the force_merge-bypasses-BP
+    #    hole (PR#3181 class) the wildcard expansion closed. A genuinely advisory
+    #    check must carry NO commit status (or be excluded from BP), not be
+    #    skipped here.
     latest = latest_statuses_by_context(pr_status.get("statuses") or [])
     ok, missing_or_bad = required_contexts_green(latest, required_contexts)
     if not ok:
@@ -1637,9 +1706,16 @@ def evaluate_merge_readiness(
     #    REQUEST_CHANGES + every BP-required context green. The trade-off is
     #    that the PR's CI ran on a possibly-behind base, so a SEMANTIC main-break
     #    is caught by POST-merge main CI (step 1's pause backstop) rather than
-    #    pre-merge. force_merge is used ONLY for missing-but-non-required
-    #    governance reds (required are green + approvals genuine), never to
-    #    bypass a failing required context or an approval shortfall.
+    #    pre-merge.
+    #
+    #    force is legacy: it was justified ONLY for a missing-but-non-required
+    #    governance red (required green + approvals genuine). Under the wildcard
+    #    BP set ("*") there is NO non-required red — every posted red already
+    #    WAITed at step 4 — so _non_required_red_present() returns False and
+    #    `force` is always False here (it fail-closes on "*"; see its body). The
+    #    call is retained only so a future LITERAL-context BP set keeps the old
+    #    behaviour; force_merge is NEVER used to bypass a failing required
+    #    context or an approval shortfall.
     if mergeable is True:
         force = _non_required_red_present(latest, required_contexts)
         return MergeDecision(True, "merge", "ready", force=force)
@@ -2474,12 +2550,21 @@ def _evaluate_candidate(
             )
             rc_prs = []
         rc_active = _is_active_release_candidate(prs=rc_prs, pr_number=pr_number)
+        # Under a wildcard BP set the CI-side gate-adequacy check reads the
+        # contexts ACTUALLY posted on the head (base names, event-suffix
+        # stripped), since "*" itself names none. Harmless for a literal BP
+        # set (adequacy then reads required_contexts and ignores this).
+        posted_ctx_base_names = [
+            _context_base_name(c)
+            for c in latest_statuses_by_context(pr_status.get("statuses") or [])
+        ]
         runtime_bump_exempt, exempt_reason = is_runtime_bump_exempt(
             pr=pr,
             pr_files=pr_files,
             required_contexts=required_contexts,
             latest_runtime_v_tag=latest_tag,
             rc_active=rc_active,
+            posted_contexts=posted_ctx_base_names,
         )
     except (ApiError, ValueError, TypeError) as exc:
         # API error fetching diff / tag / RC status → fail-closed:

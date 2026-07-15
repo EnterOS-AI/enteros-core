@@ -138,15 +138,15 @@ def test_wildcard_waits_on_any_posted_pending():
     assert bad == ["E2E Chat / E2E Chat (pull_request)=pending"]
 
 
-def test_wildcard_with_zero_posted_is_vacuously_green_at_this_layer():
-    # With NO posted statuses, "*" has nothing to reject -> green at THIS layer.
-    # That is intentional and safe ONLY because the PRESENCE of specific contexts
-    # is enforced separately by step 4b (enforced_file_contexts from
-    # .gitea/required-contexts.txt). See test_wildcard_green_but_enforced_file_
-    # context_missing_waits below for the composition.
+def test_wildcard_with_zero_posted_is_failclosed_no_match():
+    # core#4363 FOLLOW-UP (was: "vacuously green at this layer"). With NO posted
+    # statuses, "*" now matches nothing and this layer itself FAILS CLOSED
+    # (`*=no-match`) instead of returning green and leaning entirely on the
+    # step-0 / step-4b backstops. A mergeable PR always has posted CI, so this
+    # never freezes a real merge — it only refuses to bless a blank board.
     ok, bad = mq.required_contexts_green({}, ["*"])
-    assert ok is True
-    assert bad == []
+    assert ok is False
+    assert bad == ["*=no-match"]
 
 
 def test_wildcard_plus_literal_dedupes_a_double_flag():
@@ -220,6 +220,96 @@ def test_wildcard_green_but_enforced_file_context_missing_waits():
     assert decision.ready is False
     assert decision.action == "wait"
     assert "enforced" in decision.reason.lower() or "ephemeral" in decision.reason.lower()
+
+
+# --------------------------------------------------------------------------
+# core#4363 FOLLOW-UP (post-landing code review). Four hardening fixes:
+#   D) required_contexts_green generalized from literal "*" to any Gitea glob
+#      (e.g. "CI /*"), fail-closed on a zero-match.
+#   C) critical_contexts_block fail-closes when CRITICAL_REQUIRED_CONTEXT_
+#      PREFIXES parses empty (was a silent fail-open).
+#   B) is_runtime_bump_exempt gate-adequacy consults POSTED contexts under a
+#      wildcard BP set (was dead: `smoke in "*"` never matched).
+# --------------------------------------------------------------------------
+
+
+def test_glob_pattern_matches_posted_contexts_all_green():
+    # D: a narrow glob "CI /*" matches every posted CI context and passes when
+    # all are green.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["CI /*"])
+    assert ok is True, bad
+    assert bad == []
+
+
+def test_glob_pattern_waits_on_a_matched_red():
+    # D negative control: same glob, one matched context red -> WAIT, naming it.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "CI / Platform (Go) (pull_request)", "status": "failure"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["CI /*"])
+    assert ok is False
+    assert bad == ["CI / Platform (Go) (pull_request)=failure"]
+
+
+def test_glob_pattern_matching_nothing_is_failclosed():
+    # D: the exact pre-#4363 jam mechanism, now fixed the RIGHT way. A required
+    # glob that matches no posted context must WAIT (not silently pass, and not
+    # crash) — fail-closed with a `no-match` reason.
+    latest = mq.latest_statuses_by_context([
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "success"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["CI /*"])
+    assert ok is False
+    assert bad == ["CI /*=no-match"]
+
+
+def test_literal_context_path_is_unchanged_by_glob_generalization():
+    # D: a literal (no-wildcard) entry is still an EXACT presence check —
+    # byte-for-byte the old behavior, including a missing literal -> flagged.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (push)", "status": "success"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["CI / all-required (push)"])
+    assert ok is True and bad == []
+    ok2, bad2 = mq.required_contexts_green(latest, ["CI / never-posted (push)"])
+    assert ok2 is False
+    assert bad2 == ["CI / never-posted (push)=missing"]
+
+
+def test_critical_contexts_block_failcloses_on_empty_prefix_set(monkeypatch):
+    # C: if CRITICAL_REQUIRED_CONTEXT_PREFIXES is misconfigured to empty, the
+    # step-0 backstop must BLOCK (not iterate nothing and pass vacuously).
+    monkeypatch.setattr(mq, "CRITICAL_REQUIRED_CONTEXT_PREFIXES", [])
+    reasons = mq.critical_contexts_block(
+        mq.latest_statuses_by_context([
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+        ])
+    )
+    assert reasons, "empty critical set must fail-closed, not pass"
+    assert "empty set" in reasons[0]
+
+
+def test_critical_contexts_block_passes_when_prefixes_present_and_green(monkeypatch):
+    # C negative control: a non-empty prefix set with all criticals green -> no
+    # block (proves the empty-guard didn't just always-block).
+    monkeypatch.setattr(
+        mq, "CRITICAL_REQUIRED_CONTEXT_PREFIXES", ["CI / all-required"]
+    )
+    reasons = mq.critical_contexts_block(
+        mq.latest_statuses_by_context([
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+        ])
+    )
+    assert reasons == []
+
+
+# Runtime-bump gate-adequacy under a wildcard BP set (B) lives with the other
+# is_runtime_bump_exempt tests (search "GATE-ADEQUACY (CI side) under wildcard").
 
 
 def test_choose_next_pr_sorts_by_queue_label_timestamp_then_number():
@@ -2734,6 +2824,62 @@ def test_runtime_bump_exempt_accepts_case_insensitive_smoke_substring(monkeypatc
     assert exempt is True, f"expected exempt (smoke match should be case-insensitive), got: {reason}"
     assert "v0.5.0" in reason
     assert "v0.5.1" in reason
+
+
+# ---- CONDITION 2a: GATE-ADEQUACY (CI side) under wildcard BP (core#4363 fix B) ----
+
+def test_runtime_bump_exempt_under_wildcard_reads_posted_smoke(monkeypatch):
+    # B: production BP is ['*'], which names no contexts — so `smoke in '*'`
+    # never matched and the exemption was DEAD (every bump PR fell to the
+    # 2-genuine path). Adequacy now reads the POSTED contexts: a runtime smoke
+    # context posted on the head (required-to-be-green under '*') satisfies
+    # CONDITION 2a and the bump qualifies.
+    _set_allowlist(monkeypatch, "claude-code")
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="claude-code@v0.5.1", removed="claude-code@v0.5.0")],
+        required_contexts=["*"],
+        latest_runtime_v_tag="v0.5.1",
+        rc_active=False,
+        posted_contexts=["CI / runtime-provision-smoke (pull_request)"],
+    )
+    assert exempt is True, f"expected exempt under wildcard, got: {reason}"
+
+
+def test_runtime_bump_not_exempt_under_wildcard_when_no_smoke_posted(monkeypatch):
+    # B negative control: wildcard BP, allowlisted runtime, but NO runtime smoke
+    # context posted -> adequacy fails -> NOT exempt (fail-closed to 2-genuine).
+    # The exemption never fires without a real runtime gate actually running.
+    _set_allowlist(monkeypatch, "claude-code")
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="claude-code@v0.5.1", removed="claude-code@v0.5.0")],
+        required_contexts=["*"],
+        latest_runtime_v_tag="v0.5.1",
+        rc_active=False,
+        posted_contexts=["CI / all-required (pull_request)", "CI / Platform (Go) (pull_request)"],
+    )
+    assert exempt is False
+    assert "no runtime-provision/compat smoke" in reason
+
+
+def test_runtime_bump_not_exempt_under_wildcard_when_posted_is_empty(monkeypatch):
+    # B fail-closed: wildcard BP but the posted set is empty (statuses not yet
+    # reported) -> no gate to verify adequacy against -> NOT exempt.
+    _set_allowlist(monkeypatch, "claude-code")
+    pr = _bump_pr()
+    exempt, reason = mq.is_runtime_bump_exempt(
+        pr=pr,
+        pr_files=[_runtime_version_file(added="claude-code@v0.5.1", removed="claude-code@v0.5.0")],
+        required_contexts=["*"],
+        latest_runtime_v_tag="v0.5.1",
+        rc_active=False,
+        posted_contexts=[],
+    )
+    assert exempt is False
+    assert "empty" in reason
 
 
 # ---- CONDITION 2b: GATE-ADEQUACY (template allowlist) ----
