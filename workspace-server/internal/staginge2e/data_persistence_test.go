@@ -53,7 +53,6 @@ func TestDataVolumeSurvivesRecreate_Staging(t *testing.T) {
 
 	// --- Step 0: provision org + tenant, acquire token + wait TLS ready ---
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	t.Logf("org created: org_id=%s", orgID)
 
 	token := tenantAdminToken(t, cfg, slug)

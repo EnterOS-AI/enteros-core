@@ -61,7 +61,6 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 
 	// --- Fresh org via the admin API (the same org-create path the UI drives) ---
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	t.Logf("org created: org_id=%s", orgID)
 
 	token := tenantAdminToken(t, cfg, slug)
