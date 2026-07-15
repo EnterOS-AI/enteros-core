@@ -226,8 +226,13 @@ fi
 # SCRIPT to BASE. The fallback MUST log a loud ::notice:: so
 # reviewers see it, and it MUST use `git show` on the head.sha (so
 # the head is fetched only when needed).
-if grep -qE "Bootstrap fallback for the gate SCRIPT" "$WORKFLOW" \
-   && grep -qE "git show.*HEAD_SHA.*(reserved-path-review\.sh|SCRIPT_PATH)" "$WORKFLOW"; then
+# shellcheck disable=SC2016 # The fixed-string patterns are literal workflow source.
+if grep -qF "Bootstrap fallback for the gate SCRIPT" "$WORKFLOW" \
+   && grep -qF 'SCRIPT_PATH=".gitea/scripts/reserved-path-review.sh"' "$WORKFLOW" \
+   && grep -qF 'HELPER_PATH=".gitea/scripts/reserved-path-match.sh"' "$WORKFLOW" \
+   && grep -qF 'if [ ! -f "$SCRIPT_PATH" ] || [ ! -f "$HELPER_PATH" ]; then' "$WORKFLOW" \
+   && grep -qF 'for asset in "$SCRIPT_PATH" "$HELPER_PATH"; do' "$WORKFLOW" \
+   && grep -qF 'git show "${HEAD_SHA}:${asset}" > "$asset"' "$WORKFLOW"; then
   pass "T6d-bootstrap: workflow has bootstrap fallback for the SCRIPT (BASE -> PR HEAD only when BASE lacks the script)"
 else
   fail "T6d-bootstrap: workflow missing bootstrap fallback for the SCRIPT. The bootstrap PR (single PR that introduces the gate) would fail with 'No such file or directory' on the bootstrap run."
