@@ -363,6 +363,15 @@ jobs:
           # DIND mode — everything inside the disposable daemon; $BASE/$DOCKER_HOST
           # come from the "Start disposable dind" step via GITHUB_ENV.
           EPHEMERAL_DIND: "1"
+          # RFC #86 — pull the post-push staging lanes LEFT onto this per-PR gate,
+          # one at a time. `concierge_user_tasks` is first: it needs only the CP +
+          # API (external workspaces, no LLM/image), so it is the cheapest lane to
+          # move. ADVISORY=1 during the soak — it RUNS every PR (non-vacuous) but a
+          # failure does not block merge yet. Flip ADVISORY to 0 (and retire the
+          # matching post-push job in e2e-staging-saas.yml) once it has soaked
+          # green across a run of PRs.
+          E2E_EPHEMERAL_EXTRA_SCENARIOS: concierge_user_tasks
+          E2E_EPHEMERAL_EXTRA_ADVISORY: "1"
         run: |
           bash tests/e2e/ephemeral_cp_happy_path.sh
           echo "GATE_ARM=proof" >> "$GITHUB_ENV"

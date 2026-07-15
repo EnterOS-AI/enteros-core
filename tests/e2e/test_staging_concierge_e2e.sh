@@ -204,8 +204,28 @@ case "$CP_HOST" in
   *)             DERIVED_DOMAIN="$CP_HOST" ;;
 esac
 TENANT_DOMAIN="${MOLECULE_TENANT_DOMAIN:-$DERIVED_DOMAIN}"
-TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
+# MOLECULE_TENANT_URL override — the EPHEMERAL-CP path (mirrors
+# test_staging_full_saas.sh). Staging front-doors each tenant at its own
+# slug.<domain> subdomain, so the Host alone routes. An ephemeral CP is one
+# throwaway container whose wildcard proxy resolves the tenant by SLUG, so the
+# ephemeral runner points this at the CP base URL; default (unset) keeps the
+# exact staging subdomain behavior.
+TENANT_URL="${MOLECULE_TENANT_URL:-https://$SLUG.$TENANT_DOMAIN}"
 log "    TENANT_URL=$TENANT_URL"
+
+# Ephemeral-CP tenant ROUTING headers (mirrors test_staging_full_saas.sh): when
+# MOLECULE_TENANT_URL points at the CP base URL, carry the routing slug via
+# Host + X-Molecule-Org-Slug (the CP resolves the tenant by the Host-derived slug
+# or this fallback). Default unset ⇒ no extra headers ⇒ exact staging behavior.
+TENANT_ROUTE_HOST="${MOLECULE_TENANT_ROUTE_HOST:-}"
+if [ -z "$TENANT_ROUTE_HOST" ] && [ -n "${MOLECULE_TENANT_ROUTE_DOMAIN:-}" ]; then
+  TENANT_ROUTE_HOST="$SLUG.$MOLECULE_TENANT_ROUTE_DOMAIN"
+fi
+TENANT_ROUTE_HDRS=()
+if [ -n "$TENANT_ROUTE_HOST" ]; then
+  TENANT_ROUTE_HDRS=(-H "Host: $TENANT_ROUTE_HOST" -H "X-Molecule-Org-Slug: $SLUG")
+  log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG (ephemeral-CP slug routing)"
+fi
 
 # ─── 3. Per-tenant admin token + TLS readiness ───────────────────────────────
 log "3/6 Fetching per-tenant admin token..."
@@ -217,7 +237,7 @@ ok "Tenant admin token retrieved (len=${#TENANT_TOKEN})"
 log "    Waiting for tenant TLS / DNS propagation..."
 TLS_DEADLINE=$(( $(date +%s) + 15 * 60 ))
 while true; do
-  curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
+  curl -sSfk "${TENANT_ROUTE_HDRS[@]}" --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
   [ "$(date +%s)" -gt "$TLS_DEADLINE" ] && fail "Tenant /health never 2xx within 15m"
   sleep 5
 done
@@ -228,6 +248,7 @@ ok "Tenant reachable at $TENANT_URL"
 tenant_call() {  # <method> <path> [curl args…]
   local method="$1" path="$2"; shift 2
   curl "${CURL_COMMON[@]}" -X "$method" "$TENANT_URL$path" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
     -H "Origin: $TENANT_URL" "$@"

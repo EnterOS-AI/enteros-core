@@ -446,6 +446,72 @@ run_scenario() {
     bash "$HERE/test_staging_full_saas.sh"
 }
 
+# ── Extra scenarios (RFC #86 — pull the post-push staging lanes LEFT) ────────
+# The happy-path above IS the full-saas journey. These are the OTHER
+# `e2e-staging-saas.yml` lanes that today run LIVE only on push[main] (a `bash -n`
+# self-check on pull_request), being moved one at a time onto THIS per-PR gate so
+# a green PR actually exercises them. Each runs against the SAME standing
+# throwaway CP, creates its OWN org (isolated from the happy-path's org and from
+# sibling extras) and tears that org down itself, so ordering is independent.
+# They run only AFTER the happy-path passes — a broken CP would red them for
+# reasons unrelated to the scenario under test.
+#
+# ADVISORY SOAK: while E2E_EPHEMERAL_EXTRA_ADVISORY=1 an extra scenario's failure
+# is logged LOUD but does NOT fail the (required) gate — we prove the scenario is
+# deterministic per-PR before it can block merges (and before the post-push lane
+# it mirrors is retired). Flip the flag to 0 in the workflow once it has soaked
+# green to promote it to a real gate. This is the capture-first / enforce-later
+# path: the scenario is genuinely RUN every PR (non-vacuous) the whole time.
+
+# concierge user_tasks — the agent→user "ask" contract over BOTH surfaces (REST +
+# the MCP tools/call envelope) plus cross-workspace authz scoping. Workspaces are
+# `external` rows (no container/LLM), so this needs only the CP + API — the
+# cheapest lane to move left. Mirrors e2e-staging-saas.yml job
+# `e2e-staging-concierge-user-tasks`.
+run_scenario_concierge_user_tasks() {
+  echo "[proof][extra] concierge user_tasks (agent->user ask over REST+MCP, cross-ws authz) against the ephemeral CP..." >&2
+  # MOLECULE_TENANT_URL + ROUTE_DOMAIN carry the ephemeral-CP slug routing the
+  # same way run_scenario does (the CP is one throwaway container; the tenant is
+  # reached via its base URL + Host/X-Molecule-Org-Slug, not a real subdomain).
+  MOLECULE_CP_URL="${CP_BASE_URL}" \
+  MOLECULE_TENANT_URL="${CP_BASE_URL}" \
+  MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
+  MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+  E2E_AWS_LEAK_CHECK=off \
+  E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
+  E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-cncrgut" \
+    bash "$HERE/test_staging_concierge_e2e.sh"
+}
+
+# Dispatch one extra-scenario key to its runner. An UNKNOWN key is a hard error,
+# never a silent skip: a typo in E2E_EPHEMERAL_EXTRA_SCENARIOS that quietly ran
+# nothing would be the exact vacuous-green this gate exists to abolish.
+run_one_extra_scenario() {
+  case "$1" in
+    concierge_user_tasks) run_scenario_concierge_user_tasks ;;
+    *) echo "[proof][extra] ❌ unknown extra scenario '$1' — check E2E_EPHEMERAL_EXTRA_SCENARIOS" >&2; return 2 ;;
+  esac
+}
+
+# Run every scenario named in E2E_EPHEMERAL_EXTRA_SCENARIOS (comma/space list)
+# against the standing CP. Returns the COUNT of failed scenarios (0 = all green)
+# so the caller can gate or advise on it. Never returns early — every listed
+# scenario runs so one failure does not mask a second.
+run_extra_scenarios() {
+  local list="${E2E_EPHEMERAL_EXTRA_SCENARIOS:-}"
+  [ -n "$list" ] || return 0
+  local failed=0 s
+  for s in ${list//,/ }; do
+    if run_one_extra_scenario "$s"; then
+      echo "[proof][extra] ✅ ${s} PASSED against the ephemeral CP." >&2
+    else
+      failed=$((failed + 1))
+      echo "[proof][extra] ❌ ${s} FAILED against the ephemeral CP." >&2
+    fi
+  done
+  return "$failed"
+}
+
 # ── idle-digest sub-step assertion (task #219) — RETIRED as the gating check:
 # the CP re-provisions replacement containers under the SAME name, and the
 # collector followers are name-keyed, so a replacement's log (where the fired
@@ -734,6 +800,20 @@ case "$CMD" in
     run_scenario; rc=$?
     if [ "$rc" -eq 0 ]; then
       echo "[proof] ✅ core happy-path PASSED against an ephemeral CP — the SDK-owned-gate model holds with zero shared staging." >&2
+      # RFC #86: run any extra post-push lanes being pulled left onto this gate,
+      # against the SAME standing CP. Only after the happy-path passed (a broken
+      # CP must red as the happy-path, not as an unrelated extra scenario).
+      if [ -n "${E2E_EPHEMERAL_EXTRA_SCENARIOS:-}" ]; then
+        run_extra_scenarios; extra_failed=$?
+        if [ "$extra_failed" -ne 0 ]; then
+          if [ "${E2E_EPHEMERAL_EXTRA_ADVISORY:-0}" = "1" ]; then
+            echo "[proof][extra] ⚠️ ${extra_failed} extra scenario(s) FAILED — ADVISORY soak (E2E_EPHEMERAL_EXTRA_ADVISORY=1); NOT failing the gate. Read the [extra] output above and promote to gating once green." >&2
+          else
+            echo "[proof][extra] ❌ ${extra_failed} extra scenario(s) FAILED and are GATING (E2E_EPHEMERAL_EXTRA_ADVISORY!=1)." >&2
+            rc=1
+          fi
+        fi
+      fi
     fi
     if [ "$rc" -ne 0 ]; then
       echo "[proof] ❌ core happy-path FAILED (rc=$rc) against the ephemeral CP — read the full-saas output above for the failing step." >&2
