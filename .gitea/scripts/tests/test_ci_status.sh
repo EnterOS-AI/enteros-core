@@ -4,8 +4,8 @@
 # secret-scan. Closes the test-coverage gap flagged in the molecule-code-reviewer
 # REQUEST_CHANGES on PR #3422:
 #
-#   (1) internal-host derivation (GITHUB_SERVER_URL -> internal Gitea, public
-#       fallback, trailing-slash trim)                       — derive_gitea_base
+#   (1) canonical-domain derivation (ambient runner URL ignored, explicit
+#       GITEA_HOST override retained, trailing-slash trim)   — derive_gitea_base
 #   (2) CI_STATUS_TOKEN resolution: direct Gitea org secret FIRST, Infisical
 #       fallback, fail-closed vs best-effort                 — resolve_ci_status_token
 #   (3) review-status emission + host-derivation path        — emit_review_status
@@ -117,7 +117,7 @@ MOCK_CURL="$WORK/curl"
 cat > "$MOCK_CURL" <<'MOCK'
 #!/usr/bin/env bash
 # Mock curl for test_ci_status.sh. Dispatches on the request URL.
-url=""; out=""; data=""; want_code=0
+url=""; out=""; data=""; want_code=0; user_agent=""; config_file=""
 args=("$@")
 i=0
 while [ "$i" -lt "${#args[@]}" ]; do
@@ -126,11 +126,24 @@ while [ "$i" -lt "${#args[@]}" ]; do
     -o) i=$((i+1)); out="${args[$i]:-}" ;;
     -d) i=$((i+1)); data="${args[$i]:-}" ;;
     -w) i=$((i+1)); want_code=1 ;;
-    -A|-H|-K|-X) i=$((i+1)) ;;   # skip the value arg for these flags
+    -A) i=$((i+1)); user_agent="${args[$i]:-}" ;;
+    -K) i=$((i+1)); config_file="${args[$i]:-}" ;;
+    -H|-X) i=$((i+1)) ;;   # skip the value arg for these flags
     http://*|https://*) url="$a" ;;
   esac
   i=$((i+1))
 done
+if [ -n "$config_file" ]; then
+  if [ ! -f "$config_file" ] || ! grep -Fxq 'user-agent = "curl/8.4.0"' "$config_file"; then
+    echo "mock curl: auth config missing exact user-agent directive" >&2
+    exit 96
+  fi
+  user_agent="curl/8.4.0"
+fi
+if [[ "$url" == http://* || "$url" == https://* ]] && [ "$user_agent" != "curl/8.4.0" ]; then
+  echo "mock curl: request missing exact curl/8.4.0 User-Agent: $url" >&2
+  exit 96
+fi
 [ -n "${MOCK_CALL_LOG:-}" ] && printf '%s\n' "$url" >> "$MOCK_CALL_LOG"
 emit_code() { [ "$want_code" = "1" ] && printf '%s' "$1"; }
 case "$url" in
@@ -194,22 +207,24 @@ run_fn() {
 }
 
 # ===========================================================================
-# (1) derive_gitea_base — internal-host derivation
+# (1) derive_gitea_base — canonical-domain derivation
 # ===========================================================================
 echo
 echo "== derive_gitea_base (host derivation) =="
 
 reset_env; GITHUB_SERVER_URL="http://molecule-gitea-local:3000"
-assert_eq "D1 internal GITHUB_SERVER_URL preferred" "http://molecule-gitea-local:3000" "$(derive_gitea_base)"
+assert_eq "D1 ambient GITHUB_SERVER_URL ignored" "https://git.moleculesai.app" "$(derive_gitea_base)"
 
-reset_env; GITEA_HOST="git.moleculesai.app"
-assert_eq "D2 fallback to https://GITEA_HOST when GITHUB_SERVER_URL empty" "https://git.moleculesai.app" "$(derive_gitea_base)"
+reset_env; GITEA_HOST="git.example.test"
+assert_eq "D2 explicit GITEA_HOST override retained" "https://git.example.test" "$(derive_gitea_base)"
 
 reset_env
 assert_eq "D3 literal default when both unset" "https://git.moleculesai.app" "$(derive_gitea_base)"
 
-reset_env; GITHUB_SERVER_URL="http://molecule-gitea-local:3000/"
-assert_eq "D4 trailing slash trimmed (no // before /api/v1)" "http://molecule-gitea-local:3000" "$(derive_gitea_base)"
+reset_env; GITEA_HOST="git.example.test/"
+assert_eq "D4 trailing slash trimmed (no // before /api/v1)" "https://git.example.test" "$(derive_gitea_base)"
+
+assert_eq "D5 exact Cloudflare-safe User-Agent" "curl/8.4.0" "$CI_STATUS_UA"
 
 # ===========================================================================
 # (2) resolve_ci_status_token — direct-first, Infisical fallback
@@ -292,7 +307,7 @@ run_fn emit_review_status
 assert_eq  "E1 rc 0" "0" "$RC"
 assert_contains "E1 POST body state=success" '"state":"success"' "$(cat "$WORK/e1_body")"
 assert_contains "E1 POST body carries STATUS_CONTEXT" "reserved-path-review / reserved-path-review (pull_request_target)" "$(cat "$WORK/e1_body")"
-assert_contains "E1 POST hit internal-derived host" "http://molecule-gitea-local:3000/api/v1/repos/molecule-ai/molecule-core/statuses/deadbeefsha" "$(cat "$WORK/e1_url")"
+assert_contains "E1 POST ignored ambient internal host" "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-core/statuses/deadbeefsha" "$(cat "$WORK/e1_url")"
 assert_contains "E1 notice posted success" "::notice::posted success" "$OUT"
 
 # E2 — non-success eval outcome → posts state=failure.
@@ -390,8 +405,10 @@ echo
 echo "== workflow wiring (regression guard) =="
 
 # W1/W2 (qa-review.yml, security-review.yml) removed 2026-07-14 — the SOP
-# review gate was fully removed and those workflows deleted. secret-scan +
-# reserved-path-review are the remaining emit_review_status consumers.
+# review gate was fully removed and those workflows deleted. The remaining
+# library consumers have different paths: secret-scan calls the best-effort
+# reassert_commit_status helper, while reserved-path-review calls the
+# fail-closed emit_review_status helper.
 SS="$WF_DIR/secret-scan.yml"
 RPR="$WF_DIR/reserved-path-review.yml"
 
@@ -422,15 +439,14 @@ assert_eq "W4 re-assert step has if: success()" "OK" "$W4"
 # first revision; that workflow has since been deleted with the SOP gate).
 echo
 echo "== W7 no dangling legacy emission fragments =="
-for wf in "$RPR"; do
-  if grep -qE '\$\{?post_code' "$wf"; then
-    echo "  FAIL  W7 $(basename "$wf") still references \$post_code (dangling legacy fragment)"
-    FAIL=$((FAIL + 1)); FAILED_TESTS="${FAILED_TESTS} W7_$(basename "$wf")"
-  else
-    echo "  PASS  W7 $(basename "$wf") has no dangling \$post_code fragment"
-    PASS=$((PASS + 1))
-  fi
-done
+wf="$RPR"
+if grep -qE '\$\{?post_code' "$wf"; then
+  echo "  FAIL  W7 $(basename "$wf") still references \$post_code (dangling legacy fragment)"
+  FAIL=$((FAIL + 1)); FAILED_TESTS="${FAILED_TESTS} W7_$(basename "$wf")"
+else
+  echo "  PASS  W7 $(basename "$wf") has no dangling \$post_code fragment"
+  PASS=$((PASS + 1))
+fi
 
 echo
 echo "------"
