@@ -705,27 +705,33 @@ namespace = {"__name__": "kimi_bridge_test"}
 exec(compile(sys.stdin.read(), "kimi_bridge.py", "exec"), namespace)
 
 class Response:
+    status_code = 200
+    def __init__(self, rows):
+        self.rows = rows
     def raise_for_status(self):
         pass
     def json(self):
-        return [
-            {"id": "newest"},
-            {"id": "middle"},
-            {"id": "oldest"},
-        ]
+        return self.rows
 
 class Client:
     def __init__(self):
         self.params = None
+        self.response = Response([
+            {"id": "newest"},
+            {"id": "middle"},
+            {"id": "oldest"},
+        ])
     def get(self, url, params, headers):
         self.params = params
-        return Response()
+        return self.response
 
 client = Client()
-cold = namespace["poll_inbound"](client, "https://app.example.com", "ws-abc123", "token", "")
+cold, cursor = namespace["poll_inbound"](client, "https://app.example.com", "ws-abc123", "token", "")
 if client.params.get("since_secs") != "30" or "since_id" in client.params:
     raise AssertionError(f"cold-start params are not bounded since_secs-only: {client.params!r}")
-ordered = namespace["order_activity_items"](cold, "")
+if cursor != "":
+    raise AssertionError(f"cold-start cursor changed unexpectedly: {cursor!r}")
+ordered = namespace["order_activity_items"](cold, cursor)
 ids = [item["id"] for item in ordered]
 if ids != ["oldest", "middle", "newest"]:
     raise AssertionError(f"cold-start order is not chronological: {ids!r}")
@@ -740,12 +746,31 @@ steady_rows = [
     {"id": "middle"},
     {"id": "newest"},
 ]
-namespace["poll_inbound"](client, "https://app.example.com", "ws-abc123", "token", "middle")
+client.response = Response(steady_rows)
+steady_rows, cursor = namespace["poll_inbound"](client, "https://app.example.com", "ws-abc123", "token", "middle")
 if client.params.get("since_id") != "middle" or "since_secs" in client.params:
     raise AssertionError(f"steady-state params are not cursor-only: {client.params!r}")
-steady = namespace["order_activity_items"](steady_rows, "middle")
+if cursor != "middle":
+    raise AssertionError(f"valid steady-state cursor changed unexpectedly: {cursor!r}")
+steady = namespace["order_activity_items"](steady_rows, cursor)
 if [item["id"] for item in steady] != ["oldest", "middle", "newest"]:
     raise AssertionError("cursor response order was changed")
+
+class GoneResponse:
+    status_code = 410
+    def raise_for_status(self):
+        raise AssertionError("HTTP 410 must be handled before raise_for_status")
+    def json(self):
+        raise AssertionError("HTTP 410 has no activity page")
+
+client.response = GoneResponse()
+gone_rows, cursor = namespace["poll_inbound"](
+    client, "https://app.example.com", "ws-abc123", "token", "pruned-cursor"
+)
+if gone_rows != [] or cursor != "":
+    raise AssertionError(
+        f"HTTP 410 did not reset to bounded cold-start: rows={gone_rows!r} cursor={cursor!r}"
+    )
 `
 
 	cmd := exec.Command(python, "-c", harness)

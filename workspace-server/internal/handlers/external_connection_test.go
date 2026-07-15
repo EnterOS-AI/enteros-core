@@ -134,7 +134,7 @@ func TestExternalRuntimeTemplates_InstallPrivateWheelWithPublicDependencies(t *t
 	for name, body := range runtimeTemplates {
 		for _, required := range []string{
 			"pip download --no-deps",
-			"molecules-workspace-runtime==0.4.4",
+			"molecules-workspace-runtime==0.4.5",
 			"pip install --index-url https://pypi.org/simple/",
 			"molecules_workspace_runtime-*.whl",
 		} {
@@ -154,11 +154,11 @@ func TestExternalRuntimeTemplates_InstallPrivateWheelWithPublicDependencies(t *t
 	}{
 		"externalCodexTemplate": {
 			body: externalCodexTemplate,
-			want: "python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/codex-channel-molecule.git@61b46ba868822e05fb4b30eb53a35baa29a8eb6c'",
+			want: "python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/codex-channel-molecule.git@876e91c46e1ce240cdaf96a720a2864c23bf52a0'",
 		},
 		"externalHermesChannelTemplate": {
 			body: externalHermesChannelTemplate,
-			want: "python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/hermes-channel-molecule.git@1e5db15e7dc63a67ed9c96c9b85c3856b9b6eaa1'",
+			want: "python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/hermes-channel-molecule.git@d9028c6690394390f3a2b8211a6f6cdc3681971c'",
 		},
 	}
 	for name, tc := range bridgeInstalls {

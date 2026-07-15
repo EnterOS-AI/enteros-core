@@ -98,7 +98,7 @@ RUNTIME_DOWNLOAD="$(mktemp -d)" || RUNTIME_INSTALL_STATUS=$?
 if [ "$RUNTIME_INSTALL_STATUS" -eq 0 ]; then
   python3 -m pip download --no-deps --dest "$RUNTIME_DOWNLOAD" \
     --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
-    molecules-workspace-runtime==0.4.4 &&
+    molecules-workspace-runtime==0.4.5 &&
   python3 -m pip install --index-url https://pypi.org/simple/ \
     "$RUNTIME_DOWNLOAD"/molecules_workspace_runtime-*.whl
   RUNTIME_INSTALL_STATUS=$?
@@ -714,10 +714,10 @@ if __name__ == "__main__":
 //
 // The plugin (molecule-ai/hermes-channel-molecule on Gitea) is a hermes
 // platform adapter that:
-//  1. Spawns “python -m molecule_runtime.a2a_mcp_server“ as a
-//     stdio MCP subprocess (separate from any hermes-side MCP
-//     client connection).
-//  2. Long-polls “wait_for_message“ on the platform's inbox.
+//  1. Spawns “python -m molecule_runtime.mcp_cli“ as the standalone
+//     stdio MCP subprocess. That entry point owns external registration,
+//     heartbeat, inbox polling, and the MCP tool server.
+//  2. Long-polls “wait_for_message“ through that subprocess.
 //  3. Dispatches each inbound activity into the hermes gateway as a
 //     MessageEvent — same code path Telegram/Discord use.
 //  4. Outbound replies route via “send_message_to_user“ (canvas
@@ -748,7 +748,7 @@ const externalHermesChannelTemplate = tokenGuardShell + `# Hermes channel — br
 # 1. Install the runtime + plugin:
 ` + externalWorkspaceRuntimeInstall + `
 if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
-python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/hermes-channel-molecule.git@1e5db15e7dc63a67ed9c96c9b85c3856b9b6eaa1'
+python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/hermes-channel-molecule.git@d9028c6690394390f3a2b8211a6f6cdc3681971c'
 RUNTIME_INSTALL_STATUS=$?
 if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
   MOLECULE_TOKEN_OK=0
@@ -797,8 +797,9 @@ fi
 
 # Inbound canvas messages + peer A2A now arrive as MessageEvents —
 # same dispatch path Telegram/Discord/Slack use. The agent replies via
-# send_message_to_user / delegate_task MCP tool calls (already wired
-# by the plugin's molecule_runtime MCP subprocess).
+# send_message_to_user / delegate_task MCP tool calls through the plugin's
+# standalone molecule_runtime.mcp_cli subprocess, which also owns external
+# registration, heartbeat, and inbox polling.
 #
 # Source + issue tracker:
 # https://git.moleculesai.app/molecule-ai/hermes-channel-molecule
@@ -854,7 +855,7 @@ const externalCodexTemplate = tokenGuardShell + `# Codex external setup — outb
 ` + externalWorkspaceRuntimeInstall + `
 if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
 npm install -g @openai/codex@latest && \
-  python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/codex-channel-molecule.git@61b46ba868822e05fb4b30eb53a35baa29a8eb6c'
+  python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/codex-channel-molecule.git@876e91c46e1ce240cdaf96a720a2864c23bf52a0'
 RUNTIME_INSTALL_STATUS=$?
 if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
   MOLECULE_TOKEN_OK=0
@@ -1076,8 +1077,14 @@ def poll_inbound(client, url, ws, tok, since_id):
     else:
         params["since_secs"] = "30"
     r = client.get(f"{url}/workspaces/{ws}/activity", params=params, headers=hdrs(url, tok))
+    # Core returns 410 when a durable cursor is invalid or its row has been
+    # pruned. Reset to the bounded cold-start path instead of retrying the same
+    # dead since_id forever.
+    if r.status_code == 410:
+        logging.warning("activity cursor %s expired; resetting to bounded cold-start", since_id)
+        return [], ""
     r.raise_for_status()
-    return r.json()
+    return r.json(), since_id
 
 def order_activity_items(items, since_id):
     """Normalize /activity into chronological order without mutating it."""
@@ -1116,9 +1123,8 @@ def main():
                     last_beat = time.time()
 
                 # Poll for new canvas messages
-                items = order_activity_items(
-                    poll_inbound(c, purl, ws, tok, since_id), since_id
-                )
+                items, since_id = poll_inbound(c, purl, ws, tok, since_id)
+                items = order_activity_items(items, since_id)
                 for item in items:
                     since_id = item["id"]
                     src = item.get("source_id")
@@ -1232,7 +1238,7 @@ const externalOpenClawTemplate = tokenGuardShell + `# OpenClaw MCP config — ou
 # instead.
 
 # 1. Install the pinned workspace runtime wheel + openclaw CLI. The
-#    canonical 0.4.4 package includes the "molecule-mcp" console script,
+#    canonical 0.4.5 package includes the "molecule-mcp" console script,
 #    which keeps the workspace ALIVE on canvas (register-on-startup +
 #    20s heartbeat).
 ` + externalWorkspaceRuntimeInstall + `
