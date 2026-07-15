@@ -730,6 +730,16 @@ def _compile_gitea_glob(pattern: str) -> re.Pattern[str]:
             pos += 1
             if c == "]":
                 return "[" + result + "]"
+            if c == "[":
+                # Go/RE2 accepts POSIX named classes such as ``[[:alpha:]]``;
+                # Python's regexp parser gives the same bytes nested-set
+                # semantics. This conservative port does not translate that
+                # syntax, so reject it instead of widening/narrowing the
+                # branch-protection policy. A literal '[' remains available
+                # as ``\[`` below.
+                raise GiteaGlobCompileError(
+                    "nested/POSIX character classes are unsupported"
+                )
             if c == "\\":
                 if pos >= len(pattern):
                     raise GiteaGlobCompileError("unterminated character class escape")

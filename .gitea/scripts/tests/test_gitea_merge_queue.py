@@ -333,6 +333,10 @@ def test_gitea_glob_semantics_match_server_patterns(pattern, context, matches):
         # Go treats numeric escapes differently. Reject the ambiguous surface
         # instead of compiling a policy with different semantics.
         r"{CI,\1} / *",
+        # Go/RE2 supports POSIX named classes inside a character class while
+        # Python parses the same bytes as a nested set with different matches.
+        # The conservative compiler must reject that unsupported surface.
+        "CI / [[:alpha:]]",
     ],
 )
 def test_invalid_gitea_glob_fails_closed(pattern):
