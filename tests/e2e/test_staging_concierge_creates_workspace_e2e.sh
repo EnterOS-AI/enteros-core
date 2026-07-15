@@ -87,10 +87,10 @@
 #
 # Env contract (same as test_staging_concierge_e2e.sh / test_staging_full_saas.sh):
 #   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway staging CP_ADMIN_API_TOKEN
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical /shared/controlplane-admin
 #
 # Optional env:
-#   E2E_PROVISION_TIMEOUT_SECS    default 900 (15 min cold tenant EC2 budget)
+#   E2E_PROVISION_TIMEOUT_SECS    default 900 (15 min cold tenant budget)
 #   E2E_CONCIERGE_ONLINE_SECS     default 900 (concierge boot-to-online budget)
 #   E2E_MCP_TOOLS_SECS            default 240 (STEP 4.5 poll budget for the
 #                                 loaded_mcp_tools heartbeat to publish
@@ -201,7 +201,7 @@ fi
 # dispatched local run (the original PR test path) — keep the original
 # strict check below.
 if [ -z "${ADMIN_TOKEN}" ]; then
-  fail "MOLECULE_ADMIN_TOKEN required (Railway staging CP_ADMIN_API_TOKEN) — E2E_REQUIRE_LIVE=1 needs staging creds"
+  fail "MOLECULE_ADMIN_TOKEN required (staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin) — E2E_REQUIRE_LIVE=1 needs staging creds"
 fi
 # Collision-proof slug (core#2782). The prior `head -c 32` truncation
 # dropped the run_attempt suffix and let two parallel/retry runs

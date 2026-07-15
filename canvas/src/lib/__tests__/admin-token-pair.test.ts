@@ -29,15 +29,15 @@ function checkAdminTokenPair(): void {
     // eslint-disable-next-line no-console
     console.error(
       "[next.config] ADMIN_TOKEN is set but NEXT_PUBLIC_ADMIN_TOKEN is not — " +
-        "canvas will 401 against workspace-server because the bearer header " +
-        "is never attached. Set both to the same value, or unset both.",
+        "for local dev, set the matching public value; for production, remove " +
+        "ADMIN_TOKEN from the Canvas build environment (never publish it).",
     );
   } else {
     // eslint-disable-next-line no-console
     console.error(
       "[next.config] NEXT_PUBLIC_ADMIN_TOKEN is set but ADMIN_TOKEN is not — " +
-        "workspace-server will reject the bearer because no AdminAuth gate " +
-        "is configured. Set both to the same value, or unset both.",
+        "for local dev, set the matching server value; for production, remove " +
+        "NEXT_PUBLIC_ADMIN_TOKEN from the public Canvas bundle.",
     );
   }
 }
@@ -89,8 +89,8 @@ describe("checkAdminTokenPair", () => {
     // see in their dev console so regressions are visible.
     expect(errorSpy).toHaveBeenCalledWith(
       "[next.config] ADMIN_TOKEN is set but NEXT_PUBLIC_ADMIN_TOKEN is not — " +
-        "canvas will 401 against workspace-server because the bearer header " +
-        "is never attached. Set both to the same value, or unset both.",
+        "for local dev, set the matching public value; for production, remove " +
+        "ADMIN_TOKEN from the Canvas build environment (never publish it).",
     );
   });
 
@@ -100,8 +100,8 @@ describe("checkAdminTokenPair", () => {
     expect(errorSpy).toHaveBeenCalledTimes(1);
     expect(errorSpy).toHaveBeenCalledWith(
       "[next.config] NEXT_PUBLIC_ADMIN_TOKEN is set but ADMIN_TOKEN is not — " +
-        "workspace-server will reject the bearer because no AdminAuth gate " +
-        "is configured. Set both to the same value, or unset both.",
+        "for local dev, set the matching server value; for production, remove " +
+        "NEXT_PUBLIC_ADMIN_TOKEN from the public Canvas bundle.",
     );
   });
 

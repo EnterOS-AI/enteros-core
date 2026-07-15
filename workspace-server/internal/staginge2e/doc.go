@@ -12,16 +12,16 @@
 //	  go test -tags=staging_e2e -run TestWorkspaceLifecycle_Staging \
 //	  -timeout 40m ./internal/staginge2e/
 //
-// These tests provision a REAL throwaway tenant (real EC2-backed workspace on
-// staging) via the CP admin API, drive the workspace lifecycle endpoints
-// against the live tenant ws-server, and assert OBSERVABLE container-state
+// These tests provision a real throwaway tenant through staging's configured
+// control-plane backend, drive the workspace lifecycle endpoints against the
+// live tenant workspace-server, and assert observable runtime-state
 // transitions (status + serve reachability) — not just HTTP 200. Teardown is
 // t.Cleanup-driven (admin DELETE /cp/admin/tenants).
 //
-// Run them from the operator host (or CI on dispatch/schedule) where the
-// staging CP admin surface + tenant DNS are reachable.
+// Run them in CI or from an authenticated workstation where the staging
+// control-plane admin surface and tenant DNS are reachable.
 //
-// This suite is advisory-by-infra: it needs a live staging tenant, so it is
-// NOT a merge-blocking required check. Promotion to required is a separate CTO
-// decision (mirrors the cp internal/staginge2e suite, cp#386).
+// The tagged suite is not part of ordinary pull-request `go test ./...`.
+// `staging-tenant-cd.yml` runs the selected lifecycle tests as a hard post-roll
+// staging gate before that workflow reports success.
 package staginge2e

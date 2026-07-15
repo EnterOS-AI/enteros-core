@@ -1,12 +1,14 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The re-show path (GET .../external/connection) returns auth_token="", and
@@ -34,10 +36,11 @@ var credentialPersistVerbs = []string{
 	"writeFileSync",     // channel .env merge (bun)
 	"renameSync",        // ...and its atomic swap
 	"claude mcp add",    // OVERWRITES the entry for this server name
-	"openclaw mcp set",  // OVERWRITES ~/.openclaw/mcp/<name>.json
+	"openclaw mcp set",  // OVERWRITES mcp.servers.<name> in ~/.openclaw/openclaw.json
 	"cat > ",            // kimi env file (heredoc)
 	"tee ",              // any redirect-free write
 	"gateway --replace", // hermes: kills the running gateway, restarts on the new token
+	"save_token(",       // Python SDK: overwrites ~/.molecule/<workspace>/.auth_token
 }
 
 // snippetPersistsCredential reports whether a rendered snippet contains a
@@ -111,6 +114,152 @@ func TestReshowSnippets_RefuseToRunWithoutAToken(t *testing.T) {
 	}
 }
 
+// TestShellReshowSnippets_SkipEveryExecutableStep executes each guarded shell
+// snippet with a marker token, an empty HOME, and a PATH containing no external
+// commands. A credential-only guard is insufficient: installers, mkdir, bridge
+// file writes, and runtime starts must also be skipped when the dialog is
+// re-shown without a token. With `set -eu`, reaching any executable command is
+// an immediate failure; the empty HOME assertion catches built-in redirections.
+func TestShellReshowSnippets_SkipEveryExecutableStep(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash not on PATH: %v", err)
+	}
+	p := BuildExternalConnectionPayload("https://app.example.com", "ws-abc123", "My Agent", "")
+	guarded := []string{
+		"claude_code_channel_snippet",
+		"universal_mcp_snippet",
+		"hermes_channel_snippet",
+		"codex_snippet",
+		"openclaw_snippet",
+		"kimi_snippet",
+	}
+
+	for _, key := range guarded {
+		t.Run(key, func(t *testing.T) {
+			home := t.TempDir()
+			snippet := p[key].(string)
+			cmd := exec.Command(bash, "-eu")
+			cmd.Env = []string{"HOME=" + home, "PATH=/molecule-no-external-commands"}
+			cmd.Stdin = strings.NewReader("set -o pipefail\n" + snippet)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("marker-stamped snippet reached an executable step instead of skipping the whole setup: %v\n%s", err, out)
+			}
+			entries, err := os.ReadDir(home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("marker-stamped snippet changed HOME; entries=%v", entries)
+			}
+		})
+	}
+}
+
+// TestRuntimeInstallFailure_SkipsDependentSetup models an interactive paste
+// where mktemp/pip fails. A bare failing command does not stop an interactive
+// shell, so each template must explicitly suppress bridge installs, config
+// writes, and agent starts, then return non-zero with actionable output.
+func TestRuntimeInstallFailure_SkipsDependentSetup(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash not on PATH: %v", err)
+	}
+	p := BuildExternalConnectionPayload("https://app.example.com", "ws-abc123", "My Agent", "wst_live_TOKEN")
+	runtimeBacked := []string{
+		"universal_mcp_snippet",
+		"hermes_channel_snippet",
+		"codex_snippet",
+		"openclaw_snippet",
+		"kimi_snippet",
+	}
+
+	for _, key := range runtimeBacked {
+		t.Run(key, func(t *testing.T) {
+			bin := t.TempDir()
+			mktempStub := filepath.Join(bin, "mktemp")
+			if err := os.WriteFile(mktempStub, []byte("#!/bin/sh\nexit 42\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(bash)
+			cmd.Env = []string{"HOME=" + t.TempDir(), "PATH=" + bin}
+			cmd.Stdin = strings.NewReader(p[key].(string))
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("runtime install failure returned success; output:\n%s", out)
+			}
+			output := string(out)
+			if !strings.Contains(output, "runtime install failed; config and agent startup were skipped") {
+				t.Fatalf("failure was not actionable or did not prove dependent setup was skipped:\n%s", output)
+			}
+			if strings.Contains(output, "command not found") {
+				t.Fatalf("a dependent command ran after runtime install failed:\n%s", output)
+			}
+		})
+	}
+}
+
+// TestPythonSnippet_ReshowRefusesBeforeSavingToken executes the re-show render
+// as a script. The SDK's save_token call overwrites the cached credential, so
+// the visible marker must abort before that method is reached.
+func TestPythonSnippet_ReshowRefusesBeforeSavingToken(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal("python3 is required to execute the operator-facing Python snippet")
+	}
+	p := BuildExternalConnectionPayload("https://app.example.com", "ws-abc123", "My Agent", "")
+	snippet := p["python_snippet"].(string)
+
+	const harness = `
+import sys
+import types
+
+class FakeClient:
+    saved = False
+    def __init__(self, workspace_id, **kwargs):
+        self.workspace_id = workspace_id
+    def save_token(self, token):
+        FakeClient.saved = True
+    def attach_inbound_server(self, server):
+        pass
+    def register(self):
+        pass
+    def load_platform_inbound_secret(self):
+        return "inbound-secret"
+    def run_heartbeat_loop(self):
+        return "stopped"
+
+class FakeServer:
+    def __init__(self, **kwargs):
+        pass
+    def start_in_background(self):
+        pass
+    def stop(self):
+        pass
+
+sdk = types.ModuleType("molecule_external_workspace")
+sdk.RemoteAgentClient = FakeClient
+sdk.A2AServer = FakeServer
+sys.modules["molecule_external_workspace"] = sdk
+
+try:
+    exec(compile(sys.stdin.read(), "python_snippet", "exec"), {"__name__": "__main__"})
+except RuntimeError as exc:
+    if "molecule: this block has NO TOKEN" not in str(exc):
+        raise
+else:
+    raise AssertionError("marker-stamped Python snippet did not refuse to run")
+
+if FakeClient.saved:
+    raise AssertionError("marker-stamped Python snippet overwrote the cached token")
+`
+	cmd := exec.Command(python, "-c", harness)
+	cmd.Stdin = strings.NewReader(snippet)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("marker-stamped Python snippet did not refuse before save_token: %v\n%s", err, out)
+	}
+}
+
 // TestTokenGuards_MatchTheMarkerActuallyStamped closes the drift between the
 // guard's needle and the marker it is supposed to catch: change
 // tokenUnavailableMarker without changing the guards and every guard becomes a
@@ -127,6 +276,9 @@ func TestTokenGuards_MatchTheMarkerActuallyStamped(t *testing.T) {
 	}
 	if !strings.Contains(externalChannelTemplate, tokenGuardNeedle) || !strings.Contains(externalChannelTemplate, tokenGuardSentinel) {
 		t.Errorf("the channel snippet's JS guard must both test for %q and emit %q", tokenGuardNeedle, tokenGuardSentinel)
+	}
+	if !strings.Contains(externalPythonTemplate, tokenGuardNeedle) || !strings.Contains(externalPythonTemplate, tokenGuardSentinel) {
+		t.Errorf("the Python snippet's guard must both test for %q and emit %q", tokenGuardNeedle, tokenGuardSentinel)
 	}
 }
 
@@ -162,6 +314,127 @@ func TestShellSnippets_ParseUnderBash(t *testing.T) {
 					"syntax error:\n%s", key, tc.name, out)
 			}
 		}
+	}
+}
+
+// TestRenderedRuntimeSnippets_StopAfterConfigurationFailure executes the
+// operator-facing shell, with installs stubbed successful and a runtime
+// configuration/start command stubbed failed. A later help block or
+// install-status check must not turn that real failure back into exit 0, and
+// no dependent agent/gateway command may run after its configuration failed.
+func TestRenderedRuntimeSnippets_StopAfterConfigurationFailure(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash not on PATH: %v", err)
+	}
+
+	stubDir := t.TempDir()
+	const stub = `#!/usr/bin/env bash
+name="${0##*/}"
+printf '%s %s\n' "$name" "$*" >> "$CALL_LOG"
+if [[ "$name $*" == *"$FAIL_NEEDLE"* ]]; then
+  exit 42
+fi
+if [[ -n "${BACKGROUND_COMMAND:-}" && "$name $*" == "$BACKGROUND_COMMAND"* ]]; then
+  printf . >&3
+fi
+exit 0
+`
+	for _, name := range []string{"python3", "npm", "bun", "claude", "hermes", "openclaw", "codex", "codex-channel-molecule"} {
+		if err := os.WriteFile(filepath.Join(stubDir, name), []byte(stub), 0o755); err != nil {
+			t.Fatalf("write %s stub: %v", name, err)
+		}
+	}
+
+	payload := BuildExternalConnectionPayload("https://app.example.com", "ws-abc123", "My Agent", "wst_live_TESTTOKEN")
+	for _, tc := range []struct {
+		name              string
+		field             string
+		failNeedle        string
+		backgroundCommand string
+		mustNotRun        []string
+	}{
+		{name: "Claude channel config", field: "claude_code_channel_snippet", failNeedle: "bun -e", mustNotRun: []string{"claude --dangerously-load-development-channels"}},
+		{name: "universal MCP", field: "universal_mcp_snippet", failNeedle: "claude mcp add"},
+		{name: "Hermes", field: "hermes_channel_snippet", failNeedle: "hermes gateway --replace"},
+		{name: "OpenClaw", field: "openclaw_snippet", failNeedle: "openclaw mcp set", mustNotRun: []string{"openclaw gateway", "openclaw agent"}},
+		{name: "OpenClaw agent", field: "openclaw_snippet", failNeedle: "openclaw agent", backgroundCommand: "openclaw gateway"},
+		{name: "Codex agent", field: "codex_snippet", failNeedle: "codex ", backgroundCommand: "codex-channel-molecule"},
+		{name: "Kimi bridge", field: "kimi_snippet", failNeedle: "kimi_bridge.py"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := filepath.Join(t.TempDir(), "calls.log")
+			snippet, ok := payload[tc.field].(string)
+			if !ok {
+				t.Fatalf("payload field %s is not a string", tc.field)
+			}
+			home := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(home, ".openclaw"), 0o700); err != nil {
+				t.Fatalf("create OpenClaw config dir: %v", err)
+			}
+			cmd := exec.Command(bash, "-c", snippet)
+			cmd.Env = append(os.Environ(),
+				"PATH="+stubDir+":"+os.Getenv("PATH"),
+				"HOME="+home,
+				"CALL_LOG="+logPath,
+				"FAIL_NEEDLE="+tc.failNeedle,
+			)
+			var backgroundReader, backgroundWriter *os.File
+			if tc.backgroundCommand != "" {
+				var err error
+				backgroundReader, backgroundWriter, err = os.Pipe()
+				if err != nil {
+					t.Fatalf("create %s completion barrier: %v", tc.backgroundCommand, err)
+				}
+				defer backgroundReader.Close()
+				cmd.ExtraFiles = []*os.File{backgroundWriter}
+				cmd.Env = append(cmd.Env, "BACKGROUND_COMMAND="+tc.backgroundCommand)
+			}
+			var out bytes.Buffer
+			cmd.Stdout = &out
+			cmd.Stderr = &out
+			if err := cmd.Start(); err != nil {
+				if backgroundWriter != nil {
+					_ = backgroundWriter.Close()
+				}
+				t.Fatalf("start rendered snippet: %v", err)
+			}
+			if backgroundWriter != nil {
+				if err := backgroundWriter.Close(); err != nil {
+					t.Fatalf("close parent %s completion writer: %v", tc.backgroundCommand, err)
+				}
+			}
+			runErr := cmd.Wait()
+			if runErr == nil {
+				t.Errorf("rendered snippet exited 0 after %s failed; output:\n%s", tc.failNeedle, out.String())
+			}
+			// The real OpenClaw and Codex snippets intentionally leave a helper
+			// in the background. The foreground shell can return before that
+			// helper finishes opening its HOME log and appending CALL_LOG. Wait on
+			// the command-specific pipe signal before TempDir cleanup; a file poll
+			// would recreate the same cleanup race this barrier prevents.
+			if backgroundReader != nil {
+				if err := backgroundReader.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+					t.Fatalf("set %s completion deadline: %v", tc.backgroundCommand, err)
+				}
+				var signal [1]byte
+				if _, err := backgroundReader.Read(signal[:]); err != nil {
+					t.Fatalf("background %s stub did not signal completion: %v", tc.backgroundCommand, err)
+				}
+			}
+			calls, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatalf("read command log: %v", err)
+			}
+			if !strings.Contains(string(calls), tc.failNeedle) {
+				t.Fatalf("failure command was not reached; calls:\n%s", calls)
+			}
+			for _, forbidden := range tc.mustNotRun {
+				if strings.Contains(string(calls), forbidden) {
+					t.Errorf("dependent command %q ran after configuration failed; calls:\n%s", forbidden, calls)
+				}
+			}
+		})
 	}
 }
 
@@ -304,6 +577,54 @@ func TestChannelMergeScript_RefusesTheMarkerAndLeavesDiskIntact(t *testing.T) {
 	}
 }
 
+// TestChannelMergeScript_RejectsInvalidExistingArrayWithoutModification closes
+// the fail-open parse path. Tokens in this multi-workspace file are shown once;
+// treating malformed or non-array JSON as [] and replacing it destroys every
+// recoverable credential. A repair must be explicit, so the generated merge
+// script must fail and preserve the existing file byte-for-byte.
+func TestChannelMergeScript_RejectsInvalidExistingArrayWithoutModification(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{name: "malformed JSON", value: "not-json"},
+		{name: "valid non-array JSON", value: `{"id":"ws-existing","token":"wst_once"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.MkdirAll(filepath.Dir(envPath(home)), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			before := []byte("KEEP_ME=1\nMOLECULE_WORKSPACES_JSON=" + tc.value + "\nAFTER=still-here\n")
+			if err := os.WriteFile(envPath(home), before, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			entry := `{"id":"ws-abc123","token":"wst_new_TOKEN","platform_url":"https://app.example.com"}`
+			stderr, code := runChannelMerge(t, home, entry)
+			if code == 0 {
+				t.Errorf("merge accepted %s and could overwrite shown-once credentials", tc.name)
+			}
+			if !strings.Contains(stderr, "existing MOLECULE_WORKSPACES_JSON is invalid") {
+				t.Errorf("refusal did not explain the invalid existing array: stderr=%q", stderr)
+			}
+
+			after, err := os.ReadFile(envPath(home))
+			if err != nil {
+				t.Fatalf("refusing merge removed the existing .env: %v", err)
+			}
+			if string(after) != string(before) {
+				t.Errorf("refusing merge changed .env bytes\nbefore: %q\nafter:  %q", before, after)
+			}
+			if _, err := os.Stat(envPath(home) + ".tmp"); err == nil {
+				t.Error("refusing merge left a .env.tmp file")
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("inspect .env.tmp: %v", err)
+			}
+		})
+	}
+}
+
 // TestChannelMergeScript_IsAppendSafeAndIdempotent executes the merge with a
 // REAL token. It is the behavioural half of
 // TestExternalChannelTemplate_ConfigWriteIsAppendSafe, which only greps for the
@@ -429,5 +750,125 @@ func TestKimiSnippet_ShipsTheCurrentBridgeAndTellsTheTruth(t *testing.T) {
 		t.Error("the kimi snippet must detect an already-running bridge and tell the operator to " +
 			"stop it: after the config-dir re-key, an orphaned bridge from the OLD name-slug " +
 			"directory keeps polling, and a second bridge double-processes every inbound message")
+	}
+}
+
+// TestKimiSnippet_CursorPollingIsChronological executes the Python bridge
+// extracted from the rendered operator snippet. GET /activity returns a
+// newest-first feed when since_secs is used without a cursor, but cursor reads
+// are oldest-first. The bridge must normalize only the cold-start response and
+// leave since_secs off steady-state cursor requests; otherwise it replies in
+// reverse, persists the oldest id, replays newer rows, and can lose rows after
+// a poll outage longer than the time window.
+func TestKimiSnippet_CursorPollingIsChronological(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal("python3 is required to execute the rendered Kimi bridge")
+	}
+
+	p := BuildExternalConnectionPayload(
+		"https://app.example.com",
+		"ws-abc123",
+		"My Agent",
+		"wst_live_TESTTOKEN",
+	)
+	kimi, _ := p["kimi_snippet"].(string)
+	const open = "<<'PYEOF'\n"
+	const close = "\nPYEOF\n"
+	start := strings.Index(kimi, open)
+	if start < 0 {
+		t.Fatal("rendered Kimi snippet no longer contains the bridge PYEOF heredoc")
+	}
+	rest := kimi[start+len(open):]
+	end := strings.Index(rest, close)
+	if end < 0 {
+		t.Fatal("rendered Kimi bridge PYEOF heredoc is unterminated")
+	}
+	bridge := rest[:end]
+
+	const harness = `
+import sys
+import types
+
+httpx = types.ModuleType("httpx")
+httpx.Client = object
+sys.modules["httpx"] = httpx
+
+namespace = {"__name__": "kimi_bridge_test"}
+exec(compile(sys.stdin.read(), "kimi_bridge.py", "exec"), namespace)
+
+class Response:
+    status_code = 200
+    def __init__(self, rows):
+        self.rows = rows
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return self.rows
+
+class Client:
+    def __init__(self):
+        self.params = None
+        self.response = Response([
+            {"id": "newest"},
+            {"id": "middle"},
+            {"id": "oldest"},
+        ])
+    def get(self, url, params, headers):
+        self.params = params
+        return self.response
+
+client = Client()
+cold, cursor = namespace["poll_inbound"](client, "https://app.example.com", "ws-abc123", "token", "")
+if client.params.get("since_secs") != "30" or "since_id" in client.params:
+    raise AssertionError(f"cold-start params are not bounded since_secs-only: {client.params!r}")
+if cursor != "":
+    raise AssertionError(f"cold-start cursor changed unexpectedly: {cursor!r}")
+ordered = namespace["order_activity_items"](cold, cursor)
+ids = [item["id"] for item in ordered]
+if ids != ["oldest", "middle", "newest"]:
+    raise AssertionError(f"cold-start order is not chronological: {ids!r}")
+cursor = ""
+for item in ordered:
+    cursor = item["id"]
+if cursor != "newest":
+    raise AssertionError(f"cold-start persisted cursor would be {cursor!r}, want newest")
+
+steady_rows = [
+    {"id": "oldest"},
+    {"id": "middle"},
+    {"id": "newest"},
+]
+client.response = Response(steady_rows)
+steady_rows, cursor = namespace["poll_inbound"](client, "https://app.example.com", "ws-abc123", "token", "middle")
+if client.params.get("since_id") != "middle" or "since_secs" in client.params:
+    raise AssertionError(f"steady-state params are not cursor-only: {client.params!r}")
+if cursor != "middle":
+    raise AssertionError(f"valid steady-state cursor changed unexpectedly: {cursor!r}")
+steady = namespace["order_activity_items"](steady_rows, cursor)
+if [item["id"] for item in steady] != ["oldest", "middle", "newest"]:
+    raise AssertionError("cursor response order was changed")
+
+class GoneResponse:
+    status_code = 410
+    def raise_for_status(self):
+        raise AssertionError("HTTP 410 must be handled before raise_for_status")
+    def json(self):
+        raise AssertionError("HTTP 410 has no activity page")
+
+client.response = GoneResponse()
+gone_rows, cursor = namespace["poll_inbound"](
+    client, "https://app.example.com", "ws-abc123", "token", "pruned-cursor"
+)
+if gone_rows != [] or cursor != "":
+    raise AssertionError(
+        f"HTTP 410 did not reset to bounded cold-start: rows={gone_rows!r} cursor={cursor!r}"
+    )
+`
+
+	cmd := exec.Command(python, "-c", harness)
+	cmd.Stdin = strings.NewReader(bridge)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rendered Kimi bridge violates cursor polling semantics: %v\n%s", err, out)
 	}
 }

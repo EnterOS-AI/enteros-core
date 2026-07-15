@@ -23,20 +23,19 @@ This repo uses the standard monorepo testing convention: **unit tests live with 
 
 Every E2E script here assumes the platform is running at `localhost:8080` and (where noted) provisioned agents are online. See the header comment of each `.sh` for specifics.
 
-## Cleaning up rogue test workspaces
+## Cleaning up an interrupted test workspace
 
 If an E2E run aborts before its teardown runs (Ctrl-C, crash, CI timeout),
-the platform can be left with workspaces whose config volume is stale or
-empty — Docker's `unless-stopped` restart policy then spins those
-containers in a FileNotFoundError loop. The platform's pre-flight check
-(#17) marks such workspaces `failed` on the next restart, but a manual
-cleanup is useful:
+the platform can be left with a workspace whose config volume is stale or
+empty. Use the exact workspace ID printed by that test and delete it through
+the authenticated workspace API. Do not run prefix-based or fleet-wide cleanup
+against a shared staging or production tenant.
 
 ```bash
-bash scripts/cleanup-rogue-workspaces.sh               # deletes ws with id/name starting aaaaaaaa-, bbbbbbbb-, cccccccc-, test-ws-
-MOLECULE_URL=http://host:8080 bash scripts/cleanup-rogue-workspaces.sh
+curl -fsS -X DELETE \
+  -H "Authorization: Bearer ${WORKSPACE_ADMIN_TOKEN}" \
+  "${MOLECULE_URL}/workspaces/${EXACT_WORKSPACE_ID}"
 ```
 
-The script DELETEs each matching workspace via the API and
-force-removes the `ws-<id[:12]>` container as a belt-and-suspenders
-fallback.
+Local-only cleanup may additionally remove that exact workspace's container
+after the API delete. Never infer a destructive selector from a name prefix.

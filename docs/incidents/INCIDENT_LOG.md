@@ -2,7 +2,7 @@
 
 > **This file moved to the internal repo on 2026-04-22.**
 >
-> Content now lives at **`Molecule-AI/internal/security/incident-log.md`**
+> Content now lives at **`molecule-ai/internal/security/incident-log.md`**
 > (private — Molecule AI org members only).
 >
 > Why moved: incident records contain CWE references, file:line

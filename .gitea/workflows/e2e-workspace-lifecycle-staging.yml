@@ -38,9 +38,7 @@ name: E2E Workspace Lifecycle STAGING (dispatch)
 # the reaper per its existing policy.
 
 on:
-  # No workflow_dispatch.inputs — Gitea rejects the whole workflow if an
-  # inputs: map is present (feedback_gitea_workflow_dispatch_inputs_unsupported,
-  # enforced by lint-workflow-yaml).
+  # No workflow_dispatch.inputs under the repository's flat-dispatch policy.
   workflow_dispatch:
 
 concurrency:
@@ -126,7 +124,7 @@ jobs:
       - name: Verify admin token present
         run: |
           if [ -z "$CP_ADMIN_API_TOKEN" ]; then
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
           fi
           echo "Admin token present"

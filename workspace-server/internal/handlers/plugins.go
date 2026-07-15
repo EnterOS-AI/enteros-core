@@ -23,14 +23,11 @@ import (
 // workspace-scoped filtering (handler falls back to unfiltered list).
 type RuntimeLookup func(workspaceID string) (string, error)
 
-// InstanceIDLookup resolves a workspace's EC2 instance_id by ID. Empty
-// string means the workspace is not on the SaaS (EC2-per-workspace)
-// backend — i.e. either local-Docker or pre-provision. The handler uses
-// this to dispatch plugin install/uninstall to the EIC SSH path
-// (template_files_eic.go primitive) when a workspace runs on its own EC2
-// and there's no local Docker container to exec into. A nil lookup keeps
-// the handler on the local-Docker code path only — same shape as the
-// pre-fix behaviour.
+// InstanceIDLookup resolves a workspace's opaque provider instance_id by ID.
+// Empty means no provider id is available yet. Callers shape-route the value:
+// only AWS-shaped `i-*` ids may enter the legacy EIC SSH fallback, while local
+// Docker container names remain on Docker delivery. A nil lookup disables
+// provider-id dispatch and keeps the handler on its local path.
 type InstanceIDLookup func(workspaceID string) (string, error)
 
 // pluginSources is the contract PluginsHandler uses to talk to the
@@ -60,7 +57,7 @@ type PluginsHandler struct {
 	docker           *client.Client   // Docker client for container operations
 	restartFunc      func(string)     // auto-restart workspace after install/uninstall
 	runtimeLookup    RuntimeLookup    // workspace_id → runtime (optional)
-	instanceIDLookup InstanceIDLookup // workspace_id → EC2 instance_id (optional)
+	instanceIDLookup InstanceIDLookup // workspace_id → opaque provider instance_id (optional)
 	// sources narrowed from `*plugins.Registry` to the pluginSources
 	// interface (#1814) so tests can substitute a stub. Production
 	// callers still pass *plugins.Registry, which satisfies the
@@ -68,7 +65,7 @@ type PluginsHandler struct {
 	sources pluginSources
 	// deliverOverride lets tests substitute the container-delivery step of
 	// the post-online reconcile (RFC#2843) without standing up Docker or an
-	// EC2 instance. nil in production → the reconcile calls deliverToContainer.
+	// provider compute. nil in production → the reconcile calls deliverToContainer.
 	deliverOverride func(ctx context.Context, workspaceID string, r *stageResult) error
 }
 
@@ -85,7 +82,7 @@ func (h *PluginsHandler) deliver(ctx context.Context, workspaceID string, r *sta
 }
 
 // NewPluginsHandler constructs a PluginsHandler with the default source
-// registry (local + github resolvers). Deployments can add more schemes
+// registry (local, GitHub, and authenticated Gitea resolvers). Deployments can add more schemes
 // via WithSourceResolver before routes are wired — e.g. a private
 // enterprise registry or ClawHub. Logs the effective install limits
 // exactly once per process on first construction.
@@ -122,10 +119,10 @@ func (h *PluginsHandler) WithRuntimeLookup(lookup RuntimeLookup) *PluginsHandler
 	return h
 }
 
-// WithInstanceIDLookup installs a workspace → EC2 instance_id resolver.
+// WithInstanceIDLookup installs a workspace → opaque provider instance_id resolver.
 // Wired by the router so production hits a real DB; tests stub it. The
-// install/uninstall pipeline uses this to dispatch to the EIC SSH path
-// for SaaS workspaces (no local Docker container to exec into).
+// install/uninstall pipeline shape-routes AWS-shaped ids to the legacy EIC SSH
+// fallback and local container-name ids to Docker.
 func (h *PluginsHandler) WithInstanceIDLookup(lookup InstanceIDLookup) *PluginsHandler {
 	h.instanceIDLookup = lookup
 	return h

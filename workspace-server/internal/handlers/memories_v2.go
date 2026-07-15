@@ -292,10 +292,10 @@ type MemoryView struct {
 	// Score is the plugin's similarity score (1.0 = exact); only
 	// populated when ?q= is set and the plugin supports embedding.
 	Score *float64 `json:"score,omitempty"`
-	// SourceWorkspaceID is parsed out of `propagation.source_workspace_id`
-	// when present (cross-workspace propagation) — lets the canvas
-	// render a "from <peer>" badge so users can tell their own writes
-	// apart from team-shared memory.
+	// SourceWorkspaceID preserves an optional plugin-supplied
+	// `propagation.source_workspace_id` value for API consumers. Core's
+	// built-in memory path does not currently write it, and Canvas does not
+	// render peer attribution from this field.
 	SourceWorkspaceID string `json:"source_workspace_id,omitempty"`
 }
 

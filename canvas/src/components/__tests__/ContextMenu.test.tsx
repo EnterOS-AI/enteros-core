@@ -260,7 +260,7 @@ describe("ContextMenu — menu items", () => {
     mockStoreState.nodes = [{ id: "child1", data: { parentId: "n1" } }];
     render(<ContextMenu />);
     expect(screen.getByRole("menuitem", { name: /arrange/i })).toBeTruthy();
-    expect(screen.getByRole("menuitem", { name: /collapse/i })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Collapse Team View" })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: /zoom/i })).toBeTruthy();
   });
 
@@ -269,15 +269,15 @@ describe("ContextMenu — menu items", () => {
     mockStoreState.nodes = [];
     render(<ContextMenu />);
     expect(screen.queryByRole("menuitem", { name: /arrange/i })).toBeNull();
-    expect(screen.queryByRole("menuitem", { name: /collapse/i })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Collapse Team View" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: /zoom/i })).toBeNull();
   });
 
-  it("shows Collapse Team when collapsed, Expand Team when expanded", () => {
+  it("shows Expand Team View when collapsed", () => {
     openMenu({ nodeData: { name: "Parent", status: "online", tier: 4, role: "", collapsed: true } });
     mockStoreState.nodes = [{ id: "child1", data: { parentId: "n1" } }];
     render(<ContextMenu />);
-    expect(screen.getByRole("menuitem", { name: /expand/i })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Expand Team View" })).toBeTruthy();
   });
 
   it("Delete item has danger styling class", () => {

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""status-reaper — Option B compensating-status POST for Gitea 1.22.6's
-hardcoded `(push)` suffix on default-branch commit statuses.
+"""status-reaper — compensating-status POST for empirically observed
+default-branch `(push)` suffix pollution.
+
+The workaround originated on Gitea 1.22.6. Keep it only while live status
+audits continue to observe the suffix/cancellation artifacts; the server is now
+newer, so version-specific claims below are historical evidence rather than a
+statement of current product capability.
 
 Tracking: this PR (workflow + script + tests + audit issue). Sibling
 bots: internal#327 (publish-runtime-bot), internal#328 (mc-drift-bot).
@@ -64,8 +69,8 @@ What it does NOT do:
     workflow/job has a successful ` (push)` context on the same
     default-branch SHA. That case is post-merge status pollution, not
     an unproven PR gate.
-  - Compensate `error`/`pending` states. Only `failure` — the only one
-    Gitea emits for the hardcoded-suffix bug.
+  - Compensate `error`/`pending` states. Only `failure` matches the
+    historically observed hardcoded-suffix artifact.
   - Write to non-default branches. WATCH_BRANCH is sourced from
     `github.event.repository.default_branch` in the workflow.
   - Mutate workflows or runs. The Actions UI still shows the
@@ -128,9 +133,10 @@ API_RETRIES = int(_env("STATUS_REAPER_API_RETRIES", default="3") or "3")
 API_RETRY_SLEEP_SEC = float(_env("STATUS_REAPER_API_RETRY_SLEEP_SEC", default="2") or "2")
 
 # Compensating-status description prefix. Used as the marker so a human
-# auditing commit statuses can tell at a glance that the green was
-# synthetic, not a real CI pass. Kept stable; downstream tooling
-# (e.g. main-red-watchdog visual diff) MAY key on it.
+# auditing commit statuses can tell at a glance that the green was synthetic,
+# not a real CI pass. These persisted strings intentionally retain their
+# historical 1.22.6 incident labels for downstream compatibility; they are not
+# current server-capability claims. Do not change without auditing consumers.
 PUSH_COMPENSATION_DESCRIPTION = (
     "Compensated by status-reaper (workflow has no push: trigger; "
     "Gitea 1.22.6 hardcoded-suffix bug — see .gitea/scripts/status-reaper.py)"
@@ -154,8 +160,8 @@ CANCELLED_PUSH_COMPENSATION_DESCRIPTION = (
 )
 CANCELLED_DESCRIPTION = "Has been cancelled"
 
-# Context suffix the reaper acts on. Gitea hardcodes this for ALL
-# default-branch workflow runs.
+# Context suffix the reaper acts on. The legacy artifact stamped this suffix
+# onto default-branch workflow runs; live audits determine when to retire it.
 PUSH_SUFFIX = " (push)"
 PULL_REQUEST_SUFFIX = " (pull_request)"
 PULL_REQUEST_TARGET_SUFFIX = " (pull_request_target)"
@@ -446,7 +452,7 @@ def get_head_sha(branch: str) -> str:
 
 
 def get_combined_status(sha: str) -> dict:
-    """Combined commit status for `sha`. Gitea returns:
+    """Combined commit status for `sha`; accepts the repository API shape:
         {
           "state": "success" | "failure" | "pending" | "error",
           "statuses": [
@@ -648,9 +654,9 @@ def reap(
         if not isinstance(s, dict):
             continue
         context = s.get("context") or ""
-        # Schema asymmetry: Gitea 1.22.6 returns the TOP-LEVEL combined
-        # aggregate as `combined.state` but each per-context entry in
-        # `combined.statuses[]` uses the key `status`, NOT `state`.
+        # Legacy 1.22.6 response shape: the top-level combined aggregate used
+        # `combined.state`, while each per-context entry in
+        # `combined.statuses[]` used the key `status`, NOT `state`.
         # Prefer `status`; fall back to `state` so a future Gitea
         # version (or a test fixture written against the wrong key)
         # still flows through the compensation path. Verified empirically
@@ -742,11 +748,11 @@ def reap(
             continue
 
         if (s.get("description") or "").strip() == CANCELLED_DESCRIPTION:
-            # Gitea 1.22.6 maps cancelled action runs to failure commit
-            # statuses. During merge bursts, older push runs can be
-            # superseded and cancelled even though a newer run for the
-            # same branch is the real signal. Compensate only the exact
-            # Gitea cancellation description; real push failures remain red.
+            # Legacy 1.22.6 cancellation mapping: cancelled action runs were
+            # exposed as failure commit statuses. During merge bursts, older
+            # push runs can be superseded and cancelled even though a newer run
+            # for the same branch is the real signal. Compensate only the exact
+            # legacy cancellation description; real push failures remain red.
             post_compensating_status(
                 sha,
                 context,
@@ -802,9 +808,9 @@ def list_recent_commit_shas(branch: str, limit: int) -> list[str]:
     """List the most recent `limit` commit SHAs on `branch`, newest
     first.
 
-    Wraps GET /repos/{o}/{r}/commits?sha={branch}&limit={limit}. Gitea
-    1.22.6 returns a JSON list of commit objects each with a `sha` key
-    (verified via vendor-truth probe 2026-05-11 against
+    Wraps GET /repos/{o}/{r}/commits?sha={branch}&limit={limit}. A historical
+    1.22.6 vendor-truth probe returned a JSON list of commit objects, each with
+    a `sha` key (verified 2026-05-11 against
     git.moleculesai.app — `feedback_smoke_test_vendor_truth_not_shape_match`).
 
     Raises ApiError on non-2xx OR on unexpected response shape. The

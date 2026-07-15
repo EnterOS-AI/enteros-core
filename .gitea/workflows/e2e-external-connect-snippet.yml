@@ -33,9 +33,10 @@ name: E2E External Connect-Snippet + Leak-Lint
 #   local_docker provisioner / resolveTenantPlatformURL) — a different repo,
 #   never touched here.
 #
-# Gitea port notes (per the .gitea/workflows house style):
-#   - no merge_group (no Gitea merge queue), no workflow_dispatch.inputs,
-#     no environment: blocks; GITHUB_SERVER_URL pinned at workflow level.
+# Repository workflow-policy notes:
+#   - no GitHub merge_group, no workflow_dispatch.inputs, and no environment:
+#     coupling; the serialized queue and explicit gates cover those concerns.
+#   - GITHUB_SERVER_URL is pinned at workflow level.
 
 on:
   push:

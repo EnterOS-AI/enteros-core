@@ -24,22 +24,17 @@
 # `feedback_behavior_based_ast_gates` — NOT grep-by-name. That way
 # job renames or matrix-expansion-induced churn produce honest signal.
 #
-# NOTE on protection endpoint scope: `GET /repos/.../branch_protections/{branch}`
-# requires repo-admin role in Gitea 1.22.6. If DRIFT_BOT_TOKEN lacks it,
+# NOTE on protection endpoint scope: the token used here needs repo-admin access
+# for `GET /repos/.../branch_protections/{branch}`. If DRIFT_BOT_TOKEN lacks it,
 # the script skips that branch with a clear ::error:: diagnostic and exits 0
 # (the issue IS the alarm, not a red workflow). See provisioning trail in
 # the run step's GITEA_TOKEN env comment.
 
 name: ci-required-drift
 
-# IMPORTANT — Gitea 1.22.6 parser quirk per
-# `feedback_gitea_workflow_dispatch_inputs_unsupported`: do NOT add an
-# `inputs:` block here, even though stock GitHub Actions allows it.
-# Gitea 1.22.6 flattens `workflow_dispatch.inputs.X` into a sibling of
-# the `on:` event keys and rejects the entire workflow as
-# "unknown on type". The whole file then registers for ZERO events
-# (no schedule, no dispatch). When Gitea ≥ 1.23 lands fleet-wide,
-# this constraint can be revisited.
+# Repository policy keeps this dispatch flat (no `inputs:`) until shared
+# callers and lint fixtures are migrated together. The current Gitea server
+# supports richer dispatch syntax; this is a local compatibility rule.
 on:
   workflow_dispatch:
   pull_request:
@@ -124,8 +119,8 @@ jobs:
           # DRIFT_BOT_TOKEN is owned by mc-drift-bot, a least-privilege
           # Gitea persona whose ONLY job is reading branch_protections
           # and posting the [ci-drift] tracking issue. The endpoint
-          # `GET /repos/.../branch_protections/{branch}` requires
-          # repo-ADMIN role (Gitea 1.22.6) — the default GITHUB_TOKEN and the
+          # `GET /repos/.../branch_protections/{branch}` requires this bot's
+          # repo-admin access — the default GITHUB_TOKEN and the
           # auto-injected GITHUB_TOKEN do NOT have it (read-only / write
           # without admin), so the previous fallback chain 403'd.
           # Mirrors the controlplane fix landed in CP PR#134.

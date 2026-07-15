@@ -15,9 +15,10 @@
  * id "<rowid>:agent") and the live HTTP reply (client-ts, a random UUID) are
  * more than ~3s apart — appendMessageDeduped's 3s window then can't collapse
  * them, and (pre-fix) neither could the id-keyed reconcile merge, so BOTH
- * rendered. The fix (15032a31) collapses them in mergeReconciledMessages within
- * a 60s window. So this spec FORCES the two copies apart by holding the /a2a
- * HTTP reply ~30s, letting the ≤10s DB reconcile render the persisted copy
+ * rendered. The current fix collapses the optimistic and authoritative copies
+ * by stable content identity with count-based one-to-one matching, independent
+ * of elapsed time. This spec still FORCES the two copies apart by holding the
+ * /a2a HTTP reply ~30s, letting the ≤10s DB reconcile render the persisted copy
  * first, then asserting a single rendered reply AFTER the reconcile settles.
  *
  * ── THE TWO THINGS THIS SPEC GOT WRONG BEFORE (run 499907, both fixed here) ──
@@ -50,6 +51,8 @@
  */
 import { test, expect, type Page, type BrowserContext } from "@playwright/test";
 import { agentRepliesForTurn, type SimpleMessage } from "../src/lib/conciergeChatInvariants";
+import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
+import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -81,8 +84,13 @@ function tenantEnv() {
 
 /** Bearer on every request, stub /cp/auth/me, and turn stray 401s into empty
  *  JSON so a workspace-scoped 401 can't yank us to AuthKit. */
-async function authenticate(context: BrowserContext, token: string) {
+async function authenticate(
+  context: BrowserContext,
+  tenantURL: string,
+  token: string,
+) {
   await context.setExtraHTTPHeaders({ Authorization: `Bearer ${token}` });
+  await installStagingWebSocketAuth(context, { token, tenantURL });
   await context.addInitScript(() => {
     window.localStorage.setItem(
       "molecule_cookie_consent",
@@ -202,7 +210,7 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
   // happy path (~60-110s), never waited out on success.
   test.setTimeout(15 * 60 * 1000);
   const { tenantURL, tenantToken } = tenantEnv();
-  await authenticate(context, tenantToken);
+  await authenticate(context, tenantURL, tenantToken);
 
   page.on("console", (m) => {
     if (m.type() === "error") console.log(`[console-error] ${m.text()}`);
@@ -248,7 +256,9 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
     liveReplyAt = Date.now();
   });
 
-  await page.goto(tenantURL, { waitUntil: "domcontentloaded" });
+  await gotoWithNetworkChangeRetry(page, tenantURL, {
+    waitUntil: "domcontentloaded",
+  });
   await page.waitForSelector('[data-testid="nav-home"], [data-testid="hydration-error"]', { timeout: 60_000 });
   expect(await page.locator('[data-testid="hydration-error"]').count(), "canvas hydration failed").toBe(0);
 

@@ -654,7 +654,7 @@ func TestWorkspaceConfig_ResetClaudeSessionFieldPresent(t *testing.T) {
 // ever silently reverts to :latest, we lose the "one bad publish doesn't
 // break every workspace" guarantee.
 func TestSelectImage_PrefersExplicitImage(t *testing.T) {
-	pinned := "ghcr.io/molecule-ai/workspace-template-claude-code@sha256:3d6761a97ed07d7d33cfc19a8fbab81175d9d9179618d493dbc00c5f7ef076a3"
+	pinned := "registry.moleculesai.app/molecule-ai/workspace-template-claude-code@sha256:3d6761a97ed07d7d33cfc19a8fbab81175d9d9179618d493dbc00c5f7ef076a3"
 	got, err := selectImage(WorkspaceConfig{Runtime: "claude-code", Image: pinned})
 	if err != nil {
 		t.Fatalf("selectImage with cfg.Image=pinned: unexpected error %v", err)
@@ -1391,11 +1391,11 @@ func TestRuntimeTagFromImage(t *testing.T) {
 		"workspace-template:openclaw":    "openclaw",
 		"workspace-template:claude-code": "claude-code",
 		"workspace-template:base":        "base",
-		// Current GHCR form produced by molecule-ci's publish-template-image
-		// workflow and consumed by RuntimeImages.
-		"ghcr.io/molecule-ai/workspace-template-hermes:latest":           "hermes",
-		"ghcr.io/molecule-ai/workspace-template-claude-code:latest":      "claude-code",
-		"ghcr.io/molecule-ai/workspace-template-claude-code:sha-abc1234": "claude-code",
+		// Current registry form produced by the template publish workflow and
+		// consumed by RuntimeImages.
+		"registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest":           "hermes",
+		"registry.moleculesai.app/molecule-ai/workspace-template-claude-code:latest":      "claude-code",
+		"registry.moleculesai.app/molecule-ai/workspace-template-claude-code:sha-abc1234": "claude-code",
 		// Fallbacks for non-standard shapes
 		"myregistry.io/foo:v1.2": "v1.2",
 		"no-colon-at-all":        "no-colon-at-all",
@@ -1425,29 +1425,29 @@ func TestImageTagIsMoving(t *testing.T) {
 		want  bool
 	}{
 		// Bare references default to :latest at the registry level.
-		{"bare repo no tag", "ghcr.io/molecule-ai/workspace-template-hermes", true},
+		{"bare repo no tag", "registry.moleculesai.app/molecule-ai/workspace-template-hermes", true},
 		{"bare local image no tag", "workspace-template", true},
 
 		// Explicit moving tags.
-		{"explicit latest", "ghcr.io/molecule-ai/workspace-template-hermes:latest", true},
-		{"explicit staging", "ghcr.io/molecule-ai/workspace-template-hermes:staging", true},
-		{"explicit main", "ghcr.io/molecule-ai/workspace-template-hermes:main", true},
-		{"explicit dev", "ghcr.io/molecule-ai/workspace-template-hermes:dev", true},
-		{"explicit edge", "ghcr.io/molecule-ai/workspace-template-hermes:edge", true},
-		{"explicit nightly", "ghcr.io/molecule-ai/workspace-template-hermes:nightly", true},
-		{"explicit rolling", "ghcr.io/molecule-ai/workspace-template-hermes:rolling", true},
+		{"explicit latest", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest", true},
+		{"explicit staging", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:staging", true},
+		{"explicit main", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:main", true},
+		{"explicit dev", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:dev", true},
+		{"explicit edge", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:edge", true},
+		{"explicit nightly", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:nightly", true},
+		{"explicit rolling", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:rolling", true},
 
 		// Pinned tags — must NOT be classified as moving.
-		{"semver tag", "ghcr.io/molecule-ai/workspace-template-hermes:0.8.2", false},
-		{"semver with v prefix", "ghcr.io/molecule-ai/workspace-template-hermes:v1.2.3", false},
-		{"sha-prefixed commit tag", "ghcr.io/molecule-ai/workspace-template-claude-code:sha-abc1234", false},
-		{"date-stamped tag", "ghcr.io/molecule-ai/workspace-template-hermes:2026-04-30", false},
-		{"build-id tag", "ghcr.io/molecule-ai/workspace-template-hermes:build-12345", false},
+		{"semver tag", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:0.8.2", false},
+		{"semver with v prefix", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:v1.2.3", false},
+		{"sha-prefixed commit tag", "registry.moleculesai.app/molecule-ai/workspace-template-claude-code:sha-abc1234", false},
+		{"date-stamped tag", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:2026-04-30", false},
+		{"build-id tag", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:build-12345", false},
 
 		// Digest pinning — strongest immutability signal, never moving
 		// even if a moving-looking tag is also present.
-		{"digest only", "ghcr.io/molecule-ai/workspace-template-hermes@sha256:abc123def456", false},
-		{"tag plus digest", "ghcr.io/molecule-ai/workspace-template-hermes:latest@sha256:abc123def456", false},
+		{"digest only", "registry.moleculesai.app/molecule-ai/workspace-template-hermes@sha256:abc123def456", false},
+		{"tag plus digest", "registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest@sha256:abc123def456", false},
 
 		// Registry hostname with port — the `:` in `:5000` must NOT be
 		// mistaken for a tag separator. Without this guard, a private
@@ -1480,22 +1480,22 @@ func TestImageTagIsMoving(t *testing.T) {
 // (via %w) for errors.Is chains.
 
 func TestImageNotFoundErrorIncludesPullHint(t *testing.T) {
-	underlying := testErr(`Error response from daemon: No such image: ghcr.io/molecule-ai/workspace-template-openclaw:latest`)
+	underlying := testErr(`Error response from daemon: No such image: registry.moleculesai.app/molecule-ai/workspace-template-openclaw:latest`)
 	if !isImageNotFoundErr(underlying) {
 		t.Fatalf("precondition failed: classifier didn't recognise moby's message")
 	}
 
-	image := "ghcr.io/molecule-ai/workspace-template-openclaw:latest"
+	image := "registry.moleculesai.app/molecule-ai/workspace-template-openclaw:latest"
 	tag := runtimeTagFromImage(image)
 	wrapped := testErr(
-		`docker image "` + image + `" not found after pull attempt — verify GHCR visibility for ` + tag +
-			` and that the tenant has internet access (underlying error: ` + underlying.Error() + `)`,
+		`docker image "` + image + `" not found after pull attempt — verify registry access for ` + tag +
+			` and that the host can reach the configured registry (underlying error: ` + underlying.Error() + `)`,
 	)
 	s := wrapped.Error()
 
 	for _, want := range []string{
-		`"ghcr.io/molecule-ai/workspace-template-openclaw:latest"`,
-		`verify GHCR visibility for openclaw`,
+		`"registry.moleculesai.app/molecule-ai/workspace-template-openclaw:latest"`,
+		`verify registry access for openclaw`,
 		`No such image`,
 	} {
 		if !strings.Contains(s, want) {

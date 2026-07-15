@@ -195,9 +195,9 @@ func resolveConciergeAdminCredential(ctx context.Context, workspaceID string) st
 // SaaS, else the raw ADMIN_TOKEN (see resolveConciergeAdminCredential); the
 // platform URL is the in-cluster PLATFORM_URL (e.g. http://platform:8080). Existing
 // values in env win, so an operator/CP override is never clobbered. No-op for a
-// non-platform workspace. Best-effort: when orgAdminCred is empty (pure-local dev
-// with AdminAuth fail-open) the key is simply absent and the MCP — which only runs
-// on the platform-agent image anyway — is unauthenticated locally.
+// non-platform workspace. Best-effort: when orgAdminCred is empty the key is
+// absent and management MCP calls fail closed; local operators must configure
+// ADMIN_TOKEN rather than relying on unauthenticated bootstrap.
 func conciergePlatformMCPEnv(env map[string]string, workspaceID, orgAdminCred string) {
 	setIfAbsent := func(k, v string) {
 		if v == "" {

@@ -23,7 +23,8 @@ import (
 // /workspaces/:id/delegations/:delegation_id/update, ALSO write an
 // `activity_type='a2a_receive'` row to the caller's activity_logs.
 //
-// Why a flag: the caller's inbox poller (workspace/inbox.py) queries
+// Why a flag: the caller's inbox poller
+// (molecule-ai-workspace-runtime/molecule_runtime/inbox.py) queries
 // `?type=a2a_receive` to surface inbound messages to the agent. Adding
 // a2a_receive rows for delegation results is the universal-sized fix for
 // the 600s message/send timeout class — long-running delegations no

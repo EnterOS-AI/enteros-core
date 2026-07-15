@@ -8,10 +8,12 @@ name: E2E Staging External Runtime
 
 # Ported from .github/workflows/e2e-staging-external.yml on 2026-05-11 per RFC
 # internal#219 §1 sweep. Differences from the GitHub version:
-#   - Dropped `workflow_dispatch.inputs` (Gitea 1.22.6 parser rejects them
-#     per feedback_gitea_workflow_dispatch_inputs_unsupported).
-#   - Dropped `merge_group:` (no Gitea merge queue).
-#   - Dropped `environment:` blocks (Gitea has no environments).
+#   - Kept flat `workflow_dispatch` (no `inputs`) under repository policy;
+#     dispatch callers pass parameters through the established env/var path.
+#   - Omitted GitHub's `merge_group:` trigger; this repository uses its
+#     serialized Gitea queue plus pull-request/push status gates.
+#   - Omitted `environment:` blocks; this repository's approval and secret
+#     gates do not depend on Actions environments.
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
 #   - `continue-on-error: true` on each job (RFC §1 contract).
@@ -26,7 +28,7 @@ name: E2E Staging External Runtime
 #   - The full-saas harness defaults to runtime=hermes, never exercises
 #     external-runtime. Adding an `external` parameter to that script
 #     would force every push to staging through both lifecycles in
-#     series, doubling the EC2 cold-start budget.
+#     series, doubling the live-tenant provisioning budget.
 #   - The external lifecycle has unique timing (REMOTE_LIVENESS_STALE_AFTER
 #     window, 90s default + sweep interval), which we wait through
 #     deliberately. Folding it into hermes would make the long path
@@ -50,8 +52,8 @@ name: E2E Staging External Runtime
 # isolated tenant (`e2e-ext-<date>-<run_id>`), so two commits' runs never
 # corrupt each other — the shared staging quota is a throttling cost, not a
 # corruption risk. A STATIC group would make a newer main push cancel the older
-# commit's run, and on Gitea 1.22.6 a superseded same-group run is CANCELLED
-# (not queued) even with cancel-in-progress:false (status-reaper.yml 69-72),
+# commit's run. A legacy runner incident showed a superseded same-group run
+# could be CANCELLED (not queued) even with cancel-in-progress:false,
 # stamping a cancel-red that wedges the `[*]` queue. cancel-in-progress:false so
 # a half-rolled tenant always finishes its teardown.
 
@@ -115,7 +117,7 @@ jobs:
     #     - register / re-register retry ONLY transient edge 5xx (bounded),
     #       fail closed on 4xx → no more cold-boot-502 flake.
     #   STILL BLOCKS PROMOTION:
-    #     - Single shared staging tenant + EC2 quota window: an infra-side
+    #     - Shared staging molecules-server capacity: an infra-side
     #       provisioning outage (not a code bug) would turn the gate red.
     #       Needs an infra-class vs code-class signal split before required.
     #     - "CP unhealthy → exit 1" currently looks identical to a real
@@ -211,7 +213,7 @@ jobs:
             # missing — silent skip would mask infra rot. Manual dispatch
             # gets the same hard-fail; an operator running this on a fork
             # without secrets configured needs to know up-front.
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
           fi
           echo "Admin token present ✓"

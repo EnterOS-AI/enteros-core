@@ -4,8 +4,8 @@ name: lint-required-workflows-docker-host-pinned
 # pinning `runs-on:` to a Linux-only label.
 #
 # Class defect (internal#512 + mc#1529 + today's oc#81/82/83 + autogen#8):
-# the `ubuntu-latest` label is advertised by BOTH the Linux operator-host
-# runners (molecule-runner-*) AND the Windows act_runner v1.0.3 on
+# the `ubuntu-latest` label is advertised by BOTH the self-hosted Linux
+# docker runners AND the Windows act_runner v1.0.3 on
 # hongming-pc-runner-*. Job placement is non-deterministic. When a docker-
 # bound job lands on a Windows runner, `docker run`/`docker login`/
 # `docker compose` fail with platform-specific errors ("protocol not
@@ -161,8 +161,8 @@ jobs:
                   print(f"  - {f}")
               print()
               print("Why this rule exists (internal#512 + mc#1529):")
-              print("  Bare `ubuntu-latest` is advertised by BOTH Linux operator-host")
-              print("  runners AND Windows hongming-pc-runner-* (act_runner v1.0.3).")
+              print("  Bare `ubuntu-latest` is advertised by BOTH self-hosted Linux")
+              print("  docker runners AND Windows hongming-pc-runner-* (act_runner v1.0.3).")
               print("  Docker-bound jobs that land on Windows fail non-deterministically.")
               print("  Pin to `docker-host` (general) or `publish` (image build/push).")
               sys.exit(1)

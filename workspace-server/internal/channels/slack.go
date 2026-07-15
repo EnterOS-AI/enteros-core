@@ -3,11 +3,14 @@ package channels
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,8 +18,11 @@ import (
 )
 
 const (
-	slackWebhookPrefix = "https://hooks.slack.com/"
-	slackHTTPTimeout   = 10 * time.Second
+	slackWebhookPrefix         = "https://hooks.slack.com/"
+	slackHTTPTimeout           = 10 * time.Second
+	slackSignatureMaxClockSkew = 5 * time.Minute
+	maxSlackWebhookBody        = 1 << 20
+	maxSlackErrorBody          = 4 << 10
 )
 
 var slackHTTPClient = &http.Client{Timeout: slackHTTPTimeout}
@@ -55,8 +61,9 @@ func (s *SlackAdapter) DisplayName() string { return "Slack" }
 
 // ConfigSchema — Slack supports two mutually-exclusive outbound modes:
 // Bot API (bot_token + channel_id, supports per-message identity override)
-// and Incoming Webhook (webhook_url, legacy, no identity override). The
-// form exposes both; ValidateConfig enforces "one or the other".
+// and Incoming Webhook (webhook_url, legacy, no identity override). Inbound
+// Events API and slash-command requests additionally require signing_secret.
+// The form exposes all modes; ValidateConfig enforces the outbound pair.
 func (s *SlackAdapter) ConfigSchema() []ConfigField {
 	return []ConfigField{
 		{
@@ -75,6 +82,15 @@ func (s *SlackAdapter) ConfigSchema() []ConfigField {
 			Required:    false,
 			Placeholder: "C01234ABCDE",
 			Help:        "Required when using Bot Token mode. From the channel's \"View channel details\" dialog.",
+		},
+		{
+			Key:         "signing_secret",
+			Label:       "Signing Secret",
+			Type:        "password",
+			Required:    false,
+			Sensitive:   true,
+			Placeholder: "optional — required for inbound events and slash commands",
+			Help:        "From Slack App settings → Basic Information → App Credentials. Required only when receiving Events API or slash-command requests.",
 		},
 		{
 			Key:         "webhook_url",
@@ -102,6 +118,30 @@ func (s *SlackAdapter) ConfigSchema() []ConfigField {
 			Help:        "Emoji shortcode for per-message avatar. Ignored in Webhook mode.",
 		},
 	}
+}
+
+// VerifySlackSignature authenticates the exact raw request body using Slack's
+// v0 HMAC-SHA256 signing scheme and rejects timestamps outside Slack's
+// five-minute replay window. Missing credentials always fail closed.
+func VerifySlackSignature(body []byte, timestamp, signature, signingSecret string, now time.Time) bool {
+	if timestamp == "" || signature == "" || signingSecret == "" {
+		return false
+	}
+	requestUnix, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return false
+	}
+	clockDelta := now.Unix() - requestUnix
+	maxSkewSeconds := int64(slackSignatureMaxClockSkew / time.Second)
+	if clockDelta > maxSkewSeconds || clockDelta < -maxSkewSeconds {
+		return false
+	}
+
+	mac := hmac.New(sha256.New, []byte(signingSecret))
+	_, _ = mac.Write([]byte("v0:" + timestamp + ":"))
+	_, _ = mac.Write(body)
+	expected := []byte(fmt.Sprintf("v0=%x", mac.Sum(nil)))
+	return hmac.Equal(expected, []byte(signature))
 }
 
 // ValidateConfig checks that the channel config contains a valid Slack
@@ -240,9 +280,12 @@ func (s *SlackAdapter) sendWebhookMessage(ctx context.Context, config map[string
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxSlackErrorBody+1))
 		if readErr != nil {
 			return fmt.Errorf("slack: webhook returned %d (read body failed: %v)", resp.StatusCode, readErr)
+		}
+		if len(body) > maxSlackErrorBody {
+			return fmt.Errorf("slack: webhook returned %d with a response body larger than %d bytes", resp.StatusCode, maxSlackErrorBody)
 		}
 		return fmt.Errorf("slack: webhook returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -334,12 +377,15 @@ func markdownToMrkdwn(text string) string {
 
 // convertTables finds markdown tables and renders them as monospace blocks.
 // Input:  | Col A | Col B |
-//         |-------|-------|
-//         | val1  | val2  |
+//
+//	|-------|-------|
+//	| val1  | val2  |
+//
 // Output: ```
-//         Col A     Col B
-//         val1      val2
-//         ```
+//
+//	Col A     Col B
+//	val1      val2
+//	```
 func convertTables(text string) string {
 	lines := strings.Split(text, "\n")
 	var result []string
@@ -452,7 +498,27 @@ func slackSplitMessage(text string, maxLen int) []string {
 // ParseWebhook handles a Slack slash command or event API POST.
 // The payload is either URL-encoded (slash commands) or JSON (Events API).
 // Returns nil, nil for non-message events (e.g. url_verification challenge).
-func (s *SlackAdapter) ParseWebhook(c *gin.Context, _ map[string]interface{}) (*InboundMessage, error) {
+func (s *SlackAdapter) ParseWebhook(c *gin.Context, config map[string]interface{}) (*InboundMessage, error) {
+	rawBody, err := io.ReadAll(io.LimitReader(c.Request.Body, maxSlackWebhookBody+1))
+	if err != nil {
+		return nil, fmt.Errorf("slack: read body: %w", err)
+	}
+	if len(rawBody) > maxSlackWebhookBody {
+		return nil, fmt.Errorf("slack: webhook body exceeds %d bytes", maxSlackWebhookBody)
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
+
+	signingSecret, _ := config["signing_secret"].(string)
+	if !VerifySlackSignature(
+		rawBody,
+		c.GetHeader("X-Slack-Request-Timestamp"),
+		c.GetHeader("X-Slack-Signature"),
+		signingSecret,
+		time.Now(),
+	) {
+		return nil, fmt.Errorf("slack: request signature verification failed")
+	}
+
 	contentType := c.GetHeader("Content-Type")
 
 	var text, userID, username, channelID, msgID string
@@ -473,11 +539,6 @@ func (s *SlackAdapter) ParseWebhook(c *gin.Context, _ map[string]interface{}) (*
 		}
 	} else {
 		// Slack Events API JSON payload
-		body, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			return nil, fmt.Errorf("slack: read body: %w", err)
-		}
-
 		var payload struct {
 			Type      string `json:"type"`
 			Challenge string `json:"challenge"`
@@ -491,7 +552,7 @@ func (s *SlackAdapter) ParseWebhook(c *gin.Context, _ map[string]interface{}) (*
 				Subtype string `json:"subtype"`
 			} `json:"event"`
 		}
-		if err := json.Unmarshal(body, &payload); err != nil {
+		if err := json.Unmarshal(rawBody, &payload); err != nil {
 			return nil, fmt.Errorf("slack: parse event: %w", err)
 		}
 

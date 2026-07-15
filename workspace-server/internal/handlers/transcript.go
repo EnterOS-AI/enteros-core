@@ -5,9 +5,9 @@
 // (claude-code reads ~/.claude/projects/<cwd>/<session>.jsonl). Other
 // runtimes return supported:false.
 //
-// Why this lives in the platform: docker exec works for local dev but
-// not for remote (Phase 30) workspaces on Fly Machines. The platform's
-// network proxy is the only path that scales to both.
+// Why this lives in the platform: direct container access is a local-only
+// diagnostic. The authenticated network proxy works for both local and
+// provider-managed workspaces.
 package handlers
 
 import (

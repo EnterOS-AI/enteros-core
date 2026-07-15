@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -110,6 +111,301 @@ func TestExternalTemplates_NoBrokenMoleculeAIGitHubURLs(t *testing.T) {
 				t.Errorf("%s contains %q — Molecule-AI GitHub org is suspended; use git.moleculesai.app/molecule-ai/<repo> instead (RFC #229 P2-5)", name, banned)
 			}
 		}
+	}
+}
+
+// TestExternalRuntimeTemplates_InstallPrivateWheelWithPublicDependencies pins
+// the copy-paste install boundary for every snippet backed by
+// molecules-workspace-runtime. The Gitea package registry does not proxy
+// public PyPI, so using it as pip's sole index makes a clean install fail while
+// resolving dependencies such as a2a-sdk. Download the pinned private wheel
+// without dependencies, then install that local artifact with public PyPI as
+// the only resolver index. This also avoids an unrestricted --extra-index-url
+// and its dependency-confusion ambiguity for the private package name.
+func TestExternalRuntimeTemplates_InstallPrivateWheelWithPublicDependencies(t *testing.T) {
+	runtimeTemplates := map[string]string{
+		"externalUniversalMcpTemplate":  externalUniversalMcpTemplate,
+		"externalHermesChannelTemplate": externalHermesChannelTemplate,
+		"externalCodexTemplate":         externalCodexTemplate,
+		"externalOpenClawTemplate":      externalOpenClawTemplate,
+		"externalKimiTemplate":          externalKimiTemplate,
+	}
+
+	for name, body := range runtimeTemplates {
+		for _, required := range []string{
+			"pip download --no-deps",
+			"molecules-workspace-runtime==0.4.6",
+			"pip install --index-url https://pypi.org/simple/",
+			"molecules_workspace_runtime-*.whl",
+		} {
+			if !strings.Contains(body, required) {
+				t.Errorf("%s safe pinned runtime install is missing %q", name, required)
+			}
+		}
+		if strings.Contains(body, "pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecule-ai-workspace-runtime") ||
+			strings.Contains(body, "pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \"molecule-ai-workspace-runtime") {
+			t.Errorf("%s uses the private registry as pip's sole dependency index; clean installs cannot resolve public runtime dependencies", name)
+		}
+	}
+
+	bridgeInstalls := map[string]struct {
+		body string
+		want string
+	}{
+		"externalCodexTemplate": {
+			body: externalCodexTemplate,
+			want: "python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/codex-channel-molecule.git@876e91c46e1ce240cdaf96a720a2864c23bf52a0'",
+		},
+		"externalHermesChannelTemplate": {
+			body: externalHermesChannelTemplate,
+			want: "python3 -m pip install --no-deps 'git+https://git.moleculesai.app/molecule-ai/hermes-channel-molecule.git@d9028c6690394390f3a2b8211a6f6cdc3681971c'",
+		},
+	}
+	for name, tc := range bridgeInstalls {
+		if !strings.Contains(tc.body, tc.want) {
+			t.Errorf("%s must install its bridge from the verified pinned Gitea commit with --no-deps; want %q", name, tc.want)
+		}
+	}
+	if strings.Contains(externalCodexTemplate, "pip install codex-channel-molecule") {
+		t.Error("externalCodexTemplate advertises a nonexistent public codex-channel-molecule distribution")
+	}
+}
+
+// TestExternalOpenClawTemplate_UsesOneProfileAndCurrentConfigInspection keeps
+// every OpenClaw command on the same default profile. `--dev` switches the
+// gateway to ~/.openclaw-dev, where it cannot see the MCP server that the
+// preceding default-profile `openclaw mcp set` wrote. OpenClaw also stores MCP
+// servers inside openclaw.json; there is no per-server mcp/<name>.json file for
+// operators to inspect.
+func TestExternalOpenClawTemplate_UsesOneProfileAndCurrentConfigInspection(t *testing.T) {
+	snippet := BuildExternalConnectionPayload(
+		"https://app.example.com", "ws-abc123", "My Agent", "wst_real_TOKEN",
+	)["openclaw_snippet"].(string)
+
+	for _, stale := range []string{
+		"openclaw gateway --dev",
+		"~/.openclaw/mcp/",
+	} {
+		if strings.Contains(snippet, stale) {
+			t.Errorf("OpenClaw setup contains stale profile/config guidance %q", stale)
+		}
+	}
+
+	for _, required := range []string{
+		"nohup openclaw gateway --port 18789 --bind loopback",
+		"openclaw mcp show molecule-my-agent --json",
+		"~/.openclaw/openclaw.json",
+	} {
+		if !strings.Contains(snippet, required) {
+			t.Errorf("OpenClaw setup is missing current default-profile guidance %q", required)
+		}
+	}
+}
+
+// TestExternalPythonTemplate_UsesPublishedSDKTokenAPI keeps the canvas-served
+// Python example aligned with the SDK that operators actually install from the
+// Gitea package registry. The published RemoteAgentClient does not accept
+// auth_token in its constructor; an existing workspace token must be persisted
+// with save_token before register sends its authenticated announcement.
+func TestExternalPythonTemplate_UsesPublishedSDKTokenAPI(t *testing.T) {
+	if strings.Contains(externalPythonTemplate, "git+https://git.moleculesai.app/") {
+		t.Error("externalPythonTemplate installs SDK source from git+main; use the published molecule-ai-sdk package so the copy-paste path is reproducible")
+	}
+	if strings.Contains(externalPythonTemplate, "pip install molecule-ai-sdk --index-url") {
+		t.Error("externalPythonTemplate uses the private index as the sole install index, which cannot resolve the SDK's public dependencies")
+	}
+	if !strings.Contains(externalPythonTemplate, "molecule-ai-sdk") ||
+		!strings.Contains(externalPythonTemplate, "api/packages/molecule-ai/pypi/simple/") {
+		t.Error("externalPythonTemplate must install molecule-ai-sdk from the Gitea PyPI registry")
+	}
+	for _, required := range []string{
+		"pip download --no-deps",
+		"molecule-ai-sdk==0.5.2",
+		"pip install --index-url https://pypi.org/simple/",
+		"molecule_ai_sdk-*.whl",
+	} {
+		if !strings.Contains(externalPythonTemplate, required) {
+			t.Errorf("externalPythonTemplate safe pinned package install is missing %q", required)
+		}
+	}
+	if strings.Contains(externalPythonTemplate, "pypi/simple/molecule-ai-workspace-runtime/") ||
+		!strings.Contains(externalPythonTemplate, "pypi/simple/molecule-ai-sdk/") {
+		t.Error("externalPythonTemplate help must link to the molecule-ai-sdk package index, not the workspace-runtime package")
+	}
+	if strings.Contains(externalPythonTemplate, "auth_token=AUTH_TOKEN") {
+		t.Error("externalPythonTemplate passes auth_token to RemoteAgentClient, but the published SDK constructor has no such parameter")
+	}
+	if strings.Contains(externalPythonTemplate, "AGENT_URL") {
+		t.Error("externalPythonTemplate help refers to AGENT_URL, but the runnable variable is INBOUND_URL")
+	}
+	for _, required := range []string{
+		`LOCAL_HOST = "127.0.0.1"`,
+		"LOCAL_PORT = 8080",
+		"host=LOCAL_HOST",
+		"port=LOCAL_PORT",
+		"ngrok http 8080",
+	} {
+		if !strings.Contains(externalPythonTemplate, required) {
+			t.Errorf("externalPythonTemplate stable tunnel target is missing %q", required)
+		}
+	}
+	if strings.Contains(externalPythonTemplate, "run_heartbeat_loop_async") {
+		t.Error("externalPythonTemplate calls run_heartbeat_loop_async, but molecule-ai-sdk 0.5.2 exposes the synchronous run_heartbeat_loop API")
+	}
+	if !strings.Contains(externalPythonTemplate, "client.run_heartbeat_loop()") {
+		t.Error("externalPythonTemplate must call the published client's run_heartbeat_loop API")
+	}
+
+	saveAt := strings.Index(externalPythonTemplate, "client.save_token(AUTH_TOKEN)")
+	attachAt := strings.Index(externalPythonTemplate, "client.attach_inbound_server(server)")
+	secretGuardAt := strings.Index(externalPythonTemplate, "if not client.load_platform_inbound_secret():")
+	refuseAt := strings.Index(externalPythonTemplate, "refusing to start unauthenticated A2A server")
+	startAt := strings.Index(externalPythonTemplate, "server.start_in_background()")
+	registerAt := strings.Index(externalPythonTemplate, "client.register()")
+	if saveAt < 0 {
+		t.Fatal("externalPythonTemplate must call client.save_token(AUTH_TOKEN)")
+	}
+	if registerAt < 0 {
+		t.Fatal("externalPythonTemplate must call client.register()")
+	}
+	if attachAt < 0 {
+		t.Fatal("externalPythonTemplate must attach A2AServer so register/heartbeat can feed it the platform inbound secret")
+	}
+	if startAt < 0 {
+		t.Fatal("externalPythonTemplate must start A2AServer")
+	}
+	if secretGuardAt < 0 || refuseAt < 0 {
+		t.Fatal("externalPythonTemplate must refuse to start A2AServer when register does not provide an inbound auth secret")
+	}
+	if saveAt > registerAt {
+		t.Error("externalPythonTemplate must save the existing workspace token before client.register()")
+	}
+	if attachAt > startAt || attachAt > registerAt {
+		t.Error("externalPythonTemplate must attach A2AServer before starting it and before register captures the inbound secret")
+	}
+	if registerAt > startAt {
+		t.Error("externalPythonTemplate must register and capture the inbound secret before starting A2AServer, so inbound requests are fail-closed from the first request")
+	}
+	if secretGuardAt < registerAt || secretGuardAt > startAt || refuseAt > startAt {
+		t.Error("externalPythonTemplate must check the captured inbound secret after register and refuse before A2AServer starts")
+	}
+}
+
+// TestExternalPythonTemplate_HandlerConsumesCanonicalJSONRPCEnvelope executes
+// the rendered handler against the A2A v0.3 wire shape. Substring checks alone
+// missed both the nested params.message path and the kind discriminator.
+func TestExternalPythonTemplate_HandlerConsumesCanonicalJSONRPCEnvelope(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal("python3 is required to execute the operator-facing Python snippet")
+	}
+
+	snippet := strings.Replace(
+		externalPythonTemplate,
+		"if __name__ == \"__main__\":\n    main()",
+		"if False:\n    main()",
+		1,
+	)
+	harness := `
+import sys
+import types
+
+sdk = types.ModuleType("molecule_external_workspace")
+sdk.RemoteAgentClient = object
+sdk.A2AServer = object
+sys.modules["molecule_external_workspace"] = sdk
+` + snippet + `
+
+request = {
+    "jsonrpc": "2.0",
+    "id": "req-1",
+    "method": "message/send",
+    "params": {
+        "message": {
+            "messageId": "msg-1",
+            "role": "user",
+            "parts": [
+                {"kind": "text", "text": "hello "},
+                {"kind": "file", "file": {"uri": "workspace:/brief.pdf"}},
+                {"kind": "text", "text": "world"},
+            ],
+        },
+    },
+}
+got = handle(request)
+want = {"parts": [{"kind": "text", "text": "echo: hello world"}]}
+if got != want:
+    raise AssertionError(f"canonical A2A handler mismatch: got={got!r} want={want!r}")
+`
+	cmd := exec.Command(python, "-c", harness)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rendered Python handler failed canonical A2A semantic check: %v\n%s", err, out)
+	}
+}
+
+// TestExternalPythonTemplate_RefusesServerWithoutInboundSecret executes the
+// negative register path. Core may return 200 without an inbound secret when
+// lazy healing fails; starting the SDK server in that state is legacy
+// unauthenticated passthrough and must never happen in the generated example.
+func TestExternalPythonTemplate_RefusesServerWithoutInboundSecret(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal("python3 is required to execute the operator-facing Python snippet")
+	}
+
+	snippet := strings.Replace(
+		externalPythonTemplate,
+		"if __name__ == \"__main__\":\n    main()",
+		"if False:\n    main()",
+		1,
+	)
+	harness := `
+import sys
+import types
+
+class FakeClient:
+    def __init__(self, workspace_id, **kwargs):
+        self.workspace_id = workspace_id
+    def save_token(self, token):
+        pass
+    def attach_inbound_server(self, server):
+        pass
+    def register(self):
+        return ""
+    def load_platform_inbound_secret(self):
+        return None
+    def run_heartbeat_loop(self):
+        raise AssertionError("heartbeat loop must not start without inbound auth")
+
+class FakeServer:
+    started = False
+    def __init__(self, **kwargs):
+        pass
+    def start_in_background(self):
+        FakeServer.started = True
+    def stop(self):
+        pass
+
+sdk = types.ModuleType("molecule_external_workspace")
+sdk.RemoteAgentClient = FakeClient
+sdk.A2AServer = FakeServer
+sys.modules["molecule_external_workspace"] = sdk
+` + snippet + `
+
+try:
+    main()
+except RuntimeError as exc:
+    if "refusing to start unauthenticated A2A server" not in str(exc):
+        raise
+else:
+    raise AssertionError("missing inbound secret did not fail closed")
+
+if FakeServer.started:
+    raise AssertionError("A2AServer started without an inbound auth secret")
+`
+	cmd := exec.Command(python, "-c", harness)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rendered Python server did not fail closed without inbound auth: %v\n%s", err, out)
 	}
 }
 

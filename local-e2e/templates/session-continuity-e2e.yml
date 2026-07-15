@@ -21,7 +21,7 @@ name: session-continuity-e2e
 #   exact string to the template repo's branch_protection
 #   status_check_contexts list. See README.md for the bake-period rule.
 #
-# Gitea 1.22.6 / act_runner notes (cross-refs to known footguns):
+# Repository runner-compatibility notes (cross-refs to known footguns):
 #   - No cross-repo `uses:` (feedback_gitea_cross_repo_uses_blocked) —
 #     we clone molecule-core via plain git instead.
 #   - Per-SHA concurrency (feedback_concurrency_group_per_sha).

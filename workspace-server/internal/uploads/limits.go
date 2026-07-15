@@ -6,8 +6,8 @@
 //
 //  1. workspace-server Go const  — pendinguploads.MaxFileBytes
 //  2. workspace-server Go const  — handlers.chatUploadMaxBytes
-//  3. workspace Python module    — workspace/inbox_uploads.MAX_FILE_BYTES
-//  4. workspace Python module    — workspace/internal_chat_uploads
+//  3. workspace runtime package  — molecule_runtime/inbox_uploads.MAX_FILE_BYTES
+//  4. workspace runtime package  — molecule_runtime/internal_chat_uploads
 //     .CHAT_UPLOAD_MAX_BYTES / .CHAT_UPLOAD_MAX_FILE_BYTES
 //  5. canvas TypeScript const    — canvas/.../chat/uploads.ts MAX_UPLOAD_BYTES
 //

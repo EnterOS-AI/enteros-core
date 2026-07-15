@@ -72,9 +72,8 @@ on:
       - '.gitea/workflows/staging-tenant-cd.yml'
       - 'scripts/deploy/redeploy-staging-fleet.sh'
       - 'scripts/deploy/advance-staging-tenant-pin.sh'
-  # NOTE: no `workflow_dispatch.inputs:` — Gitea rejects the whole workflow if an
-  # inputs: map is present (feedback_gitea_workflow_dispatch_inputs_unsupported,
-  # enforced by lint-workflow-yaml). Operator overrides are read from repo/org
+  # Repository policy keeps dispatch flat (enforced by lint-workflow-yaml).
+  # Operator overrides are read from repo/org
   # VARS instead: STAGING_TENANT_CD_IMAGE_TAG (roll to a specific tag) and
   # STAGING_TENANT_CD_FORCE_GATE_FAIL=1 (force the e2e gate RED to prove the roll
   # is blocked). Set the var, dispatch, then unset it.

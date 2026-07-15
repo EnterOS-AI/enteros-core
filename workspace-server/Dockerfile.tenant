@@ -4,13 +4,12 @@
 # single container. Go reverse-proxies unknown routes to canvas.
 #
 # Templates + plugins are NOT cloned at build time. They are pre-cloned
-# in the trusted CI context (or operator host) by
+# in a trusted CI or local build context by
 # `scripts/clone-manifest.sh` into `.tenant-bundle-deps/` and COPYed in.
-# The reason: post-2026-05-06, every workspace-template-* repo on Gitea
-# (codex, hermes) plus all 7
-# org-template-* repos are private, so the Docker build can't `git clone`
-# from inside the build context — there's no auth path that doesn't leak
-# the Gitea token into an image layer. Pre-cloning keeps the token in
+# The reason: the manifest can include private template, plugin, or org
+# dependencies, so the Docker build cannot safely rely on unauthenticated
+# clones or pass a Gitea token into an image layer. Public template repos use
+# the same path for one deterministic build contract. Pre-cloning keeps any token in
 # the CI environment only; the resulting image carries the cloned trees
 # with `.git` already stripped (see clone-manifest.sh).
 #
@@ -24,12 +23,13 @@
 #
 # In CI this happens in publish-workspace-server-image.yml's "Pre-clone
 # manifest deps" step (uses AUTO_SYNC_TOKEN = devops-engineer persona).
-# For a manual operator-host build, source the same token from
-# /etc/molecule-bootstrap/agent-secrets.env first.
+# A manual build whose manifest contains private dependencies must likewise
+# supply a narrowly read-scoped Gitea token to clone-manifest.sh without
+# copying it into the image context or build args.
 #
 #   docker buildx build --platform linux/amd64 \
 #     -f workspace-server/Dockerfile.tenant \
-#     -t <ECR>/molecule-ai/platform-tenant:latest \
+#     -t <registry>/molecule-ai/platform-tenant:<immutable-tag> \
 #     --build-arg GIT_SHA=<sha> --build-arg NEXT_PUBLIC_PLATFORM_URL= \
 #     --push .
 
@@ -153,7 +153,7 @@ COPY workspace-server/migrations /migrations
 COPY manifest.json /app/manifest.json
 
 # Templates + plugins (pre-cloned by scripts/clone-manifest.sh in the
-# trusted CI / operator-host context, .git already stripped — see
+# trusted build context, .git already stripped — see
 # .tenant-bundle-deps/ in the build context). The Gitea token used to
 # clone them never enters this image.
 COPY .tenant-bundle-deps/workspace-configs-templates /workspace-configs-templates

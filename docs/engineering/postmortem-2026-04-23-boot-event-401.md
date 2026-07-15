@@ -1,5 +1,11 @@
 # Incident: SaaS tenant provisioning 401 on /cp/tenants/boot-event
 
+> **Historical incident record.** Railway, EC2, AWS Secrets Manager, and the
+> deployment/log-access procedures below describe the April 2026 system at the
+> time of the incident. They are evidence for the root cause, not current
+> operational guidance. Current access and deployment are domain-only and
+> CI-on-merge.
+
 **Date:** 2026-04-23
 **Severity:** High — every new SaaS tenant blocked
 **Detection path:** E2E Staging SaaS run 24848425822 failed at "tenant provisioning"; investigation of CP Railway logs surfaced the auth mismatch.

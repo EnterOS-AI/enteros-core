@@ -31,11 +31,8 @@
 
 name: main-red-watchdog
 
-# IMPORTANT — Gitea 1.22.6 parser quirk per
-# `feedback_gitea_workflow_dispatch_inputs_unsupported`: do NOT add an
-# `inputs:` block here. Gitea 1.22.6 rejects the whole workflow as
-# "unknown on type" when `workflow_dispatch.inputs.X` is present. Revisit
-# when Gitea ≥ 1.23 is fleet-wide.
+# Repository policy keeps this dispatch flat (no `inputs:`) until shared
+# callers and lint fixtures are migrated together.
 on:
   # SCHEDULE RE-ENABLED 2026-05-12 rev3 — interim disable (mc#645) reverted alongside
   # status-reaper rev3 (widen-window). Job-level timeout-minutes raised 5 → 15 below

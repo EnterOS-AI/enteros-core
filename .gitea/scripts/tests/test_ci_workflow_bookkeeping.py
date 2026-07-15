@@ -53,9 +53,9 @@ def test_all_required_is_needs_aggregator_not_a_polling_gate():
 
 
 def test_all_required_does_not_use_if_always():
-    """Plain `needs:` works on Gitea 1.22.6 / act_runner v0.6.1; `needs:` +
-    `if: always()` is BROKEN (feedback_gitea_needs_works_only_ifalways_broken)
-    and would let a non-success need pass the gate. The sentinel must use
+    """Preserve the legacy 1.22.6 / act_runner v0.6.1 compatibility guard:
+    `needs:` + `if: always()` let a non-success need pass the gate
+    (feedback_gitea_needs_works_only_ifalways_broken). The sentinel must use
     plain `needs:` WITHOUT a job-level `if: always()`.
     """
     workflow = load_workflow("ci.yml")

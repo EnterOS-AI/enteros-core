@@ -37,7 +37,7 @@
 #
 # Required env:
 #   MOLECULE_CP_URL        default https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer (Railway CP_ADMIN_API_TOKEN)
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical
 # Optional:
 #   E2E_SEO_TEMPLATE       default seo-agent
 #   E2E_EXPECTED_MODEL     default moonshot/kimi-k2.6
@@ -50,7 +50,7 @@
 set -euo pipefail
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway CP_ADMIN_API_TOKEN}"
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 SEO_TEMPLATE="${E2E_SEO_TEMPLATE:-seo-agent}"
 EXPECTED_MODEL="${E2E_EXPECTED_MODEL:-moonshot/kimi-k2.6}"
 EXPECTED_PLUGIN="${E2E_EXPECTED_PLUGIN:-seo-all}"

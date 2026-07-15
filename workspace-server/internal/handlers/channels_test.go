@@ -16,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
 	channels_crypto "git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
@@ -700,9 +701,8 @@ func TestChannelHandler_Webhook_UnknownType(t *testing.T) {
 // TestChannelHandler_Webhook_InvalidJSON_FallsBack verifies that when the DB
 // row contains invalid JSON for channel_config or allowed_users, the webhook
 // handler logs the error and falls back to an empty map/slice rather than
-// leaving the fields nil (which would panic on downstream code that expects
-// concrete values). With empty config there is no chat_id match, so the
-// handler returns {"status":"no_channel"}.
+// leaving the fields nil. The empty config has no webhook credential, so the
+// public receiver must now reject it rather than route unauthenticated input.
 func TestChannelHandler_Webhook_InvalidJSON_FallsBack(t *testing.T) {
 	mock := setupTestDB(t)
 	handler := NewChannelHandler(newTestChannelManager())
@@ -722,13 +722,13 @@ func TestChannelHandler_Webhook_InvalidJSON_FallsBack(t *testing.T) {
 
 	handler.Webhook(c)
 
-	if w.Code != 200 {
-		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d: %s", w.Code, w.Body.String())
 	}
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["status"] != "no_channel" {
-		t.Errorf("expected status 'no_channel', got %v", resp["status"])
+	if resp["error"] != "webhook authentication failed" {
+		t.Errorf("expected fail-closed authentication error, got %v", resp["error"])
 	}
 }
 
@@ -1133,6 +1133,24 @@ func TestVerifyDiscordSignature_WrongLengthPubKey(t *testing.T) {
 	}
 }
 
+// TestDiscordAuthentication_UsesAdapterConfigKey guards the contract between
+// the Discord adapter's ConfigSchema (which stores "public_key") and the
+// row-bound inbound verifier.
+func TestDiscordAuthentication_UsesAdapterConfigKey(t *testing.T) {
+	pubHex, priv := genDiscordKey(t)
+	body := []byte(`{"type":1}`)
+	req := discordSignedRequest(t, string(body), "1700000000", priv)
+	configured := []channels.ChannelRow{{
+		ID:     "discord-1",
+		Config: map[string]interface{}{"public_key": pubHex},
+	}}
+
+	got := authenticateWebhookCandidates("discord", req, body, configured, time.Now())
+	if len(got) != 1 || got[0].ID != "discord-1" {
+		t.Fatalf("configured public_key did not authenticate its row: %+v", got)
+	}
+}
+
 // TestChannelHandler_Webhook_Discord_NoKey_Returns401 verifies that a Discord
 // webhook request is rejected with 401 when no public key is configured in the
 // DB and DISCORD_APP_PUBLIC_KEY env var is not set.
@@ -1141,9 +1159,7 @@ func TestChannelHandler_Webhook_Discord_NoKey_Returns401(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewChannelHandler(newTestChannelManager())
 
-	// discordPublicKey: DB returns no rows (no Discord channels with app_public_key).
-	mock.ExpectQuery(`SELECT COALESCE\(channel_config->>'app_public_key'`).
-		WillReturnRows(sqlmock.NewRows([]string{"pubkey"}))
+	expectWebhookRows(mock, "discord", webhookDBRows())
 
 	// Ensure env var is not set.
 	t.Setenv("DISCORD_APP_PUBLIC_KEY", "")
@@ -1176,9 +1192,9 @@ func TestChannelHandler_Webhook_Discord_InvalidSig_Returns401(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewChannelHandler(newTestChannelManager())
 
-	// discordPublicKey: DB returns the correct pubHex.
-	mock.ExpectQuery(`SELECT COALESCE\(channel_config->>'app_public_key'`).
-		WillReturnRows(sqlmock.NewRows([]string{"pubkey"}).AddRow(pubHex))
+	expectWebhookRows(mock, "discord", webhookDBRows(struct {
+		id, workspaceID, channelType, config string
+	}{"discord-1", "ws-1", "discord", `{"public_key":"` + pubHex + `"}`}))
 
 	// Build a request signed with the wrong private key.
 	req := discordSignedRequest(t, `{"type":1}`, "1700000000", wrongPriv)
@@ -1201,7 +1217,7 @@ func TestChannelHandler_Webhook_Discord_InvalidSig_Returns401(t *testing.T) {
 
 // TestChannelHandler_Webhook_Discord_ValidSig_PingAccepted verifies that a
 // correctly signed Discord PING (type=1) passes the signature gate and the
-// handler returns 200 (PING returns nil msg → "ignored" status).
+// handler returns Discord's required PONG interaction response.
 func TestChannelHandler_Webhook_Discord_ValidSig_PingAccepted(t *testing.T) {
 	pubHex, priv := genDiscordKey(t)
 
@@ -1209,9 +1225,9 @@ func TestChannelHandler_Webhook_Discord_ValidSig_PingAccepted(t *testing.T) {
 	setupTestRedis(t)
 	handler := NewChannelHandler(newTestChannelManager())
 
-	// discordPublicKey: DB returns pubHex.
-	mock.ExpectQuery(`SELECT COALESCE\(channel_config->>'app_public_key'`).
-		WillReturnRows(sqlmock.NewRows([]string{"pubkey"}).AddRow(pubHex))
+	expectWebhookRows(mock, "discord", webhookDBRows(struct {
+		id, workspaceID, channelType, config string
+	}{"discord-1", "ws-1", "discord", `{"public_key":"` + pubHex + `"}`}))
 
 	body := `{"type":1}`
 	req := discordSignedRequest(t, body, "1700000000", priv)
@@ -1224,12 +1240,16 @@ func TestChannelHandler_Webhook_Discord_ValidSig_PingAccepted(t *testing.T) {
 
 	handler.Webhook(c)
 
-	// Discord PING → ParseWebhook returns nil, nil → handler responds "ignored"
+	// Discord requires {"type":1}; an arbitrary 200 body fails endpoint setup.
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 for valid PING, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "ignored") {
-		t.Errorf("expected body to contain 'ignored', got: %s", w.Body.String())
+	var response map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode PONG response: %v", err)
+	}
+	if response["type"] != float64(1) {
+		t.Errorf("expected Discord PONG type=1, got: %s", w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sqlmock expectations: %v", err)

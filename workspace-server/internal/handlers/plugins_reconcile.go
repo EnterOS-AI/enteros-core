@@ -15,7 +15,7 @@ package handlers
 //     workspace flips to `online` from ANY prior state — provisioning,
 //     offline, awaiting_agent, failed, and degraded→online recovery. A
 //     workspace is only reachable for an install once it is online (the
-//     install pipeline needs a running container or a live EC2 instance), so
+//     install pipeline needs reachable provider compute), so
 //     "just reached online" is exactly the right moment.
 //   - The existing drift_sweeper reconciles UPDATE drift only (tracked_ref
 //     moved) and explicitly does NOT install-missing. Extending it would mean

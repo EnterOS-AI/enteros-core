@@ -1,19 +1,12 @@
 /**
- * Canvas-side mirror of the Go `events.EventType` taxonomy
- * (workspace-server/internal/events/types.go). The Go side is the SSOT;
- * this union keeps the TS consumers (the socket bus + feature panels)
- * honest about which `WSMessage.event` strings can arrive, so a typo in
- * a handler `case` is a compile error rather than a silently-dropped
- * event.
+ * Typed Canvas subset of the Go `events.EventType` taxonomy
+ * (`workspace-server/internal/events/types.go`). The Go side is the SSOT;
+ * this object lists only names consumed through typed Canvas paths, so a typo
+ * in those handlers is a compile error rather than a silently dropped event.
  *
- * Keep this list in sync with the Go `AllEventTypes` slice. When P1 added
- * the unified requests inbox it introduced REQUEST_CREATED / REQUEST_RESPONDED
- * / REQUEST_MESSAGE to the Go taxonomy; those are mirrored here so the canvas
- * Tasks/Approvals tabs can react to them live (RFC unified-requests-inbox, P3).
- *
- * Only the event names the canvas actually consumes need to be exhaustive
- * for type-safety; this file intentionally lists the full known set so the
- * union reads as the contract, not a subset.
+ * Add a name when Canvas begins consuming it; this is intentionally not an
+ * exhaustive mirror of `AllEventTypes`. The unified request names are present
+ * because the Tasks/Approvals UI reacts to them live.
  */
 export const WS_EVENTS = {
   WorkspaceOnline: "WORKSPACE_ONLINE",

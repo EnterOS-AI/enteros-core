@@ -319,7 +319,7 @@ func TestProxyA2A_CrossTenant_RoutingDenied(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.Header.Set("X-Workspace-ID", caller)
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for cross-tenant a2a routing, got %d: %s", w.Code, w.Body.String())
@@ -414,7 +414,7 @@ func TestProxyA2A_SameOrg_RoutingAllowed(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.Header.Set("X-Workspace-ID", caller)
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 	time.Sleep(50 * time.Millisecond) // allow the async logA2ASuccess INSERT to flush
 
 	if w.Code != http.StatusOK {

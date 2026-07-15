@@ -5,13 +5,13 @@
 # Both processes start as non-root. SIGTERM propagates to child processes via the
 # shell's trap + wait -n pattern below.
 #
-# Go platform listens on :8080 (Fly health checks hit this port).
+# Go platform listens on :8080 (deployment health checks hit this port).
 # Canvas Node.js listens on :3000 (internal only).
 # The Go platform's fallback handler proxies non-API routes to :3000
 # so the browser only ever talks to :8080.
 #
-# If either process dies, we kill the other and exit non-zero so Fly
-# restarts the machine.
+# If either process dies, we kill the other and exit non-zero so the
+# container supervisor restarts the service.
 
 set -e
 
@@ -60,8 +60,8 @@ MEMORY_PLUGIN_PID=""
 # The CP-side injections stay valid; they now just re-state the same value.
 #
 # Note the pgvector prerequisite is already satisfied on the paths that matter:
-# LocalDocker.pgImage() defaults to pgvector/pgvector:pg16, and prod/EC2 uses the
-# same. The 2026-05-05 "extension vector is not available" incident is handled by
+# LocalDocker.pgImage() defaults to pgvector/pgvector:pg16, and hosted tenants use
+# the same requirement. The 2026-05-05 "extension vector is not available" incident is handled by
 # the DEGRADE arm below, not by leaving memory off everywhere.
 MEMORY_PLUGIN_BUNDLED_URL="http://localhost:9100"
 if [ -z "$MEMORY_PLUGIN_URL" ]; then
@@ -80,7 +80,7 @@ export MEMORY_PLUGIN_URL
 # ec2.go:2811 both emit MEMORY_PLUGIN_URL='http://localhost:9100'), so set-ness
 # carries no operator intent — it is this same constant, restated. Keying
 # fatal-vs-degrade on it would have made the DEGRADE arm below DEAD CODE on
-# precisely the fleet that motivated it: EC2/Hetzner/GCP is where the 2026-05-05
+# precisely the hosted fleet that motivated it: multiple provider backends saw the 2026-05-05
 # `extension "vector" is not available` crash-loop actually happened.
 memory_plugin_is_bundled=""
 case "$MEMORY_PLUGIN_URL" in
@@ -214,8 +214,9 @@ fi
 
 # Start Go platform in foreground-ish (we trap signals)
 # CANVAS_PROXY_URL tells the platform to proxy unmatched routes to Canvas.
-# CONTAINER_BACKEND: empty = Docker (default for self-hosted/local).
-# Set to "flyio" via Fly machine env to use Fly Machines API instead.
+# CONTAINER_BACKEND: empty = Docker (default for current hosted and self-hosted
+# deployments). The legacy "flyio" adapter remains available for deployments
+# that still explicitly configure it.
 export CANVAS_PROXY_URL="${CANVAS_PROXY_URL:-http://localhost:3000}"
 cd /
 /platform &

@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
 )
@@ -319,14 +320,18 @@ func TestIntegration_Schedules_CRUDRunHistoryHealth_RoundTrip(t *testing.T) {
 		t.Errorf("HISTORY: want 2 entries for our schedule+wsA, got %d: %+v", len(hist), hist)
 	}
 
-	// --- Case 9: HEALTH (self-call) returns health fields only ---
-	// The self-call path (callerID == workspaceID) is always allowed —
-	// no CanCommunicate check fires, no token check fires.
+	// --- Case 9: HEALTH (authenticated self-call) returns health fields only ---
+	// Self-calls skip CanCommunicate only after the source bearer is verified.
+	healthToken, err := wsauth.IssueAPIToken(context.Background(), conn, wsA)
+	if err != nil {
+		t.Fatalf("HEALTH self: issue source token: %v", err)
+	}
 	w = httptest.NewRecorder()
 	c, _ = gin.CreateTestContext(w)
 	c.Params = gin.Params{{Key: "id", Value: wsA}}
 	c.Request = httptest.NewRequest("GET", "/workspaces/"+wsA+"/schedules/health", nil)
 	c.Request.Header.Set("X-Workspace-ID", wsA) // self-call
+	c.Request.Header.Set("Authorization", "Bearer "+healthToken)
 	handler.Health(c)
 	if w.Code != http.StatusOK {
 		t.Fatalf("HEALTH self: status want 200, got %d: %s", w.Code, w.Body.String())

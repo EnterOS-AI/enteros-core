@@ -19,10 +19,11 @@ import (
 //
 // Outbound shape: POST <webhook_url> {"msg_type":"text","content":{"text":"..."}}
 // Inbound shape:  POST <your-registered-url> with one of:
-//   {"type":"url_verification","challenge":"...","token":"..."}     (handshake)
-//   {"schema":"2.0","header":{"token":"...","event_type":"im.message.receive_v1"},
-//    "event":{"sender":{"sender_id":{"user_id":"..."}},
-//             "message":{"message_id":"...","chat_id":"...","content":"{\"text\":\"hi\"}"}}}
+//
+//	{"type":"url_verification","challenge":"...","token":"..."}     (handshake)
+//	{"schema":"2.0","header":{"token":"...","event_type":"im.message.receive_v1"},
+//	 "event":{"sender":{"sender_id":{"user_id":"..."}},
+//	          "message":{"message_id":"...","chat_id":"...","content":"{\"text\":\"hi\"}"}}}
 //
 // Two URL families are accepted: open.feishu.cn (China) and open.larksuite.com
 // (international). Both speak the same payload format — only the host differs.
@@ -32,15 +33,17 @@ const (
 	larkFeishuPrefix    = "https://open.feishu.cn/open-apis/bot/v2/hook/"
 	larkLarkSuitePrefix = "https://open.larksuite.com/open-apis/bot/v2/hook/"
 	larkHTTPTimeout     = 10 * time.Second
+	maxLarkWebhookBody  = 1 << 20
+	maxLarkResponseBody = 64 << 10
 )
 
 func (l *LarkAdapter) Type() string        { return "lark" }
 func (l *LarkAdapter) DisplayName() string { return "Lark / Feishu" }
 
-// ConfigSchema — Lark Custom Bot webhook URL + optional Event Subscription
-// verify token. The webhook URL already encodes the chat, so no separate
-// chat_id field is needed (and StartPolling is a no-op for Lark — inbound
-// is delivered by ParseWebhook from the Event Subscription callback).
+// ConfigSchema — Lark Custom Bot webhook URL for outbound delivery, plus the
+// chat ID and verification token used by Event Subscription callbacks. The
+// inbound fields remain optional so outbound-only Custom Bot configs work;
+// the public receiver fails closed unless both are present for routing.
 func (l *LarkAdapter) ConfigSchema() []ConfigField {
 	return []ConfigField{
 		{
@@ -51,6 +54,14 @@ func (l *LarkAdapter) ConfigSchema() []ConfigField {
 			Sensitive:   true,
 			Placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
 			Help:        "From the Lark/Feishu bot page → Webhook settings. open.feishu.cn (China) and open.larksuite.com (international) both accepted.",
+		},
+		{
+			Key:         "chat_id",
+			Label:       "Lark Chat ID",
+			Type:        "text",
+			Required:    false,
+			Placeholder: "optional — required for inbound events",
+			Help:        "Chat ID from an im.message.receive_v1 event. Required only when routing inbound Event Subscription messages.",
 		},
 		{
 			Key:         "verify_token",
@@ -64,10 +75,34 @@ func (l *LarkAdapter) ConfigSchema() []ConfigField {
 	}
 }
 
+// VerifyLarkWebhookToken authenticates either a v1 URL-verification payload
+// (top-level token) or a v2 event payload (header.token). Missing configured
+// tokens and malformed payloads fail closed.
+func VerifyLarkWebhookToken(body []byte, expected string) bool {
+	if expected == "" {
+		return false
+	}
+	var envelope struct {
+		Type   string `json:"type"`
+		Token  string `json:"token"`
+		Header struct {
+			Token string `json:"token"`
+		} `json:"header"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return false
+	}
+	received := envelope.Header.Token
+	if envelope.Type == "url_verification" {
+		received = envelope.Token
+	}
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(received)) == 1
+}
+
 // ValidateConfig requires webhook_url to point at a Lark or Feishu Custom
-// Bot endpoint. verify_token is optional — when set, inbound events with a
-// mismatching token are rejected (use Lark's "Verification Token" from the
-// app's Event Subscriptions page).
+// Bot endpoint. verify_token and chat_id are optional for outbound-only rows;
+// the public Event Subscription receiver requires and verifies the token, then
+// binds the event's chat ID to the configured row.
 func (l *LarkAdapter) ValidateConfig(config map[string]interface{}) error {
 	webhookURL, _ := config["webhook_url"].(string)
 	if webhookURL == "" {
@@ -119,9 +154,12 @@ func (l *LarkAdapter) SendMessage(ctx context.Context, config map[string]interfa
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, readErr := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxLarkResponseBody+1))
 	if readErr != nil {
 		return fmt.Errorf("lark: read response body: %w", readErr)
+	}
+	if len(body) > maxLarkResponseBody {
+		return fmt.Errorf("lark: response body exceeds %d bytes", maxLarkResponseBody)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("lark: webhook returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
@@ -143,18 +181,25 @@ func (l *LarkAdapter) SendMessage(ctx context.Context, config map[string]interfa
 // ParseWebhook handles both the url_verification handshake and event_callback
 // payloads from Lark Event Subscriptions.
 //
-// The handshake (`type: "url_verification"`) returns nil, nil; the calling
-// HTTP handler is responsible for echoing the challenge back to Lark — this
-// matches the Slack pattern in slack.go (kept consistent so the receiver
-// layer can stay generic).
+// The handshake (`type: "url_verification"`) writes the required challenge
+// response and returns nil, nil, matching the Slack adapter's handshake
+// behavior.
 //
 // For event_callback we currently only surface the v2 message receive event
 // (im.message.receive_v1). Other event types (reactions, member changes)
 // return nil, nil so the receiver responds 200 OK without dispatching.
 func (l *LarkAdapter) ParseWebhook(c *gin.Context, config map[string]interface{}) (*InboundMessage, error) {
-	body, err := io.ReadAll(c.Request.Body)
+	expectedToken, _ := config["verify_token"].(string)
+	if expectedToken == "" {
+		return nil, fmt.Errorf("lark: verify_token not configured")
+	}
+
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxLarkWebhookBody+1))
 	if err != nil {
 		return nil, fmt.Errorf("lark: read body: %w", err)
+	}
+	if len(body) > maxLarkWebhookBody {
+		return nil, fmt.Errorf("lark: webhook body exceeds %d bytes", maxLarkWebhookBody)
 	}
 
 	// Probe for a v1 url_verification handshake first — it has a top-level
@@ -168,11 +213,10 @@ func (l *LarkAdapter) ParseWebhook(c *gin.Context, config map[string]interface{}
 		// Verify token if operator configured one. Constant-time compare —
 		// see #337: any place we compare a user-supplied value against a
 		// stored secret must use subtle.ConstantTimeCompare.
-		if expected, _ := config["verify_token"].(string); expected != "" {
-			if subtle.ConstantTimeCompare([]byte(expected), []byte(probe.Token)) != 1 {
-				return nil, fmt.Errorf("lark: url_verification token mismatch")
-			}
+		if subtle.ConstantTimeCompare([]byte(expectedToken), []byte(probe.Token)) != 1 {
+			return nil, fmt.Errorf("lark: url_verification token mismatch")
 		}
+		c.JSON(http.StatusOK, gin.H{"challenge": probe.Challenge})
 		return nil, nil
 	}
 
@@ -192,11 +236,11 @@ func (l *LarkAdapter) ParseWebhook(c *gin.Context, config map[string]interface{}
 				} `json:"sender_id"`
 			} `json:"sender"`
 			Message struct {
-				MessageID  string `json:"message_id"`
-				ChatID     string `json:"chat_id"`
-				ChatType   string `json:"chat_type"`
+				MessageID   string `json:"message_id"`
+				ChatID      string `json:"chat_id"`
+				ChatType    string `json:"chat_type"`
 				MessageType string `json:"message_type"`
-				Content    string `json:"content"` // JSON-encoded string, e.g. {"text":"hi"}
+				Content     string `json:"content"` // JSON-encoded string, e.g. {"text":"hi"}
 			} `json:"message"`
 		} `json:"event"`
 	}
@@ -205,10 +249,8 @@ func (l *LarkAdapter) ParseWebhook(c *gin.Context, config map[string]interface{}
 	}
 
 	// Verify token on event_callback too — same constant-time rule.
-	if expected, _ := config["verify_token"].(string); expected != "" {
-		if subtle.ConstantTimeCompare([]byte(expected), []byte(payload.Header.Token)) != 1 {
-			return nil, fmt.Errorf("lark: event token mismatch")
-		}
+	if subtle.ConstantTimeCompare([]byte(expectedToken), []byte(payload.Header.Token)) != 1 {
+		return nil, fmt.Errorf("lark: event token mismatch")
 	}
 
 	if payload.Header.EventType != "im.message.receive_v1" {

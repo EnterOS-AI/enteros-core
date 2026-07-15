@@ -5,10 +5,12 @@ name: E2E Staging SaaS (full lifecycle)
 
 # Ported from .github/workflows/e2e-staging-saas.yml on 2026-05-11 per RFC
 # internal#219 §1 sweep. Differences from the GitHub version:
-#   - Dropped `workflow_dispatch.inputs` (Gitea 1.22.6 parser rejects them
-#     per feedback_gitea_workflow_dispatch_inputs_unsupported).
-#   - Dropped `merge_group:` (no Gitea merge queue).
-#   - Dropped `environment:` blocks (Gitea has no environments).
+#   - Kept flat `workflow_dispatch` (no `inputs`) under repository policy;
+#     dispatch callers pass parameters through the established env/var path.
+#   - Omitted GitHub's `merge_group:` trigger; this repository uses its
+#     serialized Gitea queue plus pull-request/push status gates.
+#   - Omitted `environment:` blocks; this repository's approval and secret
+#     gates do not depend on Actions environments.
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
 #   - `continue-on-error: true` on each job (RFC §1 contract).
@@ -19,12 +21,12 @@ name: E2E Staging SaaS (full lifecycle)
 # HMA memory → activity → peers), then tears down and asserts leak-free.
 #
 # Why a separate workflow (not folded into ci.yml):
-#   - The run takes ~25-35 min (EC2 boot + cloudflared DNS + provision sweeps +
-#     agent bootstrap), way too slow for every PR.
+#   - The live tenant journey includes provision, registration, agent work, and
+#     teardown, so it needs an isolated workflow and a generous timeout.
 #   - Needs its own concurrency group so two pushes don't fight over the
 #     same staging org slug prefix.
-#   - Has its own required secrets (session cookie, admin token) that most
-#     PRs don't need to read.
+#   - Uses an Infisical-sourced staging admin credential and platform defaults
+#     that ordinary unit jobs do not need.
 #
 # Triggers:
 #   - Push to main (regression guard — fires on merges to main, not on PR updates)
@@ -68,9 +70,9 @@ on:
   # pull_request. The `E2E Staging Concierge Creates Workspace` job is now in
   # .gitea/required-contexts.txt (merge-blocking), and lint-required-no-paths
   # rejects any required workflow that path-filters its `on:` block — a
-  # path-filtered required context degrades the merge gate to a silent
-  # indefinite pending (Gitea 1.22.6 reports it as pending, never success,
-  # for PRs whose diff doesn't match the glob — wedging docs-only PRs
+  # path-filtered required context degrades the repository's merge gate to a
+  # silent indefinite pending when no status is emitted for a non-matching
+  # PR — wedging docs-only PRs
   # forever; see feedback_path_filtered_workflow_cant_be_required).
   #
   # Per-job gating is moved to the job level (`if:` guards below) so the
@@ -92,10 +94,10 @@ on:
 # is a status-reporting deploy gate, NOT a shared-fleet mutator: every run
 # provisions its OWN isolated org (slug `e2e-<date>-<run_id>`, see E2E_RUN_ID
 # below), so two commits' runs never corrupt each other's data. A STATIC group
-# would make a newer main push cancel the older commit's in-flight run — and on
-# Gitea 1.22.6 a superseded same-group run is CANCELLED (not queued) even with
-# cancel-in-progress:false (status-reaper.yml lines 69-72, DB-verified
-# 2026-05-12), stamping a cancel-red that wedges the `[*]` merge queue. Per-SHA
+# would make a newer main push cancel the older commit's in-flight run. A
+# legacy 2026-05-12 runner incident showed a superseded same-group run could be
+# CANCELLED (not queued) even with cancel-in-progress:false, stamping a
+# cancel-red that wedges the `[*]` merge queue. Per-SHA
 # gives each commit its own group so neither cancels the other. cancel-in-
 # progress:false keeps a teardown from being aborted mid-run (orphan-leak guard).
 # The finite staging org-creation quota is a throttling cost, not a corruption
@@ -320,7 +322,7 @@ jobs:
               echo "PR-mode (E2E_REQUIRE_LIVE=0): no MOLECULE_ADMIN_TOKEN — harness will self-check (bash -n) and exit 0 green ✓"
               exit 0
             fi
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
           fi
           if [ "${E2E_AWS_LEAK_CHECK}" = "required" ]; then
@@ -877,7 +879,7 @@ jobs:
               echo "PR-mode: no MOLECULE_ADMIN_TOKEN (E2E_REQUIRE_LIVE=0) — harness will self-check and skip the live boot ✓"
               exit 0
             fi
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
           fi
           # Leak-check is a no-op on molecules-server (leak=off), so AWS creds are
@@ -1089,7 +1091,7 @@ jobs:
               echo "PR-mode: no MOLECULE_ADMIN_TOKEN — live boot gated off; bash -n self-check is the PR gate ✓"
               exit 0
             fi
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
           fi
           # Leak-check is a no-op on molecules-server (leak=off), so AWS creds are
@@ -1270,7 +1272,7 @@ jobs:
               echo "PR-mode: no CP_ADMIN_API_TOKEN — go test will requireStagingEnv-skip LOUD (compile+skip, exit 0 green) ✓"
               exit 0
             fi
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
           fi
           echo "Admin token present"
@@ -1698,7 +1700,7 @@ jobs:
               echo "PR-mode: no CP_ADMIN_API_TOKEN — go tests will requireStagingEnv-skip LOUD (compile+skip, exit 0 green) ✓"
               exit 0
             fi
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
           fi
           echo "Admin token present"
@@ -1832,7 +1834,7 @@ jobs:
               echo "PR-mode: no CP_ADMIN_API_TOKEN — go test will requireStagingEnv-skip LOUD (compile+skip, exit 0 green) ✓"
               exit 0
             fi
-            echo "::error::CP_STAGING_ADMIN_API_TOKEN secret not set (Railway staging CP_ADMIN_API_TOKEN)"
+            echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
           fi
           echo "Admin token present"

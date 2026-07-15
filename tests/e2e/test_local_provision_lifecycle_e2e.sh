@@ -685,9 +685,9 @@ echo ""
 # Step 4 — RESTART-SURVIVAL (the assertion that would have caught the bug).
 # ----------------------------------------------------------------------------
 echo "--- Step 4: restart-survival (POST /workspaces/$WSID/restart) ---"
-# Re-mint the workspace bearer: every (re)provision rotates the workspace token
-# (issueAndInjectToken -> RevokeAllForWorkspace + IssueToken), so the Step-2
-# token is now stale. /restart is WorkspaceAuth-gated, so mint a fresh one.
+# Mint an explicit API-kind workspace bearer for restart and the A2A checks
+# below. Provisioning rotates only runtime-held instance tokens; this caller-held
+# API token survives the restart and remains valid for send + queue polling.
 WTOKEN=$(e2e_mint_workspace_token "$WSID" || true)
 if [ -z "$WTOKEN" ]; then
   fail "could not mint fresh workspace token for restart"
@@ -794,6 +794,8 @@ A2A_TMP=$(mktemp)
 set +e
 A2A_CODE=$(curl -s -o "$A2A_TMP" -w '%{http_code}' --max-time "$A2A_CEIL" \
   -X POST "$BASE/workspaces/$WSID/a2a" \
+  -H "Authorization: Bearer $WTOKEN" \
+  -H "X-Workspace-ID: $WSID" \
   -H "Content-Type: application/json" \
   -d "$A2A_BODY")
 A2A_RC=$?
@@ -842,6 +844,7 @@ except Exception:
     : >"$A2A_POLL_TMP"
     set +e
     curl -s -o "$A2A_POLL_TMP" -w '%{http_code}' --max-time 30 \
+      -H "Authorization: Bearer $WTOKEN" \
       -H "X-Workspace-ID: $WSID" \
       "$BASE/workspaces/$WSID/a2a/queue/$A2A_QID" >/dev/null 2>&1
     set -e

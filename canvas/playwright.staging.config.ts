@@ -6,7 +6,7 @@
  *   - Retries + timeouts can be longer (staging is remote + shared)
  *   - baseURL is dynamic (set by globalSetup → STAGING_TENANT_URL)
  *
- * Invoked by the e2e-staging-canvas GH Actions workflow:
+ * Invoked by the e2e-staging-canvas Gitea Actions workflow:
  *   npx playwright test --config=playwright.staging.config.ts
  */
 
@@ -18,8 +18,8 @@ export default defineConfig({
   // unit specs (chat-separation, filestab-smoke, etc.) stay on the local
   // config so they don't hit staging.
   testMatch: /staging-.*\.spec\.ts/,
-  // Global setup provisions the org; budget generously because EC2 boot
-  // is ~5 min and can drift to 10+ on cold AMI days.
+  // Global setup provisions the org and a real workspace host; keep the
+  // suite budget independent of provider-specific cold-boot latency.
   timeout: 120_000,
   expect: { timeout: 15_000 },
   fullyParallel: false,
@@ -29,8 +29,8 @@ export default defineConfig({
   // only mask a genuine bug and burn ~6 min each on the single shared staging
   // runner (the greeting + tabs specs each retried 3× at ~6.1m against a
   // deterministic missing-input red, wasting ~18 min per spec). A genuinely
-  // transient network class is handled by scoped in-test polls, not a
-  // whole-suite replay.
+  // transient Chromium page.goto net::ERR_NETWORK_CHANGED gets one bounded
+  // in-test navigation retry; every other failure still escapes immediately.
   retries: 0,
   // One worker: the setup provisions exactly one org/workspace, and
   // parallel specs would fight over the shared workspace selector state.

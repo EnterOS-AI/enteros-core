@@ -21,7 +21,7 @@ package handlers
 //
 // Layer placement (3-layer defense-in-depth, RFC#523 §"Proposed guardrail"):
 //   - L1 (this file): provisioner-side abort BEFORE container start
-//   - L2 (workspace/entrypoint.sh + template-* start.sh): in-container
+//   - L2 (standalone template entrypoint/start scripts): in-container
 //     env-grep + exit 1 — defense-in-depth if L1 is bypassed
 //   - L3 (.gitea/workflows/lint-forbidden-env-keys.yml): CI lint that
 //     scans Go code under workspace-server/ for new writers that
@@ -54,13 +54,10 @@ import (
 //     admin API access.
 //   - Secret-store operator tokens: bootstrap-scope tokens for the
 //     central secret store.
-//   - Infra-platform tokens: deploy / fleet-management creds.
-//   - Operator-host pointers: hostnames / addresses that identify
-//     the operator host. Per the open-source-template rule these
-//     are MOLECULE_OPERATOR_HOST style prefixes; the literal
-//     prefix is matched but the test for membership reads from
-//     this map, not from a hardcoded constant in the deny rule
-//     itself.
+//   - Infra-platform tokens: deploy / fleet-management credentials.
+//   - Retired operator-host pointers: legacy MOLECULE_OPERATOR_HOST-style
+//     variables are denied so old configuration cannot reintroduce a
+//     privileged host address into an untrusted workspace.
 //
 // Per-agent persona PATs (e.g. AGENT_DEV_A_TOKEN style names —
 // not operator-fleet scope) are NOT on this list. The guard
@@ -104,8 +101,8 @@ var forbiddenTenantEnvKeys = map[string]struct{}{
 	"MOLECULE_TEMPLATE_REPO_TOKEN": {},
 
 	// Static cloud IAM keys (security-audit H2). A long-lived AWS access
-	// key baked into a box is fleet-wide; ECR auth must be a short-TTL
-	// docker-login password minted server-side, never an IAM key/secret.
+	// key in a workspace is fleet-wide and remains forbidden even though the
+	// current Molecule deployment no longer uses AWS/ECR.
 	"AWS_ACCESS_KEY_ID":     {},
 	"AWS_SECRET_ACCESS_KEY": {},
 	"AWS_SESSION_TOKEN":     {},

@@ -77,8 +77,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	r.Use(metrics.Middleware())
 
 	// Tenant guard — the public repo's only SaaS hook. When MOLECULE_ORG_ID is
-	// set (only by the private molecule-controlplane provisioner on tenant Fly
-	// Machines), rejects requests whose X-Molecule-Org-Id header doesn't match.
+	// set by the control plane on a managed tenant, rejects requests whose
+	// X-Molecule-Org-Id header doesn't match.
 	// Unset (self-hosted / dev / CI) → no-op. Registered after metrics so
 	// rejected requests still land on the 4xx counter.
 	r.Use(middleware.TenantGuard())
@@ -187,7 +187,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// broadcast_enabled or talk_to_user_enabled.
 		wsAdmin.PATCH("/workspaces/:id/abilities", handlers.PatchAbilities)
 		// Out-of-band bootstrap signal: CP's watcher POSTs here when it
-		// detects "RUNTIME CRASHED" in a workspace EC2 console output,
+		// detects "RUNTIME CRASHED" in a workspace provider boot log,
 		// so the canvas flips to failed in seconds instead of waiting
 		// for the 10-minute provision-timeout sweeper.
 		wsAdmin.POST("/admin/workspaces/:id/bootstrap-failed", wh.BootstrapFailed)
@@ -201,8 +201,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAdmin.POST("/admin/workspaces/:id/revoke-auth-tokens", wh.RevokeAuthTokens)
 		// Repoint a workspace's instance_id + compute.provider at the box on its
 		// NEW cloud after a cross-cloud migration cutover (#806). Without this the
-		// tenant's CP-instance reconciler keeps polling the stale (terminated) AWS
-		// instance_id, sees "offline", and self-heals by re-provisioning on AWS —
+		// tenant's CP-instance reconciler keeps polling the stale source-provider
+		// instance_id, sees "offline", and self-heals on the old provider —
 		// fighting the migration into a split-brain. Pure record repoint (no
 		// deprovision); the CP migrator calls it once the cutover is verified.
 		wsAdmin.POST("/admin/workspaces/:id/set-compute-instance", wh.SetComputeInstance)
@@ -225,7 +225,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAdmin.GET("/admin/llm/offered-models", handlers.ListOfferedModels)
 		// Proxy to CP's serial-console endpoint so the canvas's "View
 		// Logs" button can render the actual boot trace without handing
-		// the tenant AWS credentials. Admin-gated because console output
+		// the tenant provider credentials. Admin-gated because boot output
 		// can include user-data snippets we treat as semi-sensitive.
 		wsAdmin.GET("/workspaces/:id/console", wh.Console)
 		// Display sessions will eventually return short-lived proxied DCV
@@ -249,7 +249,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAdmin.POST("/admin/memories/import", adminMemH.Import)
 	}
 
-	// A2A proxy — registered outside the auth group; already enforces CanCommunicate access control.
+	// A2A proxy — registered outside the shared auth group because workspace and
+	// privileged Canvas callers use different credential contracts. ProxyA2A
+	// authenticates the public request itself, binds workspace bearer ownership,
+	// then applies CanCommunicate to workspace-to-workspace calls.
 	r.POST("/workspaces/:id/a2a", wh.ProxyA2A)
 
 	// core#3319: A2A inbound endpoint for external agents. Authenticates with the
@@ -298,8 +301,9 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.POST("/broadcast", broadcastH.Broadcast)
 
 		// External-workspace credential lifecycle (issue #319 follow-up to
-		// the Create flow). Both endpoints reject runtime ≠ external with
-		// 400 — see external_rotate.go for the rationale.
+		// the Create flow). Both endpoints accept external-like BYO-compute
+		// runtimes and reject container-backed runtimes with 400 — see
+		// external_rotate.go for the rationale.
 		//
 		//   POST .../external/rotate     — mint fresh token, revoke prior,
 		//                                  return ExternalConnectionInfo
@@ -555,10 +559,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.DELETE("/schedules/:scheduleId", schedh.Delete)
 		wsAuth.POST("/schedules/:scheduleId/run", schedh.RunNow)
 		wsAuth.GET("/schedules/:scheduleId/history", schedh.History)
-		// Schedule health — open to CanCommunicate peers (no workspace bearer token
-		// required) so peer agents can detect silent cron failures without admin auth.
-		// Auth is enforced inside the handler via X-Workspace-ID + CanCommunicate
-		// (mirrors the /workspaces/:id/a2a pattern). Issue #249.
+		// Schedule health — available to authenticated CanCommunicate peers so
+		// agents can detect silent cron failures without admin auth. The handler
+		// requires an explicit X-Workspace-ID plus that workspace's source-bound
+		// bearer; verified human credentials bypass hierarchy. Issue #249.
 		r.GET("/workspaces/:id/schedules/health", schedh.Health)
 
 		// Budget — per-workspace spend ceiling and current usage (#541).
@@ -665,8 +669,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	}
 
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
-	// Fix (Cycle 7): protected by AdminAuth — any valid workspace bearer token grants access.
-	// Fail-open when no tokens exist (fresh install / pre-Phase-30 upgrade).
+	// Protected by strict AdminAuth: a missing or invalid bearer is rejected in
+	// every environment, including fresh installs, and datastore errors fail closed.
 	{
 		adminAuth := r.Group("", middleware.AdminAuth(db.DB))
 		sechGlobal := handlers.NewSecretsHandler(wh.RestartByID)
@@ -698,8 +702,8 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// Admin — cross-workspace schedule health monitoring (issue #618).
 	// Lets cron-audit agents and operators detect silent schedule failures
 	// across all workspaces without holding individual workspace bearer tokens.
-	// AdminAuth mirrors the /admin/liveness gate — fail-open on fresh install,
-	// strict bearer-only once any token exists.
+	// AdminAuth mirrors the /admin/liveness gate: strict bearer-only and
+	// fail-closed in every environment, including fresh installs.
 	{
 		asHealth := handlers.NewAdminSchedulesHealthHandler()
 		r.GET("/admin/schedules/health", middleware.AdminAuth(db.DB), asHealth.Health)
@@ -725,10 +729,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		r.GET("/admin/delegations/stats", middleware.AdminAuth(db.DB), adH.Stats)
 	}
 
-	// Admin — workspace template image refresh. Pulls latest images from GHCR
-	// and recreates running ws-* containers so they adopt the new image.
-	// Final step of the runtime CD chain — see docs/workspace-runtime-package.md.
-	// Operators (or post-publish automation) hit this after a runtime release.
+	// Admin — explicit registry-backed, single-host workspace image maintenance.
+	// Pulls from the configured registry and can remove matching ws-* containers
+	// so the local provisioner recreates them later. This is not the managed
+	// runtime rollout path; control-plane image pins own managed launches.
 	// Reuses the provisioner's Docker client; no-op when prov is nil
 	// (test / non-Docker deploy).
 	if prov != nil {
@@ -749,18 +753,19 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// containers still run on a docker daemon this process can reach, so wire
 	// a client from that daemon when it answers a Ping. Without this the
 	// plugins handler's docker client was nil, findRunningContainer returned
-	// ErrNoBackend, and delivery fell back to the retired AWS EIC path →
+	// ErrNoBackend, and delivery fell back to the legacy AWS EIC path →
 	// 90-120s timeout → 502 on every local-docker tenant (blocked the
-	// Lark-channel live test and all plugin installs). A genuine cloud tenant
-	// has no local daemon → Ping fails → dockerCli stays nil → the AWS EIC
-	// path is unchanged for real "i-<hex>" instance ids. See
+	// Lark-channel live test and all plugin installs). A remote AWS tenant has no
+	// local daemon → Ping fails → dockerCli stays nil → the EIC fallback remains
+	// available only for real "i-<hex>" instance ids. Other providers require
+	// their provider-native delivery path; an opaque instance_id must not imply AWS. See
 	// provisioner.NewDockerClientIfReachable + files_backend_dispatch.go.
 	var dockerCli *client.Client
 	if prov != nil {
 		dockerCli = prov.DockerClient()
 	} else if cli, ok := provisioner.NewDockerClientIfReachable(context.Background()); ok {
 		dockerCli = cli
-		log.Printf("router: CP-provisioner mode with a reachable local docker daemon — wired docker client for local-docker plugin/template/terminal delivery (no AWS EIC)")
+		log.Printf("router: CP-provisioner mode with a reachable local docker daemon — wired docker client for local plugin/template/terminal delivery")
 	}
 
 	// Plugins — plgh must be initialized before the drift handler that uses it.
@@ -779,10 +784,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		).Scan(&runtime)
 		return runtime, err
 	}
-	// Instance-id lookup powers the SaaS dispatch in install/uninstall:
-	// when a workspace is on the EC2-per-workspace backend (instance_id
-	// non-NULL) and there's no local Docker container to exec into, the
-	// pipeline pushes the staged plugin tarball to that EC2 over EIC SSH.
+	// Instance-id lookup supplies the opaque provider identifier to the remote
+	// install/uninstall dispatcher. The current legacy EIC fallback accepts only
+	// AWS-shaped i-* identifiers; it must not infer AWS from an arbitrary non-null
+	// instance_id. Provider-native remote delivery is a separate backend concern.
 	// Empty result means the workspace lives on the local-Docker backend
 	// (or hasn't been provisioned yet) and the handler falls back to its
 	// original Docker path. Same pattern templates.go and terminal.go use.

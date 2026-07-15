@@ -35,12 +35,10 @@ name: Lint pre-flip continue-on-error
 #      `staging` runs.
 #   4. Pull last 5 commits on the PR base branch, fetch combined
 #      commit-status per commit, scan for the target context. For
-#      each match, fetch the run log via the web-UI route
-#      `{server_url}/{repo}/actions/runs/{run_id}/jobs/{job_idx}/logs`
-#      (per `reference_gitea_actions_log_fetch` —
-#      Gitea 1.22.6 lacks REST `/actions/runs/*`; web-UI is the
-#      only working path, see also
-#      `reference_gitea_1_22_6_lacks_rest_rerun_endpoints`).
+#      each match, fetch the raw run log via the web-UI job-log route
+#      `{server_url}/{repo}/actions/runs/{run_id}/jobs/{job_idx}/logs`.
+#      The current Actions REST API supplies run metadata and reruns elsewhere;
+#      this gate retains the web route because it returns raw job logs directly.
 #   5. Grep each log for `--- FAIL`, `FAIL\s`, `::error::`. If
 #      the status is `success` but the log shows any of these,
 #      the job was masked. Block the PR with `::error::`.
@@ -81,9 +79,7 @@ env:
 permissions:
   contents: read
   # Need read on the API to pull combined commit-status + commit list
-  # for the base branch. The job-log fetch uses the same token via
-  # the web-UI route (Gitea 1.22.6 accepts `Authorization: token ...`
-  # there).
+  # for the base branch. The raw job-log route uses the same token.
   pull-requests: read
 
 concurrency:

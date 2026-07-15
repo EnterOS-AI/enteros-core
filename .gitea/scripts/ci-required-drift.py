@@ -933,8 +933,8 @@ def detect_drift(branch: str) -> tuple[list[str], dict]:
 
     # Protection
     # api() raises ApiError on non-2xx. Transient 5xx should fail loud.
-    # 403/404 means the token lacks repo-admin scope (Gitea 1.22.6's
-    # branch_protections endpoint requires it — see DRIFT_BOT_TOKEN
+    # 403/404 means the token lacks the repo-admin access required by this
+    # branch-protections probe — see DRIFT_BOT_TOKEN
     # provisioning trail in ci-required-drift.yml). Treat as
     # "cannot determine drift for this branch" — skip without turning
     # the workflow red. Surface a clear diagnostic so the operator

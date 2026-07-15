@@ -30,6 +30,8 @@ func TestEncryptSensitiveFields_RoundTrip(t *testing.T) {
 		"bot_token":      "123456:telegram-bot-token",
 		"chat_id":        "-100999",         // non-sensitive, untouched
 		"webhook_secret": "hmac-shared-key", // second known-sensitive field
+		"webhook_url":    "https://discord.com/api/webhooks/id/credential",
+		"verify_token":   "lark-verification-token",
 	}
 
 	if err := EncryptSensitiveFields(cfg); err != nil {
@@ -41,6 +43,12 @@ func TestEncryptSensitiveFields_RoundTrip(t *testing.T) {
 	}
 	if sec, _ := cfg["webhook_secret"].(string); !strings.HasPrefix(sec, ciphertextPrefix) {
 		t.Errorf("webhook_secret not encrypted: got %q", sec)
+	}
+	if url, _ := cfg["webhook_url"].(string); !strings.HasPrefix(url, ciphertextPrefix) {
+		t.Errorf("webhook_url not encrypted: got %q", url)
+	}
+	if token, _ := cfg["verify_token"].(string); !strings.HasPrefix(token, ciphertextPrefix) {
+		t.Errorf("verify_token not encrypted: got %q", token)
 	}
 	if chat, _ := cfg["chat_id"].(string); chat != "-100999" {
 		t.Errorf("chat_id modified: got %q", chat)
@@ -55,6 +63,12 @@ func TestEncryptSensitiveFields_RoundTrip(t *testing.T) {
 	}
 	if got, _ := cfg["webhook_secret"].(string); got != "hmac-shared-key" {
 		t.Errorf("webhook_secret round-trip mismatch: got %q", got)
+	}
+	if got, _ := cfg["webhook_url"].(string); got != "https://discord.com/api/webhooks/id/credential" {
+		t.Errorf("webhook_url round-trip mismatch: got %q", got)
+	}
+	if got, _ := cfg["verify_token"].(string); got != "lark-verification-token" {
+		t.Errorf("verify_token round-trip mismatch: got %q", got)
 	}
 }
 
@@ -134,5 +148,33 @@ func TestEncryptSensitiveFields_NilConfig(t *testing.T) {
 	}
 	if err := DecryptSensitiveFields(nil); err != nil {
 		t.Errorf("nil config: expected no error, got %v", err)
+	}
+}
+
+func TestRedactSensitiveFields_HidesCredentialURLsAndSecrets(t *testing.T) {
+	cfg := map[string]interface{}{
+		"bot_token":      "123:ABCDEFGHIJ",
+		"webhook_url":    "https://discord.com/api/webhooks/id/super-secret",
+		"verify_token":   "verification-secret",
+		"signing_secret": "slack-signing-secret",
+		"public_key":     "not-a-secret",
+		"chat_id":        "channel-123",
+	}
+
+	RedactSensitiveFields(cfg)
+
+	if got := cfg["bot_token"]; got != "123:...GHIJ" {
+		t.Fatalf("bot_token redaction = %q", got)
+	}
+	for _, field := range []string{"webhook_url", "verify_token", "signing_secret"} {
+		if got := cfg[field]; got != "***" {
+			t.Fatalf("%s redaction = %q, want ***", field, got)
+		}
+	}
+	if got := cfg["public_key"]; got != "not-a-secret" {
+		t.Fatalf("public_key must remain visible, got %q", got)
+	}
+	if got := cfg["chat_id"]; got != "channel-123" {
+		t.Fatalf("chat_id must remain visible, got %q", got)
 	}
 }

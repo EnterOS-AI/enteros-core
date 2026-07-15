@@ -43,8 +43,9 @@ const panelLocator = (page: Page) =>
 /** Post a message to the workspace via the A2A proxy so activity rows exist.
  *  `source` determines the auth shape, which in turn determines
  *  activity_logs.source_id:
- *    - "canvas": no workspace-resolving auth, no X-Workspace-ID → callerID
- *      empty → source_id NULL (the /activity?source=canvas filter).
+ *    - "canvas": admin bearer, no X-Workspace-ID → authenticated human
+ *      caller with an empty callerID → source_id NULL (the
+ *      /activity?source=canvas filter).
  *    - "agent": workspace bearer token → callerID = workspace →
  *      source_id = workspace_id (the /activity?source=agent filter).
  */
@@ -55,12 +56,19 @@ async function postA2AMessage(
   workspaceAuthToken: string,
 ) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (source === "agent") {
+  if (source === "canvas") {
+    const adminToken = process.env.E2E_ADMIN_TOKEN ?? process.env.ADMIN_TOKEN;
+    if (!adminToken) {
+      throw new Error("canvas-source A2A seed requires E2E_ADMIN_TOKEN or ADMIN_TOKEN");
+    }
+    headers.Authorization = `Bearer ${adminToken}`;
+  } else {
     headers.Authorization = `Bearer ${workspaceAuthToken}`;
   }
-  // canvas-source intentionally sends no bearer and no X-Workspace-ID so the
-  // proxy cannot derive a workspace callerID. This is the only way to produce
-  // the source_id NULL rows that the source=canvas endpoint keys on.
+  // canvas-source intentionally omits X-Workspace-ID. The authenticated admin
+  // credential classifies it as a human Canvas caller without inventing a
+  // workspace identity, which produces the source_id NULL rows that the
+  // source=canvas endpoint keys on.
 
   const res = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}/a2a`, {
     method: "POST",
@@ -270,8 +278,8 @@ test.describe("Activity API Source Filter", () => {
     const stopHeartbeat = startHeartbeat(ws.id, ws.authToken);
 
     // Seed BOTH source classes deterministically through the real A2A proxy:
-    //  - canvas-source: no workspace-resolving auth → callerID empty →
-    //    source_id NULL (matches /activity?source=canvas).
+    //  - canvas-source: authenticated admin bearer without X-Workspace-ID →
+    //    callerID empty → source_id NULL (matches /activity?source=canvas).
     //  - agent-source: workspace bearer token → callerID = workspace →
     //    source_id = workspace_id (matches /activity?source=agent).
     await postA2AMessage(workspaceId, "canvas", "canvas source probe", authToken);

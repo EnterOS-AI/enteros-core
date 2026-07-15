@@ -1,95 +1,104 @@
 # Connecting an AI Agent to Lark / Feishu
 
-Molecule AI's Lark channel adapter (shipped in #480) lets any workspace agent
-receive messages from Lark or Feishu chats and reply through the same thread.
-This tutorial gets you from zero to a live bot in about ten minutes.
+The Lark adapter combines two Lark primitives:
 
-> **Lark vs Feishu** — same payload format, different host.
-> Lark is the international product; Feishu is the China edition.
-> The adapter detects which host to use from your webhook URL.
+- a **Custom Bot webhook** for outbound messages
+- a **Lark App Event Subscription** for optional inbound messages
+
+Lark (international) and Feishu (China) use the same payload shape. Custom Bot
+URLs on both `open.larksuite.com` and `open.feishu.cn` are accepted.
 
 ## Prerequisites
 
-- A Molecule AI workspace already running (any runtime)
-- A Lark tenant with permission to create a **Custom Bot**
-- `PLATFORM_URL` and a workspace bearer token
+- a running Molecule AI workspace
+- a Lark or Feishu Custom Bot webhook URL
+- for inbound messages, a Lark App with Event Subscriptions access, its
+  Verification Token, and the target chat ID
 
-## Setup
+## 1. Create the outbound Custom Bot
+
+In the target group, open **Settings → Bots → Add Bot → Custom Bot** and copy
+the webhook URL:
+
+```text
+https://open.larksuite.com/open-apis/bot/v2/hook/YOUR_TOKEN
+```
+
+That URL contains a credential and is field-encrypted by Molecule AI in
+production.
+
+## 2. Add the channel row
+
+For outbound-only use, `webhook_url` is sufficient. For inbound use, add:
+
+- `chat_id`: the Lark chat that should route to this workspace
+- `verify_token`: the Verification Token from the Lark App's Event
+  Subscriptions settings
 
 ```bash
-# 1. Create a Lark Custom Bot in your group chat
-#    Settings → Bots → Add Bot → Custom Bot
-#    Copy the Webhook URL — looks like:
-#    https://open.larksuite.com/open-apis/bot/v2/hook/<token>
-
-# 2. (Recommended) Set a Verification Token in the Lark bot settings.
-#    This lets the platform reject spoofed inbound messages.
-
-# 3. Register the channel on your workspace
-curl -s -X POST "${PLATFORM_URL}/workspaces/${WORKSPACE_ID}/channel" \
+curl -X POST "${PLATFORM_URL}/workspaces/${WORKSPACE_ID}/channels" \
   -H "Authorization: Bearer ${TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
-    "type": "lark",
+    "channel_type": "lark",
     "config": {
       "webhook_url": "https://open.larksuite.com/open-apis/bot/v2/hook/YOUR_TOKEN",
-      "verify_token": "YOUR_VERIFY_TOKEN"
-    }
+      "chat_id": "oc_TARGET_CHAT_ID",
+      "verify_token": "YOUR_EVENT_SUBSCRIPTION_VERIFY_TOKEN"
+    },
+    "allowed_users": []
   }'
-
-# 4. Point Lark Event Subscriptions at your platform
-#    Lark Developer Console → Event Subscriptions → Request URL:
-#    https://YOUR_PLATFORM/channels/lark/webhook
-
-# 5. Subscribe to the im.message.receive_v1 event in Lark console.
-
-# 6. Send a message in the Lark group — your agent replies.
-#    Watch the round-trip:
-molecule workspace logs ${WORKSPACE_ID} --follow
 ```
 
-## The 200-OK-but-failed gotcha
+The Custom Bot URL already selects the outbound group, so `chat_id` is not
+used by `SendMessage`. It is required for inbound routing: the public receiver
+will not route an event to a row whose configured chat ID differs from the
+event's `event.message.chat_id`.
 
-Lark's outbound API **always** returns HTTP 200, even on delivery failure.
-The real result is in the JSON body:
+## 3. Configure Event Subscriptions
 
-```json
-{ "code": 99, "msg": "...", "data": {} }
-```
+In the Lark Developer Console for your App:
 
-Molecule AI surfaces `code != 0` as a hard Go error so your agent sees an
-actual failure instead of silent data loss. Check `last_sample_error` on the
-workspace if messages seem to disappear.
+1. Set the Event Subscription Request URL to:
 
-## Expected output
+   ```text
+   https://your-platform.example/webhooks/lark
+   ```
 
-After step 6, `workspace logs` shows:
+2. Subscribe to `im.message.receive_v1`.
+3. Ensure the App is installed in, and permitted to receive messages from, the
+   target chat.
 
-```
-[channel:lark] inbound  user_id=ou_xxx  text="Hello agent"
-[agent]        reply    "Hi! How can I help you today?"
-[channel:lark] outbound code=0  ok
-```
+During URL verification, Molecule AI verifies the request token and returns
+Lark's challenge. Event callbacks also require the configured token. Missing
+or mismatched tokens fail closed; comparisons are constant-time. If multiple
+Lark rows exist, only rows authenticated by that token are eligible for chat
+matching.
 
-## How it works
+## 4. Verify both directions
 
-When a Lark user sends a message the platform receives a `v2 event_callback`
-(`im.message.receive_v1`). It validates the optional `verify_token` with a
-constant-time compare (timing-attack safe), then proxies the text through the
-standard A2A flow — the same path used by Telegram and Slack. The agent never
-knows which channel it's talking to. Replies go back via the Custom Bot
-webhook; the adapter prefers `user_id` over `open_id` so replies land in the
-correct DM thread when the bot has contacts permission.
+Send an ordinary text message in the configured Lark chat. A valid
+`im.message.receive_v1` event is converted to an A2A user message. The agent's
+reply is then posted through the configured Custom Bot webhook.
 
-## Multi-channel teams
+The outbound API can return HTTP 200 with an application-level error. Molecule
+AI treats a response body with `code != 0` as a delivery failure; only
+`{"code":0,...}` is accepted as successful delivery.
 
-You can attach different channels to different workspaces in the same org.
-Route customer-facing chats to a triage agent on Lark while your eng team
-talks to the DevOps agent on Slack — all coordinated through the same
-Molecule AI canvas without code changes.
+## Important boundaries
+
+- A Custom Bot webhook alone is outbound-only; it does not deliver inbound
+  Event Subscription callbacks.
+- `verify_token` is optional only for outbound-only rows. It is mandatory at
+  the public receiver.
+- Only text `im.message.receive_v1` events are routed. Other event and message
+  types are acknowledged and ignored after authentication.
+- Outbound messages go to the group encoded in `webhook_url`; the adapter does
+  not reply through a per-message thread or DM API.
+- `webhook_url` and `verify_token` are AES-256-GCM field-encrypted in
+  production and redacted from channel list responses.
 
 ## Related
 
-- PR #480: [feat(channels): Lark / Feishu channel adapter](https://git.moleculesai.app/molecule-ai/molecule-core/pull/480)
-- [Social channels architecture](../agent-runtime/social-channels.md)
-- [Channel adapter reference](../api-reference.md#channels)
+- [Social channels reference](../agent-runtime/social-channels.md)
+- [API routes](../api-reference.md#routes)
