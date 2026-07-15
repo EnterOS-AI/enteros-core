@@ -50,6 +50,7 @@
  */
 import { test, expect, type Page, type BrowserContext } from "@playwright/test";
 import { agentRepliesForTurn, type SimpleMessage } from "../src/lib/conciergeChatInvariants";
+import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -248,7 +249,9 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
     liveReplyAt = Date.now();
   });
 
-  await page.goto(tenantURL, { waitUntil: "domcontentloaded" });
+  await gotoWithNetworkChangeRetry(page, tenantURL, {
+    waitUntil: "domcontentloaded",
+  });
   await page.waitForSelector('[data-testid="nav-home"], [data-testid="hydration-error"]', { timeout: 60_000 });
   expect(await page.locator('[data-testid="hydration-error"]').count(), "canvas hydration failed").toBe(0);
 

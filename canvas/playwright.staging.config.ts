@@ -29,8 +29,8 @@ export default defineConfig({
   // only mask a genuine bug and burn ~6 min each on the single shared staging
   // runner (the greeting + tabs specs each retried 3× at ~6.1m against a
   // deterministic missing-input red, wasting ~18 min per spec). A genuinely
-  // transient network class is handled by scoped in-test polls, not a
-  // whole-suite replay.
+  // transient Chromium page.goto net::ERR_NETWORK_CHANGED gets one bounded
+  // in-test navigation retry; every other failure still escapes immediately.
   retries: 0,
   // One worker: the setup provisions exactly one org/workspace, and
   // parallel specs would fight over the shared workspace selector state.
