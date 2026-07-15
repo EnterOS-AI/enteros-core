@@ -130,8 +130,8 @@ func readBodyWithLimit(r io.Reader, limit int, kind string) ([]byte, error) {
 //     policy after DNS resolution and before connect, closing the rebinding
 //     window between resolveAgentURL's preflight and the actual TCP dial. Its
 //     10s connect timeout also bounds black-holed workspace targets. When a
-//     workspace's EC2 black-holes TCP connects (instance terminated mid-flight,
-//     security group flipped, NACL bug), the OS default is 75s on Linux / 21s
+//     workspace provider endpoint black-holes TCP connects (compute terminated
+//     mid-flight or its network policy changed), the OS default is 75s on Linux / 21s
 //     on macOS — long enough that Cloudflare's ~100s edge timeout can fire first
 //     and surface a generic 502 page to canvas. 10s is well above realistic
 //     intra-region latencies and well below CF's edge timeout.
@@ -324,8 +324,8 @@ func isAgentRestartingError(err error) bool {
 //
 //   - 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout: standard
 //     proxy-layer "upstream is broken" codes (Cloudflare, ELB, agent tunnel).
-//   - 521 Web Server Is Down: Cloudflare can't open TCP to origin (most
-//     direct dead-EC2 signal).
+//   - 521 Web Server Is Down: Cloudflare cannot open TCP to the workspace
+//     origin (the most direct dead-provider-endpoint signal).
 //   - 522 Connection Timed Out: Cloudflare opened TCP but no response within
 //     ~15s — typical of SG/NACL flap or agent process hung.
 //   - 523 Origin Is Unreachable: Cloudflare can't route to origin (DNS or
@@ -1600,7 +1600,8 @@ func (h *WorkspaceHandler) dispatchA2A(ctx context.Context, workspaceID, agentUR
 		b = concrete
 	}
 	// Per-workspace idle-timeout override (capability primitive #2 —
-	// see workspace/adapter_base.py:idle_timeout_override). The
+	// see molecule-ai-workspace-runtime/molecule_runtime/adapter_base.py:
+	// idle_timeout_override). The
 	// adapter declares a longer/shorter window than the platform
 	// default in its heartbeat; the heartbeat handler stashes it in
 	// runtimeOverrides; we honor it here. Falls through to the global

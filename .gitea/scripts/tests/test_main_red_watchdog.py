@@ -42,7 +42,7 @@ def test_is_scheduled_context_no_match_for_required_ci():
 # ---------------------------------------------------------------------------
 
 def test_entry_state_prefers_status_over_state():
-    """Gitea 1.22.6 per-entry key is `status`; `state` is fallback."""
+    """Legacy 1.22.6 entries used `status`; newer `state` stays a fallback."""
     assert wd._entry_state({"status": "failure", "state": "success"}) == "failure"
 
 

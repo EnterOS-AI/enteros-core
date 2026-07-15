@@ -190,7 +190,7 @@ contains valid Python files with `@tool`-decorated functions. See
   frontmatter schema, and tool interface
 - [Config Format](../agent-runtime/config-format.md) — How skills are
   declared in `config.yaml`
-- [Plugin System](../plugins/overview.md) — Installing full plugin
-  packages (skills + MCP servers + shared rules)
-- [Remote Agent Tutorial](../tutorials/register-remote-agent.md) —
-  Installing skills on remote (external) agents
+- [Plugin shapes](../plugins/agentskills-compat.md) — Installing plugin
+  packages with skills, rules, or MCP configuration
+- [External Agent Registration](external-agent-registration.md) — connect a
+  BYO-compute agent using the current server-generated setup contract

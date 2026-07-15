@@ -4,7 +4,8 @@ name: Ops Scripts Tests
 # RFC internal#219 §1 sweep.
 #
 # Differences from the GitHub version:
-#   - Dropped `merge_group:` trigger (no Gitea merge queue).
+#   - Omitted GitHub's `merge_group:` trigger; this repository uses its
+#     serialized Gitea queue plus pull-request/push statuses.
 #   - on.paths references .gitea/workflows/test-ops-scripts.yml (this
 #     file) instead of the .github/ one.
 #   - Workflow-level env.GITHUB_SERVER_URL set.
@@ -18,7 +19,7 @@ name: Ops Scripts Tests
 # pipelines.
 #
 # Discovery layout: tests sit alongside the code they test (see
-# scripts/ops/test_sweep_cf_decide.py for the pattern; scripts/
+# scripts/ops/test_managed_flags_wiring.py for the pattern; scripts/
 # test_build_runtime_package.py for the rewriter coverage). The job
 # below runs `unittest discover` TWICE — once from `scripts/`, once
 # from `scripts/ops/` — because neither dir has an `__init__.py`, so

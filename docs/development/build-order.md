@@ -1,5 +1,10 @@
 # Build Order
 
+> **Historical implementation plan.** This file records the original scaffold
+> order and names several retired layouts and runtime-specific choices. It is
+> not a current setup guide. Use [Local Development](local-development.md) and
+> the checked repository structure instead.
+
 The core loop to prove first: **workspace registers -> canvas shows it -> heartbeat keeps it alive -> workspace goes offline -> canvas shows it gray.**
 
 Once that loop works end to end, you have the skeleton of the entire product.

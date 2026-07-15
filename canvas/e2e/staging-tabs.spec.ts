@@ -26,7 +26,8 @@
  * Known SaaS gaps — documented in #1369. These tabs legitimately cannot
  * load real content in SaaS mode and are allowed an in-panel empty/error
  * state (NOT a hard crash, NOT an ErrorBoundary):
- *   - Files tab: empty (platform can't docker exec into a remote EC2)
+ *   - Files tab: empty (the platform lacks a direct file transport to
+ *     provider-managed compute in this staging path)
  *   - Terminal tab: WS connect fails
  *   - Peers tab: 401 without workspace-scoped token
  * These are enumerated in KNOWN_DEGRADED_TABS below and asserted with a
@@ -610,12 +611,12 @@ test.describe("staging canvas tabs", () => {
  *
  * STILL BLOCKS PROMOTION-TO-REQUIRED (do NOT flip continue-on-error here —
  * CTO-owned, RFC internal#219 §1):
- *   - INFRA DEPENDENCY: each run provisions a real staging EC2 tenant
- *     (12-20 min cold boot). Required-gate latency + AWS/Cloudflare/CP
- *     availability become merge-blockers. A staging outage would freeze
- *     main even though the code is fine — unacceptable for a required check
- *     until staging has an SLA or this runs against a warm pre-provisioned
- *     pool.
+ *   - INFRA DEPENDENCY: each run provisions a fresh staging org and workspace
+ *     through the current molecules-server provider. Required-gate latency and
+ *     CP/Cloudflare/DNS availability become merge-blockers. A staging outage
+ *     would freeze main even though the code is fine — unacceptable for a
+ *     required check until staging has an SLA or this runs against a warm
+ *     pre-provisioned pool.
  *   - SHARED-RESOURCE FLAKE SURFACE: TLS/DNS/ACME propagation on a shared
  *     staging zone (staging-setup TLS_TIMEOUT_MS) is outside this repo's
  *     control. Deterministic here ≠ deterministic upstream.

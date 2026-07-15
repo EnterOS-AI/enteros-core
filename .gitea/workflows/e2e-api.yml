@@ -26,9 +26,8 @@ name: E2E API Smoke Test
 #
 # Parallel-safety (Class B Hongming-owned CICD red sweep, 2026-05-08)
 # -------------------------------------------------------------------
-# Same substrate hazard as PR #98 (handlers-postgres-integration). Our
-# Gitea act_runner runs with `container.network: host` (operator host
-# `/opt/molecule/runners/config.yaml`), which means:
+# Same substrate hazard as PR #98 (handlers-postgres-integration). The
+# self-hosted Docker runner uses `container.network: host`, which means:
 #
 #   * Two concurrent runs both try to bind their `-p 15432:5432` /
 #     `-p 16379:6379` host ports — the second postgres/redis FATALs
@@ -82,13 +81,9 @@ name: E2E API Smoke Test
 #   now closed at the source instead: the server runs under `timeout`, so a
 #   hard-cancelled run's orphan self-reaps. No cross-run signalling anywhere.
 #
-# Item explicitly NOT fixed here: failing test `Status back online`
-# fails because the platform's langgraph workspace template image
-# (ghcr.io/molecule-ai/workspace-template-langgraph:latest) returns
-# 403 Forbidden post-2026-05-06 GitHub org suspension. That is a
-# template-registry resolution issue (ADR-002 / local-build mode) and
-# belongs in a separate change that touches workspace-server, not
-# this workflow file.
+# Historical note: the former LangGraph/GHCR path failed after the 2026-05-06
+# GitHub suspension. The current lane uses local builds/current registry
+# plumbing; do not restore the retired GHCR dependency here.
 
 on:
   push:
@@ -115,9 +110,8 @@ env:
 jobs:
   detect-changes:
     # mc#1529 follow-on: pin to `docker-host` so the e2e-api lane lands
-    # on Linux operator-host runners (molecule-runner-*) that carry the
-    # `molecule-core-net` bridge network + a working `aws ecr get-login-
-    # password | docker login` path. The bare `ubuntu-latest` label is
+    # on a self-hosted Linux Docker runner that carries docker.sock and
+    # the `molecule-core-net` bridge network. The bare `ubuntu-latest` label is
     # also accepted by hongming-pc-runner-* (Windows act_runner v1.0.3),
     # where the docker.sock-bound steps below fail non-deterministically
     # (e.g. `docker run -d --name pg-e2e-api-...` with port-bind +
@@ -175,8 +169,8 @@ jobs:
   e2e-api:
     needs: detect-changes
     name: E2E API Smoke Test
-    # mc#1529 follow-on: must run on operator-host Linux runners (where
-    # docker.sock + `molecule-core-net` + `aws ecr ...` work). See
+    # mc#1529 follow-on: must run on the Linux docker-host lane (where
+    # docker.sock and `molecule-core-net` are available). See
     # detect-changes for the full rationale.
     runs-on: docker-host
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
@@ -273,7 +267,7 @@ jobs:
           # Provisioner attaches workspace containers to
           # molecule-core-net (workspace-server/internal/provisioner/
           # provisioner.go::DefaultNetwork). The bridge already exists on
-          # the operator host's docker daemon — `network create` is
+          # the runner's Docker daemon — `network create` is
           # idempotent via `|| true`.
           docker network create molecule-core-net >/dev/null 2>&1 || true
           echo "alpine:latest pre-pulled; molecule-core-net ensured."
@@ -349,11 +343,10 @@ jobs:
       - name: Set deterministic admin token for the e2e platform
         if: needs.detect-changes.outputs.api == 'true'
         run: |
-          # AdminAuth (workspace-server/internal/middleware/wsauth_middleware.go:164)
-          # reads ADMIN_TOKEN. Setting it (a) closes isDevModeFailOpen (devmode.go:50
-          # returns false when ADMIN_TOKEN is non-empty), so admin routes require a
-          # bearer, and (b) makes Tier-2b accept a bearer that constant-time-equals
-          # ADMIN_TOKEN. The platform process inherits ADMIN_TOKEN from $GITHUB_ENV.
+          # AdminAuth is fail-closed in every environment. ADMIN_TOKEN gives this
+          # ephemeral platform a deterministic bootstrap/admin bearer that Tier-2b
+          # accepts via constant-time comparison. The platform process inherits it
+          # from $GITHUB_ENV.
           #
           # MOLECULE_ADMIN_TOKEN is the var the e2e scripts send as the bearer
           # (tests/e2e/_lib.sh:33 e2e_mint_workspace_token, and the run_mock

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # check-template-parity.sh — enforce parity between a workspace template's
-# install.sh (bare-host / EC2 path) and start.sh (Docker path). Both scripts
+# install.sh (host-managed path) and start.sh (Docker path). Both scripts
 # must forward the same set of provider API keys to the agent's .env so that
 # a workspace built on one backend behaves identically to a workspace built
 # on the other.
 #
 # Drift this catches:
 #   - Someone adds HERMES_API_KEY to start.sh but forgets install.sh.
-#     EC2 workspaces using Nous fail silently; Docker works.
+#     Host-managed workspaces using Nous fail silently; Docker works.
 #   - Someone adds a HERMES_CUSTOM_BASE_URL branch to install.sh only.
-#     Docker can't use a custom OpenAI-compat endpoint; EC2 can.
+#     Docker can't use a custom OpenAI-compat endpoint; the host path can.
 #
 # Invocation (from template-hermes repo's CI):
 #

@@ -1,10 +1,18 @@
 # RFC: Org-level Platform Agent — a tenant-resident concierge
 
+> **Historical RFC snapshot.** This document records the proposal and its
+> superseded alternatives; it is not the source of truth for the currently
+> shipped topology, runtime wiring, or deployment process. Verify current
+> behavior in code and use
+> [Current Technical Reference](../architecture/molecule-technical-doc.md) for
+> user-facing documentation.
+
 **Perspective:** CTO + Backend Engineer + DevOps
-**Status:** Draft — pre-implementation, **CTO sign-off required before any implementation PR**
+**Status:** Historical draft — retained for design history; do not implement as written
 **Scope:** `molecule-core` (workspace-server), `molecule-controlplane`, workspace runtime, `molecule-app`
-**This document is the single source of truth (SSOT) for the feature.** Code, OpenAPI, the platform
-MCP, and end-user docs reconcile to this RFC — not to each other.
+**Historical authority:** this was the proposal-era SSOT. It has no current
+authority; checked code and current architecture docs win. The former generated
+management OpenAPI artifact has been retired.
 
 > **Superseded in part by [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md).**
 > The conceptual model in this RFC (platform agent as the org root, `kind` discriminator,
@@ -138,8 +146,8 @@ Invariants (handler-enforced, since there is no `org_id` for a pure-SQL unique):
 
 New `GET /registry/platform-agent` (handler `internal/handlers/platform_agent.go`): resolve the
 caller's `orgRootID()` and return it iff `kind='platform'`. This is the server hook the dashboard
-targets by default; no change to `ProxyA2A`. **Authored in the OpenAPI SSOT first**; MCP/CLI/docs
-derive from it.
+targets by default; no change to `ProxyA2A`. The proposal expected an OpenAPI-first
+contract; current consumers must derive from the checked handlers and maintained API docs.
 
 ### 5.5 Runtime: two MCPs, config-driven *(superseded by rfc-platform-mcp-as-plugin)*
 
@@ -233,7 +241,8 @@ The MCP is a *client* of the tenant handlers, so enforcement lives in the **hand
   pending requests).
 - **Escalation:** the platform agent's `parent_id` is NULL, so platform-originated approvals escalate
   to the **user** (canvas notify), not a parent.
-- The 202 response shape is authored in the **OpenAPI SSOT**.
+- Proposal-era requirement: the 202 response shape was to be authored in the
+  then-maintained management OpenAPI artifact.
 
 ### 5.9 Billing & model/provider parity
 
@@ -252,7 +261,7 @@ The **dashboard** (`molecule-app`) becomes the primary entry: a concierge chat (
 §5.4 resolver) plus a live org overview, with pending approvals surfaced inline. The **canvas** stays
 for advanced users. First UI version is produced in Claude Design and iterated before build.
 
-## 6. SSOT mapping (derive, don't fork)
+## 6. Proposal-era SSOT mapping (historical)
 
 | Concern | Single source of truth | This RFC's rule |
 |---|---|---|
@@ -261,7 +270,7 @@ for advanced users. First UI version is produced in Claude Design and iterated b
 | Model/provider | `providers.yaml` runtime matrix | concierge switches via the same registry |
 | LLM billing | `providers.DeriveProvider` → `IsPlatform` | inherits the one derivation; no new path |
 | Config/secrets delivery | tenant Secrets Manager bundle (`seedWorkspaceConfigSecret`) | no new S3 prefix / second store |
-| Management API | OpenAPI spec | new endpoints authored there first; MCP/CLI/docs derive |
+| Management API | Former OpenAPI spec (retired) | proposal required generated consumers |
 | Gated actions | `internal/approvals/policy.go` | one map |
 | Platform-agent id | `uuidv5(org, "platform-agent")` | derived, never stored separately |
 
@@ -307,8 +316,8 @@ Phase ordering is the rollout contract:
 3. **Tenant provisioning** (CP + `molecule-ci`) — *revised*: the **standard runtime image** (no
    dedicated `molecule-platform-agent` image); `start_platform_agent` in user-data + redeploy;
    identity/config via the template asset channel; billing knob.
-4. **Approval gate** (`molecule-core`): policy map + `requireApproval` at destructive handlers; OpenAPI
-   202 shape.
+4. **Approval gate** (`molecule-core`): policy map + `requireApproval` at destructive handlers;
+   proposal-era 202 response contract.
 5. **Dashboard concierge UX** (`molecule-app`): design-first, then build against the resolver.
 6. **Cleanup**: exclude the platform agent from billable counts; canvas visibility; rotation runbook.
 

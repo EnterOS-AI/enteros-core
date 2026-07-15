@@ -2,22 +2,18 @@
 # reload-staging-controlplane.sh — provider-dispatched staging CP refresh hook.
 #
 # The tenant-image CI path must stay provider-agnostic; it should not install a
-# vendor CLI or require vendor tokens. This wrapper exists for hand-run/operator
-# paths that still need to refresh a CP host after a legacy LOCAL_TENANT_IMAGE
-# change. The normal staging tenant CD path now promotes the molecule-tenant DB
-# pin through the CP admin API, so fresh provisions do not need a CP restart.
+# vendor CLI or require vendor tokens. The normal staging tenant CD path
+# promotes the molecule-tenant DB pin through the control-plane admin API, so
+# fresh provisions do not need a repository-side provider CLI or CP restart.
 #
 # Usage:
 #   reload-staging-controlplane.sh --tag staging-<sha>
 #   reload-staging-controlplane.sh --image registry.../molecule-tenant:staging-<sha>
-#   CONTROLPLANE_DEPLOY_PROVIDER=railway reload-staging-controlplane.sh --tag staging-<sha>
 #
 # Providers:
 #   none|external|ci-on-merge  no-op; CP refresh is owned by another pipeline
-#   railway                   legacy adapter, isolated under scripts/deploy/providers
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROVIDER="${CONTROLPLANE_DEPLOY_PROVIDER:-${MOLECULE_CONTROLPLANE_DEPLOY_PROVIDER:-none}}"
 
 case "$PROVIDER" in
@@ -46,12 +42,9 @@ case "$PROVIDER" in
     fi
     echo "TARGET_IMAGE=${image}"
     ;;
-  railway)
-    exec "$ROOT/scripts/deploy/providers/reload-staging-controlplane-railway.sh" "$@"
-    ;;
   *)
     echo "FATAL: unsupported CONTROLPLANE_DEPLOY_PROVIDER=$PROVIDER" >&2
-    echo "supported providers: none, external, ci-on-merge, railway" >&2
+    echo "supported providers: none, external, ci-on-merge" >&2
     exit 2
     ;;
 esac

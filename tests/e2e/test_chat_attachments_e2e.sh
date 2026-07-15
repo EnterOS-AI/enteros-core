@@ -21,6 +21,11 @@ set -euo pipefail
 
 WSID="${WSID:?WSID=<workspace-id> required}"
 BASE="${BASE:-http://localhost:8080}"
+# shellcheck source=_lib.sh
+source "$(dirname "$0")/_lib.sh"
+e2e_load_local_admin_token
+HUMAN_AUTH=()
+e2e_human_auth_args HUMAN_AUTH || exit 2
 
 # Per-run scratch dir collected under one trap so every mktemp leak path
 # (assertion failure, SIGINT, exit non-zero) is plugged. Pre-fix this test
@@ -32,7 +37,7 @@ trap 'rm -rf "$TMPDIR_E2E"' EXIT INT TERM
 log() { printf "\n=== %s ===\n" "$*"; }
 
 log "Preflight: workspace online?"
-STATUS=$(curl -s "$BASE/workspaces/$WSID" | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')
+STATUS=$(curl -s "$BASE/workspaces/$WSID" ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')
 [ "$STATUS" = "online" ] || { echo "workspace not online ($STATUS)"; exit 1; }
 
 log "Step 1 — Upload a text file via /chat/uploads"
@@ -41,7 +46,7 @@ log "Step 1 — Upload a text file via /chat/uploads"
 TEST_FILE=$(mktemp "$TMPDIR_E2E/hermes-e2e-XXXXXX.txt")
 echo "secret code: $(openssl rand -hex 4)-$(openssl rand -hex 4)" > "$TEST_FILE"
 EXPECTED=$(cat "$TEST_FILE" | awk '{print $NF}')
-UPLOAD=$(curl -s -X POST "$BASE/workspaces/$WSID/chat/uploads" -F "files=@$TEST_FILE")
+UPLOAD=$(curl -s -X POST "$BASE/workspaces/$WSID/chat/uploads" ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} -F "files=@$TEST_FILE")
 URI=$(echo "$UPLOAD" | python3 -c 'import json,sys;print(json.load(sys.stdin)["files"][0]["uri"])')
 [ -n "$URI" ] || { echo "upload failed: $UPLOAD"; exit 1; }
 echo "uploaded: $URI"
@@ -61,6 +66,7 @@ print(json.dumps({
   ]},"configuration":{"acceptedOutputModes":["text/plain"],"blocking":True}}}))
 ')
 REPLY=$(curl -s -X POST "$BASE/workspaces/$WSID/a2a" \
+  ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} \
   -H 'Content-Type: application/json' \
   --max-time 120 \
   -d "$PAYLOAD")
@@ -81,6 +87,7 @@ CONTAINER=$(docker ps --format '{{.Names}}' | grep -E "^ws-${WSID}" | head -1)
 docker exec "$CONTAINER" sh -c 'echo "E2E report body $(date -u +%s)" > /workspace/e2e-report.txt'
 
 REPLY=$(curl -s -X POST "$BASE/workspaces/$WSID/a2a" \
+  ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"} \
   -H 'Content-Type: application/json' \
   --max-time 120 \
   -d '{"jsonrpc":"2.0","id":"e2e-down","method":"message/send","params":{"message":{"role":"user","messageId":"e2e-down","kind":"message","parts":[{"kind":"text","text":"There is a file at /workspace/e2e-report.txt. Mention its exact path in your reply so I can download it."}]},"configuration":{"acceptedOutputModes":["text/plain"],"blocking":true}}}')
@@ -90,7 +97,7 @@ echo "agent attached: $FILE_URI"
 
 log "Step 4 — Download via /chat/download"
 DL_PATH=${FILE_URI#workspace:}
-BODY=$(curl -s "$BASE/workspaces/$WSID/chat/download?path=$DL_PATH")
+BODY=$(curl -s "$BASE/workspaces/$WSID/chat/download?path=$DL_PATH" ${HUMAN_AUTH[@]+"${HUMAN_AUTH[@]}"})
 echo "downloaded: $BODY"
 if echo "$BODY" | grep -q "E2E report body"; then
   echo "PASS: downloaded the agent-returned file"

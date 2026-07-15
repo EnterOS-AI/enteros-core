@@ -152,14 +152,15 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 //
 //  1. Verified CP session cookie (SaaS canvas) — upstream-confirmed.
 //
-//  2. ADMIN_TOKEN env var (recommended, closes #684): when set, the bearer
-//     MUST equal this value exactly (constant-time comparison). Workspace
-//     bearer tokens are intentionally rejected even if valid — a compromised
-//     workspace agent must not be able to read global secrets, steal GitHub App
-//     installation tokens, or enumerate pending approvals across the platform.
-//     Set ADMIN_TOKEN to a strong random secret (e.g. openssl rand -base64 32).
+//  2. Org-scoped API token — named, revocable, and audited.
 //
-//  3. Fallback — workspace token (deprecated, backward-compat): when
+//  3. ADMIN_TOKEN env var (recommended, closes #684): when set, a bearer that
+//     is not a valid org token MUST equal this value exactly (constant-time
+//     comparison). Workspace bearer tokens are intentionally rejected even if
+//     valid. Set ADMIN_TOKEN to a strong random secret (for example,
+//     `openssl rand -base64 32`).
+//
+//  4. Fallback — workspace token (deprecated, backward-compat): when
 //     ADMIN_TOKEN is not set and workspace tokens do exist globally, any valid
 //     workspace bearer token is still accepted. This preserves existing
 //     behaviour for deployments that have not yet configured ADMIN_TOKEN, but
@@ -211,7 +212,7 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 			// a stale cookie + valid bearer still pass.
 		}
 
-		// Bearer token is the ONLY accepted credential for admin routes.
+		// Outside the verified-session path, admin routes require a bearer.
 		tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
 		if tok == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "admin auth required"})
@@ -293,10 +294,9 @@ func cpSessionActor(cookieHeader string) string {
 // Accepts either:
 //
 //  1. A valid bearer token (same contract as AdminAuth) — covers molecli,
-//     agent-to-platform calls, the browser canvas (which now sends
-//     Authorization: Bearer $NEXT_PUBLIC_ADMIN_TOKEN on every platform
-//     call — see canvas/src/lib/api.ts platformAuthHeaders), and anyone
-//     using the API directly.
+//     agent-to-platform calls, direct API users, and local/ephemeral Canvas
+//     builds configured with NEXT_PUBLIC_ADMIN_TOKEN. Production SaaS Canvas
+//     uses its verified session and does not expose the tenant admin secret.
 //  2. A same-origin canvas request (Referer/Host match), but ONLY when the
 //     combined-tenant canvas proxy is active (CANVAS_PROXY_URL set). This is
 //     a real same-origin check the browser cannot forge cross-origin (see
@@ -305,7 +305,8 @@ func cpSessionActor(cookieHeader string) string {
 //     CORS_ORIGINS Origin-match path was REMOVED under the CTO
 //     "nothing fail-open" directive (a no-bearer request passing purely on a
 //     spoofable Origin is effectively open even for a cosmetic route, and is
-//     no longer needed now that the canvas always sends a bearer).
+//     no longer needed because legitimate Canvas traffic has a verified
+//     session, valid bearer, or the combined-tenant same-origin path).
 //
 // Non-cosmetic routes MUST NOT use this middleware (see #194 review on why it
 // would re-open #164 CRITICAL if applied to /bundles/import).
@@ -365,8 +366,9 @@ func CanvasOrBearer(database *sql.DB) gin.HandlerFunc {
 // request's (trivially forgeable, cross-origin) Origin header against
 // CORS_ORIGINS and was the basis of CanvasOrBearer's no-bearer Origin-match
 // pass — effectively open to any curl that sets a matching Origin. Under the
-// CTO "nothing fail-open" directive that path is gone; the canvas now always
-// sends a bearer (NEXT_PUBLIC_ADMIN_TOKEN), so nothing legitimate relied on it.
+// CTO "nothing fail-open" directive that path is gone. Legitimate callers use
+// a verified session, a valid bearer, or the narrowly-gated combined-tenant
+// same-origin path below; none relies on a forgeable Origin value.
 // The CORS *response-header* allowlist is handled by the real CORS middleware
 // upstream, unaffected by this removal.
 

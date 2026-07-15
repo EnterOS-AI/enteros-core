@@ -15,10 +15,8 @@ What it does (one cron tick):
   4. If combined state is `success`: close any open `[main-red]
      {repo}: ...` issue on a previous SHA with a
      "main returned to green at SHA {current_SHA}" comment.
-  5. Emit one Loki-shaped JSON line via `logger -t main-red-watchdog`
-     so `reference_obs_stack_phase1`'s Vector → Loki path ingests an
-     alert event (queryable in Grafana as
-     `{tenant="operator-host"} |~ "main-red-watchdog"`).
+  5. Emit one structured JSON line to the Actions log and, when available,
+     to the runner's local syslog via `logger -t main-red-watchdog`.
 
 What it does NOT do:
   - Auto-revert anything. Option B is explicitly rejected per
@@ -200,14 +198,12 @@ def api(
 
 
 # --------------------------------------------------------------------------
-# action_run.status resolver — extensibility hook for task #394.
+# Legacy action-run-status resolver hook retained for API compatibility.
 # --------------------------------------------------------------------------
 def _resolve_action_run_status(target_url: str) -> int | None:
-    """Resolve the underlying Gitea `action_run.status` integer for the
-    run referenced by `target_url`, returning None if the resolver
-    cannot reach an authoritative source from the runner.
+    """Return the legacy integer action-run status when available.
 
-    Canonical Gitea 1.22.6 enum (per `models/actions/status.go` +
+    Historical Gitea 1.22.6 integer enum (per `models/actions/status.go` +
     `reference_gitea_action_status_enum_corrected_2026_05_19`):
         1=Success, 2=Failure, 3=Cancelled, 4=Skipped,
         5=Waiting,  6=Running, 7=Blocked
@@ -216,8 +212,10 @@ def _resolve_action_run_status(target_url: str) -> int | None:
     row for a run that actually succeeded — observed empirically on
     `publish-canvas-image` jobs at SHAs in mc#1597..1630).
 
-    CURRENT STATE (2026-05-20, verified): Gitea 1.22.6 exposes NO REST
-    endpoint for `action_run.status`. Probed:
+    Historical state (2026-05-20): Gitea 1.22.6 exposed no REST action-run
+    endpoint. The live 1.26 API now exposes string `status` and `conclusion`
+    fields, so callers should use that API directly rather than extending this
+    integer-enum hook. The old probes were:
         /api/v1/repos/{o}/{r}/actions/runs/{id}   → HTTP 404
         /api/v1/repos/{o}/{r}/actions/jobs/{id}   → HTTP 404
         /api/v1/repos/{o}/{r}/actions/tasks/{id}  → HTTP 404
@@ -228,11 +226,9 @@ def _resolve_action_run_status(target_url: str) -> int | None:
     `docker exec molecule-postgres-1 psql ...`), which the runner cannot
     reach.
 
-    Therefore: this hook returns None on every call. Callers MUST fall
-    back to the description-string filter (existing) plus the HEAD
-    recheck (this PR). When a future Gitea release (>=1.23 expected) or
-    an op-host proxy exposes the endpoint, replace the body of this
-    function with an `api(...)` call — the caller contract is stable.
+    This unused hook still returns None so older tests/importers keep a stable
+    surface. Current code uses the string commit-status contract and exact-head
+    checks; new code must not decode the retired integer surface.
 
     See also:
         - `reference_chronic_red_sweep_cancelled_vs_failed_filter`
@@ -279,7 +275,7 @@ def get_combined_status(sha: str) -> dict:
 
 
 def _entry_state(s: dict) -> str:
-    """Per-entry status key in Gitea 1.22.6 is `status`; fall back to `state`."""
+    """Read legacy per-entry `status`, falling back to newer `state`."""
     return s.get("status") or s.get("state") or ""
 
 
@@ -294,22 +290,22 @@ def is_red(status: dict) -> tuple[bool, list[dict]]:
     `failed_statuses` is the list of per-context entries whose own
     `state` is in the red set; useful for the issue body.
 
-    Cancel-cascade filter (mc#1564, 2026-05-19):
-      Gitea maps BOTH `action_run.status=2 (Failure)` AND
-      `action_run.status=3 (Cancelled)` to commit-status string
+    Legacy cancel-cascade filter (mc#1564, 2026-05-19):
+      The observed 1.22.6 surface mapped BOTH `action_run.status=2 (Failure)`
+      AND `action_run.status=3 (Cancelled)` to commit-status string
       `"failure"`. On a busy main with
       `concurrency: cancel-in-progress: true`, every merge burst
       cancels prior in-flight runs (status=3) — those bubble to the
       combined-status `failure` and inflate the watchdog's red%,
       generating phantom `[main-red]` issues (mc#1562/#1552/#1540/...).
-      Canonical Gitea 1.22.6 enum per `models/actions/status.go` +
+      Historical Gitea 1.22.6 integer enum per `models/actions/status.go` +
       `reference_gitea_action_status_enum_corrected_2026_05_19`:
           1=Success, 2=Failure, 3=Cancelled, 4=Skipped,
           5=Waiting, 6=Running, 7=Blocked
       We only want status=2 (real defects) to file. At the
       commit-status layer we don't have the integer enum directly
       (only the `failure` rollup string), so we use the description
-      string Gitea writes when a run is cancelled — empirically
+      legacy description string retained for cancelled runs — empirically
       `"Has been cancelled"` (verified 2026-05-19 via #1562 body).
       Real failures show `"Failing after Ns"` and are unaffected.
       This is option B from mc#1564 (description-string filter, no
@@ -322,16 +318,15 @@ def is_red(status: dict) -> tuple[bool, list[dict]]:
     combined = status.get("state")
     statuses = status.get("statuses") or []
     red_states = {"failure", "error"}
-    # Schema asymmetry: top-level combined uses `state`, but per-entry
-    # items in `statuses[]` use `status` in Gitea 1.22.6. Prefer
-    # `status`; fall back to `state` defensively. Verified empirically
-    # 2026-05-12 03:42Z. Pre-rev4 code only read `state` from per-entry
+    # Compatibility: older responses used top-level `state` but per-entry
+    # `status`; current responses may expose either key. Prefer `status` and
+    # fall back to `state`. Pre-rev4 code only read `state` from per-entry
     # items → failed[] always empty → render_body always showed the
     # "no per-context entries were in a red state" fallback even when
     # the combined-state correctly flagged red. See
     # `feedback_smoke_test_vendor_truth_not_shape_match`.
     def _is_cancel_cascade(s: dict) -> bool:
-        """status=3 entry per Gitea 1.22.6 description-string contract.
+        """Cancelled entry under the legacy description-string contract.
         Match exactly (after strip) — substring match would catch
         legitimate test names like "Has been cancelled by the user
         unexpectedly" in failure logs."""
@@ -460,8 +455,8 @@ def render_body(sha: str, failed: list[dict], debug: dict) -> str:
     else:
         for s in failed:
             ctx = s.get("context", "(no context)")
-            # Per-entry key is `status` in Gitea 1.22.6, not `state`
-            # (see _entry_state in is_red). Fallback for forward-compat.
+            # Prefer legacy per-entry `status`; fall back to newer `state`
+            # (see _entry_state in is_red).
             state = s.get("status") or s.get("state") or "(no state)"
             url = s.get("target_url") or ""
             desc = (s.get("description") or "").strip()
@@ -507,13 +502,9 @@ def emit_loki_event(event_type: str, sha: str, failed_contexts: list[str]) -> No
     util-linux logger), print to stderr instead. The Gitea Actions
     Ubuntu runner has util-linux preinstalled.
 
-    Loki labels: the workflow runs on the Ubuntu runner where Vector is
-    NOT configured (Vector lives on the operator host + tenants per
-    `reference_obs_stack_phase1`). The Loki line is still emitted as
-    stdout JSON so the workflow log itself is parseable; treat the
-    syslog call as belt-and-braces for the cases where this script is
-    invoked from a host that DOES have Vector (e.g. operator-host cron
-    fallback in a follow-up PR).
+    Collector availability is deliberately not assumed. The stdout JSON is
+    the durable workflow evidence; the syslog copy is best-effort for runner
+    hosts whose current observability agent collects it.
     """
     payload = {
         "event_type": event_type,
@@ -522,14 +513,12 @@ def emit_loki_event(event_type: str, sha: str, failed_contexts: list[str]) -> No
         "failed_contexts": failed_contexts,
     }
     line = json.dumps(payload, sort_keys=True)
-    # Always print to stdout so the workflow log captures it (machine-
-    # readable; `gitea run logs` + Loki ingestion via the operator-host
-    # journald → Vector → Loki path will see this from runners that
-    # forward stdout). Loki query:
+    # Always print to stdout so the workflow log captures it in a
+    # machine-readable form. A downstream collector may ingest it, but this
+    # script does not depend on a particular host or observability topology.
     #   {source="gitea-actions"} |~ "main_red_detected"
     print(f"main-red-watchdog event: {line}")
-    # Best-effort syslog tag so a future "run from operator-host cron"
-    # path picks it up directly via the existing Vector pipeline.
+    # Best-effort syslog tag for runner hosts with a configured collector.
     if shutil.which("logger"):
         try:
             subprocess.run(
@@ -851,7 +840,7 @@ def run_once(*, dry_run: bool = False) -> int:
         "combined_state": status.get("state"),
         "failed_contexts": [s.get("context") for s in failed],
         "all_contexts": [
-            # Per-entry key is `status` in Gitea 1.22.6, not `state`.
+            # Prefer legacy per-entry `status`; fall back to newer `state`.
             # Pre-rev4 debug output reported `state: None` for every
             # context, making run logs useless for triage.
             {"context": s.get("context"),

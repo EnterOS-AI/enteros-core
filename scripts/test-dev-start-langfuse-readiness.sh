@@ -21,6 +21,7 @@ WORKFLOWS_DIR="$ROOT/.gitea/workflows"
 SETUP="$ROOT/infra/scripts/setup.sh"
 RESET_LIB="$ROOT/scripts/lib/docker-reset.sh"
 NUKE="$ROOT/scripts/nuke-and-rebuild.sh"
+POST_REBUILD="$ROOT/scripts/post-rebuild-setup.sh"
 
 fail() {
   echo "FAIL: $1" >&2
@@ -316,6 +317,21 @@ grep -Fq 'docker-reset.sh' "$NUKE" \
   || fail "nuke-and-rebuild.sh must source the shared scripts/lib/docker-reset.sh"
 grep -Fq 'mol_purge_ws_objects' "$NUKE" \
   || fail "nuke-and-rebuild.sh must purge ws-* via mol_purge_ws_objects (UUID-scoped)"
+
+# A local reset must not seed tenant credentials by writing global_secrets rows
+# directly.  The retired helper required a GitHub PAT and bypassed the
+# authenticated secret API/encryption path.  First-run credentials belong in
+# Canvas Settings (or PUT /settings/secrets with ADMIN_TOKEN) after the stack is
+# healthy.
+[ ! -e "$POST_REBUILD" ] \
+  || fail "post-rebuild-setup.sh must stay retired (it bypassed authenticated secret storage)"
+if grep -Fq 'post-rebuild-setup.sh' "$NUKE"; then
+  fail "nuke-and-rebuild.sh must not call the retired raw-DB secret seeder"
+fi
+grep -Fq 'Canvas Settings' "$NUKE" \
+  || fail "nuke-and-rebuild.sh must direct first-run secrets through Canvas Settings"
+grep -Fq '/settings/secrets' "$NUKE" \
+  || fail "nuke-and-rebuild.sh must name the authenticated API alternative"
 
 # The destructive wipe must NEVER fire on Ctrl-C: the exit-trap handler cleanup()
 # must invoke cleanup_dev_stack (volume-preserving), never fresh_reset.

@@ -54,8 +54,8 @@
 # (`--phantom-gate-lint`) with fail-before/pass-after unit tests in
 # .gitea/scripts/tests/test_phantom_gate_lint.py.
 #
-# IMPORTANT — Gitea parser quirk (feedback_gitea_workflow_dispatch_inputs_unsupported):
-# do NOT add an `inputs:` block to `workflow_dispatch:`.
+# IMPORTANT — repository flat-dispatch policy: do NOT add an `inputs:` block
+# to `workflow_dispatch:` without a coordinated policy/caller migration.
 
 name: lint-phantom-gate
 

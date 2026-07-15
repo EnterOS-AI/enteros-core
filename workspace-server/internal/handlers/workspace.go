@@ -344,8 +344,8 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 
 	id := uuid.New().String()
 	if h.IsSaaS() {
-		// SaaS hard gate: every hosted workspace gets its own sibling
-		// EC2 instance, so T4 is the only meaningful runtime boundary.
+		// Hosted-mode hard gate: provider-managed workspaces use the T4
+		// isolation contract, regardless of the configured compute provider.
 		// Do not trust stale clients/templates that still send T1/T2/T3.
 		payload.Tier = 4
 	} else if payload.Tier == 0 {
@@ -513,8 +513,8 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	//
 	// Fail-closed at the Create boundary so the caller learns the
 	// contract immediately — same shape as the controlplane#188
-	// runtime-unresolved gate above. Caller fixes the request, no
-	// EC2 launched, no stuck workspace, no operator paging.
+	// runtime-unresolved gate above. Caller fixes the request, no provider
+	// compute launched, no stuck workspace, no operator paging.
 	isExternal := payload.External || isExternalLikeRuntime(payload.Runtime)
 	if payload.Model == "" && !isExternal {
 		log.Printf("Create: FAIL-CLOSED — model is required (runtime=%q template=%q); refusing the silent DefaultModel fallback per CTO 2026-05-22 SSOT directive", payload.Runtime, payload.Template)
@@ -1109,7 +1109,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// Seed schedules declared in the workspace template's config.yaml
 	// AFTER provisionWorkspaceAuto succeeds so the scheduler never
 	// fires cron rows against a workspace whose backend never wired
-	// (review feedback PR #1929#1). Async EC2 provisioning may still
+	// (review feedback PR #1929#1). Async provider provisioning may still
 	// fail downstream; scheduler.go is expected to handle non-online
 	// status as a no-op tick. Idempotent across re-creates via
 	// orgImportScheduleSQL's ON CONFLICT clause; runtime-added rows

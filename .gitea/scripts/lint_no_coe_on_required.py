@@ -118,7 +118,7 @@ PR_EVENTS = {"pull_request", "pull_request_target"}
 # NOT waived (masks REMOVED in this PR — each proven green AND blessed by the
 # repo's own pre-flip gate, lint_pre_flip_continue_on_error.py):
 #   Harness Replays / Harness Replays
-#   Lint workflow YAML (Gitea-1.22.6-hostile shapes) / Lint workflow YAML ...
+#   Lint workflow YAML (repository compatibility policy) / Lint workflow YAML ...
 MASK_WAIVERS = {
     # ── Blocked by the PRE-FLIP GATE, not by a red job ──────────────────
     # All three below are PROVEN GREEN (see each workflow's inline comment),

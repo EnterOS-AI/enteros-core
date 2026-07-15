@@ -6,7 +6,8 @@ package handlers
 //
 // MCP bridge for opencode integration (#800, #809, #810).
 //
-// Exposes the same 8 A2A tools as workspace/a2a_mcp_server.py but
+// Exposes the platform's current MCP/A2A tool contract alongside the
+// molecule-ai-workspace-runtime/molecule_runtime/a2a_mcp_server.py surface, but
 // served directly from the platform over HTTP so CLI runtimes running
 // OUTSIDE workspace containers (opencode, Claude Code on the developer's
 // machine) can participate in the A2A mesh.
@@ -124,7 +125,8 @@ func (h *MCPHandler) proxyA2ARequest(ctx context.Context, workspaceID string, bo
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tool definitions (mirrors workspace/a2a_mcp_server.py TOOLS list)
+// Tool definitions (mirrors molecule-ai-workspace-runtime/
+// molecule_runtime/a2a_mcp_server.py TOOLS list)
 // ─────────────────────────────────────────────────────────────────────────────
 
 var mcpAllTools = []mcpTool{

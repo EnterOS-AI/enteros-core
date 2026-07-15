@@ -90,8 +90,8 @@ jobs:
   # bp-exempt: change detector only; downstream Harness Replays is the meaningful gate.
   detect-changes:
     # mc#1529 follow-on: pin to `docker-host` so this lane lands on
-    # Linux operator-host runners (the only ones with a working
-    # docker.sock + `molecule-core-net`). The bare `ubuntu-latest`
+    # self-hosted Linux runners with a working docker.sock and
+    # `molecule-core-net`. The bare `ubuntu-latest`
     # label is also matched by hongming-pc-runner-* (Windows act_runner
     # v1.0.3), where the `docker compose ...` exec below fails. Mirror
     # of mc#1543; see internal#512 for class defect.
@@ -223,7 +223,7 @@ jobs:
     needs: detect-changes
     name: Harness Replays
     # mc#1529 follow-on: `docker compose ... ps/logs` against tenant-alpha/
-    # beta containers. Must run on operator-host Linux (docker-host).
+    # beta containers. Must run on the Linux docker-host lane.
     runs-on: docker-host
     # UNMASKED 2026-07-14 (was `continue-on-error: true`). This is THE replay
     # gate — the whole reason this workflow exists is the #2398 TenantGuard
@@ -287,8 +287,8 @@ jobs:
       # symptom, different root cause: staging still has the in-image
       # clone path, hits the auth error directly).
       #
-      # 2026-05-08 sub-finding (#192): the clone step ALSO fails when
-      # any referenced workspace-template repo is private and the
+      # 2026-05-08 historical sub-finding (#192): the clone step also failed
+      # when a referenced workspace-template repo was private and the
       # AUTO_SYNC_TOKEN bearer (devops-engineer persona) lacks read
       # access. Root cause: 5 of 9 workspace-template repos
       # (openclaw, codex, crewai, deepagents, gemini-cli) had been
@@ -373,11 +373,10 @@ jobs:
           echo "Cloned: ws=$ws_count org=$org_count plugins=$plugins_count"
 
       - name: Install Python deps for replays
-        # peer-discovery-404 (and future replays) eval Python against the
-        # running tenant — importing workspace/a2a_client.py pulls in
-        # httpx. tests/harness/requirements.txt holds just the HTTP-client
-        # surface to keep CI install fast (~3s) vs the full
-        # workspace/requirements.txt (~30s).
+        # Replays exercise both tenant wire behavior and selected helpers from
+        # the published workspace-runtime wheel. Keep replay-only public
+        # dependencies in tests/harness/requirements.txt rather than pointing
+        # back at the runtime repository's source tree.
         if: needs.detect-changes.outputs.run == 'true'
         # The canonical molecules-workspace-runtime wheel is private while its
         # dependencies are public. Install it through the split-index helper;

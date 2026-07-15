@@ -1,221 +1,91 @@
-# Registry & Heartbeat
+# Registry and heartbeat
 
-Every workspace registers with the platform on startup and sends a heartbeat every 30 seconds. This is how the platform knows which workspaces are alive and where to find them.
+The registry records where a workspace can be reached and its latest health
+snapshot. Postgres is authoritative; Redis holds short-lived liveness and URL
+caches.
 
-## Registration Flow
+## Registration
 
-When a workspace container starts:
+A newly started workspace calls `POST /registry/register` with its workspace
+identity, advertised URL, Agent Card, and runtime capability fields. The exact
+request contract is defined by `internal/models` and
+`internal/handlers/registry.go`.
 
-```
-POST /registry/register
-Body: { id, url, agent_card }
-```
+Registration is not an unauthenticated URL update. Existing workspaces must
+present a valid credential for the workspace, and the boot path uses its scoped
+registration credential. The handler rejects an attempt to register another
+workspace's ID or replace its URL without the required proof.
 
-The platform:
-1. Writes the Agent Card to Postgres (`workspaces` table)
-2. Sets Redis key `ws:{id}` = `"online"` with TTL 60 seconds
-3. Appends a `WORKSPACE_ONLINE` event to `structure_events`
-4. Broadcasts event via WebSocket — canvas node turns green
+On success the handler updates the workspace row, refreshes routing caches,
+sets the liveness marker, writes/broadcasts the relevant lifecycle event, and
+returns the current token/config material the runtime is allowed to receive.
+`runtime=external` can enter `awaiting_agent` until the external process
+registers.
 
-## Heartbeat Flow
+## Heartbeat
 
-Every 30 seconds:
+The workspace runtime normally posts `POST /registry/heartbeat` on an
+approximately 30-second cadence. Current payload fields include health and UI
+state such as error rate, sample error, active task count, uptime, and current
+task. Runtime capability fields are also reported where applicable.
 
-```python
-# workspace/heartbeat.py
+For a `kind=platform` workspace, management-MCP health is fail closed:
 
-await platform.post("/registry/heartbeat", json={
-    "workspace_id": WORKSPACE_ID,
+- `mcp_server_present` reports that the management server is declared;
+- `loaded_mcp_tools` reports tools actually observed by the runtime;
+- after the grace window, absence of the required create-workspace tool can
+  degrade the concierge even when the server was declared.
 
-    # used by platform to make status decisions
-    "error_rate": error_tracker.error_rate,      # triggers degraded
-    "sample_error": error_tracker.sample_error,  # shown on canvas
+Heartbeat values overwrite the latest snapshot in Postgres. Long-term task and
+request observability belongs in the tracing/activity systems, not a heartbeat
+history table.
 
-    # informational — shown on canvas node tooltip
-    "active_tasks": task_counter.current,         # how many tasks running now
-    "uptime_seconds": time.time() - START_TIME,   # how long since container start
-    "current_task": current_task_description,      # what the agent is working on
-})
-```
+## Status and liveness
 
-Five fields for an ordinary workspace. Memory usage, CPU, queue depth — those are infrastructure metrics for Prometheus/Grafana or CloudWatch. The platform registry is a service discovery layer, not a metrics store.
+Each successful register or heartbeat refreshes `ws:<workspace-id>` with
+`db.LivenessTTL`, currently 180 seconds. This tolerates several missed
+heartbeats during a busy runtime turn. Do not duplicate the duration in another
+implementation; use the constant in `internal/db/redis.go`.
 
-### Platform-agent (concierge) status fields
+Health is backend aware:
 
-A `kind=platform` concierge reports **two additional fields** that the
-online/degraded gate reads (built by `platform_agent_identity.identity_gate_payload`):
+- Redis expiry drives passive offline detection;
+- local container workspaces are checked through Docker;
+- control-plane-backed workspaces use the control-plane running-state API;
+- external workspaces are considered stale after their heartbeat-age window,
+  180 seconds by default;
+- the A2A proxy can perform a reactive backend check after a forwarding error.
 
-```python
-    # platform concierge only — read by the online/degraded gate
-    "mcp_server_present": True,                       # management molecule-platform MCP is DECLARED/wired (RCA#2970)
-    "loaded_mcp_tools": ["mcp__molecule-platform__create_workspace", ...],  # tools ACTUALLY loaded (core#3082)
-```
+Paused, hibernating, hibernated, provisioning, and removed states are protected
+from being overwritten by a late health sweep. A dead or stale active workspace
+is marked offline, cache keys are cleared, an event is broadcast, and the
+configured recovery path may restart it.
 
-`mcp_server_present` (declared) is **necessary but not sufficient** — a
-declared-but-dead MCP is the false-green core#3082 catches, so the concierge also
-reports `loaded_mcp_tools`, the namespaced ids that actually loaded into the
-model. The runtime produces `loaded_mcp_tools` by enumerating the connected MCP
-servers over the wire (retrying in the background until the management MCP is
-connectable), so the concierge reaches `online` without waiting for a user turn.
-Tri-state: the field is **omitted** until something is observed (grace window
-applies), `[]` when a server connected with zero tools, or the id list. The
-required tool id is `mcp__molecule-platform__create_workspace`; *current state*
-core holds it as a literal const (`conciergePlatformMCPCreateWorkspaceTool`)
-guarded by a contract **drift test**, and the contract pins the management server
-name + status-field shape only — pinning the full id in the contract and deriving
-both sides is a *target* (in progress). See
-[Runtime ↔ Platform ↔ Plugin Responsibilities](/architecture/runtime-platform-plugin-responsibilities).
+Self-reported error rate can move an active workspace between `online` and
+`degraded`. Platform workspaces also apply the management-MCP checks above.
 
-`active_tasks` is included because the canvas uses it for a busy indicator on the node, and it sets up backpressure for Phase 2 without a schema change.
+## Discovery and relocation
 
-`current_task` is a human-readable description of what the agent is currently working on. The platform stores it in `workspaces.current_task` and broadcasts a `TASK_UPDATED` WebSocket event only when the value changes (not on every heartbeat). The canvas shows it as an amber banner on the workspace node and side panel header.
+`GET /registry/discover/:id` applies communication authorization and resolves
+the target's currently usable URL. Local peers may receive a container-network
+URL, while browser/system proxy paths use a platform-reachable URL. Cache misses
+fall back to Postgres.
 
-The platform:
-1. Overwrites heartbeat columns in Postgres (latest snapshot only — no history)
-2. Refreshes Redis TTL to 60 seconds
-3. Checks error rate for status transitions (see Health Monitoring below)
+When compute moves, a successful authenticated registration updates the durable
+URL and invalidates the old cache. Callers must discover or proxy through the
+platform rather than persisting a provider address.
 
-```go
-// workspace-server/internal/registry/heartbeat.go
+The legacy `forwarded_to` column can still be read for existing data, but
+current create, reparent, and delete flows do not populate redirect chains.
 
-func HandleHeartbeat(workspaceID string, stats HeartbeatStats) {
-    db.Exec(`
-        UPDATE workspaces SET
-            last_heartbeat_at = now(),
-            last_error_rate   = $2,
-            last_sample_error = $3,
-            active_tasks      = $4,
-            uptime_seconds    = $5,
-            current_task      = $6
-        WHERE id = $1
-    `, workspaceID,
-       stats.ErrorRate, stats.SampleError,
-       stats.ActiveTasks, stats.UptimeSeconds,
-       stats.CurrentTask,
-    )
-    redis.Refresh(workspaceID, 60*time.Second)
-    evaluateStatusTransition(workspaceID, stats)
-}
-```
+## Implementation authority
 
-No heartbeat history table. Heartbeats arrive every 30 seconds — storing history would be 2880 rows per workspace per day with no practical use. If you need health trends, Langfuse traces capture that at the task level with far more detail.
+- register/heartbeat: `workspace-server/internal/handlers/registry.go`;
+- request and response models: `workspace-server/internal/models/`;
+- Redis TTL/cache helpers: `workspace-server/internal/db/redis.go`;
+- active health sweeps: `workspace-server/internal/registry/healthsweep.go`;
+- route wiring: `workspace-server/internal/router/router.go`.
 
-## Health Monitoring
-
-The workspace self-reports its health via the heartbeat payload. The platform decides status transitions based on error rate thresholds:
-
-| Condition | Transition | Event |
-|-----------|-----------|-------|
-| `error_rate >= 0.5` and status is `online` | `online` -> `degraded` | `WORKSPACE_DEGRADED` |
-| `error_rate < 0.1` and status is `degraded` | `degraded` -> `online` | `WORKSPACE_ONLINE` |
-
-For a `kind=platform` concierge, two **MCP-presence** transitions also apply
-(fail-closed; `registry.go`):
-
-| Condition | Transition | Rationale |
-|-----------|-----------|-----------|
-| `mcp_server_present=false` on register/heartbeat | refuse `online` | RCA#2970 — no management MCP, refuse to serve a crippled concierge |
-| `mcp_server_present=true` but `loaded_mcp_tools` absent / lacks `mcp__molecule-platform__create_workspace` past the grace window | `online` -> `degraded` | core#3082 — MCP declared but its tools never loaded (false-green) |
-
-**What counts as an error:** Only things that indicate the workspace itself is broken — 5xx responses, timeouts, connection errors. Client errors (400, 403) are the caller's fault and are not counted.
-
-The workspace tracks errors locally using a rolling 60-second window and includes the stats in every heartbeat. The platform doesn't sit in the A2A message path, so it can't monitor response codes directly — self-reporting via heartbeat is the mechanism.
-
-## Liveness Detection (No Polling)
-
-Redis keyspace notifications are enabled (`notify-keyspace-events = KEA`). When `ws:{id}` TTL expires (workspace missed 2 heartbeats), Redis fires an expiry event automatically.
-
-```
-Workspace starts
-      |
-      v
-POST /registry/register  ->  Platform writes Agent Card to Postgres
-                          ->  Platform sets Redis key: ws:{id} = "online" TTL 60s
-
-Every 30s:
-POST /registry/heartbeat ->  Platform refreshes Redis TTL
-
-Workspace crashes / goes dark:
-      |
-      v
-Redis TTL expires (60s)
-      |
-      v
-Redis keyspace event fires
-      |
-      v
-Platform marks workspace offline in Postgres
-      |
-      v
-WebSocket broadcast -> canvas node turns gray
-```
-
-On expiry, the platform:
-1. Receives Redis keyspace expiry event
-2. Writes `WORKSPACE_OFFLINE` event to Postgres
-3. Updates `workspaces.status = 'offline'`
-4. Broadcasts via WebSocket — canvas node turns gray
-
-## Heartbeat Delegation Checking
-
-In addition to alive signals, the heartbeat loop checks for completed delegations every 30 seconds:
-
-```
-Every 30s:
-1. POST /registry/heartbeat        → alive signal
-2. GET /workspaces/:id/delegations → check results
-3. If new completions found:
-   a. Write to /tmp/delegation_results.jsonl (for context injection)
-   b. Send A2A self-message to wake the agent (5-min cooldown)
-   c. Push notification to user via POST /notify
-```
-
-**Self-message trigger:** When the heartbeat detects a completed delegation, it sends an A2A message to its own workspace: "Delegation results are ready. Review them and take appropriate action." This wakes the agent so it can report results back up the chain.
-
-**Cooldown:** At most one self-message per 5 minutes to prevent infinite loops (agent delegates → completes → self-message → agent delegates again → ...).
-
-**Context injection:** When the agent receives any message (including the self-message), the CLI executor reads `/tmp/delegation_results.jsonl` and injects results into the prompt as `[Delegation results received while you were idle]`.
-
-**Delegation status lifecycle:**
-```
-pending → dispatched → received → in_progress → completed | failed
-```
-
-Each transition broadcasts a `DELEGATION_STATUS` WebSocket event. `DELEGATION_COMPLETE` and `DELEGATION_FAILED` are broadcast on terminal states.
-
-## Workspace Moves to a New Machine
-
-When a workspace starts on a new machine (e.g. new EC2 instance):
-
-1. Workspace sends `POST /registry/register` with new URL
-2. Platform updates `workspaces.url` in Postgres
-3. Platform busts Redis URL cache key `ws:{id}:url`
-4. All subsequent inter-workspace calls use the new URL automatically
-
-## Workspace Forwarding
-
-The `forwarded_to` column is set when a workspace is retired but a replacement exists. Three scenarios:
-
-**1. Workspace replaced by a better version:** User deploys a new SEO agent with improved skills and retires the old one. Old workspace gets `forwarded_to = new_workspace_id`. Any workspace that still has the old URL cached gets a `410 Gone` + redirect pointer and updates its reference automatically.
-
-**2. Workspace expanded into a team:** A single Developer Agent expands into a Developer Team. The original single-agent workspace is retired. `forwarded_to = developer_pm_id` (the team lead). Anything that was talking to the old Developer Agent now gets redirected to Developer PM.
-
-**3. Workspace moved to a different parent:** A workspace is reorganized in the hierarchy. Old workspace entry kept for redirect, new one created under the new parent.
-
-In all cases, the forwarding is transparent — callers follow the redirect and update their cached URL.
-
-## Querying a Deleted Workspace
-
-When a workspace is queried after being deleted or retired:
-
-1. Platform checks `workspaces` table — status is `removed`
-2. Platform queries `structure_events` for the last event on that ID
-3. If `workspaces.forwarded_to` is set, returns `301` with the new workspace URL
-4. If no forwarding, returns `410 Gone` with the last event payload
-5. Canvas removes the node; parent workspace is notified
-
-## Related Docs
-
-- [Platform API](./platform-api.md) — Full endpoint reference
-- [Event Log](../architecture/event-log.md) — How events are recorded
-- [Database Schema](../architecture/database-schema.md) — Redis key patterns
+Related: [A2A protocol](./a2a-protocol.md),
+[Workspace provisioning](../architecture/provisioner.md), and
+[Database schema](../architecture/database-schema.md).

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """gitea-merge-queue — conservative serialized merge bot for Gitea.
 
-Gitea 1.22.6+ has auto-merge (`pull_auto_merge`) but no GitHub-style merge
-queue. This script provides the missing serialized policy in user space:
+Gitea's `pull_auto_merge` does not implement this repository's exact-head,
+one-at-a-time validation policy. This script enforces that policy in user space:
 
 1. Scan open same-repo PRs that are NOT opted out (auto-discovery, see below),
    oldest-first, skipping drafts, until an ACTIONABLE one is found. A non-ready

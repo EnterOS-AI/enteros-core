@@ -170,10 +170,11 @@ source "$(dirname "$0")/_lib.sh"
 
 # GET /workspaces (list, router.go:165) and POST /workspaces (create,
 # router.go:166) are AdminAuth-gated. The e2e-api CI job sets ADMIN_TOKEN on the
-# platform (fail-open OFF) and exports MOLECULE_ADMIN_TOKEN here, so the
+# platform and exports MOLECULE_ADMIN_TOKEN here, so the
 # pre-sweep list and every runtime-create must send the admin bearer or they
 # 401. run_mock uses POST /org/import (also admin-gated) and wires its own admin
-# auth inline. Guarded if-set so a fail-open dev platform still works.
+# auth inline. Local development follows the same fail-closed contract.
+e2e_require_admin_token
 ADMIN_AUTH=()
 e2e_admin_auth_args ADMIN_AUTH
 
@@ -556,8 +557,8 @@ run_mock() {
   # POST /org/import is AdminAuth-gated (router.go:778). When the platform has
   # ADMIN_TOKEN set (as the e2e-api CI job now does), an unauthenticated import
   # 401s with {"error":"admin auth required"}. Send the same admin bearer the
-  # mint helper uses (MOLECULE_ADMIN_TOKEN, ADMIN_TOKEN fallback) — guarded so a
-  # bootstrap/dev platform with no admin token (fail-open) still works.
+  # mint helper uses (MOLECULE_ADMIN_TOKEN, ADMIN_TOKEN fallback). The suite's
+  # preflight above requires this bootstrap credential in every environment.
   local admin_bearer="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
   local admin_auth=()
   [ -n "$admin_bearer" ] && admin_auth=(-H "Authorization: Bearer $admin_bearer")

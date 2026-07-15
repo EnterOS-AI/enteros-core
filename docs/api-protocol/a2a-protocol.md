@@ -1,45 +1,12 @@
-# A2A Protocol (Inter-Workspace Communication)
+# A2A communication
 
-Molecule supports two A2A (Agent-to-Agent protocol) transports: runtimes can
-call a discovered peer **directly**, or callers can use the platform's
-authenticated A2A proxy.
+Molecule uses A2A JSON-RPC messages between workspaces, but there is no single
+transport path. Current delivery can be direct, platform-proxied, queued, or
+poll-driven depending on the caller, target runtime, and delivery mode.
 
-## How It Works
+## Message envelope
 
-Every workspace is an A2A server. For direct peer transport, the platform
-authorizes discovery and returns a reachable URL, then leaves the message path.
-For Canvas, external inbound, queue fallback, and server-side delegation, the
-platform proxy authenticates, authorizes, forwards the request, and relays the
-response.
-
-```
-Business Core (A2A client)  ->  Developer PM (A2A server)
-                                  (opaque to Business Core
-                                   what's inside)
-```
-
-## Discovery Flow
-
-How Business Core finds Developer PM's URL:
-
-1. Business Core asks the platform: `GET /registry/discover/developer-pm-id`
-   with its required `X-Workspace-ID` claim and its bearer when token-enrolled.
-2. The platform validates the discovery credential and checks
-   `CanCommunicate()` for the caller/target pair.
-3. The platform returns the URL appropriate to the target and caller runtime:
-   an external target's registered URL, or a Docker-internal URL for a local
-   workspace target.
-4. On a cache miss, the platform reads from Postgres and refreshes the cache.
-5. Business Core sends A2A JSON-RPC message **directly** to Developer PM
-6. Developer PM processes the task and responds
-
-For this direct transport, the platform is involved only in authenticated URL
-resolution. The separate proxy transport remains in the request and response
-path as described below.
-
-## Message Format
-
-A2A uses JSON-RPC 2.0 over HTTP:
+The common request is JSON-RPC 2.0:
 
 ```json
 {
@@ -49,219 +16,124 @@ A2A uses JSON-RPC 2.0 over HTTP:
   "params": {
     "message": {
       "role": "user",
-      "parts": [{ "kind": "text", "text": "Build the login feature" }],
+      "parts": [{"kind": "text", "text": "Build the login feature"}],
       "messageId": "msg-456"
     }
   }
 }
 ```
 
-The receiving workspace:
-1. Processes this as a task
-2. Streams progress updates via SSE
-3. Returns artifacts (files, structured data, text) when done
+The selected workspace runtime owns execution and task-status semantics. Core
+does not prescribe one agent framework or interrupt implementation.
 
-## On-Demand Discovery (Not Pushed)
+## Delivery paths
 
-Topology is **not** pushed to workspaces at startup. A workspace only queries the platform for another workspace's URL at the moment it decides to delegate to it.
+### Platform proxy
 
-**Why not push at startup:** The topology changes while the workspace is running — sub-workspaces get added, removed, come online and go offline. If you push at startup you'd need to also push every topology change to every affected workspace and keep them in sync. That's complex and fragile.
+`POST /workspaces/:id/a2a` is the main routing boundary for Canvas and
+platform-mediated traffic. It:
 
-On-demand fits naturally with how agents work — an agent only needs to know about another workspace at the moment it decides to delegate, not before.
+- accepts a verified control-plane tenant-member session, org token, or
+  `ADMIN_TOKEN` for Canvas traffic, whether or not it supplies an
+  identity-workspace header; combined self-host/dev deployments retain a
+  same-origin fallback only when control-plane session verification is
+  unconfigured, and SaaS never treats `Origin` as authentication;
+- derives a workspace caller from its live bearer and requires any supplied
+  caller ID, including a self-call ID, to match that token owner;
+- applies hierarchy and same-org communication checks;
+- normalizes missing JSON-RPC/message IDs;
+- enforces request/response size and forwarding limits;
+- resolves the target's current URL;
+- records activity and classifies delivery-confirmed response failures;
+- queues work when the target is busy or uses a queue/poll delivery mode;
+- performs backend-aware dead-target recovery checks.
 
-**Note:** While URL resolution is on-demand, the workspace does fetch peer Agent Cards on startup to build its system prompt (see [System Prompt Structure](../agent-runtime/system-prompt-structure.md)). The system prompt is rebuilt reactively when `AGENT_CARD_UPDATED` events arrive — but the actual A2A URL for sending messages is resolved on-demand at delegation time.
+Long Canvas turns can return `{ "status": "queued" }` after the synchronous
+edge-safe budget while dispatch continues. The eventual response is delivered
+through the Canvas event path. `queued` is therefore not itself a failure.
 
-## Authentication Between Workspaces
+### Direct peer delivery
 
-**Direct peer transport:** The platform validates the discovery caller and
-`CanCommunicate()` when workspace A calls `GET /registry/discover/:id`. That
-route requires `X-Workspace-ID`; an enrolled workspace also presents its own
-bearer. Once A has B's URL, a direct request to B's agent server does not pass
-through the platform's HTTP A2A authenticator.
+Runtime tools can discover an allowed peer and send A2A directly for the fast
+path. The platform authenticates discovery and applies `CanCommunicate()` before
+returning the URL, but the subsequent peer request does not pass through the
+platform HTTP authenticator. Direct reachability and protection therefore
+depend on the deployment network boundary; callers should rediscover instead
+of treating a cached URL as continuing authorization.
 
-Direct transport therefore relies on the target network's trust boundary after
-discovery. It is appropriate only when peer endpoints are isolated accordingly
-(for example, a self-hosted Docker network controlled by one operator). Use the
-platform proxy when the caller needs current source authentication and
-hierarchy enforcement on each request.
+### Durable queue and poll
 
-**Known gap:** Once workspace A caches workspace B's URL, nothing stops A from calling B directly even after the hierarchy changes and A is no longer supposed to reach B. The cached URL remains valid until the container is restarted or the URL changes.
+Busy or poll-mode workspaces receive durable `a2a_queue` rows. The target polls
+with its workspace credential, and callers can query a queue row only when they
+are the recorded caller, the target, or hold accepted tenant-admin authority.
+Authorization failures use non-inferable not-found behavior.
 
-**Platform proxy transport:** `POST /workspaces/:id/a2a` is a separate path.
-It authenticates workspace callers with a source-bound bearer and applies the
-current hierarchy before dispatch. Verified control-plane sessions,
-`ADMIN_TOKEN`, org tokens, and authenticated external inbound requests are
-privileged non-workspace paths. A combined self-host/dev Canvas may use the
-same-origin fallback only when control-plane session verification is not
-configured; SaaS never accepts same-origin headers as authentication.
+`POST /workspaces/:id/delegate` and the delegation ledger add orchestration and
+terminal-status tracking on top of these delivery primitives.
 
-**Post-MVP fix — platform-issued tokens:** On discovery, the platform issues a short-lived signed token scoped to the specific caller/target pair. The target workspace validates the token on every A2A request. When the hierarchy changes, old tokens expire and new discovery attempts are blocked by `CanCommunicate()`.
+### External inbound
 
-## Task Lifecycle
+External agents expose a public inbound endpoint. Platform-to-external forwards
+carry the target workspace's `platform_inbound_secret`. An external caller that
+needs to reach a platform-hosted workspace uses:
 
-Every A2A message creates a task with a defined lifecycle:
-
-```
-submitted → working → completed
-                    → failed
-                    → canceled
-           → input-required → working (caller provides input)
-```
-
-### Full Flow
-
-```
-Caller sends message/send or message/sendSubscribe
-      │
-      ▼
-Task created: status = submitted
-      │
-      ▼
-Workspace starts processing: status = working
-      │
-      ├── needs clarification?
-      │         │
-      │         ▼
-      │   status = input-required
-      │   SSE event fires to caller
-      │   caller sends follow-up message
-      │         │
-      │         ▼
-      │   status = working (resumes)
-      │
-      ├── success
-      │         │
-      │         ▼
-      │   status = completed
-      │   SSE terminal event fires
-      │   artifacts returned
-      │
-      └── error
-                │
-                ▼
-          status = failed
-          SSE terminal event fires
-          error details returned
+```text
+POST /workspaces/:id/a2a/inbound
+Authorization: Bearer <platform_inbound_secret>
 ```
 
-### Calling Patterns
+The handler reads the target's secret, compares it in constant time, strips the
+consumed credential and any caller-supplied workspace identity, then reuses the
+normal proxy. Missing enrollment or a bad secret fails closed. The platform can
+mint/heal the secret on its outbound path and asks the caller to retry while the
+external runtime picks it up.
 
-Two patterns — synchronous for short tasks, streaming for long ones:
+## Discovery
 
-```python
-# pattern 1 — synchronous (short tasks)
-# caller blocks until terminal state
-result = await a2a.send({
-    "method": "message/send",
-    "params": { "message": { ... } }
-})
-# returns when completed/failed — no streaming
+`GET /registry/discover/:id` checks whether the caller may communicate with the
+target before returning a usable address. Local container peers may receive a
+container-network URL; platform callers use a platform-reachable URL. Addresses
+can change after restart or relocation, so callers should rediscover rather
+than persist backend hostnames.
 
-# pattern 2 — streaming (long tasks)
-# caller subscribes to SSE stream
-async for event in a2a.subscribe({
-    "method": "message/sendSubscribe",
-    "params": { "message": { ... } }
-}):
-    if event["status"] == "working":
-        # intermediate progress update
-        print(event["message"])
+Discovery authorization is not a substitute for the current credential checks
+on proxy, queue, or external inbound routes.
 
-    if event["status"] in ("completed", "failed", "canceled"):
-        # terminal event — stream ends here
-        result = event["artifacts"]
-        break
-```
+## Task and delegation status
 
-No polling needed. The SSE stream includes a terminal event — the caller knows the task is done when it receives `completed`, `failed`, or `canceled`.
+A runtime can expose A2A task states such as submitted, working,
+input-required, completed, failed, and canceled. Molecule's delegation ledger
+separately tracks dispatch/delivery/execution status so a caller can distinguish
+transport acceptance from terminal agent work.
 
-### Task ID
+Cancellation is supported only when the target runtime advertises and
+implements an interrupt primitive. A response body may contain text or
+structured artifacts; Core treats the agent as opaque and applies transport
+limits rather than interpreting framework internals.
 
-Every task gets an ID on creation, returned in the first SSE event or synchronous response:
+## Security boundaries
 
-```python
-task_id = response["id"]
+- Current tenant-admin credentials authorize Canvas calls with or without an
+  identity-workspace header. Combined self-host/dev Canvas traffic has the
+  narrow CP-unconfigured same-origin fallback described above. Other public
+  proxy callers need either a live workspace bearer or the target-bound
+  external-inbound credential; Core derives workspace-token ownership
+  server-side and rejects any mismatched `X-Workspace-ID`, including a forged
+  self-call.
+- A workspace bearer must match the caller workspace; it cannot be used to
+  impersonate another caller ID.
+- Reserved system-caller prefixes are accepted only from trusted in-process
+  call sites and are rejected from public headers.
+- Cross-org and hierarchy checks run before workspace-to-workspace forwarding.
+- External agent traffic requires the per-workspace inbound secret.
+- Agent URLs and provider identifiers are routing data, not authentication.
 
-# caller can check status explicitly if needed
-status = await a2a.get(f"/tasks/{task_id}")
-```
+Implementation authority: `workspace-server/internal/handlers/a2a_proxy.go`,
+`workspace-server/internal/handlers/a2a_queue.go`,
+`workspace-server/internal/handlers/delegation.go`,
+`workspace-server/internal/wsauth/platform_inbound.go`, and the route groups in
+`workspace-server/internal/router/router.go`.
 
-### Cancellation
-
-```python
-# cancel an in-flight task
-await a2a.send({
-    "method": "tasks/cancel",
-    "params": { "id": task_id }
-})
-# workspace receives cancel signal
-# status → canceled
-# SSE terminal event fires to all subscribers
-```
-
-The workspace handles cancellation via the `LangGraphA2AExecutor.cancel()` method, which uses LangGraph's interrupt mechanism:
-
-```python
-# workspace/a2a_executor.py
-async def cancel(self, context: RequestContext, queue: EventQueue):
-    await self.agent.ainterrupt(context.context_id)
-    # status → canceled, SSE terminal event fires automatically
-```
-
-See [Workspace Runtime — A2A Server Wrapping](../agent-runtime/workspace-runtime.md#a2a-server-wrapping) for the full executor implementation.
-
-### Artifacts
-
-On completion, the task returns artifacts:
-
-```json
-{
-  "status": "completed",
-  "artifacts": [
-    {
-      "type": "text/plain",
-      "content": "Page generated successfully"
-    },
-    {
-      "type": "application/json",
-      "content": { "page_path": "/kitchen-renovation-vancouver" }
-    }
-  ]
-}
-```
-
-## Platform A2A Proxy
-
-The canvas (browser) cannot reach Docker-internal agent URLs directly. The platform provides `POST /workspaces/:id/a2a` as a proxy:
-
-1. The caller presents a workspace bearer, verified control-plane session, `ADMIN_TOKEN`, org token, or the target-bound external inbound secret. A combined self-host/dev Canvas may use same-origin only when control-plane session verification is unconfigured.
-2. For workspace callers, the platform derives the source workspace from the bearer. `X-Workspace-ID`, when supplied, must match that identity.
-3. The proxy enforces hierarchy and same-org access before resolving the target.
-4. The proxy resolves the agent's host-accessible URL from Redis cache (falls back to DB).
-5. If the request lacks a `jsonrpc` field, the proxy wraps it in a JSON-RPC 2.0 envelope with a generated UUID.
-6. If `params.message.messageId` is missing, the proxy injects one (required by a2a-sdk).
-7. The proxy forwards the request to the agent and returns the response.
-
-Missing, revoked, tokenless legacy, forged-self, mismatched-header, and auth
-datastore-error cases fail closed before dispatch. The only no-bearer Canvas
-compatibility path is the CP-unconfigured same-origin case above. A raw direct
-call to a discovered agent URL is outside the platform proxy authorization
-boundary.
-
-## Key Properties
-
-- **Transport:** JSON-RPC 2.0 over HTTP — any language can implement it
-- **Discovery:** Agent Cards at `/.well-known/agent-card.json`
-- **On-demand:** Workspaces discover peers when needed, not at startup
-- **Opaque execution:** The caller doesn't know (or care) what's inside the callee
-- **Interoperable:** Any A2A-compliant agent from any framework can plug in
-- **Source-bound proxy auth:** Workspace bearer ownership is the authoritative caller identity on the platform proxy
-- **Fail-closed:** Invalid credentials and auth lookup failures never downgrade to canvas traffic
-
-## Related Docs
-
-- [Agent Card](../agent-runtime/agent-card.md) — The identity document used for discovery
-- [Communication Rules](./communication-rules.md) — Who can communicate with whom
-- [System Prompt Structure](../agent-runtime/system-prompt-structure.md) — How peer Agent Cards are used in prompts
-- [Registry & Heartbeat](./registry-and-heartbeat.md) — How workspaces register URLs
-- [Platform API](./platform-api.md) — The discovery endpoint
+Related: [Communication rules](./communication-rules.md),
+[Registry and heartbeat](./registry-and-heartbeat.md), and
+[Workspace runtime](../agent-runtime/workspace-runtime.md).

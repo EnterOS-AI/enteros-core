@@ -1,11 +1,19 @@
 # ADR-003: Runtime adapts to the platform; the plugin adapts to each runtime
 
-**Status:** Accepted — committed architecture (§2 dispatch-location superseded by [ADR-004](/adr/ADR-004-sdk-owns-adapter-contract-and-registry))
+**Status:** Historical/superseded implementation record. Use the checked runtime,
+template, and platform code plus
+[the current responsibility map](../architecture/runtime-platform-plugin-responsibilities.md).
 **Date:** 2026-06-25
 **Supersedes context:** RFC `rfc-platform-mcp-as-plugin` §2b/§3.4 (platform-MCP-as-plugin, de-bake)
 **Related incident:** 2026-06-25 fleet-wide concierge `degraded` (half-wired `loaded_mcp_tools` producer)
 
-> **⚠ Superseded in part by ADR-004.** The two-layer, opposite-direction split
+> **Historical warning:** the named `molecule_runtime/mcp_render.py` dispatch
+> tables no longer exist in the current runtime repository, and the universal
+> renderer described here did not become the shipped plugin model. The broad
+> responsibility split remains useful, but operational claims below are a
+> point-in-time decision record.
+>
+> **Superseded in part by ADR-004.** The two-layer, opposite-direction split
 > (runtime adapts to platform; plugin adapts to each runtime) STANDS. What
 > changes: §2 placed the per-runtime renderers/readers/present-probes in the
 > **shared engine** (`molecule_runtime/mcp_render.py` `_RUNTIME_SPECS`/
@@ -17,8 +25,8 @@
 
 ## Context
 
-Molecule runs one agent codebase across many runtimes (claude-code, codex,
-hermes, openclaw, gemini-cli) and exposes the same capabilities (management MCP,
+Molecule runs shared runtime code across several templates (claude-code, codex,
+hermes, and openclaw) and exposes common capabilities (management MCP,
 A2A, memory) on all of them. Which component adapts to which was, until now,
 tribal knowledge: the *plugin → runtime* half was documented, but the
 *runtime → platform* status contract lived only in source docstrings, the named

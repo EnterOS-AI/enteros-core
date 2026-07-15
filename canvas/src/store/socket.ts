@@ -10,10 +10,12 @@ export const WS_URL = process.env.NEXT_PUBLIC_WS_URL || (deriveWsBaseUrl() + "/w
 const WS_AUTH_PROTOCOL_PREFIX = "molecule-auth.";
 const WS_PROTOCOL_SENTINEL = "molecule-ws";
 
-/** Browsers cannot set Authorization on a WebSocket handshake. Carry the
- * existing canvas admin bearer as hex in Sec-WebSocket-Protocol instead of a
- * URL query parameter, where reverse proxies and access logs commonly record
- * it. The non-secret sentinel lets the server complete browser subprotocol
+/** Browsers cannot set Authorization on a WebSocket handshake. When local dev
+ * or an ephemeral E2E build supplies the optional Canvas admin bearer, carry
+ * it as hex in Sec-WebSocket-Protocol instead of a URL query parameter, where
+ * reverse proxies and access logs commonly record it. Production SaaS uses
+ * its verified session and leaves this public build value empty. The
+ * non-secret sentinel lets the server complete browser subprotocol
  * negotiation without echoing the credential-bearing protocol. */
 function websocketAuthProtocols(): string[] | undefined {
   const token = process.env.NEXT_PUBLIC_ADMIN_TOKEN;
@@ -430,9 +432,11 @@ export interface WorkspaceCompute {
   // internal#734: per-workspace durable-data choice. "persist" | "ephemeral" |
   // undefined (auto). Controls whether the data volume survives recreate.
   data_persistence?: string;
-  // Cloud/compute backend for this workspace box (multi-provider, per-workspace):
-  // "aws" (default EC2) | "gcp" | "hetzner". Distinct from the LLM/model provider.
-  // Set at create time; routed by CP to the matching WorkspaceProvisioner. A
+  // Cloud/compute backend for this workspace box (multi-provider, per-workspace).
+  // Recognized values currently include "aws", "gcp", and "hetzner"; the
+  // deployment's control-plane configuration selects the default. This is
+  // distinct from the LLM/model provider. Set at create time and routed by CP
+  // to the matching WorkspaceProvisioner. A
   // workspace whose provider differs from its tenant's cloud is reached over a
   // per-workspace Cloudflare tunnel (runtime#95).
   provider?: string;

@@ -1,33 +1,30 @@
 # Ported from .github/workflows/ci.yml on 2026-05-11 per RFC internal#219 §1.
-# continue-on-error: true on every job; follow-up PR will flip required after
-# surfaced bugs are fixed (per RFC §1 — "surface broken workflows without
-# blocking"). The four-surface migration audit
+# Historical advisory masks have since been removed from required jobs; each
+# job's current `continue-on-error` value is authoritative. The four-surface migration audit
 # (feedback_gitea_actions_migration_audit_pattern) was performed against this
 # port:
 #
-#   1. YAML — dropped `merge_group` trigger (no Gitea merge queue); no
-#      `workflow_dispatch.inputs` to drop (Gitea 1.22.6 rejects those —
-#      feedback_gitea_workflow_dispatch_inputs_unsupported); no `environment:`
-#      blocks; kept `runs-on: ubuntu-latest` (Gitea runner pool advertises
-#      this label per agent_labels in action_runner table). Workflow-level
-#      env.GITHUB_SERVER_URL set as belt-and-suspenders against runner
+#   1. YAML — omitted GitHub's `merge_group` trigger because this repository
+#      uses its serialized Gitea queue; retained the flat-dispatch policy (no
+#      `workflow_dispatch.inputs`) and omitted `environment:` coupling; kept
+#      `runs-on: ubuntu-latest` because the runner pool advertises this label.
+#      Workflow-level env.GITHUB_SERVER_URL is set as belt-and-suspenders against runner
 #      defaults (feedback_act_runner_github_server_url).
 #
-#   2. Cache — `actions/upload-artifact@v3.2.2` was already pinned to v3 for
-#      Gitea act_runner v0.6 compatibility (a comment in the original called
-#      this out). v4+ is incompatible with Gitea 1.22.x. No `actions/cache`
-#      usage to audit. `actions/setup-python@v6` `cache: pip` is left in
-#      place — works against Gitea's built-in cache server when runner.cache
-#      is configured (currently is, /opt/molecule/runners/config.yaml).
+#   2. Cache — `actions/upload-artifact@v3.2.2` remains the protocol validated
+#      against this repository's runner fleet; upgrade only after an end-to-end
+#      artifact round trip. No `actions/cache` usage to audit.
+#      `actions/setup-python@v6` `cache: pip` is left in place — it works
+#      against Gitea's built-in cache server when runner.cache is configured
+#      on the self-hosted runner.
 #
 #   3. Token — workflow uses no custom dispatch tokens. The auto-injected
 #      `GITHUB_TOKEN` (which Gitea aliases to a runner-scoped token) is
 #      sufficient for `actions/checkout` against this same repo.
 #
 #   4. Docs — no docs/scripts reference github.com URLs that need swapping.
-#      The canvas-deploy-status step (core#2226, formerly canvas-deploy-reminder)
-#      writes the canvas ordered-deploy status into the step summary; it points
-#      at the ECR canvas image and the publish workflow, no ghcr.io prose.
+#      The legacy-named canvas-deploy-status step writes image-publication
+#      status into the summary and points at the Gitea registry workflow.
 #
 # Cross-links:
 #   - RFC: internal#219 (CI/CD hard-gate hardening)
@@ -45,8 +42,8 @@ on:
     branches: [main, staging]
   pull_request:
     branches: [main, staging]
-  # `merge_group` (GitHub merge-queue trigger) dropped — Gitea has no merge
-  # queue. The .github/ original retains it; this Gitea-side copy drops it.
+  # GitHub's `merge_group` trigger is intentionally omitted. This repository's
+  # serialized Gitea queue advances PRs using pull-request and push statuses.
 
 # Cancel in-progress CI runs when a new commit arrives on the same ref.
 # Stale runs queue up otherwise. PR refs and main/staging refs each get
@@ -58,9 +55,9 @@ concurrency:
 env:
   # Belt-and-suspenders against the runner-default trap
   # (feedback_act_runner_github_server_url). Runners are configured with
-  # this env via /opt/molecule/runners/config.yaml runner.envs, but pinning
-  # at the workflow level protects against a runner regenerated without
-  # the config file (feedback_act_runner_needs_config_file_env).
+  # this env in runner configuration, but pinning it at the workflow level
+  # protects against a runner regenerated without that setting
+  # (feedback_act_runner_needs_config_file_env).
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
@@ -446,12 +443,10 @@ jobs:
         run: npx vitest run --coverage
       - name: Upload coverage summary as artifact
         if: ${{ needs.changes.outputs.canvas == 'true' }}
-        # Pinned to v3 for Gitea act_runner v0.6 compatibility — v4+ uses
-        # the GHES 3.10+ artifact protocol that Gitea 1.22.x does NOT
-        # implement, surfacing as `GHESNotSupportedError: @actions/artifact
-        # v2.0.0+, upload-artifact@v4+ and download-artifact@v4+ are not
-        # currently supported on GHES`. Drop this pin when Gitea ships
-        # the v4 protocol (tracked: post-Gitea-1.23 followup).
+        # Pinned to v3 because it is the artifact protocol validated across
+        # this repository's current runner fleet. Upgrade only after a v4
+        # upload/download round trip passes end to end; the legacy
+        # incompatibility surfaced as `GHESNotSupportedError`.
         uses: actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2
         with:
           name: canvas-coverage-${{ github.run_id }}
@@ -610,6 +605,11 @@ jobs:
           # slug and aborted boot-to-registration BEFORE provisioning) goes red
           # here on every PR instead of burning a live boot-cell run.
           bash tests/e2e/test_collision_proof_slug_unit.sh
+          # Full-SaaS curl status capture must never concatenate the real HTTP
+          # code with a fallback (for example 404000), and a removed-route gate
+          # must accept only exact 404. Offline fail-direction cases cover
+          # 200/401/405/500/transport failures.
+          bash tests/e2e/test_http_status_capture_unit.sh
           # core#4370: bounded idle-digest evidence polling and fail-closed
           # Docker preflight. Offline: proves missing Docker or an unreachable
           # daemon cannot silently skip E2E_IDLE_DIGEST_CHECK=on.
@@ -624,47 +624,23 @@ jobs:
         run: bash .gitea/scripts/lint-e2e-ki013-container-names.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
-        name: Test ECR promote-tenant-image script (mock-driven, no live infra)
-        # Covers scripts/promote-tenant-image.sh — the codified
-        # :staging-latest → :latest ECR promote + tenant fleet redeploy
-        # closing molecule-ai/molecule-core#660. 40 mock-driven cases
-        # exercise every exit path (preflight, snapshot, promote, redeploy
-        # 403→SSM-refresh, verify, rollback). No live AWS/CP/SSM calls.
-        run: |
-          bash scripts/test-promote-tenant-image.sh
-
-      - if: ${{ needs.changes.outputs.scripts == 'true' }}
-        name: Drift guard — KI-013 container/volume naming (SEV #2499)
-        # KI-013 removed 12-char UUID truncation from container/volume names.
-        # E2E scripts must use FULL workspace IDs. This fail-closed guard
-        # prevents regressions where a new/modified script reintroduces the
-        # old truncated-name pattern (the root cause of SEV #2499).
-        run: bash .gitea/scripts/lint-e2e-ki013-container-names.sh
-
-      - if: ${{ needs.changes.outputs.scripts == 'true' }}
-        name: Shellcheck promote-tenant-image script
+        name: Shellcheck current deployment helpers
         # scripts/ is excluded from the bulk shellcheck pass above (legacy
-        # SC3040/SC3043 cleanup pending). Run shellcheck explicitly on
-        # the promote script + its test harness so regressions there are
-        # caught by the required check.
+        # SC3040/SC3043 cleanup pending). Keep the active local-docker staging
+        # rollout helper and its fail-closed flag tests covered explicitly.
         run: |
           shellcheck --severity=warning \
-            scripts/promote-tenant-image.sh \
-            scripts/test-promote-tenant-image.sh \
             scripts/deploy/redeploy-staging-fleet.sh \
             scripts/deploy/tests/test-managed-flags.sh
 
   # mc#959 root-fix (sre)
 
   canvas-deploy-status:
-    # core#2226: replaces the old advisory "Canvas Deploy Reminder". The canvas
-    # image now has a real ORDERED auto-deploy (publish-canvas-image.yml:
-    # build → push :staging-<sha> → wait green main CI → promote :latest by
-    # digest), and docker-compose pins via CANVAS_IMAGE_TAG. There is no longer
-    # a manual "go run docker compose pull by hand" step to remind operators
-    # about — so this job just records, on a canvas-touching main push, that the
-    # ordered deploy is handling it (and where to watch), instead of prescribing
-    # a manual action that determinism made obsolete.
+    # Compatibility: keep the established check key/name, but this job records
+    # ordered IMAGE PUBLICATION only. publish-canvas-image builds, waits for
+    # green CI, and promotes registry :latest; it does not by itself prove that
+    # a live host pulled or serves that image. End-to-end rollout proof is
+    # tracked as the release blocker in internal#1038.
     name: Canvas Deploy Status
     runs-on: docker-host
     # Per-step no-op (not job-level `if:`) so the job reaches SUCCESS on PRs
@@ -672,7 +648,7 @@ jobs:
     # Step-level exit 0 handles the "not a canvas main push" case.
     needs: [changes, canvas-build]
     steps:
-      - name: Record canvas ordered-deploy status
+      - name: Record canvas image-publication status
         env:
           COMMIT_SHA: ${{ github.sha }}
           CANVAS_CHANGED: ${{ needs.changes.outputs.canvas }}
@@ -684,31 +660,31 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$CANVAS_CHANGED" != "true" ] || [ "$EVENT_NAME" != "push" ] || [ "$REF_NAME" != "refs/heads/main" ]; then
-            echo "Canvas deploy status not applicable for event=$EVENT_NAME ref=$REF_NAME canvas_changed=$CANVAS_CHANGED."
+            echo "Canvas image-publication status not applicable for event=$EVENT_NAME ref=$REF_NAME canvas_changed=$CANVAS_CHANGED."
             exit 0
           fi
 
           # Write body to a temp file — avoids backtick escaping in shell.
           cat > /tmp/deploy-status.md << 'BODY'
-          ## Canvas ordered deploy in progress — no manual action required
+          ## Canvas image publication in progress
 
           This canvas-touching main push triggers `publish-canvas-image`, which now
-          runs an ORDERED, CI-gated deploy (core#2226) — the same shape as the
-          platform's deploy-production:
+          runs an ordered, CI-gated registry publication (core#2226):
 
           1. Build → push `molecule-ai/canvas:staging-<sha>` + `:staging-latest`.
           2. Wait for green main CI on this SHA.
           3. Promote `:latest` to the verified `:staging-<sha>` by digest.
 
-          Tenants/hosts pin via `CANVAS_IMAGE_TAG` (default `latest` = the last
-          CI-green build), so a deploy is reproducible — no hand-run
-          `docker compose pull` needed. Watch the run in the canvas publish workflow.
+          This proves the registry tag, not a live rollout. A deployment owner
+          must pull the immutable candidate and verify `/api/buildinfo` against
+          the expected SHA; that fail-closed rollout is tracked in internal#1038.
+          Watch the canvas publish workflow for the image result.
           BODY
           printf '\n> Posted automatically by CI · commit `%s` · [publish workflow](%s)\n' \
             "$COMMIT_SHA" "$RUN_URL" >> /tmp/deploy-status.md
 
-          # Gitea has no commit-comments API; write to GITHUB_STEP_SUMMARY, which
-          # both GitHub and Gitea Actions render as the run's summary page.
+          # This lane records deployment status in GITHUB_STEP_SUMMARY rather
+          # than mutating commit discussion; Gitea Actions renders the summary.
           cat /tmp/deploy-status.md >> "$GITHUB_STEP_SUMMARY"
 
   # Python Lint & Test — required check, always runs.
@@ -791,9 +767,10 @@ jobs:
     # (`if: needs.changes.outputs.* != 'true'`) rather than at the JOB level.
     # A per-step-gated job always reaches a terminal SUCCESS (it no-ops its
     # expensive steps but the job itself still completes), so it is never
-    # `skipped`. Plain `needs:` (WITHOUT `if: always()`) works correctly on
-    # Gitea 1.22.6 / act_runner v0.6.1 — only `needs:` + `if: always()` is
-    # broken (feedback_gitea_needs_works_only_ifalways_broken). We therefore
+    # `skipped`. Repository compatibility policy retains plain `needs:`
+    # (WITHOUT `if: always()`). The legacy Gitea 1.22.6 / act_runner v0.6.1
+    # incident showed `needs:` + `if: always()` could bypass this gate
+    # (feedback_gitea_needs_works_only_ifalways_broken). We therefore
     # use plain `needs:` + an explicit per-need result check (NOT
     # `if: always()`); if any need fails/errors, Gitea never starts this job
     # and BP sees `CI / all-required` go red via the failed dependency

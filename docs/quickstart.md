@@ -1,20 +1,17 @@
-# Quickstart Guide
+# Quick-start guide
 
-This path is aligned to the current repository and current UI. It gets you from clone to a live workspace on the canvas without assuming any extra platform wrapper.
+This guide follows the current repository and does not require an operator host,
+GitHub organization, Railway/Render wrapper, or production credential bundle.
 
 ## Prerequisites
 
-- Docker + Docker Compose v2
+- Docker with Compose v2
 - Node.js 20+
 - Go 1.25+
-- `jq` (for the template-registry clone in `setup.sh`)
-- One model/API key for the runtime you want to use
-  - `ANTHROPIC_API_KEY`
-  - `OPENAI_API_KEY`
-  - `GOOGLE_API_KEY`
-  - or another provider routed through LiteLLM
+- `jq`
+- a model-provider credential supported by the runtime you select
 
-## The one-command path
+## One-command local start
 
 ```bash
 git clone https://git.moleculesai.app/molecule-ai/molecule-core.git
@@ -22,285 +19,96 @@ cd molecule-core
 ./scripts/dev-start.sh
 ```
 
-That single script:
+The script owns local environment generation, fail-closed admin authentication,
+infrastructure startup, manifest-backed template/plugin setup, workspace-server
+startup, and Canvas startup. Follow the URLs it prints; the Canvas default is
+`http://localhost:3000` when that port is available.
 
-1. Generates an `ADMIN_TOKEN` into `.env` (first run only — preserved on re-runs) and exports the matching `NEXT_PUBLIC_ADMIN_TOKEN` so the canvas authenticates with it. Strict admin/workspace UI auth is **fail-closed in every environment** (including local dev) — there is no dev-mode fail-open; the canvas reaches those routes only because it sends this bearer.
-2. Cleans up stale local dev containers, chooses free loopback host ports, then brings up Postgres, Redis, MinIO, ClickHouse, and Langfuse via `infra/scripts/setup.sh`
-3. Populates the workspace template + plugin registry from `manifest.json`
-4. Starts Langfuse web on the selected `127.0.0.1` port after ClickHouse is ready
-5. Builds and starts the platform on the selected `127.0.0.1` port
-6. Installs canvas deps (first run) and starts the canvas on the selected `127.0.0.1` port
-7. Prints the exact URLs and tails both processes — `Ctrl-C` tears everything down while preserving named volumes
+On first load, complete the server-derived platform-agent setup shown by Canvas.
+Runtime/provider/model choices come from current APIs and template metadata; do
+not copy a hard-coded runtime list from this page.
 
-Total wall-clock: ~30 seconds for a re-run, ~2 minutes for a first run (npm install + docker pulls).
+## Manual component start
 
-Once the canvas is up: open it and complete the first-run setup scene (runtime → provider → model + API key — see Step 5 below). When the **Enter OS Agent** is online, click a template card or **+ Create blank workspace** to grow the org.
-
-## Manual setup (advanced)
-
-If you'd rather run each component yourself — useful when you're iterating on the platform binary or the canvas in isolation — follow the steps below. Each section is what `dev-start.sh` does internally; running them by hand gives you per-component logs and lets you keep one piece running while you restart another.
-
-### Step 1: Clone the repository
-
-```bash
-git clone https://git.moleculesai.app/molecule-ai/molecule-core.git
-cd molecule-core
-```
-
-### Step 2: Start the shared infrastructure
-
-Recommended:
+For focused development, start infrastructure and the two application
+components separately:
 
 ```bash
 ./infra/scripts/setup.sh
+
+cd workspace-server
+ADMIN_TOKEN=dev-local-admin-token MOLECULE_ENV=development go run ./cmd/server
+
+# separate terminal
+cd canvas
+npm ci
+NEXT_PUBLIC_ADMIN_TOKEN=dev-local-admin-token npm run dev
 ```
 
-That brings up Postgres, Redis, MinIO, ClickHouse, and Langfuse. When invoked
-through `scripts/dev-start.sh`, their host ports are selected dynamically and
-bound to `127.0.0.1`.
+`NEXT_PUBLIC_ADMIN_TOKEN` must match the workspace server's `ADMIN_TOKEN`.
+Authentication remains fail-closed in local development; see the [admin-auth
+runbook](./runbooks/admin-auth.md).
 
-If you only want the raw compose flow:
+## Create and use a workspace
 
-```bash
-docker compose -f docker-compose.infra.yml up -d
-```
+1. Complete the first-run platform-agent configuration if Canvas presents it.
+2. Choose a template or create a blank workspace.
+3. Add the required provider credential through the authenticated secrets UI.
+4. Wait for registration/heartbeat to make the workspace `online`.
+5. Send a message from Chat and confirm the response appears in Canvas activity.
 
-> **Auth is fail-closed even in local dev.** Pick any local admin token and
-> set it on *both* sides — the platform (`ADMIN_TOKEN`) and the canvas
-> (`NEXT_PUBLIC_ADMIN_TOKEN`, same value). Without it the canvas 401s on every
-> admin/workspace call. (`scripts/dev-start.sh` does this for you; the manual
-> steps below set it explicitly.)
+A created row or accepted provision request is not proof of a healthy agent.
+Registration, heartbeat, and a real message/reply are the end-to-end check.
 
-### Step 3: Start the platform
+## Build a hierarchy
+
+Create a child with the desired `parent_id`, or drag an existing workspace onto
+its parent in Canvas. **Expand Team View** and **Collapse Team View** only show
+or hide descendants. Delete is a separate explicit lifecycle operation.
+
+## Connect an external agent
+
+1. Create/select an external workspace in Canvas.
+2. Open **Config → External Connection**.
+3. Rotate credentials if no usable one-time token is available.
+4. Choose the runtime-specific or universal setup tab and copy the server-stamped
+   block exactly.
+5. Run it on the external machine and verify registration, heartbeat, inbound
+   delivery, and reply routing.
+
+The token is shown once. Re-opening the panel deliberately renders guarded
+non-runnable placeholders so pasting it cannot overwrite a working credential.
+Different runtimes use different push/poll/channel bridges; do not substitute
+the retired `molecule-agent-sdk` command or assume an inbound public URL is
+always required.
+
+See the [External Agent Registration Guide](./guides/external-agent-registration.md)
+for the current contracts.
+
+## Verification commands
 
 ```bash
 cd workspace-server
-ADMIN_TOKEN=dev-local-admin-token MOLECULE_ENV=development go run ./cmd/server
+go test ./...
+
+cd ../canvas
+npm test
+npm run build
 ```
 
-The control plane listens on `http://localhost:8080`.
-
-### Step 4: Start the canvas
-
-In a new terminal:
-
-```bash
-cd canvas
-npm install
-NEXT_PUBLIC_ADMIN_TOKEN=dev-local-admin-token npm run dev   # MUST match ADMIN_TOKEN above
-```
-
-Open `http://localhost:3000`.
-
-## Step 5: First run — set up the platform agent
-
-On a self-hosted stack the platform agent (the org concierge) is seeded automatically at first boot — it always exists, but starts unconfigured. The first time the canvas loads, a fullscreen setup scene appears and blocks everything else until the agent is configured. Four steps:
-
-1. **Welcome** — introduces the platform agent. Its name is fixed to **Enter OS Agent** (you can rename it later via the standard workspace rename).
-2. **Runtime** — a dropdown of the available runtimes, derived from `GET /templates`.
-3. **Provider + Model** — two cascading dropdowns constrained to the chosen runtime; on self-host only bring-your-own-key options appear. Changing an upstream pick resets the downstream ones, and there is no free-text entry — an invalid (runtime, model) pair is unreachable through the UI.
-4. **API key** — the key for the selected provider, stored as a global secret.
-
-The scene writes the key **first**, then configures and provisions the agent in a single create. A progress view follows; on success the scene dismisses into the canvas and the Enter OS Agent greets you first — that greeting is the end of onboarding.
-
-There is no local "completed" flag: the scene derives its state from the server, so a mid-setup refresh resumes at the right step, and once the agent has been online it never shows again.
-
-### Headless / no-UI setup
-
-Env-configured stacks skip the scene entirely. Set these before first boot:
-
-```bash
-MOLECULE_DEFAULT_RUNTIME=openclaw           # optional — runtime for the seeded agent (default: openclaw)
-MOLECULE_LLM_DEFAULT_MODEL=claude-opus-4-8  # bare registry model id for the chosen runtime
-ANTHROPIC_API_KEY=...                       # the provider key matching the chosen model
-```
-
-With a model and its matching provider key in the environment, the concierge converges to `online` on first boot with zero UI — the scene never renders because it sees a configured agent.
-
-## Step 6: Deploy your first workspace
-
-On a fresh canvas, the center empty state shows template cards plus a blank-workspace option.
-
-You can either:
-
-1. Click a template to provision a ready-made workspace.
-2. Click `+ Create blank workspace`.
-
-## Step 7: Add an API key
-
-1. Select the workspace.
-2. Open the `Config` tab.
-3. Expand `Secrets & API Keys`.
-4. Add the API key in either:
-   - `This Workspace`
-   - `Global (All Workspaces)`
-
-Global keys are inherited by all workspaces. Workspace keys override globals with the same name.
-
-## Step 8: Send the first message
-
-1. Open the `Chat` tab.
-2. Send a prompt such as:
-
-```text
-What can you help me with in this workspace?
-```
-
-Responses are delivered through the platform A2A proxy and pushed back to the canvas through WebSocket events, with polling kept only as recovery fallback.
-
-
----
-
-## Path 2: Remote Agent (run anywhere)
-
-A remote agent runs on your own machine or a cloud VM — no Docker on the platform side. The agent registers with the platform via API, pulls its secrets at boot, and sends heartbeats to stay live on the canvas.
-
-**Use this path if you:**
-- want to run an agent on your laptop for local development
-- need an agent on a machine with specific hardware (GPU, on-prem)
-- have a data-residency requirement that keeps agent compute off the platform's infra
-
-### Step 0: Prerequisites
-
-- Python 3.10+ and `pip install molecule-agent-sdk`
-- Outbound HTTPS access from the agent machine to `https://<your-org>.moleculesai.app`
-- A platform admin token (from the canvas, under `Config → Secrets & API Keys → Global`)
-
-### Step 1: Create the workspace
-
-```bash
-PLATFORM="https://acme.moleculesai.app"
-ADMIN_TOKEN="your-admin-token"
-
-curl -X POST "$PLATFORM/workspaces" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "my-remote-agent",
-    "runtime": "external",
-    "external": true,
-    "url": "https://my-agent.example.com/a2a",
-    "parent_id": null
-  }'
-```
-
-Save the returned `workspace_id`.
-
-### Step 2: Register the agent
-
-```bash
-WORKSPACE_ID="ws-xyz"
-
-curl -X POST "$PLATFORM/registry/register" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"workspace_id\": \"$WORKSPACE_ID\",
-    \"name\": \"my-remote-agent\",
-    \"description\": \"Runs on a cloud VM in us-east-1\",
-    \"skills\": [\"research\"],
-    \"url\": \"https://my-agent.example.com/a2a\"
-  }"
-```
-
-The response includes your bearer token — save it now. It is shown only once.
-
-### Step 3: Pull secrets at boot
-
-```bash
-AGENT_TOKEN="the-token-from-step-2"
-
-curl "$PLATFORM/workspaces/$WORKSPACE_ID/secrets" \
-  -H "Authorization: Bearer $AGENT_TOKEN"
-```
-
-Store the returned secrets in your environment before starting the agent.
-
-### Step 4: Run the agent
-
-```bash
-molecule-agent run \
-  --workspace-id "$WORKSPACE_ID" \
-  --platform-url "$PLATFORM" \
-  --agent-token "$AGENT_TOKEN"
-```
-
-The agent connects to the platform, appears on the canvas within ~10 seconds, and starts processing tasks.
-
-### Step 5: Configure the agent
-
-Edit `config.yaml` in the agent's working directory:
-
-```yaml
-name: my-remote-agent
-role: researcher
-runtime: python
-platform_url: https://acme.moleculesai.app
-a2a:
-  port: 8000
-```
-
-### Step 6: Inspect and iterate
-
-The agent appears on the canvas as a workspace card with a **REMOTE** badge. Open the chat tab, send a task, and watch it work. To iterate, stop and restart the agent — it re-registers with the same `workspace_id` and token.
-
-### Behind NAT (no public IP)
-
-If the agent machine has no public IP, use a tunnel:
-
-```bash
-# Terminal 1: start a tunnel
-ngrok http 8000 --url https://my-agent.ngrok.io
-
-# Update the registered URL
-curl -X POST "$PLATFORM/registry/update-card" \
-  -H "Authorization: Bearer $AGENT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"workspace_id": "'"$WORKSPACE_ID"'", "url": "https://my-agent.ngrok.io/a2a"}'
-```
-
-No inbound firewall rules needed — the agent initiates the outbound WebSocket connection.
-
-### Next steps
-
-- [Register a Remote Agent](../tutorials/register-remote-agent.md) — full tutorial with CI/CD examples
-- [External Agent Registration Guide](../guides/external-agent-registration.md) — detailed reference
-- [Remote Workspaces FAQ](../guides/remote-workspaces-faq.md) — common questions
-
-## What To Try Next
-
-- **Expand to a team:** right-click a workspace and choose `Expand to Team`.
-- **Switch runtime:** use `Config -> Runtime` to move between Claude Code, Codex, Hermes, and OpenClaw.
-- **Inspect operations:** check `Activity`, `Traces`, `Events`, and `Terminal`.
-- **Use global keys:** configure one provider once in `Secrets & API Keys -> Global`.
-- **Import a template:** use the template palette or `POST /templates/import`.
-- **Import/export bundles:** duplicate or move workspace trees as `.bundle.json`.
+Integration suites may need sibling repositories or local services; follow the
+active workflow's setup and exact pinned dependency.
 
 ## Troubleshooting
 
-| Problem | What to check |
+| Symptom | Check |
 |---|---|
-| Workspace stays offline | Platform is running, Docker is available, and the runtime has valid credentials |
-| Template palette is empty | `workspace-configs-templates/` exists and the platform can read it |
-| Chat says agent unavailable | Workspace status is not yet `online` or `degraded` |
-| No responses from model | Add the correct API key in `Secrets & API Keys` and restart the workspace |
-| Want direct DB access | Postgres and Redis are internal-only; use `docker compose exec postgres psql` or `docker compose exec redis redis-cli` |
+| Canvas receives 401 | `ADMIN_TOKEN` and `NEXT_PUBLIC_ADMIN_TOKEN` match |
+| Workspace stays provisioning/offline | backend availability, provision logs, registration, heartbeat, and runtime credentials |
+| Template palette is empty | `manifest.json` sources were fetched and the template cache can read them |
+| Chat has no reply | workspace is online, the selected runtime booted, and the real provider credential is valid |
+| External agent loops on auth | rotate and use the newly shown one-time token; do not paste a re-show placeholder |
+| External poll bridge stops after retention | current bridge handles HTTP 410 by resetting to a bounded cold start; refresh an older generated bridge |
 
-## Architecture At A Glance
-
-```text
-Browser  -->  Canvas (Next.js :3000)
-                |
-                v
-           Platform (Go :8080)
-             |       |       |
-             |       |       +--> WebSocket events / A2A proxy / templates / bundles
-             |       +----------> Redis
-             +------------------> Postgres
-                                |
-                                v
-                       Provisioned workspaces
-                     (Claude Code / Codex / Hermes / OpenClaw)
-```
-
-For the full system model, see [Architecture](./architecture/architecture.md).
+For ownership and current architecture, see the [Core technical
+reference](./architecture/molecule-technical-doc.md).

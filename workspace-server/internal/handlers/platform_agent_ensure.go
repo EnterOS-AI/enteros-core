@@ -29,8 +29,9 @@ package handlers
 //      root, re-parent old roots, move org-anchor refs).
 //   3. provision — triggers the workspace provision via the SAME RestartByID path
 //      the boot-seed (MaybeProvisionPlatformAgentOnBoot) and the admin restart use,
-//      which serves BOTH backends (local Docker self-host AND the CP/EC2
-//      provisioner for SaaS) — RestartByID is itself debounced/coalesced so a
+//      which serves BOTH backends (local Docker self-host and the
+//      provider-selecting control-plane provisioner for SaaS) —
+//      RestartByID is itself debounced/coalesced so a
 //      double-trigger is safe.
 //
 // It makes ZERO MOLECULE_CP_URL / /cp/* calls: everything runs against this
@@ -184,7 +185,7 @@ func decideEnsureAction(derivedID, existingID, existingStatus string, existingFo
 var ensureInstallFn = installPlatformAgent
 
 // triggerPlatformProvision fires the async workspace provision for the platform
-// agent (serves both the local Docker and CP/EC2 backends). provisionTrigger-
+// agent (serves both the local Docker and control-plane backends). provisionTrigger-
 // Override is set only in tests.
 //
 // It routes through RestartByIDAfterMutation — the MUTATION variant that bypasses

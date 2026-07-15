@@ -2,10 +2,12 @@ name: publish-canvas-image
 
 # Ported from .github/workflows/publish-canvas-image.yml on 2026-05-11 per RFC
 # internal#219 §1 sweep. Differences from the GitHub version:
-#   - Dropped `workflow_dispatch.inputs` (Gitea 1.22.6 parser rejects them
-#     per feedback_gitea_workflow_dispatch_inputs_unsupported).
-#   - Dropped `merge_group:` (no Gitea merge queue).
-#   - Dropped `environment:` blocks (Gitea has no environments).
+#   - Kept flat `workflow_dispatch` (no `inputs`) under repository policy;
+#     dispatch callers pass parameters through the established env/var path.
+#   - Omitted GitHub's `merge_group:` trigger; this repository uses its
+#     serialized Gitea queue plus pull-request/push status gates.
+#   - Omitted `environment:` blocks; this repository's approval and secret
+#     gates do not depend on Actions environments.
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
 #   - `continue-on-error: true` on each job (RFC §1 contract).
@@ -17,20 +19,20 @@ name: publish-canvas-image
 #
 
 # Builds on robot-1, publishes (via chunked pusher, through the CF tunnel), and
-# (ordered) re-points :latest for the standalone canvas Docker image on
+# (after CI) re-points :latest for the standalone canvas Docker image on
 # registry.moleculesai.app whenever a commit lands on main that touches canvas.
 #
-# Ordered deploy (core#2226) — mirrors publish-workspace-server-image.yml so the
-# standalone `molecule-ai/canvas` image is deterministic + verifiable, not a
-# side effect of the platform fleet pulling a mutable `:latest`:
+# Ordered registry publication (core#2226) — mirrors the tagging pattern in
+# publish-workspace-server-image.yml so the standalone `molecule-ai/canvas`
+# artifact is deterministic and verifiable:
 #
 #   build-and-push:  build → push :staging-<sha> + :staging-latest + :sha-<sha>
-#                    (does NOT move :latest — an unpromoted build must never
-#                    become the prod-blessed tag).
+#                    (does NOT move :latest — an unverified build must not
+#                    become the CI-green convenience tag).
 #   promote-canvas:  waits for green main CI on this SHA, then re-points
 #                    :latest to the verified :staging-<sha> by digest
-#                    (imagetools create — no rebuild). So `:latest` == the
-#                    current prod-blessed canvas, byte-identical to staging-<sha>.
+#                    (imagetools create — no rebuild). Thus `:latest` is
+#                    byte-identical to that staging-<sha> artifact.
 #
 # Tag scheme produced (parallels platform-tenant):
 #   :staging-<sha> — per-commit immutable digest, what docker-compose pins to.
@@ -38,16 +40,12 @@ name: publish-canvas-image
 #   :sha-<sha>     — kept for back-compat with any consumer pinning the old tag.
 #   :latest        — most recent CI-GREEN build. Only moved by promote-canvas.
 #
-# WHY this is the canvas analogue of the platform's deploy-production, not a
-# literal copy: the standalone canvas co-deploys with the platform on the same
-# host via the root docker-compose.yml (`docker compose pull && up -d`). Gating
-# the canvas `:latest` promotion on the SAME green-main-CI signal the platform
-# deploy waits on makes platform + canvas roll together by the same SHA. The
-# canvas has no per-tenant fleet of its own and no /buildinfo endpoint, so there
-# is no fleet-rollout / per-tenant verify step to mirror here — CI-green +
-# digest-pin + immutable :staging-<sha> is the determinism contract. (A future
-# canvas /buildinfo would let this assert the served SHA like the platform does;
-# tracked in core#2226.)
+# This is an image-publication workflow, not a production deployment. It has no
+# served URL to probe and does not run `docker compose pull/up` on a live host.
+# The image exposes `/api/buildinfo` with the baked BUILD_SHA so a separate
+# environment owner can verify a rollout. Here the guarantee stops at a
+# CI-green, digest-pinned registry artifact; production rollout sequencing and
+# proof remain tracked separately in internal#1038.
 #
 # Mirror of publish-platform-image.yml, adapted for the Next.js canvas layer.
 # See that workflow for inline notes on macOS Keychain isolation and QEMU.
@@ -67,12 +65,8 @@ on:
       - 'canvas/**'
       - '.gitea/workflows/publish-canvas-image.yml'
   workflow_dispatch:
-  # NOTE (Gitea port): the original GitHub workflow had a
-  # `workflow_dispatch:` manual trigger for the
-  # non-canvas-merge-but-need-fresh-image scenario. Dropped in the
-  # Gitea port (1.22.6 parser-finicky). Manual rebuilds require
-  # pushing an empty commit to canvas/ or running the operator-host
-  # build directly.
+  # Manual rebuilds use this explicit reviewed dispatch or a normal source
+  # change; there is no host-side push-button build path.
 
 permissions:
   contents: read
@@ -231,10 +225,10 @@ jobs:
             # surfaces GIT_SHA at /buildinfo. Full 40-char SHA (not the
             # 7-char tag) so the fleet redeploy verification can match exactly.
             BUILD_SHA=${{ github.sha }}
-          # Ordered deploy (core#2226): produce the immutable per-commit tag +
+          # Ordered publication (core#2226): produce the immutable per-commit tag +
           # the build-tracking staging-latest + the legacy back-compat :sha-<sha>
-          # tag. NOT :latest — :latest is the prod-blessed tag, only re-pointed by
-          # promote-canvas after green main CI.
+          # tag. NOT :latest — :latest is the mutable CI-green convenience tag,
+          # only re-pointed by promote-canvas after green main CI.
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.staging_sha }}
             ${{ env.IMAGE_NAME }}:staging-latest
@@ -321,15 +315,17 @@ jobs:
     needs: build-and-push
     # Only on a real main push — workflow_dispatch / non-main never promotes.
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    # Side-effect deploy only; the image publish above is the durable artifact.
-    # mc#3436: do NOT renew this mask silently — it mirrors deploy-production's
-    # contract (a flaky promote must not red the ship lane), tracked in core#2226.
+    # Registry-tag promotion only; this job does not roll out a live target.
+    # mc#3436: do NOT renew this mask silently. A failed promotion is currently
+    # non-blocking, so consumers must not read workflow success as rollout proof;
+    # the sequencing/fail-open gap is tracked in mc#4391 (cross-repo release
+    # coordination remains linked from that issue to internal#1038).
     continue-on-error: true
     runs-on: publish
     timeout-minutes: 60
     env:
-      # Same green-main-CI gate the platform deploy-production waits on, so
-      # platform + canvas advance :latest off the identical signal/SHA.
+      # Wait for this SHA's required main contexts before moving the canvas tag.
+      # This is independent of any environment rollout.
       GITEA_HOST: git.moleculesai.app
       # GITEA_TOKEN was `${{ secrets.PROD_AUTO_DEPLOY_CONTROL_TOKEN ||
       # secrets.AUTO_SYNC_TOKEN }}`. PROD_AUTO_DEPLOY_CONTROL_TOKEN remains the
@@ -339,9 +335,9 @@ jobs:
       # job-level `env` cannot reference a value a step writes to $GITHUB_ENV,
       # so the resolution happens in a step.
       CI_STATUS_TIMEOUT_SECONDS: "3600"
-      # Re-uses the platform's disable kill-switch: when prod auto-deploy is
-      # paused, the canvas :latest promote pauses too (correct — an unpromoted
-      # build must not become :latest while the fleet is frozen).
+      # Re-use the legacy-named production automation kill-switch so a freeze
+      # also pauses canvas :latest promotion. This still changes only a registry
+      # tag; it does not report whether a fleet is serving that digest.
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
     steps:
       # The publish runner's default HOME (/home/hongming) is not writable, so
@@ -436,7 +432,7 @@ jobs:
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         run: |
           set -euo pipefail
-          # Same SSOT wait the platform deploy uses: blocks until the required
+          # Use the shared wait helper to block until the required
           # push contexts (CI / all-required (push) + Secret scan) go green on
           # THIS sha, and fails closed if any required context terminally fails.
           python3 .gitea/scripts/prod-auto-deploy.py wait-ci
@@ -475,5 +471,5 @@ jobs:
             echo "Re-pointed \`molecule-ai/canvas:latest\` → \`${SHA_TAG}\` (by digest)."
             echo ":latest now tracks the CI-green canvas build for commit \`${GITHUB_SHA::7}\`."
             echo ""
-            echo "Tenants/hosts that \`docker compose pull canvas\` now get the same build the platform deploy rolled for this SHA."
+            echo "Hosts that later \`docker compose pull canvas\` will receive this CI-green digest; this workflow performed no live rollout."
           } >> "$GITHUB_STEP_SUMMARY"

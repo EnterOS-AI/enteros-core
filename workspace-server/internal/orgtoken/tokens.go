@@ -314,10 +314,9 @@ func Revoke(ctx context.Context, db *sql.DB, id string, reqCtx AuditLogRequestCo
 	return n > 0, nil
 }
 
-// HasAnyLive returns true when at least one non-revoked token
-// exists. Used by the middleware to decide whether to check the
-// org-token tier at all — skipping a DB round-trip per request when
-// nobody has minted any yet.
+// HasAnyLive reports whether at least one non-revoked token exists. It is a
+// query helper used by contract and integration tests; request middleware
+// validates the presented token directly and does not call this function.
 func HasAnyLive(ctx context.Context, db *sql.DB) (bool, error) {
 	var ok bool
 	err := db.QueryRowContext(ctx, `

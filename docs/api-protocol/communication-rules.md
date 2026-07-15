@@ -113,7 +113,7 @@ The hierarchy-based model removes several components:
 | Removed | Replaced by |
 |---------|-------------|
 | `workspace_connections` table | `parent_id` on `workspaces` table |
-| `CONNECTION_CREATED` / `CONNECTION_REMOVED` events | `WORKSPACE_EXPANDED` / `WORKSPACE_COLLAPSED` events |
+| Dedicated topology or expand/collapse events | Authenticated workspace creation and `PATCH /workspaces/:id` updates to `parent_id`; clients then rehydrate current rows |
 | `/topology/connect` endpoint | Nesting via drag-into on canvas |
 | Canvas edge drawing UI | Edges auto-rendered from hierarchy |
 | Workspace whitelist table | `CanCommunicate()` hierarchy check |
@@ -132,7 +132,7 @@ The org chart IS the access control policy. Simpler schema, simpler security, si
 
 ## Related Docs
 
-- [Team Expansion](../agent-runtime/team-expansion.md) — How nesting works
+- [Platform API — Team hierarchy](./platform-api.md#team-hierarchy) — Current nesting and visual-collapse surfaces
 - [System Prompt Structure](../agent-runtime/system-prompt-structure.md) — How peer capabilities are injected
 - [A2A Protocol](./a2a-protocol.md) — Discovery flow
 - [Platform API](./platform-api.md) — Endpoint reference

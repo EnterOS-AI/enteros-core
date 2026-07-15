@@ -1,12 +1,13 @@
-# Platform-only image (no canvas). Used by publish-workspace-server-image
-# workflow for ECR. Tenant image uses Dockerfile.tenant instead.
+# Platform-only image (no canvas). Used by the image-publish workflow;
+# Dockerfile.tenant builds the combined tenant image instead.
 #
-# Templates + plugins are pre-cloned by scripts/clone-manifest.sh (in CI
-# or on the operator host) into .tenant-bundle-deps/ — same pattern as
+# Templates + plugins are pre-cloned by scripts/clone-manifest.sh in the
+# trusted build context into .tenant-bundle-deps/ — same pattern as
 # Dockerfile.tenant. See that file's header for the full rationale; the
-# short version is that post-2026-05-06 every workspace-template-* and
-# org-template-* repo on Gitea is private, so an in-image `git clone`
-# has no auth path that doesn't leak the Gitea token into a layer.
+# short version is that the manifest can include private template, plugin, or
+# org dependencies, so an in-image `git clone` has no general auth path that
+# does not risk leaking the Gitea token into a layer. Public template repos use
+# the same pre-clone path for one deterministic build contract.
 #
 # Build context: repo root, with `.tenant-bundle-deps/` populated by the
 # workflow's "Pre-clone manifest deps" step (Task #173).
@@ -70,10 +71,8 @@ FROM ${BASE_IMAGE_REGISTRY}/alpine:3.20@sha256:91bed4737195a1a9657c53334c35b0cd1
 # docker-cli + docker-cli-buildx are required by internal/provisioner/
 # localbuild.go which shells out via exec.Command("docker", "image",
 # "inspect"/"build"/"tag", ...) whenever Resolve().Mode ==
-# RegistryModeLocal — which is the permanent mode post-2026-05-06
-# (Molecule-AI GitHub org suspended → GHCR unreachable →
-# MOLECULE_IMAGE_REGISTRY unset → registry_mode.go falls through to
-# RegistryModeLocal). The CLI binary alone is not enough: modern
+# RegistryModeLocal (selected whenever MOLECULE_IMAGE_REGISTRY is unset).
+# The CLI binary alone is not enough: modern
 # Docker (26.x in this image) defaults BuildKit=on, and `docker build`
 # without the buildx plugin fails with `ERROR: BuildKit is enabled but
 # the buildx component is missing or broken`, leaving the workspace at
@@ -85,15 +84,14 @@ FROM ${BASE_IMAGE_REGISTRY}/alpine:3.20@sha256:91bed4737195a1a9657c53334c35b0cd1
 # recovery POST /restart calls (logs: `local-build: pre-flight OK
 # (docker=/usr/bin/docker)` followed by the BuildKit/buildx error from
 # the same dockerBuildProd path).
-# Related: mc#765 (parent fix), Task #194 / Issue #63 (local-build path
-# added); `feedback_workspace_image_ghcr_dead`.
+# Related: mc#765 (parent fix), Task #194 / Issue #63 (local-build path).
 RUN apk add --no-cache ca-certificates docker-cli docker-cli-buildx git tzdata wget
 COPY --from=builder /platform /platform
 COPY --from=builder /memory-plugin /memory-plugin
 COPY workspace-server/migrations /migrations
 COPY manifest.json /app/manifest.json
 # Templates + plugins (pre-cloned by scripts/clone-manifest.sh in the
-# trusted CI / operator-host context, .git already stripped). The Gitea
+# trusted build context, .git already stripped). The Gitea
 # token used to clone them never enters this image — same shape as
 # Dockerfile.tenant.
 COPY .tenant-bundle-deps/workspace-configs-templates /workspace-configs-templates
@@ -104,8 +102,8 @@ RUN addgroup -g 1000 platform && adduser -u 1000 -G platform -s /bin/sh -D platf
 EXPOSE 8080
 # HEALTHCHECK: probe the /health endpoint so orchestrators and docker's
 # health monitoring can detect a crashed or wedged server.
-# mc#1158: workspace/Dockerfile has a HEALTHCHECK; workspace-server/Dockerfile
-# was missing one, so docker ps never shows (healthy) for this container.
+# mc#1158: runtime images already had a HEALTHCHECK; workspace-server lacked
+# one, so docker ps never showed (healthy) for this container.
 # Interval 30s, timeout 5s, 3 retries, 30s start period (server boot).
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=30s \
   CMD wget -qO- --timeout=5 http://localhost:8080/health || exit 1

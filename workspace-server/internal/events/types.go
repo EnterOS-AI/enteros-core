@@ -23,11 +23,8 @@ package events
 // switch (`case "AGENT_MESSAGE":`); a typed string preserves the
 // wire contract while giving Go callers compile-time discipline.
 //
-// Mirror in canvas: a parity gate (PR-B-2 follow-up) will assert this
-// constant set ≡ the TypeScript union members in
-// `canvas/src/lib/ws-events.ts`. Today the canvas consumes the names
-// via bare-string comparisons; the mirror lands separately to keep
-// PR-B narrow.
+// Canvas exposes a typed subset of the names it consumes in
+// `canvas/src/lib/ws-events.ts`; it is not a second exhaustive taxonomy.
 
 // EventType is the wire-typed name of a WebSocket event the platform
 // broadcasts. Always emit constants from this file rather than bare
@@ -35,9 +32,9 @@ package events
 // against bare-string usage in the broadcaster surfaces.
 type EventType string
 
-// Event constants — the canonical taxonomy. New events MUST be added
-// here AND mirrored in canvas/src/lib/ws-events.ts (parity gate
-// pending in PR-B-2). Group by semantic family so the list stays
+// Event constants — the canonical server taxonomy. New events MUST be added
+// here. Add them to canvas/src/lib/ws-events.ts only when a TypeScript
+// consumer handles that event. Group by semantic family so the list stays
 // scan-friendly as it grows.
 const (
 	// Chat / agent messaging — surfaces in canvas chat panels.
@@ -149,9 +146,7 @@ const (
 
 // AllEventTypes lists every constant in this file. Used by the
 // snapshot test (events_types_drift_test.go) to detect when a new
-// constant is added without updating the snapshot — the catch-up
-// step is mirroring the addition into canvas/src/lib/ws-events.ts so
-// canvas consumers can switch on it.
+// constant is added without updating the server-side snapshot.
 //
 // Keep in lexicographic order so the snapshot diff is stable on
 // renames and the parity-with-TS comparison is order-independent.

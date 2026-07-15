@@ -45,11 +45,10 @@ func InitPostgres(databaseURL string) error {
 // — those are intentional rollbacks, only to be run by operators manually
 // via psql when a real rollback is required.
 //
-// NOTE: this runner still re-applies every migration on every boot. That
-// works for idempotent `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE ... IF NOT
-// EXISTS` statements but means non-idempotent DDL will fail on restart.
-// Migration authors must write idempotent SQL. A real schema_migrations
-// tracking table would be better; tracked as follow-up.
+// Applied filenames are recorded in schema_migrations and skipped on later
+// boots. Migration authors should still prefer restart-safe SQL because a
+// process can fail after a statement commits but before its filename is
+// recorded; transactional migrations minimize that recovery edge.
 func RunMigrations(migrationsDir string) error {
 	// Create tracking table if it doesn't exist.
 	if _, err := DB.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (

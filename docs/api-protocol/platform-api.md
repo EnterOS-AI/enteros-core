@@ -1,6 +1,10 @@
-# Platform API (Go Backend)
+# Tenant workspace-server API
 
-The Go backend is Molecule AI's control plane. It does not execute agent reasoning itself. It manages the infrastructure and coordination around workspaces.
+This Go service is the tenant workspace-server, not the Molecule control plane.
+It does not execute agent reasoning itself; it owns the tenant's workspace
+state, coordination, auth, and backend lifecycle dispatch. Control-plane admin,
+billing, membership, image-pin, and provider APIs live in the separate
+`molecule-controlplane` repository.
 
 ## Responsibilities
 
@@ -91,10 +95,10 @@ Violations return `400 Bad Request` with `{ "error": "<field> must be at most N 
 | `GET` | `/workspaces/:id` | Get one workspace |
 | `PATCH` | `/workspaces/:id` | Update workspace fields. **Requires `WorkspaceAuth`.** Workspace bearers are limited to cosmetic fields; infrastructure fields require `ADMIN_TOKEN` or a verified control-plane session. Validates `name` (≤255), `role` (≤1000), `model`/`runtime` (≤100 chars); `name` and `role` reject newlines and YAML-special chars (`{}[]|>*&!`). `:id` must be a valid UUID. See [Breaking Changes](#breaking-changes). |
 | `DELETE` | `/workspaces/:id` | Remove workspace |
-| `POST` | `/workspaces/:id/restart` | Restart workspace (reads runtime from container config.yaml before stop — detects runtime changes) |
+| `POST` | `/workspaces/:id/restart` | Restart workspace through the configured backend using the runtime persisted in Postgres. |
 | `POST` | `/workspaces/:id/pause` | Pause workspace |
 | `POST` | `/workspaces/:id/resume` | Resume workspace |
-| `POST` | `/workspaces/:id/a2a` | Proxy A2A request to the target workspace (authenticates the caller, then enforces hierarchy for workspace callers) |
+| `POST` | `/workspaces/:id/a2a` | Authenticated A2A proxy. Enforces caller binding/hierarchy and may return queued while a long dispatch continues. |
 | `POST` | `/workspaces/:id/delegate` | Async delegation — fire-and-forget, returns delegation_id |
 | `GET` | `/workspaces/:id/delegations` | List delegation status (pending/completed/failed) |
 | `GET` | `/workspaces/:id/audit` | Read the workspace's stored HMAC-linked audit events. **Requires `WorkspaceAuth`.** |
@@ -158,20 +162,24 @@ POST /workspaces/:id/delegate
 
 Poll `GET /workspaces/:id/delegations` to check results. Each entry includes `delegation_id`, `status` (pending/completed/failed), and `response_preview`. WebSocket events `DELEGATION_COMPLETE` and `DELEGATION_FAILED` are broadcast on completion.
 
-This is the recommended way for agents to delegate work — it works for all runtimes (Claude Code, LangGraph, etc.) since it operates at the platform level.
+This is the recommended way for agents to delegate work across runtime
+adapters because it operates at the authenticated platform boundary.
 
 ### Registry
 
 | Method | Path | Description | Auth |
 |---|---|---|---|
-| `POST` | `/registry/register` | Workspace registration on startup. First register issues a per-workspace bearer token in the response body (`auth_token`); re-register is idempotent and omits the token. | — |
-| `POST` | `/registry/heartbeat` | Liveness and task updates. | Phase 30.1 — `Authorization: Bearer <token>` required if the workspace has any live token on file; legacy workspaces grandfathered (fail-open). |
-| `POST` | `/registry/update-card` | Push Agent Card updates after runtime/skill changes. | Phase 30.1 — same grandfather rule as `/heartbeat`. |
-| `GET` | `/registry/discover/:id` | Resolve workspace URL for A2A calls. | Phase 30.6 — `X-Workspace-ID` is required; enrolled workspaces send their own bearer. Legacy workspaces without a live token retain bootstrap compatibility, while auth datastore errors fail closed with `503`. |
-| `GET` | `/registry/:id/peers` | List the workspace's direct siblings, children, and parent. | Phase 30.6 — the path `:id` identifies the caller; enrolled workspaces send their own bearer. Legacy no-token bootstrap remains supported; datastore errors fail closed. |
-| `POST` | `/registry/check-access` | Validate reachability/access. | — |
+| `POST` | `/registry/register` | Register URL, card, runtime state, and delivery mode. A bootstrap row with no live instance credential may receive its one-time token; an enrolled row must prove ownership. | Bootstrap credential or the workspace's live bearer, according to row state. |
+| `POST` | `/registry/heartbeat` | Refresh the 180-second liveness marker and latest health/task snapshot. | Workspace bearer once an instance token exists; legacy/bootstrap rows are migrated by registration. |
+| `POST` | `/registry/update-card` | Push Agent Card updates after runtime/skill changes. | Same workspace-credential contract as heartbeat. |
+| `GET` | `/registry/discover/:id` | Resolve an authorized peer's current URL. | Caller identity plus admin/org/workspace bearer or verified session. Auth-datastore errors fail closed. |
+| `GET` | `/registry/:id/peers` | List peers reachable by the workspace. | Same credential contract as discovery. |
+| `POST` | `/registry/check-access` | Evaluate hierarchy reachability for the supplied pair. | Handler-level validation; see current implementation. |
 
-**Why the auth callout matters:** remote (Phase 30) agents authenticate themselves with the bearer token returned by `POST /registry/register`. Local containers are transparent to this during the lazy-bootstrap grace window — the provisioner threads the token in as an env var on first register. See `docs/development/testing-e2e.md` for how E2E scripts handle token capture. If you change these routes, update `tests/e2e/test_api.sh` in the same PR.
+**Why the auth callout matters:** the registration bootstrap is intentionally
+narrow and state-dependent. Do not generalize it into anonymous access for an
+already-enrolled workspace. If these routes change, update their handler tests
+and the registration/heartbeat E2E in the same PR.
 
 ### Activity and recall
 
@@ -238,26 +246,32 @@ Backward-compatible admin aliases also exist under `/admin/secrets`.
 | `POST` | `/workspaces/:id/approvals/:approvalId/decide` | Approve or deny |
 | `POST` | `/workspaces/:id/approvals/:approvalId/withdraw` | Requester pulls back a pending approval (issue #66). Authz is against the row's creator workspace, not the path `:id`, so it works correctly under cross-workspace approval gates (#2574 / #2593). |
 
-### Team operations
+### Team hierarchy
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/workspaces/:id/expand` | Expand workspace into a team |
-| `POST` | `/workspaces/:id/collapse` | Collapse team back down |
+Teams are workspace rows connected by `parent_id`. Create or reparent rows
+through the authenticated workspace and org-import surfaces. The destructive
+`POST /workspaces/:id/expand` and `/collapse` routes are retired. Canvas visual
+collapse is a presentational `PATCH /workspaces/:id` layout update; it does not
+provision or delete child workspaces.
 
 ### Plugins
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/plugins` | List available plugins; accepts `?runtime=<name>` to filter to compatible plugins |
-| `GET` | `/plugins/sources` | List registered install-source schemes (e.g. `{"schemes":["github","local"]}`) |
+| `GET` | `/plugins/sources` | List registered install-source schemes (currently `gitea`, `github`, and `local` in the standard server) |
 | `GET` | `/workspaces/:id/plugins` | List installed plugins (each includes `supported_on_runtime: bool`) |
 | `GET` | `/workspaces/:id/plugins/available` | Plugins filtered to those compatible with the workspace runtime |
 | `GET` | `/workspaces/:id/plugins/compatibility?runtime=X` | Preflight runtime change — which installed plugins would become inert |
-| `POST` | `/workspaces/:id/plugins` | Install plugin `{"source":"<scheme>://<spec>"}` — e.g. `local://ecc`, `github://owner/repo#v1.0`. Auto-restarts workspace. |
+| `POST` | `/workspaces/:id/plugins` | Install plugin `{"source":"<scheme>://<spec>"}` — e.g. `local://ecc` or `gitea://owner/repo#<commit>`. Auto-restarts workspace. |
 | `DELETE` | `/workspaces/:id/plugins/:name` | Uninstall plugin — removes from container, auto-restarts |
 
-Plugins are installed per-workspace into `/configs/plugins/<name>/`. Sources are pluggable via schemes (local + github shipped; clawhub/oci/https planned). See [`docs/plugins/sources.md`](../plugins/sources.md) for the two-axis source/shape model.
+Plugins are installed per-workspace into `/configs/plugins/<name>/`. The
+standard source registry ships `local`, authenticated `gitea`, and
+anonymous-by-default `github` schemes;
+do not advertise an unregistered scheme as planned behavior. See
+[`docs/plugins/sources.md`](../plugins/sources.md) for the two-axis source/shape
+model.
 
 Install safeguards bound the cost of a single install (env-tunable via `PLUGIN_INSTALL_BODY_MAX_BYTES` / `PLUGIN_INSTALL_FETCH_TIMEOUT` / `PLUGIN_INSTALL_MAX_DIR_BYTES`).
 
@@ -310,15 +324,16 @@ Invalid `depth` or traversal paths return 400.
 
 | Protocol | Path | Description |
 |---|---|---|
-| `WS` | `/ws` | Live events for canvas clients and workspaces |
+| `WS` | `/ws` | Live events. Canvas requires a verified tenant session, org token, or `ADMIN_TOKEN`; workspaces require an ID-bound bearer. |
 
 Authenticated Canvas clients receive the global event stream using a verified
-CP session, org token, or admin bearer. Browser clients offer both the
-credential-bearing `molecule-auth.<hex>` protocol and the non-secret
-`molecule-ws` protocol; the server authenticates with the former and selects
-only the latter. Workspaces connect with `X-Workspace-ID` plus a bearer bound
-to that workspace and receive filtered events based on communication rules.
-Anonymous upgrades are rejected.
+control-plane session, org token, or admin bearer. Browser clients can offer a
+credential-bearing `molecule-auth.<hex>` protocol together with the non-secret
+`molecule-ws` sentinel; the server authenticates with the former and selects
+only the latter, so it never reflects the credential. Workspaces connect with
+`X-Workspace-ID` plus a bearer bound to that workspace and receive filtered
+events based on communication rules. `Origin` is checked for browser safety but
+is never accepted as authentication. Anonymous upgrades are rejected.
 
 ## A2A Proxy Behavior
 
@@ -326,11 +341,19 @@ Anonymous upgrades are rejected.
 
 It currently:
 
-- authenticates every public HTTP request before dispatch; workspace identity is derived from the bearer and an optional `X-Workspace-ID` must match it
-- accepts SaaS human traffic only through a verified control-plane session, `ADMIN_TOKEN`, or org token; authenticated external inbound traffic uses the target-bound inbound secret
-- preserves a no-bearer same-origin Canvas fallback only for combined self-host/dev deployments where control-plane session verification is unconfigured; SaaS never trusts same-origin headers as authentication
-- rejects tokenless legacy, invalid/revoked bearer, forged-self, and auth datastore-error requests instead of treating them as canvas traffic
-- enforces `CanCommunicate` and same-org isolation for authenticated workspace-to-workspace calls; verified human and server-side system calls bypass hierarchy
+- authenticates every public HTTP request before dispatch; workspace identity
+  is derived from the bearer and an optional `X-Workspace-ID` must match it
+- accepts SaaS human traffic only through a verified control-plane session,
+  `ADMIN_TOKEN`, or org token; authenticated external inbound traffic uses the
+  target-bound inbound secret
+- preserves a no-bearer same-origin Canvas fallback only for combined
+  self-host/dev deployments where control-plane session verification is
+  unconfigured; SaaS never trusts same-origin headers as authentication
+- rejects tokenless legacy, invalid/revoked bearer, forged-self, and auth
+  datastore-error requests instead of treating them as Canvas traffic
+- enforces `CanCommunicate` and same-org isolation for authenticated
+  workspace-to-workspace calls; verified human, self, and trusted in-process
+  system callers (`webhook:*`, `system:*`, `test:*`) bypass hierarchy
 - normalizes incoming JSON into JSON-RPC 2.0
 - injects `messageId` when missing
 - applies different timeout rules for browser-initiated vs workspace-initiated calls

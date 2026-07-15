@@ -312,7 +312,7 @@ func TestApplyAgentGitHTTPCreds_NilMapIsSafe(t *testing.T) {
 
 // TestApplyAgentGitHTTPCreds_DefaultPersonaRoot: when
 // MOLECULE_PERSONA_ROOT is unset, the helper falls back to
-// /etc/molecule-bootstrap/personas — the canonical operator-host path
+// /etc/molecule-bootstrap/personas — the canonical read-only persona mount
 // per the bootstrap kit shape. We can't write into /etc in a test,
 // but we CAN assert the helper takes the silent-no-op branch when
 // that real path is absent (the prod-default case on a dev laptop).

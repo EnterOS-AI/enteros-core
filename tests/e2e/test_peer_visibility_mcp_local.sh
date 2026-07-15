@@ -23,7 +23,7 @@
 # registry row, /health, the heartbeat table, or GET /registry/:id/peers.
 #
 # Only PROVISIONING differs from staging:
-#   - staging: POST /cp/admin/orgs (cold EC2 tenant) + per-tenant admin
+#   - staging: POST /cp/admin/orgs (provider-managed tenant) + per-tenant admin
 #     token + each workspace's MCP bearer from the POST /workspaces
 #     create response.
 #   - local:   POST /workspaces directly against the local stack

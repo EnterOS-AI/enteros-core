@@ -130,7 +130,7 @@ cd canvas && npm test
 # Runtime code is SSOT in molecule-ai-workspace-runtime, not molecule-core/workspace.
 cd ../molecule-ai-workspace-runtime
 python -m venv .venv && source .venv/bin/activate
-pip install --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ -e . pytest pytest-asyncio
+pip install -e . pytest pytest-asyncio
 pytest -q
 
 # E2E API tests (requires running platform)

@@ -7,7 +7,7 @@
 #
 # Required env:
 #   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer (Railway CP_ADMIN_API_TOKEN)
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical
 #
 # Optional env:
 #   E2E_KEEP_ORG           1 → skip teardown (debugging only)
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLEC…OKEN required — Railway staging CP_ADMIN_API_TOKEN}"
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug now comes
 # from make_collision_proof_slug below; the old suffix var is dead.
 

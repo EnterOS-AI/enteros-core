@@ -19,8 +19,9 @@ package handlers
 // History:
 //   - PR #2811 introduced provisionWorkspaceAuto + HasProvisioner gate
 //     (closed the org-import SaaS-skip silent-drop bug class).
-//   - PR #2824 added StopWorkspaceAuto (closed the team-collapse +
-//     workspace-delete EC2-leak class — issues #2813, #2814).
+//   - PR #2824 added StopWorkspaceAuto (closed EC2 leaks in the
+//     then-present team-collapse path and workspace delete — issues
+//     #2813, #2814). The destructive team-collapse handler was later retired.
 //   - PR #2843 + #2846 + #2847 + #2848 added RestartWorkspaceAuto +
 //     RestartWorkspaceAutoOpts + provisionWorkspaceAutoSync and
 //     migrated the four workspace_restart.go dispatch sites.
@@ -52,10 +53,9 @@ func (h *WorkspaceHandler) HasProvisioner() bool {
 	return h.cpProv != nil || h.provisioner != nil
 }
 
-// IsSaaS reports whether the CP (EC2) provisioner is wired. Each SaaS
-// workspace runs on its own sibling EC2, so the per-workspace tier
-// boundary is a Docker resource limit applied to the only container
-// on that EC2 — there's no neighbour to protect from. Self-hosted
+// IsSaaS reports whether the control-plane provisioner is wired. Hosted
+// workspaces use CP-managed full-access compute, so the per-workspace tier
+// boundary is applied by the selected provider backend. Self-hosted
 // runs many workspaces in one Docker daemon on a single host, so
 // the tier-2-by-default safe-neighbour-share posture stays.
 //
@@ -66,8 +66,8 @@ func (h *WorkspaceHandler) IsSaaS() bool {
 	return h.cpProv != nil
 }
 
-// DefaultTier is the SaaS-aware default tier. T4 on SaaS (single
-// container per EC2 — full host access matches the boundary), T3 on
+// DefaultTier is the SaaS-aware default tier. T4 on SaaS (dedicated managed
+// compute; full-host access matches the boundary), T3 on
 // self-hosted (read-write workspace mount + Docker daemon access,
 // most templates' baseline). Callers default to this when the user
 // hasn't explicitly picked a tier.
@@ -83,13 +83,14 @@ func (h *WorkspaceHandler) DefaultTier() int {
 // when a backend was kicked off, false when neither is wired.
 //
 // Single source of truth for "start provisioning a workspace" across
-// every caller (Create, OrgHandler.createWorkspaceTree, TeamHandler.Expand,
-// future paths). Centralized routing here means callers don't repeat
+// every caller (Create, org import, provider switch, resume, and bulk
+// resume paths). Centralized routing here means callers don't repeat
 // the "Docker vs CP" decision and can't drift on it.
 //
 // Self-marks-failed on the no-backend path: pre-2026-05-05 the false
-// return was silent, and any caller that forgot to handle it (TeamHandler
-// pre-#2367, OrgHandler.createWorkspaceTree pre-this-fix) silently
+// return was silent, and historical callers that forgot to handle it (the
+// now-retired TeamHandler before #2367 and OrgHandler.createWorkspaceTree
+// before its fix) silently
 // dropped workspaces — they sat in 'provisioning' for 10 min until the
 // sweeper marked them failed with the misleading "container started but
 // never called /registry/register" message. Marking failed inside Auto
@@ -246,9 +247,9 @@ func (h *WorkspaceHandler) provisionWorkspaceAutoSyncLocked(workspaceID, templat
 // Single source of truth for "stop a workspace" — symmetric with
 // provisionWorkspaceAuto. Pre-2026-05-05 the stop side had no Auto
 // dispatcher and every caller wrote `if h.provisioner != nil { Stop }`,
-// which silently leaked EC2s on SaaS:
-//   - team.go:208 (Collapse) — issue #2813
-//   - workspace_crud.go:432 (stopAndRemove during Delete) — issue #2814
+// which silently leaked EC2s on SaaS. Historical examples were the former
+// team.go collapse call site (#2813) and the old workspace_crud.go
+// stopAndRemove delete call site (#2814).
 //
 // Both bugs reproduced for ~6 months. The pattern is the same drift
 // class as the org-import provision bug closed by PR #2811.
@@ -276,14 +277,14 @@ func (h *WorkspaceHandler) StopWorkspaceAuto(ctx context.Context, workspaceID st
 }
 
 // stopWorkspaceForDelete is the DELETE-path stop dispatcher. It differs
-// from StopWorkspaceAuto in exactly one way: the CP (EC2) path gets the
+// from StopWorkspaceAuto in exactly one way: the CP-managed path gets the
 // same bounded retry the restart path uses (cpStopWithRetryErr), and on
 // retry exhaustion it persists a durable `workspace.delete.terminate_retry_exhausted`
 // event to structure_events (the structured-logging gate) so the leak
 // decision is queryable, not just stdout prose.
 //
-// Why retry here (task #15 / workspace-ec2-leak): the bare cpProv.Stop on
-// delete left a transient CP/AWS hiccup as an immediate 500 with no inline
+// Why retry here (task #15 / workspace-compute leak): the bare cpProv.Stop on
+// delete left a transient CP/provider hiccup as an immediate 500 with no inline
 // recovery. For a cascade *descendant* the "client retries → replays
 // terminate" recovery is defeated by CascadeDelete's `status != 'removed'`
 // CTE filter (the descendant's row is already 'removed', so a retry walks
@@ -320,9 +321,9 @@ func (h *WorkspaceHandler) stopWorkspaceForDelete(ctx context.Context, workspace
 }
 
 // emitDeleteTerminateRetryExhausted persists a durable record that the
-// delete-path EC2 terminate could not be completed inline after the full
+// delete-path provider termination could not be completed inline after the full
 // retry budget. Per the §Persistent structured logging gate: a
-// state-mutating decision (we are leaving a known-leaked-or-pending EC2 for
+// state-mutating decision (we are leaving known leaked/pending compute for
 // the orphan sweeper) must land in structure_events, not just log.Printf.
 //
 // Event-type taxonomy (append-only; never rename):
@@ -340,7 +341,7 @@ func (h *WorkspaceHandler) emitDeleteTerminateRetryExhausted(ctx context.Context
 		"last_error":   cause.Error(),
 		// recovery_path documents WHO is expected to finish the terminate,
 		// so a reader of the audit row doesn't have to grep the code to
-		// know the EC2 isn't simply abandoned.
+		// know the provider compute is not simply abandoned.
 		"recovery_path": "cp_orphan_sweeper",
 	}
 	payloadJSON, err := json.Marshal(payload)
@@ -383,8 +384,8 @@ func (h *WorkspaceHandler) emitDeleteTerminateRetryExhausted(ctx context.Context
 //     via cpStopWithRetry. Restart's contract is "make the workspace
 //     alive again" — refusing to reprovision when Stop fails strands
 //     the user with a dead workspace and no recovery path other than
-//     manual canvas intervention. Retry absorbs the transient CP/AWS
-//     hiccups that cause most EC2-leak-adjacent incidents. On final
+//     manual canvas intervention. Retry absorbs transient CP/provider
+//     hiccups that cause most compute-leak-adjacent incidents. On final
 //     exhaustion, cpStopWithRetry logs LEAK-SUSPECT and proceeds with
 //     reprovision regardless, bridging to the orphan reconciler.
 //
@@ -413,8 +414,8 @@ func (h *WorkspaceHandler) RestartWorkspaceAuto(ctx context.Context, workspaceID
 // per-invocation knobs that don't fit on CreateWorkspacePayload. Today
 // the only such knob is resetClaudeSession (issue #12 — clears the
 // in-container Claude session before restart so the agent comes up
-// fresh). CP doesn't have a session-reset concept (each EC2 boots from
-// a fresh image), so the flag is silently ignored on the CP path.
+// fresh). CP doesn't expose a runtime-session reset concept (managed compute
+// starts from its selected image), so the flag is silently ignored on that path.
 //
 // Most callers should call RestartWorkspaceAuto (resetClaudeSession=
 // false). The Restart HTTP handler is the one site that exposes the

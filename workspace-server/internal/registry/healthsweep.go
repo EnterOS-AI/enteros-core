@@ -21,8 +21,8 @@ type ContainerChecker interface {
 //
 // It must comfortably exceed the worst-case gap between two consecutive
 // heartbeats. The runtime's heartbeat task runs on its own ~30s asyncio
-// cadence, independent of turn processing (see workspace/heartbeat.py in
-// the runtime repo, and the contract documented on
+// cadence, independent of turn processing (see molecule_runtime/heartbeat.py
+// in molecule-ai-workspace-runtime, and the contract documented on
 // models.HeartbeatPayload.RuntimeState: "The heartbeat task lives in its
 // own asyncio task and keeps pinging even when the agent runtime is
 // wedged"). 180s = 6 missed heartbeats tolerates a long synchronous busy
@@ -62,8 +62,8 @@ func remoteStaleAfter() time.Duration {
 // StartHealthSweep periodically checks all "online" workspaces. For
 // container-backed runtimes (claude-code, codex, hermes, openclaw) it calls the
 // Docker API via `checker.IsRunning`. For `runtime='external'` (remote
-// agents per Phase 30) it checks heartbeat freshness: a heartbeat older
-// than `REMOTE_LIVENESS_STALE_AFTER` (default 90s) marks the workspace
+// agents) it checks heartbeat freshness: a heartbeat older than
+// `REMOTE_LIVENESS_STALE_AFTER` (default 180s) marks the workspace
 // offline and calls `onOffline`.
 //
 // If `checker` is nil we still run the remote-liveness path — a
@@ -95,7 +95,7 @@ func StartHealthSweep(ctx context.Context, checker ContainerChecker, interval ti
 
 func sweepOnlineWorkspaces(ctx context.Context, checker ContainerChecker, onOffline OfflineHandler) {
 	// Skip external + mock workspaces — neither has a Docker container.
-	// external: agent runs on operator's laptop, polled via heartbeat.
+	// external: agent runs outside this host and reports via heartbeat.
 	// mock: virtual workspace, every reply is canned (see
 	// workspace-server/internal/handlers/mock_runtime.go). Both would
 	// false-positive as "container gone" on every sweep tick and

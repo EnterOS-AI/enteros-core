@@ -3,8 +3,9 @@ name: redeploy-tenants-on-staging
 # MANUAL rollback / pin path for the local-docker STAGING tenant fleet.
 #
 # SUPERSEDED FOR THE AUTO PATH by staging-tenant-cd.yml (2026-07-04): the gated
-# CD pipeline (await-image -> e2e-smoke HARD GATE -> advance-pin ->
-# redeploy-fleet) now owns the automatic staging fleet roll on a staging push.
+# CD pipeline (await immutable image -> advance pin -> roll fleet -> live E2E
+# hard gate, with rollback on failure) owns the automatic main-driven staging
+# fleet roll.
 # Leaving this workflow ALSO auto-triggering on staging push would roll the fleet
 # a SECOND time, UNGATED, racing the gated pipeline — so the `push:` trigger was
 # removed. This file is retained as the operator's hand-run rollback / pin path
@@ -20,13 +21,13 @@ name: redeploy-tenants-on-staging
 # volume is intact after the roll).
 #
 # Rollback / pin: set the repo/org var STAGING_REDEPLOY_TARGET_TAG to a
-# known-good tag (e.g. staging-<sha>) and run via workflow_dispatch, OR pass the
-# `image_tag` dispatch input; unset the var afterward.
+# known-good tag (e.g. staging-<sha>) and run via workflow_dispatch; unset the
+# variable afterward. Flat dispatch intentionally has no `image_tag` input.
 
 on:
   # workflow_dispatch ONLY — the auto path moved to staging-tenant-cd.yml.
-  # No inputs: map (Gitea rejects the workflow if present — lint-workflow-yaml
-  # Rule 1). The roll target is read from the repo/org var
+  # No inputs map under the repository's flat-dispatch policy. The roll target
+  # is read from the repo/org var
   # STAGING_REDEPLOY_TARGET_TAG (else defaults to staging-latest).
   workflow_dispatch: {}
 

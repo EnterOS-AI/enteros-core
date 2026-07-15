@@ -15,12 +15,12 @@
 # can detect "alarm fired" via `if ! check-stale-promote-pr.sh; then …`.
 # Exit 0 = clean, exit ≥1 = at least N stale PRs need attention.
 #
-# Used by .github/workflows/auto-promote-stale-alarm.yml. Logic lives
-# here (not inline in the workflow YAML) so we can:
+# The former GitHub scheduled alarm was retired during the Gitea migration.
+# This standalone detector remains available for an operator or a future
+# Gitea workflow. Logic lives here so we can:
 #   - Unit-test it with a fixture (see test-check-stale-promote-pr.sh)
 #   - Run it ad-hoc by an operator: `scripts/check-stale-promote-pr.sh`
-#   - Reuse the same surface in any sibling workflow that needs the same
-#     check (SSOT — one detector, many callers).
+#   - Reuse the same surface if an active workflow needs this check.
 #
 # Requires: `curl`, `jq`. `GITEA_TOKEN` (or `GITHUB_TOKEN` / `GH_TOKEN`
 # for back-compat) in the workflow context. Reads `GITHUB_SERVER_URL`
@@ -268,7 +268,7 @@ comment_body() {
 
 Auto-merge is armed, but main's branch protection requires 1 review and no human has approved. Until someone reviews, the staging→main promote chain is wedged and downstream consumers (canvas builds, tenant redeploys) won't see new code.
 
-**Action**: a human reviewer on \`@Molecule-AI/maintainers\` should approve this PR (or mark it as not ready and close).
+**Action**: a human reviewer on \`@molecule-ai/maintainers\` should approve this PR (or mark it as not ready and close).
 
 Detected by \`scripts/check-stale-promote-pr.sh\` per issue #2975.
 EOF

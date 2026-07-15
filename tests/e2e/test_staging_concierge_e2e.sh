@@ -37,10 +37,10 @@
 #
 # Required env (same contract as test_staging_full_saas.sh):
 #   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer — Railway staging CP_ADMIN_API_TOKEN
+#   MOLECULE_ADMIN_TOKEN   staging CP admin bearer from Infisical /shared/controlplane-admin
 #
 # Optional env:
-#   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold tenant EC2 budget)
+#   E2E_PROVISION_TIMEOUT_SECS   default 900 (15 min cold tenant budget)
 #   E2E_KEEP_ORG                 1 → skip teardown (debugging only)
 #   E2E_RUN_ID                   slug suffix; CI: ${GITHUB_RUN_ID}-${RUN_ATTEMPT}
 #   E2E_AWS_LEAK_CHECK           auto (default) | required | off
@@ -64,7 +64,7 @@ source "$(dirname "$0")/_lib.sh"
 source "$(dirname "$0")/lib/aws_leak_check.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
-ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — Railway staging CP_ADMIN_API_TOKEN}"
+ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 # RUN_ID_SUFFIX removed (core#2782 follow-up shellcheck): the slug now
 # comes from make_collision_proof_slug below; the old suffix var is dead.

@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""lint-workflow-yaml — catch Gitea-1.22.6-hostile workflow YAML shapes.
+"""lint-workflow-yaml — enforce this repository's Gitea workflow policy.
 
-This script enforces six structural rules that have historically caused
-silent CI failures on Gitea Actions (1.22.6) — workflows that the server's
-YAML parser rejects with `[W] ignore invalid workflow ...` and registers
-for zero events, or shape conventions that produce ambiguous status
-contexts. Each rule maps to a documented incident in saved memory.
+The first rules originated on Gitea 1.22.6. The live server is newer and now
+documents `workflow_run` plus richer dispatch support, but those shapes remain
+disabled here until a deliberate fleet migration validates runner behavior,
+status-context emission, dispatch callers, and the existing compensating bots.
+The lint must describe that local compatibility policy, not claim the current
+server lacks features it now exposes.
 
 Rules (4 fatal + 1 fatal cross-file + 1 heuristic-warn):
-  1. `workflow_dispatch.inputs:` block — Gitea 1.22.6 mis-parses the
-     `inputs` keys as sibling event types and rejects the whole file.
+  1. `workflow_dispatch.inputs:` block — legacy flat-dispatch policy retained
+     pending a reviewed migration of dispatch callers and fixtures.
      Memory: feedback_gitea_workflow_dispatch_inputs_unsupported.
      Origin: 2026-05-11 PyPI freeze (publish-runtime).
-  2. `on: workflow_run:` event — not enumerated in Gitea 1.22.6's
-     supported event list (verified via modules/actions/workflows.go
-     enumeration; task #81). Workflow registers, fires for 0 events.
+  2. `on: workflow_run:` event — supported by the current server but not yet
+     adopted by this repository's status/reaper topology.
   3. `name:` containing `/` — breaks the
      `<workflow> / <job> (<event>)` commit-status context convention;
      downstream parsers (sop-checklist, status-reaper) tokenize on `/`.
@@ -29,9 +29,9 @@ Rules (4 fatal + 1 fatal cross-file + 1 heuristic-warn):
      or `https://github.com/.../releases/download` without a
      workflow-level `env.GITHUB_SERVER_URL` set to the Gitea instance.
      Memory: feedback_act_runner_github_server_url.
-  7. Production deploy/redeploy workflows may not rely on Gitea
-     `concurrency.cancel-in-progress: false` for serialization. Gitea
-     1.22.6 can cancel queued runs despite that setting.
+  7. Production deploy/redeploy workflows may not rely only on Gitea
+     `concurrency.cancel-in-progress: false` for serialization. The guard
+     remains defense in depth after historical queued-run cancellation.
   8. Production deploy/redeploy workflows may not dump raw CP responses or
      raw `.error` fields into CI logs/summaries.
   9. Production deploy/redeploy workflows must expose an operational control:
@@ -40,10 +40,9 @@ Rules (4 fatal + 1 fatal cross-file + 1 heuristic-warn):
       `head` closes the pipe early, `docker info` can exit nonzero from
       SIGPIPE, and the step can falsely report Docker daemon failure.
 
-Per `feedback_smoke_test_vendor_truth_not_shape_match`: fixtures used to
-validate this lint must mirror real Gitea 1.22.6 YAML semantics, not
-Python yaml-parser quirks. The test suite at tests/test_lint_workflow_yaml.py
-includes a vendor-truth fixture (the exact publish-runtime regression).
+Per `feedback_smoke_test_vendor_truth_not_shape_match`, legacy fixtures retain
+the exact incident shapes. They test the repository policy, not a claim about
+the live server version.
 
 Usage:
   python3 .gitea/scripts/lint-workflow-yaml.py
@@ -88,7 +87,7 @@ def _get_on(d: dict) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Rule 1 — workflow_dispatch.inputs block (Gitea 1.22.6 parser rejects)
+# Rule 1 — legacy flat-dispatch repository policy
 # ---------------------------------------------------------------------------
 
 def check_workflow_dispatch_inputs(filename: str, doc: Any) -> list[str]:
@@ -101,17 +100,17 @@ def check_workflow_dispatch_inputs(filename: str, doc: Any) -> list[str]:
     if isinstance(wd, dict) and wd.get("inputs"):
         errors.append(
             f"::error file={filename}::Rule 1 (FATAL): "
-            f"`on.workflow_dispatch.inputs:` block detected. Gitea 1.22.6 "
-            f"silently rejects the entire workflow with `[W] ignore invalid "
-            f"workflow: unknown on type: map[...]`. Drop the `inputs:` block "
-            f"and derive parameters from tag name / env / external query. "
-            f"Memory: feedback_gitea_workflow_dispatch_inputs_unsupported."
+            f"`on.workflow_dispatch.inputs:` block detected. This repository "
+            f"retains the legacy flat-dispatch policy until dispatch callers, "
+            f"runner behavior, and CI fixtures are migrated together. Drop the "
+            f"`inputs:` block and derive parameters from tag name / env / "
+            f"external query, or land a dedicated policy-migration PR."
         )
     return errors
 
 
 # ---------------------------------------------------------------------------
-# Rule 2 — on: workflow_run (not supported on Gitea 1.22.6)
+# Rule 2 — workflow_run not yet adopted by this repository
 # ---------------------------------------------------------------------------
 
 def check_workflow_run_event(filename: str, doc: Any) -> list[str]:
@@ -121,16 +120,16 @@ def check_workflow_run_event(filename: str, doc: Any) -> list[str]:
     if isinstance(on, dict) and "workflow_run" in on:
         errors.append(
             f"::error file={filename}::Rule 2 (FATAL): `on: workflow_run:` "
-            f"event used. Gitea 1.22.6 does NOT support `workflow_run` "
-            f"(verified via modules/actions/workflows.go enumeration; "
-            f"task #81). Workflow will fire for zero events. Use a "
-            f"`schedule:` cron OR a `push:` trigger with `paths:` filter "
-            f"on the upstream workflow file as the cross-workflow gate."
+            f"event used. The current Gitea server supports this event, but "
+            f"this repository has not migrated its status/reaper topology to "
+            f"it. Use the established `schedule:`/external dispatch or `push:` "
+            f"trigger until a dedicated end-to-end migration removes Rule 2."
         )
     elif isinstance(on, list) and "workflow_run" in on:
         errors.append(
             f"::error file={filename}::Rule 2 (FATAL): `on: workflow_run` "
-            f"in event list. Not supported on Gitea 1.22.6 — task #81."
+            f"in event list. Repository policy has not adopted this current "
+            f"Gitea feature; migrate Rule 2 and its fixtures deliberately."
         )
     return errors
 
@@ -257,8 +256,8 @@ def check_cross_repo_uses(filename: str, doc: Any) -> list[str]:
         if m:
             errors.append(
                 f"::error file={filename}::Rule 5 (FATAL): cross-repo "
-                f"`uses: {uses}` detected. Gitea 1.22.6 with "
-                f"`[actions].DEFAULT_ACTIONS_URL=github` resolves this to "
+                f"`uses: {uses}` detected. This repository's current "
+                f"`[actions].DEFAULT_ACTIONS_URL=github` policy resolves it to "
                 f"github.com/{m.group('owner')}/{m.group('repo')} which "
                 f"404s (org suspended 2026-05-06). Inline the shared bash "
                 f"into `.gitea/scripts/` until task #109 (actions mirror) "
@@ -369,8 +368,9 @@ def check_production_concurrency(filename: str, doc: Any, raw: str) -> list[str]
             errors.append(
                 f"::error file={filename}::Rule 7 (FATAL): production deploy "
                 f"workflow uses `concurrency.cancel-in-progress: false`. "
-                f"Gitea 1.22.6 can cancel queued runs despite that setting, "
-                f"so this is not a safe production serialization primitive. "
+                f"historical runner behavior cancelled queued runs despite "
+                f"that setting, so it is not sufficient as the only production "
+                f"serialization primitive. "
                 f"Use an external queue/lock or make the deploy idempotent."
             )
     return errors
@@ -438,7 +438,7 @@ def check_docker_info_head_pipefail(filename: str, doc: Any) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description="Lint Gitea Actions workflow YAML for 1.22.6-hostile shapes."
+        description="Lint Gitea Actions workflow YAML for repository-policy violations."
     )
     p.add_argument(
         "--workflow-dir",
@@ -499,7 +499,7 @@ def main(argv: list[str] | None = None) -> int:
         n = len(yml_paths)
         print(
             f"::notice::lint-workflow-yaml: {n} workflow file(s) checked, "
-            f"no fatal Gitea-1.22.6-hostile shapes. "
+            f"no fatal repository-policy violations. "
             f"({len(warnings)} heuristic warning(s) emitted.)"
         )
         return 0
