@@ -1449,6 +1449,13 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// monthly_spend: updated when the agent reports a positive value (cumulative
 	// USD cents for the current month). Zero means "no update" — never write
 	// zero to avoid accidentally clearing a previously-reported spend value.
+	// RFC #4402 B1: capture is_busy on every beat, derived IN SQL from the same
+	// active_tasks value being written (`is_busy = ($N > 0)`). No runtime sends
+	// is_busy yet (that is B2), so deriving here is behavior-identical to today
+	// and adds no new bind arg — pure capture so the column is populated before
+	// any consumer reads it (B3). Honoring the runtime's own is_busy field
+	// (COALESCE over the derive) lands with B2, when a runtime first sends it
+	// and HeartbeatPayload gains the parsed field.
 	var err error
 	if payload.MonthlySpend > 0 {
 		_, err = db.DB.ExecContext(ctx, `
@@ -1460,6 +1467,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				uptime_seconds    = $5,
 				current_task      = $6,
 				monthly_spend     = $7,
+				is_busy           = ($4 > 0),
 				-- core#3082: a kind=platform concierge is HELD in 'provisioning'
 				-- (the warming display state) and promoted to 'online' ONLY by the
 				-- verified-ready gate in evaluateStatus, which proves
@@ -1481,6 +1489,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				active_tasks      = $4,
 				uptime_seconds    = $5,
 				current_task      = $6,
+				is_busy           = ($4 > 0),
 				-- core#3082: a kind=platform concierge is HELD in 'provisioning'
 				-- (the warming display state) and promoted to 'online' ONLY by the
 				-- verified-ready gate in evaluateStatus, which proves
