@@ -166,11 +166,15 @@ async function ensurePlatformAgent(
  */
 async function authenticate(
   context: BrowserContext,
+  tenantURL: string,
   tenantToken: string,
   workspaceId: string,
 ): Promise<void> {
   await context.setExtraHTTPHeaders({ Authorization: `Bearer ${tenantToken}` });
-  await installStagingWebSocketAuth(context, tenantToken);
+  await installStagingWebSocketAuth(context, {
+    token: tenantToken,
+    tenantURL,
+  });
 
   await context.route("**/cp/auth/me", (route) =>
     route.fulfill({
@@ -277,7 +281,7 @@ test.beforeEach(async ({ page, context }) => {
       }),
     );
   });
-  await authenticate(context, tenantToken, workspaceId);
+  await authenticate(context, tenantURL, tenantToken, workspaceId);
   const { installed, name } = await ensurePlatformAgent(page, tenantURL, tenantToken, orgID);
   platformInstalled = installed;
   platformAgentName = name;

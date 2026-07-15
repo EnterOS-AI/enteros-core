@@ -258,12 +258,15 @@ test.describe("staging desktop take-control — reconnect + lease renewal (core#
   }
 
   test.beforeEach(async ({ context }) => {
-    const { tenantToken, orgID } = resolveTenant();
+    const { tenantURL, tenantToken, orgID } = resolveTenant();
     await context.setExtraHTTPHeaders({
       Authorization: `Bearer ${tenantToken}`,
       ...(orgID ? { "X-Molecule-Org-Id": orgID } : {}),
     });
-    await installStagingWebSocketAuth(context, tenantToken);
+    await installStagingWebSocketAuth(context, {
+      token: tenantToken,
+      tenantURL,
+    });
   });
 
   test("reconnect re-acquires a FRESH token and the framebuffer resumes", async ({

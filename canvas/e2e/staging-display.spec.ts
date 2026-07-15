@@ -110,9 +110,9 @@ test.describe("staging desktop take-control (real noVNC path)", () => {
 
     const workspaceId = DISPLAY_WS_ID as string;
 
-    // The per-tenant admin bearer satisfies AdminAuth for the acquire POST
-    // (which can carry a header). The WS upgrade below relies on Origin
-    // (same-origin canvas), NOT this header.
+    // The per-tenant admin bearer satisfies AdminAuth for the acquire POST.
+    // The Playwright-only bridge below supplies the same throwaway bearer to
+    // the exact tenant-origin /ws handshake; real users keep using WorkOS.
     await context.setExtraHTTPHeaders({
       Authorization: `Bearer ${tenantToken}`,
       // X-Molecule-Org-Id is required by workspace-server TenantGuard for
@@ -120,7 +120,10 @@ test.describe("staging desktop take-control (real noVNC path)", () => {
       // Harmless (and correct) to send on the same-origin tenant box too.
       ...(orgID ? { "X-Molecule-Org-Id": orgID } : {}),
     });
-    await installStagingWebSocketAuth(context, tenantToken);
+    await installStagingWebSocketAuth(context, {
+      token: tenantToken,
+      tenantURL,
+    });
 
     // 0. Sanity: the workspace must actually be display-enabled, else the
     //    whole gate is meaningless. Hit the availability endpoint first so a

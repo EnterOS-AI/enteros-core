@@ -22,10 +22,7 @@ class FakeWebSocket {
   static readonly CLOSING = 2;
   static readonly CLOSED = 3;
 
-  constructor(
-    url: string | URL,
-    protocols?: string | string[],
-  ) {
+  constructor(url: string | URL, protocols?: string | string[]) {
     created.push({ url, protocols });
   }
 }
@@ -50,11 +47,12 @@ afterEach(() => {
 
 describe("stagingWebSocketAuthInit", () => {
   it("adds the existing browser auth protocols only to this tenant's exact /ws route", () => {
-    stagingWebSocketAuthInit("A-1");
+    stagingWebSocketAuthInit({
+      token: "A-1",
+      tenantOrigin: window.location.origin,
+    });
 
-    const socket = new window.WebSocket(
-      `ws://${window.location.host}/ws`,
-    );
+    const socket = new window.WebSocket(`ws://${window.location.host}/ws`);
 
     expect(socket).toBeInstanceOf(FakeWebSocket);
     expect(created).toEqual([
@@ -66,7 +64,10 @@ describe("stagingWebSocketAuthInit", () => {
   });
 
   it("does not attach the tenant credential to another origin or route", () => {
-    stagingWebSocketAuthInit("do-not-leak");
+    stagingWebSocketAuthInit({
+      token: "do-not-leak",
+      tenantOrigin: window.location.origin,
+    });
 
     new window.WebSocket("wss://example.test/ws");
     new window.WebSocket(`ws://${window.location.host}/ws/events`);
@@ -77,10 +78,33 @@ describe("stagingWebSocketAuthInit", () => {
     ]);
   });
 
-  it("preserves caller-supplied protocols instead of overriding product behavior", () => {
-    stagingWebSocketAuthInit("test-token");
+  it("does not retain or attach the credential in a hostile-origin frame", () => {
+    const nativeWebSocket = window.WebSocket;
 
-    new window.WebSocket(`ws://${window.location.host}/ws`, ["caller-protocol"]);
+    stagingWebSocketAuthInit({
+      token: "hostile-frame-must-not-receive-this",
+      tenantOrigin: "https://pinned-tenant.example",
+    });
+    new window.WebSocket(`ws://${window.location.host}/ws`);
+
+    expect(window.WebSocket).toBe(nativeWebSocket);
+    expect(created).toEqual([
+      {
+        url: `ws://${window.location.host}/ws`,
+        protocols: undefined,
+      },
+    ]);
+  });
+
+  it("preserves caller-supplied protocols instead of overriding product behavior", () => {
+    stagingWebSocketAuthInit({
+      token: "test-token",
+      tenantOrigin: window.location.origin,
+    });
+
+    new window.WebSocket(`ws://${window.location.host}/ws`, [
+      "caller-protocol",
+    ]);
 
     expect(created[0]?.protocols).toEqual(["caller-protocol"]);
   });
@@ -91,22 +115,41 @@ describe("installStagingWebSocketAuth", () => {
     const addInitScript = vi.fn().mockResolvedValue(undefined);
     const context = { addInitScript } as unknown as BrowserContext;
 
-    await installStagingWebSocketAuth(context, "fresh-org-token");
+    await installStagingWebSocketAuth(context, {
+      token: "fresh-org-token",
+      tenantURL: "https://fresh-org.example/health",
+    });
 
     expect(addInitScript).toHaveBeenCalledOnce();
-    expect(addInitScript).toHaveBeenCalledWith(
-      stagingWebSocketAuthInit,
-      "fresh-org-token",
-    );
+    expect(addInitScript).toHaveBeenCalledWith(stagingWebSocketAuthInit, {
+      token: "fresh-org-token",
+      tenantOrigin: "https://fresh-org.example",
+    });
   });
 
   it("fails closed instead of registering an empty credential", async () => {
     const addInitScript = vi.fn().mockResolvedValue(undefined);
     const context = { addInitScript } as unknown as BrowserContext;
 
-    await expect(installStagingWebSocketAuth(context, "")).rejects.toThrow(
-      "staging tenant token is required",
-    );
+    await expect(
+      installStagingWebSocketAuth(context, {
+        token: "",
+        tenantURL: "https://fresh-org.example",
+      }),
+    ).rejects.toThrow("staging tenant token is required");
+    expect(addInitScript).not.toHaveBeenCalled();
+  });
+
+  it("fails closed instead of registering a non-HTTP tenant URL", async () => {
+    const addInitScript = vi.fn().mockResolvedValue(undefined);
+    const context = { addInitScript } as unknown as BrowserContext;
+
+    await expect(
+      installStagingWebSocketAuth(context, {
+        token: "fresh-org-token",
+        tenantURL: "javascript:alert('wrong origin')",
+      }),
+    ).rejects.toThrow("staging tenant URL must use HTTP(S)");
     expect(addInitScript).not.toHaveBeenCalled();
   });
 });

@@ -255,9 +255,13 @@ test.describe("staging canvas tabs", () => {
       "X-Molecule-Org-Id": orgID,
     });
     // WebSocket() cannot inherit Authorization. Offer this throwaway org's
-    // bearer only on the exact same-origin /ws handshake; nothing is baked
-    // into the Canvas bundle and real WorkOS-cookie behavior is unchanged.
-    await installStagingWebSocketAuth(context, tenantToken);
+    // bearer only when both the document and exact /ws handshake match this
+    // pinned tenant origin; nothing is baked into the Canvas bundle and real
+    // WorkOS-cookie behavior is unchanged.
+    await installStagingWebSocketAuth(context, {
+      token: tenantToken,
+      tenantURL,
+    });
 
     // canvas/src/components/AuthGate.tsx fetches /cp/auth/me on mount
     // and redirects to the login page on 401. The bearer header above

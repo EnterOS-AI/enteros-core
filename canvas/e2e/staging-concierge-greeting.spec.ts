@@ -205,9 +205,16 @@ test.describe("concierge greeting — stored session (server contextId belt)", (
 });
 
 /* ─────────── B. RENDERED UI — client render/persistence doubling ──────────── */
-async function authenticate(context: BrowserContext, tenantToken: string) {
+async function authenticate(
+  context: BrowserContext,
+  tenantURL: string,
+  tenantToken: string,
+) {
   await context.setExtraHTTPHeaders({ Authorization: `Bearer ${tenantToken}` });
-  await installStagingWebSocketAuth(context, tenantToken);
+  await installStagingWebSocketAuth(context, {
+    token: tenantToken,
+    tenantURL,
+  });
   await context.addInitScript(() => {
     window.localStorage.setItem(
       "molecule_cookie_consent",
@@ -264,7 +271,7 @@ test.describe("concierge greeting — rendered My Chat (UI)", () => {
   }) => {
     test.setTimeout(8 * 60 * 1000);
     const { tenantURL, tenantToken } = tenantEnv();
-    await authenticate(context, tenantToken);
+    await authenticate(context, tenantURL, tenantToken);
 
     page.on("console", (m) => {
       if (m.type() === "error") console.log(`[e2e/console-error] ${m.text()}`);

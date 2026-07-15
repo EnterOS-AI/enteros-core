@@ -13,7 +13,10 @@ import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
-test.skip(!STAGING, "CANVAS_E2E_STAGING not set — staging-only suite, not requested");
+test.skip(
+  !STAGING,
+  "CANVAS_E2E_STAGING not set — staging-only suite, not requested",
+);
 
 test("global Canvas WebSocket authenticates without a WorkOS test session", async ({
   context,
@@ -28,7 +31,10 @@ test("global Canvas WebSocket authenticates without a WorkOS test session", asyn
     );
   }
 
-  await installStagingWebSocketAuth(context, tenantToken);
+  await installStagingWebSocketAuth(context, {
+    token: tenantToken,
+    tenantURL,
+  });
   await page.goto(`${tenantURL}/health`, { waitUntil: "domcontentloaded" });
 
   const result = await page.evaluate(async () => {
@@ -54,7 +60,9 @@ test("global Canvas WebSocket authenticates without a WorkOS test session", asyn
         }
         resolve({ opened, selectedProtocol, detail });
       };
-      const timeout = window.setTimeout(
+      // Completion is event-driven; this deadline only prevents an infinite hang.
+      // prettier-ignore
+      const timeout = window.setTimeout( // lint-allow: env-coupling -- event-driven safety deadline
         () => finish(false, "timed out waiting for WebSocket open"),
         15_000,
       );
