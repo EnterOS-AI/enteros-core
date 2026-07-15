@@ -58,7 +58,7 @@ on:
   # job needs no AWS creds and no EC2 leak-check. `E2E Staging Plugin Install
   # Lifecycle` was likewise moved onto the molecules-server backend (core#182:
   # plugin install now rides docker CopyToContainer into the mol-ws-* container,
-  # not AWS EIC) and runs on push/dispatch/cron. The remaining EC2-only jobs
+  # not AWS EIC) and runs on push/dispatch. The remaining EC2-only jobs
   # (platform-boot, concierge-user-tasks, workspace-requests, concierge-platform)
   # stay DORMANT behind the `E2E_EC2_ENABLED` repo var (unset →
   # skip) until a cloud EC2 backend is wired again — re-enable by setting
