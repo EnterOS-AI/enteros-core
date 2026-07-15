@@ -4,8 +4,8 @@
 # secret-scan. Closes the test-coverage gap flagged in the molecule-code-reviewer
 # REQUEST_CHANGES on PR #3422:
 #
-#   (1) internal-host derivation (GITHUB_SERVER_URL -> internal Gitea, public
-#       fallback, trailing-slash trim)                       — derive_gitea_base
+#   (1) canonical-domain derivation (ambient runner URL ignored, explicit
+#       GITEA_HOST override retained, trailing-slash trim)   — derive_gitea_base
 #   (2) CI_STATUS_TOKEN resolution: direct Gitea org secret FIRST, Infisical
 #       fallback, fail-closed vs best-effort                 — resolve_ci_status_token
 #   (3) review-status emission + host-derivation path        — emit_review_status
@@ -194,22 +194,24 @@ run_fn() {
 }
 
 # ===========================================================================
-# (1) derive_gitea_base — internal-host derivation
+# (1) derive_gitea_base — canonical-domain derivation
 # ===========================================================================
 echo
 echo "== derive_gitea_base (host derivation) =="
 
 reset_env; GITHUB_SERVER_URL="http://molecule-gitea-local:3000"
-assert_eq "D1 internal GITHUB_SERVER_URL preferred" "http://molecule-gitea-local:3000" "$(derive_gitea_base)"
+assert_eq "D1 ambient GITHUB_SERVER_URL ignored" "https://git.moleculesai.app" "$(derive_gitea_base)"
 
-reset_env; GITEA_HOST="git.moleculesai.app"
-assert_eq "D2 fallback to https://GITEA_HOST when GITHUB_SERVER_URL empty" "https://git.moleculesai.app" "$(derive_gitea_base)"
+reset_env; GITEA_HOST="git.example.test"
+assert_eq "D2 explicit GITEA_HOST override retained" "https://git.example.test" "$(derive_gitea_base)"
 
 reset_env
 assert_eq "D3 literal default when both unset" "https://git.moleculesai.app" "$(derive_gitea_base)"
 
-reset_env; GITHUB_SERVER_URL="http://molecule-gitea-local:3000/"
-assert_eq "D4 trailing slash trimmed (no // before /api/v1)" "http://molecule-gitea-local:3000" "$(derive_gitea_base)"
+reset_env; GITEA_HOST="git.example.test/"
+assert_eq "D4 trailing slash trimmed (no // before /api/v1)" "https://git.example.test" "$(derive_gitea_base)"
+
+assert_eq "D5 exact Cloudflare-safe User-Agent" "curl/8.4.0" "$CI_STATUS_UA"
 
 # ===========================================================================
 # (2) resolve_ci_status_token — direct-first, Infisical fallback
@@ -292,7 +294,7 @@ run_fn emit_review_status
 assert_eq  "E1 rc 0" "0" "$RC"
 assert_contains "E1 POST body state=success" '"state":"success"' "$(cat "$WORK/e1_body")"
 assert_contains "E1 POST body carries STATUS_CONTEXT" "reserved-path-review / reserved-path-review (pull_request_target)" "$(cat "$WORK/e1_body")"
-assert_contains "E1 POST hit internal-derived host" "http://molecule-gitea-local:3000/api/v1/repos/molecule-ai/molecule-core/statuses/deadbeefsha" "$(cat "$WORK/e1_url")"
+assert_contains "E1 POST ignored ambient internal host" "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-core/statuses/deadbeefsha" "$(cat "$WORK/e1_url")"
 assert_contains "E1 notice posted success" "::notice::posted success" "$OUT"
 
 # E2 — non-success eval outcome → posts state=failure.
