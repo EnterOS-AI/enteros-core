@@ -542,6 +542,11 @@ jobs:
           # (mc#3244). Locks in: cold-start burst retries then succeeds, a mid-flap
           # resets the streak, persistent non-ready returns 1 (no hang/false green).
           bash tests/e2e/lib/test_cp_health_preflight.sh
+          # Active local-Docker staging teardown must validate the exact
+          # synchronous CP purge receipt/audit and exact-org absence. Offline
+          # mocked-curl cases pin success plus malformed receipt, failed purge,
+          # surviving org, and non-local backend fail-closed directions.
+          bash tests/e2e/lib/test_cp_purge_receipt_unit.sh
           # molecule-core#1995 (#1994 follow-on): fail-direction proof for
           # the A2A real-completion + byok-routing assertion helpers
           # (lib/completion_assert.sh). Offline (no LLM, no network): it

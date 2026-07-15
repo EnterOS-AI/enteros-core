@@ -4,9 +4,10 @@
 # Creates a fresh org per run (unique slug), waits for tenant provisioning,
 # exercises every major workspace-level API
 # (register, heartbeat, A2A, delegation, HMA memory, activity, peers),
-# then tears the whole org down and asserts that provider resources, DNS, and
-# database rows are gone. Legacy EC2-specific checks run only when that backend
-# is explicitly selected; current staging uses the molecules-server backend.
+# then tears the whole org down through the synchronous control-plane purge,
+# validates its exact audit receipt, and proves the exact org is absent. The
+# generic runner does not directly enumerate provider resources; current staging
+# uses the molecules-server/local-Docker backend.
 #
 # Auth model:
 #   Single MOLECULE_ADMIN_TOKEN (= staging CP_ADMIN_API_TOKEN from Infisical)
@@ -44,18 +45,9 @@
 #                                 mapped to `smoke` for back-compat with
 #                                 any in-flight runner picking up an older
 #                                 workflow checkout)
-#   E2E_AWS_LEAK_CHECK           auto (default) | required | off
-#                                required in CI so teardown cannot report
-#                                clean while slug-tagged EC2 remains alive.
-#                                Backend classification (see is_ec2_backend):
-#                                ONLY an explicit 'off' is treated as the
-#                                non-EC2 (local-docker) backend and earns the
-#                                EIC hard-check skips. 'required', the default
-#                                'auto', and an unset value all fail SAFE to
-#                                the EC2 backend so the EIC hard checks stay on
-#                                — never silently dropped on a real EC2 run.
-#   E2E_AWS_TERMINATE_LEAKS      1 → terminate slug-tagged leaked EC2 before
-#                                exiting 4
+#   E2E_INFRA_BACKEND            required: local-docker (only active staging
+#                                backend). Any other or unset value fails before
+#                                an admin bearer is sent.
 #   E2E_INTENTIONAL_FAILURE      1 → poison tenant token mid-run so the
 #                                script fails; the EXIT trap MUST still
 #                                tear down cleanly (and exit 4 on leak).
@@ -93,7 +85,7 @@
 #   1  generic failure
 #   2  missing required env
 #   3  provisioning timed out
-#   4  teardown left orphan resources
+#   4  teardown receipt/audit/org-absence proof failed
 #   5  E2E_REQUIRE_LIVE set but the run validated no real lifecycle (no
 #      false-green-on-skip)
 #
@@ -107,9 +99,9 @@
 #   • Staging-CD and production redeploy have independent triggers and their
 #     own gate chains; this harness is post-merge/on-demand evidence, not an
 #     ordering dependency for either deployment path.
-#   • The current backend is molecules-server/local Docker. The optional AWS
-#     leak-check knob is retained only for an operator-selected provider; EC2
-#     is not a prerequisite for the active lane.
+#   • The current backend is molecules-server/local Docker. Teardown evidence is
+#     the exact synchronous CP purge receipt plus exact-org absence; direct
+#     provider enumeration is explicitly outside this generic runner.
 #
 # Fail-closed properties retained here: bounded readiness polls, asserted peers
 # and activity, child provenance, and E2E_REQUIRE_LIVE=1 requiring a real
@@ -256,8 +248,10 @@ source "$(dirname "$0")/lib/model_slug.sh"
 # shellcheck source=lib/workspace_env_presence.sh
 source "$(dirname "$0")/lib/workspace_env_presence.sh"
 # shellcheck disable=SC1091
-# shellcheck source=lib/aws_leak_check.sh
-source "$(dirname "$0")/lib/aws_leak_check.sh"
+# shellcheck source=lib/cp_purge_receipt.sh
+source "$(dirname "$0")/lib/cp_purge_receipt.sh"
+e2e_cp_require_local_backend || exit 2
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 # shellcheck disable=SC1091
 # shellcheck source=lib/completion_assert.sh
 # molecule-core#1995 (#1994 follow-on): real-completion + per-provider
@@ -304,44 +298,11 @@ e2e_tmp() {
   printf '%s' "$f"
 }
 
-# ─── EC2/EIC-backend gate (provider signal) ─────────────────────────────
-# Some sub-steps probe the EC2/EIC (SSH-via-EC2-Instance-Connect) chain,
-# which has NO analog on the molecules-server (local-docker, provider=local)
-# backend. On local-docker those probes hard-fail for backend-shape reasons,
-# not real regressions:
-#   - 7b terminal-diagnose: the CP local-docker provisioner persists the
-#     CONTAINER NAME into instance_id (non-empty, not i-prefixed), so the
-#     workspace-server diagnose handler mis-routes a local-docker WS down
-#     diagnoseRemote (EIC + ssh) instead of diagnoseLocal → ok=false.
-#   - 7c Files API PUT config.yaml: the EIC write path only applies to
-#     i-prefixed instance ids; on local-docker it shape-routes to docker
-#     CopyToContainer and should pass, but its EIC assertions are moot.
-#
-# Canonical discriminator: E2E_AWS_LEAK_CHECK. The workflow sets it to
-# 'required' iff a real EC2 backend is enabled (vars.E2E_EC2_ENABLED=='1')
-# and 'off' on molecules-server. This is the same one-line knob the
-# workflow already advertises — zero new plumbing. When available, a
-# per-workspace signal (the diagnose JSON's own `remote` boolean, which
-# reflects diagnoseLocal vs diagnoseRemote) is preferred at the call site.
-#
-# FAIL-SAFE semantics (fixes a coverage hole): ONLY an explicit 'off'
-# classifies the run as non-EC2 (and thus eligible to SKIP the EIC hard
-# checks). Every other value — 'required', the DOCUMENTED default 'auto',
-# an unset var, or any unknown token — is treated as EC2 so the EIC hard
-# checks STAY ON. The old test (== 'required') mis-classified the
-# documented default 'auto' (and an unset var) as non-EC2, silently
-# dropping ALL EIC hard-checks on a real EC2 run left at default. We do
-# not try to resolve 'auto' to the true backend here (no cheap, in-repo
-# signal — the tenant CP GET's instance_id shape is owned by another
-# repo); instead 'auto' fails safe toward keeping coverage. A real
-# local-docker run must set E2E_AWS_LEAK_CHECK=off explicitly (as the
-# workflow already does) to earn the non-EC2 skips.
-is_ec2_backend() {
-  [ "${E2E_AWS_LEAK_CHECK:-auto}" != "off" ]
-}
-
 # ─── cleanup trap ───────────────────────────────────────────────────────
 CLEANUP_DONE=0
+ORG_ID=""
+ORG_CREATION_VERIFIED=0
+CREATE_BODYFILE=""
 cleanup_org() {
   # Capture upstream exit code IMMEDIATELY — must be the first statement
   # in the trap, before any command (including the CLEANUP_DONE check)
@@ -363,58 +324,26 @@ cleanup_org() {
     return 0
   fi
 
+  if [ "$ORG_CREATION_VERIFIED" != "1" ]; then
+    log "No verified creation-returned org identity for $SLUG — skipping destructive org teardown."
+    case "$entry_rc" in 0|1|2|3|4|5) return 0 ;; *) exit 1 ;; esac
+  fi
+
   log "🧹 Tearing down org $SLUG..."
 
-  # The DELETE handler runs the GDPR Art. 17 cascade synchronously
-  # (Stripe + Redis + EC2 terminate + CF tunnel + DNS + DB rows). Real
-  # observed wall-time on prod-shaped infra is ~30–90s — EC2 termination
-  # alone takes 30–60s. The 5–15s estimate in `purge.go`'s comment is
-  # the API-call cost, NOT the AWS-side time-to-termination it waits on.
-  #
-  # Two-part patience to match reality:
-  #   1. 120s curl timeout on the DELETE itself (was 30s) so the
-  #      synchronous cascade has room to complete in-band.
-  #   2. Poll up to 60s after for organizations.status='purged' (or row
-  #      gone) instead of one rigid 10s sleep — covers the case where
-  #      DELETE returns 5xx mid-cascade and the cascade finishes anyway,
-  #      and the case where DELETE legitimately exceeds 120s and we want
-  #      eventual-consistency confirmation.
-  if curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1; then
-    ok "Teardown request accepted"
-  else
-    log "Teardown returned non-2xx (may already be gone)"
-  fi
-
-  local leak_count=1
-  local elapsed=0
-  while [ "$elapsed" -lt 60 ]; do
-    leak_count=$(curl "${CURL_COMMON[@]}" "$CP_URL/cp/admin/orgs" \
-      -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-      | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for o in d.get('orgs', []) if o.get('slug')=='$SLUG' and o.get('status') != 'purged'))" \
-      2>/dev/null || echo 1)
-    if [ "$leak_count" = "0" ]; then
-      break
-    fi
-    sleep 5
-    elapsed=$((elapsed + 5))
-  done
-
-  if [ "$leak_count" != "0" ]; then
-    echo "⚠️  LEAK: org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" >&2
-    exit 4
-  fi
-  local aws_leak_rc=0
-  e2e_verify_no_ec2_leaks_for_slug "$SLUG" || aws_leak_rc=$?
-  if [ "$aws_leak_rc" != "0" ]; then
-    case "$aws_leak_rc" in
-      2) exit 2 ;;
-      *) exit 4 ;;
-    esac
-  fi
-  ok "Teardown clean — no orphan org or EC2 resources for $SLUG (${elapsed}s)"
+  # DELETE returns only after executeOrgPurge has completed the selected
+  # provider cleanup and DB-row step. Verify the exact receipt/audit identity,
+  # then require the exact-tenant boot-events endpoint to return 404. This is
+  # honest CP purge evidence, not a claim that this generic runner scanned
+  # Docker itself.
+  local purge_verify_rc=0
+  e2e_cp_delete_and_verify_purge \
+    "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" || purge_verify_rc=$?
+  case "$purge_verify_rc" in
+    0) ;;
+    2) exit 2 ;;
+    *) exit 4 ;;
+  esac
 
   # Normalize unexpected upstream exit codes to 1 (generic failure). The
   # script's documented contract (header "Exit codes" section) only emits
@@ -438,7 +367,9 @@ cleanup_org() {
 # substitution (core#2917).
 cleanup_org_and_bodyfile() {
   local entry_rc=$?
-  rm -f "$CREATE_BODYFILE" 2>/dev/null || true
+  if [ -n "$CREATE_BODYFILE" ]; then
+    rm -f "$CREATE_BODYFILE" 2>/dev/null || true
+  fi
   cleanup_org
   exit "$entry_rc"
 }
@@ -481,9 +412,10 @@ log "1/11 Creating org $SLUG via /cp/admin/orgs..."
 # set -euo pipefail, aborting the whole harness with no body
 # in the CI logs.
 CREATE_BODYFILE="$(mktemp -t create-org-resp.XXXXXX)"
-# cleanup_org_and_bodyfile (EXIT/INT/TERM trap) removes this bodyfile and
-# runs teardown, so a non-2xx org-create response is logged while the org
-# and EC2 resources are still cleaned up (core#60 / core#2917).
+# cleanup_org_and_bodyfile (EXIT/INT/TERM trap) removes this bodyfile and runs
+# teardown only after a successful create returned a valid org identity. A
+# non-2xx/invalid create response is logged but cannot authorize a slug-only
+# delete that might target a pre-existing tenant.
 set +e
 CREATE_HTTP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$CP_URL/cp/admin/orgs" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -520,10 +452,13 @@ fi
 # Without X-Molecule-Org-Id matching MOLECULE_ORG_ID on the tenant, the
 # tenant-guard middleware returns 404 to avoid leaking tenant existence.
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
-[ -z "$ORG_ID" ] && {
+if ! e2e_cp_validate_org_id "$ORG_ID"; then
   log "❌ Org create response missing 'id'; raw body: $CREATE_RESP"
-  fail "Org create response missing 'id' (see body above)"
-}
+  fail "Org create response missing a valid UUID 'id' (see body above)"
+fi
+ORG_CREATION_VERIFIED=1
+e2e_cp_publish_creation_identity "$SLUG" "$ORG_ID" \
+  || fail "Could not publish the verified org creation identity for teardown"
 ok "Org created (id=$ORG_ID http=$CREATE_HTTP_CODE slug_len=${#SLUG})"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────
@@ -1160,61 +1095,29 @@ walk(d)
 done
 rm -f "$PNG_FIXTURE"
 
-# ─── 7b. Canvas-terminal diagnose (EIC chain probe) ────────────────────
-# This step exists because the canvas-terminal failure of 2026-05-03
-# was structurally invisible to local-dev (handleLocalConnect uses
-# docker exec; handleRemoteConnect uses EIC + ssh). The CP provisioner
-# shipped without the tcp/22 EIC ingress rule for ~6 months and nobody
-# noticed until a paying tenant clicked Terminal in canvas. Probing the
-# diagnose endpoint here at synth-E2E time means a regression in
-#   - tenantIngressRules / workspaceIngressRules (CP)
-#   - eicSSHIngressRule helper (CP)
-#   - AuthorizeIngress source-group support (CP awsapi)
-#   - MOLECULE_EIC_ENDPOINT_SG_ID legacy EC2-backend environment
-#   - handleRemoteConnect's send-ssh-public-key/open-tunnel/ssh chain
-# surfaces within ~20 min of merge instead of waiting for a user report.
-#
-# The diagnose endpoint runs the full EIC + ssh probe from inside the
-# tenant's workspace-server (which already has AWS creds via its IAM
-# profile) and reports per-step status. We only need to call it as the
-# tenant — no AWS creds needed on the GHA runner. Returns
-# {"ok": bool, "first_failure": "name", "steps": [...]}.
-#
-# Local-docker workspaces get diagnoseLocal (docker.Ping + container exec).
-#
-# EC2-GATED (provider signal). The EIC/ssh chain this probe asserts
-# (send-ssh-public-key, open-tunnel, wait-for-port, ssh-probe, tenant SG
-# tcp/22, MOLECULE_EIC_ENDPOINT_SG_ID) is 100% EC2-specific and has NO
-# analog on molecules-server (local-docker). Worse, on a CP-provisioned
-# local-docker workspace the diagnose handler mis-routes to diagnoseRemote
-# (it branches on raw instanceID != "" and the CP local-docker provisioner
-# persists the CONTAINER NAME into instance_id), so this probe returns
-# ok=false for a backend-shape reason, not a real regression. So:
-#   - On an EC2 backend (E2E_AWS_LEAK_CHECK=required) we run the full
-#     EIC hard-check exactly as before.
-#   - On molecules-server we use the diagnose JSON's own `remote` boolean
-#     (diagnoseLocal ⇒ remote:false) as the per-workspace provider signal:
+# ─── 7b. Canvas-terminal diagnose ──────────────────────────────────────
+# The active staging backend is local Docker. The endpoint returns
+# {"ok": bool, "remote": bool, "first_failure": "name", "steps": [...]};
+# use its own shape signal to keep the assertions honest:
 #       * remote:false ⇒ genuine diagnoseLocal container-running check —
-#         provider-agnostic, so we still HARD-assert ok=true.
-#       * remote:true  ⇒ the EIC/ssh path (either genuinely EC2 or the CP
-#         local-docker mis-route). Its EIC assertions have no local analog,
-#         so we SKIP with a clear log line rather than false-red. The
-#         provider-agnostic "container executes" guarantee is already
+#         hard-assert ok=true (apart from the known socket-less check below).
+#       * remote:true  ⇒ a response shape with no valid local-Docker assertion;
+#         skip explicitly rather than false-pass it. Container execution is
 #         covered by wait_workspaces_online_routable (step 7) + A2A (step 8).
-log "7b/11 Canvas-terminal EIC diagnose probe..."
+log "7b/11 Canvas-terminal diagnose probe..."
 for wid in "${WS_TO_CHECK[@]}"; do
   DIAG_JSON=$(tenant_call GET "/workspaces/$wid/terminal/diagnose" 2>/dev/null || echo '{}')
   DIAG_OK=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('ok') else 'false')" 2>/dev/null || echo "false")
   DIAG_REMOTE=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('remote') else 'false')" 2>/dev/null || echo "false")
   if [ "$DIAG_OK" = "true" ]; then
     ok "    $wid terminal-reachable (canvas terminal will work)"
-  elif ! is_ec2_backend && [ "$DIAG_REMOTE" = "true" ]; then
-    # Non-EC2 backend AND the workspace took the remote/EIC path — no local
-    # analog to assert. Skip (never hard-fail on the EIC chain off EC2).
-    log "    ⏭️  $wid terminal-diagnose EIC hard-check SKIPPED (non-EC2 backend, remote-path diagnose): E2E_AWS_LEAK_CHECK=${E2E_AWS_LEAK_CHECK:-off}. The EIC/ssh chain has no local-docker analog; container-executes is covered by online+routable (step 7) and A2A (step 8)."
+  elif [ "$DIAG_REMOTE" = "true" ]; then
+    # The active backend is local Docker, so a remote-shape response has no
+    # assertion we can honestly make here.
+    log "    ⏭️  $wid terminal-diagnose remote-shape hard-check SKIPPED (active backend=local-docker): this response has no valid local assertion; container execution is covered by online+routable (step 7) and A2A (step 8)."
   else
-    # Either an EC2 backend (hard EIC regression) OR a non-EC2 diagnoseLocal
-    # (remote:false) that reported ok=false — both are real failures.
+    # diagnoseLocal (remote:false) reported ok=false. Apart from the known
+    # docker-client absence below, this is a real local-Docker failure.
     DIAG_FAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('first_failure','unknown'))" 2>/dev/null || echo "unknown")
     DIAG_DETAIL=$(echo "$DIAG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); s=[x for x in d.get('steps',[]) if not x.get('ok')]; step=s[0] if s else {}; print(' — '.join(x for x in [step.get('error',''), step.get('detail','')] if x))" 2>/dev/null || echo "")
     # #767: always emit the full diagnose JSON so operators see every step's
@@ -1223,9 +1126,7 @@ for wid in "${WS_TO_CHECK[@]}"; do
     log "── DIAGNOSTIC BURST (step 7b — terminal diagnose for $wid) ──"
     echo "$DIAG_JSON" | python3 -m json.tool 2>/dev/null || echo "$DIAG_JSON"
     log "── END DIAGNOSTIC ──"
-    if is_ec2_backend; then
-      fail "Workspace $wid terminal diagnose failed at step '$DIAG_FAIL': $DIAG_DETAIL — check tenant SG has tcp/22 from the configured EIC endpoint SG, MOLECULE_EIC_ENDPOINT_SG_ID is set for the legacy EC2 backend, and EIC endpoint health"
-    elif [ "$DIAG_FAIL" = "docker-available" ]; then
+    if [ "$DIAG_FAIL" = "docker-available" ]; then
       # A real staging TENANT's workspace-server runs INSIDE the tenant container
       # with NO docker socket (by security design — a tenant must never reach the
       # host daemon; that IS the finding-#1 escape surface). So diagnoseLocal's
@@ -1238,32 +1139,20 @@ for wid in "${WS_TO_CHECK[@]}"; do
       # failure at ANY OTHER step (container-running / exec) still hard-fails below.
       # FOLLOW-UP: terminal_diagnose.diagnoseLocal should model the real tenant
       # terminal path instead of hard-erroring on a nil docker client.
-      log "    ⏭️  $wid terminal-diagnose docker-available SKIPPED (non-EC2 tenant workspace-server has no docker socket by design; container-exec covered by steps 7+8): $DIAG_DETAIL"
+      log "    ⏭️  $wid terminal-diagnose docker-available SKIPPED (local-Docker tenant workspace-server has no docker socket by design; container execution is covered by steps 7+8): $DIAG_DETAIL"
     else
-      fail "Workspace $wid diagnoseLocal (non-EC2, remote:false) reported ok=false at step '$DIAG_FAIL': $DIAG_DETAIL — the local-docker container-running check failed (docker.Ping / container exec)"
+      fail "Workspace $wid diagnoseLocal (remote:false) reported ok=false at step '$DIAG_FAIL': $DIAG_DETAIL — the local-Docker container-running check failed (docker.Ping / container exec)"
     fi
   fi
 done
 
-# ─── 7c. Workspace files API config.yaml round-trip ────────────────────
-# Pin the config-save path that drives the Canvas Config tab's Save &
-# Restart. Two failure classes this gate catches in one shot:
-#
-#   1. Path map drift (PR #2769). Runtime falls through to the wrong
-#      base path (e.g. /opt/configs when user-data only created /configs)
-#      → SSH `install -D` fails with EACCES on a parent dir that doesn't
-#      exist. The user-visible 500 was unobservable without exercising
-#      this code path on a fresh workspace.
-#   2. Permission drift on /configs. The path is root-owned by cloud-init,
-#      so the SSH-as-ubuntu install needs `sudo -n`. Any future change
-#      that drops the sudo, switches to a non-passwordless-sudo OS user,
-#      or moves the path to a non-ubuntu-writable dir without sudo will
-#      regress this gate.
-#
-# Round-trip: PUT a known marker, GET it back, assert content matches.
-# Marker shape includes the run id so a stale file from a prior canary
-# can't false-pass.
-log "7c/11 Files API config.yaml round-trip..."
+# ─── 7c. Workspace files API config.yaml PUT ───────────────────────────
+# Exercise the Canvas Config save path with a run-specific marker. The current
+# local-Docker tenant process has no Docker socket; until WriteFile models that
+# topology, only its exact `docker not available` 5xx is an explicit skip. All
+# other transport, auth, route, validation, and server failures remain hard
+# failures. This is a PUT check, not a read-back round trip.
+log "7c/11 Files API config.yaml PUT..."
 CONFIG_MARKER="# molecule-synth-e2e: ${E2E_RUN_ID:-unknown} ${RUNTIME} $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CONFIG_PAYLOAD="${CONFIG_MARKER}
 name: synth-canary
@@ -1296,59 +1185,43 @@ for wid in "${WS_TO_CHECK[@]}"; do
   PUT_BODY_OUT=$(cat "$PUT_TMP" 2>/dev/null || echo "")
   rm -f "$PUT_TMP" "$PUT_CODE_FILE"
   if ! http_code_is_exact_success "$PUT_CODE" "$PUT_CURL_RC" 200 204; then
-    # EC2-GATED hard-fail (provider signal). The failure class this gate
-    # names (path-map / permission drift in template_files_eic.go) is the
-    # SSH-via-EIC write path, which only applies to an i-prefixed EC2
-    # instance id. On molecules-server (local-docker) WriteFile shape-routes
-    # to docker CopyToContainer — a different code path with no EIC analog —
-    # so a non-2xx here is NOT the EIC regression this gate claims to catch.
-    # On an EC2 backend we hard-fail as before; off EC2 we SKIP loudly.
-    #
-    # NARROWED (fixes a coverage hole): the non-EC2 skip is gated on the
+    # The active local-Docker WriteFile path shape-routes to docker
+    # CopyToContainer. The narrow skip below is gated on the
     # SPECIFIC docker-less-tenant signal, mirroring 7b's `docker-available`
     # narrowing — NOT on "any non-2xx". A real staging tenant's
     # workspace-server runs INSIDE the tenant container with NO docker socket
-    # (#206, by security design). WriteFile's non-EIC dispatch therefore
+    # (#206, by security design). WriteFile's container dispatch therefore
     # falls through findContainer (h.docker==nil ⇒ "") to writeViaEphemeral,
     # whose first act is `if h.docker == nil { return "docker not available" }`
     # — surfaced by the handler as HTTP 500 {"error":"failed to write file:
     # docker not available"} (workspace-server container_files.go:130-131,
     # templates.go:851-853). That is the ONLY non-2xx we skip.
     #
-    # Everything else stays a HARD FAIL even off EC2, because it points at a
+    # Everything else stays a HARD FAIL because it points at a
     # real outage this step exists to catch, not a backend-shape mismatch:
     #   - 000 → CP/tenant unreachable (curl rc!=0 / connection refused).
     #   - 5xx WITHOUT the docker-not-available marker → a genuine config-write
     #     regression (e.g. writeViaEphemeral failed AFTER the docker check).
     #   - 4xx (400/401/403/404/…) → auth/route/validation regression.
-    if is_ec2_backend; then
-      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (curl_rc=$PUT_CURL_RC): $PUT_BODY_OUT — likely a path-map or permission regression in workspace-server template_files_eic.go"
-    elif [ "$PUT_CODE" != "000" ] && \
+    if [ "$PUT_CODE" != "000" ] && \
          { [ "$PUT_CODE" -ge 500 ] 2>/dev/null; } && \
          printf '%s' "$PUT_BODY_OUT" | grep -qi 'docker not available'; then
-      # Non-EC2 tenant, 5xx, body carries the docker-less signal — the
+      # Local-Docker tenant, 5xx, body carries the docker-less signal — the
       # WriteFile docker-exec dispatch has no local analog on a socket-less
       # tenant. Config-write coverage for this backend is provided by the
       # container reading /configs/config.yaml directly via bind-mount at
       # boot (asserted by online+routable step 7). SKIP this ONE sub-step.
-      log "    ⏭️  $wid Files API PUT config.yaml EIC hard-check SKIPPED (non-EC2 socket-less tenant; docker-not-available): E2E_AWS_LEAK_CHECK=${E2E_AWS_LEAK_CHECK:-auto}, PUT returned $PUT_CODE (curl_rc=$PUT_CURL_RC). The template_files_eic.go SSH-via-EIC write path has no local-docker analog and the docker-exec fallback needs a docker socket the tenant lacks by design (#206). Body: $PUT_BODY_OUT"
+      log "    ⏭️  $wid Files API PUT config.yaml container-write hard-check SKIPPED (local-Docker socket-less tenant; docker-not-available): PUT returned $PUT_CODE (curl_rc=$PUT_CURL_RC). The docker-exec fallback needs a socket the tenant lacks by design (#206). Body: $PUT_BODY_OUT"
       continue
     else
       # 000 (unreachable) or 5xx-without-marker or any 4xx → a real outage /
       # regression, NOT a backend-shape mismatch. Hard-fail so this gate
-      # keeps catching what it exists to catch even off EC2.
-      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (curl_rc=$PUT_CURL_RC; non-EC2 backend, NOT the docker-not-available socket-less signal): $PUT_BODY_OUT — a 000 means CP/tenant unreachable; a 5xx without 'docker not available' is a genuine config-write regression; a 4xx is an auth/route/validation regression. This is a real failure, not a local-docker shape mismatch."
+      # keeps catching what it exists to catch on local-Docker.
+      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (curl_rc=$PUT_CURL_RC; local-Docker backend, NOT the docker-not-available socket-less signal): $PUT_BODY_OUT — a 000 means CP/tenant unreachable; a 5xx without 'docker not available' is a genuine config-write regression; a 4xx is an auth/route/validation regression. This is a real failure, not a backend-shape mismatch."
     fi
   fi
-  # PUT-only check; the GET-back round-trip assertion was dropped
-  # 2026-05-04 because PUT (template_files_eic.go SSH-via-EIC →
-  # workspace EC2) and GET (templates.go ReadFile → docker exec on
-  # platform-tenant-local container) hit DIFFERENT paths and DIFFERENT
-  # hosts. The asymmetry is a separate latent bug — Canvas Config tab
-  # rendering reads workspace state via other endpoints, not via this
-  # GET, so the user-facing Save & Restart works (container reads
-  # /configs/config.yaml directly via bind-mount). When the read/write
-  # paths are unified, restore the GET-back marker check here.
+  # This remains PUT-only until local-Docker read/write paths share the same
+  # supported storage contract; do not describe it as round-trip coverage.
   ok "    $wid config.yaml PUT OK (HTTP $PUT_CODE)"
 done
 
@@ -1718,7 +1591,7 @@ if echo "$AGENT_TEXT" | grep -qF "[hermes-agent error 401]"; then
   fail "A2A — REGRESSION: hermes gateway auth broken (API_SERVER_KEY not in runtime env). See template-hermes#12. Raw: $AGENT_TEXT"
 fi
 if echo "$AGENT_TEXT" | grep -qF "hermes-agent unreachable"; then
-  fail "A2A — REGRESSION: hermes gateway process down. Check /var/log/hermes-gateway.log on the workspace EC2. Raw: $AGENT_TEXT"
+  fail "A2A — REGRESSION: hermes gateway process down. Check /var/log/hermes-gateway.log in the workspace runtime. Raw: $AGENT_TEXT"
 fi
 if echo "$AGENT_TEXT" | grep -qF "model_not_found"; then
   fail "A2A — REGRESSION: model slug passed through with provider prefix. See template-hermes#13. Raw: $AGENT_TEXT"
@@ -2348,7 +2221,7 @@ fi
 # coverage. Each transition is asserted against the live DB-backed status the
 # GET /workspaces/:id endpoint returns, so a regression in the Pause/Resume/
 # Hibernate handlers (workspace_restart.go) or their CP stop/re-provision
-# wiring fails the gate instead of silently leaking an EC2 / wedging a tenant.
+# wiring fails the gate instead of leaving runtime resources or wedging a tenant.
 #
 # Contract (workspace_restart.go):
 #   POST /pause     online → 'paused'  (container stopped, url cleared)  {"status":"paused"}
@@ -2436,8 +2309,8 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   RESUME_STATUS=$(echo "$RESUME_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
   [ "$RESUME_STATUS" = "provisioning" ] || fail "Resume: POST /resume returned status='$RESUME_STATUS' (expected 'provisioning'). Body: ${RESUME_RESP:0:200}"
   # Resume re-provisions from the preserved config volume; reuse the same
-  # online+routable readiness boundary the initial boot used (no fresh EC2
-  # cold-start, but CP re-provision + heartbeat recovery can still take minutes).
+  # online+routable readiness boundary the initial boot used; CP re-provision +
+  # heartbeat recovery can still take minutes.
   wait_workspaces_online_routable "    Waiting for the leaf workspace to return online after resume (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)..." "$LIFECYCLE_WS"
   ok "    resume → provisioning → online (DB-verified)"
 

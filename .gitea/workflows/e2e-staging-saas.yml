@@ -1,6 +1,6 @@
-# RE-ENABLED 2026-07-03: the live staging lanes run on MOLECULES-SERVER
-# (local-docker, provider='local'). Some harnesses retain an optional
-# E2E_EC2_ENABLED leak-check knob, but no job is dormant behind that variable.
+# The live staging lanes run on MOLECULES-SERVER (local-docker,
+# provider='local'). Their workflows do not receive retired cloud-provider
+# credentials or enablement toggles.
 name: E2E Staging SaaS (full lifecycle)
 
 # Ported from .github/workflows/e2e-staging-saas.yml on 2026-05-11 per RFC
@@ -43,16 +43,10 @@ name: E2E Staging SaaS (full lifecycle)
 # gate.
 
 on:
-  # RE-ENABLED 2026-07-03 on MOLECULES-SERVER: push/pull_request restored. The
-  # full-journey canvas gate (`E2E Staging Concierge Creates Workspace`) no longer
-  # provisions EC2 — staging tenants run on the molecules-server (local-docker,
-  # provider='local') backend the CP now defaults to (no-AWS directive), so that
-  # job needs no AWS creds and no EC2 leak-check. `E2E Staging Plugin Install
-  # Lifecycle` was likewise moved onto the molecules-server backend (core#182:
-  # plugin install now rides docker CopyToContainer into the mol-ws-* container,
-  # not AWS EIC) and runs on push/dispatch. Platform Boot, concierge user_tasks,
-  # workspace requests, and concierge/platform-agent are also active on
-  # molecules-server; their former E2E_EC2_ENABLED job guards were removed.
+  # Active live lanes provision through the control plane's local-docker
+  # backend on MOLECULES-SERVER. Teardown proof comes from the exact completed
+  # CP purge receipt plus exact org absence; these generic runners do not claim
+  # direct provider enumeration.
   # The schedule/cron trigger was DELETED (no-nightly-e2e rule) — not commented.
   # Trunk-based (Phase 3 of internal#81): main is the only branch.
   #
@@ -118,24 +112,19 @@ jobs:
   # Full-lifecycle lane: live on protected push/dispatch; credential-free
   # self-check on pull_request. pr-validate is only a workflow-shape check and
   # is not a substitute for live staging proof.
-  # bp-exempt: full-lifecycle lane on molecules-server (local-docker); EC2 is a one-line knob (vars.E2E_EC2_ENABLED). Not a required gate.
+  # bp-exempt: full-lifecycle lane on molecules-server (local-docker). Not a required gate.
   e2e-staging-saas:
     name: E2E Staging SaaS
     runs-on: ubuntu-latest
-    # UN-PINNED from EC2 onto MOLECULES-SERVER (local-docker, provider='local'):
-    # the job-level `if: vars.E2E_EC2_ENABLED == '1' && (...)` guard is REMOVED so
-    # this provider-agnostic scenario (test_staging_full_saas.sh drives the CP admin
-    # API; the backend is the CP's provider config) runs on push against the working
-    # local-docker backend instead of being EC2-gated-skipped. On pull_request it
-    # self-checks green (E2E_REQUIRE_LIVE=0 + per-step PR gating below). EC2 remains
-    # a one-line knob via the E2E_AWS_LEAK_CHECK provider knob in the env block.
+    # Live on push/dispatch against local-docker; on pull_request the harness
+    # performs its credential-free self-check.
     # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
     # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     # Raised 45→75: step 10b now exercises pause→resume→online +
-    # hibernate→wake→online, each of which RE-PROVISIONS the parent (CP
-    # re-provision + heartbeat recovery, not a fresh EC2 cold start, but still
-    # minutes). The base provision→online→A2A matrix fits in ~35 min; the two
+    # hibernate→wake→online, each of which re-provisions the parent through the
+    # CP and waits for heartbeat recovery. The base provision→online→A2A matrix
+    # fits in ~35 min; the two
     # extra lifecycle reprovisions need headroom under WORKSPACE_ONLINE_TIMEOUT.
     timeout-minutes: 75
     permissions:
@@ -156,17 +145,10 @@ jobs:
       # Gitea Actions secret is left in place until a green run validates this
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates MOLECULE_ADMIN_TOKEN is non-empty.
-      # AWS creds stay wired (empty/unused when the secret is unset + leak=off) so
-      # enabling EC2 is one line — set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets).
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-east-2
-      # provider knob: default molecules-server (local-docker, leak-check no-op);
-      # set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets, already wired below) to run
-      # the SAME scenario against an EC2-backed staging CP with the leak-check
-      # enforced — one-line enable.
-      E2E_AWS_LEAK_CHECK: ${{ vars.E2E_EC2_ENABLED == '1' && 'required' || 'off' }}
-      E2E_AWS_TERMINATE_LEAKS: '1'
+      # Current staging is the repository-owned molecules-server/local-Docker
+      # backend. The harness rejects any other value before sending its admin
+      # bearer; provider cleanup proof comes from the synchronous CP purge receipt.
+      E2E_INFRA_BACKEND: local-docker
       # MiniMax is the PRIMARY LLM auth path post-2026-05-04. Switched
       # from hermes+OpenAI default after #2578 (the staging OpenAI key
       # account went over quota and stayed dead for 36+ hours, taking
@@ -292,8 +274,7 @@ jobs:
           # PR-mode: the KMS creds-fetch above is push-only, so on pull_request the
           # token is EXPECTED empty and green — the harness runs its bash -n
           # self-check and exit-0s. A missing token on push/dispatch stays
-          # a hard error. Leak-check is a no-op on molecules-server (leak=off), so
-          # AWS creds are only required when E2E_EC2_ENABLED=1 pins leak=required.
+          # a hard error.
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
             if [ "${{ github.event_name }}" = "pull_request" ]; then
               echo "PR-mode (E2E_REQUIRE_LIVE=0): no MOLECULE_ADMIN_TOKEN — harness will self-check (bash -n) and exit 0 green ✓"
@@ -301,14 +282,6 @@ jobs:
             fi
             echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
-          fi
-          if [ "${E2E_AWS_LEAK_CHECK}" = "required" ]; then
-            for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
-              if [ -z "${!var:-}" ]; then
-                echo "::error::$var not set — EC2 leak verification (E2E_AWS_LEAK_CHECK=required) cannot run"
-                exit 2
-              fi
-            done
           fi
           echo "Admin token present ✓"
 
@@ -391,15 +364,8 @@ jobs:
       # exemplar e2e-staging-concierge-creates-workspace Run step.
       - name: Run full-lifecycle E2E
         id: e2e
-        # No step-level `if:` — this runs LIVE on push/dispatch against
-        # the molecules-server (local-docker) backend. The #3965 EC2-gate that
-        # skipped this step off molecules-server is REVERTED: the harness now
-        # EC2-gates only the EC2/EIC-infra sub-steps (7b terminal-diagnose, 7c
-        # EIC file-write) internally, so the provider-agnostic journey
-        # (provision → online → routable → A2A → tool-use) runs live again. On
-        # pull_request the harness still self-checks (E2E_REQUIRE_LIVE=0 +
-        # bash -n) → green. Mirrors the exemplar concierge-creates-workspace
-        # Run step.
+        # Live on push/dispatch against molecules-server (local-docker). On
+        # pull_request the harness self-checks (E2E_REQUIRE_LIVE=0 + bash -n).
         run: bash tests/e2e/test_staging_full_saas.sh
 
       # Belt-and-braces teardown: the test script itself installs a trap
@@ -407,7 +373,8 @@ jobs:
       # someone pushes a new commit and workflow concurrency is set to
       # cancel), the trap may not fire. This `always()` step runs even on
       # cancellation and attempts the delete a second time. The admin
-      # DELETE endpoint is idempotent so double-invoking is safe.
+      # helper makes this idempotent by treating an authoritative exact-tenant
+      # 404 as already absent before it attempts another DELETE.
       - name: Teardown safety net (runs on cancel/failure)
         # PR-mode: never curl live staging from a PR (no token; public repo).
         if: always() && github.event_name != 'pull_request'
@@ -416,60 +383,83 @@ jobs:
           # "Fetch staging secrets from Infisical KMS" job step above.
           ADMIN_TOKEN: ${{ env.MOLECULE_ADMIN_TOKEN }}
         run: |
-          # Best-effort: find any e2e-YYYYMMDD-* orgs matching this run and
-          # nuke them. Catches the case where the script died before
-          # exporting its slug.
+          # Retry only the exact slug/ID pair published after a successful org
+          # create. Before publication this step exits visibly
+          # inconclusive without roster discovery or tenant DELETE.
           set +e
-          orgs=$(curl -sS "$MOLECULE_CP_URL/cp/admin/orgs" \
-            -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-            | python3 -c "
-          import json, sys, os, datetime
-          run_id = os.environ.get('GITHUB_RUN_ID', '')
+          source tests/e2e/lib/cp_purge_receipt.sh
+          if ! e2e_cp_require_local_backend \
+            || ! e2e_cp_require_staging_origin "$MOLECULE_CP_URL"; then
+            echo "::warning::saas teardown safety net rejected its staging target/backend before bearer use"
+            exit 0
+          fi
+          if [ -z "${GITHUB_RUN_ID:-}" ]; then
+            echo "::warning::saas teardown discovery inconclusive: GITHUB_RUN_ID is empty; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          created_slug="${E2E_CREATED_SLUG:-}"
+          created_org_id="${E2E_CREATED_ORG_ID:-}"
+          if [ -z "$created_slug" ] || ! e2e_cp_validate_org_id "$created_org_id"; then
+            echo "::warning::saas teardown discovery inconclusive: verified creation identity is unavailable; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          case "$created_slug" in
+            e2e-*|rt-e2e-*) ;;
+            *) echo "::warning::saas teardown discovery inconclusive: verified creation slug is malformed"; exit 0 ;;
+          esac
+          case "$created_slug" in
+            e2e-|rt-e2e-|*[!a-z0-9-]*) echo "::warning::saas teardown discovery inconclusive: verified creation slug is malformed"; exit 0 ;;
+          esac
+          roster_rc=0
+          roster_json=$(e2e_cp_fetch_org_roster_json \
+            "$MOLECULE_CP_URL" "$ADMIN_TOKEN") || roster_rc=$?
+          if [ "$roster_rc" != "0" ]; then
+            echo "::warning::saas teardown discovery inconclusive (roster rc=$roster_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          filter_rc=0
+          orgs=$(printf '%s' "$roster_json" | python3 -c "
+          import json, sys, os
+          run_id = os.environ['GITHUB_RUN_ID']
+          expected_slug = os.environ['E2E_CREATED_SLUG']
+          expected_org_id = os.environ['E2E_CREATED_ORG_ID']
           d = json.load(sys.stdin)
-          # ONLY sweep slugs from *this* CI run. Previously the filter was
-          # f'e2e-{today}-' which stomped on parallel CI runs AND any manual
-          # E2E probes a dev was running against staging (incident 2026-04-21
-          # 15:02Z: this workflow's safety net deleted an unrelated manual
-          # run's tenant 1s after it hit 'running').
-          # Sweep both today AND yesterday's UTC dates so a run that crosses
-          # midnight still matches its own slug — see the 2026-04-26→27
-          # canvas-safety-net incident for the same bug class.
-          today = datetime.date.today()
-          yesterday = today - datetime.timedelta(days=1)
-          dates = (today.strftime('%Y%m%d'), yesterday.strftime('%Y%m%d'))
-          if run_id:
-              prefixes = tuple(f'e2e-{d}-{run_id}-' for d in dates)
-          else:
-              prefixes = tuple(f'e2e-{d}-' for d in dates)
-          candidates = [o['slug'] for o in d.get('orgs', [])
-                        if any(o.get('slug','').startswith(p) for p in prefixes)
+          # ONLY sweep the exact identity this run's successful create step
+          # published. Slug helpers truncate run-id context to fit the CP cap,
+          # so reconstructing a full run-id prefix would miss valid tenants.
+          if not run_id:
+              raise ValueError('empty run id')
+          candidates = [o for o in d.get('orgs', [])
+                        if o.get('slug') == expected_slug
                         and o.get('instance_status') not in ('purged',)]
-          print('\n'.join(candidates))
-          " 2>/dev/null)
-          # Per-slug verified DELETE (was `>/dev/null || true` — see
-          # molecule-controlplane#420). Surface non-2xx as a workflow
-          # warning naming the leaked slug; don't exit 1 (sweeper is
-          # the safety net within ~45 min).
+          for row in candidates:
+              if row.get('id') != expected_org_id:
+                  raise ValueError('creation identity mismatch')
+          print('\n'.join(o['slug'] for o in candidates))
+          " 2>/dev/null) || filter_rc=$?
+          if [ "$filter_rc" != "0" ]; then
+            echo "::warning::saas teardown discovery inconclusive (run-scope filter rc=$filter_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          # Per-slug DELETE must prove the exact completed purge receipt/audit
+          # and exact org absence. Keep this belt-and-braces step advisory;
+          # sweep-stale-e2e-orgs is the final retry net.
           leaks=()
-          for slug in $orgs; do
+          while IFS= read -r slug; do
+            [ -n "$slug" ] || continue
             echo "Safety-net teardown: $slug"
-            # Tempfile-routed -w + set +e/-e prevents curl-exit-code
-            # pollution of the captured status (lint-curl-status-capture.yml).
-            set +e
-            curl -sS -o /tmp/saas-cleanup.out -w "%{http_code}" \
-              -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
-              -H "Authorization: Bearer $ADMIN_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"confirm\":\"$slug\"}" >/tmp/saas-cleanup.code
-            set -e
-            code=$(cat /tmp/saas-cleanup.code 2>/dev/null || echo "000")
-            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
-              echo "[teardown] deleted $slug (HTTP $code)"
+            purge_rc=0
+            e2e_cp_delete_and_verify_purge \
+              "$MOLECULE_CP_URL" "$ADMIN_TOKEN" "$slug" "$created_org_id" || purge_rc=$?
+            if [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "purged" ]; then
+              echo "[teardown] verified exact CP purge receipt/audit and exact-tenant HTTP 404 for $slug"
+            elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
+              echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::saas teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within ~45 min. Body: $(head -c 300 /tmp/saas-cleanup.out 2>/dev/null)"
+              echo "::warning::saas teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
               leaks+=("$slug")
             fi
-          done
+          done <<< "$orgs"
           if [ ${#leaks[@]} -gt 0 ]; then
             echo "::warning::saas teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
           fi
@@ -641,16 +631,12 @@ jobs:
   # .gitea/required-contexts.txt, so the merge queue does not require its
   # presence. A posted red can still block under branch protection. It does not
   # gate production; promotion requires reliable current-head evidence.
-  # bp-exempt: platform-managed boot lane on molecules-server (local-docker); EC2 is a one-line knob (vars.E2E_EC2_ENABLED). Not a required gate.
+  # bp-exempt: platform-managed boot lane on molecules-server (local-docker). Not a required gate.
   e2e-staging-platform-boot:
     name: E2E Staging Platform Boot
     runs-on: ubuntu-latest
-    # UN-PINNED from EC2 onto MOLECULES-SERVER (local-docker, provider='local'):
-    # the job-level `if: vars.E2E_EC2_ENABLED == '1'` guard is REMOVED so this
-    # provider-agnostic platform-managed-boot scenario runs on push against the
-    # working local-docker backend instead of being EC2-gated-skipped. On
-    # pull_request it self-checks green (E2E_REQUIRE_LIVE=0 + per-step PR gating).
-    # EC2 remains a one-line knob via the E2E_AWS_LEAK_CHECK provider knob below.
+    # Live on push/dispatch against local-docker; on pull_request the harness
+    # performs its credential-free self-check.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -665,17 +651,7 @@ jobs:
       # green run validates this path (validate-before-delete). On untrusted-fork
       # PRs the KMS fetch is skipped and MOLECULE_ADMIN_TOKEN stays empty; the
       # PR-mode (E2E_REQUIRE_LIVE=0) Verify-admin-token gate exits 0 as before.
-      # AWS creds stay wired (empty/unused when the secret is unset + leak=off) so
-      # enabling EC2 is one line — set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets).
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-east-2
-      # provider knob: default molecules-server (local-docker, leak-check no-op);
-      # set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets, already wired below) to run
-      # the SAME scenario against an EC2-backed staging CP with the leak-check
-      # enforced — one-line enable.
-      E2E_AWS_LEAK_CHECK: ${{ vars.E2E_EC2_ENABLED == '1' && 'required' || 'off' }}
-      E2E_AWS_TERMINATE_LEAKS: '1'
+      E2E_INFRA_BACKEND: local-docker
       # The regression combo: claude-code + platform-managed + moonshot/kimi-k2.6.
       # NO E2E_*_API_KEY is set — platform-managed billing is owned by Molecule via
       # the CP LLM proxy. The harness's E2E_LLM_PATH=platform branch sends empty
@@ -831,7 +807,7 @@ jobs:
           # and PRs carry no staging creds. Don't hard-fail here — the harness
           # detects the missing-creds case, runs a bash -n self-check, and
           # exit 0s. On push/dispatch (E2E_REQUIRE_LIVE=1) the creds MUST
-          # be present and a missing token/AWS-cred is a hard error.
+          # be present and a missing token is a hard error.
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
             if [ "${E2E_REQUIRE_LIVE}" = "0" ]; then
               echo "PR-mode: no MOLECULE_ADMIN_TOKEN (E2E_REQUIRE_LIVE=0) — harness will self-check and skip the live boot ✓"
@@ -839,16 +815,6 @@ jobs:
             fi
             echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
-          fi
-          # Leak-check is a no-op on molecules-server (leak=off), so AWS creds are
-          # only required when E2E_EC2_ENABLED=1 pins E2E_AWS_LEAK_CHECK=required.
-          if [ "${E2E_AWS_LEAK_CHECK}" = "required" ]; then
-            for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
-              if [ -z "${!var:-}" ]; then
-                echo "::error::$var not set — EC2 leak verification (E2E_AWS_LEAK_CHECK=required) cannot run"
-                exit 2
-              fi
-            done
           fi
           echo "Admin token present ✓"
 
@@ -881,11 +847,8 @@ jobs:
       # it runs the real platform-managed boot on molecules-server.
       - name: Run platform-managed boot E2E (online + completion)
         id: e2e
-        # No step-level `if:` — see the e2e-staging-saas Run step. This runs LIVE
-        # on push/dispatch against molecules-server. The #3965 EC2-gate
-        # is REVERTED; the harness now EC2-gates only the EC2/EIC-infra sub-steps
-        # (7b/7c) internally, so the platform-managed-boot journey runs live on
-        # molecules-server again. On pull_request the harness self-checks green.
+        # Live on push/dispatch against molecules-server (local-docker). On
+        # pull_request the harness self-checks green.
         run: bash tests/e2e/test_staging_full_saas.sh
 
       - name: Teardown safety net (runs on cancel/failure)
@@ -897,43 +860,73 @@ jobs:
           ADMIN_TOKEN: ${{ env.MOLECULE_ADMIN_TOKEN }}
         run: |
           set +e
-          orgs=$(curl -sS "$MOLECULE_CP_URL/cp/admin/orgs" \
-            -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-            | python3 -c "
-          import json, sys, os, datetime
-          run_id = os.environ.get('GITHUB_RUN_ID', '')
+          source tests/e2e/lib/cp_purge_receipt.sh
+          if ! e2e_cp_require_local_backend \
+            || ! e2e_cp_require_staging_origin "$MOLECULE_CP_URL"; then
+            echo "::warning::platform-boot teardown safety net rejected its staging target/backend before bearer use"
+            exit 0
+          fi
+          if [ -z "${GITHUB_RUN_ID:-}" ]; then
+            echo "::warning::platform-boot teardown discovery inconclusive: GITHUB_RUN_ID is empty; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          created_slug="${E2E_CREATED_SLUG:-}"
+          created_org_id="${E2E_CREATED_ORG_ID:-}"
+          if [ -z "$created_slug" ] || ! e2e_cp_validate_org_id "$created_org_id"; then
+            echo "::warning::platform-boot teardown discovery inconclusive: verified creation identity is unavailable; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          case "$created_slug" in
+            e2e-*|rt-e2e-*) ;;
+            *) echo "::warning::platform-boot teardown discovery inconclusive: verified creation slug is malformed"; exit 0 ;;
+          esac
+          case "$created_slug" in
+            e2e-|rt-e2e-|*[!a-z0-9-]*) echo "::warning::platform-boot teardown discovery inconclusive: verified creation slug is malformed"; exit 0 ;;
+          esac
+          roster_rc=0
+          roster_json=$(e2e_cp_fetch_org_roster_json \
+            "$MOLECULE_CP_URL" "$ADMIN_TOKEN") || roster_rc=$?
+          if [ "$roster_rc" != "0" ]; then
+            echo "::warning::platform-boot teardown discovery inconclusive (roster rc=$roster_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          filter_rc=0
+          orgs=$(printf '%s' "$roster_json" | python3 -c "
+          import json, sys, os
+          run_id = os.environ['GITHUB_RUN_ID']
+          expected_slug = os.environ['E2E_CREATED_SLUG']
+          expected_org_id = os.environ['E2E_CREATED_ORG_ID']
           d = json.load(sys.stdin)
-          today = datetime.date.today()
-          yesterday = today - datetime.timedelta(days=1)
-          dates = (today.strftime('%Y%m%d'), yesterday.strftime('%Y%m%d'))
-          # smoke mode slugs are e2e-smoke-YYYYMMDD-platform-<run_id>-...
-          if run_id:
-              prefixes = tuple(f'e2e-smoke-{d}-platform-{run_id}-' for d in dates)
-          else:
-              prefixes = tuple(f'e2e-smoke-{d}-platform-' for d in dates)
-          candidates = [o['slug'] for o in d.get('orgs', [])
-                        if any(o.get('slug','').startswith(p) for p in prefixes)
+          if not run_id:
+              raise ValueError('empty run id')
+          candidates = [o for o in d.get('orgs', [])
+                        if o.get('slug') == expected_slug
                         and o.get('instance_status') not in ('purged',)]
-          print('\n'.join(candidates))
-          " 2>/dev/null)
+          for row in candidates:
+              if row.get('id') != expected_org_id:
+                  raise ValueError('creation identity mismatch')
+          print('\n'.join(o['slug'] for o in candidates))
+          " 2>/dev/null) || filter_rc=$?
+          if [ "$filter_rc" != "0" ]; then
+            echo "::warning::platform-boot teardown discovery inconclusive (run-scope filter rc=$filter_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
           leaks=()
-          for slug in $orgs; do
+          while IFS= read -r slug; do
+            [ -n "$slug" ] || continue
             echo "Safety-net teardown: $slug"
-            set +e
-            curl -sS -o /tmp/plat-cleanup.out -w "%{http_code}" \
-              -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
-              -H "Authorization: Bearer $ADMIN_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"confirm\":\"$slug\"}" >/tmp/plat-cleanup.code
-            set -e
-            code=$(cat /tmp/plat-cleanup.code 2>/dev/null || echo "000")
-            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
-              echo "[teardown] deleted $slug (HTTP $code)"
+            purge_rc=0
+            e2e_cp_delete_and_verify_purge \
+              "$MOLECULE_CP_URL" "$ADMIN_TOKEN" "$slug" "$created_org_id" || purge_rc=$?
+            if [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "purged" ]; then
+              echo "[teardown] verified exact CP purge receipt/audit and exact-tenant HTTP 404 for $slug"
+            elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
+              echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::platform-boot teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within ~45 min. Body: $(head -c 300 /tmp/plat-cleanup.out 2>/dev/null)"
+              echo "::warning::platform-boot teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
               leaks+=("$slug")
             fi
-          done
+          done <<< "$orgs"
           if [ ${#leaks[@]} -gt 0 ]; then
             echo "::warning::platform-boot teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
           fi
@@ -945,12 +938,12 @@ jobs:
   # tenant: the full agent→user "ask" contract over BOTH surfaces (REST +
   # the MCP tools/call envelope a canvas concierge agent uses) PLUS the
   # cross-workspace authz scoping (ws-B can't touch ws-A's task). Reuses the
-  # same CP-admin org-provision/teardown scaffolding + _lib.sh + AWS-leak-check
-  # lib as the full-SaaS harness (the script SOURCEs them — no duplication).
+  # same CP-admin org-provision/teardown scaffolding + exact purge-receipt
+  # verifier as the full-SaaS harness (the script sources it — no duplication).
   #
   # GATING (no continue-on-error): user_tasks is a pure DB/handler primitive
   # with NO LLM container dependency (workspaces are created 'external' — row
-  # only, no EC2), so this is fast (~provision + TLS, no 10-min cold boot) and
+  # only, no worker container), so this is fast (~provision + TLS) and
   # NOT subject to the cp#245 boot-timeout flake the full-SaaS job carries. It
   # therefore has no honest reason to be masked. Runs on push-to-main /
   # workflow_dispatch only (needs live staging infra — never on PR, where
@@ -959,14 +952,8 @@ jobs:
   e2e-staging-concierge-user-tasks:
     name: E2E Staging Concierge user_tasks
     runs-on: ubuntu-latest
-    # UN-PINNED from EC2 onto MOLECULES-SERVER (local-docker, provider='local'):
-    # the job-level `if: vars.E2E_EC2_ENABLED == '1' && (...)` guard is REMOVED so
-    # this provider-agnostic scenario (test_staging_concierge_e2e.sh drives the CP
-    # admin API) runs on push against the working local-docker backend instead of
-    # being EC2-gated-skipped. NOTE: this harness has no PR-mode self-check, so on
-    # pull_request the live Run step is gated off and a bash -n self-check step
-    # (below) keeps the job terminal-green. EC2 stays a one-line knob via the
-    # E2E_AWS_LEAK_CHECK provider knob below.
+    # Live on push/dispatch against local-docker. On pull_request the live Run
+    # step is gated off and a bash -n self-check keeps the job terminal-green.
     timeout-minutes: 30
     permissions:
       contents: read
@@ -979,17 +966,7 @@ jobs:
       # Gitea Actions secret is left in place until a green run validates this
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates MOLECULE_ADMIN_TOKEN is non-empty.
-      # AWS creds stay wired (empty/unused when the secret is unset + leak=off) so
-      # enabling EC2 is one line — set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets).
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-east-2
-      # provider knob: default molecules-server (local-docker, leak-check no-op);
-      # set repo var E2E_EC2_ENABLED=1 (+ AWS_* secrets, already wired below) to run
-      # the SAME scenario against an EC2-backed staging CP with the leak-check
-      # enforced — one-line enable.
-      E2E_AWS_LEAK_CHECK: ${{ vars.E2E_EC2_ENABLED == '1' && 'required' || 'off' }}
-      E2E_AWS_TERMINATE_LEAKS: '1'
+      E2E_INFRA_BACKEND: local-docker
       E2E_RUN_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
       E2E_KEEP_ORG: ${{ github.event.inputs.keep_org && '1' || '0' }}
       # PR-aware fail-closed guard (mirrors exemplar). On pull_request the live Run
@@ -1038,7 +1015,7 @@ jobs:
           echo "MOLECULE_ADMIN_TOKEN=$MOLECULE_ADMIN_TOKEN" >> "$GITHUB_ENV"
           echo "MOLECULE_ADMIN_TOKEN loaded from Infisical staging SSOT (len=${#MOLECULE_ADMIN_TOKEN})"
 
-      - name: Verify admin token + AWS creds present
+      - name: Verify admin token present
         run: |
           # PR-mode: the KMS creds-fetch above is push-only, so on pull_request the
           # token is EXPECTED empty and green — the live Run step is gated off and
@@ -1051,16 +1028,6 @@ jobs:
             fi
             echo "::error::MOLECULE_ADMIN_TOKEN not loaded from Infisical staging /shared/controlplane-admin"
             exit 2
-          fi
-          # Leak-check is a no-op on molecules-server (leak=off), so AWS creds are
-          # only required when E2E_EC2_ENABLED=1 pins E2E_AWS_LEAK_CHECK=required.
-          if [ "${E2E_AWS_LEAK_CHECK}" = "required" ]; then
-            for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
-              if [ -z "${!var:-}" ]; then
-                echo "::error::$var not set — EC2 leak verification (E2E_AWS_LEAK_CHECK=required) cannot run"
-                exit 2
-              fi
-            done
           fi
           echo "Admin token present ✓"
 
@@ -1101,46 +1068,77 @@ jobs:
           # "Fetch staging CP admin token from Infisical KMS" job step above.
           ADMIN_TOKEN: ${{ env.MOLECULE_ADMIN_TOKEN }}
         run: |
-          # Sweep any e2e-cncrg-YYYYMMDD-<run_id>-* org this run created if the
-          # script died before its EXIT trap fired. Run-id scoped so it never
-          # stomps a concurrent run's fresh tenant (see the saas job's note).
+          # Retry only the exact slug/ID pair published after a successful org
+          # create. This never performs a prefix sweep, and before publication
+          # it exits visibly inconclusive without discovery or DELETE.
           set +e
-          orgs=$(curl -sS "$MOLECULE_CP_URL/cp/admin/orgs" \
-            -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-            | python3 -c "
-          import json, sys, os, datetime
-          run_id = os.environ.get('GITHUB_RUN_ID', '')
+          source tests/e2e/lib/cp_purge_receipt.sh
+          if ! e2e_cp_require_local_backend \
+            || ! e2e_cp_require_staging_origin "$MOLECULE_CP_URL"; then
+            echo "::warning::concierge teardown safety net rejected its staging target/backend before bearer use"
+            exit 0
+          fi
+          if [ -z "${GITHUB_RUN_ID:-}" ]; then
+            echo "::warning::concierge teardown discovery inconclusive: GITHUB_RUN_ID is empty; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          created_slug="${E2E_CREATED_SLUG:-}"
+          created_org_id="${E2E_CREATED_ORG_ID:-}"
+          if [ -z "$created_slug" ] || ! e2e_cp_validate_org_id "$created_org_id"; then
+            echo "::warning::concierge teardown discovery inconclusive: verified creation identity is unavailable; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          case "$created_slug" in
+            e2e-*|rt-e2e-*) ;;
+            *) echo "::warning::concierge teardown discovery inconclusive: verified creation slug is malformed"; exit 0 ;;
+          esac
+          case "$created_slug" in
+            e2e-|rt-e2e-|*[!a-z0-9-]*) echo "::warning::concierge teardown discovery inconclusive: verified creation slug is malformed"; exit 0 ;;
+          esac
+          roster_rc=0
+          roster_json=$(e2e_cp_fetch_org_roster_json \
+            "$MOLECULE_CP_URL" "$ADMIN_TOKEN") || roster_rc=$?
+          if [ "$roster_rc" != "0" ]; then
+            echo "::warning::concierge teardown discovery inconclusive (roster rc=$roster_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          filter_rc=0
+          orgs=$(printf '%s' "$roster_json" | python3 -c "
+          import json, sys, os
+          run_id = os.environ['GITHUB_RUN_ID']
+          expected_slug = os.environ['E2E_CREATED_SLUG']
+          expected_org_id = os.environ['E2E_CREATED_ORG_ID']
           d = json.load(sys.stdin)
-          today = datetime.date.today()
-          yesterday = today - datetime.timedelta(days=1)
-          dates = (today.strftime('%Y%m%d'), yesterday.strftime('%Y%m%d'))
-          if run_id:
-              prefixes = tuple(f'e2e-cncrg-{d}-{run_id}-' for d in dates)
-          else:
-              prefixes = tuple(f'e2e-cncrg-{d}-' for d in dates)
-          candidates = [o['slug'] for o in d.get('orgs', [])
-                        if any(o.get('slug','').startswith(p) for p in prefixes)
+          if not run_id:
+              raise ValueError('empty run id')
+          candidates = [o for o in d.get('orgs', [])
+                        if o.get('slug') == expected_slug
                         and o.get('instance_status') not in ('purged',)]
-          print('\n'.join(candidates))
-          " 2>/dev/null)
+          for row in candidates:
+              if row.get('id') != expected_org_id:
+                  raise ValueError('creation identity mismatch')
+          print('\n'.join(o['slug'] for o in candidates))
+          " 2>/dev/null) || filter_rc=$?
+          if [ "$filter_rc" != "0" ]; then
+            echo "::warning::concierge teardown discovery inconclusive (run-scope filter rc=$filter_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
           leaks=()
-          for slug in $orgs; do
+          while IFS= read -r slug; do
+            [ -n "$slug" ] || continue
             echo "Safety-net teardown: $slug"
-            set +e
-            curl -sS -o /tmp/cncrg-cleanup.out -w "%{http_code}" \
-              -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
-              -H "Authorization: Bearer $ADMIN_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"confirm\":\"$slug\"}" >/tmp/cncrg-cleanup.code
-            set -e
-            code=$(cat /tmp/cncrg-cleanup.code 2>/dev/null || echo "000")
-            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
-              echo "[teardown] deleted $slug (HTTP $code)"
+            purge_rc=0
+            e2e_cp_delete_and_verify_purge \
+              "$MOLECULE_CP_URL" "$ADMIN_TOKEN" "$slug" "$created_org_id" || purge_rc=$?
+            if [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "purged" ]; then
+              echo "[teardown] verified exact CP purge receipt/audit and exact-tenant HTTP 404 for $slug"
+            elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
+              echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::concierge teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within ~45 min. Body: $(head -c 300 /tmp/cncrg-cleanup.out 2>/dev/null)"
+              echo "::warning::concierge teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
               leaks+=("$slug")
             fi
-          done
+          done <<< "$orgs"
           if [ ${#leaks[@]} -gt 0 ]; then
             echo "::warning::concierge teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
           fi
@@ -1158,12 +1156,8 @@ jobs:
   e2e-staging-workspace-requests:
     name: E2E Staging Workspace Requests (core#2606)
     runs-on: ubuntu-latest
-    # UN-PINNED from EC2 onto MOLECULES-SERVER (local-docker, provider='local'):
-    # the job-level `if: vars.E2E_EC2_ENABLED == '1' && (...)` guard is REMOVED so
-    # this provider-agnostic Go staginge2e (drives the CP admin API) runs on push
-    # against the working local-docker backend instead of being EC2-gated-skipped.
-    # This job has NO AWS creds and no leak-check (nothing to un-pin there). On
-    # pull_request the KMS fetch is skipped → CP_ADMIN_API_TOKEN empty →
+    # Live on push/dispatch against local-docker. On pull_request the KMS fetch
+    # is skipped → CP_ADMIN_API_TOKEN empty →
     # requireStagingEnv t.Skips LOUD (go test exit 0, green) — a compile+skip that
     # keeps the job terminal-green; the live run happens on push/dispatch.
     timeout-minutes: 35
@@ -1314,13 +1308,10 @@ jobs:
       # path (validate-before-delete). On untrusted-fork PRs the KMS fetch is
       # skipped and MOLECULE_ADMIN_TOKEN stays empty (verify exits 2, same as
       # today); same-repo PRs and push/dispatch source it from Infisical.
-      # MOLECULES-SERVER (local-docker, provider='local'): the CP provisions the
-      # staging tenant as a local-docker container on the molecules-server host, NOT
-      # an EC2 VM — so this gate needs NO AWS creds and there is NO EC2 to leak.
-      # E2E_AWS_LEAK_CHECK=off makes tests/e2e/lib/aws_leak_check.sh a clean no-op
-      # (the org-level zero-leftover teardown assertion still runs). Re-add the AWS
-      # env + set E2E_AWS_LEAK_CHECK=required only if a cloud EC2 backend returns.
-      E2E_AWS_LEAK_CHECK: 'off'
+      # Current staging tenant provisioning is local Docker. Teardown validates
+      # the exact synchronous CP purge receipt/audit plus exact-org absence; this
+      # generic runner does not claim direct host-resource enumeration.
+      E2E_INFRA_BACKEND: local-docker
       # The concierge is platform_managed on SaaS (the CP-exported LLM proxy
       # supplies its model — no BYOK key needed for the concierge itself). The
       # MiniMax key is wired anyway so a staging image that boots the concierge
@@ -1415,9 +1406,8 @@ jobs:
       - name: Verify admin token present
         run: |
           # MOLECULES-SERVER: only the CP admin bearer is required (drives provision
-          # + tenant-token + teardown). No AWS creds — the tenant is a local-docker
-          # container on the molecules-server host, not an EC2 VM, so there is no
-          # EC2 leak verification to run.
+          # + tenant-token + teardown). The tenant is a local-Docker container on
+          # the molecules-server host; the harness verifies the CP purge receipt.
           if [ -z "$MOLECULE_ADMIN_TOKEN" ]; then
             # SAFE-ENABLE PR-mode: on pull_request the KMS fetch is intentionally
             # skipped (no live creds on PRs), so an empty token here is EXPECTED
@@ -1430,7 +1420,7 @@ jobs:
             echo "::error::MOLECULE_ADMIN_TOKEN empty (Infisical staging CP_ADMIN_API_TOKEN @ /shared/controlplane-admin)"
             exit 2
           fi
-          echo "Admin token present ✓ (molecules-server: no AWS creds needed)"
+          echo "Admin token present ✓ (molecules-server/local-Docker)"
 
       - name: CP staging health preflight
         # SAFE-ENABLE: no live staging call on PRs (they self-check only). Runs
@@ -1463,46 +1453,77 @@ jobs:
           # "Fetch staging secrets from Infisical KMS" job step above.
           ADMIN_TOKEN: ${{ env.MOLECULE_ADMIN_TOKEN }}
         run: |
-          # Sweep any e2e-cncrg-mk-YYYYMMDD-<run_id>-* org this run created if the
-          # script died before its EXIT trap fired. Run-id scoped so it never
-          # stomps a concurrent run's fresh tenant.
+          # Retry only the exact slug/ID pair published after a successful org
+          # create. This never performs a prefix sweep, and before publication
+          # it exits visibly inconclusive without discovery or DELETE.
           set +e
-          orgs=$(curl -sS "$MOLECULE_CP_URL/cp/admin/orgs" \
-            -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-            | python3 -c "
-          import json, sys, os, datetime
-          run_id = os.environ.get('GITHUB_RUN_ID', '')
+          source tests/e2e/lib/cp_purge_receipt.sh
+          if ! e2e_cp_require_local_backend \
+            || ! e2e_cp_require_staging_origin "$MOLECULE_CP_URL"; then
+            echo "::warning::concierge-mk teardown safety net rejected its staging target/backend before bearer use"
+            exit 0
+          fi
+          if [ -z "${GITHUB_RUN_ID:-}" ]; then
+            echo "::warning::concierge-mk teardown discovery inconclusive: GITHUB_RUN_ID is empty; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          created_slug="${E2E_CREATED_SLUG:-}"
+          created_org_id="${E2E_CREATED_ORG_ID:-}"
+          if [ -z "$created_slug" ] || ! e2e_cp_validate_org_id "$created_org_id"; then
+            echo "::warning::concierge-mk teardown discovery inconclusive: verified creation identity is unavailable; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          case "$created_slug" in
+            e2e-*|rt-e2e-*) ;;
+            *) echo "::warning::concierge-mk teardown discovery inconclusive: verified creation slug is malformed"; exit 0 ;;
+          esac
+          case "$created_slug" in
+            e2e-|rt-e2e-|*[!a-z0-9-]*) echo "::warning::concierge-mk teardown discovery inconclusive: verified creation slug is malformed"; exit 0 ;;
+          esac
+          roster_rc=0
+          roster_json=$(e2e_cp_fetch_org_roster_json \
+            "$MOLECULE_CP_URL" "$ADMIN_TOKEN") || roster_rc=$?
+          if [ "$roster_rc" != "0" ]; then
+            echo "::warning::concierge-mk teardown discovery inconclusive (roster rc=$roster_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          filter_rc=0
+          orgs=$(printf '%s' "$roster_json" | python3 -c "
+          import json, sys, os
+          run_id = os.environ['GITHUB_RUN_ID']
+          expected_slug = os.environ['E2E_CREATED_SLUG']
+          expected_org_id = os.environ['E2E_CREATED_ORG_ID']
           d = json.load(sys.stdin)
-          today = datetime.date.today()
-          yesterday = today - datetime.timedelta(days=1)
-          dates = (today.strftime('%Y%m%d'), yesterday.strftime('%Y%m%d'))
-          if run_id:
-              prefixes = tuple(f'e2e-cncrg-mk-{d}-{run_id}-' for d in dates)
-          else:
-              prefixes = tuple(f'e2e-cncrg-mk-{d}-' for d in dates)
-          candidates = [o['slug'] for o in d.get('orgs', [])
-                        if any(o.get('slug','').startswith(p) for p in prefixes)
+          if not run_id:
+              raise ValueError('empty run id')
+          candidates = [o for o in d.get('orgs', [])
+                        if o.get('slug') == expected_slug
                         and o.get('instance_status') not in ('purged',)]
-          print('\n'.join(candidates))
-          " 2>/dev/null)
+          for row in candidates:
+              if row.get('id') != expected_org_id:
+                  raise ValueError('creation identity mismatch')
+          print('\n'.join(o['slug'] for o in candidates))
+          " 2>/dev/null) || filter_rc=$?
+          if [ "$filter_rc" != "0" ]; then
+            echo "::warning::concierge-mk teardown discovery inconclusive (run-scope filter rc=$filter_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
           leaks=()
-          for slug in $orgs; do
+          while IFS= read -r slug; do
+            [ -n "$slug" ] || continue
             echo "Safety-net teardown: $slug"
-            set +e
-            curl -sS -o /tmp/cncrg-mk-cleanup.out -w "%{http_code}" \
-              -X DELETE "$MOLECULE_CP_URL/cp/admin/tenants/$slug" \
-              -H "Authorization: Bearer $ADMIN_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"confirm\":\"$slug\"}" >/tmp/cncrg-mk-cleanup.code
-            set -e
-            code=$(cat /tmp/cncrg-mk-cleanup.code 2>/dev/null || echo "000")
-            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
-              echo "[teardown] deleted $slug (HTTP $code)"
+            purge_rc=0
+            e2e_cp_delete_and_verify_purge \
+              "$MOLECULE_CP_URL" "$ADMIN_TOKEN" "$slug" "$created_org_id" || purge_rc=$?
+            if [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "purged" ]; then
+              echo "[teardown] verified exact CP purge receipt/audit and exact-tenant HTTP 404 for $slug"
+            elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
+              echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::concierge-mk teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within ~45 min. Body: $(head -c 300 /tmp/cncrg-mk-cleanup.out 2>/dev/null)"
+              echo "::warning::concierge-mk teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
               leaks+=("$slug")
             fi
-          done
+          done <<< "$orgs"
           if [ ${#leaks[@]} -gt 0 ]; then
             echo "::warning::concierge-mk teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
           fi
@@ -1567,13 +1588,9 @@ jobs:
   e2e-staging-concierge-platform:
     name: E2E Staging Concierge Platform Agent
     runs-on: ubuntu-latest
-    # GUARD B (regression-prevention-guards.md §Guard B): DE-GATED from
-    # E2E_EC2_ENABLED. This job runs the fresh-org platform-agent mgmt-MCP
-    # present+callable gate (TestPlatformAgentMgmtMCP_Staging), which provisions
-    # against staging = MOLECULES-SERVER (local-docker, provider='local') — NOT
-    # an EC2 VM. It never needed AWS creds; the blanket E2E_EC2_ENABLED gate
-    # applied at the 2026-06-27 AWS toggle-off left the merged Guard B test
-    # DORMANT (has never once run). Scoped to push / workflow_dispatch
+    # GUARD B (regression-prevention-guards.md §Guard B): this fresh-org
+    # platform-agent mgmt-MCP present+callable gate provisions against staging's
+    # local-docker backend. Scoped to push / workflow_dispatch
     # (mirrors e2e-staging-plugin-lifecycle) so it runs LIVE against staging on
     # merge-to-main + on-demand dispatch, WITHOUT adding a redundant per-PR Go
     # compile (the PR-time compile+skip is already owned by the sibling
@@ -1696,7 +1713,7 @@ jobs:
   # boots a real staging workspace, asserts the registry is non-empty (the
   # "no registry available" report), installs a registry plugin via
   # POST /workspaces/:id/plugins, then asserts (a) GET /workspaces/:id/plugins
-  # returns it — guards the SaaS EIC readback (CP #3125), (b) the workspace
+  # returns it — guards the installed-plugin readback contract, (b) the workspace
   # comes back online+routable and serves A2A after the install-triggered
   # restart — guards the #159 mgmt-MCP self-heal online-gate. Drives
   # TestPluginInstallLifecycle_Staging (workspace-server/internal/staginge2e).
@@ -1715,13 +1732,8 @@ jobs:
   e2e-staging-plugin-lifecycle:
     name: E2E Staging Plugin Install Lifecycle
     runs-on: ubuntu-latest
-    # MOLECULES-SERVER (local-docker) live gate — NO EC2 dependency. The CP
-    # provisions the staging tenant as a local-docker container, so the plugin
-    # install rides docker CopyToContainer into the mol-ws-* container, NOT the
-    # AWS EIC path. This job was previously EC2-dormant (E2E_EC2_ENABLED) which
-    # is exactly why the local-docker plugin-install 502 (core#182) reached prod
-    # uncaught. UN-PINNED: the job-level push-only `if:` is REMOVED (converted the
-    # same way as the un-pinned scenarios) so the job also runs on pull_request. On
+    # MOLECULES-SERVER local-docker live gate. The CP provisions the staging
+    # tenant as a local container and plugin install uses CopyToContainer. On
     # PR the KMS token fetch is skipped → CP_ADMIN_API_TOKEN empty →
     # requireStagingEnv skips LOUD (go test compile+skip, exit 0 green); the live
     # run stays on push/dispatch. Mirrors the live molecules-server gate
