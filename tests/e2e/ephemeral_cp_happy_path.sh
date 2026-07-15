@@ -60,6 +60,17 @@ RUNTIME="${E2E_RUNTIME:-hermes}"
 # LOCAL_TENANT_URL_TEMPLATE below.
 ROUTE_DOMAIN="lvh.me"
 
+# The tenant's PUBLIC front-door URL template — the SINGLE source for both the
+# CP's LOCAL_TENANT_URL_TEMPLATE (which the CP turns into the tenant's
+# CORS_ORIGINS + PLATFORM_URL via publicTenantURL/PublicURLForSlug) and any
+# scenario that must present a same-origin Origin header (the concierge harness).
+# The :8080 port is structural, not incidental: lvh.me DNS→127.0.0.1 loops back
+# to the CP's own :8080, so the tenant's ONE allowed origin is exactly this
+# string with {slug} substituted. Deriving both from a single definition is what
+# keeps the Origin a harness sends byte-identical to the origin the CP allows —
+# a gin-contrib/cors mismatch is an empty-body 403 (what broke the first port).
+TENANT_PUBLIC_URL_TEMPLATE="http://{slug}.${ROUTE_DOMAIN}:8080"
+
 # Throwaway per-run namespace (must start with pr- — pr-ephemeral-cp.sh refuses
 # to touch a non-ephemeral namespace). Deterministic in PR_NUMBER/HEAD_SHA so the
 # boot / scenario / down phases all address the SAME namespace + state file.
@@ -302,7 +313,7 @@ boot_cp() {
     # so the canary probes http://<slug>.lvh.me:8080 (DNS→127.0.0.1 = the CP's
     # own loopback, :8080 = the CP itself) and traverses the REAL wildcard-proxy
     # routing chain to the tenant instead of the unreachable staging edge.
-    echo "LOCAL_TENANT_URL_TEMPLATE=http://{slug}.${ROUTE_DOMAIN}:8080"
+    echo "LOCAL_TENANT_URL_TEMPLATE=${TENANT_PUBLIC_URL_TEMPLATE}"
     # `up` creates the network as mol-net-${NS}; the CP provisions tenants onto it.
     echo "LOCAL_TENANT_SHARED_NETWORK=mol-net-${NS}"
     echo "LOCAL_TENANT_CP_URL=http://controlplane:8080"
@@ -473,9 +484,17 @@ run_scenario_concierge_user_tasks() {
   # MOLECULE_TENANT_URL + ROUTE_DOMAIN carry the ephemeral-CP slug routing the
   # same way run_scenario does (the CP is one throwaway container; the tenant is
   # reached via its base URL + Host/X-Molecule-Org-Slug, not a real subdomain).
+  # MOLECULE_TENANT_ORIGIN_TEMPLATE — the ONLY scenario that sends an Origin
+  # header (mirroring the Cloudflare edge). In staging Origin == the tenant's own
+  # https subdomain, which IS its CORS_ORIGINS, so it passes. Here the tenant's
+  # CORS_ORIGINS is TENANT_PUBLIC_URL_TEMPLATE (set as LOCAL_TENANT_URL_TEMPLATE
+  # above), NOT the CP base URL — so the harness must present THAT origin or
+  # gin-contrib/cors returns an empty-body 403. Pass the SAME template so the two
+  # can never drift; the harness substitutes its own {slug}.
   MOLECULE_CP_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
+  MOLECULE_TENANT_ORIGIN_TEMPLATE="${TENANT_PUBLIC_URL_TEMPLATE}" \
   MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
   E2E_AWS_LEAK_CHECK=off \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \

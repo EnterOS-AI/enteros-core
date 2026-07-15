@@ -227,6 +227,21 @@ if [ -n "$TENANT_ROUTE_HOST" ]; then
   log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG (ephemeral-CP slug routing)"
 fi
 
+# Origin header: the tenant's gin-contrib/cors allows exactly ONE origin — its own
+# public front-door (CORS_ORIGINS). In staging that IS $TENANT_URL
+# (https://$SLUG.$domain), so the default below reproduces staging byte-for-byte.
+# Under the ephemeral CP, $TENANT_URL is the CP base URL (NOT a tenant origin), so
+# a same-value Origin would be cross-origin → an empty-body 403 from cors before
+# any handler runs. MOLECULE_TENANT_ORIGIN_TEMPLATE (the SAME template the CP turns
+# into the tenant's CORS_ORIGINS) is substituted with this run's slug so the Origin
+# we present is byte-identical to the origin the tenant allows. Default unset ⇒
+# Origin=$TENANT_URL ⇒ exact staging behavior.
+TENANT_ORIGIN="$TENANT_URL"
+if [ -n "${MOLECULE_TENANT_ORIGIN_TEMPLATE:-}" ]; then
+  TENANT_ORIGIN="${MOLECULE_TENANT_ORIGIN_TEMPLATE//\{slug\}/$SLUG}"
+  log "    tenant CORS origin = $TENANT_ORIGIN (from MOLECULE_TENANT_ORIGIN_TEMPLATE)"
+fi
+
 # ─── 3. Per-tenant admin token + TLS readiness ───────────────────────────────
 log "3/6 Fetching per-tenant admin token..."
 TENANT_TOKEN=$(admin_call GET "/cp/admin/orgs/$SLUG/admin-token" \
@@ -251,7 +266,7 @@ tenant_call() {  # <method> <path> [curl args…]
     "${TENANT_ROUTE_HDRS[@]}" \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
-    -H "Origin: $TENANT_URL" "$@"
+    -H "Origin: $TENANT_ORIGIN" "$@"
 }
 
 # Create an external workspace (row only — no EC2). Echoes its id.
