@@ -1209,6 +1209,9 @@ func TestValidateCallerToken_ValidToken(t *testing.T) {
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("t1", "ws-authed"))
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("t1", "ws-authed"))
 	mock.ExpectExec(`UPDATE workspace_auth_tokens SET last_used_at`).
 		WithArgs("t1").
 		WillReturnResult(sqlmock.NewResult(0, 1))

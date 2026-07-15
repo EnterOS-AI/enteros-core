@@ -286,6 +286,10 @@ token) bypass the workspace hierarchy. System caller prefixes are accepted
 only through server-side calls; sending one in an HTTP header is rejected.
 Self-calls still require the source workspace's bearer.
 
+Combined self-host/dev Canvas deployments also retain a same-origin browser
+fallback when control-plane session verification is not configured. This is
+not accepted as authentication in SaaS and is not an external-agent credential.
+
 ---
 
 ## Multiple Workspaces From One Local MCP Bridge

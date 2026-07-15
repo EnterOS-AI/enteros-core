@@ -63,7 +63,10 @@ On-demand fits naturally with how agents work — an agent only needs to know ab
 
 ## Authentication Between Workspaces
 
-**MVP: discovery-time validation only.** The platform validates `CanCommunicate()` when workspace A calls `GET /registry/discover/:id` (using `X-Workspace-ID` header). Once A has B's URL, direct A2A calls are unauthenticated.
+**Direct peer transport:** The platform validates `CanCommunicate()` when
+workspace A calls `GET /registry/discover/:id` (using `X-Workspace-ID`). Once A
+has B's URL, a direct request to B's agent server does not pass through the
+platform's HTTP A2A authenticator.
 
 This is acceptable for MVP because:
 - All workspaces are provisioned by the same platform on trusted infrastructure
@@ -71,6 +74,14 @@ This is acceptable for MVP because:
 - The tool is self-hosted — the operator controls the network
 
 **Known gap:** Once workspace A caches workspace B's URL, nothing stops A from calling B directly even after the hierarchy changes and A is no longer supposed to reach B. The cached URL remains valid until the container is restarted or the URL changes.
+
+**Platform proxy transport:** `POST /workspaces/:id/a2a` is a separate path.
+It authenticates workspace callers with a source-bound bearer and applies the
+current hierarchy before dispatch. Verified control-plane sessions,
+`ADMIN_TOKEN`, org tokens, and authenticated external inbound requests are
+privileged non-workspace paths. A combined self-host/dev Canvas may use the
+same-origin fallback only when control-plane session verification is not
+configured; SaaS never accepts same-origin headers as authentication.
 
 **Post-MVP fix — platform-issued tokens:** On discovery, the platform issues a short-lived signed token scoped to the specific caller/target pair. The target workspace validates the token on every A2A request. When the hierarchy changes, old tokens expire and new discovery attempts are blocked by `CanCommunicate()`.
 
@@ -211,7 +222,7 @@ On completion, the task returns artifacts:
 
 The canvas (browser) cannot reach Docker-internal agent URLs directly. The platform provides `POST /workspaces/:id/a2a` as a proxy:
 
-1. The caller presents a workspace bearer, verified control-plane session, `ADMIN_TOKEN`, org token, or the target-bound external inbound secret.
+1. The caller presents a workspace bearer, verified control-plane session, `ADMIN_TOKEN`, org token, or the target-bound external inbound secret. A combined self-host/dev Canvas may use same-origin only when control-plane session verification is unconfigured.
 2. For workspace callers, the platform derives the source workspace from the bearer. `X-Workspace-ID`, when supplied, must match that identity.
 3. The proxy enforces hierarchy and same-org access before resolving the target.
 4. The proxy resolves the agent's host-accessible URL from Redis cache (falls back to DB).
@@ -220,9 +231,10 @@ The canvas (browser) cannot reach Docker-internal agent URLs directly. The platf
 7. The proxy forwards the request to the agent and returns the response.
 
 Missing, revoked, tokenless legacy, forged-self, mismatched-header, and auth
-datastore-error cases fail closed before dispatch. Supported canvas and
-workspace clients use this authenticated proxy; a raw direct call to a
-discovered agent URL is outside the platform authorization boundary.
+datastore-error cases fail closed before dispatch. The only no-bearer Canvas
+compatibility path is the CP-unconfigured same-origin case above. A raw direct
+call to a discovered agent URL is outside the platform proxy authorization
+boundary.
 
 ## Key Properties
 
@@ -231,7 +243,7 @@ discovered agent URL is outside the platform authorization boundary.
 - **On-demand:** Workspaces discover peers when needed, not at startup
 - **Opaque execution:** The caller doesn't know (or care) what's inside the callee
 - **Interoperable:** Any A2A-compliant agent from any framework can plug in
-- **Source-bound auth:** Workspace bearer ownership is the authoritative caller identity
+- **Source-bound proxy auth:** Workspace bearer ownership is the authoritative caller identity on the platform proxy
 - **Fail-closed:** Invalid credentials and auth lookup failures never downgrade to canvas traffic
 
 ## Related Docs

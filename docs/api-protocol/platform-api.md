@@ -315,7 +315,8 @@ Canvas clients receive the global event stream. Workspaces connect with `X-Works
 It currently:
 
 - authenticates every public HTTP request before dispatch; workspace identity is derived from the bearer and an optional `X-Workspace-ID` must match it
-- accepts human traffic only through a verified control-plane session, `ADMIN_TOKEN`, or org token; authenticated external inbound traffic uses the target-bound inbound secret
+- accepts SaaS human traffic only through a verified control-plane session, `ADMIN_TOKEN`, or org token; authenticated external inbound traffic uses the target-bound inbound secret
+- preserves a no-bearer same-origin Canvas fallback only for combined self-host/dev deployments where control-plane session verification is unconfigured; SaaS never trusts same-origin headers as authentication
 - rejects tokenless legacy, invalid/revoked bearer, forged-self, and auth datastore-error requests instead of treating them as canvas traffic
 - enforces `CanCommunicate` and same-org isolation for authenticated workspace-to-workspace calls; verified human and server-side system calls bypass hierarchy
 - normalizes incoming JSON into JSON-RPC 2.0

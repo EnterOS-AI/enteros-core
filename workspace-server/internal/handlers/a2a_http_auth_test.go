@@ -6,6 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -103,14 +106,50 @@ func TestAuthenticateA2AHTTPCaller_ClaimMustMatchBearerOwner(t *testing.T) {
 
 	_, _, err := authenticateA2AHTTPCaller(c.Request.Context(), c, "workspace-b")
 
-	if err == nil {
-		t.Fatal("workspace B claim with workspace A bearer must be rejected")
+	if !errors.Is(err, errCallerIdentityMismatch) {
+		t.Fatalf("workspace B claim with workspace A bearer: got error %v, want source-binding mismatch", err)
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d: %s", w.Code, w.Body.String())
 	}
+	if !strings.Contains(w.Body.String(), "caller ID does not match workspace auth token") {
+		t.Fatalf("want source-binding response, got %s", w.Body.String())
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAuthenticateA2AHTTPCaller_LocalSameOriginCanvas(t *testing.T) {
+	const subprocess = "MOLECULE_TEST_LOCAL_SAME_ORIGIN_A2A"
+	if os.Getenv(subprocess) != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestAuthenticateA2AHTTPCaller_LocalSameOriginCanvas$", "-test.v")
+		cmd.Env = append(os.Environ(),
+			subprocess+"=1",
+			"CANVAS_PROXY_URL=http://local-canvas.test",
+			"CP_UPSTREAM_URL=",
+			"MOLECULE_ORG_SLUG=",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("local same-origin subprocess failed: %v\n%s", err, out)
+		}
+		return
+	}
+
+	setupTestDB(t)
+	setupTestRedis(t)
+	c, w := newA2AAuthContext()
+	c.Request.Host = "local-canvas.test"
+	c.Request.Header.Set("Referer", "http://local-canvas.test/")
+
+	callerID, isCanvasUser, err := authenticateA2AHTTPCaller(c.Request.Context(), c, "local-canvas-user")
+
+	if err != nil {
+		t.Fatalf("local same-origin canvas rejected: %v, response=%s", err, w.Body.String())
+	}
+	if callerID != "local-canvas-user" || !isCanvasUser {
+		t.Fatalf("got caller=%q canvas=%v, want local-canvas-user,true", callerID, isCanvasUser)
 	}
 }
 
@@ -189,6 +228,9 @@ func TestProxyA2A_ForgedSelfClaimRejected(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("forged self claim: want 401, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "caller ID does not match workspace auth token") {
+		t.Fatalf("forged self claim: want source-binding response, got %s", w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

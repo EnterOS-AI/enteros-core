@@ -177,8 +177,8 @@ func TestHistory_IncludesErrorDetail(t *testing.T) {
 // ==================== Health — issue #249 ====================
 //
 // GET /workspaces/:id/schedules/health is accessible to CanCommunicate peers
-// without workspace bearer auth. The handler mirrors the A2A proxy's auth
-// pattern: X-Workspace-ID + caller token + CanCommunicate gate.
+// with the peer's own source-bound workspace bearer. The handler mirrors the
+// A2A proxy's auth pattern: X-Workspace-ID + caller token + CanCommunicate gate.
 
 const healthWorkspaceID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 const healthCallerID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -187,6 +187,11 @@ const healthCallerID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 var healthCols = []string{"id", "name", "enabled", "last_run_at", "next_run_at", "run_count", "last_status", "last_error"}
 
 func expectScheduleHealthWorkspaceAuth(mock sqlmock.Sqlmock, workspaceID string) {
+	// authenticateA2AHTTPCaller first resolves the bearer owner, then validates
+	// the same token and refreshes last_used_at.
+	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("health-token", workspaceID))
 	mock.ExpectQuery(`SELECT t\.id, t\.workspace_id.*FROM workspace_auth_tokens t.*JOIN workspaces`).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "workspace_id"}).AddRow("health-token", workspaceID))

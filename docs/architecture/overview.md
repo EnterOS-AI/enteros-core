@@ -65,7 +65,9 @@ When the requested template does not exist, the Create handler falls back in ord
 The A2A proxy (`POST /workspaces/:id/a2a`) authenticates every public HTTP
 caller before applying this rule. A workspace bearer determines the source
 identity; an optional `X-Workspace-ID` must match it. Verified human callers
-bypass hierarchy, while self-calls still require a bearer. System caller
+bypass hierarchy. A combined self-host/dev Canvas retains a same-origin
+fallback only when control-plane session verification is unconfigured; SaaS
+does not trust those headers. Self-calls still require a bearer. System caller
 prefixes are trusted only on the internal Go call path and are rejected when
 supplied as HTTP headers.
 

@@ -409,8 +409,8 @@ submitted → working → completed
 
 ### Authentication
 
-- **MVP (current)**: Discovery-time validation only. Direct A2A calls are unauthenticated (acceptable for self-hosted Docker network isolation).
-- **Post-MVP**: Platform-issued short-lived signed tokens scoped to caller/target pair.
+- **Direct peer transport**: Discovery-time `CanCommunicate()` authorization; subsequent peer-to-peer requests remain outside the platform data path.
+- **Platform proxy transport**: Source-bound workspace bearer (or a privileged verified human/inbound credential), with hierarchy reapplied before dispatch. Self-host/dev same-origin Canvas is accepted only when CP session verification is unconfigured.
 
 ---
 
@@ -1028,7 +1028,7 @@ Every Tier 1 launch (Open Interpreter) had all four elements.
 
 ### Hard Design Constraints
 
-1. **Platform never routes agent messages** — A2A is strictly peer-to-peer
+1. **Keep A2A transports explicit** — direct peer calls bypass the platform data path; Canvas, inbound, queue fallback, and server-side delegation use the authenticated platform proxy
 2. **Postgres is fact source, Redis is cache** — Redis loss is fully recoverable
 3. **`structure_events` is append-only** — Never UPDATE, never DELETE
 4. **`workspace-template` has no business logic** — Logic lives in `workspace-configs-templates/`

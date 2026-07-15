@@ -30,6 +30,7 @@ The A2A send and queue-status routes are stricter:
 - `GET /workspaces/:id/a2a/queue/:queue_id` applies the same authentication before checking row ownership.
 - A workspace bearer determines the source identity. An optional `X-Workspace-ID` must match it.
 - Tokenless legacy callers and authentication datastore errors fail closed.
+- The no-bearer same-origin Canvas fallback exists only in combined self-host/dev when CP session verification is unconfigured; SaaS tests must use a verified session or bearer.
 
 The scripts handle this by:
 
