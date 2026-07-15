@@ -44,6 +44,7 @@ on:
       - 'tests/e2e/test_reconciler_heals_terminated_instance.sh'
       - 'tests/e2e/lib/collision-proof-slug.sh'
       - 'tests/e2e/lib/model_slug.sh'
+      - 'tests/e2e/lib/reconciler_container.sh'
       - '.gitea/workflows/e2e-staging-reconciler.yml'
   # pull_request auto-trigger deliberately NOT re-armed yet: it would run a REAL
   # staging molecules-server provision + docker-kill on EVERY PR touching these

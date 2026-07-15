@@ -610,6 +610,10 @@ jobs:
           # must accept only exact 404. Offline fail-direction cases cover
           # 200/401/405/500/transport failures.
           bash tests/e2e/test_http_status_capture_unit.sh
+          # Reconciler molecules-server kill-target lookup must treat a normal
+          # no-match (or transient docker ps failure) as retryable under
+          # errexit+pipefail instead of aborting the live staging harness.
+          bash tests/e2e/lib/test_reconciler_container_unit.sh
           # core#4370: bounded idle-digest evidence polling and fail-closed
           # Docker preflight. Offline: proves missing Docker or an unreachable
           # daemon cannot silently skip E2E_IDLE_DIGEST_CHECK=on.
