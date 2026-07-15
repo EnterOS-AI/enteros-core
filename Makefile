@@ -70,12 +70,14 @@ e2e-concierge-creates-workspace: ## Prove the concierge actually creates a works
 	bash tests/e2e/test_concierge_creates_workspace_local.sh
 
 # RFC "one pre-merge ephemeral gate" (§04): run the FULL cross-boundary happy
-# path against a THROWAWAY CP this target spins up itself — same runner CI uses
-# (tests/e2e/ephemeral_cp_happy_path.sh), against your working-tree tenant image.
+# path against a THROWAWAY CP this target spins up itself — same scenario runner
+# CI uses (tests/e2e/ephemeral_cp_happy_path.sh), against your working-tree tenant
+# image. The local wrapper uses direct Docker + the sibling CP checkout by default;
+# CI separately pins its CP ref and launches the topology inside per-job dind.
 # No shared staging, no CI wait: validate before you push. Needs docker + a
 # sibling molecule-controlplane checkout (or CP_EPHEMERAL_SCRIPT / CP_IMAGE set).
 # See local-e2e/ephemeral-cp-happy-path.sh for the overridable env.
-e2e-ephemeral-happy-path: ## Run the FULL happy path against a throwaway CP locally (same gate as CI; no staging).
+e2e-ephemeral-happy-path: ## Run the FULL happy-path scenario against a local throwaway CP (no staging).
 	bash local-e2e/ephemeral-cp-happy-path.sh all
 
 # MODULAR PHASES — pinpoint a failing scenario step without the full rebuild+boot.
