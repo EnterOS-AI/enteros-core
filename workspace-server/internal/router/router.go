@@ -556,10 +556,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.DELETE("/schedules/:scheduleId", schedh.Delete)
 		wsAuth.POST("/schedules/:scheduleId/run", schedh.RunNow)
 		wsAuth.GET("/schedules/:scheduleId/history", schedh.History)
-		// Schedule health — open to CanCommunicate peers (no workspace bearer token
-		// required) so peer agents can detect silent cron failures without admin auth.
-		// Auth is enforced inside the handler via X-Workspace-ID + CanCommunicate
-		// (mirrors the /workspaces/:id/a2a pattern). Issue #249.
+		// Schedule health — available to authenticated CanCommunicate peers so
+		// agents can detect silent cron failures without admin auth. The handler
+		// requires an explicit X-Workspace-ID plus that workspace's source-bound
+		// bearer; verified human credentials bypass hierarchy. Issue #249.
 		r.GET("/workspaces/:id/schedules/health", schedh.Health)
 
 		// Budget — per-workspace spend ceiling and current usage (#541).

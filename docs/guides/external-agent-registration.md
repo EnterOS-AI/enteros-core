@@ -239,11 +239,14 @@ curl -X POST http://localhost:8080/workspaces/<target-workspace-id>/a2a \
   }'
 ```
 
-Both headers are required:
+The bearer is required. `X-Workspace-ID` is an optional, recommended source
+claim:
 
 - `Authorization: Bearer <token>` -- your workspace auth token.
 - `X-Workspace-ID: <your-id>` -- identifies which workspace is making the
-  call. The platform uses this to enforce communication rules.
+  call. When omitted, the platform derives the caller from the bearer. When
+  supplied, the platform requires it to match the workspace bound to the
+  bearer before enforcing communication rules.
 
 ### 6. Discover Peers
 
@@ -255,14 +258,14 @@ curl http://localhost:8080/registry/discover/<your-workspace-id> \
   -H "Authorization: Bearer <auth_token>" \
   -H "X-Workspace-ID: <your-workspace-id>"
 
-# List peers (siblings + parent + children)
+# List direct peers (same-parent siblings + parent + children)
 curl http://localhost:8080/registry/<your-workspace-id>/peers \
-  -H "Authorization: Bearer <auth_token>" \
-  -H "X-Workspace-ID: <your-workspace-id>"
+  -H "Authorization: Bearer <auth_token>"
 ```
 
-The peers endpoint returns workspaces that your agent is allowed to
-communicate with, based on the hierarchy rules below.
+The peers endpoint returns the direct topology view. It does not recursively
+list distant ancestors or descendants even though those pairs are allowed by
+the hierarchy rules below.
 
 ---
 
@@ -274,14 +277,19 @@ The platform enforces strict hierarchy-based access control via
 | Relationship | Allowed |
 |---|---|
 | Same workspace (self-call) | Yes |
-| Siblings (same `parent_id`) | Yes |
-| Root-level siblings (both `parent_id` is NULL) | Yes |
-| Parent to child | Yes |
-| Child to parent | Yes |
-| Everything else | **Denied** |
+| Siblings sharing the same non-NULL `parent_id` | Yes |
+| Ancestor to descendant (any depth) | Yes |
+| Descendant to ancestor (any depth) | Yes |
+| Unrelated roots or disjoint subtrees | **Denied** |
 
-Canvas requests (no `X-Workspace-ID` header) and system callers
-(`webhook:*`, `system:*`, `test:*` prefixes) bypass this check.
+Verified human callers (control-plane session, tenant admin token, or org
+token) bypass the workspace hierarchy. System caller prefixes are accepted
+only through server-side calls; sending one in an HTTP header is rejected.
+Self-calls still require the source workspace's bearer.
+
+Combined self-host/dev Canvas deployments also retain a same-origin browser
+fallback when control-plane session verification is not configured. This is
+not accepted as authentication in SaaS and is not an external-agent credential.
 
 ---
 
@@ -731,22 +739,21 @@ Key differences from platform-managed workspaces:
   workspace and create a new one (or wait for a future token-reset API).
 - Tokens are automatically revoked when a workspace is deleted.
 
-### Required Headers
+### Authentication Headers
 
-| Endpoint | Required Headers |
-|----------|-----------------|
-| `POST /registry/heartbeat` | `Authorization: Bearer <token>` |
-| `POST /registry/update-card` | `Authorization: Bearer <token>` |
-| `POST /workspaces/:target/a2a` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` |
-| `GET /registry/discover/:id` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` |
-| `GET /registry/:id/peers` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` |
+| Endpoint | Required Headers | Optional / Recommended Headers |
+|----------|------------------|--------------------------------|
+| `POST /registry/heartbeat` | `Authorization: Bearer <token>` | -- |
+| `POST /registry/update-card` | `Authorization: Bearer <token>` | -- |
+| `POST /workspaces/:target/a2a` | `Authorization: Bearer <token>` | `X-Workspace-ID: <your-id>` -- if supplied, it must match the bearer owner |
+| `GET /registry/discover/:id` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` | -- |
+| `GET /registry/:id/peers` | `Authorization: Bearer <token>` | -- |
 
 ### Legacy / Bootstrap Behavior
 
-Workspaces that registered before the token system existed (Phase 30.1) are
-grandfathered -- their requests pass through without a token until their next
-`/registry/register` call issues one. After that, the token is enforced on
-every subsequent call.
+Heartbeat and card-update bootstrap behavior is documented separately. A2A
+send and queue-status calls have no tokenless legacy exception: missing,
+revoked, mismatched, or unverifiable credentials are rejected.
 
 ---
 
@@ -792,11 +799,12 @@ delete the workspace and re-create it.
 
 ### Cannot send A2A messages (403 or communication denied)
 
-**Cause:** The `CanCommunicate` check failed -- your workspace is not a
-sibling, parent, or child of the target.
+**Cause:** The `CanCommunicate` check failed -- the target is neither a
+same-nonroot-parent sibling nor an ancestor/descendant of your workspace.
 
-**Fix:** Check the hierarchy. Use `GET /registry/<your-id>/peers` to see
-which workspaces you can reach. If needed, move your workspace under the
+**Fix:** Check the hierarchy. `GET /registry/<your-id>/peers` shows direct
+siblings, children, and the parent; inspect the parent chain for more distant
+allowed ancestors/descendants. If needed, move your workspace under the
 correct parent via `PATCH /workspaces/:id` with `{"parent_id": "..."}`.
 
 ### Agent card not showing on canvas

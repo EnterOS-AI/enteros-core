@@ -2,11 +2,12 @@
 
 Key design rules and invariants that must be followed throughout the codebase.
 
-## 1. The Platform Never Routes Agent Messages
+## 1. Keep Direct and Proxied A2A Paths Distinct
 
-A2A messages go workspace-to-workspace **directly**. The platform only handles:
-- **Discovery** — resolving workspace URLs
-- **Registry** — knowing what workspaces exist
+Peer runtimes can send A2A messages **directly** after discovery, so the
+platform is not in that data path. Canvas, external inbound, queue fallback,
+and server-side delegation use the platform's A2A proxy. Do not describe the
+direct discovery boundary as if it authenticated the separate proxy route.
 
 ## 2. Postgres Is Source of Truth, Redis Is Ephemeral
 
@@ -24,9 +25,16 @@ It contains **no business logic**. All business logic lives in `workspace-config
 
 API keys, passwords, and credentials are **never** serialized into bundle JSON. The provisioner injects them from the host environment when spinning up a workspace container.
 
-## 6. No Auth for MVP
+## 6. Authentication Is Route-Specific and Fail-Closed
 
-The platform API has no authentication. All endpoints are open. This is intentional — the project follows the n8n Community Edition model. Auth is added in a separate SaaS wrapper (`molecule-cloud`).
+The platform API is not open. Administrative routes use strict admin or
+verified control-plane-session authentication; workspace routes bind bearer
+tokens to workspace identity; org tokens authorize their configured org
+surface. The public A2A proxy derives a workspace caller from its bearer and
+accepts `X-Workspace-ID` only as a matching optional claim. Never add a
+fail-open authentication branch to these strict surfaces. Registry heartbeat
+and card update retain a separately documented legacy/bootstrap availability
+exception; do not copy that transition behavior to another route.
 
 ## 7. org_id Is Omitted from MVP Schema
 
@@ -44,15 +52,18 @@ See [Workspace Tiers](../architecture/workspace-tiers.md).
 ## 9. The Hierarchy IS the Topology
 
 There is no manual connection wiring. Communication is derived from the `parent_id` hierarchy:
-- Siblings can talk to each other
-- Parents can talk to children (and vice versa)
-- No skipping levels
+- Siblings sharing a non-root parent can talk to each other
+- Any ancestor can talk to any descendant (and vice versa)
+- Unrelated roots and disjoint subtrees cannot communicate
 
 The org chart IS the access control policy. See [Communication Rules](../api-protocol/communication-rules.md).
 
-## 10. Discovery-Time Auth for MVP
+## 10. A2A Authentication Depends on the Transport
 
-Direct A2A calls between workspaces are unauthenticated in MVP. Access control is enforced at discovery time via `CanCommunicate()`. Post-MVP adds platform-issued signed tokens scoped to caller/target pairs. See [A2A Protocol — Authentication](../api-protocol/a2a-protocol.md#authentication-between-workspaces).
+Direct peer calls remain outside the platform data path after discovery-time
+`CanCommunicate()` authorization. The platform proxy is different: workspace
+callers require a source-bound bearer and the proxy reapplies hierarchy before
+dispatch. See [A2A Protocol — Authentication](../api-protocol/a2a-protocol.md#authentication-between-workspaces).
 
 ## 11. Secrets in Postgres, Encrypted
 

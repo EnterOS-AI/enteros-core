@@ -16,9 +16,15 @@ The Go backend is Molecule AI's control plane. It does not execute agent reasoni
 
 ## Caller Identification
 
-Workspace-scoped calls use the `X-Workspace-ID` header when the caller is another workspace. Browser/canvas calls do not send that header.
+Caller identification is endpoint-specific. Registry discovery requires an
+explicit `X-Workspace-ID` and validates the credential contract for that
+workspace. On `POST /workspaces/:id/a2a`, a workspace bearer is authoritative:
+the platform derives its owner, and an optional `X-Workspace-ID` claim must
+match. Verified human credentials are privileged and do not become workspace
+identity merely by supplying that header.
 
-The platform uses the caller identity to enforce hierarchy-based access rules.
+The platform uses only the server-verified caller identity to enforce
+hierarchy-based access rules.
 
 
 ## Breaking Changes
@@ -88,7 +94,7 @@ Violations return `400 Bad Request` with `{ "error": "<field> must be at most N 
 | `POST` | `/workspaces/:id/restart` | Restart workspace (reads runtime from container config.yaml before stop — detects runtime changes) |
 | `POST` | `/workspaces/:id/pause` | Pause workspace |
 | `POST` | `/workspaces/:id/resume` | Resume workspace |
-| `POST` | `/workspaces/:id/a2a` | Proxy A2A request to the target workspace (synchronous, enforces hierarchy access control via `X-Workspace-ID`) |
+| `POST` | `/workspaces/:id/a2a` | Proxy A2A request to the target workspace (authenticates the caller, then enforces hierarchy for workspace callers) |
 | `POST` | `/workspaces/:id/delegate` | Async delegation — fire-and-forget, returns delegation_id |
 | `GET` | `/workspaces/:id/delegations` | List delegation status (pending/completed/failed) |
 | `GET` | `/workspaces/:id/audit` | Read the workspace's stored HMAC-linked audit events. **Requires `WorkspaceAuth`.** |
@@ -161,8 +167,8 @@ This is the recommended way for agents to delegate work — it works for all run
 | `POST` | `/registry/register` | Workspace registration on startup. First register issues a per-workspace bearer token in the response body (`auth_token`); re-register is idempotent and omits the token. | — |
 | `POST` | `/registry/heartbeat` | Liveness and task updates. | Phase 30.1 — `Authorization: Bearer <token>` required if the workspace has any live token on file; legacy workspaces grandfathered (fail-open). |
 | `POST` | `/registry/update-card` | Push Agent Card updates after runtime/skill changes. | Phase 30.1 — same grandfather rule as `/heartbeat`. |
-| `GET` | `/registry/discover/:id` | Resolve workspace URL for A2A calls. | Phase 30.6 — caller sends `X-Workspace-ID` + own bearer token; fail-open on DB hiccup (hierarchy check is primary gate). |
-| `GET` | `/registry/:id/peers` | List reachable peers. | Phase 30.6 — same as `/discover/:id`. |
+| `GET` | `/registry/discover/:id` | Resolve workspace URL for A2A calls. | Phase 30.6 — `X-Workspace-ID` is required; enrolled workspaces send their own bearer. Legacy workspaces without a live token retain bootstrap compatibility, while auth datastore errors fail closed with `503`. |
+| `GET` | `/registry/:id/peers` | List the workspace's direct siblings, children, and parent. | Phase 30.6 — the path `:id` identifies the caller; enrolled workspaces send their own bearer. Legacy no-token bootstrap remains supported; datastore errors fail closed. |
 | `POST` | `/registry/check-access` | Validate reachability/access. | — |
 
 **Why the auth callout matters:** remote (Phase 30) agents authenticate themselves with the bearer token returned by `POST /registry/register`. Local containers are transparent to this during the lazy-bootstrap grace window — the provisioner threads the token in as an env var on first register. See `docs/development/testing-e2e.md` for how E2E scripts handle token capture. If you change these routes, update `tests/e2e/test_api.sh` in the same PR.
@@ -314,7 +320,11 @@ Canvas clients receive the global event stream. Workspaces connect with `X-Works
 
 It currently:
 
-- enforces access control via `CanCommunicate` for agent-to-agent calls (workspace caller IDs from `X-Workspace-ID`); canvas requests, self-calls, and system callers (`webhook:*`, `system:*`, `test:*`) bypass
+- authenticates every public HTTP request before dispatch; workspace identity is derived from the bearer and an optional `X-Workspace-ID` must match it
+- accepts SaaS human traffic only through a verified control-plane session, `ADMIN_TOKEN`, or org token; authenticated external inbound traffic uses the target-bound inbound secret
+- preserves a no-bearer same-origin Canvas fallback only for combined self-host/dev deployments where control-plane session verification is unconfigured; SaaS never trusts same-origin headers as authentication
+- rejects tokenless legacy, invalid/revoked bearer, forged-self, and auth datastore-error requests instead of treating them as canvas traffic
+- enforces `CanCommunicate` and same-org isolation for authenticated workspace-to-workspace calls; verified human and server-side system calls bypass hierarchy
 - normalizes incoming JSON into JSON-RPC 2.0
 - injects `messageId` when missing
 - applies different timeout rules for browser-initiated vs workspace-initiated calls

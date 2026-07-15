@@ -32,6 +32,24 @@ func TestGetA2AQueueStatus_MissingIdentity(t *testing.T) {
 	}
 }
 
+func TestGetA2AQueueStatus_HeaderWithoutBearerRejected(t *testing.T) {
+	setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-target"}, {Key: "queue_id", Value: "queue-abc"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/queue-abc", nil)
+	c.Request.Header.Set("X-Workspace-ID", "ws-forged")
+
+	handler.GetA2AQueueStatus(c)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("header-only queue caller: want 401, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // TestGetA2AQueueStatus_MissingRow_Retryable proves an authenticated caller
 // receives a 404 with retryable=true when the queue row doesn't exist, so a
 // client polling after a 202 knows to keep retrying.
@@ -52,7 +70,7 @@ func TestGetA2AQueueStatus_MissingRow_Retryable(t *testing.T) {
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/"+queueID, nil)
 	c.Request.Header.Set("X-Workspace-ID", "ws-caller")
 
-	handler.GetA2AQueueStatus(c)
+	getA2AQueueStatusAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for missing row, got %d: %s", w.Code, w.Body.String())
@@ -83,7 +101,7 @@ func TestGetA2AQueueStatus_AuthMismatch(t *testing.T) {
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/"+queueID, nil)
 	c.Request.Header.Set("X-Workspace-ID", "ws-attacker")
 
-	handler.GetA2AQueueStatus(c)
+	getA2AQueueStatusAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for auth mismatch, got %d: %s", w.Code, w.Body.String())
@@ -120,7 +138,7 @@ func TestGetA2AQueueStatus_TargetCallerCanRead(t *testing.T) {
 	c.Request = httptest.NewRequest("GET", "/workspaces/ws-target/a2a/queue/"+queueID, nil)
 	c.Request.Header.Set("X-Workspace-ID", "ws-target")
 
-	handler.GetA2AQueueStatus(c)
+	getA2AQueueStatusAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for authorized caller, got %d: %s", w.Code, w.Body.String())

@@ -1,18 +1,23 @@
 ---
 title: "How Molecule AI's A2A Protocol Works: Peer-to-Peer Agent Communication"
-description: "A technical deep-dive into Molecule AI's A2A v1.0 implementation — JSON-RPC message format, SSE streaming, Redis key resolution, and the peer-to-peer routing model that keeps the platform out of your agent-to-agent traffic."
+description: "A technical deep-dive into Molecule AI's A2A v1.0 implementation — JSON-RPC, SSE, authenticated discovery, direct peer calls, and the platform proxy."
 date: 2026-04-23
 slug: a2a-protocol-deep-dive
 og_title: "How Molecule AI's A2A Protocol Works"
-og_description: "Peer-to-peer agent communication — JSON-RPC, SSE streams, Redis key resolution, and the routing model that keeps the platform out of your traffic."
+og_description: "Agent communication with JSON-RPC, SSE, authenticated discovery, direct peer calls, and an authenticated platform proxy."
 canonical: https://docs.molecule.ai/blog/a2a-protocol-deep-dive
 ---
 
-*Meta description (160 chars): Protocol-native A2A in production — JSON-RPC, SSE, peer-to-peer routing, and why the platform never touches your agent messages.*
+*Meta description (160 chars): Protocol-native A2A in production — JSON-RPC,
+SSE, authenticated discovery, direct peer calls, and a source-bound platform
+proxy.*
 
 ---
 
-Most A2A explainers stop at the message format. This one goes further: you'll see exactly what a message looks like on the wire, how agent discovery works without a central registry, and why Molecule AI's peer-to-peer routing model means the platform is architecturally incapable of reading your agent-to-agent traffic.
+Most A2A explainers stop at the message format. This one goes further: you'll
+see exactly what a message looks like on the wire, how authenticated registry
+discovery works, when runtimes call peers directly, and when traffic uses the
+platform proxy.
 
 If you're evaluating agent platforms, this is the layer that determines whether A2A is a feature or a constraint.
 
@@ -45,17 +50,24 @@ The `message/send` call — the core primitive — takes a target agent ID and a
 
 The `task_id` is client-generated and idempotent — if you send the same `task_id` twice, Molecule AI treats the second call as a duplicate and returns the cached response rather than re-executing. This is how you get at-least-once delivery without building your own deduplication layer.
 
-## Peer-to-Peer Routing
+## Platform Proxy Routing
 
 Here's the part that matters architecturally.
 
-When an agent sends a message, it POSTs to the platform's A2A proxy at `POST /workspaces/:id/a2a`. The proxy does three things:
+When an agent uses `POST /workspaces/:id/a2a`, the platform proxy does three
+things:
 
-1. **Validates** the caller's bearer token and `X-Workspace-ID` header
+1. **Authenticates** the caller and source-binds identity. For a workspace
+   caller, the bearer owner is authoritative; an optional `X-Workspace-ID`
+   claim must match it.
 2. **Looks up** the target workspace's current URL from the registry
-3. **Forwards** the message directly to the target — the platform writes the HTTP request, not the message content
+3. **Forwards** the message to the target and relays its HTTP response
 
-After forwarding, the platform's job is done. The response comes back directly from the target agent to the caller. The platform is never in the message path for the response.
+The platform remains in this proxy transport's HTTP request and response path.
+It parses and may enrich the JSON-RPC envelope, while the target agent handles
+the task semantics. Peer runtimes may instead use authenticated discovery and
+call the returned URL directly, in which case the platform leaves the message
+path after discovery.
 
 ```
 Agent A                          Platform                          Agent B
@@ -63,14 +75,16 @@ Agent A                          Platform                          Agent B
    |-- POST /workspaces/:id/a2a ----->|                                |
    |  { target: ws_B, content: ... }  |                                |
    |                                  |-- POST http://agent-b:3001 -->|
-   |                                  |  (original message, unchanged)|
+   |                                  |  (normalized/enriched JSON-RPC)|
    |                                  |                                |
    |                                  |<-- HTTP response --------------|
-   |<-- original A2A response --------|                                |
-   (platform proxy wrote the request, but the response is Agent B's)
+   |<-- relayed A2A response ----------|                                |
+   (the platform relays Agent B's HTTP response)
 ```
 
-The platform's role is a post office, not a router. It resolves addresses and drops envelopes. It does not read the letters.
+The proxy's role is an authenticated relay: it verifies the sender, applies the
+current hierarchy, resolves the address, and passes through the target's
+response.
 
 ### JSON-RPC Wrapping
 
@@ -152,7 +166,13 @@ The `last_seen` timestamp tells you whether the target is online. Agents that ha
 
 ## Authentication at Discovery Time
 
-Every discovery call and every A2A call requires a valid bearer token. The platform enforces this at the transport layer — not as a policy, not as a middleware configuration, but as a hard requirement on every authenticated route.
+Every discovery call requires `X-Workspace-ID`; token-enrolled workspace
+callers also present their matching bearer. Legacy no-token discovery remains
+bootstrap-compatible, but authentication datastore errors fail closed.
+Platform-proxied A2A requires a source-bound workspace bearer or a verified
+human/external-inbound credential. For workspace callers, an optional
+`X-Workspace-ID` must match the bearer owner. The platform enforces this before
+routing — not as a client-side convention or optional middleware setting.
 
 The `CanCommunicate(callerID, targetID)` check runs before any message is forwarded:
 
@@ -162,25 +182,23 @@ def CanCommunicate(caller_id: str, target_id: str) -> bool:
     if caller_id == target_id:
         return True
 
-    # Parent-child relationship — allowed
-    if is_parent_of(caller_id, target_id):
-        return True
-    if is_parent_of(target_id, caller_id):
+    # Same non-root-parent siblings — allowed
+    if share_non_root_parent(caller_id, target_id):
         return True
 
-    # Siblings (same parent) — allowed
-    if share_parent(caller_id, target_id):
+    # Ancestor/descendant in either direction, at any depth — allowed
+    if is_ancestor_of(caller_id, target_id):
+        return True
+    if is_ancestor_of(target_id, caller_id):
         return True
 
-    # Root-level siblings (both parent_id IS NULL) — allowed
-    if both_root_level(caller_id, target_id):
-        return True
-
-    # Everything else — denied
+    # Unrelated roots and disjoint subtrees — denied
     return False
 ```
 
-The same-workspace check means any two agents in the same workspace can communicate without going through a hierarchy approval — they are, by definition, in the same trust boundary. Cross-workspace communication requires either a parent-child relationship or sibling-sharing.
+Self-calls are in the same trust boundary. Cross-workspace communication
+requires either the same non-root parent or an ancestor/descendant relationship
+at any depth. Unrelated roots and disjoint subtrees are denied.
 
 This is enforced in `workspace-server/internal/registry/access.go`. The Go implementation is the authoritative reference — the Python pseudocode above reflects the logic, not the production code.
 
@@ -224,13 +242,26 @@ The full cycle: heartbeat TTL expires → `WORKSPACE_OFFLINE` broadcast → canv
 
 The peer-to-peer model has concrete implications for teams building on Molecule AI.
 
-**Latency:** Messages go agent-to-agent after the initial discovery hop. The platform adds one round-trip overhead (the discovery call), then all subsequent traffic is direct. For agents behind the same Redis pub/sub bus, latency is sub-millisecond.
+**Latency:** Direct peer mode pays the discovery hop and then calls the target
+URL directly. Proxy mode adds a platform relay on every request and response;
+it is the appropriate path when the caller cannot reach the peer URL or needs
+the proxy's current authorization and queue behavior.
 
-**Privacy:** The platform proxy never reads message content. It resolves addresses, enforces auth, and forwards bytes. If your compliance team requires that messages between agents are never visible to the platform operator, the architecture satisfies that requirement structurally — not by policy.
+**Privacy:** Direct peer mode leaves the tenant platform message path after
+discovery. Proxy mode parses and normalizes the JSON-RPC envelope, may inject
+metadata, records activity, forwards the request, and relays the response. Do
+not treat the proxy as operator-blind; use direct transport and appropriate
+end-to-end content protection when that is a compliance requirement.
 
-**Scalability:** The registry is a Redis key-value store, not a database. Registration, heartbeat, and discovery are all O(1) operations. There's no central message queue to saturate, no fan-out bottleneck, no single point of contention.
+**Scalability:** Postgres is the registry source of truth and Redis caches
+liveness and URLs. Direct traffic does not load the proxy after discovery;
+proxied traffic does, so capacity planning must include the tenant
+workspace-server relay and any queue fallback.
 
-**Auditability:** Every call to the A2A proxy is logged to `structure_events` with the caller's bearer token prefix and `X-Workspace-ID`. The audit trail captures who messaged whom and when — it doesn't capture the message content itself, which stays between the two agents.
+**Auditability:** Authenticated A2A traffic that reaches routing is attributed
+using the server-verified caller identity. Workspace attribution comes from the
+bearer owner, not from trusting `X-Workspace-ID`; a supplied claim is accepted
+only when it matches.
 
 ## LangGraph Is Shipping A2A — Here's the Difference
 
@@ -242,9 +273,9 @@ The gap is governance:
 |---|---|---|
 | JSON-RPC message format | ✅ Production | ✅ In review |
 | Agent discovery | ✅ On-demand | ✅ In review |
-| Peer-to-peer routing | ✅ Platform never in message path | ⚠️ Proxy in path |
+| Routing modes | ✅ Direct after discovery + authenticated proxy | ⚠️ Proxy in path |
 | Per-workspace auth tokens | ✅ Phase 30 | ❌ Not in current PRs |
-| `X-Workspace-ID` enforcement | ✅ Protocol-level | ❌ Not in current PRs |
+| Optional `X-Workspace-ID` source binding | ✅ Protocol-level | ❌ Not in current PRs |
 | `CanCommunicate` access model | ✅ Production | ❌ Not in current PRs |
 | Cross-network federation | ✅ Phase 30 | ❌ Not in current PRs |
 | Org-scoped delegation attribution | ✅ Phase 33 | ❌ Not in current PRs |
@@ -253,8 +284,8 @@ Molecule AI's A2A implementation is production-ready today. The governance featu
 
 ## Get Started
 
-To register an external agent, follow the [External Agent Registration Guide](https://docs.molecule.ai/docs/guides/external-agent-registration). The A2A protocol spec with full JSON-RPC reference is at [docs/api-protocol/a2a-protocol.md](https://docs.molecule.ai/docs/api-protocol/a2a-protocol).
+To register an external agent, follow the [External Agent Registration Guide](/docs/guides/external-agent-registration). The A2A protocol spec with full JSON-RPC reference is at [docs/api-protocol/a2a-protocol.md](/docs/api-protocol/a2a-protocol).
 
 For the MCP server that wraps the platform API: `npx @molecule-ai/mcp-server`.
 
-If you're building a multi-agent workflow and want to understand how the pieces fit together, the [workspace runtime docs](https://docs.molecule.ai/docs/agent-runtime/workspace-runtime) cover the adapter model and how external agents integrate.
+If you're building a multi-agent workflow and want to understand how the pieces fit together, the [workspace runtime docs](/docs/agent-runtime/workspace-runtime) cover the adapter model and how external agents integrate.
