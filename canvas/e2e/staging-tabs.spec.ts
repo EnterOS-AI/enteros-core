@@ -8,8 +8,12 @@
  * token OR a WorkOS session cookie. Playwright can't mint a WorkOS
  * session, so we feed the per-tenant admin token (fetched in global
  * setup via GET /cp/admin/orgs/:slug/admin-token) as an Authorization:
- * Bearer header via context.setExtraHTTPHeaders(). Every browser
- * request inherits the header.
+ * Bearer header via context.setExtraHTTPHeaders(). Every browser HTTP request
+ * inherits the header. Browser WebSocket constructors cannot set that header,
+ * so the E2E-only init bridge offers the same fresh-org token through the
+ * existing molecule-auth subprotocol contract on the exact same-origin /ws
+ * route. Production users continue to authenticate that socket with their
+ * HttpOnly WorkOS session cookie.
  *
  * PROMOTION-READINESS (see § at bottom of file): this suite is being
  * hardened toward becoming a HARD merge-gate. It currently runs under
@@ -32,6 +36,7 @@
 
 import { test, expect, type Page } from "@playwright/test";
 import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
+import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 
 // Tab ids as declared in canvas/src/components/SidePanel.tsx TABS.
 //
@@ -240,7 +245,7 @@ test.describe("staging canvas tabs", () => {
     }
 
     // Attach the per-tenant admin bearer AND the X-Molecule-Org-Id
-    // cross-org header to every outbound request. The tenant platform's
+    // cross-org header to every outbound HTTP request. The tenant platform's
     // AdminAuth middleware accepts the bearer; the TenantGuard
     // middleware (workspace-server) requires X-Molecule-Org-Id. Both
     // are needed; missing either is a HARD 401, not a graceful degrade.
@@ -248,6 +253,14 @@ test.describe("staging canvas tabs", () => {
     await context.setExtraHTTPHeaders({
       Authorization: `Bearer ${tenantToken}`,
       "X-Molecule-Org-Id": orgID,
+    });
+    // WebSocket() cannot inherit Authorization. Offer this throwaway org's
+    // bearer only when both the document and exact /ws handshake match this
+    // pinned tenant origin; nothing is baked into the Canvas bundle and real
+    // WorkOS-cookie behavior is unchanged.
+    await installStagingWebSocketAuth(context, {
+      token: tenantToken,
+      tenantURL,
     });
 
     // canvas/src/components/AuthGate.tsx fetches /cp/auth/me on mount

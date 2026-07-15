@@ -51,6 +51,7 @@
 import { test, expect, type Page, type BrowserContext } from "@playwright/test";
 import { agentRepliesForTurn, type SimpleMessage } from "../src/lib/conciergeChatInvariants";
 import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
+import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -82,8 +83,13 @@ function tenantEnv() {
 
 /** Bearer on every request, stub /cp/auth/me, and turn stray 401s into empty
  *  JSON so a workspace-scoped 401 can't yank us to AuthKit. */
-async function authenticate(context: BrowserContext, token: string) {
+async function authenticate(
+  context: BrowserContext,
+  tenantURL: string,
+  token: string,
+) {
   await context.setExtraHTTPHeaders({ Authorization: `Bearer ${token}` });
+  await installStagingWebSocketAuth(context, { token, tenantURL });
   await context.addInitScript(() => {
     window.localStorage.setItem(
       "molecule_cookie_consent",
@@ -203,7 +209,7 @@ test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no dup
   // happy path (~60-110s), never waited out on success.
   test.setTimeout(15 * 60 * 1000);
   const { tenantURL, tenantToken } = tenantEnv();
-  await authenticate(context, tenantToken);
+  await authenticate(context, tenantURL, tenantToken);
 
   page.on("console", (m) => {
     if (m.type() === "error") console.log(`[console-error] ${m.text()}`);

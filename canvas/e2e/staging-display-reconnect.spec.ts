@@ -47,6 +47,7 @@
 
 import { test, expect } from "@playwright/test";
 import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
+import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -257,10 +258,14 @@ test.describe("staging desktop take-control — reconnect + lease renewal (core#
   }
 
   test.beforeEach(async ({ context }) => {
-    const { tenantToken, orgID } = resolveTenant();
+    const { tenantURL, tenantToken, orgID } = resolveTenant();
     await context.setExtraHTTPHeaders({
       Authorization: `Bearer ${tenantToken}`,
       ...(orgID ? { "X-Molecule-Org-Id": orgID } : {}),
+    });
+    await installStagingWebSocketAuth(context, {
+      token: tenantToken,
+      tenantURL,
     });
   });
 

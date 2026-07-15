@@ -40,14 +40,16 @@
  * online.
  *
  * Auth model is identical to staging-tabs.spec.ts: feed the per-tenant admin
- * token as an Authorization: Bearer header on every browser request, mock
- * /cp/auth/me so AuthGate resolves, and fall any non-auth 401 back to an
- * empty 200 so a workspace-scoped 401 can't yank us to AuthKit.
+ * token as an Authorization: Bearer header on every browser HTTP request,
+ * offer it on the exact /ws subprotocol through E2E-only init data, mock
+ * /cp/auth/me so AuthGate resolves, and fall any non-auth 401 back to an empty
+ * 200 so a workspace-scoped 401 can't yank us to AuthKit.
  */
 
 import { test, expect, type Page, type BrowserContext } from "@playwright/test";
 import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
 import { fulfillStagingFetchedResponse } from "./support/stagingRouteFulfill";
+import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -157,16 +159,22 @@ async function ensurePlatformAgent(
 }
 
 /**
- * Wire the per-tenant bearer + the /cp/auth/me mock + the 401→empty-200
- * fallback. Verbatim contract from staging-tabs.spec.ts so the concierge spec
- * authenticates identically (no WorkOS session available to Playwright).
+ * Wire the per-tenant HTTP + /ws bearer, the /cp/auth/me mock, and the
+ * 401→empty-200 fallback. Same contract as staging-tabs.spec.ts so the
+ * concierge spec authenticates identically (no WorkOS session is available to
+ * Playwright; production's HttpOnly session path remains unchanged).
  */
 async function authenticate(
   context: BrowserContext,
+  tenantURL: string,
   tenantToken: string,
   workspaceId: string,
 ): Promise<void> {
   await context.setExtraHTTPHeaders({ Authorization: `Bearer ${tenantToken}` });
+  await installStagingWebSocketAuth(context, {
+    token: tenantToken,
+    tenantURL,
+  });
 
   await context.route("**/cp/auth/me", (route) =>
     route.fulfill({
@@ -273,7 +281,7 @@ test.beforeEach(async ({ page, context }) => {
       }),
     );
   });
-  await authenticate(context, tenantToken, workspaceId);
+  await authenticate(context, tenantURL, tenantToken, workspaceId);
   const { installed, name } = await ensurePlatformAgent(page, tenantURL, tenantToken, orgID);
   platformInstalled = installed;
   platformAgentName = name;
