@@ -33,8 +33,8 @@ type httpClient interface {
 // Inbound messages are received via Discord's Interactions endpoint (slash
 // commands and message components). Discord POSTs a signed JSON payload to the
 // configured Interactions URL; ParseWebhook extracts the text and returns a
-// standardized InboundMessage. Signature verification must be performed at
-// the router layer before calling ParseWebhook.
+// standardized InboundMessage. The public webhook handler verifies each
+// request against the candidate row's Ed25519 public key before parsing.
 //
 // StartPolling returns nil immediately — Discord does not support long-polling;
 // use the Interactions webhook route instead.
@@ -62,11 +62,18 @@ func (d *DiscordAdapter) ConfigSchema() []ConfigField {
 			Help:        "From Server Settings → Integrations → Webhooks → Copy URL.",
 		},
 		{
+			Key:         "chat_id",
+			Label:       "Discord Channel ID",
+			Type:        "text",
+			Required:    false,
+			Placeholder: "optional — required for inbound slash commands",
+			Help:        "Enable Developer Mode in Discord, then right-click the destination channel and choose Copy Channel ID. Only needed for inbound commands.",
+		},
+		{
 			Key:         "public_key",
 			Label:       "Interactions Public Key (hex)",
-			Type:        "password",
+			Type:        "text",
 			Required:    false,
-			Sensitive:   true,
 			Placeholder: "optional — for inbound slash commands",
 			Help:        "Ed25519 public key from the Discord Developer Portal → General Information. Only needed to receive slash commands.",
 		},
@@ -183,6 +190,7 @@ func (d *DiscordAdapter) ParseWebhook(c *gin.Context, _ map[string]interface{}) 
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("discord: parse interaction: %w", err)
 	}
+	c.Set("discord_interaction_type", payload.Type)
 
 	// Type 1: PING from Discord during endpoint verification — let the handler layer respond.
 	if payload.Type == 1 {

@@ -39,6 +39,21 @@ func TestDiscordAdapter_DisplayName(t *testing.T) {
 	}
 }
 
+func TestDiscordAdapter_ConfigSchema_SupportsAuthenticatedInbound(t *testing.T) {
+	fields := (&DiscordAdapter{}).ConfigSchema()
+	got := make(map[string]ConfigField, len(fields))
+	for _, field := range fields {
+		got[field.Key] = field
+	}
+
+	if field, ok := got["chat_id"]; !ok || field.Required {
+		t.Fatalf("chat_id must be available as an optional inbound-routing field: %+v", field)
+	}
+	if field, ok := got["public_key"]; !ok || field.Required || field.Sensitive || field.Type != "text" {
+		t.Fatalf("public_key must be an optional, non-secret text field: %+v", field)
+	}
+}
+
 func TestDiscordAdapter_ValidateConfig_Valid(t *testing.T) {
 	a := &DiscordAdapter{}
 	err := a.ValidateConfig(map[string]interface{}{
@@ -68,7 +83,7 @@ func TestDiscordAdapter_ValidateConfig_EmptyWebhookURL(t *testing.T) {
 func TestDiscordAdapter_ValidateConfig_InvalidPrefix(t *testing.T) {
 	a := &DiscordAdapter{}
 	cases := []string{
-		"http://discord.com/api/webhooks/1/abc",            // wrong scheme
+		"http://discord.com/api/webhooks/1/abc",           // wrong scheme
 		"https://evil.example.com/discord-hook",           // wrong host
 		"https://discord.com.evil.com/api/webhooks/1/abc", // SSRF lookalike
 		"not-a-url",
