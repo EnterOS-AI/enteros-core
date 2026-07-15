@@ -17,6 +17,8 @@ package handlers
 //     OR an org-level token (canvas/admin) can see anything.
 //
 //   - Missing identity -> 401 Unauthorized (no existence leak).
+//     X-Workspace-ID alone is not identity; workspace ownership is derived
+//     from the bearer. Invalid credentials and auth lookup failures also 401.
 //
 //   - Authenticated caller, row not found -> 404 Not Found with
 //     retryable=true so 202-polling clients can retry the not-yet-enqueued
@@ -50,7 +52,6 @@ import (
 	"net/http"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -191,8 +192,8 @@ func queueRowAuthFields(ctx context.Context, queueID string) (callerID, workspac
 //
 // Auth flow:
 //
-//  1. Extract caller's workspace from bearer (org tokens grant org-wide
-//     access and short-circuit the per-row check).
+//  1. Authenticate the caller. Workspace identity comes from the bearer;
+//     verified human credentials grant org-wide access.
 //  2. Look up queue row's (caller_id, workspace_id).
 //  3. Allow when caller's workspace == queue.caller_id OR
 //     == queue.workspace_id, OR caller has org-level access.
@@ -208,23 +209,8 @@ func (h *WorkspaceHandler) GetA2AQueueStatus(c *gin.Context) {
 		return
 	}
 
-	// Org-level token (canvas/admin)? Bypass per-row caller match.
-	_, isOrg := c.Get("org_token_id")
-
-	// Derive caller workspace from bearer when not org-token.
-	callerWorkspace := c.GetHeader("X-Workspace-ID")
-	if !isOrg && callerWorkspace == "" {
-		if tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization")); tok != "" {
-			if wsID, err := wsauth.WorkspaceFromToken(ctx, db.DB, tok); err == nil {
-				callerWorkspace = wsID
-			}
-		}
-	}
-	if !isOrg && callerWorkspace == "" {
-		// Missing identity — tell the caller to authenticate/retry with
-		// proper credentials. This does NOT leak queue existence; an
-		// unauthenticated probe cannot tell whether the queue_id exists.
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "caller identity required"})
+	callerWorkspace, isPrivileged, authErr := authenticateA2AHTTPCaller(ctx, c, c.GetHeader("X-Workspace-ID"))
+	if authErr != nil {
 		return
 	}
 
@@ -245,7 +231,7 @@ func (h *WorkspaceHandler) GetA2AQueueStatus(c *gin.Context) {
 	}
 
 	// Access check.
-	if !isOrg && callerWorkspace != rowCallerID && callerWorkspace != rowWorkspaceID {
+	if !isPrivileged && callerWorkspace != rowCallerID && callerWorkspace != rowWorkspaceID {
 		// Auth mismatch — distinct from missing row so the polling client
 		// knows to stop retrying and fix identity alignment.
 		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})

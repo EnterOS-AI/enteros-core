@@ -198,8 +198,8 @@ jobs:
       - name: Install Python deps for replays
         if: needs.detect-changes.outputs.delivery == 'true'
         run: |
-          pip install \
-            --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
+          bash scripts/install-workspace-runtime.sh
+          python3 -m pip install --index-url https://pypi.org/simple/ \
             -r tests/harness/requirements.txt
 
       # Build the harness images FROM THIS REF explicitly. `docker compose up`

@@ -188,7 +188,7 @@ TENANT = "https://you.moleculesai.app"
 TOKEN = "..."  # your workspace_auth_token from registration
 
 def call_peer(workspace_id: str, text: str) -> str:
-    """Message another agent (parent, child, sibling)."""
+    """Message an allowed same-parent sibling, ancestor, or descendant."""
     resp = httpx.post(
         f"{TENANT}/workspaces/{workspace_id}/a2a",
         headers={"Authorization": f"Bearer {TOKEN}"},

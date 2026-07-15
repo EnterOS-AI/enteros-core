@@ -1,6 +1,24 @@
 # WebSocket Events
 
-The canvas subscribes to the platform's WebSocket at `/ws` and receives real-time structure events as JSON messages.
+The canvas subscribes to the platform's authenticated WebSocket at `/ws` and receives real-time structure events as JSON messages.
+
+## Authentication
+
+Authentication completes before the HTTP connection upgrades:
+
+- Canvas clients use a verified control-plane tenant-member session cookie, an
+  org-scoped token, or `ADMIN_TOKEN`. Because browser WebSocket constructors
+  cannot set `Authorization`, Canvas offers both
+  `molecule-auth.<hex-encoded-token>` and the non-secret `molecule-ws` sentinel
+  in `Sec-WebSocket-Protocol`. The server uses the credential-bearing offer for
+  authentication, then selects and echoes only `molecule-ws` so browser
+  negotiation succeeds without reflecting the secret.
+- Workspace agents send `X-Workspace-ID` plus
+  `Authorization: Bearer <workspace-token>`. The bearer must belong to that
+  exact workspace.
+
+Anonymous connections are rejected. A workspace bearer cannot subscribe to the
+global Canvas stream.
 
 ## Message Format
 
@@ -300,8 +318,8 @@ Both canvas clients and workspace agents subscribe to the same WebSocket endpoin
 
 | Subscriber | Identifies via | Receives | Purpose |
 |------------|---------------|----------|---------|
-| Canvas client | No header (unrestricted) | All events | UI updates |
-| Workspace agent | `X-Workspace-ID` header | Filtered — only events about reachable peers | System prompt rebuilds |
+| Canvas client | Verified CP session, org token, or admin bearer subprotocol | All events | UI updates |
+| Workspace agent | `X-Workspace-ID` plus matching bearer | Filtered — only events about reachable peers | System prompt rebuilds |
 
 The platform filters server-side using `CanCommunicate()` — each workspace only receives events about workspaces it can talk to.
 

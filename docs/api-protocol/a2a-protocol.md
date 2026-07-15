@@ -1,10 +1,16 @@
 # A2A Protocol (Inter-Workspace Communication)
 
-Workspaces talk to each other **directly** via A2A (Agent-to-Agent protocol) — the platform is not in the message path.
+Molecule supports two A2A (Agent-to-Agent protocol) transports: runtimes can
+call a discovered peer **directly**, or callers can use the platform's
+authenticated A2A proxy.
 
 ## How It Works
 
-Every workspace is an A2A server. The platform is an A2A client when it needs to communicate with workspaces. Workspaces communicate with each other directly — the platform only handles discovery.
+Every workspace is an A2A server. For direct peer transport, the platform
+authorizes discovery and returns a reachable URL, then leaves the message path.
+For Canvas, external inbound, queue fallback, and server-side delegation, the
+platform proxy authenticates, authorizes, forwards the request, and relays the
+response.
 
 ```
 Business Core (A2A client)  ->  Developer PM (A2A server)
@@ -16,16 +22,20 @@ Business Core (A2A client)  ->  Developer PM (A2A server)
 
 How Business Core finds Developer PM's URL:
 
-1. Business Core asks platform: `GET /registry/discover/developer-pm-id` with `X-Workspace-ID` header
-2. Platform checks `CanCommunicate()` for the caller/target pair
-3. Platform resolves the URL:
-   - **Workspace caller** (has `X-Workspace-ID`): returns Docker-internal URL from `ws:{id}:internal_url` Redis key — containers can reach each other by hostname on the Docker network
-   - **Canvas/external** (no header): returns host-mapped URL from `ws:{id}:url` Redis key — the ephemeral `127.0.0.1:PORT` bound by the provisioner
-4. If cache miss, platform reads from Postgres, refreshes cache
+1. Business Core asks the platform: `GET /registry/discover/developer-pm-id`
+   with its required `X-Workspace-ID` claim and its bearer when token-enrolled.
+2. The platform validates the discovery credential and checks
+   `CanCommunicate()` for the caller/target pair.
+3. The platform returns the URL appropriate to the target and caller runtime:
+   an external target's registered URL, or a Docker-internal URL for a local
+   workspace target.
+4. On a cache miss, the platform reads from Postgres and refreshes the cache.
 5. Business Core sends A2A JSON-RPC message **directly** to Developer PM
 6. Developer PM processes the task and responds
 
-The platform is **only** involved in URL resolution. The actual task messages go workspace-to-workspace.
+For this direct transport, the platform is involved only in authenticated URL
+resolution. The separate proxy transport remains in the request and response
+path as described below.
 
 ## Message Format
 
@@ -63,14 +73,27 @@ On-demand fits naturally with how agents work — an agent only needs to know ab
 
 ## Authentication Between Workspaces
 
-**MVP: discovery-time validation only.** The platform validates `CanCommunicate()` when workspace A calls `GET /registry/discover/:id` (using `X-Workspace-ID` header). Once A has B's URL, direct A2A calls are unauthenticated.
+**Direct peer transport:** The platform validates the discovery caller and
+`CanCommunicate()` when workspace A calls `GET /registry/discover/:id`. That
+route requires `X-Workspace-ID`; an enrolled workspace also presents its own
+bearer. Once A has B's URL, a direct request to B's agent server does not pass
+through the platform's HTTP A2A authenticator.
 
-This is acceptable for MVP because:
-- All workspaces are provisioned by the same platform on trusted infrastructure
-- Docker network isolation (`molecule-core-net`) limits who can reach workspace endpoints
-- The tool is self-hosted — the operator controls the network
+Direct transport therefore relies on the target network's trust boundary after
+discovery. It is appropriate only when peer endpoints are isolated accordingly
+(for example, a self-hosted Docker network controlled by one operator). Use the
+platform proxy when the caller needs current source authentication and
+hierarchy enforcement on each request.
 
 **Known gap:** Once workspace A caches workspace B's URL, nothing stops A from calling B directly even after the hierarchy changes and A is no longer supposed to reach B. The cached URL remains valid until the container is restarted or the URL changes.
+
+**Platform proxy transport:** `POST /workspaces/:id/a2a` is a separate path.
+It authenticates workspace callers with a source-bound bearer and applies the
+current hierarchy before dispatch. Verified control-plane sessions,
+`ADMIN_TOKEN`, org tokens, and authenticated external inbound requests are
+privileged non-workspace paths. A combined self-host/dev Canvas may use the
+same-origin fallback only when control-plane session verification is not
+configured; SaaS never accepts same-origin headers as authentication.
 
 **Post-MVP fix — platform-issued tokens:** On discovery, the platform issues a short-lived signed token scoped to the specific caller/target pair. The target workspace validates the token on every A2A request. When the hierarchy changes, old tokens expire and new discovery attempts are blocked by `CanCommunicate()`.
 
@@ -211,14 +234,19 @@ On completion, the task returns artifacts:
 
 The canvas (browser) cannot reach Docker-internal agent URLs directly. The platform provides `POST /workspaces/:id/a2a` as a proxy:
 
-1. Canvas sends JSON-RPC to the platform proxy
-2. Proxy resolves the agent's host-accessible URL from Redis cache (falls back to DB)
-3. If the request lacks a `jsonrpc` field, the proxy wraps it in a JSON-RPC 2.0 envelope with a generated UUID
-4. If `params.message.messageId` is missing, the proxy injects one (required by a2a-sdk)
-5. Proxy forwards the request to the agent (120s timeout, 10MB response limit)
-6. Agent response is returned to the caller
+1. The caller presents a workspace bearer, verified control-plane session, `ADMIN_TOKEN`, org token, or the target-bound external inbound secret. A combined self-host/dev Canvas may use same-origin only when control-plane session verification is unconfigured.
+2. For workspace callers, the platform derives the source workspace from the bearer. `X-Workspace-ID`, when supplied, must match that identity.
+3. The proxy enforces hierarchy and same-org access before resolving the target.
+4. The proxy resolves the agent's host-accessible URL from Redis cache (falls back to DB).
+5. If the request lacks a `jsonrpc` field, the proxy wraps it in a JSON-RPC 2.0 envelope with a generated UUID.
+6. If `params.message.messageId` is missing, the proxy injects one (required by a2a-sdk).
+7. The proxy forwards the request to the agent and returns the response.
 
-This proxy is the **only** way the canvas communicates with agents. Workspace-to-workspace communication is direct (no proxy).
+Missing, revoked, tokenless legacy, forged-self, mismatched-header, and auth
+datastore-error cases fail closed before dispatch. The only no-bearer Canvas
+compatibility path is the CP-unconfigured same-origin case above. A raw direct
+call to a discovered agent URL is outside the platform proxy authorization
+boundary.
 
 ## Key Properties
 
@@ -227,8 +255,8 @@ This proxy is the **only** way the canvas communicates with agents. Workspace-to
 - **On-demand:** Workspaces discover peers when needed, not at startup
 - **Opaque execution:** The caller doesn't know (or care) what's inside the callee
 - **Interoperable:** Any A2A-compliant agent from any framework can plug in
-- **Direct:** Workspace-to-workspace messages go direct; canvas uses platform proxy
-- **MVP auth:** Discovery-time only; post-MVP adds signed tokens
+- **Source-bound proxy auth:** Workspace bearer ownership is the authoritative caller identity on the platform proxy
+- **Fail-closed:** Invalid credentials and auth lookup failures never downgrade to canvas traffic
 
 ## Related Docs
 

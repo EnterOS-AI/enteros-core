@@ -635,7 +635,7 @@ func TestProxyA2A_JSONRPCWrapping(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-proxy/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	// Give the async LogActivity goroutine a moment to complete
 	time.Sleep(50 * time.Millisecond)
@@ -686,7 +686,7 @@ func TestProxyA2A_WorkspaceNotFound(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-missing/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected status 404, got %d: %s", w.Code, w.Body.String())
@@ -716,7 +716,7 @@ func TestProxyA2A_WorkspaceOffline(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/workspaces/ws-offline/a2a", bytes.NewBufferString(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	handler.ProxyA2A(c)
+	proxyA2AAuthenticatedForTest(handler, c)
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected status 503, got %d: %s", w.Code, w.Body.String())

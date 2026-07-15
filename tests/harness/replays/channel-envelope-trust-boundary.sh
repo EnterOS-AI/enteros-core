@@ -51,11 +51,11 @@ assert() {
 }
 
 # ─── Phase A: wheel version contains the fix ───────────────────────────
-echo "[replay] A. confirming installed molecule-ai-workspace-runtime contains #2481..."
-INSTALLED=$(pip3 show molecule-ai-workspace-runtime 2>/dev/null | awk -F': ' '/^Version:/ {print $2}')
+echo "[replay] A. confirming installed molecules-workspace-runtime contains #2481..."
+INSTALLED=$(pip3 show molecules-workspace-runtime 2>/dev/null | awk -F': ' '/^Version:/ {print $2}')
 if [ -z "$INSTALLED" ]; then
-    echo "[replay] FAIL A: molecule-ai-workspace-runtime not installed."
-    echo "         Install: pip3 install molecule-ai-workspace-runtime"
+    echo "[replay] FAIL A: molecules-workspace-runtime not installed."
+    echo "         Install from the repo root: bash scripts/install-workspace-runtime.sh"
     exit 2
 fi
 echo "[replay]   installed version: $INSTALLED"
@@ -69,7 +69,7 @@ print('yes' if parse('$INSTALLED') >= parse('0.1.78') else 'no')
 " 2>/dev/null || echo "unknown")
 if [ "$HAS_FIX" != "yes" ]; then
     echo "[replay] FAIL A: installed $INSTALLED < 0.1.78 (the version that shipped the #2481 fix)."
-    echo "         Upgrade: pip3 install --upgrade molecule-ai-workspace-runtime"
+    echo "         Upgrade from the repo root: bash scripts/install-workspace-runtime.sh"
     exit 2
 fi
 echo "[replay]   ✓ contains #2481 trust-boundary fix"

@@ -8,6 +8,124 @@ ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "deploy" / "advance-staging-tenant-pin.sh"
 
 
+def test_digest_resolution_is_independent_of_a_previous_runner_cache(tmp_path: Path):
+    """A downstream job must pull the tag before inspecting its local daemon.
+
+    Gitea may schedule ``await-image`` and ``advance-pin`` on different runners.
+    The registry tag is the shared handoff; a Docker image cached by the first
+    runner is not. Reproduce that boundary with an initially empty fake daemon.
+    """
+    digest = "sha256:" + "9" * 64
+    github_sha = "deadbeef1234567890abcdef1234567890abcdef"
+    pulled = tmp_path / "pulled"
+
+    docker = tmp_path / "docker"
+    docker.write_text(
+        f"""#!/bin/sh
+if [ "$1" = "pull" ] && [ "$2" = "registry.test/molecule-tenant:staging-deadbee" ]; then
+  : > "{pulled}"
+  exit 0
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ -f "{pulled}" ]; then
+  echo "{digest}"
+  exit 0
+fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+
+    curl = tmp_path / "curl"
+    curl.write_text(
+        f"""#!/bin/sh
+printf '%s\\n' '{{"pins":[{{"template_name":"molecule-tenant","region":"global","image_digest":"{digest}","git_sha":"{github_sha}"}}]}}'
+""",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{tmp_path}{os.pathsep}{env['PATH']}",
+            "CP_ADMIN_API_TOKEN": "test-token",
+            "CP_BASE_URL": "https://staging-api.test",
+            "TENANT_IMAGE_NAME": "registry.test/molecule-tenant",
+            "GITHUB_SHA": github_sha,
+            "GITHUB_OUTPUT": str(tmp_path / "github-output"),
+            "SKIP_SSOT_WRITE": "1",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--tag", "staging-deadbee"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert pulled.exists(), "the downstream runner never pulled the registry tag"
+
+
+def test_failed_pull_cannot_fall_back_to_a_stale_local_tag(tmp_path: Path):
+    stale_digest = "sha256:" + "8" * 64
+    called = tmp_path / "curl-called"
+
+    docker = tmp_path / "docker"
+    docker.write_text(
+        f"""#!/bin/sh
+if [ "$1" = "pull" ]; then
+  exit 42
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  echo "{stale_digest}"
+  exit 0
+fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+
+    curl = tmp_path / "curl"
+    curl.write_text(
+        f"""#!/bin/sh
+: > "{called}"
+printf '%s\\n' '{{"pins":[]}}'
+""",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{tmp_path}{os.pathsep}{env['PATH']}",
+            "CP_ADMIN_API_TOKEN": "test-token",
+            "TENANT_IMAGE_NAME": "registry.test/molecule-tenant",
+            "SKIP_SSOT_WRITE": "1",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--tag", "staging-deadbee"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode != 0, "a failed registry pull reused a stale local image"
+    assert not called.exists(), "the script mutated/read CP state after digest resolution failed"
+
+
 def test_advance_staging_tenant_pin_promotes_cp_runtime_pin(tmp_path: Path):
     new_digest = "sha256:" + "a" * 64
     old_digest = "sha256:" + "b" * 64
@@ -19,6 +137,9 @@ def test_advance_staging_tenant_pin_promotes_cp_runtime_pin(tmp_path: Path):
     docker = tmp_path / "docker"
     docker.write_text(
         f"""#!/bin/sh
+if [ "$1" = "pull" ]; then
+  exit 0
+fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ "$3" = "registry.test/molecule-tenant:staging-deadbee" ]; then
   echo "{new_digest}"
   exit 0
@@ -138,6 +259,9 @@ def test_ssot_write_fails_closed_without_infisical(tmp_path: Path):
     docker = tmp_path / "docker"
     docker.write_text(
         f"""#!/bin/sh
+if [ "$1" = "pull" ]; then
+  exit 0
+fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   echo "{resolved}"
   exit 0
@@ -205,6 +329,9 @@ def test_ssot_write_lands_the_ref_at_the_boot_default_path(tmp_path: Path):
     docker = tmp_path / "docker"
     docker.write_text(
         f"""#!/bin/sh
+if [ "$1" = "pull" ]; then
+  exit 0
+fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   echo "{resolved}"
   exit 0
