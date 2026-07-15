@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -331,11 +332,11 @@ func TestRenderedRuntimeSnippets_StopAfterConfigurationFailure(t *testing.T) {
 	const stub = `#!/usr/bin/env bash
 name="${0##*/}"
 printf '%s %s\n' "$name" "$*" >> "$CALL_LOG"
-if [[ "$name $*" == "openclaw gateway"* ]]; then
-  : > "$BACKGROUND_DONE"
-fi
 if [[ "$name $*" == *"$FAIL_NEEDLE"* ]]; then
   exit 42
+fi
+if [[ -n "${BACKGROUND_COMMAND:-}" && "$name $*" == "$BACKGROUND_COMMAND"* ]]; then
+  printf . >&3
 fi
 exit 0
 `
@@ -347,22 +348,22 @@ exit 0
 
 	payload := BuildExternalConnectionPayload("https://app.example.com", "ws-abc123", "My Agent", "wst_live_TESTTOKEN")
 	for _, tc := range []struct {
-		name       string
-		field      string
-		failNeedle string
-		mustNotRun []string
+		name              string
+		field             string
+		failNeedle        string
+		backgroundCommand string
+		mustNotRun        []string
 	}{
 		{name: "Claude channel config", field: "claude_code_channel_snippet", failNeedle: "bun -e", mustNotRun: []string{"claude --dangerously-load-development-channels"}},
 		{name: "universal MCP", field: "universal_mcp_snippet", failNeedle: "claude mcp add"},
 		{name: "Hermes", field: "hermes_channel_snippet", failNeedle: "hermes gateway --replace"},
 		{name: "OpenClaw", field: "openclaw_snippet", failNeedle: "openclaw mcp set", mustNotRun: []string{"openclaw gateway", "openclaw agent"}},
-		{name: "OpenClaw agent", field: "openclaw_snippet", failNeedle: "openclaw agent"},
-		{name: "Codex agent", field: "codex_snippet", failNeedle: "codex "},
+		{name: "OpenClaw agent", field: "openclaw_snippet", failNeedle: "openclaw agent", backgroundCommand: "openclaw gateway"},
+		{name: "Codex agent", field: "codex_snippet", failNeedle: "codex ", backgroundCommand: "codex-channel-molecule"},
 		{name: "Kimi bridge", field: "kimi_snippet", failNeedle: "kimi_bridge.py"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logPath := filepath.Join(t.TempDir(), "calls.log")
-			backgroundDone := filepath.Join(t.TempDir(), "openclaw-gateway.done")
 			snippet, ok := payload[tc.field].(string)
 			if !ok {
 				t.Fatalf("payload field %s is not a string", tc.field)
@@ -376,33 +377,49 @@ exit 0
 				"PATH="+stubDir+":"+os.Getenv("PATH"),
 				"HOME="+home,
 				"CALL_LOG="+logPath,
-				"BACKGROUND_DONE="+backgroundDone,
 				"FAIL_NEEDLE="+tc.failNeedle,
 			)
-			out, runErr := cmd.CombinedOutput()
-			if runErr == nil {
-				t.Errorf("rendered snippet exited 0 after %s failed; output:\n%s", tc.failNeedle, out)
+			var backgroundReader, backgroundWriter *os.File
+			if tc.backgroundCommand != "" {
+				var err error
+				backgroundReader, backgroundWriter, err = os.Pipe()
+				if err != nil {
+					t.Fatalf("create %s completion barrier: %v", tc.backgroundCommand, err)
+				}
+				defer backgroundReader.Close()
+				cmd.ExtraFiles = []*os.File{backgroundWriter}
+				cmd.Env = append(cmd.Env, "BACKGROUND_COMMAND="+tc.backgroundCommand)
 			}
-			// The real OpenClaw snippet intentionally leaves its gateway in the
-			// background. When this case fails the later agent command, bash may
-			// return before the gateway stub finishes opening its HOME log and
-			// appending CALL_LOG. Synchronize with that stub before TempDir cleanup;
-			// otherwise the test itself races RemoveAll and flakes with
-			// "directory not empty" even though the rendered snippet behaved.
-			if tc.failNeedle == "openclaw agent" {
-				deadline := time.Now().Add(2 * time.Second)
-				for {
-					_, markerErr := os.Stat(backgroundDone)
-					if markerErr == nil {
-						break
-					}
-					if !os.IsNotExist(markerErr) {
-						t.Fatalf("inspect OpenClaw gateway completion marker: %v", markerErr)
-					}
-					if time.Now().After(deadline) {
-						t.Fatal("background OpenClaw gateway stub did not finish before cleanup")
-					}
-					time.Sleep(10 * time.Millisecond)
+			var out bytes.Buffer
+			cmd.Stdout = &out
+			cmd.Stderr = &out
+			if err := cmd.Start(); err != nil {
+				if backgroundWriter != nil {
+					_ = backgroundWriter.Close()
+				}
+				t.Fatalf("start rendered snippet: %v", err)
+			}
+			if backgroundWriter != nil {
+				if err := backgroundWriter.Close(); err != nil {
+					t.Fatalf("close parent %s completion writer: %v", tc.backgroundCommand, err)
+				}
+			}
+			runErr := cmd.Wait()
+			if runErr == nil {
+				t.Errorf("rendered snippet exited 0 after %s failed; output:\n%s", tc.failNeedle, out.String())
+			}
+			// The real OpenClaw and Codex snippets intentionally leave a helper
+			// in the background. The foreground shell can return before that
+			// helper finishes opening its HOME log and appending CALL_LOG. Wait on
+			// the command-specific pipe signal before TempDir cleanup; a file poll
+			// would recreate the same cleanup race this barrier prevents.
+			if backgroundReader != nil {
+				if err := backgroundReader.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+					t.Fatalf("set %s completion deadline: %v", tc.backgroundCommand, err)
+				}
+				var signal [1]byte
+				if _, err := backgroundReader.Read(signal[:]); err != nil {
+					t.Fatalf("background %s stub did not signal completion: %v", tc.backgroundCommand, err)
 				}
 			}
 			calls, err := os.ReadFile(logPath)
