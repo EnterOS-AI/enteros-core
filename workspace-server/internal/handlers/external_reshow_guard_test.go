@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The re-show path (GET .../external/connection) returns auth_token="", and
@@ -330,6 +331,9 @@ func TestRenderedRuntimeSnippets_StopAfterConfigurationFailure(t *testing.T) {
 	const stub = `#!/usr/bin/env bash
 name="${0##*/}"
 printf '%s %s\n' "$name" "$*" >> "$CALL_LOG"
+if [[ "$name $*" == "openclaw gateway"* ]]; then
+  : > "$BACKGROUND_DONE"
+fi
 if [[ "$name $*" == *"$FAIL_NEEDLE"* ]]; then
   exit 42
 fi
@@ -358,6 +362,7 @@ exit 0
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logPath := filepath.Join(t.TempDir(), "calls.log")
+			backgroundDone := filepath.Join(t.TempDir(), "openclaw-gateway.done")
 			snippet, ok := payload[tc.field].(string)
 			if !ok {
 				t.Fatalf("payload field %s is not a string", tc.field)
@@ -371,11 +376,34 @@ exit 0
 				"PATH="+stubDir+":"+os.Getenv("PATH"),
 				"HOME="+home,
 				"CALL_LOG="+logPath,
+				"BACKGROUND_DONE="+backgroundDone,
 				"FAIL_NEEDLE="+tc.failNeedle,
 			)
 			out, runErr := cmd.CombinedOutput()
 			if runErr == nil {
 				t.Errorf("rendered snippet exited 0 after %s failed; output:\n%s", tc.failNeedle, out)
+			}
+			// The real OpenClaw snippet intentionally leaves its gateway in the
+			// background. When this case fails the later agent command, bash may
+			// return before the gateway stub finishes opening its HOME log and
+			// appending CALL_LOG. Synchronize with that stub before TempDir cleanup;
+			// otherwise the test itself races RemoveAll and flakes with
+			// "directory not empty" even though the rendered snippet behaved.
+			if tc.failNeedle == "openclaw agent" {
+				deadline := time.Now().Add(2 * time.Second)
+				for {
+					_, markerErr := os.Stat(backgroundDone)
+					if markerErr == nil {
+						break
+					}
+					if !os.IsNotExist(markerErr) {
+						t.Fatalf("inspect OpenClaw gateway completion marker: %v", markerErr)
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("background OpenClaw gateway stub did not finish before cleanup")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
 			}
 			calls, err := os.ReadFile(logPath)
 			if err != nil {
