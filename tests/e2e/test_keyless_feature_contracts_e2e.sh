@@ -19,13 +19,12 @@ set -uo pipefail
 # just 200s.
 #
 # Auth model (matches workspace-server/internal/middleware/wsauth_middleware.go):
-#   * WorkspaceAuth (/workspaces/:id/*) is STRICT once a token exists — a
-#     bearer-less request 401s (devmode fail-open needs MOLECULE_ENV=dev AND
-#     ADMIN_TOKEN unset, neither of which the e2e-api job sets).
+#   * WorkspaceAuth (/workspaces/:id/*) is strict: bearer-less protected
+#     requests fail in every environment.
 #   * AdminAuth routes accept the platform ADMIN_TOKEN (post-#2286) OR, when no
 #     ADMIN_TOKEN is configured, any valid workspace bearer (Tier-3 fallback) —
-#     so the workspace token we mint authenticates admin routes in BOTH the
-#     pre-#2286 (no ADMIN_TOKEN) and post-#2286 (ADMIN_TOKEN set) CI shapes.
+#     but a fresh install must first bootstrap with ADMIN_TOKEN because there is
+#     no bearer-less create path.
 #
 # Local-run shape (mirrors the e2e-api job — real PG+Redis+platform):
 #   DATABASE_URL=... REDIS_URL=... ADMIN_TOKEN=... ./platform-server &
@@ -63,10 +62,9 @@ body_and_code() {
 echo "=== Keyless feature HTTP-contract E2E (required lane) ==="
 echo ""
 
-# Platform admin bearer when the job set one (#2286 shape). When ADMIN_TOKEN is
-# configured, AdminAuth's Tier-1 fail-open is OFF even before the first token
-# exists, so admin-gated create / list / delete must carry it from the start.
-# Pre-#2286 (no ADMIN_TOKEN) this is empty → fail-open create works bare.
+# Platform admin bearer. Admin-gated create / list / delete must carry a valid
+# credential from the start; a fresh install never accepts a bare request.
+e2e_require_admin_token || exit 2
 ENV_ADMIN="${MOLECULE_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}"
 ENV_ADMIN_AUTH=()
 [ -n "$ENV_ADMIN" ] && ENV_ADMIN_AUTH=(-H "Authorization: Bearer $ENV_ADMIN")

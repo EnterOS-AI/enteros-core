@@ -4,9 +4,10 @@
 # Templates + plugins are pre-cloned by scripts/clone-manifest.sh in the
 # trusted build context into .tenant-bundle-deps/ — same pattern as
 # Dockerfile.tenant. See that file's header for the full rationale; the
-# short version is that post-2026-05-06 every workspace-template-* and
-# org-template-* repo on Gitea is private, so an in-image `git clone`
-# has no auth path that doesn't leak the Gitea token into a layer.
+# short version is that the manifest can include private template, plugin, or
+# org dependencies, so an in-image `git clone` has no general auth path that
+# does not risk leaking the Gitea token into a layer. Public template repos use
+# the same pre-clone path for one deterministic build contract.
 #
 # Build context: repo root, with `.tenant-bundle-deps/` populated by the
 # workflow's "Pre-clone manifest deps" step (Task #173).
@@ -101,8 +102,8 @@ RUN addgroup -g 1000 platform && adduser -u 1000 -G platform -s /bin/sh -D platf
 EXPOSE 8080
 # HEALTHCHECK: probe the /health endpoint so orchestrators and docker's
 # health monitoring can detect a crashed or wedged server.
-# mc#1158: workspace/Dockerfile has a HEALTHCHECK; workspace-server/Dockerfile
-# was missing one, so docker ps never shows (healthy) for this container.
+# mc#1158: runtime images already had a HEALTHCHECK; workspace-server lacked
+# one, so docker ps never showed (healthy) for this container.
 # Interval 30s, timeout 5s, 3 retries, 30s start period (server boot).
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=30s \
   CMD wget -qO- --timeout=5 http://localhost:8080/health || exit 1

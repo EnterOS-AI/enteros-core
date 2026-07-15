@@ -20,16 +20,16 @@ import (
 //	files: config files exceed 12288 bytes
 //
 // Root cause: collectCPConfigFiles hard-capped the *eligible* config bundle
-// (config.yaml + prompts/*) at 12 KiB because the controlplane embedded it in
-// EC2 user-data (16 KiB AWS ceiling − bootstrap overhead). The SEO agent's
+// (config.yaml + prompts/*) at 12 KiB because the former AWS control-plane
+// backend embedded it in EC2 user-data (16 KiB ceiling minus bootstrap
+// overhead). The SEO agent's
 // config (long SEO system prompt + SERVICES_REPO_WEBSITE + the 12-schedule
 // block baked into config.yaml) exceeds 12 KiB, so Start() failed before it
 // ever reached the wire — blocking a paying customer from provisioning.
 //
-// After moving config delivery OFF user-data and onto the persistent
-// secondary volume (CP stages the bundle to Secrets Manager; the workspace
-// fetches it at boot into /configs), the 12 KiB ceiling is obsolete: the
-// bundle travels in the JSON HTTP body to CP, which has no 16 KiB limit. This
+// Current delivery sends the bundle in the authenticated JSON request and the
+// selected control-plane backend materializes it under /configs, so the old
+// 12 KiB provider-bootstrap ceiling is obsolete. This
 // test pins that a realistically-oversized (>12288 B) config bundle now
 // reaches the CP request body intact instead of being rejected client-side.
 func TestStart_OversizedConfigBundleProvisions(t *testing.T) {
@@ -79,7 +79,7 @@ func TestStart_OversizedConfigBundleProvisions(t *testing.T) {
 		ConfigFiles: cfg,
 	})
 	if err != nil {
-		t.Fatalf("Start with oversized config bundle failed: %v — the 12288-byte cap must be gone now config delivery is off user-data", err)
+		t.Fatalf("Start with oversized config bundle failed: %v — the retired 12288-byte provider-bootstrap cap must remain gone", err)
 	}
 
 	// The full bundle must have reached the CP request body intact.

@@ -93,7 +93,8 @@ type ChannelBroadcaster interface {
 // Wired at construction by the router (production) or tests. nil is
 // allowed and treated as "no override" for every workspace, preserving
 // today's behavior — same default-false posture as
-// BaseAdapter.capabilities() in workspace/adapter_base.py.
+// BaseAdapter.capabilities() in molecule-ai-workspace-runtime/
+// molecule_runtime/adapter_base.py.
 //
 // See project memory `project_runtime_native_pluggable.md` and
 // handlers.ProvidesNativeScheduler for the production wiring.

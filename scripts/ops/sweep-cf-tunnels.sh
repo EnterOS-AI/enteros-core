@@ -26,8 +26,8 @@
 # Env vars required:
 #   CF_API_TOKEN        — Cloudflare token with
 #                          account:cloudflare_tunnel:edit scope.
-#                          (Same secret as sweep-cf-orphans, but the
-#                          token must include the tunnel scope.)
+#                          This is account-scoped and distinct from the
+#                          zone-scoped credentials used for DNS cleanup.
 #     (falls back to CLOUDFLARE_API_TOKEN if CF_API_TOKEN is unset;
 #      the workflow YAML maps both secret names into CF_API_TOKEN)
 #   CF_ACCOUNT_ID       — the account that owns the tunnels (visible

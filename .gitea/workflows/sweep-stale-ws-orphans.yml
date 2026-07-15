@@ -23,9 +23,9 @@ name: Sweep stale ws-* workspace orphans (runner host)
 # intermittent reds (#2693 / #2680 / #2739). 13 such orphans were found on the
 # retired ded-1 box (2-3 days old) and 11+3 on the production robots.
 #
-# Why a separate workflow vs the CP/AWS sweepers
-#   * sweep-stale-e2e-orgs / sweep-cf-* / sweep-aws-secrets operate at the
-#     control-plane / cloud-API layer (DELETE /cp/admin/..., CF zone, ASM).
+# Why a separate workflow from control-plane cleanup
+#   * sweep-stale-e2e-orgs and provider cleanup operate at the control-plane /
+#     cloud-API layer (for example DELETE /cp/admin/... and tunnel teardown).
 #     This leak is purely LOCAL docker state on the runner host — there is no
 #     CP org row or cloud resource to drive a cascade from. So this sweeper
 #     enumerates the runner's local docker daemon directly.

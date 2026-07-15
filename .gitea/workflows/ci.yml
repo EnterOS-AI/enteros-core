@@ -1,7 +1,6 @@
 # Ported from .github/workflows/ci.yml on 2026-05-11 per RFC internal#219 §1.
-# continue-on-error: true on every job; follow-up PR will flip required after
-# surfaced bugs are fixed (per RFC §1 — "surface broken workflows without
-# blocking"). The four-surface migration audit
+# Historical advisory masks have since been removed from required jobs; each
+# job's current `continue-on-error` value is authoritative. The four-surface migration audit
 # (feedback_gitea_actions_migration_audit_pattern) was performed against this
 # port:
 #
@@ -16,17 +15,16 @@
 #      against this repository's runner fleet; upgrade only after an end-to-end
 #      artifact round trip. No `actions/cache` usage to audit.
 #      `actions/setup-python@v6` `cache: pip` is left in place — it works
-#      against Gitea's built-in cache server when runner.cache
-#      is configured (currently is, /opt/molecule/runners/config.yaml).
+#      against Gitea's built-in cache server when runner.cache is configured
+#      on the self-hosted runner.
 #
 #   3. Token — workflow uses no custom dispatch tokens. The auto-injected
 #      `GITHUB_TOKEN` (which Gitea aliases to a runner-scoped token) is
 #      sufficient for `actions/checkout` against this same repo.
 #
 #   4. Docs — no docs/scripts reference github.com URLs that need swapping.
-#      The canvas-deploy-status step (core#2226, formerly canvas-deploy-reminder)
-#      writes the canvas ordered-deploy status into the step summary; it points
-#      at the ECR canvas image and the publish workflow, no ghcr.io prose.
+#      The legacy-named canvas-deploy-status step writes image-publication
+#      status into the summary and points at the Gitea registry workflow.
 #
 # Cross-links:
 #   - RFC: internal#219 (CI/CD hard-gate hardening)
@@ -57,9 +55,9 @@ concurrency:
 env:
   # Belt-and-suspenders against the runner-default trap
   # (feedback_act_runner_github_server_url). Runners are configured with
-  # this env via /opt/molecule/runners/config.yaml runner.envs, but pinning
-  # at the workflow level protects against a runner regenerated without
-  # the config file (feedback_act_runner_needs_config_file_env).
+  # this env in runner configuration, but pinning it at the workflow level
+  # protects against a runner regenerated without that setting
+  # (feedback_act_runner_needs_config_file_env).
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
@@ -633,14 +631,11 @@ jobs:
   # mc#959 root-fix (sre)
 
   canvas-deploy-status:
-    # core#2226: replaces the old advisory "Canvas Deploy Reminder". The canvas
-    # image now has a real ORDERED auto-deploy (publish-canvas-image.yml:
-    # build → push :staging-<sha> → wait green main CI → promote :latest by
-    # digest), and docker-compose pins via CANVAS_IMAGE_TAG. There is no longer
-    # a manual "go run docker compose pull by hand" step to remind operators
-    # about — so this job just records, on a canvas-touching main push, that the
-    # ordered deploy is handling it (and where to watch), instead of prescribing
-    # a manual action that determinism made obsolete.
+    # Compatibility: keep the established check key/name, but this job records
+    # ordered IMAGE PUBLICATION only. publish-canvas-image builds, waits for
+    # green CI, and promotes registry :latest; it does not by itself prove that
+    # a live host pulled or serves that image. End-to-end rollout proof is
+    # tracked as the release blocker in internal#1038.
     name: Canvas Deploy Status
     runs-on: docker-host
     # Per-step no-op (not job-level `if:`) so the job reaches SUCCESS on PRs
@@ -648,7 +643,7 @@ jobs:
     # Step-level exit 0 handles the "not a canvas main push" case.
     needs: [changes, canvas-build]
     steps:
-      - name: Record canvas ordered-deploy status
+      - name: Record canvas image-publication status
         env:
           COMMIT_SHA: ${{ github.sha }}
           CANVAS_CHANGED: ${{ needs.changes.outputs.canvas }}
@@ -660,25 +655,25 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$CANVAS_CHANGED" != "true" ] || [ "$EVENT_NAME" != "push" ] || [ "$REF_NAME" != "refs/heads/main" ]; then
-            echo "Canvas deploy status not applicable for event=$EVENT_NAME ref=$REF_NAME canvas_changed=$CANVAS_CHANGED."
+            echo "Canvas image-publication status not applicable for event=$EVENT_NAME ref=$REF_NAME canvas_changed=$CANVAS_CHANGED."
             exit 0
           fi
 
           # Write body to a temp file — avoids backtick escaping in shell.
           cat > /tmp/deploy-status.md << 'BODY'
-          ## Canvas ordered deploy in progress — no manual action required
+          ## Canvas image publication in progress
 
           This canvas-touching main push triggers `publish-canvas-image`, which now
-          runs an ORDERED, CI-gated deploy (core#2226) — the same shape as the
-          platform's deploy-production:
+          runs an ordered, CI-gated registry publication (core#2226):
 
           1. Build → push `molecule-ai/canvas:staging-<sha>` + `:staging-latest`.
           2. Wait for green main CI on this SHA.
           3. Promote `:latest` to the verified `:staging-<sha>` by digest.
 
-          Tenants/hosts pin via `CANVAS_IMAGE_TAG` (default `latest` = the last
-          CI-green build), so a deploy is reproducible — no hand-run
-          `docker compose pull` needed. Watch the run in the canvas publish workflow.
+          This proves the registry tag, not a live rollout. A deployment owner
+          must pull the immutable candidate and verify `/api/buildinfo` against
+          the expected SHA; that fail-closed rollout is tracked in internal#1038.
+          Watch the canvas publish workflow for the image result.
           BODY
           printf '\n> Posted automatically by CI · commit `%s` · [publish workflow](%s)\n' \
             "$COMMIT_SHA" "$RUN_URL" >> /tmp/deploy-status.md

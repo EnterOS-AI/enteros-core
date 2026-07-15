@@ -21,9 +21,9 @@ var gitIdentitySlugPattern = regexp.MustCompile(`[^a-z0-9]+`)
 const gitIdentityEmailDomain = "agents.moleculesai.app"
 
 // gitAskpassHelperPath is the in-container path of the askpass helper
-// installed by every workspace runtime image (workspace/Dockerfile in
-// molecule-core; scripts/git-askpass.sh → /usr/local/bin/molecule-askpass
-// in each external template-* repo). The helper reads GIT_HTTP_USERNAME
+// installed by every workspace runtime image (scripts/git-askpass.sh →
+// /usr/local/bin/molecule-askpass in each standalone template repository).
+// The helper reads GIT_HTTP_USERNAME
 // / GIT_HTTP_PASSWORD (falling back to GITEA_USER / GITEA_TOKEN) from
 // env and emits them on the git credential-prompt protocol. Setting
 // GIT_ASKPASS to this path is what wires container-side HTTPS git auth

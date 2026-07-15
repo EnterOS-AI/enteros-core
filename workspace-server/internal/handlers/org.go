@@ -420,7 +420,8 @@ type OrgDefaults struct {
 	// when both are set.
 	InitialPromptFile string `yaml:"initial_prompt_file" json:"initial_prompt_file"`
 	// IdlePrompt / IdleIntervalSeconds are the workspace-default idle-loop
-	// body and cadence (see workspace/heartbeat.py). They were
+	// body and cadence (see molecule-ai-workspace-runtime/
+	// molecule_runtime/heartbeat.py). They were
 	// previously dropped by the org importer because the struct didn't
 	// declare them — causing live configs to boot without idle_prompts
 	// even when org.yaml had them. Phase 1 scalability work adds both

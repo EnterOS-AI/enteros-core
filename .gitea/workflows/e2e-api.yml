@@ -343,11 +343,10 @@ jobs:
       - name: Set deterministic admin token for the e2e platform
         if: needs.detect-changes.outputs.api == 'true'
         run: |
-          # AdminAuth (workspace-server/internal/middleware/wsauth_middleware.go:164)
-          # reads ADMIN_TOKEN. Setting it (a) closes isDevModeFailOpen (devmode.go:50
-          # returns false when ADMIN_TOKEN is non-empty), so admin routes require a
-          # bearer, and (b) makes Tier-2b accept a bearer that constant-time-equals
-          # ADMIN_TOKEN. The platform process inherits ADMIN_TOKEN from $GITHUB_ENV.
+          # AdminAuth is fail-closed in every environment. ADMIN_TOKEN gives this
+          # ephemeral platform a deterministic bootstrap/admin bearer that Tier-2b
+          # accepts via constant-time comparison. The platform process inherits it
+          # from $GITHUB_ENV.
           #
           # MOLECULE_ADMIN_TOKEN is the var the e2e scripts send as the bearer
           # (tests/e2e/_lib.sh:33 e2e_mint_workspace_token, and the run_mock

@@ -2,15 +2,20 @@
 
 End-to-end test scripts live under `tests/e2e/` and exercise the platform against a real Postgres + Redis. Every script is shellcheck-clean and shares helpers from `tests/e2e/_lib.sh` + `tests/e2e/_extract_token.py`.
 
-## Scripts
+## Current entry points
 
-| Script | Checks | Prerequisites |
-|--------|--------|--------------|
-| `test_api.sh` | 62 | platform running on :8080; no live agents required |
-| `test_comprehensive_e2e.sh` | 67 | platform running; spins up its own workspaces |
-| `test_a2a_e2e.sh` | 22 | platform + 2 provisioned agents (Echo + SEO) with `OPENROUTER_API_KEY` |
-| `test_activity_e2e.sh` | 25 | platform + 1 online agent |
-| `test_claude_code_e2e.sh` | — | platform + Claude Code runtime; exercises CLI adapter |
+| Script | Purpose | Prerequisites |
+|---|---|---|
+| `test_api.sh` | Core platform API contract used by the required API workflow. | Platform, Postgres, and Redis; no external model required. |
+| `test_priority_runtimes_e2e.sh` | Canonical runtime completion smoke; the mock arm is CI-load-bearing and live-model arms are opportunistic. | Platform plus matching provider credentials for any live arms. |
+| `test_local_provision_lifecycle_e2e.sh` | Local Docker provision, restart, authenticated A2A, and cleanup lifecycle. | Local Docker and the supported `ADMIN_TOKEN` setup. |
+| `test_poll_mode_e2e.sh` | Authenticated poll-mode send, queue, cursor, and ownership behavior. | Platform and test database. |
+| `test_staging_full_saas.sh` | Production-shaped staging tenant boot and end-to-end validation. | Staging control-plane admin credential; never point it at production. |
+
+For the maintained cross-runtime developer smoke outside `tests/e2e/`, use
+`scripts/test-all-runtimes-a2a-e2e.sh`. The older one-off team, adapter, and
+Hermes-plugin demo scripts were removed because they depended on the retired
+in-core runtime tree and sent tokenless A2A requests.
 
 ## Auth Prerequisites (Phase 30)
 
@@ -38,41 +43,57 @@ The A2A send and queue-status routes are stricter:
 - Tokenless legacy callers and authentication datastore errors fail closed.
 - The no-bearer same-origin Canvas fallback exists only in combined self-host/dev when CP session verification is unconfigured; SaaS tests must use a verified session or bearer.
 
-The scripts handle this by:
+The scripts handle this in one of three explicit ways:
 
-1. Creating a workspace → platform returns no token yet.
-2. Calling `POST /registry/register` — response body includes `auth_token` once per workspace.
-3. Extracting the token via `_extract_token.py` (reads JSON from stdin).
-4. Passing it in subsequent heartbeat / discover / peers calls.
+1. A workspace actor sends its own bearer and matching `X-Workspace-ID`.
+2. A human-originated local request uses the `ADMIN_TOKEN` written by
+   `scripts/dev-start.sh` (the common helper can load just that value from
+   `.env`).
+3. A dedicated combined-tenant contract test may opt into the narrow
+   same-origin Canvas fallback with `E2E_ALLOW_SAME_ORIGIN_FALLBACK=1`; ordinary
+   shell E2Es must not synthesize browser identity from `Origin` alone.
+
+Registration-focused tests still call `POST /registry/register`, extract the
+one-time `auth_token` through `_extract_token.py`, and thread that bearer
+through heartbeat, discovery, activity, and A2A calls. SaaS tests always use a
+real tenant/session/workspace credential; they never rely on the local fallback.
 
 `test_comprehensive_e2e.sh` registers each workspace **immediately after creation** so the provisioner's auto-register doesn't race the test's explicit register. `test_activity_e2e.sh` re-registers a detected-already-online agent to capture a fresh bearer token.
 
 ## Running Locally
 
 ```bash
-# Quickest check after any platform change:
+# Quickest local platform check (the test safely reads ADMIN_TOKEN from the
+# repository .env written by scripts/dev-start.sh when it is not exported):
 cd workspace-server && go build ./cmd/server && ./server &
-bash tests/e2e/test_api.sh        # expect 62/62 pass
+bash tests/e2e/test_api.sh
 
-# Comprehensive sweep:
-bash tests/e2e/test_comprehensive_e2e.sh   # expect 67/67 pass
+# Runtime smoke (loads the local dev ADMIN_TOKEN from .env when needed):
+bash scripts/test-all-runtimes-a2a-e2e.sh
 ```
 
-Both scripts include a pre-test cleanup that deletes workspaces from previous runs so a stale DB won't cause spurious failures.
+Use each script's header as the source of truth for required services,
+credentials, target guards, and cleanup behavior. Do not infer current pass
+counts from this document; checks are added frequently.
 
-## What CI Runs
+## What CI runs
 
-`.gitea/workflows/ci.yml` (added 2026-04-13):
-
-- **e2e-api** — spins up Postgres + Redis via service containers, applies migrations with `docker exec`, builds the platform binary, runs `tests/e2e/test_api.sh`. All 62 checks must pass.
-- **shellcheck** — runs the shellcheck marketplace action against every `tests/e2e/*.sh`.
-
-The other E2E scripts are not yet in CI because they require provisioned agents and LLM credentials; run them locally before merging runtime-touching changes.
+- `.gitea/workflows/e2e-api.yml` boots Postgres, Redis, the platform, and its
+  local mock upstreams. It runs the API, keyless-feature, user-task,
+  notification, channel, priority-runtime, poll-mode, and upload suites.
+- `.gitea/workflows/ci.yml` runs ShellCheck across `tests/e2e/*.sh` and the
+  selected operational scripts, plus the no-live-infrastructure Bash contract
+  tests.
+- Staging workflows own real tenant, Canvas, external-runtime, reconciler, and
+  lifecycle validation. Their target guards and required credentials are part
+  of each workflow/script contract.
 
 ## Adding a New E2E Check
 
-1. Source `tests/e2e/_lib.sh` for `assert_*` helpers, bearer-token extraction, and the cleanup preamble.
-2. When hitting an auth-gated route, always register the workspace first and thread the returned token through subsequent requests.
+1. Source `tests/e2e/_lib.sh` for auth, token extraction, cleanup, and shared assertions.
+2. Choose the actor explicitly: workspace bearer for agent traffic, or a
+   verified human/admin credential for Canvas-originated traffic. Never add a
+   tokenless public A2A call.
 3. Keep each check idempotent — the comprehensive script is expected to be re-runnable on the same DB.
 4. Run `shellcheck tests/e2e/your_script.sh` locally before pushing.
 

@@ -21,7 +21,7 @@ package handlers
 //
 // Layer placement (3-layer defense-in-depth, RFC#523 §"Proposed guardrail"):
 //   - L1 (this file): provisioner-side abort BEFORE container start
-//   - L2 (workspace/entrypoint.sh + template-* start.sh): in-container
+//   - L2 (standalone template entrypoint/start scripts): in-container
 //     env-grep + exit 1 — defense-in-depth if L1 is bypassed
 //   - L3 (.gitea/workflows/lint-forbidden-env-keys.yml): CI lint that
 //     scans Go code under workspace-server/ for new writers that

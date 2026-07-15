@@ -17,10 +17,11 @@ package handlers
 // Same code path on local Docker and SaaS — the v1 docker-exec /
 // docker-cp paths were structurally broken in SaaS because
 // workspace-server's local Docker client has no visibility into
-// EC2-hosted workspaces (#2308 root cause). Both surfaces now use the
+// provider-managed workspaces (#2308 root cause). Both surfaces now use the
 // per-workspace platform_inbound_secret minted at provision time
 // (RFC #2312 PR-F) for auth, and the workspace's HTTP server mounts
-// the corresponding receiver at workspace/main.py.
+// the corresponding receiver in
+// molecule-ai-workspace-runtime/molecule_runtime/main.py.
 //
 // Split from templates.go because these endpoints have a different
 // security model (no /configs write, no template fallback) and a
@@ -68,7 +69,7 @@ type ChatFilesHandler struct {
 
 	// httpClient is broken out so tests can swap in an httptest.Server
 	// transport. Prod uses a default with a generous Timeout to cover
-	// the 100 MB worst case on a slow EC2 link without leaving a
+	// the 100 MB worst case on a slow provider link without leaving a
 	// connection hanging forever on a sick workspace.
 	httpClient *http.Client
 

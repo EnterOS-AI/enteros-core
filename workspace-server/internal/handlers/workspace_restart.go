@@ -364,7 +364,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	}
 
 	// runtime=mock: virtual workspace with canned A2A replies. No
-	// container, no EC2, no provisioning state to recycle. Mirror
+	// container, no provider compute, no provisioning state to recycle. Mirror
 	// the external no-op so the canvas's Restart button doesn't
 	// silently fail or leak through to the (template-less) provisioner.
 	if dbRuntime == "mock" {
@@ -376,10 +376,10 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 		return
 	}
 
-	// SaaS mode: cpProv handles workspace EC2 lifecycle. Self-hosted mode:
+	// SaaS mode: cpProv handles provider-managed workspace lifecycle. Self-hosted mode:
 	// provisioner handles local Docker containers. At least one must be
 	// available — previously only `provisioner` was checked, which broke
-	// restart entirely on every SaaS tenant (the workspace EC2 couldn't
+	// restart entirely on every SaaS tenant (the workspace compute could not
 	// be terminated + relaunched, the endpoint 503'd on every try).
 	if !h.HasProvisioner() {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "provisioner not available"})
@@ -403,7 +403,7 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	}
 
 	// Read runtime from container's config.yaml before stopping. Docker-
-	// only: in SaaS mode the workspace runs on a remote EC2 and we can't
+	// only: in SaaS mode the workspace runs on remote provider compute and we cannot
 	// exec into it, so we trust the DB value (user updates runtime via
 	// the Config tab which writes through to both the DB and the container).
 	containerRuntime := h.restartRuntimeFromConfig(ctx, id, wsName, dbRuntime, body.ApplyTemplate)
@@ -961,9 +961,10 @@ func coalesceRestart(workspaceID string, cycle func()) {
 }
 
 // stopForRestart dispatches Stop to whichever provisioner is wired (Docker or
-// CP/EC2 — mutually exclusive in production). Docker provisioner.Stop kills
-// the local container; CP provisioner.Stop calls DELETE /cp/workspaces/:id
-// which terminates the EC2 instance. Pre-fix runRestartCycle only called the
+// control plane, mutually exclusive in production). Docker provisioner.Stop
+// kills the local container; CP provisioner.Stop calls
+// DELETE /cp/workspaces/:id, which terminates the selected provider compute.
+// Pre-fix runRestartCycle only called the
 // Docker path, so on SaaS (h.provisioner=nil) the auto-restart cycle silently
 // NPE'd before reaching the reprovision step — which is why every SaaS dead-
 // agent incident pre-this-fix required manual restart from canvas.
@@ -993,8 +994,8 @@ func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID strin
 }
 
 // cpStopRetryAttempts caps total Stop attempts (initial + retries). 3 catches
-// the transient CP/AWS hiccups that produce most leaks (one EC2 metadata
-// service stall, one IAM rate-limit blip) without slowing recovery noticeably
+// transient CP/provider hiccups that produce most leaks without slowing
+// recovery noticeably
 // — worst-case wait is ~7s (1 + 2 + 4 backoff) and we run in a detached
 // goroutine, so user UX is unaffected. Package-level so tests can shrink it.
 var cpStopRetryAttempts = 3
@@ -1230,21 +1231,16 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// Runtime from DB — no more config file parsing
 	payload := withStoredCompute(ctx, workspaceID, models.CreateWorkspacePayload{Name: wsName, Tier: tier, Runtime: dbRuntime, Template: dbTemplate})
 
-	// RFC#2843 #33 + SaaS restart re-stub fix: on SaaS (cpProv), restore the
-	// persisted template AND resolve its LOCAL template dir so the re-provision
-	// re-delivers config.yaml + prompts.
+	// RFC#2843 #33 + SaaS restart re-stub fix: restore the persisted template
+	// and resolve its local template dir so the reprovision request carries both
+	// current delivery representations: fetched assets in `template_assets` and
+	// the compatibility copy in `config_files`. The pinned provision-request
+	// contract marks both fields CP-consumed; keeping the local path here also
+	// preserves compatibility across mixed-version rollouts.
 	//
-	// Setting payload.Template alone is NOT enough: it only drives the fetcher's
-	// TemplateAssets wire field, which the deployed control-plane does NOT consume
-	// (CP /cp/workspaces/provision reads `config_files` only — see
-	// controlplane wsProvisionRequest). config.yaml/prompts reach a SaaS box
-	// EXCLUSIVELY via `config_files`, which collectCPConfigFiles populates by
-	// walking cfg.TemplatePath. The restart previously passed templatePath="" →
-	// config routed only into the dropped TemplateAssets → every SaaS restart
-	// (each a fresh EC2 with empty /configs) landed a 218-byte stub config.yaml.
-	// That is the template-delivery-e2e intermittent (loses the race vs the
-	// post-online plugin-reconcile restart) AND a prod identity-loss-on-restart
-	// bug. Re-applying only touches template-owned, allowlisted files
+	// Historically this restart path passed templatePath="" and omitted the
+	// persisted template, so a fresh provider instance could land on the stub
+	// config. Re-applying only touches template-owned, allowlisted files
 	// (config.yaml, prompts/**); user/agent paths (CLAUDE.md, MEMORY.md,
 	// .claude/**, /workspace) are excluded by IsCPTemplateAssetPath, so a
 	// persisted /configs is never clobbered. Docker keeps templatePath="" to
@@ -1263,11 +1259,8 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 		}
 	}
 
-	// RFC#2843 #33: on SaaS (cpProv), restore the persisted template so the
-	// re-provision re-delivers config.yaml + prompts — TemplateIdentity is
-	// derived from payload.Template (workspace_provision.go). Without this the
-	// SaaS re-provision ran with template="" → 218-byte stub config + dropped
-	// skills on every restart. Docker keeps its persistent config volume, so it
+	// RFC#2843 #33: TemplateIdentity is derived from payload.Template in
+	// workspace_provision.go. Docker keeps its persistent config volume, so it
 	// retains the "do not re-apply templates" behavior (template left empty).
 	if h.cpProv != nil {
 		if storedTmpl := storedWorkspaceTemplate(ctx, workspaceID); storedTmpl != "" {

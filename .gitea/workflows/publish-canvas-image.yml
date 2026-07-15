@@ -45,11 +45,11 @@ name: publish-canvas-image
 # host via the root docker-compose.yml (`docker compose pull && up -d`). Gating
 # the canvas `:latest` promotion on the SAME green-main-CI signal the platform
 # deploy waits on makes platform + canvas roll together by the same SHA. The
-# canvas has no per-tenant fleet of its own and no /buildinfo endpoint, so there
-# is no fleet-rollout / per-tenant verify step to mirror here — CI-green +
-# digest-pin + immutable :staging-<sha> is the determinism contract. (A future
-# canvas /buildinfo would let this assert the served SHA like the platform does;
-# tracked in core#2226.)
+# canvas has no per-tenant fleet of its own, so this image-publication workflow
+# has no served URL to probe. The image does expose `/api/buildinfo` with the
+# baked BUILD_SHA; environment rollout workflows use that endpoint when they
+# own a live Canvas target. Here, CI-green + digest-pin + immutable
+# :staging-<sha> is the image-publication determinism contract.
 #
 # Mirror of publish-platform-image.yml, adapted for the Next.js canvas layer.
 # See that workflow for inline notes on macOS Keychain isolation and QEMU.

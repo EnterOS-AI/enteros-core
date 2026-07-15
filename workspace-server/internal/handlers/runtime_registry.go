@@ -5,7 +5,8 @@ package handlers
 //
 // Before this file, knownRuntimes was a hardcoded Go map in
 // workspace_provision.go, kept in sync MANUALLY with both
-// workspace/build-all.sh and manifest.json's workspace_templates.
+// the standalone runtime/template repositories and manifest.json's
+// workspace_templates.
 // That drift produced two visible bugs:
 //
 //   - a template existed in manifest.json but not the Go map, so

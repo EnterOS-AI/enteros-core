@@ -1,15 +1,14 @@
 name: E2E Chat
 
 # Comprehensive Playwright E2E for the unified chat stack (desktop
-# ChatTab + mobile MobileChat). Heavy browser execution is intentionally
-# outside the normal required PR path: PRs run it only after entering the
-# `merge-queue`, while push/main, nightly, and manual dispatch preserve
-# coverage without making every PR pay the full runtime/browser cost.
+# ChatTab + mobile MobileChat). Every pull request, main/staging push, and
+# manual dispatch runs the browser suite; there is no label gate, paths filter,
+# or success-without-tests arm.
 #
 # Architecture:
 #   1. Ephemeral Postgres + Redis (docker, unique container names)
 #   2. workspace-server built from source, started with
-#      MOLECULE_ENV=development (fail-open auth)
+#      MOLECULE_ENV=development with fail-closed ADMIN_TOKEN auth
 #   3. canvas dev server (npm run dev) on :3000
 #   4. Playwright tests create workspaces via API, point them at an
 #      in-process echo runtime, and exercise the full send/receive
@@ -80,14 +79,13 @@ jobs:
     #       not fixed sleeps — preserved.
     #     - passWithNoTests:false + forbidOnly (playwright.config.ts) → a
     #       renamed/moved spec or stray test.only can no longer green the lane.
-    #     - REQUIRE-LIVE guard in "Run Playwright E2E tests" → chat==true must
-    #       actually execute >=1 test, else exit 1.
+    #     - REQUIRE-LIVE guard in "Run Playwright E2E tests" requires every
+    #       invocation to execute >=1 test, else exit 1.
     #     - chat-desktop.spec.ts asserts echo-runtime.lastRequest after each
     #       round-trip, so an optimistic client-side render cannot pass without
     #       a real A2A request reaching the server (core#2796 follow-up).
-    #     - The "No-op pass" path (detect-changes chat!=true) is a legitimate
-    #       paths-filter skip that emits SUCCESS — identical to the already-gating
-    #       e2e-api.yml required lane, so it is branch-protection-clean.
+    #     - There is no paths-filter/no-op arm; every workflow invocation runs
+    #       the browser suite.
     #
     # Wiring this context into branch_protections/main (bp-required #1142) stays
     # an operator step; removing the mask here only stops the masking.
@@ -224,8 +222,9 @@ jobs:
       - name: Set deterministic admin token
         run: |
           # PR #2291 made auth fail-closed everywhere (no dev-mode escape).
-          # The platform server requires ADMIN_TOKEN; the canvas requires the
-          # matching NEXT_PUBLIC_ADMIN_TOKEN or every API call 401s.
+          # This ephemeral test platform requires ADMIN_TOKEN; its test Canvas
+          # uses the matching NEXT_PUBLIC_ADMIN_TOKEN or every API call 401s.
+          # Production SaaS leaves the public value empty and uses sessions.
           # We set a deterministic per-run value so the ephemeral platform
           # and canvas are paired correctly.
           E2E_ADMIN_TOKEN="e2e-chat-admin-${{ github.run_id }}-${{ github.run_attempt }}"

@@ -28,6 +28,9 @@ RUN npm ci --include=optional
 COPY . .
 ARG NEXT_PUBLIC_PLATFORM_URL=http://localhost:8080
 ARG NEXT_PUBLIC_WS_URL=ws://localhost:8080/ws
+# Local docker-compose / ephemeral-E2E compatibility only. The production
+# publish workflow leaves this empty: NEXT_PUBLIC values are public client
+# JavaScript, so never pass a tenant ADMIN_TOKEN here.
 ARG NEXT_PUBLIC_ADMIN_TOKEN=
 # NEXT_PUBLIC_IMAGE_GEN_R2_HOST pins the exact generated-image R2 origin into
 # the CSP img-src (buildImgSrc() in src/middleware.ts). Inlined by Next.js at

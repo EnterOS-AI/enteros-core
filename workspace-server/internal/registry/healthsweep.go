@@ -21,8 +21,8 @@ type ContainerChecker interface {
 //
 // It must comfortably exceed the worst-case gap between two consecutive
 // heartbeats. The runtime's heartbeat task runs on its own ~30s asyncio
-// cadence, independent of turn processing (see workspace/heartbeat.py in
-// the runtime repo, and the contract documented on
+// cadence, independent of turn processing (see molecule_runtime/heartbeat.py
+// in molecule-ai-workspace-runtime, and the contract documented on
 // models.HeartbeatPayload.RuntimeState: "The heartbeat task lives in its
 // own asyncio task and keeps pinging even when the agent runtime is
 // wedged"). 180s = 6 missed heartbeats tolerates a long synchronous busy

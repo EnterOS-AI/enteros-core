@@ -89,8 +89,8 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	}
 	if tier == 0 {
 		// Resolved via the same DefaultTier helper Create + Templates
-		// use (#2910 PR-E). SaaS → T4 (one container per sibling EC2,
-		// no neighbour to protect from), self-hosted → T3. Pre-#2910
+		// use (#2910 PR-E). SaaS → T4 (dedicated managed compute),
+		// self-hosted → T3. Pre-#2910
 		// this path returned T2 on self-hosted, asymmetric with
 		// workspace.go's T3 — undocumented drift. Lifting to
 		// DefaultTier collapses both call sites onto one source of
@@ -322,7 +322,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			"name": ws.Name, "external": true,
 		})
 	} else if IsMockRuntime(runtime) {
-		// Mock-runtime workspaces have no container, no EC2, no URL —
+		// Mock-runtime workspaces have no container, provider compute, or URL —
 		// the proxyA2ARequest short-circuit synthesises every reply
 		// from a canned variant pool (see mock_runtime.go). Status
 		// goes straight to 'online' so the canvas renders the node
@@ -403,7 +403,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// provisioning channel) anymore. The CTO ruling is that agent-skills
 		// are PLUGINS and must install DYNAMICALLY after the workspace boots
 		// online, via the existing plugin install pipeline — never through
-		// Secrets Manager or the template-asset relay. So instead of copying
+		// the secret-bootstrap or template-asset transport. So instead of copying
 		// the plugin tree into configFiles here, we PERSIST the declared set
 		// (workspace_declared_plugins) and let the post-online reconcile
 		// (registry heartbeat → ReconcileWorkspacePlugins) install them from
@@ -490,7 +490,8 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// Resolve idle_prompt — same precedence (ws inline → ws file → defaults).
 		// Inject into config.yaml alongside idle_interval_seconds so the
 		// workspace's heartbeat loop picks up the idle-reflection cadence on
-		// boot (see workspace/heartbeat.py + config.py).
+		// boot (see molecule-ai-workspace-runtime/molecule_runtime/
+		// heartbeat.py and config.py).
 		idlePrompt, err := resolvePromptRef(ws.IdlePrompt, ws.IdlePromptFile, orgBaseDir, ws.FilesDir)
 		if err != nil {
 			log.Printf("Org import: failed to resolve idle_prompt for %s: %v", ws.Name, err)
@@ -520,7 +521,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			// means the idle loop never fires regardless of interval, so we
 			// only emit interval when there's a body to go with it.
 			if idleInterval <= 0 {
-				idleInterval = 600 // same default as workspace/config.py
+				idleInterval = 600 // same default as molecule_runtime/config.py
 			}
 			block := fmt.Sprintf("idle_interval_seconds: %d\nidle_prompt: |\n  %s\n", idleInterval, indented)
 			configFiles["config.yaml"] = appendYAMLBlock(configFiles["config.yaml"], block)
@@ -538,7 +539,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// Inject secrets from persona env + .env files as workspace secrets.
 		// Resolution (later overrides earlier):
 		//   0. Persona env (per-role bootstrap creds; only when ws.Role is set
-//      and the configured persona directory has a matching file)
+		//      and the configured persona directory has a matching file)
 		//   1. Org root .env (shared defaults)
 		//   2. Workspace-specific .env (per-workspace overrides)
 		// Each line: KEY=VALUE → stored as encrypted workspace secret.
@@ -601,7 +602,7 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 
 		// #1084: limit concurrent provisioning via semaphore.
 		// Use provisionWorkspaceAuto so SaaS deployments route through
-		// the CP (EC2) path — calling provisionWorkspace directly was
+		// the control-plane provider path — calling provisionWorkspace directly was
 		// the same silent-drop bug that bit TeamHandler.Expand on
 		// 2026-05-04 (see workspace.go:121-125 comment + #2486). Symptom:
 		// every claude-code workspace from org-import on SaaS sat in
@@ -1031,7 +1032,7 @@ func (h *OrgHandler) lookupExistingChild(ctx context.Context, name string, paren
 // grid (so nested-parent children don't clip into leaf siblings) and
 // dispatching createWorkspaceTree for each. Pacing prevents Docker
 // container-spam thundering on the self-hosted backend; SaaS dispatches
-// the EC2 provision in a goroutine so the main loop is not blocked.
+// managed provisioning in a goroutine so the main loop is not blocked.
 func (h *OrgHandler) recurseChildrenForImport(ws OrgWorkspace, parentID string, absX, absY float64, defaults OrgDefaults, orgBaseDir string, results *[]map[string]interface{}, provisionSem chan struct{}) error {
 	if len(ws.Children) == 0 {
 		return nil

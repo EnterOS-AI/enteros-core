@@ -1,8 +1,8 @@
 /**
  * Canvas-side billing helper. Talks to the control plane's /cp/billing/*
- * routes — these exist on the `molecule-cp` app in prod and are mirrored
- * via fly-replay from tenant subdomains. Dev requires a locally-running
- * control plane on the same port as PLATFORM_URL or these calls 404.
+ * routes on the control plane. Tenant-domain routing forwards them to that
+ * service; local development requires a control plane reachable through
+ * PLATFORM_URL or these calls return 404.
  */
 import { PLATFORM_URL } from "./api";
 

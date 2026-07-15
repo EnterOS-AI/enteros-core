@@ -65,7 +65,7 @@ import (
 )
 
 // isSaaSDeployment reports whether this tenant platform is
-// running in SaaS cross-EC2 mode (mirrors handlers.saasMode;
+// running in managed control-plane mode (mirrors handlers.saasMode;
 // duplicated here because the helpers package is unexported
 // and main.go is a separate package — would be a cycle).
 //
@@ -110,7 +110,7 @@ func main() {
 	// retrying a transient startup 401 for a bounded window. A freshly-provisioned
 	// tenant can call the CP BEFORE it commits our org_instances row (the token
 	// lookup 401s and the LLM env is never delivered) — a race fast backends
-	// (local-docker) hit and slow ones (EC2) mask. A managed SaaS tenant that
+	// can expose and slower provider boots can mask. A managed SaaS tenant that
 	// still lacks the required LLM proxy vars after the retry window fatals loudly
 	// — silent-fail is worse than a loud refusal. Self-hosted (no orgID/adminToken)
 	// short-circuits inside and never retries — byte-identical to before. The
@@ -257,7 +257,7 @@ func main() {
 	var prov *provisioner.Provisioner
 	var cpProv *provisioner.CPProvisioner
 	if os.Getenv("MOLECULE_ORG_ID") != "" {
-		// SaaS tenant — provision via control plane (holds Fly token, manages billing)
+		// SaaS tenant — provision through the control plane's selected backend.
 		if cp, err := provisioner.NewCPProvisioner(); err != nil {
 			log.Printf("Control plane provisioner unavailable: %v", err)
 		} else {
@@ -503,7 +503,7 @@ func main() {
 	// above. Re-issues cpProv.Stop for any workspace at status='removed'
 	// with a non-NULL instance_id, healing the deprovision split-write
 	// race documented in #2989: tenant marks status='removed' BEFORE
-	// calling CP DELETE, so a transient CP failure leaves the EC2
+	// calling CP DELETE, so a transient CP failure leaves provider compute
 	// running with no retry path. cpProv.Stop is idempotent against
 	// already-terminated instances; on success we clear instance_id.
 	if cpProv != nil {
@@ -512,14 +512,14 @@ func main() {
 		})
 	}
 
-	// CP-mode instance-state reconciler — authoritative EC2-liveness pass
+	// CP-mode instance-state reconciler — authoritative provider-liveness pass
 	// for SaaS workspaces (core#2261). Every other liveness sweep keys off
 	// a PROXY (Redis TTL, agent heartbeat, local Docker, or
-	// runtime='external'); a SaaS claude-code workspace whose EC2 was
+	// runtime='external'); a SaaS workspace whose provider host was
 	// terminated/stopped falls through ALL of them and stays status='online'
 	// pointing at a dead instance_id forever (root cause: core#2247). This
 	// loop asks the ONE authoritative question the others lack —
-	// cpProv.IsRunning (CP DescribeInstances-equivalent) — for each online
+	// cpProv.IsRunning (the CP provider-state query) — for each online
 	// SaaS row, and on a CLEAN "not running" feeds it into the SAME
 	// onWorkspaceOffline closure the other sweeps use (status flip +
 	// RestartByID reprovision, existing volume). Fail-safe: IsRunning is
@@ -565,7 +565,7 @@ func main() {
 	// RFC internal#742 Part 2: wire the boot-failure rescue capture into
 	// the provision-timeout sweep's failure verdict. When the sweep flips
 	// a stuck workspace to `failed`, this hook captures a forensic rescue
-	// bundle off the still-running (but boot-failed) EC2 and ships it to
+	// bundle off the still-running (but boot-failed) provider host and ships it to
 	// obs/Loki before the control plane reaps the instance. Best-effort +
 	// non-blocking (handlers.BootFailureRescueHook dispatches on its own
 	// goroutine + timeout). The handler-side boot-failure path

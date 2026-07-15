@@ -1196,7 +1196,8 @@ func applyRuntimeModelEnv(envVars map[string]string, runtime, model string) {
 		return
 	}
 
-	// Canonical model env vars — molecule-runtime's workspace/config.py
+	// Canonical model env vars — molecule-ai-workspace-runtime's
+	// molecule_runtime/config.py
 	// resolves the picked model as MOLECULE_MODEL > MODEL > (legacy)
 	// MODEL_PROVIDER (#280; the legacy env-var fallback in the Python
 	// runtime is independent of the workspace_secrets row rename — it

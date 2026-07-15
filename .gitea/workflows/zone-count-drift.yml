@@ -2,10 +2,10 @@ name: zone-count-drift guardrail
 
 # Detects when the shared `moleculesai.app` CF zone's record count approaches
 # the Free-plan 200-record hard cap. The CP in-process teardown cascade and
-# the CI janitor (sweep-cf-orphans) are the two backstops that delete tenant
-# DNS records on org/tenant teardown; when BOTH are down (or when neither
-# runs the catch-all scope), records accumulate at ~10/hour under normal
-# E2E cadence. The zone hits 200 → every new provision fails with
+# the staging E2E's narrowly patterned DNS cleanup are the two current paths
+# that delete tenant/test DNS records; when teardown regresses, records can
+# accumulate at ~10/hour under normal E2E cadence. The zone hits 200 → every
+# new provision fails with
 # CF `81045 Record quota exceeded` (this already caused the 2026-06-22
 # staging provisioning outage, #895).
 #
@@ -15,11 +15,11 @@ name: zone-count-drift guardrail
 # PR1 in #965). This just catches the next silent accrual at 150/200, not
 # at the 200 wall.
 #
-# Why this exists as a separate workflow (not folded into sweep-cf-orphans):
+# Why this exists as a separate workflow:
 #   - The zone-count threshold is a different signal from "records to delete
 #     now" — a health check, not a sweep action.
-#   - The drift gate keeps producing failure rows even when the janitor
-#     sweep itself is in the failure chain (current state per #965).
+#   - The drift gate remains read-only and observable even when a teardown or
+#     targeted E2E cleanup path is in the failure chain.
 #   - A 200/200 cap means 0 capacity for new provisions; a count alert
 #     must fire before that, at 150.
 #
@@ -69,9 +69,8 @@ jobs:
     continue-on-error: false
 
     env:
-      # The Infisical fetch step populates these from the same
-      # /shared/cloudflare-tunnel-admin path that sweep-cf-orphans uses
-      # (wave-B aliases migration). No direct Gitea-secret read for the
+      # The Infisical fetch step populates these from the canonical
+      # /shared/cloudflare-tunnel-admin path. No direct Gitea-secret read for the
       # values being fetched — only the Infisical-fetch bootstrap
       # credentials (INFISICAL_CI_*) are Gitea secrets; the values
       # themselves come through the read_secret → add-mask → GITHUB_ENV
@@ -169,7 +168,7 @@ jobs:
         run: |
           set -euo pipefail
           # Thresholds (per #965): warn at 150 (approaching cap; issue-only,
-          # job stays green — this is the canary for the janitor to fix),
+          # job stays green — this is a canary for teardown drift),
           # error+exit1 at 180 (CRITICAL — both backstops likely down,
           # investigate teardown DNS-deletion path), error+exit1 at 200
           # (at-cap; provisioning will fail with CF 81045).
@@ -196,7 +195,7 @@ jobs:
             exit 1
           elif [ "$COUNT" -ge "$WARN_AT" ]; then
             LEVEL=approaching
-            echo "::warning::zone=$ZONE record count = $COUNT / $MAX (approaching the cap; if the CI janitor is failing or the in-process reaper is disabled, this is the canary)"
+            echo "::warning::zone=$ZONE record count = $COUNT / $MAX (approaching the cap; investigate CP teardown and the targeted staging-E2E DNS cleanup)"
             echo "exit_code=0 reason=approaching" >> "$GITHUB_OUTPUT"
             # CANARY: stay green at 150. Issue file below is the alert; the
             # job-exit is reserved for the actual fail conditions. This
@@ -228,7 +227,7 @@ jobs:
           esac
           NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           BODY_FILE=$(mktemp)
-          BODY=$(printf 'Zone-record count on this CF zone crossed the guardrail threshold.\n\n- zone: %s\n- record count: **%s / %s**\n- level: %s\n- workflow run: %s\n\nThis is the early-warning drift guardrail from molecule-controlplane#965. The 200-record Free-plan hard cap on the CF zone means every new provision fails with 81045 Record quota exceeded once we hit the wall.\n\nIf the count is climbing despite this alert, both teardown backstops (CP in-process reaper + CI janitor sweep-cf-orphans) are likely down. The root fix lives in #965 (sub-fix PR1 = DNS-capable CF token).\n' "$ZONE" "$COUNT" "$MAX" "$LEVEL_TITLE" "$RUN_URL")
+          BODY=$(printf 'Zone-record count on this CF zone crossed the guardrail threshold.\n\n- zone: %s\n- record count: **%s / %s**\n- level: %s\n- workflow run: %s\n\nThis is the early-warning drift guardrail from molecule-controlplane#965. The 200-record Free-plan hard cap on the CF zone means every new provision fails with 81045 Record quota exceeded once we hit the wall.\n\nIf the count is climbing, investigate the CP teardown DNS-deletion path and the targeted staging-E2E prune workflow. The retired general sweep-cf-orphans janitor is not a recovery path.\n' "$ZONE" "$COUNT" "$MAX" "$LEVEL_TITLE" "$RUN_URL")
           printf '%s' "$BODY" > "$BODY_FILE"
           # Search for an existing open issue for this zone so we don't
           # spam duplicates. Dedup on the standard title pattern.
@@ -236,7 +235,7 @@ jobs:
           if [ -n "$existing" ] && [ "$existing" != "null" ]; then
             echo "::notice::Existing open issue #$existing for this zone - not filing a duplicate. Commenting instead."
             COMMENT_FILE=$(mktemp)
-            COMMENT_BODY=$(printf 'zone-count-drift guardrail re-fired at %s.\n- zone: %s\n- record count: **%s / %s**\n- level: %s\n- run: %s\n\nIf the count is climbing despite this alert, both teardown backstops (CP in-process reaper + CI janitor) are likely down - see molecule-controlplane#965 for the root fix.\n' "$NOW_ISO" "$ZONE" "$COUNT" "$MAX" "$LEVEL_TITLE" "$RUN_URL")
+            COMMENT_BODY=$(printf 'zone-count-drift guardrail re-fired at %s.\n- zone: %s\n- record count: **%s / %s**\n- level: %s\n- run: %s\n\nIf the count is climbing, investigate CP teardown and the targeted staging-E2E DNS prune path; there is no general CI DNS janitor.\n' "$NOW_ISO" "$ZONE" "$COUNT" "$MAX" "$LEVEL_TITLE" "$RUN_URL")
             printf '%s' "$COMMENT_BODY" > "$COMMENT_FILE"
             # `|| true` here is intentional: even if the issue-comment fails
             # (e.g. transient network), the EVAL step's exit-1 above is the

@@ -38,13 +38,13 @@ type CPProvisionerAPI interface {
 	// for the permanent-delete-with-erase flow ONLY. Restart/recreate use Stop.
 	StopAndPrune(ctx context.Context, workspaceID string) error
 	GetConsoleOutput(ctx context.Context, workspaceID string) (string, error)
-	// IsRunning reports whether the workspace's compute (EC2 instance) is
+	// IsRunning reports whether the workspace's provider-managed compute is
 	// currently in the running state. Surfaced on the interface (rather than
 	// only on *CPProvisioner) so the a2a-proxy reactive-health path can
-	// detect dead EC2 agents the same way it detects dead Docker containers.
+	// detect dead managed agents the same way it detects dead Docker containers.
 	// Pre-#NNN, maybeMarkContainerDead only consulted the local Docker
 	// provisioner — for SaaS tenants (h.provisioner=nil) the check was a
-	// no-op, so a dead EC2 agent would leak 502/503 to canvas with no
+	// no-op, so a dead managed agent would leak 502/503 to canvas with no
 	// auto-recovery. (true, err) on transport errors keeps callers on the
 	// alive path; (false, nil) is the only definitive "dead" signal.
 	IsRunning(ctx context.Context, workspaceID string) (bool, error)
@@ -57,8 +57,8 @@ type CPProvisionerAPI interface {
 var _ CPProvisionerAPI = (*CPProvisioner)(nil)
 
 // CPProvisioner provisions workspace agents by calling the control plane's
-// workspace provision API. The control plane creates EC2 instances with
-// Docker + the workspace runtime installed at boot from PyPI.
+// workspace provision API. The control plane selects the configured compute
+// provider and starts the workspace runtime on that backend.
 //
 // Auto-activated when MOLECULE_ORG_ID is set (SaaS tenant).
 type CPProvisioner struct {
@@ -215,25 +215,23 @@ type cpProvisionRequest struct {
 	Display     WorkspaceDisplayConfig `json:"display,omitempty"`
 	PlatformURL string                 `json:"platform_url"`
 	Env         map[string]string      `json:"env"`
-	// ConfigFiles are template + generated config files to write into the
-	// EC2 instance's /configs directory. OFFSEC-010: collected by
+	// ConfigFiles are small generated/compatibility config files to materialize
+	// in the workspace's /configs directory. OFFSEC-010: collected by
 	// collectCPConfigFiles which rejects symlinks and non-regular files
 	// before including them. Serialised as base64 to avoid JSON escaping.
 	//
-	// ConfigFiles is the SM-bound bundle (the CP stages it through AWS
-	// Secrets Manager as molecule/workspace/<id>/config). It's the right
-	// transport for SMALL non-secret config text only — it has a 256 KiB
-	// cap and the SM transport is sized + scoped for *secrets*. See the
-	// core-devops 10:13 SM-inventory RCA.
+	// ConfigFiles retains a 256 KiB compatibility budget. Larger
+	// template-owned assets use the separate TemplateAssets field below; the
+	// control plane owns provider-specific materialization for both fields.
 	ConfigFiles map[string]string `json:"config_files,omitempty"`
 
 	// TemplateAssets (RFC #2843 #24) are non-secret template assets
 	// (config.yaml + prompts/ — agent-skills are plugins now, RFC#2843
 	// #32) fetched from a non-secret asset channel (template repo /
 	// Gitea shallow clone per RFC §4.2 transport option (a)). They
-	// travel on a SEPARATE wire field from ConfigFiles (the SM-bound
-	// bundle) so a future CP can route them through a non-secret
-	// transport without going through the SM cap. Serialised as base64
+	// travel on a SEPARATE wire field from ConfigFiles so the CP can route them
+	// through the non-secret asset channel without the compatibility budget.
+	// Serialised as base64
 	// to avoid JSON escaping.
 	//
 	// Keys are restricted to the template-asset allowlist enforced by
@@ -250,7 +248,7 @@ type cpProvisionResponse struct {
 }
 
 // buildCPTenantEnv assembles the env map the control plane forwards to a
-// tenant EC2 workspace container, applying the forensic #145 SCM-write-token
+// managed workspace runtime, applying the forensic #145 SCM-write-token
 // guard.
 //
 // The guard strips every key classified by isSCMWriteTokenKey (GITEA_TOKEN,
@@ -297,7 +295,7 @@ func buildCPTenantEnv(cfg WorkspaceConfig) map[string]string {
 	return env
 }
 
-// Start provisions a workspace by calling the control plane → EC2.
+// Start provisions a workspace through the control plane's selected backend.
 func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, error) {
 	// p.adminToken is read from os.Getenv("ADMIN_TOKEN") at provisioner creation
 	// and is used ONLY as CP request authentication (the X-Molecule-Admin-Token
@@ -305,7 +303,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// CP owns admin delivery (platform-kind only) and WS-A's scoped boot token is
 	// the ordinary box's pre-register bearer.
 	//
-	// Forensic #145 hardening: tenant workspaces run on EC2 via this path, so
+	// Forensic #145 hardening: managed workspaces run on provider compute via this path, so
 	// the SCM-write-token denylist (see buildContainerEnv) is enforced here
 	// too. Always build a filtered copy — never pass cfg.EnvVars through
 	// verbatim — so a latent persona-merged GITEA_TOKEN can't reach the
@@ -318,8 +316,7 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	// - Skips symlinks during WalkDir (prevents /etc/passwd etc. inclusion)
 	// - Validates all paths are relative and non-escaping
 	// - Caps total size at cpConfigFilesMaxBytes (a transport-DoS guard,
-	//   not the retired 12 KiB user-data ceiling — config now ships off
-	//   user-data via the CP's Secrets-Manager seeding path)
+	//   not the retired 12 KiB provider user-data ceiling)
 	configFiles, templateAssets, err := collectCPConfigFiles(cfg)
 	if err != nil {
 		return "", fmt.Errorf("cp provisioner: collect config files: %w", err)
@@ -433,7 +430,9 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		return "", fmt.Errorf("cp provisioner: decode 201 response: %w", unmarshalErr)
 	}
 
-	log.Printf("CP provisioner: workspace %s → EC2 instance %s (%s)", cfg.WorkspaceID, result.InstanceID, result.State)
+	log.Printf("CP provisioner: workspace %s → provider instance %s (%s)", cfg.WorkspaceID, result.InstanceID, result.State)
+	// Compatibility: dashboards consume this historical event name. InstanceID
+	// is now an opaque provider identifier; do not infer AWS from the event name.
 	provlog.Event("provision.ec2_started", map[string]any{
 		"workspace_id": cfg.WorkspaceID,
 		"instance_id":  result.InstanceID,
@@ -445,8 +444,8 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 }
 
 // cpConfigFilesMaxBytes bounds the aggregate config bundle this tenant
-// ships to the control plane. It is a transport-DoS guard, NOT the old
-// EC2-user-data ceiling.
+// ships to the control plane. It is a transport-DoS guard, not a provider
+// user-data limit.
 //
 // History: this was 12 KiB (12<<10) because the CP embedded the bundle in
 // EC2 user-data, which AWS caps at 16 KiB (the cap left ~4 KiB for bootstrap
@@ -456,14 +455,10 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 // client-side with "config files exceed 12288 bytes" and the workspace
 // could never provision.
 //
-// Config delivery now goes OFF user-data: the CP stages the bundle to AWS
-// Secrets Manager (molecule/workspace/<id>/config) at provision time and the
-// workspace fetches it into /configs at boot (mirrors the proven tenant
-// bootstrap-secrets pattern). The bundle travels here only inside the JSON
-// HTTP request body to the CP, which has no 16 KiB limit. The remaining
-// bound exists purely so a buggy/hostile tenant can't stream an unbounded
-// body and OOM the CP provision path — set generous (256 KiB) so legitimate
-// growth (more schedules, longer prompts, more skills) never re-hits a wall.
+// Current core sends the bundle only inside the authenticated tenant→CP JSON
+// request. The control plane chooses how its selected provider materializes
+// it. The remaining bound prevents a buggy or hostile tenant from streaming
+// an unbounded body into the CP provision path.
 const cpConfigFilesMaxBytes = 256 << 10
 
 // cpTemplateAssetsMaxBytes bounds the aggregate TEMPLATE-ASSET payload
@@ -471,11 +466,11 @@ const cpConfigFilesMaxBytes = 256 << 10
 // RFC#2843 #32; they are plugins installed post-online) delivered via the
 // generic non-secret asset channel (RFC #2843 #24). This is a SEPARATE bound
 // from cpConfigFilesMaxBytes: the config bundle is capped at 256 KiB because
-// it rides the Secrets-Manager/user-data transport, while template ASSETS
-// ride a non-secret channel. With skills removed the legitimate payload is
-// tiny (config.yaml ~8 KiB + prompts ~8 KiB), but we keep a generous 16 MiB
-// bound as a pure transport-DoS guard (not a secrets-transport limit) so a
-// runaway/malicious fetcher can't stream an unbounded body.
+// it is the compatibility field, while template assets have a dedicated
+// non-secret field. With skills removed the legitimate payload is tiny
+// (config.yaml ~8 KiB + prompts ~8 KiB), but we keep a generous 16 MiB bound
+// as a pure transport-DoS guard so a runaway or malicious fetcher cannot
+// stream an unbounded request body.
 const cpTemplateAssetsMaxBytes = 16 << 20
 
 // isCPTemplateConfigFile restricts which files from a template directory are
@@ -596,10 +591,9 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, map[string][]
 	// config.yaml + prompts/ via the non-secret asset channel
 	// (template repo, Gitea shallow clone per §4.2 transport
 	// option (a)) and land them in the SEPARATE TemplateAssets
-	// field of the provision request — NOT in ConfigFiles (the
-	// SM-bound bundle). The split is load-bearing: ConfigFiles is
-	// the bundle the CP stages through AWS Secrets Manager, which
-	// is sized + scoped for *secrets* and caps at 256 KiB.
+	// field of the provision request — NOT in ConfigFiles. The split is
+	// load-bearing: ConfigFiles retains a 256 KiB compatibility budget while
+	// template assets have their own 16 MiB transport guard.
 	//
 	// agent-skills are NOT fetched here anymore (RFC#2843 #32):
 	// skills are plugins, installed post-online via the plugin
@@ -638,15 +632,13 @@ func collectCPConfigFiles(cfg WorkspaceConfig) (map[string]string, map[string][]
 	return files, assets, nil
 }
 
-// Stop terminates the workspace's EC2 instance via the control plane.
+// Stop terminates the workspace's provider-managed compute via the control plane.
 //
-// Looks up the actual EC2 instance_id from the workspaces table before
-// calling CP — earlier versions passed workspaceID (a UUID) as the
-// instance_id query param, which CP forwarded to EC2 TerminateInstances,
-// which rejected with InvalidInstanceID.Malformed (EC2 IDs are i-… not
-// UUIDs). The terminate failure then left the workspace's SG attached,
-// blocking the next provision with InvalidGroup.Duplicate — a full
-// "Save & Restart" crash on SaaS.
+// Looks up the opaque provider instance_id from the workspaces table before
+// calling CP. Historically, the AWS backend received workspaceID instead and
+// rejected it as InvalidInstanceID.Malformed, leaving provider resources
+// attached and breaking the next provision. The lookup is provider-neutral;
+// CP routes termination using compute.provider.
 func (p *CPProvisioner) Stop(ctx context.Context, workspaceID string) error {
 	return p.stopInternal(ctx, workspaceID, false)
 }
@@ -691,9 +683,8 @@ func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, pr
 	q := url.Values{}
 	q.Set("instance_id", instanceID)
 	if provider != "" {
-		// #2386: CP Deprovision routes by provider so a non-AWS workspace is
-		// torn down by its own backend instead of falling through to the AWS
-		// terminate path (which would leak the box).
+		// #2386: CP Deprovision routes by provider so a workspace is torn down
+		// by its owning backend instead of the legacy default path.
 		q.Set("provider", provider)
 	}
 	if prune {
@@ -713,12 +704,11 @@ func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, pr
 	defer func() { _ = resp.Body.Close() }()
 	// http.Client.Do only returns err on transport failure; a 4xx/5xx
 	// response is NOT an error. Without this status check, a CP that
-	// returns 5xx (AWS hiccup, missing IAM, transient outage) is read
+	// returns 5xx (provider hiccup, missing credentials, transient outage) is read
 	// as success, the workspace row is then marked status='removed' by
-	// the caller, and the EC2 stays alive forever — there's no DB row
+	// the caller, and provider compute stays alive forever — there's no DB row
 	// left to point at the orphan. This is the leak source documented
-	// in workspace_crud.go's #1843 comment ("orphan EC2 on a
-	// 0-customer account scenario"); the loud-fail path already exists
+	// in workspace_crud.go's historical #1843 orphan-compute incident; the loud-fail path already exists
 	// upstream, this just plumbs it through.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Read a bounded slice of the body so the error message gives ops
@@ -741,7 +731,7 @@ func (p *CPProvisioner) stopInternal(ctx context.Context, workspaceID string, pr
 
 // resolveProvider reads workspaces.compute->>'provider' for the given workspace.
 // Returns ("", nil) when the row has no provider or the column is missing —
-// callers treat empty as "default provider" (AWS). Exposed as a package var
+// callers treat empty as the deployment-selected default provider. Exposed as a package var
 // so tests can substitute a stub, same pattern as resolveInstanceID.
 var resolveProvider = func(ctx context.Context, workspaceID string) (string, error) {
 	if db.DB == nil {
@@ -789,7 +779,7 @@ var resolveInstanceID = func(ctx context.Context, workspaceID string) (string, e
 	return instanceID.String, nil
 }
 
-// IsRunning checks workspace EC2 instance state via the control plane.
+// IsRunning checks workspace provider-compute state via the control plane.
 //
 // Contract (matches the Docker Provisioner.IsRunning contract —
 // critical for a2a_proxy's alive-on-transient-error path):
@@ -846,9 +836,8 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 	q := url.Values{}
 	q.Set("instance_id", instanceID)
 	if provider != "" {
-		// Sibling-leak to #2386: CP status routes by provider so a non-AWS
-		// workspace is queried by its own backend instead of falling through
-		// to the AWS status path (which would report NOT_FOUND / wrong state).
+		// Sibling-leak to #2386: CP status routes by provider so the workspace
+		// is queried through its owning backend instead of the legacy default.
 		q.Set("provider", provider)
 	}
 	u := fmt.Sprintf("%s/cp/workspaces/%s/status?%s", p.baseURL, workspaceID, q.Encode())
@@ -880,10 +869,9 @@ func (p *CPProvisioner) IsRunning(ctx context.Context, workspaceID string) (bool
 }
 
 // GetConsoleOutput proxies a call to the CP's
-// GET /cp/admin/workspaces/:id/console endpoint, which returns the EC2
-// serial console output (AWS ec2:GetConsoleOutput under the hood) for a
-// workspace instance. The tenant platform has no AWS credentials by
-// design, so CP is the only party that can read the serial console.
+// GET /cp/admin/workspaces/:id/console endpoint, which returns the provider's
+// boot log for a workspace instance. The tenant platform has no provider
+// credentials by design, so CP is the only party that can read it.
 //
 // Returns ("", err) on transport or non-2xx — the caller decides what
 // to render to the user.
@@ -902,8 +890,7 @@ func (p *CPProvisioner) GetConsoleOutput(ctx context.Context, workspaceID string
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("cp provisioner: console: unexpected %d", resp.StatusCode)
 	}
-	// Cap at 256 KiB — EC2 returns at most 64 KiB of serial console, but
-	// allow headroom for CP-side wrapping / metadata.
+	// Cap at 256 KiB to bound provider output plus CP-side wrapping/metadata.
 	var body struct {
 		Output string `json:"output"`
 	}

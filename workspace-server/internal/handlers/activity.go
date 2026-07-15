@@ -23,7 +23,8 @@ import (
 // internal#212 — secret-safe scrubber applied to error_detail strings
 // before they cross the canvas WebSocket. Defense in depth: the
 // workspace runtime already runs `_sanitize_for_external` on its side
-// (workspace/executor_helpers.py), but the broadcast layer is the last
+// (molecule-ai-workspace-runtime/molecule_runtime/executor_helpers.py), but
+// the broadcast layer is the last
 // stop before the string reaches the user's browser, so we re-scrub
 // here in case any caller path forgot.
 //

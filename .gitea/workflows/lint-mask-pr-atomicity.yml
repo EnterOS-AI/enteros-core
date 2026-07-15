@@ -68,9 +68,8 @@ on:
 env:
   # Belt-and-suspenders against the runner-default trap
   # (feedback_act_runner_github_server_url). Runners are configured
-  # with this env via /opt/molecule/runners/config.yaml, but pinning
-  # at the workflow level protects against a runner regenerated
-  # without the config file.
+  # with this env in runner configuration, but pinning it at the workflow
+  # level protects against a runner regenerated without that setting.
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 permissions:

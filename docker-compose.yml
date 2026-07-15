@@ -73,15 +73,13 @@ services:
       PORT: "${PLATFORM_PORT:-8080}"
       PLATFORM_URL: "http://platform:${PLATFORM_PORT:-8080}"
       # Container network namespace is already isolated; "all interfaces"
-      # inside the container = the bridge interface only. The fail-open
-      # default (127.0.0.1) would block host-to-container access.
+      # inside the container = the bridge interface only. The local-process
+      # loopback default (127.0.0.1) would block host-to-container access.
       BIND_ADDR: "${BIND_ADDR:-0.0.0.0}"
-      # Default MOLECULE_ENV=development so the WorkspaceAuth / AdminAuth
-      # middleware fail-open path activates when ADMIN_TOKEN is unset —
-      # otherwise the canvas (which runs without a bearer in pure local
-      # dev) gets 401 "missing workspace auth token" on every request.
-      # Override to "production" for SaaS/staged deploys; in those modes
-      # ADMIN_TOKEN must also be set or every request rejects.
+      # MOLECULE_ENV controls local conveniences, not authentication. Auth
+      # fails closed in every environment; configure ADMIN_TOKEN for this
+      # standalone stack and pass the matching local-only Canvas build value.
+      # Production/SaaS uses verified sessions and must not publish that secret.
       MOLECULE_ENV: "${MOLECULE_ENV:-development}"
       # Self-hosted: the platform agent (concierge, the org root) is seeded
       # UNCONDITIONALLY on boot when MOLECULE_ORG_ID is unset — no opt-in flag
@@ -228,6 +226,8 @@ services:
       args:
         NEXT_PUBLIC_PLATFORM_URL: ${NEXT_PUBLIC_PLATFORM_URL:-http://localhost:${PLATFORM_PUBLISH_PORT:-8080}}
         NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:${PLATFORM_PUBLISH_PORT:-8080}/ws}
+        # Standalone/local compatibility only. This becomes public browser JS;
+        # never use a production tenant ADMIN_TOKEN as this build argument.
         NEXT_PUBLIC_ADMIN_TOKEN: ${ADMIN_TOKEN:-}
         # SHA surfaced at /api/buildinfo (core#2235). CI passes the real merge
         # SHA via the publish-canvas-image workflow build-args; local compose

@@ -33,12 +33,13 @@ export interface RequestOptions {
  *  - `X-Molecule-Org-Slug` — derived from `window.location.hostname`
  *    by `getTenantSlug()`. The platform uses it to validate tenant
  *    routing. Empty on localhost / non-tenant hosts — safe to omit.
- *  - `Authorization: Bearer <token>` — `NEXT_PUBLIC_ADMIN_TOKEN` baked
- *    into the canvas build (see canvas/Dockerfile L8/L11). Required by
- *    the workspace-server when `ADMIN_TOKEN` is set on the server side
- *    (Tier-2b AdminAuth gate, wsauth_middleware.go ~L245). Empty when
- *    no admin token was provisioned — the Tier-1 session-cookie path
- *    handles that case via `credentials:"include"`.
+ *  - `Authorization: Bearer <token>` — optional local-development and
+ *    ephemeral-E2E compatibility path. `scripts/dev-start.sh` supplies a
+ *    matching `ADMIN_TOKEN` / `NEXT_PUBLIC_ADMIN_TOKEN` pair. Production
+ *    SaaS builds leave this public value empty and authenticate browser
+ *    requests with the verified control-plane session cookie carried by
+ *    `credentials:"include"`; never bake a tenant admin secret into the
+ *    public Canvas bundle.
  *
  * Why a shared helper: the two-line "read env, attach bearer; read
  * slug, attach header" pattern was duplicated across `request()` and

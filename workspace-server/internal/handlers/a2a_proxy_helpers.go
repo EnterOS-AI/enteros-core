@@ -30,7 +30,7 @@ import (
 // forward error or one flaky IsRunning probe must not restart a
 // recently-alive workspace. We only declare the container dead when:
 //   - the workspace has NOT heartbeated recently, AND IsRunning reports
-//     not-running (immediate-dead path, preserving dead-EC2 recovery); OR
+//     not-running (immediate-dead path, preserving dead-provider recovery); OR
 //   - the workspace DOES have a recent heartbeat but we see N consecutive
 //     dead observations within the debounce window.
 const (

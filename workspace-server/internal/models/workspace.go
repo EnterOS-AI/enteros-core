@@ -139,7 +139,8 @@ type HeartbeatPayload struct {
 	// RuntimeMetadata is the adapter-declared capability map + per-
 	// capability override values. The Python runtime builds this from
 	// BaseAdapter.capabilities() + per-hook methods (e.g.
-	// idle_timeout_override()) — see workspace/heartbeat.py:
+	// idle_timeout_override()) — see molecule-ai-workspace-runtime/
+	// molecule_runtime/heartbeat.py:
 	// _runtime_metadata_payload. Optional: missing means "use platform
 	// defaults for everything", matching pre-2026-04 behavior.
 	//
@@ -182,8 +183,8 @@ type HeartbeatPayload struct {
 // added with `omitempty` without breaking older runtime versions.
 //
 // See project memory `project_runtime_native_pluggable.md` for the
-// principle and workspace/adapter_base.py:RuntimeCapabilities for the
-// Python source of truth.
+// principle and molecule-ai-workspace-runtime/molecule_runtime/
+// adapter_base.py:RuntimeCapabilities for the Python source of truth.
 type RuntimeMetadata struct {
 	// Capabilities maps capability name → "adapter owns it natively".
 	// Keys (heartbeat, scheduler, session, status_mgmt, retry,
@@ -232,10 +233,10 @@ type WorkspaceCompute struct {
 	// disk (wiped each recreate — privacy); "" = auto (desktop-control persists,
 	// others follow the org flag). Forwarded verbatim to CP's data_persistence.
 	DataPersistence string `json:"data_persistence,omitempty"`
-	// Provider is the CLOUD/compute backend for this workspace box (multi-provider
-	// RFC, per-workspace): ""/"aws" = default EC2; "hetzner"/"gcp" route to the
-	// CP WorkspaceProvisioner. Distinct from the LLM/model provider. Forwarded to
-	// CP /cp/workspaces/provision `provider`.
+	// Provider is the cloud/compute backend for this workspace box. Empty means
+	// the deployment-selected default; recognized explicit values currently
+	// include "aws", "hetzner", and "gcp". Distinct from the LLM/model provider
+	// and forwarded to CP /cp/workspaces/provision as `provider`.
 	Provider string `json:"provider,omitempty"`
 }
 
@@ -269,8 +270,8 @@ type CreateWorkspacePayload struct {
 	// MaxConcurrentTasks caps parallel A2A + cron dispatch. 0 means use
 	// DefaultMaxConcurrentTasks. Leaders typically set 3.
 	MaxConcurrentTasks int `json:"max_concurrent_tasks"`
-	// Compute is the product-facing per-workspace EC2 shape/display
-	// contract. Phase 1 uses instance_type + volume.root_gb and persists
+	// Compute is the product-facing per-workspace host shape/display
+	// contract. It uses instance_type + volume.root_gb and persists
 	// display for future desktop-control workspaces.
 	Compute WorkspaceCompute `json:"compute,omitempty"`
 	Canvas  struct {
