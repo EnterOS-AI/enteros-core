@@ -35,9 +35,10 @@ func TestWorkspaceLifecycleRegisterTenantCleanupDeletesExactSlug(t *testing.T) {
 			contentType: r.Header.Get("Content-Type"),
 			body:        string(body),
 		}
-		if r.Method == http.MethodGet && r.URL.Path == "/cp/admin/orgs" {
+		if r.Method == http.MethodGet && r.URL.Path == "/cp/admin/tenants/"+slug+"/boot-events" {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"limit":500,"offset":0,"orgs":[]}`)
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":"org not found","slug":"`+slug+`"}`)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -80,8 +81,8 @@ func TestWorkspaceLifecycleRegisterTenantCleanupDeletesExactSlug(t *testing.T) {
 	}
 	select {
 	case verify := <-requests:
-		if verify.method != http.MethodGet || verify.path != "/cp/admin/orgs" {
-			t.Fatalf("cleanup verification request = %+v, want exact admin roster GET", verify)
+		if verify.method != http.MethodGet || verify.path != "/cp/admin/tenants/"+slug+"/boot-events" {
+			t.Fatalf("cleanup verification request = %+v, want exact tenant identity GET", verify)
 		}
 	default:
 		t.Fatal("registered cleanup did not verify exact org absence")
@@ -99,7 +100,7 @@ func TestDeleteTenantAndVerifyRetriesLifecycleConflictAndConfirmsAbsence(t *test
 		token = "test-admin-token"
 	)
 
-	var deleteCalls, listCalls int
+	var deleteCalls, identityCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
 			t.Errorf("authorization header = %q, want test bearer", got)
@@ -114,16 +115,14 @@ func TestDeleteTenantAndVerifyRetriesLifecycleConflictAndConfirmsAbsence(t *test
 				return
 			}
 			_, _ = io.WriteString(w, `{"deleted":true,"slug":"`+slug+`"}`)
-		case r.Method == http.MethodGet && r.URL.Path == "/cp/admin/orgs":
-			listCalls++
-			if got := r.URL.Query().Get("limit"); got != "500" {
-				t.Errorf("list limit = %q, want 500", got)
-			}
-			if got := r.URL.Query().Get("offset"); got != "0" {
-				t.Errorf("list offset = %q, want 0", got)
+		case r.Method == http.MethodGet && r.URL.Path == "/cp/admin/tenants/"+slug+"/boot-events":
+			identityCalls++
+			if got := r.URL.Query().Get("limit"); got != "1" {
+				t.Errorf("identity limit = %q, want 1", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"limit":500,"offset":0,"orgs":[]}`)
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":"org not found","slug":"`+slug+`"}`)
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusNotFound)
@@ -143,8 +142,8 @@ func TestDeleteTenantAndVerifyRetriesLifecycleConflictAndConfirmsAbsence(t *test
 	if deleteCalls != 2 {
 		t.Fatalf("DELETE calls = %d, want conflict retry plus success", deleteCalls)
 	}
-	if listCalls != 1 {
-		t.Fatalf("org-list calls = %d, want exact absence verification", listCalls)
+	if identityCalls != 1 {
+		t.Fatalf("identity calls = %d, want exact absence verification", identityCalls)
 	}
 }
 
@@ -186,5 +185,77 @@ func TestDeleteTenantAndVerifyRefusesUntrustedControlPlaneHost(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "refusing cleanup for non-E2E slug") {
 		t.Fatalf("unsafe-slug error = %v, want exact-slug path guard", err)
+	}
+}
+
+func TestExactTenantAbsentUsesIdentityBoundEndpoint(t *testing.T) {
+	const slug = "e2e-cleanup-identity-contract"
+	tests := []struct {
+		name       string
+		status     int
+		body       string
+		wantAbsent bool
+		wantErr    bool
+	}{
+		{name: "404 is authoritative absence", status: http.StatusNotFound, body: `{"error":"org not found"}`, wantAbsent: true},
+		{name: "matching 200 is present", status: http.StatusOK, body: `{"slug":"` + slug + `","events":[]}`},
+		{name: "mismatched 200 fails closed", status: http.StatusOK, body: `{"slug":"e2e-other"}`, wantErr: true},
+		{name: "malformed 200 fails closed", status: http.StatusOK, body: `{`, wantErr: true},
+		{name: "server error is inconclusive", status: http.StatusServiceUnavailable, body: `{"error":"unavailable"}`, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/cp/admin/tenants/"+slug+"/boot-events" || r.URL.Query().Get("limit") != "1" {
+					t.Errorf("identity request = %s %s, want exact tenant boot-events?limit=1", r.Method, r.URL.String())
+				}
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+
+			absent, err := exactTenantAbsent(
+				&http.Client{Timeout: time.Second},
+				stagingCfg{cpBase: server.URL, adminToken: "test-admin-token"},
+				slug,
+			)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr=%v", err, tc.wantErr)
+			}
+			if absent != tc.wantAbsent {
+				t.Fatalf("absent = %v, want %v", absent, tc.wantAbsent)
+			}
+		})
+	}
+}
+
+func TestDeleteTenantAndVerifyAcceptsAlreadyAbsentTenant(t *testing.T) {
+	const slug = "e2e-cleanup-already-absent"
+	var deleteCalls, identityCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodDelete:
+			deleteCalls++
+			w.WriteHeader(http.StatusNotFound)
+		case http.MethodGet:
+			identityCalls++
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+		}
+	}))
+	defer server.Close()
+
+	if err := deleteTenantAndVerify(
+		stagingCfg{cpBase: server.URL, adminToken: "test-admin-token"},
+		slug,
+		250*time.Millisecond,
+		time.Millisecond,
+	); err != nil {
+		t.Fatalf("already absent cleanup: %v", err)
+	}
+	if deleteCalls != 1 || identityCalls != 1 {
+		t.Fatalf("calls DELETE=%d identity=%d, want 1 each", deleteCalls, identityCalls)
 	}
 }

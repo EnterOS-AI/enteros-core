@@ -513,9 +513,9 @@ func adminDeleteTenant(t *testing.T, cfg stagingCfg, slug string) {
 
 // deleteTenantAndVerify retries the one transient response the CP emits while
 // an asynchronous lifecycle operation is still settling (HTTP 409), then
-// proves the exact slug is absent from the paginated admin roster. It is
-// deliberately bounded and exact-slug-only: no fleet sweep and no false-green
-// warning path.
+// proves the exact slug is absent through the CP's identity-bound tenant
+// endpoint (404). It is deliberately bounded and exact-slug-only: no fleet
+// sweep and no false-green warning path.
 func deleteTenantAndVerify(cfg stagingCfg, slug string, timeout, pollInterval time.Duration) error {
 	if cfg.cpBase == "" || cfg.adminToken == "" {
 		return fmt.Errorf("control-plane base URL and admin token are required")
@@ -560,14 +560,14 @@ func deleteTenantAndVerify(cfg stagingCfg, slug string, timeout, pollInterval ti
 			lastDetail = cleanupResponseDetail(respBody)
 			switch {
 			case status == http.StatusOK || status == http.StatusAccepted || status == http.StatusNotFound:
-				absent, verifyErr := exactTenantAbsent(client, cfg, slug, deadline)
+				absent, verifyErr := exactTenantAbsent(client, cfg, slug)
 				if verifyErr == nil && absent {
 					return nil
 				}
 				if verifyErr != nil {
 					lastDetail = "absence verification: " + verifyErr.Error()
 				} else {
-					lastDetail = "DELETE accepted but exact slug remains in admin roster"
+					lastDetail = "DELETE accepted but exact tenant identity still exists"
 				}
 			case status == http.StatusConflict || status == http.StatusRequestTimeout ||
 				status == http.StatusTooManyRequests || status >= http.StatusInternalServerError:
@@ -591,43 +591,33 @@ func deleteTenantAndVerify(cfg stagingCfg, slug string, timeout, pollInterval ti
 	}
 }
 
-func exactTenantAbsent(client *http.Client, cfg stagingCfg, slug string, deadline time.Time) (bool, error) {
-	const pageLimit = 500
-	base := strings.TrimRight(cfg.cpBase, "/")
-	for offset := 0; ; offset += pageLimit {
-		if time.Now().After(deadline) {
-			return false, fmt.Errorf("org-roster verification deadline exhausted")
-		}
-		status, body, err := cleanupJSONRequest(
-			client,
-			http.MethodGet,
-			fmt.Sprintf("%s/cp/admin/orgs?limit=%d&offset=%d", base, pageLimit, offset),
-			cfg.adminToken,
-			"",
-		)
-		if err != nil {
-			return false, err
-		}
-		if status != http.StatusOK {
-			return false, fmt.Errorf("org roster returned HTTP %d: %s", status, cleanupResponseDetail(body))
-		}
-		var page struct {
-			Orgs []struct {
-				Slug string `json:"slug"`
-			} `json:"orgs"`
-		}
-		if err := json.Unmarshal([]byte(body), &page); err != nil {
-			return false, fmt.Errorf("decode org roster: %w", err)
-		}
-		for _, org := range page.Orgs {
-			if org.Slug == slug {
-				return false, nil
-			}
-		}
-		if len(page.Orgs) < pageLimit {
-			return true, nil
-		}
+func exactTenantAbsent(client *http.Client, cfg stagingCfg, slug string) (bool, error) {
+	status, body, err := cleanupJSONRequest(
+		client,
+		http.MethodGet,
+		fmt.Sprintf("%s/cp/admin/tenants/%s/boot-events?limit=1", strings.TrimRight(cfg.cpBase, "/"), slug),
+		cfg.adminToken,
+		"",
+	)
+	if err != nil {
+		return false, err
 	}
+	if status == http.StatusNotFound {
+		return true, nil
+	}
+	if status != http.StatusOK {
+		return false, fmt.Errorf("exact tenant identity returned HTTP %d: %s", status, cleanupResponseDetail(body))
+	}
+	var identity struct {
+		Slug string `json:"slug"`
+	}
+	if err := json.Unmarshal([]byte(body), &identity); err != nil {
+		return false, fmt.Errorf("decode exact tenant identity: %w", err)
+	}
+	if identity.Slug != slug {
+		return false, fmt.Errorf("exact tenant identity mismatch: got %q", identity.Slug)
+	}
+	return false, nil
 }
 
 func validateStagingCPBase(raw string) error {
