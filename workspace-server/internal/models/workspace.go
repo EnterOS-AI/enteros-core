@@ -32,6 +32,12 @@ type Workspace struct {
 	LastErrorRate      float64         `json:"last_error_rate" db:"last_error_rate"`
 	LastSampleError    sql.NullString  `json:"last_sample_error" db:"last_sample_error"`
 	ActiveTasks        int             `json:"active_tasks" db:"active_tasks"`
+	// IsBusy is the self-healing successor to ActiveTasks (RFC #4402): a boolean
+	// "is the agent in a turn right now" fed by the heartbeat. During the B1→B4
+	// migration it is written on every beat — either from the runtime's own
+	// is_busy (B2+) or derived from active_tasks>0 (older runtimes). Consumers
+	// cut over to it in B3.
+	IsBusy             bool            `json:"is_busy" db:"is_busy"`
 	MaxConcurrentTasks int             `json:"max_concurrent_tasks" db:"max_concurrent_tasks"`
 	UptimeSeconds      int             `json:"uptime_seconds" db:"uptime_seconds"`
 	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
@@ -114,6 +120,13 @@ type HeartbeatPayload struct {
 	ErrorRate     float64 `json:"error_rate"`
 	SampleError   string  `json:"sample_error"`
 	ActiveTasks   int     `json:"active_tasks"`
+	// NOTE (RFC #4402): the runtime-sent is_busy field is deliberately NOT
+	// parsed here in B1. B1 captures is_busy on the server side by DERIVING it
+	// from active_tasks (`is_busy = (active_tasks > 0)` in the heartbeat
+	// UPDATE), so no runtime cooperation is required yet. The pointer field
+	// that lets the handler honor a runtime's authoritative is_busy (nil =
+	// derive, non-nil = trust) lands in B2, coupled with the molcontracts bump
+	// that adds is_busy to HeartbeatRequest — keeping B1 free of any SSOT bump.
 	UptimeSeconds int     `json:"uptime_seconds"`
 	CurrentTask   string  `json:"current_task"`
 	// MonthlySpend is cumulative USD spend for the current calendar month,

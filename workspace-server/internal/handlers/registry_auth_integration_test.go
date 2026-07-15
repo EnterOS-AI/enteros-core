@@ -157,6 +157,21 @@ func statusOf(t *testing.T, conn *sql.DB, id string) string {
 	return status
 }
 
+// busyOf reads a workspace row's current is_busy flag (RFC #4402 B1),
+// failing the test if the row is gone. Used by the is_busy-capture test to
+// verify the heartbeat derived the boolean from active_tasks.
+func busyOf(t *testing.T, conn *sql.DB, id string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var busy bool
+	err := conn.QueryRowContext(ctx, `SELECT is_busy FROM workspaces WHERE id = $1`, id).Scan(&busy)
+	if err != nil {
+		t.Fatalf("busyOf(%s): %v", id, err)
+	}
+	return busy
+}
+
 // insertWorkspaceWithURL creates a workspace row with an explicit URL
 // (the provisioner-set host-port URL the CASE-preservation tests need
 // pre-populated). Returns the DB-generated UUID. Mirrors insertWorkspace
@@ -253,6 +268,31 @@ const heartbeatUpdateSQL = `
 	UPDATE workspaces SET
 		last_heartbeat_at = now(),
 		status            = CASE WHEN status = 'provisioning' THEN 'online' ELSE status END,
+		updated_at        = now()
+	WHERE id = $1 AND status != 'removed'
+`
+
+// heartbeatIsBusyUpdateSQL mirrors RegistryHandler.Heartbeat's zero-spend
+// branch at workspace-server/internal/handlers/registry.go:1483 — the arm
+// that carries the RFC #4402 B1 `is_busy = ($4 > 0)` derive. Unlike the
+// reduced heartbeatUpdateSQL above (which drops optional columns for the
+// #73 row-state tests), this one INCLUDES active_tasks ($4) and is_busy
+// because the whole point is to prove the derive lands a real Postgres
+// boolean off the active_tasks bind arg. Both columns are in the
+// full migrations/ set CI applies (apply-all-or-skip), so the integration
+// DB has them. Kept in lockstep with registry.go:1483; CR2/CI must confirm
+// the derive clause still matches the handler. The status CASE is a no-op
+// for the 'online' rows this test inserts (kind is NOT NULL, non-platform).
+const heartbeatIsBusyUpdateSQL = `
+	UPDATE workspaces SET
+		last_heartbeat_at = now(),
+		last_error_rate   = $2,
+		last_sample_error = $3,
+		active_tasks      = $4,
+		uptime_seconds    = $5,
+		current_task      = $6,
+		is_busy           = ($4 > 0),
+		status            = (CASE WHEN status = 'provisioning' AND kind <> 'platform' THEN 'online' ELSE status END)::workspace_status,
 		updated_at        = now()
 	WHERE id = $1 AND status != 'removed'
 `
@@ -485,6 +525,52 @@ func TestIntegration_RegistryRowState_HeartbeatProvisioningAlreadyOnlineUnchange
 
 	if got := statusOf(t, conn, id); got != "online" {
 		t.Fatalf("online workspace status changed unexpectedly by heartbeat: status=%q, want 'online'", got)
+	}
+}
+
+// TestIntegration_Heartbeat_IsBusyDerivedFromActiveTasks proves the RFC #4402
+// B1 capture: the heartbeat UPDATE lands is_busy = (active_tasks > 0) as a
+// real Postgres boolean on the row. Both arms are asserted in one test so the
+// false arm is a genuine negative control — not "column defaults to false and
+// we never wrote it", but "a beat with active_tasks=0 writes is_busy=false"
+// AND "a beat with active_tasks>0 writes is_busy=true".
+//
+// Watch-fail intent: drop `is_busy = ($4 > 0)` from registry.go's heartbeat
+// UPDATE (both spend branches) and the busy arm regresses — is_busy stays at
+// its column default (false) even though the workspace reported active_tasks=3.
+// The migration (20260715120000_workspaces_is_busy) must also have landed the
+// column, or busyOf's SELECT fails loud.
+func TestIntegration_Heartbeat_IsBusyDerivedFromActiveTasks(t *testing.T) {
+	conn := integrationAuthDB(t)
+	ctx := context.Background()
+
+	id := insertWorkspace(t, conn, "busy-ws", "online", "")
+
+	// Fresh row starts is_busy=false (column DEFAULT), before any beat.
+	if busyOf(t, conn, id) {
+		t.Fatalf("fresh workspace is_busy=true, want false (column default regressed)")
+	}
+
+	// A beat reporting an in-flight task flips is_busy true.
+	// Args mirror registry.go: $1=id, $2=error_rate, $3=sample_error,
+	// $4=active_tasks, $5=uptime_seconds, $6=current_task.
+	if _, err := conn.ExecContext(ctx, heartbeatIsBusyUpdateSQL,
+		id, 0.0, "", 3, 3600, "running a turn"); err != nil {
+		t.Fatalf("busy heartbeat update: %v", err)
+	}
+	if !busyOf(t, conn, id) {
+		t.Fatalf("active_tasks=3 heartbeat did NOT set is_busy=true (RFC #4402 B1 derive regressed)")
+	}
+
+	// A later beat reporting idle flips is_busy back to false — this is the
+	// negative control: the derive must WRITE false, not just leave the
+	// prior true standing.
+	if _, err := conn.ExecContext(ctx, heartbeatIsBusyUpdateSQL,
+		id, 0.0, "", 0, 3660, ""); err != nil {
+		t.Fatalf("idle heartbeat update: %v", err)
+	}
+	if busyOf(t, conn, id) {
+		t.Fatalf("active_tasks=0 heartbeat did NOT clear is_busy (derive wrote stale true; RFC #4402 B1 regressed)")
 	}
 }
 
