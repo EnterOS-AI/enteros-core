@@ -669,12 +669,12 @@ jobs:
           # Empty on untrusted-fork PRs — the MiniMax arm is opportunistic
           # (bestfail), so an empty key never reds this required gate.
         run: bash tests/e2e/test_priority_runtimes_e2e.sh
-      - name: Install standalone runtime parser from Gitea registry
+      - name: Install pinned standalone runtime from Gitea registry
         if: needs.detect-changes.outputs.api == 'true'
-        run: |
-          python3 -m pip install --no-deps \
-            --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
-            molecule-ai-workspace-runtime
+        # The private registry does not proxy public dependencies. The helper
+        # downloads the pinned private wheel first, then resolves that local
+        # wheel's dependencies only from public PyPI (no mixed-index ambiguity).
+        run: bash scripts/install-workspace-runtime.sh
       - name: Run poll-mode + since_id cursor E2E (#2339)
         if: needs.detect-changes.outputs.api == 'true'
         run: bash tests/e2e/test_poll_mode_e2e.sh

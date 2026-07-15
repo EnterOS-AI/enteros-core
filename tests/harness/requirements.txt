@@ -16,11 +16,7 @@ httpx>=0.28.1
 # channel-envelope-trust-boundary.sh imports from `molecule_runtime.*` (the
 # wheel-rewritten path) so it catches the failure mode where the wheel
 # build silently strips a fix that unit tests on local source still pass.
-# >= 0.1.78 ships PR #2481's peer_id trust-boundary guard.
-# The workspace-runtime wheel is published to the private Gitea package
-# registry, not public PyPI. A bare `pip install -r` only queries PyPI and
-# fails with "molecule-ai-workspace-runtime ... (from versions: none)" (the
-# harness-replays red). --extra-index-url adds the private index on top of
-# PyPI (httpx still resolves from PyPI); anonymous read is allowed.
---extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
-molecule-ai-workspace-runtime>=0.1.78
+# The canonical molecules-workspace-runtime wheel is installed separately by
+# scripts/install-workspace-runtime.sh. Requirements files cannot safely express
+# its private-wheel/public-dependency split without --extra-index-url exposing
+# the private package name to both registries.
