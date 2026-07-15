@@ -14,21 +14,14 @@ queue. This script provides the missing serialized policy in user space:
    main re-runs push CI and this gate PAUSES the queue if main goes red, so no
    merge piles onto an unverified/red main (issue #2358).
 3. Refuse fork PRs; the queue may only mutate same-repo branches.
-4. DIRECT-MERGE when conflict-free (issue #2358). When Gitea reports the PR
-   conflict-free (mergeable is True) and the merge bar below is met, MERGE IT
-   DIRECTLY — even if its head does not contain current main. We do NOT call
-   /pulls/{n}/update first: branch protection does not require strict
-   up-to-date, so behind-main conflict-free PRs merge cleanly, and calling
-   /update would trigger Gitea dismiss_stale_approvals (dismissing the genuine
-   approvals and forcing a re-review every tick — the rebase-churn bottleneck).
-   The /update path is used ONLY when the PR is DEFINITIVELY not mergeable
-   (mergeable is literal False) AND its head lacks current main — refreshing the
-   branch may resolve a behind-main non-conflict; a real conflict returns HTTP
-   409 and the PR is HELD per #2352. mergeable=None/missing (Gitea STILL
-   COMPUTING conflict state) is a distinct fail-closed WAIT: never merged AND
-   never /update'd — calling /update during the compute window would dismiss the
-   PR's genuine approvals (dismiss_stale_approvals) and re-introduce the exact
-   rebase-churn this queue eliminates. None is re-checked next tick.
+4. Honor branch protection's `block_on_outdated_branch` field. When enabled,
+   a behind-main PR is updated first and must earn fresh CI/review before merge;
+   this avoids Gitea's expected HTTP 405 for a stale head. When disabled, the
+   queue retains the #2358 throughput path and directly merges a conflict-free
+   (`mergeable is True`) behind-main PR after the full merge bar passes. For a
+   current-base PR, `mergeable=None/missing` is a fail-closed WAIT and literal
+   False is a conflict WAIT. A real /update conflict returns HTTP 409 and the PR
+   is best-effort HELD per #2352.
 5. Merge ONLY when, on the PR's CURRENT head sha:
      - >= REQUIRED_APPROVALS distinct GENUINE official APPROVED reviews from
        the recognised reviewer set (not stale, not dismissed, commit_id ==
@@ -81,7 +74,7 @@ Head-of-line (HOL) safety has two complementary layers:
   (b) For the candidate the scan acts on, two permanent failure modes HOLD the
       PR (apply HOLD_LABEL) and let the scan CONTINUE to the next candidate
       rather than re-selecting the same wedged PR every tick:
-        - a permanent permission/4xx merge error (403/404/405), and
+        - a normal protected-merge refusal (403/404/405), and
         - a persistent branch-update conflict (the /update endpoint returns
           HTTP 409 because the PR branch cannot be merged with main without a
           manual rebase). A conflict will not self-resolve, so retrying it
@@ -98,7 +91,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import fnmatch
 import json
 import os
 import re
@@ -445,8 +437,11 @@ class ApiError(RuntimeError):
 
 
 class MergePermissionError(ApiError):
-    """Merge failed with a permanent permission error (403/404/405).
-    The queue should HOLD this PR and move to the next one."""
+    """The normal merge endpoint refused the request (403/404/405).
+
+    This can be permission or branch-protection policy. The queue never
+    bypasses it; it best-effort HOLDS the PR and scans the next candidate.
+    """
 
 
 class BranchUpdateConflictError(ApiError):
@@ -520,6 +515,7 @@ class BranchProtection:
     required_contexts: list[str]
     required_approvals: int
     block_on_rejected_reviews: bool
+    block_on_outdated_branch: bool = False
 
 
 def _require_runtime_env() -> None:
@@ -648,14 +644,90 @@ def latest_statuses_by_context(statuses: list[dict]) -> dict[str, dict]:
     return latest
 
 
+class GiteaGlobCompileError(ValueError):
+    """A branch-protection glob cannot be compiled with Gitea semantics."""
+
+
+_GITEA_GLOB_SPECIAL = frozenset("*?\\[]{}")
+
+
 def _is_glob(pattern: str) -> bool:
-    """A required-context entry is a Gitea GLOB (superset check) iff it
-    contains a `*` or `?` wildcard. Everything else is a literal PRESENCE
-    check. We deliberately do NOT treat `[...]` as a glob trigger: real
-    Gitea status contexts contain `(` `)` and other punctuation but never
-    the wildcard metacharacters, so keying only on `*`/`?` avoids
-    misreading a literal context name that happens to contain a bracket."""
-    return "*" in pattern or "?" in pattern
+    """Mirror Gitea modules/glob.IsSpecialByte.
+
+    Branch-protection entries are always compiled as Gitea globs. This helper
+    is only used to keep the diagnostic distinction between a missing plain
+    literal and a special pattern that matched nothing.
+    """
+    return any(c in _GITEA_GLOB_SPECIAL for c in pattern)
+
+
+def _compile_gitea_glob(pattern: str) -> re.Pattern[str]:
+    """Compile the status-context glob exactly along Gitea's modules/glob
+    grammar (with no separators, as services/pull/commit_status.go invokes it).
+
+    Supported server syntax is broader than Python ``fnmatch``: ``*``, ``**``,
+    ``?``, character classes and ``[!x]`` negation, brace alternatives, and
+    backslash escapes. Invalid classes/escapes fail closed at the caller.
+    """
+    pos = 0
+
+    def compile_chars() -> str:
+        nonlocal pos
+        result = ""
+        if pos < len(pattern) and pattern[pos] == "!":
+            pos += 1
+            result += "^"
+        while pos < len(pattern):
+            c = pattern[pos]
+            pos += 1
+            if c == "]":
+                return "[" + result + "]"
+            if c == "\\":
+                if pos >= len(pattern):
+                    raise GiteaGlobCompileError("unterminated character class escape")
+                result += re.escape(pattern[pos])
+                pos += 1
+            else:
+                result += c
+        raise GiteaGlobCompileError("unterminated character class")
+
+    def compile_part(subpattern: bool) -> str:
+        nonlocal pos
+        result = ""
+        while pos < len(pattern):
+            c = pattern[pos]
+            pos += 1
+            if subpattern and c == "}":
+                return "(?:" + result + ")"
+            if c == "*":
+                if pos < len(pattern) and pattern[pos] == "*":
+                    pos += 1
+                # Gitea calls glob.Compile(ctx) without separators, so single
+                # and double star both match any sequence of characters.
+                result += ".*"
+            elif c == "?":
+                result += "."
+            elif c == "[":
+                result += compile_chars()
+            elif c == "{":
+                result += compile_part(True)
+            elif c == "," and subpattern:
+                result += "|"
+            elif c == "\\":
+                if pos >= len(pattern):
+                    raise GiteaGlobCompileError("no character to escape")
+                result += re.escape(pattern[pos])
+                pos += 1
+            else:
+                result += re.escape(c)
+        # This intentionally mirrors Gitea's compiler: an opening brace that
+        # reaches EOF returns the compiled subexpression rather than raising.
+        return result
+
+    try:
+        return re.compile(r"\A" + compile_part(False) + r"\Z")
+    except re.error as exc:
+        raise GiteaGlobCompileError(str(exc)) from exc
 
 
 def required_contexts_green(
@@ -673,8 +745,9 @@ def required_contexts_green(
     # human (core#4363).
     #
     # Each entry is matched with Gitea's real semantics:
-    #   * a GLOB pattern (contains */?) is a SUPERSET check — it matches every
-    #     posted context via fnmatch and requires all matches to be `success`.
+    #   * a GLOB pattern is a SUPERSET check — it matches every posted context
+    #     via the same grammar as modules/glob and requires all matches to be
+    #     `success`.
     #     A glob that matches ZERO posted contexts is fail-closed: we cannot
     #     prove any required gate ran, so it WAITs (`<pattern>=no-match`). This
     #     closes the pre-#4363-followup vacuous-green hole where "*" over an
@@ -696,23 +769,24 @@ def required_contexts_green(
         missing_or_bad.append(f"{ctx}={state or 'missing'}")
 
     for pattern in contexts:
-        if _is_glob(pattern):
-            matches = [c for c in latest_statuses if fnmatch.fnmatchcase(c, pattern)]
-            if not matches:
-                # Fail-closed: a required glob that matches nothing cannot be
-                # shown green. (Bare "*" over an empty board lands here too —
-                # a mergeable PR always has posted CI, so this never freezes a
-                # real merge, but it refuses to vacuously pass a blank board.)
-                _flag(pattern, "no-match")
-                continue
-            for ctx in matches:
-                state = status_state(latest_statuses.get(ctx) or {})
-                if state != "success":
-                    _flag(ctx, state)
-        else:
-            state = status_state(latest_statuses.get(pattern) or {})
+        try:
+            matcher = _compile_gitea_glob(pattern)
+        except GiteaGlobCompileError:
+            # Gitea drops an uncompileable required pattern from its matcher;
+            # the queue is stricter and makes that policy defect explicit.
+            _flag(pattern, "invalid-glob")
+            continue
+        matches = [c for c in latest_statuses if matcher.fullmatch(c)]
+        if not matches:
+            # Fail-closed: a required pattern that matches nothing cannot be
+            # shown green. Preserve the old `missing` wording for plain exact
+            # names; special Gitea patterns report `no-match`.
+            _flag(pattern, "no-match" if _is_glob(pattern) else "missing")
+            continue
+        for ctx in matches:
+            state = status_state(latest_statuses.get(ctx) or {})
             if state != "success":
-                _flag(pattern, state)
+                _flag(ctx, state)
 
     return not missing_or_bad, missing_or_bad
 
@@ -876,6 +950,7 @@ def parse_branch_protection(body: Any) -> BranchProtection:
         required_contexts=contexts,
         required_approvals=required_approvals,
         block_on_rejected_reviews=bool(body.get("block_on_rejected_reviews")),
+        block_on_outdated_branch=bool(body.get("block_on_outdated_branch")),
     )
 
 
@@ -1457,18 +1532,15 @@ def _non_required_red_present(
     have already verified every REQUIRED context is green and approvals are
     genuine, so force only bypasses these non-required reds).
     """
-    # Under a wildcard required set ("*"), EVERY posted context is required, so
-    # there is no such thing as a "non-required red" and force_merge must never
-    # be justified this way. Defense in depth: step 4 (required_contexts_green)
-    # already WAITs on any posted red once "*" is expanded, so we should never
-    # reach here with a red present — but a literal reading of "*" here would
-    # classify every red as "non-required", set force=True, and force_merge would
-    # bypass Gitea's own BP. Fail closed. (core#4363)
-    if "*" in required_contexts:
+    # Determine required membership with the same Gitea glob grammar as step
+    # 4. Treat an invalid pattern as fail-closed: never use force_merge when we
+    # cannot prove a red context is outside branch protection.
+    try:
+        required_matchers = [_compile_gitea_glob(p) for p in required_contexts]
+    except GiteaGlobCompileError:
         return False
-    required = set(required_contexts)
     for context, status in latest.items():
-        if context in required:
+        if any(m.fullmatch(context) for m in required_matchers):
             continue
         if status_state(status) != "success":
             return True
@@ -1568,6 +1640,7 @@ def evaluate_merge_readiness(
     pr_labels: set[str] | None = None,
     runtime_bump_exempt: bool = False,
     enforced_file_contexts: list[str] | None = None,
+    block_on_outdated_branch: bool = False,
 ) -> MergeDecision:
     # 0) CRITICAL fail-closed guard (RCA core#1676). Before ANY other gate —
     #    and BEFORE step 5 computes the force_merge flag — the PR head's
@@ -1691,15 +1764,26 @@ def evaluate_merge_readiness(
                 + ", ".join(efbad),
             )
 
-    # 5) DIRECT-MERGE when conflict-free (issue #2358 — throughput fix).
+    # 5) Honor Gitea's live up-to-date branch-protection policy. Core currently
+    #    sets block_on_outdated_branch=true, so a behind-main head must be
+    #    updated and then receive fresh CI/review before any merge attempt.
+    #    Ignoring this field sends an otherwise-ready PR to an inevitable HTTP
+    #    405 and can wedge the queue when its token cannot write hold labels.
+    if block_on_outdated_branch and not pr_has_current_base:
+        return MergeDecision(
+            False,
+            "update",
+            "branch protection requires an up-to-date head; updating with current main",
+        )
+
+    # 5b) DIRECT-MERGE when conflict-free only when branch protection permits
+    #     behind-main heads (issue #2358 — throughput fix).
     #    If Gitea reports the PR conflict-free (mergeable is True), MERGE IT
     #    DIRECTLY even if its head does not yet contain current main. Branch
-    #    protection does NOT require strict up-to-date, so a behind-main but
-    #    conflict-free PR merges cleanly. We deliberately do NOT call
-    #    /pulls/{n}/update first: update triggers Gitea dismiss_stale_approvals,
-    #    which would dismiss the PR's genuine approvals and force a full
-    #    re-review every tick — the rebase-churn bottleneck that collapsed
-    #    throughput to ~0/hr with dozens of mergeable PRs open.
+    #    protection may permit that path. We do not call /update in that policy
+    #    mode because it triggers Gitea dismiss_stale_approvals and forces a
+    #    full re-review every tick — the rebase-churn bottleneck that collapsed
+    #    throughput to ~0/hr.
     #
     #    The merge bar is UNCHANGED: we only reach here with main green +
     #    >= required genuine approvals on the current head + no open
@@ -1969,11 +2053,10 @@ def hold_pr(pr_number: int, hold_note: str, *, dry_run: bool) -> None:
     """Apply HOLD_LABEL to a wedged PR so the queue advances past it.
 
     choose_next_queued_issue skips HOLD_LABEL-bearing PRs, so this is the HOL
-    guard: a PR the queue cannot make progress on (permanent permission error
-    or unresolvable branch-update conflict) is held and a human/agent fixes it,
-    rather than the queue re-selecting it every tick forever. If the label
-    cannot be applied we still post the explanatory comment so the wedge is at
-    least visible — but we never loop on the PR.
+    guard when issue writes are available. Both label and comment are best
+    effort: the production queue token may have merge permission without
+    write:issue. A failed observability write must not abort the current scan;
+    process_once still continues to later candidates without bypassing gates.
     """
     try:
         add_label_by_name(pr_number, HOLD_LABEL, dry_run=dry_run)
@@ -1985,7 +2068,13 @@ def hold_pr(pr_number: int, hold_note: str, *, dry_run: bool) -> None:
             f"\n\n(NOTE: could not apply the hold label automatically: "
             f"{label_exc}. Please add `{HOLD_LABEL}` manually.)"
         )
-    post_comment(pr_number, hold_note, dry_run=dry_run)
+    try:
+        post_comment(pr_number, hold_note, dry_run=dry_run)
+    except ApiError as comment_exc:
+        sys.stderr.write(
+            f"::error::could not post hold comment to PR #{pr_number}: "
+            f"{comment_exc}; continuing queue scan without bypass\n"
+        )
 
 
 def merge_pull(pr_number: int, *, dry_run: bool, force: bool = False) -> None:
@@ -2012,9 +2101,8 @@ def merge_pull(pr_number: int, *, dry_run: bool, force: bool = False) -> None:
         # Re-raise permission-like errors so process_once can HOLD this PR.
         # 403 = no push access, 404 = repo/pr not found, 405 = not allowed.
         msg = str(exc)
-        for code in ("403", "404", "405"):
-            if code in msg:
-                raise MergePermissionError(msg) from exc
+        if re.search(r"-> HTTP (?:403|404|405)(?:\D|$)", msg):
+            raise MergePermissionError(msg) from exc
         raise  # re-raise other ApiErrors unchanged
 
 
@@ -2101,6 +2189,7 @@ def process_once(*, dry_run: bool = False) -> int:
     print(
         f"::notice::queue policy from branch protection: "
         f"required_approvals={required_approvals} "
+        f"block_on_outdated_branch={bp.block_on_outdated_branch} "
         f"required_contexts={contexts or '[none]'} "
         f"enforced_file_contexts={enforced_file_contexts or '[none]'}"
     )
@@ -2178,6 +2267,7 @@ def process_once(*, dry_run: bool = False) -> int:
             required_approvals=required_approvals,
             dry_run=dry_run,
             enforced_file_contexts=enforced_file_contexts,
+            block_on_outdated_branch=bp.block_on_outdated_branch,
         )
         if decision is None:
             continue  # not merge-eligible (not-open / opted-out / fork / wrong base)
@@ -2255,31 +2345,19 @@ def process_once(*, dry_run: bool = False) -> int:
             try:
                 merge_pull(pr_number, dry_run=dry_run, force=decision.force)
             except MergePermissionError as exc:
-                # Permanent merge failure (HTTP 403/404/405). HOLD this PR by
-                # applying HOLD_LABEL (it becomes an opt-out label, so subsequent
-                # ticks skip it) and CONTINUE scanning so the queue still advances
-                # to the next ready PR this tick rather than stalling.
+                # Normal merge refusal (HTTP 403/404/405). Never bypass it.
+                # Best-effort HOLD this PR and CONTINUE scanning. The token may
+                # lack write:issue; hold_pr absorbs those observability-write
+                # failures so one refusal cannot abort the entire tick.
                 sys.stderr.write(f"::error::merge permission error for PR #{pr_number}: {exc}\n")
                 hold_note = (
-                    "merge-queue: merge failed with a permanent permission error "
-                    f"({exc}). No available token has Can-merge permission for this "
-                    f"PR. Applied `{HOLD_LABEL}` to unblock the queue (HOL guard). "
-                    f"Fix: grant Can-merge to the queue token, then remove "
-                    f"`{HOLD_LABEL}` to requeue."
+                    "merge-queue: the normal protected merge was refused "
+                    f"({exc}). No force/admin bypass was attempted. Best-effort "
+                    f"applied `{HOLD_LABEL}` so the queue can advance. Re-check "
+                    "branch freshness, required checks, approvals, and token "
+                    f"permissions; then remove `{HOLD_LABEL}` to requeue."
                 )
-                try:
-                    add_label_by_name(pr_number, HOLD_LABEL, dry_run=dry_run)
-                except ApiError as label_exc:
-                    # If we cannot even apply the hold label, fall back to a comment
-                    # so the wedge is at least visible; do NOT loop on this PR.
-                    sys.stderr.write(
-                        f"::error::could not apply HOLD_LABEL to PR #{pr_number}: {label_exc}\n"
-                    )
-                    hold_note += (
-                        f"\n\n(NOTE: could not apply the hold label automatically: "
-                        f"{label_exc}. Please add `{HOLD_LABEL}` manually.)"
-                    )
-                post_comment(pr_number, hold_note, dry_run=dry_run)
+                hold_pr(pr_number, hold_note, dry_run=dry_run)
                 continue  # held — keep scanning for a mergeable candidate
             return 0
     return 0
@@ -2458,6 +2536,7 @@ def _evaluate_candidate(
     required_approvals: int,
     dry_run: bool,
     enforced_file_contexts: list[str] | None = None,
+    block_on_outdated_branch: bool = False,
 ) -> tuple[MergeDecision | None, dict]:
     """Evaluate a single auto-discovered candidate against the full merge bar.
 
@@ -2595,6 +2674,7 @@ def _evaluate_candidate(
         pr_labels=pr_labels,
         runtime_bump_exempt=runtime_bump_exempt,
         enforced_file_contexts=enforced_file_contexts,
+        block_on_outdated_branch=block_on_outdated_branch,
     )
     return decision, ctx
 
@@ -2652,6 +2732,7 @@ def enumerate_readiness(*, dry_run: bool = False) -> list[ReadinessEntry]:
                 required_approvals=required_approvals,
                 dry_run=dry_run,
                 enforced_file_contexts=enforced_file_contexts,
+                block_on_outdated_branch=bp.block_on_outdated_branch,
             )
         except ApiError as exc:
             # Fail-closed per candidate: an unreadable PR is recorded as

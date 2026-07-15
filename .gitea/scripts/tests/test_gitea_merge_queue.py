@@ -281,6 +281,43 @@ def test_literal_context_path_is_unchanged_by_glob_generalization():
     assert bad2 == ["CI / never-posted (push)=missing"]
 
 
+@pytest.mark.parametrize(
+    ("pattern", "context", "matches"),
+    [
+        ("CI / [aA]ll-required", "CI / all-required", True),
+        ("CI / [!x]ll-required", "CI / all-required", True),
+        ("CI / [!a]ll-required", "CI / all-required", False),
+        ("{CI,E2E} / *", "E2E / smoke", True),
+        (r"CI / literal\*", "CI / literal*", True),
+        (r"CI / literal\*", "CI / literal-job", False),
+        ("CI / job?", "CI / job1", True),
+        ("CI / job?", "CI / job12", False),
+    ],
+)
+def test_gitea_glob_semantics_match_server_patterns(pattern, context, matches):
+    """Parity with Gitea modules/glob: classes/negation, brace alternatives,
+    escapes, and question-mark wildcards are all part of branch protection.
+
+    Python fnmatch does not implement the brace/escape cases, and the old
+    `_is_glob` check misclassified class-only patterns as literals.
+    """
+    latest = {context: {"context": context, "status": "success"}}
+    ok, bad = mq.required_contexts_green(latest, [pattern])
+    assert ok is matches
+    if matches:
+        assert bad == []
+    else:
+        assert bad == [f"{pattern}=no-match"]
+
+
+@pytest.mark.parametrize("pattern", ["CI / [unterminated", "CI / trailing\\"])
+def test_invalid_gitea_glob_fails_closed(pattern):
+    latest = {"CI / all-required": {"status": "success"}}
+    ok, bad = mq.required_contexts_green(latest, [pattern])
+    assert ok is False
+    assert bad == [f"{pattern}=invalid-glob"]
+
+
 def test_critical_contexts_block_failcloses_on_empty_prefix_set(monkeypatch):
     # C: if CRITICAL_REQUIRED_CONTEXT_PREFIXES is misconfigured to empty, the
     # step-0 backstop must BLOCK (not iterate nothing and pass vacuously).
@@ -404,6 +441,21 @@ def test_behind_main_but_mergeable_pr_merges_directly():
 
     assert decision.ready is True
     assert decision.action == "merge"
+
+
+def test_behind_main_updates_when_branch_protection_requires_current_head():
+    """Live Core BP sets block_on_outdated_branch=true. A conflict-free but
+    stale PR must be updated and revalidated, not sent to a merge POST that
+    Gitea will reject with HTTP 405.
+    """
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(pr_has_current_base=False, mergeable=True),
+        block_on_outdated_branch=True,
+    )
+
+    assert decision.ready is False
+    assert decision.action == "update"
+    assert "requires an up-to-date head" in decision.reason
 
 
 def test_behind_main_and_not_mergeable_pr_updates():
@@ -755,6 +807,7 @@ def test_parse_branch_protection_uses_status_check_contexts():
         ],
         "required_approvals": 2,
         "block_on_rejected_reviews": True,
+        "block_on_outdated_branch": True,
     })
     assert bp.required_contexts == [
         "CI / all-required (pull_request)",
@@ -762,6 +815,7 @@ def test_parse_branch_protection_uses_status_check_contexts():
     ]
     assert bp.required_approvals == 2
     assert bp.block_on_rejected_reviews is True
+    assert bp.block_on_outdated_branch is True
 
 
 def test_parse_branch_protection_fail_closed_when_contexts_missing():
@@ -968,6 +1022,29 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
     assert calls["merge_attempts"] == 1
     # The HOL fix: PR was held, not silently left re-selectable.
     assert calls["hold_label"] == (100, "merge-queue-hold")
+
+
+def test_hold_pr_is_best_effort_when_queue_token_cannot_write_issues(monkeypatch):
+    """AUTO_SYNC_TOKEN can merge but currently lacks write:issue. A failed
+    hold-label/comment attempt must not abort the scan and turn one 405 into a
+    queue-wide failure.
+    """
+    calls = []
+
+    def forbidden_label(*args, **kwargs):
+        calls.append("label")
+        raise mq.ApiError("POST /labels -> HTTP 403: issue write forbidden")
+
+    def forbidden_comment(*args, **kwargs):
+        calls.append("comment")
+        raise mq.ApiError("POST /comments -> HTTP 403: issue write forbidden")
+
+    monkeypatch.setattr(mq, "add_label_by_name", forbidden_label)
+    monkeypatch.setattr(mq, "post_comment", forbidden_comment)
+
+    # No exception: process_once can continue scanning later candidates.
+    mq.hold_pr(100, "normal merge refused; no bypass attempted", dry_run=False)
+    assert calls == ["label", "comment"]
 
 
 # --------------------------------------------------------------------------
