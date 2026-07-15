@@ -273,6 +273,9 @@ source "$(dirname "$0")/lib/aws_leak_check.sh"
 # liveness + byok-routing assertion helpers. Adds gates that FAIL on an
 # error-as-text payload (the trap the shape-only A2A checks missed).
 source "$(dirname "$0")/lib/completion_assert.sh"
+# shellcheck disable=SC1091
+# shellcheck source=lib/http_status_capture.sh
+source "$(dirname "$0")/lib/http_status_capture.sh"
 
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
 E2E_TMP_FILES=()
@@ -1079,16 +1082,20 @@ printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwA
 PNG_SHA=$(sha256sum "$PNG_FIXTURE" | awk '{print $1}')
 for wid in "${WS_TO_CHECK[@]}"; do
   UP_TMP=$(e2e_tmp /tmp/e2e_upload.XXXXXX)
-  UP_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$wid/chat/uploads" \
+  UP_CODE_FILE=$(mktemp -t e2e_upload_code.XXXXXX)
+  E2E_TMP_FILES+=("$UP_CODE_FILE")
+  capture_http_status "$UP_CODE_FILE" \
+    curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$wid/chat/uploads" \
     -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
     "${TENANT_ROUTE_HDRS[@]}" \
     -F "files=@$PNG_FIXTURE;filename=e2e-smoke.png;type=image/png" \
     -o "$UP_TMP" \
-    -w '%{http_code}' \
-    2>/dev/null || echo "000")
+    -w '%{http_code}'
+  UP_CODE="$HTTP_CAPTURE_CODE"
+  UP_CURL_RC="$HTTP_CAPTURE_RC"
   if [ "$UP_CODE" != "200" ] && [ "$UP_CODE" != "201" ]; then
-    fail "Workspace $wid image upload returned $UP_CODE: $(head -c 500 "$UP_TMP" | sanitize_http_body)"
+    fail "Workspace $wid image upload returned $UP_CODE (curl_rc=$UP_CURL_RC): $(head -c 500 "$UP_TMP" | sanitize_http_body)"
   fi
   UP_URI=$(python3 -c "
 import json, sys
@@ -1114,25 +1121,29 @@ def walk(x):
         for v in x: walk(v)
 walk(d)
 " "$UP_TMP" 2>/dev/null || echo "")
-  rm -f "$UP_TMP"
+  rm -f "$UP_TMP" "$UP_CODE_FILE"
   [ -n "$UP_URI" ] || fail "Workspace $wid upload response had no workspace URI"
   [ "$UP_MIME" = "image/png" ] || fail "Workspace $wid upload returned mime=$UP_MIME, want image/png"
 
   DOWNLOAD_PATH="$UP_URI"
   case "$DOWNLOAD_PATH" in workspace:*) DOWNLOAD_PATH="${DOWNLOAD_PATH#workspace:}" ;; esac
   DL_TMP=$(e2e_tmp /tmp/e2e_download.XXXXXX.png)
-  DL_CODE=$(curl "${CURL_COMMON[@]}" "$TENANT_URL/workspaces/$wid/chat/download?path=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DOWNLOAD_PATH")" \
+  DL_CODE_FILE=$(mktemp -t e2e_download_code.XXXXXX)
+  E2E_TMP_FILES+=("$DL_CODE_FILE")
+  capture_http_status "$DL_CODE_FILE" \
+    curl "${CURL_COMMON[@]}" "$TENANT_URL/workspaces/$wid/chat/download?path=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$DOWNLOAD_PATH")" \
     -H "Authorization: Bearer $EFFECTIVE_TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
     "${TENANT_ROUTE_HDRS[@]}" \
     -o "$DL_TMP" \
-    -w '%{http_code}' \
-    2>/dev/null || echo "000")
+    -w '%{http_code}'
+  DL_CODE="$HTTP_CAPTURE_CODE"
+  DL_CURL_RC="$HTTP_CAPTURE_RC"
   if [ "$DL_CODE" != "200" ]; then
-    fail "Workspace $wid image download returned $DL_CODE: $(head -c 300 "$DL_TMP" | sanitize_http_body)"
+    fail "Workspace $wid image download returned $DL_CODE (curl_rc=$DL_CURL_RC): $(head -c 300 "$DL_TMP" | sanitize_http_body)"
   fi
   DL_SHA=$(sha256sum "$DL_TMP" | awk '{print $1}')
-  rm -f "$DL_TMP"
+  rm -f "$DL_TMP" "$DL_CODE_FILE"
   [ "$DL_SHA" = "$PNG_SHA" ] || fail "Workspace $wid image download SHA mismatch: upload=$PNG_SHA download=$DL_SHA"
   ok "    $wid image upload/download OK ($UP_MIME, sha256=$DL_SHA)"
 done
@@ -1261,14 +1272,18 @@ for wid in "${WS_TO_CHECK[@]}"; do
   # post-merge by E2E Staging SaaS at 22:06 UTC: a 200-with-body got
   # misreported as "PUT returned <body>".
   PUT_TMP=$(mktemp -t synth_put.XXXXXX)
-  PUT_CODE=$(tenant_call PUT "/workspaces/$wid/files/config.yaml" \
+  PUT_CODE_FILE=$(mktemp -t synth_put_code.XXXXXX)
+  E2E_TMP_FILES+=("$PUT_TMP" "$PUT_CODE_FILE")
+  capture_http_status "$PUT_CODE_FILE" \
+    tenant_call PUT "/workspaces/$wid/files/config.yaml" \
     -H "Content-Type: application/json" \
     -d "$PUT_BODY" \
     -o "$PUT_TMP" \
-    -w '%{http_code}' \
-    2>/dev/null || echo "000")
+    -w '%{http_code}'
+  PUT_CODE="$HTTP_CAPTURE_CODE"
+  PUT_CURL_RC="$HTTP_CAPTURE_RC"
   PUT_BODY_OUT=$(cat "$PUT_TMP" 2>/dev/null || echo "")
-  rm -f "$PUT_TMP"
+  rm -f "$PUT_TMP" "$PUT_CODE_FILE"
   if [ "$PUT_CODE" != "200" ] && [ "$PUT_CODE" != "204" ]; then
     # EC2-GATED hard-fail (provider signal). The failure class this gate
     # names (path-map / permission drift in template_files_eic.go) is the
@@ -1296,7 +1311,7 @@ for wid in "${WS_TO_CHECK[@]}"; do
     #     regression (e.g. writeViaEphemeral failed AFTER the docker check).
     #   - 4xx (400/401/403/404/…) → auth/route/validation regression.
     if is_ec2_backend; then
-      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE: $PUT_BODY_OUT — likely a path-map or permission regression in workspace-server template_files_eic.go"
+      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (curl_rc=$PUT_CURL_RC): $PUT_BODY_OUT — likely a path-map or permission regression in workspace-server template_files_eic.go"
     elif [ "$PUT_CODE" != "000" ] && \
          { [ "$PUT_CODE" -ge 500 ] 2>/dev/null; } && \
          printf '%s' "$PUT_BODY_OUT" | grep -qi 'docker not available'; then
@@ -1305,13 +1320,13 @@ for wid in "${WS_TO_CHECK[@]}"; do
       # tenant. Config-write coverage for this backend is provided by the
       # container reading /configs/config.yaml directly via bind-mount at
       # boot (asserted by online+routable step 7). SKIP this ONE sub-step.
-      log "    ⏭️  $wid Files API PUT config.yaml EIC hard-check SKIPPED (non-EC2 socket-less tenant; docker-not-available): E2E_AWS_LEAK_CHECK=${E2E_AWS_LEAK_CHECK:-auto}, PUT returned $PUT_CODE. The template_files_eic.go SSH-via-EIC write path has no local-docker analog and the docker-exec fallback needs a docker socket the tenant lacks by design (#206). Body: $PUT_BODY_OUT"
+      log "    ⏭️  $wid Files API PUT config.yaml EIC hard-check SKIPPED (non-EC2 socket-less tenant; docker-not-available): E2E_AWS_LEAK_CHECK=${E2E_AWS_LEAK_CHECK:-auto}, PUT returned $PUT_CODE (curl_rc=$PUT_CURL_RC). The template_files_eic.go SSH-via-EIC write path has no local-docker analog and the docker-exec fallback needs a docker socket the tenant lacks by design (#206). Body: $PUT_BODY_OUT"
       continue
     else
       # 000 (unreachable) or 5xx-without-marker or any 4xx → a real outage /
       # regression, NOT a backend-shape mismatch. Hard-fail so this gate
       # keeps catching what it exists to catch even off EC2.
-      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (non-EC2 backend, NOT the docker-not-available socket-less signal): $PUT_BODY_OUT — a 000 means CP/tenant unreachable; a 5xx without 'docker not available' is a genuine config-write regression; a 4xx is an auth/route/validation regression. This is a real failure, not a local-docker shape mismatch."
+      fail "Workspace $wid Files API PUT config.yaml returned $PUT_CODE (curl_rc=$PUT_CURL_RC; non-EC2 backend, NOT the docker-not-available socket-less signal): $PUT_BODY_OUT — a 000 means CP/tenant unreachable; a 5xx without 'docker not available' is a genuine config-write regression; a 4xx is an auth/route/validation regression. This is a real failure, not a local-docker shape mismatch."
     fi
   fi
   # PUT-only check; the GET-back round-trip assertion was dropped
@@ -2151,14 +2166,19 @@ print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2
   # were removed; team-shared knowledge now flows through memory v2's
   # team:<id> namespace. If anyone re-introduces a shared-context endpoint
   # without going through RFC #2789, this gate fires.
-  set +e
-  SC_CODE=$(tenant_call GET "/workspaces/$PARENT_ID/shared-context" \
-    -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
-  set -e
-  if [ "$SC_CODE" = "200" ]; then
-    fail "shared-context route should be gone but returned 200 — regression. See task #304."
+  SC_BODY=$(mktemp -t shared_context_body.XXXXXX)
+  SC_CODE_FILE=$(mktemp -t shared_context_code.XXXXXX)
+  E2E_TMP_FILES+=("$SC_BODY" "$SC_CODE_FILE")
+  capture_http_status "$SC_CODE_FILE" \
+    tenant_call GET "/workspaces/$PARENT_ID/shared-context" \
+    -o "$SC_BODY" -w "%{http_code}"
+  SC_CODE="$HTTP_CAPTURE_CODE"
+  SC_CURL_RC="$HTTP_CAPTURE_RC"
+  if ! http_code_is_exact_removed_route "$SC_CODE"; then
+    fail "shared-context route removal requires exact HTTP 404, got $SC_CODE (curl_rc=$SC_CURL_RC): $(head -c 300 "$SC_BODY" | sanitize_http_body)"
   fi
-  ok "shared-context route confirmed removed (HTTP $SC_CODE)"
+  ok "shared-context route confirmed removed (exact HTTP 404)"
+  rm -f "$SC_BODY" "$SC_CODE_FILE"
 else
   log "9/11 Canary mode — skipping HMA / peers / activity / memory-edit / shared-context-gone"
 fi

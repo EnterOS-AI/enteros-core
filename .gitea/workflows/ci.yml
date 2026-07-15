@@ -605,6 +605,11 @@ jobs:
           # slug and aborted boot-to-registration BEFORE provisioning) goes red
           # here on every PR instead of burning a live boot-cell run.
           bash tests/e2e/test_collision_proof_slug_unit.sh
+          # Full-SaaS curl status capture must never concatenate the real HTTP
+          # code with a fallback (for example 404000), and a removed-route gate
+          # must accept only exact 404. Offline fail-direction cases cover
+          # 200/401/405/500/transport failures.
+          bash tests/e2e/test_http_status_capture_unit.sh
           # core#4370: bounded idle-digest evidence polling and fail-closed
           # Docker preflight. Offline: proves missing Docker or an unreachable
           # daemon cannot silently skip E2E_IDLE_DIGEST_CHECK=on.
