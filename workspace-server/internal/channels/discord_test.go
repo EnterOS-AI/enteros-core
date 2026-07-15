@@ -181,6 +181,14 @@ func TestDiscordAdapter_ParseWebhook_SlashCommand(t *testing.T) {
 	if msg.Metadata["platform"] != "discord" {
 		t.Errorf("expected platform metadata 'discord', got %q", msg.Metadata["platform"])
 	}
+	if _, ok := msg.Metadata["interaction_token"]; ok {
+		t.Fatal("Discord interaction token leaked into runtime-forwarded metadata")
+	}
+	for key, value := range msg.Metadata {
+		if strings.Contains(value, "interaction-token") {
+			t.Fatalf("Discord interaction token leaked through metadata[%q]", key)
+		}
+	}
 }
 
 func TestDiscordAdapter_ParseWebhook_SlashCommand_DMUser(t *testing.T) {

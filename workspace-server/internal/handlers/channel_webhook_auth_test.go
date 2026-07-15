@@ -348,4 +348,37 @@ func TestChannelHandler_Webhook_DiscordCredentialBindingAndProtocolResponses(t *
 			t.Fatalf("invalid Discord interaction response: %s", w.Body.String())
 		}
 	})
+
+	t.Run("unknown agent returns Discord interaction response", func(t *testing.T) {
+		mock := setupTestDB(t)
+		handler := NewChannelHandler(newTestChannelManager())
+		expectWebhookRows(mock, "discord", webhookDBRows(
+			struct{ id, workspaceID, channelType, config string }{
+				"discord-b", "ws-b", "discord",
+				`{"chat_id":"B","username":"Known Agent","public_key":"` + pubB + `"}`,
+			},
+		))
+
+		body := `{"type":2,"id":"i-unknown","channel_id":"B","token":"interaction-token","data":{"options":[{"name":"prompt","value":"[unknown-slug] hello"}]},"member":{"user":{"id":"u-1","username":"alice"}}}`
+		w := runWebhook(handler, "discord", discordSignedRequest(t, body, "1750000000", privB))
+		if w.Code != http.StatusOK {
+			t.Fatalf("unknown-agent Discord command returned %d: %s", w.Code, w.Body.String())
+		}
+		var response struct {
+			Type int `json:"type"`
+			Data struct {
+				Content string `json:"content"`
+				Flags   int    `json:"flags"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode unknown-agent Discord response: %v", err)
+		}
+		if response.Type != 4 || response.Data.Flags != 64 {
+			t.Fatalf("unknown-agent response is not a valid ephemeral Discord callback: %s", w.Body.String())
+		}
+		if !strings.Contains(response.Data.Content, "unknown-slug") || !strings.Contains(response.Data.Content, "known-agent") {
+			t.Fatalf("unknown-agent Discord response omitted routing context: %s", w.Body.String())
+		}
+	})
 }

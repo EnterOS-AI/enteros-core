@@ -594,6 +594,14 @@ func (h *ChannelHandler) Webhook(c *gin.Context) {
 					names = append(names, "["+strings.ToLower(strings.ReplaceAll(u, " ", "-"))+"]")
 				}
 			}
+			if channelType == "discord" {
+				content := "Unknown agent [" + targetSlug + "]."
+				if len(names) > 0 {
+					content += " Available agents: " + strings.Join(names, ", ")
+				}
+				discordInteractionMessage(c, content)
+				return
+			}
 			c.JSON(http.StatusOK, gin.H{
 				"status":          "unknown_agent",
 				"requested_slug":  targetSlug,

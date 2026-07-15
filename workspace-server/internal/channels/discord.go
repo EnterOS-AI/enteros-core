@@ -184,7 +184,6 @@ func (d *DiscordAdapter) ParseWebhook(c *gin.Context, _ map[string]interface{}) 
 			Username string `json:"username"`
 		} `json:"user"`
 		ChannelID string `json:"channel_id"`
-		Token     string `json:"token"`
 	}
 
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -229,9 +228,11 @@ func (d *DiscordAdapter) ParseWebhook(c *gin.Context, _ map[string]interface{}) 
 		Username:  username,
 		Text:      text,
 		MessageID: payload.ID,
+		// Discord's interaction token is intentionally not retained here.
+		// Inbound metadata is forwarded to the workspace runtime, while replies
+		// use the channel row's configured outbound webhook URL.
 		Metadata: map[string]string{
-			"platform":          "discord",
-			"interaction_token": payload.Token,
+			"platform": "discord",
 		},
 	}, nil
 }
