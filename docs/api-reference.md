@@ -94,7 +94,7 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | GET | /events | events.go — `AdminAuth` required |
 | GET | /events/:workspaceId | events.go — `AdminAuth` required |
 | GET | /admin/liveness | inline — `AdminAuth` required. Returns per-subsystem `supervised.Snapshot()` ages; use to check health of scheduler/heartbeat goroutines |
-| GET | /ws | socket.go |
+| GET | /ws | socket.go — authenticated WebSocket; verified CP session/org/admin credential for the global stream, or `X-Workspace-ID` plus matching workspace bearer for a filtered stream |
 
 ---
 
