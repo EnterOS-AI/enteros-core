@@ -24,12 +24,12 @@ import (
 // TestGitFetcher_RealClone_LocalRedirect proves the production
 // gitFetcher round-trips correctly against a real git repository.
 // Steps:
-//   1. Set up a local bare-git repo with workspace content.
-//   2. Configure git's `insteadOf` to rewrite the gitea URL → local path
-//      via GIT_CONFIG_COUNT/KEY/VALUE env vars (process-scoped).
-//   3. Run resolveYAMLIncludes with !external pointing at the gitea URL.
-//   4. Assert: cache dir populated; content materialized; path rewrite
-//      applied; second invocation hits cache (no second clone).
+//  1. Set up a local bare-git repo with workspace content.
+//  2. Configure git's `insteadOf` to rewrite the gitea URL → local path
+//     via GIT_CONFIG_COUNT/KEY/VALUE env vars (process-scoped).
+//  3. Run resolveYAMLIncludes with !external pointing at the gitea URL.
+//  4. Assert: cache dir populated; content materialized; path rewrite
+//     applied; second invocation hits cache (no second clone).
 func TestGitFetcher_RealClone_LocalRedirect(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skipf("git binary not found: %v", err)
@@ -46,7 +46,7 @@ func TestGitFetcher_RealClone_LocalRedirect(t *testing.T) {
 	barePath := filepath.Join(fixtures, "test-dev-dept.git")
 	workPath := filepath.Join(fixtures, "work")
 
-	mustGit(t, "", "init", "--bare", "-b", "main", barePath)
+	mustInitBare(t, barePath)
 	mustGit(t, "", "clone", barePath, workPath)
 	mustGit(t, workPath, "config", "user.email", "test@example.com")
 	mustGit(t, workPath, "config", "user.name", "Integration Test")
@@ -190,7 +190,7 @@ func TestGitFetcher_RealClone_BadRefFails(t *testing.T) {
 	fixtures := t.TempDir()
 	barePath := filepath.Join(fixtures, "empty-repo.git")
 	workPath := filepath.Join(fixtures, "work")
-	mustGit(t, "", "init", "--bare", "-b", "main", barePath)
+	mustInitBare(t, barePath)
 	mustGit(t, "", "clone", barePath, workPath)
 	mustGit(t, workPath, "config", "user.email", "test@example.com")
 	mustGit(t, workPath, "config", "user.name", "Test")
@@ -222,6 +222,34 @@ func TestGitFetcher_RealClone_BadRefFails(t *testing.T) {
 }
 
 // ---------- helpers ----------
+
+// mustInitBare creates the bare fixture repo with git's automatic housekeeping
+// turned OFF.
+//
+// `git push` makes the RECEIVING side run `git gc --auto`, which git DETACHES
+// into the background. That process outlives the test body and is still touching
+// the bare repo when t.TempDir()'s RemoveAll walks it, so the removal loses the
+// race and the test fails in CLEANUP rather than on an assertion:
+//
+//	TempDir RemoveAll cleanup: unlinkat .../test-dev-dept.git: directory not empty
+//
+// It is load-dependent — a busy runner leaves the detached gc alive longer — so
+// it reds intermittently on a REQUIRED context (CI / Platform (Go)) for diffs
+// that cannot reach this code at all. Same auto-gc hazard the Step-2 comment in
+// TestGitFetcher_RealClone_LocalRedirect describes, on the teardown side rather
+// than the clone side.
+//
+// These MUST be set in the bare repo's OWN config. Supplying them as `git -c` on
+// the pushing side does NOT work — receive-pack reads them from the receiving
+// repository, and GIT_TRACE confirms `git gc --auto` still runs on the remote
+// side when they are passed as `-c`.
+func mustInitBare(t *testing.T, barePath string) {
+	t.Helper()
+	mustGit(t, "", "init", "--bare", "-b", "main", barePath)
+	mustGit(t, "", "-C", barePath, "config", "receive.autogc", "false")
+	mustGit(t, "", "-C", barePath, "config", "gc.auto", "0")
+	mustGit(t, "", "-C", barePath, "config", "maintenance.auto", "false")
+}
 
 func mustGit(t *testing.T, cwd string, args ...string) {
 	t.Helper()
@@ -264,7 +292,7 @@ func TestGitFetcher_DirectFetch_CacheHit(t *testing.T) {
 	fixtures := t.TempDir()
 	barePath := filepath.Join(fixtures, "direct.git")
 	workPath := filepath.Join(fixtures, "w")
-	mustGit(t, "", "init", "--bare", "-b", "main", barePath)
+	mustInitBare(t, barePath)
 	mustGit(t, "", "clone", barePath, workPath)
 	mustGit(t, workPath, "config", "user.email", "t@e")
 	mustGit(t, workPath, "config", "user.name", "T")
@@ -346,7 +374,7 @@ func TestGitFetcher_CacheValidatedByCompleteMarker(t *testing.T) {
 	fixtures := t.TempDir()
 	barePath := filepath.Join(fixtures, "test.git")
 	workPath := filepath.Join(fixtures, "w")
-	mustGit(t, "", "init", "--bare", "-b", "main", barePath)
+	mustInitBare(t, barePath)
 	mustGit(t, "", "clone", barePath, workPath)
 	mustGit(t, workPath, "config", "user.email", "t@e")
 	mustGit(t, workPath, "config", "user.name", "T")

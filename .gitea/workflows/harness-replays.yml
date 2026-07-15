@@ -96,7 +96,31 @@ jobs:
     # v1.0.3), where the `docker compose ...` exec below fails. Mirror
     # of mc#1543; see internal#512 for class defect.
     runs-on: docker-host
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
+    # MASK RETAINED — but NOT because this job is red. It is provably green:
+    # 15/15 most-recent runs, every step `success`, read step-level from the
+    # Gitea Actions API (runs 497985, 498111, 498199, 498228, 498298, 498371,
+    # 498398, 498490, 498583, 498631, 498684, 498786, 498860, 499081).
+    #
+    # It stays masked because the repo's OWN pre-flip gate
+    # (.gitea/scripts/lint_pre_flip_continue_on_error.py) cannot SEE those runs,
+    # and fail-closes on what it cannot see:
+    #   lint_pre_flip_continue_on_error.py:426 fetches
+    #   `/repos/{o}/{r}/commits/{sha}/status` — Gitea's COMBINED-status endpoint,
+    #   with no pagination. That endpoint caps at 30 statuses. molecule-core now
+    #   posts 60 distinct contexts per commit, and
+    #   `Harness Replays / detect-changes (push)` sorts beyond the cap, so the
+    #   lint sees zero runs of it and reports "no runs ... cannot verify flip".
+    # Un-masking here would therefore RED a required context on every PR. The
+    # mask is recorded in MASK_WAIVERS in lint_no_coe_on_required.py; once the
+    # pre-flip lint paginates (follow-up filed), this becomes a one-line flip.
+    #
+    # Why it matters that this one gets fixed: this is a MASKED DETECTOR — the
+    # worst shape. On failure the job still rolls up GREEN but its
+    # `outputs.run` / `outputs.debug` are EMPTY. Every downstream step is gated
+    # on `needs.detect-changes.outputs.run == 'true'`, so an empty output makes
+    # the entire replay suite silently no-op while the "No-op pass" step
+    # declares the gate "satisfied without running".
+    #
     # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
     continue-on-error: true
     outputs:
@@ -201,9 +225,26 @@ jobs:
     # mc#1529 follow-on: `docker compose ... ps/logs` against tenant-alpha/
     # beta containers. Must run on operator-host Linux (docker-host).
     runs-on: docker-host
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
+    # UNMASKED 2026-07-14 (was `continue-on-error: true`). This is THE replay
+    # gate — the whole reason this workflow exists is the #2398 TenantGuard
+    # regression that shipped because nobody ran the harness. With the mask on,
+    # a failing replay rolled up to `success` and the gate could not go red at
+    # all: it asserted nothing.
+    #
+    # Proven green before un-masking, at STEP level via the Gitea Actions API
+    # (the job's own roll-up status proves nothing while masked): the 14 most
+    # recent completed runs ALL executed the suite for real ("No-op pass" =
+    # skipped, i.e. detect-changes said run=true) with `Run all replays against
+    # the harness` = success. Corroborated by `Dump compose logs on failure`
+    # (`if: failure()`) being `skipped` in all 14 — failure() never became true,
+    # so no step failed. Runs 497985, 498111, 498199, 498228, 498298, 498371,
+    # 498398, 498490, 498583, 498631, 498684, 498786, 498860, 499081.
+    #
+    # The chronic non-hermetic reds this gate used to suffer (RCA 2026-07-12,
+    # run 477499: cross-wired containers, stale tenant image) were root-fixed by
+    # the per-job dind isolation (task #78) + per-PR concurrency keying (#4122)
+    # — see the `concurrency:` and "Start disposable dind" comments above. That
+    # fix is what makes un-masking safe now.
     timeout-minutes: 30
     steps:
       - name: No-op pass (paths filter excluded this commit)

@@ -281,14 +281,14 @@ func (h *MemoriesV2Handler) Forget(c *gin.Context) {
 // `propagation` blob); MemoryView strips it to what the Memory tab
 // renders.
 type MemoryView struct {
-	ID        string                 `json:"id"`
-	Namespace string                 `json:"namespace"`
-	Content   string                 `json:"content"`
-	Kind      contract.MemoryKind    `json:"kind"`
-	Source    contract.MemorySource  `json:"source"`
-	Pin       bool                   `json:"pin"`
-	ExpiresAt *time.Time             `json:"expires_at,omitempty"`
-	CreatedAt time.Time              `json:"created_at"`
+	ID        string                `json:"id"`
+	Namespace string                `json:"namespace"`
+	Content   string                `json:"content"`
+	Kind      contract.MemoryKind   `json:"kind"`
+	Source    contract.MemorySource `json:"source"`
+	Pin       bool                  `json:"pin"`
+	ExpiresAt *time.Time            `json:"expires_at,omitempty"`
+	CreatedAt time.Time             `json:"created_at"`
 	// Score is the plugin's similarity score (1.0 = exact); only
 	// populated when ?q= is set and the plugin supports embedding.
 	Score *float64 `json:"score,omitempty"`
@@ -361,10 +361,11 @@ func namespacesToViews(in []namespace.Namespace) []NamespaceView {
 // when available.
 //
 // Format (UUID-prefix fallback):
-//   workspace:abc-123 → "Workspace (abc-123)"
-//   team:t-1          → "Team (t-1)"
-//   org:acme          → "Org (acme)"
-//   custom:foo        → "foo"
+//
+//	workspace:abc-123 → "Workspace (abc-123)"
+//	team:t-1          → "Team (t-1)"
+//	org:acme          → "Org (acme)"
+//	custom:foo        → "foo"
 func namespaceLabel(name string, kind contract.NamespaceKind) string {
 	return namespaceLabelWithName(name, kind, "")
 }
@@ -373,9 +374,10 @@ func namespaceLabel(name string, kind contract.NamespaceKind) string {
 // `displayName` when non-empty.
 //
 // When displayName is set:
-//   Workspace, "mac laptop"    → "Workspace (mac laptop)"
-//   Team, "Engineering team"   → "Team (Engineering team)"
-//   Org, "Hongming's Org"      → "Org (Hongming's Org)"
+//
+//	Workspace, "mac laptop"    → "Workspace (mac laptop)"
+//	Team, "Engineering team"   → "Team (Engineering team)"
+//	Org, "Hongming's Org"      → "Org (Hongming's Org)"
 //
 // When displayName is empty (lookup miss, future-migration drop, etc.),
 // falls back to the UUID-prefix shape for back-compat.
@@ -454,4 +456,3 @@ func parseLimit(raw string) int {
 	}
 	return n
 }
-

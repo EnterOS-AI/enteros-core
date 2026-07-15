@@ -224,12 +224,12 @@ func TestPickMockReply_Deterministic(t *testing.T) {
 // runtime: " Mock " entry doesn't silently get dispatched.
 func TestIsMockRuntime_TrimsAndCaseInsensitive(t *testing.T) {
 	cases := map[string]bool{
-		"mock":      true,
-		"MOCK":      true,
-		"  Mock  ":  true,
-		"mocky":     false,
-		"":          false,
-		"external":  false,
+		"mock":        true,
+		"MOCK":        true,
+		"  Mock  ":    true,
+		"mocky":       false,
+		"":            false,
+		"external":    false,
 		"claude-code": false,
 	}
 	for in, want := range cases {

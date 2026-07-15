@@ -639,7 +639,14 @@ func TestConciergeDefaultRuntime_EnvWinsOverConstAndBindsIntoInstall(t *testing.
 		wantTemplate := conciergeTemplateForRuntime(nonDefaultRuntime) // "platform-agent"
 
 		mock.ExpectBegin()
-		// Step 0: downgrade any other platform root ($1 = platformID).
+		// Step 0a: probe for a LIVE (online) foreign platform root. The install
+		// refuses to displace one — demoting a live concierge and upserting a
+		// container-less row it never provisions would destroy the org's
+		// concierge. No live root here, so the install proceeds.
+		mock.ExpectQuery(`SELECT id FROM workspaces.*AND status IN \('online', 'degraded'\)`).
+			WithArgs(platformID).
+			WillReturnError(sql.ErrNoRows)
+		// Step 0b: downgrade any other platform root ($1 = platformID).
 		mock.ExpectExec(`UPDATE workspaces SET kind = 'workspace'`).
 			WithArgs(platformID).
 			WillReturnResult(sqlmock.NewResult(0, 0))

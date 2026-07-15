@@ -47,7 +47,24 @@ concurrency:
   # Auto-cancel a superseded run: a newer commit/event supersedes the old
   # one instead of leaving it queued forever (root fix for waiting-run pileup).
   # PR events group by PR number; push events group by ref.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  #
+  # The group MUST include `github.event_name`. This workflow triggers on BOTH
+  # pull_request_target and pull_request_review, and Gitea suffixes the commit
+  # status context with the event — so it emits TWO DISTINCT required contexts:
+  #     reserved-path-review / reserved-path-review (pull_request_target)
+  #     reserved-path-review / reserved-path-review (pull_request_review)
+  # Keying the group on the PR number ALONE put both arms in the SAME group, so
+  # they cancelled EACH OTHER — and a cancelled Gitea run posts a `failure`
+  # status with zero logs. The result was a ping-pong that could never settle:
+  # synchronize fires the target arm → the (required, non-author) approval fires
+  # the review arm, cancelling the target arm → red; rerun the target arm and it
+  # cancels the review arm → red. Both contexts could only be green by luck, and
+  # landing core#4126/#4173/#4263/#4305 needed them drained one at a time by hand.
+  #
+  # With the event in the key, each arm supersedes only its OWN prior runs —
+  # which is exactly what the comment above always claimed. (sop-checklist.yml
+  # already keys on github.event_name for the same reason.)
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 on:
   pull_request_target:

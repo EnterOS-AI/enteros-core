@@ -33,7 +33,7 @@ func TestPushDelegationResultToInbox_FlagOff_NoSQL(t *testing.T) {
 
 	pushDelegationResultToInbox(
 		context.Background(),
-		"caller", "deleg-1", "completed", "answer body", "",
+		"caller", "target", "deleg-1", "completed", "answer body", "",
 	)
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("flag off must not fire SQL: %v", err)
@@ -48,6 +48,10 @@ func TestPushDelegationResultToInbox_FlagOn_CompletedInsertsA2AReceiveRow(t *tes
 		WithArgs(
 			"caller-ws",
 			"caller-ws", // source_id mirrors workspace_id
+			"target-ws", // target_id — the workspace that owed the reply. Left NULL
+			// before #4314: the existing correlators (a2a_queue drain stitch,
+			// a2a_queue_status response subselect) both join on it, so they could
+			// never match an inbox row.
 			"Delegation result delivered",
 			sqlmock.AnyArg(), // request_body json
 			sqlmock.AnyArg(), // response_body json
@@ -58,7 +62,7 @@ func TestPushDelegationResultToInbox_FlagOn_CompletedInsertsA2AReceiveRow(t *tes
 
 	pushDelegationResultToInbox(
 		context.Background(),
-		"caller-ws", "deleg-1", "completed", "answer body", "",
+		"caller-ws", "target-ws", "deleg-1", "completed", "answer body", "",
 	)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -74,6 +78,7 @@ func TestPushDelegationResultToInbox_FlagOn_FailedInsertsErrorRow(t *testing.T) 
 		WithArgs(
 			"caller-ws",
 			"caller-ws",
+			"target-ws",
 			"Delegation failed",
 			sqlmock.AnyArg(),
 			sqlmock.AnyArg(),
@@ -84,7 +89,7 @@ func TestPushDelegationResultToInbox_FlagOn_FailedInsertsErrorRow(t *testing.T) 
 
 	pushDelegationResultToInbox(
 		context.Background(),
-		"caller-ws", "deleg-2", "failed", "", "target unreachable",
+		"caller-ws", "target-ws", "deleg-2", "failed", "", "target unreachable",
 	)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -121,6 +126,11 @@ func TestUpdateStatus_FlagOn_PushesA2AReceiveOnCompleted(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO activity_logs`).
 		WithArgs(
 			"ws-source", "ws-source",
+			"", // target_id: the UpdateStatus callback does not carry the target,
+			// so this row stays NULL-addressed (unchanged from before #4314).
+			// Correlation now rides response_body.delegation_id, which EVERY
+			// delegate_result writer sets — including the two failure paths that
+			// used to omit response_body entirely.
 			"Delegation result delivered",
 			sqlmock.AnyArg(),
 			sqlmock.AnyArg(),
@@ -170,6 +180,7 @@ func TestUpdateStatus_FlagOn_PushesA2AReceiveOnFailed(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO activity_logs`).
 		WithArgs(
 			"ws-source", "ws-source",
+			"", // target_id — see the completed arm above.
 			"Delegation failed",
 			sqlmock.AnyArg(),
 			sqlmock.AnyArg(),

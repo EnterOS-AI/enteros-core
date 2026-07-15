@@ -13,9 +13,9 @@ import (
 // dependency, so no mock DB is needed.
 func TestValidateRelPath(t *testing.T) {
 	cases := []struct {
-		name     string
-		path     string
-		wantErr  bool
+		name      string
+		path      string
+		wantErr   bool
 		errSubstr string // if non-empty, error message must contain this substring
 	}{
 		// Valid: simple relative paths inside a destination
@@ -89,7 +89,9 @@ func TestValidateRelPath_Cleaned(t *testing.T) {
 // relative to rm's CWD, NOT the shell's working directory.
 //
 // By contrast, the shell-expanded form:
-//   sh -c "rm -rf /configs $filePath"
+//
+//	sh -c "rm -rf /configs $filePath"
+//
 // would treat ".." as path components relative to /configs and could escape.
 //
 // deleteViaEphemeral uses the exec form only (verified in code review).

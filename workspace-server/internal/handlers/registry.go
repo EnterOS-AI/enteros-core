@@ -2013,8 +2013,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 					log.Printf("Heartbeat: %s (workspace=%s, unloaded for %s)", msg, payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second))
 					// Observability: emit the deciding inputs at this demote site (core#3082 / runtime#181 follow-up).
 					// Emit managementMCPUnloaded (true here, set at line 1701) — the
-				// tool-missing boolean (managementMissing) is already conveyed by
-				// the loaded_mcp_tools_count + absent_tools_list pair right above.
+					// tool-missing boolean (managementMissing) is already conveyed by
+					// the loaded_mcp_tools_count + absent_tools_list pair right above.
 					// (Consistency with lookup-error branch per CR2 #14695 / Researcher #14696 on #3334.)
 					log.Printf("Heartbeat: workspace=%s transition=%s\u2192degraded reason=management_mcp_missing loaded_mcp_tools_count=%d absent_tools_list=%v mcp_unloaded_for=%s grace=%s management_mcp_unloaded=%v", payload.WorkspaceID, currentStatus, len(payload.LoadedMCPTools), absentToolsList, now.Sub(firstUnloaded.Time).Truncate(time.Second), managementMCPUnloadedGrace, managementMCPUnloaded)
 					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {

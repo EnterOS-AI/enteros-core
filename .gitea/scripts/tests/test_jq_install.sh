@@ -164,8 +164,8 @@ pass "(c) both fail → rc=1, ::error:: naming both paths, no ::warning:: (the p
 # (d) is already covered by (c)'s `apt-get` and `GitHub download`
 # assertions. Just re-verify the exact full message contains the
 # two paths as a single integration check.
-[[ "$out" == *"review-check.sh regression tests cannot run without jq"* ]] || fail "(d) error message must include the SOP hint 'review-check.sh regression tests cannot run without jq', got: $out"
-pass "(d) error message includes the SOP hint naming both install paths"
+[[ "$out" == *"jq-dependent workflow steps cannot run without jq"* ]] || fail "(d) error message must include the hint 'jq-dependent workflow steps cannot run without jq', got: $out"
+pass "(d) error message includes the hint naming both install paths"
 
 # ====================================================================
 # (e) Anti-mask: the function does NOT contain `|| true` / `|| echo`

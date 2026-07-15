@@ -15,12 +15,74 @@ import subprocess
 import sys
 from pathlib import Path
 
+# ── DENY-list construction (the default shape for a lane's path filter) ─────
+#
+# An ALLOW-list ("run only if a changed path matches") is vacuous-by-omission
+# by construction: forget a path — or add a whole new tree — and the lane
+# silently takes its no-op arm and reports SUCCESS having run nothing. A
+# DENY-list ("run UNLESS every changed path is provably inert for this lane")
+# fails the other way: forget one and the lane runs when it needn't.
+#
+# `deny_list(*extra_inert)` builds `^(?!docs/)(?!.*\.md$)(?!<extra>)...`, a
+# pattern that MATCHES any path that is NOT in the inert set. Because
+# classify() folds with any(), the lane is True the moment ONE non-inert file
+# is touched, and False only when every changed path is inert.
+#
+# Rule for adding an entry to a lane's inert set: it must be PROVABLE from the
+# job definition — i.e. nothing the job builds, reads or executes can be
+# affected by that tree. "Probably unrelated" is not provable; leave it out and
+# pay the minutes.
+INERT_PROSE: tuple[str, ...] = ("docs/", r".*\.md$")
+
+
+def deny_list(*extra_inert: str) -> str:
+    """Pattern matching every path NOT provably inert for the lane."""
+    return "^" + "".join(f"(?!{p})" for p in (*INERT_PROSE, *extra_inert))
+
+
 PROFILES: dict[str, dict[str, str]] = {
+    # ── ci: INVERTED (was an allow-list; see #C2) ───────────────────────────
+    #
+    # The allow-list was `platform=^workspace-server/`, `canvas=^canvas/`,
+    # `scripts=^tests/e2e/|^scripts/|^infra/scripts/`. None of those match
+    # `.gitea/` — and `^scripts/` is anchored, so it does NOT match
+    # `.gitea/scripts/`. A PR touching ONLY the CI enforcement machinery
+    # (this file, gitea-merge-queue.py, all-required-check.sh,
+    # required-contexts.txt, any workflow) therefore produced
+    # platform=false canvas=false python=false scripts=false: every heavy job
+    # took its no-op arm and `CI / all-required` reported SUCCESS having run
+    # ZERO tests. The one thing CI could not see change was CI itself. Same
+    # hole for any NEW top-level tree, which matches no allow-list entry.
+    #
+    # Inert-set proofs (ci.yml job definitions):
+    #   platform — `cd workspace-server && go build/vet/test/lint` + coverage.
+    #     canvas/ is NOT inert: workspace-server/internal/handlers/
+    #     external_connection_test.go:375 reads
+    #     ../../../canvas/src/components/__tests__/__fixtures__/
+    #     external-connection.golden.json, so a canvas fixture edit can (and
+    #     should) go red here. Root files are not inert either (manifest.json
+    #     is read by cmd/server/main.go + the manifest_pinning tests). So the
+    #     Go lane denies prose ONLY.
+    #   canvas — `npm ci && npm run build && vitest run` inside canvas/. No
+    #     canvas source or test reads a path outside canvas/ (the only
+    #     readFileSync callers — globals.a11y.test.ts, ZoomShortcut.test.tsx —
+    #     read canvas/src/**), so workspace-server/ is provably inert here.
+    #   scripts — shellcheck + the offline bash unit suites over tests/e2e,
+    #     scripts/, infra/scripts. Neither Go sources nor canvas sources are
+    #     read or executed by those steps, so both trees are inert. NOTE the
+    #     one cross-tree step (`assert_e2e_tenant_contract.py`, the e2e↔router
+    #     contract) is already OR-gated in ci.yml on `scripts || platform`, so
+    #     denying workspace-server/ here loses no coverage.
+    #   python — the `Python Lint & Test` job (ci.yml:698) consumes NO output;
+    #     it always runs the Runtime SSOT guard. This key is emitted only
+    #     because ci.yml:81 declares the output. It cannot gate anything, so it
+    #     cannot be vacuous; left as the literal "the retired workspace/ runtime
+    #     tree came back" signal it has always been.
     "ci": {
-        "platform": r"^workspace-server/",
-        "canvas": r"^canvas/",
+        "platform": deny_list(),
+        "canvas": deny_list("workspace-server/"),
         "python": r"^workspace/",
-        "scripts": r"^tests/e2e/|^scripts/|^infra/scripts/",
+        "scripts": deny_list("workspace-server/", "canvas/"),
     },
     "handlers-postgres": {
         "handlers": (
@@ -48,11 +110,12 @@ PROFILES: dict[str, dict[str, str]] = {
     "e2e-api": {
         "api": r"^workspace-server/|^tests/e2e/|^\.gitea/workflows/e2e-api\.yml$",
     },
-    # ── e2e-ephemeral: the ONE profile that is INVERTED, on purpose ──────────
+    # ── e2e-ephemeral: INVERTED (the original deny-list; `ci` and
+    # `peer-visibility` now follow it) ───────────────────────────────────────
     #
-    # Every other profile above is an ALLOW-list: "run only if a changed path
-    # matches." That encodes a bet — that we can enumerate everything able to
-    # break the lane. For the ephemeral happy-path gate we LOST that bet: its
+    # The remaining allow-list profiles encode a bet — that we can enumerate
+    # everything able to break the lane. For the ephemeral happy-path gate we
+    # LOST that bet: its
     # `on: paths:` filter listed workspace-server/, three e2e scripts and
     # tests/e2e/lib/, but the workflow also RUNS `bash tests/harness/dind.sh`
     # (the per-job isolation the gate's correctness depends on) — and
@@ -69,33 +132,59 @@ PROFILES: dict[str, dict[str, str]] = {
     # Forget one here and the gate runs when it needn't: ~6 wasted minutes.
     # Only one of those two mistakes is allowed to be the cheap one.
     "e2e-ephemeral": {
-        "happy": r"^(?!docs/)(?!.*\.md$)",
+        "happy": deny_list(),
     },
-    # #1296: the E2E Peer Visibility gate is being flipped to a REQUIRED
-    # status check. A required-check workflow may NOT carry an `on: paths:`
-    # filter (lint-required-no-paths.py / feedback_path_filtered_workflow_
-    # cant_be_required would wedge docs-only PRs). So the path-scoping that
-    # used to live in e2e-peer-visibility.yml's `on:` block moves here and
-    # is applied per-step inside the always-running job (mirrors the
-    # handlers-postgres shape). The pattern set MUST mirror the old `on:
-    # paths:` list, PLUS the wsauth + workspace_provision surface the
-    # token-kinds fix (PR#2682) introduced — a regression in either would
-    # break the literal list_peers assertion the gate exists to protect.
+    # ── peer-visibility: INVERTED (was an allow-list; see #C5) ──────────────
+    #
+    # #1296 moved the E2E Peer Visibility path-scoping out of the workflow's
+    # `on: paths:` (a REQUIRED check may not carry one — lint-required-no-
+    # paths.py / feedback_path_filtered_workflow_cant_be_required) and into
+    # this profile, applied per-step inside the always-running job. It was
+    # carried over as an ALLOW-list naming handlers/mcp.go, mcp_tools.go,
+    # middleware/, registry.go, workspace.go, workspace_provision.go, wsauth/,
+    # four e2e scripts and the workflow file.
+    #
+    # That list OMITTED internal/router/router.go, cmd/server/main.go,
+    # internal/registry/ and internal/orgtoken/ — the route table that serves
+    # list_peers, the binary's wiring, the peer-hierarchy source and the
+    # org-token validation the MCP call authenticates with. A route rename or a
+    # registry/token regression in any of them breaks the literal list_peers
+    # assertion this gate exists to protect, and the gate would have silently
+    # no-op'd (SUCCESS, zero coverage) on the very PR that broke it. Naming
+    # those four paths would only MOVE the hole: the gate boots the WHOLE
+    # binary and provisions real workspaces, so any package in it can break it.
+    # Hence the same deny-list as e2e-ephemeral.
+    #
+    # SAFETY OF FLIPPING THIS ON FOR EVERY PR (it is REQUIRED, has no
+    # continue-on-error, and branch protection is status_check_contexts=['*'],
+    # so one red on an unrelated PR would freeze the merge queue):
+    #
+    #   1. The real arm is PROVEN GREEN. Classified by reading the job logs
+    #      (NOT by guessing from duration — the real arm finishes in 30-45s
+    #      thanks to the runner's warm GOCACHE bind-mount and pre-pulled
+    #      images, so it is easily mistaken for the no-op arm): of the recent
+    #      `E2E Peer Visibility` jobs, 5 took the REAL arm and all 5 printed
+    #      "GATE PASSED (LOCAL)" — 2 on PR#4316 (31s, 33s) and 3 on PR#4332
+    #      (30s, 34s, 41s). 5/5 green, including on a PR that is not this one.
+    #
+    #   2. The cross-run wedge is fixed at its source. The lanes used to run a
+    #      host-wide /proc sweep that killed ANY process named platform-server
+    #      on the shared docker-host runner — i.e. a concurrent PR's live
+    #      server. Making this gate run on every PR would have taken that from
+    #      rare to universal. Those sweeps are DELETED (see the same PR) and
+    #      test_no_host_wide_process_sweep.py fails the build if one returns.
+    #
+    #   3. The marginal cost is ~35s. The peer-visibility JOB is already
+    #      scheduled on every PR (it is the always-running required-context
+    #      emitter; only its STEPS were path-gated), so this does not add a
+    #      runner slot — it adds work to a job that already runs.
+    #
+    # If this lane ever does start redding unrelated PRs, the revert is this
+    # one line back to an allow-list — but fix the flake first: a required gate
+    # that is red for reasons unrelated to the PR is the thing to root-cause,
+    # not to mask.
     "peer-visibility": {
-        "peervis": (
-            r"^workspace-server/internal/handlers/mcp\.go$"
-            r"|^workspace-server/internal/handlers/mcp_tools\.go$"
-            r"|^workspace-server/internal/middleware/"
-            r"|^workspace-server/internal/handlers/registry\.go$"
-            r"|^workspace-server/internal/handlers/workspace\.go$"
-            r"|^workspace-server/internal/handlers/workspace_provision\.go$"
-            r"|^workspace-server/internal/wsauth/"
-            r"|^tests/e2e/test_peer_visibility_mcp_staging\.sh$"
-            r"|^tests/e2e/test_peer_visibility_token_mint_staging\.sh$"
-            r"|^tests/e2e/test_peer_visibility_mcp_local\.sh$"
-            r"|^tests/e2e/lib/peer_visibility_assert\.sh$"
-            r"|^\.gitea/workflows/e2e-peer-visibility\.yml$"
-        ),
+        "peervis": deny_list(),
     },
     # mc#2996 / RFC#2843 #37: the template-delivery e2e is being flipped to a
     # REQUIRED status check. A required-check workflow may NOT carry an `on:

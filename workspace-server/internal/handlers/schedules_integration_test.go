@@ -41,9 +41,9 @@ import (
 	"testing"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 func integrationDB_Schedules(t *testing.T) *sql.DB {
@@ -272,9 +272,9 @@ func TestIntegration_Schedules_CRUDRunHistoryHealth_RoundTrip(t *testing.T) {
 		t.Fatalf("RUNNOW: status want 200, got %d: %s", w.Code, w.Body.String())
 	}
 	var runNow struct {
-		Status     string `json:"status"`
+		Status      string `json:"status"`
 		WorkspaceID string `json:"workspace_id"`
-		Prompt     string `json:"prompt"`
+		Prompt      string `json:"prompt"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &runNow); err != nil {
 		t.Fatalf("RUNNOW: parse: %v", err)

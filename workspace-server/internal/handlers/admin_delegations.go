@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
@@ -61,18 +62,18 @@ func NewAdminDelegationsHandler(handle *sql.DB) *AdminDelegationsHandler {
 // operator dashboard cares about. Order matches the SELECT below — keep
 // the two in sync if you add a column.
 type delegationRow struct {
-	DelegationID   string     `json:"delegation_id"`
-	CallerID       string     `json:"caller_id"`
-	CalleeID       string     `json:"callee_id"`
-	TaskPreview    string     `json:"task_preview"`
-	Status         string     `json:"status"`
-	LastHeartbeat  *time.Time `json:"last_heartbeat,omitempty"`
-	Deadline       time.Time  `json:"deadline"`
-	ResultPreview  *string    `json:"result_preview,omitempty"`
-	ErrorDetail    *string    `json:"error_detail,omitempty"`
-	RetryCount     int        `json:"retry_count"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	DelegationID  string     `json:"delegation_id"`
+	CallerID      string     `json:"caller_id"`
+	CalleeID      string     `json:"callee_id"`
+	TaskPreview   string     `json:"task_preview"`
+	Status        string     `json:"status"`
+	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
+	Deadline      time.Time  `json:"deadline"`
+	ResultPreview *string    `json:"result_preview,omitempty"`
+	ErrorDetail   *string    `json:"error_detail,omitempty"`
+	RetryCount    int        `json:"retry_count"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 // statusFilters maps the query-string `status` value to the SQL set.
@@ -81,10 +82,29 @@ type delegationRow struct {
 // entry here. Caught when a future status name doesn't pin to a UI
 // expectation (forward-defense).
 var statusFilters = map[string][]string{
-	"in_flight": {"queued", "dispatched", "in_progress"},
+	// DERIVED — and this one mattered: `in_flight` is the DEFAULT view
+	// (c.DefaultQuery("status", "in_flight")), and the hand-typed list omitted
+	// `stuck`. So the operator opening the delegations dashboard to find out why an
+	// agent was wedged saw everything EXCEPT the wedged delegations. That is #4314
+	// with a UI instead of a digest.
+	//
+	// `stuck` rows appear in BOTH `in_flight` (they are awaiting an answer) and the
+	// dedicated `stuck` tab (which narrows to just them). The overlap is intended.
+	"in_flight": DelegationInFlightStates,
 	"stuck":     {"stuck"},
 	"failed":    {"failed"},
 	"completed": {"completed"},
+}
+
+// statusFilterKeys returns the accepted `?status=` values, sorted for a stable
+// error message.
+func statusFilterKeys() []string {
+	keys := make([]string, 0, len(statusFilters))
+	for k := range statusFilters {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 const defaultListLimit = 100
@@ -101,10 +121,14 @@ func (h *AdminDelegationsHandler) List(c *gin.Context) {
 	statusKey := c.DefaultQuery("status", "in_flight")
 	statuses, ok := statusFilters[statusKey]
 	if !ok {
+		// DERIVED from the map itself. Hand-listing the keys here meant the error
+		// message could disagree with what the endpoint actually accepts — a small
+		// instance of the same drift, and it lists status names that are really
+		// FILTER keys, which is its own confusion.
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error":             "unknown status filter",
-			"allowed":           []string{"in_flight", "stuck", "failed", "completed"},
-			"requested_status":  statusKey,
+			"error":            "unknown status filter",
+			"allowed":          statusFilterKeys(),
+			"requested_status": statusKey,
 		})
 		return
 	}
@@ -208,16 +232,15 @@ func (h *AdminDelegationsHandler) Stats(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	// Initialise to zero so the response always has every known status
-	// key — the dashboard card doesn't need to handle "missing key vs
-	// zero" branching.
-	stats := map[string]int{
-		"queued":      0,
-		"dispatched":  0,
-		"in_progress": 0,
-		"completed":   0,
-		"failed":      0,
-		"stuck":       0,
+	// Initialise to zero so the response always has every known status key — the
+	// dashboard card doesn't need to handle "missing key vs zero" branching.
+	//
+	// DERIVED: this list happens to be complete today, but a hand-typed one goes
+	// stale silently — a new state would simply never appear on the dashboard, and
+	// nobody would know to look for it.
+	stats := make(map[string]int, len(DelegationAllStates))
+	for _, st := range DelegationAllStates {
+		stats[st] = 0
 	}
 	for rows.Next() {
 		var status string

@@ -207,7 +207,7 @@ func TestRegister_200_DoesNotLogFailure(t *testing.T) {
 // heartbeat. The declared-plugin reconcile (seo-all) therefore never installed
 // on a fresh prod seo-agent. This asserts register fires the reconcile when it
 // performs the provisioning→online transition. The prev-status SELECT uses
-// bare `status` (NOT-NULL enum; COALESCE(status,'') is rejected by Postgres).
+// bare `status` (NOT-NULL enum; COALESCE(status,”) is rejected by Postgres).
 func TestRegister_FiresReconcile_OnProvisioningToOnline(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)

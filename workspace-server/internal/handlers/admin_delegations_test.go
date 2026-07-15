@@ -1,10 +1,13 @@
 package handlers
 
 import (
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,8 +27,8 @@ func TestAdminDelegations_List_DefaultStatusInFlight(t *testing.T) {
 	h := NewAdminDelegationsHandler(nil)
 
 	now := time.Now()
-	mock.ExpectQuery(`SELECT delegation_id, caller_id::text, callee_id::text, task_preview,\s+status, last_heartbeat, deadline, result_preview, error_detail,\s+retry_count, created_at, updated_at\s+FROM delegations\s+WHERE status IN \(\$1,\$2,\$3\)\s+ORDER BY created_at DESC\s+LIMIT \$4`).
-		WithArgs("queued", "dispatched", "in_progress", 100).
+	mock.ExpectQuery(inFlightQueryRE()).
+		WithArgs(inFlightArgs(100)...). // DERIVED — incl. `stuck` (#4314)
 		WillReturnRows(sqlmock.NewRows([]string{
 			"delegation_id", "caller_id", "callee_id", "task_preview",
 			"status", "last_heartbeat", "deadline", "result_preview", "error_detail",
@@ -156,7 +159,7 @@ func TestAdminDelegations_List_AcceptsCustomLimit(t *testing.T) {
 	h := NewAdminDelegationsHandler(nil)
 
 	mock.ExpectQuery(`SELECT delegation_id`).
-		WithArgs("queued", "dispatched", "in_progress", 25).
+		WithArgs(inFlightArgs(25)...).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"delegation_id", "caller_id", "callee_id", "task_preview",
 			"status", "last_heartbeat", "deadline", "result_preview", "error_detail",
@@ -320,7 +323,7 @@ func TestAdminDelegations_List_RowsErr_PartialResults(t *testing.T) {
 		RowError(1, errors.New("storage engine fault"))
 
 	mock.ExpectQuery(`SELECT delegation_id`).
-		WithArgs("queued", "dispatched", "in_progress", 100).
+		WithArgs(inFlightArgs(100)...). // DERIVED — incl. `stuck` (#4314)
 		WillReturnRows(rows)
 
 	w := httptest.NewRecorder()
@@ -403,29 +406,64 @@ func TestAdminDelegations_Stats_RowsErr_Returns200(t *testing.T) {
 	}
 }
 
-// statusFilters is a contract surface — every key here is documented in
-// the endpoint comment + accepted by the validator. Pin it.
+// statusFilters is a contract surface — every key is accepted by the validator and
+// surfaced in the endpoint's error message. Pin it.
+//
+// THIS TEST USED TO PIN THE BUG. It asserted
+// `"in_flight": {"queued","dispatched","in_progress"}` — the hand-typed list that
+// DROPS `stuck`. And `in_flight` is the DEFAULT query, so the operator opening the
+// delegations dashboard to find out why an agent was wedged saw everything except
+// the wedged delegations. The test was green the whole time, because it asserted
+// the code as written rather than the behaviour required (#4314).
+//
+// It now asserts the DERIVED set, so it cannot re-encode a hand-typed list.
 func TestStatusFiltersTableShape(t *testing.T) {
-	expected := map[string][]string{
-		"in_flight": {"queued", "dispatched", "in_progress"},
-		"stuck":     {"stuck"},
-		"failed":    {"failed"},
-		"completed": {"completed"},
+	// in_flight IS the vocabulary's in-flight set — not a copy of it.
+	if got := statusFilters["in_flight"]; len(got) != len(DelegationInFlightStates) {
+		t.Fatalf("in_flight must BE DelegationInFlightStates (%v), got %v",
+			DelegationInFlightStates, got)
 	}
-	for k, want := range expected {
+	for i, want := range DelegationInFlightStates {
+		if statusFilters["in_flight"][i] != want {
+			t.Errorf("in_flight[%d]: want %q, got %q", i, want, statusFilters["in_flight"][i])
+		}
+	}
+
+	// the narrowing tabs each select exactly their own state
+	for _, k := range []string{"stuck", "failed", "completed"} {
 		got, ok := statusFilters[k]
 		if !ok {
 			t.Errorf("statusFilters missing key %q", k)
 			continue
 		}
-		if len(got) != len(want) {
-			t.Errorf("statusFilters[%q]: want %v, got %v", k, want, got)
-			continue
-		}
-		for i := range want {
-			if got[i] != want[i] {
-				t.Errorf("statusFilters[%q][%d]: want %q, got %q", k, i, want[i], got[i])
-			}
+		if len(got) != 1 || got[0] != k {
+			t.Errorf("statusFilters[%q]: want [%s], got %v", k, k, got)
 		}
 	}
+}
+
+// inFlightQueryRE builds the expected SQL regex for the DEFAULT view, with one
+// placeholder per in-flight state. Hard-coding `IN ($1,$2,$3)` is the same drift
+// as hard-coding the states: it silently pins the count at three.
+func inFlightQueryRE() string {
+	ph := make([]string, len(DelegationInFlightStates))
+	for i := range DelegationInFlightStates {
+		ph[i] = `\$` + strconv.Itoa(i+1)
+	}
+	return `SELECT delegation_id, caller_id::text, callee_id::text, task_preview,` +
+		`\s+status, last_heartbeat, deadline, result_preview, error_detail,` +
+		`\s+retry_count, created_at, updated_at\s+FROM delegations` +
+		`\s+WHERE status IN \(` + strings.Join(ph, ",") + `\)` +
+		`\s+ORDER BY created_at DESC\s+LIMIT \$` + strconv.Itoa(len(ph)+1)
+}
+
+// inFlightArgs builds the sqlmock arg list for the DEFAULT (in_flight) view from
+// the vocabulary itself. Hard-coding the three-state list here is what let the
+// dropped `stuck` go unnoticed: the test agreed with the bug.
+func inFlightArgs(limit int) []driver.Value {
+	args := make([]driver.Value, 0, len(DelegationInFlightStates)+1)
+	for _, s := range DelegationInFlightStates {
+		args = append(args, s)
+	}
+	return append(args, limit)
 }

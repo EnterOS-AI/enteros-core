@@ -15,6 +15,7 @@ import {
   unexpectedGreetings,
   contentSimilarity,
   findDuplicates,
+  agentRepliesForTurn,
   type SimpleMessage,
 } from "../conciergeChatInvariants";
 
@@ -221,5 +222,117 @@ describe("isReGreet helper", () => {
   it("does not flag a genuine conversational answer", () => {
     expect(isReGreet(GREETING, CAPABILITY_ANSWER)).toBe(false);
     expect(isReGreet(GREETING, SIGNOFF_ANSWER)).toBe(false);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * agentRepliesForTurn — turn attribution
+ *
+ * NEGATIVE-CONTROL SUITE. Every case below is anchored on the REAL transcript
+ * from Gitea Actions run 499907 / job 732021, where staging-slow-cold-greeting
+ * observed FOUR agent bubbles and its two guards BOTH failed to do their job:
+ * the whole-transcript `agents.length === 1` model false-RED'd on correct
+ * behaviour, and the exact-content `duplicateAgentContents` dedupe returned []
+ * against a hypothetical double-reply it was built to catch. These tests pin
+ * that the replacement discriminates in both directions.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+// Verbatim from run 499907's RESULT_JSON. Bubbles 1-3 are the EARLIER staging
+// specs' turns (staging-concierge-greeting.spec.ts sends "hi" + "what can you
+// do?" via the API, then "hi" again via the UI) against the SAME shared org and
+// the SAME long-lived My Chat. Bubble 4 is the reply to slow-cold's own "hi".
+const R499907_HISTORY: SimpleMessage[] = [
+  { role: "user", content: "hi" },
+  { role: "agent", content: "Hi! I'm the org concierge — the front door to your organization. I can help you get set up." },
+  { role: "user", content: "what can you do?" },
+  { role: "agent", content: "Here's what I can do as your Org Concierge:\n\n🚀 Core Capabilities\n\nTeam & Workspaces..." },
+  { role: "user", content: "hi" },
+  { role: "agent", content: "Hey again! What can I help you with?" },
+];
+const R499907_OWN_REPLY: SimpleMessage = { role: "agent", content: "Hey! What can I do for you?" };
+
+describe("agentRepliesForTurn — turn attribution (run 499907)", () => {
+  it("attributes exactly ONE reply to the turn despite 3 bubbles of shared history", () => {
+    const before = R499907_HISTORY;
+    const after = [...R499907_HISTORY, { role: "user", content: "hi" } as SimpleMessage, R499907_OWN_REPLY];
+
+    const turn = agentRepliesForTurn(before, after);
+
+    expect(turn.prefixIntact).toBe(true);
+    expect(turn.prefixDrift).toEqual([]);
+    expect(turn.replies.map((m) => m.content)).toEqual(["Hey! What can I do for you?"]);
+
+    // NEGATIVE CONTROL for the OLD model: counting the whole transcript sees 4
+    // agent bubbles and would have RED'd — on behaviour that is entirely
+    // correct. That false-RED is the defect this replaces.
+    const wholeTranscriptCount = after.filter((m) => m.role === "agent").length;
+    expect(wholeTranscriptCount).toBe(4);
+    expect(wholeTranscriptCount).not.toBe(turn.replies.length);
+  });
+
+  it("CATCHES a semantic double-reply that exact-content dedupe cannot see", () => {
+    // The bug shape the spec exists to catch: ONE "hi", TWO replies, WORDED
+    // DIFFERENTLY (the agent was dispatched twice). A user plainly sees the
+    // concierge answer twice.
+    const before = R499907_HISTORY.slice(0, 4);
+    const after: SimpleMessage[] = [
+      ...before,
+      { role: "user", content: "hi" },
+      { role: "agent", content: "Hey again! What can I help you with?" },
+      { role: "agent", content: "Hey! What can I do for you?" },
+    ];
+
+    const turn = agentRepliesForTurn(before, after);
+    expect(turn.replies).toHaveLength(2); // ← CAUGHT
+
+    // NEGATIVE CONTROL for the OLD guard: dedupe-by-exact-content is BLIND to
+    // it — the two replies differ in wording, so it reports no duplicates and
+    // the assertion built to stop this bug passes it straight through.
+    const agentsOnly = after.filter((m) => m.role === "agent");
+    expect(findDuplicates(agentsOnly)).toEqual([]); // ← the old guard sees nothing
+  });
+
+  it("CATCHES the classic render-dup (the SAME reply rendered twice)", () => {
+    const before = R499907_HISTORY;
+    const after: SimpleMessage[] = [
+      ...before,
+      { role: "user", content: "hi" },
+      R499907_OWN_REPLY,
+      { ...R499907_OWN_REPLY }, // the persisted copy + the live copy both rendered
+    ];
+    const turn = agentRepliesForTurn(before, after);
+    expect(turn.replies).toHaveLength(2);
+  });
+
+  it("CATCHES an old bubble re-inserted mid-transcript (prefix drift)", () => {
+    const before = R499907_HISTORY;
+    const after: SimpleMessage[] = [
+      ...R499907_HISTORY.slice(0, 2),
+      { role: "agent", content: "Hey again! What can I help you with?" }, // duplicated OUT of order
+      ...R499907_HISTORY.slice(2),
+      { role: "user", content: "hi" },
+      R499907_OWN_REPLY,
+    ];
+    const turn = agentRepliesForTurn(before, after);
+    expect(turn.prefixIntact).toBe(false);
+    expect(turn.prefixDrift.length).toBeGreaterThan(0);
+  });
+
+  it("is not fooled by cosmetic markdown/whitespace re-render of the baseline", () => {
+    const before = R499907_HISTORY;
+    const after: SimpleMessage[] = [
+      ...R499907_HISTORY.map((m) => ({ ...m, content: `  ${m.content}  ` })),
+      { role: "user", content: "hi" },
+      R499907_OWN_REPLY,
+    ];
+    const turn = agentRepliesForTurn(before, after);
+    expect(turn.prefixIntact).toBe(true);
+    expect(turn.replies).toHaveLength(1);
+  });
+
+  it("reports ZERO replies when the turn produced none (no silent pass)", () => {
+    const turn = agentRepliesForTurn(R499907_HISTORY, [...R499907_HISTORY, { role: "user", content: "hi" }]);
+    expect(turn.replies).toHaveLength(0);
+    expect(turn.prefixIntact).toBe(true);
   });
 });

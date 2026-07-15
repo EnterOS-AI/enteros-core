@@ -101,7 +101,7 @@ func TestRecordLedgerStatus_FlagOn_FiresUpdate(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("queued"))
 	// Then UPDATEs.
 	mock.ExpectExec(`UPDATE delegations`).
-		WithArgs("deleg-1", "dispatched", "", "").
+		WithArgs("deleg-1", "dispatched", "", "", "queued"). // $5 = CAS guard on observed status
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	recordLedgerStatus(context.Background(), "deleg-1", "dispatched", "", "")

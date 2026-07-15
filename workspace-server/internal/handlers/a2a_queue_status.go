@@ -114,10 +114,12 @@ func QueueStatusByID(ctx context.Context, queueID string) (*QueueStatus, error) 
 				(
 					SELECT al.response_body::text
 					FROM activity_logs al
-					WHERE al.method = 'delegate_result'
+					WHERE al.activity_type = 'delegation'
+						AND al.method = 'delegate_result'
 						AND al.target_id = q.workspace_id
 						AND al.workspace_id = q.caller_id
 						AND al.response_body->>'delegation_id' = (q.body->'params'->'message'->'metadata'->>'delegation_id')
+					ORDER BY al.created_at DESC
 					LIMIT 1
 				)
 			)

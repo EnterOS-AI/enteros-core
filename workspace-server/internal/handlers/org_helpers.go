@@ -144,13 +144,15 @@ func expandWithEnv(s string, env map[string]string) string {
 //     variable reference (ref == whole).
 //
 // Bare $VAR format:
-//   $HOME (alone) → ref==whole → os.Getenv ✓  (host HOME is org-template HOME)
-//   $HOME/path (partial) → ref!=whole → literal "$HOME" ✓  (CWE-78: prevents host leak)
+//
+//	$HOME (alone) → ref==whole → os.Getenv ✓  (host HOME is org-template HOME)
+//	$HOME/path (partial) → ref!=whole → literal "$HOME" ✓  (CWE-78: prevents host leak)
 //
 // Braced ${VAR} format:
-//   ${HOME} (alone) → ref==whole → os.Getenv ✓
-//   ${ROLE}/admin (partial) → ref!=whole → literal ✓
-//   "yes and ${NOT_SET}" (embedded) → ref!=whole → literal ✓
+//
+//	${HOME} (alone) → ref==whole → os.Getenv ✓
+//	${ROLE}/admin (partial) → ref!=whole → literal ✓
+//	"yes and ${NOT_SET}" (embedded) → ref!=whole → literal ✓
 //
 // This is the CWE-78 fix from commit a3a358f9.
 func expandEnvRef(key, ref, whole string, env map[string]string) string {

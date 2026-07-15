@@ -13,8 +13,8 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"gopkg.in/yaml.v3"
 	"github.com/gin-gonic/gin"
+	"gopkg.in/yaml.v3"
 )
 
 // ==================== normalizeName ====================
@@ -48,10 +48,10 @@ func TestNormalizeName(t *testing.T) {
 
 func TestGenerateDefaultConfig_WithFiles(t *testing.T) {
 	files := map[string]string{
-		"system-prompt.md":          "# System prompt",
-		"rules.md":                  "# Rules",
-		"skills/search/SKILL.md":    "Search skill",
-		"skills/review/SKILL.md":    "Review skill",
+		"system-prompt.md":           "# System prompt",
+		"rules.md":                   "# Rules",
+		"skills/search/SKILL.md":     "Search skill",
+		"skills/review/SKILL.md":     "Review skill",
 		"skills/review/templates.md": "Templates",
 	}
 
@@ -164,9 +164,9 @@ func TestGenerateDefaultConfig_YAMLInjection(t *testing.T) {
 func TestWriteFiles_Success(t *testing.T) {
 	tmpDir := t.TempDir()
 	files := map[string]string{
-		"config.yaml":            "name: Test\n",
-		"skills/test/SKILL.md":   "# Test Skill",
-		"system-prompt.md":       "# System Prompt",
+		"config.yaml":          "name: Test\n",
+		"skills/test/SKILL.md": "# Test Skill",
+		"system-prompt.md":     "# System Prompt",
 	}
 
 	if err := writeFiles(tmpDir, files); err != nil {

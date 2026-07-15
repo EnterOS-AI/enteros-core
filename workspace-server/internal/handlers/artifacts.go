@@ -247,7 +247,7 @@ func (h *ArtifactsHandler) Get(c *gin.Context) {
 		// CF API unavailable — return cached DB row with a warning.
 		log.Printf("artifacts: GetRepo from CF failed for %s: %v", row.CFRepoName, err)
 		c.JSON(http.StatusOK, gin.H{
-			"artifact": row,
+			"artifact":  row,
 			"cf_status": "unavailable",
 			"cf_error":  cfErrMessage(err),
 		})

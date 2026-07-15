@@ -1,10 +1,10 @@
--- 029_audit_events.up.sql
--- Append-only HMAC-chained agent event log for EU AI Act Annex III compliance.
--- Art. 12 record-keeping + Art. 13 transparency.
+-- 030_audit_events.up.sql
+-- Storage schema for HMAC-linked agent execution events.
 --
 -- Each row is signed with HMAC-SHA256 and chained to the preceding row for
 -- the same agent_id via prev_hmac, making the log tamper-evident.
--- See: molecule_audit/ledger.py and platform/internal/handlers/audit.go
+-- The read/verifier surface is workspace-server/internal/handlers/audit.go.
+-- Event production is owned separately.
 
 CREATE TABLE IF NOT EXISTS audit_events (
     id                   TEXT        NOT NULL,

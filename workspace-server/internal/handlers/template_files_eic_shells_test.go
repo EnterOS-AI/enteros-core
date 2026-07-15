@@ -20,11 +20,11 @@ import (
 func TestBuildInstallShell(t *testing.T) {
 	got := buildInstallShell("/configs/config.yaml")
 	wants := []string{
-		"sudo -n",                                   // privilege escalation for root-owned /configs
-		"install -D",                                // creates parent dirs
-		"-m 0644",                                   // permission contract
-		"/dev/stdin",                                // pipe-from-ssh source
-		"'/configs/config.yaml'",                    // shell-quoted destination
+		"sudo -n",                // privilege escalation for root-owned /configs
+		"install -D",             // creates parent dirs
+		"-m 0644",                // permission contract
+		"/dev/stdin",             // pipe-from-ssh source
+		"'/configs/config.yaml'", // shell-quoted destination
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {

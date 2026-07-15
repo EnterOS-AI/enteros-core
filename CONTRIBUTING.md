@@ -183,7 +183,6 @@ stages 3–4) are merge-blocking and partly live in CP's deploy pipeline.
 | python-lint | pytest with coverage |
 | e2e-api | Full API test suite (62 tests) |
 | shellcheck | Shell script linting |
-| review-check-tests | `review-check.sh` evaluator regression suite (13 scenarios) |
 | ops-scripts | Python unittest suite for `scripts/*.py` |
 
 ### Workspace runtime SSOT
@@ -194,18 +193,26 @@ Do not reintroduce `molecule-core/workspace/` or vendored `molecule_runtime/`
 copies in consumers. Core and templates consume the published runtime package
 from the Gitea package registry.
 
-For local external MCP agents, multi-workspace config is
-`MOLECULE_WORKSPACES=[{"id":"...","token":"...","platform_url":"..."}]`.
+For local external MCP agents, the multi-workspace config key is
+`MOLECULE_WORKSPACES_JSON` (that is the name `parseWorkspaceTargets` in
+`@molecule-ai/mcp-server` actually reads — there is no `MOLECULE_WORKSPACES`).
+The shape is documented once, canonically, in
+[docs/guides/external-agent-registration.md](docs/guides/external-agent-registration.md#multiple-workspaces-from-one-local-mcp-bridge);
+the operator-facing snippet is generated from
+`workspace-server/internal/handlers/external_connection.go`. Do not restate the
+shape in a new place — a second copy is how the key name drifts, and a snippet
+built against the wrong key fails silently.
 `platform_url` selects the tenant; `org_id` is not part of this config.
 Workspace IDs can differ across orgs.
 
 ## Local Testing
 
-### review-check.sh
+### CI ops-script suite
 ```bash
-bash .gitea/scripts/tests/test_review_check.sh
+python3 -m pytest .gitea/scripts/tests/ -q
+bash .gitea/scripts/tests/test_ci_status.sh
 ```
-Runs the full regression suite against a fixture HTTP server. No network access required.
+Runs the governance/merge-queue script regression suites. No network access required.
 
 ## Code Style
 

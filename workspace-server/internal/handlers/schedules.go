@@ -532,4 +532,3 @@ func (h *ScheduleHandler) Health(c *gin.Context) {
 
 	c.JSON(http.StatusOK, schedules)
 }
-

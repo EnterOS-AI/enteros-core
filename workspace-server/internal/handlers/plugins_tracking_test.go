@@ -32,13 +32,13 @@ func TestValidateTrackedRef(t *testing.T) {
 		{"sha:0123456789abcdef0123456789abcdef01234567", "sha:0123456789abcdef0123456789abcdef01234567", false},
 
 		// Reject malformed
-		{"tag:", "", true},      // empty after prefix
-		{"sha:", "", true},      // empty after prefix
-		{"latest", "", true},    // bare 'latest' is ambiguous (tag? branch?)
-		{"main", "", true},      // bare branch name not allowed
-		{"v1.0.0", "", true},    // missing tag: prefix
-		{"random", "", true},    // not in allowlist
-		{"tag", "", true},       // prefix without separator
+		{"tag:", "", true},   // empty after prefix
+		{"sha:", "", true},   // empty after prefix
+		{"latest", "", true}, // bare 'latest' is ambiguous (tag? branch?)
+		{"main", "", true},   // bare branch name not allowed
+		{"v1.0.0", "", true}, // missing tag: prefix
+		{"random", "", true}, // not in allowlist
+		{"tag", "", true},    // prefix without separator
 	}
 	for _, tc := range cases {
 		got, err := validateTrackedRef(tc.in)

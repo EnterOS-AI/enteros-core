@@ -1238,6 +1238,6 @@ type ActivityParams struct {
 	// also sets it and uses ON CONFLICT (workspace_id, message_id) DO
 	// UPDATE to stamp response_body onto the same row instead of inserting
 	// a duplicate. Empty for non-per-message activity (task_update, etc.).
-	MessageId string
-	ErrorDetail  *string
+	MessageId   string
+	ErrorDetail *string
 }

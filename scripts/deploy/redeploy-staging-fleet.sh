@@ -53,11 +53,101 @@
 #                      suffix of --tag staging-<sha>.
 #   HEALTH_GATE_ATTEMPTS / HEALTH_GATE_SLEEP_SECS tune /buildinfo polling
 #                      (defaults: 20 attempts, 3s sleep).
+#   TENANT_FLAGS       space-separated KEY=VALUE rollout flags to apply to every
+#                      tenant container, e.g. "DELEGATION_LEDGER_WRITE=1".
+#                      DECLARATIVE AND REVERSIBLE — see MANAGED_FLAG_KEYS below.
+#                      Default empty = every managed flag OFF.
 #
 # SAFETY: only recreates STATELESS cp-env=<env> platform containers; never
 # removes a named volume; each swap is health-gated + self-rolls-back; --dry-run
 # performs zero mutations. STAGING scoped by default (cp-env=staging).
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# MANAGED ROLLOUT FLAGS — declarative, and REVERSIBLE.
+#
+# Tenant env is inherited BY COPY: swap_tenant reads the RUNNING container's
+# Config.Env and re-applies it to the new image. There is no declarative source,
+# which means anything set by hand on a container is STICKY FOREVER — copied into
+# every future redeploy, with no way to unset it. A burn-in flag you cannot
+# un-flip is not a burn-in flag; a rollback that cannot roll the flag back is not
+# a rollback.
+#
+# So the keys below are OWNED by this script. On every swap they are STRIPPED from
+# the inherited env and re-applied from $TENANT_FLAGS. Consequences, and they are
+# the point:
+#   * TENANT_FLAGS is the SINGLE SOURCE OF TRUTH for these keys.
+#   * Removing a flag from TENANT_FLAGS genuinely turns it OFF on the next roll —
+#     it does not linger in the copied env.
+#   * A hand-set value on a live container is transient and will be reverted,
+#     which is what stops staging from drifting away from what the repo says.
+#
+# Add a key here the moment a flag needs to be rollable, NOT when someone first
+# wants it on.
+MANAGED_FLAG_KEYS=(
+  DELEGATION_LEDGER_WRITE
+  DELEGATION_RESULT_INBOX_PUSH
+)
+
+# apply_managed_flags <envfile>: strip every managed key from the inherited env,
+# then append exactly what TENANT_FLAGS asks for.
+apply_managed_flags() {
+  local envfile="$1"
+  local key rc
+  for key in "${MANAGED_FLAG_KEYS[@]}"; do
+    # FAIL CLOSED. `grep -v` exits 1 when it prints NO lines — which happens for a
+    # real envfile that contains nothing but this one key. Written as
+    # `grep -v ... > tmp && mv`, that skips the mv, leaves the stale flag in place,
+    # and STILL returns 0: the strip silently no-ops in exactly the case it matters,
+    # and the container rolls with the flag it was supposed to have lost. The same
+    # swallow hid any genuine error (a failed redirect: ENOSPC, read-only tmpdir).
+    #
+    # So: 0 = matched, 1 = matched nothing (both fine, and the .tmp is authoritative
+    # either way), >=2 = a real grep error, which must abort the roll.
+    set +e
+    grep -vE "^${key}=" "$envfile" > "${envfile}.tmp"
+    rc=$?
+    set -e
+    if [ "$rc" -ge 2 ]; then
+      rm -f "${envfile}.tmp"
+      echo "::error::apply_managed_flags: grep failed (rc=$rc) stripping '$key' from $envfile" >&2
+      return 1
+    fi
+    if ! mv "${envfile}.tmp" "$envfile"; then
+      rm -f "${envfile}.tmp"
+      echo "::error::apply_managed_flags: could not rewrite $envfile while stripping '$key'" >&2
+      return 1
+    fi
+  done
+  local kv
+  for kv in $TENANT_FLAGS; do
+    case "$kv" in
+      *=*) ;;
+      *) echo "::error::TENANT_FLAGS entry '$kv' is not KEY=VALUE" >&2; return 1 ;;
+    esac
+    key="${kv%%=*}"
+    # Refuse to set anything not declared managed: an unmanaged key would be
+    # sticky (never stripped), i.e. exactly the irreversibility this exists to
+    # prevent. Fail loudly rather than quietly create a one-way door.
+    local ok=0 m
+    for m in "${MANAGED_FLAG_KEYS[@]}"; do [ "$m" = "$key" ] && ok=1; done
+    if [ "$ok" -ne 1 ]; then
+      echo "::error::TENANT_FLAGS key '$key' is not in MANAGED_FLAG_KEYS — it would be" >&2
+      echo "::error::copied into every future redeploy with no way to unset it. Declare it first." >&2
+      return 1
+    fi
+    echo "$kv" >> "$envfile"
+  done
+
+  # SAY WHAT WAS ROLLED. Without this line the staging CD log gives no way to tell
+  # which flag state the fleet actually came up with — and "the burn-in silently
+  # ended two merges ago" is precisely the failure this mechanism must not have.
+  if [ -n "$TENANT_FLAGS" ]; then
+    echo "  managed flags: [$TENANT_FLAGS] (all other managed keys stripped)"
+  else
+    echo "  managed flags: none set — every managed key stripped (${MANAGED_FLAG_KEYS[*]})"
+  fi
+}
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 TENANT_IMAGE="${TENANT_IMAGE:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
@@ -80,6 +170,40 @@ while [ "$#" -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; usage 2;;
   esac
 done
+
+# FAIL CLOSED IF THE CALLER DID NOT DECLARE ITS FLAG STATE.
+#
+# This script STRIPS every managed key from the inherited tenant env and re-applies
+# only what TENANT_FLAGS names. So a call site that simply forgets to pass it does
+# NOT get "the old behaviour" — it silently turns those flags OFF across the entire
+# fleet. Shipped as `TENANT_FLAGS="${TENANT_FLAGS:-}"`, this mechanism was a flag
+# ERASER, not a flag switch: any unrelated merge to main triggers staging CD, and
+# that roll would have ended an in-flight burn-in with no log line.
+#
+# A grep-the-workflows lint cannot close this — one file can invoke the script
+# twice and mention TENANT_FLAGS once. So the requirement is structural and lives
+# HERE, at the one place every caller passes through.
+#
+# Empty is a perfectly good value: it means "all managed flags dark", the default
+# and the safe state. What is NOT acceptable is UNSET — a caller that never thought
+# about it. Say TENANT_FLAGS="" and mean it.
+#
+# Placed BELOW arg parsing so --help still prints help, and skipped for --dry-run,
+# which performs zero mutations by contract.
+if [ "$DRY_RUN" != "1" ] && [ -z "${TENANT_FLAGS+x}" ]; then
+  echo "::error::TENANT_FLAGS is not set. This script strips every managed rollout" >&2
+  echo "::error::flag (${MANAGED_FLAG_KEYS[*]}) from the inherited tenant env and" >&2
+  echo "::error::re-applies only what TENANT_FLAGS declares — so running without it" >&2
+  echo "::error::would silently turn those flags OFF on every tenant." >&2
+  echo "::error::" >&2
+  echo "::error::  flags dark (the default):  TENANT_FLAGS=\"\" bash $0 ..." >&2
+  echo "::error::  turn one on:               TENANT_FLAGS=\"DELEGATION_LEDGER_WRITE=1\" bash $0 ..." >&2
+  echo "::error::" >&2
+  echo "::error::In CI: set STAGING_TENANT_FLAGS in env: and pass" >&2
+  echo "::error::TENANT_FLAGS=\"\${STAGING_TENANT_FLAGS-}\" on the command line." >&2
+  exit 1
+fi
+TENANT_FLAGS="${TENANT_FLAGS:-}"   # --dry-run may legitimately reach here unset
 log() { printf '>> [fleet] %s\n' "$*" >&2; }
 
 # Resolve the target image ref (either an explicit --image, or TENANT_IMAGE:tag).
@@ -201,6 +325,8 @@ swap_tenant() {
   envfile="$(mktemp)"
   docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -vE '^(PATH|NODE_VERSION|YARN_VERSION)=' > "$envfile"
+  # Managed rollout flags are re-derived from TENANT_FLAGS, never inherited.
+  apply_managed_flags "$envfile" || return 1
   local labelargs=() hostargs=()
   while IFS= read -r l; do [ -n "$l" ] && labelargs+=( --label "$l" ); done \
     < <(docker inspect "$name" --format '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{println}}{{end}}' \

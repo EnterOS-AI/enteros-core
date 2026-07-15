@@ -1117,9 +1117,18 @@ func expectExecuteDelegationFailed(mock sqlmock.Sqlmock) {
 		WithArgs("failed", sqlmock.AnyArg(), testDeliverySourceID, testDeliveryDelegationID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// INSERT activity_logs for delegation failure ('failed' is a SQL literal, not a param)
+	// INSERT activity_logs for delegation failure ('failed' is a SQL literal, not a param).
+	//
+	// The last arg is asserted CONCRETELY, not as AnyArg: this is the
+	// target-unreachable path, and it used to write NO response_body at all —
+	// so response_body->>'delegation_id' was NULL on precisely the delegation
+	// you most need to correlate. Anything asking "did this ever get a reply?"
+	// answered "no, forever" for it, which is how a wedged target became
+	// invisible (#4314). If the correlation payload regresses to NULL, this
+	// must go red — a sixth AnyArg() would have accepted the bug back.
 	mock.ExpectExec("INSERT INTO activity_logs").
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			`{"delegation_id":"`+testDeliveryDelegationID+`"}`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 

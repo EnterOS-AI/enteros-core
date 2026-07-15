@@ -182,10 +182,10 @@ type githubPRReviewCommentEvent struct {
 // handful that tell DevOps "which CI job failed, where, and how to get there."
 type githubWorkflowRun struct {
 	ID         int64  `json:"id"`
-	Name       string `json:"name"`         // workflow name, e.g. "CI"
-	Event      string `json:"event"`        // push / pull_request / etc.
-	Status     string `json:"status"`       // queued / in_progress / completed
-	Conclusion string `json:"conclusion"`   // success / failure / cancelled / timed_out
+	Name       string `json:"name"`       // workflow name, e.g. "CI"
+	Event      string `json:"event"`      // push / pull_request / etc.
+	Status     string `json:"status"`     // queued / in_progress / completed
+	Conclusion string `json:"conclusion"` // success / failure / cancelled / timed_out
 	HeadBranch string `json:"head_branch"`
 	HeadSHA    string `json:"head_sha"`
 	HTMLURL    string `json:"html_url"`
@@ -283,20 +283,20 @@ func buildGitHubA2APayload(eventType, deliveryID string, rawBody []byte) (string
 			payload.WorkflowRun.HTMLURL,
 		)
 		return payload.WorkspaceID, newGitHubMessagePayload(text, map[string]interface{}{
-			"source":         "github",
-			"event":          eventType,
-			"action":         payload.Action,
-			"delivery_id":    deliveryID,
-			"repository":     payload.Repository.FullName,
-			"sender":         payload.Sender.Login,
-			"workflow_name":  payload.WorkflowRun.Name,
-			"run_id":         payload.WorkflowRun.ID,
-			"run_number":     payload.WorkflowRun.RunNumber,
-			"conclusion":     payload.WorkflowRun.Conclusion,
-			"head_branch":    payload.WorkflowRun.HeadBranch,
-			"head_sha":       payload.WorkflowRun.HeadSHA,
-			"run_url":        payload.WorkflowRun.HTMLURL,
-			"trigger_event":  payload.WorkflowRun.Event,
+			"source":        "github",
+			"event":         eventType,
+			"action":        payload.Action,
+			"delivery_id":   deliveryID,
+			"repository":    payload.Repository.FullName,
+			"sender":        payload.Sender.Login,
+			"workflow_name": payload.WorkflowRun.Name,
+			"run_id":        payload.WorkflowRun.ID,
+			"run_number":    payload.WorkflowRun.RunNumber,
+			"conclusion":    payload.WorkflowRun.Conclusion,
+			"head_branch":   payload.WorkflowRun.HeadBranch,
+			"head_sha":      payload.WorkflowRun.HeadSHA,
+			"run_url":       payload.WorkflowRun.HTMLURL,
+			"trigger_event": payload.WorkflowRun.Event,
 		}), nil
 	default:
 		return "", nil, errUnsupportedGitHubEvent

@@ -7,11 +7,10 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
 )
 
-// SanitizeFilename mirrors workspace/internal_chat_uploads.py's
-// sanitize_filename. Drift between the two means canvas-emitted URIs
-// differ between push and poll paths for the same upload — pin every
-// case the Python suite pins (workspace/tests/test_internal_chat_uploads.py
-// :: test_sanitize_filename).
+// SanitizeFilename mirrors the standalone runtime's
+// molecule_runtime/internal_chat_uploads.py sanitizer. Drift between the two
+// means canvas-emitted URIs differ between push and poll paths for the same
+// upload. These fixtures pin Core's side of that cross-repository contract.
 
 func TestSanitizeFilename_StripsPathTraversal(t *testing.T) {
 	cases := map[string]string{
@@ -29,10 +28,10 @@ func TestSanitizeFilename_StripsPathTraversal(t *testing.T) {
 
 func TestSanitizeFilename_ReplacesUnsafeChars(t *testing.T) {
 	cases := map[string]string{
-		"hello world.pdf":     "hello_world.pdf",
-		"weird;chars!?.txt":   "weird_chars__.txt",
-		"中文.docx":             "__.docx", // non-ASCII → underscore (each rune)
-		"file (1).pdf":        "file__1_.pdf",
+		"hello world.pdf":   "hello_world.pdf",
+		"weird;chars!?.txt": "weird_chars__.txt",
+		"中文.docx":           "__.docx", // non-ASCII → underscore (each rune)
+		"file (1).pdf":      "file__1_.pdf",
 	}
 	for in, want := range cases {
 		if got := handlers.SanitizeFilename(in); got != want {

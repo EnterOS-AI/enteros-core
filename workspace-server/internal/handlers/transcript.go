@@ -109,9 +109,9 @@ func NewTranscriptHandler() *TranscriptHandler {
 // without needing to spin up an http.Transport.
 func safeDialer() *net.Dialer {
 	return &net.Dialer{
-		Timeout:    10 * time.Second,
-		KeepAlive:  30 * time.Second,
-		Control:    safeDialControl,
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   safeDialControl,
 	}
 }
 
@@ -187,8 +187,8 @@ func safeDialControl(network, address string, _ syscall.RawConn) error {
 // so it propagates out of DialContext as the dial error — the
 // http.Client surfaces it to the caller.
 type ssrfDialError struct {
-	ip     net.IP   // set when the IP is known (blocked-IP case)
-	host   string   // set when the hostname couldn't be resolved (LookupIP error / empty)
+	ip     net.IP // set when the IP is known (blocked-IP case)
+	host   string // set when the hostname couldn't be resolved (LookupIP error / empty)
 	reason error
 }
 
@@ -292,4 +292,3 @@ func (h *TranscriptHandler) Get(c *gin.Context) {
 	}
 	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
 }
-

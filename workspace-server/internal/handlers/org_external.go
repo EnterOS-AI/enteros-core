@@ -436,4 +436,3 @@ func redactToken(s string) string {
 	}
 	return strings.ReplaceAll(s, token, "<redacted-token>")
 }
-
