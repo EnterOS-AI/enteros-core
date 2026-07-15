@@ -51,4 +51,18 @@ describe("fulfillStagingFetchedResponse", () => {
       fulfillStagingFetchedResponse(route, response),
     ).rejects.toBe(other);
   });
+
+  it.each([
+    "proxy: route.fulfill: Fetch response has been disposed",
+    "route.fulfill: Fetch response has been disposed after retry",
+    "proxy: route.fulfill: Target page, context or browser has been closed",
+    "route.fulfill: Target page, context or browser has been closed during retry",
+  ])("rethrows a near-match instead of substring-swallowing it: %s", async (message) => {
+    const nearMatch = new Error(message);
+    const { route, response } = fixtures(nearMatch);
+
+    await expect(
+      fulfillStagingFetchedResponse(route, response),
+    ).rejects.toBe(nearMatch);
+  });
 });

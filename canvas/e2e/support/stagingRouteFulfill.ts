@@ -19,8 +19,9 @@ export async function fulfillStagingFetchedResponse(
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
     const isTeardownRace =
-      message.includes("Fetch response has been disposed") ||
-      message.includes("Target page, context or browser has been closed");
+      message === "route.fulfill: Fetch response has been disposed" ||
+      message ===
+        "route.fulfill: Target page, context or browser has been closed";
     if (isTeardownRace) return;
     throw error;
   }
