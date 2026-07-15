@@ -671,6 +671,54 @@ def _compile_gitea_glob(pattern: str) -> re.Pattern[str]:
     """
     pos = 0
 
+    # Gitea hands glob escapes to Go's regexp compiler. Python's regexp
+    # escape language is not the same: for example, Python accepts ``\u0061``
+    # where Go rejects it, Python may parse ``\1`` as a backreference, and
+    # Python's Unicode ``\w`` is wider than Go/RE2's ASCII class. Translate a
+    # deliberately conservative common subset and reject every other
+    # alphanumeric escape. An unsupported policy must block merging rather
+    # than be interpreted differently from branch protection.
+    regexp_classes = {
+        "d": "[0-9]",
+        "D": "[^0-9]",
+        "s": r"[\t\n\f\r ]",
+        "S": r"[^\t\n\f\r ]",
+        "w": "[0-9A-Za-z_]",
+        "W": "[^0-9A-Za-z_]",
+    }
+    class_fragments = {
+        "d": "0-9",
+        "s": r"\t\n\f\r ",
+        "w": "0-9A-Za-z_",
+    }
+    control_escapes = frozenset("aftnrv")
+
+    def compile_escape(*, in_character_class: bool) -> str:
+        nonlocal pos
+        if pos >= len(pattern):
+            raise GiteaGlobCompileError("no character to escape")
+
+        escaped = pattern[pos]
+        pos += 1
+        if escaped in control_escapes:
+            return "\\" + escaped
+        if in_character_class and escaped in class_fragments:
+            return class_fragments[escaped]
+        if not in_character_class and escaped in regexp_classes:
+            return regexp_classes[escaped]
+
+        # Go/RE2 accepts an escaped ASCII punctuation character as that
+        # literal character. Re-escape it for Python instead of passing the
+        # raw sequence through (whose meaning may differ).
+        if (
+            escaped.isascii()
+            and 0x20 <= ord(escaped) <= 0x7E
+            and not escaped.isalnum()
+        ):
+            return re.escape(escaped)
+
+        raise GiteaGlobCompileError(f"unsupported regexp escape \\{escaped}")
+
     def compile_chars() -> str:
         nonlocal pos
         result = ""
@@ -685,11 +733,7 @@ def _compile_gitea_glob(pattern: str) -> re.Pattern[str]:
             if c == "\\":
                 if pos >= len(pattern):
                     raise GiteaGlobCompileError("unterminated character class escape")
-                # Gitea passes the escape through to Go's regexp compiler.
-                # Preserve that behavior so unsupported escapes fail compile
-                # instead of silently becoming a different literal pattern.
-                result += "\\" + pattern[pos]
-                pos += 1
+                result += compile_escape(in_character_class=True)
             else:
                 result += c
         raise GiteaGlobCompileError("unterminated character class")
@@ -717,10 +761,7 @@ def _compile_gitea_glob(pattern: str) -> re.Pattern[str]:
             elif c == "," and subpattern:
                 result += "|"
             elif c == "\\":
-                if pos >= len(pattern):
-                    raise GiteaGlobCompileError("no character to escape")
-                result += "\\" + pattern[pos]
-                pos += 1
+                result += compile_escape(in_character_class=False)
             else:
                 result += re.escape(c)
         # This intentionally mirrors Gitea's compiler: an opening brace that
@@ -728,7 +769,7 @@ def _compile_gitea_glob(pattern: str) -> re.Pattern[str]:
         return result
 
     try:
-        return re.compile(r"\A" + compile_part(False) + r"\Z")
+        return re.compile(r"\A" + compile_part(False) + r"\Z", re.ASCII)
     except re.error as exc:
         raise GiteaGlobCompileError(str(exc)) from exc
 

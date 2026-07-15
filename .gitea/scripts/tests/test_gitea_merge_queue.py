@@ -290,6 +290,15 @@ def test_literal_context_path_is_unchanged_by_glob_generalization():
         ("{CI,E2E} / *", "E2E / smoke", True),
         (r"CI / literal\*", "CI / literal*", True),
         (r"CI / literal\*", "CI / literal-job", False),
+        (r"CI / literal\+", "CI / literal+", True),
+        (r"CI / \w", "CI / Z", True),
+        (r"CI / \w", "CI / é", False),
+        (r"CI / \s", "CI /  ", True),
+        # Go/RE2's ASCII \s omits vertical tab; Python's does not, even with
+        # re.ASCII. Keep this regression explicit so the translation cannot
+        # silently widen the server's match set.
+        (r"CI / \s", "CI / \v", False),
+        (r"CI / \t", "CI / \t", True),
         ("CI / job?", "CI / job1", True),
         ("CI / job?", "CI / job12", False),
     ],
@@ -312,7 +321,19 @@ def test_gitea_glob_semantics_match_server_patterns(pattern, context, matches):
 
 @pytest.mark.parametrize(
     "pattern",
-    ["CI / [unterminated", "CI / trailing\\", r"CI / invalid\q"],
+    [
+        "CI / [unterminated",
+        "CI / trailing\\",
+        r"CI / invalid\q",
+        # Python accepts this as a Unicode escape while Go's regexp compiler
+        # rejects it. Treating it as valid would make the queue enforce a
+        # different policy from Gitea branch protection.
+        r"CI / \u0061*",
+        # Python interprets \1 as a backreference in this brace alternative;
+        # Go treats numeric escapes differently. Reject the ambiguous surface
+        # instead of compiling a policy with different semantics.
+        r"{CI,\1} / *",
+    ],
 )
 def test_invalid_gitea_glob_fails_closed(pattern):
     latest = {"CI / all-required": {"status": "success"}}
