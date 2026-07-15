@@ -1,332 +1,390 @@
 #!/usr/bin/env bash
-# cp#455 — Minimal-cell boot-to-registration harness.
-# CTO directive 14eb4f07: "build the minimal claude-code+kimi cell,
-# it should now go GREEN since the fix is live."
+# Minimal staging boot-to-registration cell.
 #
-# Stage 1 of 5-stage rollout. Reduced to the minimum boot-to-
-# registration surface so each cell run is ~3-5 min wall-clock.
+# Four load-bearing assertions:
+#   1. The current strict admin API accepts a fresh molecules-server org and the
+#      tenant reaches instance_status=running.
+#   2. The auto-installed platform root appears online with a routable URL and a
+#      heartbeat through the tenant workspace API. That is the externally
+#      observable result of the runtime's register + heartbeat path.
+#   3. A real A2A message/send turn returns the deterministic token PINEAPPLE;
+#      text-shaped runtime errors do not count as completion.
+#   4. The EXIT trap confirms the admin purge and verifies the org is absent.
 #
-# Four assertions (per Researcher Task #79 spec):
-#   1. Provision request accepted; workspace transitions to booting/running
-#   2. Controlplane receives /registry/register for that workspace_id
-#   3. JSON-RPC/completion route returns successful minimal response
-#   4. Teardown terminates workspace even on failure (trap)
-#
-# Cost controls (mandatory):
-#   - SPOT instances (via the dispatch-only EC2 provisioning path;
-#     we don't set instance type — that's the provisioner's call)
-#   - Fast teardown ~3-5 min wall-clock
-#   - Structured per-cell results JSON output
-#
-# Auth model (mirrors test_staging_full_saas.sh):
-#   Single MOLECULE_ADMIN_TOKEN drives everything.
-#     - POST /cp/admin/orgs to provision
-#     - GET  /cp/admin/orgs/:slug/admin-token for per-tenant token
-#     - DELETE /cp/admin/tenants/:slug for teardown
-#   Per-tenant admin token drives tenant API calls (workspaces,
-#   /registry/register, JSON-RPC completion).
-#
-# Required env:
-#   MOLECULE_CP_URL        default: https://staging-api.moleculesai.app
-#   MOLECULE_ADMIN_TOKEN   CP admin bearer
-#
-# Optional env (passed from workflow_dispatch inputs):
-#   E2E_RUNTIME            default claude-code
-#   E2E_BILLING_MODE       default platform_managed
-#   E2E_PROVIDER           default platform
-#   E2E_MODEL              default: SSOT (MOLECULE_LLM_DEFAULT_MODEL) else minimax/MiniMax-M2.7
-#   E2E_RUN_ID             Slug suffix; CI: cp455-${GITHUB_RUN_ID}
-#   E2E_PROVISION_TIMEOUT_SECS  default 300 (5 min — fast teardown budget)
-#   E2E_KEEP_ORG           1 → skip teardown (debugging only)
-#
-# Exit codes:
-#   0  happy path
-#   1  generic failure
-#   2  missing required env
-#   3  provisioning timed out (assertion 1)
-#   4  register timeout (assertion 2)
-#   5  completion failure (assertion 3)
-#   6  teardown left orphan (assertion 4)
+# Org creation intentionally sends only the current control-plane contract:
+# slug, name, owner_user_id, and provider. Runtime/model/billing are deployment
+# defaults, fetched by the workflow from Infisical and verified by the live cell;
+# they are not valid POST /cp/admin/orgs request fields.
 
 set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/collision-proof-slug.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/collision-proof-slug.sh"
+# shellcheck source=lib/completion_assert.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/completion_assert.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 RUNTIME="${E2E_RUNTIME:-claude-code}"
 BILLING_MODE="${E2E_BILLING_MODE:-platform_managed}"
-PROVIDER="${E2E_PROVIDER:-platform}"
-# Platform default model: prefer the explicit E2E_MODEL (injected by the workflow
-# from the Infisical SSOT MOLECULE_LLM_DEFAULT_MODEL), else the SSOT env directly,
-# else the current SSOT value — never a hardcoded moonshot vendor const.
+PROVIDER="${E2E_PROVIDER:-molecules-server}"
 MODEL="${E2E_MODEL:-${MOLECULE_LLM_DEFAULT_MODEL:-minimax/MiniMax-M2.7}}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}"
+REGISTER_TIMEOUT_SECS="${E2E_REGISTER_TIMEOUT_SECS:-180}"
+A2A_TIMEOUT_SECS="${E2E_A2A_TIMEOUT_SECS:-120}"
 KEEP_ORG="${E2E_KEEP_ORG:-}"
-RUN_ID_SUFFIX="${E2E_RUN_ID:-$(date +%H%M%S)-$$}"
 
-# log/fail/ok MUST be defined BEFORE the assert_collision_proof_slug call
-# below (which uses `|| fail "..."`). Defining them after the call would
-# error on a bad slug with `fail: command not found` instead of the
-# intended diagnostic. Mirrors the order in test_staging_full_saas.sh.
+CURL_COMMON=(-sS -A curl/8.4.0 --max-time 30)
+
+FAIL_CODE=1
+EXIT_CODE=0
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
-fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
+fail() {
+  local code="${FAIL_CODE:-1}"
+  EXIT_CODE="$code"
+  echo "[$(date +%H:%M:%S)] ❌ $*" >&2
+  exit "$code"
+}
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
-# Collision-proof slug (core#2782). The prior `cp455-${RUNTIME}-$RUN_ID_SUFFIX`
-# shape used a raw timestamp tail and could collide between two CI
-# runs (e.g. retry of run 3606 + fresh run 3607) on POST
-# /cp/admin/orgs 409. Migrating to the shared helper appends an 8-char
-# uuid so every run gets a unique slug regardless of how the workflow
-# composes E2E_RUN_ID. The literal `cp455-` prefix is preserved
-# (semantic — cp issue #455) — the sweeper doesn't cover this prefix
-# but the EXIT trap at `on_exit` handles teardown, so no orphan risk.
-# Note: this file is NOT covered by lint_cleanup_traps.sh's
-# `test_*staging*` glob, so the e2e-/rt-e2e- prefix rule doesn't
-# apply here. The sweeper only reaps e2e-*/rt-e2e-* anyway.
-# shellcheck source=lib/collision-proof-slug.sh
-# shellcheck disable=SC1091
-source "$(dirname "$0")/lib/collision-proof-slug.sh"
-# Compute the prefix length dynamically: "cp455-" (6 chars) +
-# RUNTIME length. RUNTIME is set by the harness to one of the
-# known runtime names (claude-code, codex, hermes, openclaw),
-# so the prefix is bounded.
+# Preserve the historical cp455 identifier while retaining the mandatory
+# collision-proof UUID suffix under the control-plane's 32-character slug cap.
 SLUG_PREFIX="cp455-${RUNTIME}-"
 SLUG="${SLUG_PREFIX}$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" ${#SLUG_PREFIX})"
-assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: produced non-collision-proof slug '$SLUG'"
+assert_collision_proof_slug "$SLUG" || fail "collision-proof helper produced invalid slug '$SLUG'"
 
 WORKSPACE_ID=""
+ORG_ID=""
 TENANT_TOKEN=""
+TENANT_URL=""
 RESULT_JSON="/tmp/cell-result.json"
-PROVISION_START_EPOCH=""
-PROVISION_END_EPOCH=""
+PROVISION_BODY="/tmp/cell-provision-${SLUG}.json"
+A2A_BODY="/tmp/cell-a2a-${SLUG}.json"
+A2A_QUEUE_BODY="/tmp/cell-a2a-queue-${SLUG}.json"
+PROVISION_START_EPOCH="$(date +%s)"
 REGISTER_STATUS="not_attempted"
 COMPLETION_STATUS="not_attempted"
 TEARDOWN_STATUS="not_attempted"
-EXIT_CODE=0
 
-# Structured per-cell results writer. Emits JSON with all 4
-# assertion statuses + elapsed timing. Called from EXIT trap so
-# results are captured even on early failure.
 write_result() {
   local elapsed="${1:-0}"
-  cat > "${RESULT_JSON}" <<JSON
-{
-  "runtime": "${RUNTIME}",
-  "billing_mode": "${BILLING_MODE}",
-  "provider": "${PROVIDER}",
-  "model": "${MODEL}",
-  "workspace_id": "${WORKSPACE_ID}",
-  "register_status": "${REGISTER_STATUS}",
-  "completion_status": "${COMPLETION_STATUS}",
-  "teardown_status": "${TEARDOWN_STATUS}",
-  "elapsed_seconds": ${elapsed},
-  "exit_code": ${EXIT_CODE},
-  "ts": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-JSON
+  python3 - "$RESULT_JSON" "$RUNTIME" "$BILLING_MODE" "$PROVIDER" "$MODEL" \
+    "$WORKSPACE_ID" "$REGISTER_STATUS" "$COMPLETION_STATUS" \
+    "$TEARDOWN_STATUS" "$elapsed" "$EXIT_CODE" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+
+path, runtime, billing, provider, model, workspace, registered, completion, teardown, elapsed, code = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump({
+        "runtime": runtime,
+        "billing_mode": billing,
+        "provider": provider,
+        "model": model,
+        "workspace_id": workspace,
+        "register_status": registered,
+        "completion_status": completion,
+        "teardown_status": teardown,
+        "elapsed_seconds": int(elapsed),
+        "exit_code": int(code),
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }, fh, indent=2)
+    fh.write("\n")
+PY
 }
 
-# EXIT trap — ALWAYS run. Writes structured results, tears down
-# workspace if we have one, never lets the script exit without
-# emitting /tmp/cell-result.json.
+org_present_count() {
+  curl "${CURL_COMMON[@]}" "$CP_URL/cp/admin/orgs?limit=500" \
+    -H "Authorization: Bearer ${ADMIN_TOKEN}" 2>/dev/null \
+    | SLUG="$SLUG" python3 -c '
+import json, os, sys
+try:
+    rows = json.load(sys.stdin).get("orgs", [])
+except Exception:
+    print(1); raise SystemExit
+slug = os.environ["SLUG"]
+print(sum(1 for row in rows if row.get("slug") == slug and row.get("status") != "purged" and row.get("instance_status") != "purged"))
+' 2>/dev/null || echo 1
+}
+
 on_exit() {
-  local exit_code=$?
-  EXIT_CODE=${exit_code}
-  local now
-  now=$(date +%s)
-  local elapsed=0
-  if [ -n "${PROVISION_START_EPOCH:-}" ] && [ "${PROVISION_START_EPOCH}" -gt 0 ] 2>/dev/null; then
-    elapsed=$(( now - PROVISION_START_EPOCH ))
-  fi
+  local entry_code=$?
+  EXIT_CODE="$entry_code"
+  local elapsed=$(( $(date +%s) - PROVISION_START_EPOCH ))
 
-  # Assertion 4: teardown terminates workspace even on failure.
-  if [ -z "${KEEP_ORG}" ] && [ -n "${SLUG:-}" ]; then
-    if [ -n "${WORKSPACE_ID:-}" ] || [ -n "${SLUG:-}" ]; then
-      echo "::group::Teardown (trap)"
-      echo "DELETE ${CP_URL}/cp/admin/tenants/${SLUG}"
-      local teardown_http_code
-      teardown_http_code=$(curl -sS -o /dev/null -w '%{http_code}' \
-        -X DELETE \
-        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-        --max-time 60 \
-        "${CP_URL}/cp/admin/tenants/${SLUG}" || echo "000")
-      if [ "${teardown_http_code}" = "200" ] || [ "${teardown_http_code}" = "204" ] || [ "${teardown_http_code}" = "404" ]; then
-        TEARDOWN_STATUS="ok"
-        echo "Teardown OK (HTTP ${teardown_http_code})"
-      else
-        TEARDOWN_STATUS="leak_risk_http_${teardown_http_code}"
-        echo "::error::Teardown returned HTTP ${teardown_http_code} — orphan risk"
-        # Bump exit code to 6 if teardown is the failure source.
-        if [ "${EXIT_CODE}" -eq 0 ]; then
-          EXIT_CODE=6
-        fi
-      fi
-      echo "::endgroup::"
-    fi
-  else
+  if [ -n "$KEEP_ORG" ]; then
     TEARDOWN_STATUS="skipped_keep_org"
+  else
+    echo "::group::Teardown (trap)"
+    local teardown_code
+    teardown_code=$(curl "${CURL_COMMON[@]}" --max-time 120 \
+      -X DELETE -o /dev/null -w '%{http_code}' \
+      -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "{\"confirm\":\"${SLUG}\"}" \
+      "$CP_URL/cp/admin/tenants/$SLUG" 2>/dev/null || echo 000)
+    log "DELETE /cp/admin/tenants/$SLUG -> HTTP $teardown_code"
+
+    local remaining=1 waited=0
+    while [ "$waited" -lt 60 ]; do
+      remaining=$(org_present_count)
+      [ "$remaining" = "0" ] && break
+      sleep 5
+      waited=$((waited + 5))
+    done
+    if [ "$remaining" = "0" ]; then
+      TEARDOWN_STATUS="ok"
+      ok "Teardown verified: org absent after ${waited}s"
+    else
+      TEARDOWN_STATUS="leak_risk_org_present"
+      EXIT_CODE=6
+      echo "::error::org $SLUG is still present after teardown (${waited}s); leak risk"
+    fi
+    echo "::endgroup::"
   fi
 
-  write_result "${elapsed}"
-  echo "Structured results written to ${RESULT_JSON}"
-  cat "${RESULT_JSON}"
-  exit "${EXIT_CODE}"
+  write_result "$elapsed"
+  echo "Structured results written to $RESULT_JSON"
+  python3 -m json.tool "$RESULT_JSON" 2>/dev/null || true
+  rm -f "$PROVISION_BODY" "$A2A_BODY" "$A2A_QUEUE_BODY"
+  trap - EXIT
+  exit "$EXIT_CODE"
 }
 trap on_exit EXIT
 trap 'echo "::error::Script aborted on signal"; exit 130' INT TERM
 
-PROVISION_START_EPOCH=$(date +%s)
-
-# Assertion 1: Provision request accepted; workspace transitions to
-# booting/running.
-echo "::group::Assertion 1: Provision"
-echo "POST ${CP_URL}/cp/admin/orgs  slug=${SLUG}  runtime=${RUNTIME}  billing_mode=${BILLING_MODE}  provider=${PROVIDER}  model=${MODEL}"
-PROVISION_HTTP_CODE=$(curl -sS -o /tmp/provision-resp.json -w '%{http_code}' \
-  -X POST \
-  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-  -H "Content-Type: application/json" \
-  --max-time 30 \
-  -d "$(cat <<JSON
-{
-  "slug": "${SLUG}",
-  "runtime": "${RUNTIME}",
-  "billing_mode": "${BILLING_MODE}",
-  "provider": "${PROVIDER}",
-  "model": "${MODEL}",
-  "tier": "spot",
-  "tags": {
-    "cp455_minimal_cell": "1",
-    "run_id": "${RUN_ID_SUFFIX}"
-  }
+admin_call() {
+  local method="$1" route="$2"
+  shift 2
+  curl "${CURL_COMMON[@]}" -X "$method" "$CP_URL$route" \
+    -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+    -H "Content-Type: application/json" "$@"
 }
-JSON
-)" \
-  "${CP_URL}/cp/admin/orgs" || echo "000")
-echo "HTTP ${PROVISION_HTTP_CODE}"
-if [ "${PROVISION_HTTP_CODE}" != "202" ] && [ "${PROVISION_HTTP_CODE}" != "200" ]; then
-  echo "::error::Provision failed (HTTP ${PROVISION_HTTP_CODE})"
-  cat /tmp/provision-resp.json 2>/dev/null || true
-  EXIT_CODE=1
-  exit "${EXIT_CODE}"
+
+tenant_call() {
+  local method="$1" route="$2"
+  shift 2
+  curl "${CURL_COMMON[@]}" -X "$method" "$TENANT_URL$route" \
+    -H "Authorization: Bearer ${TENANT_TOKEN}" \
+    -H "X-Molecule-Org-Id: ${ORG_ID}" \
+    -H "Origin: ${TENANT_URL}" "$@"
+}
+
+safe_body_preview() {
+  local value="$1" limit="${2:-400}"
+  { printf '%s' "$value" | redact_secrets | head -c "$limit"; } || true
+}
+
+a2a_queue_id_from_response() {
+  python3 -c '
+import json, sys
+try: doc = json.load(sys.stdin)
+except Exception: raise SystemExit
+queued = doc.get("queued") is True or str(doc.get("status") or "").lower() == "queued"
+qid = doc.get("queue_id") or ""
+if queued and isinstance(qid, str): print(qid)
+' 2>/dev/null
+}
+
+poll_a2a_queue_result() {
+  local deadline=$(( $(date +%s) + A2A_TIMEOUT_SECS ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local code resp status
+    code=$(tenant_call GET "/workspaces/${WORKSPACE_ID}/a2a/queue/${QUEUE_ID}" \
+      --max-time 30 -H "X-Workspace-ID: ${WORKSPACE_ID}" \
+      -o "$A2A_QUEUE_BODY" -w '%{http_code}' 2>/dev/null || echo 000)
+    resp=$(cat "$A2A_QUEUE_BODY" 2>/dev/null || echo "")
+    if [ "$code" = "200" ]; then
+      status=$(printf '%s' "$resp" | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin).get("status", ""))
+except Exception: print("")
+' 2>/dev/null || echo "")
+      case "$status" in
+        completed)
+          printf '%s' "$resp" | python3 -c '
+import json, sys
+try: body = json.load(sys.stdin).get("response_body")
+except Exception: raise SystemExit(1)
+if body is None: raise SystemExit(1)
+print(json.dumps(body))
+' >"$A2A_BODY" || fail "completed queue item omitted response_body"
+          return 0
+          ;;
+        failed|dropped) fail "A2A queue item $QUEUE_ID ended $status: $(safe_body_preview "$resp")" ;;
+        queued|dispatched|in_progress|"") ;;
+        *) fail "A2A queue item $QUEUE_ID returned unexpected status '$status'" ;;
+      esac
+    elif [ "$code" != "404" ] && [ "$code" != "000" ]; then
+      fail "A2A queue poll returned HTTP $code: $(safe_body_preview "$resp")"
+    fi
+    sleep 2
+  done
+  fail "A2A queue item $QUEUE_ID did not complete within ${A2A_TIMEOUT_SECS}s"
+}
+
+# Assertion 1: Provision through the current strict admin API.
+echo "::group::Assertion 1: provision current admin contract"
+log "POST $CP_URL/cp/admin/orgs slug=$SLUG provider=$PROVIDER"
+PROVISION_PAYLOAD=$(python3 - "$SLUG" "$PROVIDER" <<'PY'
+import json, sys
+slug, provider = sys.argv[1:]
+print(json.dumps({
+    "slug": slug,
+    "name": f"E2E {slug}",
+    "owner_user_id": f"e2e-runner:{slug}",
+    "provider": provider,
+}))
+PY
+)
+PROVISION_HTTP_CODE=$(admin_call POST /cp/admin/orgs -d "$PROVISION_PAYLOAD" \
+  -o "$PROVISION_BODY" -w '%{http_code}' 2>/dev/null || echo 000)
+PROVISION_RESP=$(cat "$PROVISION_BODY" 2>/dev/null || echo "")
+if ! [[ "$PROVISION_HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
+  fail "org create failed HTTP $PROVISION_HTTP_CODE: $(safe_body_preview "$PROVISION_RESP")"
 fi
+ORG_ID=$(printf '%s' "$PROVISION_RESP" | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin).get("id", ""))
+except Exception: print("")
+' 2>/dev/null || echo "")
+[ -n "$ORG_ID" ] || fail "org create response missing id: $(safe_body_preview "$PROVISION_RESP")"
+
+deadline=$(( $(date +%s) + PROVISION_TIMEOUT_SECS ))
+LAST_STATUS=""
+STATUS=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  LIST_JSON=$(admin_call GET '/cp/admin/orgs?limit=500' 2>/dev/null || echo '{"orgs":[]}')
+  STATUS=$(printf '%s' "$LIST_JSON" | SLUG="$SLUG" python3 -c '
+import json, os, sys
+try: rows = json.load(sys.stdin).get("orgs", [])
+except Exception: rows = []
+slug = os.environ["SLUG"]
+print(next((row.get("instance_status", "") for row in rows if row.get("slug") == slug), ""))
+' 2>/dev/null || echo "")
+  if [ "$STATUS" != "$LAST_STATUS" ]; then log "instance_status -> ${STATUS:-<none>}"; LAST_STATUS="$STATUS"; fi
+  case "$STATUS" in
+    running) break ;;
+    failed) fail "tenant provisioning failed: $(safe_body_preview "$LIST_JSON")" ;;
+  esac
+  sleep 5
+done
+[ "$STATUS" = "running" ] || { FAIL_CODE=3; fail "tenant did not reach running within ${PROVISION_TIMEOUT_SECS}s"; }
+ok "Tenant provisioned (org_id=$ORG_ID)"
 echo "::endgroup::"
 
-# Wait for org to reach running + retrieve per-tenant token. Bounded
-# at PROVISION_TIMEOUT_SECS. We poll the admin token endpoint; once
-# the org is up, the endpoint returns 200 with the token, and the
-# workspace_id is in the same response or in a follow-up /orgs/:slug
-# call.
-echo "::group::Wait for org to be ready (max ${PROVISION_TIMEOUT_SECS}s)"
-WAIT_START=$(date +%s)
-WAIT_DEADLINE=$(( WAIT_START + PROVISION_TIMEOUT_SECS ))
-TENANT_TOKEN=""
-while [ "$(date +%s)" -lt "${WAIT_DEADLINE}" ]; do
-  TOKEN_HTTP_CODE=$(curl -sS -o /tmp/token-resp.json -w '%{http_code}' \
-    -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-    --max-time 10 \
-    "${CP_URL}/cp/admin/orgs/${SLUG}/admin-token" || echo "000")
-  if [ "${TOKEN_HTTP_CODE}" = "200" ]; then
-    TENANT_TOKEN=$(jq -r '.admin_token // .token // empty' /tmp/token-resp.json 2>/dev/null || echo "")
-    if [ -n "${TENANT_TOKEN}" ]; then
-      WORKSPACE_ID=$(jq -r '.workspace_id // .default_workspace_id // empty' /tmp/token-resp.json 2>/dev/null || echo "")
-      if [ -z "${WORKSPACE_ID}" ]; then
-        # Fallback: list orgs and find by slug
-        WORKSPACE_ID=$(curl -sS -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-          "${CP_URL}/cp/admin/orgs/${SLUG}" | jq -r '.workspace_id // .default_workspace_id // empty' 2>/dev/null || echo "")
-      fi
-      if [ -n "${WORKSPACE_ID}" ]; then
-        PROVISION_END_EPOCH=$(date +%s)
-        echo "Org ready in $(( PROVISION_END_EPOCH - WAIT_START ))s — workspace_id=${WORKSPACE_ID}"
-        break
-      fi
+# Current tenant URL and auth are separate from the control-plane admin API.
+CP_HOST="${CP_URL#*://}"
+CP_HOST="${CP_HOST%%/*}"
+case "$CP_HOST" in
+  staging-api.*) TENANT_DOMAIN="staging.${CP_HOST#staging-api.}" ;;
+  api.*) TENANT_DOMAIN="${CP_HOST#api.}" ;;
+  *) TENANT_DOMAIN="$CP_HOST" ;;
+esac
+TENANT_URL="${MOLECULE_TENANT_URL:-https://${SLUG}.${TENANT_DOMAIN}}"
+TOKEN_RESP=$(admin_call GET "/cp/admin/orgs/$SLUG/admin-token" 2>/dev/null || echo '{}')
+TENANT_TOKEN=$(printf '%s' "$TOKEN_RESP" | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin).get("admin_token", ""))
+except Exception: print("")
+' 2>/dev/null || echo "")
+[ -n "$TENANT_TOKEN" ] || fail "admin-token response omitted admin_token"
+
+# Assertion 2: the platform root must have registered and be heartbeat-online.
+echo "::group::Assertion 2: platform root registered and online"
+deadline=$(( $(date +%s) + REGISTER_TIMEOUT_SECS ))
+LAST_WORKSPACE_STATUS=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  WS_CODE=$(tenant_call GET /workspaces -o "$A2A_QUEUE_BODY" -w '%{http_code}' 2>/dev/null || echo 000)
+  WS_LIST=$(cat "$A2A_QUEUE_BODY" 2>/dev/null || echo '[]')
+  if [ "$WS_CODE" = "200" ]; then
+    WORKSPACE_ID=$(printf '%s' "$WS_LIST" | python3 -c '
+import json, sys
+try: rows = json.load(sys.stdin)
+except Exception: rows = []
+for row in rows if isinstance(rows, list) else []:
+    if row.get("kind") == "platform" and not row.get("parent_id"):
+        print(row.get("id", "")); break
+' 2>/dev/null || echo "")
+  fi
+  if [ -n "$WORKSPACE_ID" ]; then
+    WS_DETAIL=$(tenant_call GET "/workspaces/$WORKSPACE_ID" 2>/dev/null || echo '{}')
+    eval "$(printf '%s' "$WS_DETAIL" | python3 -c '
+import json, shlex, sys
+try: row = json.load(sys.stdin)
+except Exception: row = {}
+for key, field in (("WS_STATUS", "status"), ("WS_URL", "url"), ("WS_HEARTBEAT", "last_heartbeat_at"), ("WS_RUNTIME", "runtime"), ("WS_MODEL", "model")):
+    print(f"{key}={shlex.quote(str(row.get(field) or \"\"))}")
+' 2>/dev/null)"
+    if [ "${WS_STATUS:-}" != "$LAST_WORKSPACE_STATUS" ]; then
+      log "platform root -> ${WS_STATUS:-<none>}"; LAST_WORKSPACE_STATUS="${WS_STATUS:-}"
+    fi
+    if [ "${WS_STATUS:-}" = "online" ] && [ -n "${WS_URL:-}" ] && [ -n "${WS_HEARTBEAT:-}" ]; then
+      REGISTER_STATUS="ok"
+      break
     fi
   fi
   sleep 5
 done
-if [ -z "${TENANT_TOKEN}" ] || [ -z "${WORKSPACE_ID}" ]; then
-  echo "::error::Provision timed out (org never reached running within ${PROVISION_TIMEOUT_SECS}s)"
-  EXIT_CODE=3
-  exit "${EXIT_CODE}"
+if [ "$REGISTER_STATUS" != "ok" ]; then
+  FAIL_CODE=4
+  fail "platform root did not become online+routable+heartbeat-registered within ${REGISTER_TIMEOUT_SECS}s (id=${WORKSPACE_ID:-none} status=${WS_STATUS:-none})"
 fi
+if [ -n "${WS_RUNTIME:-}" ] && [ "$WS_RUNTIME" != "$RUNTIME" ]; then
+  FAIL_CODE=4
+  fail "platform root runtime=$WS_RUNTIME, expected SSOT runtime=$RUNTIME"
+fi
+ok "Registration visible through tenant API (workspace_id=$WORKSPACE_ID runtime=${WS_RUNTIME:-$RUNTIME} model=${WS_MODEL:-$MODEL})"
 echo "::endgroup::"
 
-# Assertion 2: Controlplane receives /registry/register for that
-# workspace_id. The harness doesn't POST to /registry/register
-# directly — that's the workspace-server's own job on boot. We
-# verify the registration was received by polling the registry
-# endpoint (or by checking that a /workspaces/:id call returns
-# the expected fields).
-echo "::group::Assertion 2: /registry/register for workspace_id=${WORKSPACE_ID}"
-REGISTER_DEADLINE=$(( $(date +%s) + 60 ))
-while [ "$(date +%s)" -lt "${REGISTER_DEADLINE}" ]; do
-  REG_HTTP_CODE=$(curl -sS -o /tmp/reg-resp.json -w '%{http_code}' \
-    -H "Authorization: Bearer ${TENANT_TOKEN}" \
-    --max-time 10 \
-    "${CP_URL}/cp/registry/workspaces/${WORKSPACE_ID}" || echo "000")
-  if [ "${REG_HTTP_CODE}" = "200" ]; then
-    REGISTERED=$(jq -r '.registered // .workspace_id // empty' /tmp/reg-resp.json 2>/dev/null || echo "")
-    if [ -n "${REGISTERED}" ]; then
-      REGISTER_STATUS="ok"
-      echo "Registry confirms workspace_id=${WORKSPACE_ID} registered"
-      break
-    fi
+# Assertion 3: a real, deterministic A2A completion on the current route.
+echo "::group::Assertion 3: real A2A completion"
+FAIL_CODE=5
+A2A_PAYLOAD=$(python3 -c '
+import json, uuid
+print(json.dumps({
+    "jsonrpc": "2.0",
+    "method": "message/send",
+    "id": "minimal-cell-known-answer",
+    "params": {"message": {
+        "role": "user",
+        "messageId": f"e2e-{uuid.uuid4().hex[:8]}",
+        "parts": [{"kind": "text", "text": "This is a platform wiring check. No tools or memory are needed. Reply with exactly the word PINEAPPLE and nothing else."}],
+    }},
+}))
+')
+A2A_OK=0
+for attempt in 1 2 3; do
+  A2A_CODE=$(tenant_call POST "/workspaces/${WORKSPACE_ID}/a2a" \
+    --max-time "$A2A_TIMEOUT_SECS" -H "Content-Type: application/json" \
+    -H "X-Workspace-ID: ${WORKSPACE_ID}" -d "$A2A_PAYLOAD" \
+    -o "$A2A_BODY" -w '%{http_code}' 2>/dev/null || echo 000)
+  A2A_RESP=$(cat "$A2A_BODY" 2>/dev/null || echo "")
+  if [[ "$A2A_CODE" =~ ^2[0-9][0-9]$ ]]; then A2A_OK=1; break; fi
+  if [[ "$A2A_CODE" =~ ^50[234]$ ]] && [ "$attempt" -lt 3 ]; then
+    log "A2A cold-start attempt $attempt returned HTTP $A2A_CODE; retrying"
+    sleep 5
+    continue
   fi
-  sleep 3
+  break
 done
-if [ "${REGISTER_STATUS}" != "ok" ]; then
-  echo "::error::Registry did not confirm registration within 60s"
-  cat /tmp/reg-resp.json 2>/dev/null || true
-  EXIT_CODE=4
-  exit "${EXIT_CODE}"
-fi
-echo "::endgroup::"
+[ "$A2A_OK" = "1" ] || fail "A2A POST failed HTTP $A2A_CODE: $(safe_body_preview "$A2A_RESP")"
 
-# Assertion 3: JSON-RPC/completion route returns successful minimal
-# response. One minimal completion call — keep payload small.
-echo "::group::Assertion 3: JSON-RPC completion"
-COMPLETION_HTTP_CODE=$(curl -sS -o /tmp/completion-resp.json -w '%{http_code}' \
-  -X POST \
-  -H "Authorization: Bearer ${TENANT_TOKEN}" \
-  -H "Content-Type: application/json" \
-  --max-time 30 \
-  -d "$(cat <<JSON
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "completion",
-  "params": {
-    "workspace_id": "${WORKSPACE_ID}",
-    "model": "${MODEL}",
-    "messages": [{"role": "user", "content": "ping"}],
-    "max_tokens": 1
-  }
-}
-JSON
-)" \
-  "${CP_URL}/cp/rpc" || echo "000")
-echo "HTTP ${COMPLETION_HTTP_CODE}"
-if [ "${COMPLETION_HTTP_CODE}" != "200" ]; then
-  echo "::error::Completion failed (HTTP ${COMPLETION_HTTP_CODE})"
-  cat /tmp/completion-resp.json 2>/dev/null || true
-  EXIT_CODE=5
-  exit "${EXIT_CODE}"
+QUEUE_ID=$(printf '%s' "$A2A_RESP" | a2a_queue_id_from_response || echo "")
+if [ -n "$QUEUE_ID" ]; then
+  log "A2A queued as $QUEUE_ID; polling durable result"
+  poll_a2a_queue_result
+  A2A_RESP=$(cat "$A2A_BODY" 2>/dev/null || echo "")
 fi
-# Verify JSON-RPC 2.0 success envelope
-RPC_ERROR=$(jq -r '.error // empty' /tmp/completion-resp.json 2>/dev/null || echo "")
-if [ -n "${RPC_ERROR}" ]; then
-  echo "::error::Completion returned JSON-RPC error: ${RPC_ERROR}"
-  cat /tmp/completion-resp.json 2>/dev/null || true
-  EXIT_CODE=5
-  exit "${EXIT_CODE}"
-fi
-RPC_RESULT=$(jq -r '.result // empty' /tmp/completion-resp.json 2>/dev/null || echo "")
-if [ -z "${RPC_RESULT}" ] || [ "${RPC_RESULT}" = "null" ]; then
-  echo "::error::Completion response missing result field"
-  cat /tmp/completion-resp.json 2>/dev/null || true
-  EXIT_CODE=5
-  exit "${EXIT_CODE}"
-fi
+A2A_TEXT=$(printf '%s' "$A2A_RESP" | python3 "$SCRIPT_DIR/lib/a2a_text_extract.py" 2>/dev/null || echo "")
+[ -n "$A2A_TEXT" ] || log "A2A extraction empty; response: $(safe_body_preview "$A2A_RESP")"
+a2a_assert_real_completion "$A2A_TEXT" "PINEAPPLE" "minimal boot cell"
 COMPLETION_STATUS="ok"
-echo "Completion OK"
+ok "Real A2A completion succeeded"
 echo "::endgroup::"
 
-echo "All 4 assertions passed for ${SLUG} (workspace_id=${WORKSPACE_ID})"
+FAIL_CODE=1
+ok "All four minimal-cell assertions passed for $SLUG"
