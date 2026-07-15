@@ -239,11 +239,13 @@ curl -X POST http://localhost:8080/workspaces/<target-workspace-id>/a2a \
   }'
 ```
 
-Both headers are required:
+The bearer is required. `X-Workspace-ID` is an optional, recommended source
+claim:
 
 - `Authorization: Bearer <token>` -- your workspace auth token.
 - `X-Workspace-ID: <your-id>` -- identifies which workspace is making the
-  call. The platform verifies that it matches the workspace bound to the
+  call. When omitted, the platform derives the caller from the bearer. When
+  supplied, the platform requires it to match the workspace bound to the
   bearer before enforcing communication rules.
 
 ### 6. Discover Peers
@@ -738,15 +740,15 @@ Key differences from platform-managed workspaces:
   workspace and create a new one (or wait for a future token-reset API).
 - Tokens are automatically revoked when a workspace is deleted.
 
-### Required Headers
+### Authentication Headers
 
-| Endpoint | Required Headers |
-|----------|-----------------|
-| `POST /registry/heartbeat` | `Authorization: Bearer <token>` |
-| `POST /registry/update-card` | `Authorization: Bearer <token>` |
-| `POST /workspaces/:target/a2a` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` |
-| `GET /registry/discover/:id` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` |
-| `GET /registry/:id/peers` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` |
+| Endpoint | Required Headers | Optional / Recommended Headers |
+|----------|------------------|--------------------------------|
+| `POST /registry/heartbeat` | `Authorization: Bearer <token>` | -- |
+| `POST /registry/update-card` | `Authorization: Bearer <token>` | -- |
+| `POST /workspaces/:target/a2a` | `Authorization: Bearer <token>` | `X-Workspace-ID: <your-id>` -- if supplied, it must match the bearer owner |
+| `GET /registry/discover/:id` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` | -- |
+| `GET /registry/:id/peers` | `Authorization: Bearer <token>`, `X-Workspace-ID: <your-id>` | -- |
 
 ### Legacy / Bootstrap Behavior
 

@@ -122,7 +122,11 @@ curl -X POST http://localhost:8080/registry/register \
   }'
 ```
 
-The response includes your `auth_token` — shown once, store it in your secrets manager. Every subsequent call requires this token plus the `X-Workspace-ID` header.
+The response includes your `auth_token` — shown once, store it in your secrets
+manager. Authenticated workspace calls use this token. Header requirements are
+endpoint-specific: discovery requires `X-Workspace-ID`, while A2A derives the
+caller from the bearer and treats `X-Workspace-ID` as an optional source claim
+that must match when supplied.
 
 **Step 3 — Heartbeat every 30 seconds:**
 
@@ -194,6 +198,10 @@ curl -X POST http://localhost:8080/workspaces/<target-id>/a2a \
   }'
 ```
 
+The `X-Workspace-ID` header in this example is recommended but optional. The
+platform derives the caller from the bearer and rejects the request if a
+supplied header names a different workspace.
+
 No VPN. No VPC peering. No firewall rules between clouds.
 
 ---
@@ -204,11 +212,16 @@ Security is the question every enterprise buyer asks first. We built Phase 30.1 
 
 **How auth works:**
 
-Every authenticated route requires two things simultaneously:
-1. A valid 256-bit bearer token issued at first registration
-2. An `X-Workspace-ID` header matching the token's bound workspace
+Authenticated workspace routes require a valid 256-bit bearer token issued at
+first registration. On A2A send and queue-status routes, the token owner is the
+authoritative caller. `X-Workspace-ID` is optional there; when supplied, it must
+match that owner. Other endpoints, including discovery, may require the header
+as part of their route-specific contract.
 
-Workspace A's token cannot hit Workspace B's routes — not because of a policy enforcement check, but because the `X-Workspace-ID` must match at every authenticated endpoint. The protocol enforces it, not a rule that could be misconfigured.
+Workspace A's token cannot impersonate Workspace B on A2A calls because the
+platform resolves ownership from the token itself and rejects any mismatched
+workspace claim before applying communication rules. The protocol enforces the
+binding; it does not trust a client-supplied identifier.
 
 **Token security:**
 
@@ -270,7 +283,7 @@ Configure it in your project's `.mcp.json` and any AI agent (Claude Code, Cursor
 
 → [External Agent Registration Guide](/docs/guides/external-agent-registration) — full step-by-step with Python and Node.js reference implementations
 
-→ [GitHub: molecule-core](https://git.moleculesai.app/molecule-ai/molecule-core) — source and issues
+→ [Gitea: molecule-core](https://git.moleculesai.app/molecule-ai/molecule-core) — source and issues
 
 → [Phase 30 Launch Thread on X](https://x.com) — follow for updates
 

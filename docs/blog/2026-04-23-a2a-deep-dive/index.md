@@ -51,7 +51,9 @@ Here's the part that matters architecturally.
 
 When an agent sends a message, it POSTs to the platform's A2A proxy at `POST /workspaces/:id/a2a`. The proxy does three things:
 
-1. **Validates** the caller's bearer token and `X-Workspace-ID` header
+1. **Authenticates** the caller and source-binds identity. For a workspace
+   caller, the bearer owner is authoritative; an optional `X-Workspace-ID`
+   claim must match it.
 2. **Looks up** the target workspace's current URL from the registry
 3. **Forwards** the message directly to the target — the platform writes the HTTP request, not the message content
 
@@ -152,7 +154,11 @@ The `last_seen` timestamp tells you whether the target is online. Agents that ha
 
 ## Authentication at Discovery Time
 
-Every discovery call and every A2A call requires a valid bearer token. The platform enforces this at the transport layer — not as a policy, not as a middleware configuration, but as a hard requirement on every authenticated route.
+Every discovery call requires a valid workspace bearer. Platform-proxied A2A
+requires a source-bound workspace bearer or a verified human/external-inbound
+credential. For workspace callers, an optional `X-Workspace-ID` must match the
+bearer owner. The platform enforces this before routing — not as a client-side
+convention or optional middleware setting.
 
 The `CanCommunicate(callerID, targetID)` check runs before any message is forwarded:
 
@@ -230,7 +236,10 @@ The peer-to-peer model has concrete implications for teams building on Molecule 
 
 **Scalability:** The registry is a Redis key-value store, not a database. Registration, heartbeat, and discovery are all O(1) operations. There's no central message queue to saturate, no fan-out bottleneck, no single point of contention.
 
-**Auditability:** Every call to the A2A proxy is logged to `structure_events` with the caller's bearer token prefix and `X-Workspace-ID`. The audit trail captures who messaged whom and when — it doesn't capture the message content itself, which stays between the two agents.
+**Auditability:** Authenticated A2A traffic that reaches routing is attributed
+using the server-verified caller identity. Workspace attribution comes from the
+bearer owner, not from trusting `X-Workspace-ID`; a supplied claim is accepted
+only when it matches.
 
 ## LangGraph Is Shipping A2A — Here's the Difference
 
@@ -244,7 +253,7 @@ The gap is governance:
 | Agent discovery | ✅ On-demand | ✅ In review |
 | Peer-to-peer routing | ✅ Platform never in message path | ⚠️ Proxy in path |
 | Per-workspace auth tokens | ✅ Phase 30 | ❌ Not in current PRs |
-| `X-Workspace-ID` enforcement | ✅ Protocol-level | ❌ Not in current PRs |
+| Optional `X-Workspace-ID` source binding | ✅ Protocol-level | ❌ Not in current PRs |
 | `CanCommunicate` access model | ✅ Production | ❌ Not in current PRs |
 | Cross-network federation | ✅ Phase 30 | ❌ Not in current PRs |
 | Org-scoped delegation attribution | ✅ Phase 33 | ❌ Not in current PRs |
@@ -253,8 +262,8 @@ Molecule AI's A2A implementation is production-ready today. The governance featu
 
 ## Get Started
 
-To register an external agent, follow the [External Agent Registration Guide](https://docs.molecule.ai/docs/guides/external-agent-registration). The A2A protocol spec with full JSON-RPC reference is at [docs/api-protocol/a2a-protocol.md](https://docs.molecule.ai/docs/api-protocol/a2a-protocol).
+To register an external agent, follow the [External Agent Registration Guide](/docs/guides/external-agent-registration). The A2A protocol spec with full JSON-RPC reference is at [docs/api-protocol/a2a-protocol.md](/docs/api-protocol/a2a-protocol).
 
 For the MCP server that wraps the platform API: `npx @molecule-ai/mcp-server`.
 
-If you're building a multi-agent workflow and want to understand how the pieces fit together, the [workspace runtime docs](https://docs.molecule.ai/docs/agent-runtime/workspace-runtime) cover the adapter model and how external agents integrate.
+If you're building a multi-agent workflow and want to understand how the pieces fit together, the [workspace runtime docs](/docs/agent-runtime/workspace-runtime) cover the adapter model and how external agents integrate.
