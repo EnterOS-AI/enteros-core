@@ -69,6 +69,21 @@ const HAS_BULLET_LIST = /(^|\n)\s*(?:[-*•]|\d+\.)\s/;
 const GREETING_MAX_LEN = 240;
 
 /**
+ * True when a message has the semantic shape of a conversation opener.
+ *
+ * This is intentionally broader than isPureGreeting: a live concierge may
+ * answer the first literal "hi" with a greeting plus a longer capability
+ * introduction. Callers must use this only when they already know the message
+ * is the opening reply. Later-turn re-greet detection stays on the stricter,
+ * length/list-bounded predicate below.
+ */
+export function isOpeningGreeting(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return false;
+  return GREETING_OPENER.test(t) || CONCIERGE_INTRO.test(t);
+}
+
+/**
  * True when a message is a bare concierge GREETING (an opener / self-intro with
  * no substantive body), as opposed to a real answer. Robust to LLM wording:
  * keys on an anchored opener OR an explicit concierge self-introduction, and
@@ -224,7 +239,15 @@ export function checkConciergeInvariants(
   const agentMsgs = messages.filter(
     (m) => m.role === "agent" && m.content.trim().length > 0,
   );
+  const firstAgent = agentMsgs[0] ?? null;
+  const openingGreeting =
+    requireGreeting && firstAgent && isOpeningGreeting(firstAgent.content)
+      ? firstAgent
+      : null;
   const greetings = agentMsgs.filter((m) => isPureGreeting(m.content));
+  if (openingGreeting && !greetings.includes(openingGreeting)) {
+    greetings.unshift(openingGreeting);
+  }
   const greetingCount = greetings.length;
 
   // Invariant 1: exactly one greeting on a fresh chat.
@@ -240,7 +263,17 @@ export function checkConciergeInvariants(
   // requireGreeting=false means "an arbitrary window", i.e. the real opening
   // greeting may lie OUTSIDE it — so no greeting in the window gets the
   // expected-opening free pass, or a re-greet would be swallowed as the opening.
-  const reGreets = unexpectedGreetings(messages, { openingIsExpected: requireGreeting });
+  // Only a narrow/bare opening greeting consumes unexpectedGreetings' free
+  // pass. A longer opening introduction is counted above, but remains outside
+  // the later-turn bare-greeting classifier; the first later bare greeting is
+  // therefore evaluated against its preceding user turn instead of being
+  // mistaken for the opening.
+  const openingIsExpected = Boolean(
+    requireGreeting &&
+      openingGreeting &&
+      isPureGreeting(openingGreeting.content),
+  );
+  const reGreets = unexpectedGreetings(messages, { openingIsExpected });
   if (reGreets.length > 0) {
     const shown = reGreets.map((g) => `"${g.content.slice(0, 60)}"`).join("; ");
     violations.push(

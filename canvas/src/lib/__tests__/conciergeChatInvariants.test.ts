@@ -10,6 +10,7 @@
 import { describe, it, expect } from "vitest";
 import {
   checkConciergeInvariants,
+  isOpeningGreeting,
   isPureGreeting,
   isReGreet,
   unexpectedGreetings,
@@ -35,6 +36,18 @@ const CAPABILITY_ANSWER =
 const SIGNOFF_ANSWER =
   "Done — your name is Sam, noted. I'll remember it going forward. What can I help you with?";
 
+// The post-merge staging run 508720 returned this shape: an anchored greeting
+// plus a concierge self-introduction and a longer prose capability summary.
+// An opening answer to literal "hi" may be substantive without becoming a
+// re-greet; the narrow isPureGreeting predicate remains reserved for detecting
+// a bare greeting in later turns.
+const LONG_OPENING_INTRO =
+  "Hi! I'm your org concierge — the front door to everything in this organization. " +
+  "I can help you manage workspaces, delegate tasks, review approvals, coordinate agents, " +
+  "and keep your organization moving. Tell me what you want to accomplish and I'll help " +
+  "route the work to the right place, keep the relevant context together, and guide the " +
+  "next step without making you hunt through every workspace yourself.";
+
 describe("isPureGreeting", () => {
   it("classifies bare greetings / self-intros as greetings", () => {
     expect(isPureGreeting(GREETING)).toBe(true);
@@ -47,6 +60,43 @@ describe("isPureGreeting", () => {
     expect(isPureGreeting(CAPABILITY_ANSWER)).toBe(false); // long + bullet list
     expect(isPureGreeting(SIGNOFF_ANSWER)).toBe(false); // help offer is a sign-off, not an opener
     expect(isPureGreeting("Sam! You just told me a minute ago. 😄")).toBe(false);
+  });
+});
+
+describe("opening greeting contract", () => {
+  it("accepts a long concierge introduction without broadening the bare re-greet predicate", () => {
+    expect(LONG_OPENING_INTRO.length).toBeGreaterThan(240);
+    expect(isOpeningGreeting(LONG_OPENING_INTRO)).toBe(true);
+    expect(isPureGreeting(LONG_OPENING_INTRO)).toBe(false);
+  });
+
+  it("keeps a long opening introduction while still rejecting a later bare re-greet", () => {
+    const correct: SimpleMessage[] = [
+      { role: "user", content: "hi" },
+      { role: "agent", content: LONG_OPENING_INTRO },
+      { role: "user", content: "what can you do?" },
+      { role: "agent", content: CAPABILITY_ANSWER },
+    ];
+    expect(checkConciergeInvariants(correct).ok).toBe(true);
+
+    const reGreet: SimpleMessage[] = [
+      ...correct.slice(0, 2),
+      { role: "user", content: "list my workspaces" },
+      { role: "agent", content: "Hi! 👋 What would you like to do?" },
+    ];
+    expect(checkConciergeInvariants(reGreet).ok).toBe(false);
+  });
+
+  it("still rejects an exact duplicate of a long opening introduction", () => {
+    const duplicate: SimpleMessage[] = [
+      { role: "user", content: "hi" },
+      { role: "agent", content: LONG_OPENING_INTRO },
+      { role: "agent", content: LONG_OPENING_INTRO },
+    ];
+
+    const result = checkConciergeInvariants(duplicate);
+    expect(result.ok).toBe(false);
+    expect(result.duplicates).toHaveLength(1);
   });
 });
 
