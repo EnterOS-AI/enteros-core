@@ -21,10 +21,11 @@ import (
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		// In production, validate against CORS_ORIGINS. In dev, allow all.
 		origins := os.Getenv("CORS_ORIGINS")
 		if origins == "" {
-			return true // dev mode — no restriction
+			// Preserve the existing local/self-host compatibility default.
+			// Production deployments must configure CORS_ORIGINS explicitly.
+			return true
 		}
 		origin := r.Header.Get("Origin")
 		for _, allowed := range strings.Split(origins, ",") {
@@ -34,6 +35,10 @@ var upgrader = websocket.Upgrader{
 		}
 		return false
 	},
+	// Browser clients that offer any subprotocol require the server to select
+	// one. Select only this non-secret sentinel; the credential-bearing
+	// molecule-auth.<hex> offer is consumed for authentication but never echoed.
+	Subprotocols: []string{websocketProtocolSentinel},
 }
 
 type SocketHandler struct {
@@ -42,11 +47,12 @@ type SocketHandler struct {
 
 const (
 	// Browsers cannot attach Authorization to a WebSocket constructor. Canvas
-	// therefore hex-encodes its existing admin bearer into an offered protocol.
-	// The server consumes this credential for the handshake but never selects or
-	// echoes the protocol back to the client.
+	// therefore hex-encodes its existing admin bearer into an offered protocol
+	// and also offers a non-secret sentinel. The server consumes the credential
+	// but selects and echoes only the sentinel.
 	websocketAuthProtocolPrefix = "molecule-auth."
 	websocketAuthProtocolMaxHex = 8192
+	websocketProtocolSentinel   = "molecule-ws"
 )
 
 var errInvalidWebSocketCredential = errors.New("invalid WebSocket credential")

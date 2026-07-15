@@ -118,6 +118,7 @@ describe("connectSocket", () => {
       const ws = getLastWS();
       expect(ws.protocols).toEqual([
         "molecule-auth.6c6f63616c2d6465762d61646d696e",
+        "molecule-ws",
       ]);
       expect(ws.url).not.toContain("local-dev-admin");
     } finally {

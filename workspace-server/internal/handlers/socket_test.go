@@ -194,7 +194,10 @@ func TestSocketHandler_CanvasClient_AdminSubprotocol_RealUpgrade(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	dialer := websocket.Dialer{
-		Subprotocols: []string{websocketAuthProtocol("canvas-admin-secret")},
+		Subprotocols: []string{
+			websocketAuthProtocol("canvas-admin-secret"),
+			websocketProtocolSentinel,
+		},
 	}
 	conn, response, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/ws", nil)
 	if err != nil {
@@ -204,8 +207,14 @@ func TestSocketHandler_CanvasClient_AdminSubprotocol_RealUpgrade(t *testing.T) {
 		t.Fatalf("authenticated WebSocket upgrade failed: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if got := conn.Subprotocol(); got != "" {
-		t.Fatalf("credential protocol must not be echoed, got %q", got)
+	if got := conn.Subprotocol(); got != websocketProtocolSentinel {
+		t.Fatalf("selected subprotocol = %q, want non-secret sentinel %q", got, websocketProtocolSentinel)
+	}
+	if got := response.Header.Get("Sec-WebSocket-Protocol"); got != websocketProtocolSentinel {
+		t.Fatalf("handshake Sec-WebSocket-Protocol = %q, want %q", got, websocketProtocolSentinel)
+	}
+	if strings.Contains(response.Header.Get("Sec-WebSocket-Protocol"), websocketAuthProtocolPrefix) {
+		t.Fatal("handshake echoed the credential-bearing subprotocol")
 	}
 }
 

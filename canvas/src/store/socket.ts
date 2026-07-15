@@ -8,18 +8,20 @@ import { FALLBACK_POLL_MS } from "./socket-constants";
 export const WS_URL = process.env.NEXT_PUBLIC_WS_URL || (deriveWsBaseUrl() + "/ws");
 
 const WS_AUTH_PROTOCOL_PREFIX = "molecule-auth.";
+const WS_PROTOCOL_SENTINEL = "molecule-ws";
 
 /** Browsers cannot set Authorization on a WebSocket handshake. Carry the
  * existing canvas admin bearer as hex in Sec-WebSocket-Protocol instead of a
  * URL query parameter, where reverse proxies and access logs commonly record
- * it. The server consumes this offered protocol but does not echo it. */
+ * it. The non-secret sentinel lets the server complete browser subprotocol
+ * negotiation without echoing the credential-bearing protocol. */
 function websocketAuthProtocols(): string[] | undefined {
   const token = process.env.NEXT_PUBLIC_ADMIN_TOKEN;
   if (!token) return undefined;
   const encoded = Array.from(new TextEncoder().encode(token), (byte) =>
     byte.toString(16).padStart(2, "0"),
   ).join("");
-  return [`${WS_AUTH_PROTOCOL_PREFIX}${encoded}`];
+  return [`${WS_AUTH_PROTOCOL_PREFIX}${encoded}`, WS_PROTOCOL_SENTINEL];
 }
 
 export interface WSMessage {
