@@ -53,7 +53,8 @@ package staginge2e
 //
 // Guarded by the staging_e2e build tag + STAGING_E2E=1 env gate. After a
 // successful org-create response, exact-slug admin DELETE teardown is scheduled
-// before provisioning waits; teardown failures are logged for follow-up.
+// before provisioning waits; teardown retries transient lifecycle conflicts,
+// verifies exact-slug absence, and fails the E2E if cleanup cannot be proved.
 
 import (
 	cryptorand "crypto/rand"

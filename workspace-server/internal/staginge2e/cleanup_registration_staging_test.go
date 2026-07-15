@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestWorkspaceLifecycleRegisterTenantCleanupDeletesExactSlug(t *testing.T) {
@@ -23,7 +25,7 @@ func TestWorkspaceLifecycleRegisterTenantCleanupDeletesExactSlug(t *testing.T) {
 		contentType string
 		body        string
 	}
-	requests := make(chan capturedRequest, 2)
+	requests := make(chan capturedRequest, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		requests <- capturedRequest{
@@ -32,6 +34,11 @@ func TestWorkspaceLifecycleRegisterTenantCleanupDeletesExactSlug(t *testing.T) {
 			authorize:   r.Header.Get("Authorization"),
 			contentType: r.Header.Get("Content-Type"),
 			body:        string(body),
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/cp/admin/orgs" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"limit":500,"offset":0,"orgs":[]}`)
+			return
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -72,8 +79,112 @@ func TestWorkspaceLifecycleRegisterTenantCleanupDeletesExactSlug(t *testing.T) {
 		t.Fatalf("cleanup confirmation = %q, want exact slug", confirmation.Confirm)
 	}
 	select {
-	case extra := <-requests:
-		t.Fatalf("cleanup issued an unexpected second request: %+v", extra)
+	case verify := <-requests:
+		if verify.method != http.MethodGet || verify.path != "/cp/admin/orgs" {
+			t.Fatalf("cleanup verification request = %+v, want exact admin roster GET", verify)
+		}
 	default:
+		t.Fatal("registered cleanup did not verify exact org absence")
+	}
+	select {
+	case extra := <-requests:
+		t.Fatalf("cleanup issued an unexpected third request: %+v", extra)
+	default:
+	}
+}
+
+func TestDeleteTenantAndVerifyRetriesLifecycleConflictAndConfirmsAbsence(t *testing.T) {
+	const (
+		slug  = "e2e-cleanup-retry-contract"
+		token = "test-admin-token"
+	)
+
+	var deleteCalls, listCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Errorf("authorization header = %q, want test bearer", got)
+		}
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/cp/admin/tenants/"+slug:
+			deleteCalls++
+			w.Header().Set("Content-Type", "application/json")
+			if deleteCalls == 1 {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = io.WriteString(w, `{"error":"organization has an active lifecycle operation"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"deleted":true,"slug":"`+slug+`"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/cp/admin/orgs":
+			listCalls++
+			if got := r.URL.Query().Get("limit"); got != "500" {
+				t.Errorf("list limit = %q, want 500", got)
+			}
+			if got := r.URL.Query().Get("offset"); got != "0" {
+				t.Errorf("list offset = %q, want 0", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"limit":500,"offset":0,"orgs":[]}`)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	err := deleteTenantAndVerify(
+		stagingCfg{cpBase: server.URL, adminToken: token},
+		slug,
+		250*time.Millisecond,
+		time.Millisecond,
+	)
+	if err != nil {
+		t.Fatalf("deleteTenantAndVerify: %v", err)
+	}
+	if deleteCalls != 2 {
+		t.Fatalf("DELETE calls = %d, want conflict retry plus success", deleteCalls)
+	}
+	if listCalls != 1 {
+		t.Fatalf("org-list calls = %d, want exact absence verification", listCalls)
+	}
+}
+
+func TestDeleteTenantAndVerifyFailsClosedWhenConflictNeverClears(t *testing.T) {
+	const slug = "e2e-cleanup-conflict-contract"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":"organization has an active lifecycle operation"}`)
+	}))
+	defer server.Close()
+
+	err := deleteTenantAndVerify(
+		stagingCfg{cpBase: server.URL, adminToken: "test-admin-token"},
+		slug,
+		5*time.Millisecond,
+		time.Millisecond,
+	)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 409") {
+		t.Fatalf("persistent conflict error = %v, want bounded HTTP 409 failure", err)
+	}
+}
+
+func TestDeleteTenantAndVerifyRefusesUntrustedControlPlaneHost(t *testing.T) {
+	err := deleteTenantAndVerify(
+		stagingCfg{cpBase: "https://example.invalid", adminToken: "must-not-be-sent"},
+		"e2e-cleanup-host-contract",
+		time.Second,
+		time.Millisecond,
+	)
+	if err == nil || !strings.Contains(err.Error(), "refusing to send staging admin bearer") {
+		t.Fatalf("untrusted-host error = %v, want bearer exfiltration guard", err)
+	}
+
+	err = deleteTenantAndVerify(
+		stagingCfg{cpBase: "http://127.0.0.1:1", adminToken: "must-not-be-sent"},
+		"e2e-cleanup/../../unsafe",
+		time.Second,
+		time.Millisecond,
+	)
+	if err == nil || !strings.Contains(err.Error(), "refusing cleanup for non-E2E slug") {
+		t.Fatalf("unsafe-slug error = %v, want exact-slug path guard", err)
 	}
 }
