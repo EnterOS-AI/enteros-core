@@ -47,6 +47,7 @@
 
 import { test, expect, type Page, type BrowserContext } from "@playwright/test";
 import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
+import { fulfillStagingFetchedResponse } from "./support/stagingRouteFulfill";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -188,7 +189,10 @@ async function authenticate(
     } catch {
       return route.fallback();
     }
-    if (resp.status() !== 401) return route.fulfill({ response: resp });
+    if (resp.status() !== 401) {
+      await fulfillStagingFetchedResponse(route, resp);
+      return;
+    }
     const lastSeg =
       new URL(request.url()).pathname.split("/").filter(Boolean).pop() || "";
     const looksLikeList = !/^[0-9a-f-]{8,}$/.test(lastSeg);
