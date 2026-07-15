@@ -93,10 +93,15 @@ func TrackWSDisconnect() { atomic.AddInt64(&activeWSConns, -1) }
 var phantomBusyResets int64
 
 // TrackPhantomBusyReset increments the phantom-busy reset counter.
-// Called from sweepPhantomBusy in workspace-server/internal/scheduler/
+// Called from PhantomBusySweeper.Sweep in workspace-server/internal/handlers/
 // after each row whose active_tasks was reset to 0. Idempotent +
 // goroutine-safe; called once per row per sweep tick.
 func TrackPhantomBusyReset() { atomic.AddInt64(&phantomBusyResets, 1) }
+
+// PhantomBusyResets returns the cumulative phantom-busy reset count. Exposed
+// for tests (mirrors PendingUploadsSweepCounts); dashboards read the metric
+// via the /metrics endpoint's molecule_phantom_busy_resets_total line.
+func PhantomBusyResets() int64 { return atomic.LoadInt64(&phantomBusyResets) }
 
 // PendingUploadsSwept records a successful sweep cycle. acked/expired
 // are added to the per-outcome counters so dashboards can spot the

@@ -355,30 +355,12 @@ jobs:
             exit 1
           fi
 
-      - if: needs.detect-changes.outputs.handlers == 'true'
-        name: Run scheduler integration tests (#2149)
-        run: |
-          set -uo pipefail
-          # #2149: real-PG regression coverage for the scheduler firing loop
-          # (tick → A2A fire → write-back of last_run_at/next_run_at/run_count/
-          # activity_logs jsonb incl. invalid-UTF-8 sanitization + sweepPhantomBusy).
-          # Reuses the same migrated Postgres (workspace_schedules / activity_logs
-          # / workspaces all landed by the migration replay step above).
-          #
-          # Anti-vacuous-gate guard — same three zero-coverage exit-0 paths as
-          # the handlers step above; see that comment for the full enumeration.
-          LOG=$(mktemp)
-          rc=0
-          go test -tags=integration -timeout 5m -v ./internal/scheduler/ -run "^TestIntegration_" 2>&1 | tee "$LOG" || rc=$?
-          npass=$(grep -c -E '^[[:space:]]*--- PASS: ' "$LOG" || true)
-          echo "scheduler ^TestIntegration_: ${npass} test(s) actually ran and passed"
-          if [ "$rc" -ne 0 ]; then
-            exit "$rc"
-          fi
-          if [ "${npass:-0}" -eq 0 ]; then
-            echo "::error::Scheduler integration gate ran ZERO tests (0 '--- PASS:' lines) but go test still exited 0. A gate that runs no tests must NEVER report success. Check the -run regex ^TestIntegration_, the integration build tag on workspace-server/internal/scheduler/scheduler_integration_test.go, and that the suite did not skip wholesale on a missing INTEGRATION_DB_URL."
-            exit 1
-          fi
+      # The scheduler integration gate (#2149) was retired with the core cron
+      # scheduler itself (scheduler-as-trigger-plugin RFC, P4): internal/scheduler
+      # no longer exists — schedules are fired by the runtime kind:trigger daemon.
+      # The phantom-busy sweep that step also covered is now its own worker
+      # (internal/handlers/phantom_busy_sweeper.go) with unit coverage, exercised
+      # by the handlers gate above.
 
       - if: needs.detect-changes.outputs.handlers == 'true'
         name: Migration replay-from-scratch gate (#2150)
