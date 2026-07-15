@@ -1,19 +1,20 @@
 name: redeploy-tenants-on-main
 
-# molecules-server rework (2026-07-03): re-enabled + un-EC2'd (production).
+# molecules-server rework (2026-07-03): local-Docker production subset.
 #
 # History: this workflow rolled the production tenant fleet by calling the CP
 # admin endpoint /cp/admin/tenants/redeploy-fleet, which fanned out over AWS
 # SSM to one-tenant-per-EC2 boxes. It was DISABLED 2026-06-27 when the AWS
-# account was closed. Production tenants now run as local Docker containers on
-# the molecules-server host (provider='local', the LocalDocker provisioner),
-# so the EC2/SSM path is dead.
+# account was closed. Molecules-Server/local Docker is now one supported
+# production provider path, alongside control-plane-managed providers. This
+# workflow sees only containers on its Docker host carrying the production
+# label; it is not an inventory or rollout of the entire production tenant set.
 #
-# This rewrite redeploys the local-docker PRODUCTION fleet directly over the
-# host Docker socket — same shape as redeploy-tenants-on-staging.yml, differing
-# only in: the production label filter (molecule.cp-env=production), the moving
-# tag (:latest, not staging-latest), and the PROD_AUTO_DEPLOY_DISABLED kill
-# switch (below).
+# This rewrite redeploys that labeled local-Docker production subset directly
+# over the host Docker socket — same shape as
+# redeploy-tenants-on-staging.yml, differing only in: the production label
+# filter (molecule.cp-env=production), the moving tag (:latest, not
+# staging-latest), and the PROD_AUTO_DEPLOY_DISABLED kill switch (below).
 #
 # CANONICAL ALGORITHM REFERENCE: redeploy-tenants-on-staging.yml. The
 # canary-first / health-gated / self-rolling-back swap logic is intentionally
@@ -51,8 +52,8 @@ permissions:
   contents: read
 
 # Serialize per-branch so two rapid main pushes' redeploys don't overlap and
-# leave the fleet half-rolled. cancel-in-progress:false — aborting a partial
-# PROD roll mid-fleet is worse than letting it finish (each swap is
+# leave the local-Docker subset half-rolled. cancel-in-progress:false — aborting
+# a partial production roll mid-subset is worse than letting it finish (each swap is
 # health-gated + self-rolls-back, so a completed predecessor is always in a
 # good state). Explicit here to match redeploy-tenants-on-staging.yml rather
 # than lean on the Gitea/Actions default.
@@ -88,7 +89,7 @@ jobs:
               # Audit-trail marker so a future operator inspecting the run
               # summary can see WHY it short-circuited (not just an empty run).
               {
-                echo "## Production fleet redeploy — SKIPPED (frozen)"
+                echo "## Local-Docker production subset redeploy — SKIPPED (frozen)"
                 echo ""
                 echo "\`PROD_AUTO_DEPLOY_DISABLED\` is set — production auto-redeploy is frozen; no containers were touched. An operator must unset it to lift the freeze."
               } >> "$GITHUB_STEP_SUMMARY"
@@ -99,7 +100,7 @@ jobs:
               ;;
           esac
 
-      - name: Redeploy local-docker production tenant fleet
+      - name: Redeploy labeled local-Docker production tenant subset
         if: ${{ steps.guard.outputs.skip == '0' }}
         run: |
           set -euo pipefail
@@ -128,8 +129,8 @@ jobs:
             echo "::warning::candidate image $IMG carries no org.opencontainers.image.revision label — health gate falls back to LIVENESS-ONLY (cannot verify candidate identity)"
           fi
 
-          # Enumerate the running PRODUCTION tenant containers (local-docker
-          # equivalent of the old EC2 DescribeInstances fleet enumeration).
+          # Enumerate only the running, labeled production tenant containers on
+          # this Docker host. This is not control-plane-wide inventory.
           mapfile -t TENANTS < <(docker ps \
             --filter 'label=molecule.local-tenant=1' \
             --filter 'label=molecule.cp-env=production' \
@@ -138,14 +139,14 @@ jobs:
           if [ ${#TENANTS[@]} -eq 0 ]; then
             echo "::warning::no running production tenant containers found — nothing to roll"
           else
-            echo "Production tenants to roll (${#TENANTS[@]}): ${TENANTS[*]}"
+            echo "Labeled local-Docker production tenants to roll (${#TENANTS[@]}): ${TENANTS[*]}"
           fi
 
           # readiness gate: was /buildinfo-LIVENESS-ONLY (a container answering 200
           # tells you nothing about WHICH image it runs). Guard B deepens it to a
           # CANDIDATE-IDENTITY gate: /buildinfo must not only answer, it must report
           # the candidate's git_sha (EXPECT_REV). This turns the canary swap into a
-          # real "the candidate is actually running" gate BEFORE the fleet fans out
+          # real "the candidate is actually running" gate BEFORE this subset fans out
           # — a swap that silently kept the stale image now REDs the roll instead of
           # passing a hollow liveness check. (The full A2A provision_workspace
           # CALLABLE assertion for the prod image is enforced upstream by the
@@ -226,7 +227,7 @@ jobs:
           for t in "${TENANTS[@]}"; do
             if [ "$FIRST" = 1 ]; then
               echo "== canary: $t =="
-              swap_tenant "$t" "$IMG" || { echo "::error::canary $t failed — aborting fleet roll"; FAILED=1; break; }
+              swap_tenant "$t" "$IMG" || { echo "::error::canary $t failed — aborting local-Docker subset roll"; FAILED=1; break; }
               FIRST=0
             else
               echo "== $t =="
@@ -275,14 +276,14 @@ jobs:
           fi
 
           {
-            echo "## Production fleet redeploy (molecules-server / local-docker)"
+            echo "## Labeled production subset redeploy (molecules-server / local-Docker)"
             echo ""
             echo "- Tenant image: \`${IMG}\`"
             echo "- Tenants rolled: ${#TENANTS[@]}"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$FAILED" != 0 ]; then
-            echo "::error::production fleet redeploy had at least one failure (see log/summary)"
+            echo "::error::local-Docker production subset redeploy had at least one failure (see log/summary)"
             exit 1
           fi
-          echo "::notice::production fleet redeploy complete"
+          echo "::notice::local-Docker production subset redeploy complete"

@@ -1,23 +1,27 @@
 name: publish-workspace-server-image
 
-# The PUBLISH half of the tenant auto-update loop (the missing sibling of
-# redeploy-tenants-on-{main,staging}.yml).
+# The PUBLISH half of the current main-branch local-Docker tenant image path.
+# `main` is the current deployment branch; no `staging` branch exists. The
+# `staging-*` strings below are artifact-tag names retained for compatibility,
+# not evidence of a staging Git branch.
 #
-# THE LOOP
-# --------
+# CURRENT ORDERING
+# ----------------
 #   publish-workspace-server-image   (THIS FILE)  — build the tenant image
-#        push :staging-<sha> + :staging-latest  (+ promote :latest on main)
-#                     │
-#                     ▼
-#   redeploy-tenants-on-staging.yml  — pulls molecule-tenant:staging-latest
-#   redeploy-tenants-on-main.yml     — pulls molecule-tenant:latest
-#        canary-first, health-gated, self-rolling-back swap of the local
-#        docker tenant fleet onto the freshly published image.
+#        push :staging-<sha> + :staging-latest
+#        dispatch redeploy-tenants-on-main.yml (best effort)
+#        wait for CI, then promote the candidate to :latest
 #
-# Before this file existed, redeploy-tenants-on-* triggered on
+# The redeploy workflow pulls molecule-tenant:latest. Because the best-effort
+# dispatch and the sibling push-trigger can both run before promote-latest moves
+# that tag, either run may pull the previous image. No post-promotion redeploy is
+# guaranteed by this workflow. A green publish therefore proves the artifact;
+# it does not by itself prove that any running tenant consumed that artifact.
+#
+# Before this file existed, the redeploy workflow triggered on
 # `workspace-server/**` / `canvas/**` pushes but NOTHING rebuilt the tenant
-# image, so a merged fix never reached a running tenant — the deploy half had
-# no fresh artifact to deploy. This workflow closes that gap.
+# image, so a merged fix never produced a deployable artifact. This workflow
+# closes the artifact gap; the ordering gap described above remains open.
 #
 # molecules-server (local-docker) era — NOT ECR
 # ---------------------------------------------
@@ -35,8 +39,8 @@ name: publish-workspace-server-image
 #     <=90MB sequential contiguous chunks (adaptive across-blob concurrency +
 #     resume), so no PATCH ever exceeds the cap. Because the build now runs
 #     off-host, this registry push is the SSOT the deploy pulls from — NOT a
-#     same-daemon --load tag. redeploy-tenants-on-* + fresh provisions resolve
-#     the image via `docker pull` (uncapped through CF).
+#     same-daemon --load tag. The local-Docker main redeploy pulls the image
+#     from `registry.moleculesai.app`, making that registry the artifact SSOT.
 #   - DOCUMENTED FALLBACK (kept until the chunked path is prod-proven): repo var
 #     PUBLISH_PUSH_MODE=localhost-bypass reverts to the pre-migration CF-BYPASS
 #     (push straight to the host's local Gitea OCI endpoint localhost:3200,
@@ -44,13 +48,12 @@ name: publish-workspace-server-image
 #     also means overriding runs-on to a local docker-host runner. Not deleted.
 #
 # Tag scheme (parallels publish-canvas-image.yml):
-#   :staging-<sha>  — immutable per-commit build. What an operator pins to.
-#   :staging-latest — most recent BUILD (last-writer-wins, NOT gated). What
-#                     redeploy-tenants-on-staging + fresh staging provisions pull.
+#   :staging-<sha>  — immutable per-commit candidate built from main.
+#   :staging-latest — most recent BUILD from main (last-writer-wins, NOT gated).
 #   :latest         — most recent CI-GREEN build. Only moved by promote-latest
 #                     (main only, after green push CI, and only when the
 #                     production freeze PROD_AUTO_DEPLOY_DISABLED is lifted).
-#                     What redeploy-tenants-on-main + fresh prod provisions pull.
+#                     What the local-Docker main redeploy pulls.
 #
 # The tenant image bakes BOTH the Go platform (workspace-server) AND the canvas
 # Next.js UI (workspace-server/Dockerfile.tenant, stage 2 at /canvas), which is
@@ -59,6 +62,8 @@ name: publish-workspace-server-image
 
 on:
   push:
+    # `staging` is an inert compatibility entry while that branch is absent.
+    # Removing it changes trigger behavior and belongs in a separate cleanup.
     branches: [main, staging]
     paths:
       - 'workspace-server/**'
@@ -85,7 +90,7 @@ concurrency:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
-  # SSOT: the exact var + default the redeploy-tenants-on-* workflows consume,
+  # SSOT: the exact var + default the local-Docker redeploy workflow consumes,
   # so whatever they pull, this publishes (no-hardcoding principle). Overridable
   # org/repo-wide via the MOLECULE_TENANT_IMAGE var without touching any workflow.
   TENANT_IMAGE: ${{ vars.MOLECULE_TENANT_IMAGE || 'registry.moleculesai.app/molecule-ai/molecule-tenant' }}
@@ -101,10 +106,9 @@ jobs:
     # semantics, so it lands ONLY on robot-1 while still satisfying
     # lint-required-workflows-docker-host-pinned (docker-host is present). The
     # image is `--load`ed into robot-1's daemon and then pushed to the registry
-    # via the parallel chunked pusher (below); redeploy-tenants-on-* + fresh
-    # provisions pull the CI-green tag FROM registry.moleculesai.app (the reliable
-    # chunked push makes the registry the SSOT, so the build no longer has to run
-    # on the same daemon as the deploy).
+    # via the parallel chunked pusher (below); the local-Docker redeploy pulls the
+    # CI-green tag FROM registry.moleculesai.app. The reliable chunked push makes
+    # the registry the SSOT, so the build and deploy need not share a daemon.
     runs-on: [docker-host, robot-1]
     timeout-minutes: 45
     outputs:
@@ -141,15 +145,14 @@ jobs:
           echo "HOME=$H" >> "$GITHUB_ENV"
           echo "DOCKER_CONFIG=$H/.docker" >> "$GITHUB_ENV"
 
-      # AUTO_SYNC_TOKEN (devops-engineer persona PAT) is the cross-repo clone
+      # AUTO_SYNC_TOKEN is the scoped cross-repo clone
       # token for the private workspace-template-* / org-template-* / plugin
       # repos in manifest.json. Sourced from the Infisical SSOT
       # (/shared/dev-utils::AUTO_SYNC_TOKEN, environment=prod) via the CI machine
-      # identity — matches the secrets->kms direction and the retired ECR
-      # workflow's proven pre-clone auth path.
+      # identity, keeping the credential in the current Infisical SSOT path.
       #
-      # FORK SAFETY: this workflow fires only on push:[main,staging] +
-      # workflow_dispatch (no pull_request trigger), so the token is never
+      # FORK SAFETY: this workflow fires only on configured push refs (the current
+      # deployment branch is main) + workflow_dispatch, with no pull_request trigger, so
       # fetchable on an untrusted fork trigger; the conditional is
       # belt-and-suspenders. Gitea also withholds secrets from forks at the
       # runner level (defense in depth).
@@ -269,8 +272,8 @@ jobs:
             echo "::error::Tenant image build failed after 3 attempts"
             exit 1
           fi
-          # End-state verification (not exit-code trust): the tag must exist in
-          # the daemon redeploy-tenants-on-* reads.
+          # End-state verification (not exit-code trust): the tag must exist in the
+          # build daemon before the registry upload step.
           docker image inspect "${TENANT_IMAGE}:${TAG_SHA}" --format 'built {{.Id}}' >/dev/null \
             || { echo "::error::image ${TENANT_IMAGE}:${TAG_SHA} missing after build"; exit 1; }
           echo "::notice::image present in host daemon: $(docker image inspect "${TENANT_IMAGE}:${TAG_SHA}" --format '{{.Id}}')"
@@ -282,7 +285,7 @@ jobs:
       # each blob in <=90MB sequential contiguous chunks with adaptive
       # across-blob concurrency + resume, so no PATCH ever exceeds the cap. Now
       # that this build runs on robot-1 (off the deploy host), the reliable
-      # registry push is what redeploy-tenants-on-* + fresh provisions pull from
+      # registry push is what the local-Docker redeploy and configured provisions use
       # (`docker pull` is uncapped through CF) — the registry is the SSOT, not a
       # same-host --load tag.
       #
@@ -357,14 +360,11 @@ jobs:
           fi
           exit 0
 
-      # Tighten the loop: deterministically kick the matching redeploy AFTER the
-      # fresh image exists. redeploy-tenants-on-* also self-trigger on this same
-      # push, and that independent sibling run can start BEFORE this build
-      # finishes and pull the prior tag; this explicit dispatch
-      # guarantees at least one redeploy runs against the just-published image.
-      # Best-effort + non-fatal: if it fails, the sibling push-trigger still
-      # covers the deploy (belt-and-suspenders, eventual consistency).
-      - name: Trigger matching redeploy on the fresh image (best-effort)
+      # Best-effort dispatch after the candidate tags exist. The redeploy pulls
+      # :latest, which promote-latest moves only in the later job below, so this
+      # dispatch can still pull the prior image. The sibling push-trigger has
+      # the same race; neither path guarantees a post-promotion redeploy.
+      - name: Trigger matching redeploy after candidate push (best-effort; ordering not guaranteed)
         if: github.event_name == 'push'
         env:
           DISPATCH_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
@@ -389,7 +389,7 @@ jobs:
           if [ "$code" = "204" ] || [ "$code" = "201" ] || [ "$code" = "200" ]; then
             echo "::notice::dispatched ${wf} on ${REF_NAME} (HTTP ${code})"
           else
-            echo "::warning::dispatch of ${wf} returned HTTP ${code} (non-fatal; the redeploy push-trigger still covers this deploy)"
+            echo "::warning::dispatch of ${wf} returned HTTP ${code} (non-fatal; the sibling push-trigger still makes a best-effort redeploy attempt, but neither path guarantees a post-promotion rollout)"
           fi
 
   # bp-exempt: post-merge prod :latest promote side effect; gated on green push
@@ -397,18 +397,18 @@ jobs:
   promote-latest:
     name: Promote tenant :latest to CI-green build
     needs: build-and-push
-    # main only, real push only. staging advances :staging-latest directly in
-    # build-and-push (no promote); workflow_dispatch / non-main never promote.
+    # Main push only. build-and-push always advances the candidate
+    # :staging-latest tag; workflow_dispatch / non-main never promote :latest.
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: docker-host
     timeout-minutes: 60
     env:
       GITEA_HOST: git.moleculesai.app
       CI_STATUS_TIMEOUT_SECONDS: "3600"
-      # Reuses the platform's production kill-switch: while prod auto-deploy is
-      # frozen, the :latest promote pauses too (correct — an unpromoted build
-      # must not become :latest, and redeploy-tenants-on-main is frozen in
-      # lockstep, so prod stays byte-stable until an operator lifts the freeze).
+      # Reuses the production kill-switch: while local-Docker auto-redeploy is
+      # frozen, the :latest promote pauses too. This keeps that moving tag and
+      # the labeled local-Docker subset on their prior image until an operator
+      # lifts the freeze; it makes no claim about other provider paths.
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
     steps:
       - name: Prepare writable HOME + Docker config
@@ -436,7 +436,7 @@ jobs:
                 {
                   echo "## Tenant :latest promote skipped (production frozen)"
                   echo ""
-                  echo "Reason: \`PROD_AUTO_DEPLOY_DISABLED=$PROD_AUTO_DEPLOY_DISABLED\`. The build is published as \`:staging-${GITHUB_SHA::7}\` + \`:staging-latest\`; \`:latest\` was left unchanged, so production stays on its current image."
+                  echo "Reason: \`PROD_AUTO_DEPLOY_DISABLED=$PROD_AUTO_DEPLOY_DISABLED\`. The build is published as \`:staging-${GITHUB_SHA::7}\` + \`:staging-latest\`; \`:latest\` was left unchanged, so the labeled local-Docker subset stays on its prior image."
                 } >> "$GITHUB_STEP_SUMMARY"
                 exit 0 ;;
             esac
@@ -453,8 +453,8 @@ jobs:
             echo "::error::AUTO_SYNC_TOKEN required so the promote can wait for green CI on this SHA."
             exit 1
           fi
-          # Same SSOT wait the CP prod promote uses: block until the required
-          # push contexts go green on THIS sha; fail closed if any terminally fail.
+          # Shared wait-helper contract: block until the required push contexts
+          # go green on THIS sha; fail closed if any terminally fail.
           python3 .gitea/scripts/prod-auto-deploy.py wait-ci
 
       - name: Promote :latest to the CI-green tenant image (registry manifest re-point)
@@ -486,8 +486,8 @@ jobs:
           # chunked-pushed to registry.moleculesai.app. Because the build now
           # runs off-host on robot-1, we re-point in the REGISTRY (the SSOT) —
           # NOT a same-daemon `docker tag`, which would not see the build's
-          # --load tag. redeploy-tenants-on-main + fresh prod provisions pull
-          # this from the registry (`docker pull`, uncapped through CF).
+          # --load tag. The local-Docker main redeploy pulls this from the registry
+          # (`docker pull`, uncapped through CF).
           docker buildx imagetools create --tag "$DST" "$SRC"
           echo "::notice::re-pointed $DST -> $SRC (registry manifest)"
 
@@ -495,5 +495,5 @@ jobs:
             echo "## Tenant :latest promoted"
             echo ""
             echo "Re-pointed \`${TENANT_IMAGE}:latest\` -> \`${SHA_TAG}\` for commit \`${GITHUB_SHA::7}\` (registry manifest)."
-            echo "redeploy-tenants-on-main + fresh production provisions now resolve this CI-green tenant build."
+            echo "No post-promotion tenant redeploy is guaranteed by this workflow; verify the served digest separately for every target provider."
           } >> "$GITHUB_STEP_SUMMARY"

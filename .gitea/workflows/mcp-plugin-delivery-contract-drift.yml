@@ -61,9 +61,9 @@ jobs:
             /tmp/sdk-mcp-plugin-delivery.contract.json > /tmp/sdk-mcp-plugin-delivery.contract.json.canon
 
       - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
-        # Bot-token consolidation (secrets->kms). AUTO_SYNC_TOKEN (the
-        # devops-engineer persona PAT, used here as a read-only cross-repo
-        # token to fetch the template + runtime canonical contracts) is now
+        # Secret-source consolidation (Infisical SSOT). AUTO_SYNC_TOKEN is used
+        # here as a read-only cross-repo token to fetch the template + runtime
+        # canonical contracts and is
         # pulled from the Infisical SSOT at /shared/dev-utils::AUTO_SYNC_TOKEN
         # (environment=prod) instead of the duplicated `secrets.AUTO_SYNC_TOKEN`
         # Gitea secret. Exported to $GITHUB_ENV and consumed as env.* by BOTH

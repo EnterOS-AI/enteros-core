@@ -1,196 +1,176 @@
-# Skill Catalog
+# Skills: Current Usage Guide
 
-Skills extend what a workspace agent can do — from browser automation
-and TTS to research tools and custom API integrations. This page covers
-available skill types, how to install them, and how to manage their
-versions.
+Molecule does not currently ship a hosted skill marketplace or a workspace-CLI
+command family for installing, upgrading, listing, scaffolding, bundling, or
+removing skills. The available skills are the directories delivered with the
+active workspace configuration or contributed by installed plugins.
 
-> **Note:** Molecule AI does not ship a hosted skill marketplace. All
-> skills are installed from local packages, GitHub URLs, or community
-> bundles. See [Skill Lifecycle](#lifecycle) for how to publish and
-> distribute skills within your org.
+The authoritative runtime behavior lives in
+`molecule_runtime/skill_loader/loader.py`. See the maintained
+[Skills reference](../agent-runtime/skills.md) for the loader contract and
+frontmatter fields.
 
-## Available Skill Types
+## What a skill is
 
-The skills ecosystem covers the same capabilities as Hermes Tool Gateway
-and more:
+A workspace skill is a directory below the active config directory's `skills/`
+folder. It may be declarative-only or include executable helpers:
 
-| Category | Skill | What it does | Provider options |
-|----------|-------|-------------|-----------------|
-| **Browser** | `browser-automation` | Chrome DevTools Protocol via MCP — navigate, query DOM, screenshot, fill forms. Same engine as Hermes' built-in browser tool. | Built-in (CDP); swap via skill version |
-| **TTS** | `tts` | Text-to-speech generation. Streams audio to output. | OpenAI, ElevenLabs, or self-hosted |
-| **Image gen** | `image-generation` | Generates images from text prompts. | OpenAI DALL·E, Stability AI, or self-hosted |
-| **Web search** | `web-search` | Structured web search with result parsing. | Brave, SerpAPI, or custom |
-| **Research** | `arxiv-research` | Searches and summarizes arXiv papers. | Community bundle |
-| **Code** | `code-analysis` | Static analysis, diff review, complexity scoring. | Built-in |
-| **SEO** | `seo-audit` | Lighthouse audit + GSC keyword extraction. | Built-in |
-| **Social** | `social-post` | Formats and posts to social channels. | Built-in |
-
-All skills are open source. Source is visible — inspect the `SKILL.md`
-and `tools/` before installing.
-
-## Installing a Skill
-
-### From the built-in catalog
-
-```bash
-# Install browser automation
-molecule skills install browser-automation
-
-# Install TTS with a specific provider
-molecule skills install tts --provider openai
-
-# Install a specific version
-molecule skills install browser-automation --version 1.2.0
+```text
+skills/web-research/
+├── SKILL.md
+├── scripts/
+│   └── search_sources.py
+├── examples/             # optional reference material
+└── references/           # optional reference material
 ```
 
-### From GitHub
+Only these paths have automatic runtime behavior:
 
-```bash
-molecule skills install \
-  https://github.com/acme/molecule-skills/tree/main/browser-automation
-```
+- `SKILL.md` supplies frontmatter metadata and instructions.
+- Top-level, non-underscore `scripts/*.py` modules are imported and scanned for
+  `langchain_core.tools.BaseTool` objects.
 
-### From a community bundle
+The skill loader does **not** import a `tools/` directory. Other files may
+support the instructions, but the runtime does not automatically inject every
+file in the package.
 
-Community skills are hosted on GitHub and referenced by slug:
+## Enable a workspace skill
 
-```bash
-molecule skills install arxiv-research --from community
-```
-
-Community skills are reviewed by the Molecule AI team before being
-listed. Submit a skill for review by opening a PR against
-[`molecule-ai/skills`](https://git.moleculesai.app/molecule-ai/skills).
-
-## Installing via config.yaml
-
-Skills can also be declared in the workspace config file:
+Place the directory under `<config-path>/skills/` and list its directory name
+in the active `config.yaml`:
 
 ```yaml
 skills:
-  - name: browser-automation
-    source: builtin
-  - name: tts
-    source: builtin
-    config:
-      provider: openai
-  - name: arxiv-research
-    source: community
+  - web-research
+  - code-review
 ```
 
-On workspace boot, the runtime validates each skill and loads the
-`SKILL.md` + tools into the agent's context.
+The value is a list of directory-name strings, not catalog records or source
+objects. Do not put skill names under the separate `tools:` key.
 
-## Version Management
+The active config path is normally `/configs` in a workspace image. If runtime
+config loading falls back to a baked template, the runtime adopts that
+template's directory as the config base, so skills must be delivered alongside
+the config that actually loaded.
 
-Skills are versioned with semantic versioning. Pin to a known-good
-release to prevent unexpected behavior changes:
+There are three current delivery patterns:
 
-```bash
-# Pin to a specific version
-molecule skills install tts --version 1.1.0
+1. A workspace template ships the skill directory and names it in
+   `config.yaml`.
+2. An installed plugin contributes one or more skill directories through the
+   plugin lifecycle.
+3. A local or self-hosted operator places files in the active config directory
+   for development.
 
-# Upgrade to latest
-molecule skills upgrade tts
+The workspace CLI starts and manages a workspace; it does not perform any of
+these skill-package operations. For plugin delivery, use Core's plugin
+lifecycle described in [Plugin install sources](../plugins/sources.md).
 
-# View installed version
-molecule skills list
+## Write `SKILL.md`
+
+```markdown
+---
+name: web-research
+description: Finds and compares primary technical sources
+tags: [research, web]
+examples:
+  - Compare two API contracts and cite the differences.
+runtime: [claude-code, codex, hermes, openclaw]
+---
+
+# Web Research
+
+Use primary sources. Record the source URL for every claim that could change.
 ```
 
-Upgrading is safe — the skill loader validates the new package on
-installation. If the new version has breaking changes, the workspace logs
-a warning and keeps the previous version active until you restart.
+The Markdown body becomes the skill instructions in the agent's system prompt.
+The current runtime consumes `name`, `description`, `tags`, `examples`, and
+`runtime`. The directory name is the skill ID and is also the default display
+name.
 
-## Custom Skills
+Use `runtime: ["*"]` or omit the field for a universal skill. A string or list
+of adapter names can limit loading to compatible runtimes. An incompatible
+skill is skipped rather than partially loaded.
 
-Write a skill for your team's specific workflow:
+Runtime parsing tolerates malformed frontmatter with warnings so a bad metadata
+block does not crash workspace startup. Treat those warnings as authoring
+errors; do not depend on the tolerant fallback as a packaging contract.
 
-```bash
-# Scaffold a new skill
-molecule skills init my-custom-skill
+## Add executable helpers
+
+Executable helpers belong in `scripts/`, not `tools/`:
+
+```python
+from langchain_core.tools import tool
+
+
+@tool
+def summarize_file(path: str) -> str:
+    """Summarize a text file in the workspace."""
+    ...
 ```
 
-This creates:
+Each top-level `scripts/*.py` module executes when the skill loads. The loader
+collects objects produced by `@tool` because they implement `BaseTool`.
+Underscore-prefixed modules and nested Python modules are not discovered by
+this loader path.
 
-```
-skills/my-custom-skill/
-+-- SKILL.md              # instructions + frontmatter
-+-- tools/
-|   +-- my_tool.py        # MCP tool using @tool decorator
-+-- examples/             # few-shot examples
-+-- templates/            # reference files
-```
+Skill scripts execute inside the agent process. The loader temporarily removes
+a fixed set of common credential environment variables during import, and the
+configured dependency scanner can warn or block before import, but neither is
+a sandbox. Review code and dependencies before delivering an executable skill.
 
-See [Skills Reference](../agent-runtime/skills.md) for the full
-`SKILL.md` format and frontmatter schema.
+## Reload and removal behavior
 
-## Skill Lifecycle
+The runtime watches files inside skill directories already named in
+`config.yaml`. A content change is detected after the polling/debounce window
+and the runtime attempts to replace that skill's instructions and tools through
+the active adapter callback.
 
-```
-Author writes SKILL.md + tools/
-      |
-      v
-Install into workspace (local or GitHub)
-      |
-      v
-Workspace loads skill on next boot / hot-reload
-      |
-      v
-Agent sees skill in tool context
-      |
-      v
-(Optional) Publish to org bundle or community
-```
+Changing the configured skill-name list is a different lifecycle event. Restart
+the workspace after adding or removing an entry unless the active runtime or
+management surface explicitly performs that restart.
 
-**Publishing to your org:** Bundle skills with workspace templates so
-every new workspace in a role gets the same capability set:
+To remove a directly configured skill:
 
-```bash
-molecule skills bundle my-custom-skill --output ./org-templates/my-role/
-```
+1. Remove its name from `config.yaml`.
+2. Restart the workspace.
+3. Remove the directory when it is no longer referenced.
 
-**Publishing to the community:** Open a PR against
-[`molecule-ai/skills`](https://git.moleculesai.app/molecule-ai/skills) with a
-complete skill package. Community skills are reviewed for security and
-correctness before listing.
-
-## Removing a Skill
-
-```bash
-molecule skills uninstall browser-automation
-```
-
-Or remove from `config.yaml` and trigger a hot-reload by touching the
-file:
-
-```bash
-touch /configs/config.yaml
-```
-
-The workspace detects the change, rescans skills, and updates the Agent
-Card within ~3 seconds.
+For a plugin-contributed skill, use the plugin lifecycle instead. Workspace
+skills load before plugin skills, and a plugin skill with an already-loaded
+skill ID is skipped.
 
 ## Troubleshooting
 
-**Skill not found:** Check the skill name matches the catalog exactly.
-Skill names are lowercase with hyphens (`browser-automation`, not
-`browser_automation` or `BrowserAutomation`).
+**`SKILL.md not found` in logs:** The configured string must match a directory
+under `<config-path>/skills/`, and that directory must contain `SKILL.md`.
 
-**Skill loads but tools are missing:** Verify the `tools/` folder
-contains valid Python files with `@tool`-decorated functions. See
-[Skills Reference — Tool Interface](../agent-runtime/skills.md#tool-interface).
+**Instructions load but executable helpers do not:** Check that the files are
+top-level `scripts/*.py`, do not begin with `_`, import successfully, and expose
+`BaseTool` objects. A `tools/` directory has no loader semantics.
 
-**Provider auth error:** Ensure the required environment variable (e.g.
-`OPENAI_API_KEY`) is set in the workspace config or secrets.
+**Skill is skipped for this runtime:** Check the `runtime` frontmatter against
+the active adapter name.
 
-## Related Docs
+**Security scan blocks the skill:** Review the scanner output and the skill's
+dependencies. Do not disable scanning merely to force an unreviewed module to
+load.
 
-- [Skills Reference](../agent-runtime/skills.md) — Full SKILL.md format,
-  frontmatter schema, and tool interface
-- [Config Format](../agent-runtime/config-format.md) — How skills are
-  declared in `config.yaml`
-- [Plugin shapes](../plugins/agentskills-compat.md) — Installing plugin
-  packages with skills, rules, or MCP configuration
-- [External Agent Registration](external-agent-registration.md) — connect a
-  BYO-compute agent using the current server-generated setup contract
+**A new configured skill does not appear after editing `config.yaml`:** Restart
+the workspace. Hot reload watches the contents of names selected at startup; it
+is not a package installer or config-list watcher.
+
+## Skills and plugins
+
+A skill contributes instructions and optional in-process tools. A plugin is a
+separate Core-managed package that may contribute skills, rules, prompts, MCP
+descriptors, adapters, or daemons. Do not use the terms interchangeably.
+
+## Related docs
+
+- [Skills reference](../agent-runtime/skills.md)
+- [Runtime config](../agent-runtime/config-format.md)
+- [Workspace runtime](../agent-runtime/workspace-runtime.md)
+- [Plugin and agentskills.io compatibility](../plugins/agentskills-compat.md)
+- [Plugin install sources](../plugins/sources.md)

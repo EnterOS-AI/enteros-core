@@ -78,8 +78,8 @@ we bake before we cascade):
 1. `molecule-ai-workspace-template-hermes` — highest-traffic + most
    recent RFC#600-class fixes — REQUIRED gate
 2. Bake for 5 business days
-3. Cascade to claude-code, langgraph, autogen, openclaw, smolagents,
-   google-adk (one PR per template — see `scripts/onboard-template.sh`)
+3. Cascade to the other maintained templates: claude-code, codex, and
+   openclaw (one PR per template — see `scripts/onboard-template.sh`)
 
 ## Future extensions (out of scope for the initial PR)
 
