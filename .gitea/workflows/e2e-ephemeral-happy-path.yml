@@ -33,8 +33,9 @@ name: E2E Ephemeral CP Happy Path
 #
 # What remains of the migration end-state: move the contract into the SDK
 # (task #74), wire both repos, then demote the post-merge E2E Staging jobs
-# (task #86). Task #92's busy force-hibernate proof is implemented but still
-# allows a loud idle fallback by default; the demotion is therefore NOT done.
+# (task #86). Task #92's busy force-hibernate proof is still open: step 10b
+# currently proves force-hibernate only after the leaf is idle, so the demotion
+# is therefore NOT done.
 #
 # Reuses the CP repo's ephemeral spin-up plumbing (scripts/deploy/pr-ephemeral-cp.sh),
 # the shared harness the RFC generalizes.

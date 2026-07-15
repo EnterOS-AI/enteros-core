@@ -78,8 +78,9 @@ STATE_FILE="${EPHEMERAL_STATE_FILE:-${TMPDIR:-/tmp}/ephemeral-cp-${NS}.env}"
 # and one `docker rm -fv` destroys everything atomically — even on cancel. This
 # is the structural fix for the SHARED docker-host interference that killed the
 # gate's first CI runs (the host-loopback docker-proxy died mid-run with every
-# container healthy) and for the cross-run tenant leaks (`down` only sweeps the
-# leg network). Inside the dind:
+# container healthy) and for historical cross-run tenant leaks (an early `down`
+# implementation only swept the leg network). The pinned helper now removes all
+# non-self containers on the exact namespace network; inside the dind:
 #   * published ports must bind 0.0.0.0 (the dind pre-forwards its FIXED :8080
 #     to the job's host loopback at create time — dind.sh exports it as $BASE;
 #     host.docker.internal inside the dind = the dind's own gateway, which a

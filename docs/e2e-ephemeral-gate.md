@@ -62,7 +62,9 @@ live failure — do not remove one without re-running the gate locally:
    workspace-provision POST **to prod** (401). Fail-open filed as **CP #1515**.
    The topo base also feeds `LLMProxyBaseURL` (workspace LLM egress).
 4. **`E2E_LLM_PATH=platform` + `E2E_MODE=full` + `E2E_AWS_LEAK_CHECK=off`.**
-   The gate mirrors the Platform Boot lane exactly: hermes' default
+   The gate shares the Platform Boot lane's platform-managed LLM path, but not
+   its runtime or scenario breadth: this gate pins Hermes in full mode, while
+   Platform Boot uses its configured runtime in smoke mode. Hermes' default
    `minimax/MiniMax-M2.7` (slash form) is platform-managed; completions flow
    workspace → tenant proxy env → this CP's `/cp/internal/llm` proxy →
    `api.minimax.io` with the CP's own `MINIMAX_API_KEY`. (`pick_model_slug`
@@ -131,14 +133,13 @@ crash-looping containers from other runs and misdirects the RCA (it did).
 
    **Do not execute the demotion half yet.** Two current boundaries remain:
 
-   * **Busy force-hibernate coverage is implemented but not yet mandatory**
-     (task #92). Step 10b now starts a real long-running turn, waits for
-     `active_tasks > 0`, proves non-force hibernate returns 409, and then proves
-     force hibernate reaches DB state `hibernated`. If the runtime never reports
-     busy within the bound, however, the default remains a loud idle fallback;
-     only `E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1` makes that missing witness fatal.
-     The workflow does not set that switch yet, so every green run does not
-     deterministically cover the force-on-busy class.
+   * **Busy force-hibernate coverage is still open** (task #92; PR #4384).
+     Step 10b resumes the leaf, calls `/hibernate?force=true`, and verifies both
+     the response and the durable `hibernated` row. It does **not** start a
+     long-running turn, wait for `active_tasks > 0`, or prove that non-force
+     hibernate returns 409 first. The current green path therefore proves an
+     idle force-hibernate transition, not the force-on-busy class that exposed
+     core #4293.
    * **Binary identity is now explicit in the gated staging-CD path, but not in
      the legacy push lane** (task #93). `staging-tenant-cd.yml` waits for the
      immutable `:staging-<sha>` artifact, advances the staging pin, rolls the
@@ -148,8 +149,8 @@ crash-looping containers from other runs and misdirects the RCA (it did).
      as proof of the triggering SHA.
 
    Prove the PR path covers each class live and deterministically before
-   retiring its post-merge coverage. Task #92 has the right witness now, but its
-   fail-closed promotion is not done.
+   retiring its post-merge coverage. Task #92 must add the busy witness and make
+   it mandatory before this lifecycle residual is closed.
 
 ## Bugs this gate caught before it could gate anything
 
