@@ -99,7 +99,7 @@ RUNTIME_DOWNLOAD="$(mktemp -d)" || RUNTIME_INSTALL_STATUS=$?
 if [ "$RUNTIME_INSTALL_STATUS" -eq 0 ]; then
   python3 -m pip download --no-deps --dest "$RUNTIME_DOWNLOAD" \
     --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
-    molecules-workspace-runtime==0.4.5 &&
+    molecules-workspace-runtime==0.4.6 &&
   python3 -m pip install --index-url https://pypi.org/simple/ \
     "$RUNTIME_DOWNLOAD"/molecules_workspace_runtime-*.whl
   RUNTIME_INSTALL_STATUS=$?
@@ -439,8 +439,18 @@ if (String(entry.token).includes("ROTATE_TO_REVEAL_TOKEN")) {
 const lines = fs.existsSync(p) ? fs.readFileSync(p, "utf8").split("\n").filter((l) => l.trim()) : [];
 const cur = lines.find((l) => l.startsWith(KEY));
 let arr = [];
-if (cur) { try { arr = JSON.parse(cur.slice(KEY.length)); } catch (e) { arr = []; } }
-if (!Array.isArray(arr)) arr = [];
+if (cur) {
+  try {
+    arr = JSON.parse(cur.slice(KEY.length));
+  } catch (e) {
+    console.error("molecule: existing MOLECULE_WORKSPACES_JSON is invalid; refusing to overwrite .env.");
+    process.exit(1);
+  }
+  if (!Array.isArray(arr)) {
+    console.error("molecule: existing MOLECULE_WORKSPACES_JSON is invalid; expected a JSON array and refused to overwrite .env.");
+    process.exit(1);
+  }
+}
 arr = arr.filter((w) => !(w && w.id === entry.id && w.platform_url === entry.platform_url));
 arr.push(entry);
 const out = lines.filter((l) => !l.startsWith(KEY)).concat([KEY + JSON.stringify(arr)]).join("\n") + "\n";
@@ -1232,14 +1242,14 @@ const externalOpenClawTemplate = tokenGuardShell + `# OpenClaw MCP config — ou
 # it does not steer an OpenClaw session by itself.
 #
 # Multi-workspace: each workspace registers under a workspace-specific
-# MCP server name ("{{MCP_SERVER_NAME}}"). openclaw keys MCP servers by
-# name in its config (~/.openclaw/mcp/<name>.json), so re-running with
+# MCP server name ("{{MCP_SERVER_NAME}}"). OpenClaw keys MCP servers by
+# name under mcp.servers in ~/.openclaw/openclaw.json, so re-running with
 # a bare "molecule" name would overwrite the prior workspace's entry.
 # Re-run this snippet for another workspace to ADD a sibling entry
 # instead.
 
 # 1. Install the pinned workspace runtime wheel + openclaw CLI. The
-#    canonical 0.4.5 package includes the "molecule-mcp" console script,
+#    canonical 0.4.6 package includes the "molecule-mcp" console script,
 #    which keeps the workspace ALIVE on canvas (register-on-startup +
 #    20s heartbeat).
 ` + externalWorkspaceRuntimeInstall + `
@@ -1296,13 +1306,15 @@ if [ "$RUNTIME_INSTALL_STATUS" -ne 0 ]; then
 fi
 fi
 
-# 4. Start the openclaw gateway as a durable background process.
+# 4. Start the openclaw gateway as a durable background process. Keep the
+#    default profile used by mcp set/onboard/agent above: --dev switches to
+#    ~/.openclaw-dev, where the configured Molecule MCP server is absent.
 #    A bare '&' dies when the terminal closes; nohup + log file keeps
 #    the gateway alive across logout. For systemd-managed hosts,
 #    register a unit instead. This step and the agent turn are skipped if
 #    the MCP configuration above failed.
 if [ "$MOLECULE_TOKEN_OK" = "1" ]; then
-nohup openclaw gateway --dev --port 18789 --bind loopback \
+nohup openclaw gateway --port 18789 --bind loopback \
   > ~/.openclaw/gateway.log 2>&1 &
 disown
 
@@ -1319,9 +1331,12 @@ fi
 #   Common errors:
 #     • Gateway not starting — tail ~/.openclaw/gateway.log. The loopback
 #       bind requires :18789 to be free; check with ` + "`lsof -iTCP:18789`" + `.
-#     • ` + "`openclaw mcp set`" + ` rejected — the heredoc generates JSON;
-#       verify with ` + "`jq < ~/.openclaw/mcp/{{MCP_SERVER_NAME}}.json`" + ` and re-run
-#       ` + "`openclaw mcp set`" + ` if the file is malformed.
+#     • ` + "`openclaw mcp set`" + ` rejected — the heredoc generates JSON.
+#       Inspect the stored entry with
+#       ` + "`openclaw mcp show {{MCP_SERVER_NAME}} --json`" + ` (or list all
+#       entries with ` + "`openclaw mcp list`" + `), then re-run mcp set after
+#       correcting it. OpenClaw stores these entries under mcp.servers in
+#       ~/.openclaw/openclaw.json.
 fi
 fi
 [ "$RUNTIME_INSTALL_STATUS" -eq 0 ]

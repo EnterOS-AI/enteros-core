@@ -134,7 +134,7 @@ func TestExternalRuntimeTemplates_InstallPrivateWheelWithPublicDependencies(t *t
 	for name, body := range runtimeTemplates {
 		for _, required := range []string{
 			"pip download --no-deps",
-			"molecules-workspace-runtime==0.4.5",
+			"molecules-workspace-runtime==0.4.6",
 			"pip install --index-url https://pypi.org/simple/",
 			"molecules_workspace_runtime-*.whl",
 		} {
@@ -168,6 +168,37 @@ func TestExternalRuntimeTemplates_InstallPrivateWheelWithPublicDependencies(t *t
 	}
 	if strings.Contains(externalCodexTemplate, "pip install codex-channel-molecule") {
 		t.Error("externalCodexTemplate advertises a nonexistent public codex-channel-molecule distribution")
+	}
+}
+
+// TestExternalOpenClawTemplate_UsesOneProfileAndCurrentConfigInspection keeps
+// every OpenClaw command on the same default profile. `--dev` switches the
+// gateway to ~/.openclaw-dev, where it cannot see the MCP server that the
+// preceding default-profile `openclaw mcp set` wrote. OpenClaw also stores MCP
+// servers inside openclaw.json; there is no per-server mcp/<name>.json file for
+// operators to inspect.
+func TestExternalOpenClawTemplate_UsesOneProfileAndCurrentConfigInspection(t *testing.T) {
+	snippet := BuildExternalConnectionPayload(
+		"https://app.example.com", "ws-abc123", "My Agent", "wst_real_TOKEN",
+	)["openclaw_snippet"].(string)
+
+	for _, stale := range []string{
+		"openclaw gateway --dev",
+		"~/.openclaw/mcp/",
+	} {
+		if strings.Contains(snippet, stale) {
+			t.Errorf("OpenClaw setup contains stale profile/config guidance %q", stale)
+		}
+	}
+
+	for _, required := range []string{
+		"nohup openclaw gateway --port 18789 --bind loopback",
+		"openclaw mcp show molecule-my-agent --json",
+		"~/.openclaw/openclaw.json",
+	} {
+		if !strings.Contains(snippet, required) {
+			t.Errorf("OpenClaw setup is missing current default-profile guidance %q", required)
+		}
 	}
 }
 

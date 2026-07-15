@@ -35,7 +35,7 @@ var credentialPersistVerbs = []string{
 	"writeFileSync",     // channel .env merge (bun)
 	"renameSync",        // ...and its atomic swap
 	"claude mcp add",    // OVERWRITES the entry for this server name
-	"openclaw mcp set",  // OVERWRITES ~/.openclaw/mcp/<name>.json
+	"openclaw mcp set",  // OVERWRITES mcp.servers.<name> in ~/.openclaw/openclaw.json
 	"cat > ",            // kimi env file (heredoc)
 	"tee ",              // any redirect-free write
 	"gateway --replace", // hermes: kills the running gateway, restarts on the new token
@@ -557,6 +557,54 @@ func TestChannelMergeScript_RefusesTheMarkerAndLeavesDiskIntact(t *testing.T) {
 	}
 	if _, err := os.Stat(envPath(home) + ".tmp"); err == nil {
 		t.Errorf("the refusing run left a .env.tmp behind")
+	}
+}
+
+// TestChannelMergeScript_RejectsInvalidExistingArrayWithoutModification closes
+// the fail-open parse path. Tokens in this multi-workspace file are shown once;
+// treating malformed or non-array JSON as [] and replacing it destroys every
+// recoverable credential. A repair must be explicit, so the generated merge
+// script must fail and preserve the existing file byte-for-byte.
+func TestChannelMergeScript_RejectsInvalidExistingArrayWithoutModification(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{name: "malformed JSON", value: "not-json"},
+		{name: "valid non-array JSON", value: `{"id":"ws-existing","token":"wst_once"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.MkdirAll(filepath.Dir(envPath(home)), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			before := []byte("KEEP_ME=1\nMOLECULE_WORKSPACES_JSON=" + tc.value + "\nAFTER=still-here\n")
+			if err := os.WriteFile(envPath(home), before, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			entry := `{"id":"ws-abc123","token":"wst_new_TOKEN","platform_url":"https://app.example.com"}`
+			stderr, code := runChannelMerge(t, home, entry)
+			if code == 0 {
+				t.Errorf("merge accepted %s and could overwrite shown-once credentials", tc.name)
+			}
+			if !strings.Contains(stderr, "existing MOLECULE_WORKSPACES_JSON is invalid") {
+				t.Errorf("refusal did not explain the invalid existing array: stderr=%q", stderr)
+			}
+
+			after, err := os.ReadFile(envPath(home))
+			if err != nil {
+				t.Fatalf("refusing merge removed the existing .env: %v", err)
+			}
+			if string(after) != string(before) {
+				t.Errorf("refusing merge changed .env bytes\nbefore: %q\nafter:  %q", before, after)
+			}
+			if _, err := os.Stat(envPath(home) + ".tmp"); err == nil {
+				t.Error("refusing merge left a .env.tmp file")
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("inspect .env.tmp: %v", err)
+			}
+		})
 	}
 }
 

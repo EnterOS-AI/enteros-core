@@ -371,8 +371,8 @@ func TestBuildExternalConnectionPayload_McpServerNameUniquePerWorkspace(t *testi
 //   - codex: ~/.codex/config.toml [mcp_servers.<name>] — TOML rejects
 //     duplicate table keys, so a second workspace with the same name
 //     either breaks parsing or overwrites the first table.
-//   - openclaw: ~/.openclaw/mcp/<name>.json — file is keyed by <name>,
-//     `openclaw mcp set <same-name>` overwrites.
+//   - openclaw: ~/.openclaw/openclaw.json mcp.servers.<name> — the map is
+//     keyed by <name>, so `openclaw mcp set <same-name>` overwrites.
 //
 // The three MCP hosts above key a config namespace by NAME, so they must
 // stamp the workspace-specific {{MCP_SERVER_NAME}} slug. This test catches a
