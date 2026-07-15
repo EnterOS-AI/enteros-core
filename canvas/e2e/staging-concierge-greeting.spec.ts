@@ -44,7 +44,7 @@ import { test, expect, type Page, type BrowserContext, type APIRequestContext } 
 import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
 import {
   checkConciergeInvariants,
-  isPureGreeting,
+  isOpeningGreeting,
   unexpectedGreetings,
   findDuplicates,
   type SimpleMessage,
@@ -178,10 +178,12 @@ test.describe("concierge greeting — stored session (server contextId belt)", (
       .post(`${tenantURL}/workspaces/${conciergeId}/chat-session/new`, { headers })
       .catch(() => undefined);
 
-    // Turn 1: the opening 'hi' — expect a greeting.
+    // Turn 1: the opening 'hi' — expect a greeting-shaped introduction. The
+    // concierge may include a longer prose capability summary here; that is a
+    // valid opening, not the bare later-turn greeting isPureGreeting detects.
     const greeting = await sendCanvasTurnNoContext(request, tenantURL, headers, conciergeId, "hi");
     expect(
-      isPureGreeting(greeting),
+      isOpeningGreeting(greeting),
       `the concierge's opening reply was not a greeting: "${greeting.slice(0, 120)}"`,
     ).toBeTruthy();
 
@@ -312,7 +314,7 @@ test.describe("concierge greeting — rendered My Chat (UI)", () => {
     let sawGreeting = false;
     while (Date.now() < replyDeadline) {
       const bubbles = await readRenderedBubbles(page);
-      if (bubbles.some((m) => m.role === "agent" && isPureGreeting(m.content))) {
+      if (bubbles.some((m) => m.role === "agent" && isOpeningGreeting(m.content))) {
         sawGreeting = true;
         break;
       }
