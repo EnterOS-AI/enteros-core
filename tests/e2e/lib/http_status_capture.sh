@@ -14,14 +14,14 @@ capture_http_status() {
   local status_file="$1"
   shift
 
-  local _capture_had_errexit=0 _capture_rc _capture_raw
-  case $- in *e*) _capture_had_errexit=1 ;; esac
+  local _capture_rc _capture_raw
 
   : > "$status_file"
-  set +e
-  "$@" > "$status_file" 2>/dev/null
-  _capture_rc=$?
-  if [ "$_capture_had_errexit" = "1" ]; then set -e; fi
+  if "$@" > "$status_file" 2>/dev/null; then
+    _capture_rc=0
+  else
+    _capture_rc=$?
+  fi
 
   _capture_raw=$(tr -d '[:space:]' < "$status_file" 2>/dev/null || true)
   case "$_capture_raw" in
@@ -35,6 +35,16 @@ capture_http_status() {
   HTTP_CAPTURE_RC="$_capture_rc"
 }
 
+http_code_is_exact_success() {
+  local code="${1:-}" request_rc="${2:-}" expected
+  shift 2
+  [ "$request_rc" = "0" ] || return 1
+  for expected in "$@"; do
+    [ "$code" = "$expected" ] && return 0
+  done
+  return 1
+}
+
 http_code_is_exact_removed_route() {
-  [ "${1:-}" = "404" ]
+  [ "${1:-}" = "404" ] && [ "${2:-}" = "22" ]
 }

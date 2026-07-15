@@ -1094,7 +1094,7 @@ for wid in "${WS_TO_CHECK[@]}"; do
     -w '%{http_code}'
   UP_CODE="$HTTP_CAPTURE_CODE"
   UP_CURL_RC="$HTTP_CAPTURE_RC"
-  if [ "$UP_CODE" != "200" ] && [ "$UP_CODE" != "201" ]; then
+  if ! http_code_is_exact_success "$UP_CODE" "$UP_CURL_RC" 200 201; then
     fail "Workspace $wid image upload returned $UP_CODE (curl_rc=$UP_CURL_RC): $(head -c 500 "$UP_TMP" | sanitize_http_body)"
   fi
   UP_URI=$(python3 -c "
@@ -1139,7 +1139,7 @@ walk(d)
     -w '%{http_code}'
   DL_CODE="$HTTP_CAPTURE_CODE"
   DL_CURL_RC="$HTTP_CAPTURE_RC"
-  if [ "$DL_CODE" != "200" ]; then
+  if ! http_code_is_exact_success "$DL_CODE" "$DL_CURL_RC" 200; then
     fail "Workspace $wid image download returned $DL_CODE (curl_rc=$DL_CURL_RC): $(head -c 300 "$DL_TMP" | sanitize_http_body)"
   fi
   DL_SHA=$(sha256sum "$DL_TMP" | awk '{print $1}')
@@ -1284,7 +1284,7 @@ for wid in "${WS_TO_CHECK[@]}"; do
   PUT_CURL_RC="$HTTP_CAPTURE_RC"
   PUT_BODY_OUT=$(cat "$PUT_TMP" 2>/dev/null || echo "")
   rm -f "$PUT_TMP" "$PUT_CODE_FILE"
-  if [ "$PUT_CODE" != "200" ] && [ "$PUT_CODE" != "204" ]; then
+  if ! http_code_is_exact_success "$PUT_CODE" "$PUT_CURL_RC" 200 204; then
     # EC2-GATED hard-fail (provider signal). The failure class this gate
     # names (path-map / permission drift in template_files_eic.go) is the
     # SSH-via-EIC write path, which only applies to an i-prefixed EC2
@@ -2174,10 +2174,10 @@ print(len(d if isinstance(d, list) else d.get('events', [])))" "$ACTIVITY_TMP" 2
     -o "$SC_BODY" -w "%{http_code}"
   SC_CODE="$HTTP_CAPTURE_CODE"
   SC_CURL_RC="$HTTP_CAPTURE_RC"
-  if ! http_code_is_exact_removed_route "$SC_CODE"; then
-    fail "shared-context route removal requires exact HTTP 404, got $SC_CODE (curl_rc=$SC_CURL_RC): $(head -c 300 "$SC_BODY" | sanitize_http_body)"
+  if ! http_code_is_exact_removed_route "$SC_CODE" "$SC_CURL_RC"; then
+    fail "shared-context route removal requires exact HTTP 404 + curl rc 22, got HTTP $SC_CODE + curl rc $SC_CURL_RC: $(head -c 300 "$SC_BODY" | sanitize_http_body)"
   fi
-  ok "shared-context route confirmed removed (exact HTTP 404)"
+  ok "shared-context route confirmed removed (exact HTTP 404 + curl rc 22)"
   rm -f "$SC_BODY" "$SC_CODE_FILE"
 else
   log "9/11 Canary mode — skipping HMA / peers / activity / memory-edit / shared-context-gone"
