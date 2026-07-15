@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# FULL-JOURNEY staging E2E — the SSOT real-LLM gate that runs PER-PR (as the
-# required "E2E Staging Concierge Creates Workspace" context) AND is mirrored by
-# the deploy-pipeline staging gate that blocks the prod promote
-# (molecule-controlplane scripts/deploy/local-cp-staging-e2e-gate.sh). Every step
-# is a REAL assertion (a deterministic side effect / a real completion), never a
-# PONG. LLM = MiniMax (cheap): the org is platform-managed (the CP LLM proxy
+# FULL-JOURNEY staging E2E — the SSOT real-LLM scenario. Its workflow runs a
+# credential-free syntax self-check on pull requests and the real live journey
+# only on push-to-main / dispatch. It is an independent staging signal, not an
+# ordering dependency for staging-CD or production redeploy. The controlplane
+# pipeline has its own matching staging scenario. Every step here is a REAL
+# assertion (a deterministic side effect / a real completion), never a PONG.
+# LLM = MiniMax (cheap): the org is platform-managed (the CP LLM proxy
 # supplies the MiniMax default) so agent turns stay short + cheap.
 #
 #   STEP 1  CREATE A NEW ORG          via the CP admin API; wait running + tenant
@@ -174,22 +175,22 @@ fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; [ -n "${OBS_RUN_ID:-}" ] && obs_
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # ─── PR-mode early-exit (core#3081 / CR2 #12653) ──────────────────────────────
-# A required status context that never fires on pull_request degrades the
-# merge gate to a silent indefinite pending (the failure mode
-# lint-required-no-paths exists to prevent). The workflow sets
-# E2E_REQUIRE_LIVE=0 on pull_request runs because PRs do not have staging
-# creds wired; the real staging test would just exit 2 at the ADMIN_TOKEN
-# check below. The PR-mode gate is a self-check:
+# The workflow emits this job's status on pull_request, but the context is not
+# presence-required by the merge queue while parked in required-contexts.txt.
+# A posted red still blocks through main's branch-protection wildcard. The
+# workflow sets E2E_REQUIRE_LIVE=0 on pull_request because PRs do not have
+# staging creds wired; the real staging test would exit 2 at the ADMIN_TOKEN
+# check below. The PR-mode arm is a self-check:
 #   - bash -n on the script's own syntax (catches PR-merge regressions
 #     that break the script BEFORE it runs).
-# On push / dispatch / cron, E2E_REQUIRE_LIVE=1, the real staging test
+# On push / dispatch, E2E_REQUIRE_LIVE=1, the real staging test
 # runs against live staging, and skip_loud on missing infra exits 5
 # (HARD FAIL — the false-green guard).
 if [ "${REQUIRE_LIVE}" = "0" ] && [ -z "${ADMIN_TOKEN}" ]; then
   log "PR-mode: E2E_REQUIRE_LIVE=0 and no MOLECULE_ADMIN_TOKEN — skipping live staging test."
-  log "(the real staging test runs on push-to-main / dispatch / cron with E2E_REQUIRE_LIVE=1)"
+  log "(the real staging test runs on push-to-main / dispatch with E2E_REQUIRE_LIVE=1)"
   # Self-check: bash -n on the script's own syntax. The script IS the
-  # gate on push; on PR, the gate is 'script exists and is bash-clean'.
+  # live validation on push; on PR, the arm is 'script exists and is bash-clean'.
   if ! bash -n "$0"; then
     fail "PR-mode self-check FAILED: bash -n on $0 returned non-zero — script has a syntax error"
   fi

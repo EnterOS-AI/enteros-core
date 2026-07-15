@@ -148,10 +148,10 @@ jobs:
           # the candidate's git_sha (EXPECT_REV). This turns the canary swap into a
           # real "the candidate is actually running" gate BEFORE this subset fans out
           # — a swap that silently kept the stale image now REDs the roll instead of
-          # passing a hollow liveness check. (The full A2A provision_workspace
-          # CALLABLE assertion for the prod image is enforced upstream by the
-          # staging gate TestPlatformAgentMgmtMCP_Staging with
-          # E2E_ASSERT_MGMT_MCP_CALLABLE=1, which blocks the prod promote.)
+          # passing a hollow liveness check. This production redeploy is
+          # independent of the staging E2E workflows; those lanes provide separate
+          # evidence and are not an upstream dependency. This job's enforced
+          # controls are its kill switch plus candidate identity and health.
           health_gate() {
             local name="$1" port body sha
             port="$(docker port "$name" 8080/tcp 2>/dev/null | head -1 | sed 's/.*://')"

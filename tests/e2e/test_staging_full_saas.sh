@@ -98,32 +98,22 @@
 #      false-green-on-skip)
 #
 # ─────────────────────────────────────────────────────────────────────────
-# PROMOTION-READINESS (harden/e2e-staging-saas-failclosed):
-#   This harness is being hardened so `E2E Staging SaaS` + `E2E Staging
-#   Platform Boot` can become HARD merge-gates. continue-on-error is NOT
-#   flipped here — that promotion is the CTO's irreversible branch-protection
-#   call. What this branch makes fail-closed (was false-green / un-named
-#   flake before):
-#     • Provision/online waits are bounded readiness-POLLS, not fixed sleeps;
-#       each hard-fails with a named mechanism + last-seen signal on deadline,
-#       never a silent timeout (cp#245 boot-timeout class).
-#     • Peer-discovery (9b) asserts a real 2xx, not just "not 404" — a 5xx /
-#       000 / empty no longer reads as "reachable".
-#     • Activity-log (9b) is ASSERTED reachable (2xx + parseable), not
-#       logged-and-ignored behind `|| echo '[]'`.
-#     • Child activity provenance (10) is asserted (was soft-logged).
-#     • E2E_REQUIRE_LIVE=1 (CI) makes the run exit 5 if it reached the end
-#       without proving a real provision→online→A2A round-trip — no
-#       false-green-on-skip.
-#   STILL BLOCKS making it REQUIRED (must clear before the CTO flips
-#   continue-on-error→false in .gitea/workflows/e2e-staging-saas.yml):
-#     • De-flake window: N consecutive green runs on main for BOTH jobs
-#       (platform-boot shares the cp#245 boot surface — #2187 tracks its
-#       flip). This harness removes the harness-side flake mechanisms; the
-#       remaining surface is real-infra (EC2 cold boot, CF DNS) latency,
-#       already bounded by the readiness polls above.
-#     • Branch-protection required-context wiring is a repo-settings change,
-#       not a code change in this PR.
+# CURRENT EXECUTION / ENFORCEMENT:
+#   • e2e-staging-saas.yml runs this harness live on protected main pushes and
+#     workflow dispatches; pull requests run a credential-free syntax arm.
+#   • The shared-staging contexts are parked below required-contexts.txt's
+#     pending marker, so they are not presence-required by the merge queue. An
+#     emitted red can still block through main's branch-protection wildcard.
+#   • Staging-CD and production redeploy have independent triggers and their
+#     own gate chains; this harness is post-merge/on-demand evidence, not an
+#     ordering dependency for either deployment path.
+#   • The current backend is molecules-server/local Docker. The optional AWS
+#     leak-check knob is retained only for an operator-selected provider; EC2
+#     is not a prerequisite for the active lane.
+#
+# Fail-closed properties retained here: bounded readiness polls, asserted peers
+# and activity, child provenance, and E2E_REQUIRE_LIVE=1 requiring a real
+# provision→online→A2A lifecycle before a live run can report green.
 # ─────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -131,7 +121,7 @@ set -euo pipefail
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 # #48: tolerate an absent admin token here — the PR-mode early-exit below
 # (E2E_REQUIRE_LIVE=0 + no token) handles the pull_request lane cleanly. On a
-# real run (push/dispatch/cron, E2E_REQUIRE_LIVE=1) the missing-token case is
+# real run (push/dispatch, E2E_REQUIRE_LIVE=1) the missing-token case is
 # caught as a HARD FAIL just past the PR-mode block, with a clear message.
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
 RUNTIME="${E2E_RUNTIME:-hermes}"
@@ -230,19 +220,20 @@ require_live_or_die() {
 }
 
 # ─── PR-mode early-exit (#48 — mirrors test_staging_concierge_creates_workspace_e2e.sh) ──
-# This harness is invoked by TWO jobs in e2e-staging-saas.yml:
-#   - e2e-staging-saas         (push/dispatch/cron only; always has creds + REQUIRE_LIVE=1)
-#   - e2e-staging-platform-boot (now ALSO pull_request; #48 made it merge-blocking)
+# This harness is invoked by two jobs in e2e-staging-saas.yml. Both emit a
+# credential-free pull-request status and run live on push/dispatch with
+# E2E_REQUIRE_LIVE=1. Their contexts are not presence-required while parked;
+# an emitted red still blocks through main's branch-protection wildcard.
 # E2E_REQUIRE_LIVE=0 on pull_request runs because PRs do not have staging creds
 # wired; without this block the script would hard-fail at the first admin-auth
 # call and red-X every PR (a false-red, not a real regression). The PR-mode gate
 # is a self-check: bash -n on the script's own syntax (catches PR-merge
-# regressions that would break the real run on push-to-main). On push / dispatch
-# / cron, E2E_REQUIRE_LIVE=1 and the real staging boot runs and HARD FAILs
+# regressions that would break the real run on push-to-main). On push / dispatch,
+# E2E_REQUIRE_LIVE=1 and the real staging boot runs and HARD FAILs
 # (exit 5 via require_live_or_die) on a run that validated no live lifecycle.
 if [ "${REQUIRE_LIVE}" = "0" ] && [ -z "${ADMIN_TOKEN}" ]; then
   log "PR-mode: E2E_REQUIRE_LIVE=0 and no MOLECULE_ADMIN_TOKEN — skipping live staging boot."
-  log "(the real staging boot runs on push-to-main / dispatch / cron with E2E_REQUIRE_LIVE=1)"
+  log "(the real staging boot runs on push-to-main / dispatch with E2E_REQUIRE_LIVE=1)"
   if ! bash -n "$0"; then
     fail "PR-mode self-check FAILED: bash -n on $0 returned non-zero — script has a syntax error"
   fi
@@ -786,8 +777,9 @@ wait_workspaces_online_routable() {
 # without forcing every dispatch to ship them all. Priority order
 # matters — first non-empty wins:
 #
-#   E2E_MINIMAX_API_KEY → claude-code MiniMax path. Cheapest, default
-#     for the cron canary post-2026-05-03. Routes via the claude-code
+#   E2E_MINIMAX_API_KEY → claude-code MiniMax path. Cheapest; selected as the
+#     protected push/dispatch default in 2026-05 and retained today. Routes via
+#     the claude-code
 #     template's `minimax` provider (workspace-configs-templates/
 #     claude-code-default/config.yaml:64-69) which sets
 #     ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic at boot.
@@ -1748,8 +1740,8 @@ fi
 # "error-shaped response" misdirects triage to workspace-server. Observed
 # 2026-06-03/04 across every staging canary on MODEL_SLUG=MiniMax-M2 (the
 # canary default since #2710) — 100% on the parent's first cold turn,
-# identical on main's scheduled synthetic E2E and on PRs (so it is an
-# environmental backend regression, never PR-introduced).
+# identical across the then-scheduled main synthetic and PR runs (so it was an
+# environmental backend regression, not PR-introduced).
 if echo "$AGENT_TEXT" | grep -qiF "message contained no text content"; then
   fail "A2A — EMPTY COMPLETION (backend regression, NOT a platform/workspace-server bug). The configured model (MODEL_SLUG=${MODEL_SLUG:-?}) returned a 2xx completion with no text part; the runtime surfaced 'message contained no text content.'. Operator action: check the staging LLM backend / proxy for the canary model (the claude-code MiniMax-BYOK default is the BARE registered id MiniMax-M2.7 — the colon minimax:MiniMax-M2.7 is UNREGISTERED on claude-code, internal#718) — empty assistant turns, not an auth/quota/boot fault. Raw: $AGENT_TEXT"
 fi

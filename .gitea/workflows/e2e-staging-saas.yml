@@ -36,9 +36,11 @@ name: E2E Staging SaaS (full lifecycle)
 #
 # There is no path/detect-changes gate and no schedule/cron trigger. These live
 # jobs provide post-merge/on-demand staging evidence; they do not gate the core
-# production promote and are not merge-blocking while parked below the pending
-# marker in .gitea/required-contexts.txt. Real per-PR coverage belongs to the
-# isolated ephemeral-CP gate.
+# production promote, and production and staging-CD triggers are independent.
+# While parked below the pending marker, their contexts are not presence-required
+# by the merge queue; an emitted red status still blocks under main's branch-
+# protection wildcard. Real per-PR coverage belongs to the isolated ephemeral-CP
+# gate.
 
 on:
   # RE-ENABLED 2026-07-03 on MOLECULES-SERVER: push/pull_request restored. The
@@ -68,8 +70,8 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Per-SHA grouping (mirrors e2e-api.yml / local-provision-e2e.yml). This job
-# is a status-reporting deploy gate, NOT a shared-fleet mutator: every run
+# Per-SHA grouping (mirrors e2e-api.yml / local-provision-e2e.yml). This job is
+# a status-reporting post-merge validation lane, NOT a shared-fleet mutator: every run
 # provisions its OWN isolated org (slug `e2e-<date>-<run_id>`, see E2E_RUN_ID
 # below), so two commits' runs never corrupt each other's data. A STATIC group
 # would make a newer main push cancel the older commit's in-flight run. A
@@ -635,10 +637,10 @@ jobs:
   # gives the regression its own named status for observability and future
   # promotion. On pull_request it performs a credential-free self-check
   # (E2E_REQUIRE_LIVE=0); on push/dispatch it runs the real staging boot and
-  # fails loud on missing infra. The lane is currently RED on main and parked
-  # below the pending marker in .gitea/required-contexts.txt: it is not
-  # merge-blocking and does not gate production. Promotion requires a current
-  # failure RCA plus reliably green current-head runs.
+  # fails loud on missing infra. The lane is parked below the pending marker in
+  # .gitea/required-contexts.txt, so the merge queue does not require its
+  # presence. A posted red can still block under branch protection. It does not
+  # gate production; promotion requires reliable current-head evidence.
   # bp-exempt: platform-managed boot lane on molecules-server (local-docker); EC2 is a one-line knob (vars.E2E_EC2_ENABLED). Not a required gate.
   e2e-staging-platform-boot:
     name: E2E Staging Platform Boot
@@ -1699,14 +1701,16 @@ jobs:
   # restart — guards the #159 mgmt-MCP self-heal online-gate. Drives
   # TestPluginInstallLifecycle_Staging (workspace-server/internal/staginge2e).
   #
-  # GATING: fail-loud (no continue-on-error) on push/dispatch — a real
-  # red here blocks the deploy path. NOT yet a branch-protection REQUIRED
-  # context: to make it merge-blocking, add
+  # SIGNAL: fail-loud (no continue-on-error) on push/dispatch. A red marks this
+  # independent post-merge validation failed; it does not block staging-CD or
+  # production deployment. It is not presence-required by the merge queue, but
+  # an emitted red can still block under branch protection. To make its presence
+  # required, add
   #   "E2E Staging SaaS (full lifecycle) / E2E Staging Plugin Install Lifecycle"
   # to .gitea/required-contexts.txt AND to branch_protections/main
   # status_check_contexts (owner action — same two-step the platform-boot
-  # gate documents above). Until then it runs + fails loud but is advisory,
-  # exactly like e2e-staging-workspace-requests.
+  # lane documents above). Until then it runs + fails loud as an observed
+  # post-merge signal, exactly like e2e-staging-workspace-requests.
   # bp-required: pending #3133
   e2e-staging-plugin-lifecycle:
     name: E2E Staging Plugin Install Lifecycle
