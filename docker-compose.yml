@@ -194,17 +194,17 @@ services:
 
   # --- Canvas ---
   canvas:
-    # The publish-canvas-image CI workflow runs an ORDERED deploy (core#2226):
-    # build → push :staging-<sha> + :staging-latest → (after green main CI)
-    # re-point :latest to the verified :staging-<sha> by digest. So both tags
-    # below resolve to a CI-green, reproducible build, never a raw/red one.
+    # The publish-canvas-image CI workflow performs ordered registry publication
+    # (core#2226): build → push :staging-<sha> + :staging-latest → (after green
+    # main CI) re-point :latest to the verified :staging-<sha> by digest. This
+    # publishes an image; it does not prove that any live target rolled it out.
     #
-    # Reproducible deploy: pin CANVAS_IMAGE_TAG to the immutable per-commit tag
-    # the ordered deploy produced, e.g.
+    # Reproducible local/host rollout: pin CANVAS_IMAGE_TAG to the immutable
+    # per-commit tag the publication workflow produced, e.g.
     #   CANVAS_IMAGE_TAG=staging-<sha> docker compose pull canvas && docker compose up -d canvas
-    # This makes a tenant/host deploy reproducible. Unset it and the default `latest`
-    # is the prod-blessed tag the ordered deploy keeps pointed at the last
-    # green build — still deterministic vs. the old raw `:latest`.
+    # This makes a tenant/host rollout reproducible. Unset it and the default
+    # `latest` is only the most recently promoted CI-green registry tag. It is
+    # mutable and is not evidence that production is serving that digest.
     #
     # To pin by content digest instead of tag (fully immutable), resolve the
     # digest for a tag from our registry, e.g.

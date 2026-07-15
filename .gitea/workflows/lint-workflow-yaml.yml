@@ -1,4 +1,8 @@
-name: Lint workflow YAML (repository compatibility policy)
+# Historical workflow identifier retained because branch protection and status
+# auditing consume the emitted context. Rename only as a coordinated context
+# migration; the rules below enforce the current repository compatibility
+# policy even though the identifier records their Gitea-1.22.6 origin.
+name: Lint workflow YAML (Gitea-1.22.6-hostile shapes)
 
 # Tier-2 hard-gate lint (RFC internal#219 §1, charter §SOP-N rule (m)).
 # Enforces repository workflow-policy shapes before they reach `main`. Rules 1
