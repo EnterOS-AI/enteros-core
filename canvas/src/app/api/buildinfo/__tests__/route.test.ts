@@ -35,9 +35,9 @@ describe("GET /api/buildinfo", () => {
   });
 
   it("reports BUILD_SHA baked into the Docker image (fleet deploy path)", async () => {
-    // BUILD_SHA is the authoritative source for the ECR-image fleet deploy,
-    // which never runs on Vercel. It must win even when a Vercel var is also
-    // present in the environment.
+    // BUILD_SHA is authoritative for the registry-backed Docker fleet path,
+    // which does not run on Vercel. It must win even when a Vercel variable is
+    // also present in the environment.
     process.env.BUILD_SHA = "deadbeefcafe";
     process.env.VERCEL_GIT_COMMIT_SHA = "should-not-win";
     const res = await GET();

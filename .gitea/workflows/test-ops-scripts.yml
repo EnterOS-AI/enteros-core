@@ -49,6 +49,10 @@ on:
       # without this path the guard would not run on the very diff it guards.
       - '.gitea/required-contexts.txt'
       - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
+      # Active staging guidance is linted by
+      # test_deploy_comment_accuracy.py; changes to either harness must run it.
+      - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
+      - 'tests/e2e/test_staging_full_saas.sh'
   pull_request:
     branches: [main, staging]
     paths:
@@ -71,6 +75,10 @@ on:
       # without this path the guard would not run on the very diff it guards.
       - '.gitea/required-contexts.txt'
       - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
+      # Active staging guidance is linted by
+      # test_deploy_comment_accuracy.py; changes to either harness must run it.
+      - 'tests/e2e/test_staging_concierge_creates_workspace_e2e.sh'
+      - 'tests/e2e/test_staging_full_saas.sh'
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
