@@ -57,12 +57,18 @@ When the requested template does not exist, the Create handler falls back in ord
 `CanCommunicate(callerID, targetID)` determines whether two workspaces may communicate:
 
 - Same workspace → allowed
-- Siblings (same `parent_id`) → allowed
-- Root-level siblings (both `parent_id IS NULL`) → allowed
-- Parent ↔ child → allowed
-- Everything else → denied
+- Siblings sharing the same non-NULL `parent_id` → allowed
+- Ancestor ↔ descendant at any depth → allowed
+- Unrelated roots and workspaces in disjoint subtrees → denied
 
-The A2A proxy (`POST /workspaces/:id/a2a`) enforces this for agent-to-agent calls. Canvas requests (no `X-Workspace-ID` header), self-calls, and system callers (`webhook:*`, `system:*`, `test:*` prefixes via `isSystemCaller()` in `a2a_proxy.go`) bypass the check.
+The A2A proxy (`POST /workspaces/:id/a2a`) authenticates every public HTTP
+caller before applying this rule. A workspace bearer determines the source
+identity; an optional `X-Workspace-ID` must match it. Verified human callers
+bypass hierarchy. A combined self-host/dev Canvas retains a same-origin
+fallback only when control-plane session verification is unconfigured; SaaS
+does not trust those headers. Self-calls still require a bearer. System caller
+prefixes are trusted only on the internal Go call path and are rejected when
+supplied as HTTP headers.
 
 ### Handler Decomposition
 
@@ -114,9 +120,21 @@ Opt-in pattern: when `idle_prompt` is non-empty in `config.yaml`, the workspace 
 
 Three Gin middleware classes gate server-side routes. Full contract in `docs/runbooks/admin-auth.md`.
 
-- **`middleware.AdminAuth(db.DB)`** — strict bearer-only and **fail-closed in every environment** (harden/no-fail-open-auth). Used for any route where a forged request could leak prompts/memory, create/mutate workspaces, or leak ops intel. The former lazy-bootstrap fail-open (pass when `HasAnyLiveTokenGlobal` returns 0) and the dev-mode escape hatch have both been removed — a fresh install must provision `ADMIN_TOKEN` to reach admin routes.
-- **`middleware.CanvasOrBearer(db.DB)`** — accepts a bearer token OR an Origin matching `CORS_ORIGINS`. Used **only** for cosmetic routes where a forged request has zero data/security impact. Currently only on `PUT /canvas/viewport`. Do not extend this to any route that leaks data or creates resources — see the runbook.
-- **`middleware.WorkspaceAuth(db.DB)`** — binds a bearer token to `:id`. Workspace A's token cannot hit workspace B's sub-routes. Used for the entire `/workspaces/:id/*` group except the A2A proxy (which has its own `CanCommunicate` layer).
+- **`middleware.AdminAuth(db.DB)`** — strict credential validation and
+  **fail-closed in every environment**. It accepts a verified control-plane
+  session, org token, or `ADMIN_TOKEN`; the deprecated workspace-token fallback
+  exists only when `ADMIN_TOKEN` is unset. The former zero-token and dev-mode
+  bypasses are removed.
+- **`middleware.CanvasOrBearer(db.DB)`** — accepts a valid bearer or a
+  same-origin `Referer`/`Host` or exact `Origin`/`Host` heuristic only when the
+  combined tenant proxy (`CANVAS_PROXY_URL`) is active. That heuristic is
+  forgeable outside a browser and is therefore used only on the cosmetic
+  `PUT /canvas/viewport` route; do not extend it to data-bearing or mutating
+  surfaces.
+- **`middleware.WorkspaceAuth(db.DB)`** — accepts verified human/admin/org
+  credentials or binds a workspace bearer to `:id`; workspace A's bearer
+  cannot hit workspace B's sub-routes. Used for the `/workspaces/:id/*` group
+  except paths such as A2A that have their own source classifier.
 
 ### Migration Runner (`workspace-server/internal/db/postgres.go`)
 

@@ -43,8 +43,8 @@ INVALID_PROBE_ID="$(gen_uuid)"
 cleanup() {
   local rc=$?
   # Best-effort delete; non-fatal if the row was never created.
-  e2e_delete_workspace "$POLL_WS_ID" "poll-mode-test"
   e2e_delete_workspace "$CALLER_WS_ID" "poll-cross-test"
+  e2e_delete_workspace "$POLL_WS_ID" "poll-mode-test"
   exit $rc
 }
 trap cleanup EXIT
@@ -118,8 +118,46 @@ check "register response echoes delivery_mode=poll"  '"delivery_mode":"poll"' "$
 # Capture the auth token for subsequent /activity reads (Phase 30.1).
 POLL_TOKEN=$(echo "$REG_RESP" | e2e_extract_token || true)
 if [ -z "$POLL_TOKEN" ]; then
-  echo "WARN: no auth_token in register response — token-required reads will fail"
+  echo "FAIL: no auth_token in poll workspace register response"
+  exit 1
 fi
+
+# Register a distinct caller before sending A2A. Platform-proxied A2A no
+# longer has a tokenless-legacy exception: the bearer owner is the source of
+# truth, and a supplied X-Workspace-ID claim must match it. Use both below so
+# this E2E exercises the source-binding contract with a distinct caller.
+CALLER_REG_RESP=$(curl -s -X POST "$BASE/registry/register" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"id\": \"$CALLER_WS_ID\",
+    \"delivery_mode\": \"poll\",
+    \"agent_card\": {\"name\": \"poll-cross-test\"}
+  }")
+check "caller poll-mode workspace registers" '"status":"registered"' "$CALLER_REG_RESP"
+CALLER_TOKEN=$(echo "$CALLER_REG_RESP" | e2e_extract_token || true)
+if [ -z "$CALLER_TOKEN" ]; then
+  echo "FAIL: no auth_token in caller workspace register response"
+  exit 1
+fi
+
+# Make the caller a child of the target so CanCommunicate exercises a real,
+# allowed hierarchy edge. Two unrelated root workspaces are intentionally
+# isolated and would correctly return 403 even with valid source-bound auth.
+ADMIN_AUTH=()
+e2e_admin_auth_args ADMIN_AUTH
+HIER_RESP=$(curl -s -w '\n%{http_code}' -X PATCH "$BASE/workspaces/$CALLER_WS_ID" \
+  "${ADMIN_AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d "{\"parent_id\":\"$POLL_WS_ID\"}")
+HIER_CODE=$(printf '%s' "$HIER_RESP" | tail -n1)
+HIER_BODY=$(printf '%s' "$HIER_RESP" | sed '$d')
+check_eq "caller is attached under poll target (HTTP 200)" "200" "$HIER_CODE"
+check "hierarchy update succeeds" '"status":"updated"' "$HIER_BODY"
+
+A2A_AUTH=(
+  -H "Authorization: Bearer $CALLER_TOKEN"
+  -H "X-Workspace-ID: $CALLER_WS_ID"
+)
 
 # ---------- Phase 2: invalid mode rejected ----------
 echo ""
@@ -143,6 +181,7 @@ echo ""
 echo "--- Phase 3: A2A to poll-mode workspace short-circuits ---"
 
 A2A_RESP=$(curl -s --max-time "$TIMEOUT" -X POST "$BASE/workspaces/$POLL_WS_ID/a2a" \
+  "${A2A_AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
@@ -246,6 +285,7 @@ echo "--- Phase 5: since_id cursor returns ASC, strictly-after ---"
 # Send a SECOND A2A message; it must appear in the cursor-filtered feed,
 # the FIRST message must NOT (cursor is strictly-after).
 A2A_RESP2=$(curl -s --max-time "$TIMEOUT" -X POST "$BASE/workspaces/$POLL_WS_ID/a2a" \
+  "${A2A_AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
@@ -273,6 +313,7 @@ check_not_contains "since_id feed excludes the cursor row itself"  "hello-from-e
 # event after the cursor, so this case is trivially "exactly one row";
 # the next sub-phase strengthens this with a second event).
 A2A_RESP3=$(curl -s --max-time "$TIMEOUT" -X POST "$BASE/workspaces/$POLL_WS_ID/a2a" \
+  "${A2A_AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
@@ -355,22 +396,10 @@ check "410 body explains how to recover" "since_id" "$GONE_BODY"
 echo ""
 echo "--- Phase 7: Cross-workspace cursor isolation ---"
 
-# Register a SECOND poll-mode workspace and try to read its activity
-# feed using a cursor from the FIRST workspace. Must 410 — the cursor
-# is workspace-scoped to prevent UUID-guessing peeks.
-REG2=$(curl -s -X POST "$BASE/registry/register" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"id\": \"$CALLER_WS_ID\",
-    \"delivery_mode\": \"poll\",
-    \"agent_card\": {\"name\": \"poll-cross-test\"}
-  }")
-check "second poll-mode workspace registers" '"status":"registered"' "$REG2"
-CALLER_TOKEN=$(echo "$REG2" | e2e_extract_token || true)
-CROSS_AUTH=()
-[ -n "${CALLER_TOKEN:-}" ] && CROSS_AUTH=(-H "Authorization: Bearer $CALLER_TOKEN")
-
-CROSS_RESP=$(curl -s -w '\n%{http_code}' --max-time "$TIMEOUT" "${CROSS_AUTH[@]}" \
+# Use the already-authenticated caller workspace to read its activity feed
+# with a cursor from the target workspace. Must 410 — the cursor is
+# workspace-scoped to prevent UUID-guessing peeks.
+CROSS_RESP=$(curl -s -w '\n%{http_code}' --max-time "$TIMEOUT" "${A2A_AUTH[@]}" \
   "$BASE/workspaces/$CALLER_WS_ID/activity?since_id=$FIRST_ACTIVITY_ID")
 CROSS_CODE=$(printf '%s' "$CROSS_RESP" | tail -n1)
 check_eq "cross-workspace cursor blocked with 410 (no info leak)" "410" "$CROSS_CODE"

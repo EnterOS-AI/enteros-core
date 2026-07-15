@@ -206,9 +206,11 @@ curl -X POST http://localhost:8080/registry/heartbeat \
 
 If the platform misses two consecutive heartbeats, the workspace shows offline on the canvas.
 
-**5. A2A with `X-Workspace-ID` header:**
+**5. Authenticated A2A:**
 
-When sending A2A messages to sibling or parent workspaces, include the header so the platform can verify mutual auth:
+Send the workspace bearer when calling the platform A2A proxy. The platform
+derives the source workspace from that bearer. `X-Workspace-ID` is an optional,
+recommended explicit claim; if supplied, it must match the bearer owner:
 
 ```bash
 curl -X POST http://localhost:8080/workspaces/ws-pm-123/a2a \

@@ -60,11 +60,12 @@ Tenant platform :8080
    │
    ▼  TenantGuard (allowed; same-origin or header)
    ▼  AdminAuth middleware
-       ├ Tier 0: fail-open (only if no ADMIN_TOKEN and no live tokens)
-       ├ Tier 1: CP session cookie → /cp/auth/tenant-member
+       ├ Auth datastore probe error → 503 (fail closed)
+       ├ Tier 1: verified CP session cookie
        ├ Tier 2a: sha256(bearer) IN org_api_tokens WHERE revoked_at IS NULL   ← THIS
        ├ Tier 2b: bearer == ADMIN_TOKEN (bootstrap / break-glass)
-       └ Tier 3: any live workspace token (deprecated, only if no ADMIN_TOKEN)
+       └ Tier 3: any live workspace token (deprecated fallback only when
+                 ADMIN_TOKEN is unset)
 ```
 
 Cost per request on the hot path: ONE indexed SELECT + one async
