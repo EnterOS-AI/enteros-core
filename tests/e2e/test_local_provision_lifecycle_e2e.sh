@@ -685,9 +685,9 @@ echo ""
 # Step 4 — RESTART-SURVIVAL (the assertion that would have caught the bug).
 # ----------------------------------------------------------------------------
 echo "--- Step 4: restart-survival (POST /workspaces/$WSID/restart) ---"
-# Re-mint the workspace bearer: every (re)provision rotates the workspace token
-# (issueAndInjectToken -> RevokeAllForWorkspace + IssueToken), so the Step-2
-# token is now stale. /restart is WorkspaceAuth-gated, so mint a fresh one.
+# Mint an explicit API-kind workspace bearer for restart and the A2A checks
+# below. Provisioning rotates only runtime-held instance tokens; this caller-held
+# API token survives the restart and remains valid for send + queue polling.
 WTOKEN=$(e2e_mint_workspace_token "$WSID" || true)
 if [ -z "$WTOKEN" ]; then
   fail "could not mint fresh workspace token for restart"
