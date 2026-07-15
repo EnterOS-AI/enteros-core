@@ -143,6 +143,9 @@ assert_collision_proof_slug "$SLUG" || fail "Bug in make_collision_proof_slug: p
 # shellcheck disable=SC1091
 # shellcheck source=lib/model_slug.sh
 source "$(dirname "$0")/lib/model_slug.sh"
+# shellcheck disable=SC1091
+# shellcheck source=lib/reconciler_container.sh
+source "$(dirname "$0")/lib/reconciler_container.sh"
 # Kill primitive + leak sweep — provider-abstracted. The AWS lib is sourced ONLY
 # on the legacy AWS path (its e2e_* helpers are undefined on the molecules-server
 # path, and every call site is provider-branched below).
@@ -583,9 +586,9 @@ while true; do
     # box. This is the real ready signal (status=online AND a resolvable kill
     # target), not the optional API field.
     if [ "$PROVIDER" != "aws" ] && [ $(( $(date +%s) - ONLINE_SINCE )) -ge "$INSTANCE_ID_GRACE_SECS" ] && docker info >/dev/null 2>&1; then
-      WS_FRAG=$(printf '%s' "$WS_ID" | tr -d '-' | cut -c1-12)
-      ORIGINAL_INSTANCE_ID=$(docker ps --format '{{.Names}}' 2>/dev/null \
-        | grep '^mol-ws-' | grep -F -- "-$WS_FRAG" | head -1)
+      WS_FRAG=${WS_ID//-/}
+      WS_FRAG=${WS_FRAG:0:12}
+      ORIGINAL_INSTANCE_ID=$(resolve_molecules_server_container "$WS_ID")
       if [ -n "$ORIGINAL_INSTANCE_ID" ]; then
         log "    instance_id not surfaced by API after ${INSTANCE_ID_GRACE_SECS}s — resolved container from docker: $ORIGINAL_INSTANCE_ID"
         break
