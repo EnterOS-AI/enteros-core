@@ -50,7 +50,6 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/router"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/supervised"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/templatecache"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/ws"
@@ -587,15 +586,26 @@ func main() {
 		registry.StartProvisioningTimeoutSweep(c, broadcaster, registry.DefaultProvisionSweepInterval, wh.ProvisionTimeoutSecondsForRuntime)
 	})
 
-	// Cron Scheduler — fires A2A messages to workspaces on user-defined schedules
-	cronSched := scheduler.New(wh, broadcaster)
-	// Wire the native-scheduler skip — when an adapter's heartbeat
-	// declares provides_native_scheduler=true, the platform's polling
-	// loop drops that workspace's schedules to avoid double-fire (the
-	// SDK runs them itself). See project memory
-	// `project_runtime_native_pluggable.md` and capability primitive #3.
-	cronSched.SetNativeSchedulerCheck(handlers.ProvidesNativeScheduler)
-	go supervised.RunWithRecover(ctx, "scheduler", cronSched.Start)
+	// Cron scheduling is no longer run by core (scheduler-as-trigger-plugin
+	// RFC, P4). Every maintained runtime carries the kind:trigger scheduler
+	// plugin, so schedules are volume-authoritative and fired by the runtime
+	// daemon; core only proxies the Canvas/admin CRUD surface to the volume
+	// (internal/handlers/schedules_proxy.go). The old poll-and-fire loop
+	// (internal/scheduler) and the workspace_schedules table have been retired.
+	// The native-scheduler capability check that used to gate double-fire is
+	// therefore unnecessary — there is no core loop left to skip.
+	//
+	// The phantom-busy counter-drift sweep that used to ride the scheduler's
+	// tick loop survives as its own worker: active_tasks > 0 gates A2A
+	// dispatch / hibernation / discovery platform-wide, so a drifted counter
+	// must still be reset even though no core cron loop reads it any more.
+	// Disable via PHANTOM_BUSY_SWEEPER_DISABLED=true.
+	if !strings.EqualFold(os.Getenv("PHANTOM_BUSY_SWEEPER_DISABLED"), "true") {
+		phantomSweeper := handlers.NewPhantomBusySweeper(nil)
+		go supervised.RunWithRecover(ctx, "phantom-busy-sweeper", phantomSweeper.Start)
+	} else {
+		log.Printf("PhantomBusySweeper: disabled via PHANTOM_BUSY_SWEEPER_DISABLED")
+	}
 
 	// Hibernation Monitor — auto-pauses idle workspaces that have
 	// hibernation_idle_minutes configured (#711). Wakeup is triggered
@@ -648,9 +658,6 @@ func main() {
 	// Channel Manager — social channel integrations (Telegram, Slack, etc.)
 	channelMgr := channels.NewManager(wh, broadcaster)
 	go supervised.RunWithRecover(ctx, "channel-manager", channelMgr.Start)
-
-	// Wire channel manager into scheduler for auto-posting cron output to Slack
-	cronSched.SetChannels(channelMgr)
 
 	// Router
 	// Plugin registry — created before Setup so the same registry is shared
