@@ -97,6 +97,131 @@ def test_required_contexts_green_rejects_pending_with_descriptive_prefix():
     )
 
 
+# ── core#4363: BP wildcard "*" handling ─────────────────────────────────────
+# Production branch protection on main is status_check_contexts=['*']. Until this
+# fix, required_contexts_green treated "*" as a LITERAL context name, so it
+# returned (False, ["*=missing"]) on EVERY PR — even a fully green one — and the
+# merge queue decided `wait` on all of them. The bot merged nothing; humans did
+# every merge. These tests exercise the ['*'] path the existing suite never did
+# (its _ready_kwargs uses a literal required_contexts list).
+
+
+def test_wildcard_all_posted_green_is_green():
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "success"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is True, bad
+    assert bad == []
+
+
+def test_wildcard_waits_on_any_posted_red():
+    # Negative control: with "*", ANY posted non-success blocks — there is no
+    # advisory tier (matches BP ['*'] and task #113).
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "failure"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["E2E Chat / E2E Chat (pull_request)=failure"]
+
+
+def test_wildcard_waits_on_any_posted_pending():
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["E2E Chat / E2E Chat (pull_request)=pending"]
+
+
+def test_wildcard_with_zero_posted_is_vacuously_green_at_this_layer():
+    # With NO posted statuses, "*" has nothing to reject -> green at THIS layer.
+    # That is intentional and safe ONLY because the PRESENCE of specific contexts
+    # is enforced separately by step 4b (enforced_file_contexts from
+    # .gitea/required-contexts.txt). See test_wildcard_green_but_enforced_file_
+    # context_missing_waits below for the composition.
+    ok, bad = mq.required_contexts_green({}, ["*"])
+    assert ok is True
+    assert bad == []
+
+
+def test_wildcard_plus_literal_dedupes_a_double_flag():
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "failure"},
+    ])
+    ok, bad = mq.required_contexts_green(
+        latest, ["*", "CI / all-required (pull_request)"]
+    )
+    assert ok is False
+    # flagged by both the wildcard sweep and the literal check -> listed ONCE
+    assert bad == ["CI / all-required (pull_request)=failure"]
+
+
+def test_non_required_red_present_is_false_under_wildcard():
+    # Defense in depth for the force_merge path: under "*", nothing is
+    # "non-required", so force must never be justified by a "non-required red".
+    # A literal reading here would call this red non-required -> force=True ->
+    # force_merge bypasses Gitea BP. Fail closed.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "some advisory / lint (pull_request)", "status": "failure"},
+    ])
+    assert mq._non_required_red_present(latest, ["*"]) is False
+
+
+def test_wildcard_ready_pr_merges_end_to_end():
+    # THE POINT: with the production ['*'] required set and an all-green head,
+    # the queue now reaches decision.ready — i.e. the bot would actually merge.
+    # Before the fix this returned action="wait" forever.
+    decision = mq.evaluate_merge_readiness(**_ready_kwargs(required_contexts=["*"]))
+    assert decision.action == "merge", decision.reason
+    assert decision.ready is True
+    assert decision.force is False
+
+
+def test_wildcard_ready_pr_with_a_red_waits_end_to_end():
+    # Negative control on the whole decision: same ['*'] set, but a red in the PR
+    # head statuses -> the bot must WAIT, never merge.
+    kwargs = _ready_kwargs(required_contexts=["*"])
+    kwargs["pr_status"] = {
+        "state": "failure",
+        "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
+            {"context": "E2E Chat / E2E Chat (pull_request)", "status": "failure"},
+        ],
+    }
+    decision = mq.evaluate_merge_readiness(**kwargs)
+    assert decision.ready is False
+    assert decision.action == "wait"
+    # Assert the REASON names the actual red, not just that it waited. The old
+    # buggy code ALSO returned wait here (via `*=missing`), so an action-only
+    # assertion passes against the bug too — it must fail closed for the RIGHT
+    # reason (the E2E Chat failure), which only the fixed '*' sweep produces.
+    assert "E2E Chat / E2E Chat (pull_request)=failure" in decision.reason
+    assert "*=missing" not in decision.reason
+
+
+def test_wildcard_green_but_enforced_file_context_missing_waits():
+    # THE CROWN JEWEL: step 4b (.gitea/required-contexts.txt presence check) is
+    # now REACHABLE. All BP-posted contexts are green ('*' passes), but a
+    # required-contexts.txt entry never posted at all -> the queue must WAIT.
+    # Before the fix, step 4 returned wait first and this check was dead code.
+    decision = mq.evaluate_merge_readiness(
+        **_ready_kwargs(
+            required_contexts=["*"],
+            enforced_file_contexts=["E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path"],
+        )
+    )
+    assert decision.ready is False
+    assert decision.action == "wait"
+    assert "enforced" in decision.reason.lower() or "ephemeral" in decision.reason.lower()
+
+
 def test_choose_next_pr_sorts_by_queue_label_timestamp_then_number():
     issues = [
         {

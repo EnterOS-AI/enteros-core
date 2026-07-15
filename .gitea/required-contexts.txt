@@ -15,18 +15,16 @@
 #      (full lifecycle) / E2E Staging Concierge Creates Workspace` RED for
 #      exactly this reason).
 #
-#      ⚠ IT DOES NOT DO THIS TODAY (#4363). The check that reads this file
-#      (step 4b) sits behind a branch-protection check (step 4) that ALWAYS
-#      FAILS: BP on main is status_check_contexts=['*'], the queue treats '*'
-#      as a LITERAL context name, finds no posted status called "*", and
-#      returns `wait` — on every PR, including a fully green one. Step 4b is
-#      unreachable, so NONE of the entries below are enforced by the queue.
-#      Every merge on main is performed by a human, not the queue actor.
-#
-#      This file is still the SSOT and still worth curating — lint-no-coe-on-
-#      required (1) does read it, and (2) goes live the moment #4363 lands.
-#      But do NOT cite "it's above the marker" as proof that a MISSING context
-#      blocks a merge. Today only BP ['*'] on a POSTED red blocks.
+#      ENFORCED FOR REAL as of #4363 (2026-07-14). This block previously
+#      warned that step 4b was unreachable dead code — the queue treated BP's
+#      status_check_contexts=['*'] as a LITERAL context name, so step 4
+#      (required_contexts_green) returned `wait` on every PR and step 4b never
+#      ran. #4363 fixed the '*' handling (it now means "every POSTED context
+#      must be success"), so step 4b IS reached and the entries above the
+#      `# pending-` marker are now genuinely presence-required at merge time.
+#      A context listed here that never posts now BLOCKS the merge — which is
+#      the whole point. (That fix also un-jammed the autonomous merge queue;
+#      before it, every merge on main was performed by a human.)
 #
 # Form: "<workflow name> / <job name>" (event suffix stripped — the gate
 # strips `(pull_request)` / `(push)` / `(pull_request_target)` on both
@@ -89,32 +87,20 @@ Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 # hide the context. Parking a flaky-but-real gate is how a gate becomes a
 # decoration.
 #
-# ⚠ AND NOW THE PART THIS FILE HAS TO ADMIT ABOUT ITSELF (#4363).
+# ENFORCEMENT HISTORY (#4363, resolved 2026-07-14).
 #
-# NONE of the entries above are actually enforced right now — not this one, not
-# `CI / all-required`, not `Secret scan`. The header says the merge queue enforces
-# everything above the first pending marker. That is the DESIGN. It is not what
-# the code does.
+# This block used to warn that NONE of the entries above were actually enforced:
+# gitea-merge-queue.py evaluated branch protection first (step 4), BP on main is
+# status_check_contexts=['*'], and the queue treated '*' as a LITERAL context
+# name — required_contexts_green(<all green>, ['*']) returned (False, ['*=missing'])
+# on every PR, so it decided `wait` on all of them and step 4b (the check that
+# reads THIS file) was unreachable. The bot merged nothing; humans did every merge.
 #
-# gitea-merge-queue.py evaluates branch protection FIRST (step 4), and BP on main
-# is `status_check_contexts: ["*"]`. The queue treats '*' as a LITERAL context
-# name and looks for a posted status called "*". There is none, so:
-#
-#   required_contexts_green(<every status green>, ['*']) -> (False, ['*=missing'])
-#
-# It returns `wait` — on every PR, including a fully green one. Step 4b, the
-# `enforced_file_contexts` check that reads THIS FILE, sits after step 4 and is
-# therefore unreachable. There is no wildcard expansion anywhere in the script.
-# (Second, independent blocker: the three GOVERNANCE_REQUIRED_CONTEXTS producers
-# — qa-review, security-review, sop-checklist — are all `disabled_manually`, so
-# those contexts never post either.)
-#
-# Which is why every merge on main is performed by a human account, never by the
-# queue actor. This file has been documentation, not enforcement, the whole time.
-#
-# So: keep curating it — it is the SSOT and it becomes live the moment #4363 lands
-# — but do NOT cite "it's in required-contexts.txt" as proof that a missing
-# context blocks a merge. Today, only BP ['*'] on a POSTED red actually blocks.
+# #4363 fixed the '*' handling to mean "every POSTED context must be success",
+# which is Gitea's real semantics. Step 4b is now reached, so the entries above
+# the marker are genuinely presence-required: a listed context that never posts
+# now BLOCKS the merge. (The GOVERNANCE_REQUIRED_CONTEXTS second-blocker was
+# already resolved separately — that list is now empty.)
 E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path
 
 # RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────

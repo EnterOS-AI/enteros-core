@@ -651,12 +651,42 @@ def required_contexts_green(
     latest_statuses: dict[str, dict],
     contexts: list[str],
 ) -> tuple[bool, list[str]]:
+    # Gitea branch protection uses the wildcard "*" in status_check_contexts to
+    # mean "every POSTED commit status must be success" — NOT a context literally
+    # named "*". Reading it literally (`latest_statuses.get("*")` -> None ->
+    # "missing") made this return (False, ["*=missing"]) for EVERY PR, including a
+    # fully green one — so the queue decided `wait` on all of them and step 4b
+    # (the `.gitea/required-contexts.txt` presence check) was never reached. The
+    # queue thus merged nothing, and every merge on main was performed by a human
+    # (core#4363). Expand "*" to Gitea's real semantics.
+    #
+    # A "*" set is a SUPERSET check (all posted must be green), and a literal
+    # entry is a PRESENCE check (that named context must be posted AND green) —
+    # the two compose: "*" catches any posted red; literal names catch a context
+    # that never posted. Both are evaluated; results are de-duped so a context
+    # flagged by both branches is reported once.
     missing_or_bad: list[str] = []
+    seen: set[str] = set()
+
+    def _flag(ctx: str, state: str) -> None:
+        if ctx in seen:
+            return
+        seen.add(ctx)
+        missing_or_bad.append(f"{ctx}={state or 'missing'}")
+
+    if "*" in contexts:
+        for ctx, status in latest_statuses.items():
+            state = status_state(status or {})
+            if state != "success":
+                _flag(ctx, state)
+
     for context in contexts:
-        status = latest_statuses.get(context)
-        state = status_state(status or {})
+        if context == "*":
+            continue
+        state = status_state(latest_statuses.get(context) or {})
         if state != "success":
-            missing_or_bad.append(f"{context}={state or 'missing'}")
+            _flag(context, state)
+
     return not missing_or_bad, missing_or_bad
 
 
@@ -1380,6 +1410,15 @@ def _non_required_red_present(
     have already verified every REQUIRED context is green and approvals are
     genuine, so force only bypasses these non-required reds).
     """
+    # Under a wildcard required set ("*"), EVERY posted context is required, so
+    # there is no such thing as a "non-required red" and force_merge must never
+    # be justified this way. Defense in depth: step 4 (required_contexts_green)
+    # already WAITs on any posted red once "*" is expanded, so we should never
+    # reach here with a red present — but a literal reading of "*" here would
+    # classify every red as "non-required", set force=True, and force_merge would
+    # bypass Gitea's own BP. Fail closed. (core#4363)
+    if "*" in required_contexts:
+        return False
     required = set(required_contexts)
     for context, status in latest.items():
         if context in required:
