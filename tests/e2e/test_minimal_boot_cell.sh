@@ -12,9 +12,11 @@
 #   4. The EXIT trap confirms the admin purge and verifies the org is absent.
 #
 # Org creation intentionally sends only the current control-plane contract:
-# slug, name, owner_user_id, and provider. Runtime/model/billing are deployment
-# defaults, fetched by the workflow from Infisical and verified by the live cell;
-# they are not valid POST /cp/admin/orgs request fields.
+# slug, name, owner_user_id, and provider. Runtime is fetched by the workflow
+# from Infisical and verified against GET /workspaces/:id. Model and billing are
+# intentionally not sent or claimed: they are not valid org-create fields, and
+# this API does not expose an authoritative identity for them. The A2A assertion
+# proves the deployed default LLM route completes.
 
 set -uo pipefail
 
@@ -29,10 +31,9 @@ source "$SCRIPT_DIR/lib/completion_assert.sh"
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 RUNTIME="${E2E_RUNTIME:-claude-code}"
-BILLING_MODE="${E2E_BILLING_MODE:-platform_managed}"
 PROVIDER="${E2E_PROVIDER:-molecules-server}"
-MODEL="${E2E_MODEL:-${MOLECULE_LLM_DEFAULT_MODEL:-minimax/MiniMax-M2.7}}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}"
+TENANT_READY_TIMEOUT_SECS="${E2E_TENANT_READY_TIMEOUT_SECS:-300}"
 REGISTER_TIMEOUT_SECS="${E2E_REGISTER_TIMEOUT_SECS:-180}"
 A2A_TIMEOUT_SECS="${E2E_A2A_TIMEOUT_SECS:-120}"
 KEEP_ORG="${E2E_KEEP_ORG:-}"
@@ -62,6 +63,9 @@ TENANT_TOKEN=""
 TENANT_URL=""
 RESULT_JSON="/tmp/cell-result.json"
 PROVISION_BODY="/tmp/cell-provision-${SLUG}.json"
+TENANT_HEALTH_BODY="/tmp/cell-tenant-health-${SLUG}.txt"
+WORKSPACE_LIST_BODY="/tmp/cell-workspaces-${SLUG}.json"
+WORKSPACE_DETAIL_BODY="/tmp/cell-workspace-detail-${SLUG}.json"
 A2A_BODY="/tmp/cell-a2a-${SLUG}.json"
 A2A_QUEUE_BODY="/tmp/cell-a2a-queue-${SLUG}.json"
 PROVISION_START_EPOCH="$(date +%s)"
@@ -71,19 +75,17 @@ TEARDOWN_STATUS="not_attempted"
 
 write_result() {
   local elapsed="${1:-0}"
-  python3 - "$RESULT_JSON" "$RUNTIME" "$BILLING_MODE" "$PROVIDER" "$MODEL" \
+  python3 - "$RESULT_JSON" "$RUNTIME" "$PROVIDER" \
     "$WORKSPACE_ID" "$REGISTER_STATUS" "$COMPLETION_STATUS" \
     "$TEARDOWN_STATUS" "$elapsed" "$EXIT_CODE" <<'PY'
 import json, sys
 from datetime import datetime, timezone
 
-path, runtime, billing, provider, model, workspace, registered, completion, teardown, elapsed, code = sys.argv[1:]
+path, runtime, provider, workspace, registered, completion, teardown, elapsed, code = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as fh:
     json.dump({
         "runtime": runtime,
-        "billing_mode": billing,
         "provider": provider,
-        "model": model,
         "workspace_id": workspace,
         "register_status": registered,
         "completion_status": completion,
@@ -125,7 +127,7 @@ on_exit() {
       -H "Authorization: Bearer ${ADMIN_TOKEN}" \
       -H "Content-Type: application/json" \
       -d "{\"confirm\":\"${SLUG}\"}" \
-      "$CP_URL/cp/admin/tenants/$SLUG" 2>/dev/null || echo 000)
+      "$CP_URL/cp/admin/tenants/$SLUG" 2>/dev/null) || teardown_code=000
     log "DELETE /cp/admin/tenants/$SLUG -> HTTP $teardown_code"
 
     local remaining=1 waited=0
@@ -149,7 +151,8 @@ on_exit() {
   write_result "$elapsed"
   echo "Structured results written to $RESULT_JSON"
   python3 -m json.tool "$RESULT_JSON" 2>/dev/null || true
-  rm -f "$PROVISION_BODY" "$A2A_BODY" "$A2A_QUEUE_BODY"
+  rm -f "$PROVISION_BODY" "$TENANT_HEALTH_BODY" "$WORKSPACE_LIST_BODY" \
+    "$WORKSPACE_DETAIL_BODY" "$A2A_BODY" "$A2A_QUEUE_BODY"
   trap - EXIT
   exit "$EXIT_CODE"
 }
@@ -195,7 +198,7 @@ poll_a2a_queue_result() {
     local code resp status
     code=$(tenant_call GET "/workspaces/${WORKSPACE_ID}/a2a/queue/${QUEUE_ID}" \
       --max-time 30 -H "X-Workspace-ID: ${WORKSPACE_ID}" \
-      -o "$A2A_QUEUE_BODY" -w '%{http_code}' 2>/dev/null || echo 000)
+      -o "$A2A_QUEUE_BODY" -w '%{http_code}' 2>/dev/null) || code=000
     resp=$(cat "$A2A_QUEUE_BODY" 2>/dev/null || echo "")
     if [ "$code" = "200" ]; then
       status=$(printf '%s' "$resp" | python3 -c '
@@ -241,7 +244,7 @@ print(json.dumps({
 PY
 )
 PROVISION_HTTP_CODE=$(admin_call POST /cp/admin/orgs -d "$PROVISION_PAYLOAD" \
-  -o "$PROVISION_BODY" -w '%{http_code}' 2>/dev/null || echo 000)
+  -o "$PROVISION_BODY" -w '%{http_code}' 2>/dev/null) || PROVISION_HTTP_CODE=000
 PROVISION_RESP=$(cat "$PROVISION_BODY" 2>/dev/null || echo "")
 if ! [[ "$PROVISION_HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
   fail "org create failed HTTP $PROVISION_HTTP_CODE: $(safe_body_preview "$PROVISION_RESP")"
@@ -293,13 +296,53 @@ except Exception: print("")
 ' 2>/dev/null || echo "")
 [ -n "$TENANT_TOKEN" ] || fail "admin-token response omitted admin_token"
 
+# A running control-plane instance is not sufficient: DNS, TLS, and the tenant
+# edge route must answer before a workspace-detail failure can be attributed to
+# the workspace server. Keep this phase explicit so a 000/edge error cannot be
+# misreported as a runtime registration failure.
+echo "::group::Tenant edge readiness"
+deadline=$(( $(date +%s) + TENANT_READY_TIMEOUT_SECS ))
+TENANT_HEALTH_CODE="000"
+LAST_TENANT_HEALTH_CODE=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  TENANT_HEALTH_CODE=$(curl "${CURL_COMMON[@]}" "$TENANT_URL/health" \
+    -o "$TENANT_HEALTH_BODY" -w '%{http_code}' 2>/dev/null) || TENANT_HEALTH_CODE=000
+  if [ "$TENANT_HEALTH_CODE" != "$LAST_TENANT_HEALTH_CODE" ]; then
+    log "tenant /health -> HTTP $TENANT_HEALTH_CODE"
+    LAST_TENANT_HEALTH_CODE="$TENANT_HEALTH_CODE"
+  fi
+  [[ "$TENANT_HEALTH_CODE" =~ ^2[0-9][0-9]$ ]] && break
+  sleep 5
+done
+TENANT_HEALTH_RESP=$(cat "$TENANT_HEALTH_BODY" 2>/dev/null || echo "")
+if ! [[ "$TENANT_HEALTH_CODE" =~ ^2[0-9][0-9]$ ]]; then
+  FAIL_CODE=4
+  fail "tenant edge did not become healthy within ${TENANT_READY_TIMEOUT_SECS}s (http=$TENANT_HEALTH_CODE body=$(safe_body_preview "$TENANT_HEALTH_RESP"))"
+fi
+ok "Tenant DNS/TLS/edge route is healthy"
+echo "::endgroup::"
+
 # Assertion 2: the platform root must have registered and be heartbeat-online.
 echo "::group::Assertion 2: platform root registered and online"
 deadline=$(( $(date +%s) + REGISTER_TIMEOUT_SECS ))
 LAST_WORKSPACE_STATUS=""
+LAST_WORKSPACE_LIST_CODE=""
+LAST_WORKSPACE_DETAIL_CODE=""
+WS_CODE="000"
+WS_LIST=""
+WS_DETAIL_CODE="000"
+WS_DETAIL=""
+WS_STATUS=""
+WS_URL=""
+WS_HEARTBEAT=""
+WS_RUNTIME=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  WS_CODE=$(tenant_call GET /workspaces -o "$A2A_QUEUE_BODY" -w '%{http_code}' 2>/dev/null || echo 000)
-  WS_LIST=$(cat "$A2A_QUEUE_BODY" 2>/dev/null || echo '[]')
+  WS_CODE=$(tenant_call GET /workspaces -o "$WORKSPACE_LIST_BODY" -w '%{http_code}' 2>/dev/null) || WS_CODE=000
+  WS_LIST=$(cat "$WORKSPACE_LIST_BODY" 2>/dev/null || echo '[]')
+  if [ "$WS_CODE" != "$LAST_WORKSPACE_LIST_CODE" ]; then
+    log "GET /workspaces -> HTTP $WS_CODE"
+    LAST_WORKSPACE_LIST_CODE="$WS_CODE"
+  fi
   if [ "$WS_CODE" = "200" ]; then
     WORKSPACE_ID=$(printf '%s' "$WS_LIST" | python3 -c '
 import json, sys
@@ -311,16 +354,24 @@ for row in rows if isinstance(rows, list) else []:
 ' 2>/dev/null || echo "")
   fi
   if [ -n "$WORKSPACE_ID" ]; then
-    WS_DETAIL=$(tenant_call GET "/workspaces/$WORKSPACE_ID" 2>/dev/null || echo '{}')
-    eval "$(printf '%s' "$WS_DETAIL" | python3 -c '
+    WS_DETAIL_CODE=$(tenant_call GET "/workspaces/$WORKSPACE_ID" \
+      -o "$WORKSPACE_DETAIL_BODY" -w '%{http_code}' 2>/dev/null) || WS_DETAIL_CODE=000
+    WS_DETAIL=$(cat "$WORKSPACE_DETAIL_BODY" 2>/dev/null || echo '{}')
+    if [ "$WS_DETAIL_CODE" = "200" ]; then
+      eval "$(printf '%s' "$WS_DETAIL" | python3 -c '
 import json, shlex, sys
 try: row = json.load(sys.stdin)
 except Exception: row = {}
-for key, field in (("WS_STATUS", "status"), ("WS_URL", "url"), ("WS_HEARTBEAT", "last_heartbeat_at"), ("WS_RUNTIME", "runtime"), ("WS_MODEL", "model")):
-    print(f"{key}={shlex.quote(str(row.get(field) or \"\"))}")
+for key, field in (("WS_STATUS", "status"), ("WS_URL", "url"), ("WS_HEARTBEAT", "last_heartbeat_at"), ("WS_RUNTIME", "runtime")):
+    print(key + "=" + shlex.quote(str(row.get(field) or "")))
 ' 2>/dev/null)"
-    if [ "${WS_STATUS:-}" != "$LAST_WORKSPACE_STATUS" ]; then
-      log "platform root -> ${WS_STATUS:-<none>}"; LAST_WORKSPACE_STATUS="${WS_STATUS:-}"
+    else
+      WS_STATUS=""; WS_URL=""; WS_HEARTBEAT=""; WS_RUNTIME=""
+    fi
+    if [ "$WS_DETAIL_CODE" != "$LAST_WORKSPACE_DETAIL_CODE" ] || [ "${WS_STATUS:-}" != "$LAST_WORKSPACE_STATUS" ]; then
+      log "GET /workspaces/$WORKSPACE_ID -> HTTP $WS_DETAIL_CODE status=${WS_STATUS:-<none>}"
+      LAST_WORKSPACE_DETAIL_CODE="$WS_DETAIL_CODE"
+      LAST_WORKSPACE_STATUS="${WS_STATUS:-}"
     fi
     if [ "${WS_STATUS:-}" = "online" ] && [ -n "${WS_URL:-}" ] && [ -n "${WS_HEARTBEAT:-}" ]; then
       REGISTER_STATUS="ok"
@@ -331,13 +382,17 @@ for key, field in (("WS_STATUS", "status"), ("WS_URL", "url"), ("WS_HEARTBEAT", 
 done
 if [ "$REGISTER_STATUS" != "ok" ]; then
   FAIL_CODE=4
-  fail "platform root did not become online+routable+heartbeat-registered within ${REGISTER_TIMEOUT_SECS}s (id=${WORKSPACE_ID:-none} status=${WS_STATUS:-none})"
+  fail "platform root did not become online+routable+heartbeat-registered within ${REGISTER_TIMEOUT_SECS}s (id=${WORKSPACE_ID:-none} status=${WS_STATUS:-none} list_http=${WS_CODE:-000} detail_http=${WS_DETAIL_CODE:-000} detail_body=$(safe_body_preview "${WS_DETAIL:-}") list_body=$(safe_body_preview "${WS_LIST:-}" 800))"
 fi
-if [ -n "${WS_RUNTIME:-}" ] && [ "$WS_RUNTIME" != "$RUNTIME" ]; then
+[ -n "$WS_RUNTIME" ] || {
+  FAIL_CODE=4
+  fail "platform root detail omitted runtime"
+}
+[ "$WS_RUNTIME" = "$RUNTIME" ] || {
   FAIL_CODE=4
   fail "platform root runtime=$WS_RUNTIME, expected SSOT runtime=$RUNTIME"
-fi
-ok "Registration visible through tenant API (workspace_id=$WORKSPACE_ID runtime=${WS_RUNTIME:-$RUNTIME} model=${WS_MODEL:-$MODEL})"
+}
+ok "Registration visible through tenant API (workspace_id=$WORKSPACE_ID runtime=$WS_RUNTIME)"
 echo "::endgroup::"
 
 # Assertion 3: a real, deterministic A2A completion on the current route.
@@ -361,7 +416,7 @@ for attempt in 1 2 3; do
   A2A_CODE=$(tenant_call POST "/workspaces/${WORKSPACE_ID}/a2a" \
     --max-time "$A2A_TIMEOUT_SECS" -H "Content-Type: application/json" \
     -H "X-Workspace-ID: ${WORKSPACE_ID}" -d "$A2A_PAYLOAD" \
-    -o "$A2A_BODY" -w '%{http_code}' 2>/dev/null || echo 000)
+    -o "$A2A_BODY" -w '%{http_code}' 2>/dev/null) || A2A_CODE=000
   A2A_RESP=$(cat "$A2A_BODY" 2>/dev/null || echo "")
   if [[ "$A2A_CODE" =~ ^2[0-9][0-9]$ ]]; then A2A_OK=1; break; fi
   if [[ "$A2A_CODE" =~ ^50[234]$ ]] && [ "$attempt" -lt 3 ]; then
