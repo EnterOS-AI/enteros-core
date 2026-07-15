@@ -39,6 +39,10 @@ class MinimalBootCellContractTest(unittest.TestCase):
         self.assertIn("python3 tests/test_minimal_boot_cell_contract.py", WORKFLOW)
         self.assertRegex(WORKFLOW, r"timeout-minutes:\s*(?:2[0-9]|[3-9][0-9])")
 
+    def test_workflow_name_does_not_claim_a_specific_ssot_runtime(self) -> None:
+        self.assertNotIn("Minimal cell (claude-code", WORKFLOW)
+        self.assertIn("Minimal cell (SSOT runtime", WORKFLOW)
+
 
 if __name__ == "__main__":
     unittest.main()

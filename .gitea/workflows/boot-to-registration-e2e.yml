@@ -25,10 +25,8 @@ name: boot-to-registration-e2e
 # The checked-in values are fail-safe local/untrusted-ref fallbacks only.
 
 on:
-  # RE-ENABLED (group A): molecules-server (local-docker) replaces the closed AWS EC2 path,
-  # so the minimal cell provisions at ~zero cloud spend and can gate again. Path-scoped to the
-  # harness + this workflow so unrelated PRs don't spin a real tenant (mirrors the sibling e2e
-  # lanes). schedule/workflow_run stay OFF (no-nightly-e2e rule).
+  # Path-scoped to the harness and its direct dependencies so unrelated PRs do
+  # not provision a real staging tenant. schedule/workflow_run stay disabled.
   push:
     branches: [main, staging]
     paths:
@@ -75,7 +73,7 @@ jobs:
   # bp-exempt: not presence-required in .gitea/required-contexts.txt. The live
   # wildcard still makes any posted failure blocking; see core#4392.
   minimal-cell:
-    name: Minimal cell (claude-code + molecules-server + SSOT default model)
+    name: Minimal cell (SSOT runtime + molecules-server + SSOT model)
     runs-on: ubuntu-latest
     # Covers bounded provision (5m), tenant registration/DNS (5m), completion
     # and durable polling, teardown verification, and runner headroom.
