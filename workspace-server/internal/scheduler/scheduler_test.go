@@ -105,48 +105,10 @@ func TestHealthy_stale(t *testing.T) {
 	}
 }
 
-// ── TestComputeNextRun_valid ──────────────────────────────────────────────────
-
-// TestComputeNextRun_valid checks that "0 * * * *" (top-of-hour) returns a
-// future time whose Minute() == 0 when the reference is mid-hour.
-func TestComputeNextRun_valid(t *testing.T) {
-	// 2025-01-01 12:30 UTC — clearly mid-hour so "next" top-of-hour is 13:00.
-	ref := time.Date(2025, 1, 1, 12, 30, 0, 0, time.UTC)
-
-	next, err := ComputeNextRun("0 * * * *", "UTC", ref)
-	if err != nil {
-		t.Fatalf("ComputeNextRun(valid expr) returned unexpected error: %v", err)
-	}
-	if !next.After(ref) {
-		t.Errorf("ComputeNextRun() = %v, want a time strictly after ref %v", next, ref)
-	}
-	if next.Minute() != 0 {
-		t.Errorf("ComputeNextRun() minute = %d, want 0 (top of hour)", next.Minute())
-	}
-}
-
-// ── TestComputeNextRun_invalid ────────────────────────────────────────────────
-
-// TestComputeNextRun_invalid confirms that an unparseable cron expression
-// returns a non-nil error.
-func TestComputeNextRun_invalid(t *testing.T) {
-	_, err := ComputeNextRun("not-a-cron", "UTC", time.Now())
-	if err == nil {
-		t.Error("ComputeNextRun(invalid cron expr) = nil, want non-nil error")
-	}
-}
-
-// ── TestComputeNextRun_invalidTimezone ────────────────────────────────────────
-
-// TestComputeNextRun_invalidTimezone confirms that an unrecognised IANA
-// timezone name returns a non-nil error (rather than silently falling back
-// to UTC, which could mask misconfigured schedules).
-func TestComputeNextRun_invalidTimezone(t *testing.T) {
-	_, err := ComputeNextRun("0 * * * *", "Not/AZone", time.Now())
-	if err == nil {
-		t.Error("ComputeNextRun(invalid tz) = nil, want non-nil error")
-	}
-}
+// Cron next-run + validation tests moved to internal/cronspec (the SDK
+// cron-contract SSOT): cronspec_conformance_test.go asserts the shared
+// fixtures.json (30 cases incl. DST, dom/dow OR, rollover) and TestValidate
+// covers invalid expr/timezone. The scheduler no longer owns cron math.
 
 // ── TestPanicRecovery ─────────────────────────────────────────────────────────
 

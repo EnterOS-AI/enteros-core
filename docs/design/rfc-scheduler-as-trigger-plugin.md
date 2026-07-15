@@ -1,0 +1,189 @@
+# RFC: Scheduler as a trigger daemon plugin (decouple the cron engine from core)
+
+**Status:** Draft — for CTO sign-off. Author: CEO Assistant (on CTO direction 2026-07-14).
+**Related:** [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md) (same "core capability → plugin channel" move for the management MCP), [`rfc-decouple-config-skill-delivery.md`](rfc-decouple-config-skill-delivery.md) (the persisted-volume asset channel this reuses), ADR-004 (SDK-owns-adapter socket; core carries zero runtime-behaviour code).
+**Repos touched:** molecule-core (thin), molecule-ai-workspace-runtime (daemon socket + host), molecule-ai-sdk (contract + template).
+
+## 1. Summary & the decision requested
+
+We already ship a mature native scheduler — but it lives **inside** the workspace-server core: a single core-wide `robfig/cron` loop (`internal/scheduler/scheduler.go`, 1207 lines) polls the `workspace_schedules` table every 30 s and fires A2A turns into every workspace. This RFC moves the **trigger engine** out of core into a per-workspace **`kind: trigger` daemon plugin** that runs in the workspace runtime, owns the cron clock, and injects `self-scheduler` turns locally. Core keeps only a thin schedule store + the existing CRUD API and **defers firing** to any workspace that runs the plugin.
+
+This serves all four drivers the CTO named: **decouple core** (ADR-004 — the scheduler is the last big core-baked runtime behaviour), **third-party extensibility** (anyone can author a trigger plugin), **plugin-model consistency** (skills/MCP/channels are plugins; the scheduler shouldn't be special), and **per-workspace portability** (schedules travel on the workspace volume, not a central table).
+
+**Decided (CTO, 2026-07-14):** kind = **`trigger`** (a scheduler is the first *trigger* type; webhook/event pokes are another — one kind, one inject lane, one governance path); state ownership = **Option A, the daemon owns everything** (retire `workspace_schedules`; Canvas/admin/webhooks move to a runtime-exposed API — staged delivery, but A is the destination). Remaining open items are in §10.
+
+### 1.1 A correctness fix this move delivers: scheduled turns become *system* self-turns, not fake *user* messages
+Today core fires the scheduled turn as an A2A message with `role: "user"` and **no `source_type`** (`scheduler.go:408`; there's an abandoned `// "system:scheduler" was invalid — source_id is UUID` workaround comment right beside it). So every cron tick **impersonates the user**. That is not an oversight — it is the direct symptom of the engine living in Go core, *outside* the runtime's autonomous-self-turn taxonomy (`kernel.py`: `KIND_IDLE/self-idle`, `KIND_DELEGATION_RESULT`, `KIND_HARVESTER`, `KIND_LIFECYCLE_WAKE`, … all stamped via `autonomous_metadata()` so they are loop-guard-governed; scheduler is the lone holdout). Consequences: (1) the agent reads a timer as "the user asked"; (2) the turn **bypasses the autonomous-loop runaway guard** that protects idle turns; (3) it pollutes the D3 user-origin marker (the task-queue provider prioritises user-origin asks — a scheduled turn falsely tagged user jumps that queue). Moving the trigger into the runtime routes it through `kernel.autonomous_metadata(KIND_SCHEDULER)` → `source_type = self-scheduler` → a correctly-attributed, guard-governed **system self-turn**. "Make it a plugin" and "make it system, not user" are the *same fix*.
+
+## 2. What exists today (grounding, not proposal)
+
+- **Engine:** `workspace-server/internal/scheduler/scheduler.go` — 30 s poll, per-schedule 5-field cron + timezone, `maxConcurrent=10`, phantom-busy sweep, DB-op deadlines, 3-layer liveness, auto-disable after 3 consecutive SDK errors, `stale` after 3 empty runs.
+- **Store:** core Postgres `workspace_schedules` (5 migrations). Columns split cleanly into **definition** (`name, cron_expr, timezone, prompt, enabled, source`) and **engine-state bookkeeping** (`next_run_at, last_run_at, run_count, last_status, last_error, consecutive_empty_runs, consecutive_sdk_errors`).
+- **API:** 7 Canvas routes (`schedules.go`: List/Create/Update/Delete/RunNow/History + peer Health), admin health/orphan-reap (`admin_schedules_health.go`), template seeding (`template_schedules.go` + `org.go` `orgImportScheduleSQL`).
+- **Content:** 11 org-template agents ship `schedules:` YAML + Markdown prompt bodies; seeded with `source='template'` (additive-only upsert; `source='runtime'` edits survive re-provision).
+- **Delivery today:** core → `ProxyA2ARequest` (idle) or `EnqueueA2A` (busy, serial drain, schedule-ID idempotency) → workspace runtime.
+- **The runtime receiving half already exists but is unused:** `KIND_SCHEDULER` → `source_type="self-scheduler"` (`kernel.py`, `a2a_executor.py`) — defined, classified as a routine self-turn, governed by the autonomous-loop guard, **but has zero producers**. Cron ticks originate platform-side.
+
+### 2.1 The three hard couplings (why this isn't a lift-and-shift)
+1. **Core-wide singleton loop, not per-workspace** — one query across all workspaces, global concurrency ceiling. A per-workspace daemon inverts the model.
+2. **Writes core-owned tables** — the phantom-busy sweep (`UPDATE workspaces SET active_tasks=0`) and `activity_logs`; the capacity check reads `workspaces.active_tasks`. The scheduler doubles as a task-lifecycle janitor.
+3. **Busy-buffering uses in-process `EnqueueA2A`** (serial drain + idempotency) with no external API.
+
+**Key insight:** couplings #2 and #3 are artifacts of the scheduler being a *separate core process reaching into* the workspace. Run the trigger **inside the runtime** and they dissolve: the runtime already knows its own idle state (`heartbeat.active_tasks`, the signal the idle-digest loop gates on) and already serializes its own turn queue. The phantom-busy janitor exists only to repair cross-process staleness that in-process code never creates.
+
+## 3. Goals / non-goals
+
+**Goals**
+- The cron clock + fire loop run in a **per-workspace daemon plugin**, not core.
+- **Third parties can author trigger plugins** against an SDK-owned contract.
+- Schedules **travel with the workspace** (portability), seeded via the existing template→persisted-volume reconcile channel.
+- **Zero double-fire** during migration; workspaces without the plugin keep working unchanged.
+- **Trigger turns are system self-turns** (`source_type=self-scheduler`, loop-guard-governed), never `role: "user"` — fixing the impersonation described in §1.1.
+- Preserve every invariant in §7.
+
+**Non-goals**
+- Re-designing the schedule *semantics* (cron grammar, timezone, prompt body) — unchanged.
+- Changing the Canvas UX. The 7 routes stay; only their backing owner may move (§6).
+- Building second-accurate firing. The runtime idle/tick cadence is minutes-grained and that's fine.
+- A marketplace listing for the scheduler plugin (later; see rfc-marketplace-delivery).
+
+## 4. Target architecture
+
+```
+                        ┌─────────────────────── workspace runtime container ──────────────────────┐
+  template repo ──seed──▶ /configs/…/schedules  (persisted volume, reconcile-on-boot)              │
+                        │        │                                                                  │
+                        │        ▼                                                                  │
+                        │  ┌─ trigger daemon plugin (kind: trigger) ─┐   supervised subprocess      │
+   core workspace_      │  │  • reads schedule grid from volume       │   (DaemonSupervisor:         │
+   schedules  ──sync?──▶│  │  • owns cron clock (own parser)          │    spawn/backoff/breaker)    │
+   (thin store, CRUD)   │  │  • fires ONLY when idle (active_tasks=0) │                              │
+                        │  │  • injects self-scheduler turn ──────────┼──▶ local A2A lane ──▶ agent  │
+                        │  └──────────────────────────────────────────┘   (generalized from         │
+                        │             claims provides_native_scheduler      kind:channel socket)     │
+                        └───────────────────┬──────────────────────────────────────────────────────┘
+                                            │ heartbeat: provides_native_scheduler=true
+                                            ▼
+                        core scheduler loop  ──  NativeSchedulerCheck(wsID) → skip poll-and-fire
+                        (still serves workspaces WITHOUT the plugin)
+```
+
+The plugin is a supervised subprocess (the daemon lifecycle — spawn, exponential backoff, 10-fast-failure circuit breaker, SIGTERM→SIGKILL teardown — is production-ready and kind-agnostic today). It runs the clock and, on a due schedule, injects a `self-scheduler` turn through a local A2A lane. Core's existing `NativeSchedulerCheck` seam makes the central loop **defer** for any workspace advertising native scheduling — the incremental cutover control.
+
+## 5. The seams that must be built (the honest cost)
+
+The daemon *lifecycle* exists; the *inbound-to-agent* half is hard-wired to `kind: channel`. Six concrete gaps, each a scoped build item:
+
+| # | Gap | Fix | Repo |
+|---|---|---|---|
+| G1 | **No inject lane for non-channel daemons.** The local A2A socket + capability token are handed only to `kind: channel` specs; a `kind: trigger` daemon has no socket, no token, no `message/send` lane. | Generalize `ChannelEventSocketManager` to a **kind-independent local A2A lane** with a `source_type` allow-list (a trigger plugin may stamp only `self-scheduler`). This is the crux enabler. | runtime |
+| G2 | **A daemon can't claim `provides_native_scheduler`.** It's an *adapter* capability today (reported via heartbeat); a plugin has no way to flip it, so core would double-fire. | Let a loaded trigger plugin set the capability (manifest-declared or daemon-reported → folded into the heartbeat capability payload). | runtime + core |
+| G3 | **No durable per-workspace schedule state for a daemon.** Daemons aren't pointed at the persisted mailbox volume. | Hand the daemon a durable state dir on the persisted volume (schedule grid + engine bookkeeping). | runtime |
+| G4 | **No cron parser in the runtime.** `cron_expr` math lives only in Go (`ComputeNextRun`). | Daemon brings a cron evaluator; extract Go `ComputeNextRun` to a shared lib (still needed by core CRUD validation) and mirror its semantics in an SDK-owned cron contract so both sides agree. | sdk + core |
+| G5 | **No scheduler-kind template or manifest schedule block.** Templates exist only for channel/skill/mcp; the manifest can't express a cron grid. | Add a `kind: trigger` SDK scaffold + a `contributes.schedules` (or equivalent) manifest block, SSOT-validated. | sdk |
+| G6 | **No daemon health/liveness contract.** A circuit-broken scheduler goes silently `failed` until next boot. | Surface daemon state to the agent/platform (a "scheduler up/last-tick" signal) so a dead trigger is observable, matching today's `schedules/health`. | runtime + core |
+
+`kind: trigger` is already schema-legal (`kind` is an open string, "so new kinds are additive") — no schema change needed to *name* it; the work is the runtime behaviour behind it.
+
+## 6. THE decision: schedule state ownership
+
+Where does the schedule definition + bookkeeping live after the engine moves? Three options, with the blast radius the investigation measured:
+
+**Option A — Daemon owns state on the volume (max portability).**
+Schedule grid + bookkeeping live on the workspace's persisted volume; the daemon is authoritative. Canvas CRUD, admin-health, and the webhook `next_run_at=NOW()` trigger re-point to a runtime-exposed API (proxied through the platform). *Pro:* schedules truly travel with the workspace; cleanest ADR-004/portability story. *Con:* biggest surface — 7 Canvas routes + admin + webhooks + org-import all move; the `workspace_schedules` table is retired.
+
+**Option B — Core keeps the store; daemon owns only the clock (min blast radius).**
+`workspace_schedules` + all CRUD/webhooks/admin/seeding stay exactly as they are. The daemon reads its workspace's rows via a small core read-API and does the firing locally; core stops firing via `NativeSchedulerCheck`. *Pro:* smallest change, every invariant untouched, Canvas/webhooks/admin work verbatim. *Con:* state does **not** travel (still central Postgres) — fails the portability driver; least "plugin-like" (the plugin is a firing agent, not a self-contained capability).
+
+**Option C — Volume is authoritative, core mirrors (portability + working UI). [recommended]**
+The schedule *definition* travels on the volume (seeded via the existing reconcile-on-boot channel, editable by the daemon). Core keeps a **thin read-through mirror** of `workspace_schedules` that the daemon syncs, so Canvas/admin/webhooks keep working against core unchanged while the volume is the source of truth. *Pro:* portability + third-party + zero Canvas/webhook rewrite. *Con:* a sync path to keep consistent (volume ⇄ core mirror), the classic dual-write care.
+
+**CTO decision: Option A is the destination — the daemon owns everything, `workspace_schedules` is retired, and Canvas/admin/webhooks move to a runtime-exposed API.** Delivery is still **staged** (A is where we land, not a big-bang): the phasing in §8 proves the hardest new seam (local inject for a non-channel daemon) with core state untouched *first*, then moves storage + the API surface, so no single PR moves all seven routes + webhooks + seeding at once. The staging is a rollout tactic; unlike the earlier B/C options, we do **not** leave state in core as a permanent mirror — the end state is volume-authoritative with a runtime API, and the core table is deleted in P4.
+
+## 7. Invariants to preserve (regression contract)
+
+1. **Canvas 7 routes + JSON shapes** stay stable (List/Create/Update/Delete/RunNow/History + peer Health).
+2. **Seeding contract**: `source=template|runtime`, additive-only upsert, `(workspace_id,name)` uniqueness, runtime edits survive re-provision, FK-CASCADE cleanup on workspace delete.
+3. **Webhook event-trigger** (`webhooks.go` sets `next_run_at=NOW()` on named schedules) — schedules are event-poked, not purely time-based; the daemon must honor an out-of-band "fire now."
+4. **Per-template caps** (`maxTemplateSchedules=100`, cron ≤128 chars, prompt ≤16 KiB, config ≤1 MiB) — hostile-template DoS bounds.
+5. **No scheduled CI** — the `lint_schedule_budget` zero-cron ratchet stays green; exercise the new scheduler via `pull_request`/`push`/`workflow_dispatch`, never `on.schedule`.
+6. **No double-fire** — `NativeSchedulerCheck` must gate core firing before any workspace's daemon goes live.
+7. **Busy behaviour** — a schedule that comes due while the agent is mid-turn must not be dropped; in-process the runtime turn queue serializes it (replacing core's `EnqueueA2A` buffer).
+8. **Auto-disable / stale semantics** (3 SDK errors → disable; 3 empty → stale) carry into the daemon.
+9. **System provenance** — every trigger-fired turn carries `source_type=self-scheduler` (loop-guard-governed) and is **never** delivered as `role: "user"`. A regression test asserts a scheduled turn is classified as a routine self-turn and does not appear as a user-origin task-queue row (§1.1).
+
+## 8. Phasing (each an independently reviewable increment)
+
+- **P0 — shared cron lib (G4).** Extract Go `ComputeNextRun` to a tiny shared package (core CRUD still needs it); write the SDK cron contract; land a Python cron evaluator that matches it byte-for-byte on a shared fixture set. *No behaviour change.*
+- **P1 — the inject lane (G1) + native-scheduler claim (G2).** Generalize the local A2A lane to a `source_type`-allow-listed, kind-independent socket; let a trigger plugin claim `provides_native_scheduler`. Prove a subprocess can deliver a `self-scheduler` turn to the agent and that core defers. *Behind a flag; no schedule content yet.*
+- **P2 — the trigger daemon + SDK scaffold (G3, G5, G6).** The daemon: run the clock, fire-when-idle **as a `self-scheduler` system turn**, honor webhook pokes, durable bookkeeping on the volume, health surfaced. SDK `kind: trigger` template. To de-risk the *storage* move independently of the *firing* move, P2's daemon may transitionally read the existing core rows (read-only) while the inject path is proven on a canary; core defers for that workspace via `NativeSchedulerCheck`; assert fire-parity with the old core loop **and** that the turn now arrives `source_type=self-scheduler`, not `role:user`.
+- **P3 — storage move to the volume (reach Option A).** Schedule definition + bookkeeping become volume-authoritative (seeded via the reconcile-on-boot channel, written by the daemon). Stand up the **runtime-exposed schedule API**; re-point Canvas's 7 routes, admin health/orphan-reap, and the webhook event-poke at it (through the platform proxy). `workspace_schedules` reads/writes cease.
+- **P4 — retire core.** Once all maintained runtimes carry the plugin: delete `scheduler.go`'s loop **and** drop the `workspace_schedules` table + its migrations/handlers (Option A end state — no permanent mirror). Keep only `ComputeNextRun` as the shared cron lib (P0).
+
+## 8A. Delivery checklist (Definition of Done)
+
+Each phase is DONE only when its **Build · Tests/CI · e2e · Cleanup · Docs** rows are all checked. Cross-cutting DoD at the end applies to every phase.
+
+### P0 — Shared cron lib (G4)
+- **Build:** extract Go `ComputeNextRun` + cron parse/validate into a standalone shared package (`internal/cronspec`); author the SDK cron contract (5-field grammar, timezone semantics, next-run algorithm) as the SSOT; land a Python cron evaluator (vendored/pinned) in the runtime that mirrors it.
+- **Tests/CI:** a **shared cross-language fixture set** (`cron_expr × timezone × base_time → expected next_run`) asserted **identically** by Go and Python (the equivalence gate — a drift here is a silent mis-fire); `check-schemas-in-sync` drift gate extended to the cron contract; Go+Python unit CI green.
+- **e2e:** none (no behaviour change).
+- **Cleanup:** repoint all 4 core call sites (`schedules.go`, `template_schedules.go`, `admin_schedules_health.go`, `org_import.go`) at the shared package; delete the inline copy in `scheduler.go`.
+- **Docs:** cron contract documented in `sdk/contracts/` + PROVENANCE; note in testing-strategy that cron math is now a shared tier-4 lib.
+
+### P1 — Inject lane (G1) + native-scheduler claim (G2)
+- **Build:** generalize `ChannelEventSocketManager` to a kind-independent local A2A lane with a `source_type` allow-list (a `trigger` plugin may stamp **only** `self-scheduler`); wire a trigger plugin's `provides_native_scheduler` claim into the heartbeat capability payload; core `NativeSchedulerCheck` reads it. Behind a flag.
+- **Tests/CI (runtime):** a non-channel daemon opens the lane and injects a `self-scheduler` turn; **negative controls** — a daemon CANNOT forge `role:user`, a channel `source`, or a user-origin marker, and the allow-list rejects any non-`self-scheduler` `source_type`; the injected turn is governed by `should_halt` (loop guard).
+- **Tests/CI (core):** `NativeSchedulerCheck` true ⇒ `tick()` skips fire for that workspace (state-machine test, both arms).
+- **e2e:** ephemeral-CP gate sub-step (flag-gated) asserts the lane arms on a canary; distinct fail arms (no-arm-line vs armed-never-injected).
+- **Cleanup:** none (nothing retired yet).
+- **Docs:** document the trigger inject lane + `source_type` allow-list; update the autonomous-self-turn taxonomy doc to add the scheduler producer.
+
+### P2 — Trigger daemon + SDK scaffold (G3, G5, G6)
+- **Build:** the trigger daemon — cron clock, **fire-only-when-idle** (`heartbeat.active_tasks==0`), `self-scheduler` turn, honor webhook poke, durable bookkeeping on the persisted volume, auto-disable@3-SDK-errors, stale@3-empty, health surfaced; SDK `kind: trigger` template + manifest schedule block (SSOT-validated).
+- **Tests/CI (runtime):** daemon unit suite — due/not-due; deferred-when-busy; `self-scheduler` provenance **negative-controlled** (a fired turn must NOT appear as a user-origin task-queue row); webhook poke honored; auto-disable + stale counters; durable state across restart; corrupt-state degrades to no-op; circuit-breaker state observable.
+- **Tests/CI (SDK):** `kind: trigger` template scaffolds + validates against `plugin-manifest.schema.json`; manifest schedule-block SSOT test; `plugin-ecosystem-readiness` includes the trigger kind.
+- **e2e (the big sub-step):** seed a schedule → canary workspace WITH the plugin → short fire interval → assert **(a)** trigger fires, **(b)** turn arrives `self-scheduler`, NOT `role:user`, **(c)** core defers (its loop did not fire — no double-fire), **(d)** parity with old firing. Four distinct fail arms: no-arm / armed-never-fired / fired-wrong-provenance / double-fire.
+- **Cleanup:** `KIND_SCHEDULER` / `A2A_SOURCE_SELF_SCHEDULER` lose their "unwired stub / zero producers" status — update those code comments.
+- **Docs:** SDK trigger-plugin authoring guide; runtime daemon reference; update the consolidated idle-prompt design doc + `project_maintained_runtime_set` (the plugin ships with maintained runtimes).
+
+### P3 — Storage → volume + runtime API (reach Option A)
+- **Build:** schedule grid becomes **volume-authoritative** (seeded via the reconcile-on-boot asset channel, written by the daemon); stand up the runtime-exposed schedule API (7 CRUD + RunNow + History + Health); re-point Canvas `ScheduleTab`, admin health/orphan-reap, and the webhook event-poke at it (via platform proxy); org/template seeding writes the volume.
+- **Tests/CI:** Canvas contract tests (7 routes, **identical JSON shapes** — the shape is the invariant) pass against the new backend; seeding invariants (`source=template|runtime`, additive-only, runtime edits survive re-provision); webhook poke still fires; **portability test** — a workspace's schedules survive re-provision/move; **data-migration test** — existing `workspace_schedules` rows migrate to the volume idempotently with zero loss.
+- **e2e:** full-SaaS gate — create → schedule via Canvas API → fires → survives restart → visible in `ScheduleTab`.
+- **Cleanup:** core CRUD / seeding / webhooks stop **writing** `workspace_schedules` (reads may linger one release for rollback).
+- **Docs:** update `TEMPLATE_ASSET_DELIVERY.md` (schedules travel on the volume); admin runbook (health via runtime API); Canvas API doc; **self-host migration guide** for the DB→volume move.
+
+### P4 — Retire core
+- **Build:** delete `scheduler.go`'s loop + its `main.go` wiring; drop the `workspace_schedules` table (down-migration) + reduce/delete `schedules.go`, `template_schedules.go`, `admin_schedules_health.go` to the proxy (or remove); remove the phantom-busy sweep **after proving nothing else relied on it** (else relocate the `workspaces.active_tasks` repair to a proper owner); remove the `EnqueueA2A` scheduler-specific usage; delete the abandoned `//"system:scheduler" invalid` comment.
+- **Tests/CI:** delete `scheduler_test.go`, `native_scheduler_test.go`, `scheduler_integration_test.go` + the `handlers-postgres-integration.yml` scheduler steps; **anti-regression test** that the deleted scheduler artifacts stay deleted (the SOP-removal pattern); precondition gate — **verify every maintained runtime carries the plugin before deleting**.
+- **e2e:** the P2/P3 gates now run against the plugin-only path (core loop gone); no double-fire arm is now vacuous (core can't fire) — assert that explicitly.
+- **Cleanup:** purge dead constants (`priorityTask` dup, `pollInterval`, `batchLimit`), unused `events.EventCron*`, `metrics.TrackPhantomBusyReset`; drop scheduler from the core tier-3 package list.
+- **Docs:** mark **this RFC IMPLEMENTED**; update **ADR-004** ("scheduler decoupled — core carries zero scheduler runtime code"); `workspace-runtime.md`; `testing-strategy.md` (remove `scheduler` from the workspace-server packages table); CHANGELOG; retire the old scheduler docs.
+
+### Cross-cutting DoD (every phase)
+- **No double-fire** demonstrated at each cutover point (`NativeSchedulerCheck` gates before any daemon goes live).
+- **No scheduled CI** introduced — `lint_schedule_budget` zero-cron ratchet stays green; exercise via `pull_request` / `push` / `workflow_dispatch`.
+- **Contracts in sync** across core/runtime/sdk — every drift gate green (cron contract, plugin-manifest, mcp-plugin-delivery).
+- **Negative-controlled tests** — every provenance/security/gate assertion proven to fail when the property is broken (never a vacuous green).
+- **Docs + memory current** — consolidated idle-prompt design doc, this RFC's status, and `project_scheduler_as_trigger_plugin_rfc` memory updated each phase.
+- **Rollback path** — each phase reversible (P1/P2 behind a flag; P3 keeps core reads one release; P4 only after the plugin is universal).
+
+## 9. Risks
+
+- **Double-fire during cutover** — mitigated by making `NativeSchedulerCheck` the hard gate; a workspace's daemon must not fire until core confirms defer (order: claim capability → core observes → daemon arms).
+- **Inject-lane security** — generalizing the channel socket must keep the `source_type` allow-list tight (a trigger plugin may stamp `self-scheduler` and nothing else; it must not be able to forge user-origin or channel provenance).
+- **Sync consistency (Option C)** — dual-write volume⇄mirror; treat the volume as authoritative and the mirror as derived (rebuildable), never the reverse.
+- **Third-party trust** — a trigger plugin can wake the agent on a timer; the autonomous-loop guard (`should_halt`) still governs, and per-template caps bound frequency. Marketplace trust tiers apply when it's listed.
+
+## 10. Decisions
+
+**Settled (CTO, 2026-07-14):**
+- **Kind = `trigger`** — a scheduler is the first trigger type; the webhook event-poke and future condition/hook triggers share the kind, the inject lane, and the loop-guard governance.
+- **State ownership = Option A** — daemon owns everything; `workspace_schedules` retired in P4; Canvas/admin/webhooks move to a runtime API (staged per §8).
+- **Trigger turns are system self-turns** (`source_type=self-scheduler`), never `role:user` (§1.1).
+
+**Still open:**
+1. **Inject-lane breadth (G1)** — build the local A2A lane as a *general* trigger lane now (a `source_type` allow-list so a future webhook/file trigger plugs into the same socket), or scope it to the scheduler self-turn first and generalise later. The `trigger` framing leans general; the lean-increment principle leans scoped-first. *Leaning: general lane, scheduler as the first + only user shipped in P2.*
+2. **Where the native-scheduler claim is declared** — manifest (static, inspectable at load) vs daemon-reported via heartbeat (dynamic). *Recommend manifest.*
+3. **The webhook event-poke under `trigger`** — today it's a core `next_run_at=NOW()` write. Under Option A + `kind: trigger`, does the event-poke become its own trigger sub-type delivered to the daemon, or a runtime-API call the platform makes when the webhook fires? (Affects G1 breadth.)

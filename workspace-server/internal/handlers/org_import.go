@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cronspec"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
@@ -25,7 +26,6 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 	"github.com/google/uuid"
 )
 
@@ -658,7 +658,7 @@ skipProvision:
 		}
 		// #722: surface the error rather than silently using time.Time{} (zero)
 		// which lib/pq stores as 0001-01-01 and may confuse the fire query.
-		nextRun, nextRunErr := scheduler.ComputeNextRun(sched.CronExpr, tz, time.Now())
+		nextRun, nextRunErr := cronspec.ComputeNextRun(sched.CronExpr, tz, time.Now())
 		if nextRunErr != nil {
 			log.Printf("Org import: invalid cron expression for schedule '%s' on %s: %v — skipping insert",
 				sched.Name, ws.Name, nextRunErr)

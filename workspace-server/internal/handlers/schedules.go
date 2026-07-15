@@ -10,9 +10,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cronspec"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 )
 
 // ErrorResponse is returned for 4xx/5xx errors. (OpenAPI doc shape — used by swaggo.)
@@ -167,7 +167,7 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 	}
 
 	// Validate and compute next run
-	nextRun, err := scheduler.ComputeNextRun(body.CronExpr, body.Timezone, time.Now().In(loc))
+	nextRun, err := cronspec.ComputeNextRun(body.CronExpr, body.Timezone, time.Now().In(loc))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
@@ -266,7 +266,7 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timezone: " + tz})
 			return
 		}
-		nextRun, err := scheduler.ComputeNextRun(cronExpr, tz, time.Now().In(loc))
+		nextRun, err := cronspec.ComputeNextRun(cronExpr, tz, time.Now().In(loc))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 			return
