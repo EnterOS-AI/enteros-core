@@ -1,14 +1,10 @@
-# Historical workflow identifier retained because branch protection and status
-# auditing consume the emitted context. Rename only as a coordinated context
-# migration; the rules below enforce the current repository compatibility
-# policy even though the identifier records their Gitea-1.22.6 origin.
-name: Lint workflow YAML (Gitea-1.22.6-hostile shapes)
+name: Lint workflow YAML (repository compatibility policy)
 
 # Tier-2 hard-gate lint (RFC internal#219 §1, charter §SOP-N rule (m)).
 # Enforces repository workflow-policy shapes before they reach `main`. Rules 1
-# and 2 originated on Gitea 1.22.6; the current server supports more syntax,
-# but adoption requires an explicit fleet/status migration rather than an
-# incidental workflow edit.
+# and 2 originated under the former Gitea 1.22.6 fleet; the current server
+# supports additional syntax, but policy adoption requires an explicit
+# fleet/status migration rather than an incidental workflow edit.
 #
 #   1. workflow_dispatch.inputs   — feedback_gitea_workflow_dispatch_inputs_unsupported
 #                                   (2026-05-11 PyPI freeze 24h)
@@ -48,12 +44,14 @@ on:
       - '.gitea/workflows/**'
       - '.gitea/scripts/lint-workflow-yaml.py'
       - 'tests/test_lint_workflow_yaml.py'
+      - 'tests/test_current_state_ci_docs.py'
   push:
     branches: [main, staging]
     paths:
       - '.gitea/workflows/**'
       - '.gitea/scripts/lint-workflow-yaml.py'
       - 'tests/test_lint_workflow_yaml.py'
+      - 'tests/test_current_state_ci_docs.py'
 
 # Belt-and-suspenders against runner default
 # (feedback_act_runner_github_server_url).
@@ -61,11 +59,12 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
+  # bp-required: pending #4392
   lint:
-    # Compatibility status name: branch protection and audit tooling consume
-    # this exact historical label. The lint itself enforces current repository
-    # policy, as documented above; rename only through a coordinated BP change.
-    name: Lint workflow YAML for Gitea-1.22.6-hostile shapes
+    # The live wildcard branch protection already gates every posted status.
+    # #4392 tracks teaching Tier 2g that `*` covers this renamed context so the
+    # directive can become `bp-required: yes` without a redundant literal.
+    name: Lint workflow YAML for repository compatibility policy
     runs-on: ubuntu-latest
     # UNMASKED 2026-07-14 (was `continue-on-error: true`, the RFC #219 §1
     # "Phase 3" mask). The old comment promised a follow-up flip "after the 4
@@ -95,4 +94,4 @@ jobs:
       - name: Run lint-workflow-yaml unit tests
         run: |
           pip install --quiet pytest
-          python3 -m pytest tests/test_lint_workflow_yaml.py -v
+          python3 -m pytest tests/test_lint_workflow_yaml.py tests/test_current_state_ci_docs.py -v

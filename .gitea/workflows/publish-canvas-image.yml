@@ -318,7 +318,8 @@ jobs:
     # Registry-tag promotion only; this job does not roll out a live target.
     # mc#3436: do NOT renew this mask silently. A failed promotion is currently
     # non-blocking, so consumers must not read workflow success as rollout proof;
-    # the sequencing/fail-open gap is tracked in internal#1038.
+    # the sequencing/fail-open gap is tracked in mc#4391 (cross-repo release
+    # coordination remains linked from that issue to internal#1038).
     continue-on-error: true
     runs-on: publish
     timeout-minutes: 60
