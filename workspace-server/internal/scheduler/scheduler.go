@@ -11,8 +11,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
-	cronlib "github.com/robfig/cron/v3"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cronspec"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/metrics"
@@ -291,7 +291,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 		if s.providesNativeScheduler != nil && s.providesNativeScheduler(sched.WorkspaceID) {
 			// Advance next_run_at so we don't tight-loop on the same
 			// row every tick. A non-firing schedule is still scheduled.
-			if nextTime, err := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now()); err == nil {
+			if nextTime, err := cronspec.ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now()); err == nil {
 				if _, execErr := db.DB.ExecContext(ctx,
 					`UPDATE workspace_schedules SET next_run_at=$1, updated_at=now() WHERE id=$2`,
 					nextTime, sched.ID); execErr != nil {
@@ -311,7 +311,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 						s2.Name, s2.WorkspaceID, r)
 					// Always advance next_run_at even on panic so the schedule doesn't get
 					// stuck re-firing the same panicking schedule indefinitely (#1029).
-					if nextTime, err := ComputeNextRun(s2.CronExpr, s2.Timezone, time.Now()); err == nil {
+					if nextTime, err := cronspec.ComputeNextRun(s2.CronExpr, s2.Timezone, time.Now()); err == nil {
 						// F1089: use context.Background() so the panic-recovery UPDATE is not
 						// silently skipped if the outer ctx was cancelled during the panic window.
 						if _, execErr := db.DB.ExecContext(context.Background(), `UPDATE workspace_schedules SET next_run_at=$1, updated_at=now() WHERE id=$2`, nextTime, s2.ID); execErr != nil {
@@ -346,7 +346,7 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 				sched.Name, sched.ID, r)
 			// Always advance next_run_at even on panic so the schedule doesn't get
 			// stuck re-firing the same panicking schedule indefinitely (#1029).
-			if nextTime, err := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now()); err == nil {
+			if nextTime, err := cronspec.ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now()); err == nil {
 				// F1089: use context.Background() so the panic-recovery UPDATE is not
 				// silently skipped if the outer ctx was cancelled during the panic window.
 				if _, execErr := db.DB.ExecContext(context.Background(), `UPDATE workspace_schedules SET next_run_at=$1, updated_at=now() WHERE id=$2`, nextTime, sched.ID); execErr != nil {
@@ -434,7 +434,7 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 		// stale, so let it expire rather than fire late. Best-effort — on a bad
 		// cron expr we enqueue with no TTL (NULL) rather than block the tick.
 		var expiresAt *time.Time
-		if nextRun, nrErr := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now()); nrErr == nil {
+		if nextRun, nrErr := cronspec.ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now()); nrErr == nil {
 			expiresAt = &nextRun
 		}
 		enqCtx, enqCancel := context.WithTimeout(ctx, dbQueryTimeout)
@@ -591,7 +591,7 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 		}
 	}
 
-	nextRun, nextErr := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now())
+	nextRun, nextErr := cronspec.ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now())
 	var nextRunPtr *time.Time
 	if nextErr == nil {
 		nextRunPtr = &nextRun
@@ -695,7 +695,7 @@ func (s *Scheduler) fireSchedule(ctx context.Context, sched scheduleRow) {
 func (s *Scheduler) recordSkipped(ctx context.Context, sched scheduleRow, activeTasks int) {
 	reason := fmt.Sprintf("skipped: workspace busy (active_tasks=%d)", activeTasks)
 
-	nextRun, nextErr := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now())
+	nextRun, nextErr := cronspec.ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now())
 	var nextRunPtr *time.Time
 	if nextErr == nil {
 		nextRunPtr = &nextRun
@@ -767,7 +767,7 @@ func (s *Scheduler) recordSkipped(ctx context.Context, sched scheduleRow, active
 func (s *Scheduler) recordQueued(ctx context.Context, sched scheduleRow, activeTasks int, queueID string, depth int) {
 	reason := fmt.Sprintf("queued: workspace busy (active_tasks=%d), buffered (id=%s, depth=%d)", activeTasks, short(queueID, 8), depth)
 
-	nextRun, nextErr := ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now())
+	nextRun, nextErr := cronspec.ComputeNextRun(sched.CronExpr, sched.Timezone, time.Now())
 	var nextRunPtr *time.Time
 	if nextErr == nil {
 		nextRunPtr = &nextRun
@@ -855,7 +855,7 @@ func (s *Scheduler) repairNullNextRunAt(ctx context.Context) {
 			log.Printf("Scheduler: startup repair scan error: %v", err)
 			continue
 		}
-		nextRun, err := ComputeNextRun(r.CronExpr, r.Timezone, time.Now())
+		nextRun, err := cronspec.ComputeNextRun(r.CronExpr, r.Timezone, time.Now())
 		if err != nil {
 			log.Printf("Scheduler: startup repair: cannot compute next_run_at for schedule %s (%s): %v — leaving NULL",
 				r.ID, r.CronExpr, err)
@@ -1189,19 +1189,6 @@ func short(s string, n int) string {
 	return s[:n]
 }
 
-// ComputeNextRun parses a cron expression and returns the next fire time
-// after the given time, in the specified timezone.
-func ComputeNextRun(cronExpr, tz string, after time.Time) (time.Time, error) {
-	loc, err := time.LoadLocation(tz)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid timezone %q: %w", tz, err)
-	}
-
-	parser := cronlib.NewParser(cronlib.Minute | cronlib.Hour | cronlib.Dom | cronlib.Month | cronlib.Dow)
-	sched, err := parser.Parse(cronExpr)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid cron expression %q: %w", cronExpr, err)
-	}
-
-	return sched.Next(after.In(loc)).UTC(), nil
-}
+// Cron math lives in internal/cronspec (the SDK cron-contract SSOT). The
+// scheduler calls cronspec.ComputeNextRun; the previously-inline copy was
+// extracted so the runtime trigger-plugin daemon shares one behaviour.

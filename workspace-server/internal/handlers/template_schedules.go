@@ -41,8 +41,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cronspec"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/scheduler"
 )
 
 // Bounds protecting the seeder against hostile or buggy templates.
@@ -161,7 +161,7 @@ func seedTemplateSchedules(ctx context.Context, workspaceID, templatePath string
 			skipped++
 			continue
 		}
-		nextRun, nextRunErr := scheduler.ComputeNextRun(sched.CronExpr, tz, time.Now())
+		nextRun, nextRunErr := cronspec.ComputeNextRun(sched.CronExpr, tz, time.Now())
 		if nextRunErr != nil {
 			log.Printf("Template schedule seed: invalid cron for %q on %s: %v — skipping", sched.Name, workspaceID, nextRunErr)
 			skipped++
