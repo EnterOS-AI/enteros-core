@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Regression tests for .gitea/scripts/lib/ci-status.sh — the SSOT library for
-# the governance status-emission logic shared by qa-review / security-review /
+# the governance status-emission logic shared by reserved-path-review /
 # secret-scan. Closes the test-coverage gap flagged in the molecule-code-reviewer
 # REQUEST_CHANGES on PR #3422:
 #
@@ -284,41 +284,41 @@ echo "== emit_review_status (review-status emission) =="
 reset_env
 GITHUB_SERVER_URL="http://molecule-gitea-local:3000"
 REPO="molecule-ai/molecule-core"; PR_NUMBER="3422"; EVAL_OUTCOME="success"
-STATUS_CONTEXT="qa-review / approved (pull_request_target)"
+STATUS_CONTEXT="reserved-path-review / reserved-path-review (pull_request_target)"
 CI_STATUS_TOKEN="tok"
 MOCK_PR_HEADSHA="deadbeefsha"
 export MOCK_POST_BODY_OUT="$WORK/e1_body"; export MOCK_POST_URL_OUT="$WORK/e1_url"
 run_fn emit_review_status
 assert_eq  "E1 rc 0" "0" "$RC"
 assert_contains "E1 POST body state=success" '"state":"success"' "$(cat "$WORK/e1_body")"
-assert_contains "E1 POST body carries STATUS_CONTEXT" "qa-review / approved (pull_request_target)" "$(cat "$WORK/e1_body")"
+assert_contains "E1 POST body carries STATUS_CONTEXT" "reserved-path-review / reserved-path-review (pull_request_target)" "$(cat "$WORK/e1_body")"
 assert_contains "E1 POST hit internal-derived host" "http://molecule-gitea-local:3000/api/v1/repos/molecule-ai/molecule-core/statuses/deadbeefsha" "$(cat "$WORK/e1_url")"
 assert_contains "E1 notice posted success" "::notice::posted success" "$OUT"
 
 # E2 — non-success eval outcome → posts state=failure.
 reset_env
 REPO="molecule-ai/molecule-core"; PR_NUMBER="3422"; EVAL_OUTCOME="failure"
-STATUS_CONTEXT="security-review / approved (pull_request_target)"
+STATUS_CONTEXT="reserved-path-review / reserved-path-review (pull_request_target)"
 CI_STATUS_TOKEN="tok"
 export MOCK_POST_BODY_OUT="$WORK/e2_body"
 run_fn emit_review_status
 assert_eq  "E2 rc 0" "0" "$RC"
 assert_contains "E2 POST body state=failure" '"state":"failure"' "$(cat "$WORK/e2_body")"
-assert_contains "E2 security context posted" "security-review / approved (pull_request_target)" "$(cat "$WORK/e2_body")"
+assert_contains "E2 reserved-path context posted" "reserved-path-review / reserved-path-review (pull_request_target)" "$(cat "$WORK/e2_body")"
 
 # E3 — GET /pulls non-200 → loud failure (rc 1).
 reset_env
 REPO="molecule-ai/molecule-core"; PR_NUMBER="3422"; EVAL_OUTCOME="success"
-STATUS_CONTEXT="qa-review / approved (pull_request_target)"; CI_STATUS_TOKEN="tok"
+STATUS_CONTEXT="reserved-path-review / reserved-path-review (pull_request_target)"; CI_STATUS_TOKEN="tok"
 MOCK_PR_HTTP="500"
 run_fn emit_review_status
 assert_eq  "E3 rc 1 (GET failed)" "1" "$RC"
 assert_contains "E3 ::error:: GET" "::error::GET /pulls/3422 returned HTTP 500" "$OUT"
 
-# E4 — POST /statuses non-2xx → loud failure (rc 1); qa now matches security strictness.
+# E4 — POST /statuses non-2xx → loud failure (rc 1); emission is fail-closed.
 reset_env
 REPO="molecule-ai/molecule-core"; PR_NUMBER="3422"; EVAL_OUTCOME="success"
-STATUS_CONTEXT="qa-review / approved (pull_request_target)"; CI_STATUS_TOKEN="tok"
+STATUS_CONTEXT="reserved-path-review / reserved-path-review (pull_request_target)"; CI_STATUS_TOKEN="tok"
 MOCK_POST_HTTP="500"
 run_fn emit_review_status
 assert_eq  "E4 rc 1 (POST failed)" "1" "$RC"
@@ -389,19 +389,11 @@ assert_eq  "A5 NO POST attempted" "0" "$(wc -l < "$MOCK_CALL_LOG" | tr -d ' ')"
 echo
 echo "== workflow wiring (regression guard) =="
 
-QA="$WF_DIR/qa-review.yml"
-SEC="$WF_DIR/security-review.yml"
+# W1/W2 (qa-review.yml, security-review.yml) removed 2026-07-14 — the SOP
+# review gate was fully removed and those workflows deleted. secret-scan +
+# reserved-path-review are the remaining emit_review_status consumers.
 SS="$WF_DIR/secret-scan.yml"
 RPR="$WF_DIR/reserved-path-review.yml"
-
-assert_file_contains "W1 qa-review sources ci-status lib"      "$QA"  ".gitea/scripts/lib/ci-status.sh"
-assert_file_contains "W1 qa-review calls resolve_ci_status_token" "$QA" "resolve_ci_status_token"
-assert_file_contains "W1 qa-review calls emit_review_status"   "$QA"  "emit_review_status"
-assert_file_contains "W1 qa-review passes qa STATUS_CONTEXT"   "$QA"  "qa-review / approved (pull_request_target)"
-
-assert_file_contains "W2 security-review sources ci-status lib"      "$SEC" ".gitea/scripts/lib/ci-status.sh"
-assert_file_contains "W2 security-review calls emit_review_status"   "$SEC" "emit_review_status"
-assert_file_contains "W2 security-review passes security STATUS_CONTEXT" "$SEC" "security-review / approved (pull_request_target)"
 
 assert_file_contains "W3 secret-scan sources ci-status lib"       "$SS"  ".gitea/scripts/lib/ci-status.sh"
 assert_file_contains "W3 secret-scan calls reassert_commit_status" "$SS"  "reassert_commit_status"
@@ -412,12 +404,9 @@ assert_file_contains "W6 reserved-path-review calls resolve_ci_status_token" "$R
 assert_file_contains "W6 reserved-path-review calls emit_review_status" "$RPR" "emit_review_status"
 assert_file_contains "W6 reserved-path-review passes reserved STATUS_CONTEXT" "$RPR" "reserved-path-review / reserved-path-review (pull_request_target)"
 
-# W5 — review-check.sh (the qa/security evaluator) uses the SSOT derive_gitea_base
-# for its host derivation, so the reviewer's "review-check.sh host-derivation"
-# concern is covered by the D1–D4 cases above (single tested derivation).
-RC_SH="$SCRIPTS_DIR/review-check.sh"
-assert_file_contains "W5 review-check.sh sources ci-status lib" "$RC_SH" "lib/ci-status.sh"
-assert_file_contains "W5 review-check.sh uses derive_gitea_base" "$RC_SH" "derive_gitea_base"
+# W5 (review-check.sh) removed 2026-07-14 — the qa/security review evaluator
+# was deleted with the SOP gate. The derive_gitea_base SSOT is still covered by
+# the D1–D4 cases above.
 
 # W4 — the re-assert step MUST stay success()-gated (only reinforces GREEN).
 echo
@@ -425,14 +414,15 @@ echo "== W4 secret-scan re-assert is success()-gated =="
 W4=$(awk '/Re-assert Secret scan status/{found=1} found && /if:[[:space:]]*success\(\)/{print "OK"; exit}' "$SS")
 assert_eq "W4 re-assert step has if: success()" "OK" "$W4"
 
-# W7 — no dangling legacy inline-emission fragments may survive in the three
-# review workflows: after the emit_review_status lib call the old inline
-# variables ($post_code / $head_sha / $status_state) are UNSET, so a leftover
-# `if [ "$post_code" ... ]` block would kill the step with `set -u` unbound-var
-# at runtime (found live on qa-review.yml, PR #3422 first revision).
+# W7 — no dangling legacy inline-emission fragments may survive in the
+# remaining review workflow(s): after the emit_review_status lib call the old
+# inline variables ($post_code / $head_sha / $status_state) are UNSET, so a
+# leftover `if [ "$post_code" ... ]` block would kill the step with `set -u`
+# unbound-var at runtime (originally found live on qa-review.yml, PR #3422
+# first revision; that workflow has since been deleted with the SOP gate).
 echo
 echo "== W7 no dangling legacy emission fragments =="
-for wf in "$QA" "$SEC" "$RPR"; do
+for wf in "$RPR"; do
   if grep -qE '\$\{?post_code' "$wf"; then
     echo "  FAIL  W7 $(basename "$wf") still references \$post_code (dangling legacy fragment)"
     FAIL=$((FAIL + 1)); FAILED_TESTS="${FAILED_TESTS} W7_$(basename "$wf")"

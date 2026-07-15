@@ -308,6 +308,19 @@ func TestAuditQuery_Success(t *testing.T) {
 	if !ok || len(events) != 1 {
 		t.Fatalf("expected 1 event, got %v", resp["events"])
 	}
+	event, ok := events[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("event should be an object, got %T", events[0])
+	}
+	if event["agent_id"] != "agent-1" || event["operation"] != "task_start" {
+		t.Fatalf("event contract drifted: %v", event)
+	}
+	if _, exists := resp["entries"]; exists {
+		t.Fatal("response must use events, not the unsupported entries envelope")
+	}
+	if _, exists := resp["cursor"]; exists {
+		t.Fatal("response must use total/offset pagination, not cursor")
+	}
 	// chain_valid should be a bool (true — chain is intact)
 	chainValid, ok := resp["chain_valid"].(bool)
 	if !ok {
@@ -362,6 +375,55 @@ func TestAuditQuery_NoSaltReturnsNullChainValid(t *testing.T) {
 
 	if v, present := resp["chain_valid"]; present && v != nil {
 		t.Errorf("chain_valid should be null when AUDIT_LEDGER_SALT unset, got %v", v)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
+// TestAuditQuery_EmptyEventsSerializesAsArray locks the JSON contract used by
+// Canvas. Successful empty list responses must be [] rather than null.
+func TestAuditQuery_EmptyEventsSerializesAsArray(t *testing.T) {
+	resetAuditKeyCache()
+	t.Setenv("AUDIT_LEDGER_SALT", "")
+	defer resetAuditKeyCache()
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM audit_events`).
+		WithArgs("ws-empty").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	mock.ExpectQuery(`SELECT id, timestamp, agent_id`).
+		WithArgs("ws-empty", 100, 0).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "timestamp", "agent_id", "session_id", "operation",
+			"input_hash", "output_hash", "model_used",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+		}))
+
+	h := NewAuditHandler()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-empty"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-empty/audit", nil)
+
+	h.Query(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Events json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if string(resp.Events) != "[]" {
+		t.Fatalf("events = %s, want []", resp.Events)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -534,6 +596,115 @@ func TestAuditQuery_PaginatedOffsetReturnsNullChainValid(t *testing.T) {
 	// chain_valid must be null when offset > 0 — partial view cannot verify chain
 	if v, present := resp["chain_valid"]; present && v != nil {
 		t.Errorf("chain_valid should be null for paginated response (offset>0), got %v", v)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
+// TestAuditQuery_SessionFilterReturnsNullChainValid verifies that an arbitrary
+// session subset is not reported as tampered merely because earlier events for
+// the same agent are outside the result set.
+func TestAuditQuery_SessionFilterReturnsNullChainValid(t *testing.T) {
+	const testSalt = "test-salt-session-filter"
+	resetAuditKeyCache()
+	t.Setenv("AUDIT_LEDGER_SALT", testSalt)
+	defer resetAuditKeyCache()
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	key := testAuditKey(t, testSalt)
+	ts := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	ev := auditEventRow{
+		ID: "e2", Timestamp: ts, AgentID: "agent-1", SessionID: "sess-filtered",
+		Operation: "tool_call", PrevHMAC: strPtr("prior-event-hmac"), WorkspaceID: "ws-8",
+	}
+	ev.HMAC = makeAuditHMAC(t, key, &ev)
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM audit_events`).
+		WithArgs("ws-8", "sess-filtered").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	mock.ExpectQuery(`SELECT id, timestamp, agent_id`).
+		WithArgs("ws-8", "sess-filtered", 100, 0).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "timestamp", "agent_id", "session_id", "operation",
+			"input_hash", "output_hash", "model_used",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+		}).AddRow(
+			ev.ID, ev.Timestamp, ev.AgentID, ev.SessionID, ev.Operation,
+			nil, nil, nil,
+			ev.HumanOversightFlag, ev.RiskFlag, *ev.PrevHMAC, ev.HMAC, ev.WorkspaceID,
+		))
+
+	h := NewAuditHandler()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-8"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-8/audit?session_id=sess-filtered", nil)
+
+	h.Query(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if v, present := resp["chain_valid"]; present && v != nil {
+		t.Errorf("chain_valid should be null for a session-filtered subset, got %v", v)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
+// TestAuditQuery_FromFilterReturnsNullChainValid verifies that a time window
+// which omits the beginning of a chain is reported as unverified, not valid.
+func TestAuditQuery_FromFilterReturnsNullChainValid(t *testing.T) {
+	resetAuditKeyCache()
+	t.Setenv("AUDIT_LEDGER_SALT", "test-salt-from-filter")
+	defer resetAuditKeyCache()
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	from := time.Date(2026, 4, 17, 11, 0, 0, 0, time.UTC)
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM audit_events`).
+		WithArgs("ws-9", from).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	mock.ExpectQuery(`SELECT id, timestamp, agent_id`).
+		WithArgs("ws-9", from, 100, 0).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "timestamp", "agent_id", "session_id", "operation",
+			"input_hash", "output_hash", "model_used",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+		}))
+
+	h := NewAuditHandler()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-9"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-9/audit?from=2026-04-17T11:00:00Z", nil)
+
+	h.Query(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if v, present := resp["chain_valid"]; present && v != nil {
+		t.Errorf("chain_valid should be null for a from-filtered subset, got %v", v)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {

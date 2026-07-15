@@ -7,11 +7,10 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
 )
 
-// SanitizeFilename mirrors workspace/internal_chat_uploads.py's
-// sanitize_filename. Drift between the two means canvas-emitted URIs
-// differ between push and poll paths for the same upload — pin every
-// case the Python suite pins (workspace/tests/test_internal_chat_uploads.py
-// :: test_sanitize_filename).
+// SanitizeFilename mirrors the standalone runtime's
+// molecule_runtime/internal_chat_uploads.py sanitizer. Drift between the two
+// means canvas-emitted URIs differ between push and poll paths for the same
+// upload. These fixtures pin Core's side of that cross-repository contract.
 
 func TestSanitizeFilename_StripsPathTraversal(t *testing.T) {
 	cases := map[string]string{

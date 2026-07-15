@@ -171,8 +171,9 @@ func TestWorkspaceGet_RemovedReturns410(t *testing.T) {
 	if v, ok := resp["removed_at"]; !ok || v == nil {
 		t.Errorf("expected removed_at to be a real timestamp on the happy path, got: %v", v)
 	}
-	if _, ok := resp["hint"]; !ok {
-		t.Errorf("expected hint in 410 body, got: %v", resp)
+	const wantHint = "Create a replacement workspace in Canvas, then open Settings → Workspace Tokens → + New Token"
+	if resp["hint"] != wantHint {
+		t.Errorf("expected current Canvas recovery hint %q, got %v", wantHint, resp["hint"])
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
