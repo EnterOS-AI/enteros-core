@@ -117,7 +117,7 @@ MOCK_CURL="$WORK/curl"
 cat > "$MOCK_CURL" <<'MOCK'
 #!/usr/bin/env bash
 # Mock curl for test_ci_status.sh. Dispatches on the request URL.
-url=""; out=""; data=""; want_code=0
+url=""; out=""; data=""; want_code=0; user_agent=""; config_file=""
 args=("$@")
 i=0
 while [ "$i" -lt "${#args[@]}" ]; do
@@ -126,11 +126,24 @@ while [ "$i" -lt "${#args[@]}" ]; do
     -o) i=$((i+1)); out="${args[$i]:-}" ;;
     -d) i=$((i+1)); data="${args[$i]:-}" ;;
     -w) i=$((i+1)); want_code=1 ;;
-    -A|-H|-K|-X) i=$((i+1)) ;;   # skip the value arg for these flags
+    -A) i=$((i+1)); user_agent="${args[$i]:-}" ;;
+    -K) i=$((i+1)); config_file="${args[$i]:-}" ;;
+    -H|-X) i=$((i+1)) ;;   # skip the value arg for these flags
     http://*|https://*) url="$a" ;;
   esac
   i=$((i+1))
 done
+if [ -n "$config_file" ]; then
+  if [ ! -f "$config_file" ] || ! grep -Fxq 'user-agent = "curl/8.4.0"' "$config_file"; then
+    echo "mock curl: auth config missing exact user-agent directive" >&2
+    exit 96
+  fi
+  user_agent="curl/8.4.0"
+fi
+if [[ "$url" == http://* || "$url" == https://* ]] && [ "$user_agent" != "curl/8.4.0" ]; then
+  echo "mock curl: request missing exact curl/8.4.0 User-Agent: $url" >&2
+  exit 96
+fi
 [ -n "${MOCK_CALL_LOG:-}" ] && printf '%s\n' "$url" >> "$MOCK_CALL_LOG"
 emit_code() { [ "$want_code" = "1" ] && printf '%s' "$1"; }
 case "$url" in
@@ -392,8 +405,10 @@ echo
 echo "== workflow wiring (regression guard) =="
 
 # W1/W2 (qa-review.yml, security-review.yml) removed 2026-07-14 — the SOP
-# review gate was fully removed and those workflows deleted. secret-scan +
-# reserved-path-review are the remaining emit_review_status consumers.
+# review gate was fully removed and those workflows deleted. The remaining
+# library consumers have different paths: secret-scan calls the best-effort
+# reassert_commit_status helper, while reserved-path-review calls the
+# fail-closed emit_review_status helper.
 SS="$WF_DIR/secret-scan.yml"
 RPR="$WF_DIR/reserved-path-review.yml"
 
@@ -424,15 +439,14 @@ assert_eq "W4 re-assert step has if: success()" "OK" "$W4"
 # first revision; that workflow has since been deleted with the SOP gate).
 echo
 echo "== W7 no dangling legacy emission fragments =="
-for wf in "$RPR"; do
-  if grep -qE '\$\{?post_code' "$wf"; then
-    echo "  FAIL  W7 $(basename "$wf") still references \$post_code (dangling legacy fragment)"
-    FAIL=$((FAIL + 1)); FAILED_TESTS="${FAILED_TESTS} W7_$(basename "$wf")"
-  else
-    echo "  PASS  W7 $(basename "$wf") has no dangling \$post_code fragment"
-    PASS=$((PASS + 1))
-  fi
-done
+wf="$RPR"
+if grep -qE '\$\{?post_code' "$wf"; then
+  echo "  FAIL  W7 $(basename "$wf") still references \$post_code (dangling legacy fragment)"
+  FAIL=$((FAIL + 1)); FAILED_TESTS="${FAILED_TESTS} W7_$(basename "$wf")"
+else
+  echo "  PASS  W7 $(basename "$wf") has no dangling \$post_code fragment"
+  PASS=$((PASS + 1))
+fi
 
 echo
 echo "------"

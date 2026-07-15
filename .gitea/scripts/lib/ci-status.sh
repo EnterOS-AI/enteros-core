@@ -51,10 +51,10 @@ derive_gitea_base() {
 # On success: masks the token, sets the global CI_STATUS_TOKEN, appends
 # `CI_STATUS_TOKEN=<tok>` to $GITHUB_ENV (when set, for cross-step consumption),
 # logs the source + length, and returns 0.
-# On empty: returns 1 after a `::error::` when REQUIRE=1 (default — fail-closed,
-# the qa/security contract); returns 0 with an empty CI_STATUS_TOKEN after a
-# `::warning::` when REQUIRE=0 (best-effort callers such as the secret-scan
-# re-assert / fork PRs with no secrets).
+# On empty: returns 1 after a `::error::` when REQUIRE=1 (default — the
+# fail-closed reserved-path-review emission contract); returns 0 with an empty
+# CI_STATUS_TOKEN after a `::warning::` when REQUIRE=0 (best-effort callers such
+# as the secret-scan re-assert / fork PRs with no secrets).
 #
 # Tunables (env): REQUIRE (default 1), INFISICAL_BASE_URL
 # (default https://key.moleculesai.app), CI_STATUS_CURL (curl binary; for tests).
