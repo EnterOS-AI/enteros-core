@@ -216,7 +216,7 @@ The result is not just “an agent that learns.” It is **an organization that 
 
 ### Runtime
 
-- standalone workspace-template images that install `molecule-ai-workspace-runtime` from the Gitea package registry; thin AMI in production (us-east-2)
+- standalone workspace-template images that install `molecules-workspace-runtime` from the Gitea package registry; thin AMI in production (us-east-2)
 - adapter-driven execution across **4 maintained runtimes** (Claude Code, Codex, Hermes, OpenClaw)
 - Agent Card registration
 - **Memory v2 backed by pgvector** — per-tenant plugin sidecar serving HMA namespaces with FTS + semantic recall

@@ -1,7 +1,8 @@
 package handlers
 
-// external_connection.go — copy-paste connection payload shown once to
-// the operator when they create a runtime="external" workspace.
+// external_connection.go — copy-paste connection payload for external-like
+// workspaces. A real token is shown on create or credential rotation; the
+// read-only re-show path deliberately returns non-runnable placeholders.
 //
 // The canvas UI surfaces these in a single modal so the operator can
 // hand the block to whoever runs their external agent without having
@@ -50,7 +51,7 @@ const authTokenPlaceholder = "{{AUTH_TOKEN}}"
 //
 // So every snippet that WRITES a credential must ALSO fail closed on the marker.
 // See tokenGuard* below; the invariant is pinned by
-// TestReshowSnippets_ThatPersistCredentials_RefuseToRun.
+// TestReshowSnippets_RefuseToRunWithoutAToken.
 const tokenUnavailableMarker = "<ROTATE_TO_REVEAL_TOKEN>"
 
 // tokenGuardNeedle is the substring every refusal guard matches the stamped
@@ -723,7 +724,7 @@ if __name__ == "__main__":
 //  4. Outbound replies route via “send_message_to_user“ (canvas
 //     user) or “delegate_task“ (peer agent) MCP tool calls.
 //
-// Result: hermes gets push parity with Claude Code / codex / openclaw —
+// Result: hermes gets push parity with Claude Code and codex —
 // canvas messages and peer A2A arrive as conversation turns mid-session,
 // not just at the start of a new “hermes“ invocation.
 //
@@ -807,9 +808,9 @@ fi
 # Need help?
 #   Documentation: https://doc.moleculesai.app/docs/guides/external-agent-registration
 #   Common errors:
-#     • Gateway start failure — tail ~/.hermes/gateway.log. YAML
-#       duplicate-key in config.yaml is the most common cause; the
-#       gateway: block must appear exactly once.
+#     • Gateway start failure — tail ~/.hermes/gateway.log. Duplicate
+#       top-level plugins: or platforms: keys can discard working YAML;
+#       merge into the existing maps instead of appending another block.
 #     • Plugin not discovered after install — pip show hermes-channel-molecule
 #       to confirm install, then run ` + "`hermes plugins enable molecule`" + `
 #       (current Hermes) or verify platforms.molecule is enabled.
