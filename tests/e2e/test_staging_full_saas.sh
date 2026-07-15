@@ -2403,22 +2403,98 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   wait_workspaces_online_routable "    Waiting for the leaf workspace to return online after resume (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)..." "$LIFECYCLE_WS"
   ok "    resume → provisioning → online (DB-verified)"
 
-  # ── hibernate → hibernated ──
-  HIB_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate?force=true" 2>/dev/null || echo '{}')
-  HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
-  [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate: POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
-  # The handler runs the claim→stop→'hibernated' sequence; poll the DB row to
-  # confirm it landed on 'hibernated' (not stuck mid-'hibernating').
+  # ── hibernate (force coverage: core#4292/#4293) ──
+  # force-hibernate only MEANS anything on a BUSY workspace. On an idle one, the
+  # atomic claim's force-path (which DROPS the `active_tasks = 0` predicate) is
+  # indistinguishable from the non-force path, so an idle hibernate cannot tell a
+  # working `force` from a broken one. core#4292 slipped this very gate for exactly
+  # that reason: 10b hibernated an IDLE leaf, `?force=true` answered 200 while the
+  # atomic claim (still carrying `AND active_tasks = 0`) matched no row and stopped
+  # nothing — the workspace stayed online and billing. #4293 fixed the claim; this
+  # step now PROVES the fix by driving a genuinely busy workspace first.
   #
-  # Do NOT trust the 200 above on its own. This is the step that caught core#4292:
-  # ?force=true skipped the handler's active-tasks 409 but never reached the atomic
-  # claim's `active_tasks = 0` predicate, so the claim matched no row, nothing was
-  # stopped, and the handler still answered 200 {"status":"hibernated"} — satisfying
-  # the HIB_STATUS assertion above while the workspace stayed online and billing.
-  # The DB row is the only witness that cannot be talked out of the truth. Keep this
-  # assertion even if the response check looks redundant: it is not.
-  wait_status "hibernated" 120 "hibernate" || fail "Hibernate: workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) even though POST /hibernate?force=true answered '$HIB_STATUS'. The API claimed success and the row disagrees — suspect a no-op hibernate (atomic claim matched no row) before suspecting the container stop."
-  ok "    hibernate → hibernated (DB-verified)"
+  # active_tasks is heartbeat-fed (the agent self-reports its in-flight turn count
+  # every ~30s; there is no synchronous server lever), so making the workspace busy
+  # means driving a real long turn and polling until the DB reflects it. That drive
+  # is best-effort by nature. CAPTURE-FIRST / SOAK-TO-ENFORCE (task #92): when the
+  # workspace is provably busy we run the strict force-coverage assertions (a)+(b);
+  # when we cannot establish busy within the bound we LOG LOUD and fall back to the
+  # idle force-hibernate (still a valid transition, just not force-coverage). Once
+  # the busy-drive is shown reliable across the gate soak, set
+  # E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 to make a failed drive a hard red.
+
+  # Drive a long, model-independent in-flight turn WITHOUT draining the queue, so
+  # the turn stays live while we fire the two hibernate calls. Returns 0 once
+  # GET /workspaces/:id reports active_tasks>0 (the same column the handler's 409
+  # guard and atomic claim read — so the witness and the decision agree).
+  _hib_busy_drive() {
+    local sleep_secs="${E2E_HIBERNATE_BUSY_SLEEP_SECS:-180}"
+    local wait_secs="${E2E_HIBERNATE_BUSY_WAIT_SECS:-120}"
+    local busy_payload deadline cur
+    busy_payload=$(python3 -c "
+import json, uuid
+secs = ${sleep_secs}
+print(json.dumps({
+    'jsonrpc': '2.0', 'method': 'message/send', 'id': 'e2e-busy-1',
+    'params': {'message': {'role': 'user',
+        'messageId': f'e2e-busy-{uuid.uuid4().hex[:8]}',
+        'parts': [{'kind': 'text', 'text':
+            'Platform lifecycle test. Using your shell/bash tool, run exactly this one '
+            f'command and wait for it to finish: sleep {secs}. Then reply with the single '
+            'token BUSYDONE. Do nothing else.'}]}}}))
+")
+    # POST and do NOT poll the queue to completion — leave the turn in flight.
+    tenant_call POST "/workspaces/$LIFECYCLE_WS/a2a" --max-time 30 \
+      -H "Content-Type: application/json" \
+      -d "$busy_payload" -o /dev/null -w '%{http_code}' >/dev/null 2>&1 || true
+    deadline=$(( $(date +%s) + wait_secs ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      cur=$(tenant_call GET "/workspaces/$LIFECYCLE_WS" 2>/dev/null \
+        | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('active_tasks') or 0))" 2>/dev/null || echo 0)
+      if [ "${cur:-0}" -gt 0 ] 2>/dev/null; then
+        log "    active_tasks=$cur — workspace is genuinely busy"
+        return 0
+      fi
+      sleep 10
+    done
+    return 1
+  }
+
+  if _hib_busy_drive; then
+    # (a) non-force hibernate on a BUSY workspace → 409, echoing the live count.
+    _NF_TMP=$(mktemp -t hib_nf.XXXXXX)
+    _NF_CODE=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate" --max-time 30 \
+      -o "$_NF_TMP" -w '%{http_code}' 2>/dev/null || echo 000)
+    _NF_AT=$(python3 -c "import json,sys; print(int(json.load(open('$_NF_TMP')).get('active_tasks') or 0))" 2>/dev/null || echo 0)
+    [ "$_NF_CODE" = "409" ] || fail "Hibernate(busy): non-force POST /hibernate returned http=$_NF_CODE (expected 409 active-tasks conflict). A busy workspace must refuse a non-force hibernate. Body: $(cat "$_NF_TMP" 2>/dev/null | sanitize_http_body | head -c 200)"
+    [ "${_NF_AT:-0}" -gt 0 ] 2>/dev/null || fail "Hibernate(busy): 409 body reported active_tasks=$_NF_AT (expected >0) — the conflict must carry the live active-task count."
+    rm -f "$_NF_TMP"
+    ok "    non-force hibernate on BUSY ws → 409 (active_tasks=$_NF_AT)"
+
+    # (b) force hibernate on the SAME busy workspace → must terminate the in-flight
+    #     task AND land 'hibernated' in the DB. This is the exact #4293 assertion:
+    #     an idle-only test can never reach it.
+    HIB_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate?force=true" 2>/dev/null || echo '{}')
+    HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+    [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(busy,force): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
+    wait_status "hibernated" 120 "hibernate-force-busy" || fail "Hibernate(busy,force): workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) after force on a BUSY workspace — core#4293 regression: force must drop the active_tasks=0 claim predicate, terminate the in-flight task, and stop the container, not no-op to a lying 200."
+    ok "    force hibernate on BUSY ws → hibernated (DB-verified; core#4293 covered)"
+  else
+    # Busy-drive did not establish active_tasks>0 within the bound. Under the soak
+    # default this is a LOUD non-fatal fallback (the run still exercises the idle
+    # transition); flip E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 once the drive is proven
+    # reliable to make this a hard red instead.
+    if [ "${E2E_HIBERNATE_FORCE_BUSY_REQUIRED:-0}" = "1" ]; then
+      fail "Hibernate(force coverage): could not drive active_tasks>0 within ${E2E_HIBERNATE_BUSY_WAIT_SECS:-120}s (runtime never self-reported an in-flight turn). With E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 this is fatal — the gate must genuinely exercise force on a busy workspace (task #92)."
+    fi
+    log "    WARN[task#92 soak]: could not establish active_tasks>0 within the bound (runtime busy-report timing, or the agent did not run the sleep turn). Falling back to IDLE force-hibernate — this run does NOT cover the force-on-busy class (core#4293)."
+    HIB_RESP=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/hibernate?force=true" 2>/dev/null || echo '{}')
+    HIB_STATUS=$(echo "$HIB_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+    [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(idle fallback): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
+    # Even the idle path polls the DB row — the 200 alone was the #4292 lie.
+    wait_status "hibernated" 120 "hibernate" || fail "Hibernate(idle fallback): workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) even though POST /hibernate?force=true answered '$HIB_STATUS' — suspect a no-op hibernate (atomic claim matched no row) before suspecting the container stop."
+    ok "    hibernate → hibernated (DB-verified; idle fallback, force-on-busy NOT covered this run)"
+  fi
 
   # ── resume-from-hibernate via auto-wake on next A2A ──
   # A hibernated workspace auto-wakes on the next incoming A2A message/send
