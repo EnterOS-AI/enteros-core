@@ -51,6 +51,7 @@
 import { test, expect, type Page, type BrowserContext } from "@playwright/test";
 import { agentRepliesForTurn, type SimpleMessage } from "../src/lib/conciergeChatInvariants";
 import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
+import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -84,6 +85,7 @@ function tenantEnv() {
  *  JSON so a workspace-scoped 401 can't yank us to AuthKit. */
 async function authenticate(context: BrowserContext, token: string) {
   await context.setExtraHTTPHeaders({ Authorization: `Bearer ${token}` });
+  await installStagingWebSocketAuth(context, token);
   await context.addInitScript(() => {
     window.localStorage.setItem(
       "molecule_cookie_consent",

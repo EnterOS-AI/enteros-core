@@ -47,6 +47,7 @@
 
 import { test, expect } from "@playwright/test";
 import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
+import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 
 const STAGING = process.env.CANVAS_E2E_STAGING === "1";
 
@@ -262,6 +263,7 @@ test.describe("staging desktop take-control — reconnect + lease renewal (core#
       Authorization: `Bearer ${tenantToken}`,
       ...(orgID ? { "X-Molecule-Org-Id": orgID } : {}),
     });
+    await installStagingWebSocketAuth(context, tenantToken);
   });
 
   test("reconnect re-acquires a FRESH token and the framebuffer resumes", async ({

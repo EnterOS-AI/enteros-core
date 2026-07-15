@@ -42,6 +42,7 @@
 
 import { test, expect, type Page, type BrowserContext, type APIRequestContext } from "@playwright/test";
 import { gotoWithNetworkChangeRetry } from "../test-utils/stagingNavigation";
+import { installStagingWebSocketAuth } from "./support/stagingWebSocketAuth";
 import {
   checkConciergeInvariants,
   isOpeningGreeting,
@@ -206,6 +207,7 @@ test.describe("concierge greeting — stored session (server contextId belt)", (
 /* ─────────── B. RENDERED UI — client render/persistence doubling ──────────── */
 async function authenticate(context: BrowserContext, tenantToken: string) {
   await context.setExtraHTTPHeaders({ Authorization: `Bearer ${tenantToken}` });
+  await installStagingWebSocketAuth(context, tenantToken);
   await context.addInitScript(() => {
     window.localStorage.setItem(
       "molecule_cookie_consent",
