@@ -310,7 +310,10 @@ def test_gitea_glob_semantics_match_server_patterns(pattern, context, matches):
         assert bad == [f"{pattern}=no-match"]
 
 
-@pytest.mark.parametrize("pattern", ["CI / [unterminated", "CI / trailing\\"])
+@pytest.mark.parametrize(
+    "pattern",
+    ["CI / [unterminated", "CI / trailing\\", r"CI / invalid\q"],
+)
 def test_invalid_gitea_glob_fails_closed(pattern):
     latest = {"CI / all-required": {"status": "success"}}
     ok, bad = mq.required_contexts_green(latest, [pattern])

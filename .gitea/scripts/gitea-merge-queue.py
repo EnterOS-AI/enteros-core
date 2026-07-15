@@ -685,7 +685,10 @@ def _compile_gitea_glob(pattern: str) -> re.Pattern[str]:
             if c == "\\":
                 if pos >= len(pattern):
                     raise GiteaGlobCompileError("unterminated character class escape")
-                result += re.escape(pattern[pos])
+                # Gitea passes the escape through to Go's regexp compiler.
+                # Preserve that behavior so unsupported escapes fail compile
+                # instead of silently becoming a different literal pattern.
+                result += "\\" + pattern[pos]
                 pos += 1
             else:
                 result += c
@@ -716,7 +719,7 @@ def _compile_gitea_glob(pattern: str) -> re.Pattern[str]:
             elif c == "\\":
                 if pos >= len(pattern):
                     raise GiteaGlobCompileError("no character to escape")
-                result += re.escape(pattern[pos])
+                result += "\\" + pattern[pos]
                 pos += 1
             else:
                 result += re.escape(c)
