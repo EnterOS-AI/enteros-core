@@ -176,5 +176,14 @@ func seedTemplateSchedules(ctx context.Context, workspaceID, templatePath string
 		seeded++
 		log.Printf("Template schedule seed: %q (%s, %d chars) upserted on %s (source=template)", sched.Name, sched.CronExpr, len(prompt), workspaceID)
 	}
+	// A template that ships schedules needs the scheduler trigger plugin to fire
+	// them (scheduler-as-trigger-plugin, per-workspace delivery). Declare it once
+	// when at least one schedule seeded, so it installs on the workspace's next
+	// boot/reconcile. Non-fatal: a declaration hiccup must not fail provisioning.
+	if seeded > 0 {
+		if err := ensureSchedulerPluginDeclared(ctx, workspaceID); err != nil {
+			log.Printf("Template schedule seed: declare scheduler plugin for %s (non-fatal): %v", workspaceID, err)
+		}
+	}
 	return
 }
