@@ -30,7 +30,8 @@ package staginge2e
 // / waitForWorkspaceOnlineRoutable / waitForWorkspaceStatus / doTenantJSON /
 // serveProbe / jsonField). NOTHING here re-implements org provisioning or
 // teardown; the shared harness schedules an exact-slug admin DELETE before it
-// waits for provisioning, and logs teardown failures for follow-up.
+// waits for provisioning, retries transient lifecycle conflicts, and requires
+// exact-slug absence before the E2E can pass.
 //
 // Guarded by the staging_e2e build tag + STAGING_E2E=1 (requireStagingEnv).
 

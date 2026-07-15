@@ -18,8 +18,8 @@ package staginge2e
 //	  -run TestConciergeApprovalGate_Staging -v
 //
 // Guarded by the staging_e2e build tag + STAGING_E2E=1 env gate. Exact-slug
-// admin DELETE teardown is scheduled after org-create succeeds; failures log
-// the tenant for follow-up.
+// admin DELETE teardown is scheduled after org-create succeeds; transient
+// lifecycle conflicts are retried and exact absence is required for success.
 //
 // ISOLATION NOTE (fix/staging-e2e-approval-gate-subtest-isolation):
 // Previously, the test declared `var secretApprovalID string` at parent

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -442,6 +443,9 @@ func requireStagingEnv(t *testing.T) stagingCfg {
 	if len(missing) > 0 {
 		t.Skipf("STAGING_E2E=1 but missing required env: %s — skipping LOUD (not a silent pass)", strings.Join(missing, ", "))
 	}
+	if err := validateStagingCPBase(cfg.cpBase); err != nil {
+		t.Fatalf("unsafe CP_BASE_URL for staging E2E: %v", err)
+	}
 	return cfg
 }
 
@@ -498,13 +502,174 @@ func registerTenantCleanup(t *testing.T, cfg stagingCfg, slug string) {
 
 func adminDeleteTenant(t *testing.T, cfg stagingCfg, slug string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"confirm":%q}`, slug)
-	status, resp := doJSON(t, "DELETE", cfg.cpBase+"/cp/admin/tenants/"+slug, cfg.adminToken, body)
-	if status != http.StatusOK && status != http.StatusAccepted && status != http.StatusNotFound {
-		t.Logf("WARNING: teardown DELETE tenant %s returned HTTP %d: %s (manual cleanup may be needed)", slug, status, resp)
+	if err := deleteTenantAndVerify(cfg, slug, 3*time.Minute, 5*time.Second); err != nil {
+		// Cleanup is part of the live contract. A green functional assertion
+		// with a leaked tenant is not a passing E2E, so fail the test closed.
+		t.Errorf("teardown failed for exact tenant %s: %v", slug, err)
 		return
 	}
-	t.Logf("teardown: deleted tenant %s (HTTP %d)", slug, status)
+	t.Logf("teardown: deleted exact tenant %s and verified it absent", slug)
+}
+
+// deleteTenantAndVerify retries the one transient response the CP emits while
+// an asynchronous lifecycle operation is still settling (HTTP 409), then
+// proves the exact slug is absent through the CP's identity-bound tenant
+// endpoint (404). It is deliberately bounded and exact-slug-only: no fleet
+// sweep and no false-green warning path.
+func deleteTenantAndVerify(cfg stagingCfg, slug string, timeout, pollInterval time.Duration) error {
+	if cfg.cpBase == "" || cfg.adminToken == "" {
+		return fmt.Errorf("control-plane base URL and admin token are required")
+	}
+	if err := validateStagingCPBase(cfg.cpBase); err != nil {
+		return err
+	}
+	if !validE2ESlug(slug) {
+		return fmt.Errorf("refusing cleanup for non-E2E slug %q", slug)
+	}
+	if timeout <= 0 || pollInterval <= 0 {
+		return fmt.Errorf("cleanup timeout and poll interval must be positive")
+	}
+
+	requestTimeout := 30 * time.Second
+	if timeout < requestTimeout {
+		requestTimeout = timeout
+	}
+	client := &http.Client{
+		Timeout: requestTimeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	deadline := time.Now().Add(timeout)
+	body := fmt.Sprintf(`{"confirm":%q}`, slug)
+	var lastStatus int
+	var lastDetail string
+
+	for {
+		status, respBody, err := cleanupJSONRequest(
+			client,
+			http.MethodDelete,
+			strings.TrimRight(cfg.cpBase, "/")+"/cp/admin/tenants/"+slug,
+			cfg.adminToken,
+			body,
+		)
+		lastStatus = status
+		if err != nil {
+			lastDetail = err.Error()
+		} else {
+			lastDetail = cleanupResponseDetail(respBody)
+			switch {
+			case status == http.StatusOK || status == http.StatusAccepted || status == http.StatusNotFound:
+				absent, verifyErr := exactTenantAbsent(client, cfg, slug)
+				if verifyErr == nil && absent {
+					return nil
+				}
+				if verifyErr != nil {
+					lastDetail = "absence verification: " + verifyErr.Error()
+				} else {
+					lastDetail = "DELETE accepted but exact tenant identity still exists"
+				}
+			case status == http.StatusConflict || status == http.StatusRequestTimeout ||
+				status == http.StatusTooManyRequests || status >= http.StatusInternalServerError:
+				// Retry below. A 409 is expected while a just-completed test still
+				// has an active lifecycle operation; transport/5xx/429 failures are
+				// also bounded rather than converted into a false green.
+			default:
+				return fmt.Errorf("DELETE returned non-retryable HTTP %d: %s", status, lastDetail)
+			}
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("cleanup deadline exhausted after HTTP %d: %s", lastStatus, lastDetail)
+		}
+		sleepFor := pollInterval
+		if remaining < sleepFor {
+			sleepFor = remaining
+		}
+		time.Sleep(sleepFor)
+	}
+}
+
+func exactTenantAbsent(client *http.Client, cfg stagingCfg, slug string) (bool, error) {
+	status, body, err := cleanupJSONRequest(
+		client,
+		http.MethodGet,
+		fmt.Sprintf("%s/cp/admin/tenants/%s/boot-events?limit=1", strings.TrimRight(cfg.cpBase, "/"), slug),
+		cfg.adminToken,
+		"",
+	)
+	if err != nil {
+		return false, err
+	}
+	if status == http.StatusNotFound {
+		return true, nil
+	}
+	if status != http.StatusOK {
+		return false, fmt.Errorf("exact tenant identity returned HTTP %d: %s", status, cleanupResponseDetail(body))
+	}
+	var identity struct {
+		Slug string `json:"slug"`
+	}
+	if err := json.Unmarshal([]byte(body), &identity); err != nil {
+		return false, fmt.Errorf("decode exact tenant identity: %w", err)
+	}
+	if identity.Slug != slug {
+		return false, fmt.Errorf("exact tenant identity mismatch: got %q", identity.Slug)
+	}
+	return false, nil
+}
+
+func validateStagingCPBase(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("invalid control-plane URL")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if parsed.Scheme == "https" && host == "staging-api.moleculesai.app" {
+		return nil
+	}
+	if parsed.Scheme == "http" && (host == "127.0.0.1" || host == "::1" || host == "localhost") {
+		return nil
+	}
+	return fmt.Errorf("refusing to send staging admin bearer to %s://%s", parsed.Scheme, host)
+}
+
+func validE2ESlug(slug string) bool {
+	if len(slug) == 0 || len(slug) > 63 ||
+		(!strings.HasPrefix(slug, "e2e-") && !strings.HasPrefix(slug, "rt-e2e-")) {
+		return false
+	}
+	for _, r := range slug {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func cleanupJSONRequest(client *http.Client, method, url, token, body string) (int, string, error) {
+	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	if err != nil {
+		return 0, "", fmt.Errorf("build %s request: %w", method, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", fmt.Errorf("%s request: %w", method, err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, readBody(resp), nil
+}
+
+func cleanupResponseDetail(body string) string {
+	detail := strings.Join(strings.Fields(body), " ")
+	if len(detail) > 300 {
+		return detail[:300] + "..."
+	}
+	return detail
 }
 
 // tenantAdminToken fetches the per-tenant admin token from the CP admin surface.
