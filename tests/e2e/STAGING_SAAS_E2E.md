@@ -1,9 +1,10 @@
 # Staging SaaS E2E runbook
 
 The staging E2E workflows provision disposable resources through
-`https://staging-api.moleculesai.app`, exercise the deployed tenant stack, and
-tear everything down. The workflow YAML files are authoritative for triggers,
-cadence, runner labels, and timeout budgets.
+`https://staging-api.moleculesai.app` on the current local-Docker backend,
+exercise the deployed tenant stack, and tear everything down through the
+control plane. The workflow YAML files are authoritative for triggers, cadence,
+runner labels, and timeout budgets.
 
 ## Main coverage
 
@@ -21,8 +22,26 @@ cadence, runner labels, and timeout budgets.
   hard provision/management-MCP/A2A/lifecycle gate and rollback chain.
 
 The shared shell harness is `tests/e2e/test_staging_full_saas.sh`; individual
-workflows select the required mode. Every path that creates a tenant must keep
-an EXIT/INT/TERM cleanup trap and treat leftover resources as a failure.
+workflows select the required mode. The active local-Docker lanes in
+`e2e-staging-saas.yml` that use these shell harnesses keep EXIT/INT/TERM cleanup
+traps. Destructive teardown is enabled only after a successful create returns a
+valid creation-returned org ID. Cleanup requires that ID to match the exact slug
+before DELETE, then normally validates the DELETE response's purge and org
+identities, the exact completed purge audit, and that
+`/cp/admin/tenants/<slug>/boot-events?limit=1` returns HTTP 404. That endpoint
+resolves the exact tenant identity before listing events; the admin roster is
+used only to rediscover the exact slug/ID pair already published by a successful
+create and is not absence proof. A missing run ID or verified creation identity
+makes the safety net visibly inconclusive and authorizes no roster request or
+DELETE. If the synchronous delete response is lost during local-Docker network
+detach, cleanup can recover only from a completed purge audit for the same
+creation-returned slug/org ID recorded no earlier than that DELETE attempt, plus
+the same exact structured HTTP 404 absence proof; a missing, stale, or malformed
+audit remains a hard failure. A generic Actions runner does not directly
+enumerate provider resources, so its logs must never
+describe that unperformed scan as a pass. Other staging workflow families retain
+separate teardown contracts; `molecule-ai/internal#639` tracks the remaining
+convergence.
 
 ## Credential
 
@@ -33,9 +52,9 @@ runbook, a committed env file, or a persistent credential bundle.
 
 ```bash
 source ~/.molecule-ai/ops.sh
-export MOLECULE_ADMIN_TOKEN="$(mol_secret CP_ADMIN_API_TOKEN /shared/controlplane-admin staging)"
-bash tests/e2e/test_staging_full_saas.sh
-unset MOLECULE_ADMIN_TOKEN
+E2E_INFRA_BACKEND=local-docker \
+  MOLECULE_ADMIN_TOKEN="$(mol_secret CP_ADMIN_API_TOKEN /shared/controlplane-admin staging)" \
+  bash tests/e2e/test_staging_full_saas.sh
 ```
 
 `E2E_KEEP_ORG=1` is a local debugging escape hatch. Never set it in CI.
@@ -43,6 +62,7 @@ unset MOLECULE_ADMIN_TOKEN
 ## Completion criteria
 
 A run is complete only when the throwaway tenant/workspaces reach the asserted
-states, a real A2A response is observed, and cleanup verifies no resources are
-left behind. A successful API create, image push, or pin update by itself is not
-an end-to-end pass.
+states, a real A2A response is observed, and cleanup proves the exact completed
+purge audit plus an HTTP 404 from the exact-tenant boot-events endpoint. This is
+control-plane purge evidence, not a direct provider-resource scan. A successful
+API create, image push, or pin update by itself is not an end-to-end pass.

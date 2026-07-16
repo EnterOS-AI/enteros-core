@@ -42,8 +42,9 @@
 #                                     "Not logged in"/error/empty. This reds on the
 #                                     created-agent auth bug (no LLM token) and is
 #                                     INDEPENDENT of runtime#181.
-#   STEP 6  TEARDOWN                  the throwaway org is deleted cleanly (trap),
-#                                     leak-checked (org row + EC2).
+#   STEP 6  TEARDOWN                  the throwaway org is deleted through the
+#                                     synchronous CP purge; its exact receipt,
+#                                     audit row, and org absence are verified.
 #
 # NOTE on "team": this architecture has no separate create_team verb — a team is
 # realised as workspace(s) under the org, and the management MCP
@@ -100,8 +101,7 @@
 #                                 send the message — generous for nondeterminism)
 #   E2E_KEEP_ORG                  1 → skip teardown (debugging only)
 #   E2E_RUN_ID                    slug suffix; CI: ${GITHUB_RUN_ID}-${RUN_ATTEMPT}
-#   E2E_AWS_LEAK_CHECK            auto (default) | required | off
-#   E2E_AWS_TERMINATE_LEAKS      1 → terminate slug-tagged leaked EC2 on exit
+#   E2E_INFRA_BACKEND             required: local-docker (only active backend)
 #   E2E_REQUIRE_LIVE             1 → a SKIP for "no concierge on platform image"
 #                                 becomes a hard FAIL (CI sets this so a silently-
 #                                 missing platform-agent image can't false-green
@@ -112,7 +112,7 @@
 #   1  generic / assertion failure (agent didn't act, or tool failed)
 #   2  missing required env
 #   3  provisioning timed out
-#   4  teardown left orphan resources
+#   4  teardown receipt/audit/org-absence proof failed
 #   5  E2E_REQUIRE_LIVE=1 but the concierge could not be exercised (no
 #      platform-agent image / never came online) — false-green guard
 set -euo pipefail
@@ -122,10 +122,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 # shellcheck source=_lib.sh
 source "$SCRIPT_DIR/_lib.sh"
-# AWS-leak-check lib — same teardown leak assertion the full-SaaS harness uses.
+# Exact synchronous CP purge receipt + exact-org absence verifier.
 # shellcheck disable=SC1091
-# shellcheck source=lib/aws_leak_check.sh
-source "$SCRIPT_DIR/lib/aws_leak_check.sh"
+# shellcheck source=lib/cp_purge_receipt.sh
+source "$SCRIPT_DIR/lib/cp_purge_receipt.sh"
+e2e_cp_require_local_backend || exit 2
 # Real-completion error-as-text scanner — used to detect the concierge
 # surfacing its tool/LLM error AS a reply ("Agent error …") so a broken agent
 # can't read as "asked but politely declined".
@@ -153,6 +154,7 @@ source "$SCRIPT_DIR/lib/provision_tool_ssot.sh"
 source "$SCRIPT_DIR/lib/obs.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
+e2e_cp_require_staging_origin "$CP_URL" || exit 2
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:-}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 CONCIERGE_ONLINE_SECS="${E2E_CONCIERGE_ONLINE_SECS:-900}"
@@ -416,17 +418,24 @@ poll_push_async_chat_history() {
 CURL_COMMON=(-sS --max-time 30)
 TMPDIR_E2E=$(mktemp -d -t cncrg-mk-XXXXXX)
 
-# ─── teardown trap (worker delete + org delete + leak check) ─────────────────
+# ─── teardown trap (worker delete + exact CP purge proof) ────────────────────
 CLEANUP_DONE=0
 WORKER_ID=""        # set once the concierge creates it (for targeted delete)
 TENANT_URL=""       # set after provisioning
 TENANT_TOKEN=""
 ORG_ID=""
+ORG_CREATION_VERIFIED=0
 cleanup() {
   local entry_rc=$?
   [ "$CLEANUP_DONE" = "1" ] && return 0
   CLEANUP_DONE=1
   rm -rf "$TMPDIR_E2E" 2>/dev/null || true
+
+  if [ "$ORG_CREATION_VERIFIED" != "1" ]; then
+    log "No verified creation-returned org identity for $SLUG — skipping destructive org teardown."
+    [ -n "${OBS_RUN_ID:-}" ] && obs_run_end "$( [ "$entry_rc" = "0" ] && echo skip || echo fail )"
+    case "$entry_rc" in 0|1|2|3|4|5) return 0 ;; *) exit 1 ;; esac
+  fi
 
   # Best-effort targeted delete of the worker the concierge created, so the org
   # delete below isn't the only thing reaping it (defensive — org delete cascades
@@ -446,47 +455,35 @@ cleanup() {
   fi
   [ -n "${OBS_RUN_ID:-}" ] && obs_step_start teardown
   log "🧹 Tearing down org $SLUG..."
-  if curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1; then
-    ok "Teardown request accepted"
-  else
-    log "Teardown returned non-2xx (may already be gone)"
-  fi
-
-  # Eventual-consistency wait: org row gone / purged.
-  local leak_count=1 elapsed=0
-  while [ "$elapsed" -lt 60 ]; do
-    leak_count=$(curl "${CURL_COMMON[@]}" "$CP_URL/cp/admin/orgs" \
-      -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-      | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for o in d.get('orgs', []) if o.get('slug')=='$SLUG' and o.get('status') != 'purged'))" \
-      2>/dev/null || echo 1)
-    [ "$leak_count" = "0" ] && break
-    sleep 5; elapsed=$((elapsed + 5))
-  done
-  if [ "$leak_count" != "0" ]; then
-    echo "⚠️  LEAK: org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" >&2
+  local purge_verify_rc=0
+  e2e_cp_delete_and_verify_purge \
+    "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" || purge_verify_rc=$?
+  if [ "$purge_verify_rc" != "0" ]; then
     if [ -n "${OBS_RUN_ID:-}" ]; then
-      obs_leak org "$SLUG" "executeOrgPurge:purgeDBRows (org row survived admin-list)"
-      obs_step_end zero_leftover_verify fail "org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" "elapsed_secs=$elapsed"
+      obs_step_end teardown fail "CP purge receipt/audit or exact-tenant HTTP 404 verification failed" "purge_verify_rc=$purge_verify_rc"
+      obs_step_end zero_leftover_verify skip "direct provider enumeration was not performed" "purge_verify_rc=$purge_verify_rc"
       obs_run_end fail
     fi
-    exit 4
+    case "$purge_verify_rc" in 2) exit 2 ;; *) exit 4 ;; esac
   fi
-  local aws_leak_rc=0
-  e2e_verify_no_ec2_leaks_for_slug "$SLUG" || aws_leak_rc=$?
-  if [ "$aws_leak_rc" != "0" ]; then
-    if [ -n "${OBS_RUN_ID:-}" ]; then
-      obs_leak ec2 "$SLUG" "CascadeWorkspaceEC2s / deprovisionTenantInfra (slug-tagged EC2 survived)"
-      obs_step_end zero_leftover_verify fail "EC2/resource leak for $SLUG (aws_leak_rc=$aws_leak_rc)" "aws_leak_rc=$aws_leak_rc"
-      obs_run_end fail
-    fi
-    case "$aws_leak_rc" in 2) exit 2 ;; *) exit 4 ;; esac
-  fi
-  ok "Teardown clean — no orphan org or EC2 resources for $SLUG (${elapsed}s)"
+  local teardown_message teardown_proof
+  case "$E2E_CP_PURGE_RESULT" in
+    purged)
+      teardown_message="CP purge completed and exact org absent"
+      teardown_proof="cp_purge_receipt_audit_exact_tenant_404"
+      ;;
+    already_absent)
+      teardown_message="Exact org already absent; no DELETE or purge audit required"
+      teardown_proof="exact_tenant_404"
+      ;;
+    *)
+      [ -n "${OBS_RUN_ID:-}" ] && obs_step_end teardown fail "CP purge helper returned an unknown success result" "result=${E2E_CP_PURGE_RESULT:-unset}"
+      exit 4
+      ;;
+  esac
   if [ -n "${OBS_RUN_ID:-}" ]; then
-    obs_step_end teardown pass "" "elapsed_secs=$elapsed"
-    obs_step_end zero_leftover_verify pass "no orphan org or EC2 resources" "elapsed_secs=$elapsed"
+    obs_step_end teardown pass "$teardown_message" "proof=$teardown_proof"
+    obs_step_end zero_leftover_verify skip "direct provider enumeration is not available on this generic runner" "proof=$teardown_proof"
     obs_run_end "$( [ "$entry_rc" = "0" ] && echo pass || echo fail )"
   fi
   case "$entry_rc" in 0|1|2|3|4|5) ;; *) exit 1 ;; esac
@@ -571,11 +568,28 @@ obs_step_end preflight pass "" "cp_url=$CP_URL"
 # ─── 1. Create org (CP installs + provisions the concierge as platform root) ──
 obs_step_start org_create
 log "1/6 CREATE A NEW ORG — creating org $SLUG..."
-CREATE_RESP=$(admin_call POST /cp/admin/orgs \
+CREATE_BODYFILE="$TMPDIR_E2E/create-org-response.json"
+set +e
+CREATE_HTTP_CODE=$(admin_call POST /cp/admin/orgs \
+  -o "$CREATE_BODYFILE" -w '%{http_code}' \
   -d "{\"slug\":\"$SLUG\",\"name\":\"E2E $SLUG\",\"owner_user_id\":\"e2e-runner:$SLUG\"}")
+CREATE_CURL_RC=$?
+set -e
+CREATE_RESP=$(cat "$CREATE_BODYFILE" 2>/dev/null || true)
+if [ "$CREATE_CURL_RC" != "0" ]; then
+  fail "Org create request failed (curl_rc=$CREATE_CURL_RC http=${CREATE_HTTP_CODE:-000}); raw body: $CREATE_RESP"
+fi
+case "$CREATE_HTTP_CODE" in
+  2[0-9][0-9]) ;;
+  *) fail "Org create returned non-2xx (http=${CREATE_HTTP_CODE:-000}); raw body: $CREATE_RESP" ;;
+esac
 echo "$CREATE_RESP" | python3 -m json.tool >/dev/null || fail "Org create non-JSON: $CREATE_RESP"
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
-[ -z "$ORG_ID" ] && fail "Org create response missing 'id': $CREATE_RESP"
+e2e_cp_validate_org_id "$ORG_ID" \
+  || fail "Org create response missing a valid UUID 'id': $CREATE_RESP"
+ORG_CREATION_VERIFIED=1
+e2e_cp_publish_creation_identity "$SLUG" "$ORG_ID" \
+  || fail "Could not publish the verified org creation identity for teardown"
 export OBS_ORG_ID="$ORG_ID"
 ok "Org created (id=$ORG_ID)"
 obs_step_end org_create pass "" "org_id=$ORG_ID"
