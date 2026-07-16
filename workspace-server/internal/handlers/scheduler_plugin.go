@@ -29,18 +29,21 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
-const (
-	// SchedulerPluginName is the declared-plugin name (matches plugin.yaml).
-	SchedulerPluginName = "molecule-scheduler"
-	// SchedulerPluginSource is the git-native source the boot-installer /
-	// reconcile fetches. Public repo, pinned tag → reproducible, anonymous
-	// clone. Bump the tag when the plugin releases.
-	SchedulerPluginSource = "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.1.0"
+// SchedulerPluginName is the declared-plugin name (matches plugin.yaml) and the
+// registry key core looks the source up by.
+const SchedulerPluginName = "molecule-scheduler"
 
-	// schedulerArmTimeout bounds the best-effort reload forward. Short: arming
-	// is a fire-and-forget optimization over the reconcile-on-online safety net.
-	schedulerArmTimeout = 8 * time.Second
-)
+// SchedulerPluginSource is the git-native source the boot-installer / reconcile
+// fetches. It is NO LONGER a hand-written literal: it is sourced from the SDK
+// native-plugins registry SSOT (plugin_registry.go), so bumping the plugin's
+// pinned tag happens once, in the registry, and reaches core via a molcontracts
+// bump — core can't drift. A registry that drops molecule-scheduler panics at
+// startup (mustNativePluginSource) rather than recording an empty source.
+var SchedulerPluginSource = mustNativePluginSource(SchedulerPluginName)
+
+// schedulerArmTimeout bounds the best-effort reload forward. Short: arming is a
+// fire-and-forget optimization over the reconcile-on-online safety net.
+const schedulerArmTimeout = 8 * time.Second
 
 // ensureSchedulerPluginDeclared records molecule-scheduler in the workspace's
 // declared-plugin set (idempotent upsert). After this, the plugin is installed
