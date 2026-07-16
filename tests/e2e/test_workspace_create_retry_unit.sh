@@ -7,6 +7,11 @@
 # a non-idempotent create from duplicating). Negative control: SENTINEL_BROKEN=1
 # fault-injects BOTH the classifier AND the header parsers, so EVERY assertion
 # below has a demonstrated fail arm (a test you have not seen fail proves nothing).
+# The H_* header fixtures below are consumed only inside the single-quoted
+# assertion strings passed to ok()/eval, which shellcheck cannot follow — so it
+# reports every fixture as unused. They ARE used. (File-level directive: must
+# precede the first command to apply file-wide.)
+# shellcheck disable=SC2034
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -29,9 +34,16 @@ if [ "${SENTINEL_BROKEN:-0}" = "1" ]; then
   create_parse_server()      { printf 'BROKEN'; }
 fi
 
+# All fixtures live in ONE scratch dir cleaned by an EXIT trap, so a failed
+# assertion's `exit 1` never leaks scratch (RFC #2873 / lint_cleanup_traps.sh).
+# A trapped dir (not a per-file array) is required because hdr() runs inside a
+# `$(...)` subshell, where an array append would not survive to the parent.
+E2E_TMPDIR=$(mktemp -d -t wscreate-XXXXXX)
+trap 'rm -rf "$E2E_TMPDIR"' EXIT INT TERM
+
 pass=0 fail=0
 ok()  { if eval "$2"; then echo "  PASS: $1"; pass=$((pass+1)); else echo "  FAIL: $1"; fail=$((fail+1)); fi; }
-hdr() { local f; f=$(mktemp); printf '%b' "$1" > "$f"; echo "$f"; }
+hdr() { local f; f=$(mktemp "$E2E_TMPDIR/h.XXXXXX"); printf '%b' "$1" > "$f"; echo "$f"; }
 
 echo "── classifier: create_should_retry_cold ──"
 # Cold-origin "never reached a handler" → RETRY (rc 0)
@@ -69,7 +81,6 @@ ok "HTTP-date retry-after → default 2" '[ "$(create_parse_retry_after "$H_DATE
 ok "server=cloudflare parsed"         '[ "$(create_parse_server "$H_CF")" = "cloudflare" ]'
 ok "server=nginx parsed"              '[ "$(create_parse_server "$H_11")" = "nginx" ]'
 
-rm -f "$H_100" "$H_103" "$H_CF" "$H_11" "$H_NORA" "$H_HOSTILE" "$H_DATE"
 echo "──"
 echo "totals: pass=$pass fail=$fail"
 if [ "$fail" -ne 0 ]; then echo "❌ workspace-create retry unit FAILED"; exit 1; fi
