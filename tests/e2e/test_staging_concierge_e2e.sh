@@ -236,14 +236,47 @@ fi
 # (https://$SLUG.$domain), so the default below reproduces staging byte-for-byte.
 # Under the ephemeral CP, $TENANT_URL is the CP base URL (NOT a tenant origin), so
 # a same-value Origin would be cross-origin → an empty-body 403 from cors before
-# any handler runs. MOLECULE_TENANT_ORIGIN_TEMPLATE (the SAME template the CP turns
-# into the tenant's CORS_ORIGINS) is substituted with this run's slug so the Origin
-# we present is byte-identical to the origin the tenant allows. Default unset ⇒
-# Origin=$TENANT_URL ⇒ exact staging behavior.
+# any handler runs (the exact failure this port fixed). Precedence:
+#
+#   1. MOLECULE_TENANT_ORIGIN_TEMPLATE set → the SAME template the CP turns into the
+#      tenant's CORS_ORIGINS, substituted with this run's slug so the Origin we
+#      present is byte-identical to the origin the tenant allows. Always wins.
+#   2. template UNSET but ephemeral slug-routing is active (TENANT_ROUTE_HDRS
+#      non-empty ⇒ MOLECULE_TENANT_ROUTE_DOMAIN / _ROUTE_HOST in play) → $TENANT_URL
+#      is the CP base URL, NOT a tenant origin, so using it verbatim would 403.
+#      Instead DERIVE a tenant-scoped origin from the route host — the same
+#      slug.<route-domain> the CP forms CORS_ORIGINS from (PublicURLForSlug) —
+#      grounding scheme+port in the existing $TENANT_URL (or an explicit
+#      MOLECULE_TENANT_ROUTE_PORT) rather than blindly reusing the CP base URL host.
+#      This makes the Origin safe by construction even when a caller overrides
+#      MOLECULE_TENANT_URL (e.g. to the CP base URL) but forgets the origin template.
+#   3. no ephemeral routing (staging) → Origin=$TENANT_URL (the tenant's own
+#      subdomain, which IS its CORS_ORIGINS) ⇒ exact staging behavior.
 TENANT_ORIGIN="$TENANT_URL"
 if [ -n "${MOLECULE_TENANT_ORIGIN_TEMPLATE:-}" ]; then
   TENANT_ORIGIN="${MOLECULE_TENANT_ORIGIN_TEMPLATE//\{slug\}/$SLUG}"
   log "    tenant CORS origin = $TENANT_ORIGIN (from MOLECULE_TENANT_ORIGIN_TEMPLATE)"
+elif [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+  # Ephemeral slug-routing without an explicit origin template. $TENANT_URL points
+  # at the CP base URL here, so it is NOT the origin the tenant's cors allows.
+  # Rebuild the tenant-scoped origin from the route host + the scheme/port of the
+  # existing $TENANT_URL (the loopback route domain resolves to the same host:port
+  # the CP publishes on). Prefer an explicit MOLECULE_TENANT_ROUTE_PORT if given.
+  ORIGIN_SCHEME="${TENANT_URL%%://*}"
+  case "$ORIGIN_SCHEME" in http|https) ;; *) ORIGIN_SCHEME="" ;; esac
+  ORIGIN_PORT="${MOLECULE_TENANT_ROUTE_PORT:-}"
+  if [ -z "$ORIGIN_PORT" ]; then
+    TU_HOSTPORT="${TENANT_URL#*://}"; TU_HOSTPORT="${TU_HOSTPORT%%/*}"
+    case "$TU_HOSTPORT" in *:*) ORIGIN_PORT="${TU_HOSTPORT##*:}" ;; esac
+  fi
+  if [ -z "$ORIGIN_SCHEME" ] || [ -z "$TENANT_ROUTE_HOST" ]; then
+    fail "Cannot derive a tenant CORS Origin for ephemeral slug-routing (scheme='$ORIGIN_SCHEME' route_host='$TENANT_ROUTE_HOST'). Set MOLECULE_TENANT_ORIGIN_TEMPLATE to the CP's LOCAL_TENANT_URL_TEMPLATE (with {slug})."
+  fi
+  case "$TENANT_ROUTE_HOST" in
+    *:*) TENANT_ORIGIN="${ORIGIN_SCHEME}://${TENANT_ROUTE_HOST}" ;;               # route host already carries a port
+    *)   TENANT_ORIGIN="${ORIGIN_SCHEME}://${TENANT_ROUTE_HOST}${ORIGIN_PORT:+:$ORIGIN_PORT}" ;;
+  esac
+  log "    tenant CORS origin = $TENANT_ORIGIN (derived from route host; MOLECULE_TENANT_ORIGIN_TEMPLATE unset)"
 fi
 
 # ─── 3. Per-tenant admin token + TLS readiness ───────────────────────────────
@@ -256,8 +289,19 @@ ok "Tenant admin token retrieved (len=${#TENANT_TOKEN})"
 log "    Waiting for tenant TLS / DNS propagation..."
 TLS_DEADLINE=$(( $(date +%s) + 15 * 60 ))
 while true; do
-  curl -sSfk "${TENANT_ROUTE_HDRS[@]}" --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
-  [ "$(date +%s)" -gt "$TLS_DEADLINE" ] && fail "Tenant /health never 2xx within 15m"
+  # Under ephemeral slug-routing, /health is answered by the CP's OWN global
+  # handler for ANY Host, so probing it with the route headers proves NOTHING —
+  # it 2xx's on iteration 1 without the tenant route ever being up (vacuous
+  # readiness gate). Probe /org/identity — a tenant-owned handler the CP proxies
+  # through — WITH the routing headers + X-Molecule-Org-Id, so a not-yet-routable
+  # tenant is actually caught. Staging (empty TENANT_ROUTE_HDRS) keeps the global
+  # /health check. Mirrors test_staging_full_saas.sh step 4.
+  if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+    curl -sSfk --max-time 5 "${TENANT_ROUTE_HDRS[@]}" -H "X-Molecule-Org-Id: $ORG_ID" "$TENANT_URL/org/identity" >/dev/null 2>&1 && break
+  else
+    curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
+  fi
+  [ "$(date +%s)" -gt "$TLS_DEADLINE" ] && fail "Tenant never became routable within 15m (probe: $( [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ] && echo '/org/identity via route headers' || echo '/health' ))"
   sleep 5
 done
 ok "Tenant reachable at $TENANT_URL"

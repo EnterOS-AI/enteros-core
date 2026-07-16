@@ -530,30 +530,96 @@ run_scenario_concierge_user_tasks() {
 # Dispatch one extra-scenario key to its runner. An UNKNOWN key is a hard error,
 # never a silent skip: a typo in E2E_EPHEMERAL_EXTRA_SCENARIOS that quietly ran
 # nothing would be the exact vacuous-green this gate exists to abolish.
+# Exit 97 is the RESERVED unknown-key/misconfig sentinel. It must be a code the
+# scenario runners themselves NEVER emit: the concierge scenario legitimately
+# exits 2 (its cleanup_org EXIT trap / env guards), so keying misconfig on 2 would
+# misclassify a genuine ran-and-failed scenario as a never-ran typo. 97 collides
+# with nothing a scenario returns; a known scenario that somehow exits 97 is
+# remapped below so it can never masquerade as a misconfig.
+readonly EXTRA_MISCONFIG_RC=97
 run_one_extra_scenario() {
+  local rc
   case "$1" in
-    concierge_user_tasks) run_scenario_concierge_user_tasks ;;
-    *) echo "[proof][extra] ❌ unknown extra scenario '$1' — check E2E_EPHEMERAL_EXTRA_SCENARIOS" >&2; return 2 ;;
+    concierge_user_tasks) run_scenario_concierge_user_tasks; rc=$? ;;
+    *) echo "[proof][extra] ❌ unknown extra scenario '$1' — check E2E_EPHEMERAL_EXTRA_SCENARIOS" >&2; return "$EXTRA_MISCONFIG_RC" ;;
   esac
+  # A known scenario must never masquerade as the misconfig sentinel.
+  [ "$rc" -eq "$EXTRA_MISCONFIG_RC" ] && rc=1
+  return "$rc"
 }
 
+# Set by run_extra_scenarios: 1 when the extra-scenario LIST itself is a misconfig
+# (an unknown/typo'd key, or a non-empty value that names ZERO scenarios). A
+# misconfig means the wrong thing — or nothing — ran, so it is NEVER
+# advisory-suppressible: gate_extra_scenarios fails the gate on it regardless of
+# E2E_EPHEMERAL_EXTRA_ADVISORY. Distinct from a scenario that genuinely RAN and
+# failed (counted in run_extra_scenarios's return), which the advisory soak may
+# still suppress.
+EXTRA_MISCONFIG=0
+
 # Run every scenario named in E2E_EPHEMERAL_EXTRA_SCENARIOS (comma/space list)
-# against the standing CP. Returns the COUNT of failed scenarios (0 = all green)
-# so the caller can gate or advise on it. Never returns early — every listed
-# scenario runs so one failure does not mask a second.
+# against the standing CP. Returns the COUNT of scenarios that RAN and FAILED
+# (0 = none) so the caller can gate or advise on it. Sets EXTRA_MISCONFIG=1 (out
+# of band) for a never-ran misconfig. Never returns early — every listed scenario
+# runs so one failure does not mask a second.
 run_extra_scenarios() {
   local list="${E2E_EPHEMERAL_EXTRA_SCENARIOS:-}"
   [ -n "$list" ] || return 0
-  local failed=0 s
-  for s in ${list//,/ }; do
-    if run_one_extra_scenario "$s"; then
-      echo "[proof][extra] ✅ ${s} PASSED against the ephemeral CP." >&2
-    else
-      failed=$((failed + 1))
-      echo "[proof][extra] ❌ ${s} FAILED against the ephemeral CP." >&2
-    fi
+  EXTRA_MISCONFIG=0
+  # A non-empty value that tokenizes to NOTHING (e.g. "," or whitespace) passes the
+  # -n guard above but yields zero loop iterations — which would silently return 0
+  # (green, nothing ran). That is a misconfig, not "no extras": detect zero tokens
+  # explicitly and fail (never-ran ≠ all-passed).
+  local -a keys=(); local s
+  for s in ${list//,/ }; do keys+=("$s"); done
+  if [ "${#keys[@]}" -eq 0 ]; then
+    echo "[proof][extra] ❌ E2E_EPHEMERAL_EXTRA_SCENARIOS is set ('${list}') but names ZERO scenarios (no tokens after splitting) — misconfig; refusing to pass vacuously." >&2
+    EXTRA_MISCONFIG=1
+    return 0
+  fi
+  local failed=0 rc
+  for s in "${keys[@]}"; do
+    run_one_extra_scenario "$s"; rc=$?
+    case "$rc" in
+      0) echo "[proof][extra] ✅ ${s} PASSED against the ephemeral CP." >&2 ;;
+      "$EXTRA_MISCONFIG_RC") # UNKNOWN key (reserved sentinel) — a typo that ran
+         # nothing. Flag it as a misconfig so it fails the gate UNCONDITIONALLY,
+         # even under E2E_EPHEMERAL_EXTRA_ADVISORY=1: a never-ran scenario must
+         # never read as an advisory-suppressible green. A scenario that RAN and
+         # failed (any other non-zero, INCLUDING its own exit 2) falls through to
+         # the failed-count below and stays advisory-suppressible.
+         echo "[proof][extra] ❌ ${s} is an UNKNOWN scenario key (ran nothing) — misconfig; fails the gate even under E2E_EPHEMERAL_EXTRA_ADVISORY=1." >&2
+         EXTRA_MISCONFIG=1 ;;
+      *) failed=$((failed + 1))
+         echo "[proof][extra] ❌ ${s} FAILED against the ephemeral CP." >&2 ;;
+    esac
   done
   return "$failed"
+}
+
+# Run the extra scenarios against the standing CP and apply the gating policy.
+# Shared by `all` and `scenario` so the advertised local loop exercises exactly
+# what CI does. Returns 0 if the extras do NOT force a gate failure, 1 if they do:
+#   * a scenario that RAN and FAILED → gates UNLESS E2E_EPHEMERAL_EXTRA_ADVISORY=1
+#     (the capture-first advisory soak), and
+#   * a MISCONFIG (unknown key / zero-token list) → gates ALWAYS (never suppressible).
+gate_extra_scenarios() {
+  [ -n "${E2E_EPHEMERAL_EXTRA_SCENARIOS:-}" ] || return 0
+  local extra_failed gate=0
+  run_extra_scenarios; extra_failed=$?
+  if [ "${EXTRA_MISCONFIG:-0}" -ne 0 ]; then
+    echo "[proof][extra] ❌ extra-scenario MISCONFIG (unknown key or zero-token list) — failing the gate; NOT advisory-suppressible." >&2
+    gate=1
+  fi
+  if [ "$extra_failed" -ne 0 ]; then
+    if [ "${E2E_EPHEMERAL_EXTRA_ADVISORY:-0}" = "1" ]; then
+      echo "[proof][extra] ⚠️ ${extra_failed} extra scenario(s) FAILED — ADVISORY soak (E2E_EPHEMERAL_EXTRA_ADVISORY=1); NOT failing the gate. Read the [extra] output above and promote to gating once green." >&2
+    else
+      echo "[proof][extra] ❌ ${extra_failed} extra scenario(s) FAILED and are GATING (E2E_EPHEMERAL_EXTRA_ADVISORY!=1)." >&2
+      gate=1
+    fi
+  fi
+  return "$gate"
 }
 
 # ── idle-digest sub-step assertion (task #219) — RETIRED as the gating check:
@@ -830,6 +896,14 @@ print_reattach() {
 EOF
 }
 
+# Allow this file to be SOURCED by unit tests (tests/e2e/test_extra_scenarios_gating_unit.sh
+# exercises run_extra_scenarios / gate_extra_scenarios with a stubbed runner) WITHOUT
+# booting a CP: when sourced, BASH_SOURCE[0] != $0, so stop before dispatch. Executed
+# directly, the two are equal and dispatch proceeds unchanged.
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
+  return 0 2>/dev/null || true
+fi
+
 case "$CMD" in
   all)
     require_boot_env
@@ -849,17 +923,7 @@ case "$CMD" in
       # RFC #86: run any extra post-push lanes being pulled left onto this gate,
       # against the SAME standing CP. Only after the happy-path passed (a broken
       # CP must red as the happy-path, not as an unrelated extra scenario).
-      if [ -n "${E2E_EPHEMERAL_EXTRA_SCENARIOS:-}" ]; then
-        run_extra_scenarios; extra_failed=$?
-        if [ "$extra_failed" -ne 0 ]; then
-          if [ "${E2E_EPHEMERAL_EXTRA_ADVISORY:-0}" = "1" ]; then
-            echo "[proof][extra] ⚠️ ${extra_failed} extra scenario(s) FAILED — ADVISORY soak (E2E_EPHEMERAL_EXTRA_ADVISORY=1); NOT failing the gate. Read the [extra] output above and promote to gating once green." >&2
-          else
-            echo "[proof][extra] ❌ ${extra_failed} extra scenario(s) FAILED and are GATING (E2E_EPHEMERAL_EXTRA_ADVISORY!=1)." >&2
-            rc=1
-          fi
-        fi
-      fi
+      gate_extra_scenarios || rc=1
     fi
     if [ "$rc" -ne 0 ]; then
       echo "[proof] ❌ core happy-path FAILED (rc=$rc) against the ephemeral CP — read the full-saas output above for the failing step." >&2
@@ -892,6 +956,11 @@ case "$CMD" in
     if [ "$rc" -eq 0 ]; then
       stop_tenant_log_collector
       echo "[proof] ✅ scenario PASSED against standing CP ${CP_BASE_URL}." >&2
+      # The advertised fast local loop is boot→scenario; if it never ran the ported
+      # extra scenarios, a dev would get a false "passed locally" that CI (which
+      # runs them via `all`) then reds. Run them here too, against the SAME standing
+      # CP, with identical advisory/misconfig gating.
+      gate_extra_scenarios || rc=1
     fi
     if [ "$rc" -ne 0 ]; then
       echo "[proof] ❌ scenario FAILED (rc=$rc) — the CP is still UP (${CP_BASE_URL}); fix and re-run '$0 scenario'." >&2
