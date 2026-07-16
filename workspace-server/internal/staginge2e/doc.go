@@ -1,13 +1,14 @@
 // Package staginge2e holds live, against-real-staging-infra end-to-end tests
-// for molecule-core's workspace-server that are NOT part of the normal
-// `go test ./...` run and NOT part of any unit/httptest suite.
+// for molecule-core's workspace-server. The live tests are excluded from the
+// normal `go test ./...` run; untagged harness contract tests still run there.
 //
-// Every test here is guarded by the `staging_e2e` build tag AND skips itself
-// at runtime unless the required staging credentials are present in the
-// environment (see requireStagingEnv). So:
+// Every live test here is guarded by the `staging_e2e` build tag and skips at
+// runtime unless the required staging credentials are present (see
+// requireStagingEnv). Hermetic harness contracts run without live credentials.
+// So:
 //
-//	go test ./...                      # compiles nothing here (tag absent)
-//	go test -tags=staging_e2e ./...    # compiles; skips LOUD if creds absent
+//	go test ./...                      # runs untagged harness contracts only
+//	go test -tags=staging_e2e ./...    # runs tagged contracts; live tests skip LOUD without creds
 //	STAGING_E2E=1 CP_BASE_URL=... CP_ADMIN_API_TOKEN=... \
 //	  go test -tags=staging_e2e -run TestWorkspaceLifecycle_Staging \
 //	  -timeout 40m ./internal/staginge2e/

@@ -51,9 +51,10 @@ package staginge2e
 // to the existing local test_user_tasks_e2e.sh rather than being re-encoded in
 // Go.)
 //
-// Guarded by the staging_e2e build tag + STAGING_E2E=1 env gate. Teardown is
-// t.Cleanup-driven (admin DELETE /cp/admin/tenants), so a failed assertion can
-// never leak the tenant.
+// Guarded by the staging_e2e build tag + STAGING_E2E=1 env gate. After a
+// successful org-create response, exact-slug admin DELETE teardown is scheduled
+// before provisioning waits; teardown retries transient lifecycle conflicts,
+// verifies exact-slug absence, and fails the E2E if cleanup cannot be proved.
 
 import (
 	cryptorand "crypto/rand"
@@ -73,7 +74,6 @@ func TestConciergePlatformAgent_Staging(t *testing.T) {
 
 	// --- Step 1: provision throwaway org + tenant (reused scaffolding) ---
 	orgID := adminCreateOrg(t, cfg, slug)
-	t.Cleanup(func() { adminDeleteTenant(t, cfg, slug) })
 	t.Logf("org created: org_id=%s", orgID)
 
 	token := tenantAdminToken(t, cfg, slug)
@@ -85,8 +85,8 @@ func TestConciergePlatformAgent_Staging(t *testing.T) {
 	// observable proof that install actually anchored the org tree. We do NOT
 	// wait for it to boot online: every assertion here is DB/handler state
 	// (kind, parent_id, billing-mode, tab reachability), none of which needs a
-	// live container, so skipping the ~10-min EC2 cold-boot keeps the test fast
-	// and decoupled from boot-flake.
+	// live container, so skipping the workspace/container cold boot keeps the
+	// test fast and decoupled from boot-flake.
 	ordinaryWS := tenantCreateWorkspace(t, cfg, host, token, orgID)
 	t.Logf("ordinary workspace created: %s", ordinaryWS)
 

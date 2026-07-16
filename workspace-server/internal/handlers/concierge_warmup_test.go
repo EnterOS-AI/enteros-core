@@ -57,7 +57,7 @@ func expectHealthyOnlinePlatformHeartbeat(mock sqlmock.Sqlmock, wsID string) {
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs(wsID, 0.0, "", 0, 60, "").
+		WithArgs(wsID, 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
@@ -101,7 +101,7 @@ func expectWarmingPlatformHeartbeat(mock sqlmock.Sqlmock, wsID string) {
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs(wsID, 0.0, "", 0, 60, "").
+		WithArgs(wsID, 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// loaded_mcp_tools (["a2a"]) is non-nil, so it is persisted.
 	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
@@ -193,7 +193,7 @@ func TestConciergeWarmup_DoesNotFireForNonPlatform(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-regular", 0.0, "", 0, 60, "").
+		WithArgs("ws-regular", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// kind=workspace → the whole platform block (and the warmup) is skipped.

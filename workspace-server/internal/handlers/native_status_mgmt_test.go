@@ -40,7 +40,7 @@ func TestHeartbeat_NativeStatusMgmt_SkipsDegradeInference(t *testing.T) {
 
 	// heartbeat UPDATE — same as the non-native path
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-native-status", 0.8, "connection timeout", 0, 7200, "").
+		WithArgs("ws-native-status", 0.8, "connection timeout", 0, 7200, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// evaluateStatus SELECT — currently online, error_rate=0.8 would
@@ -93,7 +93,7 @@ func TestHeartbeat_NativeStatusMgmt_SkipsRecovery(t *testing.T) {
 
 	// heartbeat UPDATE — error_rate=0.05 would fire recovery
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-native-recovery", 0.05, "", 0, 7200, "").
+		WithArgs("ws-native-recovery", 0.05, "", 0, 7200, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// evaluateStatus SELECT — currently degraded; recovery branch
@@ -140,7 +140,7 @@ func TestHeartbeat_NativeStatusMgmt_WedgedStillRespected(t *testing.T) {
 	// heartbeat UPDATE — RuntimeState="wedged" means sample_error
 	// reflects the wedge reason, error_rate stays 0
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-wedged", 0.0, "SDK init timeout — restart workspace", 0, 7200, "").
+		WithArgs("ws-wedged", 0.0, "SDK init timeout — restart workspace", 0, 7200, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// evaluateStatus SELECT — currently online, wedged branch SHOULD fire

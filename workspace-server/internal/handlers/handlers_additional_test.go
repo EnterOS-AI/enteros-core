@@ -461,7 +461,7 @@ func TestHeartbeat_ExactThreshold_Degraded(t *testing.T) {
 		WithArgs("ws-edge").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-edge", 0.5, "edge case", 0, 500, "").
+		WithArgs("ws-edge", 0.5, "edge case", 0, 500, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// error_rate == 0.5 should trigger degraded (>= 0.5)
@@ -502,7 +502,7 @@ func TestHeartbeat_DegradedRecovery(t *testing.T) {
 		WithArgs("ws-rec").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-rec", 0.05, "", 1, 2000, "").
+		WithArgs("ws-rec", 0.05, "", 1, 2000, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Currently degraded, error_rate < 0.1 → should recover to online
@@ -544,7 +544,7 @@ func TestHeartbeat_ErrorRateDegrade_Guarded(t *testing.T) {
 		WithArgs("ws-degrade-guard").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-degrade-guard", 0.6, "", 1, 100, "").
+		WithArgs("ws-degrade-guard", 0.6, "", 1, 100, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Stale read: heartbeat started before CascadeDelete set status='removed'
@@ -590,7 +590,7 @@ func TestHeartbeat_DegradedRecovery_Guarded(t *testing.T) {
 		WithArgs("ws-recover-guard").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-recover-guard", 0.05, "", 1, 100, "").
+		WithArgs("ws-recover-guard", 0.05, "", 1, 100, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Stale read: heartbeat started before CascadeDelete set status='removed'
@@ -1487,7 +1487,7 @@ func TestHeartbeatHandler_RegisterFailureClearedOnCardBearingRestart(t *testing.
 
 	// heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-2739", 0.0, "", 0, 120, "").
+		WithArgs("ws-2739", 0.0, "", 0, 120, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// agent_card backfill — restart case: card ALREADY exists, 0 rows affected.

@@ -1000,43 +1000,31 @@ func conciergeModelIsPlatformManaged(runtime, model string) bool {
 // a defense-in-depth refusal for this PRIVILEGED name on any non-platform
 // workspace. The post-online reconcile + boot-install then install it.
 //
-// conciergePlatformMCPRepoPath is the fleet-fixed owner/repo of the management-MCP
-// plugin. It is HOST-agnostic on purpose: it names WHICH repo, never WHERE it is
-// served. The registry/SCM host is threaded to the box out-of-band via
-// MOLECULE_PLUGIN_REGISTRY (see pluginRegistryBase + conciergePlatformMCPEnv), so a
-// self-host / mirror / airgap overrides the host WITHOUT editing this source.
-const conciergePlatformMCPRepoPath = "molecule-ai/molecule-ai-plugin-molecule-platform-mcp"
-
-// conciergePlatformMCPRef is the pinned ref the box fetches. It MUST stay set: the
-// gitea resolver rejects an unpinned spec in production (PLUGIN_ALLOW_UNPINNED is
-// unset by default — see plugins/gitea.go), so an unpinned source would record the
-// declaration but then FAIL to fetch at boot-install time → no management MCP, no
-// create_workspace. #main matches the established seo-all convention.
-const conciergePlatformMCPRef = "main"
-
 // conciergePlatformMCPSource is the source-contract string recorded into
-// workspace_declared_plugins and consumed by the box boot-install. It is kept in
-// gitea:// wire form (NOT a full URL) for a deliberate reason:
+// workspace_declared_plugins and consumed by the box boot-install. It is NO
+// LONGER a hand-built literal: it is sourced (by name) from the SDK
+// native-plugins registry SSOT (plugin_registry.go), the install:concierge
+// entry. Consuming the registry removes the hand-kept RepoPath/Ref/Source
+// constants that previously duplicated the plugin repo's coordinates.
+//
+// The registry value is `gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main`
+// — the same gitea:// WIRE FORM the old literal used, kept deliberately:
 //
 //   - REGISTRY-CONFIGURABLE / provider-agnostic: the gitea:// scheme carries NO
-//     host. Both the older and the updated box resolvers resolve gitea://owner/repo
-//     against a configurable registry base — the platform default git.moleculesai.app
-//     OR the MOLECULE_PLUGIN_REGISTRY this handler now threads into the box env — so
-//     the host is no longer hardcoded and a mirror/airgap install just sets that env.
-//     Because the host lives in the box env, this constant does not read it and can
-//     stay a compile-time const (the 3 call sites are unchanged).
+//     host. The box resolver resolves gitea://owner/repo against a configurable
+//     registry base — the platform default git.moleculesai.app OR the
+//     MOLECULE_PLUGIN_REGISTRY this handler threads into the box env — so the host
+//     is not hardcoded and a mirror/airgap install just sets that env.
+//   - PINNED ref (#main): the gitea resolver rejects an unpinned spec in
+//     production (PLUGIN_ALLOW_UNPINNED unset by default), so the ref must stay
+//     set or the declaration records but fails to fetch → no management MCP.
+//   - A bare name is NOT acceptable (parses to the `local` image-baked scheme).
+//     The #ref does NOT affect PluginNameFromSource, so conciergePlatformMCPName
+//     below still equals the derivation.
 //
-//   - ROLLOUT-SAFE back-compat: EVERY box image already understands gitea:// (the
-//     boot-install "ONLY fetches gitea:// sources" today), whereas a full URL is only
-//     understood by the updated resolver. Emitting gitea:// keeps the concierge's
-//     management MCP working on not-yet-updated boxes mid-rollout; the updated box
-//     "handles both", so this can flip to a full `{registry}/…#ref` URL once the
-//     fleet is fully on the new image.
-//
-// A bare name is NOT acceptable: it parses to the `local` scheme (image-baked
-// plugins only) and this is a Gitea-only repo. The #ref does NOT affect
-// PluginNameFromSource, so conciergePlatformMCPName below is unchanged.
-const conciergePlatformMCPSource = "gitea://" + conciergePlatformMCPRepoPath + "#" + conciergePlatformMCPRef
+// mustNativePluginSource panics at startup if the registry drops this privileged
+// plugin, rather than recording an empty source the box then can't fetch.
+var conciergePlatformMCPSource = mustNativePluginSource(conciergePlatformMCPName)
 
 // conciergePluginRegistryEnvVar names the box-facing env var that carries the
 // SCM/registry base the plugin boot-install fetches plugin repos from. Setting it

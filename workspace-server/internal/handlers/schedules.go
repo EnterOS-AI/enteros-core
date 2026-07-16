@@ -197,6 +197,16 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 		body.Timezone = "UTC"
 	}
 
+	// Per-workspace scheduler delivery (scheduler-as-trigger-plugin): a
+	// workspace that has a schedule must run the molecule-scheduler trigger
+	// daemon. Declare the plugin (idempotent; installs on the next boot/reconcile
+	// so scheduling survives a restart) and best-effort hot-arm the running
+	// daemon. Additive + non-fatal — a declaration hiccup must never fail
+	// schedule creation. Runs on BOTH the volume and legacy paths.
+	if err := ensureAndArmSchedulerPlugin(ctx, workspaceID); err != nil {
+		log.Printf("Schedules.Create: ensure scheduler plugin for %s (non-fatal): %v", workspaceID, err)
+	}
+
 	if scheduleBackendIsVolume(workspaceID) {
 		// The runtime store validates cron + timezone + caps itself.
 		h.createVolume(c, workspaceID, body)

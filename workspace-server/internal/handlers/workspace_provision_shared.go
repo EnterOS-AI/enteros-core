@@ -340,6 +340,16 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		return nil, abort
 	}
 
+	// RFC molecule-core#4413: declare the install:default native plugins
+	// (scheduler + idle-digest providers) on this workspace, from the SDK
+	// native-plugins registry SSOT. Placed AFTER every provision abort gate so a
+	// provision that fails a preflight never records orphan declared-plugin rows.
+	// Flag-gated (default off) so merging is byte-identical to today; the owner
+	// arms it during the fleet rollout once the runtime loaders are live.
+	// Non-fatal and idempotent — runs on every provision path (create/restart/
+	// resume) and never blocks provisioning.
+	declareDefaultNativePlugins(ctx, workspaceID)
+
 	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, workspaceSecretKeys, pluginsPath)
 	cfg.ResetClaudeSession = resetClaudeSession
 
