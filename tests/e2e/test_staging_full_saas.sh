@@ -250,6 +250,8 @@ source "$(dirname "$0")/lib/workspace_env_presence.sh"
 # shellcheck disable=SC1091
 # shellcheck source=lib/cp_purge_receipt.sh
 source "$(dirname "$0")/lib/cp_purge_receipt.sh"
+# shellcheck source=lib/workspace_create_retry.sh
+source "$(dirname "$0")/lib/workspace_create_retry.sh"
 e2e_cp_require_local_backend || exit 2
 e2e_cp_require_staging_origin "$CP_URL" || exit 2
 # shellcheck disable=SC1091
@@ -648,6 +650,55 @@ print(s[:4000])
 '
 }
 
+# create_workspace_post — `POST /workspaces` with a bounded retry over the
+# transient empty-body cold-origin 5xx (RCA'd via core#4307's header capture:
+# Cloudflare returns 503 + Retry-After for ~1-2s after health passes but before
+# the tenant origin accepts writes). Honors the origin's Retry-After. Retries
+# ONLY an empty-body 502/503/504 — a JSON body (real 422/400/… create error) is
+# surfaced on the first try, and a persistent 5xx exhausts the budget and
+# returns the last (empty) body so the caller's id-check fails RED with the full
+# header diagnostic. Every attempt is logged, so a transient that self-heals is
+# still visible and never silently masked.
+#
+# Args: $1 = human label, $2 = headers dump file (-D target). Remaining args are
+# passed verbatim to `tenant_call POST /workspaces` (payload etc.). Echoes the
+# final response body on stdout; leaves the final response headers in $2.
+CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-6}"
+create_workspace_post() {
+  local label="$1" hdrs="$2"; shift 2
+  local attempt resp id status ra who
+  for (( attempt = 1; attempt <= CREATE_MAX_ATTEMPTS; attempt++ )); do
+    : > "$hdrs"
+    # --fail-with-body + set -e would abort here on a non-2xx; the existing
+    # create sites disarm set -e so curl still writes the body. Same guard.
+    set +e
+    resp=$(tenant_call POST /workspaces -D "$hdrs" "$@")
+    set -e
+    id=$(printf '%s' "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+    if [ -n "$id" ]; then
+      printf '%s' "$resp"
+      return 0
+    fi
+    status=$(create_parse_status "$hdrs")
+    if ! create_is_transient_cold_5xx "$status" "$resp"; then
+      # Real app error (non-empty body) or a non-5xx — surface immediately so
+      # the caller's id-check names it. No retry, no masking.
+      printf '%s' "$resp"
+      return 0
+    fi
+    ra=$(create_parse_retry_after "$hdrs")
+    who=$(create_parse_server "$hdrs")
+    if [ "$attempt" -lt "$CREATE_MAX_ATTEMPTS" ]; then
+      echo "[$(date +%H:%M:%S)] ⏳ $label create attempt $attempt/$CREATE_MAX_ATTEMPTS: empty-body ${status:-?} from '${who:-?}' (cold-origin write window) — honoring Retry-After ${ra}s" >&2
+      sleep "$ra"
+    fi
+  done
+  # Budget exhausted on a persistent transient 5xx — hand the last body back so
+  # the caller fails RED with the header diagnostic. Not masked.
+  printf '%s' "$resp"
+  return 0
+}
+
 wait_workspaces_online_routable() {
   local label="$1"; shift
   local deadline=$(( $(date +%s) + WORKSPACE_ONLINE_TIMEOUT_SECS ))
@@ -979,12 +1030,13 @@ fi
 # permanently un-RCA-able, which is how it survived this long.
 PARENT_HDRS=$(mktemp)
 E2E_TMP_FILES+=("$PARENT_HDRS")
-set +e
-PARENT_RESP=$(tenant_call POST /workspaces \
-  -D "$PARENT_HDRS" \
+# Bounded retry over the transient empty-body cold-origin 5xx (see
+# create_workspace_post). A real create error (JSON body) still surfaces on the
+# first try; a persistent 5xx exhausts the budget and the id-check below fails
+# RED with the header diagnostic.
+PARENT_RESP=$(create_workspace_post 'E2E Parent' "$PARENT_HDRS" \
   -H "Content-Type: application/json" \
   -d "$(build_create_payload 'E2E Parent')")
-set -e
 # Surface the workspace-create error CLEARLY instead of dying on a Python
 # KeyError when the response has no 'id'. The load-bearing cases this names:
 #   - seo-agent: an "invalid template" 400 if the seo-agent template isn't
@@ -1007,14 +1059,18 @@ if [ "$MODE" = "full" ]; then
   # Same --fail-with-body / set -e abort guard as the parent create above:
   # let a non-2xx return the body so the id-check below surfaces it instead
   # of the script dying opaquely on curl exit 22.
-  set +e
-  CHILD_RESP=$(tenant_call POST /workspaces \
+  CHILD_HDRS=$(mktemp)
+  E2E_TMP_FILES+=("$CHILD_HDRS")
+  # Same bounded cold-origin 5xx retry + header capture as the parent create.
+  CHILD_RESP=$(create_workspace_post 'E2E Child' "$CHILD_HDRS" \
     -H "Content-Type: application/json" \
     -d "$(build_create_payload 'E2E Child' "$PARENT_ID")")
-  set -e
   CHILD_ID=$(echo "$CHILD_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
   if [ -z "$CHILD_ID" ]; then
-    fail "Child workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}). Response: $(printf '%s' "$CHILD_RESP" | sanitize_http_body)"
+    fail "Child workspace create returned no 'id' (runtime=$RUNTIME, template=${PROVISION_TEMPLATE:-<none>}).
+Response body: $(printf '%s' "$CHILD_RESP" | sanitize_http_body)
+Response headers (who answered? an empty body + 503 here means it was NOT the Go handler — check 'server:' / 'cf-ray:'):
+$(sanitize_http_body < "$CHILD_HDRS")"
   fi
   log "    CHILD_ID=$CHILD_ID"
   # The child's create payload carried the same vendor key(s) — nothing to
