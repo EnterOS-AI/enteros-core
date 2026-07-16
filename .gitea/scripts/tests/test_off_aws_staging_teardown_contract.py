@@ -198,6 +198,12 @@ def test_staging_runbook_states_the_exact_teardown_proof_boundary() -> None:
     assert "E2E_INFRA_BACKEND=local-docker" in normalized
     assert "exact completed purge audit" in normalized
     assert "creation-returned org ID" in normalized
+    assert "delete response is lost during local-Docker network detach" in normalized
+    assert (
+        "completed purge audit for the same creation-returned slug/org ID" in normalized
+    )
+    assert "recorded no earlier than that DELETE attempt" in normalized
+    assert "missing, stale, or malformed audit remains a hard failure" in normalized
     assert "/cp/admin/tenants/<slug>/boot-events?limit=1" in normalized
     assert "HTTP 404" in normalized
     assert "does not directly enumerate provider resources" in normalized

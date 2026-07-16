@@ -204,7 +204,9 @@ e2e_cp_delete_and_verify_purge() {
   local poll_interval="${E2E_CP_PURGE_POLL_INTERVAL:-5}"
   local tmpdir delete_body audit_body
   local delete_code audit_code purge_id receipt_org_id receipt_fields
-  local audit_state predelete_org_id deadline
+  local audit_state audit_fields audit_purge_id predelete_org_id deadline
+  local delete_started_epoch
+  local delete_response_lost=0
 
   E2E_CP_PURGE_RESULT=""
 
@@ -265,6 +267,7 @@ e2e_cp_delete_and_verify_purge() {
   tmpdir=$(mktemp -d -t cp-purge-verify-XXXXXX) || return 2
   delete_body="$tmpdir/delete.json"
   audit_body="$tmpdir/audit.json"
+  delete_started_epoch=$(date +%s)
 
   if ! delete_code=$(curl -sS -A "$ua" --max-time 120 \
       -o "$delete_body" -w '%{http_code}' \
@@ -272,17 +275,23 @@ e2e_cp_delete_and_verify_purge() {
       -H "Authorization: Bearer $admin_token" \
       -H "Content-Type: application/json" \
       -d "{\"confirm\":\"$slug\"}"); then
-    echo "[cp-purge] DELETE failed before a purge receipt was returned for slug=$slug" >&2
-    rm -rf "$tmpdir"
-    return 4
-  fi
-  if [ "$delete_code" != "200" ]; then
-    echo "[cp-purge] DELETE returned HTTP $delete_code without a completed purge receipt for slug=$slug" >&2
-    rm -rf "$tmpdir"
-    return 4
-  fi
+    # The synchronous handler may complete the purge and then lose its response
+    # while local-Docker detaches the tenant network. That is an ambiguous
+    # transport result, not proof of failure or success. Recover only if the CP
+    # subsequently exposes a completed audit for this exact creation-returned
+    # org ID and the exact tenant endpoint proves structured absence below.
+    delete_response_lost=1
+    purge_id=""
+    receipt_org_id="$predelete_org_id"
+    echo "[cp-purge] DELETE response was lost for slug=$slug; requiring exact completed purge audit plus exact-org absence" >&2
+  else
+    if [ "$delete_code" != "200" ]; then
+      echo "[cp-purge] DELETE returned HTTP $delete_code without a completed purge receipt for slug=$slug" >&2
+      rm -rf "$tmpdir"
+      return 4
+    fi
 
-  receipt_fields=$(python3 -c '
+    receipt_fields=$(python3 -c '
 import json, sys, uuid
 expected_slug, expected_org_id = sys.argv[1:3]
 try:
@@ -304,11 +313,12 @@ if not valid:
     raise SystemExit(1)
 print(purge_id, org_id, sep="\t")
 ' "$slug" "$predelete_org_id" < "$delete_body" 2>/dev/null) || {
-    echo "[cp-purge] DELETE returned a malformed or mismatched purge receipt for slug=$slug" >&2
-    rm -rf "$tmpdir"
-    return 4
-  }
-  IFS=$'\t' read -r purge_id receipt_org_id <<< "$receipt_fields"
+      echo "[cp-purge] DELETE returned a malformed or mismatched purge receipt for slug=$slug" >&2
+      rm -rf "$tmpdir"
+      return 4
+    }
+    IFS=$'\t' read -r purge_id receipt_org_id <<< "$receipt_fields"
+  fi
 
   deadline=$(( $(date +%s) + poll_secs ))
   while true; do
@@ -318,9 +328,10 @@ print(purge_id, org_id, sep="\t")
         "$cp_url/cp/admin/purges?limit=500" \
         -H "Authorization: Bearer $admin_token"); then
       if [ "$audit_code" = "200" ]; then
-        audit_state=$(python3 -c '
-import json, sys
-purge_id, slug, org_id = sys.argv[1:4]
+        audit_fields=$(python3 -c '
+import datetime, json, sys, uuid
+purge_id, slug, org_id, delete_started_raw = sys.argv[1:5]
+delete_started = int(delete_started_raw)
 try:
     data = json.load(sys.stdin)
     rows = data.get("purges", []) if isinstance(data, dict) else []
@@ -330,28 +341,75 @@ except Exception:
 if not isinstance(rows, list):
     print("invalid")
     raise SystemExit(0)
-row = next((r for r in rows if isinstance(r, dict) and r.get("id") == purge_id), None)
-if row is None:
-    print("missing")
-elif row.get("org_slug") != slug or row.get("org_id") != org_id:
-    print("mismatch")
-elif row.get("status") == "completed":
+
+def completion_epoch(row):
+    row_id = row.get("id")
     completed_at = row.get("completed_at")
-    if (
-        row.get("last_step") == "completed"
-        and isinstance(completed_at, str)
-        and completed_at.strip()
-    ):
-        print("completed")
+    try:
+        uuid.UUID(row_id)
+        if not isinstance(completed_at, str) or not completed_at.strip():
+            return None
+        stamp = datetime.datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            return None
+    except Exception:
+        return None
+    if row.get("last_step") != "completed":
+        return None
+    return stamp.timestamp()
+
+if purge_id:
+    row = next((r for r in rows if isinstance(r, dict) and r.get("id") == purge_id), None)
+    if row is None:
+        print("missing")
+    elif row.get("org_slug") != slug or row.get("org_id") != org_id:
+        print("mismatch")
+    elif row.get("status") == "completed":
+        if completion_epoch(row) is not None:
+            print("completed", row["id"], sep="\t")
+        else:
+            print("invalid")
+    elif row.get("status") == "failed":
+        print("failed")
     else:
-        print("invalid")
-elif row.get("status") == "failed":
-    print("failed")
+        print("pending")
 else:
-    print("pending")
-' "$purge_id" "$slug" "$receipt_org_id" < "$audit_body" 2>/dev/null || echo invalid)
+    # A lost DELETE response supplies no trustworthy purge_id. The
+    # creation-returned org ID is still collision-safe authority: accept only a
+    # completed, internally consistent audit for that exact slug/ID pair. Exact
+    # structured absence is checked separately after this loop.
+    matching = [
+        r for r in rows
+        if isinstance(r, dict)
+        and r.get("org_slug") == slug
+        and r.get("org_id") == org_id
+    ]
+    done = [
+        r for r in matching
+        if r.get("status") == "completed"
+        and (completion_epoch(r) or -1) >= delete_started
+    ]
+    if done:
+        row = max(done, key=lambda r: r.get("completed_at", ""))
+        print("completed", row["id"], sep="\t")
+    elif any(r.get("status") == "completed" for r in matching):
+        print("invalid")
+    elif any(r.get("status") == "failed" for r in matching):
+        print("failed")
+    elif matching:
+        print("pending")
+    else:
+        print("missing")
+' "$purge_id" "$slug" "$receipt_org_id" "$delete_started_epoch" < "$audit_body" 2>/dev/null || echo invalid)
+        IFS=$'\t' read -r audit_state audit_purge_id <<< "$audit_fields"
         case "$audit_state" in
-          completed) break ;;
+          completed)
+            if [ "$delete_response_lost" = "1" ]; then
+              purge_id="$audit_purge_id"
+              echo "[cp-purge] recovered exact completed purge audit after lost DELETE response (purge_id=$purge_id org_id=$receipt_org_id slug=$slug)"
+            fi
+            break
+            ;;
           failed|mismatch|invalid)
             echo "[cp-purge] exact purge audit did not complete safely for slug=$slug (state=$audit_state)" >&2
             rm -rf "$tmpdir"

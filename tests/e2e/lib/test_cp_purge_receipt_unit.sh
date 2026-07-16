@@ -126,6 +126,14 @@ case "$url" in
     ;;
   */cp/admin/tenants/*)
     case "${FAKE_SCENARIO:?}" in
+      transport-loss-audit-recovered|transport-loss-audit-missing|transport-loss-stale-audit)
+        # Model the live ephemeral-CP failure: the handler completes the purge,
+        # but its Docker-network detach drops the response before curl receives
+        # an HTTP status/body. The caller may recover only from the exact audit
+        # plus exact structured absence proof.
+        printf 'deleted\n' > "${FAKE_STATE_FILE:?}"
+        exit 52
+        ;;
       malformed-receipt) body='{"deleted":true,"slug":"e2e-receipt-unit"}' ;;
       receipt-org-mismatch) body='{"deleted":true,"slug":"e2e-receipt-unit","org_id":"33333333-3333-4333-8333-333333333333","purge_id":"22222222-2222-4222-8222-222222222222"}' ;;
       create-http-409|create-http-500)
@@ -140,6 +148,16 @@ case "$url" in
     ;;
   */cp/admin/purges*)
     case "${FAKE_SCENARIO:?}" in
+      transport-loss-audit-recovered)
+        completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        body="{\"purges\":[{\"id\":\"22222222-2222-4222-8222-222222222222\",\"org_id\":\"11111111-1111-4111-8111-111111111111\",\"org_slug\":\"e2e-receipt-unit\",\"status\":\"completed\",\"last_step\":\"completed\",\"completed_at\":\"$completed_at\"}]}"
+        ;;
+      transport-loss-audit-missing)
+        body='{"purges":[]}'
+        ;;
+      transport-loss-stale-audit)
+        body='{"purges":[{"id":"22222222-2222-4222-8222-222222222222","org_id":"11111111-1111-4111-8111-111111111111","org_slug":"e2e-receipt-unit","status":"completed","last_step":"completed","completed_at":"2020-01-01T00:00:00Z"}]}'
+        ;;
       create-http-409|create-http-500)
         created_slug=$(sed -n 's/^E2E_CREATED_SLUG=//p' "${GITHUB_ENV:?}" | tail -n 1)
         body="{\"purges\":[{\"id\":\"22222222-2222-4222-8222-222222222222\",\"org_id\":\"33333333-3333-4333-8333-333333333333\",\"org_slug\":\"$created_slug\",\"status\":\"completed\",\"last_step\":\"completed\",\"completed_at\":\"2026-07-15T00:00:00Z\"}]}"
@@ -293,6 +311,23 @@ else
   printf '%s\n' "$success_output" | sed 's/^/  /' >&2
   FAIL=$((FAIL + 1))
 fi
+
+transport_recovery_output=$(run_case transport-loss-audit-recovered 2>&1)
+transport_recovery_rc=$?
+if [ "$transport_recovery_rc" = "0" ] \
+  && printf '%s' "$transport_recovery_output" | grep -q 'DELETE response was lost' \
+  && printf '%s' "$transport_recovery_output" | grep -q 'recovered exact completed purge audit' \
+  && printf '%s' "$transport_recovery_output" | grep -q 'exact org absent'; then
+  echo "PASS: lost DELETE response recovers only from exact completed audit plus exact absence"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: exact audit recovery after lost DELETE response (rc=$transport_recovery_rc)" >&2
+  printf '%s\n' "$transport_recovery_output" | sed 's/^/  /' >&2
+  FAIL=$((FAIL + 1))
+fi
+
+assert_rc "lost DELETE response without exact completed audit fails closed" 4 transport-loss-audit-missing
+assert_rc "lost DELETE response cannot reuse a stale completed audit" 4 transport-loss-stale-audit
 
 assert_rc "missing purge_id fails closed" 4 malformed-receipt
 assert_rc "receipt org_id must match the pre-delete identity" 4 receipt-org-mismatch

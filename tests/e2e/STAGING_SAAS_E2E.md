@@ -26,17 +26,22 @@ workflows select the required mode. The active local-Docker lanes in
 `e2e-staging-saas.yml` that use these shell harnesses keep EXIT/INT/TERM cleanup
 traps. Destructive teardown is enabled only after a successful create returns a
 valid creation-returned org ID. Cleanup requires that ID to match the exact slug
-before DELETE, then validates the DELETE response's purge and org identities,
-the exact completed purge audit, and that
+before DELETE, then normally validates the DELETE response's purge and org
+identities, the exact completed purge audit, and that
 `/cp/admin/tenants/<slug>/boot-events?limit=1` returns HTTP 404. That endpoint
 resolves the exact tenant identity before listing events; the admin roster is
 used only to rediscover the exact slug/ID pair already published by a successful
 create and is not absence proof. A missing run ID or verified creation identity
 makes the safety net visibly inconclusive and authorizes no roster request or
-DELETE. A generic Actions runner does not directly enumerate provider resources,
-so its logs must never describe that unperformed scan as a pass. Other staging
-workflow families retain separate teardown contracts; `molecule-ai/internal#639`
-tracks the remaining convergence.
+DELETE. If the synchronous delete response is lost during local-Docker network
+detach, cleanup can recover only from a completed purge audit for the same
+creation-returned slug/org ID recorded no earlier than that DELETE attempt, plus
+the same exact structured HTTP 404 absence proof; a missing, stale, or malformed
+audit remains a hard failure. A generic Actions runner does not directly
+enumerate provider resources, so its logs must never
+describe that unperformed scan as a pass. Other staging workflow families retain
+separate teardown contracts; `molecule-ai/internal#639` tracks the remaining
+convergence.
 
 ## Credential
 
