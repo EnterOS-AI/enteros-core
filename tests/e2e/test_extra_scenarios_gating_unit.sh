@@ -2,12 +2,15 @@
 # Unit test for ephemeral_cp_happy_path.sh's extra-scenario dispatch/gating.
 #
 # Pins the hardening from the #4406 follow-up (findings #2/#3):
-#   * an UNKNOWN/typo'd scenario key (run_one_extra_scenario → 2) is a MISCONFIG
-#     that fails the gate UNCONDITIONALLY — even under E2E_EPHEMERAL_EXTRA_ADVISORY=1
-#     (a never-ran scenario must never read as an advisory-suppressible green), and
+#   * an UNKNOWN/typo'd scenario key (run_one_extra_scenario → reserved sentinel 97)
+#     is a MISCONFIG that fails the gate UNCONDITIONALLY — even under
+#     E2E_EPHEMERAL_EXTRA_ADVISORY=1 (a never-ran scenario must never read as an
+#     advisory-suppressible green), and
 #   * a non-empty value that tokenizes to ZERO scenarios (",", whitespace) is a
 #     MISCONFIG too (not a silent green), and
-#   * a scenario that genuinely RAN and FAILED stays advisory-suppressible.
+#   * a scenario that genuinely RAN and FAILED — INCLUDING one that exits with the
+#     concierge script's own code 2 (cleanup_org trap / env guards) — stays
+#     advisory-suppressible and is NEVER misclassified as a never-ran misconfig.
 #
 # Sources the script (its dispatch is guarded so sourcing does NOT boot a CP) and
 # stubs run_one_extra_scenario so nothing real is provisioned.
@@ -21,13 +24,16 @@ fails=0
 pass() { echo "  PASS: $1"; }
 failc() { echo "  FAIL: $1"; fails=$((fails + 1)); }
 
-# Deterministic stub: 'ok_*' keys pass, 'bad_*' keys RAN-and-FAILED (rc 1); every
-# other key falls through to the real run_one_extra_scenario's unknown-key arm (rc 2).
+# Deterministic stub: 'ok_*' keys pass, 'bad_*' keys RAN-and-FAILED (rc 1),
+# 'exit2_*' keys RAN-and-FAILED with the concierge script's own code 2 (its
+# cleanup_org trap / env guards) — which must NOT be read as the unknown-key
+# sentinel; every other key falls through to the real unknown-key arm (rc 97).
 run_one_extra_scenario() {
   case "$1" in
-    ok_*)  return 0 ;;
-    bad_*) return 1 ;;
-    *) echo "[stub][extra] unknown key '$1'" >&2; return 2 ;;
+    ok_*)    return 0 ;;
+    bad_*)   return 1 ;;
+    exit2_*) return 2 ;;
+    *) echo "[stub][extra] unknown key '$1'" >&2; return 97 ;;
   esac
 }
 
@@ -50,6 +56,12 @@ expect_gate "all-pass, advisory on  → gate 0" 0 1 "ok_a,ok_b"
 expect_gate "ran-and-failed, advisory off → gate 1" 1 0 "bad_x"
 expect_gate "ran-and-failed, advisory on  → gate 0 (suppressed)" 0 1 "bad_x"
 
+# OVER-CORRECTION GUARD: a scenario that RAN and exited with the concierge script's
+# own code 2 (cleanup_org trap / env guards) is a ran-and-failed, NOT a never-ran
+# misconfig — so it stays advisory-suppressible, exactly like any other real red.
+expect_gate "ran-and-failed exit-2, advisory off → gate 1" 1 0 "exit2_concierge"
+expect_gate "ran-and-failed exit-2, advisory on  → gate 0 (suppressed, NOT misconfig)" 0 1 "exit2_concierge"
+
 # UNKNOWN key (finding #2): misconfig — fails the gate even under advisory=1.
 expect_gate "unknown key, advisory off → gate 1" 1 0 "typo_key"
 expect_gate "unknown key, advisory on  → gate 1 (NOT suppressible)" 1 1 "typo_key"
@@ -70,6 +82,16 @@ if [ "$rc" = "0" ] && [ "${EXTRA_MISCONFIG}" = "1" ]; then
   pass "run_extra_scenarios: unknown key → failed-count 0 but EXTRA_MISCONFIG=1"
 else
   failc "run_extra_scenarios: unknown key (failed-count=$rc EXTRA_MISCONFIG=${EXTRA_MISCONFIG})"
+fi
+
+# Over-correction guard, direct: a scenario that RAN and exited 2 must land in the
+# failed-COUNT (advisory-suppressible), NOT flip EXTRA_MISCONFIG.
+EXTRA_MISCONFIG=0
+E2E_EPHEMERAL_EXTRA_SCENARIOS="exit2_x" run_extra_scenarios >/dev/null 2>&1; rc=$?
+if [ "$rc" = "1" ] && [ "${EXTRA_MISCONFIG}" = "0" ]; then
+  pass "run_extra_scenarios: ran-and-failed exit-2 → failed-count 1, EXTRA_MISCONFIG=0 (not misclassified as misconfig)"
+else
+  failc "run_extra_scenarios: exit-2 scenario misclassified (failed-count=$rc EXTRA_MISCONFIG=${EXTRA_MISCONFIG})"
 fi
 
 echo "──"

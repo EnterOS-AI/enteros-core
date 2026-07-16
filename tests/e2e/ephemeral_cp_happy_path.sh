@@ -530,11 +530,22 @@ run_scenario_concierge_user_tasks() {
 # Dispatch one extra-scenario key to its runner. An UNKNOWN key is a hard error,
 # never a silent skip: a typo in E2E_EPHEMERAL_EXTRA_SCENARIOS that quietly ran
 # nothing would be the exact vacuous-green this gate exists to abolish.
+# Exit 97 is the RESERVED unknown-key/misconfig sentinel. It must be a code the
+# scenario runners themselves NEVER emit: the concierge scenario legitimately
+# exits 2 (its cleanup_org EXIT trap / env guards), so keying misconfig on 2 would
+# misclassify a genuine ran-and-failed scenario as a never-ran typo. 97 collides
+# with nothing a scenario returns; a known scenario that somehow exits 97 is
+# remapped below so it can never masquerade as a misconfig.
+readonly EXTRA_MISCONFIG_RC=97
 run_one_extra_scenario() {
+  local rc
   case "$1" in
-    concierge_user_tasks) run_scenario_concierge_user_tasks ;;
-    *) echo "[proof][extra] ❌ unknown extra scenario '$1' — check E2E_EPHEMERAL_EXTRA_SCENARIOS" >&2; return 2 ;;
+    concierge_user_tasks) run_scenario_concierge_user_tasks; rc=$? ;;
+    *) echo "[proof][extra] ❌ unknown extra scenario '$1' — check E2E_EPHEMERAL_EXTRA_SCENARIOS" >&2; return "$EXTRA_MISCONFIG_RC" ;;
   esac
+  # A known scenario must never masquerade as the misconfig sentinel.
+  [ "$rc" -eq "$EXTRA_MISCONFIG_RC" ] && rc=1
+  return "$rc"
 }
 
 # Set by run_extra_scenarios: 1 when the extra-scenario LIST itself is a misconfig
@@ -571,10 +582,12 @@ run_extra_scenarios() {
     run_one_extra_scenario "$s"; rc=$?
     case "$rc" in
       0) echo "[proof][extra] ✅ ${s} PASSED against the ephemeral CP." >&2 ;;
-      2) # UNKNOWN key (run_one_extra_scenario's return 2) — a typo that ran
+      "$EXTRA_MISCONFIG_RC") # UNKNOWN key (reserved sentinel) — a typo that ran
          # nothing. Flag it as a misconfig so it fails the gate UNCONDITIONALLY,
          # even under E2E_EPHEMERAL_EXTRA_ADVISORY=1: a never-ran scenario must
-         # never read as an advisory-suppressible green.
+         # never read as an advisory-suppressible green. A scenario that RAN and
+         # failed (any other non-zero, INCLUDING its own exit 2) falls through to
+         # the failed-count below and stays advisory-suppressible.
          echo "[proof][extra] ❌ ${s} is an UNKNOWN scenario key (ran nothing) — misconfig; fails the gate even under E2E_EPHEMERAL_EXTRA_ADVISORY=1." >&2
          EXTRA_MISCONFIG=1 ;;
       *) failed=$((failed + 1))
