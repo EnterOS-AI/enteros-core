@@ -861,13 +861,24 @@ def required_contexts_green(
             continue
         matches = [c for c in latest_statuses if matcher.fullmatch(c)]
         if _is_glob(pattern):
-            # Drop the queue's OWN in-flight status from wildcard matches — it is
-            # `pending` throughout this very run, so requiring it green under a
-            # glob like "*" is a self-referential deadlock (core#4420, see
-            # SELF_STATUS_CONTEXT). A LITERAL requirement is left untouched: a
-            # narrow glob ("CI /*") never matches it anyway, and if a policy
-            # deliberately names it exactly, honor that.
-            matches = [c for c in matches if not _SELF_STATUS_RE.fullmatch(c)]
+            # Drop the queue's OWN in-flight status from wildcard matches ONLY
+            # while it is `pending` — it stays `pending` throughout this very run,
+            # so requiring it green under a glob like "*" is a self-referential
+            # deadlock (core#4420, see SELF_STATUS_CONTEXT). The strip is gated on
+            # the pending state (fail-closed): a self-status that has actually
+            # FAILED/errored is a real red and MUST still block the merge — it
+            # self-heals on the next clean tick when a fresh run re-posts a
+            # pending (then success) status. A LITERAL requirement is left
+            # untouched: a narrow glob ("CI /*") never matches it anyway, and if a
+            # policy deliberately names it exactly, honor that.
+            matches = [
+                c
+                for c in matches
+                if not (
+                    _SELF_STATUS_RE.fullmatch(c)
+                    and status_state(latest_statuses.get(c) or {}) == "pending"
+                )
+            ]
         if not matches:
             # Fail-closed: a required pattern that matches nothing cannot be
             # shown green. Preserve the old `missing` wording for plain exact

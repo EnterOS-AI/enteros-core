@@ -186,16 +186,23 @@ def test_wildcard_still_waits_on_a_real_pending_alongside_self_status():
     assert bad == ["E2E Chat / E2E Chat (pull_request)=pending"]
 
 
-def test_wildcard_ignores_a_failed_self_status_too():
-    # The queue job is the gate-RUNNER, not a gate: a FAILED prior queue run
-    # (e.g. a transient API error) must not block the PR it evaluates either —
-    # pending was observed in core#4420, but failure is the same class.
+def test_wildcard_still_blocks_on_a_failed_self_status():
+    # NEGATIVE CONTROL for finding #5: the self-status strip is gated on the
+    # `pending` state (fail-closed). Only the queue's OWN in-flight status is a
+    # self-referential no-op, and that status is `pending` for the whole run.
+    # A self-status in a terminal FAILURE/error state is a REAL red (a queue run
+    # that genuinely broke, e.g. a merge-actor API error) and must STILL block —
+    # it self-heals on the next clean tick when a fresh run re-posts pending then
+    # success. If the strip were state-blind (the pre-fix behaviour) `ok` would
+    # flip True here and this fails. The reported `bad` names exactly the failed
+    # self-status.
     latest = mq.latest_statuses_by_context([
         {"context": "CI / all-required (pull_request)", "status": "success"},
         {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "failure"},
     ])
     ok, bad = mq.required_contexts_green(latest, ["*"])
-    assert ok is True, bad
+    assert ok is False
+    assert bad == ["gitea-merge-queue / queue (pull_request_review)=failure"]
 
 
 def test_literal_self_status_requirement_is_still_honored():
@@ -236,6 +243,74 @@ def test_wildcard_plus_literal_dedupes_a_double_flag():
     assert ok is False
     # flagged by both the wildcard sweep and the literal check -> listed ONCE
     assert bad == ["CI / all-required (pull_request)=failure"]
+
+
+def test_self_status_context_matches_live_workflow_name_and_job(tmp_path):
+    # Finding #7 (coupling guard): SELF_STATUS_CONTEXT is a hardcoded literal
+    # ("gitea-merge-queue / queue") that MUST equal the live commit-status
+    # context Gitea posts for this workflow's queue job, i.e.
+    #   f"{workflow.name} / {queue-job-id}".
+    # Nothing else cross-checks them: rename the workflow `name:` or the `queue`
+    # job id and the self-jam strip (core#4420 / #126) silently stops matching,
+    # re-introducing the deadlock with every OTHER test still green (they all
+    # hardcode the same literal). This derives the context from the workflow
+    # YAML and asserts the coupling, so a rename fails HERE.
+    # SCRIPT is .gitea/scripts/gitea-merge-queue.py; the workflow lives at
+    # .gitea/workflows/gitea-merge-queue.yml (two levels up: scripts -> .gitea).
+    workflow = SCRIPT.parent.parent / "workflows" / "gitea-merge-queue.yml"
+    assert workflow.exists(), f"workflow not found at {workflow}"
+    text = workflow.read_text()
+
+    workflow_name = None
+    job_id = None
+    try:
+        import yaml  # PyYAML preferred when importable
+
+        # The `on:` key parses to Python True under YAML 1.1; use safe_load and
+        # tolerate that — we only need `name` and `jobs`.
+        doc = yaml.safe_load(text)
+        workflow_name = doc.get("name")
+        jobs = doc.get("jobs") or {}
+        # This queue is a single-job workflow; take the sole job id.
+        assert len(jobs) == 1, f"expected exactly one job, got {sorted(jobs)}"
+        job_id = next(iter(jobs))
+    except ImportError:
+        # Tolerant fallback parse: top-level `name:` and the first job id (the
+        # first indented key under a top-level `jobs:` block).
+        import re as _re
+
+        m = _re.search(r"(?m)^name:\s*(.+?)\s*$", text)
+        workflow_name = m.group(1).strip() if m else None
+        lines = text.splitlines()
+        in_jobs = False
+        for line in lines:
+            if _re.match(r"^jobs:\s*$", line):
+                in_jobs = True
+                continue
+            if in_jobs:
+                if line.strip() == "" or line.lstrip().startswith("#"):
+                    continue
+                jm = _re.match(r"^  (\w[\w-]*):\s*$", line)
+                if jm:
+                    job_id = jm.group(1)
+                    break
+                # any non-indented line ends the jobs block
+                if not line.startswith(" "):
+                    break
+
+    assert isinstance(workflow_name, str) and workflow_name, (
+        f"could not derive workflow name from {workflow}"
+    )
+    assert isinstance(job_id, str) and job_id, (
+        f"could not derive queue job id from {workflow}"
+    )
+    derived_context = f"{workflow_name} / {job_id}"
+    assert derived_context == mq.SELF_STATUS_CONTEXT, (
+        f"self-status coupling broke: workflow posts {derived_context!r} but "
+        f"SELF_STATUS_CONTEXT is {mq.SELF_STATUS_CONTEXT!r}. Renaming the "
+        f"workflow name or the queue job id re-introduces the #126 self-jam — "
+        f"update SELF_STATUS_CONTEXT to match."
+    )
 
 
 def test_wildcard_ready_pr_merges_end_to_end():
