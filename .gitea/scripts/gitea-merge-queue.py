@@ -251,10 +251,11 @@ _EVENT_SUFFIX_RE = re.compile(
 # set ("*") therefore matches the queue's own in-flight status and — because it
 # is pending, never success, during self-evaluation — makes the queue decide
 # `wait` on the very PR whose approval fired the run. That is a self-referential
-# deadlock (#126): a PR can never merge on the event of its OWN approval; it only
+# deadlock (core#4420): a PR cannot merge on the event of its OWN approval; it only
 # merges when some UNRELATED trigger evaluates it (that run's pending self-status
 # lands on the other PR's head). required_contexts_green() drops this context
-# from GLOB matches to break the deadlock.
+# from the user-space GLOB evaluation; reassert_queue_runner_status() reconciles
+# the same gate-runner context immediately before Gitea's protected merge write.
 #
 # This is NOT the advisory-skip the module forbids elsewhere (skipping a real
 # test that carries a red/pending status): the queue job is the gate-RUNNER, not
@@ -862,7 +863,7 @@ def required_contexts_green(
         if _is_glob(pattern):
             # Drop the queue's OWN in-flight status from wildcard matches — it is
             # `pending` throughout this very run, so requiring it green under a
-            # glob like "*" is a self-referential deadlock (#126, see
+            # glob like "*" is a self-referential deadlock (core#4420, see
             # SELF_STATUS_CONTEXT). A LITERAL requirement is left untouched: a
             # narrow glob ("CI /*") never matches it anyway, and if a policy
             # deliberately names it exactly, honor that.
@@ -2149,6 +2150,58 @@ def hold_pr(pr_number: int, hold_note: str, *, dry_run: bool) -> None:
         )
 
 
+def reassert_queue_runner_status(head_sha: str, *, dry_run: bool) -> None:
+    """Replace only non-success queue-runner statuses before protected merge.
+
+    Under wildcard branch protection, Gitea itself still matches the Actions
+    job's in-flight ``gitea-merge-queue / queue`` status even though the
+    user-space readiness gate correctly excludes that gate-runner context.
+    Once every real merge gate and the final live regression check have passed,
+    publish success for the exact runner context so Gitea's ordinary protected
+    endpoint observes the same decision.  Product/test contexts are never
+    written here.  A failed or malformed status write raises and prevents the
+    merge (core#4420; observed in queue run 519372).
+    """
+    live_status = get_combined_status(head_sha, prefer_live=True)
+    latest = latest_statuses_by_context(live_status.get("statuses") or [])
+    for context in sorted(latest):
+        current = latest[context]
+        if not _SELF_STATUS_RE.fullmatch(context):
+            continue
+        if status_state(current) == "success":
+            continue
+
+        print(
+            f"::notice::reasserting queue-runner status '{context}' as success "
+            "before the ordinary protected merge write"
+        )
+        if dry_run:
+            continue
+
+        body: dict[str, Any] = {
+            "state": "success",
+            "context": context,
+            "description": "Merge queue gates passed; protected merge write in progress",
+        }
+        target_url = current.get("target_url")
+        if isinstance(target_url, str) and target_url:
+            body["target_url"] = target_url
+        _, confirmation = api(
+            "POST",
+            f"/repos/{OWNER}/{NAME}/statuses/{head_sha}",
+            body=body,
+        )
+        if (
+            not isinstance(confirmation, dict)
+            or confirmation.get("context") != context
+            or status_state(confirmation) != "success"
+        ):
+            raise ApiError(
+                "queue-runner status write did not confirm success for "
+                f"{context!r} on {head_sha}"
+            )
+
+
 def merge_pull(
     pr_number: int,
     *,
@@ -2167,6 +2220,12 @@ def merge_pull(
     print(f"::notice::merging PR #{pr_number} through the normal protected endpoint")
     if dry_run:
         return
+    # The final live product/required-context re-check is performed by the
+    # caller immediately before this function. Reconcile only the queue's own
+    # gate-runner status with that decision; failure here propagates and no
+    # merge request is sent. This is a normal status write, never an admin or
+    # branch-protection override (core#4420).
+    reassert_queue_runner_status(head_commit_id, dry_run=False)
     try:
         api("POST", f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/merge", body=payload, expect_json=False)
     except ApiError as exc:

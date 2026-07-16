@@ -151,7 +151,7 @@ def test_wildcard_with_zero_posted_is_failclosed_no_match():
 
 
 def test_wildcard_ignores_queues_own_pending_self_status():
-    # #126 self-jam: the `gitea-merge-queue / queue` status the queue itself
+    # core#4420 self-jam: the `gitea-merge-queue / queue` status the queue itself
     # posts is `pending` for the whole duration of the run that evaluates the
     # PR, so under "*" the queue required its OWN in-flight status to be green
     # and deadlocked — a PR could never merge on the event of its own approval.
@@ -189,7 +189,7 @@ def test_wildcard_still_waits_on_a_real_pending_alongside_self_status():
 def test_wildcard_ignores_a_failed_self_status_too():
     # The queue job is the gate-RUNNER, not a gate: a FAILED prior queue run
     # (e.g. a transient API error) must not block the PR it evaluates either —
-    # only pending was observed in #126, but failure is the same class.
+    # pending was observed in core#4420, but failure is the same class.
     latest = mq.latest_statuses_by_context([
         {"context": "CI / all-required (pull_request)", "status": "success"},
         {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "failure"},
@@ -1047,6 +1047,7 @@ def test_merge_pull_uses_lowercase_gitea_contract_and_exact_head(monkeypatch):
     the final status read and the merge POST.
     """
     captured = {}
+    reasserted = []
 
     def fake_api(method, path, *, body=None, query=None, expect_json=True):
         captured.update(
@@ -1061,10 +1062,16 @@ def test_merge_pull_uses_lowercase_gitea_contract_and_exact_head(monkeypatch):
     monkeypatch.setattr(mq, "OWNER", "molecule-ai")
     monkeypatch.setattr(mq, "NAME", "molecule-core")
     monkeypatch.setattr(mq, "api", fake_api)
+    monkeypatch.setattr(
+        mq,
+        "reassert_queue_runner_status",
+        lambda sha, *, dry_run: reasserted.append((sha, dry_run)),
+    )
 
     head_sha = "a" * 40
     mq.merge_pull(123, dry_run=False, head_commit_id=head_sha)
 
+    assert reasserted == [(head_sha, False)]
     assert captured == {
         "method": "POST",
         "path": "/repos/molecule-ai/molecule-core/pulls/123/merge",
@@ -1087,6 +1094,143 @@ def test_merge_pull_exposes_no_admin_force_override():
     administrator branch-protection override.
     """
     assert "force" not in inspect.signature(mq.merge_pull).parameters
+
+
+def test_reassert_queue_runner_status_clears_only_exact_non_success_contexts(monkeypatch):
+    """The server-side wildcard sees the running queue status even though the
+    user-space gate excludes it. Reassert only that exact runner context; a
+    pending product context must never be rewritten by this helper.
+    """
+    head_sha = "a" * 40
+    observed = {"live": [], "writes": []}
+
+    def fake_combined(sha, *, prefer_live=False):
+        observed["live"].append((sha, prefer_live))
+        return {"state": "pending", "statuses": [
+            {
+                "context": "gitea-merge-queue / queue (pull_request_review)",
+                "status": "pending",
+                "target_url": "/molecule-ai/molecule-core/actions/runs/1/jobs/2",
+            },
+            {
+                "context": "E2E API Smoke Test / E2E API Smoke Test (pull_request)",
+                "status": "pending",
+            },
+        ]}
+
+    def fake_api(method, path, *, body=None, **kwargs):
+        observed["writes"].append((method, path, body))
+        return 201, {"context": body["context"], "status": "success"}
+
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+    monkeypatch.setattr(mq, "api", fake_api)
+
+    mq.reassert_queue_runner_status(head_sha, dry_run=False)
+
+    assert observed["live"] == [(head_sha, True)]
+    assert observed["writes"] == [(
+        "POST",
+        f"/repos/{mq.OWNER}/{mq.NAME}/statuses/{head_sha}",
+        {
+            "state": "success",
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "description": "Merge queue gates passed; protected merge write in progress",
+            "target_url": "/molecule-ai/molecule-core/actions/runs/1/jobs/2",
+        },
+    )]
+
+
+def test_reassert_queue_runner_status_clears_failed_self_status(monkeypatch):
+    """A prior failed queue-runner row may be replaced only after this queue
+    evaluation has passed every live merge gate.
+    """
+    writes = []
+    monkeypatch.setattr(mq, "get_combined_status", lambda sha, *, prefer_live=False: {
+        "state": "failure",
+        "statuses": [{
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "failure",
+        }],
+    })
+
+    def fake_api(method, path, *, body=None, **kwargs):
+        writes.append(body)
+        return 201, {"context": body["context"], "status": "success"}
+
+    monkeypatch.setattr(mq, "api", fake_api)
+    mq.reassert_queue_runner_status("b" * 40, dry_run=False)
+    assert [body["state"] for body in writes] == ["success"]
+
+
+def test_reassert_queue_runner_status_noops_when_absent_or_green(monkeypatch):
+    """No status write is needed when the queue runner is absent or green."""
+    responses = iter([
+        {"state": "success", "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+        ]},
+        {"state": "success", "statuses": [
+            {
+                "context": "gitea-merge-queue / queue (pull_request_review)",
+                "status": "success",
+            },
+        ]},
+    ])
+    monkeypatch.setattr(
+        mq,
+        "get_combined_status",
+        lambda sha, *, prefer_live=False: next(responses),
+    )
+    monkeypatch.setattr(
+        mq,
+        "api",
+        lambda *a, **k: pytest.fail("status API must not be called"),
+    )
+
+    mq.reassert_queue_runner_status("c" * 40, dry_run=False)
+    mq.reassert_queue_runner_status("d" * 40, dry_run=False)
+
+
+def test_reassert_queue_runner_status_confirmation_is_fail_closed(monkeypatch):
+    """A malformed or non-success status response cannot authorize merge."""
+    monkeypatch.setattr(mq, "get_combined_status", lambda sha, *, prefer_live=False: {
+        "state": "pending",
+        "statuses": [{
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "pending",
+        }],
+    })
+    monkeypatch.setattr(
+        mq,
+        "api",
+        lambda *a, **k: (201, {
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "pending",
+        }),
+    )
+
+    with pytest.raises(mq.ApiError, match="did not confirm success"):
+        mq.reassert_queue_runner_status("e" * 40, dry_run=False)
+
+
+def test_merge_pull_status_reassertion_failure_prevents_merge(monkeypatch):
+    """The protected merge POST is never attempted if the exact runner-status
+    success write cannot be proven.
+    """
+    merge_posts = []
+
+    def fail_reassert(sha, *, dry_run):
+        raise mq.ApiError("status write denied")
+
+    monkeypatch.setattr(mq, "reassert_queue_runner_status", fail_reassert)
+    monkeypatch.setattr(
+        mq,
+        "api",
+        lambda method, path, **kwargs: merge_posts.append((method, path)),
+    )
+
+    with pytest.raises(mq.ApiError, match="status write denied"):
+        mq.merge_pull(321, dry_run=False, head_commit_id="f" * 40)
+    assert merge_posts == []
 
 
 # --------------------------------------------------------------------------
