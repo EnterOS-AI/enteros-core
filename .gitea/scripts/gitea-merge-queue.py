@@ -2184,7 +2184,11 @@ def reassert_queue_runner_status(head_sha: str, *, dry_run: bool) -> None:
             "description": "Merge queue gates passed; protected merge write in progress",
         }
         target_url = current.get("target_url")
-        if isinstance(target_url, str) and target_url:
+        safe_target_re = re.compile(
+            rf"\A/{re.escape(OWNER)}/{re.escape(NAME)}/actions/runs/"
+            r"[0-9]+/jobs/[0-9]+\Z"
+        )
+        if isinstance(target_url, str) and safe_target_re.fullmatch(target_url):
             body["target_url"] = target_url
         _, confirmation = api(
             "POST",

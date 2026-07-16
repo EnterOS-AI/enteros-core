@@ -1103,6 +1103,8 @@ def test_reassert_queue_runner_status_clears_only_exact_non_success_contexts(mon
     """
     head_sha = "a" * 40
     observed = {"live": [], "writes": []}
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
 
     def fake_combined(sha, *, prefer_live=False):
         observed["live"].append((sha, prefer_live))
@@ -1160,6 +1162,30 @@ def test_reassert_queue_runner_status_clears_failed_self_status(monkeypatch):
     monkeypatch.setattr(mq, "api", fake_api)
     mq.reassert_queue_runner_status("b" * 40, dry_run=False)
     assert [body["state"] for body in writes] == ["success"]
+
+
+def test_reassert_queue_runner_status_drops_untrusted_target_url(monkeypatch):
+    """Do not propagate an attacker-controlled external link while repairing
+    the exact runner context; only Gitea's canonical same-repo Actions path is
+    useful audit metadata.
+    """
+    writes = []
+    monkeypatch.setattr(mq, "get_combined_status", lambda sha, *, prefer_live=False: {
+        "state": "pending",
+        "statuses": [{
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "pending",
+            "target_url": "https://attacker.invalid/lookalike/actions/runs/1/jobs/2",
+        }],
+    })
+
+    def fake_api(method, path, *, body=None, **kwargs):
+        writes.append(body)
+        return 201, {"context": body["context"], "status": "success"}
+
+    monkeypatch.setattr(mq, "api", fake_api)
+    mq.reassert_queue_runner_status("2" * 40, dry_run=False)
+    assert "target_url" not in writes[0]
 
 
 def test_reassert_queue_runner_status_noops_when_absent_or_green(monkeypatch):
