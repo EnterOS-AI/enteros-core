@@ -13,6 +13,11 @@ name: gitea-merge-queue
 #   - bot updates stale PR heads with current main, then waits for CI
 #   - bot merges only when current main is green, genuine approvals are present
 #     on the current head, required PR contexts pass, and the PR is mergeable
+#   - under wildcard branch protection, the Actions job's own in-flight
+#     `gitea-merge-queue / queue` status is a gate-runner, not a product gate;
+#     after the final live checks pass, the bot reasserts only that exact
+#     context as success and requires Gitea to confirm it before the ordinary
+#     protected merge request. Any status-write failure aborts the merge
 #   - add `merge-queue-hold`, `do-not-auto-merge`, or `wip` to keep a PR OUT of
 #     autonomous merging; draft PRs are also skipped
 
@@ -42,7 +47,10 @@ on:
   # The full merge bar is UNCHANGED and still enforced by gitea-merge-queue.py
   # (genuine non-author approval on the CURRENT head, BP-required CI green, no
   # open REQUEST_CHANGES, reserved-path author!=merger). This changes only WHEN
-  # the queue runs, never WHETHER a PR merges.
+  # the queue runs, never WHETHER a PR merges. The exact runner-status
+  # reconciliation above exists only because Gitea also applies the wildcard
+  # rule to the currently running gate job; it is not a force/admin merge and
+  # cannot rewrite any product or test context (core#4420).
   #
   # FORK SAFETY: on a pull_request_review event the job still checks out the
   # default branch for the queue script (never PR-head), so no attacker code
