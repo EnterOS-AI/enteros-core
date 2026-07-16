@@ -904,6 +904,30 @@ print(json.dumps(s))
   log "    scheduler check ON: declared molecule-scheduler + MOLECULE_TRIGGER_POLL_SECONDS=${E2E_TRIGGER_POLL_SECONDS:-10}"
 fi
 
+# Native digest-provider plugin sub-step (10e, RFC molecule-core#4413): with
+# E2E_DIGEST_PLUGIN_CHECK=on, declare a native digest-provider plugin and turn on
+# the runtime's in-process digest-provider loader, so the workspace boot-installs
+# the plugin and the idle-digest assembler loads its DigestProvider IN-PROCESS.
+# We deliberately do NOT set MOLECULE_NATIVE_PLUGIN_NAMES: the load-time trust
+# gate must admit this plugin from the VENDORED native-plugins registry (the
+# runtime#310 SSOT source) — the whole point of this step. MOLECULE_MAILBOX_KERNEL
+# + the shrunken fire interval are (idempotently) set so the digest actually arms
+# and the loader runs within the window. Additive NON-LLM env only.
+if [ "${E2E_DIGEST_PLUGIN_CHECK:-}" = "on" ]; then
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
+import json, os
+s = json.loads(os.environ['SECRETS_JSON_IN'])
+src = os.environ.get('E2E_DIGEST_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0')
+existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
+s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
+s['MOLECULE_DIGEST_PROVIDER_PLUGINS'] = '1'          # D1 loader flag
+s.setdefault('MOLECULE_MAILBOX_KERNEL', '1')          # ensure the idle digest arms
+s.setdefault('MOLECULE_IDLE_FIRE_SECONDS', os.environ.get('E2E_IDLE_FIRE_SECONDS', '30'))
+print(json.dumps(s))
+")
+  log "    digest-plugin check ON: declared ${E2E_DIGEST_PLUGIN_SOURCE:-molecule-ai-plugin-digest-mail} + MOLECULE_DIGEST_PROVIDER_PLUGINS=1 (trust source = vendored registry, no NATIVE_PLUGIN_NAMES)"
+fi
+
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
@@ -2666,6 +2690,83 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
     unset -f scheduler_fire_probe scheduler_diagnostics
   else
     fail "E2E_SCHEDULER_CHECK=on requires a usable Docker CLI and daemon to inspect fire evidence."
+  fi
+fi
+
+# ─── 10e. Native digest-provider plugin load (RFC #4413, E2E_DIGEST_PLUGIN_CHECK=on only) ──
+# End-to-end proof that a NATIVE digest-provider plugin is loaded IN-PROCESS by
+# the runtime's idle-digest assembler, admitted by the LOAD-TIME trust gate from
+# the VENDORED native-plugins registry (runtime#310) — NOT from an env allow-list
+# (we never set MOLECULE_NATIVE_PLUGIN_NAMES). The workspace declared the plugin
+# at provision (secret-injection block above) with MOLECULE_DIGEST_PROVIDER_PLUGINS=1,
+# so it boot-installed the plugin under its repo dir and, when the digest armed,
+# build_default_providers() discovered contributes.digestProviders, imported the
+# provider, and passed the trust gate because the plugin's install name is in the
+# registry-derived native set. The runtime logs
+#   digest-provider: loaded '<provider_id>' from plugin <install-name> (native=True)
+# ONLY when all of that succeeded — the single unambiguous evidence line. The step
+# is behind E2E_DIGEST_PLUGIN_CHECK so it stays dark until the ephemeral runtime
+# pin carries the loader + the registry trust source; its fail arm is REACHABLE
+# (a refused/absent plugin never emits native=True and the diagnostics name why).
+if [ "${E2E_DIGEST_PLUGIN_CHECK:-}" = "on" ]; then
+  _DP_TIMEOUT_SECS="${E2E_DIGEST_PLUGIN_TIMEOUT_SECS:-360}"
+  _DP_POLL_SECS="${E2E_DIGEST_PLUGIN_POLL_SECS:-10}"
+  # The install-dir basename the trust gate matches = the source's repo segment
+  # (NOT the registry `name` field) — the exact identity the runtime keys on.
+  _DP_NAME=$(E2E_DIGEST_PLUGIN_SOURCE="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}" python3 -c "
+import os
+s = os.environ['E2E_DIGEST_PLUGIN_SOURCE'].split('#', 1)[0].rstrip('/')
+print(s.rsplit('/', 1)[-1])
+")
+
+  if idle_digest_require_docker; then
+    _DP_LOADED=""
+    digest_plugin_probe() {
+      local _sc
+      _DP_LOADED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        # The loader's success line (plugin_loader.py): native=True proves the
+        # registry trust gate admitted an official/reserved provider from this
+        # native plugin. Grepping the install-name + native=True is unambiguous.
+        # The line is not run-scoped, but the ephemeral gate provisions a fresh
+        # mol-ws- container per run (no reuse), so a stale prior-run match cannot
+        # occur here — same assumption 10c's generic grep already relies on.
+        if docker logs "$_sc" 2>&1 | grep -F "from plugin ${_DP_NAME} (native=True)" >/dev/null; then
+          _DP_LOADED="$_sc (runtime log)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    digest_plugin_diagnostics() {
+      local _sc _env _installed _warn
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _env=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DIGEST_PROVIDER_PLUGINS|DECLARED_PLUGINS|NATIVE_PLUGIN_NAMES)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
+        _installed=$(docker exec "$_sc" sh -c 'ls -1 /configs/plugins /plugins 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        # `|| true`: a zero-match grep exits 1, which under `set -euo pipefail`
+        # (line 119) would abort this diag fn BEFORE the log lines print — and
+        # zero matches IS the loader-off leg this diagnostic exists to explain.
+        _warn=$(docker logs "$_sc" 2>&1 | grep -F "digest-provider:" | tail -n 5 | tr '\n' '|' | head -c 500 || true)
+        log "    [digest-plugin diag] $_sc env: ${_env:-none}"
+        log "    [digest-plugin diag] $_sc installed plugins: ${_installed:-ABSENT (boot-install never fetched the plugin — check MOLECULE_DECLARED_PLUGINS reached the container)}"
+        log "    [digest-plugin diag] $_sc loader lines: ${_warn:-NONE (loader never ran — flag off, or the digest never armed; refused/native=False here means the trust source rejected the plugin)}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+    }
+
+    log "10e/11 Digest plugin: polling for in-process native load of '${_DP_NAME}' for up to ${_DP_TIMEOUT_SECS}s (poll=${_DP_POLL_SECS}s)."
+    if idle_digest_wait "$_DP_TIMEOUT_SECS" "$_DP_POLL_SECS" digest_plugin_probe; then
+      ok "    native digest-provider plugin '${_DP_NAME}' loaded IN-PROCESS via the registry trust gate (evidence: $_DP_LOADED)"
+    else
+      digest_plugin_diagnostics
+      fail "Native digest-provider plugin '${_DP_NAME}' never loaded (native=True) within ${_DP_TIMEOUT_SECS}s. The diagnostics above name the broken leg: ABSENT installed = boot-install never fetched the plugin (MOLECULE_DECLARED_PLUGINS gap); loader lines showing native=False / 'refused' = the plugin installed but the trust gate rejected it (registry trust source not carried by the runtime pin, or install name != registry source segment); NO loader lines = MOLECULE_DIGEST_PROVIDER_PLUGINS off or the digest never armed."
+    fi
+
+    unset -f digest_plugin_probe digest_plugin_diagnostics
+  else
+    fail "E2E_DIGEST_PLUGIN_CHECK=on requires a usable Docker CLI and daemon to inspect load evidence."
   fi
 fi
 
