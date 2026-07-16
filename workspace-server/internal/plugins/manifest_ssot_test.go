@@ -81,13 +81,27 @@ func TestValidateManifestSSOT_RuntimesScalarRejected(t *testing.T) {
 	assertSomeViolationContains(t, ValidateManifestSSOT([]byte(manifest)), "runtimes")
 }
 
-func TestValidateManifestSSOT_UnknownRuntimeRejected(t *testing.T) {
+func TestValidateManifestSSOT_UnknownWellFormedRuntimeAccepted(t *testing.T) {
+	// SDK contract change (molcontracts bump): the manifest `runtimes` field is
+	// no longer a CLOSED enum of known runtimes — items are the OPEN
+	// $defs/runtimeId contract (path-safe string, official support discovered
+	// separately). So an unknown-but-well-formed runtime id is now ACCEPTED at
+	// the schema layer; actual runtime authorization is the provisioner's
+	// knownRuntimes gate, not manifest validation. A closed-enum assertion here
+	// would re-close what the SSOT deliberately opened.
 	manifest := "name: my-plugin\nversion: \"1.0.0\"\ndescription: d\nruntimes:\n  - not-a-real-runtime\n"
-	v := ValidateManifestSSOT([]byte(manifest))
-	if len(v) == 0 {
-		t.Fatal("expected an enum violation for runtimes: [not-a-real-runtime], got none")
+	if v := ValidateManifestSSOT([]byte(manifest)); len(v) != 0 {
+		t.Errorf("well-formed unknown runtime id must be accepted under the open runtimeId contract, got: %s", joinViolations(v))
 	}
-	assertSomeViolationContains(t, v, "runtimes")
+}
+
+func TestValidateManifestSSOT_MalformedRuntimeIdRejected(t *testing.T) {
+	// The open runtimeId contract still BOUNDS the id: pattern
+	// ^[a-z0-9]+([-_][a-z0-9]+)*$ (lowercase, path-safe). A malformed id — here
+	// an uppercase/space one — must still red, or the field would accept anything.
+	// This is the negative control that keeps the loosened field meaningful.
+	manifest := "name: my-plugin\nversion: \"1.0.0\"\ndescription: d\nruntimes:\n  - \"Not A Runtime!\"\n"
+	assertSomeViolationContains(t, ValidateManifestSSOT([]byte(manifest)), "runtimes")
 }
 
 func TestValidateManifestSSOT_GarbageBytesNotYAML(t *testing.T) {

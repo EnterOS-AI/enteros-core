@@ -120,13 +120,16 @@ type HeartbeatPayload struct {
 	ErrorRate     float64 `json:"error_rate"`
 	SampleError   string  `json:"sample_error"`
 	ActiveTasks   int     `json:"active_tasks"`
-	// NOTE (RFC #4402): the runtime-sent is_busy field is deliberately NOT
-	// parsed here in B1. B1 captures is_busy on the server side by DERIVING it
-	// from active_tasks (`is_busy = (active_tasks > 0)` in the heartbeat
-	// UPDATE), so no runtime cooperation is required yet. The pointer field
-	// that lets the handler honor a runtime's authoritative is_busy (nil =
-	// derive, non-nil = trust) lands in B2, coupled with the molcontracts bump
-	// that adds is_busy to HeartbeatRequest — keeping B1 free of any SSOT bump.
+	// IsBusy is the runtime's authoritative turn-in-flight flag (RFC #4402 B2),
+	// the self-healing successor to active_tasks. A POINTER so the three states
+	// stay distinct: absent/nil (older image that doesn't send it → the handler
+	// DERIVES is_busy from active_tasks>0, behavior-identical to B1) vs an
+	// explicit true/false the handler TRUSTS over the derive (COALESCE in the
+	// heartbeat UPDATE). Optional in the SDK workspace-comms contract
+	// (`is_busy,omitempty`), so an old runtime simply omits it. B1 captured the
+	// column by deriving in SQL with no new bind arg; B2 adds this parsed field
+	// + the bump that puts is_busy in molcontracts.HeartbeatRequest.
+	IsBusy        *bool   `json:"is_busy,omitempty"`
 	UptimeSeconds int     `json:"uptime_seconds"`
 	CurrentTask   string  `json:"current_task"`
 	// MonthlySpend is cumulative USD spend for the current calendar month,
