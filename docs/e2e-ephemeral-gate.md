@@ -61,7 +61,11 @@ live failure — do not remove one without re-running the gate locally:
    falls through to the managed default — the ephemeral tenant sent its
    workspace-provision POST **to prod** (401). Fail-open filed as **CP #1515**.
    The topo base also feeds `LLMProxyBaseURL` (workspace LLM egress).
-4. **`E2E_LLM_PATH=platform` + `E2E_MODE=full` + `E2E_AWS_LEAK_CHECK=off`.**
+4. **`E2E_LLM_PATH=platform` + `E2E_MODE=full` +
+   `E2E_INFRA_BACKEND=local-docker` + `E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1`.**
+   The backend value selects the only active harness topology. The loopback
+   opt-in admits only `http://127.0.0.1:<numeric-port>` for this throwaway CP;
+   without it, the shared harness accepts only the canonical staging origin.
    The gate shares the Platform Boot lane's platform-managed LLM path, but not
    its runtime or scenario breadth: this gate pins Hermes in full mode, while
    Platform Boot uses its configured runtime in smoke mode. Hermes' default
