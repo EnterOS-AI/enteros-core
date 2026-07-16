@@ -10,7 +10,7 @@ End-to-end test scripts live under `tests/e2e/` and exercise the platform agains
 | `test_priority_runtimes_e2e.sh` | Canonical runtime completion smoke; the mock arm is CI-load-bearing and live-model arms are opportunistic. | Platform plus matching provider credentials for any live arms. |
 | `test_local_provision_lifecycle_e2e.sh` | Local Docker provision, restart, authenticated A2A, and cleanup lifecycle. | Local Docker and the supported `ADMIN_TOKEN` setup. |
 | `test_poll_mode_e2e.sh` | Authenticated poll-mode send, queue, cursor, and ownership behavior. | Platform and test database. |
-| `test_staging_full_saas.sh` | Production-shaped staging tenant boot and end-to-end validation. | Staging control-plane admin credential; never point it at production. |
+| `test_staging_full_saas.sh` | Production-shaped staging tenant boot and end-to-end validation. | Staging control-plane admin credential plus `E2E_INFRA_BACKEND=local-docker`; the harness rejects production and non-loopback custom origins. |
 
 For the maintained cross-runtime developer smoke outside `tests/e2e/`, use
 `scripts/test-all-runtimes-a2a-e2e.sh`. The older one-off team, adapter, and
