@@ -208,8 +208,43 @@ case "$CP_HOST" in
   *)             DERIVED_DOMAIN="$CP_HOST" ;;
 esac
 TENANT_DOMAIN="${MOLECULE_TENANT_DOMAIN:-$DERIVED_DOMAIN}"
-TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
+# MOLECULE_TENANT_URL override — the EPHEMERAL-CP path (mirrors
+# test_staging_full_saas.sh). Staging front-doors each tenant at its own
+# slug.<domain> subdomain, so the Host alone routes. An ephemeral CP is one
+# throwaway container whose wildcard proxy resolves the tenant by SLUG, so the
+# ephemeral runner points this at the CP base URL; default (unset) keeps the
+# exact staging subdomain behavior.
+TENANT_URL="${MOLECULE_TENANT_URL:-https://$SLUG.$TENANT_DOMAIN}"
 log "    TENANT_URL=$TENANT_URL"
+
+# Ephemeral-CP tenant ROUTING headers (mirrors test_staging_full_saas.sh): when
+# MOLECULE_TENANT_URL points at the CP base URL, carry the routing slug via
+# Host + X-Molecule-Org-Slug (the CP resolves the tenant by the Host-derived slug
+# or this fallback). Default unset ⇒ no extra headers ⇒ exact staging behavior.
+TENANT_ROUTE_HOST="${MOLECULE_TENANT_ROUTE_HOST:-}"
+if [ -z "$TENANT_ROUTE_HOST" ] && [ -n "${MOLECULE_TENANT_ROUTE_DOMAIN:-}" ]; then
+  TENANT_ROUTE_HOST="$SLUG.$MOLECULE_TENANT_ROUTE_DOMAIN"
+fi
+TENANT_ROUTE_HDRS=()
+if [ -n "$TENANT_ROUTE_HOST" ]; then
+  TENANT_ROUTE_HDRS=(-H "Host: $TENANT_ROUTE_HOST" -H "X-Molecule-Org-Slug: $SLUG")
+  log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG (ephemeral-CP slug routing)"
+fi
+
+# Origin header: the tenant's gin-contrib/cors allows exactly ONE origin — its own
+# public front-door (CORS_ORIGINS). In staging that IS $TENANT_URL
+# (https://$SLUG.$domain), so the default below reproduces staging byte-for-byte.
+# Under the ephemeral CP, $TENANT_URL is the CP base URL (NOT a tenant origin), so
+# a same-value Origin would be cross-origin → an empty-body 403 from cors before
+# any handler runs. MOLECULE_TENANT_ORIGIN_TEMPLATE (the SAME template the CP turns
+# into the tenant's CORS_ORIGINS) is substituted with this run's slug so the Origin
+# we present is byte-identical to the origin the tenant allows. Default unset ⇒
+# Origin=$TENANT_URL ⇒ exact staging behavior.
+TENANT_ORIGIN="$TENANT_URL"
+if [ -n "${MOLECULE_TENANT_ORIGIN_TEMPLATE:-}" ]; then
+  TENANT_ORIGIN="${MOLECULE_TENANT_ORIGIN_TEMPLATE//\{slug\}/$SLUG}"
+  log "    tenant CORS origin = $TENANT_ORIGIN (from MOLECULE_TENANT_ORIGIN_TEMPLATE)"
+fi
 
 # ─── 3. Per-tenant admin token + TLS readiness ───────────────────────────────
 log "3/6 Fetching per-tenant admin token..."
@@ -221,7 +256,7 @@ ok "Tenant admin token retrieved (len=${#TENANT_TOKEN})"
 log "    Waiting for tenant TLS / DNS propagation..."
 TLS_DEADLINE=$(( $(date +%s) + 15 * 60 ))
 while true; do
-  curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
+  curl -sSfk "${TENANT_ROUTE_HDRS[@]}" --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
   [ "$(date +%s)" -gt "$TLS_DEADLINE" ] && fail "Tenant /health never 2xx within 15m"
   sleep 5
 done
@@ -232,9 +267,10 @@ ok "Tenant reachable at $TENANT_URL"
 tenant_call() {  # <method> <path> [curl args…]
   local method="$1" path="$2"; shift 2
   curl "${CURL_COMMON[@]}" -X "$method" "$TENANT_URL$path" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
-    -H "Origin: $TENANT_URL" "$@"
+    -H "Origin: $TENANT_ORIGIN" "$@"
 }
 
 # Create an external workspace row (no worker container). Echoes its id.
