@@ -422,7 +422,7 @@ run_scenario() {
   echo "[proof] running core happy-path (full-saas, runtime=${RUNTIME}) against the ephemeral CP — zero staging creds..." >&2
   # E2E_WORKSPACE_ONLINE_TIMEOUT_SECS bounds the SCRIPT's waits, not just the job.
   # test_staging_full_saas.sh defaults WORKSPACE_ONLINE_TIMEOUT_SECS to 3600 (sized for
-  # a real EC2 cold boot), and full mode spends that budget THREE times on independent
+  # shared-staging cold boot), and full mode spends that budget THREE times on independent
   # deadlines: step 7 boot, the 10b resume, and the 10b hibernate-wake. 3×3600s = 180
   # min of legally-waiting script against a 75-min job cap — so a wedged re-provision
   # would be killed by the runner with the named `fail` never printed and the diagnostic
@@ -458,7 +458,8 @@ run_scenario() {
   E2E_REQUIRE_LIVE=1 \
   E2E_RUNTIME="${RUNTIME}" \
   E2E_LLM_PATH=platform \
-  E2E_AWS_LEAK_CHECK=off \
+  E2E_INFRA_BACKEND=local-docker \
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
   E2E_MODE="${E2E_MODE:-full}" \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}" \
