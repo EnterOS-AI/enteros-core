@@ -116,13 +116,22 @@ jobs:
           # (the generic "which shared-canvas container to roll" knob); pass the
           # prod container name through it. Empty => the roll is skipped.
           STAGING_CANVAS_APP_CONTAINER: ${{ env.PROD_CANVAS_APP_CONTAINER }}
+          # Managed rollout flags SSOT (same repo var the staging rollers use). The
+          # script strips every managed key from the inherited env and re-applies
+          # ONLY what TENANT_FLAGS names, so this MUST be wired or a main-triggered
+          # prod roll would silently turn an in-flight flag OFF fleet-wide.
+          STAGING_TENANT_FLAGS: ${{ vars.STAGING_TENANT_FLAGS }}
         run: |
           set -euo pipefail
           TAG="${TARGET_TAG_OVERRIDE:-$DEFAULT_TENANT_TAG}"
           echo "::notice::Production tenant redeploy target tag = ${TAG}"
           # CANVAS_TAG follows the tenant tag so a pinned rollback rolls a matching
           # canvas; the shared script defaults it to the tenant tag anyway.
+          # `${STAGING_TENANT_FLAGS-}` — the shell (not the templater) supplies the
+          # default, so TENANT_FLAGS arrives SET-AND-EMPTY and the script's
+          # fail-closed unset-check is satisfied while the flags stay dark.
           CANVAS_TAG="$TAG" \
+          TENANT_FLAGS="${STAGING_TENANT_FLAGS-}" \
           bash scripts/deploy/redeploy-staging-fleet.sh --cp-env production --tag "$TAG"
           {
             echo "## Production fleet redeploy (molecules-server / local-docker)"
