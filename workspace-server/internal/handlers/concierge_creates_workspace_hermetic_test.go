@@ -38,7 +38,7 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 		mock.ExpectExec("UPDATE workspaces SET").
-			WithArgs("ws-concierge-ok", 0.0, "", 0, 60, "").
+			WithArgs("ws-concierge-ok", 0.0, "", 0, 60, "", nil).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
@@ -92,7 +92,7 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 		mock.ExpectExec("UPDATE workspaces SET").
-			WithArgs("ws-concierge-missing", 0.0, "", 0, 60, "").
+			WithArgs("ws-concierge-missing", 0.0, "", 0, 60, "", nil).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.

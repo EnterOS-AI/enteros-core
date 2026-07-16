@@ -42,7 +42,7 @@ func TestHeartbeatHandler_PlatformMCPMissing_FiresRecoveryReconcile(t *testing.T
 
 	// Main heartbeat UPDATE.
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-mcp-fail", 0.0, "", 0, 60, "").
+		WithArgs("ws-mcp-fail", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// evaluateStatus: currentStatus=online, kind=platform.
@@ -108,7 +108,7 @@ func TestHeartbeatHandler_PlatformModelMissing_DoesNotFireReconcile(t *testing.T
 		WithArgs("ws-model-fail").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-model-fail", 0.0, "", 0, 60, "").
+		WithArgs("ws-model-fail", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
 		WithArgs("ws-model-fail").
@@ -211,7 +211,7 @@ func TestHeartbeatHandler_PlatformMCPPresentButEmptyTools_FiresRecoveryReconcile
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-mcp-empty-tools", 0.0, "", 0, 60, "").
+		WithArgs("ws-mcp-empty-tools", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// loaded_mcp_tools persistence.

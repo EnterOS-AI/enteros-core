@@ -40,7 +40,7 @@ func TestHeartbeatHandler_PlatformManagementMCPMissing_SustainedDegrades(t *test
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-mcp-missing", 0.0, "", 0, 60, "").
+		WithArgs("ws-mcp-missing", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
@@ -107,7 +107,7 @@ func TestHeartbeatHandler_PlatformManagementMCPMissing_WithinGrace_NoDegrade(t *
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-mcp-warmup", 0.0, "", 0, 60, "").
+		WithArgs("ws-mcp-warmup", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
@@ -167,7 +167,7 @@ func TestHeartbeatHandler_PlatformManagementMCPLoaded_ClearsStampStaysOnline(t *
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-mcp-ok", 0.0, "", 0, 60, "").
+		WithArgs("ws-mcp-ok", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
@@ -228,7 +228,7 @@ func TestHeartbeatHandler_RuntimeEmitsServerPresentButNoLoadedTools_SustainedDeg
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-server-present-no-tools", 0.0, "", 0, 60, "").
+		WithArgs("ws-server-present-no-tools", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	sustained := time.Now().Add(-5 * time.Minute)
@@ -283,7 +283,7 @@ func TestHeartbeatHandler_RuntimeEmitsServerPresentButNoLoadedTools_WithinGrace(
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-no-tools-warmup", 0.0, "", 0, 60, "").
+		WithArgs("ws-no-tools-warmup", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
@@ -336,7 +336,7 @@ func TestHeartbeatHandler_DegradedNotRecoveredWhileMCPUnloaded(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "degraded"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-stuck-degraded", 0.0, "", 0, 60, "").
+		WithArgs("ws-stuck-degraded", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.
@@ -391,7 +391,7 @@ func TestHeartbeatHandler_Pre147RuntimeNoMCPServerPresent_StaysOnline(t *testing
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-pre-147", 0.0, "", 0, 60, "").
+		WithArgs("ws-pre-147", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
@@ -439,7 +439,7 @@ func TestHeartbeatHandler_PlatformManagementMCPLookupError_FlipsOnlineToDegraded
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-mcp-lookup-err", 0.0, "", 0, 60, "").
+		WithArgs("ws-mcp-lookup-err", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// core#3082 / molecule-core#3256: persist loaded_mcp_tools to the row.

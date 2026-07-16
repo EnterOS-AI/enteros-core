@@ -256,7 +256,7 @@ func TestHeartbeatHandler_Normal(t *testing.T) {
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.1, "", 2, 3600, "").
+		WithArgs("ws-123", 0.1, "", 2, 3600, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
@@ -295,7 +295,7 @@ func TestHeartbeatHandler_Degraded(t *testing.T) {
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.8, "connection timeout", 0, 7200, "").
+		WithArgs("ws-123", 0.8, "connection timeout", 0, 7200, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT — currently online
@@ -343,7 +343,7 @@ func TestHeartbeatHandler_Recovery(t *testing.T) {
 
 	// Expect heartbeat UPDATE
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.05, "", 1, 9000, "").
+		WithArgs("ws-123", 0.05, "", 1, 9000, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT — currently degraded
@@ -742,7 +742,7 @@ func TestHeartbeatHandler_TaskChanged(t *testing.T) {
 
 	// Expect heartbeat UPDATE with new task
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.0, "", 1, 1000, "new task").
+		WithArgs("ws-123", 0.0, "", 1, 1000, "new task", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
@@ -928,7 +928,7 @@ func TestHeartbeatHandler_TaskUnchanged(t *testing.T) {
 
 	// Expect heartbeat UPDATE with same task
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.0, "", 1, 500, "doing work").
+		WithArgs("ws-123", 0.0, "", 1, 500, "doing work", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
@@ -971,7 +971,7 @@ func TestHeartbeatHandler_TaskCleared(t *testing.T) {
 
 	// Expect heartbeat UPDATE with empty task
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.0, "", 0, 600, "").
+		WithArgs("ws-123", 0.0, "", 0, 600, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// Expect evaluateStatus SELECT
@@ -1032,7 +1032,7 @@ func TestHeartbeatHandler_AlwaysBroadcastsHeartbeat(t *testing.T) {
 		WithArgs("ws-123").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend"}).AddRow("doing work", 0))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-123", 0.0, "", 1, 500, "doing work").
+		WithArgs("ws-123", 0.0, "", 1, 500, "doing work", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
 		WithArgs("ws-123").

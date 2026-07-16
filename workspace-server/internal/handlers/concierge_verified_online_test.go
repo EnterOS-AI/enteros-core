@@ -28,7 +28,7 @@ func TestHeartbeat_PlatformWarming_NotYetOnline(t *testing.T) {
 		WithArgs("ws-warm-hold").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-warm-hold", 0.0, "", 0, 60, "").
+		WithArgs("ws-warm-hold", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
 		WithArgs(sqlmock.AnyArg(), "ws-warm-hold").
@@ -74,7 +74,7 @@ func TestHeartbeat_PlatformWarming_FlipsOnlineWhenToolReported(t *testing.T) {
 		WithArgs("ws-warm-verified").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-warm-verified", 0.0, "", 0, 60, "").
+		WithArgs("ws-warm-verified", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
 		WithArgs(sqlmock.AnyArg(), "ws-warm-verified").
@@ -130,7 +130,7 @@ func TestHeartbeat_PlatformWarming_HealthyLongWarmingHolds(t *testing.T) {
 		WithArgs("ws-warm-hold-long").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-warm-hold-long", 0.0, "", 0, 60, "").
+		WithArgs("ws-warm-hold-long", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
 		WithArgs(sqlmock.AnyArg(), "ws-warm-hold-long").
@@ -179,7 +179,7 @@ func TestHeartbeat_PlatformWarming_UnhealthyLongWarmingStillHolds(t *testing.T) 
 		WithArgs("ws-warm-unhealthy").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-warm-unhealthy", 0.9, "", 0, 60, "").
+		WithArgs("ws-warm-unhealthy", 0.9, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
 		WithArgs(sqlmock.AnyArg(), "ws-warm-unhealthy").
@@ -226,7 +226,7 @@ func TestHeartbeat_PlatformProvisioning_LegacyRuntimeFlipsOnline(t *testing.T) {
 		WithArgs("ws-legacy").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-legacy", 0.0, "", 0, 60, "").
+		WithArgs("ws-legacy", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// loaded_mcp_tools omitted (nil) → no loaded_mcp_tools persist UPDATE.
 	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
@@ -396,7 +396,7 @@ func TestHeartbeat_PlatformFailed_NonCallableToolNotPromoted(t *testing.T) {
 		WithArgs("ws-failed-hold").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "failed"))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-failed-hold", 0.0, "", 0, 60, "").
+		WithArgs("ws-failed-hold", 0.0, "", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
 		WithArgs(sqlmock.AnyArg(), "ws-failed-hold").
@@ -444,7 +444,7 @@ func TestHeartbeat_PlatformOnline_WedgedDemotes(t *testing.T) {
 		WithArgs("ws-online-wedged").
 		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
 	mock.ExpectExec("UPDATE workspaces SET").
-		WithArgs("ws-online-wedged", 0.0, "SDK init timeout — restart workspace", 0, 60, "").
+		WithArgs("ws-online-wedged", 0.0, "SDK init timeout — restart workspace", 0, 60, "", nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
 		WithArgs(sqlmock.AnyArg(), "ws-online-wedged").

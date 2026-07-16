@@ -885,6 +885,49 @@ print(json.dumps(s))
   log "    idle-digest check ON: MOLECULE_IDLE_FIRE_SECONDS=${E2E_IDLE_FIRE_SECONDS:-30} injected into workspace secrets"
 fi
 
+# Scheduler autonomous-fire sub-step (P5c): with E2E_SCHEDULER_CHECK=on, declare
+# the molecule-scheduler kind:trigger plugin so the workspace boot-installs it
+# (per-workspace delivery — the runtime arms the daemon when the plugin is
+# present), and shrink the poll so a `* * * * *` schedule fires within the run.
+# Additive NON-LLM env only — same platform-managed guard rationale as the idle
+# block above. The plugin source is the public repo, fetched anonymously at boot.
+if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
+import json, os
+s = json.loads(os.environ['SECRETS_JSON_IN'])
+src = os.environ.get('E2E_SCHEDULER_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.1.0')
+existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
+s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
+s['MOLECULE_TRIGGER_POLL_SECONDS'] = os.environ.get('E2E_TRIGGER_POLL_SECONDS', '10')
+print(json.dumps(s))
+")
+  log "    scheduler check ON: declared molecule-scheduler + MOLECULE_TRIGGER_POLL_SECONDS=${E2E_TRIGGER_POLL_SECONDS:-10}"
+fi
+
+# Native digest-provider plugin sub-step (10e, RFC molecule-core#4413): with
+# E2E_DIGEST_PLUGIN_CHECK=on, declare a native digest-provider plugin and turn on
+# the runtime's in-process digest-provider loader, so the workspace boot-installs
+# the plugin and the idle-digest assembler loads its DigestProvider IN-PROCESS.
+# We deliberately do NOT set MOLECULE_NATIVE_PLUGIN_NAMES: the load-time trust
+# gate must admit this plugin from the VENDORED native-plugins registry (the
+# runtime#310 SSOT source) — the whole point of this step. MOLECULE_MAILBOX_KERNEL
+# + the shrunken fire interval are (idempotently) set so the digest actually arms
+# and the loader runs within the window. Additive NON-LLM env only.
+if [ "${E2E_DIGEST_PLUGIN_CHECK:-}" = "on" ]; then
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
+import json, os
+s = json.loads(os.environ['SECRETS_JSON_IN'])
+src = os.environ.get('E2E_DIGEST_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0')
+existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
+s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
+s['MOLECULE_DIGEST_PROVIDER_PLUGINS'] = '1'          # D1 loader flag
+s.setdefault('MOLECULE_MAILBOX_KERNEL', '1')          # ensure the idle digest arms
+s.setdefault('MOLECULE_IDLE_FIRE_SECONDS', os.environ.get('E2E_IDLE_FIRE_SECONDS', '30'))
+print(json.dumps(s))
+")
+  log "    digest-plugin check ON: declared ${E2E_DIGEST_PLUGIN_SOURCE:-molecule-ai-plugin-digest-mail} + MOLECULE_DIGEST_PROVIDER_PLUGINS=1 (trust source = vendored registry, no NATIVE_PLUGIN_NAMES)"
+fi
+
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
 log "    MODEL_SLUG=$MODEL_SLUG"
 
@@ -2556,6 +2599,174 @@ if [ "${E2E_IDLE_DIGEST_CHECK:-}" = "on" ]; then
     unset -f idle_digest_probe idle_digest_diagnostics
   else
     fail "E2E_IDLE_DIGEST_CHECK=on requires a usable Docker CLI and daemon to inspect completion evidence."
+  fi
+fi
+
+# ─── 10d. Scheduler autonomous-fire (task #37, E2E_SCHEDULER_CHECK=on only) ──
+# End-to-end proof of scheduler-as-trigger-plugin (RFC): the workspace declared
+# the molecule-scheduler kind:trigger plugin at provision (secret-injection block
+# above), so it boot-installed the plugin and armed the trigger daemon. This step
+# creates a once-a-minute schedule through the SAME tenant API a user would, then
+# waits for the daemon to autonomously FIRE it — exercising the full chain:
+#   declare → boot-install → arm daemon → advertise `scheduler` capability →
+#   create routes to the runtime volume grid → daemon polls grid → self-schedules
+#   a turn (writes schedule-history.json + logs "fired schedule").
+# The whole step is behind E2E_SCHEDULER_CHECK so it stays dark until the
+# ephemeral runtime pin carries plugin boot-install + the trigger scaffold; once
+# on, its fail arms are REACHABLE (create-4xx and never-fired are distinct hard
+# failures, each with capability/grid/health diagnostics).
+if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
+  _SCHED_TIMEOUT_SECS="${E2E_SCHEDULER_TIMEOUT_SECS:-360}"
+  _SCHED_POLL_SECS="${E2E_SCHEDULER_POLL_SECS:-10}"
+  # A run-unique name so the durable history/grid probe can't match a stale entry
+  # from another run sharing a recycled container, and so the fired-log grep is
+  # unambiguous. Bounded + cron-safe (no spaces/quotes).
+  _SCHED_NAME="e2e-fire-${E2E_RUN_ID:-local}"
+
+  if idle_digest_require_docker; then
+    # Create the schedule via the tenant API (the exact path Canvas uses). A
+    # `* * * * *` cron fires at the top of every minute; combined with the
+    # injected MOLECULE_TRIGGER_POLL_SECONDS the daemon evaluates it within the
+    # poll window. A non-2xx here is a REACHABLE fail arm (routing/plugin/auth).
+    log "10d/11 Scheduler: creating '* * * * *' schedule '$_SCHED_NAME' on $PARENT_ID via the tenant API..."
+    _SCHED_TMP=$(mktemp)
+    _SCHED_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/schedules" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"$_SCHED_NAME\",\"cron_expr\":\"* * * * *\",\"timezone\":\"UTC\",\"prompt\":\"E2E scheduler self-fire probe — reply OK.\"}" \
+      -o "$_SCHED_TMP" -w '%{http_code}' 2>/dev/null) || true
+    _SCHED_BODY=$(cat "$_SCHED_TMP" 2>/dev/null | sanitize_http_body); rm -f "$_SCHED_TMP"
+    if ! echo "$_SCHED_CODE" | grep -Eq '^2[0-9][0-9]$'; then
+      fail "Scheduler: create schedule returned http=$_SCHED_CODE (expected 2xx): ${_SCHED_BODY:0:300}. A 5xx/failed-forward here means the workspace did NOT advertise the native-scheduler capability — the molecule-scheduler plugin never boot-installed / the daemon never armed, so create fell through to the retired DB path. Check MOLECULE_DECLARED_PLUGINS reached the container and the trigger scaffold is present in the runtime pin."
+    fi
+    ok "    schedule created (http=$_SCHED_CODE) — routed to the runtime volume grid"
+
+    _SCHED_FIRED=""
+    scheduler_fire_probe() {
+      local _sc
+      _SCHED_FIRED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        # Container log: the daemon logs `fired schedule '<name>'` (scheduler.py).
+        if docker logs "$_sc" 2>&1 | grep -F "fired schedule '$_SCHED_NAME'" >/dev/null; then
+          _SCHED_FIRED="$_sc (runtime log)"
+          return 0
+        fi
+        # Durable: schedule-history.json on the persisted config volume carries a
+        # {"name":"<name>","status":"fired"} entry, written only after a real
+        # self-scheduled turn — survives CP-driven container replacement.
+        if docker exec "$_sc" sh -c \
+          "grep -Fq '\"name\": \"$_SCHED_NAME\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          >/dev/null 2>&1; then
+          _SCHED_FIRED="$_sc (durable schedule-history.json)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    scheduler_diagnostics() {
+      local _sc _grid _health _hist _caps
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _caps=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DECLARED_PLUGINS|TRIGGER)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
+        log "    [scheduler diag] $_sc env: ${_caps:-none}"
+        log "    [scheduler diag] $_sc grid: ${_grid:-ABSENT (create never reached the volume — capability/routing gap)}"
+        log "    [scheduler diag] $_sc health: ${_health:-ABSENT (daemon never wrote a heartbeat — not armed)}"
+        log "    [scheduler diag] $_sc history: ${_hist:-ABSENT (no schedule ever fired)}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+    }
+
+    log "    Scheduler: polling fire evidence for up to ${_SCHED_TIMEOUT_SECS}s (poll=${_SCHED_POLL_SECS}s)."
+    if idle_digest_wait "$_SCHED_TIMEOUT_SECS" "$_SCHED_POLL_SECS" scheduler_fire_probe; then
+      ok "    scheduler autonomously FIRED '$_SCHED_NAME' (evidence: $_SCHED_FIRED)"
+    else
+      scheduler_diagnostics
+      fail "Scheduler never fired '$_SCHED_NAME' within ${_SCHED_TIMEOUT_SECS}s — the grid/health/history diagnostics above name the broken leg: ABSENT grid = create didn't reach the volume (capability not advertised); ABSENT health = daemon not armed (plugin didn't boot-install); grid+health present but no history = daemon armed but the trigger lane never delivered (self-scheduler turn path)."
+    fi
+
+    unset -f scheduler_fire_probe scheduler_diagnostics
+  else
+    fail "E2E_SCHEDULER_CHECK=on requires a usable Docker CLI and daemon to inspect fire evidence."
+  fi
+fi
+
+# ─── 10e. Native digest-provider plugin load (RFC #4413, E2E_DIGEST_PLUGIN_CHECK=on only) ──
+# End-to-end proof that a NATIVE digest-provider plugin is loaded IN-PROCESS by
+# the runtime's idle-digest assembler, admitted by the LOAD-TIME trust gate from
+# the VENDORED native-plugins registry (runtime#310) — NOT from an env allow-list
+# (we never set MOLECULE_NATIVE_PLUGIN_NAMES). The workspace declared the plugin
+# at provision (secret-injection block above) with MOLECULE_DIGEST_PROVIDER_PLUGINS=1,
+# so it boot-installed the plugin under its repo dir and, when the digest armed,
+# build_default_providers() discovered contributes.digestProviders, imported the
+# provider, and passed the trust gate because the plugin's install name is in the
+# registry-derived native set. The runtime logs
+#   digest-provider: loaded '<provider_id>' from plugin <install-name> (native=True)
+# ONLY when all of that succeeded — the single unambiguous evidence line. The step
+# is behind E2E_DIGEST_PLUGIN_CHECK so it stays dark until the ephemeral runtime
+# pin carries the loader + the registry trust source; its fail arm is REACHABLE
+# (a refused/absent plugin never emits native=True and the diagnostics name why).
+if [ "${E2E_DIGEST_PLUGIN_CHECK:-}" = "on" ]; then
+  _DP_TIMEOUT_SECS="${E2E_DIGEST_PLUGIN_TIMEOUT_SECS:-360}"
+  _DP_POLL_SECS="${E2E_DIGEST_PLUGIN_POLL_SECS:-10}"
+  # The install-dir basename the trust gate matches = the source's repo segment
+  # (NOT the registry `name` field) — the exact identity the runtime keys on.
+  _DP_NAME=$(E2E_DIGEST_PLUGIN_SOURCE="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}" python3 -c "
+import os
+s = os.environ['E2E_DIGEST_PLUGIN_SOURCE'].split('#', 1)[0].rstrip('/')
+print(s.rsplit('/', 1)[-1])
+")
+
+  if idle_digest_require_docker; then
+    _DP_LOADED=""
+    digest_plugin_probe() {
+      local _sc
+      _DP_LOADED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        # The loader's success line (plugin_loader.py): native=True proves the
+        # registry trust gate admitted an official/reserved provider from this
+        # native plugin. Grepping the install-name + native=True is unambiguous.
+        # The line is not run-scoped, but the ephemeral gate provisions a fresh
+        # mol-ws- container per run (no reuse), so a stale prior-run match cannot
+        # occur here — same assumption 10c's generic grep already relies on.
+        if docker logs "$_sc" 2>&1 | grep -F "from plugin ${_DP_NAME} (native=True)" >/dev/null; then
+          _DP_LOADED="$_sc (runtime log)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    digest_plugin_diagnostics() {
+      local _sc _env _installed _warn
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _env=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DIGEST_PROVIDER_PLUGINS|DECLARED_PLUGINS|NATIVE_PLUGIN_NAMES)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
+        _installed=$(docker exec "$_sc" sh -c 'ls -1 /configs/plugins /plugins 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        # `|| true`: a zero-match grep exits 1, which under `set -euo pipefail`
+        # (line 119) would abort this diag fn BEFORE the log lines print — and
+        # zero matches IS the loader-off leg this diagnostic exists to explain.
+        _warn=$(docker logs "$_sc" 2>&1 | grep -F "digest-provider:" | tail -n 5 | tr '\n' '|' | head -c 500 || true)
+        log "    [digest-plugin diag] $_sc env: ${_env:-none}"
+        log "    [digest-plugin diag] $_sc installed plugins: ${_installed:-ABSENT (boot-install never fetched the plugin — check MOLECULE_DECLARED_PLUGINS reached the container)}"
+        log "    [digest-plugin diag] $_sc loader lines: ${_warn:-NONE (loader never ran — flag off, or the digest never armed; refused/native=False here means the trust source rejected the plugin)}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+    }
+
+    log "10e/11 Digest plugin: polling for in-process native load of '${_DP_NAME}' for up to ${_DP_TIMEOUT_SECS}s (poll=${_DP_POLL_SECS}s)."
+    if idle_digest_wait "$_DP_TIMEOUT_SECS" "$_DP_POLL_SECS" digest_plugin_probe; then
+      ok "    native digest-provider plugin '${_DP_NAME}' loaded IN-PROCESS via the registry trust gate (evidence: $_DP_LOADED)"
+    else
+      digest_plugin_diagnostics
+      fail "Native digest-provider plugin '${_DP_NAME}' never loaded (native=True) within ${_DP_TIMEOUT_SECS}s. The diagnostics above name the broken leg: ABSENT installed = boot-install never fetched the plugin (MOLECULE_DECLARED_PLUGINS gap); loader lines showing native=False / 'refused' = the plugin installed but the trust gate rejected it (registry trust source not carried by the runtime pin, or install name != registry source segment); NO loader lines = MOLECULE_DIGEST_PROVIDER_PLUGINS off or the digest never armed."
+    fi
+
+    unset -f digest_plugin_probe digest_plugin_diagnostics
+  else
+    fail "E2E_DIGEST_PLUGIN_CHECK=on requires a usable Docker CLI and daemon to inspect load evidence."
   fi
 fi
 
