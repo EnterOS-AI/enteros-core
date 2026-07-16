@@ -623,6 +623,14 @@ jobs:
           # Docker preflight. Offline: proves missing Docker or an unreachable
           # daemon cannot silently skip E2E_IDLE_DIGEST_CHECK=on.
           bash tests/e2e/test_idle_digest_wait_unit.sh
+          # core#4425 finding #2: the extra-scenario gating in
+          # ephemeral_cp_happy_path.sh must distinguish a MISCONFIG (unknown
+          # scenario key / empty token list → reserved rc=97 → EXTRA_MISCONFIG)
+          # from a scenario that RAN and failed (incl. a legit exit 2, which the
+          # concierge script itself emits). Offline: proves the sentinel does not
+          # collide with a wrapped process's real exit code. This test shipped in
+          # #4425 but no workflow named it — it never ran until this line.
+          bash tests/e2e/test_extra_scenarios_gating_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Drift guard — KI-013 container/volume naming (SEV #2499)
