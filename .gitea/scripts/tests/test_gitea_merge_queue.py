@@ -1594,6 +1594,44 @@ def test_get_combined_status_propagates_paginated_statuses_error(monkeypatch):
         mq.get_combined_status("a" * 40)
 
 
+def test_get_combined_status_uses_newest_id_when_history_order_is_unstable(monkeypatch):
+    """The paginated history is not a stable newest-first stream.
+
+    Gitea can return an older pending row before the completed row for the same
+    context when status writes move page boundaries during a queue run.  The
+    combined endpoint is also capped and may omit that context, so enrichment
+    must choose the greatest status id instead of trusting response order.
+    """
+    monkeypatch.setattr(mq, "OWNER", "o")
+    monkeypatch.setattr(mq, "NAME", "r")
+
+    def fake_api(method, path, *, query=None, **kw):
+        if path.endswith("/status"):
+            return 200, {"state": "success", "statuses": []}
+        raise mq.ApiError(f"unexpected {path}")
+
+    monkeypatch.setattr(mq, "api", fake_api)
+    monkeypatch.setattr(mq, "api_paginated", lambda *a, **k: [
+        {
+            "id": 96,
+            "context": "Handlers Postgres Integration / detect-changes (pull_request)",
+            "status": "pending",
+        },
+        {
+            "id": 105,
+            "context": "Handlers Postgres Integration / detect-changes (pull_request)",
+            "status": "success",
+        },
+    ])
+
+    combined = mq.get_combined_status("b" * 40)
+    latest = mq.latest_statuses_by_context(combined["statuses"])
+
+    assert latest[
+        "Handlers Postgres Integration / detect-changes (pull_request)"
+    ]["status"] == "success"
+
+
 def test_process_once_holds_tick_when_branch_protection_unavailable(monkeypatch):
     """BP enumeration failure → HOLD the whole tick (no merge, rc 0)."""
     merged = {"called": False}
