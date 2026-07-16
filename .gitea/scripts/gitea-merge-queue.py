@@ -244,6 +244,29 @@ _PENDING_MARKER_RE = re.compile(r"^\s*#\s*pending-#\d+\b", re.IGNORECASE)
 _EVENT_SUFFIX_RE = re.compile(
     r"\s*\((?:pull_request|push|pull_request_target)\)\s*$"
 )
+
+# The queue's OWN commit-status context. The `gitea-merge-queue` workflow's
+# `queue` job posts `gitea-merge-queue / queue` on the PR head, and that status
+# is `pending` for the whole duration of THIS run. A wildcard branch-protection
+# set ("*") therefore matches the queue's own in-flight status and — because it
+# is pending, never success, during self-evaluation — makes the queue decide
+# `wait` on the very PR whose approval fired the run. That is a self-referential
+# deadlock (#126): a PR can never merge on the event of its OWN approval; it only
+# merges when some UNRELATED trigger evaluates it (that run's pending self-status
+# lands on the other PR's head). required_contexts_green() drops this context
+# from GLOB matches to break the deadlock.
+#
+# This is NOT the advisory-skip the module forbids elsewhere (skipping a real
+# test that carries a red/pending status): the queue job is the gate-RUNNER, not
+# a gate, and requiring its own in-flight status to be green is a logical
+# impossibility, not a soft-fail. Only wildcard patterns are affected; a LITERAL
+# requirement naming this context is left untouched. Event-suffix-insensitive
+# (fires on pull_request_review, so the live suffix is not in _EVENT_SUFFIX_RE).
+SELF_STATUS_CONTEXT = "gitea-merge-queue / queue"
+_SELF_STATUS_RE = re.compile(
+    r"\A" + re.escape(SELF_STATUS_CONTEXT) + r"(?:\s*\([^)]*\))?\s*\Z"
+)
+
 # Required contexts for push (main/staging) runs. The push CI uses the same
 # aggregator names with " (push)" suffix. Checking these explicitly instead of
 # the combined state avoids false-pause when non-blocking jobs (e.g. Platform
@@ -825,6 +848,14 @@ def required_contexts_green(
             _flag(pattern, "invalid-glob")
             continue
         matches = [c for c in latest_statuses if matcher.fullmatch(c)]
+        if _is_glob(pattern):
+            # Drop the queue's OWN in-flight status from wildcard matches — it is
+            # `pending` throughout this very run, so requiring it green under a
+            # glob like "*" is a self-referential deadlock (#126, see
+            # SELF_STATUS_CONTEXT). A LITERAL requirement is left untouched: a
+            # narrow glob ("CI /*") never matches it anyway, and if a policy
+            # deliberately names it exactly, honor that.
+            matches = [c for c in matches if not _SELF_STATUS_RE.fullmatch(c)]
         if not matches:
             # Fail-closed: a required pattern that matches nothing cannot be
             # shown green. Preserve the old `missing` wording for plain exact
