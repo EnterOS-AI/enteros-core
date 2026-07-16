@@ -1212,6 +1212,41 @@ def test_reassert_queue_runner_status_confirmation_is_fail_closed(monkeypatch):
         mq.reassert_queue_runner_status("e" * 40, dry_run=False)
 
 
+def test_reassert_queue_runner_status_api_failure_propagates(monkeypatch):
+    """A rejected status write is a hard stop, never a best-effort bypass."""
+    monkeypatch.setattr(mq, "get_combined_status", lambda sha, *, prefer_live=False: {
+        "state": "pending",
+        "statuses": [{
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "pending",
+        }],
+    })
+
+    def reject_write(*args, **kwargs):
+        raise mq.ApiError("POST status -> HTTP 403")
+
+    monkeypatch.setattr(mq, "api", reject_write)
+    with pytest.raises(mq.ApiError, match="HTTP 403"):
+        mq.reassert_queue_runner_status("f" * 40, dry_run=False)
+
+
+def test_reassert_queue_runner_status_dry_run_never_writes(monkeypatch):
+    """The evaluator may describe the reconciliation but dry-run is read-only."""
+    monkeypatch.setattr(mq, "get_combined_status", lambda sha, *, prefer_live=False: {
+        "state": "pending",
+        "statuses": [{
+            "context": "gitea-merge-queue / queue (pull_request_review)",
+            "status": "pending",
+        }],
+    })
+    monkeypatch.setattr(
+        mq,
+        "api",
+        lambda *a, **k: pytest.fail("dry-run must not write status"),
+    )
+    mq.reassert_queue_runner_status("1" * 40, dry_run=True)
+
+
 def test_merge_pull_status_reassertion_failure_prevents_merge(monkeypatch):
     """The protected merge POST is never attempted if the exact runner-status
     success write cannot be proven.
