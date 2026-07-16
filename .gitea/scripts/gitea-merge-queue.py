@@ -649,6 +649,17 @@ def status_state(status: dict) -> str:
     return str(status.get("status") or status.get("state") or "").lower()
 
 
+def status_numeric_id(status: dict) -> int:
+    """Return a sortable Gitea commit-status id, or -1 when unavailable."""
+    value = status.get("id")
+    if isinstance(value, bool):
+        return -1
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
 def latest_statuses_by_context(statuses: list[dict]) -> dict[str, dict]:
     # Gitea /statuses endpoint returns entries in ascending id order (oldest
     # first). We need the LAST occurrence of each context, so iterate in
@@ -1927,14 +1938,18 @@ def get_combined_status(sha: str, *, prefer_live: bool = False) -> dict:
         "GET",
         f"/repos/{OWNER}/{NAME}/commits/{sha}/statuses",
     )
-    # Build latest per context: process combined (ascending→reverse=newest
-    # first), then fill gaps from all_statuses (already newest-first).
+    # Build latest per context: process combined first because it is Gitea's
+    # authoritative latest view, then fill its capped/missing contexts from the
+    # complete history.  Do not trust the paginated history's response order:
+    # concurrent status writes can move page boundaries and surface an older
+    # pending row before its newer success row.  Status ids are monotonic, so
+    # sorting by id makes enrichment deterministic across page-order races.
     latest: dict[str, dict] = {}
-    for status in reversed(sorted(combined_statuses, key=lambda s: s.get("id") or 0)):
+    for status in sorted(combined_statuses, key=status_numeric_id, reverse=True):
         ctx = status.get("context")
         if isinstance(ctx, str) and ctx not in latest:
             latest[ctx] = status
-    for status in all_statuses:
+    for status in sorted(all_statuses, key=status_numeric_id, reverse=True):
         ctx = status.get("context")
         if isinstance(ctx, str) and ctx not in latest:
             latest[ctx] = status
