@@ -150,6 +150,82 @@ def test_wildcard_with_zero_posted_is_failclosed_no_match():
     assert bad == ["*=no-match"]
 
 
+def test_wildcard_ignores_queues_own_pending_self_status():
+    # #126 self-jam: the `gitea-merge-queue / queue` status the queue itself
+    # posts is `pending` for the whole duration of the run that evaluates the
+    # PR, so under "*" the queue required its OWN in-flight status to be green
+    # and deadlocked — a PR could never merge on the event of its own approval.
+    # With every REAL context green, "*" must now return green DESPITE the
+    # self-status being pending. Uses the (pull_request_review) suffix the live
+    # status actually carries (which _EVENT_SUFFIX_RE deliberately does NOT
+    # strip) to prove the match is event-suffix-insensitive.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path (pull_request)", "status": "success"},
+        {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is True, bad
+    assert bad == []
+
+
+def test_wildcard_still_waits_on_a_real_pending_alongside_self_status():
+    # NEGATIVE CONTROL for the exclusion: it must be specific to the queue's own
+    # status, NOT a blanket "ignore every pending context". A genuinely pending
+    # REAL gate still blocks — and the reported `bad` list names ONLY that real
+    # context, never the (correctly-excluded) self-status. Guards the property,
+    # not the shape: if the fix ever over-reached to drop all pending contexts,
+    # `ok` would flip True here and this fails.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "E2E Chat / E2E Chat (pull_request)", "status": "pending"},
+        {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["E2E Chat / E2E Chat (pull_request)=pending"]
+
+
+def test_wildcard_ignores_a_failed_self_status_too():
+    # The queue job is the gate-RUNNER, not a gate: a FAILED prior queue run
+    # (e.g. a transient API error) must not block the PR it evaluates either —
+    # only pending was observed in #126, but failure is the same class.
+    latest = mq.latest_statuses_by_context([
+        {"context": "CI / all-required (pull_request)", "status": "success"},
+        {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "failure"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is True, bad
+
+
+def test_literal_self_status_requirement_is_still_honored():
+    # The exclusion is GLOB-only. A policy that LITERALLY names the self-status
+    # as a required context still gets a strict presence+success check — proving
+    # the fix removes a self-referential wildcard match, not the context's
+    # gate-ability outright.
+    latest = mq.latest_statuses_by_context([
+        {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(
+        latest, ["gitea-merge-queue / queue (pull_request_review)"]
+    )
+    assert ok is False
+    assert bad == ["gitea-merge-queue / queue (pull_request_review)=pending"]
+
+
+def test_wildcard_with_only_self_status_is_failclosed_no_match():
+    # Degenerate board: the ONLY posted status is the queue's own. After the
+    # exclusion, "*" matches nothing -> fail-closed no-match (never a vacuous
+    # green). A real mergeable PR always has other posted CI, so this only
+    # refuses to bless a board that is blank once the self-status is removed.
+    latest = mq.latest_statuses_by_context([
+        {"context": "gitea-merge-queue / queue (pull_request_review)", "status": "pending"},
+    ])
+    ok, bad = mq.required_contexts_green(latest, ["*"])
+    assert ok is False
+    assert bad == ["*=no-match"]
+
+
 def test_wildcard_plus_literal_dedupes_a_double_flag():
     latest = mq.latest_statuses_by_context([
         {"context": "CI / all-required (pull_request)", "status": "failure"},
