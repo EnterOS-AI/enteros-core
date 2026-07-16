@@ -651,19 +651,26 @@ print(s[:4000])
 }
 
 # create_workspace_post — `POST /workspaces` with a bounded retry over the
-# transient empty-body cold-origin 5xx (RCA'd via core#4307's header capture:
-# Cloudflare returns 503 + Retry-After for ~1-2s after health passes but before
-# the tenant origin accepts writes). Honors the origin's Retry-After. Retries
-# ONLY an empty-body 502/503/504 — a JSON body (real 422/400/… create error) is
-# surfaced on the first try, and a persistent 5xx exhausts the budget and
-# returns the last (empty) body so the caller's id-check fails RED with the full
-# header diagnostic. Every attempt is logged, so a transient that self-heals is
-# still visible and never silently masked.
+# cold-origin write window (RCA'd via core#4307's header capture: Cloudflare
+# returns an empty-body 503 + Retry-After for ~1-2s after health passes but
+# before the tenant origin accepts writes). Honors the origin's Retry-After.
+# Retry policy lives in lib/workspace_create_retry.sh (create_should_retry_cold):
+# retries ONLY an empty-body 503 or a connection reset (curl 000 / no status
+# line) — the two "never reached a handler" signatures. A JSON body (real
+# 422/400/… create error) and 502/504 (maybe-processed → non-idempotent) are
+# surfaced on the FIRST try. A persistent transient exhausts the budget and
+# returns the last body so the caller's id-check fails RED with the full header
+# diagnostic. Every attempt is logged, so a transient that self-heals stays
+# visible and is never silently masked.
+#
+# The attempt budget is small on purpose: the cold window is ~1-2s, so a few
+# ~2s retries cover it while a DETERMINISTIC transient still fails RED in
+# seconds rather than burning a multi-minute budget into a CI job timeout.
 #
 # Args: $1 = human label, $2 = headers dump file (-D target). Remaining args are
 # passed verbatim to `tenant_call POST /workspaces` (payload etc.). Echoes the
 # final response body on stdout; leaves the final response headers in $2.
-CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-6}"
+CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-4}"
 create_workspace_post() {
   local label="$1" hdrs="$2"; shift 2
   local attempt resp id status ra who
@@ -671,6 +678,7 @@ create_workspace_post() {
     : > "$hdrs"
     # --fail-with-body + set -e would abort here on a non-2xx; the existing
     # create sites disarm set -e so curl still writes the body. Same guard.
+    # A connection reset leaves $resp empty and writes no status line to $hdrs.
     set +e
     resp=$(tenant_call POST /workspaces -D "$hdrs" "$@")
     set -e
@@ -680,21 +688,22 @@ create_workspace_post() {
       return 0
     fi
     status=$(create_parse_status "$hdrs")
-    if ! create_is_transient_cold_5xx "$status" "$resp"; then
-      # Real app error (non-empty body) or a non-5xx — surface immediately so
-      # the caller's id-check names it. No retry, no masking.
+    if ! create_should_retry_cold "$status" "$resp"; then
+      # Real app error (non-empty body), a 502/504, or any non-cold status —
+      # surface immediately so the caller's id-check names it. No retry, no
+      # masking, and no re-POST of a possibly-already-processed create.
       printf '%s' "$resp"
       return 0
     fi
     ra=$(create_parse_retry_after "$hdrs")
     who=$(create_parse_server "$hdrs")
     if [ "$attempt" -lt "$CREATE_MAX_ATTEMPTS" ]; then
-      echo "[$(date +%H:%M:%S)] ⏳ $label create attempt $attempt/$CREATE_MAX_ATTEMPTS: empty-body ${status:-?} from '${who:-?}' (cold-origin write window) — honoring Retry-After ${ra}s" >&2
+      echo "[$(date +%H:%M:%S)] ⏳ $label create attempt $attempt/$CREATE_MAX_ATTEMPTS: empty-body ${status:-conn-reset} from '${who:-?}' (cold-origin write window) — honoring Retry-After ${ra}s" >&2
       sleep "$ra"
     fi
   done
-  # Budget exhausted on a persistent transient 5xx — hand the last body back so
-  # the caller fails RED with the header diagnostic. Not masked.
+  # Budget exhausted on a persistent cold-origin transient — hand the last body
+  # back so the caller fails RED with the header diagnostic. Not masked.
   printf '%s' "$resp"
   return 0
 }
