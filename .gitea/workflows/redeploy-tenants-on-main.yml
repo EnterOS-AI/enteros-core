@@ -1,31 +1,30 @@
 name: redeploy-tenants-on-main
 
-# molecules-server rework (2026-07-03): local-Docker production subset.
+# molecules-server rework (2026-07-03): re-enabled + un-EC2'd (production).
 #
 # History: this workflow rolled the production tenant fleet by calling the CP
 # admin endpoint /cp/admin/tenants/redeploy-fleet, which fanned out over AWS
 # SSM to one-tenant-per-EC2 boxes. It was DISABLED 2026-06-27 when the AWS
-# account was closed. Molecules-Server/local Docker is now one supported
-# production provider path, alongside control-plane-managed providers. This
-# workflow sees only containers on its Docker host carrying the production
-# label; it is not an inventory or rollout of the entire production tenant set.
+# account was closed. Production tenants now run as local Docker containers on
+# the molecules-server host (provider='local', the LocalDocker provisioner),
+# so the EC2/SSM path is dead.
 #
-# This rewrite redeploys that labeled local-Docker production subset directly
-# over the host Docker socket — same shape as
-# redeploy-tenants-on-staging.yml, differing only in: the production label
-# filter (molecule.cp-env=production), the moving tag (:latest, not
-# staging-latest), and the PROD_AUTO_DEPLOY_DISABLED kill switch (below).
+# This workflow redeploys the local-docker PRODUCTION fleet by delegating to the
+# ONE shared swap script, scripts/deploy/redeploy-staging-fleet.sh, with the
+# production deltas passed as flags/env (label filter --cp-env production, the
+# moving :latest tag, the shared prod canvas container). It differs from the
+# staging path ONLY in those deltas and in the PROD_AUTO_DEPLOY_DISABLED kill
+# switch (below).
 #
-# CANONICAL ALGORITHM REFERENCE: redeploy-tenants-on-staging.yml. The
-# canary-first / health-gated / self-rolling-back swap logic is intentionally
-# identical in both files — treat the STAGING workflow as the source of truth,
-# make algorithm changes THERE FIRST, then port only the prod-only deltas
-# (label filter / tag / kill switch) here so edits land in the right file.
-#
-# Dropped vs the EC2/SSM era: AWS creds / EC2 DescribeInstances / SSM
-# RunShellCommand / the CP redeploy-fleet call / GHCR sleep / the Infisical
-# CP-admin-token fetch. Added: the docker-host canary-first, health-gated,
-# self-rolling-back tenant swap.
+# CANONICAL ALGORITHM = scripts/deploy/redeploy-staging-fleet.sh (SSOT). This
+# used to inline a hand-copied duplicate of the canary-first / health-gated /
+# self-rolling-back swap; that copy drifted from the staging one and — critically
+# — carried the OLD host-loopback health gate (curl 127.0.0.1:<published-port>),
+# which only works when the runner IS the tenant host. The shared script's gate
+# probes /buildinfo DAEMON-SIDE (a curl sidecar in the tenant netns), so this
+# same workflow works whether it runs on the prod box OR drives the prod daemon
+# remotely over the mesh — the prerequisite for moving deploys off the prod box.
+# Make algorithm changes in the script; this file only wires prod deltas.
 #
 # PROD SAFETY — the auto-trigger is re-enabled per the re-enable request, but a
 # production roll is a side-effecting deploy, so it is HARD-GATED by
@@ -45,6 +44,7 @@ on:
     paths:
       - 'canvas/**'
       - 'workspace-server/**'
+      - 'scripts/deploy/redeploy-staging-fleet.sh'
       - '.gitea/workflows/redeploy-tenants-on-main.yml'
   workflow_dispatch:
 
@@ -52,8 +52,8 @@ permissions:
   contents: read
 
 # Serialize per-branch so two rapid main pushes' redeploys don't overlap and
-# leave the local-Docker subset half-rolled. cancel-in-progress:false — aborting
-# a partial production roll mid-subset is worse than letting it finish (each swap is
+# leave the fleet half-rolled. cancel-in-progress:false — aborting a partial
+# PROD roll mid-fleet is worse than letting it finish (each swap is
 # health-gated + self-rolls-back, so a completed predecessor is always in a
 # good state). Explicit here to match redeploy-tenants-on-staging.yml rather
 # than lean on the Gitea/Actions default.
@@ -69,11 +69,15 @@ env:
   PROD_CANVAS_APP_CONTAINER: ${{ vars.PROD_CANVAS_APP_CONTAINER || '' }}
   CANVAS_APP_IMAGE: ${{ vars.MOLECULE_CANVAS_APP_IMAGE || 'registry.moleculesai.app/molecule-ai/canvas' }}
   DEFAULT_TENANT_TAG: latest
-  DEFAULT_CANVAS_TAG: latest
 
 jobs:
   redeploy:
-    runs-on: docker-host
+    # local-deploy: the robot-2 deploy runner whose DOCKER_HOST is the prod
+    # daemon over the mesh (docker-socket-proxy). The swap runs OFF the prod box
+    # yet acts on the prod tenant fleet; the shared script's health gate is
+    # daemon-side, so it is host-agnostic. (Was docker-host — a runner ON the
+    # prod box — during the drive-deploys-off-the-prod-box migration.)
+    runs-on: local-deploy
     timeout-minutes: 30
     env:
       PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
@@ -89,7 +93,7 @@ jobs:
               # Audit-trail marker so a future operator inspecting the run
               # summary can see WHY it short-circuited (not just an empty run).
               {
-                echo "## Local-Docker production subset redeploy — SKIPPED (frozen)"
+                echo "## Production fleet redeploy — SKIPPED (frozen)"
                 echo ""
                 echo "\`PROD_AUTO_DEPLOY_DISABLED\` is set — production auto-redeploy is frozen; no containers were touched. An operator must unset it to lift the freeze."
               } >> "$GITHUB_STEP_SUMMARY"
@@ -100,190 +104,29 @@ jobs:
               ;;
           esac
 
-      - name: Redeploy labeled local-Docker production tenant subset
+      - name: Checkout (for the shared swap script)
         if: ${{ steps.guard.outputs.skip == '0' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Redeploy local-docker production tenant fleet
+        if: ${{ steps.guard.outputs.skip == '0' }}
+        env:
+          # Roll the shared PRODUCTION canvas app too, if an operator configured
+          # one. The script's shared-canvas roll reads STAGING_CANVAS_APP_CONTAINER
+          # (the generic "which shared-canvas container to roll" knob); pass the
+          # prod container name through it. Empty => the roll is skipped.
+          STAGING_CANVAS_APP_CONTAINER: ${{ env.PROD_CANVAS_APP_CONTAINER }}
         run: |
           set -euo pipefail
-
           TAG="${TARGET_TAG_OVERRIDE:-$DEFAULT_TENANT_TAG}"
-          IMG="${TENANT_IMAGE}:${TAG}"
-          echo "::notice::Production tenant redeploy target image = ${IMG}"
-
-          docker pull "$IMG" || echo "::warning::docker pull $IMG failed; using locally-present image if any"
-          if ! docker image inspect "$IMG" >/dev/null 2>&1; then
-            echo "::error::tenant image $IMG not available locally or in registry"
-            exit 1
-          fi
-
-          # Guard B (candidate-identity): resolve the candidate image's git
-          # revision from its OCI label so the health gate below can assert the
-          # ROLLED container is genuinely running THIS candidate — not a stale
-          # image that a silently-failed swap left behind. Best-effort: an image
-          # with no revision label falls back to liveness-only (logged).
-          EXPECT_REV="$(docker image inspect "$IMG" \
-            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)"
-          EXPECT_REV="$(printf '%s' "$EXPECT_REV" | tr -d '[:space:]')"
-          if [ -n "$EXPECT_REV" ]; then
-            echo "::notice::candidate image revision = ${EXPECT_REV} — the health gate will assert each rolled canary/container reports it via /buildinfo"
-          else
-            echo "::warning::candidate image $IMG carries no org.opencontainers.image.revision label — health gate falls back to LIVENESS-ONLY (cannot verify candidate identity)"
-          fi
-
-          # Enumerate only the running, labeled production tenant containers on
-          # this Docker host. This is not control-plane-wide inventory.
-          mapfile -t TENANTS < <(docker ps \
-            --filter 'label=molecule.local-tenant=1' \
-            --filter 'label=molecule.cp-env=production' \
-            --format '{{.Names}}' | sort)
-
-          if [ ${#TENANTS[@]} -eq 0 ]; then
-            echo "::warning::no running production tenant containers found — nothing to roll"
-          else
-            echo "Labeled local-Docker production tenants to roll (${#TENANTS[@]}): ${TENANTS[*]}"
-          fi
-
-          # readiness gate: was /buildinfo-LIVENESS-ONLY (a container answering 200
-          # tells you nothing about WHICH image it runs). Guard B deepens it to a
-          # CANDIDATE-IDENTITY gate: /buildinfo must not only answer, it must report
-          # the candidate's git_sha (EXPECT_REV). This turns the canary swap into a
-          # real "the candidate is actually running" gate BEFORE this subset fans out
-          # — a swap that silently kept the stale image now REDs the roll instead of
-          # passing a hollow liveness check. This production redeploy is
-          # independent of the staging E2E workflows; those lanes provide separate
-          # evidence and are not an upstream dependency. This job's enforced
-          # controls are its kill switch plus candidate identity and health.
-          health_gate() {
-            local name="$1" port body sha
-            port="$(docker port "$name" 8080/tcp 2>/dev/null | head -1 | sed 's/.*://')"
-            [ -n "$port" ] || return 1
-            for _ in $(seq 1 20); do
-              body="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/buildinfo" 2>/dev/null || true)"
-              if [ -n "$body" ]; then
-                if [ -z "$EXPECT_REV" ]; then
-                  return 0  # liveness-only fallback (no candidate revision to check)
-                fi
-                sha="$(printf '%s' "$body" | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.stdout.write(str(d.get("git_sha","")) if isinstance(d,dict) else "")' 2>/dev/null || true)"
-                case "$EXPECT_REV" in
-                  "$sha"*) return 0 ;;
-                  *) case "$sha" in "$EXPECT_REV"*) return 0 ;; esac ;;
-                esac
-                # answered but wrong image — keep polling briefly (the recreate may
-                # still be finishing), then fail identity below.
-                echo "::warning::$name /buildinfo git_sha='${sha}' != candidate '${EXPECT_REV}' — awaiting candidate"
-              fi
-              sleep 3
-            done
-            return 1
-          }
-
-          swap_tenant() {
-            local name="$1" image="$2"
-            local bak="${name}-redeploy-bak"
-            local net restart envfile
-            net="$(docker inspect "$name" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')"
-            restart="$(docker inspect "$name" --format '{{.HostConfig.RestartPolicy.Name}}')"
-            envfile="$(mktemp)"
-            docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' \
-              | grep -vE '^(PATH|NODE_VERSION|YARN_VERSION)=' > "$envfile"
-            local labelargs=() hostargs=()
-            while IFS= read -r l; do [ -n "$l" ] && labelargs+=( --label "$l" ); done \
-              < <(docker inspect "$name" --format '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{println}}{{end}}' \
-                    | grep -vE '^(org.opencontainers|com.docker)')
-            while IFS= read -r h; do [ -n "$h" ] && hostargs+=( --add-host "$h" ); done \
-              < <(docker inspect "$name" --format '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}')
-
-            docker rename "$name" "$bak"
-            docker stop "$bak" >/dev/null
-
-            if ! docker run -d \
-                  --name "$name" \
-                  --network "$net" \
-                  --restart "${restart:-always}" \
-                  --env-file "$envfile" \
-                  "${labelargs[@]}" "${hostargs[@]}" \
-                  -p 127.0.0.1::8080 \
-                  "$image" >/dev/null 2>/tmp/run.err; then
-              echo "::error::docker run failed for $name:"; cat /tmp/run.err
-              rm -f "$envfile"
-              docker rm -f "$name" 2>/dev/null || true
-              docker rename "$bak" "$name"; docker start "$name" >/dev/null
-              return 1
-            fi
-            rm -f "$envfile"
-
-            if ! health_gate "$name"; then
-              echo "::error::$name failed health gate on $image — rolling back"
-              docker rm -f "$name" 2>/dev/null || true
-              docker rename "$bak" "$name"; docker start "$name" >/dev/null
-              return 1
-            fi
-            docker rm "$bak" >/dev/null 2>&1 || true
-            echo "  ✓ $name rolled to $image"
-            return 0
-          }
-
-          FAILED=0
-          FIRST=1
-          for t in "${TENANTS[@]}"; do
-            if [ "$FIRST" = 1 ]; then
-              echo "== canary: $t =="
-              swap_tenant "$t" "$IMG" || { echo "::error::canary $t failed — aborting local-Docker subset roll"; FAILED=1; break; }
-              FIRST=0
-            else
-              echo "== $t =="
-              swap_tenant "$t" "$IMG" || { FAILED=1; break; }
-            fi
-          done
-
-          # Optional production shared canvas app roll (only when configured).
-          if [ -n "${PROD_CANVAS_APP_CONTAINER}" ] \
-             && docker ps -a --format '{{.Names}}' | grep -qx "${PROD_CANVAS_APP_CONTAINER}"; then
-            CANVAS_TAG="${TARGET_TAG_OVERRIDE:-$DEFAULT_CANVAS_TAG}"
-            CIMG="${CANVAS_APP_IMAGE}:${CANVAS_TAG}"
-            echo "== shared canvas app: ${PROD_CANVAS_APP_CONTAINER} -> ${CIMG} =="
-            docker pull "$CIMG" || echo "::warning::pull $CIMG failed; using local image if present"
-            if docker image inspect "$CIMG" >/dev/null 2>&1; then
-              net="$(docker inspect "${PROD_CANVAS_APP_CONTAINER}" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')"
-              pbind="$(docker inspect "${PROD_CANVAS_APP_CONTAINER}" --format '{{range $p,$b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}}{{end}}{{end}}')"
-              cenv="$(mktemp)"
-              docker inspect "${PROD_CANVAS_APP_CONTAINER}" --format '{{range .Config.Env}}{{println .}}{{end}}' \
-                | grep -vE '^(PATH|NODE_VERSION|YARN_VERSION|NODE_ENV|HOSTNAME|PORT|NEXT_TELEMETRY_DISABLED)=' > "$cenv"
-              docker rename "${PROD_CANVAS_APP_CONTAINER}" "${PROD_CANVAS_APP_CONTAINER}-redeploy-bak"
-              docker stop "${PROD_CANVAS_APP_CONTAINER}-redeploy-bak" >/dev/null
-              if docker run -d --name "${PROD_CANVAS_APP_CONTAINER}" --network "${net:-molecule-net}" \
-                   --restart unless-stopped --env-file "$cenv" \
-                   -p "${pbind:-3100}:3000" "$CIMG" >/dev/null 2>/tmp/cvrun.err; then
-                sleep 5
-                if curl -fsS --max-time 8 "http://127.0.0.1:${pbind:-3100}/" >/dev/null 2>&1; then
-                  docker rm "${PROD_CANVAS_APP_CONTAINER}-redeploy-bak" >/dev/null 2>&1 || true
-                  echo "  ✓ ${PROD_CANVAS_APP_CONTAINER} rolled to ${CIMG}"
-                else
-                  echo "::error::${PROD_CANVAS_APP_CONTAINER} unhealthy after roll — rolling back"
-                  docker rm -f "${PROD_CANVAS_APP_CONTAINER}" 2>/dev/null || true
-                  docker rename "${PROD_CANVAS_APP_CONTAINER}-redeploy-bak" "${PROD_CANVAS_APP_CONTAINER}"
-                  docker start "${PROD_CANVAS_APP_CONTAINER}" >/dev/null
-                  FAILED=1
-                fi
-              else
-                echo "::error::docker run failed for ${PROD_CANVAS_APP_CONTAINER}:"; cat /tmp/cvrun.err
-                docker rm -f "${PROD_CANVAS_APP_CONTAINER}" 2>/dev/null || true
-                docker rename "${PROD_CANVAS_APP_CONTAINER}-redeploy-bak" "${PROD_CANVAS_APP_CONTAINER}"
-                docker start "${PROD_CANVAS_APP_CONTAINER}" >/dev/null
-                FAILED=1
-              fi
-              rm -f "$cenv"
-            fi
-          fi
-
+          echo "::notice::Production tenant redeploy target tag = ${TAG}"
+          # CANVAS_TAG follows the tenant tag so a pinned rollback rolls a matching
+          # canvas; the shared script defaults it to the tenant tag anyway.
+          CANVAS_TAG="$TAG" \
+          bash scripts/deploy/redeploy-staging-fleet.sh --cp-env production --tag "$TAG"
           {
-            echo "## Labeled production subset redeploy (molecules-server / local-Docker)"
+            echo "## Production fleet redeploy (molecules-server / local-docker)"
             echo ""
-            echo "- Tenant image: \`${IMG}\`"
-            echo "- Tenants rolled: ${#TENANTS[@]}"
+            echo "- Target tag: \`${TAG}\`"
+            echo "- Rolled via the shared SSOT swap script (daemon-side health gate)."
           } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$FAILED" != 0 ]; then
-            echo "::error::local-Docker production subset redeploy had at least one failure (see log/summary)"
-            exit 1
-          fi
-          echo "::notice::local-Docker production subset redeploy complete"
