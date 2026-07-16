@@ -5,9 +5,11 @@ name: redeploy-tenants-on-main
 # History: this workflow rolled the production tenant fleet by calling the CP
 # admin endpoint /cp/admin/tenants/redeploy-fleet, which fanned out over AWS
 # SSM to one-tenant-per-EC2 boxes. It was DISABLED 2026-06-27 when the AWS
-# account was closed. Production tenants now run as local Docker containers on
-# the molecules-server host (provider='local', the LocalDocker provisioner),
-# so the EC2/SSM path is dead.
+# account was closed. Molecules-Server / local Docker is now one supported
+# production provider path (provider='local', the LocalDocker provisioner),
+# alongside control-plane-managed providers; the EC2/SSM path is dead. This
+# workflow sees only containers on its Docker host carrying the production
+# label; it is not an inventory or rollout of the entire production tenant set.
 #
 # This workflow redeploys the local-docker PRODUCTION fleet by delegating to the
 # ONE shared swap script, scripts/deploy/redeploy-staging-fleet.sh, with the
@@ -32,6 +34,11 @@ name: redeploy-tenants-on-main
 # deploy-freeze posture) every run short-circuits with a notice and touches
 # nothing — production stays frozen until an operator unsets it. This keeps the
 # plumbing live without auto-rolling prod.
+#
+# This production redeploy is independent of the staging E2E workflows; those
+# lanes provide separate evidence and are not an upstream dependency. This job's
+# enforced controls are its kill switch plus the shared script's candidate-identity
+# and daemon-side health gate.
 #
 # Rollback / pin: set the repo/org var PROD_MANUAL_REDEPLOY_TARGET_TAG to a
 # known-good tag and run via workflow_dispatch; unset it afterward.

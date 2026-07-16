@@ -41,6 +41,7 @@ def write_fake_bin(tmp_path: Path, git_sha: str) -> Path:
                   *Config.Labels*) printf 'molecule.local-tenant=1\\nmolecule.cp-env=staging\\n';;
                   *HostConfig.ExtraHosts*) ;;
                   *Config.Image*) printf 'registry/old:staging-old\\n';;
+                  *State.Running*) printf 'true\\n';;
                   *) printf 'stub-inspect:%s:%s\\n' "$name" "$fmt";;
                 esac
                 exit 0
@@ -48,6 +49,14 @@ def write_fake_bin(tmp_path: Path, git_sha: str) -> Path:
               rename|stop|rm|start) exit 0;;
               run)
                 printf 'new-container-id\\n'
+                exit 0
+                ;;
+              wait)
+                printf '0\\n'
+                exit 0
+                ;;
+              logs)
+                printf '{{"git_sha":"{git_sha}"}}\\n'
                 exit 0
                 ;;
               port)
