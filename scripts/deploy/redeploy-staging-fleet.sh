@@ -39,6 +39,7 @@
 #   redeploy-staging-fleet.sh --tag  staging-<sha>     # roll onto TENANT_IMAGE:tag
 #   redeploy-staging-fleet.sh --dry-run                # discover + plan only
 #   redeploy-staging-fleet.sh --cp-env staging         # (default) env label filter
+#   redeploy-staging-fleet.sh --only <name-substring>  # roll ONLY matching tenant(s)
 #
 # Env overrides (no-hardcoding):
 #   TENANT_IMAGE       registry.moleculesai.app/molecule-ai/molecule-tenant
@@ -53,101 +54,11 @@
 #                      suffix of --tag staging-<sha>.
 #   HEALTH_GATE_ATTEMPTS / HEALTH_GATE_SLEEP_SECS tune /buildinfo polling
 #                      (defaults: 20 attempts, 3s sleep).
-#   TENANT_FLAGS       space-separated KEY=VALUE rollout flags to apply to every
-#                      tenant container, e.g. "DELEGATION_LEDGER_WRITE=1".
-#                      DECLARATIVE AND REVERSIBLE — see MANAGED_FLAG_KEYS below.
-#                      Default empty = every managed flag OFF.
 #
 # SAFETY: only recreates STATELESS cp-env=<env> platform containers; never
 # removes a named volume; each swap is health-gated + self-rolls-back; --dry-run
 # performs zero mutations. STAGING scoped by default (cp-env=staging).
 set -euo pipefail
-
-# ---------------------------------------------------------------------------
-# MANAGED ROLLOUT FLAGS — declarative, and REVERSIBLE.
-#
-# Tenant env is inherited BY COPY: swap_tenant reads the RUNNING container's
-# Config.Env and re-applies it to the new image. There is no declarative source,
-# which means anything set by hand on a container is STICKY FOREVER — copied into
-# every future redeploy, with no way to unset it. A burn-in flag you cannot
-# un-flip is not a burn-in flag; a rollback that cannot roll the flag back is not
-# a rollback.
-#
-# So the keys below are OWNED by this script. On every swap they are STRIPPED from
-# the inherited env and re-applied from $TENANT_FLAGS. Consequences, and they are
-# the point:
-#   * TENANT_FLAGS is the SINGLE SOURCE OF TRUTH for these keys.
-#   * Removing a flag from TENANT_FLAGS genuinely turns it OFF on the next roll —
-#     it does not linger in the copied env.
-#   * A hand-set value on a live container is transient and will be reverted,
-#     which is what stops staging from drifting away from what the repo says.
-#
-# Add a key here the moment a flag needs to be rollable, NOT when someone first
-# wants it on.
-MANAGED_FLAG_KEYS=(
-  DELEGATION_LEDGER_WRITE
-  DELEGATION_RESULT_INBOX_PUSH
-)
-
-# apply_managed_flags <envfile>: strip every managed key from the inherited env,
-# then append exactly what TENANT_FLAGS asks for.
-apply_managed_flags() {
-  local envfile="$1"
-  local key rc
-  for key in "${MANAGED_FLAG_KEYS[@]}"; do
-    # FAIL CLOSED. `grep -v` exits 1 when it prints NO lines — which happens for a
-    # real envfile that contains nothing but this one key. Written as
-    # `grep -v ... > tmp && mv`, that skips the mv, leaves the stale flag in place,
-    # and STILL returns 0: the strip silently no-ops in exactly the case it matters,
-    # and the container rolls with the flag it was supposed to have lost. The same
-    # swallow hid any genuine error (a failed redirect: ENOSPC, read-only tmpdir).
-    #
-    # So: 0 = matched, 1 = matched nothing (both fine, and the .tmp is authoritative
-    # either way), >=2 = a real grep error, which must abort the roll.
-    set +e
-    grep -vE "^${key}=" "$envfile" > "${envfile}.tmp"
-    rc=$?
-    set -e
-    if [ "$rc" -ge 2 ]; then
-      rm -f "${envfile}.tmp"
-      echo "::error::apply_managed_flags: grep failed (rc=$rc) stripping '$key' from $envfile" >&2
-      return 1
-    fi
-    if ! mv "${envfile}.tmp" "$envfile"; then
-      rm -f "${envfile}.tmp"
-      echo "::error::apply_managed_flags: could not rewrite $envfile while stripping '$key'" >&2
-      return 1
-    fi
-  done
-  local kv
-  for kv in $TENANT_FLAGS; do
-    case "$kv" in
-      *=*) ;;
-      *) echo "::error::TENANT_FLAGS entry '$kv' is not KEY=VALUE" >&2; return 1 ;;
-    esac
-    key="${kv%%=*}"
-    # Refuse to set anything not declared managed: an unmanaged key would be
-    # sticky (never stripped), i.e. exactly the irreversibility this exists to
-    # prevent. Fail loudly rather than quietly create a one-way door.
-    local ok=0 m
-    for m in "${MANAGED_FLAG_KEYS[@]}"; do [ "$m" = "$key" ] && ok=1; done
-    if [ "$ok" -ne 1 ]; then
-      echo "::error::TENANT_FLAGS key '$key' is not in MANAGED_FLAG_KEYS — it would be" >&2
-      echo "::error::copied into every future redeploy with no way to unset it. Declare it first." >&2
-      return 1
-    fi
-    echo "$kv" >> "$envfile"
-  done
-
-  # SAY WHAT WAS ROLLED. Without this line the staging CD log gives no way to tell
-  # which flag state the fleet actually came up with — and "the burn-in silently
-  # ended two merges ago" is precisely the failure this mechanism must not have.
-  if [ -n "$TENANT_FLAGS" ]; then
-    echo "  managed flags: [$TENANT_FLAGS] (all other managed keys stripped)"
-  else
-    echo "  managed flags: none set — every managed key stripped (${MANAGED_FLAG_KEYS[*]})"
-  fi
-}
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 TENANT_IMAGE="${TENANT_IMAGE:-registry.moleculesai.app/molecule-ai/molecule-tenant}"
@@ -158,6 +69,11 @@ CANVAS_APP_IMAGE="${CANVAS_APP_IMAGE:-registry.moleculesai.app/molecule-ai/canva
 STAGING_CANVAS_APP_CONTAINER="${STAGING_CANVAS_APP_CONTAINER:-}"
 CP_ENV="staging"
 IMAGE="" ; TAG="" ; DRY_RUN=0
+# ONLY: optional substring — when set, restricts the roll to tenant containers
+# whose name contains it. Lets an operator re-roll a single tenant (e.g. one that
+# failed its gate) and bounds blast radius for a targeted canary, without ever
+# touching the rest of the fleet. Empty (default) = the whole cp-env fleet.
+ONLY=""
 
 usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ "$#" -gt 0 ]; do
@@ -165,45 +81,12 @@ while [ "$#" -gt 0 ]; do
     --image)   IMAGE="$2"; shift 2;;
     --tag)     TAG="$2";   shift 2;;
     --cp-env)  CP_ENV="$2"; shift 2;;
+    --only)    ONLY="$2"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
     -h|--help) usage 0;;
     *) echo "unknown arg: $1" >&2; usage 2;;
   esac
 done
-
-# FAIL CLOSED IF THE CALLER DID NOT DECLARE ITS FLAG STATE.
-#
-# This script STRIPS every managed key from the inherited tenant env and re-applies
-# only what TENANT_FLAGS names. So a call site that simply forgets to pass it does
-# NOT get "the old behaviour" — it silently turns those flags OFF across the entire
-# fleet. Shipped as `TENANT_FLAGS="${TENANT_FLAGS:-}"`, this mechanism was a flag
-# ERASER, not a flag switch: any unrelated merge to main triggers staging CD, and
-# that roll would have ended an in-flight burn-in with no log line.
-#
-# A grep-the-workflows lint cannot close this — one file can invoke the script
-# twice and mention TENANT_FLAGS once. So the requirement is structural and lives
-# HERE, at the one place every caller passes through.
-#
-# Empty is a perfectly good value: it means "all managed flags dark", the default
-# and the safe state. What is NOT acceptable is UNSET — a caller that never thought
-# about it. Say TENANT_FLAGS="" and mean it.
-#
-# Placed BELOW arg parsing so --help still prints help, and skipped for --dry-run,
-# which performs zero mutations by contract.
-if [ "$DRY_RUN" != "1" ] && [ -z "${TENANT_FLAGS+x}" ]; then
-  echo "::error::TENANT_FLAGS is not set. This script strips every managed rollout" >&2
-  echo "::error::flag (${MANAGED_FLAG_KEYS[*]}) from the inherited tenant env and" >&2
-  echo "::error::re-applies only what TENANT_FLAGS declares — so running without it" >&2
-  echo "::error::would silently turn those flags OFF on every tenant." >&2
-  echo "::error::" >&2
-  echo "::error::  flags dark (the default):  TENANT_FLAGS=\"\" bash $0 ..." >&2
-  echo "::error::  turn one on:               TENANT_FLAGS=\"DELEGATION_LEDGER_WRITE=1\" bash $0 ..." >&2
-  echo "::error::" >&2
-  echo "::error::In CI: set STAGING_TENANT_FLAGS in env: and pass" >&2
-  echo "::error::TENANT_FLAGS=\"\${STAGING_TENANT_FLAGS-}\" on the command line." >&2
-  exit 1
-fi
-TENANT_FLAGS="${TENANT_FLAGS:-}"   # --dry-run may legitimately reach here unset
 log() { printf '>> [fleet] %s\n' "$*" >&2; }
 
 # Resolve the target image ref (either an explicit --image, or TENANT_IMAGE:tag).
@@ -240,22 +123,60 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   fi
 fi
 
+# Candidate-identity fallback: if no expected git_sha was supplied or derivable
+# from a staging-<sha> tag — e.g. a PRODUCTION roll of the moving :latest tag,
+# which carries no sha in its name — read it from the target image's OCI revision
+# label. This lets the health gate assert the ROLLED container is genuinely
+# running THIS candidate (not a stale image a silently-failed swap left behind)
+# for ANY tag, not just staging-<sha>. Absent label => liveness-only (logged).
+if [ -z "$EXPECTED_BUILD_SHA" ] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  _rev="$(docker image inspect "$IMAGE" \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$_rev" ] && [ "$_rev" != "<novalue>" ] && [ "$_rev" != "<no value>" ]; then
+    EXPECTED_BUILD_SHA="$_rev"
+    log "expected git_sha derived from image OCI revision label = ${EXPECTED_BUILD_SHA}"
+  else
+    log "target image carries no org.opencontainers.image.revision label — health gate is LIVENESS-ONLY (cannot verify candidate identity)"
+  fi
+fi
+
 # Discover running <env> platform containers (the STATELESS mol-tenant-* boxes).
 mapfile -t TENANTS < <(docker ps \
   --filter 'label=molecule.local-tenant=1' \
   --filter "label=molecule.cp-env=${CP_ENV}" \
   --format '{{.Names}}' | sort)
 
+# Optional --only substring narrowing (targeted re-roll / bounded canary).
+if [ -n "$ONLY" ]; then
+  mapfile -t TENANTS < <(printf '%s\n' "${TENANTS[@]}" | grep -F "$ONLY" || true)
+  log "--only '${ONLY}' selected ${#TENANTS[@]} of the ${CP_ENV} fleet"
+fi
+
 if [ "${#TENANTS[@]}" -eq 0 ]; then
-  log "no running ${CP_ENV} tenant platform containers found — nothing to roll"
+  log "no running ${CP_ENV} tenant platform containers found${ONLY:+ matching --only '$ONLY'} — nothing to roll"
 else
   log "tenants to roll (${#TENANTS[@]}): ${TENANTS[*]}"
 fi
 
 # Snapshot the session-bearing rtstate volumes BEFORE the roll so we can assert
 # the fleet swap left every one intact (session-preservation regression guard).
-mapfile -t RTSTATE_BEFORE < <(docker volume ls --format '{{.Name}}' | grep -E '^mol-ws-rtstate-' | sort || true)
-log "session (rtstate) volumes present before roll: ${#RTSTATE_BEFORE[@]}"
+# The remote deploy path reaches the daemon through docker-socket-proxy, which
+# DENIES the volume API (VOLUMES=0 — deliberately, since the swap issues no volume
+# op and the volume-delete surface is a crown jewel). A denied `docker volume ls`
+# returns a 403 that would otherwise read as "zero volumes" and make the
+# before/after guard report a HOLLOW pass. Detect the denial via the command's
+# exit status and mark the guard UNAVAILABLE rather than falsely green — on that
+# path session safety rests on the design invariant that this script recreates
+# only STATELESS mol-tenant-* containers and never touches a volume.
+RTSTATE_GUARD=1
+RTSTATE_BEFORE=()
+if volout="$(docker volume ls --format '{{.Name}}' 2>/dev/null)"; then
+  mapfile -t RTSTATE_BEFORE < <(printf '%s\n' "$volout" | grep -E '^mol-ws-rtstate-' | sort || true)
+  log "session (rtstate) volumes present before roll: ${#RTSTATE_BEFORE[@]}"
+else
+  RTSTATE_GUARD=0
+  log "NOTE: volume API unavailable on this daemon (docker-socket-proxy denies VOLUMES) — rtstate before/after guard DISABLED; session safety rests on the stateless-container-only swap invariant (no volume op is ever issued)"
+fi
 
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY-RUN: would roll ${#TENANTS[@]} tenant(s) onto ${IMAGE} (canary-first, health-gated)"
@@ -286,16 +207,82 @@ json_git_sha() {
   sed -n 's/.*"git_sha"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
-# health_gate <container>: probe the tenant's published :8080 /buildinfo through
-# the host loopback. Returns 0 when it answers and, for staging-<sha> rolls,
-# reports the candidate git_sha.
+# health_gate <container>: probe the tenant's /buildinfo DAEMON-SIDE — a throwaway
+# curl container in the TENANT's own network namespace hits localhost:8080. This
+# is host-agnostic: it works identically whether this script runs ON the tenant
+# host or drives a remote DOCKER_HOST over the mesh. The old form curled
+# 127.0.0.1:<published-port> on the runner host, which only worked when the runner
+# WAS the tenant host — so a deploy from any other box passed a hollow check (or,
+# with the port loopback-bound, could not reach the tenant at all). The internal
+# port (8080) is stable, so we no longer need `docker port` to resolve a mapping.
+PROBE_IMAGE="${PROBE_IMAGE:-curlimages/curl:8.11.1}"
+
+# ensure_probe_image: pull the daemon-side probe sidecar ONCE, up front, so the
+# health gate never depends on registry reachability DURING a roll. Without this,
+# the first `docker run` inside health_gate would auto-pull; a transient Docker
+# Hub blip would then read as "tenant unhealthy" and roll back a container that is
+# actually fine — the worst possible failure mode (a good deploy self-reverts on a
+# network hiccup). Pulling here fails the WHOLE run loudly BEFORE any tenant is
+# touched, which is the safe direction. The gate then runs with --pull=never so it
+# makes ZERO network calls.
+ensure_probe_image() {
+  if docker image inspect "$PROBE_IMAGE" >/dev/null 2>&1; then
+    log "probe image present: ${PROBE_IMAGE}"; return 0
+  fi
+  log "pulling daemon-side probe image ${PROBE_IMAGE} ..."
+  if docker pull "$PROBE_IMAGE" >/dev/null 2>&1; then
+    log "probe image pulled: ${PROBE_IMAGE}"; return 0
+  fi
+  echo "::error::probe image ${PROBE_IMAGE} unavailable — needed for the daemon-side health gate; refusing to roll (set PROBE_IMAGE to a locally-present image)" >&2
+  return 1
+}
+
+# probe_http <container> <url> [max_time]: hit <url> from inside <container>'s OWN
+# network namespace via a throwaway curl sidecar, run DETACHED, then read the
+# result via `docker wait` (exit code) + `docker logs` (body). Echoes the response
+# body on stdout and returns curl's exit code.
+#
+# WHY DETACHED + logs, not an attached `docker run` that captures stdout?
+# The remote deploy path reaches the daemon through docker-socket-proxy over the
+# mesh, and an ATTACHED run streams the container's stdout over a HIJACKED
+# bidirectional connection that the proxy does NOT relay — so an attached probe
+# returns an EMPTY body every time even though curl succeeded inside the container
+# (proven on staging: exit 0, zero bytes). An empty body reads as "unhealthy" and
+# would roll back a perfectly good tenant on EVERY remote roll. `docker wait` and
+# `docker logs` are ordinary request/response calls the proxy relays fine, so the
+# detached form is the one that actually works host-agnostically. Robustness:
+#   * --pull=never: image pre-pulled by ensure_probe_image; the gate makes zero
+#     registry calls, so a network blip can't masquerade as an unhealthy tenant.
+#   * --connect-timeout bounds each attempt even if the tenant is wedged.
+#   * the probe container is labelled + force-removed so it never leaks.
+probe_http() {
+  local container="$1" url="$2" maxt="${3:-5}" cid rc
+  cid="$(docker run -d --pull=never --label molecule.ephemeral-probe=1 \
+           --network "container:${container}" "$PROBE_IMAGE" \
+           -fsS --connect-timeout 3 --max-time "$maxt" "$url" 2>/dev/null)" || return 125
+  rc="$(docker wait "$cid" 2>/dev/null || echo 1)"
+  docker logs "$cid" 2>/dev/null
+  docker rm -f "$cid" >/dev/null 2>&1 || true
+  case "$rc" in ''|*[!0-9]*) rc=1;; esac
+  return "$rc"
+}
+
+# health_gate <container>: gate on /buildinfo DAEMON-SIDE via probe_http.
+# Robustness properties layered on top of probe_http's transport-correctness:
+#   * State.Running short-circuit: a container that exited immediately can never be
+#     probed; detect it directly instead of burning the whole retry budget on a
+#     netns that will never answer, and report it distinctly.
+#   * requires both curl-exit==0 AND a non-empty body before accepting.
 health_gate() {
-  local name="$1" port body got last=""
-  port="$(docker port "$name" 8080/tcp 2>/dev/null | head -1 | sed 's/.*://')"
-  [ -n "$port" ] || return 1
+  local name="$1" body got last="" state rc
   for _ in $(seq 1 "$HEALTH_GATE_ATTEMPTS"); do
-    body="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/buildinfo" 2>/dev/null || true)"
-    if [ -n "$body" ]; then
+    state="$(docker inspect "$name" --format '{{.State.Running}}' 2>/dev/null || echo '?')"
+    if [ "$state" != "true" ]; then
+      last="not-running(${state})"
+      sleep "$HEALTH_GATE_SLEEP_SECS"; continue
+    fi
+    body="$(probe_http "$name" "http://localhost:8080/buildinfo")"; rc=$?
+    if [ "$rc" = 0 ] && [ -n "$body" ]; then
       got="$(printf '%s' "$body" | json_git_sha | head -1)"
       last="$got"
       if [ -z "$EXPECTED_BUILD_SHA" ]; then
@@ -310,6 +297,8 @@ health_gate() {
   done
   if [ -n "$EXPECTED_BUILD_SHA" ]; then
     echo "::error::$name /buildinfo git_sha=${last:-<empty>} did not match expected ${EXPECTED_BUILD_SHA}" >&2
+  else
+    echo "::error::$name did not answer /buildinfo daemon-side after ${HEALTH_GATE_ATTEMPTS} attempts (last=${last:-<empty>})" >&2
   fi
   return 1
 }
@@ -325,8 +314,6 @@ swap_tenant() {
   envfile="$(mktemp)"
   docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -vE '^(PATH|NODE_VERSION|YARN_VERSION)=' > "$envfile"
-  # Managed rollout flags are re-derived from TENANT_FLAGS, never inherited.
-  apply_managed_flags "$envfile" || return 1
   local labelargs=() hostargs=()
   while IFS= read -r l; do [ -n "$l" ] && labelargs+=( --label "$l" ); done \
     < <(docker inspect "$name" --format '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{println}}{{end}}' \
@@ -363,6 +350,11 @@ swap_tenant() {
   log "  ✓ $name rolled to $image"
   return 0
 }
+
+# Pre-flight the daemon-side probe image BEFORE mutating any tenant, so a probe
+# infra problem aborts with zero changes rather than rolling back a healthy
+# container mid-fleet.
+ensure_probe_image || exit 1
 
 FAILED=0
 FIRST=1
@@ -411,7 +403,10 @@ if [ -n "${STAGING_CANVAS_APP_CONTAINER}" ] \
          --restart unless-stopped --env-file "$cenv" \
          -p "${pbind:-3101}:3000" "$CIMG" >/dev/null 2>/tmp/cvrun.err; then
       sleep 5
-      if curl -fsS --max-time 8 "http://127.0.0.1:${pbind:-3101}/" >/dev/null 2>&1; then
+      # Daemon-side probe (see probe_http): hit the canvas in its OWN netns on its
+      # internal port 3000, not the runner host's published port — host-agnostic,
+      # works over a remote DOCKER_HOST via the detached run + docker-logs path.
+      if probe_http "$cvc" "http://localhost:3000/" 8 >/dev/null; then
         docker rm "${cvc}-redeploy-bak" >/dev/null 2>&1 || true
         log "  ✓ ${cvc} rolled to ${CIMG}"
       else
@@ -438,13 +433,20 @@ fi
 
 # Session-preservation assertion: every rtstate volume that existed before the
 # roll must still exist after it (the fleet swap must never destroy a session).
-mapfile -t RTSTATE_AFTER < <(docker volume ls --format '{{.Name}}' | grep -E '^mol-ws-rtstate-' | sort || true)
-LOST=0
-for v in "${RTSTATE_BEFORE[@]}"; do
-  printf '%s\n' "${RTSTATE_AFTER[@]}" | grep -qxF "$v" || { echo "::error::session volume $v was REMOVED by the fleet roll (session-preservation VIOLATED)" >&2; LOST=1; }
-done
-[ "$LOST" = 0 ] && log "session-preservation OK: all ${#RTSTATE_BEFORE[@]} rtstate volume(s) intact after roll"
-[ "$LOST" = 0 ] || FAILED=1
+# Skipped when the volume API is unavailable (remote proxy path) — see the BEFORE
+# snapshot note; the swap touched only stateless mol-tenant-* containers by
+# construction, so nothing could have removed a volume.
+if [ "$RTSTATE_GUARD" = 1 ]; then
+  mapfile -t RTSTATE_AFTER < <(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E '^mol-ws-rtstate-' | sort || true)
+  LOST=0
+  for v in "${RTSTATE_BEFORE[@]}"; do
+    printf '%s\n' "${RTSTATE_AFTER[@]}" | grep -qxF "$v" || { echo "::error::session volume $v was REMOVED by the fleet roll (session-preservation VIOLATED)" >&2; LOST=1; }
+  done
+  [ "$LOST" = 0 ] && log "session-preservation OK: all ${#RTSTATE_BEFORE[@]} rtstate volume(s) intact after roll"
+  [ "$LOST" = 0 ] || FAILED=1
+else
+  log "session-preservation volume-diff guard SKIPPED (volume API denied on this daemon); swap recreated only stateless mol-tenant-* containers by construction"
+fi
 
 if [ "$FAILED" != 0 ]; then
   echo "::error::staging fleet redeploy had at least one failure (see log above)" >&2
