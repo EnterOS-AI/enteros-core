@@ -108,9 +108,20 @@ const (
 	WorkspaceKindPlatform = "platform"
 
 	// alpineImage is the digest-pinned alpine image used for throwaway
-	// containers that read/write volumes or migrate data.  Pinning prevents
+	// containers that read/write volumes or migrate data. Pinning prevents
 	// supply-chain drift / compromised-tag attacks (core#2545).
-	// Matches workspace-server/Dockerfile FROM alpine:3.20@sha256:...
+	//
+	// KNOWN SINGLE-ARCH (amd64; runs under Rosetta/QEMU on arm64 hosts). Do
+	// not re-pin to Hub's multi-arch index (tried, reverted in PR #4455): a
+	// new digest exists in no runner cache, and the ephemeral-CP lane's fresh
+	// dind must not pull from Hub anonymously — nor can it be pre-seeded,
+	// because `docker save | docker load` drops RepoDigests. Durable fix:
+	// host a multi-arch index on registry.moleculesai.app (buildx imagetools
+	// create) and re-pin to that.
+	//
+	// Deliberately differs from workspace-server/Dockerfile's base digest
+	// (single-arch mirror re-pin). The CI pre-pull in
+	// .gitea/workflows/local-provision-e2e.yml must match this constant.
 	alpineImageDefault = "alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e"
 )
 

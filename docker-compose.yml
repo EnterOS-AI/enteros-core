@@ -4,23 +4,38 @@ include:
 
 services:
   # --- Observability ---
-  # digest-pinned 2026-05-10 (sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d, linux/amd64)
+  # Digest pins in this file are MULTI-ARCH manifest-list digests (amd64+arm64),
+  # never platform-specific image digests — see the note in
+  # docker-compose.infra.yml for the refresh procedure.
+  #
+  # This service is the ONE definition of the Langfuse web app: dev-start.sh
+  # brings it up via `docker compose up -d langfuse` (dynamic port + generated
+  # keys arrive via the exported env), and a plain `docker compose up` gets it
+  # with the defaults below.
   langfuse:
-    image: langfuse/langfuse@sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d
+    image: langfuse/langfuse:2.95.11@sha256:85c278dcab96c15db94191a5c1664f85aba2d7fb6771a00e99681c902c4b7015
     depends_on:
       langfuse-clickhouse:
         condition: service_healthy
       langfuse-db-init:
         condition: service_completed_successfully
     environment:
+      # Next.js standalone binds the interface named by HOSTNAME; without this
+      # it binds only the container-hostname eth0 address and nothing listens
+      # on loopback (same fix as canvas/Dockerfile).
+      HOSTNAME: "0.0.0.0"
       DATABASE_URL: postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@postgres:5432/langfuse
       # Langfuse v2 expects the HTTP interface (port 8123). The previous
       # clickhouse://...:9000 native-protocol URL is rejected with
       # "ClickHouse URL protocol must be either http or https".
       CLICKHOUSE_URL: http://langfuse-clickhouse:8123
-      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      # Credentials embedded: the bundled migrate binary reads only the URL,
+      # not CLICKHOUSE_USER/PASSWORD. Password default mirrors
+      # docker-compose.infra.yml's langfuse-clickhouse service — the two MUST
+      # stay in lockstep or migrations fail auth.
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse:${CLICKHOUSE_PASSWORD:-langfuse-dev}@langfuse-clickhouse:9000
       CLICKHOUSE_USER: langfuse
-      CLICKHOUSE_PASSWORD: langfuse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-langfuse-dev}
       NEXTAUTH_SECRET: ${LANGFUSE_SECRET:-changeme-langfuse-secret}
       NEXTAUTH_URL: ${LANGFUSE_HOST:-http://127.0.0.1:3001}
       SALT: ${LANGFUSE_SALT:-changeme-langfuse-salt}
@@ -41,9 +56,14 @@ services:
     ports:
       - "127.0.0.1:${MOLECULE_LANGFUSE_HOST_PORT:-3001}:3000"
     networks:
-      - molecule-core-net
+      molecule-core-net:
+        # Workspace agents resolve the trace endpoint as langfuse-web.
+        aliases:
+          - langfuse-web
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/public/health || exit 1"]
+      # 127.0.0.1, not localhost: busybox wget resolves localhost to [::1]
+      # first, and the app (bound 0.0.0.0 via HOSTNAME above) is IPv4-only.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/api/public/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -265,10 +285,13 @@ services:
   # And use model names from infra/litellm_config.yml (e.g. "claude-opus-4-5",
   # "gpt-4o", "openrouter/deepseek-r1", "ollama/llama3.2").
   # Edit infra/litellm_config.yml to add/remove providers and models.
-  # digest-pinned 2026-05-10 (sha256:7c311546c25e7bb6e8cafede9fcd3d0d622ac636b5c9418befaa32e85dfb0186)
-  # Refresh: curl -sI https://ghcr.io/v2/berriai/litellm/manifests/main-latest (Docker-Content-Digest header)
+  # Re-pinned 2026-07-17: the 2026-05-10 pin used a wrong repo path
+  # (berriai/litellm/main-latest) and its digest had been garbage-collected
+  # upstream — unpullable on any fresh machine. main-latest is a moving tag, so
+  # this digest is a newer litellm than the old pin; refresh deliberately with:
+  # docker buildx imagetools inspect ghcr.io/berriai/litellm:main-latest
   litellm:
-    image: ghcr.io/berriai/litellm/main-latest@sha256:7c311546c25e7bb6e8cafede9fcd3d0d622ac636b5c9418befaa32e85dfb0186
+    image: ghcr.io/berriai/litellm:main-latest@sha256:177c71b596e3290798adec693528a4ed043fe47dbe219f5f71d2bc3750c85061
     profiles:
       - multi-provider
     ports:
@@ -299,10 +322,11 @@ services:
   #   docker compose exec ollama ollama pull qwen2.5-coder:7b
   # Then set MODEL_PROVIDER=ollama:llama3.2 in your workspace config.yaml
   # Workspace agents reach Ollama at http://ollama:11434 (internal Docker network).
-  # digest-pinned 2026-05-10 (sha256:90bd8ed1ad1853fbfb1ef5835f9d7a24fe890e05ace521e2d8d7a6f56bb667dd, linux/amd64)
-  # Refresh: curl -s https://hub.docker.com/v2/repositories/ollama/ollama/tags/latest | python3 -c "import json,sys; ..."
+  # Re-pinned 2026-07-17 (old pin was amd64-only). latest is a moving tag, so
+  # this is a newer ollama than the old pin; refresh deliberately with:
+  # docker buildx imagetools inspect ollama/ollama:latest
   ollama:
-    image: ollama/ollama@sha256:90bd8ed1ad1853fbfb1ef5835f9d7a24fe890e05ace521e2d8d7a6f56bb667dd
+    image: ollama/ollama:latest@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0
     profiles:
       - local-models
     ports:
