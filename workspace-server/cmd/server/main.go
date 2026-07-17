@@ -271,6 +271,25 @@ func main() {
 		if p, err := provisioner.New(); err != nil {
 			log.Printf("Provisioner disabled (Docker not available): %v", err)
 		} else {
+			// Provisioning-phase boot telemetry → BOOT_STEP broadcasts, as
+			// step 1 of the boot family ("Provision compute" — the one step
+			// the runtime can never emit because it is not running yet; see
+			// events.EventBootStep). The runtime's own steps take the family
+			// over once the container is up. Without this the canvas
+			// watchdog is silent for the whole provisioning phase — a
+			// first-boot local image build is 5+ minutes of "waiting for
+			// boot telemetry" that reads as a hang.
+			p.SetBootStepEmitter(func(workspaceID, status, message string) {
+				broadcaster.BroadcastOnly(workspaceID, string(events.EventBootStep), map[string]interface{}{
+					"workspace_id": workspaceID,
+					"step":         1,
+					"total":        8,
+					"key":          "PWR",
+					"label":        "Provision compute",
+					"status":       status,
+					"message":      message,
+				})
+			})
 			prov = p
 			defer prov.Close()
 			log.Println("Provisioner: Docker")

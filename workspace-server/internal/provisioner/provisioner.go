@@ -308,6 +308,67 @@ type Provisioner struct {
 	// paths — and on a registry-unreachable host would turn each call into a
 	// per-call pull-timeout instead of a single one.
 	alpineEnsureOnce sync.Once
+	// bootStep, when set (SetBootStepEmitter), streams provisioning-phase
+	// boot telemetry (status ∈ running|ok|failed + a human message) for a
+	// workspace. The wiring in cmd/server turns these into BOOT_STEP
+	// broadcasts (step 1, "Provision compute" — the one step of the boot
+	// family the runtime can never emit because it is not running yet).
+	// Without this the canvas watchdog shows "waiting for boot telemetry"
+	// for the entire provisioning phase — on a first local-build boot that
+	// is 5+ silent minutes that read as a hang. nil = no-op.
+	bootStep func(workspaceID, status, message string)
+}
+
+// SetBootStepEmitter wires provisioning-phase boot telemetry (see the
+// bootStep field). Call before the first Start; not synchronized.
+func (p *Provisioner) SetBootStepEmitter(fn func(workspaceID, status, message string)) {
+	p.bootStep = fn
+}
+
+func (p *Provisioner) emitBootStep(workspaceID, status, message string) {
+	if p != nil && p.bootStep != nil {
+		p.bootStep(workspaceID, status, message)
+	}
+}
+
+// buildHeartbeatInterval paces the "still building" telemetry during a
+// local image build. Package-level so the unit test can shrink it.
+var buildHeartbeatInterval = 20 * time.Second
+
+// buildLocalImageWithTelemetry wraps the local-build seam with boot
+// telemetry: an immediate "building" line, a heartbeat while the docker
+// build runs (first boot builds take minutes with no other signal), and a
+// completion line. Cache hits (fast returns) report reuse instead.
+func (p *Provisioner) buildLocalImageWithTelemetry(ctx context.Context, workspaceID, runtime string) (string, error) {
+	p.emitBootStep(workspaceID, "running",
+		fmt.Sprintf("building %s runtime image from template — a first boot can take several minutes", runtime))
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(buildHeartbeatInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				p.emitBootStep(workspaceID, "running",
+					fmt.Sprintf("still building %s runtime image — %s elapsed", runtime, time.Since(start).Round(time.Second)))
+			}
+		}
+	}()
+	tag, err := ensureLocalImageHook(ctx, runtime)
+	close(done)
+	if err != nil {
+		return "", err
+	}
+	if elapsed := time.Since(start); elapsed < 3*time.Second {
+		p.emitBootStep(workspaceID, "running", fmt.Sprintf("runtime image already built — reusing %s", tag))
+	} else {
+		p.emitBootStep(workspaceID, "running",
+			fmt.Sprintf("runtime image ready in %s", time.Since(start).Round(time.Second)))
+	}
+	return tag, nil
 }
 
 // New creates a new Provisioner connected to the local Docker daemon.
@@ -681,6 +742,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	if p == nil || p.cli == nil {
 		return "", ErrNoBackend
 	}
+	p.emitBootStep(cfg.WorkspaceID, "running", "provisioning compute (docker)")
 	name := ContainerName(cfg.WorkspaceID)
 	// KI-013 deploy safety: prefer legacy truncated config volume if it
 	// already exists, so pre-deploy workspace data is not orphaned.
@@ -739,7 +801,7 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	// the operator chose explicitly.
 	if cfg.Image == "" && cfg.Runtime != "" {
 		if src := Resolve(); src.Mode == RegistryModeLocal {
-			builtTag, buildErr := ensureLocalImageHook(ctx, cfg.Runtime)
+			builtTag, buildErr := p.buildLocalImageWithTelemetry(ctx, cfg.WorkspaceID, cfg.Runtime)
 			if buildErr != nil {
 				return "", fmt.Errorf("local-build mode: ensure image for runtime %q: %w", cfg.Runtime, buildErr)
 			}
@@ -944,6 +1006,10 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 	}
 
 	log.Printf("Provisioner: started container %s for workspace %s at %s (advertise: %s, internal: %s)", name, cfg.WorkspaceID, hostURL, advertiseURL, InternalURL(cfg.WorkspaceID))
+	// status stays "running", not "ok": the runtime's own boot steps take the
+	// family over from here, and a green tile before the runtime is actually
+	// online would overstate progress if the container dies on entrypoint.
+	p.emitBootStep(cfg.WorkspaceID, "running", "compute ready — runtime starting")
 	return hostURL, nil
 }
 
