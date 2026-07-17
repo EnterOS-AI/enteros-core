@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -721,15 +722,120 @@ func tenantCreateWorkspaceWithRuntime(t *testing.T, cfg stagingCfg, host, token,
 		`{"name":%q,"runtime":%q,"tier":%d,"model":%q,"provider":%q}`,
 		name, runtime, 1, model, "platform",
 	)
-	status, resp := doTenantJSON(t, "POST", url, token, orgID, body)
-	if status != http.StatusCreated && status != http.StatusOK {
-		t.Fatalf("tenant workspace create (runtime=%s model=%s): HTTP %d: %s", runtime, model, status, resp)
+	// Cold-origin 503 retry (#91, RCA run 527280): the create POST intermittently
+	// returns an EMPTY-body 503 in the ~1-2s Cloudflare cold-origin window right
+	// after /health went green — the request never reached the ws-server handler.
+	// Retry ONLY that "never reached a handler" signature (empty-body 503 or a
+	// transport error surfaced as status 0), honoring the origin's Retry-After.
+	// A non-empty body, or a 502/504 (a non-idempotent POST that may already have
+	// been processed), is surfaced on the first try — never re-POSTed. This
+	// mirrors the shell (tests/e2e/lib/workspace_create_retry.sh) and TS
+	// (canvas workspaceCreateRetry.ts) classifiers so all three create seams
+	// share ONE non-masking rule.
+	const maxAttempts = 4
+	var status int
+	var resp string
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var retryAfter string
+		status, resp, retryAfter = doTenantCreateOnce(t, url, token, orgID, body)
+		if status == http.StatusCreated || status == http.StatusOK {
+			id := jsonField(resp, "id")
+			if id == "" {
+				t.Fatalf("tenant workspace create: no id in response: %s", resp)
+			}
+			return id
+		}
+		if coldCreateShouldRetry(status, resp) && attempt < maxAttempts {
+			delay := parseColdRetryAfter(retryAfter)
+			t.Logf("tenant workspace create (runtime=%s model=%s): cold-origin retryable HTTP %d (empty body), attempt %d/%d — sleeping %ds (Retry-After=%q) [#91]",
+				runtime, model, status, attempt, maxAttempts, delay, retryAfter)
+			time.Sleep(time.Duration(delay) * time.Second)
+			continue
+		}
+		break
 	}
-	id := jsonField(resp, "id")
-	if id == "" {
-		t.Fatalf("tenant workspace create: no id in response: %s", resp)
+	t.Fatalf("tenant workspace create (runtime=%s model=%s): HTTP %d: %s", runtime, model, status, resp)
+	return ""
+}
+
+// doTenantCreateOnce issues the SAME tenant create request as doTenantJSON (the
+// three SaaS-auth headers + Content-Type, the same 90s client) but RETURNS the
+// Retry-After header and, on a transport error, status=0 with empty body so the
+// caller's retry loop — not this helper — decides. It deliberately does NOT
+// t.Fatalf on a transport error: a connection reset / never-established socket
+// in the cold-origin window is exactly the retryable "never reached a handler"
+// signal, and t.Fatalf here would kill the test before the loop could retry.
+func doTenantCreateOnce(t *testing.T, url, token, orgID, body string) (int, string, string) {
+	t.Helper()
+	req, err := http.NewRequest("POST", url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build POST %s: %v", url, err)
 	}
-	return id
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Molecule-Org-Id", orgID)
+	req.Header.Set("Origin", "https://"+strings.SplitN(strings.TrimPrefix(url, "https://"), "/", 2)[0])
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		// Transport error / connection reset / never-established: model as
+		// status 0 (no status line, no handler reached) and let the loop decide.
+		return 0, "", ""
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, readBody(resp), resp.Header.Get("Retry-After")
+}
+
+// coldCreateShouldRetry is the pure, non-masking classifier for the create POST.
+// It mirrors create_should_retry_cold (shell) / shouldRetryColdCreate (TS)
+// byte-for-byte: retry ONLY a "never reached a handler" signature.
+//
+//   - A NON-EMPTY body is a real response from the ws-server handler (which
+//     always emits a body — e.g. a 422/400 JSON error). Emptiness IS the
+//     "not the handler" signal, so a non-empty body is NEVER retried; it is
+//     surfaced so a genuine regression cannot be masked by a retry.
+//   - status 503 with an empty body → the edge/ingress "Service Unavailable"
+//     synthesised before a handler is up (the RCA'd cold-origin signature).
+//   - status 0 (transport error / connection reset) → the same cold window at
+//     the transport layer.
+//   - 502 / 504 (and everything else) → NOT retried: a bad-gateway /
+//     gateway-timeout on a non-idempotent POST may already have been processed,
+//     so re-POSTing risks a double-create.
+func coldCreateShouldRetry(status int, body string) bool {
+	if strings.TrimSpace(body) != "" {
+		return false
+	}
+	switch status {
+	case 503, 0:
+		return true
+	default:
+		return false
+	}
+}
+
+// parseColdRetryAfter honors ONLY a bare integer delta-seconds Retry-After
+// (RFC 7231 also allows an HTTP-date; we do not follow a date). Anything that is
+// not all-digits after stripping whitespace — an HTTP-date, empty, or junk —
+// falls back to the default rather than being mangled into a huge value.
+// Default 2, capped at 10 so a hostile/large value can't stall the whole gate.
+func parseColdRetryAfter(raw string) int {
+	s := strings.Join(strings.Fields(raw), "") // strip all whitespace (mirror shell tr -d)
+	if s == "" {
+		return 2
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 2
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 2
+	}
+	if n > 10 {
+		n = 10
+	}
+	return n
 }
 
 // --- reachability ----------------------------------------------------------
