@@ -14,6 +14,8 @@ This serves all four drivers the CTO named: **decouple core** (ADR-005, formerly
 **Decided (CTO, 2026-07-14):** kind = **`trigger`** (a scheduler is the first *trigger* type; webhook/event pokes are another — one kind, one inject lane, one governance path); state ownership = **Option A, the daemon owns everything** (retire `workspace_schedules`; Canvas/admin/webhooks move to a runtime-exposed API — staged delivery, but A is the destination). Remaining open items are in §10.
 
 ### 1.1 A correctness fix this move delivers: scheduled turns become *system* self-turns, not fake *user* messages
+
+> **Historical (delivered):** the fix below SHIPPED — the trigger daemon stamps `source_type=self-scheduler` (runtime#300), and the core engine this section critiques was deleted in core#4399 (2026-07-15). Kept as the design rationale.
 Today core fires the scheduled turn as an A2A message with `role: "user"` and **no `source_type`** (`scheduler.go:408`; there's an abandoned `// "system:scheduler" was invalid — source_id is UUID` workaround comment right beside it). So every cron tick **impersonates the user**. That is not an oversight — it is the direct symptom of the engine living in Go core, *outside* the runtime's autonomous-self-turn taxonomy (`kernel.py`: `KIND_IDLE/self-idle`, `KIND_DELEGATION_RESULT`, `KIND_HARVESTER`, `KIND_LIFECYCLE_WAKE`, … all stamped via `autonomous_metadata()` so they are loop-guard-governed; scheduler is the lone holdout). Consequences: (1) the agent reads a timer as "the user asked"; (2) the turn **bypasses the autonomous-loop runaway guard** that protects idle turns; (3) it pollutes the D3 user-origin marker (the task-queue provider prioritises user-origin asks — a scheduled turn falsely tagged user jumps that queue). Moving the trigger into the runtime routes it through `kernel.autonomous_metadata(KIND_SCHEDULER)` → `source_type = self-scheduler` → a correctly-attributed, guard-governed **system self-turn**. "Make it a plugin" and "make it system, not user" are the *same fix*.
 
 ## 2. What existed before the move (grounding, not proposal — written 2026-07-14; the engine below was deleted by core#4399)
@@ -66,10 +68,10 @@ Today core fires the scheduled turn as an A2A message with `role: "user"` and **
                                             │ heartbeat: provides_native_scheduler=true
                                             ▼
                         core scheduler loop  ──  NativeSchedulerCheck(wsID) → skip poll-and-fire
-                        (still serves workspaces WITHOUT the plugin)
+                        (HISTORICAL — cutover control during P1–P3; BOTH deleted in core#4399)
 ```
 
-The plugin is a supervised subprocess (the daemon lifecycle — spawn, exponential backoff, 10-fast-failure circuit breaker, SIGTERM→SIGKILL teardown — is production-ready and kind-agnostic today). It runs the clock and, on a due schedule, injects a `self-scheduler` turn through a local A2A lane. Core's existing `NativeSchedulerCheck` seam makes the central loop **defer** for any workspace advertising native scheduling — the incremental cutover control.
+The plugin is a supervised subprocess (the daemon lifecycle — spawn, exponential backoff, 10-fast-failure circuit breaker, SIGTERM→SIGKILL teardown — is production-ready and kind-agnostic today). It runs the clock and, on a due schedule, injects a `self-scheduler` turn through a local A2A lane. Core's `NativeSchedulerCheck` seam **made** the central loop defer for any workspace advertising native scheduling — the incremental cutover control during P1–P3 (both the loop and the seam were deleted in core#4399; the fire path is now 100% plugin-owned).
 
 ## 5. The seams that must be built (the honest cost)
 
