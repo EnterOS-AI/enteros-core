@@ -34,6 +34,22 @@ after the workspace is online.
 The asset channel is **never** a secrets transport; the secrets channel is
 **never** an asset transport.
 
+### Schedules: volume-authoritative, but template seeding still lands in the DB
+
+Schedules are **volume-authoritative** for any workspace running the
+`kind: trigger` scheduler plugin (`rfc-scheduler-as-trigger-plugin.md`,
+Option A): the grid lives at `<configs>/schedules/schedules.yaml` on the
+persisted volume and Canvas CRUD proxies to the runtime's
+`/internal/schedules*` API. However, a template's `config.yaml` `schedules:`
+block is currently **still seeded into the legacy `workspace_schedules` DB
+table** (`internal/handlers/template_schedules.go` / `org.go`), *not* onto the
+volume. The runtime's reconcile-on-boot schedule seeding (runtime#303) covers
+only a trigger plugin's own shipped `schedules.yaml`; a **template
+`config.yaml` → volume re-seed channel is an open design seam — it is not
+built**. Until it is, template-source schedules on a plugin workspace exist
+only as DB rows the daemon never reads. Tracked with the P3 remainders in the
+scheduler RFC and issue #4411.
+
 ## How delivery works
 
 1. **Identity.** At boot, `initTemplateRepoByName()` (package init in

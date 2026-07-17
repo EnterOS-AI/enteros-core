@@ -13,14 +13,14 @@ template, and platform code plus
 > responsibility split remains useful, but operational claims below are a
 > point-in-time decision record.
 >
-> **Superseded in part by ADR-004.** The two-layer, opposite-direction split
+> **Superseded in part by ADR-005 (formerly numbered ADR-004).** The two-layer, opposite-direction split
 > (runtime adapts to platform; plugin adapts to each runtime) STANDS. What
 > changes: §2 placed the per-runtime renderers/readers/present-probes in the
 > **shared engine** (`molecule_runtime/mcp_render.py` `_RUNTIME_SPECS`/
-> `_RUNTIME_READERS`, `persona_render._RUNTIME_PERSONA`). ADR-004 moves the
+> `_RUNTIME_READERS`, `persona_render._RUNTIME_PERSONA`). ADR-005 moves the
 > per-runtime *shape* into the **adapter socket** (SDK-owned contract + official
 > registry) so the shared engine holds **zero** runtime-specific code and names no
-> runtime. Read ADR-004 before touching the dispatch tables — they are being
+> runtime. Read ADR-005 before touching the dispatch tables — they are being
 > deleted, not extended.
 
 ## Context
@@ -70,7 +70,7 @@ tribal knowledge:
    references.
 
 The full statement, the field tables, and the guardrail matrix live in
-[`architecture/runtime-platform-plugin-responsibilities.md`](/architecture/runtime-platform-plugin-responsibilities).
+[`architecture/runtime-platform-plugin-responsibilities.md`](../architecture/runtime-platform-plugin-responsibilities.md).
 
 ## Consequences
 
