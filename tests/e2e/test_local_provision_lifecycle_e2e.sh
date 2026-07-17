@@ -590,6 +590,34 @@ if [ -n "$WS_URL_AFTER" ]; then
 else
   fail "workspace URL is empty after reaching online" "registry row has no url"
 fi
+
+# Provisioning-phase boot telemetry (PR #4460): the platform's provisioner
+# must emit step-1 "PWR / Provision compute" telemetry while provisioning —
+# the cmd/server wiring logs each emission as "boot-telemetry: ...". Without
+# this the canvas watchdog is silent for the entire provisioning phase (a
+# first-boot image build is 5+ minutes of "waiting for boot telemetry").
+# BOOT_STEP itself is broadcast-only, so the log line is the only durable
+# evidence the main-loop wiring fired; the canvas-side rendering is guarded
+# separately by canvas/e2e/boot-regression.spec.ts. PLATFORM_LOG defaults to
+# where the CI workflow writes it; override for local runs.
+PLATFORM_LOG="${PLATFORM_LOG:-workspace-server/platform.log}"
+if [ -f "$PLATFORM_LOG" ]; then
+  if grep -q "boot-telemetry: workspace=${WSID} step=1/8 key=PWR status=running" "$PLATFORM_LOG"; then
+    pass "provisioning boot telemetry fired for ws-${WSID} (main-loop wiring connected)"
+  else
+    fail "no boot-telemetry log line for ws-${WSID}" \
+      "SetBootStepEmitter wiring in cmd/server did not fire during provisioning — canvas watchdog would be silent all provisioning phase"
+  fi
+else
+  # Local convenience only: CI always has the workflow-written log. Refuse to
+  # silently vacuum the assertion away unless the operator opts out.
+  if [ -n "${SKIP_BOOT_TELEMETRY_LOG_ASSERT:-}" ]; then
+    echo "SKIP: boot-telemetry log assertion (PLATFORM_LOG=$PLATFORM_LOG not found; opt-out set)"
+  else
+    fail "platform log not found at $PLATFORM_LOG" \
+      "set PLATFORM_LOG to the platform's log file, or SKIP_BOOT_TELEMETRY_LOG_ASSERT=1 for ad-hoc local runs"
+  fi
+fi
 URL_HOST_AFTER="${WS_URL_AFTER#http://}"
 URL_HOST_AFTER="${URL_HOST_AFTER#https://}"
 URL_HOST_AFTER="${URL_HOST_AFTER%%:*}"

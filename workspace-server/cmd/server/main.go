@@ -280,6 +280,12 @@ func main() {
 			// first-boot local image build is 5+ minutes of "waiting for
 			// boot telemetry" that reads as a hang.
 			p.SetBootStepEmitter(func(workspaceID, status, message string) {
+				// Logged as well as broadcast: BOOT_STEP is broadcast-only
+				// (never persisted), so this line is the only durable
+				// record that provisioning telemetry fired — operators
+				// correlate it with local-build timings, and the lifecycle
+				// e2e greps it to prove this wiring stays connected.
+				log.Printf("boot-telemetry: workspace=%s step=1/8 key=PWR status=%s msg=%q", workspaceID, status, message)
 				broadcaster.BroadcastOnly(workspaceID, string(events.EventBootStep), map[string]interface{}{
 					"workspace_id": workspaceID,
 					"step":         1,
