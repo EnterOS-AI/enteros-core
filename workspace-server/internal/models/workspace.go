@@ -192,6 +192,27 @@ type HeartbeatPayload struct {
 	// Runtime needs a loaded_mcp_tools producer to make the deployed path
 	// healthy (tracked separately — see PR #3101 PM flag).
 	LoadedMCPTools []string `json:"loaded_mcp_tools,omitempty"`
+
+	// MCPToolsReady is the EV2 POSITIVE readiness signal: the runtime's
+	// MCPReadinessProber sets it true on the FIRST successful `tools/list`
+	// (turn-independent, so it fires for codex/hermes without a synthetic
+	// turn). Core flips a concierge provisioning->online on the first beat
+	// carrying true — replacing the wall-clock fireConciergeWarmup nudge that
+	// used to coax the per-turn loaded_mcp_tools capture. The 180s grace is
+	// KEPT as the flap absorber.
+	//
+	// POINTER so the three states stay distinct (absent != false): nil =
+	// unknown / probe not yet succeeded (older image, or before first
+	// success), false = probed-not-ready, true = tools loaded. Optional in the
+	// SDK workspace-comms contract (`mcp_tools_ready,omitempty`); runtime#273
+	// landed the NEGATIVE half (launch_failure) — this is the positive half.
+	MCPToolsReady *bool `json:"mcp_tools_ready,omitempty"`
+
+	// FirstReadyAt is the RFC3339 timestamp of the first tools/list success
+	// that set MCPToolsReady=true. Observability/latency only
+	// (provisioning->ready wall-clock); the online-flip MUST NOT gate on it.
+	// Absent until the first probe success. (EV2)
+	FirstReadyAt string `json:"first_ready_at,omitempty"`
 }
 
 // RuntimeMetadata is the adapter-declared capability + override block

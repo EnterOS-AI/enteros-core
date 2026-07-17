@@ -453,11 +453,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// #1870 Phase 1: wire the queue drain hook so Heartbeat can dispatch
 	// a queued A2A request when the workspace reports spare capacity.
 	rh.SetQueueDrainFunc(wh.DrainQueueForWorkspace)
-	// core#3082 keystone: wire the concierge warmup A2A sender so a freshly-
-	// online kind=platform concierge gets one benign turn that triggers the
-	// per-turn loaded_mcp_tools capture (holds it online without a user turn).
-	// Same exported-method late-wiring pattern as SetQueueDrainFunc above.
-	rh.SetWarmupSendFunc(wh.SendConciergeWarmupA2A)
+	// EV2: the concierge warmup A2A sender wiring was REMOVED — fireConciergeWarmup
+	// is retired. The provisioning->online flip is now driven by the runtime's
+	// turn-independent mcp_tools_ready heartbeat event, so no synthetic warmup turn
+	// (and thus no WorkspaceHandler warmup sender) is needed.
 	r.POST("/registry/register", rh.Register)
 	r.POST("/registry/heartbeat", rh.Heartbeat)
 	r.POST("/registry/update-card", rh.UpdateCard)
