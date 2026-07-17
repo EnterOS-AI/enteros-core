@@ -447,21 +447,25 @@ run_scenario() {
   # scenario would run with no admin token and no E2E_REQUIRE_LIVE. Shellcheck catches
   # it as SC2034 ("appears unused"), which is what those assignments become.
   #
-  # E2E_SCHEDULER_CHECK defaults OFF (unlike the idle-digest check, which is a native
-  # runtime loop present in every image). The scheduler autonomous-fire step (10d)
-  # needs the ephemeral runtime pin to boot-install the molecule-scheduler kind:trigger
-  # plugin from gitea and carry the trigger scaffold — capabilities that ship with the
-  # runtime image, not core. Flip E2E_SCHEDULER_CHECK=on here once the pinned runtime
-  # image the ephemeral CP provisions is confirmed to carry them; until then the step
-  # stays dark so it can't red a gate on a capability the image doesn't yet have.
+  # E2E_SCHEDULER_CHECK and E2E_DIGEST_PLUGIN_CHECK default ON: the precondition
+  # that used to keep steps 10d/10e dark — a provisioned runtime image without the
+  # 0.4.9 bits — was verified CLEARED on 2026-07-16. The gate provisions the
+  # registry's workspace-template-hermes:latest, which == sha-2106348 (runtime
+  # 0.4.9), pushed 2026-07-16T21:43:59Z. The runtime-v0.4.9 tree carries all four
+  # legs both steps need: the kind:trigger scaffold, declared-plugin boot-install
+  # (MOLECULE_DECLARED_PLUGINS), the digest-provider plugin loader, and the
+  # vendored native-plugins registry TRUST source (runtime#310).
   #
-  # E2E_DIGEST_PLUGIN_CHECK defaults OFF for the same reason (step 10e): proving a
-  # NATIVE digest-provider plugin loads in-process needs the runtime pin to (a)
-  # boot-install the molecule-ai-plugin-digest-* plugin and (b) carry the
-  # digest-provider loader's native-plugins-registry TRUST source (runtime#310).
-  # Flip E2E_DIGEST_PLUGIN_CHECK=on once the pinned image carries both; until then
-  # the baked digest roster still renders every section (D1 flag default-off), so
-  # this only gates the NEW plugin-load path, not the digest itself.
+  # MOVING-:latest CAVEAT (no-flakes rule): the gate re-resolves :latest on every
+  # run — the verification above pins the precondition to sha-2106348, not to
+  # whatever :latest points at tomorrow. If 10d/10e reds in the future, FIRST check
+  # the packages API for a workspace-template publish newer than
+  # 2026-07-16T21:43:59Z (a regressed/partial template is the likely mechanism)
+  # before theorizing about core-side causes.
+  #
+  # 10e scope note still holds: the baked digest roster renders every section
+  # regardless (D1 flag default-off), so 10e gates only the NEW native
+  # plugin-load path, not the digest itself.
   MOLECULE_CP_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
@@ -476,9 +480,9 @@ run_scenario() {
   E2E_WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}" \
   E2E_IDLE_DIGEST_CHECK="${E2E_IDLE_DIGEST_CHECK:-on}" \
   E2E_IDLE_FIRE_SECONDS="${E2E_IDLE_FIRE_SECONDS:-30}" \
-  E2E_SCHEDULER_CHECK="${E2E_SCHEDULER_CHECK:-off}" \
+  E2E_SCHEDULER_CHECK="${E2E_SCHEDULER_CHECK:-on}" \
   E2E_TRIGGER_POLL_SECONDS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
-  E2E_DIGEST_PLUGIN_CHECK="${E2E_DIGEST_PLUGIN_CHECK:-off}" \
+  E2E_DIGEST_PLUGIN_CHECK="${E2E_DIGEST_PLUGIN_CHECK:-on}" \
   E2E_DIGEST_PLUGIN_SOURCE="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}" \
     bash "$HERE/test_staging_full_saas.sh"
 }
