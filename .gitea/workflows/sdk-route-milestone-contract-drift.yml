@@ -1,0 +1,98 @@
+name: sdk-route-milestone-contract-drift
+
+# SDK route + happy-path milestone derive-gates (RFC molecule-core#4428, Phase 1
+# — SHADOW / NON-BLOCKING). Closes #87 and #88 in shadow form.
+#
+# molecule-ai-sdk is the SSOT for the registry+A2A route lane
+# (molcontracts.SDKRoutes) and the happy-path milestone set
+# (molcontracts.HappyPathMilestones), both vendored into workspace-server via
+# the gen/go binding. These two Go tests DERIVE the contract from the vendored
+# SSOT and assert core still honours it:
+#
+#   * TestSDKRoutesContract (internal/router) — every SDKRoutes entry is
+#     registered in router.go under the same method (#87).
+#   * TestHappyPathMilestonesMatchRunner (internal/e2emilestones) — the
+#     staging-full-saas runner's `required=` set equals the SSOT milestone
+#     ids (#88), locking them together so Phase 2's extension can't drift.
+#
+# ── WHY push[main] ONLY, NEVER pull_request, NEVER schedule (tasks #113 + zero-cron) ──
+# core `main` runs branch-protection required_contexts=['*'], which counts
+# EVERY posted commit status. Task #113 proved `continue-on-error: true` does
+# NOT suppress the status — so a pull_request-triggered gate, even advisory,
+# would STILL post a status on the PR head that ['*'] counts and would jam the
+# merge queue. Therefore this workflow MUST NOT run on pull_request and its
+# contexts MUST NOT be added to .gitea/required-contexts.txt. It is a
+# post-merge advisory drift alert in Phase 1; Phase 3 (owner + soak) promotes it.
+#
+# NO schedule/cron: molecule-core enforces a zero-cron ratchet
+# (.gitea/scripts/lint_schedule_budget.py — "NO nightly/scheduled CI; every
+# gate runs per-PR and/or as the prod-merge gate on push:main"). The task's
+# "push[main] and/or schedule" latitude resolves to push[main] here because a
+# cron would fail that lint. push:main is the post-merge drift signal;
+# workflow_dispatch allows on-demand runs.
+#
+# This mirrors the reporting shape of mcp-plugin-delivery-contract-drift.yml
+# (standalone workflow, not a ci.yml job, not in branch protection) but — unlike
+# that workflow — deliberately drops the pull_request trigger entirely, per the
+# #113 constraint above.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'workspace-server/go.mod'
+      - 'workspace-server/go.sum'
+      - 'workspace-server/internal/router/router.go'
+      - 'workspace-server/internal/router/sdk_routes_contract_test.go'
+      - 'workspace-server/internal/e2emilestones/**'
+      - 'tests/e2e/test_staging_full_saas.sh'
+      - '.gitea/workflows/sdk-route-milestone-contract-drift.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-route-milestone-contract-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # bp-exempt: Phase 1 SHADOW advisory drift alert (RFC #4428 §7) — NOT a merge
+  # gate; never add this context to .gitea/required-contexts.txt while shadow.
+  # Phase 3 (owner + soak) promotes it to bp-required.
+  derive-gates:
+    name: SDK route + milestone derive-gates (shadow)
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    defaults:
+      run:
+        working-directory: workspace-server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+          # cache:false — self-hosted runners bind-mount a persistent
+          # GOCACHE/GOMODCACHE; actions/cache corrupts it (see weekly-platform-go.yml).
+          cache: false
+
+      - name: Go mod download
+        run: go mod download
+
+      # MOLECULE_RUN_CONTRACT_DRIFT_GATES=1 un-skips the two gate tests, which
+      # SKIP by default (so ci.yml's `go test ./...` on PRs stays non-blocking).
+      # This workflow is the ONLY place they execute for real.
+      - name: Route derive-gate (SDKRoutes vs router.go) — #87
+        env:
+          MOLECULE_RUN_CONTRACT_DRIFT_GATES: "1"
+        run: go test ./internal/router/ -run 'SDKRoutes' -count=1 -v
+
+      - name: Milestone derive-gate (HappyPathMilestones vs E2E runner) — #88
+        env:
+          MOLECULE_RUN_CONTRACT_DRIFT_GATES: "1"
+        run: go test ./internal/e2emilestones/ -run 'HappyPathMilestones' -count=1 -v
