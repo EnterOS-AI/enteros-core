@@ -112,13 +112,46 @@ function classifyCreateError(err: unknown): CreateErrorDecision {
   }
 
   // No status → the fetch itself rejected before any response.
-  if (e?.name === "TypeError") {
-    // Browser/undici surface a failed fetch (DNS, refused, reset) as a
+  if (isNetworkTypeError(e)) {
+    // Browser/undici surface a FAILED FETCH (DNS, refused, reset) as a
     // TypeError — connection reset / never established → cold-origin, retry.
     return { retry: shouldRetryColdCreate(null, ""), retryAfter: null };
   }
-  // TimeoutError/AbortError (maybe-processed) and any other throw → surface.
+  // TimeoutError/AbortError (maybe-processed), a non-network TypeError (a real
+  // client bug), and any other throw → surface, never retry.
   return NO_RETRY;
+}
+
+/**
+ * Is this a genuine fetch/network-failure TypeError (vs an incidental
+ * TypeError from a real client bug)? Only a network failure is the transport
+ * twin of curl `000` that may be safely retried; a `TypeError` from, e.g.,
+ * calling a non-function or reading a property of undefined must NOT be retried
+ * 4× — it will never succeed and the retries only delay surfacing the bug.
+ *
+ * `fetch` rejects a network failure with a `TypeError` whose message is one of
+ * a small, cross-runtime set, and Node/undici additionally attaches the
+ * underlying transport error as `.cause`. We treat EITHER signal as "network":
+ *   - Chrome/Blink:   "Failed to fetch"
+ *   - Node/undici:    "fetch failed"           (+ a `.cause`)
+ *   - Firefox/Gecko:  "NetworkError when attempting to fetch resource."
+ *   - Safari/WebKit:  "Load failed"
+ */
+function isNetworkTypeError(e: {
+  name?: string;
+  message?: string;
+  cause?: unknown;
+}): boolean {
+  if (e?.name !== "TypeError") return false;
+  // undici/Node attaches the underlying system/transport error as `cause`; a
+  // plain programmer-error TypeError has none.
+  if (e.cause != null) return true;
+  const msg = (e.message ?? "").toLowerCase();
+  return (
+    msg.includes("fetch") || // "Failed to fetch" / "fetch failed"
+    msg.includes("network") || // "NetworkError when attempting to fetch…"
+    msg.includes("load failed") // Safari
+  );
 }
 
 /** Injectable seams so the bounded loop is unit-testable without real timers

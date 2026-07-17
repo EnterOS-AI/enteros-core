@@ -719,6 +719,8 @@ create_workspace_post() {
     # A connection reset leaves $resp empty and writes no status line to $hdrs.
     set +e
     resp=$(tenant_call POST /workspaces -D "$hdrs" "$@")
+    local curl_rc=$?   # curl's transport exit: 0=got a response; 28=timeout
+                       # (maybe-processed), 7/56/…=connection reset/refused.
     set -e
     id=$(printf '%s' "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
     if [ -n "$id" ]; then
@@ -726,7 +728,10 @@ create_workspace_post() {
       return 0
     fi
     status=$(create_parse_status "$hdrs")
-    if ! create_should_retry_cold "$status" "$resp"; then
+    # Pass curl_rc so a client TIMEOUT (28) is NOT retried (the origin may have
+    # already processed this non-idempotent POST → re-POST would double-create),
+    # while a genuine connection reset/refused still is.
+    if ! create_should_retry_cold "$status" "$resp" "$curl_rc"; then
       # Real app error (non-empty body), a 502/504, or any non-cold status —
       # surface immediately so the caller's id-check names it. No retry, no
       # masking, and no re-POST of a possibly-already-processed create.

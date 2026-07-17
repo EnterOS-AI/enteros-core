@@ -182,6 +182,37 @@ describe("createWorkspaceWithRetry", () => {
     expect(post).toHaveBeenCalledTimes(1);
   });
 
+  it("non-network TypeError (a real client bug) → NO retry, surfaces on first try", async () => {
+    // A programmer-error TypeError (e.g. calling a non-function) is NOT a fetch
+    // failure. It must surface immediately — retrying it 4× only delays the bug
+    // and never succeeds. Regression guard for the over-broad `name==="TypeError"`.
+    const bug = new TypeError("obj.doesNotExist is not a function");
+    const post = vi.fn().mockRejectedValue(bug);
+    const { deps: d } = deps(post as CreateRetryDeps["post"]);
+
+    await expect(createWorkspaceWithRetry({ name: "K" }, undefined, d)).rejects.toThrow(
+      "is not a function",
+    );
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  it("undici network TypeError (message 'fetch failed' + cause) → retries", async () => {
+    // Node/undici rejects a network failure with `TypeError: fetch failed` and
+    // attaches the transport error as `.cause` — still a genuine network reset.
+    const netErr = new TypeError("fetch failed");
+    (netErr as unknown as { cause: unknown }).cause = new Error("ECONNRESET");
+    const post = vi
+      .fn()
+      .mockRejectedValueOnce(netErr)
+      .mockResolvedValueOnce({ id: "ws-net" });
+    const { deps: d } = deps(post as CreateRetryDeps["post"]);
+
+    const res = await createWorkspaceWithRetry<{ id: string }>({ name: "L" }, undefined, d);
+
+    expect(res).toEqual({ id: "ws-net" });
+    expect(post).toHaveBeenCalledTimes(2);
+  });
+
   it("first-try 200 → no retry, single POST", async () => {
     const post = vi.fn().mockResolvedValueOnce({ id: "ws-fast" });
     const { deps: d, sleep } = deps(post as CreateRetryDeps["post"]);

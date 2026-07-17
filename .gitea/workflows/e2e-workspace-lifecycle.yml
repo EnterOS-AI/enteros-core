@@ -100,3 +100,14 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "SKIP: TestWorkspaceLifecycle_Staging" \
             || { echo "::error::expected a LOUD skip of TestWorkspaceLifecycle_Staging without creds"; exit 1; }
+      - name: Run pure cold-create retry classifier unit tests (offline, no creds)
+        working-directory: workspace-server
+        run: |
+          # The cold-origin create-retry classifiers (coldCreateShouldRetry /
+          # coldCreateTransportRetryable / parseColdRetryAfter) are pure and do
+          # NOT skip without creds — so ACTUALLY RUN them here as a real per-PR
+          # gate (compile-only is not coverage). This is the executed twin of the
+          # shell test_workspace_create_retry_unit.sh (ci.yml) and the canvas
+          # workspaceCreateRetry vitest.
+          go test -tags staging_e2e ./internal/staginge2e/ \
+            -run 'TestColdCreate|TestParseColdRetryAfter' -count=1 -v

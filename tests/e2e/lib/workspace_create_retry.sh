@@ -33,19 +33,51 @@
 #   fails RED with the full header diagnostic; every attempt is logged, so a
 #   transient that self-heals is visible, never a silent green.
 #
-#   create_should_retry_cold  <http_status> <body>   → rc 0 retry / rc 1 don't
+#   create_should_retry_cold  <http_status> <body> [curl_exit]  → rc 0 retry / rc 1 don't
 #   create_parse_status       <headers_file>  → status code from the FINAL status line
 #   create_parse_retry_after  <headers_file>  → Retry-After delta-seconds
 #                                                (integer only; default 2, cap 10)
 #   create_parse_server       <headers_file>  → `server:` header value (who answered)
 
+# A curl transport failure (empty status line, empty body) is NOT uniformly
+# retryable: a CLIENT-side timeout may fire AFTER the origin already processed
+# the non-idempotent POST, so re-POSTing double-creates — the exact 502/504
+# "maybe-processed" hazard, at the transport layer. Only a connection that was
+# refused/reset/never-established (curl couldn't-resolve/connect/SSL/recv) truly
+# "never reached a handler" and is safe to retry. These are the curl exit codes
+# that mean "never established / reset before the server could act":
+#   6  couldn't resolve host      7  failed to connect (refused)
+#   35 SSL connect error          56 failure receiving data (connection reset)
+# curl 28 (operation timeout) and every OTHER/unknown transport exit are treated
+# as maybe-processed → NOT retried (non-masking default: when unsure, don't
+# double-create). Mirrors the Go coldCreateTransportRetryable + the TS
+# classifier refusing TimeoutError/AbortError.
+_CREATE_RETRYABLE_CURL_EXITS=" 6 7 35 56 "
+
 # Retry only the cold-origin "never reached a handler" signatures (see contract).
+# curl_exit is OPTIONAL: pass curl's exit status on a transport failure so a
+# client timeout (28) is distinguished from a connection reset/refusal. When
+# omitted or 0, the decision is purely status/body based (a response WAS
+# received), preserving the original two-arg behavior.
 create_should_retry_cold() {
-  local status="$1" body="$2"
+  local status="$1" body="$2" curl_exit="${3:-}"
   # A non-empty body is a real response from the app (e.g. a 422/400 JSON
   # error). Never retry it — surface it so the caller's id-check names WHY.
   if printf '%s' "$body" | grep -q '[^[:space:]]'; then
     return 1
+  fi
+  # Transport-layer failure: ONLY when curl produced no status line at all (an
+  # empty status). A non-empty status means a response WAS received — even a
+  # 503 makes curl --fail-with-body exit 22 — so it must be classified on the
+  # status below, never mistaken for a transport failure. With no status line,
+  # curl's exit decides: a connection reset/refused/never-established is the
+  # retryable cold twin; a client timeout (28) or any other/unknown transport
+  # exit is maybe-processed → do NOT retry.
+  if [ -z "$status" ] && [ -n "$curl_exit" ] && [ "$curl_exit" != "0" ]; then
+    case "$_CREATE_RETRYABLE_CURL_EXITS" in
+      *" $curl_exit "*) return 0 ;;  # refused/reset/never-established → cold twin
+      *) return 1 ;;                 # 28 timeout & any other transport exit → no retry
+    esac
   fi
   case "$status" in
     503) return 0 ;;      # edge/ingress "Service Unavailable" — handler not up yet
@@ -71,8 +103,23 @@ create_parse_retry_after() {
     | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r\n' | tr -d '[:space:]')
   if printf '%s' "$raw" | grep -qE '^[0-9]+$'; then
     # A cold-start window is seconds; cap a hostile/large value so it can't
-    # stall the whole gate.
-    [ "$raw" -gt 10 ] && raw=10
+    # stall the whole gate. Guard the cap against integer overflow: a 20+digit
+    # all-numeric value passes the ^[0-9]+$ test but overflows the shell's
+    # signed-64-bit `[ "$raw" -gt 10 ]` arithmetic ("integer expression
+    # expected"), which — untrapped — skips the cap and sleeps a giant value
+    # until CI times out. Any value with more digits than the cap is, by
+    # construction, larger than the cap → clamp by LENGTH before the numeric
+    # compare ever runs. (Strip a leading-zero run first so "0000000010" is
+    # length-10, not spuriously clamped.)
+    local n="${raw#"${raw%%[!0]*}"}"   # drop leading zeros
+    [ -z "$n" ] && n=0                  # all-zeros → 0
+    if [ "${#n}" -gt 2 ]; then
+      raw=10                            # >=100: always over the 10s cap
+    elif [ "$n" -gt 10 ]; then
+      raw=10                            # 2 digits (<=99): numeric compare is overflow-safe
+    else
+      raw="$n"                          # already <= cap
+    fi
     printf '%s' "$raw"
   else
     printf '2'

@@ -3,8 +3,11 @@
 package staginge2e
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -778,12 +781,53 @@ func doTenantCreateOnce(t *testing.T, url, token, orgID, body string) (int, stri
 	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		// Transport error / connection reset / never-established: model as
-		// status 0 (no status line, no handler reached) and let the loop decide.
-		return 0, "", ""
+		if coldCreateTransportRetryable(err) {
+			// Connection reset / refused / never-established in the cold window:
+			// no handler was reached, so model as status 0 (no status line) and
+			// let coldCreateShouldRetry retry — the transport twin of curl `000`.
+			return 0, "", ""
+		}
+		// Client-side timeout (http.Client.Timeout / context deadline) or abort:
+		// the origin may already have PROCESSED this non-idempotent POST before
+		// the client stopped waiting, so a re-POST would DOUBLE-CREATE. Surface a
+		// non-retryable sentinel — status -1 AND a non-empty body each
+		// independently force coldCreateShouldRetry to false — so the loop stops.
+		return -1, "transport error (maybe-processed, not retried): " + err.Error(), ""
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode, readBody(resp), resp.Header.Get("Retry-After")
+}
+
+// coldCreateTransportRetryable classifies a client.Do transport error (an error
+// return with NO HTTP response). It is the Go twin of the shell's curl-exit
+// gate and the TS classifier's TypeError-vs-TimeoutError split:
+//
+//   - A CLIENT-side timeout — http.Client.Timeout, a request-context deadline,
+//     or any net.Error whose Timeout() is true — is maybe-processed: the origin
+//     may already have handled the non-idempotent POST /workspaces before the
+//     client gave up, so re-POSTing risks a DOUBLE-CREATE. NOT retryable.
+//     (Mirrors the TS classifier refusing TimeoutError/AbortError and the shell
+//     refusing curl exit 28.)
+//   - Everything else at the transport layer — connection refused / reset by
+//     peer / never-established socket / EOF — never reached a handler, so it is
+//     the safe cold-origin transient to retry (the twin of curl `000`).
+func coldCreateTransportRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	// http.Client.Timeout cancels the request context, surfacing (possibly
+	// wrapped in *url.Error) as context.DeadlineExceeded.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// Dial/read/write deadlines and other timeouts surface as a net.Error with
+	// Timeout()==true; *url.Error forwards Timeout() from the error it wraps.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	// Non-timeout transport failure (reset/refused/never-established) → retry.
+	return true
 }
 
 // coldCreateShouldRetry is the pure, non-masking classifier for the create POST.
