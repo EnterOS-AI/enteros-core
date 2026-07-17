@@ -552,6 +552,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 		// Schedules (cron tasks)
 		schedh := handlers.NewScheduleHandler()
+		// P4b (core#4435): wire the post-online runtime-schedule inheritance restore
+		// into the registry heartbeat handler, alongside the plugin reconcile
+		// (rh.SetReconcileFunc below). Wired here — not next to SetReconcileFunc —
+		// because schedh is scoped to this block; rh (declared above) is in scope.
+		rh.SetRestoreSchedulesFunc(schedh.RestoreInheritedRuntimeSchedules)
 		wsAuth.GET("/schedules", schedh.List)
 		wsAuth.POST("/schedules", schedh.Create)
 		wsAuth.PATCH("/schedules/:scheduleId", schedh.Update)
