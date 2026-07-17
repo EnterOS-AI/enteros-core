@@ -169,6 +169,27 @@ grep -Fq 'CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-langfuse-dev}' "$COMPOSE" 
 grep -Fq -- '- langfuse-web' "$COMPOSE_MAIN" \
   || fail "compose Langfuse must carry the langfuse-web network alias for workspace agents"
 
+# Hermetic Go bootstrap: must exist, be attempted before the go-run/container
+# branch, verify a pinned sha256, and stage inside the toolchains dir (atomic
+# same-fs rename — no half-install a later run would trust).
+bootstrap_fn_line=$(line_of '^bootstrap_go_toolchain\(\) \{')
+go_branch_line=$(line_of '^if command -v go >/dev/null 2>&1; then$')
+[ "$bootstrap_fn_line" -lt "$go_branch_line" ] \
+  || fail "Go bootstrap must be defined before the platform go-run branch"
+grep -Eq '^GO_SHA256_(DARWIN|LINUX)_(ARM64|AMD64)="[a-f0-9]{64}"' "$DEV_START" \
+  || fail "Go bootstrap must pin per-platform sha256 checksums"
+grep -Fq 'CHECKSUM MISMATCH' "$DEV_START" \
+  || fail "Go bootstrap must refuse a toolchain that fails checksum verification"
+grep -Fq 'refusing unverified toolchain' "$DEV_START" \
+  || fail "Go bootstrap must refuse to install without a sha256 tool"
+# shellcheck disable=SC2016
+grep -Fq 'mktemp -d "$(dirname "$go_dest")/.stage.XXXXXX"' "$DEV_START" \
+  || fail "Go bootstrap must stage inside the toolchains dir for an atomic install"
+bootstrap_body=$(function_body bootstrap_go_toolchain)
+if printf '%s\n' "$bootstrap_body" | grep -Eq 'sudo|brew |apt-get|apt |dnf |pacman'; then
+  fail "Go bootstrap must stay hermetic — no sudo/package-manager installs"
+fi
+
 echo "PASS: dev-start.sh gates the ready banner on Langfuse readiness"
 echo "PASS: dev-start.sh wires local private-repo tokens without persisting them"
 echo "PASS: dev-start.sh wires the local SDK object-store backend to MinIO"
