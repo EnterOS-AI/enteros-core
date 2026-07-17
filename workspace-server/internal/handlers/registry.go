@@ -110,6 +110,12 @@ type RegistryHandler struct {
 	// reconcile when unset (e.g. unit tests, CP/SaaS mode without a plugins
 	// handler). Wired by the router to PluginsHandler.ReconcileWorkspacePlugins.
 	reconcilePlugins ReconcileFunc
+	// restoreSchedules replays a removed predecessor's captured runtime schedule
+	// grid onto a freshly-online workspace (P4b volume-side org-re-import
+	// inheritance, core#4435). nil-safe: fireReconcileOnline skips it when unset
+	// (unit tests / deployments without a schedule handler). Wired by the router
+	// to ScheduleHandler.RestoreInheritedRuntimeSchedules.
+	restoreSchedules ReconcileFunc
 	// mcpRecoveryLastFire rate-limits the RCA#2970 deadlock-break reconcile (#33).
 	// The gate fails on EVERY heartbeat until the management MCP lands, so without
 	// a throttle a concierge that cannot recover (e.g. a missing plugin-source
@@ -152,18 +158,36 @@ func (h *RegistryHandler) SetReconcileFunc(f ReconcileFunc) {
 	h.reconcilePlugins = f
 }
 
-// fireReconcileOnline fires the declared-plugin reconcile for a workspace that
-// has just transitioned to online. Fire-and-forget via globalGoAsync so the
-// heartbeat handler returns immediately; the reconcile owns its own deadline.
-// nil-safe + uses context.WithoutCancel because the heartbeat ctx expires when
-// the handler returns, well before a plugin clone+deliver completes.
+// SetRestoreSchedulesFunc wires the post-online runtime-schedule inheritance hook
+// (P4b volume-side org-re-import, core#4435). Router wires this to
+// ScheduleHandler.RestoreInheritedRuntimeSchedules after both handlers are
+// constructed (same late-wiring pattern as SetReconcileFunc), keeping
+// RegistryHandler free of a schedule-handler import.
+func (h *RegistryHandler) SetRestoreSchedulesFunc(f ReconcileFunc) {
+	h.restoreSchedules = f
+}
+
+// fireReconcileOnline fires the transition-to-online hooks for a workspace:
+// the declared-plugin reconcile AND the P4b runtime-schedule inheritance restore
+// (core#4435). Fire-and-forget via globalGoAsync so the heartbeat handler returns
+// immediately; each hook owns its own deadline. Uses context.WithoutCancel
+// because the heartbeat ctx expires when the handler returns, well before a
+// plugin clone+deliver (or a schedule restore forward) completes.
+//
+// EACH hook runs in its OWN globalGoAsync so they are independent: globalGoAsync
+// recovers panics per goroutine, so a panic in the schedule restore cannot take
+// down the plugin reconcile (or vice-versa). Both are nil-safe.
 func (h *RegistryHandler) fireReconcileOnline(ctx context.Context, workspaceID string) {
-	if h.reconcilePlugins == nil {
-		return
-	}
 	rctx := context.WithoutCancel(ctx)
 	wsID := workspaceID
-	globalGoAsync(func() { h.reconcilePlugins(rctx, wsID) })
+	if h.reconcilePlugins != nil {
+		reconcile := h.reconcilePlugins
+		globalGoAsync(func() { reconcile(rctx, wsID) })
+	}
+	if h.restoreSchedules != nil {
+		restore := h.restoreSchedules
+		globalGoAsync(func() { restore(rctx, wsID) })
+	}
 }
 
 // fireReconcileMCPRecovery breaks the RCA#2970 management-MCP deadlock (#33).
@@ -213,7 +237,6 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 	wsID := workspaceID
 	globalGoAsync(func() { h.reconcilePlugins(rctx, wsID) })
 }
-
 
 // validateAgentURL rejects URLs that could be used as SSRF vectors against
 // cloud metadata services or other internal infrastructure.
