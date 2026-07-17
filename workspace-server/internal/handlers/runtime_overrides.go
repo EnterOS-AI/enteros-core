@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -146,6 +147,31 @@ func (c *runtimeOverrideCache) HasCapability(workspaceID, name string) bool {
 	}
 	e := c.loadEntry(workspaceID)
 	return e.capabilities[name]
+}
+
+// WorkspacesWithCapability returns the IDs of every workspace whose most
+// recent heartbeat declared native ownership of the named capability, in
+// stable (sorted) order. Fan-out consumers (the webhook cron-poke and the
+// admin schedule-health aggregate) use this to discover volume-native
+// scheduler workspaces — the cache is the only registry of capability
+// declarations (there is no DB column). Same staleness contract as
+// HasCapability: entries persist until platform restart, then repopulate
+// within a heartbeat cycle.
+func (c *runtimeOverrideCache) WorkspacesWithCapability(name string) []string {
+	if name == "" {
+		return nil
+	}
+	var ids []string
+	c.m.Range(func(k, v any) bool {
+		id, okID := k.(string)
+		e, okE := v.(runtimeOverrideEntry)
+		if okID && okE && e.capabilities[name] {
+			ids = append(ids, id)
+		}
+		return true
+	})
+	sort.Strings(ids)
+	return ids
 }
 
 // Reset clears the entire cache. Test-only; production code never

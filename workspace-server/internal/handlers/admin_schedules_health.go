@@ -1,6 +1,10 @@
 package handlers
 
 import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -54,6 +58,78 @@ func computeStaleThreshold(cronExpr, tz string, now time.Time) (time.Duration, e
 	return 2 * t2.Sub(t1), nil
 }
 
+// volumeAdminScheduleHealth builds the admin health entries for one
+// volume-native workspace from its runtime grid + the trigger daemon's health
+// file (P4b re-point — the workspace's DB rows, if any remain pre-migration,
+// are stale strays). last_run_at carries the daemon's last tick: that is the
+// RFC G6 liveness signal — an alive daemon classifies "ok", a dead one drifts
+// to "stale" past the 2× cron-interval threshold, a never-started one reports
+// "never_run".
+func volumeAdminScheduleHealth(ctx context.Context, workspaceID, workspaceName string, now time.Time) ([]adminScheduleHealth, error) {
+	wsURL, secret, err := resolveScheduleFanoutTarget(ctx, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	status, body, err := fetchScheduleAPI(ctx, wsURL, secret, http.MethodGet, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("grid list returned %d", status)
+	}
+	var grid struct {
+		Schedules []volumeEntry `json:"schedules"`
+	}
+	if err := json.Unmarshal(body, &grid); err != nil {
+		return nil, fmt.Errorf("malformed grid: %w", err)
+	}
+	hstatus, hbody, err := fetchScheduleAPI(ctx, wsURL, secret, http.MethodGet, "/health", nil)
+	if err != nil {
+		return nil, err
+	}
+	if hstatus != http.StatusOK {
+		return nil, fmt.Errorf("health returned %d", hstatus)
+	}
+	var health volumeHealthPayload
+	if err := json.Unmarshal(hbody, &health); err != nil {
+		return nil, fmt.Errorf("malformed health: %w", err)
+	}
+
+	var lastTick *time.Time
+	if health.LastTick != nil {
+		if t, perr := time.Parse(time.RFC3339, *health.LastTick); perr == nil {
+			lastTick = &t
+		}
+	}
+	entries := make([]adminScheduleHealth, 0, len(grid.Schedules))
+	for _, e := range grid.Schedules {
+		staleThreshold, cronErr := computeStaleThreshold(e.Cron, e.Timezone, now)
+		var staleThresholdSeconds int64
+		if cronErr == nil {
+			staleThresholdSeconds = int64(staleThreshold.Seconds())
+		} else {
+			log.Printf("AdminSchedulesHealth: cron parse error for volume schedule %s/%s (%q): %v",
+				workspaceID, e.Name, e.Cron, cronErr)
+		}
+		var nextRun *time.Time
+		if next, nerr := computeNextRunSafe(e.Cron, e.Timezone); nerr == nil {
+			nextRun = &next
+		}
+		entries = append(entries, adminScheduleHealth{
+			WorkspaceID:           workspaceID,
+			WorkspaceName:         workspaceName,
+			ScheduleID:            e.Name, // volume grid is name-keyed: id == name
+			ScheduleName:          e.Name,
+			CronExpr:              e.Cron,
+			LastRunAt:             lastTick,
+			ExpectedNextRun:       nextRun,
+			Status:                classifyScheduleStatus(lastTick, staleThreshold, now),
+			StaleThresholdSeconds: staleThresholdSeconds,
+		})
+	}
+	return entries, nil
+}
+
 // Health handles GET /admin/schedules/health.
 //
 // It joins workspace_schedules with workspaces and, for each schedule, computes:
@@ -63,11 +139,24 @@ func computeStaleThreshold(cronExpr, tz string, now time.Time) (time.Duration, e
 //   - stale_threshold_seconds: 2 × the cron interval derived from cron_expr.
 //   - expected_next_run:     the next_run_at value stored by the scheduler.
 //
+// Volume-native workspaces (native `scheduler` capability, P4b re-point) are
+// served from the runtime schedule API instead of the DB: their grid +
+// bookkeeping live on the workspace volume, so any rows still in
+// workspace_schedules are pre-migration strays and are skipped. The DB path
+// stays for legacy stragglers. An unreachable volume workspace is logged and
+// omitted rather than failing the whole aggregate.
+//
 // Returns 200 with a JSON array (empty if no schedules exist), 500 on DB error.
 // Auth is enforced by the adminAuth() middleware registered in router.go.
 func (h *AdminSchedulesHealthHandler) Health(c *gin.Context) {
 	ctx := c.Request.Context()
 	now := time.Now()
+
+	volumeIDs := volumeSchedulerWorkspaceIDs()
+	isVolume := make(map[string]bool, len(volumeIDs))
+	for _, id := range volumeIDs {
+		isVolume[id] = true
+	}
 
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT
@@ -113,6 +202,12 @@ func (h *AdminSchedulesHealthHandler) Health(c *gin.Context) {
 			continue
 		}
 
+		// Volume-native workspace — its DB rows are pre-migration strays; the
+		// live view comes from the runtime proxy loop below.
+		if isVolume[workspaceID] {
+			continue
+		}
+
 		// Compute stale threshold = 2 × cron interval.
 		// On parse failure (malformed cron_expr in DB) we report 0 and still
 		// classify the row — a bad cron_expr itself is worth surfacing in the
@@ -143,6 +238,25 @@ func (h *AdminSchedulesHealthHandler) Health(c *gin.Context) {
 	}
 	if err := rows.Err(); err != nil {
 		log.Printf("AdminSchedulesHealth: rows iteration error: %v", err)
+	}
+
+	// Volume-native workspaces: live schedule state via the runtime proxy.
+	for _, wsID := range volumeIDs {
+		var wsName string
+		if err := db.DB.QueryRowContext(ctx,
+			`SELECT name FROM workspaces WHERE id = $1 AND status != 'removed'`, wsID,
+		).Scan(&wsName); err != nil {
+			if err != sql.ErrNoRows {
+				log.Printf("AdminSchedulesHealth: name lookup for %s failed: %v", wsID, err)
+			}
+			continue // removed/unknown workspace — nothing to report
+		}
+		ventries, err := volumeAdminScheduleHealth(ctx, wsID, wsName, now)
+		if err != nil {
+			log.Printf("AdminSchedulesHealth: runtime health for %s unavailable (omitted): %v", wsID, err)
+			continue
+		}
+		entries = append(entries, ventries...)
 	}
 
 	c.JSON(http.StatusOK, entries)
