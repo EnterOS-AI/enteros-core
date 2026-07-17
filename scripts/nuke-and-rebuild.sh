@@ -19,6 +19,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Pin the compose project like dev-start.sh does: without this, a checkout in
+# a differently-named directory creates a parallel <dir>-langfuse-1 that also
+# claims the langfuse-web alias on the shared molecule-core-net.
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-molecule-core}"
+export COMPOSE_PROJECT_NAME
 # Shared docker-teardown helpers (mol_purge_ws_objects) — same UUID-scoped,
 # xargs-free purge scripts/dev-start.sh --fresh uses.
 # shellcheck source=scripts/lib/docker-reset.sh

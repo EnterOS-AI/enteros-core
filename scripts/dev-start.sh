@@ -44,6 +44,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$ROOT/.env"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-molecule-core}"
 export COMPOSE_PROJECT_NAME
+# Compose derives container names from the project; every by-name docker
+# inspect/rm/logs below must use this, never a hardcoded molecule-core-…
+LANGFUSE_CONTAINER="${COMPOSE_PROJECT_NAME}-langfuse-1"
 PLATFORM_PID=
 CANVAS_PID=
 FRESH=0
@@ -149,7 +152,7 @@ cleanup_dev_stack() {
     # named volumes so the local DB/object-store state survives restarts.
     docker compose -f "$ROOT/docker-compose.yml" down --remove-orphans >/dev/null 2>&1 || true
     docker compose -f "$ROOT/docker-compose.infra.yml" down --remove-orphans >/dev/null 2>&1 || true
-    docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
+    docker rm -f "$LANGFUSE_CONTAINER" >/dev/null 2>&1 || true
 }
 
 fresh_reset() {
@@ -171,7 +174,7 @@ fresh_reset() {
         || echo "    WARN: 'docker compose -f docker-compose.yml down -v' failed — local DB/Redis volumes may persist" >&2
     docker compose -f "$ROOT/docker-compose.infra.yml" down -v --remove-orphans >/dev/null 2>&1 \
         || echo "    WARN: 'docker compose -f docker-compose.infra.yml down -v' failed — MinIO/Langfuse volumes may persist" >&2
-    docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
+    docker rm -f "$LANGFUSE_CONTAINER" >/dev/null 2>&1 || true
     # Dynamically-spawned ws-<uuid> workspace containers + volumes (UUID-scoped so
     # an unrelated project's ws-* object on the same host is never touched).
     mol_purge_ws_objects
@@ -427,6 +430,9 @@ MOLECULE_LANGFUSE_HOST_PORT=${MOLECULE_LANGFUSE_HOST_PORT:-$(pick_port 3001)}
 export MOLECULE_LANGFUSE_HOST_PORT
 export LANGFUSE_PUBLIC_KEY="${LANGFUSE_PUBLIC_KEY:-pk-lf-0000000000000000000000000000000000000001}"
 export LANGFUSE_SECRET_KEY="${LANGFUSE_SECRET_KEY:-sk-lf-0000000000000000000000000000000000000002}"
+# Same keys under the names the compose langfuse service seeds the org with.
+export LANGFUSE_INIT_PROJECT_PUBLIC_KEY="$LANGFUSE_PUBLIC_KEY"
+export LANGFUSE_INIT_PROJECT_SECRET_KEY="$LANGFUSE_SECRET_KEY"
 export LANGFUSE_HOST="http://127.0.0.1:${MOLECULE_LANGFUSE_HOST_PORT}"          # platform reader (host)
 export MOLECULE_WORKSPACE_LANGFUSE_HOST="http://langfuse-web:3000"             # agent producer (docker net)
 echo "    Langfuse   ${LANGFUSE_HOST}  (traces UI + platform /traces proxy)"
@@ -462,10 +468,10 @@ wait_for_langfuse_http() {
     echo "    Waiting for Langfuse HTTP..."
     i=1
     while [ "$i" -le 90 ]; do
-        running=$(docker inspect -f '{{.State.Running}}' molecule-core-langfuse-1 2>/dev/null || echo false)
+        running=$(docker inspect -f '{{.State.Running}}' "$LANGFUSE_CONTAINER" 2>/dev/null || echo false)
         if [ "$running" != "true" ]; then
             echo "    ✗ Langfuse exited before becoming ready — last logs:"
-            docker logs --tail 80 molecule-core-langfuse-1 2>&1 | sed 's/^/      /'
+            docker logs --tail 80 "$LANGFUSE_CONTAINER" 2>&1 | sed 's/^/      /'
             return 1
         fi
 
@@ -482,36 +488,24 @@ wait_for_langfuse_http() {
     done
 
     echo "    ✗ Langfuse did not respond in 90s — last logs:"
-    docker logs --tail 80 molecule-core-langfuse-1 2>&1 | sed 's/^/      /'
+    docker logs --tail 80 "$LANGFUSE_CONTAINER" 2>&1 | sed 's/^/      /'
     return 1
 }
 
 # ─────────────────────────────────────────── Langfuse web (trace UI + API)
-# setup.sh brings up the Langfuse deps (clickhouse + langfuse-db-init) but NOT
-# the web app (it lives in docker-compose.yml, whose network ownership
-# conflicts with infra's external net). Run it directly on molecule-core-net
-# with a `langfuse-web` alias so agents resolve it, seeded with a deterministic
-# project + keys. clickhouse password mirrors docker-compose.infra.yml's
-# ${CLICKHOUSE_PASSWORD:-langfuse-dev}; the migration URL embeds it.
+# setup.sh brings up the Langfuse deps (clickhouse + langfuse-db-init) but not
+# the web app. That lives in docker-compose.yml as the ONE Langfuse definition;
+# bring it up from there — parameterized by the exported env above — so this
+# script and plain `docker compose up` cannot drift apart.
 echo "==> Starting Langfuse (trace UI on :${MOLECULE_LANGFUSE_HOST_PORT})"
 wait_for_langfuse_clickhouse_native
-docker rm -f molecule-core-langfuse-1 >/dev/null 2>&1 || true
-if docker run -d --name molecule-core-langfuse-1 --network molecule-core-net \
-  --network-alias langfuse-web -p "127.0.0.1:${MOLECULE_LANGFUSE_HOST_PORT}:3000" \
-  -e DATABASE_URL="postgres://${POSTGRES_USER:-dev}:${POSTGRES_PASSWORD:-dev}@postgres:5432/langfuse" \
-  -e CLICKHOUSE_URL="http://langfuse-clickhouse:8123" \
-  -e CLICKHOUSE_MIGRATION_URL="clickhouse://langfuse:${CLICKHOUSE_PASSWORD:-langfuse-dev}@langfuse-clickhouse:9000" \
-  -e CLICKHOUSE_USER="langfuse" -e CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-langfuse-dev}" \
-  -e NEXTAUTH_SECRET="${LANGFUSE_SECRET:-changeme-langfuse-secret}" \
-  -e NEXTAUTH_URL="${LANGFUSE_HOST}" -e SALT="${LANGFUSE_SALT:-changeme-langfuse-salt}" \
-  -e TELEMETRY_ENABLED="false" \
-  -e LANGFUSE_INIT_ORG_ID="molecule" -e LANGFUSE_INIT_ORG_NAME="Molecule" \
-  -e LANGFUSE_INIT_PROJECT_ID="molecule-local" -e LANGFUSE_INIT_PROJECT_NAME="Molecule Local" \
-  -e LANGFUSE_INIT_PROJECT_PUBLIC_KEY="${LANGFUSE_PUBLIC_KEY}" \
-  -e LANGFUSE_INIT_PROJECT_SECRET_KEY="${LANGFUSE_SECRET_KEY}" \
-  -e LANGFUSE_INIT_USER_EMAIL="dev@molecule.local" -e LANGFUSE_INIT_USER_NAME="Dev" \
-  -e LANGFUSE_INIT_USER_PASSWORD="dev-langfuse-pw" \
-  langfuse/langfuse@sha256:e7aafd3ccf721821b40f8b2251220b4bb8af5e4877b5c5a8846af5b3318aaf1d >/dev/null 2>&1; then
+# Remove a stale non-compose Langfuse container from pre-unification checkouts;
+# compose refuses to reuse the name otherwise.
+if docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' \
+    "$LANGFUSE_CONTAINER" 2>/dev/null | grep -Fqvx "$COMPOSE_PROJECT_NAME"; then
+    docker rm -f "$LANGFUSE_CONTAINER" >/dev/null 2>&1 || true
+fi
+if docker compose -f "$ROOT/docker-compose.yml" up -d langfuse; then
     echo "    Langfuse container started (first boot ~15-30s)"
 else
     echo "    ✗ Langfuse failed to start"
@@ -642,7 +636,7 @@ cat <<EOF
 
   Auth:      fail-closed — canvas uses the dev ADMIN_TOKEN (see .env)
   Logs:      /tmp/molecule-platform.log · /tmp/molecule-canvas.log
-             docker logs molecule-core-langfuse-1   (trace sink)
+             docker logs ${LANGFUSE_CONTAINER}   (trace sink)
              docker logs molecule-core-minio-1      (object store)
 
   Ports are dynamic: the conventional port is used when free, else a free

@@ -59,15 +59,17 @@ env:
 
 jobs:
   # ===========================================================================
-  # REQUIRED gate — stub runtime, fast. This IS meant to be a required merge gate
-  # (the only mandatory coverage for the LOCAL Docker provisioner), but the new
-  # context is not yet in branch_protections/main — wire it in once the operator
-  # confirms the docker-host runners reliably provision sibling containers from
-  # the host platform binary for this lane (see SUBSTRATE REQUIREMENT above), then
-  # flip the directive below to `# bp-required: yes`. Until then it runs gating
-  # locally (continue-on-error: false) but un-wired in BP, an acknowledged
-  # asymmetry tracked for follow-up. (Earlier this block read `# bp-exempt`, which
-  # contradicted "REQUIRED gate" and tripped lint-required-context-exists-in-bp.)
+  # REQUIRED merge gate — stub runtime, fast; the only mandatory coverage for
+  # the LOCAL Docker provisioner. ENFORCED TODAY on two layers (do not read the
+  # `pending` directive below as "not enforced"):
+  #   1. This context is listed above the `# pending-` marker in
+  #      .gitea/required-contexts.txt, so the merge queue PRESENCE-requires it:
+  #      it must post AND be green on the PR head (#3181, real since #4363).
+  #   2. branch_protections/main uses status_check_contexts=['*'] — every
+  #      posted context must be success (#4363 '*' semantics).
+  # The directive stays `pending` only because BP does not list this context by
+  # its literal name (it relies on '*'), and `bp-required: yes` makes the lint
+  # demand literal membership. #2409 tracks retiring that gap.
   # bp-required: pending #2409
   # ===========================================================================
   lifecycle-stub:
@@ -143,10 +145,12 @@ jobs:
           # lifecycle script also uses alpine to seed config.yaml into the
           # named config volume. Pre-pull + ensure the bridge (idempotent).
           docker pull alpine:3 >/dev/null
-          # Pre-pull the exact digest-pinned alpine image the platform server
-          # uses for token-write helper containers (workspace-server/Dockerfile
-          # and provisioner.go). Without this, the real-image advisory job can
-          # fail when the runner cache does not already contain the pinned SHA.
+          # Pre-pull the exact digest-pinned alpine image provisioner.go's
+          # alpineImageDefault uses for token-write helper containers
+          # (deliberately NOT workspace-server/Dockerfile's base digest, which
+          # is the single-arch mirror re-pin; do not "re-sync" them). Without
+          # this, the real-image advisory job can fail when the runner cache
+          # does not already contain the pinned SHA.
           docker pull alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e >/dev/null
           docker network create molecule-core-net >/dev/null 2>&1 || true
           # SEV-2499 / mc#2499: connect the act_runner job container to
@@ -163,6 +167,39 @@ jobs:
             echo "WARN: could not connect job container to molecule-core-net (fallback to gateway)."
           fi
           echo "alpine:3 pre-pulled; molecule-core-net ensured."
+
+      - name: Verify digest pins are multi-arch (amd64+arm64)
+        run: |
+          # Guards the invariant documented in docker-compose.infra.yml: every
+          # fixed image pin must be a multi-arch manifest-list/index digest. A
+          # platform-specific digest reads identically in review but breaks
+          # arm64 dev hosts (redis-cli segfaults under qemu, ClickHouse
+          # aborts). FAIL-CLOSED: a runner without buildx fails the job rather
+          # than silently downgrading this gate to advisory — fix the runner,
+          # not the check (docker-host runners already run buildx imagetools
+          # in the publish workflows).
+          if ! docker buildx version >/dev/null 2>&1; then
+            echo "::error::docker buildx unavailable on this runner — multi-arch pin verification cannot run (gate is fail-closed)"
+            exit 1
+          fi
+          # Scope: the two compose files only. provisioner.go's alpine helper
+          # pin is EXCLUDED — it is knowingly single-arch until a multi-arch
+          # index is hosted on the internal mirror (see the comment on
+          # alpineImageDefault); adding it here would red this gate on a known,
+          # documented exception.
+          refs=$(grep -hoE 'image: [^ ]+@sha256:[a-f0-9]{64}' docker-compose.yml docker-compose.infra.yml | sed 's/^image: //' | sort -u)
+          rc=0
+          for ref in $refs; do
+            plats=$(docker buildx imagetools inspect "$ref" 2>/dev/null | grep -E '^[[:space:]]+Platform:' | awk '{print $2}')
+            if ! printf '%s\n' "$plats" | grep -qx 'linux/amd64' \
+               || ! printf '%s\n' "$plats" | grep -q '^linux/arm64'; then
+              echo "::error::NOT MULTI-ARCH: $ref [$(printf '%s' "$plats" | tr '\n' ' ')]"
+              rc=1
+            else
+              echo "ok: $ref"
+            fi
+          done
+          exit $rc
 
       - name: Start Postgres (docker, ephemeral host port)
         run: |
@@ -532,8 +569,10 @@ jobs:
       - name: Ensure provisioner network + pre-pull alpine
         run: |
           docker pull alpine:3 >/dev/null
-          # Pre-pull the exact digest-pinned alpine image the platform server
-          # uses for token-write helper containers.
+          # Pre-pull the exact digest-pinned alpine image provisioner.go's
+          # alpineImageDefault uses for token-write helper containers
+          # (deliberately differs from the Dockerfile's single-arch mirror
+          # re-pin).
           docker pull alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e >/dev/null
           docker network create molecule-core-net >/dev/null 2>&1 || true
           # Workspace containers join molecule-core-net. The act_runner job
