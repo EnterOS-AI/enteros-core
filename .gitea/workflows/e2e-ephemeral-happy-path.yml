@@ -372,25 +372,6 @@ jobs:
           DIND_NS: ${{ github.run_id }}-ephemeral
         run: bash tests/harness/dind.sh down
 
-      # THE CATCH-ALL. A job whose every step SKIPS still SUCCEEDS — and this
-      # context is a required one, so a green with no arm run is a silent hole.
-      # That is not hypothetical: the guard suite for this very file passed
-      # `5 OK` against a workflow whose proof step was `if: false`. Shape-matching
-      # step conditions cannot catch that; a runtime sentinel can.
-      #
-      # Exactly one arm must have run: `proof` (the gate) or `noop` (docs-only).
-      # The fork arm exits 1 and never reaches here.
-      - name: Assert an arm actually ran (no silent green)
-        if: always() && !cancelled()
-        run: |
-          set -euo pipefail
-          ARM="${GATE_ARM:-}"
-          if [ -z "$ARM" ]; then
-            echo "::error::NO ARM RAN. Every step in this job skipped, so the job would have posted SUCCESS on a REQUIRED context having proved nothing. Some `if:` condition is wrong — the gate did not run, and it did not honestly no-op either."
-            exit 1
-          fi
-          echo "arm=$ARM"
-
       # Fork PR + code diff: FAIL. A fork gets no e2e creds by design, so the gate
       # cannot run — and a gate that cannot observe its subject must not report
       # success. This step used to `::notice::` and exit 0, i.e. post GREEN on an
@@ -419,3 +400,26 @@ jobs:
           echo "The ephemeral happy-path topology cannot be affected by this diff, so it was not spun up."
           echo "This context is GREEN so the required check is satisfied without burning ~6min + a live LLM call."
           echo "GATE_ARM=noop" >> "$GITHUB_ENV"
+      # THE CATCH-ALL. A job whose every step SKIPS still SUCCEEDS — and this
+      # context is a required one, so a green with no arm run is a silent hole.
+      # That is not hypothetical: the guard suite for this very file passed
+      # `5 OK` against a workflow whose proof step was `if: false`. Shape-matching
+      # step conditions cannot catch that; a runtime sentinel can.
+      #
+      # Exactly one arm must have run: `proof` (the gate) or `noop` (docs-only).
+      # The fork arm exits 1 and never reaches here.
+      #
+      # ORDERING IS LOAD-BEARING: this sentinel must be the LAST step — after
+      # every arm that can stamp GATE_ARM. It originally sat above the no-op
+      # arm, so every docs-only PR failed here before the arm could stamp
+      # (first hit: PR #4413, 2026-07-17). The guard test pins this order.
+      - name: Assert an arm actually ran (no silent green)
+        if: always() && !cancelled()
+        run: |
+          set -euo pipefail
+          ARM="${GATE_ARM:-}"
+          if [ -z "$ARM" ]; then
+            echo "::error::NO ARM RAN. Every step in this job skipped, so the job would have posted SUCCESS on a REQUIRED context having proved nothing. Some `if:` condition is wrong — the gate did not run, and it did not honestly no-op either."
+            exit 1
+          fi
+          echo "arm=$ARM"

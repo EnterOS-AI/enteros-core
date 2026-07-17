@@ -213,6 +213,27 @@ class TestEphemeralGateIsEnforced(unittest.TestCase):
             "condition bug it exists to catch.",
         )
 
+        # (b2) ORDERING IS LOAD-BEARING: the sentinel must come AFTER every arm
+        #     that can stamp GATE_ARM. Steps run top-to-bottom; a sentinel that
+        #     precedes the no-op arm fails BEFORE the arm can stamp — which made
+        #     every docs-only PR red on this REQUIRED context (first hit:
+        #     PR #4413, 2026-07-17). Negative control: reordering the sentinel
+        #     above the no-op arm makes this assertion fail.
+        sentinel_idx = steps.index(sentinel[0])
+        noop_idx = steps.index(noop[0])
+        self.assertGreater(
+            sentinel_idx, noop_idx,
+            "The GATE_ARM sentinel runs BEFORE the docs-only no-op arm, so a "
+            "docs-only PR fails the sentinel before the arm can stamp GATE_ARM=noop. "
+            "Move the sentinel below every stamping arm.",
+        )
+        proof_idx = steps.index(proof[0])
+        self.assertGreater(
+            sentinel_idx, proof_idx,
+            "The GATE_ARM sentinel runs BEFORE the proof arm — it can never observe "
+            "the proof stamp.",
+        )
+
         # (c) The fork arm must FAIL, not print-and-pass. Check the last effective
         #     command, not a substring: `echo "would exit 1"` must not satisfy this.
         fork = [
