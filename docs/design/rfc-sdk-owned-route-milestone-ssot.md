@@ -481,6 +481,70 @@ promote pattern already in the tree, so it is a known-safe rollout shape.
 
 ---
 
+## 12. Implementation checklist (what to replace · build · doc · cleanup)
+
+Actionable, PR-by-PR, keyed to the Phase 0→3 sequencing in §7. Nothing here is
+built yet; boxes are unchecked by design. Each core PR is an SOP PR (2 genuine
+reviews), negative-controlled, and — for any new `tests/e2e/*_unit.sh` — wired
+into `ci.yml` by an **explicit** line (the #112 vacuity class; they are not
+globbed).
+
+### 12.1 What gets replaced (before → after)
+
+| # | Drift source today | Replaced / superseded by | Repo | Kept or removed |
+|---|---|---|---|---|
+| WR1 | Hand-maintained `required="provisioned tenant_online workspace_online a2a_roundtrip"` (`test_staging_full_saas.sh:200`) | Value **derived** from `molcontracts.HappyPathMilestones` (static-assert unit, or `go run` helper — Q1) | core | **Removed** (the literal string deleted once the derive-gate is required) |
+| WR2 | Core router as the **sole** route authority (`assert_e2e_tenant_contract.py` regex-parses `router.go` only) | SDK `routes.manifest.json` becomes the route **SSOT**; core's router is **checked against it** by the route derive-gate | SDK + core | Guard **kept** as positive-presence (§5); its role narrows from "authority" to "does core serve what the scripts call" |
+| WR3 | SDK workspace-comms contracts carry **body only**, no route | + machine-readable route descriptor (Option B `routes.manifest.json`, D1) | SDK | **Added** |
+| WR4 | No generated route/milestone Go binding | `routes_gen.go` + `happy_path_gen.go` emitted by `gen-go`, vendored via the existing `go.mod:25` pin | SDK→core | **Added** |
+| WR5 | ~6 proven-but-**unstamped** lifecycle stages (§2.2 table) | `live_milestone <id>` stamped at each **promoted** stage (§6) | core runner | **Added** (stamps), the "proves-but-doesn't-require" hole **removed** |
+| WR6 | SDK `happy-path/README.md` describes the derive plan as **aspiration** ("core reads the embedded milestone set instead of hand-maintaining …") | Same doc updated to describe it as **implemented**, pointing at the shipped binding + gate | SDK | Rewording (**cleanup**, 12.4) |
+
+### 12.2 Build checklist (per PR)
+
+**Phase 0 — SDK capture (additive, no core impact)**
+- [ ] `PR-SDK-1`: add `contracts/workspace-comms/routes.manifest.json` (the 9 registry+A2A routes, §4.1) + a `routes.manifest.schema.json` requiring `schema_version`, `owned_scope`, `routes[].{id,method,path}`, `headers[]`.
+- [ ] Extend `tools/gen-go.mjs` `molcontracts` block to emit `gen/go/molcontracts/routes_gen.go` (ordered `[]Route{Method,Path}` + contract-lane headers) and `gen/go/molcontracts/happy_path_gen.go` (ordered milestone `id`+`order`+`summary`), both with the `DO NOT EDIT` header.
+- [ ] Confirm the SDK **codegen-drift gate** covers the two new files (re-run generator → zero diff); negative-control by hand-editing a `_gen.go` and seeing the gate RED.
+- [ ] Publish a new `go.moleculesai.app/sdk/gen/go` module version carrying the bindings.
+
+**Phase 1 — core vendor + shadow gates (non-blocking)**
+- [ ] `PR-CORE-1`: bump `workspace-server/go.mod:25` to the Phase-0 module version; `go mod tidy`; confirm `molcontracts.SDKRoutes` / `.HappyPathMilestones` import.
+- [ ] Add the **route derive-gate** (Go test in `workspace-server`, or standalone cross-repo workflow — Q2): every `molcontracts.SDKRoutes` entry is registered in `router.go` under the same method; reuse gin `matches()` semantics (R2). Land it `continue-on-error: true` **or** as a standalone workflow **not** in branch protection (the `mcp-plugin-delivery-contract-drift.yml` pattern).
+- [ ] Add the **milestone derive-gate** (`tests/e2e/<name>_unit.sh` **with an explicit `ci.yml` invocation line**, or a Go static test): asserts the runner's required set == the binding's promoted-id list. Land non-blocking.
+- [ ] Negative-control **both** gates on a scratch branch (declare a phantom SDK route; make `required=` wrong) → confirm each REDs; restore.
+
+**Phase 2 — core stamp + derive (still non-blocking gate)**
+- [ ] `PR-CORE-2`: add `live_milestone <id>` at each **promoted** stage (§6): `memory_online` (`:1975-2022`), `delegation_provenance` (`:2161-2302`), `cascade_guard` (`:2354-2363`), `lifecycle_pause_resume` (`:2389-2404`), `lifecycle_hibernate_wake` **idle-only summary** (`:2407-2475`).
+- [ ] Switch `require_live_or_die`'s required set (`:200`) to **derive** from the binding (WR1); make it **mode-aware** so smoke / `E2E_LIFECYCLE=off` runs don't false-`exit 5` on a legitimately-skipped promoted stage.
+- [ ] Prove a real live staging run stamps the **full** promoted set (read the run log; §7 Phase 2).
+
+**Phase 3 — promote to required (can now jam; by construction green)**
+- [ ] `PR-CORE-3`: flip both derive-gates to `continue-on-error: false`; add their context(s) to `.gitea/required-contexts.txt`. Only after a green soak across real PRs (§7).
+- [ ] Verify the promoted context actually runs on the PR path (not a paths-gated no-op) before trusting it as a gate.
+
+### 12.3 Doc-update checklist
+- [ ] SDK `contracts/happy-path/README.md`: aspiration → **implemented** (name the shipped `happy_path_gen.go` + the core derive-gate). (WR6)
+- [ ] SDK `contracts/workspace-comms/` README (or a new `routes.manifest`-adjacent note): document `routes.manifest.json`, the `owned_scope` boundary (N1), and that adding a non-owned core route here is rejected by the gate (I4).
+- [ ] core `docs/e2e-ephemeral-gate.md`: note the required-milestone set is **SDK-derived**, list the promoted ids, and update the "Roadmap"/"Bugs this gate caught" sections (hibernate-force still idle-only until #92).
+- [ ] core `tests/e2e/lib/assert_e2e_tenant_contract.py` docstring: add a line that a complementary **route derive-gate** now owns SDK↔core route parity, and this guard remains the positive-presence check (§5 table).
+- [ ] **This RFC**: on sign-off, flip `Status: proposed → accepted`, record the D1–D4 answers inline, and link the landed PRs.
+
+### 12.4 Cleanup checklist
+- [ ] Delete the literal `required=` string once the derive-gate is required (WR1) — no hand-maintained milestone list left in the runner.
+- [ ] Remove any runner comments that describe milestones as hand-maintained (they become false once derived).
+- [ ] Remove the aspirational "already anticipates / will pick up" wording from the SDK README (WR6) — replace with the implemented reference.
+- [ ] Confirm **no third copy** of the registry/A2A route strings exists beyond {SDK descriptor, core router} — grep for stray hardcoded `/registry/*` / `/workspaces/:id/a2a*` lists in scripts/tests and fold any into the derived source.
+- [ ] Delete the scratch negative-control commits/branches used to prove the gates (12.2).
+
+### 12.5 Definition of done
+- [ ] The SDK declares the registry+A2A routes and the happy-path milestone set; `gen-go` emits both bindings; the SDK codegen-drift gate keeps them byte-stable.
+- [ ] Core vendors the bindings; the route derive-gate REDs on SDK↔core route divergence and the milestone derive-gate REDs on a required-set mismatch — both **negative-controlled** and both **promoted to required** after a green soak.
+- [ ] The runner stamps every promoted milestone at a stage it already hard-asserts (I3); no hand-maintained list remains (WR1); hibernate-wake carries the idle-only summary pending #92 (§6 caveat).
+- [ ] All 12.3 docs updated; all 12.4 cleanups done; this RFC marked accepted with D1–D4 recorded.
+
+---
+
 ## Appendix A — file:line index (grounding)
 
 **molecule-core** (main):
