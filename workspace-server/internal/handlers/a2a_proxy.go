@@ -775,9 +775,11 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// Dispatching now falls to poll-mode 'queued' and hangs with no reply (the
 	// 675s dead-air the principal hit in test1). Defer a real caller with 503 +
 	// Retry-After (the canvas renders a warming state and auto-retries post-flip,
-	// mirroring the existing hibernation-wake contract). EXEMPT system callers —
-	// system:concierge-warmup MUST reach the runtime DURING warming, it produces
-	// the loaded_mcp_tools capture that drives the verified flip — and self-calls.
+	// mirroring the existing hibernation-wake contract). EXEMPT system callers and
+	// self-calls — a platform/system self-turn (callerID "system:…") must reach the
+	// runtime during warming. (EV2 retired the fireConciergeWarmup readiness turn;
+	// the provisioning->online flip is now driven by the runtime's mcp_tools_ready
+	// heartbeat event, not a synthetic warmup turn.)
 	// Placed AFTER access-control + budget + can_delegate so an unauthorized /
 	// over-budget caller still gets 403/429 first (denial hierarchy preserved),
 	// and BEFORE persist so a deferred call leaves no half-persisted bubble.
@@ -1131,30 +1133,6 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	}
 
 	return resp.StatusCode, respBody, nil
-}
-
-// SendConciergeWarmupA2A adapts proxyA2ARequest to the RegistryHandler's
-// WarmupSendFunc signature for the concierge warmup (core#3082 keystone). The
-// router wires it via rh.SetWarmupSendFunc(wh.SendConciergeWarmupA2A) — the
-// same exported-method late-wiring pattern as rh.SetQueueDrainFunc(
-// wh.DrainQueueForWorkspace). It REUSES the exact internal A2A dispatch +
-// auth + URL-resolution mechanism that delegations use (proxyA2ARequest →
-// resolveAgentURL → dispatchA2A); no new auth path is invented.
-//
-// logActivity=false: the warmup is an internal readiness probe, not a
-// user/agent turn worth recording in activity_logs. isCanvasUser=false: the
-// system caller (callerID "system:…") is trusted via isSystemCaller and is
-// NOT treated as a delegation (so can_delegate is irrelevant) and NOT a
-// canvas user.
-//
-// The typed *proxyA2AError is converted to a plain error explicitly: a nil
-// pointer assigned to an error interface would otherwise be a non-nil error.
-func (h *WorkspaceHandler) SendConciergeWarmupA2A(ctx context.Context, workspaceID string, body []byte, callerID string) (int, []byte, error) {
-	status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, body, callerID, false, false)
-	if proxyErr != nil {
-		return status, respBody, proxyErr
-	}
-	return status, respBody, nil
 }
 
 // conciergeWarmingGate returns a 503 + Retry-After deferral when the target is a
