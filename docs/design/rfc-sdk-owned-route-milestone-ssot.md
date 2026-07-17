@@ -1,11 +1,22 @@
 # RFC: SDK-owned route + milestone SSOT with a codegen derive-gate (closes the #87/#88 drift class)
 
-**Status:** proposed (awaiting CTO sign-off to build) · **Author:** CEO-assistant · **Date:** 2026-07-16
+**Status:** ACCEPTED 2026-07-17 (CTO sign-off) · **Author:** CEO-assistant · **Date:** 2026-07-16
 
-> Scope note: this is a **proposal for sign-off**, not a landed design. The CTO
-> ruled "Full SSOT (arch RFC)" for this drift class; this doc specifies it and
-> asks for the specific decisions in §10. No generator, gate, or contract field
-> is built yet.
+> ACCEPTED by the CTO on 2026-07-17 with the author-recommended decisions.
+> Implementation proceeds per §12, capture-first (Phase 0 in the SDK) then enforce.
+
+> **Decisions recorded (D1–D4, §10):**
+> - **D1 = Option B** — a single `contracts/workspace-comms/routes.manifest.json`
+>   with an `owned_scope` field.
+> - **D2 = confirmed** — the SDK route authority is **registry + A2A only** (the
+>   nine endpoints in §4.1); the full ~50-route tenant surface is an explicit
+>   non-goal (N1), a separate RFC if ever wanted.
+> - **D3 = as recommended** — promote {`memory_online`, `delegation_provenance`,
+>   `cascade_guard`, `lifecycle_pause_resume`, `lifecycle_hibernate_wake`
+>   (idle-only summary, §6 caveat, gated on #92)}; keep {`activity_logged`,
+>   `workspace_kv_edit`} optional.
+> - **D4 = approved** — capture-first-then-enforce (§7): shadow/non-blocking
+>   through Phase 1–2, promote to branch-protection-required only after a green soak.
 
 ## 1. Summary & the decision requested
 
