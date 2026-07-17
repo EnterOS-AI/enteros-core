@@ -825,6 +825,19 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 		log.Printf("CascadeDelete schedule disable for %s: %v", id, err)
 	}
 
+	// P4b (core#4435): CAPTURE each volume-native workspace's user-created
+	// (source='runtime') schedule grid into workspaces.carryover_runtime_schedules
+	// NOW — BEFORE stopAndRemove tears the container down. This MUST run while the
+	// container is still up: for a volume-native workspace the grid lives on the
+	// runtime's persisted volume behind its /internal/schedules API, which dies the
+	// instant the container stops (stopWorkspaceForDelete below). The volume itself
+	// survives (erase=false), but a fresh-volume org re-import mints a NEW id +
+	// volume and would abandon it — so RestoreInheritedRuntimeSchedules can only
+	// replay what we buffer here. Best-effort by contract: any resolve/fetch/persist
+	// failure is logged and skipped, never blocking teardown. Non-volume (legacy
+	// DB-backed) ids are skipped — their schedules already persist in the table.
+	captureRuntimeSchedulesForCarryover(ctx, allIDs)
+
 	cleanupCtx, cleanupCancel := context.WithTimeout(
 		context.WithoutCancel(ctx), 30*time.Second)
 	defer cleanupCancel()
@@ -862,6 +875,83 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 	})
 
 	return descendantIDs, stopErrs, nil
+}
+
+// captureRuntimeSchedulesForCarryover buffers each volume-native workspace's
+// user-created (source='runtime') schedule grid into
+// workspaces.carryover_runtime_schedules ahead of teardown, so a fresh-volume
+// org re-import can restore them onto the successor (RestoreInheritedRuntimeSchedules).
+// See core#4435 / the P4b staged-retirement doc (#4450).
+//
+// DECISIVE TIMING CONSTRAINT: a volume-native workspace's schedule grid lives on
+// its persisted volume, served ONLY by the runtime's /internal/schedules API,
+// which stops answering the moment the container stops. CascadeDelete deletes on
+// an erase=false teardown (the volume persists) but the re-import path allocates a
+// fresh id + volume, abandoning the old grid. So capture MUST happen here, before
+// the container is stopped — the successor cannot read the predecessor grid later.
+//
+// Best-effort by contract: unreachable / timeout / non-200 / malformed → log and
+// continue (NEVER block a delete). Each forward is bounded by
+// scheduleForwardTimeout (fetchScheduleAPI's own deadline). Legacy DB-backed ids
+// (scheduleBackendIsVolume==false) are skipped — their schedules already persist
+// in workspace_schedules and are re-pointed by the DB-world path.
+//
+// The captured JSON is exactly the filtered array of source='runtime' grid
+// entries. Template-source entries are intentionally NOT captured — the org
+// template reconcile re-seeds those on the successor's volume, so carrying them
+// would duplicate (and, on a name collision, template wins — matching the DB
+// world's NOT EXISTS guard in migrateRuntimeSchedulesFromRemovedPredecessor).
+func captureRuntimeSchedulesForCarryover(ctx context.Context, ids []string) {
+	if db.DB == nil {
+		return
+	}
+	for _, id := range ids {
+		if !scheduleBackendIsVolume(id) {
+			continue // legacy DB-backed workspace — schedules persist in the table
+		}
+		wsURL, secret, err := resolveScheduleFanoutTarget(ctx, id)
+		if err != nil {
+			log.Printf("carryover-capture: resolve %s failed (skipping, teardown continues): %v", id, err)
+			continue
+		}
+		status, body, err := fetchScheduleAPI(ctx, wsURL, secret, http.MethodGet, "", nil)
+		if err != nil {
+			log.Printf("carryover-capture: grid fetch %s failed (skipping, teardown continues): %v", id, err)
+			continue
+		}
+		if status != http.StatusOK {
+			log.Printf("carryover-capture: grid fetch %s returned %d (skipping, teardown continues)", id, status)
+			continue
+		}
+		var grid struct {
+			Schedules []volumeEntry `json:"schedules"`
+		}
+		if err := json.Unmarshal(body, &grid); err != nil {
+			log.Printf("carryover-capture: malformed grid from %s (skipping): %v", id, err)
+			continue
+		}
+		runtimeEntries := make([]volumeEntry, 0, len(grid.Schedules))
+		for _, e := range grid.Schedules {
+			if e.Source == "runtime" {
+				runtimeEntries = append(runtimeEntries, e)
+			}
+		}
+		if len(runtimeEntries) == 0 {
+			continue // nothing user-authored to carry
+		}
+		raw, err := json.Marshal(runtimeEntries)
+		if err != nil {
+			log.Printf("carryover-capture: marshal %s failed (skipping): %v", id, err)
+			continue
+		}
+		if _, err := db.DB.ExecContext(ctx,
+			`UPDATE workspaces SET carryover_runtime_schedules = $1::jsonb, updated_at = now() WHERE id = $2`,
+			raw, id); err != nil {
+			log.Printf("carryover-capture: persist %s failed (skipping): %v", id, err)
+			continue
+		}
+		log.Printf("carryover-capture: buffered %d runtime schedule(s) for %s ahead of teardown", len(runtimeEntries), id)
+	}
 }
 
 // PatchTemplate handles PATCH /workspaces/:id/template.
