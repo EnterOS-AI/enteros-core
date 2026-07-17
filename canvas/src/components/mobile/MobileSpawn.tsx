@@ -11,6 +11,7 @@
 import { useEffect, useState } from "react";
 
 import { api } from "@/lib/api";
+import { createWorkspaceWithRetry } from "@/lib/workspaceCreateRetry";
 import { type Template } from "@/lib/deploy-preflight";
 import { isSaaSTenant } from "@/lib/tenant";
 
@@ -66,7 +67,7 @@ export function MobileSpawn({ dark, onClose }: { dark: boolean; onClose: () => v
     setError(null);
     setBusy(true);
     try {
-      await api.post<{ id: string }>("/workspaces", {
+      await createWorkspaceWithRetry<{ id: string }>({
         name: (name.trim() || chosen.name),
         template: chosen.id,
         tier: isSaaS ? 4 : Number(tier.slice(1)),

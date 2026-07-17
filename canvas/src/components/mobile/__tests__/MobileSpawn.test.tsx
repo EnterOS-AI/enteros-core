@@ -44,12 +44,19 @@ const { apiGetSpy, apiPostSpy } = vi.hoisted(() => {
   return { apiGetSpy: vi.fn(), apiPostSpy: vi.fn() };
 });
 
-vi.mock("@/lib/api", () => ({
-  api: {
-    get: apiGetSpy,
-    post: apiPostSpy,
-  },
-}));
+// Spread the real module so PlatformUnavailableError (used by the create
+// path's cold-origin retry classifier, workspaceCreateRetry.ts) stays a real
+// constructor for `instanceof`; only the `api` object's methods are spied.
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    api: {
+      get: apiGetSpy,
+      post: apiPostSpy,
+    },
+  };
+});
 
 afterEach(() => {
   cleanup();

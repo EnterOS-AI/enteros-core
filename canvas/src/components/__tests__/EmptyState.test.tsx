@@ -46,12 +46,19 @@ const { mockSelectNode, mockSetPanelTab } = vi.hoisted(() => ({
 
 // ─── Mocks ────────────────────────────────────────────────────────────────────
 
-vi.mock("@/lib/api", () => ({
-  api: {
-    get: mockApiGet,
-    post: mockApiPost,
-  },
-}));
+// Spread the real module so PlatformUnavailableError (used by the create
+// path's cold-origin retry classifier, workspaceCreateRetry.ts) stays a real
+// constructor for `instanceof`; only the `api` object's methods are mocked.
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    api: {
+      get: mockApiGet,
+      post: mockApiPost,
+    },
+  };
+});
 
 vi.mock("@/hooks/useTemplateDeploy", () => ({
   useTemplateDeploy: () => ({

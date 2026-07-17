@@ -25,6 +25,20 @@ export interface RequestOptions {
 }
 
 /**
+ * Error thrown by `request()` on a non-ok HTTP response. Carries the raw
+ * signals a caller-side classifier needs without re-parsing the message:
+ *  - `status`   — the HTTP status code
+ *  - `bodyText` — the raw (possibly empty) response body
+ *  - `retryAfter` — the origin's `Retry-After` header, or null
+ * `workspaceCreateRetry.ts` classifies the cold-origin 503 window off these.
+ */
+export type ApiError = Error & {
+  status?: number;
+  bodyText?: string;
+  retryAfter?: string | null;
+};
+
+/**
  * Build the platform auth header set used by every authenticated fetch
  * from the canvas. Returns a fresh object so callers can mutate (e.g.
  * append `Content-Type` for JSON requests, omit it for FormData).
@@ -166,11 +180,19 @@ async function request<T>(
         if (err instanceof PlatformUnavailableError) throw err;
       }
     }
-    const apiErr = new Error(`API ${method} ${path}: ${res.status} ${text}`);
+    const apiErr = new Error(`API ${method} ${path}: ${res.status} ${text}`) as ApiError;
     // Attach the HTTP status so callers can branch without parsing the
     // message (e.g. useChatSend treats a Cloudflare 524/522/504 on a held
     // long A2A turn as "still processing", not "agent unreachable").
-    (apiErr as Error & { status?: number }).status = res.status;
+    apiErr.status = res.status;
+    // Attach the raw response body and Retry-After so the cold-origin
+    // create-retry classifier (workspaceCreateRetry.ts) can decide on the
+    // SAME raw signals as the E2E's tests/e2e/lib/workspace_create_retry.sh:
+    // emptiness of the body is the "never reached a handler" signal, and the
+    // origin's Retry-After bounds the backoff. `headers` is optional-chained
+    // so error mocks without a Headers object don't throw here.
+    apiErr.bodyText = text;
+    apiErr.retryAfter = res.headers?.get?.("Retry-After") ?? null;
     throw apiErr;
   }
   return res.json();

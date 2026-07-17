@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useState, type ReactNode } from "react";
-import { api } from "@/lib/api";
+import { createWorkspaceWithRetry } from "@/lib/workspaceCreateRetry";
 import {
   checkDeploySecrets,
   resolveRuntime,
@@ -123,7 +123,7 @@ export function useTemplateDeploy(
               x: Math.random() * 400 + 100,
               y: Math.random() * 300 + 100,
             };
-        const ws = await api.post<{ id: string }>("/workspaces", {
+        const ws = await createWorkspaceWithRetry<{ id: string }>({
           name: template.name,
           template: template.id,
           tier: isSaaSTenant() ? 4 : template.tier,

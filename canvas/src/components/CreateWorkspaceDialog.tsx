@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback, useId, useMemo } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { api } from "@/lib/api";
+import { createWorkspaceWithRetry } from "@/lib/workspaceCreateRetry";
 import {
   FALLBACK_COMPUTE_OPTIONS,
   type ComputeOptions,
@@ -381,12 +382,12 @@ export function CreateWorkspaceButton() {
       const [displayWidth, displayHeight] = displayResolution.split("x").map((v) => parseInt(v, 10));
       const parsedRootGB = parseInt(displayRootGB, 10);
 
-      const createResp = await api.post<{
+      const createResp = await createWorkspaceWithRetry<{
         id: string;
         status: string;
         external?: boolean;
         connection?: ExternalConnectionInfo;
-      }>("/workspaces", {
+      }>({
         name: name.trim(),
         role: role.trim() || undefined,
         // External workspaces don't consume a template — skip it so the
