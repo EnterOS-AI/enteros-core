@@ -2741,28 +2741,172 @@ fi
 if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
   _SCHED_TIMEOUT_SECS="${E2E_SCHEDULER_TIMEOUT_SECS:-360}"
   _SCHED_POLL_SECS="${E2E_SCHEDULER_POLL_SECS:-10}"
+  # Bounded pre/post-create waits that CLOSE the #4448 arm race instead of hiding
+  # it behind a longer fire timeout. cap-ready gates the create on the trigger
+  # daemon having armed (necessary precondition); create-verify then re-issues the
+  # create through the capability-advertisement lag until the schedule is CONFIRMED
+  # on the runtime volume grid — so a create that silently mis-routed to the
+  # retired DB (native-scheduler not advertised in core yet) is retried into place
+  # rather than firing nowhere for ${_SCHED_TIMEOUT_SECS}s (armed:0).
+  _SCHED_CAP_TIMEOUT_SECS="${E2E_SCHEDULER_CAP_TIMEOUT_SECS:-120}"
+  _SCHED_CREATE_TIMEOUT_SECS="${E2E_SCHEDULER_CREATE_TIMEOUT_SECS:-120}"
   # A run-unique name so the durable history/grid probe can't match a stale entry
   # from another run sharing a recycled container, and so the fired-log grep is
   # unambiguous. Bounded + cron-safe (no spaces/quotes).
   _SCHED_NAME="e2e-fire-${E2E_RUN_ID:-local}"
 
   if idle_digest_require_docker; then
-    # Create the schedule via the tenant API (the exact path Canvas uses). A
-    # `* * * * *` cron fires at the top of every minute; combined with the
-    # injected MOLECULE_TRIGGER_POLL_SECONDS the daemon evaluates it within the
-    # poll window. A non-2xx here is a REACHABLE fail arm (routing/plugin/auth).
-    log "10d/11 Scheduler: creating '* * * * *' schedule '$_SCHED_NAME' on $PARENT_ID via the tenant API..."
-    _SCHED_TMP=$(mktemp)
-    _SCHED_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/schedules" \
-      -H "Content-Type: application/json" \
-      -d "{\"name\":\"$_SCHED_NAME\",\"cron_expr\":\"* * * * *\",\"timezone\":\"UTC\",\"prompt\":\"E2E scheduler self-fire probe — reply OK.\"}" \
-      -o "$_SCHED_TMP" -w '%{http_code}' 2>/dev/null) || true
-    _SCHED_BODY=$(cat "$_SCHED_TMP" 2>/dev/null | sanitize_http_body); rm -f "$_SCHED_TMP"
-    if ! echo "$_SCHED_CODE" | grep -Eq '^2[0-9][0-9]$'; then
-      fail "Scheduler: create schedule returned http=$_SCHED_CODE (expected 2xx): ${_SCHED_BODY:0:300}. A 5xx/failed-forward here means the workspace did NOT advertise the native-scheduler capability — the molecule-scheduler plugin never boot-installed / the daemon never armed, so create fell through to the retired DB path. Check MOLECULE_DECLARED_PLUGINS reached the container and the trigger scaffold is present in the runtime pin."
-    fi
-    ok "    schedule created (http=$_SCHED_CODE) — routed to the runtime volume grid"
+    # Shared diagnostics — used by ALL fail arms below (cap-ready, create-verify,
+    # fire poll), so define it once up front. Dumps the on-volume grid + daemon
+    # heartbeat + run log for every mol-ws container so a failure names the leg.
+    scheduler_diagnostics() {
+      local _sc _grid _health _hist _caps
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        _caps=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DECLARED_PLUGINS|TRIGGER)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
+        log "    [scheduler diag] $_sc env: ${_caps:-none}"
+        log "    [scheduler diag] $_sc grid: ${_grid:-ABSENT (create never reached the volume — capability/routing gap)}"
+        log "    [scheduler diag] $_sc health: ${_health:-ABSENT (daemon never wrote a heartbeat — not armed)}"
+        log "    [scheduler diag] $_sc history: ${_hist:-ABSENT (no schedule ever fired)}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+    }
 
+    # ── 10d.1 Daemon-armed precondition (the "capability-ready" wait) ──
+    # BEFORE creating, wait until the trigger daemon is actually up and ticking.
+    # Observable proxy: the daemon writes /configs/schedules/schedule-health.json
+    # on every poll tick once it has armed; a NON-NULL `last_tick` proves it
+    # booted, armed its grid, and completed ≥1 poll cycle (`armed` may still be 0
+    # here — no schedule yet — that's expected). This cleanly separates the
+    # "plugin never boot-installed / daemon never armed" failure leg (health
+    # ABSENT here) from the capability-routing leg the create-verify loop handles
+    # next: the daemon being locally armed does NOT guarantee core has yet
+    # PROCESSED the heartbeat advertising `scheduler` (that lag is #4448 root cause
+    # #1), so the create step below re-issues the create until core routes it to
+    # the volume — this gate only guarantees the daemon exists to route to.
+    _SCHED_CAP_EVIDENCE=""
+    scheduler_capability_ready() {
+      local _sc _health
+      _SCHED_CAP_EVIDENCE=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null)
+        # Non-null quoted last_tick = daemon armed & ticking. A literal `null`
+        # (pre-first-tick fallback {"last_tick":null,...}) does NOT match, so the
+        # gate correctly keeps waiting until the daemon has actually ticked.
+        if printf '%s' "$_health" | grep -Eq '"last_tick"[[:space:]]*:[[:space:]]*"[^"]+"'; then
+          _SCHED_CAP_EVIDENCE="$_sc (schedule-health.json last_tick live)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    log "10d/11 Scheduler: waiting up to ${_SCHED_CAP_TIMEOUT_SECS}s for the trigger daemon to arm (schedule-health.json ticking) BEFORE creating the schedule — the daemon-ready precondition for the create-verify loop (#4448; poll=${_SCHED_POLL_SECS}s)."
+    if idle_digest_wait "$_SCHED_CAP_TIMEOUT_SECS" "$_SCHED_POLL_SECS" scheduler_capability_ready; then
+      ok "    trigger daemon armed & ticking — ready to accept a volume-routed create (evidence: $_SCHED_CAP_EVIDENCE)"
+    else
+      scheduler_diagnostics
+      fail "Scheduler: the workspace never advertised native-scheduler within ${_SCHED_CAP_TIMEOUT_SECS}s (no mol-ws container wrote a daemon heartbeat with a live last_tick). The molecule-scheduler trigger plugin never boot-installed / the daemon never armed, so a schedule created now would mis-route to the retired DB path (post-#4399 fires nowhere → armed:0). The diagnostics above name the leg: ABSENT health = plugin didn't boot-install (check MOLECULE_DECLARED_PLUGINS reached the container and the trigger scaffold is present in the runtime pin)."
+    fi
+
+    # ── 10d.2 Create + verify it reached the volume grid (closes race #1 & #2) ──
+    # Create via the tenant API (the exact path Canvas uses); a `* * * * *` cron
+    # fires at the top of every minute. Then VERIFY the schedule actually landed
+    # on the daemon's volume grid (/configs/schedules/schedules.yaml — read from
+    # the container directly: ground truth, NOT through core's routing).
+    #
+    # The #4448 race: right after online, core may not yet have processed the
+    # workspace's heartbeat advertising the `scheduler` capability, so
+    # scheduleBackendIsVolume is false and the create SILENTLY routes to the
+    # retired workspace_schedules DB — a 2xx, but the schedule fires nowhere
+    # post-#4399 (armed:0). The create-response `id` is the deterministic routing
+    # tell: the volume path returns id==name, the DB path returns a generated UUID.
+    #
+    # So we RE-ISSUE the create through that capability lag (bounded), but only
+    # when it is SAFE: a re-create runs only while the schedule is NOT yet on the
+    # volume grid AND the id shows a DB-misroute (a UUID) — there is no
+    # unique(workspace_id,name) constraint (migration 015), so a repeated DB-routed
+    # insert is a harmless stray, and re-posting can't collide with a volume entry
+    # (no 409). Once core has the capability the next create routes to the volume
+    # and lands. A volume-routed create writes the grid synchronously, so once
+    # id==name we only poll for file visibility (never re-create → never 409).
+    _SCHED_GRID_EVIDENCE=""
+    scheduler_grid_has_entry() {
+      local _sc _grid
+      _SCHED_GRID_EVIDENCE=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null)
+        if printf '%s' "$_grid" | grep -Fq "$_SCHED_NAME"; then
+          _SCHED_GRID_EVIDENCE="$_sc (schedules.yaml)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    scheduler_create_once() {
+      # POST the schedule; sets _SCHED_CODE/_SCHED_BODY/_SCHED_ID. Returns 0 on a
+      # 2xx create, 1 otherwise. A non-2xx is a hard, non-retryable fail arm
+      # (routing/plugin/auth — e.g. a 502 volume-forward failure); the silent
+      # DB-misroute this step defends against returns 2xx, so callers treat a
+      # non-2xx as fatal.
+      local _tmp
+      _tmp=$(mktemp)
+      _SCHED_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/schedules" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"$_SCHED_NAME\",\"cron_expr\":\"* * * * *\",\"timezone\":\"UTC\",\"prompt\":\"E2E scheduler self-fire probe — reply OK.\"}" \
+        -o "$_tmp" -w '%{http_code}' 2>/dev/null) || true
+      _SCHED_BODY=$(cat "$_tmp" 2>/dev/null | sanitize_http_body); rm -f "$_tmp"
+      _SCHED_ID=$(printf '%s' "$_SCHED_BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+      echo "$_SCHED_CODE" | grep -Eq '^2[0-9][0-9]$'
+    }
+
+    _SCHED_CODE=""; _SCHED_BODY=""; _SCHED_ID=""
+    _sched_do_create=1     # create on the first iteration
+    _sched_elapsed=0
+    _sched_why=""; _sched_next=""
+    log "    Scheduler: creating '* * * * *' schedule '$_SCHED_NAME' on $PARENT_ID and verifying it reached the volume grid (retrying the capability-advertisement race for up to ${_SCHED_CREATE_TIMEOUT_SECS}s; poll=${_SCHED_POLL_SECS}s) — #4448."
+    while true; do
+      if [ "$_sched_do_create" = "1" ]; then
+        if ! scheduler_create_once; then
+          scheduler_diagnostics
+          fail "Scheduler: create schedule returned http=$_SCHED_CODE (expected 2xx): ${_SCHED_BODY:0:300}. A 5xx/failed-forward here means the create routed to the volume but the runtime forward failed, or an auth/plugin fault (the silent DB-misroute returns 2xx, not 5xx). Check the workspace runtime is reachable, MOLECULE_DECLARED_PLUGINS reached the container, and the trigger scaffold is present in the runtime pin."
+        fi
+        _sched_do_create=0
+      fi
+
+      if scheduler_grid_has_entry; then
+        break   # CONFIRMED on the volume grid — the only success arm
+      fi
+
+      # Grid-absent — classify from the create-response id (deterministic routing tell).
+      if printf '%s' "$_SCHED_ID" | grep -Eiq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+        _sched_why="create mis-routed to the retired DB (id='$_SCHED_ID' is a UUID) — native-scheduler capability not advertised in core yet"
+        _sched_do_create=1; _sched_next="re-creating"   # safe: not on the volume, so no 409; DB strays fire nowhere
+      elif [ "$_SCHED_ID" = "$_SCHED_NAME" ]; then
+        _sched_why="create routed to the volume (id='$_SCHED_ID') but the grid write is not visible yet"
+        _sched_do_create=0; _sched_next="re-polling"    # do NOT re-create a volume entry (would 409); just re-poll
+      else
+        _sched_why="routing unclear (id='${_SCHED_ID:-empty}')"
+        _sched_do_create=0; _sched_next="re-polling"    # conservative: re-poll rather than risk a volume 409
+      fi
+
+      if [ "$_sched_elapsed" -ge "$_SCHED_CREATE_TIMEOUT_SECS" ]; then
+        scheduler_diagnostics
+        fail "Scheduler: schedule '$_SCHED_NAME' never reached the volume grid within ${_SCHED_CREATE_TIMEOUT_SECS}s (last: $_sched_why; create http=$_SCHED_CODE). This is the #4448 mis-route/arm race: the create kept landing in the retired core DB (native-scheduler capability never advertised — molecule-scheduler plugin didn't boot-install / daemon didn't arm) OR the runtime grid write never landed — either way the daemon will never fire it. The grid/health diagnostics above name the leg: ABSENT grid = create never reached the volume."
+      fi
+
+      log "    Scheduler: not yet on the volume grid — $_sched_why; $_sched_next (${_sched_elapsed}/${_SCHED_CREATE_TIMEOUT_SECS}s)."
+      sleep "$_SCHED_POLL_SECS"
+      _sched_elapsed=$((_sched_elapsed + _SCHED_POLL_SECS))
+    done
+    ok "    schedule '$_SCHED_NAME' created (http=$_SCHED_CODE, id='$_SCHED_ID') and CONFIRMED on the volume grid (evidence: $_SCHED_GRID_EVIDENCE) — routed to the runtime volume, not the retired DB"
+
+    # ── 10d.4 Fire poll (unchanged final step) ──
     _SCHED_FIRED=""
     scheduler_fire_probe() {
       local _sc
@@ -2787,21 +2931,6 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
       return 1
     }
 
-    scheduler_diagnostics() {
-      local _sc _grid _health _hist _caps
-      while IFS= read -r _sc; do
-        [ -n "$_sc" ] || continue
-        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
-        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
-        _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
-        _caps=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DECLARED_PLUGINS|TRIGGER)" | sort | tr "\n" " "' 2>/dev/null || echo "exec-failed")
-        log "    [scheduler diag] $_sc env: ${_caps:-none}"
-        log "    [scheduler diag] $_sc grid: ${_grid:-ABSENT (create never reached the volume — capability/routing gap)}"
-        log "    [scheduler diag] $_sc health: ${_health:-ABSENT (daemon never wrote a heartbeat — not armed)}"
-        log "    [scheduler diag] $_sc history: ${_hist:-ABSENT (no schedule ever fired)}"
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
-    }
-
     log "    Scheduler: polling fire evidence for up to ${_SCHED_TIMEOUT_SECS}s (poll=${_SCHED_POLL_SECS}s)."
     if idle_digest_wait "$_SCHED_TIMEOUT_SECS" "$_SCHED_POLL_SECS" scheduler_fire_probe; then
       ok "    scheduler autonomously FIRED '$_SCHED_NAME' (evidence: $_SCHED_FIRED)"
@@ -2810,7 +2939,7 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
       fail "Scheduler never fired '$_SCHED_NAME' within ${_SCHED_TIMEOUT_SECS}s — the grid/health/history diagnostics above name the broken leg: ABSENT grid = create didn't reach the volume (capability not advertised); ABSENT health = daemon not armed (plugin didn't boot-install); grid+health present but no history = daemon armed but the trigger lane never delivered (self-scheduler turn path)."
     fi
 
-    unset -f scheduler_fire_probe scheduler_diagnostics
+    unset -f scheduler_capability_ready scheduler_create_once scheduler_grid_has_entry scheduler_fire_probe scheduler_diagnostics
   else
     fail "E2E_SCHEDULER_CHECK=on requires a usable Docker CLI and daemon to inspect fire evidence."
   fi
