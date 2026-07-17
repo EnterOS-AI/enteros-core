@@ -1,4 +1,6 @@
-# ADR-004: The SDK owns the runtime-adapter contract + official registry; the shared runtime engine is runtime-agnostic
+# ADR-005: The SDK owns the runtime-adapter contract + official registry; the shared runtime engine is runtime-agnostic
+
+> **Renumbered 2026-07-16** from ADR-004: two ADRs were accidentally issued the 004 number; [ADR-004-unconditional-concierge-and-one-ensure-flow](ADR-004-unconditional-concierge-and-one-ensure-flow.md) (2026-07-07) keeps it. Prose elsewhere (including other repos) written before this date that says "ADR-004 (SDK-owns-adapter socket)" means **this** document.
 
 **Status:** Proposed — supersedes ADR-003 §2 (dispatch-location) pending principal ratification
 **Date:** 2026-07-09
@@ -38,6 +40,7 @@ Adopt as committed architecture — enforced by guardrails so it cannot regress:
 - **Third-party runtimes become possible** without a `molecule_runtime` PR — they implement the SDK socket and register.
 - **Migration is staged, one vertical slice first:** (P1) land the SDK socket + registry + conformance suite; (P2) migrate **hermes** as the reference adapter (already validated live — 46 tools incl. `provision_workspace`) and prove the conformance suite green; (P3) migrate claude-code / codex / openclaw; (P4) delete the engine dispatch tables and flip G6/lockstep → the conformance gate + the ratchet. Each phase is independently mergeable and leaves the fleet green.
 - **`api-protocol` / the SDK `registry-contract.md`** remain the workspace↔platform wire contract; this ADR is about the *adapter* contract, a distinct seam.
+- **Scheduler decoupled (2026-07-15):** the last big core-baked runtime behaviour this ADR called out is gone — core carries **zero scheduler runtime code** (the `internal/scheduler` cron loop was retired in core#4399; firing is owned by the per-workspace `kind: trigger` plugin per [`rfc-scheduler-as-trigger-plugin.md`](../design/rfc-scheduler-as-trigger-plugin.md)). The `workspace_schedules` store retirement (P4b) is still pending — core#4411 item 5.
 
 ## Enforcement (guardrail matrix — target)
 

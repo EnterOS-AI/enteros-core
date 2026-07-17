@@ -2,7 +2,7 @@
 
 **Status:** DRAFT — design note, needs CTO sign-off on the contract shape before build.
 **Repos touched:** molecule-ai-workspace-runtime (workload source), molecule-core (peer surface + MCP), molecule-ai-sdk (contract).
-**Related:** [`rfc-agent-liveness.md`](rfc-agent-liveness.md), the idle-consolidation digest kernel (runtime), ADR-004 (SDK-owns-adapter socket; core carries zero runtime-behaviour code).
+**Related:** [`rfc-agent-liveness.md`](rfc-agent-liveness.md), the idle-consolidation digest kernel (runtime), ADR-005 (SDK-owns-adapter socket; core carries zero runtime-behaviour code — formerly numbered ADR-004).
 
 ## Problem
 
@@ -51,7 +51,7 @@ Fold the same summary into the idle digest so an HR/supervisor agent passively r
 
 ## Why this shape
 
-- **SSOT:** the runtime's task queue is the one source; core relays, never re-derives. Matches ADR-004 and how the idle digest / schedule grid are already owned.
+- **SSOT:** the runtime's task queue is the one source; core relays, never re-derives. Matches ADR-005 (SDK-owns-adapter) and how the idle digest / schedule grid are already owned.
 - **No fake task list:** avoids resurrecting `current_task` as a pseudo-array.
 - **Reuses existing seams:** `list_peers` for pull, the idle digest for push.
 

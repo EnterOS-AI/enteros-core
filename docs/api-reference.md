@@ -58,10 +58,13 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | GET | /workspaces/:id/a2a/queue/:queue_id | a2a_queue_status.go — same authentication as A2A send, followed by queue sender/target ownership checks |
 | POST | /workspaces/:id/delegate | delegation.go (async fire-and-forget) |
 | GET | /workspaces/:id/delegations | delegation.go (list delegation status) |
-| GET/POST | /workspaces/:id/schedules | schedules.go (cron CRUD) |
-| PATCH/DELETE | /workspaces/:id/schedules/:scheduleId | schedules.go |
-| POST | /workspaces/:id/schedules/:scheduleId/run | schedules.go (manual trigger) |
-| GET | /workspaces/:id/schedules/:scheduleId/history | schedules.go (past runs) |
+| GET/POST | /workspaces/:id/schedules | schedules.go (cron CRUD). When the workspace advertises the `scheduler` capability (it runs the `kind: trigger` scheduler plugin), these routes proxy to the runtime's volume-backed `/internal/schedules*` API (schedules_proxy.go) — the volume grid is the source of truth; otherwise they serve the legacy `workspace_schedules` table (kept until P4b). `SCHEDULE_VOLUME_PROXY_DISABLED=1` forces the legacy path. |
+| PATCH/DELETE | /workspaces/:id/schedules/:scheduleId | schedules.go — same volume-proxy/legacy split as above; in the volume model `:scheduleId` is the schedule *name* |
+| POST | /workspaces/:id/schedules/:scheduleId/run | schedules.go (manual trigger) — volume path pokes the trigger daemon, which fires an autonomous `self-scheduler` turn (response carries `fired_by:"daemon"`); legacy path as before |
+| GET | /workspaces/:id/schedules/:scheduleId/history | schedules.go (past runs) — still reads core `activity_logs` `cron_run` rows; the volume re-point (runtime history file) is pending. Daemon fires on a plugin workspace do not write `activity_logs`, so use the runtime's history surface for those. |
+| GET | /workspaces/:id/schedules/health | schedules.go — peer-readable schedule health (issue #249); still reads the legacy table (volume re-point pending) |
+| POST | /admin/workspaces/:id/schedules/migrate-to-volume | schedules_proxy.go — `AdminAuth`; copies the workspace's `source='runtime'` schedule rows from the DB to its volume grid, idempotent; see `docs/guides/selfhost-schedule-migration.md` |
+| POST | /admin/schedules/backfill-plugin | scheduler_plugin.go — `AdminAuth`; declares the `molecule-scheduler` trigger plugin for every workspace with `workspace_schedules` rows; **dry-run by default**, `?apply=true` to declare + arm; see `docs/runbooks/scheduler-plugin.md` |
 | GET/POST | /workspaces/:id/channels | channels.go (social channel CRUD) |
 | PATCH/DELETE | /workspaces/:id/channels/:channelId | channels.go |
 | POST | /workspaces/:id/channels/:channelId/send | channels.go (outbound message) |
@@ -93,14 +96,14 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | POST | /org/import | org.go — `AdminAuth` required; applies `resolveInsideRoot` path sanitiser on template paths |
 | GET | /events | events.go — `AdminAuth` required |
 | GET | /events/:workspaceId | events.go — `AdminAuth` required |
-| GET | /admin/liveness | inline — `AdminAuth` required. Returns per-subsystem `supervised.Snapshot()` ages; use to check health of scheduler/heartbeat goroutines |
+| GET | /admin/liveness | inline — `AdminAuth` required. Returns per-subsystem `supervised.Snapshot()` ages; use to check health of the background worker goroutines (health-sweep, orphan-sweeper, liveness-monitor, …). The core scheduler loop is no longer among them — it was retired in core#4399; schedule firing is per-workspace (see `docs/runbooks/scheduler-plugin.md`) |
 | GET | /ws | socket.go — Canvas requires a verified tenant session, org token, or `ADMIN_TOKEN`; workspace subscribers require `X-Workspace-ID` plus a bearer bound to that workspace |
 
 ---
 
 ## Database
 
-Migration files live in `workspace-server/migrations/` (latest: `022_workspace_schedules_source`). Each migration ships as a `.up.sql`/`.down.sql` pair. The migration runner globs `*.sql`, filters out `.down.sql` files, sorts alphabetically, and executes each file on boot. All `.up.sql` files must be idempotent (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ... IF NOT EXISTS`) because the runner re-applies every migration on every boot.
+Migration files live in `workspace-server/migrations/` (timestamp-named; check the directory for the latest). Each migration ships as a `.up.sql`/`.down.sql` pair. The migration runner globs `*.sql`, filters out `.down.sql` files, sorts alphabetically, and executes each file on boot. All `.up.sql` files must be idempotent (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ... IF NOT EXISTS`) because the runner re-applies every migration on every boot.
 
 ### Key Tables
 
@@ -109,8 +112,8 @@ Migration files live in `workspace-server/migrations/` (latest: `022_workspace_s
 | `workspaces` | Core entity — status, runtime, `agent_card` JSONB, heartbeat columns, `current_task`, `workspace_dir` |
 | `canvas_layouts` | Per-workspace x/y canvas position |
 | `structure_events` | Append-only event log (workspace lifecycle, agent, approval events) |
-| `activity_logs` | A2A communications, task updates, agent logs, errors. `error_detail` is populated by the scheduler so cron run history can surface failure reasons. |
-| `workspace_schedules` | Cron tasks — expression, timezone, prompt, run history, `source` (`'template'` for org/import-seeded, `'runtime'` for Canvas/API-created), `last_status` (includes `'skipped'` when the scheduler concurrency-skips a busy workspace) |
+| `activity_logs` | A2A communications, task updates, agent logs, errors. Historical `cron_run` rows (with `error_detail`) were written by the retired core scheduler loop and still back the legacy History route; the per-workspace trigger daemon writes its run log to the workspace volume instead. |
+| `workspace_schedules` | **Legacy** cron store — expression, timezone, prompt, run bookkeeping, `source` (`'template'` for org/import-seeded, `'runtime'` for Canvas/API-created). For a workspace running the scheduler trigger plugin the volume grid is the source of truth and this table is bypassed by CRUD; it still serves non-plugin workspaces, template seeding, History/Health, admin health, and the webhook poke. Retired in P4b (issue #4411 item 5). |
 | `workspace_channels` | Social channel integrations (Telegram, Slack, etc.) with JSONB config and allowlist |
 | `agents` | Agent records |
 | `workspace_secrets` | Per-workspace encrypted secrets |
