@@ -528,6 +528,53 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			log.Printf("Org import: injected idle_prompt (%d chars, interval=%ds) into config.yaml for %s", len(trimmed), idleInterval, ws.Name)
 		}
 
+		// Scheduler-as-trigger-plugin RFC §8A P3 (template-seeding seam, core
+		// leg — mechanism decided on issue #4411, 2026-07-17): render the
+		// workspace's RESOLVED schedules into the DELIVERED config.yaml so the
+		// runtime's boot/reload seeding (molecule-ai-workspace-runtime#318,
+		// seed_schedules_from_workspace_config) reconciles them onto the
+		// volume-authoritative grid. The config/asset channel lands the file
+		// on the volume BEFORE boot, so there is no core→runtime API race on
+		// first provision. The legacy workspace_schedules DB seed further down
+		// KEEPS running during the cutover — P4b retires it; this is the
+		// additive volume path. Must run BEFORE the provision dispatch below,
+		// which captures configFiles for the provision goroutine.
+		if len(ws.Schedules) > 0 {
+			schedBlock, schedRendered, schedSkipped := renderTemplateSchedulesYAML(ws.Schedules, orgBaseDir, ws.FilesDir, ws.Name)
+			if schedBlock != "" {
+				if configFiles == nil {
+					configFiles = map[string][]byte{}
+				}
+				// Checked append (belt+braces over the per-entry round-trip
+				// guard): the ASSEMBLED config.yaml is re-parsed; if the combined
+				// document fails to load, the block is dropped — an unparseable
+				// config.yaml would brick workspace boot (runtime config.py
+				// loads it with no try/except).
+				combined, appended := appendYAMLBlockChecked(configFiles["config.yaml"], schedBlock, "schedules", ws.Name)
+				configFiles["config.yaml"] = combined
+				if appended {
+					log.Printf("Org import: injected %d schedule(s) into config.yaml for %s (skipped=%d of %d)", schedRendered, ws.Name, schedSkipped, len(ws.Schedules))
+				} else {
+					schedRendered = 0
+				}
+			}
+			// C2 ordering (RFC P5 per-workspace delivery): a workspace that
+			// ships schedules needs the molecule-scheduler trigger plugin to
+			// fire them (post-#4399 the plugin is the ONLY fire path), and the
+			// declaration must land in workspace_declared_plugins BEFORE the
+			// provision goroutine below assembles MOLECULE_DECLARED_PLUGINS
+			// (buildProvisionerConfig → desiredPluginSources), so first boot
+			// installs the daemon instead of waiting for the next online
+			// reconcile. Pre-fix the org-import path never declared it at all
+			// (only schedules.go Create and template_schedules.go did).
+			// Non-fatal: a declare hiccup must not fail the import.
+			if schedRendered > 0 {
+				if declErr := ensureSchedulerPluginDeclared(ctx, id); declErr != nil {
+					log.Printf("Org import: declare scheduler plugin for %s (non-fatal): %v", ws.Name, declErr)
+				}
+			}
+		}
+
 		// Inline system_prompt (only if no files_dir provides one)
 		if ws.SystemPrompt != "" {
 			if configFiles == nil {
