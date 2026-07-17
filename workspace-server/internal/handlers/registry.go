@@ -21,7 +21,6 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
 // isProvisionerHostPortURL reports whether u is a loopback URL with a port
@@ -103,28 +102,6 @@ var saasModeWarnUnknownOnce sync.Once
 // periodic A2A queue sweeper (#2930).
 type QueueDrainFunc func(ctx context.Context, workspaceID string, capacity int)
 
-// WarmupSendFunc delivers ONE benign A2A turn to a workspace's own agent.
-// Injected into RegistryHandler at router wiring time (same pattern as
-// QueueDrainFunc/ReconcileFunc) to avoid a handler→handler import cycle —
-// the router wires it to WorkspaceHandler.proxyA2ARequest. nil-safe: the
-// concierge warmup is skipped when unset (unit tests, CP/SaaS deployments
-// without a workspace handler).
-//
-// It is the platform-side trigger for the proven per-turn loaded_mcp_tools
-// capture: a de-baked kind=platform concierge reaches online but the
-// runtime's init-time MCP enumeration fails, so it never reports
-// loaded_mcp_tools — only the claude_sdk_executor per-turn capture (reading
-// the agent's live MCP on a real turn) reliably publishes them. The #3082
-// gate then degrades the idle concierge ~90s later. Sending one warmup turn
-// fires that capture so the next heartbeat carries loaded_mcp_tools (incl.
-// mcp__molecule-platform__provision_workspace) and the concierge HOLDS online
-// without any user message.
-//
-// Returns the HTTP status, the (ignored) response body, and an error. The
-// caller treats ANY result as best-effort — a non-2xx status or error never
-// affects the online/degraded decision.
-type WarmupSendFunc func(ctx context.Context, workspaceID string, body []byte, callerID string) (int, []byte, error)
-
 type RegistryHandler struct {
 	broadcaster *events.Broadcaster
 	drainQueue  QueueDrainFunc // nil-safe: Heartbeat skips drain when unset
@@ -148,35 +125,6 @@ type RegistryHandler struct {
 	// holds within a process lifetime (acceptable — redeploys are not sub-minute,
 	// and one extra reconcile per redeploy on a stuck concierge is tolerable).
 	mcpRecoveryLastFire sync.Map
-
-	// warmupSend delivers ONE benign A2A turn to a concierge's own agent to
-	// trigger the proven per-turn loaded_mcp_tools capture (see WarmupSendFunc
-	// + fireConciergeWarmup). nil-safe: the warmup is skipped when unset. Wired
-	// by the router to WorkspaceHandler.proxyA2ARequest.
-	warmupSend WarmupSendFunc
-	// warmedConcierges throttles the concierge warmup per process. Keyed by
-	// workspace ID → time.Time of the last fire. core#3082 changed this from a
-	// strict one-shot to a time-throttle (re-fires every conciergeWarmupTimeout):
-	// under the verified-ready model the warmup DRIVES the warming→online flip, so
-	// a cold warmup turn that raced ahead of the MCP connect — or a transient
-	// warmup failure — MUST be retryable, or the concierge would sit warming until
-	// the 180s timeout force-fails it. Since each warmup POST is bounded at
-	// conciergeWarmupTimeout, two can't be in flight. A CP restart re-warms
-	// (acceptable — a fresh process has no live capture state).
-	warmedConcierges sync.Map
-	// warmedDelivered records concierges whose warmup turn was DELIVERED
-	// successfully (a 2xx from the agent) at least once this process lifetime.
-	// Keyed by workspace ID → true. Once set, fireConciergeWarmup STOPS
-	// re-firing: the warmup exists only to trigger ONE successful turn that runs
-	// the per-turn loaded_mcp_tools capture, so a second, third … fire after a
-	// clean delivery cannot help (an under-emitting loaded_mcp_tools producer,
-	// runtime#181, is not fixed by re-warming) and only spams the chat pane with
-	// a repeating readiness-probe row every conciergeWarmupTimeout — the demo
-	// leak. Real user turns remain the capture fallback and a CP restart clears
-	// this map (a fresh process re-warms once). A warmup that FAILED to deliver
-	// is NOT recorded, so the existing conciergeWarmupTimeout retry still
-	// self-heals a transient/cold miss.
-	warmedDelivered sync.Map
 }
 
 // mcpRecoveryCooldown bounds how often a single concierge's RCA#2970
@@ -202,15 +150,6 @@ func (h *RegistryHandler) SetQueueDrainFunc(f QueueDrainFunc) {
 // keeping RegistryHandler free of a plugins-handler import.
 func (h *RegistryHandler) SetReconcileFunc(f ReconcileFunc) {
 	h.reconcilePlugins = f
-}
-
-// SetWarmupSendFunc wires the concierge warmup A2A sender. Router wires this
-// to WorkspaceHandler.proxyA2ARequest after both handlers are constructed
-// (same late-wiring pattern as SetQueueDrainFunc), keeping RegistryHandler
-// free of a workspace-handler import. nil-safe: the warmup is skipped when
-// unset.
-func (h *RegistryHandler) SetWarmupSendFunc(f WarmupSendFunc) {
-	h.warmupSend = f
 }
 
 // fireReconcileOnline fires the declared-plugin reconcile for a workspace that
@@ -275,156 +214,6 @@ func (h *RegistryHandler) fireReconcileMCPRecovery(ctx context.Context, workspac
 	globalGoAsync(func() { h.reconcilePlugins(rctx, wsID) })
 }
 
-// conciergeWarmupCaller is the system caller identity for the platform-fired
-// warmup turn. The `system:` prefix bypasses workspace access control and the
-// can_delegate gate (see isSystemCaller / a2a_proxy.go), and is NOT treated as
-// a delegation — exactly right for a platform-initiated self-turn.
-const conciergeWarmupCaller = "system:concierge-warmup"
-
-// conciergeWarmupText is the benign message body of the warmup turn. It is a
-// no-op readiness check — the concierge needs only to RUN a turn (which fires
-// the per-turn loaded_mcp_tools capture); the content is immaterial. It is
-// stamped with conciergeWarmupSourceType so the chat-history reader classifies
-// the row as an internal self-message (system/notice) and it NEVER renders as a
-// blue user bubble — see conciergeWarmupSourceType.
-const conciergeWarmupText = "Platform readiness check — no action needed."
-
-// conciergeWarmupSourceType is the params.metadata.source_type marker stamped on
-// the warmup turn. It is a member of the SSOT self-source-type set
-// (messagestore.selfSourceTypes / canvas message-parser selfSourceTypes /
-// runtime _ROUTINE_SELF_SOURCE_TYPES), so the chat-history reader classifies the
-// warmup a2a_receive row Role="system" (SystemKind="notice") instead of the
-// blue user bubble it used to leak as (the readiness-probe was a heartbeat
-// internal, never a human turn). The value MUST stay in lock-step with the
-// "self-warmup" entry in those three registries.
-const conciergeWarmupSourceType = "self-warmup"
-
-// conciergeWarmupTimeout bounds the warmup A2A POST so the detached goroutine
-// can never leak. A cold first turn (model warmup + MCP enumeration) can take
-// tens of seconds; 60s is comfortably longer than that yet still bounded.
-const conciergeWarmupTimeout = 60 * time.Second
-
-// buildConciergeWarmupBody builds the A2A v0.3 message/send JSON-RPC body for
-// the warmup turn. Mirrors buildDelegateA2ABody (A2A v0.3 Part discriminator is
-// `kind`, not `type`; a `type`-keyed Part is dropped by the receiver's v0.3
-// validator). messageId is a fresh UUID so the turn is idempotent at the
-// runtime and never collides with a real message.
-func buildConciergeWarmupBody(workspaceID string) ([]byte, error) {
-	// UNIQUE messageId per fire (CR2 #14189). The in-process one-shot guard
-	// (warmedConcierges) RESETS on a CP restart, so a post-restart warmup
-	// legitimately re-fires. A DETERMINISTIC messageId would collide with the
-	// pre-restart fire and be DEDUPED downstream → the re-warmup no-ops → the
-	// concierge stays degraded (the exact failure this warmup exists to fix). A
-	// nonce suffix makes every fire a distinct, never-deduped turn, while the
-	// in-process guard still prevents repeat warmups within one CP lifetime.
-	warmupID := "concierge-warmup-" + workspaceID + "-" + uuid.New().String()
-	return json.Marshal(map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      warmupID,
-		"method":  "message/send",
-		"params": map[string]interface{}{
-			// source_type at the params.metadata sibling of message is the
-			// CANONICAL location the reader (messagestore.RequestSourceType)
-			// checks first, and the location proven to survive
-			// normalizeA2APayload + persistence (self-harvester rows on prod
-			// land here). Stamping it marks the warmup row internal so it is
-			// classified system/notice, never a user bubble.
-			"metadata": map[string]interface{}{"source_type": conciergeWarmupSourceType},
-			"message": map[string]interface{}{
-				"role":      "user",
-				"messageId": warmupID,
-				"parts":     []map[string]interface{}{{"kind": "text", "text": conciergeWarmupText}},
-				// Mirror source_type on the message.metadata fallback location
-				// too (RequestSourceType checks it second) so classification is
-				// robust regardless of which metadata slot a normalizer keeps.
-				"metadata": map[string]interface{}{"concierge_warmup": true, "source_type": conciergeWarmupSourceType},
-			},
-		},
-	})
-}
-
-// fireConciergeWarmup sends ONE benign A2A turn to a freshly-online platform
-// concierge to trigger the proven per-turn loaded_mcp_tools capture (core#3082
-// keystone). See WarmupSendFunc for the full rationale.
-//
-// Contract (this is the heartbeat path — fleet-wide, correctness is critical):
-//   - THROTTLED + IDEMPOTENT: at most once per conciergeWarmupTimeout per
-//     concierge per process. core#3082 made this retryable (was a strict
-//     one-shot) so the warming→online flip self-heals if a cold warmup turn
-//     raced ahead of the MCP connect or failed transiently. Since each POST is
-//     bounded at conciergeWarmupTimeout, two warmups can't be in flight. A
-//     process restart re-warms (a fresh process has no live capture state).
-//   - ASYNC / NON-BLOCKING: dispatched on a detached globalGoAsync goroutine so
-//     it never blocks or slows the Heartbeat handler response.
-//   - FAIL-SAFE: a send error (timeout, 4xx/5xx, anything) is logged loudly and
-//     ignored. It NEVER touches the online/degraded decision. The per-turn
-//     capture from a real user turn remains the fallback exactly as today.
-//   - BOUNDED: the POST runs under conciergeWarmupTimeout so the goroutine can't
-//     leak. context.WithoutCancel detaches from the heartbeat ctx (which expires
-//     when the handler returns, well before a cold first turn completes).
-//
-// nil-safe: skipped when warmupSend is unset or workspaceID is empty. The
-// caller is responsible for only invoking this for a kind=platform workspace
-// that has its model + management MCP server present (the #3082 gate passed).
-func (h *RegistryHandler) fireConciergeWarmup(ctx context.Context, workspaceID string) {
-	if h.warmupSend == nil || workspaceID == "" {
-		return
-	}
-	// Fire-once: a warmup already DELIVERED successfully this process lifetime is
-	// never re-fired. The one clean turn already ran the per-turn capture; more
-	// fires only repeat the readiness-probe row (the demo chat leak) without
-	// helping. See warmedDelivered. A CP restart clears the map → re-warms once.
-	if _, delivered := h.warmedDelivered.Load(workspaceID); delivered {
-		return
-	}
-	// Throttle: re-fire at most once per conciergeWarmupTimeout. The Load+Store
-	// is not strictly atomic, so two concurrent heartbeats could both fire one
-	// extra warmup — harmless (idempotent, bounded, fail-safe). Storing the
-	// timestamp BEFORE firing means a concurrent beat within the window sees the
-	// fresh stamp and skips.
-	now := time.Now()
-	if prev, ok := h.warmedConcierges.Load(workspaceID); ok {
-		if last, isTime := prev.(time.Time); isTime && now.Sub(last) < conciergeWarmupTimeout {
-			return // fired recently — let the in-flight / recent warmup converge
-		}
-	}
-	h.warmedConcierges.Store(workspaceID, now)
-	body, err := buildConciergeWarmupBody(workspaceID)
-	if err != nil {
-		// Marshalling a constant body cannot realistically fail; if it somehow
-		// does, clear the throttle stamp so a later heartbeat can retry, and bail.
-		log.Printf("Heartbeat: concierge warmup body marshal failed for %s: %v (clearing throttle stamp)", workspaceID, err)
-		h.warmedConcierges.Delete(workspaceID)
-		return
-	}
-	wsID := workspaceID
-	// Detach from the heartbeat ctx and apply a bounded timeout so the
-	// goroutine can't outlive the warmup turn.
-	send := h.warmupSend
-	globalGoAsync(func() {
-		warmupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), conciergeWarmupTimeout)
-		defer cancel()
-		log.Printf("Heartbeat: firing one-shot concierge warmup turn for platform agent %s (core#3082 loaded_mcp_tools capture)", wsID)
-		status, _, sErr := send(warmupCtx, wsID, body, conciergeWarmupCaller)
-		if sErr != nil {
-			// Best-effort: a warmup failure must NEVER affect status. The real
-			// user-turn capture remains the fallback. Log loudly so an operator
-			// can see whether the warmup path is healthy in the fleet.
-			log.Printf("Heartbeat: concierge warmup turn for %s failed (status=%d): %v — best-effort, status unaffected; per-turn capture on a real turn remains the fallback", wsID, status, sErr)
-			return
-		}
-		// Delivered cleanly (2xx). Record it so the warmup is not re-fired every
-		// conciergeWarmupTimeout — the single successful turn already drove the
-		// per-turn capture; further fires would only repeat the readiness-probe
-		// chat row. A non-2xx "delivery" (httpx does not raise on 4xx/5xx) means
-		// the agent was NOT woken, so leave warmedDelivered UNset and let the
-		// timeout retry fire again.
-		if status >= 200 && status < 300 {
-			h.warmedDelivered.Store(wsID, true)
-		}
-		log.Printf("Heartbeat: concierge warmup turn for %s delivered (status=%d) — per-turn loaded_mcp_tools capture should publish on the next heartbeat; warmup will not re-fire this process (fire-once)", wsID, status)
-	})
-}
 
 // validateAgentURL rejects URLs that could be used as SSRF vectors against
 // cloud metadata services or other internal infrastructure.
@@ -531,16 +320,17 @@ const errPlatformNotRoot = "a platform agent must be the org root (parent_id mus
 // fail-closed RCA#2970 intent (steady-state guarantee: sustained-missing DOES
 // degrade).
 //
-// 180s ≈ 9 heartbeats at the runtime's 20s cadence. Sized for the platform-side
-// warmup turn (fireConciergeWarmup), which fires on the SAME heartbeat that opens
-// this window: that warmup is a COLD first turn — model cold-start (~25-30s P95
-// for the platform-managed default) + async MCP connect + the turn itself — and
-// the loaded_mcp_tools capture only lands on the NEXT heartbeat after the turn
-// completes. 90s was borderline for that cold path (single-degrade-flap before
-// recovery, observed 2026-06-25 staging); 180s gives the cold warmup turn +
-// capture-bearing heartbeat comfortable headroom while still surfacing a genuine
-// sustained-missing regression within ~3 min (the fail-closed RCA#2970 intent is
-// preserved — sustained absence past the window still degrades).
+// 180s ≈ 9 heartbeats at the runtime's 20s cadence. EV2 RETIRED the platform-side
+// warmup turn (fireConciergeWarmup) this window used to be sized for; the
+// provisioning->online flip is now driven by the runtime's turn-independent
+// mcp_tools_ready event, which lands on a normal beat with no cold-turn latency.
+// This grace is KEPT as the steady-state flap absorber for the loaded_mcp_tools
+// under-emit window (runtime#181): the async MCP connect + the runtime's per-beat
+// tool-list observation can legitimately report an absent/partial list for a few
+// beats after the ready flip, and degrading on that single sample (then recovering
+// on the next) is the ~50/50 online<->degraded flap this window eliminates. 180s
+// still surfaces a genuine sustained-missing regression within ~3 min (the fail-
+// closed RCA#2970 intent is preserved — sustained absence past the window degrades).
 const managementMCPUnloadedGrace = 180 * time.Second
 
 // isPlatformRootViolation reports whether err is the DB rejecting a register
@@ -1769,29 +1559,24 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		// management plugin row isn't declared yet, so it would false-flip to online
 		// before the plugin reconcile lands). A platform row is HELD in
 		// 'provisioning' (the warming display state) until a heartbeat proves the
-		// tool loaded; the warmup below fires the per-turn capture that produces that
-		// proof. This inverts the old "online-first, degrade-only-if-tools-never-load"
+		// tool loaded; EV2's mcp_tools_ready event (turn-independent) now produces
+		// that proof directly — no synthetic warmup turn needed. This inverts the
+		// old "online-first, degrade-only-if-tools-never-load"
 		// model that let an unverified concierge accept a user turn and hang (the
 		// principal's live test1).
 		//
-		// ⚠️ PRESENCE, NOT CALLABILITY — and the field is UNRELIABLE (runtime#181).
-		// loaded_mcp_tools is a PRESENCE signal, not a true callability probe, and a
-		// genuine inline probe (an actual provision_workspace call) is infeasible on
-		// the fleet-wide heartbeat path — it must stay fast / non-blocking, so the
-		// async warmup turn is the only "is it really callable?" driver we have. WORSE,
-		// runtime#181 reports the producer under-emits: loaded_mcp_tools comes back
-		// null/empty even when the tool IS loaded and deliverable (proven on staging).
-		// That means trusting PRESENCE alone risks the INVERSE failure of test1 — a
-		// healthy concierge held in 'provisioning' and then force-FAILED at the 180s
-		// warming bound while the tool is actually callable. Two safeguards keep that
-		// from hanging the fleet: (1) the legacy (mcp_server_present==nil) fast-path
-		// promotes a null-field runtime immediately; (2) the bounded warming timeout
-		// stops an infinite 'provisioning' hold. But for MODERN runtimes neither
-		// safeguard makes this gate RELIABLE — that requires fixing the producer.
-		// runtime#181 (wire/repair the loaded_mcp_tools producer so it emits the real
-		// loaded set) is a REQUIRED, BLOCKING companion fix: this gate must not reach
-		// prod ahead of it, or every modern concierge warms-then-fails. See the PR
-		// description for the explicit blocking-companion recommendation.
+		// ⚠️ loaded_mcp_tools is PRESENCE, NOT CALLABILITY — and UNRELIABLE (runtime#181
+		// reports the producer under-emits: the list comes back null/empty even when the
+		// tool IS loaded and deliverable, proven on staging). Trusting PRESENCE alone
+		// risks the INVERSE of test1 — a healthy concierge held in 'provisioning' while
+		// the tool is actually callable. EV2 fixes the driver: the runtime's
+		// MCPReadinessProber sets mcp_tools_ready=true directly on the FIRST successful
+		// tools/list (turn-independent — no synthetic warmup turn, and independent of the
+		// under-emitting loaded_mcp_tools producer), so the online-flip is driven by that
+		// reliable event (see readyForOnline below). loaded_mcp_tools presence of
+		// provision_workspace remains a back-compat fallback for a runtime that emits the
+		// list but not yet the ready flag; the legacy (mcp_server_present==nil) fast-path
+		// still promotes a null-field runtime immediately.
 		provisionToolLoaded := false
 		for _, t := range payload.LoadedMCPTools {
 			if t == conciergePlatformMCPProvisionWorkspaceTool {
@@ -1799,6 +1584,26 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				break
 			}
 		}
+
+		// EV2 (SDK mcp_tools_ready): the POSITIVE, turn-independent readiness
+		// event. The runtime's MCPReadinessProber sets mcp_tools_ready=true on the
+		// FIRST successful tools/list — so it fires for codex/hermes WITHOUT a
+		// synthetic turn. TRUE is a sufficient online-flip trigger and REPLACES the
+		// wall-clock fireConciergeWarmup nudge (retired) that used to coax the
+		// per-turn loaded_mcp_tools capture. TRI-STATE (absent != false): nil =
+		// unknown / prober not yet succeeded, false = probed-not-ready, true =
+		// tools loaded. runtime#273 landed the negative half (launch_failure); this
+		// is the positive half.
+		mcpToolsReady := payload.MCPToolsReady != nil && *payload.MCPToolsReady
+
+		// readyForOnline is the verified-ready predicate for the provisioning->
+		// online flip: EITHER the EV2 tools-loaded heartbeat event (preferred —
+		// reliable + turn-independent) OR the legacy presence of the required
+		// provision_workspace tool in loaded_mcp_tools (back-compat for a runtime
+		// that emits the list but not yet the ready flag). The 180s
+		// managementMCPUnloadedGrace below is KEPT as the post-online flap
+		// absorber for the loaded_mcp_tools under-emit window (runtime#181).
+		readyForOnline := mcpToolsReady || provisionToolLoaded
 
 		// recoverable lists the statuses a live heartbeat may legitimately promote
 		// to online. removed/paused/hibernated/hibernating are terminal or
@@ -1810,18 +1615,11 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 			currentStatus == string(models.StatusAwaitingAgent) ||
 			currentStatus == string(models.StatusDegraded)
 
-		// Fire the warmup whenever the tool is not yet proven loaded — it drives the
-		// per-turn loaded_mcp_tools capture that resolves the warming→online
-		// chicken-and-egg (and re-captures during any post-online #3082 grace gap).
-		// Scoped to online/recoverable states so a terminal row is never warmed.
-		// fireConciergeWarmup is throttled per process (re-fires every
-		// conciergeWarmupTimeout) so a cold warmup turn that raced ahead of the MCP
-		// connect — or a transient warmup failure — self-heals rather than stranding
-		// the concierge until the warming timeout; system:concierge-warmup is exempt
-		// from the dispatch warming-gate so it reaches the runtime while warming.
-		if !provisionToolLoaded && (currentStatus == string(models.StatusOnline) || recoverable) {
-			h.fireConciergeWarmup(ctx, payload.WorkspaceID)
-		}
+		// EV2: the wall-clock fireConciergeWarmup nudge is RETIRED. The per-turn
+		// loaded_mcp_tools capture no longer needs a synthetic turn to coax it —
+		// the runtime's turn-independent MCPReadinessProber reports mcp_tools_ready
+		// directly on the heartbeat, so the warming->online flip is driven by that
+		// real readiness event (readyForOnline) instead of a 60s synthetic turn.
 
 		// nil mcp_server_present == a legacy runtime that can never report
 		// loaded_mcp_tools; applying the strict verified gate would strand it in
@@ -1863,15 +1661,16 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				}
 				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"recovered_from": currentStatus})
 				h.fireReconcileOnline(ctx, payload.WorkspaceID)
-			case provisionToolLoaded && !conciergeUnhealthy:
-				// VERIFIED-ready by construction: provision_workspace is callable, so
-				// promote and clear any warming stamp. The AND status=$currentStatus
-				// guard keeps the flip conditional so a racing Delete/pause is not
-				// overwritten.
+			case readyForOnline && !conciergeUnhealthy:
+				// VERIFIED-ready by construction: the EV2 mcp_tools_ready event (or,
+				// back-compat, provision_workspace present in loaded_mcp_tools) proves
+				// the management MCP is loaded, so promote and clear any warming stamp.
+				// The AND status=$currentStatus guard keeps the flip conditional so a
+				// racing Delete/pause is not overwritten.
 				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2 AND status = $3::workspace_status`, models.StatusOnline, payload.WorkspaceID, currentStatus); err != nil {
 					log.Printf("Heartbeat: verified platform %s %s->online failed: %v", payload.WorkspaceID, currentStatus, err)
 				} else {
-					log.Printf("Heartbeat: platform %s VERIFIED-ready (provision_workspace loaded) %s->online (core#3082)", payload.WorkspaceID, currentStatus)
+					log.Printf("Heartbeat: platform %s VERIFIED-ready (mcp_tools_ready=%v provision_workspace_loaded=%v) %s->online (EV2/core#3082)", payload.WorkspaceID, mcpToolsReady, provisionToolLoaded, currentStatus)
 				}
 				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"verified_ready": true, "recovered_from": currentStatus})
 				h.fireReconcileOnline(ctx, payload.WorkspaceID)
@@ -1881,7 +1680,8 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				// wall-clock. It leaves 'provisioning' only on a real signal:
 				//
 				//   * READY  → the verified-ready case above flips it online the instant a
-				//     heartbeat reports provision_workspace loaded AND the row is healthy.
+				//     heartbeat reports mcp_tools_ready=true (EV2) — or, back-compat,
+				//     provision_workspace loaded — AND the row is healthy.
 				//   * UNHEALTHY → held here (NOT promoted): the earlier switch cases fell
 				//     through because conciergeUnhealthy (runtime wedged / sustained
 				//     error_rate / recent register failure) blocked the verified promote
@@ -1911,7 +1711,7 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 						log.Printf("Heartbeat: failed to stamp warming mcp_unloaded_since for %s: %v", payload.WorkspaceID, err)
 					}
 				}
-				log.Printf("Heartbeat: platform %s warming, holding provisioning (waiting on loaded_mcp_tools signal; unloaded for %s, provision_workspace_loaded=%v unhealthy=%v) (core#3082)", payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second), provisionToolLoaded, conciergeUnhealthy)
+				log.Printf("Heartbeat: platform %s warming, holding provisioning (waiting on mcp_tools_ready/loaded_mcp_tools signal; unloaded for %s, mcp_tools_ready=%v provision_workspace_loaded=%v unhealthy=%v) (EV2/core#3082)", payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second), mcpToolsReady, provisionToolLoaded, conciergeUnhealthy)
 			default:
 				// Modern runtime in failed/offline/awaiting_agent/degraded that is NOT
 				// promotable this beat — either the tool is not proven loaded OR the
