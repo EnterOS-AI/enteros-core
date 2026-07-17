@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -825,6 +826,15 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 		log.Printf("CascadeDelete schedule disable for %s: %v", id, err)
 	}
 
+	// cleanupCtx is the non-cancelable, time-bounded teardown context: detached
+	// from the request ctx via context.WithoutCancel so a canceled / timed-out
+	// DELETE still runs the stop → remove-volume → broadcast sequence to
+	// completion instead of leaking compute. Created HERE — before the schedule
+	// capture below — so capture runs on it too (F4).
+	cleanupCtx, cleanupCancel := context.WithTimeout(
+		context.WithoutCancel(ctx), 30*time.Second)
+	defer cleanupCancel()
+
 	// P4b (core#4435): CAPTURE each volume-native workspace's user-created
 	// (source='runtime') schedule grid into workspaces.carryover_runtime_schedules
 	// NOW — BEFORE stopAndRemove tears the container down. This MUST run while the
@@ -836,11 +846,16 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 	// replay what we buffer here. Best-effort by contract: any resolve/fetch/persist
 	// failure is logged and skipped, never blocking teardown. Non-volume (legacy
 	// DB-backed) ids are skipped — their schedules already persist in the table.
-	captureRuntimeSchedulesForCarryover(ctx, allIDs)
-
-	cleanupCtx, cleanupCancel := context.WithTimeout(
-		context.WithoutCancel(ctx), 30*time.Second)
-	defer cleanupCancel()
+	//
+	// F4: runs on cleanupCtx (NOT the cancelable request ctx) so a canceled DELETE
+	// still buffers the grid rather than silently skipping it; and is HARD-BOUNDED
+	// to captureCarryoverBudget TOTAL across all ids via captureCtx, so a
+	// black-holed descendant can never add N×scheduleForwardTimeout to the DELETE
+	// — once the budget is spent the remaining forwards fast-fail on the expired
+	// context and teardown proceeds. Best-effort throughout (never blocks).
+	captureCtx, captureCancel := context.WithTimeout(cleanupCtx, captureCarryoverBudget)
+	captureRuntimeSchedulesForCarryover(captureCtx, allIDs)
+	captureCancel()
 
 	var stopErrs []error
 	stopAndRemove := func(wsID string) {
@@ -877,6 +892,16 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 	return descendantIDs, stopErrs, nil
 }
 
+// captureCarryoverBudget hard-bounds the TOTAL wall-clock the teardown-time
+// schedule capture may spend across ALL torn-down ids. Capture is best-effort and
+// must never block a delete, so instead of paying scheduleForwardTimeout (15s)
+// per black-holed descendant — N×15s on the DELETE — the whole loop shares this
+// one budget; once it is exhausted the remaining forwards fast-fail on the
+// already-expired context. A live local container answers /internal/schedules in
+// milliseconds, so 10s is generous for the reachable case and only ever caps the
+// pathological unreachable one.
+const captureCarryoverBudget = 10 * time.Second
+
 // captureRuntimeSchedulesForCarryover buffers each volume-native workspace's
 // user-created (source='runtime') schedule grid into
 // workspaces.carryover_runtime_schedules ahead of teardown, so a fresh-volume
@@ -891,10 +916,26 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 // the container is stopped — the successor cannot read the predecessor grid later.
 //
 // Best-effort by contract: unreachable / timeout / non-200 / malformed → log and
-// continue (NEVER block a delete). Each forward is bounded by
-// scheduleForwardTimeout (fetchScheduleAPI's own deadline). Legacy DB-backed ids
+// continue (NEVER block a delete). Each forward is bounded by fetchScheduleAPI's
+// own deadline, and the WHOLE loop is additionally hard-capped by the caller's
+// captureCarryoverBudget ctx (see CascadeDelete) so N black-holed descendants
+// cannot add N×scheduleForwardTimeout to the DELETE. Legacy DB-backed ids
 // (scheduleBackendIsVolume==false) are skipped — their schedules already persist
 // in workspace_schedules and are re-pointed by the DB-world path.
+//
+// F3 — STRUCTURAL "never block a delete": this runs SYNCHRONOUSLY inside
+// CascadeDelete, so the whole body is panic-isolated below (recover-and-don't-
+// re-raise, mirroring logProvisionPanic / coalesceRestart). A panic in a helper,
+// a bad grid decode, or a driver bug must never abort the teardown before
+// stopAndRemove — it logs with a stack trace and returns so CascadeDelete
+// proceeds. A missed capture only costs the successor that grid, never a delete.
+//
+// CAUTION — real-DB-unexercised-in-CI: the carryover_runtime_schedules JSONB
+// write below (and the read/clear in RestoreInheritedRuntimeSchedules) reuses the
+// proven registry.go loaded_mcp_tools ::jsonb idiom, and is now exercised against
+// real Postgres by TestIntegration_CarryoverSchedules_* (runtime stubbed at the
+// HTTP layer). A full LIVE volume-native delete→re-import soak is still required
+// before P4b retires the DB-world path — see the PR #4453 soak plan.
 //
 // The captured JSON is exactly the filtered array of source='runtime' grid
 // entries. Template-source entries are intentionally NOT captured — the org
@@ -902,6 +943,15 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 // would duplicate (and, on a name collision, template wins — matching the DB
 // world's NOT EXISTS guard in migrateRuntimeSchedulesFromRemovedPredecessor).
 func captureRuntimeSchedulesForCarryover(ctx context.Context, ids []string) {
+	// F3: panic-isolate the entire capture so a panic can NEVER abort the
+	// synchronous CascadeDelete teardown (recover-and-don't-re-raise, matching
+	// logProvisionPanic / coalesceRestart). Log with a stack trace and return —
+	// CascadeDelete then proceeds to stopAndRemove.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("carryover-capture: PANIC — recovered, teardown continues: %v\n%s", r, debug.Stack())
+		}
+	}()
 	if db.DB == nil {
 		return
 	}
