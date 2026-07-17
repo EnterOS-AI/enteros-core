@@ -472,6 +472,14 @@ func (h *ScheduleHandler) History(c *gin.Context) {
 	workspaceID := c.Param("id")
 	ctx := c.Request.Context()
 
+	if scheduleBackendIsVolume(workspaceID) {
+		// scheduleID is the grid entry name in the volume model; the runtime's
+		// bounded run log replaces activity_logs as the source (P4b re-point —
+		// post-#4399 no core code writes cron_run rows for these workspaces).
+		h.historyVolume(c, workspaceID, scheduleID)
+		return
+	}
+
 	// #152: include error_detail in history so UI can show why a run failed.
 	// activity_logs.error_detail is populated by scheduler.fireSchedule when
 	// the A2A proxy returns non-2xx or the update SQL reports an error.
@@ -572,6 +580,15 @@ func (h *ScheduleHandler) Health(c *gin.Context) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 			return
 		}
+	}
+
+	// Volume-native workspaces: serve health from the runtime grid + the
+	// trigger daemon's health file (P4b re-point). Deliberately AFTER every
+	// auth gate above — the re-point changes the data source only; the caller
+	// identity + CanCommunicate contract is identical on both branches.
+	if scheduleBackendIsVolume(workspaceID) {
+		h.healthVolume(c, workspaceID)
+		return
 	}
 
 	rows, err := db.DB.QueryContext(ctx, `

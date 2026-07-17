@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -48,6 +50,21 @@ func scheduleBackendIsVolume(workspaceID string) bool {
 		return false
 	}
 	return ProvidesNativeScheduler(workspaceID)
+}
+
+// volumeSchedulerWorkspaceIDs returns the workspaces whose schedule surface is
+// served by the runtime volume backend right now: they advertise the native
+// `scheduler` capability AND the kill-switch is off. Sorted (stable) order so
+// fan-out surfaces (webhook cron-poke, admin health) behave deterministically.
+func volumeSchedulerWorkspaceIDs() []string {
+	ids := runtimeOverrides.WorkspacesWithCapability("scheduler")
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if scheduleBackendIsVolume(id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // volumeEntry is one schedule as the runtime's SDK-owned grid contract names its
@@ -122,6 +139,68 @@ func (h *ScheduleHandler) forwardScheduleAPI(c *gin.Context, workspaceID, method
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	return resp.StatusCode, rb, true
+}
+
+// resolveScheduleFanoutTarget resolves the workspace URL + inbound secret for a
+// quiet (non-gin) schedule forward — the webhook poke fan-out and the admin
+// health aggregate, where one unreachable workspace must never fail the whole
+// surface. Mirrors armSchedulerPlugin's resolution; callers log-and-skip on a
+// non-nil error.
+func resolveScheduleFanoutTarget(ctx context.Context, workspaceID string) (string, string, error) {
+	var wsURL string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(url, '') FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&wsURL); err != nil {
+		return "", "", fmt.Errorf("workspace lookup: %w", err)
+	}
+	if wsURL == "" {
+		return "", "", errors.New("no callback URL (poll-mode / not registered)")
+	}
+	if err := isSafeURL(wsURL); err != nil {
+		return "", "", fmt.Errorf("unsafe workspace URL rejected: %w", err)
+	}
+	secret, _, err := readOrLazyHealInboundSecret(ctx, workspaceID, "schedules-fanout")
+	if err != nil {
+		return "", "", fmt.Errorf("inbound secret unavailable: %w", err)
+	}
+	return wsURL, secret, nil
+}
+
+// fetchScheduleAPI performs one quiet forward to a resolved workspace runtime
+// target's `/internal/schedules<subpath>` endpoint. Unlike forwardScheduleAPI
+// it never touches a gin response — fan-out callers aggregate results and
+// decide the surface themselves. A fresh SSRF-safe client per call matches the
+// armSchedulerPlugin idiom.
+func fetchScheduleAPI(ctx context.Context, wsURL, secret, method, subpath string, body []byte) (int, []byte, error) {
+	target := strings.TrimRight(wsURL, "/") + "/internal/schedules" + subpath
+	fctx, cancel := context.WithTimeout(ctx, scheduleForwardTimeout)
+	defer cancel()
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(fctx, method, target, reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+secret)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	client := &http.Client{
+		Timeout: scheduleForwardTimeout,
+		Transport: &http.Transport{
+			DialContext:         safeDialer().DialContext,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, rb, nil
 }
 
 // listVolume serves List from the runtime grid.
@@ -241,6 +320,136 @@ func (h *ScheduleHandler) runNowVolume(c *gin.Context, workspaceID, name string)
 		"workspace_id": workspaceID,
 		"fired_by":     "daemon",
 	})
+}
+
+// scheduleHistoryLimit mirrors the legacy History query's `LIMIT 20` so the
+// volume-proxied history surface returns the same window as the DB one.
+const scheduleHistoryLimit = 20
+
+// volumeHistoryRow is one run-log row exactly as the trigger daemon appends it
+// (SDK templates/trigger/scheduler.py run_once → schedule-history.json).
+type volumeHistoryRow struct {
+	Name         string `json:"name"`
+	At           string `json:"at"`
+	ScheduledFor string `json:"scheduled_for"`
+	Poked        bool   `json:"poked"`
+	Status       string `json:"status"` // fired | deferred | unknown
+}
+
+// historyVolume serves History from the runtime's bounded run log
+// (GET /internal/schedules/{name}/history — the per-name filter is a PATH
+// segment; the runtime ignores query params). The daemon appends
+// chronologically, so the Canvas newest-first contract means walking the log
+// backwards, capped at scheduleHistoryLimit (parity with the legacy
+// activity_logs query). The legacy HistoryEntry JSON shape is preserved
+// field-for-field; the daemon's success value "fired" maps to the legacy
+// success value "ok", while the newer daemon states (deferred/unknown) pass
+// through — masking them as ok or error would misreport.
+func (h *ScheduleHandler) historyVolume(c *gin.Context, workspaceID, name string) {
+	status, body, ok := h.forwardScheduleAPI(c, workspaceID, http.MethodGet, "/"+urlPathEscape(name)+"/history", nil)
+	if !ok {
+		return
+	}
+	if status != http.StatusOK {
+		relayScheduleError(c, status, body)
+		return
+	}
+	var payload struct {
+		History []volumeHistoryRow `json:"history"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "malformed schedule history from runtime"})
+		return
+	}
+	entries := make([]HistoryEntry, 0, len(payload.History))
+	for i := len(payload.History) - 1; i >= 0 && len(entries) < scheduleHistoryLimit; i-- {
+		row := payload.History[i]
+		ts, err := time.Parse(time.RFC3339, row.At)
+		if err != nil {
+			continue // unparseable row — skip rather than fabricate a timestamp
+		}
+		st := row.Status
+		if st == "fired" {
+			st = "ok"
+		}
+		req, _ := json.Marshal(map[string]any{
+			"schedule_id":   name,
+			"scheduled_for": row.ScheduledFor,
+			"poked":         row.Poked,
+		})
+		entries = append(entries, HistoryEntry{
+			Timestamp:   ts,
+			DurationMs:  nil, // the daemon's run log does not measure turn duration
+			Status:      &st,
+			ErrorDetail: "",
+			Request:     req,
+		})
+	}
+	c.JSON(http.StatusOK, entries)
+}
+
+// volumeHealthPayload is the daemon-health surface the runtime serves
+// (GET /internal/schedules/health): the trigger daemon's heartbeat file, or the
+// pre-first-tick fallback {"last_tick":null,"armed":N,"errors":{}}.
+type volumeHealthPayload struct {
+	LastTick *string           `json:"last_tick"`
+	Armed    int               `json:"armed"`
+	Errors   map[string]string `json:"errors"`
+}
+
+// healthVolume serves the peer Health view from the runtime grid + the trigger
+// daemon's health file, mapped into the legacy ScheduleHealthResponse shape so
+// the JSON contract — field names AND the no-prompt/no-cron_expr redaction
+// (issue #249) — is unchanged. Callers MUST have already passed the caller/
+// CanCommunicate gates; this function only changes the data source, never the
+// access contract. Bookkeeping the volume model does not surface per schedule
+// (last_run_at, run_count) is left zero — the same convention as
+// toScheduleResponse. last_status carries what a peer needs to detect a silent
+// failure: "error" (+ last_error) when the daemon reports the schedule broken,
+// "ok" while the daemon is ticking, "" before its first tick.
+func (h *ScheduleHandler) healthVolume(c *gin.Context, workspaceID string) {
+	status, body, ok := h.forwardScheduleAPI(c, workspaceID, http.MethodGet, "", nil)
+	if !ok {
+		return
+	}
+	if status != http.StatusOK {
+		relayScheduleError(c, status, body)
+		return
+	}
+	var grid struct {
+		Schedules []volumeEntry `json:"schedules"`
+	}
+	if err := json.Unmarshal(body, &grid); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "malformed schedule grid from runtime"})
+		return
+	}
+	hstatus, hbody, ok := h.forwardScheduleAPI(c, workspaceID, http.MethodGet, "/health", nil)
+	if !ok {
+		return
+	}
+	if hstatus != http.StatusOK {
+		relayScheduleError(c, hstatus, hbody)
+		return
+	}
+	var health volumeHealthPayload
+	if err := json.Unmarshal(hbody, &health); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "malformed schedule health from runtime"})
+		return
+	}
+	out := make([]ScheduleHealthResponse, 0, len(grid.Schedules))
+	for _, e := range grid.Schedules {
+		s := ScheduleHealthResponse{ID: e.Name, Name: e.Name, Enabled: e.Enabled}
+		if next, err := computeNextRunSafe(e.Cron, e.Timezone); err == nil {
+			s.NextRunAt = &next
+		}
+		if reason, broken := health.Errors[e.Name]; broken {
+			s.LastStatus, s.LastError = "error", reason
+		} else if health.LastTick != nil {
+			s.LastStatus = "ok"
+		}
+		out = append(out, s)
+	}
+	c.JSON(http.StatusOK, out)
 }
 
 // MigrateToVolume copies a workspace's user-created (source='runtime') schedules
