@@ -422,6 +422,65 @@ func renderCategoryRoutingYAML(routing map[string][]string) (string, error) {
 	return string(out), nil
 }
 
+// stripTopLevelYAMLKey removes a single top-level mapping key — and the ENTIRE
+// value beneath it, whatever its indentation STYLE — from a YAML document,
+// preserving every OTHER line byte-for-byte (a line scanner, not a yaml
+// round-trip, so unrelated keys, comments, and formatting survive exactly —
+// a full unmarshal/re-marshal would drop comments, reorder keys, and re-quote,
+// none of which the delivered config.yaml may tolerate).
+//
+// Used on the DIRECT workspace-create path to drop a template config.yaml's RAW
+// authoring `schedules:` block before the runtime-native RENDERED block is
+// appended in its place: the raw block uses core's `cron_expr` authoring alias
+// (not the runtime's `cron` key) and may carry `prompt_file` refs that dangle
+// in-container, so it must NOT ship to the runtime's config-seeding — and
+// leaving it in place while appending the rendered block would DUPLICATE the
+// `schedules:` key, an unloadable config.yaml that bricks workspace boot
+// (runtime config.py load_config has no try/except). Only the FIRST occurrence
+// is stripped (a well-formed config has at most one).
+//
+// The value is consumed regardless of the author's block-sequence style:
+//   - INDENTED children (indented block-mapping, or an indented "  - " sequence)
+//     and blank lines interior to the block;
+//   - FLUSH-STYLE (zero-indent) block-sequence entries — a "- " item line at
+//     column 0, valid YAML the sibling parseTemplateSchedules accepts — plus
+//     each entry's indented continuation lines.
+//
+// The block ends at the next ZERO-INDENT, non-blank line that is NOT a
+// flush-style sequence entry (i.e. the next real top-level key), or at EOF.
+// Before this handled flush style, a zero-indent sequence body was left
+// orphaned after its `schedules:` key line was removed, making the combined
+// doc invalid so appendYAMLBlockChecked's round-trip guard rejected it and the
+// UNCHANGED template copy shipped instead — the rendered runtime-native block
+// never reached the volume grid and the raw block reached the runtime.
+func stripTopLevelYAMLKey(data []byte, key string) []byte {
+	lines := strings.Split(string(data), "\n")
+	out := make([]string, 0, len(lines))
+	prefix := key + ":"
+	inBlock := false
+	for _, line := range lines {
+		trimmedLeft := strings.TrimLeft(line, " \t")
+		indented := len(line) > len(trimmedLeft)
+		if inBlock {
+			// Consume the block's value whatever its style: indented children,
+			// blank interior lines, and flush-style (zero-indent) "- " sequence
+			// entries. The block ends at the next zero-indent, non-blank,
+			// non-sequence line (the next real top-level key) or EOF.
+			if indented || strings.TrimSpace(line) == "" ||
+				trimmedLeft == "-" || strings.HasPrefix(trimmedLeft, "- ") {
+				continue
+			}
+			inBlock = false
+		}
+		if !indented && strings.HasPrefix(trimmedLeft, prefix) {
+			inBlock = true // skip this key line and its value (any style)
+			continue
+		}
+		out = append(out, line)
+	}
+	return []byte(strings.Join(out, "\n"))
+}
+
 // appendYAMLBlock concatenates a YAML fragment to an existing buffer, guaranteeing
 // a newline boundary between them. Upstream code writes config.yaml in fragments
 // (base template → category_routing → initial_prompt) and the base isn't

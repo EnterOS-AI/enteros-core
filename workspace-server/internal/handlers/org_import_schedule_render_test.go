@@ -352,3 +352,146 @@ func TestAppendYAMLBlockChecked_RevertsOnUnparseableAssembly(t *testing.T) {
 		t.Errorf("broken schedules block leaked into the delivered config.yaml:\n%s", got)
 	}
 }
+
+// TestStripTopLevelYAMLKey_RemovesScheduleBlockPreservesRest pins the
+// direct-create replace-in-place helper (P4b): the template config.yaml's RAW
+// authoring `schedules:` block (cron_expr alias / prompt_file refs) must be
+// stripped before the runtime-native rendered block is appended in its place —
+// otherwise the delivered config.yaml carries a DUPLICATE `schedules:` key and
+// is unloadable. Every OTHER line — keys, nested maps, comments — must survive
+// byte-for-byte.
+func TestStripTopLevelYAMLKey_RemovesScheduleBlockPreservesRest(t *testing.T) {
+	src := []byte("name: Agent\n" +
+		"runtime: claude-code\n" +
+		"# author's note\n" +
+		"schedules:\n" +
+		"  - name: raw-authoring\n" +
+		"    cron_expr: \"0 9 * * *\"\n" +
+		"    prompt_file: daily.md\n" +
+		"runtime_config:\n" +
+		"  model: sonnet\n")
+
+	stripped := stripTopLevelYAMLKey(src, "schedules")
+	s := string(stripped)
+	// The raw block and its authoring-only keys are gone…
+	if strings.Contains(s, "schedules:") || strings.Contains(s, "cron_expr") || strings.Contains(s, "prompt_file") || strings.Contains(s, "raw-authoring") {
+		t.Errorf("raw schedules block not fully stripped:\n%s", s)
+	}
+	// …every unrelated line survives, including the comment and the sibling
+	// nested map that FOLLOWS the block (the scanner must resume after the block).
+	for _, want := range []string{"name: Agent", "runtime: claude-code", "# author's note", "runtime_config:", "  model: sonnet"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("stripped output dropped unrelated line %q:\n%s", want, s)
+		}
+	}
+	// Negative control 1: a document with no such key is returned unchanged
+	// (modulo the trailing-newline normalization of split/join, which is
+	// byte-stable for a \n-terminated input).
+	noKey := []byte("name: Agent\nruntime: claude-code\n")
+	if got := stripTopLevelYAMLKey(noKey, "schedules"); !bytes.Equal(got, noKey) {
+		t.Errorf("no-op strip changed a document without the key:\ngot=%q want=%q", got, noKey)
+	}
+	// Negative control 2: the strip result plus a rendered block must parse as a
+	// SINGLE schedules key (the duplicate-key boot-brick the helper prevents).
+	block, _, _ := renderTemplateSchedulesYAML(
+		[]OrgSchedule{{Name: "runtime-native", CronExpr: "0 9 * * *", Prompt: "go"}},
+		t.TempDir(), "", "WS Strip")
+	combined, ok := appendYAMLBlockChecked(stripped, block, "schedules", "WS Strip")
+	if !ok {
+		t.Fatalf("strip+append must yield a loadable config.yaml:\n%s", combined)
+	}
+	if got := len(parseRenderedSchedules(t, combined)); got != 1 {
+		t.Errorf("combined config.yaml carries %d schedules, want exactly 1 (rendered replaces raw):\n%s", got, combined)
+	}
+}
+
+// TestStripTopLevelYAMLKey_StripsFlushStyleSequence pins the review finding:
+// the strip must remove a FLUSH-STYLE (zero-indent) `schedules:` sequence body
+// too — the exact style a template author can legally write and the sibling
+// parseTemplateSchedules accepts. Pre-fix the scanner removed only the
+// `schedules:` KEY line and left the orphaned `- name:` / `cron_expr:` body,
+// so the combined doc was invalid → appendYAMLBlockChecked's round-trip guard
+// returned ok=false → the UNCHANGED template copy shipped, the rendered
+// runtime-native block never reached the volume grid, AND the raw block reached
+// the runtime (schedules VANISH at the later DB-seed-retirement cutover).
+//
+// This drives the SAME strip→render→append sequence workspace.go runs on the
+// direct-create path (workspace.go: appendYAMLBlockChecked(
+// stripTopLevelYAMLKey(baseCfg, "schedules"), schedBlock, …)).
+//
+// Negative control (recorded in the PR): on the pre-fix stripTopLevelYAMLKey
+// every assertion below fails — `appended` comes back FALSE (orphaned flush
+// body makes the assembly unparseable), the delivered doc is byte-equal to the
+// raw template (so the rendered `cron:` block is ABSENT and the raw `cron_expr`
+// / `prompt_file` keys are PRESENT), and parseRenderedSchedules reads the raw
+// entries, not the single rendered one. Both fail arms are reachable.
+func TestStripTopLevelYAMLKey_StripsFlushStyleSequence(t *testing.T) {
+	// Template config.yaml with a FLUSH-STYLE (zero-indent) schedules sequence:
+	// the "- name:" items sit at column 0, valid YAML the author may write.
+	src := []byte("name: Agent\n" +
+		"runtime: claude-code\n" +
+		"# author's note\n" +
+		"schedules:\n" +
+		"- name: raw-authoring\n" +
+		"  cron_expr: \"0 9 * * *\"\n" +
+		"  prompt_file: daily.md\n" +
+		"- name: second-raw\n" +
+		"  cron_expr: \"30 18 * * 1-5\"\n" +
+		"  prompt: inline body\n" +
+		"runtime_config:\n" +
+		"  model: sonnet\n")
+
+	stripped := stripTopLevelYAMLKey(src, "schedules")
+
+	// (c) All OTHER config.yaml keys survive BYTE-IDENTICAL — the entire
+	// flush-style value (both entries, all continuation lines) is gone, and the
+	// sibling `runtime_config:` map that FOLLOWS the block resumes untouched.
+	wantStripped := "name: Agent\n" +
+		"runtime: claude-code\n" +
+		"# author's note\n" +
+		"runtime_config:\n" +
+		"  model: sonnet\n"
+	if string(stripped) != wantStripped {
+		t.Fatalf("flush-style strip not byte-identical on non-schedules keys:\ngot:\n%q\nwant:\n%q", stripped, wantStripped)
+	}
+	for _, gone := range []string{"schedules:", "cron_expr", "prompt_file", "raw-authoring", "second-raw"} {
+		if strings.Contains(string(stripped), gone) {
+			t.Errorf("flush-style strip left raw authoring token %q behind:\n%s", gone, stripped)
+		}
+	}
+
+	// Render the runtime-native replacement block and append it exactly as the
+	// direct-create path does.
+	block, rendered, _ := renderTemplateSchedulesYAML(
+		[]OrgSchedule{{Name: "runtime-native", CronExpr: "0 9 * * *", Prompt: "go"}},
+		t.TempDir(), "", "WS Flush")
+	if rendered != 1 {
+		t.Fatalf("precondition: rendered=%d want 1\n%s", rendered, block)
+	}
+	combined, appended := appendYAMLBlockChecked(stripped, block, "schedules", "WS Flush")
+	if !appended {
+		// The pre-fix fail arm: the orphaned flush body makes the assembly
+		// unparseable, so the guard reverts and the raw template ships.
+		t.Fatalf("strip+append of a flush-style template must yield a LOADABLE config.yaml (ok=false means the orphaned body survived):\n%s", combined)
+	}
+
+	// (a) the delivered doc carries the rendered runtime-native block, and (b)
+	// it parses cleanly as a SINGLE schedules list (no orphaned body).
+	entries := parseRenderedSchedules(t, combined)
+	if len(entries) != 1 || entries[0]["name"] != "runtime-native" || entries[0]["cron"] != "0 9 * * *" {
+		t.Fatalf("delivered config.yaml must carry exactly the 1 rendered runtime-native schedule, got: %#v\n%s", entries, combined)
+	}
+	// The runtime-native `cron:` key is present and the raw `cron_expr` alias is
+	// gone — proof the rendered block replaced the raw one rather than the
+	// unchanged template copy shipping.
+	if !strings.Contains(string(combined), "cron: 0 9 * * *") {
+		t.Errorf("delivered config.yaml missing the rendered runtime-native cron key:\n%s", combined)
+	}
+	if strings.Contains(string(combined), "cron_expr") || strings.Contains(string(combined), "prompt_file") {
+		t.Errorf("raw authoring keys leaked into the delivered config.yaml:\n%s", combined)
+	}
+	// The non-schedules head survives byte-for-byte into the delivered doc.
+	if !strings.HasPrefix(string(combined), wantStripped) {
+		t.Errorf("delivered config.yaml did not preserve the non-schedules keys byte-for-byte:\n%s", combined)
+	}
+}

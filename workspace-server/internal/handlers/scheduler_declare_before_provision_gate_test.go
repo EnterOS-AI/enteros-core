@@ -105,8 +105,14 @@ func TestSchedulerDeclare_BeforeProvisionDispatch_OrgImport(t *testing.T) {
 
 // TestSchedulerDeclare_BeforeProvisionDispatch_Create pins the workspace
 // Create path: the pre-provision declare (and the schedule parse feeding it)
-// precede the provisionWorkspaceAuto dispatch.
+// precede the provisionWorkspaceAuto dispatch. The renderTemplateSchedulesYAML
+// arm is the P4b direct-create leg (issue #4411): the schedules must be
+// rendered into configFiles BEFORE the dispatch captures configFiles for the
+// provision goroutine — the same happens-before the org-import leg carries.
+// Pre-change (render only wired into org_import.go), Create does NOT call
+// renderTemplateSchedulesYAML, so this arm's "no longer calls" fail path fires.
 func TestSchedulerDeclare_BeforeProvisionDispatch_Create(t *testing.T) {
 	assertCallBefore(t, "workspace.go", "Create", "parseTemplateSchedules", "provisionWorkspaceAuto")
 	assertCallBefore(t, "workspace.go", "Create", "ensureSchedulerPluginDeclared", "provisionWorkspaceAuto")
+	assertCallBefore(t, "workspace.go", "Create", "renderTemplateSchedulesYAML", "provisionWorkspaceAuto")
 }

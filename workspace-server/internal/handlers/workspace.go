@@ -1105,6 +1105,65 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			log.Printf("Create %s: parsing template schedules: %v (continuing)", id, schedParseErr)
 			templateScheds = nil
 		} else if len(templateScheds) > 0 {
+			// P4b (issue #4411): render the template's RESOLVED schedules into
+			// the DELIVERED config.yaml so the runtime's boot/reload seeding
+			// (seed_schedules_from_workspace_config, molecule-ai-workspace-
+			// runtime#318) reconciles them onto the volume-authoritative grid —
+			// the SAME volume path #4444 wired for the ORG-IMPORT leg
+			// (org_import.go), now closing the direct-create asymmetry: a
+			// directly-created workspace whose template declares schedules used
+			// to get ONLY the legacy DB seed and NO schedules: block in its
+			// config.yaml, so its schedules never reached the volume grid and
+			// would vanish once the DB seed is retired.
+			//
+			// On the template path configFiles is nil and the delivered
+			// config.yaml is the template's on-disk copy (CopyTemplateToContainer
+			// / the collectCPConfigFiles TemplatePath walk). Read that copy as the
+			// BASE and hand a combined file to the provisioner via ConfigFiles so
+			// it OVERRIDES the template copy (Docker: WriteFilesToContainer runs
+			// AFTER CopyTemplateToContainer; CP: collectCPConfigFiles has the
+			// ConfigFiles map overwrite the TemplatePath-walked config.yaml).
+			//
+			// The template's config.yaml IS the schedule source: it carries a RAW
+			// authoring `schedules:` block (core's `cron_expr` alias, possibly
+			// `prompt_file` refs) that parseTemplateSchedules read above. That raw
+			// block must NOT ship to the runtime's config-seeding — the runtime
+			// wants the native `cron` key and inlined prompts, and appending the
+			// rendered block alongside the raw one would DUPLICATE the
+			// `schedules:` key (an unloadable config.yaml that bricks boot). So
+			// STRIP the raw block and append the RENDERED, runtime-native one in
+			// its place. Reuses renderTemplateSchedulesYAML + appendYAMLBlockChecked
+			// verbatim — same caps / name-contract / prompt-inlining / yaml-emitter
+			// round-trip guards as the org-import leg. Prompt refs resolve against
+			// templatePath (filesDir="") exactly like seedTemplateSchedules.
+			//
+			// The legacy workspace_schedules DB seed further below KEEPS running
+			// during the cutover — a later gated PR (P4b) retires it; this is the
+			// additive volume precondition. Must run BEFORE provisionWorkspaceAuto,
+			// which captures configFiles for the provision goroutine. Byte-
+			// identical when the template renders no schedules (nothing is
+			// stripped or appended — configFiles stays nil, the template copy
+			// ships unchanged).
+			schedBlock, schedRendered, schedSkipped := renderTemplateSchedulesYAML(templateScheds, templatePath, "", payload.Name)
+			if schedBlock != "" {
+				if baseCfg, readErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); readErr != nil {
+					// parseTemplateSchedules already read this file above, so a
+					// read failure here is unexpected; deliver WITHOUT the volume
+					// block (the DB seed below still lands the schedules) rather
+					// than fail the create.
+					log.Printf("Create %s: reading template config.yaml to append schedules failed: %v (continuing without the volume block)", id, readErr)
+				} else if combined, appended := appendYAMLBlockChecked(stripTopLevelYAMLKey(baseCfg, "schedules"), schedBlock, "schedules", payload.Name); appended {
+					if configFiles == nil {
+						configFiles = map[string][]byte{}
+					}
+					configFiles["config.yaml"] = combined
+					log.Printf("Create %s: rendered %d schedule(s) into delivered config.yaml (skipped=%d of %d)", id, schedRendered, schedSkipped, len(templateScheds))
+				}
+			}
+			// C2 ordering (unchanged from #4444): declare molecule-scheduler
+			// BEFORE the provision dispatch so first boot installs the daemon
+			// (buildProvisionerConfig → desiredPluginSources reads
+			// workspace_declared_plugins at dispatch time).
 			if declErr := ensureSchedulerPluginDeclared(ctx, id); declErr != nil {
 				log.Printf("Create %s: pre-provision scheduler plugin declare failed (non-fatal): %v", id, declErr)
 			}
