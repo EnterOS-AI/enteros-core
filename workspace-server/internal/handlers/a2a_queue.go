@@ -115,7 +115,26 @@ type QueuedItem struct {
 	Body        []byte
 	Method      sql.NullString
 	Attempts    int
+	EnqueuedAt  time.Time
 }
+
+// a2aSettlingRetryCeiling bounds the total wall-clock a single queued A2A turn
+// may spend in the NON-cap-burning transient-retry path (a gateway-origin
+// failure while the target is still heartbeating — see DrainQueueForWorkspace).
+// That path deliberately does NOT burn the 5-attempt terminal cap so a brief
+// blip can't strand a legitimate turn. But with NO other ceiling, a PERSISTENTLY
+// settling target re-queues FOREVER: a force-hibernated box that was woken onto a
+// fresh container while the in-flight turn still targets the dead one, or any
+// workspace whose forward path stays broken while it keeps heartbeating. Each
+// re-delivery attempt pokes the runtime and resets its idle clock, so the
+// idle-digest (and every other idle-gated behaviour) is starved indefinitely —
+// the RCA of the nondeterministic ephemeral happy-path gate (run 533322:
+// digest armed=3, fired=0; task #124/#94). Past this ceiling we stop treating the
+// failure as transient and DROP the turn (terminally, with a caller-visible
+// reason) so it can never zombie-requeue. Sized generously (well beyond a normal
+// hibernate wake, which settles in ~15-30s) so a merely-slow-but-recovering
+// target is not dropped. Env override: A2A_SETTLING_RETRY_CEILING_S.
+var a2aSettlingRetryCeiling = envDuration("A2A_SETTLING_RETRY_CEILING_S", 180*time.Second)
 
 // EnqueueA2A inserts a busy-retry-eligible A2A request into a2a_queue and
 // returns the new row ID + current queue depth. Caller MUST have already
@@ -267,7 +286,7 @@ func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 	var item QueuedItem
 	var body string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, workspace_id, caller_id, priority, body::text, method, attempts
+		SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at
 		FROM a2a_queue
 		WHERE workspace_id = $1 AND status = 'queued'
 		  AND (expires_at IS NULL OR expires_at > now())
@@ -277,7 +296,7 @@ func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 		LIMIT 1
 	`, workspaceID).Scan(
 		&item.ID, &item.WorkspaceID, &item.CallerID, &item.Priority,
-		&body, &item.Method, &item.Attempts,
+		&body, &item.Method, &item.Attempts, &item.EnqueuedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -383,6 +402,26 @@ func MarkQueueItemTransientRetry(ctx context.Context, id, errMsg string) {
 		WHERE id = $1
 	`, id, errMsg, transientRetryBackoffSecs); err != nil {
 		log.Printf("A2AQueue: failed to mark %s for transient retry: %v", id, err)
+	}
+}
+
+// DropQueueItemTerminal terminally drops a currently-dispatched item to
+// 'dropped' with a caller-visible reason. Unlike MarkQueueItemFailed (whose
+// 'failed' transition only fires once attempts>=cap — and the transient-retry
+// path deliberately keeps attempts at 0), this ends the item unconditionally so
+// a persistently-settling target cannot zombie-requeue it forever. The status
+// guard pins the write to the row THIS drain dispatched, so a racing enqueue/
+// completion is not clobbered.
+func DropQueueItemTerminal(ctx context.Context, id, reason string) {
+	if _, err := db.DB.ExecContext(ctx, `
+		UPDATE a2a_queue
+		SET status = 'dropped',
+		    last_error = $2,
+		    dispatched_at = NULL,
+		    completed_at = now()
+		WHERE id = $1 AND status = 'dispatched'
+	`, id, reason); err != nil {
+		log.Printf("A2AQueue: failed to terminally drop %s: %v", id, err)
 	}
 }
 
@@ -537,13 +576,32 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 			// hand off to MarkQueueItemTransientRetry which undoes the
 			// DequeueNext attempts-increment.
 			if isGatewayOriginFailure(proxyErr) && h.hasRecentHeartbeat(ctx, workspaceID) {
+				// The transient path deliberately does NOT burn the 5-attempt cap.
+				// But a target that has been settling far past the point a blip can
+				// explain (a woken box on a fresh container while this turn targets
+				// the dead one, or any persistently-broken forward path) would
+				// re-queue FOREVER, poking the runtime on every attempt and starving
+				// idle-gated work (task #124/#94). Bound it: past
+				// a2aSettlingRetryCeiling, stop treating it as transient and DROP it.
+				settlingFor := time.Since(item.EnqueuedAt)
+				if settlingFor >= a2aSettlingRetryCeiling {
+					dropMsg := fmt.Sprintf("target failed to settle within %s of enqueue (persistent gateway-origin failure, last status=%d classification=%s: %s); dropped to stop a zombie re-queue that starves the workspace (core#124)",
+						a2aSettlingRetryCeiling, proxyErr.Status, classificationOrUnknown(classification), errMsg)
+					DropQueueItemTerminal(ctx, item.ID, dropMsg)
+					log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s SETTLING CEILING EXCEEDED "+
+						"(settling_for=%s ceiling=%s status=%d classification=%s) — dropped to stop zombie re-queue",
+						item.ID, workspaceID, resolvedURL, settlingFor.Truncate(time.Second), a2aSettlingRetryCeiling,
+						proxyErr.Status, classificationOrUnknown(classification))
+					continue
+				}
 				h.invalidateCachedURLForDrain(ctx, workspaceID)
 				MarkQueueItemTransientRetry(ctx, item.ID,
 					fmt.Sprintf("transient gateway origin (%s, status=%d): %s",
 						classificationOrUnknown(classification), proxyErr.Status, errMsg))
 				log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s transient gateway failure "+
-					"(status=%d classification=%s) — re-queued without burning attempt cap (attempts preserved at %d)",
-					item.ID, workspaceID, resolvedURL, proxyErr.Status, classificationOrUnknown(classification), item.Attempts)
+					"(status=%d classification=%s) — re-queued without burning attempt cap (attempts preserved at %d, settling_for=%s/%s)",
+					item.ID, workspaceID, resolvedURL, proxyErr.Status, classificationOrUnknown(classification), item.Attempts,
+					settlingFor.Truncate(time.Second), a2aSettlingRetryCeiling)
 				continue
 			}
 

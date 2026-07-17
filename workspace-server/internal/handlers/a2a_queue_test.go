@@ -241,6 +241,10 @@ func drainItem(wsID string) *QueuedItem {
 		Body:        []byte(`{"method":"message/send","params":{"message":{"role":"user","parts":[{"type":"text","text":"hi"}]}}}`),
 		Method:      sql.NullString{String: "message/send", Valid: true},
 		Attempts:    1,
+		// Just-enqueued: well WITHIN a2aSettlingRetryCeiling, so the transient
+		// gateway-origin path stays eligible (the ceiling drop is exercised by
+		// TestDrainQueueForWorkspace_SettlingCeilingExceeded_Drops with an aged item).
+		EnqueuedAt: time.Now(),
 	}
 }
 
@@ -255,13 +259,13 @@ func drainItem(wsID string) *QueuedItem {
 func expectDequeueNextOk(mock sqlmock.Sqlmock, item *QueuedItem) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(
-		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
+		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
 		WithArgs(item.WorkspaceID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "workspace_id", "caller_id", "priority", "body", "method", "attempts",
+			"id", "workspace_id", "caller_id", "priority", "body", "method", "attempts", "enqueued_at",
 		}).AddRow(
 			item.ID, item.WorkspaceID, item.CallerID, item.Priority,
-			string(item.Body), item.Method, item.Attempts,
+			string(item.Body), item.Method, item.Attempts, item.EnqueuedAt,
 		))
 	mock.ExpectExec(
 		"UPDATE a2a_queue SET status = 'dispatched', dispatched_at = now(), attempts = attempts + 1 WHERE id = $1").
@@ -275,7 +279,7 @@ func expectDequeueNextOk(mock sqlmock.Sqlmock, item *QueuedItem) {
 func expectDequeueNextEmpty(mock sqlmock.Sqlmock, wsID string) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(
-		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
+		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
 		WithArgs(wsID).
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectRollback()
@@ -312,6 +316,15 @@ func expectTransientRetry(mock sqlmock.Sqlmock, id string, errMsg sqlmock.Argume
 	mock.ExpectExec(
 		"UPDATE a2a_queue SET status = 'queued', attempts = GREATEST(attempts - 1, 0), last_error = $2, dispatched_at = NULL, next_attempt_at = now() + make_interval(secs => $3) WHERE id = $1").
 		WithArgs(id, errMsg, transientRetryBackoffSecs).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// expectSettlingCeilingDrop mocks DropQueueItemTerminal — the terminal drop taken
+// when a transient gateway-origin failure has persisted past a2aSettlingRetryCeiling.
+func expectSettlingCeilingDrop(mock sqlmock.Sqlmock, id string, reason sqlmock.Argument) {
+	mock.ExpectExec(
+		"UPDATE a2a_queue SET status = 'dropped', last_error = $2, dispatched_at = NULL, completed_at = now() WHERE id = $1 AND status = 'dispatched'").
+		WithArgs(id, reason).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
@@ -549,7 +562,7 @@ func TestDrainQueueForWorkspace_DequeueError_LogsAndReturns(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(
-		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
+		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
 		WithArgs("ws-dequeue-err").
 		WillReturnError(sql.ErrConnDone)
 	mock.ExpectRollback()
@@ -711,6 +724,50 @@ func TestDrainQueueForWorkspace_TransientGatewayFailure_InvalidatesCachedURL(t *
 	// "ws:<id>:url" — after the drain it must be gone.
 	if got, err := mr.Get(fmt.Sprintf("ws:%s:url", item.WorkspaceID)); err == nil && got != "" {
 		t.Errorf("cached URL survived transient-retry invalidation: got=%q want empty", got)
+	}
+}
+
+// TestDrainQueueForWorkspace_SettlingCeilingExceeded_Drops is the negative
+// control to TestDrainQueueForWorkspace_TransientGatewayFailure_StaysQueued:
+// SAME inputs (online workspace, recent heartbeat, transient 502 gateway-origin
+// failure) EXCEPT the item was enqueued longer ago than a2aSettlingRetryCeiling.
+// The transient path is NON-cap-burning and would otherwise re-queue forever,
+// poking the runtime on every attempt and starving idle-gated work (the RCA of
+// the flaky ephemeral happy-path gate — task #124/#94). Past the ceiling the
+// drain must TERMINALLY DROP the item (DropQueueItemTerminal), NOT re-queue it,
+// and must NOT invalidate the cached URL (that only happens on the retry path).
+func TestDrainQueueForWorkspace_SettlingCeilingExceeded_Drops(t *testing.T) {
+	item := drainItem("ws-settling-zombie")
+	// Enqueued well past the ceiling: the target has been "settling" far longer
+	// than any real blip explains.
+	item.EnqueuedAt = time.Now().Add(-(a2aSettlingRetryCeiling + time.Minute))
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+	expectDequeueNextOk(mock, item)
+	expectQueueBudgetCheck(mock, item.WorkspaceID)
+	expectRuntimeLookup(mock, item.WorkspaceID)
+	expectRecentHeartbeatPresent(mock, item.WorkspaceID)
+
+	// Same 502 gateway-origin shape as the transient-retry test.
+	srv := agentServer(`<html>cloudflare error</html>`, http.StatusBadGateway)
+	defer srv.Close()
+	seedRedisURL(t, mr, item.WorkspaceID, srv.URL)
+
+	// Expect the TERMINAL drop, NOT a transient re-queue. If the ceiling check
+	// were absent the drain would call MarkQueueItemTransientRetry instead and
+	// this expectation would go unmet (proving the branch).
+	expectSettlingCeilingDrop(mock, item.ID, sqlmock.AnyArg())
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+
+	// The cached URL must SURVIVE (the drop path does not invalidate it — only
+	// the transient-retry path does). Guards against accidentally sharing the
+	// retry path's side effects.
+	if got, err := mr.Get(fmt.Sprintf("ws:%s:url", item.WorkspaceID)); err != nil || got == "" {
+		t.Errorf("cached URL was invalidated on the ceiling-drop path; want it preserved (got=%q err=%v)", got, err)
 	}
 }
 
