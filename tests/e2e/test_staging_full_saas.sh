@@ -197,16 +197,54 @@ live_milestone() {
 require_live_or_die() {
   # No-op unless CI demanded a live run.
   [ "$REQUIRE_LIVE" = "1" ] || return 0
-  local required="provisioned tenant_online workspace_online a2a_roundtrip"
+
+  # ── Canonical DECLARED happy-path milestone set (the SSOT) ──────────────────
+  # This MUST equal molcontracts.HappyPathMilestones (9 ids, RFC #4428 Phase 2).
+  # The core-side derive-gate (workspace-server/internal/e2emilestones,
+  # TestHappyPathMilestonesMatchRunner) greps THIS line with the regex
+  # requiredMilestonesRE and set-compares it (both directions) to the vendored
+  # binding. Keep it a single-line quoted assignment, and when the SDK milestone
+  # set changes, change the id list here — the gate will red otherwise.
+  local required="provisioned tenant_online workspace_online a2a_roundtrip memory_online delegation_provenance cascade_guard lifecycle_pause_resume lifecycle_hibernate_wake"
+
+  # ── Mode-aware ENFORCEMENT partition ────────────────────────────────────────
+  # The DECLARED set is always all 9 (SSOT). But a milestone is only *required to
+  # have fired* when the stage that proves it was supposed to run THIS mode.
+  # Blindly enforcing all 9 would false-red smoke mode / E2E_LIFECYCLE=off, where
+  # those stages legitimately never execute (see the mode gates at the memory,
+  # delegation, and 10b lifecycle stages). This is the runner-side complement of
+  # the derive-gate: the gate locks WHICH ids are declared; this locks WHICH of
+  # them this mode must actually reach.
+  #   always              : provisioned tenant_online workspace_online a2a_roundtrip
+  #   MODE=full           : + memory_online (step 9)  + delegation_provenance (step 10)
+  #   full & lifecycle!=off: + cascade_guard + lifecycle_pause_resume + lifecycle_hibernate_wake (step 10b)
+  local enforced="provisioned tenant_online workspace_online a2a_roundtrip"
+  if [ "$MODE" = "full" ]; then
+    enforced="$enforced memory_online delegation_provenance"
+    if [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
+      enforced="$enforced cascade_guard lifecycle_pause_resume lifecycle_hibernate_wake"
+    fi
+  fi
+
+  # Drift self-check: every enforced id MUST be a member of the declared set, so
+  # enforcement can never check an id the SSOT doesn't declare (a typo would
+  # otherwise silently never be verified). Fail loud on divergence.
+  local e r found
+  for e in $enforced; do
+    found=0
+    for r in $required; do [ "$e" = "$r" ] && { found=1; break; }; done
+    [ "$found" = "1" ] || fail "require_live_or_die bug: enforced milestone '$e' is not in the declared required set — enforcement/SSOT drift. declared='$required' enforced='$enforced'"
+  done
+
   local m missing=""
-  for m in $required; do
+  for m in $enforced; do
     case " $LIVE_MILESTONES " in
       *" $m "*) ;;
       *) missing="$missing $m" ;;
     esac
   done
   if [ -n "$missing" ]; then
-    echo "[$(date +%H:%M:%S)] ❌ E2E_REQUIRE_LIVE=1 but the run did NOT prove a full live lifecycle — missing milestone(s):${missing}. Reached:${LIVE_MILESTONES:-<none>}. This is a false-green-on-skip guard: a run that validates no real provision→online→A2A cycle MUST NOT report green." >&2
+    echo "[$(date +%H:%M:%S)] ❌ E2E_REQUIRE_LIVE=1 but the run did NOT prove the milestones required for MODE=$MODE E2E_LIFECYCLE=${E2E_LIFECYCLE:-auto} — missing milestone(s):${missing}. Reached:${LIVE_MILESTONES:-<none>}. This is a false-green-on-skip guard: a run that skipped a stage it SHOULD have run MUST NOT report green." >&2
     exit 5
   fi
 }
@@ -2020,6 +2058,9 @@ print(json.dumps({
     fail "HMA memory not readable after write (http=$MEM_LIST_CODE). List: $(printf '%s' "$MEM_LIST" | sanitize_http_body | head -c 200)"
   fi
   ok "HMA memory write+read roundtripped"
+  # Milestone: HMA memory write+read roundtripped against the live workspace
+  # (RFC #4428 Phase 2). Stamped ONLY here, after the hard read-back assertion.
+  live_milestone memory_online
 
   log "9b.  Peer discovery + activity log smoke..."
   # FAIL-CLOSED: assert a real 2xx, not merely "not 404". The previous
@@ -2298,6 +2339,10 @@ except Exception:
   done
   if [ "$CHILD_ACT_SEEN" = "1" ]; then
     ok "Child activity log records parent as source"
+    # Milestone: delegation provenance proven — the child's activity log records
+    # the parent as source_id after a real agent→agent A2A (RFC #4428 Phase 2).
+    # Stamped ONLY on the hard-asserted success branch (the else branch fails).
+    live_milestone delegation_provenance
   else
     fail "Child activity log never referenced parent $PARENT_ID within ${E2E_CHILD_ACTIVITY_TIMEOUT_SECS:-60}s (last http=$CHILD_ACT_LASTCODE) — delegation-provenance pipeline regression (parent not recorded as source). Previously soft-logged → false-green."
   fi
@@ -2361,6 +2406,10 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
       fail "Cascade guard: POST /workspaces/\$PARENT_ID/pause (no ?cascade) must be REFUSED with 409 + the descendant list while child $CHILD_ID is live — got http=$CASC_CODE. A regression here lets a parent pause strand its running children. Body: $(printf '%s' "$CASC_BODY" | sanitize_http_body | head -c 200)"
     fi
     ok "    cascade guard: parent pause refused while a child is live (HTTP 409)"
+    # Milestone: cascade guard proven — a parent pause with a live child is
+    # REFUSED 409 + descendant list (RFC #4428 Phase 2). Stamped inside the
+    # CHILD_ID branch, after the hard 409+"descendants" assertion.
+    live_milestone cascade_guard
   fi
 
   lifecycle_status() {  # echoes the live workspace status
@@ -2402,6 +2451,10 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   # heartbeat recovery can still take minutes.
   wait_workspaces_online_routable "    Waiting for the leaf workspace to return online after resume (up to $((WORKSPACE_ONLINE_TIMEOUT_SECS/60)) min)..." "$LIFECYCLE_WS"
   ok "    resume → provisioning → online (DB-verified)"
+  # Milestone: pause→resume lifecycle proven — leaf DB-verified paused, then
+  # resumed back to online/routable (RFC #4428 Phase 2). Stamped after both the
+  # pause and resume DB-verified assertions above complete.
+  live_milestone lifecycle_pause_resume
 
   # ── hibernate (force coverage: core#4292/#4293) ──
   # force-hibernate only MEANS anything on a BUSY workspace. On an idle one, the
@@ -2594,6 +2647,12 @@ print(json.dumps({
   wait_status "online" "$WORKSPACE_ONLINE_TIMEOUT_SECS" "hibernate-wake" \
     || fail "Hibernate auto-wake: workspace $LIFECYCLE_WS never returned to status=online after a wake A2A (last A2A http=$WAKE_CODE) — auto-wake-on-message regression (a hibernated ws must re-provision on the next A2A)."
   ok "    hibernate → online via auto-wake A2A (DB-verified)"
+  # Milestone: idle force-hibernate → auto-wake → online proven, DB-verified
+  # (RFC #4428 Phase 2). Stamped at the SHARED auto-wake success — reached by
+  # both the busy and idle-fallback hibernate branches — so it is NOT contingent
+  # on the best-effort busy-drive (the force-on-busy #4293 coverage is task #92,
+  # capture-first, and deliberately NOT gated to this milestone).
+  live_milestone lifecycle_hibernate_wake
   ok "Lifecycle transitions passed: pause→resume→online + hibernate→wake→online"
 else
   log "10b/11 Lifecycle transitions skipped (MODE=$MODE, E2E_LIFECYCLE=${E2E_LIFECYCLE:-auto}) — pause/resume/hibernate only run in full mode with E2E_LIFECYCLE!=off."

@@ -17,10 +17,15 @@ package e2emilestones
 // counts, jamming the merge queue even with continue-on-error. It is therefore
 // NOT wired to pull_request and NOT in .gitea/required-contexts.txt.
 //
-// Phase 1 scope note: this gate deliberately does NOT extend or re-order the
-// milestone set — it only proves the runner and the SSOT declare the same ids.
-// Both sides are the same 4 today (provisioned, tenant_online, workspace_online,
-// a2a_roundtrip), so this passes; the lock is what matters.
+// Scope note: this gate is set-equality only — it proves the runner and the
+// SSOT declare the same ids, it does not itself extend or re-order the set.
+// As of RFC #4428 Phase 2b both sides declare the same 9 ids: the original 4
+// (provisioned, tenant_online, workspace_online, a2a_roundtrip) plus the 5
+// promoted in Phase 2a (memory_online, delegation_provenance, cascade_guard,
+// lifecycle_pause_resume, lifecycle_hibernate_wake). The runner declares all 9
+// in its `local required="..."` SSOT line; a mode-aware ENFORCEMENT partition in
+// require_live_or_die decides which of them a given mode must actually reach, so
+// declaring 9 never false-reds smoke / E2E_LIFECYCLE=off. The lock is what matters.
 
 import (
 	"os"
