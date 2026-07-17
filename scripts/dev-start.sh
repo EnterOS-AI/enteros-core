@@ -515,20 +515,124 @@ wait_for_langfuse_http
 
 # ─────────────────────────────────────────────── 3. platform
 #
-# Two paths:
-#   (a) `go` is on PATH → run the platform directly via `go run`.
-#       Fast iteration, attaches to /tmp/molecule-platform.log.
-#   (b) `go` is NOT on PATH → fall back to the published platform
-#       container image. Slower first run (image pull) but the script
-#       still works on a fresh dev box without forcing the dev to
-#       install Go just to read logs.
+# Three paths, tried in order:
+#   (a) usable `go` on PATH (or one this script bootstrapped earlier) →
+#       run the platform directly via `go run`. Fast iteration, attaches
+#       to /tmp/molecule-platform.log.
+#   (b) no usable `go` → bootstrap_go_toolchain downloads the official,
+#       checksum-pinned Go tarball for this OS/arch into
+#       ~/.molecule-ai/toolchains/ (hermetic: no sudo, no package manager,
+#       nothing system-wide; ~70MB once, cached forever) and puts it on
+#       PATH for this run only.
+#   (c) bootstrap impossible (offline, unsupported OS/arch, checksum
+#       mismatch) → fall back to the published platform container image.
+#       NOTE: on arm64 hosts this fallback currently fails — the
+#       workspace-server/Dockerfile base images are single-arch amd64
+#       mirror digests — which is exactly why (b) exists.
 #
 # The earlier version of this script silently called `go run` and died
-# with `go: not found` on dev boxes where Go wasn't installed; the
-# script's own prerequisite list (line 13-21) said "Go 1.25+" but the
-# user had no signpost between "open the doc" and "command not found
-# at line 111." This branch makes the failure path either succeed
-# (fallback) or fail loud with explicit install guidance.
+# with `go: not found` on dev boxes where Go wasn't installed. This
+# ladder makes the failure path either succeed (bootstrap/fallback) or
+# fail loud with explicit guidance.
+
+# Pinned bootstrap toolchain. Any go >= 1.21 on PATH is also fine as-is:
+# Go's own GOTOOLCHAIN mechanism then auto-fetches the exact version
+# workspace-server/go.mod requires. Refresh procedure (all five lines
+# together): pick the release from https://go.dev/dl/?mode=json and copy
+# its per-platform archive sha256 sums.
+GO_BOOTSTRAP_VERSION="go1.26.5"
+GO_SHA256_DARWIN_ARM64="efb87ff28af9a188d0536ef5d42e63dd52ba8263cd7344a993cc48dd11dedb6a"
+GO_SHA256_DARWIN_AMD64="6231d8d3b8f5552ec6cbf6d685bdd5482e1e703214b120e89b3bf0d7bf1ef725"
+GO_SHA256_LINUX_ARM64="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
+GO_SHA256_LINUX_AMD64="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+
+# go_is_usable: go on PATH with major.minor >= 1.21 (GOTOOLCHAIN takes it
+# from there). Unparseable version output = not usable (fail toward
+# bootstrap, which is deterministic).
+go_is_usable() {
+    command -v go >/dev/null 2>&1 || return 1
+    go_ver_mm=$(go version 2>/dev/null | sed -n 's/^go version go\([0-9]*\.[0-9]*\).*/\1/p')
+    [ -n "$go_ver_mm" ] || return 1
+    [ "$(printf '%s\n' "$go_ver_mm" | cut -d. -f1)" -gt 1 ] 2>/dev/null && return 0
+    [ "$(printf '%s\n' "$go_ver_mm" | cut -d. -f1)" -eq 1 ] 2>/dev/null \
+        && [ "$(printf '%s\n' "$go_ver_mm" | cut -d. -f2)" -ge 21 ] 2>/dev/null
+}
+
+# bootstrap_go_toolchain: hermetic per-user Go install. Returns 0 with the
+# toolchain's bin FIRST on PATH, non-zero (with a reason on stderr) when
+# this host can't be bootstrapped — the caller then uses the container
+# fallback. Download + verify + extract happen in a temp dir with an
+# atomic rename at the end, so a killed run never leaves a half-installed
+# toolchain that a later run would trust.
+bootstrap_go_toolchain() {
+    go_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    case "$go_os" in
+        darwin|linux) ;;
+        *) echo "    bootstrap: unsupported OS '$go_os'" >&2; return 1 ;;
+    esac
+    case "$(uname -m)" in
+        arm64|aarch64) go_arch=arm64 ;;
+        x86_64|amd64)  go_arch=amd64 ;;
+        *) echo "    bootstrap: unsupported arch '$(uname -m)'" >&2; return 1 ;;
+    esac
+    case "${go_os}-${go_arch}" in
+        darwin-arm64) go_sha="$GO_SHA256_DARWIN_ARM64" ;;
+        darwin-amd64) go_sha="$GO_SHA256_DARWIN_AMD64" ;;
+        linux-arm64)  go_sha="$GO_SHA256_LINUX_ARM64" ;;
+        linux-amd64)  go_sha="$GO_SHA256_LINUX_AMD64" ;;
+    esac
+
+    go_dest="$HOME/.molecule-ai/toolchains/${GO_BOOTSTRAP_VERSION}"
+    if [ -x "$go_dest/go/bin/go" ]; then
+        PATH="$go_dest/go/bin:$PATH"; export PATH
+        echo "    Using cached hermetic Go toolchain: $go_dest"
+        return 0
+    fi
+
+    go_tarball="${GO_BOOTSTRAP_VERSION}.${go_os}-${go_arch}.tar.gz"
+    go_url="https://go.dev/dl/${go_tarball}"
+    # Stage INSIDE the toolchains dir so the final mv is an atomic same-fs
+    # rename — a killed run leaves only a .stage.* dir (never a half-install
+    # the cache check above would trust), and a later run redoes it cleanly.
+    mkdir -p "$(dirname "$go_dest")" || return 1
+    go_tmp=$(mktemp -d "$(dirname "$go_dest")/.stage.XXXXXX") || return 1
+    echo "==> Go not found — bootstrapping hermetic ${GO_BOOTSTRAP_VERSION} (${go_os}/${go_arch}, ~70MB, one-time)"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 -o "$go_tmp/$go_tarball" "$go_url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$go_tmp/$go_tarball" "$go_url"
+    else
+        echo "    bootstrap: neither curl nor wget available" >&2
+        rm -rf "$go_tmp"; return 1
+    fi || { echo "    bootstrap: download failed ($go_url)" >&2; rm -rf "$go_tmp"; return 1; }
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        go_got=$(sha256sum "$go_tmp/$go_tarball" | cut -d' ' -f1)
+    elif command -v shasum >/dev/null 2>&1; then
+        go_got=$(shasum -a 256 "$go_tmp/$go_tarball" | cut -d' ' -f1)
+    else
+        echo "    bootstrap: no sha256 tool (sha256sum/shasum) — refusing unverified toolchain" >&2
+        rm -rf "$go_tmp"; return 1
+    fi
+    if [ "$go_got" != "$go_sha" ]; then
+        echo "    bootstrap: CHECKSUM MISMATCH for $go_tarball (got $go_got) — refusing" >&2
+        rm -rf "$go_tmp"; return 1
+    fi
+
+    mkdir -p "$go_tmp/extract" \
+        && tar -xzf "$go_tmp/$go_tarball" -C "$go_tmp/extract" \
+        && mv "$go_tmp/extract" "$go_dest" \
+        || { echo "    bootstrap: extract/install failed" >&2; rm -rf "$go_tmp"; return 1; }
+    rm -rf "$go_tmp"
+
+    PATH="$go_dest/go/bin:$PATH"; export PATH
+    echo "    Hermetic Go installed: $go_dest (system untouched; delete that dir to remove)"
+    return 0
+}
+
+if ! go_is_usable; then
+    bootstrap_go_toolchain || true
+fi
 
 if command -v go >/dev/null 2>&1; then
     echo "==> Starting Platform (Go :${PLATFORM_PORT})"
