@@ -356,6 +356,30 @@ const errPlatformNotRoot = "a platform agent must be the org root (parent_id mus
 // closed RCA#2970 intent is preserved — sustained absence past the window degrades).
 const managementMCPUnloadedGrace = 180 * time.Second
 
+// conciergeWarmupFailGrace bounds how long a kind=platform concierge may sit in
+// 'provisioning' (the warming display state) WITHOUT ever reaching verified-ready
+// before core surfaces an operator-visible fault (degraded) instead of holding
+// 'provisioning' forever.
+//
+// EV2 REGRESSION (#4449) this restores: #4449 removed the old wall-clock warm-FAIL
+// on the theory that the turn-independent mcp_tools_ready event always arrives
+// within seconds. But if the readiness probe never publishes mcp_tools_ready (the
+// probe is disabled via MOLECULE_MCP_READINESS_PROBE=off, or persistently fails to
+// spawn/handshake the management MCP) AND the per-turn loaded_mcp_tools producer
+// under-emits (runtime#181), NOTHING flips the box online and NOTHING degrades it —
+// it holds 'provisioning' indefinitely with no online, no degrade, and no operator
+// signal. This bound re-instates a SAFETY NET: a concierge that never reaches ready
+// within the window is marked degraded (recoverable — a later ready beat still
+// promotes it) with an operator-visible last_sample_error.
+//
+// This is NOT the retired fireConciergeWarmup synthetic-turn nudge (EV2's whole
+// point was to delete that): it is a pure wall-clock terminal on the warming hold,
+// no turn is injected. It is sized GENEROUSLY (well beyond the ~seconds a healthy
+// pre-baked concierge takes to publish mcp_tools_ready) so a merely-slow-but-healthy
+// warmup is never false-failed — the false-fail complaint that motivated #4449's
+// removal — while a genuinely-stuck box still surfaces within a few minutes.
+const conciergeWarmupFailGrace = 300 * time.Second
+
 // isPlatformRootViolation reports whether err is the DB rejecting a register
 // that tried to mark a non-root workspace as a platform agent (the
 // workspaces_platform_root_check CHECK constraint). The handler maps it to a
@@ -1715,17 +1739,28 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				//   * DEAD   → a concierge that STOPS heartbeating during warm-up is
 				//     terminated by the provision-timeout sweep (registry/
 				//     provisiontimeout.go) once updated_at goes stale — the real
-				//     "no longer alive" signal, and the ONLY terminal here.
+				//     "no longer alive" signal.
+				//   * STUCK  → a concierge that KEEPS heartbeating but never reaches
+				//     ready within conciergeWarmupFailGrace is surfaced as degraded
+				//     (the bounded warm-fail SAFETY NET below) — operator-visible,
+				//     still recoverable if a later beat reports ready.
 				//
-				// This DELETES the 180s managementMCPUnloadedGrace warm-up FAIL — an
-				// arbitrary cutoff that force-failed HEALTHY concierges whose management
-				// MCP was merely slow to connect (the flaky e2e-smoke STEP-4 failure). The
-				// slow path it was compensating for is eliminated at the source: the
-				// runtime image now PRE-BAKES @molecule-ai/mcp-server into the npm cache,
-				// so the concierge's `npx --prefer-offline` resolves the management MCP
-				// with ZERO network pull (loads in ~1s), and the runtime enumeration
-				// retries robustly on the real signal with dynamic backoff. mcp_unloaded_since
-				// is still stamped below, for observability only (no longer a fail trigger).
+				// #4449 replaced the old 180s managementMCPUnloadedGrace warm-FAIL with an
+				// UNBOUNDED hold, on the theory that the turn-independent mcp_tools_ready
+				// event always lands within seconds (the runtime image PRE-BAKES
+				// @molecule-ai/mcp-server so `npx --prefer-offline` loads the management MCP
+				// with zero network pull). That removed the flaky-e2e false-FAIL of
+				// HEALTHY-but-slow concierges — but it ALSO removed the only signal for a
+				// concierge that never reaches ready at all (readiness probe disabled via
+				// MOLECULE_MCP_READINESS_PROBE=off or persistently failing, AND
+				// loaded_mcp_tools under-emitting per runtime#181): that box held
+				// 'provisioning' FOREVER with no online, no degrade, no operator signal
+				// (EV2 REGRESSION #4449). The bounded warm-fail below RESTORES a safety net
+				// WITHOUT re-introducing fireConciergeWarmup's synthetic turn — it is a pure
+				// wall-clock terminal on the warming hold, sized GENEROUSLY
+				// (conciergeWarmupFailGrace) so a merely-slow healthy warmup is never
+				// false-failed. mcp_unloaded_since (stamped below) doubles as the warming-
+				// since clock this bound measures against.
 				now := time.Now()
 				firstUnloaded := mcpUnloadedSince
 				if !firstUnloaded.Valid {
@@ -1734,7 +1769,33 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 						log.Printf("Heartbeat: failed to stamp warming mcp_unloaded_since for %s: %v", payload.WorkspaceID, err)
 					}
 				}
-				log.Printf("Heartbeat: platform %s warming, holding provisioning (waiting on mcp_tools_ready/loaded_mcp_tools signal; unloaded for %s, mcp_tools_ready=%v provision_workspace_loaded=%v unhealthy=%v) (EV2/core#3082)", payload.WorkspaceID, now.Sub(firstUnloaded.Time).Truncate(time.Second), mcpToolsReady, provisionToolLoaded, conciergeUnhealthy)
+				warmingFor := now.Sub(firstUnloaded.Time)
+				if warmingFor >= conciergeWarmupFailGrace {
+					// BOUNDED WARM-FAIL (EV2 regression #4449 safety net): the concierge
+					// has held 'provisioning' past the generous warmup window without ever
+					// reaching verified-ready. Surface it as degraded with an operator-
+					// visible reason instead of holding provisioning silently forever. NOT
+					// terminal: degraded is recoverable, so a later heartbeat that finally
+					// reports mcp_tools_ready=true still promotes it via the verified-ready
+					// case above. Conditional UPDATE (AND status='provisioning') so a racing
+					// Delete/promote is not overwritten.
+					msg := fmt.Sprintf("platform concierge never reached management-MCP readiness within %s of warming (mcp_tools_ready not published and loaded_mcp_tools did not carry provision_workspace); marking degraded (EV2 warm-fail safety net, core#3082/#4449)", conciergeWarmupFailGrace)
+					log.Printf("Heartbeat: workspace=%s transition=provisioning→degraded reason=warmup_never_ready warming_for=%s grace=%s mcp_tools_ready=%v provision_workspace_loaded=%v", payload.WorkspaceID, warmingFor.Truncate(time.Second), conciergeWarmupFailGrace, mcpToolsReady, provisionToolLoaded)
+					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'provisioning'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
+						log.Printf("Heartbeat: failed to warm-fail %s to degraded: %v", payload.WorkspaceID, err)
+					}
+					h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+						"warmup_never_ready": true,
+						"warming_for_secs":   int(warmingFor.Seconds()),
+						"sample_error":       msg,
+					})
+					// Try to regenerate the management MCP config so a subsequent beat can
+					// carry the required tool and recover the box (mirrors the post-online
+					// #3082 deadlock-break).
+					h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
+				} else {
+					log.Printf("Heartbeat: platform %s warming, holding provisioning (waiting on mcp_tools_ready/loaded_mcp_tools signal; unloaded for %s of %s, mcp_tools_ready=%v provision_workspace_loaded=%v unhealthy=%v) (EV2/core#3082)", payload.WorkspaceID, warmingFor.Truncate(time.Second), conciergeWarmupFailGrace, mcpToolsReady, provisionToolLoaded, conciergeUnhealthy)
+				}
 			default:
 				// Modern runtime in failed/offline/awaiting_agent/degraded that is NOT
 				// promotable this beat — either the tool is not proven loaded OR the
@@ -1778,7 +1839,35 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 		// intent: a genuinely-missing management MCP stays absent past the
 		// window and degrades, and stays degraded (the recovery branch below is
 		// gated on managementMCPUnloaded).
-		if payload.MCPServerPresent != nil && *payload.MCPServerPresent {
+		//
+		// EV2 RELIABLE-SIGNAL SHORT-CIRCUIT (fix for #4449 stuck-degrade / flap):
+		// mcp_tools_ready is now the RELIABLE readiness signal — the runtime's
+		// MCPReadinessProber sets it true ONLY when provision_workspace is verified
+		// loaded (the corrected runtime contract), turn-INDEPENDENTLY. So an ONLINE
+		// concierge that AFFIRMS mcp_tools_ready=true on this beat IS provision-ready
+		// by construction and must STAY ONLINE — even though the SEPARATE, UNDER-
+		// EMITTING per-turn loaded_mcp_tools producer (runtime#181) reports an
+		// empty/partial list on this beat. Degrading such a box on loaded_mcp_tools
+		// alone is exactly the #4449 defect: an online codex/hermes concierge whose
+		// loaded_mcp_tools under-emits degraded after the 180s grace and then flapped
+		// (readyForOnline re-promoted it, only to degrade again) — an online<->degraded
+		// oscillation with intermittent unavailability. We therefore SKIP the
+		// loaded_mcp_tools degrade whenever mcp_tools_ready is affirmed, and clear any
+		// stale unloaded stamp. Genuine management-MCP LOSS is still caught hard by
+		// mcp_server_present going false (the fail-closed gate at the top), and the
+		// non-affirmed cases (mcp_tools_ready nil=legacy runtime / false=probed-not-
+		// ready) still fall through to the legacy loaded_mcp_tools grace gate below.
+		if payload.MCPServerPresent != nil && *payload.MCPServerPresent && mcpToolsReady {
+			// Reliable readiness affirmed → do NOT degrade on loaded_mcp_tools
+			// under-emission. Clear any outstanding unloaded stamp so a future
+			// genuine loss starts a fresh grace window rather than degrading instantly.
+			if mcpUnloadedSince.Valid {
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET mcp_unloaded_since = NULL, updated_at = now() WHERE id = $1 AND mcp_unloaded_since IS NOT NULL`, payload.WorkspaceID); err != nil {
+					log.Printf("Heartbeat: failed to clear mcp_unloaded_since for %s (mcp_tools_ready affirmed): %v", payload.WorkspaceID, err)
+				}
+			}
+			log.Printf("Heartbeat: platform %s online, mcp_tools_ready=true — staying online despite loaded_mcp_tools_count=%d (EV2 reliable-signal short-circuit, core#3082/#4449)", payload.WorkspaceID, len(payload.LoadedMCPTools))
+		} else if payload.MCPServerPresent != nil && *payload.MCPServerPresent {
 			loaded := payload.LoadedMCPTools
 			var (
 				managementMissing bool
