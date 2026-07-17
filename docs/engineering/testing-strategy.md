@@ -18,7 +18,7 @@ Every Go package, every TypeScript module, every Python module fits one of these
 |---|---|---|---|---|
 | **1. Auth / secrets / crypto** | `tokens`, `session_auth`, `wsauth_middleware`, `crypto/envelope`, `cp_tenant_auth` | **90%** | **85%** | Every branch tested. Adversarial scenarios (cross-tenant, expired token, null origin, malformed header). Timing considered. |
 | **2. Handlers with side effects** | `workspace_provision`, `workspace_crud`, `container_files`, `terminal`, `registry` | **75%** | 70% | Happy + main error paths. DB mocks. Ownership / tenant-isolation checks. |
-| **3. State machines + workers** | `scheduler`, `provisioner`, `healthsweep`, `orphan-sweeper`, `boot_ready` | **75%** | 70% | Every state transition tested, plus the transitions that *shouldn't* fire. |
+| **3. State machines + workers** | `provisioner`, `healthsweep`, `orphan-sweeper`, `boot_ready` | **75%** | 70% | Every state transition tested, plus the transitions that *shouldn't* fire. |
 | **4. Config / business logic** | `budget`, `orgtoken` (validation), `templates`, `derive-provider`, `redaction` | **70%** | 65% | Standard unit-test territory. Table-driven preferred. |
 | **5. Plain DTOs / generated** | `models/*`, proto-generated Go, TypeScript interfaces | none | none | Writing tests here is theatre. Don't. |
 | **6. CLI glue / cmd/*** | `cmd/server`, `cmd/molecli` | smoke only | — | Integration tests / E2E cover these. One startup-smoke test per binary. |
@@ -42,13 +42,22 @@ Run `go test ./... -cover` in each repo for up-to-date numbers. Snapshot:
 | `internal/handlers/workspace_provision.go` | **0%** | 2 | 75% | 75 |
 | `internal/middleware/wsauth_middleware.go` | ~48% | 1 | 90% | 42 |
 | `internal/provisioner` | 45% | 3 | 75% | 30 |
-| `internal/scheduler` | 49% | 3 | 75% | 26 |
 | `internal/channels` | 40% | 4 | 70% | 30 |
 | `internal/orgtoken` | 88% | 4 | 70% | — |
 | `internal/crypto` | 91% | 1 | 90% | — |
 | `internal/supervised` | 93% | 3 | 75% | — |
 | `internal/plugins` | 94% | 4 | 70% | — |
 | `internal/envx` | 100% | 5 | none | — |
+
+> **Note (2026-07):** `internal/scheduler` (the core cron loop, formerly a tier-3
+> state machine here) was deleted in core#4399 — firing is owned by the
+> per-workspace `kind: trigger` plugin (see
+> `docs/design/rfc-scheduler-as-trigger-plugin.md`). Cron *math* lives in the
+> shared tier-4 lib `internal/cronspec`, conformance-gated to the SDK cron
+> contract (`contracts/cron`): `cronspec_conformance_test.go` and the runtime's
+> `test_cronspec_contract.py` both assert the same 30 cross-language fixtures
+> (`testdata/fixtures.json`), so Go and Python can never silently disagree on a
+> next-run time.
 
 ### molecule-controlplane (Go)
 
