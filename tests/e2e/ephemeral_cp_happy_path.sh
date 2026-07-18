@@ -247,11 +247,15 @@ seed_workspace_image() {
   # Retag by resolved image ID, NOT by "$ref": a digest-pinned ref does not survive
   # `docker save | docker load` into the fresh dind daemon — the RepoDigest name is
   # dropped and the image lands by ID only, so `docker tag <digest-ref> ...` fails
-  # with "No such image" (verified on docker 28.3.3). The image ID IS preserved
-  # across save/load, and the host daemon (which pulled by digest) resolves it;
-  # moving-tag refs resolve to the same ID too, so this is uniformly correct.
+  # with "No such image" in the nested daemon (observed on the CI dind). The image ID
+  # IS preserved across save/load, and the HOST daemon (which pulled by digest) has
+  # it under the ref — resolve the ID there and tag THAT. Parse the "Id" field from
+  # the plain `image inspect` JSON (the `--format '{{.Id}}'` variant returned empty on
+  # the CI daemon; the no-format inspect is the exact call pull_via_host already
+  # relies on above, so it is reliable). Moving-tag refs resolve the same way.
   local img_id
-  img_id="$(host_docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null)" || img_id="$ref"
+  img_id="$(host_docker image inspect "$ref" 2>/dev/null | grep -m1 '"Id"' | sed -E 's/.*"Id":[[:space:]]*"([^"]+)".*/\1/')"
+  [ -n "$img_id" ] || { echo "FATAL: could not resolve the image ID for ${ref} on the host daemon" >&2; exit 1; }
   docker tag "$img_id" "$bare"
   echo "[proof] seeded ${bare}" >&2
 }
