@@ -78,6 +78,8 @@ Head-of-line (HOL) safety has two complementary layers:
           HTTP 409 because the PR branch cannot be merged with main without a
           manual rebase). A conflict will not self-resolve, so retrying it
           every tick would HOL-block every ready PR behind it (issue #2352).
+      If the scoped queue token cannot persist HOLD_LABEL, the tick FAILS RED
+      instead of claiming success without a durable hold (internal#1082).
 
 Status-fetch is fail-closed: if the combined status for a sha cannot be
 fetched, the PR is skipped this tick (never treated as green).
@@ -94,6 +96,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -269,6 +272,14 @@ SELF_STATUS_CONTEXT = "gitea-merge-queue / queue"
 _SELF_STATUS_RE = re.compile(
     r"\A" + re.escape(SELF_STATUS_CONTEXT) + r"(?:\s*\([^)]*\))?\s*\Z"
 )
+# Gitea's commit-status write response can precede visibility in the combined
+# status view used by wildcard branch protection. Keep both waits short and
+# bounded: failure to observe the write is a hard stop, never permission to
+# bypass the protected endpoint.
+SELF_STATUS_CONFIRM_ATTEMPTS = 5
+SELF_STATUS_CONFIRM_DELAY_SECONDS = 0.25
+MERGE_STATUS_RETRY_ATTEMPTS = 3
+MERGE_STATUS_RETRY_DELAY_SECONDS = 0.5
 
 # Required contexts for push (main/staging) runs. The push CI uses the same
 # aggregator names with " (push)" suffix. Checking these explicitly instead of
@@ -2139,28 +2150,36 @@ def hold_pr(pr_number: int, hold_note: str, *, dry_run: bool) -> None:
     """Apply HOLD_LABEL to a wedged PR so the queue advances past it.
 
     choose_next_queued_issue skips HOLD_LABEL-bearing PRs, so this is the HOL
-    guard when issue writes are available. Both label and comment are best
-    effort: the production queue token may have merge permission without
-    write:issue. A failed observability write must not abort the current scan;
-    process_once still continues to later candidates without bypassing gates.
+    guard when issue writes are available. The comment is observability-only,
+    but the label is the durable opt-out state. If the label cannot be written,
+    raise after attempting the diagnostic comment so main() makes this queue
+    run red. A merge refusal must never be reported as a successful queue tick
+    when no durable hold was recorded (internal#1082).
     """
+    label_exc: ApiError | None = None
     try:
         add_label_by_name(pr_number, HOLD_LABEL, dry_run=dry_run)
-    except ApiError as label_exc:
+    except ApiError as exc:
+        label_exc = exc
         sys.stderr.write(
-            f"::error::could not apply HOLD_LABEL to PR #{pr_number}: {label_exc}\n"
+            f"::error::could not apply HOLD_LABEL to PR #{pr_number}: {exc}\n"
         )
         hold_note += (
             f"\n\n(NOTE: could not apply the hold label automatically: "
-            f"{label_exc}. Please add `{HOLD_LABEL}` manually.)"
+            f"{exc}. Please add `{HOLD_LABEL}` manually.)"
         )
     try:
         post_comment(pr_number, hold_note, dry_run=dry_run)
     except ApiError as comment_exc:
         sys.stderr.write(
             f"::error::could not post hold comment to PR #{pr_number}: "
-            f"{comment_exc}; continuing queue scan without bypass\n"
+            f"{comment_exc}\n"
         )
+    if label_exc is not None:
+        raise ApiError(
+            f"could not durably hold PR #{pr_number} with `{HOLD_LABEL}` "
+            f"after a permanent queue refusal: {label_exc}"
+        ) from label_exc
 
 
 def reassert_queue_runner_status(head_sha: str, *, dry_run: bool) -> None:
@@ -2218,6 +2237,26 @@ def reassert_queue_runner_status(head_sha: str, *, dry_run: bool) -> None:
                 f"{context!r} on {head_sha}"
             )
 
+        # The POST response only proves that Gitea accepted the new row. The
+        # protected merge path reads the separately materialized combined
+        # commit-status view, which can lag briefly. Confirm through that same
+        # live read surface before attempting the ordinary merge endpoint.
+        for attempt in range(1, SELF_STATUS_CONFIRM_ATTEMPTS + 1):
+            visible = get_combined_status(head_sha, prefer_live=True)
+            visible_latest = latest_statuses_by_context(
+                visible.get("statuses") or []
+            )
+            if status_state(visible_latest.get(context, {})) == "success":
+                break
+            if attempt < SELF_STATUS_CONFIRM_ATTEMPTS:
+                time.sleep(SELF_STATUS_CONFIRM_DELAY_SECONDS)
+        else:
+            raise ApiError(
+                "queue-runner status write was accepted but not visible as "
+                f"success for {context!r} on {head_sha} after "
+                f"{SELF_STATUS_CONFIRM_ATTEMPTS} live reads"
+            )
+
 
 def merge_pull(
     pr_number: int,
@@ -2242,16 +2281,31 @@ def merge_pull(
     # gate-runner status with that decision; failure here propagates and no
     # merge request is sent. This is a normal status write, never an admin or
     # branch-protection override (core#4420).
-    reassert_queue_runner_status(head_commit_id, dry_run=False)
-    try:
-        api("POST", f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/merge", body=payload, expect_json=False)
-    except ApiError as exc:
-        # Re-raise permission-like errors so process_once can HOLD this PR.
-        # 403 = no push access, 404 = repo/pr not found, 405 = not allowed.
-        msg = str(exc)
-        if re.search(r"-> HTTP (?:403|404|405)(?:\D|$)", msg):
-            raise MergePermissionError(msg) from exc
-        raise  # re-raise other ApiErrors unchanged
+    merge_path = f"/repos/{OWNER}/{NAME}/pulls/{pr_number}/merge"
+    for attempt in range(1, MERGE_STATUS_RETRY_ATTEMPTS + 1):
+        reassert_queue_runner_status(head_commit_id, dry_run=False)
+        try:
+            api("POST", merge_path, body=payload, expect_json=False)
+            return
+        except ApiError as exc:
+            msg = str(exc)
+            status_visibility_race = (
+                re.search(r"-> HTTP 405(?:\D|$)", msg) is not None
+                and "Not all required status checks successful" in msg
+            )
+            if status_visibility_race and attempt < MERGE_STATUS_RETRY_ATTEMPTS:
+                print(
+                    "::warning::protected merge has not observed the confirmed "
+                    "queue-runner success yet; retrying the same ordinary "
+                    f"endpoint ({attempt}/{MERGE_STATUS_RETRY_ATTEMPTS})"
+                )
+                time.sleep(MERGE_STATUS_RETRY_DELAY_SECONDS)
+                continue
+            # Re-raise permission-like errors so process_once can HOLD this PR.
+            # 403 = no push access, 404 = repo/pr not found, 405 = not allowed.
+            if re.search(r"-> HTTP (?:403|404|405)(?:\D|$)", msg):
+                raise MergePermissionError(msg) from exc
+            raise  # re-raise other ApiErrors unchanged
 
 
 def live_premerge_status_regressions(
@@ -2503,14 +2557,15 @@ def process_once(*, dry_run: bool = False) -> int:
                 )
             except MergePermissionError as exc:
                 # Normal merge refusal (HTTP 403/404/405). Never bypass it.
-                # Best-effort HOLD this PR and CONTINUE scanning. The token may
-                # lack write:issue; hold_pr absorbs those observability-write
-                # failures so one refusal cannot abort the entire tick.
+                # HOLD this PR and CONTINUE scanning only when the durable
+                # HOLD_LABEL write succeeds. If the scoped token lacks
+                # write:issue, hold_pr raises so main() returns non-success;
+                # a refused merge with no durable hold must not look green.
                 sys.stderr.write(f"::error::merge permission error for PR #{pr_number}: {exc}\n")
                 hold_note = (
                     "merge-queue: the normal protected merge was refused "
-                    f"({exc}). No force/admin bypass was attempted. Best-effort "
-                    f"applied `{HOLD_LABEL}` so the queue can advance. Re-check "
+                    f"({exc}). No force/admin bypass was attempted. Attempted "
+                    f"to apply `{HOLD_LABEL}` so the queue can advance. Re-check "
                     "branch freshness, required checks, approvals, and token "
                     f"permissions; then remove `{HOLD_LABEL}` to requeue."
                 )

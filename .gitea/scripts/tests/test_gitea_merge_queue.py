@@ -1178,15 +1178,17 @@ def test_reassert_queue_runner_status_clears_only_exact_non_success_contexts(mon
     """
     head_sha = "a" * 40
     observed = {"live": [], "writes": []}
+    write_visible = False
     monkeypatch.setattr(mq, "OWNER", "molecule-ai")
     monkeypatch.setattr(mq, "NAME", "molecule-core")
 
     def fake_combined(sha, *, prefer_live=False):
+        nonlocal write_visible
         observed["live"].append((sha, prefer_live))
         return {"state": "pending", "statuses": [
             {
                 "context": "gitea-merge-queue / queue (pull_request_review)",
-                "status": "pending",
+                "status": "success" if write_visible else "pending",
                 "target_url": "/molecule-ai/molecule-core/actions/runs/1/jobs/2",
             },
             {
@@ -1196,7 +1198,9 @@ def test_reassert_queue_runner_status_clears_only_exact_non_success_contexts(mon
         ]}
 
     def fake_api(method, path, *, body=None, **kwargs):
+        nonlocal write_visible
         observed["writes"].append((method, path, body))
+        write_visible = True
         return 201, {"context": body["context"], "status": "success"}
 
     monkeypatch.setattr(mq, "get_combined_status", fake_combined)
@@ -1204,7 +1208,7 @@ def test_reassert_queue_runner_status_clears_only_exact_non_success_contexts(mon
 
     mq.reassert_queue_runner_status(head_sha, dry_run=False)
 
-    assert observed["live"] == [(head_sha, True)]
+    assert observed["live"] == [(head_sha, True), (head_sha, True)]
     assert observed["writes"] == [(
         "POST",
         f"/repos/{mq.OWNER}/{mq.NAME}/statuses/{head_sha}",
@@ -1222,18 +1226,24 @@ def test_reassert_queue_runner_status_clears_failed_self_status(monkeypatch):
     evaluation has passed every live merge gate.
     """
     writes = []
-    monkeypatch.setattr(mq, "get_combined_status", lambda sha, *, prefer_live=False: {
-        "state": "failure",
-        "statuses": [{
-            "context": "gitea-merge-queue / queue (pull_request_review)",
-            "status": "failure",
-        }],
-    })
+    write_visible = False
+
+    def fake_combined(sha, *, prefer_live=False):
+        return {
+            "state": "success" if write_visible else "failure",
+            "statuses": [{
+                "context": "gitea-merge-queue / queue (pull_request_review)",
+                "status": "success" if write_visible else "failure",
+            }],
+        }
 
     def fake_api(method, path, *, body=None, **kwargs):
+        nonlocal write_visible
         writes.append(body)
+        write_visible = True
         return 201, {"context": body["context"], "status": "success"}
 
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
     monkeypatch.setattr(mq, "api", fake_api)
     mq.reassert_queue_runner_status("b" * 40, dry_run=False)
     assert [body["state"] for body in writes] == ["success"]
@@ -1245,19 +1255,25 @@ def test_reassert_queue_runner_status_drops_untrusted_target_url(monkeypatch):
     useful audit metadata.
     """
     writes = []
-    monkeypatch.setattr(mq, "get_combined_status", lambda sha, *, prefer_live=False: {
-        "state": "pending",
-        "statuses": [{
-            "context": "gitea-merge-queue / queue (pull_request_review)",
-            "status": "pending",
-            "target_url": "https://attacker.invalid/lookalike/actions/runs/1/jobs/2",
-        }],
-    })
+    write_visible = False
+
+    def fake_combined(sha, *, prefer_live=False):
+        return {
+            "state": "success" if write_visible else "pending",
+            "statuses": [{
+                "context": "gitea-merge-queue / queue (pull_request_review)",
+                "status": "success" if write_visible else "pending",
+                "target_url": "https://attacker.invalid/lookalike/actions/runs/1/jobs/2",
+            }],
+        }
 
     def fake_api(method, path, *, body=None, **kwargs):
+        nonlocal write_visible
         writes.append(body)
+        write_visible = True
         return 201, {"context": body["context"], "status": "success"}
 
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
     monkeypatch.setattr(mq, "api", fake_api)
     mq.reassert_queue_runner_status("2" * 40, dry_run=False)
     assert "target_url" not in writes[0]
@@ -1292,25 +1308,82 @@ def test_reassert_queue_runner_status_noops_when_absent_or_green(monkeypatch):
 
 
 def test_reassert_queue_runner_status_confirmation_is_fail_closed(monkeypatch):
-    """A malformed or non-success status response cannot authorize merge."""
-    monkeypatch.setattr(mq, "get_combined_status", lambda sha, *, prefer_live=False: {
-        "state": "pending",
-        "statuses": [{
-            "context": "gitea-merge-queue / queue (pull_request_review)",
-            "status": "pending",
-        }],
-    })
+    """A successful write that never becomes live cannot authorize merge."""
+    live_reads = []
+
+    def still_pending(sha, *, prefer_live=False):
+        live_reads.append((sha, prefer_live))
+        return {
+            "state": "pending",
+            "statuses": [{
+                "context": "gitea-merge-queue / queue (pull_request_review)",
+                "status": "pending",
+            }],
+        }
+
+    monkeypatch.setattr(mq, "get_combined_status", still_pending)
     monkeypatch.setattr(
         mq,
         "api",
         lambda *a, **k: (201, {
             "context": "gitea-merge-queue / queue (pull_request_review)",
-            "status": "pending",
+            "status": "success",
         }),
     )
+    monkeypatch.setattr(mq.time, "sleep", lambda _: None)
+
+    with pytest.raises(mq.ApiError, match="not visible as success"):
+        mq.reassert_queue_runner_status("e" * 40, dry_run=False)
+    assert len(live_reads) == 1 + mq.SELF_STATUS_CONFIRM_ATTEMPTS
+
+
+def test_reassert_rejects_malformed_write_response_before_polling(monkeypatch):
+    """The visibility poll cannot launder a malformed status-write response."""
+    context = "gitea-merge-queue / queue (pull_request_review)"
+    reads = []
+
+    def pending(sha, *, prefer_live=False):
+        reads.append((sha, prefer_live))
+        return {"state": "pending", "statuses": [{
+            "context": context,
+            "status": "pending",
+        }]}
+
+    monkeypatch.setattr(mq, "get_combined_status", pending)
+    monkeypatch.setattr(mq, "api", lambda *a, **k: (201, {"status": "success"}))
 
     with pytest.raises(mq.ApiError, match="did not confirm success"):
-        mq.reassert_queue_runner_status("e" * 40, dry_run=False)
+        mq.reassert_queue_runner_status("8" * 40, dry_run=False)
+
+    assert reads == [("8" * 40, True)]
+
+
+def test_reassert_waits_for_live_read_after_write_visibility(monkeypatch):
+    """The POST response is not enough: wildcard branch protection reads the
+    commit-status view, so wait until that independent live read sees success.
+    """
+    context = "gitea-merge-queue / queue (pull_request_review)"
+    responses = iter([
+        {"state": "pending", "statuses": [{"context": context, "status": "pending"}]},
+        {"state": "pending", "statuses": [{"context": context, "status": "pending"}]},
+        {"state": "success", "statuses": [{"context": context, "status": "success"}]},
+    ])
+    sleeps = []
+    monkeypatch.setattr(
+        mq,
+        "get_combined_status",
+        lambda sha, *, prefer_live=False: next(responses),
+    )
+    monkeypatch.setattr(
+        mq,
+        "api",
+        lambda *a, **k: (201, {"context": context, "status": "success"}),
+    )
+    monkeypatch.setattr(mq.time, "sleep", sleeps.append)
+
+    mq.reassert_queue_runner_status("9" * 40, dry_run=False)
+
+    assert sleeps == [mq.SELF_STATUS_CONFIRM_DELAY_SECONDS]
 
 
 def test_reassert_queue_runner_status_api_failure_propagates(monkeypatch):
@@ -1367,6 +1440,89 @@ def test_merge_pull_status_reassertion_failure_prevents_merge(monkeypatch):
     with pytest.raises(mq.ApiError, match="status write denied"):
         mq.merge_pull(321, dry_run=False, head_commit_id="f" * 40)
     assert merge_posts == []
+
+
+def test_merge_pull_retries_only_status_propagation_405(monkeypatch):
+    """A short Gitea visibility race is retried through the same ordinary
+    protected endpoint; no force/admin parameter is introduced.
+    """
+    calls = {"reassert": 0, "merge": 0, "sleeps": []}
+
+    def reassert(sha, *, dry_run):
+        calls["reassert"] += 1
+
+    def fake_api(method, path, **kwargs):
+        calls["merge"] += 1
+        if calls["merge"] == 1:
+            raise mq.ApiError(
+                "POST /pulls/321/merge -> HTTP 405: "
+                '{"message":"Not all required status checks successful"}'
+            )
+        return 200, None
+
+    monkeypatch.setattr(mq, "reassert_queue_runner_status", reassert)
+    monkeypatch.setattr(mq, "api", fake_api)
+    monkeypatch.setattr(mq.time, "sleep", calls["sleeps"].append)
+
+    mq.merge_pull(321, dry_run=False, head_commit_id="f" * 40)
+
+    assert calls == {
+        "reassert": 2,
+        "merge": 2,
+        "sleeps": [mq.MERGE_STATUS_RETRY_DELAY_SECONDS],
+    }
+
+
+def test_merge_pull_does_not_retry_unrelated_405(monkeypatch):
+    """Permission and policy refusals remain immediate fail-closed errors."""
+    calls = {"reassert": 0, "merge": 0, "sleeps": []}
+
+    def reassert(sha, *, dry_run):
+        calls["reassert"] += 1
+
+    def forbidden(*args, **kwargs):
+        calls["merge"] += 1
+        raise mq.ApiError("POST /pulls/321/merge -> HTTP 405: merge forbidden")
+
+    monkeypatch.setattr(mq, "reassert_queue_runner_status", reassert)
+    monkeypatch.setattr(mq, "api", forbidden)
+    monkeypatch.setattr(mq.time, "sleep", calls["sleeps"].append)
+
+    with pytest.raises(mq.MergePermissionError, match="merge forbidden"):
+        mq.merge_pull(321, dry_run=False, head_commit_id="f" * 40)
+
+    assert calls == {"reassert": 1, "merge": 1, "sleeps": []}
+
+
+def test_merge_pull_exhausted_status_race_is_a_hard_failure(monkeypatch):
+    """Bounded retries may absorb propagation lag, never convert a persistent
+    protected-endpoint refusal into a green queue result.
+    """
+    calls = {"reassert": 0, "merge": 0, "sleeps": []}
+
+    def reassert(sha, *, dry_run):
+        calls["reassert"] += 1
+
+    def still_refused(*args, **kwargs):
+        calls["merge"] += 1
+        raise mq.ApiError(
+            "POST /pulls/321/merge -> HTTP 405: "
+            '{"message":"Not all required status checks successful"}'
+        )
+
+    monkeypatch.setattr(mq, "reassert_queue_runner_status", reassert)
+    monkeypatch.setattr(mq, "api", still_refused)
+    monkeypatch.setattr(mq.time, "sleep", calls["sleeps"].append)
+
+    with pytest.raises(mq.MergePermissionError, match="required status"):
+        mq.merge_pull(321, dry_run=False, head_commit_id="f" * 40)
+
+    assert calls == {
+        "reassert": mq.MERGE_STATUS_RETRY_ATTEMPTS,
+        "merge": mq.MERGE_STATUS_RETRY_ATTEMPTS,
+        "sleeps": [mq.MERGE_STATUS_RETRY_DELAY_SECONDS]
+        * (mq.MERGE_STATUS_RETRY_ATTEMPTS - 1),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1443,10 +1599,9 @@ def test_process_once_holds_pr_on_permanent_merge_error(monkeypatch):
     assert calls["hold_label"] == (100, "merge-queue-hold")
 
 
-def test_hold_pr_is_best_effort_when_queue_token_cannot_write_issues(monkeypatch):
-    """AUTO_SYNC_TOKEN can merge but currently lacks write:issue. A failed
-    hold-label/comment attempt must not abort the scan and turn one 405 into a
-    queue-wide failure.
+def test_hold_pr_fails_tick_when_queue_token_cannot_write_durable_hold(monkeypatch):
+    """A merge refusal must not finish green when the token cannot persist the
+    opt-out label. The red queue status is the least-privilege durable signal.
     """
     calls = []
 
@@ -1461,8 +1616,8 @@ def test_hold_pr_is_best_effort_when_queue_token_cannot_write_issues(monkeypatch
     monkeypatch.setattr(mq, "add_label_by_name", forbidden_label)
     monkeypatch.setattr(mq, "post_comment", forbidden_comment)
 
-    # No exception: process_once can continue scanning later candidates.
-    mq.hold_pr(100, "normal merge refused; no bypass attempted", dry_run=False)
+    with pytest.raises(mq.ApiError, match="could not durably hold PR #100"):
+        mq.hold_pr(100, "normal merge refused; no bypass attempted", dry_run=False)
     assert calls == ["label", "comment"]
 
 
