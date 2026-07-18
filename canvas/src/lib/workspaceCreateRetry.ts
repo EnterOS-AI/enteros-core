@@ -136,6 +136,17 @@ function classifyCreateError(err: unknown): CreateErrorDecision {
  *   - Node/undici:    "fetch failed"           (+ a `.cause`)
  *   - Firefox/Gecko:  "NetworkError when attempting to fetch resource."
  *   - Safari/WebKit:  "Load failed"
+ *   - Safari/iOS:     "The Internet connection appears to be offline.",
+ *                     "The network connection was lost.",
+ *                     "A server with the specified hostname could not be found."
+ *
+ * The earlier form only matched fetch/network/"load failed", so a genuine
+ * offline/DNS TypeError on Safari/iOS (none of which contain those substrings)
+ * was mis-classified NO_RETRY — regressing the cold-origin retry this exists for
+ * (#4456 code review). Broadened below to the offline/connection/hostname
+ * variants; a bare programmer-error TypeError ("x is not a function", "Cannot
+ * read properties of undefined") still matches none of these, and even a
+ * mis-match is bounded by the 4-attempt cap.
  */
 function isNetworkTypeError(e: {
   name?: string;
@@ -149,9 +160,17 @@ function isNetworkTypeError(e: {
   const msg = (e.message ?? "").toLowerCase();
   return (
     msg.includes("fetch") || // "Failed to fetch" / "fetch failed"
-    msg.includes("network") || // "NetworkError when attempting to fetch…"
-    msg.includes("load failed") // Safari
+    msg.includes("network") || // "NetworkError…" / "The network connection was lost."
+    msg.includes("load failed") || // Safari "Load failed"
+    msg.includes("offline") || // Safari/iOS "The Internet connection appears to be offline."
+    msg.includes("could not be found") // Safari/iOS DNS "…hostname could not be found."
   );
+  // NOTE: deliberately NOT matching the bare token "connection" — it appears in
+  // non-network programmer-error TypeErrors too (a field/property named
+  // `connection`), which would burn all 4 retries on a real bug. The three
+  // offline/DNS messages above are already covered by "network" ("network
+  // connection was lost"), "offline", and "could not be found" respectively
+  // (#4462 re-review).
 }
 
 /** Injectable seams so the bounded loop is unit-testable without real timers

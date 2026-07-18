@@ -122,6 +122,38 @@ describe("createWorkspaceWithRetry", () => {
     expect(sleep).toHaveBeenCalledWith(2000);
   });
 
+  // Cross-browser network-failure TypeError messages that do NOT contain
+  // fetch/network/"load failed" — the pre-fix classifier mis-treated these as
+  // NO_RETRY, regressing the cold-origin retry (#4456 code review).
+  it.each([
+    "The Internet connection appears to be offline.",
+    "The network connection was lost.",
+    "A server with the specified hostname could not be found.",
+  ])("offline/DNS TypeError %j → retries and succeeds", async (message) => {
+    const post = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError(message))
+      .mockResolvedValueOnce({ id: "ws-off" });
+    const { deps: d } = deps(post as CreateRetryDeps["post"]);
+
+    const res = await createWorkspaceWithRetry<{ id: string }>({ name: "OFF" }, undefined, d);
+    expect(res).toEqual({ id: "ws-off" });
+    expect(post).toHaveBeenCalledTimes(2);
+  });
+
+  it("programmer-error TypeError (not network) → NO retry, surfaces on first try", async () => {
+    // A bare bug, e.g. reading a property of undefined — matches none of the
+    // network-message substrings and has no `.cause`, so it must NOT be retried
+    // 4× (the retries would never succeed and only delay surfacing the bug).
+    const post = vi.fn().mockRejectedValue(new TypeError("undefined is not a function"));
+    const { deps: d } = deps(post as CreateRetryDeps["post"]);
+
+    await expect(createWorkspaceWithRetry({ name: "BUG" }, undefined, d)).rejects.toThrow(
+      "undefined is not a function",
+    );
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
   it("persistent empty-503 → exhausts the bounded budget and throws", async () => {
     const post = vi.fn().mockRejectedValue(apiError(503, "", "1"));
     const { deps: d } = deps(post as CreateRetryDeps["post"]);
