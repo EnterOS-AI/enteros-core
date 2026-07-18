@@ -1,3 +1,5 @@
+> ✅ IMPLEMENTED — hermes adapter shipped as a live runtime (`workspace-configs-templates/hermes/adapter.py` + `executor.py`, per-plugin `adapters/hermes.py`) (archived 2026-07-18)
+
 # Hermes Adapter — Implementation Plan
 
 > **Historical implementation plan.** The proposed in-core adapter, fallback
