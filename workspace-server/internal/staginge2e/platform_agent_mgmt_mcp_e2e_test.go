@@ -56,7 +56,7 @@ import (
 func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-mcp-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("mcp")
 	t.Logf("platform-agent-mgmt-mcp: slug=%s", slug)
 
 	// --- Fresh org via the admin API (the same org-create path the UI drives) ---

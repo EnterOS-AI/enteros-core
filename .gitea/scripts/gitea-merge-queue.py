@@ -2440,8 +2440,8 @@ def live_premerge_status_regressions(
 
 def process_once(*, dry_run: bool = False) -> int:
     # Required status contexts come from BRANCH PROTECTION, not a hand-kept env
-    # list. Fail-closed: if BP cannot be enumerated, HOLD the whole tick rather
-    # than merge against an unverified required set.
+    # list. Fail-closed: if BP cannot be enumerated, FAIL the whole tick rather
+    # than merge against an unverified required set or publish a false green.
     try:
         bp = get_branch_protection(WATCH_BRANCH)
     except BranchProtectionUnavailable as exc:
