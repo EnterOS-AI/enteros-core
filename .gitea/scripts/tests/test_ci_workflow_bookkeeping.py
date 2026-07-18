@@ -138,3 +138,16 @@ def test_all_required_step_uses_extracted_script():
     assert "check()" not in run_block, (
         "all-required step still contains inline check() function — re-inline regression"
     )
+
+
+def test_ops_scripts_runs_audit_force_merge_shell_contract():
+    """The shell integration test is not collected by pytest, so the ops
+    workflow must invoke it explicitly."""
+    workflow = load_workflow("test-ops-scripts.yml")
+    steps = workflow["jobs"]["test"].get("steps", [])
+    run_blocks = [step.get("run", "") for step in steps if isinstance(step, dict)]
+
+    assert any(
+        "bash .gitea/scripts/tests/test_audit_force_merge.sh" in run
+        for run in run_blocks
+    ), "test-ops-scripts.yml must execute the audit-force-merge shell contract"
