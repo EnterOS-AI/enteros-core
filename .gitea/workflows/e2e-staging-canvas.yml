@@ -333,8 +333,8 @@ jobs:
           echo "Deleting orphan tenant: $slug"
           # Verify HTTP 2xx instead of `>/dev/null || true` swallowing
           # failures. A 5xx or timeout previously looked identical to
-          # success, leaving the tenant alive for up to ~45 min until
-          # sweep-stale-e2e-orgs caught it. Surface failures as
+          # success, leaving the tenant alive until a later main-push
+          # sweep-stale-e2e-orgs run after its 90-minute floor. Surface failures as
           # workflow warnings naming the slug. Don't `exit 1` — a single
           # cleanup miss shouldn't fail-flag the canvas test when the
           # actual smoke check passed; the sweeper is the safety net.
@@ -352,6 +352,6 @@ jobs:
           if [ "$code" = "200" ] || [ "$code" = "204" ]; then
             echo "[teardown] deleted $slug (HTTP $code)"
           else
-            echo "::warning::canvas teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within ~45 min. Body: $(head -c 300 /tmp/canvas-cleanup.out 2>/dev/null)"
+            echo "::warning::canvas teardown for $slug returned HTTP $code — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor. Body: $(head -c 300 /tmp/canvas-cleanup.out 2>/dev/null)"
           fi
           exit 0

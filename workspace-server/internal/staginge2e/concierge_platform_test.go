@@ -71,7 +71,7 @@ import (
 func TestConciergePlatformAgent_Staging(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-cncrg-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("cncrg")
 	t.Logf("concierge-platform: slug=%s", slug)
 
 	// --- Step 1: provision throwaway org + tenant (reused scaffolding) ---
