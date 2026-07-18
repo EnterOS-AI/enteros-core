@@ -221,6 +221,10 @@ def test_safety_net_comments_match_exact_published_identity_boundary() -> None:
 def test_ephemeral_shared_harness_caller_uses_explicit_loopback_contract() -> None:
     source = (ROOT / "tests/e2e/ephemeral_cp_happy_path.sh").read_text()
     runbook = (ROOT / "docs/e2e-ephemeral-gate.md").read_text()
+    for function_name in ("run_scenario", "run_scenario_concierge_user_tasks"):
+        caller = _shell_function(source, function_name)
+        assert "E2E_INFRA_BACKEND=local-docker" in caller
+        assert "E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1" in caller
     for text in (source, runbook):
         assert "E2E_INFRA_BACKEND=local-docker" in text
         assert "E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1" in text
