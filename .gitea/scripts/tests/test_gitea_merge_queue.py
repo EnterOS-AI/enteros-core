@@ -2182,8 +2182,8 @@ def test_get_combined_status_uses_newest_id_when_history_order_is_unstable(monke
     ]["status"] == "success"
 
 
-def test_process_once_holds_tick_when_branch_protection_unavailable(monkeypatch):
-    """BP enumeration failure → HOLD the whole tick (no merge, rc 0)."""
+def test_process_once_fails_when_branch_protection_unavailable(monkeypatch):
+    """BP enumeration failure → no merge and a non-success queue context."""
     merged = {"called": False}
     monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
 
@@ -2193,7 +2193,7 @@ def test_process_once_holds_tick_when_branch_protection_unavailable(monkeypatch)
     monkeypatch.setattr(mq, "merge_pull", lambda *a, **k: merged.__setitem__("called", True))
 
     rc = mq.process_once(dry_run=False)
-    assert rc == 0
+    assert rc == 1
     assert merged["called"] is False
 
 
