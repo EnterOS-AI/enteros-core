@@ -62,7 +62,11 @@ cleanup_org() {
     && ok "Teardown request accepted" \
     || log "Teardown returned non-2xx (may already be gone)"
 }
-trap cleanup_org EXIT
+# INT/TERM as well as EXIT: a graceful CI cancellation delivers SIGTERM/SIGINT;
+# without trapping those, bash dies before the EXIT trap runs and the tenant
+# leaks (the staging-provisioning-outage leak class). A SIGKILL still bypasses
+# this — the sweep-stale-e2e-orgs janitor is the backstop for that case.
+trap cleanup_org EXIT INT TERM
 
 # ─── provision tenant ───────────────────────────────────────────────────
 log "Provisioning tenant $SLUG..."
@@ -118,7 +122,7 @@ ok "Container ID: $CONTAINER_ID"
 log "Testing MCP stdio transport with regular-file stdout..."
 
 OUTPUT=$(mktemp)
-trap 'rm -f "$OUTPUT"; cleanup_org' EXIT
+trap 'rm -f "$OUTPUT"; cleanup_org' EXIT INT TERM
 
 # Send initialize + tools/list via stdin, capture stdout to regular file
 {
