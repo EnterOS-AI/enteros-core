@@ -34,11 +34,24 @@ name: Sweep stale e2e-* orgs (staging)
 # workflow is an exact-prefix catch-up tool, not a scheduled production janitor.
 
 on:
-  # Deliberately manual: callers inspect the dry-run candidate list before any
-  # destructive catch-up. Normal E2E cleanup remains automatic in its owner.
+  # AUTOMATIC on every main merge (2026-07-18). The per-run E2E teardown trap
+  # cannot survive Gitea's cancellation: a cancelled run's job container is
+  # `docker kill`ed (SIGKILL), so the bash `trap teardown INT TERM` never fires
+  # and the tenant leaks. A backstop MUST run automatically. GitHub ran this on
+  # `schedule` (cron), but molecule-core's zero-cron ratchet
+  # (lint_schedule_budget.py) forbids `schedule:` — so this janitor sat
+  # workflow_dispatch-ONLY and never ran, and leaked e2e tenants accumulated for
+  # DAYS until they exhausted the local-docker provider and staging provisioning
+  # stalled (the 2026-07-18 outage: tenants never reached instance_status=running
+  # within 1800s → the required E2E lanes red-walled the core merge queue).
+  # `push:[main]` is the sanctioned per-merge cadence under the ratchet: core
+  # merges frequently, so the backstop now fires often enough to keep pace with
+  # the leak. MAX_AGE_MINUTES=30 keeps it from touching in-flight runs.
+  push:
+    branches: [main]
   workflow_dispatch:
-# Don't let two sweeps fight. Cron + workflow_dispatch could overlap
-# on a manual trigger; queue rather than parallel-delete.
+# Don't let two sweeps fight. A push-triggered and a manual sweep could overlap;
+# queue rather than parallel-delete.
 concurrency:
   group: sweep-stale-e2e-orgs
   cancel-in-progress: false
@@ -50,6 +63,9 @@ env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
 jobs:
+  # bp-exempt: post-merge staging janitor, NOT a merge gate — its context must
+  # not be a required check (a red sweep must not block PRs; it fails loud to ops
+  # via the notify-failure step instead).
   sweep:
     name: Sweep e2e orgs
     runs-on: ubuntu-latest
@@ -90,12 +106,16 @@ jobs:
       #
       # TRUSTED-REF GATING: molecule-core is a PUBLIC repo; this step consumes
       # the INFISICAL_CI_* machine-identity secrets, so it must only run on a
-      # TRUSTED event — the schedule cron or an operator workflow_dispatch.
+      # TRUSTED event — a push to main (maintainer-only; a fork cannot push to
+      # main, so no fork can harvest INFISICAL_CI_*), an operator
+      # workflow_dispatch, or the (currently disallowed) schedule cron. It must
+      # NEVER run on a pull_request, where a fork could exfiltrate the creds.
       - name: Fetch staging CP admin token from Infisical KMS
         id: kms_admin
         if: >-
           github.event_name == 'schedule' ||
-          github.event_name == 'workflow_dispatch'
+          github.event_name == 'workflow_dispatch' ||
+          github.event_name == 'push'
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
