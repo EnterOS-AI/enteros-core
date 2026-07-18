@@ -21,6 +21,7 @@
  */
 
 import { test, expect } from "@playwright/test";
+import type { Page } from "@playwright/test";
 import { startEchoRuntime, type EchoRuntime } from "./fixtures/echo-runtime";
 import {
   seedWorkspace,
@@ -28,6 +29,15 @@ import {
   cleanupWorkspace,
   type SeededWorkspace,
 } from "./fixtures/chat-seed";
+
+/** Enter the Org-map view so the Canvas (React Flow graph) mounts — same
+ * helper as chat-desktop.spec.ts (the default view is the concierge shell,
+ * where workspace nodes are not clickable). */
+async function enterMapView(page: Page): Promise<void> {
+  const btn = page.getByTestId("nav-map");
+  await expect(btn, "rail button nav-map missing").toBeVisible({ timeout: 10_000 });
+  await btn.click();
+}
 
 const PLATFORM_URL = process.env.E2E_PLATFORM_URL ?? "http://localhost:8080";
 
@@ -80,7 +90,10 @@ test("provisioning-phase BOOT_STEP renders on the boot screen", async ({ page })
   // panel tabs for BootSequenceScreen.
   runPsql(`UPDATE workspaces SET status = 'provisioning' WHERE id = '${ws.id}'`);
 
+  await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/");
+  await enterMapView(page);
+  await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
   await page.getByTestId(`workspace-node-${ws.name}`).click();
 
   // Pre-telemetry: the watchdog is attached but idle.
@@ -115,4 +128,40 @@ test("provisioning-phase BOOT_STEP renders on the boot screen", async ({ page })
 
   // Restore online so afterAll cleanup and other specs see a settled row.
   runPsql(`UPDATE workspaces SET status = 'online' WHERE id = '${ws.id}'`);
+});
+
+test("agent /notify delivery reaches the canvas chat (self-initiated reply leg)", async ({ page }) => {
+  // The runtime's digest reply-forwarder (workspace-runtime
+  // idle_digest/reply_forwarder.py) and send_message_to_user both deliver
+  // agent-initiated messages through POST /workspaces/:id/notify. This test
+  // guards the platform+canvas half of that chain per pull: a workspace-token
+  // notify must land as a chat bubble over the live WebSocket. Regression
+  // shape: notify ingestion, broadcast, or ChatTab rendering breaks → every
+  // self-initiated agent message (digest replies, proactive updates) silently
+  // vanishes while request-response chat still works.
+  runPsql(`UPDATE workspaces SET status = 'online' WHERE id = '${ws.id}'`);
+
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto("/");
+  await enterMapView(page);
+  await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
+  await page.getByTestId(`workspace-node-${ws.name}`).click();
+  await page.locator("#tab-chat").click();
+  await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", {
+    timeout: 5_000,
+  });
+
+  const message = `digest reply delivery e2e ${Date.now()}`;
+  const res = await fetch(`${PLATFORM_URL}/workspaces/${ws.id}/notify`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${ws.authToken}`,
+    },
+    body: JSON.stringify({ message }),
+  });
+  expect(res.status, "workspace-token notify must be accepted").toBe(200);
+
+  const chat = page.locator("#panel-chat [data-testid='chat-panel']:visible");
+  await expect(chat.getByText(message)).toBeVisible({ timeout: 10_000 });
 });
