@@ -1,4 +1,4 @@
-> ✅ IMPLEMENTED — hermes adapter shipped as a live runtime (`workspace-configs-templates/hermes/adapter.py` + `executor.py`, per-plugin `adapters/hermes.py`) (archived 2026-07-18)
+> ✅ IMPLEMENTED — the Hermes runtime ships in the separate `molecule-ai-workspace-template-hermes` repository (`adapter.py` + `executor.py`); plugin repositories provide their own `adapters/hermes.py` (archived 2026-07-18)
 
 # Hermes Adapter — Shell Design Spec
 

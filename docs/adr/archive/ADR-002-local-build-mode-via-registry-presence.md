@@ -10,7 +10,7 @@
 > Railway, EC2, AWS ECR, operator-host, runtime-count, and production-topology
 > statements are historical, not current operating instructions. Current local
 > setup is manifest-backed and current deployment is domain-only CI-on-merge;
-> follow the [quick-start guide](../quickstart.md) and active workflows.
+> follow the [quick-start guide](../../quickstart.md) and active workflows.
 
 ## Context
 
