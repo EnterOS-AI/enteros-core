@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cpurl"
@@ -160,6 +161,33 @@ func assertManagedTenantHasLLMEnv() error {
 	return nil
 }
 
+// assertSaaSTenantHasAdminToken refuses boot for a Molecule-managed tenant that
+// has no ADMIN_TOKEN (core#4485). Without ADMIN_TOKEN, middleware.AdminAuth's
+// deprecated Tier-3 fallback (wsauth_middleware.go:268-280) accepts ANY live
+// workspace token as org-admin — so a workspace self-surface token could manage
+// the org / create-delete-restart sibling workspaces. It ALSO silently skips the
+// managed-tenant LLM-env assertion, because assertManagedTenantHasLLMEnv and
+// refreshEnvFromCP both no-op when ADMIN_TOKEN is unset. A managed tenant missing
+// ADMIN_TOKEN is thus misclassified as self-host and boots doubly-broken.
+//
+// Gate on MOLECULE_ORG_ID (NOT isSaaSDeployment): the CP provisioner is selected
+// on ORG_ID alone (see main.go) and defaults to Molecule's control plane, so
+// ORG_ID-set == a Molecule-managed tenant regardless of MOLECULE_DEPLOY_MODE. A
+// real self-host / local-dev never sets MOLECULE_ORG_ID (it would misprovision
+// against Molecule's CP), so it is EXEMPT and keeps the deprecated single-trust-
+// domain Tier-3 path. Correctly-provisioned managed tenants always bake
+// ADMIN_TOKEN into `docker run`, so this never fires for them. The caller
+// (main.go) fatals on a non-nil return; assert BEFORE ensureManagedTenantLLMEnv.
+func assertSaaSTenantHasAdminToken() error {
+	if strings.TrimSpace(os.Getenv("MOLECULE_ORG_ID")) == "" {
+		return nil
+	}
+	if strings.TrimSpace(os.Getenv("ADMIN_TOKEN")) == "" {
+		return fmt.Errorf("ADMIN_TOKEN_REQUIRED_FOR_MANAGED_TENANT: a Molecule-managed tenant (MOLECULE_ORG_ID set) must set ADMIN_TOKEN — without it admin routes fall back to accepting any live workspace token as org-admin (core#4485)")
+	}
+	return nil
+}
+
 // cpConfigRetryWindow / cpConfigRetryInterval bound how long a freshly-
 // provisioned managed tenant retries the CP config fetch before giving up.
 // Package vars (not consts) so tests can shrink them. Interval is a short poll
@@ -264,3 +292,4 @@ func ensureManagedTenantLLMEnv() error {
 	// Window elapsed with the fetch never succeeding — fatal with the real cause.
 	return fmt.Errorf("CP config fetch did not succeed within %s: %w", window, lastErr)
 }
+
