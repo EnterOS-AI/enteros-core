@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
-# audit-force-merge — detect a §SOP-6 force-merge after PR close, emit
-# `incident.force_merge` to stdout as structured JSON.
+# audit-force-merge — detect a §SOP-6 force-merge or governance-invalid merge
+# after PR close and emit structured incident JSON to stdout.
 #
 # Vector's docker_logs source picks up runner stdout; the JSON gets
 # shipped to Loki on molecule-canonical-obs, indexable by event_type.
 # Query example:
 #
-#   {host="operator"} |= "event_type" |= "incident.force_merge" | json
+#   {host=~".+"} |= "event_type" |= "incident.force_merge" | json
+#   {host=~".+"} |= "event_type" |= "incident.merge_governance" | json
 #
-# A force-merge is detected when a PR closed-with-merged=true had at
-# least one of the repo's required-status-check contexts in a state
-# other than "success" at the merge commit's SHA. That's exactly what
-# the Gitea force_merge:true API call lets through, so it's a faithful
-# detector of the override path.
+# A force-merge is detected when a PR closed-with-merged=true had at least one
+# required status context non-success on its exact head. Independently, a
+# governance-invalid merge is detected when that head lacks the configured
+# number of genuine, official, non-author approvals or carries a current-head
+# REQUEST_CHANGES. Governance violations fail the workflow red; green statuses
+# alone are never sufficient evidence that a merge satisfied policy.
 #
 # Triggers on `pull_request_target: closed` (loaded from base branch
 # per §SOP-6 security model). No-op when merged=false.
 #
 # Required env (set by the workflow):
 #   GITEA_TOKEN, GITEA_HOST, REPO, PR_NUMBER
+#   REQUIRED_APPROVALS (defaults to 1)
 #   plus one of REQUIRED_CHECKS_JSON (preferred) or REQUIRED_CHECKS (legacy)
 #
 # REQUIRED_CHECKS_JSON is a JSON object keyed by branch name. Each value
@@ -31,8 +34,8 @@
 #
 # REQUIRED_CHECKS (legacy) is a newline-separated list used when the
 # JSON variable is not set. Declared in the workflow YAML rather than
-# fetched from /branch_protections (which needs admin scope — 
-# has read-only). Trade dynamism for simplicity: when the required-check
+# fetched from /branch_protections (which needs repo-admin scope while this
+# audit identity is read-only). Trade dynamism for simplicity: when the required-check
 # set changes, update both branch protection AND this env. Keeping them
 # in sync is less complexity than granting the audit bot admin perms on
 # every repo.
@@ -47,18 +50,27 @@ if [ -z "${REQUIRED_CHECKS_JSON:-}" ] && [ -z "${REQUIRED_CHECKS:-}" ]; then
   echo "::error::Either REQUIRED_CHECKS_JSON or REQUIRED_CHECKS must be set"
   exit 1
 fi
+REQUIRED_APPROVALS="${REQUIRED_APPROVALS:-1}"
+case "$REQUIRED_APPROVALS" in
+  ''|*[!0-9]*|0)
+    echo "::error::REQUIRED_APPROVALS must be a positive integer"
+    exit 1
+    ;;
+esac
 
 OWNER="${REPO%%/*}"
 NAME="${REPO##*/}"
 API="https://${GITEA_HOST}/api/v1"
 AUTH="Authorization: token ${GITEA_TOKEN}"
+MOLECULE_UA="${MOLECULE_UA:-curl/8.4.0}"
+_AUDIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 1. Fetch the PR. If not merged, no-op.
 # Fail-closed: verify HTTP 200 before parsing. A 401/403/404 means the token
 # is invalid or the PR is inaccessible — we must NOT silently treat that as
 # "not merged" and skip the audit.
 PR_TMP=$(mktemp)
-PR_HTTP=$(curl -sS -o "$PR_TMP" -w '%{http_code}' -H "$AUTH" \
+PR_HTTP=$(curl -sS -A "$MOLECULE_UA" -o "$PR_TMP" -w '%{http_code}' -H "$AUTH" \
   "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}")
 PR=$(cat "$PR_TMP")
 rm -f "$PR_TMP"
@@ -73,6 +85,7 @@ PR_SCHEMA_OK=$(echo "$PR" | jq -r '
   (.merged | type == "boolean") and
   (.merge_commit_sha | type == "string") and
   (.merged_by | type == "object") and (.merged_by.login | type == "string") and
+  (.user | type == "object") and (.user.login | type == "string") and
   (.base | type == "object") and (.base.ref | type == "string") and
   (.head | type == "object") and (.head.sha | type == "string")
 ')
@@ -93,7 +106,132 @@ TITLE=$(echo "$PR" | jq -r '.title // ""')
 BASE_BRANCH=$(echo "$PR" | jq -r '.base.ref')
 HEAD_SHA=$(echo "$PR" | jq -r '.head.sha')
 
-# 1b. DETECTIVE: reserved-path self-merge (author == merger). The preventive
+# 1b. GOVERNANCE: exhaust the official review history and evaluate it through
+#     the same exact-head approval SSOT used by the merge queue. The review
+#     endpoint is paginated; only an explicit empty page proves exhaustion.
+PER_REVIEW_PAGE=100
+MAX_REVIEW_PAGES=200
+review_page=1
+declare -A REVIEW_IDS_SEEN=()
+ALL_REVIEWS_TMP=$(mktemp)
+printf '[]' > "$ALL_REVIEWS_TMP"
+while :; do
+  REVIEW_TMP=$(mktemp)
+  REVIEW_HTTP=$(curl -sS -A "$MOLECULE_UA" -o "$REVIEW_TMP" -w '%{http_code}' -H "$AUTH" \
+    "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/reviews?page=${review_page}&limit=${PER_REVIEW_PAGE}")
+  if [ "$REVIEW_HTTP" != "200" ]; then
+    rm -f "$REVIEW_TMP" "$ALL_REVIEWS_TMP"
+    echo "::error::GET /pulls/${PR_NUMBER}/reviews?page=${review_page} returned HTTP ${REVIEW_HTTP} — cannot evaluate merge governance."
+    exit 1
+  fi
+  if ! jq -e 'type == "array" and all(.[];
+      type == "object" and
+      ((.id | type) == "number") and (.id > 0) and (.id == (.id | floor)) and
+      ((.state | type) == "string") and
+      ((.official | type) == "boolean") and
+      ((.dismissed | type) == "boolean") and
+      ((.stale | type) == "boolean") and
+      (((.commit_id | type) == "string") or ((.commit_id | type) == "null")) and
+      ((.user | type) == "object") and
+      ((.user.login | type) == "string") and (.user.login | length > 0)
+    )' "$REVIEW_TMP" >/dev/null 2>&1; then
+    rm -f "$REVIEW_TMP" "$ALL_REVIEWS_TMP"
+    echo "::error::GET /pulls/${PR_NUMBER}/reviews?page=${review_page} returned a malformed review page — cannot evaluate merge governance."
+    exit 1
+  fi
+  REVIEW_COUNT=$(jq 'length' "$REVIEW_TMP")
+  if [ "$REVIEW_COUNT" -eq 0 ]; then
+    rm -f "$REVIEW_TMP"
+    break
+  fi
+  while IFS= read -r review_id; do
+    if [ -n "${REVIEW_IDS_SEEN[$review_id]+x}" ]; then
+      rm -f "$REVIEW_TMP" "$ALL_REVIEWS_TMP"
+      echo "::error::GET /pulls/${PR_NUMBER}/reviews pagination returned duplicate review id ${review_id} — cannot evaluate merge governance."
+      exit 1
+    fi
+    REVIEW_IDS_SEEN[$review_id]=1
+  done < <(jq -r '.[].id' "$REVIEW_TMP")
+  COMBINED=$(jq -s '.[0] + .[1]' "$ALL_REVIEWS_TMP" "$REVIEW_TMP")
+  printf '%s' "$COMBINED" > "$ALL_REVIEWS_TMP"
+  rm -f "$REVIEW_TMP"
+  review_page=$((review_page + 1))
+  if [ "$review_page" -gt "$MAX_REVIEW_PAGES" ]; then
+    rm -f "$ALL_REVIEWS_TMP"
+    echo "::error::GET /pulls/${PR_NUMBER}/reviews exceeded ${MAX_REVIEW_PAGES} non-empty pages without an exhaustion proof — cannot evaluate merge governance."
+    exit 1
+  fi
+done
+
+# Sort by numeric id before the SSOT reducer because it intentionally applies
+# the latest VALID verdict per reviewer, while API page order is not trusted.
+SORTED_REVIEWS_TMP=$(mktemp)
+jq 'sort_by(.id)' "$ALL_REVIEWS_TMP" > "$SORTED_REVIEWS_TMP"
+rm -f "$ALL_REVIEWS_TMP"
+GOVERNANCE_RESULT=$(PYTHONPATH="$_AUDIT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 - "$SORTED_REVIEWS_TMP" "$HEAD_SHA" "$PR_AUTHOR" "$REQUIRED_APPROVALS" <<'PY'
+import json
+import sys
+
+from _approval_validator import classify_reviews
+
+path, head, author, required_raw = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    reviews = json.load(handle)
+approvers, request_changes = classify_reviews(reviews, headsha=head)
+approvers = sorted(login for login in approvers if login != author)
+request_changes = sorted(set(request_changes))
+required = int(required_raw)
+violations = []
+if len(approvers) < required:
+    violations.append(
+        f"genuine exact-head approvals={len(approvers)}/{required}"
+    )
+if request_changes:
+    violations.append("open exact-head REQUEST_CHANGES=" + ",".join(request_changes))
+print(json.dumps({
+    "approvers": approvers,
+    "request_changes": request_changes,
+    "required_approvals": required,
+    "violations": violations,
+}, separators=(",", ":")))
+PY
+)
+rm -f "$SORTED_REVIEWS_TMP"
+if ! jq -e '
+    (.approvers | type == "array") and
+    (.request_changes | type == "array") and
+    (.required_approvals | type == "number") and
+    (.violations | type == "array")
+  ' <<<"$GOVERNANCE_RESULT" >/dev/null 2>&1; then
+  echo "::error::approval SSOT returned malformed governance output"
+  exit 1
+fi
+
+GOVERNANCE_FAILURE=0
+GOVERNANCE_VIOLATION_COUNT=$(jq '.violations | length' <<<"$GOVERNANCE_RESULT")
+if [ "$GOVERNANCE_VIOLATION_COUNT" -gt 0 ]; then
+  GOVERNANCE_FAILURE=1
+  NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -nc \
+    --arg event_type "incident.merge_governance" \
+    --arg ts "$NOW" \
+    --arg repo "$REPO" \
+    --argjson pr "$PR_NUMBER" \
+    --arg title "$TITLE" \
+    --arg base "$BASE_BRANCH" \
+    --arg author "$PR_AUTHOR" \
+    --arg merged_by "$MERGED_BY" \
+    --arg head_sha "$HEAD_SHA" \
+    --arg merge_sha "$MERGE_SHA" \
+    --argjson governance "$GOVERNANCE_RESULT" \
+    '{event_type:$event_type, ts:$ts, repo:$repo, pr:$pr, title:$title,
+      base_branch:$base, author:$author, merged_by:$merged_by,
+      head_sha:$head_sha, merge_sha:$merge_sha, governance:$governance}'
+  echo "::error::MERGE GOVERNANCE VIOLATION on PR #${PR_NUMBER}: no sufficient genuine exact-head approval or an exact-head REQUEST_CHANGES remained open."
+fi
+
+# 1c. DETECTIVE: reserved-path self-merge (author == merger). The preventive
 #     reserved-path-review gate blocks the normal merge button, but a
 #     determined admin/force-merge can still bypass it — that is exactly how
 #     cp#673 slipped. This backstop emits `incident.reserved_self_merge` when a
@@ -104,7 +242,6 @@ HEAD_SHA=$(echo "$PR" | jq -r '.head.sha')
 #     merge detection below must still execute even if this block can't read
 #     the files list / reserved-paths file).
 RESERVED_PATHS_FILE="${RESERVED_PATHS_FILE:-.gitea/reserved-paths.txt}"
-_AUDIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -n "$PR_AUTHOR" ] && [ "$PR_AUTHOR" = "$MERGED_BY" ] \
    && [ -f "${_AUDIT_DIR}/reserved-path-match.sh" ] \
    && [ -f "$RESERVED_PATHS_FILE" ]; then
@@ -114,7 +251,7 @@ if [ -n "$PR_AUTHOR" ] && [ "$PR_AUTHOR" = "$MERGED_BY" ] \
   _rp_page=1
   while : ; do
     _rp_tmp=$(mktemp)
-    _rp_http=$(curl -sS -o "$_rp_tmp" -w '%{http_code}' -H "$AUTH" \
+    _rp_http=$(curl -sS -A "$MOLECULE_UA" -o "$_rp_tmp" -w '%{http_code}' -H "$AUTH" \
       "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/files?limit=50&page=${_rp_page}")
     if [ "$_rp_http" != "200" ]; then rm -f "$_rp_tmp"; break; fi
     if ! jq -e 'type == "array" and all(.[];
@@ -181,7 +318,7 @@ else
 fi
 if [ -z "${REQUIRED//[[:space:]]/}" ]; then
   echo "::notice::REQUIRED_CHECKS empty for branch '$BASE_BRANCH' — force-merge not applicable."
-  exit 0
+  exit "$GOVERNANCE_FAILURE"
 fi
 
 # 3. Status-check state at the PR HEAD (where checks ran). The merge
@@ -210,7 +347,7 @@ ALL_STATUSES_TMP=$(mktemp)
 printf '[]' > "$ALL_STATUSES_TMP"   # accumulator: a single JSON array of rows
 while :; do
   STATUS_TMP=$(mktemp)
-  STATUS_HTTP=$(curl -sS -o "$STATUS_TMP" -w '%{http_code}' -H "$AUTH" \
+  STATUS_HTTP=$(curl -sS -A "$MOLECULE_UA" -o "$STATUS_TMP" -w '%{http_code}' -H "$AUTH" \
     "${API}/repos/${OWNER}/${NAME}/commits/${HEAD_SHA}/statuses?page=${page}&limit=${PER_PAGE}&sort=highestindex")
   PAGE_BODY=$(cat "$STATUS_TMP")
   rm -f "$STATUS_TMP"
@@ -304,7 +441,7 @@ done <<< "$REQUIRED"
 
 if [ "${#FAILED_CHECKS[@]}" -eq 0 ]; then
   echo "::notice::PR #${PR_NUMBER} merged with all required checks green — not a force-merge."
-  exit 0
+  exit "$GOVERNANCE_FAILURE"
 fi
 
 # 5. Emit structured audit event.
@@ -331,3 +468,4 @@ jq -nc \
     failed_checks: $failed_checks}'
 
 echo "::warning::FORCE-MERGE detected on PR #${PR_NUMBER} by ${MERGED_BY}: ${#FAILED_CHECKS[@]} required check(s) not green at merge time."
+exit "$GOVERNANCE_FAILURE"

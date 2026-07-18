@@ -1,5 +1,7 @@
 # audit-force-merge — emit `incident.force_merge` to runner stdout when
-# a PR is merged with required-status-checks not green. ALSO emits
+# a PR is merged with required-status-checks not green. Independently emits
+# `incident.merge_governance` when the merged exact head lacked a genuine
+# approval or retained a current REQUEST_CHANGES. Also emits
 # `incident.reserved_self_merge` when a PR that touched a CTO-reserved path
 # (.gitea/reserved-paths.txt) was merged by its own author (author==merger) —
 # the DETECTIVE backstop for the reserved-path-review preventive gate, since a
@@ -7,8 +9,9 @@
 # JSON line off docker_logs and ships to Loki on molecule-canonical-obs (per
 # `reference_obs_stack_phase1`); query as:
 #
-#   {host="operator"} |= "event_type" |= "incident.force_merge" | json
-#   {host="operator"} |= "event_type" |= "incident.reserved_self_merge" | json
+#   {host=~".+"} |= "event_type" |= "incident.force_merge" | json
+#   {host=~".+"} |= "event_type" |= "incident.merge_governance" | json
+#   {host=~".+"} |= "event_type" |= "incident.reserved_self_merge" | json
 #
 # Closes the §SOP-6 audit gap (the doc says force-merges write to
 # `structure_events`, but that table lives in the platform DB, not
@@ -56,6 +59,8 @@ jobs:
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # Exact-head, official, non-author approvals required at merge time.
+          REQUIRED_APPROVALS: "1"
           # Required-status-check contexts to evaluate at merge time.
           # Branch-aware JSON dict: keys are protected branch names,
           # values are arrays of context names that branch protection

@@ -24,6 +24,7 @@ validate_pr_schema() {
     (.merged | type == "boolean") and
     (.merge_commit_sha | type == "string") and
     (.merged_by | type == "object") and (.merged_by.login | type == "string") and
+    (.user | type == "object") and (.user.login | type == "string") and
     (.base | type == "object") and (.base.ref | type == "string") and
     (.head | type == "object") and (.head.sha | type == "string")
   '
@@ -34,44 +35,49 @@ validate_statuses_type() {
 }
 
 # T1 — valid PR payload → true
-T1=$(echo '{"merged":true,"merge_commit_sha":"abc","merged_by":{"login":"u"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
+T1=$(echo '{"merged":true,"merge_commit_sha":"abc","merged_by":{"login":"u"},"user":{"login":"author"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
 [ "$T1" = "true" ] || fail "T1: valid payload should pass schema"
 pass "T1: valid payload passes schema"
 
 # T2 — merged=false (valid types) → true (schema is about types, not values)
-T2=$(echo '{"merged":false,"merge_commit_sha":"abc","merged_by":{"login":"u"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
+T2=$(echo '{"merged":false,"merge_commit_sha":"abc","merged_by":{"login":"u"},"user":{"login":"author"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
 [ "$T2" = "true" ] || fail "T2: merged=false with valid types should pass schema"
 pass "T2: merged=false with valid types passes schema"
 
 # T3 — missing merged field → false
-T3=$(echo '{"merge_commit_sha":"abc","merged_by":{"login":"u"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
+T3=$(echo '{"merge_commit_sha":"abc","merged_by":{"login":"u"},"user":{"login":"author"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
 [ "$T3" = "false" ] || fail "T3: missing merged should fail schema"
 pass "T3: missing merged fails schema"
 
 # T4 — merged is string "true" instead of boolean → false
-T4=$(echo '{"merged":"true","merge_commit_sha":"abc","merged_by":{"login":"u"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
+T4=$(echo '{"merged":"true","merge_commit_sha":"abc","merged_by":{"login":"u"},"user":{"login":"author"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
 [ "$T4" = "false" ] || fail "T4: merged as string should fail schema"
 pass "T4: merged as string fails schema"
 
 # T5 — merge_commit_sha is null → false
-T5=$(echo '{"merged":true,"merge_commit_sha":null,"merged_by":{"login":"u"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
+T5=$(echo '{"merged":true,"merge_commit_sha":null,"merged_by":{"login":"u"},"user":{"login":"author"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
 [ "$T5" = "false" ] || fail "T5: null merge_commit_sha should fail schema"
 pass "T5: null merge_commit_sha fails schema"
 
 # T6 — merged_by is null → false
-T6=$(echo '{"merged":true,"merge_commit_sha":"abc","merged_by":null,"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
+T6=$(echo '{"merged":true,"merge_commit_sha":"abc","merged_by":null,"user":{"login":"author"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
 [ "$T6" = "false" ] || fail "T6: null merged_by should fail schema"
 pass "T6: null merged_by fails schema"
 
 # T7 — base.ref is number → false
-T7=$(echo '{"merged":true,"merge_commit_sha":"abc","merged_by":{"login":"u"},"base":{"ref":123},"head":{"sha":"def"}}' | validate_pr_schema)
+T7=$(echo '{"merged":true,"merge_commit_sha":"abc","merged_by":{"login":"u"},"user":{"login":"author"},"base":{"ref":123},"head":{"sha":"def"}}' | validate_pr_schema)
 [ "$T7" = "false" ] || fail "T7: numeric base.ref should fail schema"
 pass "T7: numeric base.ref fails schema"
 
 # T8 — head is missing → false
-T8=$(echo '{"merged":true,"merge_commit_sha":"abc","merged_by":{"login":"u"},"base":{"ref":"main"}}' | validate_pr_schema)
+T8=$(echo '{"merged":true,"merge_commit_sha":"abc","merged_by":{"login":"u"},"user":{"login":"author"},"base":{"ref":"main"}}' | validate_pr_schema)
 [ "$T8" = "false" ] || fail "T8: missing head should fail schema"
 pass "T8: missing head fails schema"
+
+# T8a — user is missing even though every other consumed field is valid.
+T8A=$(echo '{"merged":true,"merge_commit_sha":"abc","merged_by":{"login":"u"},"base":{"ref":"main"},"head":{"sha":"def"}}' | validate_pr_schema)
+[ "$T8A" = "false" ] || fail "T8a: missing user should fail schema"
+pass "T8a: missing user fails schema"
 
 # T9 — statuses missing → false
 T9=$(echo '{}' | validate_statuses_type)
@@ -227,6 +233,51 @@ curl() {
   [ -n "${MOCK_CALL_LOG:-}" ] && printf '%s\n' "$url" >> "$MOCK_CALL_LOG"
   body='{}'
   case "$url" in
+    *"/pulls/42/reviews?"*)
+      page="${url#*page=}"
+      page="${page%%&*}"
+      case "${MOCK_SCENARIO:-}" in
+        no_approval) body='[]' ;;
+        self_approval)
+          if [ "$page" = "1" ]; then
+            body=$(jq -nc --arg head "$HEAD_SHA" '[{id:1,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"pr-author"}}]')
+          else
+            body='[]'
+          fi
+          ;;
+        stale_approval)
+          if [ "$page" = "1" ]; then
+            body=$(jq -nc --arg head "$HEAD_SHA" '[{id:1,state:"APPROVED",official:true,dismissed:false,stale:true,commit_id:$head,user:{login:"independent-reviewer"}}]')
+          else
+            body='[]'
+          fi
+          ;;
+        request_changes)
+          if [ "$page" = "1" ]; then
+            body=$(jq -nc --arg head "$HEAD_SHA" '[
+              {id:1,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"independent-reviewer"}},
+              {id:2,state:"REQUEST_CHANGES",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"blocking-reviewer"}}
+            ]')
+          else
+            body='[]'
+          fi
+          ;;
+        review_server_cap)
+          case "$page" in
+            1) body=$(jq -nc --arg head "$HEAD_SHA" '[range(1;51) | {id:.,state:"COMMENT",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:("noise-" + (.|tostring))}}]') ;;
+            2) body=$(jq -nc --arg head "$HEAD_SHA" '[{id:51,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"independent-reviewer"}}]') ;;
+            *) body='[]' ;;
+          esac
+          ;;
+        malformed_reviews) body='{"unexpected":"object"}' ;;
+        *)
+          case "$page" in
+            1) body=$(jq -nc --arg head "$HEAD_SHA" '[{id:1,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"independent-reviewer"}}]') ;;
+            *) body='[]' ;;
+          esac
+          ;;
+      esac
+      ;;
     *"/pulls/42/files?"*)
       page="${url#*page=}"
       page="${page%%&*}"
@@ -304,7 +355,7 @@ curl() {
             body='[]'
           fi
           ;;
-        reserved_server_cap|reserved_malformed|reserved_control_filename)
+        reserved_server_cap|reserved_malformed|reserved_control_filename|no_approval|self_approval|stale_approval|request_changes|review_server_cap|malformed_reviews)
           case "$page" in
             1) body='[{"id":1,"context":"CI / all-required (push)","status":"success"}]' ;;
             *) body='[]' ;;
@@ -420,6 +471,49 @@ run_audit reserved_control_filename
 [[ "$AUDIT_OUT" != *'incident.reserved_self_merge'* ]] || fail "T33: control-character filename must not create synthetic reserved-path evidence"
 [[ "$AUDIT_OUT" == *'all required checks green'* ]] || fail "T33: status audit did not continue after malformed filename"
 pass "T33: control-character reserved filename is rejected without aborting status audit"
+
+# T34 — statuses alone are not sufficient merge evidence. A merged PR with all
+# required contexts green but no genuine independent APPROVED row on the exact
+# head must emit a governance incident and fail the audit job red.
+run_audit no_approval
+[ "$AUDIT_RC" = "1" ] || fail "T34: missing exact-head approval must fail red, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'incident.merge_governance'* ]] || fail "T34: missing approval did not emit incident.merge_governance"
+[[ "$AUDIT_OUT" == *'genuine exact-head approval'* ]] || fail "T34: missing approval diagnostic is not explicit"
+pass "T34: missing exact-head approval emits governance incident and fails red"
+
+# T35 — an author's own exact-head approval never satisfies the independent
+# review floor.
+run_audit self_approval
+[ "$AUDIT_RC" = "1" ] || fail "T35: self approval must fail red, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'genuine exact-head approvals=0/1'* ]] || fail "T35: self approval was not excluded"
+pass "T35: self approval is excluded from the governance floor"
+
+# T36 — stale/dismissed review rows are not current policy evidence.
+run_audit stale_approval
+[ "$AUDIT_RC" = "1" ] || fail "T36: stale approval must fail red, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'genuine exact-head approvals=0/1'* ]] || fail "T36: stale approval was counted"
+pass "T36: stale approval is rejected"
+
+# T37 — an exact-head REQUEST_CHANGES remains blocking even alongside a valid
+# approval from another reviewer.
+run_audit request_changes
+[ "$AUDIT_RC" = "1" ] || fail "T37: REQUEST_CHANGES must fail red, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'open exact-head REQUEST_CHANGES=blocking-reviewer'* ]] || fail "T37: blocking review was not recorded"
+pass "T37: exact-head REQUEST_CHANGES fails governance"
+
+# T38 — review pagination also requires explicit empty-page exhaustion. The
+# only approval is on page 2 after a server-capped 50-row page.
+run_audit review_server_cap
+[ "$AUDIT_RC" = "0" ] || fail "T38: page-2 approval should satisfy governance, rc=$AUDIT_RC output=$AUDIT_OUT"
+grep -qF 'reviews?page=3&limit=100' "$AUDIT_CALL_LOG" || fail "T38: review pagination did not prove exhaustion with page 3"
+pass "T38: review pagination finds page-2 approval and exhausts page 3"
+
+# T39 — malformed review pages fail closed instead of being treated as no
+# reviews or a policy success.
+run_audit malformed_reviews
+[ "$AUDIT_RC" = "1" ] || fail "T39: malformed review page must fail closed, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'malformed review page'* ]] || fail "T39: malformed review diagnostic is not explicit"
+pass "T39: malformed review page fails closed"
 
 echo
 echo "ALL AUDIT-FORCE-MERGE CHECKS PASSED"
