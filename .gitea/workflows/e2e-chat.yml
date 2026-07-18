@@ -353,6 +353,7 @@ jobs:
           # non-zero too. The assertions below are belt-and-braces.
           npx playwright test e2e/chat-desktop.spec.ts e2e/chat-mobile.spec.ts e2e/chat-separation.spec.ts \
             e2e/schedule-tab.spec.ts \
+            e2e/boot-regression.spec.ts \
             --reporter=list 2>&1 | tee /tmp/pw-chat.out
           # The guard used to be `grep -qE '[0-9]+ (passed|failed|skipped)'` — which
           # ACCEPTED `skipped` as proof of execution, while its own comment claimed

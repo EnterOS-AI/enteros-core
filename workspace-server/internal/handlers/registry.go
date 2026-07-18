@@ -412,19 +412,28 @@ func validateAgentURL(rawURL string) error {
 	}
 	hostname := parsed.Hostname()
 
-	// Link-local / loopback / IPv6 metadata classes are blocked in every
-	// mode — they are never a legitimate agent URL and they cover the AWS/
-	// GCP/Azure IMDS endpoints. RFC-1918 ranges are conditionally blocked:
-	// in SaaS mode workspaces register with their VPC-private IP and the
-	// control plane is the source of truth for which instances exist, so
-	// allowing 10/8, 172.16/12, 192.168/16 is safe. In self-hosted mode
-	// we keep the strict blocklist — those deployments have no legitimate
-	// reason to accept private-range URLs from agents.
+	// Link-local / IPv6 metadata classes are blocked in every mode — they
+	// are never a legitimate agent URL and they cover the AWS/GCP/Azure
+	// IMDS endpoints. RFC-1918 ranges are conditionally blocked: in SaaS
+	// mode workspaces register with their VPC-private IP and the control
+	// plane is the source of truth for which instances exist, so allowing
+	// 10/8, 172.16/12, 192.168/16 is safe. In self-hosted mode we keep the
+	// strict blocklist — those deployments have no legitimate reason to
+	// accept private-range URLs from agents.
+	//
+	// Loopback is blocked in every mode EXCEPT MOLECULE_ENV=development
+	// (devModeAllowsLoopback — the same carve-out isSafeURL/safeDialer use,
+	// see ssrf.go): on a local dev host the provisioner itself assigns
+	// http://127.0.0.1:<hostport> advertise URLs, so rejecting them here
+	// only guarantees a boot-register 400 whose "recovery" is the heartbeat
+	// backfill storing the SAME loopback URL ~30s later — a delay plus a
+	// red NET/Register boot step, protecting nothing. This validator also
+	// already allows the literal hostname "localhost" (below), so blocking
+	// the address it aliases added no security in dev anyway. SaaS and
+	// self-hosted production keep loopback blocked.
 	blockedRanges := []blockedRange{
 		{"169.254.0.0/16", "link-local address (cloud metadata endpoint)"},
-		{"127.0.0.0/8", "loopback address"},
 		{"fe80::/10", "IPv6 link-local address (cloud metadata analogue)"},
-		{"::1/128", "IPv6 loopback address"},
 		// Always-blocked regardless of deploy mode: these ranges are never valid
 		// agent URLs in any deployment. TEST-NET (RFC-5737) are documentation-only
 		// ranges. CGNAT (RFC-6598) is never used for VPC subnets on any cloud
@@ -438,6 +447,12 @@ func validateAgentURL(rawURL string) error {
 		{"224.0.0.0/4", "IPv4 multicast address"},
 		{"fc00::/8", "IPv6 ULA non-routable prefix (fc00::/8)"},
 		{"2001:db8::/32", "IPv6 documentation address (RFC-3849 reserved)"},
+	}
+	if !devModeAllowsLoopback() {
+		blockedRanges = append(blockedRanges,
+			blockedRange{"127.0.0.0/8", "loopback address"},
+			blockedRange{"::1/128", "IPv6 loopback address"},
+		)
 	}
 	if !saasMode() {
 		blockedRanges = append(blockedRanges,
