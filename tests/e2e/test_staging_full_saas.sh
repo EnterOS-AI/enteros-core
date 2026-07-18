@@ -942,6 +942,27 @@ print(json.dumps(s))
   log "    scheduler check ON: declared molecule-scheduler + MOLECULE_TRIGGER_POLL_SECONDS=${E2E_TRIGGER_POLL_SECONDS:-10}"
 fi
 
+# Self-schedule tool sub-step (10f): with E2E_SELF_SCHEDULE_CHECK=on, additively
+# declare the molecule-ai-plugin-schedule-self plugin (audience:self on its
+# mcpServers contribution) onto the workspace roster so the runtime's audience
+# injector renders the self-mode create_schedule tool surface. FIRING is done by
+# the scheduler trigger daemon (10d), so 10f is CO-GATED on E2E_SCHEDULER_CHECK=on
+# (enforced in the 10f VERIFY block). Additive NON-LLM env only — same
+# platform-managed guard rationale as the scheduler/digest blocks above; the plugin
+# source is the public repo, fetched anonymously at boot. Comma-appended so it
+# coexists with the scheduler + digest-mail plugins on one roster.
+if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
+  SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
+import json, os
+s = json.loads(os.environ['SECRETS_JSON_IN'])
+src = os.environ.get('E2E_SELF_SCHEDULE_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-schedule-self#v0.1.2')
+existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
+s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
+print(json.dumps(s))
+")
+  log "    self-schedule check ON: declared ${E2E_SELF_SCHEDULE_PLUGIN_SOURCE:-molecule-ai-plugin-schedule-self#v0.1.2} additively onto MOLECULE_DECLARED_PLUGINS (co-gated on E2E_SCHEDULER_CHECK for the fire path)"
+fi
+
 # Native digest-provider plugin sub-step (10e, RFC molecule-core#4413): with
 # E2E_DIGEST_PLUGIN_CHECK=on, declare a native digest-provider plugin and turn on
 # the runtime's in-process digest-provider loader, so the workspace boot-installs
@@ -3019,6 +3040,428 @@ print(s.rsplit('/', 1)[-1])
     unset -f digest_plugin_probe digest_plugin_diagnostics
   else
     fail "E2E_DIGEST_PLUGIN_CHECK=on requires a usable Docker CLI and daemon to inspect load evidence."
+  fi
+fi
+
+# ─── 10f. Self-schedule tool (RFC, E2E_SELF_SCHEDULE_CHECK=on only) ──────────
+# End-to-end proof that the audience:self create_schedule TOOL — delivered by the
+# molecule-ai-plugin-schedule-self plugin (declared additively at provision, above)
+# and rendered onto the workspace by the runtime's audience injector — creates a
+# schedule that lands on the workspace's OWN volume grid and FIRES, using ONLY the
+# per-workspace token (no org/admin key). Firing is done by the scheduler trigger
+# daemon (10d), so this step is CO-GATED on E2E_SCHEDULER_CHECK=on.
+#
+# Deterministic (no LLM): from the gate host we `docker exec -i` into the OWN mol-ws
+# container and pipe a two-line JSON-RPC stream (initialize, then tools/call
+# create_schedule) into `npx --prefer-offline @molecule-ai/mcp-server@1.9.2 -e
+# MOLECULE_MCP_MODE=self`, capturing stdout — mirroring test_mcp_stdio_staging.sh.
+# create_schedule lives ONLY on the Node self-mode stdio surface (NOT core's Go MCP
+# HTTP bridge), so this is the sole path that exercises the real tool with no agent
+# turn (an LLM/A2A path would be non-deterministic — the flake this step avoids).
+#
+# Two legs:
+#   LEG A (injector proof): parse the rendered self mcpServers entry env from the
+#     runtime's native adapter config → assert MOLECULE_MCP_MODE=self + token-file
+#     present; NEG CONTROL: org/admin keys ABSENT from that RENDERED entry env
+#     (box-independent evidence — NOT /proc/<pid>/environ, which inherits ambient
+#     process env on a concierge box even though authHeaders() never reads it).
+#   LEG B (tool proof): create_schedule TWICE — (i) explicit workspace_id and (ii)
+#     workspace_id OMITTED (must SELF-RESOLVE via the runtime WORKSPACE_ID injection
+#     + the self-mode self-default a recent fix restored) — assert each lands on the
+#     OWN grid + the explicit one FIRES (reuses 10d's log/history verification).
+#     NEG CONTROL: a FOREIGN workspace_id is REJECTED (tool error / core 401) AND
+#     never arrives on any grid; precondition-assert the self container carries no
+#     admin/org token so the 401 leg cannot false-pass.
+#
+# Dark until preconditions confirmed (default OFF): needs a workspace-template pin
+# carrying runtime#328's self-audience injector AND a prebaked mcp-server 1.9.2 (so
+# `npx --prefer-offline` resolves offline in the no-network gate). Its fail arms are
+# REACHABLE (each leg has a distinct hard failure with diagnostics). It registers NO
+# live_milestone (LIVE_MILESTONES is a closed SSOT — adding one trips the drift gate).
+if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
+  # Co-gate: the scheduler trigger daemon (10d) supplies the FIRE path 10f depends
+  # on. Requiring E2E_SCHEDULER_CHECK=on keeps this a hard, reachable contract.
+  if [ "${E2E_SCHEDULER_CHECK:-}" != "on" ]; then
+    fail "E2E_SELF_SCHEDULE_CHECK=on requires E2E_SCHEDULER_CHECK=on — the scheduler trigger daemon (10d) fires the self-created schedule. Enable both together."
+  fi
+  _SS_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_TIMEOUT_SECS:-360}"
+  _SS_POLL_SECS="${E2E_SELF_SCHEDULE_POLL_SECS:-10}"
+  _SS_CAP_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CAP_TIMEOUT_SECS:-120}"
+  _SS_CREATE_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CREATE_TIMEOUT_SECS:-120}"
+  _SS_SETTLE_SECS="${E2E_SELF_SCHEDULE_SETTLE_SECS:-30}"
+  _SS_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.2}"
+  # Run-unique names (distinct from 10d's e2e-fire-* to avoid a ScheduleStore
+  # name-collision 409 + grid-provenance ambiguity). Bounded, cron-safe.
+  _SS_SN="e2e-self-fire-${E2E_RUN_ID:-local}"
+  _SS_SN_OMIT="e2e-self-omit-${E2E_RUN_ID:-local}"
+  _SS_FN="e2e-foreign-${E2E_RUN_ID:-local}"
+
+  if idle_digest_require_docker; then
+    # Globals set by the probe fns below; pre-init so `set -u` never trips when a
+    # diagnostic reads one before its producer ran.
+    _SS_SELF_CID=""; _SS_SELF_WSID=""; _SS_CAP_EVIDENCE=""; _SS_FIRED=""
+    _SS_CLASS=""; _SS_OUT_FILE=""; _SS_LEGA_DETAIL=""
+
+    # Per-runtime native MCP-config path/format the audience injector renders the
+    # self entry into (mirrors the mcp_render / plugins_reconcile SSOT, ADR-005).
+    self_schedule_adapter_config_path() {
+      local _rt
+      _rt=$(printf '%s' "${1:-claude-code}" | tr 'A-Z' 'a-z' | tr '-' '_')
+      case "$_rt" in
+        hermes)   printf '%s' "/home/agent/.hermes/config.yaml" ;;
+        openclaw) printf '%s' "/home/agent/.openclaw/openclaw.json" ;;
+        codex)    printf '%s' "/home/agent/.codex/config.toml" ;;
+        *)        printf '%s' "/configs/.claude/settings.json" ;;
+      esac
+    }
+    self_schedule_adapter_config_format() {
+      local _rt
+      _rt=$(printf '%s' "${1:-claude-code}" | tr 'A-Z' 'a-z' | tr '-' '_')
+      case "$_rt" in
+        hermes) printf '%s' "yaml" ;;
+        codex)  printf '%s' "toml" ;;
+        *)      printf '%s' "json" ;;
+      esac
+    }
+
+    # Resolve the OWN mol-ws container: the one whose WORKSPACE_ID env == PARENT_ID
+    # (provisioner.go sets WORKSPACE_ID=<id> in every workspace container). "$WS_ID
+    # from container env" — deterministic, no name-mangling on the short-12 suffix.
+    self_schedule_resolve_own_container() {
+      local _sc _wsid
+      _SS_SELF_CID=""; _SS_SELF_WSID=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _wsid=$(docker exec "$_sc" sh -c 'printf "%s" "${WORKSPACE_ID:-}"' 2>/dev/null || true)
+        if [ -n "$_wsid" ] && [ "$_wsid" = "$PARENT_ID" ]; then
+          _SS_SELF_CID="$_sc"
+          _SS_SELF_WSID="$_wsid"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    # Daemon-armed precondition, mirroring 10d (scheduler_capability_ready): a
+    # non-null quoted last_tick proves the trigger daemon booted + completed ≥1 poll
+    # cycle, so a create now will route to an armed grid (closes the #4448 arm race).
+    self_schedule_capability_ready() {
+      local _sc _health
+      _SS_CAP_EVIDENCE=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null || true)
+        if printf '%s' "$_health" | grep -Eq '"last_tick"[[:space:]]*:[[:space:]]*"[^"]+"'; then
+          _SS_CAP_EVIDENCE="$_sc (schedule-health.json last_tick live)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    # $1=name present on the OWN (self) container's volume grid?
+    self_schedule_own_grid_has() {
+      local _grid
+      _grid=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
+      printf '%s' "$_grid" | grep -Fq "$1"
+    }
+
+    # $1=name present on ANY mol-ws container's volume grid? (foreign non-arrival).
+    self_schedule_any_grid_has() {
+      local _sc _grid
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
+        if printf '%s' "$_grid" | grep -Fq "$1"; then
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    # $1=name fired? Reuses 10d's verification verbatim: the daemon logs
+    # `fired schedule '<name>'` OR writes a durable {"name":..,"status":"fired"}.
+    self_schedule_fire_probe() {
+      local _name="$1" _sc
+      _SS_FIRED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        if docker logs "$_sc" 2>&1 | grep -F "fired schedule '$_name'" >/dev/null; then
+          _SS_FIRED="$_sc (runtime log)"
+          return 0
+        fi
+        if docker exec "$_sc" sh -c \
+          "grep -Fq '\"name\": \"$_name\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          >/dev/null 2>&1; then
+          _SS_FIRED="$_sc (durable schedule-history.json)"
+          return 0
+        fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+
+    # NC precondition: the self (own) workspace is ORDINARY — its container must NOT
+    # carry an admin/org token. If it did, core WorkspaceAuth would accept a FOREIGN
+    # workspace_id for ANY id and the 401 leg of the foreign-id neg control would
+    # false-pass. (LEG A's org-key control reads the RENDERED spec-env, not the
+    # container env, precisely because a concierge box can carry an org key ambiently;
+    # the self workspace here is an ordinary child, so its container env is clean.)
+    self_schedule_assert_ordinary_box() {
+      local _leak
+      _leak=$(docker exec "$_SS_SELF_CID" sh -c 'env | grep -E "^(MOLECULE_ADMIN_TOKEN|MOLECULE_ORG_API_KEY|ORG_API_KEY)=" | sed "s/=.*/=<present>/" | tr "\n" " "' 2>/dev/null || true)
+      [ -z "$_leak" ]
+    }
+
+    # LEG A: read the rendered self mcpServers entry env from the runtime's native
+    # adapter config and assert MODE=self + token-file present, org/admin keys absent
+    # — SCOPED to the self entry env (box-independent). Sets _SS_LEGA_DETAIL.
+    self_schedule_injector_proof() {
+      local _cfg _fmt _content _res
+      _cfg=$(self_schedule_adapter_config_path "$RUNTIME")
+      _fmt=$(self_schedule_adapter_config_format "$RUNTIME")
+      _content=$(docker exec "$_SS_SELF_CID" sh -c "cat '$_cfg' 2>/dev/null" 2>/dev/null || true)
+      if [ -z "$_content" ]; then
+        _SS_LEGA_DETAIL="adapter config '$_cfg' absent/empty on $_SS_SELF_CID (runtime=$RUNTIME) — the audience injector never rendered the self entry"
+        return 3
+      fi
+      _res=$(SS_CFG_RAW="$_content" SS_CFG_FMT="$_fmt" python3 -c '
+import json, os, sys
+raw = os.environ.get("SS_CFG_RAW", "")
+fmt = os.environ.get("SS_CFG_FMT", "json")
+data = None
+perr = ""
+try:
+    data = json.loads(raw)
+except Exception as e:
+    perr = str(e)
+if data is None:
+    if fmt in ("yaml", "yml"):
+        try:
+            import yaml
+            data = yaml.safe_load(raw)
+        except ImportError:
+            print("PARSE_FAIL yaml-lib-missing"); sys.exit(0)
+        except Exception as e:
+            print("PARSE_FAIL yaml:" + str(e)); sys.exit(0)
+    elif fmt == "toml":
+        try:
+            import tomllib
+            data = tomllib.loads(raw)
+        except Exception as e:
+            print("PARSE_FAIL toml:" + str(e)); sys.exit(0)
+    else:
+        print("PARSE_FAIL json:" + perr); sys.exit(0)
+found = []
+def walk(o):
+    if isinstance(o, dict):
+        env = o.get("env")
+        if isinstance(env, dict) and str(env.get("MOLECULE_MCP_MODE", "")) == "self":
+            found.append(env)
+        for v in o.values():
+            walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            walk(v)
+walk(data)
+if not found:
+    print("NO_SELF_ENTRY"); sys.exit(0)
+env = found[0]
+if str(env.get("MOLECULE_MCP_MODE", "")) != "self":
+    print("FAIL mode-not-self"); sys.exit(0)
+if not env.get("MOLECULE_WORKSPACE_TOKEN_FILE"):
+    print("FAIL token-file-absent"); sys.exit(0)
+leaked = [k for k in ("MOLECULE_API_KEY", "MOLECULE_ORG_API_KEY", "ORG_API_KEY", "MOLECULE_ADMIN_TOKEN") if k in env]
+if leaked:
+    print("FAIL org-key-leaked:" + ",".join(leaked)); sys.exit(0)
+print("OK token_file=" + str(env.get("MOLECULE_WORKSPACE_TOKEN_FILE")))
+' 2>/dev/null || echo "PARSE_FAIL exec")
+      _SS_LEGA_DETAIL="$_res (config=$_cfg fmt=$_fmt)"
+      case "$_res" in
+        OK*)           return 0 ;;
+        NO_SELF_ENTRY) return 2 ;;
+        *)             return 1 ;;
+      esac
+    }
+
+    # Drive ONE create_schedule call via the self-mode mcp-server on the OWN
+    # container. $1 = the create_schedule arguments JSON. Sets _SS_OUT_FILE (captured
+    # stdout) and _SS_CLASS ∈ {ok, tool-error, error, no-result, no-response,
+    # parse-failed}. Swallows the nonzero RC (server exits nonzero on stdin EOF —
+    # expected, mirrors test_mcp_stdio_staging.sh:128-132).
+    self_schedule_invoke_create() {
+      local _args="$1" _init _call
+      _SS_OUT_FILE=$(e2e_tmp /tmp/e2e_self_schedule.XXXXXX)
+      _init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-10f","version":"1.0.0"}}}'
+      _call=$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_schedule","arguments":%s}}' "$_args")
+      {
+        printf '%s\n' "$_init"
+        printf '%s\n' "$_call"
+      } | docker exec -i \
+            -e MOLECULE_MCP_MODE=self \
+            -e MOLECULE_WORKSPACE_TOKEN_FILE=/configs/.auth_token \
+            "$_SS_SELF_CID" \
+            npx --prefer-offline "$_SS_MCP_SPEC" > "$_SS_OUT_FILE" 2>&1 || {
+        local _rc=$?
+        log "    10f: self-mode mcp-server exited rc=$_rc (nonzero on stdin EOF is expected — mirrors test_mcp_stdio_staging.sh)"
+      }
+      _SS_CLASS=$(python3 -c '
+import json, sys
+cls = "no-response"
+try:
+    fh = open(sys.argv[1], "r", errors="replace")
+except Exception:
+    print("no-response"); sys.exit(0)
+for line in fh:
+    line = line.strip()
+    if not line or line[:1] != "{":
+        continue
+    try:
+        m = json.loads(line)
+    except Exception:
+        continue
+    if m.get("id") == 2:
+        if "error" in m:
+            cls = "error"
+        else:
+            r = m.get("result", None)
+            if r is None:
+                cls = "no-result"
+            elif isinstance(r, dict) and r.get("isError") is True:
+                cls = "tool-error"
+            else:
+                cls = "ok"
+        break
+print(cls)
+' "$_SS_OUT_FILE" 2>/dev/null || echo "parse-failed")
+    }
+
+    # Shared diagnostics — called by EVERY fail arm below. Dumps per-container
+    # declared-plugins/mode env, installed-plugin dirs, recent self/schedule log
+    # lines, and the last captured JSON-RPC payload. Every grep is `|| true` because
+    # a zero-match grep exits 1 under `set -euo pipefail` and would abort this fn
+    # before the log lines print — and a zero match IS the leg it explains.
+    self_schedule_diagnostics() {
+      local _sc _decl _plug _slog
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _decl=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DECLARED_PLUGINS|MCP_MODE|TRIGGER)" | sort | tr "\n" " "' 2>/dev/null || true)
+        _plug=$(docker exec "$_sc" sh -c 'ls -1 /configs/plugins /plugins 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300 || true)
+        _slog=$(docker logs "$_sc" 2>&1 | grep -iE "self|schedule|mcp-server|audience" | tail -n 5 | tr '\n' '|' | head -c 500 || true)
+        log "    [self-schedule diag] $_sc declared/mode: ${_decl:-none}"
+        log "    [self-schedule diag] $_sc installed plugins: ${_plug:-ABSENT (boot-install never fetched schedule-self — check MOLECULE_DECLARED_PLUGINS reached the container)}"
+        log "    [self-schedule diag] $_sc recent self/schedule log: ${_slog:-NONE}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      if [ -n "${_SS_OUT_FILE:-}" ] && [ -f "${_SS_OUT_FILE:-}" ]; then
+        log "    [self-schedule diag] last create JSON-RPC payload (class=${_SS_CLASS:-?}): $(sanitize_http_body < "$_SS_OUT_FILE" | tr '\n' '|' | head -c 600 || true)"
+      fi
+    }
+
+    # ── 10f.0 Resolve the own container ──
+    log "10f/11 Self-schedule: resolving the OWN workspace container (WORKSPACE_ID=$PARENT_ID) for the deterministic self-mode invocation (up to ${_SS_CAP_TIMEOUT_SECS}s; poll=${_SS_POLL_SECS}s)."
+    if idle_digest_wait "$_SS_CAP_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_resolve_own_container; then
+      ok "    resolved own container: $_SS_SELF_CID (WORKSPACE_ID=$_SS_SELF_WSID)"
+    else
+      self_schedule_diagnostics
+      fail "Self-schedule: no running mol-ws container reported WORKSPACE_ID=$PARENT_ID within ${_SS_CAP_TIMEOUT_SECS}s — cannot drive the self-mode create without the own container."
+    fi
+
+    # ── 10f.A Injector proof (rendered self spec-env, org-key-free) ──
+    log "    LEG A: asserting the rendered self mcpServers entry env on $_SS_SELF_CID (MOLECULE_MCP_MODE=self + token-file present; org/admin keys ABSENT)."
+    if self_schedule_injector_proof; then
+      ok "    LEG A: self-mode spec env correct AND org-key-free — $_SS_LEGA_DETAIL"
+    else
+      self_schedule_diagnostics
+      fail "LEG A self-schedule injector proof failed: $_SS_LEGA_DETAIL. Expected the rendered self entry env to carry MOLECULE_MCP_MODE=self + MOLECULE_WORKSPACE_TOKEN_FILE and to OMIT MOLECULE_API_KEY/MOLECULE_ORG_API_KEY/ORG_API_KEY/MOLECULE_ADMIN_TOKEN. NO_SELF_ENTRY = the injector never rendered an audience:self entry (template missing runtime#328 / plugin not declared); org-key-leaked = the injector leaked a privileged key onto the ordinary-box self surface (a real regression); PARSE_FAIL yaml-lib-missing = the runner python lacks PyYAML for the hermes config.yaml adapter path (verify before flipping 10f on)."
+    fi
+
+    # ── 10f.B precondition: ordinary box (no admin/org token) ──
+    if self_schedule_assert_ordinary_box; then
+      ok "    precondition: own container carries no admin/org token — the foreign-id 401 neg control is meaningful"
+    else
+      self_schedule_diagnostics
+      fail "Self-schedule precondition failed: the OWN workspace container carries an admin/org token (MOLECULE_ADMIN_TOKEN/MOLECULE_ORG_API_KEY/ORG_API_KEY present). WorkspaceAuth would then accept a FOREIGN workspace_id for any id, so the foreign-id negative control below would false-pass. Investigate token injection — the ordinary-box token model is violated."
+    fi
+
+    # ── 10f.B.1 Daemon-armed wait (mirror 10d; closes #4448 before create) ──
+    log "    LEG B: waiting up to ${_SS_CAP_TIMEOUT_SECS}s for the trigger daemon to arm (schedule-health.json ticking) before creating — #4448 arm-race guard."
+    if idle_digest_wait "$_SS_CAP_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_capability_ready; then
+      ok "    trigger daemon armed & ticking (evidence: $_SS_CAP_EVIDENCE)"
+    else
+      self_schedule_diagnostics
+      fail "Self-schedule: the trigger daemon never armed within ${_SS_CAP_TIMEOUT_SECS}s (no live last_tick). A schedule created now would not fire. 10f is co-gated on E2E_SCHEDULER_CHECK=on (10d) — check the scheduler plugin boot-installed and the daemon armed."
+    fi
+
+    # ── 10f.B.2 create with EXPLICIT workspace_id → lands on OWN grid ──
+    _SS_ARGS_EXPLICIT=$(SS_WS="$PARENT_ID" SS_NM="$_SS_SN" python3 -c 'import json,os; print(json.dumps({"workspace_id":os.environ["SS_WS"],"name":os.environ["SS_NM"],"cron_expr":"* * * * *","prompt":"e2e self-schedule explicit-id probe","enabled":True}))')
+    log "    LEG B(i): create_schedule with EXPLICIT workspace_id=$PARENT_ID name='$_SS_SN' via self-mode mcp-server ($_SS_MCP_SPEC) on $_SS_SELF_CID."
+    self_schedule_invoke_create "$_SS_ARGS_EXPLICIT"
+    if [ "$_SS_CLASS" != "ok" ]; then
+      self_schedule_diagnostics
+      fail "LEG B(i): explicit-id create_schedule did not return a non-error result (class=$_SS_CLASS). The captured JSON-RPC payload is in the diagnostics above. A tool-error/error here means the self-mode create handler rejected a create for the OWN workspace — a regression in the self-mode auth-assembly or workspace_id handling."
+    fi
+    if idle_digest_wait "$_SS_CREATE_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_own_grid_has "$_SS_SN"; then
+      ok "    LEG B(i): explicit-id schedule '$_SS_SN' landed on the OWN volume grid ($_SS_SELF_CID:/configs/schedules/schedules.yaml)"
+    else
+      self_schedule_diagnostics
+      fail "LEG B(i): explicit-id create returned ok but '$_SS_SN' never appeared on the OWN grid within ${_SS_CREATE_TIMEOUT_SECS}s — the create did not route to the runtime volume (self-mode → core create routing gap)."
+    fi
+
+    # ── 10f.B.3 create with OMITTED workspace_id → SELF-RESOLVES + lands ──
+    _SS_ARGS_OMIT=$(SS_NM="$_SS_SN_OMIT" python3 -c 'import json,os; print(json.dumps({"name":os.environ["SS_NM"],"cron_expr":"* * * * *","prompt":"e2e self-schedule omit-id probe","enabled":True}))')
+    log "    LEG B(ii): create_schedule with workspace_id OMITTED name='$_SS_SN_OMIT' — must SELF-RESOLVE to the own workspace (runtime WORKSPACE_ID injection + self-mode self-default) and land, NOT error."
+    self_schedule_invoke_create "$_SS_ARGS_OMIT"
+    if [ "$_SS_CLASS" != "ok" ]; then
+      self_schedule_diagnostics
+      fail "LEG B(ii): omit-id create_schedule did not self-resolve — it returned class=$_SS_CLASS instead of a non-error result. The self-mode server must default workspace_id to the container's own WORKSPACE_ID (the recently-restored self-default). An error here means that self-default regressed."
+    fi
+    if idle_digest_wait "$_SS_CREATE_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_own_grid_has "$_SS_SN_OMIT"; then
+      ok "    LEG B(ii): omit-id schedule '$_SS_SN_OMIT' SELF-RESOLVED to the own workspace and landed on the OWN grid"
+    else
+      self_schedule_diagnostics
+      fail "LEG B(ii): omit-id create returned ok but '$_SS_SN_OMIT' never appeared on the OWN grid within ${_SS_CREATE_TIMEOUT_SECS}s — self-resolution did not route to the own volume."
+    fi
+
+    # ── 10f.B.4 the explicit-id self-created schedule FIRES (reuse 10d) ──
+    log "    LEG B: polling fire evidence for '$_SS_SN' for up to ${_SS_TIMEOUT_SECS}s (reuses 10d's log/history verification; poll=${_SS_POLL_SECS}s)."
+    if idle_digest_wait "$_SS_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_fire_probe "$_SS_SN"; then
+      ok "    LEG B: self-created schedule '$_SS_SN' autonomously FIRED (evidence: $_SS_FIRED)"
+    else
+      self_schedule_diagnostics
+      fail "LEG B: self-created schedule '$_SS_SN' never fired within ${_SS_TIMEOUT_SECS}s — it landed on the grid but the trigger daemon never delivered a self-scheduled turn (scheduler co-gate / trigger-lane leg)."
+    fi
+
+    # ── 10f.B.5 NEG CONTROL: FOREIGN workspace_id rejected + never arrives ──
+    _SS_FWS="${CHILD_ID:-00000000-0000-4000-8000-0000000ff0f0}"
+    _SS_ARGS_FOREIGN=$(SS_WS="$_SS_FWS" SS_NM="$_SS_FN" python3 -c 'import json,os; print(json.dumps({"workspace_id":os.environ["SS_WS"],"name":os.environ["SS_NM"],"cron_expr":"* * * * *","prompt":"e2e self-schedule foreign-id neg control","enabled":True}))')
+    log "    LEG B NEG CONTROL: create_schedule with FOREIGN workspace_id=$_SS_FWS name='$_SS_FN' — must be REJECTED (tool error / core 401) and never arrive on any grid."
+    self_schedule_invoke_create "$_SS_ARGS_FOREIGN"
+    case "$_SS_CLASS" in
+      tool-error|error)
+        ok "    LEG B NC: foreign-id create was REJECTED at the tool/auth boundary (class=$_SS_CLASS) — the self box carries only the per-workspace token, so core WorkspaceAuth 401s a foreign id"
+        ;;
+      *)
+        self_schedule_diagnostics
+        fail "LEG B NC: foreign-id create_schedule was NOT rejected (class=$_SS_CLASS) — a create against a FOREIGN workspace_id must fail (tool error / core 401 from WorkspaceAuth). A non-error here means the self box could mutate another workspace's grid — a cross-tenant auth regression."
+        ;;
+    esac
+    log "    LEG B NC: settling ${_SS_SETTLE_SECS}s, then asserting '$_SS_FN' arrived on NO mol-ws grid (container-inspectable non-arrival)."
+    sleep "$_SS_SETTLE_SECS"
+    if self_schedule_any_grid_has "$_SS_FN"; then
+      self_schedule_diagnostics
+      fail "LEG B NC: the foreign-named schedule '$_SS_FN' APPEARED on a mol-ws volume grid despite the rejected create — the foreign create mutated a grid it must never reach. This is a hard cross-tenant isolation failure."
+    else
+      ok "    LEG B NC: '$_SS_FN' is absent from every mol-ws volume grid — the rejected foreign create never mutated any grid (isolation holds)"
+    fi
+
+    ok "    10f self-schedule tool: LEG A injector proof + LEG B (explicit-id, omit-id self-resolve, fire) + foreign-id/org-key neg controls all PASSED"
+
+    unset -f self_schedule_adapter_config_path self_schedule_adapter_config_format \
+      self_schedule_resolve_own_container self_schedule_capability_ready \
+      self_schedule_own_grid_has self_schedule_any_grid_has self_schedule_fire_probe \
+      self_schedule_assert_ordinary_box self_schedule_injector_proof \
+      self_schedule_invoke_create self_schedule_diagnostics
+  else
+    fail "E2E_SELF_SCHEDULE_CHECK=on requires a usable Docker CLI and daemon to drive the self-mode create_schedule tool and inspect grid/fire evidence."
   fi
 fi
 

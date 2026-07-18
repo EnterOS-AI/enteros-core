@@ -466,6 +466,21 @@ run_scenario() {
   # 10e scope note still holds: the baked digest roster renders every section
   # regardless (D1 flag default-off), so 10e gates only the NEW native
   # plugin-load path, not the digest itself.
+  #
+  # E2E_SELF_SCHEDULE_CHECK defaults OFF (dark), unlike 10d/10e above. Step 10f
+  # deterministically drives the audience:self create_schedule TOOL via a docker-exec
+  # self-mode mcp-server (@molecule-ai/mcp-server 1.9.2) and asserts it lands on the
+  # OWN grid + fires (org-key/foreign-id neg controls). It has a JOINED precondition
+  # NOT YET verified on the moving :latest template: (1) the workspace-template must
+  # be republished from a runtime tree carrying runtime#328's self-audience injector
+  # (_inject_self_env), AND (2) that SAME template must prebake mcp-server 1.9.2 so
+  # `npx --prefer-offline` resolves offline in the no-network gate
+  # (scripts/prebake-mgmt-mcp.sh + platform_agent_identity.py
+  # PINNED_VERSION/COMPATIBLE_RANGE). Before flipping :-off} -> :-on}, verify BOTH via
+  # the packages API digest (same discipline the 10d/10e note above records) and
+  # confirm the schedule-self manifest audience:self is recognized by the injector on
+  # the shipped template. Keep this note ABOVE the env block (a `#` BETWEEN the
+  # backslash-continued lines below would sever the env prefix — see the 444-448 note).
   MOLECULE_CP_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
@@ -484,6 +499,9 @@ run_scenario() {
   E2E_TRIGGER_POLL_SECONDS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
   E2E_DIGEST_PLUGIN_CHECK="${E2E_DIGEST_PLUGIN_CHECK:-on}" \
   E2E_DIGEST_PLUGIN_SOURCE="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}" \
+  E2E_SELF_SCHEDULE_CHECK="${E2E_SELF_SCHEDULE_CHECK:-off}" \
+  E2E_SELF_SCHEDULE_PLUGIN_SOURCE="${E2E_SELF_SCHEDULE_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-schedule-self#v0.1.2}" \
+  E2E_SELF_SCHEDULE_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.2}" \
     bash "$HERE/test_staging_full_saas.sh"
 }
 
