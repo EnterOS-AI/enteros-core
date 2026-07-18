@@ -281,7 +281,8 @@ jobs:
             # Per-slug verified DELETE — see molecule-controlplane#420.
             # `>/dev/null 2>&1` previously hid every failure; surface
             # non-2xx as workflow warnings so the run page names what
-            # leaked. Sweeper catches the rest within ~45 min.
+            # leaked. The automatic sweeper retries on a later main push only
+            # after its conservative 90-minute age floor.
             leaks=()
             for slug in $orgs; do
               # Tempfile-routed -w + set +e/-e prevents curl-exit-code
@@ -297,7 +298,7 @@ jobs:
               if [ "$code" = "200" ] || [ "$code" = "204" ]; then
                 echo "[teardown] deleted $slug (HTTP $code)"
               else
-                echo "::warning::external teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within ~45 min. Body: $(head -c 300 /tmp/external-cleanup.out 2>/dev/null)"
+                echo "::warning::external teardown for $slug returned HTTP $code — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor. Body: $(head -c 300 /tmp/external-cleanup.out 2>/dev/null)"
                 leaks+=("$slug")
               fi
             done

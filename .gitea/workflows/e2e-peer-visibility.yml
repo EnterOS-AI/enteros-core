@@ -560,7 +560,7 @@ jobs:
             if [ "$code" = "200" ] || [ "$code" = "204" ]; then
               echo "[teardown] deleted $slug (HTTP $code)"
             else
-              echo "::warning::pv teardown for $slug returned HTTP $code — sweep-stale-e2e-orgs will catch it within MAX_AGE_MINUTES. Body: $(head -c 300 /tmp/pv-cleanup.out 2>/dev/null)"
+              echo "::warning::pv teardown for $slug returned HTTP $code — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor. Body: $(head -c 300 /tmp/pv-cleanup.out 2>/dev/null)"
             fi
           done
           exit 0

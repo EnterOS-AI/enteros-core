@@ -25,8 +25,10 @@ def test_workflow_policy_status_names_are_version_neutral() -> None:
     ) in workflow
 
 
-def test_canvas_promotion_mask_uses_same_repo_tracker() -> None:
+def test_canvas_candidate_soak_mask_uses_same_repo_tracker() -> None:
     workflow = read(".gitea/workflows/publish-canvas-image.yml")
-    promote_job = workflow[workflow.index("\n  promote-canvas:\n") :]
+    build_job = workflow[workflow.index("\n  build-and-push:\n") :]
 
-    assert "mc#4391" in promote_job
+    assert "continue-on-error: true" in build_job
+    assert "internal#1038" in build_job
+    assert "\n  promote-canvas:\n" not in workflow

@@ -73,6 +73,10 @@ jobs:
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates CP_ADMIN_API_TOKEN is non-empty.
       STAGING_E2E: '1'
+      # Consumed only by the `if: always()` teardown safety net below (the purge
+      # helper tests/e2e/lib/cp_purge_receipt.sh origin/backend guards). The Go
+      # test itself reads E2E_PROVIDER, not this.
+      E2E_INFRA_BACKEND: local-docker
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -139,9 +143,24 @@ jobs:
       - name: Run workspace-lifecycle staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceLifecycle_Staging -count=1 -v -timeout 50m
-      # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
-      # (runs even on a Fatal). We deliberately do NOT add a broad in-workflow
-      # "sweep all e2e-life-* slugs" net here — that could delete a concurrently
-      # running dispatch's fresh tenant (the slug is not run-id scoped). The
-      # age-guarded `sweep-stale-e2e-orgs` workflow (30-min floor, e2e- prefix)
-      # is the final safety net for a tenant orphaned by a hard runner cancel.
+      # Belt-and-braces teardown: the Go test installs a t.Cleanup admin-DELETE
+      # of its own tenant, but Go SKIPS t.Cleanup when `go test -timeout` fires
+      # or the runner is SIGKILLed — so a timed-out/cancelled Go test leaks its
+      # org. This net purges any CP admin org whose slug carries THIS run's
+      # GITHUB_RUN_ID for the exact tag(s) this job creates (e2eSlug formats
+      # slugs as e2e-<tag>-<run_id>-<uniq>), via the SAME identity-bound purge
+      # helper the shell jobs use (cp_purge_receipt.sh) — no new auth path.
+      # Idempotent with t.Cleanup; a fast no-op on the happy path.
+      - name: Teardown safety net (runs on timeout/cancel/failure)
+        # push/dispatch-only workflow; the PR guard is a uniform no-op here.
+        if: always() && github.event_name != 'pull_request'
+        env:
+          # Sourced from Infisical (staging /shared/controlplane-admin) via the
+          # "Fetch staging CP admin token from Infisical KMS" step above.
+          ADMIN_TOKEN: ${{ env.CP_ADMIN_API_TOKEN }}
+          # Exact tag THIS job creates (TestWorkspaceLifecycle_Staging →
+          # e2eSlug("life")). RETROFIT: this workflow previously declined a
+          # sweep because the slug was not run-id scoped; e2eSlug now embeds the
+          # run-id, so a run+tag-scoped sweep is safe against concurrent dispatches.
+          TEARDOWN_TAGS: "life"
+        run: bash tests/e2e/lib/go_e2e_run_teardown.sh

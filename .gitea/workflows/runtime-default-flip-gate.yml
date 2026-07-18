@@ -49,6 +49,10 @@ jobs:
     env:
       CP_BASE_URL: https://staging-api.moleculesai.app
       E2E_PROVIDER: molecules-server
+      # Consumed only by the `if: always()` teardown safety net below (the purge
+      # helper tests/e2e/lib/cp_purge_receipt.sh origin/backend guards). The Go
+      # test itself reads E2E_PROVIDER, not this.
+      E2E_INFRA_BACKEND: local-docker
       PROPOSED_RUNTIME: ${{ vars.RUNTIME_FLIP_PROPOSED_RUNTIME }}
       FLIP_KEY: ${{ vars.RUNTIME_FLIP_KEY }}
       FLIP_VALUE: ${{ vars.RUNTIME_FLIP_VALUE }}
@@ -106,3 +110,23 @@ jobs:
             echo "::notice::dry-run (default) — planning only, zero writes. Set RUNTIME_FLIP_APPLY=1 to apply through the gate."
           fi
           bash scripts/deploy/gate-runtime-default-flip.sh "${ARGS[@]}"
+      # Belt-and-braces teardown: the Go test installs a t.Cleanup admin-DELETE
+      # of its own tenant, but Go SKIPS t.Cleanup when `go test -timeout` fires
+      # or the runner is SIGKILLed — so a timed-out/cancelled Go test leaks its
+      # org. This net purges any CP admin org whose slug carries THIS run's
+      # GITHUB_RUN_ID for the exact tag(s) this job creates (e2eSlug formats
+      # slugs as e2e-<tag>-<run_id>-<uniq>), via the SAME identity-bound purge
+      # helper the shell jobs use (cp_purge_receipt.sh) — no new auth path.
+      # Idempotent with t.Cleanup; a fast no-op on the happy path.
+      - name: Teardown safety net (runs on timeout/cancel/failure)
+        # push/dispatch-only workflow; the PR guard is a uniform no-op here.
+        if: always() && github.event_name != 'pull_request'
+        env:
+          # Sourced from Infisical (staging /shared/controlplane-admin) via the
+          # "Fetch staging CP admin token from Infisical KMS" step above.
+          ADMIN_TOKEN: ${{ env.CP_ADMIN_API_TOKEN }}
+          # Exact tag THIS job creates: the gate wrapper runs
+          # TestPlatformAgentMgmtMCP_Staging → e2eSlug("mcp") (only when a flip
+          # var is set; otherwise no org exists and the roster filter is empty).
+          TEARDOWN_TAGS: "mcp"
+        run: bash tests/e2e/lib/go_e2e_run_teardown.sh

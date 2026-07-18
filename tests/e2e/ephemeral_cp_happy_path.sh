@@ -599,6 +599,8 @@ run_scenario_concierge_user_tasks() {
   MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
   MOLECULE_TENANT_ORIGIN_TEMPLATE="${TENANT_PUBLIC_URL_TEMPLATE}" \
   MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+  E2E_INFRA_BACKEND=local-docker \
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
   E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-cncrgut" \
     bash "$HERE/test_staging_concierge_e2e.sh"
@@ -1054,4 +1056,3 @@ case "$CMD" in
     exit 2
     ;;
 esac
-

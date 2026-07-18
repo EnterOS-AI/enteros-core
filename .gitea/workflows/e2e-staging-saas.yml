@@ -37,8 +37,8 @@ name: E2E Staging SaaS (full lifecycle)
 # There is no path/detect-changes gate and no schedule/cron trigger. These live
 # jobs provide post-merge/on-demand staging evidence; they do not gate the core
 # production promote, and production and staging-CD triggers are independent.
-# While parked below the pending marker, their contexts are not presence-required
-# by the merge queue; an emitted red status still blocks under main's branch-
+# While parked below the pending marker, their contexts are
+# not presence-required by the merge queue; an emitted red status still blocks under main's branch-
 # protection wildcard. Real per-PR coverage belongs to the isolated ephemeral-CP
 # gate.
 
@@ -443,7 +443,8 @@ jobs:
           fi
           # Per-slug DELETE must prove the exact completed purge receipt/audit
           # and exact org absence. Keep this belt-and-braces step advisory;
-          # sweep-stale-e2e-orgs is the final retry net.
+          # sweep-stale-e2e-orgs is the automatic main-push retry net once the
+          # tenant crosses its conservative 90-minute age floor.
           leaks=()
           while IFS= read -r slug; do
             [ -n "$slug" ] || continue
@@ -456,7 +457,7 @@ jobs:
             elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
               echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::saas teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              echo "::warning::saas teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor"
               leaks+=("$slug")
             fi
           done <<< "$orgs"
@@ -923,7 +924,7 @@ jobs:
             elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
               echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::platform-boot teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              echo "::warning::platform-boot teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor"
               leaks+=("$slug")
             fi
           done <<< "$orgs"
@@ -1135,7 +1136,7 @@ jobs:
             elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
               echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::concierge teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              echo "::warning::concierge teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor"
               leaks+=("$slug")
             fi
           done <<< "$orgs"
@@ -1173,6 +1174,11 @@ jobs:
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates CP_ADMIN_API_TOKEN is non-empty.
       STAGING_E2E: '1'
+      # E2E_INFRA_BACKEND pins the purge helper (tests/e2e/lib/cp_purge_receipt.sh)
+      # to the live local-docker staging backend, mirroring the shell jobs. The
+      # Go test itself reads E2E_PROVIDER, not this; it is consumed only by the
+      # `if: always()` teardown safety net below (its origin/backend guards).
+      E2E_INFRA_BACKEND: local-docker
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -1242,51 +1248,29 @@ jobs:
       - name: Run workspace-requests staginge2e (core#2606)
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceCanRaiseTaskAndApprovalToUser -count=1 -v -timeout 30m
-
-  # Drives tests/e2e/test_staging_concierge_creates_workspace_e2e.sh — the
-  # RFC docs/design/rfc-platform-agent.md §11.4 "Reach" check turned into a gate:
-  # send the org concierge a natural-language A2A message ("create a workspace
-  # named e2e-cncrg-worker-<runid> with role engineer") and assert the
-  # DETERMINISTIC SIDE EFFECT — that named workspace now EXISTS in GET /workspaces
-  # — which can only happen if the concierge's LLM really invoked the
-  # create_workspace platform-MCP tool (a real org mutation), NOT just that a REST
-  # API returned 200.
-  #
-  # GATING (no continue-on-error), but FALSE-GREEN-PROOF via E2E_REQUIRE_LIVE=1:
-  # this is a REAL-LLM, REAL-tool test, so it depends on the concierge being
-  # provisioned on the DEDICATED platform-agent image (Dockerfile.platform-agent,
-  # ships /opt/molecule-mcp-server — the ONLY image where create_workspace lights
-  # up; see platform_agent.go's SELF-HOST CAVEAT). A parallel agent is wiring that
-  # image into the staging provision path. The script SKIPs LOUD when the
-  # concierge is absent / not online / not on the platform-agent image — but with
-  # E2E_REQUIRE_LIVE=1 the harness converts that skip into a HARD FAIL (exit 5) so
-  # a silently-missing platform-agent image can NEVER false-green this gate. Runs
-  # on push-to-main / workflow_dispatch only (needs live staging infra +
-  # a model — never on PR, where pr-validate posts the workflow's PR status).
-  # (enforcement sequenced on molecules-server — the authoritative directive is
-  # the `bp-required: pending #3411` line directly above the job key; core#3081
-  # also adds the A2A-probe step in the test script: it reads the
-  # concierge's /configs/mcp_servers.yaml via GET /workspaces/:id/files/mcp_servers.yaml
-  # and asserts the molecule-platform MCP server is declared with create_workspace.
-  # The previous false-green slipped because the proxies were healthy, the
-  # concierge was online, and the platform-agent image was baked — but the
-  # mcp_servers.yaml overlay on the concierge's /configs did not name the
-  # platform server, so the LLM could not call the tool. Probing the overlay
-  # directly is the only way to fail fast before burning LLM budget on a
-  # 7-minute cold-concierge tool call that will never succeed.)
-  #
-  # core#3081 / CR2 #12653: NO `if:` guard on this job. The job IS the
-  # required status context (see .gitea/required-contexts.txt) — a required
-  # context that never fires on pull_request degrades the merge gate to a
-  # silent indefinite pending (the exact failure mode lint-required-no-paths
-  # exists to prevent; see feedback_path_filtered_workflow_cant_be_required).
-  # The job runs on every PR; E2E_REQUIRE_LIVE is 0 on PR (the script
-  # detects the missing-creds case and exit 0s with a self-check), 1 on
-  # push-to-main / dispatch (the real staging test runs and HARD
-  # FAILs on missing infra).
-  # bp-required: pending #3411 (molecules-server enforcement sequenced — kept below
-  # the ENFORCED marker in .gitea/required-contexts.txt until a green main run +
-  # creds-less PR/fork path, then BP-PATCH + promote).
+      # Belt-and-braces teardown: the Go test installs a t.Cleanup admin-DELETE
+      # of its own tenant, but Go SKIPS t.Cleanup when `go test -timeout` fires
+      # or the runner is SIGKILLed — so a timed-out/cancelled Go test leaks its
+      # org. Unlike the shell jobs, a Go test cannot publish its exact
+      # E2E_CREATED_SLUG/ORG_ID to $GITHUB_ENV, so this net discovers leaks by
+      # the GITHUB_RUN_ID that e2eSlug embeds (e2e-<tag>-<run_id>-<uniq>): it
+      # enumerates the CP admin roster, selects rows whose slug carries THIS
+      # run's id, then hands each (slug, roster org_id) pair to the SAME
+      # identity-bound purge helper the shell jobs use (cp_purge_receipt.sh) — no
+      # new auth path. Idempotent with t.Cleanup; on the happy path the org is
+      # already gone, so the roster filter is empty and this is a fast no-op.
+      - name: Teardown safety net (runs on timeout/cancel/failure)
+        # PR-mode: never curl live staging from a PR (no token; public repo).
+        if: always() && github.event_name != 'pull_request'
+        env:
+          # Sourced from Infisical (staging /shared/controlplane-admin) via the
+          # "Fetch staging CP admin token from Infisical KMS" step above.
+          ADMIN_TOKEN: ${{ env.CP_ADMIN_API_TOKEN }}
+          # Exact tag(s) THIS job creates (TestWorkspaceCanRaiseTaskAndApprovalToUser
+          # → e2eSlug("req")). Scopes the run-id sweep to only this job's org so a
+          # parallel sibling job's in-flight org is never purged.
+          TEARDOWN_TAGS: "req"
+        run: bash tests/e2e/lib/go_e2e_run_teardown.sh
   e2e-staging-concierge-creates-workspace:
     name: E2E Staging Concierge Creates Workspace
     runs-on: ubuntu-latest
@@ -1520,7 +1504,7 @@ jobs:
             elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
               echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::concierge-mk teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              echo "::warning::concierge-mk teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor"
               leaks+=("$slug")
             fi
           done <<< "$orgs"
@@ -1618,6 +1602,11 @@ jobs:
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates CP_ADMIN_API_TOKEN is non-empty.
       STAGING_E2E: '1'
+      # E2E_INFRA_BACKEND pins the purge helper (tests/e2e/lib/cp_purge_receipt.sh)
+      # to the live local-docker staging backend, mirroring the shell jobs. The
+      # Go test itself reads E2E_PROVIDER, not this; it is consumed only by the
+      # `if: always()` teardown safety net below (its origin/backend guards).
+      E2E_INFRA_BACKEND: local-docker
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -1704,31 +1693,31 @@ jobs:
       - name: Run fresh-org platform-agent mgmt-MCP staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPlatformAgentMgmtMCP_Staging -count=1 -v -timeout 30m
-      # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
-      # (e2e-cncrg-* / e2e-mcp-* slug), running even on a t.Fatal. The age-guarded
-      # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
-      # net for a tenant orphaned by a hard runner cancel.
-
-  # Tenant plugin-install lifecycle guard (canvas Plugins tab regression class):
-  # boots a real staging workspace, asserts the registry is non-empty (the
-  # "no registry available" report), installs a registry plugin via
-  # POST /workspaces/:id/plugins, then asserts (a) GET /workspaces/:id/plugins
-  # returns it — guards the installed-plugin readback contract, (b) the workspace
-  # comes back online+routable and serves A2A after the install-triggered
-  # restart — guards the #159 mgmt-MCP self-heal online-gate. Drives
-  # TestPluginInstallLifecycle_Staging (workspace-server/internal/staginge2e).
-  #
-  # SIGNAL: fail-loud (no continue-on-error) on push/dispatch. A red marks this
-  # independent post-merge validation failed; it does not block staging-CD or
-  # production deployment. It is not presence-required by the merge queue, but
-  # an emitted red can still block under branch protection. To make its presence
-  # required, add
-  #   "E2E Staging SaaS (full lifecycle) / E2E Staging Plugin Install Lifecycle"
-  # to .gitea/required-contexts.txt AND to branch_protections/main
-  # status_check_contexts (owner action — same two-step the platform-boot
-  # lane documents above). Until then it runs + fails loud as an observed
-  # post-merge signal, exactly like e2e-staging-workspace-requests.
-  # bp-required: pending #3133
+      # Teardown: the tests install a t.Cleanup admin-DELETE of their own tenant
+      # (e2e-cncrg-* / e2e-mcp-* slug), running even on a t.Fatal. The automatic
+      # main-push sweep-stale-e2e-orgs workflow (90-minute age floor) is the
+      # final delayed net for a tenant orphaned by a hard runner cancel.
+      #
+      # Belt-and-braces always()-net: Go SKIPS t.Cleanup when `go test -timeout`
+      # fires or the runner is SIGKILLed, so a timed-out/cancelled Go test leaks
+      # its org. This net discovers leaks by the GITHUB_RUN_ID that e2eSlug embeds
+      # (e2e-<tag>-<run_id>-<uniq>) — one net sweeps BOTH go test steps above —
+      # and hands each (slug, roster org_id) pair to the SAME identity-bound purge
+      # helper the shell jobs use (cp_purge_receipt.sh). No new auth path;
+      # idempotent with t.Cleanup.
+      - name: Teardown safety net (runs on timeout/cancel/failure)
+        # PR-mode: never curl live staging from a PR (no token; public repo).
+        if: always() && github.event_name != 'pull_request'
+        env:
+          # Sourced from Infisical (staging /shared/controlplane-admin) via the
+          # "Fetch staging CP admin token from Infisical KMS" step above.
+          ADMIN_TOKEN: ${{ env.CP_ADMIN_API_TOKEN }}
+          # BOTH tags THIS job creates: TestConciergePlatformAgent_Staging →
+          # e2eSlug("cncrg") AND TestPlatformAgentMgmtMCP_Staging → e2eSlug("mcp").
+          # Scopes the run-id sweep to only this job's orgs so a parallel sibling
+          # job's in-flight org is never purged.
+          TEARDOWN_TAGS: "cncrg mcp"
+        run: bash tests/e2e/lib/go_e2e_run_teardown.sh
   e2e-staging-plugin-lifecycle:
     name: E2E Staging Plugin Install Lifecycle
     runs-on: ubuntu-latest
@@ -1751,6 +1740,11 @@ jobs:
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates CP_ADMIN_API_TOKEN is non-empty.
       STAGING_E2E: '1'
+      # E2E_INFRA_BACKEND pins the purge helper (tests/e2e/lib/cp_purge_receipt.sh)
+      # to the live local-docker staging backend, mirroring the shell jobs. The
+      # Go test itself reads E2E_PROVIDER, not this; it is consumed only by the
+      # `if: always()` teardown safety net below (its origin/backend guards).
+      E2E_INFRA_BACKEND: local-docker
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -1823,6 +1817,25 @@ jobs:
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 55m
       # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
-      # (e2e-plgn-* slug), running even on a t.Fatal. The age-guarded
-      # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
+      # (e2e-plgn-* slug), running even on a t.Fatal. The automatic main-push
+      # sweep-stale-e2e-orgs workflow (90-minute age floor) is the final delayed
       # net for a tenant orphaned by a hard runner cancel.
+      #
+      # Belt-and-braces always()-net: Go SKIPS t.Cleanup when `go test -timeout`
+      # fires or the runner is SIGKILLed, so a timed-out/cancelled Go test leaks
+      # its org. This net discovers leaks by the GITHUB_RUN_ID that e2eSlug embeds
+      # (e2e-<tag>-<run_id>-<uniq>) and hands each (slug, roster org_id) pair to
+      # the SAME identity-bound purge helper the shell jobs use
+      # (cp_purge_receipt.sh). No new auth path; idempotent with t.Cleanup.
+      - name: Teardown safety net (runs on timeout/cancel/failure)
+        # PR-mode: never curl live staging from a PR (no token; public repo).
+        if: always() && github.event_name != 'pull_request'
+        env:
+          # Sourced from Infisical (staging /shared/controlplane-admin) via the
+          # "Fetch staging CP admin token from Infisical KMS" step above.
+          ADMIN_TOKEN: ${{ env.CP_ADMIN_API_TOKEN }}
+          # Exact tag THIS job creates (TestPluginInstallLifecycle_Staging →
+          # e2eSlug("plgn")). Scopes the run-id sweep to only this job's org so a
+          # parallel sibling job's in-flight org is never purged.
+          TEARDOWN_TAGS: "plgn"
+        run: bash tests/e2e/lib/go_e2e_run_teardown.sh

@@ -129,7 +129,7 @@ func secretWriteApprovalFlow(t *testing.T, host, token, orgID, ordinaryWS, key, 
 func TestConciergeApprovalGate_Staging(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-gate-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("gate")
 	t.Logf("approval-gate: slug=%s", slug)
 
 	// --- Step 1: provision throwaway org + tenant ---
@@ -288,7 +288,7 @@ func TestConciergeApprovalGate_Staging(t *testing.T) {
 func TestConciergeApprovalGate_Staging_OrderIndependent(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-isolation-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("isolation")
 	t.Logf("isolation: slug=%s", slug)
 
 	orgID := adminCreateOrg(t, cfg, slug)

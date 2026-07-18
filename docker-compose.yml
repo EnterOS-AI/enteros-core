@@ -214,17 +214,17 @@ services:
 
   # --- Canvas ---
   canvas:
-    # The publish-canvas-image CI workflow performs ordered registry publication
-    # (core#2226): build → push :staging-<sha> + :staging-latest → (after green
-    # main CI) re-point :latest to the verified :staging-<sha> by digest. This
-    # publishes an image; it does not prove that any live target rolled it out.
+    # The publish-canvas-image CI workflow currently performs advisory candidate
+    # publication (internal#1038): it writes and verifies :staging-<sha>,
+    # :staging-latest, and :sha-<short-sha>. It deliberately leaves :latest and
+    # live targets untouched while the fail-closed publisher is soaked on main.
     #
     # Reproducible local/host rollout: pin CANVAS_IMAGE_TAG to the immutable
     # per-commit tag the publication workflow produced, e.g.
     #   CANVAS_IMAGE_TAG=staging-<sha> docker compose pull canvas && docker compose up -d canvas
-    # This makes a tenant/host rollout reproducible. Unset it and the default
-    # `latest` is only the most recently promoted CI-green registry tag. It is
-    # mutable and is not evidence that production is serving that digest.
+    # This makes a tenant/host rollout reproducible. Unset it and compose still
+    # selects the independently managed mutable `latest`; the candidate workflow
+    # neither updates that tag nor proves production is serving any digest.
     #
     # To pin by content digest instead of tag (fully immutable), resolve the
     # digest for a tag from our registry, e.g.
@@ -235,9 +235,10 @@ services:
     #
     # Registry: OUR OWN container registry (the Gitea registry). Pull auth is a
     # standard `docker login registry.moleculesai.app` with a Gitea PAT
-    # (GITEA_USER/GITEA_TOKEN). The image is
-    # overridable for a mirror via MOLECULE_CANVAS_IMAGE (mirrors the SSOT var
-    # the redeploy workflows already read); default is our registry.
+    # (GITEA_USER/GITEA_TOKEN). Local Compose keeps its established
+    # MOLECULE_CANVAS_IMAGE environment override; Gitea publishers/redeploys use
+    # the repository variable MOLECULE_CANVAS_APP_IMAGE. Both default to the
+    # same canonical registry path.
     # Local dev keeps working via the `build:` context below (docker compose build canvas).
     image: ${MOLECULE_CANVAS_IMAGE:-registry.moleculesai.app/molecule-ai/canvas}:${CANVAS_IMAGE_TAG:-latest}
     build:

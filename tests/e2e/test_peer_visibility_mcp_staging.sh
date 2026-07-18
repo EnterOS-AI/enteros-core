@@ -183,7 +183,7 @@ print(sum(1 for o in orgs if o.get('slug') == '$SLUG' and o.get('instance_status
     fi
     sleep 5
   done
-  echo "::warning::[teardown] $SLUG still present after 120s — sweep-stale-e2e-orgs will catch it within MAX_AGE_MINUTES" >&2
+  echo "::warning::[teardown] $SLUG still present after 120s — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor" >&2
   [ "$rc" -eq 0 ] && rc=4
   exit "$rc"
 }

@@ -48,7 +48,7 @@ func TestDataVolumeSurvivesRecreate_Staging(t *testing.T) {
 	stamp := time.Now().UnixNano()
 	relPath := fmt.Sprintf("e2e-persist/%d.sentinel", stamp)
 
-	slug := fmt.Sprintf("e2e-persist-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("persist")
 	t.Logf("data-persistence: slug=%s", slug)
 
 	// --- Step 0: provision org + tenant, acquire token + wait TLS ready ---
