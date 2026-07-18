@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # test_audit_force_merge.sh — regression lock for audit-force-merge fail-closed
-# behavior. Verifies every schema validation path via direct jq filter tests.
+# behavior. Covers jq schema filters plus the real script against a fake Gitea
+# API so pagination, validation, and incident decisions are exercised together.
 #
 # Usage: bash test_audit_force_merge.sh
 
@@ -12,6 +13,10 @@ pass() { echo "PASS: $*"; }
 [ -x "$(command -v jq)" ] || { echo "SKIP: jq not on PATH"; exit 0; }
 
 HEAD_SHA="deadbeef00000000000000000000000000000000"
+THIS_DIR="$(cd "$(dirname "$0")" && pwd)"
+AUDIT_SCRIPT="$(cd "$THIS_DIR/.." && pwd)/audit-force-merge.sh"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 
 # The schema validation jq expression from audit-force-merge.sh.
 validate_pr_schema() {
@@ -174,20 +179,247 @@ RESULT3=$(echo "$DUP" | collapse_newest_per_context)
 [ "$RESULT3" = "success" ] || fail "T21: newest (success) must win over older (failure), got '$RESULT3'"
 pass "T21: newest row per context wins after pagination collapse"
 
-# T22 — short-page stop condition: a page with fewer than PER_PAGE rows ends
-#       the loop. Emulate the numeric comparison the script uses.
-PER_PAGE=100
+# T22 — a non-empty short page MUST continue. Gitea silently caps `limit=100`
+#       to 50 on this installation, so `count < requested limit` is not proof
+#       that the collection is exhausted.
 PAGE_COUNT=$(echo "$PAGE2" | jq 'length')   # 1 row
-if [ "$PAGE_COUNT" -lt "$PER_PAGE" ]; then SHORT=stop; else SHORT=continue; fi
-[ "$SHORT" = "stop" ] || fail "T22: short page should stop pagination"
-pass "T22: short page stops pagination loop"
+if [ "$PAGE_COUNT" -eq 0 ]; then SHORT="stop"; else SHORT="continue"; fi
+[ "$SHORT" = "continue" ] || fail "T22: non-empty short page should continue pagination"
+pass "T22: non-empty short page continues pagination"
 
-# T23 — a full page (== PER_PAGE) continues the loop.
-FULL=$(jq -nc '[range(0;100) | {id:., context:"x", status:"success"}]')
-FULL_COUNT=$(echo "$FULL" | jq 'length')
-if [ "$FULL_COUNT" -lt "$PER_PAGE" ]; then CONT=stop; else CONT=continue; fi
-[ "$CONT" = "continue" ] || fail "T23: full page should continue pagination"
-pass "T23: full page continues pagination loop"
+# T23 — only an explicit empty page terminates pagination.
+EMPTY='[]'
+EMPTY_COUNT=$(echo "$EMPTY" | jq 'length')
+if [ "$EMPTY_COUNT" -eq 0 ]; then EMPTY_RESULT="stop"; else EMPTY_RESULT="continue"; fi
+[ "$EMPTY_RESULT" = "stop" ] || fail "T23: empty page should stop pagination"
+pass "T23: explicit empty page stops pagination"
+
+# ---------------------------------------------------------------------------
+# T24+ — execute the real audit script against a fake Gitea API. These are the
+# behavioral regressions; the smaller jq checks above merely document helpers.
+# The fake server deliberately returns fewer rows than the requested limit to
+# model Gitea's configured api.max_response_items=50 clamp.
+# ---------------------------------------------------------------------------
+
+curl() {
+  local url="" out="" want_code=0 arg page body author merger
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    shift
+    case "$arg" in
+      -o)
+        out="${1:-}"
+        shift
+        ;;
+      -w)
+        want_code=1
+        shift
+        ;;
+      -H|-A|-X)
+        shift
+        ;;
+      http://*|https://*)
+        url="$arg"
+        ;;
+    esac
+  done
+
+  [ -n "${MOCK_CALL_LOG:-}" ] && printf '%s\n' "$url" >> "$MOCK_CALL_LOG"
+  body='{}'
+  case "$url" in
+    *"/pulls/42/files?"*)
+      page="${url#*page=}"
+      page="${page%%&*}"
+      case "${MOCK_SCENARIO:-}" in
+        reserved_server_cap)
+          case "$page" in
+            1) body=$(jq -nc '[range(1;31) | {filename:("src/noise-" + (.|tostring) + ".txt")} ]') ;;
+            2) body='[{"filename":"docs/design/new-rfc.md"}]' ;;
+            *) body='[]' ;;
+          esac
+          ;;
+        reserved_malformed) body='{"unexpected":"object"}' ;;
+        reserved_control_filename) body='[{"filename":"docs/design/evil\nsecond"}]' ;;
+        *) body='[]' ;;
+      esac
+      ;;
+    *"/pulls/42")
+      author="pr-author"
+      merger="release-manager"
+      if [ "${MOCK_SCENARIO:-}" = "reserved_server_cap" ] || \
+         [ "${MOCK_SCENARIO:-}" = "reserved_malformed" ] || \
+         [ "${MOCK_SCENARIO:-}" = "reserved_control_filename" ]; then
+        author="release-manager"
+      fi
+      body=$(jq -nc \
+        --arg author "$author" \
+        --arg merger "$merger" \
+        --arg head "$HEAD_SHA" \
+        '{merged:true, merge_commit_sha:"merge-sha", merged_by:{login:$merger},
+          user:{login:$author}, title:"pagination regression", base:{ref:"main"},
+          head:{sha:$head}}')
+      ;;
+    *"/commits/${HEAD_SHA}/statuses?"*)
+      page="${url#*page=}"
+      page="${page%%&*}"
+      case "${MOCK_SCENARIO:-}" in
+        server_cap)
+          case "$page" in
+            1) body=$(jq -nc '[range(1;51) | {id:., context:("noise-" + (.|tostring)), status:"success"}]') ;;
+            2) body='[{"id":51,"context":"CI / all-required (push)","status":"success"}]' ;;
+            *) body='[]' ;;
+          esac
+          ;;
+        explicit_empty)
+          case "$page" in
+            1) body='[{"id":1,"context":"CI / all-required (push)","status":"success"}]' ;;
+            *) body='[]' ;;
+          esac
+          ;;
+        duplicate_id)
+          case "$page" in
+            1) body=$(jq -nc '[{id:1, context:"CI / all-required (push)", status:"success"}] + [range(2;51) | {id:., context:("noise-" + (.|tostring)), status:"success"}]') ;;
+            2) body='[{"id":50,"context":"late-duplicate","status":"success"}]' ;;
+            *) body='[]' ;;
+          esac
+          ;;
+        malformed_row)
+          body='[{"id":"not-an-integer","context":"CI / all-required (push)","status":"success"}]'
+          ;;
+        non_monotonic)
+          case "$page" in
+            1) body='[{"id":1,"context":"CI / all-required (push)","status":"success"},{"id":3,"context":"noise","status":"success"}]' ;;
+            2) body='[{"id":2,"context":"late-old-row","status":"success"}]' ;;
+            *) body='[]' ;;
+          esac
+          ;;
+        page_bound)
+          if [ "$page" -le 201 ]; then
+            if [ "$page" -eq 1 ]; then
+              body='[{"id":1,"context":"CI / all-required (push)","status":"success"}]'
+            else
+              body=$(jq -nc --argjson id "$page" '[{id:$id, context:("noise-" + ($id|tostring)), status:"success"}]')
+            fi
+          else
+            body='[]'
+          fi
+          ;;
+        reserved_server_cap|reserved_malformed|reserved_control_filename)
+          case "$page" in
+            1) body='[{"id":1,"context":"CI / all-required (push)","status":"success"}]' ;;
+            *) body='[]' ;;
+          esac
+          ;;
+        *) body='[]' ;;
+      esac
+      ;;
+  esac
+
+  [ -n "$out" ] && printf '%s' "$body" > "$out"
+  [ "$want_code" -eq 1 ] && printf '200'
+}
+export -f curl
+export HEAD_SHA
+
+run_audit() {
+  local scenario="$1"
+  AUDIT_OUT_FILE="$WORK/${scenario}.out"
+  AUDIT_CALL_LOG="$WORK/${scenario}.calls"
+  : > "$AUDIT_CALL_LOG"
+  set +e
+  MOCK_SCENARIO="$scenario" \
+  MOCK_CALL_LOG="$AUDIT_CALL_LOG" \
+  GITEA_TOKEN="test-token" \
+  GITEA_HOST="git.moleculesai.app" \
+  REPO="molecule-ai/molecule-core" \
+  PR_NUMBER="42" \
+  REQUIRED_CHECKS_JSON='{"main":["CI / all-required (push)"]}' \
+  RESERVED_PATHS_FILE="$(cd "$THIS_DIR/../../.." && pwd)/.gitea/reserved-paths.txt" \
+    bash "$AUDIT_SCRIPT" > "$AUDIT_OUT_FILE" 2>&1
+  AUDIT_RC=$?
+  set -e
+  AUDIT_OUT=$(cat "$AUDIT_OUT_FILE")
+}
+
+# T24 — live defect: request limit=100, server returns 50 rows, and the needed
+# status is on page 2. The audit must read page 2 AND the empty page 3, then
+# report all checks green (never incident.force_merge).
+run_audit server_cap
+[ "$AUDIT_RC" = "0" ] || fail "T24: capped-page audit should succeed, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" != *'incident.force_merge'* ]] || fail "T24: capped page produced false incident.force_merge"
+[[ "$AUDIT_OUT" == *'all required checks green'* ]] || fail "T24: page-2 required success was not found"
+grep -qF "statuses?page=3&limit=100" "$AUDIT_CALL_LOG" || fail "T24: audit did not prove exhaustion with empty page 3"
+pass "T24: server-capped page walks through page-2 success to empty page 3"
+
+# T25 — even a one-row first page requires a second, empty request. A short
+# non-empty page is never an exhaustion proof.
+run_audit explicit_empty
+[ "$AUDIT_RC" = "0" ] || fail "T25: explicit-empty audit should succeed, rc=$AUDIT_RC output=$AUDIT_OUT"
+grep -qF "statuses?page=2&limit=100" "$AUDIT_CALL_LOG" || fail "T25: one-row page incorrectly terminated pagination"
+pass "T25: only an explicit empty page terminates status pagination"
+
+# T26 — a duplicate id across page boundaries means the snapshot is ambiguous
+# (usually an unstable ordering/boundary). Fail closed instead of evaluating a
+# partial or duplicated history.
+run_audit duplicate_id
+[ "$AUDIT_RC" = "1" ] || fail "T26: duplicate status id should fail closed, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'duplicate status id'* ]] || fail "T26: duplicate-id failure should be explicit"
+pass "T26: duplicate status id across pages fails closed"
+
+# T27 — malformed rows cannot safely participate in max-by-id selection.
+run_audit malformed_row
+[ "$AUDIT_RC" = "1" ] || fail "T27: malformed status row should fail closed, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'malformed status row'* ]] || fail "T27: malformed-row failure should be explicit"
+pass "T27: malformed status row fails closed"
+
+# T28 — explicit stable id ordering is part of the pagination request; default
+# ordering is not a safe cross-page contract.
+run_audit explicit_empty
+grep -qF 'sort=highestindex' "$AUDIT_CALL_LOG" || fail "T28: status pagination did not request stable id order"
+pass "T28: status pagination requests stable highest-index ordering"
+
+# T29 — an out-of-order id despite the explicit sort means the page snapshot
+# is not trustworthy and must fail closed.
+run_audit non_monotonic
+[ "$AUDIT_RC" = "1" ] || fail "T29: non-monotonic status ids should fail closed, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'not strictly increasing by id'* ]] || fail "T29: non-monotonic-id failure should be explicit"
+pass "T29: non-monotonic status ids fail closed"
+
+# T30 — the same short-page bug existed in the reserved-files pagination loop.
+# A reserved path on page 2 must still trigger the detective self-merge event,
+# and page 3 must be read to prove file-list exhaustion.
+run_audit reserved_server_cap
+[ "$AUDIT_RC" = "0" ] || fail "T30: reserved-path audit should succeed, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'incident.reserved_self_merge'* ]] || fail "T30: reserved path on capped page 2 was missed"
+grep -qF 'files?limit=50&page=3' "$AUDIT_CALL_LOG" || fail "T30: files pagination did not terminate on explicit empty page"
+pass "T30: reserved-files pagination survives server cap and terminates on empty page"
+
+# T31 — reserved-path detection is intentionally best-effort, but malformed
+# file pages must be explicit and must not abort the independent force-merge
+# status audit.
+run_audit reserved_malformed
+[ "$AUDIT_RC" = "0" ] || fail "T31: malformed reserved-files page must not abort force-merge audit, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'returned a malformed page'* ]] || fail "T31: malformed reserved-files page should emit a warning"
+[[ "$AUDIT_OUT" == *'all required checks green'* ]] || fail "T31: status audit did not continue after malformed reserved-files page"
+pass "T31: malformed reserved-files page warns while status audit continues"
+
+# T32 — an endpoint that never reaches empty within the safety bound must fail
+# closed instead of occupying the audit runner indefinitely. The fake becomes
+# empty only after page 201, just beyond the production bound.
+run_audit page_bound
+[ "$AUDIT_RC" = "1" ] || fail "T32: excessive non-empty status pages should fail closed, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'exceeded 200 non-empty pages'* ]] || fail "T32: page-bound failure should be explicit"
+pass "T32: excessive non-empty status pages fail closed"
+
+# T33 — filenames are consumed through a newline-delimited jq stream and the
+# matcher emits tab-delimited evidence. Reject control characters at the API
+# boundary so one filename cannot be split into synthetic paths/evidence.
+run_audit reserved_control_filename
+[ "$AUDIT_RC" = "0" ] || fail "T33: malformed reserved filename must not abort force-merge audit, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'returned a malformed page'* ]] || fail "T33: control-character filename should mark the page malformed"
+[[ "$AUDIT_OUT" != *'incident.reserved_self_merge'* ]] || fail "T33: control-character filename must not create synthetic reserved-path evidence"
+[[ "$AUDIT_OUT" == *'all required checks green'* ]] || fail "T33: status audit did not continue after malformed filename"
+pass "T33: control-character reserved filename is rejected without aborting status audit"
 
 echo
 echo "ALL AUDIT-FORCE-MERGE CHECKS PASSED"
