@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# TENANT_URL / TENANT_ROUTE_HOST / TENANT_ROUTE_HDRS / TENANT_ORIGIN are OUTPUT
+# variables set for the caller's scope; shellcheck cannot see the cross-file use.
+# shellcheck disable=SC2034
+#
 # tenant_topology.sh — derive the tenant-facing routing/CORS topology for a
 # staging E2E scenario, so the SAME script runs unchanged against either
 #   (a) real staging  — each tenant front-doored at its own slug.<domain>, OR

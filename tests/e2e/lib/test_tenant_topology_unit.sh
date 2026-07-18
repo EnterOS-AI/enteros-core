@@ -33,8 +33,8 @@ eq "staging TENANT_ORIGIN = TENANT_URL" "$TENANT_ORIGIN" "https://myslug.staging
 
 # ── 2. Ephemeral slug-routing: CP base URL + route domain, no origin template ──
 reset
-MOLECULE_TENANT_URL="$CP_EPHEM"
-MOLECULE_TENANT_ROUTE_DOMAIN="lvh.me"
+export MOLECULE_TENANT_URL="$CP_EPHEM"
+export MOLECULE_TENANT_ROUTE_DOMAIN="lvh.me"
 derive_tenant_topology "eph1" "$CP_EPHEM"; rc=$?
 eq "ephemeral rc=0" "$rc" "0"
 eq "ephemeral TENANT_URL = CP base" "$TENANT_URL" "http://controlplane:8080"
@@ -45,17 +45,17 @@ eq "ephemeral TENANT_ORIGIN derived from route host + TENANT_URL port" "$TENANT_
 
 # ── 3. Explicit origin template ALWAYS wins ──
 reset
-MOLECULE_TENANT_URL="$CP_EPHEM"
-MOLECULE_TENANT_ROUTE_DOMAIN="lvh.me"
-MOLECULE_TENANT_ORIGIN_TEMPLATE="http://{slug}.lvh.me:8080"
+export MOLECULE_TENANT_URL="$CP_EPHEM"
+export MOLECULE_TENANT_ROUTE_DOMAIN="lvh.me"
+export MOLECULE_TENANT_ORIGIN_TEMPLATE="http://{slug}.lvh.me:8080"
 derive_tenant_topology "eph2" "$CP_EPHEM"; rc=$?
 eq "origin-template rc=0" "$rc" "0"
 eq "origin-template substituted with slug" "$TENANT_ORIGIN" "http://eph2.lvh.me:8080"
 
 # ── 4. Explicit MOLECULE_TENANT_ROUTE_HOST overrides the <slug>.<domain> derivation ──
 reset
-MOLECULE_TENANT_URL="$CP_EPHEM"
-MOLECULE_TENANT_ROUTE_HOST="custom-host.lvh.me"
+export MOLECULE_TENANT_URL="$CP_EPHEM"
+export MOLECULE_TENANT_ROUTE_HOST="custom-host.lvh.me"
 derive_tenant_topology "eph3" "$CP_EPHEM"; rc=$?
 eq "explicit route host used verbatim" "$TENANT_ROUTE_HOST" "custom-host.lvh.me"
 eq "explicit route host in headers" "$(hdrs)" "-H Host: custom-host.lvh.me -H X-Molecule-Org-Slug: eph3"
@@ -67,15 +67,15 @@ eq "prod api.* derives <domain> (drops the api. label)" "$TENANT_URL" "https://p
 
 # ── 5. Staging with explicit tenant-domain override ──
 reset
-MOLECULE_TENANT_DOMAIN="custom.example.io"
+export MOLECULE_TENANT_DOMAIN="custom.example.io"
 derive_tenant_topology "dom1" "$CP_STAGING"; rc=$?
 eq "domain override" "$TENANT_URL" "https://dom1.custom.example.io"
 
 # ── 6. NEGATIVE CONTROL: routing active but TENANT_URL has no usable scheme and
 #      no origin template ⇒ cannot derive a CORS origin ⇒ hard error (rc=1). ──
 reset
-MOLECULE_TENANT_URL="noscheme-garbage"
-MOLECULE_TENANT_ROUTE_DOMAIN="lvh.me"
+export MOLECULE_TENANT_URL="noscheme-garbage"
+export MOLECULE_TENANT_ROUTE_DOMAIN="lvh.me"
 err=$(derive_tenant_topology "eph4" "$CP_EPHEM" 2>&1); rc=$?
 eq "un-derivable origin fails closed rc=1" "$rc" "1"
 if printf '%s' "$err" | grep -q "Cannot derive a tenant CORS Origin"; then
