@@ -52,6 +52,8 @@ jobs:
   # `sdk-route-milestone-contract-drift / SDK route + milestone derive-gates` and
   # is listed in .gitea/required-contexts.txt. Renaming this job changes the
   # context string — keep it in lockstep with that file.
+  # bp-required: yes — merge-blocking under main's branch-protection
+  # status_check_contexts=['*'] (every posted context is required, #4363).
   derive-gates:
     name: SDK route + milestone derive-gates
     runs-on: ubuntu-latest

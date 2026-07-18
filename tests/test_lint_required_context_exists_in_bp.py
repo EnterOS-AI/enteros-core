@@ -292,6 +292,26 @@ def test_new_emission_with_bp_required_yes_not_in_bp(env, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# bp-required: yes under a WILDCARD BP (status_check_contexts=['*']) → pass.
+# molecule-core/main uses ['*'] ("every posted context is required", #4363), so
+# a bp-required: yes context IS covered by the wildcard even though it is not a
+# literal member. Before the fnmatch fix this returned 1 (fail-closed on the
+# wildcard); it must now pass.
+# ---------------------------------------------------------------------------
+def test_new_emission_with_bp_required_yes_under_wildcard(env, monkeypatch, capsys):
+    m = _import_lint()
+    _stub_git_and_api(
+        monkeypatch,
+        m,
+        base_files={".gitea/workflows/ci.yml": WF_CI_BASE},
+        head_files={".gitea/workflows/ci.yml": WF_CI_NEW_JOB_BP_YES},
+        bp_response=("ok", {"status_check_contexts": ["*"]}),
+    )
+    rc = m.run()
+    assert rc == 0
+
+
+# ---------------------------------------------------------------------------
 # bp-required: pending #NNN → pass.
 # ---------------------------------------------------------------------------
 def test_new_emission_with_bp_required_pending(env, monkeypatch, capsys):
