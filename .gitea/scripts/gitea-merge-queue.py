@@ -2440,16 +2440,21 @@ def live_premerge_status_regressions(
 
 def process_once(*, dry_run: bool = False) -> int:
     # Required status contexts come from BRANCH PROTECTION, not a hand-kept env
-    # list. Fail-closed: if BP cannot be enumerated, HOLD the whole tick rather
-    # than merge against an unverified required set.
+    # list. Fail-closed: if BP cannot be enumerated, FAIL the whole tick rather
+    # than merge against an unverified required set or publish a false green.
     try:
         bp = get_branch_protection(WATCH_BRANCH)
     except BranchProtectionUnavailable as exc:
         sys.stderr.write(
-            f"::error::queue held: branch protection for {WATCH_BRANCH} "
-            f"unavailable (fail-closed): {exc}\n"
+            f"::error::queue failed closed: branch protection for {WATCH_BRANCH} "
+            f"unavailable; no merge attempted: {exc}\n"
         )
-        return 0
+        # The hold is safe only if it is also honest. Returning success here
+        # made an approval-triggered consumer publish a green queue context even
+        # though the conductor could not read policy and made no merge attempt
+        # (internal#1084). A transient API failure may retry on the next event or
+        # manual dispatch, but this run must remain non-success.
+        return 1
     # Uniform gate: governance checks are ALWAYS required, even if branch
     # protection does not enumerate them. Deduplicate against BP list.
     contexts = list(dict.fromkeys(bp.required_contexts + GOVERNANCE_REQUIRED_CONTEXTS))
@@ -2463,8 +2468,8 @@ def process_once(*, dry_run: bool = False) -> int:
     # ApiError) BEFORE the candidate loop. We deliberately do NOT catch it:
     # it propagates to main()'s ApiError handler → rc 1 (no merge + operators
     # paged). A vanished merge-gate SSOT is an incident, not a transient to be
-    # held silently — unlike BranchProtectionUnavailable, which can be a Gitea
-    # blip and is held quietly with rc 0.
+    # held silently. BranchProtectionUnavailable is equally non-success: even a
+    # transient Gitea blip cannot produce an honest green queue context.
     enforced_file_contexts = load_enforced_file_contexts(ENFORCED_CONTEXTS_FILE)
     print(
         f"::notice::queue policy from branch protection: "
