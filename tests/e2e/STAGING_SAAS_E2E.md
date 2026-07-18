@@ -43,6 +43,17 @@ describe that unperformed scan as a pass. Other staging workflow families retain
 separate teardown contracts; `molecule-ai/internal#639` tracks the remaining
 convergence.
 
+The full-SaaS scheduler checks are volume-authoritative. Step 10f resolves the
+workspace under test, accepts daemon-readiness evidence only from that exact
+container's `schedule-health.json`, and requires both explicit-ID and omitted-ID
+self-mode creates to appear on its own `schedules.yaml` grid. A UUID response is
+the only signal that permits a bounded create retry because it proves the
+request reached the retired database path while capability propagation was
+stale; name-keyed volume responses and visible grid entries switch to poll-only
+to avoid duplicate creates. On failure, the harness prints the target's bounded
+grid, health, armed-state, and history snapshots before the wider container
+context. A sibling workspace heartbeat is never target readiness evidence.
+
 ## Credential
 
 Load staging `CP_ADMIN_API_TOKEN` from Infisical environment `staging`, path

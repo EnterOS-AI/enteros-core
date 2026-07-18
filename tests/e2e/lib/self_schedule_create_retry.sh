@@ -10,6 +10,21 @@
 # that permits reinvocation: it proves core accepted the create into the retired
 # DB while its capability cache was stale. id==name is volume-routing evidence,
 # and any visible grid entry is authoritative, so both switch to poll-only.
+self_schedule_target_capability_ready() {
+  local health
+
+  _SS_CAP_EVIDENCE=""
+  [ -n "${_SS_SELF_CID:-}" ] || return 1
+  health=$(docker exec "$_SS_SELF_CID" sh -c \
+    'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null || true)
+  if printf '%s' "$health" \
+      | grep -Eq '"last_tick"[[:space:]]*:[[:space:]]*"[^"]+"'; then
+    _SS_CAP_EVIDENCE="$_SS_SELF_CID (schedule-health.json last_tick live)"
+    return 0
+  fi
+  return 1
+}
+
 self_schedule_create_until_own_grid() {
   local args_json="${1:-}" expected_name="${2:-}"
   local elapsed=0 do_create=1 why="" next="" remaining sleep_secs

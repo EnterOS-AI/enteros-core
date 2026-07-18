@@ -3161,23 +3161,6 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
       return 1
     }
 
-    # Daemon-armed precondition, mirroring 10d (scheduler_capability_ready): a
-    # non-null quoted last_tick proves the trigger daemon booted + completed ≥1 poll
-    # cycle, so a create now will route to an armed grid (closes the #4448 arm race).
-    self_schedule_capability_ready() {
-      local _sc _health
-      _SS_CAP_EVIDENCE=""
-      while IFS= read -r _sc; do
-        [ -n "$_sc" ] || continue
-        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null || true)
-        if printf '%s' "$_health" | grep -Eq '"last_tick"[[:space:]]*:[[:space:]]*"[^"]+"'; then
-          _SS_CAP_EVIDENCE="$_sc (schedule-health.json last_tick live)"
-          return 0
-        fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
-      return 1
-    }
-
     # $1=name present on the OWN (self) container's volume grid?
     self_schedule_own_grid_has() {
       local _grid
@@ -3451,7 +3434,20 @@ print(rid)
     # a zero-match grep exits 1 under `set -euo pipefail` and would abort this fn
     # before the log lines print — and a zero match IS the leg it explains.
     self_schedule_diagnostics() {
-      local _sc _decl _plug _slog
+      local _sc _decl _plug _slog _grid _health _state _history
+      # Always snapshot the resolved target directly. A sibling's healthy daemon is
+      # not evidence for this grid, and the target may have stopped and disappeared
+      # from `docker ps` by the time the failure arm runs.
+      if [ -n "${_SS_SELF_CID:-}" ]; then
+        _grid=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 1200 || true)
+        _health=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 800 || true)
+        _state=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-state.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 1200 || true)
+        _history=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | tail -c 1600 || true)
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedules.yaml: ${_grid:-ABSENT}"
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-health.json: ${_health:-ABSENT}"
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-state.json: ${_state:-ABSENT}"
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-history.json tail: ${_history:-ABSENT}"
+      fi
       while IFS= read -r _sc; do
         [ -n "$_sc" ] || continue
         _decl=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DECLARED_PLUGINS|MCP_MODE|TRIGGER)" | sort | tr "\n" " "' 2>/dev/null || true)
@@ -3494,7 +3490,7 @@ print(rid)
 
     # ── 10f.B.1 Daemon-armed wait (mirror 10d; closes #4448 before create) ──
     log "    LEG B: waiting up to ${_SS_CAP_TIMEOUT_SECS}s for the trigger daemon to arm (schedule-health.json ticking) before creating — #4448 arm-race guard."
-    if idle_digest_wait "$_SS_CAP_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_capability_ready; then
+    if idle_digest_wait "$_SS_CAP_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_target_capability_ready; then
       ok "    trigger daemon armed & ticking (evidence: $_SS_CAP_EVIDENCE)"
     else
       self_schedule_diagnostics
@@ -3564,7 +3560,7 @@ print(rid)
     ok "    10f self-schedule tool: LEG A injector proof + LEG B (explicit-id, omit-id self-resolve, fire) + foreign-id/org-key neg controls all PASSED"
 
     unset -f self_schedule_adapter_config_path self_schedule_adapter_config_format \
-      self_schedule_resolve_own_container self_schedule_capability_ready \
+      self_schedule_resolve_own_container \
       self_schedule_own_grid_has self_schedule_any_grid_has self_schedule_fire_probe \
       self_schedule_assert_ordinary_box self_schedule_injector_proof \
       self_schedule_invoke_create self_schedule_diagnostics

@@ -31,6 +31,9 @@ SLEEPS=""
 LOGS=""
 RESULT_CLASSES=()
 RESULT_IDS=()
+DOCKER_CALL_FILE=$(mktemp "${TMPDIR:-/tmp}/self-schedule-docker-calls.XXXXXX")
+trap 'rm -f "$DOCKER_CALL_FILE"' EXIT
+TARGET_HEALTH=""
 
 reset_case() {
   _SS_CREATE_TIMEOUT_SECS="$1"
@@ -69,6 +72,15 @@ log() {
 
 run_create() {
   self_schedule_create_until_own_grid '{"name":"e2e-self-fire-unit"}' "$NAME"
+}
+
+docker() {
+  printf '%s\n' "$*" >> "$DOCKER_CALL_FILE"
+  if [ "${1:-}" = "exec" ] && [ "${2:-}" = "own-container" ]; then
+    printf '%s' "$TARGET_HEALTH"
+    return 0
+  fi
+  return 1
 }
 
 # The exact main-run failure: UUID + missing OWN grid proves a legacy DB
@@ -148,12 +160,67 @@ assert_eq "persistent DB misroute fails bounded" 1 "$rc"
 assert_eq "persistent DB misroute has bounded attempts" 3 "$INVOKES"
 assert_eq "persistent DB misroute has bounded sleeps" "10,10" "$SLEEPS"
 
+# Daemon readiness must come from the already-resolved OWN container. A healthy
+# sibling/child is not evidence that the target grid's trigger daemon is armed.
+_SS_SELF_CID=""
+_SS_CAP_EVIDENCE="stale"
+: > "$DOCKER_CALL_FILE"
+TARGET_HEALTH='{"last_tick":"2026-07-18T19:00:00+00:00"}'
+self_schedule_target_capability_ready
+rc=$?
+assert_eq "missing OWN container cannot prove readiness" 1 "$rc"
+assert_eq "missing OWN container performs no Docker probe" "" "$(<"$DOCKER_CALL_FILE")"
+assert_eq "missing OWN container clears stale evidence" "" "${_SS_CAP_EVIDENCE:-}"
+
+_SS_SELF_CID="own-container"
+_SS_CAP_EVIDENCE=""
+: > "$DOCKER_CALL_FILE"
+TARGET_HEALTH='{"last_tick":null}'
+self_schedule_target_capability_ready
+rc=$?
+assert_eq "OWN container without a live tick is not ready" 1 "$rc"
+assert_eq "readiness probes only the OWN container" \
+  "exec own-container sh -c cat /configs/schedules/schedule-health.json 2>/dev/null" \
+  "$(<"$DOCKER_CALL_FILE")"
+
+_SS_CAP_EVIDENCE=""
+: > "$DOCKER_CALL_FILE"
+TARGET_HEALTH='{"last_tick":"2026-07-18T19:00:00+00:00"}'
+self_schedule_target_capability_ready
+rc=$?
+assert_eq "OWN container live tick proves readiness" 0 "$rc"
+assert_eq "OWN readiness evidence names the target" \
+  "own-container (schedule-health.json last_tick live)" "$_SS_CAP_EVIDENCE"
+
 if grep -Fq 'self_schedule_create_until_own_grid "$_SS_ARGS_EXPLICIT" "$_SS_SN"' "$HARNESS" \
     && grep -Fq 'self_schedule_create_until_own_grid "$_SS_ARGS_OMIT" "$_SS_SN_OMIT"' "$HARNESS"; then
   printf '%s\n' "  PASS: both positive 10f legs consume the retry helper"
   passed=$((passed + 1))
 else
   printf '%s\n' "  FAIL: both positive 10f legs must consume the retry helper" >&2
+  failed=$((failed + 1))
+fi
+
+if grep -Fq 'idle_digest_wait "$_SS_CAP_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_target_capability_ready' "$HARNESS"; then
+  printf '%s\n' "  PASS: 10f readiness is scoped to the resolved OWN container"
+  passed=$((passed + 1))
+else
+  printf '%s\n' "  FAIL: 10f readiness must call the OWN-container helper" >&2
+  failed=$((failed + 1))
+fi
+
+diagnostic_block=$(sed -n '/self_schedule_diagnostics()/,/^    }/p' "$HARNESS")
+diagnostic_files=(schedules.yaml schedule-health.json schedule-state.json schedule-history.json)
+diagnostic_contract_ok=1
+for diagnostic_file in "${diagnostic_files[@]}"; do
+  printf '%s' "$diagnostic_block" | grep -Fq "$diagnostic_file" || diagnostic_contract_ok=0
+done
+if [ "$diagnostic_contract_ok" = 1 ] \
+    && printf '%s' "$diagnostic_block" | grep -Fq '$_SS_SELF_CID'; then
+  printf '%s\n' "  PASS: failure diagnostics dump the target grid/state/health/history"
+  passed=$((passed + 1))
+else
+  printf '%s\n' "  FAIL: failure diagnostics must dump target grid/state/health/history" >&2
   failed=$((failed + 1))
 fi
 
