@@ -243,19 +243,27 @@ seed_workspace_image() {
     ref="${registry}/workspace-template-${rt}:latest"
   fi
   echo "[proof] seeding ${bare} from ${ref}..." >&2
-  pull_via_host "$ref" || { echo "FATAL: cannot obtain ${ref} — the CP cannot provision ${rt} workspaces without it" >&2; exit 1; }
-  # Retag by resolved image ID, NOT by "$ref": a digest-pinned ref does not survive
-  # `docker save | docker load` into the fresh dind daemon — the RepoDigest name is
-  # dropped and the image lands by ID only, so `docker tag <digest-ref> ...` fails
-  # with "No such image" in the nested daemon (observed on the CI dind). The image ID
-  # IS preserved across save/load, and the HOST daemon (which pulled by digest) has
-  # it under the ref — resolve the ID there and tag THAT. Parse the "Id" field from
-  # the plain `image inspect` JSON (the `--format '{{.Id}}'` variant returned empty on
-  # the CI daemon; the no-format inspect is the exact call pull_via_host already
-  # relies on above, so it is reliable). Moving-tag refs resolve the same way.
-  local img_id
-  img_id="$(host_docker image inspect "$ref" 2>/dev/null | grep -m1 '"Id"' | sed -E 's/.*"Id":[[:space:]]*"([^"]+)".*/\1/')"
-  [ -n "$img_id" ] || { echo "FATAL: could not resolve the image ID for ${ref} on the host daemon" >&2; exit 1; }
+  # Resolve on the host cache (digest = content-addressed, so a HIT is exact) or pull,
+  # then stream into the nested daemon CAPTURING the ID that `docker load` reports, and
+  # tag THAT to the bare name. We must use the load-reported ID (not `image inspect`)
+  # for TWO independent reasons, both observed on the CI dind:
+  #  (1) the digest-ref NAME does not survive `docker save | docker load` — the image
+  #      lands by ID only, so `docker tag <digest-ref> $bare` fails "No such image"; and
+  #  (2) the HOST (containerd image store) reports the MANIFEST digest as `.Id` for a
+  #      digest-ref, which is NOT the CONFIG-digest ID the dind loaded, so tagging a
+  #      host-inspected ID ALSO fails "No such image". `docker load`'s reported ID is
+  #      the dind's own handle — the only reliable one. (Moving-tag refs work too:
+  #      save|load round-trips them and load still reports the loaded ID.)
+  if ref_is_digest_pinned "$ref" && host_docker image inspect "$ref" >/dev/null 2>&1; then
+    echo "[proof] host cache HIT for digest-pinned ${ref} — no registry pull" >&2
+  else
+    host_docker pull "$ref" >&2 || { echo "FATAL: cannot obtain ${ref} — the CP cannot provision ${rt} workspaces without it" >&2; exit 1; }
+  fi
+  local _load_out img_id
+  _load_out="$(host_docker save "$ref" | docker load 2>&1)" || { echo "FATAL: could not stream ${ref} into the nested daemon" >&2; exit 1; }
+  printf '%s\n' "$_load_out" >&2
+  img_id="$(printf '%s\n' "$_load_out" | sed -n 's/^Loaded image ID: *//p; s/^Loaded image: *//p' | tail -1)"
+  [ -n "$img_id" ] || { echo "FATAL: could not determine the loaded image ID for ${ref} from docker load output" >&2; exit 1; }
   docker tag "$img_id" "$bare"
   echo "[proof] seeded ${bare}" >&2
 }
