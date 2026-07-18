@@ -55,6 +55,11 @@ func TestPluginInstallLifecycle_Staging(t *testing.T) {
 	token := tenantAdminToken(t, cfg, slug)
 	waitForHTTP(t, host, http.StatusOK, 10*time.Minute, "tenant /health ready")
 	t.Logf("tenant TLS ready: %s", host)
+	// /health is allowlisted and goes green before the app's real proxied routes
+	// serve (controlplane#1012). Gate on the actual /plugins route the next
+	// subtest asserts, to a stable streak, before reading it — otherwise a
+	// transient boot-window 503 flakes registry_non_empty.
+	waitForTenantRoute(t, host, "/plugins", token, orgID, 2, 3*time.Minute, "tenant /plugins ready")
 
 	// --- Step 2: registry must be non-empty BEFORE we pick a plugin ----------
 	// This is independent of any workspace — the registry is host-local

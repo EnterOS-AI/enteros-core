@@ -75,10 +75,11 @@ var forbiddenTenantEnvKeys = map[string]struct{}{
 	"BITBUCKET_TOKEN": {},
 
 	// Control-plane admin tokens.
-	"CP_ADMIN_API_TOKEN":   {},
-	"CP_ADMIN_TOKEN":       {},
-	"ADMIN_TOKEN":          {},
-	"MOLECULE_ADMIN_TOKEN": {},
+	"CP_ADMIN_API_TOKEN":        {},
+	"CP_PROMOTE_PROD_API_TOKEN": {},
+	"CP_ADMIN_TOKEN":            {},
+	"ADMIN_TOKEN":               {},
+	"MOLECULE_ADMIN_TOKEN":      {},
 
 	// Control-plane shared/provision secrets (security-audit M5). One
 	// fleet-wide value gating /cp/workspaces/* + re-served by
@@ -202,7 +203,13 @@ func findPrivilegedTenantAdminEnvKeys(envVars map[string]string) []string {
 		return []string{}
 	}
 	found := make([]string, 0)
-	for _, key := range []string{"ADMIN_TOKEN", "MOLECULE_ADMIN_TOKEN", "CP_ADMIN_API_TOKEN", "CP_ADMIN_TOKEN"} {
+	for _, key := range []string{
+		"ADMIN_TOKEN",
+		"MOLECULE_ADMIN_TOKEN",
+		"CP_ADMIN_API_TOKEN",
+		"CP_ADMIN_TOKEN",
+		"CP_PROMOTE_PROD_API_TOKEN",
+	} {
 		if _, ok := envVars[key]; ok {
 			found = append(found, key)
 		}

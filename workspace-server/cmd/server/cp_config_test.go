@@ -498,3 +498,41 @@ func TestEnsureManagedTenantLLMEnv_HappyPathNoRetry(t *testing.T) {
 		t.Errorf("happy path must make exactly 1 CP call (no retry), got %d", got)
 	}
 }
+
+// TestAssertSaaSTenantHasAdminToken (core#4485): a Molecule-managed tenant
+// (MOLECULE_ORG_ID set) with no ADMIN_TOKEN must REFUSE boot — otherwise
+// AdminAuth's Tier-3 fallback accepts any workspace token as org-admin. Self-
+// hosted / local-dev (no MOLECULE_ORG_ID) must still boot, keeping the deprecated
+// Tier-3 path. Gated on MOLECULE_ORG_ID (the CP-provisioner signal), NOT
+// MOLECULE_DEPLOY_MODE. Negative-controlled: both refuse arms and pass arms;
+// a whitespace-only ADMIN_TOKEN counts as unset.
+func TestAssertSaaSTenantHasAdminToken(t *testing.T) {
+	cases := []struct {
+		name       string
+		deployMode string
+		orgID      string
+		adminToken string
+		wantErr    bool
+	}{
+		{"self-host: no org, no admin token -> ok (Tier-3 exempt)", "", "", "", false},
+		{"self-host: DEPLOY_MODE=self-hosted, no org, no admin -> ok", "self-hosted", "", "", false},
+		{"managed: org set + DEPLOY_MODE=self-hosted, no admin -> refuse (CP-provisioned on ORG_ID alone)", "self-hosted", "org-abc", "", true},
+		{"managed: org set, admin token set -> ok", "", "org-abc", "secret", false},
+		{"managed: org set, NO admin token -> refuse", "", "org-abc", "", true},
+		{"managed: org set, whitespace admin token -> refuse", "", "org-abc", "   ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MOLECULE_DEPLOY_MODE", tc.deployMode)
+			t.Setenv("MOLECULE_ORG_ID", tc.orgID)
+			t.Setenv("ADMIN_TOKEN", tc.adminToken)
+			err := assertSaaSTenantHasAdminToken()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected boot refusal, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected nil (must not break this deploy), got %v", err)
+			}
+		})
+	}
+}

@@ -905,6 +905,61 @@ func waitForHTTP(t *testing.T, host string, want int, timeout time.Duration, why
 	t.Fatalf("%s: %s never returned HTTP %d within %s (last=%d)", why, url, want, timeout, last)
 }
 
+// waitForTenantRoute gates on a REAL proxied tenant route (not the allowlisted
+// /health) serving a STABLE consecutive-200 streak before the caller asserts
+// against it. The CP publishes instance_status=running on a /health-only canary
+// (controlplane#1012 — internal/provisioner/canary.go probes only /health), so
+// the first proxied API call (e.g. GET /plugins, GET /workspaces) can transiently
+// 502/503 while the app finishes wiring under load. This is a readiness gate, not
+// a retry-until-green mask: a genuinely half-wired tenant never reaches the streak
+// and this fails loudly; the caller's content assertions still run afterwards.
+func waitForTenantRoute(t *testing.T, host, path, token, orgID string, wantStreak int, timeout time.Duration, why string) {
+	t.Helper()
+	url := "https://" + host + path
+	client := &http.Client{Timeout: 15 * time.Second}
+	deadline := time.Now().Add(timeout)
+	streak, last := 0, 0
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Molecule-Org-Id", orgID)
+		req.Header.Set("Origin", "https://"+host)
+		resp, err := client.Do(req)
+		if err == nil {
+			last = resp.StatusCode
+			// 401/403 are definitive auth failures, not a boot-window condition —
+			// fail fast instead of burning the whole deadline and mis-blaming the
+			// provisioner.
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				resp.Body.Close()
+				t.Fatalf("%s: %s returned HTTP %d — an AUTH failure (bad tenant token/org-id), not a readiness/half-wired issue", why, url, resp.StatusCode)
+			}
+			if resp.StatusCode == http.StatusOK {
+				// Reject a 200 whose body is the canvas SPA HTML fallback (route
+				// not registered yet): the assertion this gates needs JSON.
+				body := readBody(resp)
+				resp.Body.Close()
+				trimmed := strings.TrimSpace(body)
+				if len(trimmed) > 0 && trimmed[0] != '<' {
+					streak++
+					if streak >= wantStreak {
+						return
+					}
+					time.Sleep(3 * time.Second)
+					continue
+				}
+				streak = 0
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			resp.Body.Close()
+		}
+		streak = 0
+		time.Sleep(3 * time.Second)
+	}
+	t.Fatalf("%s: %s never served a stable %dx200 JSON within %s (last=%d) — persistent half-wired tenant (controlplane#1012), not a transient boot window", why, url, wantStreak, timeout, last)
+}
+
 // --- HTTP helpers ----------------------------------------------------------
 
 // doJSON hits the CP admin surface (bearer admin token, no tenant headers).

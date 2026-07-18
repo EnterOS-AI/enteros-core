@@ -114,6 +114,17 @@ func main() {
 	// — silent-fail is worse than a loud refusal. Self-hosted (no orgID/adminToken)
 	// short-circuits inside and never retries — byte-identical to before. The
 	// refresh also heals older tenants whose MOLECULE_CP_SHARED_SECRET is unset.
+	// (core#4485) A Molecule-managed tenant (MOLECULE_ORG_ID set) MUST provide
+	// ADMIN_TOKEN. Without it, AdminAuth's deprecated Tier-3 fallback
+	// (wsauth_middleware.go:268-280) accepts any live workspace token as
+	// org-admin — a workspace self-surface token could then manage the org /
+	// create-delete-restart sibling workspaces. Assert BEFORE
+	// ensureManagedTenantLLMEnv, whose managed-tenant detection (refreshEnvFromCP
+	// / assertManagedTenantHasLLMEnv) silently no-ops when ADMIN_TOKEN is unset.
+	// Self-hosted / local-dev (no MOLECULE_ORG_ID) is exempt and keeps Tier-3.
+	if err := assertSaaSTenantHasAdminToken(); err != nil {
+		log.Fatalf("Managed tenant boot refused: %v", err)
+	}
 	if err := ensureManagedTenantLLMEnv(); err != nil {
 		log.Fatalf("Managed tenant boot assertion: %v", err)
 	}
@@ -903,3 +914,4 @@ func deleteLegacyAdminTokenGlobalSecrets() {
 		log.Printf("deleteLegacyAdminTokenGlobalSecrets: removed %d legacy admin-token global secret row(s)", rows)
 	}
 }
+

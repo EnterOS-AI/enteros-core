@@ -41,6 +41,7 @@ func TestIsForbiddenTenantEnvKey_ExactMatches(t *testing.T) {
 
 		// Control-plane admin tokens.
 		{"CP_ADMIN_API_TOKEN", true},
+		{"CP_PROMOTE_PROD_API_TOKEN", true},
 		{"CP_ADMIN_TOKEN", true},
 		{"ADMIN_TOKEN", true},
 		{"MOLECULE_ADMIN_TOKEN", true},

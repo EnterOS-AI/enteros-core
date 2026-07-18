@@ -984,11 +984,14 @@ func TestBuildContainerEnv_AdminTokenGatedToPlatformKind(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "tenant-admin-secret")
 	cfgFor := func(kind string) WorkspaceConfig {
 		return WorkspaceConfig{
-			WorkspaceID:  "ws-local",
-			PlatformURL:  "http://platform:8080",
-			Runtime:      "claude-code",
-			Kind:         kind,
-			EnvVars:      map[string]string{"ADMIN_TOKEN": "caller-admin", "MOLECULE_ADMIN_TOKEN": "caller-admin-2", "CUSTOM": "ok"},
+			WorkspaceID: "ws-local",
+			PlatformURL: "http://platform:8080",
+			Runtime:     "claude-code",
+			Kind:        kind,
+			EnvVars: map[string]string{
+				"ADMIN_TOKEN": "caller-admin", "MOLECULE_ADMIN_TOKEN": "caller-admin-2",
+				"CP_PROMOTE_PROD_API_TOKEN": "caller-promote", "CUSTOM": "ok",
+			},
 			TemplatePath: t.TempDir(),
 		}
 	}
@@ -1015,6 +1018,9 @@ func TestBuildContainerEnv_AdminTokenGatedToPlatformKind(t *testing.T) {
 		}
 		if envContainsPrefix(got, "MOLECULE_ADMIN_TOKEN=") {
 			t.Fatalf("caller-supplied MOLECULE_ADMIN_TOKEN must be stripped, got %v", got)
+		}
+		if envContainsPrefix(got, "CP_PROMOTE_PROD_API_TOKEN=") {
+			t.Fatalf("production promote capability must never reach a tenant box, got %v", got)
 		}
 	}
 }
@@ -1129,10 +1135,11 @@ func TestBuildCPTenantEnv_NeverForwardsAdminToken(t *testing.T) {
 	cfg := WorkspaceConfig{
 		WorkspaceID: "ws-tenant",
 		EnvVars: map[string]string{
-			"ADMIN_TOKEN":          "caller-admin",
-			"MOLECULE_ADMIN_TOKEN": "caller-admin-2",
-			"GITEA_TOKEN":          "stripme",
-			"CUSTOM":               "ok",
+			"ADMIN_TOKEN":               "caller-admin",
+			"MOLECULE_ADMIN_TOKEN":      "caller-admin-2",
+			"CP_PROMOTE_PROD_API_TOKEN": "caller-promote",
+			"GITEA_TOKEN":               "stripme",
+			"CUSTOM":                    "ok",
 		},
 	}
 	got := buildCPTenantEnv(cfg)
@@ -1141,6 +1148,9 @@ func TestBuildCPTenantEnv_NeverForwardsAdminToken(t *testing.T) {
 	}
 	if _, ok := got["MOLECULE_ADMIN_TOKEN"]; ok {
 		t.Errorf("caller-supplied MOLECULE_ADMIN_TOKEN must be stripped: %v", got)
+	}
+	if _, ok := got["CP_PROMOTE_PROD_API_TOKEN"]; ok {
+		t.Errorf("production promote capability must never be forwarded to a tenant box: %v", got)
 	}
 	if _, ok := got["GITEA_TOKEN"]; ok {
 		t.Errorf("GITEA_TOKEN must still be stripped")

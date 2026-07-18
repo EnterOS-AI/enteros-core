@@ -28,10 +28,40 @@ type credEntry struct {
 	EnvKey       string   `json:"env_key"`
 	BoxedEnvKey  string   `json:"boxed_env_key"`
 	Aliases      []string `json:"aliases"`
+	ForbiddenOn  []string `json:"forbidden_on"`
 	DisclosureOf *struct {
 		ShownOnce bool   `json:"shown_once"`
 		Recovery  string `json:"recovery"`
 	} `json:"disclosure"`
+}
+
+func TestProductionPromoteCredentialIsForbiddenFromTenantBoxes(t *testing.T) {
+	c := loadCredentialsContract(t)
+	var promote *credEntry
+	for i := range c.Credentials {
+		if c.Credentials[i].EnvKey == "CP_PROMOTE_PROD_API_TOKEN" {
+			promote = &c.Credentials[i]
+			break
+		}
+	}
+	if promote == nil {
+		t.Fatal("vendored SDK credentials contract is missing CP_PROMOTE_PROD_API_TOKEN")
+	}
+	forbidden := make(map[string]struct{}, len(promote.ForbiddenOn))
+	for _, surface := range promote.ForbiddenOn {
+		forbidden[surface] = struct{}{}
+	}
+	for _, surface := range []string{"ordinary-workspace", "tenant-platform-box", "tenant-concierge"} {
+		if _, ok := forbidden[surface]; !ok {
+			t.Errorf("promote credential must be forbidden on %q; got %v", surface, promote.ForbiddenOn)
+		}
+	}
+	if !isForbiddenTenantEnvKey(promote.EnvKey) {
+		t.Errorf("%s is not in the tenant forbidden-env guard", promote.EnvKey)
+	}
+	if got := findPrivilegedTenantAdminEnvKeys(map[string]string{promote.EnvKey: "sentinel"}); len(got) != 1 || got[0] != promote.EnvKey {
+		t.Errorf("final tenant admin guard = %v, want [%s]", got, promote.EnvKey)
+	}
 }
 
 type credentialsContract struct {

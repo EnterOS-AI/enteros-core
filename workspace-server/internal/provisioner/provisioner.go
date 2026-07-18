@@ -1086,10 +1086,11 @@ func isSCMWriteTokenKey(key string) bool {
 }
 
 var privilegedWorkspaceEnvKeys = map[string]struct{}{
-	"ADMIN_TOKEN":          {},
-	"MOLECULE_ADMIN_TOKEN": {},
-	"CP_ADMIN_API_TOKEN":   {},
-	"CP_ADMIN_TOKEN":       {},
+	"ADMIN_TOKEN":               {},
+	"MOLECULE_ADMIN_TOKEN":      {},
+	"CP_ADMIN_API_TOKEN":        {},
+	"CP_ADMIN_TOKEN":            {},
+	"CP_PROMOTE_PROD_API_TOKEN": {},
 }
 
 func isPrivilegedWorkspaceEnvKey(key string) bool {
