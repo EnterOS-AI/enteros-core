@@ -405,21 +405,16 @@ echo
 echo "== workflow wiring (regression guard) =="
 
 # W1/W2 (qa-review.yml, security-review.yml) removed 2026-07-14 — the SOP
-# review gate was fully removed and those workflows deleted. The remaining
-# library consumers have different paths: secret-scan calls the best-effort
-# reassert_commit_status helper, while reserved-path-review calls the
-# fail-closed emit_review_status helper.
+# review gate was fully removed and those workflows deleted. W6
+# (reserved-path-review.yml) removed 2026-07-17 (CTO directive) — the preventive
+# self-merge gate was retired; audit-force-merge.yml remains the DETECTIVE
+# backstop. The remaining library consumer is secret-scan (best-effort
+# reassert_commit_status helper).
 SS="$WF_DIR/secret-scan.yml"
-RPR="$WF_DIR/reserved-path-review.yml"
 
 assert_file_contains "W3 secret-scan sources ci-status lib"       "$SS"  ".gitea/scripts/lib/ci-status.sh"
 assert_file_contains "W3 secret-scan calls reassert_commit_status" "$SS"  "reassert_commit_status"
 assert_file_contains "W3 secret-scan passes CONTEXT_BASE"          "$SS"  "Secret scan / Scan diff for credential-shaped strings"
-
-assert_file_contains "W6 reserved-path-review sources ci-status lib"    "$RPR" ".gitea/scripts/lib/ci-status.sh"
-assert_file_contains "W6 reserved-path-review calls resolve_ci_status_token" "$RPR" "resolve_ci_status_token"
-assert_file_contains "W6 reserved-path-review calls emit_review_status" "$RPR" "emit_review_status"
-assert_file_contains "W6 reserved-path-review passes reserved STATUS_CONTEXT" "$RPR" "reserved-path-review / reserved-path-review (pull_request_target)"
 
 # W5 (review-check.sh) removed 2026-07-14 — the qa/security review evaluator
 # was deleted with the SOP gate. The derive_gitea_base SSOT is still covered by
@@ -439,7 +434,9 @@ assert_eq "W4 re-assert step has if: success()" "OK" "$W4"
 # first revision; that workflow has since been deleted with the SOP gate).
 echo
 echo "== W7 no dangling legacy emission fragments =="
-wf="$RPR"
+# reserved-path-review.yml (the original W7 target) was removed 2026-07-17;
+# secret-scan.yml is now the sole surviving emit_review_status/reassert consumer.
+wf="$SS"
 if grep -qE '\$\{?post_code' "$wf"; then
   echo "  FAIL  W7 $(basename "$wf") still references \$post_code (dangling legacy fragment)"
   FAIL=$((FAIL + 1)); FAILED_TESTS="${FAILED_TESTS} W7_$(basename "$wf")"

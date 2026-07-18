@@ -125,7 +125,8 @@ def test_active_ci_status_comments_do_not_claim_an_internal_operator_path() -> N
     paths = (
         ".gitea/scripts/lib/ci-status.sh",
         ".gitea/workflows/main-canary.yml",
-        ".gitea/workflows/reserved-path-review.yml",
+        # reserved-path-review.yml removed 2026-07-17 (CTO directive — preventive
+        # self-merge gate retired; audit-force-merge remains the detective backstop).
         ".gitea/workflows/secret-scan.yml",
     )
     stale_claims = (

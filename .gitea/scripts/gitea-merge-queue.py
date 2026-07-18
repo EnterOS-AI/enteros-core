@@ -165,10 +165,12 @@ OPT_OUT_LABELS = {
 # SOP review-gate contexts (qa-review / security-review / sop-checklist) were
 # fully removed 2026-07-14 (CTO directive): the producing workflows are deleted
 # and no PR emits these contexts anymore, so keeping them here would make every
-# merge wait forever on phantom-required checks. The peer-approval floor
-# (REVIEWER_SET + REQUIRED_APPROVALS, see below) and reserved-path-review remain
-# the review gates. Kept as an (empty) list so the concat sites below are a
-# harmless no-op and re-adding a uniform governance context is a one-line change.
+# merge wait forever on phantom-required checks. reserved-path-review was
+# likewise RETIRED 2026-07-17 (CTO directive; workflow + script deleted), so the
+# peer-approval floor (REVIEWER_SET + REQUIRED_APPROVALS, see below) plus the
+# DETECTIVE audit-force-merge backstop are now the review gates. Kept as an
+# (empty) list so the concat sites below are a harmless no-op and re-adding a
+# uniform governance context is a one-line change.
 GOVERNANCE_REQUIRED_CONTEXTS: list[str] = []
 
 # --------------------------------------------------------------------------
