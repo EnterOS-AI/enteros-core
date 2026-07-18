@@ -3053,7 +3053,7 @@ fi
 #
 # Deterministic (no LLM): from the gate host we `docker exec -i` into the OWN mol-ws
 # container and pipe a two-line JSON-RPC stream (initialize, then tools/call
-# create_schedule) into `npx --prefer-offline @molecule-ai/mcp-server@1.9.2 -e
+# create_schedule) into `npx --prefer-offline @molecule-ai/mcp-server@1.9.3 -e
 # MOLECULE_MCP_MODE=self`, capturing stdout — mirroring test_mcp_stdio_staging.sh.
 # create_schedule lives ONLY on the Node self-mode stdio surface (NOT core's Go MCP
 # HTTP bridge), so this is the sole path that exercises the real tool with no agent
@@ -3074,7 +3074,7 @@ fi
 #     admin/org token so the 401 leg cannot false-pass.
 #
 # Dark until preconditions confirmed (default OFF): needs a workspace-template pin
-# carrying runtime#328's self-audience injector AND a prebaked mcp-server 1.9.2 (so
+# carrying runtime#328's self-audience injector AND a prebaked mcp-server 1.9.3 (so
 # `npx --prefer-offline` resolves offline in the no-network gate). Its fail arms are
 # REACHABLE (each leg has a distinct hard failure with diagnostics). It registers NO
 # live_milestone (LIVE_MILESTONES is a closed SSOT — adding one trips the drift gate).
@@ -3089,7 +3089,7 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
   _SS_CAP_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CAP_TIMEOUT_SECS:-120}"
   _SS_CREATE_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CREATE_TIMEOUT_SECS:-120}"
   _SS_SETTLE_SECS="${E2E_SELF_SCHEDULE_SETTLE_SECS:-30}"
-  _SS_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.2}"
+  _SS_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.3}"
   # Run-unique names (distinct from 10d's e2e-fire-* to avoid a ScheduleStore
   # name-collision 409 + grid-provenance ambiguity). Bounded, cron-safe.
   _SS_SN="e2e-self-fire-${E2E_RUN_ID:-local}"
@@ -3570,3 +3570,4 @@ fi
 require_live_or_die
 log "11/11 All checks passed. Teardown runs via EXIT trap."
 ok "═══ STAGING $MODE-SAAS E2E PASSED ═══"
+
