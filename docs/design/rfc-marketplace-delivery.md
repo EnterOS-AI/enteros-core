@@ -30,8 +30,9 @@ its runtime engine:
 - Core's required pre-merge `template-delivery-e2e` proves config/prompts asset
   delivery for a fresh template. Plugin reconciliation requires a deployed
   runtime; the separate manual, branch-protection-exempt
-  `template-delivery-e2e-staging.yml` proves `seo-all` post-deploy and is not a
-  required pre-merge proof.
+  `template-delivery-e2e-staging.yml` is the `seo-all` post-deploy proof lane.
+  It is not a required pre-merge proof, and this stub does not claim a current
+  staging run.
 
 The entitlement broker, per-seller artifact encryption, third-party publishing,
 billing integration, and marketplace UI described by the original RFC are not
