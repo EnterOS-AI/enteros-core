@@ -312,6 +312,25 @@ def test_new_emission_with_bp_required_yes_under_wildcard(env, monkeypatch, caps
 
 
 # ---------------------------------------------------------------------------
+# bp-required: yes under a NON-universal sub-glob BP → FAIL closed (not covered
+# by a literal member, and we deliberately do NOT expand arbitrary globs with
+# fnmatch — whose `*` crosses ` / ` and can diverge from Gitea's own matcher, a
+# fail-OPEN). Only the universal `*` is accepted; `CI /*` is not.
+# ---------------------------------------------------------------------------
+def test_new_emission_with_bp_required_yes_under_subglob_fails_closed(env, monkeypatch, capsys):
+    m = _import_lint()
+    _stub_git_and_api(
+        monkeypatch,
+        m,
+        base_files={".gitea/workflows/ci.yml": WF_CI_BASE},
+        head_files={".gitea/workflows/ci.yml": WF_CI_NEW_JOB_BP_YES},
+        bp_response=("ok", {"status_check_contexts": ["CI /*"]}),
+    )
+    assert m.run() == 1
+    assert "brand-new" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # bp-required: pending #NNN → pass.
 # ---------------------------------------------------------------------------
 def test_new_emission_with_bp_required_pending(env, monkeypatch, capsys):

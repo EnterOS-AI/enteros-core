@@ -86,7 +86,6 @@ Memory cross-links
 """
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
 import re
@@ -515,17 +514,16 @@ def run() -> int:
             )
             continue
         if kind == "required-yes":
-            # A BP status_check_contexts entry may be a Gitea glob pattern, most
-            # importantly the `*` wildcard that molecule-core/main uses (every
-            # POSTED context is required, per #4363). A literal membership test
-            # is blind to that: under BP=['*'] EVERY context is required, so a
-            # `bp-required: yes` directive is satisfied by the wildcard. Match
-            # the context against each BP pattern with fnmatch (consistent with
-            # the merge queue's own glob handling, #122) so the wildcard — and
-            # any other glob — resolves correctly instead of failing closed.
-            if ctx in bp_contexts or any(
-                fnmatch.fnmatch(ctx, pat) for pat in bp_contexts
-            ):
+            # Accept a literal member OR the universal wildcard `*` that
+            # molecule-core/main uses (BP=['*'] → every POSTED context is
+            # required, #4363), which a bare literal-membership test is blind to.
+            # We deliberately do NOT expand ARBITRARY globs here: a sub-glob like
+            # `CI /*` matched with Python fnmatch (whose `*` crosses the ` / `
+            # separator) can diverge from Gitea's own BP glob engine and green a
+            # context Gitea does not actually require — a fail-OPEN. Only the
+            # universal `*` is treated as covering; anything else must be an exact
+            # member (fail-closed if unsure). The only wildcard in use is `*`.
+            if ctx in bp_contexts or "*" in bp_contexts:
                 print(
                     f"::notice::{ctx}: bp-required: yes, and context is covered "
                     f"by BP ({sorted(bp_contexts)}), OK."
