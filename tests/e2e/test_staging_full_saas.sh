@@ -3102,6 +3102,15 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
     _SS_SELF_CID=""; _SS_SELF_WSID=""; _SS_CAP_EVIDENCE=""; _SS_FIRED=""
     _SS_CLASS=""; _SS_OUT_FILE=""; _SS_LEGA_DETAIL=""
 
+    # LEG A + the rendered-launch extractor parse the DEFAULT-runtime hermes
+    # config.yaml with the runner's python; make PyYAML importable (fail-loud
+    # best-effort install) so a missing lib cannot masquerade as a missing self
+    # entry (PARSE_FAIL yaml-lib-missing). No-op when already present or for the
+    # claude-code JSON path.
+    if ! python3 -c 'import yaml' 2>/dev/null; then
+      pip install --quiet PyYAML 2>/dev/null || python3 -m pip install --quiet PyYAML 2>/dev/null || true
+    fi
+
     # Per-runtime native MCP-config path/format the audience injector renders the
     # self entry into (mirrors the mcp_render / plugins_reconcile SSOT, ADR-005).
     self_schedule_adapter_config_path() {
@@ -3295,18 +3304,82 @@ print("OK token_file=" + str(env.get("MOLECULE_WORKSPACE_TOKEN_FILE")))
     # parse-failed}. Swallows the nonzero RC (server exits nonzero on stdin EOF —
     # expected, mirrors test_mcp_stdio_staging.sh:128-132).
     self_schedule_invoke_create() {
-      local _args="$1" _init _call
+      local _args="$1" _init _call _cfg _fmt _cfg_raw _nodebin _cpath
       _SS_OUT_FILE=$(e2e_tmp /tmp/e2e_self_schedule.XXXXXX)
       _init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-10f","version":"1.0.0"}}}'
       _call=$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_schedule","arguments":%s}}' "$_args")
+      # Drive the PLUGIN'S RENDERED launch, NOT a hand-rolled npx: read the
+      # command/args/env the audience injector actually wrote into the adapter
+      # config (the offline `sh -c` shim + npm_config registry/cache + injected
+      # MOLECULE_MCP_MODE=self / token-file / WORKSPACE_ID), so a regression in
+      # that rendered entry is CAUGHT here instead of masked by a substitute
+      # invocation. hermes keeps node/npx OFF the container PATH (adapter_base's
+      # mcp_launch_env adds it only for children the runtime itself spawns), so we
+      # resolve the node bin and prepend it — replicating the runtime's spawn env —
+      # else the shim's npm/npx would not resolve.
+      _cfg=$(self_schedule_adapter_config_path "$RUNTIME")
+      _fmt=$(self_schedule_adapter_config_format "$RUNTIME")
+      _cfg_raw=$(docker exec "$_SS_SELF_CID" sh -c "cat '$_cfg' 2>/dev/null" 2>/dev/null || true)
+      _nodebin=$(docker exec "$_SS_SELF_CID" sh -c 'for d in "$HERMES_HOME/node/bin" "$HOME/.hermes/node/bin" /tmp/.hermes/node/bin /home/agent/.hermes/node/bin; do [ -x "$d/npx" ] && { printf "%s" "$d"; exit 0; }; done; if command -v npx >/dev/null 2>&1; then dirname "$(command -v npx)"; fi' 2>/dev/null || true)
+      _cpath=$(docker exec "$_SS_SELF_CID" sh -c 'printf "%s" "${PATH:-/usr/local/bin:/usr/bin:/bin}"' 2>/dev/null || printf '%s' "/usr/local/bin:/usr/bin:/bin")
+      local _dexec_args=()
+      mapfile -d '' _dexec_args < <(SS_CFG_RAW="$_cfg_raw" SS_CFG_FMT="$_fmt" SS_CID="$_SS_SELF_CID" SS_NODEBIN="$_nodebin" SS_CPATH="$_cpath" python3 -c '
+import json, os, sys
+raw = os.environ.get("SS_CFG_RAW", ""); fmt = os.environ.get("SS_CFG_FMT", "json")
+data = None
+try:
+    data = json.loads(raw)
+except Exception:
+    pass
+if data is None and fmt in ("yaml", "yml"):
+    try:
+        import yaml; data = yaml.safe_load(raw)
+    except Exception:
+        data = None
+if data is None and fmt == "toml":
+    try:
+        import tomllib; data = tomllib.loads(raw)
+    except Exception:
+        data = None
+entry = [None]
+def walk(o):
+    if entry[0] is not None:
+        return
+    if isinstance(o, dict):
+        env = o.get("env")
+        if isinstance(env, dict) and str(env.get("MOLECULE_MCP_MODE", "")) == "self" and ("command" in o or "args" in o):
+            entry[0] = o; return
+        for v in o.values():
+            walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            walk(v)
+walk(data if data is not None else {})
+e = entry[0]
+if e is None:
+    sys.exit(0)  # empty argv -> caller treats as no-render
+out = []
+for k, v in (e.get("env") or {}).items():
+    out.append("-e"); out.append("%s=%s" % (k, v))
+nb = os.environ.get("SS_NODEBIN", ""); cp = os.environ.get("SS_CPATH", "")
+out.append("-e"); out.append("PATH=%s" % ((nb + ":" + cp) if nb else cp))
+out.append(os.environ["SS_CID"])
+cmd = e.get("command")
+if cmd is not None:
+    out.append(str(cmd))
+for a in (e.get("args") or []):
+    out.append(str(a))
+sys.stdout.write("\0".join(out))
+' 2>/dev/null)
+      if [ "${#_dexec_args[@]}" -eq 0 ]; then
+        _SS_CLASS="no-render"
+        log "    10f: could not extract the rendered self-launch (MODE=self command entry) from $_cfg — LEG A injector-proof should have caught a missing render first"
+        return 0
+      fi
       {
         printf '%s\n' "$_init"
         printf '%s\n' "$_call"
-      } | docker exec -i \
-            -e MOLECULE_MCP_MODE=self \
-            -e MOLECULE_WORKSPACE_TOKEN_FILE=/configs/.auth_token \
-            "$_SS_SELF_CID" \
-            npx --prefer-offline "$_SS_MCP_SPEC" > "$_SS_OUT_FILE" 2>&1 || {
+      } | docker exec -i "${_dexec_args[@]}" > "$_SS_OUT_FILE" 2>&1 || {
         local _rc=$?
         log "    10f: self-mode mcp-server exited rc=$_rc (nonzero on stdin EOF is expected — mirrors test_mcp_stdio_staging.sh)"
       }
@@ -3334,6 +3407,24 @@ for line in fh:
                 cls = "no-result"
             elif isinstance(r, dict) and r.get("isError") is True:
                 cls = "tool-error"
+            elif isinstance(r, dict):
+                # self-mode returns an HTTP/auth rejection (e.g. core 401 on a
+                # FOREIGN workspace_id) as a NORMAL result whose content carries
+                # {"error": ...} WITHOUT isError (see self-mode.test.ts). Treat an
+                # embedded content error as a tool-error so the foreign-id neg
+                # control sees the rejection; a successful create has no error key.
+                emb = False
+                for c in (r.get("content") or []):
+                    t = c.get("text", "") if isinstance(c, dict) else ""
+                    ts = t.strip()
+                    if ts[:1] == "{":
+                        try:
+                            o = json.loads(ts)
+                        except Exception:
+                            o = None
+                        if isinstance(o, dict) and o.get("error"):
+                            emb = True; break
+                cls = "tool-error" if emb else "ok"
             else:
                 cls = "ok"
         break
