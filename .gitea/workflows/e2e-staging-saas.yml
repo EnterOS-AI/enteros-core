@@ -37,8 +37,8 @@ name: E2E Staging SaaS (full lifecycle)
 # There is no path/detect-changes gate and no schedule/cron trigger. These live
 # jobs provide post-merge/on-demand staging evidence; they do not gate the core
 # production promote, and production and staging-CD triggers are independent.
-# While parked below the pending marker, their contexts are not presence-required
-# by the merge queue; an emitted red status still blocks under main's branch-
+# While parked below the pending marker, their contexts are
+# not presence-required by the merge queue; an emitted red status still blocks under main's branch-
 # protection wildcard. Real per-PR coverage belongs to the isolated ephemeral-CP
 # gate.
 
@@ -443,7 +443,8 @@ jobs:
           fi
           # Per-slug DELETE must prove the exact completed purge receipt/audit
           # and exact org absence. Keep this belt-and-braces step advisory;
-          # sweep-stale-e2e-orgs is the final retry net.
+          # sweep-stale-e2e-orgs is the automatic main-push retry net once the
+          # tenant crosses its conservative 90-minute age floor.
           leaks=()
           while IFS= read -r slug; do
             [ -n "$slug" ] || continue
@@ -456,7 +457,7 @@ jobs:
             elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
               echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::saas teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              echo "::warning::saas teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor"
               leaks+=("$slug")
             fi
           done <<< "$orgs"
@@ -923,7 +924,7 @@ jobs:
             elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
               echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::platform-boot teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              echo "::warning::platform-boot teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor"
               leaks+=("$slug")
             fi
           done <<< "$orgs"
@@ -1135,7 +1136,7 @@ jobs:
             elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
               echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::concierge teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              echo "::warning::concierge teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor"
               leaks+=("$slug")
             fi
           done <<< "$orgs"
@@ -1269,130 +1270,7 @@ jobs:
           # → e2eSlug("req")). Scopes the run-id sweep to only this job's org so a
           # parallel sibling job's in-flight org is never purged.
           TEARDOWN_TAGS: "req"
-        run: |
-          set +e
-          source tests/e2e/lib/cp_purge_receipt.sh
-          if ! e2e_cp_require_local_backend \
-            || ! e2e_cp_require_staging_origin "$CP_BASE_URL"; then
-            echo "::warning::go-e2e teardown safety net rejected its staging target/backend before bearer use"
-            exit 0
-          fi
-          if [ -z "${GITHUB_RUN_ID:-}" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive: GITHUB_RUN_ID is empty; no roster discovery or tenant DELETE was attempted"
-            exit 0
-          fi
-          if [ -z "${ADMIN_TOKEN:-}" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive: admin token unavailable (PR-mode/creds skip); no roster discovery or tenant DELETE was attempted"
-            exit 0
-          fi
-          if [ -z "${TEARDOWN_TAGS:-}" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive: TEARDOWN_TAGS unset; no roster discovery or tenant DELETE was attempted"
-            exit 0
-          fi
-          roster_rc=0
-          roster_json=$(e2e_cp_fetch_org_roster_json "$CP_BASE_URL" "$ADMIN_TOKEN") || roster_rc=$?
-          if [ "$roster_rc" != "0" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive (roster rc=$roster_rc); no tenant DELETE was attempted"
-            exit 0
-          fi
-          # Run+tag-scoped discovery: e2eSlug formats slugs as
-          # e2e-<tag>-<GITHUB_RUN_ID>-<uniq>, so match the DELIMITER-ANCHORED
-          # marker "-<tag>-<run_id>-" for ONLY the tag(s) THIS job creates
-          # (TEARDOWN_TAGS). Anchoring on both sides prevents (a) purging a
-          # sibling job's in-flight org — GITHUB_RUN_ID is shared by every job in
-          # the run and the Go jobs have no `needs:`, so they run in parallel —
-          # and (b) a bare-substring run-id collision (5679 matching 2605679 on a
-          # re-run). Emit slug<TAB>org_id so the purge helper receives the exact
-          # creation-returned org id it requires before it will issue DELETE.
-          filter_rc=0
-          pairs=$(printf '%s' "$roster_json" | python3 -c "
-          import json, sys, os
-          run_id = os.environ['GITHUB_RUN_ID']
-          tags = os.environ['TEARDOWN_TAGS'].split()
-          if not run_id or not tags:
-              raise SystemExit(0)
-          markers = tuple('-%s-%s-' % (t, run_id) for t in tags)
-          d = json.load(sys.stdin)
-          for o in d.get('orgs', []):
-              slug = o.get('slug', '')
-              org_id = o.get('id', '')
-              if any(m in slug for m in markers) and o.get('instance_status') not in ('purged',):
-                  print(slug + '\t' + str(org_id))
-          " 2>/dev/null) || filter_rc=$?
-          if [ "$filter_rc" != "0" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive (run-scope filter rc=$filter_rc); no tenant DELETE was attempted"
-            exit 0
-          fi
-          # Per-slug DELETE proves the exact completed purge receipt/audit and
-          # exact org absence via the shared helper. Advisory (never exit 1) so a
-          # transient CP blip can't red a gate — but there is NO automatic retry
-          # net behind it: the sweep-stale-e2e-orgs sweeper is workflow_dispatch-
-          # only (not scheduled), so a residual leak needs manual cleanup.
-          leaks=()
-          while IFS=$'\t' read -r slug org_id; do
-            [ -n "$slug" ] || continue
-            echo "Safety-net teardown: $slug"
-            purge_rc=0
-            e2e_cp_delete_and_verify_purge \
-              "$CP_BASE_URL" "$ADMIN_TOKEN" "$slug" "$org_id" || purge_rc=$?
-            if [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "purged" ]; then
-              echo "[teardown] verified exact CP purge receipt/audit and exact-tenant HTTP 404 for $slug"
-            elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
-              echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
-            else
-              echo "::warning::go-e2e teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — MANUAL cleanup required: the sweep-stale-e2e-orgs sweeper is dispatch-only (not scheduled) and will NOT auto-retry"
-              leaks+=("$slug")
-            fi
-          done <<< "$pairs"
-          if [ ${#leaks[@]} -gt 0 ]; then
-            echo "::warning::go-e2e teardown left ${#leaks[@]} leak(s) needing MANUAL cleanup (no scheduled sweeper): ${leaks[*]}"
-          fi
-          exit 0
-
-  # Drives tests/e2e/test_staging_concierge_creates_workspace_e2e.sh — the
-  # RFC docs/design/rfc-platform-agent.md §11.4 "Reach" check turned into a gate:
-  # send the org concierge a natural-language A2A message ("create a workspace
-  # named e2e-cncrg-worker-<runid> with role engineer") and assert the
-  # DETERMINISTIC SIDE EFFECT — that named workspace now EXISTS in GET /workspaces
-  # — which can only happen if the concierge's LLM really invoked the
-  # create_workspace platform-MCP tool (a real org mutation), NOT just that a REST
-  # API returned 200.
-  #
-  # GATING (no continue-on-error), but FALSE-GREEN-PROOF via E2E_REQUIRE_LIVE=1:
-  # this is a REAL-LLM, REAL-tool test, so it depends on the concierge being
-  # provisioned on the DEDICATED platform-agent image (Dockerfile.platform-agent,
-  # ships /opt/molecule-mcp-server — the ONLY image where create_workspace lights
-  # up; see platform_agent.go's SELF-HOST CAVEAT). A parallel agent is wiring that
-  # image into the staging provision path. The script SKIPs LOUD when the
-  # concierge is absent / not online / not on the platform-agent image — but with
-  # E2E_REQUIRE_LIVE=1 the harness converts that skip into a HARD FAIL (exit 5) so
-  # a silently-missing platform-agent image can NEVER false-green this gate. Runs
-  # on push-to-main / workflow_dispatch only (needs live staging infra +
-  # a model — never on PR, where pr-validate posts the workflow's PR status).
-  # (enforcement sequenced on molecules-server — the authoritative directive is
-  # the `bp-required: pending #3411` line directly above the job key; core#3081
-  # also adds the A2A-probe step in the test script: it reads the
-  # concierge's /configs/mcp_servers.yaml via GET /workspaces/:id/files/mcp_servers.yaml
-  # and asserts the molecule-platform MCP server is declared with create_workspace.
-  # The previous false-green slipped because the proxies were healthy, the
-  # concierge was online, and the platform-agent image was baked — but the
-  # mcp_servers.yaml overlay on the concierge's /configs did not name the
-  # platform server, so the LLM could not call the tool. Probing the overlay
-  # directly is the only way to fail fast before burning LLM budget on a
-  # 7-minute cold-concierge tool call that will never succeed.)
-  #
-  # core#3081 / CR2 #12653: NO `if:` guard on this job. The job IS the
-  # required status context (see .gitea/required-contexts.txt) — a required
-  # context that never fires on pull_request degrades the merge gate to a
-  # silent indefinite pending (the exact failure mode lint-required-no-paths
-  # exists to prevent; see feedback_path_filtered_workflow_cant_be_required).
-  # The job runs on every PR; E2E_REQUIRE_LIVE is 0 on PR (the script
-  # detects the missing-creds case and exit 0s with a self-check), 1 on
-  # push-to-main / dispatch (the real staging test runs and HARD
-  # FAILs on missing infra).
-  # bp-required: pending #3411 (molecules-server enforcement sequenced — kept below
-  # the ENFORCED marker in .gitea/required-contexts.txt until a green main run +
-  # creds-less PR/fork path, then BP-PATCH + promote).
+        run: bash tests/e2e/lib/go_e2e_run_teardown.sh
   e2e-staging-concierge-creates-workspace:
     name: E2E Staging Concierge Creates Workspace
     runs-on: ubuntu-latest
@@ -1626,7 +1504,7 @@ jobs:
             elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
               echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
             else
-              echo "::warning::concierge-mk teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              echo "::warning::concierge-mk teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — investigate now; sweep-stale-e2e-orgs retries on a later main push after its 90m age floor"
               leaks+=("$slug")
             fi
           done <<< "$orgs"
@@ -1816,9 +1694,9 @@ jobs:
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPlatformAgentMgmtMCP_Staging -count=1 -v -timeout 30m
       # Teardown: the tests install a t.Cleanup admin-DELETE of their own tenant
-      # (e2e-cncrg-* / e2e-mcp-* slug), running even on a t.Fatal. The age-guarded
-      # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
-      # net for a tenant orphaned by a hard runner cancel.
+      # (e2e-cncrg-* / e2e-mcp-* slug), running even on a t.Fatal. The automatic
+      # main-push sweep-stale-e2e-orgs workflow (90-minute age floor) is the
+      # final delayed net for a tenant orphaned by a hard runner cancel.
       #
       # Belt-and-braces always()-net: Go SKIPS t.Cleanup when `go test -timeout`
       # fires or the runner is SIGKILLed, so a timed-out/cancelled Go test leaks
@@ -1839,106 +1717,7 @@ jobs:
           # Scopes the run-id sweep to only this job's orgs so a parallel sibling
           # job's in-flight org is never purged.
           TEARDOWN_TAGS: "cncrg mcp"
-        run: |
-          set +e
-          source tests/e2e/lib/cp_purge_receipt.sh
-          if ! e2e_cp_require_local_backend \
-            || ! e2e_cp_require_staging_origin "$CP_BASE_URL"; then
-            echo "::warning::go-e2e teardown safety net rejected its staging target/backend before bearer use"
-            exit 0
-          fi
-          if [ -z "${GITHUB_RUN_ID:-}" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive: GITHUB_RUN_ID is empty; no roster discovery or tenant DELETE was attempted"
-            exit 0
-          fi
-          if [ -z "${ADMIN_TOKEN:-}" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive: admin token unavailable (PR-mode/creds skip); no roster discovery or tenant DELETE was attempted"
-            exit 0
-          fi
-          if [ -z "${TEARDOWN_TAGS:-}" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive: TEARDOWN_TAGS unset; no roster discovery or tenant DELETE was attempted"
-            exit 0
-          fi
-          roster_rc=0
-          roster_json=$(e2e_cp_fetch_org_roster_json "$CP_BASE_URL" "$ADMIN_TOKEN") || roster_rc=$?
-          if [ "$roster_rc" != "0" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive (roster rc=$roster_rc); no tenant DELETE was attempted"
-            exit 0
-          fi
-          # Run+tag-scoped discovery: e2eSlug formats slugs as
-          # e2e-<tag>-<GITHUB_RUN_ID>-<uniq>, so match the DELIMITER-ANCHORED
-          # marker "-<tag>-<run_id>-" for ONLY the tag(s) THIS job creates
-          # (TEARDOWN_TAGS). Anchoring on both sides prevents (a) purging a
-          # sibling job's in-flight org — GITHUB_RUN_ID is shared by every job in
-          # the run and the Go jobs have no `needs:`, so they run in parallel —
-          # and (b) a bare-substring run-id collision (5679 matching 2605679 on a
-          # re-run). Emit slug<TAB>org_id so the purge helper receives the exact
-          # creation-returned org id it requires before it will issue DELETE.
-          filter_rc=0
-          pairs=$(printf '%s' "$roster_json" | python3 -c "
-          import json, sys, os
-          run_id = os.environ['GITHUB_RUN_ID']
-          tags = os.environ['TEARDOWN_TAGS'].split()
-          if not run_id or not tags:
-              raise SystemExit(0)
-          markers = tuple('-%s-%s-' % (t, run_id) for t in tags)
-          d = json.load(sys.stdin)
-          for o in d.get('orgs', []):
-              slug = o.get('slug', '')
-              org_id = o.get('id', '')
-              if any(m in slug for m in markers) and o.get('instance_status') not in ('purged',):
-                  print(slug + '\t' + str(org_id))
-          " 2>/dev/null) || filter_rc=$?
-          if [ "$filter_rc" != "0" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive (run-scope filter rc=$filter_rc); no tenant DELETE was attempted"
-            exit 0
-          fi
-          # Per-slug DELETE proves the exact completed purge receipt/audit and
-          # exact org absence via the shared helper. Advisory (never exit 1) so a
-          # transient CP blip can't red a gate — but there is NO automatic retry
-          # net behind it: the sweep-stale-e2e-orgs sweeper is workflow_dispatch-
-          # only (not scheduled), so a residual leak needs manual cleanup.
-          leaks=()
-          while IFS=$'\t' read -r slug org_id; do
-            [ -n "$slug" ] || continue
-            echo "Safety-net teardown: $slug"
-            purge_rc=0
-            e2e_cp_delete_and_verify_purge \
-              "$CP_BASE_URL" "$ADMIN_TOKEN" "$slug" "$org_id" || purge_rc=$?
-            if [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "purged" ]; then
-              echo "[teardown] verified exact CP purge receipt/audit and exact-tenant HTTP 404 for $slug"
-            elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
-              echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
-            else
-              echo "::warning::go-e2e teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — MANUAL cleanup required: the sweep-stale-e2e-orgs sweeper is dispatch-only (not scheduled) and will NOT auto-retry"
-              leaks+=("$slug")
-            fi
-          done <<< "$pairs"
-          if [ ${#leaks[@]} -gt 0 ]; then
-            echo "::warning::go-e2e teardown left ${#leaks[@]} leak(s) needing MANUAL cleanup (no scheduled sweeper): ${leaks[*]}"
-          fi
-          exit 0
-
-  # Tenant plugin-install lifecycle guard (canvas Plugins tab regression class):
-  # boots a real staging workspace, asserts the registry is non-empty (the
-  # "no registry available" report), installs a registry plugin via
-  # POST /workspaces/:id/plugins, then asserts (a) GET /workspaces/:id/plugins
-  # returns it — guards the installed-plugin readback contract, (b) the workspace
-  # comes back online+routable and serves A2A after the install-triggered
-  # restart — guards the #159 mgmt-MCP self-heal online-gate. Drives
-  # TestPluginInstallLifecycle_Staging (workspace-server/internal/staginge2e).
-  #
-  # SIGNAL: fail-loud (no continue-on-error) on push/dispatch. A red marks this
-  # independent post-merge validation failed; it does not block staging-CD or
-  # production deployment. It is not presence-required by the merge queue, but
-  # an emitted red can still block under branch protection. To make its presence
-  # required, add
-  #   "E2E Staging SaaS (full lifecycle) / E2E Staging Plugin Install Lifecycle"
-  # to .gitea/required-contexts.txt AND to branch_protections/main
-  # status_check_contexts (owner action — same two-step the platform-boot
-  # lane documents above). Until then it runs + fails loud as an observed
-  # post-merge signal, exactly like e2e-staging-workspace-requests.
-  # bp-required: pending #3133
+        run: bash tests/e2e/lib/go_e2e_run_teardown.sh
   e2e-staging-plugin-lifecycle:
     name: E2E Staging Plugin Install Lifecycle
     runs-on: ubuntu-latest
@@ -2038,8 +1817,8 @@ jobs:
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 55m
       # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
-      # (e2e-plgn-* slug), running even on a t.Fatal. The age-guarded
-      # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
+      # (e2e-plgn-* slug), running even on a t.Fatal. The automatic main-push
+      # sweep-stale-e2e-orgs workflow (90-minute age floor) is the final delayed
       # net for a tenant orphaned by a hard runner cancel.
       #
       # Belt-and-braces always()-net: Go SKIPS t.Cleanup when `go test -timeout`
@@ -2059,82 +1838,4 @@ jobs:
           # e2eSlug("plgn")). Scopes the run-id sweep to only this job's org so a
           # parallel sibling job's in-flight org is never purged.
           TEARDOWN_TAGS: "plgn"
-        run: |
-          set +e
-          source tests/e2e/lib/cp_purge_receipt.sh
-          if ! e2e_cp_require_local_backend \
-            || ! e2e_cp_require_staging_origin "$CP_BASE_URL"; then
-            echo "::warning::go-e2e teardown safety net rejected its staging target/backend before bearer use"
-            exit 0
-          fi
-          if [ -z "${GITHUB_RUN_ID:-}" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive: GITHUB_RUN_ID is empty; no roster discovery or tenant DELETE was attempted"
-            exit 0
-          fi
-          if [ -z "${ADMIN_TOKEN:-}" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive: admin token unavailable (PR-mode/creds skip); no roster discovery or tenant DELETE was attempted"
-            exit 0
-          fi
-          if [ -z "${TEARDOWN_TAGS:-}" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive: TEARDOWN_TAGS unset; no roster discovery or tenant DELETE was attempted"
-            exit 0
-          fi
-          roster_rc=0
-          roster_json=$(e2e_cp_fetch_org_roster_json "$CP_BASE_URL" "$ADMIN_TOKEN") || roster_rc=$?
-          if [ "$roster_rc" != "0" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive (roster rc=$roster_rc); no tenant DELETE was attempted"
-            exit 0
-          fi
-          # Run+tag-scoped discovery: e2eSlug formats slugs as
-          # e2e-<tag>-<GITHUB_RUN_ID>-<uniq>, so match the DELIMITER-ANCHORED
-          # marker "-<tag>-<run_id>-" for ONLY the tag(s) THIS job creates
-          # (TEARDOWN_TAGS). Anchoring on both sides prevents (a) purging a
-          # sibling job's in-flight org — GITHUB_RUN_ID is shared by every job in
-          # the run and the Go jobs have no `needs:`, so they run in parallel —
-          # and (b) a bare-substring run-id collision (5679 matching 2605679 on a
-          # re-run). Emit slug<TAB>org_id so the purge helper receives the exact
-          # creation-returned org id it requires before it will issue DELETE.
-          filter_rc=0
-          pairs=$(printf '%s' "$roster_json" | python3 -c "
-          import json, sys, os
-          run_id = os.environ['GITHUB_RUN_ID']
-          tags = os.environ['TEARDOWN_TAGS'].split()
-          if not run_id or not tags:
-              raise SystemExit(0)
-          markers = tuple('-%s-%s-' % (t, run_id) for t in tags)
-          d = json.load(sys.stdin)
-          for o in d.get('orgs', []):
-              slug = o.get('slug', '')
-              org_id = o.get('id', '')
-              if any(m in slug for m in markers) and o.get('instance_status') not in ('purged',):
-                  print(slug + '\t' + str(org_id))
-          " 2>/dev/null) || filter_rc=$?
-          if [ "$filter_rc" != "0" ]; then
-            echo "::warning::go-e2e teardown discovery inconclusive (run-scope filter rc=$filter_rc); no tenant DELETE was attempted"
-            exit 0
-          fi
-          # Per-slug DELETE proves the exact completed purge receipt/audit and
-          # exact org absence via the shared helper. Advisory (never exit 1) so a
-          # transient CP blip can't red a gate — but there is NO automatic retry
-          # net behind it: the sweep-stale-e2e-orgs sweeper is workflow_dispatch-
-          # only (not scheduled), so a residual leak needs manual cleanup.
-          leaks=()
-          while IFS=$'\t' read -r slug org_id; do
-            [ -n "$slug" ] || continue
-            echo "Safety-net teardown: $slug"
-            purge_rc=0
-            e2e_cp_delete_and_verify_purge \
-              "$CP_BASE_URL" "$ADMIN_TOKEN" "$slug" "$org_id" || purge_rc=$?
-            if [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "purged" ]; then
-              echo "[teardown] verified exact CP purge receipt/audit and exact-tenant HTTP 404 for $slug"
-            elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
-              echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
-            else
-              echo "::warning::go-e2e teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — MANUAL cleanup required: the sweep-stale-e2e-orgs sweeper is dispatch-only (not scheduled) and will NOT auto-retry"
-              leaks+=("$slug")
-            fi
-          done <<< "$pairs"
-          if [ ${#leaks[@]} -gt 0 ]; then
-            echo "::warning::go-e2e teardown left ${#leaks[@]} leak(s) needing MANUAL cleanup (no scheduled sweeper): ${leaks[*]}"
-          fi
-          exit 0
+        run: bash tests/e2e/lib/go_e2e_run_teardown.sh

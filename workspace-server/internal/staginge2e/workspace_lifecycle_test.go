@@ -4,6 +4,8 @@ package staginge2e
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -473,13 +475,19 @@ func envOr(k, def string) string {
 // run-id-scoped always()-net on timeout/kill).
 //
 // On local runs GITHUB_RUN_ID is empty, so it falls back to the legacy
-// unix-timestamp form. The short nanosecond-derived suffix keeps slugs unique
-// within a single run (a job/test may create several orgs) while staying well
-// under the DNS-label / CP slug length limit.
+// unix-timestamp form. A short 24-bit random suffix keeps parallel/rerun slugs
+// collision-resistant while staying well under the DNS-label / CP slug limit.
 func e2eSlug(tag string) string {
-	uniq := time.Now().UnixNano() % 100000 // 5-digit intra-run uniquifier
 	if runID := strings.TrimSpace(os.Getenv("GITHUB_RUN_ID")); runID != "" {
-		return fmt.Sprintf("e2e-%s-%s-%05d", tag, runID, uniq)
+		var entropy [3]byte
+		if _, err := cryptorand.Read(entropy[:]); err == nil {
+			return fmt.Sprintf("e2e-%s-%s-%s", tag, runID, hex.EncodeToString(entropy[:]))
+		}
+		// A crypto/rand outage should not turn slug construction into a silent
+		// empty value. Preserve the exact six-hex contract with a clock fallback;
+		// the create endpoint still rejects any real collision.
+		fallback := uint64(time.Now().UnixNano()) & 0xffffff
+		return fmt.Sprintf("e2e-%s-%s-%06x", tag, runID, fallback)
 	}
 	return fmt.Sprintf("e2e-%s-%d", tag, time.Now().Unix()%100000000)
 }
