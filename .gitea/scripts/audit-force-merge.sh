@@ -21,7 +21,8 @@
 #
 # Required env (set by the workflow):
 #   GITEA_TOKEN, GITEA_HOST, REPO, PR_NUMBER
-#   REQUIRED_APPROVALS (defaults to 1)
+#   REVIEWER_SET and REQUIRED_APPROVALS are optional strict overrides; their
+#   checked-in defaults come from .gitea/scripts/_review_policy.py
 #   plus one of REQUIRED_CHECKS_JSON (preferred) or REQUIRED_CHECKS (legacy)
 #
 # REQUIRED_CHECKS_JSON is a JSON object keyed by branch name. Each value
@@ -50,14 +51,6 @@ if [ -z "${REQUIRED_CHECKS_JSON:-}" ] && [ -z "${REQUIRED_CHECKS:-}" ]; then
   echo "::error::Either REQUIRED_CHECKS_JSON or REQUIRED_CHECKS must be set"
   exit 1
 fi
-REQUIRED_APPROVALS="${REQUIRED_APPROVALS:-1}"
-case "$REQUIRED_APPROVALS" in
-  ''|*[!0-9]*|0)
-    echo "::error::REQUIRED_APPROVALS must be a positive integer"
-    exit 1
-    ;;
-esac
-
 OWNER="${REPO%%/*}"
 NAME="${REPO##*/}"
 API="https://${GITEA_HOST}/api/v1"
@@ -169,19 +162,28 @@ SORTED_REVIEWS_TMP=$(mktemp)
 jq 'sort_by(.id)' "$ALL_REVIEWS_TMP" > "$SORTED_REVIEWS_TMP"
 rm -f "$ALL_REVIEWS_TMP"
 GOVERNANCE_RESULT=$(PYTHONPATH="$_AUDIT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 - "$SORTED_REVIEWS_TMP" "$HEAD_SHA" "$PR_AUTHOR" "$REQUIRED_APPROVALS" <<'PY'
+  python3 - "$SORTED_REVIEWS_TMP" "$HEAD_SHA" "$PR_AUTHOR" <<'PY'
 import json
+import os
 import sys
 
 from _approval_validator import classify_reviews
+from _review_policy import recognized_reviewers, required_approvals
 
-path, head, author, required_raw = sys.argv[1:]
+path, head, author = sys.argv[1:]
 with open(path, encoding="utf-8") as handle:
     reviews = json.load(handle)
-approvers, request_changes = classify_reviews(reviews, headsha=head)
+try:
+    reviewer_set = recognized_reviewers(os.environ.get("REVIEWER_SET"))
+    required = required_approvals(os.environ.get("REQUIRED_APPROVALS"))
+except ValueError as exc:
+    print(f"::error::invalid shared review policy: {exc}", file=sys.stderr)
+    raise SystemExit(2) from exc
+approvers, request_changes = classify_reviews(
+    reviews, headsha=head, reviewer_set=reviewer_set
+)
 approvers = sorted(login for login in approvers if login != author)
 request_changes = sorted(set(request_changes))
-required = int(required_raw)
 violations = []
 if len(approvers) < required:
     violations.append(
@@ -192,6 +194,7 @@ if request_changes:
 print(json.dumps({
     "approvers": approvers,
     "request_changes": request_changes,
+    "recognized_reviewer_count": len(reviewer_set),
     "required_approvals": required,
     "violations": violations,
 }, separators=(",", ":")))
@@ -201,6 +204,7 @@ rm -f "$SORTED_REVIEWS_TMP"
 if ! jq -e '
     (.approvers | type == "array") and
     (.request_changes | type == "array") and
+    (.recognized_reviewer_count | type == "number") and
     (.required_approvals | type == "number") and
     (.violations | type == "array")
   ' <<<"$GOVERNANCE_RESULT" >/dev/null 2>&1; then

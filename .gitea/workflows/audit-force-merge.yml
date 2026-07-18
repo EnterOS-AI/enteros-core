@@ -59,8 +59,8 @@ jobs:
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          # Exact-head, official, non-author approvals required at merge time.
-          REQUIRED_APPROVALS: "1"
+          # Exact-head reviewer roster and approval floor come from the shared
+          # checked-in `_review_policy.py` consumed by both audit and queue.
           # Required-status-check contexts to evaluate at merge time.
           # Branch-aware JSON dict: keys are protected branch names,
           # values are arrays of context names that branch protection

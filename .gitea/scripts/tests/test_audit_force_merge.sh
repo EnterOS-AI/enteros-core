@@ -240,14 +240,14 @@ curl() {
         no_approval) body='[]' ;;
         self_approval)
           if [ "$page" = "1" ]; then
-            body=$(jq -nc --arg head "$HEAD_SHA" '[{id:1,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"pr-author"}}]')
+            body=$(jq -nc --arg head "$HEAD_SHA" '[{id:1,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"core-lead"}}]')
           else
             body='[]'
           fi
           ;;
         stale_approval)
           if [ "$page" = "1" ]; then
-            body=$(jq -nc --arg head "$HEAD_SHA" '[{id:1,state:"APPROVED",official:true,dismissed:false,stale:true,commit_id:$head,user:{login:"independent-reviewer"}}]')
+            body=$(jq -nc --arg head "$HEAD_SHA" '[{id:1,state:"APPROVED",official:true,dismissed:false,stale:true,commit_id:$head,user:{login:"core-lead"}}]')
           else
             body='[]'
           fi
@@ -255,9 +255,16 @@ curl() {
         request_changes)
           if [ "$page" = "1" ]; then
             body=$(jq -nc --arg head "$HEAD_SHA" '[
-              {id:1,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"independent-reviewer"}},
+              {id:1,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"core-lead"}},
               {id:2,state:"REQUEST_CHANGES",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"blocking-reviewer"}}
             ]')
+          else
+            body='[]'
+          fi
+          ;;
+        unrecognized_approval)
+          if [ "$page" = "1" ]; then
+            body=$(jq -nc --arg head "$HEAD_SHA" '[{id:1,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"outside-reviewer"}}]')
           else
             body='[]'
           fi
@@ -265,14 +272,14 @@ curl() {
         review_server_cap)
           case "$page" in
             1) body=$(jq -nc --arg head "$HEAD_SHA" '[range(1;51) | {id:.,state:"COMMENT",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:("noise-" + (.|tostring))}}]') ;;
-            2) body=$(jq -nc --arg head "$HEAD_SHA" '[{id:51,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"independent-reviewer"}}]') ;;
+            2) body=$(jq -nc --arg head "$HEAD_SHA" '[{id:51,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"core-lead"}}]') ;;
             *) body='[]' ;;
           esac
           ;;
         malformed_reviews) body='{"unexpected":"object"}' ;;
         *)
           case "$page" in
-            1) body=$(jq -nc --arg head "$HEAD_SHA" '[{id:1,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"independent-reviewer"}}]') ;;
+            1) body=$(jq -nc --arg head "$HEAD_SHA" '[{id:1,state:"APPROVED",official:true,dismissed:false,stale:false,commit_id:$head,user:{login:"core-lead"}}]') ;;
             *) body='[]' ;;
           esac
           ;;
@@ -297,6 +304,9 @@ curl() {
     *"/pulls/42")
       author="pr-author"
       merger="release-manager"
+      if [ "${MOCK_SCENARIO:-}" = "self_approval" ]; then
+        author="core-lead"
+      fi
       if [ "${MOCK_SCENARIO:-}" = "reserved_server_cap" ] || \
          [ "${MOCK_SCENARIO:-}" = "reserved_malformed" ] || \
          [ "${MOCK_SCENARIO:-}" = "reserved_control_filename" ]; then
@@ -355,7 +365,7 @@ curl() {
             body='[]'
           fi
           ;;
-        reserved_server_cap|reserved_malformed|reserved_control_filename|no_approval|self_approval|stale_approval|request_changes|review_server_cap|malformed_reviews)
+        reserved_server_cap|reserved_malformed|reserved_control_filename|no_approval|self_approval|stale_approval|request_changes|unrecognized_approval|review_server_cap|malformed_reviews)
           case "$page" in
             1) body='[{"id":1,"context":"CI / all-required (push)","status":"success"}]' ;;
             *) body='[]' ;;
@@ -514,6 +524,14 @@ run_audit malformed_reviews
 [ "$AUDIT_RC" = "1" ] || fail "T39: malformed review page must fail closed, rc=$AUDIT_RC output=$AUDIT_OUT"
 [[ "$AUDIT_OUT" == *'malformed review page'* ]] || fail "T39: malformed review diagnostic is not explicit"
 pass "T39: malformed review page fails closed"
+
+# T40 — the post-merge detector must use the same recognised-reviewer policy
+# as the preventive queue. An otherwise-valid approval from an account outside
+# that roster is not governance evidence.
+run_audit unrecognized_approval
+[ "$AUDIT_RC" = "1" ] || fail "T40: unrecognised reviewer must fail red, rc=$AUDIT_RC output=$AUDIT_OUT"
+[[ "$AUDIT_OUT" == *'genuine exact-head approvals=0/1'* ]] || fail "T40: unrecognised approval was counted"
+pass "T40: unrecognised approval does not satisfy governance"
 
 echo
 echo "ALL AUDIT-FORCE-MERGE CHECKS PASSED"
