@@ -951,20 +951,37 @@ func waitForTenantRoute(t *testing.T, host, path, token, orgID string, wantStrea
 		resp, err := client.Do(req)
 		if err == nil {
 			last = resp.StatusCode
-			resp.Body.Close()
+			// 401/403 are definitive auth failures, not a boot-window condition —
+			// fail fast instead of burning the whole deadline and mis-blaming the
+			// provisioner.
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				resp.Body.Close()
+				t.Fatalf("%s: %s returned HTTP %d — an AUTH failure (bad tenant token/org-id), not a readiness/half-wired issue", why, url, resp.StatusCode)
+			}
 			if resp.StatusCode == http.StatusOK {
-				streak++
-				if streak >= wantStreak {
-					return
+				// Reject a 200 whose body is the canvas SPA HTML fallback (route
+				// not registered yet): the assertion this gates needs JSON.
+				body := readBody(resp)
+				resp.Body.Close()
+				trimmed := strings.TrimSpace(body)
+				if len(trimmed) > 0 && trimmed[0] != '<' {
+					streak++
+					if streak >= wantStreak {
+						return
+					}
+					time.Sleep(3 * time.Second)
+					continue
 				}
+				streak = 0
 				time.Sleep(3 * time.Second)
 				continue
 			}
+			resp.Body.Close()
 		}
 		streak = 0
 		time.Sleep(3 * time.Second)
 	}
-	t.Fatalf("%s: %s never served a stable %dx200 within %s (last=%d) — persistent half-wired tenant (controlplane#1012), not a transient boot window", why, url, wantStreak, timeout, last)
+	t.Fatalf("%s: %s never served a stable %dx200 JSON within %s (last=%d) — persistent half-wired tenant (controlplane#1012), not a transient boot window", why, url, wantStreak, timeout, last)
 }
 
 // --- HTTP helpers ----------------------------------------------------------

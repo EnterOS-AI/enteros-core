@@ -202,6 +202,12 @@ e2e_cp_delete_and_verify_purge() {
   local ua="${MOLECULE_UA:-curl/8.4.0}"
   local poll_secs="${E2E_CP_PURGE_POLL_SECS:-60}"
   local poll_interval="${E2E_CP_PURGE_POLL_INTERVAL:-5}"
+  # Dedicated, independently-tunable budget for the 409 "active lifecycle
+  # operation" DELETE-retry phase. This is ADDITIVE to the audit-poll and
+  # absence-poll budgets (each poll_secs), so worst-case teardown ≈
+  # delete_retry_secs + 2*poll_secs; keep this modest so a slow lifecycle-drain
+  # cannot blow a job cleanup timeout. Observed drain in CI is ~30s.
+  local delete_retry_secs="${E2E_CP_PURGE_DELETE_RETRY_SECS:-60}"
   local tmpdir delete_body audit_body
   local delete_code audit_code purge_id receipt_org_id receipt_fields
   local audit_state audit_fields audit_purge_id predelete_org_id deadline
@@ -275,10 +281,11 @@ e2e_cp_delete_and_verify_purge() {
   # recovery is to wait for the lifecycle claim to free and re-issue the DELETE.
   # Without this, a teardown that lands while the org is still settling hard-
   # fails and LEAKS the tenant (the staging-provisioning-outage leak class). The
-  # retry is bounded by the shared purge-poll budget. Any OTHER non-200 is a hard
+  # retry is bounded by its OWN delete_retry_secs budget (additive to the later
+  # audit/absence polls — see the local declaration). Any OTHER non-200 is a hard
   # failure: it is not a self-resolving conflict, and retrying it would only mask
   # a real teardown defect.
-  delete_deadline=$(( $(date +%s) + poll_secs ))
+  delete_deadline=$(( $(date +%s) + delete_retry_secs ))
   while true; do
     delete_started_epoch=$(date +%s)
     if ! delete_code=$(curl -sS -A "$ua" --max-time 120 \
@@ -301,7 +308,7 @@ e2e_cp_delete_and_verify_purge() {
 
     if [ "$delete_code" = "409" ]; then
       if [ "$(date +%s)" -ge "$delete_deadline" ]; then
-        echo "[cp-purge] DELETE still 409 (active lifecycle operation) after ${poll_secs}s for slug=$slug" >&2
+        echo "[cp-purge] DELETE still 409 (active lifecycle operation) after ${delete_retry_secs}s for slug=$slug" >&2
         rm -rf "$tmpdir"
         return 4
       fi

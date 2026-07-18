@@ -44,23 +44,47 @@ wait_tenant_api_ready() {
     return 2
   fi
 
-  local start now elapsed code last="000" streak=0
+  local bodyfile
+  bodyfile=$(mktemp -t tenant-ready-XXXXXX) || return 2
+  local start now elapsed code last="000" streak=0 first
   start=$(date +%s)
   while true; do
     # `|| code=000`: a transport timeout / connection refused during app boot must
     # NOT abort the step under `bash -e` — it is a retryable not-ready signal.
-    code=$("$curl_bin" -sS -o /dev/null -w '%{http_code}' --max-time "$per_timeout" \
+    code=$("$curl_bin" -sS -o "$bodyfile" -w '%{http_code}' --max-time "$per_timeout" \
       -H "Authorization: Bearer $token" \
       -H "X-Molecule-Org-Id: $org_id" \
       -H "Origin: $turl" \
       "$turl$path" 2>/dev/null) || code="000"
     last="$code"
 
+    # 401/403 are DEFINITIVE auth failures (bad/expired tenant token or org-id),
+    # never a boot-window condition. Fail FAST with an auth-specific message
+    # instead of burning the whole deadline and mis-blaming the provisioner.
+    if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+      echo "::error::[tenant-ready] $label ($path) returned HTTP ${code} — an AUTH failure (bad/expired tenant token or org-id), NOT a readiness/half-wired issue." >&2
+      rm -f "$bodyfile"
+      return 1
+    fi
+
     if [ "$code" = "200" ]; then
-      streak=$((streak + 1))
-      if [ "$streak" -ge "$need_streak" ]; then
-        echo "[tenant-ready] $label serving (stable ${need_streak}x200 at $path)"
-        return 0
+      # A 200 whose body is the canvas SPA HTML fallback (gin NoRoute) means the
+      # proxied API route has NOT registered yet — up but half-wired. The
+      # assertions this gate protects reject '<'-leading bodies, so a 200-HTML is
+      # NOT ready: reset the streak and keep polling rather than false-passing.
+      first=$(head -c 256 "$bodyfile" 2>/dev/null | tr -d '[:space:]' | head -c 1)
+      if [ "$first" = "<" ]; then
+        if [ "$streak" -gt 0 ]; then
+          echo "::notice::[tenant-ready] $label streak reset (200 but SPA-HTML fallback at $path)"
+        fi
+        streak=0
+      else
+        streak=$((streak + 1))
+        if [ "$streak" -ge "$need_streak" ]; then
+          echo "[tenant-ready] $label serving (stable ${need_streak}x200 JSON at $path)"
+          rm -f "$bodyfile"
+          return 0
+        fi
       fi
     else
       # 502/503/000/404 = app still wiring up under load → reset streak, keep polling.
@@ -73,7 +97,8 @@ wait_tenant_api_ready() {
     now=$(date +%s)
     elapsed=$((now - start))
     if [ "$elapsed" -ge "$deadline_s" ]; then
-      echo "::error::[tenant-ready] $label ($path) never served a stable ${need_streak}x200 within ${deadline_s}s (last HTTP ${last}) — persistent half-wired tenant (controlplane#1012), not a transient boot window." >&2
+      echo "::error::[tenant-ready] $label ($path) never served a stable ${need_streak}x200 JSON within ${deadline_s}s (last HTTP ${last}) — persistent half-wired tenant (controlplane#1012), not a transient boot window." >&2
+      rm -f "$bodyfile"
       return 1
     fi
     sleep "$poll_s"

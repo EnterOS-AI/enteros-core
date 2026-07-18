@@ -46,7 +46,14 @@ on:
   # within 1800s → the required E2E lanes red-walled the core merge queue).
   # `push:[main]` is the sanctioned per-merge cadence under the ratchet: core
   # merges frequently, so the backstop now fires often enough to keep pace with
-  # the leak. MAX_AGE_MINUTES=30 keeps it from touching in-flight runs.
+  # the leak. MAX_AGE_MINUTES must stay ABOVE the longest legitimate E2E run so
+  # the now-automatic sweep can never reap a tenant that an OVERLAPPING run (from
+  # an earlier merge) is still using: the staging Go lanes run `go test
+  # -timeout 55m`, and the bash lanes add provisioning + a 15m /health wait + the
+  # readiness gate, so a live tenant can legitimately exist ~55m. 90m gives a
+  # comfortable margin above that ceiling. (Only the SIGKILL-on-cancel leak — a
+  # cancelled dind job whose teardown trap never fires, #117 — is what this
+  # backstop is for; #117 is the real source fix.)
   push:
     branches: [main]
   workflow_dispatch:
@@ -89,7 +96,7 @@ jobs:
       # Gitea Actions secret is left in place until a green run validates this
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates ADMIN_TOKEN is non-empty.
-      MAX_AGE_MINUTES: ${{ github.event.inputs.max_age_minutes || '30' }}
+      MAX_AGE_MINUTES: ${{ github.event.inputs.max_age_minutes || '90' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       # Refuse to delete more than this many orgs in one tick. If the
       # CP DB is briefly empty (or the admin endpoint goes weird and
@@ -112,10 +119,14 @@ jobs:
       # NEVER run on a pull_request, where a fork could exfiltrate the creds.
       - name: Fetch staging CP admin token from Infisical KMS
         id: kms_admin
+        # A push arm MUST re-assert the ref is main. The main-only restriction
+        # otherwise lives solely in on.push.branches:[main]; if a later edit ever
+        # broadens that filter, this guard would silently fetch INFISICAL_CI_* on
+        # the new refs. Keep the trusted-ref guarantee co-located with the fetch.
         if: >-
           github.event_name == 'schedule' ||
           github.event_name == 'workflow_dispatch' ||
-          github.event_name == 'push'
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}

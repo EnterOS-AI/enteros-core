@@ -291,6 +291,7 @@ run_case() {
     E2E_INFRA_BACKEND="$backend" \
     E2E_CP_PURGE_POLL_SECS="$poll_secs" \
     E2E_CP_PURGE_POLL_INTERVAL="$poll_interval" \
+    E2E_CP_PURGE_DELETE_RETRY_SECS="$poll_secs" \
     e2e_cp_delete_and_verify_purge \
       "$cp_url" "test-token" "$slug" "$expected_org_id"
 }

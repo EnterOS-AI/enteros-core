@@ -467,19 +467,30 @@ run_scenario() {
   # regardless (D1 flag default-off), so 10e gates only the NEW native
   # plugin-load path, not the digest itself.
   #
-  # E2E_SELF_SCHEDULE_CHECK defaults OFF (dark), unlike 10d/10e above. Step 10f
-  # deterministically drives the audience:self create_schedule TOOL via a docker-exec
-  # self-mode mcp-server (@molecule-ai/mcp-server 1.9.2) and asserts it lands on the
-  # OWN grid + fires (org-key/foreign-id neg controls). It has a JOINED precondition
-  # NOT YET verified on the moving :latest template: (1) the workspace-template must
-  # be republished from a runtime tree carrying runtime#328's self-audience injector
-  # (_inject_self_env), AND (2) that SAME template must prebake mcp-server 1.9.2 so
-  # `npx --prefer-offline` resolves offline in the no-network gate
-  # (scripts/prebake-mgmt-mcp.sh + platform_agent_identity.py
-  # PINNED_VERSION/COMPATIBLE_RANGE). Before flipping :-off} -> :-on}, verify BOTH via
-  # the packages API digest (same discipline the 10d/10e note above records) and
-  # confirm the schedule-self manifest audience:self is recognized by the injector on
-  # the shipped template. Keep this note ABOVE the env block (a `#` BETWEEN the
+  # E2E_SELF_SCHEDULE_CHECK defaults ON (10f), like 10d/10e above — it is a native
+  # plugin, gated by default. Step 10f deterministically drives the audience:self
+  # create_schedule TOOL via a docker-exec self-mode mcp-server
+  # (@molecule-ai/mcp-server 1.9.2) and asserts it lands on the OWN grid + fires
+  # (org-key/foreign-id neg controls). Its JOINED precondition was VERIFIED CLEARED
+  # on 2026-07-18: (1) @molecule-ai/mcp-server@1.9.2 is PUBLISHED to the Gitea npm
+  # registry (dist-tag latest=1.9.2) — before this the prebake `npm install ...@1.9.2`
+  # E404'd and froze every workspace-template (hermes stuck at runtime 0.4.25); (2)
+  # workspace-template-hermes:latest was republished from the runtime-0.4.29 tree,
+  # which carries runtime#328's self-audience injector (_inject_self_env) + #329
+  # hardening (force MOLECULE_WORKSPACE_TOKEN_FILE, inject WORKSPACE_ID) + #330's
+  # prebake of mcp-server 1.9.2 (scripts/prebake-mgmt-mcp.sh + platform_agent_identity.py
+  # PINNED_VERSION=1.9.2 / COMPATIBLE_RANGE=^1.8.0), so `npx --prefer-offline` resolves
+  # offline in the no-network gate. The injector fires on audience:self alone (the
+  # plugin's runtimes:[claude_code] is not consulted on the render path), so the self
+  # entry renders on the gate's default hermes template too.
+  #
+  # MOVING-:latest CAVEAT (no-flakes rule, same discipline as the 10d/10e note above):
+  # the gate re-resolves :latest every run — the verification pins the precondition to
+  # the runtime-0.4.29 hermes republish, NOT to whatever :latest points at tomorrow. If
+  # 10f reds in the future, FIRST check the packages API for a workspace-template-hermes
+  # publish built from a runtime tree OLDER than the one carrying #328/#329 + the 1.9.2
+  # prebake (a regressed/rolled-back template is the likely mechanism) before theorizing
+  # about core-side causes. Keep this note ABOVE the env block (a `#` BETWEEN the
   # backslash-continued lines below would sever the env prefix — see the 444-448 note).
   MOLECULE_CP_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_URL="${CP_BASE_URL}" \
@@ -499,7 +510,7 @@ run_scenario() {
   E2E_TRIGGER_POLL_SECONDS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
   E2E_DIGEST_PLUGIN_CHECK="${E2E_DIGEST_PLUGIN_CHECK:-on}" \
   E2E_DIGEST_PLUGIN_SOURCE="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}" \
-  E2E_SELF_SCHEDULE_CHECK="${E2E_SELF_SCHEDULE_CHECK:-off}" \
+  E2E_SELF_SCHEDULE_CHECK="${E2E_SELF_SCHEDULE_CHECK:-on}" \
   E2E_SELF_SCHEDULE_PLUGIN_SOURCE="${E2E_SELF_SCHEDULE_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-schedule-self#v0.1.2}" \
   E2E_SELF_SCHEDULE_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.2}" \
     bash "$HERE/test_staging_full_saas.sh"
