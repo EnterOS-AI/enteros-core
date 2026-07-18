@@ -628,6 +628,10 @@ jobs:
           # Docker preflight. Offline: proves missing Docker or an unreachable
           # daemon cannot silently skip E2E_IDLE_DIGEST_CHECK=on.
           bash tests/e2e/test_idle_digest_wait_unit.sh
+          # 10f self-schedule capability-cache race: a UUID create result plus
+          # an absent OWN grid is the only safe reinvocation signal. Offline
+          # behavior cases prove bounded retries and no duplicate volume create.
+          bash tests/e2e/test_self_schedule_create_retry_unit.sh
           # core#4425 finding #2: the extra-scenario gating in
           # ephemeral_cp_happy_path.sh must distinguish a MISCONFIG (unknown
           # scenario key / empty token list → reserved rc=97 → EXTRA_MISCONFIG)
