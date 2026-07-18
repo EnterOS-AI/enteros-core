@@ -1,3 +1,5 @@
+> ✅ IMPLEMENTED — local-build mode when `MOLECULE_IMAGE_REGISTRY` is unset (`workspace-server/internal/provisioner/localbuild.go` + `registry_mode.go`); ADR Accepted (archived 2026-07-18)
+
 # ADR-002: Local-build mode signalled by `MOLECULE_IMAGE_REGISTRY` presence
 
 * Status: Superseded (2026-06; retained as a historical decision record)
@@ -8,7 +10,7 @@
 > Railway, EC2, AWS ECR, operator-host, runtime-count, and production-topology
 > statements are historical, not current operating instructions. Current local
 > setup is manifest-backed and current deployment is domain-only CI-on-merge;
-> follow the [quick-start guide](../quickstart.md) and active workflows.
+> follow the [quick-start guide](../../quickstart.md) and active workflows.
 
 ## Context
 
