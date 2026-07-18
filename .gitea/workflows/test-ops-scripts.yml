@@ -48,6 +48,9 @@ on:
       # that line back down into the parked half — touches ONLY this file, so
       # without this path the guard would not run on the very diff it guards.
       - '.gitea/required-contexts.txt'
+      # The marketplace SSOT test guards this public stub as well as its own
+      # test file. A stub-only regression must therefore emit this gate.
+      - 'docs/design/rfc-marketplace-delivery.md'
       - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
       # Active staging guidance is linted by
       # test_deploy_comment_accuracy.py; changes to either harness must run it.
@@ -74,6 +77,9 @@ on:
       # that line back down into the parked half — touches ONLY this file, so
       # without this path the guard would not run on the very diff it guards.
       - '.gitea/required-contexts.txt'
+      # The marketplace SSOT test guards this public stub as well as its own
+      # test file. A stub-only regression must therefore emit this gate.
+      - 'docs/design/rfc-marketplace-delivery.md'
       - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
       # Active staging guidance is linted by
       # test_deploy_comment_accuracy.py; changes to either harness must run it.
