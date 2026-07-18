@@ -132,6 +132,11 @@ jobs:
           # by branch protection. It is sourced
           # from the Infisical SSOT by the fetch step above (exported to
           # $GITHUB_ENV as AUTO_SYNC_TOKEN -> hence env.* here).
+          # It intentionally has no write:issue capability. If a protected
+          # merge is refused and the optional hold label therefore cannot be
+          # persisted, the script exits non-success so the queue status itself
+          # is a durable fail-closed signal; it never reports an unheld refusal
+          # as green (internal#1082).
           GITEA_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
