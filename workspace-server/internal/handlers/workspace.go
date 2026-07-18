@@ -1431,8 +1431,8 @@ const workspaceListQuery = `
 func (h *WorkspaceHandler) List(c *gin.Context) {
 	rows, err := db.DB.QueryContext(c.Request.Context(), workspaceListQuery)
 	if err != nil {
-		log.Printf("List workspaces error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+		log.Printf("List workspaces: database query failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list workspaces"})
 		return
 	}
 	defer rows.Close()
@@ -1441,8 +1441,11 @@ func (h *WorkspaceHandler) List(c *gin.Context) {
 	for rows.Next() {
 		ws, err := scanWorkspaceRow(rows)
 		if err != nil {
-			log.Printf("List scan error: %v", err)
-			continue
+			// A partial roster is indistinguishable from a complete roster to
+			// callers, so a single unreadable row invalidates the whole result.
+			log.Printf("List workspaces: database row scan failed")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list workspaces"})
+			return
 		}
 		// #2054 phase 2: surface per-runtime provision-timeout for
 		// canvas's ProvisioningTimeout banner. Decorating per-row
@@ -1454,8 +1457,8 @@ func (h *WorkspaceHandler) List(c *gin.Context) {
 		workspaces = append(workspaces, ws)
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("List rows error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "query iteration failed"})
+		log.Printf("List workspaces: database row iteration failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list workspaces"})
 		return
 	}
 
