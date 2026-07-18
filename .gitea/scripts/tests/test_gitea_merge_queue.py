@@ -23,11 +23,17 @@ def _no_enforced_file_contexts_by_default(monkeypatch):
     integration tests below predate that feature and only set up
     branch-protection + governance statuses; left unpatched they would pick
     up the REAL repo file (whose entries aren't in their fixtures) and
-    correctly go `wait`. Default the loader to [] so the legacy BP-path tests
-    keep asserting the BP path; the dedicated SSOT-enforced tests pass
-    `enforced_file_contexts=` explicitly to evaluate_merge_readiness (and
-    call load_enforced_file_contexts on a tmp file), so they are unaffected."""
-    monkeypatch.setattr(mq, "load_enforced_file_contexts", lambda path: [])
+    correctly go `wait`. Default the loader to the single `CI / all-required`
+    aggregator sentinel — every repo's SSOT carries exactly this line, and the
+    critical-context guard now DERIVES its per-repo critical set from it
+    (critical_context_prefixes); a realistic baseline keeps the legacy BP-path
+    tests asserting the BP path while the step-0 critical guard sees the
+    sentinel their ready fixtures already post green. The dedicated
+    SSOT-enforced tests pass `enforced_file_contexts=` explicitly (and call
+    load_enforced_file_contexts on a tmp file), so they are unaffected."""
+    monkeypatch.setattr(
+        mq, "load_enforced_file_contexts", lambda path: ["CI / all-required"]
+    )
 
 
 def test_latest_statuses_dedupes_by_context_newest_first():
@@ -353,7 +359,12 @@ def test_wildcard_green_but_enforced_file_context_missing_waits():
     decision = mq.evaluate_merge_readiness(
         **_ready_kwargs(
             required_contexts=["*"],
-            enforced_file_contexts=["E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path"],
+            enforced_file_contexts=[
+                # Aggregator sentinel (posted green by the ready fixture) so the
+                # step-0 critical guard passes and we reach the step-4b check.
+                "CI / all-required",
+                "E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path",
+            ],
         )
     )
     assert decision.ready is False
@@ -485,31 +496,120 @@ def test_invalid_gitea_glob_fails_closed(pattern):
     assert bad == [f"{pattern}=invalid-glob"]
 
 
-def test_critical_contexts_block_failcloses_on_empty_prefix_set(monkeypatch):
-    # C: if CRITICAL_REQUIRED_CONTEXT_PREFIXES is misconfigured to empty, the
-    # step-0 backstop must BLOCK (not iterate nothing and pass vacuously).
-    monkeypatch.setattr(mq, "CRITICAL_REQUIRED_CONTEXT_PREFIXES", [])
+def test_critical_contexts_block_failcloses_on_empty_prefix_set():
+    # C: if the per-repo critical set resolves EMPTY (no env override AND the
+    # repo's SSOT carries no `<workflow> / all-required` aggregator sentinel to
+    # derive from), the step-0 backstop must BLOCK (not iterate nothing and pass
+    # vacuously).
     reasons = mq.critical_contexts_block(
         mq.latest_statuses_by_context([
             {"context": "CI / all-required (pull_request)", "status": "success"},
-        ])
+        ]),
+        [],
     )
     assert reasons, "empty critical set must fail-closed, not pass"
-    assert "empty set" in reasons[0]
+    assert "empty" in reasons[0]
 
 
-def test_critical_contexts_block_passes_when_prefixes_present_and_green(monkeypatch):
+def test_critical_contexts_block_passes_when_prefixes_present_and_green():
     # C negative control: a non-empty prefix set with all criticals green -> no
     # block (proves the empty-guard didn't just always-block).
-    monkeypatch.setattr(
-        mq, "CRITICAL_REQUIRED_CONTEXT_PREFIXES", ["CI / all-required"]
-    )
     reasons = mq.critical_contexts_block(
         mq.latest_statuses_by_context([
             {"context": "CI / all-required (pull_request)", "status": "success"},
-        ])
+        ]),
+        ["CI / all-required"],
     )
     assert reasons == []
+
+
+# --------------------------------------------------------------------------
+# ROOT-CAUSE regression lock: the critical-context set is PER-REPO SSOT-derived,
+# not a hardcoded molecule-core constant. The former hardcoded default
+# ("CI / Platform (Go),CI / all-required") phantom-blocked EVERY PR on any repo
+# whose emitted context names differ — molecule-controlplane emits LOWERCASE
+# `ci / all-required` and has no `Platform (Go)` job. A context that is
+# legitimately absent-on-this-repo is NOT a missing required check; a
+# genuinely-missing/skipped aggregator STILL blocks.
+# --------------------------------------------------------------------------
+
+
+def test_critical_context_prefixes_derived_per_repo_from_ssot():
+    # molecule-controlplane SSOT (lowercase `ci`, no Platform(Go)) → the
+    # lowercase aggregator sentinel is the derived critical context.
+    cp_enforced = [
+        "ci / all-required", "ci / build", "ci / integration",
+        "pr-ephemeral-cp-gate / pr-ephemeral-gate",
+    ]
+    assert mq.critical_context_prefixes(cp_enforced) == ["ci / all-required"]
+    # molecule-core SSOT (uppercase `CI`) → uppercase aggregator.
+    core_enforced = [
+        "CI / all-required", "E2E API Smoke Test / E2E API Smoke Test",
+        "Secret scan / Scan diff for credential-shaped strings",
+    ]
+    assert mq.critical_context_prefixes(core_enforced) == ["CI / all-required"]
+
+
+def test_critical_context_prefixes_rejects_malformed_bare_sentinel():
+    # The contract is a complete emitted context (`<workflow> / all-required`),
+    # not merely a matching final token. A typo in the SSOT must therefore
+    # resolve to an empty set and trigger the caller's fail-closed guard.
+    malformed = ["all-required", "CI/all-required", " / all-required"]
+    assert mq.critical_context_prefixes(malformed) == []
+
+
+def test_critical_context_prefixes_env_override_wins():
+    # An explicit env override is honored verbatim (a repo may still pin extra
+    # critical contexts), bypassing SSOT derivation.
+    import unittest.mock as _mock
+    with _mock.patch.object(
+        mq, "CRITICAL_REQUIRED_CONTEXT_PREFIXES",
+        ["CI / Platform (Go)", "CI / all-required"],
+    ):
+        assert mq.critical_context_prefixes(["ci / all-required"]) == [
+            "CI / Platform (Go)", "CI / all-required",
+        ]
+
+
+def test_controlplane_lowercase_all_green_is_NOT_phantom_blocked():
+    # THE BUG: controlplane posts lowercase `ci / all-required` (green) and has
+    # NO `CI / Platform (Go)` job. The former hardcoded core critical set
+    # demanded both → "CRITICAL required context(s) not green" on EVERY CP PR.
+    # SSOT-derived, the critical context is the repo's OWN `ci / all-required`,
+    # which is green → NO block. path-filtered/repo-inapplicable ⇒ not-required.
+    cp_enforced = ["ci / all-required", "ci / build", "ci / serving-e2e"]
+    latest = mq.latest_statuses_by_context([
+        {"context": "ci / all-required (pull_request)", "status": "success"},
+        {"context": "ci / build (pull_request)", "status": "success"},
+        {"context": "ci / serving-e2e (pull_request)", "status": "success"},
+    ])
+    prefixes = mq.critical_context_prefixes(cp_enforced)
+    assert prefixes == ["ci / all-required"]
+    assert mq.critical_contexts_block(latest, prefixes) == []
+
+
+def test_controlplane_genuinely_missing_aggregator_still_blocks():
+    # Negative control: if CP's OWN aggregator is genuinely NOT posted (the gate
+    # did not run), the guard STILL fail-closes — the fix does not weaken the
+    # #1676 protection, it only stops demanding contexts that are inapplicable.
+    cp_enforced = ["ci / all-required", "ci / build"]
+    latest = mq.latest_statuses_by_context([
+        {"context": "ci / build (pull_request)", "status": "success"},
+    ])
+    reasons = mq.critical_contexts_block(latest, mq.critical_context_prefixes(cp_enforced))
+    assert reasons
+    assert "ci / all-required=missing" in reasons[0]
+
+
+def test_controlplane_skipped_aggregator_still_blocks():
+    # A SKIPPED aggregator (the canonical #1676 shape) is FATAL on any repo.
+    cp_enforced = ["ci / all-required"]
+    latest = mq.latest_statuses_by_context([
+        {"context": "ci / all-required (pull_request)", "status": "skipped"},
+    ])
+    reasons = mq.critical_contexts_block(latest, mq.critical_context_prefixes(cp_enforced))
+    assert reasons
+    assert "skipped" in reasons[0]
 
 
 # Runtime-bump gate-adequacy under a wildcard BP set (B) lives with the other
@@ -578,6 +678,11 @@ def _ready_kwargs(**overrides):
         required_contexts=[
             "CI / all-required (pull_request)",
         ],
+        # The repo's SSOT aggregator sentinel — critical_context_prefixes()
+        # derives the step-0 critical set from this (the ready fixture posts
+        # `CI / all-required` green above). Every real required-contexts.txt
+        # carries this line.
+        enforced_file_contexts=["CI / all-required"],
         required_approvals=2,
         approvers={"agent-reviewer-cr2", "agent-researcher"},
         request_changes=[],
@@ -873,11 +978,17 @@ def _rca_1676_statuses():
 
 
 def test_critical_contexts_block_helper_flags_1676():
+    # The canonical #1676 shape is `all-required = skipped`: the aggregator
+    # sentinel did not actually run, so nothing gated the required jobs. The
+    # SSOT-derived critical set (the `CI / all-required` aggregator) flags the
+    # skip and BLOCKS — force cannot bypass it. (Platform(Go) is a sub-job the
+    # aggregator `needs:`; a green aggregator transitively proves it, so it is
+    # no longer enumerated as a separate hardcoded critical context.)
     latest = mq.latest_statuses_by_context(_rca_1676_statuses()["statuses"])
-    reasons = mq.critical_contexts_block(latest)
+    reasons = mq.critical_contexts_block(latest, ["CI / all-required"])
     joined = " ".join(reasons)
-    assert "CI / Platform (Go)" in joined
     assert "CI / all-required" in joined
+    assert "skipped" in joined
 
 
 def test_critical_guard_blocks_1676_former_force_regression():
@@ -912,19 +1023,23 @@ def test_critical_guard_blocks_skipped_all_required():
     assert "CI / all-required" in decision.reason
 
 
-def test_critical_guard_blocks_missing_platform_go():
+def test_critical_guard_blocks_missing_aggregator():
+    # The repo's own aggregator sentinel (SSOT-derived critical context) is
+    # ENTIRELY ABSENT from the posted statuses → cannot prove green → BLOCK.
+    # This is the genuinely-missing case the guard must still catch (as opposed
+    # to a context that is legitimately not applicable to the repo).
     statuses = {
         "state": "success",
         "statuses": [
-            {"context": "CI / all-required (pull_request)", "status": "success"},
-            # CI / Platform (Go) entirely absent → cannot prove green → BLOCK.
+            {"context": "some-other-lint / lint (pull_request)", "status": "success"},
+            # CI / all-required entirely absent → cannot prove green → BLOCK.
         ],
     }
     decision = mq.evaluate_merge_readiness(
         **_ready_kwargs(pr_status=statuses, required_contexts=[], mergeable=True)
     )
     assert decision.ready is False
-    assert "CI / Platform (Go)=missing" in decision.reason
+    assert "CI / all-required=missing" in decision.reason
 
 
 def test_critical_guard_allows_when_both_green():
@@ -4256,10 +4371,16 @@ def test_enforced_file_red_blocks_merge_not_forced_over():
         ],
     }
     decision = mq.evaluate_merge_readiness(
-        **_ready_kwargs(pr_status=pr_status),
-        enforced_file_contexts=[
-            "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace"
-        ],
+        **_ready_kwargs(
+            pr_status=pr_status,
+            # Realistic SSOT: the aggregator sentinel is always present (and
+            # green here) so the step-0 critical guard is satisfied and we reach
+            # the step-4b enforced-file check under test.
+            enforced_file_contexts=[
+                "CI / all-required",
+                "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace",
+            ],
+        ),
     )
     assert decision.ready is False
     assert decision.action == "wait"
@@ -4282,10 +4403,13 @@ def test_enforced_file_green_allows_merge():
         ],
     }
     decision = mq.evaluate_merge_readiness(
-        **_ready_kwargs(pr_status=pr_status),
-        enforced_file_contexts=[
-            "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace"
-        ],
+        **_ready_kwargs(
+            pr_status=pr_status,
+            enforced_file_contexts=[
+                "CI / all-required",
+                "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace",
+            ],
+        ),
     )
     assert decision.ready is True
     assert decision.action == "merge"
@@ -4317,8 +4441,7 @@ def test_parked_pending_context_does_not_block(tmp_path):
         ],
     }
     decision = mq.evaluate_merge_readiness(
-        **_ready_kwargs(pr_status=pr_status),
-        enforced_file_contexts=enforced,
+        **_ready_kwargs(pr_status=pr_status, enforced_file_contexts=enforced),
     )
     # Only "CI / all-required" is enforced from the file; it is green, and the
     # parked red is treated as a genuinely non-required advisory status. The
@@ -4450,16 +4573,16 @@ def test_process_once_live_recheck_red_required_aborts_merge(monkeypatch, capsys
 
 
 def test_process_once_live_recheck_red_critical_aborts_merge(monkeypatch, capsys):
-    """(a, variant) A CRITICAL context (CI / Platform (Go)) flipping red on the
-    live re-fetch also aborts — the critical guard is re-run live and force
-    cannot bypass it."""
+    """(a, variant) The CRITICAL context — the repo's `CI / all-required`
+    aggregator sentinel (SSOT-derived) — flipping red on the live re-fetch
+    aborts: the critical guard is re-run live and force cannot bypass it."""
     calls = {"merge_attempts": 0, "live_refetch_shas": [], "updated": False}
     head_sha = _live_recheck_process_once_monkeypatch(
         monkeypatch,
         live_pr_statuses=[
-            {"context": "CI / all-required (pull_request)", "status": "success"},
-            # CRITICAL context now RED on the live re-fetch.
-            {"context": "CI / Platform (Go) (pull_request)", "status": "failure"},
+            # CRITICAL aggregator sentinel now RED on the live re-fetch.
+            {"context": "CI / all-required (pull_request)", "status": "failure"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
             {"context": "qa-review / approved (pull_request_target)", "status": "success"},
             {"context": "security-review / approved (pull_request_target)", "status": "success"},
             {"context": "sop-checklist / all-items-acked (pull_request_target)", "status": "success"},
@@ -4474,7 +4597,7 @@ def test_process_once_live_recheck_red_critical_aborts_merge(monkeypatch, capsys
     assert calls["live_refetch_shas"] == [head_sha]
     out = capsys.readouterr().out
     assert "PR #333 SKIPPED: live pre-merge re-check" in out
-    assert "CI / Platform (Go)" in out
+    assert "CI / all-required" in out
 
 
 def test_process_once_live_recheck_green_merges_normally(monkeypatch, capsys):
@@ -4541,12 +4664,15 @@ def test_process_once_live_recheck_red_enforced_file_context_aborts_merge(monkey
         calls=calls,
     )
     # The SAME enforced set the decision used must be re-checked live. Override
-    # the autouse [] stub for THIS test so process_once sees a non-empty
-    # enforced set (event-stripped form, as the loader produces).
+    # the autouse stub for THIS test so process_once sees this enforced set
+    # (event-stripped form, as the loader produces). Includes the aggregator
+    # sentinel (always present in a real SSOT; green here) so the step-0 critical
+    # guard passes and the decision reaches the enforced-file check.
     monkeypatch.setattr(
         mq, "load_enforced_file_contexts",
         lambda path: [
-            "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace"
+            "CI / all-required",
+            "E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace",
         ],
     )
 
@@ -4625,7 +4751,7 @@ def test_live_premerge_status_regressions_helper(monkeypatch):
     regressions = mq.live_premerge_status_regressions(
         "a" * 40,
         required_contexts=["CI / all-required (pull_request)"],
-        enforced_file_contexts=[],
+        enforced_file_contexts=["CI / all-required"],
     )
     assert regressions == []
     assert seen["prefer_live"] is True  # snapshot genuinely bypassed
@@ -4640,7 +4766,7 @@ def test_live_premerge_status_regressions_helper(monkeypatch):
     regressions = mq.live_premerge_status_regressions(
         "a" * 40,
         required_contexts=["CI / all-required (pull_request)"],
-        enforced_file_contexts=[],
+        enforced_file_contexts=["CI / all-required"],
     )
     assert regressions  # non-empty → abort
     assert any("CI / all-required" in r for r in regressions)
