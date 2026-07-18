@@ -117,12 +117,28 @@ if [ -n "$PR_AUTHOR" ] && [ "$PR_AUTHOR" = "$MERGED_BY" ] \
     _rp_http=$(curl -sS -o "$_rp_tmp" -w '%{http_code}' -H "$AUTH" \
       "${API}/repos/${OWNER}/${NAME}/pulls/${PR_NUMBER}/files?limit=50&page=${_rp_page}")
     if [ "$_rp_http" != "200" ]; then rm -f "$_rp_tmp"; break; fi
+    if ! jq -e 'type == "array" and all(.[];
+      type == "object" and
+      (.filename | type == "string" and length > 0 and ((test("[\\t\\r\\n]")) | not))
+    )' \
+      < "$_rp_tmp" >/dev/null 2>&1; then
+      echo "::warning::GET /pulls/${PR_NUMBER}/files?page=${_rp_page} returned a malformed page; reserved-path detective scan is incomplete."
+      rm -f "$_rp_tmp"
+      break
+    fi
     _rp_n=$(jq 'length' < "$_rp_tmp")
-    while IFS= read -r _fn; do [ -n "$_fn" ] && _RP_FILES+=("$_fn"); done \
-      < <(jq -r '.[].filename' < "$_rp_tmp")
+    while IFS= read -r _fn; do
+      [ -n "$_fn" ] && _RP_FILES+=("$_fn")
+    done < <(jq -r '.[].filename' < "$_rp_tmp")
     rm -f "$_rp_tmp"
-    [ "${_rp_n:-0}" -lt 50 ] && break
-    _rp_page=$((_rp_page+1)); [ "$_rp_page" -gt 40 ] && break
+    # A short non-empty page is NOT an exhaustion proof: Gitea may clamp the
+    # requested limit below 50. Only an explicit empty page terminates.
+    [ "${_rp_n:-0}" -eq 0 ] && break
+    _rp_page=$((_rp_page+1))
+    if [ "$_rp_page" -gt 200 ]; then
+      echo "::warning::GET /pulls/${PR_NUMBER}/files exceeded 200 non-empty pages; reserved-path detective scan is incomplete."
+      break
+    fi
   done
   if [ "${#_RP_FILES[@]}" -gt 0 ] \
      && _RP_HITS=$(reserved_paths_match_any "$RESERVED_PATHS_FILE" "${_RP_FILES[@]}"); then
@@ -178,7 +194,7 @@ fi
 # required-context SUCCESS row is pushed PAST that cap, so reading the combined
 # view would record that context as `missing` and emit a FALSE-POSITIVE
 # force-merge. We instead page through the dedicated /commits/{sha}/statuses
-# list to EXHAUSTION (until a short/empty page), accumulating every row.
+# list to EXHAUSTION (until an explicit empty page), accumulating every row.
 #
 # Fail-closed is preserved end to end: any non-200 page, or a page whose body
 # is not a JSON array, aborts with exit 1 (we never treat an unreadable/partial
@@ -186,13 +202,16 @@ fi
 # so CHECK_STATE has no entry for it → `${...:-missing}` below keeps it
 # `missing` → it is still counted as not-green. No fail-open path is added.
 PER_PAGE=100
+MAX_STATUS_PAGES=200
 page=1
+LAST_STATUS_ID=0
+declare -A STATUS_IDS_SEEN=()
 ALL_STATUSES_TMP=$(mktemp)
 printf '[]' > "$ALL_STATUSES_TMP"   # accumulator: a single JSON array of rows
 while :; do
   STATUS_TMP=$(mktemp)
   STATUS_HTTP=$(curl -sS -o "$STATUS_TMP" -w '%{http_code}' -H "$AUTH" \
-    "${API}/repos/${OWNER}/${NAME}/commits/${HEAD_SHA}/statuses?page=${page}&limit=${PER_PAGE}")
+    "${API}/repos/${OWNER}/${NAME}/commits/${HEAD_SHA}/statuses?page=${page}&limit=${PER_PAGE}&sort=highestindex")
   PAGE_BODY=$(cat "$STATUS_TMP")
   rm -f "$STATUS_TMP"
   if [ "$STATUS_HTTP" != "200" ]; then
@@ -209,15 +228,54 @@ while :; do
     exit 1
   fi
   PAGE_COUNT=$(echo "$PAGE_BODY" | jq 'length')
+  # Only an explicit empty page proves exhaustion. Gitea silently clamps a
+  # requested limit=100 to its configured max (50), so every full server page
+  # otherwise looks "short" and page 2+ is lost.
+  if [ "$PAGE_COUNT" -eq 0 ]; then
+    break
+  fi
+  # Each row feeds an id-based newest-per-context decision below. Reject rows
+  # that cannot participate safely instead of letting jq coerce/misorder them.
+  if ! echo "$PAGE_BODY" | jq -e '
+    all(.[];
+      type == "object" and
+      ((.id | type) == "number") and (.id > 0) and (.id == (.id | floor)) and
+      ((.context | type) == "string") and (.context | length > 0) and
+      ((.context | test("[\\t\\r\\n]")) | not) and
+      ((.status | type) == "string") and (.status | length > 0) and
+      ((.status | test("[\\t\\r\\n]")) | not)
+    )' >/dev/null 2>&1; then
+    rm -f "$ALL_STATUSES_TMP"
+    echo "::error::GET /commits/${HEAD_SHA}/statuses?page=${page} returned a malformed status row — cannot evaluate required checks."
+    exit 1
+  fi
+  # `sort=highestindex` is oldest-to-newest by status id. A duplicate or
+  # non-increasing id means the cross-page snapshot is ambiguous; fail closed
+  # rather than risk accepting a partial history or emitting a false incident.
+  while IFS= read -r status_id; do
+    if [ -n "${STATUS_IDS_SEEN[$status_id]+x}" ]; then
+      rm -f "$ALL_STATUSES_TMP"
+      echo "::error::GET /commits/${HEAD_SHA}/statuses pagination returned duplicate status id ${status_id} — cannot evaluate required checks."
+      exit 1
+    fi
+    if [ "$status_id" -le "$LAST_STATUS_ID" ]; then
+      rm -f "$ALL_STATUSES_TMP"
+      echo "::error::GET /commits/${HEAD_SHA}/statuses pagination is not strictly increasing by id (${status_id} after ${LAST_STATUS_ID}) — cannot evaluate required checks."
+      exit 1
+    fi
+    STATUS_IDS_SEEN[$status_id]=1
+    LAST_STATUS_ID="$status_id"
+  done < <(echo "$PAGE_BODY" | jq -r '.[].id')
   # Append this page's rows to the accumulator (insertion order is preserved
   # but NOT relied upon — the collapse below selects max-by-id per context).
   COMBINED=$(jq -s '.[0] + .[1]' "$ALL_STATUSES_TMP" <(echo "$PAGE_BODY"))
   printf '%s' "$COMBINED" > "$ALL_STATUSES_TMP"
-  # Short page (fewer than PER_PAGE rows) ⇒ last page ⇒ stop.
-  if [ "$PAGE_COUNT" -lt "$PER_PAGE" ]; then
-    break
-  fi
   page=$((page + 1))
+  if [ "$page" -gt "$MAX_STATUS_PAGES" ]; then
+    rm -f "$ALL_STATUSES_TMP"
+    echo "::error::GET /commits/${HEAD_SHA}/statuses exceeded ${MAX_STATUS_PAGES} non-empty pages without an exhaustion proof — cannot evaluate required checks."
+    exit 1
+  fi
 done
 STATUS=$(cat "$ALL_STATUSES_TMP")
 rm -f "$ALL_STATUSES_TMP"
