@@ -126,6 +126,9 @@ source "$SCRIPT_DIR/_lib.sh"
 # shellcheck disable=SC1091
 # shellcheck source=lib/cp_purge_receipt.sh
 source "$SCRIPT_DIR/lib/cp_purge_receipt.sh"
+
+# shellcheck source=lib/tenant_api_ready.sh
+source "$SCRIPT_DIR/lib/tenant_api_ready.sh"
 e2e_cp_require_local_backend || exit 2
 # Real-completion error-as-text scanner — used to detect the concierge
 # surfacing its tool/LLM error AS a reply ("Agent error …") so a broken agent
@@ -646,6 +649,15 @@ while true; do
   sleep 5
 done
 ok "Tenant reachable at $TENANT_URL"
+
+# /health is allowlisted past the tenant guard, so it goes green while the app's
+# real proxied routes are still coming up (controlplane#1012). The CP publishes
+# instance_status=running on a /health-only canary, so 'running' can precede
+# 'app serving' by a few seconds under load. Gate on the ACTUAL API contract the
+# canvas assertions below depend on, to a stable streak, before asserting — a
+# genuinely half-wired tenant never stabilises and this fails loudly.
+wait_tenant_api_ready "$TENANT_URL" /workspaces "$TENANT_TOKEN" "$ORG_ID" "concierge-creates" \
+  || fail "Tenant proxied API (GET /workspaces) never became ready — half-wired tenant (controlplane#1012)"
 obs_step_end tenant_health pass "" "tenant_url=$TENANT_URL"
 
 # ─── 2. CANVAS WORKS — the tenant canvas/app + its PROXIED API actually resolve ─
