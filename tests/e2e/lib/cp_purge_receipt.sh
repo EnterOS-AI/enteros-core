@@ -205,7 +205,7 @@ e2e_cp_delete_and_verify_purge() {
   local tmpdir delete_body audit_body
   local delete_code audit_code purge_id receipt_org_id receipt_fields
   local audit_state audit_fields audit_purge_id predelete_org_id deadline
-  local delete_started_epoch
+  local delete_started_epoch delete_deadline
   local delete_response_lost=0
 
   E2E_CP_PURGE_RESULT=""
@@ -267,24 +267,49 @@ e2e_cp_delete_and_verify_purge() {
   tmpdir=$(mktemp -d -t cp-purge-verify-XXXXXX) || return 2
   delete_body="$tmpdir/delete.json"
   audit_body="$tmpdir/audit.json"
-  delete_started_epoch=$(date +%s)
+  # DELETE is synchronous. A 409 is the control plane's "organization has an
+  # active lifecycle operation" — claimOrgPurge could not claim the lifecycle
+  # parent row because the org's OWN in-flight workspace op (provision or
+  # deprovision) has not drained yet. It is transient and self-resolving: no
+  # purge audit row is created on 409 (nothing to poll), so the only correct
+  # recovery is to wait for the lifecycle claim to free and re-issue the DELETE.
+  # Without this, a teardown that lands while the org is still settling hard-
+  # fails and LEAKS the tenant (the staging-provisioning-outage leak class). The
+  # retry is bounded by the shared purge-poll budget. Any OTHER non-200 is a hard
+  # failure: it is not a self-resolving conflict, and retrying it would only mask
+  # a real teardown defect.
+  delete_deadline=$(( $(date +%s) + poll_secs ))
+  while true; do
+    delete_started_epoch=$(date +%s)
+    if ! delete_code=$(curl -sS -A "$ua" --max-time 120 \
+        -o "$delete_body" -w '%{http_code}' \
+        -X DELETE "$cp_url/cp/admin/tenants/$slug" \
+        -H "Authorization: Bearer $admin_token" \
+        -H "Content-Type: application/json" \
+        -d "{\"confirm\":\"$slug\"}"); then
+      # The synchronous handler may complete the purge and then lose its response
+      # while local-Docker detaches the tenant network. That is an ambiguous
+      # transport result, not proof of failure or success. Recover only if the CP
+      # subsequently exposes a completed audit for this exact creation-returned
+      # org ID and the exact tenant endpoint proves structured absence below.
+      delete_response_lost=1
+      purge_id=""
+      receipt_org_id="$predelete_org_id"
+      echo "[cp-purge] DELETE response was lost for slug=$slug; requiring exact completed purge audit plus exact-org absence" >&2
+      break
+    fi
 
-  if ! delete_code=$(curl -sS -A "$ua" --max-time 120 \
-      -o "$delete_body" -w '%{http_code}' \
-      -X DELETE "$cp_url/cp/admin/tenants/$slug" \
-      -H "Authorization: Bearer $admin_token" \
-      -H "Content-Type: application/json" \
-      -d "{\"confirm\":\"$slug\"}"); then
-    # The synchronous handler may complete the purge and then lose its response
-    # while local-Docker detaches the tenant network. That is an ambiguous
-    # transport result, not proof of failure or success. Recover only if the CP
-    # subsequently exposes a completed audit for this exact creation-returned
-    # org ID and the exact tenant endpoint proves structured absence below.
-    delete_response_lost=1
-    purge_id=""
-    receipt_org_id="$predelete_org_id"
-    echo "[cp-purge] DELETE response was lost for slug=$slug; requiring exact completed purge audit plus exact-org absence" >&2
-  else
+    if [ "$delete_code" = "409" ]; then
+      if [ "$(date +%s)" -ge "$delete_deadline" ]; then
+        echo "[cp-purge] DELETE still 409 (active lifecycle operation) after ${poll_secs}s for slug=$slug" >&2
+        rm -rf "$tmpdir"
+        return 4
+      fi
+      echo "[cp-purge] DELETE 409 (active lifecycle operation) for slug=$slug; lifecycle op still draining, retrying in ${poll_interval}s"
+      sleep "$poll_interval"
+      continue
+    fi
+
     if [ "$delete_code" != "200" ]; then
       echo "[cp-purge] DELETE returned HTTP $delete_code without a completed purge receipt for slug=$slug" >&2
       rm -rf "$tmpdir"
@@ -318,7 +343,8 @@ print(purge_id, org_id, sep="\t")
       return 4
     }
     IFS=$'\t' read -r purge_id receipt_org_id <<< "$receipt_fields"
-  fi
+    break
+  done
 
   deadline=$(( $(date +%s) + poll_secs ))
   while true; do
