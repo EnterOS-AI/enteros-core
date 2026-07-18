@@ -134,6 +134,35 @@ case "$url" in
         printf 'deleted\n' > "${FAKE_STATE_FILE:?}"
         exit 52
         ;;
+      delete-409-then-200)
+        # Transient "organization has an active lifecycle operation": the first
+        # DELETE conflicts (org still settling its own workspace op), the retry
+        # succeeds. Count prior DELETE calls in the log (this call is already
+        # appended) to decide which attempt this is.
+        dn=$(grep -c '^DELETE ' "${FAKE_CALL_LOG:?}" 2>/dev/null || printf 0)
+        if [ "${dn:-0}" -le 1 ]; then
+          printf '%s' '{"error":"organization has an active lifecycle operation"}' > "$out"
+          printf '409'
+        else
+          printf '%s' '{"deleted":true,"slug":"e2e-receipt-unit","org_id":"11111111-1111-4111-8111-111111111111","purge_id":"22222222-2222-4222-8222-222222222222"}' > "$out"
+          printf 'deleted\n' > "${FAKE_STATE_FILE:?}"
+          printf '200'
+        fi
+        exit 0
+        ;;
+      delete-409-persistent)
+        # Conflict never clears: the retry loop must give up at the deadline.
+        printf '%s' '{"error":"organization has an active lifecycle operation"}' > "$out"
+        printf '409'
+        exit 0
+        ;;
+      delete-500-persistent)
+        # Negative control: a 500 is NOT a self-resolving conflict. It must fail
+        # immediately without any retry (guards that only 409 is retried).
+        printf '%s' '{"error":"purge cascade failed; automatic retry scheduled"}' > "$out"
+        printf '500'
+        exit 0
+        ;;
       malformed-receipt) body='{"deleted":true,"slug":"e2e-receipt-unit"}' ;;
       receipt-org-mismatch) body='{"deleted":true,"slug":"e2e-receipt-unit","org_id":"33333333-3333-4333-8333-333333333333","purge_id":"22222222-2222-4222-8222-222222222222"}' ;;
       create-http-409|create-http-500)
@@ -338,6 +367,58 @@ assert_rc "mismatched purge audit org_id fails closed" 4 audit-org-mismatch
 assert_rc "exact org still present fails closed" 4 org-present
 assert_rc "malformed exact-tenant 200 is inconclusive" 4 malformed-identity
 assert_rc "exact-tenant endpoint error is inconclusive" 4 identity-error
+
+# ── transient 409 "active lifecycle operation" is retried until it clears ──
+# Reproduces run 539697: the org's own workspace lifecycle op had not drained
+# at teardown, so the synchronous DELETE returned 409. It is self-resolving —
+# a bounded retry must let it clear rather than hard-failing and leaking.
+retry_out=$(run_case delete-409-then-200 local-docker \
+  https://staging-api.moleculesai.app e2e-receipt-unit \
+  "$TMPDIR_TEST/retry-state" "$TMPDIR_TEST/retry-calls" 5 0 2>&1)
+retry_rc=$?
+retry_deletes=$(grep -c '^DELETE ' "$TMPDIR_TEST/retry-calls" 2>/dev/null || true)
+if [ "$retry_rc" = "0" ] \
+  && printf '%s' "$retry_out" | grep -q 'active lifecycle operation' \
+  && printf '%s' "$retry_out" | grep -q 'CP purge completed' \
+  && [ "${retry_deletes:-0}" -ge 2 ]; then
+  echo "PASS: transient 409 active-lifecycle DELETE is retried until it clears (attempts=$retry_deletes)"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: transient 409 retry (rc=$retry_rc deletes=$retry_deletes)" >&2
+  printf '%s\n' "$retry_out" | sed 's/^/  /' >&2
+  FAIL=$((FAIL + 1))
+fi
+
+# ── a 409 that never clears retries, then fails closed at the deadline ──
+persist_out=$(run_case delete-409-persistent local-docker \
+  https://staging-api.moleculesai.app e2e-receipt-unit \
+  "$TMPDIR_TEST/persist409-state" "$TMPDIR_TEST/persist409-calls" 1 1 2>&1)
+persist_rc=$?
+persist_deletes=$(grep -c '^DELETE ' "$TMPDIR_TEST/persist409-calls" 2>/dev/null || true)
+if [ "$persist_rc" = "4" ] && [ "${persist_deletes:-0}" -ge 2 ]; then
+  echo "PASS: persistent 409 retries then fails closed at the deadline (attempts=$persist_deletes)"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: persistent 409 fail-closed (rc=$persist_rc deletes=$persist_deletes; expected rc=4 deletes>=2)" >&2
+  printf '%s\n' "$persist_out" | sed 's/^/  /' >&2
+  FAIL=$((FAIL + 1))
+fi
+
+# ── NEGATIVE CONTROL: a non-409 (500) is NOT a self-resolving conflict — it
+#    must fail closed on the FIRST attempt, with NO retry, even with poll budget.
+noretry_out=$(run_case delete-500-persistent local-docker \
+  https://staging-api.moleculesai.app e2e-receipt-unit \
+  "$TMPDIR_TEST/noretry-state" "$TMPDIR_TEST/noretry-calls" 5 0 2>&1)
+noretry_rc=$?
+noretry_deletes=$(grep -c '^DELETE ' "$TMPDIR_TEST/noretry-calls" 2>/dev/null || true)
+if [ "$noretry_rc" = "4" ] && [ "${noretry_deletes:-0}" = "1" ]; then
+  echo "PASS: non-409 DELETE fails closed without retry (attempts=$noretry_deletes)"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: non-409 must not retry (rc=$noretry_rc deletes=$noretry_deletes; expected rc=4 deletes=1)" >&2
+  printf '%s\n' "$noretry_out" | sed 's/^/  /' >&2
+  FAIL=$((FAIL + 1))
+fi
 assert_rc "non-local backend is rejected" 2 success legacy-ec2
 
 collision_calls="$TMPDIR_TEST/collision-calls"
