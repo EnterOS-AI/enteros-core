@@ -180,6 +180,13 @@ jobs:
       - name: Run .gitea/scripts pytest suite
         run: python -m pytest .gitea/scripts/tests -q
 
+      - name: audit-force-merge pagination contract (network-free)
+        # This is a shell integration test, so pytest does not collect it.
+        # Its fake Gitea API reproduces the live server's limit=50 clamp and
+        # proves that status/file pagination continues to an explicit empty
+        # page while malformed or ambiguous status histories fail closed.
+        run: bash .gitea/scripts/tests/test_audit_force_merge.sh
+
       - name: all-required-check.sh fail-closed contract
         # Regression lock for molecule-core#656 / #2615. The CI / all-required
         # aggregation logic was extracted to .gitea/scripts/all-required-check.sh;
