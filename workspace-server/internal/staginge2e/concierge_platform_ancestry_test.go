@@ -73,6 +73,15 @@ func TestFirstChildOnPath(t *testing.T) {
 			descendant: "ordinary",
 		},
 		{
+			name: "cycle includes ancestor",
+			rows: []workspaceListRow{
+				{ID: "platform", ParentID: "ordinary"},
+				{ID: "ordinary", ParentID: "platform"},
+			},
+			ancestorID: "platform",
+			descendant: "ordinary",
+		},
+		{
 			name: "duplicate id",
 			rows: []workspaceListRow{
 				{ID: "platform"},

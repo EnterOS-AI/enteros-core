@@ -446,6 +446,7 @@ func firstChildOnPath(rows []workspaceListRow, ancestorID, descendantID string) 
 	}
 
 	current := descendantID
+	firstChild := ""
 	visited := make(map[string]struct{}, len(rows))
 	for {
 		if _, seen := visited[current]; seen {
@@ -454,11 +455,14 @@ func firstChildOnPath(rows []workspaceListRow, ancestorID, descendantID string) 
 		visited[current] = struct{}{}
 
 		parent, ok := parents[current]
-		if !ok || parent == "" {
+		if !ok {
 			return "", false
 		}
-		if parent == ancestorID {
-			return current, true
+		if parent == "" {
+			return firstChild, firstChild != ""
+		}
+		if parent == ancestorID && firstChild == "" {
+			firstChild = current
 		}
 		current = parent
 	}
