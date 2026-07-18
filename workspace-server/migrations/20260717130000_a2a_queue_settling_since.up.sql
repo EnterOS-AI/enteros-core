@@ -1,0 +1,13 @@
+-- settling_since: the instant an a2a_queue item first entered the NON-cap-burning
+-- transient (gateway-origin) retry path. The settling-retry ceiling
+-- (a2aSettlingRetryCeiling, a2a_queue.go) is measured from THIS timestamp, not
+-- from enqueued_at.
+--
+-- WHY (core#4459 re-review, CONFIRMED data-loss): the ceiling was measured from
+-- enqueued_at (total queue residence). A turn queued while its target was offline
+-- for >ceiling (e.g. a hibernated box) would, on the target's return, be
+-- TERMINALLY DROPPED on its very FIRST gateway-origin blip — because enqueued_at
+-- was already old — instead of getting the intended settling window. Measuring
+-- from settling_since gives every item the full window from its first settling
+-- failure, so a merely-long-queued-but-now-deliverable turn is never lost.
+ALTER TABLE a2a_queue ADD COLUMN IF NOT EXISTS settling_since timestamptz;

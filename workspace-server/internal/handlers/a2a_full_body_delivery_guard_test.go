@@ -77,13 +77,13 @@ func TestDequeueNext_PreservesFullBody_NoTruncation(t *testing.T) {
 	// is that DequeueNext propagates it untouched into item.Body.
 	mock.ExpectBegin()
 	mock.ExpectQuery(
-		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
+		"SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at, settling_since FROM a2a_queue WHERE workspace_id = $1 AND status = 'queued' AND (expires_at IS NULL OR expires_at > now()) AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY priority DESC, enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT 1").
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "workspace_id", "caller_id", "priority", "body", "method", "attempts", "enqueued_at",
+			"id", "workspace_id", "caller_id", "priority", "body", "method", "attempts", "enqueued_at", "settling_since",
 		}).AddRow(
 			itemID, wsID, sql.NullString{Valid: false}, PriorityTask,
-			fullBody, sql.NullString{String: "message/send", Valid: true}, 0, time.Now(),
+			fullBody, sql.NullString{String: "message/send", Valid: true}, 0, time.Now(), sql.NullTime{},
 		))
 	mock.ExpectExec(
 		"UPDATE a2a_queue SET status = 'dispatched', dispatched_at = now(), attempts = attempts + 1 WHERE id = $1").

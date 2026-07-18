@@ -80,6 +80,52 @@ func TestDrainStitch_TerminalizesTheLedgerNotJustActivityLogs(t *testing.T) {
 	}
 }
 
+// TestDropStitch_TerminalizesLedgerAndActivityLogsToFailed is the FAILURE twin of
+// the above, for the settling-ceiling drop path (core#4459 re-review [1]). When
+// the drain terminally drops a queued DELEGATION, its placeholder delegate_result
+// must move queued → failed AND the `delegations` ledger row must terminalize —
+// otherwise the caller's check_task_status hangs until the 6h sweeper deadline.
+func TestDropStitch_TerminalizesLedgerAndActivityLogsToFailed(t *testing.T) {
+	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
+	mock := drainMock(t, 1) // activity_logs delegate_result queued → failed (1 row)
+
+	// The ledger row must also move to a terminal 'failed' so the sweeper stops
+	// treating the abandoned delegation as in-flight.
+	mock.ExpectQuery(`SELECT status FROM delegations WHERE delegation_id = \$1`).
+		WithArgs("deleg-drop").
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("queued"))
+	mock.ExpectExec(`UPDATE delegations`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	h := &WorkspaceHandler{}
+	h.stitchDroppedDelegationFailure(context.Background(),
+		"caller-ws", "callee-ws", "deleg-drop", "target failed to settle; dropped")
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("a settling-ceiling-dropped delegation left its ledger/activity_logs row non-terminal — "+
+			"the caller's check_task_status hangs until the 6h sweeper deadline: %v", err)
+	}
+}
+
+// TestDropStitch_NoOpWhenNoQueuedPlaceholder pins the rows==0 guard: when the
+// dropped item is NOT a delegation with a live queued placeholder (activity_logs
+// UPDATE affects 0 rows), the stitch must NOT touch the ledger — no spurious
+// SELECT/UPDATE on `delegations`.
+func TestDropStitch_NoOpWhenNoQueuedPlaceholder(t *testing.T) {
+	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
+	mock := drainMock(t, 0) // activity_logs UPDATE matches 0 rows → not a live delegation
+	// NO delegations SELECT/UPDATE expected — if the guard is wrong and the ledger
+	// write fires, ExpectationsWereMet reports the unexpected query.
+
+	h := &WorkspaceHandler{}
+	h.stitchDroppedDelegationFailure(context.Background(),
+		"caller-ws", "callee-ws", "deleg-none", "dropped, but not a delegation")
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("drop-stitch touched the ledger despite no queued delegate_result placeholder: %v", err)
+	}
+}
+
 // TestLedgerTransitions_CoverEveryRealWriter pins allowedTransitions to the
 // paths that actually exist, so it cannot drift back into a presumed lifecycle.
 //

@@ -116,6 +116,10 @@ type QueuedItem struct {
 	Method      sql.NullString
 	Attempts    int
 	EnqueuedAt  time.Time
+	// SettlingSince is when this item first entered the transient gateway-origin
+	// retry path (NULL until then). The settling ceiling is measured from here,
+	// not EnqueuedAt — see a2aSettlingRetryCeiling.
+	SettlingSince sql.NullTime
 }
 
 // a2aSettlingRetryCeiling bounds the total wall-clock a single queued A2A turn
@@ -286,7 +290,7 @@ func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 	var item QueuedItem
 	var body string
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at
+		SELECT id, workspace_id, caller_id, priority, body::text, method, attempts, enqueued_at, settling_since
 		FROM a2a_queue
 		WHERE workspace_id = $1 AND status = 'queued'
 		  AND (expires_at IS NULL OR expires_at > now())
@@ -296,7 +300,7 @@ func DequeueNext(ctx context.Context, workspaceID string) (*QueuedItem, error) {
 		LIMIT 1
 	`, workspaceID).Scan(
 		&item.ID, &item.WorkspaceID, &item.CallerID, &item.Priority,
-		&body, &item.Method, &item.Attempts, &item.EnqueuedAt,
+		&body, &item.Method, &item.Attempts, &item.EnqueuedAt, &item.SettlingSince,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -398,7 +402,8 @@ func MarkQueueItemTransientRetry(ctx context.Context, id, errMsg string) {
 		    attempts = GREATEST(attempts - 1, 0),
 		    last_error = $2,
 		    dispatched_at = NULL,
-		    next_attempt_at = now() + make_interval(secs => $3)
+		    next_attempt_at = now() + make_interval(secs => $3),
+		    settling_since = COALESCE(settling_since, now())
 		WHERE id = $1
 	`, id, errMsg, transientRetryBackoffSecs); err != nil {
 		log.Printf("A2AQueue: failed to mark %s for transient retry: %v", id, err)
@@ -583,11 +588,28 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 				// re-queue FOREVER, poking the runtime on every attempt and starving
 				// idle-gated work (task #124/#94). Bound it: past
 				// a2aSettlingRetryCeiling, stop treating it as transient and DROP it.
-				settlingFor := time.Since(item.EnqueuedAt)
-				if settlingFor >= a2aSettlingRetryCeiling {
-					dropMsg := fmt.Sprintf("target failed to settle within %s of enqueue (persistent gateway-origin failure, last status=%d classification=%s: %s); dropped to stop a zombie re-queue that starves the workspace (core#124)",
+				// Measure the settling window from settling_since (the FIRST
+				// gateway-origin failure), NOT enqueued_at. A turn that merely sat
+				// queued a long time (target offline) whose settling_since is still
+				// NULL falls through to the transient retry below — which STAMPS
+				// settling_since — so it is never dropped on its first blip; only a
+				// SUSTAINED settling past the ceiling drops (core#4459 re-review [0]).
+				if item.SettlingSince.Valid && time.Since(item.SettlingSince.Time) >= a2aSettlingRetryCeiling {
+					settlingFor := time.Since(item.SettlingSince.Time)
+					dropMsg := fmt.Sprintf("target failed to settle within %s of the first gateway-origin failure (persistent, last status=%d classification=%s: %s); dropped to stop a zombie re-queue that starves the workspace (core#124)",
 						a2aSettlingRetryCeiling, proxyErr.Status, classificationOrUnknown(classification), errMsg)
 					DropQueueItemTerminal(ctx, item.ID, dropMsg)
+					// The stale/dead cached URL is what caused the drop — invalidate it
+					// so the REMAINING queued items of this workspace in this same drain
+					// re-resolve instead of all hammering the same dead URL (re-review [3]).
+					h.invalidateCachedURLForDrain(ctx, workspaceID)
+					// If this was a DELEGATION, terminalize its delegate_result to
+					// 'failed' NOW so the caller's check_task_status is unblocked
+					// immediately, instead of hanging until the 6h delegation-sweeper
+					// deadline (re-review [1]).
+					if delegationID := extractDelegationIDFromBody(item.Body); delegationID != "" {
+						h.stitchDroppedDelegationFailure(ctx, callerID, item.WorkspaceID, delegationID, dropMsg)
+					}
 					log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s SETTLING CEILING EXCEEDED "+
 						"(settling_for=%s ceiling=%s status=%d classification=%s) — dropped to stop zombie re-queue",
 						item.ID, workspaceID, resolvedURL, settlingFor.Truncate(time.Second), a2aSettlingRetryCeiling,
@@ -598,10 +620,14 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 				MarkQueueItemTransientRetry(ctx, item.ID,
 					fmt.Sprintf("transient gateway origin (%s, status=%d): %s",
 						classificationOrUnknown(classification), proxyErr.Status, errMsg))
+				settledFor := time.Duration(0)
+				if item.SettlingSince.Valid {
+					settledFor = time.Since(item.SettlingSince.Time)
+				}
 				log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s transient gateway failure "+
 					"(status=%d classification=%s) — re-queued without burning attempt cap (attempts preserved at %d, settling_for=%s/%s)",
 					item.ID, workspaceID, resolvedURL, proxyErr.Status, classificationOrUnknown(classification), item.Attempts,
-					settlingFor.Truncate(time.Second), a2aSettlingRetryCeiling)
+					settledFor.Truncate(time.Second), a2aSettlingRetryCeiling)
 				continue
 			}
 
@@ -768,6 +794,75 @@ func (h *WorkspaceHandler) stitchDrainResponseToDelegation(ctx context.Context, 
 			"target_id":        targetID,
 			"response_preview": textutil.TruncateBytes(responseText, 200),
 			"via":              "queue_drain",
+		})
+	}
+}
+
+// stitchDroppedDelegationFailure is the FAILURE twin of
+// stitchDrainResponseToDelegation, for the settling-ceiling drop path. When the
+// drain terminally drops a queued item that was a DELEGATION, the caller's
+// delegate_result placeholder (status='queued', written by executeDelegation)
+// would otherwise sit until the 6h delegation-sweeper deadline — the caller's
+// check_task_status reports the work still in-flight for hours after the platform
+// abandoned it (core#4459 re-review [1]). This closes "queued → failed" the same
+// way the success path closes "queued → completed": it flips the placeholder,
+// terminalizes the ledger, and (single-reply-authority) notifies the caller.
+//
+// Best-effort / idempotent by the same rules as the success stitch: the
+// AND status='queued' guard pins the write to the placeholder (so a race with the
+// sweeper's own terminal row is not clobbered) and makes a replayed drop a no-op.
+func (h *WorkspaceHandler) stitchDroppedDelegationFailure(ctx context.Context, sourceID, targetID, delegationID, reason string) {
+	if sourceID == "" || delegationID == "" {
+		return
+	}
+	errJSON, marshalErr := json.Marshal(map[string]interface{}{
+		"text":          reason,
+		"delegation_id": delegationID,
+	})
+	if marshalErr != nil {
+		log.Printf("a2aQueue drop-stitch %s: json.Marshal failed: %v", delegationID, marshalErr)
+		return
+	}
+	res, err := db.DB.ExecContext(ctx, `
+		UPDATE activity_logs
+		   SET status        = 'failed',
+		       summary       = $1,
+		       error_detail  = $2,
+		       response_body = $3::jsonb
+		 WHERE workspace_id   = $4
+		   AND activity_type  = 'delegation'
+		   AND method         = 'delegate_result'
+		   AND target_id      = $5
+		   AND response_body->>'delegation_id' = $6
+		   AND status         = 'queued'
+	`, "Delegation failed ("+textutil.TruncateBytes(reason, 80)+")", reason, string(errJSON),
+		sourceID, targetID, delegationID)
+	if err != nil {
+		log.Printf("A2AQueue drain drop-stitch: update failed for delegation %s: %v", delegationID, err)
+		return
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		log.Printf("A2AQueue drain drop-stitch: RowsAffected error for delegation %s: %v", delegationID, err)
+		return
+	}
+	if rows == 0 {
+		// Not a delegation with a live placeholder (or already terminalized) —
+		// nothing to fail. No ledger/inbox side effects.
+		log.Printf("A2AQueue drain drop-stitch: no queued delegate_result row for delegation %s", delegationID)
+		return
+	}
+	authority := recordLedgerStatus(ctx, delegationID, "failed", reason, "")
+	log.Printf("A2AQueue drain drop-stitch: delegation %s queued → failed (settling-ceiling drop)", delegationID)
+	if mayReply(authority) {
+		pushDelegationResultToInbox(ctx, sourceID, targetID, delegationID, "failed", "", reason)
+	}
+	if h.broadcaster != nil {
+		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationFailed), sourceID, map[string]interface{}{
+			"delegation_id": delegationID,
+			"target_id":     targetID,
+			"error":         textutil.TruncateBytes(reason, 200),
+			"via":           "queue_drain_drop",
 		})
 	}
 }
