@@ -552,6 +552,11 @@ jobs:
           # 200-but-SPA-HTML is NOT ready, and transient-503 recovery. Offline
           # mocked-curl; fail-direction negative-controlled.
           bash tests/e2e/lib/test_tenant_api_ready_unit.sh
+          # tenant-topology derivation (#86 ephemeral-gate ports): staging default
+          # (unset ⇒ exact staging), ephemeral slug-routing headers, derived CORS
+          # origin, origin-template override, prod/staging domain derivation, and
+          # the un-derivable-origin fail-closed. Pure logic, negative-controlled.
+          bash tests/e2e/lib/test_tenant_topology_unit.sh
           # molecule-core#1995 (#1994 follow-on): fail-direction proof for
           # the A2A real-completion + byok-routing assertion helpers
           # (lib/completion_assert.sh). Offline (no LLM, no network): it
