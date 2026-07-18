@@ -2,10 +2,9 @@
 
 > **The full RFC moved to the private internal repository on 2026-07-18.**
 >
-> The canonical document is the private
-> [`internal/rfcs/marketplace-delivery.md`](https://git.moleculesai.app/molecule-ai/internal/src/branch/main/rfcs/marketplace-delivery.md)
-> record. The source-to-stub migration is tracked by
-> [`internal#1075`](https://git.moleculesai.app/molecule-ai/internal/issues/1075).
+> The canonical document is
+> **`Molecule-AI/internal/rfcs/marketplace-delivery.md`** (private). The
+> source-to-stub migration is tracked by **`internal#1081`**.
 >
 > Why moved: the RFC contains unshipped marketplace strategy, entitlement and
 > encryption design, and historical account-specific rollout material. Core's
