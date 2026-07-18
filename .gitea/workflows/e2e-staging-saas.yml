@@ -1173,6 +1173,11 @@ jobs:
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates CP_ADMIN_API_TOKEN is non-empty.
       STAGING_E2E: '1'
+      # E2E_INFRA_BACKEND pins the purge helper (tests/e2e/lib/cp_purge_receipt.sh)
+      # to the live local-docker staging backend, mirroring the shell jobs. The
+      # Go test itself reads E2E_PROVIDER, not this; it is consumed only by the
+      # `if: always()` teardown safety net below (its origin/backend guards).
+      E2E_INFRA_BACKEND: local-docker
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -1242,6 +1247,91 @@ jobs:
       - name: Run workspace-requests staginge2e (core#2606)
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceCanRaiseTaskAndApprovalToUser -count=1 -v -timeout 30m
+      # Belt-and-braces teardown: the Go test installs a t.Cleanup admin-DELETE
+      # of its own tenant, but Go SKIPS t.Cleanup when `go test -timeout` fires
+      # or the runner is SIGKILLed — so a timed-out/cancelled Go test leaks its
+      # org. Unlike the shell jobs, a Go test cannot publish its exact
+      # E2E_CREATED_SLUG/ORG_ID to $GITHUB_ENV, so this net discovers leaks by
+      # the GITHUB_RUN_ID that e2eSlug embeds (e2e-<tag>-<run_id>-<uniq>): it
+      # enumerates the CP admin roster, selects rows whose slug carries THIS
+      # run's id, then hands each (slug, roster org_id) pair to the SAME
+      # identity-bound purge helper the shell jobs use (cp_purge_receipt.sh) — no
+      # new auth path. Idempotent with t.Cleanup; on the happy path the org is
+      # already gone, so the roster filter is empty and this is a fast no-op.
+      - name: Teardown safety net (runs on timeout/cancel/failure)
+        # PR-mode: never curl live staging from a PR (no token; public repo).
+        if: always() && github.event_name != 'pull_request'
+        env:
+          # Sourced from Infisical (staging /shared/controlplane-admin) via the
+          # "Fetch staging CP admin token from Infisical KMS" step above.
+          ADMIN_TOKEN: ${{ env.CP_ADMIN_API_TOKEN }}
+        run: |
+          set +e
+          source tests/e2e/lib/cp_purge_receipt.sh
+          if ! e2e_cp_require_local_backend \
+            || ! e2e_cp_require_staging_origin "$CP_BASE_URL"; then
+            echo "::warning::go-e2e teardown safety net rejected its staging target/backend before bearer use"
+            exit 0
+          fi
+          if [ -z "${GITHUB_RUN_ID:-}" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive: GITHUB_RUN_ID is empty; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          if [ -z "${ADMIN_TOKEN:-}" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive: admin token unavailable (PR-mode/creds skip); no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          roster_rc=0
+          roster_json=$(e2e_cp_fetch_org_roster_json "$CP_BASE_URL" "$ADMIN_TOKEN") || roster_rc=$?
+          if [ "$roster_rc" != "0" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive (roster rc=$roster_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          # Run-scoped discovery: e2eSlug embeds the full GITHUB_RUN_ID, so a
+          # substring match uniquely scopes the sweep to THIS run's leaked orgs —
+          # never a parallel run's or a dev's manual staging probe. Emit each
+          # candidate as slug<TAB>org_id so the purge helper receives the exact
+          # creation-returned org id it requires before it will issue DELETE.
+          filter_rc=0
+          pairs=$(printf '%s' "$roster_json" | python3 -c "
+          import json, sys, os
+          run_id = os.environ['GITHUB_RUN_ID']
+          if not run_id:
+              raise ValueError('empty run id')
+          d = json.load(sys.stdin)
+          for o in d.get('orgs', []):
+              slug = o.get('slug', '')
+              org_id = o.get('id', '')
+              if run_id in slug and o.get('instance_status') not in ('purged',):
+                  print(slug + '\t' + str(org_id))
+          " 2>/dev/null) || filter_rc=$?
+          if [ "$filter_rc" != "0" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive (run-scope filter rc=$filter_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          # Per-slug DELETE proves the exact completed purge receipt/audit and
+          # exact org absence via the shared helper. Advisory (never exit 1);
+          # sweep-stale-e2e-orgs is the age-guarded final retry net.
+          leaks=()
+          while IFS=$'\t' read -r slug org_id; do
+            [ -n "$slug" ] || continue
+            echo "Safety-net teardown: $slug"
+            purge_rc=0
+            e2e_cp_delete_and_verify_purge \
+              "$CP_BASE_URL" "$ADMIN_TOKEN" "$slug" "$org_id" || purge_rc=$?
+            if [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "purged" ]; then
+              echo "[teardown] verified exact CP purge receipt/audit and exact-tenant HTTP 404 for $slug"
+            elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
+              echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
+            else
+              echo "::warning::go-e2e teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              leaks+=("$slug")
+            fi
+          done <<< "$pairs"
+          if [ ${#leaks[@]} -gt 0 ]; then
+            echo "::warning::go-e2e teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
+          fi
+          exit 0
 
   # Drives tests/e2e/test_staging_concierge_creates_workspace_e2e.sh — the
   # RFC docs/design/rfc-platform-agent.md §11.4 "Reach" check turned into a gate:
@@ -1618,6 +1708,11 @@ jobs:
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates CP_ADMIN_API_TOKEN is non-empty.
       STAGING_E2E: '1'
+      # E2E_INFRA_BACKEND pins the purge helper (tests/e2e/lib/cp_purge_receipt.sh)
+      # to the live local-docker staging backend, mirroring the shell jobs. The
+      # Go test itself reads E2E_PROVIDER, not this; it is consumed only by the
+      # `if: always()` teardown safety net below (its origin/backend guards).
+      E2E_INFRA_BACKEND: local-docker
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -1704,10 +1799,92 @@ jobs:
       - name: Run fresh-org platform-agent mgmt-MCP staginge2e
         working-directory: workspace-server
         run: go test -tags staging_e2e ./internal/staginge2e/ -run TestPlatformAgentMgmtMCP_Staging -count=1 -v -timeout 30m
-      # Teardown: the test installs a t.Cleanup admin-DELETE of its own tenant
+      # Teardown: the tests install a t.Cleanup admin-DELETE of their own tenant
       # (e2e-cncrg-* / e2e-mcp-* slug), running even on a t.Fatal. The age-guarded
       # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
       # net for a tenant orphaned by a hard runner cancel.
+      #
+      # Belt-and-braces always()-net: Go SKIPS t.Cleanup when `go test -timeout`
+      # fires or the runner is SIGKILLed, so a timed-out/cancelled Go test leaks
+      # its org. This net discovers leaks by the GITHUB_RUN_ID that e2eSlug embeds
+      # (e2e-<tag>-<run_id>-<uniq>) — one net sweeps BOTH go test steps above —
+      # and hands each (slug, roster org_id) pair to the SAME identity-bound purge
+      # helper the shell jobs use (cp_purge_receipt.sh). No new auth path;
+      # idempotent with t.Cleanup.
+      - name: Teardown safety net (runs on timeout/cancel/failure)
+        # PR-mode: never curl live staging from a PR (no token; public repo).
+        if: always() && github.event_name != 'pull_request'
+        env:
+          # Sourced from Infisical (staging /shared/controlplane-admin) via the
+          # "Fetch staging CP admin token from Infisical KMS" step above.
+          ADMIN_TOKEN: ${{ env.CP_ADMIN_API_TOKEN }}
+        run: |
+          set +e
+          source tests/e2e/lib/cp_purge_receipt.sh
+          if ! e2e_cp_require_local_backend \
+            || ! e2e_cp_require_staging_origin "$CP_BASE_URL"; then
+            echo "::warning::go-e2e teardown safety net rejected its staging target/backend before bearer use"
+            exit 0
+          fi
+          if [ -z "${GITHUB_RUN_ID:-}" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive: GITHUB_RUN_ID is empty; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          if [ -z "${ADMIN_TOKEN:-}" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive: admin token unavailable (PR-mode/creds skip); no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          roster_rc=0
+          roster_json=$(e2e_cp_fetch_org_roster_json "$CP_BASE_URL" "$ADMIN_TOKEN") || roster_rc=$?
+          if [ "$roster_rc" != "0" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive (roster rc=$roster_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          # Run-scoped discovery: e2eSlug embeds the full GITHUB_RUN_ID, so a
+          # substring match uniquely scopes the sweep to THIS run's leaked orgs —
+          # never a parallel run's or a dev's manual staging probe. Emit each
+          # candidate as slug<TAB>org_id so the purge helper receives the exact
+          # creation-returned org id it requires before it will issue DELETE.
+          filter_rc=0
+          pairs=$(printf '%s' "$roster_json" | python3 -c "
+          import json, sys, os
+          run_id = os.environ['GITHUB_RUN_ID']
+          if not run_id:
+              raise ValueError('empty run id')
+          d = json.load(sys.stdin)
+          for o in d.get('orgs', []):
+              slug = o.get('slug', '')
+              org_id = o.get('id', '')
+              if run_id in slug and o.get('instance_status') not in ('purged',):
+                  print(slug + '\t' + str(org_id))
+          " 2>/dev/null) || filter_rc=$?
+          if [ "$filter_rc" != "0" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive (run-scope filter rc=$filter_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          # Per-slug DELETE proves the exact completed purge receipt/audit and
+          # exact org absence via the shared helper. Advisory (never exit 1);
+          # sweep-stale-e2e-orgs is the age-guarded final retry net.
+          leaks=()
+          while IFS=$'\t' read -r slug org_id; do
+            [ -n "$slug" ] || continue
+            echo "Safety-net teardown: $slug"
+            purge_rc=0
+            e2e_cp_delete_and_verify_purge \
+              "$CP_BASE_URL" "$ADMIN_TOKEN" "$slug" "$org_id" || purge_rc=$?
+            if [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "purged" ]; then
+              echo "[teardown] verified exact CP purge receipt/audit and exact-tenant HTTP 404 for $slug"
+            elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
+              echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
+            else
+              echo "::warning::go-e2e teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              leaks+=("$slug")
+            fi
+          done <<< "$pairs"
+          if [ ${#leaks[@]} -gt 0 ]; then
+            echo "::warning::go-e2e teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
+          fi
+          exit 0
 
   # Tenant plugin-install lifecycle guard (canvas Plugins tab regression class):
   # boots a real staging workspace, asserts the registry is non-empty (the
@@ -1751,6 +1928,11 @@ jobs:
       # path (validate-before-delete). The Verify-admin-token gate still
       # validates CP_ADMIN_API_TOKEN is non-empty.
       STAGING_E2E: '1'
+      # E2E_INFRA_BACKEND pins the purge helper (tests/e2e/lib/cp_purge_receipt.sh)
+      # to the live local-docker staging backend, mirroring the shell jobs. The
+      # Go test itself reads E2E_PROVIDER, not this; it is consumed only by the
+      # `if: always()` teardown safety net below (its origin/backend guards).
+      E2E_INFRA_BACKEND: local-docker
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -1826,3 +2008,84 @@ jobs:
       # (e2e-plgn-* slug), running even on a t.Fatal. The age-guarded
       # sweep-stale-e2e-orgs workflow (30-min floor, e2e- prefix) is the final
       # net for a tenant orphaned by a hard runner cancel.
+      #
+      # Belt-and-braces always()-net: Go SKIPS t.Cleanup when `go test -timeout`
+      # fires or the runner is SIGKILLed, so a timed-out/cancelled Go test leaks
+      # its org. This net discovers leaks by the GITHUB_RUN_ID that e2eSlug embeds
+      # (e2e-<tag>-<run_id>-<uniq>) and hands each (slug, roster org_id) pair to
+      # the SAME identity-bound purge helper the shell jobs use
+      # (cp_purge_receipt.sh). No new auth path; idempotent with t.Cleanup.
+      - name: Teardown safety net (runs on timeout/cancel/failure)
+        # PR-mode: never curl live staging from a PR (no token; public repo).
+        if: always() && github.event_name != 'pull_request'
+        env:
+          # Sourced from Infisical (staging /shared/controlplane-admin) via the
+          # "Fetch staging CP admin token from Infisical KMS" step above.
+          ADMIN_TOKEN: ${{ env.CP_ADMIN_API_TOKEN }}
+        run: |
+          set +e
+          source tests/e2e/lib/cp_purge_receipt.sh
+          if ! e2e_cp_require_local_backend \
+            || ! e2e_cp_require_staging_origin "$CP_BASE_URL"; then
+            echo "::warning::go-e2e teardown safety net rejected its staging target/backend before bearer use"
+            exit 0
+          fi
+          if [ -z "${GITHUB_RUN_ID:-}" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive: GITHUB_RUN_ID is empty; no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          if [ -z "${ADMIN_TOKEN:-}" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive: admin token unavailable (PR-mode/creds skip); no roster discovery or tenant DELETE was attempted"
+            exit 0
+          fi
+          roster_rc=0
+          roster_json=$(e2e_cp_fetch_org_roster_json "$CP_BASE_URL" "$ADMIN_TOKEN") || roster_rc=$?
+          if [ "$roster_rc" != "0" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive (roster rc=$roster_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          # Run-scoped discovery: e2eSlug embeds the full GITHUB_RUN_ID, so a
+          # substring match uniquely scopes the sweep to THIS run's leaked orgs —
+          # never a parallel run's or a dev's manual staging probe. Emit each
+          # candidate as slug<TAB>org_id so the purge helper receives the exact
+          # creation-returned org id it requires before it will issue DELETE.
+          filter_rc=0
+          pairs=$(printf '%s' "$roster_json" | python3 -c "
+          import json, sys, os
+          run_id = os.environ['GITHUB_RUN_ID']
+          if not run_id:
+              raise ValueError('empty run id')
+          d = json.load(sys.stdin)
+          for o in d.get('orgs', []):
+              slug = o.get('slug', '')
+              org_id = o.get('id', '')
+              if run_id in slug and o.get('instance_status') not in ('purged',):
+                  print(slug + '\t' + str(org_id))
+          " 2>/dev/null) || filter_rc=$?
+          if [ "$filter_rc" != "0" ]; then
+            echo "::warning::go-e2e teardown discovery inconclusive (run-scope filter rc=$filter_rc); no tenant DELETE was attempted"
+            exit 0
+          fi
+          # Per-slug DELETE proves the exact completed purge receipt/audit and
+          # exact org absence via the shared helper. Advisory (never exit 1);
+          # sweep-stale-e2e-orgs is the age-guarded final retry net.
+          leaks=()
+          while IFS=$'\t' read -r slug org_id; do
+            [ -n "$slug" ] || continue
+            echo "Safety-net teardown: $slug"
+            purge_rc=0
+            e2e_cp_delete_and_verify_purge \
+              "$CP_BASE_URL" "$ADMIN_TOKEN" "$slug" "$org_id" || purge_rc=$?
+            if [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "purged" ]; then
+              echo "[teardown] verified exact CP purge receipt/audit and exact-tenant HTTP 404 for $slug"
+            elif [ "$purge_rc" = "0" ] && [ "$E2E_CP_PURGE_RESULT" = "already_absent" ]; then
+              echo "[teardown] exact tenant already absent by HTTP 404 for $slug; no DELETE or purge audit was required"
+            else
+              echo "::warning::go-e2e teardown verification for $slug failed or was inconclusive (rc=$purge_rc result=${E2E_CP_PURGE_RESULT:-unset}) — sweep-stale-e2e-orgs will retry within ~45 min"
+              leaks+=("$slug")
+            fi
+          done <<< "$pairs"
+          if [ ${#leaks[@]} -gt 0 ]; then
+            echo "::warning::go-e2e teardown left ${#leaks[@]} leak(s): ${leaks[*]}"
+          fi
+          exit 0

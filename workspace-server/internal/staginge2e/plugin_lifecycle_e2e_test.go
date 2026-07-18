@@ -37,7 +37,6 @@ package staginge2e
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -46,7 +45,7 @@ import (
 func TestPluginInstallLifecycle_Staging(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-plgn-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("plgn")
 	t.Logf("plugin-lifecycle: slug=%s", slug)
 
 	// --- Step 1: provision throwaway org + tenant (reused scaffolding) ---
