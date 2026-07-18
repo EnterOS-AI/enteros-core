@@ -12,6 +12,7 @@ FORBIDDEN_INTERNAL_URL = "https://git.moleculesai.app/molecule-ai/internal"
 
 def test_marketplace_rfc_is_a_bounded_internal_ssot_stub() -> None:
     text = STUB.read_text()
+    normalized = " ".join(text.split())
 
     assert CANONICAL_PATH in text
     assert MIGRATION_PR in text
@@ -19,6 +20,17 @@ def test_marketplace_rfc_is_a_bounded_internal_ssot_stub() -> None:
     # path-only; a full private URL leaks internal filenames to crawlers.
     assert FORBIDDEN_INTERNAL_URL not in text
     assert len(text.splitlines()) <= 60
+    assert (
+        "required pre-merge `template-delivery-e2e` proves config/prompts "
+        "asset delivery"
+    ) in normalized
+    assert (
+        "manual, branch-protection-exempt `template-delivery-e2e-staging.yml` "
+        "is the `seo-all` post-deploy proof lane"
+        in normalized
+    )
+    assert "not a required pre-merge proof" in normalized
+    assert "does not claim a current staging run" in normalized
 
     stale_duplicate_markers = (
         "resolveTemplateAssets",

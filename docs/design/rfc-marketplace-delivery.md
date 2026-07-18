@@ -27,8 +27,11 @@ its runtime engine:
   names.
 - Template config/prompts use the separate `TemplateAssets` provision channel;
   declared skills are reconciled as plugins.
-- Core's required `template-delivery-e2e` provisions a fresh template workspace
-  and verifies config, prompts, and declared-plugin delivery before merge.
+- Core's required pre-merge `template-delivery-e2e` proves config/prompts asset
+  delivery for a fresh template. Plugin reconciliation requires a deployed
+  runtime; the separate manual, branch-protection-exempt
+  `template-delivery-e2e-staging.yml` proves `seo-all` post-deploy and is not a
+  required pre-merge proof.
 
 The entitlement broker, per-seller artifact encryption, third-party publishing,
 billing integration, and marketplace UI described by the original RFC are not
@@ -41,4 +44,5 @@ those deferred systems.
 - `workspace-server/internal/handlers/workspace_crud.go`
 - `workspace-server/internal/provisioner/template_assets.go`
 - `.gitea/workflows/template-delivery-e2e.yml`
+- `.gitea/workflows/template-delivery-e2e-staging.yml`
 - `docs/design/rfc-decouple-config-skill-delivery.md`
