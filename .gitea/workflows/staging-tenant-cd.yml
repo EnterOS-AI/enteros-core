@@ -207,6 +207,10 @@ jobs:
       CP_BASE_URL: https://staging-api.moleculesai.app
       E2E_PROVIDER: molecules-server
       STAGING_E2E: '1'
+      # Consumed only by the `if: always()` teardown safety net below (the purge
+      # helper tests/e2e/lib/cp_purge_receipt.sh origin/backend guards). The Go
+      # test itself reads E2E_PROVIDER, not this.
+      E2E_INFRA_BACKEND: local-docker
       GATE_FORCE_FAIL: ${{ vars.STAGING_TENANT_CD_FORCE_GATE_FAIL }}
       # E2E_DEFAULT_RUNTIME is exported by the Infisical step below from the same
       # optional /shared/controlplane selector the deployed CP consumes. When the
@@ -327,7 +331,27 @@ jobs:
         #   runtime could not resolve). This makes the deploy gate go RED on that failure. BOTH must
         #   pass after the fleet roll (needs-gated, un-bypassable).
         run: go test -tags staging_e2e ./internal/staginge2e/ -run 'TestWorkspaceLifecycle_Staging|TestPlatformAgentMgmtMCP_Staging' -count=1 -v -timeout 50m
-
+      # Belt-and-braces teardown: the Go test installs a t.Cleanup admin-DELETE
+      # of its own tenant, but Go SKIPS t.Cleanup when `go test -timeout` fires
+      # or the runner is SIGKILLed — so a timed-out/cancelled Go test leaks its
+      # org. This net purges any CP admin org whose slug carries THIS run's
+      # GITHUB_RUN_ID for the exact tag(s) this job creates (e2eSlug formats
+      # slugs as e2e-<tag>-<run_id>-<uniq>), via the SAME identity-bound purge
+      # helper the shell jobs use (cp_purge_receipt.sh) — no new auth path.
+      # Idempotent with t.Cleanup; a fast no-op on the happy path.
+      - name: Teardown safety net (runs on timeout/cancel/failure)
+        # push/dispatch-only workflow; the PR guard is a uniform no-op here.
+        if: always() && github.event_name != 'pull_request'
+        env:
+          # Sourced from Infisical (staging /shared/controlplane-admin) via the
+          # "Fetch staging CP admin token from Infisical KMS" step above.
+          ADMIN_TOKEN: ${{ env.CP_ADMIN_API_TOKEN }}
+          # BOTH tags THIS job's -run creates: TestWorkspaceLifecycle_Staging →
+          # e2eSlug("life") AND TestPlatformAgentMgmtMCP_Staging → e2eSlug("mcp").
+          # Scopes the run-id sweep to only this job's orgs so a parallel sibling
+          # job's in-flight org is never purged.
+          TEARDOWN_TAGS: "life mcp"
+        run: bash tests/e2e/lib/go_e2e_run_teardown.sh
   rollback-pin:
     name: rollback-pin (revert pin if the fleet roll failed)
     needs: [advance-pin, redeploy-fleet, e2e-smoke]
