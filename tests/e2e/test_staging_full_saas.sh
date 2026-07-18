@@ -3108,7 +3108,13 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
       local _rt
       _rt=$(printf '%s' "${1:-claude-code}" | tr 'A-Z' 'a-z' | tr '-' '_')
       case "$_rt" in
-        hermes)   printf '%s' "/home/agent/.hermes/config.yaml" ;;
+        # hermes: the runtime writes native MCP servers to $HERMES_HOME/config.yaml,
+        # and the container runs the runtime under HERMES_HOME=/tmp/.hermes + HOME=/tmp
+        # (adapter._hermes_config_path), NOT the build-time installer default
+        # /home/agent/.hermes/config.yaml (which nothing rewrites at runtime). Inspect
+        # the path the injector actually renders to + hermes-agent reads. (codex/openclaw
+        # /home/agent paths are unverified for the same HOME=/tmp effect — follow-up.)
+        hermes)   printf '%s' "/tmp/.hermes/config.yaml" ;;
         openclaw) printf '%s' "/home/agent/.openclaw/openclaw.json" ;;
         codex)    printf '%s' "/home/agent/.codex/config.toml" ;;
         *)        printf '%s' "/configs/.claude/settings.json" ;;
