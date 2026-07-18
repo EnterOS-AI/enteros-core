@@ -1796,18 +1796,31 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 					// Delete/promote is not overwritten.
 					msg := fmt.Sprintf("platform concierge never reached management-MCP readiness within %s of warming (mcp_tools_ready not published and loaded_mcp_tools did not carry provision_workspace); marking degraded (EV2 warm-fail safety net, core#3082/#4449)", conciergeWarmupFailGrace)
 					log.Printf("Heartbeat: workspace=%s transition=provisioning→degraded reason=warmup_never_ready warming_for=%s grace=%s mcp_tools_ready=%v provision_workspace_loaded=%v", payload.WorkspaceID, warmingFor.Truncate(time.Second), conciergeWarmupFailGrace, mcpToolsReady, provisionToolLoaded)
-					if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'provisioning'`, models.StatusDegraded, msg, payload.WorkspaceID); err != nil {
+					res, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'provisioning'`, models.StatusDegraded, msg, payload.WorkspaceID)
+					if err != nil {
 						log.Printf("Heartbeat: failed to warm-fail %s to degraded: %v", payload.WorkspaceID, err)
+						// Best-effort recovery still fires on a DB error (as it did
+						// pre-#4462, unconditionally): a transient write failure must not
+						// deny a genuinely-stuck box its config-regen chance ([7]). We only
+						// SKIP the degraded broadcast on the 0-rows race (below), not on an
+						// error where the row state is unknown.
+						h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
+					} else if rows, _ := res.RowsAffected(); rows > 0 {
+						// Only signal if the guarded UPDATE actually degraded the row.
+						// The UPDATE is conditional (AND status='provisioning') so a racing
+						// promote/Delete leaves 0 rows — broadcasting EventWorkspaceDegraded
+						// + reconcile on a box another beat just promoted online is the
+						// cluster-3 regression (a spurious degraded flap on a healthy box).
+						h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+							"warmup_never_ready": true,
+							"warming_for_secs":   int(warmingFor.Seconds()),
+							"sample_error":       msg,
+						})
+						// Try to regenerate the management MCP config so a subsequent beat can
+						// carry the required tool and recover the box (mirrors the post-online
+						// #3082 deadlock-break).
+						h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
 					}
-					h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
-						"warmup_never_ready": true,
-						"warming_for_secs":   int(warmingFor.Seconds()),
-						"sample_error":       msg,
-					})
-					// Try to regenerate the management MCP config so a subsequent beat can
-					// carry the required tool and recover the box (mirrors the post-online
-					// #3082 deadlock-break).
-					h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
 				} else {
 					log.Printf("Heartbeat: platform %s warming, holding provisioning (waiting on mcp_tools_ready/loaded_mcp_tools signal; unloaded for %s of %s, mcp_tools_ready=%v provision_workspace_loaded=%v unhealthy=%v) (EV2/core#3082)", payload.WorkspaceID, warmingFor.Truncate(time.Second), conciergeWarmupFailGrace, mcpToolsReady, provisionToolLoaded, conciergeUnhealthy)
 				}
@@ -1882,6 +1895,49 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				}
 			}
 			log.Printf("Heartbeat: platform %s online, mcp_tools_ready=true — staying online despite loaded_mcp_tools_count=%d (EV2 reliable-signal short-circuit, core#3082/#4449)", payload.WorkspaceID, len(payload.LoadedMCPTools))
+		} else if payload.MCPServerPresent != nil && *payload.MCPServerPresent && payload.MCPToolsReady != nil {
+			// EV2 LIVE-NEGATIVE degrade (fix for the #4457 sustained-absence hole):
+			// *payload.MCPToolsReady == false here (the affirmed-true case was handled
+			// above). Since runtime#326 the readiness prober re-probes continuously, so
+			// a false is a RELIABLE, turn-INDEPENDENT "provision_workspace not loaded"
+			// signal — unlike the under-emitting per-turn loaded_mcp_tools producer. We
+			// degrade on it directly (subject to the SAME managementMCPUnloadedGrace
+			// window that absorbs a transient warmup blip), which is what finally closes
+			// the hole a frozen sticky-true mcp_tools_ready used to leave open: an online
+			// concierge that loses the verb while its MCP server stays up is now caught
+			// here rather than staying online forever.
+			managementMCPUnloaded = true
+			now := time.Now()
+			firstUnloaded := mcpUnloadedSince
+			if !firstUnloaded.Valid {
+				firstUnloaded = sql.NullTime{Time: now, Valid: true}
+				if _, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET mcp_unloaded_since = COALESCE(mcp_unloaded_since, now()), updated_at = now() WHERE id = $1`, payload.WorkspaceID); err != nil {
+					log.Printf("Heartbeat: failed to stamp mcp_unloaded_since for %s (mcp_tools_ready=false): %v", payload.WorkspaceID, err)
+				}
+			}
+			if now.Sub(firstUnloaded.Time) < managementMCPUnloadedGrace {
+				log.Printf("Heartbeat: platform %s reports mcp_tools_ready=false; within %s grace (not-ready for %s) — not degrading (EV2 live-signal, core#3082/#4457)", payload.WorkspaceID, managementMCPUnloadedGrace, now.Sub(firstUnloaded.Time).Truncate(time.Second))
+			} else {
+				msg := "platform agent management-MCP readiness probe reports provision_workspace not loaded past the grace window; marking degraded (EV2 live mcp_tools_ready=false, core#3082/#4457)"
+				log.Printf("Heartbeat: workspace=%s transition=%s→degraded reason=mcp_tools_ready_false not_ready_for=%s grace=%s", payload.WorkspaceID, currentStatus, now.Sub(firstUnloaded.Time).Truncate(time.Second), managementMCPUnloadedGrace)
+				res, err := db.DB.ExecContext(ctx, `UPDATE workspaces SET status = $1::workspace_status, last_sample_error = $2, updated_at = now() WHERE id = $3 AND status = 'online'`, models.StatusDegraded, msg, payload.WorkspaceID)
+				if err != nil {
+					log.Printf("Heartbeat: failed to mark %s degraded (mcp_tools_ready=false): %v", payload.WorkspaceID, err)
+					// Best-effort recovery still fires on a DB error (parity with the
+					// warm-fail path, [7]); only the 0-rows race skips the signal.
+					h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
+				} else if rows, _ := res.RowsAffected(); rows > 0 {
+					// Only signal if THIS beat actually degraded the row — a racing
+					// promote/Delete may have moved it off 'online' (0 rows), and a
+					// spurious degraded event + reconcile on a healthy box is the
+					// cluster-3 regression we are also fixing.
+					h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceDegraded), payload.WorkspaceID, map[string]interface{}{
+						"mcp_tools_ready_false": true,
+						"sample_error":          msg,
+					})
+					h.fireReconcileMCPRecovery(ctx, payload.WorkspaceID)
+				}
+			}
 		} else if payload.MCPServerPresent != nil && *payload.MCPServerPresent {
 			loaded := payload.LoadedMCPTools
 			var (

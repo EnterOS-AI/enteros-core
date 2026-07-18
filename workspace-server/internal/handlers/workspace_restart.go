@@ -410,7 +410,11 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 
 	// Reset to provisioning
 	if _, err := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusProvisioning, id); err != nil {
+		// Clear mcp_unloaded_since so the concierge warming clock (EV2 warm-fail +
+		// online not-ready grace, registry.go) starts fresh for this new provisioning
+		// episode — a stale stamp from a prior online-degrade would instantly re-degrade
+		// the box on its first post-restart beat (core#4457 cluster-2).
+		`UPDATE workspaces SET status = $1, url = '', mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`, models.StatusProvisioning, id); err != nil {
 		log.Printf("Restart: failed to set provisioning status for %s: %v", id, err)
 	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), id, map[string]interface{}{
@@ -1221,7 +1225,9 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	h.stopForRestart(ctx, workspaceID)
 
 	if _, err := db.DB.ExecContext(ctx,
-		`UPDATE workspaces SET status = $1, url = '', updated_at = now() WHERE id = $2`, models.StatusProvisioning, workspaceID); err != nil {
+		// Clear mcp_unloaded_since — fresh warming clock for the new provisioning
+		// episode (core#4457 cluster-2; see Restart path above).
+		`UPDATE workspaces SET status = $1, url = '', mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`, models.StatusProvisioning, workspaceID); err != nil {
 		log.Printf("Auto-restart: failed to set provisioning status for %s: %v", workspaceID, err)
 	}
 	h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), workspaceID, map[string]interface{}{
@@ -1465,7 +1471,10 @@ func (h *WorkspaceHandler) Resume(c *gin.Context) {
 	// Re-provision all
 	for _, ws := range toResume {
 		if _, err := db.DB.ExecContext(ctx,
-			`UPDATE workspaces SET status = $1, updated_at = now() WHERE id = $2`, models.StatusProvisioning, ws.id); err != nil {
+			// Clear mcp_unloaded_since — this is the RESUME path (pause/hibernate →
+			// provisioning); a stale warming stamp here is exactly the cluster-2
+			// false-degrade the EV2 review flagged (core#4457).
+			`UPDATE workspaces SET status = $1, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $2`, models.StatusProvisioning, ws.id); err != nil {
 			log.Printf("Resume: failed to set provisioning status for %s: %v", ws.id, err)
 		}
 		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceProvisioning), ws.id, map[string]interface{}{

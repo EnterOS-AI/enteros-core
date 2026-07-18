@@ -288,3 +288,100 @@ func TestHeartbeat_EV2_RealDB_StuckWarmingSurfacesFault(t *testing.T) {
 		t.Fatalf("defect #3: warm-fail must persist an operator-visible last_sample_error, got empty")
 	}
 }
+
+// TestHeartbeat_EV2_RealDB_OnlineDegradesOnLiveMCPToolsReadyFalse proves the core
+// side of the #4457 sustained-absence fix. Since runtime#326 the readiness prober
+// re-probes continuously, so mcp_tools_ready=false is a RELIABLE, turn-independent
+// "provision_workspace not loaded" signal. An ONLINE concierge reporting it past
+// managementMCPUnloadedGrace must degrade — independent of the under-emitting
+// loaded_mcp_tools producer. Negative control: within the grace window it HOLDS.
+func TestHeartbeat_EV2_RealDB_OnlineDegradesOnLiveMCPToolsReadyFalse(t *testing.T) {
+	initEV2DB(t)
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	const id = "55555555-5555-4555-8555-555555555555"
+	seedProvisioningPlatformConcierge(t, id)
+	t.Cleanup(func() {
+		db.DB.Exec(`DELETE FROM workspace_secrets WHERE workspace_id = $1`, id)
+		db.DB.Exec(`DELETE FROM workspaces WHERE id = $1`, id)
+	})
+
+	// mcp_server_present=true, mcp_tools_ready=FALSE (explicit — the live prober says
+	// provision_workspace is not loaded), loaded_mcp_tools OMITTED.
+	body := `{"workspace_id":"` + id + `","error_rate":0.0,"uptime_seconds":600,"mcp_server_present":true,"mcp_tools_ready":false}`
+
+	// --- WITHIN GRACE (negative control): stamp only 60s old → HOLD online ---
+	setPlatformRow(t, id, "online", 60) // 60s < 180s managementMCPUnloadedGrace
+	if code := postHeartbeat(t, handler, body); code != http.StatusOK {
+		t.Fatalf("within-grace heartbeat status = %d, want 200", code)
+	}
+	if got := currentStatus(t, id); got != "online" {
+		t.Fatalf("negative control: mcp_tools_ready=false WITHIN grace must HOLD online, got %q", got)
+	}
+
+	// --- PAST GRACE: not-ready persisted past the window → DEGRADE ---
+	setPlatformRow(t, id, "online", 400) // 400s > 180s
+	if code := postHeartbeat(t, handler, body); code != http.StatusOK {
+		t.Fatalf("past-grace heartbeat status = %d, want 200", code)
+	}
+	if got := currentStatus(t, id); got != "degraded" {
+		t.Fatalf("live mcp_tools_ready=false PAST grace must degrade (closes the #4457 hole), got %q", got)
+	}
+	// Operator-visible reason must be persisted.
+	var sampleErr string
+	if err := db.DB.QueryRowContext(context.Background(),
+		`SELECT COALESCE(last_sample_error,'') FROM workspaces WHERE id = $1`, id).Scan(&sampleErr); err != nil {
+		t.Fatalf("read last_sample_error: %v", err)
+	}
+	if sampleErr == "" {
+		t.Fatalf("live mcp_tools_ready=false degrade must persist an operator-visible last_sample_error, got empty")
+	}
+}
+
+// TestHeartbeat_EV2_RealDB_ResumeClearsWarmingClockAvoidsFalseDegrade proves the
+// cluster-2 fix: the resume/restart lifecycle clears mcp_unloaded_since when it
+// re-enters 'provisioning', so a re-provisioned box starts a FRESH warming clock
+// instead of instant-degrading on a stale stamp from a prior episode. The two arms
+// are a negative-control pair — arm A (stamp NOT cleared) is the bug, arm B (stamp
+// cleared, the fix) is the correct behavior.
+func TestHeartbeat_EV2_RealDB_ResumeClearsWarmingClockAvoidsFalseDegrade(t *testing.T) {
+	initEV2DB(t)
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	const id = "66666666-6666-4666-8666-666666666666"
+	seedProvisioningPlatformConcierge(t, id)
+	t.Cleanup(func() {
+		db.DB.Exec(`DELETE FROM workspace_secrets WHERE workspace_id = $1`, id)
+		db.DB.Exec(`DELETE FROM workspaces WHERE id = $1`, id)
+	})
+
+	// A never-ready warming beat (no mcp_tools_ready, no loaded_mcp_tools).
+	warmBeat := `{"workspace_id":"` + id + `","error_rate":0.0,"uptime_seconds":30,"mcp_server_present":true}`
+
+	// --- ARM A (the cluster-2 BUG / negative control): re-enter 'provisioning' with a
+	// STALE, non-cleared mcp_unloaded_since (400s > 300s conciergeWarmupFailGrace) →
+	// the very first warming beat instant-warm-fails to degraded. ---
+	setPlatformRow(t, id, "provisioning", 400)
+	if code := postHeartbeat(t, handler, warmBeat); code != http.StatusOK {
+		t.Fatalf("arm-A heartbeat status = %d, want 200", code)
+	}
+	if got := currentStatus(t, id); got != "degraded" {
+		t.Fatalf("control: a stale non-cleared warming stamp SHOULD instant-degrade (the pre-fix bug), got %q", got)
+	}
+
+	// --- ARM B (the FIX): the resume lifecycle (workspace_restart.go / switch_provider)
+	// sets provisioning AND clears mcp_unloaded_since. Mimic that write, then the first
+	// warming beat must start a FRESH clock and HOLD provisioning (no false-degrade). ---
+	if _, err := db.DB.ExecContext(context.Background(),
+		`UPDATE workspaces SET status = 'provisioning'::workspace_status, mcp_unloaded_since = NULL, updated_at = now() WHERE id = $1`, id); err != nil {
+		t.Fatalf("mimic resume UPDATE: %v", err)
+	}
+	if code := postHeartbeat(t, handler, warmBeat); code != http.StatusOK {
+		t.Fatalf("arm-B heartbeat status = %d, want 200", code)
+	}
+	if got := currentStatus(t, id); got != "provisioning" {
+		t.Fatalf("fix: resume cleared the warming stamp, so a fresh warming beat must HOLD provisioning, got %q", got)
+	}
+}

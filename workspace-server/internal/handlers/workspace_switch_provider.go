@@ -133,7 +133,7 @@ func (h *WorkspaceHandler) SwitchProvider(c *gin.Context) {
 	// pre-claim never needs a revert (the row is unchanged).
 	preClaim, err := db.DB.ExecContext(ctx, `
 		UPDATE workspaces
-		SET status = $2, updated_at = now()
+		SET status = $2, mcp_unloaded_since = NULL, updated_at = now()
 		WHERE id = $1
 		  AND status <> $2
 		  AND COALESCE(compute->>'provider', '') IS NOT DISTINCT FROM $3`,
