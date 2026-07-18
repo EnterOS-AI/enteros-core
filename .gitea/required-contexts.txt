@@ -103,6 +103,17 @@ Concierge Creates Workspace Hermetic / Concierge Creates Workspace Hermetic
 # already resolved separately — that list is now empty.)
 E2E Ephemeral CP Happy Path / E2E Ephemeral CP Happy Path
 
+# PROMOTED 2026-07-18 (RFC #4428 Phase 3, task #87/#88). The SDK route + happy-
+# path milestone derive-gates. Its producer
+# (sdk-route-milestone-contract-drift.yml) was flipped from a push-only SHADOW
+# alert to an always-fire pull_request gate (paths filter dropped; the two Go
+# derive tests are deterministic and were verified green on main before this
+# promotion). Both #87 (SDKRoutes vs router.go) and #88 (HappyPathMilestones vs
+# the staging-full-saas runner) run in one job → one context. No shared creds /
+# no fork exfil path (pure vendored Go tests), so it is honestly per-PR
+# enforceable — unlike the staging-concierge journey parked below.
+sdk-route-milestone-contract-drift / SDK route + milestone derive-gates
+
 # RE-ENABLED on MOLECULES-SERVER 2026-07-03 — enforcement SEQUENCED ─────────
 # `E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace`
 # is NO LONGER workflow_dispatch-only: its producer (e2e-staging-saas.yml) was
