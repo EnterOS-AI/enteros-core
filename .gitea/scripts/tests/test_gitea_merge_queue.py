@@ -550,6 +550,14 @@ def test_critical_context_prefixes_derived_per_repo_from_ssot():
     assert mq.critical_context_prefixes(core_enforced) == ["CI / all-required"]
 
 
+def test_critical_context_prefixes_rejects_malformed_bare_sentinel():
+    # The contract is a complete emitted context (`<workflow> / all-required`),
+    # not merely a matching final token. A typo in the SSOT must therefore
+    # resolve to an empty set and trigger the caller's fail-closed guard.
+    malformed = ["all-required", "CI/all-required", " / all-required"]
+    assert mq.critical_context_prefixes(malformed) == []
+
+
 def test_critical_context_prefixes_env_override_wins():
     # An explicit env override is honored verbatim (a repo may still pin extra
     # critical contexts), bypassing SSOT derivation.

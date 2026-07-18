@@ -1668,8 +1668,11 @@ def _is_aggregator_sentinel(base_context: str) -> bool:
     The workflow-name segment is preserved verbatim in the returned prefix, so
     the emitted-context match downstream stays exact.
     """
-    job = base_context.rsplit("/", 1)[-1].strip().lower()
-    return job == "all-required"
+    parts = base_context.rsplit(" / ", 1)
+    if len(parts) != 2:
+        return False
+    workflow, job = parts
+    return bool(workflow.strip()) and job.strip().lower() == "all-required"
 
 
 def critical_context_prefixes(
