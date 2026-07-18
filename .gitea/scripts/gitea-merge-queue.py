@@ -181,30 +181,46 @@ GOVERNANCE_REQUIRED_CONTEXTS: list[str] = []
 # `CI / Platform (Go) = failure` AND `CI / all-required = skipped`, turning
 # main RED. Same class as #3181.)
 # --------------------------------------------------------------------------
-# These two contexts MUST be green before ANY merge.
-# They are checked here UNCONDITIONALLY and INDEPENDENTLY of whatever branch
-# protection happens to enumerate in status_check_contexts — the #1676 gap was
-# precisely that when BP did NOT list these (or listed a different suffix),
-# Platform(Go)=failure + all-required=skipped fell through the required-set
-# check and were then swept up as "non-required reds" and FORCE-MERGED past.
+# The repo's `<workflow> / all-required` AGGREGATOR SENTINEL MUST be green
+# before ANY merge. It is checked UNCONDITIONALLY and INDEPENDENTLY of whatever
+# branch protection happens to enumerate in status_check_contexts — the #1676
+# gap was precisely that when BP did NOT list it (or listed a different suffix),
+# a skipped/failed aggregator fell through the required-set check and was then
+# swept up as a "non-required red" and FORCE-MERGED past.
 #
 # Rules (all fail-closed — unverifiable == BLOCK):
-#   * `CI / Platform (Go)`  : must be `success`. failure/error/skipped/missing
-#                              all BLOCK. (skipped/missing = the gate did not
-#                              actually run → cannot prove green.)
-#   * `CI / all-required`   : the aggregator sentinel. `skipped` is FATAL —
-#                              a skipped all-required means the required jobs
-#                              it gates did NOT actually run, so nothing
+#   * `<workflow> / all-required` : the aggregator sentinel. `skipped` is FATAL
+#                              — a skipped all-required means the required jobs
+#                              it `needs:` did NOT actually run, so nothing
 #                              gated the merge. failure/error/missing also
-#                              BLOCK; only `success` passes.
+#                              BLOCK; only `success` passes. Because the
+#                              sentinel `needs:` every required job (enforced by
+#                              lint-required-no-paths + all-required-check), its
+#                              green transitively proves each sub-job (e.g.
+#                              `Platform (Go)`) ran and passed, so #1676 is fully
+#                              covered by requiring THIS one context green.
 # The context names are matched by their base prefix (the part before the
 # trailing " (pull_request*)" event suffix) so the guard catches the context
 # regardless of which event variant Gitea emitted it under.
+#
+# ZERO-DRIFT / PER-REPO (root-cause fix): the critical set is NOT a hardcoded
+# constant — it is DERIVED PER-REPO from that repo's own checked-in SSOT
+# (`.gitea/required-contexts.txt` → enforced_file_contexts) by
+# `critical_context_prefixes()`. The former hardcoded default
+# ("CI / Platform (Go),CI / all-required") was molecule-core-specific and, when
+# this shared script ran for other repos (e.g. molecule-controlplane, which
+# emits LOWERCASE `ci / all-required` and has NO `Platform (Go)` job), demanded
+# contexts that were legitimately ABSENT on that repo — phantom-blocking EVERY
+# PR ("CRITICAL required context(s) not green"). A context that legitimately
+# does not exist on a repo is not a missing required check.
+# `CRITICAL_REQUIRED_CONTEXT_PREFIXES` remains an OPTIONAL explicit override (a
+# repo may still pin extra critical contexts by name); left empty (the default)
+# the set is SSOT-derived.
 CRITICAL_REQUIRED_CONTEXT_PREFIXES = [
     name.strip()
     for name in _env(
         "CRITICAL_REQUIRED_CONTEXT_PREFIXES",
-        default="CI / Platform (Go),CI / all-required",
+        default="",
     ).split(",")
     if name.strip()
 ]
@@ -1653,12 +1669,69 @@ def _context_base_name(context: str) -> str:
     return stripped
 
 
-def critical_contexts_block(latest: dict[str, dict]) -> list[str]:
-    """FAIL-CLOSED guard for the CRITICAL_REQUIRED_CONTEXT_PREFIXES.
+def _is_aggregator_sentinel(base_context: str) -> bool:
+    """True for a `<workflow> / all-required` aggregator sentinel (job key ==
+    `all-required`).
 
-    Returns a list of human-readable block reasons; an EMPTY list means every
-    critical context is provably green. A NON-empty list means the merge MUST
-    be refused (evaluate_merge_readiness calls this before any merge decision).
+    The job key (the segment after the final ` / `) is compared
+    case-INSENSITIVELY so a repo whose workflow is named `ci` (molecule-
+    controlplane) is matched identically to one named `CI` (molecule-core).
+    The workflow-name segment is preserved verbatim in the returned prefix, so
+    the emitted-context match downstream stays exact.
+    """
+    parts = base_context.rsplit(" / ", 1)
+    if len(parts) != 2:
+        return False
+    workflow, job = parts
+    return bool(workflow.strip()) and job.strip().lower() == "all-required"
+
+
+def critical_context_prefixes(
+    enforced_file_contexts: list[str] | None,
+) -> list[str]:
+    """The per-repo CRITICAL fail-closed context set (zero-drift).
+
+    Priority:
+      1. An explicit `CRITICAL_REQUIRED_CONTEXT_PREFIXES` env override — a repo
+         may still pin critical contexts by name. Used verbatim when non-empty.
+      2. Otherwise DERIVED from this repo's own checked-in SSOT
+         (`.gitea/required-contexts.txt` → ``enforced_file_contexts``): every
+         ENFORCED `<workflow> / all-required` aggregator sentinel.
+
+    This replaces the former hardcoded, molecule-core-specific default
+    (`CI / Platform (Go), CI / all-required`) which phantom-blocked every PR on
+    any repo whose emitted context names differ (molecule-controlplane emits
+    LOWERCASE `ci / all-required` and has no `Platform (Go)` job). The
+    aggregator sentinel is (by lint-required-no-paths + all-required-check)
+    guaranteed non-path-filtered and `needs:` every required job, so requiring
+    IT green — sourced from the SSOT, correctly-cased per repo — is the correct
+    fail-closed backstop for ANY repo.
+
+    Returns [] only when neither source yields a context (a genuine
+    misconfiguration — no override AND an SSOT with no all-required sentinel);
+    the caller (critical_contexts_block) fail-closes on empty.
+    """
+    if CRITICAL_REQUIRED_CONTEXT_PREFIXES:
+        return list(CRITICAL_REQUIRED_CONTEXT_PREFIXES)
+    derived: list[str] = []
+    for ctx in enforced_file_contexts or []:
+        base = _context_base_name(ctx)
+        if _is_aggregator_sentinel(base) and base not in derived:
+            derived.append(base)
+    return derived
+
+
+def critical_contexts_block(
+    latest: dict[str, dict], critical_prefixes: list[str]
+) -> list[str]:
+    """FAIL-CLOSED guard for the per-repo CRITICAL context set.
+
+    ``critical_prefixes`` is the repo-correct critical set from
+    :func:`critical_context_prefixes` (SSOT-derived aggregator sentinel(s), or an
+    explicit env override). Returns a list of human-readable block reasons; an
+    EMPTY list means every critical context is provably green. A NON-empty list
+    means the merge MUST be refused (evaluate_merge_readiness calls this before
+    any merge decision).
 
     Fail-closed semantics (RCA core#1676):
       * A critical context that is failure/error/skipped/missing → BLOCK.
@@ -1674,19 +1747,20 @@ def critical_contexts_block(latest: dict[str, dict]) -> list[str]:
     proven green).
     """
     # Fail-closed empty-guard (core#4363 follow-up). This step-0 backstop is
-    # the last line of defense against a vacuous merge. If
-    # CRITICAL_REQUIRED_CONTEXT_PREFIXES parses to
-    # an empty set (env var set to "" / whitespace / all-comma), the loop below
-    # would iterate nothing and return [] — a fail-OPEN that lets a PR with no
-    # posted CI sail through step 0. `push_required_contexts()` raises on its
-    # empty parse for exactly this reason; the critical set must be just as
+    # the last line of defense against a vacuous merge. If the per-repo critical
+    # set is empty (no env override AND the repo's SSOT carries no
+    # `<workflow> / all-required` aggregator sentinel), the loop below would
+    # iterate nothing and return [] — a fail-OPEN that lets a PR with no posted
+    # CI sail through step 0. `push_required_contexts()` raises on its empty
+    # parse for exactly this reason; the critical set must be just as
     # unforgiving. BLOCK rather than pass vacuously.
-    if not CRITICAL_REQUIRED_CONTEXT_PREFIXES:
+    if not critical_prefixes:
         return [
-            "CRITICAL_REQUIRED_CONTEXT_PREFIXES parsed to an empty set — the "
-            "step-0 critical backstop would pass vacuously for ANY PR (incl. one "
-            "with no posted CI). Merge gate HOLDS (fail-closed). Set at least the "
-            "default 'CI / Platform (Go),CI / all-required'."
+            "critical context set is empty — no CRITICAL_REQUIRED_CONTEXT_"
+            "PREFIXES override AND the repo's .gitea/required-contexts.txt SSOT "
+            "carries no '<workflow> / all-required' aggregator sentinel to derive "
+            "from. The step-0 critical backstop would pass vacuously for ANY PR "
+            "(incl. one with no posted CI). Merge gate HOLDS (fail-closed)."
         ]
 
     # Map base-name -> set of observed states for that base name.
@@ -1698,7 +1772,7 @@ def critical_contexts_block(latest: dict[str, dict]) -> list[str]:
         observed.setdefault(base, []).append(status_state(status))
 
     reasons: list[str] = []
-    for prefix in CRITICAL_REQUIRED_CONTEXT_PREFIXES:
+    for prefix in critical_prefixes:
         states = observed.get(prefix)
         if not states:
             reasons.append(f"{prefix}=missing (critical context not reported — cannot prove green)")
@@ -1728,16 +1802,18 @@ def evaluate_merge_readiness(
     enforced_file_contexts: list[str] | None = None,
     block_on_outdated_branch: bool = False,
 ) -> MergeDecision:
-    # 0) CRITICAL fail-closed guard (RCA core#1676). Before ANY other gate, the PR head's
-    #    critical contexts (CI / Platform (Go), CI / all-required) MUST be
-    #    green. This is checked UNCONDITIONALLY, independent of branch
-    #    protection's status_check_contexts. #1676 merged red because these
-    #    fell out of the BP-required set and the former force path bypassed
-    #    them. There is no exemption from
-    #    this gate — runtime-bump exemption only bypasses the APPROVALS bar,
-    #    never a red required CI status.
+    # 0) CRITICAL fail-closed guard (RCA core#1676). Before ANY other gate, the
+    #    PR head's per-repo critical context — the repo's own
+    #    `<workflow> / all-required` aggregator sentinel, SSOT-derived from
+    #    enforced_file_contexts (see critical_context_prefixes) — MUST be green.
+    #    This is checked UNCONDITIONALLY, independent of branch protection's
+    #    status_check_contexts. #1676 merged red because the aggregator fell out
+    #    of the BP-required set and the former force path bypassed it. There is
+    #    no exemption from this gate — runtime-bump exemption only bypasses the
+    #    APPROVALS bar, never a red required CI status.
+    critical_prefixes = critical_context_prefixes(enforced_file_contexts)
     pr_latest_critical = latest_statuses_by_context(pr_status.get("statuses") or [])
-    critical_block = critical_contexts_block(pr_latest_critical)
+    critical_block = critical_contexts_block(pr_latest_critical, critical_prefixes)
     if critical_block:
         return MergeDecision(
             False, "wait",
@@ -2347,7 +2423,9 @@ def live_premerge_status_regressions(
     regressions: list[str] = []
     # Same order evaluate_merge_readiness checks: critical first (force cannot
     # bypass), then BP+governance required, then the enforced-file SSOT set.
-    critical_block = critical_contexts_block(live_latest)
+    critical_block = critical_contexts_block(
+        live_latest, critical_context_prefixes(enforced_file_contexts)
+    )
     if critical_block:
         regressions.extend(critical_block)
     ok, bad = required_contexts_green(live_latest, required_contexts)
