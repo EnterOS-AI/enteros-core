@@ -24,8 +24,9 @@ name: redeploy-tenants-on-main
 # — carried the OLD host-loopback health gate (curl 127.0.0.1:<published-port>),
 # which only works when the runner IS the tenant host. The shared script's gate
 # probes /buildinfo DAEMON-SIDE (a curl sidecar in the tenant netns), so this
-# same workflow works whether it runs on the prod box OR drives the prod daemon
-# remotely over the mesh — the prerequisite for moving deploys off the prod box.
+# same workflow works with either a local socket or a remotely configured Docker
+# endpoint. Endpoint and transport selection belong to deploy-runner configuration;
+# this repository does not prescribe an operator host or a host-login access path.
 # Make algorithm changes in the script; this file only wires prod deltas.
 #
 # PROD SAFETY — the auto-trigger is re-enabled per the re-enable request, but a
@@ -79,11 +80,10 @@ env:
 
 jobs:
   redeploy:
-    # local-deploy: the robot-2 deploy runner whose DOCKER_HOST is the prod
-    # daemon over the mesh (docker-socket-proxy). The swap runs OFF the prod box
-    # yet acts on the prod tenant fleet; the shared script's health gate is
-    # daemon-side, so it is host-agnostic. (Was docker-host — a runner ON the
-    # prod box — during the drive-deploys-off-the-prod-box migration.)
+    # local-deploy: the CI deploy runner whose production Docker endpoint is
+    # supplied by runner configuration. The shared script's health gate runs
+    # daemon-side, so it remains endpoint- and transport-agnostic; no host or
+    # operator-login route is encoded in this workflow.
     runs-on: local-deploy
     timeout-minutes: 30
     env:
