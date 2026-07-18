@@ -2,9 +2,12 @@
 
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[3]
 STUB = ROOT / "docs/design/rfc-marketplace-delivery.md"
+OPS_WORKFLOW = ROOT / ".gitea/workflows/test-ops-scripts.yml"
 CANONICAL_PATH = "Molecule-AI/internal/rfcs/marketplace-delivery.md"
 MIGRATION_PR = "internal#1081"
 FORBIDDEN_INTERNAL_URL = "https://git.moleculesai.app/molecule-ai/internal"
@@ -39,3 +42,11 @@ def test_marketplace_rfc_is_a_bounded_internal_ssot_stub() -> None:
         "CP #828",
     )
     assert not [marker for marker in stale_duplicate_markers if marker in text]
+
+
+def test_marketplace_stub_changes_trigger_the_required_guard() -> None:
+    workflow = yaml.load(OPS_WORKFLOW.read_text(), Loader=yaml.BaseLoader)
+    guarded_path = str(STUB.relative_to(ROOT))
+
+    for event in ("push", "pull_request"):
+        assert guarded_path in workflow["on"][event]["paths"]
