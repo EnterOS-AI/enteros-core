@@ -46,10 +46,18 @@ const scheduleForwardTimeout = 15 * time.Second
 // workspace_schedules table. True exactly when the workspace advertises the
 // native scheduler capability AND the kill-switch is off.
 func scheduleBackendIsVolume(workspaceID string) bool {
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv(scheduleProxyKillEnv))); v == "1" || v == "true" || v == "yes" {
+	if scheduleProxyKillSwitchEnabled() {
 		return false
 	}
 	return ProvidesNativeScheduler(workspaceID)
+}
+
+// scheduleProxyKillSwitchEnabled reports whether SCHEDULE_VOLUME_PROXY_DISABLED
+// is set truthy — forcing the legacy core-DB path for every workspace. While it
+// is on, the workspace_schedules table cannot be safely dropped (P4b).
+func scheduleProxyKillSwitchEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(scheduleProxyKillEnv)))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 // volumeSchedulerWorkspaceIDs returns the workspaces whose schedule surface is
