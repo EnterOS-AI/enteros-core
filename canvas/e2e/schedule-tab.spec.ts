@@ -5,13 +5,17 @@ import { seedWorkspace, startHeartbeat, cleanupWorkspace } from "./fixtures/chat
 
 /**
  * Scheduler ScheduleTab regression e2e — exercises the Canvas schedule surface
- * end-to-end against the local platform (real workspace_schedules DB): the tab
- * mounts, the create form validates + persists, the row appears, edit/toggle
- * mutate it, RunNow fires the schedule's prompt as an A2A turn to the (echo)
- * runtime, and delete removes it. This is the regression guard the P3-live
- * backend re-point (Canvas → runtime schedule API) must keep green: the visible
- * behaviour + JSON contract (name, cron_expr, timezone, prompt, enabled) is the
- * invariant, independent of whether the store is core Postgres or the volume.
+ * end-to-end against the local platform: the tab mounts, the create form
+ * validates + persists, the row appears, edit/toggle mutate it, RunNow fires the
+ * schedule's prompt as an A2A turn to the (echo) runtime, and delete removes it.
+ *
+ * Post-P4b the store is the runtime VOLUME grid, not core Postgres — the legacy
+ * workspace_schedules table was retired and the Canvas schedule surface forwards
+ * to the runtime's /internal/schedules* API. The echo runtime therefore serves a
+ * faithful in-process grid (see fixtures/echo-runtime.ts), so this remains the
+ * regression guard for the backend re-point: the visible behaviour + JSON
+ * contract (name, cron_expr, timezone, prompt, enabled) is the invariant,
+ * independent of whether the store is core Postgres or the volume.
  */
 
 /** Enter the Org-map view so the React-Flow graph mounts, then open the workspace. */
