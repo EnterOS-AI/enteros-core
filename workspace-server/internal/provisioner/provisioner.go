@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -1442,7 +1443,7 @@ func buildTemplateTar(templatePath string) (*bytes.Buffer, error) {
 		// would extract that as a flat FILE literally named "scripts\boot.sh"
 		// at /configs root instead of a scripts/ directory — the workspace
 		// boots without its nested config layout.
-		header.Name = filepath.ToSlash(rel)
+		header.Name = wirepath.Normalize(rel)
 
 		if info.IsDir() {
 			return tw.WriteHeader(header)
@@ -1508,7 +1509,7 @@ func buildConfigFilesTar(files map[string][]byte) (*bytes.Buffer, error) {
 		// slashes and use path.Dir, never filepath.* — on a Windows host
 		// filepath.Dir("a/b/c") returns `a\b`, and a backslash dir header
 		// extracts on the Linux daemon as a flat literal-backslash file.
-		name := path.Clean(filepath.ToSlash(rawName))
+		name := wirepath.Normalize(rawName)
 		// Create parent directories in tar (deduplicated)
 		dir := path.Dir(name)
 		if dir != "." && dir != "/" && !createdDirs[dir] {

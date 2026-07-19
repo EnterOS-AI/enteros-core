@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 )
 
 // devModeAllowsLoopback reports whether the SSRF defence should permit
@@ -310,7 +312,7 @@ func validateRelPath(filePath string) error {
 	// the API_SERVER_KEY — none of which may be served through the workspace
 	// file API. Deny the subtree at the shared guard so every read/list/write
 	// path (docker exec, EIC, host-mirror) inherits the block.
-	slashClean := filepath.ToSlash(clean)
+	slashClean := wirepath.Normalize(clean)
 	if slashClean == ".hermes" || strings.HasPrefix(slashClean, ".hermes/") {
 		return fmt.Errorf("runtime private state not accessible: %s", filePath)
 	}

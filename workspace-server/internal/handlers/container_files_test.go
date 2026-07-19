@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -130,14 +129,13 @@ func TestDeleteViaEphemeral_ConcatFormDocs(t *testing.T) {
 // 2026-07-19 plugin-delivery incident).
 func TestBuildContainerFilesTar_SlashOnlyDestRootedNames(t *testing.T) {
 	files := map[string]string{
-		"config.yaml":         "tier: 3\n",
-		"skills/foo/SKILL.md": "# Foo\n",
-	}
-	// The literal-backslash key only exercises the normalization on Windows:
-	// filepath.ToSlash is a no-op on Linux, where a backslash is a legal
-	// filename character — normalizing it there would corrupt a real name.
-	if runtime.GOOS == "windows" {
-		files["win\\style\\file.txt"] = "key built with filepath.Join on Windows"
+		"config.yaml":          "tier: 3\n",
+		"skills/foo/SKILL.md":  "# Foo\n",
+		// wirepath.Normalize converts backslashes UNCONDITIONALLY (not just
+		// on Windows), so this assertion runs — and protects — on the Linux
+		// per-PR CI too, closing the "Windows-only behavior is untestable in
+		// CI" gap.
+		"win\\style\\file.txt": "key built with filepath.Join on Windows",
 	}
 
 	buf, err := buildContainerFilesTar("/configs", files)
@@ -176,9 +174,7 @@ func TestBuildContainerFilesTar_SlashOnlyDestRootedNames(t *testing.T) {
 	want := map[string]string{
 		"/configs/config.yaml":         "tier: 3\n",
 		"/configs/skills/foo/SKILL.md": "# Foo\n",
-	}
-	if runtime.GOOS == "windows" {
-		want["/configs/win/style/file.txt"] = "key built with filepath.Join on Windows"
+		"/configs/win/style/file.txt":  "key built with filepath.Join on Windows",
 	}
 	for name, body := range want {
 		if got[name] != body {

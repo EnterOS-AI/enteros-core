@@ -1355,12 +1355,13 @@ type platformLLMEnvResult struct {
 // runtime until one derives to a non-platform vendor arm WITH a usable
 // credential in scope (global or workspace). Returns ok=false when nothing
 // resolves — the caller keeps the historical fail-closed abort.
-func onboardingSelectedFallback(ctx context.Context, manifest *providers.Manifest, runtime string, envVars map[string]string) (string, providers.Provider, bool) {
-	rootID := PlatformAgentID()
-	secrets, _, _, _ := loadWorkspaceSecrets(ctx, rootID)
-	rootModel := strings.TrimSpace(secrets["MODEL"])
+// onboardingModelCandidates expands a stored onboarding model id into the
+// forms to try against a (possibly different) runtime's registry: the raw
+// stored value plus the bare id after a colon (hermes stores
+// `minimax:MiniMax-M3`) or slash. Pure — unit-tested directly.
+func onboardingModelCandidates(rootModel string) []string {
 	if rootModel == "" {
-		return "", providers.Provider{}, false
+		return nil
 	}
 	candidates := []string{rootModel}
 	if i := strings.IndexByte(rootModel, ':'); i >= 0 && i+1 < len(rootModel) {
@@ -1369,8 +1370,18 @@ func onboardingSelectedFallback(ctx context.Context, manifest *providers.Manifes
 	if i := strings.LastIndexByte(rootModel, '/'); i >= 0 && i+1 < len(rootModel) {
 		candidates = append(candidates, rootModel[i+1:])
 	}
+	return candidates
+}
+
+func onboardingSelectedFallback(ctx context.Context, manifest *providers.Manifest, runtime string, envVars map[string]string) (string, providers.Provider, bool) {
+	rootID := PlatformAgentID()
+	secrets, _, _, _ := loadWorkspaceSecrets(ctx, rootID)
+	rootModel := strings.TrimSpace(secrets["MODEL"])
+	if rootModel == "" {
+		return "", providers.Provider{}, false
+	}
 	authEnv := availableAuthEnvNames(envVars)
-	for _, cand := range candidates {
+	for _, cand := range onboardingModelCandidates(rootModel) {
 		p, err := manifest.DeriveProvider(runtime, cand, authEnv)
 		if err != nil || p.IsPlatform() {
 			continue

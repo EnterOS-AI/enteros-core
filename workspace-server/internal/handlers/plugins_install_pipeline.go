@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 	"github.com/gin-gonic/gin"
@@ -701,7 +702,7 @@ func streamDirAsTar(root string, tw *tar.Writer) error {
 		// Windows host and the Linux-side unpack would create flat
 		// literal-backslash filenames (same defect as tarWalk; see its
 		// comment).
-		hdr.Name = filepath.ToSlash(rel)
+		hdr.Name = wirepath.Normalize(rel)
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}

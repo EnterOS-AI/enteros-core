@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"errors"
 	"io"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -85,15 +84,11 @@ func TestBuildConfigFilesTar_SlashOnlyEntryNames(t *testing.T) {
 	files := map[string][]byte{
 		"nested/dir/file.txt": []byte("data"),
 		".auth_token":         []byte("tok"),
+		// wirepath.Normalize converts backslashes UNCONDITIONALLY, so this
+		// assertion runs — and protects — on the Linux per-PR CI too.
+		"win\\style\\key.txt": []byte("from filepath.Join on Windows"),
 	}
-	// Literal-backslash key exercises the normalization only on Windows:
-	// filepath.ToSlash is a no-op on Linux, where a backslash is a legal
-	// filename character.
-	wantNames := []string{"nested/dir/", "nested/dir/file.txt", ".auth_token"}
-	if runtime.GOOS == "windows" {
-		files["win\\style\\key.txt"] = []byte("from filepath.Join on Windows")
-		wantNames = append(wantNames, "win/style/key.txt")
-	}
+	wantNames := []string{"nested/dir/", "nested/dir/file.txt", ".auth_token", "win/style/key.txt"}
 
 	buf, err := buildConfigFilesTar(files)
 	if err != nil {

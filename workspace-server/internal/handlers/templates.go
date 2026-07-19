@@ -6,11 +6,11 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/docker/docker/client"
@@ -939,7 +939,7 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 		// host filepath.Join yields `\configs\...`, making rm -f a silent
 		// no-op. Use -f (not -rf) to avoid recursive deletion of an entire
 		// directory via traversal.
-		_, err := h.execInContainer(ctx, containerName, []string{"rm", "-f", path.Join("/configs", filepath.ToSlash(filePath))})
+		_, err := h.execInContainer(ctx, containerName, []string{"rm", "-f", wirepath.Join("/configs", filePath)})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to delete: %v", err)})
 			return

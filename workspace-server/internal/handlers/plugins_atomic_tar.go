@@ -8,8 +8,9 @@ import (
 	"archive/tar"
 	"io"
 	"os"
-	"path"
 	"path/filepath"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 )
 
 // newTarWriter is a thin wrapper so atomic_test.go can swap the writer
@@ -33,7 +34,7 @@ func tarWalk(hostDir, prefix string, tw *tar.Writer) error {
 	// host landed as garbage in the container's `/`, leaving the concierge
 	// without its management MCP). path.Clean/path.Join are the
 	// slash-native equivalents.
-	prefix = path.Clean(filepath.ToSlash(prefix))
+	prefix = wirepath.Normalize(prefix)
 	return filepath.Walk(hostDir, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -58,7 +59,7 @@ func tarWalk(hostDir, prefix string, tw *tar.Writer) error {
 		if err != nil {
 			return err
 		}
-		hdr.Name = path.Join(prefix, filepath.ToSlash(rel))
+		hdr.Name = wirepath.Join(prefix, rel)
 		if info.IsDir() {
 			hdr.Name += "/"
 		}

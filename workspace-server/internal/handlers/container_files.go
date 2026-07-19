@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/docker/docker/api/types/container"
@@ -176,13 +177,13 @@ func buildContainerFilesTar(destPath string, files map[string]string) (*bytes.Bu
 	// filepath.Join produces backslash entry names, which the Linux daemon
 	// extracts as flat literal-backslash files; and the escape guard below
 	// would false-positive because `\configs\x` has no `/configs` prefix).
-	destSlash := path.Clean(filepath.ToSlash(destPath))
+	destSlash := wirepath.Normalize(destPath)
 	createdDirs := map[string]bool{}
 	for name, content := range files {
 		// Block absolute paths and traversal attempts at the archive-write boundary.
 		// Files are written inside destPath (typically /configs); anything that escapes
 		// via ".." or an absolute name could reach other volumes or system paths.
-		clean := path.Clean(filepath.ToSlash(name))
+		clean := wirepath.Normalize(name)
 		if path.IsAbs(clean) || strings.HasPrefix(clean, "..") {
 			return nil, fmt.Errorf("unsafe file path in archive: %s", name)
 		}
