@@ -580,14 +580,13 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	}
 
 	if c.GetHeader("X-Confirm-Name") != workspaceName {
-		childCount, scheduleCount := destructiveDeleteCounts(ctx, id)
+		childCount := destructiveDeleteCounts(ctx, id)
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":          "destructive_action_requires_confirmation",
 			"hint":           "Re-send the same request with header X-Confirm-Name: " + workspaceName,
 			"workspace_name": workspaceName,
 			"active_tasks":   activeTasks,
 			"child_count":    childCount,
-			"schedule_count": scheduleCount,
 		})
 		return
 	}
@@ -641,8 +640,8 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 
 	// Delegate the cascade to CascadeDelete so the HTTP path and the
 	// OrgImport reconcile path share one teardown sequence (#73 race
-	// guard, container stop, volume removal, token revocation, schedule
-	// disable, broadcast). The HTTP-specific bits — direct-children 409
+	// guard, container stop, volume removal, token revocation,
+	// broadcast). The HTTP-specific bits — direct-children 409
 	// gate above, ?purge=true hard-delete below, response shaping —
 	// stay in this handler.
 	// internal#734: the user can ask to erase saved data (browser profile /
@@ -693,7 +692,9 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 			"workspace_channels", "workspace_config", "workspace_memory",
 			"workspace_token_usage", "approval_requests", "audit_events",
 			"workspace_artifacts", "agents",
-			"workspace_auth_tokens", "workspace_schedules", "canvas_layouts",
+			// schedule rows are covered by their FK ON DELETE CASCADE when the
+			// workspaces row is hard-deleted below.
+			"workspace_auth_tokens", "canvas_layouts",
 		} {
 			if _, err := db.DB.ExecContext(ctx,
 				fmt.Sprintf("DELETE FROM %s WHERE workspace_id = ANY($1::uuid[])", table),
@@ -737,26 +738,20 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "removed", "cascade_deleted": len(descendantIDs)})
 }
 
-func destructiveDeleteCounts(ctx context.Context, id string) (childCount int, scheduleCount int) {
+func destructiveDeleteCounts(ctx context.Context, id string) (childCount int) {
 	if err := db.DB.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM workspaces WHERE parent_id = $1 AND status != 'removed'`, id,
 	).Scan(&childCount); err != nil {
 		log.Printf("Delete: child count failed for %s: %v", id, err)
 		childCount = 0
 	}
-	if err := db.DB.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM workspace_schedules WHERE workspace_id = $1 AND enabled = true`, id,
-	).Scan(&scheduleCount); err != nil {
-		log.Printf("Delete: schedule count failed for %s: %v", id, err)
-		scheduleCount = 0
-	}
-	return childCount, scheduleCount
+	return childCount
 }
 
 // CascadeDelete performs the cascade-removal sequence used by the HTTP
 // DELETE handler and by OrgImport's reconcile mode: walk descendants, mark
 // self+descendants 'removed' first (#73 race guard), stop containers / EC2s,
-// remove volumes, revoke tokens, disable schedules, broadcast events.
+// remove volumes, revoke tokens, broadcast events.
 //
 // Idempotent against already-removed rows (the descendant CTE and all UPDATE
 // guards skip status='removed'). Returns the descendant id list so the HTTP
@@ -768,7 +763,7 @@ func destructiveDeleteCounts(ctx context.Context, id string) (childCount int, sc
 // returns 409 when children exist + ?confirm=true is missing); this helper
 // always cascades.
 // CascadeDelete tears down a workspace and its descendants (stop compute,
-// remove volumes, revoke tokens, disable schedules, broadcast). erase=true
+// remove volumes, revoke tokens, broadcast). erase=true
 // (internal#734) means the user asked to erase saved data, so the CP compute
 // teardown prunes each workspace's durable data volume; the HTTP delete passes
 // the user's choice, the org-import reconcile passes false (a reconcile is not
@@ -819,13 +814,6 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 		pq.Array(allIDs)); err != nil {
 		log.Printf("CascadeDelete token revocation for %s: %v", id, err)
 	}
-	if _, err := db.DB.ExecContext(ctx,
-		`UPDATE workspace_schedules SET enabled = false, updated_at = now()
-		 WHERE workspace_id = ANY($1::uuid[]) AND enabled = true`,
-		pq.Array(allIDs)); err != nil {
-		log.Printf("CascadeDelete schedule disable for %s: %v", id, err)
-	}
-
 	// cleanupCtx is the non-cancelable, time-bounded teardown context: detached
 	// from the request ctx via context.WithoutCancel so a canceled / timed-out
 	// DELETE still runs the stop → remove-volume → broadcast sequence to
@@ -919,9 +907,9 @@ const captureCarryoverBudget = 10 * time.Second
 // continue (NEVER block a delete). Each forward is bounded by fetchScheduleAPI's
 // own deadline, and the WHOLE loop is additionally hard-capped by the caller's
 // captureCarryoverBudget ctx (see CascadeDelete) so N black-holed descendants
-// cannot add N×scheduleForwardTimeout to the DELETE. Legacy DB-backed ids
-// (scheduleBackendIsVolume==false) are skipped — their schedules already persist
-// in workspace_schedules and are re-pointed by the DB-world path.
+// cannot add N×scheduleForwardTimeout to the DELETE. Ids without a native
+// scheduler (ProvidesNativeScheduler==false) are skipped — there is no volume
+// grid to capture for them.
 //
 // F3 — STRUCTURAL "never block a delete": this runs SYNCHRONOUSLY inside
 // CascadeDelete, so the whole body is panic-isolated below (recover-and-don't-
@@ -940,8 +928,8 @@ const captureCarryoverBudget = 10 * time.Second
 // The captured JSON is exactly the filtered array of source='runtime' grid
 // entries. Template-source entries are intentionally NOT captured — the org
 // template reconcile re-seeds those on the successor's volume, so carrying them
-// would duplicate (and, on a name collision, template wins — matching the DB
-// world's NOT EXISTS guard in migrateRuntimeSchedulesFromRemovedPredecessor).
+// would duplicate (and, on a name collision, template wins — the successor's
+// existing grid entry is preserved).
 func captureRuntimeSchedulesForCarryover(ctx context.Context, ids []string) {
 	// F3: panic-isolate the entire capture so a panic can NEVER abort the
 	// synchronous CascadeDelete teardown (recover-and-don't-re-raise, matching
@@ -956,8 +944,8 @@ func captureRuntimeSchedulesForCarryover(ctx context.Context, ids []string) {
 		return
 	}
 	for _, id := range ids {
-		if !scheduleBackendIsVolume(id) {
-			continue // legacy DB-backed workspace — schedules persist in the table
+		if !ProvidesNativeScheduler(id) {
+			continue // no native scheduler — nothing to capture from its volume
 		}
 		wsURL, secret, err := resolveScheduleFanoutTarget(ctx, id)
 		if err != nil {

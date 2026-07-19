@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -17,62 +16,25 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
-// P3-live: volume-authoritative schedule storage.
+// Volume-authoritative schedule storage.
 //
-// When a workspace runs the kind:trigger scheduler plugin it advertises the
-// `scheduler` capability (heartbeat → runtimeOverrides). For such a workspace
-// the schedule *grid* lives on its persisted volume and is owned by the trigger
-// daemon; the core `workspace_schedules` table is NOT the source of truth. Canvas
-// CRUD must therefore be served by the workspace runtime's volume-backed
-// `/internal/schedules*` API rather than the core DB — otherwise a Canvas edit
-// writes a row the daemon never reads (a silent no-op).
-//
-// This is the destination shape of RFC Option A. It is intentionally SELF-DARK:
-// `scheduleBackendIsVolume` is false for every workspace that does not report the
-// `scheduler` capability, so until the trigger-plugin runtime is actually
-// deployed the entire proxy path is unreachable and core keeps serving the DB.
-// The kill-switch env forces the legacy DB path even for native workspaces, an
-// operational escape hatch during the staged cutover.
-
-// scheduleProxyKillEnv, when set truthy, forces the legacy core-DB schedule path
-// even for workspaces that advertise a native scheduler.
-const scheduleProxyKillEnv = "SCHEDULE_VOLUME_PROXY_DISABLED"
+// Schedules are owned by each workspace's kind:trigger scheduler plugin: the
+// grid lives on the workspace's persisted volume behind the runtime's
+// `/internal/schedules*` API, and the trigger daemon fires it. Core no longer
+// stores or fires schedules — it only proxies the Canvas/admin CRUD surface to
+// that volume-backed runtime API. Every workspace that has schedules advertises
+// the `scheduler` capability (heartbeat → runtimeOverrides) and runs the daemon;
+// the legacy dual-path core-DB schedule backend was retired in P4b.
 
 // scheduleForwardTimeout bounds a single forward to the workspace runtime.
 const scheduleForwardTimeout = 15 * time.Second
 
-// scheduleBackendIsVolume reports whether schedule CRUD for this workspace must
-// be proxied to the runtime's volume-backed API rather than served from the core
-// workspace_schedules table. True exactly when the workspace advertises the
-// native scheduler capability AND the kill-switch is off.
-func scheduleBackendIsVolume(workspaceID string) bool {
-	if scheduleProxyKillSwitchEnabled() {
-		return false
-	}
-	return ProvidesNativeScheduler(workspaceID)
-}
-
-// scheduleProxyKillSwitchEnabled reports whether SCHEDULE_VOLUME_PROXY_DISABLED
-// is set truthy — forcing the legacy core-DB path for every workspace. While it
-// is on, the workspace_schedules table cannot be safely dropped (P4b).
-func scheduleProxyKillSwitchEnabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(scheduleProxyKillEnv)))
-	return v == "1" || v == "true" || v == "yes"
-}
-
 // volumeSchedulerWorkspaceIDs returns the workspaces whose schedule surface is
-// served by the runtime volume backend right now: they advertise the native
-// `scheduler` capability AND the kill-switch is off. Sorted (stable) order so
-// fan-out surfaces (webhook cron-poke, admin health) behave deterministically.
+// served by the runtime volume backend — those advertising the native
+// `scheduler` capability. Stable (sorted) order so fan-out surfaces (webhook
+// cron-poke, admin health) behave deterministically.
 func volumeSchedulerWorkspaceIDs() []string {
-	ids := runtimeOverrides.WorkspacesWithCapability("scheduler")
-	out := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if scheduleBackendIsVolume(id) {
-			out = append(out, id)
-		}
-	}
-	return out
+	return runtimeOverrides.WorkspacesWithCapability("scheduler")
 }
 
 // volumeEntry is one schedule as the runtime's SDK-owned grid contract names its
@@ -458,104 +420,6 @@ func (h *ScheduleHandler) healthVolume(c *gin.Context, workspaceID string) {
 		out = append(out, s)
 	}
 	c.JSON(http.StatusOK, out)
-}
-
-// MigrateToVolume copies a workspace's user-created (source='runtime') schedules
-// from the core workspace_schedules table into its volume grid via the runtime
-// API. Template-source schedules are NOT copied — they are re-seeded on the
-// volume by the org-template reconcile channel, so copying them here would
-// duplicate. Idempotent: entries whose name already exists on the volume are
-// skipped, so re-running (or running before every workspace is cut over) never
-// double-writes or errors. This is the DB→volume data step of the Option-A
-// cutover; run it per workspace once its trigger plugin is live, before core
-// stops writing the table (P4).
-//
-//	@Summary	Migrate a workspace's schedules from the core DB to its volume
-//	@Tags		schedules
-//	@Produce	json
-//	@Param		id	path	string	true	"Workspace ID"
-//	@Success	200	{object}	map[string]int
-//	@Router		/admin/workspaces/{id}/schedules/migrate-to-volume [post]
-func (h *ScheduleHandler) MigrateToVolume(c *gin.Context) {
-	workspaceID := c.Param("id")
-	ctx := c.Request.Context()
-
-	if !ProvidesNativeScheduler(workspaceID) {
-		c.JSON(http.StatusConflict, gin.H{
-			"error": "workspace does not advertise a native scheduler; nothing to migrate to (install the trigger plugin first)",
-		})
-		return
-	}
-
-	// Existing volume names — for idempotency, we never re-create these.
-	status, body, ok := h.forwardScheduleAPI(c, workspaceID, http.MethodGet, "", nil)
-	if !ok {
-		return
-	}
-	if status != http.StatusOK {
-		relayScheduleError(c, status, body)
-		return
-	}
-	var existing struct {
-		Schedules []volumeEntry `json:"schedules"`
-	}
-	_ = json.Unmarshal(body, &existing)
-	onVolume := make(map[string]bool, len(existing.Schedules))
-	for _, e := range existing.Schedules {
-		onVolume[e.Name] = true
-	}
-
-	rows, err := db.DB.QueryContext(ctx, `
-		SELECT name, cron_expr, timezone, prompt, enabled
-		FROM workspace_schedules
-		WHERE workspace_id = $1 AND source = 'runtime'
-		ORDER BY created_at ASC
-	`, workspaceID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read schedules"})
-		return
-	}
-	defer rows.Close()
-
-	migrated, skipped, failed := 0, 0, 0
-	for rows.Next() {
-		var e volumeEntry
-		if err := rows.Scan(&e.Name, &e.Cron, &e.Timezone, &e.Prompt, &e.Enabled); err != nil {
-			failed++
-			continue
-		}
-		if onVolume[e.Name] {
-			skipped++
-			continue
-		}
-		e.Source = "runtime"
-		raw, _ := json.Marshal(e)
-		st, _, fok := h.forwardScheduleAPI(c, workspaceID, http.MethodPost, "", raw)
-		if !fok {
-			return // forward wrote the error response
-		}
-		if st == http.StatusCreated {
-			migrated++
-			onVolume[e.Name] = true
-		} else {
-			failed++
-		}
-	}
-	// A mid-stream read error ends rows.Next() with no Scan error; surface it so a
-	// truncated migration is never reported as complete. (The fleet twin,
-	// migrateWorkspaceRuntimeToVolume in schedules_p4b.go, keeps the same guard —
-	// the two intentionally differ only in transport: gin forward vs quiet fan-out.)
-	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "schedule read did not complete; migration may be partial"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"workspace_id": workspaceID,
-		"migrated":     migrated,
-		"skipped":      skipped, // already present on the volume (idempotent)
-		"failed":       failed,
-	})
 }
 
 // relayScheduleError forwards a non-2xx runtime response, mapping the runtime's

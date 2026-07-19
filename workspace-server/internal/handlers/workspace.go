@@ -1091,11 +1091,10 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// plugin BEFORE the provision dispatch. provisionWorkspaceAuto spawns the
 	// provision goroutine that assembles MOLECULE_DECLARED_PLUGINS from
 	// workspace_declared_plugins (buildProvisionerConfig →
-	// desiredPluginSources); the declare used to run only inside
-	// seedTemplateSchedules AFTER the dispatch, so first boot RACED the
-	// declaration and could come up without the scheduler daemon until the
-	// next online reconcile. Parsing here also feeds the post-provision DB
-	// seed below (single parse). Non-fatal: a broken schedules block or a
+	// desiredPluginSources), so the declare must land first or first boot races
+	// the declaration and could come up without the scheduler daemon until the
+	// next online reconcile. The parsed schedules also feed the config.yaml
+	// render below (single parse). Non-fatal: a broken schedules block or a
 	// declare hiccup must never block workspace creation.
 	var templateScheds []OrgSchedule
 	if templatePath != "" {
@@ -1135,11 +1134,10 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// its place. Reuses renderTemplateSchedulesYAML + appendYAMLBlockChecked
 			// verbatim — same caps / name-contract / prompt-inlining / yaml-emitter
 			// round-trip guards as the org-import leg. Prompt refs resolve against
-			// templatePath (filesDir="") exactly like seedTemplateSchedules.
+			// templatePath (filesDir="") the same as the org-import render leg.
 			//
-			// The legacy workspace_schedules DB seed further below KEEPS running
-			// during the cutover — a later gated PR (P4b) retires it; this is the
-			// additive volume precondition. Must run BEFORE provisionWorkspaceAuto,
+			// This is now the ONLY schedule delivery path — the legacy core-DB
+			// seed was retired in P4b. Must run BEFORE provisionWorkspaceAuto,
 			// which captures configFiles for the provision goroutine. Byte-
 			// identical when the template renders no schedules (nothing is
 			// stripped or appended — configFiles stays nil, the template copy
@@ -1187,30 +1185,6 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			ON CONFLICT (workspace_id) DO UPDATE SET data = $2::jsonb
 		`, id, cfgJSON); err != nil {
 			log.Printf("Create: workspace_config persist failed for %s: %v", id, err)
-		}
-	}
-
-	// Seed schedules declared in the workspace template's config.yaml
-	// AFTER provisionWorkspaceAuto succeeds so the scheduler never
-	// fires cron rows against a workspace whose backend never wired
-	// (review feedback PR #1929#1). Async provider provisioning may still
-	// fail downstream; scheduler.go is expected to handle non-online
-	// status as a no-op tick. Idempotent across re-creates via
-	// orgImportScheduleSQL's ON CONFLICT clause; runtime-added rows
-	// are preserved (Issue #24 contract). Restart does not re-seed
-	// (so user-deleted template rows stay deleted). templateScheds was
-	// parsed above, pre-dispatch (C2 ordering) — only the DB seed waits
-	// for the provision verdict.
-	//
-	// Non-fatal: a broken schedules: block must never block workspace
-	// provisioning — the workspace row is already live and the grid
-	// is recoverable via POST /workspaces/{id}/schedules.
-	if provisionOK && templatePath != "" && len(templateScheds) > 0 {
-		seeded, skipped := seedTemplateSchedules(ctx, id, templatePath, templateScheds)
-		if skipped > 0 {
-			log.Printf("Create %s: template schedule partial-seed: seeded=%d skipped=%d total=%d", id, seeded, skipped, len(templateScheds))
-		} else {
-			log.Printf("Create %s: seeded %d/%d template schedules", id, seeded, len(templateScheds))
 		}
 	}
 

@@ -1135,9 +1135,6 @@ func TestWorkspaceDelete_CascadeWithChildren(t *testing.T) {
 	// Token revocation: once a workspace is gone its auth tokens are meaningless.
 	mock.ExpectExec("UPDATE workspace_auth_tokens SET revoked_at").
 		WillReturnResult(sqlmock.NewResult(0, 2))
-	// #1027: cascade-disable schedules for deleted workspaces.
-	mock.ExpectExec("UPDATE workspace_schedules SET enabled = false").
-		WillReturnResult(sqlmock.NewResult(0, 3))
 	// Broadcast for child WORKSPACE_REMOVED (fires during the descendant loop).
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -1207,9 +1204,6 @@ func TestWorkspaceDelete_DisablesSchedules(t *testing.T) {
 	// Token revocation
 	mock.ExpectExec("UPDATE workspace_auth_tokens SET revoked_at").
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	// #1027: schedule disable — expect exactly this UPDATE to fire
-	mock.ExpectExec("UPDATE workspace_schedules SET enabled = false").
-		WillReturnResult(sqlmock.NewResult(0, 2)) // 2 schedules disabled
 	// Broadcast WORKSPACE_REMOVED for the workspace itself
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -1268,9 +1262,6 @@ func TestWorkspaceDelete_CascadeDisablesDescendantSchedules(t *testing.T) {
 	// Token revocation
 	mock.ExpectExec("UPDATE workspace_auth_tokens SET revoked_at").
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	// #1027: schedule disable — covers parent + child + grandchild in one batch
-	mock.ExpectExec("UPDATE workspace_schedules SET enabled = false").
-		WillReturnResult(sqlmock.NewResult(0, 5)) // 5 total schedules across 3 workspaces
 	// Broadcast for child WORKSPACE_REMOVED
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -1339,11 +1330,6 @@ func TestWorkspaceDelete_ScheduleDisableOnlyTargetsDeletedWorkspace(t *testing.T
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("UPDATE workspace_auth_tokens SET revoked_at").
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	// Schedule disable fires only for wsA's IDs — sqlmock enforces query ordering
-	// so if the production code somehow included wsB it would be a different
-	// query argument and fail to match.
-	mock.ExpectExec("UPDATE workspace_schedules SET enabled = false").
-		WillReturnResult(sqlmock.NewResult(0, 0)) // wsA had no schedules
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 

@@ -12,8 +12,8 @@ package handlers
 // (POST /internal/daemons/reload, molecule-ai-workspace-runtime#308).
 //
 // This is additive: it only ever adds a declaration + best-effort reload for
-// workspaces that touch schedules. It does not change the schedule storage
-// routing (volume vs the legacy DB table) — that cutover is P4b.
+// workspaces that touch schedules. Schedule storage is volume-authoritative
+// (the legacy core-DB schedule backend was retired in P4b).
 
 import (
 	"bytes"
@@ -23,8 +23,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/gin-gonic/gin"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
@@ -135,75 +133,4 @@ func ensureAndArmSchedulerPlugin(ctx context.Context, workspaceID string) error 
 		armSchedulerPlugin(actx, wsID)
 	})
 	return nil
-}
-
-// BackfillSchedulerPlugin remediates the P4 gap for EXISTING scheduled
-// workspaces: those with rows in workspace_schedules created before per-workspace
-// delivery existed have no scheduler plugin, so post-P4 their schedules fire
-// nowhere. This declares molecule-scheduler for each such workspace (and, when
-// applying, best-effort arms it).
-//
-// DRY-RUN BY DEFAULT — returns the affected workspace list and counts WITHOUT
-// mutating. Pass ?apply=true to actually declare + arm. This lets an operator
-// review the exact blast radius (and hand it to the CTO) before touching prod.
-//
-//	@Router	/admin/schedules/backfill-plugin [post]
-//	@Security	AdminAuth
-func (h *ScheduleHandler) BackfillSchedulerPlugin(c *gin.Context) {
-	ctx := c.Request.Context()
-	apply := strings.EqualFold(strings.TrimSpace(c.Query("apply")), "true")
-
-	rows, err := db.DB.QueryContext(ctx,
-		`SELECT DISTINCT workspace_id FROM workspace_schedules ORDER BY workspace_id`)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to enumerate scheduled workspaces"})
-		return
-	}
-	defer rows.Close()
-	var workspaceIDs []string
-	for rows.Next() {
-		var id string
-		if scanErr := rows.Scan(&id); scanErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to scan workspace id"})
-			return
-		}
-		workspaceIDs = append(workspaceIDs, id)
-	}
-	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "row iteration failed"})
-		return
-	}
-
-	if !apply {
-		c.JSON(http.StatusOK, gin.H{
-			"dry_run":       true,
-			"would_declare": len(workspaceIDs),
-			"plugin":        SchedulerPluginName,
-			"source":        SchedulerPluginSource,
-			"workspace_ids": workspaceIDs,
-			"note":          "no changes made — re-run with ?apply=true to declare + arm",
-		})
-		return
-	}
-
-	var declared, failed int
-	failures := map[string]string{}
-	for _, id := range workspaceIDs {
-		if err := ensureAndArmSchedulerPlugin(ctx, id); err != nil {
-			failed++
-			failures[id] = err.Error()
-			log.Printf("scheduler-backfill: declare failed for %s: %v", id, err)
-			continue
-		}
-		declared++
-	}
-	log.Printf("scheduler-backfill: applied — declared=%d failed=%d of %d scheduled workspace(s)", declared, failed, len(workspaceIDs))
-	c.JSON(http.StatusOK, gin.H{
-		"dry_run":  false,
-		"declared": declared,
-		"failed":   failed,
-		"total":    len(workspaceIDs),
-		"plugin":   SchedulerPluginName,
-		"failures": failures,
-	})
 }
