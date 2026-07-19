@@ -135,3 +135,35 @@ func TestDockerBuildProd_NonZeroExitSurfacesOutput(t *testing.T) {
 		t.Errorf("build error did not surface docker output: %v", err)
 	}
 }
+
+// buildkitQuietPhaseExempt must recognize the tail of a build that is inside
+// BuildKit's final export/unpack phase (legitimately silent — local I/O only,
+// can run minutes on a multi-GB image with zero output) and NOTHING else.
+// Pure function — runs on every platform, including Windows where the
+// process-driving tests skip. 2026-07-18 fresh-onboarding regression: the
+// silent unpack of the ~7GB hermes image exceeded the 4m stall grace and
+// every first-boot self-host provision was killed mid-unpack.
+func TestBuildkitQuietPhaseExempt(t *testing.T) {
+	cases := []struct {
+		name string
+		tail string
+		want bool
+	}{
+		{"unpack in progress", "#26 naming to docker.io/x done\n#26 unpacking to docker.io/molecule-local/workspace-template-hermes:4dad19390d61-amd64\n", true},
+		{"export layers in progress", "#25 DONE 0.1s\n\n#26 exporting to image\n#26 exporting layers\n", true},
+		{"unpack finished (done suffix)", "#26 unpacking to docker.io/x 210.4s done\n", false},
+		{"phase block finished (DONE)", "#26 unpacking to docker.io/x done\n#26 DONE 212.0s\n", false},
+		{"silent RUN step is NOT exempt", "#24 [18/21] RUN curl -fsSL https://example.com/install.sh | bash\n", false},
+		{"pip step is NOT exempt", "#12 RUN pip install --no-cache-dir -r requirements.txt\n", false},
+		{"empty tail", "", false},
+		{"whitespace only", "\n\n  \n", false},
+		{"unpack mentioned mid-log but later output exists", "#26 unpacking to docker.io/x\n#27 writing sbom\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildkitQuietPhaseExempt([]byte(tc.tail)); got != tc.want {
+				t.Errorf("buildkitQuietPhaseExempt(%q) = %v, want %v", tc.tail, got, tc.want)
+			}
+		})
+	}
+}

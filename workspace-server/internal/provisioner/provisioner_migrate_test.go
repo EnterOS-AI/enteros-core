@@ -63,6 +63,10 @@ func (f *fakeDockerClient) ContainerExecCreate(ctx context.Context, ctr string, 
 	return container.ExecCreateResponse{}, errors.New("not implemented")
 }
 
+func (f *fakeDockerClient) ContainerExecInspect(ctx context.Context, execID string) (container.ExecInspect, error) {
+	return container.ExecInspect{}, errors.New("not implemented")
+}
+
 func (f *fakeDockerClient) ContainerInspect(ctx context.Context, name string) (container.InspectResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

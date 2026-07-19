@@ -74,6 +74,53 @@ func TestWriteFilesToContainerTar_FilesAreAgentOwned(t *testing.T) {
 	}
 }
 
+// TestBuildConfigFilesTar_SlashOnlyEntryNames pins the Windows-host fix: tar
+// entry names (including parent-dir headers) must be slash-only regardless of
+// host OS and even when a caller built the map key with filepath.Join on
+// Windows. A backslash dir header ("nested\dir/") extracts on the Linux
+// daemon as ONE flat literal-backslash filename — same bug class as the
+// 2026-07-19 plugin-delivery incident.
+func TestBuildConfigFilesTar_SlashOnlyEntryNames(t *testing.T) {
+	files := map[string][]byte{
+		"nested/dir/file.txt": []byte("data"),
+		"win\\style\\key.txt": []byte("from filepath.Join on Windows"),
+		".auth_token":         []byte("tok"),
+	}
+
+	buf, err := buildConfigFilesTar(files)
+	if err != nil {
+		t.Fatalf("buildConfigFilesTar: %v", err)
+	}
+
+	tr := tar.NewReader(buf)
+	seen := map[string]bool{}
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read tar: %v", err)
+		}
+		if _, err := io.Copy(io.Discard, tr); err != nil {
+			t.Fatalf("drain %s: %v", hdr.Name, err)
+		}
+		if strings.Contains(hdr.Name, `\`) {
+			t.Fatalf("tar entry %q contains a backslash — Windows path separator leaked into the tar", hdr.Name)
+		}
+		if hdr.Typeflag == tar.TypeDir && !strings.HasSuffix(hdr.Name, "/") {
+			t.Fatalf("dir entry %q missing trailing slash", hdr.Name)
+		}
+		seen[hdr.Name] = true
+	}
+
+	for _, want := range []string{"nested/dir/", "nested/dir/file.txt", "win/style/key.txt", ".auth_token"} {
+		if !seen[want] {
+			t.Fatalf("tar missing %q (seen: %v)", want, seen)
+		}
+	}
+}
+
 // TestWriteAuthTokenVolumeCmd_ChownsToAgent covers the issue #1877 pre-start
 // volume-write path (WriteAuthTokenToVolume): the throwaway alpine container
 // writes /vol/.auth_token then chmod 0600 but, pre-fix, never chowns it, so it

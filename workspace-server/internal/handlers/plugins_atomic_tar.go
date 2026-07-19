@@ -8,6 +8,7 @@ import (
 	"archive/tar"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 )
 
@@ -24,7 +25,15 @@ func newTarWriter(w io.Writer) *tar.Writer {
 // The trailing-slash on prefix is normalized away: prefix "foo" and
 // prefix "foo/" produce identical archives.
 func tarWalk(hostDir, prefix string, tw *tar.Writer) error {
-	prefix = filepath.Clean(prefix)
+	// Tar entry names MUST use forward slashes regardless of host OS:
+	// filepath.Clean/Join on a Windows host produce backslashes, and the
+	// Linux docker daemon extracts `configs\plugins\...\plugin.yaml` as ONE
+	// flat literal-backslash FILE in the extraction root instead of a
+	// directory tree (2026-07-19: every plugin "install" from a Windows
+	// host landed as garbage in the container's `/`, leaving the concierge
+	// without its management MCP). path.Clean/path.Join are the
+	// slash-native equivalents.
+	prefix = path.Clean(filepath.ToSlash(prefix))
 	return filepath.Walk(hostDir, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -49,7 +58,7 @@ func tarWalk(hostDir, prefix string, tw *tar.Writer) error {
 		if err != nil {
 			return err
 		}
-		hdr.Name = filepath.Join(prefix, rel)
+		hdr.Name = path.Join(prefix, filepath.ToSlash(rel))
 		if info.IsDir() {
 			hdr.Name += "/"
 		}

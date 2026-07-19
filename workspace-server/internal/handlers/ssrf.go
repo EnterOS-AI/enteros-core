@@ -304,5 +304,15 @@ func validateRelPath(filePath string) error {
 	if strings.Contains(filePath, "..") || strings.Contains(clean, "..") {
 		return fmt.Errorf("path traversal or absolute path not allowed: %s", filePath)
 	}
+	// Runtime private state: /configs/.hermes is the hermes daemon's home
+	// (persisted there so sessions survive container recreates). It holds the
+	// rendered .env (plaintext provider API keys), session transcripts, and
+	// the API_SERVER_KEY — none of which may be served through the workspace
+	// file API. Deny the subtree at the shared guard so every read/list/write
+	// path (docker exec, EIC, host-mirror) inherits the block.
+	slashClean := filepath.ToSlash(clean)
+	if slashClean == ".hermes" || strings.HasPrefix(slashClean, ".hermes/") {
+		return fmt.Errorf("runtime private state not accessible: %s", filePath)
+	}
 	return nil
 }

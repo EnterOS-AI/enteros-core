@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"archive/tar"
+	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -104,6 +107,85 @@ func TestDeleteViaEphemeral_ConcatFormDocs(t *testing.T) {
 	}
 	if !strings.Contains(src, `"/configs/" + filePath`) {
 		t.Error("deleteViaEphemeral does not use concat form; F1085 fix may be missing or reverted")
+	}
+}
+
+// TestBuildContainerFilesTar_SlashOnlyDestRootedNames pins the Windows-host
+// contract for the Files-API write path (copyFilesToContainer): tar entry
+// names are CONTAINER (Linux) paths and must be slash-only regardless of host
+// OS. Pre-fix, filepath.Join on a Windows host produced `\configs\x` entry
+// names — which both tripped the destPath escape guard (spurious "path escapes
+// destination" on every save) and, where they slipped through, extracted on
+// the Linux daemon as flat literal-backslash files (same bug class as the
+// 2026-07-19 plugin-delivery incident).
+func TestBuildContainerFilesTar_SlashOnlyDestRootedNames(t *testing.T) {
+	files := map[string]string{
+		"config.yaml":          "tier: 3\n",
+		"skills/foo/SKILL.md":  "# Foo\n",
+		"win\\style\\file.txt": "key built with filepath.Join on Windows",
+	}
+
+	buf, err := buildContainerFilesTar("/configs", files)
+	if err != nil {
+		t.Fatalf("buildContainerFilesTar: %v", err)
+	}
+
+	got := map[string]string{}
+	tr := tar.NewReader(buf)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read tar: %v", err)
+		}
+		if strings.Contains(hdr.Name, `\`) {
+			t.Fatalf("tar entry %q contains a backslash — Windows path separator leaked into the tar", hdr.Name)
+		}
+		if !strings.HasPrefix(hdr.Name, "/configs/") {
+			t.Fatalf("tar entry %q not rooted under /configs/", hdr.Name)
+		}
+		if hdr.Typeflag == tar.TypeDir && !strings.HasSuffix(hdr.Name, "/") {
+			t.Fatalf("dir entry %q missing trailing slash", hdr.Name)
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			body, err := io.ReadAll(tr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got[hdr.Name] = string(body)
+		}
+	}
+
+	want := map[string]string{
+		"/configs/config.yaml":         "tier: 3\n",
+		"/configs/skills/foo/SKILL.md": "# Foo\n",
+		"/configs/win/style/file.txt":  "key built with filepath.Join on Windows",
+	}
+	for name, body := range want {
+		if got[name] != body {
+			t.Errorf("body[%q] = %q; want %q", name, got[name], body)
+		}
+	}
+}
+
+// TestBuildContainerFilesTar_RejectsEscapes: absolute names and ".." names
+// that would climb out of destPath must be refused; a benign embedded ".."
+// that cleans to a safe in-destination path stays accepted.
+func TestBuildContainerFilesTar_RejectsEscapes(t *testing.T) {
+	for _, name := range []string{
+		"../outside.txt",
+		"..\\outside.txt",
+		"/etc/passwd",
+		"a/../../outside.txt",
+	} {
+		if _, err := buildContainerFilesTar("/configs", map[string]string{name: "x"}); err == nil {
+			t.Errorf("name %q: expected escape/unsafe-path error, got nil", name)
+		}
+	}
+	if _, err := buildContainerFilesTar("/configs", map[string]string{"a/../b.txt": "x"}); err != nil {
+		t.Errorf("a/../b.txt should be accepted (cleans to b.txt): %v", err)
 	}
 }
 

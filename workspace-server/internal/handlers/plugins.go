@@ -3,7 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
-	"io"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -301,7 +301,25 @@ func (h *PluginsHandler) execInContainerAs(ctx context.Context, containerName, u
 		return "", err
 	}
 	defer resp.Close()
-	var stdout bytes.Buffer
-	stdcopy.StdCopy(&stdout, io.Discard, resp.Reader)
+	var stdout, stderr bytes.Buffer
+	stdcopy.StdCopy(&stdout, &stderr, resp.Reader)
+	// Surface the exit code. This helper's callers have ALWAYS assumed
+	// "non-zero exit → non-nil error" (atomicCopyToContainer branches its
+	// snapshot/rollback logic on it, and documents that contract) — but the
+	// pre-2026-07-19 implementation never inspected it, so every failed
+	// `test`/`mv`/`touch` looked like success. That masking let a plugin
+	// install whose tar extracted to garbage report "installed" while the
+	// box had nothing (the concierge-without-management-MCP incident).
+	inspect, ierr := h.docker.ContainerExecInspect(ctx, execID.ID)
+	if ierr != nil {
+		return strings.TrimSpace(stdout.String()), fmt.Errorf("exec inspect %v: %w", cmd, ierr)
+	}
+	if inspect.ExitCode != 0 {
+		errText := strings.TrimSpace(stderr.String())
+		if errText == "" {
+			errText = strings.TrimSpace(stdout.String())
+		}
+		return strings.TrimSpace(stdout.String()), fmt.Errorf("exec %v: exit %d: %s", cmd, inspect.ExitCode, errText)
+	}
 	return strings.TrimSpace(stdout.String()), nil
 }

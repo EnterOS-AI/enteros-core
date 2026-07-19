@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -496,7 +497,7 @@ func (h *TemplatesHandler) ListFiles(c *gin.Context) {
 		// Uses find + sh -c stat to output TYPE|SIZE|PATH per line.
 		output, err := h.execInContainer(ctx, containerName, []string{
 			"sh", "-c",
-			fmt.Sprintf(`find '%s' -maxdepth %d -not -path '*/.git/*' -not -path '*/__pycache__/*' -not -path '*/node_modules/*' -not -name .DS_Store | while IFS= read -r f; do
+			fmt.Sprintf(`find '%s' -maxdepth %d -not -path '*/.git/*' -not -path '*/__pycache__/*' -not -path '*/node_modules/*' -not -path '*/.hermes' -not -path '*/.hermes/*' -not -name .DS_Store | while IFS= read -r f; do
 				rel="${f#'%s'/}"; [ "$rel" = '%s' ] && continue; [ -z "$rel" ] && continue
 				if [ -d "$f" ]; then echo "d|0|$rel"; else s=$(stat -c %%s "$f" 2>/dev/null || stat -f %%z "$f" 2>/dev/null || echo 0); echo "f|$s|$rel"; fi
 			done`, listPath, depth, listPath, listPath),
@@ -931,11 +932,14 @@ func (h *TemplatesHandler) DeleteFile(c *gin.Context) {
 
 	// Delete via docker exec when container is running
 	if containerName := h.findContainer(ctx, workspaceID); containerName != "" {
-		// CWE-78: use filepath.Join instead of string concat to prevent path
+		// CWE-78: use path.Join instead of string concat to prevent path
 		// injection into the exec argument. validateRelPath above is the primary
-		// guard; filepath.Join is defence-in-depth. Use -f (not -rf) to avoid
-		// recursive deletion of an entire directory via traversal.
-		_, err := h.execInContainer(ctx, containerName, []string{"rm", "-f", filepath.Join("/configs", filePath)})
+		// guard; path.Join is defence-in-depth. It must be path.Join, NOT
+		// filepath.Join: this is a container (Linux) path, and on a Windows
+		// host filepath.Join yields `\configs\...`, making rm -f a silent
+		// no-op. Use -f (not -rf) to avoid recursive deletion of an entire
+		// directory via traversal.
+		_, err := h.execInContainer(ctx, containerName, []string{"rm", "-f", path.Join("/configs", filepath.ToSlash(filePath))})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to delete: %v", err)})
 			return
