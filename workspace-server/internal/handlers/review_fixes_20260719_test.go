@@ -87,7 +87,9 @@ func TestEnqueueRestartContext_PriorityAndIdempotency(t *testing.T) {
 	mock := setupTestDB(t)
 
 	restartAt := time.Unix(1_770_000_000, 0)
-	wantKey := "restart-context-ws-42-1770000000"
+	// Keyed per WORKSPACE (no restart timestamp): consecutive restarts must
+	// collapse to one queued snapshot, not stack one message per attempt.
+	wantKey := "restart-context-ws-42"
 
 	// Supersede-expired sweep for the same key, then the keyed INSERT.
 	mock.ExpectExec("UPDATE a2a_queue").

@@ -288,8 +288,13 @@ func buildRestartA2APayload(text string) ([]byte, error) {
 				"role":      "user",
 				"parts":     []any{map[string]any{"kind": "text", "text": text}},
 				"metadata": map[string]any{
-					"source":          "platform",
-					"kind":            "restart_context",
+					"source": "platform",
+					"kind":   "restart_context",
+					// SSOT self-message classifier (messagestore.selfSourceTypes):
+					// renders as a system notice, never a blue user bubble —
+					// required since the durable-enqueue path routes this
+					// through the ordinary ingest persist.
+					"source_type":     "self-restart-context",
 					"layer":           1,
 					"restart_context": true,
 				},
@@ -396,7 +401,13 @@ func (h *WorkspaceHandler) enqueueRestartContext(ctx context.Context, workspaceI
 	qCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
 	expires := time.Now().Add(restartContextQueueTTL)
-	idem := fmt.Sprintf("restart-context-%s-%d", workspaceID, data.RestartAt.Unix())
+	// Keyed per WORKSPACE, not per restart: rapid consecutive restarts (e.g.
+	// image-build failures then success) must collapse to ONE queued context
+	// snapshot — three restarts on 2026-07-19 delivered three stacked wake
+	// messages into the same session. EnqueueA2A's active-row conflict keeps
+	// the first pending snapshot; content staleness across a few minutes is
+	// harmless (the message is a generic "you restarted" nudge).
+	idem := "restart-context-" + workspaceID
 	// Priority 90 (> default 50; drain is ORDER BY priority DESC) so the
 	// context snapshot is dispatched BEFORE any queued user message in the
 	// same drain pass — the boot turn should precede the user's turn, which
