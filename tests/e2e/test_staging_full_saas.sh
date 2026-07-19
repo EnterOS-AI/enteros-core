@@ -704,14 +704,21 @@ print(s[:4000])
 # diagnostic. Every attempt is logged, so a transient that self-heals stays
 # visible and is never silently masked.
 #
-# The attempt budget is small on purpose: the cold window is ~1-2s, so a few
-# ~2s retries cover it while a DETERMINISTIC transient still fails RED in
-# seconds rather than burning a multi-minute budget into a CI job timeout.
+# The attempt budget stays bounded but must cover the ACTUAL cold window: the
+# core#4307 RCA estimated ~1-2s, but under concurrent-provision load on the
+# shared staging docker host the tenant origin warms slower — run 546336
+# (Platform Boot) saw a persistent empty-body 503 from Cloudflare across the old
+# 4-attempt / ~8s budget. 8 attempts at Retry-After ~2s (~16s) covers the
+# observed longer window. This does NOT slow the deterministic-failure path: a
+# non-cold status (JSON app error, 502/504) is surfaced on attempt 1 by
+# create_should_retry_cold, so ONLY a genuinely-persistent cold-origin transient
+# consumes the budget — and a never-warming origin still fails RED in ~16s, well
+# under a CI job timeout. Env-overridable for a still-longer window if needed.
 #
 # Args: $1 = human label, $2 = headers dump file (-D target). Remaining args are
 # passed verbatim to `tenant_call POST /workspaces` (payload etc.). Echoes the
 # final response body on stdout; leaves the final response headers in $2.
-CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-4}"
+CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-8}"
 create_workspace_post() {
   local label="$1" hdrs="$2"; shift 2
   local attempt resp id status ra who
