@@ -4770,3 +4770,191 @@ def test_live_premerge_status_regressions_helper(monkeypatch):
     )
     assert regressions  # non-empty → abort
     assert any("CI / all-required" in r for r in regressions)
+
+
+# --------------------------------------------------------------------------
+# BP-read 403 fallback (repo-wide merge-queue jam regression)
+# --------------------------------------------------------------------------
+# The `/branch_protections/{branch}` READ endpoint is admin-only. The queue's
+# non-bypass merge actor is a WRITE collaborator (least privilege — write is all
+# it needs to merge), so this read legitimately 403s. Fail-closing on that 403
+# red-stamped `gitea-merge-queue / queue` on EVERY PR under a `['*']` BP and
+# jammed the whole repo. The fix: on 403, FALL BACK to Gitea's own merge-time
+# enforcement (the protected merge endpoint re-checks BP server-side and 405s an
+# unready PR) instead of holding the whole tick.
+
+
+def test_get_branch_protection_falls_back_to_env_on_403(monkeypatch):
+    """The admin-only /branch_protections read 403s for the write-scoped merge
+    actor. get_branch_protection must NOT raise (fail-closed) — it must return a
+    fallback BranchProtection(fallback=True) with the SAFE env-derived gate."""
+    def forbid(method, path, *, body=None, query=None, expect_json=True):
+        assert "branch_protections" in path
+        raise mq.ApiError(
+            f"GET {path} -> HTTP 403: user should be an owner or a "
+            "collaborator with admin write of a repository"
+        )
+    monkeypatch.setattr(mq, "api", forbid)
+    bp = mq.get_branch_protection("main")
+    assert bp.fallback is True
+    # Approval FLOOR preserved (never 0). This is the ONLY approval gate when a
+    # repo's BP records required_approvals=0 (Gitea then enforces none at merge).
+    assert bp.required_approvals == mq.REQUIRED_APPROVALS_DEFAULT
+    assert bp.required_approvals >= 1
+    # Client context set = the env aggregator (a SUBSET of the real '*', so it
+    # can never be LESS strict than Gitea's own server-side merge check).
+    assert bp.required_contexts == mq.required_contexts(mq.REQUIRED_CONTEXTS_RAW)
+
+
+def test_get_branch_protection_still_fail_closed_on_non_403(monkeypatch):
+    """A transient 5xx/network error is NOT a deterministic permission state and
+    could self-resolve — it must stay FAIL-CLOSED (HOLD the tick, retry next
+    tick), never drop to the permissive fallback on a possible Gitea blip."""
+    def flaky(method, path, *, body=None, query=None, expect_json=True):
+        raise mq.ApiError(f"GET {path} -> HTTP 502: bad gateway")
+    monkeypatch.setattr(mq, "api", flaky)
+    with pytest.raises(mq.BranchProtectionUnavailable):
+        mq.get_branch_protection("main")
+
+
+def _setup_bp403_process_once(monkeypatch, *, reviews, merge_fn):
+    """Wire process_once so the ONLY authoritative branch-protection read
+    (get_branch_protection -> api) 403s, exercising the REAL fallback end to
+    end. Every other collaborator is faked. `reviews` sets the PR approval
+    state; `merge_fn` the merge outcome. Returns (head_sha, main_sha)."""
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-controlplane")
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "QUEUE_LABEL", "merge-queue")
+    monkeypatch.setattr(mq, "HOLD_LABEL", "merge-queue-hold")
+    monkeypatch.setattr(mq, "AUTO_DISCOVER", True)
+    monkeypatch.setattr(
+        mq, "OPT_OUT_LABELS", {"merge-queue-hold", "do-not-auto-merge", "wip"}
+    )
+    monkeypatch.setattr(mq, "REVIEWER_SET", REVIEWERS)
+
+    # The authoritative BP read is FORBIDDEN (admin-only endpoint, write actor).
+    # get_branch_protection runs FOR REAL over this api and must fall back — it
+    # is the ONLY real api call left on this path (everything else is faked).
+    def forbid_bp(method, path, *, body=None, query=None, expect_json=True):
+        assert "branch_protections" in path, (
+            f"unexpected real api call in fallback path: {method} {path}"
+        )
+        raise mq.ApiError(
+            f"{method} {path} -> HTTP 403: user should be an owner or a "
+            "collaborator with admin write of a repository"
+        )
+    monkeypatch.setattr(mq, "api", forbid_bp)
+
+    main_sha = "b" * 40
+    head_sha = "a" * 40
+    monkeypatch.setattr(mq, "get_branch_head", lambda branch: main_sha)
+
+    def fake_combined(sha, *, prefer_live=False):
+        if sha == main_sha:
+            return {"state": "success", "statuses": [
+                {"context": "CI / all-required (push)", "status": "success"}]}
+        return {"state": "success", "statuses": [
+            {"context": "CI / all-required (pull_request)", "status": "success"},
+            {"context": "CI / Platform (Go) (pull_request)", "status": "success"},
+        ]}
+    monkeypatch.setattr(mq, "get_combined_status", fake_combined)
+
+    monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: [
+        {"number": 2734, "pull_request": {}, "labels": [],
+         "created_at": "2026-07-18T00:00:00Z"}])
+    monkeypatch.setattr(mq, "get_pull", lambda n: {
+        "state": "open", "number": n, "mergeable": True,
+        "base": {"ref": "main", "repo_id": 1},
+        "head": {"sha": head_sha, "repo_id": 1},
+        "labels": []})
+    monkeypatch.setattr(
+        mq, "get_pull_commits", lambda n: [{"sha": main_sha}, {"sha": head_sha}]
+    )
+    monkeypatch.setattr(mq, "get_pull_reviews", lambda n: reviews)
+    # Runtime-bump exemption helpers issue their own API calls; fake them to a
+    # clean NON-bump result so the only REAL api() call on this path stays the
+    # branch-protection read (which 403s and exercises the fallback).
+    monkeypatch.setattr(mq, "get_pull_diff_files", lambda n: [])
+    monkeypatch.setattr(mq, "latest_runtime_v_tag_for", lambda pr: None)
+    monkeypatch.setattr(mq, "merge_pull", merge_fn)
+    monkeypatch.setattr(mq, "post_comment", lambda *a, **k: None)
+    return head_sha, main_sha
+
+
+def test_process_once_bp403_proceeds_to_merge_attempt(monkeypatch):
+    """REGRESSION (the repo-wide jam): a 403 on the admin-only branch_protections
+    read must NOT hold the whole tick (the old fail-closed behaviour that
+    red-stamped every PR). With a ready+approved+green PR the queue must PROCEED
+    to the actual protected-merge attempt via the fallback path."""
+    merged = {"n": 0, "pr": None, "head": None}
+
+    def fake_merge(pr_number, *, dry_run, head_commit_id=None):
+        merged["n"] += 1
+        merged["pr"] = pr_number
+        merged["head"] = head_commit_id
+
+    head_sha, _ = _setup_bp403_process_once(
+        monkeypatch,
+        reviews=[{"state": "APPROVED", "user": {"login": "agent-researcher"},
+                  "official": True, "stale": False, "dismissed": False,
+                  "commit_id": "a" * 40}],
+        merge_fn=fake_merge,
+    )
+    rc = mq.process_once(dry_run=False)
+    assert rc == 0
+    # THE POINT: the merge was ATTEMPTED (queue did not fail-closed hold the
+    # tick), with the exact reviewed head pinned.
+    assert merged["n"] == 1
+    assert merged["pr"] == 2734
+    assert merged["head"] == head_sha
+
+
+def test_process_once_bp403_fallback_cannot_merge_what_gitea_rejects(monkeypatch):
+    """INVARIANT: the fallback grants NO new privilege. Gitea's server-side
+    branch-protection check is the authority — it 405s an unready PR (e.g. a
+    context red only under the real '*' set that the env-subset client gate
+    doesn't see) and the queue must HOLD, never merge past the server gate."""
+    calls = {"merge_attempts": 0, "hold": None}
+
+    def gitea_rejects(pr_number, *, dry_run, head_commit_id=None):
+        calls["merge_attempts"] += 1
+        raise mq.MergePermissionError(
+            "POST /pulls/2734/merge -> HTTP 405: Not all required status "
+            "checks successful"
+        )
+
+    _setup_bp403_process_once(
+        monkeypatch,
+        reviews=[{"state": "APPROVED", "user": {"login": "agent-researcher"},
+                  "official": True, "stale": False, "dismissed": False,
+                  "commit_id": "a" * 40}],
+        merge_fn=gitea_rejects,
+    )
+
+    def record_hold(pr_number, label_name, *, dry_run):
+        calls["hold"] = (pr_number, label_name)
+    monkeypatch.setattr(mq, "add_label_by_name", record_hold)
+
+    rc = mq.process_once(dry_run=False)
+    assert rc == 0
+    # Merge attempted through the protected endpoint, Gitea refused (405), PR
+    # HELD — never merged. Gitea, not the queue, is the final gate.
+    assert calls["merge_attempts"] == 1
+    assert calls["hold"] == (2734, "merge-queue-hold")
+
+
+def test_process_once_bp403_fallback_refuses_unapproved_pr(monkeypatch):
+    """INVARIANT: in fallback mode the client-side approval FLOOR still applies
+    (it is the only approval gate when BP records required_approvals=0). An
+    unapproved PR must WAIT — merge is never even attempted."""
+    calls = {"merge_attempts": 0}
+
+    def must_not_merge(pr_number, *, dry_run, head_commit_id=None):
+        calls["merge_attempts"] += 1
+        raise AssertionError("merge must not be attempted for an unapproved PR")
+
+    _setup_bp403_process_once(monkeypatch, reviews=[], merge_fn=must_not_merge)
+    rc = mq.process_once(dry_run=False)
+    assert rc == 0
+    assert calls["merge_attempts"] == 0
