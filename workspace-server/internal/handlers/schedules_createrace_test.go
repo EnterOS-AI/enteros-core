@@ -38,15 +38,16 @@ type createRaceStub struct {
 	postCalls    int
 	script       []raceResp
 	reloadStatus int
+	grid         string // GET /internal/schedules body (the stored grid)
 	srv          *httptest.Server
 }
 
 // newCreateRaceStub serves POST /internal/daemons/reload (reloadStatus, default
-// 200) and POST /internal/schedules (scripted per attempt; default 201-echo),
-// recording request order.
+// 200), GET /internal/schedules (the grid, default empty), and POST
+// /internal/schedules (scripted per attempt; default 201-echo), recording order.
 func newCreateRaceStub(t *testing.T, script []raceResp) *createRaceStub {
 	t.Helper()
-	s := &createRaceStub{script: script, reloadStatus: http.StatusOK}
+	s := &createRaceStub{script: script, reloadStatus: http.StatusOK, grid: `{"schedules":[]}`}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.requests = append(s.requests, r.Method+" "+r.URL.Path)
@@ -56,6 +57,13 @@ func newCreateRaceStub(t *testing.T, script []raceResp) *createRaceStub {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(s.reloadStatus)
 			fmt.Fprint(w, "{}")
+		case r.Method == http.MethodGet && r.URL.Path == "/internal/schedules":
+			s.mu.Lock()
+			g := s.grid
+			s.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, g)
 		case r.Method == http.MethodPost && r.URL.Path == "/internal/schedules":
 			s.mu.Lock()
 			i := s.postCalls
@@ -67,11 +75,16 @@ func newCreateRaceStub(t *testing.T, script []raceResp) *createRaceStub {
 			}
 			if resp.dialFail {
 				// Force a transport error: hijack the conn and close it without a
-				// response, so the core client's Do() returns err != nil.
-				if hj, ok := w.(http.Hijacker); ok {
-					if conn, _, err := hj.Hijack(); err == nil {
-						_ = conn.Close()
-					}
+				// response, so the core client's Do() returns err != nil. Fail
+				// LOUDLY if the writer can't hijack (e.g. an HTTP/2 test server),
+				// rather than silently degrading to an empty-200 that would flip
+				// the retry/duplicate assertions to the wrong branch.
+				hj, ok := w.(http.Hijacker)
+				if !ok {
+					panic("createRaceStub: ResponseWriter is not http.Hijacker — dialFail cannot force a transport error")
+				}
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
 				}
 				return
 			}
@@ -143,12 +156,19 @@ func expectCreateArmAndResolve(mock sqlmock.Sqlmock, wsID, url, secret string) {
 
 // TestScheduleCreate_ArmsSynchronouslyBeforeForward is the core of the #4448 fix:
 // the daemon reload (arm) must be forwarded BEFORE the create POST, so createVolume
-// never races a still-booting runtime. If Create reverts to arming ASYNC (the old
-// globalGoAsync), the create POST races ahead of the reload and this ordering
-// assertion fails.
+// never races a still-booting runtime.
+//
+// The stub REQUEST-ORDER assertion is the load-bearing check — DB expectations are
+// matched UNORDERED (MatchExpectationsInOrder(false)) precisely so that reordering
+// arm vs createVolume does NOT trip sqlmock first; the only thing that fails is the
+// reloadIdx<createIdx assertion below. Mutation-verified: running h.createVolume
+// before the arm makes the create POST land first and this test fails HERE (not on
+// a mock-ordering error, which would have made the assertion vacuous — the #112
+// class the review flagged).
 func TestScheduleCreate_ArmsSynchronouslyBeforeForward(t *testing.T) {
 	allowLoopbackForTest(t)
 	mock := setupTestDB(t)
+	mock.MatchExpectationsInOrder(false)
 	setupTestRedis(t)
 	h := NewScheduleHandler()
 
@@ -239,6 +259,30 @@ func TestScheduleCreate_RealBadRequest_NotRetried(t *testing.T) {
 	}
 }
 
+// TestScheduleCreate_RetriesGatewayNotReady — a COMPLETED 503 (err==nil) from an
+// ingress whose upstream runtime is still booting is a transient not-ready signal
+// and must be RETRIED (not relayed as the bare gateway error #4448 targets). The
+// review flagged that dial-failure-only retry misses the real deploy topology.
+func TestScheduleCreate_RetriesGatewayNotReady(t *testing.T) {
+	allowLoopbackForTest(t)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	h := NewScheduleHandler()
+
+	wsID := "44e59f01-0008-4000-8000-000000000008"
+	// attempt 0 → 503 (ingress upstream booting), attempt 1 → 201.
+	stub := newCreateRaceStub(t, []raceResp{{status: http.StatusServiceUnavailable, body: `{"error":"upstream not ready"}`}})
+	expectCreateArmAndResolve(mock, wsID, stub.srv.URL, "cr-secret-8")
+
+	w := doScheduleCreate(t, h, wsID, createRaceBody)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("a transient gateway 503 must be retried to success, got %d: %s", w.Code, w.Body.String())
+	}
+	if n := stub.postCount(); n != 2 {
+		t.Errorf("want 2 create attempts (503 retried), got %d", n)
+	}
+}
+
 // TestScheduleCreate_DuplicateAfterRetry_TreatedAsSuccess — the idempotency
 // guard: if a prior attempt actually landed the create on the runtime but its
 // response was lost to a transient error, the retry hits the store's name guard
@@ -255,14 +299,43 @@ func TestScheduleCreate_DuplicateAfterRetry_TreatedAsSuccess(t *testing.T) {
 		{dialFail: true}, // attempt 0: landed on runtime, response lost
 		{status: http.StatusBadRequest, body: `{"error":"schedule already exists: nightly"}`},
 	})
+	// The GET createVolume makes to confirm the already-exists entry finds a grid
+	// row that MATCHES the request → the landed-then-lost replay is masked as 201.
+	stub.grid = `{"schedules":[{"name":"nightly","cron":"0 3 * * *","timezone":"UTC","prompt":"p","enabled":true,"source":"runtime"}]}`
 	expectCreateArmAndResolve(mock, wsID, stub.srv.URL, "cr-secret-5")
 
 	w := doScheduleCreate(t, h, wsID, createRaceBody)
 	if w.Code != http.StatusCreated {
-		t.Fatalf("400 'already exists' on a RETRY must be success (201), got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("400 'already exists' on a RETRY (grid matches) must be success (201), got %d: %s", w.Code, w.Body.String())
 	}
 	if n := stub.postCount(); n != 2 {
 		t.Errorf("want 2 attempts, got %d", n)
+	}
+}
+
+// TestScheduleCreate_DuplicateAfterRetry_DifferentSchedule_Relayed — the [6]
+// guard: a 400 "already exists" after a retry whose grid entry DIFFERS from the
+// request (a genuine pre-existing conflict, not our lost create) must relay the
+// 400, NOT mask a different schedule as our fresh 201.
+func TestScheduleCreate_DuplicateAfterRetry_DifferentSchedule_Relayed(t *testing.T) {
+	allowLoopbackForTest(t)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	h := NewScheduleHandler()
+
+	wsID := "44e59f01-0007-4000-8000-000000000007"
+	stub := newCreateRaceStub(t, []raceResp{
+		{dialFail: true},
+		{status: http.StatusBadRequest, body: `{"error":"schedule already exists: nightly"}`},
+	})
+	// Pre-existing "nightly" with a DIFFERENT cron/prompt than the request →
+	// gridEntryMatches is false → relay the 400.
+	stub.grid = `{"schedules":[{"name":"nightly","cron":"0 9 * * *","timezone":"UTC","prompt":"other","enabled":true,"source":"runtime"}]}`
+	expectCreateArmAndResolve(mock, wsID, stub.srv.URL, "cr-secret-7")
+
+	w := doScheduleCreate(t, h, wsID, createRaceBody)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("a pre-existing DIFFERENT schedule must relay 400 (not mask), got %d: %s", w.Code, w.Body.String())
 	}
 }
 

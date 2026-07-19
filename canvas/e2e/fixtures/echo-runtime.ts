@@ -33,15 +33,21 @@ interface GridEntry {
 
 /**
  * Minimal 5-field cron validation, standing in for the runtime schedule_store's
- * validate_entry. It only needs to accept the specs' valid exprs
- * ("* / 15 * * * *", "0 9 * * *") and reject "not a cron" so the ScheduleTab's
- * invalid-cron alert path (validated host-side post-P4b, not in core) stays
- * covered — full cron semantics are the runtime's concern, tested there.
+ * validate_entry. It accepts the common numeric AND named forms a user can type
+ * in the free-text ScheduleTab cron input (steps, ranges, lists, and named
+ * day/month tokens like MON-FRI or JAN) and rejects free prose ("not a cron"), so
+ * the invalid-cron alert path (validated host-side post-P4b, not in core) stays
+ * covered without rejecting valid exprs — full cron semantics are the runtime's
+ * concern, tested there.
  */
 function isValidCron(expr: string): boolean {
   const fields = expr.trim().split(/\s+/);
   if (fields.length !== 5) return false;
-  const field = /^(\*|\*\/\d+|\d+(-\d+)?(,\d+(-\d+)?)*(\/\d+)?)$/;
+  // A field is *, or a comma-list of terms, each: a value/name, an optional
+  // range (a-b), and an optional /step. Values are digits or 3-letter names
+  // (MON, JAN, …) so day-of-week/month names validate.
+  const term = "(\\*|\\d+|[A-Za-z]{3})(-(\\d+|[A-Za-z]{3}))?(\\/\\d+)?";
+  const field = new RegExp(`^(\\*(\\/\\d+)?|${term}(,${term})*)$`);
   return fields.every((f) => field.test(f));
 }
 
@@ -264,10 +270,17 @@ export async function startEchoRuntime(): Promise<EchoRuntime> {
           if (patch.timezone !== undefined) cur.timezone = String(patch.timezone);
           if (patch.prompt !== undefined) cur.prompt = String(patch.prompt);
           if (patch.enabled !== undefined) cur.enabled = patch.enabled !== false;
-          // Rename re-keys the grid (name is the primary key).
+          // Rename re-keys the grid (name is the primary key). Reject a collision
+          // with an existing entry, mirroring the real store's name guard.
           if (patch.name !== undefined && String(patch.name) !== name) {
+            const newName = String(patch.name);
+            if (schedules.has(newName)) {
+              res.writeHead(400);
+              res.end(JSON.stringify({ error: `schedule already exists: ${newName}` }));
+              return;
+            }
             schedules.delete(name);
-            cur.name = String(patch.name);
+            cur.name = newName;
           }
           schedules.set(cur.name, cur);
           res.writeHead(200);

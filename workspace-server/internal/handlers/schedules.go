@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -163,14 +164,18 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 	// Post-P4b the schedule store is volume-only, so the arm must land before
 	// createVolume forwards — a 2xx reload proves /internal/schedules is serving,
 	// which closes the first-schedule race that the retired DB path used to
-	// absorb. Non-fatal: a declaration hiccup is logged (createVolume's retry+503
-	// covers a still-starting daemon), never blocking creation beyond the arm.
-	if _, err := ensureAndArmSchedulerPluginSync(ctx, workspaceID); err != nil {
+	// absorb. Bound the whole arm+forward by createScheduleDeadline so a wedged
+	// runtime returns a retryable 503 within the client budget rather than hanging.
+	// Non-fatal: a declaration hiccup is logged (createVolume's retry+503 covers a
+	// still-starting daemon), never blocking creation beyond the arm.
+	createCtx, cancel := context.WithTimeout(ctx, createScheduleDeadline)
+	defer cancel()
+	if _, err := ensureAndArmSchedulerPluginSync(createCtx, workspaceID); err != nil {
 		log.Printf("Schedules.Create: ensure scheduler plugin for %s (non-fatal): %v", workspaceID, err)
 	}
 
 	// The runtime store validates cron + timezone + caps itself.
-	h.createVolume(c, workspaceID, body)
+	h.createVolume(c, createCtx, workspaceID, body)
 }
 
 type UpdateScheduleRequest struct {

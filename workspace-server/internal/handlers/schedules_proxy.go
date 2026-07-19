@@ -40,6 +40,14 @@ const (
 	createVolumeRetryBackoff = 400 * time.Millisecond
 )
 
+// createScheduleDeadline bounds the WHOLE create (synchronous arm + forward
+// retries) so a wedged or still-booting runtime returns the retryable 503 well
+// within the Canvas/proxy client budget instead of hanging tens of seconds (a
+// healthy create completes in well under a second; this only caps the failure
+// path). Comfortably above a legitimately-slow arm+forward, comfortably below
+// common 30s+ gateway read timeouts.
+const createScheduleDeadline = 15 * time.Second
+
 // volumeSchedulerWorkspaceIDs returns the workspaces whose schedule surface is
 // served by the runtime volume backend — those advertising the native
 // `scheduler` capability. Stable (sorted) order so fan-out surfaces (webhook
@@ -214,11 +222,13 @@ func (h *ScheduleHandler) listVolume(c *gin.Context, workspaceID string) {
 // workspace runtime is still coming up (the daemon was just declared+armed on
 // this very request) can race the runtime's readiness — the retired DB path used
 // to absorb that. Create arms the daemon SYNCHRONOUSLY first (a 2xx reload proves
-// /internal/schedules is serving), and this forward additionally RETRIES a
-// transient dial failure a bounded number of times, surfacing a retryable 503
-// rather than a bare 502 if the runtime never answers. A completed HTTP
-// round-trip (incl. a real 4xx from the runtime) is NEVER retried — it is relayed.
-func (h *ScheduleHandler) createVolume(c *gin.Context, workspaceID string, body CreateScheduleRequest) {
+// /internal/schedules is serving) and passes a bounded ctx (createScheduleDeadline).
+// This forward RETRIES a transient not-ready signal — a dial failure OR a gateway
+// status (502/503/504) from an ingress whose upstream is still booting — a bounded
+// number of times, then surfaces a retryable 503 rather than a bare 502 if the
+// runtime never answers within the deadline. A completed 2xx or a real 4xx (e.g.
+// 400 bad cron) is terminal and relayed unchanged.
+func (h *ScheduleHandler) createVolume(c *gin.Context, ctx context.Context, workspaceID string, body CreateScheduleRequest) {
 	enabled := true
 	if body.Enabled != nil {
 		enabled = *body.Enabled
@@ -229,7 +239,6 @@ func (h *ScheduleHandler) createVolume(c *gin.Context, workspaceID string, body 
 	}
 	raw, _ := json.Marshal(entry)
 
-	ctx := c.Request.Context()
 	wsURL, secret, ok := resolveWorkspaceForwardCreds(c, ctx, workspaceID, "schedules")
 	if !ok {
 		return // gin response already written (404/503/…) — not a transient dial failure
@@ -237,27 +246,42 @@ func (h *ScheduleHandler) createVolume(c *gin.Context, workspaceID string, body 
 
 	var status int
 	var respBody []byte
-	var err error
+	retried := false
 	for attempt := 0; ; attempt++ {
+		var err error
 		status, respBody, err = fetchScheduleAPI(ctx, wsURL, secret, http.MethodPost, "", raw)
-		if err == nil {
-			// A completed HTTP round-trip (2xx or a real 4xx/5xx) — never retried.
-			// Idempotency guard: if a PRIOR attempt already landed the create on
-			// the runtime but its response was lost to a transient error, the
-			// runtime now rejects the duplicate name with 400 "already exists"
-			// (schedule_store name guard). On a retry that is a FALSE failure —
-			// the schedule DOES exist — so treat it as the create it actually was.
-			if attempt > 0 && status == http.StatusBadRequest && scheduleAlreadyExists(respBody) {
-				status, respBody = http.StatusCreated, raw
-			}
+		// Terminal iff a completed round-trip that is NOT an upstream-not-ready
+		// gateway status: a 2xx or a real 4xx. Retry a dial failure (err) or a
+		// 502/503/504 (ingress upstream still booting).
+		if err == nil && !isTransientForwardStatus(status) {
 			break
 		}
-		if attempt >= createVolumeMaxRetries {
-			log.Printf("createVolume %s: runtime unreachable after %d attempt(s): %v", workspaceID, attempt+1, err)
+		if attempt >= createVolumeMaxRetries || ctx.Err() != nil {
+			log.Printf("createVolume %s: runtime not ready after %d attempt(s) (err=%v status=%d)", workspaceID, attempt+1, err, status)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "scheduler starting, retry"})
 			return
 		}
-		time.Sleep(createVolumeRetryBackoff)
+		retried = true
+		if !sleepCtx(ctx, createVolumeRetryBackoff) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "scheduler starting, retry"})
+			return
+		}
+	}
+
+	// Idempotency: a duplicate-name 400 AFTER a retry may be a create that landed
+	// but whose response was lost to a transient error. Fetch the stored entry;
+	// only mask as success when it MATCHES this request (an idempotent replay of
+	// our own create). A pre-existing DIFFERENT schedule with the same name is a
+	// genuine conflict and its 400 is relayed unchanged (avoids the false-success
+	// + fabricated next_run_at the request echo would produce).
+	if retried && status == http.StatusBadRequest && scheduleAlreadyExists(respBody) {
+		if s2, b2, e2 := fetchScheduleAPI(ctx, wsURL, secret, http.MethodGet, "", nil); e2 == nil && s2 == http.StatusOK {
+			if found, ok := findGridEntry(b2, entry.Name); ok && gridEntryMatches(found, entry) {
+				if fb, e3 := json.Marshal(found); e3 == nil {
+					status, respBody = http.StatusCreated, fb
+				}
+			}
+		}
 	}
 
 	if status != http.StatusCreated {
@@ -275,11 +299,56 @@ func (h *ScheduleHandler) createVolume(c *gin.Context, workspaceID string, body 
 	c.JSON(http.StatusCreated, out)
 }
 
+// isTransientForwardStatus reports whether a completed forward status signals an
+// upstream that is not ready yet (an ingress/sidecar in front of a still-booting
+// runtime), so the create forward should retry rather than relay it.
+func isTransientForwardStatus(status int) bool {
+	return status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout
+}
+
+// sleepCtx sleeps for d unless ctx is cancelled first; returns false if ctx ended
+// (so the retry loop stops burning attempts after a client disconnect / deadline).
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// findGridEntry returns the named entry from a runtime {"schedules":[…]} grid.
+func findGridEntry(body []byte, name string) (volumeEntry, bool) {
+	var payload struct {
+		Schedules []volumeEntry `json:"schedules"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return volumeEntry{}, false
+	}
+	for _, e := range payload.Schedules {
+		if e.Name == name {
+			return e, true
+		}
+	}
+	return volumeEntry{}, false
+}
+
+// gridEntryMatches reports whether a stored grid entry is the same definition the
+// caller tried to create (source is runtime-stamped, so it is excluded).
+func gridEntryMatches(stored, req volumeEntry) bool {
+	return stored.Cron == req.Cron &&
+		stored.Prompt == req.Prompt &&
+		stored.Timezone == req.Timezone &&
+		stored.Enabled == req.Enabled
+}
+
 // scheduleAlreadyExists reports whether a runtime 400 body is the schedule_store
 // name-collision guard ("schedule already exists: <name>"). Used to treat a
-// duplicate-name rejection ON A RETRY as success, since it means a prior attempt
-// of the same create already landed on the runtime (the store rejects duplicates
-// rather than upserting).
+// duplicate-name rejection ON A RETRY as an idempotent replay (see createVolume).
 func scheduleAlreadyExists(body []byte) bool {
 	var parsed struct {
 		Error string `json:"error"`

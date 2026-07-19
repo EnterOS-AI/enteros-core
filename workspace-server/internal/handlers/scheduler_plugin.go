@@ -136,7 +136,12 @@ func armSchedulerPlugin(ctx context.Context, workspaceID string) bool {
 // schedulerArmTimeout (8s), so the create response is delayed at most that long
 // and only while the daemon is actually starting.
 func ensureAndArmSchedulerPluginSync(ctx context.Context, workspaceID string) (armed bool, err error) {
-	if err := ensureSchedulerPluginDeclared(ctx, workspaceID); err != nil {
+	// The declaration MUST persist even if the caller's ctx is cancelled (client
+	// disconnect) or the create deadline fires mid-write — otherwise a schedule
+	// can land on the volume with no declared plugin and silently never fire after
+	// the next restart (the reconcile-on-online net installs only what's declared).
+	// Detach it from cancellation; it is a fast idempotent upsert.
+	if err := ensureSchedulerPluginDeclared(context.WithoutCancel(ctx), workspaceID); err != nil {
 		return false, err
 	}
 	actx, cancel := context.WithTimeout(ctx, schedulerArmTimeout)
