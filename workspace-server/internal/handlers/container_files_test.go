@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -39,6 +40,15 @@ func TestValidateRelPath(t *testing.T) {
 		{"dotdot middle", "a/b/../../c", true, "path traversal"},
 		{"path ends in ..", "foo/..", true, "path traversal"},
 		{"bare ..", "..", true, "path traversal"},
+
+		// Runtime private state: /configs/.hermes holds the hermes daemon's
+		// .env (plaintext provider keys) and session store — never servable
+		// through the workspace file API (2026-07-19 review finding).
+		{".hermes root denied", ".hermes", true, "runtime private state"},
+		{".hermes env denied", ".hermes/.env", true, "runtime private state"},
+		{".hermes nested denied", ".hermes/sessions/x.jsonl", true, "runtime private state"},
+		{"dot-normalized .hermes denied", "./.hermes/.env", true, "runtime private state"},
+		{"similar-prefix name allowed", ".hermes2/notes.md", false, ""},
 
 		// Absolute: must be rejected
 		{"absolute unix", "/etc/passwd", true, "path traversal"},
@@ -120,9 +130,14 @@ func TestDeleteViaEphemeral_ConcatFormDocs(t *testing.T) {
 // 2026-07-19 plugin-delivery incident).
 func TestBuildContainerFilesTar_SlashOnlyDestRootedNames(t *testing.T) {
 	files := map[string]string{
-		"config.yaml":          "tier: 3\n",
-		"skills/foo/SKILL.md":  "# Foo\n",
-		"win\\style\\file.txt": "key built with filepath.Join on Windows",
+		"config.yaml":         "tier: 3\n",
+		"skills/foo/SKILL.md": "# Foo\n",
+	}
+	// The literal-backslash key only exercises the normalization on Windows:
+	// filepath.ToSlash is a no-op on Linux, where a backslash is a legal
+	// filename character — normalizing it there would corrupt a real name.
+	if runtime.GOOS == "windows" {
+		files["win\\style\\file.txt"] = "key built with filepath.Join on Windows"
 	}
 
 	buf, err := buildContainerFilesTar("/configs", files)
@@ -161,7 +176,9 @@ func TestBuildContainerFilesTar_SlashOnlyDestRootedNames(t *testing.T) {
 	want := map[string]string{
 		"/configs/config.yaml":         "tier: 3\n",
 		"/configs/skills/foo/SKILL.md": "# Foo\n",
-		"/configs/win/style/file.txt":  "key built with filepath.Join on Windows",
+	}
+	if runtime.GOOS == "windows" {
+		want["/configs/win/style/file.txt"] = "key built with filepath.Join on Windows"
 	}
 	for name, body := range want {
 		if got[name] != body {

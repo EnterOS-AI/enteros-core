@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"errors"
 	"io"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -83,8 +84,15 @@ func TestWriteFilesToContainerTar_FilesAreAgentOwned(t *testing.T) {
 func TestBuildConfigFilesTar_SlashOnlyEntryNames(t *testing.T) {
 	files := map[string][]byte{
 		"nested/dir/file.txt": []byte("data"),
-		"win\\style\\key.txt": []byte("from filepath.Join on Windows"),
 		".auth_token":         []byte("tok"),
+	}
+	// Literal-backslash key exercises the normalization only on Windows:
+	// filepath.ToSlash is a no-op on Linux, where a backslash is a legal
+	// filename character.
+	wantNames := []string{"nested/dir/", "nested/dir/file.txt", ".auth_token"}
+	if runtime.GOOS == "windows" {
+		files["win\\style\\key.txt"] = []byte("from filepath.Join on Windows")
+		wantNames = append(wantNames, "win/style/key.txt")
 	}
 
 	buf, err := buildConfigFilesTar(files)
@@ -114,7 +122,7 @@ func TestBuildConfigFilesTar_SlashOnlyEntryNames(t *testing.T) {
 		seen[hdr.Name] = true
 	}
 
-	for _, want := range []string{"nested/dir/", "nested/dir/file.txt", "win/style/key.txt", ".auth_token"} {
+	for _, want := range wantNames {
 		if !seen[want] {
 			t.Fatalf("tar missing %q (seen: %v)", want, seen)
 		}
