@@ -1146,10 +1146,13 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			if schedBlock != "" {
 				if baseCfg, readErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); readErr != nil {
 					// parseTemplateSchedules already read this file above, so a
-					// read failure here is unexpected; deliver WITHOUT the volume
-					// block (the DB seed below still lands the schedules) rather
-					// than fail the create.
-					log.Printf("Create %s: reading template config.yaml to append schedules failed: %v (continuing without the volume block)", id, readErr)
+					// read failure here is unexpected. Post-P4b there is NO legacy
+					// DB seed fallback, so these template schedules would be
+					// DROPPED for this workspace — log loudly rather than fail the
+					// create (the workspace still provisions; the schedules can be
+					// re-added). If this ever fires in practice, the config.yaml
+					// render should be made fail-closed instead.
+					log.Printf("Create %s: reading template config.yaml to append schedules failed: %v — template schedules DROPPED (no DB fallback post-P4b)", id, readErr)
 				} else if combined, appended := appendYAMLBlockChecked(stripTopLevelYAMLKey(baseCfg, "schedules"), schedBlock, "schedules", payload.Name); appended {
 					if configFiles == nil {
 						configFiles = map[string][]byte{}
