@@ -53,15 +53,21 @@ func ensureSchedulerPluginDeclared(ctx context.Context, workspaceID string) erro
 }
 
 // armSchedulerPlugin asks a RUNNING workspace to start its scheduler daemon now
-// (no restart), via the runtime hot-start endpoint. Best-effort and
-// non-blocking: any failure is logged and swallowed, because the daemon is also
-// armed by the reconcile-on-online path (the durable safety net) — this call
-// just makes a freshly-scheduled workspace fire without waiting for a restart.
-// A runtime too old to expose the endpoint simply 404s here and arms on its
-// next restart instead.
-func armSchedulerPlugin(ctx context.Context, workspaceID string) {
+// (no restart), via the runtime hot-start endpoint. Non-fatal: any failure is
+// logged, because the daemon is also armed by the reconcile-on-online path (the
+// durable safety net). A runtime too old to expose the endpoint simply 404s here
+// and arms on its next restart instead.
+//
+// Returns true iff the reload returned 2xx. Because the runtime mounts
+// /internal/schedules BEFORE /internal/daemons/reload (and both before it
+// accepts connections), a 2xx here PROVES the schedule grid API is already
+// serving — the synchronous Create path (ensureAndArmSchedulerPluginSync) uses
+// that as a readiness signal to avoid forwarding a create at a still-booting
+// runtime. Statement-callers that don't care (the carryover restore path) simply
+// discard the bool.
+func armSchedulerPlugin(ctx context.Context, workspaceID string) bool {
 	if db.DB == nil {
-		return
+		return false
 	}
 	var wsURL string
 	if err := db.DB.QueryRowContext(ctx,
@@ -70,19 +76,19 @@ func armSchedulerPlugin(ctx context.Context, workspaceID string) {
 		if err != sql.ErrNoRows {
 			log.Printf("scheduler-arm: workspace lookup failed for %s: %v", workspaceID, err)
 		}
-		return
+		return false
 	}
 	if wsURL == "" {
-		return // no callback URL (poll-mode / not registered) — reconcile arms it
+		return false // no callback URL (poll-mode / not registered) — reconcile arms it
 	}
 	if err := isSafeURL(wsURL); err != nil {
 		log.Printf("scheduler-arm: unsafe workspace URL for %s rejected: %v", workspaceID, err)
-		return
+		return false
 	}
 	secret, _, err := readOrLazyHealInboundSecret(ctx, workspaceID, "scheduler-arm")
 	if err != nil {
 		log.Printf("scheduler-arm: inbound secret unavailable for %s: %v", workspaceID, err)
-		return
+		return false
 	}
 
 	target := strings.TrimRight(wsURL, "/") + "/internal/daemons/reload"
@@ -90,7 +96,7 @@ func armSchedulerPlugin(ctx context.Context, workspaceID string) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(fctx, http.MethodPost, target, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return
+		return false
 	}
 	req.Header.Set("Authorization", "Bearer "+secret)
 	req.Header.Set("Content-Type", "application/json")
@@ -104,33 +110,36 @@ func armSchedulerPlugin(ctx context.Context, workspaceID string) {
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("scheduler-arm: reload forward to %s failed (workspace will arm on next reconcile): %v", workspaceID, err)
-		return
+		return false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		log.Printf("scheduler-arm: reload for %s returned %d (arms on next reconcile)", workspaceID, resp.StatusCode)
-		return
+		return false
 	}
 	log.Printf("scheduler-arm: hot-armed scheduler daemon on %s", workspaceID)
+	return true
 }
 
-// ensureAndArmSchedulerPlugin declares the plugin (blocking, must persist so
+// ensureAndArmSchedulerPluginSync declares the plugin (blocking, must persist so
 // the plugin survives a restart) and then arms the running daemon
-// asynchronously (best-effort, off the request path). Call it whenever a
-// workspace gains a schedule. A declaration failure is returned so callers that
-// care (create) can log it; arming never blocks or errors.
-func ensureAndArmSchedulerPlugin(ctx context.Context, workspaceID string) error {
+// SYNCHRONOUSLY, returning whether the arm reached a serving runtime.
+//
+// This is the Create path. Post-P4b the schedule store is volume-only (no DB
+// fallback), so a create MUST NOT forward to a runtime that isn't serving
+// /internal/schedules yet — the daemon is often declared+armed on this very
+// request (first schedule on a fresh workspace). Arming here BEFORE createVolume
+// closes that race: because the runtime mounts /internal/schedules before the
+// reload route, a true return (2xx reload) proves the grid API is up. A false
+// return is non-fatal — createVolume still tries, and its bounded transient-dial
+// retry + retryable 503 cover a runtime that is still coming up. Bounded by
+// schedulerArmTimeout (8s), so the create response is delayed at most that long
+// and only while the daemon is actually starting.
+func ensureAndArmSchedulerPluginSync(ctx context.Context, workspaceID string) (armed bool, err error) {
 	if err := ensureSchedulerPluginDeclared(ctx, workspaceID); err != nil {
-		return err
+		return false, err
 	}
-	// Detach from the request context so a slow reload never delays the create
-	// response, and use a background context so request cancellation after the
-	// (already-committed) declaration does not abort the arm.
-	wsID := workspaceID
-	globalGoAsync(func() {
-		actx, cancel := context.WithTimeout(context.Background(), schedulerArmTimeout+2*time.Second)
-		defer cancel()
-		armSchedulerPlugin(actx, wsID)
-	})
-	return nil
+	actx, cancel := context.WithTimeout(ctx, schedulerArmTimeout)
+	defer cancel()
+	return armSchedulerPlugin(actx, workspaceID), nil
 }

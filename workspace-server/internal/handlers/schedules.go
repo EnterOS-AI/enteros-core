@@ -159,10 +159,13 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 	// Per-workspace scheduler delivery (scheduler-as-trigger-plugin): a
 	// workspace that has a schedule must run the molecule-scheduler trigger
 	// daemon. Declare the plugin (idempotent; installs on the next boot/reconcile
-	// so scheduling survives a restart) and best-effort hot-arm the running
-	// daemon. Additive + non-fatal — a declaration hiccup must never fail
-	// schedule creation.
-	if err := ensureAndArmSchedulerPlugin(ctx, workspaceID); err != nil {
+	// so scheduling survives a restart) and arm the running daemon SYNCHRONOUSLY.
+	// Post-P4b the schedule store is volume-only, so the arm must land before
+	// createVolume forwards — a 2xx reload proves /internal/schedules is serving,
+	// which closes the first-schedule race that the retired DB path used to
+	// absorb. Non-fatal: a declaration hiccup is logged (createVolume's retry+503
+	// covers a still-starting daemon), never blocking creation beyond the arm.
+	if _, err := ensureAndArmSchedulerPluginSync(ctx, workspaceID); err != nil {
 		log.Printf("Schedules.Create: ensure scheduler plugin for %s (non-fatal): %v", workspaceID, err)
 	}
 

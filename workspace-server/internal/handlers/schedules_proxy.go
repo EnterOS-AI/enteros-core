@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -28,6 +29,16 @@ import (
 
 // scheduleForwardTimeout bounds a single forward to the workspace runtime.
 const scheduleForwardTimeout = 15 * time.Second
+
+// createVolumeMaxRetries / createVolumeRetryBackoff bound createVolume's retry of
+// a TRANSIENT dial failure. Small on purpose: Create already arms the daemon
+// synchronously (≤8s) so the runtime is normally serving on the first attempt —
+// this only rides out a brief readiness gap. A completed HTTP round-trip (even a
+// real 4xx from the runtime) is never retried.
+const (
+	createVolumeMaxRetries   = 2
+	createVolumeRetryBackoff = 400 * time.Millisecond
+)
 
 // volumeSchedulerWorkspaceIDs returns the workspaces whose schedule surface is
 // served by the runtime volume backend — those advertising the native
@@ -198,6 +209,15 @@ func (h *ScheduleHandler) listVolume(c *gin.Context, workspaceID string) {
 }
 
 // createVolume serves Create by POSTing a definition to the runtime grid.
+//
+// Post-P4b the volume path is unconditional, so a Create issued while the
+// workspace runtime is still coming up (the daemon was just declared+armed on
+// this very request) can race the runtime's readiness — the retired DB path used
+// to absorb that. Create arms the daemon SYNCHRONOUSLY first (a 2xx reload proves
+// /internal/schedules is serving), and this forward additionally RETRIES a
+// transient dial failure a bounded number of times, surfacing a retryable 503
+// rather than a bare 502 if the runtime never answers. A completed HTTP
+// round-trip (incl. a real 4xx from the runtime) is NEVER retried — it is relayed.
 func (h *ScheduleHandler) createVolume(c *gin.Context, workspaceID string, body CreateScheduleRequest) {
 	enabled := true
 	if body.Enabled != nil {
@@ -208,10 +228,38 @@ func (h *ScheduleHandler) createVolume(c *gin.Context, workspaceID string, body 
 		Prompt: body.Prompt, Enabled: enabled, Source: "runtime",
 	}
 	raw, _ := json.Marshal(entry)
-	status, respBody, ok := h.forwardScheduleAPI(c, workspaceID, http.MethodPost, "", raw)
+
+	ctx := c.Request.Context()
+	wsURL, secret, ok := resolveWorkspaceForwardCreds(c, ctx, workspaceID, "schedules")
 	if !ok {
-		return
+		return // gin response already written (404/503/…) — not a transient dial failure
 	}
+
+	var status int
+	var respBody []byte
+	var err error
+	for attempt := 0; ; attempt++ {
+		status, respBody, err = fetchScheduleAPI(ctx, wsURL, secret, http.MethodPost, "", raw)
+		if err == nil {
+			// A completed HTTP round-trip (2xx or a real 4xx/5xx) — never retried.
+			// Idempotency guard: if a PRIOR attempt already landed the create on
+			// the runtime but its response was lost to a transient error, the
+			// runtime now rejects the duplicate name with 400 "already exists"
+			// (schedule_store name guard). On a retry that is a FALSE failure —
+			// the schedule DOES exist — so treat it as the create it actually was.
+			if attempt > 0 && status == http.StatusBadRequest && scheduleAlreadyExists(respBody) {
+				status, respBody = http.StatusCreated, raw
+			}
+			break
+		}
+		if attempt >= createVolumeMaxRetries {
+			log.Printf("createVolume %s: runtime unreachable after %d attempt(s): %v", workspaceID, attempt+1, err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "scheduler starting, retry"})
+			return
+		}
+		time.Sleep(createVolumeRetryBackoff)
+	}
+
 	if status != http.StatusCreated {
 		relayScheduleError(c, status, respBody)
 		return
@@ -225,6 +273,21 @@ func (h *ScheduleHandler) createVolume(c *gin.Context, workspaceID string, body 
 		}
 	}
 	c.JSON(http.StatusCreated, out)
+}
+
+// scheduleAlreadyExists reports whether a runtime 400 body is the schedule_store
+// name-collision guard ("schedule already exists: <name>"). Used to treat a
+// duplicate-name rejection ON A RETRY as success, since it means a prior attempt
+// of the same create already landed on the runtime (the store rejects duplicates
+// rather than upserting).
+func scheduleAlreadyExists(body []byte) bool {
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(parsed.Error), "already exists")
 }
 
 // updateVolume serves Update by PATCHing the name-keyed grid entry. The Canvas
