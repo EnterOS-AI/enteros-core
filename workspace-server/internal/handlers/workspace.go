@@ -1101,8 +1101,11 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		var schedParseErr error
 		templateScheds, schedParseErr = parseTemplateSchedules(templatePath)
 		if schedParseErr != nil {
+			// Non-fatal: skip schedule delivery for this create. templateScheds
+			// is confined to this block (post-P4b the legacy DB seed that used to
+			// consume it after the render is gone), so no explicit reset is
+			// needed — the render below is in the else arm and never runs here.
 			log.Printf("Create %s: parsing template schedules: %v (continuing)", id, schedParseErr)
-			templateScheds = nil
 		} else if len(templateScheds) > 0 {
 			// P4b (issue #4411): render the template's RESOLVED schedules into
 			// the DELIVERED config.yaml so the runtime's boot/reload seeding
