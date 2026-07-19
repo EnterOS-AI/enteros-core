@@ -563,6 +563,17 @@ class BranchProtection:
     required_approvals: int
     block_on_rejected_reviews: bool
     block_on_outdated_branch: bool = False
+    # True when this record was NOT read from the authoritative
+    # `/branch_protections` endpoint but SYNTHESIZED from the env-configured
+    # fallback because that endpoint was FORBIDDEN (HTTP 403) to the queue's
+    # merge actor. In this mode the queue does NOT trust its own client-side
+    # required-context/approval set as the authority — it relies on Gitea's
+    # server-side branch-protection enforcement AT MERGE TIME (the protected
+    # `/pulls/{n}/merge` endpoint re-checks BP itself and returns 405 for an
+    # under-approved / red / stale-head PR, which merge_pull maps to
+    # MergePermissionError -> HOLD). See get_branch_protection() for why a 403
+    # is a DETERMINISTIC permission state that must NOT fail-closed forever.
+    fallback: bool = False
 
 
 def _require_runtime_env() -> None:
@@ -1085,11 +1096,106 @@ def parse_branch_protection(body: Any) -> BranchProtection:
     )
 
 
+# Match the `-> HTTP <code>` fragment that api() embeds in every ApiError it
+# raises (`f"{method} {path} -> HTTP {status}: {snippet}"`). Used to tell a
+# DETERMINISTIC permission denial (403) apart from a transient/unknown failure.
+_HTTP_STATUS_RE = re.compile(r"-> HTTP (\d{3})\b")
+
+
+def _apierror_http_status(exc: ApiError) -> int | None:
+    """Best-effort extract of the HTTP status embedded in an ApiError message,
+    or None when the error carries no `-> HTTP <code>` marker (e.g. a non-JSON
+    body error or a locally-raised ApiError)."""
+    m = _HTTP_STATUS_RE.search(str(exc))
+    return int(m.group(1)) if m else None
+
+
+def _fallback_branch_protection(reason: str) -> BranchProtection:
+    """Synthesize a SAFE branch-protection record for the merge-time-authoritative
+    fallback path (see get_branch_protection).
+
+      * required_contexts  -> [] (EMPTY). In fallback mode the client MUST NOT
+        gate on a hard-coded context NAME: the wildcard BP set is `*` (match
+        every posted status), whose case/naming is repo-specific (e.g. this org
+        posts `ci / all-required`, lowercase), and the env REQUIRED_CONTEXTS
+        default is a differently-cased placeholder. A literal client-side name
+        that does not match the repo's actual context would FALSE-WAIT a green
+        PR forever — the exact opposite of unjamming. Deferring the named-context
+        gate to Gitea's server-side `*` check (always case-correct) is both
+        correct and strictly safe: the queue never uses the admin force-override,
+        so Gitea re-checks the full `*` set at write time and 405s any PR with
+        ANY posted context red, which merge_pull HOLDs. The client still keeps
+        its CASE-CORRECT, SSOT-sourced CI backstops that do NOT depend on this
+        field: the step-0 CRITICAL guard (critical_context_prefixes(), derived
+        from the repo's own `.gitea/required-contexts.txt`) and the step-4b
+        ENFORCED-file set (load_enforced_file_contexts, event-suffix-insensitive)
+        — so a PR whose aggregator is red is still refused client-side before any
+        futile merge POST.
+      * required_approvals -> REQUIRED_APPROVALS_DEFAULT, the env approval
+        FLOOR (never 0). This matters because a repo whose BP records
+        required_approvals=0 gets NO server-side approval enforcement from
+        Gitea at merge time, so this client floor is the ONLY approval gate in
+        fallback mode — it must never drop below the SSOT floor.
+      * block_on_outdated_branch -> False: take the #2358 direct-merge path; a
+        stale head Gitea still 405s server-side and merge_pull HOLDs it.
+
+    fallback=True flags every consumer that the authority is Gitea's merge-time
+    check, not this record.
+    """
+    print(
+        "::warning::branch protection unreadable to the queue merge actor "
+        f"({reason}); entering GITEA-AUTHORITATIVE FALLBACK: the protected "
+        "merge endpoint re-checks the wildcard branch protection server-side and "
+        "rejects (405) any under-approved / red / stale-head PR. Client keeps its "
+        "SSOT-sourced backstops (critical-context + enforced-file CI gates + the "
+        f"approval floor REQUIRED_APPROVALS={REQUIRED_APPROVALS_DEFAULT}) and defers "
+        "the named required-context set to Gitea. This grants the queue NO new "
+        "privilege — it merges strictly less than Gitea itself allows."
+    )
+    return BranchProtection(
+        required_contexts=[],
+        required_approvals=REQUIRED_APPROVALS_DEFAULT,
+        block_on_rejected_reviews=True,
+        block_on_outdated_branch=False,
+        fallback=True,
+    )
+
+
 def get_branch_protection(branch: str) -> BranchProtection:
-    """Fetch branch protection for `branch`; fail-closed if unavailable."""
+    """Fetch branch protection for `branch`.
+
+    The `/branch_protections/{branch}` READ endpoint is ADMIN-only in Gitea
+    ("user should be an owner or a collaborator with admin write"). The queue's
+    non-bypass merge actor is deliberately a WRITE collaborator (least
+    privilege — write is all it needs to MERGE), so this read can legitimately
+    return 403 while the actor still has full authority to merge. Fail-closing
+    on that 403 would red-stamp `gitea-merge-queue / queue` on EVERY PR under a
+    `['*']` BP and jam the whole repo (the exact regression this fixes: the CP
+    merge actor was reset admin->write and the queue died).
+
+    A 403 is a DETERMINISTIC permission state — re-reading will never succeed,
+    so holding forever is wrong. Instead FALL BACK to Gitea's own
+    merge-time enforcement: build a safe env-derived BranchProtection
+    (fallback=True) and let the protected merge endpoint be the authoritative
+    gate. It remains IMPOSSIBLE for the queue to merge anything Gitea would
+    reject: the queue never uses the admin force-override, so Gitea re-checks
+    required approvals + required contexts server-side at write time and 405s an
+    unready PR, which merge_pull converts to a HOLD.
+
+    A NON-403 failure (transient 5xx, network, malformed body) is NOT
+    deterministic and could self-resolve, so it stays FAIL-CLOSED
+    (BranchProtectionUnavailable -> HOLD the tick, retry next tick) rather than
+    dropping to the fallback on a possible Gitea blip.
+    """
     try:
         _, body = api("GET", f"/repos/{OWNER}/{NAME}/branch_protections/{branch}")
     except ApiError as exc:
+        status = _apierror_http_status(exc)
+        if status == 403:
+            return _fallback_branch_protection(
+                f"HTTP 403 reading branch_protections/{branch} "
+                "(merge actor lacks admin read; write is sufficient to merge)"
+            )
         raise BranchProtectionUnavailable(
             f"could not fetch branch protection for {branch}: {exc}"
         ) from exc
