@@ -101,9 +101,11 @@ func TestP4bReadiness_Droppable_WhenRuntimeRowsAllOnVolume(t *testing.T) {
 
 	expectReadinessCounts(mock,
 		sqlmock.NewRows([]string{"workspace_id", "source", "count"}).AddRow(wsID, "runtime", 2), 0)
-	mock.ExpectQuery("SELECT name, source FROM workspace_schedules").WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"name", "source"}).
-			AddRow("a", "runtime").AddRow("b", "runtime"))
+	// Content matches the grid stub (cron/tz/prompt/enabled) → synced.
+	mock.ExpectQuery("SELECT name, cron_expr, timezone, prompt, enabled, source FROM workspace_schedules").WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "cron_expr", "timezone", "prompt", "enabled", "source"}).
+			AddRow("a", "*/5 * * * *", "UTC", "p", true, "runtime").
+			AddRow("b", "*/5 * * * *", "UTC", "p", true, "runtime"))
 	expectFanoutURL(mock, wsID, stub.srv.URL)
 	expectInboundSecret(mock, wsID, "sec-1")
 
@@ -114,8 +116,8 @@ func TestP4bReadiness_Droppable_WhenRuntimeRowsAllOnVolume(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	m := decodeJSON(t, w)
-	if m["droppable"] != true {
-		t.Errorf("expected droppable=true, got %v (body=%s)", m["droppable"], w.Body.String())
+	if m["data_drop_safe"] != true {
+		t.Errorf("expected data_drop_safe=true, got %v (body=%s)", m["data_drop_safe"], w.Body.String())
 	}
 	if m["workspaces_needing_migration"].(float64) != 0 || m["not_volume_native"].(float64) != 0 {
 		t.Errorf("expected zero blockers, got %s", w.Body.String())
@@ -137,9 +139,10 @@ func TestP4bReadiness_BlocksOnUnmigratedRuntimeRows(t *testing.T) {
 
 	expectReadinessCounts(mock,
 		sqlmock.NewRows([]string{"workspace_id", "source", "count"}).AddRow(wsID, "runtime", 2), 0)
-	mock.ExpectQuery("SELECT name, source FROM workspace_schedules").WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"name", "source"}).
-			AddRow("a", "runtime").AddRow("b", "runtime"))
+	mock.ExpectQuery("SELECT name, cron_expr, timezone, prompt, enabled, source FROM workspace_schedules").WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "cron_expr", "timezone", "prompt", "enabled", "source"}).
+			AddRow("a", "*/5 * * * *", "UTC", "p", true, "runtime").
+			AddRow("b", "*/5 * * * *", "UTC", "p", true, "runtime"))
 	expectFanoutURL(mock, wsID, stub.srv.URL)
 	expectInboundSecret(mock, wsID, "sec-2")
 
@@ -147,8 +150,8 @@ func TestP4bReadiness_BlocksOnUnmigratedRuntimeRows(t *testing.T) {
 	handler.P4bReadiness(ctx)
 
 	m := decodeJSON(t, w)
-	if m["droppable"] != false {
-		t.Errorf("expected droppable=false with unmigrated rows, got %s", w.Body.String())
+	if m["data_drop_safe"] != false {
+		t.Errorf("expected data_drop_safe=false with unmigrated rows, got %s", w.Body.String())
 	}
 	if m["workspaces_needing_migration"].(float64) != 1 {
 		t.Errorf("expected 1 workspace needing migration, got %s", w.Body.String())
@@ -176,8 +179,8 @@ func TestP4bReadiness_BlocksOnNotVolumeNative(t *testing.T) {
 	handler.P4bReadiness(ctx)
 
 	m := decodeJSON(t, w)
-	if m["droppable"] != false || m["not_volume_native"].(float64) != 1 {
-		t.Errorf("expected droppable=false, not_volume_native=1, got %s", w.Body.String())
+	if m["data_drop_safe"] != false || m["not_volume_native"].(float64) != 1 {
+		t.Errorf("expected data_drop_safe=false, not_volume_native=1, got %s", w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock: %v", err)
@@ -197,8 +200,9 @@ func TestP4bReadiness_BlocksOnUnseededTemplateRows(t *testing.T) {
 
 	expectReadinessCounts(mock,
 		sqlmock.NewRows([]string{"workspace_id", "source", "count"}).AddRow(wsID, "template", 1), 0)
-	mock.ExpectQuery("SELECT name, source FROM workspace_schedules").WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"name", "source"}).AddRow("nightly", "template"))
+	mock.ExpectQuery("SELECT name, cron_expr, timezone, prompt, enabled, source FROM workspace_schedules").WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "cron_expr", "timezone", "prompt", "enabled", "source"}).
+			AddRow("nightly", "0 3 * * *", "UTC", "p", true, "template"))
 	expectFanoutURL(mock, wsID, stub.srv.URL)
 	expectInboundSecret(mock, wsID, "sec-6")
 
@@ -206,12 +210,89 @@ func TestP4bReadiness_BlocksOnUnseededTemplateRows(t *testing.T) {
 	handler.P4bReadiness(ctx)
 
 	m := decodeJSON(t, w)
-	if m["droppable"] != false || m["workspaces_needing_reseed"].(float64) != 1 {
-		t.Errorf("expected droppable=false, needing_reseed=1, got %s", w.Body.String())
+	if m["data_drop_safe"] != false || m["workspaces_needing_reseed"].(float64) != 1 {
+		t.Errorf("expected data_drop_safe=false, needing_reseed=1, got %s", w.Body.String())
 	}
 	row := m["workspaces"].([]interface{})[0].(map[string]interface{})
 	if row["template_rows_unsynced"].(float64) != 1 {
 		t.Errorf("expected template_rows_unsynced=1, got %v", row)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
+func TestP4bReadiness_BlocksOnContentDivergentVolumeEntry(t *testing.T) {
+	// A same-NAMED but content-divergent volume entry must NOT count as synced —
+	// else the DROP discards the DB's authoritative definition and the stale
+	// volume copy fires on the wrong cron/prompt.
+	allowLoopbackForTest(t)
+	mock := setupTestDB(t)
+	handler := NewScheduleHandler()
+	wsID := "22e59f01-0007-4000-8000-000000000007"
+	markVolumeScheduler(t, wsID)
+
+	// DB says cron "0 9 * * *"; the grid has the SAME name with a DIFFERENT cron.
+	stub := newCreateCapableStub(t, `{"schedules":[
+		{"name":"daily","cron":"0 6 * * *","timezone":"UTC","prompt":"p","enabled":true}
+	]}`)
+
+	expectReadinessCounts(mock,
+		sqlmock.NewRows([]string{"workspace_id", "source", "count"}).AddRow(wsID, "runtime", 1), 0)
+	mock.ExpectQuery("SELECT name, cron_expr, timezone, prompt, enabled, source FROM workspace_schedules").WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "cron_expr", "timezone", "prompt", "enabled", "source"}).
+			AddRow("daily", "0 9 * * *", "UTC", "p", true, "runtime"))
+	expectFanoutURL(mock, wsID, stub.srv.URL)
+	expectInboundSecret(mock, wsID, "sec-7")
+
+	w, ctx := adminCtx(t, "GET", "/admin/schedules/p4b-readiness")
+	handler.P4bReadiness(ctx)
+
+	m := decodeJSON(t, w)
+	if m["data_drop_safe"] != false || m["workspaces_needing_migration"].(float64) != 1 {
+		t.Errorf("content-divergent entry must block (needs_migration=1), got %s", w.Body.String())
+	}
+	row := m["workspaces"].([]interface{})[0].(map[string]interface{})
+	if row["runtime_rows_unsynced"].(float64) != 1 {
+		t.Errorf("expected runtime_rows_unsynced=1 for the divergent entry, got %v", row)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
+func TestP4bReadiness_MissingSecretIsUnverifiable_FailsClosed(t *testing.T) {
+	// A NULL platform_inbound_secret must make the workspace UNVERIFIABLE — the
+	// audit cannot reach the volume to verify parity, so it fails CLOSED
+	// (blocking, data_drop_safe=false), never assuming synced. No-mint is by
+	// construction: the read-only path uses wsauth.ReadPlatformInboundSecret,
+	// which has no write leg (unlike readOrLazyHealInboundSecret). (This test
+	// does NOT assert no-mint — a healing regression would still surface here as
+	// unverifiable; the no-write guarantee is a code-review invariant.)
+	allowLoopbackForTest(t)
+	mock := setupTestDB(t)
+	handler := NewScheduleHandler()
+	wsID := "22e59f01-0008-4000-8000-000000000008"
+	markVolumeScheduler(t, wsID)
+
+	expectReadinessCounts(mock,
+		sqlmock.NewRows([]string{"workspace_id", "source", "count"}).AddRow(wsID, "runtime", 1), 0)
+	mock.ExpectQuery("SELECT name, cron_expr, timezone, prompt, enabled, source FROM workspace_schedules").WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"name", "cron_expr", "timezone", "prompt", "enabled", "source"}).
+			AddRow("daily", "0 9 * * *", "UTC", "p", true, "runtime"))
+	expectFanoutURL(mock, wsID, "http://127.0.0.1:9/") // loopback so isSafeURL passes
+	expectInboundSecret(mock, wsID, nil)               // NULL → ErrNoInboundSecret (no fetch, no mint)
+
+	w, ctx := adminCtx(t, "GET", "/admin/schedules/p4b-readiness")
+	handler.P4bReadiness(ctx)
+
+	m := decodeJSON(t, w)
+	if m["data_drop_safe"] != false || m["workspaces_unverifiable"].(float64) != 1 {
+		t.Errorf("missing secret must be unverifiable (fail closed), got %s", w.Body.String())
+	}
+	row := m["workspaces"].([]interface{})[0].(map[string]interface{})
+	if row["blocking"] != true || row["runtime_rows_unsynced"].(float64) != -1 {
+		t.Errorf("expected blocking with unsynced=-1 (unverifiable), got %v", row)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock: %v", err)

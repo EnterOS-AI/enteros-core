@@ -3007,12 +3007,12 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
   _p4b_call GET "/admin/schedules/p4b-readiness" "p4b-readiness" '
 import json,sys
 d=json.load(sys.stdin)
-for k in ("droppable","kill_switch_enabled","workspaces_with_live_rows","workspaces_needing_migration","workspaces"):
+for k in ("data_drop_safe","drop_still_requires","kill_switch_enabled","workspaces_with_live_rows","workspaces_needing_migration","workspaces_unverifiable","workspaces"):
     assert k in d, "missing key: "+k+" (got "+str(sorted(d))+")"
-assert isinstance(d["droppable"], bool), "droppable must be a bool"
+assert isinstance(d["data_drop_safe"], bool), "data_drop_safe must be a bool"
 assert isinstance(d["workspaces"], list), "workspaces must be a list"
-print("    readiness: droppable=%s live_rows=%s not_native=%s needs_migration=%s" % (
-    d["droppable"], d["workspaces_with_live_rows"], d.get("not_volume_native"), d["workspaces_needing_migration"]))
+print("    readiness: data_drop_safe=%s live_rows=%s not_native=%s needs_migration=%s unverifiable=%s" % (
+    d["data_drop_safe"], d["workspaces_with_live_rows"], d.get("not_volume_native"), d["workspaces_needing_migration"], d["workspaces_unverifiable"]))
 '
   ok "    p4b-readiness reachable + correctly shaped"
 

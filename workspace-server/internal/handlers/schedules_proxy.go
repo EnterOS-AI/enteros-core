@@ -541,6 +541,14 @@ func (h *ScheduleHandler) MigrateToVolume(c *gin.Context) {
 			failed++
 		}
 	}
+	// A mid-stream read error ends rows.Next() with no Scan error; surface it so a
+	// truncated migration is never reported as complete. (The fleet twin,
+	// migrateWorkspaceRuntimeToVolume in schedules_p4b.go, keeps the same guard —
+	// the two intentionally differ only in transport: gin forward vs quiet fan-out.)
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "schedule read did not complete; migration may be partial"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"workspace_id": workspaceID,
