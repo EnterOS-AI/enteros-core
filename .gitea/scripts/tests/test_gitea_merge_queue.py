@@ -4801,9 +4801,12 @@ def test_get_branch_protection_falls_back_to_env_on_403(monkeypatch):
     # repo's BP records required_approvals=0 (Gitea then enforces none at merge).
     assert bp.required_approvals == mq.REQUIRED_APPROVALS_DEFAULT
     assert bp.required_approvals >= 1
-    # Client context set = the env aggregator (a SUBSET of the real '*', so it
-    # can never be LESS strict than Gitea's own server-side merge check).
-    assert bp.required_contexts == mq.required_contexts(mq.REQUIRED_CONTEXTS_RAW)
+    # Client named-context set is EMPTY in fallback: the repo's actual context
+    # casing/naming is unknown to a hard-coded env literal, so gating on one
+    # would FALSE-WAIT a green PR. The named gate defers to Gitea's case-correct
+    # server-side '*' check; case-correct SSOT backstops (critical + enforced
+    # file) and the approval floor still apply and do NOT use this field.
+    assert bp.required_contexts == []
 
 
 def test_get_branch_protection_still_fail_closed_on_non_403(monkeypatch):

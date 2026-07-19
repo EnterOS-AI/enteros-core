@@ -1114,12 +1114,23 @@ def _fallback_branch_protection(reason: str) -> BranchProtection:
     """Synthesize a SAFE branch-protection record for the merge-time-authoritative
     fallback path (see get_branch_protection).
 
-    The env-configured defaults are used as the queue's CLIENT-side gate:
-      * required_contexts  -> REQUIRED_CONTEXTS (default the aggregator
-        `CI / all-required (pull_request)`). This is a SUBSET of the real
-        wildcard BP set, so it can never be LESS strict at merge time than
-        Gitea's own server-side check — Gitea still enforces the full `*` set
-        and rejects (405) any PR with any other posted context red.
+      * required_contexts  -> [] (EMPTY). In fallback mode the client MUST NOT
+        gate on a hard-coded context NAME: the wildcard BP set is `*` (match
+        every posted status), whose case/naming is repo-specific (e.g. this org
+        posts `ci / all-required`, lowercase), and the env REQUIRED_CONTEXTS
+        default is a differently-cased placeholder. A literal client-side name
+        that does not match the repo's actual context would FALSE-WAIT a green
+        PR forever — the exact opposite of unjamming. Deferring the named-context
+        gate to Gitea's server-side `*` check (always case-correct) is both
+        correct and strictly safe: the queue never uses the admin force-override,
+        so Gitea re-checks the full `*` set at write time and 405s any PR with
+        ANY posted context red, which merge_pull HOLDs. The client still keeps
+        its CASE-CORRECT, SSOT-sourced CI backstops that do NOT depend on this
+        field: the step-0 CRITICAL guard (critical_context_prefixes(), derived
+        from the repo's own `.gitea/required-contexts.txt`) and the step-4b
+        ENFORCED-file set (load_enforced_file_contexts, event-suffix-insensitive)
+        — so a PR whose aggregator is red is still refused client-side before any
+        futile merge POST.
       * required_approvals -> REQUIRED_APPROVALS_DEFAULT, the env approval
         FLOOR (never 0). This matters because a repo whose BP records
         required_approvals=0 gets NO server-side approval enforcement from
@@ -1134,14 +1145,15 @@ def _fallback_branch_protection(reason: str) -> BranchProtection:
     print(
         "::warning::branch protection unreadable to the queue merge actor "
         f"({reason}); entering GITEA-AUTHORITATIVE FALLBACK: the protected "
-        "merge endpoint re-checks branch protection server-side and rejects "
-        "(405) any under-approved / red / stale-head PR. Client-side gate uses "
-        f"REQUIRED_CONTEXTS={REQUIRED_CONTEXTS_RAW!r} and the approval floor "
-        f"REQUIRED_APPROVALS={REQUIRED_APPROVALS_DEFAULT}. This grants the queue "
-        "NO new privilege — it merges strictly less than Gitea itself allows."
+        "merge endpoint re-checks the wildcard branch protection server-side and "
+        "rejects (405) any under-approved / red / stale-head PR. Client keeps its "
+        "SSOT-sourced backstops (critical-context + enforced-file CI gates + the "
+        f"approval floor REQUIRED_APPROVALS={REQUIRED_APPROVALS_DEFAULT}) and defers "
+        "the named required-context set to Gitea. This grants the queue NO new "
+        "privilege — it merges strictly less than Gitea itself allows."
     )
     return BranchProtection(
-        required_contexts=required_contexts(REQUIRED_CONTEXTS_RAW),
+        required_contexts=[],
         required_approvals=REQUIRED_APPROVALS_DEFAULT,
         block_on_rejected_reviews=True,
         block_on_outdated_branch=False,
