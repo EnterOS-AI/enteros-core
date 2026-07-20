@@ -269,19 +269,6 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 		return
 	}
 
-	// Scoped single-use grant for PRIVILEGED / boundary-crossing delegations
-	// (admin-token / org-token callers). Fires BEFORE the self-delegation
-	// guard, idempotency lookup, insertDelegationRow, executeDelegation
-	// goroutine, and broadcast — i.e. before any DB or proxy side effect, so a
-	// consequential handoff cannot proceed without the verified single-use
-	// grant. Routine intra-org sibling A2A (workspace-token callers) is NOT
-	// privileged and passes through untouched; the whole gate is dormant unless
-	// an operator arms MOLECULE_PRIVILEGED_DELEGATION_GATE. Response (403/500)
-	// already written on the reject path.
-	if !gatePrivilegedDelegation(c, h.broadcaster, sourceID, body.TargetID, body.Task) {
-		return
-	}
-
 	// #548 — prevent self-delegation: a workspace delegating to itself
 	// acquires _run_lock twice on the same mutex, deadlocking permanently.
 	//
@@ -310,10 +297,31 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 		return
 	}
 
+	// Scoped single-use grant for PRIVILEGED / boundary-crossing delegations
+	// (admin-token / org-token callers). FINDING[2]: this runs AFTER the
+	// idempotency lookup above, so a replay of an already-accepted delegation
+	// replays the original delegation_id WITHOUT requiring or consuming a fresh
+	// grant. FINDING[7]/[8]: the privileged classification + gated decision live
+	// in the approvals SSOT (see delegationRequiresGrant). Routine intra-org
+	// sibling A2A (workspace-token callers) is NOT privileged and passes through
+	// untouched; the whole gate is dormant unless an operator arms
+	// MOLECULE_PRIVILEGED_DELEGATION_GATE. The grant is CONSUMED here (atomic,
+	// single-use, so a 403 fires before any dispatch) and RESTORED below if the
+	// hand-off never actually dispatches (FINDING[3]). Response (403/500) already
+	// written on the reject path.
+	proceed, grantID := gatePrivilegedDelegation(c, h.broadcaster, sourceID, body.TargetID, body.Task)
+	if !proceed {
+		return
+	}
+
 	delegationID := uuid.New().String()
 
 	outcome := insertDelegationRow(ctx, c, sourceID, body, delegationID)
 	if outcome == insertHandledByIdempotent {
+		// A concurrent idempotent request won the unique slot; THIS request will
+		// not dispatch. Return the grant we consumed so it is not burned on a
+		// delegation that never happened (FINDING[3]). No-op when grantID == "".
+		restorePrivilegedDelegationGrant(ctx, sourceID, grantID)
 		return // idempotency-conflict response already written
 	}
 	// insertTrackingUnavailable means insert failed for a non-idempotency
@@ -362,7 +370,11 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 	// asyncWG.
 	h.workspace.goAsync(func() {
 		defer cancelDelegation()
-		h.executeDelegation(delegationCtx, sourceID, body.TargetID, delegationID, a2aBody)
+		// grantID (when non-empty) is the consumed privileged-delegation grant;
+		// executeDelegation restores it if the A2A hand-off fails to dispatch,
+		// so a grant is never burned on a delegation that never reached the
+		// target (FINDING[3]).
+		h.executeDelegation(delegationCtx, sourceID, body.TargetID, delegationID, a2aBody, grantID)
 	})
 
 	// Broadcast event so canvas shows delegation in real-time
@@ -562,7 +574,13 @@ var delegationRetryDelay = 8 * time.Second
 // executeDelegation runs the A2A dispatch for a delegation. ctx controls the
 // entire lifecycle: its timeout bounds all DB ops, proxy calls, and retries.
 // Pass context.Background() when no external deadline applies (e.g. tests).
-func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, targetID, delegationID string, a2aBody []byte) {
+// consumedGrantID, when non-empty, is the single-use privileged-delegation
+// grant that POST /delegate atomically consumed before dispatching. If the A2A
+// hand-off fails to dispatch terminally (the target was never reached), this
+// restores the grant so it is not permanently burned on a delegation that never
+// happened (FINDING[3]). Empty (the default for routine A2A / gate-off / tests)
+// makes every restore path a no-op — byte-identical to prior behaviour.
+func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, targetID, delegationID string, a2aBody []byte, consumedGrantID string) {
 	runtime.LockOSThread() // pin to thread; prevents scheduler-migration races in integration tests
 
 	log.Printf("Delegation %s: %s → %s (dispatched)", delegationID, sourceID, targetID)
@@ -641,6 +659,12 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 		if mayReply(authority) {
 			pushDelegationResultToInbox(ctx, sourceID, targetID, delegationID, "failed", "", proxyErr.Error())
 		}
+		// FINDING[3]: the A2A hand-off never reached the target (this is the
+		// non-delivery branch — delivery-confirmed 2xx and durable-enqueue are
+		// handled above/below and do NOT restore). Return the consumed
+		// single-use grant so it is not permanently burned on a delegation that
+		// never dispatched. No-op when consumedGrantID == "".
+		restorePrivilegedDelegationGrant(ctx, sourceID, consumedGrantID)
 		return
 	}
 
@@ -847,15 +871,12 @@ func (h *DelegationHandler) Record(c *gin.Context) {
 		return
 	}
 
-	// Same privileged-delegation grant gate as Delegate. Record is the agent-
-	// fired-A2A-directly variant, so a privileged caller must not be able to
-	// register (and later mark complete) a boundary-crossing handoff here to
-	// bypass the /delegate gate. Routine sibling A2A is unaffected; gate dormant
-	// unless armed. Response already written on the reject path.
-	if !gatePrivilegedDelegation(c, h.broadcaster, sourceID, body.TargetID, body.Task) {
-		return
-	}
-
+	// FINDING[4]: Record is NOT gated. It is the log-only self-report that fires
+	// AFTER the agent has ALREADY dispatched the A2A itself — gating it cannot
+	// prevent the hand-off, it can only HIDE the audit row for an action that
+	// already executed. The privileged-delegation grant is enforced at the real
+	// dispatch point (POST /delegate → executeDelegation → proxyA2ARequest); here
+	// we always record, so the ledger never loses a row for an executed hand-off.
 	taskJSON, marshalErr := json.Marshal(map[string]interface{}{
 		"task":          body.Task,
 		"delegation_id": body.DelegationID,

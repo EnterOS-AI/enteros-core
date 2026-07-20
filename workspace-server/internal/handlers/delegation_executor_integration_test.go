@@ -312,7 +312,7 @@ func TestIntegration_ExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSucce
 
 	start := time.Now()
 	runWithTimeout(t, 30*time.Second, func(ctx context.Context) {
-		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody)
+		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody, "")
 	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
@@ -364,7 +364,7 @@ func TestIntegration_ExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing
 	})
 	start := time.Now()
 	runWithTimeout(t, 30*time.Second, func(ctx context.Context) {
-		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody)
+		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody, "")
 	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
@@ -413,7 +413,7 @@ func TestIntegration_ExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *test
 	})
 	start := time.Now()
 	runWithTimeout(t, 30*time.Second, func(ctx context.Context) {
-		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody)
+		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody, "")
 	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
@@ -461,7 +461,7 @@ func TestIntegration_ExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T
 	})
 	start := time.Now()
 	runWithTimeout(t, 30*time.Second, func(ctx context.Context) {
-		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody)
+		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody, "")
 	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
@@ -517,7 +517,7 @@ func TestIntegration_ExecuteDelegation_RedisDown_FallsBackToDB(t *testing.T) {
 	})
 	start := time.Now()
 	runWithTimeout(t, 30*time.Second, func(ctx context.Context) {
-		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody)
+		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody, "")
 	})
 	t.Logf("executeDelegation took %v", time.Since(start))
 
@@ -567,7 +567,7 @@ func TestIntegration_ExecuteDelegation_SettlingTarget_Enqueues(t *testing.T) {
 		},
 	})
 	runWithTimeout(t, 30*time.Second, func(ctx context.Context) {
-		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody)
+		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody, "")
 	})
 
 	status, _, errDet := readDelegationRow(t, conn)
@@ -664,6 +664,152 @@ func TestIntegration_SameOrg_RealCTE_ResolvesAncestorChain(t *testing.T) {
 		if ok {
 			t.Errorf("sameOrg(%s,%s) = true, want false (different orgs — cross-tenant must stay denied)", pair[0], pair[1])
 		}
+	}
+}
+
+// seedConsumedGrant inserts an APPROVED + already-CONSUMED privileged-delegation
+// grant owned by workspaceID and returns (grantID, cleanup). Mirrors what
+// gatePrivilegedDelegation's atomic consume leaves behind just before the
+// detached dispatch runs.
+func seedConsumedGrant(t *testing.T, conn *sql.DB, workspaceID string) (string, func()) {
+	t.Helper()
+	const grantID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := conn.ExecContext(ctx, `
+		INSERT INTO approval_requests (id, workspace_id, action, status, consumed_at)
+		VALUES ($1::uuid, $2::uuid, 'privileged_delegate', 'approved', now())
+		ON CONFLICT (id) DO UPDATE SET status = 'approved', consumed_at = now()
+	`, grantID, workspaceID); err != nil {
+		t.Fatalf("seed consumed grant: %v", err)
+	}
+	return grantID, func() {
+		c, cc := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cc()
+		conn.ExecContext(c, `DELETE FROM approval_requests WHERE id = $1`, grantID)
+	}
+}
+
+// grantConsumedAt returns whether the seeded grant is still consumed.
+func grantConsumedAt(t *testing.T, conn *sql.DB, grantID string) (consumed bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var consumedAt sql.NullTime
+	if err := conn.QueryRowContext(ctx,
+		`SELECT consumed_at FROM approval_requests WHERE id = $1`, grantID).Scan(&consumedAt); err != nil {
+		t.Fatalf("read grant consumed_at: %v", err)
+	}
+	return consumedAt.Valid
+}
+
+// FINDING[3] (end-to-end, fail direction): a privileged delegation whose A2A
+// hand-off NEVER reaches the target (terminal-unreachable) must RESTORE the
+// consumed single-use grant — so an operator's one approval is not permanently
+// burned on a delegation that never dispatched. This is the hole the old design
+// left open: consume-at-gate + detached fire-and-forget dispatch that fails
+// after the 202.
+func TestIntegration_ExecuteDelegation_DispatchFailure_RestoresGrant(t *testing.T) {
+	allowLoopbackForTest(t)
+	conn := integrationDB(t)
+	cleanup := setupIntegrationFixtures(t, conn)
+	defer cleanup()
+	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
+
+	grantID, grantCleanup := seedConsumedGrant(t, conn, integrationTestSourceID)
+	defer grantCleanup()
+
+	// Terminal target: no URL and not self-recovering → genuinely unreachable →
+	// the dispatch fails (not enqueues).
+	if _, err := conn.Exec(`UPDATE workspaces SET status = 'failed' WHERE id = $1::uuid`, integrationTestTargetID); err != nil {
+		t.Fatalf("set target status=failed: %v", err)
+	}
+
+	mr := setupTestRedis(t)
+	defer mr.Close()
+
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	a2aBody, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": "1", "method": "message/send",
+		"params": map[string]interface{}{
+			"message": map[string]interface{}{
+				"role":  "user",
+				"parts": []map[string]string{{"type": "text", "text": "do work"}},
+			},
+		},
+	})
+
+	runWithTimeout(t, 30*time.Second, func(ctx context.Context) {
+		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody, grantID)
+	})
+
+	// The delegation itself failed (target unreachable) ...
+	status, _, errDet := readDelegationRow(t, conn)
+	if status != "failed" {
+		t.Errorf("delegation status: want failed (unreachable target), got %q", status)
+	}
+	if errDet == "" {
+		t.Error("error_detail should be set on an unreachable-target failure")
+	}
+	// ... but the grant was RESTORED so it is not burned on a hand-off that never happened.
+	if grantConsumedAt(t, conn, grantID) {
+		t.Error("dispatch failure MUST restore the grant (consumed_at → NULL); grant is still consumed")
+	}
+}
+
+// FINDING[3] (end-to-end, negative control / legit direction): a privileged
+// delegation that DOES dispatch successfully must KEEP the grant consumed — the
+// single-use approval was legitimately spent on a hand-off that actually
+// happened. Guards against an over-eager restore that would let one approval
+// drive unlimited dispatches.
+func TestIntegration_ExecuteDelegation_DispatchSuccess_KeepsGrantConsumed(t *testing.T) {
+	allowLoopbackForTest(t)
+	conn := integrationDB(t)
+	cleanup := setupIntegrationFixtures(t, conn)
+	defer cleanup()
+	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
+
+	grantID, grantCleanup := seedConsumedGrant(t, conn, integrationTestSourceID)
+	defer grantCleanup()
+
+	agentURL, closeServer := rawHTTPServer(t, 200, `{"result":{"parts":[{"text":"all good"}]}}`)
+	defer closeServer()
+
+	mr := setupTestRedis(t)
+	defer mr.Close()
+	db.CacheURL(context.Background(), integrationTestTargetID, agentURL)
+
+	prevClient := a2aClient
+	defer func() { a2aClient = prevClient }()
+	a2aClient = newA2AClientForHost(extractHostPort(agentURL))
+
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	a2aBody, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": "1", "method": "message/send",
+		"params": map[string]interface{}{
+			"message": map[string]interface{}{
+				"role":  "user",
+				"parts": []map[string]string{{"type": "text", "text": "do work"}},
+			},
+		},
+	})
+
+	runWithTimeout(t, 30*time.Second, func(ctx context.Context) {
+		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody, grantID)
+	})
+
+	status, _, _ := readDelegationRow(t, conn)
+	if status != "completed" {
+		t.Errorf("delegation status: want completed, got %q", status)
+	}
+	if !grantConsumedAt(t, conn, grantID) {
+		t.Error("a successfully dispatched delegation MUST keep its single-use grant consumed; it was restored")
 	}
 }
 

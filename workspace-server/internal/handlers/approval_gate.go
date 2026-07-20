@@ -159,14 +159,16 @@ func gateDestructive(c *gin.Context, b events.EventEmitter, workspaceID string, 
 	//     automation from a surprise async-approval behaviour change.
 	//   - non-agent callers (workspace tokens, session cookies) bypass
 	//     entirely — ordinary operation is byte-identical.
-	isAdminToken := callerIsAdminToken(c)
-	if !isAdminToken {
-		if !destructiveGateEnabled() {
-			return true
-		}
-		if !callerHoldsOrgToken(c) {
-			return true
-		}
+	// Activation policy via the shared privileged classifier (callerIsPrivileged,
+	// FINDING[8] dedupe). Behaviour is byte-identical to the prior hand-rolled
+	// form: a non-privileged caller (workspace token / session cookie) bypasses
+	// entirely; an admin-token caller is ALWAYS gated (flag-independent — the
+	// core#2574 escalation fix); an org-token caller follows the rollout flag.
+	if !callerIsPrivileged(c) {
+		return true
+	}
+	if !callerIsAdminToken(c) && !destructiveGateEnabled() {
+		return true
 	}
 	approved, approvalID, err := requireApproval(c.Request.Context(), b, workspaceID, action, reason, contextMap)
 	if err != nil {
@@ -229,6 +231,17 @@ func callerIsAdminToken(c *gin.Context) bool {
 	return ok && b
 }
 
+// callerIsPrivileged reports whether the caller crossed the org trust boundary
+// with an admin token (Tier 2b bootstrap / Tier 3 fallback) or an org token
+// (Tier 2a) — the privileged surface that BOTH the destructive-op gate and the
+// privileged-delegation gate protect. It is the SINGLE source of truth for "who
+// is privileged", so the two gates cannot drift on the classifier (FINDING[8]);
+// they diverge only on their independent rollout flags (see gateDestructive vs
+// delegationRequiresGrant).
+func callerIsPrivileged(c *gin.Context) bool {
+	return callerIsAdminToken(c) || callerHoldsOrgToken(c)
+}
+
 // ── Scoped single-use grant for PRIVILEGED / boundary-crossing delegations ──
 //
 // FIX-1 (single-use grant) + FIX-2 (proof-gated / verify-before-act) for the
@@ -267,7 +280,15 @@ func delegationRequiresGrant(c *gin.Context) bool {
 	if !privilegedDelegationGateEnabled() {
 		return false
 	}
-	return callerIsAdminToken(c) || callerHoldsOrgToken(c)
+	// FINDING[7]: the gate decision is wired through the approvals SSOT. If
+	// ActionPrivilegedDelegate is dropped from the gated map, this gate goes
+	// inert — exactly like gateDestructive consulting IsGated(action) — so the
+	// policy lives in ONE auditable place, not in a divergent inline classifier.
+	if !approvals.IsGated(approvals.ActionPrivilegedDelegate) {
+		return false
+	}
+	// FINDING[8]: identical privileged classification to gateDestructive.
+	return callerIsPrivileged(c)
 }
 
 // privilegedDelegationContext binds a grant to a SPECIFIC (target, task) so an
@@ -283,21 +304,31 @@ func privilegedDelegationContext(targetID, task string) map[string]interface{} {
 }
 
 // gatePrivilegedDelegation is the choke point the delegation authorize path
-// calls BEFORE any side effect (row insert, A2A dispatch, broadcast). For a
-// privileged caller it requires — and atomically CONSUMES (single-use) — a
-// matching approved grant, reusing requireApproval's verify-before-act
-// consumption. Because the verification happens before the act, a consequential
-// handoff cannot proceed to (or report) completion without the verified
-// precondition (FIX-2). Returns true when the caller may proceed:
-//   - not a privileged caller (or gate dormant) → true, no DB touch, no grant
-//     required — routine A2A is unaffected;
-//   - privileged + a grant was consumed → true;
-//   - privileged + no consumable grant → writes 403 (a pending grant request is
-//     recorded so a human can approve it) and returns false;
-//   - server error → writes 500 and returns false.
-func gatePrivilegedDelegation(c *gin.Context, b events.EventEmitter, sourceID, targetID, task string) bool {
+// calls, in POST /delegate, AFTER the idempotency lookup (FINDING[2]) and BEFORE
+// the row insert + detached A2A dispatch. For a privileged caller it requires —
+// and atomically CONSUMES (single-use) — a matching approved grant, reusing
+// requireApproval's verify-before-act consumption. Because the verification
+// happens before the act, a consequential handoff cannot proceed without the
+// verified precondition, and a missing grant 403s before anything dispatches.
+//
+// It returns the CONSUMED grant id (consumedGrantID) alongside proceed. Consume
+// is synchronous (so single-use is atomic and the 403 fires pre-dispatch), but
+// the actual hand-off is a detached goroutine that can fail AFTER the 202 — so
+// the caller MUST restorePrivilegedDelegationGrant(consumedGrantID) if the
+// hand-off never dispatches, so a grant is never burned on a delegation that
+// never happened (FINDING[3]). consumedGrantID is "" when nothing was consumed
+// (routine caller / dormant gate / reject), i.e. nothing to restore.
+//
+// Return matrix:
+//   - not a privileged caller (or gate dormant) → (true, "") — routine A2A
+//     unaffected, no DB touch, no grant required;
+//   - privileged + a grant was consumed → (true, grantID);
+//   - privileged + no consumable grant → writes 403 (records a pending grant
+//     request for later human approval) → (false, "");
+//   - server error → writes 500 → (false, "").
+func gatePrivilegedDelegation(c *gin.Context, b events.EventEmitter, sourceID, targetID, task string) (proceed bool, consumedGrantID string) {
 	if !delegationRequiresGrant(c) {
-		return true
+		return true, ""
 	}
 	approved, grantID, err := requireApproval(
 		c.Request.Context(), b, sourceID,
@@ -308,7 +339,7 @@ func gatePrivilegedDelegation(c *gin.Context, b events.EventEmitter, sourceID, t
 	if err != nil {
 		log.Printf("gatePrivilegedDelegation: %v (ws=%s target=%s)", err, sourceID, targetID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "delegation grant gate failed"})
-		return false
+		return false, ""
 	}
 	if !approved {
 		log.Printf("gatePrivilegedDelegation: rejected privileged delegation without grant (ws=%s target=%s grant_request=%s)", sourceID, targetID, grantID)
@@ -317,7 +348,37 @@ func gatePrivilegedDelegation(c *gin.Context, b events.EventEmitter, sourceID, t
 			"action":           string(approvals.ActionPrivilegedDelegate),
 			"grant_request_id": grantID,
 		})
-		return false
+		return false, ""
 	}
-	return true
+	// grantID is the just-CONSUMED grant — returned for restore-on-non-dispatch.
+	return true, grantID
+}
+
+// restorePrivilegedDelegationGrant returns a single-use grant to the unconsumed
+// pool after the delegation that consumed it FAILED to actually dispatch
+// (FINDING[3]). gatePrivilegedDelegation consumes the grant synchronously (so
+// the single-use guarantee is atomic and a missing grant can 403 before the
+// 202); but the real A2A hand-off is a detached goroutine that can fail AFTER
+// the 202 — an unreachable target, or a lost idempotency-insert race — so the
+// consumed grant would otherwise be burned on a hand-off that never happened.
+// Restoring it (consumed_at → NULL) makes the consume recoverable, so the
+// operator's single approval survives a transient dispatch failure and the next
+// retry can use it.
+//
+// Best-effort and grant-scoped: a no-op when grantID == "" (nothing was
+// consumed — routine caller / dormant gate), and a restore failure only logs —
+// it must never fail the (already-terminal) delegation. Bounded to the
+// consuming workspace and to still-consumed rows so it can neither touch another
+// workspace's grant nor resurrect one a concurrent flow legitimately re-consumed.
+func restorePrivilegedDelegationGrant(ctx context.Context, workspaceID, grantID string) {
+	if grantID == "" {
+		return
+	}
+	if _, err := db.DB.ExecContext(ctx, `
+		UPDATE approval_requests
+		SET consumed_at = NULL
+		WHERE id = $1 AND workspace_id = $2 AND consumed_at IS NOT NULL
+	`, grantID, workspaceID); err != nil {
+		log.Printf("restorePrivilegedDelegationGrant: failed to restore grant %s (ws=%s): %v", grantID, workspaceID, err)
+	}
 }

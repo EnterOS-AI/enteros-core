@@ -45,3 +45,20 @@ var gated = map[Action]bool{
 func IsGated(action Action) bool {
 	return gated[action]
 }
+
+// SetGatedForTest overrides whether an action is gated and returns a restore
+// func. TEST-ONLY — exported so consumers in OTHER packages (e.g. the
+// privileged-delegation gate in handlers/) can negative-control that their gate
+// decision is wired through IsGated, the single source of truth, rather than a
+// divergent local classifier. Never call from production code.
+func SetGatedForTest(action Action, value bool) func() {
+	prev, had := gated[action]
+	gated[action] = value
+	return func() {
+		if had {
+			gated[action] = prev
+		} else {
+			delete(gated, action)
+		}
+	}
+}

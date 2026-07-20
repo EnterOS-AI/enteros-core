@@ -101,14 +101,18 @@ func TestGatePrivilegedDelegation_RoutineBypass(t *testing.T) {
 	_ = setupTestDB(t) // db.DB is the mock; NO queries are expected on this path
 
 	t.Setenv("MOLECULE_PRIVILEGED_DELEGATION_GATE", "1")
-	if !gatePrivilegedDelegation(newDelegCtx("none"), nil, "ws-source", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "do the thing") {
+	if proceed, grantID := gatePrivilegedDelegation(newDelegCtx("none"), nil, "ws-source", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "do the thing"); !proceed {
 		t.Error("routine (no privileged token) delegation must proceed with no grant")
+	} else if grantID != "" {
+		t.Errorf("routine delegation must consume NO grant, got grantID=%q", grantID)
 	}
 
-	// Gate dormant (flag off) + admin-token → still proceeds, no DB touch.
+	// Gate dormant (flag off) + admin-token → still proceeds, no DB touch, no grant.
 	os.Unsetenv("MOLECULE_PRIVILEGED_DELEGATION_GATE")
-	if !gatePrivilegedDelegation(newDelegCtx("admin-token"), nil, "ws-source", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "do the thing") {
+	if proceed, grantID := gatePrivilegedDelegation(newDelegCtx("admin-token"), nil, "ws-source", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "do the thing"); !proceed {
 		t.Error("gate dormant: admin-token delegation must proceed unchanged")
+	} else if grantID != "" {
+		t.Errorf("gate dormant: must consume NO grant, got grantID=%q", grantID)
 	}
 }
 
@@ -130,8 +134,12 @@ func TestGatePrivilegedDelegation_RejectedWithoutGrant(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
 
 	c, w := newDelegCtxRec("admin-token")
-	if gatePrivilegedDelegation(c, nil, "ws-source", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "delete prod") {
+	proceed, grantID := gatePrivilegedDelegation(c, nil, "ws-source", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "delete prod")
+	if proceed {
 		t.Fatal("privileged delegation WITHOUT a grant MUST be rejected (want proceed=false)")
+	}
+	if grantID != "" {
+		t.Errorf("a rejected delegation consumes NO grant, so grantID must be empty, got %q", grantID)
 	}
 	if w.Code != http.StatusForbidden {
 		t.Errorf("want 403, got %d: %s", w.Code, w.Body.String())
@@ -162,8 +170,14 @@ func TestGatePrivilegedDelegation_ConsumesGrantAndProceeds(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("grant-approved-42"))
 
 	c := newDelegCtx("admin-token")
-	if !gatePrivilegedDelegation(c, nil, "ws-source", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "delete prod") {
+	proceed, grantID := gatePrivilegedDelegation(c, nil, "ws-source", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "delete prod")
+	if !proceed {
 		t.Fatal("privileged delegation WITH a valid grant MUST proceed (want proceed=true)")
+	}
+	// The CONSUMED grant id must be surfaced so the dispatch path can restore it
+	// if the hand-off later fails (FINDING[3]).
+	if grantID != "grant-approved-42" {
+		t.Errorf("want consumed grantID=grant-approved-42, got %q", grantID)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("grant was not consumed as expected: %v", err)
