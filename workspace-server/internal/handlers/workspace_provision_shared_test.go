@@ -1791,3 +1791,50 @@ func TestPrepareProvisionContext_LatePrivilegedAdminEnvFailsClosed(t *testing.T)
 		t.Fatalf("forbidden keys = %#v, want [ADMIN_TOKEN]", abort.Extra["forbidden_env_keys"])
 	}
 }
+
+// TestPrepareProvisionContext_DeclaresSchedulerUnconditionally — the scheduler is
+// a BASE per-workspace ability (the firing daemon AND the self-audience
+// self-schedule MCP tool ship in the one molecule-scheduler plugin), so it must be
+// declared on EVERY workspace at provision REGARDLESS of the
+// MOLECULE_DECLARE_DEFAULT_NATIVE_PLUGINS flag (which stays the lever for the
+// digest providers). With the flag OFF, prepareProvisionContext must still record
+// molecule-scheduler in workspace_declared_plugins.
+func TestPrepareProvisionContext_DeclaresSchedulerUnconditionally(t *testing.T) {
+	// Flag OFF — the digest-provider default set is a no-op, but the scheduler is not.
+	t.Setenv(declareDefaultNativePluginsEnv, "")
+	os.Unsetenv(declareDefaultNativePluginsEnv)
+	// Platform-managed model (CP proxy base URL + usage token present) so the
+	// provision reaches the declare hook rather than aborting on the BYOK gate.
+	t.Setenv("MOLECULE_LLM_BASE_URL", "https://api.example.test/api/v1/internal/llm/openai/v1")
+	t.Setenv("MOLECULE_LLM_USAGE_TOKEN", "tenant-admin-token")
+
+	mock := setupTestDB(t)
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM global_secrets`).
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	mock.ExpectQuery(`SELECT key, encrypted_value, encryption_version FROM workspace_secrets`).
+		WithArgs("ws-sched-base").
+		WillReturnRows(sqlmock.NewRows([]string{"key", "encrypted_value", "encryption_version"}))
+	// The unconditional scheduler declare — the behavior under test. molecule-
+	// scheduler is not the concierge MCP, so recordDeclaredPlugin is a single INSERT
+	// (no entitlement SELECT).
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	handler := NewWorkspaceHandler(&captureBroadcaster{}, nil, "http://localhost:8080", t.TempDir())
+	payload := models.CreateWorkspacePayload{
+		Name:  "Sched-Base",
+		Role:  "agent-sched",
+		Tier:  1,
+		Model: "anthropic:claude-opus-4-7",
+	}
+	_, abort := handler.prepareProvisionContext(
+		context.Background(), "ws-sched-base", "/nonexistent", nil, payload, false)
+	if abort != nil {
+		t.Fatalf("unexpected abort: %s", abort.Msg)
+	}
+	// The scheduler INSERT expectation being MET proves it was declared with the
+	// flag off (a flag-gated-only declare would leave it unmet).
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("scheduler must be declared at provision even with the default-native flag OFF: %v", err)
+	}
+}

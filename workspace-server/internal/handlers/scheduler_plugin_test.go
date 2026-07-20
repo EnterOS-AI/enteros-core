@@ -16,8 +16,13 @@ func TestEnsureSchedulerPluginDeclared_DeclaresPinnedSource(t *testing.T) {
 	mock := setupTestDB(t)
 	// molecule-scheduler is not the privileged concierge MCP → no kind precheck,
 	// straight to the declared-plugins upsert.
+	// Reference the SSOT (SchedulerPluginName/Source) not a frozen literal: the
+	// exact-pin canary lives in plugin_registry_test.go
+	// (TestNativeRegistry_SourcesByteIdenticalToRetiredConsts), so this test only
+	// needs to prove the upsert writes THAT source verbatim — and it must not
+	// re-break on every registry pin bump.
 	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
-		WithArgs("ws-1", "molecule-scheduler", "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.1.0").
+		WithArgs("ws-1", SchedulerPluginName, SchedulerPluginSource).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := ensureSchedulerPluginDeclared(context.Background(), "ws-1"); err != nil {

@@ -206,8 +206,90 @@ pull_via_host() {
 # history. The opt-out is explicit: set WORKSPACE_IMAGE_PRESEEDED=1 when you have
 # deliberately put a locally BUILT template under the bare tag and want the gate
 # to exercise that instead of the published one.
-seed_workspace_image() {
-  local rt="${RUNTIME}"
+# ── Real multi-runtime matrix (opt-in, DEFAULT-OFF) ──────────────────────────
+# Make the ephemeral CP boot the REAL multi-runtime matrix (hermes + openclaw +
+# claude-code) to status=online per-PR, so peer_visibility exercises the SAME
+# real-boot matrix staging does instead of the secret-free `external:true` row
+# slice. STRICTLY OPT-IN: with E2E_EPHEMERAL_REAL_RUNTIME_MATRIX unset/"" the gate
+# is BYTE-IDENTICAL to today — a single-runtime hermes seed and peer_visibility in
+# external mode. Both infra legs the matrix needs are already present, verified:
+#   (a) all three workspace-template images are published to
+#       registry.moleculesai.app/molecule-ai and pull the same way the hermes one
+#       already does in CI (digest-pinned below), and
+#   (b) all three runtimes carry `minimax/MiniMax-M2.7` in their platform arm
+#       (workspace-server/internal/providers/gen/registry_gen.go), and the
+#       platform provider is anthropic-compat authed by the CP-injected
+#       MOLECULE_LLM_USAGE_TOKEN — so the CP's single MINIMAX_API_KEY serves the
+#       WHOLE matrix through /cp/internal/llm. NO anthropic/moonshot key is needed.
+# It stays opt-in because the openclaw/claude-code cold-boot-to-online inside the
+# nested dind has not yet SOAKED — arm it (=1) only after a maintainer proves the
+# matrix green in CI. Arm a subset first via E2E_EPHEMERAL_MATRIX_RUNTIMES.
+real_runtime_matrix_enabled() {
+  case "${E2E_EPHEMERAL_REAL_RUNTIME_MATRIX:-}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The runtime set the gate stands up template images for (and, matrix-on, boots to
+# online). OFF: exactly the single E2E_RUNTIME (hermes) — today's behaviour. ON:
+# the full maintained matrix, overridable so a maintainer can soak a SUBSET (e.g.
+# drop claude-code) with E2E_EPHEMERAL_MATRIX_RUNTIMES without a code change.
+matrix_runtimes() {
+  if real_runtime_matrix_enabled; then
+    printf '%s' "${E2E_EPHEMERAL_MATRIX_RUNTIMES:-hermes openclaw claude-code}"
+  else
+    printf '%s' "$RUNTIME"
+  fi
+}
+
+# peer_visibility provisioning mode: `managed` (real boot to online) when the
+# matrix is armed, else `external` (awaiting_agent rows, no container/LLM) — the
+# default, byte-identical to today.
+pv_provision_mode() {
+  if real_runtime_matrix_enabled; then printf 'managed'; else printf 'external'; fi
+}
+
+# ── resolve_template_ref: the pinned registry ref for one runtime's template
+# image. DIGEST-PIN (audit Q1 #2 / no-flakes moving-tag rule):
+# workspace-template-<rt>:latest is re-pushed on every template merge, so a
+# failed/partial rebuild could silently change WHICH image this REQUIRED gate
+# provisions with NO core diff, and red (or worse, false-pass) an unrelated PR on
+# a template change nobody reviewed. Same hazard/fix as CP_EPHEMERAL_REF in
+# .gitea/workflows/e2e-ephemeral-happy-path.yml. Image-layer only: this does NOT
+# touch the in-image @molecule-ai/mcp-server npm version-range resolution (that
+# runs at workspace runtime and is orthogonal to which layer we pull here).
+#
+# TO BUMP a pin: read the new digest and paste it below — in its own reviewed PR,
+# so the template advance is reviewed as what gates the gate —
+#   skopeo inspect --format '{{.Digest}}' \
+#     docker://registry.moleculesai.app/molecule-ai/workspace-template-<rt>:latest
+# (equivalently `docker buildx imagetools inspect ...:latest`, the template repo's
+#  Build&push `pushed ...@sha256:...` log line, or a registry v2 manifest HEAD).
+# Each pin is overridable via WORKSPACE_TEMPLATE_<RT>_REF (RT upper, '-'→'_').
+#   hermes      = runtime 0.4.31 / mcp-server 1.9.3 (sha-4dad193) — UNCHANGED;
+#                 the happy-path's input, do NOT retag it on this task.
+#   openclaw    = workspace-template-openclaw:latest resolved 2026-07-20.
+#   claude-code = workspace-template-claude-code:latest resolved 2026-07-20.
+resolve_template_ref() {
+  local rt="$1"
+  local registry="${MOLECULE_IMAGE_REGISTRY:-registry.moleculesai.app/molecule-ai}"
+  case "$rt" in
+    hermes)      printf '%s' "${WORKSPACE_TEMPLATE_HERMES_REF:-${registry}/workspace-template-hermes@sha256:8aab6b48f2af15c3dd1056a5d1f5e7a61fb9a8a66aa7aca5b51cf2d2702215f9}" ;;
+    openclaw)    printf '%s' "${WORKSPACE_TEMPLATE_OPENCLAW_REF:-${registry}/workspace-template-openclaw@sha256:24085f9895af728b7166f9f7908cf4a6b825a4c98abdeb0c1462daa8a5838715}" ;;
+    claude-code) printf '%s' "${WORKSPACE_TEMPLATE_CLAUDE_CODE_REF:-${registry}/workspace-template-claude-code@sha256:50b8068739f35fd3c7404afe7b8336f5057285b12e73b69e62ccd5c6dcc6ddab}" ;;
+    *)
+      # No pinned digest for this runtime; fall back to the moving tag
+      # (unpinned, best-effort — the gate does not exercise it by default).
+      printf '%s' "${registry}/workspace-template-${rt}:latest" ;;
+  esac
+}
+
+# Seed ONE runtime's template image into the LOCAL docker store under its BARE
+# tag (see the file-level comment above; extracted so the matrix path can seed
+# each runtime with byte-identical behaviour).
+seed_one_runtime_image() {
+  local rt="$1"
   local bare="workspace-template-${rt}:latest"
   if [ -n "${WORKSPACE_IMAGE_PRESEEDED:-}" ]; then
     docker image inspect "$bare" >/dev/null 2>&1 \
@@ -215,33 +297,7 @@ seed_workspace_image() {
     echo "[proof] WORKSPACE_IMAGE_PRESEEDED=1 — using the ${bare} already in the store, not the published one" >&2
     return 0
   fi
-  # DIGEST-PIN the template pull (audit Q1 #2). workspace-template-<rt>:latest is a
-  # MOVING tag — CI re-pushes it on every merge — so a failed or partial rebuild can
-  # silently change WHICH image this REQUIRED gate provisions with NO core diff, and
-  # red (or worse, false-pass) an unrelated PR on a template change nobody reviewed.
-  # Same hazard, same fix as CP_EPHEMERAL_REF in
-  # .gitea/workflows/e2e-ephemeral-happy-path.yml: pin an exact digest that a
-  # maintainer bumps, in its own PR, when the template INTENTIONALLY advances.
-  # Image-layer only: this does NOT touch the in-image @molecule-ai/mcp-server npm
-  # version-range / compatible_range resolution (that runs at workspace runtime and
-  # is orthogonal to which image layer we pull here).
-  #
-  # TO BUMP (hermes is the only runtime this gate exercises — E2E_RUNTIME=hermes):
-  # after the template republishes, read the new digest and paste it below —
-  #   skopeo inspect --format '{{.Digest}}' \
-  #     docker://registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest
-  # (equivalently: `docker buildx imagetools inspect ...:latest`, the template repo's
-  #  Build&push job log line `pushed ...@sha256:...`, or a registry v2 manifest HEAD).
-  # Current pin = runtime 0.4.31 / mcp-server 1.9.3 baked (sha-4dad193).
-  local registry="${MOLECULE_IMAGE_REGISTRY:-registry.moleculesai.app/molecule-ai}"
-  local ref
-  if [ "$rt" = "hermes" ]; then
-    ref="${WORKSPACE_TEMPLATE_HERMES_REF:-${registry}/workspace-template-hermes@sha256:8aab6b48f2af15c3dd1056a5d1f5e7a61fb9a8a66aa7aca5b51cf2d2702215f9}"
-  else
-    # No pinned digest published for other runtimes; the gate doesn't exercise them,
-    # so fall back to the moving tag (unpinned, best-effort).
-    ref="${registry}/workspace-template-${rt}:latest"
-  fi
+  local ref; ref="$(resolve_template_ref "$rt")"
   echo "[proof] seeding ${bare} from ${ref}..." >&2
   # Resolve on the host cache (digest = content-addressed, so a HIT is exact) or pull,
   # then stream into the nested daemon CAPTURING the ID that `docker load` reports, and
@@ -266,6 +322,16 @@ seed_workspace_image() {
   [ -n "$img_id" ] || { echo "FATAL: could not determine the loaded image ID for ${ref} from docker load output" >&2; exit 1; }
   docker tag "$img_id" "$bare"
   echo "[proof] seeded ${bare}" >&2
+}
+
+# Seed every runtime the gate will provision: just E2E_RUNTIME (hermes) by
+# default — byte-identical to the pre-matrix single-image seed — or the full
+# maintained matrix when E2E_EPHEMERAL_REAL_RUNTIME_MATRIX=1.
+seed_workspace_image() {
+  local rt
+  for rt in $(matrix_runtimes); do
+    seed_one_runtime_image "$rt"
+  done
 }
 
 # ── start_pg: throwaway postgres:16 on an ephemeral host port ────────────────
@@ -718,20 +784,56 @@ run_scenario_reconciler_heals_terminated() {
 # /workspaces/:id/mcp, JSON-RPC tools/call name=list_peers, through the real
 # WorkspaceAuth + MCPRateLimiter chain; asserts the sibling peer set is present,
 # non-empty, and NOT a native-sessions fallback — the byte-for-byte call
-# mcp_molecule_list_peers makes from a canvas agent). Ported in EXTERNAL
-# provision mode: workspace rows are `external:true` (awaiting_agent, no runtime
-# container / LLM boot), so the scenario exercises the platform auth + peer-set
-# contract WITHOUT needing runtime images or backed platform models — the
-# ephemeral CP only carries MINIMAX_API_KEY and CANNOT boot the staging job's
-# real hermes+openclaw+claude-code matrix to `online`. This is the same
-# secret-free slice the docker-host local leg (test_peer_visibility_mcp_local.sh)
-# proves; folding it onto the standing ephemeral CP consolidates it onto the one
-# gate. UNLIKE concierge, NO peer-visibility curl sends an Origin header (the MCP
-# call + provisioning are server-to-server, not a browser CORS request), so this
-# scenario needs NO MOLECULE_TENANT_ORIGIN_TEMPLATE — only the Host +
-# X-Molecule-Org-Slug slug routing (+ X-Molecule-Org-Id). Mirrors
-# e2e-staging-saas.yml's peer-visibility job.
+# mcp_molecule_list_peers makes from a canvas agent).
+#
+# TWO provision modes, selected by pv_provision_mode() (the real-runtime-matrix
+# opt-in flag):
+#
+#   external (DEFAULT, byte-identical to today) — workspace rows are
+#     `external:true` (awaiting_agent, no runtime container / LLM boot), so the
+#     scenario exercises the platform auth + peer-set contract WITHOUT runtime
+#     images or backed platform models. The same secret-free slice the docker-host
+#     local leg (test_peer_visibility_mcp_local.sh) proves.
+#
+#   managed (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX=1) — the FULL staging behaviour:
+#     one real workspace per runtime in matrix_runtimes(), each booted to
+#     status=online, then the literal list_peers call. This is the multi-runtime
+#     real-boot coverage the staging peer-visibility job carries and the reason
+#     the matrix flag exists. It works on the ephemeral CP because seed_workspace_image
+#     pre-seeds every matrix runtime's template image and E2E_MODEL_SLUG pins the
+#     platform model to `minimax/MiniMax-M2.7` — the ONE vendor the ephemeral CP is
+#     keyed for (MINIMAX_API_KEY) and a registered platform model for all three
+#     runtimes — OVERRIDING the staging default (pv_platform_model_for_runtime →
+#     anthropic/moonshot), which the ephemeral CP's LLM proxy is NOT keyed to serve.
+#
+# UNLIKE concierge, NO peer-visibility curl sends an Origin header (the MCP call +
+# provisioning are server-to-server, not a browser CORS request), so this scenario
+# needs NO MOLECULE_TENANT_ORIGIN_TEMPLATE — only the Host + X-Molecule-Org-Slug
+# slug routing (+ X-Molecule-Org-Id). Mirrors e2e-staging-saas.yml's peer-visibility
+# job.
 run_scenario_peer_visibility() {
+  local mode; mode="$(pv_provision_mode)"
+  if [ "$mode" = "managed" ]; then
+    local rts; rts="$(matrix_runtimes)"
+    echo "[proof][extra] peer_visibility (literal MCP list_peers, REAL managed-boot matrix=[${rts}], model=${E2E_MODEL_SLUG:-minimax/MiniMax-M2.7}) against the ephemeral CP..." >&2
+    # Managed real-boot: E2E_MODEL_SLUG pins the model to the ephemeral CP's one
+    # keyed vendor (overriding pv_platform_model_for_runtime's staging
+    # anthropic/moonshot defaults). Timeout is the REAL cold-boot budget — three
+    # runtime containers booting to online, not an awaiting_agent row flip.
+    MOLECULE_CP_URL="${CP_BASE_URL}" \
+    MOLECULE_TENANT_URL="${CP_BASE_URL}" \
+    MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
+    MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+    E2E_INFRA_BACKEND=local-docker \
+    E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+    PV_PROVISION_MODE=managed \
+    PV_RUNTIMES="$rts" \
+    E2E_MODEL_SLUG="${E2E_MODEL_SLUG:-minimax/MiniMax-M2.7}" \
+    E2E_PROVISION_TIMEOUT_SECS="${E2E_PV_PROVISION_TIMEOUT_SECS:-900}" \
+    E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-pv" \
+      bash "$HERE/test_peer_visibility_mcp_staging.sh"
+    return $?
+  fi
   echo "[proof][extra] peer_visibility (literal MCP list_peers, external-mode) against the ephemeral CP..." >&2
   MOLECULE_CP_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_URL="${CP_BASE_URL}" \

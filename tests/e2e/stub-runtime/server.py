@@ -104,6 +104,63 @@ def _log(msg):
     print(f"[stub-runtime {_short}] {msg}", flush=True)
 
 
+def _plugin_name_from_source(src):
+    """Derive the on-box plugin directory name from a declared source, mirroring
+    workspace-server/internal/plugins.PluginNameFromSource: strip the scheme and
+    any #ref, then take the LAST path segment (the repo, or a subpath leaf). E.g.
+    `gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0` -> `molecule-ai-plugin-scheduler`.
+    Returns "" for an unparseable entry (skipped)."""
+    s = (src or "").strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("#", 1)[0].rstrip("/")
+    return s.split("/")[-1] if s else ""
+
+
+def materialize_declared_plugins():
+    """Boot-materialize the workspace's DECLARED plugins, mirroring the real
+    runtime's boot materializer (molecule_runtime.plugin_sources.install_declared_plugins):
+    for every source in MOLECULE_DECLARED_PLUGINS, create
+    /configs/plugins/<name>/plugin.yaml so the plugin reads as boot-installed.
+
+    WHY THE STUB NEEDS THIS: the platform's post-online plugin reconcile skips
+    delivery+restart for a plugin already present on the box
+    (plugins_reconcile.pluginPresentOnBox cats /configs/plugins/<name>/plugin.yaml).
+    The REAL runtime pulls declared plugins at boot, so a new workspace is online
+    WITH them and the reconcile is a no-op. This stub carried no materializer, so a
+    default-on plugin (e.g. molecule-scheduler, now declared on every workspace)
+    read as "not on box" -> the reconcile docker-cp'd it into the running container
+    and AUTO-RESTARTED to load it — which races (and, with AutoRemove containers,
+    tears down) the restart-survival + proxy assertions. Materializing here makes
+    the stub faithful to production's present-at-first-boot contract. Placeholder
+    content is sufficient: the stub runs no plugin host, and pluginPresentOnBox only
+    checks that plugin.yaml exists and is non-empty. Idempotent (config volume
+    persists across restart)."""
+    raw = os.environ.get("MOLECULE_DECLARED_PLUGINS", "").strip()
+    if not raw:
+        return
+    plugins_dir = os.path.join(CONFIG_PATH, "plugins")
+    for src in raw.split(","):
+        name = _plugin_name_from_source(src)
+        if not name:
+            continue
+        try:
+            pdir = os.path.join(plugins_dir, name)
+            os.makedirs(pdir, exist_ok=True)
+            manifest = os.path.join(pdir, "plugin.yaml")
+            if not os.path.exists(manifest) or os.path.getsize(manifest) == 0:
+                with open(manifest, "w") as f:
+                    f.write(
+                        f"name: {name}\n"
+                        "kind: stub\n"
+                        "# boot-materialized placeholder (e2e stub runtime) — see "
+                        "materialize_declared_plugins()\n"
+                    )
+            _log(f"materialized declared plugin: {name}")
+        except Exception as e:
+            _log(f"materialize {name!r} failed (non-fatal): {e}")
+
+
 def read_volume_token():
     """The provisioner pre-writes the CURRENT workspace bearer to
     /configs/.auth_token before every container start (issueAndInjectToken,
@@ -288,6 +345,12 @@ def main():
         sys.exit(1)
 
     _log(f"booting: platform={PLATFORM_URL} self_url={SELF_URL} hostname={HOSTNAME}")
+
+    # Boot-materialize declared plugins BEFORE the first heartbeat flips us online,
+    # so the platform's transition-to-online plugin reconcile sees them already on
+    # the box (present-at-first-boot) and records-only instead of docker-cp'ing +
+    # auto-restarting them mid-lifecycle. Mirrors the real runtime's boot materializer.
+    materialize_declared_plugins()
 
     # Start the HTTP server FIRST so the platform can reach us the instant we
     # register (avoids a race where the proxy forwards before we're listening).
