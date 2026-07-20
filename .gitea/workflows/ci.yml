@@ -645,6 +645,12 @@ jobs:
           # collide with a wrapped process's real exit code. This test shipped in
           # #4425 but no workflow named it — it never ran until this line.
           bash tests/e2e/test_extra_scenarios_gating_unit.sh
+          # real-runtime-matrix opt-in (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX) in
+          # ephemeral_cp_happy_path.sh: proves DEFAULT-OFF is byte-identical to
+          # today (matrix_runtimes == just hermes, peer_visibility external) and
+          # that arming boots the full maintained matrix (managed mode), with the
+          # per-runtime template digest pins + overrides. Offline/pure: no docker.
+          bash tests/e2e/test_real_runtime_matrix_unit.sh
           # Staging full-SaaS POST /workspaces cold-origin 5xx retry classifier
           # (lib/workspace_create_retry.sh). Offline: proves an empty-body
           # 502/503/504 is retried (honoring Retry-After) while a JSON app error
