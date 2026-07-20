@@ -2976,66 +2976,6 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
   fi
 fi
 
-# ─── 10g. P4b retirement tooling reachable (core#4507, E2E_SCHEDULER_CHECK=on only) ──
-# End-to-end proof that the workspace_schedules-retirement tooling is DEPLOYED
-# and reachable on a real tenant through the CP proxy: the read-only readiness
-# audit and the DRY-RUN fleet migrate are AdminAuth-gated ws-server routes that
-# must return their documented JSON contract. The irreversible DROP itself stays
-# owner-gated — this proves ONLY that the enabling tooling is live + correctly
-# shaped (the migration MATH is unit-tested with negative controls in
-# workspace-server/internal/handlers/schedules_p4b_test.go). Co-gated on
-# E2E_SCHEDULER_CHECK so it reuses 10d's volume-native tenant.
-# Reachable fail arms: non-2xx (route not registered / AdminAuth rejected the
-# tenant admin token) vs a 2xx whose body is missing the contract keys.
-if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
-  log "── 10g. P4b readiness + fleet-migrate tooling reachable ──"
-  _P4B_BODY=$(mktemp)
-  E2E_TMP_FILES+=("$_P4B_BODY")  # cleaned by the EXIT trap even if fail() exits mid-step
-
-  _p4b_call() {  # <method> <path> <label> <python-contract-check-on-stdin>
-    local method="$1" path="$2" label="$3" checks="$4" code rc summary prc
-    set +e
-    code=$(tenant_call "$method" "$path" -o "$_P4B_BODY" -w '%{http_code}'); rc=$?
-    set -e
-    if [ "$rc" -ne 0 ] || [ "$code" != "200" ]; then
-      log "$(sanitize_http_body <"$_P4B_BODY" | head -c 400)"
-      fail "10g: $label returned HTTP $code (curl_rc=$rc) — the route is not registered on the tenant ws-server, or AdminAuth rejected the tenant admin token."
-    fi
-    set +e
-    summary=$(python3 -c "$checks" <"$_P4B_BODY"); prc=$?
-    set -e
-    if [ "$prc" -ne 0 ]; then
-      log "$(sanitize_http_body <"$_P4B_BODY" | head -c 400)"
-      fail "10g: $label returned 200 but not the documented contract (see body above)."
-    fi
-    [ -n "$summary" ] && log "$summary"
-  }
-
-  _p4b_call GET "/admin/schedules/p4b-readiness" "p4b-readiness" '
-import json,sys
-d=json.load(sys.stdin)
-for k in ("data_drop_safe","drop_still_requires","kill_switch_enabled","workspaces_with_live_rows","workspaces_needing_migration","workspaces_unverifiable","workspaces"):
-    assert k in d, "missing key: "+k+" (got "+str(sorted(d))+")"
-assert isinstance(d["data_drop_safe"], bool), "data_drop_safe must be a bool"
-assert isinstance(d["workspaces"], list), "workspaces must be a list"
-print("    readiness: data_drop_safe=%s live_rows=%s not_native=%s needs_migration=%s unverifiable=%s" % (
-    d["data_drop_safe"], d["workspaces_with_live_rows"], d.get("not_volume_native"), d["workspaces_needing_migration"], d["workspaces_unverifiable"]))
-'
-  ok "    p4b-readiness reachable + correctly shaped"
-
-  _p4b_call POST "/admin/schedules/migrate-all-to-volume" "migrate-all(dry-run)" '
-import json,sys
-d=json.load(sys.stdin)
-assert d.get("apply") is False, "no ?apply must default to dry-run (apply=false), got %r" % d.get("apply")
-for k in ("workspaces","total_migrated","results"):
-    assert k in d, "missing key: "+k
-print("    migrate-all dry-run: apply=%s workspaces=%s would_migrate=%s" % (d["apply"], d["workspaces"], d["total_migrated"]))
-'
-  ok "    migrate-all-to-volume reachable + dry-run by default (no writes)"
-
-  rm -f "$_P4B_BODY"; unset -f _p4b_call
-fi
-
 # ─── 10e. Native digest-provider plugin load (RFC #4413, E2E_DIGEST_PLUGIN_CHECK=on only) ──
 # End-to-end proof that a NATIVE digest-provider plugin is loaded IN-PROCESS by
 # the runtime's idle-digest assembler, admitted by the LOAD-TIME trust gate from

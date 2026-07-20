@@ -13,10 +13,8 @@ import (
 	"os"
 	"strings"
 
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"github.com/gin-gonic/gin"
-	"github.com/lib/pq"
 )
 
 type WebhookHandler struct {
@@ -332,27 +330,23 @@ func newGitHubMessagePayload(text string, metadata map[string]interface{}) map[s
 //   - pull_request_review (action=submitted) → fires schedules with "PR review"
 //                                               or "security review" in name
 //
-// Mechanism (P4b re-point, scheduler-as-trigger-plugin RFC):
-//   - Volume-native workspaces (native `scheduler` capability): POST the
-//     runtime poke API (/internal/schedules/{name}/run) for each matching
-//     enabled grid entry — the trigger daemon's evaluate_tick(poked=…) fires
-//     it immediately. The core cron loop was deleted in #4399, so a
-//     workspace_schedules write for these workspaces is read by NOTHING.
-//   - Legacy workspaces: UPDATE next_run_at = NOW() on matching enabled
-//     rows, exactly as before (their rows are excluded from the poke set).
+// Mechanism (scheduler-as-trigger-plugin RFC): volume-native workspaces (native
+// `scheduler` capability) get a POST to the runtime poke API
+// (/internal/schedules/{name}/run) for each matching enabled grid entry — the
+// trigger daemon's evaluate_tick(poked=…) fires it immediately. Core no longer
+// stores or fires schedules (the legacy dual-path core-DB schedule backend was
+// retired in P4b), so the runtime poke is the whole mechanism.
 // ---------------------------------------------------------------------------
 
 // pokeVolumeSchedules fires event-matched schedules on volume-native
 // (plugin-scheduled) workspaces via the runtime poke API. For each workspace it
 // lists the volume grid, then POSTs /internal/schedules/{name}/run for every
-// ENABLED entry whose name satisfies matches. Returns the volume-native
-// workspace IDs (so the caller's legacy UPDATE can exclude their stale rows)
-// plus the number of schedules poked (202 Accepted from the runtime).
-// Best-effort per workspace: an unreachable runtime is logged and skipped — a
-// GitHub webhook must not 500 because one workspace is down.
-func pokeVolumeSchedules(ctx context.Context, matches func(name string) bool) (volumeIDs []string, poked int64) {
-	volumeIDs = volumeSchedulerWorkspaceIDs()
-	for _, wsID := range volumeIDs {
+// ENABLED entry whose name satisfies matches. Returns the number of schedules
+// poked (202 Accepted from the runtime). Best-effort per workspace: an
+// unreachable runtime is logged and skipped — a GitHub webhook must not 500
+// because one workspace is down.
+func pokeVolumeSchedules(ctx context.Context, matches func(name string) bool) (poked int64) {
+	for _, wsID := range volumeSchedulerWorkspaceIDs() {
 		wsURL, secret, err := resolveScheduleFanoutTarget(ctx, wsID)
 		if err != nil {
 			log.Printf("Webhook: cron poke: resolve %s failed (skipping): %v", wsID, err)
@@ -382,7 +376,7 @@ func pokeVolumeSchedules(ctx context.Context, matches func(name string) bool) (v
 			poked++
 		}
 	}
-	return volumeIDs, poked
+	return poked
 }
 
 // githubIssuesEvent is the minimal subset of the GitHub "issues" webhook payload.
@@ -439,32 +433,15 @@ func (h *WebhookHandler) handleCronTriggerEvent(c *gin.Context, eventType string
 		matches := func(name string) bool {
 			return strings.Contains(strings.ToLower(name), "pick-up-work")
 		}
-		volumeIDs, poked := pokeVolumeSchedules(ctx, matches)
-		result, err := db.DB.ExecContext(ctx, `
-			UPDATE workspace_schedules
-			SET next_run_at = now(), updated_at = now()
-			WHERE enabled = true
-			  AND next_run_at IS NOT NULL
-			  AND LOWER(name) LIKE '%pick-up-work%'
-			  AND NOT (workspace_id::text = ANY($1))
-		`, pq.Array(volumeIDs))
-		if err != nil {
-			log.Printf("Webhook: cron trigger (issues/opened) DB error: %v", err)
-			return true, fmt.Errorf("failed to trigger schedules: %w", err)
-		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			log.Printf("Webhook: issues/opened RowsAffected error: %v", err)
-		} else {
-			log.Printf("Webhook: issues/opened in %s #%d by %s — triggered %d legacy + poked %d volume pick-up-work schedule(s)",
-				payload.Repository.FullName, payload.Issue.Number, payload.Sender.Login, affected, poked)
-		}
+		poked := pokeVolumeSchedules(ctx, matches)
+		log.Printf("Webhook: issues/opened in %s #%d by %s — poked %d volume pick-up-work schedule(s)",
+			payload.Repository.FullName, payload.Issue.Number, payload.Sender.Login, poked)
 
 		c.JSON(http.StatusOK, gin.H{
 			"status":             "triggered",
 			"event":              "issues",
 			"action":             "opened",
-			"schedules_affected": affected + poked,
+			"schedules_affected": poked,
 		})
 		return true, nil
 
@@ -486,32 +463,15 @@ func (h *WebhookHandler) handleCronTriggerEvent(c *gin.Context, eventType string
 			lower := strings.ToLower(name)
 			return strings.Contains(lower, "pr review") || strings.Contains(lower, "security review")
 		}
-		volumeIDs, poked := pokeVolumeSchedules(ctx, matches)
-		result, err := db.DB.ExecContext(ctx, `
-			UPDATE workspace_schedules
-			SET next_run_at = now(), updated_at = now()
-			WHERE enabled = true
-			  AND next_run_at IS NOT NULL
-			  AND (LOWER(name) LIKE '%pr review%' OR LOWER(name) LIKE '%security review%')
-			  AND NOT (workspace_id::text = ANY($1))
-		`, pq.Array(volumeIDs))
-		if err != nil {
-			log.Printf("Webhook: cron trigger (pull_request_review/submitted) DB error: %v", err)
-			return true, fmt.Errorf("failed to trigger schedules: %w", err)
-		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			log.Printf("Webhook: pull_request_review/submitted RowsAffected error: %v", err)
-		} else {
-			log.Printf("Webhook: pull_request_review/submitted in %s PR #%d by %s (state=%s) — triggered %d legacy + poked %d volume review schedule(s)",
-				payload.Repository.FullName, payload.PullRequest.Number, payload.Sender.Login, payload.Review.State, affected, poked)
-		}
+		poked := pokeVolumeSchedules(ctx, matches)
+		log.Printf("Webhook: pull_request_review/submitted in %s PR #%d by %s (state=%s) — poked %d volume review schedule(s)",
+			payload.Repository.FullName, payload.PullRequest.Number, payload.Sender.Login, payload.Review.State, poked)
 
 		c.JSON(http.StatusOK, gin.H{
 			"status":             "triggered",
 			"event":              "pull_request_review",
 			"action":             "submitted",
-			"schedules_affected": affected + poked,
+			"schedules_affected": poked,
 		})
 		return true, nil
 

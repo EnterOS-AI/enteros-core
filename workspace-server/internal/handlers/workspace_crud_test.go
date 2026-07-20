@@ -360,9 +360,6 @@ func TestDelete_LeafWithoutConfirmName(t *testing.T) {
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspaces WHERE parent_id = \$1 AND status != 'removed'`).
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM workspace_schedules WHERE workspace_id = \$1 AND enabled = true`).
-		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(11))
 
 	req, _ := http.NewRequest("DELETE", "/workspaces/"+wsID, nil)
 	w := httptest.NewRecorder()
@@ -384,9 +381,6 @@ func TestDelete_LeafWithoutConfirmName(t *testing.T) {
 	}
 	if resp["active_tasks"] != float64(3) {
 		t.Errorf("active_tasks should be 3, got %v", resp["active_tasks"])
-	}
-	if resp["schedule_count"] != float64(11) {
-		t.Errorf("schedule_count should be 11, got %v", resp["schedule_count"])
 	}
 }
 

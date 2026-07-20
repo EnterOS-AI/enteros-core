@@ -1,26 +1,17 @@
 package handlers
 
-// schedules_volume_repoint_test.go — P4b preconditions (scheduler-as-trigger-
-// plugin RFC, issue #4411): the webhook event-poke, History, and Health (peer +
-// admin) surfaces must serve VOLUME-NATIVE workspaces from the runtime
-// /internal/schedules API, keeping the legacy DB path — and the exact legacy
-// JSON shapes — for everything else.
-//
-// NEGATIVE CONTROL: every test here fails on pre-fix main (verified by
-// stashing the non-test source changes and re-running):
-//   - the webhook tests fail because pre-fix code UPDATEs workspace_schedules
-//     with no exclusion arg (sqlmock args mismatch → 500) and never POSTs the
-//     runtime poke;
-//   - the History/Health/admin tests fail because pre-fix code reads the DB
-//     (no sqlmock expectations for those reads → 500 / unmet expectations).
-// This file deliberately references only symbols that exist pre-fix so the
-// package still compiles for that control run.
+// schedules_volume_repoint_test.go — the webhook event-poke, History, and Health
+// (peer + admin) surfaces must serve schedules from the runtime
+// /internal/schedules API. Core no longer stores or fires schedules (the legacy
+// dual-path core-DB backend was retired in P4b), so these tests assert the
+// volume path end-to-end and the exact Canvas JSON shapes it returns.
 
 import (
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -28,15 +19,13 @@ import (
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
-	"github.com/lib/pq"
 )
 
 // markVolumeScheduler registers wsID as a volume-native scheduler workspace for
-// the duration of the test: capability declared (heartbeat-equivalent) and the
-// volume-proxy kill-switch off.
+// the duration of the test: the `scheduler` capability is declared
+// (heartbeat-equivalent), so schedule CRUD is served from the runtime volume.
 func markVolumeScheduler(t *testing.T, wsID string) {
 	t.Helper()
-	t.Setenv(scheduleProxyKillEnv, "")
 	runtimeOverrides.SetCapabilities(wsID, map[string]bool{"scheduler": true})
 	t.Cleanup(func() { runtimeOverrides.SetCapabilities(wsID, nil) })
 }
@@ -120,12 +109,11 @@ func assertExactKeys(t *testing.T, m map[string]interface{}, want []string, labe
 
 // ==================== Webhook event-poke ====================
 
-// TestWebhookCronPoke_VolumeNative_PokesRuntimeNotDB is the P4b webhook
-// re-point gate: on issues/opened, a volume-native workspace's matching ENABLED
-// grid entry must be poked via POST /internal/schedules/{name}/run (the only
-// live "fire now" channel post-#4399), the disabled/non-matching entries must
-// NOT be poked, and the legacy next_run_at UPDATE must EXCLUDE the volume
-// workspace's rows — proven by the exclusion array arg carrying its id.
+// TestWebhookCronPoke_VolumeNative_PokesRuntimeNotDB is the webhook re-point
+// gate: on issues/opened, a volume-native workspace's matching ENABLED grid
+// entry must be poked via POST /internal/schedules/{name}/run (the only live
+// "fire now" channel post-#4399), while disabled/non-matching entries must NOT
+// be poked. Core writes no DB table.
 func TestWebhookCronPoke_VolumeNative_PokesRuntimeNotDB(t *testing.T) {
 	allowLoopbackForTest(t)
 	mock := setupTestDB(t)
@@ -148,12 +136,6 @@ func TestWebhookCronPoke_VolumeNative_PokesRuntimeNotDB(t *testing.T) {
 	// Fan-out resolution: URL + inbound secret for the volume workspace.
 	expectFanoutURL(mock, wsID, stub.srv.URL)
 	expectInboundSecret(mock, wsID, "poke-secret-1")
-
-	// The legacy UPDATE must carry the volume workspace id in the exclusion
-	// array — that is the "DB write only in the legacy branch" proof.
-	mock.ExpectExec("UPDATE workspace_schedules").
-		WithArgs(pq.Array([]string{wsID})).
-		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	secret := "test-secret"
 	t.Setenv("GITHUB_WEBHOOK_SECRET", secret)
@@ -190,57 +172,9 @@ func TestWebhookCronPoke_VolumeNative_PokesRuntimeNotDB(t *testing.T) {
 			t.Errorf("runtime forward missing inbound-secret bearer, got %q", a)
 		}
 	}
-	// Combined count: 1 legacy row updated + 1 volume poke.
-	if !strings.Contains(w.Body.String(), `"schedules_affected":2`) {
-		t.Errorf("expected schedules_affected 2 (1 legacy + 1 poked), got: %s", w.Body.String())
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock expectations not met: %v", err)
-	}
-}
-
-// TestWebhookCronPoke_KillSwitch_ForcesLegacyPath proves the volume branch is
-// kill-switchable: with SCHEDULE_VOLUME_PROXY_DISABLED set, a capability-
-// advertising workspace gets NO runtime traffic and the legacy UPDATE runs
-// with an empty exclusion set (i.e. it may touch every row again).
-func TestWebhookCronPoke_KillSwitch_ForcesLegacyPath(t *testing.T) {
-	mock := setupTestDB(t)
-	setupTestRedis(t)
-	handler := NewWebhookHandler(newTestBroadcaster())
-
-	wsID := "11e59f01-0002-4000-8000-000000000002"
-	markVolumeScheduler(t, wsID)
-	t.Setenv(scheduleProxyKillEnv, "1") // after markVolumeScheduler — override
-
-	stub := newVolumeRuntimeStub(t, `{"schedules":[]}`, `{}`, `{}`)
-
-	mock.ExpectExec("UPDATE workspace_schedules").
-		WithArgs(pq.Array([]string{})).
-		WillReturnResult(sqlmock.NewResult(0, 3))
-
-	secret := "test-secret"
-	t.Setenv("GITHUB_WEBHOOK_SECRET", secret)
-	body := []byte(`{
-		"action": "submitted",
-		"repository": {"full_name": "acme/repo"},
-		"sender": {"login": "bob"},
-		"review": {"state": "approved", "html_url": "https://example.com/r"},
-		"pull_request": {"number": 9, "title": "T", "html_url": "https://example.com/9"}
-	}`)
-	w, c := newWebhookTestContext(t, "", body)
-	c.Request.Header.Set("X-GitHub-Event", "pull_request_review")
-	c.Request.Header.Set("X-Hub-Signature-256", githubSignature(secret, body))
-
-	handler.GitHub(c)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	if got := stub.got(); len(got) != 0 {
-		t.Errorf("kill-switch on: runtime must receive no traffic, got %v", got)
-	}
-	if !strings.Contains(w.Body.String(), `"schedules_affected":3`) {
-		t.Errorf("expected schedules_affected 3 (legacy only), got: %s", w.Body.String())
+	// Only the volume poke is counted now — core no longer writes a DB table.
+	if !strings.Contains(w.Body.String(), `"schedules_affected":1`) {
+		t.Errorf("expected schedules_affected 1 (1 poked), got: %s", w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met: %v", err)
@@ -443,20 +377,126 @@ func TestScheduleHealth_VolumeNative_PeerWithoutCanCommunicate_Rejected(t *testi
 	}
 }
 
+// TestScheduleHealth_VolumeNative_SelfCall_Allowed — the callerID==workspaceID
+// self-read must bypass the CanCommunicate gate and reach the volume forward.
+// (The negative side is covered by _PeerWithoutCanCommunicate_Rejected; this
+// guards the ALLOW branch so an over-restrictive auth regression that dropped
+// the self-bypass — making agents unable to read their OWN schedule health —
+// would be caught. Deliberately sets NO CanCommunicate expectation: if the
+// self-bypass is removed, the handler hits the unmocked CanCommunicate query
+// and sqlmock fails the test. Mutation-verified.)
+func TestScheduleHealth_VolumeNative_SelfCall_Allowed(t *testing.T) {
+	allowLoopbackForTest(t)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewScheduleHandler()
+
+	wsID := "11e59f01-0007-4000-8000-000000000007"
+	markVolumeScheduler(t, wsID)
+	stub := newVolumeRuntimeStub(t, `{"schedules":[]}`, `{"last_tick":null,"armed":0,"errors":{}}`, `{"history":[]}`)
+
+	// Bearer resolves to wsID → callerID == workspaceID (self). No
+	// CanCommunicate query is expected; the two forwards (grid, health) follow.
+	expectScheduleHealthWorkspaceAuth(mock, wsID)
+	expectURL(mock, wsID, stub.srv.URL)
+	expectInboundSecret(mock, wsID, "self-secret")
+	expectURL(mock, wsID, stub.srv.URL)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	req := httptest.NewRequest("GET", "/workspaces/"+wsID+"/schedules/health", nil)
+	req.Header.Set("X-Workspace-ID", wsID)
+	req.Header.Set("Authorization", "Bearer health-token")
+	c.Request = req
+
+	handler.Health(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("self-read must be allowed to the volume forward, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := stub.got(); len(got) != 2 {
+		t.Errorf("self-read must reach the runtime (grid+health), got %v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestScheduleHealth_VolumeNative_CanCommunicatePeer_Allowed — a peer caller
+// that passes CanCommunicate must reach the volume forward. Guards the ALLOW
+// arm of the hierarchy gate (its DENY arm is _PeerWithoutCanCommunicate_
+// Rejected); a regression that inverted or hard-denied the gate would be caught
+// here rather than silently blocking all cross-agent health reads.
+func TestScheduleHealth_VolumeNative_CanCommunicatePeer_Allowed(t *testing.T) {
+	allowLoopbackForTest(t)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewScheduleHandler()
+
+	wsID := "11e59f01-0008-4000-8000-000000000008"
+	callerID := "11e59f01-0009-4000-8000-000000000009"
+	markVolumeScheduler(t, wsID)
+	stub := newVolumeRuntimeStub(t, `{"schedules":[]}`, `{"last_tick":null,"armed":0,"errors":{}}`, `{"history":[]}`)
+
+	expectScheduleHealthWorkspaceAuth(mock, callerID)
+	mockCanCommunicate(mock, callerID, wsID, true)
+	expectURL(mock, wsID, stub.srv.URL)
+	expectInboundSecret(mock, wsID, "peer-secret")
+	expectURL(mock, wsID, stub.srv.URL)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: wsID}}
+	req := httptest.NewRequest("GET", "/workspaces/"+wsID+"/schedules/health", nil)
+	req.Header.Set("X-Workspace-ID", callerID)
+	req.Header.Set("Authorization", "Bearer health-token")
+	c.Request = req
+
+	handler.Health(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("CanCommunicate peer must be allowed to the volume forward, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := stub.got(); len(got) != 2 {
+		t.Errorf("allowed peer read must reach the runtime (grid+health), got %v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestScheduleHealthResponse_HasNoPromptOrCronFields is the structural half of
+// the issue #249 redaction contract: _ShapeParity_AndRedaction proves the live
+// response omits task content; this proves the RESPONSE TYPE cannot carry it, so
+// a future field addition (e.g. re-adding Prompt for a UI convenience) is caught
+// at compile-adjacent time rather than leaking through the volume proxy.
+func TestScheduleHealthResponse_HasNoPromptOrCronFields(t *testing.T) {
+	rt := reflect.TypeOf(ScheduleHealthResponse{})
+	for i := 0; i < rt.NumField(); i++ {
+		tag := strings.ToLower(rt.Field(i).Tag.Get("json"))
+		name := strings.ToLower(rt.Field(i).Name)
+		for _, banned := range []string{"prompt", "cron", "timezone"} {
+			if strings.Contains(tag, banned) || strings.Contains(name, banned) {
+				t.Errorf("ScheduleHealthResponse must not expose %q (field %s / tag %q) — redaction contract #249",
+					banned, rt.Field(i).Name, rt.Field(i).Tag.Get("json"))
+			}
+		}
+	}
+}
+
 // ==================== Health (admin aggregate) ====================
 
-// TestAdminSchedulesHealth_VolumeNative_UsesRuntimeProxy_SkipsStaleRows — the
-// admin aggregate must serve a capability-advertising workspace from the
-// runtime proxy (grid + daemon last_tick as the liveness signal) and SKIP its
-// stale pre-migration DB rows, while legacy workspaces keep the DB path.
-func TestAdminSchedulesHealth_VolumeNative_UsesRuntimeProxy_SkipsStaleRows(t *testing.T) {
+// TestAdminSchedulesHealth_VolumeNative_UsesRuntimeProxy — the admin aggregate
+// serves a capability-advertising workspace from the runtime proxy (grid +
+// daemon last_tick as the liveness signal).
+func TestAdminSchedulesHealth_VolumeNative_UsesRuntimeProxy(t *testing.T) {
 	allowLoopbackForTest(t)
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	handler := NewAdminSchedulesHealthHandler()
 
 	volWS := "11e59f01-0007-4000-8000-000000000007"
-	legacyWS := "11e59f01-0008-4000-8000-000000000008"
 	markVolumeScheduler(t, volWS)
 
 	lastTick := time.Now().UTC().Add(-1 * time.Minute).Format(time.RFC3339)
@@ -465,17 +505,6 @@ func TestAdminSchedulesHealth_VolumeNative_UsesRuntimeProxy_SkipsStaleRows(t *te
 		`{"last_tick":"`+lastTick+`","armed":1,"errors":{}}`,
 		`{"history":[]}`,
 	)
-
-	legacyLastRun := time.Now().Add(-2 * time.Minute)
-	legacyNextRun := time.Now().Add(3 * time.Minute)
-	// The DB JOIN returns a live legacy row AND a stale row for the volume
-	// workspace — the latter must NOT appear in the response.
-	mock.ExpectQuery(`SELECT\s+w\.id`).
-		WillReturnRows(sqlmock.NewRows(adminHealthCols).
-			AddRow(legacyWS, "Legacy WS", "sched-legacy-id", "legacy-sched",
-				"*/5 * * * *", "UTC", &legacyLastRun, &legacyNextRun).
-			AddRow(volWS, "Vol WS", "sched-stale-id", "stale-sched",
-				"*/5 * * * *", "UTC", nil, nil))
 
 	// Volume loop: name lookup, then quiet fan-out creds.
 	mock.ExpectQuery(`SELECT name FROM workspaces WHERE id = \$1 AND status != 'removed'`).
@@ -497,23 +526,10 @@ func TestAdminSchedulesHealth_VolumeNative_UsesRuntimeProxy_SkipsStaleRows(t *te
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("parse response: %v", err)
 	}
-	if len(resp) != 2 {
-		t.Fatalf("expected 2 entries (1 legacy + 1 volume), got %d: %s", len(resp), w.Body.String())
+	if len(resp) != 1 {
+		t.Fatalf("expected 1 volume entry, got %d: %s", len(resp), w.Body.String())
 	}
-	byName := map[string]adminScheduleHealth{}
-	for _, e := range resp {
-		byName[e.ScheduleName] = e
-	}
-	if _, stale := byName["stale-sched"]; stale {
-		t.Errorf("stale pre-migration DB row for the volume workspace must be skipped: %s", w.Body.String())
-	}
-	if e, ok := byName["legacy-sched"]; !ok || e.Status != "ok" || e.WorkspaceID != legacyWS {
-		t.Errorf("legacy DB path entry wrong: %+v", byName["legacy-sched"])
-	}
-	vol, ok := byName["vol-sched"]
-	if !ok {
-		t.Fatalf("volume workspace entry missing: %s", w.Body.String())
-	}
+	vol := resp[0]
 	if vol.WorkspaceName != "Vol WS" || vol.ScheduleID != "vol-sched" || vol.CronExpr != "*/5 * * * *" {
 		t.Errorf("volume entry fields wrong: %+v", vol)
 	}
