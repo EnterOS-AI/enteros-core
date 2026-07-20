@@ -326,9 +326,22 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 	// in MISSING_REQUIRED_ENV and coped by queueing placeholder secret-write
 	// approvals for values that, on self-host, simply don't matter yet.
 	// Self-host signal: no CP proxy wired (same gate as the platform-arm
-	// model fallback).
-	if !PlatformManagedProxyConfigured() && configFiles != nil {
-		applySelfHostTenantDefaults(envVars, missingRequiredEnv(configFiles, envVars))
+	// model fallback). The RESTART path carries templatePath instead of
+	// in-memory configFiles (preflight #5 skips there for the same reason),
+	// so fall back to reading the template's config.yaml from disk — without
+	// this, a restart booted the workspace with NO tenant identity at all
+	// while a create filled it (observed 2026-07-19: online SEO agent with
+	// empty TENANT_* env).
+	if !PlatformManagedProxyConfigured() {
+		reqSrc := configFiles
+		if reqSrc == nil && templatePath != "" {
+			if b, rErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); rErr == nil {
+				reqSrc = map[string][]byte{"config.yaml": b}
+			}
+		}
+		if reqSrc != nil {
+			applySelfHostTenantDefaults(envVars, missingRequiredEnv(reqSrc, envVars))
+		}
 	}
 
 	// Preflight #5: refuse to launch when config.yaml declares required
