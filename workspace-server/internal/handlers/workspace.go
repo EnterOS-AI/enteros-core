@@ -1235,6 +1235,24 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		}
 	}
 
+	// Payload-declared plugins (CreateWorkspacePayload.Plugins): the API-level
+	// equivalent of a template's `plugins:` block for callers that don't own a
+	// template (e.g. an e2e harness declaring a native plugin to exercise its
+	// boot-install). Flows through the SAME seedTemplatePlugins →
+	// recordDeclaredPlugin chokepoint as the template blocks above, so it inherits
+	// the idempotent ON CONFLICT upsert AND the privileged-plugin kind-gate (the
+	// concierge MCP can never be declared here on a non-platform workspace). This
+	// is the DURABLE declare channel: unlike a MOLECULE_DECLARED_PLUGINS value
+	// injected via `secrets`, a payload plugin lands in the declared-set SSOT that
+	// provision recomputes MOLECULE_DECLARED_PLUGINS from, so it is not overwritten.
+	// Non-fatal: a bad entry never blocks provisioning (the workspace row is live).
+	if provisionOK && len(payload.Plugins) > 0 {
+		if declared := mergePlugins(nil, payload.Plugins); len(declared) > 0 {
+			recorded, skipped := seedTemplatePlugins(ctx, id, declared)
+			log.Printf("Create %s: recorded %d/%d payload-declared plugins (skipped=%d)", id, recorded, len(declared), skipped)
+		}
+	}
+
 	// Mint the workspace's first bearer token and return it inline
 	// (#1644). Pre-fix, callers had to make a separate POST to
 	// /admin/workspaces/:id/tokens (production path, AdminAuth-gated,

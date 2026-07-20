@@ -304,6 +304,17 @@ type CreateWorkspacePayload struct {
 	// workspace secrets at creation time.  Stored encrypted (same path as
 	// POST /workspaces/:id/secrets).  Nil/empty map is a no-op.
 	Secrets map[string]string `json:"secrets"`
+	// Plugins is an optional list of git-native plugin SOURCES to DECLARE for
+	// this workspace at create (workspace_declared_plugins → the post-online
+	// reconcile installs them). It is the API-level equivalent of a template's
+	// `plugins:` block for callers that don't own a template — same DB channel
+	// (seedTemplatePlugins → recordDeclaredPlugin), same idempotent ON CONFLICT
+	// upsert, and the SAME privileged-plugin kind-gate (the org-management MCP
+	// can never be declared here on a non-platform workspace). Empty is a no-op.
+	// NOTE: declaring via this DB channel is the durable path; injecting
+	// MOLECULE_DECLARED_PLUGINS via `secrets` does NOT survive, because provision
+	// recomputes that env from the declared-set SSOT and overwrites it.
+	Plugins []string `json:"plugins,omitempty"`
 	// MaxConcurrentTasks caps parallel A2A + cron dispatch. 0 means use
 	// DefaultMaxConcurrentTasks. Leaders typically set 3.
 	MaxConcurrentTasks int `json:"max_concurrent_tasks"`
