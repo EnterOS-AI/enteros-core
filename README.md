@@ -43,6 +43,31 @@ Open [http://localhost:3000](http://localhost:3000). See the
 [quick-start guide](./docs/quickstart.md) for prerequisites, manual startup,
 first-run configuration, and troubleshooting.
 
+## OpenAI Codex & GPT-5.6
+
+Codex is both a product surface and a build tool for EnterOS:
+
+- **Codex as a first-class agent runtime.** The
+  [`codex` workspace template](./workspace-configs-templates/codex/) wraps
+  Codex CLI (`@openai/codex`) as an EnterOS workspace runtime: each tenant
+  session holds a long-lived `codex app-server` child bound to one thread, so
+  agent-to-agent messages process in order with full conversation continuity.
+  Provisioning a Codex workspace is a single `provision_workspace` call from
+  the platform agent — the same runtime-contract SDK drives Codex and five
+  other runtimes identically.
+- **GPT-5.x model routing.** A provider registry in the template's
+  `config.yaml` routes auth via a ChatGPT/Codex subscription
+  (`CODEX_AUTH_JSON`), a direct `OPENAI_API_KEY`, or any endpoint speaking the
+  OpenAI Responses API; GPT-5-family models are selectable per workspace.
+- **Codex in the build loop.** During OpenAI Build Week (Jul 13–21, 2026),
+  Codex CLI sessions running GPT-5.6-codex were used to implement and review
+  changes shipped to this repository; our CI/merge pipeline (all-green status
+  gate plus reviewer approval) applied to that agent-authored work the same as
+  to any human contribution.
+
+The canonical public mirror of this repository is
+[github.com/EnterOS-AI/enteros-core](https://github.com/EnterOS-AI/enteros-core).
+
 ## What this repository owns
 
 `molecule-core` contains the tenant workspace server and Canvas. Together they
