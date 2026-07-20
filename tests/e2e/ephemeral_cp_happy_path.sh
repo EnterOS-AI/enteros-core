@@ -215,10 +215,56 @@ seed_workspace_image() {
     echo "[proof] WORKSPACE_IMAGE_PRESEEDED=1 — using the ${bare} already in the store, not the published one" >&2
     return 0
   fi
-  local ref="${MOLECULE_IMAGE_REGISTRY:-registry.moleculesai.app/molecule-ai}/workspace-template-${rt}:latest"
+  # DIGEST-PIN the template pull (audit Q1 #2). workspace-template-<rt>:latest is a
+  # MOVING tag — CI re-pushes it on every merge — so a failed or partial rebuild can
+  # silently change WHICH image this REQUIRED gate provisions with NO core diff, and
+  # red (or worse, false-pass) an unrelated PR on a template change nobody reviewed.
+  # Same hazard, same fix as CP_EPHEMERAL_REF in
+  # .gitea/workflows/e2e-ephemeral-happy-path.yml: pin an exact digest that a
+  # maintainer bumps, in its own PR, when the template INTENTIONALLY advances.
+  # Image-layer only: this does NOT touch the in-image @molecule-ai/mcp-server npm
+  # version-range / compatible_range resolution (that runs at workspace runtime and
+  # is orthogonal to which image layer we pull here).
+  #
+  # TO BUMP (hermes is the only runtime this gate exercises — E2E_RUNTIME=hermes):
+  # after the template republishes, read the new digest and paste it below —
+  #   skopeo inspect --format '{{.Digest}}' \
+  #     docker://registry.moleculesai.app/molecule-ai/workspace-template-hermes:latest
+  # (equivalently: `docker buildx imagetools inspect ...:latest`, the template repo's
+  #  Build&push job log line `pushed ...@sha256:...`, or a registry v2 manifest HEAD).
+  # Current pin = runtime 0.4.31 / mcp-server 1.9.3 baked (sha-4dad193).
+  local registry="${MOLECULE_IMAGE_REGISTRY:-registry.moleculesai.app/molecule-ai}"
+  local ref
+  if [ "$rt" = "hermes" ]; then
+    ref="${WORKSPACE_TEMPLATE_HERMES_REF:-${registry}/workspace-template-hermes@sha256:8aab6b48f2af15c3dd1056a5d1f5e7a61fb9a8a66aa7aca5b51cf2d2702215f9}"
+  else
+    # No pinned digest published for other runtimes; the gate doesn't exercise them,
+    # so fall back to the moving tag (unpinned, best-effort).
+    ref="${registry}/workspace-template-${rt}:latest"
+  fi
   echo "[proof] seeding ${bare} from ${ref}..." >&2
-  pull_via_host "$ref" || { echo "FATAL: cannot obtain ${ref} — the CP cannot provision ${rt} workspaces without it" >&2; exit 1; }
-  docker tag "$ref" "$bare"
+  # Resolve on the host cache (digest = content-addressed, so a HIT is exact) or pull,
+  # then stream into the nested daemon CAPTURING the ID that `docker load` reports, and
+  # tag THAT to the bare name. We must use the load-reported ID (not `image inspect`)
+  # for TWO independent reasons, both observed on the CI dind:
+  #  (1) the digest-ref NAME does not survive `docker save | docker load` — the image
+  #      lands by ID only, so `docker tag <digest-ref> $bare` fails "No such image"; and
+  #  (2) the HOST (containerd image store) reports the MANIFEST digest as `.Id` for a
+  #      digest-ref, which is NOT the CONFIG-digest ID the dind loaded, so tagging a
+  #      host-inspected ID ALSO fails "No such image". `docker load`'s reported ID is
+  #      the dind's own handle — the only reliable one. (Moving-tag refs work too:
+  #      save|load round-trips them and load still reports the loaded ID.)
+  if ref_is_digest_pinned "$ref" && host_docker image inspect "$ref" >/dev/null 2>&1; then
+    echo "[proof] host cache HIT for digest-pinned ${ref} — no registry pull" >&2
+  else
+    host_docker pull "$ref" >&2 || { echo "FATAL: cannot obtain ${ref} — the CP cannot provision ${rt} workspaces without it" >&2; exit 1; }
+  fi
+  local _load_out img_id
+  _load_out="$(host_docker save "$ref" | docker load 2>&1)" || { echo "FATAL: could not stream ${ref} into the nested daemon" >&2; exit 1; }
+  printf '%s\n' "$_load_out" >&2
+  img_id="$(printf '%s\n' "$_load_out" | sed -n 's/^Loaded image ID: *//p; s/^Loaded image: *//p' | tail -1)"
+  [ -n "$img_id" ] || { echo "FATAL: could not determine the loaded image ID for ${ref} from docker load output" >&2; exit 1; }
+  docker tag "$img_id" "$bare"
   echo "[proof] seeded ${bare}" >&2
 }
 
@@ -450,17 +496,17 @@ run_scenario() {
   # E2E_SCHEDULER_CHECK and E2E_DIGEST_PLUGIN_CHECK default ON: the precondition
   # that used to keep steps 10d/10e dark — a provisioned runtime image without the
   # 0.4.9 bits — was verified CLEARED on 2026-07-16. The gate provisions the
-  # registry's workspace-template-hermes:latest, which == sha-2106348 (runtime
-  # 0.4.9), pushed 2026-07-16T21:43:59Z. The runtime-v0.4.9 tree carries all four
-  # legs both steps need: the kind:trigger scaffold, declared-plugin boot-install
+  # DIGEST-PINNED workspace-template-hermes @sha256:8aab6b48… (sha-4dad193 = runtime
+  # 0.4.31; see seed_workspace_image). That tree carries all four legs both steps
+  # need: the kind:trigger scaffold, declared-plugin boot-install
   # (MOLECULE_DECLARED_PLUGINS), the digest-provider plugin loader, and the
   # vendored native-plugins registry TRUST source (runtime#310).
   #
-  # MOVING-:latest CAVEAT (no-flakes rule): the gate re-resolves :latest on every
-  # run — the verification above pins the precondition to sha-2106348, not to
-  # whatever :latest points at tomorrow. If 10d/10e reds in the future, FIRST check
-  # the packages API for a workspace-template publish newer than
-  # 2026-07-16T21:43:59Z (a regressed/partial template is the likely mechanism)
+  # PINNED-image note (no-flakes rule): the gate NO LONGER re-resolves :latest — it
+  # pins the digest above, so a template drift/rollback cannot silently change this
+  # required gate's input. If 10d/10e reds in the future, FIRST check whether
+  # WORKSPACE_TEMPLATE_HERMES_REF is STALE vs a newer INTENTIONAL template republish
+  # (bump the pinned digest in seed_workspace_image) as the likely mechanism
   # before theorizing about core-side causes.
   #
   # 10e scope note still holds: the baked digest roster renders every section
@@ -470,27 +516,25 @@ run_scenario() {
   # E2E_SELF_SCHEDULE_CHECK defaults ON (10f), like 10d/10e above — it is a native
   # plugin, gated by default. Step 10f deterministically drives the audience:self
   # create_schedule TOOL via a docker-exec self-mode mcp-server
-  # (@molecule-ai/mcp-server 1.9.2) and asserts it lands on the OWN grid + fires
+  # (@molecule-ai/mcp-server 1.9.3) and asserts it lands on the OWN grid + fires
   # (org-key/foreign-id neg controls). Its JOINED precondition was VERIFIED CLEARED
-  # on 2026-07-18: (1) @molecule-ai/mcp-server@1.9.2 is PUBLISHED to the Gitea npm
-  # registry (dist-tag latest=1.9.2) — before this the prebake `npm install ...@1.9.2`
-  # E404'd and froze every workspace-template (hermes stuck at runtime 0.4.25); (2)
-  # workspace-template-hermes:latest was republished from the runtime-0.4.29 tree,
-  # which carries runtime#328's self-audience injector (_inject_self_env) + #329
-  # hardening (force MOLECULE_WORKSPACE_TOKEN_FILE, inject WORKSPACE_ID) + #330's
-  # prebake of mcp-server 1.9.2 (scripts/prebake-mgmt-mcp.sh + platform_agent_identity.py
-  # PINNED_VERSION=1.9.2 / COMPATIBLE_RANGE=^1.8.0), so `npx --prefer-offline` resolves
-  # offline in the no-network gate. The injector fires on audience:self alone (the
-  # plugin's runtimes:[claude_code] is not consulted on the render path), so the self
-  # entry renders on the gate's default hermes template too.
+  # 2026-07-18 and is now DIGEST-PINNED (seed_workspace_image): the gate provisions
+  # workspace-template-hermes @sha256:8aab6b48… (sha-4dad193 = runtime 0.4.31), which
+  # carries runtime#328's self-audience injector (_inject_self_env) + #329 hardening
+  # (force MOLECULE_WORKSPACE_TOKEN_FILE, inject WORKSPACE_ID) + #330/#333's prebake of
+  # mcp-server 1.9.3 (self-mode X-Molecule-Org-Id tenant routing) via
+  # scripts/prebake-mgmt-mcp.sh + platform_agent_identity.py PINNED_VERSION=1.9.3 /
+  # COMPATIBLE_RANGE=^1.8.0, so `npx --prefer-offline` resolves offline in the
+  # no-network gate. The injector fires on audience:self alone (the plugin's
+  # runtimes:[claude_code] is not consulted on the render path), so the self entry
+  # renders on the gate's default hermes template too.
   #
-  # MOVING-:latest CAVEAT (no-flakes rule, same discipline as the 10d/10e note above):
-  # the gate re-resolves :latest every run — the verification pins the precondition to
-  # the runtime-0.4.29 hermes republish, NOT to whatever :latest points at tomorrow. If
-  # 10f reds in the future, FIRST check the packages API for a workspace-template-hermes
-  # publish built from a runtime tree OLDER than the one carrying #328/#329 + the 1.9.2
-  # prebake (a regressed/rolled-back template is the likely mechanism) before theorizing
-  # about core-side causes. Keep this note ABOVE the env block (a `#` BETWEEN the
+  # PINNED-image note (no-flakes rule): the gate NO LONGER re-resolves :latest — it
+  # pins the digest in seed_workspace_image, so a template drift/rollback CANNOT
+  # silently change this required gate's input. If 10f reds in the future, FIRST check
+  # whether WORKSPACE_TEMPLATE_HERMES_REF is STALE vs a newer INTENTIONAL template
+  # republish (bump the pinned digest in seed_workspace_image, its own PR) before
+  # theorizing about core-side causes. Keep this note ABOVE the env block (a `#` BETWEEN the
   # backslash-continued lines below would sever the env prefix — see the 444-448 note).
   MOLECULE_CP_URL="${CP_BASE_URL}" \
   MOLECULE_TENANT_URL="${CP_BASE_URL}" \
@@ -512,7 +556,7 @@ run_scenario() {
   E2E_DIGEST_PLUGIN_SOURCE="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}" \
   E2E_SELF_SCHEDULE_CHECK="${E2E_SELF_SCHEDULE_CHECK:-on}" \
   E2E_SELF_SCHEDULE_PLUGIN_SOURCE="${E2E_SELF_SCHEDULE_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-schedule-self#v0.1.2}" \
-  E2E_SELF_SCHEDULE_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.2}" \
+  E2E_SELF_SCHEDULE_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.3}" \
     bash "$HERE/test_staging_full_saas.sh"
 }
 
@@ -555,6 +599,8 @@ run_scenario_concierge_user_tasks() {
   MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
   MOLECULE_TENANT_ORIGIN_TEMPLATE="${TENANT_PUBLIC_URL_TEMPLATE}" \
   MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+  E2E_INFRA_BACKEND=local-docker \
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
   E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
   E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-cncrgut" \
     bash "$HERE/test_staging_concierge_e2e.sh"

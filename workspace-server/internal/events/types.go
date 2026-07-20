@@ -82,10 +82,8 @@ const (
 	EventDelegationComplete EventType = "DELEGATION_COMPLETE"
 	EventDelegationFailed   EventType = "DELEGATION_FAILED"
 
-	// Task progression + scheduler.
-	EventTaskUpdated  EventType = "TASK_UPDATED"
-	EventCronExecuted EventType = "CRON_EXECUTED"
-	EventCronSkipped  EventType = "CRON_SKIPPED"
+	// Task progression.
+	EventTaskUpdated EventType = "TASK_UPDATED"
 
 	// Approvals.
 	EventApprovalRequested EventType = "APPROVAL_REQUESTED"
@@ -163,8 +161,6 @@ var AllEventTypes = []EventType{
 	EventApprovalRequested,
 	EventBootStep,
 	EventChannelMessage,
-	EventCronExecuted,
-	EventCronSkipped,
 	EventDelegationComplete,
 	EventDelegationFailed,
 	EventDelegationSent,

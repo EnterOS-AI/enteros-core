@@ -552,6 +552,11 @@ jobs:
           # 200-but-SPA-HTML is NOT ready, and transient-503 recovery. Offline
           # mocked-curl; fail-direction negative-controlled.
           bash tests/e2e/lib/test_tenant_api_ready_unit.sh
+          # tenant-topology derivation (#86 ephemeral-gate ports): staging default
+          # (unset ⇒ exact staging), ephemeral slug-routing headers, derived CORS
+          # origin, origin-template override, prod/staging domain derivation, and
+          # the un-derivable-origin fail-closed. Pure logic, negative-controlled.
+          bash tests/e2e/lib/test_tenant_topology_unit.sh
           # molecule-core#1995 (#1994 follow-on): fail-direction proof for
           # the A2A real-completion + byok-routing assertion helpers
           # (lib/completion_assert.sh). Offline (no LLM, no network): it
@@ -628,6 +633,10 @@ jobs:
           # Docker preflight. Offline: proves missing Docker or an unreachable
           # daemon cannot silently skip E2E_IDLE_DIGEST_CHECK=on.
           bash tests/e2e/test_idle_digest_wait_unit.sh
+          # 10f self-schedule capability-cache race: a UUID create result plus
+          # an absent OWN grid is the only safe reinvocation signal. Offline
+          # behavior cases prove bounded retries and no duplicate volume create.
+          bash tests/e2e/test_self_schedule_create_retry_unit.sh
           # core#4425 finding #2: the extra-scenario gating in
           # ephemeral_cp_happy_path.sh must distinguish a MISCONFIG (unknown
           # scenario key / empty token list → reserved rc=97 → EXTRA_MISCONFIG)
@@ -665,10 +674,10 @@ jobs:
 
   canvas-deploy-status:
     # Compatibility: keep the established check key/name, but this job records
-    # ordered IMAGE PUBLICATION only. publish-canvas-image builds, waits for
-    # green CI, and promotes registry :latest; it does not by itself prove that
-    # a live host pulled or serves that image. End-to-end rollout proof is
-    # tracked as the release blocker in internal#1038.
+    # advisory candidate IMAGE PUBLICATION only. publish-canvas-image writes and
+    # verifies staging selectors; it does not move :latest or prove that a live
+    # host pulled or serves the image. Fail-closed release wiring remains tracked
+    # in internal#1038.
     name: Canvas Deploy Status
     runs-on: docker-host
     # Per-step no-op (not job-level `if:`) so the job reaches SUCCESS on PRs
@@ -697,16 +706,16 @@ jobs:
           ## Canvas image publication in progress
 
           This canvas-touching main push triggers `publish-canvas-image`, which now
-          runs an ordered, CI-gated registry publication (core#2226):
+          runs the advisory pre-flip candidate publication for internal#1038:
 
-          1. Build → push `molecule-ai/canvas:staging-<sha>` + `:staging-latest`.
-          2. Wait for green main CI on this SHA.
-          3. Promote `:latest` to the verified `:staging-<sha>` by digest.
+          1. Build or reuse the write-once `molecule-ai/canvas:staging-<sha>`.
+          2. Repair `:staging-latest` and `:sha-<short-sha>` to that exact digest.
+          3. Pull and prove all three selectors carry the expected OCI revision.
 
-          This proves the registry tag, not a live rollout. A deployment owner
-          must pull the immutable candidate and verify `/api/buildinfo` against
-          the expected SHA; that fail-closed rollout is tracked in internal#1038.
-          Watch the canvas publish workflow for the image result.
+          The job remains `continue-on-error` during this soak, so its commit
+          status alone is not evidence. Inspect the exact post-main job log for
+          a clean run before removing the mask in internal#1038. This workflow
+          never moves production `:latest` and performs no live rollout.
           BODY
           printf '\n> Posted automatically by CI · commit `%s` · [publish workflow](%s)\n' \
             "$COMMIT_SHA" "$RUN_URL" >> /tmp/deploy-status.md

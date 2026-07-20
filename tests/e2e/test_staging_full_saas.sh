@@ -150,6 +150,9 @@ source "$(dirname "$0")/lib/collision-proof-slug.sh"
 # shellcheck source=lib/idle_digest_wait.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/idle_digest_wait.sh"
+# shellcheck source=lib/self_schedule_create_retry.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/self_schedule_create_retry.sh"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
@@ -701,14 +704,21 @@ print(s[:4000])
 # diagnostic. Every attempt is logged, so a transient that self-heals stays
 # visible and is never silently masked.
 #
-# The attempt budget is small on purpose: the cold window is ~1-2s, so a few
-# ~2s retries cover it while a DETERMINISTIC transient still fails RED in
-# seconds rather than burning a multi-minute budget into a CI job timeout.
+# The attempt budget stays bounded but must cover the ACTUAL cold window: the
+# core#4307 RCA estimated ~1-2s, but under concurrent-provision load on the
+# shared staging docker host the tenant origin warms slower — run 546336
+# (Platform Boot) saw a persistent empty-body 503 from Cloudflare across the old
+# 4-attempt / ~8s budget. 8 attempts at Retry-After ~2s (~16s) covers the
+# observed longer window. This does NOT slow the deterministic-failure path: a
+# non-cold status (JSON app error, 502/504) is surfaced on attempt 1 by
+# create_should_retry_cold, so ONLY a genuinely-persistent cold-origin transient
+# consumes the budget — and a never-warming origin still fails RED in ~16s, well
+# under a CI job timeout. Env-overridable for a still-longer window if needed.
 #
 # Args: $1 = human label, $2 = headers dump file (-D target). Remaining args are
 # passed verbatim to `tenant_call POST /workspaces` (payload etc.). Echoes the
 # final response body on stdout; leaves the final response headers in $2.
-CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-4}"
+CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-8}"
 create_workspace_post() {
   local label="$1" hdrs="$2"; shift 2
   local attempt resp id status ra who
@@ -2966,6 +2976,66 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
   fi
 fi
 
+# ─── 10g. P4b retirement tooling reachable (core#4507, E2E_SCHEDULER_CHECK=on only) ──
+# End-to-end proof that the workspace_schedules-retirement tooling is DEPLOYED
+# and reachable on a real tenant through the CP proxy: the read-only readiness
+# audit and the DRY-RUN fleet migrate are AdminAuth-gated ws-server routes that
+# must return their documented JSON contract. The irreversible DROP itself stays
+# owner-gated — this proves ONLY that the enabling tooling is live + correctly
+# shaped (the migration MATH is unit-tested with negative controls in
+# workspace-server/internal/handlers/schedules_p4b_test.go). Co-gated on
+# E2E_SCHEDULER_CHECK so it reuses 10d's volume-native tenant.
+# Reachable fail arms: non-2xx (route not registered / AdminAuth rejected the
+# tenant admin token) vs a 2xx whose body is missing the contract keys.
+if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
+  log "── 10g. P4b readiness + fleet-migrate tooling reachable ──"
+  _P4B_BODY=$(mktemp)
+  E2E_TMP_FILES+=("$_P4B_BODY")  # cleaned by the EXIT trap even if fail() exits mid-step
+
+  _p4b_call() {  # <method> <path> <label> <python-contract-check-on-stdin>
+    local method="$1" path="$2" label="$3" checks="$4" code rc summary prc
+    set +e
+    code=$(tenant_call "$method" "$path" -o "$_P4B_BODY" -w '%{http_code}'); rc=$?
+    set -e
+    if [ "$rc" -ne 0 ] || [ "$code" != "200" ]; then
+      log "$(sanitize_http_body <"$_P4B_BODY" | head -c 400)"
+      fail "10g: $label returned HTTP $code (curl_rc=$rc) — the route is not registered on the tenant ws-server, or AdminAuth rejected the tenant admin token."
+    fi
+    set +e
+    summary=$(python3 -c "$checks" <"$_P4B_BODY"); prc=$?
+    set -e
+    if [ "$prc" -ne 0 ]; then
+      log "$(sanitize_http_body <"$_P4B_BODY" | head -c 400)"
+      fail "10g: $label returned 200 but not the documented contract (see body above)."
+    fi
+    [ -n "$summary" ] && log "$summary"
+  }
+
+  _p4b_call GET "/admin/schedules/p4b-readiness" "p4b-readiness" '
+import json,sys
+d=json.load(sys.stdin)
+for k in ("data_drop_safe","drop_still_requires","kill_switch_enabled","workspaces_with_live_rows","workspaces_needing_migration","workspaces_unverifiable","workspaces"):
+    assert k in d, "missing key: "+k+" (got "+str(sorted(d))+")"
+assert isinstance(d["data_drop_safe"], bool), "data_drop_safe must be a bool"
+assert isinstance(d["workspaces"], list), "workspaces must be a list"
+print("    readiness: data_drop_safe=%s live_rows=%s not_native=%s needs_migration=%s unverifiable=%s" % (
+    d["data_drop_safe"], d["workspaces_with_live_rows"], d.get("not_volume_native"), d["workspaces_needing_migration"], d["workspaces_unverifiable"]))
+'
+  ok "    p4b-readiness reachable + correctly shaped"
+
+  _p4b_call POST "/admin/schedules/migrate-all-to-volume" "migrate-all(dry-run)" '
+import json,sys
+d=json.load(sys.stdin)
+assert d.get("apply") is False, "no ?apply must default to dry-run (apply=false), got %r" % d.get("apply")
+for k in ("workspaces","total_migrated","results"):
+    assert k in d, "missing key: "+k
+print("    migrate-all dry-run: apply=%s workspaces=%s would_migrate=%s" % (d["apply"], d["workspaces"], d["total_migrated"]))
+'
+  ok "    migrate-all-to-volume reachable + dry-run by default (no writes)"
+
+  rm -f "$_P4B_BODY"; unset -f _p4b_call
+fi
+
 # ─── 10e. Native digest-provider plugin load (RFC #4413, E2E_DIGEST_PLUGIN_CHECK=on only) ──
 # End-to-end proof that a NATIVE digest-provider plugin is loaded IN-PROCESS by
 # the runtime's idle-digest assembler, admitted by the LOAD-TIME trust gate from
@@ -3053,7 +3123,7 @@ fi
 #
 # Deterministic (no LLM): from the gate host we `docker exec -i` into the OWN mol-ws
 # container and pipe a two-line JSON-RPC stream (initialize, then tools/call
-# create_schedule) into `npx --prefer-offline @molecule-ai/mcp-server@1.9.2 -e
+# create_schedule) into `npx --prefer-offline @molecule-ai/mcp-server@1.9.3 -e
 # MOLECULE_MCP_MODE=self`, capturing stdout — mirroring test_mcp_stdio_staging.sh.
 # create_schedule lives ONLY on the Node self-mode stdio surface (NOT core's Go MCP
 # HTTP bridge), so this is the sole path that exercises the real tool with no agent
@@ -3074,7 +3144,7 @@ fi
 #     admin/org token so the 401 leg cannot false-pass.
 #
 # Dark until preconditions confirmed (default OFF): needs a workspace-template pin
-# carrying runtime#328's self-audience injector AND a prebaked mcp-server 1.9.2 (so
+# carrying runtime#328's self-audience injector AND a prebaked mcp-server 1.9.3 (so
 # `npx --prefer-offline` resolves offline in the no-network gate). Its fail arms are
 # REACHABLE (each leg has a distinct hard failure with diagnostics). It registers NO
 # live_milestone (LIVE_MILESTONES is a closed SSOT — adding one trips the drift gate).
@@ -3089,7 +3159,7 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
   _SS_CAP_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CAP_TIMEOUT_SECS:-120}"
   _SS_CREATE_TIMEOUT_SECS="${E2E_SELF_SCHEDULE_CREATE_TIMEOUT_SECS:-120}"
   _SS_SETTLE_SECS="${E2E_SELF_SCHEDULE_SETTLE_SECS:-30}"
-  _SS_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.2}"
+  _SS_MCP_SPEC="${E2E_SELF_SCHEDULE_MCP_SPEC:-@molecule-ai/mcp-server@1.9.3}"
   # Run-unique names (distinct from 10d's e2e-fire-* to avoid a ScheduleStore
   # name-collision 409 + grid-provenance ambiguity). Bounded, cron-safe.
   _SS_SN="e2e-self-fire-${E2E_RUN_ID:-local}"
@@ -3100,7 +3170,8 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
     # Globals set by the probe fns below; pre-init so `set -u` never trips when a
     # diagnostic reads one before its producer ran.
     _SS_SELF_CID=""; _SS_SELF_WSID=""; _SS_CAP_EVIDENCE=""; _SS_FIRED=""
-    _SS_CLASS=""; _SS_OUT_FILE=""; _SS_LEGA_DETAIL=""
+    _SS_CLASS=""; _SS_ID=""; _SS_OUT_FILE=""; _SS_LEGA_DETAIL=""
+    _SS_CREATE_DETAIL=""
 
     # LEG A + the rendered-launch extractor parse the DEFAULT-runtime hermes
     # config.yaml with the runner's python; make PyYAML importable (fail-loud
@@ -3151,23 +3222,6 @@ if [ "${E2E_SELF_SCHEDULE_CHECK:-}" = "on" ]; then
         if [ -n "$_wsid" ] && [ "$_wsid" = "$PARENT_ID" ]; then
           _SS_SELF_CID="$_sc"
           _SS_SELF_WSID="$_wsid"
-          return 0
-        fi
-      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
-      return 1
-    }
-
-    # Daemon-armed precondition, mirroring 10d (scheduler_capability_ready): a
-    # non-null quoted last_tick proves the trigger daemon booted + completed ≥1 poll
-    # cycle, so a create now will route to an armed grid (closes the #4448 arm race).
-    self_schedule_capability_ready() {
-      local _sc _health
-      _SS_CAP_EVIDENCE=""
-      while IFS= read -r _sc; do
-        [ -n "$_sc" ] || continue
-        _health=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null || true)
-        if printf '%s' "$_health" | grep -Eq '"last_tick"[[:space:]]*:[[:space:]]*"[^"]+"'; then
-          _SS_CAP_EVIDENCE="$_sc (schedule-health.json last_tick live)"
           return 0
         fi
       done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
@@ -3305,6 +3359,8 @@ print("OK token_file=" + str(env.get("MOLECULE_WORKSPACE_TOKEN_FILE")))
     # expected, mirrors test_mcp_stdio_staging.sh:128-132).
     self_schedule_invoke_create() {
       local _args="$1" _init _call _cfg _fmt _cfg_raw _nodebin _cpath
+      local _result_fields=()
+      _SS_ID=""
       _SS_OUT_FILE=$(e2e_tmp /tmp/e2e_self_schedule.XXXXXX)
       _init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-10f","version":"1.0.0"}}}'
       _call=$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_schedule","arguments":%s}}' "$_args")
@@ -3383,13 +3439,14 @@ sys.stdout.write("\0".join(out))
         local _rc=$?
         log "    10f: self-mode mcp-server exited rc=$_rc (nonzero on stdin EOF is expected — mirrors test_mcp_stdio_staging.sh)"
       }
-      _SS_CLASS=$(python3 -c '
+      mapfile -t _result_fields < <(python3 -c '
 import json, sys
 cls = "no-response"
+rid = ""
 try:
     fh = open(sys.argv[1], "r", errors="replace")
 except Exception:
-    print("no-response"); sys.exit(0)
+    print("no-response"); print(""); sys.exit(0)
 for line in fh:
     line = line.strip()
     if not line or line[:1] != "{":
@@ -3422,14 +3479,20 @@ for line in fh:
                             o = json.loads(ts)
                         except Exception:
                             o = None
-                        if isinstance(o, dict) and o.get("error"):
-                            emb = True; break
+                        if isinstance(o, dict):
+                            if o.get("id") is not None:
+                                rid = str(o.get("id"))
+                            if o.get("error"):
+                                emb = True; break
                 cls = "tool-error" if emb else "ok"
             else:
                 cls = "ok"
         break
 print(cls)
-' "$_SS_OUT_FILE" 2>/dev/null || echo "parse-failed")
+print(rid)
+' "$_SS_OUT_FILE" 2>/dev/null || printf 'parse-failed\n\n')
+      _SS_CLASS="${_result_fields[0]:-parse-failed}"
+      _SS_ID="${_result_fields[1]:-}"
     }
 
     # Shared diagnostics — called by EVERY fail arm below. Dumps per-container
@@ -3438,7 +3501,20 @@ print(cls)
     # a zero-match grep exits 1 under `set -euo pipefail` and would abort this fn
     # before the log lines print — and a zero match IS the leg it explains.
     self_schedule_diagnostics() {
-      local _sc _decl _plug _slog
+      local _sc _decl _plug _slog _grid _health _state _history
+      # Always snapshot the resolved target directly. A sibling's healthy daemon is
+      # not evidence for this grid, and the target may have stopped and disappeared
+      # from `docker ps` by the time the failure arm runs.
+      if [ -n "${_SS_SELF_CID:-}" ]; then
+        _grid=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 1200 || true)
+        _health=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 800 || true)
+        _state=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-state.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | head -c 1200 || true)
+        _history=$(docker exec "$_SS_SELF_CID" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' | tail -c 1600 || true)
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedules.yaml: ${_grid:-ABSENT}"
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-health.json: ${_health:-ABSENT}"
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-state.json: ${_state:-ABSENT}"
+        log "    [self-schedule diag] TARGET $_SS_SELF_CID schedule-history.json tail: ${_history:-ABSENT}"
+      fi
       while IFS= read -r _sc; do
         [ -n "$_sc" ] || continue
         _decl=$(docker exec "$_sc" sh -c 'env | grep -E "^MOLECULE_(DECLARED_PLUGINS|MCP_MODE|TRIGGER)" | sort | tr "\n" " "' 2>/dev/null || true)
@@ -3449,7 +3525,7 @@ print(cls)
         log "    [self-schedule diag] $_sc recent self/schedule log: ${_slog:-NONE}"
       done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
       if [ -n "${_SS_OUT_FILE:-}" ] && [ -f "${_SS_OUT_FILE:-}" ]; then
-        log "    [self-schedule diag] last create JSON-RPC payload (class=${_SS_CLASS:-?}): $(sanitize_http_body < "$_SS_OUT_FILE" | tr '\n' '|' | head -c 600 || true)"
+        log "    [self-schedule diag] last create JSON-RPC payload (class=${_SS_CLASS:-?}, id=${_SS_ID:-empty}): $(sanitize_http_body < "$_SS_OUT_FILE" | tr '\n' '|' | head -c 600 || true)"
       fi
     }
 
@@ -3481,7 +3557,7 @@ print(cls)
 
     # ── 10f.B.1 Daemon-armed wait (mirror 10d; closes #4448 before create) ──
     log "    LEG B: waiting up to ${_SS_CAP_TIMEOUT_SECS}s for the trigger daemon to arm (schedule-health.json ticking) before creating — #4448 arm-race guard."
-    if idle_digest_wait "$_SS_CAP_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_capability_ready; then
+    if idle_digest_wait "$_SS_CAP_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_target_capability_ready; then
       ok "    trigger daemon armed & ticking (evidence: $_SS_CAP_EVIDENCE)"
     else
       self_schedule_diagnostics
@@ -3490,32 +3566,30 @@ print(cls)
 
     # ── 10f.B.2 create with EXPLICIT workspace_id → lands on OWN grid ──
     _SS_ARGS_EXPLICIT=$(SS_WS="$PARENT_ID" SS_NM="$_SS_SN" python3 -c 'import json,os; print(json.dumps({"workspace_id":os.environ["SS_WS"],"name":os.environ["SS_NM"],"cron_expr":"* * * * *","prompt":"e2e self-schedule explicit-id probe","enabled":True}))')
-    log "    LEG B(i): create_schedule with EXPLICIT workspace_id=$PARENT_ID name='$_SS_SN' via self-mode mcp-server ($_SS_MCP_SPEC) on $_SS_SELF_CID."
-    self_schedule_invoke_create "$_SS_ARGS_EXPLICIT"
-    if [ "$_SS_CLASS" != "ok" ]; then
-      self_schedule_diagnostics
-      fail "LEG B(i): explicit-id create_schedule did not return a non-error result (class=$_SS_CLASS). The captured JSON-RPC payload is in the diagnostics above. A tool-error/error here means the self-mode create handler rejected a create for the OWN workspace — a regression in the self-mode auth-assembly or workspace_id handling."
-    fi
-    if idle_digest_wait "$_SS_CREATE_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_own_grid_has "$_SS_SN"; then
+    log "    LEG B(i): create_schedule with EXPLICIT workspace_id=$PARENT_ID name='$_SS_SN' via self-mode mcp-server ($_SS_MCP_SPEC) on $_SS_SELF_CID, retrying only a proven UUID DB-misroute for up to ${_SS_CREATE_TIMEOUT_SECS}s."
+    if self_schedule_create_until_own_grid "$_SS_ARGS_EXPLICIT" "$_SS_SN"; then
       ok "    LEG B(i): explicit-id schedule '$_SS_SN' landed on the OWN volume grid ($_SS_SELF_CID:/configs/schedules/schedules.yaml)"
     else
+      _ss_create_rc=$?
       self_schedule_diagnostics
-      fail "LEG B(i): explicit-id create returned ok but '$_SS_SN' never appeared on the OWN grid within ${_SS_CREATE_TIMEOUT_SECS}s — the create did not route to the runtime volume (self-mode → core create routing gap)."
+      if [ "$_ss_create_rc" = "2" ]; then
+        fail "LEG B(i): explicit-id create_schedule failed before OWN-grid confirmation ($_SS_CREATE_DETAIL). The captured JSON-RPC payload is in the diagnostics above. A tool-error/error is not a capability-cache race and remains a hard failure."
+      fi
+      fail "LEG B(i): explicit-id schedule '$_SS_SN' never appeared on the OWN grid within ${_SS_CREATE_TIMEOUT_SECS}s ($_SS_CREATE_DETAIL). A UUID+missing-grid result was retried through the bounded capability-cache window; volume/unclear ids were poll-only to avoid duplicate creates."
     fi
 
     # ── 10f.B.3 create with OMITTED workspace_id → SELF-RESOLVES + lands ──
     _SS_ARGS_OMIT=$(SS_NM="$_SS_SN_OMIT" python3 -c 'import json,os; print(json.dumps({"name":os.environ["SS_NM"],"cron_expr":"* * * * *","prompt":"e2e self-schedule omit-id probe","enabled":True}))')
-    log "    LEG B(ii): create_schedule with workspace_id OMITTED name='$_SS_SN_OMIT' — must SELF-RESOLVE to the own workspace (runtime WORKSPACE_ID injection + self-mode self-default) and land, NOT error."
-    self_schedule_invoke_create "$_SS_ARGS_OMIT"
-    if [ "$_SS_CLASS" != "ok" ]; then
-      self_schedule_diagnostics
-      fail "LEG B(ii): omit-id create_schedule did not self-resolve — it returned class=$_SS_CLASS instead of a non-error result. The self-mode server must default workspace_id to the container's own WORKSPACE_ID (the recently-restored self-default). An error here means that self-default regressed."
-    fi
-    if idle_digest_wait "$_SS_CREATE_TIMEOUT_SECS" "$_SS_POLL_SECS" self_schedule_own_grid_has "$_SS_SN_OMIT"; then
+    log "    LEG B(ii): create_schedule with workspace_id OMITTED name='$_SS_SN_OMIT' — must SELF-RESOLVE to the own workspace and land, retrying only a proven UUID DB-misroute for up to ${_SS_CREATE_TIMEOUT_SECS}s."
+    if self_schedule_create_until_own_grid "$_SS_ARGS_OMIT" "$_SS_SN_OMIT"; then
       ok "    LEG B(ii): omit-id schedule '$_SS_SN_OMIT' SELF-RESOLVED to the own workspace and landed on the OWN grid"
     else
+      _ss_create_rc=$?
       self_schedule_diagnostics
-      fail "LEG B(ii): omit-id create returned ok but '$_SS_SN_OMIT' never appeared on the OWN grid within ${_SS_CREATE_TIMEOUT_SECS}s — self-resolution did not route to the own volume."
+      if [ "$_ss_create_rc" = "2" ]; then
+        fail "LEG B(ii): omit-id create_schedule failed before OWN-grid confirmation ($_SS_CREATE_DETAIL). The self-mode server must default workspace_id to the container's own WORKSPACE_ID; a tool-error/error is a hard self-resolution/auth failure, not a retry signal."
+      fi
+      fail "LEG B(ii): omit-id schedule '$_SS_SN_OMIT' never appeared on the OWN grid within ${_SS_CREATE_TIMEOUT_SECS}s ($_SS_CREATE_DETAIL). A UUID+missing-grid result was retried through the bounded capability-cache window; volume/unclear ids were poll-only to avoid duplicate creates."
     fi
 
     # ── 10f.B.4 the explicit-id self-created schedule FIRES (reuse 10d) ──
@@ -3553,7 +3627,7 @@ print(cls)
     ok "    10f self-schedule tool: LEG A injector proof + LEG B (explicit-id, omit-id self-resolve, fire) + foreign-id/org-key neg controls all PASSED"
 
     unset -f self_schedule_adapter_config_path self_schedule_adapter_config_format \
-      self_schedule_resolve_own_container self_schedule_capability_ready \
+      self_schedule_resolve_own_container \
       self_schedule_own_grid_has self_schedule_any_grid_has self_schedule_fire_probe \
       self_schedule_assert_ordinary_box self_schedule_injector_proof \
       self_schedule_invoke_create self_schedule_diagnostics

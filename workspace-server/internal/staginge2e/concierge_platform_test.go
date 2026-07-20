@@ -19,7 +19,9 @@ package staginge2e
 //     POST /admin/org/platform-agent makes the org root kind='platform'.
 //     GET  /org/identity returns the org name + platform_managed_available.
 //     The platform agent becomes the SOLE parent_id IS NULL root, and the
-//     ordinary workspace created earlier is re-parented under it.
+//     ordinary workspace created earlier remains in its descendant tree. When
+//     a non-platform root already exists, install inserts the platform above
+//     that root rather than flattening all of its descendants.
 //
 //  2. kind on the workspace API
 //     GET /workspaces + GET /workspaces/:id return kind ('platform' for the
@@ -69,7 +71,7 @@ import (
 func TestConciergePlatformAgent_Staging(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-cncrg-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("cncrg")
 	t.Logf("concierge-platform: slug=%s", slug)
 
 	// --- Step 1: provision throwaway org + tenant (reused scaffolding) ---
@@ -92,6 +94,7 @@ func TestConciergePlatformAgent_Staging(t *testing.T) {
 
 	// ── Feature 1: platform-agent install + identity ─────────────────────────
 	var platformID string
+	var platformDirectChildID string
 	t.Run("platform_agent_install_and_identity", func(t *testing.T) {
 		// Reuse an existing platform agent if the deployed CP already installed
 		// one at org-provision time (the install is idempotent only for the SAME
@@ -164,18 +167,30 @@ func TestConciergePlatformAgent_Staging(t *testing.T) {
 			t.Fatalf("sole root is %q, expected the platform agent %q", roots[0], platformID)
 		}
 
-		// The ordinary workspace must have been re-parented UNDER the platform
-		// agent (it is no longer a root; its parent_id is the platform agent).
-		parent := workspaceParentID(t, host, token, orgID, ordinaryWS)
-		if parent != platformID {
-			t.Fatalf("ordinary workspace %s parent_id=%q, expected to be re-parented under platform agent %q",
-				ordinaryWS, parent, platformID)
+		// Installing a platform above an existing ordinary root deliberately
+		// preserves that root's subtree: only the former root is re-parented to
+		// the platform. Prove the ordinary workspace is transitively below the
+		// platform and remember the first hop, which is the platform's actual
+		// direct peer.
+		listStatus, listBody := doTenantJSON(t, "GET", "https://"+host+"/workspaces", token, orgID, "")
+		if listStatus != http.StatusOK {
+			t.Fatalf("ancestry GET /workspaces: HTTP %d: %s", listStatus, listBody)
 		}
-		t.Logf("platform agent %s is sole root; ordinary ws re-parented under it", platformID)
+		firstChild, ok := firstChildOnPath(parseWorkspaceList(t, listBody), platformID, ordinaryWS)
+		if !ok {
+			t.Fatalf("ordinary workspace %s is not a descendant of platform agent %s: %s",
+				ordinaryWS, platformID, listBody)
+		}
+		platformDirectChildID = firstChild
+		t.Logf("platform agent %s is sole root; ordinary ws descends through direct child %s",
+			platformID, platformDirectChildID)
 	})
 
 	if platformID == "" {
 		t.Fatal("platform agent id not established by Feature 1 — dependent subtests cannot run")
+	}
+	if platformDirectChildID == "" {
+		t.Fatal("platform direct child not established by Feature 1 — dependent subtests cannot run")
 	}
 
 	// ── Feature 2: kind on the workspace API ─────────────────────────────────
@@ -271,16 +286,26 @@ func TestConciergePlatformAgent_Staging(t *testing.T) {
 		}
 		// Body must be a JSON array (the peer list shape) — a 200 with a non-array
 		// would be a different regression.
-		var peers []json.RawMessage
+		var peers []map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(body), &peers); err != nil {
 			t.Fatalf("GET /registry/%s/peers returned 200 but body is not a JSON array: %v (%s)", platformID, err, body)
 		}
-		// The ordinary workspace was re-parented under the concierge, so it is a
-		// CHILD peer — assert the concierge can actually see it.
-		if !strings.Contains(body, ordinaryWS) {
-			t.Fatalf("concierge peer list does not include its re-parented child %s: %s", ordinaryWS, body)
+		// Peer discovery is intentionally one tree edge deep. Assert the
+		// platform sees the first child on the ordinary workspace's ancestry
+		// path, which may be the former non-platform root rather than the nested
+		// ordinary workspace itself.
+		directChildVisible := false
+		for _, peer := range peers {
+			if rawString(peer["id"]) == platformDirectChildID {
+				directChildVisible = true
+				break
+			}
 		}
-		t.Logf("peers admin-auth OK (HTTP %d, %d peer(s), child visible)", hs, len(peers))
+		if !directChildVisible {
+			t.Fatalf("concierge peer list does not include direct child %s on path to ordinary workspace %s: %s",
+				platformDirectChildID, ordinaryWS, body)
+		}
+		t.Logf("peers admin-auth OK (HTTP %d, %d peer(s), direct child visible)", hs, len(peers))
 	})
 
 	// Feature 5 (BYOK billing-mode round-trip) was removed 2026-06-30 together
@@ -394,18 +419,53 @@ func findPlatformRoot(t *testing.T, host, token, orgID string) string {
 	return ""
 }
 
-// workspaceParentID returns the parent_id of a single workspace ("" when root).
-func workspaceParentID(t *testing.T, host, token, orgID, wsID string) string {
-	t.Helper()
-	hs, body := doTenantJSON(t, "GET", "https://"+host+"/workspaces/"+wsID, token, orgID, "")
-	if hs != http.StatusOK {
-		t.Fatalf("workspaceParentID GET /workspaces/%s: HTTP %d: %s", wsID, hs, body)
+// firstChildOnPath returns the direct child of ancestorID on the path to
+// descendantID. It fails closed on missing rows, duplicate ids, disconnected
+// trees, and cycles. The helper models the one-edge peer contract without
+// assuming platform installation flattens an existing workspace subtree.
+func firstChildOnPath(rows []workspaceListRow, ancestorID, descendantID string) (string, bool) {
+	if ancestorID == "" || descendantID == "" || ancestorID == descendantID {
+		return "", false
 	}
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(body), &m); err != nil {
-		t.Fatalf("workspaceParentID: body not JSON object: %v (%s)", err, truncate(body, 200))
+
+	parents := make(map[string]string, len(rows))
+	for _, row := range rows {
+		if row.ID == "" {
+			return "", false
+		}
+		if _, exists := parents[row.ID]; exists {
+			return "", false
+		}
+		parents[row.ID] = row.ParentID
 	}
-	return rawString(m["parent_id"])
+	if _, ok := parents[ancestorID]; !ok {
+		return "", false
+	}
+	if _, ok := parents[descendantID]; !ok {
+		return "", false
+	}
+
+	current := descendantID
+	firstChild := ""
+	visited := make(map[string]struct{}, len(rows))
+	for {
+		if _, seen := visited[current]; seen {
+			return "", false
+		}
+		visited[current] = struct{}{}
+
+		parent, ok := parents[current]
+		if !ok {
+			return "", false
+		}
+		if parent == "" {
+			return firstChild, firstChild != ""
+		}
+		if parent == ancestorID && firstChild == "" {
+			firstChild = current
+		}
+		current = parent
+	}
 }
 
 // jsonBool extracts a top-level bool field. ok=false when the field is absent or

@@ -586,6 +586,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// every workspace that already has schedules (stranded post-P4). AdminAuth;
 		// DRY-RUN by default, ?apply=true to declare + arm. One-shot remediation.
 		r.POST("/admin/schedules/backfill-plugin", middleware.AdminAuth(db.DB), schedh.BackfillSchedulerPlugin)
+		// P4b readiness + fleet migration: measure and execute the DROP
+		// precondition without touching the irreversible parts. AdminAuth.
+		// Readiness is read-only; migrate-all is DRY-RUN by default (?apply=true).
+		r.GET("/admin/schedules/p4b-readiness", middleware.AdminAuth(db.DB), schedh.P4bReadiness)
+		r.POST("/admin/schedules/migrate-all-to-volume", middleware.AdminAuth(db.DB), schedh.MigrateAllToVolume)
 
 		// Budget — per-workspace spend ceiling and current usage (#541).
 		// GET stays on wsAuth — a workspace agent reading its own budget is legitimate.

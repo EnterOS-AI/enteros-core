@@ -48,6 +48,9 @@ on:
       # that line back down into the parked half — touches ONLY this file, so
       # without this path the guard would not run on the very diff it guards.
       - '.gitea/required-contexts.txt'
+      # The marketplace SSOT test guards this public stub as well as its own
+      # test file. A stub-only regression must therefore emit this gate.
+      - 'docs/design/rfc-marketplace-delivery.md'
       - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
       # Active staging guidance is linted by
       # test_deploy_comment_accuracy.py; changes to either harness must run it.
@@ -74,6 +77,9 @@ on:
       # that line back down into the parked half — touches ONLY this file, so
       # without this path the guard would not run on the very diff it guards.
       - '.gitea/required-contexts.txt'
+      # The marketplace SSOT test guards this public stub as well as its own
+      # test file. A stub-only regression must therefore emit this gate.
+      - 'docs/design/rfc-marketplace-delivery.md'
       - 'tests/e2e/test_local_provision_lifecycle_e2e.sh'
       # Active staging guidance is linted by
       # test_deploy_comment_accuracy.py; changes to either harness must run it.
@@ -173,6 +179,13 @@ jobs:
           python -m unittest discover -p 'test_*.py' -v
       - name: Run .gitea/scripts pytest suite
         run: python -m pytest .gitea/scripts/tests -q
+
+      - name: audit-force-merge pagination contract (network-free)
+        # This is a shell integration test, so pytest does not collect it.
+        # Its fake Gitea API reproduces the live server's limit=50 clamp and
+        # proves that status/file pagination continues to an explicit empty
+        # page while malformed or ambiguous status histories fail closed.
+        run: bash .gitea/scripts/tests/test_audit_force_merge.sh
 
       - name: all-required-check.sh fail-closed contract
         # Regression lock for molecule-core#656 / #2615. The CI / all-required

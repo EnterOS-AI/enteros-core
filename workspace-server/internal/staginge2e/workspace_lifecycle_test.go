@@ -4,6 +4,8 @@ package staginge2e
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,7 +65,7 @@ import (
 func TestWorkspaceLifecycle_Staging(t *testing.T) {
 	cfg := requireStagingEnv(t)
 
-	slug := fmt.Sprintf("e2e-life-%d", time.Now().Unix()%100000000)
+	slug := e2eSlug("life")
 	t.Logf("workspace-lifecycle: slug=%s", slug)
 
 	// --- Step 1: provision org via admin API ---
@@ -458,6 +460,36 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// e2eSlug builds the slug for an ephemeral e2e org.
+//
+// It keeps the `e2e-<tag>` prefix so CP's IsEphemeral classifier still tags the
+// org throwaway, and — crucially — embeds the CI run-id (GITHUB_RUN_ID) so the
+// workflow-level `if: always()` teardown net can sweep a leaked org by run-id
+// even when Go's t.Cleanup never fires. `go test -timeout` firing and a
+// SIGKILL'd runner both SKIP t.Cleanup, so the old run-id-less slug form
+// (`e2e-<tag>-<unixtime>`) could not be matched by the always()-net and leaked
+// until the age-guarded reaper eventually caught it. Embedding the run-id closes
+// that gap: belt (t.Cleanup on the happy/failure path) and braces (the
+// run-id-scoped always()-net on timeout/kill).
+//
+// On local runs GITHUB_RUN_ID is empty, so it falls back to the legacy
+// unix-timestamp form. A short 24-bit random suffix keeps parallel/rerun slugs
+// collision-resistant while staying well under the DNS-label / CP slug limit.
+func e2eSlug(tag string) string {
+	if runID := strings.TrimSpace(os.Getenv("GITHUB_RUN_ID")); runID != "" {
+		var entropy [3]byte
+		if _, err := cryptorand.Read(entropy[:]); err == nil {
+			return fmt.Sprintf("e2e-%s-%s-%s", tag, runID, hex.EncodeToString(entropy[:]))
+		}
+		// A crypto/rand outage should not turn slug construction into a silent
+		// empty value. Preserve the exact six-hex contract with a clock fallback;
+		// the create endpoint still rejects any real collision.
+		fallback := uint64(time.Now().UnixNano()) & 0xffffff
+		return fmt.Sprintf("e2e-%s-%s-%06x", tag, runID, fallback)
+	}
+	return fmt.Sprintf("e2e-%s-%d", tag, time.Now().Unix()%100000000)
 }
 
 // adminCreateOrg provisions a throwaway org via the CP admin API, immediately

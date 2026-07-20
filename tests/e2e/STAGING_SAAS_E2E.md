@@ -43,6 +43,28 @@ describe that unperformed scan as a pass. Other staging workflow families retain
 separate teardown contracts; `molecule-ai/internal#639` tracks the remaining
 convergence.
 
+The Go staging suites use `e2eSlug(<tag>)`, which embeds `GITHUB_RUN_ID` and a
+five-digit uniqueness suffix in CI. Their primary path remains the test's
+fail-closed `t.Cleanup` exact delete. A process timeout or runner SIGKILL cannot
+run `t.Cleanup`, so every credential-bearing Go job invokes the shared
+`tests/e2e/lib/go_e2e_run_teardown.sh` safety net with only the exact tags that
+job creates. The helper accepts only a full
+`e2e-<tag>-<run-id>-<six-hex>` match, obtains the matching org ID from the
+staging roster, and delegates deletion and proof to `cp_purge_receipt.sh`.
+Cleanup failure remains visible; the automatic main-push janitor is only a
+delayed final backstop after its conservative 90-minute age floor.
+
+The full-SaaS scheduler checks are volume-authoritative. Step 10f resolves the
+workspace under test, accepts daemon-readiness evidence only from that exact
+container's `schedule-health.json`, and requires both explicit-ID and omitted-ID
+self-mode creates to appear on its own `schedules.yaml` grid. A UUID response is
+the only signal that permits a bounded create retry because it proves the
+request reached the retired database path while capability propagation was
+stale; name-keyed volume responses and visible grid entries switch to poll-only
+to avoid duplicate creates. On failure, the harness prints the target's bounded
+grid, health, armed-state, and history snapshots before the wider container
+context. A sibling workspace heartbeat is never target readiness evidence.
+
 ## Credential
 
 Load staging `CP_ADMIN_API_TOKEN` from Infisical environment `staging`, path
