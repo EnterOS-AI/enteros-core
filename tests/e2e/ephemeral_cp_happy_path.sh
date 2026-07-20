@@ -846,6 +846,114 @@ run_scenario_peer_visibility() {
     bash "$HERE/test_peer_visibility_mcp_staging.sh"
 }
 
+# ── Go-harness staging journeys (RFC #86 — pull the go-staging-test lanes LEFT) ─
+# The five scenarios above shell out to tests/e2e/test_*.sh. The next three shell
+# out to the TOPOLOGY-AWARE Go staging-e2e harness (#4525:
+# workspace-server/internal/staginge2e/tenant_topology.go) instead — the SAME
+# `-tags staging_e2e` test binary the post-push `e2e-staging-saas.yml` jobs run,
+# now aimed at THIS throwaway CP by threading the ephemeral topology through env:
+#
+#   CP_BASE_URL / CP_ADMIN_API_TOKEN      requireStagingEnv (the harness's admin surface)
+#   STAGING_E2E=1                         arms the suite (else it t.Skips LOUD)
+#   MOLECULE_TENANT_URL=$CP_BASE_URL      tenant traffic hits the CP base, not a real subdomain
+#   MOLECULE_TENANT_ROUTE_DOMAIN=lvh.me   → Host=<slug>.lvh.me + X-Molecule-Org-Slug (CP wildcard proxy routing)
+#   MOLECULE_TENANT_ORIGIN_TEMPLATE=…     the tenant's ONE allowed CORS origin (= the CP's
+#                                         LOCAL_TENANT_URL_TEMPLATE); doTenantJSON sends an Origin,
+#                                         so this must be byte-identical or gin-contrib/cors 403s
+#   E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1     lets validateStagingCPBase accept the http loopback CP base
+#
+# All three create their OWN throwaway org (e2eSlug) with t.Cleanup admin-DELETE
+# teardown, isolated from the happy-path org and each other — and the whole CP is
+# a disposable dind that dies at gate end, so no run-id teardown net is needed
+# here (unlike the post-push jobs). The Go toolchain is present on this runner
+# (actions/setup-go, e2e-ephemeral-happy-path.yml). Run from workspace-server so
+# the module + go.sum resolve.
+
+# workspace_requests — TestWorkspaceCanRaiseTaskAndApprovalToUser (core#2606): a
+# NORMAL workspace mints its own token and raises a task AND an approval into the
+# org's unified pending inbox via the wsAuth POST /workspaces/:id/requests path.
+# SECRET-FREE on the loopback CP: it lands request ROWS and polls the org pending
+# view — it never waits for the workspace to boot online, so no runtime image or
+# platform model is required. Mirrors e2e-staging-saas.yml job
+# `E2E Staging SaaS / workspace-requests`.
+run_scenario_workspace_requests() {
+  echo "[proof][extra] workspace_requests (core#2606: a normal workspace raises task+approval to the user's unified inbox via wsAuth) against the ephemeral CP..." >&2
+  # requireStagingEnv reads CP_BASE_URL + CP_ADMIN_API_TOKEN from the ENVIRONMENT,
+  # so export the two standing shell vars into the subshell (they are already set
+  # by boot_cp) — a `go test` exec only inherits EXPORTED vars. Do NOT re-assign
+  # them in the env-prefix below: assigning a var AND expanding the same name in
+  # one simple command is SC2097/SC2098 (the expansion would see the outer, not
+  # the just-assigned, value). Exporting first, then expanding, is warning-clean.
+  ( cd "$HERE/../../workspace-server" && \
+    export CP_BASE_URL CP_ADMIN_API_TOKEN && \
+    STAGING_E2E=1 \
+    MOLECULE_TENANT_URL="${CP_BASE_URL}" \
+    MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
+    MOLECULE_TENANT_ORIGIN_TEMPLATE="${TENANT_PUBLIC_URL_TEMPLATE}" \
+    MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+    E2E_INFRA_BACKEND=local-docker \
+    E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+      go test -tags staging_e2e ./internal/staginge2e/ -run TestWorkspaceCanRaiseTaskAndApprovalToUser -count=1 -v -timeout 30m )
+}
+
+# concierge_platform_agent — TestConciergePlatformAgent_Staging: platform-agent
+# install + /org/identity, kind on the workspace API, discovery-peers admin-auth
+# regression guard, BYOK billing-mode round-trip, and the concierge config-tab
+# auth sweep. SECRET-FREE on the loopback CP: every assertion is DB/handler state
+# — the test deliberately does NOT wait for the concierge or the ordinary
+# workspace to boot online (concierge_platform_test.go), so no runtime image or
+# platform model is needed. This is the DB-level HALF; the mgmt-MCP present+
+# callable half (TestPlatformAgentMgmtMCP_Staging) requires a real concierge boot
+# and belongs with the real-runtime matrix (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX) —
+# it is intentionally NOT wired here. Mirrors e2e-staging-saas.yml job
+# `E2E Staging Concierge Platform Agent` (its first go-test step only).
+run_scenario_concierge_platform_agent() {
+  echo "[proof][extra] concierge_platform_agent (platform-agent install + identity, kind, discovery-peers authz, BYOK billing round-trip, config-tab auth — DB/handler state, no boot) against the ephemeral CP..." >&2
+  # See run_scenario_workspace_requests for the export-then-expand rationale
+  # (requireStagingEnv reads CP_BASE_URL + CP_ADMIN_API_TOKEN from the env; a bare
+  # env-prefix reassignment of those names would trip SC2097/SC2098).
+  ( cd "$HERE/../../workspace-server" && \
+    export CP_BASE_URL CP_ADMIN_API_TOKEN && \
+    STAGING_E2E=1 \
+    MOLECULE_TENANT_URL="${CP_BASE_URL}" \
+    MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
+    MOLECULE_TENANT_ORIGIN_TEMPLATE="${TENANT_PUBLIC_URL_TEMPLATE}" \
+    MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+    E2E_INFRA_BACKEND=local-docker \
+    E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+      go test -tags staging_e2e ./internal/staginge2e/ -run TestConciergePlatformAgent_Staging -count=1 -v -timeout 35m )
+}
+
+# plugin_install_lifecycle — TestPluginInstallLifecycle_Staging: registry is
+# non-empty, install a registry plugin, ListInstalled reads it back (CP #3125
+# EIC guard), and the agent stays online across the install-triggered restart
+# (#159 mgmt-MCP self-heal). UNLIKE the two above, this REALLY BOOTS a workspace
+# — Step 3 waits for online+routable, Step 4 waits for the post-install
+# restart→online — so it needs one real runtime container + a keyed platform
+# model. That is exactly the real-workspace path the happy-path (E2E_MODE=full)
+# already stands up on this CP (seeded hermes template + the CP's MINIMAX_API_KEY
+# platform proxy), so it runs here WITHOUT the multi-runtime matrix flag (it uses
+# only the single default RUNTIME=hermes image, not matrix_runtimes()). Kept
+# advisory: it is the heaviest of the three (a real cold boot + restart), so it
+# soaks for determinism before it can gate. Mirrors e2e-staging-saas.yml job
+# `E2E Staging Plugin Install Lifecycle`.
+run_scenario_plugin_install_lifecycle() {
+  echo "[proof][extra] plugin_install_lifecycle (registry non-empty -> install -> ListInstalled reads back -> agent stays online across the install restart; REAL workspace boot) against the ephemeral CP..." >&2
+  # See run_scenario_workspace_requests for the export-then-expand rationale
+  # (requireStagingEnv reads CP_BASE_URL + CP_ADMIN_API_TOKEN from the env; a bare
+  # env-prefix reassignment of those names would trip SC2097/SC2098).
+  ( cd "$HERE/../../workspace-server" && \
+    export CP_BASE_URL CP_ADMIN_API_TOKEN && \
+    STAGING_E2E=1 \
+    MOLECULE_TENANT_URL="${CP_BASE_URL}" \
+    MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
+    MOLECULE_TENANT_ORIGIN_TEMPLATE="${TENANT_PUBLIC_URL_TEMPLATE}" \
+    MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+    E2E_INFRA_BACKEND=local-docker \
+    E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+      go test -tags staging_e2e ./internal/staginge2e/ -run TestPluginInstallLifecycle_Staging -count=1 -v -timeout 55m )
+}
+
 # Dispatch one extra-scenario key to its runner. An UNKNOWN key is a hard error,
 # never a silent skip: a typo in E2E_EPHEMERAL_EXTRA_SCENARIOS that quietly ran
 # nothing would be the exact vacuous-green this gate exists to abolish.
@@ -864,6 +972,9 @@ run_one_extra_scenario() {
     external_runtime) run_scenario_external_runtime; rc=$? ;;
     reconciler_heals_terminated) run_scenario_reconciler_heals_terminated; rc=$? ;;
     peer_visibility) run_scenario_peer_visibility; rc=$? ;;
+    workspace_requests) run_scenario_workspace_requests; rc=$? ;;
+    concierge_platform_agent) run_scenario_concierge_platform_agent; rc=$? ;;
+    plugin_install_lifecycle) run_scenario_plugin_install_lifecycle; rc=$? ;;
     *) echo "[proof][extra] ❌ unknown extra scenario '$1' — check E2E_EPHEMERAL_EXTRA_SCENARIOS" >&2; return "$EXTRA_MISCONFIG_RC" ;;
   esac
   # A known scenario must never masquerade as the misconfig sentinel.

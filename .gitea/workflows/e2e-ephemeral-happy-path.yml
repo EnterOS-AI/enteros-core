@@ -365,13 +365,22 @@ jobs:
           # come from the "Start disposable dind" step via GITHUB_ENV.
           EPHEMERAL_DIND: "1"
           # RFC #86 — pull the post-push staging lanes LEFT onto this per-PR gate,
-          # one at a time. `concierge_user_tasks` is first: it needs only the CP +
-          # API (external workspaces, no LLM/image), so it is the cheapest lane to
-          # move. ADVISORY=1 during the soak — it RUNS every PR (non-vacuous) but a
-          # failure does not block merge yet. Flip ADVISORY to 0 (and retire the
-          # matching post-push job in e2e-staging-saas.yml) once it has soaked
-          # green across a run of PRs.
-          E2E_EPHEMERAL_EXTRA_SCENARIOS: concierge_user_tasks,concierge_creates_workspace,external_runtime,reconciler_heals_terminated,peer_visibility
+          # one at a time. `concierge_user_tasks` was first: it needs only the CP +
+          # API (external workspaces, no LLM/image), so it was the cheapest lane to
+          # move. The last three (workspace_requests, concierge_platform_agent,
+          # plugin_install_lifecycle) are the go-staging-test lanes — they shell out
+          # to the topology-aware Go harness (#4525) instead of a test_*.sh; the
+          # first two are DB/handler-level (secret-free), plugin_install_lifecycle
+          # really boots one workspace (the same real-workspace path the happy path
+          # already stands up). ADVISORY=1 during the soak — every scenario RUNS
+          # every PR (non-vacuous) but a failure does not block merge yet. Flip
+          # ADVISORY to 0 (and retire the matching post-push job in
+          # e2e-staging-saas.yml) once a scenario has soaked green across a run of
+          # PRs. NOTE: the mgmt-MCP present+callable half of the concierge lane
+          # (TestPlatformAgentMgmtMCP_Staging) needs a real concierge boot and is
+          # intentionally deferred to the real-runtime matrix
+          # (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX, default-off), not wired here.
+          E2E_EPHEMERAL_EXTRA_SCENARIOS: concierge_user_tasks,concierge_creates_workspace,external_runtime,reconciler_heals_terminated,peer_visibility,workspace_requests,concierge_platform_agent,plugin_install_lifecycle
           E2E_EPHEMERAL_EXTRA_ADVISORY: "1"
         run: |
           bash tests/e2e/ephemeral_cp_happy_path.sh
