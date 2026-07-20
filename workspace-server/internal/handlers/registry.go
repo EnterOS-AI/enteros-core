@@ -1372,6 +1372,17 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// an older image that omits the field), while an explicit true/false is
 	// trusted verbatim — the self-healing successor to the active_tasks>0 proxy.
 	// The bind is the last positional arg in each branch.
+	//
+	// Test-only busy-inject seam (task #92): testBusyActiveTasksHook is nil in
+	// every shipped build (testbusy_disabled.go), so activeTasks is exactly
+	// payload.ActiveTasks and this is behaviour-identical to before. Under the
+	// e2e_busy_inject build tag it raises the persisted count to an injected
+	// floor so the ephemeral gate's 10b force-hibernate hits a genuinely busy
+	// workspace. See testbusy.go.
+	activeTasks := payload.ActiveTasks
+	if testBusyActiveTasksHook != nil {
+		activeTasks = testBusyActiveTasksHook(payload.WorkspaceID, activeTasks)
+	}
 	var err error
 	if payload.MonthlySpend > 0 {
 		_, err = db.DB.ExecContext(ctx, `
@@ -1394,7 +1405,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed'
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
-			payload.ActiveTasks, payload.UptimeSeconds, payload.CurrentTask,
+			activeTasks, payload.UptimeSeconds, payload.CurrentTask,
 			payload.MonthlySpend, payload.IsBusy)
 	} else {
 		_, err = db.DB.ExecContext(ctx, `
@@ -1416,7 +1427,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed'
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
-			payload.ActiveTasks, payload.UptimeSeconds, payload.CurrentTask,
+			activeTasks, payload.UptimeSeconds, payload.CurrentTask,
 			payload.IsBusy)
 	}
 	if err != nil {

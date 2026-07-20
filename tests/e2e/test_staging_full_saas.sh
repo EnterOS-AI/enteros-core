@@ -2503,20 +2503,79 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   # step now PROVES the fix by driving a genuinely busy workspace first.
   #
   # active_tasks is heartbeat-fed (the agent self-reports its in-flight turn count
-  # every ~30s; there is no synchronous server lever), so making the workspace busy
-  # means driving a real long turn and polling until the DB reflects it. That drive
-  # is best-effort by nature. CAPTURE-FIRST / SOAK-TO-ENFORCE (task #92): when the
-  # workspace is provably busy we run the strict force-coverage assertions (a)+(b);
-  # when we cannot establish busy within the bound we LOG LOUD and fall back to the
-  # idle force-hibernate (still a valid transition, just not force-coverage). Once
-  # the busy-drive is shown reliable across the gate soak, set
-  # E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 to make a failed drive a hard red.
+  # every ~30s). Two ways to make the workspace busy, selected by E2E_BUSY_INJECT:
+  #
+  #   * E2E_BUSY_INJECT=1 (the ephemeral gate — task #92): the tenant image is
+  #     built with `-tags e2e_busy_inject`, which exposes POST
+  #     /workspaces/:id/test-busy. It pins active_tasks to a floor synchronously
+  #     (and holds it across heartbeats), so busy is DETERMINISTIC without a real
+  #     LLM turn. This route exists ONLY in the tag-built throwaway tenant image;
+  #     it is absent (404) from every shipped/staging binary. A non-busy 10b under
+  #     this mode is a hard red (see E2E_HIBERNATE_FORCE_BUSY_REQUIRED below).
+  #
+  #   * default (staging lanes, untagged images): drive a real long turn and poll
+  #     until the DB reflects it — best-effort by nature. CAPTURE-FIRST /
+  #     SOAK-TO-ENFORCE: when provably busy we run the strict force-coverage
+  #     assertions (a)+(b); otherwise we LOG LOUD and fall back to the idle
+  #     force-hibernate (a valid transition, not force-coverage) unless
+  #     E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 makes a failed drive fatal.
+
+  # Deterministic busy via the test-only inject route (E2E_BUSY_INJECT=1). Pins
+  # active_tasks=1 in the same DB column the hibernate 409 guard + atomic claim
+  # read, then confirms GET reflects it. Returns 0 iff active_tasks>0 was
+  # established. A 404 here means the tenant image was NOT built with the
+  # e2e_busy_inject tag — a wiring error the operator must fix, not a soft skip.
+  _hib_busy_inject() {
+    local bi_tmp bi_code cur deadline
+    bi_tmp=$(mktemp -t hib_inject.XXXXXX)
+    set +e
+    bi_code=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/test-busy" --max-time 20 \
+      -H "Content-Type: application/json" -d '{"active_tasks":1,"is_busy":true}' \
+      -o "$bi_tmp" -w '%{http_code}' 2>/dev/null)
+    set -e
+    bi_code=${bi_code:-000}
+    if [ "$bi_code" != "200" ]; then
+      log "    busy-inject: POST /test-busy → http=$bi_code (expected 200). If 404, the tenant image lacks -tags e2e_busy_inject. Body: $(cat "$bi_tmp" 2>/dev/null | sanitize_http_body | head -c 200)"
+      rm -f "$bi_tmp"
+      return 1
+    fi
+    rm -f "$bi_tmp"
+    # Confirm the DB reflects it. The sticky floor keeps active_tasks>=1 across
+    # heartbeats, so a single confirming read is sufficient and stable.
+    deadline=$(( $(date +%s) + 30 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      cur=$(tenant_call GET "/workspaces/$LIFECYCLE_WS" 2>/dev/null \
+        | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('active_tasks') or 0))" 2>/dev/null || echo 0)
+      log "    busy-inject poll: active_tasks=${cur:-?} (want >0)"
+      if [ "${cur:-0}" -gt 0 ] 2>/dev/null; then
+        log "    active_tasks=$cur — workspace is busy via test-inject (deterministic)"
+        return 0
+      fi
+      sleep 3
+    done
+    return 1
+  }
+
+  # Release a previously-injected hold so post-wake heartbeats stop reporting busy
+  # (the sticky floor would otherwise re-raise active_tasks after the workspace
+  # wakes). No-op / harmless when the route is absent.
+  _hib_busy_release() {
+    tenant_call POST "/workspaces/$LIFECYCLE_WS/test-busy" --max-time 20 \
+      -H "Content-Type: application/json" -d '{"active_tasks":0}' \
+      -o /dev/null -w '' 2>/dev/null || true
+    log "    busy-inject: released active_tasks hold"
+  }
 
   # Drive a long, model-independent in-flight turn WITHOUT draining the queue, so
   # the turn stays live while we fire the two hibernate calls. Returns 0 once
   # GET /workspaces/:id reports active_tasks>0 (the same column the handler's 409
   # guard and atomic claim read — so the witness and the decision agree).
   _hib_busy_drive() {
+    # Deterministic path first when the gate armed it.
+    if [ "${E2E_BUSY_INJECT:-0}" = "1" ]; then
+      _hib_busy_inject && return 0
+      return 1
+    fi
     local sleep_secs="${E2E_HIBERNATE_BUSY_SLEEP_SECS:-180}"
     local wait_secs="${E2E_HIBERNATE_BUSY_WAIT_SECS:-150}"
     local busy_payload deadline cur bd_tmp bd_code bd_qid bd_attempt
@@ -2613,6 +2672,11 @@ print(json.dumps({
     [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(busy,force): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
     wait_status "hibernated" 120 "hibernate-force-busy" || fail "Hibernate(busy,force): workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) after force on a BUSY workspace — core#4293 regression: force must drop the active_tasks=0 claim predicate, terminate the in-flight task, and stop the container, not no-op to a lying 200."
     ok "    force hibernate on BUSY ws → hibernated (DB-verified; core#4293 covered)"
+    # Release any injected busy hold now that the force-on-busy assertions passed,
+    # so the workspace can wake IDLE below (the sticky floor would otherwise
+    # re-raise active_tasks on the post-wake heartbeats). No-op under the
+    # real-turn drive (the route is absent / the hold was never set).
+    if [ "${E2E_BUSY_INJECT:-0}" = "1" ]; then _hib_busy_release; fi
   else
     # Busy-drive did not establish active_tasks>0 within the bound. Under the soak
     # default this is a LOUD non-fatal fallback (the run still exercises the idle

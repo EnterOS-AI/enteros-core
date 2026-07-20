@@ -294,6 +294,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// to 'hibernated'. The workspace auto-wakes on the next A2A message.
 		wsAuth.POST("/hibernate", wh.Hibernate)
 
+		// Test-only busy-inject (task #92). Compiled ONLY under the
+		// e2e_busy_inject build tag — a no-op stub in every shipped image
+		// (testbusy_disabled.go), so no route is registered and the path 404s in
+		// production. The tag-built throwaway tenant image the ephemeral CP gate
+		// uses gets POST /workspaces/:id/test-busy, which pins active_tasks so
+		// 10b force-hibernate deterministically hits a BUSY workspace without a
+		// real LLM turn. WorkspaceAuth (this group) is the request-time guard.
+		handlers.RegisterTestBusyRoutes(wsAuth)
+
 		// Broadcast — send a message to all non-removed workspaces in the org.
 		// Requires broadcast_enabled=true on the source workspace (checked
 		// inside the handler). WorkspaceAuth on wsAuth proves token ownership.
