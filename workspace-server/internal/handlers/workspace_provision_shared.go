@@ -348,14 +348,30 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		return nil, abort
 	}
 
-	// RFC molecule-core#4413: declare the install:default native plugins
-	// (scheduler + idle-digest providers) on this workspace, from the SDK
-	// native-plugins registry SSOT. Placed AFTER every provision abort gate so a
-	// provision that fails a preflight never records orphan declared-plugin rows.
-	// Flag-gated (default off) so merging is byte-identical to today; the owner
-	// arms it during the fleet rollout once the runtime loaders are live.
-	// Non-fatal and idempotent — runs on every provision path (create/restart/
-	// resume) and never blocks provisioning.
+	// The SCHEDULER is a BASE per-workspace ability, declared UNCONDITIONALLY on
+	// every workspace at provision (not flag-gated). The one molecule-scheduler
+	// plugin ships BOTH halves of self-scheduling — the firing trigger daemon AND
+	// the self-audience self-schedule MCP tool (plugin-mcp-audience-contract
+	// self-schedule v1). The tool CANNOT be declared on-demand the way the daemon
+	// alone was (ensureSchedulerPluginDeclared on schedule-create): you need the
+	// tool to create the first schedule. So every workspace gets it up front — which
+	// is also what the native-plugins registry already intends ("the scheduler is
+	// default-on-every-workspace"). The org-manage side stays on the concierge
+	// management MCP (install:concierge, org key) — never this every-workspace
+	// plugin. Non-fatal + idempotent (recordDeclaredPlugin upserts); placed AFTER
+	// every provision abort gate so a failed preflight records no orphan rows.
+	if err := ensureSchedulerPluginDeclared(ctx, workspaceID); err != nil {
+		log.Printf("provision: declare scheduler plugin for %s (non-fatal): %v", workspaceID, err)
+	}
+
+	// RFC molecule-core#4413: declare the OTHER install:default native plugins
+	// (the idle-digest providers) on this workspace, from the SDK native-plugins
+	// registry SSOT. Placed AFTER every provision abort gate so a failed preflight
+	// records no orphan rows. Still FLAG-gated (default off) — the owner arms it
+	// during the fleet rollout once the runtime digest loaders are live; the
+	// scheduler above is intentionally NOT gated (base ability), so it re-declaring
+	// the scheduler here when the flag is on is a harmless idempotent no-op.
+	// Non-fatal and idempotent — runs on every provision path (create/restart/resume).
 	declareDefaultNativePlugins(ctx, workspaceID)
 
 	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, workspaceSecretKeys, pluginsPath)
