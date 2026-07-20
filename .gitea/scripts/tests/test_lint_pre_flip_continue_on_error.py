@@ -350,9 +350,14 @@ class TestVerifyFlip(unittest.TestCase):
         self.assertEqual(len(verdict["fail_runs"]), 1)
         self.assertIn("log unavailable", verdict["fail_runs"][0]["samples"][0])
 
-    def test_zero_runs_history_blocks(self):
-        # No commits with a matching context — cannot verify the flip.
-        # Fail-closed: treat as masked rather than allowing.
+    def test_zero_runs_history_allows_with_warning(self):
+        # #107: commits exist but NONE carry a matching-context run (a dormant
+        # push-only lane, a workflow_dispatch-only cron, or a paths-filtered job
+        # whose paths were not touched). A zero-run job cannot be MASKING a
+        # failure — there is nothing to mask — so the flip is ALLOWED with a
+        # ::warning::, per the documented "no run history → warn + allow" intent.
+        # (Negative control: before the #107 fix this appended to masked_runs and
+        # blocked — see git history of verify_flip's checked_commits==0 branch.)
         with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1", "sha2"]):
             with mock.patch.object(
                 lpfc, "combined_status",
@@ -361,8 +366,9 @@ class TestVerifyFlip(unittest.TestCase):
                 verdict = lpfc.verify_flip(FLIP_FIXTURE, "main", 5)
         self.assertEqual(verdict["checked_commits"], 0)
         self.assertEqual(verdict["fail_runs"], [])
-        self.assertEqual(len(verdict["masked_runs"]), 1)
-        self.assertIn("cannot verify flip", verdict["masked_runs"][0]["samples"][0])
+        self.assertEqual(verdict["masked_runs"], [])          # NOT blocked
+        self.assertEqual(len(verdict["warnings"]), 1)         # allowed, but surfaced
+        self.assertIn("allowing flip", verdict["warnings"][0])
 
     def test_zero_commits_blocks(self):
         # Empty branch (newly created repo, e.g.). Fail-closed: block.
@@ -384,8 +390,11 @@ class TestVerifyFlip(unittest.TestCase):
                 verdict = lpfc.verify_flip(FLIP_FIXTURE, "main", 5)
         self.assertEqual(verdict["checked_commits"], 0)
         self.assertEqual(verdict["fail_runs"], [])
-        # One masked_run from the ApiError, one from zero checked_commits.
-        self.assertEqual(len(verdict["masked_runs"]), 2)
+        # The ApiError itself is a hard fail-closed masked_run (an UNREADABLE
+        # status is different from a verified-zero-run job — we cannot say it is
+        # clean, so it must still block). The trailing checked_commits==0 goes to
+        # warnings (#107), so masked_runs holds exactly the ApiError entry.
+        self.assertEqual(len(verdict["masked_runs"]), 1)
         self.assertIn("API error", verdict["masked_runs"][0]["samples"][0])
 
 
@@ -514,6 +523,294 @@ class TestContextName(unittest.TestCase):
             lpfc.workflow_name(doc, fallback="my-workflow"),
             "my-workflow",
         )
+
+
+# --------------------------------------------------------------------------
+# 7. #106 — PAGINATED per-commit statuses (combined /status caps at 30)
+# --------------------------------------------------------------------------
+class TestPaginatedCommitStatuses(unittest.TestCase):
+    """all_commit_statuses() must walk the paginated /statuses endpoint and
+    surface EVERY context, including ones that sort past the 30-entry cap of
+    the combined /status endpoint (#106). Negative-controlled: the old
+    un-paginated fetch (a single page / the 30-capped combined endpoint) would
+    NOT contain a context at position 40, so this test reds against it.
+    """
+
+    #: 60 contexts: ctx-00 .. ctx-59, each a success entry.
+    NUM_CONTEXTS = 60
+
+    def _paged_api(self):
+        """Return a fake `api()` that serves the 60 contexts across pages of
+        STATUS_PAGE_LIMIT, recording which pages were requested."""
+        all_entries = [
+            {"context": f"ctx-{i:02d}", "status": "success",
+             "target_url": f"/o/r/actions/runs/{i}/jobs/0",
+             "updated_at": f"2026-07-20T00:{i:02d}:00Z", "id": i}
+            for i in range(self.NUM_CONTEXTS)
+        ]
+        pages_seen = []
+
+        def fake_api(method, path, *, body=None, query=None):
+            self.assertEqual(method, "GET")
+            self.assertIn("/statuses", path)
+            page = int((query or {}).get("page", "1"))
+            limit = int((query or {}).get("limit", str(lpfc.STATUS_PAGE_LIMIT)))
+            pages_seen.append(page)
+            start = (page - 1) * limit
+            return 200, all_entries[start:start + limit]
+
+        return fake_api, pages_seen, all_entries
+
+    def test_reads_context_beyond_position_30(self):
+        fake_api, pages_seen, all_entries = self._paged_api()
+        with mock.patch.object(lpfc, "api", side_effect=fake_api):
+            out = lpfc.all_commit_statuses("deadbeef")
+        contexts = {s["context"] for s in out}
+        # The whole point of #106: a context at position 40 (past the 30 cap)
+        # must be present.
+        self.assertIn("ctx-40", contexts)
+        # And one that only exists on page 2 (position 55 with limit 50) — this
+        # proves the pagination LOOP ran, not just a single wide page.
+        self.assertIn("ctx-55", contexts)
+        self.assertEqual(len(contexts), self.NUM_CONTEXTS)
+        # More than one page was fetched.
+        self.assertIn(2, pages_seen)
+
+        # NEGATIVE CONTROL: the old un-paginated fetch returned only the first
+        # 30 (combined /status cap). Prove ctx-40 is genuinely unreachable that
+        # way, so the assertion above is load-bearing and would red against the
+        # pre-fix code.
+        old_capped = {s["context"] for s in all_entries[:30]}
+        self.assertNotIn("ctx-40", old_capped)
+
+    def test_stops_on_short_first_page(self):
+        # Fewer than a full page → exactly one request, no needless page 2.
+        entries = [{"context": f"c{i}", "status": "success",
+                    "target_url": "", "updated_at": f"t{i}", "id": i}
+                   for i in range(5)]
+        calls = []
+
+        def fake_api(method, path, *, body=None, query=None):
+            calls.append((query or {}).get("page"))
+            return 200, entries
+
+        with mock.patch.object(lpfc, "api", side_effect=fake_api):
+            out = lpfc.all_commit_statuses("sha")
+        self.assertEqual(len(out), 5)
+        self.assertEqual(calls, ["1"])  # only page 1
+
+    def test_latest_per_context_dedup(self):
+        # The /statuses list endpoint returns ALL historical statuses, NOT
+        # newest-first. Reduce to latest-per-context by updated_at so a stale
+        # `pending` never shadows a later `success`.
+        entries = [
+            {"context": "CI / X (push)", "status": "pending",
+             "target_url": "/a", "updated_at": "2026-07-20T00:00:00Z", "id": 1},
+            {"context": "CI / X (push)", "status": "success",
+             "target_url": "/b", "updated_at": "2026-07-20T00:05:00Z", "id": 2},
+        ]
+
+        def fake_api(method, path, *, body=None, query=None):
+            return 200, entries
+
+        with mock.patch.object(lpfc, "api", side_effect=fake_api):
+            out = lpfc.all_commit_statuses("sha")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["status"], "success")
+        self.assertEqual(out[0]["target_url"], "/b")
+
+    def test_non_list_body_raises(self):
+        def fake_api(method, path, *, body=None, query=None):
+            return 200, {"not": "a list"}
+
+        with mock.patch.object(lpfc, "api", side_effect=fake_api):
+            with self.assertRaises(lpfc.ApiError):
+                lpfc.all_commit_statuses("sha")
+
+
+# --------------------------------------------------------------------------
+# 8. #107 — paths-filtered workflows accept pull_request evidence
+# --------------------------------------------------------------------------
+class TestWorkflowIsPathsFiltered(unittest.TestCase):
+    def test_push_paths_is_filtered(self):
+        # Bare `on:` — PyYAML parses the key as the boolean True; the helper
+        # must still find the trigger config.
+        doc = lpfc.yaml.safe_load(
+            "name: WF\non:\n  push:\n    branches: [main]\n    paths: ['x/**']\n"
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertTrue(lpfc.workflow_is_paths_filtered(doc))
+
+    def test_pull_request_paths_ignore_is_filtered(self):
+        doc = lpfc.yaml.safe_load(
+            "name: WF\non:\n  pull_request:\n    paths-ignore: ['docs/**']\n"
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertTrue(lpfc.workflow_is_paths_filtered(doc))
+
+    def test_no_paths_is_not_filtered(self):
+        doc = lpfc.yaml.safe_load(
+            "name: WF\non:\n  push:\n    branches: [main]\n"
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertFalse(lpfc.workflow_is_paths_filtered(doc))
+
+    def test_on_as_list_is_not_filtered(self):
+        doc = lpfc.yaml.safe_load(
+            "name: WF\non: [push, pull_request]\n"
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertFalse(lpfc.workflow_is_paths_filtered(doc))
+
+    def test_quoted_on_key_still_works(self):
+        # If someone quotes "on": the key is the string "on" not True.
+        doc = lpfc.yaml.safe_load(
+            'name: WF\n"on":\n  push:\n    paths: [\'x/**\']\n'
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertTrue(lpfc.workflow_is_paths_filtered(doc))
+
+
+PATHS_FILTERED_BASE = """\
+name: Secret Pattern Drift
+on:
+  push:
+    branches: [main]
+    paths: ['.gitea/workflows/**']
+  pull_request:
+    paths: ['.gitea/workflows/**']
+jobs:
+  scan:
+    name: scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - run: echo scan
+"""
+
+PATHS_FILTERED_HEAD = PATHS_FILTERED_BASE.replace(
+    "continue-on-error: true", "continue-on-error: false"
+)
+
+
+class TestDetectFlipsPathsFiltered(unittest.TestCase):
+    def test_paths_filtered_flip_accepts_both_contexts(self):
+        flips = lpfc.detect_flips(
+            {".gitea/workflows/secret-pattern-drift.yml": PATHS_FILTERED_BASE},
+            {".gitea/workflows/secret-pattern-drift.yml": PATHS_FILTERED_HEAD},
+        )
+        self.assertEqual(len(flips), 1)
+        f = flips[0]
+        self.assertTrue(f["paths_filtered"])
+        self.assertEqual(
+            sorted(f["accept_contexts"]),
+            ["Secret Pattern Drift / scan (pull_request)",
+             "Secret Pattern Drift / scan (push)"],
+        )
+        # Back-compat: the primary context is still the push one.
+        self.assertEqual(f["context"], "Secret Pattern Drift / scan (push)")
+
+    def test_non_paths_filtered_flip_accepts_only_push(self):
+        flips = lpfc.detect_flips(
+            {".gitea/workflows/ci.yml": CI_YML_BASE},
+            {".gitea/workflows/ci.yml": CI_YML_HEAD_FLIPPED},
+        )
+        for f in flips:
+            self.assertFalse(f["paths_filtered"])
+            self.assertEqual(f["accept_contexts"], [f["context"]])
+
+
+PATHS_FLIP_FIXTURE = {
+    "workflow_path": ".gitea/workflows/secret-pattern-drift.yml",
+    "workflow_name": "Secret Pattern Drift",
+    "job_key": "scan",
+    "job_name": "scan",
+    "context": "Secret Pattern Drift / scan (push)",
+    "accept_contexts": [
+        "Secret Pattern Drift / scan (push)",
+        "Secret Pattern Drift / scan (pull_request)",
+    ],
+    "paths_filtered": True,
+}
+
+
+class TestVerifyFlipPathsFiltered(unittest.TestCase):
+    def test_pr_only_green_run_blesses_flip(self):
+        # #107 catch-22 resolution: a paths-filtered workflow never fires on a
+        # main PUSH, so only a pull_request context exists on recent commits.
+        # A green PR run with a clean log MUST now bless the flip.
+        pr_ctx = "Secret Pattern Drift / scan (pull_request)"
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1"]):
+            with mock.patch.object(
+                lpfc, "combined_status",
+                return_value=_stub_status(pr_ctx, "success"),
+            ):
+                with mock.patch.object(lpfc, "fetch_log", return_value="PASS\nok\n"):
+                    verdict = lpfc.verify_flip(PATHS_FLIP_FIXTURE, "main", 5)
+        self.assertEqual(verdict["checked_commits"], 1)
+        self.assertEqual(verdict["fail_runs"], [])
+        self.assertEqual(verdict["masked_runs"], [])
+
+    def test_pr_run_with_masked_log_still_blocks(self):
+        # Safety preserved: a PR-event run whose log shows --- FAIL despite a
+        # success status is still a Quirk #10 mask → block.
+        pr_ctx = "Secret Pattern Drift / scan (pull_request)"
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1"]):
+            with mock.patch.object(
+                lpfc, "combined_status",
+                return_value=_stub_status(pr_ctx, "success"),
+            ):
+                with mock.patch.object(
+                    lpfc, "fetch_log",
+                    return_value="--- FAIL: TestSecretScan (0.01s)\n",
+                ):
+                    verdict = lpfc.verify_flip(PATHS_FLIP_FIXTURE, "main", 5)
+        self.assertEqual(len(verdict["masked_runs"]), 1)
+        self.assertTrue(any("TestSecretScan" in s for s in verdict["masked_runs"][0]["samples"]))
+
+    def test_both_contexts_on_one_commit_masked_pr_blocks(self):
+        # A commit carries BOTH a clean push context AND a masked pull_request
+        # context. We must NOT stop at the first (clean push) match — the
+        # masked PR run has to block. Proves the removed `break`.
+        push_ctx = "Secret Pattern Drift / scan (push)"
+        pr_ctx = "Secret Pattern Drift / scan (pull_request)"
+        both = {
+            "state": "success",
+            "statuses": [
+                {"context": push_ctx, "status": "success",
+                 "target_url": "/o/r/actions/runs/1/jobs/0"},
+                {"context": pr_ctx, "status": "success",
+                 "target_url": "/o/r/actions/runs/2/jobs/0"},
+            ],
+        }
+        # push log clean, PR log masked.
+        logs = {"/o/r/actions/runs/1/jobs/0": "PASS\n",
+                "/o/r/actions/runs/2/jobs/0": "--- FAIL: TestX\n"}
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1"]):
+            with mock.patch.object(lpfc, "combined_status", return_value=both):
+                with mock.patch.object(
+                    lpfc, "fetch_log",
+                    side_effect=lambda url: logs[url],
+                ):
+                    verdict = lpfc.verify_flip(PATHS_FLIP_FIXTURE, "main", 5)
+        self.assertEqual(verdict["checked_commits"], 2)  # both contexts evaluated
+        self.assertEqual(len(verdict["masked_runs"]), 1)
+        self.assertTrue(any("TestX" in s for s in verdict["masked_runs"][0]["samples"]))
+
+    def test_zero_runs_message_names_all_accept_contexts(self):
+        # #107: a paths-filtered flip with no matching runs is ALLOWED (warning),
+        # and the warning must name every accepted context so the reader can see
+        # both the push and pull_request contexts were checked.
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1"]):
+            with mock.patch.object(
+                lpfc, "combined_status",
+                return_value={"state": "success", "statuses": []},
+            ):
+                verdict = lpfc.verify_flip(PATHS_FLIP_FIXTURE, "main", 5)
+        self.assertEqual(verdict["masked_runs"], [])          # allowed, not blocked
+        msg = verdict["warnings"][0]
+        self.assertIn("pull_request", msg)
+        self.assertIn("allowing flip", msg)
 
 
 if __name__ == "__main__":
