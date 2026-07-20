@@ -350,9 +350,14 @@ class TestVerifyFlip(unittest.TestCase):
         self.assertEqual(len(verdict["fail_runs"]), 1)
         self.assertIn("log unavailable", verdict["fail_runs"][0]["samples"][0])
 
-    def test_zero_runs_history_blocks(self):
-        # No commits with a matching context — cannot verify the flip.
-        # Fail-closed: treat as masked rather than allowing.
+    def test_zero_runs_history_allows_with_warning(self):
+        # #107: commits exist but NONE carry a matching-context run (a dormant
+        # push-only lane, a workflow_dispatch-only cron, or a paths-filtered job
+        # whose paths were not touched). A zero-run job cannot be MASKING a
+        # failure — there is nothing to mask — so the flip is ALLOWED with a
+        # ::warning::, per the documented "no run history → warn + allow" intent.
+        # (Negative control: before the #107 fix this appended to masked_runs and
+        # blocked — see git history of verify_flip's checked_commits==0 branch.)
         with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1", "sha2"]):
             with mock.patch.object(
                 lpfc, "combined_status",
@@ -361,8 +366,9 @@ class TestVerifyFlip(unittest.TestCase):
                 verdict = lpfc.verify_flip(FLIP_FIXTURE, "main", 5)
         self.assertEqual(verdict["checked_commits"], 0)
         self.assertEqual(verdict["fail_runs"], [])
-        self.assertEqual(len(verdict["masked_runs"]), 1)
-        self.assertIn("cannot verify flip", verdict["masked_runs"][0]["samples"][0])
+        self.assertEqual(verdict["masked_runs"], [])          # NOT blocked
+        self.assertEqual(len(verdict["warnings"]), 1)         # allowed, but surfaced
+        self.assertIn("allowing flip", verdict["warnings"][0])
 
     def test_zero_commits_blocks(self):
         # Empty branch (newly created repo, e.g.). Fail-closed: block.
@@ -384,8 +390,11 @@ class TestVerifyFlip(unittest.TestCase):
                 verdict = lpfc.verify_flip(FLIP_FIXTURE, "main", 5)
         self.assertEqual(verdict["checked_commits"], 0)
         self.assertEqual(verdict["fail_runs"], [])
-        # One masked_run from the ApiError, one from zero checked_commits.
-        self.assertEqual(len(verdict["masked_runs"]), 2)
+        # The ApiError itself is a hard fail-closed masked_run (an UNREADABLE
+        # status is different from a verified-zero-run job — we cannot say it is
+        # clean, so it must still block). The trailing checked_commits==0 goes to
+        # warnings (#107), so masked_runs holds exactly the ApiError entry.
+        self.assertEqual(len(verdict["masked_runs"]), 1)
         self.assertIn("API error", verdict["masked_runs"][0]["samples"][0])
 
 
@@ -789,15 +798,19 @@ class TestVerifyFlipPathsFiltered(unittest.TestCase):
         self.assertTrue(any("TestX" in s for s in verdict["masked_runs"][0]["samples"]))
 
     def test_zero_runs_message_names_all_accept_contexts(self):
+        # #107: a paths-filtered flip with no matching runs is ALLOWED (warning),
+        # and the warning must name every accepted context so the reader can see
+        # both the push and pull_request contexts were checked.
         with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1"]):
             with mock.patch.object(
                 lpfc, "combined_status",
                 return_value={"state": "success", "statuses": []},
             ):
                 verdict = lpfc.verify_flip(PATHS_FLIP_FIXTURE, "main", 5)
-        msg = verdict["masked_runs"][0]["samples"][0]
+        self.assertEqual(verdict["masked_runs"], [])          # allowed, not blocked
+        msg = verdict["warnings"][0]
         self.assertIn("pull_request", msg)
-        self.assertIn("cannot verify flip", msg)
+        self.assertIn("allowing flip", msg)
 
 
 if __name__ == "__main__":

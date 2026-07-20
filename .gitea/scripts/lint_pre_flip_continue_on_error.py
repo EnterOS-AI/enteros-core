@@ -752,13 +752,20 @@ def verify_flip(flip: dict, branch: str, n: int) -> dict:
             # pull_request contexts on this commit are both evaluated.
 
     if result["checked_commits"] == 0:
+        # #107: no runs of any accepted context in the window. This is NOT
+        # evidence the job is red — a job with ZERO runs cannot be masking a
+        # failure (there is nothing to mask). Dormant push-only lanes,
+        # workflow_dispatch-only crons, and paths-filtered jobs whose paths were
+        # not touched recently all legitimately have no runs here. Per the
+        # documented "newly added workflow: no run history → warn + allow"
+        # intent, emit a ::warning:: and ALLOW the flip rather than fail-closed.
+        # If the job later runs red, THAT run blocks honestly (this gate is
+        # about not un-masking a KNOWN-red job; a zero-run job is not known-red).
         contexts_str = " / ".join(repr(c) for c in accept_contexts)
-        result["masked_runs"].append({
-            "sha": "",
-            "status": "unverified",
-            "target_url": "",
-            "samples": [f"no runs of {contexts_str} found in the last {n} commits on {branch} — cannot verify flip"],
-        })
+        result["warnings"].append(
+            f"no runs of {contexts_str} found in the last {n} commits on {branch} "
+            f"— nothing to verify (a zero-run job cannot mask a failure); allowing flip"
+        )
     return result
 
 
