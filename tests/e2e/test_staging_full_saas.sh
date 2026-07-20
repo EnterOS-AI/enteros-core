@@ -983,18 +983,24 @@ fi
 # + the shrunken fire interval are (idempotently) set so the digest actually arms
 # and the loader runs within the window. Additive NON-LLM env only.
 if [ "${E2E_DIGEST_PLUGIN_CHECK:-}" = "on" ]; then
+  # DECLARE the digest plugin via the DURABLE DB channel (payload.plugins →
+  # workspace_declared_plugins), NOT MOLECULE_DECLARED_PLUGINS-in-secrets. Now that
+  # the scheduler is declared on EVERY workspace, provision recomputes
+  # MOLECULE_DECLARED_PLUGINS from the declared-set SSOT and OVERWRITES any
+  # secret-injected value, so a secret-declared digest plugin silently vanishes.
+  _DIGEST_SRC="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}"
+  E2E_WS_PLUGINS="${E2E_WS_PLUGINS:-}${E2E_WS_PLUGINS:+,}$_DIGEST_SRC"
+  # The loader flag + digest arming are real runtime TOGGLES (not plugin decls), so
+  # they stay in the secret env.
   SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
 import json, os
 s = json.loads(os.environ['SECRETS_JSON_IN'])
-src = os.environ.get('E2E_DIGEST_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0')
-existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
-s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
 s['MOLECULE_DIGEST_PROVIDER_PLUGINS'] = '1'          # D1 loader flag
 s.setdefault('MOLECULE_MAILBOX_KERNEL', '1')          # ensure the idle digest arms
 s.setdefault('MOLECULE_IDLE_FIRE_SECONDS', os.environ.get('E2E_IDLE_FIRE_SECONDS', '30'))
 print(json.dumps(s))
 ")
-  log "    digest-plugin check ON: declared ${E2E_DIGEST_PLUGIN_SOURCE:-molecule-ai-plugin-digest-mail} + MOLECULE_DIGEST_PROVIDER_PLUGINS=1 (trust source = vendored registry, no NATIVE_PLUGIN_NAMES)"
+  log "    digest-plugin check ON: declared $_DIGEST_SRC via payload.plugins (durable DB channel) + MOLECULE_DIGEST_PROVIDER_PLUGINS=1 (trust source = vendored registry, no NATIVE_PLUGIN_NAMES)"
 fi
 
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
@@ -1061,6 +1067,7 @@ build_create_payload() {
   E2E_WS_TEMPLATE="$PROVISION_TEMPLATE" \
   E2E_WS_MODEL="$MODEL_SLUG" \
   E2E_WS_SECRETS="$SECRETS_JSON" \
+  E2E_WS_PLUGINS="${E2E_WS_PLUGINS:-}" \
   python3 -c "
 import json, os
 secrets = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
@@ -1070,6 +1077,14 @@ payload = {
     'model': os.environ['E2E_WS_MODEL'],
     'secrets': secrets,
 }
+# Declared plugins ride the DURABLE DB channel (CreateWorkspacePayload.Plugins →
+# workspace_declared_plugins), NOT a MOLECULE_DECLARED_PLUGINS secret: provision
+# recomputes that env from the declared-set SSOT and OVERWRITES a secret-injected
+# value (it does now that the scheduler is declared on every workspace), so a
+# secret-declared plugin would silently vanish before boot-install.
+_plugins = [p.strip() for p in os.environ.get('E2E_WS_PLUGINS', '').split(',') if p.strip()]
+if _plugins:
+    payload['plugins'] = _plugins
 tmpl = os.environ.get('E2E_WS_TEMPLATE', '')
 if tmpl:
     # Template-selected variant (seo-agent): the template's config.yaml
