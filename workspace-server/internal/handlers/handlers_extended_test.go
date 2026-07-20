@@ -49,10 +49,6 @@ func TestExtended_WorkspaceDelete(t *testing.T) {
 	mock.ExpectExec("UPDATE workspace_auth_tokens SET revoked_at").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	// #1027: cascade-disable schedules for deleted workspaces.
-	mock.ExpectExec("UPDATE workspace_schedules SET enabled = false").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-
 	// Expect RecordAndBroadcast INSERT for WORKSPACE_REMOVED
 	mock.ExpectExec("INSERT INTO structure_events").
 		WillReturnResult(sqlmock.NewResult(0, 1))

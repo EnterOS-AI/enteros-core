@@ -578,19 +578,6 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// requires an explicit X-Workspace-ID plus that workspace's source-bound
 		// bearer; verified human credentials bypass hierarchy. Issue #249.
 		r.GET("/workspaces/:id/schedules/health", schedh.Health)
-		// P3-live cutover: copy a workspace's runtime-source schedules from the
-		// core DB into its volume grid (idempotent). AdminAuth — an ops action
-		// run once per workspace after its trigger plugin goes live.
-		r.POST("/admin/workspaces/:id/schedules/migrate-to-volume", middleware.AdminAuth(db.DB), schedh.MigrateToVolume)
-		// Per-workspace scheduler delivery (P5b): declare molecule-scheduler for
-		// every workspace that already has schedules (stranded post-P4). AdminAuth;
-		// DRY-RUN by default, ?apply=true to declare + arm. One-shot remediation.
-		r.POST("/admin/schedules/backfill-plugin", middleware.AdminAuth(db.DB), schedh.BackfillSchedulerPlugin)
-		// P4b readiness + fleet migration: measure and execute the DROP
-		// precondition without touching the irreversible parts. AdminAuth.
-		// Readiness is read-only; migrate-all is DRY-RUN by default (?apply=true).
-		r.GET("/admin/schedules/p4b-readiness", middleware.AdminAuth(db.DB), schedh.P4bReadiness)
-		r.POST("/admin/schedules/migrate-all-to-volume", middleware.AdminAuth(db.DB), schedh.MigrateAllToVolume)
 
 		// Budget — per-workspace spend ceiling and current usage (#541).
 		// GET stays on wsAuth — a workspace agent reading its own budget is legitimate.
@@ -734,8 +721,6 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	{
 		asHealth := handlers.NewAdminSchedulesHealthHandler()
 		r.GET("/admin/schedules/health", middleware.AdminAuth(db.DB), asHealth.Health)
-		r.GET("/admin/schedules/orphans", middleware.AdminAuth(db.DB), asHealth.Orphans)
-		r.POST("/admin/schedules/reap-orphans", middleware.AdminAuth(db.DB), asHealth.ReapOrphans)
 	}
 
 	// Admin — stale a2a_queue cleanup (issue #1947). Marks queued items older

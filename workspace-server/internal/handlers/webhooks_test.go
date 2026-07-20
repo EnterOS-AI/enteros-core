@@ -230,10 +230,6 @@ func TestGitHubWebhook_IssuesOpened_TriggersCrons(t *testing.T) {
 		"issue": {"number": 42, "title": "New feature request", "html_url": "https://github.com/Molecule-AI/molecule-core/issues/42"}
 	}`)
 
-	// Expect the UPDATE that sets next_run_at = now() on pick-up-work schedules.
-	mock.ExpectExec("UPDATE workspace_schedules").
-		WillReturnResult(sqlmock.NewResult(0, 3))
-
 	w, c := newWebhookTestContext(t, "", body)
 	c.Request.Header.Set("X-GitHub-Event", "issues")
 	c.Request.Header.Set("X-Hub-Signature-256", githubSignature(secret, body))
@@ -301,10 +297,6 @@ func TestGitHubWebhook_PRReviewSubmitted_TriggersCrons(t *testing.T) {
 		"review": {"state": "changes_requested", "html_url": "https://github.com/Molecule-AI/molecule-core/pull/7#pullrequestreview-1"},
 		"pull_request": {"number": 7, "title": "Fix scheduler bug", "html_url": "https://github.com/Molecule-AI/molecule-core/pull/7"}
 	}`)
-
-	// Expect the UPDATE that sets next_run_at = now() on review schedules.
-	mock.ExpectExec("UPDATE workspace_schedules").
-		WillReturnResult(sqlmock.NewResult(0, 2))
 
 	w, c := newWebhookTestContext(t, "", body)
 	c.Request.Header.Set("X-GitHub-Event", "pull_request_review")
