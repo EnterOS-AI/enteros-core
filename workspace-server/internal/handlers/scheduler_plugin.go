@@ -52,32 +52,19 @@ func ensureSchedulerPluginDeclared(ctx context.Context, workspaceID string) erro
 	return recordDeclaredPlugin(ctx, workspaceID, SchedulerPluginName, SchedulerPluginSource)
 }
 
-// armSchedulerPlugin asks a RUNNING workspace to start its scheduler daemon now
-// (no restart), via the runtime hot-start endpoint. Non-fatal: any failure is
-// logged, because the daemon is also armed by the reconcile-on-online path (the
-// durable safety net). A runtime too old to expose the endpoint simply 404s here
-// and arms on its next restart instead.
+// armSchedulerReload asks a RUNNING workspace to start its scheduler daemon now
+// (no restart), via the runtime hot-start endpoint, using ALREADY-RESOLVED
+// forward creds. Non-fatal: any failure is logged, because the daemon is also
+// armed by the reconcile-on-online path (the durable safety net). A runtime too
+// old to expose the endpoint simply 404s here and arms on its next restart.
 //
 // Returns true iff the reload returned 2xx. Because the runtime mounts
-// /internal/schedules BEFORE /internal/daemons/reload (and both before it
-// accepts connections), a 2xx here PROVES the schedule grid API is already
-// serving — the synchronous Create path (ensureAndArmSchedulerPluginSync) uses
-// that as a readiness signal to avoid forwarding a create at a still-booting
-// runtime. Statement-callers that don't care (the carryover restore path) simply
-// discard the bool.
-func armSchedulerPlugin(ctx context.Context, workspaceID string) bool {
-	if db.DB == nil {
-		return false
-	}
-	var wsURL string
-	if err := db.DB.QueryRowContext(ctx,
-		`SELECT COALESCE(url, '') FROM workspaces WHERE id = $1`, workspaceID,
-	).Scan(&wsURL); err != nil {
-		if err != sql.ErrNoRows {
-			log.Printf("scheduler-arm: workspace lookup failed for %s: %v", workspaceID, err)
-		}
-		return false
-	}
+// /internal/schedules BEFORE /internal/daemons/reload (and both before it accepts
+// connections), a 2xx here PROVES the schedule grid API is already serving — the
+// Create path uses that as the readiness signal to avoid forwarding a create at a
+// still-booting runtime. Create resolves url+secret ONCE and shares them with the
+// create forward (SSOT — no second workspaces.url query).
+func armSchedulerReload(ctx context.Context, workspaceID, wsURL, secret string) bool {
 	if wsURL == "" {
 		return false // no callback URL (poll-mode / not registered) — reconcile arms it
 	}
@@ -85,12 +72,6 @@ func armSchedulerPlugin(ctx context.Context, workspaceID string) bool {
 		log.Printf("scheduler-arm: unsafe workspace URL for %s rejected: %v", workspaceID, err)
 		return false
 	}
-	secret, _, err := readOrLazyHealInboundSecret(ctx, workspaceID, "scheduler-arm")
-	if err != nil {
-		log.Printf("scheduler-arm: inbound secret unavailable for %s: %v", workspaceID, err)
-		return false
-	}
-
 	target := strings.TrimRight(wsURL, "/") + "/internal/daemons/reload"
 	fctx, cancel := context.WithTimeout(ctx, schedulerArmTimeout)
 	defer cancel()
@@ -121,30 +102,51 @@ func armSchedulerPlugin(ctx context.Context, workspaceID string) bool {
 	return true
 }
 
-// ensureAndArmSchedulerPluginSync declares the plugin (blocking, must persist so
-// the plugin survives a restart) and then arms the running daemon
-// SYNCHRONOUSLY, returning whether the arm reached a serving runtime.
-//
-// This is the Create path. Post-P4b the schedule store is volume-only (no DB
-// fallback), so a create MUST NOT forward to a runtime that isn't serving
-// /internal/schedules yet — the daemon is often declared+armed on this very
-// request (first schedule on a fresh workspace). Arming here BEFORE createVolume
-// closes that race: because the runtime mounts /internal/schedules before the
-// reload route, a true return (2xx reload) proves the grid API is up. A false
-// return is non-fatal — createVolume still tries, and its bounded transient-dial
-// retry + retryable 503 cover a runtime that is still coming up. Bounded by
-// schedulerArmTimeout (8s), so the create response is delayed at most that long
-// and only while the daemon is actually starting.
-func ensureAndArmSchedulerPluginSync(ctx context.Context, workspaceID string) (armed bool, err error) {
-	// The declaration MUST persist even if the caller's ctx is cancelled (client
-	// disconnect) or the create deadline fires mid-write — otherwise a schedule
-	// can land on the volume with no declared plugin and silently never fire after
-	// the next restart (the reconcile-on-online net installs only what's declared).
-	// Detach it from cancellation; it is a fast idempotent upsert.
-	if err := ensureSchedulerPluginDeclared(context.WithoutCancel(ctx), workspaceID); err != nil {
-		return false, err
+// armSchedulerPlugin is the SELF-RESOLVING arm for callers that don't already
+// hold the workspace's forward creds (the carryover restore path). It resolves
+// url + secret then delegates to armSchedulerReload. The Create path does NOT use
+// this — it resolves once via resolveWorkspaceForwardCreds and calls
+// armSchedulerReload directly, so there is no second workspaces.url query.
+func armSchedulerPlugin(ctx context.Context, workspaceID string) bool {
+	if db.DB == nil {
+		return false
 	}
-	actx, cancel := context.WithTimeout(ctx, schedulerArmTimeout)
+	var wsURL string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(url, '') FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&wsURL); err != nil {
+		if err != sql.ErrNoRows {
+			log.Printf("scheduler-arm: workspace lookup failed for %s: %v", workspaceID, err)
+		}
+		return false
+	}
+	if wsURL == "" {
+		return false
+	}
+	secret, _, err := readOrLazyHealInboundSecret(ctx, workspaceID, "scheduler-arm")
+	if err != nil {
+		log.Printf("scheduler-arm: inbound secret unavailable for %s: %v", workspaceID, err)
+		return false
+	}
+	return armSchedulerReload(ctx, workspaceID, wsURL, secret)
+}
+
+// schedulerDeclareTimeout bounds the DETACHED plugin-declaration upsert (see
+// ensureSchedulerPluginDeclaredBounded). Detaching from the request/deadline
+// keeps the durable declaration from being aborted by a client disconnect, but
+// the write must still be bounded so a contended/slow workspace_declared_plugins
+// upsert can't hang the request — the bug a raw context.WithoutCancel had.
+const schedulerDeclareTimeout = 5 * time.Second
+
+// ensureSchedulerPluginDeclaredBounded records the molecule-scheduler declaration
+// on a context DETACHED from the caller's cancellation (so a client disconnect or
+// the create deadline can't abort the must-persist upsert) yet BOUNDED by
+// schedulerDeclareTimeout (so it can't hang unbounded). Post-P4b the schedule
+// store is volume-only, so a missing declaration means the daemon is never
+// installed on the next restart and the schedule silently never fires — hence the
+// declaration is the durable net and must persist, but only within a bound.
+func ensureSchedulerPluginDeclaredBounded(ctx context.Context, workspaceID string) error {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), schedulerDeclareTimeout)
 	defer cancel()
-	return armSchedulerPlugin(actx, workspaceID), nil
+	return ensureSchedulerPluginDeclared(dctx, workspaceID)
 }

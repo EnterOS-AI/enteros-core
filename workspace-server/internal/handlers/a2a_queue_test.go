@@ -35,6 +35,12 @@ import (
 // Same fix as setupTestDB (handlers_test.go); same root cause as mc#975.
 func setupTestDBForQueueTests(t *testing.T) sqlmock.Sqlmock {
 	t.Helper()
+	// Drain stragglers from PRIOR tests before swapping the global db.DB:
+	// a globalGoAsync goroutine still running (e.g. ensureAndArmSchedulerPlugin)
+	// reads db.DB concurrently with this write — the CI -race failure in
+	// TestScheduleHandler_Create_CRLFStripped. Draining first means every
+	// leaked goroutine finishes against the OLD handle.
+	waitGlobalAsyncForTest()
 	mockDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)

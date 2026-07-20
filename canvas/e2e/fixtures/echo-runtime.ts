@@ -228,11 +228,24 @@ export async function startEchoRuntime(): Promise<EchoRuntime> {
         return;
       }
       if (suffix === "/run" && req.method === "POST") {
+        // Name-keyed store: an unknown schedule 404s (mirrors the runtime's
+        // "404 unknown" on /run), not a blanket 202.
+        if (!schedules.has(name)) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: `not found: ${name}` }));
+          return;
+        }
         res.writeHead(202);
         res.end(JSON.stringify({ poked: name }));
         return;
       }
       if (!suffix && req.method === "DELETE") {
+        // Deleting an unknown name 404s (name-keyed store), not a blanket 200.
+        if (!schedules.has(name)) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: `not found: ${name}` }));
+          return;
+        }
         schedules.delete(name);
         res.writeHead(200);
         res.end(JSON.stringify({ status: "deleted" }));
@@ -259,17 +272,21 @@ export async function startEchoRuntime(): Promise<EchoRuntime> {
             res.end(JSON.stringify({ error: "invalid json" }));
             return;
           }
+          // Build the update on a COPY and validate EVERYTHING (cron, rename
+          // collision) before committing — so a rejected PATCH leaves the stored
+          // entry untouched (no mutate-before-validate aliasing).
+          const updated: GridEntry = { ...cur };
           if (patch.cron !== undefined) {
             if (!isValidCron(String(patch.cron))) {
               res.writeHead(400);
               res.end(JSON.stringify({ error: `invalid cron expression: ${String(patch.cron)}` }));
               return;
             }
-            cur.cron = String(patch.cron);
+            updated.cron = String(patch.cron);
           }
-          if (patch.timezone !== undefined) cur.timezone = String(patch.timezone);
-          if (patch.prompt !== undefined) cur.prompt = String(patch.prompt);
-          if (patch.enabled !== undefined) cur.enabled = patch.enabled !== false;
+          if (patch.timezone !== undefined) updated.timezone = String(patch.timezone);
+          if (patch.prompt !== undefined) updated.prompt = String(patch.prompt);
+          if (patch.enabled !== undefined) updated.enabled = patch.enabled !== false;
           // Rename re-keys the grid (name is the primary key). Reject a collision
           // with an existing entry, mirroring the real store's name guard.
           if (patch.name !== undefined && String(patch.name) !== name) {
@@ -279,12 +296,13 @@ export async function startEchoRuntime(): Promise<EchoRuntime> {
               res.end(JSON.stringify({ error: `schedule already exists: ${newName}` }));
               return;
             }
-            schedules.delete(name);
-            cur.name = newName;
+            updated.name = newName;
           }
-          schedules.set(cur.name, cur);
+          // Commit only after all validation passed.
+          if (updated.name !== name) schedules.delete(name);
+          schedules.set(updated.name, updated);
           res.writeHead(200);
-          res.end(JSON.stringify(cur));
+          res.end(JSON.stringify(updated));
         });
         return;
       }
