@@ -21,14 +21,24 @@ const (
 	ActionDeprovision     Action = "deprovision_workspace"
 	ActionSecretWrite     Action = "secret_write"
 	ActionOrgTokenMint    Action = "org_token_mint"
+	// ActionPrivilegedDelegate is the single-use grant class for a
+	// PRIVILEGED / boundary-crossing delegation (a handoff dispatched by an
+	// admin-token or org-token caller). It is NOT a routine intra-org sibling
+	// A2A message — those carry no grant and remain fluid. The grant is minted
+	// out-of-band as an APPROVED approval_requests row and CONSUMED (single-use)
+	// at delegation execution, mirroring the destructive-op gate's
+	// verify-before-act consumption. See handlers/approval_gate.go
+	// gatePrivilegedDelegation.
+	ActionPrivilegedDelegate Action = "privileged_delegate"
 )
 
 // gated is the set of actions that require a human approval. Add an entry here
 // (and gate the corresponding handler with requireApproval) to expand the
 // boundary; remove one to drop a gate. This is the only place the policy lives.
 var gated = map[Action]bool{
-	ActionSecretWrite:  true,
-	ActionOrgTokenMint: true,
+	ActionSecretWrite:        true,
+	ActionOrgTokenMint:       true,
+	ActionPrivilegedDelegate: true,
 }
 
 // IsGated reports whether action requires a human approval before executing.

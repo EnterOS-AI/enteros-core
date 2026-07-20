@@ -269,6 +269,19 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 		return
 	}
 
+	// Scoped single-use grant for PRIVILEGED / boundary-crossing delegations
+	// (admin-token / org-token callers). Fires BEFORE the self-delegation
+	// guard, idempotency lookup, insertDelegationRow, executeDelegation
+	// goroutine, and broadcast — i.e. before any DB or proxy side effect, so a
+	// consequential handoff cannot proceed without the verified single-use
+	// grant. Routine intra-org sibling A2A (workspace-token callers) is NOT
+	// privileged and passes through untouched; the whole gate is dormant unless
+	// an operator arms MOLECULE_PRIVILEGED_DELEGATION_GATE. Response (403/500)
+	// already written on the reject path.
+	if !gatePrivilegedDelegation(c, h.broadcaster, sourceID, body.TargetID, body.Task) {
+		return
+	}
+
 	// #548 — prevent self-delegation: a workspace delegating to itself
 	// acquires _run_lock twice on the same mutex, deadlocking permanently.
 	//
@@ -831,6 +844,15 @@ func (h *DelegationHandler) Record(c *gin.Context) {
 	}
 	if _, err := uuid.Parse(body.TargetID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "target_id must be a valid UUID"})
+		return
+	}
+
+	// Same privileged-delegation grant gate as Delegate. Record is the agent-
+	// fired-A2A-directly variant, so a privileged caller must not be able to
+	// register (and later mark complete) a boundary-crossing handoff here to
+	// bypass the /delegate gate. Routine sibling A2A is unaffected; gate dormant
+	// unless armed. Response already written on the reject path.
+	if !gatePrivilegedDelegation(c, h.broadcaster, sourceID, body.TargetID, body.Task) {
 		return
 	}
 

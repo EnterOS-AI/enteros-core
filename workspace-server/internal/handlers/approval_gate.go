@@ -228,3 +228,96 @@ func callerIsAdminToken(c *gin.Context) bool {
 	b, ok := v.(bool)
 	return ok && b
 }
+
+// ── Scoped single-use grant for PRIVILEGED / boundary-crossing delegations ──
+//
+// FIX-1 (single-use grant) + FIX-2 (proof-gated / verify-before-act) for the
+// privileged-delegation subset. This is deliberately NOT applied to routine
+// intra-org sibling A2A: a workspace-token peer delegating to a sibling via
+// list_peers holds neither an admin token nor an org token, so it never enters
+// this gate and keeps flowing with no grant. ONLY a privileged caller — the
+// concierge/platform agent holding the tenant ADMIN_TOKEN, or an org-token
+// caller — crosses the trust boundary this gate protects.
+//
+// The gate is a strict superset of "do nothing" until an operator arms it:
+// privilegedDelegationGateEnabled() is default-OFF, so with no env set the gate
+// is byte-identical to prior behaviour (every delegation proceeds). It is
+// FULLY flag-gated — including the admin-token path — because, unlike the
+// destructive-op gate (which has a live human-approval subsystem), there is not
+// yet a grant-minting UX for delegations; arming it unconditionally would strand
+// the concierge with no way to obtain a grant. This mirrors the shipped-dormant
+// posture of MOLECULE_PLATFORM_APPROVAL_GATE (core RFC platform-agent 4b).
+
+// privilegedDelegationGateEnabled is the default-off rollout flag for the
+// privileged-delegation single-use grant gate. Inert until an operator sets
+// MOLECULE_PRIVILEGED_DELEGATION_GATE=1 (or "true"). While off, the gate is a
+// no-op and all delegations proceed exactly as before.
+func privilegedDelegationGateEnabled() bool {
+	v := os.Getenv("MOLECULE_PRIVILEGED_DELEGATION_GATE")
+	return v == "1" || v == "true"
+}
+
+// delegationRequiresGrant reports whether THIS caller's delegation is a
+// privileged / boundary-crossing handoff that must present a single-use grant.
+// It mirrors gateDestructive's activation policy: admin-token and org-token
+// callers are the privileged surface; workspace-token, canvas-session, and
+// system callers (routine intra-org sibling A2A, the busy/offline queue+wake
+// path, self-host) are NEVER privileged and pass through untouched.
+func delegationRequiresGrant(c *gin.Context) bool {
+	if !privilegedDelegationGateEnabled() {
+		return false
+	}
+	return callerIsAdminToken(c) || callerHoldsOrgToken(c)
+}
+
+// privilegedDelegationContext binds a grant to a SPECIFIC (target, task) so an
+// approved grant for "delegate task T to A" cannot be replayed to a different
+// target or a different task. The task is digested (not stored raw) to keep the
+// approval context bounded; requireApproval folds this map into request_hash.
+func privilegedDelegationContext(targetID, task string) map[string]interface{} {
+	sum := sha256.Sum256([]byte(task))
+	return map[string]interface{}{
+		"target_id": targetID,
+		"task_hash": hex.EncodeToString(sum[:]),
+	}
+}
+
+// gatePrivilegedDelegation is the choke point the delegation authorize path
+// calls BEFORE any side effect (row insert, A2A dispatch, broadcast). For a
+// privileged caller it requires — and atomically CONSUMES (single-use) — a
+// matching approved grant, reusing requireApproval's verify-before-act
+// consumption. Because the verification happens before the act, a consequential
+// handoff cannot proceed to (or report) completion without the verified
+// precondition (FIX-2). Returns true when the caller may proceed:
+//   - not a privileged caller (or gate dormant) → true, no DB touch, no grant
+//     required — routine A2A is unaffected;
+//   - privileged + a grant was consumed → true;
+//   - privileged + no consumable grant → writes 403 (a pending grant request is
+//     recorded so a human can approve it) and returns false;
+//   - server error → writes 500 and returns false.
+func gatePrivilegedDelegation(c *gin.Context, b events.EventEmitter, sourceID, targetID, task string) bool {
+	if !delegationRequiresGrant(c) {
+		return true
+	}
+	approved, grantID, err := requireApproval(
+		c.Request.Context(), b, sourceID,
+		approvals.ActionPrivilegedDelegate,
+		"privileged delegation to "+targetID,
+		privilegedDelegationContext(targetID, task),
+	)
+	if err != nil {
+		log.Printf("gatePrivilegedDelegation: %v (ws=%s target=%s)", err, sourceID, targetID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delegation grant gate failed"})
+		return false
+	}
+	if !approved {
+		log.Printf("gatePrivilegedDelegation: rejected privileged delegation without grant (ws=%s target=%s grant_request=%s)", sourceID, targetID, grantID)
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":            "privileged delegation requires an approved single-use grant",
+			"action":           string(approvals.ActionPrivilegedDelegate),
+			"grant_request_id": grantID,
+		})
+		return false
+	}
+	return true
+}
