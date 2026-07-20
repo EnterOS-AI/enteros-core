@@ -123,6 +123,9 @@ export function SelfHostSetupScene() {
     evaluateSelfHostSetupGate(defaultGateDeps).then((result) => {
       if (cancelled) return;
       setGate(result);
+      // Tell the shell the gate has a verdict (either way) so it can drop
+      // its pre-gate loading screen — see selfHostGateResolved in the store.
+      useCanvasStore.getState().setSelfHostGateResolved(true);
       if (!result.show) return;
       const ctx = result.context;
       // Pre-select the existing platform root's runtime when offerable.
@@ -148,6 +151,11 @@ export function SelfHostSetupScene() {
           ),
         });
       }
+    }).catch(() => {
+      // Gate evaluation failed — fail-closed-to-invisible for the scene, but
+      // the shell must still drop its pre-gate loading screen (a spinner
+      // that never resolves is worse than the legacy no-concierge view).
+      if (!cancelled) useCanvasStore.getState().setSelfHostGateResolved(true);
     });
     return () => {
       cancelled = true;

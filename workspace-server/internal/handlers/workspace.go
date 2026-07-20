@@ -1454,6 +1454,42 @@ func (h *WorkspaceHandler) List(c *gin.Context) {
 		if rt, _ := ws["runtime"].(string); rt != "" {
 			h.addProvisionTimeoutMs(ws, rt)
 		}
+		// Boot-telemetry replay: BOOT_STEP broadcasts are ephemeral, so a
+		// canvas re-hydrate mid-boot used to reset the boot screen to
+		// "waiting for boot telemetry". Attach the observed history
+		// (events/boottrace.go) for rows still provisioning so the client
+		// restores keycaps + watchdog log across reloads/reconnects. The
+		// capability is reached via a narrow assertion on the injected
+		// emitter — NOT a package global — so the #1814 interface seam
+		// stays intact: test fakes simply don't have it and skip.
+		//
+		// Contract with the canvas (canvas.ts hydrate):
+		//   - `boot_steps` present + `boot_generation` present → authoritative
+		//     for THAT generation: same gen as the client holds → merge; a
+		//     different gen → the client resets to the replay (stale-boot
+		//     telemetry must not survive a reprovision), even when empty
+		//     (the WORKSPACE_PROVISIONING reset mints a fresh empty entry).
+		//   - `boot_steps` present WITHOUT a generation → this instance holds
+		//     no trace entry (restarted mid-boot / other instance) — the
+		//     client keeps its own richer local state.
+		//   - field absent → platform doesn't track boot history (old build /
+		//     fake emitter); the client keeps its own state.
+		if status, _ := ws["status"].(string); status == string(models.StatusProvisioning) {
+			if replayer, ok := h.broadcaster.(interface {
+				BootReplayFor(string) ([]events.BootStepRecord, string, bool)
+			}); ok {
+				if id, _ := ws["id"].(string); id != "" {
+					steps, gen, known := replayer.BootReplayFor(id)
+					if steps == nil {
+						steps = []events.BootStepRecord{}
+					}
+					ws["boot_steps"] = steps
+					if known && gen != "" {
+						ws["boot_generation"] = gen
+					}
+				}
+			}
+		}
 		workspaces = append(workspaces, ws)
 	}
 	if err := rows.Err(); err != nil {

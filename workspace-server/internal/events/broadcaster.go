@@ -49,10 +49,28 @@ type Broadcaster struct {
 	hub    *ws.Hub
 	ssesMu sync.RWMutex
 	sses   []*sseSubscription
+	// bootTrace mirrors the BOOT_STEP stream (and the lifecycle events that
+	// reset it) so GET /workspaces can replay a mid-boot history to a
+	// re-hydrating canvas. See boottrace.go.
+	bootTrace *BootTrace
 }
 
 func NewBroadcaster(hub *ws.Hub) *Broadcaster {
-	return &Broadcaster{hub: hub}
+	return &Broadcaster{hub: hub, bootTrace: NewBootTrace()}
+}
+
+// BootStepsFor exposes the observed boot-telemetry history for a workspace.
+// Consumed by the workspaces List handler through a narrow local interface
+// assertion (not EventEmitter) so test fakes are unaffected.
+func (b *Broadcaster) BootStepsFor(workspaceID string) []BootStepRecord {
+	return b.bootTrace.StepsFor(workspaceID)
+}
+
+// BootReplayFor exposes the observed boot history WITH its generation marker
+// (see BootTrace.Replay) — the List handler serves both so the canvas can
+// tell "same boot, merge" from "new boot, reset".
+func (b *Broadcaster) BootReplayFor(workspaceID string) ([]BootStepRecord, string, bool) {
+	return b.bootTrace.Replay(workspaceID)
 }
 
 // RecordAndBroadcast inserts a structure event into Postgres and publishes to Redis pub/sub.
@@ -71,6 +89,13 @@ func (b *Broadcaster) RecordAndBroadcast(ctx context.Context, eventType string, 
 		log.Printf("RecordAndBroadcast: insert event error: %v", err)
 		return err
 	}
+
+	// Boot-telemetry lifecycle tap (boottrace.go): a WORKSPACE_PROVISIONING
+	// starts a new boot generation; ONLINE/PROVISION_FAILED/REMOVED free the
+	// entry. Deliberately AFTER the persist — an aborted record (DB error
+	// above) must not wipe a live boot's trace for an event that never
+	// actually happened.
+	b.bootTrace.Observe(eventType, workspaceID, payload)
 
 	// Build WebSocket message
 	msg := models.WSMessage{
@@ -106,6 +131,11 @@ func (b *Broadcaster) BroadcastOnly(workspaceID string, eventType string, payloa
 		log.Printf("BroadcastOnly: marshal error: %v", err)
 		return
 	}
+
+	// Boot-telemetry tap (boottrace.go): BOOT_STEP is broadcast-only, so this
+	// is the one place its history can be captured for GET /workspaces replay.
+	// After the marshal guard — an event that never goes out is not observed.
+	b.bootTrace.Observe(eventType, workspaceID, payload)
 
 	msg := models.WSMessage{
 		Event:       eventType,

@@ -690,6 +690,16 @@ func (h *WorkspaceHandler) logA2AFailure(ctx context.Context, workspaceID, calle
 			DurationMs:   &durationMs,
 			Status:       "error",
 			ErrorDetail:  &errMsg,
+			// Message-key the failure row so it collapses (ON CONFLICT) into
+			// the ingest row #2560 wrote for the same messageId. Without this,
+			// a retried forward of an already-ingested message inserted a
+			// SECOND row with the same request_body → chat-history rendered a
+			// duplicate user bubble (2026-07-19: the doubled "2" after a
+			// plugin-install restart broke the in-flight connection). The
+			// conflict clause refuses to downgrade a row that already has a
+			// response_body, so a stale late failure can't relabel a
+			// completed turn.
+			MessageId: extractMessageIdFromA2ABody(body),
 		})
 	})
 }

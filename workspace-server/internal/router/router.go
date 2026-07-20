@@ -457,6 +457,16 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// is retired. The provisioning->online flip is now driven by the runtime's
 	// turn-independent mcp_tools_ready heartbeat event, so no synthetic warmup turn
 	// (and thus no WorkspaceHandler warmup sender) is needed.
+	//
+	// First-boot greeting: on the provisioning→online transition (verified
+	// concierge flip / ordinary workspace's first register), drive a real
+	// agent turn so the agent greets the user in its own persona, delivered
+	// through the AgentMessageWriter SSOT (first_boot_greeting.go). A fresh
+	// onboarding lands in a chat where the agent has already spoken.
+	rh.SetFirstBootGreeter(handlers.FirstBootGreeter(
+		handlers.NewAgentMessageWriter(db.DB, broadcaster),
+		wh.ProxyA2ARequest,
+	))
 	r.POST("/registry/register", rh.Register)
 	r.POST("/registry/heartbeat", rh.Heartbeat)
 	r.POST("/registry/update-card", rh.UpdateCard)

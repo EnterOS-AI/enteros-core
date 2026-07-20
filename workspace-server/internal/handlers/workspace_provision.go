@@ -151,7 +151,16 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 	// apply_template=true) and wiring it in. The volume will be rewritten from
 	// the template on container start, same as first-provision. Only if the
 	// recovery template itself is missing do we bail.
-	if srcErr := provisioner.ValidateConfigSource(templatePath, configFiles); srcErr != nil {
+	// Validate against the PREPARED cfg's ConfigFiles, not this function's
+	// parameters: prepareProvisionContext may have introduced in-memory config
+	// files the caller didn't supply — the concierge overlay composes the
+	// persona + runtime-native config.yaml exactly on the auto-restart path
+	// where the caller passes (templatePath="", configFiles=nil). Checking the
+	// stale parameters here made that path fall through to the #1858 volume
+	// probe and, on a fresh volume, rebuild cfg WITHOUT the composed files —
+	// the concierge booted as a generic runtime agent with no persona
+	// (2026-07-19: hermes-default "I'm Hermes" greeting, no Org Concierge).
+	if srcErr := provisioner.ValidateConfigSource(templatePath, cfg.ConfigFiles); srcErr != nil {
 		hasConfig, probeErr := h.provisioner.VolumeHasFile(ctx, workspaceID, "config.yaml")
 		if probeErr != nil {
 			log.Printf("Provisioner: config.yaml preflight probe failed for %s: %v (proceeding)", workspaceID, probeErr)
@@ -177,7 +186,10 @@ func (h *WorkspaceHandler) provisionWorkspaceOpts(workspaceID, templatePath stri
 							workspaceID, filepath.Base(runtimeTemplate))
 						templatePath = runtimeTemplate
 						// Rebuild cfg with the recovered template path so Start() sees it.
-						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, prepared.EnvVars, prepared.Config.WorkspaceSecretKeys, prepared.PluginsPath)
+						// Keep the PREPARED in-memory config files (concierge overlay etc.)
+						// rather than the caller's parameter — see the ValidateConfigSource
+						// note above.
+						cfg = h.buildProvisionerConfig(ctx, workspaceID, templatePath, prepared.Config.ConfigFiles, payload, prepared.EnvVars, prepared.Config.WorkspaceSecretKeys, prepared.PluginsPath)
 						cfg.ResetClaudeSession = resetClaudeSession
 						recovered = true
 						break
@@ -1316,6 +1328,13 @@ func effectiveModelForBilling(model string, envVars map[string]string) string {
 type platformLLMEnvResult struct {
 	RoutedToPlatform bool
 	HasUsableLLMCred bool
+	// SubstitutedModel is non-empty when the self-host platform-arm fallback
+	// replaced the requested model with the onboarding-selected one. The
+	// caller MUST feed this to applyRuntimeModelEnv in place of payload.Model
+	// — that function gives payload.Model top priority, so without the
+	// override it would resurrect the unusable platform-arm model in the
+	// container env right after the fallback rerouted billing.
+	SubstitutedModel string
 }
 
 // globalKeys is the provenance side-channel from loadWorkspaceSecrets: the set
@@ -1328,6 +1347,53 @@ type platformLLMEnvResult struct {
 // wrong upstream. May be nil (no global-origin keys / unknown provenance) — a
 // nil set strips nothing, preserving the pre-#728 behavior for callers that do
 // not thread provenance.
+// onboardingSelectedFallback resolves the self-host substitute for a
+// platform-arm model: the platform root's stored MODEL secret (the onboarding
+// setup-scene selection). The stored form is runtime-flavored (hermes stores
+// `minimax:MiniMax-M3`; claude-code stores the bare id), so each candidate
+// form (raw, after-colon, after-slash) is tried against THIS workspace's
+// runtime until one derives to a non-platform vendor arm WITH a usable
+// credential in scope (global or workspace). Returns ok=false when nothing
+// resolves — the caller keeps the historical fail-closed abort.
+// onboardingModelCandidates expands a stored onboarding model id into the
+// forms to try against a (possibly different) runtime's registry: the raw
+// stored value plus the bare id after a colon (hermes stores
+// `minimax:MiniMax-M3`) or slash. Pure — unit-tested directly.
+func onboardingModelCandidates(rootModel string) []string {
+	if rootModel == "" {
+		return nil
+	}
+	candidates := []string{rootModel}
+	if i := strings.IndexByte(rootModel, ':'); i >= 0 && i+1 < len(rootModel) {
+		candidates = append(candidates, rootModel[i+1:])
+	}
+	if i := strings.LastIndexByte(rootModel, '/'); i >= 0 && i+1 < len(rootModel) {
+		candidates = append(candidates, rootModel[i+1:])
+	}
+	return candidates
+}
+
+func onboardingSelectedFallback(ctx context.Context, manifest *providers.Manifest, runtime string, envVars map[string]string) (string, providers.Provider, bool) {
+	rootID := PlatformAgentID()
+	secrets, _, _, _ := loadWorkspaceSecrets(ctx, rootID)
+	rootModel := strings.TrimSpace(secrets["MODEL"])
+	if rootModel == "" {
+		return "", providers.Provider{}, false
+	}
+	authEnv := availableAuthEnvNames(envVars)
+	for _, cand := range onboardingModelCandidates(rootModel) {
+		p, err := manifest.DeriveProvider(runtime, cand, authEnv)
+		if err != nil || p.IsPlatform() {
+			continue
+		}
+		if !hasAnyPlatformManagedLLMKey(p, envVars) {
+			continue
+		}
+		return cand, p, true
+	}
+	return "", providers.Provider{}, false
+}
+
 func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, workspaceID, runtime, model string, globalKeys map[string]struct{}) platformLLMEnvResult {
 	// internal#718 P2-B: the platform-vs-byok decision now DERIVES the provider
 	// from (runtime, model) via the registry and keys off IsPlatform(derived) —
@@ -1362,6 +1428,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 	var derivedProvider providers.Provider
 	routeToPlatform := false
 	resolvedProviderName := ""
+	substitutedModel := "" // set by the self-host platform-arm fallback below
 	if manifest, mErr := providerRegistry(); mErr == nil && manifest != nil {
 		if p, dErr := manifest.DeriveProvider(runtime, effectiveModel, availableAuthEnv); dErr == nil {
 			derivedProvider = p
@@ -1413,6 +1480,36 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 						derivedProvider = pp
 						break
 					}
+				}
+			}
+
+			// SELF-HOST PLATFORM-ARM FALLBACK (2026-07-19 operator decision):
+			// a model that resolves to the closed `platform` arm can NEVER run
+			// on a self-hosted stack — there is no CP proxy — so pre-fix the
+			// provision died on MISSING_PLATFORM_PROXY (the SaaS-tuned
+			// seo-agent template's `provider: platform` default did exactly
+			// this). Instead of the dead end, follow the ONBOARDING-SELECTED
+			// model: the platform root's stored MODEL (the setup-scene choice),
+			// re-derived against THIS workspace's runtime. Fires ONLY when
+			// platform-routed with no proxy wired — explicit BYOK selections
+			// and every SaaS path are untouched. If the onboarding selection
+			// can't be resolved (no root, underivable, no credential), the
+			// historical MISSING_PLATFORM_PROXY abort stands.
+			if routeToPlatform && !PlatformManagedProxyConfigured() {
+				if obModel, obProv, ok := onboardingSelectedFallback(ctx, manifest, runtime, envVars); ok {
+					log.Printf("workspace_provision: llm routing workspace=%s — model %q routes to the platform arm but no CP proxy is wired (self-host); following onboarding selection %q (provider=%s)",
+						workspaceID, effectiveModel, obModel, obProv.Name)
+					effectiveModel = obModel
+					derivedProvider = obProv
+					routeToPlatform = false
+					resolvedProviderName = obProv.Name
+					substitutedModel = obModel
+					// Publish the substituted model on BOTH names of the
+					// applyRuntimeModelEnv fallback chain so the runtime and
+					// every downstream reader see the effective model, not the
+					// unusable template default.
+					envVars["MODEL"] = obModel
+					envVars["MOLECULE_MODEL"] = obModel
 				}
 			}
 		} else {
@@ -1546,6 +1643,7 @@ func applyPlatformManagedLLMEnv(ctx context.Context, envVars map[string]string, 
 		return platformLLMEnvResult{
 			RoutedToPlatform: false,
 			HasUsableLLMCred: hasAnyPlatformManagedLLMKey(byokResolvedProvider, envVars),
+			SubstitutedModel: substitutedModel,
 		}
 	}
 	baseURL := firstNonEmptyEnv("MOLECULE_LLM_BASE_URL", "OPENAI_BASE_URL")

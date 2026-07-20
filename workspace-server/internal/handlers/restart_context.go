@@ -288,8 +288,13 @@ func buildRestartA2APayload(text string) ([]byte, error) {
 				"role":      "user",
 				"parts":     []any{map[string]any{"kind": "text", "text": text}},
 				"metadata": map[string]any{
-					"source":          "platform",
-					"kind":            "restart_context",
+					"source": "platform",
+					"kind":   "restart_context",
+					// SSOT self-message classifier (messagestore.selfSourceTypes):
+					// renders as a system notice, never a blue user bubble —
+					// required since the durable-enqueue path routes this
+					// through the ordinary ingest persist.
+					"source_type":     "self-restart-context",
 					"layer":           1,
 					"restart_context": true,
 				},
@@ -317,7 +322,14 @@ func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartCo
 	defer cancel()
 
 	if !waitForWorkspaceOnline(ctx, workspaceID, restartContextOnlineTimeout) {
-		log.Printf("restart-context: workspace %s did not come online within %s — dropping context message", workspaceID, restartContextOnlineTimeout)
+		// Do NOT drop: a first boot that builds a runtime image takes many
+		// minutes (10m+ observed), far past any reasonable inline wait, and a
+		// dropped context message is exactly the "agent forgot what it was
+		// doing after the plugin-install restart" failure (2026-07-19). Durably
+		// enqueue instead — the a2a queue drains on the workspace's first
+		// heartbeat, and the expiry keeps a truly-dead workspace from replaying
+		// a stale snapshot hours later.
+		h.enqueueRestartContext(ctx, workspaceID, data, "online-wait timeout")
 		return
 	}
 	// Self-fire guard (Layer 2 of the 2026-05-19 ws-server self-fire fix):
@@ -333,6 +345,13 @@ func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartCo
 	// effort: if the DB read errors out we proceed (preserves the legacy
 	// behaviour of "online means online").
 	if !waitForFreshHeartbeat(ctx, workspaceID, data.RestartAt, restartContextOnlineTimeout) {
+		// Deliberate DROP, not enqueue: this arm means the workspace looks
+		// online but no post-restart heartbeat has arrived — possibly the OLD
+		// container is still heartbeating. A queued snapshot would be drained
+		// by that old instance's next heartbeat (the queue drain re-checks
+		// neither url freshness nor heartbeat > RestartAt), delivering "you
+		// just restarted" to the pre-restart container and leaving the real
+		// new instance with nothing.
 		log.Printf("restart-context: workspace %s online but no fresh heartbeat or empty url — dropping context message (self-fire guard)", workspaceID)
 		return
 	}
@@ -349,8 +368,55 @@ func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartCo
 	// caller-token check in a2a_proxy.go.
 	status, _, proxyErr := h.ProxyA2ARequest(ctx, workspaceID, body, "system:restart-context", false)
 	if proxyErr != nil {
+		// Deliberate DROP, not enqueue: a proxy error does NOT prove the
+		// message went undelivered — a response-read timeout after the agent
+		// already received the turn is common on this path, and enqueueing
+		// would double-deliver the snapshot (the idempotency key dedupes
+		// concurrent enqueues, not push-then-queue). At-most-once beats
+		// at-least-once for a context nudge.
 		log.Printf("restart-context: ProxyA2ARequest failed for %s (status=%d): %v", workspaceID, status, proxyErr)
 		return
 	}
 	log.Printf("restart-context: delivered to %s (status=%d, keys=%d)", workspaceID, status, len(data.EnvKeys))
+}
+
+// restartContextQueueTTL bounds how long an undelivered restart-context
+// snapshot stays meaningful. Long enough to cover a first-boot runtime image
+// build (10m+ observed); short enough that a workspace revived much later
+// doesn't get a confusing stale "you just restarted" prompt.
+const restartContextQueueTTL = 30 * time.Minute
+
+// enqueueRestartContext durably buffers the restart-context snapshot in the
+// a2a queue (drained on the workspace's heartbeat) instead of dropping it.
+// The idempotency key is derived from the restart timestamp so retries of the
+// same restart collapse to one queued message.
+func (h *WorkspaceHandler) enqueueRestartContext(ctx context.Context, workspaceID string, data restartContextData, why string) {
+	body, err := buildRestartA2APayload(buildRestartContextMessage(data))
+	if err != nil {
+		log.Printf("restart-context: failed to marshal payload for %s: %v", workspaceID, err)
+		return
+	}
+	// The delivery ctx may already be exhausted (that can be WHY we are here);
+	// the enqueue must not inherit its deadline.
+	qCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	expires := time.Now().Add(restartContextQueueTTL)
+	// Keyed per WORKSPACE, not per restart: rapid consecutive restarts (e.g.
+	// image-build failures then success) must collapse to ONE queued context
+	// snapshot — three restarts on 2026-07-19 delivered three stacked wake
+	// messages into the same session. EnqueueA2A's active-row conflict keeps
+	// the first pending snapshot; content staleness across a few minutes is
+	// harmless (the message is a generic "you restarted" nudge).
+	idem := "restart-context-" + workspaceID
+	// Priority 90 (> default 50; drain is ORDER BY priority DESC) so the
+	// context snapshot is dispatched BEFORE any queued user message in the
+	// same drain pass — the boot turn should precede the user's turn, which
+	// is the ordering the push path's exclusivity gate produced. (Two
+	// CONCURRENT drains can still interleave rows via SKIP LOCKED; that is a
+	// pre-existing property of the queue for all items, not new exposure.)
+	if _, _, qErr := h.EnqueueA2A(qCtx, workspaceID, "system:restart-context", 90, body, "message/send", idem, &expires); qErr != nil {
+		log.Printf("restart-context: enqueue failed for %s (%s): %v — context message lost", workspaceID, why, qErr)
+		return
+	}
+	log.Printf("restart-context: %s for %s — queued for heartbeat drain (ttl=%s)", why, workspaceID, restartContextQueueTTL)
 }

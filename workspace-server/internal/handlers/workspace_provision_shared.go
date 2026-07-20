@@ -243,7 +243,15 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 			Extra: map[string]interface{}{"error": msg, "code": "MISSING_PLATFORM_PROXY", "routing": "platform", "issue": "2162"},
 		}
 	}
-	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
+	// When the self-host platform-arm fallback substituted the model, the
+	// substitution — not payload.Model — must win applyRuntimeModelEnv's
+	// priority chain, or the container env resurrects the unusable
+	// platform-arm model the fallback just routed away from.
+	effectivePayloadModel := payload.Model
+	if llmRes.SubstitutedModel != "" {
+		effectivePayloadModel = llmRes.SubstitutedModel
+	}
+	applyRuntimeModelEnv(envVars, payload.Runtime, effectivePayloadModel)
 	if payload.Role != "" {
 		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
 	}

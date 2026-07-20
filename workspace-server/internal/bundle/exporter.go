@@ -116,9 +116,24 @@ func execInContainer(ctx context.Context, dockerCli *client.Client, containerNam
 		return "", err
 	}
 	defer resp.Close()
-	var stdout bytes.Buffer
-	if _, err := stdcopy.StdCopy(&stdout, io.Discard, io.LimitReader(resp.Reader, 5*1024*1024)); err != nil {
+	var stdout, stderr bytes.Buffer
+	if _, err := stdcopy.StdCopy(&stdout, &stderr, io.LimitReader(resp.Reader, 5*1024*1024)); err != nil {
 		return "", fmt.Errorf("failed to read exec output: %w", err)
+	}
+	// Surface the exit code: loadFromContainer treats a nil error as "file
+	// read OK", so a swallowed non-zero exit (missing system-prompt.md,
+	// unreadable skill file) would silently export EMPTY content into the
+	// bundle instead of falling back / skipping.
+	inspect, ierr := dockerCli.ContainerExecInspect(ctx, execID.ID)
+	if ierr != nil {
+		return strings.TrimSpace(stdout.String()), fmt.Errorf("exec inspect %v: %w", cmd, ierr)
+	}
+	if inspect.ExitCode != 0 {
+		errText := strings.TrimSpace(stderr.String())
+		if errText == "" {
+			errText = strings.TrimSpace(stdout.String())
+		}
+		return strings.TrimSpace(stdout.String()), fmt.Errorf("exec %v: exit %d: %s", cmd, inspect.ExitCode, errText)
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }

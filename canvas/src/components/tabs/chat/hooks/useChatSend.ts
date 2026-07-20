@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { uploadChatFiles, FileTooLargeError } from "../uploads";
 import { createMessage, type ChatMessage, type ChatAttachment } from "../types";
@@ -195,6 +195,18 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
   const setupGuardRef = useRef(false);
   const optionsRef = useRef(options);
   optionsRef.current = options;
+  // Pending warming-retry timers (core#3082 auto-retry). Tracked so unmount
+  // clears them — a retry firing after the panel is gone would re-POST into
+  // a dead UI (and leak the timer). Note the message itself is still lost
+  // on unmount mid-retry, same as any in-flight send when the page closes.
+  const warmingRetryTimersRef = useRef<Set<number>>(new Set());
+  useEffect(
+    () => () => {
+      for (const id of warmingRetryTimersRef.current) window.clearTimeout(id);
+      warmingRetryTimersRef.current.clear();
+    },
+    [],
+  );
 
   const syncSendingState = useCallback(() => {
     const pending =
@@ -340,7 +352,18 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
         });
       }
 
-      api
+      // Warming auto-retry budget (core#3082): while the concierge is still
+      // verifying its management tools, the A2A proxy DEFERS the turn with a
+      // structured 503 {"warming":true} + Retry-After instead of delivering
+      // it. That is "not ready yet", not "unreachable" — so the send retries
+      // itself on the server's cadence while the boot finishes, keeping the
+      // thinking indicator up. ~24 × 5s covers a 2-minute warm-up tail; a
+      // boot slower than that exhausts the budget and surfaces a calm
+      // "still booting" error rather than the scary unreachable banner.
+      let warmingRetriesLeft = 24;
+
+      const postTurn = (): void => {
+        api
         .post<A2AResponse>(
           `/workspaces/${workspaceId}/a2a`,
           {
@@ -469,9 +492,54 @@ export function useChatSend(workspaceId: string, options: UseChatSendOptions) {
             return; // delivered; reply (and guard release) arrives via WS
           }
 
+          // WARMING 503 (core#3082): the proxy DEFERRED the turn — the
+          // concierge is booting, not unreachable. Retry on the server's
+          // Retry-After cadence with the token kept in flight so the
+          // thinking indicator stays up and the message delivers itself
+          // the moment the agent comes online.
+          const apiErr = e as {
+            status?: number;
+            bodyText?: string;
+            retryAfter?: string | null;
+          } | null;
+          let isWarming = false;
+          if (apiErr?.status === 503 && typeof apiErr.bodyText === "string") {
+            try {
+              isWarming = (JSON.parse(apiErr.bodyText) as { warming?: boolean }).warming === true;
+            } catch {
+              // Non-JSON 503 body — not the warming shape.
+            }
+          }
+          if (isWarming && warmingRetriesLeft > 0) {
+            warmingRetriesLeft--;
+            const hinted = parseInt(apiErr?.retryAfter ?? "", 10);
+            const delayMs =
+              (Number.isFinite(hinted) && hinted > 0 ? Math.min(hinted, 30) : 5) * 1000;
+            const timerId = window.setTimeout(() => {
+              warmingRetryTimersRef.current.delete(timerId);
+              // The turn may have been finished elsewhere meanwhile (WS
+              // completion, session reset) — don't re-send a settled token.
+              if (
+                !inFlightTokensRef.current.has(myToken) &&
+                !pendingWSTokensRef.current.has(myToken)
+              ) {
+                return;
+              }
+              postTurn();
+            }, delayMs);
+            warmingRetryTimersRef.current.add(timerId);
+            return; // token stays in flight — still "thinking"
+          }
+
           finishSendToken(myToken);
-          setError("Failed to send message — agent may be unreachable");
+          setError(
+            isWarming
+              ? "Agent is still booting — the message wasn't delivered. Try again in a moment."
+              : "Failed to send message — agent may be unreachable",
+          );
         });
+      };
+      postTurn();
 
       // The POST is now in flight (the .then/.catch above run later, off the
       // microtask queue). Release the setup guard on the next microtask so
