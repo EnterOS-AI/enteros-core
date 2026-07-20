@@ -1355,6 +1355,56 @@ type platformLLMEnvResult struct {
 // runtime until one derives to a non-platform vendor arm WITH a usable
 // credential in scope (global or workspace). Returns ok=false when nothing
 // resolves — the caller keeps the historical fail-closed abort.
+// applySelfHostTenantDefaults fills MISSING TENANT_* identity vars with
+// self-host placeholders so a template's required_env can never dead-end a
+// first boot over tenant identity (there is no SaaS tenant on self-host —
+// the operator IS the tenant). Only vars in `missing` (i.e. currently unset
+// after org- and workspace-scope secrets merged) are touched, so real values
+// set at either scope always win. Non-TENANT_* missing vars are left alone —
+// those (API keys etc.) must still fail closed.
+func applySelfHostTenantDefaults(envVars map[string]string, missing []string) {
+	known := map[string]func() string{
+		"TENANT_NAME":        func() string { return "Enter OS" },
+		"TENANT_DOMAIN":      func() string { return "enteros.local" },
+		"TENANT_DOMAIN_APEX": func() string { return "enteros.local" },
+		"TENANT_DOMAIN_FULL": func() string { return "https://enteros.local" },
+		"TENANT_TIMEZONE":    systemTimezoneName,
+	}
+	for _, key := range missing {
+		if !strings.HasPrefix(key, "TENANT_") {
+			continue
+		}
+		if gen, ok := known[key]; ok {
+			envVars[key] = gen()
+		} else {
+			// Unknown TENANT_* requirement from a future template: a branded
+			// placeholder still beats a bricked first boot.
+			envVars[key] = "Enter OS"
+		}
+	}
+}
+
+// systemTimezoneName resolves the host's timezone for TENANT_TIMEZONE: the
+// TZ env when set, an IANA-looking time.Local name, else a fixed UTC±HH:MM
+// offset (Windows Go often reports time.Local as just "Local").
+func systemTimezoneName() string {
+	if tz := strings.TrimSpace(os.Getenv("TZ")); tz != "" {
+		return tz
+	}
+	if name := time.Local.String(); strings.Contains(name, "/") {
+		return name
+	}
+	_, offset := time.Now().Zone()
+	if offset == 0 {
+		return "UTC"
+	}
+	sign := "+"
+	if offset < 0 {
+		sign, offset = "-", -offset
+	}
+	return fmt.Sprintf("UTC%s%02d:%02d", sign, offset/3600, (offset%3600)/60)
+}
+
 // onboardingModelCandidates expands a stored onboarding model id into the
 // forms to try against a (possibly different) runtime's registry: the raw
 // stored value plus the bare id after a colon (hermes stores
