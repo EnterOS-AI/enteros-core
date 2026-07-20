@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
@@ -89,6 +90,24 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 			// Check before per-workspace token so an org-key presenter
 			// doesn't hit the narrower ValidateToken failure path.
 			if id, prefix, orgID, err := orgtoken.Validate(ctx, database, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); err == nil {
+				// #95 hole 2: an org key grants access to every workspace in
+				// ITS OWN org — never a sibling org sharing this multi-org
+				// datastore. Bind an ANCHORED token (org_id populated) to this
+				// workspace's org root and reject a confirmed cross-org
+				// mismatch. Fails CLOSED on a lookup error (matches sameOrg's
+				// tenant-isolation posture — a DB blip denies rather than
+				// leaks). An unanchored (pre-migration/bootstrap, org_id NULL)
+				// token keeps the legacy accept for backward-compat; those
+				// callers are already denied on org-scoped routes by
+				// requireOrgOwnership, bounding their blast radius.
+				if orgID != "" {
+					wsOrg, orgErr := workspaceOrgRoot(ctx, database, workspaceID)
+					if orgErr != nil || wsOrg == "" || wsOrg != orgID {
+						log.Printf("wsauth: WorkspaceAuth: org-token org %q not authorized for workspace %q (org root %q, err=%v) — denying", orgID, workspaceID, wsOrg, orgErr)
+						c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "org token not authorized for this workspace's org"})
+						return
+					}
+				}
 				c.Set("org_token_id", id)
 				c.Set("org_token_prefix", prefix)
 				// org_id may be "" for pre-migration tokens (NULL column).
@@ -110,6 +129,14 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace auth token"})
 				return
 			}
+			// #95 hole 3: a per-workspace token authenticates ITSELF, and
+			// ValidateToken has just bound it to this :id. Record that
+			// authenticated identity so handlers that derive a source workspace
+			// (e.g. POST /workspaces/:id/delegate) can assert it against the URL
+			// :id instead of trusting the path blindly. Only set for the
+			// narrowest-scope credential; org-token/admin/cp-session are
+			// higher-privileged and may legitimately act on any :id in scope.
+			c.Set("authenticated_workspace_id", workspaceID)
 			c.Set("caller_credential_class", "workspace-token")
 			c.Next()
 			return
@@ -279,6 +306,42 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 		c.Set("caller_credential_class", "admin-token-tier3-fallback")
 		c.Next()
 	}
+}
+
+// workspaceOrgRoot resolves the org root of workspaceID by walking the
+// parent_id chain to the row whose parent_id IS NULL (its own id is the org
+// root). This is the SAME recursive-CTE tenant-scoping primitive the handlers
+// package uses in org_scope.go (sameOrg / orgRootID) and the OFFSEC-015
+// broadcast fix; it is duplicated here (a few lines) only to avoid a
+// middleware→handlers import cycle. Returns ("", nil) when the workspace has no
+// row, and the underlying error on any DB failure so callers can fail closed.
+func workspaceOrgRoot(ctx context.Context, database *sql.DB, workspaceID string) (string, error) {
+	if database == nil || workspaceID == "" {
+		return "", nil
+	}
+	var root sql.NullString
+	err := database.QueryRowContext(ctx, `
+		WITH RECURSIVE org_chain AS (
+			SELECT id, parent_id
+			FROM workspaces
+			WHERE id = $1
+			UNION ALL
+			SELECT w.id, w.parent_id
+			FROM workspaces w
+			JOIN org_chain c ON w.id = c.parent_id
+		)
+		SELECT id FROM org_chain WHERE parent_id IS NULL LIMIT 1
+	`, workspaceID).Scan(&root)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !root.Valid {
+		return "", nil
+	}
+	return root.String, nil
 }
 
 func cpSessionActor(cookieHeader string) string {

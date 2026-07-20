@@ -249,6 +249,24 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 	sourceID := c.Param("id")
 	ctx := c.Request.Context()
 
+	// #95 hole 3: the delegation SOURCE must be the authenticated principal,
+	// not merely whatever :id is in the URL. WorkspaceAuth binds a per-workspace
+	// token to the :id it validated against (ValidateToken) and records it as
+	// authenticated_workspace_id. When the caller presented that narrowest-scope
+	// credential, refuse to emit a delegation whose source (:id) differs from
+	// the token's own workspace — that would let a workspace forge a peer as the
+	// delegation origin. Higher-privileged principals (org token bound to this
+	// workspace's org, ADMIN_TOKEN, verified CP session) do NOT set that key and
+	// may legitimately act on behalf of any :id within their scope, so they are
+	// unaffected. Defense-in-depth: the binding is already enforced upstream, but
+	// pinning it here means a future middleware/route change cannot silently
+	// widen the source-forgery surface.
+	if authWS := c.GetString("authenticated_workspace_id"); authWS != "" && authWS != sourceID {
+		log.Printf("Delegate: source-binding mismatch — authenticated workspace=%s but URL source=%s (rejected)", authWS, sourceID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "source workspace does not match authenticated identity"})
+		return
+	}
+
 	var body delegateRequest
 	if err := bindDelegateRequest(c, &body); err != nil {
 		return // response already written

@@ -971,13 +971,16 @@ const a2aInboundAuthenticatedContextKey = "a2a_inbound_authenticated"
 
 // authenticateA2AHTTPCaller returns the server-authenticated caller identity.
 // X-Workspace-ID is only a claim: for workspace callers it must match the
-// presented workspace bearer's owner. Human callers use a verified CP session,
-// ADMIN_TOKEN, or org token. Self-hosted/dev also preserves the same-origin
-// Canvas fallback only when CP session verification is unconfigured; SaaS
-// never accepts that forgeable signal. The external inbound endpoint sets a
-// private Gin context marker only after validating and consuming the target's
-// inbound secret. Missing, revoked, tokenless-legacy, and datastore-error cases
-// fail closed.
+// presented workspace bearer's owner. Human/canvas callers use a verified CP
+// session, ADMIN_TOKEN, or a managed-org token — every one a real,
+// non-forgeable credential. An org token is org-scoped: it is bound to the
+// target workspace's org root and never returns the caller-supplied
+// X-Workspace-ID as trusted (#95). There is NO same-origin/Referer fallback:
+// a forgeable header can never grant the canvas bypass (#95 hole 1); the
+// legitimate self-hosted Canvas authenticates with its ADMIN_TOKEN bearer. The
+// external inbound endpoint sets a private Gin context marker only after
+// validating and consuming the target's inbound secret. Missing, revoked,
+// tokenless-legacy, cross-org, and datastore-error cases all fail closed.
 func authenticateA2AHTTPCaller(ctx context.Context, c *gin.Context, claimedCallerID string) (callerID string, isCanvasUser bool, err error) {
 	if authenticated, _ := c.Get(a2aInboundAuthenticatedContextKey); authenticated == true {
 		return claimedCallerID, false, nil
@@ -986,13 +989,18 @@ func authenticateA2AHTTPCaller(ctx context.Context, c *gin.Context, claimedCalle
 	if middleware.IsVerifiedCanvasSession(c) {
 		return claimedCallerID, true, nil
 	}
-	// Self-hosted/dev has no control-plane session verifier. Preserve the
-	// existing local Canvas contract only for a request that actually came from
-	// the same-origin Canvas proxy. SaaS always skips this forgeable fallback.
-	if !middleware.CPSessionConfigured() && middleware.IsSameOriginCanvas(c) {
-		return claimedCallerID, true, nil
-	}
-
+	// #95 hole 1: the former `!CPSessionConfigured() && IsSameOriginCanvas(c)`
+	// branch granted isCanvasUser=true — a full CanCommunicate/sameOrg/
+	// can_delegate bypass — on a request whose ONLY evidence was a matching
+	// Referer/Origin/Host. Those headers are trivially forgeable by any
+	// container on the Docker network (see the IsSameOriginCanvas doc comment
+	// and #623/#194), so a no-credential caller could dispatch into any agent.
+	// It is REMOVED. The legitimate self-hosted / combined-image Canvas is not
+	// affected: canvas/src/lib/api.ts always attaches
+	// `Authorization: Bearer <NEXT_PUBLIC_ADMIN_TOKEN>` on self-host, which is
+	// authenticated by the ADMIN_TOKEN path below (real, non-forgeable
+	// credential). SaaS Canvas uses the verified CP session above. A canvas
+	// with no credential at all now correctly falls through to fail-closed.
 	tok := wsauth.BearerTokenFromHeader(c.GetHeader("Authorization"))
 	if tok == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing caller auth token"})
@@ -1017,12 +1025,53 @@ func authenticateA2AHTTPCaller(ctx context.Context, c *gin.Context, claimedCalle
 		return workspaceID, false, nil
 	}
 
-	if _, _, _, orgErr := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); orgErr == nil {
-		return claimedCallerID, true, nil
+	if _, _, tokenOrgID, orgErr := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); orgErr == nil {
+		// #95 hole 2: a managed-org token is a canvas-CLASS credential, but it
+		// is NOT a workspace and it is scoped to its own org. Two hardenings vs
+		// the old `return claimedCallerID, true`:
+		//
+		//  1. Never return the caller-supplied X-Workspace-ID (claimedCallerID)
+		//     as the trusted caller. It is an unverified claim; treating it as
+		//     the source both spoofs activity attribution and — because
+		//     isCanvasUser=true skips CanCommunicate/sameOrg/can_delegate at
+		//     proxyA2ARequest — let an org token forge dispatch as any peer. An
+		//     org-token canvas request is attributed to the anonymous-canvas
+		//     identity (""), exactly like a real CP-session canvas send that
+		//     carries no workspace source.
+		//
+		//  2. Bind an ANCHORED token (org_id populated) to the TARGET
+		//     workspace's org root. An org key may act only within its own org,
+		//     never a sibling org in the same multi-org datastore (the sameOrg
+		//     tenant boundary, #1953). Cross-org / lookup-failure fails CLOSED.
+		//     An unanchored (pre-migration/bootstrap, org_id NULL) token keeps
+		//     the legacy canvas-class accept — it still cannot forge a caller
+		//     (we return "") — matching the requireOrgOwnership posture that
+		//     already denies unanchored tokens on org-scoped routes.
+		if tokenOrgID != "" && !orgRootMatches(ctx, c.Param("id"), tokenOrgID) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "org token not authorized for this workspace's org"})
+			return "", false, errCallerOrgMismatch
+		}
+		return "", true, nil
 	}
 
 	c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid caller auth token"})
 	return "", false, workspaceErr
+}
+
+// orgRootMatches reports whether workspaceID's org root equals orgID. Used to
+// bind a managed-org token to the org it may act within. Fails CLOSED (false)
+// on an empty input, a nil datastore, or any lookup error — matching sameOrg's
+// tenant-isolation posture where a DB hiccup denies cross-org routing rather
+// than allowing it.
+func orgRootMatches(ctx context.Context, workspaceID, orgID string) bool {
+	if workspaceID == "" || orgID == "" || db.DB == nil {
+		return false
+	}
+	root, err := orgRootID(ctx, db.DB, workspaceID)
+	if err != nil {
+		return false
+	}
+	return root == orgID
 }
 
 // validateCallerToken is the compatibility wrapper used by schedule-health.
@@ -1051,6 +1100,11 @@ var errInvalidCallerToken = errors.New("missing caller auth token")
 // generic credential or datastore failure. Tests assert this sentinel so the
 // binding guard cannot disappear behind an unrelated 401.
 var errCallerIdentityMismatch = errors.New("caller identity does not match authenticated workspace")
+
+// errCallerOrgMismatch distinguishes an org-scope rejection (an org token
+// presented for a workspace outside its org) from a generic credential
+// failure. #95 hole 2.
+var errCallerOrgMismatch = errors.New("org token not authorized for this workspace's org")
 
 // extractToolTrace pulls metadata.tool_trace from an A2A JSON-RPC response.
 // Returns nil when absent or malformed — callers can pass it straight through.

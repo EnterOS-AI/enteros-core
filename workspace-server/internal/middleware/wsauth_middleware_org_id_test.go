@@ -17,6 +17,12 @@ import (
 // query — no secondary lookup is needed.
 const orgTokenValidateQuery = "SELECT id, prefix, org_id, expires_at FROM org_api_tokens WHERE token_hash"
 
+// workspaceOrgRootQuery matches the recursive-CTE org-root lookup that
+// WorkspaceAuth runs to bind an anchored org token to the target workspace's
+// org (#95 hole 2). The lookup follows the org-token Validate SELECT + async
+// last_used_at UPDATE.
+const workspaceOrgRootQuery = "WITH RECURSIVE org_chain"
+
 func TestWorkspaceAuth_ValidOrgToken_SetsOrgIDContext(t *testing.T) {
 	// F1097 (#1218): org tokens validated via WorkspaceAuth must have
 	// org_id populated on the Gin context so downstream handlers can
@@ -40,6 +46,13 @@ func TestWorkspaceAuth_ValidOrgToken_SetsOrgIDContext(t *testing.T) {
 	mock.ExpectExec("UPDATE org_api_tokens SET last_used_at").
 		WithArgs("tok-org-abc").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// #95 hole 2: WorkspaceAuth binds the anchored org token to the workspace's
+	// org root. ws-1's org root == the token's org_id → allowed.
+	mock.ExpectQuery(workspaceOrgRootQuery).
+		WithArgs("ws-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).
+			AddRow("00000000-0000-0000-0000-000000000001"))
 
 	r := gin.New()
 	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
@@ -231,6 +244,12 @@ func TestWorkspaceAuth_OrgToken_DBRowScanError_DoesNotPanic(t *testing.T) {
 		WithArgs("tok-ok").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
+	// #95 hole 2: org-root bind — ws-1's org root matches the token org_id.
+	mock.ExpectQuery(workspaceOrgRootQuery).
+		WithArgs("ws-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).
+			AddRow("00000000-0000-0000-0000-000000000099"))
+
 	r := gin.New()
 	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
 		// org_id key may or may not be set — either is acceptable here.
@@ -274,6 +293,12 @@ func TestWorkspaceAuth_OrgToken_SetsAllContextKeys(t *testing.T) {
 	mock.ExpectExec("UPDATE org_api_tokens SET last_used_at").
 		WithArgs("tok-full").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// #95 hole 2: org-root bind — ws-1's org root matches the token org_id.
+	mock.ExpectQuery(workspaceOrgRootQuery).
+		WithArgs("ws-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).
+			AddRow(expectedOrgID))
 
 	r := gin.New()
 	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
