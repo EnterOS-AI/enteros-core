@@ -112,7 +112,16 @@ jobs:
   # Full-lifecycle lane: live on protected push/dispatch; credential-free
   # self-check on pull_request. pr-validate is only a workflow-shape check and
   # is not a substitute for live staging proof.
-  # bp-exempt: full-lifecycle lane on molecules-server (local-docker). Not a required gate.
+  #
+  # FAIL-LOUD (not advisory): this job carries NO continue-on-error mask — it is
+  # proven green (E2E Staging SaaS = success across the recent push/main +
+  # pull_request Actions window, e.g. runs 549861, 549753, 549575, 549456,
+  # 549320) and it fails loud on a real regression. `bp-exempt` below means only
+  # that it is not enumerated in .gitea/required-contexts.txt; it does NOT mean a
+  # red is harmless. Under main's branch protection status_check_contexts=["*"]
+  # every posted context is merge-blocking, so an emitted red here still wedges
+  # the queue — do NOT re-add a mask to "quiet" it; keep the lane green.
+  # bp-exempt: full-lifecycle lane on molecules-server (local-docker). Not enumerated in required-contexts.txt.
   e2e-staging-saas:
     name: E2E Staging SaaS
     runs-on: ubuntu-latest
