@@ -813,5 +813,253 @@ class TestVerifyFlipPathsFiltered(unittest.TestCase):
         self.assertIn("allowing flip", msg)
 
 
+# --------------------------------------------------------------------------
+# 9. Zero-run outcome must be SAFE, not blanket-allow — the #4524 fail-open fix
+#    (findings [2]/[6]/[7]): allow ONLY when the workflow cannot gate a PR.
+# --------------------------------------------------------------------------
+class TestWorkflowGatesPr(unittest.TestCase):
+    """workflow_gates_pr() decides the zero-run branch: a workflow that
+    triggers on pull_request/pull_request_target CAN post a merge-blocking
+    status, so zero matches there is could-not-verify (fail-closed); one that
+    can't gate a PR is safe to allow on zero runs."""
+
+    def test_pull_request_mapping_gates(self):
+        doc = lpfc.yaml.safe_load(
+            "name: WF\non:\n  pull_request:\n    branches: [main]\n"
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertTrue(lpfc.workflow_gates_pr(doc))
+
+    def test_pull_request_target_mapping_gates(self):
+        doc = lpfc.yaml.safe_load(
+            "name: WF\non:\n  pull_request_target:\n    branches: [main]\n"
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertTrue(lpfc.workflow_gates_pr(doc))
+
+    def test_list_form_with_pull_request_gates(self):
+        doc = lpfc.yaml.safe_load(
+            "name: WF\non: [push, pull_request]\n"
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertTrue(lpfc.workflow_gates_pr(doc))
+
+    def test_push_only_does_not_gate(self):
+        doc = lpfc.yaml.safe_load(
+            "name: WF\non:\n  push:\n    branches: [main]\n"
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertFalse(lpfc.workflow_gates_pr(doc))
+
+    def test_dispatch_and_schedule_only_does_not_gate(self):
+        # A workflow_dispatch-only cron cannot post a PR-blocking status.
+        doc = lpfc.yaml.safe_load(
+            "name: Nightly\non:\n  workflow_dispatch: {}\n  schedule:\n"
+            "    - cron: '0 3 * * *'\n"
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertFalse(lpfc.workflow_gates_pr(doc))
+
+    def test_scalar_pull_request_gates(self):
+        doc = lpfc.yaml.safe_load(
+            "name: WF\non: pull_request\n"
+            "jobs:\n  j:\n    continue-on-error: true\n"
+        )
+        self.assertTrue(lpfc.workflow_gates_pr(doc))
+
+
+# A PR-gating (on: pull_request) workflow whose flip carries gates_pr=True.
+PR_GATING_FLIP_FIXTURE = {
+    "workflow_path": ".gitea/workflows/ci.yml",
+    "workflow_name": "CI",
+    "job_key": "platform-build",
+    "job_name": "Platform (Go)",
+    "context": "CI / Platform (Go) (push)",
+    "accept_contexts": ["CI / Platform (Go) (push)"],
+    "paths_filtered": False,
+    "gates_pr": True,
+}
+
+# A workflow_dispatch/push-only cron whose flip carries gates_pr=False.
+DISPATCH_ONLY_FLIP_FIXTURE = {
+    "workflow_path": ".gitea/workflows/nightly.yml",
+    "workflow_name": "Nightly",
+    "job_key": "sweep",
+    "job_name": "Sweep",
+    "context": "Nightly / Sweep (push)",
+    "accept_contexts": ["Nightly / Sweep (push)"],
+    "paths_filtered": False,
+    "gates_pr": False,
+}
+
+
+class TestZeroRunFailOpenFix(unittest.TestCase):
+    def test_a_pr_gating_zero_match_namemismatch_blocks(self):
+        # Finding [2]: the flipped job IS running and RED, but its real Gitea
+        # context ("CI / platform-build (ubuntu-latest) (push)" — a matrix
+        # display name) does NOT byte-match the accepted context
+        # ("CI / Platform (Go) (push)"). That produces ZERO matching statuses.
+        # Because the workflow gates PRs, zero matches is could-not-verify, not
+        # no-coverage — the flip MUST fail-closed (block), or the still-red job
+        # gets un-masked onto main.
+        namemismatch_red = {
+            "state": "failure",
+            "statuses": [
+                {"context": "CI / platform-build (ubuntu-latest) (push)",
+                 "status": "failure",
+                 "target_url": "/o/r/actions/runs/9/jobs/0"},
+            ],
+        }
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1", "sha2"]):
+            with mock.patch.object(lpfc, "combined_status", return_value=namemismatch_red):
+                verdict = lpfc.verify_flip(PR_GATING_FLIP_FIXTURE, "main", 5)
+        # No context matched → nothing verified.
+        self.assertEqual(verdict["checked_commits"], 0)
+        # ...and because the workflow gates PRs, that BLOCKS.
+        self.assertEqual(verdict["fail_runs"], [])
+        self.assertEqual(len(verdict["masked_runs"]), 1)
+        self.assertIn("COULD-NOT-VERIFY", verdict["masked_runs"][0]["samples"][0])
+
+        # NEGATIVE CONTROL: the #4524 code had no gates_pr distinction and
+        # blanket-ALLOWED any zero-match flip. Reproduce that pre-fix path by
+        # dropping gates_pr from the record and prove the SAME red, name-
+        # mismatched job is (wrongly) allowed — i.e. this test genuinely reds
+        # against the pre-fix behavior.
+        legacy = dict(PR_GATING_FLIP_FIXTURE)
+        legacy.pop("gates_pr")
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1", "sha2"]):
+            with mock.patch.object(lpfc, "combined_status", return_value=namemismatch_red):
+                legacy_verdict = lpfc.verify_flip(legacy, "main", 5)
+        self.assertEqual(legacy_verdict["masked_runs"], [])   # pre-fix: allowed
+        self.assertTrue(any("allowing flip" in w for w in legacy_verdict["warnings"]))
+
+    def test_b_dispatch_only_cron_zero_runs_allows(self):
+        # A workflow_dispatch-only cron cannot post a merge-blocking status on a
+        # PR, so a flip on it with zero run evidence is genuinely safe → ALLOW
+        # (warning, not block). This is the SAFE half of the fix.
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["sha1", "sha2"]):
+            with mock.patch.object(
+                lpfc, "combined_status",
+                return_value={"state": "success", "statuses": []},  # zero runs
+            ):
+                verdict = lpfc.verify_flip(DISPATCH_ONLY_FLIP_FIXTURE, "main", 5)
+        self.assertEqual(verdict["checked_commits"], 0)
+        self.assertEqual(verdict["fail_runs"], [])
+        self.assertEqual(verdict["masked_runs"], [])          # NOT blocked
+        self.assertEqual(len(verdict["warnings"]), 1)
+        self.assertIn("does not gate PRs", verdict["warnings"][0])
+        self.assertIn("allowing flip", verdict["warnings"][0])
+
+    def test_detect_flips_sets_gates_pr(self):
+        # End-to-end: detect_flips must derive gates_pr from the head workflow's
+        # triggers so verify_flip's zero-run branch is fed the right value.
+        # CI_YML_* is on: push (no PR trigger) → gates_pr False.
+        push_flips = lpfc.detect_flips(
+            {".gitea/workflows/ci.yml": CI_YML_BASE},
+            {".gitea/workflows/ci.yml": CI_YML_HEAD_FLIPPED},
+        )
+        self.assertTrue(all(f["gates_pr"] is False for f in push_flips))
+        # PATHS_FILTERED_* is on: push + pull_request → gates_pr True.
+        pr_flips = lpfc.detect_flips(
+            {".gitea/workflows/secret-pattern-drift.yml": PATHS_FILTERED_BASE},
+            {".gitea/workflows/secret-pattern-drift.yml": PATHS_FILTERED_HEAD},
+        )
+        self.assertEqual(len(pr_flips), 1)
+        self.assertTrue(pr_flips[0]["gates_pr"])
+
+
+PATHS_PR_HEAD_FLIP_FIXTURE = {
+    "workflow_path": ".gitea/workflows/secret-pattern-drift.yml",
+    "workflow_name": "Secret Pattern Drift",
+    "job_key": "scan",
+    "job_name": "scan",
+    "context": "Secret Pattern Drift / scan (push)",
+    "accept_contexts": [
+        "Secret Pattern Drift / scan (push)",
+        "Secret Pattern Drift / scan (pull_request)",
+    ],
+    "paths_filtered": True,
+    "gates_pr": True,
+}
+
+
+class TestVerifyFlipPrHeadSampling(unittest.TestCase):
+    def test_c_paths_filtered_verified_via_pr_head(self):
+        # Finding [7]: a paths-filtered workflow never fires on a plain push to
+        # main, so recent main commits carry NO run for it — the pull_request
+        # run lives only on the PR-HEAD sha. verify_flip must sample the PR head
+        # and, seeing a GREEN pull_request run there with a clean log, bless the
+        # flip (checked_commits==1). Without PR-head sampling this would fall
+        # into the zero-run branch and — since the workflow gates PRs — BLOCK,
+        # which is the catch-22 finding [7] describes.
+        PR_HEAD = "prhead0123456789"
+        pr_ctx = "Secret Pattern Drift / scan (pull_request)"
+
+        def fake_combined(sha):
+            if sha == PR_HEAD:
+                return _stub_status(pr_ctx, "success",
+                                    target_url="/o/r/actions/runs/7/jobs/0")
+            return {"state": "success", "statuses": []}  # main commits: no runs
+
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["m1", "m2"]):
+            with mock.patch.object(lpfc, "combined_status", side_effect=fake_combined):
+                with mock.patch.object(lpfc, "fetch_log", return_value="PASS\nok\n"):
+                    verdict = lpfc.verify_flip(
+                        PATHS_PR_HEAD_FLIP_FIXTURE, "main", 5, pr_head_sha=PR_HEAD,
+                    )
+        # The PR-head run was seen and verified.
+        self.assertEqual(verdict["checked_commits"], 1)
+        self.assertEqual(verdict["fail_runs"], [])
+        self.assertEqual(verdict["masked_runs"], [])          # blessed, not blocked
+
+    def test_c_paths_filtered_masked_pr_head_blocks(self):
+        # Companion to the positive case: PR-head sampling is a REAL verification,
+        # not a rubber-stamp. A PR-head pull_request run whose log shows --- FAIL
+        # despite a success status (Quirk #10 mask) must still BLOCK.
+        PR_HEAD = "prhead0123456789"
+        pr_ctx = "Secret Pattern Drift / scan (pull_request)"
+
+        def fake_combined(sha):
+            if sha == PR_HEAD:
+                return _stub_status(pr_ctx, "success",
+                                    target_url="/o/r/actions/runs/7/jobs/0")
+            return {"state": "success", "statuses": []}
+
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["m1", "m2"]):
+            with mock.patch.object(lpfc, "combined_status", side_effect=fake_combined):
+                with mock.patch.object(
+                    lpfc, "fetch_log",
+                    return_value="--- FAIL: TestSecretScan (0.02s)\n",
+                ):
+                    verdict = lpfc.verify_flip(
+                        PATHS_PR_HEAD_FLIP_FIXTURE, "main", 5, pr_head_sha=PR_HEAD,
+                    )
+        self.assertEqual(verdict["checked_commits"], 1)
+        self.assertEqual(len(verdict["masked_runs"]), 1)
+        self.assertTrue(
+            any("TestSecretScan" in s for s in verdict["masked_runs"][0]["samples"])
+        )
+
+    def test_c_pr_head_not_sampled_for_non_paths_filtered(self):
+        # PR-head sampling is scoped to paths-filtered flips (their evidence
+        # structurally lives on the PR head). A normal push-lane flip must NOT
+        # pull the PR head — its evidence is the main-push run. Prove the PR
+        # head is never fetched for a non-paths-filtered flip.
+        PR_HEAD = "prhead0123456789"
+        seen = []
+
+        def fake_combined(sha):
+            seen.append(sha)
+            return _stub_status(PR_GATING_FLIP_FIXTURE["context"], "success")
+
+        with mock.patch.object(lpfc, "recent_commits_on_branch", return_value=["m1"]):
+            with mock.patch.object(lpfc, "combined_status", side_effect=fake_combined):
+                with mock.patch.object(lpfc, "fetch_log", return_value="PASS\n"):
+                    lpfc.verify_flip(
+                        PR_GATING_FLIP_FIXTURE, "main", 5, pr_head_sha=PR_HEAD,
+                    )
+        self.assertNotIn(PR_HEAD, seen)
+
+
 if __name__ == "__main__":
     unittest.main()

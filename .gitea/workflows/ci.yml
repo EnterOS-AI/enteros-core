@@ -295,6 +295,37 @@ jobs:
         run: go test -timeout 10m -coverprofile=coverage.out ./...
 
       - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: Run e2e_busy_inject positive-control tests (blocking gate)
+        # task #112 / #92 vacuity fix. The test-only busy-inject seam
+        # (internal/handlers/testbusy_enabled_test.go) compiles ONLY under the
+        # `e2e_busy_inject` build tag, so the default `go test ./...` blocking
+        # gate above can never see it — TestTestBusy_HookArmed /
+        # TestTestBusy_RouteRegistered existed but were executed by NO workflow
+        # (the #112 "a test no workflow names is never run" class). The only
+        # other reference to the tag, e2e-ephemeral-happy-path.yml, merely
+        # COMPILES it into the tenant image (BUILD_TAGS=e2e_busy_inject); it does
+        # not `go test` these unit assertions. Run them here explicitly — an
+        # enumerated package + -run filter, no glob (per
+        # feedback_verify_new_test_is_wired_to_ci).
+        #
+        # Non-vacuity guard: a bare `go test -run TestTestBusy` that matches zero
+        # tests (e.g. after a rename, or if the tag stops compiling the file)
+        # still exits 0 with "no tests to run" — a vacuous green. So we tee the
+        # verbose output and require BOTH `--- PASS` lines; a missing one fails
+        # the gate.
+        run: |
+          set -euo pipefail
+          go test -tags e2e_busy_inject -count=1 -v \
+            ./internal/handlers/ -run TestTestBusy 2>&1 | tee /tmp/test-busy-inject.log
+          for t in TestTestBusy_HookArmed TestTestBusy_RouteRegistered; do
+            if ! grep -q -- "--- PASS: $t" /tmp/test-busy-inject.log; then
+              echo "::error::e2e_busy_inject positive control did not execute $t — vacuous pass (check the build tag and -run filter)."
+              exit 1
+            fi
+          done
+          echo "e2e_busy_inject positive-control tests executed and passed ✓"
+
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Race detection (advisory, non-blocking)
         # mc#1184: runs race detector as an advisory check so cold-runner
         # compile-time spikes don't block merges. Failures here surface in
