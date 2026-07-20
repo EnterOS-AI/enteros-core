@@ -93,8 +93,6 @@ jobs:
     runs-on: ubuntu-latest
     # NOT required yet — surface failures without blocking merges. Flip to
     # false + add to branch protection once green on main for a de-flake
-    # window (see the header note). mc#3436: do not renew this mask silently.
-    continue-on-error: true
     timeout-minutes: 60
     permissions:
       contents: read

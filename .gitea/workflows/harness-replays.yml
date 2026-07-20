@@ -121,8 +121,6 @@ jobs:
     # the entire replay suite silently no-op while the "No-op pass" step
     # declares the gate "satisfied without running".
     #
-    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
     outputs:
       run: ${{ steps.decide.outputs.run }}
       debug: ${{ steps.decide.outputs.debug }}
