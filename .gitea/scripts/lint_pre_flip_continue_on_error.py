@@ -129,8 +129,15 @@ RECENT_COMMITS_N = int(_env("RECENT_COMMITS_N", default="5"))
 # loop until a short page. 50 is the Gitea REST max page size.
 STATUS_PAGE_LIMIT = int(_env("STATUS_PAGE_LIMIT", default="50"))
 # Safety ceiling on how many pages to walk (defends against a pathological
-# commit with thousands of historical statuses). 20 * 50 = 1000 entries.
-MAX_STATUS_PAGES = int(_env("MAX_STATUS_PAGES", default="20"))
+# commit with thousands of historical statuses).
+# #106 finding [6]: the old ceiling of 20 pages (20 * 50 = 1000 entries) let a
+# matching status that sorted PAST entry #1000 fall off the end → invisible →
+# (pre-fix) the flip fail-OPEN'd on "zero matches". The primary fix below now
+# fail-CLOSES a PR-gating workflow on zero matches, so truncation can no longer
+# silently un-mask a job; but a legitimate matching status past 1000 must still
+# be FOUND so a genuinely-green flip is not falsely blocked. Raise the ceiling
+# well past this repo's per-commit context count (~60). 200 * 50 = 10000.
+MAX_STATUS_PAGES = int(_env("MAX_STATUS_PAGES", default="200"))
 
 OWNER, NAME = (REPO.split("/", 1) + [""])[:2] if REPO else ("", "")
 API = f"https://{GITEA_HOST}/api/v1" if GITEA_HOST else ""
@@ -343,6 +350,40 @@ def workflow_is_paths_filtered(workflow_doc: dict) -> bool:
     return False
 
 
+def workflow_gates_pr(workflow_doc: dict) -> bool:
+    """True if the workflow triggers on ``pull_request`` or
+    ``pull_request_target`` — i.e. it CAN post a merge-blocking commit-status on
+    a PR head.
+
+    This is the safety pivot for the zero-run branch of ``verify_flip``
+    (findings [2]/[6]/[7]). A workflow that does NOT gate PRs — a
+    ``workflow_dispatch``-only cron, a push-only lane — can never post a status
+    that blocks a PR, so a flip on it with zero matching run evidence is
+    genuinely safe to allow (there is nothing it could be masking on the PR).
+
+    A workflow that DOES gate PRs is the dangerous case: zero MATCHING runs does
+    NOT prove "no coverage". It usually means could-not-verify — the real Gitea
+    context did not byte-match ``context_name()`` (a matrix job emitting
+    ``job (ubuntu-latest)``, a differing display name, a context under a
+    different event), the status sorted past the pagination ceiling, or the
+    PR-head run was never sampled. Un-masking a job we could not prove green
+    red-walls main, so it must fail-CLOSED.
+
+    Handles the mapping form (``on: {pull_request: ...}``), the list form
+    (``on: [push, pull_request]``), and the scalar form (``on: pull_request``),
+    plus PyYAML's ``on:``→``True`` bare-key quirk via ``workflow_triggers()``.
+    """
+    on = workflow_triggers(workflow_doc)
+    gating = ("pull_request", "pull_request_target")
+    if isinstance(on, dict):
+        return any(event in on for event in gating)
+    if isinstance(on, (list, tuple)):
+        return any(event in on for event in gating)
+    if isinstance(on, str):
+        return on in gating
+    return False
+
+
 # --------------------------------------------------------------------------
 # Diff detection — flips, not arbitrary changes
 # --------------------------------------------------------------------------
@@ -387,6 +428,10 @@ def detect_flips(
         head_map = jobs_coe_map(head_doc)
         wf_name = workflow_name(head_doc, fallback=os.path.basename(path).rsplit(".", 1)[0])
         paths_filtered = workflow_is_paths_filtered(head_doc)
+        # findings [2]/[6]/[7]: whether this workflow can post a merge-blocking
+        # status on a PR decides the zero-run outcome in verify_flip (allow a
+        # dispatch-only cron; fail-closed a PR-gating lane we couldn't verify).
+        gates_pr = workflow_gates_pr(head_doc)
         for job_key, base_val in base_map.items():
             if job_key not in head_map:
                 continue  # job removed — not a flip
@@ -413,6 +458,7 @@ def detect_flips(
                     "context": push_ctx,
                     "accept_contexts": accept_contexts,
                     "paths_filtered": paths_filtered,
+                    "gates_pr": gates_pr,
                 })
     return flips
 
@@ -628,10 +674,19 @@ def grep_fail_markers(log_text: str) -> list[str]:
 # --------------------------------------------------------------------------
 # Verification: for one flip, scan recent runs on BASE_REF
 # --------------------------------------------------------------------------
-def verify_flip(flip: dict, branch: str, n: int) -> dict:
-    """Scan the last ``n`` commits on ``branch``. For each commit whose
-    combined status contains a context matching ``flip["context"]``,
-    fetch the run log and grep for FAIL markers.
+def verify_flip(flip: dict, branch: str, n: int, pr_head_sha: str | None = None) -> dict:
+    """Scan the last ``n`` commits on ``branch`` (and, for a paths-filtered
+    workflow, the PR-HEAD sha). For each commit whose combined status contains a
+    context matching one of ``flip["accept_contexts"]``, fetch the run log and
+    grep for FAIL markers.
+
+    ``pr_head_sha`` (finding [7]): a paths-filtered workflow almost never fires
+    on a plain push to ``main``, so its ``pull_request``-event run lives on the
+    PR-HEAD sha (``github.event.pull_request.head.sha``) — which is NOT among
+    ``recent_commits_on_branch(main)``. Sampling only recent main commits would
+    therefore bless the flip WITHOUT ever seeing the PR's own run. We add the
+    PR-head sha to the scan set for paths-filtered flips so that run is actually
+    verified.
 
     Returns::
 
@@ -676,6 +731,12 @@ def verify_flip(flip: dict, branch: str, n: int) -> dict:
             "samples": [f"no recent commits on {branch} — cannot verify flip"],
         })
         return result
+
+    # finding [7]: for a paths-filtered workflow the pull_request run evidence
+    # lives on the PR-HEAD sha, not on any recent main commit. Add it to the
+    # scan set so the PR's own run is verified rather than blessed unseen.
+    if flip.get("paths_filtered") and pr_head_sha and pr_head_sha not in shas:
+        shas = list(shas) + [pr_head_sha]
 
     for sha in shas:
         try:
@@ -752,20 +813,51 @@ def verify_flip(flip: dict, branch: str, n: int) -> dict:
             # pull_request contexts on this commit are both evaluated.
 
     if result["checked_commits"] == 0:
-        # #107: no runs of any accepted context in the window. This is NOT
-        # evidence the job is red — a job with ZERO runs cannot be masking a
-        # failure (there is nothing to mask). Dormant push-only lanes,
-        # workflow_dispatch-only crons, and paths-filtered jobs whose paths were
-        # not touched recently all legitimately have no runs here. Per the
-        # documented "newly added workflow: no run history → warn + allow"
-        # intent, emit a ::warning:: and ALLOW the flip rather than fail-closed.
-        # If the job later runs red, THAT run blocks honestly (this gate is
-        # about not un-masking a KNOWN-red job; a zero-run job is not known-red).
+        # Zero matching runs. Whether that is SAFE ("no coverage — nothing to
+        # mask") or DANGEROUS ("could-not-verify") depends on whether this
+        # workflow can post a merge-blocking status on a PR. #4524 got this
+        # wrong: it blanket-ALLOWED, which fail-OPENS three ways (findings
+        # [2]/[6]/[7]) — a genuinely-red job whose real Gitea context does not
+        # byte-match context_name() (matrix `job (ubuntu-latest)`, a differing
+        # display name, a context under a different event), a status past the
+        # pagination ceiling, or an unsampled PR-head run all produce zero
+        # matches and were being un-masked onto a still-red main.
         contexts_str = " / ".join(repr(c) for c in accept_contexts)
-        result["warnings"].append(
-            f"no runs of {contexts_str} found in the last {n} commits on {branch} "
-            f"— nothing to verify (a zero-run job cannot mask a failure); allowing flip"
-        )
+        if flip.get("gates_pr"):
+            # The workflow triggers on pull_request / pull_request_target, so it
+            # CAN gate a PR. Zero MATCHING runs here is could-not-verify, NOT
+            # no-coverage: we sampled recent main commits (and, for a
+            # paths-filtered flip, the PR head) and found nothing under a context
+            # we recognize — but the real run may be posting under a name we did
+            # not match, or sorted past the fetch ceiling. Un-masking a job we
+            # could not prove green red-walls main → FAIL-CLOSED (block).
+            result["masked_runs"].append({
+                "sha": "",
+                "status": "unverified",
+                "target_url": "",
+                "samples": [
+                    f"no runs matching {contexts_str} found on {branch} "
+                    f"(last {n} commits"
+                    + (" + PR head" if flip.get("paths_filtered") and pr_head_sha else "")
+                    + ") — but this workflow gates PRs (triggers on "
+                    "pull_request/pull_request_target), so zero matches means "
+                    "COULD-NOT-VERIFY (real context name mismatch / status past "
+                    "the fetch ceiling / unsampled PR head), NOT no-coverage. "
+                    "Fail-closed: cannot bless an un-mask we could not verify."
+                ],
+            })
+        else:
+            # The workflow does NOT trigger on pull_request/pull_request_target —
+            # a workflow_dispatch-only cron or a push-only lane. It structurally
+            # cannot post a merge-blocking status on a PR, so a flip on it with
+            # zero run evidence is genuinely safe: there is nothing it could be
+            # masking on the PR. Emit a ::warning:: and ALLOW the flip.
+            result["warnings"].append(
+                f"no runs of {contexts_str} found in the last {n} commits on {branch} "
+                f"— workflow does not gate PRs (no pull_request/pull_request_target "
+                f"trigger), so a zero-run flip cannot mask a PR-blocking failure; "
+                f"allowing flip"
+            )
     return result
 
 
@@ -844,7 +936,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"::notice::detected {len(flips)} continue-on-error true→false flip(s); verifying recent runs on {BASE_REF}")
     bad_flips: list[dict] = []
     for flip in flips:
-        verdict = verify_flip(flip, BASE_REF, RECENT_COMMITS_N)
+        # finding [7]: pass the PR-HEAD sha so a paths-filtered workflow's
+        # pull_request run (which lives on the PR head, not on any recent main
+        # commit) is actually sampled and verified.
+        verdict = verify_flip(flip, BASE_REF, RECENT_COMMITS_N, pr_head_sha=HEAD_SHA)
         report = render_flip_report(verdict)
         if verdict["fail_runs"] or verdict["masked_runs"]:
             print(f"::error file={flip['workflow_path']}::flip of {flip['job_key']} "
