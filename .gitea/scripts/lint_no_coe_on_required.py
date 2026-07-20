@@ -156,12 +156,6 @@ MASK_WAIVERS = {
     # In-flight: these masks are being removed by other open PRs. Waived here
     # ONLY so this lint can land without a merge-order dead-lock against them.
     # When those PRs merge, the waiver goes stale and is reported as prune-me.
-    "E2E Staging Canvas (Playwright) / detect-changes":
-        "mask removed by PR #4323 (in flight) — prune this waiver once #4323 lands",
-    "E2E Staging Canvas (Playwright) / Canvas tabs E2E":
-        "mask removed by PR #4323 (in flight) — prune this waiver once #4323 lands",
-    "E2E Staging SaaS (full lifecycle) / E2E Staging SaaS":
-        "mask removed by PR #4326 (in flight) — prune this waiver once #4326 lands",
     "E2E Staging SaaS (full lifecycle) / Prune stale e2e DNS records":
         "mask removed by PR #4326 (in flight) — prune this waiver once #4326 lands",
     "Ops Scripts Tests / Ops scripts (unittest)":

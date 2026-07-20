@@ -118,9 +118,6 @@ jobs:
     runs-on: ubuntu-latest
     # Live on push/dispatch against local-docker; on pull_request the harness
     # performs its credential-free self-check.
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
     # Raised 45→75: step 10b now exercises pause→resume→online +
     # hibernate→wake→online, each of which re-provisions the parent through the
     # CP and waits for heartbeat recovery. The base provision→online→A2A matrix
