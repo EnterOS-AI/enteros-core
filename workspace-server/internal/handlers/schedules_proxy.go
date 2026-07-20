@@ -228,7 +228,7 @@ func (h *ScheduleHandler) listVolume(c *gin.Context, workspaceID string) {
 // number of times, then surfaces a retryable 503 rather than a bare 502 if the
 // runtime never answers within the deadline. A completed 2xx or a real 4xx (e.g.
 // 400 bad cron) is terminal and relayed unchanged.
-func (h *ScheduleHandler) createVolume(c *gin.Context, ctx context.Context, workspaceID string, body CreateScheduleRequest) {
+func (h *ScheduleHandler) createVolume(c *gin.Context, ctx context.Context, workspaceID string, body CreateScheduleRequest, wsURL, secret string) {
 	enabled := true
 	if body.Enabled != nil {
 		enabled = *body.Enabled
@@ -239,14 +239,8 @@ func (h *ScheduleHandler) createVolume(c *gin.Context, ctx context.Context, work
 	}
 	raw, _ := json.Marshal(entry)
 
-	wsURL, secret, ok := resolveWorkspaceForwardCreds(c, ctx, workspaceID, "schedules")
-	if !ok {
-		return // gin response already written (404/503/…) — not a transient dial failure
-	}
-
 	var status int
 	var respBody []byte
-	retried := false
 	for attempt := 0; ; attempt++ {
 		var err error
 		status, respBody, err = fetchScheduleAPI(ctx, wsURL, secret, http.MethodPost, "", raw)
@@ -261,20 +255,21 @@ func (h *ScheduleHandler) createVolume(c *gin.Context, ctx context.Context, work
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "scheduler starting, retry"})
 			return
 		}
-		retried = true
 		if !sleepCtx(ctx, createVolumeRetryBackoff) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "scheduler starting, retry"})
 			return
 		}
 	}
 
-	// Idempotency: a duplicate-name 400 AFTER a retry may be a create that landed
-	// but whose response was lost to a transient error. Fetch the stored entry;
-	// only mask as success when it MATCHES this request (an idempotent replay of
-	// our own create). A pre-existing DIFFERENT schedule with the same name is a
-	// genuine conflict and its 400 is relayed unchanged (avoids the false-success
-	// + fabricated next_run_at the request echo would produce).
-	if retried && status == http.StatusBadRequest && scheduleAlreadyExists(respBody) {
+	// Idempotency: a duplicate-name 400 may be a create that landed but whose ack
+	// was lost — either to a transient error on OUR retry, OR (the case the
+	// per-call flag missed) to the CLIENT's automatic retry after we returned 503
+	// on the final attempt. In both, the schedule exists on the volume, so the mask
+	// is keyed on whether the STORED entry matches this request — never on a
+	// per-invocation flag: a matching entry is our landed create (return the stored
+	// entry, so id/next_run_at reflect reality); a DIFFERENT schedule with the same
+	// name is a genuine conflict and its 400 is relayed unchanged.
+	if status == http.StatusBadRequest && scheduleAlreadyExists(respBody) {
 		if s2, b2, e2 := fetchScheduleAPI(ctx, wsURL, secret, http.MethodGet, "", nil); e2 == nil && s2 == http.StatusOK {
 			if found, ok := findGridEntry(b2, entry.Name); ok && gridEntryMatches(found, entry) {
 				if fb, e3 := json.Marshal(found); e3 == nil {
@@ -338,11 +333,14 @@ func findGridEntry(body []byte, name string) (volumeEntry, bool) {
 }
 
 // gridEntryMatches reports whether a stored grid entry is the same definition the
-// caller tried to create (source is runtime-stamped, so it is excluded).
+// caller tried to create (source is runtime-stamped, so it is excluded). The
+// string fields are compared trim-insensitively so a whitespace normalization the
+// runtime store applies on write doesn't make a genuine idempotent replay fail to
+// match (and then surface a false 400 for a schedule that was in fact created).
 func gridEntryMatches(stored, req volumeEntry) bool {
-	return stored.Cron == req.Cron &&
-		stored.Prompt == req.Prompt &&
-		stored.Timezone == req.Timezone &&
+	return strings.TrimSpace(stored.Cron) == strings.TrimSpace(req.Cron) &&
+		strings.TrimSpace(stored.Prompt) == strings.TrimSpace(req.Prompt) &&
+		strings.TrimSpace(stored.Timezone) == strings.TrimSpace(req.Timezone) &&
 		stored.Enabled == req.Enabled
 }
 
