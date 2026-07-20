@@ -15,6 +15,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // abortAuthLookupError is the single response shape for "the auth
@@ -100,9 +101,29 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 				// token keeps the legacy accept for backward-compat; those
 				// callers are already denied on org-scoped routes by
 				// requireOrgOwnership, bounding their blast radius.
+				//
+				// LIKE-FOR-LIKE (the catastrophic bug this replaces): the org
+				// root resolved from the parent_id chain is a workspaces.id, and
+				// the org's root workspace IS the concierge/platform-agent whose
+				// id the CP derives as DeterministicPlatformAgentID(orgUUID) — so
+				// it is NEVER equal to the raw CP org UUID. But org_api_tokens.org_id
+				// is written in BOTH namespaces across the codebase:
+				//   (a) the org-root WORKSPACE id — the canonical form the FK
+				//       (org_api_tokens.org_id REFERENCES workspaces(id)) and the
+				//       session-backfill / inherited-mint paths use; and
+				//   (b) the raw CP org UUID (MOLECULE_ORG_ID) — what the concierge
+				//       managed-token mint passes (platform_agent.go
+				//       resolveConciergeAdminCredential → orgtoken.Issue).
+				// A plain `wsOrg != orgID` compares a workspace id to the CP org
+				// UUID and is therefore ALWAYS unequal for the concierge token,
+				// 403-ing every anchored org token fleet-wide. Compare in
+				// workspace-id space by also mapping the CP-org-UUID form forward
+				// through the same deterministic derivation the org root is built
+				// from. Both arms are org-root-specific, so no cross-org token is
+				// accepted.
 				if orgID != "" {
 					wsOrg, orgErr := workspaceOrgRoot(ctx, database, workspaceID)
-					if orgErr != nil || wsOrg == "" || wsOrg != orgID {
+					if orgErr != nil || wsOrg == "" || !orgAnchorMatchesRoot(orgID, wsOrg) {
 						log.Printf("wsauth: WorkspaceAuth: org-token org %q not authorized for workspace %q (org root %q, err=%v) — denying", orgID, workspaceID, wsOrg, orgErr)
 						c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "org token not authorized for this workspace's org"})
 						return
@@ -129,14 +150,24 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace auth token"})
 				return
 			}
-			// #95 hole 3: a per-workspace token authenticates ITSELF, and
-			// ValidateToken has just bound it to this :id. Record that
-			// authenticated identity so handlers that derive a source workspace
-			// (e.g. POST /workspaces/:id/delegate) can assert it against the URL
-			// :id instead of trusting the path blindly. Only set for the
-			// narrowest-scope credential; org-token/admin/cp-session are
+			// #95 hole 3: a per-workspace token authenticates ITSELF. Record the
+			// authenticated identity DERIVED FROM THE TOKEN (resolved by token
+			// hash via WorkspaceFromToken, independent of the URL :id) so handlers
+			// that derive a source workspace (e.g. POST /workspaces/:id/delegate)
+			// assert the URL source against the TOKEN's real workspace rather than
+			// comparing c.Param("id") to itself — the tautology that closed
+			// nothing. ValidateToken already proved token.workspace_id == this :id,
+			// so tokenWS == workspaceID in the normal path; sourcing it from the
+			// token keeps the /delegate guard a genuine cross-check that survives a
+			// future route/:id refactor. Fall back to the validated id only on a
+			// datastore error (fail toward the already-proven identity). Only set
+			// for the narrowest-scope credential; org-token/admin/cp-session are
 			// higher-privileged and may legitimately act on any :id in scope.
-			c.Set("authenticated_workspace_id", workspaceID)
+			tokenWS, tokErr := wsauth.WorkspaceFromToken(ctx, database, tok)
+			if tokErr != nil || tokenWS == "" {
+				tokenWS = workspaceID
+			}
+			c.Set("authenticated_workspace_id", tokenWS)
 			c.Set("caller_credential_class", "workspace-token")
 			c.Next()
 			return
@@ -342,6 +373,38 @@ func workspaceOrgRoot(ctx context.Context, database *sql.DB, workspaceID string)
 		return "", nil
 	}
 	return root.String, nil
+}
+
+// orgAnchorMatchesRoot reports whether a token's org anchor (org_api_tokens.org_id)
+// identifies the org whose root workspace is wsRoot. org_id is stored in two
+// namespaces across the codebase, so a correct bind must accept BOTH:
+//
+//   - the org-root WORKSPACE id directly (the canonical form: the FK
+//     org_api_tokens.org_id REFERENCES workspaces(id), plus the session-backfill
+//     and inherited-mint paths), or
+//   - the raw CP org UUID (MOLECULE_ORG_ID) the concierge managed-token mint
+//     passes — the org root workspace id is DeterministicPlatformAgentID(orgUUID),
+//     so map the CP-org-UUID form forward and compare in workspace-id space.
+//
+// Both comparisons are pinned to THIS workspace's org root, so a token anchored
+// to a different org can never match.
+func orgAnchorMatchesRoot(orgAnchor, wsRoot string) bool {
+	if orgAnchor == "" || wsRoot == "" {
+		return false
+	}
+	return orgAnchor == wsRoot || deterministicPlatformAgentID(orgAnchor) == wsRoot
+}
+
+// deterministicPlatformAgentID mirrors handlers.DeterministicPlatformAgentID
+// (the SSOT, cross-impl golden-tested against the CP in
+// handlers/platform_agent_ensure_test.go). It reproduces, byte-for-byte, the
+// org-root/platform-agent workspace id the control plane and core derive from an
+// org's CP UUID: an RFC-4122 v5 (SHA-1) UUID over the URL namespace and the
+// "molecule-platform-agent:<orgID>" name. It is duplicated here (a single pure
+// line) only to avoid a middleware→handlers import cycle, exactly as
+// workspaceOrgRoot duplicates the org_scope.go CTE for the same reason.
+func deterministicPlatformAgentID(orgID string) string {
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("molecule-platform-agent:"+orgID)).String()
 }
 
 func cpSessionActor(cookieHeader string) string {

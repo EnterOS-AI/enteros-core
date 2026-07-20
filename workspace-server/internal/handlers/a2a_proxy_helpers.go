@@ -1026,52 +1026,67 @@ func authenticateA2AHTTPCaller(ctx context.Context, c *gin.Context, claimedCalle
 	}
 
 	if _, _, tokenOrgID, orgErr := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); orgErr == nil {
-		// #95 hole 2: a managed-org token is a canvas-CLASS credential, but it
-		// is NOT a workspace and it is scoped to its own org. Two hardenings vs
-		// the old `return claimedCallerID, true`:
+		// #95 hole 2 / hole 1: a managed-org token is a canvas-CLASS org-admin
+		// credential, but it is NOT a workspace and it is scoped to its own org.
+		// On this dispatch path isCanvasUser=true SKIPS CanCommunicate/sameOrg/
+		// can_delegate in proxyA2ARequest, so the org bind here is the ONLY thing
+		// standing between an org token and any agent in the datastore.
 		//
-		//  1. Never return the caller-supplied X-Workspace-ID (claimedCallerID)
-		//     as the trusted caller. It is an unverified claim; treating it as
-		//     the source both spoofs activity attribution and — because
-		//     isCanvasUser=true skips CanCommunicate/sameOrg/can_delegate at
-		//     proxyA2ARequest — let an org token forge dispatch as any peer. An
-		//     org-token canvas request is attributed to the anonymous-canvas
-		//     identity (""), exactly like a real CP-session canvas send that
-		//     carries no workspace source.
-		//
-		//  2. Bind an ANCHORED token (org_id populated) to the TARGET
-		//     workspace's org root. An org key may act only within its own org,
-		//     never a sibling org in the same multi-org datastore (the sameOrg
-		//     tenant boundary, #1953). Cross-org / lookup-failure fails CLOSED.
-		//     An unanchored (pre-migration/bootstrap, org_id NULL) token keeps
-		//     the legacy canvas-class accept — it still cannot forge a caller
-		//     (we return "") — matching the requireOrgOwnership posture that
-		//     already denies unanchored tokens on org-scoped routes.
-		if tokenOrgID != "" && !orgRootMatches(ctx, c.Param("id"), tokenOrgID) {
+		//  1. #95 hole 1 (unanchored bypass): an UNANCHORED token (org_id NULL)
+		//     carries no verifiable org scope. It MUST NOT be trusted as a
+		//     cross-workspace canvas-class caller — otherwise ANY legacy/bootstrap
+		//     org token forges dispatch into ANY agent. Fail CLOSED; anchoring
+		//     (PATCH /org/tokens/:id) is required to use A2A. Mirrors the
+		//     requireOrgOwnership posture that already denies unanchored tokens on
+		//     org-scoped routes.
+		if tokenOrgID == "" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "unanchored org token cannot dispatch A2A — anchor the token to its org"})
+			return "", false, errCallerOrgMismatch
+		}
+		//  2. Bind the ANCHORED token to the TARGET workspace's org root. An org
+		//     key may act only within its own org, never a sibling org in the same
+		//     multi-org datastore (the sameOrg tenant boundary, #1953). Compared
+		//     LIKE-FOR-LIKE in workspace-id space: org_api_tokens.org_id is written
+		//     either as the org-root WORKSPACE id (FK to workspaces.id; user /
+		//     backfilled / inherited mints) OR as the raw CP org UUID
+		//     (MOLECULE_ORG_ID) the concierge managed-token mint passes — and the
+		//     org root workspace id is DeterministicPlatformAgentID(orgUUID), never
+		//     the raw UUID. orgAnchorMatchesRoot accepts both forms; cross-org /
+		//     lookup-failure fails CLOSED.
+		targetRoot, rootErr := orgRootID(ctx, db.DB, c.Param("id"))
+		if rootErr != nil || targetRoot == "" || !orgAnchorMatchesRoot(tokenOrgID, targetRoot) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "org token not authorized for this workspace's org"})
 			return "", false, errCallerOrgMismatch
 		}
-		return "", true, nil
+		//  3. #95 hole 4 (attribution): never return the caller-supplied
+		//     X-Workspace-ID (claimedCallerID) as the caller — it is an unverified
+		//     claim and returning it would let the org token forge dispatch as any
+		//     peer. But dropping to the anonymous-canvas identity ("") erases a
+		//     real, verified principal. Attribute to the token's own org root
+		//     workspace (the org-admin/concierge identity) — a value DERIVED FROM
+		//     the validated token, not from any client header — so activity keeps
+		//     a truthful, non-forgeable caller.
+		return targetRoot, true, nil
 	}
 
 	c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid caller auth token"})
 	return "", false, workspaceErr
 }
 
-// orgRootMatches reports whether workspaceID's org root equals orgID. Used to
-// bind a managed-org token to the org it may act within. Fails CLOSED (false)
-// on an empty input, a nil datastore, or any lookup error — matching sameOrg's
-// tenant-isolation posture where a DB hiccup denies cross-org routing rather
-// than allowing it.
-func orgRootMatches(ctx context.Context, workspaceID, orgID string) bool {
-	if workspaceID == "" || orgID == "" || db.DB == nil {
+// orgAnchorMatchesRoot reports whether a token's org anchor
+// (org_api_tokens.org_id) identifies the org whose root workspace is root. The
+// anchor is stored in two namespaces across the codebase, so a correct bind must
+// accept BOTH: the org-root WORKSPACE id directly (canonical: the FK
+// org_api_tokens.org_id REFERENCES workspaces(id), session-backfill, inherited
+// mints), OR the raw CP org UUID (MOLECULE_ORG_ID) the concierge managed-token
+// mint passes — whose org root workspace id is DeterministicPlatformAgentID(orgUUID).
+// Both comparisons are pinned to THIS workspace's org root, so a token anchored
+// to a different org can never match.
+func orgAnchorMatchesRoot(orgAnchor, root string) bool {
+	if orgAnchor == "" || root == "" {
 		return false
 	}
-	root, err := orgRootID(ctx, db.DB, workspaceID)
-	if err != nil {
-		return false
-	}
-	return root == orgID
+	return orgAnchor == root || DeterministicPlatformAgentID(orgAnchor) == root
 }
 
 // validateCallerToken is the compatibility wrapper used by schedule-health.

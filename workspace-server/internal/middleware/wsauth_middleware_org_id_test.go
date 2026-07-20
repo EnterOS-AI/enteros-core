@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -24,9 +25,17 @@ const orgTokenValidateQuery = "SELECT id, prefix, org_id, expires_at FROM org_ap
 const workspaceOrgRootQuery = "WITH RECURSIVE org_chain"
 
 func TestWorkspaceAuth_ValidOrgToken_SetsOrgIDContext(t *testing.T) {
-	// F1097 (#1218): org tokens validated via WorkspaceAuth must have
-	// org_id populated on the Gin context so downstream handlers can
-	// enforce org isolation without a per-request DB round-trip.
+	// #95 hole 2 REGRESSION (the catastrophic bug the prior pass shipped): the
+	// legitimate concierge managed org token is anchored to the raw CP org UUID
+	// (MOLECULE_ORG_ID) — see platform_agent.go resolveConciergeAdminCredential —
+	// while the workspace's org root is the org-root/platform-agent WORKSPACE id,
+	// which the CP derives as DeterministicPlatformAgentID(orgUUID). Those two are
+	// DISTINCT by construction. A plain `wsOrg != orgID` therefore 403s EVERY
+	// anchored org token fleet-wide (the concierge + all user org keys). This test
+	// uses realistic DISTINCT UUIDs — the token org_id and the org root are NOT the
+	// same literal (that same-literal shortcut is exactly what masked the bug) —
+	// and the org root is the real deterministic derivation, so it FAILS against
+	// the buggy comparison and passes only with the like-for-like bind.
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -36,11 +45,20 @@ func TestWorkspaceAuth_ValidOrgToken_SetsOrgIDContext(t *testing.T) {
 	orgToken := "tok_test_org_token_abc123"
 	tokenHash := sha256.Sum256([]byte(orgToken))
 
-	// orgtoken.Validate — returns id + prefix + org_id directly.
+	// The concierge token's org anchor is the tenant's CP org UUID.
+	cpOrgUUID := "7f3b2c1a-9d4e-4f6a-8b2c-1e5d7a9c3f80"
+	// The workspace's org root is the platform-agent workspace id the CP derives
+	// from that CP org UUID — a DIFFERENT UUID.
+	orgRootWorkspaceID := deterministicPlatformAgentID(cpOrgUUID)
+	if orgRootWorkspaceID == cpOrgUUID {
+		t.Fatal("test precondition broken: derived org root must differ from the CP org UUID")
+	}
+
+	// orgtoken.Validate — returns id + prefix + org_id (the CP org UUID).
 	mock.ExpectQuery(orgTokenValidateQuery).
 		WithArgs(tokenHash[:]).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).
-			AddRow("tok-org-abc", "tok_test", "00000000-0000-0000-0000-000000000001", nil))
+			AddRow("tok-org-abc", "tok_test", cpOrgUUID, nil))
 
 	// Best-effort last_used_at update after Validate succeeds.
 	mock.ExpectExec("UPDATE org_api_tokens SET last_used_at").
@@ -48,11 +66,12 @@ func TestWorkspaceAuth_ValidOrgToken_SetsOrgIDContext(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// #95 hole 2: WorkspaceAuth binds the anchored org token to the workspace's
-	// org root. ws-1's org root == the token's org_id → allowed.
+	// org root (the DERIVED platform-agent id), which the token's CP-org-UUID
+	// anchor maps forward to → allowed.
 	mock.ExpectQuery(workspaceOrgRootQuery).
 		WithArgs("ws-1").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).
-			AddRow("00000000-0000-0000-0000-000000000001"))
+			AddRow(orgRootWorkspaceID))
 
 	r := gin.New()
 	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
@@ -71,12 +90,102 @@ func TestWorkspaceAuth_ValidOrgToken_SetsOrgIDContext(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+		t.Errorf("expected 200 (legit concierge/org token must not be locked out), got %d: %s", w.Code, w.Body.String())
 	}
-	// org_id must appear in the JSON response body.
-	body := w.Body.String()
-	if body == "" || body == "{}" {
-		t.Errorf("org_id missing from response body: %s", body)
+	// org_id must appear in the JSON response body, and it is the CP org UUID.
+	if body := w.Body.String(); !strings.Contains(body, cpOrgUUID) {
+		t.Errorf("org_id (%s) missing from response body: %s", cpOrgUUID, body)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceAuth_OrgToken_CanonicalWorkspaceRootAnchor_Allowed(t *testing.T) {
+	// The other legitimate namespace: a user/backfilled/inherited org token is
+	// anchored DIRECTLY to the org-root WORKSPACE id (the FK
+	// org_api_tokens.org_id REFERENCES workspaces(id)). Here org_id == the org
+	// root, so the direct-equality arm of orgAnchorMatchesRoot allows it.
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	orgToken := "tok_canonical_ws_root_anchor"
+	tokenHash := sha256.Sum256([]byte(orgToken))
+	orgRootWorkspaceID := "c4e1a2b3-0000-4a1b-9c2d-2b7f6e5d4c3a"
+
+	mock.ExpectQuery(orgTokenValidateQuery).
+		WithArgs(tokenHash[:]).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).
+			AddRow("tok-canon", "tok_cano", orgRootWorkspaceID, nil))
+	mock.ExpectExec("UPDATE org_api_tokens SET last_used_at").
+		WithArgs("tok-canon").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(workspaceOrgRootQuery).
+		WithArgs("ws-7").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(orgRootWorkspaceID))
+
+	r := gin.New()
+	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/workspaces/ws-7/secrets", nil)
+	req.Header.Set("Authorization", "Bearer "+orgToken)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for workspace-root-anchored org token, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceAuth_OrgToken_CrossOrg_Denied(t *testing.T) {
+	// Negative control (must FAIL closed): an anchored org token for org A must
+	// NOT reach a workspace whose org root belongs to a DIFFERENT org B in the
+	// same multi-org datastore. Distinct realistic UUIDs, and the two orgs' roots
+	// are genuinely different derivations, so neither arm of orgAnchorMatchesRoot
+	// matches → 403.
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	orgToken := "tok_attacker_cross_org"
+	tokenHash := sha256.Sum256([]byte(orgToken))
+	attackerCPOrgUUID := "11111111-2222-4333-8444-555566667777"
+	victimOrgRootWorkspaceID := deterministicPlatformAgentID("99999999-8888-4777-8666-555544443333")
+	if deterministicPlatformAgentID(attackerCPOrgUUID) == victimOrgRootWorkspaceID {
+		t.Fatal("test precondition broken: attacker and victim org roots must differ")
+	}
+
+	mock.ExpectQuery(orgTokenValidateQuery).
+		WithArgs(tokenHash[:]).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).
+			AddRow("tok-atk", "tok_atk_", attackerCPOrgUUID, nil))
+	mock.ExpectExec("UPDATE org_api_tokens SET last_used_at").
+		WithArgs("tok-atk").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(workspaceOrgRootQuery).
+		WithArgs("ws-victim").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(victimOrgRootWorkspaceID))
+
+	r := gin.New()
+	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/workspaces/ws-victim/secrets", nil)
+	req.Header.Set("Authorization", "Bearer "+orgToken)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("cross-org org token must be denied 403, got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)
