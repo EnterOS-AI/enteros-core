@@ -534,11 +534,30 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		if item.CallerID.Valid {
 			callerID = item.CallerID.String
 		}
-		// Resolve the agent URL up front so every drain log line carries it.
+		// Re-resolve the agent URL FRESH from the DB (source of truth) at EACH
+		// drain attempt — never trust the Redis URL cache here. A force-
+		// hibernate→wake re-provisions a NEW container with a NEW host/URL;
+		// Hibernate and WakeWorkspace blank workspaces.url in the DB, but the
+		// 5-minute Redis URL cache (and a late re-register from the dying pre-
+		// hibernate container) can still hold the DEAD container's URL. If the
+		// drain trusted that stale cache it would dial a host that no longer
+		// exists ("dial tcp: lookup <old-host>: no such host"), the forward
+		// would fail as upstream_dead, and — with no recent heartbeat on a
+		// just-woken box — burn the 5-attempt cap on a doomed dial, stranding
+		// the turn forever (core#124, ephemeral-gate run 815192).
+		//
+		// ClearCachedURL evicts ONLY the url key (not the liveness key), so the
+		// resolveAgentURL below re-reads the DB and RESEEDS the cache with the
+		// truth: the woken workspace's fresh container URL (→ dispatched to the
+		// NEW box), or a URL-less settling/provisioning row (→ classified
+		// workspace_settling and re-queued WITHOUT a stale-url dial, preserving
+		// the settling-ceiling wall-clock semantics of core#4459). The
+		// proxyA2ARequest below then resolves the SAME reseeded cache value.
 		// resolveAgentURL swallows its own errors into a proxyA2AError, so a
 		// resolution failure here is rare — usually a workspace with no URL
 		// row. Empty string is fine for the log; the dispatch below will
 		// produce the structured error and we already log it.
+		db.ClearCachedURL(ctx, workspaceID)
 		resolvedURL, _ := h.resolveAgentURL(ctx, workspaceID)
 		log.Printf("A2AQueue drain: dispatching queue_id=%s workspace_id=%s url=%s attempt=%d",
 			item.ID, workspaceID, resolvedURL, item.Attempts)
