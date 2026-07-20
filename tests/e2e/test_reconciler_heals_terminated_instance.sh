@@ -146,6 +146,12 @@ source "$(dirname "$0")/lib/model_slug.sh"
 # shellcheck disable=SC1091
 # shellcheck source=lib/reconciler_container.sh
 source "$(dirname "$0")/lib/reconciler_container.sh"
+# Ephemeral-CP tenant topology (Host/X-Molecule-Org-Slug slug-routing + CORS
+# Origin). SHARED helper; default (all MOLECULE_TENANT_* unset) reproduces exact
+# staging behaviour byte-for-byte.
+# shellcheck disable=SC1091
+# shellcheck source=lib/tenant_topology.sh
+source "$(dirname "$0")/lib/tenant_topology.sh"
 # Kill primitive + leak sweep — provider-abstracted. The AWS lib is sourced ONLY
 # on the legacy AWS path (its e2e_* helpers are undefined on the molecules-server
 # path, and every call site is provider-branched below).
@@ -405,16 +411,17 @@ print('(no org row found for slug=$SLUG — DB drift?)')
 done
 ok "Tenant provisioning complete"
 
-# Derive tenant domain from CP hostname (same logic as the full-saas harness).
-CP_HOST=$(echo "$CP_URL" | sed -E 's#^https?://##; s#/.*$##')
-case "$CP_HOST" in
-  api.*)         DERIVED_DOMAIN="${CP_HOST#api.}" ;;
-  staging-api.*) DERIVED_DOMAIN="staging.${CP_HOST#staging-api.}" ;;
-  *)             DERIVED_DOMAIN="$CP_HOST" ;;
-esac
-TENANT_DOMAIN="${MOLECULE_TENANT_DOMAIN:-$DERIVED_DOMAIN}"
-TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
+# Derive the tenant-facing routing/CORS topology via the shared helper. Default
+# (all MOLECULE_TENANT_* unset) keeps the exact staging slug.<domain> subdomain +
+# no route headers; the ephemeral runner points MOLECULE_TENANT_URL at the CP base
+# and sets MOLECULE_TENANT_ROUTE_DOMAIN / _ORIGIN_TEMPLATE for slug-routing. Sets
+# TENANT_URL / TENANT_ROUTE_HOST / TENANT_ROUTE_HDRS[] / TENANT_ORIGIN in this scope.
+derive_tenant_topology "$SLUG" "$CP_URL" \
+  || fail "Could not derive tenant topology for $SLUG (ephemeral slug-routing needs MOLECULE_TENANT_ORIGIN_TEMPLATE — see lib/tenant_topology.sh)"
 log "    TENANT_URL=$TENANT_URL"
+if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+  log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG (ephemeral-CP slug routing); CORS origin=$TENANT_ORIGIN"
+fi
 
 # ─── 3. Retrieve per-tenant admin token ────────────────────────────────
 log "3/6 Fetching per-tenant admin token..."
@@ -423,15 +430,22 @@ TENANT_TOKEN=$(echo "$TENANT_TOKEN_RESP" | python3 -c "import json,sys; print(js
 [ -z "$TENANT_TOKEN" ] && fail "Could not retrieve per-tenant admin token for $SLUG"
 ok "Tenant admin token retrieved (len=${#TENANT_TOKEN})"
 
-# Wait for tenant TLS / DNS propagation before any tenant API call.
-log "    Waiting for tenant TLS / DNS propagation..."
+# Wait for tenant readiness before any tenant API call. Under ephemeral slug-
+# routing the CP answers /health for ANY Host (vacuous readiness), so probe
+# /org/identity — a tenant-owned handler the CP proxies — WITH the route headers +
+# X-Molecule-Org-Id so a not-yet-routable tenant is actually caught. Staging (empty
+# TENANT_ROUTE_HDRS) keeps the global /health probe ⇒ exact staging behaviour.
+# Mirrors test_staging_concierge_e2e.sh / test_staging_full_saas.sh step 4.
+log "    Waiting for tenant TLS / DNS / routing propagation..."
 TLS_DEADLINE=$(( $(date +%s) + 15 * 60 ))
 while true; do
-  if curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1; then
-    break
+  if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+    curl -sSfk --max-time 5 "${TENANT_ROUTE_HDRS[@]}" -H "X-Molecule-Org-Id: $ORG_ID" "$TENANT_URL/org/identity" >/dev/null 2>&1 && break
+  else
+    curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
   fi
   if [ "$(date +%s)" -gt "$TLS_DEADLINE" ]; then
-    fail "Tenant URL never responded 2xx on /health within 15m"
+    fail "Tenant never became routable within 15m (probe: $( [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ] && echo '/org/identity via route headers' || echo '/health' ))"
   fi
   sleep 5
 done
@@ -443,8 +457,10 @@ tenant_call() {
   # X-Molecule-Org-Id is REQUIRED — the tenant guard 404s anything without it
   # (it does NOT 403, to hide tenant existence from org scanners).
   curl "${CURL_COMMON[@]}" -X "$method" "$TENANT_URL$path" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
+    -H "Origin: $TENANT_ORIGIN" \
     "$@"
 }
 

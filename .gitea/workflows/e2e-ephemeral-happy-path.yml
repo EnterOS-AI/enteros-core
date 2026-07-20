@@ -353,7 +353,7 @@ jobs:
           # failure does not block merge yet. Flip ADVISORY to 0 (and retire the
           # matching post-push job in e2e-staging-saas.yml) once it has soaked
           # green across a run of PRs.
-          E2E_EPHEMERAL_EXTRA_SCENARIOS: concierge_user_tasks
+          E2E_EPHEMERAL_EXTRA_SCENARIOS: concierge_user_tasks,concierge_creates_workspace,external_runtime,reconciler_heals_terminated,peer_visibility
           E2E_EPHEMERAL_EXTRA_ADVISORY: "1"
         run: |
           bash tests/e2e/ephemeral_cp_happy_path.sh
