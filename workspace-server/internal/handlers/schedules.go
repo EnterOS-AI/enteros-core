@@ -157,25 +157,45 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 		body.Timezone = "UTC"
 	}
 
-	// Per-workspace scheduler delivery (scheduler-as-trigger-plugin): a
-	// workspace that has a schedule must run the molecule-scheduler trigger
-	// daemon. Declare the plugin (idempotent; installs on the next boot/reconcile
-	// so scheduling survives a restart) and arm the running daemon SYNCHRONOUSLY.
-	// Post-P4b the schedule store is volume-only, so the arm must land before
-	// createVolume forwards — a 2xx reload proves /internal/schedules is serving,
-	// which closes the first-schedule race that the retired DB path used to
-	// absorb. Bound the whole arm+forward by createScheduleDeadline so a wedged
-	// runtime returns a retryable 503 within the client budget rather than hanging.
-	// Non-fatal: a declaration hiccup is logged (createVolume's retry+503 covers a
-	// still-starting daemon), never blocking creation beyond the arm.
-	createCtx, cancel := context.WithTimeout(ctx, createScheduleDeadline)
-	defer cancel()
-	if _, err := ensureAndArmSchedulerPluginSync(createCtx, workspaceID); err != nil {
-		log.Printf("Schedules.Create: ensure scheduler plugin for %s (non-fatal): %v", workspaceID, err)
+	// Fast-fail an invalid cron / timezone BEFORE the (up to 8s) synchronous arm
+	// and the volume forward — the retired DB path validated these core-side, and
+	// while the runtime store re-validates, doing it here avoids spending the arm +
+	// forward budget on input the runtime will only reject. Same SSOT validator.
+	if err := cronspec.Validate(body.CronExpr, body.Timezone); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 
-	// The runtime store validates cron + timezone + caps itself.
-	h.createVolume(c, createCtx, workspaceID, body)
+	// Bound the whole arm+forward so a wedged runtime returns a retryable 503
+	// within the client budget rather than hanging.
+	createCtx, cancel := context.WithTimeout(ctx, createScheduleDeadline)
+	defer cancel()
+
+	// Per-workspace scheduler delivery (scheduler-as-trigger-plugin): a workspace
+	// that has a schedule must run the molecule-scheduler trigger daemon. DECLARE
+	// the plugin — the durable net (installs on the next boot/reconcile so
+	// scheduling survives a restart); bounded + detached so a client disconnect
+	// can't abort the must-persist upsert nor a slow write hang it. Non-fatal.
+	if err := ensureSchedulerPluginDeclaredBounded(createCtx, workspaceID); err != nil {
+		log.Printf("Schedules.Create: declare scheduler plugin for %s (non-fatal): %v", workspaceID, err)
+	}
+
+	// Resolve the workspace forward creds ONCE (SSOT) — shared by the arm and the
+	// create forward, so there is no duplicate workspaces.url query.
+	wsURL, secret, ok := resolveWorkspaceForwardCreds(c, createCtx, workspaceID, "schedules")
+	if !ok {
+		return // gin error already written (404/422/503); declaration persisted above
+	}
+
+	// ARM the daemon SYNCHRONOUSLY before forwarding — a 2xx reload proves
+	// /internal/schedules is serving (it mounts before the reload route), closing
+	// the first-schedule race the retired DB path used to absorb. Non-fatal: a
+	// false return still forwards, and createVolume's transient retry + 503 cover a
+	// still-starting daemon.
+	armSchedulerReload(createCtx, workspaceID, wsURL, secret)
+
+	// The runtime store re-validates cron + timezone + caps.
+	h.createVolume(c, createCtx, workspaceID, body, wsURL, secret)
 }
 
 type UpdateScheduleRequest struct {
@@ -215,6 +235,23 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 	if body.Prompt != nil {
 		clean := strings.ReplaceAll(*body.Prompt, "\r", "")
 		body.Prompt = &clean
+	}
+
+	// Fast-fail an invalid cron / timezone on the provided fields (the retired DB
+	// path validated these core-side; the runtime re-validates on PATCH). Update
+	// is partial, so validate what's present: cron+tz together when both are given,
+	// else the timezone alone (an invalid IANA zone was the specific dropped check).
+	switch {
+	case body.CronExpr != nil && body.Timezone != nil:
+		if err := cronspec.Validate(*body.CronExpr, *body.Timezone); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	case body.Timezone != nil:
+		if _, err := time.LoadLocation(*body.Timezone); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timezone: " + *body.Timezone})
+			return
+		}
 	}
 
 	// scheduleID is the grid entry name in the volume model.
