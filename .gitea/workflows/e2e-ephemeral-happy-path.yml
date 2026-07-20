@@ -197,6 +197,11 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: 'stable'
+          # cache:false — the self-hosted fleet SSOTs GOCACHE/GOMODCACHE via
+          # bind-mounted /var/cache/ci-go-{build,mod}; setup-go's actions/cache
+          # untars OVER that mount ("File exists" → failed restore). Required by
+          # lint-setup-go-cache (core#2524). Introduced by #4525, fixed here.
+          cache: false
 
       # Per-job DISPOSABLE dind (tests/harness/dind.sh — the harness-replays
       # pattern, task#78): the WHOLE topology (PG, CP, tenants, workspaces,
