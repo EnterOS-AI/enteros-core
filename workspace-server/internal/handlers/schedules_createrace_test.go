@@ -145,13 +145,13 @@ func doScheduleCreate(t *testing.T, h *ScheduleHandler, wsID, jsonBody string) *
 const createRaceBody = `{"name":"nightly","cron_expr":"0 3 * * *","timezone":"UTC","prompt":"p","enabled":true}`
 
 // expectCreateArmAndResolve wires the DB mocks a Create makes up to the forwards:
-// declare INSERT, then the arm's 1-col url + inbound secret (cached), then
-// createVolume's 2-col url (secret reused from cache — no 2nd secret query).
+// the declare INSERT, then the SINGLE resolveWorkspaceForwardCreds resolution
+// (2-col url + inbound secret) whose creds are SHARED by the arm and the create
+// forward — post-refactor there is no separate arm url query (SSOT: one resolve).
 func expectCreateArmAndResolve(mock sqlmock.Sqlmock, wsID, url, secret string) {
 	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).WillReturnResult(sqlmock.NewResult(0, 1))
-	expectFanoutURL(mock, wsID, url)
-	expectInboundSecret(mock, wsID, secret)
 	expectURL(mock, wsID, url)
+	expectInboundSecret(mock, wsID, secret)
 }
 
 // TestScheduleCreate_ArmsSynchronouslyBeforeForward is the core of the #4448 fix:
@@ -283,6 +283,33 @@ func TestScheduleCreate_RetriesGatewayNotReady(t *testing.T) {
 	}
 }
 
+// TestScheduleCreate_InvalidCron_RejectedBeforeArm — cron/timezone are validated
+// core-side BEFORE the (up to 8s) synchronous arm and the volume forward, so an
+// invalid cron is a fast 400 that touches neither the DB (no declare/resolve) nor
+// the runtime (no reload/create). setupTestDB with NO expectations proves the
+// early-reject: any DB query before validation would trip sqlmock.
+func TestScheduleCreate_InvalidCron_RejectedBeforeArm(t *testing.T) {
+	allowLoopbackForTest(t)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	h := NewScheduleHandler()
+
+	wsID := "44e59f01-000a-4000-8000-00000000000a"
+	stub := newCreateRaceStub(t, nil)
+
+	w := doScheduleCreate(t, h, wsID,
+		`{"name":"x","cron_expr":"not a cron","timezone":"UTC","prompt":"p","enabled":true}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid cron must be 400 before the arm, got %d: %s", w.Code, w.Body.String())
+	}
+	if n := stub.postCount(); n != 0 {
+		t.Errorf("invalid cron must not forward to the runtime, got %d posts", n)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("invalid cron must reject before any DB query: %v", err)
+	}
+}
+
 // TestScheduleCreate_DuplicateAfterRetry_TreatedAsSuccess — the idempotency
 // guard: if a prior attempt actually landed the create on the runtime but its
 // response was lost to a transient error, the retry hits the store's name guard
@@ -339,11 +366,13 @@ func TestScheduleCreate_DuplicateAfterRetry_DifferentSchedule_Relayed(t *testing
 	}
 }
 
-// TestScheduleCreate_FirstAttemptDuplicate_IsRelayed — negative control for the
-// idempotency guard: a 400 "already exists" on the FIRST attempt (attempt 0, no
-// prior create) is a GENUINE duplicate and must be relayed as 400, NOT masked as
-// success. Ensures the guard is scoped to retries only.
-func TestScheduleCreate_FirstAttemptDuplicate_IsRelayed(t *testing.T) {
+// TestScheduleCreate_MatchingDuplicate_IdempotentSuccess — the review [2] fix: a
+// 400 "already exists" whose stored entry MATCHES this request is an idempotent
+// replay (the create landed; its ack was lost — to our retry OR to the client's
+// retry after a 503), so it returns 201 with the stored entry, REGARDLESS of
+// whether this invocation itself retried. Here the FIRST attempt gets the 400 (no
+// retry) — the old `retried`-gated guard would have wrongly relayed 400.
+func TestScheduleCreate_MatchingDuplicate_IdempotentSuccess(t *testing.T) {
 	allowLoopbackForTest(t)
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -353,11 +382,36 @@ func TestScheduleCreate_FirstAttemptDuplicate_IsRelayed(t *testing.T) {
 	stub := newCreateRaceStub(t, []raceResp{
 		{status: http.StatusBadRequest, body: `{"error":"schedule already exists: nightly"}`},
 	})
+	stub.grid = `{"schedules":[{"name":"nightly","cron":"0 3 * * *","timezone":"UTC","prompt":"p","enabled":true,"source":"runtime"}]}`
 	expectCreateArmAndResolve(mock, wsID, stub.srv.URL, "cr-secret-6")
 
 	w := doScheduleCreate(t, h, wsID, createRaceBody)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("a matching duplicate (idempotent replay) must be 201 regardless of retry, got %d: %s", w.Code, w.Body.String())
+	}
+	if n := stub.postCount(); n != 1 {
+		t.Errorf("a first-attempt matching duplicate must not retry, got %d attempts", n)
+	}
+}
+
+// TestScheduleCreate_UnconfirmableDuplicate_Relayed — safety fallback: a 400
+// "already exists" whose stored entry can't be confirmed (grid GET returns nothing
+// for the name) is relayed as 400, never masked as a fabricated success.
+func TestScheduleCreate_UnconfirmableDuplicate_Relayed(t *testing.T) {
+	allowLoopbackForTest(t)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	h := NewScheduleHandler()
+
+	wsID := "44e59f01-0009-4000-8000-000000000009"
+	stub := newCreateRaceStub(t, []raceResp{
+		{status: http.StatusBadRequest, body: `{"error":"schedule already exists: nightly"}`},
+	}) // grid stays the default empty {"schedules":[]}
+	expectCreateArmAndResolve(mock, wsID, stub.srv.URL, "cr-secret-9")
+
+	w := doScheduleCreate(t, h, wsID, createRaceBody)
 	if w.Code != http.StatusBadRequest {
-		t.Fatalf("a genuine first-attempt duplicate must relay 400, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("an unconfirmable duplicate must relay 400, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -392,26 +446,43 @@ func TestArmSchedulerPlugin_ReturnsReloadOutcome(t *testing.T) {
 	})
 }
 
-// TestEnsureAndArmSchedulerPluginSync_DeclaresThenArms — the Create-path helper
-// declares (INSERT) then arms synchronously, returning (armed, nil) on a 2xx
-// reload.
-func TestEnsureAndArmSchedulerPluginSync_DeclaresThenArms(t *testing.T) {
+// TestArmSchedulerReload_ReturnsReloadOutcome — armSchedulerReload takes ALREADY-
+// resolved creds (no DB query — the Create path shares its single resolution) and
+// returns true iff the reload is 2xx.
+func TestArmSchedulerReload_ReturnsReloadOutcome(t *testing.T) {
 	allowLoopbackForTest(t)
+
+	t.Run("2xx reload → true", func(t *testing.T) {
+		stub := newCreateRaceStub(t, nil)
+		if !armSchedulerReload(context.Background(), "ws-reload-a", stub.srv.URL, "s") {
+			t.Errorf("want true on a 2xx reload")
+		}
+	})
+	t.Run("non-2xx reload → false", func(t *testing.T) {
+		stub := newCreateRaceStub(t, nil)
+		stub.reloadStatus = http.StatusInternalServerError
+		if armSchedulerReload(context.Background(), "ws-reload-b", stub.srv.URL, "s") {
+			t.Errorf("want false on a non-2xx reload")
+		}
+	})
+	t.Run("empty url → false (no forward)", func(t *testing.T) {
+		if armSchedulerReload(context.Background(), "ws-reload-c", "", "s") {
+			t.Errorf("want false on an empty url")
+		}
+	})
+}
+
+// TestEnsureSchedulerPluginDeclaredBounded_Declares — the durable declaration
+// records the plugin (INSERT) on a detached-but-bounded context.
+func TestEnsureSchedulerPluginDeclaredBounded_Declares(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 
 	wsID := "44e59f01-00a3-4000-8000-0000000000a3"
-	stub := newCreateRaceStub(t, nil)
 	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).WillReturnResult(sqlmock.NewResult(0, 1))
-	expectFanoutURL(mock, wsID, stub.srv.URL)
-	expectInboundSecret(mock, wsID, "arm-secret-c")
 
-	armed, err := ensureAndArmSchedulerPluginSync(context.Background(), wsID)
-	if err != nil {
+	if err := ensureSchedulerPluginDeclaredBounded(context.Background(), wsID); err != nil {
 		t.Fatalf("declare must succeed: %v", err)
-	}
-	if !armed {
-		t.Errorf("want armed=true on a 2xx reload")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock: %v", err)
