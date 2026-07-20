@@ -185,6 +185,19 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Go toolchain for the ephemeral gate runner. This makes a go-staging-test
+      # lane RUNNABLE here (the shared harness in workspace-server/internal/staginge2e
+      # is now ephemeral-topology-aware via MOLECULE_TENANT_* + E2E_CP_ALLOW_EPHEMERAL_LOOPBACK).
+      # It only installs the toolchain — the journeys are wired into the runner in a
+      # downstream PR. Gated on the same happy/same-repo condition as the dind step so
+      # fork PRs and docs-only no-op arms don't pay for it. 'stable' matches every
+      # other Go lane in this repo (ci.yml, e2e-*.yml).
+      - name: Set up Go
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+
       # Per-job DISPOSABLE dind (tests/harness/dind.sh — the harness-replays
       # pattern, task#78): the WHOLE topology (PG, CP, tenants, workspaces,
       # image builds) lives inside a nested daemon and dies with one atomic
