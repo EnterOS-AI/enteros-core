@@ -606,6 +606,144 @@ run_scenario_concierge_user_tasks() {
     bash "$HERE/test_staging_concierge_e2e.sh"
 }
 
+# concierge CREATES-A-WORKSPACE — the FULL real-workspace-boot journey: a fresh
+# org's concierge (kind='platform' root) is driven over A2A to invoke its
+# platform-MCP provision_workspace verb, the created member boots a REAL runtime,
+# and it round-trips a REAL platform-managed MiniMax completion (17x23=391).
+# Unlike run_scenario_concierge_user_tasks (which uses `external` rows, no
+# container/LLM — the cheapest lane), this boots REAL tenant + member containers
+# and runs REAL LLM turns. The ephemeral CP already boots real workspaces + real
+# A2A/MiniMax completions in its own happy path (child workspace + delegation
+# matrix, model = the hermes default minimax/MiniMax-M2.7 PLATFORM-managed via
+# THIS CP's /cp/internal/llm proxy + MINIMAX_API_KEY), so the infra fully
+# supports it. Mirrors e2e-staging-saas.yml job
+# `e2e-staging-concierge-creates-workspace`.
+run_scenario_concierge_creates_workspace() {
+  echo "[proof][extra] concierge CREATES-a-workspace (real A2A -> platform-MCP provision_workspace + member boot + real MiniMax turn) against the ephemeral CP..." >&2
+  # Topology env identical to run_scenario_concierge_user_tasks: MOLECULE_TENANT_URL
+  # + ROUTE_DOMAIN carry the ephemeral-CP slug routing (Host + X-Molecule-Org-Slug),
+  # and MOLECULE_TENANT_ORIGIN_TEMPLATE presents the tenant's real CORS_ORIGINS
+  # (= LOCAL_TENANT_URL_TEMPLATE, set on the CP boot-env) so the Origin the script
+  # sends is byte-identical to what the tenant's gin-contrib/cors allows — else an
+  # empty-body 403 before any handler runs. Pass the SAME template so the two can
+  # never drift; the script substitutes its own {slug}.
+  #   E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 lets e2e_cp_require_staging_origin accept
+  #     the loopback CP base URL (it already honors this flag; no script edit).
+  #   E2E_REQUIRE_LIVE=1: a concierge/member that never reaches online is a HARD
+  #     FAIL (exit 5), never a silent skip — the false-green guard a real gate needs
+  #     (and it flips the script past its no-creds PR-mode self-check into the real
+  #     run since MOLECULE_ADMIN_TOKEN is also supplied).
+  MOLECULE_CP_URL="${CP_BASE_URL}" \
+  MOLECULE_TENANT_URL="${CP_BASE_URL}" \
+  MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
+  MOLECULE_TENANT_ORIGIN_TEMPLATE="${TENANT_PUBLIC_URL_TEMPLATE}" \
+  MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+  E2E_INFRA_BACKEND=local-docker \
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+  E2E_REQUIRE_LIVE=1 \
+  E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-600}" \
+  E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-cncrgmk" \
+    bash "$HERE/test_staging_concierge_creates_workspace_e2e.sh"
+}
+
+# external_runtime — the external-mode workspace lifecycle journey (RFC #86 port).
+# Registers external-runtime workspace rows and asserts all FOUR awaiting_agent
+# transitions (create→awaiting_agent DB-verified, register→online, sweep→awaiting_agent,
+# re-register→online) plus the BYO meta-runtime (kimi/kimi-cli) provision→online→A2A
+# poll-queue arms. Workspaces are `external` rows (no container / no LLM / no compute),
+# so — like concierge_user_tasks — this needs only the CP + workspace-server API and
+# runs entirely inside the throwaway dind CP over lvh.me loopback with ZERO staging creds.
+# Mirrors e2e-staging-saas.yml job `e2e-staging-external-runtime`
+# (required context "E2E Staging External Runtime / E2E Staging External Runtime").
+run_scenario_external_runtime() {
+  echo "[proof][extra] external_runtime (external-mode workspace lifecycle: 4 awaiting_agent transitions + BYO kimi/kimi-cli poll-queue A2A) against the ephemeral CP..." >&2
+  # Same topology-env shape as run_scenario_concierge_user_tasks: the CP is one
+  # throwaway container; the tenant is reached via its base URL + Host/X-Molecule-Org-Slug
+  # (not a real subdomain). MOLECULE_TENANT_ORIGIN_TEMPLATE == the CP's
+  # LOCAL_TENANT_URL_TEMPLATE, so the Origin the harness presents is byte-identical to the
+  # tenant's CORS_ORIGINS (else gin-contrib/cors returns an empty-body 403). Default
+  # (all MOLECULE_TENANT_* unset) reproduces exact staging behaviour byte-for-byte.
+  # E2E_REQUIRE_LIVE=1 arms the script's fail-closed contract (exit 5): a clean exit that
+  # did NOT actually drive all four awaiting_agent transitions can never masquerade green.
+  MOLECULE_CP_URL="${CP_BASE_URL}" \
+  MOLECULE_TENANT_URL="${CP_BASE_URL}" \
+  MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
+  MOLECULE_TENANT_ORIGIN_TEMPLATE="${TENANT_PUBLIC_URL_TEMPLATE}" \
+  MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+  E2E_INFRA_BACKEND=local-docker \
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+  E2E_REQUIRE_LIVE=1 \
+  E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
+  E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-extrt" \
+    bash "$HERE/test_staging_external_runtime.sh"
+}
+
+run_scenario_reconciler_heals_terminated() {
+  echo "[proof][extra] reconciler heals a killed workspace instance (provision -> docker rm -f the container -> assert reconciler flips it off 'online') against the ephemeral CP..." >&2
+  # Same ephemeral-CP slug-routing contract as run_scenario_concierge_user_tasks:
+  # the CP is one throwaway container reached via its base URL + Host/
+  # X-Molecule-Org-Slug (NOT a real subdomain), and MOLECULE_TENANT_ORIGIN_TEMPLATE
+  # carries the tenant's ONE allowed CORS origin (the CP's LOCAL_TENANT_URL_TEMPLATE
+  # substituted per-slug) so the threaded Origin can never drift from CORS_ORIGINS.
+  #
+  # Unlike the concierge lane, this journey provisions a REAL local-docker workspace
+  # (it must reach status=online so we can kill its container), so it also mirrors
+  # the happy-path's real-workspace knobs (E2E_RUNTIME / E2E_LLM_PATH=platform /
+  # online timeout). E2E_PROVIDER is PINNED to molecules-server so the kill primitive
+  # is `docker rm -f <container>` on the current DOCKER_HOST (the dind daemon the CP
+  # provisioned on) — never the legacy AWS terminate path (no AWS creds in the gate).
+  # PRIMARY assertion (workspace leaves 'online') is the gate; SECONDARY (existing-
+  # volume reprovision) stays best-effort/soft-miss inside the script.
+  MOLECULE_CP_URL="${CP_BASE_URL}" \
+  MOLECULE_TENANT_URL="${CP_BASE_URL}" \
+  MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
+  MOLECULE_TENANT_ORIGIN_TEMPLATE="${TENANT_PUBLIC_URL_TEMPLATE}" \
+  MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+  E2E_INFRA_BACKEND=local-docker \
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+  E2E_PROVIDER=molecules-server \
+  E2E_RUNTIME="${RUNTIME}" \
+  E2E_LLM_PATH=platform \
+  E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
+  E2E_WORKSPACE_ONLINE_TIMEOUT_SECS="${E2E_WORKSPACE_ONLINE_TIMEOUT_SECS:-900}" \
+  E2E_RECONCILE_OFFLINE_TIMEOUT_SECS="${E2E_RECONCILE_OFFLINE_TIMEOUT_SECS:-180}" \
+  E2E_REPROVISION_TIMEOUT_SECS="${E2E_REPROVISION_TIMEOUT_SECS:-600}" \
+  E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-rec" \
+    bash "$HERE/test_reconciler_heals_terminated_instance.sh"
+}
+
+# peer_visibility — the LITERAL mcp_molecule_list_peers PLATFORM contract (POST
+# /workspaces/:id/mcp, JSON-RPC tools/call name=list_peers, through the real
+# WorkspaceAuth + MCPRateLimiter chain; asserts the sibling peer set is present,
+# non-empty, and NOT a native-sessions fallback — the byte-for-byte call
+# mcp_molecule_list_peers makes from a canvas agent). Ported in EXTERNAL
+# provision mode: workspace rows are `external:true` (awaiting_agent, no runtime
+# container / LLM boot), so the scenario exercises the platform auth + peer-set
+# contract WITHOUT needing runtime images or backed platform models — the
+# ephemeral CP only carries MINIMAX_API_KEY and CANNOT boot the staging job's
+# real hermes+openclaw+claude-code matrix to `online`. This is the same
+# secret-free slice the docker-host local leg (test_peer_visibility_mcp_local.sh)
+# proves; folding it onto the standing ephemeral CP consolidates it onto the one
+# gate. UNLIKE concierge, NO peer-visibility curl sends an Origin header (the MCP
+# call + provisioning are server-to-server, not a browser CORS request), so this
+# scenario needs NO MOLECULE_TENANT_ORIGIN_TEMPLATE — only the Host +
+# X-Molecule-Org-Slug slug routing (+ X-Molecule-Org-Id). Mirrors
+# e2e-staging-saas.yml's peer-visibility job.
+run_scenario_peer_visibility() {
+  echo "[proof][extra] peer_visibility (literal MCP list_peers, external-mode) against the ephemeral CP..." >&2
+  MOLECULE_CP_URL="${CP_BASE_URL}" \
+  MOLECULE_TENANT_URL="${CP_BASE_URL}" \
+  MOLECULE_TENANT_ROUTE_DOMAIN="${ROUTE_DOMAIN}" \
+  MOLECULE_ADMIN_TOKEN="${CP_ADMIN_API_TOKEN}" \
+  E2E_INFRA_BACKEND=local-docker \
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+  PV_PROVISION_MODE=external \
+  PV_RUNTIMES="${PV_RUNTIMES:-hermes openclaw claude-code}" \
+  E2E_PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-300}" \
+  E2E_RUN_ID="${PR_NUMBER:-0}-${HEAD_SHA:-local0000}-pv" \
+    bash "$HERE/test_peer_visibility_mcp_staging.sh"
+}
+
 # Dispatch one extra-scenario key to its runner. An UNKNOWN key is a hard error,
 # never a silent skip: a typo in E2E_EPHEMERAL_EXTRA_SCENARIOS that quietly ran
 # nothing would be the exact vacuous-green this gate exists to abolish.
@@ -620,6 +758,10 @@ run_one_extra_scenario() {
   local rc
   case "$1" in
     concierge_user_tasks) run_scenario_concierge_user_tasks; rc=$? ;;
+    concierge_creates_workspace) run_scenario_concierge_creates_workspace; rc=$? ;;
+    external_runtime) run_scenario_external_runtime; rc=$? ;;
+    reconciler_heals_terminated) run_scenario_reconciler_heals_terminated; rc=$? ;;
+    peer_visibility) run_scenario_peer_visibility; rc=$? ;;
     *) echo "[proof][extra] ❌ unknown extra scenario '$1' — check E2E_EPHEMERAL_EXTRA_SCENARIOS" >&2; return "$EXTRA_MISCONFIG_RC" ;;
   esac
   # A known scenario must never masquerade as the misconfig sentinel.
