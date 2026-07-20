@@ -306,7 +306,11 @@ func assertURLCleared(t *testing.T, host, token, orgID, wsID string, timeout tim
 // connection error / 5xx / 4xx means it did not serve.
 func serveProbe(t *testing.T, host, token, orgID, wsID string) (served bool, code int) {
 	t.Helper()
-	url := "https://" + host + "/workspaces/" + wsID + "/a2a"
+	top, err := tenantTopoFromHost(host)
+	if err != nil {
+		t.Fatalf("serve probe: tenant topology for %s: %v", host, err)
+	}
+	url := top.baseURL + "/workspaces/" + wsID + "/a2a"
 	body := fmt.Sprintf(`{"jsonrpc":"2.0","method":"message/send","id":"e2e-probe","params":{"message":{"role":"user","messageId":%q,"parts":[{"kind":"text","text":"platform lifecycle e2e serve probe — reply with the single token: PONG"}]}}}`,
 		fmt.Sprintf("e2e-probe-%d", time.Now().UnixNano()))
 	req, err := http.NewRequest("POST", url, strings.NewReader(body))
@@ -315,7 +319,7 @@ func serveProbe(t *testing.T, host, token, orgID, wsID string) (served bool, cod
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Molecule-Org-Id", orgID)
-	req.Header.Set("Origin", "https://"+host)
+	applyTenantRouting(req, top)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
@@ -669,7 +673,37 @@ func validateStagingCPBase(raw string) error {
 	if parsed.Scheme == "http" && (host == "127.0.0.1" || host == "::1" || host == "localhost") {
 		return nil
 	}
+	// Ephemeral per-PR loopback CP: the throwaway control-plane is reached over a
+	// loopback alias (lvh.me / *.lvh.me / *.localhost) or a single-label docker DNS
+	// name (e.g. "controlplane") on the gate's private compose network. Accepted
+	// ONLY under an explicit opt-in so a normal staging run can never send its
+	// admin bearer to a loopback host. Default-unset ⇒ this arm is never taken ⇒
+	// byte-identical to the historical validation.
+	if os.Getenv("E2E_CP_ALLOW_EPHEMERAL_LOOPBACK") == "1" &&
+		parsed.Scheme == "http" && isEphemeralLoopbackHost(host) {
+		return nil
+	}
 	return fmt.Errorf("refusing to send staging admin bearer to %s://%s", parsed.Scheme, host)
+}
+
+// isEphemeralLoopbackHost reports whether host is a loopback-resolving alias the
+// ephemeral per-PR CP is reached by. It is gated behind E2E_CP_ALLOW_EPHEMERAL_LOOPBACK
+// in validateStagingCPBase, so it only ever loosens the check under explicit opt-in.
+func isEphemeralLoopbackHost(host string) bool {
+	switch {
+	case host == "lvh.me" || strings.HasSuffix(host, ".lvh.me"):
+		return true
+	case host == "localhost" || strings.HasSuffix(host, ".localhost"):
+		return true
+	case host == "127.0.0.1" || host == "::1":
+		return true
+	case !strings.Contains(host, "."):
+		// A single-label container DNS name on the ephemeral docker network
+		// (e.g. "controlplane") — only resolvable inside the gate's compose net.
+		return true
+	default:
+		return false
+	}
 }
 
 func validE2ESlug(slug string) bool {
@@ -802,13 +836,17 @@ func tenantCreateWorkspaceWithRuntime(t *testing.T, cfg stagingCfg, host, token,
 // signal, and t.Fatalf here would kill the test before the loop could retry.
 func doTenantCreateOnce(t *testing.T, url, token, orgID, body string) (int, string, string) {
 	t.Helper()
-	req, err := http.NewRequest("POST", url, strings.NewReader(body))
+	rewritten, top, err := tenantTopoFromURL(url)
 	if err != nil {
-		t.Fatalf("build POST %s: %v", url, err)
+		t.Fatalf("tenant topology for %s: %v", url, err)
+	}
+	req, err := http.NewRequest("POST", rewritten, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build POST %s: %v", rewritten, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Molecule-Org-Id", orgID)
-	req.Header.Set("Origin", "https://"+strings.SplitN(strings.TrimPrefix(url, "https://"), "/", 2)[0])
+	applyTenantRouting(req, top)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
@@ -918,12 +956,19 @@ func parseColdRetryAfter(raw string) int {
 
 func waitForHTTP(t *testing.T, host string, want int, timeout time.Duration, why string) {
 	t.Helper()
-	url := "https://" + host + "/health"
+	top, err := tenantTopoFromHost(host)
+	if err != nil {
+		t.Fatalf("%s: tenant topology for %s: %v", why, host, err)
+	}
+	url := top.baseURL + "/health"
 	client := &http.Client{Timeout: 15 * time.Second}
 	deadline := time.Now().Add(timeout)
 	var last int
 	for time.Now().Before(deadline) {
 		req, _ := http.NewRequest("GET", url, nil)
+		// /health carries no CORS Origin today; add only the slug-routing Host
+		// header under ephemeral routing (a no-op on staging → byte-identical).
+		applyTenantHostOnly(req, top)
 		resp, err := client.Do(req)
 		if err == nil {
 			last = resp.StatusCode
@@ -947,7 +992,11 @@ func waitForHTTP(t *testing.T, host string, want int, timeout time.Duration, why
 // and this fails loudly; the caller's content assertions still run afterwards.
 func waitForTenantRoute(t *testing.T, host, path, token, orgID string, wantStreak int, timeout time.Duration, why string) {
 	t.Helper()
-	url := "https://" + host + path
+	top, err := tenantTopoFromHost(host)
+	if err != nil {
+		t.Fatalf("%s: tenant topology for %s: %v", why, host, err)
+	}
+	url := top.baseURL + path
 	client := &http.Client{Timeout: 15 * time.Second}
 	deadline := time.Now().Add(timeout)
 	streak, last := 0, 0
@@ -955,7 +1004,7 @@ func waitForTenantRoute(t *testing.T, host, path, token, orgID string, wantStrea
 		req, _ := http.NewRequest("GET", url, nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("X-Molecule-Org-Id", orgID)
-		req.Header.Set("Origin", "https://"+host)
+		applyTenantRouting(req, top)
 		resp, err := client.Do(req)
 		if err == nil {
 			last = resp.StatusCode
@@ -1018,13 +1067,17 @@ func doJSON(t *testing.T, method, url, token, body string) (int, string) {
 // mismatched/absent Origin with 404).
 func doTenantJSON(t *testing.T, method, url, token, orgID, body string) (int, string) {
 	t.Helper()
-	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	rewritten, top, err := tenantTopoFromURL(url)
 	if err != nil {
-		t.Fatalf("build %s %s: %v", method, url, err)
+		t.Fatalf("tenant topology for %s: %v", url, err)
+	}
+	req, err := http.NewRequest(method, rewritten, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build %s %s: %v", method, rewritten, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Molecule-Org-Id", orgID)
-	req.Header.Set("Origin", "https://"+strings.SplitN(strings.TrimPrefix(url, "https://"), "/", 2)[0])
+	applyTenantRouting(req, top)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
