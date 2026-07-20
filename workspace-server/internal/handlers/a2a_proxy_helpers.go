@@ -87,16 +87,19 @@ func isGatewayOriginFailure(proxyErr *proxyA2AError) bool {
 	return isUpstreamDeadStatus(proxyErr.Status)
 }
 
-// invalidateCachedURLForDrain evicts the cached agent URL for workspaceID
-// from Redis so the next drain tick re-resolves it from the DB. Called
-// on transient gateway-origin failures where the cached URL is a likely
-// contributor (stale mapping after a tunnel flap, container port change
-// behind a CDN, etc.). db.ClearWorkspaceKeys already swallows Redis
-// errors internally (the platform's Redis layer is best-effort for the
-// URL cache — a cache-miss is harmless, just slower), so this helper
-// exists mainly for symmetry with the other drain instrumentation.
+// invalidateCachedURLForDrain evicts ONLY the cached agent URL for workspaceID
+// from Redis so the next drain tick re-resolves it from the DB. Called on
+// transient gateway-origin failures where the cached URL is a likely contributor
+// (stale mapping after a tunnel flap, container port change behind a CDN, etc.).
+//
+// finding [10]: this MUST use ClearCachedURL (url key only), NOT ClearWorkspaceKeys.
+// The drain's whole premise is a workspace that is ALIVE/heartbeating whose URL is
+// merely stale — ClearWorkspaceKeys also drops the liveness key (ws:<id>), flipping
+// IsOnline to false and contradicting that premise. ClearCachedURL is the surgical
+// url-only invalidation (see db.ClearCachedURL). It swallows Redis errors internally
+// (the URL cache is best-effort — a cache-miss is harmless, just slower).
 func (h *WorkspaceHandler) invalidateCachedURLForDrain(ctx context.Context, workspaceID string) {
-	db.ClearWorkspaceKeys(ctx, workspaceID)
+	db.ClearCachedURL(ctx, workspaceID)
 }
 
 // handleA2ADispatchError translates a forward-call failure into a proxyA2AError,

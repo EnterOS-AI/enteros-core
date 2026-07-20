@@ -242,6 +242,20 @@ func expectAgentURLResolve(mock sqlmock.Sqlmock, wsID, url string) {
 		WillReturnRows(sqlmock.NewRows([]string{"url", "status"}).AddRow(url, "online"))
 }
 
+// expectAgentURLResolveSettling mocks the same fresh per-attempt DB URL read, but
+// for a workspace that has NOT reached online yet: url is NULL and status is a
+// recoverable-settling state (provisioning / awaiting_agent). resolveAgentURL then
+// returns a classWorkspaceSettling proxyA2AError (no URL), which
+// DrainQueueForWorkspace must route onto the BOUNDED settling path — NOT through
+// proxyA2ARequest (which would enqueueBusyA2A a fresh unbounded row: the #4531
+// regression). status='provisioning' is one of isRecoverableSettlingStatus's set.
+func expectAgentURLResolveSettling(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectQuery(
+		"SELECT url, status FROM workspaces WHERE id = $1").
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"url", "status"}).AddRow(nil, "provisioning"))
+}
+
 // seedRedisURL puts the agent server URL into the Redis cache so resolveAgentURL
 // returns it without needing a DB lookup.
 func seedRedisURL(t *testing.T, mr *miniredis.Miniredis, wsID, url string) {
@@ -431,11 +445,13 @@ func TestDrainQueueForWorkspace_BatchCapacity_DrainsMultiple(t *testing.T) {
 	srv := agentServer(`{"result":{"status":"ok"}}`, http.StatusOK)
 	defer srv.Close()
 	expectDequeueNextOk(mock, item1)
+	// #4531/finding [8]: the agent URL is resolved ONCE per drain call (lazily, on
+	// the first dequeued item), not per-iteration — so only ONE expectAgentURLResolve
+	// is registered even though two items are dispatched.
 	expectAgentURLResolve(mock, wsID, srv.URL)
 	expectQueueBudgetCheck(mock, wsID)
 	expectCompleted(mock, item1.ID, `{"result":{"status":"ok"}}`)
 	expectDequeueNextOk(mock, item2)
-	expectAgentURLResolve(mock, wsID, srv.URL)
 	expectQueueBudgetCheck(mock, wsID)
 	expectCompleted(mock, item2.ID, `{"result":{"status":"ok"}}`)
 
@@ -1040,6 +1056,84 @@ func TestDrainQueueForWorkspace_FreshResolve_UsesNewURLNotStaleCache(t *testing.
 	// resolves (and the proxyA2ARequest that just ran) use the NEW url.
 	if got, err := mr.Get(fmt.Sprintf("ws:%s:url", wsID)); err != nil || got != fresh.URL {
 		t.Errorf("cache was not corrected to the fresh URL after drain: got=(%q, %v), want %q", got, err, fresh.URL)
+	}
+}
+
+// TestDrainQueueForWorkspace_SettlingWorkspace_BoundedRetryNotFreshEnqueue is the
+// regression test for the #4531 unbounded-requeue bug. A workspace stuck
+// provisioning/awaiting_agent (URL-less → resolveAgentURL returns
+// classWorkspaceSettling) had its queued turn routed through proxyA2ARequest, whose
+// classWorkspaceSettling branch enqueueBusyA2A's a FRESH a2a_queue row every drain
+// (attempts=0, settling_since=NULL, enqueued_at=now()) and then MarkQueueItemCompleted's
+// the original — so the #4459 settling ceiling AND DropStaleQueueItems could never
+// fire and the turn zombie-requeued forever.
+//
+// The fix keeps the SAME row on the bounded settling path: MarkQueueItemTransientRetry,
+// which COALESCE-stamps settling_since and preserves attempts (idempotent requeue, no
+// fresh INSERT). This test pins that: a settling workspace's dequeued item is
+// transient-retried and NO proxyA2ARequest / EnqueueA2A INSERT happens.
+//
+// NEGATIVE CONTROL (proven against the pre-fix unconditional-clear code): the ONLY
+// mocks registered after the settling resolve are for MarkQueueItemTransientRetry.
+// The pre-fix code instead calls proxyA2ARequest, whose first DB touch
+// (checkWorkspaceBudget's `SELECT COALESCE(budget_limits ...)`) is unmocked and
+// whose enqueue path issues a fresh EnqueueA2A INSERT — none of which match the
+// registered transient-retry UPDATE, so ExpectationsWereMet reports the
+// transient-retry expectation as UNMET and the test fails. Only the conditional-
+// settling fix makes it pass.
+func TestDrainQueueForWorkspace_SettlingWorkspace_BoundedRetryNotFreshEnqueue(t *testing.T) {
+	item := drainItem("ws-provisioning-settle")
+	// First settling observation: settling_since is still NULL (well within the
+	// ceiling), so the bounded path transient-retries (which STAMPS settling_since)
+	// rather than dropping.
+	item.SettlingSince = sql.NullTime{Valid: false}
+	mock, handler, mr := drainSetup(t, item.WorkspaceID)
+
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolveSettling(mock, item.WorkspaceID)
+	// The bounded path calls MarkQueueItemTransientRetry directly — no proxyA2ARequest,
+	// no budget check, no fresh EnqueueA2A INSERT. The transient-retry SQL COALESCEs
+	// settling_since and undoes DequeueNext's attempts++ (attempts preserved).
+	expectTransientRetry(mock, item.ID, sqlmock.AnyArg())
+
+	// No cached URL: a provisioning workspace has none. ClearCachedURL over an empty
+	// key is a no-op; the DB resolve returns NULL url → classWorkspaceSettling.
+	_ = mr
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (settling workspace was NOT kept on the bounded "+
+			"transient-retry path — likely dispatched through proxyA2ARequest and fresh-enqueued, "+
+			"re-opening #4531): %v", err)
+	}
+}
+
+// TestDrainQueueForWorkspace_SettlingWorkspace_CeilingExceeded_Drops is the twin of
+// the online settling-ceiling drop, on the URL-less/provisioning path. Same inputs
+// as the bounded-retry test EXCEPT settling_since is older than a2aSettlingRetryCeiling:
+// the target has stayed URL-less far past any normal wake/provision window. The bounded
+// path must TERMINALLY DROP the item (DropQueueItemTerminal), NOT transient-retry it,
+// so a provisioning box that never comes online cannot zombie-requeue the turn forever.
+//
+// NEGATIVE CONTROL: only DropQueueItemTerminal is registered after the resolve. If the
+// ceiling branch were absent, the code would MarkQueueItemTransientRetry instead (unmet
+// drop expectation → fail); the pre-#4531-fix code would call proxyA2ARequest (unmet
+// drop expectation → fail).
+func TestDrainQueueForWorkspace_SettlingWorkspace_CeilingExceeded_Drops(t *testing.T) {
+	item := drainItem("ws-provisioning-zombie")
+	item.SettlingSince = sql.NullTime{Time: time.Now().Add(-(a2aSettlingRetryCeiling + time.Minute)), Valid: true}
+	mock, handler, _ := drainSetup(t, item.WorkspaceID)
+
+	expectDequeueNextOk(mock, item)
+	expectAgentURLResolveSettling(mock, item.WorkspaceID)
+	expectSettlingCeilingDrop(mock, item.ID, sqlmock.AnyArg())
+
+	handler.DrainQueueForWorkspace(context.Background(), item.WorkspaceID, 1)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations (settling item past the ceiling was NOT terminally "+
+			"dropped on the URL-less path): %v", err)
 	}
 }
 
