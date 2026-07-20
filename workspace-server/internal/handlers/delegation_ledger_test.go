@@ -334,7 +334,14 @@ func TestLedgerHeartbeat_EmptyIDIsNoOp(t *testing.T) {
 // forward-only guard rejected the transition and the ledger was left permanently
 // reporting `stuck` for a delegation that had SUCCEEDED.
 func TestAllowedTransitionsTableShape(t *testing.T) {
-	for _, terminal := range []string{"completed", "failed"} {
+	// Derive the terminal set from the SSOT vocabulary (DelegationTerminalStates),
+	// NOT a hand-typed pair — a hand-typed list here is the same #4314 drift class.
+	// This is the structural half of the append-only invariant: the delegations
+	// row is a MATERIALIZED VIEW folded over the append-only activity_logs event
+	// stream, and a terminal state must be a SINK so no fold can silently rewrite
+	// a settled outcome. If someone marks a new state terminal, this fails until
+	// its outbound edges are removed.
+	for _, terminal := range DelegationTerminalStates {
 		if _, has := allowedTransitions[terminal]; has {
 			t.Errorf("terminal state %q must not appear as transition source", terminal)
 		}
