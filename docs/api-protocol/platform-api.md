@@ -129,7 +129,8 @@ and `offset` (default 0). The response contract is:
     }
   ],
   "total": 1,
-  "chain_valid": true
+  "chain_valid": true,
+  "chain_verification": "verified"
 }
 ```
 
@@ -141,6 +142,21 @@ when `AUDIT_LEDGER_SALT` is unset or when `offset`, `session_id`, or `from`
 could omit chain predecessors. Clients must distinguish that state from
 `false`, which means verification detected a mismatch in a complete chain
 prefix returned by the endpoint.
+
+`chain_verification` splits the two very different reasons `chain_valid` can be
+`null`, so a missing salt is never a silent no-audit:
+
+| `chain_verification`          | `chain_valid` | meaning |
+| ----------------------------- | ------------- | ------- |
+| `verified`                    | `true`        | full chain re-verified, HMACs intact |
+| `tampered`                    | `false`       | HMAC/link mismatch in a complete prefix (fail-closed) |
+| `unavailable_partial_query`   | `null`        | salt IS set, but `offset`/`session_id`/`from` could omit predecessors (benign) |
+| `disabled_no_salt`            | `null`        | `AUDIT_LEDGER_SALT` is unset: verification is OFF and the ledger is **not tamper-evident** — a misconfiguration, also logged loudly server-side |
+
+The append-only `activity_logs`/`structure_events` stream is the immutable
+source of truth; the folded `delegations` row is a materialized view whose
+lifecycle transitions are forward-only (a terminal state is a sink — see
+`delegation_ledger.go`), so no state transition can silently rewrite history.
 Successful empty responses return `"events": []`. Canvas deliberately does not
 render the hash and HMAC integrity values returned in each event.
 
