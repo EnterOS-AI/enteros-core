@@ -347,7 +347,9 @@ func (p *Provisioner) buildLocalImageWithTelemetry(ctx context.Context, workspac
 		fmt.Sprintf("building %s runtime image from template — a first boot can take several minutes", runtime))
 	start := time.Now()
 	done := make(chan struct{})
+	hbStopped := make(chan struct{})
 	go func() {
+		defer close(hbStopped)
 		t := time.NewTicker(buildHeartbeatInterval)
 		defer t.Stop()
 		for {
@@ -362,6 +364,13 @@ func (p *Provisioner) buildLocalImageWithTelemetry(ctx context.Context, workspac
 	}()
 	tag, err := ensureLocalImageHook(ctx, runtime)
 	close(done)
+	// JOIN the heartbeat before emitting the completion line: close(done)
+	// only signals it, and an already-in-flight tick could land AFTER the
+	// completion, leaving "still building — Ns elapsed" as the log's last
+	// line (canvas watchdog reads that as an unfinished build; also the
+	// TestBuildTelemetrySlowBuild CI flake). The completion line must be
+	// terminal.
+	<-hbStopped
 	if err != nil {
 		return "", err
 	}

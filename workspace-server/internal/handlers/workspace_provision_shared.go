@@ -315,6 +315,35 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		}
 	}
 
+	// SELF-HOST TENANT-IDENTITY DEFAULTS (2026-07-19 operator decision): a
+	// template that hard-requires TENANT_* identity vars (seo-agent's
+	// TENANT_NAME/DOMAIN/TIMEZONE...) must NEVER fail first boot on a
+	// self-hosted stack over them. There is no SaaS tenant here — the
+	// operator IS the tenant — so generate branded placeholders ("Enter OS",
+	// system timezone) for any that are unset and boot; the operator refines
+	// them later via org-scope Secrets (which override these, since defaults
+	// only fill ABSENT keys). Pre-fix the concierge's create flow dead-ended
+	// in MISSING_REQUIRED_ENV and coped by queueing placeholder secret-write
+	// approvals for values that, on self-host, simply don't matter yet.
+	// Self-host signal: no CP proxy wired (same gate as the platform-arm
+	// model fallback). The RESTART path carries templatePath instead of
+	// in-memory configFiles (preflight #5 skips there for the same reason),
+	// so fall back to reading the template's config.yaml from disk — without
+	// this, a restart booted the workspace with NO tenant identity at all
+	// while a create filled it (observed 2026-07-19: online SEO agent with
+	// empty TENANT_* env).
+	if !PlatformManagedProxyConfigured() {
+		reqSrc := configFiles
+		if reqSrc == nil && templatePath != "" {
+			if b, rErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); rErr == nil {
+				reqSrc = map[string][]byte{"config.yaml": b}
+			}
+		}
+		if reqSrc != nil {
+			applySelfHostTenantDefaults(envVars, missingRequiredEnv(reqSrc, envVars))
+		}
+	}
+
 	// Preflight #5: refuse to launch when config.yaml declares required
 	// env vars that are not set. Skipped in SaaS mode when configFiles
 	// is nil (CP-mode's cfg is built without local config bytes — the

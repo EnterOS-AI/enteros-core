@@ -454,6 +454,22 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// and unset/local falls back to the same literal, so no behavior change
 			// today; a later platform-default flip is a separate KMS edit.
 			payload.Runtime = bareCreateDefaultRuntime()
+			// SELF-HOST (2026-07-20 operator decision): a bare create should
+			// follow the ONBOARDING-SELECTED runtime — the platform root's own
+			// runtime (hermes on the current default) — not the SaaS literal.
+			// Same "follow the onboarding selection" doctrine as the model
+			// fallback. Templates that PIN a runtime are untouched
+			// (controlplane#188 fail-closed stands); this only shapes the
+			// no-template, no-runtime default. Gated on no CP proxy (self-host).
+			if !PlatformManagedProxyConfigured() {
+				var rootRuntime string
+				_ = db.DB.QueryRowContext(c.Request.Context(),
+					`SELECT COALESCE(runtime,'') FROM workspaces WHERE kind='platform' AND status != 'removed' LIMIT 1`,
+				).Scan(&rootRuntime)
+				if strings.TrimSpace(rootRuntime) != "" {
+					payload.Runtime = rootRuntime
+				}
+			}
 		}
 	}
 

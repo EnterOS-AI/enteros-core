@@ -125,6 +125,40 @@ func TestHermesManagementProbe_ReadsRenderedConfig(t *testing.T) {
 	}
 }
 
+// TestApplySelfHostTenantDefaults: on self-host, MISSING TENANT_* required
+// vars get branded placeholders (never a bricked first boot), set values are
+// never overridden, and non-TENANT vars (API keys) still fail closed.
+func TestApplySelfHostTenantDefaults(t *testing.T) {
+	env := map[string]string{
+		"TENANT_DOMAIN": "real-customer.com", // operator-set — must survive
+	}
+	missing := []string{
+		"TENANT_NAME", "TENANT_TIMEZONE", "TENANT_DOMAIN_FULL",
+		"TENANT_FUTURE_FIELD", // unknown TENANT_* from a future template
+		"MOONSHOT_API_KEY",    // NOT tenant identity — must stay missing
+	}
+	applySelfHostTenantDefaults(env, missing)
+
+	if env["TENANT_NAME"] != "Enter OS" {
+		t.Errorf("TENANT_NAME = %q; want Enter OS", env["TENANT_NAME"])
+	}
+	if env["TENANT_DOMAIN"] != "real-customer.com" {
+		t.Errorf("operator-set TENANT_DOMAIN was overridden: %q", env["TENANT_DOMAIN"])
+	}
+	if env["TENANT_DOMAIN_FULL"] != "https://enteros.local" {
+		t.Errorf("TENANT_DOMAIN_FULL = %q", env["TENANT_DOMAIN_FULL"])
+	}
+	if env["TENANT_TIMEZONE"] == "" {
+		t.Error("TENANT_TIMEZONE not defaulted to system timezone")
+	}
+	if env["TENANT_FUTURE_FIELD"] != "Enter OS" {
+		t.Errorf("unknown TENANT_* var not placeholdered: %q", env["TENANT_FUTURE_FIELD"])
+	}
+	if _, set := env["MOONSHOT_API_KEY"]; set {
+		t.Error("non-TENANT missing var must NOT be defaulted (API keys fail closed)")
+	}
+}
+
 // TestOnboardingModelCandidates: the self-host fallback must try the stored
 // onboarding model in every runtime-flavored form — raw, after-colon
 // (hermes stores minimax:MiniMax-M3), and after-slash.

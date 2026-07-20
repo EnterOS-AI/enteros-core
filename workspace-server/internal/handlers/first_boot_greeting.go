@@ -128,6 +128,17 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 		}
 		defer firstBootGreetingPending.Delete(workspaceID)
 
+		// Hold the platform-boot-turn gate for the greeting's duration: the
+		// A2A proxy queues (rather than dispatches) caller turns while it is
+		// up, and the queue drain waits on it. Without this, a user who types
+		// the instant the workspace flips online races the in-character
+		// greeting turn — hermes interrupts it and the caller's "answer" is
+		// the "⚡ Interrupting current task…" ack (staging e2e failure,
+		// 2026-07-20). The greeting itself dispatches as a system caller,
+		// which passes the gate.
+		markRestartContextPending(workspaceID)
+		defer clearRestartContextPending(workspaceID)
+
 		ctx, cancel := context.WithTimeout(context.Background(), firstBootGreetingTimeout)
 		defer cancel()
 

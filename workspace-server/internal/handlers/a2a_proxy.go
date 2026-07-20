@@ -857,6 +857,32 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		return http.StatusOK, respBody, nil
 	}
 
+	// PLATFORM-OWNED BOOT TURN IN FLIGHT (first-boot greeting or
+	// restart-context): dispatching a caller's turn NOW interleaves it into
+	// the agent's single session mid-boot-turn — hermes INTERRUPTS the
+	// running turn and acks "⚡ Interrupting current task…", which the caller
+	// receives as their answer (the staging e2e's "opening reply was not a
+	// greeting"). The queue DRAIN already respects this gate
+	// (a2a_queue.go restartContextInFlight check); this closes the DIRECT
+	// dispatch path the same way: durably queue and return the standard
+	// queued envelope (the canvas already waits for the WS-delivered reply
+	// on that shape). System callers pass through — the gate holder itself
+	// dispatches through this proxy.
+	if a2aMethod == "message/send" && restartContextInFlight(workspaceID) && !isSystemCaller(callerID) {
+		if _, _, qErr := EnqueueA2A(ctx, workspaceID, callerID, 50, body, a2aMethod, "", nil); qErr == nil {
+			log.Printf("ProxyA2A: platform boot turn in flight for %s — queued caller turn instead of interleaving", workspaceID)
+			respBody, marshalErr := json.Marshal(gin.H{
+				"status": "queued",
+				"method": a2aMethod,
+			})
+			if marshalErr == nil {
+				return http.StatusOK, respBody, nil
+			}
+		}
+		// Enqueue/marshal failure: fall through to normal dispatch — an
+		// interleaved turn beats a dropped one.
+	}
+
 	// Mock-runtime short-circuit. Workspaces with runtime='mock' have
 	// no container, no EC2, no URL — every reply is synthesised here
 	// from a small canned-variant pool. Built for the "200-workspace
