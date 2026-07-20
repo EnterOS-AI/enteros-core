@@ -1119,6 +1119,59 @@ fi
 ok "Created node is a real kind='workspace' row"
 obs_step_end create_team_verify pass "" "worker_id=$WORKER_ID" "worker_kind=${WORKER_KIND:-workspace}"
 
+# ─── 4.7. CONCIERGE MANAGES A CHILD'S SCHEDULES (org key, CROSS-workspace) ─────
+# The capability the management-mode schedule tools deliver (mcp-server#111): the
+# concierge / org API key can CREATE, LIST and DELETE schedules on ANOTHER
+# workspace. Those verbs POST/GET/DELETE /workspaces/<TARGET>/schedules under the
+# ORG key — exactly what tenant_call does here: TENANT_TOKEN is the org-scoped
+# bearer, which core's WorkspaceAuth org-token branch admits for EVERY workspace in
+# the org. We target the CHILD ($WORKER_ID), NOT the caller — so this proves the
+# cross-workspace grant end-to-end against the real tenant core, deterministically.
+# (The LLM tool-invocation + tool-registration surface is unit-gated in mcp-server's
+# management.test.ts; this gate covers the load-bearing core route + org-key auth.)
+obs_step_start concierge_manages_schedule
+log "4.7/6 CONCIERGE MANAGES SCHEDULES — org key creates a schedule on CHILD $WORKER_ID (cross-workspace)..."
+_SCHED_NAME="e2e-cncrg-sched-$(printf '%s' "$WORKER_ID" | tr -cd 'a-f0-9' | cut -c1-8)"
+_SCHED_TMP="$TMPDIR_E2E/cncrg_sched_out"
+_SCHED_BODY_JSON=$(SCHED_NAME="$_SCHED_NAME" python3 -c 'import json,os; print(json.dumps({"name":os.environ["SCHED_NAME"],"cron_expr":"0 9 * * *","prompt":"e2e cross-workspace schedule (concierge/org key)","enabled":True}))')
+# CREATE — bounded retry only on a 5xx daemon-arm race (the auth/route itself is
+# deterministic; a 401/403 is a HARD, non-retryable capability regression).
+_SCHED_CODE=000
+for _CS_ATTEMPT in $(seq 1 6); do
+  : >"$_SCHED_TMP"
+  _SCHED_CODE=$(tenant_call POST "/workspaces/$WORKER_ID/schedules" \
+    -H "Content-Type: application/json" -d "$_SCHED_BODY_JSON" \
+    -o "$_SCHED_TMP" -w '%{http_code}' 2>/dev/null || echo 000)
+  _SCHED_RESP=$(cat "$_SCHED_TMP" 2>/dev/null || echo "")
+  echo "$_SCHED_CODE" | grep -Eq '^2..$' && break
+  if echo "$_SCHED_CODE" | grep -Eq '^(401|403)$'; then
+    fail "CONCIERGE CROSS-WORKSPACE SCHEDULE DENIED: org-key POST /workspaces/$WORKER_ID/schedules → http=$_SCHED_CODE. \
+The org/tenant key is NOT admitted for another workspace's schedule route — the load-bearing dependency of the management-mode schedule tools (mcp-server#111) is broken (WorkspaceAuth org-token branch). Body: $(echo "$_SCHED_RESP" | head -c 300)"
+  fi
+  log "    create attempt $_CS_ATTEMPT/6 → http=$_SCHED_CODE (daemon-arm/forward race); retrying"; sleep 10
+done
+if ! echo "$_SCHED_CODE" | grep -Eq '^2..$'; then
+  fail "CONCIERGE SCHEDULE CREATE FAILED: org-key POST /workspaces/$WORKER_ID/schedules → http=$_SCHED_CODE (want 2xx) after retries. Body: $(echo "$_SCHED_RESP" | head -c 300)"
+fi
+_SCHED_ID=$(printf '%s' "$_SCHED_RESP" | python3 -c "import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d={}
+print((d.get('id') if isinstance(d,dict) else '') or ((d.get('schedule') or {}).get('id') if isinstance(d,dict) else '') or '')" 2>/dev/null || echo "")
+ok "org key CREATED a schedule on CHILD $WORKER_ID (http=$_SCHED_CODE, id=${_SCHED_ID:-?})"
+# LIST — the created schedule must be visible to the org key on the child.
+_LIST_RESP=$(tenant_call GET "/workspaces/$WORKER_ID/schedules" 2>/dev/null || echo "")
+if ! printf '%s' "$_LIST_RESP" | grep -q "$_SCHED_NAME"; then
+  fail "CONCIERGE SCHEDULE LIST MISSING: org-key GET /workspaces/$WORKER_ID/schedules did not contain '$_SCHED_NAME'. Body: $(echo "$_LIST_RESP" | head -c 300)"
+fi
+ok "org key LISTED child $WORKER_ID schedules and saw '$_SCHED_NAME' (cross-workspace read OK)"
+# DELETE — prove the delete verb + clean up (non-fatal on cleanup miss).
+if [ -n "$_SCHED_ID" ]; then
+  _DEL_CODE=$(tenant_call DELETE "/workspaces/$WORKER_ID/schedules/$_SCHED_ID" -o /dev/null -w '%{http_code}' 2>/dev/null || echo 000)
+  echo "$_DEL_CODE" | grep -Eq '^2..$' && ok "org key DELETED the schedule on child (http=$_DEL_CODE)" || log "    delete returned $_DEL_CODE (non-fatal cleanup)"
+fi
+ok "═ STEP 4.7 PASS: concierge/org-key CROSS-workspace schedule management works end-to-end"
+obs_step_end concierge_manages_schedule pass "" "worker_id=$WORKER_ID" "sched_id=${_SCHED_ID:-none}"
+
 # ─── 4.6. CREATED-AGENT LLM AUTH PRESENCE (corroborating, observability-tolerant)
 # The concierge-created member must receive the platform LLM auth — the CP proxy
 # usage token MOLECULE_LLM_USAGE_TOKEN — or it cannot complete a turn and replies
