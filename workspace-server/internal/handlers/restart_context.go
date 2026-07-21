@@ -285,11 +285,7 @@ func buildRestartA2APayload(workspaceID, text string) ([]byte, error) {
 		"params": map[string]any{
 			"message": map[string]any{
 				"messageId": uuid.New().String(),
-				// The DEFAULT workspace session (same id the canvas and the
-				// server belt use) — platform turns must land in the user's
-				// conversation, not a fresh runtime-minted session
-				// (Langfuse 3-session fragmentation, 2026-07-21).
-				"contextId": canvasSessionContextID(workspaceID),
+				"contextId": platformTurnContextID(workspaceID),
 				"role":      "user",
 				"parts":     []any{map[string]any{"kind": "text", "text": text}},
 				"metadata": map[string]any{

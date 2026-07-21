@@ -1451,6 +1451,20 @@ func canvasSessionContextID(workspaceID string) string {
 	return "canvas-" + workspaceID
 }
 
+// platformTurnContextID is the contextId platform-originated turns (first-boot
+// greeting, restart-context wake) stamp on their synthetic messages: the SAME
+// deterministic default session the canvas uses and the server belt fills —
+// so boots and restarts land in the user's conversation instead of a fresh
+// runtime-minted session (Langfuse 3-session fragmentation, 2026-07-21).
+// KNOWN TRADEOFF: after an explicit "New session" rotation (a client-local
+// sess-* id the server cannot see), platform turns still land in the DEFAULT
+// session. That is deliberate — system notices belong to the workspace's
+// default thread, and chat-history hydration is activity-log based so nothing
+// is lost; the alternative (runtime-minted UUID per boot) fragments tracing.
+func platformTurnContextID(workspaceID string) string {
+	return canvasSessionContextID(workspaceID)
+}
+
 // ensureCanvasSessionContextID injects a stable, deterministic contextId into a
 // canvas-origin message/send envelope that lacks one, and reports whether it
 // rewrote the body. It is the server half of the concierge double-greeting fix:
