@@ -579,6 +579,16 @@ run_scenario() {
   # regardless (D1 flag default-off), so 10e gates only the NEW native
   # plugin-load path, not the digest itself.
   #
+  # E2E_SCHEDULE_DELIVER_CHECK defaults ON (10g, #4555): the fire→DELIVER half.
+  # 10d proves a schedule FIRES; 10g additionally proves the fired turn CALLS
+  # send_message_to_user and the message lands in the AgentMessageWriter notify
+  # ground-truth. It CO-GATES on E2E_SCHEDULER_CHECK=on (the fire machinery) AND a
+  # real tool-calling LLM. This lane's real-LLM arm is the platform path below
+  # (E2E_LLM_PATH=platform → CP-proxied minimax/MiniMax-M2.7), so 10g runs HARD
+  # per-PR here; a keyless/mock arm SKIPs it (never reds). The FIRE half (10d)
+  # stays hard on every arm. Set E2E_SCHEDULE_DELIVER_CHECK=off to disable JUST
+  # the deliver leg without disabling the fire gate.
+  #
   # E2E_SELF_SCHEDULE_CHECK defaults ON (10f), like 10d/10e above — it is a native
   # plugin, gated by default. Step 10f deterministically drives the audience:self
   # create_schedule TOOL via a docker-exec self-mode mcp-server
@@ -620,6 +630,7 @@ run_scenario() {
   E2E_IDLE_FIRE_SECONDS="${E2E_IDLE_FIRE_SECONDS:-30}" \
   E2E_SCHEDULER_CHECK="${E2E_SCHEDULER_CHECK:-on}" \
   E2E_TRIGGER_POLL_SECONDS="${E2E_TRIGGER_POLL_SECONDS:-10}" \
+  E2E_SCHEDULE_DELIVER_CHECK="${E2E_SCHEDULE_DELIVER_CHECK:-on}" \
   E2E_DIGEST_PLUGIN_CHECK="${E2E_DIGEST_PLUGIN_CHECK:-on}" \
   E2E_DIGEST_PLUGIN_SOURCE="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}" \
   E2E_SELF_SCHEDULE_CHECK="${E2E_SELF_SCHEDULE_CHECK:-on}" \
