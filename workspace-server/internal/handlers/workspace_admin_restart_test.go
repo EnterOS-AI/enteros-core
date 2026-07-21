@@ -171,9 +171,35 @@ func (h *WorkspaceHandler) AdminRestart() {
 	}
 }
 
-// adminRestartDispatchShape returns RestartByID calls inside a function literal
-// passed to goAsync separately from every other RestartByID call. Passing nil
-// src makes go/parser read filename from disk.
+// TestAdminRestartAsyncShapeRejectsDeadNestedDispatch proves the gate does not
+// accept a RestartByID call hidden in an uncalled nested function. Lexical
+// ancestry inside goAsync is insufficient; the restart must be the wrapper's
+// direct executable statement.
+func TestAdminRestartAsyncShapeRejectsDeadNestedDispatch(t *testing.T) {
+	t.Parallel()
+
+	const nested = `package handlers
+func (h *WorkspaceHandler) AdminRestart() {
+	h.goAsync(func() {
+		_ = func() { h.RestartByID("ws-1") }
+	})
+}`
+	tracked, untracked, err := adminRestartDispatchShape("dead_nested_dispatch.go", nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tracked != 0 || untracked != 1 {
+		t.Fatalf(
+			"dead nested RestartByID mutation shape = tracked:%d untracked:%d; want tracked:0 untracked:1",
+			tracked,
+			untracked,
+		)
+	}
+}
+
+// adminRestartDispatchShape returns direct RestartByID calls in a top-level
+// goAsync wrapper separately from every other RestartByID call. Passing nil src
+// makes go/parser read filename from disk.
 func adminRestartDispatchShape(filename string, src any) (tracked, untracked int, err error) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, filename, src, 0)
@@ -194,60 +220,56 @@ func adminRestartDispatchShape(filename string, src any) (tracked, untracked int
 	}
 	receiver := adminRestart.Recv.List[0].Names[0].Name
 
-	trackedLiterals := make(map[*ast.FuncLit]struct{})
+	receiverCall := func(expression ast.Expr, method string) (*ast.CallExpr, bool) {
+		call, ok := expression.(*ast.CallExpr)
+		if !ok {
+			return nil, false
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != method {
+			return nil, false
+		}
+		owner, ok := selector.X.(*ast.Ident)
+		return call, ok && owner.Name == receiver
+	}
+
+	trackedCalls := make(map[*ast.CallExpr]struct{})
+	for _, statement := range adminRestart.Body.List {
+		expression, ok := statement.(*ast.ExprStmt)
+		if !ok {
+			continue
+		}
+		wrapper, ok := receiverCall(expression.X, "goAsync")
+		if !ok || len(wrapper.Args) != 1 {
+			continue
+		}
+		literal, ok := wrapper.Args[0].(*ast.FuncLit)
+		if !ok || len(literal.Body.List) != 1 {
+			continue
+		}
+		restartStatement, ok := literal.Body.List[0].(*ast.ExprStmt)
+		if !ok {
+			continue
+		}
+		restart, ok := receiverCall(restartStatement.X, "RestartByID")
+		if ok {
+			trackedCalls[restart] = struct{}{}
+		}
+	}
+
 	ast.Inspect(adminRestart.Body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
+		if _, ok := receiverCall(call, "RestartByID"); !ok {
 			return true
 		}
-		owner, ownerOK := selector.X.(*ast.Ident)
-		if !ownerOK || owner.Name != receiver || selector.Sel.Name != "goAsync" || len(call.Args) != 1 {
-			return true
+		if _, ok := trackedCalls[call]; ok {
+			tracked++
+		} else {
+			untracked++
 		}
-		literal, ok := call.Args[0].(*ast.FuncLit)
-		if ok {
-			trackedLiterals[literal] = struct{}{}
-		}
-		return true
-	})
-
-	var ancestors []ast.Node
-	ast.Inspect(adminRestart.Body, func(node ast.Node) bool {
-		if node == nil {
-			ancestors = ancestors[:len(ancestors)-1]
-			return true
-		}
-
-		if call, ok := node.(*ast.CallExpr); ok {
-			selector, selectorOK := call.Fun.(*ast.SelectorExpr)
-			if selectorOK {
-				owner, ownerOK := selector.X.(*ast.Ident)
-				if ownerOK && owner.Name == receiver && selector.Sel.Name == "RestartByID" {
-					insideTrackedLiteral := false
-					for _, ancestor := range ancestors {
-						literal, ok := ancestor.(*ast.FuncLit)
-						if !ok {
-							continue
-						}
-						if _, ok := trackedLiterals[literal]; ok {
-							insideTrackedLiteral = true
-							break
-						}
-					}
-					if insideTrackedLiteral {
-						tracked++
-					} else {
-						untracked++
-					}
-				}
-			}
-		}
-
-		ancestors = append(ancestors, node)
 		return true
 	})
 
