@@ -46,6 +46,14 @@ export function getConversationId(workspaceId: string): string {
     // stranded on a fragment forever. Legacy conv-* ids are old defaults —
     // fold them into the deterministic session. Post-unification EXPLICIT
     // rotations mint `sess-*`, which is preserved (user-chosen isolation).
+    //
+    // ACCEPTED TRADEOFF (review wf_8b04761b #3): a PRE-deploy explicit
+    // "New session" also minted conv-* and is indistinguishable from a
+    // legacy default, so it folds into the deterministic session too. The
+    // harm is bounded — for these browsers the canvas-<wsid> runtime thread
+    // is fresh (their history lived under conv-* ids), so they join a new
+    // default rather than resuming the rotated-away context — while NOT
+    // migrating would strand every legacy browser on a fragment forever.
     if (existing && !existing.startsWith("conv-")) return existing;
     // DEFAULT is the DETERMINISTIC workspace session id — the SAME value the
     // server belt (canvasSessionContextID) fills for contextId-less sends and
