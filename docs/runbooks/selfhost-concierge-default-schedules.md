@@ -122,28 +122,81 @@ deploy tail below), the prompt tells the concierge to report that update tooling
 is not yet installed and do nothing else — so the schedule is harmless before
 its tooling ships.
 
-## Owner-gated deploy tail (required before `plugin-auto-update` functions)
+## Status (as of 2026-07-21)
+
+The publish + pin-cascade + image-bake tail (formerly the blocker) is **DONE**:
+`plugin-auto-update`'s verbs are shipped in mcp-server **1.9.6**, baked into the
+**0.4.36** runtime image. The feature is code-complete. What remains OPEN is
+external / owner-gated (operator action), an unbuilt guard, or follow-up
+coverage — not code we still owe.
+
+**DONE**
+
+- Template `schedules:` block (template #20) + the tool-verified delivery-rule
+  persona (template #21) — a scheduled-job prompt must show a tool result in the
+  same turn, retry once, then report FAILED, never a bare confirmation line.
+- Self-host graft in core (`graftConciergeSchedules`, core #4549).
+- `check_plugin_updates` + `apply_plugin_update` verbs (mcp-server #115),
+  **published in mcp-server 1.9.6** via the break-glass publish path.
+- Pin cascade to 1.9.6: sdk #139, runtime #340, mcp-server #116, claude-code
+  template #336.
+- Runtime **0.4.36** fleet roll — `.runtime-version` bumped to 0.4.36 (carrying
+  the 1.9.6 verbs) across the four maintained templates (claude-code #338,
+  hermes #285, codex #284, openclaw #259), and the self-host installer pinned
+  (`scripts/install-workspace-runtime.sh` `RUNTIME_VERSION="0.4.36"`; core
+  runtime pins bumped).
+- Composition coverage: core #4556 (Go **unit** test pinning both defaults
+  through the graft) + runtime #341 (runtime-level seed / fire-signal / deliver
+  **unit** tests with stubs). See the Coverage note under Provenance — these are
+  unit tests, **not** a live e2e.
+
+**OPEN**
+
+- **Self-host operator image redeploy.** Publishing 0.4.36 does not touch a
+  running self-host deployment; the *operator* must pull the 0.4.36 image and
+  re-provision the concierge for `plugin-auto-update` to gain its verbs. Until an
+  operator does, the schedule degrades gracefully (reports tooling missing).
+- **Self-restart health guard.** `apply_plugin_update` restarting the
+  concierge's own workspace mid-schedule (see the caveat above) could brick the
+  org-root concierge on a bad ref. **Addressed by core #4565** (in review): the
+  Apply path now DEFERS the restart when the target is the platform concierge
+  (mirroring the reconcile path's `platformConciergeReconcileShouldSkipRestart`
+  guard) — the new ref is re-pinned and picked up on the next deliberate restart,
+  never as an auto-apply side effect; non-concierge workspaces still restart
+  immediately. A post-restart health-probe + pin-rollback remains a possible
+  future hardening.
+- **Live fire→deliver e2e** — [molecule-core #4555]: a real self-host concierge
+  that seeds, has the daemon fire the cron, and `send_message_to_user` actually
+  deliver, is **not** covered by the unit tests above.
+- **Stale gitea-MCP / release-CI token.** 1.9.6 shipped via the break-glass
+  publish path because the mcp-server release-CI token is dead; a fresh token is
+  needed to restore the normal tagged-release publish (no `v1.9.6` git tag was
+  cut — tags stop at v1.9.5).
+
+## `plugin-auto-update` verbs — now live (the former deploy tail)
 
 `daily-activity-report` works as soon as the template (#20) and core graft
 (#4549) are in place and the concierge re-provisions — it uses only
 `send_message_to_user` and the always-present `/activity` (+ `/mail/summary`)
 endpoints, so it needs no new tooling.
 
-`plugin-auto-update` only functions once its verbs are live, which is an
-**owner-gated deploy tail**:
+`plugin-auto-update` needs its management-mode verbs, which are now **shipped**
+(what used to be the owner-gated deploy tail):
 
-1. **Publish** `molecule-mcp-server` carrying the `check_plugin_updates` +
-   `apply_plugin_update` management-mode verbs (mcp-server #115, merged) — via
+1. **Publish — DONE.** `molecule-mcp-server` carrying the `check_plugin_updates`
+   + `apply_plugin_update` verbs (mcp-server #115) is published as **1.9.6** via
    the break-glass publish path.
-2. **Pin cascade** the new mcp-server version through the SDK / runtime /
-   template pins.
-3. **Bake** the pinned mcp-server into the self-host runtime image and
-   re-provision.
+2. **Pin cascade — DONE.** 1.9.6 is pinned through sdk #139, runtime #340,
+   mcp-server #116, and the claude-code template #336.
+3. **Bake — DONE.** 1.9.6 is baked into the **0.4.36** runtime image (four
+   template `.runtime-version` bumps + the self-host installer pin).
 
-Until that tail completes, `plugin-auto-update` degrades gracefully (reports the
-tooling is missing). `check_plugin_updates` reads
-`GET /admin/plugin-updates-pending`; `apply_plugin_update` POSTs the hardened
-`/admin/plugin-updates/:id/apply` — both org-key-authed (management-mode only).
+The one remaining step is not ours: a **self-host operator** must redeploy onto
+the 0.4.36 image and re-provision the concierge (see OPEN above). Until an
+operator does, `plugin-auto-update` degrades gracefully (reports the tooling is
+missing). `check_plugin_updates` reads `GET /admin/plugin-updates-pending`;
+`apply_plugin_update` POSTs the hardened `/admin/plugin-updates/:id/apply` —
+both org-key-authed (management-mode only).
 
 ## Provenance
 

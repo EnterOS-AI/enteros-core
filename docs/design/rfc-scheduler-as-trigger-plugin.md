@@ -185,7 +185,7 @@ Each phase is DONE only when its **Build · Tests/CI · e2e · Cleanup · Docs**
 - **Cleanup:** the delivery is additive — nothing retired here; it is the *precondition* for P4's `workspace_schedules` drop (P4b).
 - **Docs:** this block; `project_scheduler_trigger_plugin_no_default_delivery` memory; the plugin repo README. ⏳ SDK trigger-plugin authoring guide still references the scaffold (task #39).
 
-### P5.1 — Concierge default schedules (self-host) — **MERGED: template #20, core graft #4549; verbs mcp-server #115; plugin-auto-update deploy tail owner-gated**
+### P5.1 — Concierge default schedules (self-host) — **MERGED + DEPLOYED: template #20, core graft #4549, verbs mcp-server #115; published 1.9.6 + fleet-rolled to runtime-0.4.36 (2026-07-21); only the self-host operator's own image redeploy + a live fire→deliver e2e (#4555) remain**
 
 An *operational* increment on top of P5's delivery: now that a self-host
 workspace boots the scheduler daemon, the **self-host concierge** ships two
@@ -212,14 +212,37 @@ graft* increment — no new scheduler-engine seam.
   `check_plugin_updates` (`GET /admin/plugin-updates-pending`) +
   `apply_plugin_update` (`POST /admin/plugin-updates/:id/apply`), management-mode
   / org-key-authed. `apply_plugin_update` re-pins and restarts the affected
-  workspace — including the concierge's own if it updates a plugin on itself
-  (self-restart caveat). Core/runtime updates are report-only (operator deploy).
-- **Deploy tail (owner-gated).** `daily-activity-report` works once #20 + #4549
-  land and the concierge re-provisions (it uses only `send_message_to_user` +
-  the always-present `/activity` (+ `/mail/summary`) endpoints).
-  `plugin-auto-update` only **functions** once mcp-server (with #115) is
-  published + pin-cascaded + baked into the self-host runtime image — until then
-  its prompt degrades gracefully (reports tooling not installed).
+  workspace — including the concierge's own if it updates a plugin on itself.
+  The **self-brick guard (#4565)** defers that self-restart for the platform
+  concierge (mirrors the reconcile path's `platformConciergeReconcileShouldSkipRestart`);
+  non-concierge workspaces still restart immediately. Core/runtime updates are
+  report-only (operator deploy).
+- **Verified assumptions (2026-07-21).** Two load-bearing preconditions were
+  proven against code, not assumed: the runtime reconcile
+  (`seed_schedules_from_workspace_config` → `ScheduleStore.upsert_template`) is
+  **non-destructive** of operator-edited schedules (preserves `source=runtime`,
+  honors tombstones, atomic writes; 33 tests); and the concierge **can deliver**
+  `send_message_to_user` by default (tool registered unconditionally, RBAC default
+  `operator`→approve, `workspaces.talk_to_user_enabled` DB-default TRUE, not
+  overridden on concierge creation).
+- **Deploy tail — DONE (2026-07-21).** `daily-activity-report` works once #20 +
+  #4549 land and the concierge re-provisions (it uses only `send_message_to_user`
+  + the always-present `/activity` (+ `/mail/summary`) endpoints).
+  `plugin-auto-update`'s verbs are now live: mcp-server **1.9.6 PUBLISHED**
+  (break-glass path — the tagged-release publish.yml stays dead on the revoked
+  Infisical `MOL_PACKAGE_TOKEN`, so no `v1.9.6` git tag was cut) → pin cascade
+  sdk#139 / runtime#340 / mcp-server#116 / template#336 → **runtime-0.4.36**
+  bakes `MANAGEMENT_MCP_PINNED_VERSION=1.9.6`, fleet-rolled via `.runtime-version`
+  bumps on all four maintained templates (claude-code#338 / hermes#285 /
+  codex#284 / openclaw#259). The one remaining step is **not ours**: a self-host
+  *operator* must redeploy onto the 0.4.36 image + re-provision the concierge;
+  until then `plugin-auto-update` degrades gracefully (reports tooling missing).
+- **Coverage (honest).** core#4556 is a Go **unit** test pinning both defaults
+  through the graft; runtime#341 is runtime-level **unit** tests (seed / fire-
+  *signal* / deliver) with **stubs** (DELIVER stubs `httpx` — the LLM is never
+  invoked; FIRE writes a poke file the daemon never consumes). These are **not**
+  a live e2e. The live self-host seed→cron-fire→LLM-turn→`send_message_to_user`
+  loop is **not** covered — open as **[#4555]**.
 - **Docs/runbook:** `docs/runbooks/selfhost-concierge-default-schedules.md`;
   memory `project_selfhost_concierge_default_schedules`.
 
