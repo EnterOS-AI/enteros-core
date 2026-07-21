@@ -183,11 +183,12 @@ func TestDelegate_PrivilegedConcurrentRetryRace_ReplaysWithoutGrantOr403(t *test
 // delegation with no consumable grant must still be REJECTED (403) — and because
 // the pending row is now inserted BEFORE the gate, the reject path must ROLL IT
 // BACK so the never-dispatched delegation neither holds the idempotency slot nor
-// lingers as a phantom in-flight row. Rollback TERMINALIZES the row (bounded
-// UPDATE ... SET status='failed'), not a hard DELETE (#4539 follow-up: a DELETE
-// left an idempotency-race loser holding a delegation_id whose row vanished →
-// not-found forever). This guards against the reorder accidentally (a) making the
-// gate permissive, or (b) leaking the speculative row on a 403.
+// lingers as a phantom in-flight row. This request carries NO idempotency_key, so
+// no idempotent poller can exist — rollback hard-DELETEs it (the keyless branch;
+// #4539 re-review FINDING[1] keeps DELETE keyless to avoid unreclaimable orphan
+// 'failed' rows). The keyed branch (terminalize-to-'failed') is covered separately.
+// This guards against the reorder accidentally (a) making the gate permissive, or
+// (b) leaking the speculative row on a 403.
 func TestDelegate_PrivilegedNewDelegationNoGrant_Rejected403AndRollsBackRow(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	mock := setupTestDB(t)
@@ -219,12 +220,9 @@ func TestDelegate_PrivilegedNewDelegationNoGrant_Rejected403AndRollsBackRow(t *t
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
 		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
-	// The reject MUST roll back the speculative pending row by TERMINALIZING it
-	// (UPDATE ... SET status='failed'), bounded to exactly this
-	// (workspace_id, delegation_id) pending delegate row — NOT a hard DELETE, so an
-	// idempotency-race loser holding this delegation_id resolves to an honest
-	// terminal state instead of a phantom not-found (#4539 follow-up).
-	mock.ExpectExec(`UPDATE activity_logs\s+SET status = 'failed'`).
+	// Keyless reject → the rollback hard-DELETEs the speculative pending row,
+	// bounded to exactly this (workspace_id, delegation_id) pending delegate row.
+	mock.ExpectExec("DELETE FROM activity_logs").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
@@ -318,38 +316,57 @@ func TestRestorePrivilegedDelegationGrant_EmptyGrantIsNoDBTouch(t *testing.T) {
 	}
 }
 
-// #4539 follow-up BUG 1 (phantom idempotency-loser): rollbackUndispatchedDelegation
-// must TERMINALIZE the rejected speculative row (UPDATE ... SET status='failed'),
-// NOT hard-DELETE it. The DELETE erased a row an idempotency-race LOSER already
-// held (it returned the winner's delegation_id as 'pending' after the unique-
-// constraint conflict); once the winner 403s and the row is gone,
-// check_delegation_status returns not-found forever — a permanent phantom.
+// #4539 BUG 1 + re-review FINDING[1] (phantom idempotency-loser, key-aware):
+// rollbackUndispatchedDelegation's disposition depends on whether the rejected
+// delegation carried an idempotency_key.
 //
-// Negative control: the ONLY registered Exec expectation is the terminalizing
-// UPDATE bounded to (workspace_id, delegation_id). On the PRE-FIX code the rollback
-// issues `DELETE FROM activity_logs`, which (a) is an unexpected statement against
-// the mock and (b) leaves the UPDATE expectation unmet — so ExpectationsWereMet
-// fails. A green run is only reachable once the rollback terminalizes instead of
-// deletes, i.e. the loser's delegation_id resolves to an honest terminal state.
-func TestRollbackUndispatchedDelegation_TerminalizesNotDeletes(t *testing.T) {
-	mock := setupTestDB(t)
-
+//   - KEYED: an idempotency-race LOSER may hold this delegation_id (it returned the
+//     winner's id as 'pending' after the unique-constraint conflict), so the row is
+//     TERMINALIZED to 'failed' — the loser's poll resolves to an honest terminal
+//     state instead of a permanent phantom not-found. Pre-fix issued a DELETE.
+//   - KEYLESS: no idempotent poller can exist (lookupIdempotentDelegation
+//     early-returns for an empty key), so the row is hard-DELETEd — a terminal
+//     'failed' row here would be an unreclaimable orphan.
+//
+// Negative control (keyed direction): the ONLY registered Exec is the terminalizing
+// UPDATE. On the PRE-FIX code (unconditional DELETE) that UPDATE expectation stays
+// unmet AND a DELETE fires unexpectedly, so ExpectationsWereMet fails. Green is only
+// reachable once the keyed branch terminalizes.
+func TestRollbackUndispatchedDelegation_KeyedTerminalizes_KeylessDeletes(t *testing.T) {
 	const (
 		wsID         = "88888888-8888-4888-8888-888888888888"
 		delegationID = "99999999-9999-4999-8999-999999999999"
 	)
-	// Expect the terminalizing UPDATE bounded to this workspace + delegation_id.
-	// (A DELETE from the pre-fix code would not match and would leave this unmet.)
-	mock.ExpectExec(`UPDATE activity_logs\s+SET status = 'failed'`).
-		WithArgs(wsID, delegationID).
-		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	rollbackUndispatchedDelegation(context.Background(), wsID, delegationID)
+	t.Run("keyed_terminalizes", func(t *testing.T) {
+		mock := setupTestDB(t)
+		// Expect the terminalizing UPDATE bounded to this workspace + delegation_id.
+		// (A DELETE from the pre-fix code would not match and would leave this unmet.)
+		mock.ExpectExec(`UPDATE activity_logs\s+SET status = 'failed'`).
+			WithArgs(wsID, delegationID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("rollback must terminalize the rejected row (UPDATE status='failed'), not DELETE it — "+
-			"an idempotency-race loser must resolve to a terminal state, not phantom not-found: %v", err)
-	}
+		rollbackUndispatchedDelegation(context.Background(), wsID, delegationID, "some-idem-key")
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("keyed rollback must terminalize the rejected row (UPDATE status='failed'), not DELETE — "+
+				"an idempotency-race loser must resolve to a terminal state, not phantom not-found: %v", err)
+		}
+	})
+
+	t.Run("keyless_deletes", func(t *testing.T) {
+		mock := setupTestDB(t)
+		// No poller can exist for a keyless delegation → clean DELETE, no orphan.
+		mock.ExpectExec(`DELETE FROM activity_logs`).
+			WithArgs(wsID, delegationID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		rollbackUndispatchedDelegation(context.Background(), wsID, delegationID, "")
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("keyless rollback must hard-DELETE the rejected row (no poller, no orphan): %v", err)
+		}
+	})
 }
 
 // #4539 follow-up BUG 2 (grant burned on ctx-expiry): restorePrivilegedDelegationGrant
@@ -385,5 +402,60 @@ func TestRestorePrivilegedDelegationGrant_SurvivesExpiredContext(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("restore MUST land the consumed_at=NULL UPDATE even on an expired ctx "+
 			"(otherwise the single-use grant stays burned on a never-dispatched delegation): %v", err)
+	}
+}
+
+// #4539 re-review FINDING[0]: the ENTIRE non-dispatch cleanup — not just the grant
+// restore — must run on a fresh detached context. In the 30-min-ceiling failure
+// mode, executeDelegation reaches finalizeNonDispatchedDelegation with an EXPIRED
+// delegationCtx; if the terminalization + delegate_result write inherited it, they
+// short-circuit in database/sql's (*DB).conn and the row is stuck 'pending'/
+// 'dispatched' forever (a phantom the sweeper/digest count and a same-key retry
+// replays as an idempotent HIT), even though #4539 already detached the restore.
+//
+// This drives finalizeNonDispatchedDelegation with an already-expired ctx and
+// asserts EVERY cleanup write lands: the status-terminalize UPDATE, the
+// delegate_result INSERT, the failure broadcast, AND the grant-restore UPDATE.
+// Negative control: revert the shared detached cleanupCtx (use the inherited ctx)
+// and all four short-circuit → the ordered expectations stay unmet → FAIL.
+func TestFinalizeNonDispatchedDelegation_ExpiredCtxTerminalizesAndRestores(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mock := setupTestDB(t)
+	setupTestRedis(t) // RecordAndBroadcast publishes to db.RDB
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	const (
+		sourceID     = "a1a1a1a1-1111-4111-8111-a1a1a1a1a1a1"
+		targetID     = "b2b2b2b2-2222-4222-8222-b2b2b2b2b2b2"
+		delegationID = "c3c3c3c3-3333-4333-8333-c3c3c3c3c3c3"
+		grantID      = "d4d4d4d4-4444-4444-8444-d4d4d4d4d4d4"
+	)
+
+	// Cleanup order (ledger + inbox-push are flag-off no-ops → no queries):
+	//   1. updateDelegationStatus → activity_logs UPDATE (terminalize to 'failed')
+	//   2. delegate_result INSERT
+	//   3. failure broadcast → structure_events INSERT
+	//   4. grant restore → approval_requests UPDATE
+	mock.ExpectExec(`UPDATE activity_logs\s+SET status`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO structure_events`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE approval_requests\s+SET consumed_at = NULL`).
+		WithArgs(grantID, sourceID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// The 30-min delegationCtx has ALREADY expired by the time this cleanup runs.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	dh.finalizeNonDispatchedDelegation(ctx, sourceID, targetID, delegationID, "target unreachable (deadline exceeded)", grantID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expired-ctx non-dispatch cleanup MUST terminalize the row AND restore the grant "+
+			"(row must not be left phantom-pending): %v", err)
 	}
 }

@@ -387,10 +387,14 @@ func restorePrivilegedDelegationGrant(ctx context.Context, workspaceID, grantID 
 	// clear never lands, and the single-use grant stays burned on a delegation that
 	// never dispatched — defeating the restore in precisely the ctx-expiry failure
 	// mode it exists to cover. context.WithoutCancel keeps trace/tenant values while
-	// dropping the inherited (possibly-expired) deadline; a fresh short timeout bounds
-	// the compensating write. This mirrors the established detach pattern in this
-	// package (a2a_proxy_helpers.go: enqueue/log-on-detached-ctx).
-	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	// dropping the inherited (possibly-expired) deadline; a fresh timeout bounds the
+	// compensating write. The 30s floor matches the other detached-ctx budgets in
+	// this package (a2a_proxy_helpers.go enqueue/log paths) rather than a tighter 10s
+	// (#4539 re-review FINDING[4]): a single-row UPDATE is far below either ceiling,
+	// but 30s is a safer floor for the common (non-expired) failure path where the
+	// caller may still have budget, and the ceiling exists only to bound a
+	// pathological hang, not to race a healthy write.
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	if _, err := db.DB.ExecContext(restoreCtx, `
 		UPDATE approval_requests
