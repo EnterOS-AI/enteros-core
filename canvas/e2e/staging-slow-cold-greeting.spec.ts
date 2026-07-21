@@ -201,13 +201,7 @@ async function waitForStableAgentBubbles(
   );
 }
 
-// FIXME(#4517): circular fix-behind-deploy — this spec exercises the
-// first-boot greeting RACE whose server-side fix (greeting holds the
-// boot-turn gate; proxy queues direct sends while it is up) ships IN
-// PR #4517, but staging runs the deployed tenant build, which only
-// picks the fix up AFTER that PR merges and deploys. Un-skip in the
-// follow-up PR once the staging deploy lands (expected green).
-test.fixme("slow cold first turn: the ONE stored greeting RENDERS exactly once (no duplicate bubble)", async ({
+test("slow cold first turn: the ONE stored greeting RENDERS exactly once (no duplicate bubble)", async ({
   page,
   context,
 }) => {
