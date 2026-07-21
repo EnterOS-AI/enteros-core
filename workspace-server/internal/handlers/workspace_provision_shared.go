@@ -377,29 +377,42 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		return nil, abort
 	}
 
-	// The SCHEDULER is a BASE per-workspace ability, declared UNCONDITIONALLY on
-	// every workspace at provision (not flag-gated). The one molecule-scheduler
-	// plugin ships BOTH halves of self-scheduling — the firing trigger daemon AND
-	// the self-audience self-schedule MCP tool (plugin-mcp-audience-contract
-	// self-schedule v1). The tool CANNOT be declared on-demand the way the daemon
-	// alone was (ensureSchedulerPluginDeclared on schedule-create): you need the
-	// tool to create the first schedule. So every workspace gets it up front — which
-	// is also what the native-plugins registry already intends ("the scheduler is
+	// The SCHEDULER is a BASE per-workspace ability, declared on every workspace at
+	// provision. The one molecule-scheduler plugin ships BOTH halves of
+	// self-scheduling — the firing trigger daemon AND the self-audience
+	// self-schedule MCP tool (plugin-mcp-audience-contract self-schedule v1). The
+	// tool CANNOT be declared on-demand the way the daemon alone was
+	// (ensureSchedulerPluginDeclared on schedule-create): you need the tool to
+	// create the first schedule. So every workspace gets it up front — which is also
+	// what the native-plugins registry already intends ("the scheduler is
 	// default-on-every-workspace"). The org-manage side stays on the concierge
 	// management MCP (install:concierge, org key) — never this every-workspace
 	// plugin. Non-fatal + idempotent (recordDeclaredPlugin upserts); placed AFTER
 	// every provision abort gate so a failed preflight records no orphan rows.
-	if err := ensureSchedulerPluginDeclared(ctx, workspaceID); err != nil {
-		log.Printf("provision: declare scheduler plugin for %s (non-fatal): %v", workspaceID, err)
+	//
+	// Guarded by a DEFAULT-ON kill-switch (declareSchedulerPluginEnabled): the
+	// roll-out stays on by default — byte-identical to today — but the owner can
+	// HALT it in an emergency by setting MOLECULE_DECLARE_SCHEDULER_PLUGIN to a
+	// falsey value, without a code revert (the idle-digest half kept its flag, so
+	// the scheduler needs a symmetric switch).
+	if declareSchedulerPluginEnabled() {
+		if err := ensureSchedulerPluginDeclared(ctx, workspaceID); err != nil {
+			log.Printf("provision: declare scheduler plugin for %s (non-fatal): %v", workspaceID, err)
+		}
 	}
 
 	// RFC molecule-core#4413: declare the OTHER install:default native plugins
 	// (the idle-digest providers) on this workspace, from the SDK native-plugins
 	// registry SSOT. Placed AFTER every provision abort gate so a failed preflight
 	// records no orphan rows. Still FLAG-gated (default off) — the owner arms it
-	// during the fleet rollout once the runtime digest loaders are live; the
-	// scheduler above is intentionally NOT gated (base ability), so it re-declaring
-	// the scheduler here when the flag is on is a harmless idempotent no-op.
+	// during the fleet rollout once the runtime digest loaders are live. This path
+	// EXCLUDES the scheduler source (declareDefaultNativePlugins filters it out):
+	// the scheduler is owned by the ensureSchedulerPluginDeclared path above, which
+	// declares it under the const name SchedulerPluginName ("molecule-scheduler"),
+	// whereas this path derives its name from the source via PluginNameFromSource
+	// ("molecule-ai-plugin-scheduler") — declaring it here too would write a SECOND,
+	// differently-named workspace_declared_plugins row for one plugin (a duplicate
+	// boot-install), not the harmless idempotent no-op an earlier comment claimed.
 	// Non-fatal and idempotent — runs on every provision path (create/restart/resume).
 	declareDefaultNativePlugins(ctx, workspaceID)
 

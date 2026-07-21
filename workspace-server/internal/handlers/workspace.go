@@ -1190,6 +1190,33 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		}
 	}
 
+	// Payload-declared plugins (CreateWorkspacePayload.Plugins): the API-level
+	// equivalent of a template's `plugins:` block for callers that don't own a
+	// template (e.g. an e2e harness declaring a native plugin to exercise its
+	// boot-install). Seeded pre-dispatch, alongside the scheduler declare above,
+	// so the entries land in workspace_declared_plugins BEFORE provisionWorkspaceAuto
+	// captures the declared set: the provision goroutine's buildProvisionerConfig →
+	// desiredPluginSources reads workspace_declared_plugins at dispatch time, so a
+	// payload plugin is present in the FIRST-BOOT MOLECULE_DECLARED_PLUGINS rather
+	// than arriving only via the post-online reconcile → docker-cp → mid-lifecycle
+	// restart. Flows through the SAME seedTemplatePlugins → recordDeclaredPlugin
+	// chokepoint as the template blocks, so it inherits the idempotent ON CONFLICT
+	// upsert AND the privileged-plugin kind-gate (the concierge MCP can never be
+	// declared here on a non-platform workspace). Seeded unconditionally on
+	// len(payload.Plugins) > 0 — there is no provisionOK yet pre-dispatch, and a
+	// later provision failure tears down the workspace anyway. The maxTemplatePlugins
+	// count cap (payloadPluginsToSeed) mirrors parseTemplatePlugins so a hostile
+	// payload can't enqueue an unbounded declared set. Non-fatal: a bad entry never
+	// blocks provisioning.
+	if len(payload.Plugins) > 0 {
+		if declared, ok := payloadPluginsToSeed(payload.Plugins); !ok {
+			log.Printf("Create %s: payload declares more than the %d-plugin cap — skipping payload plugin seed", id, maxTemplatePlugins)
+		} else if len(declared) > 0 {
+			recorded, skipped := seedTemplatePlugins(ctx, id, declared)
+			log.Printf("Create %s: recorded %d/%d payload-declared plugins (skipped=%d)", id, recorded, len(declared), skipped)
+		}
+	}
+
 	// Auto-provision — pick backend: control plane (SaaS) or Docker (self-hosted).
 	// Routing AND the no-backend mark-failed path are both inside
 	// provisionWorkspaceAuto (single source of truth). The Create-specific
@@ -1248,24 +1275,6 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 				recorded, skipped := seedTemplatePlugins(ctx, id, declaredPlugins)
 				log.Printf("Create %s: recorded %d/%d fetched-template declared plugins (skipped=%d)", id, recorded, len(declaredPlugins), skipped)
 			}
-		}
-	}
-
-	// Payload-declared plugins (CreateWorkspacePayload.Plugins): the API-level
-	// equivalent of a template's `plugins:` block for callers that don't own a
-	// template (e.g. an e2e harness declaring a native plugin to exercise its
-	// boot-install). Flows through the SAME seedTemplatePlugins →
-	// recordDeclaredPlugin chokepoint as the template blocks above, so it inherits
-	// the idempotent ON CONFLICT upsert AND the privileged-plugin kind-gate (the
-	// concierge MCP can never be declared here on a non-platform workspace). This
-	// is the DURABLE declare channel: unlike a MOLECULE_DECLARED_PLUGINS value
-	// injected via `secrets`, a payload plugin lands in the declared-set SSOT that
-	// provision recomputes MOLECULE_DECLARED_PLUGINS from, so it is not overwritten.
-	// Non-fatal: a bad entry never blocks provisioning (the workspace row is live).
-	if provisionOK && len(payload.Plugins) > 0 {
-		if declared := mergePlugins(nil, payload.Plugins); len(declared) > 0 {
-			recorded, skipped := seedTemplatePlugins(ctx, id, declared)
-			log.Printf("Create %s: recorded %d/%d payload-declared plugins (skipped=%d)", id, recorded, len(declared), skipped)
 		}
 	}
 
