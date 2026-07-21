@@ -97,7 +97,7 @@ func firstBootFallbackText(toolCount int) string {
 // buildFirstBootGreetPayload wraps the greet prompt in the JSON-RPC 2.0 A2A
 // message/send shape the proxy normalizes — the same envelope restart-context
 // uses, with its own metadata kind so runtimes/forensics can identify it.
-func buildFirstBootGreetPayload() ([]byte, error) {
+func buildFirstBootGreetPayload(workspaceID string) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
@@ -105,6 +105,11 @@ func buildFirstBootGreetPayload() ([]byte, error) {
 		"params": map[string]any{
 			"message": map[string]any{
 				"messageId": uuid.New().String(),
+				// Same DEFAULT workspace session the canvas + server belt +
+				// restart-context use — the greeting must open the user's
+				// conversation, not a runtime-minted session (Langfuse
+				// 3-session fragmentation, 2026-07-21).
+				"contextId": canvasSessionContextID(workspaceID),
 				"role":      "user",
 				"parts":     []any{map[string]any{"kind": "text", "text": firstBootGreetPrompt}},
 				"metadata": map[string]any{
@@ -166,7 +171,7 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 		// writer below is the single chat entry point (no duplicate rows).
 		text := ""
 		if runTurn != nil {
-			if payload, err := buildFirstBootGreetPayload(); err == nil {
+			if payload, err := buildFirstBootGreetPayload(workspaceID); err == nil {
 				status, resp, turnErr := runTurn(ctx, workspaceID, payload, "system:first-boot-greeting", false)
 				switch {
 				case turnErr != nil || status >= 300:

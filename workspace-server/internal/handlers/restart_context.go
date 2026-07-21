@@ -277,7 +277,7 @@ func waitForFreshHeartbeat(ctx context.Context, workspaceID string, restartStart
 // buildRestartA2APayload wraps the rendered context string in the
 // JSON-RPC 2.0 / A2A message/send shape that the proxy already knows
 // how to normalize. Returns the marshalled body ready for ProxyA2ARequest.
-func buildRestartA2APayload(text string) ([]byte, error) {
+func buildRestartA2APayload(workspaceID, text string) ([]byte, error) {
 	payload := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
@@ -285,6 +285,11 @@ func buildRestartA2APayload(text string) ([]byte, error) {
 		"params": map[string]any{
 			"message": map[string]any{
 				"messageId": uuid.New().String(),
+				// The DEFAULT workspace session (same id the canvas and the
+				// server belt use) — platform turns must land in the user's
+				// conversation, not a fresh runtime-minted session
+				// (Langfuse 3-session fragmentation, 2026-07-21).
+				"contextId": canvasSessionContextID(workspaceID),
 				"role":      "user",
 				"parts":     []any{map[string]any{"kind": "text", "text": text}},
 				"metadata": map[string]any{
@@ -357,7 +362,7 @@ func (h *WorkspaceHandler) sendRestartContext(workspaceID string, data restartCo
 	}
 
 	text := buildRestartContextMessage(data)
-	body, err := buildRestartA2APayload(text)
+	body, err := buildRestartA2APayload(workspaceID, text)
 	if err != nil {
 		log.Printf("restart-context: failed to marshal payload for %s: %v", workspaceID, err)
 		return
@@ -391,7 +396,7 @@ const restartContextQueueTTL = 30 * time.Minute
 // The idempotency key is derived from the restart timestamp so retries of the
 // same restart collapse to one queued message.
 func (h *WorkspaceHandler) enqueueRestartContext(ctx context.Context, workspaceID string, data restartContextData, why string) {
-	body, err := buildRestartA2APayload(buildRestartContextMessage(data))
+	body, err := buildRestartA2APayload(workspaceID, buildRestartContextMessage(data))
 	if err != nil {
 		log.Printf("restart-context: failed to marshal payload for %s: %v", workspaceID, err)
 		return

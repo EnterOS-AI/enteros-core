@@ -42,7 +42,13 @@ export function getConversationId(workspaceId: string): string {
   try {
     const existing = window.localStorage.getItem(key);
     if (existing) return existing;
-    const id = mint(workspaceId);
+    // DEFAULT is the DETERMINISTIC workspace session id — the SAME value the
+    // server belt (canvasSessionContextID) fills for contextId-less sends and
+    // the platform stamps on its own turns (first-boot greeting,
+    // restart-context). One workspace = one default session across browsers,
+    // restarts, and boots (Langfuse showed 3 fragments, 2026-07-21); a RANDOM
+    // id is minted only on an explicit "New session" (rotateConversationId).
+    const id = `canvas-${workspaceId}`;
     window.localStorage.setItem(key, id);
     return id;
   } catch {
