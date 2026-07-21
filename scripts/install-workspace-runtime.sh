@@ -5,7 +5,7 @@
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-RUNTIME_VERSION="0.4.29"
+RUNTIME_VERSION="0.4.36"
 PRIVATE_INDEX="https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/"
 PUBLIC_INDEX="https://pypi.org/simple/"
 
