@@ -14,11 +14,11 @@ TEARDOWN = ROOT / "tests/e2e/lib/go_e2e_run_teardown.sh"
 HELPER = "bash tests/e2e/lib/go_e2e_run_teardown.sh"
 STEP_NAME = "Teardown safety net (runs on timeout/cancel/failure)"
 
+# The e2e-staging-saas / e2e-workspace-lifecycle-staging TEST lanes were retired
+# (their journeys now run per-PR on the isolated ephemeral-CP gate, which tears
+# down its own dind topology and never leaks real staging orgs — so it needs no
+# go-e2e-run teardown net). Only the surviving staging workflows remain here.
 EXPECTED_STEPS = {
-    ("e2e-staging-saas.yml", "e2e-staging-workspace-requests"): "req",
-    ("e2e-staging-saas.yml", "e2e-staging-concierge-platform"): "cncrg mcp",
-    ("e2e-staging-saas.yml", "e2e-staging-plugin-lifecycle"): "plgn",
-    ("e2e-workspace-lifecycle-staging.yml", "lifecycle-staging"): "life",
     ("runtime-default-flip-gate.yml", "flip-gate"): "mcp",
     ("staging-tenant-cd.yml", "e2e-smoke"): "life mcp",
 }
