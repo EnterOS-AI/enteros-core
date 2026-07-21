@@ -118,8 +118,13 @@ const transientRetryBackoffSecs = 5
 //   - unkeyed messages (an insert would duplicate, never collapse)
 // The upsert lands on the row the original ingest wrote (ON CONFLICT
 // workspace_id,message_id), so no new bubble is ever created here.
-func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, workspaceID string, reqBody, respBody []byte) {
+func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, workspaceID string, hasCaller bool, reqBody, respBody []byte) {
 	if len(respBody) == 0 {
+		return
+	}
+	// Peer/delegation turns (caller_id present) have their own stitching
+	// (delegation rows) and must never render in this workspace's chat.
+	if hasCaller {
 		return
 	}
 	if st := messagestore.RequestSourceType(reqBody); st != "" && messagestore.IsSelfSourceType(st) {
@@ -129,21 +134,35 @@ func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, works
 	if messageID == "" {
 		return
 	}
-	logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-	defer cancel()
-	method := "message/send"
-	summary := "message/send (queued turn reply)"
-	LogActivity(logCtx, h.broadcaster, ActivityParams{
-		WorkspaceID:  workspaceID,
-		ActivityType: "a2a_receive",
-		TargetID:     &workspaceID,
-		Method:       &method,
-		Summary:      &summary,
-		RequestBody:  json.RawMessage(reqBody),
-		ResponseBody: json.RawMessage(respBody),
-		ToolTrace:    extractToolTrace(respBody),
-		Status:       "ok",
-		MessageId:    messageID,
+	// Async (review wf_8b04761b #7): the DB write must not stall the drain
+	// loop; and UPDATE-ONLY (#5): if no ingest row exists for this
+	// messageId, an upsert would INSERT a fresh source_id-NULL row that
+	// hydrates as a surprise user bubble — skip instead (the reply still
+	// reached the user live via the runtime's own delivery).
+	h.goAsync(func() {
+		logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		var exists bool
+		if err := db.DB.QueryRowContext(logCtx,
+			`SELECT EXISTS(SELECT 1 FROM activity_logs WHERE workspace_id = $1 AND message_id = $2)`,
+			workspaceID, messageID,
+		).Scan(&exists); err != nil || !exists {
+			return
+		}
+		method := "message/send"
+		summary := "message/send (queued turn reply)"
+		LogActivity(logCtx, h.broadcaster, ActivityParams{
+			WorkspaceID:  workspaceID,
+			ActivityType: "a2a_receive",
+			TargetID:     &workspaceID,
+			Method:       &method,
+			Summary:      &summary,
+			RequestBody:  json.RawMessage(reqBody),
+			ResponseBody: json.RawMessage(respBody),
+			ToolTrace:    extractToolTrace(respBody),
+			Status:       "ok",
+			MessageId:    messageID,
+		})
 	})
 }
 
@@ -646,11 +665,6 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		// count attempts; the new (re-)queue row already exists.
 		if status == http.StatusAccepted {
 			MarkQueueItemCompleted(ctx, item.ID, nil)
-			// Async tool-trace completion (2026-07-21): attach the reply +
-			// tool_trace onto the USER turn's message-keyed activity row.
-			// Self-source platform turns (restart-context wake, first-boot
-			// greet) are skipped — their replies are not user chat.
-			h.attachQueuedTurnCompletion(ctx, workspaceID, item.Body, respBody)
 			log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s re-queued (target still busy)",
 				item.ID, workspaceID)
 			continue
@@ -737,6 +751,12 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 			continue
 		}
 		MarkQueueItemCompleted(ctx, item.ID, respBody)
+		// Async tool-trace completion (2026-07-21, corrected by review
+		// wf_8b04761b: the first wiring landed on the 202-requeue branch and
+		// stamped the busy-ack as the durable reply). ONLY here — the 200
+		// branch with the agent's REAL reply — attach response_body +
+		// tool_trace onto the canvas turn's message-keyed activity row.
+		h.attachQueuedTurnCompletion(ctx, workspaceID, item.CallerID.Valid, item.Body, respBody)
 		log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s dispatched (attempt=%d)",
 			item.ID, workspaceID, resolvedURL, item.Attempts)
 

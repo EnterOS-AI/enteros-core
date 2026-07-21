@@ -134,7 +134,7 @@ func TestExternalRuntimeTemplates_InstallPrivateWheelWithPublicDependencies(t *t
 	for name, body := range runtimeTemplates {
 		for _, required := range []string{
 			"pip download --no-deps",
-			"molecules-workspace-runtime==0.4.13",
+			"molecules-workspace-runtime==0.4.36",
 			"pip install --index-url https://pypi.org/simple/",
 			"molecules_workspace_runtime-*.whl",
 		} {

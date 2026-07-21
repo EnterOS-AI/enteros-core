@@ -159,10 +159,16 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 				WHERE workspace_id = $1
 				  AND activity_type = 'a2a_receive'
 				  AND source_id IS NULL
-				  -- Self-source platform turns (restart-context wake etc.) are
-				  -- NOT user chat: a wake ingested during a slow first boot
-				  -- must not suppress the greeting (review wf_b8f98be3 #4).
-				  AND COALESCE(request_body->'params'->'message'->'metadata'->>'source_type', '') NOT LIKE 'self-%'
+				  -- Self-source platform/runtime turns (restart-context wake,
+				  -- heartbeat harvester, cron self-ticks...) are NOT user chat:
+				  -- they must not suppress the greeting (reviews wf_b8f98be3 #4,
+				  -- wf_8b04761b #4). The marker lives at params.metadata
+				  -- (primary, runtime-stamped) OR params.message.metadata
+				  -- (platform-stamped) — mirror RequestSourceType and check both.
+				  AND COALESCE(
+				        request_body->'params'->'metadata'->>'source_type',
+				        request_body->'params'->'message'->'metadata'->>'source_type',
+				        '') NOT LIKE 'self-%'
 			)`, workspaceID,
 		).Scan(&hasHistory); err != nil {
 			log.Printf("first-boot greeting: history check failed for %s (skipping): %v", workspaceID, err)
