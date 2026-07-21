@@ -120,26 +120,30 @@ func TestAuthenticateA2AHTTPCaller_ClaimMustMatchBearerOwner(t *testing.T) {
 	}
 }
 
-// TestAuthenticateA2AHTTPCaller_SameOriginNoBearerRejected is the #95 hole-1
-// negative control. The subprocess sets CANVAS_PROXY_URL so IsSameOriginCanvas
-// returns true for the crafted Referer/Host — i.e. the exact forgeable signal
-// the old branch trusted. With NO real credential the request must now FAIL
-// CLOSED: a matching Referer/Origin/Host is trivially forged by any container
-// on the Docker network and can no longer grant the canvas bypass.
-func TestAuthenticateA2AHTTPCaller_SameOriginNoBearerRejected(t *testing.T) {
-	const subprocess = "MOLECULE_TEST_SAME_ORIGIN_NOBEARER_A2A"
+// TestAuthenticateA2AHTTPCaller_SelfHostSameOriginNoBearerAccepted is the
+// finding[1] regression control: on SELF-HOST (no CP session verifier, no
+// ADMIN_TOKEN) the legitimate same-origin Canvas has no non-forgeable credential
+// to present, so the same-origin fallback is intentionally RETAINED there. The
+// subprocess sets CANVAS_PROXY_URL (so IsSameOriginCanvas is true for the crafted
+// Referer/Host) and leaves CP_UPSTREAM_URL / MOLECULE_ORG_SLUG unset (so
+// CPSessionConfigured() is false). A same-origin no-bearer request must still
+// authenticate as a canvas-class caller. This is a KNOWN self-host trust
+// boundary (#95 hole 1) — see the SaaS negative control below that proves it
+// does NOT apply when CP is configured.
+func TestAuthenticateA2AHTTPCaller_SelfHostSameOriginNoBearerAccepted(t *testing.T) {
+	const subprocess = "MOLECULE_TEST_SELFHOST_SAME_ORIGIN_NOBEARER_A2A"
 	if os.Getenv(subprocess) != "1" {
-		cmd := exec.Command(os.Args[0], "-test.run=^TestAuthenticateA2AHTTPCaller_SameOriginNoBearerRejected$", "-test.v")
+		cmd := exec.Command(os.Args[0], "-test.run=^TestAuthenticateA2AHTTPCaller_SelfHostSameOriginNoBearerAccepted$", "-test.v")
 		cmd.Env = append(os.Environ(),
 			subprocess+"=1",
 			"CANVAS_PROXY_URL=http://local-canvas.test",
-			"CP_UPSTREAM_URL=",
+			"CP_UPSTREAM_URL=", // self-host: no CP session verifier
 			"MOLECULE_ORG_SLUG=",
-			"ADMIN_TOKEN=", // no admin token configured
+			"ADMIN_TOKEN=", // self-host with no admin token configured
 		)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf("same-origin no-bearer subprocess failed: %v\n%s", err, out)
+			t.Fatalf("self-host same-origin no-bearer subprocess failed: %v\n%s", err, out)
 		}
 		return
 	}
@@ -149,15 +153,62 @@ func TestAuthenticateA2AHTTPCaller_SameOriginNoBearerRejected(t *testing.T) {
 	c, w := newA2AAuthContext()
 	c.Request.Host = "local-canvas.test"
 	c.Request.Header.Set("Referer", "http://local-canvas.test/")
-	// NO Authorization header — a forged same-origin request with no credential.
+	// NO Authorization header — the self-host Canvas same-origin request.
+
+	callerID, isCanvasUser, err := authenticateA2AHTTPCaller(c.Request.Context(), c, "local-canvas-user")
+
+	if err != nil {
+		t.Fatalf("self-host same-origin canvas must still authenticate (finding[1]): %v, response=%s", err, w.Body.String())
+	}
+	if !isCanvasUser {
+		t.Fatal("self-host same-origin canvas must become a canvas user")
+	}
+	if callerID != "local-canvas-user" {
+		t.Fatalf("self-host same-origin canvas keeps the claimed caller, got %q", callerID)
+	}
+}
+
+// TestAuthenticateA2AHTTPCaller_SaaSSameOriginNoBearerRejected is the #95 hole-1
+// SaaS negative control (the other direction). The subprocess configures CP
+// (CP_UPSTREAM_URL + MOLECULE_ORG_SLUG set, so CPSessionConfigured() is true)
+// AND sets CANVAS_PROXY_URL so IsSameOriginCanvas returns true for the crafted
+// Referer/Host — the exact forgeable signal. With CP configured the self-host
+// fallback is DEAD, and with no bearer / no verified session the request must
+// FAIL CLOSED: a matching Referer/Origin/Host is trivially forged by any
+// container on the Docker network and can no longer grant the canvas bypass on
+// SaaS.
+func TestAuthenticateA2AHTTPCaller_SaaSSameOriginNoBearerRejected(t *testing.T) {
+	const subprocess = "MOLECULE_TEST_SAAS_SAME_ORIGIN_NOBEARER_A2A"
+	if os.Getenv(subprocess) != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestAuthenticateA2AHTTPCaller_SaaSSameOriginNoBearerRejected$", "-test.v")
+		cmd.Env = append(os.Environ(),
+			subprocess+"=1",
+			"CANVAS_PROXY_URL=http://local-canvas.test",
+			"CP_UPSTREAM_URL=https://cp.example.test", // SaaS: CP session verifier configured
+			"MOLECULE_ORG_SLUG=acme",
+			"ADMIN_TOKEN=", // no admin token
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("SaaS same-origin no-bearer subprocess failed: %v\n%s", err, out)
+		}
+		return
+	}
+
+	setupTestDB(t)
+	setupTestRedis(t)
+	c, w := newA2AAuthContext()
+	c.Request.Host = "local-canvas.test"
+	c.Request.Header.Set("Referer", "http://local-canvas.test/")
+	// NO Authorization header, NO session cookie — a forged same-origin request.
 
 	_, isCanvasUser, err := authenticateA2AHTTPCaller(c.Request.Context(), c, "local-canvas-user")
 
 	if err == nil {
-		t.Fatal("forged same-origin request with no credential must be rejected (#95 hole 1)")
+		t.Fatal("SaaS forged same-origin request with no credential must be rejected (#95 hole 1)")
 	}
 	if isCanvasUser {
-		t.Fatal("a no-credential same-origin request must NOT become a canvas user")
+		t.Fatal("SaaS no-credential same-origin request must NOT become a canvas user")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d: %s", w.Code, w.Body.String())

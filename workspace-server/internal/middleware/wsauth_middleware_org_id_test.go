@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"crypto/sha256"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -174,6 +175,12 @@ func TestWorkspaceAuth_OrgToken_CrossOrg_Denied(t *testing.T) {
 	mock.ExpectQuery(workspaceOrgRootQuery).
 		WithArgs("ws-victim").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(victimOrgRootWorkspaceID))
+	// Resolve-arm (finding[2]): the attacker anchor's OWN org root is the
+	// attacker's org — CONFIRMED different from the victim's root, so the deny is
+	// a real cross-org mismatch (not a lookup-error fall-through).
+	mock.ExpectQuery(workspaceOrgRootQuery).
+		WithArgs(attackerCPOrgUUID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(deterministicPlatformAgentID(attackerCPOrgUUID)))
 
 	r := gin.New()
 	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
@@ -186,6 +193,108 @@ func TestWorkspaceAuth_OrgToken_CrossOrg_Denied(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("cross-org org token must be denied 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceAuth_OrgToken_TransientRootLookupError_DoesNotDeny(t *testing.T) {
+	// finding[0] AVAILABILITY: WorkspaceAuth is a broad data-route gate, so a
+	// TRANSIENT datastore error on the org-root lookup must NOT introduce a new
+	// fleet-wide 403 cliff. On a lookup error the request falls back to the
+	// pre-PR global-org-key acceptance (no worse than today) — the anchored org
+	// token still passes (200). A CONFIRMED cross-org mismatch still 403s (see
+	// TestWorkspaceAuth_OrgToken_CrossOrg_Denied). Distinct realistic UUIDs.
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	orgToken := "tok_transient_db_blip"
+	tokenHash := sha256.Sum256([]byte(orgToken))
+	cpOrgUUID := "5c2f9a10-6b3d-4e7a-8c1f-9d0e2b4a6c88"
+
+	mock.ExpectQuery(orgTokenValidateQuery).
+		WithArgs(tokenHash[:]).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).
+			AddRow("tok-blip", "tok_blip", cpOrgUUID, nil))
+	mock.ExpectExec("UPDATE org_api_tokens SET last_used_at").
+		WithArgs("tok-blip").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The org-root lookup hits a transient datastore error.
+	mock.ExpectQuery(workspaceOrgRootQuery).
+		WithArgs("ws-blip").
+		WillReturnError(errors.New("org-root store momentarily unavailable"))
+
+	r := gin.New()
+	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/workspaces/ws-blip/secrets", nil)
+	req.Header.Set("Authorization", "Bearer "+orgToken)
+	r.ServeHTTP(w, req)
+
+	if w.Code == http.StatusForbidden {
+		t.Errorf("transient org-root lookup error must NOT 403 an in-org token (finding[0]); got 403: %s", w.Body.String())
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 (fall back to pre-PR acceptance on a DB blip), got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+func TestWorkspaceAuth_OrgToken_NonDerivedRandomRoot_Allowed(t *testing.T) {
+	// finding[2] NON-DERIVED ROOT: an org whose root workspace has a PLAIN RANDOM
+	// id (not DeterministicPlatformAgentID) with a token anchored to the CP org
+	// UUID. Neither cheap arm of orgAnchorMatchesRoot matches, so the bind must
+	// RESOLVE the token anchor to its own org root and compare — both resolve to
+	// the same random root → allowed (200). Distinct realistic UUIDs.
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	orgToken := "tok_non_derived_random_root"
+	tokenHash := sha256.Sum256([]byte(orgToken))
+	cpOrgUUID := "2b7e4d1c-8a3f-4c9d-9e05-1a2b3c4d5e6f"
+	randomOrgRoot := "9f0e1d2c-3b4a-4958-8677-56453423120a" // NOT det(cpOrgUUID)
+	if deterministicPlatformAgentID(cpOrgUUID) == randomOrgRoot || cpOrgUUID == randomOrgRoot {
+		t.Fatal("test precondition broken: root must be a non-derived random id distinct from the anchor")
+	}
+
+	mock.ExpectQuery(orgTokenValidateQuery).
+		WithArgs(tokenHash[:]).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "prefix", "org_id", "expires_at"}).
+			AddRow("tok-ndr", "tok_ndr_", cpOrgUUID, nil))
+	mock.ExpectExec("UPDATE org_api_tokens SET last_used_at").
+		WithArgs("tok-ndr").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Target's org root is the RANDOM id (cheap arms miss).
+	mock.ExpectQuery(workspaceOrgRootQuery).
+		WithArgs("ws-ndr").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(randomOrgRoot))
+	// Resolve-arm: the token anchor's OWN org root is that same random root.
+	mock.ExpectQuery(workspaceOrgRootQuery).
+		WithArgs(cpOrgUUID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(randomOrgRoot))
+
+	r := gin.New()
+	r.GET("/workspaces/:id/secrets", WorkspaceAuth(mockDB), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/workspaces/ws-ndr/secrets", nil)
+	req.Header.Set("Authorization", "Bearer "+orgToken)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("non-derived-root in-org org token must be allowed (finding[2]), got %d: %s", w.Code, w.Body.String())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet sqlmock expectations: %v", err)

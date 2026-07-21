@@ -54,21 +54,22 @@ func expectValidUnanchoredOrgToken(mock sqlmock.Sqlmock) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
-// TestAuthenticateA2AHTTPCaller_OrgToken_ConciergeCPOrgUUID_AttributesOrgRoot is
-// the #95 hole-2/hole-4 positive + attribution control, AND the regression guard
-// for the catastrophic namespace bug. The concierge managed org token is anchored
-// to the raw CP org UUID (MOLECULE_ORG_ID); the target's org root is the
+// TestAuthenticateA2AHTTPCaller_OrgToken_ConciergeCPOrgUUID_CanvasClass is the
+// #95 hole-2/hole-4 positive + attribution control, AND the regression guard for
+// the catastrophic namespace bug. The concierge managed org token is anchored to
+// the raw CP org UUID (MOLECULE_ORG_ID); the target's org root is the
 // platform-agent WORKSPACE id, DeterministicPlatformAgentID(cpOrgUUID) — a
 // DISTINCT value. The prior pass compared them directly and 403'd every anchored
 // org token; here the token authenticates as a canvas-class principal and:
 //   - it must NOT carry the caller-supplied X-Workspace-ID (an unverified claim);
-//   - it must be attributed to a REAL, verified caller (the token's org root
-//     workspace), NOT the anonymous-canvas identity ("").
+//   - it is attributed as a CANVAS-CLASS caller ("") — an org key is a human/
+//     org-admin principal, not a workspace (finding[6]); returning the org root
+//     workspace id would collide with the target on a self-dispatch.
 //
 // Realistic DISTINCT UUIDs — the token org_id and the org root are NOT the same
 // literal — so this fails against a naive `root == orgID` bind and passes only
-// with the like-for-like mapping.
-func TestAuthenticateA2AHTTPCaller_OrgToken_ConciergeCPOrgUUID_AttributesOrgRoot(t *testing.T) {
+// with the like-for-like mapping (the det() cheap arm here).
+func TestAuthenticateA2AHTTPCaller_OrgToken_ConciergeCPOrgUUID_CanvasClass(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	t.Setenv("ADMIN_TOKEN", "")
@@ -99,11 +100,8 @@ func TestAuthenticateA2AHTTPCaller_OrgToken_ConciergeCPOrgUUID_AttributesOrgRoot
 	if !isCanvasUser {
 		t.Fatal("managed-org token must authenticate as a canvas-class principal")
 	}
-	if callerID == "some-victim-workspace" {
-		t.Fatal("org token must NOT return the unverified claimed caller (forgery)")
-	}
-	if callerID != orgRootWorkspaceID {
-		t.Fatalf("org token must be attributed to the verified org root %q, got %q", orgRootWorkspaceID, callerID)
+	if callerID != "" {
+		t.Fatalf("org token must be attributed canvas-class (\"\"), never a workspace id or the forged claim; got %q", callerID)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -112,8 +110,8 @@ func TestAuthenticateA2AHTTPCaller_OrgToken_ConciergeCPOrgUUID_AttributesOrgRoot
 
 // TestAuthenticateA2AHTTPCaller_OrgToken_WorkspaceRootAnchor_Allowed covers the
 // other legitimate namespace: an org token anchored directly to the org-root
-// WORKSPACE id (the FK form). The direct-equality arm allows it, attributed to
-// that same org root.
+// WORKSPACE id (the FK form). The direct-equality cheap arm allows it, attributed
+// canvas-class ("").
 func TestAuthenticateA2AHTTPCaller_OrgToken_WorkspaceRootAnchor_Allowed(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -137,47 +135,135 @@ func TestAuthenticateA2AHTTPCaller_OrgToken_WorkspaceRootAnchor_Allowed(t *testi
 	if !isCanvasUser {
 		t.Fatal("managed-org token must authenticate as a canvas-class principal")
 	}
-	if callerID != orgRootWorkspaceID {
-		t.Fatalf("attribution: got %q, want org root %q", callerID, orgRootWorkspaceID)
+	if callerID != "" {
+		t.Fatalf("attribution: got %q, want canvas-class \"\"", callerID)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// TestAuthenticateA2AHTTPCaller_OrgToken_Unanchored_FailsClosed is the #95 hole-1
-// negative control: an UNANCHORED org token (org_id NULL) has no verifiable org
-// scope and must NOT be trusted as a cross-workspace canvas-class caller on the
-// A2A dispatch path (isCanvasUser=true would skip CanCommunicate/sameOrg/
-// can_delegate). It fails CLOSED 403 — never reaching the org-root lookup.
-func TestAuthenticateA2AHTTPCaller_OrgToken_Unanchored_FailsClosed(t *testing.T) {
+// TestAuthenticateA2AHTTPCaller_OrgToken_NonDerivedRandomRoot_Allowed is the
+// finding[2] positive control: an org whose root workspace has a PLAIN RANDOM id
+// (NOT DeterministicPlatformAgentID) with a token anchored to the CP org UUID.
+// Neither cheap arm of orgAnchorMatchesRoot matches (anchor != root, and
+// det(anchor) != the random root), so the bind must RESOLVE the token anchor to
+// its own org root and compare in the same namespace — here both resolve to the
+// same random root → allowed. Distinct realistic UUIDs throughout.
+func TestAuthenticateA2AHTTPCaller_OrgToken_NonDerivedRandomRoot_Allowed(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	t.Setenv("ADMIN_TOKEN", "")
+
+	cpOrgUUID := "3a9d1e2f-4b6c-4d8e-9f01-2c3b4a5d6e7f"
+	randomOrgRoot := "b17c9e04-5f2a-4c1d-8e3b-6a7d9c0f1234" // NOT det(cpOrgUUID)
+	if DeterministicPlatformAgentID(cpOrgUUID) == randomOrgRoot || cpOrgUUID == randomOrgRoot {
+		t.Fatal("test precondition broken: root must be a non-derived random id distinct from the anchor")
+	}
+
+	expectNotAWorkspaceToken(mock)
+	expectValidAnchoredOrgToken(mock, cpOrgUUID)
+	// Target's org root is the RANDOM id (cheap arms miss).
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
+		WithArgs("ws-target").
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(randomOrgRoot))
+	// Resolve-arm: the token anchor's OWN org root is that same random root.
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
+		WithArgs(cpOrgUUID).
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(randomOrgRoot))
+
+	c, w := a2aAuthContextWithTarget("ws-target")
+	c.Request.Header.Set("Authorization", "Bearer org-token-value")
+
+	callerID, isCanvasUser, err := authenticateA2AHTTPCaller(c.Request.Context(), c, "")
+	if err != nil {
+		t.Fatalf("non-derived-root in-org org token rejected (finding[2]): %v, response=%s", err, w.Body.String())
+	}
+	if !isCanvasUser {
+		t.Fatal("in-org org token must authenticate as a canvas-class principal")
+	}
+	if callerID != "" {
+		t.Fatalf("attribution: got %q, want canvas-class \"\"", callerID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAuthenticateA2AHTTPCaller_OrgToken_SelfDispatchToOrgRoot_NotSelf is the
+// finding[6] control: an org token dispatching to the ORG-ROOT workspace itself
+// (target == org root). The old code returned targetRoot as callerID, so
+// callerID == workspaceID — mis-classified as a workspace self-request. The
+// caller must instead be attributed canvas-class (""), NEVER equal to the target
+// workspace id, so a real org-admin→concierge dispatch is not treated as self.
+func TestAuthenticateA2AHTTPCaller_OrgToken_SelfDispatchToOrgRoot_NotSelf(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	t.Setenv("ADMIN_TOKEN", "")
+
+	orgRoot := "d4f10a2b-3c5e-4a6d-8b9f-1e2d3c4b5a60"
+
+	expectNotAWorkspaceToken(mock)
+	expectValidAnchoredOrgToken(mock, orgRoot)
+	// The TARGET is the org root itself; its org root resolves to itself.
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
+		WithArgs(orgRoot).
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(orgRoot))
+
+	c, w := a2aAuthContextWithTarget(orgRoot) // dispatch TO the org root workspace
+	c.Request.Header.Set("Authorization", "Bearer org-token-value")
+
+	callerID, isCanvasUser, err := authenticateA2AHTTPCaller(c.Request.Context(), c, "")
+	if err != nil {
+		t.Fatalf("org-admin dispatch to org root rejected: %v, response=%s", err, w.Body.String())
+	}
+	if !isCanvasUser {
+		t.Fatal("org token must authenticate as a canvas-class principal")
+	}
+	if callerID == orgRoot {
+		t.Fatal("finding[6]: caller must NOT equal the target org-root workspace (self-request mis-classification)")
+	}
+	if callerID != "" {
+		t.Fatalf("attribution: got %q, want canvas-class \"\"", callerID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAuthenticateA2AHTTPCaller_OrgToken_Unanchored_AcceptedAsCanvasClass is the
+// finding[3] control: an UNANCHORED org token (org_id NULL) is accepted on every
+// OTHER /workspaces/:id/* route (WorkspaceAuth applies no org bind to a NULL-org
+// token), so failing closed on /a2a alone would break legacy automation without
+// closing anything. It is accepted here as a canvas-class caller ("") — aligned
+// with the middleware. RESIDUAL LEGACY GAP (#95): no org scope is enforced for
+// an unanchored token; anchoring (PATCH /org/tokens/:id) is the migration. No
+// org-root lookup fires (accepted before the bind).
+func TestAuthenticateA2AHTTPCaller_OrgToken_Unanchored_AcceptedAsCanvasClass(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
 	t.Setenv("ADMIN_TOKEN", "")
 
 	expectNotAWorkspaceToken(mock)
 	expectValidUnanchoredOrgToken(mock)
-	// NOTE: no org_chain lookup is expected — the unanchored token is rejected
+	// NOTE: no org_chain lookup is expected — the unanchored token is accepted
 	// before the bind. ExpectationsWereMet fails if an unexpected query fires.
 
 	c, w := a2aAuthContextWithTarget("ws-target")
 	c.Request.Header.Set("Authorization", "Bearer legacy-unanchored-token")
-	// Even a forged in-target claim must not rescue an unanchored token.
+	// A forged in-target claim must NOT be returned as the caller either.
 	c.Request.Header.Set("X-Workspace-ID", "ws-target")
 
 	callerID, isCanvasUser, err := authenticateA2AHTTPCaller(c.Request.Context(), c, "ws-target")
 
-	if !errors.Is(err, errCallerOrgMismatch) {
-		t.Fatalf("unanchored org token: got err %v, want errCallerOrgMismatch", err)
+	if err != nil {
+		t.Fatalf("unanchored org token must be accepted (finding[3]): %v, response=%s", err, w.Body.String())
 	}
-	if isCanvasUser {
-		t.Fatal("unanchored org token must NOT become a canvas user (hole 1)")
+	if !isCanvasUser {
+		t.Fatal("unanchored org token must authenticate as a canvas-class principal (aligned with middleware)")
 	}
 	if callerID != "" {
-		t.Fatalf("unanchored org token must not authenticate any caller; got %q", callerID)
-	}
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("want 403, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("unanchored org token must be canvas-class (\"\"), never the forged claim; got %q", callerID)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -202,10 +288,16 @@ func TestAuthenticateA2AHTTPCaller_OrgToken_CrossOrg_Rejected(t *testing.T) {
 
 	expectNotAWorkspaceToken(mock)
 	expectValidAnchoredOrgToken(mock, attackerCPOrgUUID)
-	// Target ws-victim belongs to a DIFFERENT org root.
+	// Target ws-victim belongs to a DIFFERENT org root — cheap arms miss.
 	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
 		WithArgs("ws-victim").
 		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(victimOrgRootWorkspaceID))
+	// Resolve-arm (finding[2]): the attacker anchor's OWN org root is the
+	// attacker's org (its derived platform-agent id) — CONFIRMED different from
+	// the victim's root → 403 via a real cross-org mismatch, not a lookup error.
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
+		WithArgs(attackerCPOrgUUID).
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow(DeterministicPlatformAgentID(attackerCPOrgUUID)))
 
 	c, w := a2aAuthContextWithTarget("ws-victim")
 	c.Request.Header.Set("Authorization", "Bearer cross-org-token")

@@ -121,13 +121,9 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 				// through the same deterministic derivation the org root is built
 				// from. Both arms are org-root-specific, so no cross-org token is
 				// accepted.
-				if orgID != "" {
-					wsOrg, orgErr := workspaceOrgRoot(ctx, database, workspaceID)
-					if orgErr != nil || wsOrg == "" || !orgAnchorMatchesRoot(orgID, wsOrg) {
-						log.Printf("wsauth: WorkspaceAuth: org-token org %q not authorized for workspace %q (org root %q, err=%v) — denying", orgID, workspaceID, wsOrg, orgErr)
-						c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "org token not authorized for this workspace's org"})
-						return
-					}
+				if orgID != "" && orgTokenConfirmedCrossOrg(ctx, database, orgID, workspaceID) {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "org token not authorized for this workspace's org"})
+					return
 				}
 				c.Set("org_token_id", id)
 				c.Set("org_token_prefix", prefix)
@@ -151,23 +147,20 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 				return
 			}
 			// #95 hole 3: a per-workspace token authenticates ITSELF. Record the
-			// authenticated identity DERIVED FROM THE TOKEN (resolved by token
-			// hash via WorkspaceFromToken, independent of the URL :id) so handlers
-			// that derive a source workspace (e.g. POST /workspaces/:id/delegate)
-			// assert the URL source against the TOKEN's real workspace rather than
-			// comparing c.Param("id") to itself — the tautology that closed
-			// nothing. ValidateToken already proved token.workspace_id == this :id,
-			// so tokenWS == workspaceID in the normal path; sourcing it from the
-			// token keeps the /delegate guard a genuine cross-check that survives a
-			// future route/:id refactor. Fall back to the validated id only on a
-			// datastore error (fail toward the already-proven identity). Only set
-			// for the narrowest-scope credential; org-token/admin/cp-session are
-			// higher-privileged and may legitimately act on any :id in scope.
-			tokenWS, tokErr := wsauth.WorkspaceFromToken(ctx, database, tok)
-			if tokErr != nil || tokenWS == "" {
-				tokenWS = workspaceID
-			}
-			c.Set("authenticated_workspace_id", tokenWS)
+			// authenticated identity so handlers that derive a source workspace
+			// (e.g. POST /workspaces/:id/delegate) can assert the URL source against
+			// the TOKEN's real workspace rather than comparing c.Param("id") to
+			// itself — the tautology that closed nothing.
+			//
+			// finding[7]: ValidateToken above already PROVED this token's
+			// workspace_id == workspaceID (it returns ErrInvalidToken on any
+			// mismatch — see wsauth.ValidateToken's expectedWorkspaceID binding), so
+			// the token's own workspace IS workspaceID. A second WorkspaceFromToken()
+			// token-hash SELECT to re-derive the same value would be redundant; set
+			// the validated id directly. Only set for the narrowest-scope credential;
+			// org-token/admin/cp-session are higher-privileged and may legitimately
+			// act on any :id in scope.
+			c.Set("authenticated_workspace_id", workspaceID)
 			c.Set("caller_credential_class", "workspace-token")
 			c.Next()
 			return
@@ -373,6 +366,66 @@ func workspaceOrgRoot(ctx context.Context, database *sql.DB, workspaceID string)
 		return "", nil
 	}
 	return root.String, nil
+}
+
+// orgTokenConfirmedCrossOrg reports whether an ANCHORED org token (anchor =
+// org_api_tokens.org_id, non-empty) is CONFIRMED to belong to a DIFFERENT org
+// than workspaceID's — the only condition under which WorkspaceAuth denies it.
+//
+// Availability (finding[0]): WorkspaceAuth is a broad data-route gate, so this
+// must NOT introduce a new fleet-wide 403 cliff on a TRANSIENT datastore error.
+// It returns true ONLY on a CONFIRMED cross-org mismatch; a lookup error or an
+// unresolved org root returns false (fall back to the pre-PR global-org-key
+// acceptance — no worse than today) and logs. The A2A dispatch path fails
+// CLOSED on the same errors instead, because it is the more sensitive
+// canvas-class bypass (see authenticateA2AHTTPCaller).
+//
+// Non-derived roots (finding[2]): the two cheap namespace arms in
+// orgAnchorMatchesRoot (anchor == root, or det(anchor) == root) miss an org
+// root formed with a plain RANDOM id, or an anchor that is a non-root workspace
+// id within the org. Before confirming a mismatch, resolve the anchor to its
+// OWN org root and compare in the same workspace-id namespace. The comparison is
+// pinned to the TARGET's org root, so a genuinely cross-org token can never match.
+//
+// NOTE: this deny predicate is duplicated in spirit by the A2A path's inline
+// bind in authenticateA2AHTTPCaller (handlers pkg). They are NOT dedup'd into a
+// shared helper because middleware must not import handlers (import cycle — see
+// workspaceOrgRoot / deterministicPlatformAgentID below, duplicated for the same
+// reason) AND their availability postures deliberately DIFFER (this one degrades
+// open on a blip; A2A fails closed). Both are kept aligned by construction.
+func orgTokenConfirmedCrossOrg(ctx context.Context, database *sql.DB, anchor, workspaceID string) bool {
+	wsRoot, err := workspaceOrgRoot(ctx, database, workspaceID)
+	if err != nil {
+		log.Printf("wsauth: WorkspaceAuth: org-root lookup error for workspace %q (org %q): %v — allowing (no new denial cliff, finding[0])", workspaceID, anchor, err)
+		return false
+	}
+	if wsRoot == "" {
+		log.Printf("wsauth: WorkspaceAuth: no org root resolved for workspace %q (org %q) — allowing (no confirmed mismatch)", workspaceID, anchor)
+		return false
+	}
+	if orgAnchorMatchesRoot(anchor, wsRoot) {
+		return false // cheap-arm match — same org
+	}
+	// Cheap arms missed — resolve the anchor to its own org root (finding[2]).
+	anchorRoot, anchorErr := workspaceOrgRoot(ctx, database, anchor)
+	if anchorErr != nil {
+		log.Printf("wsauth: WorkspaceAuth: org-anchor resolve error for org %q (workspace %q): %v — allowing (no new denial cliff, finding[0])", anchor, workspaceID, anchorErr)
+		return false
+	}
+	if anchorRoot == "" {
+		// Anchor did not resolve to an org root (anomalous — the FK
+		// org_api_tokens.org_id REFERENCES workspaces(id) guarantees a non-NULL
+		// anchor references a real workspace). Not a CONFIRMED mismatch; per
+		// finding[0] do not introduce a new denial. Log for the operator.
+		log.Printf("wsauth: WorkspaceAuth: org-anchor %q did not resolve to an org root (workspace %q, org root %q) — allowing (no confirmed mismatch)", anchor, workspaceID, wsRoot)
+		return false
+	}
+	if anchorRoot == wsRoot {
+		return false // same org via resolution
+	}
+	// anchorRoot != wsRoot — a resolved, DIFFERENT org root is a real cross-org token.
+	log.Printf("wsauth: WorkspaceAuth: org-token org %q (root %q) not authorized for workspace %q (org root %q) — denying", anchor, anchorRoot, workspaceID, wsRoot)
+	return true
 }
 
 // orgAnchorMatchesRoot reports whether a token's org anchor (org_api_tokens.org_id)
