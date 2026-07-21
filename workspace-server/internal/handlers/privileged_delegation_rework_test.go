@@ -182,10 +182,12 @@ func TestDelegate_PrivilegedConcurrentRetryRace_ReplaysWithoutGrantOr403(t *test
 // FINDING[4] (negative control / reject direction): a GENUINELY-new privileged
 // delegation with no consumable grant must still be REJECTED (403) — and because
 // the pending row is now inserted BEFORE the gate, the reject path must ROLL IT
-// BACK (bounded DELETE) so the never-dispatched delegation neither holds the
-// idempotency slot nor lingers as a phantom in-flight row. This guards against
-// the reorder accidentally (a) making the gate permissive, or (b) leaking the
-// speculative row on a 403.
+// BACK so the never-dispatched delegation neither holds the idempotency slot nor
+// lingers as a phantom in-flight row. Rollback TERMINALIZES the row (bounded
+// UPDATE ... SET status='failed'), not a hard DELETE (#4539 follow-up: a DELETE
+// left an idempotency-race loser holding a delegation_id whose row vanished →
+// not-found forever). This guards against the reorder accidentally (a) making the
+// gate permissive, or (b) leaking the speculative row on a 403.
 func TestDelegate_PrivilegedNewDelegationNoGrant_Rejected403AndRollsBackRow(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	mock := setupTestDB(t)
@@ -217,9 +219,12 @@ func TestDelegate_PrivilegedNewDelegationNoGrant_Rejected403AndRollsBackRow(t *t
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
 		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
-	// The reject MUST roll back the speculative pending row — bounded to exactly
-	// this (workspace_id, delegation_id) pending delegate row.
-	mock.ExpectExec("DELETE FROM activity_logs").
+	// The reject MUST roll back the speculative pending row by TERMINALIZING it
+	// (UPDATE ... SET status='failed'), bounded to exactly this
+	// (workspace_id, delegation_id) pending delegate row — NOT a hard DELETE, so an
+	// idempotency-race loser holding this delegation_id resolves to an honest
+	// terminal state instead of a phantom not-found (#4539 follow-up).
+	mock.ExpectExec(`UPDATE activity_logs\s+SET status = 'failed'`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
@@ -310,5 +315,75 @@ func TestRestorePrivilegedDelegationGrant_EmptyGrantIsNoDBTouch(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("empty grantID must not touch the DB: %v", err)
+	}
+}
+
+// #4539 follow-up BUG 1 (phantom idempotency-loser): rollbackUndispatchedDelegation
+// must TERMINALIZE the rejected speculative row (UPDATE ... SET status='failed'),
+// NOT hard-DELETE it. The DELETE erased a row an idempotency-race LOSER already
+// held (it returned the winner's delegation_id as 'pending' after the unique-
+// constraint conflict); once the winner 403s and the row is gone,
+// check_delegation_status returns not-found forever — a permanent phantom.
+//
+// Negative control: the ONLY registered Exec expectation is the terminalizing
+// UPDATE bounded to (workspace_id, delegation_id). On the PRE-FIX code the rollback
+// issues `DELETE FROM activity_logs`, which (a) is an unexpected statement against
+// the mock and (b) leaves the UPDATE expectation unmet — so ExpectationsWereMet
+// fails. A green run is only reachable once the rollback terminalizes instead of
+// deletes, i.e. the loser's delegation_id resolves to an honest terminal state.
+func TestRollbackUndispatchedDelegation_TerminalizesNotDeletes(t *testing.T) {
+	mock := setupTestDB(t)
+
+	const (
+		wsID         = "88888888-8888-4888-8888-888888888888"
+		delegationID = "99999999-9999-4999-8999-999999999999"
+	)
+	// Expect the terminalizing UPDATE bounded to this workspace + delegation_id.
+	// (A DELETE from the pre-fix code would not match and would leave this unmet.)
+	mock.ExpectExec(`UPDATE activity_logs\s+SET status = 'failed'`).
+		WithArgs(wsID, delegationID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	rollbackUndispatchedDelegation(context.Background(), wsID, delegationID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("rollback must terminalize the rejected row (UPDATE status='failed'), not DELETE it — "+
+			"an idempotency-race loser must resolve to a terminal state, not phantom not-found: %v", err)
+	}
+}
+
+// #4539 follow-up BUG 2 (grant burned on ctx-expiry): restorePrivilegedDelegationGrant
+// must land the consumed_at=NULL clear EVEN when invoked with an already-expired
+// context. executeDelegation runs the restore on delegationCtx (a 30-min
+// WithTimeout ctx); one dispatch-failure mode is that very ctx hitting its ceiling,
+// so the restore that compensates it is handed an expired ctx.
+//
+// Negative control (the mechanism): database/sql's (*DB).conn checks ctx.Done()
+// BEFORE reaching the driver, so on the PRE-FIX code (which passed the inherited
+// ctx straight to ExecContext) an already-cancelled ctx short-circuits the UPDATE —
+// it never reaches sqlmock, the expectation stays unmet, and the grant stays burned
+// on a delegation that never dispatched. With the fix the restore runs on a fresh
+// detached context, so the UPDATE fires and the expectation is met.
+func TestRestorePrivilegedDelegationGrant_SurvivesExpiredContext(t *testing.T) {
+	mock := setupTestDB(t)
+
+	const (
+		grantID = "66666666-6666-4666-8666-666666666666"
+		wsID    = "77777777-7777-4777-8777-777777777777"
+	)
+	mock.ExpectExec(`UPDATE approval_requests\s+SET consumed_at = NULL`).
+		WithArgs(grantID, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Simulate the 30-min delegationCtx having ALREADY expired by the time the
+	// proxyErr branch calls restore — the exact ctx-expiry failure mode.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled/expired
+
+	restorePrivilegedDelegationGrant(ctx, wsID, grantID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("restore MUST land the consumed_at=NULL UPDATE even on an expired ctx "+
+			"(otherwise the single-use grant stays burned on a never-dispatched delegation): %v", err)
 	}
 }

@@ -567,30 +567,50 @@ func insertDelegationRow(ctx context.Context, c *gin.Context, sourceID string, b
 	return insertTrackingUnavailable
 }
 
-// rollbackUndispatchedDelegation removes the speculative pending activity_logs
-// row for a delegation that was inserted but then REJECTED at the privileged
-// grant gate before any dispatch (FINDING[4]). Because the row is inserted
-// BEFORE the gate (so the DB unique constraint can arbitrate the idempotency
-// race), a gate 403/500 must undo it — otherwise the never-dispatched row would
-// (a) hold the (workspace_id, idempotency_key) slot so a later retry WITH a
-// grant replays a doomed row instead of dispatching, and (b) linger as a
+// rollbackUndispatchedDelegation TERMINALIZES the speculative pending
+// activity_logs row for a delegation that was inserted but then REJECTED at the
+// privileged grant gate before any dispatch (FINDING[4]). Because the row is
+// inserted BEFORE the gate (so the DB unique constraint can arbitrate the
+// idempotency race), a gate 403/500 must undo it — otherwise the never-dispatched
+// row would (a) hold the (workspace_id, idempotency_key) slot so a later retry
+// WITH a grant replays a doomed row instead of dispatching, and (b) linger as a
 // phantom in-flight delegation the sweeper/digest counts as awaiting a reply.
 //
+// It transitions the row to the TERMINAL 'failed' status rather than hard-DELETEing
+// it (#4539 follow-up, phantom-loser bug). A DELETE erased a row that an
+// idempotency-race LOSER may already hold: the loser hit the unique-constraint
+// conflict, re-queried the winner's committed row, and returned the WINNER's
+// delegation_id to its client as status='pending'. When the winner then 403s at
+// the gate and DELETEs that same row, the loser is left polling
+// check_delegation_status for a delegation_id whose row no longer exists —
+// not-found forever, a permanent phantom the caller can never resolve, and a
+// same-key retry mints a brand-new delegation that itself 403s. Terminalizing to
+// 'failed' instead makes that poll resolve to an HONEST terminal outcome while
+// still satisfying both original rollback goals: 'failed' is terminal so the
+// sweeper/digest no longer count it as in-flight (goal b), and
+// lookupIdempotentDelegation deletes 'failed' rows to RELEASE the
+// (workspace_id, idempotency_key) slot on a same-key retry (goal a) — so an
+// operator who later obtains a grant can retry the same key and succeed
+// (recover-after-grant), rather than being stuck replaying a doomed row.
+//
 // Bounded to the exact (workspace_id, delegation_id) pending delegate row so it
-// can never touch another delegation. Best-effort: a failure only logs and must
-// never mask the gate's already-written 403/500. (The default-off durable
-// ledger row, when DELEGATION_LEDGER_WRITE is armed, is left to the ledger's own
-// in-flight reconciliation — a benign 'pending' row for a rejected delegation.)
+// can never touch another delegation, and guarded on status='pending' so it only
+// terminalizes a still-speculative row. Best-effort: a failure only logs and must
+// never mask the gate's already-written 403/500. (The default-off durable ledger
+// row, when DELEGATION_LEDGER_WRITE is armed, is left to the ledger's own
+// in-flight reconciliation.)
 func rollbackUndispatchedDelegation(ctx context.Context, workspaceID, delegationID string) {
 	if _, err := db.DB.ExecContext(ctx, `
-		DELETE FROM activity_logs
+		UPDATE activity_logs
+		   SET status = 'failed',
+		       error_detail = COALESCE(NULLIF(error_detail, ''), 'privileged delegation rejected: no approved grant')
 		 WHERE workspace_id = $1
 		   AND activity_type = 'delegation'
 		   AND method = 'delegate'
 		   AND status = 'pending'
 		   AND response_body->>'delegation_id' = $2
 	`, workspaceID, delegationID); err != nil {
-		log.Printf("rollbackUndispatchedDelegation: failed to remove rejected pending row for ws=%s delegation=%s: %v", workspaceID, delegationID, err)
+		log.Printf("rollbackUndispatchedDelegation: failed to terminalize rejected pending row for ws=%s delegation=%s: %v", workspaceID, delegationID, err)
 	}
 }
 

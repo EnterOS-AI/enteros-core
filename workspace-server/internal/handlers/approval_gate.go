@@ -30,6 +30,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -377,7 +378,21 @@ func restorePrivilegedDelegationGrant(ctx context.Context, workspaceID, grantID 
 	if grantID == "" {
 		return
 	}
-	if _, err := db.DB.ExecContext(ctx, `
+	// DETACH from the caller's context BEFORE the restore UPDATE. executeDelegation
+	// runs on delegationCtx = context.WithTimeout(parent, 30*time.Minute); one of the
+	// dispatch-failure modes this restore compensates is that ctx hitting its 30-min
+	// ceiling (proxyA2ARequest fails BECAUSE the deadline elapsed). If the UPDATE
+	// inherited that already-expired ctx, database/sql short-circuits on ctx.Done()
+	// in (*DB).conn BEFORE the statement ever reaches the driver, the consumed_at=NULL
+	// clear never lands, and the single-use grant stays burned on a delegation that
+	// never dispatched — defeating the restore in precisely the ctx-expiry failure
+	// mode it exists to cover. context.WithoutCancel keeps trace/tenant values while
+	// dropping the inherited (possibly-expired) deadline; a fresh short timeout bounds
+	// the compensating write. This mirrors the established detach pattern in this
+	// package (a2a_proxy_helpers.go: enqueue/log-on-detached-ctx).
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if _, err := db.DB.ExecContext(restoreCtx, `
 		UPDATE approval_requests
 		SET consumed_at = NULL
 		WHERE id = $1 AND workspace_id = $2 AND consumed_at IS NOT NULL
