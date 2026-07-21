@@ -668,6 +668,10 @@ jobs:
           # would risk double-delivering a non-idempotent delegation), this
           # goes red on every PR.
           bash tests/e2e/test_deleg_a2a_timeout_unit.sh
+          # HTTP diagnostics from both live staging harnesses must share the
+          # credential redactor. This pins compound registration keys such as
+          # platform_inbound_secret and preserves non-secret proof fields.
+          python3 tests/e2e/test_sanitize_http_body.py
           # #1994 byok-routing presence-probe (lib/workspace_env_presence.sh) —
           # the shared MOLECULE_LLM_USAGE_TOKEN presence contract used by 8c +
           # the concierge auth gate. Offline: stubs tenant_call and locks the
