@@ -266,30 +266,57 @@ func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 		// Non-fatal: install succeeded; operator can retry or mark manually.
 	}
 
-	// Step 5: trigger workspace restart.
-	// The pluginsHandler carries a restartFunc (Provisioner.RestartByID) set
-	// at construction. Trigger it asynchronously so the HTTP response returns
-	// immediately after the install; the restart is best-effort.
-	if h.pluginsHandler != nil {
-		// RFC internal#524 Layer 1: globalGoAsync so the detached restart
-		// is drained before db.DB swap (see workspace.go:globalGoAsync).
-		wsID := entry.WorkspaceID
-		globalGoAsync(func() {
-			// We can't use result.PluginName as a restart key since the
-			// restartFunc takes a workspaceID. Pass the workspaceID.
-			if restart := h.pluginsHandler.GetRestartFunc(); restart != nil {
-				restart(wsID)
-			}
-		})
-	}
+	// Step 5: trigger workspace restart — UNLESS the target is the self-host
+	// platform concierge in its fragile lifecycle window (self-brick guard).
+	restarting := h.applyRestartAfterDrift(ctx, entry.WorkspaceID)
 
-	log.Printf("AdminPluginDrift: applied drift update for %s/%s (queue_id=%s)",
-		entry.WorkspaceID, entry.PluginName, queueID)
+	log.Printf("AdminPluginDrift: applied drift update for %s/%s (queue_id=%s, restarting=%t)",
+		entry.WorkspaceID, entry.PluginName, queueID, restarting)
 	c.JSON(http.StatusOK, gin.H{
 		"status":        "applied",
 		"workspace_id":  entry.WorkspaceID,
 		"plugin_name":   entry.PluginName,
 		"installed_sha": result.InstalledSHA,
-		"restarting":    true,
+		"restarting":    restarting,
 	})
+}
+
+// applyRestartAfterDrift triggers the post-apply workspace restart for a drift
+// update, EXCEPT when the target is a kind=platform concierge in its fragile
+// lifecycle window (provisioning/online) — the SELF-BRICK guard. Returns true
+// iff a restart was actually dispatched.
+//
+// Why the guard: the concierge's plugin-auto-update cron (0 3 * * *) can enqueue
+// drift for its OWN workspace and then drive this Apply against itself. The
+// restart here is UNCONDITIONAL — no health probe, no rollback — so a bad
+// upstream ref that installs but fails to boot would restart the org-root
+// concierge into a brick, mid-auto-apply-batch, with nothing left running to
+// recover it. We DEFER the restart the same way the reconcile path does
+// (platformConciergeReconcileShouldSkipRestart): the new ref is already re-pinned
+// on the workspace_plugins row (step 3) and the queue entry is marked applied
+// (step 4); the concierge picks the new bytes up on its next DELIBERATE restart
+// rather than an auto-apply side effect. Non-concierge workspaces keep the
+// immediate re-pin + restart — auto-apply stays intact (the product decision).
+//
+// Fail-open: platformConciergeReconcileShouldSkipRestart returns false on any DB
+// error, so a transient blip never masks a needed non-concierge restart.
+func (h *AdminPluginDriftHandler) applyRestartAfterDrift(ctx context.Context, wsID string) bool {
+	if h.pluginsHandler == nil {
+		return false
+	}
+	if platformConciergeReconcileShouldSkipRestart(ctx, wsID) {
+		log.Printf("AdminPluginDrift: apply: DEFERRING restart of platform concierge workspace=%s "+
+			"(self-brick guard) — plugin re-pinned; restart must be a deliberate action", wsID)
+		return false
+	}
+	// RFC internal#524 Layer 1: globalGoAsync so the detached restart is drained
+	// before a db.DB swap (see workspace.go:globalGoAsync). Async so the HTTP
+	// response returns immediately after the install; the restart is best-effort.
+	globalGoAsync(func() {
+		// restartFunc takes a workspaceID (not a plugin name); pass wsID.
+		if restart := h.pluginsHandler.GetRestartFunc(); restart != nil {
+			restart(wsID)
+		}
+	})
+	return true
 }
