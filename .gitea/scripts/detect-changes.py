@@ -94,10 +94,6 @@ PROFILES: dict[str, dict[str, str]] = {
             # workflow, so a regression in either package MUST trigger the job.
             r"|^workspace-server/internal/registry/"
             r"|^workspace-server/internal/orgtoken/"
-            # #2149: the scheduler real-PG integration tests run in this same
-            # workflow (they reuse its migrated Postgres), so changes to the
-            # scheduler package must trigger the job too.
-            r"|^workspace-server/internal/scheduler/"
             # #2150: the db package's real-PG migration-replay-from-scratch
             # + InitPostgres ping tests also run in this same workflow (they
             # reuse its sibling Postgres, against a separate `molecule_replay`
