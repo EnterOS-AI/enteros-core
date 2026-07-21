@@ -64,9 +64,28 @@ require_positive_int RUNTIME_IMAGE_PULL_ATTEMPTS "$PULL_ATTEMPTS"
 case "$RETRY_DELAY" in
   ''|*[!0-9]*) fail "RUNTIME_IMAGE_PULL_RETRY_DELAY_SECONDS must be a non-negative integer" ;;
 esac
-for command_name in curl jq docker timeout; do
+for command_name in curl node docker timeout; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is unavailable: $command_name"
 done
+
+# Parse one required, non-empty JSON string from stdin without echoing the
+# credential-bearing document on failure. Node is part of the reviewed
+# local-deploy runner contract because actions/checkout requires it; jq is not
+# installed on that host executor.
+json_required_string() {
+  local field_path="$1"
+  node -e '
+    "use strict";
+    try {
+      let value = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      for (const key of process.argv[1].split(".")) value = value?.[key];
+      if (typeof value !== "string" || value.length === 0) process.exit(1);
+      process.stdout.write(value);
+    } catch (_) {
+      process.exit(1);
+    }
+  ' "$field_path"
+}
 
 # Source, rather than merely execute, so every pull/inspect below reuses the
 # exact endpoint and mTLS pins that the read-only fingerprint validated.
@@ -89,14 +108,14 @@ deadline=$((started + READINESS_TIMEOUT))
 # formatting JSON-safe without handing the client secret to a helper process.
 printf -v login_body '{"clientId":"%s","clientSecret":"%s"}' "$infisical_client_id" "$infisical_client_secret"
 unset infisical_client_id infisical_client_secret
-if ! login_response="$(printf '%s' "$login_body" | curl --silent --show-error --fail-with-body \
+if ! login_response="$(printf '%s' "$login_body" | curl --disable --silent --show-error --fail-with-body \
   --max-time 30 --user-agent curl/8.4.0 --request POST \
   --header 'Content-Type: application/json' --data-binary @- \
   "$INFISICAL_BASE/api/v1/auth/universal-auth/login")"; then
   fail "Infisical universal-auth login failed"
 fi
 unset login_body
-if ! infisical_token="$(printf '%s' "$login_response" | jq -er '.accessToken | select(type == "string" and length > 0)')"; then
+if ! infisical_token="$(printf '%s' "$login_response" | json_required_string accessToken)"; then
   fail "Infisical universal-auth returned no accessToken"
 fi
 unset login_response
@@ -109,11 +128,11 @@ if ! secret_response="$({
   printf 'silent\nshow-error\nfail-with-body\nmax-time = 30\n'
   printf 'header = "User-Agent: curl/8.4.0"\n'
   printf 'header = "Authorization: Bearer %s"\n' "$infisical_token"
-} | curl --config - "$secret_url")"; then
+} | curl --disable --config - "$secret_url")"; then
   fail "could not read CP_ADMIN_API_TOKEN from Infisical staging /shared/controlplane-admin"
 fi
 unset infisical_token
-if ! cp_token="$(printf '%s' "$secret_response" | jq -er '.secret.secretValue | select(type == "string" and length > 0)')"; then
+if ! cp_token="$(printf '%s' "$secret_response" | json_required_string secret.secretValue)"; then
   fail "Infisical returned an empty CP_ADMIN_API_TOKEN"
 fi
 unset secret_response
@@ -124,38 +143,58 @@ esac
 {
   printf 'silent\nshow-error\nfail-with-body\nmax-time = 30\n'
   printf 'header = "User-Agent: curl/8.4.0"\n'
-} | curl --config - "$CP_BASE_URL/cp/runtimes" > "$catalog_json" \
+} | curl --disable --config - "$CP_BASE_URL/cp/runtimes" > "$catalog_json" \
   || fail "could not read the staging runtime catalog"
 {
   printf 'silent\nshow-error\nfail-with-body\nmax-time = 30\n'
   printf 'header = "User-Agent: curl/8.4.0"\n'
   printf 'header = "Authorization: Bearer %s"\n' "$cp_token"
-} | curl --config - "$CP_BASE_URL/cp/admin/runtime-image" > "$pins_json" \
+} | curl --disable --config - "$CP_BASE_URL/cp/admin/runtime-image" > "$pins_json" \
   || fail "could not read promoted runtime-image pins from staging"
 unset cp_token
 
 # Build and validate the complete CP-owned plan before the first Docker pull.
 # Every pinnable runtime must have exactly one global pin and a resolved ref.
-if ! jq -nr \
-  --slurpfile catalog "$catalog_json" \
-  --slurpfile pin_doc "$pins_json" '
-    ($catalog[0].runtimes // []) as $all |
-    [$all[] | select(.pinnable == true)] as $required |
-    ($pin_doc[0].pins // []) as $pins |
-    if ($required | length) == 0 then
-      error("runtime catalog has no pinnable runtimes")
-    else
-      $required[] as $runtime |
-      [$pins[] | select(.template_name == $runtime.name and .region == "global")] as $matches |
-      if ($matches | length) != 1 then
-        error("missing one exact global image pin for runtime " + $runtime.name +
-              " (found " + (($matches | length) | tostring) + ")")
-      else
-        $matches[0] as $pin |
-        [$runtime.name, $runtime.image, $pin.image_digest, ($pin.image_ref // "")] | @tsv
-      end
-    end
-  ' > "$plan_tsv"; then
+# shellcheck disable=SC2016 # Node template literals must not expand in Bash.
+if ! node -e '
+  "use strict";
+  const fs = require("fs");
+  const fail = (message) => { console.error(message); process.exit(1); };
+  let catalog, pinDoc;
+  try {
+    catalog = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    pinDoc = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  } catch (_) {
+    fail("runtime catalog or pin document is not valid JSON");
+  }
+  if (!Array.isArray(catalog?.runtimes) || !Array.isArray(pinDoc?.pins)) {
+    fail("runtime catalog or pin document has an invalid shape");
+  }
+  const required = catalog.runtimes.filter((runtime) => runtime?.pinnable === true);
+  if (required.length === 0) fail("runtime catalog has no pinnable runtimes");
+  const seen = new Set();
+  const rows = [];
+  for (const runtime of required) {
+    if (typeof runtime?.name !== "string" || seen.has(runtime.name)) {
+      fail("runtime catalog has an invalid or duplicate pinnable runtime name");
+    }
+    seen.add(runtime.name);
+    const matches = pinDoc.pins.filter((pin) =>
+      pin?.template_name === runtime.name && pin?.region === "global"
+    );
+    if (matches.length !== 1) {
+      fail(`missing one exact global image pin for runtime ${runtime.name} (found ${matches.length})`);
+    }
+    const pin = matches[0];
+    rows.push([runtime.name, runtime.image, pin.image_digest, pin.image_ref ?? ""]);
+  }
+  for (const row of rows) {
+    if (row.some((value) => typeof value !== "string" || /[\t\r\n]/.test(value))) {
+      fail("runtime catalog/pin plan contains a non-string or control character");
+    }
+  }
+  process.stdout.write(rows.map((row) => row.join("\t")).join("\n") + "\n");
+' "$catalog_json" "$pins_json" > "$plan_tsv"; then
   fail "runtime catalog/pin plan is incomplete or invalid; refusing a partial pre-pull"
 fi
 

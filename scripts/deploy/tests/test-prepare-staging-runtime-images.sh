@@ -16,6 +16,7 @@ fail() {
 [[ -f "$GUARD" ]] || fail "missing local-deploy daemon guard: $GUARD"
 
 mkdir -p "$TMP_DIR/bin" "$TMP_DIR/certs"
+REAL_NODE="$(command -v node)" || fail "node is required to exercise the local-deploy runner contract"
 printf 'ca\n' > "$TMP_DIR/certs/ca.pem"
 printf 'cert\n' > "$TMP_DIR/certs/cert.pem"
 printf 'key\n' > "$TMP_DIR/certs/key.pem"
@@ -36,6 +37,7 @@ for name in INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID; do
   [[ ! -v "$name" ]] || { echo "Infisical credential environment reached curl" >&2; exit 90; }
 done
 args="$*"
+[[ "${1:-}" == "--disable" ]] || { echo "curl did not disable ambient config first" >&2; exit 89; }
 for secret in "${EXPECTED_INFISICAL_SECRET:?}" "${EXPECTED_ACCESS_TOKEN:?}" "${EXPECTED_CP_TOKEN:?}"; do
   [[ "$args" != *"$secret"* ]] || { echo "secret leaked into curl argv" >&2; exit 91; }
 done
@@ -118,7 +120,27 @@ while [[ "${1:-}" == --* ]]; do shift; done
 shift
 "$@"
 MOCK_TIMEOUT
-chmod +x "$TMP_DIR/bin/dirname" "$TMP_DIR/bin/curl" "$TMP_DIR/bin/docker" "$TMP_DIR/bin/timeout"
+
+# The host-executor contract intentionally has Node (actions/checkout requires
+# it) but not jq. Keep a poison jq in PATH so this consumer cannot regress to
+# the dependency that already failed on the exact local-deploy runner.
+cat > "$TMP_DIR/bin/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+echo "readiness must not invoke jq on the local-deploy runner" >&2
+exit 98
+MOCK_JQ
+
+cat > "$TMP_DIR/bin/node" <<'MOCK_NODE'
+#!/usr/bin/env bash
+set -euo pipefail
+for name in INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET INFISICAL_PROJECT_ID; do
+  [[ ! -v "$name" ]] || { echo "Infisical credential environment reached node" >&2; exit 90; }
+done
+exec "${REAL_NODE:?}" "$@"
+MOCK_NODE
+
+chmod +x "$TMP_DIR/bin/dirname" "$TMP_DIR/bin/curl" "$TMP_DIR/bin/docker" \
+  "$TMP_DIR/bin/timeout" "$TMP_DIR/bin/jq" "$TMP_DIR/bin/node"
 
 CATALOG="$TMP_DIR/catalog.json"
 PINS="$TMP_DIR/pins.json"
@@ -165,7 +187,7 @@ run_gate() {
     EXPECTED_INFISICAL_SECRET="$INFISICAL_SECRET" \
     EXPECTED_ACCESS_TOKEN="$ACCESS_TOKEN" \
     EXPECTED_CP_TOKEN="$CP_TOKEN" \
-    CATALOG_FIXTURE="$CATALOG" PINS_FIXTURE="$PINS" \
+    REAL_NODE="$REAL_NODE" CATALOG_FIXTURE="$CATALOG" PINS_FIXTURE="$PINS" \
     CURL_LOG="$CURL_LOG" DOCKER_LOG="$DOCKER_LOG" TIMEOUT_LOG="$TIMEOUT_LOG" \
     PULL_STATE="$PULL_STATE" MOCK_REMOTE_HOST="$REMOTE_HOST" \
     DOCKER_HOST="${TEST_DOCKER_HOST:-$REMOTE_HOST}" \
@@ -211,6 +233,33 @@ done
 grep -Fx "pull $REF_A" "$DOCKER_LOG" >/dev/null || fail "claude-code digest not pulled"
 grep -Fx "pull $REF_B" "$DOCKER_LOG" >/dev/null || fail "hermes digest not pulled"
 [[ "$(grep -cE ' docker .* pull ' "$TIMEOUT_LOG")" == "2" ]] || fail "pulls are not independently timeout-bounded"
+
+# Malformed JSON and duplicate CP-owned rows must fail before the first Docker
+# mutation. This exercises the complete-plan parser without jq available.
+printf '{not-json\n' > "$CATALOG"
+expect_failure "malformed catalog" "not valid JSON" run_gate
+if grep -q '^pull ' "$DOCKER_LOG"; then fail "malformed catalog reached docker pull"; fi
+
+write_catalog
+python3 - "$CATALOG" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+p["runtimes"].append(dict(p["runtimes"][0]))
+json.dump(p, open(sys.argv[1], "w"))
+PY
+expect_failure "duplicate runtime" "invalid or duplicate pinnable runtime name" run_gate
+if grep -q '^pull ' "$DOCKER_LOG"; then fail "duplicate runtime reached docker pull"; fi
+
+write_catalog
+write_good_pins
+python3 - "$PINS" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+p["pins"].append(dict(p["pins"][0]))
+json.dump(p, open(sys.argv[1], "w"))
+PY
+expect_failure "duplicate pin" "missing one exact global image pin" run_gate
+if grep -q '^pull ' "$DOCKER_LOG"; then fail "duplicate pin reached docker pull"; fi
 
 # Runner label alone is not the daemon boundary: endpoint drift, missing mTLS,
 # missing molecule-net, or an absent/misattached staging CP must fail before
