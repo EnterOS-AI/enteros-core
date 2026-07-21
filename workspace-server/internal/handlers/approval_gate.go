@@ -368,6 +368,18 @@ func gatePrivilegedDelegation(c *gin.Context, b events.EventEmitter, sourceID, t
 // operator's single approval survives a transient dispatch failure and the next
 // retry can use it.
 //
+// CONTEXT CONTRACT (#4539 convergence review FIX-B — single detach point): this
+// function uses the ctx it is GIVEN, as-is. It does NOT re-detach. The caller owns
+// detaching from any expired/expiring delegationCtx: the sole production caller,
+// finalizeNonDispatchedDelegation, already hands over a fresh detached cleanupCtx
+// and bounds the WHOLE cleanup (restore included) under that ONE deadline. An
+// earlier revision detached again HERE (WithoutCancel + its own timeout), which
+// let the restore write escape the cleanup's bound and run ~2x the ceiling — an
+// inconsistency with finalize's comment and its single-deadline guarantee.
+// Consequence of the contract: a caller that passes an already-cancelled ctx gets
+// a no-op restore (database/sql short-circuits) — that is the caller's bug to
+// avoid by detaching, not this function's to paper over.
+//
 // Best-effort and grant-scoped: a no-op when grantID == "" (nothing was
 // consumed — routine caller / dormant gate), and a restore failure only logs —
 // it must never fail the (already-terminal) delegation. Bounded to the

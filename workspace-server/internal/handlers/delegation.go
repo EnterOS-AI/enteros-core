@@ -362,7 +362,7 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 		// lingers as a phantom in-flight row for the sweeper/digest. Only when an
 		// insertOK row actually exists (insertTrackingUnavailable wrote nothing).
 		if outcome == insertOK {
-			rollbackUndispatchedDelegation(ctx, sourceID, delegationID)
+			rollbackUndispatchedDelegation(ctx, sourceID, delegationID, body.IdempotencyKey)
 		}
 		return
 	}
@@ -468,6 +468,17 @@ func lookupIdempotentDelegation(ctx context.Context, c *gin.Context, sourceID, i
 		return false
 	}
 	if existingStatus == "failed" {
+		// SEMANTIC CONTRACT (#4539 re-review FINDING[3]): a 'failed' idempotency row
+		// is TERMINAL-then-may-vanish. A same-key retry deletes it here to RELEASE the
+		// unique (workspace_id, idempotency_key) slot so the retry can mint a fresh
+		// attempt (the recover-after-grant path). This means a caller polling that
+		// delegation_id AFTER a same-key retry sees not-found again. That is by design
+		// and safe: a well-behaved poller stops on the terminal 'failed' it already
+		// observed. We keep the reclaim a DELETE (not a status transition) on purpose —
+		// the slot is the unique index itself, so freeing it necessarily removes the
+		// row; preserving a terminal row while freeing the slot would need a schema
+		// change. Minimal by choice; the honest-terminal guarantee is "observable until
+		// the next same-key retry", not "observable forever".
 		if _, err := db.DB.ExecContext(ctx, `
 			DELETE FROM activity_logs
 			 WHERE workspace_id = $1 AND idempotency_key = $2 AND status = 'failed'
@@ -567,30 +578,73 @@ func insertDelegationRow(ctx context.Context, c *gin.Context, sourceID string, b
 	return insertTrackingUnavailable
 }
 
-// rollbackUndispatchedDelegation removes the speculative pending activity_logs
-// row for a delegation that was inserted but then REJECTED at the privileged
-// grant gate before any dispatch (FINDING[4]). Because the row is inserted
-// BEFORE the gate (so the DB unique constraint can arbitrate the idempotency
-// race), a gate 403/500 must undo it — otherwise the never-dispatched row would
-// (a) hold the (workspace_id, idempotency_key) slot so a later retry WITH a
-// grant replays a doomed row instead of dispatching, and (b) linger as a
+// rollbackUndispatchedDelegation TERMINALIZES the speculative pending
+// activity_logs row for a delegation that was inserted but then REJECTED at the
+// privileged grant gate before any dispatch (FINDING[4]). Because the row is
+// inserted BEFORE the gate (so the DB unique constraint can arbitrate the
+// idempotency race), a gate 403/500 must undo it — otherwise the never-dispatched
+// row would (a) hold the (workspace_id, idempotency_key) slot so a later retry
+// WITH a grant replays a doomed row instead of dispatching, and (b) linger as a
 // phantom in-flight delegation the sweeper/digest counts as awaiting a reply.
 //
+// The disposition depends on whether the delegation carried an idempotency_key
+// (#4539 re-review FINDING[1]):
+//
+//   - KEYED (idempotencyKey != ""): TERMINALIZE the row to 'failed' rather than
+//     DELETE it. A DELETE erased a row that an idempotency-race LOSER may already
+//     hold: the loser hit the unique-constraint conflict, re-queried the winner's
+//     committed row, and returned the WINNER's delegation_id to its client as
+//     status='pending'. When the winner then 403s and DELETEs that same row, the
+//     loser is left polling check_delegation_status for a delegation_id whose row
+//     no longer exists — not-found forever, a permanent phantom. Terminalizing to
+//     'failed' makes that poll resolve to an HONEST terminal outcome while still
+//     satisfying both original rollback goals: 'failed' is terminal so the
+//     sweeper/digest no longer count it as in-flight (goal b), and
+//     lookupIdempotentDelegation deletes 'failed' rows to RELEASE the
+//     (workspace_id, idempotency_key) slot on a same-key retry (goal a) — so an
+//     operator who later obtains a grant can retry the same key and succeed.
+//
+//   - KEYLESS (idempotencyKey == ""): keep the original hard DELETE. With no key,
+//     lookupIdempotentDelegation early-returns, so NO idempotent poller can ever be
+//     holding this delegation_id — there is no observer to keep honest. A terminal
+//     'failed' row here would just be an UNRECLAIMABLE orphan (nothing revisits a
+//     keyless row) accumulating unbounded in the caller's activity/delegation
+//     history. DELETE leaves it clean, exactly as before.
+//
 // Bounded to the exact (workspace_id, delegation_id) pending delegate row so it
-// can never touch another delegation. Best-effort: a failure only logs and must
-// never mask the gate's already-written 403/500. (The default-off durable
-// ledger row, when DELEGATION_LEDGER_WRITE is armed, is left to the ledger's own
-// in-flight reconciliation — a benign 'pending' row for a rejected delegation.)
-func rollbackUndispatchedDelegation(ctx context.Context, workspaceID, delegationID string) {
+// can never touch another delegation, and guarded on status='pending' so it only
+// acts on a still-speculative row. Best-effort: a failure only logs and must never
+// mask the gate's already-written 403/500. (The default-off durable ledger row,
+// when DELEGATION_LEDGER_WRITE is armed, is left to the ledger's own in-flight
+// reconciliation.)
+func rollbackUndispatchedDelegation(ctx context.Context, workspaceID, delegationID, idempotencyKey string) {
+	if idempotencyKey == "" {
+		// Keyless: no poller can exist — clean DELETE, no orphan.
+		if _, err := db.DB.ExecContext(ctx, `
+			DELETE FROM activity_logs
+			 WHERE workspace_id = $1
+			   AND activity_type = 'delegation'
+			   AND method = 'delegate'
+			   AND status = 'pending'
+			   AND response_body->>'delegation_id' = $2
+		`, workspaceID, delegationID); err != nil {
+			log.Printf("rollbackUndispatchedDelegation: failed to remove keyless rejected pending row for ws=%s delegation=%s: %v", workspaceID, delegationID, err)
+		}
+		return
+	}
+	// Keyed: an idempotency-race loser may be polling this delegation_id —
+	// terminalize (not delete) so that poll resolves to an honest terminal state.
 	if _, err := db.DB.ExecContext(ctx, `
-		DELETE FROM activity_logs
+		UPDATE activity_logs
+		   SET status = 'failed',
+		       error_detail = COALESCE(NULLIF(error_detail, ''), 'privileged delegation rejected: no approved grant')
 		 WHERE workspace_id = $1
 		   AND activity_type = 'delegation'
 		   AND method = 'delegate'
 		   AND status = 'pending'
 		   AND response_body->>'delegation_id' = $2
 	`, workspaceID, delegationID); err != nil {
-		log.Printf("rollbackUndispatchedDelegation: failed to remove rejected pending row for ws=%s delegation=%s: %v", workspaceID, delegationID, err)
+		log.Printf("rollbackUndispatchedDelegation: failed to terminalize rejected pending row for ws=%s delegation=%s: %v", workspaceID, delegationID, err)
 	}
 }
 
@@ -625,6 +679,18 @@ func buildDelegateA2ABody(delegationID, task string) ([]byte, error) {
 // bulk restarts used to produce spurious "failed to reach workspace
 // agent" errors when delegations fired within the warm-up window.
 var delegationRetryDelay = 8 * time.Second
+
+// delegationCleanupBudget is the deadline on the fresh detached context that
+// finalizeNonDispatchedDelegation runs the ENTIRE non-dispatch cleanup under. It
+// is a pathological-HANG ceiling, NOT a tight bound (#4539 convergence review
+// FIX-A): it must stay GENEROUSLY above the normal latency of the handful of
+// cleanup writes, so a slow-but-live DB (a write stalling while the original
+// delegationCtx still had minutes of budget) cannot short-circuit the cleanup
+// mid-way and re-introduce the phantom-'pending' + burned-grant this refactor
+// prevents. 2 minutes is far above any healthy single-row write yet still bounds a
+// genuinely wedged DB so the detached goroutine cannot leak forever. A package var
+// (like delegationRetryDelay) so its value is pinned in one place and guard-tested.
+var delegationCleanupBudget = 2 * time.Minute
 
 // NB: the log.Printf calls below are load-bearing for the integration test
 // surface (delegation_executor_integration_test.go). The test uses a raw TCP
@@ -708,59 +774,26 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 		}
 		log.Printf("Delegation %s: step=handling_failure err=%v%s", delegationID, proxyErr, classification)
 		log.Printf("Delegation %s: failed — %s", delegationID, proxyErr.Error())
-		authority := h.updateDelegationStatus(ctx, sourceID, delegationID, "failed", proxyErr.Error())
-
-		if _, err := db.DB.ExecContext(ctx, `
-			INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, status, error_detail, response_body)
-			VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4, 'failed', $5, $6::jsonb)
-		`, sourceID, sourceID, targetID, "Delegation failed", proxyErr.Error(),
-			delegationCorrelationJSON(delegationID)); err != nil {
-			log.Printf("Delegation %s: failed to insert error log: %v", delegationID, err)
-		}
-
-		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationFailed), sourceID, map[string]interface{}{
-			"delegation_id": delegationID, "target_id": targetID, "error": proxyErr.Error(),
-		})
-		// RFC #2829 PR-2 result-push (see UpdateStatus for rationale).
-		if mayReply(authority) {
-			pushDelegationResultToInbox(ctx, sourceID, targetID, delegationID, "failed", "", proxyErr.Error())
-		}
-		// FINDING[3]: the A2A hand-off never reached the target (this is the
-		// non-delivery branch — delivery-confirmed 2xx and durable-enqueue are
-		// handled above/below and do NOT restore). Return the consumed
-		// single-use grant so it is not permanently burned on a delegation that
-		// never dispatched. No-op when consumedGrantID == "".
-		restorePrivilegedDelegationGrant(ctx, sourceID, consumedGrantID)
+		// FINDING[3] + FINDING[0] (#4539 re-review): the A2A hand-off never reached
+		// the target (non-delivery branch). ALL of the cleanup — terminalize the row,
+		// write the delegate_result, broadcast, best-effort inbox-push, and restore
+		// the consumed single-use grant — runs on ONE fresh detached context inside
+		// finalizeNonDispatchedDelegation, because this is exactly the branch a
+		// 30-min-ceiling ctx expiry lands in. Restoring the grant alone (leaving the
+		// row stuck 'pending'/'dispatched' on the expired ctx) would leave a phantom
+		// the sweeper/digest count and a same-key retry replays as an idempotent HIT.
+		h.finalizeNonDispatchedDelegation(ctx, sourceID, targetID, delegationID, proxyErr.Error(), consumedGrantID)
 		return
 	}
 
 	if status >= 200 && status < 300 && len(respBody) == 0 {
 		errMsg := "workspace agent returned empty response"
 		log.Printf("Delegation %s: step=handling_failure err=%s", delegationID, errMsg)
-		authority := h.updateDelegationStatus(ctx, sourceID, delegationID, "failed", errMsg)
-
-		if _, err := db.DB.ExecContext(ctx, `
-			INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, status, error_detail, response_body)
-			VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4, 'failed', $5, $6::jsonb)
-		`, sourceID, sourceID, targetID, "Delegation failed", errMsg,
-			delegationCorrelationJSON(delegationID)); err != nil {
-			log.Printf("Delegation %s: failed to insert empty-response error log: %v", delegationID, err)
-		}
-
-		h.broadcaster.RecordAndBroadcast(ctx, string(events.EventDelegationFailed), sourceID, map[string]interface{}{
-			"delegation_id": delegationID, "target_id": targetID, "error": errMsg,
-		})
-		if mayReply(authority) {
-			pushDelegationResultToInbox(ctx, sourceID, targetID, delegationID, "failed", "", errMsg)
-		}
-		// FINDING[5]: this is a FAILED, non-dispatched delegation — the target
-		// returned a 2xx with an EMPTY body, so no work was actually handed off
-		// (the sibling proxyErr non-delivery branch above already restores; this
-		// branch previously did not, permanently burning the grant on a
-		// delegation the system itself marks failed). Restore the consumed
-		// single-use grant so it is not lost on a hand-off that never delivered.
-		// No-op when consumedGrantID == "".
-		restorePrivilegedDelegationGrant(ctx, sourceID, consumedGrantID)
+		// FINDING[5] + FINDING[0]: a FAILED, non-dispatched delegation (2xx with an
+		// EMPTY body — no work handed off). Same unified cleanup as the proxyErr
+		// branch, on a fresh detached context, so the row reliably terminalizes and
+		// the consumed single-use grant is restored (no-op when consumedGrantID == "").
+		h.finalizeNonDispatchedDelegation(ctx, sourceID, targetID, delegationID, errMsg, consumedGrantID)
 		return
 	}
 
@@ -866,6 +899,58 @@ handleSuccess:
 		pushDelegationResultToInbox(ctx, sourceID, targetID, delegationID, "completed", responseText, "")
 	}
 	log.Printf("Delegation %s: step=complete", delegationID)
+}
+
+// finalizeNonDispatchedDelegation performs the COMPLETE cleanup for a delegation
+// that failed to dispatch — the proxy non-delivery branch (target unreachable /
+// erroring) and the 2xx-empty-body branch both funnel here. It terminalizes the
+// delegation row to 'failed', writes the delegate_result row, broadcasts the
+// failure, best-effort pushes the inbox reply, and RESTORES any consumed
+// single-use privileged-delegation grant (no-op when consumedGrantID == "").
+//
+// FINDING[0] (#4539 re-review): EVERY write here runs on ONE fresh DETACHED
+// context computed at the top — NEVER the caller's delegationCtx. executeDelegation
+// runs on delegationCtx = context.WithTimeout(parent, 30*time.Minute), and a
+// primary failure mode reaching this path is that ctx hitting its 30-min ceiling
+// (proxyA2ARequest failed BECAUSE the deadline elapsed). On that already-expired
+// ctx, database/sql short-circuits in (*DB).conn BEFORE the driver, so the
+// terminalization + the delegate_result write would NEVER land: the row would be
+// stuck 'pending'/'dispatched' forever (a phantom the sweeper/digest count, and
+// which lookupIdempotentDelegation returns as an idempotent HIT to a same-key
+// retry → the caller is permanently wedged), even though the grant restore (which
+// #4539 already detached) succeeded. Detaching the WHOLE cleanup — not just the
+// restore — makes the row reliably reach its terminal state precisely in the
+// expiry mode this cleanup exists to handle. context.WithoutCancel preserves
+// trace/tenant values.
+//
+// The deadline (delegationCleanupBudget) is a pathological-HANG ceiling, NOT a
+// tight bound (#4539 convergence review FIX-A) — see that var. The ENTIRE cleanup,
+// restore included, is bounded by this ONE deadline (restore uses this ctx as-is —
+// no second, independent detach; FIX-B).
+func (h *DelegationHandler) finalizeNonDispatchedDelegation(ctx context.Context, sourceID, targetID, delegationID, errMsg, consumedGrantID string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), delegationCleanupBudget)
+	defer cancel()
+
+	authority := h.updateDelegationStatus(cleanupCtx, sourceID, delegationID, "failed", errMsg)
+
+	if _, err := db.DB.ExecContext(cleanupCtx, `
+		INSERT INTO activity_logs (workspace_id, activity_type, method, source_id, target_id, summary, status, error_detail, response_body)
+		VALUES ($1, 'delegation', 'delegate_result', $2, $3, $4, 'failed', $5, $6::jsonb)
+	`, sourceID, sourceID, targetID, "Delegation failed", errMsg,
+		delegationCorrelationJSON(delegationID)); err != nil {
+		log.Printf("Delegation %s: failed to insert error log: %v", delegationID, err)
+	}
+
+	h.broadcaster.RecordAndBroadcast(cleanupCtx, string(events.EventDelegationFailed), sourceID, map[string]interface{}{
+		"delegation_id": delegationID, "target_id": targetID, "error": errMsg,
+	})
+	// RFC #2829 PR-2 result-push (see UpdateStatus for rationale).
+	if mayReply(authority) {
+		pushDelegationResultToInbox(cleanupCtx, sourceID, targetID, delegationID, "failed", "", errMsg)
+	}
+	// Return the consumed single-use grant so it is not permanently burned on a
+	// delegation that never dispatched (FINDING[3]/[5]). No-op when empty.
+	restorePrivilegedDelegationGrant(cleanupCtx, sourceID, consumedGrantID)
 }
 
 // updateDelegationStatus updates the status of a delegation record in activity_logs.
