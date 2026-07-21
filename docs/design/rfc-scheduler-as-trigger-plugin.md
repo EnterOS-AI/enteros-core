@@ -179,10 +179,49 @@ Each phase is DONE only when its **Build · Tests/CI · e2e · Cleanup · Docs**
   - ✅ **P5a DONE — the plugin artifact.** `molecule-ai-plugin-scheduler` repo (`plugin.yaml` `kind: trigger` + daemon `scheduler`, empty `schedules.yaml` — it ships the *daemon*, not preset schedules), tagged **v0.1.0**. `scheduler.py`/`trigger_schedule.py`/`channel_sdk.py` are byte-identical to the SDK `templates/trigger` scaffold, enforced by an in-repo **drift gate** (`scripts/check_scaffold_drift.py` regenerates via `init_plugin(...)` and diffs; CI installs the SDK from git so it carries the `trigger` scaffold kind the published wheel lacks).
   - ✅ **P5b-rt DONE — runtime hot-start (runtime#308).** `DaemonSupervisor.supervise`/`ChannelEventSocketManager.add_specs` add a newly-installed daemon mid-process; a `DaemonRuntime` holder makes `ensure_daemons()` idempotent (cold at boot, warm via `POST /internal/daemons/reload`, `platform_inbound`-authed). So a running workspace arms a just-declared scheduler **without a restart**.
   - ✅ **P5b core delivery (core#4408).** `scheduler_plugin.go`: `ensureSchedulerPluginDeclared` (idempotent upsert of the pinned `gitea://…#v0.1.0` source), `armSchedulerPlugin` (best-effort reload forward — non-fatal, reconcile-on-online is the durable net), `ensureAndArmSchedulerPlugin` (declare sync + arm async). Hooked into `schedules.go` Create and template seeding (`template_schedules.go`, when ≥1 schedule seeds). `POST /admin/schedules/backfill-plugin` (AdminAuth, **dry-run by default**, `?apply=true` to declare+arm) remediates workspaces stranded by #4399.
+  - ✅ **Default-on-every-workspace + kill-switch (core#4541).** The one `molecule-scheduler` plugin ships **both** the firing daemon and the self-schedule MCP tool, so it can no longer wait for a schedule to exist (you need the tool to create the first one). It is now declared **unconditionally on every provision** (`workspace_provision_shared.go` → `ensureSchedulerPluginDeclared`, still idempotent + non-fatal), guarded by a **default-ON kill-switch** `MOLECULE_DECLARE_SCHEDULER_PLUGIN` (`declareSchedulerPluginEnabled`: unset/`""`/`1`/`true`/`yes` ⇒ ON, `0`/`false`/`no` ⇒ OFF) so the owner can HALT the roll-out in an emergency without a code revert — the symmetric-but-**inverted** counterpart to the default-off `MOLECULE_DECLARE_DEFAULT_NATIVE_PLUGINS` that gates the digest default-native declaration. **Ownership/SSOT:** the scheduler is declared **exactly once**, under the const `SchedulerPluginName = "molecule-scheduler"`; it is **excluded** from `declareDefaultNativePlugins` via `defaultNativePluginSourcesForDeclare()` filtering `SchedulerPluginSource` out of the registry-derived set. Without the filter the two paths double-declare: `declareDefaultNativePlugins` derives the install name from the raw source (`PluginNameFromSource` → `molecule-ai-plugin-scheduler`), a *different* name than the const, so one plugin lands as two `workspace_declared_plugins` rows + a duplicate boot-install. Note the kill-switch is presently a **code-default lever** — read from the process env, **not yet registered in the Infisical/CP config SSOT** — so ops set it on the core deployment env directly (runbook: `docs/runbooks/scheduler-plugin.md`).
 - **Tests/CI:** ✅ P5a scaffold-drift gate + daemon tests green in the plugin repo; P5b-rt hot-start unit + integration tests (supervise idempotency, holder cold/warm-add/warm-noop, `add_specs` binds only new lanes) — 129 runtime tests green; P5b core `scheduler_plugin_test.go` — **pinned source declared exactly** (typo = silent no-install, the load-bearing guard), source shape well-formed, arm no-ops without a callback URL (negative control), backfill dry-run is read-only (negative control, no INSERT).
 - **e2e — P5c (core#4408):** `test_staging_full_saas.sh` **step 10d** (mirrors idle step 10c) — with `E2E_SCHEDULER_CHECK=on` the ephemeral workspace declares the plugin, boot-installs + arms it, then a `* * * * *` schedule is created via the **tenant API** and the daemon must **autonomously fire** it (`schedule-history.json` + `"fired schedule"` log). Reachable, distinct fail arms: create-non-2xx (capability/routing gap) vs never-fired with grid/health/history diagnostics naming the broken leg. Defaults **OFF** until the ephemeral runtime pin carries plugin boot-install + the trigger scaffold, so it can't red a gate on a capability the image doesn't yet have.
 - **Cleanup:** the delivery is additive — nothing retired here; it is the *precondition* for P4's `workspace_schedules` drop (P4b).
 - **Docs:** this block; `project_scheduler_trigger_plugin_no_default_delivery` memory; the plugin repo README. ⏳ SDK trigger-plugin authoring guide still references the scaffold (task #39).
+
+### P5.1 — Concierge default schedules (self-host) — **MERGED: template #20, core graft #4549; verbs mcp-server #115; plugin-auto-update deploy tail owner-gated**
+
+An *operational* increment on top of P5's delivery: now that a self-host
+workspace boots the scheduler daemon, the **self-host concierge** ships two
+default schedules so a fresh install is useful on day one. This is a *content +
+graft* increment — no new scheduler-engine seam.
+
+- **Content lives in the template, not core.** The two schedules
+  (`daily-activity-report` `0 9 * * *`; `plugin-auto-update` `0 3 * * *`, both
+  UTC/enabled) are a top-level **runtime-native** `schedules:` block in the
+  platform-agent template `config.yaml` (**#20, merged**) — key `cron`, prompt
+  inlined, so they satisfy the runtime schedule contract with no render step.
+  Editing a cron/prompt is a template edit + re-export, **no core redeploy**
+  (`[[feedback_plugin_defaults_live_in_template_not_core]]`).
+- **Self-host-only graft in core (#4549, merged `380e81f9`).**
+  `graftConciergeSchedules` in `composeConciergeRuntimeConfig`
+  (`platform_agent.go`) grafts whatever `schedules:` node the platform-agent
+  template carries onto the composed concierge config — a **generic passthrough**
+  (content never hardcoded in Go), gated `SelfHostPlatformSeedEnabled()`
+  (`MOLECULE_ORG_ID` unset). On SaaS the concierge config stays byte-identical
+  (`grafted=false`). Boot-safe: a round-trip guard ships the config *without*
+  schedules on any failure rather than bricking boot. `renderTemplateSchedulesYAML`
+  is **not** called (the concierge entries are already runtime-native).
+- **Verbs for `plugin-auto-update` (mcp-server #115, merged).**
+  `check_plugin_updates` (`GET /admin/plugin-updates-pending`) +
+  `apply_plugin_update` (`POST /admin/plugin-updates/:id/apply`), management-mode
+  / org-key-authed. `apply_plugin_update` re-pins and restarts the affected
+  workspace — including the concierge's own if it updates a plugin on itself
+  (self-restart caveat). Core/runtime updates are report-only (operator deploy).
+- **Deploy tail (owner-gated).** `daily-activity-report` works once #20 + #4549
+  land and the concierge re-provisions (it uses only `send_message_to_user` +
+  the always-present `/activity` (+ `/mail/summary`) endpoints).
+  `plugin-auto-update` only **functions** once mcp-server (with #115) is
+  published + pin-cascaded + baked into the self-host runtime image — until then
+  its prompt degrades gracefully (reports tooling not installed).
+- **Docs/runbook:** `docs/runbooks/selfhost-concierge-default-schedules.md`;
+  memory `project_selfhost_concierge_default_schedules`.
 
 ### Cross-cutting DoD (every phase)
 - **No double-fire** demonstrated at each cutover point (`NativeSchedulerCheck` gates before any daemon goes live).

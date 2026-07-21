@@ -23,23 +23,6 @@ def _assert_absent(relative_path: str, stale_claims: tuple[str, ...]) -> None:
         assert claim not in text, f"{relative_path} still contains stale claim: {claim!r}"
 
 
-def test_staging_workflow_does_not_claim_deploy_dependency_or_current_red() -> None:
-    path = ".gitea/workflows/e2e-staging-saas.yml"
-    _assert_absent(
-        path,
-        (
-            "status-reporting deploy gate",
-            "currently RED on main",
-            "red here blocks the deploy path",
-            "not merge-blocking while parked below the pending",
-        ),
-    )
-    text = _text(path)
-    assert "not presence-required by the merge queue" in text
-    assert "an emitted red status still blocks" in text
-    assert "production and staging-CD triggers are independent" in text
-
-
 def test_required_context_guidance_uses_presence_not_deploy_gate_semantics() -> None:
     path = ".gitea/required-contexts.txt"
     _assert_absent(

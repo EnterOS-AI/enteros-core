@@ -87,16 +87,19 @@ func isGatewayOriginFailure(proxyErr *proxyA2AError) bool {
 	return isUpstreamDeadStatus(proxyErr.Status)
 }
 
-// invalidateCachedURLForDrain evicts the cached agent URL for workspaceID
-// from Redis so the next drain tick re-resolves it from the DB. Called
-// on transient gateway-origin failures where the cached URL is a likely
-// contributor (stale mapping after a tunnel flap, container port change
-// behind a CDN, etc.). db.ClearWorkspaceKeys already swallows Redis
-// errors internally (the platform's Redis layer is best-effort for the
-// URL cache — a cache-miss is harmless, just slower), so this helper
-// exists mainly for symmetry with the other drain instrumentation.
+// invalidateCachedURLForDrain evicts ONLY the cached agent URL for workspaceID
+// from Redis so the next drain tick re-resolves it from the DB. Called on
+// transient gateway-origin failures where the cached URL is a likely contributor
+// (stale mapping after a tunnel flap, container port change behind a CDN, etc.).
+//
+// finding [10]: this MUST use ClearCachedURL (url key only), NOT ClearWorkspaceKeys.
+// The drain's whole premise is a workspace that is ALIVE/heartbeating whose URL is
+// merely stale — ClearWorkspaceKeys also drops the liveness key (ws:<id>), flipping
+// IsOnline to false and contradicting that premise. ClearCachedURL is the surgical
+// url-only invalidation (see db.ClearCachedURL). It swallows Redis errors internally
+// (the URL cache is best-effort — a cache-miss is harmless, just slower).
 func (h *WorkspaceHandler) invalidateCachedURLForDrain(ctx context.Context, workspaceID string) {
-	db.ClearWorkspaceKeys(ctx, workspaceID)
+	db.ClearCachedURL(ctx, workspaceID)
 }
 
 // handleA2ADispatchError translates a forward-call failure into a proxyA2AError,
@@ -968,13 +971,23 @@ const a2aInboundAuthenticatedContextKey = "a2a_inbound_authenticated"
 
 // authenticateA2AHTTPCaller returns the server-authenticated caller identity.
 // X-Workspace-ID is only a claim: for workspace callers it must match the
-// presented workspace bearer's owner. Human callers use a verified CP session,
-// ADMIN_TOKEN, or org token. Self-hosted/dev also preserves the same-origin
-// Canvas fallback only when CP session verification is unconfigured; SaaS
-// never accepts that forgeable signal. The external inbound endpoint sets a
-// private Gin context marker only after validating and consuming the target's
-// inbound secret. Missing, revoked, tokenless-legacy, and datastore-error cases
-// fail closed.
+// presented workspace bearer's owner. Human/canvas callers use a verified CP
+// session, ADMIN_TOKEN, or a managed-org token — every one a real,
+// non-forgeable credential. An org token is org-scoped: an ANCHORED token is
+// bound to the target workspace's org root; it never returns the caller-
+// supplied X-Workspace-ID as trusted (#95).
+//
+// SELF-HOST trust boundary (#95 hole 1, intentionally RETAINED): a self-hosted
+// deploy has no control-plane session verifier and may run with no ADMIN_TOKEN,
+// so a same-origin Canvas request with no bearer is accepted as a canvas-class
+// caller — but ONLY when CPSessionConfigured() is false. On SaaS (CP configured)
+// that forgeable same-origin signal can never grant the bypass, so SaaS stays
+// closed. See the branch comment below.
+//
+// The external inbound endpoint sets a private Gin context marker only after
+// validating and consuming the target's inbound secret. On SaaS, missing,
+// revoked, tokenless-legacy, cross-org, and datastore-error cases all fail
+// closed.
 func authenticateA2AHTTPCaller(ctx context.Context, c *gin.Context, claimedCallerID string) (callerID string, isCanvasUser bool, err error) {
 	if authenticated, _ := c.Get(a2aInboundAuthenticatedContextKey); authenticated == true {
 		return claimedCallerID, false, nil
@@ -983,9 +996,21 @@ func authenticateA2AHTTPCaller(ctx context.Context, c *gin.Context, claimedCalle
 	if middleware.IsVerifiedCanvasSession(c) {
 		return claimedCallerID, true, nil
 	}
-	// Self-hosted/dev has no control-plane session verifier. Preserve the
-	// existing local Canvas contract only for a request that actually came from
-	// the same-origin Canvas proxy. SaaS always skips this forgeable fallback.
+	// #95 hole 1 — SELF-HOST trust boundary (intentionally RETAINED per the CTO
+	// decision: close the SaaS holes cleanly while keeping self-host working).
+	// A self-hosted / combined-image deploy has no control-plane session verifier
+	// and may run with NO ADMIN_TOKEN, so its legitimate same-origin Canvas has
+	// no non-forgeable credential to present. Preserve the local Canvas contract
+	// ONLY there: accept a same-origin request as a canvas-class caller when
+	// CPSessionConfigured() is false.
+	//
+	// This is a KNOWN open hole on SELF-HOST ONLY (tracked #95): the
+	// Referer/Origin/Host signal IsSameOriginCanvas checks is forgeable by any
+	// container on the self-hosted Docker network. It is accepted pending a
+	// dedicated self-host auth story. It fires ONLY when CPSessionConfigured() is
+	// false — on SaaS (CP_UPSTREAM_URL + org slug set) this branch is DEAD, so the
+	// forgeable signal can never grant the bypass and SaaS remains closed (SaaS
+	// Canvas authenticates via the verified CP session above). See #623/#194.
 	if !middleware.CPSessionConfigured() && middleware.IsSameOriginCanvas(c) {
 		return claimedCallerID, true, nil
 	}
@@ -1014,12 +1039,89 @@ func authenticateA2AHTTPCaller(ctx context.Context, c *gin.Context, claimedCalle
 		return workspaceID, false, nil
 	}
 
-	if _, _, _, orgErr := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); orgErr == nil {
-		return claimedCallerID, true, nil
+	if _, _, tokenOrgID, orgErr := orgtoken.Validate(ctx, db.DB, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); orgErr == nil {
+		// #95 hole 2 / hole 1: a managed-org token is a canvas-CLASS org-admin
+		// credential, but it is NOT a workspace and it is scoped to its own org.
+		// On this dispatch path isCanvasUser=true SKIPS CanCommunicate/sameOrg/
+		// can_delegate in proxyA2ARequest, so the org bind here is the ONLY thing
+		// standing between an org token and any agent in the datastore.
+		//
+		//  1. #95 hole 1 (unanchored) — CONSISTENCY with the rest of the API
+		//     (finding[3]). An UNANCHORED token (org_id NULL) is accepted on every
+		//     other /workspaces/:id/* route: WorkspaceAuth applies no org bind to a
+		//     NULL-org token (the legacy org-key global-access posture). Failing
+		//     CLOSED on /a2a ALONE would break legacy automation WITHOUT closing
+		//     anything — the same token still reaches every workspace via those
+		//     routes. So accept it here too, as a canvas-class caller, to stay
+		//     aligned with the middleware.
+		//
+		//     RESIDUAL LEGACY GAP (#95): an unanchored token carries no verifiable
+		//     org scope, so this does NOT enforce the tenant boundary for it;
+		//     anchoring (PATCH /org/tokens/:id) is the migration to a real per-org
+		//     bind, after which arm 2 below applies. Attributed canvas-class ("")
+		//     like any other org-admin/canvas principal — never the forgeable claim.
+		if tokenOrgID == "" {
+			return "", true, nil
+		}
+		//  2. Bind the ANCHORED token to the TARGET workspace's org root. An org
+		//     key may act only within its own org, never a sibling org in the same
+		//     multi-org datastore (the sameOrg tenant boundary, #1953). Compared
+		//     LIKE-FOR-LIKE in workspace-id space: org_api_tokens.org_id is written
+		//     either as the org-root WORKSPACE id (FK to workspaces.id; user /
+		//     backfilled / inherited mints) OR as the raw CP org UUID
+		//     (MOLECULE_ORG_ID) the concierge managed-token mint passes.
+		//     orgAnchorMatchesRoot handles both cheap namespace forms; when they
+		//     miss we resolve the token anchor to its OWN org root and compare in
+		//     the same namespace (finding[2] — an org root formed with a plain
+		//     random id, or an anchor that is a non-root workspace id in the org,
+		//     matches neither cheap form). This is the sensitive canvas-class
+		//     dispatch path, so it fails CLOSED on ANY lookup error (consistent
+		//     with proxyA2ARequest's sameOrg tenant check).
+		targetRoot, rootErr := orgRootID(ctx, db.DB, c.Param("id"))
+		if rootErr != nil || targetRoot == "" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "org token not authorized for this workspace's org"})
+			return "", false, errCallerOrgMismatch
+		}
+		if !orgAnchorMatchesRoot(tokenOrgID, targetRoot) {
+			anchorRoot, anchorErr := orgRootID(ctx, db.DB, tokenOrgID)
+			if anchorErr != nil || anchorRoot == "" || anchorRoot != targetRoot {
+				c.JSON(http.StatusForbidden, gin.H{"error": "org token not authorized for this workspace's org"})
+				return "", false, errCallerOrgMismatch
+			}
+		}
+		//  3. #95 hole 4 (attribution) + finding[6]: never return the caller-
+		//     supplied X-Workspace-ID (claimedCallerID) — an unverified claim whose
+		//     return would let the org token forge dispatch as any peer. Attribute
+		//     the org-admin principal as a canvas-class caller (""), exactly like
+		//     the anonymous Canvas user and the unanchored branch above: an org key
+		//     is a human/canvas-class principal, not a workspace. Returning the org
+		//     root workspace id instead would make callerID == workspaceID whenever
+		//     the target IS the org root, mis-classifying a real org-admin→concierge
+		//     dispatch as a workspace self-request (it would skip the concierge
+		//     warming gate and mis-stamp last_outbound_at). callerIDToSourceID
+		//     normalizes a canvas-class caller to a NULL source_id — the correct,
+		//     truthful attribution for a non-workspace principal.
+		return "", true, nil
 	}
 
 	c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid caller auth token"})
 	return "", false, workspaceErr
+}
+
+// orgAnchorMatchesRoot reports whether a token's org anchor
+// (org_api_tokens.org_id) identifies the org whose root workspace is root. The
+// anchor is stored in two namespaces across the codebase, so a correct bind must
+// accept BOTH: the org-root WORKSPACE id directly (canonical: the FK
+// org_api_tokens.org_id REFERENCES workspaces(id), session-backfill, inherited
+// mints), OR the raw CP org UUID (MOLECULE_ORG_ID) the concierge managed-token
+// mint passes — whose org root workspace id is DeterministicPlatformAgentID(orgUUID).
+// Both comparisons are pinned to THIS workspace's org root, so a token anchored
+// to a different org can never match.
+func orgAnchorMatchesRoot(orgAnchor, root string) bool {
+	if orgAnchor == "" || root == "" {
+		return false
+	}
+	return orgAnchor == root || DeterministicPlatformAgentID(orgAnchor) == root
 }
 
 // validateCallerToken is the compatibility wrapper used by schedule-health.
@@ -1048,6 +1150,11 @@ var errInvalidCallerToken = errors.New("missing caller auth token")
 // generic credential or datastore failure. Tests assert this sentinel so the
 // binding guard cannot disappear behind an unrelated 401.
 var errCallerIdentityMismatch = errors.New("caller identity does not match authenticated workspace")
+
+// errCallerOrgMismatch distinguishes an org-scope rejection (an org token
+// presented for a workspace outside its org) from a generic credential
+// failure. #95 hole 2.
+var errCallerOrgMismatch = errors.New("org token not authorized for this workspace's org")
 
 // extractToolTrace pulls metadata.tool_trace from an A2A JSON-RPC response.
 // Returns nil when absent or malformed — callers can pass it straight through.

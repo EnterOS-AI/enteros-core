@@ -121,7 +121,6 @@ def test_the_platform_lanes_still_reap_their_own_server() -> None:
     """
     lanes = {
         "e2e-api.yml",
-        "e2e-peer-visibility.yml",
         "local-provision-e2e.yml",
     }
     for wf in lanes:

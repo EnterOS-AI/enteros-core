@@ -11,6 +11,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -139,5 +140,129 @@ func TestSeedTemplatePlugins_SkipsUnparseableSource(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// TestPayloadDeclaredPlugins_SeedsViaMergeAndSeed pins the chain the Create
+// handler runs for CreateWorkspacePayload.Plugins: mergePlugins(nil, payload) →
+// seedTemplatePlugins. This is the DURABLE declare channel that lands a plugin in
+// workspace_declared_plugins (the SSOT provision recomputes MOLECULE_DECLARED_PLUGINS
+// from) — unlike a MOLECULE_DECLARED_PLUGINS value injected via `secrets`, which
+// provision overwrites. A duplicate entry must collapse to ONE upsert (mergePlugins
+// dedup), proving the payload path is byte-identical to the template `plugins:` path.
+func TestPayloadDeclaredPlugins_SeedsViaMergeAndSeed(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+
+	source := "gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0"
+	// mergePlugins dedups → exactly ONE INSERT for the digest-mail install name.
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+		WithArgs("ws-create-1", "molecule-ai-plugin-digest-mail", source).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	declared := mergePlugins(nil, []string{source, source}) // caller-supplied dup
+	recorded, skipped := seedTemplatePlugins(context.Background(), "ws-create-1", declared)
+	if recorded != 1 || skipped != 0 {
+		t.Fatalf("expected recorded=1 skipped=0 (dedup to one row), got recorded=%d skipped=%d", recorded, skipped)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations (payload-declared digest row not written): %v", err)
+	}
+}
+
+// nDistinctPluginSources builds n distinct gitea plugin sources (each derives a
+// distinct install name), so mergePlugins keeps all n — a worst-case declared set.
+func nDistinctPluginSources(n int) []string {
+	out := make([]string, n)
+	for i := 0; i < n; i++ {
+		out[i] = fmt.Sprintf("gitea://molecule-ai/molecule-ai-plugin-p%d#v1", i)
+	}
+	return out
+}
+
+// TestPayloadPluginsToSeed_CapsAtMaxTemplatePlugins is the DoS bound: the payload
+// `plugins:` path must enforce the SAME maxTemplatePlugins cap parseTemplatePlugins
+// applies to the template path, and — matching that convention — REJECT an over-cap
+// set entirely (ok=false, nil) rather than seed an unbounded number of rows. A set
+// at exactly the cap passes through untouched.
+//
+// Negative control: against the pre-fix code the payload path was a bare
+// mergePlugins(nil, payload.Plugins) with NO cap, so an over-cap set flowed
+// straight into seedTemplatePlugins (len == maxTemplatePlugins+50 rows). This test
+// asserts ok=false + nil for that same input, which the uncapped pre-fix path could
+// not produce.
+func TestPayloadPluginsToSeed_CapsAtMaxTemplatePlugins(t *testing.T) {
+	over := nDistinctPluginSources(maxTemplatePlugins + 50)
+	if got, ok := payloadPluginsToSeed(over); ok || got != nil {
+		t.Fatalf("payload with %d distinct plugins (cap %d) must be REJECTED (ok=false, nil), got ok=%v len=%d — unbounded seed still possible",
+			len(over), maxTemplatePlugins, ok, len(got))
+	}
+
+	atCap := nDistinctPluginSources(maxTemplatePlugins)
+	got, ok := payloadPluginsToSeed(atCap)
+	if !ok || len(got) != maxTemplatePlugins {
+		t.Fatalf("payload at exactly the %d-plugin cap must pass unchanged, got ok=%v len=%d", maxTemplatePlugins, ok, len(got))
+	}
+
+	// Dedup still applies below the cap (byte-aligned with the template path).
+	deduped, ok := payloadPluginsToSeed([]string{"local://a", "local://a", "local://b"})
+	if !ok || len(deduped) != 2 {
+		t.Fatalf("under-cap payload must dedup to 2, got ok=%v %v", ok, deduped)
+	}
+}
+
+// TestPayloadDeclaredPlugins_OverCapRecordsZeroRows is the end-to-end bound proof:
+// an over-cap payload, run through the SAME guard the Create handler uses
+// (payloadPluginsToSeed → skip on !ok), writes ZERO workspace_declared_plugins
+// rows. The mock DB programs NO ExpectExec, so any INSERT fails the test.
+//
+// Negative control: the pre-fix handler ran mergePlugins(nil, payload) →
+// seedTemplatePlugins unconditionally, which would have attempted
+// maxTemplatePlugins+50 INSERTs here and tripped sqlmock on the first unprogrammed
+// write.
+func TestPayloadDeclaredPlugins_OverCapRecordsZeroRows(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	// No ExpectExec programmed: an over-cap set must not reach seedTemplatePlugins.
+
+	over := nDistinctPluginSources(maxTemplatePlugins + 50)
+	declared, ok := payloadPluginsToSeed(over)
+	if ok {
+		// Mirror the handler guard: only seed when ok. If the cap regressed, this
+		// branch would attempt INSERTs and sqlmock would fail below.
+		seedTemplatePlugins(context.Background(), "ws-overcap", declared)
+	}
+	if ok {
+		t.Fatalf("over-cap payload must be rejected before seeding (ok=false), got ok=true len=%d", len(declared))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected DB writes for an over-cap payload: %v", err)
+	}
+}
+
+// TestPayloadDeclaredPlugins_PrivilegedRefused is the security negative-control:
+// the payload plugins field must NOT become a privilege-escalation surface. The
+// concierge management MCP (org-admin tools) declared via this path on a
+// non-platform workspace must be REFUSED by recordDeclaredPlugin's kind-gate — no
+// INSERT — exactly as the template/org-import paths are, since all share the same
+// chokepoint.
+func TestPayloadDeclaredPlugins_PrivilegedRefused(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+
+	// The kind precheck resolves the target workspace as an ordinary workspace.
+	mock.ExpectQuery(`SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-ordinary").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
+	// No ExpectExec is programmed: an INSERT here would be a privilege escalation
+	// and sqlmock fails the test on any unexpected write.
+
+	declared := mergePlugins(nil, []string{conciergePlatformMCPSource})
+	recorded, skipped := seedTemplatePlugins(context.Background(), "ws-ordinary", declared)
+	if recorded != 0 || skipped != 1 {
+		t.Fatalf("privileged plugin on a non-platform workspace must be refused (recorded=0 skipped=1), got recorded=%d skipped=%d", recorded, skipped)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations (kind-gate should have blocked the write): %v", err)
 	}
 }

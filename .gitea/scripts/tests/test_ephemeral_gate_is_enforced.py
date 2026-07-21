@@ -262,6 +262,62 @@ class TestEphemeralGateIsEnforced(unittest.TestCase):
                 "GREEN'. Fail closed in the creds step instead — never skip.",
             )
 
+    def test_peervis_and_concierge_creates_are_gating_not_advisory(self):
+        """peer_visibility + concierge_creates_workspace must be MERGE-BLOCKING.
+
+        #4543 retired the push staging E2E lanes for these two journeys (the literal
+        MCP `list_peers` auth contract, and concierge-creates-a-workspace) and moved
+        them onto THIS per-PR gate — but it left them in the global advisory soak
+        (E2E_EPHEMERAL_EXTRA_ADVISORY=1), so a regression to either merged GREEN. That
+        is a coverage hole: the journeys RAN per-PR but could not FAIL the merge.
+
+        The runner (tests/e2e/ephemeral_cp_happy_path.sh::gate_extra_scenarios) gates
+        on a failed scenario that is named in E2E_EPHEMERAL_EXTRA_GATING regardless of
+        the soak. So the invariant is: both keys appear in the workflow's
+        E2E_EPHEMERAL_EXTRA_GATING list AND in the E2E_EPHEMERAL_EXTRA_SCENARIOS list
+        it runs. This is the whole point of the #4543 fix.
+
+        Negative control (performed): remove either key from E2E_EPHEMERAL_EXTRA_GATING
+        (leave it advisory-only, as #4543 shipped it) -> this reds. Drop the whole
+        E2E_EPHEMERAL_EXTRA_GATING line -> this reds.
+
+        Parsed from the YAML env, not string-matched in comments (code_only would not
+        help here — the value we assert on is real config, and the prose around it
+        deliberately names the same keys).
+        """
+        wf = yaml.safe_load(WORKFLOW.read_text())
+        # Find the step that runs the gate (its env carries the extra-scenario config).
+        gate_step = None
+        for s in wf["jobs"]["happy-path"]["steps"]:
+            if "ephemeral_cp_happy_path.sh" in (s.get("run") or ""):
+                gate_step = s
+                break
+        self.assertIsNotNone(gate_step, "no step runs ephemeral_cp_happy_path.sh")
+        env = gate_step.get("env", {})
+
+        def _keys(val: str) -> set[str]:
+            return {t for t in re.split(r"[,\s]+", str(val or "")) if t}
+
+        gating = _keys(env.get("E2E_EPHEMERAL_EXTRA_GATING", ""))
+        scenarios = _keys(env.get("E2E_EPHEMERAL_EXTRA_SCENARIOS", ""))
+
+        for key in ("peer_visibility", "concierge_creates_workspace"):
+            self.assertIn(
+                key,
+                gating,
+                f"{key!r} is not in E2E_EPHEMERAL_EXTRA_GATING, so its failure is "
+                "suppressed by the global advisory soak (E2E_EPHEMERAL_EXTRA_ADVISORY=1) "
+                "and a regression merges GREEN. #4543 moved this journey onto the "
+                "ephemeral gate; it must GATE, not merely run. Add it to "
+                "E2E_EPHEMERAL_EXTRA_GATING.",
+            )
+            self.assertIn(
+                key,
+                scenarios,
+                f"{key!r} is gating-listed but not in E2E_EPHEMERAL_EXTRA_SCENARIOS, so "
+                "it never runs — a gate on a scenario that does not execute is vacuous.",
+            )
+
     def test_controlplane_baseline_is_pinned(self):
         """Negative control: replace the fetch with `git clone` of main -> this reds.
 

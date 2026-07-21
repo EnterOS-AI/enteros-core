@@ -869,11 +869,14 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// on that shape). System callers pass through — the gate holder itself
 	// dispatches through this proxy.
 	if a2aMethod == "message/send" && restartContextInFlight(workspaceID) && !isSystemCaller(callerID) {
-		if _, _, qErr := EnqueueA2A(ctx, workspaceID, callerID, 50, body, a2aMethod, "", nil); qErr == nil {
+		if qid, depth, qErr := EnqueueA2A(ctx, workspaceID, callerID, PriorityTask, body, a2aMethod, "", nil); qErr == nil {
 			log.Printf("ProxyA2A: platform boot turn in flight for %s — queued caller turn instead of interleaving", workspaceID)
 			respBody, marshalErr := json.Marshal(gin.H{
-				"status": "queued",
-				"method": a2aMethod,
+				"status":      "queued",
+				"method":      a2aMethod,
+				"queued":      true,
+				"queue_id":    qid,
+				"queue_depth": depth,
 			})
 			if marshalErr == nil {
 				return http.StatusOK, respBody, nil
@@ -1446,6 +1449,20 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 // resulting id survives any runtime session-id sanitisation unchanged.
 func canvasSessionContextID(workspaceID string) string {
 	return "canvas-" + workspaceID
+}
+
+// platformTurnContextID is the contextId platform-originated turns (first-boot
+// greeting, restart-context wake) stamp on their synthetic messages: the SAME
+// deterministic default session the canvas uses and the server belt fills —
+// so boots and restarts land in the user's conversation instead of a fresh
+// runtime-minted session (Langfuse 3-session fragmentation, 2026-07-21).
+// KNOWN TRADEOFF: after an explicit "New session" rotation (a client-local
+// sess-* id the server cannot see), platform turns still land in the DEFAULT
+// session. That is deliberate — system notices belong to the workspace's
+// default thread, and chat-history hydration is activity-log based so nothing
+// is lost; the alternative (runtime-minted UUID per boot) fragments tracing.
+func platformTurnContextID(workspaceID string) string {
+	return canvasSessionContextID(workspaceID)
 }
 
 // ensureCanvasSessionContextID injects a stable, deterministic contextId into a

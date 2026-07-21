@@ -23,6 +23,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/messagestore"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
@@ -105,6 +106,46 @@ const (
 // heartbeats typically every 5-30s) and short enough that recovery on
 // the next heartbeat is not perceptibly delayed.
 const transientRetryBackoffSecs = 5
+
+// attachQueuedTurnCompletion attaches a drained USER turn's reply
+// (response_body + tool_trace) onto its message-keyed activity row — the
+// async half of the hermes tool-trace feature. Deliberately NARROW instead
+// of dispatching the drain with logActivity=true: the queue NULL-normalizes
+// system callers, so the full logging path would treat platform boot turns
+// as canvas turns (broadcast internal replies into chat, trip the greet-once
+// gate, duplicate busy re-queues — review wf_b8f98be3). Skips:
+//   - self-source platform turns (restart-context wake, first-boot greet)
+//   - unkeyed messages (an insert would duplicate, never collapse)
+// The upsert lands on the row the original ingest wrote (ON CONFLICT
+// workspace_id,message_id), so no new bubble is ever created here.
+func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, workspaceID string, reqBody, respBody []byte) {
+	if len(respBody) == 0 {
+		return
+	}
+	if st := messagestore.RequestSourceType(reqBody); st != "" && messagestore.IsSelfSourceType(st) {
+		return
+	}
+	messageID := extractIdempotencyKey(reqBody)
+	if messageID == "" {
+		return
+	}
+	logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	method := "message/send"
+	summary := "message/send (queued turn reply)"
+	LogActivity(logCtx, h.broadcaster, ActivityParams{
+		WorkspaceID:  workspaceID,
+		ActivityType: "a2a_receive",
+		TargetID:     &workspaceID,
+		Method:       &method,
+		Summary:      &summary,
+		RequestBody:  json.RawMessage(reqBody),
+		ResponseBody: json.RawMessage(respBody),
+		ToolTrace:    extractToolTrace(respBody),
+		Status:       "ok",
+		MessageId:    messageID,
+	})
+}
 
 // QueuedItem is what the heartbeat drain path pulls off the queue.
 type QueuedItem struct {
@@ -520,6 +561,17 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		log.Printf("A2AQueue drain: workspace %s has a restart-context boot turn in flight — deferring drain to the next heartbeat", workspaceID)
 		return
 	}
+	// The agent URL is CONSTANT for this workspace across the whole drain call, so
+	// evict+resolve it exactly ONCE (finding [8]) — lazily, on the first dequeued
+	// item, so an empty queue does no DB read and the resolve keeps its original
+	// position after the first DequeueNext. `resolved` guards the once-only block;
+	// `workspaceSettling` records whether the target is URL-less/provisioning.
+	var (
+		resolved           bool
+		resolvedURL        string
+		settlingResolveErr *proxyA2AError
+		workspaceSettling  bool
+	)
 	for i := 0; i < capacity; i++ {
 		item, err := DequeueNext(ctx, workspaceID)
 		if err != nil {
@@ -534,17 +586,58 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		if item.CallerID.Valid {
 			callerID = item.CallerID.String
 		}
-		// Resolve the agent URL up front so every drain log line carries it.
-		// resolveAgentURL swallows its own errors into a proxyA2AError, so a
-		// resolution failure here is rare — usually a workspace with no URL
-		// row. Empty string is fine for the log; the dispatch below will
-		// produce the structured error and we already log it.
-		resolvedURL, _ := h.resolveAgentURL(ctx, workspaceID)
+		// Resolve the agent URL FRESH from the DB (source of truth) — never trust
+		// the Redis URL cache. A force-hibernate→wake re-provisions a NEW container
+		// with a NEW host/URL; Hibernate and WakeWorkspace blank workspaces.url in
+		// the DB, but the 5-minute Redis URL cache (and a late re-register from the
+		// dying pre-hibernate container) can still hold the DEAD container's URL. If
+		// the drain trusted that stale cache it would dial a host that no longer
+		// exists ("dial tcp: lookup <old-host>: no such host"), the forward would
+		// fail as upstream_dead, and — with no recent heartbeat on a just-woken box
+		// — burn the 5-attempt cap on a doomed dial, stranding the turn forever
+		// (core#124, ephemeral-gate run 815192).
+		//
+		// ClearCachedURL evicts ONLY the url key (not the liveness key), so
+		// resolveAgentURL re-reads the DB and RESEEDS the cache with the truth: the
+		// woken workspace's fresh container URL (→ dispatched to the NEW box), or a
+		// URL-less settling/provisioning row (→ classified workspace_settling). The
+		// proxyA2ARequest below then resolves the SAME reseeded cache value.
+		if !resolved {
+			db.ClearCachedURL(ctx, workspaceID)
+			resolvedURL, settlingResolveErr = h.resolveAgentURL(ctx, workspaceID)
+			workspaceSettling = settlingResolveErr != nil &&
+				settlingResolveErr.Classification == classWorkspaceSettling
+			resolved = true
+		}
+
+		// #4531 regression fix. A workspace that has NOT resolved to a reachable
+		// online URL — still provisioning / awaiting_agent (URL-less,
+		// classWorkspaceSettling; e.g. a wake that never reached online in the
+		// task#127 outage) — must NOT be dispatched through proxyA2ARequest. That
+		// path re-classifies classWorkspaceSettling and enqueueBusyA2A INSERTS a
+		// FRESH a2a_queue row every drain (attempts=0, settling_since=NULL,
+		// enqueued_at=now()), so the #4459 settling ceiling AND DropStaleQueueItems
+		// can NEVER fire and the turn zombie-requeues forever, re-poking provisioner
+		// discovery each sweep — re-opening exactly what #4459 fixed. Keep THIS row
+		// on the BOUNDED settling path instead: MarkQueueItemTransientRetry preserves
+		// settling_since (COALESCE) + attempts (idempotent requeue of the SAME row,
+		// no fresh insert), so the ceiling advances and DropQueueItemTerminal ends it.
+		if workspaceSettling {
+			h.settleQueuedItemBounded(ctx, workspaceID, callerID, item, settlingResolveErr)
+			continue
+		}
 		log.Printf("A2AQueue drain: dispatching queue_id=%s workspace_id=%s url=%s attempt=%d",
 			item.ID, workspaceID, resolvedURL, item.Attempts)
 
-		// logActivity=false: the original EnqueueA2A callsite already logged
-		// the dispatch attempt; re-logging here would double-count events.
+		// logActivity=false STANDS: EnqueueA2A NULL-normalizes system callers
+		// (caller_id is a UUID column), so a drained boot turn re-dispatches
+		// with callerID=="" and the full logging path would treat it as a
+		// CANVAS turn — broadcasting internal restart/greet replies into the
+		// user's chat, tripping the greet-once gate, and re-persisting busy
+		// re-queues as duplicate bubbles (review wf_b8f98be3, 5 confirmed
+		// regressions). The async tool-trace completion is attached instead
+		// by the NARROW helper below, which skips self-source turns and
+		// only upserts onto the message-keyed row.
 		status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false, false)
 
 		// 202 Accepted = the dispatch was itself queued again (target still busy).
@@ -553,6 +646,11 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		// count attempts; the new (re-)queue row already exists.
 		if status == http.StatusAccepted {
 			MarkQueueItemCompleted(ctx, item.ID, nil)
+			// Async tool-trace completion (2026-07-21): attach the reply +
+			// tool_trace onto the USER turn's message-keyed activity row.
+			// Self-source platform turns (restart-context wake, first-boot
+			// greet) are skipped — their replies are not user chat.
+			h.attachQueuedTurnCompletion(ctx, workspaceID, item.Body, respBody)
 			log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s re-queued (target still busy)",
 				item.ID, workspaceID)
 			continue
@@ -653,6 +751,59 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 			h.stitchDrainResponseToDelegation(ctx, callerID, item.WorkspaceID, delegationID, respBody)
 		}
 	}
+}
+
+// settleQueuedItemBounded handles a dequeued item whose target workspace has NOT
+// yet resolved to a reachable online URL — it is still provisioning /
+// awaiting_agent (classWorkspaceSettling, URL-less). It keeps the item on the same
+// BOUNDED settling path the #4459 ceiling governs, instead of dispatching it
+// through proxyA2ARequest (whose classWorkspaceSettling branch enqueueBusyA2A's a
+// FRESH unbounded a2a_queue row every drain — the #4531 regression). Two outcomes,
+// mirroring the online transient-gateway path:
+//
+//   - settling_since is set AND older than a2aSettlingRetryCeiling → the target has
+//     stayed URL-less far past any normal wake/provision window →
+//     DropQueueItemTerminal (+ delegation drop-stitch) so the turn can never
+//     zombie-requeue and starve idle-gated work (task #124/#94).
+//   - otherwise → MarkQueueItemTransientRetry, which COALESCEs settling_since
+//     (stamps it on the FIRST settling observation, preserves it thereafter) and
+//     undoes DequeueNext's attempts++ so attempts are PRESERVED across requeues.
+//     The row is the SAME durable row every drain (idempotent), so the ceiling
+//     genuinely advances toward the drop — unlike the fresh-row regression.
+func (h *WorkspaceHandler) settleQueuedItemBounded(ctx context.Context, workspaceID, callerID string, item *QueuedItem, resolveErr *proxyA2AError) {
+	status := 0
+	if resolveErr != nil {
+		status = resolveErr.Status
+	}
+
+	if item.SettlingSince.Valid && time.Since(item.SettlingSince.Time) >= a2aSettlingRetryCeiling {
+		settlingFor := time.Since(item.SettlingSince.Time)
+		dropMsg := fmt.Sprintf("target workspace never reached online within %s of the first settling observation "+
+			"(still URL-less/provisioning, last resolve status=%d); dropped to stop a zombie re-queue that starves the workspace (core#124/#4531)",
+			a2aSettlingRetryCeiling, status)
+		DropQueueItemTerminal(ctx, item.ID, dropMsg)
+		// If this was a DELEGATION, terminalize its delegate_result to 'failed' NOW
+		// so the caller's check_task_status is unblocked immediately instead of
+		// hanging until the 6h delegation-sweeper deadline (mirrors the online
+		// ceiling-drop, core#4459 re-review [1]).
+		if delegationID := extractDelegationIDFromBody(item.Body); delegationID != "" {
+			h.stitchDroppedDelegationFailure(ctx, callerID, item.WorkspaceID, delegationID, dropMsg)
+		}
+		log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s SETTLING CEILING EXCEEDED (URL-less: "+
+			"settling_for=%s ceiling=%s resolve_status=%d) — dropped to stop zombie re-queue",
+			item.ID, workspaceID, settlingFor.Truncate(time.Second), a2aSettlingRetryCeiling, status)
+		return
+	}
+
+	MarkQueueItemTransientRetry(ctx, item.ID,
+		fmt.Sprintf("workspace settling (URL-less/provisioning, resolve status=%d): awaiting online for drain", status))
+	settledFor := time.Duration(0)
+	if item.SettlingSince.Valid {
+		settledFor = time.Since(item.SettlingSince.Time)
+	}
+	log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s URL-less settling — re-queued on the bounded settling "+
+		"path (attempts preserved at %d, settling_for=%s/%s)",
+		item.ID, workspaceID, item.Attempts, settledFor.Truncate(time.Second), a2aSettlingRetryCeiling)
 }
 
 // classificationOrUnknown renders an empty proxyA2AError.Classification as

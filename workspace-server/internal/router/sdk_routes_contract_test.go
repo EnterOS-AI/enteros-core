@@ -140,8 +140,49 @@ func matches(call, route string) bool {
 // which sets this env var. Locally: MOLECULE_RUN_CONTRACT_DRIFT_GATES=1 go test ...
 const contractDriftGateEnv = "MOLECULE_RUN_CONTRACT_DRIFT_GATES"
 
+// capturedRoutesPendingSDKModel are workspace-server routes the e2e suite
+// exercises that today are contract-checked ONLY because
+// tests/e2e/lib/assert_e2e_tenant_contract.py validates the LIVE e2e call sites
+// against router.go. They are NOT (yet) declared in the SDK route SSOT
+// (workspace-comms/routes.manifest.json → molcontracts.SDKRoutes), whose bounded
+// scope is registry+a2a (SDKRoutesOwnedScope). The workspace-request lane
+// (wsAuth `/workspaces/:id/requests*` + the admin `/requests/*` mirror) sits
+// outside that scope, so the SSOT is silent on it.
+//
+// This matters now because the post-push staging E2E lanes are being retired in
+// favour of the per-PR ephemeral gate (task #86). Once those lanes go, the e2e
+// call sites that keep the Python guard honest disappear, and this derive-gate
+// becomes the ONLY structural proof that core still serves these routes.
+// Retiring staging must NOT narrow the sole contract-check of them — so we
+// CAPTURE them here first (capture-first per RFC molecule-core#4428, issue #87)
+// and hold core to serving each one under the same method.
+//
+// FOLLOW-UP (RFC #4428 D1/D2, issue #87): absorb these into
+// workspace-comms/routes.manifest.json in molecule-ai-sdk (a `requests` scope, or
+// widening SDKRoutesOwnedScope) and regenerate molcontracts.SDKRoutes, then delete
+// this slice so the SDK manifest is once again the single SSOT. The
+// list_peers/A2A-peers route (GET /registry/:id/peers) is intentionally NOT here:
+// it is already declared in SDKRoutes (id="peers").
+var capturedRoutesPendingSDKModel = []molcontracts.Route{
+	{ID: "workspace_request_create", Method: "POST", Path: "/workspaces/:id/requests"},
+	{ID: "workspace_requests_pending", Method: "GET", Path: "/requests/pending"},
+	{ID: "workspace_request_add_message", Method: "POST", Path: "/requests/:id/messages"},
+}
+
+// routeRegistered reports whether some registered gin route serves the given
+// SDK-declared method+path (via the gin :param/*wild matcher).
+func routeRegistered(routes []registeredRoute, method, path string) bool {
+	for _, rr := range routes {
+		if rr.method == method && matches(path, rr.path) {
+			return true
+		}
+	}
+	return false
+}
+
 // TestSDKRoutesContract is the shadow route derive-gate: every molcontracts.SDKRoutes
-// entry must be registered in router.go under the same method.
+// entry — plus every capturedRoutesPendingSDKModel entry (capture-first, issue #87)
+// — must be registered in router.go under the same method.
 func TestSDKRoutesContract(t *testing.T) {
 	if os.Getenv(contractDriftGateEnv) == "" {
 		t.Skipf("shadow contract-drift gate (RFC #4428 Phase 1, issue #87) — set %s=1 to run. "+
@@ -157,17 +198,23 @@ func TestSDKRoutesContract(t *testing.T) {
 	}
 
 	for _, sr := range molcontracts.SDKRoutes {
-		found := false
-		for _, rr := range routes {
-			if rr.method == sr.Method && matches(sr.Path, rr.path) {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !routeRegistered(routes, sr.Method, sr.Path) {
 			t.Errorf("SDK contract route %s %s (id=%q) is NOT registered in router.go under method %s — "+
 				"either core dropped a contract route or the SDK manifest drifted (RFC #4428, issue #87)",
 				sr.Method, sr.Path, sr.ID, sr.Method)
+		}
+	}
+
+	// Capture-first routes: same check, but these are core-captured pending SDK
+	// modelling (see capturedRoutesPendingSDKModel). Losing one means retiring
+	// staging E2E silently dropped the only contract-check of a live route.
+	for _, cr := range capturedRoutesPendingSDKModel {
+		if !routeRegistered(routes, cr.Method, cr.Path) {
+			t.Errorf("captured route %s %s (id=%q) is NOT registered in router.go under method %s — "+
+				"a route the e2e suite exercises lost its registration, and it is NOT covered by "+
+				"molcontracts.SDKRoutes (RFC #4428 capture-first, issue #87). Re-add it to router.go "+
+				"or, if genuinely removed, drop it from capturedRoutesPendingSDKModel.",
+				cr.Method, cr.Path, cr.ID, cr.Method)
 		}
 	}
 }

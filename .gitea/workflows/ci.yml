@@ -295,6 +295,37 @@ jobs:
         run: go test -timeout 10m -coverprofile=coverage.out ./...
 
       - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: Run e2e_busy_inject positive-control tests (blocking gate)
+        # task #112 / #92 vacuity fix. The test-only busy-inject seam
+        # (internal/handlers/testbusy_enabled_test.go) compiles ONLY under the
+        # `e2e_busy_inject` build tag, so the default `go test ./...` blocking
+        # gate above can never see it — TestTestBusy_HookArmed /
+        # TestTestBusy_RouteRegistered existed but were executed by NO workflow
+        # (the #112 "a test no workflow names is never run" class). The only
+        # other reference to the tag, e2e-ephemeral-happy-path.yml, merely
+        # COMPILES it into the tenant image (BUILD_TAGS=e2e_busy_inject); it does
+        # not `go test` these unit assertions. Run them here explicitly — an
+        # enumerated package + -run filter, no glob (per
+        # feedback_verify_new_test_is_wired_to_ci).
+        #
+        # Non-vacuity guard: a bare `go test -run TestTestBusy` that matches zero
+        # tests (e.g. after a rename, or if the tag stops compiling the file)
+        # still exits 0 with "no tests to run" — a vacuous green. So we tee the
+        # verbose output and require BOTH `--- PASS` lines; a missing one fails
+        # the gate.
+        run: |
+          set -euo pipefail
+          go test -tags e2e_busy_inject -count=1 -v \
+            ./internal/handlers/ -run TestTestBusy 2>&1 | tee /tmp/test-busy-inject.log
+          for t in TestTestBusy_HookArmed TestTestBusy_RouteRegistered; do
+            if ! grep -q -- "--- PASS: $t" /tmp/test-busy-inject.log; then
+              echo "::error::e2e_busy_inject positive control did not execute $t — vacuous pass (check the build tag and -run filter)."
+              exit 1
+            fi
+          done
+          echo "e2e_busy_inject positive-control tests executed and passed ✓"
+
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Race detection (advisory, non-blocking)
         # mc#1184: runs race detector as an advisory check so cold-runner
         # compile-time spikes don't block merges. Failures here surface in
@@ -497,6 +528,10 @@ jobs:
         name: Managed tenant flags are reversible (rollback safety)
         run: bash scripts/deploy/tests/test-managed-flags.sh
 
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Promoted runtime images are ready before staging E2E
+        run: bash scripts/deploy/tests/test-prepare-staging-runtime-images.sh
+
       # Runs when EITHER side of the contract moves: the e2e scripts (scripts)
       # or the router that serves them (platform). A route rename in
       # workspace-server is exactly how a call goes dead without anyone noticing.
@@ -583,6 +618,10 @@ jobs:
           # gate load-bearing while avoiding duplicate task sends after the
           # canvas cap returns `{status:"queued",delivery_mode:"push-async"}`.
           bash tests/e2e/test_chat_history_agent_text_unit.sh
+          # A durable queued response must expose a queue_id before the required
+          # local-provision lane constructs its queue-status URL. Offline cases
+          # preserve the MiniMax advisory skip but make the stub lane fail fast.
+          bash tests/e2e/test_local_provision_queue_guard_unit.sh
           # harden/e2e-staging-saas-failclosed: fail-direction proof for the
           # E2E_REQUIRE_LIVE fail-closed-on-skip guard in
           # test_staging_full_saas.sh. Offline (no LLM/network/provisioning):
@@ -645,6 +684,12 @@ jobs:
           # collide with a wrapped process's real exit code. This test shipped in
           # #4425 but no workflow named it — it never ran until this line.
           bash tests/e2e/test_extra_scenarios_gating_unit.sh
+          # real-runtime-matrix opt-in (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX) in
+          # ephemeral_cp_happy_path.sh: proves DEFAULT-OFF is byte-identical to
+          # today (matrix_runtimes == just hermes, peer_visibility external) and
+          # that arming boots the full maintained matrix (managed mode), with the
+          # per-runtime template digest pins + overrides. Offline/pure: no docker.
+          bash tests/e2e/test_real_runtime_matrix_unit.sh
           # Staging full-SaaS POST /workspaces cold-origin 5xx retry classifier
           # (lib/workspace_create_retry.sh). Offline: proves an empty-body
           # 502/503/504 is retried (honoring Retry-After) while a JSON app error
@@ -668,7 +713,10 @@ jobs:
         run: |
           shellcheck --severity=warning \
             scripts/deploy/redeploy-staging-fleet.sh \
-            scripts/deploy/tests/test-managed-flags.sh
+            scripts/deploy/tests/test-managed-flags.sh \
+            scripts/deploy/require-local-deploy-daemon.sh \
+            scripts/deploy/prepare-staging-runtime-images.sh \
+            scripts/deploy/tests/test-prepare-staging-runtime-images.sh
 
   # mc#959 root-fix (sre)
 

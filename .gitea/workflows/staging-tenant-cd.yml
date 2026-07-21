@@ -7,12 +7,12 @@ name: staging-tenant-cd
 # local-cp-deploy-pipeline.yml), which likewise triggers on push to `main`. The
 # operator model is TRUNK-BASED: every `main` merge is the staging candidate, so
 # a push to `main` that changes the tenant image sources flows through a
-# STRUCTURALLY-GATED, provider-agnostic job chain:
+# STRUCTURALLY-GATED, explicit local-Docker provider-boundary job chain:
 #
-#   await-image -> advance-pin -> redeploy-fleet -> e2e-smoke
-#                                      ^                  ^
-#                                      |                  HARD GATE (real staging A2A-serve e2e)
-#                                      candidate roll: canary-first + /buildinfo health gate
+#   await-image -> advance-pin -> redeploy-fleet -------------> e2e-smoke
+#                              \-> runtime-image-readiness ----/     ^
+#                                      ^                            HARD GATE (real staging A2A-serve e2e)
+#                                      exact promoted runtime digests ready on provisioner daemon
 #
 # THE LOOP (build half + deploy half)
 #   publish-workspace-server-image.yml  (BUILD)  — already triggers on push:[main]
@@ -30,13 +30,14 @@ name: staging-tenant-cd
 # deploy never rolls onto a half-built image and never races the build.
 #
 # WHY STRUCTURALLY GATED (un-bypassable)
-#   e2e-smoke `needs: redeploy-fleet` which `needs: advance-pin` which `needs:
-#   await-image`. The tenant-image CD path deliberately does NOT deploy/reload
-#   the control-plane host: that is provider-specific infrastructure work and
-#   belongs behind its own provider adapter, outside this tenant-image CI. If
-#   anything after advance-pin fails or is skipped, rollback-pin restores the old
-#   pin and rerolls the staging tenant fleet back to that old image. There is no
-#   continue-on-error on any gating job.
+#   e2e-smoke `needs:` BOTH redeploy-fleet and runtime-image-readiness; each
+#   needs advance-pin, which needs await-image. The readiness sibling targets
+#   exactly the `local-deploy` daemon selected by runner configuration and only
+#   prepares its image cache from CP-owned read projections. It does NOT
+#   deploy/reload the control-plane host; that provider-specific infrastructure
+#   work remains outside tenant-image CI. If anything after advance-pin fails or
+#   is skipped, rollback-pin restores the old pin and rerolls the staging tenant
+#   fleet back to that old image. There is no continue-on-error on any gating job.
 #
 # SESSION PRESERVATION
 #   redeploy-fleet delegates to scripts/deploy/redeploy-staging-fleet.sh, which
@@ -50,11 +51,12 @@ name: staging-tenant-cd
 # PROD_AUTO_DEPLOY_DISABLED-gated) owns the prod fleet, and this pipeline never
 # writes the prod pin nor the :latest tag.
 #
-# Runs on the docker-host runner (host /var/run/docker.sock = the daemon serving
-# the mol-tenant-* fleet) for the image/pin/roll jobs; the e2e-smoke job runs on
-# a Go runner and hits staging over HTTPS (no CP source dependency — molecule-core
-# stays OSS/CP-independent; it exercises the DEPLOYED staging system exactly like
-# the existing e2e-workspace-lifecycle.yml staging job it reuses).
+# The image/pin/tenant-roll jobs use docker-host. Runtime readiness uses the
+# dedicated local-deploy runner because that runner's mTLS Docker endpoint is
+# the daemon the local-Docker workspace provisioner mutates; the script consumes
+# only deployed CP HTTPS projections, never CP source. e2e-smoke runs on a Go
+# runner and hits staging over HTTPS exactly like the existing
+# e2e-workspace-lifecycle.yml staging job it reuses.
 
 on:
   # TRUNK-BASED: fire on push to `main` (NOT the abandoned `staging` branch,
@@ -72,6 +74,8 @@ on:
       - '.gitea/workflows/staging-tenant-cd.yml'
       - 'scripts/deploy/redeploy-staging-fleet.sh'
       - 'scripts/deploy/advance-staging-tenant-pin.sh'
+      - 'scripts/deploy/prepare-staging-runtime-images.sh'
+      - 'scripts/deploy/require-local-deploy-daemon.sh'
   # Repository policy keeps dispatch flat (enforced by lint-workflow-yaml).
   # Operator overrides are read from repo/org
   # VARS instead: STAGING_TENANT_CD_IMAGE_TAG (roll to a specific tag) and
@@ -198,9 +202,33 @@ jobs:
           TENANT_FLAGS="${STAGING_TENANT_FLAGS-}" \
             bash scripts/deploy/redeploy-staging-fleet.sh --tag "${{ needs.await-image.outputs.tag }}"
 
+  # bp-exempt: post-merge staging CD hard gate; enforced by e2e needs + rollback, not PR branch protection.
+  runtime-image-readiness:
+    name: runtime-image-readiness (exact promoted digests on provisioner daemon)
+    needs: [advance-pin]
+    # This is the runner whose operator-configured mTLS endpoint reaches the
+    # daemon used by the staging local-Docker provisioner. The checked-in guard
+    # proves endpoint equality + mTLS + the staging CP's molecule-net
+    # attachment before any pull.
+    runs-on: local-deploy
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Verify the exact local-deploy Docker daemon
+        run: bash scripts/deploy/require-local-deploy-daemon.sh
+      - name: Pre-pull and RepoDigest-verify every promoted pinnable runtime
+        env:
+          CP_BASE_URL: https://staging-api.moleculesai.app
+          INFISICAL_BASE: https://key.moleculesai.app
+          INFISICAL_ENV: staging
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: bash scripts/deploy/prepare-staging-runtime-images.sh
+
   e2e-smoke:
     name: e2e-smoke (staging real provision + A2A HARD GATE)
-    needs: [redeploy-fleet]
+    needs: [redeploy-fleet, runtime-image-readiness]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -354,7 +382,7 @@ jobs:
         run: bash tests/e2e/lib/go_e2e_run_teardown.sh
   rollback-pin:
     name: rollback-pin (revert pin if the fleet roll failed)
-    needs: [advance-pin, redeploy-fleet, e2e-smoke]
+    needs: [advance-pin, redeploy-fleet, runtime-image-readiness, e2e-smoke]
     # ALWAYS-RUN + explicit in-job branch (main-status coherence). Because this
     # workflow advances the pin before the fleet roll, any failure/skipped path
     # after advance-pin must restore the old pin and reroll staging tenants back
@@ -368,6 +396,7 @@ jobs:
         env:
           ADVANCE_RESULT: ${{ needs.advance-pin.result }}
           REDEPLOY_RESULT: ${{ needs.redeploy-fleet.result }}
+          READINESS_RESULT: ${{ needs.runtime-image-readiness.result }}
           E2E_RESULT: ${{ needs.e2e-smoke.result }}
           OLD_IMAGE: ${{ needs.advance-pin.outputs.old_image }}
           OLD_GIT_SHA: ${{ needs.advance-pin.outputs.old_git_sha }}
@@ -391,15 +420,15 @@ jobs:
             echo "::notice::pin never advanced (advance-pin=$ADVANCE_RESULT) — nothing to revert."
             exit 0
           fi
-          if [ "$REDEPLOY_RESULT" = "success" ] && [ "$E2E_RESULT" = "success" ]; then
-            echo "::notice::candidate fleet roll + e2e green — no rollback needed."
+          if [ "$REDEPLOY_RESULT" = "success" ] && [ "$READINESS_RESULT" = "success" ] && [ "$E2E_RESULT" = "success" ]; then
+            echo "::notice::candidate fleet roll + runtime readiness + e2e green — no rollback needed."
             exit 0
           fi
           if [ -z "$OLD_IMAGE" ]; then
             echo "::warning::advance-pin succeeded but exposed no old_image — cannot auto-revert; operator attention needed."
             exit 0
           fi
-          echo "::warning::candidate path failed after pin advance (redeploy=$REDEPLOY_RESULT e2e=$E2E_RESULT) — reverting staging pin and fleet to $OLD_IMAGE"
+          echo "::warning::candidate path failed after pin advance (redeploy=$REDEPLOY_RESULT readiness=$READINESS_RESULT e2e=$E2E_RESULT) — reverting staging pin and fleet to $OLD_IMAGE"
           if [ -n "$OLD_GIT_SHA" ]; then
             bash scripts/deploy/advance-staging-tenant-pin.sh --image "$OLD_IMAGE" --git-sha "$OLD_GIT_SHA"
             EXPECTED_BUILD_SHA="$OLD_GIT_SHA" bash scripts/deploy/redeploy-staging-fleet.sh --image "$OLD_IMAGE"

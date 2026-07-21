@@ -29,7 +29,7 @@ function mint(workspaceId: string): string {
     typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  return `conv-${workspaceId}-${rand}`;
+  return `sess-${workspaceId}-${rand}`;
 }
 
 /**
@@ -41,15 +41,26 @@ export function getConversationId(workspaceId: string): string {
   const key = storageKey(workspaceId);
   try {
     const existing = window.localStorage.getItem(key);
-    if (existing) return existing;
-    const id = mint(workspaceId);
+    // MIGRATION (2026-07-21): pre-unification builds minted a RANDOM default
+    // (`conv-<wsid>-<rand>`), so browsers that ever opened the workspace are
+    // stranded on a fragment forever. Legacy conv-* ids are old defaults —
+    // fold them into the deterministic session. Post-unification EXPLICIT
+    // rotations mint `sess-*`, which is preserved (user-chosen isolation).
+    if (existing && !existing.startsWith("conv-")) return existing;
+    // DEFAULT is the DETERMINISTIC workspace session id — the SAME value the
+    // server belt (canvasSessionContextID) fills for contextId-less sends and
+    // the platform stamps on its own turns (first-boot greeting,
+    // restart-context). One workspace = one default session across browsers,
+    // restarts, and boots (Langfuse showed 3 fragments, 2026-07-21); a RANDOM
+    // id is minted only on an explicit "New session" (rotateConversationId).
+    const id = `canvas-${workspaceId}`;
     window.localStorage.setItem(key, id);
     return id;
   } catch {
     // No storage (SSR / privacy mode): a workspace-scoped constant is still far
     // better than a fresh-per-request context_id — it stays stable within the
     // page's lifetime for that workspace.
-    return `conv-${workspaceId}`;
+    return `canvas-${workspaceId}`;
   }
 }
 

@@ -14,12 +14,21 @@ runner labels, and timeout budgets.
   interactions against a real staging org.
 - `.gitea/workflows/e2e-staging-external.yml`: external-runtime registration,
   heartbeat, and delivery.
-- `.gitea/workflows/e2e-staging-reconciler.yml`: backend reconciliation and
-  recovery.
+- backend reconciliation and recovery: the standalone
+  `e2e-staging-reconciler.yml` post-push lane was RETIRED (it was push-only,
+  narrowly paths-filtered, and dormant — 0 runs across the recent Actions
+  window — and red-when-run because its `docker info` preflight needs a
+  molecules-server `DOCKER_HOST` that the generic `ubuntu-latest` runner does
+  not have). Its coverage now runs advisory per-PR on the ephemeral gate as the
+  `reconciler_heals_terminated` scenario
+  (`.gitea/workflows/e2e-ephemeral-happy-path.yml`), driven by the same
+  `tests/e2e/test_reconciler_heals_terminated_instance.sh` harness.
 - `.gitea/workflows/e2e-workspace-lifecycle-staging.yml`: restart,
   pause/resume, hibernate/wake, and A2A survival.
 - `.gitea/workflows/staging-tenant-cd.yml`: exact-image staging rollout plus a
-  hard provision/management-MCP/A2A/lifecycle gate and rollback chain.
+  guarded exact-digest runtime-image readiness sibling, followed by the hard
+  provision/management-MCP/A2A/lifecycle gate and rollback chain. The E2E cannot
+  start until the tenant roll and local-deploy daemon readiness are both green.
 
 The shared shell harness is `tests/e2e/test_staging_full_saas.sh`; individual
 workflows select the required mode. The active local-Docker lanes in

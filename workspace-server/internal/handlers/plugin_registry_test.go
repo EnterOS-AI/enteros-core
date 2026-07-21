@@ -21,7 +21,7 @@ func TestNativeRegistry_SourcesByteIdenticalToRetiredConsts(t *testing.T) {
 		got        string
 		wantSource string
 	}{
-		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.1.0"},
+		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0"},
 		{conciergePlatformMCPName, conciergePlatformMCPSource, "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"},
 	}
 	for _, c := range cases {
@@ -78,11 +78,17 @@ func TestNativeRegistry_DefaultSetExcludesConcierge(t *testing.T) {
 // delivery payload is present: the four idle-digest plugins are declared as
 // install:default so the fleet rollout (flag on) reaches every workspace.
 func TestNativeRegistry_DefaultSetIncludesDigestProviders(t *testing.T) {
+	// Golden set, bumped consciously when the SDK registry pins move (a molcontracts
+	// bump trips this, forcing a deliberate review — same discipline as
+	// TestNativeRegistry_SourcesByteIdenticalToRetiredConsts). These pins are the
+	// digest-provider source-move (RFC molecule-core#4413 D3, v0.2.x). Their
+	// declaration is still flag-gated OFF (declareDefaultNativePluginsEnabled), so
+	// the pin bump is dormant on the fleet until Phase-B arming flips the flag.
 	want := []string{
-		"gitea://molecule-ai/molecule-ai-plugin-digest-goal#v0.1.0",
-		"gitea://molecule-ai/molecule-ai-plugin-digest-identity#v0.1.0",
-		"gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0",
-		"gitea://molecule-ai/molecule-ai-plugin-digest-task-queue#v0.1.0",
+		"gitea://molecule-ai/molecule-ai-plugin-digest-goal#v0.2.0",
+		"gitea://molecule-ai/molecule-ai-plugin-digest-identity#v0.2.1",
+		"gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.2.1",
+		"gitea://molecule-ai/molecule-ai-plugin-digest-task-queue#v0.2.0",
 	}
 	defaults := defaultNativePluginSources()
 	have := map[string]bool{}
@@ -115,6 +121,102 @@ func TestDeclareDefaultNativePluginsEnabled_DefaultOff(t *testing.T) {
 		t.Setenv(declareDefaultNativePluginsEnv, on)
 		if !declareDefaultNativePluginsEnabled() {
 			t.Errorf("value %q must read as ON", on)
+		}
+	}
+}
+
+// TestDefaultNativePluginSourcesForDeclare_ExcludesScheduler proves the fix for
+// the latent double-declare: declareDefaultNativePlugins seeds
+// defaultNativePluginSourcesForDeclare(), which MUST drop the scheduler source
+// (the dedicated ensureSchedulerPluginDeclared path owns it), while leaving the
+// registry SSOT (defaultNativePluginSources) untouched.
+//
+// Negative control: the pre-fix declareDefaultNativePlugins seeded
+// defaultNativePluginSources() directly, which DOES contain SchedulerPluginSource
+// (asserted below via the raw set) — so the pre-fix seed set would fail the
+// "scheduler absent" assertion here.
+func TestDefaultNativePluginSourcesForDeclare_ExcludesScheduler(t *testing.T) {
+	forDeclare := defaultNativePluginSourcesForDeclare()
+	for _, s := range forDeclare {
+		if s == SchedulerPluginSource {
+			t.Fatalf("declareDefaultNativePlugins seed set still contains the scheduler source %q — the ensureSchedulerPluginDeclared path owns it; a second (differently-named) row = duplicate boot-install", s)
+		}
+	}
+	// The registry SSOT is NOT mutated: the raw default set still carries it.
+	var rawHasScheduler bool
+	for _, s := range defaultNativePluginSources() {
+		if s == SchedulerPluginSource {
+			rawHasScheduler = true
+		}
+	}
+	if !rawHasScheduler {
+		t.Fatalf("filtering must happen in declareDefaultNativePlugins only — defaultNativePluginSources() (registry SSOT) must still include the scheduler")
+	}
+	// The digest providers survive the filter (only the scheduler is dropped).
+	if len(forDeclare) != len(defaultNativePluginSources())-1 {
+		t.Fatalf("expected exactly one source (the scheduler) filtered out; declare-set=%d raw=%d", len(forDeclare), len(defaultNativePluginSources()))
+	}
+}
+
+// TestScheduler_DeclaredExactlyOnce_AcrossProvisionDeclarePaths pins the property
+// finding #3b is about: across the TWO provision-time declare paths — the
+// dedicated ensureSchedulerPluginDeclared (name SchedulerPluginName) and the
+// flag-armed declareDefaultNativePlugins (name derived from source) — the
+// scheduler plugin is declared under exactly ONE name, i.e. exactly once.
+//
+// Negative control: with the pre-fix seed set (defaultNativePluginSources(),
+// unfiltered) the derived scheduler name "molecule-ai-plugin-scheduler" AND the
+// const SchedulerPluginName "molecule-scheduler" would BOTH be present, giving a
+// count of 2 — this test would fail. (The two names differing is itself asserted.)
+func TestScheduler_DeclaredExactlyOnce_AcrossProvisionDeclarePaths(t *testing.T) {
+	derived, err := plugins.PluginNameFromSource(SchedulerPluginSource)
+	if err != nil {
+		t.Fatalf("PluginNameFromSource(%q): %v", SchedulerPluginSource, err)
+	}
+	// The whole hazard rests on the two names diverging; assert that explicitly.
+	if derived == SchedulerPluginName {
+		t.Fatalf("test premise broken: derived name %q == const name %q (no double-declare hazard)", derived, SchedulerPluginName)
+	}
+
+	names := map[string]int{}
+	// Path 1: ensureSchedulerPluginDeclared always records under the const name.
+	names[SchedulerPluginName]++
+	// Path 2: declareDefaultNativePlugins (flag armed) records each seed source
+	// under its derived name.
+	for _, s := range defaultNativePluginSourcesForDeclare() {
+		n, err := plugins.PluginNameFromSource(s)
+		if err != nil {
+			t.Fatalf("PluginNameFromSource(%q): %v", s, err)
+		}
+		names[n]++
+	}
+
+	total := names[SchedulerPluginName] + names[derived]
+	if total != 1 {
+		t.Fatalf("scheduler declared %d time(s) across provision declare paths (%q=%d, %q=%d); want exactly 1 — a second row = duplicate boot-install",
+			total, SchedulerPluginName, names[SchedulerPluginName], derived, names[derived])
+	}
+}
+
+// TestDeclareSchedulerPluginEnabled_DefaultOn is the kill-switch blast-radius gate
+// (finding #3a): the unconditional per-provision scheduler declare stays ON by
+// default (unset/"" enabled, byte-identical to today), and only an explicit falsey
+// value disables it — the inverse of declareDefaultNativePluginsEnabled.
+func TestDeclareSchedulerPluginEnabled_DefaultOn(t *testing.T) {
+	os.Unsetenv(declareSchedulerPluginEnv)
+	if !declareSchedulerPluginEnabled() {
+		t.Fatal("flag unset must be ON (default-on kill-switch: provisioning unchanged unless explicitly disabled)")
+	}
+	for _, on := range []string{"", "1", "true", "yes", "on", "TRUE", "whatever"} {
+		t.Setenv(declareSchedulerPluginEnv, on)
+		if !declareSchedulerPluginEnabled() {
+			t.Errorf("value %q must read as ON (default-on)", on)
+		}
+	}
+	for _, off := range []string{"0", "false", "no", "FALSE", "No", " false "} {
+		t.Setenv(declareSchedulerPluginEnv, off)
+		if declareSchedulerPluginEnabled() {
+			t.Errorf("value %q must read as OFF (explicit disable)", off)
 		}
 	}
 }
