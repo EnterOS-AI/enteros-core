@@ -97,6 +97,7 @@ export function resolveHomeChatTarget<N extends { id: string }>(
 
 export function ConciergeShell() {
   const nodes = useCanvasStore((st) => st.nodes);
+  const selfHostGateResolved = useCanvasStore((st) => st.selfHostGateResolved);
   const topView = useCanvasStore((st) => st.topView);
   const setTopView = useCanvasStore((st) => st.setTopView);
   const selectNode = useCanvasStore((st) => st.selectNode);
@@ -338,11 +339,40 @@ export function ConciergeShell() {
   // so it needs its own hook here. Falls through to the normal shell the
   // moment the root reports online — the runtime POSTs one BOOT_STEP per phase
   // to /workspaces/:id/boot-event, which the screen animates as keycaps.
+  // Deliberately BEFORE the pre-gate hold: a mid-boot page reload must show
+  // the restored boot screen immediately, not a generic spinner for however
+  // long the setup gate's API round-trips take on a build-saturated host.
   if (
     platformRoot &&
     platformRoot.data.status === WORKSPACE_STATUS.Provisioning
   ) {
     return <BootSequenceScreen node={platformRoot} />;
+  }
+
+  // Pre-gate hold: on a fresh self-host load the always-seeded platform root
+  // is present but NOT online (unconfigured/offline), and the
+  // SelfHostSetupScene's async gate hasn't yet decided whether to mount the
+  // onboarding overlay. Rendering the shell in that window flashed a
+  // misleading "concierge offline" view for the second the gate takes —
+  // hold a neutral loading screen until the gate has a verdict. An ONLINE
+  // root skips the hold entirely (returning users never see a spinner), and
+  // after the verdict the shell renders normally (the overlay covers it on
+  // self-host; SaaS no-concierge orgs get the legacy create-agent view).
+  if (
+    !selfHostGateResolved &&
+    (!platformRoot || platformRoot.data.status !== WORKSPACE_STATUS.Online)
+  ) {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        data-testid="concierge-pregate-loading"
+        className="fixed inset-0 flex flex-col items-center justify-center gap-3 bg-surface"
+      >
+        <span className="w-8 h-8 rounded-full border-2 border-line border-t-accent motion-safe:animate-spin" aria-hidden="true" />
+        <span className="text-xs text-ink-mid">Connecting to your organization…</span>
+      </div>
+    );
   }
 
   return (

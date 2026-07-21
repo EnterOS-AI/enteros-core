@@ -372,13 +372,17 @@ func findWorkspaceByName(t *testing.T, host, token, orgID, want string) (id, kin
 // tool-use turn on a cold concierge can exceed doTenantJSON's default 90s.
 func doTenantJSONTimeout(t *testing.T, method, url, token, orgID, body string, timeout time.Duration) (int, string) {
 	t.Helper()
-	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	rewritten, top, err := tenantTopoFromURL(url)
 	if err != nil {
-		t.Fatalf("build %s %s: %v", method, url, err)
+		t.Fatalf("tenant topology for %s: %v", url, err)
+	}
+	req, err := http.NewRequest(method, rewritten, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build %s %s: %v", method, rewritten, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Molecule-Org-Id", orgID)
-	req.Header.Set("Origin", "https://"+strings.SplitN(strings.TrimPrefix(url, "https://"), "/", 2)[0])
+	applyTenantRouting(req, top)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)

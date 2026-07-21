@@ -21,6 +21,36 @@ export interface EchoRuntime {
   lastRequest: { method: string; text: string; files: unknown[] } | null;
 }
 
+/** One schedule as the runtime's volume grid contract names its fields. */
+interface GridEntry {
+  name: string;
+  cron: string;
+  timezone: string;
+  prompt: string;
+  enabled: boolean;
+  source: string;
+}
+
+/**
+ * Minimal 5-field cron validation, standing in for the runtime schedule_store's
+ * validate_entry. It accepts the common numeric AND named forms a user can type
+ * in the free-text ScheduleTab cron input (steps, ranges, lists, and named
+ * day/month tokens like MON-FRI or JAN) and rejects free prose ("not a cron"), so
+ * the invalid-cron alert path (validated host-side post-P4b, not in core) stays
+ * covered without rejecting valid exprs — full cron semantics are the runtime's
+ * concern, tested there.
+ */
+function isValidCron(expr: string): boolean {
+  const fields = expr.trim().split(/\s+/);
+  if (fields.length !== 5) return false;
+  // A field is *, or a comma-list of terms, each: a value/name, an optional
+  // range (a-b), and an optional /step. Values are digits or 3-letter names
+  // (MON, JAN, …) so day-of-week/month names validate.
+  const term = "(\\*|\\d+|[A-Za-z]{3})(-(\\d+|[A-Za-z]{3}))?(\\/\\d+)?";
+  const field = new RegExp(`^(\\*(\\/\\d+)?|${term}(,${term})*)$`);
+  return fields.every((f) => field.test(f));
+}
+
 /** Parse a minimal multipart body and extract the first file's name + content. */
 function parseMultipart(body: Buffer): { name: string; mimeType: string; content: Buffer } | null {
   // Find the boundary line (first line starting with "--").
@@ -65,6 +95,10 @@ function parseMultipart(body: Buffer): { name: string; mimeType: string; content
 
 export async function startEchoRuntime(): Promise<EchoRuntime> {
   let lastRequest: EchoRuntime["lastRequest"] = null;
+  // In-process, name-keyed schedule grid (the volume backend the Canvas schedule
+  // surface forwards to post-P4b, once the legacy core workspace_schedules store
+  // was retired). Persists across requests for one echo-runtime instance.
+  const schedules = new Map<string, GridEntry>();
 
   const server = createServer((req, res) => {
     // CORS: allow the canvas origin (localhost:3000) to call us.
@@ -111,6 +145,167 @@ export async function startEchoRuntime(): Promise<EchoRuntime> {
         res.end(JSON.stringify(response));
       });
       return;
+    }
+
+    // ── Volume schedule API (post-P4b) ──────────────────────────────────────
+    // The Canvas schedule surface forwards to the runtime's /internal/schedules*
+    // grid and hot-arms the daemon via /internal/daemons/reload. Serve both as a
+    // faithful in-process volume backend so schedule-tab.spec exercises the real
+    // path (the legacy core-DB store was retired in P4b). Name-keyed; mirrors the
+    // runtime schedule_store contract (validate cron, reject duplicate name).
+    const path = url.split("?")[0];
+
+    if (path === "/internal/daemons/reload" && req.method === "POST") {
+      // A 2xx here signals the grid API is already serving — the create-race
+      // readiness probe the platform's synchronous arm relies on.
+      res.setHeader("Content-Type", "application/json");
+      res.writeHead(200);
+      res.end(JSON.stringify({ armed: schedules.size, added: ["molecule-scheduler"], trigger: true }));
+      return;
+    }
+    if (path === "/internal/schedules" && req.method === "GET") {
+      res.setHeader("Content-Type", "application/json");
+      res.writeHead(200);
+      res.end(JSON.stringify({ schedules: [...schedules.values()] }));
+      return;
+    }
+    if (path === "/internal/schedules/health" && req.method === "GET") {
+      res.setHeader("Content-Type", "application/json");
+      res.writeHead(200);
+      res.end(JSON.stringify({ last_tick: null, armed: schedules.size, errors: {} }));
+      return;
+    }
+    if (path === "/internal/schedules" && req.method === "POST") {
+      let raw = "";
+      req.setEncoding("utf8");
+      req.on("data", (chunk: string) => {
+        raw += chunk;
+      });
+      req.on("end", () => {
+        res.setHeader("Content-Type", "application/json");
+        let e: Record<string, unknown>;
+        try {
+          e = JSON.parse(raw);
+        } catch {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "invalid json" }));
+          return;
+        }
+        const cron = String(e.cron ?? "");
+        if (!isValidCron(cron)) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `invalid cron expression: ${cron}` }));
+          return;
+        }
+        const name = String(e.name ?? "");
+        if (schedules.has(name)) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: `schedule already exists: ${name}` }));
+          return;
+        }
+        const entry: GridEntry = {
+          name,
+          cron,
+          timezone: String(e.timezone || "UTC"),
+          prompt: String(e.prompt ?? ""),
+          enabled: e.enabled !== false,
+          source: "runtime",
+        };
+        schedules.set(name, entry);
+        res.writeHead(201);
+        res.end(JSON.stringify(entry));
+      });
+      return;
+    }
+    const schedMatch = path.match(/^\/internal\/schedules\/([^/]+)(\/run|\/history)?$/);
+    if (schedMatch) {
+      const name = decodeURIComponent(schedMatch[1]);
+      const suffix = schedMatch[2];
+      res.setHeader("Content-Type", "application/json");
+      if (suffix === "/history" && req.method === "GET") {
+        res.writeHead(200);
+        res.end(JSON.stringify({ history: [] }));
+        return;
+      }
+      if (suffix === "/run" && req.method === "POST") {
+        // Name-keyed store: an unknown schedule 404s (mirrors the runtime's
+        // "404 unknown" on /run), not a blanket 202.
+        if (!schedules.has(name)) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: `not found: ${name}` }));
+          return;
+        }
+        res.writeHead(202);
+        res.end(JSON.stringify({ poked: name }));
+        return;
+      }
+      if (!suffix && req.method === "DELETE") {
+        // Deleting an unknown name 404s (name-keyed store), not a blanket 200.
+        if (!schedules.has(name)) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: `not found: ${name}` }));
+          return;
+        }
+        schedules.delete(name);
+        res.writeHead(200);
+        res.end(JSON.stringify({ status: "deleted" }));
+        return;
+      }
+      if (!suffix && req.method === "PATCH") {
+        let raw = "";
+        req.setEncoding("utf8");
+        req.on("data", (chunk: string) => {
+          raw += chunk;
+        });
+        req.on("end", () => {
+          const cur = schedules.get(name);
+          if (!cur) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: `not found: ${name}` }));
+            return;
+          }
+          let patch: Record<string, unknown>;
+          try {
+            patch = JSON.parse(raw);
+          } catch {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: "invalid json" }));
+            return;
+          }
+          // Build the update on a COPY and validate EVERYTHING (cron, rename
+          // collision) before committing — so a rejected PATCH leaves the stored
+          // entry untouched (no mutate-before-validate aliasing).
+          const updated: GridEntry = { ...cur };
+          if (patch.cron !== undefined) {
+            if (!isValidCron(String(patch.cron))) {
+              res.writeHead(400);
+              res.end(JSON.stringify({ error: `invalid cron expression: ${String(patch.cron)}` }));
+              return;
+            }
+            updated.cron = String(patch.cron);
+          }
+          if (patch.timezone !== undefined) updated.timezone = String(patch.timezone);
+          if (patch.prompt !== undefined) updated.prompt = String(patch.prompt);
+          if (patch.enabled !== undefined) updated.enabled = patch.enabled !== false;
+          // Rename re-keys the grid (name is the primary key). Reject a collision
+          // with an existing entry, mirroring the real store's name guard.
+          if (patch.name !== undefined && String(patch.name) !== name) {
+            const newName = String(patch.name);
+            if (schedules.has(newName)) {
+              res.writeHead(400);
+              res.end(JSON.stringify({ error: `schedule already exists: ${newName}` }));
+              return;
+            }
+            updated.name = newName;
+          }
+          // Commit only after all validation passed.
+          if (updated.name !== name) schedules.delete(name);
+          schedules.set(updated.name, updated);
+          res.writeHead(200);
+          res.end(JSON.stringify(updated));
+        });
+        return;
+      }
     }
 
     // Default: A2A JSON-RPC handler.

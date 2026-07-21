@@ -627,7 +627,7 @@ func main() {
 	// plugin, so schedules are volume-authoritative and fired by the runtime
 	// daemon; core only proxies the Canvas/admin CRUD surface to the volume
 	// (internal/handlers/schedules_proxy.go). The old poll-and-fire loop
-	// (internal/scheduler) and the workspace_schedules table have been retired.
+	// (internal/scheduler) has been retired.
 	// The native-scheduler capability check that used to gate double-fire is
 	// therefore unnecessary — there is no core loop left to skip.
 	//
@@ -914,4 +914,3 @@ func deleteLegacyAdminTokenGlobalSecrets() {
 		log.Printf("deleteLegacyAdminTokenGlobalSecrets: removed %d legacy admin-token global secret row(s)", rows)
 	}
 }
-

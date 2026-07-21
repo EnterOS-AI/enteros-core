@@ -141,3 +141,57 @@ func TestSeedTemplatePlugins_SkipsUnparseableSource(t *testing.T) {
 		t.Errorf("unmet DB expectations: %v", err)
 	}
 }
+
+// TestPayloadDeclaredPlugins_SeedsViaMergeAndSeed pins the chain the Create
+// handler runs for CreateWorkspacePayload.Plugins: mergePlugins(nil, payload) →
+// seedTemplatePlugins. This is the DURABLE declare channel that lands a plugin in
+// workspace_declared_plugins (the SSOT provision recomputes MOLECULE_DECLARED_PLUGINS
+// from) — unlike a MOLECULE_DECLARED_PLUGINS value injected via `secrets`, which
+// provision overwrites. A duplicate entry must collapse to ONE upsert (mergePlugins
+// dedup), proving the payload path is byte-identical to the template `plugins:` path.
+func TestPayloadDeclaredPlugins_SeedsViaMergeAndSeed(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+
+	source := "gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0"
+	// mergePlugins dedups → exactly ONE INSERT for the digest-mail install name.
+	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
+		WithArgs("ws-create-1", "molecule-ai-plugin-digest-mail", source).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	declared := mergePlugins(nil, []string{source, source}) // caller-supplied dup
+	recorded, skipped := seedTemplatePlugins(context.Background(), "ws-create-1", declared)
+	if recorded != 1 || skipped != 0 {
+		t.Fatalf("expected recorded=1 skipped=0 (dedup to one row), got recorded=%d skipped=%d", recorded, skipped)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations (payload-declared digest row not written): %v", err)
+	}
+}
+
+// TestPayloadDeclaredPlugins_PrivilegedRefused is the security negative-control:
+// the payload plugins field must NOT become a privilege-escalation surface. The
+// concierge management MCP (org-admin tools) declared via this path on a
+// non-platform workspace must be REFUSED by recordDeclaredPlugin's kind-gate — no
+// INSERT — exactly as the template/org-import paths are, since all share the same
+// chokepoint.
+func TestPayloadDeclaredPlugins_PrivilegedRefused(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+
+	// The kind precheck resolves the target workspace as an ordinary workspace.
+	mock.ExpectQuery(`SELECT COALESCE\(kind, 'workspace'\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-ordinary").
+		WillReturnRows(sqlmock.NewRows([]string{"kind"}).AddRow("workspace"))
+	// No ExpectExec is programmed: an INSERT here would be a privilege escalation
+	// and sqlmock fails the test on any unexpected write.
+
+	declared := mergePlugins(nil, []string{conciergePlatformMCPSource})
+	recorded, skipped := seedTemplatePlugins(context.Background(), "ws-ordinary", declared)
+	if recorded != 0 || skipped != 1 {
+		t.Fatalf("privileged plugin on a non-platform workspace must be refused (recorded=0 skipped=1), got recorded=%d skipped=%d", recorded, skipped)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations (kind-gate should have blocked the write): %v", err)
+	}
+}

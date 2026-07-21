@@ -28,7 +28,6 @@ package handlers
 
 import (
 	"context"
-	"database/sql"
 	"strings"
 	"sync"
 	"testing"
@@ -102,18 +101,12 @@ func driveScheduledImport(t *testing.T, withSchedule bool) provisioner.Workspace
 		WillReturnResult(sqlmock.NewResult(1, 1)) // MODEL persist (core#2594)
 	mock.ExpectExec(`INSERT INTO canvas_layouts`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectQuery(`SELECT id FROM workspaces`).
-		WillReturnError(sql.ErrNoRows) // no removed predecessor (internal#2006)
 
 	if withSchedule {
 		// THE C2 assertion: the org-import path itself declares
 		// molecule-scheduler (pre-provision). Args: (workspace_id, name, source).
 		mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
 			WithArgs(sqlmock.AnyArg(), SchedulerPluginName, SchedulerPluginSource).
-			WillReturnResult(sqlmock.NewResult(1, 1))
-		// The legacy DB seed MUST KEEP running alongside the volume path
-		// until P4b retires it — its removal here would be a silent cutover.
-		mock.ExpectExec(`INSERT INTO workspace_schedules`).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 	}
 
@@ -160,9 +153,9 @@ func driveScheduledImport(t *testing.T, withSchedule bool) provisioner.Workspace
 
 	if withSchedule {
 		// All load-bearing expectations — including the declared-plugin upsert
-		// and the KEPT legacy workspace_schedules seed — must have fired.
+		// — must have fired.
 		if err := mock.ExpectationsWereMet(); err != nil {
-			t.Errorf("load-bearing statements missing (declare-before-provision or legacy DB seed regressed): %v", err)
+			t.Errorf("load-bearing statements missing (declare-before-provision regressed): %v", err)
 		}
 	}
 	return capture.startedCfg(t)

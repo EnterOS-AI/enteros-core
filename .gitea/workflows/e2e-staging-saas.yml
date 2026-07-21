@@ -112,15 +112,21 @@ jobs:
   # Full-lifecycle lane: live on protected push/dispatch; credential-free
   # self-check on pull_request. pr-validate is only a workflow-shape check and
   # is not a substitute for live staging proof.
-  # bp-exempt: full-lifecycle lane on molecules-server (local-docker). Not a required gate.
+  #
+  # FAIL-LOUD (not advisory): this job carries NO continue-on-error mask — it is
+  # proven green (E2E Staging SaaS = success across the recent push/main +
+  # pull_request Actions window, e.g. runs 549861, 549753, 549575, 549456,
+  # 549320) and it fails loud on a real regression. `bp-exempt` below means only
+  # that it is not enumerated in .gitea/required-contexts.txt; it does NOT mean a
+  # red is harmless. Under main's branch protection status_check_contexts=["*"]
+  # every posted context is merge-blocking, so an emitted red here still wedges
+  # the queue — do NOT re-add a mask to "quiet" it; keep the lane green.
+  # bp-exempt: full-lifecycle lane on molecules-server (local-docker). Not enumerated in required-contexts.txt.
   e2e-staging-saas:
     name: E2E Staging SaaS
     runs-on: ubuntu-latest
     # Live on push/dispatch against local-docker; on pull_request the harness
     # performs its credential-free self-check.
-    # Phase 3 (RFC #219 §1): surface broken workflows without blocking.
-    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
     # Raised 45→75: step 10b now exercises pause→resume→online +
     # hibernate→wake→online, each of which re-provisions the parent through the
     # CP and waits for heartbeat recovery. The base provision→online→A2A matrix

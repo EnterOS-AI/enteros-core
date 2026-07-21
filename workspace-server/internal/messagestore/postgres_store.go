@@ -66,6 +66,11 @@ var selfSourceTypes = map[string]bool{
 	"self-goal-nudge":        true,
 	"self-delegation-result": true,
 	"self-warmup":            true,
+	// The platform's post-restart context snapshot (restart_context.go).
+	// Delivered via the a2a queue since 2026-07-19 (durable-enqueue fix),
+	// which routes through the ordinary ingest persist — without this marker
+	// each drained snapshot rendered as a blue user bubble in My Chat.
+	"self-restart-context": true,
 }
 
 // IsSelfSourceType reports whether a params.metadata.source_type marker
@@ -135,6 +140,9 @@ func isInternalSelfRequest(body json.RawMessage, text string) bool {
 // the runtime), never here.
 var internalSelfPrefixes = []string{
 	"Delegation results are ready",
+	// Restart-context snapshots persisted before the source_type marker was
+	// added (2026-07-19) — retroactively reclassifies those rows.
+	"=== WORKSPACE RESTART CONTEXT ===",
 }
 
 // IsInternalSelfMessage reports whether text starts with any registered

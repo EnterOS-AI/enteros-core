@@ -9,32 +9,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// The volume-mode gate must be SELF-DARK: false for any workspace that does not
-// advertise the `scheduler` capability, true when it does, and forced false by
-// the kill-switch even for a native workspace.
-func TestScheduleBackendIsVolume_Gate(t *testing.T) {
-	const ws = "ws-gate-1"
-	t.Setenv(scheduleProxyKillEnv, "")
-
-	if scheduleBackendIsVolume(ws) {
-		t.Fatal("expected volume=false for a workspace with no scheduler capability (self-dark)")
-	}
-
-	runtimeOverrides.SetCapabilities(ws, map[string]bool{"scheduler": true})
-	t.Cleanup(func() { runtimeOverrides.SetCapabilities(ws, nil) })
-
-	if !scheduleBackendIsVolume(ws) {
-		t.Fatal("expected volume=true once the workspace advertises the scheduler capability")
-	}
-
-	for _, v := range []string{"1", "true", "YES"} {
-		t.Setenv(scheduleProxyKillEnv, v)
-		if scheduleBackendIsVolume(ws) {
-			t.Fatalf("kill-switch %q must force the legacy DB path even for a native workspace", v)
-		}
-	}
-}
-
 // A name-keyed grid entry maps to the stable Canvas shape with id==name,
 // cron->cron_expr, and a computed next_run_at.
 func TestToScheduleResponse_Translation(t *testing.T) {

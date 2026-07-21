@@ -243,7 +243,15 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 			Extra: map[string]interface{}{"error": msg, "code": "MISSING_PLATFORM_PROXY", "routing": "platform", "issue": "2162"},
 		}
 	}
-	applyRuntimeModelEnv(envVars, payload.Runtime, payload.Model)
+	// When the self-host platform-arm fallback substituted the model, the
+	// substitution — not payload.Model — must win applyRuntimeModelEnv's
+	// priority chain, or the container env resurrects the unusable
+	// platform-arm model the fallback just routed away from.
+	effectivePayloadModel := payload.Model
+	if llmRes.SubstitutedModel != "" {
+		effectivePayloadModel = llmRes.SubstitutedModel
+	}
+	applyRuntimeModelEnv(envVars, payload.Runtime, effectivePayloadModel)
 	if payload.Role != "" {
 		envVars["MOLECULE_AGENT_ROLE"] = payload.Role
 	}
@@ -307,6 +315,35 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		}
 	}
 
+	// SELF-HOST TENANT-IDENTITY DEFAULTS (2026-07-19 operator decision): a
+	// template that hard-requires TENANT_* identity vars (seo-agent's
+	// TENANT_NAME/DOMAIN/TIMEZONE...) must NEVER fail first boot on a
+	// self-hosted stack over them. There is no SaaS tenant here — the
+	// operator IS the tenant — so generate branded placeholders ("Enter OS",
+	// system timezone) for any that are unset and boot; the operator refines
+	// them later via org-scope Secrets (which override these, since defaults
+	// only fill ABSENT keys). Pre-fix the concierge's create flow dead-ended
+	// in MISSING_REQUIRED_ENV and coped by queueing placeholder secret-write
+	// approvals for values that, on self-host, simply don't matter yet.
+	// Self-host signal: no CP proxy wired (same gate as the platform-arm
+	// model fallback). The RESTART path carries templatePath instead of
+	// in-memory configFiles (preflight #5 skips there for the same reason),
+	// so fall back to reading the template's config.yaml from disk — without
+	// this, a restart booted the workspace with NO tenant identity at all
+	// while a create filled it (observed 2026-07-19: online SEO agent with
+	// empty TENANT_* env).
+	if !PlatformManagedProxyConfigured() {
+		reqSrc := configFiles
+		if reqSrc == nil && templatePath != "" {
+			if b, rErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); rErr == nil {
+				reqSrc = map[string][]byte{"config.yaml": b}
+			}
+		}
+		if reqSrc != nil {
+			applySelfHostTenantDefaults(envVars, missingRequiredEnv(reqSrc, envVars))
+		}
+	}
+
 	// Preflight #5: refuse to launch when config.yaml declares required
 	// env vars that are not set. Skipped in SaaS mode when configFiles
 	// is nil (CP-mode's cfg is built without local config bytes — the
@@ -340,14 +377,30 @@ func (h *WorkspaceHandler) prepareProvisionContext(
 		return nil, abort
 	}
 
-	// RFC molecule-core#4413: declare the install:default native plugins
-	// (scheduler + idle-digest providers) on this workspace, from the SDK
-	// native-plugins registry SSOT. Placed AFTER every provision abort gate so a
-	// provision that fails a preflight never records orphan declared-plugin rows.
-	// Flag-gated (default off) so merging is byte-identical to today; the owner
-	// arms it during the fleet rollout once the runtime loaders are live.
-	// Non-fatal and idempotent — runs on every provision path (create/restart/
-	// resume) and never blocks provisioning.
+	// The SCHEDULER is a BASE per-workspace ability, declared UNCONDITIONALLY on
+	// every workspace at provision (not flag-gated). The one molecule-scheduler
+	// plugin ships BOTH halves of self-scheduling — the firing trigger daemon AND
+	// the self-audience self-schedule MCP tool (plugin-mcp-audience-contract
+	// self-schedule v1). The tool CANNOT be declared on-demand the way the daemon
+	// alone was (ensureSchedulerPluginDeclared on schedule-create): you need the
+	// tool to create the first schedule. So every workspace gets it up front — which
+	// is also what the native-plugins registry already intends ("the scheduler is
+	// default-on-every-workspace"). The org-manage side stays on the concierge
+	// management MCP (install:concierge, org key) — never this every-workspace
+	// plugin. Non-fatal + idempotent (recordDeclaredPlugin upserts); placed AFTER
+	// every provision abort gate so a failed preflight records no orphan rows.
+	if err := ensureSchedulerPluginDeclared(ctx, workspaceID); err != nil {
+		log.Printf("provision: declare scheduler plugin for %s (non-fatal): %v", workspaceID, err)
+	}
+
+	// RFC molecule-core#4413: declare the OTHER install:default native plugins
+	// (the idle-digest providers) on this workspace, from the SDK native-plugins
+	// registry SSOT. Placed AFTER every provision abort gate so a failed preflight
+	// records no orphan rows. Still FLAG-gated (default off) — the owner arms it
+	// during the fleet rollout once the runtime digest loaders are live; the
+	// scheduler above is intentionally NOT gated (base ability), so it re-declaring
+	// the scheduler here when the flag is on is a harmless idempotent no-op.
+	// Non-fatal and idempotent — runs on every provision path (create/restart/resume).
 	declareDefaultNativePlugins(ctx, workspaceID)
 
 	cfg := h.buildProvisionerConfig(ctx, workspaceID, templatePath, configFiles, payload, envVars, workspaceSecretKeys, pluginsPath)

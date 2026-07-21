@@ -135,6 +135,51 @@ func TestComputeAuditHMAC_TimestampStripsSubseconds(t *testing.T) {
 	}
 }
 
+// ============================= missing-salt is LOUD, not silent ============
+
+// TestGetAuditHMACKey_MissingSaltLogsLoudly is the security neg-control for the
+// silent-no-audit hole: an unset AUDIT_LEDGER_SALT must NOT be a silent skip —
+// it must emit a loud SECURITY/AUDIT config error. Proves the loud log fires
+// (and, in the sibling sub-test, that a configured salt is silent).
+func TestGetAuditHMACKey_MissingSaltLogsLoudly(t *testing.T) {
+	t.Run("unset salt logs loudly and derives no key", func(t *testing.T) {
+		resetAuditKeyCache()
+		os.Unsetenv("AUDIT_LEDGER_SALT")
+		defer resetAuditKeyCache()
+
+		buf := captureLog(t)
+		key := getAuditHMACKey()
+		out := buf.String()
+
+		if key != nil {
+			t.Fatalf("expected nil key when salt unset, got %d bytes", len(key))
+		}
+		if !strings.Contains(out, "SECURITY/AUDIT") || !strings.Contains(out, "AUDIT_LEDGER_SALT is not set") {
+			t.Fatalf("missing salt must be a LOUD config error, not a silent skip; log was: %q", out)
+		}
+		if !strings.Contains(out, "NOT tamper-evident") {
+			t.Errorf("loud log should spell out the consequence (not tamper-evident); got: %q", out)
+		}
+	})
+
+	t.Run("configured salt is silent and derives a key", func(t *testing.T) {
+		resetAuditKeyCache()
+		t.Setenv("AUDIT_LEDGER_SALT", "loud-log-negctl")
+		defer resetAuditKeyCache()
+
+		buf := captureLog(t)
+		key := getAuditHMACKey()
+		out := buf.String()
+
+		if key == nil {
+			t.Fatal("expected a derived key when salt is set")
+		}
+		if strings.Contains(out, "SECURITY/AUDIT") {
+			t.Errorf("a configured salt must NOT emit the missing-salt error; got: %q", out)
+		}
+	})
+}
+
 // ============================= verifyAuditChain ============================
 
 // TestVerifyAuditChain_NilKeyReturnsNil verifies that unset SALT → nil result
@@ -707,6 +752,220 @@ func TestAuditQuery_FromFilterReturnsNullChainValid(t *testing.T) {
 		t.Errorf("chain_valid should be null for a from-filtered subset, got %v", v)
 	}
 
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
+// ===================== chain_verification field (split null) ===============
+
+// TestAuditQuery_ChainVerification_Verified proves the field reads "verified"
+// on an intact chain (positive control for the split-null field).
+func TestAuditQuery_ChainVerification_Verified(t *testing.T) {
+	const testSalt = "test-salt-cv-verified"
+	resetAuditKeyCache()
+	t.Setenv("AUDIT_LEDGER_SALT", testSalt)
+	defer resetAuditKeyCache()
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	key := testAuditKey(t, testSalt)
+	ts := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	ev := auditEventRow{
+		ID: "e1", Timestamp: ts, AgentID: "agent-1", SessionID: "sess-1",
+		Operation: "task_start", WorkspaceID: "ws-cv1",
+	}
+	ev.HMAC = makeAuditHMAC(t, key, &ev)
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM audit_events`).
+		WithArgs("ws-cv1").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT id, timestamp, agent_id`).
+		WithArgs("ws-cv1", 100, 0).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "timestamp", "agent_id", "session_id", "operation",
+			"input_hash", "output_hash", "model_used",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+		}).AddRow(
+			ev.ID, ev.Timestamp, ev.AgentID, ev.SessionID, ev.Operation,
+			nil, nil, nil,
+			ev.HumanOversightFlag, ev.RiskFlag, nil, ev.HMAC, ev.WorkspaceID,
+		))
+
+	h := NewAuditHandler()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-cv1"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-cv1/audit", nil)
+	h.Query(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp["chain_verification"] != "verified" {
+		t.Errorf("chain_verification = %v, want verified", resp["chain_verification"])
+	}
+	if cv, _ := resp["chain_valid"].(bool); !cv {
+		t.Errorf("chain_valid = %v, want true", resp["chain_valid"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
+// TestAuditQuery_ChainVerification_Tampered is the tamper neg-control at the
+// handler layer: a corrupted stored HMAC must fail closed to
+// chain_valid=false / chain_verification="tampered".
+func TestAuditQuery_ChainVerification_Tampered(t *testing.T) {
+	const testSalt = "test-salt-cv-tamper"
+	resetAuditKeyCache()
+	t.Setenv("AUDIT_LEDGER_SALT", testSalt)
+	defer resetAuditKeyCache()
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+
+	key := testAuditKey(t, testSalt)
+	ts := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	ev := auditEventRow{
+		ID: "e1", Timestamp: ts, AgentID: "agent-1", SessionID: "sess-1",
+		Operation: "task_start", WorkspaceID: "ws-cv2",
+	}
+	ev.HMAC = makeAuditHMAC(t, key, &ev)
+	ev.HMAC = "deadbeef" + ev.HMAC[8:] // tamper the stored HMAC
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM audit_events`).
+		WithArgs("ws-cv2").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT id, timestamp, agent_id`).
+		WithArgs("ws-cv2", 100, 0).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "timestamp", "agent_id", "session_id", "operation",
+			"input_hash", "output_hash", "model_used",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+		}).AddRow(
+			ev.ID, ev.Timestamp, ev.AgentID, ev.SessionID, ev.Operation,
+			nil, nil, nil,
+			ev.HumanOversightFlag, ev.RiskFlag, nil, ev.HMAC, ev.WorkspaceID,
+		))
+
+	h := NewAuditHandler()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-cv2"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-cv2/audit", nil)
+	h.Query(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp["chain_verification"] != "tampered" {
+		t.Errorf("chain_verification = %v, want tampered", resp["chain_verification"])
+	}
+	cv, ok := resp["chain_valid"].(bool)
+	if !ok || cv {
+		t.Errorf("chain_valid = %v, want false (fail-closed on tamper)", resp["chain_valid"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
+// TestAuditQuery_ChainVerification_DisabledNoSalt proves the split-null: an
+// unset salt is reported as "disabled_no_salt" (a misconfiguration), NOT the
+// benign "unavailable_partial_query" — so a missing salt is not a silent
+// no-audit even at the API layer. chain_valid stays null (contract-preserving).
+func TestAuditQuery_ChainVerification_DisabledNoSalt(t *testing.T) {
+	resetAuditKeyCache()
+	os.Unsetenv("AUDIT_LEDGER_SALT")
+	defer resetAuditKeyCache()
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM audit_events`).
+		WithArgs("ws-cv3").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`SELECT id, timestamp, agent_id`).
+		WithArgs("ws-cv3", 100, 0).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "timestamp", "agent_id", "session_id", "operation",
+			"input_hash", "output_hash", "model_used",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+		}))
+
+	h := NewAuditHandler()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-cv3"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-cv3/audit", nil)
+	h.Query(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp["chain_verification"] != "disabled_no_salt" {
+		t.Errorf("chain_verification = %v, want disabled_no_salt", resp["chain_verification"])
+	}
+	if v, present := resp["chain_valid"]; present && v != nil {
+		t.Errorf("chain_valid should be null when salt unset, got %v", v)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock: %v", err)
+	}
+}
+
+// TestAuditQuery_ChainVerification_PartialQuery proves the OTHER null case is
+// still distinguished as benign: salt IS set, but offset>0 could omit chain
+// predecessors, so the field is "unavailable_partial_query" (NOT
+// disabled_no_salt, NOT tampered).
+func TestAuditQuery_ChainVerification_PartialQuery(t *testing.T) {
+	const testSalt = "test-salt-cv-partial"
+	resetAuditKeyCache()
+	t.Setenv("AUDIT_LEDGER_SALT", testSalt)
+	defer resetAuditKeyCache()
+
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM audit_events`).
+		WithArgs("ws-cv4").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(10))
+	mock.ExpectQuery(`SELECT id, timestamp, agent_id`).
+		WithArgs("ws-cv4", 100, 50).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "timestamp", "agent_id", "session_id", "operation",
+			"input_hash", "output_hash", "model_used",
+			"human_oversight_flag", "risk_flag", "prev_hmac", "hmac", "workspace_id",
+		}))
+
+	h := NewAuditHandler()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-cv4"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-cv4/audit?offset=50", nil)
+	h.Query(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp["chain_verification"] != "unavailable_partial_query" {
+		t.Errorf("chain_verification = %v, want unavailable_partial_query", resp["chain_verification"])
+	}
+	if v, present := resp["chain_valid"]; present && v != nil {
+		t.Errorf("chain_valid should be null for paginated response, got %v", v)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock: %v", err)
 	}

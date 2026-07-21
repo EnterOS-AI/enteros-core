@@ -294,6 +294,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// to 'hibernated'. The workspace auto-wakes on the next A2A message.
 		wsAuth.POST("/hibernate", wh.Hibernate)
 
+		// Test-only busy-inject (task #92). Compiled ONLY under the
+		// e2e_busy_inject build tag — a no-op stub in every shipped image
+		// (testbusy_disabled.go), so no route is registered and the path 404s in
+		// production. The tag-built throwaway tenant image the ephemeral CP gate
+		// uses gets POST /workspaces/:id/test-busy, which pins active_tasks so
+		// 10b force-hibernate deterministically hits a BUSY workspace without a
+		// real LLM turn. WorkspaceAuth (this group) is the request-time guard.
+		handlers.RegisterTestBusyRoutes(wsAuth)
+
 		// Broadcast — send a message to all non-removed workspaces in the org.
 		// Requires broadcast_enabled=true on the source workspace (checked
 		// inside the handler). WorkspaceAuth on wsAuth proves token ownership.
@@ -457,6 +466,16 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// is retired. The provisioning->online flip is now driven by the runtime's
 	// turn-independent mcp_tools_ready heartbeat event, so no synthetic warmup turn
 	// (and thus no WorkspaceHandler warmup sender) is needed.
+	//
+	// First-boot greeting: on the provisioning→online transition (verified
+	// concierge flip / ordinary workspace's first register), drive a real
+	// agent turn so the agent greets the user in its own persona, delivered
+	// through the AgentMessageWriter SSOT (first_boot_greeting.go). A fresh
+	// onboarding lands in a chat where the agent has already spoken.
+	rh.SetFirstBootGreeter(handlers.FirstBootGreeter(
+		handlers.NewAgentMessageWriter(db.DB, broadcaster),
+		wh.ProxyA2ARequest,
+	))
 	r.POST("/registry/register", rh.Register)
 	r.POST("/registry/heartbeat", rh.Heartbeat)
 	r.POST("/registry/update-card", rh.UpdateCard)
@@ -568,14 +587,6 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// requires an explicit X-Workspace-ID plus that workspace's source-bound
 		// bearer; verified human credentials bypass hierarchy. Issue #249.
 		r.GET("/workspaces/:id/schedules/health", schedh.Health)
-		// P3-live cutover: copy a workspace's runtime-source schedules from the
-		// core DB into its volume grid (idempotent). AdminAuth — an ops action
-		// run once per workspace after its trigger plugin goes live.
-		r.POST("/admin/workspaces/:id/schedules/migrate-to-volume", middleware.AdminAuth(db.DB), schedh.MigrateToVolume)
-		// Per-workspace scheduler delivery (P5b): declare molecule-scheduler for
-		// every workspace that already has schedules (stranded post-P4). AdminAuth;
-		// DRY-RUN by default, ?apply=true to declare + arm. One-shot remediation.
-		r.POST("/admin/schedules/backfill-plugin", middleware.AdminAuth(db.DB), schedh.BackfillSchedulerPlugin)
 
 		// Budget — per-workspace spend ceiling and current usage (#541).
 		// GET stays on wsAuth — a workspace agent reading its own budget is legitimate.
@@ -719,8 +730,6 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	{
 		asHealth := handlers.NewAdminSchedulesHealthHandler()
 		r.GET("/admin/schedules/health", middleware.AdminAuth(db.DB), asHealth.Health)
-		r.GET("/admin/schedules/orphans", middleware.AdminAuth(db.DB), asHealth.Orphans)
-		r.POST("/admin/schedules/reap-orphans", middleware.AdminAuth(db.DB), asHealth.ReapOrphans)
 	}
 
 	// Admin — stale a2a_queue cleanup (issue #1947). Marks queued items older

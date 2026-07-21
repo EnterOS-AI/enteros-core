@@ -1,48 +1,25 @@
 package handlers
 
-// template_schedules.go — read a workspace template's `schedules:`
-// block and seed workspace_schedules with source='template'. Mirrors
-// the org/import flow (org_import.go) so a workspace created directly
-// from a workspace template (e.g. via WorkspaceHandler.Create) lands
-// with the same schedule grid the org/import path would have produced.
+// template_schedules.go — parse a workspace template's `schedules:`
+// block. The parsed entries are rendered into the delivered config.yaml
+// (renderTemplateSchedulesYAML) so the runtime seeds them onto the
+// volume-authoritative grid at boot/reload; core no longer seeds a
+// schedule DB table (retired in P4b).
 //
-// Issue #24 contract (also enforced by org_import + schedules.go):
-//   - INSERT new rows with source='template'
-//   - On (workspace_id, name) collision, only refresh template-source
-//     rows; runtime-added rows survive re-provisioning untouched
-//   - Never DELETE (additive only)
-//
-// The actual INSERT statement is the canonical orgImportScheduleSQL
-// defined in org.go — reused here verbatim so the four guarantees
-// stay in one place.
-//
-// Hostile-template defenses (a tenant can upload a config.yaml via
+// Hostile-template defense (a tenant can upload a config.yaml via
 // POST /templates/import or webhook-sync a repo they control):
-//   - config.yaml is loaded through a 1 MiB LimitReader so a YAML
-//     anchor-bomb / billion-laughs cannot pre-explode memory before
-//     unmarshal returns.
-//   - len(schedules), per-schedule cron length, and resolved prompt
-//     body length are all bounded; over-sized entries are skipped
-//     rather than committed.
-//   - Per-row insert errors and ctx cancellation surface to the
-//     caller via the returned counts so partial-seed states are
-//     observable (workspace.go Create logs the (seeded, skipped)
-//     pair when skipped > 0).
+// config.yaml is loaded through a 1 MiB LimitReader so a YAML
+// anchor-bomb / billion-laughs cannot pre-explode memory before
+// unmarshal returns, and len(schedules) is bounded.
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
-	"time"
 
 	"gopkg.in/yaml.v3"
-
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cronspec"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 // Bounds protecting the seeder against hostile or buggy templates.
@@ -106,84 +83,4 @@ func parseTemplateSchedules(templatePath string) ([]OrgSchedule, error) {
 		return nil, fmt.Errorf("template declares %d schedules; cap is %d", len(cfg.Schedules), maxTemplateSchedules)
 	}
 	return cfg.Schedules, nil
-}
-
-// seedTemplateSchedules INSERTs (or refreshes) each schedule into
-// workspace_schedules with source='template'. Returns (seeded,
-// skipped) counts so the caller can observe partial-seed states.
-//
-// Prompt body resolution mirrors org_import.go: inline `prompt:` wins,
-// else `prompt_file:` is resolved relative to templatePath via
-// resolvePromptRef. Per-schedule failures (bad cron, missing prompt
-// file, DB error, oversize input) are logged with the schedule name
-// quoted via %q (CRLF-safe) and skipped so one bad row never breaks
-// the rest of the grid. A cancelled ctx breaks the loop early.
-//
-// Timezone defaults to "UTC" when unset. Env-var expansion in the
-// timezone field is intentionally not performed — that mirrors the
-// org/import behavior; template authors should pick a literal IANA
-// zone (or rely on UTC + operator overrides per-tenant).
-func seedTemplateSchedules(ctx context.Context, workspaceID, templatePath string, schedules []OrgSchedule) (seeded, skipped int) {
-	for _, sched := range schedules {
-		// Honour caller cancellation — protects against long seed
-		// loops on a request whose client already gave up.
-		if err := ctx.Err(); err != nil {
-			log.Printf("Template schedule seed: ctx cancelled after %d/%d on %s: %v", seeded, len(schedules), workspaceID, err)
-			skipped += len(schedules) - seeded - skipped
-			return
-		}
-		if len(sched.CronExpr) > maxScheduleCronExprLen {
-			log.Printf("Template schedule seed: cron_expr too long (%d > %d) for %q on %s — skipping", len(sched.CronExpr), maxScheduleCronExprLen, sched.Name, workspaceID)
-			skipped++
-			continue
-		}
-		tz := sched.Timezone
-		if tz == "" {
-			tz = "UTC"
-		}
-		enabled := true
-		if sched.Enabled != nil {
-			enabled = *sched.Enabled
-		}
-		prompt, promptErr := resolvePromptRef(sched.Prompt, sched.PromptFile, templatePath, "")
-		if promptErr != nil {
-			log.Printf("Template schedule seed: failed to resolve prompt for %q on %s: %v — skipping", sched.Name, workspaceID, promptErr)
-			skipped++
-			continue
-		}
-		if prompt == "" {
-			log.Printf("Template schedule seed: schedule %q on %s has empty prompt — skipping", sched.Name, workspaceID)
-			skipped++
-			continue
-		}
-		if len(prompt) > maxSchedulePromptBytes {
-			log.Printf("Template schedule seed: prompt too long (%d > %d bytes) for %q on %s — skipping", len(prompt), maxSchedulePromptBytes, sched.Name, workspaceID)
-			skipped++
-			continue
-		}
-		nextRun, nextRunErr := cronspec.ComputeNextRun(sched.CronExpr, tz, time.Now())
-		if nextRunErr != nil {
-			log.Printf("Template schedule seed: invalid cron for %q on %s: %v — skipping", sched.Name, workspaceID, nextRunErr)
-			skipped++
-			continue
-		}
-		if _, err := db.DB.ExecContext(ctx, orgImportScheduleSQL,
-			workspaceID, sched.Name, sched.CronExpr, tz, prompt, enabled, nextRun); err != nil {
-			log.Printf("Template schedule seed: failed to upsert %q on %s: %v", sched.Name, workspaceID, err)
-			skipped++
-			continue
-		}
-		seeded++
-		log.Printf("Template schedule seed: %q (%s, %d chars) upserted on %s (source=template)", sched.Name, sched.CronExpr, len(prompt), workspaceID)
-	}
-	// A template that ships schedules needs the scheduler trigger plugin to fire
-	// them (scheduler-as-trigger-plugin, per-workspace delivery). Declare it once
-	// when at least one schedule seeded, so it installs on the workspace's next
-	// boot/reconcile. Non-fatal: a declaration hiccup must not fail provisioning.
-	if seeded > 0 {
-		if err := ensureSchedulerPluginDeclared(ctx, workspaceID); err != nil {
-			log.Printf("Template schedule seed: declare scheduler plugin for %s (non-fatal): %v", workspaceID, err)
-		}
-	}
-	return
 }

@@ -21,7 +21,7 @@ func TestNativeRegistry_SourcesByteIdenticalToRetiredConsts(t *testing.T) {
 		got        string
 		wantSource string
 	}{
-		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.1.0"},
+		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0"},
 		{conciergePlatformMCPName, conciergePlatformMCPSource, "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"},
 	}
 	for _, c := range cases {
@@ -78,11 +78,17 @@ func TestNativeRegistry_DefaultSetExcludesConcierge(t *testing.T) {
 // delivery payload is present: the four idle-digest plugins are declared as
 // install:default so the fleet rollout (flag on) reaches every workspace.
 func TestNativeRegistry_DefaultSetIncludesDigestProviders(t *testing.T) {
+	// Golden set, bumped consciously when the SDK registry pins move (a molcontracts
+	// bump trips this, forcing a deliberate review — same discipline as
+	// TestNativeRegistry_SourcesByteIdenticalToRetiredConsts). These pins are the
+	// digest-provider source-move (RFC molecule-core#4413 D3, v0.2.x). Their
+	// declaration is still flag-gated OFF (declareDefaultNativePluginsEnabled), so
+	// the pin bump is dormant on the fleet until Phase-B arming flips the flag.
 	want := []string{
-		"gitea://molecule-ai/molecule-ai-plugin-digest-goal#v0.1.0",
-		"gitea://molecule-ai/molecule-ai-plugin-digest-identity#v0.1.0",
-		"gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0",
-		"gitea://molecule-ai/molecule-ai-plugin-digest-task-queue#v0.1.0",
+		"gitea://molecule-ai/molecule-ai-plugin-digest-goal#v0.2.0",
+		"gitea://molecule-ai/molecule-ai-plugin-digest-identity#v0.2.1",
+		"gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.2.1",
+		"gitea://molecule-ai/molecule-ai-plugin-digest-task-queue#v0.2.0",
 	}
 	defaults := defaultNativePluginSources()
 	have := map[string]bool{}

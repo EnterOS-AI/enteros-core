@@ -368,7 +368,13 @@ var managementMCPConfigProbes = map[string]managementMCPConfigProbe{
 		hasServer:     openclawConfigHasPlatformMCP,
 	},
 	"hermes": {
-		containerPath: "/home/agent/.hermes/config.yaml",
+		// The RUNTIME config start.sh renders lives at /tmp/.hermes (the
+		// gateway runs with HOME=/tmp; /tmp/.hermes is a symlink onto the
+		// persisted /configs/.hermes since 2026-07-19). /home/agent/.hermes
+		// is the hermes INSTALL dir whose installer-seeded stock config never
+		// gains the molecule entry — probing it made the reconciler think the
+		// management MCP was absent on every cycle and re-deliver forever.
+		containerPath: "/tmp/.hermes/config.yaml",
 		eicRuntime:    "hermes",
 		eicRelPath:    "config.yaml",
 		hasServer:     hermesConfigHasPlatformMCP,

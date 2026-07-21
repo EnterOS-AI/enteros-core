@@ -185,6 +185,24 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Go toolchain for the ephemeral gate runner. This makes a go-staging-test
+      # lane RUNNABLE here (the shared harness in workspace-server/internal/staginge2e
+      # is now ephemeral-topology-aware via MOLECULE_TENANT_* + E2E_CP_ALLOW_EPHEMERAL_LOOPBACK).
+      # It only installs the toolchain — the journeys are wired into the runner in a
+      # downstream PR. Gated on the same happy/same-repo condition as the dind step so
+      # fork PRs and docs-only no-op arms don't pay for it. 'stable' matches every
+      # other Go lane in this repo (ci.yml, e2e-*.yml).
+      - name: Set up Go
+        if: (needs.detect.outputs.happy != 'false') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+          # cache:false — the self-hosted fleet SSOTs GOCACHE/GOMODCACHE via
+          # bind-mounted /var/cache/ci-go-{build,mod}; setup-go's actions/cache
+          # untars OVER that mount ("File exists" → failed restore). Required by
+          # lint-setup-go-cache (core#2524). Introduced by #4525, fixed here.
+          cache: false
+
       # Per-job DISPOSABLE dind (tests/harness/dind.sh — the harness-replays
       # pattern, task#78): the WHOLE topology (PG, CP, tenants, workspaces,
       # image builds) lives inside a nested daemon and dies with one atomic
@@ -309,9 +327,15 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
+          # BUILD_TAGS=e2e_busy_inject compiles the TEST-ONLY busy-inject route
+          # (task #92) into THIS throwaway tenant image so 10b force-hibernate can
+          # deterministically hit a busy workspace. The tag exists nowhere else —
+          # no production/staging image is built with it, so the route is absent
+          # from every shipped binary (default BUILD_TAGS="" = today's image).
           docker build \
             -f workspace-server/Dockerfile.tenant \
             --build-arg GIT_SHA="${HEAD_SHA}" \
+            --build-arg BUILD_TAGS=e2e_busy_inject \
             -t "molecule-tenant:pr-${HEAD_SHA:0:8}" \
             .
           echo "TENANT_IMAGE=molecule-tenant:pr-${HEAD_SHA:0:8}" >> "$GITHUB_ENV"
@@ -343,17 +367,32 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           E2E_RUNTIME: hermes
+          # Task #92: the tenant image above is built with -tags e2e_busy_inject,
+          # so 10b uses the deterministic test-busy inject route (no flaky real
+          # LLM turn) AND requires a genuinely busy workspace — a non-busy 10b is
+          # now a hard red, no more capture-first idle fallback.
+          E2E_BUSY_INJECT: "1"
+          E2E_HIBERNATE_FORCE_BUSY_REQUIRED: "1"
           # DIND mode — everything inside the disposable daemon; $BASE/$DOCKER_HOST
           # come from the "Start disposable dind" step via GITHUB_ENV.
           EPHEMERAL_DIND: "1"
           # RFC #86 — pull the post-push staging lanes LEFT onto this per-PR gate,
-          # one at a time. `concierge_user_tasks` is first: it needs only the CP +
-          # API (external workspaces, no LLM/image), so it is the cheapest lane to
-          # move. ADVISORY=1 during the soak — it RUNS every PR (non-vacuous) but a
-          # failure does not block merge yet. Flip ADVISORY to 0 (and retire the
-          # matching post-push job in e2e-staging-saas.yml) once it has soaked
-          # green across a run of PRs.
-          E2E_EPHEMERAL_EXTRA_SCENARIOS: concierge_user_tasks
+          # one at a time. `concierge_user_tasks` was first: it needs only the CP +
+          # API (external workspaces, no LLM/image), so it was the cheapest lane to
+          # move. The last three (workspace_requests, concierge_platform_agent,
+          # plugin_install_lifecycle) are the go-staging-test lanes — they shell out
+          # to the topology-aware Go harness (#4525) instead of a test_*.sh; the
+          # first two are DB/handler-level (secret-free), plugin_install_lifecycle
+          # really boots one workspace (the same real-workspace path the happy path
+          # already stands up). ADVISORY=1 during the soak — every scenario RUNS
+          # every PR (non-vacuous) but a failure does not block merge yet. Flip
+          # ADVISORY to 0 (and retire the matching post-push job in
+          # e2e-staging-saas.yml) once a scenario has soaked green across a run of
+          # PRs. NOTE: the mgmt-MCP present+callable half of the concierge lane
+          # (TestPlatformAgentMgmtMCP_Staging) needs a real concierge boot and is
+          # intentionally deferred to the real-runtime matrix
+          # (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX, default-off), not wired here.
+          E2E_EPHEMERAL_EXTRA_SCENARIOS: concierge_user_tasks,concierge_creates_workspace,external_runtime,reconciler_heals_terminated,peer_visibility,workspace_requests,concierge_platform_agent,plugin_install_lifecycle
           E2E_EPHEMERAL_EXTRA_ADVISORY: "1"
         run: |
           bash tests/e2e/ephemeral_cp_happy_path.sh

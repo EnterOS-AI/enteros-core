@@ -704,19 +704,31 @@ fi
 CANVAS_PID=$!
 
 echo "    Waiting for Canvas HTTP 200..."
+# 180s, liveness-gated: a COLD Next.js/Turbopack compile on a loaded machine
+# routinely exceeds 30s, and the old hard 30s gate tore down the whole stack
+# (platform included) for a canvas that was seconds from ready. Keep waiting
+# as long as the canvas process is alive; bail fast if it DIED.
 CANVAS_READY=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
-         21 22 23 24 25 26 27 28 29 30; do
+i=0
+while [ "$i" -lt 180 ]; do
+    i=$((i + 1))
     code=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:${CANVAS_PORT}/" 2>/dev/null || echo "0")
     if [ "$code" = "200" ]; then
         echo "    Canvas ready (t+${i}s)"
         CANVAS_READY=1
         break
     fi
+    if [ -n "${CANVAS_PID:-}" ] && ! kill -0 "$CANVAS_PID" 2>/dev/null; then
+        echo "    ✗ Canvas process exited during startup — check /tmp/molecule-canvas.log"
+        break
+    fi
+    if [ $((i % 30)) -eq 0 ]; then
+        echo "    still compiling canvas — ${i}s elapsed"
+    fi
     sleep 1
 done
 if [ "$CANVAS_READY" -ne 1 ]; then
-    echo "    ✗ Canvas did not respond in 30s — check /tmp/molecule-canvas.log"
+    echo "    ✗ Canvas did not respond in 180s — check /tmp/molecule-canvas.log"
     exit 1
 fi
 

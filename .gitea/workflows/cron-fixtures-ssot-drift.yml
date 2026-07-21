@@ -1,0 +1,76 @@
+name: cron-fixtures-ssot-drift
+
+# Byte-drift gate for the Go cron conformance fixtures (scheduler-as-trigger RFC).
+#
+# workspace-server/internal/cronspec/testdata/fixtures.json is a byte-for-byte
+# vendored copy of the SDK cron contract's executable SSOT
+# (molecule-ai-sdk contracts/cron/fixtures.json). The Go conformance test
+# (internal/cronspec/cronspec_conformance_test.go) proves robfig/cron still
+# matches whatever sits in testdata/, but NOTHING keeps that vendored copy
+# byte-identical to the SDK SSOT — unlike the runtime Python mirror, which is
+# byte-drift-gated (molecule-ai-workspace-runtime scripts/check-schemas-in-sync.sh
+# MAP entry cron.fixtures.json -> contracts/cron/fixtures.json, wired into
+# schema-sync.yml). This gate closes that gap: fetch the SDK SSOT and byte-diff
+# the vendored core copy. RED on any drift.
+#
+# molecule-ai-sdk is PUBLIC, so the fetch is anonymous (no token) — same as the
+# SDK-SSOT fetch step in mcp-plugin-delivery-contract-drift.yml.
+#
+# ENFORCEMENT GATING: standalone workflow, NOT a job in ci.yml and NOT in branch
+# protection (soak-then-promote; mirrors mcp-plugin-delivery-contract-drift.yml
+# and sync-providers-yaml.yml). Promote into required-contexts after a green soak.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'workspace-server/internal/cronspec/testdata/fixtures.json'
+      - '.gitea/workflows/cron-fixtures-ssot-drift.yml'
+  push:
+    branches: [main, staging]
+    paths:
+      - 'workspace-server/internal/cronspec/testdata/fixtures.json'
+      - '.gitea/workflows/cron-fixtures-ssot-drift.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cron-fixtures-ssot-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # bp-exempt: standalone soak-then-promote drift gate; not in branch protection yet.
+  compare:
+    name: Verify vendored cron fixtures are byte-identical to the molecule-ai-sdk SSOT
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Fetch SDK cron fixtures SSOT and byte-diff the vendored copy
+        env:
+          SDK_FIXTURES_URL: https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/cron/fixtures.json
+          VENDORED: workspace-server/internal/cronspec/testdata/fixtures.json
+        run: |
+          set -uo pipefail
+          if [ ! -f "$VENDORED" ]; then
+            echo "::error::vendored cron fixtures missing: $VENDORED"
+            exit 1
+          fi
+          if ! curl -fsS -A curl/8.4.0 "$SDK_FIXTURES_URL" -o /tmp/sdk-cron-fixtures.json; then
+            echo "::warning::could not fetch cron fixtures from molecule-ai-sdk main (network/infra) — skipping byte-drift check (soft skip; the invariant is still enforced on any successful fetch)."
+            exit 0
+          fi
+          # Parse-guard the fetched SSOT so a truncated body / HTML error page
+          # can never diff-clean into a false green.
+          python3 -c 'import json,sys; json.load(open(sys.argv[1]))' /tmp/sdk-cron-fixtures.json
+          if diff -u "$VENDORED" /tmp/sdk-cron-fixtures.json; then
+            echo "OK — $VENDORED is byte-identical to molecule-ai-sdk contracts/cron/fixtures.json."
+          else
+            echo "::error::$VENDORED has DRIFTED from the molecule-ai-sdk SSOT (contracts/cron/fixtures.json)."
+            echo "Re-vendor (the SDK is canonical):"
+            echo "  curl -fsS -A curl/8.4.0 \"$SDK_FIXTURES_URL\" -o \"$VENDORED\""
+            exit 1
+          fi

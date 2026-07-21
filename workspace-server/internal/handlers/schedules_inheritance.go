@@ -17,9 +17,8 @@ package handlers
 // ADDITIVE + DARK: fired alongside the plugin reconcile on transition-to-online.
 // It no-ops for every workspace with no removed predecessor carrying a buffer
 // (the overwhelmingly common case) and is fully idempotent, so it is safe to fire
-// on every online transition. It RETIRES — does not replace — the legacy DB-world
-// re-point path (org_import.migrateRuntimeSchedulesFromRemovedPredecessor); both
-// coexist until P4b drops the workspace_schedules table.
+// on every online transition. It replaces the legacy DB-world re-point path
+// (removed in P4b) as the sole runtime-schedule inheritance mechanism.
 
 import (
 	"context"
@@ -34,10 +33,9 @@ import (
 
 // RestoreInheritedRuntimeSchedules replays a removed predecessor's captured
 // runtime schedule grid onto the freshly-online workspace newID and clears the
-// buffer on success. It mirrors the removed-predecessor MATCH predicate used by
-// org_import.migrateRuntimeSchedulesFromRemovedPredecessor (role when present,
-// name fallback; same parent) so the volume path inherits from exactly the same
-// predecessor the DB path would have.
+// buffer on success. The removed-predecessor MATCH predicate is role when
+// present, name fallback, same parent — so the successor inherits from exactly
+// the predecessor it recreates.
 //
 // Signature matches ReconcileFunc so the registry heartbeat can fire it alongside
 // the declared-plugin reconcile on transition-to-online. Best-effort throughout:
@@ -120,7 +118,7 @@ func (h *ScheduleHandler) RestoreInheritedRuntimeSchedules(ctx context.Context, 
 	// hasn't been advertised on a heartbeat), we cannot serve its volume grid.
 	// Return WITHOUT clearing: declaring the plugin above will bring the daemon
 	// up, and the next transition-to-online re-fires this and converges.
-	if !scheduleBackendIsVolume(newID) {
+	if !ProvidesNativeScheduler(newID) {
 		log.Printf("schedule-inherit: %s not yet volume-native (scheduler capability unadvertised) — deferring restore of %d schedule(s) from %s", newID, len(carried), predID)
 		return
 	}

@@ -862,6 +862,22 @@ func extractA2AText(body []byte) string {
 		}
 	}
 
+	// Format 3: result.status.message.parts[0].text — the a2a-sdk TASK
+	// response (hermes runtime returns this for message/send; observed
+	// 2026-07-19 when the first-boot greeting's in-character reply fell
+	// through to the JSON fallback and was discarded).
+	if statusObj, ok := result["status"].(map[string]interface{}); ok {
+		if msg, ok := statusObj["message"].(map[string]interface{}); ok {
+			if parts, ok := msg["parts"].([]interface{}); ok && len(parts) > 0 {
+				if part, ok := parts[0].(map[string]interface{}); ok {
+					if text, ok := part["text"].(string); ok && text != "" {
+						return text
+					}
+				}
+			}
+		}
+	}
+
 	// Fallback: marshal result as JSON.
 	b, marshalErr := json.Marshal(result)
 	if marshalErr != nil {

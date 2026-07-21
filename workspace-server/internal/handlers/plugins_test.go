@@ -1430,11 +1430,13 @@ func TestStreamDirAsTar_RelativePaths(t *testing.T) {
 			t.Errorf("tar entry has unsafe path: %q", hdr.Name)
 		}
 	}
-	// Must include both our files with relative paths
+	// Must include both our files with relative SLASH-separated paths — tar
+	// entry names are forward-slash by spec on every host OS (asserting via
+	// filepath.Join here would wrongly expect backslashes on Windows).
 	if !seen["top.md"] {
 		t.Errorf("missing top.md; saw: %v", seen)
 	}
-	if !seen[filepath.Join("sub", "nested.md")] {
+	if !seen["sub/nested.md"] {
 		t.Errorf("missing sub/nested.md; saw: %v", seen)
 	}
 }
@@ -1547,7 +1549,9 @@ func TestPluginDownload_GithubSchemeStreamsTarball(t *testing.T) {
 		}
 		seen[hdr.Name] = true
 	}
-	for _, want := range []string{"plugin.yaml", filepath.Join("skills", "x", "SKILL.md"), filepath.Join("adapters", "claude_code.py")} {
+	// Tar entry names are forward-slash by spec on every host OS — never
+	// build expectations with filepath.Join (backslashes on Windows).
+	for _, want := range []string{"plugin.yaml", "skills/x/SKILL.md", "adapters/claude_code.py"} {
 		if !seen[want] {
 			t.Errorf("expected tar entry %q, saw: %v", want, seen)
 		}

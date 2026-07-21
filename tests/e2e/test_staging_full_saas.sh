@@ -704,14 +704,21 @@ print(s[:4000])
 # diagnostic. Every attempt is logged, so a transient that self-heals stays
 # visible and is never silently masked.
 #
-# The attempt budget is small on purpose: the cold window is ~1-2s, so a few
-# ~2s retries cover it while a DETERMINISTIC transient still fails RED in
-# seconds rather than burning a multi-minute budget into a CI job timeout.
+# The attempt budget stays bounded but must cover the ACTUAL cold window: the
+# core#4307 RCA estimated ~1-2s, but under concurrent-provision load on the
+# shared staging docker host the tenant origin warms slower — run 546336
+# (Platform Boot) saw a persistent empty-body 503 from Cloudflare across the old
+# 4-attempt / ~8s budget. 8 attempts at Retry-After ~2s (~16s) covers the
+# observed longer window. This does NOT slow the deterministic-failure path: a
+# non-cold status (JSON app error, 502/504) is surfaced on attempt 1 by
+# create_should_retry_cold, so ONLY a genuinely-persistent cold-origin transient
+# consumes the budget — and a never-warming origin still fails RED in ~16s, well
+# under a CI job timeout. Env-overridable for a still-longer window if needed.
 #
 # Args: $1 = human label, $2 = headers dump file (-D target). Remaining args are
 # passed verbatim to `tenant_call POST /workspaces` (payload etc.). Echoes the
 # final response body on stdout; leaves the final response headers in $2.
-CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-4}"
+CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-8}"
 create_workspace_post() {
   local label="$1" hdrs="$2"; shift 2
   local attempt resp id status ra who
@@ -976,18 +983,24 @@ fi
 # + the shrunken fire interval are (idempotently) set so the digest actually arms
 # and the loader runs within the window. Additive NON-LLM env only.
 if [ "${E2E_DIGEST_PLUGIN_CHECK:-}" = "on" ]; then
+  # DECLARE the digest plugin via the DURABLE DB channel (payload.plugins →
+  # workspace_declared_plugins), NOT MOLECULE_DECLARED_PLUGINS-in-secrets. Now that
+  # the scheduler is declared on EVERY workspace, provision recomputes
+  # MOLECULE_DECLARED_PLUGINS from the declared-set SSOT and OVERWRITES any
+  # secret-injected value, so a secret-declared digest plugin silently vanishes.
+  _DIGEST_SRC="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}"
+  E2E_WS_PLUGINS="${E2E_WS_PLUGINS:-}${E2E_WS_PLUGINS:+,}$_DIGEST_SRC"
+  # The loader flag + digest arming are real runtime TOGGLES (not plugin decls), so
+  # they stay in the secret env.
   SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
 import json, os
 s = json.loads(os.environ['SECRETS_JSON_IN'])
-src = os.environ.get('E2E_DIGEST_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0')
-existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
-s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
 s['MOLECULE_DIGEST_PROVIDER_PLUGINS'] = '1'          # D1 loader flag
 s.setdefault('MOLECULE_MAILBOX_KERNEL', '1')          # ensure the idle digest arms
 s.setdefault('MOLECULE_IDLE_FIRE_SECONDS', os.environ.get('E2E_IDLE_FIRE_SECONDS', '30'))
 print(json.dumps(s))
 ")
-  log "    digest-plugin check ON: declared ${E2E_DIGEST_PLUGIN_SOURCE:-molecule-ai-plugin-digest-mail} + MOLECULE_DIGEST_PROVIDER_PLUGINS=1 (trust source = vendored registry, no NATIVE_PLUGIN_NAMES)"
+  log "    digest-plugin check ON: declared $_DIGEST_SRC via payload.plugins (durable DB channel) + MOLECULE_DIGEST_PROVIDER_PLUGINS=1 (trust source = vendored registry, no NATIVE_PLUGIN_NAMES)"
 fi
 
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
@@ -1054,6 +1067,7 @@ build_create_payload() {
   E2E_WS_TEMPLATE="$PROVISION_TEMPLATE" \
   E2E_WS_MODEL="$MODEL_SLUG" \
   E2E_WS_SECRETS="$SECRETS_JSON" \
+  E2E_WS_PLUGINS="${E2E_WS_PLUGINS:-}" \
   python3 -c "
 import json, os
 secrets = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
@@ -1063,6 +1077,14 @@ payload = {
     'model': os.environ['E2E_WS_MODEL'],
     'secrets': secrets,
 }
+# Declared plugins ride the DURABLE DB channel (CreateWorkspacePayload.Plugins →
+# workspace_declared_plugins), NOT a MOLECULE_DECLARED_PLUGINS secret: provision
+# recomputes that env from the declared-set SSOT and OVERWRITES a secret-injected
+# value (it does now that the scheduler is declared on every workspace), so a
+# secret-declared plugin would silently vanish before boot-install.
+_plugins = [p.strip() for p in os.environ.get('E2E_WS_PLUGINS', '').split(',') if p.strip()]
+if _plugins:
+    payload['plugins'] = _plugins
 tmpl = os.environ.get('E2E_WS_TEMPLATE', '')
 if tmpl:
     # Template-selected variant (seo-agent): the template's config.yaml
@@ -2496,20 +2518,79 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   # step now PROVES the fix by driving a genuinely busy workspace first.
   #
   # active_tasks is heartbeat-fed (the agent self-reports its in-flight turn count
-  # every ~30s; there is no synchronous server lever), so making the workspace busy
-  # means driving a real long turn and polling until the DB reflects it. That drive
-  # is best-effort by nature. CAPTURE-FIRST / SOAK-TO-ENFORCE (task #92): when the
-  # workspace is provably busy we run the strict force-coverage assertions (a)+(b);
-  # when we cannot establish busy within the bound we LOG LOUD and fall back to the
-  # idle force-hibernate (still a valid transition, just not force-coverage). Once
-  # the busy-drive is shown reliable across the gate soak, set
-  # E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 to make a failed drive a hard red.
+  # every ~30s). Two ways to make the workspace busy, selected by E2E_BUSY_INJECT:
+  #
+  #   * E2E_BUSY_INJECT=1 (the ephemeral gate — task #92): the tenant image is
+  #     built with `-tags e2e_busy_inject`, which exposes POST
+  #     /workspaces/:id/test-busy. It pins active_tasks to a floor synchronously
+  #     (and holds it across heartbeats), so busy is DETERMINISTIC without a real
+  #     LLM turn. This route exists ONLY in the tag-built throwaway tenant image;
+  #     it is absent (404) from every shipped/staging binary. A non-busy 10b under
+  #     this mode is a hard red (see E2E_HIBERNATE_FORCE_BUSY_REQUIRED below).
+  #
+  #   * default (staging lanes, untagged images): drive a real long turn and poll
+  #     until the DB reflects it — best-effort by nature. CAPTURE-FIRST /
+  #     SOAK-TO-ENFORCE: when provably busy we run the strict force-coverage
+  #     assertions (a)+(b); otherwise we LOG LOUD and fall back to the idle
+  #     force-hibernate (a valid transition, not force-coverage) unless
+  #     E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 makes a failed drive fatal.
+
+  # Deterministic busy via the test-only inject route (E2E_BUSY_INJECT=1). Pins
+  # active_tasks=1 in the same DB column the hibernate 409 guard + atomic claim
+  # read, then confirms GET reflects it. Returns 0 iff active_tasks>0 was
+  # established. A 404 here means the tenant image was NOT built with the
+  # e2e_busy_inject tag — a wiring error the operator must fix, not a soft skip.
+  _hib_busy_inject() {
+    local bi_tmp bi_code cur deadline
+    bi_tmp=$(mktemp -t hib_inject.XXXXXX)
+    set +e
+    bi_code=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/test-busy" --max-time 20 \
+      -H "Content-Type: application/json" -d '{"active_tasks":1,"is_busy":true}' \
+      -o "$bi_tmp" -w '%{http_code}' 2>/dev/null)
+    set -e
+    bi_code=${bi_code:-000}
+    if [ "$bi_code" != "200" ]; then
+      log "    busy-inject: POST /test-busy → http=$bi_code (expected 200). If 404, the tenant image lacks -tags e2e_busy_inject. Body: $(cat "$bi_tmp" 2>/dev/null | sanitize_http_body | head -c 200)"
+      rm -f "$bi_tmp"
+      return 1
+    fi
+    rm -f "$bi_tmp"
+    # Confirm the DB reflects it. The sticky floor keeps active_tasks>=1 across
+    # heartbeats, so a single confirming read is sufficient and stable.
+    deadline=$(( $(date +%s) + 30 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      cur=$(tenant_call GET "/workspaces/$LIFECYCLE_WS" 2>/dev/null \
+        | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('active_tasks') or 0))" 2>/dev/null || echo 0)
+      log "    busy-inject poll: active_tasks=${cur:-?} (want >0)"
+      if [ "${cur:-0}" -gt 0 ] 2>/dev/null; then
+        log "    active_tasks=$cur — workspace is busy via test-inject (deterministic)"
+        return 0
+      fi
+      sleep 3
+    done
+    return 1
+  }
+
+  # Release a previously-injected hold so post-wake heartbeats stop reporting busy
+  # (the sticky floor would otherwise re-raise active_tasks after the workspace
+  # wakes). No-op / harmless when the route is absent.
+  _hib_busy_release() {
+    tenant_call POST "/workspaces/$LIFECYCLE_WS/test-busy" --max-time 20 \
+      -H "Content-Type: application/json" -d '{"active_tasks":0}' \
+      -o /dev/null -w '' 2>/dev/null || true
+    log "    busy-inject: released active_tasks hold"
+  }
 
   # Drive a long, model-independent in-flight turn WITHOUT draining the queue, so
   # the turn stays live while we fire the two hibernate calls. Returns 0 once
   # GET /workspaces/:id reports active_tasks>0 (the same column the handler's 409
   # guard and atomic claim read — so the witness and the decision agree).
   _hib_busy_drive() {
+    # Deterministic path first when the gate armed it.
+    if [ "${E2E_BUSY_INJECT:-0}" = "1" ]; then
+      _hib_busy_inject && return 0
+      return 1
+    fi
     local sleep_secs="${E2E_HIBERNATE_BUSY_SLEEP_SECS:-180}"
     local wait_secs="${E2E_HIBERNATE_BUSY_WAIT_SECS:-150}"
     local busy_payload deadline cur bd_tmp bd_code bd_qid bd_attempt
@@ -2606,6 +2687,11 @@ print(json.dumps({
     [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(busy,force): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
     wait_status "hibernated" 120 "hibernate-force-busy" || fail "Hibernate(busy,force): workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) after force on a BUSY workspace — core#4293 regression: force must drop the active_tasks=0 claim predicate, terminate the in-flight task, and stop the container, not no-op to a lying 200."
     ok "    force hibernate on BUSY ws → hibernated (DB-verified; core#4293 covered)"
+    # Release any injected busy hold now that the force-on-busy assertions passed,
+    # so the workspace can wake IDLE below (the sticky floor would otherwise
+    # re-raise active_tasks on the post-wake heartbeats). No-op under the
+    # real-turn drive (the route is absent / the hold was never set).
+    if [ "${E2E_BUSY_INJECT:-0}" = "1" ]; then _hib_busy_release; fi
   else
     # Busy-drive did not establish active_tasks>0 within the bound. Under the soak
     # default this is a LOUD non-fatal fallback (the run still exercises the idle

@@ -454,6 +454,22 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// and unset/local falls back to the same literal, so no behavior change
 			// today; a later platform-default flip is a separate KMS edit.
 			payload.Runtime = bareCreateDefaultRuntime()
+			// SELF-HOST (2026-07-20 operator decision): a bare create should
+			// follow the ONBOARDING-SELECTED runtime — the platform root's own
+			// runtime (hermes on the current default) — not the SaaS literal.
+			// Same "follow the onboarding selection" doctrine as the model
+			// fallback. Templates that PIN a runtime are untouched
+			// (controlplane#188 fail-closed stands); this only shapes the
+			// no-template, no-runtime default. Gated on no CP proxy (self-host).
+			if !PlatformManagedProxyConfigured() {
+				var rootRuntime string
+				_ = db.DB.QueryRowContext(c.Request.Context(),
+					`SELECT COALESCE(runtime,'') FROM workspaces WHERE kind='platform' AND status != 'removed' LIMIT 1`,
+				).Scan(&rootRuntime)
+				if strings.TrimSpace(rootRuntime) != "" {
+					payload.Runtime = rootRuntime
+				}
+			}
 		}
 	}
 
@@ -1091,19 +1107,21 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// plugin BEFORE the provision dispatch. provisionWorkspaceAuto spawns the
 	// provision goroutine that assembles MOLECULE_DECLARED_PLUGINS from
 	// workspace_declared_plugins (buildProvisionerConfig →
-	// desiredPluginSources); the declare used to run only inside
-	// seedTemplateSchedules AFTER the dispatch, so first boot RACED the
-	// declaration and could come up without the scheduler daemon until the
-	// next online reconcile. Parsing here also feeds the post-provision DB
-	// seed below (single parse). Non-fatal: a broken schedules block or a
+	// desiredPluginSources), so the declare must land first or first boot races
+	// the declaration and could come up without the scheduler daemon until the
+	// next online reconcile. The parsed schedules also feed the config.yaml
+	// render below (single parse). Non-fatal: a broken schedules block or a
 	// declare hiccup must never block workspace creation.
 	var templateScheds []OrgSchedule
 	if templatePath != "" {
 		var schedParseErr error
 		templateScheds, schedParseErr = parseTemplateSchedules(templatePath)
 		if schedParseErr != nil {
+			// Non-fatal: skip schedule delivery for this create. templateScheds
+			// is confined to this block (post-P4b the legacy DB seed that used to
+			// consume it after the render is gone), so no explicit reset is
+			// needed — the render below is in the else arm and never runs here.
 			log.Printf("Create %s: parsing template schedules: %v (continuing)", id, schedParseErr)
-			templateScheds = nil
 		} else if len(templateScheds) > 0 {
 			// P4b (issue #4411): render the template's RESOLVED schedules into
 			// the DELIVERED config.yaml so the runtime's boot/reload seeding
@@ -1135,11 +1153,10 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// its place. Reuses renderTemplateSchedulesYAML + appendYAMLBlockChecked
 			// verbatim — same caps / name-contract / prompt-inlining / yaml-emitter
 			// round-trip guards as the org-import leg. Prompt refs resolve against
-			// templatePath (filesDir="") exactly like seedTemplateSchedules.
+			// templatePath (filesDir="") the same as the org-import render leg.
 			//
-			// The legacy workspace_schedules DB seed further below KEEPS running
-			// during the cutover — a later gated PR (P4b) retires it; this is the
-			// additive volume precondition. Must run BEFORE provisionWorkspaceAuto,
+			// This is now the ONLY schedule delivery path — the legacy core-DB
+			// seed was retired in P4b. Must run BEFORE provisionWorkspaceAuto,
 			// which captures configFiles for the provision goroutine. Byte-
 			// identical when the template renders no schedules (nothing is
 			// stripped or appended — configFiles stays nil, the template copy
@@ -1148,10 +1165,13 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			if schedBlock != "" {
 				if baseCfg, readErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); readErr != nil {
 					// parseTemplateSchedules already read this file above, so a
-					// read failure here is unexpected; deliver WITHOUT the volume
-					// block (the DB seed below still lands the schedules) rather
-					// than fail the create.
-					log.Printf("Create %s: reading template config.yaml to append schedules failed: %v (continuing without the volume block)", id, readErr)
+					// read failure here is unexpected. Post-P4b there is NO legacy
+					// DB seed fallback, so these template schedules would be
+					// DROPPED for this workspace — log loudly rather than fail the
+					// create (the workspace still provisions; the schedules can be
+					// re-added). If this ever fires in practice, the config.yaml
+					// render should be made fail-closed instead.
+					log.Printf("Create %s: reading template config.yaml to append schedules failed: %v — template schedules DROPPED (no DB fallback post-P4b)", id, readErr)
 				} else if combined, appended := appendYAMLBlockChecked(stripTopLevelYAMLKey(baseCfg, "schedules"), schedBlock, "schedules", payload.Name); appended {
 					if configFiles == nil {
 						configFiles = map[string][]byte{}
@@ -1187,30 +1207,6 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			ON CONFLICT (workspace_id) DO UPDATE SET data = $2::jsonb
 		`, id, cfgJSON); err != nil {
 			log.Printf("Create: workspace_config persist failed for %s: %v", id, err)
-		}
-	}
-
-	// Seed schedules declared in the workspace template's config.yaml
-	// AFTER provisionWorkspaceAuto succeeds so the scheduler never
-	// fires cron rows against a workspace whose backend never wired
-	// (review feedback PR #1929#1). Async provider provisioning may still
-	// fail downstream; scheduler.go is expected to handle non-online
-	// status as a no-op tick. Idempotent across re-creates via
-	// orgImportScheduleSQL's ON CONFLICT clause; runtime-added rows
-	// are preserved (Issue #24 contract). Restart does not re-seed
-	// (so user-deleted template rows stay deleted). templateScheds was
-	// parsed above, pre-dispatch (C2 ordering) — only the DB seed waits
-	// for the provision verdict.
-	//
-	// Non-fatal: a broken schedules: block must never block workspace
-	// provisioning — the workspace row is already live and the grid
-	// is recoverable via POST /workspaces/{id}/schedules.
-	if provisionOK && templatePath != "" && len(templateScheds) > 0 {
-		seeded, skipped := seedTemplateSchedules(ctx, id, templatePath, templateScheds)
-		if skipped > 0 {
-			log.Printf("Create %s: template schedule partial-seed: seeded=%d skipped=%d total=%d", id, seeded, skipped, len(templateScheds))
-		} else {
-			log.Printf("Create %s: seeded %d/%d template schedules", id, seeded, len(templateScheds))
 		}
 	}
 
@@ -1252,6 +1248,24 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 				recorded, skipped := seedTemplatePlugins(ctx, id, declaredPlugins)
 				log.Printf("Create %s: recorded %d/%d fetched-template declared plugins (skipped=%d)", id, recorded, len(declaredPlugins), skipped)
 			}
+		}
+	}
+
+	// Payload-declared plugins (CreateWorkspacePayload.Plugins): the API-level
+	// equivalent of a template's `plugins:` block for callers that don't own a
+	// template (e.g. an e2e harness declaring a native plugin to exercise its
+	// boot-install). Flows through the SAME seedTemplatePlugins →
+	// recordDeclaredPlugin chokepoint as the template blocks above, so it inherits
+	// the idempotent ON CONFLICT upsert AND the privileged-plugin kind-gate (the
+	// concierge MCP can never be declared here on a non-platform workspace). This
+	// is the DURABLE declare channel: unlike a MOLECULE_DECLARED_PLUGINS value
+	// injected via `secrets`, a payload plugin lands in the declared-set SSOT that
+	// provision recomputes MOLECULE_DECLARED_PLUGINS from, so it is not overwritten.
+	// Non-fatal: a bad entry never blocks provisioning (the workspace row is live).
+	if provisionOK && len(payload.Plugins) > 0 {
+		if declared := mergePlugins(nil, payload.Plugins); len(declared) > 0 {
+			recorded, skipped := seedTemplatePlugins(ctx, id, declared)
+			log.Printf("Create %s: recorded %d/%d payload-declared plugins (skipped=%d)", id, recorded, len(declared), skipped)
 		}
 	}
 
@@ -1453,6 +1467,42 @@ func (h *WorkspaceHandler) List(c *gin.Context) {
 		// the cache hit is sub-microsecond.
 		if rt, _ := ws["runtime"].(string); rt != "" {
 			h.addProvisionTimeoutMs(ws, rt)
+		}
+		// Boot-telemetry replay: BOOT_STEP broadcasts are ephemeral, so a
+		// canvas re-hydrate mid-boot used to reset the boot screen to
+		// "waiting for boot telemetry". Attach the observed history
+		// (events/boottrace.go) for rows still provisioning so the client
+		// restores keycaps + watchdog log across reloads/reconnects. The
+		// capability is reached via a narrow assertion on the injected
+		// emitter — NOT a package global — so the #1814 interface seam
+		// stays intact: test fakes simply don't have it and skip.
+		//
+		// Contract with the canvas (canvas.ts hydrate):
+		//   - `boot_steps` present + `boot_generation` present → authoritative
+		//     for THAT generation: same gen as the client holds → merge; a
+		//     different gen → the client resets to the replay (stale-boot
+		//     telemetry must not survive a reprovision), even when empty
+		//     (the WORKSPACE_PROVISIONING reset mints a fresh empty entry).
+		//   - `boot_steps` present WITHOUT a generation → this instance holds
+		//     no trace entry (restarted mid-boot / other instance) — the
+		//     client keeps its own richer local state.
+		//   - field absent → platform doesn't track boot history (old build /
+		//     fake emitter); the client keeps its own state.
+		if status, _ := ws["status"].(string); status == string(models.StatusProvisioning) {
+			if replayer, ok := h.broadcaster.(interface {
+				BootReplayFor(string) ([]events.BootStepRecord, string, bool)
+			}); ok {
+				if id, _ := ws["id"].(string); id != "" {
+					steps, gen, known := replayer.BootReplayFor(id)
+					if steps == nil {
+						steps = []events.BootStepRecord{}
+					}
+					ws["boot_steps"] = steps
+					if known && gen != "" {
+						ws["boot_generation"] = gen
+					}
+				}
+			}
 		}
 		workspaces = append(workspaces, ws)
 	}

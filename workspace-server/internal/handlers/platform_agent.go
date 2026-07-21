@@ -207,6 +207,18 @@ func conciergePlatformMCPEnv(env map[string]string, workspaceID, orgAdminCred st
 			env[k] = v
 		}
 	}
+
+	// Platform-agent identity marker (runtime wheel:
+	// platform_agent_identity.PLATFORM_AGENT_IMAGE_ENV). Historically only the
+	// baked Dockerfile.platform-agent image set it; a concierge on a PLAIN
+	// runtime image (hermes) had to infer platform-ness from "management MCP
+	// present in the rendered runtime config" — a signal that only becomes
+	// true MID-boot, so the runtime's boot-step emitter silently dropped
+	// steps 1-4 (PLG/ID/RT/MCP idle keycaps on the Enter OS screen,
+	// 2026-07-19). This function is kind-gated to the concierge, which IS the
+	// platform agent regardless of which image it runs — stamp the marker so
+	// every consumer of the identity gate is correct from process start.
+	setIfAbsent("MOLECULE_PLATFORM_AGENT_IMAGE_BAKED", "1")
 	// The management MCP's SELF default: install_plugin / get_conversation_history
 	// fall back to MOLECULE_WORKSPACE_ID when workspace_id is omitted, making
 	// "act on MY OWN workspace" the zero-config case (self-reprovision §5.2).

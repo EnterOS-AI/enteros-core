@@ -12,8 +12,8 @@ package handlers
 // (POST /internal/daemons/reload, molecule-ai-workspace-runtime#308).
 //
 // This is additive: it only ever adds a declaration + best-effort reload for
-// workspaces that touch schedules. It does not change the schedule storage
-// routing (volume vs the legacy DB table) — that cutover is P4b.
+// workspaces that touch schedules. Schedule storage is volume-authoritative
+// (the legacy core-DB schedule backend was retired in P4b).
 
 import (
 	"bytes"
@@ -23,8 +23,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/gin-gonic/gin"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
@@ -54,45 +52,32 @@ func ensureSchedulerPluginDeclared(ctx context.Context, workspaceID string) erro
 	return recordDeclaredPlugin(ctx, workspaceID, SchedulerPluginName, SchedulerPluginSource)
 }
 
-// armSchedulerPlugin asks a RUNNING workspace to start its scheduler daemon now
-// (no restart), via the runtime hot-start endpoint. Best-effort and
-// non-blocking: any failure is logged and swallowed, because the daemon is also
-// armed by the reconcile-on-online path (the durable safety net) — this call
-// just makes a freshly-scheduled workspace fire without waiting for a restart.
-// A runtime too old to expose the endpoint simply 404s here and arms on its
-// next restart instead.
-func armSchedulerPlugin(ctx context.Context, workspaceID string) {
-	if db.DB == nil {
-		return
-	}
-	var wsURL string
-	if err := db.DB.QueryRowContext(ctx,
-		`SELECT COALESCE(url, '') FROM workspaces WHERE id = $1`, workspaceID,
-	).Scan(&wsURL); err != nil {
-		if err != sql.ErrNoRows {
-			log.Printf("scheduler-arm: workspace lookup failed for %s: %v", workspaceID, err)
-		}
-		return
-	}
+// armSchedulerReload asks a RUNNING workspace to start its scheduler daemon now
+// (no restart), via the runtime hot-start endpoint, using ALREADY-RESOLVED
+// forward creds. Non-fatal: any failure is logged, because the daemon is also
+// armed by the reconcile-on-online path (the durable safety net). A runtime too
+// old to expose the endpoint simply 404s here and arms on its next restart.
+//
+// Returns true iff the reload returned 2xx. Because the runtime mounts
+// /internal/schedules BEFORE /internal/daemons/reload (and both before it accepts
+// connections), a 2xx here PROVES the schedule grid API is already serving — the
+// Create path uses that as the readiness signal to avoid forwarding a create at a
+// still-booting runtime. Create resolves url+secret ONCE and shares them with the
+// create forward (SSOT — no second workspaces.url query).
+func armSchedulerReload(ctx context.Context, workspaceID, wsURL, secret string) bool {
 	if wsURL == "" {
-		return // no callback URL (poll-mode / not registered) — reconcile arms it
+		return false // no callback URL (poll-mode / not registered) — reconcile arms it
 	}
 	if err := isSafeURL(wsURL); err != nil {
 		log.Printf("scheduler-arm: unsafe workspace URL for %s rejected: %v", workspaceID, err)
-		return
+		return false
 	}
-	secret, _, err := readOrLazyHealInboundSecret(ctx, workspaceID, "scheduler-arm")
-	if err != nil {
-		log.Printf("scheduler-arm: inbound secret unavailable for %s: %v", workspaceID, err)
-		return
-	}
-
 	target := strings.TrimRight(wsURL, "/") + "/internal/daemons/reload"
 	fctx, cancel := context.WithTimeout(ctx, schedulerArmTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(fctx, http.MethodPost, target, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return
+		return false
 	}
 	req.Header.Set("Authorization", "Bearer "+secret)
 	req.Header.Set("Content-Type", "application/json")
@@ -106,104 +91,62 @@ func armSchedulerPlugin(ctx context.Context, workspaceID string) {
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("scheduler-arm: reload forward to %s failed (workspace will arm on next reconcile): %v", workspaceID, err)
-		return
+		return false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		log.Printf("scheduler-arm: reload for %s returned %d (arms on next reconcile)", workspaceID, resp.StatusCode)
-		return
+		return false
 	}
 	log.Printf("scheduler-arm: hot-armed scheduler daemon on %s", workspaceID)
+	return true
 }
 
-// ensureAndArmSchedulerPlugin declares the plugin (blocking, must persist so
-// the plugin survives a restart) and then arms the running daemon
-// asynchronously (best-effort, off the request path). Call it whenever a
-// workspace gains a schedule. A declaration failure is returned so callers that
-// care (create) can log it; arming never blocks or errors.
-func ensureAndArmSchedulerPlugin(ctx context.Context, workspaceID string) error {
-	if err := ensureSchedulerPluginDeclared(ctx, workspaceID); err != nil {
-		return err
+// armSchedulerPlugin is the SELF-RESOLVING arm for callers that don't already
+// hold the workspace's forward creds (the carryover restore path). It resolves
+// url + secret then delegates to armSchedulerReload. The Create path does NOT use
+// this — it resolves once via resolveWorkspaceForwardCreds and calls
+// armSchedulerReload directly, so there is no second workspaces.url query.
+func armSchedulerPlugin(ctx context.Context, workspaceID string) bool {
+	if db.DB == nil {
+		return false
 	}
-	// Detach from the request context so a slow reload never delays the create
-	// response, and use a background context so request cancellation after the
-	// (already-committed) declaration does not abort the arm.
-	wsID := workspaceID
-	globalGoAsync(func() {
-		actx, cancel := context.WithTimeout(context.Background(), schedulerArmTimeout+2*time.Second)
-		defer cancel()
-		armSchedulerPlugin(actx, wsID)
-	})
-	return nil
-}
-
-// BackfillSchedulerPlugin remediates the P4 gap for EXISTING scheduled
-// workspaces: those with rows in workspace_schedules created before per-workspace
-// delivery existed have no scheduler plugin, so post-P4 their schedules fire
-// nowhere. This declares molecule-scheduler for each such workspace (and, when
-// applying, best-effort arms it).
-//
-// DRY-RUN BY DEFAULT — returns the affected workspace list and counts WITHOUT
-// mutating. Pass ?apply=true to actually declare + arm. This lets an operator
-// review the exact blast radius (and hand it to the CTO) before touching prod.
-//
-//	@Router	/admin/schedules/backfill-plugin [post]
-//	@Security	AdminAuth
-func (h *ScheduleHandler) BackfillSchedulerPlugin(c *gin.Context) {
-	ctx := c.Request.Context()
-	apply := strings.EqualFold(strings.TrimSpace(c.Query("apply")), "true")
-
-	rows, err := db.DB.QueryContext(ctx,
-		`SELECT DISTINCT workspace_id FROM workspace_schedules ORDER BY workspace_id`)
+	var wsURL string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(url, '') FROM workspaces WHERE id = $1`, workspaceID,
+	).Scan(&wsURL); err != nil {
+		if err != sql.ErrNoRows {
+			log.Printf("scheduler-arm: workspace lookup failed for %s: %v", workspaceID, err)
+		}
+		return false
+	}
+	if wsURL == "" {
+		return false
+	}
+	secret, _, err := readOrLazyHealInboundSecret(ctx, workspaceID, "scheduler-arm")
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to enumerate scheduled workspaces"})
-		return
+		log.Printf("scheduler-arm: inbound secret unavailable for %s: %v", workspaceID, err)
+		return false
 	}
-	defer rows.Close()
-	var workspaceIDs []string
-	for rows.Next() {
-		var id string
-		if scanErr := rows.Scan(&id); scanErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to scan workspace id"})
-			return
-		}
-		workspaceIDs = append(workspaceIDs, id)
-	}
-	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "row iteration failed"})
-		return
-	}
+	return armSchedulerReload(ctx, workspaceID, wsURL, secret)
+}
 
-	if !apply {
-		c.JSON(http.StatusOK, gin.H{
-			"dry_run":       true,
-			"would_declare": len(workspaceIDs),
-			"plugin":        SchedulerPluginName,
-			"source":        SchedulerPluginSource,
-			"workspace_ids": workspaceIDs,
-			"note":          "no changes made — re-run with ?apply=true to declare + arm",
-		})
-		return
-	}
+// schedulerDeclareTimeout bounds the DETACHED plugin-declaration upsert (see
+// ensureSchedulerPluginDeclaredBounded). Detaching from the request/deadline
+// keeps the durable declaration from being aborted by a client disconnect, but
+// the write must still be bounded so a contended/slow workspace_declared_plugins
+// upsert can't hang the request — the bug a raw context.WithoutCancel had.
+const schedulerDeclareTimeout = 5 * time.Second
 
-	var declared, failed int
-	failures := map[string]string{}
-	for _, id := range workspaceIDs {
-		if err := ensureAndArmSchedulerPlugin(ctx, id); err != nil {
-			failed++
-			failures[id] = err.Error()
-			log.Printf("scheduler-backfill: declare failed for %s: %v", id, err)
-			continue
-		}
-		declared++
-	}
-	log.Printf("scheduler-backfill: applied — declared=%d failed=%d of %d scheduled workspace(s)", declared, failed, len(workspaceIDs))
-	c.JSON(http.StatusOK, gin.H{
-		"dry_run":  false,
-		"declared": declared,
-		"failed":   failed,
-		"total":    len(workspaceIDs),
-		"plugin":   SchedulerPluginName,
-		"failures": failures,
-	})
+// ensureSchedulerPluginDeclaredBounded records the molecule-scheduler declaration
+// on a context DETACHED from the caller's cancellation (so a client disconnect or
+// the create deadline can't abort the must-persist upsert) yet BOUNDED by
+// schedulerDeclareTimeout (so it can't hang unbounded). Post-P4b the schedule
+// store is volume-only, so a missing declaration means the daemon is never
+// installed on the next restart and the schedule silently never fires — hence the
+// declaration is the durable net and must persist, but only within a bound.
+func ensureSchedulerPluginDeclaredBounded(ctx context.Context, workspaceID string) error {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), schedulerDeclareTimeout)
+	defer cancel()
+	return ensureSchedulerPluginDeclared(dctx, workspaceID)
 }
