@@ -230,7 +230,12 @@ while IFS=$'\t' read -r runtime image_ref; do
     if [[ "$pull_rc" -eq 0 ]]; then pulled=1; break; fi
     if [[ "$attempt" -lt "$PULL_ATTEMPTS" ]]; then
       echo "::warning::runtime image readiness: pull failed for runtime=$runtime rc=$pull_rc; retrying within the global budget" >&2
-      [[ "$RETRY_DELAY" -eq 0 ]] || sleep "$RETRY_DELAY"
+      if [[ "$RETRY_DELAY" -ne 0 ]]; then
+        remaining=$((deadline - $(date +%s)))
+        [[ "$remaining" -gt "$RETRY_DELAY" ]] \
+          || fail "retry delay would exhaust the global ${READINESS_TIMEOUT}s budget before runtime $runtime"
+        sleep "$RETRY_DELAY"
+      fi
     fi
     attempt=$((attempt + 1))
   done

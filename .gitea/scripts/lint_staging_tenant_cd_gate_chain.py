@@ -72,6 +72,8 @@ READINESS_GUARD_COMMAND = "bash scripts/deploy/require-local-deploy-daemon.sh"
 READINESS_ACTION_COMMAND = "bash scripts/deploy/prepare-staging-runtime-images.sh"
 READINESS_ACTION_ENV = {
     "CP_BASE_URL": "https://staging-api.moleculesai.app",
+    "INFISICAL_BASE": "https://key.moleculesai.app",
+    "INFISICAL_ENV": "staging",
     "INFISICAL_CLIENT_ID": "${{ secrets.INFISICAL_CI_CLIENT_ID }}",
     "INFISICAL_CLIENT_SECRET": "${{ secrets.INFISICAL_CI_CLIENT_SECRET }}",
     "INFISICAL_PROJECT_ID": "${{ secrets.INFISICAL_CI_PROJECT_ID }}",
@@ -86,6 +88,8 @@ FORBIDDEN_WORKFLOW_ENV_KEYS = {
     "DOCKER_TLS_VERIFY",
     "DOCKER_CERT_PATH",
     "MOLECULE_PROD_DOCKER_HOST",
+    "INFISICAL_BASE",
+    "INFISICAL_ENV",
 }
 
 

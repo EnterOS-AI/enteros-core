@@ -53,6 +53,8 @@ def test_accepts_guarded_runtime_readiness_fleet_gate(tmp_path: Path):
               - run: bash scripts/deploy/require-local-deploy-daemon.sh
               - env:
                   CP_BASE_URL: https://staging-api.moleculesai.app
+                  INFISICAL_BASE: https://key.moleculesai.app
+                  INFISICAL_ENV: staging
                   INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
                   INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
                   INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
@@ -215,6 +217,8 @@ def readiness_workflow(*, runner="local-deploy", action=None, rollback_readiness
               - run: bash scripts/deploy/require-local-deploy-daemon.sh
               - env:
                   CP_BASE_URL: https://staging-api.moleculesai.app
+                  INFISICAL_BASE: https://key.moleculesai.app
+                  INFISICAL_ENV: staging
                   INFISICAL_CLIENT_ID: ${{{{ secrets.INFISICAL_CI_CLIENT_ID }}}}
                   INFISICAL_CLIENT_SECRET: ${{{{ secrets.INFISICAL_CI_CLIENT_SECRET }}}}
                   INFISICAL_PROJECT_ID: ${{{{ secrets.INFISICAL_CI_PROJECT_ID }}}}
@@ -395,6 +399,22 @@ def test_workflow_env_cannot_replace_runner_owned_daemon_endpoint(tmp_path: Path
 
     assert result.returncode == 1
     assert "trusted Docker endpoint values" in result.stdout
+
+
+def test_workflow_env_cannot_redirect_infisical_credentials(tmp_path: Path):
+    body = readiness_workflow().replace(
+        "        jobs:\n",
+        "        env:\n"
+        "          INFISICAL_BASE: https://credential-sink.example.test\n"
+        "          INFISICAL_ENV: prod\n"
+        "        jobs:\n",
+    )
+    workflow = write_workflow(tmp_path, body)
+
+    result = run_lint(workflow)
+
+    assert result.returncode == 1
+    assert "forbidden execution/endpoint key" in result.stdout
 
 
 def test_e2e_cannot_override_failed_needs_with_always_condition(tmp_path: Path):

@@ -198,9 +198,9 @@ run_gate() {
     INFISICAL_BASE="https://key.example.test" INFISICAL_ENV=staging \
     INFISICAL_CLIENT_ID="$INFISICAL_ID" INFISICAL_CLIENT_SECRET="$INFISICAL_SECRET" \
     INFISICAL_PROJECT_ID="293c3669-423b-4610-96f0-d3f7a611b340" \
-    RUNTIME_IMAGE_READINESS_TIMEOUT_SECONDS=1200 \
+    RUNTIME_IMAGE_READINESS_TIMEOUT_SECONDS="${TEST_READINESS_TIMEOUT:-1200}" \
     RUNTIME_IMAGE_PULL_TIMEOUT_SECONDS=600 RUNTIME_IMAGE_PULL_ATTEMPTS=2 \
-    RUNTIME_IMAGE_PULL_RETRY_DELAY_SECONDS=0 PATH="$TMP_DIR/bin:$PATH" \
+    RUNTIME_IMAGE_PULL_RETRY_DELAY_SECONDS="${TEST_RETRY_DELAY:-0}" PATH="$TMP_DIR/bin:$PATH" \
     bash "$READINESS" 2>&1
 }
 
@@ -304,5 +304,11 @@ set +e
 inspect_output="$(MOCK_INSPECT_MISMATCH=1 run_gate)"; inspect_rc=$?
 set -e
 [[ $inspect_rc -ne 0 && "$inspect_output" == *"exact RepoDigest verification failed"* ]] || fail "digest mismatch did not fail closed"
+
+set +e
+delay_output="$(MOCK_PULL_MODE=always-fail TEST_READINESS_TIMEOUT=10 TEST_RETRY_DELAY=999 run_gate)"; delay_rc=$?
+set -e
+[[ $delay_rc -ne 0 && "$delay_output" == *"retry delay would exhaust"* ]] \
+  || fail "retry delay was not charged against the global deadline: $delay_output"
 
 echo "PASS: Core staging CD pre-pulls the CP-projected exact runtime digests on the guarded local-deploy daemon"
