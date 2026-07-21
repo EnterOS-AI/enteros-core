@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -1309,13 +1310,88 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 	}
 	// SSRF defence: reject private/metadata URLs before making outbound call.
 	if err := isSafeURL(agentURL); err != nil {
-		log.Printf("ProxyA2A: unsafe URL for workspace %s: %v", workspaceID, err)
-		return "", &proxyA2AError{
-			Status:   http.StatusBadGateway,
-			Response: gin.H{"error": "workspace URL is not publicly routable"},
+		// Docker-internal restart-flap residual (core#4548): on the local-
+		// docker topology the workspace URL was rewritten above to the
+		// synthesized container hostname (ws-<id>:8000). During a config-PUT
+		// restart flap the container's DNS name can transiently fail to
+		// resolve while docker-DNS races to (re)register it — isSafeURL then
+		// returns a *net.DNSError-wrapped "DNS resolution blocked" error and
+		// the turn is dropped with a spurious 502.
+		//
+		// settleDockerInternalDNS re-runs isSafeURL a bounded number of times
+		// to let docker-DNS settle. It is NOT a routability relaxation: the
+		// classification of what counts as routable is byte-for-byte
+		// unchanged, and it only retries while the failure remains a DNS-
+		// *resolution* error — a genuine routability rejection (private/
+		// metadata/link-local classification) is a plain error, does not
+		// match, and fails closed on the first attempt.
+		//
+		// Prod-safety: this branch is gated on devModeAllowsLoopback()
+		// (MOLECULE_ENV=development|dev) AND platformInDocker AND the URL
+		// being the container-hostname rewrite. SaaS/prod tenants run
+		// MOLECULE_ENV=production (crypto strict-init) and register by VPC-
+		// private IP (never the 127.0.0.1→ws-<id> rewrite), so prod never
+		// enters here and calls isSafeURL exactly once — the production
+		// SSRF/routability guard is unchanged.
+		if devModeAllowsLoopback() && platformInDocker &&
+			agentURL == provisioner.InternalURL(workspaceID) &&
+			isDNSResolutionError(err) {
+			err = settleDockerInternalDNS(agentURL)
+		}
+		if err != nil {
+			log.Printf("ProxyA2A: unsafe URL for workspace %s: %v", workspaceID, err)
+			return "", &proxyA2AError{
+				Status:   http.StatusBadGateway,
+				Response: gin.H{"error": "workspace URL is not publicly routable"},
+			}
 		}
 	}
 	return agentURL, nil
+}
+
+// dockerDNSSettleAttempts / dockerDNSSettleDelay bound how long the A2A
+// proxy waits for docker-DNS to (re)register a workspace container's
+// hostname during a restart flap before giving up. Ceiling ~1.5s
+// (5 × 300ms), well under the A2A client timeout. Package vars so tests
+// can shorten the delay; production never reaches settleDockerInternalDNS
+// (see resolveAgentURL gate).
+var (
+	dockerDNSSettleAttempts = 5
+	dockerDNSSettleDelay    = 300 * time.Millisecond
+)
+
+// isDNSResolutionError reports whether err (as produced by isSafeURL) is a
+// transient DNS *resolution* failure rather than a routability rejection.
+// isSafeURL wraps net.LookupHost's *net.DNSError with %w on the resolution-
+// blocked path; classification rejections are plain fmt.Errorf values that
+// do not unwrap to a *net.DNSError. This is what keeps the settle retry from
+// ever re-attempting — and thus never masking — a real SSRF rejection.
+func isDNSResolutionError(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
+}
+
+// settleDockerInternalDNS re-runs the SSRF/routability check (isSafeURL) up
+// to dockerDNSSettleAttempts times, sleeping dockerDNSSettleDelay between
+// attempts, but ONLY while the failure remains a DNS-resolution error. The
+// first time isSafeURL returns nil the URL is accepted; the first time it
+// returns a NON-DNS error (an actual routability rejection) that rejection
+// is returned immediately. It therefore never broadens what counts as
+// routable — it only waits for the container name to resolve. Returns nil
+// on success or the last error on timeout.
+func settleDockerInternalDNS(agentURL string) error {
+	var err error
+	for i := 0; i < dockerDNSSettleAttempts; i++ {
+		time.Sleep(dockerDNSSettleDelay)
+		err = isSafeURL(agentURL)
+		if err == nil {
+			return nil
+		}
+		if !isDNSResolutionError(err) {
+			return err // real routability rejection — fail closed, do not retry
+		}
+	}
+	return err
 }
 
 // normalizeA2APayload parses the incoming body, wraps it in a JSON-RPC 2.0
