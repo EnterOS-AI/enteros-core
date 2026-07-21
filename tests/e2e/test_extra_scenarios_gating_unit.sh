@@ -112,9 +112,10 @@ expect_gate_g "graduated scenario passes, soak on → gate 0" \
 # red (listed) still blocks — the whole point of per-scenario graduation.
 expect_gate_g "graduated red + soaking red together, soak on → gate 1 (graduated one blocks)" \
   1 1 "bad_peer_visibility" "bad_soaker,bad_peer_visibility"
-# And with ONLY the still-soaking red present, the soak suppresses → gate 0.
-expect_gate_g "only a soaking red (graduated one absent), soak on → gate 0" \
-  0 1 "bad_peer_visibility" "bad_soaker"
+# A still-soaking red is suppressed while the graduated one is PRESENT and passes
+# (gating key stays a subset of the scenario list — see the fail-closed guard below).
+expect_gate_g "soaking red suppressed while graduated one passes, soak on → gate 0" \
+  0 1 "ok_grad" "ok_grad,bad_soaker"
 
 # Two graduated scenarios (the real config shape: peer_visibility + concierge_creates_workspace).
 expect_gate_g "both graduated, one fails, soak on → gate 1" \
@@ -124,6 +125,33 @@ expect_gate_g "both graduated, one fails, soak on → gate 1" \
 # gates because the soak is off, listed or not — the list only MATTERS under soak.
 expect_gate_g "gating list is a no-op when soak already off → gate 1" \
   1 0 "bad_peer_visibility" "bad_peer_visibility"
+
+# ── FAIL-CLOSED GUARD: gating ⊆ scenarios (finding #2) ───────────────────────
+# A key in E2E_EPHEMERAL_EXTRA_GATING that is NOT in E2E_EPHEMERAL_EXTRA_SCENARIOS
+# never runs, so it can never fail — the gate would fail OPEN and a regression to
+# that journey merges GREEN. The runner asserts the subset internally and FAILS
+# THE GATE on a violation (defense-in-depth with the Python shape test).
+#
+# THE INVARIANT + its NEGATIVE CONTROL, side by side: the SAME gating key gates
+# to a HARD FAIL when it is MISSING from the scenario list, and passes (gate 0)
+# the moment it is ADDED to the scenario list and its scenario is green.
+expect_gate_g "gating key NOT in scenario list → fail-closed misconfig, gate 1" \
+  1 1 "peer_visibility" "ok_concierge"
+expect_gate_g "same gating key ADDED to scenario list (and passes) → gate 0" \
+  0 1 "ok_peer_visibility" "ok_peer_visibility,ok_concierge"
+
+# The early-return bypass: a gating list set with an EMPTY scenario list is the
+# same fail-open misconfig and must NOT slip through the "no extras" early exit.
+expect_gate_g "gating set but scenario list EMPTY → fail-closed misconfig, gate 1" \
+  1 1 "peer_visibility" ""
+
+# Only SOME gating keys missing (one present, one absent) still fails closed.
+expect_gate_g "one gating key present, one absent → fail-closed misconfig, gate 1" \
+  1 1 "ok_a,peer_visibility" "ok_a"
+
+# Empty gating list + empty scenario list → nothing requested → gate 0 (legal).
+expect_gate_g "empty gating + empty scenarios → gate 0" \
+  0 1 "" ""
 
 # Direct run_extra_scenarios contract: unknown key sets EXTRA_MISCONFIG even though
 # its ran-and-failed count can be 0.
