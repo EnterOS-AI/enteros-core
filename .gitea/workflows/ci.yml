@@ -614,6 +614,10 @@ jobs:
           # gate load-bearing while avoiding duplicate task sends after the
           # canvas cap returns `{status:"queued",delivery_mode:"push-async"}`.
           bash tests/e2e/test_chat_history_agent_text_unit.sh
+          # A durable queued response must expose a queue_id before the required
+          # local-provision lane constructs its queue-status URL. Offline cases
+          # preserve the MiniMax advisory skip but make the stub lane fail fast.
+          bash tests/e2e/test_local_provision_queue_guard_unit.sh
           # harden/e2e-staging-saas-failclosed: fail-direction proof for the
           # E2E_REQUIRE_LIVE fail-closed-on-skip guard in
           # test_staging_full_saas.sh. Offline (no LLM/network/provisioning):

@@ -869,11 +869,14 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 	// on that shape). System callers pass through — the gate holder itself
 	// dispatches through this proxy.
 	if a2aMethod == "message/send" && restartContextInFlight(workspaceID) && !isSystemCaller(callerID) {
-		if _, _, qErr := EnqueueA2A(ctx, workspaceID, callerID, 50, body, a2aMethod, "", nil); qErr == nil {
+		if qid, depth, qErr := EnqueueA2A(ctx, workspaceID, callerID, PriorityTask, body, a2aMethod, "", nil); qErr == nil {
 			log.Printf("ProxyA2A: platform boot turn in flight for %s — queued caller turn instead of interleaving", workspaceID)
 			respBody, marshalErr := json.Marshal(gin.H{
-				"status": "queued",
-				"method": a2aMethod,
+				"status":      "queued",
+				"method":      a2aMethod,
+				"queued":      true,
+				"queue_id":    qid,
+				"queue_depth": depth,
 			})
 			if marshalErr == nil {
 				return http.StatusOK, respBody, nil
