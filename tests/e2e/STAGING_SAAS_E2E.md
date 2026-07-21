@@ -26,7 +26,9 @@ runner labels, and timeout budgets.
 - `.gitea/workflows/e2e-workspace-lifecycle-staging.yml`: restart,
   pause/resume, hibernate/wake, and A2A survival.
 - `.gitea/workflows/staging-tenant-cd.yml`: exact-image staging rollout plus a
-  hard provision/management-MCP/A2A/lifecycle gate and rollback chain.
+  guarded exact-digest runtime-image readiness sibling, followed by the hard
+  provision/management-MCP/A2A/lifecycle gate and rollback chain. The E2E cannot
+  start until the tenant roll and local-deploy daemon readiness are both green.
 
 The shared shell harness is `tests/e2e/test_staging_full_saas.sh`; individual
 workflows select the required mode. The active local-Docker lanes in

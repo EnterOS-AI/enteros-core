@@ -20,8 +20,12 @@ eligible merge to `main`, it:
 2. advances the staging tenant-image pin in the control plane;
 3. rolls the stateless staging tenant platform containers while preserving
    workspace runtime/session volumes;
-4. runs the real staging provision, management-MCP, A2A, and lifecycle gate;
-5. keeps or rolls back the pin/fleet according to that hard gate.
+4. in parallel with the tenant roll, uses the guarded `local-deploy` daemon to
+   pre-pull and exact-`RepoDigests` verify every pinnable runtime selected by
+   the control-plane runtime catalog and promoted-pin projections;
+5. runs the real staging provision, management-MCP, A2A, and lifecycle gate
+   only after both the fleet roll and runtime-image readiness are green;
+6. keeps or rolls back the pin/fleet according to that hard gate.
 
 The pipeline is serialized and does not write the production pin or `latest`
 tag. A successful staging run is not a production deployment.
@@ -49,6 +53,8 @@ A green image build or pin write alone is insufficient. The staging gate must
 show:
 
 - the exact image is pullable and the deployed build identity matches;
+- every promoted pinnable runtime digest is already present and verified on the
+  local-Docker provisioner daemon before a workspace create starts;
 - a throwaway tenant/workspace reaches the expected state;
 - the selected runtime registers and serves a real A2A turn;
 - management-MCP tools are present and callable where required;
