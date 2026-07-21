@@ -32,7 +32,7 @@ class InstallWorkspaceRuntimeTest(unittest.TestCase):
                           previous="$arg"
                         done
                         mkdir -p "$dest"
-                        : > "$dest/molecules_workspace_runtime-0.4.29-py3-none-any.whl"
+                        : > "$dest/molecules_workspace_runtime-0.4.36-py3-none-any.whl"
                         ;;
                       *" pip install "*)
                         if [ "${FAKE_INSTALL_FAIL:-0}" = "1" ]; then exit 23; fi
@@ -73,7 +73,7 @@ class InstallWorkspaceRuntimeTest(unittest.TestCase):
             "https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/",
             download,
         )
-        self.assertIn("molecules-workspace-runtime==0.4.29", download)
+        self.assertIn("molecules-workspace-runtime==0.4.36", download)
         self.assertNotIn("--extra-index-url", download + install)
 
         self.assertIn("install", install)
