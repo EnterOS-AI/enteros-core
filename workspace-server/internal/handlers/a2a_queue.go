@@ -588,9 +588,16 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		log.Printf("A2AQueue drain: dispatching queue_id=%s workspace_id=%s url=%s attempt=%d",
 			item.ID, workspaceID, resolvedURL, item.Attempts)
 
-		// logActivity=false: the original EnqueueA2A callsite already logged
-		// the dispatch attempt; re-logging here would double-count events.
-		status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false, false)
+		// logActivity=TRUE (changed 2026-07-21): with the activity upsert
+		// message-keyed (ON CONFLICT workspace_id,message_id), re-logging no
+		// longer double-counts — the ingest collapses into the row the
+		// EnqueueA2A callsite wrote, and logA2ASuccess attaches the reply's
+		// response_body + tool_trace onto that SAME row. Pre-fix (false),
+		// queued/slow turns never got their completion logged, so the canvas
+		// tool-call chain (and the durable reply) was dropped for every turn
+		// that outlived the sync proxy window — the async half of the hermes
+		// tool-trace feature.
+		status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, true, false)
 
 		// 202 Accepted = the dispatch was itself queued again (target still busy).
 		// That's not a failure — the queued item just stays queued naturally on
