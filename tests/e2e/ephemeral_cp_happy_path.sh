@@ -993,15 +993,24 @@ run_one_extra_scenario() {
 # still suppress.
 EXTRA_MISCONFIG=0
 
+# Set by run_extra_scenarios: the KEYS of the scenarios that RAN and FAILED, in
+# order. The failed-COUNT (run_extra_scenarios's return) says HOW MANY reds there
+# were; this says WHICH — which is what gate_extra_scenarios needs to apply the
+# per-scenario gating policy (a graduated scenario gates even under the global
+# advisory soak; see E2E_EPHEMERAL_EXTRA_GATING / gate_extra_scenarios).
+EXTRA_FAILED_KEYS=()
+
 # Run every scenario named in E2E_EPHEMERAL_EXTRA_SCENARIOS (comma/space list)
 # against the standing CP. Returns the COUNT of scenarios that RAN and FAILED
-# (0 = none) so the caller can gate or advise on it. Sets EXTRA_MISCONFIG=1 (out
-# of band) for a never-ran misconfig. Never returns early — every listed scenario
-# runs so one failure does not mask a second.
+# (0 = none) so the caller can gate or advise on it. Records the failed keys in
+# EXTRA_FAILED_KEYS. Sets EXTRA_MISCONFIG=1 (out of band) for a never-ran
+# misconfig. Never returns early — every listed scenario runs so one failure does
+# not mask a second.
 run_extra_scenarios() {
   local list="${E2E_EPHEMERAL_EXTRA_SCENARIOS:-}"
   [ -n "$list" ] || return 0
   EXTRA_MISCONFIG=0
+  EXTRA_FAILED_KEYS=()
   # A non-empty value that tokenizes to NOTHING (e.g. "," or whitespace) passes the
   # -n guard above but yields zero loop iterations — which would silently return 0
   # (green, nothing ran). That is a misconfig, not "no extras": detect zero tokens
@@ -1027,33 +1036,89 @@ run_extra_scenarios() {
          echo "[proof][extra] ❌ ${s} is an UNKNOWN scenario key (ran nothing) — misconfig; fails the gate even under E2E_EPHEMERAL_EXTRA_ADVISORY=1." >&2
          EXTRA_MISCONFIG=1 ;;
       *) failed=$((failed + 1))
+         EXTRA_FAILED_KEYS+=("$s")
          echo "[proof][extra] ❌ ${s} FAILED against the ephemeral CP." >&2 ;;
     esac
   done
   return "$failed"
 }
 
+# A scenario key is GATING-OVERRIDE when it is named in E2E_EPHEMERAL_EXTRA_GATING
+# (comma/space list): its failure fails the gate EVEN under the global advisory
+# soak (E2E_EPHEMERAL_EXTRA_ADVISORY=1). This is how an individual scenario
+# graduates from capture-first soak to merge-blocking without flipping the whole
+# extra-set hard — a genuinely-still-flaky lane (external_runtime,
+# reconciler_heals_terminated) can keep soaking in the SAME run while a proven one
+# (peer_visibility, concierge_creates_workspace — the #4543 coverage-hole fix)
+# gates. Returns 0 (is-gating) / 1 (not-listed).
+_extra_scenario_is_gating_override() {
+  local key="$1" g list="${E2E_EPHEMERAL_EXTRA_GATING:-}"
+  for g in ${list//,/ }; do
+    [ "$g" = "$key" ] && return 0
+  done
+  return 1
+}
+
+# FAIL-CLOSED GUARD (defense-in-depth with test_ephemeral_gate_is_enforced.py):
+# every key in E2E_EPHEMERAL_EXTRA_GATING MUST also appear in
+# E2E_EPHEMERAL_EXTRA_SCENARIOS. A gating key that is NOT in the scenario list
+# never runs → never enters EXTRA_FAILED_KEYS → can NEVER fail the gate: the gate
+# stays green and a regression to that journey merges silently (fail-open). That
+# is the exact hole the gating list exists to close, so a mis-declared list must
+# FAIL THE GATE — same class as the unknown-key/zero-token misconfig above, never
+# advisory-suppressible. Returns 0 when the subset holds, 1 (with ::error::) when
+# any gating key is missing from the scenario list.
+_assert_gating_subset_of_scenarios() {
+  local gate_list="${E2E_EPHEMERAL_EXTRA_GATING:-}" scen="${E2E_EPHEMERAL_EXTRA_SCENARIOS:-}"
+  local g s found; local -a missing=()
+  for g in ${gate_list//,/ }; do
+    found=0
+    for s in ${scen//,/ }; do [ "$s" = "$g" ] && { found=1; break; }; done
+    [ "$found" -eq 0 ] && missing+=("$g")
+  done
+  if [ "${#missing[@]}" -ne 0 ]; then
+    echo "::error::[proof][extra] E2E_EPHEMERAL_EXTRA_GATING names scenario(s) NOT in E2E_EPHEMERAL_EXTRA_SCENARIOS: ${missing[*]} — a gating key that never runs can never fail, so the gate would fail OPEN (a regression to that journey merges GREEN). Add the key to E2E_EPHEMERAL_EXTRA_SCENARIOS or remove it from E2E_EPHEMERAL_EXTRA_GATING. FAILING the gate (fail-closed misconfig)." >&2
+    return 1
+  fi
+  return 0
+}
+
 # Run the extra scenarios against the standing CP and apply the gating policy.
 # Shared by `all` and `scenario` so the advertised local loop exercises exactly
 # what CI does. Returns 0 if the extras do NOT force a gate failure, 1 if they do:
-#   * a scenario that RAN and FAILED → gates UNLESS E2E_EPHEMERAL_EXTRA_ADVISORY=1
-#     (the capture-first advisory soak), and
+#   * a gating list that is NOT a subset of the scenario list → gates ALWAYS
+#     (fail-closed misconfig; a gating key that never runs can never fail);
+#   * a scenario that RAN and FAILED → gates UNLESS the global advisory soak
+#     (E2E_EPHEMERAL_EXTRA_ADVISORY=1) suppresses it — but a scenario named in
+#     E2E_EPHEMERAL_EXTRA_GATING GATES REGARDLESS of the soak (it has graduated);
 #   * a MISCONFIG (unknown key / zero-token list) → gates ALWAYS (never suppressible).
 gate_extra_scenarios() {
-  [ -n "${E2E_EPHEMERAL_EXTRA_SCENARIOS:-}" ] || return 0
   local extra_failed gate=0
+  # Checked BEFORE the empty-scenario early return: a gating list set with an
+  # empty scenario list is itself the fail-open misconfig, and must not slip
+  # through by returning 0 early.
+  _assert_gating_subset_of_scenarios || gate=1
+  [ -n "${E2E_EPHEMERAL_EXTRA_SCENARIOS:-}" ] || return "$gate"
   run_extra_scenarios; extra_failed=$?
   if [ "${EXTRA_MISCONFIG:-0}" -ne 0 ]; then
     echo "[proof][extra] ❌ extra-scenario MISCONFIG (unknown key or zero-token list) — failing the gate; NOT advisory-suppressible." >&2
     gate=1
   fi
   if [ "$extra_failed" -ne 0 ]; then
-    if [ "${E2E_EPHEMERAL_EXTRA_ADVISORY:-0}" = "1" ]; then
-      echo "[proof][extra] ⚠️ ${extra_failed} extra scenario(s) FAILED — ADVISORY soak (E2E_EPHEMERAL_EXTRA_ADVISORY=1); NOT failing the gate. Read the [extra] output above and promote to gating once green." >&2
-    else
-      echo "[proof][extra] ❌ ${extra_failed} extra scenario(s) FAILED and are GATING (E2E_EPHEMERAL_EXTRA_ADVISORY!=1)." >&2
-      gate=1
-    fi
+    local soak="${E2E_EPHEMERAL_EXTRA_ADVISORY:-0}" s hard=0
+    # Classify EACH ran-and-failed scenario. A scenario gates when the soak is
+    # off OR when it is a gating-override (graduated) scenario; otherwise the
+    # soak suppresses it. Iterate names (EXTRA_FAILED_KEYS), not just the count,
+    # so a graduated red and a still-soaking red in the SAME run are told apart.
+    for s in "${EXTRA_FAILED_KEYS[@]}"; do
+      if [ "$soak" != "1" ] || _extra_scenario_is_gating_override "$s"; then
+        hard=$((hard + 1))
+        echo "[proof][extra] ❌ ${s} FAILED and is GATING (merge-blocking) — advisory soak does NOT suppress it." >&2
+      else
+        echo "[proof][extra] ⚠️ ${s} FAILED — ADVISORY soak (E2E_EPHEMERAL_EXTRA_ADVISORY=1, not in E2E_EPHEMERAL_EXTRA_GATING); NOT failing the gate. Read the [extra] output above and promote to gating (add it to E2E_EPHEMERAL_EXTRA_GATING) once green." >&2
+      fi
+    done
+    [ "$hard" -ne 0 ] && gate=1
   fi
   return "$gate"
 }
