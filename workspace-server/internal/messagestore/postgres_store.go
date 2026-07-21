@@ -71,6 +71,9 @@ var selfSourceTypes = map[string]bool{
 	// which routes through the ordinary ingest persist — without this marker
 	// each drained snapshot rendered as a blue user bubble in My Chat.
 	"self-restart-context": true,
+	// The first-boot greeting's internal prompt (first_boot_greeting.go) —
+	// persisted only when a busy-queued greet turn is drained later.
+	"self-first-boot-greet": true,
 }
 
 // IsSelfSourceType reports whether a params.metadata.source_type marker

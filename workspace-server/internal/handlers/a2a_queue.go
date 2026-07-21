@@ -23,6 +23,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/messagestore"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
@@ -105,6 +106,46 @@ const (
 // heartbeats typically every 5-30s) and short enough that recovery on
 // the next heartbeat is not perceptibly delayed.
 const transientRetryBackoffSecs = 5
+
+// attachQueuedTurnCompletion attaches a drained USER turn's reply
+// (response_body + tool_trace) onto its message-keyed activity row — the
+// async half of the hermes tool-trace feature. Deliberately NARROW instead
+// of dispatching the drain with logActivity=true: the queue NULL-normalizes
+// system callers, so the full logging path would treat platform boot turns
+// as canvas turns (broadcast internal replies into chat, trip the greet-once
+// gate, duplicate busy re-queues — review wf_b8f98be3). Skips:
+//   - self-source platform turns (restart-context wake, first-boot greet)
+//   - unkeyed messages (an insert would duplicate, never collapse)
+// The upsert lands on the row the original ingest wrote (ON CONFLICT
+// workspace_id,message_id), so no new bubble is ever created here.
+func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, workspaceID string, reqBody, respBody []byte) {
+	if len(respBody) == 0 {
+		return
+	}
+	if st := messagestore.RequestSourceType(reqBody); st != "" && messagestore.IsSelfSourceType(st) {
+		return
+	}
+	messageID := extractIdempotencyKey(reqBody)
+	if messageID == "" {
+		return
+	}
+	logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	method := "message/send"
+	summary := "message/send (queued turn reply)"
+	LogActivity(logCtx, h.broadcaster, ActivityParams{
+		WorkspaceID:  workspaceID,
+		ActivityType: "a2a_receive",
+		TargetID:     &workspaceID,
+		Method:       &method,
+		Summary:      &summary,
+		RequestBody:  json.RawMessage(reqBody),
+		ResponseBody: json.RawMessage(respBody),
+		ToolTrace:    extractToolTrace(respBody),
+		Status:       "ok",
+		MessageId:    messageID,
+	})
+}
 
 // QueuedItem is what the heartbeat drain path pulls off the queue.
 type QueuedItem struct {
@@ -588,8 +629,15 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		log.Printf("A2AQueue drain: dispatching queue_id=%s workspace_id=%s url=%s attempt=%d",
 			item.ID, workspaceID, resolvedURL, item.Attempts)
 
-		// logActivity=false: the original EnqueueA2A callsite already logged
-		// the dispatch attempt; re-logging here would double-count events.
+		// logActivity=false STANDS: EnqueueA2A NULL-normalizes system callers
+		// (caller_id is a UUID column), so a drained boot turn re-dispatches
+		// with callerID=="" and the full logging path would treat it as a
+		// CANVAS turn — broadcasting internal restart/greet replies into the
+		// user's chat, tripping the greet-once gate, and re-persisting busy
+		// re-queues as duplicate bubbles (review wf_b8f98be3, 5 confirmed
+		// regressions). The async tool-trace completion is attached instead
+		// by the NARROW helper below, which skips self-source turns and
+		// only upserts onto the message-keyed row.
 		status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false, false)
 
 		// 202 Accepted = the dispatch was itself queued again (target still busy).
@@ -598,6 +646,11 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		// count attempts; the new (re-)queue row already exists.
 		if status == http.StatusAccepted {
 			MarkQueueItemCompleted(ctx, item.ID, nil)
+			// Async tool-trace completion (2026-07-21): attach the reply +
+			// tool_trace onto the USER turn's message-keyed activity row.
+			// Self-source platform turns (restart-context wake, first-boot
+			// greet) are skipped — their replies are not user chat.
+			h.attachQueuedTurnCompletion(ctx, workspaceID, item.Body, respBody)
 			log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s re-queued (target still busy)",
 				item.ID, workspaceID)
 			continue
