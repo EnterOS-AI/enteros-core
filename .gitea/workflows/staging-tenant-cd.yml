@@ -202,6 +202,7 @@ jobs:
           TENANT_FLAGS="${STAGING_TENANT_FLAGS-}" \
             bash scripts/deploy/redeploy-staging-fleet.sh --tag "${{ needs.await-image.outputs.tag }}"
 
+  # bp-exempt: post-merge staging CD hard gate; enforced by e2e needs + rollback, not PR branch protection.
   runtime-image-readiness:
     name: runtime-image-readiness (exact promoted digests on provisioner daemon)
     needs: [advance-pin]
