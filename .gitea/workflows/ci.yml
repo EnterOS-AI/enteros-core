@@ -528,6 +528,10 @@ jobs:
         name: Managed tenant flags are reversible (rollback safety)
         run: bash scripts/deploy/tests/test-managed-flags.sh
 
+      - if: ${{ needs.changes.outputs.scripts == 'true' }}
+        name: Promoted runtime images are ready before staging E2E
+        run: bash scripts/deploy/tests/test-prepare-staging-runtime-images.sh
+
       # Runs when EITHER side of the contract moves: the e2e scripts (scripts)
       # or the router that serves them (platform). A route rename in
       # workspace-server is exactly how a call goes dead without anyone noticing.
@@ -709,7 +713,10 @@ jobs:
         run: |
           shellcheck --severity=warning \
             scripts/deploy/redeploy-staging-fleet.sh \
-            scripts/deploy/tests/test-managed-flags.sh
+            scripts/deploy/tests/test-managed-flags.sh \
+            scripts/deploy/require-local-deploy-daemon.sh \
+            scripts/deploy/prepare-staging-runtime-images.sh \
+            scripts/deploy/tests/test-prepare-staging-runtime-images.sh
 
   # mc#959 root-fix (sre)
 
