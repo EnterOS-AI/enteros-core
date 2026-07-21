@@ -505,7 +505,72 @@ func (h *WorkspaceHandler) composeConciergeRuntimeConfig(runtime string) ([]byte
 	if err != nil {
 		return nil, fmt.Errorf("marshal composed concierge config %q: %w", base, err)
 	}
+	// Self-host only: graft the platform-agent template's runtime-native
+	// `schedules:` node onto the composed config so the concierge boots with the
+	// template's schedules. Boot-safe: on ANY problem (SaaS, no template, no
+	// schedules node, unparseable template, failed round-trip) we ship `out` —
+	// the composed config WITHOUT schedules — unchanged.
+	if withSched, grafted := h.graftConciergeSchedules(&doc, root); grafted {
+		out = withSched
+	}
 	return out, nil
+}
+
+// graftConciergeSchedules grafts the platform-agent template's top-level
+// `schedules:` node onto the composed concierge config root and returns the
+// re-marshaled bytes. It is a ONE-TIME, GENERIC enablement: whatever runtime-
+// native `schedules:` the platform-agent template carries survives concierge
+// config composition — the schedule content is NEVER hardcoded in Go.
+//
+// Gate: only self-host deployments (SelfHostPlatformSeedEnabled — MOLECULE_ORG_ID
+// unset) graft; on SaaS the concierge config stays byte-identical (grafted=false).
+//
+// The template's schedules are already runtime-native (cron/inline prompt), so
+// this is a pure passthrough — renderTemplateSchedulesYAML is NOT called.
+//
+// Boot-safety (mirrors appendYAMLBlockChecked): after grafting, the whole doc is
+// re-marshaled and re-parsed (round-trip guard). If the template dir is
+// unresolvable, its config.yaml is missing/unparseable, it carries no schedules
+// node, or the merged doc fails the round-trip, grafted=false is returned and the
+// caller ships the composed config UNCHANGED — an unloadable config.yaml bricks
+// boot, so a missing schedule is always preferred over a broken config.
+func (h *WorkspaceHandler) graftConciergeSchedules(doc, root *yaml.Node) ([]byte, bool) {
+	if !SelfHostPlatformSeedEnabled() {
+		return nil, false // SaaS: concierge config stays byte-identical.
+	}
+	dir, err := resolveWorkspaceTemplatePath(h.configsDir, h.cacheDir, "platform-agent")
+	if err != nil {
+		return nil, false
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		return nil, false
+	}
+	var tdoc yaml.Node
+	if err := yaml.Unmarshal(raw, &tdoc); err != nil {
+		log.Printf("Provisioner: concierge schedules graft — platform-agent config.yaml unparseable (%v); shipping composed config WITHOUT schedules", err)
+		return nil, false
+	}
+	if tdoc.Kind != yaml.DocumentNode || len(tdoc.Content) == 0 || tdoc.Content[0].Kind != yaml.MappingNode {
+		return nil, false
+	}
+	sched := yamlMappingGet(tdoc.Content[0], "schedules")
+	if sched == nil {
+		return nil, false // template carries no schedules → no-op.
+	}
+	// Graft the node, then round-trip-guard the WHOLE merged doc.
+	yamlMappingSet(root, "schedules", sched)
+	merged, err := yaml.Marshal(doc)
+	if err != nil {
+		log.Printf("Provisioner: concierge schedules graft — re-marshal failed (%v); shipping composed config WITHOUT schedules", err)
+		return nil, false
+	}
+	var probe map[string]interface{}
+	if err := yaml.Unmarshal(merged, &probe); err != nil {
+		log.Printf("Provisioner: concierge schedules graft — merged config.yaml fails to re-parse (%v); shipping composed config WITHOUT schedules (would brick boot)", err)
+		return nil, false
+	}
+	return merged, true
 }
 
 // resolveConciergePersonaBytes returns the RAW (unsubstituted) concierge persona
