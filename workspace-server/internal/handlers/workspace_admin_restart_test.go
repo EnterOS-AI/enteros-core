@@ -11,10 +11,13 @@ package handlers
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
@@ -124,37 +127,129 @@ func TestAdminRestart_EmptyIDIs400(t *testing.T) {
 	}
 }
 
-// Sanity check that the handler does NOT pause for the actual restart
-// (the 202 path is async; the migrator's poll loop is not held by
-// the restart's provisioning time). A 1ms-budgeted assertion catches
-// a regression that turns the handler into a synchronous call.
-func TestAdminRestart_AsyncDoesNotBlock(t *testing.T) {
-	h, mock := setupBootstrapHandler(t)
-	mock.ExpectQuery(`SELECT 1 FROM workspaces WHERE id = \$1`).
-		WithArgs("ws-1").
-		WillReturnRows(sqlmock.NewRows([]string{"x"}).AddRow(1))
+// TestAdminRestart_RestartByIDUsesTrackedAsyncDispatch pins the actual
+// non-blocking invariant structurally: RestartByID must be inside the function
+// literal passed to h.goAsync. A wall-clock assertion cannot prove this when
+// the test handler has no provisioner (a synchronous RestartByID returns
+// immediately), and a tight timeout makes the test itself scheduler-flaky.
+func TestAdminRestart_RestartByIDUsesTrackedAsyncDispatch(t *testing.T) {
+	t.Parallel()
 
-	done := make(chan struct{})
-	go func() {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Params = gin.Params{{Key: "id", Value: "ws-1"}}
-		c.Request = httptest.NewRequest("POST", "/admin/workspaces/ws-1/restart", nil)
-		h.AdminRestart(c)
-		close(done)
-	}()
-	select {
-	case <-done:
-		// PASS — handler returned quickly.
-	case <-timeAfter(1):
-		t.Fatal("AdminRestart blocked (the 202 must return without waiting for the restart goroutine)")
+	tracked, untracked, err := adminRestartDispatchShape("workspace_admin_restart.go", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet: %v", err)
+	if tracked != 1 || untracked != 0 {
+		t.Fatalf(
+			"AdminRestart RestartByID dispatch shape = tracked:%d untracked:%d; want tracked:1 untracked:0",
+			tracked,
+			untracked,
+		)
 	}
 }
 
-// Use a package-private alias so the test file doesn't need to
-// inline a time.After call. Kept inline; standard library time is
-// imported via the test harness.
-var timeAfter = func(d int) <-chan time.Time { return time.After(time.Duration(d) * time.Millisecond) }
+// TestAdminRestartAsyncShapeRejectsDirectDispatch is the fail-direction proof
+// for the structural gate. It prevents a broken detector from silently passing
+// the exact regression this test is meant to catch.
+func TestAdminRestartAsyncShapeRejectsDirectDispatch(t *testing.T) {
+	t.Parallel()
+
+	const direct = `package handlers
+func (h *WorkspaceHandler) AdminRestart() {
+	h.RestartByID("ws-1")
+}`
+	tracked, untracked, err := adminRestartDispatchShape("direct_dispatch.go", direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tracked != 0 || untracked != 1 {
+		t.Fatalf(
+			"direct RestartByID mutation shape = tracked:%d untracked:%d; want tracked:0 untracked:1",
+			tracked,
+			untracked,
+		)
+	}
+}
+
+// adminRestartDispatchShape returns RestartByID calls inside a function literal
+// passed to goAsync separately from every other RestartByID call. Passing nil
+// src makes go/parser read filename from disk.
+func adminRestartDispatchShape(filename string, src any) (tracked, untracked int, err error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, src, 0)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse %s: %w", filename, err)
+	}
+
+	var adminRestart *ast.FuncDecl
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Recv != nil && fn.Body != nil && fn.Name.Name == "AdminRestart" {
+			adminRestart = fn
+			break
+		}
+	}
+	if adminRestart == nil {
+		return 0, 0, fmt.Errorf("AdminRestart method not found in %s", filename)
+	}
+	receiver := adminRestart.Recv.List[0].Names[0].Name
+
+	trackedLiterals := make(map[*ast.FuncLit]struct{})
+	ast.Inspect(adminRestart.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		owner, ownerOK := selector.X.(*ast.Ident)
+		if !ownerOK || owner.Name != receiver || selector.Sel.Name != "goAsync" || len(call.Args) != 1 {
+			return true
+		}
+		literal, ok := call.Args[0].(*ast.FuncLit)
+		if ok {
+			trackedLiterals[literal] = struct{}{}
+		}
+		return true
+	})
+
+	var ancestors []ast.Node
+	ast.Inspect(adminRestart.Body, func(node ast.Node) bool {
+		if node == nil {
+			ancestors = ancestors[:len(ancestors)-1]
+			return true
+		}
+
+		if call, ok := node.(*ast.CallExpr); ok {
+			selector, selectorOK := call.Fun.(*ast.SelectorExpr)
+			if selectorOK {
+				owner, ownerOK := selector.X.(*ast.Ident)
+				if ownerOK && owner.Name == receiver && selector.Sel.Name == "RestartByID" {
+					insideTrackedLiteral := false
+					for _, ancestor := range ancestors {
+						literal, ok := ancestor.(*ast.FuncLit)
+						if !ok {
+							continue
+						}
+						if _, ok := trackedLiterals[literal]; ok {
+							insideTrackedLiteral = true
+							break
+						}
+					}
+					if insideTrackedLiteral {
+						tracked++
+					} else {
+						untracked++
+					}
+				}
+			}
+		}
+
+		ancestors = append(ancestors, node)
+		return true
+	})
+
+	return tracked, untracked, nil
+}
