@@ -84,9 +84,23 @@ func TestClassifyConciergeConfigTabResponse(t *testing.T) {
 			want:       conciergeConfigTabRejected,
 		},
 		{
+			name:       "offline body with successful status is rejected",
+			tab:        "schedules",
+			statusCode: http.StatusOK,
+			body:       `{"error":"workspace url not registered yet"}`,
+			want:       conciergeConfigTabRejected,
+		},
+		{
 			name:       "offline body from a non-proxy tab is rejected",
 			tab:        "plugins",
 			statusCode: http.StatusServiceUnavailable,
+			body:       `{"error":"workspace url not registered yet"}`,
+			want:       conciergeConfigTabRejected,
+		},
+		{
+			name:       "offline body from a non-proxy tab with client status is rejected",
+			tab:        "plugins",
+			statusCode: http.StatusNotFound,
 			body:       `{"error":"workspace url not registered yet"}`,
 			want:       conciergeConfigTabRejected,
 		},

@@ -30,9 +30,13 @@ func classifyConciergeConfigTabResponse(tab string, statusCode int, body string)
 			"config-tab %q rejected the admin token (HTTP %d)", tab, statusCode)
 	}
 
-	if tab == "schedules" && statusCode == http.StatusServiceUnavailable && exactSchedulesOfflineResponse(body) {
-		return conciergeConfigTabExpectedOffline,
-			"schedules is runtime-proxied and the unbooted platform agent has not registered its workspace URL"
+	if exactSchedulesOfflineResponse(body) {
+		if tab == "schedules" && statusCode == http.StatusServiceUnavailable {
+			return conciergeConfigTabExpectedOffline,
+				"schedules is runtime-proxied and the unbooted platform agent has not registered its workspace URL"
+		}
+		return conciergeConfigTabRejected, fmt.Sprintf(
+			"config-tab %q returned the schedules-offline body with unexpected HTTP %d", tab, statusCode)
 	}
 
 	if statusCode >= http.StatusInternalServerError {
