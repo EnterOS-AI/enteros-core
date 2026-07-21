@@ -30,7 +30,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
@@ -369,6 +368,18 @@ func gatePrivilegedDelegation(c *gin.Context, b events.EventEmitter, sourceID, t
 // operator's single approval survives a transient dispatch failure and the next
 // retry can use it.
 //
+// CONTEXT CONTRACT (#4539 convergence review FIX-B — single detach point): this
+// function uses the ctx it is GIVEN, as-is. It does NOT re-detach. The caller owns
+// detaching from any expired/expiring delegationCtx: the sole production caller,
+// finalizeNonDispatchedDelegation, already hands over a fresh detached cleanupCtx
+// and bounds the WHOLE cleanup (restore included) under that ONE deadline. An
+// earlier revision detached again HERE (WithoutCancel + its own timeout), which
+// let the restore write escape the cleanup's bound and run ~2x the ceiling — an
+// inconsistency with finalize's comment and its single-deadline guarantee.
+// Consequence of the contract: a caller that passes an already-cancelled ctx gets
+// a no-op restore (database/sql short-circuits) — that is the caller's bug to
+// avoid by detaching, not this function's to paper over.
+//
 // Best-effort and grant-scoped: a no-op when grantID == "" (nothing was
 // consumed — routine caller / dormant gate), and a restore failure only logs —
 // it must never fail the (already-terminal) delegation. Bounded to the
@@ -378,25 +389,7 @@ func restorePrivilegedDelegationGrant(ctx context.Context, workspaceID, grantID 
 	if grantID == "" {
 		return
 	}
-	// DETACH from the caller's context BEFORE the restore UPDATE. executeDelegation
-	// runs on delegationCtx = context.WithTimeout(parent, 30*time.Minute); one of the
-	// dispatch-failure modes this restore compensates is that ctx hitting its 30-min
-	// ceiling (proxyA2ARequest fails BECAUSE the deadline elapsed). If the UPDATE
-	// inherited that already-expired ctx, database/sql short-circuits on ctx.Done()
-	// in (*DB).conn BEFORE the statement ever reaches the driver, the consumed_at=NULL
-	// clear never lands, and the single-use grant stays burned on a delegation that
-	// never dispatched — defeating the restore in precisely the ctx-expiry failure
-	// mode it exists to cover. context.WithoutCancel keeps trace/tenant values while
-	// dropping the inherited (possibly-expired) deadline; a fresh timeout bounds the
-	// compensating write. The 30s floor matches the other detached-ctx budgets in
-	// this package (a2a_proxy_helpers.go enqueue/log paths) rather than a tighter 10s
-	// (#4539 re-review FINDING[4]): a single-row UPDATE is far below either ceiling,
-	// but 30s is a safer floor for the common (non-expired) failure path where the
-	// caller may still have budget, and the ceiling exists only to bound a
-	// pathological hang, not to race a healthy write.
-	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
-	if _, err := db.DB.ExecContext(restoreCtx, `
+	if _, err := db.DB.ExecContext(ctx, `
 		UPDATE approval_requests
 		SET consumed_at = NULL
 		WHERE id = $1 AND workspace_id = $2 AND consumed_at IS NOT NULL

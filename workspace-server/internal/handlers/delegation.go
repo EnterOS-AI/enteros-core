@@ -680,6 +680,18 @@ func buildDelegateA2ABody(delegationID, task string) ([]byte, error) {
 // agent" errors when delegations fired within the warm-up window.
 var delegationRetryDelay = 8 * time.Second
 
+// delegationCleanupBudget is the deadline on the fresh detached context that
+// finalizeNonDispatchedDelegation runs the ENTIRE non-dispatch cleanup under. It
+// is a pathological-HANG ceiling, NOT a tight bound (#4539 convergence review
+// FIX-A): it must stay GENEROUSLY above the normal latency of the handful of
+// cleanup writes, so a slow-but-live DB (a write stalling while the original
+// delegationCtx still had minutes of budget) cannot short-circuit the cleanup
+// mid-way and re-introduce the phantom-'pending' + burned-grant this refactor
+// prevents. 2 minutes is far above any healthy single-row write yet still bounds a
+// genuinely wedged DB so the detached goroutine cannot leak forever. A package var
+// (like delegationRetryDelay) so its value is pinned in one place and guard-tested.
+var delegationCleanupBudget = 2 * time.Minute
+
 // NB: the log.Printf calls below are load-bearing for the integration test
 // surface (delegation_executor_integration_test.go). The test uses a raw TCP
 // mock server; without these calls the compiler inlines executeDelegation and
@@ -909,9 +921,14 @@ handleSuccess:
 // #4539 already detached) succeeded. Detaching the WHOLE cleanup — not just the
 // restore — makes the row reliably reach its terminal state precisely in the
 // expiry mode this cleanup exists to handle. context.WithoutCancel preserves
-// trace/tenant values; a fresh 30s deadline bounds the handful of cleanup writes.
+// trace/tenant values.
+//
+// The deadline (delegationCleanupBudget) is a pathological-HANG ceiling, NOT a
+// tight bound (#4539 convergence review FIX-A) — see that var. The ENTIRE cleanup,
+// restore included, is bounded by this ONE deadline (restore uses this ctx as-is —
+// no second, independent detach; FIX-B).
 func (h *DelegationHandler) finalizeNonDispatchedDelegation(ctx context.Context, sourceID, targetID, delegationID, errMsg, consumedGrantID string) {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), delegationCleanupBudget)
 	defer cancel()
 
 	authority := h.updateDelegationStatus(cleanupCtx, sourceID, delegationID, "failed", errMsg)
