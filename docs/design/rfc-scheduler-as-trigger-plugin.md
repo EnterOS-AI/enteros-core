@@ -185,6 +185,44 @@ Each phase is DONE only when its **Build · Tests/CI · e2e · Cleanup · Docs**
 - **Cleanup:** the delivery is additive — nothing retired here; it is the *precondition* for P4's `workspace_schedules` drop (P4b).
 - **Docs:** this block; `project_scheduler_trigger_plugin_no_default_delivery` memory; the plugin repo README. ⏳ SDK trigger-plugin authoring guide still references the scaffold (task #39).
 
+### P5.1 — Concierge default schedules (self-host) — **MERGED: template #20, core graft #4549; verbs mcp-server #115; plugin-auto-update deploy tail owner-gated**
+
+An *operational* increment on top of P5's delivery: now that a self-host
+workspace boots the scheduler daemon, the **self-host concierge** ships two
+default schedules so a fresh install is useful on day one. This is a *content +
+graft* increment — no new scheduler-engine seam.
+
+- **Content lives in the template, not core.** The two schedules
+  (`daily-activity-report` `0 9 * * *`; `plugin-auto-update` `0 3 * * *`, both
+  UTC/enabled) are a top-level **runtime-native** `schedules:` block in the
+  platform-agent template `config.yaml` (**#20, merged**) — key `cron`, prompt
+  inlined, so they satisfy the runtime schedule contract with no render step.
+  Editing a cron/prompt is a template edit + re-export, **no core redeploy**
+  (`[[feedback_plugin_defaults_live_in_template_not_core]]`).
+- **Self-host-only graft in core (#4549, merged `380e81f9`).**
+  `graftConciergeSchedules` in `composeConciergeRuntimeConfig`
+  (`platform_agent.go`) grafts whatever `schedules:` node the platform-agent
+  template carries onto the composed concierge config — a **generic passthrough**
+  (content never hardcoded in Go), gated `SelfHostPlatformSeedEnabled()`
+  (`MOLECULE_ORG_ID` unset). On SaaS the concierge config stays byte-identical
+  (`grafted=false`). Boot-safe: a round-trip guard ships the config *without*
+  schedules on any failure rather than bricking boot. `renderTemplateSchedulesYAML`
+  is **not** called (the concierge entries are already runtime-native).
+- **Verbs for `plugin-auto-update` (mcp-server #115, merged).**
+  `check_plugin_updates` (`GET /admin/plugin-updates-pending`) +
+  `apply_plugin_update` (`POST /admin/plugin-updates/:id/apply`), management-mode
+  / org-key-authed. `apply_plugin_update` re-pins and restarts the affected
+  workspace — including the concierge's own if it updates a plugin on itself
+  (self-restart caveat). Core/runtime updates are report-only (operator deploy).
+- **Deploy tail (owner-gated).** `daily-activity-report` works once #20 + #4549
+  land and the concierge re-provisions (it uses only `send_message_to_user` +
+  the always-present `/activity` (+ `/mail/summary`) endpoints).
+  `plugin-auto-update` only **functions** once mcp-server (with #115) is
+  published + pin-cascaded + baked into the self-host runtime image — until then
+  its prompt degrades gracefully (reports tooling not installed).
+- **Docs/runbook:** `docs/runbooks/selfhost-concierge-default-schedules.md`;
+  memory `project_selfhost_concierge_default_schedules`.
+
 ### Cross-cutting DoD (every phase)
 - **No double-fire** demonstrated at each cutover point (`NativeSchedulerCheck` gates before any daemon goes live).
 - **No scheduled CI** introduced — `lint_schedule_budget` zero-cron ratchet stays green; exercise via `pull_request` / `push` / `workflow_dispatch`.
