@@ -21,6 +21,7 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -42,6 +43,23 @@ var SchedulerPluginSource = mustNativePluginSource(SchedulerPluginName)
 // schedulerArmTimeout bounds the best-effort reload forward. Short: arming is a
 // fire-and-forget optimization over the reconcile-on-online safety net.
 const schedulerArmTimeout = 8 * time.Second
+
+// declareSchedulerPluginEnv is the DEFAULT-ON kill-switch for the unconditional
+// per-provision scheduler declare (workspace_provision_shared.go). The scheduler
+// is a base per-workspace ability declared on every provision; this flag lets the
+// owner HALT that roll-out in an emergency without a code revert — the symmetric
+// counterpart to declareDefaultNativePluginsEnv, but with the DEFAULT inverted.
+const declareSchedulerPluginEnv = "MOLECULE_DECLARE_SCHEDULER_PLUGIN"
+
+// declareSchedulerPluginEnabled reports whether the unconditional per-provision
+// scheduler declare is active. Default ON (the inverse of
+// declareDefaultNativePluginsEnabled): unset/"" reads as ENABLED, so provisioning
+// is byte-identical to today unless the owner explicitly sets a falsey value
+// ("0"/"false"/"no") to disable it.
+func declareSchedulerPluginEnabled() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(declareSchedulerPluginEnv)))
+	return v != "0" && v != "false" && v != "no"
+}
 
 // ensureSchedulerPluginDeclared records molecule-scheduler in the workspace's
 // declared-plugin set (idempotent upsert). After this, the plugin is installed

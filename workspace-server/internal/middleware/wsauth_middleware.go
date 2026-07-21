@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
@@ -14,6 +15,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/orgtoken"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // abortAuthLookupError is the single response shape for "the auth
@@ -89,6 +91,40 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 			// Check before per-workspace token so an org-key presenter
 			// doesn't hit the narrower ValidateToken failure path.
 			if id, prefix, orgID, err := orgtoken.Validate(ctx, database, tok, orgtoken.AuditLogRequestContextFromGin(c), "", false); err == nil {
+				// #95 hole 2: an org key grants access to every workspace in
+				// ITS OWN org — never a sibling org sharing this multi-org
+				// datastore. Bind an ANCHORED token (org_id populated) to this
+				// workspace's org root and reject a confirmed cross-org
+				// mismatch. Fails CLOSED on a lookup error (matches sameOrg's
+				// tenant-isolation posture — a DB blip denies rather than
+				// leaks). An unanchored (pre-migration/bootstrap, org_id NULL)
+				// token keeps the legacy accept for backward-compat; those
+				// callers are already denied on org-scoped routes by
+				// requireOrgOwnership, bounding their blast radius.
+				//
+				// LIKE-FOR-LIKE (the catastrophic bug this replaces): the org
+				// root resolved from the parent_id chain is a workspaces.id, and
+				// the org's root workspace IS the concierge/platform-agent whose
+				// id the CP derives as DeterministicPlatformAgentID(orgUUID) — so
+				// it is NEVER equal to the raw CP org UUID. But org_api_tokens.org_id
+				// is written in BOTH namespaces across the codebase:
+				//   (a) the org-root WORKSPACE id — the canonical form the FK
+				//       (org_api_tokens.org_id REFERENCES workspaces(id)) and the
+				//       session-backfill / inherited-mint paths use; and
+				//   (b) the raw CP org UUID (MOLECULE_ORG_ID) — what the concierge
+				//       managed-token mint passes (platform_agent.go
+				//       resolveConciergeAdminCredential → orgtoken.Issue).
+				// A plain `wsOrg != orgID` compares a workspace id to the CP org
+				// UUID and is therefore ALWAYS unequal for the concierge token,
+				// 403-ing every anchored org token fleet-wide. Compare in
+				// workspace-id space by also mapping the CP-org-UUID form forward
+				// through the same deterministic derivation the org root is built
+				// from. Both arms are org-root-specific, so no cross-org token is
+				// accepted.
+				if orgID != "" && orgTokenConfirmedCrossOrg(ctx, database, orgID, workspaceID) {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "org token not authorized for this workspace's org"})
+					return
+				}
 				c.Set("org_token_id", id)
 				c.Set("org_token_prefix", prefix)
 				// org_id may be "" for pre-migration tokens (NULL column).
@@ -110,6 +146,21 @@ func WorkspaceAuth(database *sql.DB) gin.HandlerFunc {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace auth token"})
 				return
 			}
+			// #95 hole 3: a per-workspace token authenticates ITSELF. Record the
+			// authenticated identity so handlers that derive a source workspace
+			// (e.g. POST /workspaces/:id/delegate) can assert the URL source against
+			// the TOKEN's real workspace rather than comparing c.Param("id") to
+			// itself — the tautology that closed nothing.
+			//
+			// finding[7]: ValidateToken above already PROVED this token's
+			// workspace_id == workspaceID (it returns ErrInvalidToken on any
+			// mismatch — see wsauth.ValidateToken's expectedWorkspaceID binding), so
+			// the token's own workspace IS workspaceID. A second WorkspaceFromToken()
+			// token-hash SELECT to re-derive the same value would be redundant; set
+			// the validated id directly. Only set for the narrowest-scope credential;
+			// org-token/admin/cp-session are higher-privileged and may legitimately
+			// act on any :id in scope.
+			c.Set("authenticated_workspace_id", workspaceID)
 			c.Set("caller_credential_class", "workspace-token")
 			c.Next()
 			return
@@ -279,6 +330,134 @@ func AdminAuth(database *sql.DB) gin.HandlerFunc {
 		c.Set("caller_credential_class", "admin-token-tier3-fallback")
 		c.Next()
 	}
+}
+
+// workspaceOrgRoot resolves the org root of workspaceID by walking the
+// parent_id chain to the row whose parent_id IS NULL (its own id is the org
+// root). This is the SAME recursive-CTE tenant-scoping primitive the handlers
+// package uses in org_scope.go (sameOrg / orgRootID) and the OFFSEC-015
+// broadcast fix; it is duplicated here (a few lines) only to avoid a
+// middleware→handlers import cycle. Returns ("", nil) when the workspace has no
+// row, and the underlying error on any DB failure so callers can fail closed.
+func workspaceOrgRoot(ctx context.Context, database *sql.DB, workspaceID string) (string, error) {
+	if database == nil || workspaceID == "" {
+		return "", nil
+	}
+	var root sql.NullString
+	err := database.QueryRowContext(ctx, `
+		WITH RECURSIVE org_chain AS (
+			SELECT id, parent_id
+			FROM workspaces
+			WHERE id = $1
+			UNION ALL
+			SELECT w.id, w.parent_id
+			FROM workspaces w
+			JOIN org_chain c ON w.id = c.parent_id
+		)
+		SELECT id FROM org_chain WHERE parent_id IS NULL LIMIT 1
+	`, workspaceID).Scan(&root)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !root.Valid {
+		return "", nil
+	}
+	return root.String, nil
+}
+
+// orgTokenConfirmedCrossOrg reports whether an ANCHORED org token (anchor =
+// org_api_tokens.org_id, non-empty) is CONFIRMED to belong to a DIFFERENT org
+// than workspaceID's — the only condition under which WorkspaceAuth denies it.
+//
+// Availability (finding[0]): WorkspaceAuth is a broad data-route gate, so this
+// must NOT introduce a new fleet-wide 403 cliff on a TRANSIENT datastore error.
+// It returns true ONLY on a CONFIRMED cross-org mismatch; a lookup error or an
+// unresolved org root returns false (fall back to the pre-PR global-org-key
+// acceptance — no worse than today) and logs. The A2A dispatch path fails
+// CLOSED on the same errors instead, because it is the more sensitive
+// canvas-class bypass (see authenticateA2AHTTPCaller).
+//
+// Non-derived roots (finding[2]): the two cheap namespace arms in
+// orgAnchorMatchesRoot (anchor == root, or det(anchor) == root) miss an org
+// root formed with a plain RANDOM id, or an anchor that is a non-root workspace
+// id within the org. Before confirming a mismatch, resolve the anchor to its
+// OWN org root and compare in the same workspace-id namespace. The comparison is
+// pinned to the TARGET's org root, so a genuinely cross-org token can never match.
+//
+// NOTE: this deny predicate is duplicated in spirit by the A2A path's inline
+// bind in authenticateA2AHTTPCaller (handlers pkg). They are NOT dedup'd into a
+// shared helper because middleware must not import handlers (import cycle — see
+// workspaceOrgRoot / deterministicPlatformAgentID below, duplicated for the same
+// reason) AND their availability postures deliberately DIFFER (this one degrades
+// open on a blip; A2A fails closed). Both are kept aligned by construction.
+func orgTokenConfirmedCrossOrg(ctx context.Context, database *sql.DB, anchor, workspaceID string) bool {
+	wsRoot, err := workspaceOrgRoot(ctx, database, workspaceID)
+	if err != nil {
+		log.Printf("wsauth: WorkspaceAuth: org-root lookup error for workspace %q (org %q): %v — allowing (no new denial cliff, finding[0])", workspaceID, anchor, err)
+		return false
+	}
+	if wsRoot == "" {
+		log.Printf("wsauth: WorkspaceAuth: no org root resolved for workspace %q (org %q) — allowing (no confirmed mismatch)", workspaceID, anchor)
+		return false
+	}
+	if orgAnchorMatchesRoot(anchor, wsRoot) {
+		return false // cheap-arm match — same org
+	}
+	// Cheap arms missed — resolve the anchor to its own org root (finding[2]).
+	anchorRoot, anchorErr := workspaceOrgRoot(ctx, database, anchor)
+	if anchorErr != nil {
+		log.Printf("wsauth: WorkspaceAuth: org-anchor resolve error for org %q (workspace %q): %v — allowing (no new denial cliff, finding[0])", anchor, workspaceID, anchorErr)
+		return false
+	}
+	if anchorRoot == "" {
+		// Anchor did not resolve to an org root (anomalous — the FK
+		// org_api_tokens.org_id REFERENCES workspaces(id) guarantees a non-NULL
+		// anchor references a real workspace). Not a CONFIRMED mismatch; per
+		// finding[0] do not introduce a new denial. Log for the operator.
+		log.Printf("wsauth: WorkspaceAuth: org-anchor %q did not resolve to an org root (workspace %q, org root %q) — allowing (no confirmed mismatch)", anchor, workspaceID, wsRoot)
+		return false
+	}
+	if anchorRoot == wsRoot {
+		return false // same org via resolution
+	}
+	// anchorRoot != wsRoot — a resolved, DIFFERENT org root is a real cross-org token.
+	log.Printf("wsauth: WorkspaceAuth: org-token org %q (root %q) not authorized for workspace %q (org root %q) — denying", anchor, anchorRoot, workspaceID, wsRoot)
+	return true
+}
+
+// orgAnchorMatchesRoot reports whether a token's org anchor (org_api_tokens.org_id)
+// identifies the org whose root workspace is wsRoot. org_id is stored in two
+// namespaces across the codebase, so a correct bind must accept BOTH:
+//
+//   - the org-root WORKSPACE id directly (the canonical form: the FK
+//     org_api_tokens.org_id REFERENCES workspaces(id), plus the session-backfill
+//     and inherited-mint paths), or
+//   - the raw CP org UUID (MOLECULE_ORG_ID) the concierge managed-token mint
+//     passes — the org root workspace id is DeterministicPlatformAgentID(orgUUID),
+//     so map the CP-org-UUID form forward and compare in workspace-id space.
+//
+// Both comparisons are pinned to THIS workspace's org root, so a token anchored
+// to a different org can never match.
+func orgAnchorMatchesRoot(orgAnchor, wsRoot string) bool {
+	if orgAnchor == "" || wsRoot == "" {
+		return false
+	}
+	return orgAnchor == wsRoot || deterministicPlatformAgentID(orgAnchor) == wsRoot
+}
+
+// deterministicPlatformAgentID mirrors handlers.DeterministicPlatformAgentID
+// (the SSOT, cross-impl golden-tested against the CP in
+// handlers/platform_agent_ensure_test.go). It reproduces, byte-for-byte, the
+// org-root/platform-agent workspace id the control plane and core derive from an
+// org's CP UUID: an RFC-4122 v5 (SHA-1) UUID over the URL namespace and the
+// "molecule-platform-agent:<orgID>" name. It is duplicated here (a single pure
+// line) only to avoid a middleware→handlers import cycle, exactly as
+// workspaceOrgRoot duplicates the org_scope.go CTE for the same reason.
+func deterministicPlatformAgentID(orgID string) string {
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("molecule-platform-agent:"+orgID)).String()
 }
 
 func cpSessionActor(cookieHeader string) string {
