@@ -813,6 +813,70 @@ func TestIntegration_ExecuteDelegation_DispatchSuccess_KeepsGrantConsumed(t *tes
 	}
 }
 
+// FINDING[5] (end-to-end): a privileged delegation whose target answered 2xx
+// with an EMPTY body is marked FAILED and delivered NOTHING — so, exactly like
+// the proxyErr non-delivery branch, it must RESTORE the consumed single-use
+// grant. Before this fix the 2xx-empty-body failure branch did NOT restore, so a
+// delegation the system itself marks failed permanently BURNED the operator's
+// one approval. Negative control against DispatchSuccess_KeepsGrantConsumed (a
+// DELIVERED 2xx keeps the grant consumed): the two directions diverge only on
+// whether the hand-off actually delivered a body.
+func TestIntegration_ExecuteDelegation_EmptyBodyFailure_RestoresGrant(t *testing.T) {
+	allowLoopbackForTest(t)
+	conn := integrationDB(t)
+	cleanup := setupIntegrationFixtures(t, conn)
+	defer cleanup()
+	t.Setenv("DELEGATION_LEDGER_WRITE", "1")
+
+	grantID, grantCleanup := seedConsumedGrant(t, conn, integrationTestSourceID)
+	defer grantCleanup()
+
+	// 200 + empty body → isDeliveryConfirmedSuccess fails (needs len>0), proxyErr
+	// is nil, so executeDelegation takes the 2xx-empty-body FAILURE branch.
+	agentURL, closeServer := rawHTTPServer(t, 200, "")
+	defer closeServer()
+
+	mr := setupTestRedis(t)
+	defer mr.Close()
+	db.CacheURL(context.Background(), integrationTestTargetID, agentURL)
+
+	prevClient := a2aClient
+	defer func() { a2aClient = prevClient }()
+	a2aClient = newA2AClientForHost(extractHostPort(agentURL))
+
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	a2aBody, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": "1", "method": "message/send",
+		"params": map[string]interface{}{
+			"message": map[string]interface{}{
+				"role":  "user",
+				"parts": []map[string]string{{"type": "text", "text": "do work"}},
+			},
+		},
+	})
+
+	runWithTimeout(t, 30*time.Second, func(ctx context.Context) {
+		dh.executeDelegation(ctx, integrationTestSourceID, integrationTestTargetID, integrationTestDelegationID, a2aBody, grantID)
+	})
+
+	// The delegation failed (empty body) ...
+	status, _, errDet := readDelegationRow(t, conn)
+	if status != "failed" {
+		t.Errorf("delegation status: want failed (empty-body target), got %q", status)
+	}
+	if errDet == "" {
+		t.Error("error_detail should be set on an empty-body failure")
+	}
+	// ... but the grant is RESTORED so a failed, non-delivering hand-off does not
+	// permanently burn the operator's single approval (FINDING[5]).
+	if grantConsumedAt(t, conn, grantID) {
+		t.Error("2xx-empty-body FAILURE must restore the grant (consumed_at → NULL); grant is still consumed")
+	}
+}
+
 // extractHostPort parses "http://127.0.0.1:PORT/" and returns "127.0.0.1:PORT".
 func extractHostPort(rawURL string) string {
 	// Simple parse: strip "http://" prefix and trailing slash.

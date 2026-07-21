@@ -304,8 +304,10 @@ func privilegedDelegationContext(targetID, task string) map[string]interface{} {
 }
 
 // gatePrivilegedDelegation is the choke point the delegation authorize path
-// calls, in POST /delegate, AFTER the idempotency lookup (FINDING[2]) and BEFORE
-// the row insert + detached A2A dispatch. For a privileged caller it requires —
+// calls, in POST /delegate, AFTER the idempotency lookup AND the unique-winning
+// row insert (FINDING[2]/[4]) and BEFORE the detached A2A dispatch — so only the
+// sole owner of the delegation reaches it, and a concurrent idempotent retry
+// replays the winner without ever consuming a grant. For a privileged caller it requires —
 // and atomically CONSUMES (single-use) — a matching approved grant, reusing
 // requireApproval's verify-before-act consumption. Because the verification
 // happens before the act, a consequential handoff cannot proceed without the
@@ -359,8 +361,9 @@ func gatePrivilegedDelegation(c *gin.Context, b events.EventEmitter, sourceID, t
 // (FINDING[3]). gatePrivilegedDelegation consumes the grant synchronously (so
 // the single-use guarantee is atomic and a missing grant can 403 before the
 // 202); but the real A2A hand-off is a detached goroutine that can fail AFTER
-// the 202 — an unreachable target, or a lost idempotency-insert race — so the
-// consumed grant would otherwise be burned on a hand-off that never happened.
+// the 202 — an unreachable/erroring target (proxyErr non-delivery) or a target
+// that answered 2xx with an EMPTY body (FINDING[5]) — so the consumed grant
+// would otherwise be burned on a hand-off that never actually delivered.
 // Restoring it (consumed_at → NULL) makes the consume recoverable, so the
 // operator's single approval survives a transient dispatch failure and the next
 // retry can use it.

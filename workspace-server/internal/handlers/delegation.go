@@ -290,43 +290,64 @@ func (h *DelegationHandler) Delegate(c *gin.Context) {
 		return
 	}
 
-	// #124 — idempotency. If the caller supplies an idempotency_key, return
-	// the existing delegation when (workspace_id, idempotency_key) already
-	// exists and is not in a failed terminal state.
+	// #124 — idempotency (fast path). If the caller supplies an idempotency_key
+	// and an existing non-failed delegation is ALREADY committed, replay it.
 	if hit := lookupIdempotentDelegation(ctx, c, sourceID, body.IdempotencyKey); hit {
-		return
-	}
-
-	// Scoped single-use grant for PRIVILEGED / boundary-crossing delegations
-	// (admin-token / org-token callers). FINDING[2]: this runs AFTER the
-	// idempotency lookup above, so a replay of an already-accepted delegation
-	// replays the original delegation_id WITHOUT requiring or consuming a fresh
-	// grant. FINDING[7]/[8]: the privileged classification + gated decision live
-	// in the approvals SSOT (see delegationRequiresGrant). Routine intra-org
-	// sibling A2A (workspace-token callers) is NOT privileged and passes through
-	// untouched; the whole gate is dormant unless an operator arms
-	// MOLECULE_PRIVILEGED_DELEGATION_GATE. The grant is CONSUMED here (atomic,
-	// single-use, so a 403 fires before any dispatch) and RESTORED below if the
-	// hand-off never actually dispatches (FINDING[3]). Response (403/500) already
-	// written on the reject path.
-	proceed, grantID := gatePrivilegedDelegation(c, h.broadcaster, sourceID, body.TargetID, body.Task)
-	if !proceed {
 		return
 	}
 
 	delegationID := uuid.New().String()
 
+	// Insert the pending row BEFORE the privileged-delegation grant gate so the
+	// DB unique constraint on (workspace_id, idempotency_key) is the SINGLE
+	// arbiter of the idempotent-replay race (FINDING[4]). Two same-key requests
+	// can both slip past the lookup above (each reads before the other writes);
+	// they converge HERE, where exactly ONE wins the insert. Every other request
+	// gets insertHandledByIdempotent and REPLAYS the winner's delegation_id
+	// WITHOUT ever reaching — or consuming — a grant. A legitimate idempotent
+	// retry therefore never 403s and never burns a grant, even under the race.
+	// (Old ordering gated FIRST: the retry consumed the sole single-use grant,
+	// won nothing, and the losing request found no grant → spurious 403.)
+	//
+	// This does NOT weaken single-use enforcement: inserting the tracking row is
+	// not a dispatch. The gate still runs BELOW — for the sole insert winner
+	// only — and consumes the grant before executeDelegation dispatches anything.
 	outcome := insertDelegationRow(ctx, c, sourceID, body, delegationID)
 	if outcome == insertHandledByIdempotent {
-		// A concurrent idempotent request won the unique slot; THIS request will
-		// not dispatch. Return the grant we consumed so it is not burned on a
-		// delegation that never happened (FINDING[3]). No-op when grantID == "".
-		restorePrivilegedDelegationGrant(ctx, sourceID, grantID)
-		return // idempotency-conflict response already written
+		// Losing request: the winner's idempotent-replay response is already
+		// written by insertDelegationRow. No grant was consumed on this path
+		// (the gate runs only below, for the winner), so there is nothing to
+		// restore — the replay simply returns.
+		return
 	}
 	// insertTrackingUnavailable means insert failed for a non-idempotency
-	// reason (logged); we still dispatch the A2A request and surface the
-	// warning in the response.
+	// reason (logged); no durable row exists, but we still gate + dispatch.
+
+	// Scoped single-use grant for PRIVILEGED / boundary-crossing delegations
+	// (admin-token / org-token callers). Runs AFTER the idempotency lookup AND
+	// the unique-winning insert (FINDING[2]/[4]): only the sole owner of this
+	// delegation reaches the gate, and it does so BEFORE any dispatch.
+	// FINDING[7]/[8]: the privileged classification + gated decision live in the
+	// approvals SSOT (see delegationRequiresGrant). Routine intra-org sibling A2A
+	// (workspace-token callers) is NOT privileged and passes through untouched;
+	// the whole gate is dormant unless an operator arms
+	// MOLECULE_PRIVILEGED_DELEGATION_GATE. The grant is CONSUMED here (atomic,
+	// single-use) and RESTORED by executeDelegation if the hand-off never
+	// actually dispatches (FINDING[3]). Response (403/500) already written on the
+	// reject path.
+	proceed, grantID := gatePrivilegedDelegation(c, h.broadcaster, sourceID, body.TargetID, body.Task)
+	if !proceed {
+		// Privileged caller with no consumable grant (403) or a gate error (500)
+		// — response already written, nothing consumed. Roll back the pending
+		// row we just inserted so this REJECTED, never-dispatched delegation
+		// neither holds the (workspace_id, idempotency_key) idempotency slot nor
+		// lingers as a phantom in-flight row for the sweeper/digest. Only when an
+		// insertOK row actually exists (insertTrackingUnavailable wrote nothing).
+		if outcome == insertOK {
+			rollbackUndispatchedDelegation(ctx, sourceID, delegationID)
+		}
+		return
+	}
 
 	// Build A2A payload. Embedding delegation_id in metadata gives the
 	// queue drain path a way to look up the originating delegation row
@@ -528,6 +549,33 @@ func insertDelegationRow(ctx context.Context, c *gin.Context, sourceID string, b
 	return insertTrackingUnavailable
 }
 
+// rollbackUndispatchedDelegation removes the speculative pending activity_logs
+// row for a delegation that was inserted but then REJECTED at the privileged
+// grant gate before any dispatch (FINDING[4]). Because the row is inserted
+// BEFORE the gate (so the DB unique constraint can arbitrate the idempotency
+// race), a gate 403/500 must undo it — otherwise the never-dispatched row would
+// (a) hold the (workspace_id, idempotency_key) slot so a later retry WITH a
+// grant replays a doomed row instead of dispatching, and (b) linger as a
+// phantom in-flight delegation the sweeper/digest counts as awaiting a reply.
+//
+// Bounded to the exact (workspace_id, delegation_id) pending delegate row so it
+// can never touch another delegation. Best-effort: a failure only logs and must
+// never mask the gate's already-written 403/500. (The default-off durable
+// ledger row, when DELEGATION_LEDGER_WRITE is armed, is left to the ledger's own
+// in-flight reconciliation — a benign 'pending' row for a rejected delegation.)
+func rollbackUndispatchedDelegation(ctx context.Context, workspaceID, delegationID string) {
+	if _, err := db.DB.ExecContext(ctx, `
+		DELETE FROM activity_logs
+		 WHERE workspace_id = $1
+		   AND activity_type = 'delegation'
+		   AND method = 'delegate'
+		   AND status = 'pending'
+		   AND response_body->>'delegation_id' = $2
+	`, workspaceID, delegationID); err != nil {
+		log.Printf("rollbackUndispatchedDelegation: failed to remove rejected pending row for ws=%s delegation=%s: %v", workspaceID, delegationID, err)
+	}
+}
+
 // buildDelegateA2ABody constructs the A2A JSON-RPC envelope for a delegation.
 // The returned shape is a schema-valid SendMessageRequest with role="user",
 // messageId, parts, and delegation metadata. Extracted to a pure function so
@@ -687,6 +735,14 @@ func (h *DelegationHandler) executeDelegation(ctx context.Context, sourceID, tar
 		if mayReply(authority) {
 			pushDelegationResultToInbox(ctx, sourceID, targetID, delegationID, "failed", "", errMsg)
 		}
+		// FINDING[5]: this is a FAILED, non-dispatched delegation — the target
+		// returned a 2xx with an EMPTY body, so no work was actually handed off
+		// (the sibling proxyErr non-delivery branch above already restores; this
+		// branch previously did not, permanently burning the grant on a
+		// delegation the system itself marks failed). Restore the consumed
+		// single-use grant so it is not lost on a hand-off that never delivered.
+		// No-op when consumedGrantID == "".
+		restorePrivilegedDelegationGrant(ctx, sourceID, consumedGrantID)
 		return
 	}
 

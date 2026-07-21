@@ -12,6 +12,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -93,6 +94,158 @@ func TestDelegate_PrivilegedIdempotentReplay_ReplaysWithoutConsumingGrant(t *tes
 	// been recorded here as an unmet/extra expectation (and would have 500'd).
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("replay must consume NO grant — unexpected DB activity: %v", err)
+	}
+}
+
+// FINDING[4]: concurrent idempotent-retry race. Two same-idempotency-key
+// requests can both slip past lookupIdempotentDelegation (each reads before the
+// other writes). The gate now runs AFTER the unique-winning insert, so the
+// LOSING request resolves at the insert's unique-constraint conflict and REPLAYS
+// the winner's delegation_id WITHOUT ever reaching — or consuming — a grant. A
+// legit idempotent retry therefore never 403s and never burns a grant, even
+// while armed.
+//
+// Regression proof: the only approval_requests activity that could fire is a
+// consume UPDATE, and NO such expectation is registered. Under the OLD ordering
+// (gate BEFORE insert) an armed privileged retry consumes the sole single-use
+// grant first — a consume UPDATE that mismatches the INSERT expectation and
+// 500s, OR (with a grant already spent by the winner) a hard 403. A green
+// 200-idempotent_hit with zero approval DB touches is only reachable with the
+// gate moved below the insert. Distinct realistic UUIDs on every axis so a
+// collapsed-literal can't mask the winner-id assertion.
+func TestDelegate_PrivilegedConcurrentRetryRace_ReplaysWithoutGrantOr403(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	// Armed gate + admin-token caller = a PRIVILEGED delegation that would need a
+	// grant on a genuinely-fresh dispatch.
+	t.Setenv("MOLECULE_PRIVILEGED_DELEGATION_GATE", "1")
+
+	const (
+		sourceID = "aaaaaaaa-1111-4a11-8a11-aaaaaaaaaaaa"
+		targetID = "bbbbbbbb-2222-4b22-8b22-bbbbbbbbbbbb"
+		winnerID = "cccccccc-3333-4c33-8c33-cccccccccccc"
+		idemKey  = "idem-race-key-xyz"
+	)
+
+	// (1) idempotency lookup MISSES — the concurrent winner has not committed its
+	//     row yet, so this retry believes it is the first.
+	mock.ExpectQuery("SELECT request_body->>'delegation_id', status, target_id").
+		WithArgs(sourceID, idemKey).
+		WillReturnError(fmt.Errorf("sql: no rows in result set"))
+	// (2) THIS request LOSES the unique-constraint race on insert.
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WithArgs(sourceID, sourceID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), sqlmock.AnyArg(), idemKey).
+		WillReturnError(fmt.Errorf("pq: duplicate key value violates unique constraint \"activity_logs_idempotency_uniq\""))
+	// (3) re-query resolves to the committed WINNER — replay path.
+	mock.ExpectQuery("SELECT request_body->>'delegation_id', status").
+		WithArgs(sourceID, idemKey).
+		WillReturnRows(sqlmock.NewRows([]string{"delegation_id", "status"}).
+			AddRow(winnerID, "dispatched"))
+	// DELIBERATELY NO `UPDATE approval_requests SET consumed_at`: the loser must
+	// replay BEFORE the grant gate. A consume here would be an unexpected query.
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: sourceID}}
+	c.Set("caller_is_admin_token", true) // privileged caller
+	body := fmt.Sprintf(`{"target_id":"%s","task":"delete prod","idempotency_key":"%s"}`, targetID, idemKey)
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+sourceID+"/delegate", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	dh.Delegate(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("armed privileged CONCURRENT idempotent retry must REPLAY (200), never 403/500; got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response json: %v", err)
+	}
+	if resp["delegation_id"] != winnerID {
+		t.Errorf("retry must replay the WINNER's delegation_id %s, got %v", winnerID, resp["delegation_id"])
+	}
+	if resp["idempotent_hit"] != true {
+		t.Errorf("want idempotent_hit=true, got %v", resp["idempotent_hit"])
+	}
+	// Proves the loser touched NO grant: an approval consume/create UPDATE would
+	// be an unexpected/extra expectation here (and would have 500'd or 403'd).
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("concurrent retry must consume NO grant and 403 nothing — unexpected DB activity: %v", err)
+	}
+}
+
+// FINDING[4] (negative control / reject direction): a GENUINELY-new privileged
+// delegation with no consumable grant must still be REJECTED (403) — and because
+// the pending row is now inserted BEFORE the gate, the reject path must ROLL IT
+// BACK (bounded DELETE) so the never-dispatched delegation neither holds the
+// idempotency slot nor lingers as a phantom in-flight row. This guards against
+// the reorder accidentally (a) making the gate permissive, or (b) leaking the
+// speculative row on a 403.
+func TestDelegate_PrivilegedNewDelegationNoGrant_Rejected403AndRollsBackRow(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	t.Setenv("MOLECULE_PRIVILEGED_DELEGATION_GATE", "1")
+
+	const (
+		sourceID = "dddddddd-4444-4d44-8d44-dddddddddddd"
+		targetID = "eeeeeeee-5555-4e55-8e55-eeeeeeeeeeee"
+	)
+
+	// No idempotency_key → lookup issues no query; loadWorkspaceCanDelegate's
+	// SELECT is unmatched (errors → proceeds), then the pending INSERT wins.
+	mock.ExpectExec("INSERT INTO activity_logs").
+		WithArgs(sourceID, sourceID, targetID, "Delegating to "+targetID, sqlmock.AnyArg(), sqlmock.AnyArg(), nil).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Gate: requireApproval finds no approved grant (consume UPDATE → ErrNoRows),
+	// creates a pending grant request, broadcasts EventApprovalRequested (one
+	// structure_events INSERT), parent lookup returns NULL → 403.
+	mock.ExpectQuery(`UPDATE approval_requests SET consumed_at`).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`WITH existing AS`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("grant-pending-req-1"))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
+		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
+	// The reject MUST roll back the speculative pending row — bounded to exactly
+	// this (workspace_id, delegation_id) pending delegate row.
+	mock.ExpectExec("DELETE FROM activity_logs").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: sourceID}}
+	c.Set("caller_is_admin_token", true) // privileged caller
+	body := fmt.Sprintf(`{"target_id":"%s","task":"delete prod"}`, targetID)
+	c.Request = httptest.NewRequest("POST", "/workspaces/"+sourceID+"/delegate", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	dh.Delegate(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("armed privileged NEW delegation with no grant must be REJECTED (403), got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response json: %v", err)
+	}
+	if resp["grant_request_id"] != "grant-pending-req-1" {
+		t.Errorf("want grant_request_id=grant-pending-req-1, got %v", resp["grant_request_id"])
+	}
+	// ExpectationsWereMet proves the rollback DELETE actually fired — an
+	// un-rolled-back row would leave the DELETE expectation unmet.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("reject must 403 AND roll back the speculative pending row: %v", err)
 	}
 }
 
