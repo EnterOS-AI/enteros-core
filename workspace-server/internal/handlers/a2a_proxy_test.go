@@ -760,6 +760,11 @@ func TestProxyA2A_OrgTokenSkipsBearerDerive(t *testing.T) {
 	mock.ExpectExec(`UPDATE org_api_tokens SET last_used_at`).
 		WithArgs("org-token-123").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// #95 hole 2: the org token is bound to the target workspace's org root.
+	// ws-target's org root == the token's org_id → authorized.
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
+		WithArgs("ws-target").
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("org-1"))
 	expectBudgetCheck(mock, "ws-target")
 
 	// Activity log INSERT with NULL source_id (canvas-class semantics).
@@ -1302,10 +1307,17 @@ func TestValidateCallerToken_CanvasUser_OrgToken(t *testing.T) {
 	mock.ExpectExec(`UPDATE org_api_tokens SET last_used_at`).
 		WithArgs("orgtok-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// #95 hole 2: org token bound to the target workspace's org root. The
+	// target is c.Param("id") (the workspace whose queue/health is queried);
+	// its org root == the token org_id → authorized.
+	mock.ExpectQuery(`WITH RECURSIVE org_chain`).
+		WithArgs("ws-target-org").
+		WillReturnRows(sqlmock.NewRows([]string{"root_id"}).AddRow("org-1"))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	req := httptest.NewRequest("POST", "/workspaces/x/a2a", bytes.NewBufferString("{}"))
+	c.Params = gin.Params{{Key: "id", Value: "ws-target-org"}}
+	req := httptest.NewRequest("POST", "/workspaces/ws-target-org/a2a", bytes.NewBufferString("{}"))
 	req.Header.Set("Authorization", "Bearer org-token-plaintext-xyz")
 	c.Request = req
 

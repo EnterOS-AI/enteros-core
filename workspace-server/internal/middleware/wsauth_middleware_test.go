@@ -318,6 +318,13 @@ func TestWorkspaceAuth_ValidBearer_Passes(t *testing.T) {
 			if got := c.GetString("caller_credential_class"); got != "workspace-token" {
 				t.Errorf("caller_credential_class = %q, want workspace-token", got)
 			}
+			// finding[7]: authenticated_workspace_id is set directly from the
+			// validated :id (ValidateToken already proved token.workspace_id ==
+			// this :id), with NO redundant second WorkspaceFromToken SELECT — the
+			// mock declares only ONE token SELECT above.
+			if got := c.GetString("authenticated_workspace_id"); got != "ws-enrolled" {
+				t.Errorf("authenticated_workspace_id = %q, want ws-enrolled", got)
+			}
 			c.JSON(http.StatusOK, gin.H{"ok": true})
 		})
 
