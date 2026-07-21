@@ -43,6 +43,15 @@ def _unsafe_raw_response_diagnostics(text: str) -> list[str]:
     return violations
 
 
+def _sanitizer_definition_precedes_calls(text: str) -> bool:
+    definition = text.find("sanitize_http_body() {")
+    calls = [
+        match.start()
+        for match in re.finditer(r"(?:\|\s*|\$\()sanitize_http_body\b", text)
+    ]
+    return definition >= 0 and bool(calls) and definition < min(calls)
+
+
 class SanitizeHttpBodyTests(unittest.TestCase):
     def test_registration_json_redacts_secrets_but_keeps_proof_fields(self) -> None:
         sanitizer = _load_helper()
@@ -100,6 +109,10 @@ class SanitizeHttpBodyTests(unittest.TestCase):
             self.assertIn(
                 expected_call, text, f"{script.name} bypasses shared sanitization"
             )
+            self.assertTrue(
+                _sanitizer_definition_precedes_calls(text),
+                f"{script.name} calls the sanitizer before Bash defines it",
+            )
             self.assertEqual(
                 _unsafe_raw_response_diagnostics(text),
                 [],
@@ -125,6 +138,13 @@ class SanitizeHttpBodyTests(unittest.TestCase):
             ["line 1: REGISTER_RESP"],
         )
         self.assertEqual(_unsafe_raw_response_diagnostics(safe), [])
+
+    def test_sanitizer_definition_order_check_fails_closed(self) -> None:
+        call = 'log "$(printf \'%s\' "$REGISTER_RESP" | sanitize_http_body)"'
+        definition = "sanitize_http_body() { printf '<redacted>'; }"
+
+        self.assertFalse(_sanitizer_definition_precedes_calls(f"{call}\n{definition}"))
+        self.assertTrue(_sanitizer_definition_precedes_calls(f"{definition}\n{call}"))
 
     def test_cli_truncates_only_after_redaction(self) -> None:
         result = subprocess.run(

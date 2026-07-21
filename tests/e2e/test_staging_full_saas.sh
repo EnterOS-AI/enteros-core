@@ -184,6 +184,12 @@ log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
 ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
+# Defined before the first HTTP diagnostic (org creation below). Bash executes
+# top to bottom and does not make a later function definition available early.
+sanitize_http_body() {
+  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/redact_secrets.py" --max-chars 4000 || printf '%s' '<redaction failed>'
+}
+
 # Collision-proof slug construction (core#2782) — runs AFTER log/fail/ok
 # are defined so the assert below can call `fail` on mismatch.
 # Self-check: fail loud at harness startup if a future refactor
@@ -704,10 +710,6 @@ tenant_call() {
     -H "X-Molecule-Org-Id: $ORG_ID" \
     "${TENANT_ROUTE_HDRS[@]}" \
     "$@"
-}
-
-sanitize_http_body() {
-  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/redact_secrets.py" --max-chars 4000 || printf '%s' '<redaction failed>'
 }
 
 # create_workspace_post — `POST /workspaces` with a bounded retry over the
