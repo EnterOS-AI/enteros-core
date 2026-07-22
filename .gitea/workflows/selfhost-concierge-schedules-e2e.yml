@@ -1,0 +1,260 @@
+name: Self-Host Concierge Schedules E2E
+
+# HERMETIC per-PR coverage for the self-host concierge default-schedules graft
+# (core#4555). It boots the platform with MOLECULE_ORG_ID UNSET — the self-host
+# posture that (a) seeds the kind='platform' concierge, (b) wires the LOCAL Docker
+# provisioner, and (c) enables graftConciergeSchedules — then provisions the
+# concierge onto the tiny stub runtime and asserts BOTH default schedules
+# (daily-activity-report + plugin-auto-update) flow through the LIVE
+# graft->deliver->seed->grid loop.
+#
+# THE WHOLE POINT is the MOLECULE_ORG_ID-unset boot: with it set (SaaS) the graft
+# is gated OFF and the schedules never appear, so this lane genuinely exercises the
+# self-host gate rather than a hardcoded seed. See
+# tests/e2e/test_selfhost_concierge_schedules_e2e.sh.
+#
+# Modeled on local-provision-e2e.yml's lifecycle-stub job (same docker-host
+# substrate, Postgres+Redis service containers, molecule-core-net plumbing, and
+# stub->cache-tag image trick). The ONLY behavioural additions are the three
+# self-host schedule signals: MOLECULE_DEFAULT_RUNTIME=claude-code,
+# MOLECULE_LLM_DEFAULT_MODEL=claude-opus-4-7 (a bare anthropic id => BYOK, no CP
+# proxy needed), and CONFIGS_DIR pointing at the template fixtures the e2e writes.
+
+on:
+  push:
+    branches: [main, staging]
+    paths:
+      - 'workspace-server/**'
+      - 'tests/e2e/test_selfhost_concierge_schedules_e2e.sh'
+      - 'tests/e2e/stub-runtime/**'
+      - 'tests/e2e/_lib.sh'
+      - '.gitea/workflows/selfhost-concierge-schedules-e2e.yml'
+  pull_request:
+    branches: [main, staging]
+    paths:
+      - 'workspace-server/**'
+      - 'tests/e2e/test_selfhost_concierge_schedules_e2e.sh'
+      - 'tests/e2e/stub-runtime/**'
+      - 'tests/e2e/_lib.sh'
+      - '.gitea/workflows/selfhost-concierge-schedules-e2e.yml'
+
+concurrency:
+  # Per-SHA grouping (mirrors local-provision-e2e.yml). cancel-in-progress:false so
+  # a queued run for an older SHA isn't cancelled by a newer push.
+  group: selfhost-concierge-schedules-e2e-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+  PLATFORM_BOOT_DEADLINE: 480
+
+jobs:
+  # bp-required: yes  # core/main BP=['*'] requires every posted context (#4363); this is a hard gate (continue-on-error:false)
+  selfhost-schedules:
+    name: Self-Host Concierge Schedules E2E (stub)
+    runs-on: docker-host
+    continue-on-error: false
+    timeout-minutes: 20
+    env:
+      PG_CONTAINER: pg-shsched-${{ github.run_id }}-${{ github.run_attempt }}
+      REDIS_CONTAINER: redis-shsched-${{ github.run_id }}-${{ github.run_attempt }}
+      # Dev posture (same as lifecycle-stub). MOLECULE_ORG_ID is deliberately NEVER
+      # set anywhere in this job — that unset is what enables the self-host seed +
+      # graft the whole lane exists to prove.
+      MOLECULE_ENV: development
+      SECRETS_ENCRYPTION_KEY: shsched-test-encryption-key-32bytes!
+      # act_runner runs the job inside Docker; force platformInDocker=false so the
+      # proxy keeps using the host-mapped 127.0.0.1:<port> URL (reachable), which
+      # the schedules proxy also uses (devModeAllowsLoopback lets isSafeURL pass it).
+      MOLECULE_IN_DOCKER: false
+      # Self-host schedule signals (the only additions over lifecycle-stub):
+      MOLECULE_DEFAULT_RUNTIME: claude-code
+      MOLECULE_LLM_DEFAULT_MODEL: claude-opus-4-7
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+          cache: false
+          cache-dependency-path: workspace-server/go.sum
+
+      - name: Init owned-workspace manifest (run-scoped teardown identity)
+        run: |
+          # The e2e appends the concierge id here; the teardown removes ws-<id> by
+          # EXACT NAME and nothing else (positive identity, #4346 — never enumerate
+          # the shared daemon).
+          : > /tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt
+          echo "owned-workspace manifest initialised (empty)."
+
+      - name: Build e2e-names SSOT CLI
+        working-directory: workspace-server
+        run: go build -o /usr/local/bin/e2e-names ./cmd/e2e-names
+
+      - name: Ensure provisioner network + pre-pull alpine
+        run: |
+          docker pull alpine:3 >/dev/null
+          docker pull alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e >/dev/null
+          docker network create molecule-core-net >/dev/null 2>&1 || true
+          # Connect the act_runner job container to molecule-core-net so workspace
+          # containers can reach the platform (mc#2499).
+          JOB_CID="$(hostname)"
+          echo "JOB_CID=${JOB_CID}" >> "$GITHUB_ENV"
+          if docker network connect molecule-core-net "$JOB_CID" >/dev/null 2>&1; then
+            echo "Connected job container ($JOB_CID) to molecule-core-net."
+          else
+            echo "WARN: could not connect job container to molecule-core-net (fallback to gateway)."
+          fi
+
+      - name: Start Postgres (docker, ephemeral host port)
+        run: |
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$PG_CONTAINER" \
+            -e POSTGRES_USER=dev -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=molecule \
+            -p 127.0.0.1::5432 postgres:16 >/dev/null
+          PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
+          [ -z "$PG_PORT" ] && PG_PORT=$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | awk -F: '{print $NF}')
+          if [ -z "$PG_PORT" ]; then echo "::error::no host port for $PG_CONTAINER"; docker logs "$PG_CONTAINER" || true; exit 1; fi
+          echo "DATABASE_URL=postgres://dev:dev@127.0.0.1:${PG_PORT}/molecule?sslmode=disable" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            docker exec "$PG_CONTAINER" pg_isready -U dev >/dev/null 2>&1 && { echo "pg ready ${i}s"; exit 0; }
+            sleep 1
+          done
+          echo "::error::Postgres not ready in 30s"; docker logs "$PG_CONTAINER" || true; exit 1
+
+      - name: Start Redis (docker, ephemeral host port)
+        run: |
+          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+          docker run -d --name "$REDIS_CONTAINER" -p 127.0.0.1::6379 redis:7 >/dev/null
+          REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | awk -F: '/^(0\.0\.0\.0|127\.0\.0\.1):/ {print $2; exit}')
+          [ -z "$REDIS_PORT" ] && REDIS_PORT=$(docker port "$REDIS_CONTAINER" 6379/tcp | head -1 | awk -F: '{print $NF}')
+          if [ -z "$REDIS_PORT" ]; then echo "::error::no host port for $REDIS_CONTAINER"; docker logs "$REDIS_CONTAINER" || true; exit 1; fi
+          echo "REDIS_URL=redis://127.0.0.1:${REDIS_PORT}" >> "$GITHUB_ENV"
+          for i in $(seq 1 15); do
+            docker exec "$REDIS_CONTAINER" redis-cli ping 2>/dev/null | grep -q PONG && { echo "redis ready ${i}s"; exit 0; }
+            sleep 1
+          done
+          echo "::error::Redis not ready in 15s"; docker logs "$REDIS_CONTAINER" || true; exit 1
+
+      - name: Configure platform env (self-host, local Docker provisioner)
+        run: |
+          PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
+          echo "PORT=${PORT}" >> "$GITHUB_ENV"
+          echo "BASE=http://127.0.0.1:${PORT}" >> "$GITHUB_ENV"
+          docker network inspect molecule-core-net >/dev/null 2>&1 || docker network create molecule-core-net >/dev/null
+          PLATFORM_HOST_IP=$(docker network inspect molecule-core-net 2>/dev/null | sed -n 's/.*"Gateway": "\([^"]*\)".*/\1/p' | head -1)
+          if [ -z "$PLATFORM_HOST_IP" ]; then
+            PLATFORM_HOST_IP=$(docker network inspect bridge 2>/dev/null | sed -n 's/.*"Gateway": "\([^"]*\)".*/\1/p' | head -1)
+          fi
+          if [ -z "$PLATFORM_HOST_IP" ]; then
+            PLATFORM_HOST_IP=$(ip route | awk '/default/ {print $3}' | head -1 || true)
+          fi
+          if [ -z "$PLATFORM_HOST_IP" ]; then
+            echo "::error::Could not determine PLATFORM_HOST_IP for Docker containers to reach the platform"
+            exit 1
+          fi
+          echo "PLATFORM_HOST_IP=${PLATFORM_HOST_IP}"
+          echo "PLATFORM_URL=http://${PLATFORM_HOST_IP}:${PORT}" >> "$GITHUB_ENV"
+          # SSRF allows only "localhost" by name in self-host dev mode; the job
+          # container is host-networked so localhost:<host-port> reaches the
+          # host-mapped workspace port (#2851).
+          echo "MOLECULE_WORKSPACE_ADVERTISE_HOST=localhost" >> "$GITHUB_ENV"
+          T="shsched-admin-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "ADMIN_TOKEN=${T}" >> "$GITHUB_ENV"
+          echo "MOLECULE_ADMIN_TOKEN=${T}" >> "$GITHUB_ENV"
+          echo "MOLECULE_ENV=development" >> "$GITHUB_ENV"
+          echo "SECRETS_ENCRYPTION_KEY=shsched-test-encryption-key-32bytes!" >> "$GITHUB_ENV"
+          # Template root the concierge graft reads from (the e2e writes the
+          # claude-code-default + platform-agent fixtures here). Point the runtime
+          # template cache at a fresh EMPTY dir so it never shadows the fixtures.
+          CFG_DIR="/tmp/shsched-configs-${{ github.run_id }}-${{ github.run_attempt }}"
+          CACHE_DIR="/tmp/shsched-tplcache-${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$CFG_DIR" "$CACHE_DIR"
+          echo "CONFIGS_DIR=${CFG_DIR}" >> "$GITHUB_ENV"
+          echo "TEMPLATE_CACHE_DIR=${CACHE_DIR}" >> "$GITHUB_ENV"
+          echo "E2E_TEMPLATES_DIR=${CFG_DIR}" >> "$GITHUB_ENV"
+
+      - name: Build platform
+        working-directory: workspace-server
+        run: go build -o platform-server ./cmd/server
+
+      - name: Start platform (background)
+        working-directory: workspace-server
+        run: |
+          # MOLECULE_ORG_ID is intentionally UNSET -> self-host seed + local Docker
+          # provisioner + the schedules graft. MOLECULE_DEFAULT_RUNTIME +
+          # MOLECULE_LLM_DEFAULT_MODEL are inherited from the job-level env; the
+          # rest come from $GITHUB_ENV. `timeout` bound == the job timeout so a
+          # hard-cancelled run reaps only OUR child.
+          echo "starting platform PORT=$PORT self-host (MOLECULE_ORG_ID unset) runtime=$MOLECULE_DEFAULT_RUNTIME model=$MOLECULE_LLM_DEFAULT_MODEL configs=$CONFIGS_DIR"
+          PORT=$PORT BIND_ADDR=0.0.0.0 PLATFORM_URL="${PLATFORM_URL:-http://host.docker.internal:$PORT}" \
+            timeout --signal=TERM --kill-after=30s 20m ./platform-server > platform.log 2>&1 &
+          echo $! > platform.pid
+
+      - name: Wait for /health (+ migrations applied)
+        run: |
+          DEADLINE=${PLATFORM_BOOT_DEADLINE:-300}; PID="$(cat workspace-server/platform.pid 2>/dev/null || true)"; start=$(date +%s)
+          while :; do
+            if [ -n "$PID" ] && ! kill -0 "$PID" 2>/dev/null; then
+              echo "::error::platform-server exited early (failed to bind or crashed)"; cat workspace-server/platform.log || true; exit 1
+            fi
+            if curl -sf "$BASE/health" >/dev/null; then
+              tables=$(docker exec "$PG_CONTAINER" psql -U dev -d molecule -tAc \
+                "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='workspaces'" 2>/dev/null || echo 0)
+              [ "$tables" = "1" ] && { echo "healthy + migrated after $(( $(date +%s) - start ))s"; exit 0; }
+            fi
+            [ "$(( $(date +%s) - start ))" -ge "$DEADLINE" ] && { echo "::error::platform not healthy in ${DEADLINE}s"; cat workspace-server/platform.log || true; exit 1; }
+            sleep 1
+          done
+
+      - name: Run self-host concierge schedules E2E (REQUIRED)
+        env:
+          E2E_WS_MANIFEST: /tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt
+        run: bash tests/e2e/test_selfhost_concierge_schedules_e2e.sh
+
+      - name: Dump platform log on failure
+        if: failure()
+        run: cat workspace-server/platform.log || true
+
+      - name: Dump concierge container logs on failure
+        if: failure()
+        run: |
+          MANIFEST="/tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt"
+          [ -s "$MANIFEST" ] || { echo "(no workspace was provisioned by this run)"; exit 0; }
+          while read -r wsid; do
+            [ -n "$wsid" ] || continue
+            name="ws-${wsid}"
+            echo "=== Concierge container logs for $name (OURS) ==="
+            docker logs "$name" 2>&1 | tail -n 80 || echo "(container $name is gone)"
+            echo "=== /configs/config.yaml (OURS) ==="
+            docker exec "$name" cat /configs/config.yaml 2>&1 | tail -n 60 || echo "(cannot read config)"
+          done < "$MANIFEST"
+
+      - name: Stop platform
+        if: always()
+        run: |
+          [ -f workspace-server/platform.pid ] && kill "$(cat workspace-server/platform.pid)" 2>/dev/null || true
+
+      - name: Stop service containers
+        if: always()
+        run: |
+          docker rm -f "$PG_CONTAINER" 2>/dev/null || true
+          docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+
+      - name: Teardown OUR ws-* workspace containers (positive identity, #4346)
+        if: always()
+        run: |
+          # Remove exactly the concierge container this run provisioned, by EXACT
+          # NAME. Never enumerate the shared daemon (a listing filter could select
+          # a concurrent run's container — the #4346 failure).
+          MANIFEST="/tmp/ws_owned_${{ github.run_id }}_${{ github.run_attempt }}.txt"
+          [ -f "$MANIFEST" ] || : > "$MANIFEST"
+          removed=0
+          while read -r wsid; do
+            [ -n "$wsid" ] || continue
+            echo "removing our workspace container: ws-${wsid}"
+            docker rm -f "ws-${wsid}" >/dev/null 2>&1 || true
+            docker volume rm -f "ws-${wsid}-configs" "ws-${wsid}-claude-sessions" "ws-${wsid}-workspace" >/dev/null 2>&1 || true
+            removed=$((removed + 1))
+          done < "$MANIFEST"
+          echo "ws-* teardown removed $removed owned container(s)."
+          rm -f "$MANIFEST" 2>/dev/null || true

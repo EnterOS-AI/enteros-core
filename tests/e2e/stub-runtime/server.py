@@ -60,6 +60,11 @@ import urllib.error
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:
+    import yaml  # PyYAML — same parser the real runtime seeds config.yaml with.
+except Exception:  # pragma: no cover — import guard so a missing dep is diagnosable.
+    yaml = None
+
 PORT = 8000
 
 WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "").strip()
@@ -159,6 +164,83 @@ def materialize_declared_plugins():
             _log(f"materialized declared plugin: {name}")
         except Exception as e:
             _log(f"materialize {name!r} failed (non-fatal): {e}")
+
+
+def _config_schedule_entries():
+    """Read the delivered /configs/config.yaml top-level `schedules:` block and
+    return it as a list of grid entries in the shape core's schedules_proxy
+    expects (volumeEntry: name/cron/timezone/prompt/enabled/source). Returns []
+    when there is no config, no schedules node, or the config can't be parsed.
+
+    WHY: on self-host the platform GRAFTS the platform-agent template's
+    `schedules:` node onto the concierge's composed config.yaml
+    (graftConciergeSchedules, workspace-server platform_agent.go). The REAL
+    runtime's seed_schedules_from_workspace_config then materializes that block
+    into the runtime schedule grid; core reads the grid via
+    GET /workspaces/:id/schedules -> proxy -> GET /internal/schedules. This stub
+    carries no runtime, so it mirrors that seed: parse the config schedules and
+    serve them as the grid. Faithful to the runtime seeder's config path (the
+    `cron` key is passed through as-is — it is already the grid's field name;
+    schedules_proxy.volumeEntry maps `cron`, not core's `cron_expr`)."""
+    cfg = os.path.join(CONFIG_PATH, "config.yaml")
+    if yaml is None:
+        _log("PyYAML unavailable — cannot parse config.yaml schedules")
+        return []
+    try:
+        with open(cfg, "r") as f:
+            doc = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        _log(f"config.yaml parse failed (non-fatal): {e}")
+        return []
+    raw = doc.get("schedules") if isinstance(doc, dict) else None
+    if not isinstance(raw, list):
+        return []
+    entries = []
+    for s in raw:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name", "")).strip()
+        if not name:
+            continue
+        entries.append({
+            "name": name,
+            "cron": str(s.get("cron", "")),
+            "timezone": str(s.get("timezone", "")),
+            "prompt": str(s.get("prompt", "")),
+            "enabled": bool(s.get("enabled", True)),
+            # Config.yaml-seeded schedules are template-origin (schedules.go:102).
+            "source": str(s.get("source", "") or "template"),
+        })
+    return entries
+
+
+def materialize_schedules_from_config():
+    """Boot-materialize the config.yaml `schedules:` block onto
+    /configs/schedules/schedules.yaml — mirroring the real runtime's
+    seed_schedules_from_workspace_config, which writes the grid file the
+    ephemeral SaaS e2e reads via `docker exec cat /configs/schedules/schedules.yaml`
+    (test_staging_full_saas.sh). The live grid served by GET /internal/schedules is
+    read fresh from config.yaml on each request (below); this file write is the
+    on-disk mirror the docker-exec assertion inspects. Best-effort + idempotent."""
+    entries = _config_schedule_entries()
+    if not entries:
+        return
+    try:
+        sched_dir = os.path.join(CONFIG_PATH, "schedules")
+        os.makedirs(sched_dir, exist_ok=True)
+        out = os.path.join(sched_dir, "schedules.yaml")
+        payload = {"schedules": entries}
+        with open(out, "w") as f:
+            if yaml is not None:
+                yaml.safe_dump(payload, f, sort_keys=False, default_flow_style=False)
+            else:
+                json.dump(payload, f)
+        _log(f"materialized {len(entries)} schedule(s) onto {out}: "
+             f"{[e['name'] for e in entries]}")
+    except Exception as e:
+        _log(f"materialize schedules failed (non-fatal): {e}")
 
 
 def read_volume_token():
@@ -302,7 +384,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        # Health: any GET returns 200 so probes see us as alive.
+        # Schedule grid: core's GET /workspaces/:id/schedules proxies to
+        # <wsURL>/internal/schedules (schedules_proxy.forwardScheduleAPI) and
+        # expects 200 {"schedules":[volumeEntry...]}. Serve the config.yaml-seeded
+        # grid (read fresh so a config delivered slightly after boot is still
+        # picked up). The proxy attaches the inbound-secret bearer; the stub does
+        # no LLM work, so it does not re-validate it (same posture as its other
+        # routes) — the e2e only exercises the grid contract, not auth.
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path == "/internal/schedules":
+            self._send(200, {"schedules": _config_schedule_entries()})
+            return
+        # Health: any other GET returns 200 so probes see us as alive.
         self._send(200, {"status": "ok", "stub": True, "workspace_id": WORKSPACE_ID})
 
     def do_POST(self):
@@ -351,6 +444,12 @@ def main():
     # the box (present-at-first-boot) and records-only instead of docker-cp'ing +
     # auto-restarting them mid-lifecycle. Mirrors the real runtime's boot materializer.
     materialize_declared_plugins()
+
+    # Boot-materialize the config.yaml schedules block onto
+    # /configs/schedules/schedules.yaml (the on-disk grid mirror the docker-exec
+    # assertion reads), mirroring the real runtime's config-schedule seeder. The
+    # live GET /internal/schedules grid is served fresh from config.yaml.
+    materialize_schedules_from_config()
 
     # Start the HTTP server FIRST so the platform can reach us the instant we
     # register (avoids a race where the proxy forwards before we're listening).

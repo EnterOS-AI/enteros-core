@@ -42,6 +42,12 @@ FROM --platform=linux/amd64 ${BASE_IMAGE_REGISTRY}/python:3.12-alpine@sha256:aa6
 # needs the dir to exist so a missing-mount never trips it up.
 RUN mkdir -p /configs /workspace
 
+# PyYAML: the stub parses the delivered /configs/config.yaml `schedules:` block
+# (the self-host graft output) to serve the runtime schedule grid, mirroring the
+# real runtime's PyYAML-based seed_schedules_from_workspace_config. A cp312
+# musllinux wheel is published, so this is a wheel install (no compiler needed).
+RUN pip install --no-cache-dir pyyaml==6.0.2
+
 WORKDIR /app
 COPY server.py /app/server.py
 
