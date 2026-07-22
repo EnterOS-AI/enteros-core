@@ -185,7 +185,7 @@ Each phase is DONE only when its **Build · Tests/CI · e2e · Cleanup · Docs**
 - **Cleanup:** the delivery is additive — nothing retired here; it is the *precondition* for P4's `workspace_schedules` drop (P4b).
 - **Docs:** this block; `project_scheduler_trigger_plugin_no_default_delivery` memory; the plugin repo README. ⏳ SDK trigger-plugin authoring guide still references the scaffold (task #39).
 
-### P5.1 — Concierge default schedules (self-host) — **MERGED + DEPLOYED: template #20, core graft #4549, verbs mcp-server #115; published 1.9.6 + fleet-rolled to runtime-0.4.36 (2026-07-21); only the self-host operator's own image redeploy + a live fire→deliver e2e (#4555) remain**
+### P5.1 — Concierge default schedules (self-host) — **DONE (2026-07-22): template #20, core graft #4549, verbs mcp-server #115; published 1.9.6 + fleet-rolled to runtime-0.4.36; self-brick guard #4565; FULL live e2e (10g #4568, apply+self-brick #4569, hermetic self-host graft→grid #4571 — #4555 CLOSED). Only the self-host operator's own image redeploy remains (external).**
 
 An *operational* increment on top of P5's delivery: now that a self-host
 workspace boots the scheduler daemon, the **self-host concierge** ships two
@@ -237,12 +237,24 @@ graft* increment — no new scheduler-engine seam.
   codex#284 / openclaw#259). The one remaining step is **not ours**: a self-host
   *operator* must redeploy onto the 0.4.36 image + re-provision the concierge;
   until then `plugin-auto-update` degrades gracefully (reports tooling missing).
-- **Coverage (honest).** core#4556 is a Go **unit** test pinning both defaults
-  through the graft; runtime#341 is runtime-level **unit** tests (seed / fire-
-  *signal* / deliver) with **stubs** (DELIVER stubs `httpx` — the LLM is never
-  invoked; FIRE writes a poke file the daemon never consumes). These are **not**
-  a live e2e. The live self-host seed→cron-fire→LLM-turn→`send_message_to_user`
-  loop is **not** covered — open as **[#4555]**.
+- **Coverage — FULL, live per-PR (#4555 CLOSED 2026-07-22).** Three layers, each
+  live in CI:
+  - **Fire → deliver (10g, #4568):** ephemeral-CP sub-step — a scheduled prompt
+    calls `send_message_to_user` and the gate asserts the delivery lands (the
+    `a2a_receive`/`notify` `activity_logs` row carrying a run-unique marker) on the
+    real-LLM arm; mock arms skip (never red). Proven live in its own lane.
+  - **Apply + self-brick guard (#4569):** `TestIntegration_*` in the Handlers
+    Postgres lane drive the full `apply_plugin_update` against real schema
+    (re-pin + `status→applied`) and assert the concierge self-restart is **deferred**
+    (#4565) while a non-concierge restarts.
+  - **Self-host graft → grid (hermetic, #4571):** a new lane boots ws-server with
+    `MOLECULE_ORG_ID` **unset** (so `graftConciergeSchedules` genuinely fires) +
+    Postgres + the stub-runtime (extended to materialize the config.yaml `schedules:`
+    block onto the grid + serve `/internal/schedules`), provisions the concierge to
+    online (bare-anthropic BYOK on the LLM-less stub), and asserts both defaults via
+    `docker exec` config.yaml **and** `GET /workspaces/<concierge>/schedules`.
+  (The earlier Go unit test #4556 + runtime unit test #341 remain as the fast
+  compose-level + seed-level checks beneath these live lanes.)
 - **Docs/runbook:** `docs/runbooks/selfhost-concierge-default-schedules.md`;
   memory `project_selfhost_concierge_default_schedules`.
 
