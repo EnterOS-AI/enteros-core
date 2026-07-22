@@ -1,9 +1,23 @@
 # Upstream PR draft: `register_platform_adapter` for hermes-agent plugins
 
-**Status:** Draft — pre-submission review (REWRITTEN 2026-05-02 after deeper research)
+**Status:** RETIRED — full lifecycle complete (2026-07-22)
 **Target repo:** `NousResearch/hermes-agent`
 **Owner:** Molecule AI (hongmingwang@moleculesai.app)
 **Date drafted:** 2026-05-02 (rewrite of earlier draft)
+
+> **Outcome (historical record):** submitted upstream as
+> [NousResearch/hermes-agent#18775](https://github.com/NousResearch/hermes-agent/pull/18775),
+> then **closed as superseded** (2026-05-03) by upstream
+> [#17751](https://github.com/NousResearch/hermes-agent/pull/17751)
+> (merged 2026-04-30: `ctx.register_platform(...)` + open `Platform` enum +
+> `gateway/platform_registry.py`) — a richer version of the same socket.
+> The Molecule A2A plugin (`hermes-platform-molecule-a2a`) has been
+> dual-mode since May, preferring the upstream API. The interim
+> `molecule-ai/hermes-agent` fork that carried this patch series was
+> retired from the hermes template on **2026-07-22**
+> (template-hermes #294: stock `hermes-agent` wheel pinned from PyPI,
+> daily upstream-sync bump bot); the fork repo is archived. Everything
+> below is the pre-#17751 design snapshot, kept for history.
 
 ---
 
