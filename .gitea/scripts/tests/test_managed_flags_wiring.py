@@ -408,6 +408,12 @@ _KNOWN_FLEET_CALLERS = {
     #                   asserting TENANT_FLAGS on it
     "scripts/deploy/tests/test-managed-flags.sh": "the bash test harness; drives the script with its own fixtures",
     "scripts/deploy/redeploy-staging-fleet.sh": "the script itself",
+    "scripts/deploy/probe-enteros-buildinfo.sh": (
+        "MENTION-ONLY (Enter OS Phase 2, internal#1089): the advisory enteros.ai "
+        "edge probe's comments point at the fleet script as the BLOCKING gate and "
+        "mirror its BRAND_PREFIXES / json_git_sha helpers. It never executes the "
+        "fleet script and rolls nothing, so TENANT_FLAGS does not apply."
+    ),
 }
 
 

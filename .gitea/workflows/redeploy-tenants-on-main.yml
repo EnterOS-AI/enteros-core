@@ -146,3 +146,31 @@ jobs:
             echo "- Target tag: \`${TAG}\`"
             echo "- Rolled via the shared SSOT swap script (daemon-side health gate)."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Enter OS rebrand Phase 2 (internal#1089): ADVISORY dual-domain arm ──
+      # The BLOCKING gate is unchanged and just ran above: the shared swap
+      # script health-gates every rolled tenant's /buildinfo DAEMON-SIDE — the
+      # service behind <slug>.moleculesai.app. This step ADDS a second,
+      # NON-blocking probe of the SAME tenants through the NEW brand edge
+      # (https://<slug>.enteros.ai/buildinfo, runner-side through DNS + CF +
+      # tunnel ingress), measuring enteros.ai routing readiness that the
+      # daemon-side gate cannot see. Until ops seeds the enteros.ai tenant
+      # DNS/ingress this WARNS on every roll — that is the readiness signal,
+      # not noise; the ::warning:: names exactly what to check.
+      #
+      # FLIP-TO-BLOCKING CONDITION: once ops seeds enteros.ai tenant routing
+      # AND this step has soaked green across consecutive prod rolls, delete
+      # the continue-on-error line below (and wire EXPECTED_BUILD_SHA from the
+      # image's OCI revision label) so BOTH domains gate the deploy. The probe
+      # script already fails closed, so the flip is only removing the mask.
+      - name: Probe enteros.ai tenant buildinfo (advisory Phase-2 arm)
+        if: ${{ steps.guard.outputs.skip == '0' }}
+        # internal#1089 — Enter OS Phase 2: advisory until enteros.ai tenant
+        # routing is ops-seeded + soak-green (flip condition in the comment above).
+        continue-on-error: true
+        env:
+          ENTEROS_TENANT_DOMAIN: ${{ vars.ENTEROS_TENANT_DOMAIN || 'enteros.ai' }}
+        run: |
+          set -euo pipefail
+          bash scripts/deploy/probe-enteros-buildinfo.sh \
+            --cp-env production --domain "$ENTEROS_TENANT_DOMAIN"
