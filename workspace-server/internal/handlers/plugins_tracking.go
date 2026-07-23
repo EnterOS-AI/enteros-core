@@ -367,8 +367,25 @@ func desiredPluginSources(ctx context.Context, workspaceID string) ([]string, er
 	}
 	sort.Strings(names)
 	out := make([]string, 0, len(names))
+	// Cross-NAME source dedup (2026-07-23 boot-install regression): one
+	// plugin can be tracked under TWO names — the scheduler is declared as
+	// "molecule-scheduler" (SchedulerPluginName) but recorded by the
+	// post-install reconcile under its repo-derived name
+	// ("molecule-ai-plugin-scheduler"). Name-keyed dedup keeps both, the
+	// env lists the identical source twice, and the template's boot-install
+	// destination-conflict gate fails BOTH copies ("duplicate install
+	// destination") — installed=0, and a fresh volume boots with no plugins
+	// at all. Identical sources are always redundant regardless of name;
+	// same-destination-different-ref pairs still pass through so the
+	// template gate can flag the genuine ambiguity.
+	seenSrc := make(map[string]struct{}, len(names))
 	for _, n := range names {
-		out = append(out, byName[n])
+		src := byName[n]
+		if _, dup := seenSrc[src]; dup {
+			continue
+		}
+		seenSrc[src] = struct{}{}
+		out = append(out, src)
 	}
 	return out, nil
 }
