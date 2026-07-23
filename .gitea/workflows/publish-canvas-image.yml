@@ -155,22 +155,18 @@ jobs:
           fi
           echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
 
-      - name: Fetch registry token from Infisical SSOT
-        env:
-          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
-          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
-          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
-        run: |
-          set -euo pipefail
-          REG_TOKEN="$(python3 .gitea/scripts/infisical-read-secret.py \
-            MOLECULE_REGISTRY_TOKEN /shared/dev-utils prod)"
-          echo "::add-mask::$REG_TOKEN"
-          echo "REG_TOKEN=$REG_TOKEN" >> "$GITHUB_ENV"
-
+      # Registry credential: MOLECULE_REGISTRY_TOKEN is read from the Gitea org
+      # Actions secret — the SAME canonical source the tenant publisher
+      # (publish-workspace-server-image.yml) uses. The former Infisical
+      # /shared/dev-utils copy was retired (reads 404) and broke this workflow
+      # (core#4584); per the reconcile rule the straggler consumer aligns to the
+      # canonical source. The token is provided per-step below; the publish step
+      # hard-fails if the secret is unset.
       - name: Reuse existing immutable Canvas candidate when present
         id: existing_candidate
         env:
           REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           candidate="${IMAGE_NAME}:staging-${GITHUB_SHA}"
@@ -184,6 +180,7 @@ jobs:
               echo "::notice::$candidate is absent; first publication will build it"
               ;;
             0)
+              echo "::add-mask::$REG_TOKEN"
               printf '%s' "$REG_TOKEN" | docker login "${IMAGE_NAME%%/*}" \
                 --username "$REG_USER" --password-stdin >/dev/null
               ref="${IMAGE_NAME}@${digest}"
@@ -280,6 +277,7 @@ jobs:
           STAGING_SHA_TAG: ${{ steps.tags.outputs.staging_sha }}
           UPLOAD_TAG: upload-canvas
           REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
           AUTO_SYNC_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
           PUSHER_REF: ${{ env.OPERATOR_CONFIG_PUSHER_SHA }}
           PUSHER_SHA256: ${{ env.OPERATOR_CONFIG_PUSHER_SHA256 }}
@@ -351,6 +349,7 @@ jobs:
           SHA_TAG: sha-${{ steps.tags.outputs.sha }}
           EXPECTED_SHA: ${{ github.sha }}
           REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           # A repository-variable drift must fail before docker login could send
