@@ -19,6 +19,35 @@ export type ResolvedTheme = "light" | "dark";
 
 export const THEME_COOKIE = "mol_theme";
 
+/**
+ * Brand apex cookie domains (Enter OS rebrand, internal#1089 Phase 2).
+ *
+ * The SAME canvas build is served under BOTH brand generations' tenant fqdns
+ * (`<slug>.moleculesai.app` alias-forever, `<slug>.enteros.ai` additive), so
+ * the theme cookie's `Domain=` cannot be a single baked literal — it must be
+ * derived from the RUNTIME hostname against this list. Mirrors the SDK
+ * ResourcePrefix / LegacyResourcePrefixes shape: the legacy entry stays
+ * forever; matchers derive from this ONE list, never a scattered literal.
+ *
+ * Leading dots are deliberate — the match requires a SUBDOMAIN of the apex
+ * (same behavior the old `endsWith(".moleculesai.app")` literal had).
+ */
+export const BrandCookieDomains = [".moleculesai.app", ".enteros.ai"] as const;
+
+/**
+ * brandCookieDomain returns the brand apex `Domain=` value the given hostname
+ * belongs to, or null when the host is on neither brand domain (localhost,
+ * previews, self-hosted) — callers then write a host-only cookie, exactly as
+ * before. Pure; case-insensitive on the hostname.
+ */
+export function brandCookieDomain(hostname: string): string | null {
+  const host = hostname.toLowerCase();
+  for (const domain of BrandCookieDomains) {
+    if (host.endsWith(domain)) return domain;
+  }
+  return null;
+}
+
 export function readThemeCookie(value: string | undefined): ThemePreference {
   if (value === "light" || value === "dark" || value === "system") {
     return value;

@@ -497,3 +497,36 @@ jobs:
             echo "Re-pointed \`${TENANT_IMAGE}:latest\` -> \`${SHA_TAG}\` for commit \`${GITHUB_SHA::7}\` (registry manifest)."
             echo "No post-promotion tenant redeploy is guaranteed by this workflow; verify the served digest separately for every target provider."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Enter OS rebrand Phase 2 (internal#1089): ADVISORY dual-domain arm ──
+      # This publish workflow has no per-tenant fqdn context (the blocking
+      # <slug>.moleculesai.app-service /buildinfo identity gate runs daemon-side
+      # in the redeploy workflows' shared swap script). The enteros.ai
+      # equivalent HERE is an ops-seeded CANARY fqdn: after the :latest
+      # promote, probe https://<canary>/buildinfo through the NEW brand edge
+      # to measure enteros.ai routing readiness. DARK by default — until ops
+      # seeds the ENTEROS_BUILDINFO_CANARY_FQDN repo var (e.g. a concierge
+      # tenant's <slug>.enteros.ai) this step notices-and-exits 0, changing
+      # nothing. Once seeded it WARNS loudly on failure; the ::warning:: names
+      # exactly what to check.
+      #
+      # FLIP-TO-BLOCKING CONDITION: once ops seeds enteros.ai tenant routing +
+      # the canary var AND this arm has soaked green across consecutive
+      # promotes, delete the continue-on-error line below (and wire
+      # EXPECTED_BUILD_SHA) so the enteros edge gates the promote too. The
+      # probe script already fails closed; the flip is only removing the mask.
+      - name: Probe enteros.ai canary buildinfo (advisory Phase-2 arm)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        # internal#1089 — Enter OS Phase 2: advisory until enteros.ai routing +
+        # canary var are ops-seeded + soak-green (flip condition above).
+        continue-on-error: true
+        env:
+          ENTEROS_BUILDINFO_CANARY_FQDN: ${{ vars.ENTEROS_BUILDINFO_CANARY_FQDN || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ENTEROS_BUILDINFO_CANARY_FQDN}" ]; then
+            echo "::notice::enteros.ai canary buildinfo probe is DARK — repo var ENTEROS_BUILDINFO_CANARY_FQDN is unset (internal#1089 Phase 2: ops seeds it with a tenant fqdn on enteros.ai to arm this advisory probe)."
+            exit 0
+          fi
+          bash scripts/deploy/probe-enteros-buildinfo.sh \
+            --fqdn "$ENTEROS_BUILDINFO_CANARY_FQDN"
