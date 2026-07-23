@@ -63,7 +63,7 @@ export default function PricingPage() {
 
       <footer className="mx-auto mt-20 max-w-5xl border-t border-line px-6 py-6 text-center text-sm text-ink-mid">
         <p>
-          © {new Date().getFullYear()} Enter OS, Inc. ·{" "}
+          © 2026 Enter OS ·{" "}
           <a href="/legal/terms" className="hover:text-ink-mid">
             Terms
           </a>

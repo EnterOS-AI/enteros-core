@@ -23,6 +23,7 @@ SAMPLE_CANVAS_CSS = """
   --color-ink-soft: #888888;
   --color-accent: #0066cc;
   --color-accent-strong: #0055aa;
+  --color-accent-wash: #bdbbff;
   --color-warm: #ff9900;
   --color-good: #0c8a52;
   --color-bad: #c2403c;
@@ -40,6 +41,7 @@ SAMPLE_CANVAS_CSS = """
   --color-ink-soft: #777777;
   --color-accent: #4d9fff;
   --color-accent-strong: #66adff;
+  --color-accent-wash: #2b2b66;
   --color-warm: #ffaa33;
   --color-good: #2a6e44;
   --color-bad: #b0463f;
