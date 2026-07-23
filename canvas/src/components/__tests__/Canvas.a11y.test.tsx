@@ -136,7 +136,7 @@ describe("Canvas — accessibility landmarks", () => {
     render(<Canvas />);
     const flow = document.querySelector('[data-testid="react-flow"]');
     expect(flow?.getAttribute("aria-label")).toBe(
-      "Molecule AI workspace canvas"
+      "Enter OS workspace canvas"
     );
   });
 

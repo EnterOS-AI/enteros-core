@@ -396,7 +396,7 @@ describe("humanizeSetupError (§8 mapping)", () => {
       { code: WORKSPACE_ERROR_CODES.MissingPlatformProxy },
       ctx,
     );
-    expect(view.copy).toContain("Molecule's hosted proxy");
+    expect(view.copy).toContain("Enter OS hosted proxy");
     expect(view.returnToKeyStep).toBe(false);
   });
 

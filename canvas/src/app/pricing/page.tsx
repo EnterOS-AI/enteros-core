@@ -12,7 +12,7 @@ import { PricingTable } from "@/components/PricingTable";
  * from landing → pricing → in-app experience stays cohesive.
  */
 export const metadata = {
-  title: "Pricing — Molecule AI",
+  title: "Pricing — Enter OS",
   description:
     "Flat-rate team and org pricing — no per-seat fees. Free to start, $29/month for teams, $99/month for production orgs. Full runtime stack included on every paid tier.",
 };
@@ -63,7 +63,7 @@ export default function PricingPage() {
 
       <footer className="mx-auto mt-20 max-w-5xl border-t border-line px-6 py-6 text-center text-sm text-ink-mid">
         <p>
-          © {new Date().getFullYear()} Molecule AI, Inc. ·{" "}
+          © {new Date().getFullYear()} Enter OS, Inc. ·{" "}
           <a href="/legal/terms" className="hover:text-ink-mid">
             Terms
           </a>

@@ -95,7 +95,7 @@ export function EmptyState() {
         </div>
 
         <p className="text-[10px] font-semibold uppercase tracking-[0.28em] text-sky-400/80 mb-2">
-          Welcome to Molecule AI
+          Welcome to Enter OS
         </p>
         <h2 className="text-xl font-semibold text-ink mb-1">
           Deploy your first agent

@@ -251,8 +251,8 @@ export function Toolbar() {
     >
       {/* Logo / Title — title text drops on mobile to reclaim space */}
       <div className="flex items-center gap-2 sm:pr-3 sm:border-r sm:border-line/60">
-        <img src="/molecule-icon.png" alt="Molecule AI" className="w-5 h-5" />
-        <span className="hidden sm:inline text-[11px] font-semibold text-ink-mid tracking-wide">Molecule AI</span>
+        <img src="/molecule-icon.png" alt="Enter OS" className="w-5 h-5" />
+        <span className="hidden sm:inline text-[11px] font-semibold text-ink-mid tracking-wide">Enter OS</span>
       </div>
 
       {/* Status pills + workspace total in one segment — previously two
