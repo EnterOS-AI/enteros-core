@@ -13,8 +13,11 @@ package handlers
 // intact"): installed=0, and a FRESH volume boots with no plugins at all.
 //
 // Property 1: identical sources under different names collapse to one.
-// Property 2 (negative control): same destination but DIFFERENT refs both
-// survive — that is a genuine ambiguity the template gate must still see.
+// Property 2: DIFFERENT refs for the same destination resolve via
+// installed-wins (review wf_7cb5003d finding #1: emitting both let the
+// template's duplicate-destination gate reject BOTH after a routine
+// user re-pin — a plugin-less boot one ref-bump away).
+// Property 3 (negative control): genuinely distinct plugins both survive.
 
 import (
 	"context"
@@ -59,7 +62,7 @@ func TestDesiredPluginSources_IdenticalSourceAcrossNames_Collapses(t *testing.T)
 	}
 }
 
-func TestDesiredPluginSources_DifferentRefsSameDest_BothSurvive(t *testing.T) {
+func TestDesiredPluginSources_InstalledRefWinsAcrossAliasedNames(t *testing.T) {
 	mockDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -84,8 +87,42 @@ func TestDesiredPluginSources_DifferentRefsSameDest_BothSurvive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("desiredPluginSources: %v", err)
 	}
+	want := "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.3.0"
+	if len(srcs) != 1 || srcs[0] != want {
+		t.Fatalf("same destination under aliased names must resolve installed-wins (%s); got %v", want, srcs)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestDesiredPluginSources_DistinctPluginsBothSurvive(t *testing.T) {
+	mockDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer mockDB.Close()
+	orig := db.DB
+	db.DB = mockDB
+	defer func() { db.DB = orig }()
+
+	const wsID = "ws-distinct"
+
+	mock.ExpectQuery(`FROM workspace_declared_plugins`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"plugin_name", "source_raw"}).
+			AddRow("molecule-scheduler", "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0"))
+	mock.ExpectQuery(`FROM workspace_plugins`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"plugin_name", "source_raw"}).
+			AddRow("lark-channel", "gitea://molecule-ai/lark-channel-molecule#main"))
+
+	srcs, err := desiredPluginSources(context.Background(), wsID)
+	if err != nil {
+		t.Fatalf("desiredPluginSources: %v", err)
+	}
 	if len(srcs) != 2 {
-		t.Fatalf("same dest with DIFFERENT refs must both survive (template gate flags the ambiguity); got %v", srcs)
+		t.Fatalf("distinct plugins must both survive; got %v", srcs)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sqlmock expectations: %v", err)

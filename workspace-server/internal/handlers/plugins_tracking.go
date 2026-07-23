@@ -18,6 +18,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 )
 
 // trackedRefValues is the closed set of bare-string values the
@@ -346,46 +347,49 @@ func desiredPluginSources(ctx context.Context, workspaceID string) ([]string, er
 	if err != nil {
 		return nil, fmt.Errorf("desiredPluginSources: installed: %w", err)
 	}
-	// byName: declared first (seed), then installed overrides on collision.
-	byName := make(map[string]string, len(declared)+len(installed))
-	names := make([]string, 0, len(declared)+len(installed))
+	// Key the union by INSTALL DESTINATION — the repo-derived name from the
+	// source (plugins.PluginNameFromSource) — NOT by the tracking row's
+	// plugin_name. One plugin can be tracked under TWO names: the scheduler
+	// is DECLARED as "molecule-scheduler" (SchedulerPluginName) but the
+	// post-install reconcile records it in workspace_plugins under its
+	// repo-derived name ("molecule-ai-plugin-scheduler"). With name-keyed
+	// dedup, installed-wins never applied across that alias: after a mere
+	// ref divergence (user re-pin to v0.3.0 while the declaration stays at
+	// v0.2.0) BOTH sources landed in MOLECULE_DECLARED_PLUGINS and the
+	// template's boot-install destination-conflict gate failed BOTH copies
+	// ("duplicate install destination") — installed=0, a fresh volume boots
+	// with no plugins at all (2026-07-23 concierge regression + review
+	// wf_7cb5003d finding #1). Destination-keying is exactly the template
+	// gate's own collision key, so installed-wins now resolves every alias
+	// pair the gate would otherwise reject, identical duplicates collapse
+	// as a side effect, and genuinely distinct plugins are untouched.
+	// Unparseable sources fall back to the row's plugin_name — never drop.
+	byDest := make(map[string]string, len(declared)+len(installed))
+	dests := make([]string, 0, len(declared)+len(installed))
 	add := func(p DeclaredPlugin) {
 		src := strings.TrimSpace(p.SourceRaw)
 		if p.PluginName == "" || src == "" {
 			return
 		}
-		if _, seen := byName[p.PluginName]; !seen {
-			names = append(names, p.PluginName)
+		dest, derr := plugins.PluginNameFromSource(src)
+		if derr != nil || dest == "" {
+			dest = p.PluginName
 		}
-		byName[p.PluginName] = src
+		if _, seen := byDest[dest]; !seen {
+			dests = append(dests, dest)
+		}
+		byDest[dest] = src
 	}
 	for _, d := range declared {
 		add(d)
 	}
 	for _, i := range installed {
-		add(i) // installed source wins on collision
+		add(i) // installed source wins on destination collision
 	}
-	sort.Strings(names)
-	out := make([]string, 0, len(names))
-	// Cross-NAME source dedup (2026-07-23 boot-install regression): one
-	// plugin can be tracked under TWO names — the scheduler is declared as
-	// "molecule-scheduler" (SchedulerPluginName) but recorded by the
-	// post-install reconcile under its repo-derived name
-	// ("molecule-ai-plugin-scheduler"). Name-keyed dedup keeps both, the
-	// env lists the identical source twice, and the template's boot-install
-	// destination-conflict gate fails BOTH copies ("duplicate install
-	// destination") — installed=0, and a fresh volume boots with no plugins
-	// at all. Identical sources are always redundant regardless of name;
-	// same-destination-different-ref pairs still pass through so the
-	// template gate can flag the genuine ambiguity.
-	seenSrc := make(map[string]struct{}, len(names))
-	for _, n := range names {
-		src := byName[n]
-		if _, dup := seenSrc[src]; dup {
-			continue
-		}
-		seenSrc[src] = struct{}{}
-		out = append(out, src)
+	sort.Strings(dests)
+	out := make([]string, 0, len(dests))
+	for _, dst := range dests {
+		out = append(out, byDest[dst])
 	}
 	return out, nil
 }
