@@ -254,7 +254,7 @@ describe("Toolbar — help popover dialog ARIA", () => {
 describe("Toolbar — aria-hidden on decorative elements", () => {
   it("logo image has alt=text (product name)", () => {
     render(<Toolbar />);
-    const logo = document.querySelector("img[alt='Molecule AI']") as HTMLImageElement;
+    const logo = document.querySelector("img[alt='Enter OS']") as HTMLImageElement;
     expect(logo).not.toBeNull();
   });
 

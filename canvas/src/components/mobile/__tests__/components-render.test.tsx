@@ -79,9 +79,9 @@ describe("RemoteBadge", () => {
 // ─── WorkspacePill ────────────────────────────────────────────────────────────
 
 describe("WorkspacePill", () => {
-  it("renders the Molecule AI brand text", () => {
+  it("renders the Enter OS brand text", () => {
     const { container } = renderWithProvider(<WorkspacePill dark={false} count={3} />);
-    expect(container.textContent).toContain("Molecule AI");
+    expect(container.textContent).toContain("Enter OS");
   });
 
   it("renders the count value", () => {
@@ -110,9 +110,9 @@ describe("WorkspacePill", () => {
     expect(container.textContent).toContain("LIVE");
   });
 
-  it("renders the brand initial M in the logo badge", () => {
+  it("renders the brand initial E in the logo badge", () => {
     const { container } = renderWithProvider(<WorkspacePill dark={false} count={1} />);
-    expect(container.textContent).toContain("M");
+    expect(container.textContent).toContain("E");
   });
 
   it("has an inline borderRadius style (pill shape)", () => {

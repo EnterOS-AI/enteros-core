@@ -425,7 +425,7 @@ test.describe("staging canvas tabs", () => {
     // Wait for the React Flow canvas to mount, then poll for the
     // workspace-node count (RFs layout pass takes a tick after the
     // nav click) before drilling down to the specific workspace.
-    await expect(page.locator('[aria-label="Molecule AI workspace canvas"]')).toBeVisible({
+    await expect(page.locator('[aria-label="Enter OS workspace canvas"]')).toBeVisible({
       timeout: 15_000,
     });
     await expect

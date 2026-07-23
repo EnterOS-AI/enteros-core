@@ -302,7 +302,7 @@ test.describe("concierge shell + nav", () => {
 
     // Topbar org name is dynamic from GET /org/identity. The endpoint returns
     // MOLECULE_ORG_NAME (may be "" on a staging tenant), in which case the
-    // shell falls back to "Molecule AI". Either way it must render a
+    // shell falls back to "Enter OS". Either way it must render a
     // non-empty name — assert the element resolves to real text.
     const orgName = page.getByTestId("topbar-org-name");
     await expect(orgName).toBeVisible();
@@ -431,7 +431,7 @@ test.describe("concierge Org map", () => {
     await navTo(page, "map");
 
     // The React Flow canvas renders.
-    await expect(page.locator('[aria-label="Molecule AI workspace canvas"]')).toBeVisible({
+    await expect(page.locator('[aria-label="Enter OS workspace canvas"]')).toBeVisible({
       timeout: 15_000,
     });
 
@@ -682,7 +682,7 @@ test.describe("concierge Org map toolbar", () => {
     const { tenantURL } = tenantEnv();
     await loadConcierge(page, tenantURL);
     await navTo(page, "map");
-    await expect(page.locator('[aria-label="Molecule AI workspace canvas"]')).toBeVisible({
+    await expect(page.locator('[aria-label="Enter OS workspace canvas"]')).toBeVisible({
       timeout: 15_000,
     });
 

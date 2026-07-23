@@ -321,7 +321,7 @@ function CanvasInner() {
           minZoom={0.1}
           maxZoom={2}
           proOptions={{ hideAttribution: true }}
-          aria-label="Molecule AI workspace canvas"
+          aria-label="Enter OS workspace canvas"
         >
           <Background
             variant={BackgroundVariant.Dots}
