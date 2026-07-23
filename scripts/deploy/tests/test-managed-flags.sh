@@ -42,7 +42,18 @@ case "${1:-}" in
   info|pull) exit 0 ;;
   image)  [ "${2:-}" = "inspect" ] && exit 0 ;;
   ps)     printf 'mol-tenant-canary\n'; exit 0 ;;
-  volume) [ "${2:-}" = "ls" ] && exit 0 ;;
+  volume)
+    # Mixed-generation rtstate fixture (Enter OS rebrand, internal#1089): one
+    # LEGACY mol-* volume, one enteros-* volume, one non-rtstate distractor.
+    # LITERAL strings on purpose — never derived from the script's prefix list —
+    # so a script that goes blind to either generation (or over-matches) is
+    # caught by the count assertion in test 7 below.
+    if [ "${2:-}" = "ls" ]; then
+      printf 'mol-ws-rtstate-11111111\n'
+      printf 'enteros-ws-rtstate-22222222\n'
+      printf 'totally-unrelated-volume\n'
+    fi
+    exit 0 ;;
   port)   printf '127.0.0.1:39001\n'; exit 0 ;;
   rename|stop|rm|start) exit 0 ;;
   inspect)
@@ -193,4 +204,24 @@ grep -q 'TENANT_FLAGS is not set' <<<"$out" \
 #    while one of them is silently unwired. That mutation was demonstrated. This
 #    script keeps the behavioural assertions; the wiring assertions are next door.)
 
-echo "ok: managed tenant flags are reversible, exact, idempotent, fail-closed, and wired at every call site"
+# 7. DUAL-PREFIX rtstate recognition (Enter OS rebrand, internal#1089).
+#    The session-preservation guard must see BOTH brand generations of rtstate
+#    volume names. The fake `docker volume ls` above lists exactly one LEGACY
+#    mol-ws-rtstate-* volume, one enteros-ws-rtstate-* volume and one unrelated
+#    volume, so the ONLY correct count is 2:
+#      * a mol-only matcher counts 1  -> the flip would blind the guard to the
+#        whole new-prefix fleet (silent, hollow session-preservation pass);
+#      * an enteros-only matcher counts 1 -> blind to every EXISTING session;
+#      * an over-broad matcher counts 3 -> guards volumes it must not own.
+out="$(PATH="$tmp/bin:$PATH" \
+        TENANT_FLAGS="" \
+        TENANT_IMAGE="registry.example/molecule-tenant" \
+        STAGING_CANVAS_APP_CONTAINER="" \
+        HEALTH_GATE_ATTEMPTS=1 HEALTH_GATE_SLEEP_SECS=0 \
+        bash "$script" --tag staging-deadbee 2>&1 || true)"
+grep -Fq 'session (rtstate) volumes present before roll: 2' <<<"$out" \
+  || fail "rtstate snapshot did not count exactly the 2 branded volumes (mol-* + enteros-*) — a single-prefix or over-broad matcher regressed the guard"
+grep -Fq 'session-preservation OK: all 2 rtstate volume(s) intact after roll' <<<"$out" \
+  || fail "session-preservation verdict did not cover both brand generations of rtstate volumes"
+
+echo "ok: managed tenant flags are reversible, exact, idempotent, fail-closed, and wired at every call site; rtstate guard sees both brand prefixes"
