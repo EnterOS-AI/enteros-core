@@ -22,13 +22,21 @@ package handlers
 // platform self-turns converge on the same id, which is the actual
 // continuity guarantee.
 //
-// The three properties this pins:
+// The two properties this pins:
 //   1. CONVERGENCE — all three surfaces produce identical contextId.
 //   2. RESTART-INVARIANCE — the id is a pure function of the workspace id, so
 //      repeated builds (successive restarts) never drift it.
-//   3. NEW-SESSION CARVE-OUT — a canvas turn carrying an explicit rotated
-//      contextId is preserved untouched, so the ONLY way to leave the shared
-//      thread is the user's explicit New Session (client-minted sess-*).
+//
+// The NEW-SESSION carve-out — a canvas turn carrying an explicit rotated
+// contextId (the client-minted sess-*) is preserved untouched, so the only way
+// to leave the shared thread is the user's explicit New Session — is the belt's
+// job and is gated by TestEnsureCanvasSessionContextID_PreservesCallerSupplied
+// (a2a_proxy_contextid_belt_test.go). It is deliberately NOT re-asserted here:
+// on the Go side "preserve a caller-supplied contextId" is one behavior
+// regardless of the id's prefix (the belt already pins it), and the sess-* vs
+// canvas-<ws> namespace *divergence* is a client-side minting convention pinned
+// canvas-side (useChatSend.contextId.test.tsx) — this package cannot assert it
+// without comparing two hardcoded literals, which tests nothing.
 
 import (
 	"encoding/json"
@@ -92,21 +100,8 @@ func TestSessionContinuity_AllSurfacesConvergeOnStableContextID(t *testing.T) {
 	}
 }
 
-func TestSessionContinuity_NewSessionRotationIsPreserved(t *testing.T) {
-	const ws = "11111111-2222-3333-4444-555555555555"
-	// A canvas turn carrying an EXPLICIT rotated contextId (the client-local
-	// sess-* the user minted by clicking "New Session") must be preserved —
-	// the belt must NOT drag it back onto the shared canvas-<ws> thread.
-	rotated := "sess-" + ws + "-abc123"
-	body := []byte(`{"params":{"message":{"role":"user","messageId":"m-2","contextId":"` + rotated + `","parts":[{"kind":"text","text":"fresh"}]}}}`)
-	out, changed := ensureCanvasSessionContextID(body, ws)
-	if changed {
-		t.Fatal("belt overwrote a user-rotated contextId — New Session would not actually start a fresh session")
-	}
-	if got, _ := parseMsg(t, out)["contextId"].(string); got != rotated {
-		t.Errorf("rotated contextId altered: got %q, want %q", got, rotated)
-	}
-	if rotated == canvasSessionContextID(ws) {
-		t.Fatal("rotated id collided with the default — a New Session would not diverge")
-	}
-}
+// NOTE: the New-Session carve-out (a caller-supplied / user-rotated contextId is
+// preserved untouched) is gated by the belt test
+// TestEnsureCanvasSessionContextID_PreservesCallerSupplied in
+// a2a_proxy_contextid_belt_test.go — see the file header for why it is not
+// duplicated here.
