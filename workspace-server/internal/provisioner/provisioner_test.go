@@ -858,6 +858,18 @@ func TestBuildContainerEnv_InjectsDefaultSessionContextID(t *testing.T) {
 	}
 }
 
+func TestBuildCPTenantEnv_InjectsDefaultSessionContextID(t *testing.T) {
+	// PARITY with the local-Docker path: tenant/managed workspaces (CPProvisioner
+	// → buildCPTenantEnv) must also receive core's authoritative session id, so
+	// production self-wakes converge without relying on the runtime's fallback.
+	const ws = "ea3cfcf1-cb9c-53b4-90fd-c53123569c4a"
+	env := buildCPTenantEnv(WorkspaceConfig{WorkspaceID: ws})
+	if got, want := env[sessionid.DefaultSessionContextEnv], sessionid.DefaultContextID(ws); got != want {
+		t.Errorf("tenant env %s = %q, want %q (core session id must reach managed workspaces too)",
+			sessionid.DefaultSessionContextEnv, got, want)
+	}
+}
+
 func TestBuildContainerEnv_InjectsPYTHONPATH(t *testing.T) {
 	// Standalone workspace-template repos COPY adapter.py to /app and rely on
 	// `import adapter` resolving via PYTHONPATH. molecule-runtime is a pip

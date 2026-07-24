@@ -10,9 +10,8 @@ func TestDefaultContextID(t *testing.T) {
 	if got := DefaultContextID(ws); got != "canvas-"+ws {
 		t.Fatalf("DefaultContextID(%q) = %q, want %q", ws, got, "canvas-"+ws)
 	}
-	if DefaultContextID(ws) != DefaultContextID(ws) {
-		t.Fatal("DefaultContextID is not deterministic")
-	}
+	// Pure function of the workspace id: distinct ids never collide (the property
+	// runtime session resumption relies on — one stable id per workspace).
 	if DefaultContextID("a") == DefaultContextID("b") {
 		t.Fatal("DefaultContextID must depend on the workspace id")
 	}
