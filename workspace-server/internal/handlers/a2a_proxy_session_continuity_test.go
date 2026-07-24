@@ -79,6 +79,16 @@ func TestSessionContinuity_AllSurfacesConvergeOnStableContextID(t *testing.T) {
 	const ws = "11111111-2222-3333-4444-555555555555"
 	want := canvasSessionContextID(ws) // "canvas-<ws>"
 
+	// Pin the ABSOLUTE format, not just convergence: if canvasSessionContextID
+	// itself drifted (say, gained a boot counter), every surface would drift
+	// WITH it and the convergence checks below would still pass while
+	// cross-restart continuity silently broke. The canvas side pins the same
+	// literal (useChatSend.contextId.test.tsx expects "canvas-ws-ctx"), so the
+	// two repos jointly hold the wire format fixed.
+	if want != "canvas-"+ws {
+		t.Fatalf("canvasSessionContextID format drifted: %q (must be canvas-<workspaceID> — restart-stable and matching the canvas test's literal)", want)
+	}
+
 	// Property 1 — CONVERGENCE.
 	restartBody, err := buildRestartA2APayload(ws, "=== WORKSPACE RESTART CONTEXT ===")
 	if err != nil {
