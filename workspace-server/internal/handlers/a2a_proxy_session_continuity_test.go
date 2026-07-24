@@ -41,7 +41,22 @@ package handlers
 import (
 	"encoding/json"
 	"testing"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/sessionid"
 )
+
+// TestSessionContinuity_BeltUsesTheOneAuthority pins that the a2a proxy belt /
+// platform self-turns derive their contextId from the SINGLE authority
+// (sessionid.DefaultContextID) — the SAME value the provisioner injects into the
+// workspace container as MOLECULE_DEFAULT_SESSION_CONTEXT_ID for the runtime's
+// self-wakes. If a future refactor re-inlines a "canvas-" literal here, the
+// platform id and the provisioned runtime id could drift; this fails first.
+func TestSessionContinuity_BeltUsesTheOneAuthority(t *testing.T) {
+	const ws = "11111111-2222-3333-4444-555555555555"
+	if got, want := canvasSessionContextID(ws), sessionid.DefaultContextID(ws); got != want {
+		t.Fatalf("belt/self-turn contextId %q diverged from the sessionid authority %q", got, want)
+	}
+}
 
 // ctxIDFromPayload extracts params.message.contextId from a self-turn payload
 // (buildRestartA2APayload / buildFirstBootGreetPayload shape).

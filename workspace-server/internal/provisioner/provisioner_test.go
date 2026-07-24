@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/sessionid"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
@@ -830,6 +831,30 @@ func TestBuildContainerEnv_InjectsBothPlatformURLAndMoleculeAIURL(t *testing.T) 
 		if !found {
 			t.Errorf("expected env to contain %q, got %v", want, env)
 		}
+	}
+}
+
+func TestBuildContainerEnv_InjectsDefaultSessionContextID(t *testing.T) {
+	// Session-continuity SSOT (2026-07-24): the provisioner MUST hand every
+	// workspace container core's authoritative default-session id, so the shared
+	// runtime's self-wakes (idle / harvester / delegation-result / cron /
+	// scheduler / goal-nudge / boot / reprovision) converge on the user's
+	// conversation instead of minting a throwaway context_id per turn (Langfuse
+	// session fragmentation across restart / plugin install). This is the wiring
+	// guard: if the env line is dropped, the runtime silently falls back to
+	// re-deriving the convention and the two can drift.
+	const ws = "ea3cfcf1-cb9c-53b4-90fd-c53123569c4a"
+	env := buildContainerEnv(WorkspaceConfig{WorkspaceID: ws, Runtime: "hermes"})
+
+	want := sessionid.DefaultSessionContextEnv + "=" + sessionid.DefaultContextID(ws)
+	if !envContains(env, want) {
+		t.Errorf("expected env to inject %q so the runtime consumes core's session id; got %v", want, env)
+	}
+	// Pin the value equals the canvas/self-turn id (the id the a2a proxy belt +
+	// platform self-turns stamp is canvasSessionContextID == the same authority),
+	// so the provisioned env can never diverge from the conversation it targets.
+	if got := sessionid.DefaultContextID(ws); got != "canvas-"+ws {
+		t.Errorf("authority derivation drifted: DefaultContextID(%q)=%q, want canvas-<ws>", ws, got)
 	}
 }
 
