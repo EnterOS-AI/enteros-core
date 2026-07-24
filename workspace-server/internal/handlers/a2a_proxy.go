@@ -29,6 +29,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/sessionid"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -1523,8 +1524,13 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 // across process restarts — exactly the property runtime session resumption
 // needs. The workspace id is a UUID (dash-delimited, no colons), so the
 // resulting id survives any runtime session-id sanitisation unchanged.
+//
+// Delegates to sessionid.DefaultContextID — the ONE authority for this
+// convention (the provisioner injects the SAME value into each workspace
+// container as MOLECULE_DEFAULT_SESSION_CONTEXT_ID, and the shared runtime
+// consumes it). The convention can only move in sessionid.
 func canvasSessionContextID(workspaceID string) string {
-	return "canvas-" + workspaceID
+	return sessionid.DefaultContextID(workspaceID)
 }
 
 // platformTurnContextID is the contextId platform-originated turns (first-boot
