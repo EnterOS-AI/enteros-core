@@ -16,13 +16,3 @@ func TestDefaultContextID(t *testing.T) {
 		t.Fatal("DefaultContextID must depend on the workspace id")
 	}
 }
-
-// TestDefaultSessionContextEnv pins the env-var name the provisioner sets and
-// the shared runtime reads. It is a cross-repo contract string — changing it
-// here without changing the runtime reader silently breaks convergence.
-func TestDefaultSessionContextEnv(t *testing.T) {
-	if DefaultSessionContextEnv != "MOLECULE_DEFAULT_SESSION_CONTEXT_ID" {
-		t.Fatalf("env var name changed to %q — update molecule_runtime "+
-			"a2a_client.default_self_turn_context_id to match", DefaultSessionContextEnv)
-	}
-}

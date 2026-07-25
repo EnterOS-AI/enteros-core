@@ -13,9 +13,10 @@ package staginge2e
 //	The pre-existing staging gates provision a PLAIN default-runtime workspace
 //	workspace with NO declared plugins (TestWorkspaceLifecycle_Staging) or drive
 //	the concierge WITHOUT waiting for it to boot online (TestConciergePlatformAgent
-//	_Staging asserts only DB/handler state — kind/parent_id/config-tab auth). A
-//	plain workspace reaches online WITHOUT any management MCP, and the concierge
-//	test never waits for online, so BOTH stay green even when a fresh platform
+//	_Staging asserts kind/parent_id/config-tab auth and accepts only the schedules
+//	proxy's exact pre-registration offline response). A plain workspace reaches
+//	online WITHOUT any management MCP, and the concierge test never waits for
+//	online, so BOTH stay green even when a fresh platform
 //	agent can NEVER mark online because its mgmt-MCP plugin was not installed. That
 //	is exactly the "checks presence/serve-text, not mgmt-MCP callability" flaw the
 //	prod-deploy hard-gate rule warns about.

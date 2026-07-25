@@ -19,7 +19,6 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cpurl"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/sessionid"
 )
 
 // CPProvisionerAPI is the contract WorkspaceHandler uses to talk to the
@@ -277,15 +276,7 @@ type cpProvisionResponse struct {
 // Forwarding ADMIN_TOKEN here both 400-failed the delegated provision and
 // over-privileged every ordinary box; deleting it reconciles core with #1217.
 func buildCPTenantEnv(cfg WorkspaceConfig) map[string]string {
-	env := make(map[string]string, len(cfg.EnvVars)+1)
-	// Session-continuity SSOT (parity with buildContainerEnv, the local-Docker
-	// path): hand tenant/managed workspaces core's authoritative default-session
-	// id too, so the runtime's self-wakes converge on the user's conversation
-	// without relying on the runtime's own "canvas-<ws>" fallback. Set BEFORE the
-	// cfg.EnvVars loop so a workspace secret of the same key (there is none in
-	// practice) would still win, mirroring how MOLECULE_CONFIG_BOOT_TOKEN is
-	// layered onto this map. Derived from the ONE authority (sessionid).
-	env[sessionid.DefaultSessionContextEnv] = sessionid.DefaultContextID(cfg.WorkspaceID)
+	env := make(map[string]string, len(cfg.EnvVars))
 	for k, v := range cfg.EnvVars {
 		if isPrivilegedWorkspaceEnvKey(k) {
 			log.Printf("CPProvisioner.Start: dropped privileged credential %q from tenant workspace env", k)
