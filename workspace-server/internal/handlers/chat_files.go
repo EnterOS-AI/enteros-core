@@ -51,6 +51,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/pendinguploads"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/uploads"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 )
 
 // ChatFilesHandler serves file upload + download for chat. Holds a
@@ -402,6 +403,44 @@ func (h *ChatFilesHandler) Upload(c *gin.Context) {
 	h.streamWorkspaceResponse(c, "upload", workspaceID, forwardURL, req, []string{"Content-Type"})
 }
 
+// containerDownloadPathError validates a download `path` query and returns the
+// user-facing 400 message when it is invalid, or "" when it is safe to forward.
+//
+// The path is a LINUX CONTAINER path (/workspace/..., /configs/...), NOT a host
+// path, so it is validated with FORWARD-SLASH semantics on every OS. Using
+// os-specific path/filepath here breaks a Windows-host platform (native
+// `go run`): filepath.IsAbs("/workspace/x") is FALSE on Windows and
+// filepath.Clean rewrites separators to `\`, so EVERY chat-attachment download
+// 400s even though the workspace serves the file fine (2026-07-24 regression).
+// This mirrors the platform-uniform invariant internal/wirepath enforces
+// elsewhere — the chat-download path was missed. Because the checks are pure
+// forward-slash string logic, one Linux-CI unit test proves the Windows behavior.
+func containerDownloadPathError(p string) string {
+	// A container absolute path always begins with "/".
+	if !strings.HasPrefix(p, "/") {
+		return "path must be absolute"
+	}
+	// Must land under one of the allowed roots — mirrors the ReadFile security
+	// model, preventing arbitrary reads of /etc or other system paths.
+	rooted := false
+	for root := range allowedRoots {
+		if p == root || strings.HasPrefix(p, root+"/") {
+			rooted = true
+			break
+		}
+	}
+	if !rooted {
+		return "path must be under /configs, /workspace, /home, or /plugins"
+	}
+	// Reject non-canonical / traversal paths. wirepath.Normalize is forward-slash
+	// path.Clean — NOT filepath.Clean, which would rewrite "/" to "\" on a Windows
+	// host and false-reject a legitimate container path.
+	if wirepath.Normalize(p) != p || strings.Contains(p, "..") {
+		return "invalid path"
+	}
+	return ""
+}
+
 // Download handles GET /workspaces/:id/chat/download?path=<abs path>.
 // Forwards over HTTP to the workspace's own /internal/file/read endpoint
 // (RFC #2312 PR-D), replacing the docker-cp tar-stream extraction that
@@ -429,28 +468,8 @@ func (h *ChatFilesHandler) Download(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "path query required"})
 		return
 	}
-	if !filepath.IsAbs(path) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "path must be absolute"})
-		return
-	}
-	// Path must land under one of the allowed roots — mirrors the
-	// ReadFile security model and prevents arbitrary reads of /etc
-	// or other system paths via this endpoint.
-	rooted := false
-	for root := range allowedRoots {
-		if path == root || strings.HasPrefix(path, root+"/") {
-			rooted = true
-			break
-		}
-	}
-	if !rooted {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "path must be under /configs, /workspace, /home, or /plugins"})
-		return
-	}
-	// Reject anything that canonicalises differently or contains a
-	// traversal segment. Defence-in-depth on top of the prefix check.
-	if filepath.Clean(path) != path || strings.Contains(path, "..") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid path"})
+	if errMsg := containerDownloadPathError(path); errMsg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 		return
 	}
 
