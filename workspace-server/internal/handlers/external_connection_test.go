@@ -114,6 +114,60 @@ func TestExternalTemplates_NoBrokenMoleculeAIGitHubURLs(t *testing.T) {
 	}
 }
 
+// installerRuntimeVersionRe extracts the in-repo SSOT runtime pin from
+// scripts/install-workspace-runtime.sh.
+var installerRuntimeVersionRe = regexp.MustCompile(`(?m)^RUNTIME_VERSION="([^"]+)"`)
+
+// installerRuntimeVersion reads the molecules-workspace-runtime pin from the
+// single in-repo SSOT, scripts/install-workspace-runtime.sh, instead of
+// carrying yet another hard-coded copy of the version string.
+//
+// Why this exists: the pin used to be duplicated in three independent places —
+// the installer script, the operator-facing snippet const in
+// external_connection.go, and this test's literal. Nothing tied them together,
+// so when the Gitea package-retention janitor pruned the pinned version off the
+// private index (it keeps only the newest 5 unpinned versions, and a pypi
+// version referenced solely by a source constant is invisible to its
+// pin-awareness guards) the operator had to find and bump every copy by hand.
+// Missing one silently ships a snippet that pip-fails on a paste. Deriving here
+// makes a partial bump a RED test rather than a live product break.
+func installerRuntimeVersion(t *testing.T) string {
+	t.Helper()
+	// workspace-server/internal/handlers -> repo root
+	path := filepath.Join("..", "..", "..", "scripts", "install-workspace-runtime.sh")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("cannot read the runtime-pin SSOT %s: %v", path, err)
+	}
+	match := installerRuntimeVersionRe.FindSubmatch(body)
+	if match == nil {
+		t.Fatalf(`no RUNTIME_VERSION="..." line in %s — the runtime-pin SSOT moved; update installerRuntimeVersion`, path)
+	}
+	return string(match[1])
+}
+
+// TestExternalRuntimeTemplates_PinMatchesInstallerSSOT asserts the
+// operator-facing copy-paste snippets pin the SAME molecules-workspace-runtime
+// version that scripts/install-workspace-runtime.sh installs in CI.
+//
+// A divergence here is not cosmetic: CI installs one version while every
+// operator who pastes the external-connect snippet installs another, and once
+// the snippet's version falls out of the registry's retention window the paste
+// fails with "Could not find a version that satisfies the requirement" while CI
+// stays green. Bump the SSOT and this test forces the snippet along with it.
+func TestExternalRuntimeTemplates_PinMatchesInstallerSSOT(t *testing.T) {
+	want := "molecules-workspace-runtime==" + installerRuntimeVersion(t)
+	if !strings.Contains(externalWorkspaceRuntimeInstall, want) {
+		t.Errorf("externalWorkspaceRuntimeInstall does not pin %q — it has drifted from the in-repo SSOT scripts/install-workspace-runtime.sh; bump both together", want)
+	}
+	stale := regexp.MustCompile(`molecules-workspace-runtime==(\S+)`)
+	for _, m := range stale.FindAllStringSubmatch(externalWorkspaceRuntimeInstall, -1) {
+		if "molecules-workspace-runtime=="+strings.TrimSpace(m[1]) != want {
+			t.Errorf("externalWorkspaceRuntimeInstall still pins %q; expected %q", m[0], want)
+		}
+	}
+}
+
 // TestExternalRuntimeTemplates_InstallPrivateWheelWithPublicDependencies pins
 // the copy-paste install boundary for every snippet backed by
 // molecules-workspace-runtime. The Gitea package registry does not proxy
@@ -134,7 +188,7 @@ func TestExternalRuntimeTemplates_InstallPrivateWheelWithPublicDependencies(t *t
 	for name, body := range runtimeTemplates {
 		for _, required := range []string{
 			"pip download --no-deps",
-			"molecules-workspace-runtime==0.4.36",
+			"molecules-workspace-runtime==" + installerRuntimeVersion(t),
 			"pip install --index-url https://pypi.org/simple/",
 			"molecules_workspace_runtime-*.whl",
 		} {

@@ -108,6 +108,7 @@ from typing import Any
 # _approval_validator.py for the fail-closed contract.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _approval_validator import classify_reviews as _classify_reviews_ssot  # noqa: E402
+from _review_policy import recognized_reviewers, required_approvals  # noqa: E402
 
 
 def _env(key: str, *, default: str = "") -> str:
@@ -309,7 +310,8 @@ PUSH_REQUIRED_CONTEXTS_RAW = _env(
 
 # Recognised official-reviewer set. A merge requires this many DISTINCT genuine
 # approvals (not stale/dismissed, on the current head sha) from accounts in
-# this set.
+# this set. Checked-in defaults live only in _review_policy.py, which is shared
+# with audit-force-merge.sh; optional environment overrides remain fail-closed.
 #
 # CTO 2026-07-14: the peer roster is the union of the review, management, and
 # owner teams — reviewers, managers, and owners may all satisfy the floor.
@@ -317,32 +319,18 @@ PUSH_REQUIRED_CONTEXTS_RAW = _env(
 # a login list of three accounts that no automation drives; they produced 0
 # genuine approvals across 29 merges, so the floor was unsatisfiable and EVERY
 # merge fell through to a manual owner/admin path (the queue was dead). This
-# default is the current membership of teams code-reviewers/qa/security/
+# roster is the current membership of teams code-reviewers/qa/security/
 # managers/Owners. It is still a LOGIN list (not team-resolved) so the queue
-# needs no org-team read scope to run; the trade-off is that it drifts as team
-# membership changes — tracked as a follow-up to make this team-keyed (SSOT),
-# which requires confirming the merge-actor token's org:read scope first.
-REVIEWER_SET = {
-    name.strip()
-    for name in _env(
-        "REVIEWER_SET",
-        default=(
-            "molecule-code-reviewer,core-qa,core-security,"          # reviewers (code-reviewers/qa/security)
-            "core-lead,cp-lead,dev-lead,app-lead,sdk-lead,"          # management
-            "infra-lead,release-manager,pm,agent-pm,"               # management
-            "hongming,cui,hongming-personal,hongming-pc2,"          # owners
-            "claude-ceo-assistant,hongming-ceo-delegated"           # owner/delegate
-        ),
-    ).split(",")
-    if name.strip()
-}
+# needs no org-team read scope to run; the trade-off is that team membership
+# changes require updating the one shared policy module.
+REVIEWER_SET = recognized_reviewers(os.environ.get("REVIEWER_SET"))
 # CTO 2026-07-14: the genuine-peer floor is ONE approval. The previous default
 # of 2 was drift and, combined with the dead REVIEWER_SET above and the actual
 # review practice (<=1 general review per PR, 0/14 recent merges had 2 distinct
 # peer approvals), made the queue unable to merge anything.
 # Branch protection's value still wins when it is a valid int >= this floor
 # (see the fail-closed clamp in branch-protection parsing).
-REQUIRED_APPROVALS_DEFAULT = int(_env("REQUIRED_APPROVALS", default="1") or "1")
+REQUIRED_APPROVALS_DEFAULT = required_approvals(os.environ.get("REQUIRED_APPROVALS"))
 
 # --------------------------------------------------------------------------
 # Runtime-bump auto-merge exemption (RFC internal#131 PR-A, dispatch 9c2e9c88)

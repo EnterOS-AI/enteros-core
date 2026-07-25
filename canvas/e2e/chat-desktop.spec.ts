@@ -1,14 +1,7 @@
 import { test, expect } from "@playwright/test";
-import type { Page } from "@playwright/test";
 import { startEchoRuntime, type EchoRuntime } from "./fixtures/echo-runtime";
 import { seedWorkspace, startHeartbeat, cleanupWorkspace, runPsql, seedChatHistory } from "./fixtures/chat-seed";
-
-/** Enter the Org-map view so the Canvas (React Flow graph) mounts. */
-async function enterMapView(page: Page): Promise<void> {
-  const btn = page.getByTestId("nav-map");
-  await expect(btn, "rail button nav-map missing").toBeVisible({ timeout: 10_000 });
-  await btn.click();
-}
+import { enterMapView, clickWorkspaceNode } from "./helpers/canvas";
 
 test.describe("Desktop ChatTab", () => {
   let cleanup: () => Promise<void> = async () => {};
@@ -47,13 +40,11 @@ test.describe("Desktop ChatTab", () => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto("/");
     await enterMapView(page);
-    await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
-    // Click the workspace node by its exact name label — scoped to the
-    // React Flow canvas: ConciergeShell stays mounted (hidden) on the map
-    // view and renders a matching wsName div, so an unscoped getByText
-    // .first() can resolve to the invisible concierge node (DOM-order
-    // dependent → alternating green/red on main).
-    await page.getByTestId(`workspace-node-${workspaceName}`).click();
+    // clickWorkspaceNode waits for the canvas to settle (fitView done) before
+    // clicking, so the node isn't under the fixed top chrome (the E2E Chat
+    // node-click flake), and targets by data-testid so the click can't land on
+    // the hidden ConciergeShell copy of the workspace name.
+    await clickWorkspaceNode(page, workspaceName);
     // Wait for the side panel chat tab to be clickable, then click it.
     await page.locator('#tab-chat').click();
     // All chat selectors are scoped to #panel-chat (the map SidePanel
@@ -117,8 +108,7 @@ test.describe("Desktop ChatTab", () => {
 
     await page.reload();
     await enterMapView(page);
-    await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
-    await page.getByTestId(`workspace-node-${workspaceName}`).click();
+    await clickWorkspaceNode(page, workspaceName);
     await page.locator('#tab-chat').click();
     await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", { timeout: 5_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
@@ -181,8 +171,7 @@ test.describe("Desktop ChatTab — Markdown rendering", () => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto("/");
     await enterMapView(page);
-    await page.waitForSelector(".react-flow__node", { timeout: 10_000 });
-    await page.getByTestId(`workspace-node-${workspaceName}`).click();
+    await clickWorkspaceNode(page, workspaceName);
     await page.locator('#tab-chat').click();
     await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", { timeout: 5_000 });
     // Wait for the workspace status to flip to online and the textarea to be enabled.
