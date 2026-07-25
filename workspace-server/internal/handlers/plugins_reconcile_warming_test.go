@@ -112,3 +112,44 @@ func TestReconcile_PlatformConciergeSuppressesAutomaticRestart(t *testing.T) {
 		t.Errorf("unmet DB expectations: %v", err)
 	}
 }
+
+// TestReconcile_LocalSourceSuppressesAutomaticRestart proves the box-fetchability
+// guard on the delivery path: an ORDINARY workspace (not a platform concierge, so
+// the lifecycle guard does NOT fire) with a host-side local:// source must still
+// deliver WITHOUT an automatic restart. This is the loop the concierge guard never
+// covered — before this guard, an ordinary fresh box declaring a local:// plugin
+// would deliver, restart, wipe /configs, find the plugin missing, deliver, restart
+// … forever, because the boot materializer cannot re-pull a host-side source.
+func TestReconcile_LocalSourceSuppressesAutomaticRestart(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+	h, _ := newReconcileHandler(t)
+
+	expectDeclared(mock,
+		[]DeclaredPlugin{{PluginName: "seo-all", SourceRaw: "local://seo-all"}},
+		nil,
+	)
+	// Ordinary workspace → platformConciergeReconcileShouldSkipRestart == false,
+	// so any suppression MUST come from the local:// (!BoxFetchable) guard alone.
+	mock.ExpectQuery("SELECT kind, status FROM workspaces WHERE id =").
+		WithArgs("ws-local-source").
+		WillReturnRows(sqlmock.NewRows([]string{"kind", "status"}).
+			AddRow(models.KindWorkspace, string(models.StatusOnline)))
+
+	suppressed := false
+	h.deliverOverride = func(_ context.Context, _ string, stage *stageResult) error {
+		suppressed = stage.SuppressRestart
+		return nil
+	}
+	mock.ExpectExec(`INSERT INTO workspace_plugins`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	h.ReconcileWorkspacePlugins(context.Background(), "ws-local-source")
+
+	if !suppressed {
+		t.Fatal("ordinary-workspace reconcile delivered a local:// source WITH automatic restart — the restart loop is not broken")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
