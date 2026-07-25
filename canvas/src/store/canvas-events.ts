@@ -120,11 +120,18 @@ export function handleCanvasEvent(
           ? { ...e, className: "mol-deploy-edge-laser" }
           : e,
       );
+      // Greeting-first UI: a FIRST boot (provisioning→online) has not greeted
+      // yet, so mark greeted=false to render the "warming / composing greeting"
+      // state until the AGENT_MESSAGE greeting lands. A recovery flip (online
+      // after an outage — prior status not provisioning) does NOT re-greet, so
+      // it goes straight to ready. An already-greeted node stays greeted.
+      const wasProvisioning = existing.data.status === "provisioning";
+      const greetedNext = existing.data.greeted === true ? true : !wasProvisioning;
       set({
         edges: updatedEdges,
         nodes: nodes.map((n) =>
           n.id === msg.workspace_id
-            ? { ...n, data: { ...n.data, status: "online" } }
+            ? { ...n, data: { ...n.data, status: "online", greeted: greetedNext } }
             : n,
         ),
         liveAnnouncement: `${nodeName} is now online`,
@@ -478,7 +485,25 @@ export function handleCanvasEvent(
         const { agentMessages } = get();
         const existing = agentMessages[msg.workspace_id] || [];
         const messageId = typeof msg.payload.message_id === "string" ? msg.payload.message_id : undefined;
+        // Mark the node greeted: a real agent→user message means the agent has
+        // spoken, so the greeting-first UI can drop the "warming/composing"
+        // state and show full "ready". Only touch nodes when it actually flips
+        // (idempotent) to avoid needless React Flow re-renders. This is the live
+        // edge of the greeting-first UI decouple; reload hydrates greeted from
+        // the GET /workspaces snapshot instead.
+        const greetTarget = nodes.find((n) => n.id === msg.workspace_id);
+        const nodesPatch =
+          greetTarget && greetTarget.data.greeted !== true
+            ? {
+                nodes: nodes.map((n) =>
+                  n.id === msg.workspace_id
+                    ? { ...n, data: { ...n.data, greeted: true } }
+                    : n,
+                ),
+              }
+            : {};
         set({
+          ...nodesPatch,
           agentMessages: {
             ...agentMessages,
             [msg.workspace_id]: [
