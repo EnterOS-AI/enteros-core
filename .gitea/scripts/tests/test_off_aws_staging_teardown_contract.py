@@ -8,13 +8,10 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[3]
-WORKFLOW_PATH = ROOT / ".gitea/workflows/e2e-staging-saas.yml"
-ACTIVE_LOCAL_JOBS = (
-    "e2e-staging-saas",
-    "e2e-staging-platform-boot",
-    "e2e-staging-concierge-user-tasks",
-    "e2e-staging-concierge-creates-workspace",
-)
+# NOTE: the e2e-staging-saas.yml TEST lane was retired (its journeys run per-PR on
+# the ephemeral-CP gate). The two workflow-shape tests that read it were removed;
+# the harness/exit-trap contract tests below still apply — the tests/e2e/*.sh
+# harnesses are RETAINED because the ephemeral gate reuses them.
 ACTIVE_HARNESSES = (
     ROOT / "tests/e2e/test_staging_full_saas.sh",
     ROOT / "tests/e2e/test_staging_concierge_e2e.sh",
@@ -26,69 +23,6 @@ def _shell_function(source: str, name: str) -> str:
     match = re.search(rf"(?ms)^{re.escape(name)}\(\) \{{\n(.*?)^\}}$", source)
     assert match is not None, f"missing shell function {name}"
     return match.group(1)
-
-
-def test_active_local_jobs_do_not_receive_retired_aws_credentials_or_toggles() -> None:
-    workflow_source = WORKFLOW_PATH.read_text()
-    workflow = yaml.safe_load(workflow_source)
-    jobs = workflow["jobs"]
-
-    for job_name in ACTIVE_LOCAL_JOBS:
-        job = jobs[job_name]
-        serialized = json.dumps(job, sort_keys=True)
-        source_match = re.search(
-            rf"(?ms)^  {re.escape(job_name)}:\n.*?(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
-            workflow_source,
-        )
-        assert source_match is not None
-        active_job_source = source_match.group(0)
-        assert job["env"]["E2E_INFRA_BACKEND"] == "local-docker"
-        assert "source tests/e2e/lib/cp_purge_receipt.sh" in active_job_source
-        assert "e2e_cp_require_staging_origin" in active_job_source
-        assert "e2e_cp_fetch_org_roster_json" in active_job_source
-        assert "e2e_cp_delete_and_verify_purge" in active_job_source
-        assert "discovery inconclusive" in active_job_source
-        assert "orgs=$(curl" not in active_job_source
-        assert "/cp/admin/tenants/" not in active_job_source
-        empty_run_guard = 'if [ -z "${GITHUB_RUN_ID:-}" ]; then'
-        assert empty_run_guard in active_job_source
-        assert active_job_source.index(empty_run_guard) < active_job_source.index(
-            "e2e_cp_fetch_org_roster_json"
-        )
-        assert "GITHUB_RUN_ID is empty" in active_job_source
-        creation_guard = 'created_slug="${E2E_CREATED_SLUG:-}"'
-        assert creation_guard in active_job_source
-        assert active_job_source.index(creation_guard) < active_job_source.index(
-            "e2e_cp_fetch_org_roster_json"
-        )
-        assert 'created_org_id="${E2E_CREATED_ORG_ID:-}"' in active_job_source
-        assert "verified creation identity is unavailable" in active_job_source
-        assert "run_id = os.environ['GITHUB_RUN_ID']" in active_job_source
-        assert "expected_slug = os.environ['E2E_CREATED_SLUG']" in active_job_source
-        assert "expected_org_id = os.environ['E2E_CREATED_ORG_ID']" in active_job_source
-        assert "os.environ.get('GITHUB_RUN_ID'" not in active_job_source
-        assert "if not run_id:" in active_job_source
-        assert "if o.get('slug') == expected_slug" in active_job_source
-        assert "prefixes =" not in active_job_source
-        assert "datetime.date" not in active_job_source
-        assert '"$MOLECULE_CP_URL" "$ADMIN_TOKEN" "$slug" "$created_org_id"' in active_job_source
-        for date_wide_fallback in (
-            "tuple(f'e2e-{d}-' for d in dates)",
-            "tuple(f'e2e-smoke-{d}-platform-' for d in dates)",
-            "tuple(f'e2e-cncrg-{d}-' for d in dates)",
-            "tuple(f'e2e-cncrg-mk-{d}-' for d in dates)",
-        ):
-            assert date_wide_fallback not in active_job_source
-        for retired_text in (
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "E2E_AWS_LEAK_CHECK",
-            "E2E_AWS_TERMINATE_LEAKS",
-            "E2E_EC2_ENABLED",
-            "one-line knob",
-        ):
-            assert retired_text not in serialized
-            assert retired_text not in active_job_source
 
 
 def test_active_harnesses_use_exact_cp_purge_proof_without_ec2_false_clean() -> None:
@@ -208,14 +142,6 @@ def test_staging_runbook_states_the_exact_teardown_proof_boundary() -> None:
     assert "HTTP 404" in normalized
     assert "does not directly enumerate provider resources" in normalized
     assert "molecule-ai/internal#639" in normalized
-
-
-def test_safety_net_comments_match_exact_published_identity_boundary() -> None:
-    source = WORKFLOW_PATH.read_text()
-    assert source.count("exact slug/ID pair published after a successful org") == 3
-    assert "Best-effort: find any e2e-YYYYMMDD" not in source
-    assert "Sweep any e2e-cncrg-YYYYMMDD" not in source
-    assert "died before exporting its slug" not in source
 
 
 def test_ephemeral_shared_harness_caller_uses_explicit_loopback_contract() -> None:

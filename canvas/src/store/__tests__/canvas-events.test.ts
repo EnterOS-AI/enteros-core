@@ -1160,7 +1160,38 @@ describe("handleCanvasEvent – BOOT_STEP", () => {
       label: "Provision compute",
       status: "running",
       message: "allocating container…",
+      // Arrival timestamp — feeds the watchdog log's stable offsets. Live
+      // events are client-clock-stamped (serverClock: false); the offset
+      // math clamps deltas across the server/client clock boundary.
+      at: expect.any(Number),
+      serverClock: false,
     });
+    // The same event also lands as the first watchdog log line.
+    const log = state.nodes[0].data.bootLog!;
+    expect(log).toHaveLength(1);
+    expect(log[0].text).toBe("allocating container…");
+    expect(log[0].status).toBe("running");
+  });
+
+  it("appends a NEW log line for each distinct heartbeat message (same step+status)", () => {
+    const node = makeNode("ws-1", { status: "provisioning" });
+    const { get, set, state } = makeStore([node]);
+
+    const base = { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running" };
+    handleCanvasEvent(bootMsg("ws-1", { ...base, message: "building image — 20s elapsed" }), get, set);
+    handleCanvasEvent(bootMsg("ws-1", { ...base, message: "building image — 40s elapsed" }), get, set);
+    // Identical re-broadcast must NOT duplicate.
+    handleCanvasEvent(bootMsg("ws-1", { ...base, message: "building image — 40s elapsed" }), get, set);
+
+    // Keycaps stay latest-per-step…
+    expect(state.nodes[0].data.bootSteps).toHaveLength(1);
+    expect(state.nodes[0].data.bootSteps![0].message).toBe("building image — 40s elapsed");
+    // …while the watchdog log keeps the full history.
+    const log = state.nodes[0].data.bootLog!;
+    expect(log.map((l) => l.text)).toEqual([
+      "building image — 20s elapsed",
+      "building image — 40s elapsed",
+    ]);
   });
 
   it("merges a running→ok transition in place (latest status per step wins)", () => {
@@ -1209,6 +1240,48 @@ describe("handleCanvasEvent – BOOT_STEP", () => {
     handleCanvasEvent(bootMsg("ws-1", { step: 1, total: 8, label: "x", status: "ok" }), get, set);
 
     expect(state.nodes[0].data.bootSteps ?? []).toHaveLength(0);
+  });
+
+  it("renders a status-derived log line when the runtime posts an EMPTY message", () => {
+    // boot_event.go broadcasts `message` verbatim — plain status transitions
+    // arrive as "" and must not become blank watchdog lines (2026-07-18
+    // live-boot regression: half the log rendered as bare timestamps).
+    const node = makeNode("ws-1", { status: "provisioning" });
+    const { get, set, state } = makeStore([node]);
+
+    handleCanvasEvent(
+      bootMsg("ws-1", { step: 5, total: 8, key: "TOOL", label: "Enumerate tools", status: "ok", message: "" }),
+      get,
+      set
+    );
+
+    expect(state.nodes[0].data.bootLog!.map((l) => l.text)).toEqual(["Enumerate tools — done"]);
+  });
+
+  it("clears bootSteps/bootLog when WORKSPACE_PROVISIONING restarts a node", () => {
+    // A restart starts a NEW boot generation (the server drops its trace on
+    // the same event) — stale telemetry must not render the previous boot's
+    // keycaps/failure banner over the fresh boot.
+    resetProvisioningSequence();
+    const node = makeNode("ws-1", {
+      status: "failed",
+      bootSteps: [
+        { step: 5, total: 8, key: "TOOL", label: "Enumerate tools", status: "failed", message: "boom" },
+      ],
+      bootLog: [{ id: "0:5-failed", at: 100, t: 0, status: "failed", text: "boom" }],
+    });
+    const { get, set, state } = makeStore([node]);
+
+    handleCanvasEvent(
+      makeMsg({ event: "WORKSPACE_PROVISIONING", workspace_id: "ws-1", payload: { name: "WS" } }),
+      get,
+      set
+    );
+
+    const data = state.nodes[0].data;
+    expect(data.status).toBe("provisioning");
+    expect(data.bootSteps).toBeUndefined();
+    expect(data.bootLog).toBeUndefined();
   });
 
   it("drops a BOOT_STEP for an unknown workspace (indeterminate-boot fallback)", () => {

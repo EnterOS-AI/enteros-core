@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/cronspec"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
@@ -535,10 +534,9 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// seed_schedules_from_workspace_config) reconciles them onto the
 		// volume-authoritative grid. The config/asset channel lands the file
 		// on the volume BEFORE boot, so there is no core→runtime API race on
-		// first provision. The legacy workspace_schedules DB seed further down
-		// KEEPS running during the cutover — P4b retires it; this is the
-		// additive volume path. Must run BEFORE the provision dispatch below,
-		// which captures configFiles for the provision goroutine.
+		// first provision. This is now the ONLY schedule delivery path — the
+		// legacy core-DB seed was retired in P4b. Must run BEFORE the provision
+		// dispatch below, which captures configFiles for the provision goroutine.
 		if len(ws.Schedules) > 0 {
 			schedBlock, schedRendered, schedSkipped := renderTemplateSchedulesYAML(ws.Schedules, orgBaseDir, ws.FilesDir, ws.Name)
 			if schedBlock != "" {
@@ -671,53 +669,10 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 	}
 
 skipProvision:
-	// internal#2006: migrate runtime-created schedules from a removed
-	// predecessor of the same agent (role+parent) onto this freshly-created
-	// workspace. Reconcile re-derives template-sourced state below, but
-	// schedules a user added at runtime (source='runtime', via the canvas/API)
-	// bind to the ephemeral workspace_id and would otherwise be abandoned on
-	// the removed row when an agent is recreated with a new id. Runs before the
-	// template upsert loop so a same-named template schedule still wins.
-	// Best-effort: never fails the import.
-	h.migrateRuntimeSchedulesFromRemovedPredecessor(ctx, id, role, ws.Name, parentID)
-
-	// Insert schedules if defined. Resolve each schedule's prompt body from
-	// either inline `prompt:` or `prompt_file:` (file ref relative to the
-	// workspace's files_dir). Inline wins; empty prompt after resolution is
-	// a configuration error (cron with no body would never do anything).
-	for _, sched := range ws.Schedules {
-		tz := sched.Timezone
-		if tz == "" {
-			tz = "UTC"
-		}
-		enabled := true
-		if sched.Enabled != nil {
-			enabled = *sched.Enabled
-		}
-		prompt, promptErr := resolvePromptRef(sched.Prompt, sched.PromptFile, orgBaseDir, ws.FilesDir)
-		if promptErr != nil {
-			log.Printf("Org import: failed to resolve prompt for schedule '%s' on %s: %v — skipping insert", sched.Name, ws.Name, promptErr)
-			continue
-		}
-		if prompt == "" {
-			log.Printf("Org import: schedule '%s' on %s has empty prompt (neither prompt nor prompt_file set) — skipping insert", sched.Name, ws.Name)
-			continue
-		}
-		// #722: surface the error rather than silently using time.Time{} (zero)
-		// which lib/pq stores as 0001-01-01 and may confuse the fire query.
-		nextRun, nextRunErr := cronspec.ComputeNextRun(sched.CronExpr, tz, time.Now())
-		if nextRunErr != nil {
-			log.Printf("Org import: invalid cron expression for schedule '%s' on %s: %v — skipping insert",
-				sched.Name, ws.Name, nextRunErr)
-			continue
-		}
-		if _, err := db.DB.ExecContext(context.Background(), orgImportScheduleSQL,
-			id, sched.Name, sched.CronExpr, tz, prompt, enabled, nextRun); err != nil {
-			log.Printf("Org import: failed to upsert schedule '%s' for %s: %v", sched.Name, ws.Name, err)
-		} else {
-			log.Printf("Org import: schedule '%s' (%s, %d chars) upserted for %s (source=template)", sched.Name, sched.CronExpr, len(prompt), ws.Name)
-		}
-	}
+	// Schedules declared in the template were rendered into the delivered
+	// config.yaml above (renderTemplateSchedulesYAML); the runtime seeds them
+	// onto the volume-authoritative grid at boot/reload. Core no longer writes
+	// a schedule DB table (retired in P4b).
 
 	// Insert channels if defined (Telegram, Slack, etc.). Config values
 	// support ${VAR} expansion from .env files. The manager is reloaded
@@ -977,69 +932,6 @@ func scanPlatformAnchor(ctx context.Context, query string, args ...interface{}) 
 		return "", 0, 0, false
 	}
 	return id, x, y, true
-}
-
-// migrateRuntimeSchedulesFromRemovedPredecessor re-points runtime-created
-// schedules (source='runtime') from the most-recent removed predecessor of the
-// same agent onto newID. Recreating an agent mints a NEW workspace id (the
-// ON CONFLICT in createWorkspaceTree only matches non-removed rows), so a
-// schedule a user added at runtime would otherwise be abandoned on the removed
-// row. Template-sourced schedules are NOT migrated — reconcile re-derives those
-// from the org template (the upsert loop). The predecessor is matched by the
-// stable `role` when present (survives the name auto-suffixing that yields
-// "Agent (2)"), falling back to name+parent. Idempotent (skips names already on
-// newID) and best-effort (logs, never errors the import). See internal#2006.
-func (h *OrgHandler) migrateRuntimeSchedulesFromRemovedPredecessor(ctx context.Context, newID string, role interface{}, name string, parentID *string) {
-	var predID string
-	var err error
-	if role != nil {
-		err = db.DB.QueryRowContext(ctx, `
-			SELECT id FROM workspaces
-			WHERE status = 'removed' AND role = $1
-			  AND parent_id IS NOT DISTINCT FROM $2
-			  AND id <> $3
-			ORDER BY updated_at DESC NULLS LAST
-			LIMIT 1
-		`, role, parentID, newID).Scan(&predID)
-	} else {
-		err = db.DB.QueryRowContext(ctx, `
-			SELECT id FROM workspaces
-			WHERE status = 'removed' AND name = $1
-			  AND parent_id IS NOT DISTINCT FROM $2
-			  AND id <> $3
-			ORDER BY updated_at DESC NULLS LAST
-			LIMIT 1
-		`, name, parentID, newID).Scan(&predID)
-	}
-	if errors.Is(err, sql.ErrNoRows) {
-		return // first-time create — no predecessor to migrate from
-	}
-	if err != nil {
-		log.Printf("Org import: predecessor lookup for %q (new=%s) failed: %v — skipping schedule migration", name, newID, err)
-		return
-	}
-	res, err := db.DB.ExecContext(ctx, `
-		UPDATE workspace_schedules s
-		SET workspace_id = $1, updated_at = now()
-		WHERE s.workspace_id = $2
-		  AND s.source = 'runtime'
-		  AND NOT EXISTS (
-		      SELECT 1 FROM workspace_schedules t
-		      WHERE t.workspace_id = $1 AND t.name = s.name
-		  )
-	`, newID, predID)
-	if err != nil {
-		log.Printf("Org import: schedule migration %s -> %s (%q) failed: %v", predID, newID, name, err)
-		return
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		log.Printf("Org import: schedule migration rows affected %s -> %s: %v", predID, newID, err)
-		return
-	}
-	if n > 0 {
-		log.Printf("Org import: migrated %d runtime schedule(s) from removed predecessor %s to new workspace %s (%q)", n, predID, newID, name)
-	}
 }
 
 // lookupExistingChild returns the id of an existing workspace under

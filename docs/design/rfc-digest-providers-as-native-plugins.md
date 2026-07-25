@@ -16,6 +16,22 @@ This RFC moves the digest providers **out of the runtime** and delivers them as 
 
 This is **not** "make the A2A mailbox / kernel a plugin." The mailbox kernel (`kernel.py`, `mailbox_dir.py`) and the A2A inject lane are the **transport substrate** — the nervous system that autonomous turns (and plugins themselves) are delivered *into*. Plugins run *on* it; making the transport a plugin is circular. The A2A **tools** (`a2a_tools_inbox`, `messaging`, …) are a separate, later question (they look like MCP-tool contributions). This RFC scopes to the **digest providers** only.
 
+### 1.2 Not to be confused with the concierge `daily-activity-report` schedule
+
+The self-host concierge ships a `daily-activity-report` **schedule** (see
+[`rfc-scheduler-as-trigger-plugin.md`](rfc-scheduler-as-trigger-plugin.md) §P5.1
+and `docs/runbooks/selfhost-concierge-default-schedules.md`) that composes a
+morning summary from the **same** `/activity` (+ `/mail/summary`) sources these
+digest providers read — the mail providers here take their comms source from the
+platform mail-summary API, and the scheduled report pulls
+`GET /workspaces/<id>/activity?since_secs=86400` plus `/mail/summary`. Despite
+the shared data sources the two are **distinct mechanisms**: the idle digest is
+an **in-process, wake-gating** assembly (it decides whether an idle agent stays
+asleep, `official`/reserved-id-governed), whereas the daily report is a **cron
+self-turn** the concierge composes and **delivers to the user** via
+`send_message_to_user` (canvas chat + push). One is agent-facing wake logic; the
+other is a user-facing digest email. They neither share code nor gate each other.
+
 ## 2. What exists today (grounding, not proposal)
 
 - **The protocol** (`idle_digest/provider.py`): `DigestProvider` = `provider_id: str`, `official: bool`, `async contribute() -> Sequence[Contribution]`, `on_included(fired_at)`. `ProviderRunner` invokes each provider with per-provider timeout + a consecutive-failure disable, so one bad provider never wedges the idle tick.
@@ -123,9 +139,11 @@ The phasing landed as designed; the open questions above were resolved in code a
 3. **Trust-tier enforcement point** → **both**, as leaned. Runtime-side load-time gate (native-only for official/reserved) **and** core-side (the native-plugins registry is the only declared source; the concierge MCP stays entitlement-gated to `kind=platform`).
 4. **Sandboxed third-party providers** → still the future unlock; unchanged.
 
-**All code increments have landed** (D0, D2, D1 loader + registry trust source + e2e, core consumption — every row above merged and adversarially reviewed). What remains is **operational / owner-gated only**:
+**D0–D2 + the D3 source-move have landed** (every row above merged and adversarially reviewed). **D3's baked delete is NOT merge-ready** — beyond the owner-gated arming, real ENGINEERING and a live divergence remain (a fresh 2026-07-19 re-audit; the earlier "all landed, only owner-gated" claim understated this):
 
-- **D3** — delete the `idle_digest/providers/` baked roster. Hard-gated on the loader being fleet-universal: until every runtime image carries the loader *and* the flags are armed, the baked roster is the live source, so deleting it early would break flag-on workspaces. Sequenced strictly after the fleet rollout.
+- ⚠️ **LIVE SSOT DIVERGENCE — byte-identical parity is currently BROKEN on runtime main.** After the 4 plugins froze at `v0.2.0` (2026-07-17 20:35Z), the **baked** `providers/identity.py` advanced via `2db2e8f` (`<SYSTEM IDLE PROMPT>` framing + in-process bridge-registry union) and `5e634ee` (#327 byte-budget/valve). The frozen identity plugin lacks all of it, so the identity header no longer renders byte-identical baked-vs-plugin — and the per-plugin parity CIs went self-contained (plugin-vs-static-golden) and **no longer compare baked-vs-plugin**, so the drift shipped undetected. (mail/goal/task are NOT stale: #292's resilience is in the shared substrate/`PlatformMailSummarySource` the plugins inherit; goal/task render halves are unchanged.)
+- **Pre-delete ENGINEERING (not "operational only"):** (a) repoint `molecule_runtime/a2a_tools_idle.py` off `idle_digest.providers` (it still imports `GoalStateProvider`/`TaskQueueProvider`, backing the `goal_get`/`task_list` MCP tools — a naive delete breaks agent tooling fleet-wide); (b) relocate the `GoalStore`/`TaskQueueStore` writer halves (runtime-owned); (c) rewrite the parity goldens (they compare baked==plugin — deletion removes both sides) + add a runtime retired-artifacts guard (the runtime has none); (d) **cut identity plugin `>v0.2.0` to absorb the framing/bridge-union/#327** before the delete, else it regresses the header; (e) **rebase runtime#324** (head predates #292/#327/framing; `mergeable=false`).
+- **D3 delete** — remove `idle_digest/providers/` + make `build_default_providers()` discovery-only. Owner-gated on Phase-B arming + flag-on AND the pre-delete engineering above.
 - **Fleet rollout** — runtime image rebuild (carrying the loader + vendored registry trust source) + re-provision, then flipping `MOLECULE_DIGEST_PROVIDER_PLUGINS`, `MOLECULE_DECLARE_DEFAULT_NATIVE_PLUGINS`, and `E2E_DIGEST_PLUGIN_CHECK` on.
 - **This RFC's own sign-off** — the phasing is fully built to spec; awaiting CTO ratification of the design record.
 

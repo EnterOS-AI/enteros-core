@@ -53,6 +53,8 @@
 set -euo pipefail
 
 source "$(dirname "$0")/_lib.sh"  # sets BASE default + admin-auth + cleanup helpers
+# shellcheck source=lib/a2a_queue_guard.sh
+source "$(dirname "$0")/lib/a2a_queue_guard.sh"
 
 # ---- config -----------------------------------------------------------------
 ADMIN_TOKEN="${ADMIN_TOKEN:-${MOLECULE_ADMIN_TOKEN:-}}"
@@ -855,14 +857,10 @@ try:
 except Exception:
   print('false')" 2>/dev/null || echo "false")
 if [ "$A2A_QUEUED" = "true" ]; then
-  A2A_QID=$(printf '%s' "$A2A" | python3 -c "
-import sys,json
-try:
-  print(json.load(sys.stdin).get('queue_id',''))
-except Exception:
-  print('')" 2>/dev/null || echo "")
-  if [ -z "$A2A_QID" ]; then
-    infra_skip_advisory "a2a-queued-no-queue-id" "initial POST was queued but returned no queue_id"
+  A2A_QID=$(printf '%s' "$A2A" | a2a_queue_id_from_response 2>/dev/null || echo "")
+  if ! require_a2a_queue_id "$A2A_QID"; then
+    echo "=== Results: $PASS passed, $FAIL failed ==="
+    exit 1
   fi
   echo "  A2A queued (queue_id=$A2A_QID); polling durable result..."
   A2A_POLL_TMP=$(mktemp)

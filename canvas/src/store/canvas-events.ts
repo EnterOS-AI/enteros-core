@@ -2,6 +2,8 @@ import type { Node, Edge } from "@xyflow/react";
 import type { WSMessage } from "./socket";
 import type { WorkspaceNodeData, BootStep } from "./canvas";
 import { extractResponseText, extractFilesFromTask } from "@/components/tabs/chat/message-parser";
+import { appendBootLog, mergeBootStep, parseBootStepWire } from "./boot-telemetry";
+import type { BootStepWire } from "./boot-telemetry";
 
 // ---------------------------------------------------------------------------
 // Monotonically increasing counter used to assign grid positions.
@@ -197,11 +199,27 @@ export function handleCanvasEvent(
     case "WORKSPACE_PROVISIONING": {
       const exists = nodes.find((n) => n.id === msg.workspace_id);
       if (exists) {
-        // Restart — update existing node to provisioning
+        // Restart — update existing node to provisioning. bootSteps/bootLog
+        // are explicitly dropped: this event starts a NEW boot generation
+        // (the server resets its boot trace on the same event), and stale
+        // telemetry left here would render the previous boot's keycaps/log —
+        // including a spurious "Boot failed" banner — over the fresh boot,
+        // with the hydrate carry-over then preserving it on every rehydrate.
         set({
           nodes: nodes.map((n) =>
             n.id === msg.workspace_id
-              ? { ...n, data: { ...n.data, status: "provisioning", needsRestart: false, currentTask: "" } }
+              ? {
+                  ...n,
+                  data: {
+                    ...n.data,
+                    status: "provisioning",
+                    needsRestart: false,
+                    currentTask: "",
+                    bootSteps: undefined,
+                    bootLog: undefined,
+                    bootGen: undefined,
+                  },
+                }
               : n
           ),
         });
@@ -511,37 +529,28 @@ export function handleCanvasEvent(
       // provisioning node lands, which is the graceful no-events fallback.
       const bootNode = nodes.find((n) => n.id === msg.workspace_id);
       if (!bootNode) break;
-      const rawStep = msg.payload.step;
-      const rawTotal = msg.payload.total;
-      const rawStatus = msg.payload.status;
-      // Defensive parse: a malformed broadcast (missing/out-of-range fields)
-      // must not corrupt the keycap layout. Reject anything that isn't a
-      // usable step rather than rendering a broken "0/8" or a blank keycap.
-      const step = typeof rawStep === "number" ? rawStep : NaN;
-      const total = typeof rawTotal === "number" ? rawTotal : NaN;
-      const key = typeof msg.payload.key === "string" ? msg.payload.key : "";
-      const label = typeof msg.payload.label === "string" ? msg.payload.label : "";
-      const status =
-        rawStatus === "running" || rawStatus === "ok" || rawStatus === "failed"
-          ? rawStatus
-          : null;
-      if (!Number.isFinite(step) || step < 1 || !Number.isFinite(total) || total < step || !key || !label || !status) {
-        break;
-      }
-      const message = typeof msg.payload.message === "string" ? msg.payload.message : undefined;
-      const incoming: BootStep = { step, total, key, label, status, message };
+      // Defensive parse — the SAME acceptance rule the GET /workspaces
+      // replay path uses (boot-telemetry.ts), so a reload can never
+      // reconstruct different state than the live session showed. A
+      // malformed broadcast is dropped rather than rendering a broken
+      // "0/8" or a blank keycap.
+      const parsed = parseBootStepWire(msg.payload as BootStepWire);
+      if (!parsed) break;
+      // Live events are stamped with the CLIENT clock; the log's display
+      // offsets clamp deltas across the clock boundary (boot-telemetry.ts),
+      // so mixing with server-stamped replayed lines cannot corrupt them.
+      const incoming: BootStep = { ...parsed, at: Date.now(), serverClock: false };
       set({
         nodes: nodes.map((n) => {
           if (n.id !== msg.workspace_id) return n;
           const prev = (n.data.bootSteps ?? []) as BootStep[];
-          // Latest status per `step` wins: a step goes running → ok/failed,
-          // so replace an existing entry at the same index in place (keeps
-          // keycap identity stable) rather than appending a duplicate.
-          const idx = prev.findIndex((s) => s.step === incoming.step);
-          const next = idx >= 0
-            ? prev.map((s, i) => (i === idx ? incoming : s))
-            : [...prev, incoming];
-          return { ...n, data: { ...n.data, bootSteps: next } };
+          // Watchdog log first (it needs the PRE-merge entry to detect
+          // whether this event's line is new), then merge latest-per-step
+          // for the keycaps. Both rules live in boot-telemetry.ts so the
+          // GET /workspaces replay path reconstructs identical state.
+          const bootLog = appendBootLog(n.data.bootLog ?? [], prev, incoming);
+          const next = mergeBootStep(prev, incoming);
+          return { ...n, data: { ...n.data, bootSteps: next, bootLog } };
         }),
       });
       break;

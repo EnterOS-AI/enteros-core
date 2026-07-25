@@ -101,6 +101,22 @@ func parseTemplatePlugins(templatePath string) ([]string, error) {
 	return merged, nil
 }
 
+// payloadPluginsToSeed applies the SAME dedup + count cap parseTemplatePlugins
+// enforces on the template path to a Create payload's `plugins:` list
+// (CreateWorkspacePayload.Plugins). It runs the raw list through
+// mergePlugins(nil, raw) for byte-identical dedup + "!"/"-" opt-out handling,
+// then bounds the result at maxTemplatePlugins. Returns (nil, false) when the
+// deduped set exceeds the cap so the caller SKIPS seeding entirely — matching
+// parseTemplatePlugins, which rejects an over-cap template rather than trimming
+// it (a hostile payload must not enqueue an unbounded declared set).
+func payloadPluginsToSeed(raw []string) (declared []string, ok bool) {
+	declared = mergePlugins(nil, raw)
+	if len(declared) > maxTemplatePlugins {
+		return nil, false
+	}
+	return declared, true
+}
+
 // seedTemplatePlugins records each declared plugin source (workspace_declared_plugins)
 // for a Create-provisioned workspace. Returns (recorded, skipped) counts so the
 // caller can observe partial-record states. Mirrors the org_import.go loop:

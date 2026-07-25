@@ -77,6 +77,9 @@ func drainTestAsync() {
 // main HEAD 8026f020 (mc#975).
 func setupTestDB(t *testing.T) sqlmock.Sqlmock {
 	t.Helper()
+	// Drain globalGoAsync stragglers from prior tests BEFORE swapping the
+	// global db.DB (see setupTestDBForQueueTests — same -race class).
+	waitGlobalAsyncForTest()
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("failed to create sqlmock: %v", err)

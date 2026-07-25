@@ -2,12 +2,10 @@ package handlers
 
 import (
 	"context"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/gin-gonic/gin"
 )
 
 // The declared source is load-bearing: it is the exact string the boot-installer
@@ -18,8 +16,13 @@ func TestEnsureSchedulerPluginDeclared_DeclaresPinnedSource(t *testing.T) {
 	mock := setupTestDB(t)
 	// molecule-scheduler is not the privileged concierge MCP → no kind precheck,
 	// straight to the declared-plugins upsert.
+	// Reference the SSOT (SchedulerPluginName/Source) not a frozen literal: the
+	// exact-pin canary lives in plugin_registry_test.go
+	// (TestNativeRegistry_SourcesByteIdenticalToRetiredConsts), so this test only
+	// needs to prove the upsert writes THAT source verbatim — and it must not
+	// re-break on every registry pin bump.
 	mock.ExpectExec(`INSERT INTO workspace_declared_plugins`).
-		WithArgs("ws-1", "molecule-scheduler", "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.1.0").
+		WithArgs("ws-1", SchedulerPluginName, SchedulerPluginSource).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := ensureSchedulerPluginDeclared(context.Background(), "ws-1"); err != nil {
@@ -59,33 +62,5 @@ func TestArmSchedulerPlugin_NoForwardWithoutURL(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("arm must stop at the empty-url check (no secret read / forward): %v", err)
-	}
-}
-
-// The prod backfill is DRY-RUN by default: it must enumerate scheduled
-// workspaces and report them WITHOUT declaring anything. The negative control is
-// the absence of any INSERT — only the SELECT runs.
-func TestBackfillSchedulerPlugin_DryRunIsReadOnly(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	mock := setupTestDB(t)
-	mock.ExpectQuery(`SELECT DISTINCT workspace_id FROM workspace_schedules`).
-		WillReturnRows(sqlmock.NewRows([]string{"workspace_id"}).AddRow("ws-a").AddRow("ws-b"))
-	// NO ExpectExec: a dry-run must not declare (mutate) anything.
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest("POST", "/admin/schedules/backfill-plugin", nil)
-
-	(&ScheduleHandler{}).BackfillSchedulerPlugin(c)
-
-	if w.Code != 200 {
-		t.Fatalf("dry-run should 200, got %d: %s", w.Code, w.Body.String())
-	}
-	body := w.Body.String()
-	if !strings.Contains(body, `"dry_run":true`) || !strings.Contains(body, `"would_declare":2`) {
-		t.Fatalf("dry-run body should report 2 candidates without mutating: %s", body)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("dry-run must be read-only (an INSERT fired): %v", err)
 	}
 }

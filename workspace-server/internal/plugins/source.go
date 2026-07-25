@@ -68,6 +68,30 @@ func (s Source) Raw() string {
 // String is Raw so Source satisfies fmt.Stringer and logs cleanly.
 func (s Source) String() string { return s.Raw() }
 
+// BoxFetchable reports whether the in-container boot materializer
+// (molecule_runtime.plugin_sources) can re-fetch this source by itself on a
+// (re-)provision — i.e. whether the source names a remote the box can pull.
+//
+// This is the single source of truth for that property. It governs the
+// online-transition reconcile: reconcile re-delivers any plugin missing from
+// /configs/plugins and, unless told not to, restarts the box to activate it.
+// A restart re-provisions the box, which wipes /configs — so for a source the
+// box CANNOT re-fetch, the next reconcile finds the plugin missing again,
+// re-delivers, and restarts again: an infinite restart loop. Suppressing the
+// automatic restart for such sources breaks the loop (the bytes are already
+// delivered; activation waits for an explicit restart).
+//
+// Only "local" is host-side: LocalResolver reads the workspace-server's own
+// plugins/ directory, which no in-container process can reach, so its bytes are
+// pushed in from the host and evaporate on the next re-provision. Every other
+// scheme (github, gitea, presign, clawhub, https, …) names a remote the boot
+// materializer pulls. Unknown schemes default to fetchable: a genuinely
+// unfetchable new scheme would surface as the (visible) restart loop — a safer
+// failure than silently suppressing the restart of a legitimate remote plugin.
+func (s Source) BoxFetchable() bool {
+	return s.Scheme != "local"
+}
+
 // schemeRE matches "<scheme>://" where scheme is the usual URL-scheme
 // grammar (ASCII letters, digits, +, -, .). The body match is `.*` (can
 // be empty) so we can emit a targeted error for `local://` rather than

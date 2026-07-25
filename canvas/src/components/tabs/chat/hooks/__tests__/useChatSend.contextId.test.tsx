@@ -69,7 +69,7 @@ describe("useChatSend — stable conversation contextId (tenant-agent BUG 3)", (
     const c2 = ctxOf(1);
     expect(c1).toBeTruthy();
     expect(c1).toBe(c2); // STABLE across turns — the whole point
-    expect(c1).toMatch(/^conv-ws-ctx-/); // workspace-scoped
+    expect(c1).toBe("canvas-ws-ctx"); // workspace-scoped
     // Matches the persisted conversation id.
     expect(c1).toBe(getConversationId("ws-ctx"));
   });

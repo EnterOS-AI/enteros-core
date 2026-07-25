@@ -35,6 +35,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 )
 
 const (
@@ -146,7 +148,7 @@ func hashLocalTree(root string) (map[string]string, error) {
 			return err
 		}
 		sum := sha256.Sum256(body)
-		out[filepath.ToSlash(rel)] = hex.EncodeToString(sum[:])
+		out[wirepath.Normalize(rel)] = hex.EncodeToString(sum[:])
 		return nil
 	})
 	if err != nil {

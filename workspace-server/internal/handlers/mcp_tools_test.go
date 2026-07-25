@@ -49,6 +49,32 @@ func TestExtractA2AText_A2AErrorMissingMessage(t *testing.T) {
 	}
 }
 
+func TestExtractA2AText_TaskStatusMessageText(t *testing.T) {
+	// The a2a-sdk TASK response shape (result.status.message.parts) — the
+	// hermes runtime answers message/send with this; 2026-07-19 regression:
+	// the first-boot greeting's in-character reply fell through to the JSON
+	// fallback and was discarded in favor of the canned text.
+	body, _ := json.Marshal(map[string]interface{}{
+		"result": map[string]interface{}{
+			"id":   "task-1",
+			"kind": "task",
+			"status": map[string]interface{}{
+				"state": "completed",
+				"message": map[string]interface{}{
+					"role": "agent",
+					"parts": []interface{}{
+						map[string]interface{}{"kind": "text", "text": "Hey there! I'm your agent."},
+					},
+				},
+			},
+		},
+	})
+	got := extractA2AText(body)
+	if got != "Hey there! I'm your agent." {
+		t.Errorf("task status message: got %q", got)
+	}
+}
+
 func TestExtractA2AText_ArtifactsText(t *testing.T) {
 	body, _ := json.Marshal(map[string]interface{}{
 		"result": map[string]interface{}{

@@ -121,25 +121,20 @@ PR_EVENTS = {"pull_request", "pull_request_target"}
 #   Lint workflow YAML (repository compatibility policy) / Lint workflow YAML ...
 MASK_WAIVERS = {
     # ── Blocked by the PRE-FLIP GATE, not by a red job ──────────────────
-    # All three below are PROVEN GREEN (see each workflow's inline comment),
+    # The two below are PROVEN GREEN (see each workflow's inline comment),
     # but lint_pre_flip_continue_on_error.py — which is itself an unmasked,
     # merge-blocking required context — refuses to bless the flip, so
     # un-masking them would red every PR. Left masked deliberately.
+    # (A third, `Harness Replays / detect-changes`, was in this bucket until
+    # #4521 unmasked it — see the note just below.)
     #
-    # `Harness Replays / detect-changes`: green 15/15 (step-level, Actions
-    # API). The pre-flip gate cannot SEE those runs — lint_pre_flip_
-    # continue_on_error.py:426 reads the COMBINED-status endpoint
-    # `/commits/{sha}/status`, which Gitea caps at 30 statuses; this repo posts
-    # 60 distinct contexts per commit, and this context sorts past the cap. The
-    # gate then fail-closes with "no runs ... cannot verify flip". FIX = paginate
-    # that fetch (or use /commits/{sha}/statuses?page=N, which does paginate).
-    # This is a MASKED DETECTOR — empty outputs on failure silently no-op the
-    # whole replay suite — so it is the highest-value one to unmask.
-    "Harness Replays / detect-changes":
-        "PROVEN GREEN (15/15 runs, step-level) but the pre-flip gate cannot verify it: "
-        "lint_pre_flip_continue_on_error.py:426 uses the un-paginated combined-status "
-        "endpoint (30-status cap; repo posts 60 contexts). Unmask once that paginates. "
-        "MASKED DETECTOR — highest priority. Follow-up filed.",
+    # `Harness Replays / detect-changes` was UNMASKED by #4521 (proven green
+    # 15/15 step-level, and still green on current main) — its waiver has been
+    # pruned from this register. The pre-flip-gate blind spot that kept it masked
+    # (lint_pre_flip_continue_on_error.py:426 reads the un-paginated
+    # `/commits/{sha}/status` combined endpoint, 30-status cap while the repo
+    # posts 60 contexts) is tracked separately in task #106.
+    #
     # The next two are PATHS-FILTERED workflows: they essentially never run on a
     # push to main, and the pre-flip gate only accepts main-PUSH runs from the
     # last RECENT_COMMITS_N (=5) commits as proof. So they can NEVER satisfy it —
@@ -156,12 +151,6 @@ MASK_WAIVERS = {
     # In-flight: these masks are being removed by other open PRs. Waived here
     # ONLY so this lint can land without a merge-order dead-lock against them.
     # When those PRs merge, the waiver goes stale and is reported as prune-me.
-    "E2E Staging Canvas (Playwright) / detect-changes":
-        "mask removed by PR #4323 (in flight) — prune this waiver once #4323 lands",
-    "E2E Staging Canvas (Playwright) / Canvas tabs E2E":
-        "mask removed by PR #4323 (in flight) — prune this waiver once #4323 lands",
-    "E2E Staging SaaS (full lifecycle) / E2E Staging SaaS":
-        "mask removed by PR #4326 (in flight) — prune this waiver once #4326 lands",
     "E2E Staging SaaS (full lifecycle) / Prune stale e2e DNS records":
         "mask removed by PR #4326 (in flight) — prune this waiver once #4326 lands",
     "Ops Scripts Tests / Ops scripts (unittest)":

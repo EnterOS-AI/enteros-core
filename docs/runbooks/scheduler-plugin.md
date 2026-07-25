@@ -16,11 +16,16 @@ scheduled turns on old-pin workspaces fire nowhere.
 
 All in `workspace-server/internal/handlers/scheduler_plugin.go`:
 
-1. **Declare** — creating a schedule (Canvas/API) or seeding template schedules
-   upserts `molecule-scheduler` into `workspace_declared_plugins`
-   (`ensureSchedulerPluginDeclared`, idempotent). Declared plugins install at
-   boot via `MOLECULE_DECLARED_PLUGINS` or on the transition-to-online
-   reconcile.
+1. **Declare** — as of core#4541 the scheduler is a **base per-workspace
+   ability declared on every provision** (create/restart/resume), because the
+   one `molecule-scheduler` plugin now ships both the firing daemon *and* the
+   self-schedule MCP tool — and you need the tool to create the first schedule,
+   so it can no longer wait for a schedule to exist. `ensureSchedulerPluginDeclared`
+   upserts `molecule-scheduler` into `workspace_declared_plugins` (idempotent);
+   schedule-create and template seeding still call the same upsert on-demand.
+   Declared plugins install at boot via `MOLECULE_DECLARED_PLUGINS` or on the
+   transition-to-online reconcile. The every-provision declare is guarded by a
+   default-on kill-switch — see **Kill-switch: halt the roll-out** below.
 2. **Arm (hot)** — core then best-effort forwards
    `POST /internal/daemons/reload` to the running workspace
    (`armSchedulerPlugin`; bearer = the per-workspace platform-inbound secret,
@@ -30,6 +35,67 @@ All in `workspace-server/internal/handlers/scheduler_plugin.go`:
 3. **Advertise** — once the daemon is up, the workspace heartbeat advertises
    the `scheduler` capability; core's `ProvidesNativeScheduler` flips true and
    schedule CRUD proxies to the volume backend (`schedules_proxy.go`).
+
+## Kill-switch: halt the roll-out (`MOLECULE_DECLARE_SCHEDULER_PLUGIN`)
+
+The unconditional every-provision `ensureSchedulerPluginDeclared` (step 1 above,
+in `workspace_provision_shared.go`) is guarded by one env flag on the
+**workspace-server (core)** deployment:
+
+| Env var | Default | Guards | Parsing |
+| --- | --- | --- | --- |
+| `MOLECULE_DECLARE_SCHEDULER_PLUGIN` | **ON** | the unconditional every-provision scheduler declare | unset / `""` / `1` / `true` / `yes` ⇒ **ON**; `0` / `false` / `no` (case-insensitive, trimmed) ⇒ **OFF** |
+
+`declareSchedulerPluginEnabled()` (`scheduler_plugin.go`) reads it: default-on
+means provisioning is **byte-identical to today** unless the owner explicitly
+sets a falsey value.
+
+**To emergency-halt the scheduler roll-out without a code revert:** set
+`MOLECULE_DECLARE_SCHEDULER_PLUGIN=0` (or `false`/`no`) in the workspace-server
+(core) deployment env and roll it. New provisions then declare no scheduler;
+already-declared workspaces are unaffected (the flag gates the declare, not
+un-declare). Flipping it back to ON (or removing it) resumes the roll-out.
+
+> **Where to set it:** this is a **code-default lever only** — it is read
+> straight from the process env and is **not yet registered in the Infisical /
+> CP config SSOT**. Set it in the core deployment's env (the same place other
+> core process env lives), not by adding an Infisical secret expecting it to
+> flow through — until it is onboarded to the config SSOT, an Infisical entry
+> would not reach the process.
+
+**Sibling flag — note the inverted default.** The idle-digest default-native
+declaration (`declareDefaultNativePlugins`, `plugin_registry.go`) has its own
+switch `MOLECULE_DECLARE_DEFAULT_NATIVE_PLUGINS`, which is **default OFF** and
+gates declaring the *other* `install: default` native plugins (the digest
+providers). The scheduler needed a **symmetric but inverted** switch: the
+scheduler roll-out is on-by-default and this flag exists to *halt* it, whereas
+the digest flag is off-by-default and exists to *arm* it (fleet-rollout step 3).
+`""`/`0`/`false`/`no` all read OFF for the digest flag; only a truthy value arms it.
+
+## Ownership / SSOT: the scheduler is declared exactly once
+
+The scheduler is declared **exactly once per provision**, by
+`ensureSchedulerPluginDeclared`, under the const name
+`SchedulerPluginName = "molecule-scheduler"`. It is deliberately **excluded**
+from `declareDefaultNativePlugins`:
+
+- Both paths run on every provision. `declareDefaultNativePlugins` seeds the
+  `install: default` native set from the SDK native-plugins registry SSOT, but
+  it seeds `defaultNativePluginSourcesForDeclare()` — which is the full
+  `install: default` set **MINUS `SchedulerPluginSource`** (the filter lives in
+  `plugin_registry.go`).
+- Why the filter matters: `declareDefaultNativePlugins` derives each plugin's
+  install name from its source via `PluginNameFromSource`, which for the
+  scheduler source yields a **different** name, `molecule-ai-plugin-scheduler`,
+  than the const `molecule-scheduler` the dedicated path declares. Declaring via
+  both paths therefore produced **two `workspace_declared_plugins` rows for one
+  plugin** (a divergent-name double-declare, and a duplicate boot-install), not
+  a harmless idempotent no-op.
+- The filter is applied in `defaultNativePluginSourcesForDeclare()`, **not** in
+  `defaultNativePluginSources()` — so the registry-derived SSOT set stays
+  untouched for every other consumer (e.g. the concierge-exclusion test).
+
+Reference: core#4541.
 
 ## Health
 
@@ -88,7 +154,11 @@ automatically on merge:
    (a soft restart reuses the old image).
 3. **Declare-flag** — flip `MOLECULE_DECLARE_DEFAULT_NATIVE_PLUGINS` (core
    env, default-off, `plugin_registry.go`) so every provision declares the
-   `install: default` native plugins (scheduler + digest providers).
+   *other* `install: default` native plugins (the digest providers). Post
+   core#4541 the **scheduler is no longer declared by this flag** — it is
+   declared unconditionally on every provision (default-on, its own
+   `MOLECULE_DECLARE_SCHEDULER_PLUGIN` kill-switch) and filtered out of this
+   path to avoid a divergent-name double-declare (see **Ownership / SSOT**).
 4. **Digest org-secret** — set the runtime-side digest loader flag
    `MOLECULE_DIGEST_PROVIDER_PLUGINS=1` for workspaces via the org/global
    secret env fan-out (flag-off is byte-identical; separate RFC, same rollout

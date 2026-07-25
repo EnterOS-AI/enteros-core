@@ -60,6 +60,11 @@ import urllib.error
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:
+    import yaml  # PyYAML — same parser the real runtime seeds config.yaml with.
+except Exception:  # pragma: no cover — import guard so a missing dep is diagnosable.
+    yaml = None
+
 PORT = 8000
 
 WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "").strip()
@@ -102,6 +107,140 @@ _started = time.time()
 
 def _log(msg):
     print(f"[stub-runtime {_short}] {msg}", flush=True)
+
+
+def _plugin_name_from_source(src):
+    """Derive the on-box plugin directory name from a declared source, mirroring
+    workspace-server/internal/plugins.PluginNameFromSource: strip the scheme and
+    any #ref, then take the LAST path segment (the repo, or a subpath leaf). E.g.
+    `gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0` -> `molecule-ai-plugin-scheduler`.
+    Returns "" for an unparseable entry (skipped)."""
+    s = (src or "").strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("#", 1)[0].rstrip("/")
+    return s.split("/")[-1] if s else ""
+
+
+def materialize_declared_plugins():
+    """Boot-materialize the workspace's DECLARED plugins, mirroring the real
+    runtime's boot materializer (molecule_runtime.plugin_sources.install_declared_plugins):
+    for every source in MOLECULE_DECLARED_PLUGINS, create
+    /configs/plugins/<name>/plugin.yaml so the plugin reads as boot-installed.
+
+    WHY THE STUB NEEDS THIS: the platform's post-online plugin reconcile skips
+    delivery+restart for a plugin already present on the box
+    (plugins_reconcile.pluginPresentOnBox cats /configs/plugins/<name>/plugin.yaml).
+    The REAL runtime pulls declared plugins at boot, so a new workspace is online
+    WITH them and the reconcile is a no-op. This stub carried no materializer, so a
+    default-on plugin (e.g. molecule-scheduler, now declared on every workspace)
+    read as "not on box" -> the reconcile docker-cp'd it into the running container
+    and AUTO-RESTARTED to load it — which races (and, with AutoRemove containers,
+    tears down) the restart-survival + proxy assertions. Materializing here makes
+    the stub faithful to production's present-at-first-boot contract. Placeholder
+    content is sufficient: the stub runs no plugin host, and pluginPresentOnBox only
+    checks that plugin.yaml exists and is non-empty. Idempotent (config volume
+    persists across restart)."""
+    raw = os.environ.get("MOLECULE_DECLARED_PLUGINS", "").strip()
+    if not raw:
+        return
+    plugins_dir = os.path.join(CONFIG_PATH, "plugins")
+    for src in raw.split(","):
+        name = _plugin_name_from_source(src)
+        if not name:
+            continue
+        try:
+            pdir = os.path.join(plugins_dir, name)
+            os.makedirs(pdir, exist_ok=True)
+            manifest = os.path.join(pdir, "plugin.yaml")
+            if not os.path.exists(manifest) or os.path.getsize(manifest) == 0:
+                with open(manifest, "w") as f:
+                    f.write(
+                        f"name: {name}\n"
+                        "kind: stub\n"
+                        "# boot-materialized placeholder (e2e stub runtime) — see "
+                        "materialize_declared_plugins()\n"
+                    )
+            _log(f"materialized declared plugin: {name}")
+        except Exception as e:
+            _log(f"materialize {name!r} failed (non-fatal): {e}")
+
+
+def _config_schedule_entries():
+    """Read the delivered /configs/config.yaml top-level `schedules:` block and
+    return it as a list of grid entries in the shape core's schedules_proxy
+    expects (volumeEntry: name/cron/timezone/prompt/enabled/source). Returns []
+    when there is no config, no schedules node, or the config can't be parsed.
+
+    WHY: on self-host the platform GRAFTS the platform-agent template's
+    `schedules:` node onto the concierge's composed config.yaml
+    (graftConciergeSchedules, workspace-server platform_agent.go). The REAL
+    runtime's seed_schedules_from_workspace_config then materializes that block
+    into the runtime schedule grid; core reads the grid via
+    GET /workspaces/:id/schedules -> proxy -> GET /internal/schedules. This stub
+    carries no runtime, so it mirrors that seed: parse the config schedules and
+    serve them as the grid. Faithful to the runtime seeder's config path (the
+    `cron` key is passed through as-is — it is already the grid's field name;
+    schedules_proxy.volumeEntry maps `cron`, not core's `cron_expr`)."""
+    cfg = os.path.join(CONFIG_PATH, "config.yaml")
+    if yaml is None:
+        _log("PyYAML unavailable — cannot parse config.yaml schedules")
+        return []
+    try:
+        with open(cfg, "r") as f:
+            doc = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        _log(f"config.yaml parse failed (non-fatal): {e}")
+        return []
+    raw = doc.get("schedules") if isinstance(doc, dict) else None
+    if not isinstance(raw, list):
+        return []
+    entries = []
+    for s in raw:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name", "")).strip()
+        if not name:
+            continue
+        entries.append({
+            "name": name,
+            "cron": str(s.get("cron", "")),
+            "timezone": str(s.get("timezone", "")),
+            "prompt": str(s.get("prompt", "")),
+            "enabled": bool(s.get("enabled", True)),
+            # Config.yaml-seeded schedules are template-origin (schedules.go:102).
+            "source": str(s.get("source", "") or "template"),
+        })
+    return entries
+
+
+def materialize_schedules_from_config():
+    """Boot-materialize the config.yaml `schedules:` block onto
+    /configs/schedules/schedules.yaml — mirroring the real runtime's
+    seed_schedules_from_workspace_config, which writes the grid file the
+    ephemeral SaaS e2e reads via `docker exec cat /configs/schedules/schedules.yaml`
+    (test_staging_full_saas.sh). The live grid served by GET /internal/schedules is
+    read fresh from config.yaml on each request (below); this file write is the
+    on-disk mirror the docker-exec assertion inspects. Best-effort + idempotent."""
+    entries = _config_schedule_entries()
+    if not entries:
+        return
+    try:
+        sched_dir = os.path.join(CONFIG_PATH, "schedules")
+        os.makedirs(sched_dir, exist_ok=True)
+        out = os.path.join(sched_dir, "schedules.yaml")
+        payload = {"schedules": entries}
+        with open(out, "w") as f:
+            if yaml is not None:
+                yaml.safe_dump(payload, f, sort_keys=False, default_flow_style=False)
+            else:
+                json.dump(payload, f)
+        _log(f"materialized {len(entries)} schedule(s) onto {out}: "
+             f"{[e['name'] for e in entries]}")
+    except Exception as e:
+        _log(f"materialize schedules failed (non-fatal): {e}")
 
 
 def read_volume_token():
@@ -245,7 +384,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        # Health: any GET returns 200 so probes see us as alive.
+        # Schedule grid: core's GET /workspaces/:id/schedules proxies to
+        # <wsURL>/internal/schedules (schedules_proxy.forwardScheduleAPI) and
+        # expects 200 {"schedules":[volumeEntry...]}. Serve the config.yaml-seeded
+        # grid (read fresh so a config delivered slightly after boot is still
+        # picked up). The proxy attaches the inbound-secret bearer; the stub does
+        # no LLM work, so it does not re-validate it (same posture as its other
+        # routes) — the e2e only exercises the grid contract, not auth.
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path == "/internal/schedules":
+            self._send(200, {"schedules": _config_schedule_entries()})
+            return
+        # Health: any other GET returns 200 so probes see us as alive.
         self._send(200, {"status": "ok", "stub": True, "workspace_id": WORKSPACE_ID})
 
     def do_POST(self):
@@ -288,6 +438,18 @@ def main():
         sys.exit(1)
 
     _log(f"booting: platform={PLATFORM_URL} self_url={SELF_URL} hostname={HOSTNAME}")
+
+    # Boot-materialize declared plugins BEFORE the first heartbeat flips us online,
+    # so the platform's transition-to-online plugin reconcile sees them already on
+    # the box (present-at-first-boot) and records-only instead of docker-cp'ing +
+    # auto-restarting them mid-lifecycle. Mirrors the real runtime's boot materializer.
+    materialize_declared_plugins()
+
+    # Boot-materialize the config.yaml schedules block onto
+    # /configs/schedules/schedules.yaml (the on-disk grid mirror the docker-exec
+    # assertion reads), mirroring the real runtime's config-schedule seeder. The
+    # live GET /internal/schedules grid is served fresh from config.yaml.
+    materialize_schedules_from_config()
 
     # Start the HTTP server FIRST so the platform can reach us the instant we
     # register (avoids a race where the proxy forwards before we're listening).

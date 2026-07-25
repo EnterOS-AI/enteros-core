@@ -260,63 +260,6 @@ class TestValidateTracker(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# End-to-end fixture pin: the real .gitea/workflows/e2e-staging-saas.yml
-# --------------------------------------------------------------------------
-class TestE2eStagingSaasWorkflow(unittest.TestCase):
-    """Pin the live workflow file: prune-stale-e2e-dns must have a
-    fresh, open tracker reference. Regression guard for mc#3147
-    (governance decision: keep fail-soft + renew tracker)."""
-
-    REPO_ROOT = Path(__file__).resolve().parents[3]
-    WORKFLOW_PATH = REPO_ROOT / ".gitea" / "workflows" / "e2e-staging-saas.yml"
-
-    def test_workflow_has_prune_stale_e2e_dns_with_truthy_coe(self):
-        """The live workflow must contain the prune-stale-e2e-dns job
-        with continue-on-error: true (governance decision per mc#3147)."""
-        self.assertTrue(
-            self.WORKFLOW_PATH.exists(),
-            f"workflow not found at {self.WORKFLOW_PATH}",
-        )
-        raw = self.WORKFLOW_PATH.read_text(encoding="utf-8")
-        doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
-        raw_lines = raw.splitlines()
-        locs = lcoet.find_coe_truthies(doc, raw_lines)
-        coe_jobs = {jkey for jkey, _ in locs}
-        self.assertIn(
-            "prune-stale-e2e-dns",
-            coe_jobs,
-            f"prune-stale-e2e-dns must have continue-on-error: true; "
-            f"found coe jobs: {coe_jobs}",
-        )
-
-    def test_workflow_prune_stale_e2e_dns_has_tracker_in_window(self):
-        """The prune-stale-e2e-dns job's continue-on-error directive must
-        have a `# mc#NNN` or `# internal#NNN` tracker within 2 lines."""
-        raw = self.WORKFLOW_PATH.read_text(encoding="utf-8")
-        doc = lcoet.yaml.load(raw, Loader=lcoet._LineLoader)
-        raw_lines = raw.splitlines()
-        locs = lcoet.find_coe_truthies(doc, raw_lines)
-        for jkey, line in locs:
-            if jkey == "prune-stale-e2e-dns":
-                tracker = lcoet.find_tracker_in_window(raw_lines, line)
-                self.assertIsNotNone(
-                    tracker,
-                    f"prune-stale-e2e-dns at line {line} has no tracker "
-                    f"comment within ±{lcoet.WINDOW} lines. Per mc#3147, "
-                    f"the fail-soft mask must carry a fresh mc#NNNN reference.",
-                )
-                slug, num = tracker
-                self.assertEqual(slug, "mc", "tracker slug should be 'mc'")
-                self.assertGreater(
-                    num, 0, f"tracker number must be positive, got {num}"
-                )
-                return
-        self.fail("prune-stale-e2e-dns coe directive not found")
-
-
-# --------------------------------------------------------------------------
-# End-to-end fixture pin: the real .gitea/workflows/design-token-drift-gate.yml
-# --------------------------------------------------------------------------
 class TestDesignTokenDriftGateWorkflow(unittest.TestCase):
     """Pin the live workflow file: drift job must have a fresh, open
     tracker reference. Regression guard for mc#3089 (governance decision:

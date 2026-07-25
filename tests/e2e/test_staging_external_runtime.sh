@@ -115,6 +115,12 @@ PROVIDER="${E2E_PROVIDER:-molecules-server}"
 # shellcheck source=lib/collision-proof-slug.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/collision-proof-slug.sh"
+# Shared tenant routing/CORS topology helper (derive_tenant_topology). Default (all
+# MOLECULE_TENANT_* unset) reproduces exact staging behaviour byte-for-byte; the
+# ephemeral-CP runner sets MOLECULE_TENANT_URL/_ROUTE_DOMAIN/_ORIGIN_TEMPLATE.
+# shellcheck source=lib/tenant_topology.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/tenant_topology.sh"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
@@ -159,8 +165,10 @@ register_with_retry() {  # $1 = step label, $2 = request body
     set +e
     resp=$(curl -sS --max-time 30 -w "\nHTTP_CODE=%{http_code}" -X POST \
       "$TENANT_URL/registry/register" \
+      "${TENANT_ROUTE_HDRS[@]}" \
       -H "Authorization: Bearer $WS_AUTH_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
+      -H "Origin: $TENANT_ORIGIN" \
       -H "Content-Type: application/json" \
       -d "$body")
     set -e
@@ -321,16 +329,16 @@ print('(no org row found for slug=$SLUG — DB drift?)')
 done
 ok "Tenant provisioning complete"
 
-# Derive tenant URL the same way the full-saas harness does.
-CP_HOST=$(echo "$CP_URL" | sed -E 's#^https?://##; s#/.*$##')
-case "$CP_HOST" in
-  api.*)         DERIVED_DOMAIN="${CP_HOST#api.}" ;;
-  staging-api.*) DERIVED_DOMAIN="staging.${CP_HOST#staging-api.}" ;;
-  *)             DERIVED_DOMAIN="$CP_HOST" ;;
-esac
-TENANT_DOMAIN="${MOLECULE_TENANT_DOMAIN:-$DERIVED_DOMAIN}"
-TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
+# Derive tenant routing/CORS topology via the shared helper. Sets TENANT_URL,
+# TENANT_ROUTE_HOST, TENANT_ROUTE_HDRS[] (Host + X-Molecule-Org-Slug, empty on
+# staging), TENANT_ORIGIN. Default (all MOLECULE_TENANT_* unset) reproduces the
+# exact staging slug.<domain> subdomain + Origin byte-for-byte.
+derive_tenant_topology "$SLUG" "$CP_URL" \
+  || fail "Could not derive tenant topology for $SLUG (set MOLECULE_TENANT_ORIGIN_TEMPLATE for ephemeral slug-routing)"
 log "    TENANT_URL=$TENANT_URL"
+if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+  log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG; CORS Origin=$TENANT_ORIGIN (ephemeral-CP slug routing)"
+fi
 
 # ─── 3. Per-tenant admin token + TLS readiness ──────────────────────────
 log "3/8 Fetching per-tenant admin token..."
@@ -342,9 +350,18 @@ ok "Token retrieved (len=${#TENANT_TOKEN})"
 log "Waiting for tenant TLS / DNS..."
 TLS_DEADLINE=$(( $(date +%s) + 15 * 60 ))
 while true; do
-  if curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1; then break; fi
+  # Under ephemeral slug-routing /health is answered by the CP's OWN global
+  # handler for ANY Host, so probing it proves NOTHING (vacuous readiness). Probe
+  # /org/identity — a tenant-owned handler the CP proxies through — WITH the route
+  # headers + X-Molecule-Org-Id so a not-yet-routable tenant is actually caught.
+  # Staging (empty TENANT_ROUTE_HDRS) keeps the global /health check unchanged.
+  if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+    curl -sSfk --max-time 5 "${TENANT_ROUTE_HDRS[@]}" -H "X-Molecule-Org-Id: $ORG_ID" -H "Origin: $TENANT_ORIGIN" "$TENANT_URL/org/identity" >/dev/null 2>&1 && break
+  else
+    curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
+  fi
   if [ "$(date +%s)" -gt "$TLS_DEADLINE" ]; then
-    fail "Tenant URL never responded 2xx on /health within 15min"
+    fail "Tenant never became routable within 15min (probe: $( [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ] && echo '/org/identity via route headers' || echo '/health' ))"
   fi
   sleep 5
 done
@@ -353,8 +370,10 @@ ok "Tenant reachable"
 tenant_call() {
   local method="$1"; shift; local path="$1"; shift
   curl "${CURL_COMMON[@]}" -X "$method" "$TENANT_URL$path" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
+    -H "Origin: $TENANT_ORIGIN" \
     "$@"
 }
 
@@ -583,8 +602,10 @@ print(json.dumps({
     : >"$a2a_tmp"
     set +e
     a2a_code=$(curl -sS --max-time 60 -X POST "$TENANT_URL/workspaces/$wid/a2a" \
+      "${TENANT_ROUTE_HDRS[@]}" \
       -H "Authorization: Bearer $TENANT_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
+      -H "Origin: $TENANT_ORIGIN" \
       -H "Content-Type: application/json" \
       -d "$a2a_payload" -o "$a2a_tmp" -w '%{http_code}' 2>/dev/null)
     a2a_rc=$?
