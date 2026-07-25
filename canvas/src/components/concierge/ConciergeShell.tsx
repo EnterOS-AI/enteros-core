@@ -111,10 +111,10 @@ export function ConciergeShell() {
 
   // Dynamic org name for the topbar. Sourced from GET /org/identity
   // ({name} ← MOLECULE_ORG_NAME, added by a parallel backend change).
-  // Falls back to "Molecule AI" when the endpoint 404s / errors or
+  // Falls back to "Enter OS" when the endpoint 404s / errors or
   // returns an empty name, so the topbar never breaks before the backend
   // lands.
-  const [orgName, setOrgName] = useState("Molecule AI");
+  const [orgName, setOrgName] = useState("Enter OS");
   // Current org slug (from GET /org/identity) — used to highlight the active
   // org in the switcher and to derive the apex domain for cross-org navigation.
   const [orgSlug, setOrgSlug] = useState("");
@@ -129,7 +129,7 @@ export function ConciergeShell() {
         if (!cancelled && slug) setOrgSlug(slug);
       })
       .catch(() => {
-        // No endpoint / not reachable — keep the "Molecule AI" fallback.
+        // No endpoint / not reachable — keep the "Enter OS" fallback.
       });
     return () => {
       cancelled = true;
@@ -386,7 +386,7 @@ export function ConciergeShell() {
             <div className={s.logo} title="Toggle sidebar" onClick={() => setRailOpen((o) => !o)}>
               <IcMolecule />
             </div>
-            <span className={s.railWordmark}>Molecule</span>
+            <span className={s.railWordmark}>Enter OS</span>
             <button className={s.railToggle} title="Collapse sidebar" onClick={() => setRailOpen((o) => !o)}>
               <IcOrgMap />
             </button>

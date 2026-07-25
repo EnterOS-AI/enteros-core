@@ -33,6 +33,7 @@ SHARED_TOKEN_NAMES: Tuple[str, ...] = (
     "--color-ink-soft",
     "--color-accent",
     "--color-accent-strong",
+    "--color-accent-wash",
     "--color-warm",
     "--color-good",
     "--color-bad",

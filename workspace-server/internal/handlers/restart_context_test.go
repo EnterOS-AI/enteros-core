@@ -59,7 +59,7 @@ func TestBuildRestartContextMessage_WithDataRendersKeysAndDelta(t *testing.T) {
 }
 
 func TestBuildRestartA2APayload_ShapeIsJSONRPCMessageSend(t *testing.T) {
-	body, err := buildRestartA2APayload("hello world")
+	body, err := buildRestartA2APayload("ws-test", "hello world")
 	if err != nil {
 		t.Fatalf("buildRestartA2APayload: %v", err)
 	}

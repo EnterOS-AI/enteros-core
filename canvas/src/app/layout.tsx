@@ -1,22 +1,41 @@
 import type { Metadata } from "next";
-import { Hanken_Grotesk, JetBrains_Mono } from "next/font/google";
+import localFont from "next/font/local";
 import { cookies, headers } from "next/headers";
 import "./globals.css";
 
-// Self-hosted at build time → CSP-safe (font-src 'self' covers them
-// because Next.js serves the .woff2 from /_next/static). Exposed as
-// CSS variables so the mobile palette can reference them without
-// importing this module.
-// Org Concierge UI typeface (canvas redesign): Hanken Grotesk, exposed as
-// --font-hanken and consumed by the --font-sans theme token in globals.css.
-const interFont = Hanken_Grotesk({
-  subsets: ["latin"],
-  weight: ["400", "500", "600", "700"],
+// Enter OS brand typography (internal#1089). The woff2 files in ./fonts/
+// are byte-identical copies of molecule-ai-sdk brand/assets/fonts/ (the
+// brand SSOT — Chillax is Fontshare, not on Google Fonts, so next/font/local
+// instead of next/font/google). Self-hosted at build time → CSP-safe
+// (font-src 'self' covers them because Next.js serves the .woff2 from
+// /_next/static). Exposed as CSS variables so the mobile palette and
+// CSS modules can reference them without importing this module:
+//   --font-chillax     → display headings (--font-display in globals.css)
+//   --font-inter-tight → body sans (--font-sans in globals.css)
+//   --font-jetbrains   → mono (--font-mono in globals.css)
+const displayFont = localFont({
+  src: [
+    { path: "./fonts/Chillax-Light.woff2", weight: "300", style: "normal" },
+    { path: "./fonts/Chillax-Regular.woff2", weight: "400", style: "normal" },
+    { path: "./fonts/Chillax-Medium.woff2", weight: "500", style: "normal" },
+    { path: "./fonts/Chillax-Semibold.woff2", weight: "600", style: "normal" },
+  ],
   display: "swap",
-  variable: "--font-hanken",
+  variable: "--font-chillax",
 });
-const monoFont = JetBrains_Mono({
-  subsets: ["latin"],
+const sansFont = localFont({
+  src: [
+    { path: "./fonts/InterTight-Regular.woff2", weight: "400", style: "normal" },
+    { path: "./fonts/InterTight-Medium.woff2", weight: "500", style: "normal" },
+  ],
+  display: "swap",
+  variable: "--font-inter-tight",
+});
+const monoFont = localFont({
+  src: [
+    { path: "./fonts/JetBrainsMono-Regular.woff2", weight: "400", style: "normal" },
+    { path: "./fonts/JetBrainsMono-Medium.woff2", weight: "500", style: "normal" },
+  ],
   display: "swap",
   variable: "--font-jetbrains",
 });
@@ -39,19 +58,19 @@ import {
 //
 // Override per-route by exporting a page-level `metadata`/`generateMetadata`
 // — Next.js merges page metadata over layout metadata using
-// `title.template` for "<page> | Molecule AI" composition.
+// `title.template` for "<page> | Enter OS" composition.
 const SITE_URL =
   process.env.NEXT_PUBLIC_SITE_URL ?? "https://app.moleculesai.app";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
   title: {
-    default: "Molecule AI — the AI org chart canvas",
-    template: "%s | Molecule AI",
+    default: "Enter OS — the AI org chart canvas",
+    template: "%s | Enter OS",
   },
   description:
-    "Molecule AI is an org-chart canvas for AI agent teams. Wire Claude Code, Codex, Hermes, and OpenClaw agents into a governed multi-agent workspace with credit metering, audit, and one-click runtime provisioning.",
-  applicationName: "Molecule AI",
+    "Enter OS is an org-chart canvas for AI agent teams. Wire Claude Code, Codex, Hermes, and OpenClaw agents into a governed multi-agent workspace with credit metering, audit, and one-click runtime provisioning.",
+  applicationName: "Enter OS",
   keywords: [
     "AI agents",
     "multi-agent",
@@ -64,9 +83,9 @@ export const metadata: Metadata = {
     "A2A",
     "agent runtime",
   ],
-  authors: [{ name: "Molecule AI" }],
-  creator: "Molecule AI",
-  publisher: "Molecule AI",
+  authors: [{ name: "Enter OS" }],
+  creator: "Enter OS",
+  publisher: "Enter OS",
   alternates: { canonical: "/" },
   // OG + Twitter images come from the file-convention sibling
   // `opengraph-image.tsx` — Next.js auto-attaches them to og:image
@@ -77,16 +96,16 @@ export const metadata: Metadata = {
   // is injected by Next.js at build time from opengraph-image.tsx.
   openGraph: {
     type: "website",
-    siteName: "Molecule AI",
+    siteName: "Enter OS",
     url: SITE_URL,
-    title: "Molecule AI — the AI org chart canvas",
+    title: "Enter OS — the AI org chart canvas",
     description:
       "Wire Claude Code, Codex, Hermes, and OpenClaw agents into a governed multi-agent workspace. Credit metering, audit, and one-click runtime provisioning.",
     locale: "en_US",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Molecule AI — the AI org chart canvas",
+    title: "Enter OS — the AI org chart canvas",
     description:
       "Wire Claude Code, Codex, Hermes, and OpenClaw agents into a governed multi-agent workspace.",
   },
@@ -204,7 +223,7 @@ export default async function RootLayout({
                 {
                   "@type": "Organization",
                   "@id": `${SITE_URL}#organization`,
-                  name: "Molecule AI",
+                  name: "Enter OS",
                   url: SITE_URL,
                   logo: `${SITE_URL}/molecule-icon.png`,
                   sameAs: [
@@ -216,14 +235,14 @@ export default async function RootLayout({
                   "@type": "WebSite",
                   "@id": `${SITE_URL}#website`,
                   url: SITE_URL,
-                  name: "Molecule AI",
+                  name: "Enter OS",
                   publisher: { "@id": `${SITE_URL}#organization` },
                   inLanguage: "en-US",
                 },
                 {
                   "@type": "SoftwareApplication",
                   "@id": `${SITE_URL}#software`,
-                  name: "Molecule AI",
+                  name: "Enter OS",
                   applicationCategory: "DeveloperApplication",
                   operatingSystem: "Web",
                   description:
@@ -244,7 +263,7 @@ export default async function RootLayout({
           }}
         />
       </head>
-      <body className={`bg-surface text-ink ${interFont.variable} ${monoFont.variable}`}>
+      <body className={`bg-surface text-ink ${displayFont.variable} ${sansFont.variable} ${monoFont.variable}`}>
         <ThemeProvider initialTheme={theme}>
           {/* ErrorBoundary is a client component; it catches render crashes
               anywhere inside AuthGate / children so a single failing view

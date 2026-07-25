@@ -775,7 +775,7 @@ describe("provision watch", () => {
       });
     });
     expect(screen.getByTestId("scene-error").textContent).toContain(
-      "Molecule's hosted proxy",
+      "Enter OS hosted proxy",
     );
   });
 
@@ -880,7 +880,7 @@ describe("provision watch", () => {
       await vi.advanceTimersByTimeAsync(WATCH_POLL_MS);
     });
     expect(screen.getByTestId("scene-error").textContent).toContain(
-      "Molecule's hosted proxy",
+      "Enter OS hosted proxy",
     );
 
     // Second scene instance: failed row WITHOUT last_sample_error → generic.
@@ -1032,7 +1032,7 @@ describe("derived-state resume", () => {
     render(<SelfHostSetupScene />);
     await flush();
     expect(screen.getByTestId("scene-error").textContent).toContain(
-      "Molecule's hosted proxy",
+      "Enter OS hosted proxy",
     );
     fireEvent.click(screen.getByTestId("scene-adjust"));
     expect(screen.getByTestId("scene-step-welcome")).toBeTruthy();

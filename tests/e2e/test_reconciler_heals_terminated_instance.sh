@@ -627,6 +627,22 @@ ok "Workspace online (instance_id=$ORIGINAL_INSTANCE_ID)"
 # provider-branched primitive lives in kill_workspace_instance (top of file).
 log "5/6 KILLING the workspace instance ($PROVIDER) to simulate an out-of-band termination..."
 require_kill_capability
+# local-docker only: capture the DOCKER CONTAINER ID (not the name) of the box we
+# are about to kill. On molecules-server the reprovision heal recreates the
+# container under the SAME name (mol-ws-<slug>-<short12>) — so the container NAME
+# and the API's instance_id (when it even surfaces it) are IDENTICAL before and
+# after the heal. The only signal that a genuine NEW instance came up is a NEW
+# container ID. Without this, the 6b SECONDARY assertion below can NEVER be
+# satisfied on this topology and dead-soaks the full REPROVISION_TIMEOUT_SECS
+# window every run (verified: run 550823/attempt 2 sat in 6b from reprovision-
+# online at 01:13:31 until the run was cancelled, ~6 min of pure soak — this
+# widens the wall-clock window in which an external cancel / job timeout lands
+# on the required lane, one of the two flakes in core#4548). Captured here,
+# before the kill, so the post-heal compare below has a real baseline.
+ORIGINAL_CONTAINER_UID=""
+if [ "$PROVIDER" != "aws" ] && docker info >/dev/null 2>&1; then
+  ORIGINAL_CONTAINER_UID=$(docker inspect -f '{{.Id}}' "$ORIGINAL_INSTANCE_ID" 2>/dev/null || echo "")
+fi
 KILLED_IDS=$(kill_workspace_instance "$ORIGINAL_INSTANCE_ID" "$SLUG")
 ok "Killed workspace instance: $KILLED_IDS — reconciler should now detect the dead instance"
 
@@ -675,7 +691,7 @@ fi
 # FUTURE TIGHTENING (deliberately one edit away): once this reprovision path
 # is proven reliable on staging, promote the `log "SECONDARY ..."` soft-miss
 # below to a `fail ...` so a stuck reprovision becomes a hard gate.
-log "6b/6 SECONDARY (best-effort): asserting auto-reprovision to online with a NEW instance_id within ${REPROVISION_TIMEOUT_SECS}s..."
+log "6b/6 SECONDARY (best-effort): asserting auto-reprovision to online with a NEW instance within ${REPROVISION_TIMEOUT_SECS}s..."
 REPROV_DEADLINE=$(( $(date +%s) + REPROVISION_TIMEOUT_SECS ))
 REPROV_OK=0
 REPROV_LAST_STATUS=""
@@ -690,19 +706,48 @@ while true; do
     REPROV_LAST_STATUS="$RP_STATUS"
   fi
   if [ "$RP_STATUS" = "online" ]; then
-    NEW_INSTANCE_ID=$(ws_field "$WS_ID" "instance_id")
-    if [ -n "$NEW_INSTANCE_ID" ] && [ "$NEW_INSTANCE_ID" != "$ORIGINAL_INSTANCE_ID" ]; then
-      REPROV_OK=1
-      break
+    if [ "$PROVIDER" != "aws" ]; then
+      # local-docker: the tenant API does NOT surface instance_id here, and the
+      # heal recreates the container under the SAME name — so "NEW instance_id"
+      # via ws_field can never be satisfied (it dead-soaks to the deadline). The
+      # genuine new-instance signal on this topology is a NEW docker container
+      # ID under the same name. Resolve it from the daemon (same surface the
+      # boot path + kill step use) and compare against the pre-kill container ID.
+      NEW_CONTAINER_NAME=$(resolve_molecules_server_container "$WS_ID")
+      if [ -n "$NEW_CONTAINER_NAME" ]; then
+        NEW_CONTAINER_UID=$(docker inspect -f '{{.Id}}' "$NEW_CONTAINER_NAME" 2>/dev/null || echo "")
+        if [ -n "$NEW_CONTAINER_UID" ] && [ "$NEW_CONTAINER_UID" != "$ORIGINAL_CONTAINER_UID" ]; then
+          NEW_INSTANCE_ID="$NEW_CONTAINER_NAME"
+          REPROV_OK=1
+          break
+        fi
+      fi
+      # online again but the replacement container is not up yet (or, if
+      # ORIGINAL_CONTAINER_UID could not be captured, we can't prove the swap) —
+      # keep polling until a distinct container ID materializes.
+    else
+      NEW_INSTANCE_ID=$(ws_field "$WS_ID" "instance_id")
+      if [ -n "$NEW_INSTANCE_ID" ] && [ "$NEW_INSTANCE_ID" != "$ORIGINAL_INSTANCE_ID" ]; then
+        REPROV_OK=1
+        break
+      fi
+      # online again but instance_id either not surfaced yet or still the old
+      # (terminated) id — keep polling until the reprovision swaps it.
     fi
-    # online again but instance_id either not surfaced yet or still the old
-    # (terminated) id — keep polling until the reprovision swaps it.
   fi
   sleep 15
 done
 
 if [ "$REPROV_OK" = "1" ]; then
-  ok "SECONDARY held — auto-reprovisioned to online on NEW instance_id=$NEW_INSTANCE_ID (was $ORIGINAL_INSTANCE_ID)"
+  if [ "$PROVIDER" != "aws" ]; then
+    # Short IDs for readability only — use printf, not ${VAR:0:N}, so the
+    # KI-013 container-name truncation guard (SEV-2499) does not flag a log line.
+    _orig_short=$(printf '%.12s' "$ORIGINAL_CONTAINER_UID")
+    _new_short=$(printf '%.12s' "$NEW_CONTAINER_UID")
+    ok "SECONDARY held — auto-reprovisioned to online on a NEW container (id ${_orig_short}… → ${_new_short}…, same name $NEW_INSTANCE_ID)"
+  else
+    ok "SECONDARY held — auto-reprovisioned to online on NEW instance_id=$NEW_INSTANCE_ID (was $ORIGINAL_INSTANCE_ID)"
+  fi
 else
   # Soft-miss — see FUTURE TIGHTENING note above. PRIMARY is the gate.
   log "⚠️  SECONDARY not satisfied within ${REPROVISION_TIMEOUT_SECS}s (status=${REPROV_LAST_STATUS:-<empty>}, instance_id=${NEW_INSTANCE_ID:-<none>}, original=$ORIGINAL_INSTANCE_ID). NOT failing — the PRIMARY heal-detection assertion is the gate; reprovision is a slower, flakier cold path. Promote this to a hard fail once it's proven reliable."

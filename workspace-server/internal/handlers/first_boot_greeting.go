@@ -97,7 +97,7 @@ func firstBootFallbackText(toolCount int) string {
 // buildFirstBootGreetPayload wraps the greet prompt in the JSON-RPC 2.0 A2A
 // message/send shape the proxy normalizes — the same envelope restart-context
 // uses, with its own metadata kind so runtimes/forensics can identify it.
-func buildFirstBootGreetPayload() ([]byte, error) {
+func buildFirstBootGreetPayload(workspaceID string) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
@@ -105,11 +105,17 @@ func buildFirstBootGreetPayload() ([]byte, error) {
 		"params": map[string]any{
 			"message": map[string]any{
 				"messageId": uuid.New().String(),
+				"contextId": platformTurnContextID(workspaceID),
 				"role":      "user",
 				"parts":     []any{map[string]any{"kind": "text", "text": firstBootGreetPrompt}},
 				"metadata": map[string]any{
-					"source":              "platform",
-					"kind":                "first_boot_greeting",
+					"source": "platform",
+					"kind":   "first_boot_greeting",
+					// SSOT self-message classifier (messagestore.selfSourceTypes):
+					// if this internal prompt is ever persisted (e.g. a
+					// busy-queued greet drained later), it renders as a system
+					// notice, never a blue user bubble.
+					"source_type":         "self-first-boot-greet",
 					"first_boot_greeting": true,
 				},
 			},
@@ -153,6 +159,16 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 				WHERE workspace_id = $1
 				  AND activity_type = 'a2a_receive'
 				  AND source_id IS NULL
+				  -- Self-source platform/runtime turns (restart-context wake,
+				  -- heartbeat harvester, cron self-ticks...) are NOT user chat:
+				  -- they must not suppress the greeting (reviews wf_b8f98be3 #4,
+				  -- wf_8b04761b #4). The marker lives at params.metadata
+				  -- (primary, runtime-stamped) OR params.message.metadata
+				  -- (platform-stamped) — mirror RequestSourceType and check both.
+				  AND COALESCE(
+				        request_body->'params'->'metadata'->>'source_type',
+				        request_body->'params'->'message'->'metadata'->>'source_type',
+				        '') NOT LIKE 'self-%'
 			)`, workspaceID,
 		).Scan(&hasHistory); err != nil {
 			log.Printf("first-boot greeting: history check failed for %s (skipping): %v", workspaceID, err)
@@ -166,7 +182,7 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 		// writer below is the single chat entry point (no duplicate rows).
 		text := ""
 		if runTurn != nil {
-			if payload, err := buildFirstBootGreetPayload(); err == nil {
+			if payload, err := buildFirstBootGreetPayload(workspaceID); err == nil {
 				status, resp, turnErr := runTurn(ctx, workspaceID, payload, "system:first-boot-greeting", false)
 				switch {
 				case turnErr != nil || status >= 300:

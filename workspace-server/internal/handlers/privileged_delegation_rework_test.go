@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/approvals"
 	"github.com/DATA-DOG/go-sqlmock"
@@ -182,10 +183,13 @@ func TestDelegate_PrivilegedConcurrentRetryRace_ReplaysWithoutGrantOr403(t *test
 // FINDING[4] (negative control / reject direction): a GENUINELY-new privileged
 // delegation with no consumable grant must still be REJECTED (403) — and because
 // the pending row is now inserted BEFORE the gate, the reject path must ROLL IT
-// BACK (bounded DELETE) so the never-dispatched delegation neither holds the
-// idempotency slot nor lingers as a phantom in-flight row. This guards against
-// the reorder accidentally (a) making the gate permissive, or (b) leaking the
-// speculative row on a 403.
+// BACK so the never-dispatched delegation neither holds the idempotency slot nor
+// lingers as a phantom in-flight row. This request carries NO idempotency_key, so
+// no idempotent poller can exist — rollback hard-DELETEs it (the keyless branch;
+// #4539 re-review FINDING[1] keeps DELETE keyless to avoid unreclaimable orphan
+// 'failed' rows). The keyed branch (terminalize-to-'failed') is covered separately.
+// This guards against the reorder accidentally (a) making the gate permissive, or
+// (b) leaking the speculative row on a 403.
 func TestDelegate_PrivilegedNewDelegationNoGrant_Rejected403AndRollsBackRow(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	mock := setupTestDB(t)
@@ -217,8 +221,8 @@ func TestDelegate_PrivilegedNewDelegationNoGrant_Rejected403AndRollsBackRow(t *t
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(`SELECT parent_id FROM workspaces WHERE id`).
 		WillReturnRows(sqlmock.NewRows([]string{"parent_id"}).AddRow(nil))
-	// The reject MUST roll back the speculative pending row — bounded to exactly
-	// this (workspace_id, delegation_id) pending delegate row.
+	// Keyless reject → the rollback hard-DELETEs the speculative pending row,
+	// bounded to exactly this (workspace_id, delegation_id) pending delegate row.
 	mock.ExpectExec("DELETE FROM activity_logs").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -310,5 +314,227 @@ func TestRestorePrivilegedDelegationGrant_EmptyGrantIsNoDBTouch(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("empty grantID must not touch the DB: %v", err)
+	}
+}
+
+// #4539 BUG 1 + re-review FINDING[1] (phantom idempotency-loser, key-aware):
+// rollbackUndispatchedDelegation's disposition depends on whether the rejected
+// delegation carried an idempotency_key.
+//
+//   - KEYED: an idempotency-race LOSER may hold this delegation_id (it returned the
+//     winner's id as 'pending' after the unique-constraint conflict), so the row is
+//     TERMINALIZED to 'failed' — the loser's poll resolves to an honest terminal
+//     state instead of a permanent phantom not-found. Pre-fix issued a DELETE.
+//   - KEYLESS: no idempotent poller can exist (lookupIdempotentDelegation
+//     early-returns for an empty key), so the row is hard-DELETEd — a terminal
+//     'failed' row here would be an unreclaimable orphan.
+//
+// Negative control (keyed direction): the ONLY registered Exec is the terminalizing
+// UPDATE. On the PRE-FIX code (unconditional DELETE) that UPDATE expectation stays
+// unmet AND a DELETE fires unexpectedly, so ExpectationsWereMet fails. Green is only
+// reachable once the keyed branch terminalizes.
+func TestRollbackUndispatchedDelegation_KeyedTerminalizes_KeylessDeletes(t *testing.T) {
+	const (
+		wsID         = "88888888-8888-4888-8888-888888888888"
+		delegationID = "99999999-9999-4999-8999-999999999999"
+	)
+
+	t.Run("keyed_terminalizes", func(t *testing.T) {
+		mock := setupTestDB(t)
+		// Expect the terminalizing UPDATE bounded to this workspace + delegation_id.
+		// (A DELETE from the pre-fix code would not match and would leave this unmet.)
+		mock.ExpectExec(`UPDATE activity_logs\s+SET status = 'failed'`).
+			WithArgs(wsID, delegationID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		rollbackUndispatchedDelegation(context.Background(), wsID, delegationID, "some-idem-key")
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("keyed rollback must terminalize the rejected row (UPDATE status='failed'), not DELETE — "+
+				"an idempotency-race loser must resolve to a terminal state, not phantom not-found: %v", err)
+		}
+	})
+
+	t.Run("keyless_deletes", func(t *testing.T) {
+		mock := setupTestDB(t)
+		// No poller can exist for a keyless delegation → clean DELETE, no orphan.
+		mock.ExpectExec(`DELETE FROM activity_logs`).
+			WithArgs(wsID, delegationID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		rollbackUndispatchedDelegation(context.Background(), wsID, delegationID, "")
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("keyless rollback must hard-DELETE the rejected row (no poller, no orphan): %v", err)
+		}
+	})
+}
+
+// #4539 convergence review FIX-B (single detach point): restorePrivilegedDelegationGrant
+// must use the ctx it is GIVEN, as-is — it must NOT re-detach. The detach
+// responsibility lives with the caller (finalizeNonDispatchedDelegation passes the
+// bounded cleanupCtx and bounds the WHOLE cleanup, restore included, under ONE
+// deadline). Surviving an EXPIRED ctx is therefore the CALLER's job (proven by
+// TestFinalizeNonDispatchedDelegation_ExpiredCtxTerminalizesAndRestores), NOT this
+// function's — an earlier revision re-detached here, letting the restore write
+// escape the cleanup bound and run ~2x the ceiling.
+//
+// Negative control for the single-detach contract: register the restore UPDATE as
+// an expectation, then call restore with an ALREADY-CANCELLED ctx. Post-FIX-B the
+// UPDATE short-circuits in database/sql (restore honors the cancelled caller ctx),
+// so the expectation stays UNMET → ExpectationsWereMet returns an error (the
+// assertion we want). PRE-FIX-B (internal WithoutCancel+timeout re-detach) the
+// UPDATE would fire despite the cancelled ctx, the expectation would be MET, and
+// this test would FAIL — pinning that the second, independent detach is gone.
+func TestRestorePrivilegedDelegationGrant_HonorsCallerCtx_NoReDetach(t *testing.T) {
+	mock := setupTestDB(t)
+
+	const (
+		grantID = "66666666-6666-4666-8666-666666666666"
+		wsID    = "77777777-7777-4777-8777-777777777777"
+	)
+	mock.ExpectExec(`UPDATE approval_requests\s+SET consumed_at = NULL`).
+		WithArgs(grantID, wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // caller handed restore an already-cancelled ctx
+
+	restorePrivilegedDelegationGrant(ctx, wsID, grantID)
+
+	if err := mock.ExpectationsWereMet(); err == nil {
+		t.Error("restore MUST honor the caller's ctx as-is (no internal re-detach): a cancelled " +
+			"ctx must short-circuit the UPDATE, leaving the expectation unmet. It fired — restore re-detached.")
+	}
+}
+
+// #4539 re-review FINDING[0]: the ENTIRE non-dispatch cleanup — not just the grant
+// restore — must run on a fresh detached context. In the 30-min-ceiling failure
+// mode, executeDelegation reaches finalizeNonDispatchedDelegation with an EXPIRED
+// delegationCtx; if the terminalization + delegate_result write inherited it, they
+// short-circuit in database/sql's (*DB).conn and the row is stuck 'pending'/
+// 'dispatched' forever (a phantom the sweeper/digest count and a same-key retry
+// replays as an idempotent HIT), even though #4539 already detached the restore.
+//
+// This drives finalizeNonDispatchedDelegation with an already-expired ctx and
+// asserts EVERY cleanup write lands: the status-terminalize UPDATE, the
+// delegate_result INSERT, the failure broadcast, AND the grant-restore UPDATE.
+// Negative control: revert the shared detached cleanupCtx (use the inherited ctx)
+// and all four short-circuit → the ordered expectations stay unmet → FAIL.
+func TestFinalizeNonDispatchedDelegation_ExpiredCtxTerminalizesAndRestores(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mock := setupTestDB(t)
+	setupTestRedis(t) // RecordAndBroadcast publishes to db.RDB
+	broadcaster := newTestBroadcaster()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	dh := NewDelegationHandler(wh, broadcaster)
+
+	const (
+		sourceID     = "a1a1a1a1-1111-4111-8111-a1a1a1a1a1a1"
+		targetID     = "b2b2b2b2-2222-4222-8222-b2b2b2b2b2b2"
+		delegationID = "c3c3c3c3-3333-4333-8333-c3c3c3c3c3c3"
+		grantID      = "d4d4d4d4-4444-4444-8444-d4d4d4d4d4d4"
+	)
+
+	// Cleanup order (ledger + inbox-push are flag-off no-ops → no queries):
+	//   1. updateDelegationStatus → activity_logs UPDATE (terminalize to 'failed')
+	//   2. delegate_result INSERT
+	//   3. failure broadcast → structure_events INSERT
+	//   4. grant restore → approval_requests UPDATE
+	mock.ExpectExec(`UPDATE activity_logs\s+SET status`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO activity_logs`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO structure_events`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE approval_requests\s+SET consumed_at = NULL`).
+		WithArgs(grantID, sourceID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// The 30-min delegationCtx has ALREADY expired by the time this cleanup runs.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	dh.finalizeNonDispatchedDelegation(ctx, sourceID, targetID, delegationID, "target unreachable (deadline exceeded)", grantID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expired-ctx non-dispatch cleanup MUST terminalize the row AND restore the grant "+
+			"(row must not be left phantom-pending): %v", err)
+	}
+}
+
+// #4539 convergence review FIX-A: the shared cleanup budget is a GENEROUS hang
+// ceiling, not a tight bound — and the WHOLE cleanup (restore included) runs under
+// that ONE deadline (FIX-B: no second detach). Two proofs:
+//
+//	(1) VALUE GUARD: the budget must stay well above normal write latency. A revert
+//	    toward the old 30s (anything < 60s) trips this — the FIX-A regression: a
+//	    slow-but-live DB would short-circuit the cleanup mid-way while the original
+//	    delegationCtx still had minutes of budget, re-leaking phantom-'pending' +
+//	    burned grant.
+//	(2) SHARED-BOUND BEHAVIOUR (deterministic, sub-second): with a small injected
+//	    budget, a first-write stall UNDER budget lets the whole cleanup complete,
+//	    while a stall OVER budget expires the shared deadline mid-cleanup so the
+//	    remaining writes short-circuit — proving there is exactly ONE bound and it
+//	    covers every write including the restore.
+func TestFinalizeNonDispatchedDelegation_CleanupBudgetIsGenerousSharedBound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// (1) value guard.
+	if delegationCleanupBudget < 60*time.Second {
+		t.Fatalf("delegationCleanupBudget must stay a generous hang-ceiling (>=60s), got %s — "+
+			"a tight bound re-introduces phantom-'pending' + burned-grant on a slow-but-live DB", delegationCleanupBudget)
+	}
+
+	// (2) shared-bound behaviour. run() stalls the FIRST cleanup write by
+	// firstWriteDelay under an injected budget; returns whether the WHOLE cleanup
+	// (all four writes) landed.
+	run := func(t *testing.T, budget, firstWriteDelay time.Duration) bool {
+		mock := setupTestDB(t)
+		setupTestRedis(t)
+		broadcaster := newTestBroadcaster()
+		wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+		dh := NewDelegationHandler(wh, broadcaster)
+
+		orig := delegationCleanupBudget
+		delegationCleanupBudget = budget
+		t.Cleanup(func() { delegationCleanupBudget = orig })
+
+		const (
+			sourceID = "e5e5e5e5-5555-4555-8555-e5e5e5e5e5e5"
+			grantID  = "f6f6f6f6-6666-4666-8666-f6f6f6f6f6f6"
+		)
+		// First cleanup write (the terminalize UPDATE) stalls; whether the rest fire
+		// depends on the ONE shared budget outlasting that stall.
+		mock.ExpectExec(`UPDATE activity_logs\s+SET status`).
+			WillDelayFor(firstWriteDelay).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(`INSERT INTO activity_logs`).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(`INSERT INTO structure_events`).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(`UPDATE approval_requests\s+SET consumed_at = NULL`).
+			WithArgs(grantID, sourceID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		// A NON-expired parent ctx: the only bound in play is the injected cleanup
+		// budget, so this isolates the budget's effect (not parent expiry).
+		dh.finalizeNonDispatchedDelegation(context.Background(),
+			sourceID, "b7b7b7b7-7777-4777-8777-b7b7b7b7b7b7",
+			"c8c8c8c8-8888-4888-8888-c8c8c8c8c8c8", "slow-db failure", grantID)
+
+		return mock.ExpectationsWereMet() == nil
+	}
+
+	// Stall comfortably UNDER budget → the WHOLE cleanup completes.
+	if !run(t, 500*time.Millisecond, 40*time.Millisecond) {
+		t.Error("a stall UNDER the cleanup budget must let the whole cleanup complete (all writes, incl. restore, fired)")
+	}
+	// Stall OVER budget → the shared deadline expires mid-cleanup; later writes
+	// (incl. the restore) short-circuit. If they still fired, the restore had its
+	// OWN independent deadline (FIX-B regression) or the budget wasn't shared.
+	if run(t, 40*time.Millisecond, 400*time.Millisecond) {
+		t.Error("a stall EXCEEDING the cleanup budget must short-circuit the remaining writes — " +
+			"proves ONE shared bound covering every write including the restore")
 	}
 }

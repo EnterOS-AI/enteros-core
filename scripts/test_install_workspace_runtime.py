@@ -1,4 +1,5 @@
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -9,6 +10,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install-workspace-runtime.sh"
+
+
+def _installer_runtime_version() -> str:
+    """Read the pinned version straight from the installer so this test tracks
+    the script and never drifts when the pin is bumped (e.g. after a registry
+    prune). A hard-coded copy here is exactly what broke on the 0.4.29->0.4.36
+    bump."""
+    match = re.search(r'RUNTIME_VERSION="([^"]+)"', INSTALLER.read_text())
+    assert match is not None, "RUNTIME_VERSION not found in install-workspace-runtime.sh"
+    return match.group(1)
+
+
+RUNTIME_VERSION = _installer_runtime_version()
 
 
 class InstallWorkspaceRuntimeTest(unittest.TestCase):
@@ -32,7 +46,7 @@ class InstallWorkspaceRuntimeTest(unittest.TestCase):
                           previous="$arg"
                         done
                         mkdir -p "$dest"
-                        : > "$dest/molecules_workspace_runtime-0.4.29-py3-none-any.whl"
+                        : > "$dest/molecules_workspace_runtime-${FAKE_WHEEL_VERSION}-py3-none-any.whl"
                         ;;
                       *" pip install "*)
                         if [ "${FAKE_INSTALL_FAIL:-0}" = "1" ]; then exit 23; fi
@@ -48,6 +62,7 @@ class InstallWorkspaceRuntimeTest(unittest.TestCase):
                     "PYTHON_BIN": str(fake_python),
                     "FAKE_PIP_LOG": str(log),
                     "FAKE_INSTALL_FAIL": "1" if fail_install else "0",
+                    "FAKE_WHEEL_VERSION": RUNTIME_VERSION,
                 }
             )
             result = subprocess.run(
@@ -73,7 +88,7 @@ class InstallWorkspaceRuntimeTest(unittest.TestCase):
             "https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/",
             download,
         )
-        self.assertIn("molecules-workspace-runtime==0.4.29", download)
+        self.assertIn(f"molecules-workspace-runtime=={RUNTIME_VERSION}", download)
         self.assertNotIn("--extra-index-url", download + install)
 
         self.assertIn("install", install)

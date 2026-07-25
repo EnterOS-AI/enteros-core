@@ -185,6 +185,79 @@ Each phase is DONE only when its **Build · Tests/CI · e2e · Cleanup · Docs**
 - **Cleanup:** the delivery is additive — nothing retired here; it is the *precondition* for P4's `workspace_schedules` drop (P4b).
 - **Docs:** this block; `project_scheduler_trigger_plugin_no_default_delivery` memory; the plugin repo README. ⏳ SDK trigger-plugin authoring guide still references the scaffold (task #39).
 
+### P5.1 — Concierge default schedules (self-host) — **DONE (2026-07-22): template #20, core graft #4549, verbs mcp-server #115; published 1.9.6 + fleet-rolled to runtime-0.4.36; self-brick guard #4565; FULL live e2e (10g #4568, apply+self-brick #4569, hermetic self-host graft→grid #4571 — #4555 CLOSED). Only the self-host operator's own image redeploy remains (external).**
+
+An *operational* increment on top of P5's delivery: now that a self-host
+workspace boots the scheduler daemon, the **self-host concierge** ships two
+default schedules so a fresh install is useful on day one. This is a *content +
+graft* increment — no new scheduler-engine seam.
+
+- **Content lives in the template, not core.** The two schedules
+  (`daily-activity-report` `0 9 * * *`; `plugin-auto-update` `0 3 * * *`, both
+  UTC/enabled) are a top-level **runtime-native** `schedules:` block in the
+  platform-agent template `config.yaml` (**#20, merged**) — key `cron`, prompt
+  inlined, so they satisfy the runtime schedule contract with no render step.
+  Editing a cron/prompt is a template edit + re-export, **no core redeploy**
+  (`[[feedback_plugin_defaults_live_in_template_not_core]]`).
+- **Self-host-only graft in core (#4549, merged `380e81f9`).**
+  `graftConciergeSchedules` in `composeConciergeRuntimeConfig`
+  (`platform_agent.go`) grafts whatever `schedules:` node the platform-agent
+  template carries onto the composed concierge config — a **generic passthrough**
+  (content never hardcoded in Go), gated `SelfHostPlatformSeedEnabled()`
+  (`MOLECULE_ORG_ID` unset). On SaaS the concierge config stays byte-identical
+  (`grafted=false`). Boot-safe: a round-trip guard ships the config *without*
+  schedules on any failure rather than bricking boot. `renderTemplateSchedulesYAML`
+  is **not** called (the concierge entries are already runtime-native).
+- **Verbs for `plugin-auto-update` (mcp-server #115, merged).**
+  `check_plugin_updates` (`GET /admin/plugin-updates-pending`) +
+  `apply_plugin_update` (`POST /admin/plugin-updates/:id/apply`), management-mode
+  / org-key-authed. `apply_plugin_update` re-pins and restarts the affected
+  workspace — including the concierge's own if it updates a plugin on itself.
+  The **self-brick guard (#4565)** defers that self-restart for the platform
+  concierge (mirrors the reconcile path's `platformConciergeReconcileShouldSkipRestart`);
+  non-concierge workspaces still restart immediately. Core/runtime updates are
+  report-only (operator deploy).
+- **Verified assumptions (2026-07-21).** Two load-bearing preconditions were
+  proven against code, not assumed: the runtime reconcile
+  (`seed_schedules_from_workspace_config` → `ScheduleStore.upsert_template`) is
+  **non-destructive** of operator-edited schedules (preserves `source=runtime`,
+  honors tombstones, atomic writes; 33 tests); and the concierge **can deliver**
+  `send_message_to_user` by default (tool registered unconditionally, RBAC default
+  `operator`→approve, `workspaces.talk_to_user_enabled` DB-default TRUE, not
+  overridden on concierge creation).
+- **Deploy tail — DONE (2026-07-21).** `daily-activity-report` works once #20 +
+  #4549 land and the concierge re-provisions (it uses only `send_message_to_user`
+  + the always-present `/activity` (+ `/mail/summary`) endpoints).
+  `plugin-auto-update`'s verbs are now live: mcp-server **1.9.6 PUBLISHED**
+  (break-glass path — the tagged-release publish.yml stays dead on the revoked
+  Infisical `MOL_PACKAGE_TOKEN`, so no `v1.9.6` git tag was cut) → pin cascade
+  sdk#139 / runtime#340 / mcp-server#116 / template#336 → **runtime-0.4.36**
+  bakes `MANAGEMENT_MCP_PINNED_VERSION=1.9.6`, fleet-rolled via `.runtime-version`
+  bumps on all four maintained templates (claude-code#338 / hermes#285 /
+  codex#284 / openclaw#259). The one remaining step is **not ours**: a self-host
+  *operator* must redeploy onto the 0.4.36 image + re-provision the concierge;
+  until then `plugin-auto-update` degrades gracefully (reports tooling missing).
+- **Coverage — FULL, live per-PR (#4555 CLOSED 2026-07-22).** Three layers, each
+  live in CI:
+  - **Fire → deliver (10g, #4568):** ephemeral-CP sub-step — a scheduled prompt
+    calls `send_message_to_user` and the gate asserts the delivery lands (the
+    `a2a_receive`/`notify` `activity_logs` row carrying a run-unique marker) on the
+    real-LLM arm; mock arms skip (never red). Proven live in its own lane.
+  - **Apply + self-brick guard (#4569):** `TestIntegration_*` in the Handlers
+    Postgres lane drive the full `apply_plugin_update` against real schema
+    (re-pin + `status→applied`) and assert the concierge self-restart is **deferred**
+    (#4565) while a non-concierge restarts.
+  - **Self-host graft → grid (hermetic, #4571):** a new lane boots ws-server with
+    `MOLECULE_ORG_ID` **unset** (so `graftConciergeSchedules` genuinely fires) +
+    Postgres + the stub-runtime (extended to materialize the config.yaml `schedules:`
+    block onto the grid + serve `/internal/schedules`), provisions the concierge to
+    online (bare-anthropic BYOK on the LLM-less stub), and asserts both defaults via
+    `docker exec` config.yaml **and** `GET /workspaces/<concierge>/schedules`.
+  (The earlier Go unit test #4556 + runtime unit test #341 remain as the fast
+  compose-level + seed-level checks beneath these live lanes.)
+- **Docs/runbook:** `docs/runbooks/selfhost-concierge-default-schedules.md`;
+  memory `project_selfhost_concierge_default_schedules`.
+
 ### Cross-cutting DoD (every phase)
 - **No double-fire** demonstrated at each cutover point (`NativeSchedulerCheck` gates before any daemon goes live).
 - **No scheduled CI** introduced — `lint_schedule_budget` zero-cron ratchet stays green; exercise via `pull_request` / `push` / `workflow_dispatch`.

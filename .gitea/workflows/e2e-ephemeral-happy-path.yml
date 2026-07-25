@@ -384,16 +384,27 @@ jobs:
           # to the topology-aware Go harness (#4525) instead of a test_*.sh; the
           # first two are DB/handler-level (secret-free), plugin_install_lifecycle
           # really boots one workspace (the same real-workspace path the happy path
-          # already stands up). ADVISORY=1 during the soak — every scenario RUNS
-          # every PR (non-vacuous) but a failure does not block merge yet. Flip
-          # ADVISORY to 0 (and retire the matching post-push job in
-          # e2e-staging-saas.yml) once a scenario has soaked green across a run of
-          # PRs. NOTE: the mgmt-MCP present+callable half of the concierge lane
+          # already stands up). ADVISORY=1 is the global capture-first soak — every
+          # scenario RUNS every PR (non-vacuous); a failure of a still-soaking one
+          # does not block merge yet. GRADUATE a scenario by adding its key to
+          # E2E_EPHEMERAL_EXTRA_GATING below (NOT by flipping the global ADVISORY,
+          # which would promote the whole set at once) — a gating-listed scenario's
+          # failure fails this REQUIRED context even while the others soak. Retire
+          # the matching post-push job in e2e-staging-saas.yml once graduated. NOTE:
+          # the mgmt-MCP present+callable half of the concierge lane
           # (TestPlatformAgentMgmtMCP_Staging) needs a real concierge boot and is
           # intentionally deferred to the real-runtime matrix
           # (E2E_EPHEMERAL_REAL_RUNTIME_MATRIX, default-off), not wired here.
           E2E_EPHEMERAL_EXTRA_SCENARIOS: concierge_user_tasks,concierge_creates_workspace,external_runtime,reconciler_heals_terminated,peer_visibility,workspace_requests,concierge_platform_agent,plugin_install_lifecycle
           E2E_EPHEMERAL_EXTRA_ADVISORY: "1"
+          # GRADUATED to merge-blocking (#4543 coverage-hole fix): peer_visibility
+          # (the literal MCP list_peers auth contract) and concierge_creates_workspace.
+          # #4543 retired their push staging lanes and moved the journeys here, but
+          # they ran under the global ADVISORY soak — so a regression to either merged
+          # GREEN. Listing them here fails THIS gate on their failure regardless of the
+          # soak; external_runtime + reconciler_heals_terminated stay advisory (not yet
+          # reliable — separate promotion once soaked green).
+          E2E_EPHEMERAL_EXTRA_GATING: peer_visibility,concierge_creates_workspace
         run: |
           bash tests/e2e/ephemeral_cp_happy_path.sh
           echo "GATE_ARM=proof" >> "$GITHUB_ENV"

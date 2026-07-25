@@ -16,6 +16,22 @@ This RFC moves the digest providers **out of the runtime** and delivers them as 
 
 This is **not** "make the A2A mailbox / kernel a plugin." The mailbox kernel (`kernel.py`, `mailbox_dir.py`) and the A2A inject lane are the **transport substrate** — the nervous system that autonomous turns (and plugins themselves) are delivered *into*. Plugins run *on* it; making the transport a plugin is circular. The A2A **tools** (`a2a_tools_inbox`, `messaging`, …) are a separate, later question (they look like MCP-tool contributions). This RFC scopes to the **digest providers** only.
 
+### 1.2 Not to be confused with the concierge `daily-activity-report` schedule
+
+The self-host concierge ships a `daily-activity-report` **schedule** (see
+[`rfc-scheduler-as-trigger-plugin.md`](rfc-scheduler-as-trigger-plugin.md) §P5.1
+and `docs/runbooks/selfhost-concierge-default-schedules.md`) that composes a
+morning summary from the **same** `/activity` (+ `/mail/summary`) sources these
+digest providers read — the mail providers here take their comms source from the
+platform mail-summary API, and the scheduled report pulls
+`GET /workspaces/<id>/activity?since_secs=86400` plus `/mail/summary`. Despite
+the shared data sources the two are **distinct mechanisms**: the idle digest is
+an **in-process, wake-gating** assembly (it decides whether an idle agent stays
+asleep, `official`/reserved-id-governed), whereas the daily report is a **cron
+self-turn** the concierge composes and **delivers to the user** via
+`send_message_to_user` (canvas chat + push). One is agent-facing wake logic; the
+other is a user-facing digest email. They neither share code nor gate each other.
+
 ## 2. What exists today (grounding, not proposal)
 
 - **The protocol** (`idle_digest/provider.py`): `DigestProvider` = `provider_id: str`, `official: bool`, `async contribute() -> Sequence[Contribution]`, `on_included(fired_at)`. `ProviderRunner` invokes each provider with per-provider timeout + a consecutive-failure disable, so one bad provider never wedges the idle tick.

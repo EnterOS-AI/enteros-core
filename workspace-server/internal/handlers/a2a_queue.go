@@ -23,6 +23,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/messagestore"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/textutil"
 )
 
@@ -105,6 +106,65 @@ const (
 // heartbeats typically every 5-30s) and short enough that recovery on
 // the next heartbeat is not perceptibly delayed.
 const transientRetryBackoffSecs = 5
+
+// attachQueuedTurnCompletion attaches a drained USER turn's reply
+// (response_body + tool_trace) onto its message-keyed activity row — the
+// async half of the hermes tool-trace feature. Deliberately NARROW instead
+// of dispatching the drain with logActivity=true: the queue NULL-normalizes
+// system callers, so the full logging path would treat platform boot turns
+// as canvas turns (broadcast internal replies into chat, trip the greet-once
+// gate, duplicate busy re-queues — review wf_b8f98be3). Skips:
+//   - self-source platform turns (restart-context wake, first-boot greet)
+//   - unkeyed messages (an insert would duplicate, never collapse)
+// The upsert lands on the row the original ingest wrote (ON CONFLICT
+// workspace_id,message_id), so no new bubble is ever created here.
+func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, workspaceID string, hasCaller bool, reqBody, respBody []byte) {
+	if len(respBody) == 0 {
+		return
+	}
+	// Peer/delegation turns (caller_id present) have their own stitching
+	// (delegation rows) and must never render in this workspace's chat.
+	if hasCaller {
+		return
+	}
+	if st := messagestore.RequestSourceType(reqBody); st != "" && messagestore.IsSelfSourceType(st) {
+		return
+	}
+	messageID := extractIdempotencyKey(reqBody)
+	if messageID == "" {
+		return
+	}
+	// Async (review wf_8b04761b #7): the DB write must not stall the drain
+	// loop; and UPDATE-ONLY (#5): if no ingest row exists for this
+	// messageId, an upsert would INSERT a fresh source_id-NULL row that
+	// hydrates as a surprise user bubble — skip instead (the reply still
+	// reached the user live via the runtime's own delivery).
+	h.goAsync(func() {
+		logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		var exists bool
+		if err := db.DB.QueryRowContext(logCtx,
+			`SELECT EXISTS(SELECT 1 FROM activity_logs WHERE workspace_id = $1 AND message_id = $2)`,
+			workspaceID, messageID,
+		).Scan(&exists); err != nil || !exists {
+			return
+		}
+		method := "message/send"
+		summary := "message/send (queued turn reply)"
+		LogActivity(logCtx, h.broadcaster, ActivityParams{
+			WorkspaceID:  workspaceID,
+			ActivityType: "a2a_receive",
+			TargetID:     &workspaceID,
+			Method:       &method,
+			Summary:      &summary,
+			RequestBody:  json.RawMessage(reqBody),
+			ResponseBody: json.RawMessage(respBody),
+			ToolTrace:    extractToolTrace(respBody),
+			Status:       "ok",
+			MessageId:    messageID,
+		})
+	})
+}
 
 // QueuedItem is what the heartbeat drain path pulls off the queue.
 type QueuedItem struct {
@@ -588,8 +648,15 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 		log.Printf("A2AQueue drain: dispatching queue_id=%s workspace_id=%s url=%s attempt=%d",
 			item.ID, workspaceID, resolvedURL, item.Attempts)
 
-		// logActivity=false: the original EnqueueA2A callsite already logged
-		// the dispatch attempt; re-logging here would double-count events.
+		// logActivity=false STANDS: EnqueueA2A NULL-normalizes system callers
+		// (caller_id is a UUID column), so a drained boot turn re-dispatches
+		// with callerID=="" and the full logging path would treat it as a
+		// CANVAS turn — broadcasting internal restart/greet replies into the
+		// user's chat, tripping the greet-once gate, and re-persisting busy
+		// re-queues as duplicate bubbles (review wf_b8f98be3, 5 confirmed
+		// regressions). The async tool-trace completion is attached instead
+		// by the NARROW helper below, which skips self-source turns and
+		// only upserts onto the message-keyed row.
 		status, respBody, proxyErr := h.proxyA2ARequest(ctx, workspaceID, item.Body, callerID, false, false)
 
 		// 202 Accepted = the dispatch was itself queued again (target still busy).
@@ -684,6 +751,12 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 			continue
 		}
 		MarkQueueItemCompleted(ctx, item.ID, respBody)
+		// Async tool-trace completion (2026-07-21, corrected by review
+		// wf_8b04761b: the first wiring landed on the 202-requeue branch and
+		// stamped the busy-ack as the durable reply). ONLY here — the 200
+		// branch with the agent's REAL reply — attach response_body +
+		// tool_trace onto the canvas turn's message-keyed activity row.
+		h.attachQueuedTurnCompletion(ctx, workspaceID, item.CallerID.Valid, item.Body, respBody)
 		log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s dispatched (attempt=%d)",
 			item.ID, workspaceID, resolvedURL, item.Attempts)
 

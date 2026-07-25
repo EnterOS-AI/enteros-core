@@ -488,7 +488,7 @@ function ProviderPickerModal({
           <div className="space-y-2">
             {isSelectedPlatformManaged ? (
               <div className="bg-surface-card/50 rounded-lg px-3 py-2.5 border border-line/50 text-[11px] text-ink-mid">
-                Platform-managed — no API key required. Molecule handles LLM
+                Platform-managed — no API key required. Enter OS handles LLM
                 billing and proxy credentials.
               </div>
             ) : (

@@ -3055,6 +3055,213 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
   fi
 fi
 
+# ─── 10g. Scheduler fire → DELIVER (send_message_to_user) — #4555 ────────────
+# Closes the #4555 coverage gap the audit flagged. 10d proves the daemon
+# autonomously FIRES a schedule, but a FIRE only self-schedules a turn — it does
+# NOT prove that turn actually DELIVERED anything to the user. Pre-this-step, the
+# DELIVER half lived ONLY as a stubbed unit test (runtime#341). This sub-step
+# drives the full chain live: create a `* * * * *` schedule whose PROMPT instructs
+# the agent to call the send_message_to_user tool with a run-unique MARKER,
+# confirm the daemon FIRES it (reusing 10d's grid + fire ground-truth), THEN poll
+# the delivery ground-truth — an activity_logs a2a_receive/notify row written by
+# the AgentMessageWriter SSOT (workspace-server/internal/handlers/
+# agent_message_writer.go: INSERT activity_type='a2a_receive', method='notify',
+# response_body={"result": <message>}, summary='Agent message: <preview>') — for
+# that same MARKER, read via GET /workspaces/:id/activity (the same endpoint 9b
+# smoke-tests; List returns a bare JSON array with no default type filter, so
+# notify rows are included). The marker landing in a notify row proves the fired
+# turn actually invoked send_message_to_user and the message reached the user.
+#
+# CO-GATE (two conditions, BOTH required):
+#   1. E2E_SCHEDULER_CHECK=on — DELIVER rides the SAME fire machinery as 10d, so
+#      it shares 10d's gate (the ephemeral happy-path lane sets it on per-PR; an
+#      independent E2E_SCHEDULE_DELIVER_CHECK, default on, can disable JUST this
+#      sub-step without disabling the fire gate — gate the sub-step, never the
+#      whole scenario).
+#   2. A REAL tool-calling LLM must be driving the workspace. DELIVER needs the
+#      agent to actually CALL a tool; a mock/canned-reply arm never invokes one,
+#      so on a no-real-LLM arm this SKIPS (never reds) — mirroring how the byok
+#      guards (8c/8d) stay best-effort when their key is absent on untrusted-fork
+#      PRs. The FIRE half (10d) stays a HARD gate on ALL arms; ONLY the DELIVER
+#      half is arm-gated.
+#      "Real tool-calling LLM present" = the platform-managed path (E2E_LLM_PATH=
+#      platform → the CP LLM proxy serves a real model; the EPHEMERAL happy-path
+#      lane's arm is exactly this: model minimax/MiniMax-M2.7 via the CP's own
+#      MINIMAX_API_KEY, NOT a BYOK E2E_MINIMAX_API_KEY — see ephemeral_cp_happy_
+#      path.sh run_scenario) OR any BYOK vendor key (MiniMax/Anthropic/OpenAI).
+#      A keyless, non-platform arm has no tool-caller → SKIP. NB: gating literally
+#      on E2E_MINIMAX_API_KEY (absent in the ephemeral lane) would SKIP forever
+#      here and make the per-PR gate vacuous — the platform path IS this lane's
+#      real-LLM arm, so it must count.
+#
+# NON-TAUTOLOGY (negative control, by construction): the DELIVER probe matches the
+# run-unique MARKER ONLY inside an activity_type=a2a_receive / method=notify row —
+# the exact shape AgentMessageWriter writes and NOTHING else does. A FIRE alone
+# writes schedule-history.json (status=fired) but NO notify row, so the fire
+# cannot satisfy DELIVER. A fired turn that does NOT call send_message_to_user
+# produces no notify row carrying the marker either (a scheduled turn has no
+# connected user session — its final assistant text is not auto-broadcast; the
+# ONLY path to a notify row is an explicit send_message_to_user call). The marker
+# is unique per run and reaches activity_logs solely via the send_message_to_user
+# / notify SSOT — so this assertion is satisfied ONLY by a real tool-driven
+# delivery, never by the fire. (Proof by demonstration: swap the prompt for one
+# that fires but omits the tool call and the deliver_probe below stays red until
+# the timeout — the fire/grid arms still pass, isolating the DELIVER leg.)
+if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}" = "on" ]; then
+  # Co-gate condition 2 — real tool-calling LLM present? Compute once, then unset.
+  schedule_deliver_real_llm_arm() {
+    [ "${E2E_LLM_PATH:-}" = "platform" ] && return 0
+    [ -n "${E2E_MINIMAX_API_KEY:-}" ] && return 0
+    [ -n "${E2E_ANTHROPIC_API_KEY:-}" ] && return 0
+    [ -n "${E2E_OPENAI_API_KEY:-}" ] && return 0
+    return 1
+  }
+  if schedule_deliver_real_llm_arm; then _DLV_LLM_READY=1; else _DLV_LLM_READY=0; fi
+  unset -f schedule_deliver_real_llm_arm
+
+  if [ "$_DLV_LLM_READY" != "1" ]; then
+    log "10g/11 Scheduler DELIVER: SKIP — no real tool-calling LLM on this arm (E2E_LLM_PATH='${E2E_LLM_PATH:-}', no BYOK key). send_message_to_user needs the agent to actually invoke a tool; the mock/canned arm never will, so asserting DELIVER here would red on a stub, not a regression. The FIRE half (10d) already ran as a hard gate on this arm; DELIVER is hard only on a real-LLM arm (#4555)."
+  elif ! idle_digest_require_docker; then
+    fail "10g DELIVER: E2E_SCHEDULER_CHECK=on requires a usable Docker CLI + daemon to read the fire/deliver ground-truth (same requirement as 10d)."
+  else
+    _DLV_NAME="e2e-deliver-${E2E_RUN_ID:-local}"
+    # Run-unique marker. Only reaches activity_logs via send_message_to_user →
+    # AgentMessageWriter; a distinct token so a stale row on a recycled container
+    # cannot false-pass and the fire alone cannot produce it.
+    _DLV_MARKER="E2E-SMTU-DELIVER-${E2E_RUN_ID:-local}"
+    _DLV_FIRE_TIMEOUT_SECS="${E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-360}}"
+    # DELIVER window spans MULTIPLE fires: a `* * * * *` schedule re-fires every
+    # minute and each fire is an INDEPENDENT chance for the model to invoke the
+    # tool. Polling across ≥3 fire cycles absorbs the occasional turn where a
+    # capable-but-nondeterministic model acks in text without calling the tool
+    # (the same class the idle-digest A2A seed deliberately avoided). The marker
+    # only has to land ONCE — this is the NAMED flake-mitigation mechanism, not a
+    # silent retry.
+    _DLV_DELIVER_TIMEOUT_SECS="${E2E_SCHEDULE_DELIVER_TIMEOUT_SECS:-210}"
+    _DLV_POLL_SECS="${E2E_SCHEDULER_POLL_SECS:-10}"
+    # Imperative single-tool prompt — mirrors the daily-activity-report default's
+    # "deliver a report" instruction. The fired turn has no user session, so the
+    # ONLY route to the user (and a notify row) is an explicit tool call.
+    _DLV_PROMPT="You are running a scheduled background turn with no user watching. You MUST call the send_message_to_user tool exactly once, with its message set to EXACTLY this token and nothing else: ${_DLV_MARKER}. Do not just write the token as your reply — invoke the tool. Do not call any other tool."
+
+    scheduler_deliver_diagnostics() {
+      local _sc _grid _hist _act
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        log "    [deliver diag] $_sc grid: ${_grid:-ABSENT}"
+        log "    [deliver diag] $_sc history: ${_hist:-ABSENT}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      _act=$(tenant_call GET "/workspaces/$PARENT_ID/activity?limit=20" 2>/dev/null | sanitize_http_body | tr '\n' ' ' | head -c 600)
+      log "    [deliver diag] recent activity (redacted): ${_act:-<none>}"
+    }
+
+    # Create the DELIVER schedule. By now 10d proved the daemon armed AND core
+    # advertises the scheduler capability, so a fresh create routes to the volume
+    # deterministically — no #4448 re-issue loop needed here.
+    _DLV_TMP=$(mktemp)
+    _DLV_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/schedules" \
+      -H "Content-Type: application/json" \
+      -d "$(DLV_NAME="$_DLV_NAME" DLV_PROMPT="$_DLV_PROMPT" python3 -c 'import json,os; print(json.dumps({"name":os.environ["DLV_NAME"],"cron_expr":"* * * * *","timezone":"UTC","prompt":os.environ["DLV_PROMPT"]}))')" \
+      -o "$_DLV_TMP" -w '%{http_code}' 2>/dev/null) || true
+    _DLV_BODY=$(cat "$_DLV_TMP" 2>/dev/null | sanitize_http_body); rm -f "$_DLV_TMP"
+    if ! echo "$_DLV_CODE" | grep -Eq '^2[0-9][0-9]$'; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: create schedule '$_DLV_NAME' returned http=$_DLV_CODE (expected 2xx): ${_DLV_BODY:0:300}. The scheduler capability was advertised (10d passed), so a non-2xx here is a routing/auth regression on the create path."
+    fi
+
+    # Confirm it reached the volume grid.
+    _DLV_GRID_EVIDENCE=""
+    deliver_grid_has() {
+      local _sc _grid
+      _DLV_GRID_EVIDENCE=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
+        if printf '%s' "$_grid" | grep -Fq "$_DLV_NAME"; then _DLV_GRID_EVIDENCE="$_sc"; return 0; fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+    log "10g/11 Scheduler DELIVER: created '$_DLV_NAME' (http=$_DLV_CODE); verifying it reached the volume grid (up to ${_DLV_FIRE_TIMEOUT_SECS}s; poll=${_DLV_POLL_SECS}s)."
+    if ! idle_digest_wait "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_grid_has; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' never reached the volume grid within ${_DLV_FIRE_TIMEOUT_SECS}s — the create 2xx'd but did not land on the daemon's grid (routing regression specific to the DELIVER schedule; 10d's identical create DID land)."
+    fi
+    ok "    DELIVER schedule '$_DLV_NAME' on the volume grid (evidence: $_DLV_GRID_EVIDENCE)"
+
+    # Confirm the daemon FIRED it (reuse 10d's fire ground-truth verbatim).
+    _DLV_FIRED=""
+    deliver_fire_probe() {
+      local _sc
+      _DLV_FIRED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        if docker logs "$_sc" 2>&1 | grep -F "fired schedule '$_DLV_NAME'" >/dev/null; then _DLV_FIRED="$_sc (runtime log)"; return 0; fi
+        if docker exec "$_sc" sh -c \
+          "grep -Fq '\"name\": \"$_DLV_NAME\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          >/dev/null 2>&1; then _DLV_FIRED="$_sc (durable schedule-history.json)"; return 0; fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+    log "    DELIVER: polling FIRE evidence for '$_DLV_NAME' (up to ${_DLV_FIRE_TIMEOUT_SECS}s; poll=${_DLV_POLL_SECS}s)."
+    if ! idle_digest_wait "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_fire_probe; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' reached the grid but the daemon never FIRED it within ${_DLV_FIRE_TIMEOUT_SECS}s (grid present, no history) — a FIRE-path failure surfaced on the DELIVER schedule; see 10d for the shared mechanism."
+    fi
+    ok "    DELIVER schedule FIRED (evidence: $_DLV_FIRED) — turn self-scheduled; now asserting it DELIVERED"
+
+    # DELIVER ground-truth: an activity_logs a2a_receive/notify row (the
+    # AgentMessageWriter SSOT) carrying the run-unique marker. See the block
+    # header for why matching this specific row shape is non-tautological.
+    _DLV_DELIVERED=""
+    deliver_probe() {
+      local _tmp _code _rc
+      _DLV_DELIVERED=""
+      _tmp=$(mktemp)
+      _code=$(tenant_call GET "/workspaces/$PARENT_ID/activity?limit=50" -o "$_tmp" -w '%{http_code}' 2>/dev/null) || true
+      if ! echo "$_code" | grep -Eq '^2[0-9][0-9]$'; then rm -f "$_tmp"; return 1; fi
+      MARKER="$_DLV_MARKER" python3 -c '
+import json, os, sys
+marker = os.environ["MARKER"]
+try:
+    rows = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+if isinstance(rows, dict):
+    rows = rows.get("events", [])
+if not isinstance(rows, list):
+    sys.exit(1)
+for r in rows:
+    if not isinstance(r, dict):
+        continue
+    # The exact shape AgentMessageWriter writes for send_message_to_user / notify.
+    if r.get("activity_type") != "a2a_receive" or r.get("method") != "notify":
+        continue
+    rb = r.get("response_body")
+    hay = json.dumps(rb) if rb is not None else ""
+    summ = r.get("summary") or ""
+    if marker in hay or marker in summ:
+        sys.exit(0)
+sys.exit(1)
+' "$_tmp"
+      _rc=$?
+      rm -f "$_tmp"
+      [ "$_rc" = "0" ] && _DLV_DELIVERED="activity a2a_receive/notify row carries '$_DLV_MARKER'"
+      return "$_rc"
+    }
+    log "    DELIVER: polling delivery ground-truth (activity a2a_receive/notify row with marker '$_DLV_MARKER') for up to ${_DLV_DELIVER_TIMEOUT_SECS}s across ~$(( _DLV_DELIVER_TIMEOUT_SECS / 60 )) fire cycles (poll=${_DLV_POLL_SECS}s)."
+    if idle_digest_wait "$_DLV_DELIVER_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_probe; then
+      ok "    scheduler fired turn DELIVERED to the user via send_message_to_user (evidence: $_DLV_DELIVERED) — #4555 fire→deliver proven live on this real-LLM arm"
+    else
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' FIRED but no send_message_to_user delivery landed within ${_DLV_DELIVER_TIMEOUT_SECS}s — no activity_logs a2a_receive/notify row carries the marker '$_DLV_MARKER'. The fired turn did not invoke send_message_to_user, or the AgentMessageWriter deliver path is broken (the #4555 regression this gate exists to catch). The fire itself is confirmed above, so this is specifically the DELIVER leg, not a scheduler-fire fault. (Real-LLM arm: E2E_LLM_PATH='${E2E_LLM_PATH:-}'.)"
+    fi
+
+    unset -f scheduler_deliver_diagnostics deliver_grid_has deliver_fire_probe deliver_probe
+  fi
+fi
+
 # ─── 10e. Native digest-provider plugin load (RFC #4413, E2E_DIGEST_PLUGIN_CHECK=on only) ──
 # End-to-end proof that a NATIVE digest-provider plugin is loaded IN-PROCESS by
 # the runtime's idle-digest assembler, admitted by the LOAD-TIME trust gate from
