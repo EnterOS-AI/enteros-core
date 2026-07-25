@@ -29,10 +29,34 @@ async function openChatPanel(page: Page, workspaceName: string): Promise<void> {
   // Scope to the map-side panel (#2587) so we don't accidentally hit the
   // hidden ConciergeShell copy of ChatTab.
   await page.getByTestId(`workspace-node-${workspaceName}`).click();
-  await page.locator("#tab-chat").click();
+  // Selecting the node mounts SidePanel — a `fixed right-0 z-50 animate-in
+  // slide-in-from-right duration-200` overlay (SidePanel.tsx:122) rendered
+  // INSIDE <main id="canvas-main"> (Canvas.tsx:305). No `#tab-chat` click is
+  // needed: the panel already opens on the Chat tab (the canvas store's
+  // panelTab defaults to "chat" and the goto("/") above resets the in-memory
+  // store), and clicking ANY element inside the panel while it is still
+  // sliding in makes Playwright's actionability hit-test resolve the click
+  // point to the full-viewport canvas-main ancestor ("<main id=canvas-main>
+  // intercepts pointer events") until the test times out. This was the E2E
+  // Chat flake (2026-07-24): load-dependent, because whether the 200ms slide
+  // has settled by hit-test time depends on CI scheduling.
   await page.waitForSelector("#panel-chat [data-testid='chat-panel']:visible", {
     timeout: 5_000,
   });
+  // Settle gate (the actual fix): wait for the slide-in to FINISH so every
+  // later click — here and in the test bodies that run after this beforeEach —
+  // lands on a stationary panel, not a mid-animation one. Web Animations API,
+  // filtered to FINITE animations so the infinite status-dot pulse
+  // (motion-safe:animate-pulse) can't leave `.finished` unresolved. No fixed
+  // sleep, no force-click — it waits exactly as long as the animation runs.
+  await page.evaluate(() =>
+    Promise.all(
+      document
+        .getAnimations()
+        .filter((a) => a.effect?.getComputedTiming().iterations !== Infinity)
+        .map((a) => a.finished.catch(() => {})),
+    ),
+  );
   await expect(page.locator("#panel-chat [data-testid='chat-panel']:visible textarea").first()).toBeEnabled({
     timeout: 15_000,
   });
