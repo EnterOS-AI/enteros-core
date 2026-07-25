@@ -395,6 +395,18 @@ export interface WorkspaceData {
   budget_limit: number | null;
   /** Cumulative USD spend for this workspace. Present when the platform tracks spend. */
   budget_used?: number | null;
+  /** "Enter OS" boot-telemetry replay (server events/boottrace.go): the
+   *  BOOT_STEP history observed so far, attached only while status is
+   *  `provisioning`. Lets hydrate restore the boot screen (keycaps +
+   *  watchdog log) after a reload/reconnect instead of resetting it to
+   *  "waiting for boot telemetry". Absent on older platform builds. */
+  boot_steps?: import("./boot-telemetry").BootStepWire[];
+  /** Boot-generation marker paired with boot_steps (events/boottrace.go):
+   *  identifies WHICH boot the replay belongs to, so the client can merge a
+   *  same-generation replay with live-streamed state but reset on a new
+   *  generation. Absent when the server holds no trace entry (instance
+   *  restarted mid-boot) — the client keeps its local state then. */
+  boot_generation?: string;
   /** Server-declared provisioning-timeout override in milliseconds (#2054).
    *  Sourced from the workspace's template manifest at provision time —
    *  lets a slow runtime declare its cold-boot expectation without a

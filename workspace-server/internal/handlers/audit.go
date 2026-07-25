@@ -22,23 +22,30 @@ package handlers
 // Response:
 //
 //	{
-//	    "events":      [...],     // slice of audit event rows
-//	    "total":       N,         // total matching rows (ignoring limit/offset)
-//	    "chain_valid": true|false|null
-//	    // null when verification is unavailable for this query
+//	    "events":             [...],   // slice of audit event rows
+//	    "total":              N,       // total matching rows (ignoring limit/offset)
+//	    "chain_valid":        true|false|null,
+//	    "chain_verification": "verified"|"tampered"|
+//	                          "unavailable_partial_query"|"disabled_no_salt"
 //	}
 //
 // Chain verification
 // ------------------
 // When AUDIT_LEDGER_SALT is set, the handler re-derives the PBKDF2 key and
 // verifies every HMAC in the result set (scoped to each queried agent_id, in
-// chronological order). It returns null when the salt is absent or when
-// pagination/session/lower-time filters omit possible chain predecessors.
+// chronological order). chain_valid is null when the salt is absent or when
+// pagination/session/lower-time filters omit possible chain predecessors —
+// chain_verification SPLITS those two cases so an unset salt (a
+// misconfiguration that leaves the ledger NOT tamper-evident) is never
+// indistinguishable from a benign partial view. An unset salt is additionally
+// logged loudly (once) via getAuditHMACKey; a genuine tamper is fail-closed to
+// chain_valid=false / chain_verification="tampered".
 //
 // Environment variables:
 //
-//	AUDIT_LEDGER_SALT — secret salt for PBKDF2 key derivation (optional;
-//	                    chain_valid is null when unset)
+//	AUDIT_LEDGER_SALT — secret salt for PBKDF2 key derivation. When unset,
+//	                    chain_valid is null, chain_verification is
+//	                    "disabled_no_salt", and a loud SECURITY/AUDIT log fires.
 
 import (
 	"crypto/hmac"
@@ -72,17 +79,31 @@ var (
 
 // getAuditHMACKey derives (and caches) the 32-byte HMAC key from AUDIT_LEDGER_SALT.
 // Returns nil when the env var is not set.
+//
+// A missing salt is a MISCONFIGURATION, not a benign default: with no key the
+// HMAC audit-chain cannot be verified at all, so the ledger stops being
+// tamper-evident. That must never be a SILENT no-audit. This function therefore
+// emits a loud, once-only SECURITY/AUDIT log the first time it observes an unset
+// salt, and the read handler additionally surfaces chain_verification=
+// "disabled_no_salt" on EVERY response so operators and clients both see it.
 func getAuditHMACKey() []byte {
 	auditKeyOnce.Do(func() {
-		if salt := os.Getenv("AUDIT_LEDGER_SALT"); salt != "" {
-			auditHMACKey = pbkdf2.Key(
-				[]byte(salt),
-				auditPBKDF2Salt,
-				auditPBKDF2Iterations,
-				auditPBKDF2KeyLen,
-				sha256.New,
-			)
+		salt := os.Getenv("AUDIT_LEDGER_SALT")
+		if salt == "" {
+			// Loud, not silent. Once-only (guarded by auditKeyOnce) so it cannot be
+			// used to flood logs, but unmissable in operator dashboards.
+			log.Printf("SECURITY/AUDIT: AUDIT_LEDGER_SALT is not set — HMAC audit-chain " +
+				"verification is DISABLED; the audit ledger is NOT tamper-evident. Configure " +
+				"AUDIT_LEDGER_SALT to enable append-only chain verification.")
+			return
 		}
+		auditHMACKey = pbkdf2.Key(
+			[]byte(salt),
+			auditPBKDF2Salt,
+			auditPBKDF2Iterations,
+			auditPBKDF2KeyLen,
+			sha256.New,
+		)
 	})
 	return auditHMACKey
 }
@@ -213,19 +234,51 @@ func (h *AuditHandler) Query(c *gin.Context) {
 	}
 
 	// Chain verification (inline when AUDIT_LEDGER_SALT is set) ------------
+	// chain_valid stays a bool|null as before. chain_verification is an added,
+	// non-breaking field that SPLITS the two very different reasons chain_valid
+	// can be null, so a missing salt is never a silent no-audit:
+	//
+	//   "verified"                  — full chain re-verified, HMAC intact
+	//   "tampered"                  — HMAC/link mismatch in a complete prefix
+	//   "unavailable_partial_query" — salt IS set, but offset/session/from could
+	//                                 omit chain predecessors (legitimate)
+	//   "disabled_no_salt"          — AUDIT_LEDGER_SALT is unset: verification is
+	//                                 OFF and the ledger is NOT tamper-evident
+	//                                 (a misconfiguration, also logged loudly)
+	//
 	// A non-zero offset, session filter, or lower time bound can omit earlier
-	// events in an agent's chain. Return null instead of a misleading verdict.
-	// agent_id selects complete per-agent chains; an upper time bound and limit
-	// retain a verifiable prefix when offset is zero.
+	// events in an agent's chain, so those are reported as unavailable rather
+	// than a misleading verdict. agent_id selects complete per-agent chains; an
+	// upper time bound and limit retain a verifiable prefix when offset is zero.
 	var chainValid *bool
-	if offset == 0 && sessionID == "" && fromStr == "" {
+	var chainVerification string
+	switch {
+	case getAuditHMACKey() == nil:
+		// No key can be derived — the ledger is not tamper-evident. This is a
+		// configuration failure, distinct from the benign partial-view case, and
+		// must be surfaced on every response (getAuditHMACKey also logs loudly).
+		chainVerification = "disabled_no_salt"
+	case offset != 0 || sessionID != "" || fromStr != "":
+		chainVerification = "unavailable_partial_query"
+	default:
 		chainValid = verifyAuditChain(events)
+		switch {
+		case chainValid == nil:
+			// Unreachable while the salt is set, but stay explicit rather than
+			// silently emitting a bare null.
+			chainVerification = "unavailable"
+		case *chainValid:
+			chainVerification = "verified"
+		default:
+			chainVerification = "tampered"
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"events":      events,
-		"total":       total,
-		"chain_valid": chainValid,
+		"events":             events,
+		"total":              total,
+		"chain_valid":        chainValid,
+		"chain_verification": chainVerification,
 	})
 }
 

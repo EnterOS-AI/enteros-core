@@ -146,6 +146,12 @@ source "$(dirname "$0")/lib/model_slug.sh"
 # shellcheck disable=SC1091
 # shellcheck source=lib/reconciler_container.sh
 source "$(dirname "$0")/lib/reconciler_container.sh"
+# Ephemeral-CP tenant topology (Host/X-Molecule-Org-Slug slug-routing + CORS
+# Origin). SHARED helper; default (all MOLECULE_TENANT_* unset) reproduces exact
+# staging behaviour byte-for-byte.
+# shellcheck disable=SC1091
+# shellcheck source=lib/tenant_topology.sh
+source "$(dirname "$0")/lib/tenant_topology.sh"
 # Kill primitive + leak sweep — provider-abstracted. The AWS lib is sourced ONLY
 # on the legacy AWS path (its e2e_* helpers are undefined on the molecules-server
 # path, and every call site is provider-branched below).
@@ -405,16 +411,17 @@ print('(no org row found for slug=$SLUG — DB drift?)')
 done
 ok "Tenant provisioning complete"
 
-# Derive tenant domain from CP hostname (same logic as the full-saas harness).
-CP_HOST=$(echo "$CP_URL" | sed -E 's#^https?://##; s#/.*$##')
-case "$CP_HOST" in
-  api.*)         DERIVED_DOMAIN="${CP_HOST#api.}" ;;
-  staging-api.*) DERIVED_DOMAIN="staging.${CP_HOST#staging-api.}" ;;
-  *)             DERIVED_DOMAIN="$CP_HOST" ;;
-esac
-TENANT_DOMAIN="${MOLECULE_TENANT_DOMAIN:-$DERIVED_DOMAIN}"
-TENANT_URL="https://$SLUG.$TENANT_DOMAIN"
+# Derive the tenant-facing routing/CORS topology via the shared helper. Default
+# (all MOLECULE_TENANT_* unset) keeps the exact staging slug.<domain> subdomain +
+# no route headers; the ephemeral runner points MOLECULE_TENANT_URL at the CP base
+# and sets MOLECULE_TENANT_ROUTE_DOMAIN / _ORIGIN_TEMPLATE for slug-routing. Sets
+# TENANT_URL / TENANT_ROUTE_HOST / TENANT_ROUTE_HDRS[] / TENANT_ORIGIN in this scope.
+derive_tenant_topology "$SLUG" "$CP_URL" \
+  || fail "Could not derive tenant topology for $SLUG (ephemeral slug-routing needs MOLECULE_TENANT_ORIGIN_TEMPLATE — see lib/tenant_topology.sh)"
 log "    TENANT_URL=$TENANT_URL"
+if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+  log "    tenant routing via Host=$TENANT_ROUTE_HOST + X-Molecule-Org-Slug=$SLUG (ephemeral-CP slug routing); CORS origin=$TENANT_ORIGIN"
+fi
 
 # ─── 3. Retrieve per-tenant admin token ────────────────────────────────
 log "3/6 Fetching per-tenant admin token..."
@@ -423,15 +430,22 @@ TENANT_TOKEN=$(echo "$TENANT_TOKEN_RESP" | python3 -c "import json,sys; print(js
 [ -z "$TENANT_TOKEN" ] && fail "Could not retrieve per-tenant admin token for $SLUG"
 ok "Tenant admin token retrieved (len=${#TENANT_TOKEN})"
 
-# Wait for tenant TLS / DNS propagation before any tenant API call.
-log "    Waiting for tenant TLS / DNS propagation..."
+# Wait for tenant readiness before any tenant API call. Under ephemeral slug-
+# routing the CP answers /health for ANY Host (vacuous readiness), so probe
+# /org/identity — a tenant-owned handler the CP proxies — WITH the route headers +
+# X-Molecule-Org-Id so a not-yet-routable tenant is actually caught. Staging (empty
+# TENANT_ROUTE_HDRS) keeps the global /health probe ⇒ exact staging behaviour.
+# Mirrors test_staging_concierge_e2e.sh / test_staging_full_saas.sh step 4.
+log "    Waiting for tenant TLS / DNS / routing propagation..."
 TLS_DEADLINE=$(( $(date +%s) + 15 * 60 ))
 while true; do
-  if curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1; then
-    break
+  if [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ]; then
+    curl -sSfk --max-time 5 "${TENANT_ROUTE_HDRS[@]}" -H "X-Molecule-Org-Id: $ORG_ID" "$TENANT_URL/org/identity" >/dev/null 2>&1 && break
+  else
+    curl -sSfk --max-time 5 "$TENANT_URL/health" >/dev/null 2>&1 && break
   fi
   if [ "$(date +%s)" -gt "$TLS_DEADLINE" ]; then
-    fail "Tenant URL never responded 2xx on /health within 15m"
+    fail "Tenant never became routable within 15m (probe: $( [ ${#TENANT_ROUTE_HDRS[@]} -gt 0 ] && echo '/org/identity via route headers' || echo '/health' ))"
   fi
   sleep 5
 done
@@ -443,8 +457,10 @@ tenant_call() {
   # X-Molecule-Org-Id is REQUIRED — the tenant guard 404s anything without it
   # (it does NOT 403, to hide tenant existence from org scanners).
   curl "${CURL_COMMON[@]}" -X "$method" "$TENANT_URL$path" \
+    "${TENANT_ROUTE_HDRS[@]}" \
     -H "Authorization: Bearer $TENANT_TOKEN" \
     -H "X-Molecule-Org-Id: $ORG_ID" \
+    -H "Origin: $TENANT_ORIGIN" \
     "$@"
 }
 
@@ -611,6 +627,22 @@ ok "Workspace online (instance_id=$ORIGINAL_INSTANCE_ID)"
 # provider-branched primitive lives in kill_workspace_instance (top of file).
 log "5/6 KILLING the workspace instance ($PROVIDER) to simulate an out-of-band termination..."
 require_kill_capability
+# local-docker only: capture the DOCKER CONTAINER ID (not the name) of the box we
+# are about to kill. On molecules-server the reprovision heal recreates the
+# container under the SAME name (mol-ws-<slug>-<short12>) — so the container NAME
+# and the API's instance_id (when it even surfaces it) are IDENTICAL before and
+# after the heal. The only signal that a genuine NEW instance came up is a NEW
+# container ID. Without this, the 6b SECONDARY assertion below can NEVER be
+# satisfied on this topology and dead-soaks the full REPROVISION_TIMEOUT_SECS
+# window every run (verified: run 550823/attempt 2 sat in 6b from reprovision-
+# online at 01:13:31 until the run was cancelled, ~6 min of pure soak — this
+# widens the wall-clock window in which an external cancel / job timeout lands
+# on the required lane, one of the two flakes in core#4548). Captured here,
+# before the kill, so the post-heal compare below has a real baseline.
+ORIGINAL_CONTAINER_UID=""
+if [ "$PROVIDER" != "aws" ] && docker info >/dev/null 2>&1; then
+  ORIGINAL_CONTAINER_UID=$(docker inspect -f '{{.Id}}' "$ORIGINAL_INSTANCE_ID" 2>/dev/null || echo "")
+fi
 KILLED_IDS=$(kill_workspace_instance "$ORIGINAL_INSTANCE_ID" "$SLUG")
 ok "Killed workspace instance: $KILLED_IDS — reconciler should now detect the dead instance"
 
@@ -659,7 +691,7 @@ fi
 # FUTURE TIGHTENING (deliberately one edit away): once this reprovision path
 # is proven reliable on staging, promote the `log "SECONDARY ..."` soft-miss
 # below to a `fail ...` so a stuck reprovision becomes a hard gate.
-log "6b/6 SECONDARY (best-effort): asserting auto-reprovision to online with a NEW instance_id within ${REPROVISION_TIMEOUT_SECS}s..."
+log "6b/6 SECONDARY (best-effort): asserting auto-reprovision to online with a NEW instance within ${REPROVISION_TIMEOUT_SECS}s..."
 REPROV_DEADLINE=$(( $(date +%s) + REPROVISION_TIMEOUT_SECS ))
 REPROV_OK=0
 REPROV_LAST_STATUS=""
@@ -674,19 +706,48 @@ while true; do
     REPROV_LAST_STATUS="$RP_STATUS"
   fi
   if [ "$RP_STATUS" = "online" ]; then
-    NEW_INSTANCE_ID=$(ws_field "$WS_ID" "instance_id")
-    if [ -n "$NEW_INSTANCE_ID" ] && [ "$NEW_INSTANCE_ID" != "$ORIGINAL_INSTANCE_ID" ]; then
-      REPROV_OK=1
-      break
+    if [ "$PROVIDER" != "aws" ]; then
+      # local-docker: the tenant API does NOT surface instance_id here, and the
+      # heal recreates the container under the SAME name — so "NEW instance_id"
+      # via ws_field can never be satisfied (it dead-soaks to the deadline). The
+      # genuine new-instance signal on this topology is a NEW docker container
+      # ID under the same name. Resolve it from the daemon (same surface the
+      # boot path + kill step use) and compare against the pre-kill container ID.
+      NEW_CONTAINER_NAME=$(resolve_molecules_server_container "$WS_ID")
+      if [ -n "$NEW_CONTAINER_NAME" ]; then
+        NEW_CONTAINER_UID=$(docker inspect -f '{{.Id}}' "$NEW_CONTAINER_NAME" 2>/dev/null || echo "")
+        if [ -n "$NEW_CONTAINER_UID" ] && [ "$NEW_CONTAINER_UID" != "$ORIGINAL_CONTAINER_UID" ]; then
+          NEW_INSTANCE_ID="$NEW_CONTAINER_NAME"
+          REPROV_OK=1
+          break
+        fi
+      fi
+      # online again but the replacement container is not up yet (or, if
+      # ORIGINAL_CONTAINER_UID could not be captured, we can't prove the swap) —
+      # keep polling until a distinct container ID materializes.
+    else
+      NEW_INSTANCE_ID=$(ws_field "$WS_ID" "instance_id")
+      if [ -n "$NEW_INSTANCE_ID" ] && [ "$NEW_INSTANCE_ID" != "$ORIGINAL_INSTANCE_ID" ]; then
+        REPROV_OK=1
+        break
+      fi
+      # online again but instance_id either not surfaced yet or still the old
+      # (terminated) id — keep polling until the reprovision swaps it.
     fi
-    # online again but instance_id either not surfaced yet or still the old
-    # (terminated) id — keep polling until the reprovision swaps it.
   fi
   sleep 15
 done
 
 if [ "$REPROV_OK" = "1" ]; then
-  ok "SECONDARY held — auto-reprovisioned to online on NEW instance_id=$NEW_INSTANCE_ID (was $ORIGINAL_INSTANCE_ID)"
+  if [ "$PROVIDER" != "aws" ]; then
+    # Short IDs for readability only — use printf, not ${VAR:0:N}, so the
+    # KI-013 container-name truncation guard (SEV-2499) does not flag a log line.
+    _orig_short=$(printf '%.12s' "$ORIGINAL_CONTAINER_UID")
+    _new_short=$(printf '%.12s' "$NEW_CONTAINER_UID")
+    ok "SECONDARY held — auto-reprovisioned to online on a NEW container (id ${_orig_short}… → ${_new_short}…, same name $NEW_INSTANCE_ID)"
+  else
+    ok "SECONDARY held — auto-reprovisioned to online on NEW instance_id=$NEW_INSTANCE_ID (was $ORIGINAL_INSTANCE_ID)"
+  fi
 else
   # Soft-miss — see FUTURE TIGHTENING note above. PRIMARY is the gate.
   log "⚠️  SECONDARY not satisfied within ${REPROVISION_TIMEOUT_SECS}s (status=${REPROV_LAST_STATUS:-<empty>}, instance_id=${NEW_INSTANCE_ID:-<none>}, original=$ORIGINAL_INSTANCE_ID). NOT failing — the PRIMARY heal-detection assertion is the gate; reprovision is a slower, flakier cold path. Promote this to a hard fail once it's proven reliable."

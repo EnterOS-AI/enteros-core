@@ -57,6 +57,30 @@ func defaultNativePluginSources() []string {
 	return nativePluginSourcesForInstall(molcontracts.NativePluginInstallDefault)
 }
 
+// defaultNativePluginSourcesForDeclare is the install:default set
+// declareDefaultNativePlugins actually seeds: defaultNativePluginSources() MINUS
+// the scheduler source. The scheduler is owned by the dedicated
+// ensureSchedulerPluginDeclared path (workspace_provision_shared.go), which
+// declares it under the const SchedulerPluginName ("molecule-scheduler"). This
+// path derives an install name from the source via PluginNameFromSource, which
+// for the scheduler source yields a DIFFERENT name ("molecule-ai-plugin-
+// scheduler") — so seeding the scheduler here too would create a SECOND,
+// differently-named workspace_declared_plugins row for one plugin and a duplicate
+// boot-install. Filtering here (not in defaultNativePluginSources) keeps the
+// registry SSOT untouched — the concierge-exclusion test and other consumers
+// still see the full registry-derived set.
+func defaultNativePluginSourcesForDeclare() []string {
+	all := defaultNativePluginSources()
+	out := make([]string, 0, len(all))
+	for _, s := range all {
+		if s == SchedulerPluginSource {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
 // declareDefaultNativePluginsEnv gates the universal install:default
 // declaration below.
 const declareDefaultNativePluginsEnv = "MOLECULE_DECLARE_DEFAULT_NATIVE_PLUGINS"
@@ -90,12 +114,14 @@ func declareDefaultNativePluginsEnabled() bool {
 //
 // The install:concierge plugin (the management MCP) is NOT declared here — it is
 // privileged and stays gated to the org-root kind=platform concierge via
-// applyConciergeProvisionConfig + the recordDeclaredPlugin entitlement gate.
+// applyConciergeProvisionConfig + the recordDeclaredPlugin entitlement gate. The
+// scheduler is likewise NOT declared here — the dedicated ensureSchedulerPluginDeclared
+// path owns it (see defaultNativePluginSourcesForDeclare).
 func declareDefaultNativePlugins(ctx context.Context, workspaceID string) {
 	if !declareDefaultNativePluginsEnabled() {
 		return
 	}
-	sources := defaultNativePluginSources()
+	sources := defaultNativePluginSourcesForDeclare()
 	if len(sources) == 0 {
 		return
 	}

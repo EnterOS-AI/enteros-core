@@ -1,6 +1,6 @@
 # RFC: Scheduler as a trigger daemon plugin (decouple the cron engine from core)
 
-**Status:** Draft — for CTO sign-off. Author: CEO Assistant (on CTO direction 2026-07-14).
+**Status:** Implemented — additive delivery + CI gates merged (all code phases through P5; delivery linchpin core#4408). The legacy `workspace_schedules` table DROP (P4b) and the operational rollout remain owner-gated (fleet runtime pins, prod backfill `?apply=true`, `E2E_SCHEDULER_CHECK` flip) — tracked in [issue #4411](https://git.moleculesai.app/molecule-ai/molecule-core/issues/4411). Author: CEO Assistant (on CTO direction 2026-07-14).
 **Delivery state (2026-07-15):** all code phases through P5 are **merged** (P0 cron lib: core `internal/cronspec` + runtime#298; P1/P2/P3a-c: runtime#300 + SDK; P3-live: core#4398; P4 loop retirement: core#4399; P5 delivery: core#4408 `60fdebf6`); what remains is P4b (store retirement), a handful of P3 re-points (§8A P3), and the **operational rollout — tracked in [issue #4411](https://git.moleculesai.app/molecule-ai/molecule-core/issues/4411)** (owner-gated: fleet pins, prod backfill `?apply=true`, `E2E_SCHEDULER_CHECK` flip).
 **Related:** [`rfc-platform-mcp-as-plugin.md`](rfc-platform-mcp-as-plugin.md) (same "core capability → plugin channel" move for the management MCP), [`rfc-decouple-config-skill-delivery.md`](rfc-decouple-config-skill-delivery.md) (the persisted-volume asset channel this reuses), ADR-005 (SDK-owns-adapter socket; core carries zero runtime-behaviour code).
 **Repos touched:** molecule-core (thin), molecule-ai-workspace-runtime (daemon socket + host), molecule-ai-sdk (contract + template).
@@ -112,7 +112,7 @@ The schedule *definition* travels on the volume (seeded via the existing reconci
 5. **No scheduled CI** — the `lint_schedule_budget` zero-cron ratchet stays green; exercise the new scheduler via `pull_request`/`push`/`workflow_dispatch`, never `on.schedule`.
 6. **No double-fire** — `NativeSchedulerCheck` must gate core firing before any workspace's daemon goes live.
 7. **Busy behaviour** — a schedule that comes due while the agent is mid-turn must not be dropped; in-process the runtime turn queue serializes it (replacing core's `EnqueueA2A` buffer).
-8. **Auto-disable / stale semantics** (3 SDK errors → disable; 3 empty → stale) carry into the daemon.
+8. **Auto-disable / stale semantics** (3 SDK errors → disable; 3 empty → stale) ✅ **preserved (runtime-observed)** — the runtime attributes each fired turn's outcome to its schedule and applies the old-core engine semantics verbatim (runtime#335 + sdk#130 correlation); see P2 build notes.
 9. **System provenance** — every trigger-fired turn carries `source_type=self-scheduler` (loop-guard-governed) and is **never** delivered as `role: "user"`. A regression test asserts a scheduled turn is classified as a routine self-turn and does not appear as a user-origin task-queue row (§1.1).
 
 ## 8. Phasing (each an independently reviewable increment)
@@ -146,19 +146,22 @@ Each phase is DONE only when its **Build · Tests/CI · e2e · Cleanup · Docs**
 ### P2 — Trigger daemon + SDK scaffold (G3, G5, G6) — **DELIVERED (sdk#·runtime re-vendor), except the live e2e**
 - **Build:** ✅ **DONE.** Reference trigger daemon `templates/trigger/scheduler.py` — cron clock (real `molecule_runtime.cronspec`, lazy-imported), `self-scheduler` turn via the trigger client, durable bookkeeping on the persisted volume (atomic temp-file+`os.replace`), health heartbeat file, per-tick error isolation (one bad cron never wedges the daemon or its siblings). SDK `kind: trigger` template (`plugin.yaml` daemon + `schedules.yaml` grid) scaffolds + validates.
   - **Design decision — idle-gating delegated to the executor, not the daemon.** The RFC drafted `fire-only-when-idle` as a daemon `active_tasks==0` check. Instead the daemon fires unconditionally when due and the **executor's routine-self drop-not-queue** governs idleness (a `self-scheduler` turn that arrives mid-turn is dropped, never queued/interrupting). This is the same idle-gate the idle-digest and cron self-pings already use — one gate, no daemon-side TOCTOU race. Consequence: a schedule due while the agent is busy is dropped for that tick (fires next due time), not buffered as the old core `EnqueueA2A` loop did; consistent with the §1.1 routine-self taxonomy.
-  - **Not yet built (fold into P3, they need the runtime schedule API):** webhook event-poke honoring; auto-disable@3-SDK-errors / stale@3-empty counters (the old core engine-state bookkeeping) — deferred until the grid is volume-authoritative and the daemon owns that state.
+  - ✅ **Auto-disable@3-SDK-errors / stale@3-empty — DONE (runtime-observed, RFC invariant #8).** Landed as a *runtime-observed* state machine rather than daemon-owned bookkeeping: the daemon attaches `schedule_name` to the fire (SDK scaffold 0.5.5, sdk#130 + plugin re-vendor), and the runtime's `a2a_executor` classifies the completed turn's outcome (empty→stale streak; recognized provider error→disable streak; internal crash→neutral) via the pure `schedule_engine` state machine, persists per-schedule health to `schedule-engine.json` on the volume, and disables at 3 via the source-preserving `ScheduleStore.set_enabled` (runtime#335). Fidelity-verified against old core: the ok/empty branch resets the SDK-error streak, so an alternating error/empty sequence never disables (negative-controlled). Keyed on `source_type=self-scheduler` **AND** `schedule_name`, so the mailbox scheduler tick is ignored; dormant-safe (no-op without `schedule_name`).
+  - **Not yet built (fold into P3, needs the runtime schedule API):** webhook event-poke honoring — deferred until the grid is volume-authoritative and the daemon owns that state.
 - **Tests/CI (runtime + SDK):** ✅ **DONE.** Pure decision core (`trigger_schedule.evaluate_tick`) unit-tested — arm-without-boot-fire (negative control), fire-once-and-rearm, not-yet-due, disabled-disarm, bad-cron isolation; **integration vs the real `cronspec` engine** — hourly arm→fire→rearm, no thundering catch-up, DST spring-forward gap skipped. Trigger **client** contract tested — autonomous `self-scheduler` provenance (never `role:user`), client-supplied `source` stripped, capability-absent known-safe, post-delivery failure → `DeliveryUnknown`/never-replay. Scaffold generates + validates + its tests pass. SSOT drift fixed: `TRIGGER_*` constants relocated to the SDK source, vendor gate byte-identical.
 - **e2e (the big sub-step) — ⏳ REMAINING:** seed a schedule → canary workspace WITH the plugin → short fire interval → assert **(a)** trigger fires, **(b)** turn arrives `self-scheduler`, NOT `role:user`, **(c)** core defers (no double-fire), **(d)** parity. Four distinct fail arms: no-arm / armed-never-fired / fired-wrong-provenance / double-fire. Needs a live canary + the P3 schedule source.
 - **Cleanup — ⏳ REMAINING:** `KIND_SCHEDULER` / `A2A_SOURCE_SELF_SCHEDULER` now have a real producer (the daemon) — update the "unwired stub / zero producers" code comments once the plugin ships with a maintained runtime.
 - **Docs:** ⏳ SDK trigger-plugin authoring guide + runtime daemon reference still to write; update `project_maintained_runtime_set` when the plugin ships.
 
-### P3 — Storage → volume + runtime API (reach Option A) — **P3-live DELIVERED (core#4398: Canvas CRUD/RunNow re-point + DB→volume `MigrateToVolume`; ScheduleTab e2e core#4397); webhook/admin/History+Health re-points + template seeding REMAINING**
+### P3 — Storage → volume + runtime API (reach Option A) — **COMPLETE — Canvas CRUD/RunNow (core#4398) + webhook/admin/History+Health re-point (core#4430) + template seeding to config.yaml (core#4444 org-import + core#4451 direct-create) all MERGED; only the P4b table retirement remains (owner-gated)**
 - **Build:** ✅ **P3a DONE — the volume-authoritative store.** SDK `schedule` contract (`contracts/schedule/`) is the grid SSOT — definition-only entries, caps (100 / cron ≤128 / prompt ≤16384 bytes), valid/invalid fixtures. Runtime `molecule_runtime/schedule_store.py` is the validated write side: CRUD on the volume grid file, every write checked against the vendored schema + byte/count caps + `cronspec.validate` (unschedulable cron rejected at *write* time), atomic `os.replace`, `load()` re-validates so an out-of-band corrupt grid never loads silently, `replace_all` for seeding. Grid contract vendored byte-identical + drift-gated.
   - ✅ **P3b DONE — the runtime schedule API.** `molecule_runtime/internal_schedules.py`: `/internal/schedules*` List/Create/Update/Delete/Health over the store, mounted beside the other `/internal/*` platform-forward routes with the same `platform_inbound` forward-auth. Store validation → 400, unknown → 404, unconfigured state dir → 503; Health reads the daemon's health file (grid armed-count fallback pre-first-tick). API + daemon share one `MOLECULE_TRIGGER_STATE_DIR`.
   - ✅ **P3c DONE — RunNow / History / webhook-poke over a file IPC.** `POST /internal/schedules/{name}/run` enqueues a poke (202; 404 unknown, 409 disabled); the webhook event-poke is the same call. `evaluate_tick(poked=…)` fires a poked+enabled schedule immediately regardless of cron and re-arms so it never double-fires; the daemon consumes pokes (deferring only undeliverable ones) and appends a bounded run log that `GET …/history` (optionally per-name) reads. The whole poke→deliver→clear→history loop is covered by a `run_once` scaffold test.
   - ✅ **State-dir injection DONE.** `molecule_runtime/trigger_state.resolve_trigger_state_dir()` is the one resolver both sides use — `MOLECULE_TRIGGER_STATE_DIR` override else `<configs_dir>/schedules` on the persisted volume. The schedule API defaults to it; the channel-events injector sets it into every trigger daemon's env, so the API and daemon provably share the durable per-workspace grid + health + history + poke files (tested).
   - ✅ **P3-live DONE (core#4398, merged 2026-07-15).** Canvas List/Create/Update/Delete/RunNow are proxied to the runtime's volume-backed `/internal/schedules*` API whenever the workspace advertises the `scheduler` capability (`schedules_proxy.go` — `scheduleBackendIsVolume`, incl. the `cron`↔`cron_expr` shape mapping to the existing Canvas JSON contract; `SCHEDULE_VOLUME_PROXY_DISABLED` kill-switch forces the legacy DB path). The DB→volume **data migration** shipped as `POST /admin/workspaces/:id/schedules/migrate-to-volume` (`MigrateToVolume` — copies `source='runtime'` rows, idempotent; see `docs/guides/selfhost-schedule-migration.md`). Canvas `ScheduleTab` e2e landed as core#4397.
-  - ⏳ **REMAINING:** re-point Canvas **History + Health** (still read `activity_logs` / `workspace_schedules`), **admin health/orphan-reap** (`admin_schedules_health.go`, still DB), and the **webhook event-poke** (`webhooks.go` still writes `next_run_at=NOW()` to the DB) at the runtime API. **Template seeding to the volume is an open design seam:** core still seeds a template's `config.yaml` `schedules:` block into the legacy DB only (`template_schedules.go` / `org.go`); the runtime's reconcile-on-boot seeding (runtime#303) covers a trigger plugin's *shipped* `schedules.yaml`, not the workspace template's `config.yaml` grid.
+  - ✅ **Re-point DONE (core#4430, merged).** Canvas **History + Health**, **admin health** (`admin_schedules_health.go` → `volumeAdminScheduleHealth` + the volume proxy loop), and the **webhook event-poke** (`webhooks.go` → `pokeVolumeSchedules` POSTs `/internal/schedules/{name}/run`) all serve volume-native workspaces from the runtime API. Dual-path: the legacy DB legs are retained (kill-switchable) as fallback until P4b removes them. (Admin **orphan-reap** stays pure-DB — a legacy-only tool with no volume analogue needed; the volume equivalent is capture→`carryover_runtime_schedules`→`RestoreInheritedRuntimeSchedules`; it is deleted at P4b, not re-pointed.)
+  - ✅ **Template seeding to the volume DONE.** Core renders a workspace's resolved `schedules:` block into the **delivered `config.yaml`** (`renderTemplateSchedulesYAML` → `appendYAMLBlockChecked`): `core#4444` (org-import path) + `core#4451` (direct-create path, closing the asymmetry). The runtime seeds it into the volume grid on boot/reload (`seed_schedules_from_workspace_config`, runtime#318). The legacy DB seed (`orgImportScheduleSQL`, `source='template'`) is retained as a dual-write until P4b. `core#4453` adds `carryover_runtime_schedules` for volume-side inheritance across recreation.
+  - ✅ **P4b enabling tooling DONE (core#4507/#4508/#4510).** `GET /admin/schedules/p4b-readiness` (read-only fleet audit → `data_drop_safe` + per-workspace blockers; content-parity, fail-closed) + `POST /admin/schedules/migrate-all-to-volume?apply=false` (dry-run-default, idempotent, copy-only). 10g E2E proves both reachable on a real tenant; safety-hardened via an xhigh review (#4510). These make the P4b DROP precondition measurable + executable without touching the irreversible parts.
 - **Tests/CI:** ✅ **P3a store suite** (`tests/test_schedule_store.py`, 11) — every valid/invalid **contract fixture** partition holds (store can't drift from the contract), byte-cap enforced on UTF-8 bytes (multibyte negative control), count/dup caps, unschedulable-cron rejected, CRUD round-trip, corrupt-grid rejected, `load` re-validates persisted entries, `replace_all` atomic (failed validation leaves prior grid intact). ⏳ **REMAINING:** Canvas contract tests (7 routes, **identical JSON shapes**); seeding invariants (`source=template|runtime`, additive-only, runtime edits survive re-provision); webhook poke still fires; **portability** — schedules survive re-provision/move; **data-migration** — existing `workspace_schedules` rows migrate to the volume idempotently with zero loss.
 - **e2e:** full-SaaS gate — create → schedule via Canvas API → fires → survives restart → visible in `ScheduleTab`.
 - **Cleanup:** core CRUD / seeding / webhooks stop **writing** `workspace_schedules` (reads may linger one release for rollback).
@@ -176,10 +179,84 @@ Each phase is DONE only when its **Build · Tests/CI · e2e · Cleanup · Docs**
   - ✅ **P5a DONE — the plugin artifact.** `molecule-ai-plugin-scheduler` repo (`plugin.yaml` `kind: trigger` + daemon `scheduler`, empty `schedules.yaml` — it ships the *daemon*, not preset schedules), tagged **v0.1.0**. `scheduler.py`/`trigger_schedule.py`/`channel_sdk.py` are byte-identical to the SDK `templates/trigger` scaffold, enforced by an in-repo **drift gate** (`scripts/check_scaffold_drift.py` regenerates via `init_plugin(...)` and diffs; CI installs the SDK from git so it carries the `trigger` scaffold kind the published wheel lacks).
   - ✅ **P5b-rt DONE — runtime hot-start (runtime#308).** `DaemonSupervisor.supervise`/`ChannelEventSocketManager.add_specs` add a newly-installed daemon mid-process; a `DaemonRuntime` holder makes `ensure_daemons()` idempotent (cold at boot, warm via `POST /internal/daemons/reload`, `platform_inbound`-authed). So a running workspace arms a just-declared scheduler **without a restart**.
   - ✅ **P5b core delivery (core#4408).** `scheduler_plugin.go`: `ensureSchedulerPluginDeclared` (idempotent upsert of the pinned `gitea://…#v0.1.0` source), `armSchedulerPlugin` (best-effort reload forward — non-fatal, reconcile-on-online is the durable net), `ensureAndArmSchedulerPlugin` (declare sync + arm async). Hooked into `schedules.go` Create and template seeding (`template_schedules.go`, when ≥1 schedule seeds). `POST /admin/schedules/backfill-plugin` (AdminAuth, **dry-run by default**, `?apply=true` to declare+arm) remediates workspaces stranded by #4399.
+  - ✅ **Default-on-every-workspace + kill-switch (core#4541).** The one `molecule-scheduler` plugin ships **both** the firing daemon and the self-schedule MCP tool, so it can no longer wait for a schedule to exist (you need the tool to create the first one). It is now declared **unconditionally on every provision** (`workspace_provision_shared.go` → `ensureSchedulerPluginDeclared`, still idempotent + non-fatal), guarded by a **default-ON kill-switch** `MOLECULE_DECLARE_SCHEDULER_PLUGIN` (`declareSchedulerPluginEnabled`: unset/`""`/`1`/`true`/`yes` ⇒ ON, `0`/`false`/`no` ⇒ OFF) so the owner can HALT the roll-out in an emergency without a code revert — the symmetric-but-**inverted** counterpart to the default-off `MOLECULE_DECLARE_DEFAULT_NATIVE_PLUGINS` that gates the digest default-native declaration. **Ownership/SSOT:** the scheduler is declared **exactly once**, under the const `SchedulerPluginName = "molecule-scheduler"`; it is **excluded** from `declareDefaultNativePlugins` via `defaultNativePluginSourcesForDeclare()` filtering `SchedulerPluginSource` out of the registry-derived set. Without the filter the two paths double-declare: `declareDefaultNativePlugins` derives the install name from the raw source (`PluginNameFromSource` → `molecule-ai-plugin-scheduler`), a *different* name than the const, so one plugin lands as two `workspace_declared_plugins` rows + a duplicate boot-install. Note the kill-switch is presently a **code-default lever** — read from the process env, **not yet registered in the Infisical/CP config SSOT** — so ops set it on the core deployment env directly (runbook: `docs/runbooks/scheduler-plugin.md`).
 - **Tests/CI:** ✅ P5a scaffold-drift gate + daemon tests green in the plugin repo; P5b-rt hot-start unit + integration tests (supervise idempotency, holder cold/warm-add/warm-noop, `add_specs` binds only new lanes) — 129 runtime tests green; P5b core `scheduler_plugin_test.go` — **pinned source declared exactly** (typo = silent no-install, the load-bearing guard), source shape well-formed, arm no-ops without a callback URL (negative control), backfill dry-run is read-only (negative control, no INSERT).
 - **e2e — P5c (core#4408):** `test_staging_full_saas.sh` **step 10d** (mirrors idle step 10c) — with `E2E_SCHEDULER_CHECK=on` the ephemeral workspace declares the plugin, boot-installs + arms it, then a `* * * * *` schedule is created via the **tenant API** and the daemon must **autonomously fire** it (`schedule-history.json` + `"fired schedule"` log). Reachable, distinct fail arms: create-non-2xx (capability/routing gap) vs never-fired with grid/health/history diagnostics naming the broken leg. Defaults **OFF** until the ephemeral runtime pin carries plugin boot-install + the trigger scaffold, so it can't red a gate on a capability the image doesn't yet have.
 - **Cleanup:** the delivery is additive — nothing retired here; it is the *precondition* for P4's `workspace_schedules` drop (P4b).
 - **Docs:** this block; `project_scheduler_trigger_plugin_no_default_delivery` memory; the plugin repo README. ⏳ SDK trigger-plugin authoring guide still references the scaffold (task #39).
+
+### P5.1 — Concierge default schedules (self-host) — **DONE (2026-07-22): template #20, core graft #4549, verbs mcp-server #115; published 1.9.6 + fleet-rolled to runtime-0.4.36; self-brick guard #4565; FULL live e2e (10g #4568, apply+self-brick #4569, hermetic self-host graft→grid #4571 — #4555 CLOSED). Only the self-host operator's own image redeploy remains (external).**
+
+An *operational* increment on top of P5's delivery: now that a self-host
+workspace boots the scheduler daemon, the **self-host concierge** ships two
+default schedules so a fresh install is useful on day one. This is a *content +
+graft* increment — no new scheduler-engine seam.
+
+- **Content lives in the template, not core.** The two schedules
+  (`daily-activity-report` `0 9 * * *`; `plugin-auto-update` `0 3 * * *`, both
+  UTC/enabled) are a top-level **runtime-native** `schedules:` block in the
+  platform-agent template `config.yaml` (**#20, merged**) — key `cron`, prompt
+  inlined, so they satisfy the runtime schedule contract with no render step.
+  Editing a cron/prompt is a template edit + re-export, **no core redeploy**
+  (`[[feedback_plugin_defaults_live_in_template_not_core]]`).
+- **Self-host-only graft in core (#4549, merged `380e81f9`).**
+  `graftConciergeSchedules` in `composeConciergeRuntimeConfig`
+  (`platform_agent.go`) grafts whatever `schedules:` node the platform-agent
+  template carries onto the composed concierge config — a **generic passthrough**
+  (content never hardcoded in Go), gated `SelfHostPlatformSeedEnabled()`
+  (`MOLECULE_ORG_ID` unset). On SaaS the concierge config stays byte-identical
+  (`grafted=false`). Boot-safe: a round-trip guard ships the config *without*
+  schedules on any failure rather than bricking boot. `renderTemplateSchedulesYAML`
+  is **not** called (the concierge entries are already runtime-native).
+- **Verbs for `plugin-auto-update` (mcp-server #115, merged).**
+  `check_plugin_updates` (`GET /admin/plugin-updates-pending`) +
+  `apply_plugin_update` (`POST /admin/plugin-updates/:id/apply`), management-mode
+  / org-key-authed. `apply_plugin_update` re-pins and restarts the affected
+  workspace — including the concierge's own if it updates a plugin on itself.
+  The **self-brick guard (#4565)** defers that self-restart for the platform
+  concierge (mirrors the reconcile path's `platformConciergeReconcileShouldSkipRestart`);
+  non-concierge workspaces still restart immediately. Core/runtime updates are
+  report-only (operator deploy).
+- **Verified assumptions (2026-07-21).** Two load-bearing preconditions were
+  proven against code, not assumed: the runtime reconcile
+  (`seed_schedules_from_workspace_config` → `ScheduleStore.upsert_template`) is
+  **non-destructive** of operator-edited schedules (preserves `source=runtime`,
+  honors tombstones, atomic writes; 33 tests); and the concierge **can deliver**
+  `send_message_to_user` by default (tool registered unconditionally, RBAC default
+  `operator`→approve, `workspaces.talk_to_user_enabled` DB-default TRUE, not
+  overridden on concierge creation).
+- **Deploy tail — DONE (2026-07-21).** `daily-activity-report` works once #20 +
+  #4549 land and the concierge re-provisions (it uses only `send_message_to_user`
+  + the always-present `/activity` (+ `/mail/summary`) endpoints).
+  `plugin-auto-update`'s verbs are now live: mcp-server **1.9.6 PUBLISHED**
+  (break-glass path — the tagged-release publish.yml stays dead on the revoked
+  Infisical `MOL_PACKAGE_TOKEN`, so no `v1.9.6` git tag was cut) → pin cascade
+  sdk#139 / runtime#340 / mcp-server#116 / template#336 → **runtime-0.4.36**
+  bakes `MANAGEMENT_MCP_PINNED_VERSION=1.9.6`, fleet-rolled via `.runtime-version`
+  bumps on all four maintained templates (claude-code#338 / hermes#285 /
+  codex#284 / openclaw#259). The one remaining step is **not ours**: a self-host
+  *operator* must redeploy onto the 0.4.36 image + re-provision the concierge;
+  until then `plugin-auto-update` degrades gracefully (reports tooling missing).
+- **Coverage — FULL, live per-PR (#4555 CLOSED 2026-07-22).** Three layers, each
+  live in CI:
+  - **Fire → deliver (10g, #4568):** ephemeral-CP sub-step — a scheduled prompt
+    calls `send_message_to_user` and the gate asserts the delivery lands (the
+    `a2a_receive`/`notify` `activity_logs` row carrying a run-unique marker) on the
+    real-LLM arm; mock arms skip (never red). Proven live in its own lane.
+  - **Apply + self-brick guard (#4569):** `TestIntegration_*` in the Handlers
+    Postgres lane drive the full `apply_plugin_update` against real schema
+    (re-pin + `status→applied`) and assert the concierge self-restart is **deferred**
+    (#4565) while a non-concierge restarts.
+  - **Self-host graft → grid (hermetic, #4571):** a new lane boots ws-server with
+    `MOLECULE_ORG_ID` **unset** (so `graftConciergeSchedules` genuinely fires) +
+    Postgres + the stub-runtime (extended to materialize the config.yaml `schedules:`
+    block onto the grid + serve `/internal/schedules`), provisions the concierge to
+    online (bare-anthropic BYOK on the LLM-less stub), and asserts both defaults via
+    `docker exec` config.yaml **and** `GET /workspaces/<concierge>/schedules`.
+  (The earlier Go unit test #4556 + runtime unit test #341 remain as the fast
+  compose-level + seed-level checks beneath these live lanes.)
+- **Docs/runbook:** `docs/runbooks/selfhost-concierge-default-schedules.md`;
+  memory `project_selfhost_concierge_default_schedules`.
 
 ### Cross-cutting DoD (every phase)
 - **No double-fire** demonstrated at each cutover point (`NativeSchedulerCheck` gates before any daemon goes live).

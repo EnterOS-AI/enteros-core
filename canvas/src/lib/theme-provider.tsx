@@ -10,6 +10,7 @@ import {
 } from "react";
 import {
   THEME_COOKIE,
+  brandCookieDomain,
   type ResolvedTheme,
   type ThemePreference,
 } from "@/lib/theme-cookie";
@@ -47,29 +48,35 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 /**
  * Cookie attributes:
- *  - `Domain=.moleculesai.app` so the preference follows the user across
- *    canvas.moleculesai.app, app.moleculesai.app, market.moleculesai.app,
- *    docs.moleculesai.app, AND tenant subdomains (acme.moleculesai.app,
- *    acme.staging.moleculesai.app, ...). All match `endsWith(".moleculesai.app")`.
- *    Skipped on localhost (browser would reject Domain= for a
- *    non-public-suffix host).
+ *  - `Domain=<brand apex>` so the preference follows the user across that
+ *    brand's surfaces (app, market, docs, landing, canvas) AND tenant
+ *    subdomains (acme.moleculesai.app, acme.staging.moleculesai.app, ...).
+ *    The apex is DERIVED from the runtime hostname via brandCookieDomain()
+ *    because the SAME build serves both brand generations' fqdns (Enter OS
+ *    rebrand, internal#1089 Phase 2): `.moleculesai.app` hosts keep the exact
+ *    pre-Phase-2 cookie; `.enteros.ai` hosts get their own apex. A baked
+ *    single-domain literal here would make the browser silently DROP the
+ *    Domain attribute on the other brand's hosts (host-only, non-Secure
+ *    cookie). Skipped on localhost / previews / self-hosted (browser would
+ *    reject Domain= for a non-matching host) — host-only cookie, as before.
  *  - `Max-Age=1y` — long-lived; users rarely change theme.
  *  - `SameSite=Lax` — fine for a UI preference; not security-sensitive.
  *  - `Secure` only in production HTTPS contexts.
  */
 function writeThemeCookie(value: ThemePreference): void {
   if (typeof document === "undefined") return;
-  const isProdHost =
-    typeof window !== "undefined" &&
-    window.location.hostname.endsWith(".moleculesai.app");
+  const domain =
+    typeof window !== "undefined"
+      ? brandCookieDomain(window.location.hostname)
+      : null;
   const parts = [
     `${THEME_COOKIE}=${value}`,
     "Path=/",
     "Max-Age=31536000",
     "SameSite=Lax",
   ];
-  if (isProdHost) {
-    parts.push("Domain=.moleculesai.app");
+  if (domain) {
+    parts.push(`Domain=${domain}`);
     parts.push("Secure");
   }
   document.cookie = parts.join("; ");

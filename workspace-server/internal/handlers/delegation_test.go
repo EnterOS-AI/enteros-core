@@ -1209,7 +1209,7 @@ func TestExecuteDelegation_DeliveryConfirmedProxyError_TreatsAsSuccess(t *testin
 			},
 		},
 	})
-	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody, "")
 
 	time.Sleep(100 * time.Millisecond) // let DB writes settle
 
@@ -1275,7 +1275,7 @@ func TestExecuteDelegation_ProxyErrorNon2xx_RemainsFailed(t *testing.T) {
 			},
 		},
 	})
-	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody, "")
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -1325,7 +1325,7 @@ func TestExecuteDelegation_ProxyErrorEmptyBody_RemainsFailed(t *testing.T) {
 			},
 		},
 	})
-	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody, "")
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -1368,7 +1368,7 @@ func TestExecuteDelegation_CleanProxyResponse_Unchanged(t *testing.T) {
 			},
 		},
 	})
-	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody)
+	dh.executeDelegation(context.Background(), testDeliverySourceID, testDeliveryTargetID, testDeliveryDelegationID, a2aBody, "")
 
 	time.Sleep(100 * time.Millisecond)
 

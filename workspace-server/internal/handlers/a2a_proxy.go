@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -28,6 +29,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/sessionid"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wsauth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -857,6 +859,35 @@ func (h *WorkspaceHandler) proxyA2ARequest(ctx context.Context, workspaceID stri
 		return http.StatusOK, respBody, nil
 	}
 
+	// PLATFORM-OWNED BOOT TURN IN FLIGHT (first-boot greeting or
+	// restart-context): dispatching a caller's turn NOW interleaves it into
+	// the agent's single session mid-boot-turn — hermes INTERRUPTS the
+	// running turn and acks "⚡ Interrupting current task…", which the caller
+	// receives as their answer (the staging e2e's "opening reply was not a
+	// greeting"). The queue DRAIN already respects this gate
+	// (a2a_queue.go restartContextInFlight check); this closes the DIRECT
+	// dispatch path the same way: durably queue and return the standard
+	// queued envelope (the canvas already waits for the WS-delivered reply
+	// on that shape). System callers pass through — the gate holder itself
+	// dispatches through this proxy.
+	if a2aMethod == "message/send" && restartContextInFlight(workspaceID) && !isSystemCaller(callerID) {
+		if qid, depth, qErr := EnqueueA2A(ctx, workspaceID, callerID, PriorityTask, body, a2aMethod, "", nil); qErr == nil {
+			log.Printf("ProxyA2A: platform boot turn in flight for %s — queued caller turn instead of interleaving", workspaceID)
+			respBody, marshalErr := json.Marshal(gin.H{
+				"status":      "queued",
+				"method":      a2aMethod,
+				"queued":      true,
+				"queue_id":    qid,
+				"queue_depth": depth,
+			})
+			if marshalErr == nil {
+				return http.StatusOK, respBody, nil
+			}
+		}
+		// Enqueue/marshal failure: fall through to normal dispatch — an
+		// interleaved turn beats a dropped one.
+	}
+
 	// Mock-runtime short-circuit. Workspaces with runtime='mock' have
 	// no container, no EC2, no URL — every reply is synthesised here
 	// from a small canned-variant pool. Built for the "200-workspace
@@ -1280,13 +1311,88 @@ func (h *WorkspaceHandler) resolveAgentURL(ctx context.Context, workspaceID stri
 	}
 	// SSRF defence: reject private/metadata URLs before making outbound call.
 	if err := isSafeURL(agentURL); err != nil {
-		log.Printf("ProxyA2A: unsafe URL for workspace %s: %v", workspaceID, err)
-		return "", &proxyA2AError{
-			Status:   http.StatusBadGateway,
-			Response: gin.H{"error": "workspace URL is not publicly routable"},
+		// Docker-internal restart-flap residual (core#4548): on the local-
+		// docker topology the workspace URL was rewritten above to the
+		// synthesized container hostname (ws-<id>:8000). During a config-PUT
+		// restart flap the container's DNS name can transiently fail to
+		// resolve while docker-DNS races to (re)register it — isSafeURL then
+		// returns a *net.DNSError-wrapped "DNS resolution blocked" error and
+		// the turn is dropped with a spurious 502.
+		//
+		// settleDockerInternalDNS re-runs isSafeURL a bounded number of times
+		// to let docker-DNS settle. It is NOT a routability relaxation: the
+		// classification of what counts as routable is byte-for-byte
+		// unchanged, and it only retries while the failure remains a DNS-
+		// *resolution* error — a genuine routability rejection (private/
+		// metadata/link-local classification) is a plain error, does not
+		// match, and fails closed on the first attempt.
+		//
+		// Prod-safety: this branch is gated on devModeAllowsLoopback()
+		// (MOLECULE_ENV=development|dev) AND platformInDocker AND the URL
+		// being the container-hostname rewrite. SaaS/prod tenants run
+		// MOLECULE_ENV=production (crypto strict-init) and register by VPC-
+		// private IP (never the 127.0.0.1→ws-<id> rewrite), so prod never
+		// enters here and calls isSafeURL exactly once — the production
+		// SSRF/routability guard is unchanged.
+		if devModeAllowsLoopback() && platformInDocker &&
+			agentURL == provisioner.InternalURL(workspaceID) &&
+			isDNSResolutionError(err) {
+			err = settleDockerInternalDNS(agentURL)
+		}
+		if err != nil {
+			log.Printf("ProxyA2A: unsafe URL for workspace %s: %v", workspaceID, err)
+			return "", &proxyA2AError{
+				Status:   http.StatusBadGateway,
+				Response: gin.H{"error": "workspace URL is not publicly routable"},
+			}
 		}
 	}
 	return agentURL, nil
+}
+
+// dockerDNSSettleAttempts / dockerDNSSettleDelay bound how long the A2A
+// proxy waits for docker-DNS to (re)register a workspace container's
+// hostname during a restart flap before giving up. Ceiling ~1.5s
+// (5 × 300ms), well under the A2A client timeout. Package vars so tests
+// can shorten the delay; production never reaches settleDockerInternalDNS
+// (see resolveAgentURL gate).
+var (
+	dockerDNSSettleAttempts = 5
+	dockerDNSSettleDelay    = 300 * time.Millisecond
+)
+
+// isDNSResolutionError reports whether err (as produced by isSafeURL) is a
+// transient DNS *resolution* failure rather than a routability rejection.
+// isSafeURL wraps net.LookupHost's *net.DNSError with %w on the resolution-
+// blocked path; classification rejections are plain fmt.Errorf values that
+// do not unwrap to a *net.DNSError. This is what keeps the settle retry from
+// ever re-attempting — and thus never masking — a real SSRF rejection.
+func isDNSResolutionError(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
+}
+
+// settleDockerInternalDNS re-runs the SSRF/routability check (isSafeURL) up
+// to dockerDNSSettleAttempts times, sleeping dockerDNSSettleDelay between
+// attempts, but ONLY while the failure remains a DNS-resolution error. The
+// first time isSafeURL returns nil the URL is accepted; the first time it
+// returns a NON-DNS error (an actual routability rejection) that rejection
+// is returned immediately. It therefore never broadens what counts as
+// routable — it only waits for the container name to resolve. Returns nil
+// on success or the last error on timeout.
+func settleDockerInternalDNS(agentURL string) error {
+	var err error
+	for i := 0; i < dockerDNSSettleAttempts; i++ {
+		time.Sleep(dockerDNSSettleDelay)
+		err = isSafeURL(agentURL)
+		if err == nil {
+			return nil
+		}
+		if !isDNSResolutionError(err) {
+			return err // real routability rejection — fail closed, do not retry
+		}
+	}
+	return err
 }
 
 // normalizeA2APayload parses the incoming body, wraps it in a JSON-RPC 2.0
@@ -1418,8 +1524,27 @@ func normalizeA2APayload(body []byte) ([]byte, string, *proxyA2AError) {
 // across process restarts — exactly the property runtime session resumption
 // needs. The workspace id is a UUID (dash-delimited, no colons), so the
 // resulting id survives any runtime session-id sanitisation unchanged.
+//
+// Delegates to sessionid.DefaultContextID — the ONE authority for this
+// convention (the provisioner injects the SAME value into each workspace
+// container as MOLECULE_DEFAULT_SESSION_CONTEXT_ID, and the shared runtime
+// consumes it). The convention can only move in sessionid.
 func canvasSessionContextID(workspaceID string) string {
-	return "canvas-" + workspaceID
+	return sessionid.DefaultContextID(workspaceID)
+}
+
+// platformTurnContextID is the contextId platform-originated turns (first-boot
+// greeting, restart-context wake) stamp on their synthetic messages: the SAME
+// deterministic default session the canvas uses and the server belt fills —
+// so boots and restarts land in the user's conversation instead of a fresh
+// runtime-minted session (Langfuse 3-session fragmentation, 2026-07-21).
+// KNOWN TRADEOFF: after an explicit "New session" rotation (a client-local
+// sess-* id the server cannot see), platform turns still land in the DEFAULT
+// session. That is deliberate — system notices belong to the workspace's
+// default thread, and chat-history hydration is activity-log based so nothing
+// is lost; the alternative (runtime-minted UUID per boot) fragments tracing.
+func platformTurnContextID(workspaceID string) string {
+	return canvasSessionContextID(workspaceID)
 }
 
 // ensureCanvasSessionContextID injects a stable, deterministic contextId into a

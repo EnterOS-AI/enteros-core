@@ -195,6 +195,178 @@ describe("hydrate", () => {
     expect(useCanvasStore.getState().nodes[0].data.currentTask).toBe("");
   });
 
+  it("restores bootSteps + watchdog bootLog from the server boot_steps replay", () => {
+    // A page reload / rehydrate mid-boot: GET /workspaces attaches the
+    // BOOT_STEP history for provisioning rows (events/boottrace.go). The
+    // boot screen must come back with keycaps AND the full log, not reset
+    // to "waiting for boot telemetry".
+    const ws = makeWS({
+      id: "ws-1",
+      status: "provisioning",
+      boot_steps: [
+        { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running", message: "building image", at: 1000 },
+        { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running", message: "still building — 20s elapsed", at: 21000 },
+        { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "ok", message: "image ready", at: 30000 },
+      ],
+    });
+
+    useCanvasStore.getState().hydrate([ws]);
+    const data = useCanvasStore.getState().nodes[0].data;
+
+    // Keycaps: latest status per step wins.
+    expect(data.bootSteps).toHaveLength(1);
+    expect(data.bootSteps![0].status).toBe("ok");
+    // Watchdog log: every distinct heartbeat line survives, in order.
+    expect(data.bootLog!.map((l) => l.text)).toEqual([
+      "building image",
+      "still building — 20s elapsed",
+      "image ready",
+    ]);
+    // Display offsets are per-line and derived from the server timestamps.
+    expect(data.bootLog!.map((l) => l.t)).toEqual([0, 20000, 29000]);
+  });
+
+  it("MERGES a same-generation replay with local state (union log, no keycap regress)", () => {
+    // The replay is a snapshot ~1 RTT old: a shorter same-generation replay
+    // must not truncate the log or regress keycaps the client already
+    // streamed live — the boot GENERATION marker is what proves sameness
+    // (never timestamps: server vs client clocks are not comparable).
+    const fullReplay = [
+      { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running", message: "a", at: 1000 },
+      { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running", message: "b", at: 2000 },
+      { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running", message: "c", at: 3000 },
+    ];
+    useCanvasStore.getState().hydrate([
+      makeWS({ id: "ws-1", status: "provisioning", boot_steps: fullReplay, boot_generation: "genA" }),
+    ]);
+    expect(useCanvasStore.getState().nodes[0].data.bootLog).toHaveLength(3);
+
+    // Next rehydrate serves a SHORTER snapshot of the SAME generation —
+    // the union keeps all three lines.
+    useCanvasStore.getState().hydrate([
+      makeWS({ id: "ws-1", status: "provisioning", boot_steps: [fullReplay[2]], boot_generation: "genA" }),
+    ]);
+    expect(useCanvasStore.getState().nodes[0].data.bootLog).toHaveLength(3);
+  });
+
+  it("clears stale local telemetry when a NEW generation's replay arrives (even empty)", () => {
+    // A reprovision mints a fresh generation and resets the server trace;
+    // the previous boot's keycaps/log/failure banner must not bleed into
+    // the new boot — even before its first step lands (empty replay).
+    useCanvasStore.getState().hydrate([
+      makeWS({
+        id: "ws-1",
+        status: "provisioning",
+        boot_generation: "genA",
+        boot_steps: [
+          { step: 5, total: 8, key: "TOOL", label: "Enumerate tools", status: "failed", message: "boom", at: 1000 },
+        ],
+      }),
+    ]);
+    expect(useCanvasStore.getState().nodes[0].data.bootSteps).toHaveLength(1);
+
+    useCanvasStore.getState().hydrate([
+      makeWS({ id: "ws-1", status: "provisioning", boot_steps: [], boot_generation: "genB" }),
+    ]);
+    const data = useCanvasStore.getState().nodes[0].data;
+    expect(data.bootSteps).toBeUndefined();
+    expect(data.bootLog).toBeUndefined();
+  });
+
+  it("keeps local state when the replay carries NO generation (server restarted mid-boot)", () => {
+    // A server that restarted mid-boot holds no trace entry: it serves
+    // boot_steps: [] WITHOUT a generation. That is "I know nothing", not
+    // "there is nothing" — the client keeps its richer local state.
+    useCanvasStore.getState().hydrate([
+      makeWS({
+        id: "ws-1",
+        status: "provisioning",
+        boot_generation: "genA",
+        boot_steps: [
+          { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running", message: "building", at: 1000 },
+        ],
+      }),
+    ]);
+    expect(useCanvasStore.getState().nodes[0].data.bootLog).toHaveLength(1);
+
+    useCanvasStore.getState().hydrate([
+      makeWS({ id: "ws-1", status: "provisioning", boot_steps: [] }),
+    ]);
+    const data = useCanvasStore.getState().nodes[0].data;
+    expect(data.bootLog).toHaveLength(1);
+    expect(data.bootSteps).toHaveLength(1);
+  });
+
+  it("adopts a NEW boot generation's replay even when it is shorter", () => {
+    // A reprovision that happened while this client was disconnected: the
+    // fresh generation's records are newer than everything held locally, so
+    // the (short) replay must replace the stale history.
+    useCanvasStore.getState().hydrate([
+      makeWS({
+        id: "ws-1",
+        status: "provisioning",
+        boot_generation: "genA",
+        boot_steps: [
+          { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running", message: "old a", at: 1000 },
+          { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "ok", message: "old b", at: 2000 },
+        ],
+      }),
+    ]);
+    useCanvasStore.getState().hydrate([
+      makeWS({
+        id: "ws-1",
+        status: "provisioning",
+        boot_generation: "genB",
+        boot_steps: [
+          { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running", message: "fresh", at: 99000 },
+        ],
+      }),
+    ]);
+    const data = useCanvasStore.getState().nodes[0].data;
+    expect(data.bootLog!.map((l) => l.text)).toEqual(["fresh"]);
+    expect(data.bootSteps![0].status).toBe("running");
+  });
+
+  it("carries over locally-accumulated boot telemetry when the server replay is absent", () => {
+    // Older platform build (no boot_steps in GET /workspaces): a periodic
+    // rehydrate must NOT wipe what this session already received over WS.
+    const steps = [
+      { step: 1, total: 8, key: "PWR", label: "Provision compute", status: "running" as const, at: 500 },
+    ];
+    const log = [{ id: "0:1-running", at: 500, t: 0, status: "running" as const, text: "Provision compute…" }];
+    useCanvasStore.getState().hydrate([makeWS({ id: "ws-1", status: "provisioning" })]);
+    useCanvasStore.setState({
+      nodes: useCanvasStore.getState().nodes.map((n) =>
+        n.id === "ws-1" ? { ...n, data: { ...n.data, bootSteps: steps, bootLog: log } } : n,
+      ),
+    });
+
+    // Rehydrate with the same provisioning row, still no boot_steps.
+    useCanvasStore.getState().hydrate([makeWS({ id: "ws-1", status: "provisioning" })]);
+    const data = useCanvasStore.getState().nodes[0].data;
+    expect(data.bootSteps).toEqual(steps);
+    expect(data.bootLog).toEqual(log);
+  });
+
+  it("does not carry boot telemetry onto a workspace that left provisioning", () => {
+    useCanvasStore.getState().hydrate([makeWS({ id: "ws-1", status: "provisioning" })]);
+    useCanvasStore.setState({
+      nodes: useCanvasStore.getState().nodes.map((n) =>
+        n.id === "ws-1"
+          ? {
+              ...n,
+              data: {
+                ...n.data,
+                bootSteps: [{ step: 1, total: 8, key: "PWR", label: "Provision compute", status: "ok" as const }],
+              },
+            }
+          : n,
+      ),
+    });
+    useCanvasStore.getState().hydrate([makeWS({ id: "ws-1", status: "online" })]);
+    expect(useCanvasStore.getState().nodes[0].data.bootSteps).toBeUndefined();
+  });
+
   it("preserves in-flight turn status after refresh (issue #2391)", () => {
     // Simulates a page refresh: the canvas re-hydrates from GET /workspaces
     // while the agent has an active in-flight turn. The store must reflect

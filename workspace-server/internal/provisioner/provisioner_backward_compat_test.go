@@ -54,6 +54,10 @@ func (f *compatFakeDockerClient) ContainerExecCreate(ctx context.Context, contai
 	panic("ContainerExecCreate not expected")
 }
 
+func (f *compatFakeDockerClient) ContainerExecInspect(ctx context.Context, execID string) (container.ExecInspect, error) {
+	panic("ContainerExecInspect not expected")
+}
+
 func (f *compatFakeDockerClient) ContainerInspect(ctx context.Context, name string) (container.InspectResponse, error) {
 	f.record("ContainerInspect:%s", name)
 	if err, ok := f.inspectErr[name]; ok {

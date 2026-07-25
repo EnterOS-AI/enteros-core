@@ -163,7 +163,7 @@ const VENDOR_LABELS: Record<string, string> = {
 /** Optional per-vendor tooltip shown on hover. */
 const VENDOR_TOOLTIPS: Record<string, string> = {
   "platform":
-    "Use the Molecule platform-managed LLM proxy. No vendor API key is required.",
+    "Use the Enter OS platform-managed LLM proxy. No vendor API key is required.",
   "anthropic-oauth":
     "Use your Claude.ai (Pro/Max/Team) subscription via OAuth. Run `claude login` in the workspace terminal to mint the token, then paste it here. No API spend.",
   anthropic:

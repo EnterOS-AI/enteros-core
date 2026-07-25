@@ -5,9 +5,11 @@ package handlers
 // already dismissed, workspace_plugins missing, install failure).
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -204,6 +206,103 @@ func TestAdminPluginDrift_Apply_WorkspacePluginsMissing(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404 when workspace_plugins row missing, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// restartSpy is a concurrency-safe recorder for the pluginsHandler restartFunc.
+type restartSpy struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (s *restartSpy) fn(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, id)
+}
+
+func (s *restartSpy) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.calls))
+	copy(out, s.calls)
+	return out
+}
+
+// TestAdminPluginDrift_Apply_ConciergeSelfRestartDeferred is the SELF-BRICK
+// guard: an Apply whose target is the kind=platform concierge in its fragile
+// lifecycle window (online) must NOT dispatch an immediate unconditional
+// restart — the concierge's own auto-update cron could otherwise reboot the
+// org-root box into a brick on a bad ref, mid-batch, with no health probe.
+//
+// Negative control: the pre-fix code restarted UNCONDITIONALLY in step 5. Point
+// this test at that path (drop the platformConciergeReconcileShouldSkipRestart
+// guard from applyRestartAfterDrift) and restarting==true / spy.calls==[wsID],
+// so the assertions below fail — proving the guard is what suppresses the
+// restart, not some incidental nil.
+func TestAdminPluginDrift_Apply_ConciergeSelfRestartDeferred(t *testing.T) {
+	mock := setupTestDB(t)
+
+	spy := &restartSpy{}
+	ph := NewPluginsHandler(t.TempDir(), nil, spy.fn)
+	h := NewAdminPluginDriftHandler(ph)
+
+	const wsID = "concierge-ws-uuid"
+	// The guard queries workspaces.kind/status: platform + online => defer.
+	mock.ExpectQuery(`SELECT kind, status FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind", "status"}).
+			AddRow("platform", "online"))
+
+	restarting := h.applyRestartAfterDrift(context.Background(), wsID)
+
+	// Drain any detached restart goroutine so a late call can't slip past the
+	// assertion (there should be none).
+	waitGlobalAsyncForTest()
+
+	if restarting {
+		t.Errorf("expected restarting=false for platform concierge (self-brick guard), got true")
+	}
+	if calls := spy.snapshot(); len(calls) != 0 {
+		t.Errorf("expected NO restart dispatched for platform concierge, got %v", calls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestAdminPluginDrift_Apply_NonConciergeStillRestarts proves auto-apply is
+// preserved: a normal (kind=workspace) target still gets its immediate re-pin +
+// restart. Negative control for the guard direction — if the guard over-fired
+// and suppressed non-concierge restarts, restarting would be false and
+// spy.calls empty, failing here.
+func TestAdminPluginDrift_Apply_NonConciergeStillRestarts(t *testing.T) {
+	mock := setupTestDB(t)
+
+	spy := &restartSpy{}
+	ph := NewPluginsHandler(t.TempDir(), nil, spy.fn)
+	h := NewAdminPluginDriftHandler(ph)
+
+	const wsID = "tenant-ws-uuid"
+	mock.ExpectQuery(`SELECT kind, status FROM workspaces WHERE id = \$1`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"kind", "status"}).
+			AddRow("workspace", "online"))
+
+	restarting := h.applyRestartAfterDrift(context.Background(), wsID)
+
+	// The restart is dispatched on a detached globalGoAsync goroutine; wait for it.
+	waitGlobalAsyncForTest()
+
+	if !restarting {
+		t.Errorf("expected restarting=true for non-concierge workspace (auto-apply preserved), got false")
+	}
+	calls := spy.snapshot()
+	if len(calls) != 1 || calls[0] != wsID {
+		t.Errorf("expected exactly one restart of %q, got %v", wsID, calls)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)

@@ -109,6 +109,91 @@ func TestHeartbeat_PlatformWarming_FlipsOnlineWhenToolReported(t *testing.T) {
 	}
 }
 
+// TestHeartbeat_VerifiedFlip_FiresFirstBootGreeting proves the verified
+// provisioning→online promotion invokes the first-boot greeting hook with the
+// heartbeat's tool count — the seam first_boot_greeting.go hangs off. Without
+// this wire, a fresh onboarding lands in a silent empty chat again.
+func TestHeartbeat_VerifiedFlip_FiresFirstBootGreeting(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewRegistryHandler(newTestBroadcaster())
+
+	type call struct {
+		workspaceID string
+		toolCount   int
+	}
+	greeted := make(chan call, 1)
+	handler.SetFirstBootGreeter(func(workspaceID string, toolCount int) {
+		greeted <- call{workspaceID, toolCount}
+	})
+
+	mock.ExpectQuery("SELECT COALESCE\\(current_task").
+		WithArgs("ws-warm-greet").
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "provisioning"))
+	mock.ExpectExec("UPDATE workspaces SET").
+		WithArgs("ws-warm-greet", 0.0, "", 0, 60, "", nil).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE workspaces SET loaded_mcp_tools").
+		WithArgs(sqlmock.AnyArg(), "ws-warm-greet").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT status, kind, last_register_failure_at, mcp_unloaded_since FROM workspaces WHERE id =").
+		WithArgs("ws-warm-greet").
+		WillReturnRows(evalStatusRows("provisioning", "platform", nil, nil))
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs("ws-warm-greet").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec("UPDATE workspaces SET status = .*mcp_unloaded_since = NULL").
+		WithArgs(models.StatusOnline, "ws-warm-greet", "provisioning").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO structure_events").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"workspace_id":"ws-warm-greet","error_rate":0.0,"sample_error":"","active_tasks":0,"uptime_seconds":60,"mcp_server_present":true,"loaded_mcp_tools":["a2a","` + conciergePlatformMCPProvisionWorkspaceTool + `"]}`
+	c.Request = httptest.NewRequest("POST", "/registry/heartbeat", bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Heartbeat(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	select {
+	case got := <-greeted:
+		if got.workspaceID != "ws-warm-greet" {
+			t.Errorf("greeter workspace = %q, want ws-warm-greet", got.workspaceID)
+		}
+		if got.toolCount != 2 {
+			t.Errorf("greeter toolCount = %d, want 2 (len(loaded_mcp_tools))", got.toolCount)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("first-boot greeter was not fired on the verified online flip")
+	}
+}
+
+// TestHoldOnlineBroadcastForWarmingPlatform pins Register's broadcast gate:
+// a platform row still HELD in 'provisioning' (warming) must not be announced
+// WORKSPACE_ONLINE — that flips the canvas to an interactive chat whose sends
+// bounce off the warming 503 (2026-07-18 fresh-onboarding repro). Everything
+// else keeps the legacy announce.
+func TestHoldOnlineBroadcastForWarmingPlatform(t *testing.T) {
+	cases := []struct {
+		kind, status string
+		want         bool
+	}{
+		{"platform", "provisioning", true},
+		{"platform", "online", false},
+		{"workspace", "provisioning", false},
+		{"workspace", "online", false},
+	}
+	for _, tc := range cases {
+		if got := holdOnlineBroadcastForWarmingPlatform(tc.kind, tc.status); got != tc.want {
+			t.Errorf("holdOnlineBroadcastForWarmingPlatform(%q,%q) = %v, want %v", tc.kind, tc.status, got, tc.want)
+		}
+	}
+}
+
 // TestHeartbeat_PlatformWarming_HealthyLongWarmingHolds proves the DYNAMIC,
 // signal-driven warm-up terminal (core#3082 warm-up determinism): a HEALTHY
 // concierge that has been warming a long time (mcp_unloaded_since well in the

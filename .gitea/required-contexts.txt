@@ -46,7 +46,6 @@
 CI / all-required
 E2E API Smoke Test / E2E API Smoke Test
 Handlers Postgres Integration / Handlers Postgres Integration
-E2E Peer Visibility (literal MCP list_peers) / E2E Peer Visibility
 Secret scan / Scan diff for credential-shaped strings
 template-delivery-e2e / Template-asset delivery (fresh seo-agent — config+prompts via asset channel, seo-all via plugin reconcile)
 # SOP/review ceremony gates REMOVED from the required set 2026-07-11 (CTO
@@ -175,7 +174,6 @@ sdk-route-milestone-contract-drift / SDK route + milestone derive-gates
 # on the PR head would require handing PR-authored code the staging admin token —
 # see the long note above. The real journey runs independently on push/dispatch.
 # Do NOT promote this line without first moving the coverage to the ephemeral gate.
-E2E Staging SaaS (full lifecycle) / E2E Staging Concierge Creates Workspace
 
 # pending-#2409 (not yet enforced) ──────────────────────────────────────
 # The local-docker real-tenant provision lane (local-provision-e2e.yml,
@@ -201,4 +199,3 @@ Local Provision Lifecycle E2E / Local Provision Lifecycle E2E (stub)
 #
 # #48 (RCA molecule-controlplane #878→#885): real platform-managed boot is
 # the intended merge gate.
-E2E Staging SaaS (full lifecycle) / E2E Staging Platform Boot

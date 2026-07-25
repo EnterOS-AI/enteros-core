@@ -137,6 +137,83 @@ func TestBuildTemplateTar_SkipsSymlinks(t *testing.T) {
 	}
 }
 
+func TestBuildTemplateTar_CRLFTemplatesSurviveStrip(t *testing.T) {
+	// Regression: on a Windows checkout the .sh/.py/.md templates carry
+	// CRLF on disk. buildTemplateTar strips CRLF from those files but used
+	// to set header.Size AFTER the header had already been written, so the
+	// tar declared the on-disk size while fewer stripped bytes followed —
+	// "archive/tar: missed writing N bytes" and every provision on a
+	// Windows host failed at the copy-template step (2026-07-18 local
+	// onboarding failure: README.md with exactly 53 CRLFs → "missed
+	// writing 53 bytes").
+	dir := t.TempDir()
+	crlfDoc := "# Title\r\nline one\r\nline two\r\n"
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte(crlfDoc), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+	// NESTED + UPPERCASE: the entry name must use forward slashes even when
+	// built on Windows (filepath.Rel yields `scripts\BOOT.SH` there — a
+	// literal-backslash FILE name to the Linux daemon), and the CRLF strip
+	// must be extension-case-insensitive (NTFS is case-insensitive).
+	if err := os.MkdirAll(filepath.Join(dir, "scripts"), 0755); err != nil {
+		t.Fatalf("mkdir scripts: %v", err)
+	}
+	crlfScript := "#!/bin/sh\r\necho hi\r\n"
+	if err := os.WriteFile(filepath.Join(dir, "scripts", "BOOT.SH"), []byte(crlfScript), 0644); err != nil {
+		t.Fatalf("write scripts/BOOT.SH: %v", err)
+	}
+	// A non-stripped extension keeps its bytes verbatim, CRLF and all.
+	crlfYAML := "name: keep\r\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(crlfYAML), 0644); err != nil {
+		t.Fatalf("write config.yaml: %v", err)
+	}
+
+	buf, err := buildTemplateTar(dir)
+	if err != nil {
+		t.Fatalf("buildTemplateTar with CRLF templates: %v", err)
+	}
+
+	bodies := map[string]string{}
+	sizes := map[string]int64{}
+	tr := tar.NewReader(buf)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read tar: %v", err)
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("read body for %s: %v", hdr.Name, err)
+		}
+		bodies[hdr.Name] = string(body)
+		sizes[hdr.Name] = hdr.Size
+	}
+
+	wantDoc := strings.ReplaceAll(crlfDoc, "\r\n", "\n")
+	if bodies["README.md"] != wantDoc {
+		t.Errorf("README.md body = %q, want CRLF-stripped %q", bodies["README.md"], wantDoc)
+	}
+	if sizes["README.md"] != int64(len(wantDoc)) {
+		t.Errorf("README.md header size = %d, want stripped length %d", sizes["README.md"], len(wantDoc))
+	}
+	// Forward-slash entry name (never `scripts\BOOT.SH`), CRLF stripped
+	// despite the uppercase extension.
+	wantScript := strings.ReplaceAll(crlfScript, "\r\n", "\n")
+	if bodies["scripts/BOOT.SH"] != wantScript {
+		names := make([]string, 0, len(bodies))
+		for n := range bodies {
+			names = append(names, n)
+		}
+		t.Errorf("scripts/BOOT.SH body = %q, want CRLF-stripped %q (entries: %v)", bodies["scripts/BOOT.SH"], wantScript, names)
+	}
+	if bodies["config.yaml"] != crlfYAML {
+		t.Errorf("config.yaml body = %q, want verbatim %q", bodies["config.yaml"], crlfYAML)
+	}
+}
+
 // baseHostConfig returns a fresh HostConfig with typical pre-tier binds,
 // mimicking what Start() builds before calling ApplyTierConfig.
 func baseHostConfig(pluginsPath string) *container.HostConfig {

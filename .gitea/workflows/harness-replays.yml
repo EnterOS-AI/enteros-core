@@ -8,7 +8,11 @@ name: Harness Replays
 #   - Dropped `environment:` blocks (Gitea has no environments).
 #   - Workflow-level env.GITHUB_SERVER_URL pinned per
 #     feedback_act_runner_github_server_url.
-#   - `continue-on-error: true` on each job (RFC §1 contract).
+#   - The original port added `continue-on-error: true` to each job (RFC §1
+#     contract). Both masks have since been REMOVED — `Harness Replays` was
+#     unmasked 2026-07-14 and `detect-changes` by #4521 — after each was proven
+#     green (see the per-job comments below). Neither job is advisory any more:
+#     both fail loud.
 #
 
 # Boots tests/harness (production-shape compose topology with TenantGuard,
@@ -96,33 +100,31 @@ jobs:
     # v1.0.3), where the `docker compose ...` exec below fails. Mirror
     # of mc#1543; see internal#512 for class defect.
     runs-on: docker-host
-    # MASK RETAINED — but NOT because this job is red. It is provably green:
-    # 15/15 most-recent runs, every step `success`, read step-level from the
-    # Gitea Actions API (runs 497985, 498111, 498199, 498228, 498298, 498371,
-    # 498398, 498490, 498583, 498631, 498684, 498786, 498860, 499081).
+    # UNMASKED by #4521 (was `continue-on-error: true`). This job is a DETECTOR
+    # whose empty outputs would silently no-op the whole replay suite if it ever
+    # rolled up green while broken — the worst shape for a mask. On failure the
+    # job leaves `outputs.run` / `outputs.debug` EMPTY, and every downstream step
+    # is gated on `needs.detect-changes.outputs.run == 'true'`, so a masked
+    # failure would let the "No-op pass" step declare the gate "satisfied without
+    # running". It therefore must be able to go red — hence no mask.
     #
-    # It stays masked because the repo's OWN pre-flip gate
-    # (.gitea/scripts/lint_pre_flip_continue_on_error.py) cannot SEE those runs,
-    # and fail-closes on what it cannot see:
-    #   lint_pre_flip_continue_on_error.py:426 fetches
-    #   `/repos/{o}/{r}/commits/{sha}/status` — Gitea's COMBINED-status endpoint,
-    #   with no pagination. That endpoint caps at 30 statuses. molecule-core now
-    #   posts 60 distinct contexts per commit, and
-    #   `Harness Replays / detect-changes (push)` sorts beyond the cap, so the
-    #   lint sees zero runs of it and reports "no runs ... cannot verify flip".
-    # Un-masking here would therefore RED a required context on every PR. The
-    # mask is recorded in MASK_WAIVERS in lint_no_coe_on_required.py; once the
-    # pre-flip lint paginates (follow-up filed), this becomes a one-line flip.
+    # Proven green before un-masking, step-level via the Gitea Actions API (the
+    # roll-up status proves nothing while masked): 15/15 most-recent runs, every
+    # step `success` (runs 497985, 498111, 498199, 498228, 498298, 498371,
+    # 498398, 498490, 498583, 498631, 498684, 498786, 498860, 499081), and still
+    # green on current main (e.g. runs 549755, 549577, 549460).
     #
-    # Why it matters that this one gets fixed: this is a MASKED DETECTOR — the
-    # worst shape. On failure the job still rolls up GREEN but its
-    # `outputs.run` / `outputs.debug` are EMPTY. Every downstream step is gated
-    # on `needs.detect-changes.outputs.run == 'true'`, so an empty output makes
-    # the entire replay suite silently no-op while the "No-op pass" step
-    # declares the gate "satisfied without running".
+    # HISTORY: this job stayed masked longer than it should have because the
+    # repo's OWN pre-flip gate (.gitea/scripts/lint_pre_flip_continue_on_error.py)
+    # could not SEE those runs and fail-closes on what it cannot see —
+    # line 426 fetches the un-paginated `/commits/{sha}/status` combined endpoint,
+    # which Gitea caps at 30 statuses while this repo posts 60 contexts per commit,
+    # so `Harness Replays / detect-changes (push)` sorted past the cap and the
+    # gate reported "no runs ... cannot verify flip" (task #106). The flip landed
+    # anyway once that lane was proven green out-of-band; the now-dead
+    # MASK_WAIVERS entry for this context has been pruned from
+    # lint_no_coe_on_required.py.
     #
-    # mc#3436: pre-existing continue-on-error mask; root-fix and remove, do not renew silently.
-    continue-on-error: true
     outputs:
       run: ${{ steps.decide.outputs.run }}
       debug: ${{ steps.decide.outputs.debug }}

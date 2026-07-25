@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -658,13 +659,60 @@ func dockerBuildProd(ctx context.Context, opts *LocalBuildOptions, contextDir, t
 	// legitimately runs long (large pip/apt layer, QEMU cross-arch) streams
 	// output the whole time and is never killed; a wedged build (network
 	// black hole) is killed after opts.stallGrace() with a clear message.
-	out, err := runStreamingCommand(ctx, cmd, opts.stallGrace(), opts.ceiling())
+	// The exemption keeps BuildKit's final export/unpack phase — silent by
+	// design, minutes-long for a multi-GB image — from reading as a stall
+	// (buildkitQuietPhaseExempt); the ceiling still bounds it.
+	out, err := runStreamingCommandExempt(ctx, cmd, opts.stallGrace(), opts.ceiling(), buildkitQuietPhaseExempt)
 	if err != nil {
 		// Sanitize defensive — docker build output shouldn't contain a
 		// token, but maskTokenInString is a no-op when token is empty.
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(maskTokenInString(string(out), opts.Token)))
 	}
 	return nil
+}
+
+// buildkitQuietPhaseExempt reports whether the tail of a `docker build`'s
+// output ends INSIDE BuildKit's final image export/unpack phase. That phase
+// ("#N exporting …" / "#N unpacking to …") emits nothing until it completes —
+// on a multi-GB image it is minutes of silence by design, local disk I/O
+// only, no network to hang on. Without this exemption the stall watchdog
+// killed every first-boot build of the ~7GB hermes image mid-unpack
+// ("no output within stall grace 4m0s", 2026-07-18 fresh-onboarding
+// failure) — the one phase whose silence is healthy.
+//
+// Detection is deliberately narrow: the LAST non-empty output line must be a
+// BuildKit step-status line (`#<n> `) for an export/unpack marker that has
+// not yet printed its completion (`… done` suffix / `#<n> DONE`). Every
+// network-bound step (pull, apt, pip, git) streams progress, so those stay
+// under the normal no-output gate. A false positive merely defers the kill
+// to the absolute per-runtime ceiling — bounded, never forever.
+func buildkitQuietPhaseExempt(tail []byte) bool {
+	trimmed := bytes.TrimRight(tail, " \t\r\n")
+	if len(trimmed) == 0 {
+		return false
+	}
+	if i := bytes.LastIndexByte(trimmed, '\n'); i >= 0 {
+		trimmed = trimmed[i+1:]
+	}
+	last := bytes.TrimSpace(trimmed)
+	// Must be a BuildKit step-status line: "#<digits> ...".
+	if len(last) < 3 || last[0] != '#' {
+		return false
+	}
+	rest := last[1:]
+	d := 0
+	for d < len(rest) && rest[d] >= '0' && rest[d] <= '9' {
+		d++
+	}
+	if d == 0 || d >= len(rest) || rest[d] != ' ' {
+		return false
+	}
+	step := rest[d+1:]
+	// A completed phase prints "... done" (and the block ends with "#N DONE").
+	if bytes.HasSuffix(step, []byte(" done")) || bytes.HasPrefix(step, []byte("DONE")) {
+		return false
+	}
+	return bytes.HasPrefix(step, []byte("unpacking to ")) || bytes.HasPrefix(step, []byte("exporting "))
 }
 
 // dockerBuildArgs assembles the `docker build …` argv. Extracted from

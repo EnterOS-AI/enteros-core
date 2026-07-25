@@ -40,11 +40,12 @@ package staginge2e
 //
 //  6. Config-tab endpoint sweep for the platform agent
 //     The per-workspace canvas config tabs (traces / plugins / schedules /
-//     channels / secrets / model + peers) must return non-401 for the concierge
-//     with the operator token. The concierge is a kind='platform' row with no
-//     per-workspace token of its own, so this pins that the admin bearer
-//     authenticates every tab (the class validateDiscoveryCaller's admin
-//     fallback fixed, extended to the whole tab set).
+//     channels / secrets / model + peers) must accept the operator token. The
+//     concierge is a kind='platform' row with no per-workspace token of its own,
+//     so this pins the admin fallback across the whole tab set. Schedules is
+//     runtime-proxied: before the deliberately unbooted concierge registers its
+//     callback URL, only the exact 503 offline response is accepted. Every other
+//     5xx remains a failure.
 //
 // (Feature 3 — the user_tasks REST+MCP+authz primitive — is covered end-to-end
 // against real staging by tests/e2e/test_staging_concierge_e2e.sh, which reuses
@@ -85,10 +86,11 @@ func TestConciergePlatformAgent_Staging(t *testing.T) {
 
 	// An ordinary workspace — its re-parenting under the platform agent is the
 	// observable proof that install actually anchored the org tree. We do NOT
-	// wait for it to boot online: every assertion here is DB/handler state
-	// (kind, parent_id, billing-mode, tab reachability), none of which needs a
-	// live container, so skipping the workspace/container cold boot keeps the
-	// test fast and decoupled from boot-flake.
+	// wait for it to boot online. Most assertions are core DB/handler state; the
+	// schedules config tab is runtime-proxied, so its exact pre-registration 503 is
+	// an expected offline result rather than proof of a server fault. No assertion
+	// requires a live container response, keeping this advisory decoupled from
+	// boot flake.
 	ordinaryWS := tenantCreateWorkspace(t, cfg, host, token, orgID)
 	t.Logf("ordinary workspace created: %s", ordinaryWS)
 
@@ -316,12 +318,12 @@ func TestConciergePlatformAgent_Staging(t *testing.T) {
 
 	// ── Feature 6: config-tab endpoint sweep for the concierge ───────────────
 	t.Run("config_tab_sweep_for_concierge", func(t *testing.T) {
-		// Each per-workspace canvas config tab must authenticate the concierge
-		// with the operator token (non-401/403). The concierge is a kind=platform
-		// row with no per-workspace token, so this pins that the admin bearer is
-		// accepted across the WHOLE tab set (not just peers). We assert non-401
-		// (and non-403): the data shape varies per tab and an empty/200 list is a
-		// valid state — the regression class is auth-rejection, not data.
+		// Each per-workspace canvas config tab must authenticate the concierge with
+		// the operator token. Data shapes vary, so non-auth 4xx responses still prove
+		// reachability. The schedules read is different: it proxies to the runtime,
+		// which this advisory deliberately does not boot, so only its exact
+		// pre-registration 503 is an expected offline result. The shared classifier
+		// rejects 401/403 and every other 5xx.
 		tabs := []struct {
 			name string
 			url  string
@@ -339,18 +341,19 @@ func TestConciergePlatformAgent_Staging(t *testing.T) {
 		for _, tab := range tabs {
 			url := tab.url
 			hs, body := doTenantJSON(t, "GET", url, token, orgID, "")
-			if hs == http.StatusUnauthorized || hs == http.StatusForbidden {
-				t.Fatalf("config-tab %q for concierge rejected admin token (HTTP %d) — "+
-					"operator must read every config tab for the platform agent: %s", tab.name, hs, body)
+			verdict, reason := classifyConciergeConfigTabResponse(tab.name, hs, body)
+			switch verdict {
+			case conciergeConfigTabReachable:
+				t.Logf("    tab %-10s → HTTP %d (admin auth accepted)", tab.name, hs)
+			case conciergeConfigTabExpectedOffline:
+				t.Logf("    tab %-10s → HTTP %d (expected offline: %s)", tab.name, hs, reason)
+			case conciergeConfigTabRejected:
+				t.Fatalf("config-tab sweep failed: %s", reason)
+			default:
+				t.Fatalf("config-tab %q returned unknown classifier verdict %d", tab.name, verdict)
 			}
-			// A 5xx is a real server fault, not an auth issue — surface it too so
-			// a broken tab handler doesn't read as "auth OK".
-			if hs >= 500 {
-				t.Fatalf("config-tab %q for concierge returned HTTP %d (server fault): %s", tab.name, hs, body)
-			}
-			t.Logf("    tab %-10s → HTTP %d (non-401 ✓)", tab.name, hs)
 		}
-		t.Logf("all concierge config tabs authenticate the operator token (non-401)")
+		t.Logf("all concierge config tabs accepted the operator token; proxy-offline handling stayed exact")
 	})
 }
 

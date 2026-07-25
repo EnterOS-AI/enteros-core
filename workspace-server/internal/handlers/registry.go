@@ -105,6 +105,10 @@ type QueueDrainFunc func(ctx context.Context, workspaceID string, capacity int)
 type RegistryHandler struct {
 	broadcaster *events.Broadcaster
 	drainQueue  QueueDrainFunc // nil-safe: Heartbeat skips drain when unset
+	// firstBootGreeter sends the concierge's proactive first chat message on
+	// the provisioning→online promotion (first_boot_greeting.go). nil-safe:
+	// the promotion skips it when unset (unit tests / unwired deployments).
+	firstBootGreeter func(workspaceID string, toolCount int)
 	// reconcilePlugins installs declared-but-missing plugins when a workspace
 	// transitions to online (RFC#2843 #32). nil-safe: Heartbeat skips the
 	// reconcile when unset (e.g. unit tests, CP/SaaS mode without a plugins
@@ -148,6 +152,34 @@ func NewRegistryHandler(b *events.Broadcaster) *RegistryHandler {
 // keeps RegistryHandler's import list clean.
 func (h *RegistryHandler) SetQueueDrainFunc(f QueueDrainFunc) {
 	h.drainQueue = f
+}
+
+// SetFirstBootGreeter wires the concierge first-boot greeting hook
+// (first_boot_greeting.go) — fired on the provisioning→online promotion so
+// a freshly-onboarded platform agent opens the chat with a greeting instead
+// of an empty panel. Same late-wiring nil-safe pattern as the other hooks.
+func (h *RegistryHandler) SetFirstBootGreeter(f func(workspaceID string, toolCount int)) {
+	h.firstBootGreeter = f
+}
+
+// fireFirstBootGreeting invokes the greeting hook in its own goroutine (it
+// does DB + agent-turn work and must not add latency to the register/
+// heartbeat response). nil-safe for tests and deployments that don't wire it.
+func (h *RegistryHandler) fireFirstBootGreeting(workspaceID string, toolCount int) {
+	if h.firstBootGreeter == nil {
+		return
+	}
+	go h.firstBootGreeter(workspaceID, toolCount)
+}
+
+// holdOnlineBroadcastForWarmingPlatform reports whether Register must NOT
+// announce WORKSPACE_ONLINE for this row: a platform concierge still held in
+// 'provisioning' by the core#3082 warming gate is not ready for callers —
+// announcing online flips the canvas to an interactive chat whose every send
+// bounces off the warming 503. The verified heartbeat flip is the sole
+// announcer for those rows.
+func holdOnlineBroadcastForWarmingPlatform(kind, status string) bool {
+	return kind == string(models.KindPlatform) && status == string(models.StatusProvisioning)
 }
 
 // SetReconcileFunc wires the post-online plugin reconcile hook (RFC#2843).
@@ -974,11 +1006,14 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// status). status is a NOT-NULL enum — select it bare (never COALESCE to '',
 	// which Postgres rejects as an invalid enum literal and fails the scan).
 	//
-	// Guarded on h.reconcilePlugins != nil so the extra read only runs when the
-	// reconcile hook is actually wired (production router). Unit tests that don't
-	// wire a ReconcileFunc skip this query entirely (no mock churn).
+	// Read guarded on EITHER post-online hook being wired (plugin reconcile
+	// or first-boot greeting) so the query only runs when a consumer exists;
+	// unit tests that wire neither skip it entirely (no mock churn). The
+	// greeting must NOT ride on the reconcile wiring alone — a deployment
+	// that sets a greeter without a ReconcileFunc would otherwise silently
+	// never greet (prevStatusForReconcile would stay "" forever).
 	var prevStatusForReconcile string
-	if h.reconcilePlugins != nil {
+	if h.reconcilePlugins != nil || h.firstBootGreeter != nil {
 		if err := db.DB.QueryRowContext(ctx, `SELECT status FROM workspaces WHERE id = $1`, payload.ID).Scan(&prevStatusForReconcile); err != nil {
 			// sql.ErrNoRows on a brand-new workspace is expected (INSERT path);
 			// leave prevStatusForReconcile empty so we don't fire on first create
@@ -1138,12 +1173,41 @@ func (h *RegistryHandler) Register(c *gin.Context) {
 	// Broadcast WORKSPACE_ONLINE — use the reconciled card so the canvas
 	// Agent Card view live-updates with the friendly name, matching what
 	// was just persisted (not the runtime's raw UUID-name card).
-	if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.ID, map[string]interface{}{
-		"url":           cachedURL,
-		"agent_card":    reconciledCard,
-		"delivery_mode": effectiveMode,
-	}); err != nil {
-		log.Printf("Registry broadcast error: %v", err)
+	//
+	// EXCEPT for a platform row still HELD in 'provisioning' (the core#3082
+	// warming gate): the register upsert deliberately does not flip those to
+	// online, but this broadcast used to announce ONLINE anyway — the canvas
+	// swapped the boot screen for the chat and let the user send into the
+	// warming gate's 503, ~10s before the agent could answer (2026-07-18
+	// fresh-onboarding repro). Hold the announcement; the verified heartbeat
+	// flip broadcasts WORKSPACE_ONLINE when the concierge is genuinely ready.
+	// Fail OPEN on a read error (legacy behavior: announce) — a missed hold
+	// is a cosmetic regression, a missed announcement strands the canvas.
+	holdOnline := false
+	var rowKindForBroadcast, rowStatusForBroadcast string
+	if err := db.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(kind, 'workspace'), status::text FROM workspaces WHERE id = $1`, payload.ID,
+	).Scan(&rowKindForBroadcast, &rowStatusForBroadcast); err == nil {
+		holdOnline = holdOnlineBroadcastForWarmingPlatform(rowKindForBroadcast, rowStatusForBroadcast)
+	}
+	if holdOnline {
+		log.Printf("Registry: holding WORKSPACE_ONLINE broadcast for warming platform %s (verified heartbeat flip announces it, core#3082)", payload.ID)
+	} else {
+		if err := h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.ID, map[string]interface{}{
+			"url":           cachedURL,
+			"agent_card":    reconciledCard,
+			"delivery_mode": effectiveMode,
+		}); err != nil {
+			log.Printf("Registry broadcast error: %v", err)
+		}
+		// First boot of an ORDINARY workspace (the concierge's greeting fires
+		// from its verified heartbeat flip instead): once genuinely online
+		// from provisioning, have the agent greet the user in its own voice.
+		// toolCount 0 — register carries no loaded_mcp_tools; the in-character
+		// turn doesn't need it and the fallback copy stays role-agnostic.
+		if prevStatusForReconcile == string(models.StatusProvisioning) {
+			h.fireFirstBootGreeting(payload.ID, 0)
+		}
 	}
 
 	// Phase 30.1: issue a workspace auth token on first registration.
@@ -1308,6 +1372,17 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// an older image that omits the field), while an explicit true/false is
 	// trusted verbatim — the self-healing successor to the active_tasks>0 proxy.
 	// The bind is the last positional arg in each branch.
+	//
+	// Test-only busy-inject seam (task #92): testBusyActiveTasksHook is nil in
+	// every shipped build (testbusy_disabled.go), so activeTasks is exactly
+	// payload.ActiveTasks and this is behaviour-identical to before. Under the
+	// e2e_busy_inject build tag it raises the persisted count to an injected
+	// floor so the ephemeral gate's 10b force-hibernate hits a genuinely busy
+	// workspace. See testbusy.go.
+	activeTasks := payload.ActiveTasks
+	if testBusyActiveTasksHook != nil {
+		activeTasks = testBusyActiveTasksHook(payload.WorkspaceID, activeTasks)
+	}
 	var err error
 	if payload.MonthlySpend > 0 {
 		_, err = db.DB.ExecContext(ctx, `
@@ -1330,7 +1405,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed'
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
-			payload.ActiveTasks, payload.UptimeSeconds, payload.CurrentTask,
+			activeTasks, payload.UptimeSeconds, payload.CurrentTask,
 			payload.MonthlySpend, payload.IsBusy)
 	} else {
 		_, err = db.DB.ExecContext(ctx, `
@@ -1352,7 +1427,7 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 				updated_at        = now()
 			WHERE id = $1 AND status != 'removed'
 		`, payload.WorkspaceID, payload.ErrorRate, payload.SampleError,
-			payload.ActiveTasks, payload.UptimeSeconds, payload.CurrentTask,
+			activeTasks, payload.UptimeSeconds, payload.CurrentTask,
 			payload.IsBusy)
 	}
 	if err != nil {
@@ -1723,6 +1798,14 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				}
 				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"recovered_from": currentStatus})
 				h.fireReconcileOnline(ctx, payload.WorkspaceID)
+				// FIRST boots only (provisioning→online). Recovery promotions
+				// (offline/failed/degraded→online after an outage) must never
+				// greet — an unprompted "first boot" message weeks after
+				// onboarding reads as a haunted chat. The greeter's own
+				// empty-history gate stays as the second key.
+				if currentStatus == string(models.StatusProvisioning) {
+					h.fireFirstBootGreeting(payload.WorkspaceID, len(payload.LoadedMCPTools))
+				}
 			case readyForOnline && !conciergeUnhealthy:
 				// VERIFIED-ready by construction: the EV2 mcp_tools_ready event (or,
 				// back-compat, provision_workspace present in loaded_mcp_tools) proves
@@ -1736,6 +1819,10 @@ func (h *RegistryHandler) evaluateStatus(c *gin.Context, payload models.Heartbea
 				}
 				h.broadcaster.RecordAndBroadcast(ctx, string(events.EventWorkspaceOnline), payload.WorkspaceID, map[string]interface{}{"verified_ready": true, "recovered_from": currentStatus})
 				h.fireReconcileOnline(ctx, payload.WorkspaceID)
+				// FIRST boots only — see the legacy arm's comment above.
+				if currentStatus == string(models.StatusProvisioning) {
+					h.fireFirstBootGreeting(payload.WorkspaceID, len(payload.LoadedMCPTools))
+				}
 			case currentStatus == string(models.StatusProvisioning):
 				// WARMING / held. The concierge is held in 'provisioning' (its callers
 				// get the 503 warming-gate) — a DYNAMIC wait on the REAL signals, never a

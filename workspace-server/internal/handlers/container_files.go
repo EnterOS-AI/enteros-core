@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/docker/docker/api/types/container"
@@ -130,9 +132,25 @@ func (h *TemplatesHandler) execInContainer(ctx context.Context, containerName st
 		return "", err
 	}
 	defer resp.Close()
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	// Use stdcopy to correctly demux Docker multiplexed stream (stdout/stderr)
-	stdcopy.StdCopy(&stdout, io.Discard, io.LimitReader(resp.Reader, maxExecOutput))
+	stdcopy.StdCopy(&stdout, &stderr, io.LimitReader(resp.Reader, maxExecOutput))
+	// Surface the exit code — callers assume "non-zero exit → non-nil error"
+	// (template_import.go branches its config-regeneration on `test -f`, and
+	// DELETE /files reports rm failures), but without ContainerExecInspect a
+	// failed exec looked identical to success (same masking that hid the
+	// plugin-delivery corruption; see PluginsHandler.execInContainerAs).
+	inspect, ierr := h.docker.ContainerExecInspect(ctx, execID.ID)
+	if ierr != nil {
+		return strings.TrimSpace(stdout.String()), fmt.Errorf("exec inspect %v: %w", cmd, ierr)
+	}
+	if inspect.ExitCode != 0 {
+		errText := strings.TrimSpace(stderr.String())
+		if errText == "" {
+			errText = strings.TrimSpace(stdout.String())
+		}
+		return strings.TrimSpace(stdout.String()), fmt.Errorf("exec %v: exit %d: %s", cmd, inspect.ExitCode, errText)
+	}
 	return strings.TrimSpace(stdout.String()), nil
 }
 
@@ -140,32 +158,48 @@ func (h *TemplatesHandler) execInContainer(ctx context.Context, containerName st
 // The destPath is prepended to each file name. File names must be relative and must not escape
 // destPath via ".." segments — otherwise the tar header name could escape the mounted volume.
 func (h *TemplatesHandler) copyFilesToContainer(ctx context.Context, containerName, destPath string, files map[string]string) error {
+	buf, err := buildContainerFilesTar(destPath, files)
+	if err != nil {
+		return err
+	}
+	return h.docker.CopyToContainer(ctx, containerName, destPath, buf, container.CopyToContainerOptions{})
+}
+
+// buildContainerFilesTar builds the archive copyFilesToContainer streams into
+// the container. Pulled out as a pure function so the entry-name contract
+// (slash-only, destPath-rooted, no escapes) is unit-testable without a daemon.
+func buildContainerFilesTar(destPath string, files map[string]string) (*bytes.Buffer, error) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 
+	// Tar entry names and destPath are CONTAINER (Linux) paths — build them
+	// with path.* on ToSlash'd input, never filepath.* (on a Windows host
+	// filepath.Join produces backslash entry names, which the Linux daemon
+	// extracts as flat literal-backslash files; and the escape guard below
+	// would false-positive because `\configs\x` has no `/configs` prefix).
+	destSlash := wirepath.Normalize(destPath)
 	createdDirs := map[string]bool{}
 	for name, content := range files {
 		// Block absolute paths and traversal attempts at the archive-write boundary.
 		// Files are written inside destPath (typically /configs); anything that escapes
 		// via ".." or an absolute name could reach other volumes or system paths.
-		clean := filepath.Clean(name)
-		if filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
-			return fmt.Errorf("unsafe file path in archive: %s", name)
+		clean := wirepath.Normalize(name)
+		if path.IsAbs(clean) || strings.HasPrefix(clean, "..") {
+			return nil, fmt.Errorf("unsafe file path in archive: %s", name)
 		}
 		// Prepend destPath so relative paths land inside the volume mount.
 		// Use cleaned name so validation (which checks clean) and usage stay consistent.
-		archiveName := filepath.Join(destPath, clean)
+		archiveName := path.Join(destSlash, clean)
 		// Defence-in-depth: ensure the joined path doesn't escape destPath.
-		// This guards against platform-specific filepath.Join behaviour where
-		// joining a relative name containing ".." with a destPath can still
-		// produce an absolute path outside the intended directory.
-		if !strings.HasPrefix(archiveName, destPath) && archiveName != destPath {
-			return fmt.Errorf("path escapes destination: %s", name)
+		// This guards against a relative name containing ".." that survives
+		// the check above yet still climbs out of the destination once joined.
+		if !strings.HasPrefix(archiveName, destSlash+"/") && archiveName != destSlash {
+			return nil, fmt.Errorf("path escapes destination: %s", name)
 		}
 
 		// Create parent directories in tar (deduplicated)
-		dir := filepath.Dir(archiveName)
-		if dir != destPath && !createdDirs[dir] {
+		dir := path.Dir(archiveName)
+		if dir != destSlash && !createdDirs[dir] {
 			tw.WriteHeader(&tar.Header{
 				Typeflag: tar.TypeDir,
 				Name:     dir + "/",
@@ -181,17 +215,17 @@ func (h *TemplatesHandler) copyFilesToContainer(ctx context.Context, containerNa
 			Size: int64(len(data)),
 		}
 		if err := tw.WriteHeader(header); err != nil {
-			return fmt.Errorf("failed to write tar header for %s: %w", name, err)
+			return nil, fmt.Errorf("failed to write tar header for %s: %w", name, err)
 		}
 		if _, err := tw.Write(data); err != nil {
-			return fmt.Errorf("failed to write tar data for %s: %w", name, err)
+			return nil, fmt.Errorf("failed to write tar data for %s: %w", name, err)
 		}
 	}
 	if err := tw.Close(); err != nil {
-		return fmt.Errorf("failed to close tar writer: %w", err)
+		return nil, fmt.Errorf("failed to close tar writer: %w", err)
 	}
 
-	return h.docker.CopyToContainer(ctx, containerName, destPath, &buf, container.CopyToContainerOptions{})
+	return &buf, nil
 }
 
 // writeViaEphemeral writes files to a named volume using an ephemeral Alpine container.

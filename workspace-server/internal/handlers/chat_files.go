@@ -184,7 +184,15 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 	if err := db.DB.QueryRowContext(ctx,
 		`SELECT COALESCE(url, ''), delivery_mode FROM workspaces WHERE id = $1`, workspaceID,
 	).Scan(&wsURL, &deliveryMode); err != nil {
-		log.Printf("chat_files %s: workspace lookup failed for %s: %v", op, workspaceID, err)
+		log.Printf("resolve-forward-creds %s: workspace lookup failed for %s: %v", op, workspaceID, err)
+		// A deadline/cancel (e.g. the schedule-create budget elapsed, or the
+		// client disconnected mid-request) is transient — a 404 would misreport
+		// the workspace as MISSING. Surface a retryable 503 in that case; a
+		// genuine missing/other lookup error stays 404.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "workspace lookup timed out, retry"})
+			return "", "", false
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 		return "", "", false
 	}
@@ -214,8 +222,8 @@ func resolveWorkspaceForwardCreds(c *gin.Context, ctx context.Context, workspace
 		// dispatch path, ever".
 		if !deliveryMode.Valid || deliveryMode.String != "push" {
 			c.JSON(http.StatusUnprocessableEntity, gin.H{
-				"error":  "workspace has no callback URL — chat " + op + " requires push-mode + public URL",
-				"detail": "This workspace registered without a publicly-reachable URL (delivery_mode is not 'push'). The platform cannot dispatch chat uploads to it. Re-register the workspace with a public URL in push mode (e.g. via ngrok / Cloudflare tunnel) to enable chat file " + op + ".",
+				"error":  "workspace has no callback URL — " + op + " requires push-mode + a public URL",
+				"detail": "This workspace registered without a publicly-reachable URL (delivery_mode is not 'push'). The platform cannot HTTP-forward to it. Re-register the workspace with a public URL in push mode (e.g. via ngrok / Cloudflare tunnel) to enable " + op + ".",
 			})
 			return "", "", false
 		}

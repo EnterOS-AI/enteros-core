@@ -1148,9 +1148,12 @@ func logActivityExec(ctx context.Context, exec activityExecutor, broadcaster eve
 			ON CONFLICT (workspace_id, message_id) WHERE message_id IS NOT NULL
 			DO UPDATE SET
 				response_body = COALESCE(EXCLUDED.response_body, activity_logs.response_body),
-				status        = EXCLUDED.status,
-				duration_ms   = COALESCE(EXCLUDED.duration_ms, activity_logs.duration_ms),
-				error_detail  = EXCLUDED.error_detail,
+				status        = CASE WHEN activity_logs.response_body IS NOT NULL AND EXCLUDED.status = 'error'
+				                     THEN activity_logs.status ELSE EXCLUDED.status END,
+				duration_ms   = CASE WHEN activity_logs.response_body IS NOT NULL AND EXCLUDED.status = 'error'
+				                     THEN activity_logs.duration_ms ELSE COALESCE(EXCLUDED.duration_ms, activity_logs.duration_ms) END,
+				error_detail  = CASE WHEN activity_logs.response_body IS NOT NULL AND EXCLUDED.status = 'error'
+				                     THEN activity_logs.error_detail ELSE EXCLUDED.error_detail END,
 				tool_trace    = CASE WHEN EXCLUDED.tool_trace IS NOT NULL THEN EXCLUDED.tool_trace ELSE activity_logs.tool_trace END
 		)
 		UPDATE workspaces SET last_activity_at = now() WHERE id = $1
