@@ -106,6 +106,60 @@ describe("handleCanvasEvent – WORKSPACE_ONLINE", () => {
     }
     expect(__pendingOnlineSizeForTest()).toBe(1000);
   });
+
+  // Greeting-first UI readiness: a FIRST boot (provisioning→online) has not
+  // greeted yet, so greeted=false drives the "warming / composing greeting"
+  // node state; a recovery flip (not from provisioning) does not re-greet and
+  // goes straight to ready (greeted=true).
+  it("marks a first-boot (from provisioning) online node greeted=false (warming)", () => {
+    const node = makeNode("ws-1", { status: "provisioning" });
+    const { get, set } = makeStore([node]);
+    handleCanvasEvent(makeMsg({ event: "WORKSPACE_ONLINE", workspace_id: "ws-1" }), get, set);
+    const updated = (set.mock.calls[0][0] as { nodes: Node<WorkspaceNodeData>[] }).nodes;
+    expect(updated.find((n) => n.id === "ws-1")!.data.greeted).toBe(false);
+  });
+
+  it("marks a recovery flip (from offline) online node greeted=true (no warming)", () => {
+    const node = makeNode("ws-1", { status: "offline" });
+    const { get, set } = makeStore([node]);
+    handleCanvasEvent(makeMsg({ event: "WORKSPACE_ONLINE", workspace_id: "ws-1" }), get, set);
+    const updated = (set.mock.calls[0][0] as { nodes: Node<WorkspaceNodeData>[] }).nodes;
+    expect(updated.find((n) => n.id === "ws-1")!.data.greeted).toBe(true);
+  });
+
+  it("keeps greeted=true across a re-online for an already-greeted node", () => {
+    const node = makeNode("ws-1", { status: "provisioning", greeted: true });
+    const { get, set } = makeStore([node]);
+    handleCanvasEvent(makeMsg({ event: "WORKSPACE_ONLINE", workspace_id: "ws-1" }), get, set);
+    const updated = (set.mock.calls[0][0] as { nodes: Node<WorkspaceNodeData>[] }).nodes;
+    expect(updated.find((n) => n.id === "ws-1")!.data.greeted).toBe(true);
+  });
+});
+
+describe("handleCanvasEvent – AGENT_MESSAGE greeting-first readiness", () => {
+  it("marks the node greeted=true when a real agent message arrives", () => {
+    const node = makeNode("ws-1", { status: "online", greeted: false });
+    const { get, set } = makeStore([node]);
+    handleCanvasEvent(
+      makeMsg({ event: "AGENT_MESSAGE", workspace_id: "ws-1", payload: { message: "Hi, I'm your concierge." } }),
+      get,
+      set,
+    );
+    const patch = set.mock.calls[0][0] as { nodes?: Node<WorkspaceNodeData>[] };
+    expect(patch.nodes?.find((n) => n.id === "ws-1")!.data.greeted).toBe(true);
+  });
+
+  it("does not touch nodes when the node is already greeted (no needless re-render)", () => {
+    const node = makeNode("ws-1", { status: "online", greeted: true });
+    const { get, set } = makeStore([node]);
+    handleCanvasEvent(
+      makeMsg({ event: "AGENT_MESSAGE", workspace_id: "ws-1", payload: { message: "Follow-up message." } }),
+      get,
+      set,
+    );
+    const patch = set.mock.calls[0][0] as { nodes?: Node<WorkspaceNodeData>[] };
+    expect(patch.nodes).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------

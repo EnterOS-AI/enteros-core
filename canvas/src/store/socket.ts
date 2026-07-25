@@ -427,6 +427,14 @@ export interface WorkspaceData {
    *  collapsing the spinner the moment the synchronous queued-200 returns
    *  (task #227 — external/MCP workspaces had no progress UX). */
   delivery_mode?: string;
+  /** Greeting-first UI readiness (decoupled from serving status): true once the
+   *  agent's first-boot greeting has landed in chat (server evaluates the same
+   *  a2a_receive / source_id IS NULL predicate the greeter's greet-once gate
+   *  uses). Lets the canvas render "warming / composing greeting" for an online
+   *  workspace that has not spoken yet, and settle it to "ready" on reload
+   *  without flashing warming. Absent on older ws-server builds → treated as
+   *  greeted (no warming). */
+  greeted?: boolean;
   compute?: WorkspaceCompute;
 }
 
