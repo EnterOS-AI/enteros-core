@@ -14,7 +14,7 @@ import type { MetadataRoute } from "next";
 // runs (CI-hosted or local). If current CMS-backed content is added,
 // swap to a per-entry timestamp from the source-of-truth metadata.
 const SITE_URL =
-  process.env.NEXT_PUBLIC_SITE_URL ?? "https://app.moleculesai.app";
+  process.env.NEXT_PUBLIC_SITE_URL ?? "https://app.enteros.ai";
 
 const BUILD_DATE = new Date();
 
