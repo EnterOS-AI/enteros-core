@@ -22,7 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/sessionid"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -1128,16 +1127,6 @@ func buildContainerEnv(cfg WorkspaceConfig) []string {
 	env := []string{
 		fmt.Sprintf("WORKSPACE_ID=%s", cfg.WorkspaceID),
 		"WORKSPACE_CONFIG_PATH=/configs",
-		// Session-continuity SSOT: hand the shared runtime CORE's authoritative
-		// default-session id so every runtime self-wake (idle / harvester /
-		// delegation-result / cron / scheduler / goal-nudge / boot / reprovision)
-		// converges on the user's conversation instead of minting a throwaway
-		// context_id per turn (Langfuse session fragmentation across restart /
-		// plugin install). The runtime reads this at highest precedence and only
-		// falls back to deriving "canvas-<ws>" itself when it is absent. Derived
-		// from the ONE authority (sessionid) so it can never drift from the a2a
-		// proxy belt / platform self-turns that stamp the same id.
-		fmt.Sprintf("%s=%s", sessionid.DefaultSessionContextEnv, sessionid.DefaultContextID(cfg.WorkspaceID)),
 		fmt.Sprintf("PLATFORM_URL=%s", cfg.PlatformURL),
 		fmt.Sprintf("MOLECULE_URL=%s", cfg.PlatformURL),
 		fmt.Sprintf("TIER=%d", cfg.Tier),
