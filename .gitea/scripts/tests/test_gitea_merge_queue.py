@@ -1785,6 +1785,115 @@ def test_successful_branch_update_comment_absorbs_transport_failure(
 
 
 # --------------------------------------------------------------------------
+# Fork-PR skip-comment is best-effort: the merge-actor token (AUTO_SYNC_TOKEN)
+# lacks write:issue, so posting the "fork PRs not supported" skip comment 403s.
+# That 403 must NOT propagate and crash the tick before the queue reaches the
+# other candidates. Same graceful-degrade philosophy as the #4505 BP-read
+# fallback. (Regression: one un-commentable fork PR wedged the whole queue.)
+# --------------------------------------------------------------------------
+def test_post_skip_comment_best_effort_absorbs_write_issue_403(monkeypatch, capsys):
+    """The helper swallows a 403 (write:issue missing) and only warns."""
+    def forbidden_comment(*args, **kwargs):
+        raise mq.ApiError("POST /issues/200/comments -> HTTP 403: write:issue required")
+
+    monkeypatch.setattr(mq, "post_comment", forbidden_comment)
+
+    # Must NOT raise.
+    mq.post_skip_comment_best_effort(200, "fork PRs are not supported", dry_run=False)
+    assert "could not post skip comment" in capsys.readouterr().err
+
+
+def test_post_skip_comment_best_effort_absorbs_transport_failure(monkeypatch, capsys):
+    def unavailable_comment(*args, **kwargs):
+        raise mq.urllib.error.URLError("temporary DNS failure")
+
+    monkeypatch.setattr(mq, "post_comment", unavailable_comment)
+
+    mq.post_skip_comment_best_effort(200, "fork PRs are not supported", dry_run=False)
+    assert "could not post skip comment" in capsys.readouterr().err
+
+
+def test_evaluate_candidate_fork_pr_skips_when_comment_forbidden(monkeypatch):
+    """A fork PR whose skip-comment POST 403s is cleanly SKIPPED (decision=None),
+    not raised. Directly exercises the crash site inside _evaluate_candidate."""
+    monkeypatch.setattr(mq, "OWNER", "molecule-ai")
+    monkeypatch.setattr(mq, "NAME", "molecule-core")
+    monkeypatch.setattr(mq, "WATCH_BRANCH", "main")
+    monkeypatch.setattr(mq, "OPT_OUT_LABELS", {"merge-queue-hold", "do-not-auto-merge", "wip"})
+    # Fork PR: head.repo_id != base.repo_id.
+    monkeypatch.setattr(mq, "get_pull", lambda n: {
+        "state": "open", "number": n, "mergeable": True,
+        "base": {"ref": "main", "repo_id": 1},
+        "head": {"sha": "a" * 40, "repo_id": 99},
+        "labels": [],
+    })
+
+    def forbidden_comment(*args, **kwargs):
+        raise mq.ApiError("POST /issues/200/comments -> HTTP 403: write:issue required")
+
+    monkeypatch.setattr(mq, "post_comment", forbidden_comment)
+
+    decision, ctx = mq._evaluate_candidate(
+        {"number": 200},
+        main_sha="b" * 40,
+        main_status={"state": "success", "statuses": []},
+        required_contexts=["CI / all-required (pull_request)"],
+        required_approvals=2,
+        dry_run=False,
+    )
+    assert decision is None            # skipped, not merged
+    assert ctx["pr_number"] == 200
+
+
+def test_process_once_fork_pr_comment_403_does_not_wedge_queue(monkeypatch, capsys):
+    """END-TO-END regression: a fork PR at the HEAD of the FIFO queue whose
+    skip-comment 403s must NOT crash the tick — the ready PR behind it still
+    merges. Before the fix, the 403 propagated out of the scan loop and wedged
+    every landing behind the un-commentable fork."""
+    calls = {"merge_attempts": 0, "hold_label": None, "updated": False, "merge_head_commit_id": None}
+    _fully_ready_process_once_monkeypatch(monkeypatch, mergeable=True, calls=calls)
+
+    head_sha = "a" * 40
+    # FIFO: the fork PR (#200, older) is scanned BEFORE the ready PR (#102).
+    monkeypatch.setattr(mq, "list_candidate_issues", lambda *, auto_discover: [
+        {"number": 200, "pull_request": {}, "labels": [{"name": "merge-queue"}],
+         "created_at": "2026-05-01T00:00:00Z"},
+        {"number": 102, "pull_request": {}, "labels": [{"name": "merge-queue"}],
+         "created_at": "2026-06-01T00:00:00Z"},
+    ])
+
+    def get_pull_dispatch(n):
+        if n == 200:  # fork PR: head.repo_id != base.repo_id
+            return {
+                "state": "open", "number": 200, "mergeable": True,
+                "base": {"ref": "main", "repo_id": 1},
+                "head": {"sha": head_sha, "repo_id": 99},
+                "labels": [{"name": "merge-queue"}],
+            }
+        return {  # #102: fully ready, same-repo
+            "state": "open", "number": n, "mergeable": True,
+            "base": {"ref": "main", "repo_id": 1},
+            "head": {"sha": head_sha, "repo_id": 1},
+            "labels": [{"name": "merge-queue"}],
+        }
+    monkeypatch.setattr(mq, "get_pull", get_pull_dispatch)
+
+    def forbidden_comment(*args, **kwargs):
+        raise mq.ApiError("POST /issues/200/comments -> HTTP 403: write:issue required")
+
+    monkeypatch.setattr(mq, "post_comment", forbidden_comment)
+
+    # No exception: the fork's un-postable skip comment must not wedge the tick.
+    rc = mq.process_once(dry_run=False)
+
+    assert rc == 0
+    # The PR behind the fork STILL merged — the queue proceeded.
+    assert calls["merge_attempts"] == 1
+    assert calls["merge_head_commit_id"] == head_sha
+    assert "could not post skip comment" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
 # Fix 2 (cont.): mergeable=None is fail-CLOSED — Gitea is still computing the
 # conflict check, so the queue must WAIT (re-check next tick), NOT merge. Only
 # an explicit mergeable==True proceeds to an autonomous merge.

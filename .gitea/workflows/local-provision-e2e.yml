@@ -450,11 +450,14 @@ jobs:
     # it stays masked until the docker-host runner pool reliably builds the
     # template + reaches api.minimax.io AND MOLECULE_STAGING_MINIMAX_API_KEY is
     # stably available. The current review has not established the required
-    # clean-window evidence, so the mask is re-tracked rather than unmasked. Two prior
+    # clean-window evidence, so the mask is re-tracked rather than unmasked. The
+    # 2026-07-25 review recorded 25/25 green runs over ~21h — a promotion
+    # candidate, held only because the CI substrate under this lane is still
+    # mid-migration. Three prior
     # renewal trackers aged past the 14d cap and were superseded (their numbers
     # are intentionally NOT repeated within 2 lines of the directive below —
     # lint-continue-on-error-tracking matches the FIRST tracker in that window).
-    continue-on-error: true  # mc#3617: 2026-07-09 renewal, expires 2026-07-23 — advisory MiniMax e2e; promote to gating (flip false) when the runner pool + staging MiniMax key are stable, else open a successor tracker (per mc#2408).
+    continue-on-error: true  # mc#4603: 2026-07-25 renewal, expires 2026-08-08 — advisory MiniMax e2e; promote to gating (flip false) when the runner pool + staging MiniMax key are stable, else open a successor tracker (per mc#2408).
     timeout-minutes: 30
     env:
       PG_CONTAINER: pg-lpe2e-real-${{ github.run_id }}-${{ github.run_attempt }}

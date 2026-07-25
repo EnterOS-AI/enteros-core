@@ -2261,6 +2261,31 @@ def post_branch_update_comment_best_effort(
         )
 
 
+def post_skip_comment_best_effort(
+    pr_number: int, body: str, *, dry_run: bool
+) -> None:
+    """Post an early-skip explanation without letting it gate the queue.
+
+    Observable-skip classes (today: fork PRs) get an explanatory PR comment.
+    But the merge-actor token (AUTO_SYNC_TOKEN) intentionally has
+    repository-write without issue-write scope, so this POST 403s. The skip
+    decision is ALREADY made (``reason`` is set) — the comment is pure
+    observability. A failed comment must therefore stay visible (``::warning::``)
+    while allowing the queue tick to CONTINUE to every candidate behind this
+    one: one un-commentable fork PR must never wedge the whole tick and
+    head-of-line-block every ready PR (the serialized queue does not support
+    fork PRs anyway — the PR is skipped whether or not the comment lands). Same
+    graceful-degrade philosophy as the #4505 BP-read fallback.
+    """
+    try:
+        post_comment(pr_number, body, dry_run=dry_run)
+    except (ApiError, urllib.error.URLError, TimeoutError) as exc:
+        sys.stderr.write(
+            f"::warning::could not post skip comment to PR #{pr_number}: "
+            f"{exc}; PR is skipped regardless, continuing queue scan\n"
+        )
+
+
 def update_pull(pr_number: int, *, dry_run: bool) -> None:
     print(f"::notice::updating PR #{pr_number} with base branch via style={UPDATE_STYLE}")
     if dry_run:
@@ -2960,7 +2985,12 @@ def _evaluate_candidate(
         # but avoid PR-comment noise for the high-volume skip classes.
         print(f"::notice::PR #{pr_number} {reason}; skipping")
         if pr_comment is not None:
-            post_comment(pr_number, pr_comment, dry_run=dry_run)
+            # Best-effort ONLY: never let an un-postable skip comment (the
+            # merge-actor token lacks write:issue -> 403 on fork PRs) raise out
+            # of _evaluate_candidate and crash the whole tick. Both callers
+            # (the process_once scan loop and enumerate_readiness) then continue
+            # to the remaining candidates. See post_skip_comment_best_effort.
+            post_skip_comment_best_effort(pr_number, pr_comment, dry_run=dry_run)
         return None, ctx
 
     head_sha = pr.get("head", {}).get("sha")
