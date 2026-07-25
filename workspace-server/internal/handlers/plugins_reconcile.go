@@ -166,12 +166,22 @@ func (h *PluginsHandler) ReconcileWorkspacePlugins(ctx context.Context, workspac
 			log.Printf("Plugin reconcile: workspace=%s plugin=%s already on box (boot-installed) — recording tracking row only, no re-deliver/restart",
 				workspaceID, stage.PluginName)
 		} else {
-			// Platform concierge lifecycle guard: preserve idempotent delivery,
-			// but leave any required restart to an explicit operator action.
-			if suppressRestart {
+			// Deliver the bytes, but suppress the automatic restart when a
+			// restart would either interrupt a lifecycle or spin a loop:
+			//
+			//   - suppressRestart: the platform concierge is mid provisioning/
+			//     online lifecycle; a reconcile-restart bounces it back to
+			//     provisioning. Leave any restart to an explicit operator action.
+			//   - !BoxFetchable: a host-side-only source (local://) was pushed in
+			//     from the workspace-server. A restart re-provisions the box and
+			//     wipes /configs; the boot materializer cannot re-pull a host-side
+			//     source, so the next reconcile re-delivers and restarts again —
+			//     an infinite loop. Deliver, but defer activation to an explicit
+			//     restart (or the next boot-install once the source is on the box).
+			if suppressRestart || !stage.Source.BoxFetchable() {
 				stage.SuppressRestart = true
-				log.Printf("Plugin reconcile: workspace=%s plugin=%s not on box during platform concierge provisioning/online lifecycle — delivering WITHOUT automatic restart",
-					workspaceID, stage.PluginName)
+				log.Printf("Plugin reconcile: workspace=%s plugin=%s delivering WITHOUT automatic restart (concierge_lifecycle=%v box_fetchable=%v) — activation deferred to explicit restart",
+					workspaceID, stage.PluginName, suppressRestart, stage.Source.BoxFetchable())
 			}
 			if deliverErr := h.deliver(ctx, workspaceID, stage); deliverErr != nil {
 				stage.cleanup()
