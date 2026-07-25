@@ -704,14 +704,21 @@ print(s[:4000])
 # diagnostic. Every attempt is logged, so a transient that self-heals stays
 # visible and is never silently masked.
 #
-# The attempt budget is small on purpose: the cold window is ~1-2s, so a few
-# ~2s retries cover it while a DETERMINISTIC transient still fails RED in
-# seconds rather than burning a multi-minute budget into a CI job timeout.
+# The attempt budget stays bounded but must cover the ACTUAL cold window: the
+# core#4307 RCA estimated ~1-2s, but under concurrent-provision load on the
+# shared staging docker host the tenant origin warms slower — run 546336
+# (Platform Boot) saw a persistent empty-body 503 from Cloudflare across the old
+# 4-attempt / ~8s budget. 8 attempts at Retry-After ~2s (~16s) covers the
+# observed longer window. This does NOT slow the deterministic-failure path: a
+# non-cold status (JSON app error, 502/504) is surfaced on attempt 1 by
+# create_should_retry_cold, so ONLY a genuinely-persistent cold-origin transient
+# consumes the budget — and a never-warming origin still fails RED in ~16s, well
+# under a CI job timeout. Env-overridable for a still-longer window if needed.
 #
 # Args: $1 = human label, $2 = headers dump file (-D target). Remaining args are
 # passed verbatim to `tenant_call POST /workspaces` (payload etc.). Echoes the
 # final response body on stdout; leaves the final response headers in $2.
-CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-4}"
+CREATE_MAX_ATTEMPTS="${CREATE_MAX_ATTEMPTS:-8}"
 create_workspace_post() {
   local label="$1" hdrs="$2"; shift 2
   local attempt resp id status ra who
@@ -976,18 +983,24 @@ fi
 # + the shrunken fire interval are (idempotently) set so the digest actually arms
 # and the loader runs within the window. Additive NON-LLM env only.
 if [ "${E2E_DIGEST_PLUGIN_CHECK:-}" = "on" ]; then
+  # DECLARE the digest plugin via the DURABLE DB channel (payload.plugins →
+  # workspace_declared_plugins), NOT MOLECULE_DECLARED_PLUGINS-in-secrets. Now that
+  # the scheduler is declared on EVERY workspace, provision recomputes
+  # MOLECULE_DECLARED_PLUGINS from the declared-set SSOT and OVERWRITES any
+  # secret-injected value, so a secret-declared digest plugin silently vanishes.
+  _DIGEST_SRC="${E2E_DIGEST_PLUGIN_SOURCE:-gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0}"
+  E2E_WS_PLUGINS="${E2E_WS_PLUGINS:-}${E2E_WS_PLUGINS:+,}$_DIGEST_SRC"
+  # The loader flag + digest arming are real runtime TOGGLES (not plugin decls), so
+  # they stay in the secret env.
   SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
 import json, os
 s = json.loads(os.environ['SECRETS_JSON_IN'])
-src = os.environ.get('E2E_DIGEST_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-digest-mail#v0.1.0')
-existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
-s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
 s['MOLECULE_DIGEST_PROVIDER_PLUGINS'] = '1'          # D1 loader flag
 s.setdefault('MOLECULE_MAILBOX_KERNEL', '1')          # ensure the idle digest arms
 s.setdefault('MOLECULE_IDLE_FIRE_SECONDS', os.environ.get('E2E_IDLE_FIRE_SECONDS', '30'))
 print(json.dumps(s))
 ")
-  log "    digest-plugin check ON: declared ${E2E_DIGEST_PLUGIN_SOURCE:-molecule-ai-plugin-digest-mail} + MOLECULE_DIGEST_PROVIDER_PLUGINS=1 (trust source = vendored registry, no NATIVE_PLUGIN_NAMES)"
+  log "    digest-plugin check ON: declared $_DIGEST_SRC via payload.plugins (durable DB channel) + MOLECULE_DIGEST_PROVIDER_PLUGINS=1 (trust source = vendored registry, no NATIVE_PLUGIN_NAMES)"
 fi
 
 MODEL_SLUG=$(pick_model_slug "$RUNTIME")
@@ -1054,6 +1067,7 @@ build_create_payload() {
   E2E_WS_TEMPLATE="$PROVISION_TEMPLATE" \
   E2E_WS_MODEL="$MODEL_SLUG" \
   E2E_WS_SECRETS="$SECRETS_JSON" \
+  E2E_WS_PLUGINS="${E2E_WS_PLUGINS:-}" \
   python3 -c "
 import json, os
 secrets = json.loads(os.environ['E2E_WS_SECRETS'] or '{}')
@@ -1063,6 +1077,14 @@ payload = {
     'model': os.environ['E2E_WS_MODEL'],
     'secrets': secrets,
 }
+# Declared plugins ride the DURABLE DB channel (CreateWorkspacePayload.Plugins →
+# workspace_declared_plugins), NOT a MOLECULE_DECLARED_PLUGINS secret: provision
+# recomputes that env from the declared-set SSOT and OVERWRITES a secret-injected
+# value (it does now that the scheduler is declared on every workspace), so a
+# secret-declared plugin would silently vanish before boot-install.
+_plugins = [p.strip() for p in os.environ.get('E2E_WS_PLUGINS', '').split(',') if p.strip()]
+if _plugins:
+    payload['plugins'] = _plugins
 tmpl = os.environ.get('E2E_WS_TEMPLATE', '')
 if tmpl:
     # Template-selected variant (seo-agent): the template's config.yaml
@@ -2496,20 +2518,79 @@ if [ "$MODE" = "full" ] && [ "${E2E_LIFECYCLE:-auto}" != "off" ]; then
   # step now PROVES the fix by driving a genuinely busy workspace first.
   #
   # active_tasks is heartbeat-fed (the agent self-reports its in-flight turn count
-  # every ~30s; there is no synchronous server lever), so making the workspace busy
-  # means driving a real long turn and polling until the DB reflects it. That drive
-  # is best-effort by nature. CAPTURE-FIRST / SOAK-TO-ENFORCE (task #92): when the
-  # workspace is provably busy we run the strict force-coverage assertions (a)+(b);
-  # when we cannot establish busy within the bound we LOG LOUD and fall back to the
-  # idle force-hibernate (still a valid transition, just not force-coverage). Once
-  # the busy-drive is shown reliable across the gate soak, set
-  # E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 to make a failed drive a hard red.
+  # every ~30s). Two ways to make the workspace busy, selected by E2E_BUSY_INJECT:
+  #
+  #   * E2E_BUSY_INJECT=1 (the ephemeral gate — task #92): the tenant image is
+  #     built with `-tags e2e_busy_inject`, which exposes POST
+  #     /workspaces/:id/test-busy. It pins active_tasks to a floor synchronously
+  #     (and holds it across heartbeats), so busy is DETERMINISTIC without a real
+  #     LLM turn. This route exists ONLY in the tag-built throwaway tenant image;
+  #     it is absent (404) from every shipped/staging binary. A non-busy 10b under
+  #     this mode is a hard red (see E2E_HIBERNATE_FORCE_BUSY_REQUIRED below).
+  #
+  #   * default (staging lanes, untagged images): drive a real long turn and poll
+  #     until the DB reflects it — best-effort by nature. CAPTURE-FIRST /
+  #     SOAK-TO-ENFORCE: when provably busy we run the strict force-coverage
+  #     assertions (a)+(b); otherwise we LOG LOUD and fall back to the idle
+  #     force-hibernate (a valid transition, not force-coverage) unless
+  #     E2E_HIBERNATE_FORCE_BUSY_REQUIRED=1 makes a failed drive fatal.
+
+  # Deterministic busy via the test-only inject route (E2E_BUSY_INJECT=1). Pins
+  # active_tasks=1 in the same DB column the hibernate 409 guard + atomic claim
+  # read, then confirms GET reflects it. Returns 0 iff active_tasks>0 was
+  # established. A 404 here means the tenant image was NOT built with the
+  # e2e_busy_inject tag — a wiring error the operator must fix, not a soft skip.
+  _hib_busy_inject() {
+    local bi_tmp bi_code cur deadline
+    bi_tmp=$(mktemp -t hib_inject.XXXXXX)
+    set +e
+    bi_code=$(tenant_call POST "/workspaces/$LIFECYCLE_WS/test-busy" --max-time 20 \
+      -H "Content-Type: application/json" -d '{"active_tasks":1,"is_busy":true}' \
+      -o "$bi_tmp" -w '%{http_code}' 2>/dev/null)
+    set -e
+    bi_code=${bi_code:-000}
+    if [ "$bi_code" != "200" ]; then
+      log "    busy-inject: POST /test-busy → http=$bi_code (expected 200). If 404, the tenant image lacks -tags e2e_busy_inject. Body: $(cat "$bi_tmp" 2>/dev/null | sanitize_http_body | head -c 200)"
+      rm -f "$bi_tmp"
+      return 1
+    fi
+    rm -f "$bi_tmp"
+    # Confirm the DB reflects it. The sticky floor keeps active_tasks>=1 across
+    # heartbeats, so a single confirming read is sufficient and stable.
+    deadline=$(( $(date +%s) + 30 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      cur=$(tenant_call GET "/workspaces/$LIFECYCLE_WS" 2>/dev/null \
+        | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('active_tasks') or 0))" 2>/dev/null || echo 0)
+      log "    busy-inject poll: active_tasks=${cur:-?} (want >0)"
+      if [ "${cur:-0}" -gt 0 ] 2>/dev/null; then
+        log "    active_tasks=$cur — workspace is busy via test-inject (deterministic)"
+        return 0
+      fi
+      sleep 3
+    done
+    return 1
+  }
+
+  # Release a previously-injected hold so post-wake heartbeats stop reporting busy
+  # (the sticky floor would otherwise re-raise active_tasks after the workspace
+  # wakes). No-op / harmless when the route is absent.
+  _hib_busy_release() {
+    tenant_call POST "/workspaces/$LIFECYCLE_WS/test-busy" --max-time 20 \
+      -H "Content-Type: application/json" -d '{"active_tasks":0}' \
+      -o /dev/null -w '' 2>/dev/null || true
+    log "    busy-inject: released active_tasks hold"
+  }
 
   # Drive a long, model-independent in-flight turn WITHOUT draining the queue, so
   # the turn stays live while we fire the two hibernate calls. Returns 0 once
   # GET /workspaces/:id reports active_tasks>0 (the same column the handler's 409
   # guard and atomic claim read — so the witness and the decision agree).
   _hib_busy_drive() {
+    # Deterministic path first when the gate armed it.
+    if [ "${E2E_BUSY_INJECT:-0}" = "1" ]; then
+      _hib_busy_inject && return 0
+      return 1
+    fi
     local sleep_secs="${E2E_HIBERNATE_BUSY_SLEEP_SECS:-180}"
     local wait_secs="${E2E_HIBERNATE_BUSY_WAIT_SECS:-150}"
     local busy_payload deadline cur bd_tmp bd_code bd_qid bd_attempt
@@ -2606,6 +2687,11 @@ print(json.dumps({
     [ "$HIB_STATUS" = "hibernated" ] || fail "Hibernate(busy,force): POST /hibernate?force=true returned status='$HIB_STATUS' (expected 'hibernated'). Body: ${HIB_RESP:0:200}"
     wait_status "hibernated" 120 "hibernate-force-busy" || fail "Hibernate(busy,force): workspace $LIFECYCLE_WS never settled at status=hibernated (DB row) after force on a BUSY workspace — core#4293 regression: force must drop the active_tasks=0 claim predicate, terminate the in-flight task, and stop the container, not no-op to a lying 200."
     ok "    force hibernate on BUSY ws → hibernated (DB-verified; core#4293 covered)"
+    # Release any injected busy hold now that the force-on-busy assertions passed,
+    # so the workspace can wake IDLE below (the sticky floor would otherwise
+    # re-raise active_tasks on the post-wake heartbeats). No-op under the
+    # real-turn drive (the route is absent / the hold was never set).
+    if [ "${E2E_BUSY_INJECT:-0}" = "1" ]; then _hib_busy_release; fi
   else
     # Busy-drive did not establish active_tasks>0 within the bound. Under the soak
     # default this is a LOUD non-fatal fallback (the run still exercises the idle
@@ -2969,64 +3055,211 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
   fi
 fi
 
-# ─── 10g. P4b retirement tooling reachable (core#4507, E2E_SCHEDULER_CHECK=on only) ──
-# End-to-end proof that the workspace_schedules-retirement tooling is DEPLOYED
-# and reachable on a real tenant through the CP proxy: the read-only readiness
-# audit and the DRY-RUN fleet migrate are AdminAuth-gated ws-server routes that
-# must return their documented JSON contract. The irreversible DROP itself stays
-# owner-gated — this proves ONLY that the enabling tooling is live + correctly
-# shaped (the migration MATH is unit-tested with negative controls in
-# workspace-server/internal/handlers/schedules_p4b_test.go). Co-gated on
-# E2E_SCHEDULER_CHECK so it reuses 10d's volume-native tenant.
-# Reachable fail arms: non-2xx (route not registered / AdminAuth rejected the
-# tenant admin token) vs a 2xx whose body is missing the contract keys.
-if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
-  log "── 10g. P4b readiness + fleet-migrate tooling reachable ──"
-  _P4B_BODY=$(mktemp)
-  E2E_TMP_FILES+=("$_P4B_BODY")  # cleaned by the EXIT trap even if fail() exits mid-step
-
-  _p4b_call() {  # <method> <path> <label> <python-contract-check-on-stdin>
-    local method="$1" path="$2" label="$3" checks="$4" code rc summary prc
-    set +e
-    code=$(tenant_call "$method" "$path" -o "$_P4B_BODY" -w '%{http_code}'); rc=$?
-    set -e
-    if [ "$rc" -ne 0 ] || [ "$code" != "200" ]; then
-      log "$(sanitize_http_body <"$_P4B_BODY" | head -c 400)"
-      fail "10g: $label returned HTTP $code (curl_rc=$rc) — the route is not registered on the tenant ws-server, or AdminAuth rejected the tenant admin token."
-    fi
-    set +e
-    summary=$(python3 -c "$checks" <"$_P4B_BODY"); prc=$?
-    set -e
-    if [ "$prc" -ne 0 ]; then
-      log "$(sanitize_http_body <"$_P4B_BODY" | head -c 400)"
-      fail "10g: $label returned 200 but not the documented contract (see body above)."
-    fi
-    [ -n "$summary" ] && log "$summary"
+# ─── 10g. Scheduler fire → DELIVER (send_message_to_user) — #4555 ────────────
+# Closes the #4555 coverage gap the audit flagged. 10d proves the daemon
+# autonomously FIRES a schedule, but a FIRE only self-schedules a turn — it does
+# NOT prove that turn actually DELIVERED anything to the user. Pre-this-step, the
+# DELIVER half lived ONLY as a stubbed unit test (runtime#341). This sub-step
+# drives the full chain live: create a `* * * * *` schedule whose PROMPT instructs
+# the agent to call the send_message_to_user tool with a run-unique MARKER,
+# confirm the daemon FIRES it (reusing 10d's grid + fire ground-truth), THEN poll
+# the delivery ground-truth — an activity_logs a2a_receive/notify row written by
+# the AgentMessageWriter SSOT (workspace-server/internal/handlers/
+# agent_message_writer.go: INSERT activity_type='a2a_receive', method='notify',
+# response_body={"result": <message>}, summary='Agent message: <preview>') — for
+# that same MARKER, read via GET /workspaces/:id/activity (the same endpoint 9b
+# smoke-tests; List returns a bare JSON array with no default type filter, so
+# notify rows are included). The marker landing in a notify row proves the fired
+# turn actually invoked send_message_to_user and the message reached the user.
+#
+# CO-GATE (two conditions, BOTH required):
+#   1. E2E_SCHEDULER_CHECK=on — DELIVER rides the SAME fire machinery as 10d, so
+#      it shares 10d's gate (the ephemeral happy-path lane sets it on per-PR; an
+#      independent E2E_SCHEDULE_DELIVER_CHECK, default on, can disable JUST this
+#      sub-step without disabling the fire gate — gate the sub-step, never the
+#      whole scenario).
+#   2. A REAL tool-calling LLM must be driving the workspace. DELIVER needs the
+#      agent to actually CALL a tool; a mock/canned-reply arm never invokes one,
+#      so on a no-real-LLM arm this SKIPS (never reds) — mirroring how the byok
+#      guards (8c/8d) stay best-effort when their key is absent on untrusted-fork
+#      PRs. The FIRE half (10d) stays a HARD gate on ALL arms; ONLY the DELIVER
+#      half is arm-gated.
+#      "Real tool-calling LLM present" = the platform-managed path (E2E_LLM_PATH=
+#      platform → the CP LLM proxy serves a real model; the EPHEMERAL happy-path
+#      lane's arm is exactly this: model minimax/MiniMax-M2.7 via the CP's own
+#      MINIMAX_API_KEY, NOT a BYOK E2E_MINIMAX_API_KEY — see ephemeral_cp_happy_
+#      path.sh run_scenario) OR any BYOK vendor key (MiniMax/Anthropic/OpenAI).
+#      A keyless, non-platform arm has no tool-caller → SKIP. NB: gating literally
+#      on E2E_MINIMAX_API_KEY (absent in the ephemeral lane) would SKIP forever
+#      here and make the per-PR gate vacuous — the platform path IS this lane's
+#      real-LLM arm, so it must count.
+#
+# NON-TAUTOLOGY (negative control, by construction): the DELIVER probe matches the
+# run-unique MARKER ONLY inside an activity_type=a2a_receive / method=notify row —
+# the exact shape AgentMessageWriter writes and NOTHING else does. A FIRE alone
+# writes schedule-history.json (status=fired) but NO notify row, so the fire
+# cannot satisfy DELIVER. A fired turn that does NOT call send_message_to_user
+# produces no notify row carrying the marker either (a scheduled turn has no
+# connected user session — its final assistant text is not auto-broadcast; the
+# ONLY path to a notify row is an explicit send_message_to_user call). The marker
+# is unique per run and reaches activity_logs solely via the send_message_to_user
+# / notify SSOT — so this assertion is satisfied ONLY by a real tool-driven
+# delivery, never by the fire. (Proof by demonstration: swap the prompt for one
+# that fires but omits the tool call and the deliver_probe below stays red until
+# the timeout — the fire/grid arms still pass, isolating the DELIVER leg.)
+if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}" = "on" ]; then
+  # Co-gate condition 2 — real tool-calling LLM present? Compute once, then unset.
+  schedule_deliver_real_llm_arm() {
+    [ "${E2E_LLM_PATH:-}" = "platform" ] && return 0
+    [ -n "${E2E_MINIMAX_API_KEY:-}" ] && return 0
+    [ -n "${E2E_ANTHROPIC_API_KEY:-}" ] && return 0
+    [ -n "${E2E_OPENAI_API_KEY:-}" ] && return 0
+    return 1
   }
+  if schedule_deliver_real_llm_arm; then _DLV_LLM_READY=1; else _DLV_LLM_READY=0; fi
+  unset -f schedule_deliver_real_llm_arm
 
-  _p4b_call GET "/admin/schedules/p4b-readiness" "p4b-readiness" '
-import json,sys
-d=json.load(sys.stdin)
-for k in ("droppable","kill_switch_enabled","workspaces_with_live_rows","workspaces_needing_migration","workspaces"):
-    assert k in d, "missing key: "+k+" (got "+str(sorted(d))+")"
-assert isinstance(d["droppable"], bool), "droppable must be a bool"
-assert isinstance(d["workspaces"], list), "workspaces must be a list"
-print("    readiness: droppable=%s live_rows=%s not_native=%s needs_migration=%s" % (
-    d["droppable"], d["workspaces_with_live_rows"], d.get("not_volume_native"), d["workspaces_needing_migration"]))
-'
-  ok "    p4b-readiness reachable + correctly shaped"
+  if [ "$_DLV_LLM_READY" != "1" ]; then
+    log "10g/11 Scheduler DELIVER: SKIP — no real tool-calling LLM on this arm (E2E_LLM_PATH='${E2E_LLM_PATH:-}', no BYOK key). send_message_to_user needs the agent to actually invoke a tool; the mock/canned arm never will, so asserting DELIVER here would red on a stub, not a regression. The FIRE half (10d) already ran as a hard gate on this arm; DELIVER is hard only on a real-LLM arm (#4555)."
+  elif ! idle_digest_require_docker; then
+    fail "10g DELIVER: E2E_SCHEDULER_CHECK=on requires a usable Docker CLI + daemon to read the fire/deliver ground-truth (same requirement as 10d)."
+  else
+    _DLV_NAME="e2e-deliver-${E2E_RUN_ID:-local}"
+    # Run-unique marker. Only reaches activity_logs via send_message_to_user →
+    # AgentMessageWriter; a distinct token so a stale row on a recycled container
+    # cannot false-pass and the fire alone cannot produce it.
+    _DLV_MARKER="E2E-SMTU-DELIVER-${E2E_RUN_ID:-local}"
+    _DLV_FIRE_TIMEOUT_SECS="${E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-360}}"
+    # DELIVER window spans MULTIPLE fires: a `* * * * *` schedule re-fires every
+    # minute and each fire is an INDEPENDENT chance for the model to invoke the
+    # tool. Polling across ≥3 fire cycles absorbs the occasional turn where a
+    # capable-but-nondeterministic model acks in text without calling the tool
+    # (the same class the idle-digest A2A seed deliberately avoided). The marker
+    # only has to land ONCE — this is the NAMED flake-mitigation mechanism, not a
+    # silent retry.
+    _DLV_DELIVER_TIMEOUT_SECS="${E2E_SCHEDULE_DELIVER_TIMEOUT_SECS:-210}"
+    _DLV_POLL_SECS="${E2E_SCHEDULER_POLL_SECS:-10}"
+    # Imperative single-tool prompt — mirrors the daily-activity-report default's
+    # "deliver a report" instruction. The fired turn has no user session, so the
+    # ONLY route to the user (and a notify row) is an explicit tool call.
+    _DLV_PROMPT="You are running a scheduled background turn with no user watching. You MUST call the send_message_to_user tool exactly once, with its message set to EXACTLY this token and nothing else: ${_DLV_MARKER}. Do not just write the token as your reply — invoke the tool. Do not call any other tool."
 
-  _p4b_call POST "/admin/schedules/migrate-all-to-volume" "migrate-all(dry-run)" '
-import json,sys
-d=json.load(sys.stdin)
-assert d.get("apply") is False, "no ?apply must default to dry-run (apply=false), got %r" % d.get("apply")
-for k in ("workspaces","total_migrated","results"):
-    assert k in d, "missing key: "+k
-print("    migrate-all dry-run: apply=%s workspaces=%s would_migrate=%s" % (d["apply"], d["workspaces"], d["total_migrated"]))
-'
-  ok "    migrate-all-to-volume reachable + dry-run by default (no writes)"
+    scheduler_deliver_diagnostics() {
+      local _sc _grid _hist _act
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 300)
+        _hist=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedule-history.json 2>/dev/null | tr "\n" " "' 2>/dev/null | head -c 400)
+        log "    [deliver diag] $_sc grid: ${_grid:-ABSENT}"
+        log "    [deliver diag] $_sc history: ${_hist:-ABSENT}"
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      _act=$(tenant_call GET "/workspaces/$PARENT_ID/activity?limit=20" 2>/dev/null | sanitize_http_body | tr '\n' ' ' | head -c 600)
+      log "    [deliver diag] recent activity (redacted): ${_act:-<none>}"
+    }
 
-  rm -f "$_P4B_BODY"; unset -f _p4b_call
+    # Create the DELIVER schedule. By now 10d proved the daemon armed AND core
+    # advertises the scheduler capability, so a fresh create routes to the volume
+    # deterministically — no #4448 re-issue loop needed here.
+    _DLV_TMP=$(mktemp)
+    _DLV_CODE=$(tenant_call POST "/workspaces/$PARENT_ID/schedules" \
+      -H "Content-Type: application/json" \
+      -d "$(DLV_NAME="$_DLV_NAME" DLV_PROMPT="$_DLV_PROMPT" python3 -c 'import json,os; print(json.dumps({"name":os.environ["DLV_NAME"],"cron_expr":"* * * * *","timezone":"UTC","prompt":os.environ["DLV_PROMPT"]}))')" \
+      -o "$_DLV_TMP" -w '%{http_code}' 2>/dev/null) || true
+    _DLV_BODY=$(cat "$_DLV_TMP" 2>/dev/null | sanitize_http_body); rm -f "$_DLV_TMP"
+    if ! echo "$_DLV_CODE" | grep -Eq '^2[0-9][0-9]$'; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: create schedule '$_DLV_NAME' returned http=$_DLV_CODE (expected 2xx): ${_DLV_BODY:0:300}. The scheduler capability was advertised (10d passed), so a non-2xx here is a routing/auth regression on the create path."
+    fi
+
+    # Confirm it reached the volume grid.
+    _DLV_GRID_EVIDENCE=""
+    deliver_grid_has() {
+      local _sc _grid
+      _DLV_GRID_EVIDENCE=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        _grid=$(docker exec "$_sc" sh -c 'cat /configs/schedules/schedules.yaml 2>/dev/null' 2>/dev/null || true)
+        if printf '%s' "$_grid" | grep -Fq "$_DLV_NAME"; then _DLV_GRID_EVIDENCE="$_sc"; return 0; fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+    log "10g/11 Scheduler DELIVER: created '$_DLV_NAME' (http=$_DLV_CODE); verifying it reached the volume grid (up to ${_DLV_FIRE_TIMEOUT_SECS}s; poll=${_DLV_POLL_SECS}s)."
+    if ! idle_digest_wait "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_grid_has; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' never reached the volume grid within ${_DLV_FIRE_TIMEOUT_SECS}s — the create 2xx'd but did not land on the daemon's grid (routing regression specific to the DELIVER schedule; 10d's identical create DID land)."
+    fi
+    ok "    DELIVER schedule '$_DLV_NAME' on the volume grid (evidence: $_DLV_GRID_EVIDENCE)"
+
+    # Confirm the daemon FIRED it (reuse 10d's fire ground-truth verbatim).
+    _DLV_FIRED=""
+    deliver_fire_probe() {
+      local _sc
+      _DLV_FIRED=""
+      while IFS= read -r _sc; do
+        [ -n "$_sc" ] || continue
+        if docker logs "$_sc" 2>&1 | grep -F "fired schedule '$_DLV_NAME'" >/dev/null; then _DLV_FIRED="$_sc (runtime log)"; return 0; fi
+        if docker exec "$_sc" sh -c \
+          "grep -Fq '\"name\": \"$_DLV_NAME\"' /configs/schedules/schedule-history.json 2>/dev/null && grep -Fq '\"status\": \"fired\"' /configs/schedules/schedule-history.json 2>/dev/null" \
+          >/dev/null 2>&1; then _DLV_FIRED="$_sc (durable schedule-history.json)"; return 0; fi
+      done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
+      return 1
+    }
+    log "    DELIVER: polling FIRE evidence for '$_DLV_NAME' (up to ${_DLV_FIRE_TIMEOUT_SECS}s; poll=${_DLV_POLL_SECS}s)."
+    if ! idle_digest_wait "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_fire_probe; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' reached the grid but the daemon never FIRED it within ${_DLV_FIRE_TIMEOUT_SECS}s (grid present, no history) — a FIRE-path failure surfaced on the DELIVER schedule; see 10d for the shared mechanism."
+    fi
+    ok "    DELIVER schedule FIRED (evidence: $_DLV_FIRED) — turn self-scheduled; now asserting it DELIVERED"
+
+    # DELIVER ground-truth: an activity_logs a2a_receive/notify row (the
+    # AgentMessageWriter SSOT) carrying the run-unique marker. See the block
+    # header for why matching this specific row shape is non-tautological.
+    _DLV_DELIVERED=""
+    deliver_probe() {
+      local _tmp _code _rc
+      _DLV_DELIVERED=""
+      _tmp=$(mktemp)
+      _code=$(tenant_call GET "/workspaces/$PARENT_ID/activity?limit=50" -o "$_tmp" -w '%{http_code}' 2>/dev/null) || true
+      if ! echo "$_code" | grep -Eq '^2[0-9][0-9]$'; then rm -f "$_tmp"; return 1; fi
+      MARKER="$_DLV_MARKER" python3 -c '
+import json, os, sys
+marker = os.environ["MARKER"]
+try:
+    rows = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+if isinstance(rows, dict):
+    rows = rows.get("events", [])
+if not isinstance(rows, list):
+    sys.exit(1)
+for r in rows:
+    if not isinstance(r, dict):
+        continue
+    # The exact shape AgentMessageWriter writes for send_message_to_user / notify.
+    if r.get("activity_type") != "a2a_receive" or r.get("method") != "notify":
+        continue
+    rb = r.get("response_body")
+    hay = json.dumps(rb) if rb is not None else ""
+    summ = r.get("summary") or ""
+    if marker in hay or marker in summ:
+        sys.exit(0)
+sys.exit(1)
+' "$_tmp"
+      _rc=$?
+      rm -f "$_tmp"
+      [ "$_rc" = "0" ] && _DLV_DELIVERED="activity a2a_receive/notify row carries '$_DLV_MARKER'"
+      return "$_rc"
+    }
+    log "    DELIVER: polling delivery ground-truth (activity a2a_receive/notify row with marker '$_DLV_MARKER') for up to ${_DLV_DELIVER_TIMEOUT_SECS}s across ~$(( _DLV_DELIVER_TIMEOUT_SECS / 60 )) fire cycles (poll=${_DLV_POLL_SECS}s)."
+    if idle_digest_wait "$_DLV_DELIVER_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_probe; then
+      ok "    scheduler fired turn DELIVERED to the user via send_message_to_user (evidence: $_DLV_DELIVERED) — #4555 fire→deliver proven live on this real-LLM arm"
+    else
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' FIRED but no send_message_to_user delivery landed within ${_DLV_DELIVER_TIMEOUT_SECS}s — no activity_logs a2a_receive/notify row carries the marker '$_DLV_MARKER'. The fired turn did not invoke send_message_to_user, or the AgentMessageWriter deliver path is broken (the #4555 regression this gate exists to catch). The fire itself is confirmed above, so this is specifically the DELIVER leg, not a scheduler-fire fault. (Real-LLM arm: E2E_LLM_PATH='${E2E_LLM_PATH:-}'.)"
+    fi
+
+    unset -f scheduler_deliver_diagnostics deliver_grid_has deliver_fire_probe deliver_probe
+  fi
 fi
 
 # ─── 10e. Native digest-provider plugin load (RFC #4413, E2E_DIGEST_PLUGIN_CHECK=on only) ──

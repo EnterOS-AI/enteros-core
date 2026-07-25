@@ -17,7 +17,7 @@
  *      load AFTER tailwind so its specificity wins.
  *   3. theme-tokens.css — canvas-only motion + deploy animation vars
  *      (--mol-duration-*, --mol-easing-*, --mol-deploy-*). NOT colour
- *      tokens; the warm-paper @theme block below owns those.
+ *      tokens; the semantic @theme block below owns those.
  *   4. settings-panel.css / org-deploy.css — feature stylesheets that
  *      reference the variables above.
  */
@@ -28,7 +28,7 @@
 @import "../styles/boot-sequence.css";
 
 /*
- * Warm-paper semantic tokens — light defaults via @theme, dark
+ * Enter OS semantic tokens — light defaults via @theme, dark
  * overrides via [data-theme="dark"]. Names are role-based
  * (`bg-surface`, `text-ink`, `border-line`) not colour-based, so the
  * same component classes work in either mode.
@@ -43,58 +43,58 @@
  * before paint to eliminate flash.
  */
 @theme {
-  /* Org Concierge palette (RFC platform-agent / canvas redesign). Warm-paper
-     light theme + purple accent replacing the old blue brand. */
+  /* Enter OS palette (rebrand, internal#1089). Values are generated from
+     molecule-ai-sdk brand/src/brand.json "semantic" (sdk@28789cd) — the
+     brand SSOT — and must stay byte-identical to molecule-app's copy
+     (.gitea/scripts/check_app_token_drift.py compares value strings). */
   /* Surface — page / elevated card / sunken input / deep card */
-  --color-surface: #f1efe8;
+  --color-surface: #ffffff;
   --color-surface-elevated: #ffffff;
-  --color-surface-sunken: #f6f4ee;
-  --color-surface-card: #faf9f4;
+  --color-surface-sunken: #f4f4f6;
+  --color-surface-card: #fafafc;
 
   /* Borders */
-  --color-line: #ddd9cf;
-  --color-line-soft: #ebe8df;
+  --color-line: #d6d6d6;
+  --color-line-soft: #e8e8e8;
 
   /* Text */
-  --color-ink: #21201b;
-  --color-ink-mid: #5c5a52;
-  --color-ink-soft: #656871;
+  --color-ink: #000000;
+  --color-ink-mid: #4d4d4d;
+  --color-ink-soft: #6e6e78;
 
-  /* Brand + state — purple accent (concept #7c3aed). good/bad (LIGHT) are
-     darkened to actually clear WCAG AA 4.5:1 on their own 10%-tint badges
-     (`text-good` on `bg-good/10`): the old #0c8a52/#c2403c measured 3.87/4.46
-     (axe, molecule-app issue #48 + core#2742) — only NOW do they pass
-     (#2a6e44 → 5.33, #b0463f → 4.79). ink-soft #656871 too (4.84). These are
-     the UNIFIED values all three surfaces share (canvas / mobile-web palette /
-     molecule-app) — the cross-surface SSOT, gated by globals.a11y.test.ts.
-     Dark already passes AA (unchanged). */
-  --color-accent: #7c3aed;
-  --color-accent-strong: #6d28d9;
-  --color-warm: #c47e12;
-  --color-good: #2a6e44;
-  --color-bad: #b0463f;
+  /* Brand + state — Enter OS periwinkle accent. good/bad/ink-soft (LIGHT)
+     clear WCAG AA 4.5:1 on their at-risk pairs (`text-good` on `bg-good/10`
+     etc.) — gated by globals.a11y.test.ts (core#2742): good/10 4.70,
+     bad/10 4.69, ink-soft on surface 5.04. accent-wash is decorative-only
+     (washes/pills, never body text) and intentionally NOT contrast-gated. */
+  --color-accent: #6663d6;
+  --color-accent-strong: #4f4cb0;
+  --color-accent-wash: #bdbbff;
+  --color-warm: #8f5b00;
+  --color-good: #25794a;
+  --color-bad: #b8423b;
 }
 
 [data-theme="dark"] {
-  /* Org Concierge dark palette — near-black panels, bright purple accent. */
-  --color-surface: #08080a;
-  --color-surface-elevated: #16161d;
-  --color-surface-sunken: #0d0d11;
-  --color-surface-card: #1b1b23;
+  /* Enter OS dark palette — deep-navy panels, periwinkle accent. */
+  --color-surface: #010120;
+  --color-surface-elevated: #0b0b38;
+  --color-surface-sunken: #05052a;
+  --color-surface-card: #101042;
 
-  --color-line: #26262e;
-  --color-line-soft: #1b1b22;
+  --color-line: #232350;
+  --color-line-soft: #19193f;
 
-  --color-ink: #ececf1;
-  --color-ink-mid: #9b9baa;
-  --color-ink-soft: #65656f;
+  --color-ink: #f4f4ff;
+  --color-ink-mid: #a3a3c8;
+  --color-ink-soft: #8888b0;
 
-  /* Purple accent brightened for AA on the near-black surfaces. */
-  --color-accent: #a78bfa;
-  --color-accent-strong: #c4b5fd;
+  --color-accent: #bdbbff;
+  --color-accent-strong: #d6d5ff;
+  --color-accent-wash: #2b2b66;
   --color-warm: #fbbf24;
-  --color-good: #34d399;
-  --color-bad: #f87171;
+  --color-good: #3fd69a;
+  --color-bad: #ff8a80;
 }
 
 :root {
@@ -129,10 +129,12 @@
   --color-plasma: rgb(139 92 246);    /* concept --accent #8b5cf6 */
   --color-warn: rgb(251 191 36);      /* amber-400 */
 
-  /* Typography — Org Concierge (Hanken Grotesk UI, JetBrains Mono code).
-     next/font variables are set on <html> in the canvas layout. */
-  --font-sans: var(--font-hanken), ui-sans-serif, system-ui, -apple-system,
-    "Segoe UI", Roboto, sans-serif;
+  /* Typography — Enter OS brand (Chillax display, Inter Tight body,
+     JetBrains Mono code; SSOT: molecule-ai-sdk brand/src/brand.json fonts).
+     next/font/local variables are set on <body> in the canvas layout. */
+  --font-sans: var(--font-inter-tight), -apple-system, BlinkMacSystemFont,
+    system-ui, sans-serif;
+  --font-display: var(--font-chillax), var(--font-inter-tight), sans-serif;
   --font-mono: var(--font-jetbrains), ui-monospace, "SF Mono", Menlo, monospace;
 }
 
@@ -142,8 +144,8 @@ body {
   overflow: hidden;
   background-color: var(--color-surface);
   color: var(--color-ink);
-  font-family: var(--font-hanken), -apple-system, BlinkMacSystemFont, "Segoe UI",
-    Roboto, "Helvetica Neue", sans-serif;
+  font-family: var(--font-inter-tight), -apple-system, BlinkMacSystemFont,
+    system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }

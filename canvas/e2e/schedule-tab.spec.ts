@@ -1,17 +1,21 @@
 import { test, expect } from "@playwright/test";
-import type { Page } from "@playwright/test";
+import type { Page, Request } from "@playwright/test";
 import { startEchoRuntime, type EchoRuntime } from "./fixtures/echo-runtime";
 import { seedWorkspace, startHeartbeat, cleanupWorkspace } from "./fixtures/chat-seed";
 
 /**
  * Scheduler ScheduleTab regression e2e — exercises the Canvas schedule surface
- * end-to-end against the local platform (real workspace_schedules DB): the tab
- * mounts, the create form validates + persists, the row appears, edit/toggle
- * mutate it, RunNow fires the schedule's prompt as an A2A turn to the (echo)
- * runtime, and delete removes it. This is the regression guard the P3-live
- * backend re-point (Canvas → runtime schedule API) must keep green: the visible
- * behaviour + JSON contract (name, cron_expr, timezone, prompt, enabled) is the
- * invariant, independent of whether the store is core Postgres or the volume.
+ * end-to-end against the local platform: the tab mounts, the create form
+ * validates + persists, the row appears, edit/toggle mutate it, RunNow fires the
+ * schedule's prompt as an A2A turn to the (echo) runtime, and delete removes it.
+ *
+ * Post-P4b the store is the runtime VOLUME grid, not core Postgres — the legacy
+ * workspace_schedules table was retired and the Canvas schedule surface forwards
+ * to the runtime's /internal/schedules* API. The echo runtime therefore serves a
+ * faithful in-process grid (see fixtures/echo-runtime.ts), so this remains the
+ * regression guard for the backend re-point: the visible behaviour + JSON
+ * contract (name, cron_expr, timezone, prompt, enabled) is the invariant,
+ * independent of whether the store is core Postgres or the volume.
  */
 
 /** Enter the Org-map view so the React-Flow graph mounts, then open the workspace. */
@@ -85,12 +89,26 @@ test.describe("ScheduleTab", () => {
       timeout: 10_000,
     });
 
-    // --- run-now: frontend calls /run then fires the prompt as A2A to the echo runtime ---
+    // --- run-now: post-P4b, Run-now POSTs /schedules/{id}/run; the runtime
+    // ENQUEUES a poke and the DAEMON fires the turn (fired_by:"daemon") — Canvas
+    // does NOT send the turn itself. Assert the poke round-trips (core's RunNow
+    // returns 200 after the runtime accepts the poke) and that EXACTLY ONE /run is
+    // issued (Canvas doesn't double-fire). The no-double-fire poke→deliver→clear
+    // invariant itself is server-side, covered by the runtime daemon run_once
+    // tests, not this UI round-trip.
+    const runPosts: string[] = [];
+    const onReq = (r: Request) => {
+      if (r.method() === "POST" && r.url().endsWith("/run")) runPosts.push(r.url());
+    };
+    page.on("request", onReq);
     const runResp = page.waitForResponse(
       (r) => r.url().includes(`/schedules/`) && r.url().endsWith("/run") && r.request().method() === "POST",
     );
     await panel.getByRole("button", { name: `Run schedule ${name} now` }).click();
-    expect((await runResp).status()).toBeLessThan(300);
+    expect((await runResp).status()).toBe(200);
+    await page.waitForTimeout(300);
+    page.off("request", onReq);
+    expect(runPosts).toHaveLength(1);
 
     // --- delete (ConfirmDialog) ---
     await panel.getByRole("button", { name: `Delete schedule ${name}` }).click();

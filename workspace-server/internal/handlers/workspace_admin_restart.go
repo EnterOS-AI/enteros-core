@@ -53,13 +53,12 @@ import (
 // manual per-migration recovery into the migration's natural final step.
 //
 // Behavior:
-//   - 404 if the workspace id is empty or the workspace doesn't exist
-//     in the DB
+//   - 400 if the workspace id is empty
+//   - 404 if the workspace doesn't exist in the DB
 //   - 202 Accepted on a successful dispatch (the restart is async;
 //     the migrator's poll-via-strengthened-health-check verifies the
 //     cred re-injection landed)
-//   - 500 if the dispatch fails (extremely rare; the RestartByID
-//     call panics-recover'd in a goroutine)
+//   - 500 if the synchronous DB pre-flight fails
 //
 // Idempotent: a second POST to this endpoint while a restart is
 // in-flight is coalesced via the existing restartState pattern

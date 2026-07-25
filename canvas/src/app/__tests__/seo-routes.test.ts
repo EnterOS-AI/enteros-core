@@ -9,9 +9,8 @@ import { describe, it, expect, vi } from "vitest";
 // vitest-compatible (next/font expects the Next.js compiler swc
 // transform). We import layout.tsx only for its exported `metadata`
 // constant — mock the font module to a constructor-returning stub.
-vi.mock("next/font/google", () => ({
-  Hanken_Grotesk: () => ({ variable: "--font-hanken" }),
-  JetBrains_Mono: () => ({ variable: "--font-jetbrains" }),
+vi.mock("next/font/local", () => ({
+  default: () => ({ variable: "--font-mock" }),
 }));
 
 import robots from "../robots";
@@ -83,7 +82,7 @@ describe("sitemap.ts", () => {
 describe("root layout metadata", () => {
   it("sets a templated title + non-empty description", () => {
     const t = metadata.title as { default: string; template: string };
-    expect(t.default).toMatch(/Molecule AI/);
+    expect(t.default).toMatch(/Enter OS/);
     expect(t.template).toMatch(/%s/);
     expect((metadata.description ?? "").length).toBeGreaterThan(50);
   });
@@ -91,7 +90,7 @@ describe("root layout metadata", () => {
   it("declares OG + Twitter text fields (image comes from opengraph-image.tsx)", () => {
     const og = metadata.openGraph;
     expect(og).toBeDefined();
-    expect((og as { title: string }).title).toMatch(/Molecule AI/);
+    expect((og as { title: string }).title).toMatch(/Enter OS/);
     expect((og as { description: string }).description.length).toBeGreaterThan(
       50,
     );

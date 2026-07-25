@@ -139,6 +139,20 @@ CANVAS_APP_IMAGE="${CANVAS_APP_IMAGE:-registry.moleculesai.app/molecule-ai/canva
 # workflow's PROD_CANVAS_APP_CONTAINER. Left empty so the fleet roll never
 # clobbers the central staging-app container.
 STAGING_CANVAS_APP_CONTAINER="${STAGING_CANVAS_APP_CONTAINER:-}"
+# ── Brand prefix set (Enter OS rebrand, internal#1089) ───────────────────────
+# Resource NAMES on a host may carry EITHER brand generation's prefix: legacy
+# "mol" (mol-ws-rtstate-<id>, mol-tenant-<slug>) and "enteros" (the future SDK
+# ResourcePrefix; "mol" stays in LegacyResourcePrefixes()). Every name matcher
+# in this script MUST be derived from this ONE list — never a scattered
+# hardcoded alternation — so the SDK-side prefix flip cannot blind the fleet
+# scripts to one generation of resources. Tenant DISCOVERY is label-driven
+# (molecule.local-tenant / molecule.cp-env) and therefore prefix-agnostic;
+# only the rtstate session-volume guard matches names.
+BRAND_PREFIXES="${BRAND_PREFIXES:-mol enteros}"
+# shellcheck disable=SC2086  # word-splitting of BRAND_PREFIXES is intended
+_BRAND_ALT="$(printf '%s\n' $BRAND_PREFIXES | paste -sd'|' -)"
+# Session (rtstate) volume names: <prefix>-ws-rtstate-<id>, both generations.
+RTSTATE_VOL_RE="^(${_BRAND_ALT})-ws-rtstate-"
 CP_ENV="staging"
 IMAGE="" ; TAG="" ; DRY_RUN=0
 # ONLY: optional substring — when set, restricts the roll to tenant containers
@@ -268,7 +282,7 @@ fi
 RTSTATE_GUARD=1
 RTSTATE_BEFORE=()
 if volout="$(docker volume ls --format '{{.Name}}' 2>/dev/null)"; then
-  mapfile -t RTSTATE_BEFORE < <(printf '%s\n' "$volout" | grep -E '^mol-ws-rtstate-' | sort || true)
+  mapfile -t RTSTATE_BEFORE < <(printf '%s\n' "$volout" | grep -E "$RTSTATE_VOL_RE" | sort || true)
   log "session (rtstate) volumes present before roll: ${#RTSTATE_BEFORE[@]}"
 else
   RTSTATE_GUARD=0
@@ -538,7 +552,7 @@ fi
 # snapshot note; the swap touched only stateless mol-tenant-* containers by
 # construction, so nothing could have removed a volume.
 if [ "$RTSTATE_GUARD" = 1 ]; then
-  mapfile -t RTSTATE_AFTER < <(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E '^mol-ws-rtstate-' | sort || true)
+  mapfile -t RTSTATE_AFTER < <(docker volume ls --format '{{.Name}}' 2>/dev/null | grep -E "$RTSTATE_VOL_RE" | sort || true)
   LOST=0
   for v in "${RTSTATE_BEFORE[@]}"; do
     printf '%s\n' "${RTSTATE_AFTER[@]}" | grep -qxF "$v" || { echo "::error::session volume $v was REMOVED by the fleet roll (session-preservation VIOLATED)" >&2; LOST=1; }

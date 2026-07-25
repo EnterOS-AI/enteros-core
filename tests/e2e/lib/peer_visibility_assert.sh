@@ -71,6 +71,7 @@ pv_assert_runtime() {
   set +e
   resp=$(curl -sS -X POST "$base_url/workspaces/$wid/mcp" \
     -H "Authorization: Bearer $wtok" \
+    ${PV_ROUTE_HDRS[@]+"${PV_ROUTE_HDRS[@]}"} \
     ${org_header[@]+"${org_header[@]}"} \
     -H "Content-Type: application/json" \
     -d "$PV_RPC_BODY" \

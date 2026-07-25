@@ -97,6 +97,13 @@ func TestTarHostDirWithPrefix_HappyPath(t *testing.T) {
 		if !strings.HasPrefix(hdr.Name, prefix) {
 			t.Errorf("entry %q does not start with prefix %q", hdr.Name, prefix)
 		}
+		// Tar names are slash-only by spec: a backslash entry (what
+		// filepath.Join produced on Windows hosts pre-fix) extracts on the
+		// Linux daemon as ONE flat literal-backslash filename in `/` — the
+		// 2026-07-19 concierge-without-management-MCP incident.
+		if strings.Contains(hdr.Name, `\`) {
+			t.Errorf("entry %q contains a backslash — Windows-host path separator leaked into the tar", hdr.Name)
+		}
 		if hdr.Typeflag == tar.TypeReg {
 			body, err := io.ReadAll(tr)
 			if err != nil {

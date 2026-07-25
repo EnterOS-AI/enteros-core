@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -282,6 +284,7 @@ type dockerClient interface {
 	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
 	ContainerExecAttach(ctx context.Context, execID string, config container.ExecAttachOptions) (types.HijackedResponse, error)
 	ContainerExecCreate(ctx context.Context, container string, config container.ExecOptions) (container.ExecCreateResponse, error)
+	ContainerExecInspect(ctx context.Context, execID string) (container.ExecInspect, error)
 	ContainerInspect(ctx context.Context, container string) (container.InspectResponse, error)
 	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
 	ContainerLogs(ctx context.Context, container string, options container.LogsOptions) (io.ReadCloser, error)
@@ -344,7 +347,9 @@ func (p *Provisioner) buildLocalImageWithTelemetry(ctx context.Context, workspac
 		fmt.Sprintf("building %s runtime image from template — a first boot can take several minutes", runtime))
 	start := time.Now()
 	done := make(chan struct{})
+	hbStopped := make(chan struct{})
 	go func() {
+		defer close(hbStopped)
 		t := time.NewTicker(buildHeartbeatInterval)
 		defer t.Stop()
 		for {
@@ -359,6 +364,13 @@ func (p *Provisioner) buildLocalImageWithTelemetry(ctx context.Context, workspac
 	}()
 	tag, err := ensureLocalImageHook(ctx, runtime)
 	close(done)
+	// JOIN the heartbeat before emitting the completion line: close(done)
+	// only signals it, and an already-in-flight tick could land AFTER the
+	// completion, leaving "still building — Ns elapsed" as the log's last
+	// line (canvas watchdog reads that as an unfinished build; also the
+	// TestBuildTelemetrySlowBuild CI flake). The completion line must be
+	// terminal.
+	<-hbStopped
 	if err != nil {
 		return "", err
 	}
@@ -1435,30 +1447,43 @@ func buildTemplateTar(templatePath string) (*bytes.Buffer, error) {
 		if err != nil {
 			return err
 		}
-		header.Name = rel
+		// Tar entry names MUST use forward slashes: filepath.Rel returns
+		// `scripts\boot.sh` on a Windows host, and the Linux docker daemon
+		// would extract that as a flat FILE literally named "scripts\boot.sh"
+		// at /configs root instead of a scripts/ directory — the workspace
+		// boots without its nested config layout.
+		header.Name = wirepath.Normalize(rel)
 
+		if info.IsDir() {
+			return tw.WriteHeader(header)
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		// Strip CRLF from shell scripts and Python files. Windows
+		// git checkout introduces \r\n even with .gitattributes eol=lf;
+		// Linux containers choke on \r in shebangs and Python path args.
+		// This is the single fix point — every file that enters a
+		// container passes through CopyTemplateToContainer. Extension is
+		// case-folded: NTFS is case-insensitive, so SETUP.SH is a normal
+		// occurrence that must strip identically to setup.sh.
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext == ".sh" || ext == ".py" || ext == ".md" {
+			data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+		}
+		// Size MUST be set before WriteHeader: the strip above shrinks the
+		// data below the on-disk size FileInfoHeader recorded, and mutating
+		// the header after writing it does nothing — the tar would declare
+		// more bytes than follow and fail with "missed writing N bytes"
+		// (every Windows-host provision died at copy-template this way).
+		header.Size = int64(len(data))
 		if err := tw.WriteHeader(header); err != nil {
 			return err
 		}
-
-		if !info.IsDir() {
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			// Strip CRLF from shell scripts and Python files. Windows
-			// git checkout introduces \r\n even with .gitattributes eol=lf;
-			// Linux containers choke on \r in shebangs and Python path args.
-			// This is the single fix point — every file that enters a
-			// container passes through CopyTemplateToContainer.
-			ext := filepath.Ext(path)
-			if ext == ".sh" || ext == ".py" || ext == ".md" {
-				data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
-			}
-			header.Size = int64(len(data))
-			if _, err := tw.Write(data); err != nil {
-				return err
-			}
+		if _, err := tw.Write(data); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -1488,10 +1513,15 @@ func buildConfigFilesTar(files map[string][]byte) (*bytes.Buffer, error) {
 	tw := tar.NewWriter(&buf)
 
 	createdDirs := map[string]bool{}
-	for name, data := range files {
+	for rawName, data := range files {
+		// Tar entry names are container (Linux) paths: normalize to forward
+		// slashes and use path.Dir, never filepath.* — on a Windows host
+		// filepath.Dir("a/b/c") returns `a\b`, and a backslash dir header
+		// extracts on the Linux daemon as a flat literal-backslash file.
+		name := wirepath.Normalize(rawName)
 		// Create parent directories in tar (deduplicated)
-		dir := filepath.Dir(name)
-		if dir != "." && !createdDirs[dir] {
+		dir := path.Dir(name)
+		if dir != "." && dir != "/" && !createdDirs[dir] {
 			if err := tw.WriteHeader(&tar.Header{
 				Typeflag: tar.TypeDir,
 				Name:     dir + "/",
@@ -1512,10 +1542,10 @@ func buildConfigFilesTar(files map[string][]byte) (*bytes.Buffer, error) {
 			Gid:  AgentGID,
 		}
 		if err := tw.WriteHeader(header); err != nil {
-			return nil, fmt.Errorf("failed to write tar header for %s: %w", name, err)
+			return nil, fmt.Errorf("failed to write tar header for %s: %w", rawName, err)
 		}
 		if _, err := tw.Write(data); err != nil {
-			return nil, fmt.Errorf("failed to write tar data for %s: %w", name, err)
+			return nil, fmt.Errorf("failed to write tar data for %s: %w", rawName, err)
 		}
 	}
 	if err := tw.Close(); err != nil {
@@ -1570,6 +1600,16 @@ func (p *Provisioner) ExecRead(ctx context.Context, containerName, filePath stri
 		}
 		clean = append(clean, data[8:8+size]...)
 		data = data[8+size:]
+	}
+	// Surface the exit code: without this, `cat` on a missing file returned
+	// (nil bytes, nil error) — indistinguishable from an empty file — and
+	// callers persisted the empty read instead of using their volume fallback.
+	inspect, ierr := p.cli.ContainerExecInspect(ctx, exec.ID)
+	if ierr != nil {
+		return clean, fmt.Errorf("exec inspect (cat %s): %w", filePath, ierr)
+	}
+	if inspect.ExitCode != 0 {
+		return clean, fmt.Errorf("exec cat %s: exit %d", filePath, inspect.ExitCode)
 	}
 	return clean, nil
 }

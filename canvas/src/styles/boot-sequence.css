@@ -1,214 +1,367 @@
 /**
  * "Enter OS" boot-sequence module.
  *
- * Loaded globally (see app/globals.css). Styles the 3D keycaps, the
- * ENTER OS key, and the watchdog log for BootSequenceScreen.tsx —
- * effects (sculpted keycap box-shadow stacks, press-in / pop-up
- * transforms, breathe / shake keyframes) that Tailwind utilities can't
- * express cleanly. Layout, spacing and the semantic color roles stay in
- * the component via Tailwind; only the tactile keycap physics live here.
+ * Loaded globally (see app/globals.css). Styles BootSequenceScreen.tsx to
+ * match the approved "Enter OS — Workspace Boot Sequence" mockup (artifact
+ * bbc372b1 — the design SSOT): a CENTERED card (max-width ~940px) on a
+ * near-black page with faint violet glows — never a full-bleed stretch —
+ * all-mono typography, flat-sculpted keycaps in a 7+spacebar grid, a
+ * violet progress bar, a grammar-highlighted watchdog log, and an ENTER OS
+ * bar that arms violet and plays a light-sweep on entry.
  *
- * Palette maps onto the canvas semantic tokens (globals.css @theme):
- *   accent (--color-accent)  → brand / "armed" glow
- *   warm   (--color-warm)    → a step that is currently running
- *   good   (--color-good)    → a completed step
- *   bad    (--color-bad)     → a failed step
- * Local --mol-boot-* vars below capture the keycap sculpting rgba stacks
- * that have no semantic-token equivalent (pure 3D-shading values).
+ * Palette is pinned here as --eos-* vars (sampled from the mockup — it
+ * uses the canvas DARK semantics: violet accent, amber running, green ok)
+ * so the surrounding app theme can never wash the screen out; the boot
+ * screen renders identically in light and dark app themes.
  *
  * Component contract — BootSequenceScreen adds these classes:
- *   .mol-boot-key            base keycap (idle / dim)
- *   .mol-boot-key.is-active  pressed-in + amber glow (step running)
- *   .mol-boot-key.is-done    popped-up + green ring (step ok)
- *   .mol-boot-key.is-failed  red ring + shake (step failed)
- *   .mol-boot-enter          the ENTER OS key (locked by default)
- *   .mol-boot-enter.is-armed pulsing purple (ready → press to enter)
- *   .mol-boot-enter.is-hit   struck (transition to chat)
+ *   .mol-boot                 page wrapper (near-black + violet glows)
+ *   .mol-boot-card            the centered card
+ *   .mol-boot-icon            violet return-key tile in the header
+ *   .mol-boot-key             base keycap (idle / dim)
+ *   .mol-boot-key.is-waiting  pre-telemetry wave (staggered via --mol-boot-i)
+ *   .mol-boot-key.is-active   amber ring + sweeping underline (running)
+ *   .mol-boot-key.is-done     popped face + green ring/underline (ok)
+ *   .mol-boot-key.is-failed   red ring + shake (failed)
+ *   .mol-boot-key-fill        per-key underline fill
+ *   .mol-boot-bar-indeterminate  sweeping progress stripe (no telemetry yet)
+ *   .mol-boot-enter           the ENTER OS bar (locked by default)
+ *   .mol-boot-enter.is-armed  violet ring + glow + light sweep (entering)
+ *   .mol-boot-enter.is-hit    struck (transition to chat)
+ *   .mol-boot-logline         watchdog log line entrance
+ *   .mol-boot-log-kw          green keyword highlight inside a log line
+ *   .mol-boot-log-ref         violet reference highlight (ports, packages)
  *
  * Reduced motion handled at the bottom, matching the other modules.
  */
 
-:root {
-  /* Keycap sculpting — neutral 3D shading with no semantic-token twin. */
-  --mol-boot-key-face: linear-gradient(180deg, #2b323f 0%, #20262f 47%, #181d26 100%);
-  --mol-boot-key-face-active: linear-gradient(180deg, #352f3d 0%, #29232e 50%, #211b26 100%);
-  --mol-boot-key-face-failed: linear-gradient(180deg, #39292c 0%, #2c2023 50%, #231a1c 100%);
-  --mol-boot-key-stack:
-    0 1px 0 #1a1f28, 0 2px 0 #171b22, 0 3px 0 #14181f,
-    0 4px 0 #11141b, 0 5px 0 #0e1116, 0 6px 0 #0b0d12,
-    0 14px 22px -7px rgba(0, 0, 0, 0.72);
+.mol-boot {
+  /* Enter OS boot palette (SSOT: the bbc372b1 boot-sequence mockup). */
+  --eos-page: #0b0b0e;
+  --eos-card: #15151a;
+  --eos-deck: #0f0f13;
+  --eos-key: #1b1b21;
+  --eos-key-hi: #232329;
+  --eos-border: rgba(255, 255, 255, 0.08);
+  --eos-fg: #ececf1;
+  --eos-fg-muted: rgba(236, 236, 241, 0.6);
+  --eos-fg-dim: rgba(236, 236, 241, 0.38);
+  --eos-accent: #8b7cff;
+  --eos-accent-strong: #6d5ef0;
+  --eos-warm: #f5b95e;
+  --eos-good: #7ed9a7;
+  --eos-bad: #f38b8b;
+  /* Motion — one standard ease + one spring for the "pop" moments. */
+  --eos-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --eos-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  background:
+    radial-gradient(600px 400px at 12% 0%, rgba(139, 124, 255, 0.05), transparent 70%),
+    radial-gradient(700px 500px at 95% 100%, rgba(139, 124, 255, 0.07), transparent 70%),
+    var(--eos-page);
+  color: var(--eos-fg);
+  font-family: var(--font-jetbrains, ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace);
+}
+
+/* The centered card — the mockup never stretches content full-bleed. */
+.mol-boot-card {
+  width: 100%;
+  max-width: 940px;
+  margin: 0 auto;
+  background: var(--eos-card);
+  border: 1px solid var(--eos-border);
+  border-radius: 16px;
+  box-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.8);
+}
+
+/* Violet return-key tile in the card header. */
+.mol-boot-icon {
+  background: linear-gradient(180deg, #9187fb 0%, #6d5ef0 100%);
+  border-radius: 10px;
+  box-shadow:
+    0 0 0 1px rgba(139, 124, 255, 0.35),
+    0 8px 22px -8px rgba(139, 124, 255, 0.65);
 }
 
 /* ────────────────────────────────────────────────────────
-   Keycaps
+   Keycaps — flat-sculpted, per the mockup (subtle gradient face,
+   1px ring, colored underline), not heavy 3D stacks.
    ──────────────────────────────────────────────────────── */
 .mol-boot-key {
   position: relative;
-  opacity: 0.5;
-  border-radius: 10px 10px 14px 14px;
-  background: var(--mol-boot-key-face);
+  opacity: 0.45;
+  border-radius: 9px;
+  background: linear-gradient(180deg, #1f1f26 0%, var(--eos-key) 100%);
+  border: 1px solid var(--eos-border);
   box-shadow:
-    inset 0 1.5px 0 rgba(255, 255, 255, 0.14),
-    inset 0 -10px 16px rgba(0, 0, 0, 0.36),
-    var(--mol-boot-key-stack);
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 3px 0 rgba(0, 0, 0, 0.35),
+    0 10px 18px -10px rgba(0, 0, 0, 0.7);
   transform: translateY(0);
   transition:
-    transform 130ms var(--mol-easing-emphasize),
-    box-shadow 220ms ease,
-    opacity 300ms ease,
-    background 300ms ease;
-}
-/* Specular highlight across the top face. */
-.mol-boot-key::before {
-  content: "";
-  position: absolute;
-  left: 9px;
-  right: 9px;
-  top: 8px;
-  height: 34%;
-  border-radius: 8px 8px 20px 20px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0));
-  pointer-events: none;
+    transform 160ms var(--eos-spring),
+    box-shadow 220ms var(--eos-ease),
+    border-color 220ms var(--eos-ease),
+    opacity 300ms var(--eos-ease),
+    background 300ms var(--eos-ease);
 }
 
-/* Pressed-in + glowing while the step is working. */
+/* Waiting for telemetry (indeterminate boot) — a staggered wave sweeping
+   the deck so the pre-telemetry screen visibly works instead of sitting
+   frozen. Stagger from the per-keycap --mol-boot-i index. */
+.mol-boot-key.is-waiting {
+  animation: mol-boot-waiting 2.4s var(--eos-ease) infinite;
+  animation-delay: calc(var(--mol-boot-i, 0) * 200ms);
+}
+@keyframes mol-boot-waiting {
+  0%, 100% { opacity: 0.45; transform: translateY(0); }
+  10% { opacity: 0.9; transform: translateY(1px); }
+  26% { opacity: 0.45; transform: translateY(0); }
+}
+
+/* Running — pressed in, amber ring + soft glow, breathing. */
 .mol-boot-key.is-active {
   opacity: 1;
-  transform: translateY(4px);
-  background: var(--mol-boot-key-face-active);
+  transform: translateY(2px);
+  background: linear-gradient(180deg, #2b2418 0%, #221d15 100%);
+  border-color: color-mix(in srgb, var(--eos-warm) 55%, transparent);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.1),
-    inset 0 -7px 14px rgba(0, 0, 0, 0.36),
-    0 1px 0 #1a1f28, 0 2px 0 #171b22,
-    0 0 0 1px color-mix(in srgb, var(--color-warm) 50%, transparent),
-    0 12px 30px -10px color-mix(in srgb, var(--color-warm) 60%, transparent);
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 2px 0 rgba(0, 0, 0, 0.35),
+    0 10px 26px -10px color-mix(in srgb, var(--eos-warm) 45%, transparent);
   animation: mol-boot-breathe 1.7s ease-in-out infinite;
 }
+@keyframes mol-boot-breathe {
+  0%, 100% {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.05),
+      0 2px 0 rgba(0, 0, 0, 0.35),
+      0 8px 22px -12px color-mix(in srgb, var(--eos-warm) 35%, transparent);
+  }
+  50% {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.05),
+      0 2px 0 rgba(0, 0, 0, 0.35),
+      0 14px 32px -8px color-mix(in srgb, var(--eos-warm) 60%, transparent);
+  }
+}
 
-/* Popped back up, lit as done. */
+/* Done — popped back up with a small spring, lighter face, green ring. */
 .mol-boot-key.is-done {
   opacity: 1;
-  transform: translateY(1px);
+  transform: translateY(0);
+  background: linear-gradient(180deg, #26262d 0%, var(--eos-key-hi) 100%);
+  border-color: color-mix(in srgb, var(--eos-good) 40%, transparent);
+  animation: mol-boot-pop 420ms var(--eos-spring);
   box-shadow:
-    inset 0 1.5px 0 rgba(255, 255, 255, 0.13),
-    inset 0 -9px 15px rgba(0, 0, 0, 0.34),
-    0 1px 0 #1a1f28, 0 2px 0 #171b22, 0 3px 0 #14181f, 0 4px 0 #11141b, 0 5px 0 #0e1116,
-    0 0 0 1px color-mix(in srgb, var(--color-good) 42%, transparent),
-    0 13px 22px -10px color-mix(in srgb, var(--color-good) 32%, transparent);
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 3px 0 rgba(0, 0, 0, 0.35),
+    0 12px 22px -12px color-mix(in srgb, var(--eos-good) 30%, transparent);
+}
+@keyframes mol-boot-pop {
+  0% { transform: translateY(2px); }
+  55% { transform: translateY(-2px); }
+  100% { transform: translateY(0); }
 }
 
 /* Failed — red ring + a short shake. */
 .mol-boot-key.is-failed {
   opacity: 1;
-  transform: translateY(2px);
-  background: var(--mol-boot-key-face-failed);
+  transform: translateY(1px);
+  background: linear-gradient(180deg, #2c1b1d 0%, #221518 100%);
+  border-color: color-mix(in srgb, var(--eos-bad) 60%, transparent);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.08),
-    inset 0 -7px 13px rgba(0, 0, 0, 0.36),
-    0 1px 0 #1a1f28, 0 2px 0 #171b22,
-    0 0 0 1px color-mix(in srgb, var(--color-bad) 55%, transparent),
-    0 12px 32px -10px color-mix(in srgb, var(--color-bad) 55%, transparent);
-  animation: mol-boot-shake 0.42s ease;
-}
-
-@keyframes mol-boot-breathe {
-  0%, 100% {
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.1),
-      inset 0 -7px 14px rgba(0, 0, 0, 0.36),
-      0 1px 0 #1a1f28, 0 2px 0 #171b22,
-      0 0 0 1px color-mix(in srgb, var(--color-warm) 35%, transparent),
-      0 10px 26px -12px color-mix(in srgb, var(--color-warm) 40%, transparent);
-  }
-  50% {
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.1),
-      inset 0 -7px 14px rgba(0, 0, 0, 0.36),
-      0 1px 0 #1a1f28, 0 2px 0 #171b22,
-      0 0 0 1px color-mix(in srgb, var(--color-warm) 70%, transparent),
-      0 16px 36px -8px color-mix(in srgb, var(--color-warm) 62%, transparent);
-  }
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 2px 0 rgba(0, 0, 0, 0.35),
+    0 12px 30px -10px color-mix(in srgb, var(--eos-bad) 50%, transparent);
+  animation: mol-boot-shake 0.42s var(--eos-ease);
 }
 @keyframes mol-boot-shake {
-  0%, 100% { transform: translate(0, 2px); }
-  25% { transform: translate(-3px, 2px); }
-  50% { transform: translate(3px, 2px); }
-  75% { transform: translate(-2px, 2px); }
+  0%, 100% { transform: translate(0, 1px); }
+  25% { transform: translate(-3px, 1px); }
+  50% { transform: translate(3px, 1px); }
+  75% { transform: translate(-2px, 1px); }
 }
 
-/* Per-key progress bar fill — colored by state via currentColor. */
+/* Per-key underline fill — color/glow owned entirely by the keycap state
+   classes (the component only sets the width), so there is no inline-style
+   vs stylesheet ownership split. While running, an amber band sweeps along
+   the fill (the mockup's NET/RUN treatment) so even a long step reads as
+   alive. */
 .mol-boot-key-fill {
-  transition: width 500ms var(--mol-easing-standard);
+  transition: width 500ms var(--eos-ease);
+}
+.mol-boot-key.is-done .mol-boot-key-fill {
+  background: var(--eos-good);
+  box-shadow: 0 0 8px var(--eos-good);
+}
+.mol-boot-key.is-failed .mol-boot-key-fill {
+  background: var(--eos-bad);
+  box-shadow: 0 0 8px var(--eos-bad);
+}
+.mol-boot-key.is-active .mol-boot-key-fill {
+  background-color: var(--eos-warm);
+  background-image: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--eos-warm) 25%, transparent) 0%,
+    var(--eos-warm) 45%,
+    color-mix(in srgb, var(--eos-warm) 25%, transparent) 90%
+  );
+  background-size: 180% 100%;
+  box-shadow: 0 0 8px var(--eos-warm);
+  animation: mol-boot-sheen 1.5s linear infinite;
+}
+@keyframes mol-boot-sheen {
+  from { background-position: 160% 0; }
+  to { background-position: -60% 0; }
 }
 
 /* ────────────────────────────────────────────────────────
-   ENTER OS key
+   Overall progress
+   ──────────────────────────────────────────────────────── */
+/* Indeterminate — a sweeping violet stripe while no boot telemetry has
+   arrived yet (pct would otherwise pin a dead bar at 0%). */
+.mol-boot-bar-indeterminate {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--eos-accent) 65%, transparent) 40%,
+    var(--eos-accent) 50%,
+    color-mix(in srgb, var(--eos-accent) 65%, transparent) 60%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  animation: mol-boot-bar-sweep 1.8s linear infinite;
+}
+@keyframes mol-boot-bar-sweep {
+  from { background-position: 200% 0; }
+  to { background-position: -100% 0; }
+}
+
+/* ────────────────────────────────────────────────────────
+   ENTER OS bar
    ──────────────────────────────────────────────────────── */
 .mol-boot-enter {
   position: relative;
   overflow: hidden;
-  border-radius: 14px;
-  background: linear-gradient(180deg, #1a1e27 0%, #12151c 100%);
+  border-radius: 12px;
+  color: var(--eos-fg-dim);
+  border: 1px solid var(--eos-border);
+  background: linear-gradient(180deg, #1a1a20 0%, #141419 100%);
   box-shadow:
-    0 6px 0 -1px #0e1119,
-    0 16px 40px -20px rgba(0, 0, 0, 0.8),
-    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 4px 0 rgba(0, 0, 0, 0.35),
+    0 14px 30px -18px rgba(0, 0, 0, 0.9);
   transition:
-    transform 120ms ease,
-    box-shadow 250ms ease,
-    color 300ms ease,
-    border-color 300ms ease;
+    transform 140ms var(--eos-ease),
+    box-shadow 250ms var(--eos-ease),
+    color 300ms var(--eos-ease),
+    border-color 300ms var(--eos-ease);
 }
+/* Armed / entering — violet ring + glow, text brightens, and a light
+   sweep travels the bar (the mockup's "ENTERING…" moment). */
 .mol-boot-enter.is-armed {
   cursor: pointer;
-  background: linear-gradient(180deg, #2a2564 0%, #1b1840 100%);
+  color: var(--eos-fg);
+  border-color: color-mix(in srgb, var(--eos-accent) 70%, transparent);
   box-shadow:
-    0 6px 0 -1px var(--color-accent-strong),
-    0 0 0 1px color-mix(in srgb, var(--color-accent) 50%, transparent),
-    0 24px 50px -22px var(--color-accent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.14);
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 0 0 1px color-mix(in srgb, var(--eos-accent) 35%, transparent),
+    0 0 34px -6px color-mix(in srgb, var(--eos-accent) 55%, transparent),
+    0 4px 0 rgba(0, 0, 0, 0.35);
   animation: mol-boot-armglow 1.8s ease-in-out infinite;
 }
-.mol-boot-enter.is-hit {
-  transform: translateY(6px);
-  animation: none;
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--color-accent) 60%, transparent),
-    0 0 60px 4px color-mix(in srgb, var(--color-accent) 50%, transparent),
-    inset 0 2px 8px rgba(0, 0, 0, 0.5);
+.mol-boot-enter.is-armed::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 20%,
+    rgba(255, 255, 255, 0.18) 45%,
+    rgba(255, 255, 255, 0.3) 50%,
+    rgba(255, 255, 255, 0.18) 55%,
+    transparent 80%
+  );
+  background-size: 250% 100%;
+  animation: mol-boot-enter-sweep 1.6s var(--eos-ease) infinite;
+  pointer-events: none;
+}
+@keyframes mol-boot-enter-sweep {
+  from { background-position: 220% 0; }
+  to { background-position: -120% 0; }
 }
 @keyframes mol-boot-armglow {
   0%, 100% {
     box-shadow:
-      0 6px 0 -1px var(--color-accent-strong),
-      0 0 0 1px color-mix(in srgb, var(--color-accent) 40%, transparent),
-      0 20px 44px -24px var(--color-accent);
+      inset 0 1px 0 rgba(255, 255, 255, 0.07),
+      0 0 0 1px color-mix(in srgb, var(--eos-accent) 30%, transparent),
+      0 0 26px -8px color-mix(in srgb, var(--eos-accent) 45%, transparent),
+      0 4px 0 rgba(0, 0, 0, 0.35);
   }
   50% {
     box-shadow:
-      0 6px 0 -1px var(--color-accent-strong),
-      0 0 0 1px color-mix(in srgb, var(--color-accent) 70%, transparent),
-      0 28px 60px -20px var(--color-accent);
+      inset 0 1px 0 rgba(255, 255, 255, 0.07),
+      0 0 0 1px color-mix(in srgb, var(--eos-accent) 55%, transparent),
+      0 0 44px -4px color-mix(in srgb, var(--eos-accent) 65%, transparent),
+      0 4px 0 rgba(0, 0, 0, 0.35);
   }
+}
+/* Struck — pressed flat, glow blooms as the card fades to the OS. */
+.mol-boot-enter.is-hit {
+  transform: translateY(3px);
+  animation: none;
+  color: var(--eos-fg);
+  border-color: var(--eos-accent);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--eos-accent) 70%, transparent),
+    0 0 60px 4px color-mix(in srgb, var(--eos-accent) 45%, transparent),
+    inset 0 2px 8px rgba(0, 0, 0, 0.5);
 }
 
 /* ────────────────────────────────────────────────────────
-   Watchdog log line-in
+   Watchdog log
    ──────────────────────────────────────────────────────── */
 .mol-boot-logline {
-  animation: mol-boot-fadein 0.3s forwards;
+  animation: mol-boot-fadein 0.3s var(--eos-ease) forwards;
 }
 @keyframes mol-boot-fadein {
   from { opacity: 0; transform: translateY(3px); }
   to { opacity: 1; transform: none; }
 }
+/* Keyword grammar inside a line (see renderBootLogText in the component):
+   green for state words (ready/OK/connected/ONLINE…), violet for
+   references (ports, package specs). */
+.mol-boot-log-kw {
+  color: var(--eos-good);
+  font-weight: 600;
+}
+.mol-boot-log-ref {
+  color: var(--eos-accent);
+}
+/* Thin visible scrollbar, like the mockup's log. */
+.mol-boot-log::-webkit-scrollbar {
+  width: 6px;
+}
+.mol-boot-log::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 3px;
+}
+.mol-boot-log::-webkit-scrollbar-track {
+  background: transparent;
+}
 
 @media (prefers-reduced-motion: reduce) {
   .mol-boot-key,
+  .mol-boot-key.is-waiting,
   .mol-boot-key.is-active,
+  .mol-boot-key.is-done,
   .mol-boot-key.is-failed,
+  .mol-boot-key.is-active .mol-boot-key-fill,
+  .mol-boot-bar-indeterminate,
   .mol-boot-enter,
   .mol-boot-enter.is-armed,
+  .mol-boot-enter.is-armed::after,
   .mol-boot-logline {
     animation: none !important;
     transition: none !important;

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/wirepath"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 	"github.com/gin-gonic/gin"
@@ -520,6 +521,39 @@ func (h *PluginsHandler) deliverViaDocker(ctx context.Context, workspaceID, cont
 		log.Printf("Plugin install: failed to copy %s to %s (container %s): %v", r.PluginName, workspaceID, containerName, err)
 		return false, newHTTPErr(http.StatusInternalServerError, gin.H{"error": "failed to copy plugin to container"})
 	}
+	// POST-DELIVERY VERIFICATION: read the manifest back from the live path
+	// before declaring success. The atomic pipeline's own error paths cover
+	// most failures, but a delivery whose extraction lands in the WRONG
+	// place with exit 0 (the 2026-07-19 Windows backslash-tar incident:
+	// every step "succeeded" while the plugin materialized as garbage in
+	// the container root) is only caught by verifying the artifact where
+	// the loader will look for it. Host-OS independent — this guard fires
+	// on the FIRST bad install, not on a later reconcile cycle.
+	//
+	// Two review-driven constraints (2026-07-19):
+	//   - Only verify plugin.yaml when the STAGED tree actually shipped one:
+	//     manifest-less plugins are legal (stagePlugin's SSOT block — missing
+	//     manifest is ADVISORY), so requiring it would 500 every such install.
+	//   - Hold the same per-(container,plugin) mutex as atomicCopyToContainer:
+	//     a concurrent install of the same plugin has a live-path-absent
+	//     window between its SNAPSHOT and SWAP steps; taking the lock means we
+	//     verify either before it starts or after it completes, never inside
+	//     that window.
+	if _, statErr := os.Stat(filepath.Join(r.StagedDir, "plugin.yaml")); statErr == nil {
+		verify := func() (string, error) {
+			lockKey := containerName + "\x00" + r.PluginName
+			mu, _ := atomicInstallLocks.LoadOrStore(lockKey, &sync.Mutex{})
+			mu.(*sync.Mutex).Lock()
+			defer mu.(*sync.Mutex).Unlock()
+			return h.execInContainer(ctx, containerName, []string{
+				"cat", "/configs/plugins/" + r.PluginName + "/plugin.yaml",
+			})
+		}
+		if out, verr := verify(); verr != nil || len(out) == 0 {
+			log.Printf("Plugin install: post-delivery verification FAILED for %s → %s (container %s): manifest unreadable at live path (err=%v)", r.PluginName, workspaceID, containerName, verr)
+			return false, newHTTPErr(http.StatusInternalServerError, gin.H{"error": "plugin delivered but not present at live path — delivery corrupt"})
+		}
+	}
 	h.execAsRoot(ctx, containerName, []string{
 		"chown", "-R", "1000:1000", "/configs/plugins/" + r.PluginName,
 	})
@@ -664,7 +698,11 @@ func streamDirAsTar(root string, tw *tar.Writer) error {
 		if err != nil {
 			return err
 		}
-		hdr.Name = rel
+		// Forward slashes always — filepath.Rel yields backslashes on a
+		// Windows host and the Linux-side unpack would create flat
+		// literal-backslash filenames (same defect as tarWalk; see its
+		// comment).
+		hdr.Name = wirepath.Normalize(rel)
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}

@@ -99,7 +99,7 @@ RUNTIME_DOWNLOAD="$(mktemp -d)" || RUNTIME_INSTALL_STATUS=$?
 if [ "$RUNTIME_INSTALL_STATUS" -eq 0 ]; then
   python3 -m pip download --no-deps --dest "$RUNTIME_DOWNLOAD" \
     --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ \
-    molecules-workspace-runtime==0.4.13 &&
+    molecules-workspace-runtime==0.4.36 &&
   python3 -m pip install --index-url https://pypi.org/simple/ \
     "$RUNTIME_DOWNLOAD"/molecules_workspace_runtime-*.whl
   RUNTIME_INSTALL_STATUS=$?
@@ -1249,7 +1249,7 @@ const externalOpenClawTemplate = tokenGuardShell + `# OpenClaw MCP config — ou
 # instead.
 
 # 1. Install the pinned workspace runtime wheel + openclaw CLI. The
-#    canonical 0.4.13 package includes the "molecule-mcp" console script,
+#    canonical 0.4.36 package includes the "molecule-mcp" console script,
 #    which keeps the workspace ALIVE on canvas (register-on-startup +
 #    20s heartbeat).
 ` + externalWorkspaceRuntimeInstall + `

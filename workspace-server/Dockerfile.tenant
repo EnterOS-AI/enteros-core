@@ -72,6 +72,12 @@ COPY workspace-server/ .
 # threaded through here, every tenant returns "dev" and the verification
 # fails closed — which is the correct fail-direction (#2395 root fix).
 ARG GIT_SHA=dev
+# BUILD_TAGS — Go build tags for the /platform binary. EMPTY by default, so a
+# normal build is byte-for-byte today's binary. The ephemeral CP happy-path gate
+# passes BUILD_TAGS=e2e_busy_inject to compile the test-only busy-inject route
+# (task #92) into its THROWAWAY tenant image only; no production/staging image is
+# ever built with a tag, so that route does not exist in shipped binaries.
+ARG BUILD_TAGS=""
 # Build flags (RFC#563):
 #   -trimpath           strip absolute build-host paths from the binary
 #   -ldflags "-s -w"    omit symbol table (-s) and DWARF debug info (-w)
@@ -83,6 +89,7 @@ ARG GIT_SHA=dev
 # Mirrors the pattern already in molecule-controlplane/Dockerfile.
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
+    -tags "${BUILD_TAGS}" \
     -ldflags "-s -w -X git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/buildinfo.GitSHA=${GIT_SHA}" \
     -o /platform ./cmd/server
 # Memory v2 sidecar binary (Memory v2 #2728). Bundled so an operator

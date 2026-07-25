@@ -2,7 +2,7 @@
 //
 // The mobile palette's CORE tokens must stay equal to the canonical canvas
 // @theme tokens in src/app/globals.css — the single source of truth for the
-// warm-paper + near-black-dark surfaces and the PURPLE brand accent. This
+// Enter OS light/dark surfaces and the brand accent. This
 // test PARSES globals.css (not a second hardcoded copy) and asserts the
 // mobile MOL_LIGHT / MOL_DARK core values match, so the two can't silently
 // re-diverge (the mobile UI once shipped a green accent + lighter surfaces).
@@ -78,9 +78,9 @@ describe("mobile palette ↔ canvas @theme SSOT", () => {
     expect(MOL_DARK.online).toBe(dark["good"]);
   });
 
-  it("the brand accent is the canvas purple, not the legacy mobile green", () => {
-    expect(MOL_LIGHT.accent.toLowerCase()).toBe("#7c3aed");
-    expect(MOL_DARK.accent.toLowerCase()).toBe("#a78bfa");
+  it("the brand accent is the canvas Enter OS accent, not the legacy mobile green", () => {
+    expect(MOL_LIGHT.accent.toLowerCase()).toBe("#6663d6");
+    expect(MOL_DARK.accent.toLowerCase()).toBe("#bdbbff");
     expect(MOL_LIGHT.accent).not.toBe("#2f9e6a");
   });
 });
