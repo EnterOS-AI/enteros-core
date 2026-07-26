@@ -98,7 +98,7 @@ func TestSessionContinuity_AllSurfacesConvergeOnStableContextID(t *testing.T) {
 		t.Errorf("restart-context contextId = %q, want %q — a restart would land in a DIFFERENT session than the user's chat (continuity break)", got, want)
 	}
 
-	greetBody, err := buildFirstBootGreetPayload(ws)
+	greetBody, err := buildFirstBootGreetPayload(ws, "wake-continuity")
 	if err != nil {
 		t.Fatalf("buildFirstBootGreetPayload: %v", err)
 	}

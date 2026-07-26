@@ -34,10 +34,13 @@ func stubTurn(t *testing.T, calls *[]string, status int, respBody string, retErr
 	}
 }
 
-func expectNoHistory(mock sqlmock.Sqlmock, wsID string) {
-	mock.ExpectQuery(`SELECT EXISTS`).
+// expectNotGreeted pins the greet-once gate reading the has_greeted boot marker
+// (RFC concierge rule 2 SSOT) and finding it UNSET — a fresh box that must
+// greet. Replaces the old derived activity_logs user-chat EXISTS query.
+func expectNotGreeted(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectQuery(`SELECT has_greeted FROM workspaces`).
 		WithArgs(wsID).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		WillReturnRows(sqlmock.NewRows([]string{"has_greeted"}).AddRow(false))
 }
 
 func expectWriterSend(mock sqlmock.Sqlmock, wsID, name string) {
@@ -47,6 +50,15 @@ func expectWriterSend(mock sqlmock.Sqlmock, wsID, name string) {
 	mock.ExpectExec(`INSERT INTO activity_logs.*'a2a_receive'.*'notify'`).
 		WithArgs(wsID, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+}
+
+// expectMarkGreeted pins the commit-on-delivery marker write that follows a
+// successful AgentMessageWriter.Send — has_greeted flips true ONLY after the
+// user has seen the greeting.
+func expectMarkGreeted(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectExec(`UPDATE workspaces SET has_greeted = true`).
+		WithArgs(wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
 func sentMessage(t *testing.T, emitter *capturingEmitter) string {
@@ -74,8 +86,9 @@ func TestFirstBootGreeting_UsesInCharacterAgentReply(t *testing.T) {
 			nil),
 	)
 
-	expectNoHistory(mock, "ws-first")
+	expectNotGreeted(mock, "ws-first")
 	expectWriterSend(mock, "ws-first", "Scout")
+	expectMarkGreeted(mock, "ws-first")
 
 	greet("ws-first", 0)
 
@@ -103,8 +116,9 @@ func TestFirstBootGreeting_FallsBackWhenTurnFails(t *testing.T) {
 		stubTurn(t, &calls, 502, `bad gateway`, nil),
 	)
 
-	expectNoHistory(mock, "ws-fb")
+	expectNotGreeted(mock, "ws-fb")
 	expectWriterSend(mock, "ws-fb", "Enter OS Agent")
+	expectMarkGreeted(mock, "ws-fb")
 
 	greet("ws-fb", 45)
 
@@ -132,8 +146,9 @@ func TestFirstBootGreeting_FallsBackOnErrorReply(t *testing.T) {
 		stubTurn(t, &calls, 200, `{"jsonrpc":"2.0","error":{"message":"boom"}}`, nil),
 	)
 
-	expectNoHistory(mock, "ws-err-reply")
+	expectNotGreeted(mock, "ws-err-reply")
 	expectWriterSend(mock, "ws-err-reply", "Agent")
+	expectMarkGreeted(mock, "ws-err-reply")
 
 	greet("ws-err-reply", 0)
 
@@ -174,7 +189,7 @@ func TestFirstBootGreeting_QueuedGreetSendsNothingSynchronously(t *testing.T) {
 				stubTurn(t, &calls, tc.status, tc.body, nil),
 			)
 
-			expectNoHistory(mock, "ws-queued")
+			expectNotGreeted(mock, "ws-queued")
 
 			greet("ws-queued", 0)
 
@@ -207,7 +222,7 @@ func TestFirstBootGreeting_BusyQueuedGreet_DrainDeliversRealReply(t *testing.T) 
 			`{"queued":true,"queue_id":"q-1","queue_depth":1,"message":"workspace agent busy — request queued"}`,
 			nil),
 	)
-	expectNoHistory(mock, wsID)
+	expectNotGreeted(mock, wsID)
 	greet(wsID, 0)
 	if len(emitter.events) != 0 {
 		t.Fatalf("busy-queued greet must send nothing synchronously, got %#v", emitter.events)
@@ -216,14 +231,15 @@ func TestFirstBootGreeting_BusyQueuedGreet_DrainDeliversRealReply(t *testing.T) 
 	// Half 2 — the queue drain dispatched the greet turn, got the agent's real
 	// in-character reply, and hands it to attachQueuedTurnCompletion. The
 	// self-first-boot-greet exception must DELIVER it (not skip it as an
-	// internal self-message).
-	reqBody, err := buildFirstBootGreetPayload(wsID)
+	// internal self-message) AND commit the has_greeted marker on delivery.
+	reqBody, err := buildFirstBootGreetPayload(wsID, "wake-busy-greet")
 	if err != nil {
 		t.Fatalf("buildFirstBootGreetPayload: %v", err)
 	}
 	realReply := `{"jsonrpc":"2.0","result":{"message":{"parts":[{"kind":"text","text":"Hey — I'm Scout, your research agent. Ask me to track a topic!"}]}}}`
 	h := &WorkspaceHandler{broadcaster: emitter}
 	expectWriterSend(mock, wsID, "Scout")
+	expectMarkGreeted(mock, wsID)
 	h.attachQueuedTurnCompletion(context.Background(), wsID, false, reqBody, []byte(realReply))
 	h.asyncWG.Wait()
 
@@ -247,12 +263,13 @@ func TestFirstBootGreeting_DrainedGreet_EmptyReplyFallsBack(t *testing.T) {
 	mock := setupTestDB(t)
 	emitter := &capturingEmitter{}
 	const wsID = "ws-drain-empty"
-	reqBody, err := buildFirstBootGreetPayload(wsID)
+	reqBody, err := buildFirstBootGreetPayload(wsID, "wake-drain-empty")
 	if err != nil {
 		t.Fatalf("buildFirstBootGreetPayload: %v", err)
 	}
 	h := &WorkspaceHandler{broadcaster: emitter}
 	expectWriterSend(mock, wsID, "Agent")
+	expectMarkGreeted(mock, wsID)
 	// An A2A-level error reply is not usable greeting prose.
 	h.attachQueuedTurnCompletion(context.Background(), wsID, false,
 		reqBody, []byte(`{"jsonrpc":"2.0","error":{"message":"boom"}}`))
@@ -297,8 +314,9 @@ func TestFirstBootGreeting_JSONShapedReplyFallsBack(t *testing.T) {
 		stubTurn(t, &calls, 200, `{"unexpected":"shape"}`, nil),
 	)
 
-	expectNoHistory(mock, "ws-json")
+	expectNotGreeted(mock, "ws-json")
 	expectWriterSend(mock, "ws-json", "Agent")
+	expectMarkGreeted(mock, "ws-json")
 
 	greet("ws-json", 0)
 
@@ -330,9 +348,10 @@ func TestFirstBootGreeting_ConcurrentInvocationsGreetOnce(t *testing.T) {
 		},
 	)
 
-	// Exactly ONE history check + ONE send may hit the DB.
-	expectNoHistory(mock, "ws-race")
+	// Exactly ONE marker check + ONE send + ONE marker write may hit the DB.
+	expectNotGreeted(mock, "ws-race")
 	expectWriterSend(mock, "ws-race", "Agent")
+	expectMarkGreeted(mock, "ws-race")
 
 	done := make(chan struct{})
 	go func() {
@@ -356,7 +375,12 @@ func TestFirstBootGreeting_ConcurrentInvocationsGreetOnce(t *testing.T) {
 	}
 }
 
-func TestFirstBootGreeting_SkipsWhenHistoryExists(t *testing.T) {
+func TestFirstBootGreeting_SkipsWhenAlreadyGreeted(t *testing.T) {
+	// RFC concierge rule 2: the greet-once gate now reads the has_greeted boot
+	// marker (SSOT), NOT a derived user-chat query. Marker SET (a greeted box
+	// being reconnected/restarted) stops everything: no agent turn, no lookup,
+	// no INSERT, no broadcast — the double-greet hole (greeted-but-user-silent)
+	// is closed because the gate no longer keys on whether the USER chatted.
 	mock := setupTestDB(t)
 	emitter := &capturingEmitter{}
 	var calls []string
@@ -365,11 +389,9 @@ func TestFirstBootGreeting_SkipsWhenHistoryExists(t *testing.T) {
 		stubTurn(t, &calls, 200, `{}`, nil),
 	)
 
-	// History present (a restart / reconnect, not a first boot) — the gate
-	// stops everything: no agent turn, no lookup, no INSERT, no broadcast.
-	mock.ExpectQuery(`SELECT EXISTS`).
+	mock.ExpectQuery(`SELECT has_greeted FROM workspaces`).
 		WithArgs("ws-restart").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		WillReturnRows(sqlmock.NewRows([]string{"has_greeted"}).AddRow(true))
 
 	greet("ws-restart", 45)
 
@@ -377,15 +399,16 @@ func TestFirstBootGreeting_SkipsWhenHistoryExists(t *testing.T) {
 		t.Errorf("DB expectations: %v", err)
 	}
 	if len(calls) != 0 {
-		t.Fatalf("expected no agent turn on non-first boot, got %d", len(calls))
+		t.Fatalf("expected no agent turn on already-greeted box, got %d", len(calls))
 	}
 	if len(emitter.events) != 0 {
-		t.Fatalf("expected no broadcast on non-first boot, got %#v", emitter.events)
+		t.Fatalf("expected no broadcast on already-greeted box, got %#v", emitter.events)
 	}
 }
 
-func TestFirstBootGreeting_SkipsOnHistoryCheckError(t *testing.T) {
-	// Fail CLOSED: an unreadable history must not risk a duplicate greeting.
+func TestFirstBootGreeting_SkipsOnMarkerCheckError(t *testing.T) {
+	// Fail CLOSED: an unreadable has_greeted marker must not risk a duplicate
+	// greeting.
 	mock := setupTestDB(t)
 	emitter := &capturingEmitter{}
 	var calls []string
@@ -394,14 +417,91 @@ func TestFirstBootGreeting_SkipsOnHistoryCheckError(t *testing.T) {
 		stubTurn(t, &calls, 200, `{}`, nil),
 	)
 
-	mock.ExpectQuery(`SELECT EXISTS`).
+	mock.ExpectQuery(`SELECT has_greeted FROM workspaces`).
 		WithArgs("ws-err").
 		WillReturnError(errDBDown)
 
 	greet("ws-err", 3)
 
 	if len(calls) != 0 || len(emitter.events) != 0 {
-		t.Fatalf("expected nothing on history-check error, got calls=%d events=%#v", len(calls), emitter.events)
+		t.Fatalf("expected nothing on marker-check error, got calls=%d events=%#v", len(calls), emitter.events)
+	}
+}
+
+func TestFirstBootGreeting_DeliveryCommitsMarker_NoReGreet(t *testing.T) {
+	// RFC concierge rule 2, the double-greet close: commit-on-delivery sets the
+	// has_greeted marker AFTER Send, so a later reconcile/restart greet reads the
+	// marker SET and skips. This is the exact hole the old derived user-chat
+	// query left open (greeted-but-user-silent re-greeted). Sequenced on ONE mock:
+	// boot 1 greets (gate unset → deliver → mark), boot 2 skips (gate set).
+	mock := setupTestDB(t)
+	emitter := &capturingEmitter{}
+	const wsID = "ws-commit-marker"
+	var calls []string
+	greet := FirstBootGreeter(
+		NewAgentMessageWriter(db.DB, emitter),
+		stubTurn(t, &calls, 200,
+			`{"jsonrpc":"2.0","result":{"message":{"parts":[{"kind":"text","text":"Hi, I'm Ada."}]}}}`,
+			nil),
+	)
+
+	// Boot 1 — fresh box: gate unset → agent turn → deliver → COMMIT marker.
+	expectNotGreeted(mock, wsID)
+	expectWriterSend(mock, wsID, "Ada")
+	expectMarkGreeted(mock, wsID)
+	greet(wsID, 0)
+
+	// Boot 2 — reconcile restart: gate now reads SET → skip entirely (no turn,
+	// no send, no second broadcast). Proves delivery-committed marker prevents
+	// the reconcile double-greet.
+	mock.ExpectQuery(`SELECT has_greeted FROM workspaces`).
+		WithArgs(wsID).
+		WillReturnRows(sqlmock.NewRows([]string{"has_greeted"}).AddRow(true))
+	greet(wsID, 0)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Errorf("agent turn ran %d times, want 1 (second boot must skip)", len(calls))
+	}
+	if len(emitter.events) != 1 {
+		t.Errorf("expected exactly ONE greeting broadcast across two boots, got %d", len(emitter.events))
+	}
+}
+
+func TestFirstBootGreeting_WakeKeyDedupsRetriedDelivery(t *testing.T) {
+	// RFC concierge rule 2, idempotency: the wake key
+	// (params.metadata.wake_idempotency_key, minted at decision time) dedups a
+	// RETRIED delivery of the SAME wake — the sync path racing its own drain, a
+	// double drain, or a replayed queue row. Two deliverFirstBootGreeting calls
+	// with the same key collapse to exactly ONE Send + ONE marker commit.
+	mock := setupTestDB(t)
+	emitter := &capturingEmitter{}
+	const wsID = "ws-wake-dedup"
+	const wakeKey = "wake-dedup-test-1"
+	writer := NewAgentMessageWriter(db.DB, emitter)
+
+	// Only the FIRST delivery may hit the DB (lookup + insert + marker write).
+	expectWriterSend(mock, wsID, "Agent")
+	expectMarkGreeted(mock, wsID)
+
+	if err := deliverFirstBootGreeting(context.Background(), writer, wsID, "Hello from the agent.", wakeKey); err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+	// Retry with the SAME wake key: must dedup — no Send, no marker write.
+	if err := deliverFirstBootGreeting(context.Background(), writer, wsID, "Hello AGAIN (retry).", wakeKey); err != nil {
+		t.Fatalf("retried delivery should no-op, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations (exactly one delivery): %v", err)
+	}
+	if len(emitter.events) != 1 {
+		t.Fatalf("wake key must dedup the retry to ONE broadcast, got %d", len(emitter.events))
+	}
+	if msg := sentMessage(t, emitter); !strings.Contains(msg, "Hello from the agent") {
+		t.Errorf("delivered message = %q, want the first delivery's text", msg)
 	}
 }
 

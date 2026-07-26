@@ -30,11 +30,16 @@ package handlers
 //     (the verified concierge flip AND ordinary workspaces' first register)
 //     via the late-wired nil-safe hook pattern (SetFirstBootGreeter). By
 //     construction the workspace is online and addressable when it fires.
-//   - GREET ONCE: skipped when the workspace already has ANY chat history
-//     (an `a2a_receive` row with source_id IS NULL — the exact predicate the
-//     chat-history reader uses, messagestore/postgres_store.go), so
-//     restarts and reconnects never re-greet. A restart after a failed
-//     FIRST boot has no history yet and correctly greets.
+//   - GREET ONCE (RFC concierge rule 2): gated on the workspaces.has_greeted
+//     boot marker — the SINGLE authoritative "has this box been greeted"
+//     signal (SSOT), read here and by restart-context arbitration. The marker
+//     is set true ONLY on CONFIRMED delivery (commit-on-delivery, after
+//     AgentMessageWriter.Send succeeds), so a decided-but-undelivered greet
+//     still greets on the next boot and a delivered one never re-greets. This
+//     REPLACES the old derived activity_logs query (which answered "has the
+//     USER chatted", not "has the box greeted" — the double-greet hole where a
+//     greeted-but-silent box re-greeted on reconnect). A restart after a
+//     FAILED first boot has no marker yet and correctly greets.
 
 import (
 	"context"
@@ -108,7 +113,12 @@ func firstBootFallbackText(toolCount int) string {
 // buildFirstBootGreetPayload wraps the greet prompt in the JSON-RPC 2.0 A2A
 // message/send shape the proxy normalizes — the same envelope restart-context
 // uses, with its own metadata kind so runtimes/forensics can identify it.
-func buildFirstBootGreetPayload(workspaceID string) ([]byte, error) {
+//
+// wakeKey is the decision-time wake idempotency key: it rides in the metadata
+// (additionalProperties-safe) so a busy-queued greet that drains later carries
+// the SAME key back, letting the delivery seam dedup a retried/re-drained wake
+// (RFC concierge rule 2, idempotency).
+func buildFirstBootGreetPayload(workspaceID, wakeKey string) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
@@ -128,10 +138,98 @@ func buildFirstBootGreetPayload(workspaceID string) ([]byte, error) {
 					// notice, never a blue user bubble.
 					"source_type":         firstBootGreetSourceType,
 					"first_boot_greeting": true,
+					// Wake idempotency key — threaded decision→delivery→marker.
+					"wake_idempotency_key": wakeKey,
 				},
 			},
 		},
 	})
+}
+
+// firstBootGreetDelivered dedups greeting DELIVERY on the wake idempotency key
+// (params.metadata.wake_idempotency_key, minted at decision time). has_greeted
+// is the durable SSOT, but it is committed only AFTER Send succeeds — so
+// between two racing deliveries of the SAME wake (the synchronous greet path
+// and its own busy-queued drain, a double drain, or a replayed queue row) the
+// marker is not set yet. LoadOrStore on the key makes that window
+// single-delivery: the first caller to claim the key delivers; a retry
+// carrying the same key no-ops. Cleared on Send failure so a genuine retry can
+// still deliver.
+var firstBootGreetDelivered sync.Map // wakeIdempotencyKey -> struct{}
+
+// markWorkspaceGreeted sets the has_greeted boot marker (SSOT) true. Called
+// ONLY after the greeting is CONFIRMED delivered (AgentMessageWriter.Send
+// returned nil), never at decision time — so the marker means "the user has
+// actually seen the greeting", closing both the decided-but-undelivered (lost)
+// and delivered-but-unreported (double) windows. Best-effort: a failed write
+// is logged, not fatal (the user already saw the greeting; worst case a rare
+// re-greet on the next boot, strictly better than a silent chat).
+func markWorkspaceGreeted(ctx context.Context, workspaceID string) {
+	if _, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET has_greeted = true WHERE id = $1`, workspaceID); err != nil {
+		log.Printf("first-boot greeting: failed to set has_greeted marker for %s: %v", workspaceID, err)
+	}
+}
+
+// workspaceHasGreeted reads the has_greeted boot marker (SSOT) — the single
+// authoritative answer to "has this workspace been greeted/booted", read by
+// BOTH the greet-once gate here AND restart-context arbitration.
+func workspaceHasGreeted(ctx context.Context, workspaceID string) (bool, error) {
+	var greeted bool
+	err := db.DB.QueryRowContext(ctx,
+		`SELECT has_greeted FROM workspaces WHERE id = $1`, workspaceID).Scan(&greeted)
+	return greeted, err
+}
+
+// firstBootWakeKey extracts the wake idempotency key stamped by
+// buildFirstBootGreetPayload. Checks params.metadata first (runtime-stamped
+// primary) then params.message.metadata (platform-stamped) — mirroring the
+// dual-location convention the greet-once/self-source readers use. "" when
+// absent or unparseable.
+func firstBootWakeKey(reqBody []byte) string {
+	var body struct {
+		Params struct {
+			Metadata struct {
+				WakeIdempotencyKey string `json:"wake_idempotency_key"`
+			} `json:"metadata"`
+			Message struct {
+				Metadata struct {
+					WakeIdempotencyKey string `json:"wake_idempotency_key"`
+				} `json:"metadata"`
+			} `json:"message"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(reqBody, &body); err != nil {
+		return ""
+	}
+	if body.Params.Metadata.WakeIdempotencyKey != "" {
+		return body.Params.Metadata.WakeIdempotencyKey
+	}
+	return body.Params.Message.Metadata.WakeIdempotencyKey
+}
+
+// deliverFirstBootGreeting is the SINGLE delivery seam for the first-boot
+// greeting, shared by the synchronous greet path (FirstBootGreeter) and the
+// busy-queued drain path (deliverDrainedFirstBootGreeting). It enforces
+// commit-on-delivery: has_greeted is set ONLY after Send succeeds, and the
+// wake idempotency key dedups a retried/re-drained delivery of the same wake.
+func deliverFirstBootGreeting(ctx context.Context, writer *AgentMessageWriter, workspaceID, text, wakeKey string) error {
+	if wakeKey != "" {
+		if _, alreadyDelivered := firstBootGreetDelivered.LoadOrStore(wakeKey, struct{}{}); alreadyDelivered {
+			log.Printf("first-boot greeting: wake %s already delivered for %s — dedup (no re-greet)", wakeKey, workspaceID)
+			return nil
+		}
+	}
+	if err := writer.Send(ctx, workspaceID, text, nil); err != nil {
+		// Let a genuine retry deliver — the wake did NOT reach the user.
+		if wakeKey != "" {
+			firstBootGreetDelivered.Delete(wakeKey)
+		}
+		return err
+	}
+	// Commit-on-delivery: the user has now seen the greeting.
+	markWorkspaceGreeted(ctx, workspaceID)
+	return nil
 }
 
 // FirstBootGreeter builds the greeting hook for RegistryHandler.
@@ -159,41 +257,31 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 		ctx, cancel := context.WithTimeout(context.Background(), firstBootGreetingTimeout)
 		defer cancel()
 
-		// Greet-once gate: any existing chat-history row means this is not a
-		// first boot. Fail CLOSED on a DB error (skip the greeting) — a
-		// duplicate greeting after every reconnect would be worse than a
-		// missed one.
-		var hasHistory bool
-		if err := db.DB.QueryRowContext(ctx, `
-			SELECT EXISTS(
-				SELECT 1 FROM activity_logs
-				WHERE workspace_id = $1
-				  AND activity_type = 'a2a_receive'
-				  AND source_id IS NULL
-				  -- Self-source platform/runtime turns (restart-context wake,
-				  -- heartbeat harvester, cron self-ticks...) are NOT user chat:
-				  -- they must not suppress the greeting (reviews wf_b8f98be3 #4,
-				  -- wf_8b04761b #4). The marker lives at params.metadata
-				  -- (primary, runtime-stamped) OR params.message.metadata
-				  -- (platform-stamped) — mirror RequestSourceType and check both.
-				  AND COALESCE(
-				        request_body->'params'->'metadata'->>'source_type',
-				        request_body->'params'->'message'->'metadata'->>'source_type',
-				        '') NOT LIKE 'self-%'
-			)`, workspaceID,
-		).Scan(&hasHistory); err != nil {
-			log.Printf("first-boot greeting: history check failed for %s (skipping): %v", workspaceID, err)
+		// Greet-once gate (RFC concierge rule 2): read the has_greeted boot
+		// marker — the single authoritative "has this box been greeted" signal
+		// (SSOT), the SAME marker restart-context arbitrates on. Set true only
+		// on confirmed delivery below, so a greeted box never re-greets and a
+		// failed first boot still greets. Fail CLOSED on a DB error (skip) — a
+		// duplicate greeting after every reconnect is worse than a missed one.
+		greeted, err := workspaceHasGreeted(ctx, workspaceID)
+		if err != nil {
+			log.Printf("first-boot greeting: has_greeted check failed for %s (skipping): %v", workspaceID, err)
 			return
 		}
-		if hasHistory {
+		if greeted {
 			return
 		}
+
+		// Mint the wake idempotency key at decision time; thread it through the
+		// greet payload (so a busy-queued drain carries it back) and the
+		// delivery seam so a retried/re-drained wake can't double-greet.
+		wakeKey := uuid.New().String()
 
 		// Ask the agent to greet in its own voice. logActivity=false — the
 		// writer below is the single chat entry point (no duplicate rows).
 		text := ""
 		if runTurn != nil {
-			if payload, err := buildFirstBootGreetPayload(workspaceID); err == nil {
+			if payload, err := buildFirstBootGreetPayload(workspaceID, wakeKey); err == nil {
 				status, resp, turnErr := runTurn(ctx, workspaceID, payload, "system:first-boot-greeting", false)
 				queued, _ := QueuedA2AResponse(resp)
 				switch {
@@ -232,10 +320,12 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 		}
 
 		// Deliver on a FRESH budget: a turn that ate the whole turn timeout
-		// must not starve the guaranteed (fallback) delivery of context.
+		// must not starve the guaranteed (fallback) delivery of context. The
+		// seam commits has_greeted on success (commit-on-delivery) and dedups
+		// on the wake key.
 		sendCtx, cancelSend := context.WithTimeout(context.Background(), greetSendTimeout)
 		defer cancelSend()
-		if err := writer.Send(sendCtx, workspaceID, text, nil); err != nil {
+		if err := deliverFirstBootGreeting(sendCtx, writer, workspaceID, text, wakeKey); err != nil {
 			log.Printf("first-boot greeting: send failed for %s: %v", workspaceID, err)
 			return
 		}

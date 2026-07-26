@@ -176,7 +176,7 @@ func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, works
 		// greet turn sent nothing; this drain carries the real reply, so deliver
 		// it rather than swallowing it as an internal self-message.
 		if st == firstBootGreetSourceType {
-			h.deliverDrainedFirstBootGreeting(ctx, workspaceID, respBody)
+			h.deliverDrainedFirstBootGreeting(ctx, workspaceID, reqBody, respBody)
 		}
 		return
 	}
@@ -228,20 +228,27 @@ func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, works
 // Runs async (goAsync) so the workspace-lookup + broadcast + persist never
 // stalls the drain loop, matching attachQueuedTurnCompletion's own async write.
 //
+// Commit-on-delivery (RFC concierge rule 2): routed through the shared
+// deliverFirstBootGreeting seam, so has_greeted is set only after Send succeeds
+// and the wake idempotency key (carried back in reqBody's metadata) dedups a
+// re-drained/retried delivery of the SAME wake — a fresh box greets exactly
+// once across the sync-return-then-drain handoff.
+//
 // Last-resort fallback: if the drained reply yields no usable prose (LLM error
 // / unknown shape), send the role-agnostic static greeting so a fresh
 // onboarding never opens on a silent chat — the ONLY case the fallback fires on
 // this path, and only because the queued reply genuinely arrived empty.
-func (h *WorkspaceHandler) deliverDrainedFirstBootGreeting(ctx context.Context, workspaceID string, respBody []byte) {
+func (h *WorkspaceHandler) deliverDrainedFirstBootGreeting(ctx context.Context, workspaceID string, reqBody, respBody []byte) {
 	text := greetingTextFromReply(respBody)
 	if text == "" {
 		text = firstBootFallbackText(0)
 	}
+	wakeKey := firstBootWakeKey(reqBody)
 	h.goAsync(func() {
 		sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), greetSendTimeout)
 		defer cancel()
 		writer := NewAgentMessageWriter(db.DB, h.broadcaster)
-		if err := writer.Send(sendCtx, workspaceID, text, nil); err != nil {
+		if err := deliverFirstBootGreeting(sendCtx, writer, workspaceID, text, wakeKey); err != nil {
 			log.Printf("first-boot greeting: drained real-reply delivery failed for %s: %v", workspaceID, err)
 			return
 		}
