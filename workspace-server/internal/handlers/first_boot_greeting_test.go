@@ -146,28 +146,143 @@ func TestFirstBootGreeting_FallsBackOnErrorReply(t *testing.T) {
 	}
 }
 
-func TestFirstBootGreeting_QueuedPollModeSendsNothing(t *testing.T) {
-	// Poll-mode short-circuit: the proxy queued the greet prompt and the
-	// agent will answer via /notify when it polls. Relaying anything now
-	// would post the raw queued envelope as the first chat bubble AND later
-	// duplicate the agent's real greeting.
+func TestFirstBootGreeting_QueuedGreetSendsNothingSynchronously(t *testing.T) {
+	// Both queued acks — the poll-mode {"status":"queued"} short-circuit AND
+	// the busy-target {"queued":true} enqueue — mean the proxy ACCEPTED the
+	// greet turn but has NOT answered it. The synchronous greeter must send
+	// NOTHING: not the raw envelope, and (RFC rule 1) not the premature static
+	// fallback either. The agent's real reply arrives later — via the queue
+	// drain (attachQueuedTurnCompletion) for a busy target, or the agent's own
+	// /notify for a poll-mode target — so relaying anything now would
+	// double-greet. Pins that the unified QueuedA2AResponse matcher recognizes
+	// both shapes.
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"poll-mode short-circuit", 200, `{"status":"queued","delivery_mode":"poll","method":"message/send"}`},
+		{"busy-target enqueue", 202, `{"queued":true,"queue_id":"q-1","queue_depth":1,"message":"workspace agent busy — request queued"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := setupTestDB(t)
+			emitter := &capturingEmitter{}
+			var calls []string
+			greet := FirstBootGreeter(
+				NewAgentMessageWriter(db.DB, emitter),
+				stubTurn(t, &calls, tc.status, tc.body, nil),
+			)
+
+			expectNoHistory(mock, "ws-queued")
+
+			greet("ws-queued", 0)
+
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("DB expectations: %v", err)
+			}
+			if len(emitter.events) != 0 {
+				t.Fatalf("queued greet must send nothing synchronously, got %#v", emitter.events)
+			}
+		})
+	}
+}
+
+func TestFirstBootGreeting_BusyQueuedGreet_DrainDeliversRealReply(t *testing.T) {
+	// RFC concierge rule 1, end to end: a BUSY-QUEUED greet turn must NOT emit
+	// the static fallback synchronously, and the agent's REAL reply — produced
+	// later and drained from a2a_queue — must be delivered via the
+	// AgentMessageWriter SSOT. The two halves collapse to exactly ONE greeting
+	// (dedup-safe).
 	mock := setupTestDB(t)
 	emitter := &capturingEmitter{}
+	const wsID = "ws-busy-greet"
+
+	// Half 1 — greet turn is busy-queued. Only the history check hits the DB;
+	// no writer Send, because the fallback must not fire on a queued ack.
 	var calls []string
 	greet := FirstBootGreeter(
 		NewAgentMessageWriter(db.DB, emitter),
-		stubTurn(t, &calls, 200, `{"status":"queued","delivery_mode":"poll","method":"message/send"}`, nil),
+		stubTurn(t, &calls, 202,
+			`{"queued":true,"queue_id":"q-1","queue_depth":1,"message":"workspace agent busy — request queued"}`,
+			nil),
 	)
+	expectNoHistory(mock, wsID)
+	greet(wsID, 0)
+	if len(emitter.events) != 0 {
+		t.Fatalf("busy-queued greet must send nothing synchronously, got %#v", emitter.events)
+	}
 
-	expectNoHistory(mock, "ws-poll")
-
-	greet("ws-poll", 0)
+	// Half 2 — the queue drain dispatched the greet turn, got the agent's real
+	// in-character reply, and hands it to attachQueuedTurnCompletion. The
+	// self-first-boot-greet exception must DELIVER it (not skip it as an
+	// internal self-message).
+	reqBody, err := buildFirstBootGreetPayload(wsID)
+	if err != nil {
+		t.Fatalf("buildFirstBootGreetPayload: %v", err)
+	}
+	realReply := `{"jsonrpc":"2.0","result":{"message":{"parts":[{"kind":"text","text":"Hey — I'm Scout, your research agent. Ask me to track a topic!"}]}}}`
+	h := &WorkspaceHandler{broadcaster: emitter}
+	expectWriterSend(mock, wsID, "Scout")
+	h.attachQueuedTurnCompletion(context.Background(), wsID, false, reqBody, []byte(realReply))
+	h.asyncWG.Wait()
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("DB expectations: %v", err)
 	}
+	msg := sentMessage(t, emitter) // exactly ONE broadcast total
+	if !strings.Contains(msg, "I'm Scout") {
+		t.Errorf("drained greeting should be the agent's real reply, got %q", msg)
+	}
+	if strings.Contains(msg, "online and ready") || strings.Contains(msg, "What are we building?") {
+		t.Errorf("real drained reply must not be replaced by the fallback: %q", msg)
+	}
+}
+
+func TestFirstBootGreeting_DrainedGreet_EmptyReplyFallsBack(t *testing.T) {
+	// The static fallback IS still the last resort on the drain-deliver path:
+	// if the drained greet reply carries no usable prose (LLM error / unknown
+	// shape), deliver the role-agnostic static greeting so the fresh chat is
+	// never silent.
+	mock := setupTestDB(t)
+	emitter := &capturingEmitter{}
+	const wsID = "ws-drain-empty"
+	reqBody, err := buildFirstBootGreetPayload(wsID)
+	if err != nil {
+		t.Fatalf("buildFirstBootGreetPayload: %v", err)
+	}
+	h := &WorkspaceHandler{broadcaster: emitter}
+	expectWriterSend(mock, wsID, "Agent")
+	// An A2A-level error reply is not usable greeting prose.
+	h.attachQueuedTurnCompletion(context.Background(), wsID, false,
+		reqBody, []byte(`{"jsonrpc":"2.0","error":{"message":"boom"}}`))
+	h.asyncWG.Wait()
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations: %v", err)
+	}
+	msg := sentMessage(t, emitter)
+	if strings.Contains(msg, "boom") {
+		t.Errorf("error reply leaked into the greeting: %q", msg)
+	}
+	if !strings.Contains(msg, "online and ready") {
+		t.Errorf("expected role-agnostic fallback, got %q", msg)
+	}
+}
+
+func TestAttachQueuedTurnCompletion_NonGreetSelfSourceStillSkipped(t *testing.T) {
+	// The first-boot exception must stay NARROW: every OTHER self-source turn
+	// (restart-context wake, harvester nudge) is an internal message the user
+	// must never see, so it stays skipped — no broadcast, no DB write.
+	setupTestDB(t) // no expectations => any DB call fails the test
+	emitter := &capturingEmitter{}
+	h := &WorkspaceHandler{broadcaster: emitter}
+	reqBody := []byte(`{"jsonrpc":"2.0","method":"message/send","params":{"metadata":{"source_type":"self-restart-context"},"message":{"messageId":"m1","parts":[{"kind":"text","text":"=== WORKSPACE RESTART CONTEXT ==="}]}}}`)
+	realReply := `{"jsonrpc":"2.0","result":{"message":{"parts":[{"kind":"text","text":"context noted"}]}}}`
+	h.attachQueuedTurnCompletion(context.Background(), "ws-rc", false, reqBody, []byte(realReply))
+	h.asyncWG.Wait()
 	if len(emitter.events) != 0 {
-		t.Fatalf("queued response must send nothing, got %#v", emitter.events)
+		t.Fatalf("non-greet self-source turn must not deliver, got %#v", emitter.events)
 	}
 }
 

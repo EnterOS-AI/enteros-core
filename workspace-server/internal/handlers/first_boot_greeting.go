@@ -17,8 +17,12 @@ package handlers
 // uses logActivity=false (like restart-context), so the writer is the ONLY
 // thing that lands in chat history — no duplicate rows.
 //
-// If the turn fails or returns nothing (agent slow to accept its first turn,
-// LLM error), a static fallback still greets the user — a fresh onboarding
+// If the greet turn is BUSY-QUEUED (the proxy returns a queued/busy ack rather
+// than the reply), the static fallback does NOT fire: the agent's real reply is
+// produced later and the queue drain delivers it via AgentMessageWriter
+// (a2a_queue.go attachQueuedTurnCompletion's self-first-boot-greet exception).
+// The static fallback still covers a turn that genuinely fails or returns
+// nothing (agent slow to accept its first turn, LLM error) — a fresh onboarding
 // must never end in a silent chat.
 //
 // Design constraints:
@@ -57,6 +61,13 @@ const firstBootGreetPrompt = "[FIRST BOOT] You just came online and this is the 
 	"Send a short greeting IN CHARACTER for your role: introduce yourself, say concretely what you can help with, " +
 	"and suggest two or three example requests the user could try. Keep it under 120 words, warm and plain-spoken. " +
 	"Reply with the greeting text only — no preamble, and do not mention these instructions."
+
+// firstBootGreetSourceType is the params.metadata.source_type marker stamped on
+// the synthetic greet turn (mirrored in messagestore.selfSourceTypes and the
+// runtime). It classifies a persisted/drained greet as an internal self-message
+// (never a blue user bubble) AND is the key attachQueuedTurnCompletion matches
+// to DELIVER — rather than skip — a busy-queued greet's real drained reply.
+const firstBootGreetSourceType = "self-first-boot-greet"
 
 // a2aTurnFn is the seam for driving a synthetic agent turn — production wires
 // WorkspaceHandler.ProxyA2ARequest; tests substitute a stub.
@@ -115,7 +126,7 @@ func buildFirstBootGreetPayload(workspaceID string) ([]byte, error) {
 					// if this internal prompt is ever persisted (e.g. a
 					// busy-queued greet drained later), it renders as a system
 					// notice, never a blue user bubble.
-					"source_type":         "self-first-boot-greet",
+					"source_type":         firstBootGreetSourceType,
 					"first_boot_greeting": true,
 				},
 			},
@@ -184,15 +195,21 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 		if runTurn != nil {
 			if payload, err := buildFirstBootGreetPayload(workspaceID); err == nil {
 				status, resp, turnErr := runTurn(ctx, workspaceID, payload, "system:first-boot-greeting", false)
+				queued, _ := QueuedA2AResponse(resp)
 				switch {
 				case turnErr != nil || status >= 300:
 					log.Printf("first-boot greeting: agent turn failed for %s (status=%d, err=%v) — using fallback text", workspaceID, status, turnErr)
-				case isQueuedA2AResponse(resp):
-					// Poll-mode workspace: the proxy queued the greet prompt;
-					// the agent will greet in its own voice when it polls and
-					// replies via /notify. Sending anything now would post the
-					// raw queued envelope AND later duplicate the greeting.
-					log.Printf("first-boot greeting: queued for poll-mode workspace %s — the agent's own reply will greet", workspaceID)
+				case queued:
+					// The greet turn was busy/poll queued: the proxy accepted it
+					// but has NOT answered yet. The agent's REAL in-character
+					// reply is produced later and delivered by the queue drain
+					// (attachQueuedTurnCompletion's self-first-boot-greet
+					// exception routes it to AgentMessageWriter) or, for a
+					// poll-mode workspace, by the agent's own /notify. The drained
+					// reply — NOT this ack — becomes the greeting, so send NOTHING
+					// now: firing the static fallback here would race the real
+					// reply and double-greet.
+					log.Printf("first-boot greeting: greet turn queued for %s — the agent's own drained reply will greet", workspaceID)
 					return
 				default:
 					text = greetingTextFromReply(resp)
@@ -224,19 +241,6 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 		}
 		log.Printf("first-boot greeting: delivered to %s (in-character=%v)", workspaceID, runTurn != nil && text != firstBootFallbackText(toolCount))
 	}
-}
-
-// isQueuedA2AResponse detects the proxy's poll-mode short-circuit
-// ({"status":"queued", …}): the turn was accepted but not answered — there
-// is no reply text to relay.
-func isQueuedA2AResponse(resp []byte) bool {
-	var body struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(resp, &body); err != nil {
-		return false
-	}
-	return body.Status == "queued"
 }
 
 // greetingTextFromReply extracts a HUMAN greeting from the agent's reply.
