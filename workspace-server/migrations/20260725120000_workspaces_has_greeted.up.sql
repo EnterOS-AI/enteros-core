@@ -13,18 +13,24 @@ BEGIN;
 -- decision time.
 --
 -- NOT NULL DEFAULT false so every read gets a guaranteed boolean and a brand-
--- new workspace created after this migration greets exactly once. IF NOT EXISTS
--- keeps the up idempotent under a runner that re-applies forward migrations.
+-- new workspace created after this migration greets exactly once. The
+-- ADD COLUMN IF NOT EXISTS only makes the DDL half re-entrant; it does NOT make
+-- the whole migration idempotent — the unconditional backfill below would
+-- re-clobber legitimately-false rows if this file were ever re-applied. That is
+-- only theoretical: golang-migrate records each version and never re-runs a
+-- forward migration, so this runs exactly once. Do not rely on re-apply safety.
 ALTER TABLE workspaces
     ADD COLUMN IF NOT EXISTS has_greeted BOOLEAN NOT NULL DEFAULT false;
 
--- Backfill: every workspace that ALREADY exists at migration time has passed
--- its first-boot moment (the greeting feature shipped earlier). Mark them
+-- Backfill (one-shot): every workspace that ALREADY exists at migration time has
+-- passed its first-boot moment (the greeting feature shipped earlier). Mark them
 -- greeted so their next restart is arbitrated as a REAL restart (fires
 -- restart-context) and they never re-greet. Without this, the default false
 -- would make every existing box look like a fresh boot on its next restart —
 -- a wave of spurious re-greets AND skipped restart-context. New rows created
--- after this statement keep the column default (false) and greet once.
+-- after this statement keep the column default (false) and greet once. This
+-- UPDATE is intentionally unconditional (correct for a single forward run); it
+-- is NOT re-apply-safe — see the note above.
 UPDATE workspaces SET has_greeted = true;
 
 COMMIT;

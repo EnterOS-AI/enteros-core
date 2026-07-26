@@ -228,31 +228,65 @@ func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, works
 // Runs async (goAsync) so the workspace-lookup + broadcast + persist never
 // stalls the drain loop, matching attachQueuedTurnCompletion's own async write.
 //
-// Commit-on-delivery (RFC concierge rule 2): routed through the shared
-// deliverFirstBootGreeting seam, so has_greeted is set only after Send succeeds
-// and the wake idempotency key (carried back in reqBody's metadata) dedups a
-// re-drained/retried delivery of the SAME wake — a fresh box greets exactly
-// once across the sync-return-then-drain handoff.
+// Claim-on-delivery (RFC concierge rule 2): routed through the shared
+// deliverFirstBootGreeting seam, so has_greeted is atomically claimed BEFORE
+// Send and rolled back on Send failure — a fresh box greets exactly once across
+// the sync-return-then-drain handoff, even against a second distinct wake, and
+// a failed delivery re-arms for a retry.
 //
 // Last-resort fallback: if the drained reply yields no usable prose (LLM error
-// / unknown shape), send the role-agnostic static greeting so a fresh
-// onboarding never opens on a silent chat — the ONLY case the fallback fires on
-// this path, and only because the queued reply genuinely arrived empty.
+// / unknown shape), send the static greeting so a fresh onboarding never opens
+// on a silent chat. The tool count is recovered from the greet payload metadata
+// (firstBootToolCount) so a concierge (toolCount>0) keeps its tool-count
+// fallback text rather than degrading to the role-agnostic zero-tool greeting
+// (rule-1 finding #3).
 func (h *WorkspaceHandler) deliverDrainedFirstBootGreeting(ctx context.Context, workspaceID string, reqBody, respBody []byte) {
 	text := greetingTextFromReply(respBody)
 	if text == "" {
-		text = firstBootFallbackText(0)
+		text = firstBootFallbackText(firstBootToolCount(reqBody))
 	}
-	wakeKey := firstBootWakeKey(reqBody)
 	h.goAsync(func() {
 		sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), greetSendTimeout)
 		defer cancel()
 		writer := NewAgentMessageWriter(db.DB, h.broadcaster)
-		if err := deliverFirstBootGreeting(sendCtx, writer, workspaceID, text, wakeKey); err != nil {
+		if err := deliverFirstBootGreeting(sendCtx, writer, workspaceID, text); err != nil {
 			log.Printf("first-boot greeting: drained real-reply delivery failed for %s: %v", workspaceID, err)
 			return
 		}
 		log.Printf("first-boot greeting: delivered drained real reply to %s", workspaceID)
+	})
+}
+
+// deliverFirstBootFallbackOnTerminalDrop is the never-silent guarantee for the
+// busy-queued first-boot greeting (rule-1 finding #1). When a self-first-boot-
+// greet queue item is TERMINALLY dropped/failed in the drain loop (attempt cap,
+// settling ceiling, or URL-less settling drop), the agent's real greeting reply
+// is gone AND the synchronous greet path already returned without sending — so
+// without this the fresh chat opens silent while the user stares at an online
+// agent. Deliver the static fallback (with the concierge tool-count recovered
+// from the payload metadata) through the SAME claim-on-delivery seam: it dedups
+// against a wake that already greeted (claim lost → skip) and rolls back on Send
+// failure. No-op for any non-greet queue item.
+//
+// (The stale-sweep DropStaleQueueItems path is deliberately NOT covered here —
+// see its doc comment: a swept queued greet leaves has_greeted false, so the
+// workspace's next provisioning→online transition re-greets, which is the
+// correct healing for an item dropped precisely because the box was NOT
+// draining.)
+func (h *WorkspaceHandler) deliverFirstBootFallbackOnTerminalDrop(ctx context.Context, workspaceID string, reqBody []byte) {
+	if messagestore.RequestSourceType(reqBody) != firstBootGreetSourceType {
+		return
+	}
+	text := firstBootFallbackText(firstBootToolCount(reqBody))
+	h.goAsync(func() {
+		sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), greetSendTimeout)
+		defer cancel()
+		writer := NewAgentMessageWriter(db.DB, h.broadcaster)
+		if err := deliverFirstBootGreeting(sendCtx, writer, workspaceID, text); err != nil {
+			log.Printf("first-boot greeting: terminal-drop fallback delivery failed for %s: %v", workspaceID, err)
+			return
+		}
+		log.Printf("first-boot greeting: delivered static fallback for %s after terminal drain drop (never-silent)", workspaceID)
 	})
 }
 
@@ -499,17 +533,27 @@ func MarkQueueItemCompleted(ctx context.Context, id string, responseBody []byte)
 // incremented attempts counter so the next drain tick picks it up. Hits
 // an upper bound (5 attempts) to avoid wedging a stuck item in the queue
 // forever.
-func MarkQueueItemFailed(ctx context.Context, id, errMsg string) {
+//
+// Returns terminal=true iff this call flipped the row to 'failed' (the cap was
+// hit) — the caller uses it to fire the never-silent first-boot fallback only
+// on the genuinely terminal transition, not on a re-queue that will retry. The
+// status is read back via RETURNING so the signal is exact regardless of the
+// attempts arithmetic.
+func MarkQueueItemFailed(ctx context.Context, id, errMsg string) (terminal bool) {
 	const maxAttempts = 5
-	if _, err := db.DB.ExecContext(ctx, `
+	var status string
+	if err := db.DB.QueryRowContext(ctx, `
 		UPDATE a2a_queue
 		SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'queued' END,
 		    last_error = $3,
 		    dispatched_at = NULL
 		WHERE id = $1
-	`, id, maxAttempts, errMsg); err != nil {
+		RETURNING status
+	`, id, maxAttempts, errMsg).Scan(&status); err != nil {
 		log.Printf("A2AQueue: failed to mark %s failed: %v", id, err)
+		return false
 	}
+	return status == "failed"
 }
 
 // MarkQueueItemTransientRetry returns a dispatched item to 'queued' WITHOUT
@@ -586,6 +630,17 @@ func DropQueueItemTerminal(ctx context.Context, id, reason string) {
 // all workspaces.
 //
 // Returns the number of items dropped for visibility/audit logging.
+//
+// First-boot greeting (rule-1 finding #1): a swept self-first-boot-greet item is
+// NOT the silent-chat bug and needs no fallback here. This sweep only drops items
+// still 'queued' (never drained) — meaning the workspace was NOT draining. Because
+// has_greeted is committed only ON delivery (claim-on-delivery), a never-delivered
+// greet leaves the marker false, so the workspace's next provisioning→online
+// transition re-greets fresh. Delivering a fallback at sweep time (which would also
+// require a broadcaster this package function does not carry) would instead RACE
+// that re-greet. The in-drain-loop terminal branches DO deliver a fallback because
+// there the box is online-but-stuck with no re-greet coming — see
+// deliverFirstBootFallbackOnTerminalDrop.
 func DropStaleQueueItems(ctx context.Context, workspaceID string, maxAgeMinutes int) (int, error) {
 	var rows int64
 	var err error
@@ -801,6 +856,10 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 					dropMsg := fmt.Sprintf("target failed to settle within %s of the first gateway-origin failure (persistent, last status=%d classification=%s: %s); dropped to stop a zombie re-queue that starves the workspace (core#124)",
 						a2aSettlingRetryCeiling, proxyErr.Status, classificationOrUnknown(classification), errMsg)
 					DropQueueItemTerminal(ctx, item.ID, dropMsg)
+					// Never-silent (rule-1 finding #1): a self-first-boot-greet item
+					// terminally dropped here would leave the fresh chat blank —
+					// deliver the static fallback (no-op for any other item).
+					h.deliverFirstBootFallbackOnTerminalDrop(ctx, workspaceID, item.Body)
 					// The stale/dead cached URL is what caused the drop — invalidate it
 					// so the REMAINING queued items of this workspace in this same drain
 					// re-resolve instead of all hammering the same dead URL (re-review [3]).
@@ -833,7 +892,11 @@ func (h *WorkspaceHandler) DrainQueueForWorkspace(ctx context.Context, workspace
 				continue
 			}
 
-			MarkQueueItemFailed(ctx, item.ID, errMsg)
+			if MarkQueueItemFailed(ctx, item.ID, errMsg) {
+				// Terminal (attempt cap hit): never-silent fallback for a
+				// self-first-boot-greet item (rule-1 finding #1). No-op otherwise.
+				h.deliverFirstBootFallbackOnTerminalDrop(ctx, workspaceID, item.Body)
+			}
 			log.Printf("A2AQueue drain: queue_id=%s workspace_id=%s url=%s dispatch failed "+
 				"(attempt=%d status=%d classification=%s): %s",
 				item.ID, workspaceID, resolvedURL, item.Attempts, proxyErr.Status,
@@ -892,6 +955,10 @@ func (h *WorkspaceHandler) settleQueuedItemBounded(ctx context.Context, workspac
 			"(still URL-less/provisioning, last resolve status=%d); dropped to stop a zombie re-queue that starves the workspace (core#124/#4531)",
 			a2aSettlingRetryCeiling, status)
 		DropQueueItemTerminal(ctx, item.ID, dropMsg)
+		// Never-silent (rule-1 finding #1): a self-first-boot-greet item dropped
+		// on the URL-less settling ceiling would leave the fresh chat blank —
+		// deliver the static fallback (no-op for any other item).
+		h.deliverFirstBootFallbackOnTerminalDrop(ctx, workspaceID, item.Body)
 		// If this was a DELEGATION, terminalize its delegate_result to 'failed' NOW
 		// so the caller's check_task_status is unblocked immediately instead of
 		// hanging until the 6h delegation-sweeper deadline (mirrors the online

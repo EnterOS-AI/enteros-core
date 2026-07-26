@@ -52,11 +52,30 @@ func expectWriterSend(mock sqlmock.Sqlmock, wsID, name string) {
 		WillReturnResult(sqlmock.NewResult(1, 1))
 }
 
-// expectMarkGreeted pins the commit-on-delivery marker write that follows a
-// successful AgentMessageWriter.Send — has_greeted flips true ONLY after the
-// user has seen the greeting.
-func expectMarkGreeted(mock sqlmock.Sqlmock, wsID string) {
-	mock.ExpectExec(`UPDATE workspaces SET has_greeted = true`).
+// expectClaimWon pins the atomic claim-on-delivery marker flip that PRECEDES a
+// successful AgentMessageWriter.Send: has_greeted is set true via a
+// compare-and-set (WHERE has_greeted = false) and exactly one row flips, so this
+// caller won the claim and proceeds to Send. Replaces the old post-Send
+// markGreeted write — the claim is now the authoritative cross-wake dedup.
+func expectClaimWon(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectExec(`UPDATE workspaces SET has_greeted = true WHERE id = \$1 AND has_greeted = false`).
+		WithArgs(wsID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// expectClaimLost pins the claim losing the compare-and-set (zero rows flipped)
+// — another wake already greeted this box, so the caller SKIPS Send silently.
+func expectClaimLost(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectExec(`UPDATE workspaces SET has_greeted = true WHERE id = \$1 AND has_greeted = false`).
+		WithArgs(wsID).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+}
+
+// expectClaimRollback pins the rollback of a WON claim after Send failed — the
+// greeting never reached the user, so has_greeted is reset to false to re-arm a
+// future wake's retry.
+func expectClaimRollback(mock sqlmock.Sqlmock, wsID string) {
+	mock.ExpectExec(`UPDATE workspaces SET has_greeted = false WHERE id = \$1`).
 		WithArgs(wsID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
@@ -87,8 +106,8 @@ func TestFirstBootGreeting_UsesInCharacterAgentReply(t *testing.T) {
 	)
 
 	expectNotGreeted(mock, "ws-first")
+	expectClaimWon(mock, "ws-first")
 	expectWriterSend(mock, "ws-first", "Scout")
-	expectMarkGreeted(mock, "ws-first")
 
 	greet("ws-first", 0)
 
@@ -117,8 +136,8 @@ func TestFirstBootGreeting_FallsBackWhenTurnFails(t *testing.T) {
 	)
 
 	expectNotGreeted(mock, "ws-fb")
+	expectClaimWon(mock, "ws-fb")
 	expectWriterSend(mock, "ws-fb", "Enter OS Agent")
-	expectMarkGreeted(mock, "ws-fb")
 
 	greet("ws-fb", 45)
 
@@ -147,8 +166,8 @@ func TestFirstBootGreeting_FallsBackOnErrorReply(t *testing.T) {
 	)
 
 	expectNotGreeted(mock, "ws-err-reply")
+	expectClaimWon(mock, "ws-err-reply")
 	expectWriterSend(mock, "ws-err-reply", "Agent")
-	expectMarkGreeted(mock, "ws-err-reply")
 
 	greet("ws-err-reply", 0)
 
@@ -232,14 +251,14 @@ func TestFirstBootGreeting_BusyQueuedGreet_DrainDeliversRealReply(t *testing.T) 
 	// in-character reply, and hands it to attachQueuedTurnCompletion. The
 	// self-first-boot-greet exception must DELIVER it (not skip it as an
 	// internal self-message) AND commit the has_greeted marker on delivery.
-	reqBody, err := buildFirstBootGreetPayload(wsID, "wake-busy-greet")
+	reqBody, err := buildFirstBootGreetPayload(wsID, 0)
 	if err != nil {
 		t.Fatalf("buildFirstBootGreetPayload: %v", err)
 	}
 	realReply := `{"jsonrpc":"2.0","result":{"message":{"parts":[{"kind":"text","text":"Hey — I'm Scout, your research agent. Ask me to track a topic!"}]}}}`
 	h := &WorkspaceHandler{broadcaster: emitter}
+	expectClaimWon(mock, wsID)
 	expectWriterSend(mock, wsID, "Scout")
-	expectMarkGreeted(mock, wsID)
 	h.attachQueuedTurnCompletion(context.Background(), wsID, false, reqBody, []byte(realReply))
 	h.asyncWG.Wait()
 
@@ -263,13 +282,13 @@ func TestFirstBootGreeting_DrainedGreet_EmptyReplyFallsBack(t *testing.T) {
 	mock := setupTestDB(t)
 	emitter := &capturingEmitter{}
 	const wsID = "ws-drain-empty"
-	reqBody, err := buildFirstBootGreetPayload(wsID, "wake-drain-empty")
+	reqBody, err := buildFirstBootGreetPayload(wsID, 0)
 	if err != nil {
 		t.Fatalf("buildFirstBootGreetPayload: %v", err)
 	}
 	h := &WorkspaceHandler{broadcaster: emitter}
+	expectClaimWon(mock, wsID)
 	expectWriterSend(mock, wsID, "Agent")
-	expectMarkGreeted(mock, wsID)
 	// An A2A-level error reply is not usable greeting prose.
 	h.attachQueuedTurnCompletion(context.Background(), wsID, false,
 		reqBody, []byte(`{"jsonrpc":"2.0","error":{"message":"boom"}}`))
@@ -315,8 +334,8 @@ func TestFirstBootGreeting_JSONShapedReplyFallsBack(t *testing.T) {
 	)
 
 	expectNotGreeted(mock, "ws-json")
+	expectClaimWon(mock, "ws-json")
 	expectWriterSend(mock, "ws-json", "Agent")
-	expectMarkGreeted(mock, "ws-json")
 
 	greet("ws-json", 0)
 
@@ -348,10 +367,10 @@ func TestFirstBootGreeting_ConcurrentInvocationsGreetOnce(t *testing.T) {
 		},
 	)
 
-	// Exactly ONE marker check + ONE send + ONE marker write may hit the DB.
+	// Exactly ONE marker check + ONE claim + ONE send may hit the DB.
 	expectNotGreeted(mock, "ws-race")
+	expectClaimWon(mock, "ws-race")
 	expectWriterSend(mock, "ws-race", "Agent")
-	expectMarkGreeted(mock, "ws-race")
 
 	done := make(chan struct{})
 	go func() {
@@ -445,10 +464,10 @@ func TestFirstBootGreeting_DeliveryCommitsMarker_NoReGreet(t *testing.T) {
 			nil),
 	)
 
-	// Boot 1 — fresh box: gate unset → agent turn → deliver → COMMIT marker.
+	// Boot 1 — fresh box: gate unset → agent turn → claim → deliver.
 	expectNotGreeted(mock, wsID)
+	expectClaimWon(mock, wsID)
 	expectWriterSend(mock, wsID, "Ada")
-	expectMarkGreeted(mock, wsID)
 	greet(wsID, 0)
 
 	// Boot 2 — reconcile restart: gate now reads SET → skip entirely (no turn,
@@ -470,27 +489,30 @@ func TestFirstBootGreeting_DeliveryCommitsMarker_NoReGreet(t *testing.T) {
 	}
 }
 
-func TestFirstBootGreeting_WakeKeyDedupsRetriedDelivery(t *testing.T) {
-	// RFC concierge rule 2, idempotency: the wake key
-	// (params.metadata.wake_idempotency_key, minted at decision time) dedups a
-	// RETRIED delivery of the SAME wake — the sync path racing its own drain, a
-	// double drain, or a replayed queue row. Two deliverFirstBootGreeting calls
-	// with the same key collapse to exactly ONE Send + ONE marker commit.
+func TestFirstBootGreeting_ClaimDedupsRetriedDelivery(t *testing.T) {
+	// RFC concierge rule 2, idempotency: the has_greeted claim (atomic
+	// compare-and-set) is the AUTHORITATIVE dedup for a RETRIED delivery — the
+	// sync path racing its own drain, a double drain, or a replayed queue row.
+	// The first deliverFirstBootGreeting WINS the claim (one row flips) and
+	// Sends; the second LOSES the claim (zero rows flip) and skips. Exactly ONE
+	// Send. Unlike the old in-memory sync.Map, the claim survives across two
+	// DISTINCT wake goroutines and does not grow unboundedly.
 	mock := setupTestDB(t)
 	emitter := &capturingEmitter{}
-	const wsID = "ws-wake-dedup"
-	const wakeKey = "wake-dedup-test-1"
+	const wsID = "ws-claim-dedup"
 	writer := NewAgentMessageWriter(db.DB, emitter)
 
-	// Only the FIRST delivery may hit the DB (lookup + insert + marker write).
+	// First delivery: WIN the claim, then Send.
+	expectClaimWon(mock, wsID)
 	expectWriterSend(mock, wsID, "Agent")
-	expectMarkGreeted(mock, wsID)
+	// Second delivery: LOSE the claim (already true) → no Send.
+	expectClaimLost(mock, wsID)
 
-	if err := deliverFirstBootGreeting(context.Background(), writer, wsID, "Hello from the agent.", wakeKey); err != nil {
+	if err := deliverFirstBootGreeting(context.Background(), writer, wsID, "Hello from the agent."); err != nil {
 		t.Fatalf("first delivery: %v", err)
 	}
-	// Retry with the SAME wake key: must dedup — no Send, no marker write.
-	if err := deliverFirstBootGreeting(context.Background(), writer, wsID, "Hello AGAIN (retry).", wakeKey); err != nil {
+	// Retry (a second distinct wake): must dedup on the claim — no Send.
+	if err := deliverFirstBootGreeting(context.Background(), writer, wsID, "Hello AGAIN (retry)."); err != nil {
 		t.Fatalf("retried delivery should no-op, got: %v", err)
 	}
 
@@ -498,10 +520,168 @@ func TestFirstBootGreeting_WakeKeyDedupsRetriedDelivery(t *testing.T) {
 		t.Errorf("DB expectations (exactly one delivery): %v", err)
 	}
 	if len(emitter.events) != 1 {
-		t.Fatalf("wake key must dedup the retry to ONE broadcast, got %d", len(emitter.events))
+		t.Fatalf("claim must dedup the retry to ONE broadcast, got %d", len(emitter.events))
 	}
 	if msg := sentMessage(t, emitter); !strings.Contains(msg, "Hello from the agent") {
 		t.Errorf("delivered message = %q, want the first delivery's text", msg)
+	}
+}
+
+func TestFirstBootGreeting_ClaimRollbackReArmsRetryOnSendFailure(t *testing.T) {
+	// Rollback-on-failure (review fix): a WON claim whose Send FAILS must reset
+	// has_greeted to false so a future wake re-claims and retries — never leave
+	// the marker durably true for an undelivered greeting (commit-on-delivery).
+	// A subsequent delivery then WINS a fresh claim and Sends.
+	mock := setupTestDB(t)
+	emitter := &capturingEmitter{}
+	const wsID = "ws-claim-rollback"
+	writer := NewAgentMessageWriter(db.DB, emitter)
+
+	// Attempt 1: win the claim, but the writer lookup errors → Send fails →
+	// the claim is rolled back to false.
+	expectClaimWon(mock, wsID)
+	mock.ExpectQuery("SELECT name, talk_to_user_enabled FROM workspaces").
+		WithArgs(wsID).
+		WillReturnError(errDBDown)
+	expectClaimRollback(mock, wsID)
+
+	if err := deliverFirstBootGreeting(context.Background(), writer, wsID, "Greeting text."); err == nil {
+		t.Fatal("expected Send failure to propagate as an error")
+	}
+	if len(emitter.events) != 0 {
+		t.Fatalf("failed Send must not broadcast, got %#v", emitter.events)
+	}
+
+	// Attempt 2 (a later wake): the rolled-back marker lets it re-claim and Send.
+	expectClaimWon(mock, wsID)
+	expectWriterSend(mock, wsID, "Agent")
+	if err := deliverFirstBootGreeting(context.Background(), writer, wsID, "Greeting text."); err != nil {
+		t.Fatalf("retry after rollback should deliver, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations: %v", err)
+	}
+	if len(emitter.events) != 1 {
+		t.Fatalf("retry after rollback must deliver exactly one greeting, got %d", len(emitter.events))
+	}
+}
+
+func TestFirstBootGreeting_TwoDistinctWakesGreetExactlyOnce(t *testing.T) {
+	// Rule-1 finding #2 / rule-2 nit 1: two DISTINCT wakes racing to greet the
+	// same fresh box must collapse to EXACTLY ONE greeting via the atomic claim
+	// — the exact case the old in-memory sync.Map could not cover (its keys did
+	// not survive across two independent wake goroutines). K2 (sync path) wins
+	// the claim and greets; K1 (its busy-queued greet now draining) tries to
+	// deliver its own real reply, LOSES the claim, and delivers nothing.
+	mock := setupTestDB(t)
+	emitter := &capturingEmitter{}
+	const wsID = "ws-two-wakes"
+
+	// Wake K2 — synchronous greet path: gate unset → claim WON → send.
+	var calls []string
+	greet := FirstBootGreeter(
+		NewAgentMessageWriter(db.DB, emitter),
+		stubTurn(t, &calls, 200,
+			`{"jsonrpc":"2.0","result":{"message":{"parts":[{"kind":"text","text":"Hi, I'm Ada."}]}}}`,
+			nil),
+	)
+	expectNotGreeted(mock, wsID)
+	expectClaimWon(mock, wsID)
+	expectWriterSend(mock, wsID, "Ada")
+	greet(wsID, 0)
+
+	// Wake K1 — a separate busy-queued greet now draining. Its real reply tries
+	// to deliver, but the claim is already taken → LOSE → deliver nothing.
+	reqBody, err := buildFirstBootGreetPayload(wsID, 0)
+	if err != nil {
+		t.Fatalf("buildFirstBootGreetPayload: %v", err)
+	}
+	h := &WorkspaceHandler{broadcaster: emitter}
+	expectClaimLost(mock, wsID)
+	h.attachQueuedTurnCompletion(context.Background(), wsID, false, reqBody,
+		[]byte(`{"jsonrpc":"2.0","result":{"message":{"parts":[{"kind":"text","text":"Hi again from the drain."}]}}}`))
+	h.asyncWG.Wait()
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations (exactly one greeting across two wakes): %v", err)
+	}
+	if len(emitter.events) != 1 {
+		t.Fatalf("two distinct wakes must greet exactly once, got %d", len(emitter.events))
+	}
+	if msg := sentMessage(t, emitter); !strings.Contains(msg, "I'm Ada") {
+		t.Errorf("first wake's greeting should stand, got %q", msg)
+	}
+}
+
+func TestFirstBootGreeting_TerminalDropDeliversFallback_PreservesToolCount(t *testing.T) {
+	// Rule-1 finding #1 (never-silent) + finding #3 (toolCount): a busy-queued
+	// first-boot greet whose drain TERMINALLY fails must still deliver the static
+	// fallback — and a concierge (toolCount>0) must keep its tool-count text,
+	// recovered from the greet payload metadata, not degrade to the zero-tool
+	// greeting. Exercises the seam the drain's terminal branches call.
+	mock := setupTestDB(t)
+	emitter := &capturingEmitter{}
+	const wsID = "ws-terminal-drop"
+	reqBody, err := buildFirstBootGreetPayload(wsID, 45)
+	if err != nil {
+		t.Fatalf("buildFirstBootGreetPayload: %v", err)
+	}
+	h := &WorkspaceHandler{broadcaster: emitter}
+	expectClaimWon(mock, wsID)
+	expectWriterSend(mock, wsID, "Concierge")
+	h.deliverFirstBootFallbackOnTerminalDrop(context.Background(), wsID, reqBody)
+	h.asyncWG.Wait()
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations: %v", err)
+	}
+	msg := sentMessage(t, emitter)
+	if !strings.Contains(msg, "45 management tools") {
+		t.Errorf("terminal-drop fallback lost the concierge tool count: %q", msg)
+	}
+}
+
+func TestFirstBootGreeting_TerminalDropNoOpForNonGreet(t *testing.T) {
+	// The never-silent fallback is NARROW: a terminally-dropped item that is NOT
+	// a self-first-boot-greet (an ordinary user turn, a restart-context wake)
+	// must deliver nothing — no claim, no Send, no broadcast.
+	setupTestDB(t) // no expectations => any DB call fails the test
+	emitter := &capturingEmitter{}
+	h := &WorkspaceHandler{broadcaster: emitter}
+	reqBody := []byte(`{"jsonrpc":"2.0","method":"message/send","params":{"metadata":{"source_type":"self-restart-context"},"message":{"messageId":"m1"}}}`)
+	h.deliverFirstBootFallbackOnTerminalDrop(context.Background(), "ws-nongreet", reqBody)
+	h.asyncWG.Wait()
+	if len(emitter.events) != 0 {
+		t.Fatalf("non-greet terminal drop must deliver nothing, got %#v", emitter.events)
+	}
+}
+
+func TestFirstBootGreeting_DrainedGreet_EmptyReplyPreservesToolCount(t *testing.T) {
+	// Rule-1 finding #3 on the drain-deliver path: when the drained greet reply
+	// is unusable and the fallback fires, a concierge (toolCount>0) keeps its
+	// tool-count text — the count is threaded through the payload metadata rather
+	// than hardcoded to firstBootFallbackText(0).
+	mock := setupTestDB(t)
+	emitter := &capturingEmitter{}
+	const wsID = "ws-drain-toolcount"
+	reqBody, err := buildFirstBootGreetPayload(wsID, 45)
+	if err != nil {
+		t.Fatalf("buildFirstBootGreetPayload: %v", err)
+	}
+	h := &WorkspaceHandler{broadcaster: emitter}
+	expectClaimWon(mock, wsID)
+	expectWriterSend(mock, wsID, "Concierge")
+	h.attachQueuedTurnCompletion(context.Background(), wsID, false,
+		reqBody, []byte(`{"jsonrpc":"2.0","error":{"message":"boom"}}`))
+	h.asyncWG.Wait()
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations: %v", err)
+	}
+	msg := sentMessage(t, emitter)
+	if !strings.Contains(msg, "45 management tools") {
+		t.Errorf("drain fallback lost the concierge tool count: %q", msg)
 	}
 }
 

@@ -329,12 +329,17 @@ func expectCompleted(mock sqlmock.Sqlmock, id string, respBody interface{}) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
-// expectFailed sets up mock for MarkQueueItemFailed with a specific error message.
+// expectFailed sets up mock for MarkQueueItemFailed with a specific error
+// message. MarkQueueItemFailed now reads the resulting status back (RETURNING
+// status) so the drain can fire the never-silent first-boot fallback only on the
+// genuinely-terminal 'failed' transition — hence ExpectQuery, not ExpectExec.
+// Returns 'queued' (the non-terminal re-queue) so the drain's fallback branch
+// does NOT fire for the non-greet items these existing tests exercise.
 func expectFailed(mock sqlmock.Sqlmock, id string, errMsg string) {
-	mock.ExpectExec(
-		"UPDATE a2a_queue SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'queued' END, last_error = $3, dispatched_at = NULL WHERE id = $1").
+	mock.ExpectQuery(
+		"UPDATE a2a_queue SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'queued' END, last_error = $3, dispatched_at = NULL WHERE id = $1 RETURNING status").
 		WithArgs(id, 5, errMsg).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("queued"))
 }
 
 // expectTransientRetry sets up mock for MarkQueueItemTransientRetry. The
