@@ -22,8 +22,9 @@ import { RequestsInbox } from "./RequestsInbox";
 import { MonitorPanel } from "@/components/monitor/MonitorPanel";
 import {
   IcHome, IcOrgMap, IcSettings, IcSearch, IcBell, IcSun, IcMoon, IcChevDown,
-  IcQueue, IcCaret, IcMolecule, IcCheck, IcChat,
+  IcQueue, IcCaret, IcMolecule, IcCheck, IcChat, IcLogs,
 } from "./icons";
+import { DOZZLE_URL } from "@/lib/dozzle";
 
 /* ── status → concept palette ─────────────────────────────────────────── */
 function statusInfo(status: string): { color: string; label: string } {
@@ -401,6 +402,19 @@ export function ConciergeShell() {
             <span className={s.ico}><IcQueue /></span><span className={s.lbl}>Monitor</span>
           </button>
           <div className={s.spacer} />
+          {/* Dev-only escape hatch to raw container logs (Dozzle). External
+              link, not a TopView — it opens in a new tab rather than taking
+              over the rail's own view state. */}
+          <a
+            data-testid="nav-logs"
+            className={s.navbtn}
+            title="Logs — open Dozzle in a new tab"
+            href={DOZZLE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <span className={s.ico}><IcLogs /></span><span className={s.lbl}>Logs</span>
+          </a>
           <button data-testid="nav-settings" className={`${s.navbtn} ${topView === "settings" ? s.active : ""}`} title="Settings" onClick={() => nav("settings")}>
             <span className={s.ico}><IcSettings /></span><span className={s.lbl}>Settings</span>
           </button>
