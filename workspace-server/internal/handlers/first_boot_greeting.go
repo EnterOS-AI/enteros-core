@@ -30,11 +30,20 @@ package handlers
 //     (the verified concierge flip AND ordinary workspaces' first register)
 //     via the late-wired nil-safe hook pattern (SetFirstBootGreeter). By
 //     construction the workspace is online and addressable when it fires.
-//   - GREET ONCE: skipped when the workspace already has ANY chat history
-//     (an `a2a_receive` row with source_id IS NULL — the exact predicate the
-//     chat-history reader uses, messagestore/postgres_store.go), so
-//     restarts and reconnects never re-greet. A restart after a failed
-//     FIRST boot has no history yet and correctly greets.
+//   - GREET ONCE (RFC concierge rule 2): gated on the workspaces.has_greeted
+//     boot marker — the SINGLE authoritative "has this box been greeted"
+//     signal (SSOT), read here and by restart-context arbitration. The marker
+//     is the AUTHORITATIVE atomic cross-wake dedup: every delivery point CLAIMS
+//     it via a compare-and-set (UPDATE ... WHERE has_greeted = false) BEFORE
+//     Send and delivers only if it won the claim; a claim whose Send fails is
+//     ROLLED BACK to false. Net: the marker is durably true ONLY for a greeting
+//     the user actually saw, so a decided-but-undelivered greet still greets on
+//     the next boot and a delivered one never re-greets — even across two
+//     DISTINCT wakes (the case the old in-memory sync.Map dedup could not
+//     cover). This REPLACES the old derived activity_logs query (which answered
+//     "has the USER chatted", not "has the box greeted" — the double-greet hole
+//     where a greeted-but-silent box re-greeted on reconnect). A restart after a
+//     FAILED first boot has no marker yet and correctly greets.
 
 import (
 	"context"
@@ -87,6 +96,11 @@ var firstBootGreetingPending sync.Map // workspaceID -> struct{}
 // starve the guaranteed fallback delivery of context.
 const greetSendTimeout = 15 * time.Second
 
+// greetRollbackTimeout bounds the DETACHED has_greeted rollback (releaseGreetClaim)
+// on its own fresh budget — see releaseGreetClaim for why the rollback must never
+// ride the Send context that just failed.
+const greetRollbackTimeout = 5 * time.Second
+
 // firstBootFallbackText is the static greeting used when the agent turn
 // fails. toolCount is the size of the heartbeat's loaded_mcp_tools — >0
 // means the org concierge (the verified flip is the only toolCount-bearing
@@ -108,7 +122,13 @@ func firstBootFallbackText(toolCount int) string {
 // buildFirstBootGreetPayload wraps the greet prompt in the JSON-RPC 2.0 A2A
 // message/send shape the proxy normalizes — the same envelope restart-context
 // uses, with its own metadata kind so runtimes/forensics can identify it.
-func buildFirstBootGreetPayload(workspaceID string) ([]byte, error) {
+//
+// toolCount rides in the metadata (additionalProperties-safe) so a busy-queued
+// greet that drains later — or a terminal-failure fallback on the drain path —
+// can recover the concierge's tool-count fallback text instead of degrading to
+// the role-agnostic zero-tool greeting (rule-1 finding #3). Read back via
+// firstBootToolCount.
+func buildFirstBootGreetPayload(workspaceID string, toolCount int) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
@@ -128,10 +148,139 @@ func buildFirstBootGreetPayload(workspaceID string) ([]byte, error) {
 					// notice, never a blue user bubble.
 					"source_type":         firstBootGreetSourceType,
 					"first_boot_greeting": true,
+					// Concierge tool count — threaded decision→drain so the drain
+					// fallback keeps the tool-count greeting (rule-1 finding #3).
+					"first_boot_tool_count": toolCount,
 				},
 			},
 		},
 	})
+}
+
+// claimGreetDelivery is the AUTHORITATIVE atomic cross-wake dedup for the
+// first-boot greeting (replaces the old in-memory firstBootGreetDelivered
+// sync.Map, which could not survive across two DISTINCT wake goroutines and
+// grew unboundedly). It performs a compare-and-set on the has_greeted boot
+// marker (SSOT) — `UPDATE ... WHERE has_greeted = false` — and reports whether
+// THIS caller flipped the row (exactly one row affected = we won the claim).
+//
+// Every greeting delivery point claims BEFORE Send; only the winner delivers.
+// Two distinct wakes racing to greet the same fresh box (K1's busy-queued drain
+// and K2's synchronous greet) both call this, but only the first flips the
+// marker and delivers — closing the double-greet-across-wakes hole. The loser
+// skips silently. On a claimed-but-undelivered greet the winner rolls the
+// marker back (releaseGreetClaim) so a future wake retries — commit-on-delivery
+// is preserved (the marker is durably true ONLY once the user has seen it).
+func claimGreetDelivery(ctx context.Context, workspaceID string) (won bool, err error) {
+	res, err := db.DB.ExecContext(ctx,
+		`UPDATE workspaces SET has_greeted = true WHERE id = $1 AND has_greeted = false`, workspaceID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// releaseGreetClaim rolls the has_greeted marker back to false after a WON claim
+// whose delivery FAILED — the greeting never reached the user, so a future wake
+// must be free to re-claim and retry. This is what keeps commit-on-delivery
+// honest: the marker is never left durably true for a greeting the user did not
+// see. Best-effort: a failed rollback is logged (worst case a missed re-greet,
+// strictly better than crashing the delivery goroutine).
+//
+// The rollback runs on a context DETACHED from the caller's Send context
+// (context.WithoutCancel + a fresh greetRollbackTimeout budget). This is
+// load-bearing: the rollback is triggered precisely when writer.Send FAILED, and
+// the most common cause is that the greetSendTimeout/sendCtx deadline expired.
+// Reusing that same already-expired ctx for the rollback UPDATE would make the
+// write fail DETERMINISTICALLY (database/sql rejects an exec on a done context
+// before it reaches the pool) — leaving has_greeted stuck true for a greeting the
+// user never saw: nothing delivered, no future re-greet, and restart-context
+// wrongly firing. WithoutCancel keeps any request-scoped values while dropping the
+// dead deadline/cancellation; the fresh 5s timeout bounds the detached write.
+// (Same WithoutCancel+WithTimeout shape the drain-path delivery budgets use.) A
+// rollback that STILL fails on the fresh context is a real DB error — logged, and
+// that residual missed re-greet is inherent and acceptable.
+func releaseGreetClaim(ctx context.Context, workspaceID string) {
+	rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), greetRollbackTimeout)
+	defer cancel()
+	if _, err := db.DB.ExecContext(rbCtx,
+		`UPDATE workspaces SET has_greeted = false WHERE id = $1`, workspaceID); err != nil {
+		log.Printf("first-boot greeting: failed to roll back has_greeted claim for %s: %v", workspaceID, err)
+	}
+}
+
+// workspaceHasGreeted reads the has_greeted boot marker (SSOT) — the single
+// authoritative answer to "has this workspace been greeted/booted", read by
+// BOTH the greet-once gate here AND restart-context arbitration.
+func workspaceHasGreeted(ctx context.Context, workspaceID string) (bool, error) {
+	var greeted bool
+	err := db.DB.QueryRowContext(ctx,
+		`SELECT has_greeted FROM workspaces WHERE id = $1`, workspaceID).Scan(&greeted)
+	return greeted, err
+}
+
+// firstBootToolCount extracts the concierge tool count stamped by
+// buildFirstBootGreetPayload. Checks params.metadata first (runtime-stamped
+// primary) then params.message.metadata (platform-stamped) — mirroring the
+// dual-location convention the greet-once/self-source readers use. Returns 0
+// when absent or unparseable (the role-agnostic fallback, safe default). A JSON
+// number decodes as float64 through interface{}, so accept that shape too.
+func firstBootToolCount(reqBody []byte) int {
+	var body struct {
+		Params struct {
+			Metadata struct {
+				FirstBootToolCount *float64 `json:"first_boot_tool_count"`
+			} `json:"metadata"`
+			Message struct {
+				Metadata struct {
+					FirstBootToolCount *float64 `json:"first_boot_tool_count"`
+				} `json:"metadata"`
+			} `json:"message"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(reqBody, &body); err != nil {
+		return 0
+	}
+	if body.Params.Metadata.FirstBootToolCount != nil {
+		return int(*body.Params.Metadata.FirstBootToolCount)
+	}
+	if body.Params.Message.Metadata.FirstBootToolCount != nil {
+		return int(*body.Params.Message.Metadata.FirstBootToolCount)
+	}
+	return 0
+}
+
+// deliverFirstBootGreeting is the SINGLE delivery seam for the first-boot
+// greeting, shared by the synchronous greet path (FirstBootGreeter), the
+// busy-queued drain path (deliverDrainedFirstBootGreeting), and the
+// terminal-failure fallback (deliverFirstBootFallbackOnTerminalDrop). It
+// enforces claim-on-delivery via the has_greeted boot marker (SSOT):
+//   - CLAIM the marker atomically (claimGreetDelivery). If we did not win the
+//     claim, another wake already greeted — skip silently (no double-greet).
+//   - SEND only when we won the claim. On Send failure, ROLL BACK the claim
+//     (releaseGreetClaim) so a future wake retries — the greeting never reached
+//     the user, and commit-on-delivery must never leave the marker durably true
+//     for an undelivered greeting.
+func deliverFirstBootGreeting(ctx context.Context, writer *AgentMessageWriter, workspaceID, text string) error {
+	won, err := claimGreetDelivery(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	if !won {
+		log.Printf("first-boot greeting: has_greeted already claimed for %s — another wake greeted (dedup, no re-greet)", workspaceID)
+		return nil
+	}
+	if err := writer.Send(ctx, workspaceID, text, nil); err != nil {
+		// Roll the claim back — the greeting did NOT reach the user, so a
+		// future wake must be free to re-claim and retry.
+		releaseGreetClaim(ctx, workspaceID)
+		return err
+	}
+	return nil
 }
 
 // FirstBootGreeter builds the greeting hook for RegistryHandler.
@@ -159,41 +308,29 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 		ctx, cancel := context.WithTimeout(context.Background(), firstBootGreetingTimeout)
 		defer cancel()
 
-		// Greet-once gate: any existing chat-history row means this is not a
-		// first boot. Fail CLOSED on a DB error (skip the greeting) — a
-		// duplicate greeting after every reconnect would be worse than a
-		// missed one.
-		var hasHistory bool
-		if err := db.DB.QueryRowContext(ctx, `
-			SELECT EXISTS(
-				SELECT 1 FROM activity_logs
-				WHERE workspace_id = $1
-				  AND activity_type = 'a2a_receive'
-				  AND source_id IS NULL
-				  -- Self-source platform/runtime turns (restart-context wake,
-				  -- heartbeat harvester, cron self-ticks...) are NOT user chat:
-				  -- they must not suppress the greeting (reviews wf_b8f98be3 #4,
-				  -- wf_8b04761b #4). The marker lives at params.metadata
-				  -- (primary, runtime-stamped) OR params.message.metadata
-				  -- (platform-stamped) — mirror RequestSourceType and check both.
-				  AND COALESCE(
-				        request_body->'params'->'metadata'->>'source_type',
-				        request_body->'params'->'message'->'metadata'->>'source_type',
-				        '') NOT LIKE 'self-%'
-			)`, workspaceID,
-		).Scan(&hasHistory); err != nil {
-			log.Printf("first-boot greeting: history check failed for %s (skipping): %v", workspaceID, err)
+		// Greet-once gate (RFC concierge rule 2): read the has_greeted boot
+		// marker — the single authoritative "has this box been greeted" signal
+		// (SSOT), the SAME marker restart-context arbitrates on. This is a
+		// fast-path skip; the AUTHORITATIVE dedup is the atomic claim at delivery
+		// (claimGreetDelivery), so a greeted box never re-greets and a failed
+		// first boot still greets. Fail CLOSED on a DB error (skip) — a duplicate
+		// greeting after every reconnect is worse than a missed one.
+		greeted, err := workspaceHasGreeted(ctx, workspaceID)
+		if err != nil {
+			log.Printf("first-boot greeting: has_greeted check failed for %s (skipping): %v", workspaceID, err)
 			return
 		}
-		if hasHistory {
+		if greeted {
 			return
 		}
 
 		// Ask the agent to greet in its own voice. logActivity=false — the
-		// writer below is the single chat entry point (no duplicate rows).
+		// writer below is the single chat entry point (no duplicate rows). The
+		// toolCount is stamped into the payload metadata so a busy-queued drain
+		// (or its terminal-failure fallback) keeps the concierge tool-count text.
 		text := ""
 		if runTurn != nil {
-			if payload, err := buildFirstBootGreetPayload(workspaceID); err == nil {
+			if payload, err := buildFirstBootGreetPayload(workspaceID, toolCount); err == nil {
 				status, resp, turnErr := runTurn(ctx, workspaceID, payload, "system:first-boot-greeting", false)
 				queued, _ := QueuedA2AResponse(resp)
 				switch {
@@ -232,10 +369,12 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 		}
 
 		// Deliver on a FRESH budget: a turn that ate the whole turn timeout
-		// must not starve the guaranteed (fallback) delivery of context.
+		// must not starve the guaranteed (fallback) delivery of context. The
+		// seam claims has_greeted BEFORE Send (claim-on-delivery) and rolls the
+		// claim back if Send fails, so the marker is the authoritative dedup.
 		sendCtx, cancelSend := context.WithTimeout(context.Background(), greetSendTimeout)
 		defer cancelSend()
-		if err := writer.Send(sendCtx, workspaceID, text, nil); err != nil {
+		if err := deliverFirstBootGreeting(sendCtx, writer, workspaceID, text); err != nil {
 			log.Printf("first-boot greeting: send failed for %s: %v", workspaceID, err)
 			return
 		}

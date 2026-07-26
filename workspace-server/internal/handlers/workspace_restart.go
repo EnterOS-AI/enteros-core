@@ -487,12 +487,13 @@ func (h *WorkspaceHandler) Restart(c *gin.Context) {
 	h.goAsync(func() {
 		h.RestartWorkspaceAutoOpts(context.Background(), id, templatePath, configFiles, payload, resetClaudeSession)
 	})
-	// Claim the agent's session for the boot turn BEFORE spawning the sender:
-	// the drain is woken by the same heartbeat, so marking inside the goroutine
-	// would leave open the very window this closes. Cleared by sendRestartContext's
-	// defer on every exit path. See restartContextPending in restart_context.go.
-	markRestartContextPending(id)
-	h.goAsync(func() { h.sendRestartContext(id, restartData) })
+	// First-boot-vs-restart arbitration (RFC concierge rule 2): fire
+	// restart-context ONLY if this workspace has already been greeted (a real
+	// restart). A genuine first boot is skipped — the first-boot greeting owns
+	// that edge. Claims the per-restart concurrency gate BEFORE spawning the
+	// sender when it does fire (see fireRestartContextIfBooted / the drain-race
+	// note in restart_context.go).
+	h.fireRestartContextIfBooted(ctx, id, restartData)
 
 	c.JSON(http.StatusOK, gin.H{"status": "provisioning", "config_dir": configLabel, "reset_session": resetClaudeSession})
 }
@@ -1306,10 +1307,14 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// Tracked via h.goAsync so tests can wait for it via h.asyncWG before
 	// closing the sqlmock. Without this, untracked goroutines hit the restored
 	// mock and cause "was not expected" errors in parallel CI execution (mc#1264).
-	// Same session claim as the Restart handler above — set before the spawn so
-	// the drain woken by this restart's first heartbeat already sees the gate.
-	markRestartContextPending(workspaceID)
-	h.goAsync(func() { h.sendRestartContext(workspaceID, restartData) })
+	//
+	// First-boot-vs-restart arbitration (RFC concierge rule 2): fire only for an
+	// already-greeted workspace (has_greeted marker) — a genuine first boot is
+	// skipped, the greeting owns that edge. Same session-claim ordering as the
+	// Restart handler: fireRestartContextIfBooted sets the per-restart gate
+	// before the spawn so the drain woken by this restart's first heartbeat
+	// already sees it.
+	h.fireRestartContextIfBooted(ctx, workspaceID, restartData)
 }
 
 // Pause handles POST /workspaces/:id/pause
