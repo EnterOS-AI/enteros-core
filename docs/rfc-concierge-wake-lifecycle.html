@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RFC: Concierge Wake Lifecycle &amp; the Control/Data-Plane Split</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5a5a5a; --line: #e2e2e2;
+    --card: #f7f7f5; --accent: #6d5ef5; --accent-soft: #efedff;
+    --bad: #c0392b; --bad-soft: #fdecea; --good: #1e8a4c; --good-soft: #e8f6ee;
+    --warn: #b8860b; --warn-soft: #fbf3e0; --code-bg: #f2f2ef;
+    --coreC: #6d5ef5; --rtC: #1e8a4c; --tplC: #b8860b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --fg: #e8e8ea; --muted: #a0a0a8; --line: #2c2c34;
+      --card: #1e1e24; --accent: #a99bff; --accent-soft: #24223a;
+      --bad: #ff7a6b; --bad-soft: #3a201d; --good: #6fdc9a; --good-soft: #1a2e22;
+      --warn: #e0b64a; --warn-soft: #332a14; --code-bg: #22222a;
+      --coreC: #a99bff; --rtC: #6fdc9a; --tplC: #e0b64a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #16161a; --fg: #e8e8ea; --muted: #a0a0a8; --line: #2c2c34;
+    --card: #1e1e24; --accent: #a99bff; --accent-soft: #24223a;
+    --bad: #ff7a6b; --bad-soft: #3a201d; --good: #6fdc9a; --good-soft: #1a2e22;
+    --warn: #e0b64a; --warn-soft: #332a14; --code-bg: #22222a;
+    --coreC: #a99bff; --rtC: #6fdc9a; --tplC: #e0b64a;
+  }
+  :root[data-theme="light"] {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5a5a5a; --line: #e2e2e2;
+    --card: #f7f7f5; --accent: #6d5ef5; --accent-soft: #efedff;
+    --bad: #c0392b; --bad-soft: #fdecea; --good: #1e8a4c; --good-soft: #e8f6ee;
+    --warn: #b8860b; --warn-soft: #fbf3e0; --code-bg: #f2f2ef;
+    --coreC: #6d5ef5; --rtC: #1e8a4c; --tplC: #b8860b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 48px 24px 96px; }
+  h1 { font-size: 30px; line-height: 1.2; margin: 0 0 6px; letter-spacing: -0.02em; }
+  h2 { font-size: 22px; margin: 44px 0 12px; letter-spacing: -0.01em; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  h3 { font-size: 17px; margin: 26px 0 8px; }
+  p, li { color: var(--fg); }
+  .sub { color: var(--muted); font-size: 15px; margin: 0 0 4px; }
+  .tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); vertical-align: middle; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 0.86em; font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); padding: 14px 16px; border-radius: 8px; overflow-x: auto; border: 1px solid var(--line); }
+  pre code { background: none; padding: 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin: 14px 0; }
+  .diagram { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin: 18px 0; overflow-x: auto; }
+  .diagram .cap { color: var(--muted); font-size: 13px; margin-top: 8px; text-align: center; }
+  .bad { color: var(--bad); font-weight: 600; }
+  .good { color: var(--good); font-weight: 600; }
+  .callout { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 10px 16px; border-radius: 0 8px 8px 0; margin: 14px 0; }
+  .callout.bad { border-color: var(--bad); background: var(--bad-soft); }
+  .callout.good { border-color: var(--good); background: var(--good-soft); }
+  .callout.warn { border-color: var(--warn); background: var(--warn-soft); }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 14px; display: block; overflow-x: auto; }
+  th, td { border: 1px solid var(--line); padding: 8px 11px; text-align: left; vertical-align: top; }
+  th { background: var(--card); font-weight: 600; }
+  ul { padding-left: 22px; }
+  li { margin: 3px 0; }
+  .meta { display: flex; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 13px; margin: 10px 0 22px; }
+  .meta b { color: var(--fg); font-weight: 600; }
+  .num { display: inline-flex; width: 22px; height: 22px; border-radius: 6px; background: var(--accent); color: #fff; font-size: 13px; font-weight: 700; align-items: center; justify-content: center; margin-right: 8px; vertical-align: text-bottom; }
+  hr { border: none; border-top: 1px solid var(--line); margin: 40px 0; }
+  .footnote { color: var(--muted); font-size: 13.5px; }
+  .repo { display: inline-block; font-size: 11.5px; font-weight: 700; padding: 1px 7px; border-radius: 5px; border: 1px solid var(--line); white-space: nowrap; }
+  .repo.core { color: var(--coreC); border-color: var(--coreC); }
+  .repo.rt { color: var(--rtC); border-color: var(--rtC); }
+  .repo.tpl { color: var(--tplC); border-color: var(--tplC); }
+  .repo.man { color: var(--muted); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 6px 0 0; font-size: 13px; }
+  .keep { color: var(--good); font-weight: 600; }
+  .del { color: var(--bad); font-weight: 600; }
+  .add { color: var(--accent); font-weight: 600; }
+  .mod { color: var(--warn); font-weight: 600; }
+  .pill { display:inline-block; font-size:11.5px; font-weight:700; padding:1px 8px; border-radius:999px; }
+  .pill.ctrl { background: var(--accent-soft); color: var(--accent); }
+  .pill.data { background: var(--good-soft); color: var(--good); }
+  .verdict { font-size:11.5px; font-weight:700; padding:1px 7px; border-radius:5px; white-space:nowrap; }
+  .v-ok { background: var(--good-soft); color: var(--good); }
+  .v-part { background: var(--warn-soft); color: var(--warn); }
+  .v-no { background: var(--bad-soft); color: var(--bad); }
+  del { color: var(--muted); text-decoration: line-through; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<span class="tag">RFC · DRAFT · rev 6 (implementation-readiness audit)</span>
+<h1>Concierge Wake Lifecycle &amp; the Control / Data-Plane Split</h1>
+<p class="sub">Why the concierge onboarding keeps breaking, the one owner that fixes it, the plane split that keeps that fix true at scale — corrected against the working tree by 7 independent reviews.</p>
+<div class="meta">
+  <span><b>Scope:</b> molecule-ai-sdk (schema SSOT) · molecule-core (incl. embedded hermes template) · workspace-runtime · manifest</span>
+  <span><b>Status:</b> direction accepted; specifics corrected; decisions locked</span>
+  <span><b>Author:</b> drafted with Claude</span>
+</div>
+
+<div class="callout warn">
+<b>Rev 4–5 changelog.</b> Seven agents verified each claim against the code. The <b>direction survived intact</b> (core owns the wake decision; control/data-plane split). The <b>specifics did not</b>: rule 5's file-map was wrong (it named a function that doesn't exist), rule 4's cleanup target was already deleted, rule 1's fix as-worded was a regression, and the invariant table over-claimed. Every correction is folded in below and flagged <span class="verdict v-part">CORRECTED</span>. Verdicts: <span class="verdict v-ok">CONFIRMED</span> <span class="verdict v-part">PARTIAL / CORRECTED</span> <span class="verdict v-no">REFUTED</span>. <b>Rev 5:</b> rule 3 is revived — not as "converge the classifier" but as the <b>one-line agent model</b> (§5.5): idle runs on the canvas line and a user turn preempts it. The three open decisions are locked (show prompts; adopt the 5 contract items; idle resolved by design — no live recheck).
+</div>
+
+<div class="callout warn">
+<b>Rev 6 — implementation-readiness audit (6 more passes: SSOT · abstraction · SDK · CI · cleanup · docs).</b> The operational output lives in a companion, <code>rfc-concierge-implementation-checklist.html</code> (per-repo CI commands, per-step checklist, cleanup + docs inventories). Design-level corrections folded here. Two <b>new latent bugs</b> the audit found (fix under the same owner): (1) <code>self-lifecycle</code> is missing from core's <code>selfSourceTypes</code> → a reprovision wake renders as a <b>blue user bubble today</b>; (2) <code>buildStallProbeBody</code>/<code>buildNudgeBody</code> stamp no <code>contextId</code>/<code>source_type</code> → those self-wakes leak as user bubbles and fragment the session. Emitter count is <b>4+N</b> (add stall, nudge, harvester, reprovision, initial-prompt), not four. And there is a <b>4th artifact</b>: <code>molecule-ai-sdk</code> owns the wire schemas — heartbeat changes are SDK-first and <code>schema-sync</code> blocks the runtime release.
+</div>
+<div class="legend">
+  <span class="repo">molecule-ai-sdk</span> schema SSOT ·
+  <span class="repo core">molecule-core</span> Go control plane + embedded hermes template ·
+  <span class="repo rt">workspace-runtime</span> Python reconciler ·
+  <span class="repo man">manifest</span> pin
+</div>
+
+<h2>1. The evidence (from Langfuse traces)</h2>
+<table>
+<thead><tr><th>What was seen</th><th>Verified root</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td><b>Restart-context fired on a genuine first boot</b></td><td>Confirmed: restart-context has no first-boot arbitration and is <i>designed</i> to render on a no-prior-session box (<code>restart_context.go:101-102</code>). It fires on every <b>restart</b>; a fresh box is hit because the reconcile restart happens <i>inside</i> the first-boot sequence.</td><td><span class="verdict v-ok">CONFIRMED</span></td></tr>
+<tr><td><b>Raw internal prompts appear as SYSTEM messages</b></td><td>This is the classifier working <b>as designed</b> — self-source turns are re-roled to <code>system/notice</code> and deliberately <i>surfaced</i>, never dropped (<code>postgres_store.go:493-501</code>). Not a leak. Whether to <i>hide</i> them instead is a product decision (§8, open).</td><td><span class="verdict v-no">NOT A BUG</span></td></tr>
+<tr><td><b>Idle prompt in a different session</b></td><td>The Langfuse <i>trace</i> session converges (#350) — that part is fine. But the idle turn runs on a freshly-minted <b>routing <code>context_id</code></b> (<code>a2a_client.py:665-670</code>) — a <b>separate execution line</b>. That breaks the intended <b>one-agent-line</b> model (§5.5): idle work should run on the canvas line, and a user prompt should <b>preempt</b> it as highest priority — not run in parallel on a detached line. "Independent context prevents collision" is the wrong fix; preemption is the right one.</td><td><span class="verdict v-part">REAL (design)</span></td></tr>
+<tr><td><b>Fallback greeting instead of the real one</b></td><td>Confirmed end-to-end: greet turn hits the busy queue (<code>{"queued":true,...}</code>), <code>isQueuedA2AResponse</code> only matches <code>{"status":"queued"}</code>, greeter falls to <code>default</code> → empty text → static fallback. The real reply is written to <code>a2a_queue.response_body</code> but the drain path skips self-source turns, so it is <b>never delivered</b>.</td><td><span class="verdict v-ok">CONFIRMED</span></td></tr>
+</tbody>
+</table>
+<p><b>Reconcile race (verified, with nuance):</b> a watcher md5's the <code>mcp_servers:</code> block of the hermes gateway config (<code>~/.hermes/config.yaml</code>) and restarts the gateway on a persistent diff. The diff is driven by a shell-seeded YAML (<code>start.sh</code>) vs a Python <code>yaml.safe_dump</code> re-serialization of the <i>same</i> mapping — different formatters, same meaning. The restart is a <b>SIGTERM + 90 s drain</b>, not a blunt kill, and several mitigations already exist (settle-and-rebaseline, <code>molecule-runtime-prepare</code> pre-materialization). So the greeting dies mainly when it is <i>queued</i> (busy) rather than in-flight — tying this to the rule-1 symptom.</p>
+
+<h2>2. Why the fixes kept failing</h2>
+<div class="callout bad">
+Each attempt fixed one symptom in isolation inside a system with <b>no single owner of the flow</b>. A fix in one place was raced or undone by another; two attempts (the greeting-first status gate, #4606) failed review because they patched a delicate state machine without owning it end-to-end.
+</div>
+
+<h2>3. The design flaw</h2>
+<p><b>Three uncoordinated mechanisms</b> emit the onboarding self-turn (the "fallback" is a branch of the greeting, not a fourth peer), and many more self-wake types exist beyond onboarding (<code>self-cron</code>, <code>self-scheduler</code>, <code>self-goal-nudge</code>, <code>self-lifecycle</code>…). None share an owner:</p>
+<div class="diagram">
+<pre class="mermaid">
+flowchart TB
+  boot([Fresh workspace boots]) --> today
+  subgraph today["TODAY — three uncoordinated deciders (onboarding scope)"]
+    direction LR
+    R1["first-boot greeting (core) — fallback is a branch of this"]
+    R2["restart-context wake (core)"]
+    R3["idle self-tick (runtime, P4 trigger plugin)"]
+  end
+  R1 -->|greet turn queued when busy| GW
+  R2 -->|fires on any restart, no arbitration| GW
+  R3 -->|separate line breaks one-line model| GW
+  GW["hermes gateway plus reconcile restart"] --> CHAT["User chat and Langfuse session"]
+  Q(("no shared owner")) -.-> R1
+  Q -.-> R2
+  Q -.-> R3
+</pre>
+<div class="cap">No coordinator across when / which-session / visible / dedup. That is the flaw.</div>
+</div>
+
+<h2>4. The constraint: control plane vs data plane</h2>
+<p>"Make core own everything" fixes consistency but does not scale: a core on the hot path of every turn/log/wake, holding a live socket per agent, is a throughput wall and a single point of failure. The discriminator is <b>decision-frequency + consistency need</b>:</p>
+<table>
+<thead><tr><th>Concern</th><th>Frequency @ scale</th><th>Global consistency?</th><th>Plane</th></tr></thead>
+<tbody>
+<tr><td><b>Boot / wake lifecycle</b></td><td>rare per agent — <b>but correlated</b> (fleet reboots cluster)</td><td>yes (dedup, session, greet-once)</td><td><span class="pill ctrl">CONTROL</span></td></tr>
+<tr><td><b>Platform abilities</b></td><td>low per agent</td><td>yes (mutates the fleet)</td><td><span class="pill ctrl">CONTROL</span></td></tr>
+<tr><td><b>Turns</b></td><td>very high</td><td>no</td><td><span class="pill data">DATA</span></td></tr>
+<tr><td><b>Logs / telemetry</b></td><td>very high</td><td>no</td><td><span class="pill data">DATA</span></td></tr>
+</tbody>
+</table>
+<div class="callout warn">
+<b>Amendment (review-driven):</b> "rare" is per-agent average — wake decisions are <b>correlated</b> (a deploy/zone reboot boots the fleet together), so they cluster. And facts-up rides the heartbeat <i>into</i> core, so heartbeat ingest is itself a data-plane-frequency load on the control plane. Both must be bounded (jitter/splay on recovery; ingest cardinality), not waved through.
+</div>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart TB
+  user([User and channels]) --> gw
+  subgraph data["DATA PLANE — scales sideways, never blocks on core"]
+    direction LR
+    gw["Gateway tier: turns. stateless, sharded"]
+    pipe["Log / telemetry pipeline"]
+  end
+  subgraph control["CONTROL PLANE — core. sharded by org, low-QPS"]
+    direction LR
+    core["Desired state, policy, identity, WAKE DECISION"]
+    sched["Restart scheduling (idle stays in runtime, P4)"]
+  end
+  subgraph fleet["WORKSPACE FLEET — N local reconcilers"]
+    direction LR
+    rt1["runtime W1: reconcile, run tasks, use plugins, idle trigger"]
+    rt2["runtime W2"]
+    rtN["runtime WN"]
+  end
+  gw --> rt1
+  rt1 -->|ship logs| pipe
+  core -.->|desired state + generation| rt1
+  rt1 -.->|facts via versioned heartbeat| core
+  core -.->|pointers only| pipe
+</pre>
+<div class="cap">Core sets <b>desired state</b> (rare); runtimes <b>reconcile</b> locally. Idle scheduling stays a per-workspace runtime trigger (P4) — it is <i>more</i> scalable there, not less.</div>
+</div>
+
+<h2>5. Proposed design — core owns desired state, runtime reconciles</h2>
+<div class="callout good">
+<b>Owner = molecule-core (control plane).</b> Verified: the center of gravity is genuinely core-side — the greet-once marker, delivery sink (<code>AgentMessageWriter</code>), and self-source classification SSOT are cleanly in core; session authority and restart scheduling + boot-state are core building blocks. The <b>one runtime straggler</b> is the idle tick — and the correct move is to pull up only its <i>session/classification correctness</i>, <b>not</b> its scheduling (which P4 deliberately decentralized).
+</div>
+
+<h3>Invariant reality <span class="verdict v-part">CORRECTED</span></h3>
+<p>Rev 3 claimed "6 of 8 in core." Verified reality is ~<b>5 of 8</b>, and two rows were wrong:</p>
+<table>
+<thead><tr><th>Invariant</th><th>Reality</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>Dedup / greet-once</td><td>real persisted gate</td><td><span class="repo core">core</span> <code>first_boot_greeting.go:156-179</code> ✓</td></tr>
+<tr><td>Deliver real reply</td><td>SSOT sink</td><td><span class="repo core">core</span> <code>AgentMessageWriter</code> ✓</td></tr>
+<tr><td>Hidden / self-source</td><td>classify SSOT (stamp is runtime-side)</td><td><span class="repo core">core</span> <code>postgres_store.go:61-85</code> ✓</td></tr>
+<tr><td>Session binding</td><td><b>platform turns only</b>; idle binds runtime-side</td><td>partial — core authority + runtime <code>tracing.py</code></td></tr>
+<tr><td>First-boot vs restart</td><td><b>arbitration logic exists nowhere yet</b>; core holds only the ingredients</td><td>to build</td></tr>
+<tr><td>Restart / <del>idle</del> scheduling</td><td><b>idle scheduling is RUNTIME</b> — P4 retired core's cron loop (<code>scheduler_plugin.go</code>, <code>schedules_proxy.go</code>); only <i>restart</i> scheduling is core</td><td><span class="repo rt">runtime</span> (idle) / <span class="repo core">core</span> (restart)</td></tr>
+<tr><td>Readiness fact</td><td>correct</td><td><span class="repo rt">runtime</span> ✓</td></tr>
+<tr><td>Settled gateway</td><td>correct</td><td><span class="repo rt">runtime</span> + template ✓</td></tr>
+</tbody>
+</table>
+<p>The conclusion still holds — reality says "pull one straggler's session/classification up," not "move ownership down." The <i>table</i> was what needed fixing.</p>
+
+<h3>Reconcile model + the contract that must be pinned NOW</h3>
+<p>Mechanism = <b>level-triggered reconciliation</b> (Kubernetes-style) over the existing heartbeat, not a live command socket. But the review found that <b>greet-once is a one-shot effect, not a pure level</b> — greeting twice is a visible bug — so the reconcile shape alone is insufficient. These <b>contract</b> items are "the shape," not deferrable scale machinery; retrofitting them later is a protocol break + data migration:</p>
+<div class="callout bad">
+<ul>
+<li><b>Wake idempotency key</b> threaded decision → dispatch → delivery → marker. The only thing that makes exactly-once greeting survive retries, reconnects, and a future sharded gateway. <b>#1 priority.</b></li>
+<li><b>Marker-commit timing</b> — decision-time vs confirmed-delivery. Covers the two windows the link-down rule ignores: <i>decided-but-undelivered</i> (greeting lost forever) and <i>delivered-but-unreported</i> (double greet). This is the same race class we're eliminating, relocated to the decide/deliver boundary.</li>
+<li><b>Desired-state generation</b> on a <b>versioned heartbeat envelope</b> (k8s <code>observedGeneration</code>) so stale vs new desired state is distinguishable.</li>
+<li><b>Session-id namespacing</b> — decide <code>canvas-&lt;wsid&gt;</code> vs <code>canvas-&lt;org&gt;-&lt;wsid&gt;</code> now; it is written into the message store (migration to change later).</li>
+<li><b>Log pointer granularity</b> — per-session, not per-turn, or per-turn frequency leaks back into the control plane.</li>
+</ul>
+</div>
+<div class="callout warn">
+<b>Named tension:</b> the heartbeat interval is the <b>greeting-latency floor</b> — "greet now" only arrives on the next poll. The property that makes the mechanism scale (periodic, not live) directly slows the flagship greeting. Pick an interval (with jitter) consciously; a fast-lane nudge for the first greeting may be warranted.
+</div>
+
+<div class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Booting
+  Booting --> Settling: process up
+  Settling --> Ready: runtime reports SETTLED readiness (fact, contingent on rule 5)
+  Ready --> FirstBoot: no has_greeted marker
+  Ready --> Restart: has_greeted marker present
+  FirstBoot --> Greeted: emit ONE greeting w/ idempotency key, drain-deliver real reply
+  Restart --> Serving: emit restart-context, gated on marker
+  Greeted --> Serving: commit has_greeted on confirmed delivery
+  Serving --> Serving: idle ticks (runtime trigger), converged session, deduped
+  Greeted --> [*]
+</pre>
+<div class="cap">Marker commits on <b>confirmed delivery</b>; the greeting carries an idempotency key. A genuine first boot never takes the Restart edge.</div>
+</div>
+
+<h3>The contract (five rules) <span class="verdict v-part">CORRECTED</span></h3>
+<table>
+<thead><tr><th>#</th><th>Rule (corrected)</th><th>Owner</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><b>Greet when ready; deliver the REAL reply.</b> Recognize <i>every</i> queued shape (<code>{"status":"queued"}</code> AND <code>{"queued":true}</code>) — <b>and</b> wire drain-delivery: read the drained reply from <code>a2a_queue.response_body</code> (keyed by the returned <code>queue_id</code>) and deliver via <code>AgentMessageWriter</code>. <span class="bad">Recognition alone is a regression</span> (push-mode busy has no <code>/notify</code>, so it would silently deliver nothing). Static fallback is a true last resort.</td><td><span class="repo core">core</span></td></tr>
+<tr><td>2</td><td><b>Genuine first boot never takes the restart path.</b> A marker written at <b>greet/boot time</b> (a <code>has_greeted</code> column or a non-suppressed boot-event <code>activity_logs</code> row) arbitrates. Pure reuse of the greet-once <i>user-chat</i> gate is insufficient — it leaves a double-greet hole (greeted-but-user-silent + reconcile restart).</td><td><span class="repo core">core</span></td></tr>
+<tr><td>3</td><td><b>Idle runs on the single agent line; a user turn preempts it.</b> Remove the independent routing <code>context_id</code> for the idle wake — run it on the canvas context so it shares the agent's one line and conversation memory. A user prompt cuts in at highest priority (interrupt / priority-queue via the lifecycle owner), instead of racing a detached parallel line. Full behavior contract in §5.5. (Self-source classification + Langfuse convergence are already correct — unchanged.)</td><td><span class="repo core">core</span> + <span class="repo rt">runtime</span></td></tr>
+<tr><td>4</td><td><b>Readiness is a settled fact — achieved via rule 5, not a probe change.</b> The probe cannot observe reconcile convergence; rule 5 removes the restart, which is what makes "ready" safe. <b>Rule 4 is contingent on rule 5.</b></td><td><span class="repo rt">runtime</span> → <span class="repo core">core</span></td></tr>
+<tr><td>5</td><td><b>Make the config write idempotent + parse-and-compare the reconcile.</b> The unconditional <code>yaml.safe_dump</code> rewrite is the byte-diff source; the watcher compares raw bytes. Fix both.</td><td><span class="repo core">core</span> (embedded template)</td></tr>
+</tbody>
+</table>
+
+<h3 id="s55">5.5 The one-line agent model + idle behavior contract <span class="verdict v-part">NEW</span></h3>
+<div class="callout good">
+<b>The agent is one line.</b> Everything — user turns, the greeting, restart-context, and the idle wake — runs on a <b>single execution line</b> per workspace (the canvas context), sharing one conversation memory. A user prompt is always <b>highest priority</b> and preempts whatever the agent is doing. The idle wake is not a parallel side-thread; it is low-priority work the agent does <i>on that same line</i> when the line is otherwise quiet.
+</div>
+<p>This settles the idle-context question directly. The independent <code>context_id</code> for the idle wake was a workaround to stop a returning user turn from colliding with in-flight idle work — but collision is the <b>wrong</b> thing to avoid. The correct behavior is <b>preemption</b>: the user turn cuts in and wins. So the fix is to put idle back on the one line and arbitrate priority, not to keep it on a detached line.</p>
+<p><b>Idle behavior contract</b> — the flow the idle wake drives:</p>
+<ol>
+<li>Fire only after a genuine idle interval — no user turn and no agent tool-calls for the window.</li>
+<li>Wake on the <b>current session</b> (one line, full conversation memory), not a fresh context.</li>
+<li>The agent triages what's top-priority, and <b>may fan out subagents</b> to work items in parallel (faster, better compute use).</li>
+<li><b>Ack before working:</b> e.g. "No active work from you right now — I'm picking up: &lt;items&gt;. I'll report back as each is done."</li>
+<li><b>Report per work item</b> as it completes (visible in canvas chat — wake prompts are shown, per the resolved decision).</li>
+<li>Continue until there's nothing left — no backlog, no long-term goals — then close the idle loop until the next wake.</li>
+<li>At any point, a user prompt <b>preempts</b> the idle work and takes over.</li>
+</ol>
+<div class="callout warn">
+<b>Delivery implication.</b> This is more than "forward the final reply." The idle turn emits <b>multiple</b> user-facing messages over its lifetime (the upfront ack + a status per work item) — the agent proactively messages the user via its send-to-user tool, rather than the poster forwarding one response body (<code>idle_digest/poster.py</code> forwards a single reply today). The mechanism must support proactive, multi-message idle reporting on the canvas line, and it must be cleanly interruptible when the user returns.
+</div>
+
+<h2>6. Cross-repo file map <span class="verdict v-part">CORRECTED</span></h2>
+<div class="callout warn"><b>Structural correction.</b> There are <b>three</b> artifacts, not four — the hermes template is checked out <i>inside</i> molecule-core at <code>workspace-configs-templates/hermes/</code>. <b>MUST VERIFY before editing:</b> whether that local copy is authoritative for provisioning or whether the manifest-pinned <code>molecule-ai-workspace-template-hermes</code> (line 33) is — it decides whether template edits deploy with core or need a pin bump.</div>
+
+<h3>A · <span class="repo core">molecule-core</span> — Go platform, <code>workspace-server/internal/</code></h3>
+<table>
+<thead><tr><th>File</th><th>Action</th><th>Change</th></tr></thead>
+<tbody>
+<tr><td><code>handlers/wake_lifecycle.go</code></td><td><span class="add">ADD</span></td><td>Desired-state owner + idempotency key + marker-commit-on-delivery. The single decider.</td></tr>
+<tr><td><code>handlers/first_boot_greeting.go</code></td><td><span class="mod">MODIFY</span></td><td>Recognize both queued shapes; <b>drain-deliver</b> from <code>a2a_queue.response_body</code> via <code>AgentMessageWriter</code>. (<code>isQueuedA2AResponse:232</code> is the outlier — <code>delegation.go:1468</code> already matches <code>queued:true</code>.)</td></tr>
+<tr><td><code>handlers/a2a_queue.go</code></td><td><span class="mod">MODIFY</span></td><td><code>attachQueuedTurnCompletion</code> (<code>:130-132</code>) currently skips self-source turns — carve a first-boot exception to broadcast the drained greeting, or expose <code>response_body</code> read-by-<code>queue_id</code> for the greeter.</td></tr>
+<tr><td><code>handlers/restart_context.go</code></td><td><span class="mod">MODIFY</span></td><td>Gate the two trigger sites on the boot-time marker; skip on genuine first boot.</td></tr>
+<tr><td><code>handlers/workspace_restart.go</code></td><td><span class="mod">MODIFY</span></td><td>Route restart self-fire (<code>:494</code>, <code>:1311</code>) through the lifecycle.</td></tr>
+<tr><td>turn arbitration / preemption</td><td><span class="mod">MODIFY</span></td><td><b>Rule 3 / one-line model:</b> a user turn preempts in-flight idle work at highest priority (interrupt or priority-queue) so idle + user share one line safely. Builds on the existing interrupt path (the "⚡ Interrupting current task" mechanism).</td></tr>
+<tr><td><code>handlers/registry.go</code></td><td><span class="keep">KEEP</span></td><td>Already gates online + greeting on the readiness fact (<code>:1734/1809/1824</code>). <del>Delete fireConciergeWarmup</del> — <b>already removed</b>; no action.</td></tr>
+<tr><td>new migration + marker read/write</td><td><span class="add">ADD</span></td><td><code>has_greeted</code>/<code>has_booted</code> marker (column or boot-event row), committed on confirmed delivery.</td></tr>
+<tr><td><code>sessionid/</code>, <code>messagestore/</code></td><td><span class="keep">KEEP</span></td><td>Classifier + session authority are correct as-is. Only touched if the surface-vs-hide decision (§8) says "hide."</td></tr>
+</tbody>
+</table>
+
+<h3>A′ · <span class="repo core">embedded hermes template</span> — <code>workspace-configs-templates/hermes/</code></h3>
+<table>
+<thead><tr><th>File</th><th>Action</th><th>Change</th></tr></thead>
+<tbody>
+<tr><td><code>adapter.py::register_mcp_server_hook</code> (<code>:336-352</code>)</td><td><span class="mod">MODIFY</span></td><td>The real culprit: unconditional <code>write_text(yaml.safe_dump(...))</code>. Add an <code>if servers.get(name)==spec: return</code> guard so a semantically-unchanged map is a no-op. (<b>Not</b> <code>adapter_base.py::render_hermes_config</code> — that function does not exist.)</td></tr>
+<tr><td><code>scripts/mcp-reconcile-watch.sh</code> (<code>:53-55</code>)</td><td><span class="mod">MODIFY</span></td><td>Replace <code>sed | md5sum</code> with a parse-and-compare of the <code>mcp_servers</code> mapping. <b>Do NOT delete</b> — it is the backstop for hermes ≥0.19 eager-discovery missing post-launch servers ("31 tools instead of ~91").</td></tr>
+<tr><td><code>start.sh</code> (seed <code>:545-548</code>)</td><td><span class="mod">MODIFY</span></td><td>The shell heredoc seed is the actual diff source vs the Python writer. Reconcile: seed via the same serializer, or don't seed <code>mcp_servers</code> at all and let the prepare step materialize it.</td></tr>
+</tbody>
+</table>
+
+<h3>B · <span class="repo rt">workspace-runtime</span> — Python, <code>molecule_runtime/</code></h3>
+<table>
+<thead><tr><th>File</th><th>Action</th><th>Change</th></tr></thead>
+<tbody>
+<tr><td><code>heartbeat.py</code> / envelope</td><td><span class="mod">MODIFY</span></td><td>Add desired-state <b>generation</b> + version the envelope (the contract items). Readiness stays a reported fact.</td></tr>
+<tr><td><code>mcp_readiness_probe.py</code></td><td><span class="keep">KEEP</span></td><td>Already reconcile-independent by design; rule 5 (not a probe change) closes the race.</td></tr>
+<tr><td><code>skills_render.py</code> (<code>:340-348</code>)</td><td><span class="keep">KEEP</span></td><td>Already conditional and writes <code>skills:</code>, not <code>mcp_servers</code> — not the diff source. Left alone.</td></tr>
+<tr><td>rt <code>trigger_state.py</code> + <code>main.py</code> idle loop; <b>P4 scheduling is core Go</b> (<code>scheduler_plugin.go</code> / <code>schedules_proxy.go</code>)</td><td><span class="keep">KEEP</span> scheduling</td><td><b>Do NOT move scheduling to core</b> — P4 already decentralized it. <i>When</i> idle fires stays put; only the execution line + delivery change. (Earlier file-map mislabeled this as runtime <code>scheduler_plugin.py</code> — corrected; the runtime has <code>trigger_state.py</code>, not <code>scheduler_plugin.py</code>.)</td></tr>
+<tr><td><code>a2a_client.py::build_message_send_params</code> (self-idle) · <code>idle_digest/poster.py</code></td><td><span class="mod">MODIFY</span></td><td><b>Rule 3 / one-line model:</b> run the idle wake on the <b>canvas <code>context_id</code></b> (stop minting an independent one for self-idle) so it shares the agent's line + memory. Replace single-reply forwarding with proactive, multi-message idle reporting (ack + per-work status), cleanly interruptible.</td></tr>
+</tbody>
+</table>
+
+<h3>C · <span class="repo man">manifest</span></h3>
+<p><code>manifest.json:33</code> hermes pin — bump <b>only if</b> the authoritative template is the pinned repo (see §6 MUST-VERIFY). If the embedded <code>workspace-configs-templates/hermes/</code> is authoritative, template edits deploy with core and no pin bump is needed. Production deploy either way — your confirm.</p>
+
+<h2>7. Sequencing</h2>
+<div class="card"><p><span class="num">0</span><b>Verify template authority · pin the contract · land the SDK schema</b> &nbsp;<span class="repo">sdk</span> <span class="repo core">core</span> <span class="repo rt">runtime</span></p><p>Resolve which hermes template is authoritative (§6 MUST-VERIFY). Decide the 5 contract items (§5). <b>Land the SDK schema PRs FIRST</b> — the heartbeat generation/versioned envelope is a <code>molecule-ai-sdk</code> change and <code>schema-sync</code> BLOCKS the runtime auto-release until it merges (companion checklist §4). These gate everything else.</p></div>
+<div class="card"><p><span class="num">1</span><b>Rule 5 — idempotent config write + parse-and-compare</b> &nbsp;<span class="repo core">core</span> (embedded template)</p><p>Guard <code>register_mcp_server_hook</code>; parse-compare the watcher; reconcile the <code>start.sh</code> seed. <span class="good">Stops the spurious restart.</span> Verify on the local stack.</p></div>
+<div class="card"><p><span class="num">2</span><b>Rule 4 falls out of rule 5</b> &nbsp;<span class="repo rt">runtime</span></p><p>No probe change needed; confirm "ready" no longer precedes a restart once rule 5 lands. Add the versioned-heartbeat/generation fields here.</p></div>
+<div class="card"><p><span class="num">3</span><b>Deploy</b> &nbsp;<span class="repo man">manifest</span>/<span class="repo core">core</span> &nbsp;<span class="footnote">(your confirm)</span></p><p>Per §6 authority: pin bump, or ships with core.</p></div>
+<div class="card"><p><span class="num">4</span><b>Rule 1 — recognize both shapes + drain-deliver</b> &nbsp;<span class="repo core">core</span></p><p>The core correctness fix. <b>Must</b> include the drain-delivery wiring, not just shape recognition.</p></div>
+<div class="card"><p><span class="num">5</span><b>Rule 2 — boot-time marker + lifecycle owner</b> &nbsp;<span class="repo core">core</span></p><p>Add <code>wake_lifecycle.go</code> + marker + idempotency key; gate restart-context; arbitrate first-boot vs restart.</p></div>
+<div class="card"><p><span class="num">6</span><b>Delete dead code + docs</b> &nbsp;<span class="repo core">core</span> <span class="repo rt">runtime</span></p><p>Remove the now-folded standalone restart trigger + #4606 remnants; reconcile docs. <b>Scope corrected:</b> no <code>fireConciergeWarmup</code> to delete (gone), no scheduler move (P4), no classifier rewrite (correct).</p></div>
+
+<h2>8. Decisions — locked</h2>
+<table>
+<thead><tr><th>Decision</th><th>Resolution</th></tr></thead>
+<tbody>
+<tr><td><b>Surface vs hide wake prompts</b></td><td><span class="good">SHOW them.</span> Not a problem to fix — the greeting/restart/idle prompts and the idle ack + per-work status all render in canvas chat. No suppression work; the classifier stays as-is.</td></tr>
+<tr><td><b>Adopt the 5 contract items now?</b></td><td><span class="good">YES.</span> Idempotency key, marker-commit-on-delivery, desired-state generation on a versioned heartbeat, session namespacing, log-pointer granularity — pinned in step 0 before any code.</td></tr>
+<tr><td><b>Idle "different session"</b></td><td><span class="good">Resolved by the one-line model (§5.5) — no live recheck needed.</span> Target design is defined regardless: idle runs on the one canvas line with full memory; a user turn preempts as highest priority; the independent routing context is removed.</td></tr>
+</tbody>
+</table>
+
+<h2>9. Resolved decisions</h2>
+<table>
+<thead><tr><th>Question</th><th>Resolution</th></tr></thead>
+<tbody>
+<tr><td>Owner placement</td><td><span class="good">CORE owns desired state; runtime reconciles.</span> Verified core-resident center of gravity.</td></tr>
+<tr><td>Core "owns all flows"?</td><td><span class="good">No — decisions, not the hot path.</span> Turns/logs are data-plane.</td></tr>
+<tr><td>Command socket vs heartbeat</td><td><span class="good">Versioned heartbeat reconcile</span>, not a live socket.</td></tr>
+<tr><td>Link-down</td><td><span class="good">Reconcile toward last-known</span> — but bounded by the idempotency key + marker-commit timing (else greeting is lost or doubled).</td></tr>
+<tr><td>Idle scheduling</td><td><span class="good">Stays in the runtime (P4).</span> <i>When</i> idle fires is not moved to core.</td></tr>
+<tr><td>Idle execution line</td><td><span class="good">One line.</span> The idle turn runs on the canvas context with full memory; a user turn preempts it as highest priority. The independent routing context is removed. (Scheduling location unchanged; only the execution line + arbitration change.)</td></tr>
+<tr><td>Restart-context on first boot</td><td><span class="good">Never</span> — boot-time marker arbitrates.</td></tr>
+</tbody>
+</table>
+
+<hr>
+<p class="footnote">Rev 4 reconciles rev 3 against seven independent code-verification passes. Every "CORRECTED" mark reflects a claim the working tree refuted or refined. On sign-off I'll implement in the step order above — step 0 (verify template authority + pin the contract) first, the manifest pin bump held for your explicit confirm.</p>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js" crossorigin="anonymous"></script>
+<script>
+  (function () {
+    var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    if (window.mermaid) {
+      mermaid.initialize({ startOnLoad: true, securityLevel: 'loose', theme: dark ? 'dark' : 'neutral' });
+    } else {
+      document.querySelectorAll('pre.mermaid').forEach(function (el) {
+        el.insertAdjacentHTML('beforebegin',
+          '<div style="color:#b8860b;font-size:13px">[diagram needs internet to render — mermaid.js failed to load; the code is below]</div>');
+      });
+    }
+  })();
+</script>
+</body>
+</html>
