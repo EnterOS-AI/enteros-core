@@ -810,7 +810,7 @@ handleSuccess:
 	// queued JSON is the agent's reply. Fixes the chat-leak where the
 	// LLM echoed "Delegation completed (workspace agent busy ...)" to
 	// the user.
-	if status == http.StatusAccepted && isQueuedProxyResponse(respBody) {
+	if queued, _ := QueuedA2AResponse(respBody); status == http.StatusAccepted && queued {
 		log.Printf("Delegation %s: target %s busy — queued for drain", delegationID, targetID)
 		// activity_logs ONLY — deliberately not the ledger.
 		//
@@ -1452,21 +1452,6 @@ func isDeliveryConfirmedSuccess(proxyErr *proxyA2AError, status int, respBody []
 		return false
 	}
 	return true
-}
-
-// isQueuedProxyResponse reports whether the proxy returned a body shaped like
-// `{"queued": true, "queue_id": ..., "queue_depth": ..., "message": ...}` —
-// the busy-target enqueue path in a2a_proxy_helpers.go. Caller checks this
-// alongside HTTP 202 to distinguish a successful agent reply from a deferred
-// dispatch; without the distinction we'd write the queued-message JSON into
-// the delegation result row and the LLM would surface it as agent output.
-func isQueuedProxyResponse(body []byte) bool {
-	var resp map[string]interface{}
-	if json.Unmarshal(body, &resp) != nil {
-		return false
-	}
-	queued, _ := resp["queued"].(bool)
-	return queued
 }
 
 func extractResponseText(body []byte) string {
