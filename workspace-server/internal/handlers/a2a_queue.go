@@ -78,6 +78,38 @@ func extractExpiresInSeconds(body []byte) int {
 	return seconds
 }
 
+// QueuedA2AResponse reports whether resp is one of the proxy's "accepted but
+// NOT answered — deferred" acknowledgements and, when present, extracts the
+// queue row id. TWO shapes exist and every caller must recognize BOTH:
+//
+//   - busy-target enqueue (a2a_proxy_helpers.go): 202 + {"queued":true,
+//     "queue_id":...,"queue_depth":...} — the target was busy, so the turn was
+//     persisted to a2a_queue and will be dispatched on the next drain.
+//   - poll-mode / push-async short-circuit (a2a_proxy.go): {"status":"queued",
+//     "delivery_mode":...} — the turn was accepted but the agent answers later
+//     out-of-band.
+//
+// In neither case is resp the agent's real reply, so callers must NOT relay it
+// as agent output. This unifies the two former local predicates
+// (delegation.isQueuedProxyResponse + first-boot.isQueuedA2AResponse) so a new
+// queued shape is handled in exactly one place. A non-bool `queued` value
+// (e.g. the string "true") makes the whole decode fail and returns false —
+// defensive parity with the old map[string]interface{} type-assertion check.
+func QueuedA2AResponse(resp []byte) (queued bool, queueID string) {
+	var body struct {
+		Status  string `json:"status"`
+		Queued  *bool  `json:"queued"`
+		QueueID string `json:"queue_id"`
+	}
+	if err := json.Unmarshal(resp, &body); err != nil {
+		return false, ""
+	}
+	if body.Status != "queued" && (body.Queued == nil || !*body.Queued) {
+		return false, ""
+	}
+	return true, body.QueueID
+}
+
 const (
 	PriorityCritical = 100
 	PriorityTask     = 50
@@ -114,8 +146,20 @@ const transientRetryBackoffSecs = 5
 // system callers, so the full logging path would treat platform boot turns
 // as canvas turns (broadcast internal replies into chat, trip the greet-once
 // gate, duplicate busy re-queues — review wf_b8f98be3). Skips:
-//   - self-source platform turns (restart-context wake, first-boot greet)
+//   - peer/delegation turns (caller_id present) — stitched via delegation rows
+//   - self-source platform turns (restart-context wake, harvester nudges) —
+//     internal self-messages the user must never see
 //   - unkeyed messages (an insert would duplicate, never collapse)
+//
+// EXCEPTION (RFC concierge rule 1): the first-boot greeting
+// (source_type=self-first-boot-greet) is self-source but IS the user-facing
+// message. When its greet turn was busy-queued, THIS drain carries the agent's
+// only real reply — the synchronous greet path already returned without
+// sending anything (first_boot_greeting.go), so route the drained reply to the
+// AgentMessageWriter SSOT here instead of skipping it, otherwise the fresh chat
+// opens silent or on the static fallback. Every OTHER self-source turn keeps
+// the skip. This is the single delivery on that path (dedup-safe).
+//
 // The upsert lands on the row the original ingest wrote (ON CONFLICT
 // workspace_id,message_id), so no new bubble is ever created here.
 func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, workspaceID string, hasCaller bool, reqBody, respBody []byte) {
@@ -128,6 +172,12 @@ func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, works
 		return
 	}
 	if st := messagestore.RequestSourceType(reqBody); st != "" && messagestore.IsSelfSourceType(st) {
+		// First-boot greeting exception — see the doc comment. Its busy-queued
+		// greet turn sent nothing; this drain carries the real reply, so deliver
+		// it rather than swallowing it as an internal self-message.
+		if st == firstBootGreetSourceType {
+			h.deliverDrainedFirstBootGreeting(ctx, workspaceID, respBody)
+		}
 		return
 	}
 	messageID := extractIdempotencyKey(reqBody)
@@ -163,6 +213,39 @@ func (h *WorkspaceHandler) attachQueuedTurnCompletion(ctx context.Context, works
 			Status:       "ok",
 			MessageId:    messageID,
 		})
+	})
+}
+
+// deliverDrainedFirstBootGreeting delivers the agent's REAL first-boot greeting
+// after its greet turn was busy-queued and is only now draining (RFC concierge
+// rule 1). The synchronous greet path (first_boot_greeting.go) returned on the
+// queued ack WITHOUT sending anything, so THIS is the single delivery — routed
+// through the AgentMessageWriter SSOT exactly like a normal greeting (the same
+// writer shape router.go wires), which is dedup-safe because it is the only
+// writer on this path. Mirrors the writer construction the production greeter
+// uses (broadcaster only; no push notifier).
+//
+// Runs async (goAsync) so the workspace-lookup + broadcast + persist never
+// stalls the drain loop, matching attachQueuedTurnCompletion's own async write.
+//
+// Last-resort fallback: if the drained reply yields no usable prose (LLM error
+// / unknown shape), send the role-agnostic static greeting so a fresh
+// onboarding never opens on a silent chat — the ONLY case the fallback fires on
+// this path, and only because the queued reply genuinely arrived empty.
+func (h *WorkspaceHandler) deliverDrainedFirstBootGreeting(ctx context.Context, workspaceID string, respBody []byte) {
+	text := greetingTextFromReply(respBody)
+	if text == "" {
+		text = firstBootFallbackText(0)
+	}
+	h.goAsync(func() {
+		sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), greetSendTimeout)
+		defer cancel()
+		writer := NewAgentMessageWriter(db.DB, h.broadcaster)
+		if err := writer.Send(sendCtx, workspaceID, text, nil); err != nil {
+			log.Printf("first-boot greeting: drained real-reply delivery failed for %s: %v", workspaceID, err)
+			return
+		}
+		log.Printf("first-boot greeting: delivered drained real reply to %s", workspaceID)
 	})
 }
 
