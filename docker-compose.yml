@@ -366,7 +366,7 @@ services:
   # observability without a Loki/Grafana stack. UI: http://127.0.0.1:3110.
   # No DOZZLE_FILTER on purpose — show everything so nothing is hidden.
   dozzle:
-    image: amir20/dozzle:latest
+    image: amir20/dozzle:latest@sha256:bc1ee4ba8d66c7fc0d03823a78486165fb219809f79eaf54cecf3114d647ab14
     container_name: molecule-dozzle
     logging: *default-logging
     volumes:
