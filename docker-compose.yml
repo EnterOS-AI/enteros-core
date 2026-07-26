@@ -344,6 +344,26 @@ services:
       retries: 5
       start_period: 20s
 
+  # Dozzle — lightweight real-time log viewer for EVERY container on the
+  # daemon: each ws-<id> workspace runtime, all infra, tenants. Reads the
+  # Docker socket read-only; no DB, no agents, no config. Single-tenant
+  # observability without a Loki/Grafana stack. UI: http://127.0.0.1:3110.
+  # No DOZZLE_FILTER on purpose — show everything so nothing is hidden.
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: molecule-dozzle
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "127.0.0.1:${DOZZLE_PORT:-3110}:8080"
+    environment:
+      DOZZLE_NO_ANALYTICS: "true"
+      # Keep more scrollback than the default so a full boot sequence is visible.
+      DOZZLE_TAILSIZE: "1000"
+    networks:
+      - molecule-core-net
+    restart: unless-stopped
+
 networks:
   molecule-core-net:
     name: molecule-core-net

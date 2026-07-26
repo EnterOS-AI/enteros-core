@@ -7,8 +7,10 @@
 #      clickhouse + populates template/plugin registry from manifest.json)
 #   3. Starts the platform (Go :8080), waits for /health
 #   4. Starts the canvas (Next.js :3000), waits for HTTP 200
+#      4b. Starts logdy (if installed) tailing the platform/canvas host
+#          log files — Dozzle can't see them since they're not containers
 #   5. Prints a readiness banner with API-key add instructions
-#   6. On Ctrl-C, kills both background processes and tears down infra
+#   6. On Ctrl-C, kills all background processes and tears down infra
 #
 # Prerequisites:
 #   - Docker + Docker Compose v2  (for postgres/redis/langfuse/etc)
@@ -49,6 +51,7 @@ export COMPOSE_PROJECT_NAME
 LANGFUSE_CONTAINER="${COMPOSE_PROJECT_NAME}-langfuse-1"
 PLATFORM_PID=
 CANVAS_PID=
+LOGDY_PID=
 FRESH=0
 
 print_usage() {
@@ -205,6 +208,9 @@ cleanup() {
     fi
     if [ -n "${CANVAS_PID:-}" ]; then
         kill "$CANVAS_PID" 2>/dev/null || true
+    fi
+    if [ -n "${LOGDY_PID:-}" ]; then
+        kill "$LOGDY_PID" 2>/dev/null || true
     fi
     cleanup_dev_stack
     echo "    Done."
@@ -365,6 +371,9 @@ MOLECULE_MINIO_HOST_PORT=${MOLECULE_MINIO_HOST_PORT:-$(pick_port 9000)}
 MOLECULE_MINIO_CONSOLE_HOST_PORT=${MOLECULE_MINIO_CONSOLE_HOST_PORT:-$(pick_port 9001)}
 PLATFORM_PORT=$(pick_port 8080)
 CANVAS_PORT=$(pick_port 3000)
+# Sequential with Dozzle's :3110 (container logs) below — this is the HOST
+# process log viewer (see section 4b).
+LOGDY_PORT=${LOGDY_PORT:-$(pick_port 3111)}
 export MOLECULE_PG_HOST_PORT MOLECULE_REDIS_HOST_PORT \
        MOLECULE_MINIO_HOST_PORT MOLECULE_MINIO_CONSOLE_HOST_PORT
 
@@ -703,6 +712,42 @@ fi
 ./node_modules/.bin/next dev --turbopack -p "$CANVAS_PORT" > /tmp/molecule-canvas.log 2>&1 &
 CANVAS_PID=$!
 
+# ─────────────────────────────────────────── 4b. host log viewer (logdy)
+#
+# Platform (`go run ./cmd/server`) and Canvas (`next dev`) above are HOST
+# processes, not containers, so their output lands in
+# /tmp/molecule-platform.log / /tmp/molecule-canvas.log — Dozzle (:3110)
+# only tails container logs via the Docker socket and can never see them.
+#
+# Surface these with logdy (https://logdy.dev — single static binary) run
+# as a HOST process, not as an added docker-compose service bind-mounting
+# /tmp: on Docker Desktop for Windows that bind mount is fragile in two
+# independent ways that don't show up as an obvious error —
+#   1. Docker Desktop only shares WINDOWS DRIVE paths (C:/Users/... or
+#      //c/Users/...) into its WSL2/Hyper-V backend. A bare `/tmp:...`
+#      compose volume resolves inside the Desktop VM's OWN root filesystem,
+#      not this host's /tmp — a different, unrelated directory — so the
+#      mount is either empty or errors, never the files we want.
+#   2. Even fixed up, Git-Bash/MSYS rewrites POSIX-looking path arguments
+#      before they reach the docker CLI, which can mangle a manually-typed
+#      bind-mount source further.
+# Running logdy as a plain host process sidesteps both: it opens the files
+# by path on the SAME host that wrote them, no VM/path-translation layer
+# involved, and the exact same invocation works on macOS/Linux too.
+#
+# Soft-dependency (same posture as jq in infra/scripts/setup.sh): skip with
+# install instructions if it's not on PATH rather than failing the script.
+if command -v logdy >/dev/null 2>&1; then
+    echo "==> Starting logdy log viewer (:${LOGDY_PORT}) — platform + canvas host logs"
+    logdy follow /tmp/molecule-platform.log /tmp/molecule-canvas.log \
+        --full-read -p "$LOGDY_PORT" > /tmp/molecule-logdy.log 2>&1 &
+    LOGDY_PID=$!
+else
+    echo "==> logdy not found on PATH — skipping live log viewer for host logs"
+    echo "    Install: curl -sSL https://logdy.dev/install.sh | sh   (https://logdy.dev)"
+    echo "    Logs remain readable at /tmp/molecule-platform.log and /tmp/molecule-canvas.log"
+fi
+
 echo "    Waiting for Canvas HTTP 200..."
 # 180s, liveness-gated: a COLD Next.js/Turbopack compile on a loaded machine
 # routinely exceeds 30s, and the old hard 30s gate tore down the whole stack
@@ -734,6 +779,12 @@ fi
 
 # ─────────────────────────────────────────────── 5. readiness banner
 
+if [ -n "${LOGDY_PID:-}" ]; then
+    LOGS_LINE="  Logs:      http://127.0.0.1:${LOGDY_PORT}   (live tail: platform + canvas host logs)"
+else
+    LOGS_LINE="  Logs:      /tmp/molecule-platform.log · /tmp/molecule-canvas.log"
+fi
+
 cat <<EOF
 
 ═══════════════════════════════════════════════════════════
@@ -751,7 +802,7 @@ cat <<EOF
   MinIO:     127.0.0.1:${MOLECULE_MINIO_HOST_PORT} (S3 API, bucket: ${MOLECULE_WORKSPACE_DATA_BUCKET})
 
   Auth:      fail-closed — canvas uses the dev ADMIN_TOKEN (see .env)
-  Logs:      /tmp/molecule-platform.log · /tmp/molecule-canvas.log
+${LOGS_LINE}
              docker logs ${LANGFUSE_CONTAINER}   (trace sink)
              docker logs molecule-core-minio-1      (object store)
 

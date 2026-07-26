@@ -5,6 +5,7 @@ import { useCanvasStore, type WorkspaceNodeData } from "@/store/canvas";
 import { api } from "@/lib/api";
 import { showToast } from "./Toaster";
 import { statusDotClass } from "@/lib/design-tokens";
+import { workspaceLogsUrl } from "@/lib/dozzle";
 
 interface MenuItem {
   label: string;
@@ -222,6 +223,15 @@ export function ContextMenu() {
     closeContextMenu();
   }, [contextMenu, selectNode, setPanelTab, closeContextMenu]);
 
+  const handleViewLogs = useCallback(() => {
+    if (!contextMenu) return;
+    // Dev-only escape hatch: deep-links Dozzle filtered to this workspace's
+    // container (ws-<id>) instead of dumping the user into every container's
+    // logs. Opens in a new tab so the canvas/context menu state is untouched.
+    window.open(workspaceLogsUrl(contextMenu.nodeId), "_blank", "noopener,noreferrer");
+    closeContextMenu();
+  }, [contextMenu, closeContextMenu]);
+
   const setCollapsed = useCanvasStore((s) => s.setCollapsed);
   const handleCollapse = useCallback(async () => {
     if (!contextMenu) return;
@@ -276,6 +286,7 @@ export function ContextMenu() {
     { label: "Details", icon: "i", action: handleViewDetails },
     { label: "Chat", icon: "💬", action: handleOpenChat, disabled: !isOnline },
     { label: "Terminal", icon: ">_", action: handleOpenTerminal, disabled: !isOnline },
+    { label: "View Logs", icon: "🗎", action: handleViewLogs },
     { label: "", icon: "", action: () => {}, divider: true },
     { label: "Export Bundle", icon: "📦", action: handleExportBundle },
     { label: "Duplicate", icon: "⧉", action: handleDuplicate },
