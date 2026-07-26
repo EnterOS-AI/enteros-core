@@ -74,6 +74,19 @@ var selfSourceTypes = map[string]bool{
 	// The first-boot greeting's internal prompt (first_boot_greeting.go) —
 	// persisted only when a busy-queued greet turn is drained later.
 	"self-first-boot-greet": true,
+	// The runtime's reprovision/lifecycle wake (source_type "self-lifecycle").
+	// A lifecycle turn is a routine self-wake, NOT a human turn — without this
+	// marker it was classified as a genuine user message and rendered as a blue
+	// user bubble (2026-07-25 live bug).
+	"self-lifecycle": true,
+	// The platform stall-watchdog liveness probe (stall_watchdog.go,
+	// buildStallProbeBody). Fired to itself when a workspace is silent-but-busy;
+	// an internal wake, never a human turn.
+	"self-stall": true,
+	// The platform request-nudge sweeper's unhandled-inbox reminder
+	// (request_nudge_sweeper.go, buildNudgeBody). Fired to an idle agent about
+	// its own stale inbox items; an internal wake, never a human turn.
+	"self-nudge": true,
 }
 
 // IsSelfSourceType reports whether a params.metadata.source_type marker

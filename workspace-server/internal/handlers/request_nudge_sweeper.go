@@ -265,7 +265,7 @@ func (s *RequestNudgeSweeper) Sweep(ctx context.Context) NudgeResult {
 // last_nudged_at UPDATE only fires after a successful enqueue so a failed
 // enqueue is retried next sweep (the items stay un-stamped, hence eligible).
 func (s *RequestNudgeSweeper) nudgeAgent(ctx context.Context, recipientID string, ids []string, now time.Time) error {
-	body, err := buildNudgeBody(len(ids))
+	body, err := buildNudgeBody(recipientID, len(ids))
 	if err != nil {
 		return fmt.Errorf("build nudge body: %w", err)
 	}
@@ -298,7 +298,14 @@ func (s *RequestNudgeSweeper) nudgeAgent(ctx context.Context, recipientID string
 // buildNudgeBody constructs the A2A `message/send` JSON-RPC body for the nudge.
 // Mirrors the scheduler's body shape (role=user, generated messageId, single
 // text part) so the receiving agent processes it like any other inbound turn.
-func buildNudgeBody(n int) ([]byte, error) {
+//
+// The message carries platform self-source metadata (source="platform",
+// source_type="self-nudge") and the workspace's default-session contextId, the
+// same way buildRestartA2APayload stamps its wake: without source_type the nudge
+// leaks into My Chat as a blue user bubble (messagestore.selfSourceTypes must
+// list "self-nudge"); without contextId it mints a fresh runtime session,
+// fragmenting the conversation (Langfuse session fragmentation, 2026-07-21).
+func buildNudgeBody(workspaceID string, n int) ([]byte, error) {
 	plural := "request"
 	if n != 1 {
 		plural = "requests"
@@ -314,7 +321,13 @@ func buildNudgeBody(n int) ([]byte, error) {
 			"message": map[string]interface{}{
 				"role":      "user",
 				"messageId": "inbox-nudge-" + uuid.New().String(),
+				"contextId": platformTurnContextID(workspaceID),
 				"parts":     []map[string]interface{}{{"kind": "text", "text": text}},
+				"metadata": map[string]interface{}{
+					"source":      "platform",
+					"kind":        "inbox_nudge",
+					"source_type": "self-nudge",
+				},
 			},
 		},
 	})
