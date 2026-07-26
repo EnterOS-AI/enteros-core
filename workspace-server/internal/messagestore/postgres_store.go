@@ -17,10 +17,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"path"
 	"strings"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/a2aresp"
 	"github.com/google/uuid"
 )
 
@@ -585,7 +585,7 @@ func extractFilesFromUserMessage(body json.RawMessage) []ChatAttachment {
 	if len(env.Params.Message) == 0 {
 		return nil
 	}
-	return extractFilesFromTask(env.Params.Message)
+	return toChatAttachments(a2aresp.Files(env.Params.Message))
 }
 
 // extractChatResponseText collects text from any of the response
@@ -604,259 +604,34 @@ func extractFilesFromUserMessage(body json.RawMessage) []ChatAttachment {
 // details-in-artifacts. The pre-collect first-wins silently
 // truncated 15k-char briefs and dropped artifact details.
 func extractChatResponseText(body json.RawMessage) string {
-	if len(body) == 0 {
-		return ""
+	if t := a2aresp.AllText(body); t != "" {
+		return t
 	}
-	// {"result": "string"}
-	var asString struct {
-		Result string `json:"result"`
-	}
-	if err := json.Unmarshal(body, &asString); err == nil && asString.Result != "" {
-		return asString.Result
-	}
-	// {"result": {object}} — try the structured shapes
+	// Preserve the messagestore-specific {"task":"<text>"} top-level fallback.
 	var asObject struct {
-		Result json.RawMessage `json:"result"`
-		Task   string          `json:"task"`
+		Task string `json:"task"`
 	}
-	if err := json.Unmarshal(body, &asObject); err != nil {
-		return ""
-	}
-	var collected []string
-	if len(asObject.Result) > 0 {
-		var resultObj struct {
-			Parts     []map[string]any  `json:"parts"`
-			Artifacts []json.RawMessage `json:"artifacts"`
-			Status    json.RawMessage   `json:"status"`
-			Message   json.RawMessage   `json:"message"`
-		}
-		if err := json.Unmarshal(asObject.Result, &resultObj); err == nil {
-			if t := joinTextParts(resultObj.Parts); t != "" {
-				collected = append(collected, t)
-			}
-			var rootTexts []string
-			for _, p := range resultObj.Parts {
-				if root, ok := p["root"].(map[string]any); ok {
-					if t, ok := root["text"].(string); ok && t != "" {
-						rootTexts = append(rootTexts, t)
-					}
-				}
-			}
-			if len(rootTexts) > 0 {
-				collected = append(collected, strings.Join(rootTexts, "\n"))
-			}
-			if len(resultObj.Status) > 0 {
-				var status struct {
-					Message struct {
-						Parts []map[string]any `json:"parts"`
-					} `json:"message"`
-				}
-				if err := json.Unmarshal(resultObj.Status, &status); err == nil {
-					if t := joinTextParts(status.Message.Parts); t != "" {
-						collected = append(collected, t)
-					}
-				}
-			}
-			if len(resultObj.Message) > 0 {
-				var msg struct {
-					Parts []map[string]any `json:"parts"`
-				}
-				if err := json.Unmarshal(resultObj.Message, &msg); err == nil {
-					if t := joinTextParts(msg.Parts); t != "" {
-						collected = append(collected, t)
-					}
-				}
-			}
-			for _, raw := range resultObj.Artifacts {
-				var art struct {
-					Parts []map[string]any `json:"parts"`
-				}
-				if err := json.Unmarshal(raw, &art); err == nil {
-					if t := joinTextParts(art.Parts); t != "" {
-						collected = append(collected, t)
-					}
-				}
-			}
-		}
-	}
-	if len(collected) > 0 {
-		return strings.Join(collected, "\n")
-	}
-	if asObject.Task != "" {
+	if err := json.Unmarshal(body, &asObject); err == nil && asObject.Task != "" {
 		return asObject.Task
 	}
 	return ""
 }
 
-func joinTextParts(parts []map[string]any) string {
-	var texts []string
-	for _, p := range parts {
-		kind, hasKind := p["kind"].(string)
-		typ, hasType := p["type"].(string)
-		hasDiscriminator := (hasKind && kind != "") || (hasType && typ != "")
-		isText := true
-		if hasDiscriminator {
-			isText = kind == "text" || typ == "text"
-		}
-		if !isText {
-			continue
-		}
-		if t, ok := p["text"].(string); ok && t != "" {
-			texts = append(texts, t)
-		}
-	}
-	return strings.Join(texts, "\n")
-}
-
 func extractFilesFromResponse(body json.RawMessage) []ChatAttachment {
-	if len(body) == 0 {
-		return nil
-	}
-	var probe struct {
-		Result json.RawMessage `json:"result"`
-	}
-	if err := json.Unmarshal(body, &probe); err != nil {
-		log.Printf("messagestore: unmarshal probe body: %v", err)
-	}
-	feed := body
-	if len(probe.Result) > 0 {
-		trimmed := bytesTrimSpace(probe.Result)
-		if len(trimmed) > 0 && trimmed[0] == '{' {
-			feed = probe.Result
-		}
-	}
-	return extractFilesFromTask(feed)
+	return toChatAttachments(a2aresp.Files(body))
 }
 
-// extractFilesFromTask walks parts[] + artifacts[].parts[] +
-// status.message.parts[] + message.parts[]. Mirrors canvas
-// extractFilesFromTask exactly — same v0 hot path + v1 protobuf
-// flat shape.
-func extractFilesFromTask(taskJSON json.RawMessage) []ChatAttachment {
-	if len(taskJSON) == 0 {
+// toChatAttachments maps the neutral a2aresp.File descriptors to the
+// messagestore ChatAttachment type (identical fields).
+func toChatAttachments(fs []a2aresp.File) []ChatAttachment {
+	if len(fs) == 0 {
 		return nil
 	}
-	var task struct {
-		Parts     []map[string]any  `json:"parts"`
-		Artifacts []json.RawMessage `json:"artifacts"`
-		Status    json.RawMessage   `json:"status"`
-		Message   json.RawMessage   `json:"message"`
-	}
-	if err := json.Unmarshal(taskJSON, &task); err != nil {
-		return nil
-	}
-	var out []ChatAttachment
-	out = appendFilesFromParts(out, task.Parts)
-	for _, raw := range task.Artifacts {
-		var art struct {
-			Parts []map[string]any `json:"parts"`
-		}
-		if err := json.Unmarshal(raw, &art); err == nil {
-			out = appendFilesFromParts(out, art.Parts)
-		}
-	}
-	if len(task.Status) > 0 {
-		var st struct {
-			Message struct {
-				Parts []map[string]any `json:"parts"`
-			} `json:"message"`
-		}
-		if err := json.Unmarshal(task.Status, &st); err == nil {
-			out = appendFilesFromParts(out, st.Message.Parts)
-		}
-	}
-	if len(task.Message) > 0 {
-		var msg struct {
-			Parts []map[string]any `json:"parts"`
-		}
-		if err := json.Unmarshal(task.Message, &msg); err == nil {
-			out = appendFilesFromParts(out, msg.Parts)
-		}
+	out := make([]ChatAttachment, 0, len(fs))
+	for _, f := range fs {
+		out = append(out, ChatAttachment{Name: f.Name, URI: f.URI, MimeType: f.MimeType, Size: f.Size})
 	}
 	return out
-}
-
-func appendFilesFromParts(out []ChatAttachment, parts []map[string]any) []ChatAttachment {
-	for _, raw := range parts {
-		v0 := false
-		if k, ok := raw["kind"].(string); ok && k == "file" {
-			v0 = true
-		}
-		if t, ok := raw["type"].(string); ok && t == "file" {
-			v0 = true
-		}
-		v1URL, _ := raw["url"].(string)
-		if !v0 && v1URL == "" {
-			continue
-		}
-		var att ChatAttachment
-		if v0 {
-			file, _ := raw["file"].(map[string]any)
-			if file == nil {
-				file = raw
-			}
-			uri, _ := file["uri"].(string)
-			if uri == "" {
-				continue
-			}
-			att.URI = uri
-			if name, _ := file["name"].(string); name != "" {
-				att.Name = name
-			} else {
-				att.Name = basename(uri)
-			}
-			if mt, ok := file["mimeType"].(string); ok {
-				att.MimeType = mt
-			}
-			if sz, ok := numericSize(file["size"]); ok {
-				att.Size = &sz
-			}
-		} else {
-			att.URI = v1URL
-			if name, _ := raw["filename"].(string); name != "" {
-				att.Name = name
-			} else {
-				att.Name = basename(v1URL)
-			}
-			if mt, ok := raw["mediaType"].(string); ok {
-				att.MimeType = mt
-			}
-		}
-		out = append(out, att)
-	}
-	return out
-}
-
-func numericSize(v any) (int64, bool) {
-	switch n := v.(type) {
-	case float64:
-		return int64(n), true
-	case int64:
-		return n, true
-	case int:
-		return int64(n), true
-	}
-	return 0, false
-}
-
-func basename(uri string) string {
-	cleaned := strings.TrimPrefix(uri, "workspace:")
-	cleaned = strings.TrimPrefix(cleaned, "https://")
-	cleaned = strings.TrimPrefix(cleaned, "http://")
-	if cleaned == "" {
-		return "file"
-	}
-	return path.Base(cleaned)
-}
-
-func bytesTrimSpace(b json.RawMessage) json.RawMessage {
-	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t' || b[0] == '\n' || b[0] == '\r') {
-		b = b[1:]
-	}
-	for len(b) > 0 && (b[len(b)-1] == ' ' || b[len(b)-1] == '\t' || b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
-		b = b[:len(b)-1]
-	}
-	return b
 }
 
 func newMessageID() string {

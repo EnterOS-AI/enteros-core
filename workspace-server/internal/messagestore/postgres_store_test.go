@@ -678,28 +678,8 @@ func TestChatHistory_IsInternalSelfMessage_DelegationPrefix(t *testing.T) {
 	}
 }
 
-// =====================================================================
-// basename helper — mirrors canvas basename() semantics
-// =====================================================================
-
-func TestChatHistory_BasenameStripsSchemeAndPath(t *testing.T) {
-	cases := []struct {
-		in, want string
-	}{
-		{"workspace:/uploads/shot.png", "shot.png"},
-		{"workspace:/a/b/c/file.txt", "file.txt"},
-		{"https://example.com/path/file.csv", "file.csv"},
-		{"http://x/y", "y"},
-		{"", "file"},
-		{"workspace:", "file"}, // scheme-only collapses to "" → "file" sentinel, matches canvas basename
-	}
-	for _, tc := range cases {
-		got := basename(tc.in)
-		if got != tc.want {
-			t.Errorf("basename(%q) = %q want %q", tc.in, got, tc.want)
-		}
-	}
-}
+// basename moved to internal/a2aresp during the A2A-extraction SSOT
+// consolidation; its coverage now lives in a2aresp.TestBasename.
 
 // TestActivityRow_AgentMessageCarriesToolTrace (core#2636): the tool-use
 // chain must ride on the agent message so a chat reload re-renders it.
