@@ -137,7 +137,15 @@ export function extractRequestText(body: Record<string, unknown> | null): string
  *  canonical case is the heartbeat delegation-result harvester
  *  ("Delegation results are ready …"). "self-warmup" is the platform-fired
  *  concierge readiness probe ("Platform readiness check — no action needed."),
- *  a heartbeat internal that used to leak as a blue user bubble. */
+ *  a heartbeat internal that used to leak as a blue user bubble.
+ *
+ *  This list MUST stay in exact parity with the Go selfSourceTypes SSOT
+ *  in postgres_store.go — a marker missing here re-introduces the very
+ *  bug this set exists to prevent: a self-wake rendering as a blue user
+ *  bubble in loaded chat history. Parity is currently maintained by hand
+ *  (this file drifted behind Go); the durable fix is a shared codegen
+ *  contract that emits both the Go map and this set from one source
+ *  (tracked follow-up). */
 export const SELF_SOURCE_TYPES: ReadonlySet<string> = new Set<string>([
   "self-cron",
   "self-harvester",
@@ -146,6 +154,19 @@ export const SELF_SOURCE_TYPES: ReadonlySet<string> = new Set<string>([
   "self-goal-nudge",
   "self-delegation-result",
   "self-warmup",
+  // The platform's post-restart context snapshot (restart_context.go),
+  // delivered via the a2a queue — without this marker each drained
+  // snapshot rendered as a blue user bubble in My Chat.
+  "self-restart-context",
+  // The first-boot greeting's internal prompt (first_boot_greeting.go),
+  // persisted only when a busy-queued greet turn is drained later.
+  "self-first-boot-greet",
+  // Wake-lifecycle self-nudges (self-lifecycle / self-stall / self-nudge):
+  // the concierge wake-lifecycle internals that must surface as system
+  // notices, never as user turns.
+  "self-lifecycle",
+  "self-stall",
+  "self-nudge",
 ]);
 
 /** Read the typed source marker the runtime stamps on outbound

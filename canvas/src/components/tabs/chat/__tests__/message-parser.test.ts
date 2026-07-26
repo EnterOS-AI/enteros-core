@@ -5,6 +5,8 @@ import {
   extractAgentText,
   extractTextsFromParts,
   extractFilesFromTask,
+  isInternalSelfRequest,
+  SELF_SOURCE_TYPES,
 } from "../message-parser";
 
 describe("extractRequestText", () => {
@@ -413,5 +415,81 @@ describe("extractFilesFromTask", () => {
         size: 12345,
       },
     ]);
+  });
+});
+
+describe("isInternalSelfRequest self-source classification", () => {
+  // A2A request_body shape the runtime persists: the source_type marker
+  // rides on params.metadata (sibling of params.message).
+  const selfBody = (sourceType: string) => ({
+    params: {
+      metadata: { source_type: sourceType },
+      message: { parts: [{ kind: "text", text: "wake nudge" }] },
+    },
+  });
+
+  // Guards the exact parity contract with the Go selfSourceTypes SSOT
+  // (postgres_store.go). A marker missing from SELF_SOURCE_TYPES makes the
+  // self-wake fall through to the `false` branch and render as a blue user
+  // bubble in loaded history — the drift bug this set exists to prevent.
+  const SELF_MARKERS = [
+    "self-cron",
+    "self-harvester",
+    "self-idle",
+    "self-scheduler",
+    "self-goal-nudge",
+    "self-delegation-result",
+    "self-warmup",
+    "self-restart-context",
+    "self-first-boot-greet",
+    "self-lifecycle",
+    "self-stall",
+    "self-nudge",
+  ];
+
+  it.each(SELF_MARKERS)(
+    "classifies %s as an internal self-message (system notice, not user)",
+    (marker) => {
+      expect(SELF_SOURCE_TYPES.has(marker)).toBe(true);
+      expect(isInternalSelfRequest(selfBody(marker), "wake nudge")).toBe(true);
+    },
+  );
+
+  // Regression pins for the markers this change added (canvas had drifted
+  // behind Go and was missing these five).
+  it.each([
+    "self-restart-context",
+    "self-first-boot-greet",
+    "self-lifecycle",
+    "self-stall",
+    "self-nudge",
+  ])("newly-aligned marker %s is honored as self-source", (marker) => {
+    expect(isInternalSelfRequest(selfBody(marker), "")).toBe(true);
+  });
+
+  it("SELF_SOURCE_TYPES matches the Go SSOT set exactly (no drift)", () => {
+    expect([...SELF_SOURCE_TYPES].sort()).toEqual([...SELF_MARKERS].sort());
+  });
+
+  it("treats a tagged non-self source_type as a genuine user turn", () => {
+    const body = {
+      params: {
+        metadata: { source_type: "user-typed" },
+        message: { parts: [{ kind: "text", text: "hello" }] },
+      },
+    };
+    expect(isInternalSelfRequest(body, "hello")).toBe(false);
+  });
+
+  it("classifies an untagged legacy delegation-result row via the text prefix", () => {
+    // No source_type marker (legacy row) → falls back to the deprecated
+    // text-prefix classifier.
+    expect(
+      isInternalSelfRequest(null, "Delegation results are ready. Review them."),
+    ).toBe(true);
+  });
+
+  it("leaves an untagged ordinary user message as a user turn", () => {
+    expect(isInternalSelfRequest(null, "can you deploy staging?")).toBe(false);
   });
 });
