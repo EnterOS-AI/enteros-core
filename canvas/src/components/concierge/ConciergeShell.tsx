@@ -347,7 +347,18 @@ export function ConciergeShell() {
     platformRoot &&
     platformRoot.data.status === WORKSPACE_STATUS.Provisioning
   ) {
-    return <BootSequenceScreen node={platformRoot} />;
+    // Full-viewport wrapper: BootSequenceScreen sizes itself with `h-full`,
+    // which resolves to CONTENT height unless an ancestor has a resolved
+    // height. This shell renders straight into the page body (page.tsx), so
+    // without this the boot screen painted as a short top-anchored block with
+    // a dead black band under it instead of the fullscreen boot the design
+    // calls for. Same `fixed inset-0` treatment the pre-gate hold below and
+    // the SelfHostSetupScene mount already use.
+    return (
+      <div className="fixed inset-0" data-testid="concierge-boot-screen">
+        <BootSequenceScreen node={platformRoot} />
+      </div>
+    );
   }
 
   // Pre-gate hold: on a fresh self-host load the always-seeded platform root
