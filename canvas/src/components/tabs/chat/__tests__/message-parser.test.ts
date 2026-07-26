@@ -1,4 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   extractRequestText,
   extractResponseText,
@@ -428,10 +431,12 @@ describe("isInternalSelfRequest self-source classification", () => {
     },
   });
 
-  // Guards the exact parity contract with the Go selfSourceTypes SSOT
-  // (postgres_store.go). A marker missing from SELF_SOURCE_TYPES makes the
-  // self-wake fall through to the `false` branch and render as a blue user
-  // bubble in loaded history — the drift bug this set exists to prevent.
+  // Enumeration of the self-source markers, used only to drive the per-marker
+  // classification behavior tests below (each marker must be honored as an
+  // internal self-message). This is NOT the drift guard — a hardcoded list here
+  // can only agree with itself. The genuine cross-SSOT drift guard is the
+  // "matches the Go selfSourceTypes SSOT exactly" test at the end of this
+  // block, which reads and parses the Go source directly.
   const SELF_MARKERS = [
     "self-cron",
     "self-harvester",
@@ -467,8 +472,71 @@ describe("isInternalSelfRequest self-source classification", () => {
     expect(isInternalSelfRequest(selfBody(marker), "")).toBe(true);
   });
 
-  it("SELF_SOURCE_TYPES matches the Go SSOT set exactly (no drift)", () => {
-    expect([...SELF_SOURCE_TYPES].sort()).toEqual([...SELF_MARKERS].sort());
+  // REAL cross-SSOT drift guard. This does NOT compare the canvas set to a
+  // hardcoded list living in this same file (that only proves the file agrees
+  // with itself). It reads the actual Go source of truth
+  // (workspace-server/internal/messagestore/postgres_store.go), extracts the
+  // keys of the `selfSourceTypes` map literal, and asserts the canvas
+  // SELF_SOURCE_TYPES set equals that Go set EXACTLY in both directions — no
+  // marker present in Go but missing from canvas (the drift that reintroduces
+  // the blue-user-bubble bug), and none present in canvas but absent from Go.
+  // If either SSOT is edited without the other, this test fails loudly.
+  //
+  // NOTE: reading + regex-parsing Go from a TS test is a pragmatic guard, not
+  // the durable fix. The durable fix is a shared codegen contract that emits
+  // both the Go map and this TS set from one source (tracked follow-up); until
+  // then this test is what actually catches drift between the two hand-written
+  // lists.
+  it("SELF_SOURCE_TYPES matches the Go selfSourceTypes SSOT exactly (no drift)", () => {
+    // Path from this test file up to the repo root, then down to the Go SSOT:
+    //   canvas/src/components/tabs/chat/__tests__  ->  <repo root>  (6 levels up)
+    const testDir = dirname(fileURLToPath(import.meta.url));
+    const goSourcePath = resolve(
+      testDir,
+      "../../../../../../workspace-server/internal/messagestore/postgres_store.go",
+    );
+
+    let goSource: string;
+    try {
+      goSource = readFileSync(goSourcePath, "utf8");
+    } catch (err) {
+      throw new Error(
+        `Cross-SSOT drift guard could not read the Go source of truth at ` +
+          `${goSourcePath}. If postgres_store.go moved, update this relative ` +
+          `path. Underlying error: ${(err as Error).message}`,
+      );
+    }
+
+    // Isolate the `var selfSourceTypes = map[string]bool{ ... }` literal so we
+    // only pick up markers that are actually members of the SSOT map (not, say,
+    // a "self-..." string mentioned in a surrounding comment or elsewhere).
+    const mapMatch = goSource.match(
+      /var\s+selfSourceTypes\s*=\s*map\[string\]bool\{([\s\S]*?)\n\}/,
+    );
+    expect(
+      mapMatch,
+      `Could not locate the 'var selfSourceTypes = map[string]bool{ ... }' ` +
+        `literal in ${goSourcePath}. The map declaration may have been ` +
+        `renamed or reformatted — update this parser.`,
+    ).not.toBeNull();
+
+    const mapBody = mapMatch![1];
+    // Each active entry is `"self-...": true,` — pull the quoted key of every
+    // one mapped to true (ignore any commented-out or false-mapped lines).
+    const goMarkers = [...mapBody.matchAll(/"([^"]+)"\s*:\s*true\b/g)].map(
+      (m) => m[1],
+    );
+
+    // Sanity: the parse must actually find markers, otherwise a regex/format
+    // change could silently make this guard vacuously pass.
+    expect(
+      goMarkers.length,
+      `Parsed zero markers out of the Go selfSourceTypes map — the entry ` +
+        `format likely changed; update the key regex.`,
+    ).toBeGreaterThan(0);
+
+    // Exact set equality, both directions.
+    expect([...SELF_SOURCE_TYPES].sort()).toEqual([...goMarkers].sort());
   });
 
   it("treats a tagged non-self source_type as a genuine user turn", () => {
