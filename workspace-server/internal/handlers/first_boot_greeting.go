@@ -96,6 +96,11 @@ var firstBootGreetingPending sync.Map // workspaceID -> struct{}
 // starve the guaranteed fallback delivery of context.
 const greetSendTimeout = 15 * time.Second
 
+// greetRollbackTimeout bounds the DETACHED has_greeted rollback (releaseGreetClaim)
+// on its own fresh budget — see releaseGreetClaim for why the rollback must never
+// ride the Send context that just failed.
+const greetRollbackTimeout = 5 * time.Second
+
 // firstBootFallbackText is the static greeting used when the agent turn
 // fails. toolCount is the size of the heartbeat's loaded_mcp_tools — >0
 // means the org concierge (the verified flip is the only toolCount-bearing
@@ -185,8 +190,24 @@ func claimGreetDelivery(ctx context.Context, workspaceID string) (won bool, err 
 // honest: the marker is never left durably true for a greeting the user did not
 // see. Best-effort: a failed rollback is logged (worst case a missed re-greet,
 // strictly better than crashing the delivery goroutine).
+//
+// The rollback runs on a context DETACHED from the caller's Send context
+// (context.WithoutCancel + a fresh greetRollbackTimeout budget). This is
+// load-bearing: the rollback is triggered precisely when writer.Send FAILED, and
+// the most common cause is that the greetSendTimeout/sendCtx deadline expired.
+// Reusing that same already-expired ctx for the rollback UPDATE would make the
+// write fail DETERMINISTICALLY (database/sql rejects an exec on a done context
+// before it reaches the pool) — leaving has_greeted stuck true for a greeting the
+// user never saw: nothing delivered, no future re-greet, and restart-context
+// wrongly firing. WithoutCancel keeps any request-scoped values while dropping the
+// dead deadline/cancellation; the fresh 5s timeout bounds the detached write.
+// (Same WithoutCancel+WithTimeout shape the drain-path delivery budgets use.) A
+// rollback that STILL fails on the fresh context is a real DB error — logged, and
+// that residual missed re-greet is inherent and acceptable.
 func releaseGreetClaim(ctx context.Context, workspaceID string) {
-	if _, err := db.DB.ExecContext(ctx,
+	rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), greetRollbackTimeout)
+	defer cancel()
+	if _, err := db.DB.ExecContext(rbCtx,
 		`UPDATE workspaces SET has_greeted = false WHERE id = $1`, workspaceID); err != nil {
 		log.Printf("first-boot greeting: failed to roll back has_greeted claim for %s: %v", workspaceID, err)
 	}

@@ -567,6 +567,52 @@ func TestFirstBootGreeting_ClaimRollbackReArmsRetryOnSendFailure(t *testing.T) {
 	}
 }
 
+func TestFirstBootGreeting_ReleaseGreetClaim_DetachedFromExpiredContext(t *testing.T) {
+	// Edge-#1 (re-review MEDIUM): the has_greeted rollback must run on a context
+	// DETACHED from the caller's Send context. The rollback fires precisely when
+	// writer.Send FAILED, and the dominant cause is the greetSendTimeout/sendCtx
+	// deadline expiring — so reusing that same done ctx for the rollback UPDATE
+	// would fail DETERMINISTICALLY (database/sql rejects an exec on a cancelled ctx
+	// before it reaches the pool), leaving has_greeted stuck true: nothing
+	// delivered AND no future re-greet. Simulate the worst case with an
+	// ALREADY-CANCELLED ctx: with the WithoutCancel detach the rollback UPDATE
+	// still reaches the DB; WITHOUT it, the exec never fires and this expectation
+	// goes unmet (the exact regression guard).
+	mock := setupTestDB(t)
+	const wsID = "ws-detached-rollback"
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel() // the Send-context budget is gone — as it is when Send failed on timeout
+
+	expectClaimRollback(mock, wsID)
+	releaseGreetClaim(expired, wsID)
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("rollback UPDATE did not fire on the detached context (Edge-#1 regressed): %v", err)
+	}
+
+	// Prove the marker is genuinely re-armed: a SUBSEQUENT wake (fresh ctx) WINS a
+	// new claim and delivers — the greeting the expired-ctx Send dropped is now
+	// retried and the fresh chat is no longer permanently silent.
+	emitter := &capturingEmitter{}
+	writer := NewAgentMessageWriter(db.DB, emitter)
+	expectClaimWon(mock, wsID)
+	expectWriterSend(mock, wsID, "Agent")
+	if err := deliverFirstBootGreeting(context.Background(), writer, wsID, "Re-greet after rollback."); err != nil {
+		t.Fatalf("subsequent wake should re-greet after the detached rollback, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("DB expectations: %v", err)
+	}
+	if len(emitter.events) != 1 {
+		t.Fatalf("subsequent wake must deliver exactly one greeting, got %d", len(emitter.events))
+	}
+	if msg := sentMessage(t, emitter); !strings.Contains(msg, "Re-greet after rollback") {
+		t.Errorf("re-greet delivered wrong text: %q", msg)
+	}
+}
+
 func TestFirstBootGreeting_TwoDistinctWakesGreetExactlyOnce(t *testing.T) {
 	// Rule-1 finding #2 / rule-2 nit 1: two DISTINCT wakes racing to greet the
 	// same fresh box must collapse to EXACTLY ONE greeting via the atomic claim
