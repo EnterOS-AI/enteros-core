@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Concierge Wake Lifecycle — Implementation &amp; CI Checklist</title>
+<style>
+  :root{--bg:#fff;--fg:#1a1a1a;--muted:#5a5a5a;--line:#e2e2e2;--card:#f7f7f5;--accent:#6d5ef5;--accent-soft:#efedff;--bad:#c0392b;--bad-soft:#fdecea;--good:#1e8a4c;--good-soft:#e8f6ee;--warn:#b8860b;--warn-soft:#fbf3e0;--code-bg:#f2f2ef;--coreC:#6d5ef5;--rtC:#1e8a4c;--tplC:#b8860b;--sdkC:#c0392b;}
+  @media (prefers-color-scheme:dark){:root{--bg:#16161a;--fg:#e8e8ea;--muted:#a0a0a8;--line:#2c2c34;--card:#1e1e24;--accent:#a99bff;--accent-soft:#24223a;--bad:#ff7a6b;--bad-soft:#3a201d;--good:#6fdc9a;--good-soft:#1a2e22;--warn:#e0b64a;--warn-soft:#332a14;--code-bg:#22222a;--coreC:#a99bff;--rtC:#6fdc9a;--tplC:#e0b64a;--sdkC:#ff7a6b;}}
+  :root[data-theme="dark"]{--bg:#16161a;--fg:#e8e8ea;--muted:#a0a0a8;--line:#2c2c34;--card:#1e1e24;--accent:#a99bff;--accent-soft:#24223a;--bad:#ff7a6b;--bad-soft:#3a201d;--good:#6fdc9a;--good-soft:#1a2e22;--warn:#e0b64a;--warn-soft:#332a14;--code-bg:#22222a;--coreC:#a99bff;--rtC:#6fdc9a;--tplC:#e0b64a;--sdkC:#ff7a6b;}
+  :root[data-theme="light"]{--bg:#fff;--fg:#1a1a1a;--muted:#5a5a5a;--line:#e2e2e2;--card:#f7f7f5;--accent:#6d5ef5;--accent-soft:#efedff;--bad:#c0392b;--bad-soft:#fdecea;--good:#1e8a4c;--good-soft:#e8f6ee;--warn:#b8860b;--warn-soft:#fbf3e0;--code-bg:#f2f2ef;--coreC:#6d5ef5;--rtC:#1e8a4c;--tplC:#b8860b;--sdkC:#c0392b;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15.5px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1000px;margin:0 auto;padding:44px 22px 90px}
+  h1{font-size:28px;margin:0 0 6px;letter-spacing:-.02em}
+  h2{font-size:21px;margin:42px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line);letter-spacing:-.01em}
+  h3{font-size:16px;margin:24px 0 8px}
+  .sub{color:var(--muted);font-size:14.5px;margin:0 0 4px}
+  code{background:var(--code-bg);padding:1px 5px;border-radius:4px;font-size:.86em;font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace}
+  pre{background:var(--code-bg);padding:13px 15px;border-radius:8px;overflow-x:auto;border:1px solid var(--line);font-size:13px;line-height:1.5}
+  pre code{background:none;padding:0}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:var(--card);font-weight:600}
+  ul,ol{padding-left:22px}li{margin:3px 0}
+  .callout{border-left:3px solid var(--accent);background:var(--accent-soft);padding:10px 15px;border-radius:0 8px 8px 0;margin:13px 0}
+  .callout.bad{border-color:var(--bad);background:var(--bad-soft)}
+  .callout.warn{border-color:var(--warn);background:var(--warn-soft)}
+  .callout.good{border-color:var(--good);background:var(--good-soft)}
+  .tag{display:inline-block;font-size:12px;font-weight:600;padding:2px 9px;border-radius:999px;background:var(--accent-soft);color:var(--accent)}
+  .repo{display:inline-block;font-size:11px;font-weight:700;padding:1px 6px;border-radius:5px;border:1px solid var(--line);white-space:nowrap}
+  .repo.core{color:var(--coreC);border-color:var(--coreC)}.repo.rt{color:var(--rtC);border-color:var(--rtC)}.repo.tpl{color:var(--tplC);border-color:var(--tplC)}.repo.sdk{color:var(--sdkC);border-color:var(--sdkC)}.repo.man{color:var(--muted)}
+  .del{color:var(--bad);font-weight:700}.add{color:var(--accent);font-weight:700}.mod{color:var(--warn);font-weight:700}.keep{color:var(--good);font-weight:700}
+  .lie{background:var(--bad-soft);color:var(--bad);font-weight:700;font-size:11px;padding:1px 6px;border-radius:5px}
+  .bug{background:var(--bad-soft);color:var(--bad);font-weight:700;font-size:11px;padding:1px 6px;border-radius:5px}
+  hr{border:none;border-top:1px solid var(--line);margin:36px 0}
+  .footnote{color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<span class="tag">Companion to the Concierge Wake-Lifecycle RFC · execution artifact</span>
+<h1>Implementation &amp; CI Checklist</h1>
+<p class="sub">The operational half of the RFC — verified against the working tree by 6 audit passes (SSOT · abstraction · SDK/contract · CI · cleanup · docs). The RFC holds the <i>design</i>; this holds the <i>execution</i>: what to consolidate, what CI must pass, what to delete, what docs to fix.</p>
+
+<div class="callout warn">
+<b>Read the RFC first</b> (<code>rfc-concierge-wake-lifecycle.html</code>) for the design and step order (0–6). Every item here is keyed to an RFC step. Two bugs the audit found that are <b>not</b> in the RFC's original evidence are marked <span class="bug">NEW BUG</span> — they should be fixed under the same owner.
+</div>
+
+<h2>1. Artifacts &amp; the SSOT chain (there are FOUR, not three)</h2>
+<div class="legend" style="margin-bottom:8px">
+  <span class="repo sdk">molecule-ai-sdk</span> schema SSOT ·
+  <span class="repo core">molecule-core</span> Go control plane + embedded hermes template ·
+  <span class="repo rt">workspace-runtime</span> Python producer ·
+  <span class="repo man">manifest / .runtime-version</span> pins
+</div>
+<p>Wire contracts flow one way: <b>SDK owns every <code>*.schema.json</code></b> → <b>core <code>models/workspace.go</code></b> is the Go wire authority the schemas derive from → <b>runtime vendors the schemas byte-for-byte</b> and conformance-tests against them. <b>SDK-first</b> is still the correct ordering for any heartbeat/envelope field. <span class="add">CORRECTED:</span> the <code>heartbeat.schema.json</code> specifically is <b>not</b> mapped by <code>check-schemas-in-sync.sh</code> (which guards plugin-manifest, idle-prompt, agent-trace, …) — so for heartbeat the guard is the <b><code>$id</code>-tripwire conformance test</b> (<code>test_workspace_comms_conformance.py</code>) + the downstream re-vendor, not the release-blocking sync gate. The SDK also runs <b><code>contracts-codegen-drift</code></b> (gen/ bindings must regenerate). <span class="add">DONE:</span> SDK change is <b>PR #169</b> (draft) with codegen regenerated.</p>
+
+<h2>2. SSOT mandates (design must have exactly one source per concern)</h2>
+<table>
+<thead><tr><th>Concern</th><th>Status today</th><th>Mandate</th><th>Step</th></tr></thead>
+<tbody>
+<tr><td><b>Self-source type set</b></td><td><span class="lie">TRIPLICATED + DRIFTED</span> — <b>three</b> hand-maintained mirrors: core <code>selfSourceTypes</code> (<code>postgres_store.go</code>), runtime <code>_ROUTINE_SELF_SOURCE_TYPES</code> (<code>a2a_executor.py</code>), <b>and canvas <code>SELF_SOURCE_TYPES</code></b> (<code>message-parser.ts</code>). <span class="add">PARTIALLY FIXED:</span> the two live bugs (<code>self-lifecycle</code> missing → blue bubble on ingest; canvas missing <code>self-restart-context</code>/<code>self-first-boot-greet</code> → blue bubble in history) are fixed in <b>PR #4860</b> (Go, +<code>self-stall</code>/<code>self-nudge</code>) + the canvas parity PR.</td><td>Immediate: parity across all three (done via #4860 + canvas PR). Durable: define the enum <b>once</b> in a shared SDK contract + <b>codegen</b> the Go map / Python tuple / TS set (the SDK already has a <code>gen/</code> codegen pipeline). <b>#1 SSOT priority.</b></td><td>done / 6</td></tr>
+<tr><td><b>Queued/busy shape</b></td><td>Fragmented — 2 matchers (<code>isQueuedA2AResponse</code> status-only; <code>delegation.go:1468</code> queued-only) over 4 producer shapes.</td><td>One exported predicate <code>status=="queued" OR queued==true</code> returning <code>queue_id</code>, in <code>a2a_queue.go</code>. Ideally converge producers to one wire shape.</td><td>4</td></tr>
+<tr><td><b>Config <code>mcp_servers</code> writer</b></td><td>2 writers — <code>start.sh:545</code> seed + <code>adapter.py:352</code> unconditional <code>safe_dump</code>; watched by raw-byte md5.</td><td>Single Python writer (<code>register_mcp_server_hook</code>) + idempotency guard; <code>start.sh</code> stops seeding <code>mcp_servers</code>; watcher parse-and-compares.</td><td>1</td></tr>
+<tr><td><b>Wake emission</b></td><td>3 (→ really 4+N) uncoordinated deciders.</td><td>One <code>wake_lifecycle.go</code> desired-state decider; all emitters route the "when / which-session / idempotency-key" decision through it.</td><td>5</td></tr>
+<tr><td><b>Boot marker</b></td><td>Single but <b>derived</b> from an <code>activity_logs</code> query (<code>first_boot_greeting.go:156-172</code>); <code>restart_context.go</code> reads no marker.</td><td>One marker read by <b>both</b> greeting and restart paths. If adding a <code>has_greeted</code> column, <b>replace</b> the derive — do not run both (that re-creates two markers).</td><td>5</td></tr>
+<tr><td><b><code>canvas-&lt;wsid&gt;</code> literal</b></td><td>Built in 2 languages from 2 hardcoded literals (<code>sessionid.go:34</code>, <code>tracing.py:430</code>) kept equal by hand.</td><td>Promote to one shared constant/contract. The <code>canvas-&lt;wsid&gt;</code> vs <code>canvas-&lt;org&gt;-&lt;wsid&gt;</code> namespacing decision must be applied to <b>both</b> sites atomically.</td><td>0 / 5</td></tr>
+<tr><td><b>Readiness producer</b></td><td>Single gate (<code>registry.go</code>), 2 producer modules (<code>loaded_mcp_tools_probe.py</code> + <code>mcp_readiness_probe.py</code>).</td><td>Declare one runtime producer; derive beat-field + event from it. (Low priority.)</td><td>2</td></tr>
+</tbody>
+</table>
+
+<h2>3. Abstraction / consolidation targets (no redundant copies)</h2>
+<div class="callout">
+The RFC undercounts emitters: there are <b>4 + N</b> self-wakes — greeting, restart-context, idle, plus <b>stall probe</b> (<code>stall_watchdog.go:436</code>), <b>inbox nudge</b> (<code>request_nudge_sweeper.go:301</code>), <b>delegation harvester</b> (<code>heartbeat.py:995/1272</code>), <b>reprovision wake</b> (<code>reprovision_wake.py:393</code>), <b>initial-prompt/lifecycle</b> (<code>main.py:1537</code>). <span class="bug">NEW BUG</span> <code>buildStallProbeBody</code> and <code>buildNudgeBody</code> stamp <b>no <code>contextId</code> and no <code>source_type</code></b> → they leak as user bubbles <i>and</i> fragment the session. They belong under the new owner + in the type set.
+</div>
+<table>
+<thead><tr><th>Extract</th><th>Replaces</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td><b>One self-wake emitter</b> — <code>wake_lifecycle.go</code> (core) + <code>self_wake.py</code> (rt)</td><td>Absorbs payload build, typed <code>source_type</code> stamp, <code>contextId</code>, dedup gate, online-wait, drain-deliver. Replaces the two core sync.Maps (<code>firstBootGreetingPending</code>, <code>restartContextPending</code>) + rt <code>SELF_MESSAGE_COOLDOWN</code> with the one idempotency key.</td><td>core + rt</td></tr>
+<tr><td><b>One envelope builder</b> — <code>buildSelfWakeEnvelope</code> / <code>post_self_wake</code></td><td>8 hand-rolled core <code>message/send</code> builders + 5 runtime copies. Forces <code>contextId</code>+<code>source_type</code> on by construction (kills the stall/nudge leak).</td><td>core + rt</td></tr>
+<tr><td><b>One queued matcher</b></td><td><code>isQueuedA2AResponse</code> (<code>first_boot_greeting.go:232</code>) + <code>isQueuedProxyResponse</code> (<code>delegation.go:1463</code>).</td><td>core <code>a2a_queue.go</code></td></tr>
+<tr><td><b>One drained-reply seam</b></td><td>Carve the self-source skip at <code>a2a_queue.go:130</code> for first-boot (mirror the delegation stitch at <code>:871</code>); route via a <code>queue_id</code> callback off <code>MarkQueueItemCompleted</code>.</td><td>core</td></tr>
+<tr><td><b>One send-to-user sink</b></td><td>Core already has <code>AgentMessageWriter</code> (SSOT). Runtime has <b>4</b> <code>/notify</code> reimplementations — collapse behind one <code>send_to_user</code>. Idle should deliver via the <code>send_message_to_user</code> tool → <code>AgentMessageWriter</code>, retiring <code>idle_digest/poster.py</code>'s single-reply forward. <b>No new proactive-send mechanism needed</b> — the sink already supports N messages.</td><td>core (reuse) + rt (collapse)</td></tr>
+</tbody>
+</table>
+
+<h2>4. SDK / contract / schema change list</h2>
+<table>
+<thead><tr><th>Change</th><th>Repos that MUST move together</th><th>Breaking?</th><th>Gate</th></tr></thead>
+<tbody>
+<tr><td>Heartbeat <code>observed_generation</code> + versioned envelope</td><td><span class="repo sdk">SDK schema</span> → <span class="repo core">core <code>workspace.go</code></span> → <span class="repo rt">runtime producer + re-vendor</span></td><td><b>Yes</b> — request/response are <code>additionalProperties:false</code>; SDK schema must update first (2 heartbeat body literals in <code>heartbeat.py</code> to sync).</td><td>schema-sync (blocks auto-release) + <code>test_workspace_comms_conformance.py</code></td></tr>
+<tr><td>Idle on canvas <code>contextId</code> (drop independent line)</td><td><span class="repo rt">runtime <code>a2a_client</code>/<code>poster</code></span> + <span class="repo core">core <code>wake_lifecycle</code>/preemption + <code>sessionid.go</code> doc</span></td><td>Schema-safe (metadata additive) but <b>invariant-breaking</b> — reverses a doc-pinned design in both repos; must default-preserve delegation-harvester callers.</td><td><code>test_idle_selffire_wire_conformance.py</code> (needs rewrite), sessionid drift test</td></tr>
+<tr><td>Wake idempotency key</td><td><span class="repo rt">runtime builder</span> + <span class="repo core">core decision→marker</span></td><td>No — <code>params.metadata</code> is <code>additionalProperties:true</code>.</td><td>behavioral</td></tr>
+<tr><td>Multi-message idle reporting</td><td><span class="repo rt">runtime <code>poster</code>/<code>reply_forwarder</code></span> + possibly <span class="repo sdk">idle-prompt SDK contract</span></td><td>Behavior; <code>test_idle_selffire_wire_conformance.py</code> currently asserts single <code>/notify</code> reply → rewrite.</td><td>idle-selffire conformance</td></tr>
+<tr><td>Session-id namespacing decision</td><td><span class="repo core">core <code>sessionid.go</code></span> + <span class="repo rt">runtime <code>tracing.py</code></span></td><td>DB migration if changed later — <b>decide NOW</b>.</td><td>handlers drift test</td></tr>
+<tr><td>Runtime wheel release</td><td>runtime tag → all template <code>.runtime-version</code> + molecule-core</td><td>Auto — tag-only on green merge; <b>don't hand-bump <code>pyproject.toml</code></b> unless raising a minor/major floor.</td><td><code>check_consumer_runtime_drift.py</code></td></tr>
+</tbody>
+</table>
+<p class="footnote">Version discipline: release is automatic on green merge to runtime <code>main</code> (<code>auto-release.yml</code> cuts <code>runtime-v&lt;next&gt;</code>); <code>propagate</code> opens <code>.runtime-version</code> bump PRs on every consumer. The hermes <b>template</b> pin (<code>manifest.json:33</code>) is a <i>separate</i> bump from the runtime wheel. <span class="add">RESOLVED (was MUST-VERIFY):</span> the <b>manifest pin is authoritative</b> — <code>workspace-configs-templates/hermes/</code> is <b>gitignored and regenerated</b> from the pin at build/setup (provenance marker <code>.molecule-manifest-source</code>; <code>templatecache</code> prefers the manifest-cloned cache). So <b>rule-5 template edits do NOT ship via a core PR</b> — they must be applied to the <code>molecule-ai-workspace-template-hermes</code> repo, then the <code>manifest.json:33</code> pin bumped (deploy gate, user-confirmed). Rule-5 is therefore delivered as a <b>validated patch</b>, not a core PR.</p>
+
+<h2>5. Per-repo pre-PR CI (exact commands)</h2>
+
+<h3><span class="repo core">molecule-core</span> — Platform (Go), from <code>workspace-server/</code></h3>
+<pre><code>go mod download &amp;&amp; go build ./cmd/server &amp;&amp; go vet ./...
+# staticcheck gate — pinned version; go vet/test do NOT catch SA-codes:
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+"$(go env GOPATH)/bin/golangci-lint" run --timeout 3m ./...
+go test -timeout 10m -coverprofile=coverage.out ./...      # 25% total floor; handlers &gt;10%/file
+go test -tags e2e_busy_inject -count=1 -v ./internal/handlers/ -run TestTestBusy
+MOLECULE_GITEA_TOKEN=&lt;token&gt; go test ./internal/handlers/ -run 'TestManifest_'   # if manifest.json touched
+# migrations (Step 5): check-migration-collisions.yml runs on migration changes</code></pre>
+<p class="footnote">Correction: <code>TestManifest_RefPinningCompleteness</code> does not exist. Real: <code>TestManifest_RefPinning_AllEntriesAreCommitSHAs</code>, <code>_AllSHAsReachable</code>, <code>_WorkspaceTemplatesIncludeConfigYAML</code>, <code>_SuperpowersPinnedManifestValidatesSSOT</code>, <code>_Provider_KnownValues</code>. Core <code>shellcheck</code> job only covers <code>tests/e2e</code> + <code>infra/scripts</code> — <b>not</b> the template.</p>
+
+<h3><span class="repo rt">workspace-runtime</span> — from repo root</h3>
+<pre><code>pip install -e ".[test]" pytest pytest-asyncio
+pytest -q --ignore=tests/integration
+pytest tests/test_workspace_comms_conformance.py            # heartbeat/A2A schema conformance
+pytest -v -rs tests/test_self_turn_session_convergence.py tests/test_idle_selffire_wire_conformance.py
+pip install ruff &amp;&amp; ruff check --select=E9,F63,F7,F82 molecule_runtime/   # syntax-subset only; no mypy/black
+python -m build &amp;&amp; python -m twine check dist/*
+python scripts/check_consumer_runtime_drift.py             # soft-skips without RUNTIME_BOT_TOKEN
+bash scripts/check-schemas-in-sync.sh                      # only if contracts/** touched; rc1=drift=fail
+# DO NOT hand-bump pyproject.toml version (tag stamps it at build time)</code></pre>
+
+<h3><span class="repo tpl">embedded hermes template</span> — from <code>workspace-configs-templates/hermes/</code></h3>
+<pre><code>pip install -q pyyaml
+bash scripts/test-mcp-reconcile-watch.sh       # Step 1 backstop harness
+bash scripts/test-*.sh                          # the rest of the shell unit tests
+pytest tests/test_conformance.py                # adapter-socket conformance (needs runtime installed)
+shellcheck scripts/mcp-reconcile-watch.sh scripts/start.sh   # NOTHING runs this in CI today — do it manually</code></pre>
+
+<h3>Branch protection</h3>
+<p><code>DEFAULT_REQUIRED_APPROVALS = 1</code> — merge needs <b>1 genuine non-author approval on the current head</b> + all required CI green. Any push after approval invalidates it → re-approve. "Not enough approvals" red = zero non-author approvals on the latest commit.</p>
+
+<h2>6. Per-step pre-PR checklist</h2>
+<table>
+<thead><tr><th>Step</th><th>Artifact(s)</th><th>Gates that must pass locally</th></tr></thead>
+<tbody>
+<tr><td><b>0</b> verify template authority + pin the 5 contract items + SDK schema PRs</td><td><span class="repo sdk">SDK</span> <span class="repo core">core</span> <span class="repo rt">rt</span></td><td>SDK contract PRs merge first (they block runtime release). If <code>manifest.json</code> edited → Platform(Go) + <code>TestManifest_</code> + <code>manifest-entry-existence-check.sh</code>.</td></tr>
+<tr><td><b>1</b> Rule 5 — idempotent config write + parse-compare</td><td><span class="repo tpl">template</span> <code>adapter.py</code>, <code>mcp-reconcile-watch.sh</code>, <code>start.sh</code></td><td><b>CI GAP</b> (§7#1) — no core gate fires. Run <code>test-mcp-reconcile-watch.sh</code> + <code>test-*.sh</code> + <code>pytest tests/test_conformance.py</code> + <code>shellcheck</code> manually; verify on local stack.</td></tr>
+<tr><td><b>2</b> Rule 4 + versioned heartbeat/generation</td><td><span class="repo rt">rt</span> <code>heartbeat.py</code></td><td>rt pytest + <code>test_workspace_comms_conformance.py</code> + heartbeat tests + ruff + build. No pyproject bump.</td></tr>
+<tr><td><b>3</b> deploy (pin bump or ships-with-core)</td><td><span class="repo man">manifest</span></td><td>Platform(Go) + <code>TestManifest_</code> (esp. <code>_AllSHAsReachable</code>, <code>_WorkspaceTemplatesIncludeConfigYAML</code>) + entity-existence. New SHA must exist on Gitea, tree must contain <code>config.yaml</code>.</td></tr>
+<tr><td><b>4</b> Rule 1 — both shapes + drain-deliver</td><td><span class="repo core">core</span> <code>first_boot_greeting.go</code>, <code>a2a_queue.go</code></td><td>Full Platform(Go) incl. golangci-lint (staticcheck) + coverage + <code>e2e_busy_inject</code>. Weigh E2E API / Handlers-Postgres impact.</td></tr>
+<tr><td><b>5</b> Rule 2 — marker + lifecycle owner + idle-one-line + preemption</td><td><span class="repo core">core</span> new <code>wake_lifecycle.go</code> + migration; <span class="repo rt">rt</span> <code>a2a_client</code>/<code>poster</code></td><td>Platform(Go) + <code>check-migration-collisions.yml</code>; rt conformance rewrites. New files clear staticcheck + per-file coverage.</td></tr>
+<tr><td><b>6</b> delete dead code + docs</td><td><span class="repo core">core</span> <span class="repo rt">rt</span></td><td>Platform(Go) + rt pytest/ruff/build. Grep for dangling refs so unused-import / <code>F401</code> don't red.</td></tr>
+</tbody>
+</table>
+<p><b>Generic hygiene (every step):</b> rebase on latest <code>main</code>; run gates on a clean HEAD first and diff (Windows has pre-existing failures — only chase what your change introduced); golangci-lint pinned v2.12.2; no debug prints; new behavior wired into a named CI job (a test no workflow names is never run); 1 non-author approval on the final head.</p>
+
+<h2>7. CI gaps to add (change types with NO gate)</h2>
+<ol>
+<li><b>Embedded-template edits are ungated in core CI</b> (hits Step 1 directly). Gitea runs only repo-root workflows; the hermes template's nested CI never runs in a core PR, and core's <code>shellcheck</code>/<code>platform</code> paths exclude it. <b>Add</b> a core job running the hermes <code>scripts/test-*.sh</code> + <code>pytest tests/test_conformance.py</code> when <code>workspace-configs-templates/hermes/**</code> changes. (Resolve the §6 authority question in Step 0.)</li>
+<li><b>No shellcheck on template shell scripts anywhere</b> — <code>mcp-reconcile-watch.sh</code>/<code>start.sh</code> get no static lint. Fold into the gap-#1 job.</li>
+<li><b>No cross-repo heartbeat-envelope drift gate</b> (hits Step 2). <code>schema-sync</code> only guards the plugin-manifest schema; the versioned/generation envelope is validated only inside runtime. <b>Add</b> a core↔runtime heartbeat-envelope conformance check so "versioned envelope pinned NOW" is machine-enforced.</li>
+</ol>
+
+<h2>8. Cleanup inventory (step 6 — aggressive)</h2>
+<div class="callout good"><b>No live orphaned code exists today</b> tied to greeting/reconcile/idle — everything actionable is gated behind a step. The <code>fireConciergeWarmup</code> references are <b>accurate past-tense rationale, not lies</b> (code already removed in EV2) — optional prune, out of scope.</div>
+<h3>Delete after step 4 (Rule 1)</h3>
+<ul>
+<li><code>first_boot_greeting.go:229-240</code> <code>isQueuedA2AResponse</code> — <span class="del">DELETE</span>, superseded by the unified matcher.</li>
+<li><code>first_boot_greeting.go:190-196</code> queued-branch <code>return</code> (skip delivery) — <span class="del">DELETE</span>, replaced by drain-delivery.</li>
+<li><code>first_boot_greeting_test.go:149-171</code> <code>TestFirstBootGreeting_QueuedPollModeSendsNothing</code> — <span class="del">DEAD TEST</span> (asserts the removed behavior).</li>
+<li><code>first_boot_greeting.go:229-231</code> "no reply text to relay" + <code>a2a_queue.go:110-120/130</code> "skips first-boot greet" — <span class="lie">LIE-AFTER</span>, rewrite.</li>
+</ul>
+<h3>Delete after step 5 (Rule 2)</h3>
+<ul>
+<li><code>restart_context.go:101-102</code> <code>PrevSessionAt.IsZero()</code> "(no prior session on record)" branch — <span class="del">DEAD</span> (unreachable once the marker gates first boot).</li>
+<li><code>restart_context_test.go:30-40</code> <code>TestBuildRestartContextMessage_NoPriorSession</code> — <span class="del">DEAD TEST</span>. KEEP <code>restartContextPending</code> (it's a concurrency gate, not arbitration).</li>
+</ul>
+<h3>Delete after §5.5 / Rule 3 (idle on one line)</h3>
+<ul>
+<li><code>main.py:1781-1900+</code> legacy <code>_run_idle_loop</code> + <code>:1767-1777</code> fallback — <span class="del">DEAD</span> once <code>MOLECULE_MAILBOX_KERNEL=0</code> opt-out is retired (still the kernel-off fallback today — gate deletion on removing the flag).</li>
+<li><code>idle_digest/poster.py:86-113</code> single-reply forward + <code>idle_digest/reply_forwarder.py</code> (whole module) — <span class="del">SUPERSEDED</span> by proactive multi-message via the send-to-user tool. (Salvage <code>describe_reply</code> classification if useful.)</li>
+<li><code>a2a_client.py:665-670</code>, <code>tracing.py:408-420/468-480</code>, <code>a2a_executor.py:222-227</code> — <span class="lie">LIE-AFTER</span> for idle: rescope (not delete — shared with other self-wakes that stay independent).</li>
+<li><code>test_self_turn_session_convergence.py:159-168/210-219</code> + <code>test_idle_selffire_wire_conformance.py:127-181</code> — <span class="del">DEAD TESTS</span> for the <code>self-idle</code> case; drop idle from the parametrized sweeps / rewrite the wire conformance.</li>
+</ul>
+<div class="callout warn"><b>Do NOT delete:</b> <code>idle_digest/providers/goal.py migrate_from_config</code> (part of the <i>new</i> model despite <code>SOURCE_LEGACY_MIGRATION</code> naming); the EV2 readiness blocks; the P4 scheduling; the other <code>self-*</code> types + their independent-context convergence (rule 3 moves <b>only idle</b>).</div>
+
+<h2>9. Docs update inventory (lie-after-change first)</h2>
+<table>
+<thead><tr><th>file:line</th><th>Fix</th><th>Step</th></tr></thead>
+<tbody>
+<tr><td><span class="lie">LIE</span> <code>a2a_client.py:665-670</code></td><td>Currently justifies the independent self-wake <code>context_id</code>. Rescope: idle runs on the canvas <code>context_id</code>; collision resolved by <b>preemption</b>, not a detached line.</td><td>5</td></tr>
+<tr><td><span class="lie">LIE</span> <code>sessionid.go:14-21</code></td><td>Pull <b>idle</b> out of the "keep their own routing context" list — idle now binds <code>canvas-&lt;ws&gt;</code> for routing AND session. Others may still differ.</td><td>5</td></tr>
+<tr><td><span class="lie">LIE</span> <code>a2a_executor.py:222-227 / 250-257</code></td><td>The "self-idle drops rather than queues" rationale contradicts one-line/preemption. Update; reconsider <code>A2A_SOURCE_SELF_IDLE</code>'s membership in the drop set.</td><td>5</td></tr>
+<tr><td><span class="lie">LIE</span> <code>idle_digest/poster.py:1-19</code> + <code>reply_forwarder.py:1-33</code></td><td>Rewrite from "forward the one reply body" to proactive, multi-message, interruptible idle reporting via the send-to-user sink.</td><td>5</td></tr>
+<tr><td><span class="lie">LIE</span> <code>first_boot_greeting.go:19-33</code></td><td>Greet-once user-chat gate is insufficient (double-greet hole); arbitration moves to a boot-time marker committed on confirmed delivery. Fallback is last-resort only after drain-delivery.</td><td>4/5</td></tr>
+<tr><td><span class="lie">LIE</span> <code>restart_context.go:1-9,25-54</code></td><td>Document that the two trigger sites gate on the boot marker and never fire on a genuine first boot.</td><td>5</td></tr>
+<tr><td><span class="lie">LIE</span> <code>a2a_queue.go:110-120</code></td><td>The blanket "skips first-boot greet" becomes wrong once the drain exception lands.</td><td>4</td></tr>
+<tr><td><span class="lie">LIE</span> <code>mcp-reconcile-watch.sh:53-55</code></td><td>Header + <code>mcp_block_hash</code>: describe structural parse-and-compare, not raw-byte md5.</td><td>1</td></tr>
+<tr><td><span class="lie">LIE</span> <code>hermes/adapter.py:326-352</code></td><td>Comment claims the hook is "idempotent" but the write at <code>:352</code> is unconditional. Add the guard, make "idempotent" true at the file-write level.</td><td>1</td></tr>
+<tr><td>soft <code>trigger-daemons.md:209-214</code></td><td>Note lifecycle/idle wakes move to the preemptible one-line model; keep scheduler drop-not-queue semantics.</td><td>6</td></tr>
+</tbody>
+</table>
+<p class="footnote">Not lies: <code>manifest.json</code> pinning prose (bump ref only if the pinned template is authoritative); <code>contracts/PROVENANCE.md</code> idle-prompt (digest policy, unchanged); the <code>fireConciergeWarmup</code> historical comments (code already gone). No standalone architecture/CLAUDE.md narrative describes the concierge flow — the in-code docstrings above are the authoritative descriptions.</p>
+
+<hr>
+<p class="footnote">Companion to <code>rfc-concierge-wake-lifecycle.html</code>. Both are proposals — no code written. Verified against the working tree by six audit passes; one cross-agent conflict (<code>fireConciergeWarmup</code> removed?) was settled by direct grep in favor of "already removed."</p>
+
+</div>
+</body>
+</html>
