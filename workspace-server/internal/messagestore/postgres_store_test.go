@@ -192,6 +192,34 @@ func TestChatHistory_ClassifiesDelegationResultAsSystem(t *testing.T) {
 	}
 }
 
+// TestChatHistory_ClassifiesSelfLifecycleAsSystem pins the 2026-07-25 live-bug
+// fix: the runtime stamps source_type "self-lifecycle" on its reprovision/
+// lifecycle wake. It is a routine self-turn, never a human turn, and MUST be
+// classified system/notice — before "self-lifecycle" was added to
+// selfSourceTypes it fell through as a genuine user message and rendered as a
+// blue user bubble.
+func TestChatHistory_ClassifiesSelfLifecycleAsSystem(t *testing.T) {
+	body := json.RawMessage(`{"params":{"metadata":{"source_type":"self-lifecycle"},"message":{"parts":[{"kind":"text","text":"lifecycle wake after reprovision"}]}}}`)
+	msgs := activityRowToChatMessages("row-lifecycle", mustParseTime(t, fixedTimestamp), "ok", body, nil, nil)
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 system message, got %d", len(msgs))
+	}
+	if msgs[0].Role != "system" || msgs[0].SystemKind != "notice" {
+		t.Errorf("self-lifecycle classified role=%q kind=%q; want system/notice (must NEVER be a user bubble)", msgs[0].Role, msgs[0].SystemKind)
+	}
+}
+
+// TestSelfSourceTypes_PlatformWakeMarkers pins the SSOT membership the stall
+// watchdog and inbox-nudge sweeper depend on: their new self-source markers
+// MUST be recognized, or the wakes they stamp still leak as user bubbles.
+func TestSelfSourceTypes_PlatformWakeMarkers(t *testing.T) {
+	for _, st := range []string{"self-lifecycle", "self-stall", "self-nudge"} {
+		if !IsSelfSourceType(st) {
+			t.Errorf("IsSelfSourceType(%q) = false; want true (would leak as a blue user bubble)", st)
+		}
+	}
+}
+
 func TestChatHistory_NoUserMessageWhenRequestBodyNull(t *testing.T) {
 	msgs := activityRowToChatMessages("row-1", mustParseTime(t, fixedTimestamp), "ok", nil, nil, nil)
 	for _, m := range msgs {
