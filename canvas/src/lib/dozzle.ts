@@ -11,9 +11,13 @@ export const DOZZLE_URL =
 
 // Workspace containers are named `ws-<workspaceId>` by the provisioner (see
 // workspace-server internal/provisioner/provisioner.go ContainerName). Dozzle
-// accepts a `?filter=name%3D<container-name>` query param that pre-filters
-// its container list, so this link opens Dozzle scoped to just that
-// workspace's container instead of the full unfiltered log list.
+// exposes a real name→container deep-link at `/show?name=<container-name>`:
+// it resolves the name to the container's id and forwards to
+// `/container/<id>`, opening scoped straight to that workspace's logs.
+// (Dozzle's web UI has NO client-side `?filter=` query param — that only
+// exists as the server-side DOZZLE_FILTER env/CLI setting — so an earlier
+// `/?filter=name%3D…` link silently landed on the full unfiltered list.
+// See https://dozzle.dev/guide/faq — "Can I deep link to a container?")
 export function workspaceLogsUrl(workspaceId: string): string {
-  return `${DOZZLE_URL}/?filter=name%3Dws-${encodeURIComponent(workspaceId)}`;
+  return `${DOZZLE_URL}/show?name=ws-${encodeURIComponent(workspaceId)}`;
 }

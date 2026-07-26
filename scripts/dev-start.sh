@@ -371,9 +371,12 @@ MOLECULE_MINIO_HOST_PORT=${MOLECULE_MINIO_HOST_PORT:-$(pick_port 9000)}
 MOLECULE_MINIO_CONSOLE_HOST_PORT=${MOLECULE_MINIO_CONSOLE_HOST_PORT:-$(pick_port 9001)}
 PLATFORM_PORT=$(pick_port 8080)
 CANVAS_PORT=$(pick_port 3000)
-# Sequential with Dozzle's :3110 (container logs) below — this is the HOST
-# process log viewer (see section 4b).
+# Dozzle (container-log viewer) on :3110; logdy (HOST-process log viewer, see
+# section 4b) sits sequentially on :3111. DOZZLE_PORT is exported so the compose
+# dozzle service publishes on the SAME port this script advertises below.
+DOZZLE_PORT=${DOZZLE_PORT:-$(pick_port 3110)}
 LOGDY_PORT=${LOGDY_PORT:-$(pick_port 3111)}
+export DOZZLE_PORT
 export MOLECULE_PG_HOST_PORT MOLECULE_REDIS_HOST_PORT \
        MOLECULE_MINIO_HOST_PORT MOLECULE_MINIO_CONSOLE_HOST_PORT
 
@@ -521,6 +524,18 @@ else
     exit 1
 fi
 wait_for_langfuse_http
+
+# ─────────────────────────────────────────── Dozzle (container log viewer)
+# Dozzle tails EVERY container's stdout via the Docker socket (infra, platform,
+# langfuse, and each ws-<id> workspace runtime) — the container-side complement
+# to logdy's host-process view (section 4b). Resilient: a Dozzle failure must
+# NOT abort the whole dev stack, so warn and carry on rather than exit.
+echo "==> Starting Dozzle (container log viewer on :${DOZZLE_PORT})"
+if docker compose -f "$ROOT/docker-compose.yml" up -d dozzle; then
+    echo "    Dozzle ready — http://127.0.0.1:${DOZZLE_PORT}"
+else
+    echo "    WARN: Dozzle failed to start — container logs still available via 'docker logs'" >&2
+fi
 
 # ─────────────────────────────────────────────── 3. platform
 #
@@ -784,6 +799,9 @@ if [ -n "${LOGDY_PID:-}" ]; then
 else
     LOGS_LINE="  Logs:      /tmp/molecule-platform.log · /tmp/molecule-canvas.log"
 fi
+# Dozzle sees every CONTAINER's logs (infra + platform + langfuse + each
+# ws-<id> workspace); logdy above covers the HOST processes. Shown together.
+DOZZLE_LINE="  Dozzle:    http://127.0.0.1:${DOZZLE_PORT}   (live tail: ALL container logs)"
 
 cat <<EOF
 
@@ -803,6 +821,7 @@ cat <<EOF
 
   Auth:      fail-closed — canvas uses the dev ADMIN_TOKEN (see .env)
 ${LOGS_LINE}
+${DOZZLE_LINE}
              docker logs ${LANGFUSE_CONTAINER}   (trace sink)
              docker logs molecule-core-minio-1      (object store)
 

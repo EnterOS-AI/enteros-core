@@ -2,6 +2,19 @@
 include:
   - docker-compose.infra.yml
 
+# Bounded json-file logging shared by the long-running services below. Dozzle
+# reads container stdout via the json-file driver, so keeping that driver (with
+# rotation) means every container's logs stay COMPLETE in Dozzle AND capped on
+# disk at max 3 × 10m per container. Referenced with `logging: *default-logging`.
+# NOTE: YAML anchors do not cross the `include:` boundary — this applies only to
+# services defined in THIS file; infra services set their own in
+# docker-compose.infra.yml if desired.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # --- Observability ---
   # Digest pins in this file are MULTI-ARCH manifest-list digests (amd64+arm64),
@@ -14,6 +27,7 @@ services:
   # with the defaults below.
   langfuse:
     image: langfuse/langfuse:2.95.11@sha256:85c278dcab96c15db94191a5c1664f85aba2d7fb6771a00e99681c902c4b7015
+    logging: *default-logging
     depends_on:
       langfuse-clickhouse:
         condition: service_healthy
@@ -82,6 +96,7 @@ services:
       # already uses context=. , this aligns local with CI.
       context: .
       dockerfile: workspace-server/Dockerfile
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -241,6 +256,7 @@ services:
     # same canonical registry path.
     # Local dev keeps working via the `build:` context below (docker compose build canvas).
     image: ${MOLECULE_CANVAS_IMAGE:-registry.moleculesai.app/molecule-ai/canvas}:${CANVAS_IMAGE_TAG:-latest}
+    logging: *default-logging
     build:
       context: ./canvas
       dockerfile: Dockerfile
@@ -352,6 +368,7 @@ services:
   dozzle:
     image: amir20/dozzle:latest
     container_name: molecule-dozzle
+    logging: *default-logging
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:

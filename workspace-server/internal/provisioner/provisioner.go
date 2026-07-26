@@ -884,6 +884,20 @@ func (p *Provisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string, e
 				{HostIP: "127.0.0.1", HostPort: hostPort}, // Pre-allocated stable host port (#2851)
 			},
 		},
+		// Explicit json-file log driver + rotation for every ws-<id> runtime
+		// container. Dozzle reads container stdout through the json-file driver,
+		// so pinning it here (instead of inheriting a daemon default that may be
+		// a non-readable driver like local/journald/none) guarantees these
+		// containers' logs are captured AND visible in Dozzle, while max-size/
+		// max-file cap on-disk growth at 3 × 10m per workspace. Mirrors the
+		// x-logging anchor the compose services use.
+		LogConfig: container.LogConfig{
+			Type: "json-file",
+			Config: map[string]string{
+				"max-size": "10m",
+				"max-file": "3",
+			},
+		},
 	}
 
 	// Apply tier-based container configuration

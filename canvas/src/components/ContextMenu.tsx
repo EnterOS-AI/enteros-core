@@ -225,9 +225,11 @@ export function ContextMenu() {
 
   const handleViewLogs = useCallback(() => {
     if (!contextMenu) return;
-    // Dev-only escape hatch: deep-links Dozzle filtered to this workspace's
-    // container (ws-<id>) instead of dumping the user into every container's
-    // logs. Opens in a new tab so the canvas/context menu state is untouched.
+    // Dev-only escape hatch: deep-links Dozzle to this workspace's container
+    // via its `/show?name=ws-<id>` route (Dozzle resolves the name and forwards
+    // to /container/<id>), opening scoped to just that workspace's logs instead
+    // of the full container list. Opens in a new tab so the canvas/context-menu
+    // state is untouched.
     window.open(workspaceLogsUrl(contextMenu.nodeId), "_blank", "noopener,noreferrer");
     closeContextMenu();
   }, [contextMenu, closeContextMenu]);
