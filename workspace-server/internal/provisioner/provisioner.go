@@ -443,10 +443,21 @@ func legacyContainerName(workspaceID string) string {
 	return fmt.Sprintf("ws-%s", id)
 }
 
-// containerNamePrefix is the shared prefix every workspace container
-// name carries (`ws-`). Used by ListWorkspaceContainerIDPrefixes for
-// the Docker name-filter, and by the orphan sweeper to recognise our
-// own containers vs. anything else on the host.
+// containerNamePrefix is the prefix every workspace container THIS
+// package mints carries (`ws-`, see ContainerName). It is a generic
+// workspace descriptor, NOT a brand token, so it survives a rebrand
+// untouched.
+//
+// It is also the Docker name-FILTER used by the list methods below.
+// That filter is a SUBSTRING match, so it also returns the
+// control-plane-minted `<brand>-ws-…` containers that share the daemon
+// — which is exactly what we want, because those are workspace
+// containers too. The precise classification is NOT done here: it is
+// done by parseWorkspaceContainerID in brand_seam.go, which accepts the
+// full union WorkspaceContainerNamePrefixes() returns. Matching on this
+// single token alone would go blind to every brand-prefixed container
+// and false-orphan live workspaces — see brand_seam.go for the failure
+// mode and brand_seam_test.go for its negative control.
 const containerNamePrefix = "ws-"
 
 // LabelManaged is stamped on every workspace container + volume the
@@ -553,12 +564,18 @@ func PlatformInstanceID() string {
 	return platformInstanceID
 }
 
-// ListWorkspaceContainerIDPrefixes returns the 12-char workspace ID
-// prefixes of every running ws-* container the Docker daemon knows
-// about. The 12-char form matches ContainerName's truncation, so the
-// orphan sweeper can intersect this set against `SELECT
-// substring(id::text, 1, 12) FROM workspaces WHERE status = 'removed'`
-// without an extra round-trip per row.
+// ListWorkspaceContainerIDPrefixes returns the workspace ID prefixes of
+// every workspace container the Docker daemon knows about — every name
+// shape in WorkspaceContainerNamePrefixes(): the `ws-<id>` form this
+// package mints AND the `<brand>-ws-<tenant>-<short>` form the control
+// plane's local-docker backend mints on the same daemon, for the current
+// brand and every legacy brand. A `ws-`-only match here false-orphans
+// live brand-prefixed workspaces (see brand_seam.go).
+//
+// Every returned value is a LEADING SUBSTRING of `workspaces.id::text`,
+// so the orphan sweeper can intersect this set against the workspaces
+// table with a single `id::text LIKE ANY(...)` round-trip instead of one
+// query per row.
 //
 // Returns an empty slice on any Docker error (sweeper treats that as
 // "skip this round" — better than a partial scan that misses leaks).
@@ -579,21 +596,20 @@ func (p *Provisioner) ListWorkspaceContainerIDPrefixes(ctx context.Context) ([]s
 	prefixes := make([]string, 0, len(containers))
 	for _, c := range containers {
 		// Container names from the API include a leading slash:
-		// "/ws-abc123def456". Strip both the slash and our prefix
-		// to recover the 12-char workspace ID.
+		// "/ws-abc123def456". parseWorkspaceContainerID strips the
+		// slash and whichever of the union prefixes
+		// (WorkspaceContainerNamePrefixes) the name carries, returning
+		// the workspace-id prefix in `workspaces.id::text` space.
 		//
 		// The Docker name filter is a SUBSTRING match (not a prefix
 		// match), so something like "my-ws-thing" would also be
-		// returned. The HasPrefix check below is load-bearing:
-		// without it those false positives would flow into the
-		// orphan sweeper's DB query as bogus LIKE patterns.
+		// returned. The anchored prefix check inside
+		// parseWorkspaceContainerID is load-bearing: without it those
+		// false positives would flow into the orphan sweeper's DB
+		// query as bogus LIKE patterns.
 		for _, name := range c.Names {
-			n := strings.TrimPrefix(name, "/")
-			if !strings.HasPrefix(n, containerNamePrefix) {
-				continue
-			}
-			id := strings.TrimPrefix(n, containerNamePrefix)
-			if id == "" {
+			id, ok := parseWorkspaceContainerID(name)
+			if !ok {
 				continue
 			}
 			prefixes = append(prefixes, id)
@@ -645,17 +661,17 @@ func (p *Provisioner) ListManagedContainerIDPrefixes(ctx context.Context) ([]str
 	}
 	prefixes := make([]string, 0, len(containers))
 	for _, c := range containers {
-		// Same name-strip dance as ListWorkspaceContainerIDPrefixes —
-		// label filter is exact (not substring), so any false-positive
-		// must be a non-ws-* container we accidentally labeled. Defence
-		// against a future bug that stamps the label on something else.
+		// Same name parse as ListWorkspaceContainerIDPrefixes — label
+		// filter is exact (not substring), so any false-positive must
+		// be a container outside every workspace name shape that we
+		// accidentally labeled. Defence against a future bug that
+		// stamps the label on something else. Going through the shared
+		// seam also means a labeled container minted under a brand
+		// prefix stays visible to the wiped-DB pass instead of leaking
+		// forever behind a `ws-`-only check.
 		for _, name := range c.Names {
-			n := strings.TrimPrefix(name, "/")
-			if !strings.HasPrefix(n, containerNamePrefix) {
-				continue
-			}
-			id := strings.TrimPrefix(n, containerNamePrefix)
-			if id == "" {
+			id, ok := parseWorkspaceContainerID(name)
+			if !ok {
 				continue
 			}
 			prefixes = append(prefixes, id)
