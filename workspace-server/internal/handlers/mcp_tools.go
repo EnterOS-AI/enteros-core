@@ -16,6 +16,7 @@ import (
 	"os"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/a2aresp"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/registry"
 	"github.com/google/uuid"
 )
@@ -818,72 +819,41 @@ func (h *MCPHandler) toolRecallMemory(ctx context.Context, workspaceID string, a
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// extractA2AText extracts human-readable text from an A2A JSON-RPC response body.
-// Falls back to the raw JSON when no text part can be found.
+// extractA2AText extracts human-readable text from an A2A JSON-RPC response
+// body via the a2aresp SSOT (internal/a2aresp owns the full shape matrix —
+// bare parts, nested message, task status.message, and artifacts). This call
+// site keeps only its legacy contract on top: A2A errors surface as
+// "[error] <msg>", and a response with NO extractable text falls back to the
+// raw result JSON so check_task_status shows something rather than empty
+// (greetingTextFromReply rejects that "{"-prefixed fallback and degrades to
+// the static greeting).
 func extractA2AText(body []byte) string {
+	if msg := a2aresp.ErrorMessage(body); msg != "" {
+		return "[error] " + msg
+	}
+	if text := a2aresp.Text(body); text != "" {
+		return text
+	}
+	// No text part — preserve the raw-JSON diagnostic fallback.
 	var resp map[string]interface{}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return string(body)
 	}
-
-	// Propagate A2A errors.
-	if errObj, ok := resp["error"].(map[string]interface{}); ok {
-		if msg, ok := errObj["message"].(string); ok {
-			return "[error] " + msg
+	// Only marshal an OBJECT result. A scalar/array/null result (e.g.
+	// {"result":42} or {"result":[1,2]}) would marshal to "42"/"[1,2]" — a
+	// fragment greetingTextFromReply does NOT reject (it only rejects a "{" or
+	// "[{" prefix), so a malformed scalar could ship as the greeting. Falling
+	// back to the whole envelope string(body) is always "{"-prefixed and thus
+	// rejected, degrading safely to the static greeting.
+	if result, ok := resp["result"].(map[string]interface{}); ok {
+		b, err := json.Marshal(result)
+		if err != nil {
+			log.Printf("extractA2AText: json.Marshal result failed: %v", err)
+			return string(body)
 		}
+		return string(b)
 	}
-
-	result, ok := resp["result"].(map[string]interface{})
-	if !ok {
-		return string(body)
-	}
-
-	// Format 1: result.artifacts[0].parts[0].text
-	if artifacts, ok := result["artifacts"].([]interface{}); ok && len(artifacts) > 0 {
-		if art, ok := artifacts[0].(map[string]interface{}); ok {
-			if parts, ok := art["parts"].([]interface{}); ok && len(parts) > 0 {
-				if part, ok := parts[0].(map[string]interface{}); ok {
-					if text, ok := part["text"].(string); ok && text != "" {
-						return text
-					}
-				}
-			}
-		}
-	}
-
-	// Format 2: result.message.parts[0].text
-	if msg, ok := result["message"].(map[string]interface{}); ok {
-		if parts, ok := msg["parts"].([]interface{}); ok && len(parts) > 0 {
-			if part, ok := parts[0].(map[string]interface{}); ok {
-				if text, ok := part["text"].(string); ok && text != "" {
-					return text
-				}
-			}
-		}
-	}
-
-	// Format 3: result.status.message.parts[0].text — the a2a-sdk TASK
-	// response (hermes runtime returns this for message/send; observed
-	// 2026-07-19 when the first-boot greeting's in-character reply fell
-	// through to the JSON fallback and was discarded).
-	if statusObj, ok := result["status"].(map[string]interface{}); ok {
-		if msg, ok := statusObj["message"].(map[string]interface{}); ok {
-			if parts, ok := msg["parts"].([]interface{}); ok && len(parts) > 0 {
-				if part, ok := parts[0].(map[string]interface{}); ok {
-					if text, ok := part["text"].(string); ok && text != "" {
-						return text
-					}
-				}
-			}
-		}
-	}
-
-	// Fallback: marshal result as JSON.
-	b, marshalErr := json.Marshal(result)
-	if marshalErr != nil {
-		log.Printf("extractA2AText: json.Marshal result failed: %v", marshalErr)
-	}
-	return string(b)
+	return string(body)
 }
 
 func extractA2AErrorMessage(body []byte) string {
