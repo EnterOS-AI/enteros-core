@@ -4,6 +4,15 @@
 // keys now available) and delivers it as a synthetic A2A message/send
 // so the agent sees what changed across the restart boundary.
 //
+// First-boot vs restart arbitration (RFC concierge rule 2): restart-context
+// fires ONLY for a workspace that has already been greeted — the has_greeted
+// boot marker (SSOT, see first_boot_greeting.go). A genuine first boot has no
+// marker; its two trigger sites (workspace_restart.go) route through
+// fireRestartContextIfBooted, which SKIPS the snapshot entirely so the
+// first-boot greeting owns that edge. Pre-rule-2, restart-context fired on
+// EVERY restart with no arbitration — a fresh box got a "(no prior session on
+// record)" placeholder that raced the greeting.
+//
 // Layer 2 (user-defined restart_prompt via config.yaml / org.yaml) is
 // out of scope for this file — tracked as a separate follow-up issue.
 package handlers
@@ -69,6 +78,52 @@ func restartContextInFlight(workspaceID string) bool {
 	return ok
 }
 
+// fireRestartContextIfBooted is the first-boot-vs-restart arbitration seam (RFC
+// concierge rule 2). It fires restart-context ONLY for a workspace that has
+// already been greeted (the has_greeted boot marker = a REAL restart), setting
+// the per-restart concurrency gate (restartContextPending) FIRST — before the
+// sender goroutine spawns, so the drain woken by this restart's first heartbeat
+// already sees the gate. On a genuine first boot (marker unset) it SKIPS
+// restart-context entirely: the first-boot greeting owns that edge, and firing
+// here would double up (a "you just restarted / no prior session" nudge racing
+// the greeting).
+//
+// Fails CLOSED (skips) on a marker-read error: rule 2's invariant is absolute —
+// a genuine first boot must NEVER take the restart-context path — so on doubt
+// we skip. A missed restart nudge is a benign degradation; a first boot on the
+// restart path is the exact bug this closes. restartContextPending stays the
+// per-restart concurrency gate, NOT arbitration — it is set here only when we
+// actually fire.
+func (h *WorkspaceHandler) fireRestartContextIfBooted(ctx context.Context, workspaceID string, data restartContextData) {
+	if !shouldFireRestartContext(ctx, workspaceID) {
+		return
+	}
+	markRestartContextPending(workspaceID)
+	h.goAsync(func() { h.sendRestartContext(workspaceID, data) })
+}
+
+// shouldFireRestartContext is the pure first-boot-vs-restart arbitration
+// DECISION (RFC concierge rule 2): restart-context fires ONLY for an
+// already-greeted workspace (has_greeted marker set = a REAL restart). It
+// returns false on a genuine first boot (marker unset) AND, fail-CLOSED, on a
+// marker-read error — because rule 2's invariant is absolute: a genuine first
+// boot must NEVER take the restart-context path. A missed restart nudge is a
+// benign degradation; a first boot on the restart path is the exact bug this
+// closes. Split out from fireRestartContextIfBooted so the decision is unit-
+// testable without spawning the sender goroutine.
+func shouldFireRestartContext(ctx context.Context, workspaceID string) bool {
+	greeted, err := workspaceHasGreeted(ctx, workspaceID)
+	if err != nil {
+		log.Printf("restart-context: has_greeted arbitration read failed for %s (%v) — skipping (fail-closed: a first boot must never take the restart-context path)", workspaceID, err)
+		return false
+	}
+	if !greeted {
+		log.Printf("restart-context: %s not yet greeted (genuine first boot) — skipping restart-context; first-boot greeting owns this edge", workspaceID)
+		return false
+	}
+	return true
+}
+
 // restartContextOnlineTimeout bounds how long we wait for a workspace
 // to re-register after restart before dropping the context message.
 // The Restart HTTP handler has already returned 200 by the time this
@@ -91,9 +146,15 @@ type restartContextData struct {
 }
 
 // buildRestartContextMessage renders the restart context into the
-// exact format proposed in issue #19. Fields that have no data (e.g.
-// first-ever session) are rendered with a neutral placeholder so the
-// agent always sees a consistent shape.
+// exact format proposed in issue #19. Fields that have no data are rendered
+// with a neutral placeholder so the agent always sees a consistent shape.
+//
+// The zero-PrevSessionAt branch is now a DEFENSIVE fallback, not the first-boot
+// case: under RFC concierge rule 2, restart-context fires only for an
+// already-greeted workspace (fireRestartContextIfBooted), and a box that has
+// greeted was online and therefore has a last_heartbeat_at — so a real restart
+// carries a prior session. The placeholder survives only for the pathological
+// marker-set-but-heartbeat-unreadable case, keeping the shape consistent.
 func buildRestartContextMessage(d restartContextData) string {
 	msg := "=== WORKSPACE RESTART CONTEXT ===\n"
 	msg += fmt.Sprintf("Restart at: %s\n", d.RestartAt.UTC().Format(time.RFC3339))
