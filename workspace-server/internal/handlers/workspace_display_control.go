@@ -420,3 +420,59 @@ func validateDisplaySessionToken(token, workspaceID, controlledBy string, expire
 func displaySessionSigningSecret() string {
 	return os.Getenv("DISPLAY_SESSION_SIGNING_SECRET")
 }
+
+// View/control split (design §8, review fix): the CONTROL token above binds to
+// the lock holder (controlledBy), which is correct for /input arbitration — but
+// it meant a human who does NOT hold the lock could not even WATCH (no token
+// validates). Sight must never be arbitrated. signDisplayViewerToken mints a
+// VIEW-ONLY token bound only to the workspace (+ a self-contained expiry), so
+// any authorized caller can watch regardless of who holds control. DisplaySession
+// accepts EITHER a valid viewer token OR a valid control token; only /input is
+// gated on holding the lock.
+func signDisplayViewerToken(workspaceID string, expiresAt time.Time) string {
+	secret := displaySessionSigningSecret()
+	if secret == "" || workspaceID == "" || expiresAt.IsZero() {
+		return ""
+	}
+	payload := strings.Join([]string{"view", workspaceID, strconv.FormatInt(expiresAt.Unix(), 10)}, "|")
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// validateDisplayViewerToken verifies a view-only token for workspaceID. The
+// expiry lives IN the token (self-contained), so — unlike the control token —
+// the validator needs NO knowledge of the lock holder or lease. This is what
+// decouples watching from controlling.
+func validateDisplayViewerToken(token, workspaceID string) bool {
+	secret := displaySessionSigningSecret()
+	parts := strings.Split(token, ".")
+	if secret == "" || len(parts) != 2 || workspaceID == "" {
+		return false
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(payloadBytes)
+	if !hmac.Equal(sig, mac.Sum(nil)) {
+		return false
+	}
+	fields := strings.Split(string(payloadBytes), "|")
+	if len(fields) != 3 || fields[0] != "view" {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(fields[1]), []byte(workspaceID)) != 1 {
+		return false
+	}
+	exp, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil || time.Now().After(time.Unix(exp, 0)) {
+		return false
+	}
+	return true
+}
