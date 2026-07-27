@@ -29,15 +29,36 @@ const (
 	displayControlMaxTTLSeconds     = 3600
 )
 
+// acquireDisplayControlQuery upserts the display-control lock. The WHERE clause
+// on the UPDATE is the arbitration policy (see AcquireDisplayControl for the
+// human-preempts-agent semantics); it is a package const so the real-PG
+// integration test exercises the EXACT statement the handler runs (no drift).
+const acquireDisplayControlQuery = `
+INSERT INTO workspace_display_control_locks
+    (workspace_id, controller, controlled_by, expires_at)
+VALUES
+    ($1, $2, $3, now() + ($4 * interval '1 second'))
+ON CONFLICT (workspace_id) DO UPDATE
+SET controller = EXCLUDED.controller,
+    controlled_by = EXCLUDED.controlled_by,
+    expires_at = EXCLUDED.expires_at,
+    updated_at = now()
+WHERE workspace_display_control_locks.expires_at <= now()
+   OR workspace_display_control_locks.controlled_by = EXCLUDED.controlled_by
+   OR (workspace_display_control_locks.controller = 'agent' AND EXCLUDED.controller = 'user')
+RETURNING controller, controlled_by, expires_at`
+
 type workspaceDisplayControlResponse struct {
-	Controller   string    `json:"controller"`
-	ControlledBy string    `json:"controlled_by,omitempty"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	SessionURL   string    `json:"session_url,omitempty"`
+	Controller     string    `json:"controller"`
+	ControlledBy   string    `json:"controlled_by,omitempty"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	SessionURL     string    `json:"session_url,omitempty"`
+	ViewSessionURL string    `json:"view_session_url,omitempty"`
 }
 
 type workspaceDisplayControlNoneResponse struct {
-	Controller string `json:"controller"`
+	Controller     string `json:"controller"`
+	ViewSessionURL string `json:"view_session_url,omitempty"`
 }
 
 type acquireDisplayControlRequest struct {
@@ -57,10 +78,15 @@ func (h *WorkspaceHandler) DisplayControl(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load display control"})
 		return
 	}
+	// Issue a view-only URL either way (§8): watching never requires holding
+	// control, so any authorized caller polling the lock state also gets a URL to
+	// watch. Empty when signing is unconfigured.
+	viewURL := signedDisplayViewerURL(c.Param("id"))
 	if !found {
-		c.JSON(http.StatusOK, workspaceDisplayControlNoneResponse{Controller: "none"})
+		c.JSON(http.StatusOK, workspaceDisplayControlNoneResponse{Controller: "none", ViewSessionURL: viewURL})
 		return
 	}
+	lock.ViewSessionURL = viewURL
 	c.JSON(http.StatusOK, lock)
 }
 
@@ -108,19 +134,13 @@ func (h *WorkspaceHandler) AcquireDisplayControl(c *gin.Context) {
 		"ttl_seconds":   req.TTLSeconds,
 	})
 	var lock workspaceDisplayControlResponse
-	err := db.DB.QueryRowContext(c.Request.Context(), `
-INSERT INTO workspace_display_control_locks
-    (workspace_id, controller, controlled_by, expires_at)
-VALUES
-    ($1, $2, $3, now() + ($4 * interval '1 second'))
-ON CONFLICT (workspace_id) DO UPDATE
-SET controller = EXCLUDED.controller,
-    controlled_by = EXCLUDED.controlled_by,
-    expires_at = EXCLUDED.expires_at,
-    updated_at = now()
-WHERE workspace_display_control_locks.expires_at <= now()
-   OR workspace_display_control_locks.controlled_by = EXCLUDED.controlled_by
-RETURNING controller, controlled_by, expires_at`,
+	// Human-preempts-agent takeover (§8, checklist line 269): a user acquiring
+	// control PREEMPTS an active AGENT lock — the human is the ultimate authority
+	// and needs NO admin token to take the wheel (the third WHERE clause below).
+	// A user still cannot steal ANOTHER user's active lock (that path 409s and
+	// requires a force release). Once preempted, the gateway fails the agent's
+	// next /input closed (ErrHumanInControl), so control transfers atomically.
+	err := db.DB.QueryRowContext(c.Request.Context(), acquireDisplayControlQuery,
 		workspaceID, req.Controller, controlledBy, req.TTLSeconds,
 	).Scan(&lock.Controller, &lock.ControlledBy, &lock.ExpiresAt)
 	if err == nil {
@@ -419,4 +439,76 @@ func validateDisplaySessionToken(token, workspaceID, controlledBy string, expire
 
 func displaySessionSigningSecret() string {
 	return os.Getenv("DISPLAY_SESSION_SIGNING_SECRET")
+}
+
+// View/control split (design §8, review fix): the CONTROL token above binds to
+// the lock holder (controlledBy), which is correct for /input arbitration — but
+// it meant a human who does NOT hold the lock could not even WATCH (no token
+// validates). Sight must never be arbitrated. signDisplayViewerToken mints a
+// VIEW-ONLY token bound only to the workspace (+ a self-contained expiry), so
+// any authorized caller can watch regardless of who holds control. DisplaySession
+// accepts EITHER a valid viewer token OR a valid control token; only /input is
+// gated on holding the lock.
+// displayViewerTTL bounds a minted view-only session. Sight is low-stakes and
+// re-mintable on the next DisplayControl poll, so a short window is fine.
+const displayViewerTTL = 300 * time.Second
+
+// signedDisplayViewerURL mints a VIEW-ONLY session URL for a workspace — usable
+// by any authorized caller to watch regardless of who holds control (§8). Empty
+// when signing is unconfigured. This is the issuance half of the view/control
+// split; DisplaySession accepts the resulting token.
+func signedDisplayViewerURL(workspaceID string) string {
+	tok := signDisplayViewerToken(workspaceID, time.Now().Add(displayViewerTTL))
+	if tok == "" {
+		return ""
+	}
+	return fmt.Sprintf("/workspaces/%s/display/session/websockify#token=%s", url.PathEscape(workspaceID), tok)
+}
+
+func signDisplayViewerToken(workspaceID string, expiresAt time.Time) string {
+	secret := displaySessionSigningSecret()
+	if secret == "" || workspaceID == "" || expiresAt.IsZero() {
+		return ""
+	}
+	payload := strings.Join([]string{"view", workspaceID, strconv.FormatInt(expiresAt.Unix(), 10)}, "|")
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// validateDisplayViewerToken verifies a view-only token for workspaceID. The
+// expiry lives IN the token (self-contained), so — unlike the control token —
+// the validator needs NO knowledge of the lock holder or lease. This is what
+// decouples watching from controlling.
+func validateDisplayViewerToken(token, workspaceID string) bool {
+	secret := displaySessionSigningSecret()
+	parts := strings.Split(token, ".")
+	if secret == "" || len(parts) != 2 || workspaceID == "" {
+		return false
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(payloadBytes)
+	if !hmac.Equal(sig, mac.Sum(nil)) {
+		return false
+	}
+	fields := strings.Split(string(payloadBytes), "|")
+	if len(fields) != 3 || fields[0] != "view" {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(fields[1]), []byte(workspaceID)) != 1 {
+		return false
+	}
+	exp, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil || time.Now().After(time.Unix(exp, 0)) {
+		return false
+	}
+	return true
 }
