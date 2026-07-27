@@ -358,3 +358,11 @@ Honest ledger. "✅" = code committed **and** verified here (`go test`/`vet`/`bu
 - ✅ **Runtime** (`molecule-ai-workspace-runtime`, branch `feat/desktop-tool-repoint-to-gateway`): re-pointed `a2a_tools_desktop.py`'s screenshot/click/type/key from `chroot /host` to the gateway route (reuses `PLATFORM_URL`/`WORKSPACE_ID`/`auth_headers`; 409→pause). py_compile clean. Follow-up: `open_url`/`check` re-point + retire `_host_*`.
 - ✅ **SDK**: `computer-use` contract (branch `feat/computer-use-tool-contract`).
 - The agent surface staying in the runtime is exactly the native-`kind:mcp`-plugin extraction path (deferred RFC).
+
+**Update (code substantially complete — ~52 tests, verification bar noted):**
+- ✅ (unit-verified) display-proxy re-home transport (§13); view/control split viewer token (§8); idle sweeper decision (§10); derived per-sidecar control token (§6.5).
+- ✅ (compile+vet, SQL needs a stack) `DesktopLifecycleStore` (gateway `LockChecker`/`ActivityRecorder` + `LoadActivity`/`SetState`/`RunningDesktopWorkspaceIDs`).
+- ◻︎ **Remaining code** (each needs a running stack or is deferred behind the security prerequisite): `cmd/server` activation wiring (construct gateway+store+Local sidecar provisioner + `SetDesktopGateway`/`SetSidecarProvisioner`) — **deferred until per-workspace networking exists, since wiring to the flat `molecule-core-net` would ship the cross-tenant exposure the design blocks on**; `DisplaySession` viewer-token accept + view-only enforcement; human-preempts-agent preemption SQL; `wsdesk-` reap into the delete path + orphan-sweeper-by-label.
+- ◻︎ **Cross-repo**: SDK codegen + `MatchesSSOT`; CP backend.
+- ◻︎ **Infra (the ship-blocker, decision 1)**: per-workspace network · egress · `userns-remap` · Redis auth.
+- ◻︎ **Terminal human gates**: image build/publish · CI · security review · production deploy.
