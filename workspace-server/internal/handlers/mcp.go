@@ -94,6 +94,12 @@ type MCPHandler struct {
 	// clear error rather than crashing when the operator hasn't set
 	// MEMORY_PLUGIN_URL.
 	memv2 *memoryV2Deps
+
+	// computerGateway proxies the `computer` tool to the desktop enforcement
+	// gateway (internal/desktopgateway). nil -> the tool reports the desktop
+	// unavailable (per-tier gate, decision 4). Wired at router setup on
+	// deployments with a desktop backend.
+	computerGateway computerGateway
 }
 
 // NewMCPHandler wires the handler to db and broadcaster.
@@ -665,6 +671,8 @@ func (h *MCPHandler) dispatch(ctx context.Context, workspaceID, toolName string,
 		return h.toolCommitMemory(ctx, workspaceID, args)
 	case "recall_memory":
 		return h.toolRecallMemory(ctx, workspaceID, args)
+	case "computer":
+		return h.toolComputer(ctx, workspaceID, args)
 
 	// v2 memory tools (RFC #2728). PR-6 will alias the legacy names to
 	// these; until then they are independent surfaces.
