@@ -127,6 +127,13 @@ func (g *Gateway) ensureRunning(ctx context.Context, workspaceID string) (string
 	if h.Address == "" {
 		return "", fmt.Errorf("desktop started but no reachable address")
 	}
+	// SSRF allowlist (§13): confirm the backend-resolved address is EXACTLY a
+	// desktop-sidecar target before any authed request is forwarded to it, so a
+	// compromised/misconfigured provisioner address can never point the gateway
+	// at the cloud metadata IP, a backend service, or an arbitrary host.
+	if err := provisioner.ValidateSidecarTarget(h.Address); err != nil {
+		return "", fmt.Errorf("refusing to forward to an invalid desktop target: %w", err)
+	}
 	return h.Address, nil
 }
 

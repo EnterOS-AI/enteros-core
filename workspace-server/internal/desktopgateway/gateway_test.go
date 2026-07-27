@@ -62,7 +62,7 @@ func tokenFn(_ context.Context, _ string) (string, error) { return "sidecar-secr
 // Input must FAIL-CLOSED when the agent does not hold the control lock: no HTTP
 // call, no desktop start (§8).
 func TestGateway_Input_FailsClosedWhenAgentLacksControl(t *testing.T) {
-	prov := &fakeProv{addr: "wsdesk-w1:6070"}
+	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusNoContent}
 	g := New(prov, fakeLocks{held: false}, &fakeActivity{}, tokenFn, doer)
 
@@ -79,7 +79,7 @@ func TestGateway_Input_FailsClosedWhenAgentLacksControl(t *testing.T) {
 }
 
 func TestGateway_Input_ProxiesWhenAgentHoldsControl(t *testing.T) {
-	prov := &fakeProv{addr: "wsdesk-w1:6070"}
+	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusNoContent}
 	act := &fakeActivity{}
 	g := New(prov, fakeLocks{held: true}, act, tokenFn, doer)
@@ -97,7 +97,7 @@ func TestGateway_Input_ProxiesWhenAgentHoldsControl(t *testing.T) {
 		t.Fatalf("want 1 proxied request, got %d", len(doer.reqs))
 	}
 	req := doer.reqs[0]
-	if req.Method != http.MethodPost || req.URL.String() != "http://wsdesk-w1:6070/input" {
+	if req.Method != http.MethodPost || req.URL.String() != "http://wsdesk-abc123:6070/input" {
 		t.Fatalf("bad proxied request: %s %s", req.Method, req.URL)
 	}
 	if req.Header.Get("Authorization") != "Bearer sidecar-secret" {
@@ -108,7 +108,7 @@ func TestGateway_Input_ProxiesWhenAgentHoldsControl(t *testing.T) {
 // Sight is never arbitrated: Screenshot does not consult the lock and works
 // even without control (§8).
 func TestGateway_Screenshot_NoLockCheck(t *testing.T) {
-	prov := &fakeProv{addr: "wsdesk-w1:6070"}
+	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusOK, body: "PNGBYTES"}
 	act := &fakeActivity{}
 	// held:false — but screenshots must still work.
@@ -143,7 +143,7 @@ func TestGateway_UnavailableBackendSurfaces(t *testing.T) {
 
 // A lock-check error fails closed (deny), never open.
 func TestGateway_Input_LockErrorFailsClosed(t *testing.T) {
-	prov := &fakeProv{addr: "wsdesk-w1:6070"}
+	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusNoContent}
 	g := New(prov, fakeLocks{err: errors.New("db down")}, &fakeActivity{}, tokenFn, doer)
 	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err == nil {

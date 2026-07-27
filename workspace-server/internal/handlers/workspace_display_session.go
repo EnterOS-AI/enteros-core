@@ -86,7 +86,14 @@ func (h *WorkspaceHandler) DisplaySession(c *gin.Context) {
 	defer cancel()
 	fwd := func(fn func(target *url.URL) error) error {
 		if useSidecar {
-			return desktopDisplayForward(ctx, provisioner.DesktopContainerName(workspaceID)+":"+desktopNoVNCPort, fn)
+			sidecarHost := provisioner.DesktopContainerName(workspaceID) + ":" + desktopNoVNCPort
+			// SSRF allowlist (§13): the host is server-built from the authed
+			// route's workspace id, but pin its shape so a malformed id can never
+			// steer the noVNC reverse proxy to an arbitrary host.
+			if err := provisioner.ValidateSidecarTarget(sidecarHost); err != nil {
+				return err
+			}
+			return desktopDisplayForward(ctx, sidecarHost, fn)
 		}
 		return displayForward(ctx, instanceID, fn)
 	}

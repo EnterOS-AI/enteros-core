@@ -61,6 +61,59 @@ func WorkspaceIDFromDesktopName(name string) string {
 	return strings.TrimPrefix(name, desktopContainerNamePrefix)
 }
 
+// desktopSidecarPorts are the ONLY ports a resolved sidecar target may address:
+// the control server (agent hands/eyes) and noVNC (human display). Any other
+// port is rejected as an SSRF attempt by ValidateSidecarTarget.
+var desktopSidecarPorts = map[string]struct{}{"6070": {}, "6080": {}}
+
+// IsWellFormedWorkspaceID reports whether s uses only the hex-and-dash alphabet
+// of a workspace UUID (and is non-empty). Anything else must NEVER be
+// interpolated into a sidecar hostname — a value containing "/", "@", ":", or a
+// dot could otherwise steer a proxy target to an attacker-chosen host.
+func IsWellFormedWorkspaceID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		case r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateSidecarTarget is the SSRF allowlist for the desktop display proxy and
+// the computer-use gateway (design §13 / checklist "SSRF hostname allowlist for
+// the sidecar"). It confirms host is EXACTLY a desktop-sidecar target —
+// "wsdesk-<well-formed-id>:<control-or-vnc-port>" — before any request is
+// forwarded to it. This is defence-in-depth: the host is normally server-built
+// from an authenticated route's workspace id, but pinning the shape here means a
+// malformed id, an unexpected port, or a compromised address resolver can never
+// redirect the proxy to the cloud metadata IP, a backend service, or an
+// arbitrary external host. Returns a non-nil error naming the rejection.
+func ValidateSidecarTarget(host string) error {
+	hostname, port, ok := strings.Cut(host, ":")
+	if !ok || port == "" {
+		return fmt.Errorf("sidecar target %q missing host:port", host)
+	}
+	if _, allowed := desktopSidecarPorts[port]; !allowed {
+		return fmt.Errorf("sidecar target %q uses disallowed port %q (want 6070 or 6080)", host, port)
+	}
+	id := WorkspaceIDFromDesktopName(hostname)
+	if id == "" {
+		return fmt.Errorf("sidecar target %q hostname is not a %q sidecar", host, desktopContainerNamePrefix)
+	}
+	if !IsWellFormedWorkspaceID(id) {
+		return fmt.Errorf("sidecar target %q has a malformed workspace id %q", host, id)
+	}
+	return nil
+}
+
 // desktopManagedLabels is the label map stamped on every desktop sidecar
 // container + profile volume: the standard managed/instance ownership labels
 // PLUS LabelRole=RoleDesktop, so the container is found and reaped by label,
