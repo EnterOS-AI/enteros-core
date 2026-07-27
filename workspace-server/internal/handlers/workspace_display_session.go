@@ -16,6 +16,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"github.com/gin-gonic/gin"
 )
 
@@ -23,6 +24,17 @@ const workspaceDisplaySessionTimeout = 12 * time.Hour
 const displaySessionTokenProtocolPrefix = "molecule-display-token."
 
 var displayForward = realDisplayForward
+
+const desktopNoVNCPort = "6080"
+
+// desktopDisplayForward dials a Docker/k8s desktop SIDECAR's noVNC listener
+// directly over the per-workspace network — the §13 display re-home. Unlike
+// realDisplayForward (EC2 EIC SSH tunnel) there is NO tunnel: the sidecar is a
+// name on the workspace network, so the reverse proxy is handed an
+// http://<sidecarHost> target directly (sidecarHost e.g. "wsdesk-<id>:6080").
+func desktopDisplayForward(_ context.Context, sidecarHost string, fn func(target *url.URL) error) error {
+	return fn(&url.URL{Scheme: "http", Host: sidecarHost})
+}
 
 // DisplaySession proxies noVNC/websockify requests for a display-enabled EC2
 // workspace through the existing EIC SSH path. The EC2 :6080 listener stays
@@ -43,7 +55,13 @@ func (h *WorkspaceHandler) DisplaySession(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "display not enabled"})
 		return
 	}
-	if instanceID == "" {
+	// Display re-home (§13): a deployment with a desktop-sidecar backend wired
+	// reaches the sidecar's noVNC directly over the per-workspace network (no
+	// EC2 instance_id / EIC tunnel). EC2 deployments keep the instance_id gate.
+	// (Per-workspace sidecar-vs-EC2 selection from the lifecycle table is a
+	// follow-up; the wired-backend flag is the deployment-level discriminator.)
+	useSidecar := h.sidecarProv != nil
+	if !useSidecar && instanceID == "" {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "display session unavailable"})
 		return
 	}
@@ -66,7 +84,13 @@ func (h *WorkspaceHandler) DisplaySession(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), workspaceDisplaySessionTimeout)
 	defer cancel()
-	err = displayForward(ctx, instanceID, func(target *url.URL) error {
+	fwd := func(fn func(target *url.URL) error) error {
+		if useSidecar {
+			return desktopDisplayForward(ctx, provisioner.DesktopContainerName(workspaceID)+":"+desktopNoVNCPort, fn)
+		}
+		return displayForward(ctx, instanceID, fn)
+	}
+	err = fwd(func(target *url.URL) error {
 		proxy := newDisplaySessionReverseProxy(target)
 		proxy.ServeHTTP(c.Writer, c.Request.WithContext(ctx))
 		return nil
