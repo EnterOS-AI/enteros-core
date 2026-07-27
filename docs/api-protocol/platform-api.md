@@ -160,10 +160,38 @@ lifecycle transitions are forward-only (a terminal state is a sink — see
 Successful empty responses return `"events": []`. Canvas deliberately does not
 render the hash and HMAC integrity values returned in each event.
 
-This endpoint is a read surface; it does not create audit events. The active
-runtime currently has no `audit_events` producer. Restoring runtime emission or
-retiring this orphaned surface requires a separate product decision; the read
-endpoint alone is not evidence that current agent actions are being recorded.
+| `unsigned_events_present`     | `false`       | the page contains rows appended while `AUDIT_LEDGER_SALT` was unset. They are genuine records but were never signed, so the chain cannot be verified. Distinct from `tampered` — there is no attacker to hunt, there is a salt to configure |
+
+This endpoint is a read surface; it does not create audit events.
+
+**Producers.** Lifecycle events are written by the workspace-server itself
+(`internal/handlers/audit_write.go`) for the security-relevant admin verbs:
+
+| `operation`          | written by |
+| -------------------- | ---------- |
+| `workspace.create`   | `POST /workspaces`, after the row commits |
+| `workspace.delete`   | `DELETE /workspaces/:id`, after the cascade |
+| `workspace.purge`    | `DELETE /workspaces/:id?purge=true`, after the hard delete |
+| `auth_token.mint`    | `POST /workspaces/:id/tokens`, `POST /admin/workspaces/:id/tokens` |
+| `auth_token.revoke`  | `DELETE /workspaces/:id/tokens/:tokenId`, `POST /admin/workspaces/:id/revoke-auth-tokens` |
+
+For these rows `agent_id` carries the ACTOR — the credential that
+authenticated the call (`admin-token`, `org-token:<prefix>`,
+`session:<workos-user-id>`, `workspace-token`) — and `details` carries the
+event's subject (which workspace, which token id, client IP). `session_id`
+carries the upstream `X-Request-Id` when the caller supplied one.
+
+Agent-execution events (`task_start`, `llm_call`, `tool_call`, `task_end`) are
+still NOT produced by any runtime. That remains a separate product decision;
+the presence of lifecycle rows is not evidence that agent actions are recorded.
+
+**Delete anchoring.** `audit_events.workspace_id` is `NOT NULL REFERENCES
+workspaces(id) ON DELETE CASCADE`, and `?purge=true` additionally deletes
+`audit_events` for every purged workspace. A delete/purge event is therefore
+filed under the target's PARENT (never in the purge set), not the target — so
+querying a deleted workspace's own audit trail will not show its deletion; query
+the parent. A workspace with no parent has nowhere surviving to anchor to, and
+purging it still erases its own delete event.
 
 ### Async Delegation
 

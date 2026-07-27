@@ -126,6 +126,14 @@ func (h *TokenHandler) Create(c *gin.Context) {
 
 	log.Printf("tokens: issued new token for workspace %s", workspaceID)
 
+	// Tamper-evident audit append — see admin_workspace_tokens.go. Prefix
+	// only; the plaintext never enters the ledger.
+	RecordAuditEvent(c.Request.Context(), db.DB, auditEntryFromGin(c, workspaceID, AuditOpTokenMint, true, map[string]any{
+		"workspace_id": workspaceID,
+		"route":        "workspace",
+		"token_prefix": auditTokenPrefix(token),
+	}))
+
 	c.JSON(http.StatusCreated, gin.H{
 		"auth_token":   token,
 		"workspace_id": workspaceID,
@@ -165,5 +173,16 @@ func (h *TokenHandler) Revoke(c *gin.Context) {
 	}
 
 	log.Printf("tokens: revoked token %s for workspace %s", tokenID, workspaceID)
+
+	// Tamper-evident audit append. Revocation is recorded only on the path
+	// where RowsAffected proved a live token actually changed state, so the
+	// ledger never claims a revocation that did not happen.
+	RecordAuditEvent(c.Request.Context(), db.DB, auditEntryFromGin(c, workspaceID, AuditOpTokenRevoke, true, map[string]any{
+		"workspace_id":  workspaceID,
+		"route":         "workspace",
+		"token_id":      tokenID,
+		"revoked_count": rows,
+	}))
+
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
 }
