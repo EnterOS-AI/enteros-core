@@ -406,8 +406,22 @@ jobs:
           # reliable — separate promotion once soaked green).
           E2E_EPHEMERAL_EXTRA_GATING: peer_visibility,concierge_creates_workspace
         run: |
-          bash tests/e2e/ephemeral_cp_happy_path.sh
+          # Stamp the arm BEFORE running the gate, not after.
+          #
+          # This step and the sentinel below answer two DIFFERENT questions.
+          # The sentinel asks "did any arm RUN?" — it exists to catch a job whose
+          # every step skipped and would otherwise post SUCCESS on a required
+          # context having proved nothing. It does NOT ask "did the gate PASS";
+          # this step's own exit code already answers that and fails the job.
+          #
+          # With the stamp after the command, `set -e` skipped it on any gate
+          # failure, so a genuine gate red ALSO printed "::error::NO ARM RAN.
+          # … Some `if:` condition is wrong" — sending the reader hunting a
+          # phantom workflow-conditional bug instead of reading the gate output
+          # directly above it. Never a false green (the step still failed), but
+          # misdirected diagnosis is expensive on this gate.
           echo "GATE_ARM=proof" >> "$GITHUB_ENV"
+          bash tests/e2e/ephemeral_cp_happy_path.sh
 
       # Atomic teardown: one rm destroys the entire nested topology (CP, PG,
       # tenants, workspaces, volumes, networks, built images) — even after a
