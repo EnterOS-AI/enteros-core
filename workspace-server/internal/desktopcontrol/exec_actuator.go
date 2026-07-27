@@ -79,18 +79,58 @@ func (a *ExecActuator) ensureFocus(ctx context.Context) error {
 	return nil
 }
 
+// typePasteThreshold is the byte length above which Type() pastes via the
+// clipboard instead of injecting keystrokes. Key injection is O(n) xdotool work
+// and drops characters on fields with async handlers; paste is one Ctrl+V.
+const typePasteThreshold = 40
+
 func (a *ExecActuator) Type(ctx context.Context, text string) error {
 	if err := a.ensureFocus(ctx); err != nil {
 		return err
 	}
+	// IME paste fallback (§ input hardening): key injection is slow and
+	// IME-fragile for long or non-ASCII text (accented chars, CJK, emoji), which
+	// xdotool type may drop or mistranslate. For those, stage the text on the
+	// clipboard and Ctrl+V it — atomic and IME-safe. Short ASCII stays on the
+	// direct type path (no clipboard side effects for the common case).
+	if len(text) > typePasteThreshold || !isASCII(text) {
+		return a.typeViaPaste(ctx, text)
+	}
 	// --delay spaces keystrokes (ms) so fast injection doesn't outrun an input
-	// field's async JS handlers and drop characters (§ input hardening). NOTE:
-	// a clipboard "paste" fallback for very long / non-ASCII (IME) text is a
-	// follow-up — it needs xclip/xsel added to the sidecar image.
+	// field's async JS handlers and drop characters.
 	if _, err := a.run(ctx, "xdotool", "type", "--clearmodifiers", "--delay", "12", "--", text); err != nil {
 		return fmt.Errorf("xdotool type: %w", err)
 	}
 	return nil
+}
+
+// typeViaPaste stages text on the X clipboard (via xclip, reading a short-lived
+// temp file so no stdin plumbing is needed) then pastes it with Ctrl+V. The temp
+// file lives only inside the isolated sidecar and is removed immediately, matching
+// the screenshot temp-file pattern.
+func (a *ExecActuator) typeViaPaste(ctx context.Context, text string) error {
+	f := filepath.Join(a.tmpDir, "desktop-paste.txt")
+	if err := os.WriteFile(f, []byte(text), 0o600); err != nil {
+		return fmt.Errorf("stage paste text: %w", err)
+	}
+	defer func() { _ = os.Remove(f) }()
+	if _, err := a.run(ctx, "xclip", "-selection", "clipboard", "-i", f); err != nil {
+		return fmt.Errorf("xclip set clipboard: %w", err)
+	}
+	if _, err := a.run(ctx, "xdotool", "key", "--clearmodifiers", "ctrl+v"); err != nil {
+		return fmt.Errorf("xdotool paste: %w", err)
+	}
+	return nil
+}
+
+// isASCII reports whether every rune in s is a 7-bit ASCII character.
+func isASCII(s string) bool {
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *ExecActuator) Key(ctx context.Context, keys string) error {

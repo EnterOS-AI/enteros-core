@@ -283,7 +283,7 @@ Not a one-var swap. v2 edits: (a) re-type `displayForward`/`realDisplayForward` 
 - [ ] Vision-capable-adapter gating in `tools/list`
 - [ ] Attachment-URI screenshot result; per-task cost budget documented
 - [ ] Chrome kiosk window pinning + geometry assert
-- [~] Input hardening — settle/sync (move→settle→click) + focus-verify (getactivewindow before type/key) + type `--delay` **done+tested**; IME clipboard-paste fallback ◻︎ (needs xclip in the image)
+- [x] Input hardening — settle/sync (move→settle→click) + focus-verify (getactivewindow before type/key) + type `--delay` + **IME clipboard-paste fallback** (long/non-ASCII text staged via xclip → Ctrl+V; xclip added to the image; clipboard round-trip **verified with non-ASCII in the hardened container**); tests cover all branches
 
 **Data model / proxy**
 - [ ] `compute` jsonb + side table migrations (up/down)

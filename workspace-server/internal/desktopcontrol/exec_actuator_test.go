@@ -104,6 +104,45 @@ func TestExecActuator_TypeKeyScroll(t *testing.T) {
 	}
 }
 
+func TestExecActuator_TypePasteFallback(t *testing.T) {
+	// Long text -> clipboard paste path (getactivewindow, xclip, ctrl+v).
+	a, got := newRecordingActuator(t)
+	long := strings.Repeat("a", 50) // > typePasteThreshold, ASCII
+	if err := a.Type(context.Background(), long); err != nil {
+		t.Fatal(err)
+	}
+	if len(*got) != 3 {
+		t.Fatalf("paste path wants 3 cmds (focus, xclip, paste), got %d: %+v", len(*got), *got)
+	}
+	if (*got)[0].name != "xdotool" || (*got)[0].args[0] != "getactivewindow" {
+		t.Fatalf("first cmd = %q, want focus verify", joined((*got)[0]))
+	}
+	if (*got)[1].name != "xclip" || (*got)[1].args[0] != "-selection" || (*got)[1].args[1] != "clipboard" {
+		t.Fatalf("second cmd = %q, want xclip set clipboard", joined((*got)[1]))
+	}
+	if j := joined((*got)[2]); j != "xdotool key --clearmodifiers ctrl+v" {
+		t.Fatalf("third cmd = %q, want ctrl+v paste", j)
+	}
+
+	// Non-ASCII (even if short) also uses the paste path.
+	a, got = newRecordingActuator(t)
+	if err := a.Type(context.Background(), "café ☕"); err != nil {
+		t.Fatal(err)
+	}
+	if len(*got) != 3 || (*got)[1].name != "xclip" {
+		t.Fatalf("non-ASCII text must use paste path: %+v", *got)
+	}
+
+	// Short ASCII stays on the direct type path (no clipboard side effect).
+	a, got = newRecordingActuator(t)
+	if err := a.Type(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if len(*got) != 2 || (*got)[1].name != "xdotool" || (*got)[1].args[0] != "type" {
+		t.Fatalf("short ASCII must use direct type path: %+v", *got)
+	}
+}
+
 func TestExecActuator_TypeRefusesWhenNoFocus(t *testing.T) {
 	dir := t.TempDir()
 	a := &ExecActuator{

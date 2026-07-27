@@ -54,7 +54,7 @@ FROM debian:bookworm-slim
 # the direct-capture + input tools (scrot/xdotool), and the human VNC path.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb x11-utils openbox chromium x11vnc websockify novnc \
-    scrot xdotool ca-certificates fonts-liberation dbus-x11 tini \
+    scrot xdotool xclip ca-certificates fonts-liberation dbus-x11 tini \
   && rm -rf /var/lib/apt/lists/*
 
 # Non-root desktop user. Its own uid; the profile volume is chowned to it. With
