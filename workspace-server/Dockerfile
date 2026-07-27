@@ -94,11 +94,23 @@ COPY manifest.json /app/manifest.json
 # trusted build context, .git already stripped). The Gitea
 # token used to clone them never enters this image — same shape as
 # Dockerfile.tenant.
-COPY .tenant-bundle-deps/workspace-configs-templates /workspace-configs-templates
-COPY .tenant-bundle-deps/org-templates /org-templates
-COPY .tenant-bundle-deps/plugins /plugins
 # Non-root runtime with Docker socket access for workspace provisioning.
+# MOVED ABOVE the COPYs so they can --chown to it (see the org-templates note).
 RUN addgroup -g 1000 platform && adduser -u 1000 -G platform -s /bin/sh -D platform
+COPY .tenant-bundle-deps/workspace-configs-templates /workspace-configs-templates
+# org-templates MUST be writable by the runtime user. An org template carrying an
+# `!external` ref makes the importer materialise a content-addressable cache at
+# <template-dir>/.external-cache/ (org_external.go, gitFetcher.Fetch -> MkdirAll).
+# Without --chown this tree lands root:root 0755 while the server runs as uid 1000
+# `platform`, so that MkdirAll returns EACCES and the template becomes
+# UNIMPORTABLE:
+#   POST /org/import {"dir":"molecule-dev"} -> {"error":"org template expansion failed"}
+#   log: !external at line 155: ... mkdir /org-templates/molecule-dev/.external-cache:
+#        permission denied
+# molecule-dev is the org template the dev team actually uses, and it was broken on
+# every image built from this file. Reproduced and fixed against a local stack.
+COPY --chown=platform:platform .tenant-bundle-deps/org-templates /org-templates
+COPY .tenant-bundle-deps/plugins /plugins
 EXPOSE 8080
 # HEALTHCHECK: probe the /health endpoint so orchestrators and docker's
 # health monitoring can detect a crashed or wedged server.
