@@ -26,9 +26,11 @@ type fakeSidecarDocker struct {
 		name  string
 		force bool
 	}
-	volCreates []volume.CreateOptions
-	volRemoves []string
-	running    map[string]bool
+	volCreates  []volume.CreateOptions
+	volRemoves  []string
+	netsCreated []string
+	netsRemoved []string
+	running     map[string]bool
 }
 
 func newFakeSidecarDocker() *fakeSidecarDocker { return &fakeSidecarDocker{running: map[string]bool{}} }
@@ -72,13 +74,21 @@ func (f *fakeSidecarDocker) VolumeRemove(_ context.Context, name string, _ bool)
 	f.volRemoves = append(f.volRemoves, name)
 	return nil
 }
+func (f *fakeSidecarDocker) NetworkCreate(_ context.Context, name string, _ network.CreateOptions) (network.CreateResponse, error) {
+	f.netsCreated = append(f.netsCreated, name)
+	return network.CreateResponse{ID: "net-" + name}, nil
+}
+func (f *fakeSidecarDocker) NetworkRemove(_ context.Context, name string) error {
+	f.netsRemoved = append(f.netsRemoved, name)
+	return nil
+}
 
 const sidecarTestWS = "abc12345-6789-4def-8123-56789abcdef0"
 
 func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 	f := newFakeSidecarDocker()
-	const net = "ws-net-" + sidecarTestWS
-	p := NewLocalSidecarProvisioner(f, "desk:img", net, 6070, 0, 1<<30)
+	const prefix = "wsnet"
+	p := NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 1<<30)
 
 	h, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS})
 	if err != nil {
@@ -121,10 +131,15 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 	if c.host.OomScoreAdj <= 0 {
 		t.Fatalf("OomScoreAdj = %d, want > 0 so pressure sheds the desktop not the tenant", c.host.OomScoreAdj)
 	}
-	// Attached to the ISOLATED per-workspace network with a name alias.
-	ep, ok := c.net.EndpointsConfig[net]
+	// A DEDICATED per-workspace network was created, and the sidecar is
+	// attached to it (isolation boundary), with a name alias.
+	wantNet := prefix + "-" + sidecarTestWS
+	if len(f.netsCreated) != 1 || f.netsCreated[0] != wantNet {
+		t.Fatalf("per-workspace network not created: %v (want %q)", f.netsCreated, wantNet)
+	}
+	ep, ok := c.net.EndpointsConfig[wantNet]
 	if !ok {
-		t.Fatalf("sidecar not attached to per-workspace network %q: %+v", net, c.net.EndpointsConfig)
+		t.Fatalf("sidecar not attached to per-workspace network %q: %+v", wantNet, c.net.EndpointsConfig)
 	}
 	if len(ep.Aliases) == 0 || ep.Aliases[0] != name {
 		t.Fatalf("network alias = %v, want %q", ep.Aliases, name)

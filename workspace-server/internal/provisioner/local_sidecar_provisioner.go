@@ -26,6 +26,8 @@ type sidecarDocker interface {
 	ContainerRemove(ctx context.Context, name string, options container.RemoveOptions) error
 	VolumeCreate(ctx context.Context, options volume.CreateOptions) (volume.Volume, error)
 	VolumeRemove(ctx context.Context, volumeID string, force bool) error
+	NetworkCreate(ctx context.Context, name string, options network.CreateOptions) (network.CreateResponse, error)
+	NetworkRemove(ctx context.Context, networkID string) error
 }
 
 // LocalSidecarProvisioner is the Docker (self-host) backend of
@@ -41,16 +43,21 @@ type LocalSidecarProvisioner struct {
 	// control server). Digest-pinned in production.
 	image string
 
-	// networkName is the Docker network the sidecar joins.
+	// networkPrefix names a DEDICATED PER-WORKSPACE network the sidecar is
+	// created on: "<networkPrefix>-<workspaceID>" (§6.1, decision 1 — security
+	// first). Each workspace's desktop gets its OWN network. StartDesktop
+	// creates it; StopDesktop removes it best-effort. Empty = no network attach
+	// (tests only; NOT production).
 	//
-	// SECURITY (§6.1, decision 1 — security first): production MUST set this
-	// to the workspace's DEDICATED per-workspace network, never the shared
-	// molecule-core-net. A credential-bearing browser on the flat shared
-	// network is a cross-tenant pivot (passwordless Redis, LiteLLM keys,
-	// other tenants). The lifecycle logic here is network-agnostic; the caller
-	// supplies the isolated network. Empty = no explicit network attach (test
-	// / not-yet-isolated; NOT a production-valid configuration).
-	networkName string
+	// VERIFIED against real Docker (2026-07-27): a per-workspace network blocks
+	// reaching other containers BY NAME (Docker DNS is per-network) but NOT BY
+	// IP — bridge networks on one host still route to each other's subnets. So
+	// this is NECESSARY BUT NOT SUFFICIENT: it MUST be paired with egress
+	// control that denies RFC-1918 (the §6.1 egress proxy / a DOCKER-USER
+	// firewall rule), or a sidecar can still hit postgres/redis/litellm by IP.
+	// Do NOT treat "sidecar is on a per-workspace network" as "sidecar is
+	// isolated" until the egress-deny is in place.
+	networkPrefix string
 
 	// controlPort is the sidecar control-server port the computer-use gateway
 	// and the display proxy dial.
@@ -69,18 +76,27 @@ type LocalSidecarProvisioner struct {
 
 // NewLocalSidecarProvisioner constructs the Docker desktop backend. See the
 // networkName doc for the production security requirement.
-func NewLocalSidecarProvisioner(cli sidecarDocker, image, networkName string, controlPort int, stopTimeout time.Duration, memoryLimitBytes int64) *LocalSidecarProvisioner {
+func NewLocalSidecarProvisioner(cli sidecarDocker, image, networkPrefix string, controlPort int, stopTimeout time.Duration, memoryLimitBytes int64) *LocalSidecarProvisioner {
 	if stopTimeout <= 0 {
 		stopTimeout = 10 * time.Second
 	}
 	return &LocalSidecarProvisioner{
 		cli:              cli,
 		image:            image,
-		networkName:      networkName,
+		networkPrefix:    networkPrefix,
 		controlPort:      controlPort,
 		stopTimeout:      stopTimeout,
 		memoryLimitBytes: memoryLimitBytes,
 	}
+}
+
+// perWorkspaceNetwork is the dedicated network name for a workspace's desktop
+// ("<prefix>-<id>"), or "" when no prefix is configured.
+func (p *LocalSidecarProvisioner) perWorkspaceNetwork(workspaceID string) string {
+	if p.networkPrefix == "" {
+		return ""
+	}
+	return p.networkPrefix + "-" + workspaceID
 }
 
 // Compile-time assertion: *LocalSidecarProvisioner satisfies SidecarProvisioner.
@@ -136,9 +152,16 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 	}
 
 	netCfg := &network.NetworkingConfig{}
-	if p.networkName != "" {
+	if net := p.perWorkspaceNetwork(cfg.WorkspaceID); net != "" {
+		// Create the DEDICATED per-workspace network (idempotent: a re-create
+		// after a stale sidecar reuses it). This is the isolation boundary —
+		// the sidecar is on ONLY this network, never the shared molecule-core-
+		// net, so it cannot reach other tenants or the backend infra (§6.1).
+		if _, err := p.cli.NetworkCreate(ctx, net, network.CreateOptions{Labels: desktopManagedLabels()}); err != nil && !isNetworkExists(err) {
+			return DesktopHandle{}, fmt.Errorf("create per-workspace network: %w", err)
+		}
 		netCfg.EndpointsConfig = map[string]*network.EndpointSettings{
-			p.networkName: {Aliases: []string{name}},
+			net: {Aliases: []string{name}},
 		}
 	}
 
@@ -171,11 +194,16 @@ func (p *LocalSidecarProvisioner) StopDesktop(ctx context.Context, workspaceID s
 	}
 	// Not Force: the container is already stopped, so a plain remove suffices
 	// and there is no SIGKILL involved.
-	if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{}); err != nil {
-		if isNoSuchContainer(err) {
-			return nil
-		}
+	if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{}); err != nil && !isNoSuchContainer(err) {
 		return fmt.Errorf("remove desktop sidecar: %w", err)
+	}
+	// Best-effort: remove the now-empty per-workspace network so it doesn't
+	// leak. A network still holding an endpoint (slow teardown) is left for a
+	// later sweep; don't fail the stop over it.
+	if net := p.perWorkspaceNetwork(workspaceID); net != "" {
+		if err := p.cli.NetworkRemove(ctx, net); err != nil && !isNoSuchNetwork(err) {
+			_ = err
+		}
 	}
 	return nil
 }
@@ -213,4 +241,12 @@ func isNoSuchContainer(err error) bool {
 
 func isNoSuchVolume(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "No such volume")
+}
+
+func isNetworkExists(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "already exists")
+}
+
+func isNoSuchNetwork(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No such network")
 }
