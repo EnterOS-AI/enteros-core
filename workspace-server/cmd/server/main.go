@@ -40,6 +40,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/codexauth"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/desktopgateway"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/envx"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/events"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/handlers"
@@ -358,6 +359,35 @@ func main() {
 		})
 	if cpProv != nil {
 		wh.SetCPProvisioner(cpProv)
+	}
+
+	// Desktop computer-use wiring (design decision B). DISABLED by default:
+	// enabling it BEFORE the per-workspace-network egress-deny (§6.1) is in
+	// place would let a credential-bearing sidecar reach backend infra BY IP
+	// (a VERIFIED gap — a per-workspace network blocks by-name, not by-IP). So
+	// an operator flips MOLECULE_DESKTOP_ENABLED=true ONLY once the egress
+	// prerequisite is provisioned. Self-host (local Docker) only for now; the
+	// CP/k8s backend is a separate follow-up.
+	if envOr("MOLECULE_DESKTOP_ENABLED", "false") == "true" {
+		if prov != nil {
+			image := envOr("MOLECULE_DESKTOP_IMAGE", "registry.moleculesai.app/molecule-ai/molecule-desktop:latest")
+			sidecar := provisioner.NewLocalSidecarProvisioner(prov.DockerClient(), image, "wsnet", 6070, 10*time.Second, 2<<30)
+			wh.SetSidecarProvisioner(sidecar)
+			store := handlers.NewDesktopLifecycleStore(db.DB)
+			gw := desktopgateway.New(
+				sidecar,
+				store, // LockChecker
+				store, // ActivityRecorder
+				func(_ context.Context, workspaceID string) (string, error) {
+					return handlers.DeriveDesktopControlToken(os.Getenv("DISPLAY_SESSION_SIGNING_SECRET"), workspaceID), nil
+				},
+				nil,
+			)
+			wh.SetDesktopGateway(gw)
+			log.Println("Desktop: computer-use ENABLED (sidecar provisioner + gateway wired)")
+		} else {
+			log.Println("Desktop: MOLECULE_DESKTOP_ENABLED=true but no local Docker provisioner; skipping")
+		}
 	}
 
 	// Wake-lifecycle owner (PR-D): route this handler's proactive-wake emitters
