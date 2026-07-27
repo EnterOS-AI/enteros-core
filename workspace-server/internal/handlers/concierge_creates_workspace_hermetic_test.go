@@ -35,7 +35,7 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 		// Base heartbeat UPDATE.
 		mock.ExpectQuery("SELECT COALESCE\\(current_task").
 			WithArgs("ws-concierge-ok").
-			WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+			WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 		mock.ExpectExec("UPDATE workspaces SET").
 			WithArgs("ws-concierge-ok", 0.0, "", 0, 60, "", nil).
@@ -89,7 +89,7 @@ func TestConciergeCreatesWorkspace_Hermetic(t *testing.T) {
 
 		mock.ExpectQuery("SELECT COALESCE\\(current_task").
 			WithArgs("ws-concierge-missing").
-			WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+			WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 		mock.ExpectExec("UPDATE workspaces SET").
 			WithArgs("ws-concierge-missing", 0.0, "", 0, 60, "", nil).

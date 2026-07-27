@@ -37,7 +37,7 @@ func TestHeartbeatHandler_PlatformManagementMCPMissing_SustainedDegrades(t *test
 	// Initial heartbeat UPDATE.
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-mcp-missing").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-mcp-missing", 0.0, "", 0, 60, "", nil).
@@ -104,7 +104,7 @@ func TestHeartbeatHandler_PlatformManagementMCPMissing_WithinGrace_NoDegrade(t *
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-mcp-warmup").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-mcp-warmup", 0.0, "", 0, 60, "", nil).
@@ -164,7 +164,7 @@ func TestHeartbeatHandler_PlatformManagementMCPLoaded_ClearsStampStaysOnline(t *
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-mcp-ok").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-mcp-ok", 0.0, "", 0, 60, "", nil).
@@ -225,7 +225,7 @@ func TestHeartbeatHandler_RuntimeEmitsServerPresentButNoLoadedTools_SustainedDeg
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-server-present-no-tools").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-server-present-no-tools", 0.0, "", 0, 60, "", nil).
@@ -280,7 +280,7 @@ func TestHeartbeatHandler_RuntimeEmitsServerPresentButNoLoadedTools_WithinGrace(
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-no-tools-warmup").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-no-tools-warmup", 0.0, "", 0, 60, "", nil).
@@ -333,7 +333,7 @@ func TestHeartbeatHandler_DegradedNotRecoveredWhileMCPUnloaded(t *testing.T) {
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-stuck-degraded").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "degraded"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "degraded", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-stuck-degraded", 0.0, "", 0, 60, "", nil).
@@ -388,7 +388,7 @@ func TestHeartbeatHandler_Pre147RuntimeNoMCPServerPresent_StaysOnline(t *testing
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-pre-147").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-pre-147", 0.0, "", 0, 60, "", nil).
@@ -436,7 +436,7 @@ func TestHeartbeatHandler_PlatformManagementMCPLookupError_FlipsOnlineToDegraded
 
 	mock.ExpectQuery("SELECT COALESCE\\(current_task").
 		WithArgs("ws-mcp-lookup-err").
-		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status"}).AddRow("", 0, "online"))
+		WillReturnRows(sqlmock.NewRows([]string{"current_task", "monthly_spend", "status", "desired_generation"}).AddRow("", 0, "online", int64(0)))
 
 	mock.ExpectExec("UPDATE workspaces SET").
 		WithArgs("ws-mcp-lookup-err", 0.0, "", 0, 60, "", nil).
