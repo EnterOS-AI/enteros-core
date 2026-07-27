@@ -707,6 +707,16 @@ jobs:
           # is surfaced on the first try — the retry can never mask a real
           # create regression, only absorb the cold-origin write window.
           bash tests/e2e/test_workspace_create_retry_unit.sh
+          # peer-visibility teardown vs the CP's org-lifecycle fence. The gate
+          # reds on main AFTER printing "GATE PASSED": claimOrgPurge answers an
+          # immediate 409 "organization has an active lifecycle operation" while
+          # the org's own async concierge provision is in flight, and the old
+          # hand-rolled teardown issued ONE fire-and-forget DELETE — a 409 writes
+          # no purge audit row, so the poll could never converge and the tenant
+          # LEAKED (runs 578856 / 578755). Drives the REAL script against a mocked
+          # CP: transient 409 → retried and provably purged; persistent 409 → still
+          # fails closed with exit 4. Offline: no docker, no creds.
+          bash tests/e2e/test_peer_visibility_teardown_unit.sh
 
       - if: ${{ needs.changes.outputs.scripts == 'true' }}
         name: Drift guard — KI-013 container/volume naming (SEV #2499)
