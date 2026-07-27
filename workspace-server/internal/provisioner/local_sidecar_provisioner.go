@@ -194,12 +194,12 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 		SecurityOpt: p.securityOpt(),
 	}
 	if p.memoryLimitBytes > 0 {
-		hostCfg.Resources.Memory = p.memoryLimitBytes
+		hostCfg.Memory = p.memoryLimitBytes
 		// Pin swap to the memory cap so the container cannot use ~2× the limit
 		// via swap — otherwise the OOM-shed guarantee below is only half real
 		// (reviewer B-nit). Equal Memory/MemorySwap = swap disabled for the
 		// container.
-		hostCfg.Resources.MemorySwap = p.memoryLimitBytes
+		hostCfg.MemorySwap = p.memoryLimitBytes
 		// Shed the DESKTOP under memory pressure, never the tenant/agent (§10):
 		// a positive oom_score_adj makes the kernel prefer killing the sidecar.
 		hostCfg.OomScoreAdj = 500

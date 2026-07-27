@@ -126,15 +126,15 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 		t.Fatalf("restart policy = %q, want \"no\"", c.host.RestartPolicy.Name)
 	}
 	// Memory cap + oom-shed-the-desktop.
-	if c.host.Resources.Memory != 1<<30 {
-		t.Fatalf("memory limit = %d, want %d", c.host.Resources.Memory, int64(1<<30))
+	if c.host.Memory != 1<<30 {
+		t.Fatalf("memory limit = %d, want %d", c.host.Memory, int64(1<<30))
 	}
 	if c.host.OomScoreAdj <= 0 {
 		t.Fatalf("OomScoreAdj = %d, want > 0 so pressure sheds the desktop not the tenant", c.host.OomScoreAdj)
 	}
 	// Swap pinned to the memory cap (no ~2× via swap).
-	if c.host.Resources.MemorySwap != c.host.Resources.Memory {
-		t.Fatalf("MemorySwap = %d, want == Memory (%d) so swap can't defeat the cap", c.host.Resources.MemorySwap, c.host.Resources.Memory)
+	if c.host.MemorySwap != c.host.Memory {
+		t.Fatalf("MemorySwap = %d, want == Memory (%d) so swap can't defeat the cap", c.host.MemorySwap, c.host.Memory)
 	}
 	// B2 hardening: CapDrop ALL + no-new-privileges + a NON-empty seccomp
 	// profile (the embedded Chromium-tuned default, since "" was passed). This

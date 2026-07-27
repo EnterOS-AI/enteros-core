@@ -12,7 +12,7 @@ import (
 // a deployment without a wired desktop backend (CP/k8s) leave the rest of the
 // platform unaffected (design decision 4).
 func TestUnavailableSidecarProvisioner_GatesFeatureCleanly(t *testing.T) {
-	var sp SidecarProvisioner = NewUnavailableSidecarProvisioner()
+	sp := NewUnavailableSidecarProvisioner() // returns SidecarProvisioner (interface)
 	ctx := context.Background()
 
 	if _, err := sp.StartDesktop(ctx, WorkspaceConfig{WorkspaceID: "w1"}); !errors.Is(err, ErrDesktopBackendUnavailable) {
