@@ -3,6 +3,7 @@ package provisioner
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
@@ -88,7 +89,7 @@ const sidecarTestWS = "abc12345-6789-4def-8123-56789abcdef0"
 func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 	f := newFakeSidecarDocker()
 	const prefix = "wsnet"
-	p := NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 1<<30)
+	p := NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 1<<30, "") // "" → embedded Chromium-tuned seccomp default
 
 	h, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS})
 	if err != nil {
@@ -131,6 +132,33 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 	if c.host.OomScoreAdj <= 0 {
 		t.Fatalf("OomScoreAdj = %d, want > 0 so pressure sheds the desktop not the tenant", c.host.OomScoreAdj)
 	}
+	// Swap pinned to the memory cap (no ~2× via swap).
+	if c.host.Resources.MemorySwap != c.host.Resources.Memory {
+		t.Fatalf("MemorySwap = %d, want == Memory (%d) so swap can't defeat the cap", c.host.Resources.MemorySwap, c.host.Resources.Memory)
+	}
+	// B2 hardening: CapDrop ALL + no-new-privileges + a NON-empty seccomp
+	// profile (the embedded Chromium-tuned default, since "" was passed). This
+	// is what keeps the browser's userns sandbox active with no CAP_SYS_ADMIN.
+	if len(c.host.CapDrop) != 1 || c.host.CapDrop[0] != "ALL" {
+		t.Fatalf("CapDrop = %v, want [ALL]", c.host.CapDrop)
+	}
+	var hasNoNewPriv bool
+	var seccompVal string
+	for _, opt := range c.host.SecurityOpt {
+		if opt == "no-new-privileges" {
+			hasNoNewPriv = true
+		}
+		if strings.HasPrefix(opt, "seccomp=") {
+			seccompVal = strings.TrimPrefix(opt, "seccomp=")
+		}
+	}
+	if !hasNoNewPriv {
+		t.Fatalf("SecurityOpt missing no-new-privileges: %v", c.host.SecurityOpt)
+	}
+	// Embedded default must be real JSON, NOT "unconfined".
+	if seccompVal == "" || seccompVal == "unconfined" || !strings.HasPrefix(strings.TrimSpace(seccompVal), "{") {
+		t.Fatalf("SecurityOpt seccomp must be the embedded JSON profile, got %.40q", seccompVal)
+	}
 	// A DEDICATED per-workspace network was created, and the sidecar is
 	// attached to it (isolation boundary), with a name alias.
 	wantNet := prefix + "-" + sidecarTestWS
@@ -153,7 +181,7 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 func TestLocalSidecar_StartDesktop_Idempotent(t *testing.T) {
 	f := newFakeSidecarDocker()
 	f.running[DesktopContainerName(sidecarTestWS)] = true // already up
-	p := NewLocalSidecarProvisioner(f, "desk:img", "net", 6070, 0, 0)
+	p := NewLocalSidecarProvisioner(f, "desk:img", "net", 6070, 0, 0, "unconfined")
 
 	h, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS})
 	if err != nil {
@@ -171,7 +199,7 @@ func TestLocalSidecar_StopDesktop_GracefulPreservesProfile(t *testing.T) {
 	f := newFakeSidecarDocker()
 	name := DesktopContainerName(sidecarTestWS)
 	f.running[name] = true
-	p := NewLocalSidecarProvisioner(f, "desk:img", "net", 6070, 0, 0)
+	p := NewLocalSidecarProvisioner(f, "desk:img", "net", 6070, 0, 0, "unconfined")
 
 	if err := p.StopDesktop(context.Background(), sidecarTestWS); err != nil {
 		t.Fatalf("StopDesktop: %v", err)
@@ -191,7 +219,7 @@ func TestLocalSidecar_StopDesktop_GracefulPreservesProfile(t *testing.T) {
 
 func TestLocalSidecar_StopDesktop_Idempotent(t *testing.T) {
 	f := newFakeSidecarDocker() // nothing running
-	p := NewLocalSidecarProvisioner(f, "desk:img", "net", 6070, 0, 0)
+	p := NewLocalSidecarProvisioner(f, "desk:img", "net", 6070, 0, 0, "unconfined")
 	if err := p.StopDesktop(context.Background(), sidecarTestWS); err != nil {
 		t.Fatalf("StopDesktop on absent sidecar must be a no-op, got %v", err)
 	}
@@ -199,7 +227,7 @@ func TestLocalSidecar_StopDesktop_Idempotent(t *testing.T) {
 
 func TestLocalSidecar_WipeProfile_RemovesVolume(t *testing.T) {
 	f := newFakeSidecarDocker()
-	p := NewLocalSidecarProvisioner(f, "desk:img", "net", 6070, 0, 0)
+	p := NewLocalSidecarProvisioner(f, "desk:img", "net", 6070, 0, 0, "unconfined")
 	if err := p.WipeProfile(context.Background(), sidecarTestWS); err != nil {
 		t.Fatalf("WipeProfile: %v", err)
 	}
@@ -210,7 +238,7 @@ func TestLocalSidecar_WipeProfile_RemovesVolume(t *testing.T) {
 
 func TestLocalSidecar_DesktopRunning(t *testing.T) {
 	f := newFakeSidecarDocker()
-	p := NewLocalSidecarProvisioner(f, "desk:img", "net", 6070, 0, 0)
+	p := NewLocalSidecarProvisioner(f, "desk:img", "net", 6070, 0, 0, "unconfined")
 
 	if r, err := p.DesktopRunning(context.Background(), sidecarTestWS); err != nil || r {
 		t.Fatalf("absent sidecar: got (%v,%v), want (false,nil)", r, err)

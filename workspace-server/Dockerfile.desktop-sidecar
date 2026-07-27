@@ -8,8 +8,19 @@
 #
 # SECURITY (decision 1 / §6): this image is launched by the provisioner ONTO A
 # DEDICATED PER-WORKSPACE NETWORK (never the flat molecule-core-net), run as a
-# non-root user with dropped caps + seccomp, and with Chromium's own sandbox ON.
-# The control server authenticates every inbound request (§6.5).
+# non-root user (USER desktop below) with --cap-drop ALL + no-new-privileges,
+# and with Chromium's own sandbox ON. The control server authenticates every
+# inbound request (§6.5).
+#
+# Chromium sandbox mechanism (VERIFIED 2026-07-27, Docker 29.5.3): the entrypoint
+# does NOT pass --no-sandbox, so Chromium uses its unprivileged USER-NAMESPACE
+# sandbox — which needs clone(CLONE_NEWUSER) + a chroot setup that the stock
+# Docker seccomp profile blocks once caps are dropped. The provisioner therefore
+# applies a Chromium-tuned seccomp profile (internal/provisioner/seccomp/) that
+# re-allows exactly those syscalls WITHOUT granting CAP_SYS_ADMIN. That is why
+# the setuid `chromium-sandbox` helper is deliberately NOT installed: under
+# no-new-privileges it could not elevate anyway, and the userns sandbox is the
+# path that actually works here. See internal/provisioner/seccomp/README.md.
 #
 # Build context: repo root. Publishing goes through the workflow-owned registry
 # pusher, same as Dockerfile.tenant.

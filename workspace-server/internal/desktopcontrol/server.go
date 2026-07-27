@@ -28,6 +28,12 @@ import (
 	"strings"
 )
 
+// maxScrollAmount bounds a single scroll action's magnitude. The actuator
+// issues one xdotool button click per unit, so this caps the per-request work
+// at a fixed, small number of clicks — preventing an unbounded amount from
+// becoming a near-infinite CPU loop.
+const maxScrollAmount = 100
+
 // Geometry is the pinned desktop resolution (the §3 coordinate contract).
 type Geometry struct {
 	Width  int
@@ -148,6 +154,14 @@ func (s *Server) validate(a Action) error {
 	case "scroll":
 		if a.Amount == 0 {
 			return fmt.Errorf("scroll action requires a non-zero amount")
+		}
+		// Bound the magnitude: the actuator issues one xdotool click per unit
+		// (exec_actuator.go), so an unbounded amount (e.g. 2e9) is a near-infinite
+		// CPU loop — a trivial local DoS. maxScrollAmount clicks is far past any
+		// legitimate single scroll gesture; a caller wanting more sends multiple
+		// actions. (Reviewer scroll-DoS nit.)
+		if a.Amount > maxScrollAmount || a.Amount < -maxScrollAmount {
+			return fmt.Errorf("scroll amount %d out of range (max magnitude %d)", a.Amount, maxScrollAmount)
 		}
 	case "screenshot":
 		// no-op action shape; screenshots normally use GET /screenshot.

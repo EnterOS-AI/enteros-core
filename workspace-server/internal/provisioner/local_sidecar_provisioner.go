@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"strings"
 	"time"
@@ -11,6 +12,16 @@ import (
 	"github.com/docker/docker/api/types/volume"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+// defaultDesktopSeccompProfile is the Chromium-tuned seccomp profile applied to
+// every sidecar (SecurityOpt "seccomp=<content>"). It is the upstream Docker
+// default (deny-by-default) with the namespace-creation + chroot-setup syscalls
+// the Chromium unprivileged-userns sandbox needs allowed — so the browser keeps
+// its OWN sandbox (no --no-sandbox) WITHOUT the container holding CAP_SYS_ADMIN.
+// Empirically verified against Docker 29.5.3 (2026-07-27). See seccomp/README.md.
+//
+//go:embed seccomp/desktop-sidecar.json
+var defaultDesktopSeccompProfile string
 
 // sidecarDocker is the narrow slice of the Docker SDK the local desktop-sidecar
 // provisioner needs. It is deliberately NOT the package's dockerClient
@@ -72,13 +83,26 @@ type LocalSidecarProvisioner struct {
 	// unbounded (not recommended in production — a runaway Chrome must not
 	// compete unbounded with the tenant).
 	memoryLimitBytes int64
+
+	// seccompProfile is the seccomp profile JSON applied to the sidecar via
+	// SecurityOpt "seccomp=<content>". Empty is replaced by the embedded
+	// Chromium-tuned default in the constructor. The literal "unconfined"
+	// disables seccomp (debugging ONLY — never production). See
+	// seccomp/README.md for why a custom profile is required: the stock Docker
+	// profile blocks the Chromium userns sandbox under --cap-drop ALL.
+	seccompProfile string
 }
 
 // NewLocalSidecarProvisioner constructs the Docker desktop backend. See the
-// networkName doc for the production security requirement.
-func NewLocalSidecarProvisioner(cli sidecarDocker, image, networkPrefix string, controlPort int, stopTimeout time.Duration, memoryLimitBytes int64) *LocalSidecarProvisioner {
+// networkName doc for the production security requirement. seccompProfile is
+// the seccomp JSON to apply ("" → the embedded Chromium-tuned default;
+// "unconfined" → seccomp disabled, debugging only).
+func NewLocalSidecarProvisioner(cli sidecarDocker, image, networkPrefix string, controlPort int, stopTimeout time.Duration, memoryLimitBytes int64, seccompProfile string) *LocalSidecarProvisioner {
 	if stopTimeout <= 0 {
 		stopTimeout = 10 * time.Second
+	}
+	if seccompProfile == "" {
+		seccompProfile = defaultDesktopSeccompProfile
 	}
 	return &LocalSidecarProvisioner{
 		cli:              cli,
@@ -87,7 +111,23 @@ func NewLocalSidecarProvisioner(cli sidecarDocker, image, networkPrefix string, 
 		controlPort:      controlPort,
 		stopTimeout:      stopTimeout,
 		memoryLimitBytes: memoryLimitBytes,
+		seccompProfile:   seccompProfile,
 	}
+}
+
+// securityOpt builds the container SecurityOpt list: no-new-privileges always,
+// plus the seccomp profile (the embedded Chromium-tuned default unless an
+// operator supplied one, or "unconfined" to disable). Combined with CapDrop
+// ALL in StartDesktop, this is the B2 hardening — verified to keep the Chromium
+// userns sandbox active with no CAP_SYS_ADMIN (seccomp/README.md).
+func (p *LocalSidecarProvisioner) securityOpt() []string {
+	opts := []string{"no-new-privileges"}
+	if p.seccompProfile == "unconfined" {
+		opts = append(opts, "seccomp=unconfined")
+	} else {
+		opts = append(opts, "seccomp="+p.seccompProfile)
+	}
+	return opts
 }
 
 // perWorkspaceNetwork is the dedicated network name for a workspace's desktop
@@ -143,9 +183,23 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 		// produces; crash recovery is the platform re-calling StartDesktop
 		// (§10). Never "unless-stopped".
 		RestartPolicy: container.RestartPolicy{Name: "no"},
+		// B2 hardening (verified 2026-07-27, Docker 29.5.3): the sidecar runs
+		// untrusted web content, so it is locked to the minimum the browser's
+		// own userns sandbox needs. CapDrop ALL + no-new-privileges + the
+		// Chromium-tuned seccomp profile keep Chromium's sandbox ACTIVE (no
+		// --no-sandbox) WITHOUT granting the container CAP_SYS_ADMIN. Empirically
+		// confirmed: Chromium renders under exactly this config. See
+		// securityOpt() and seccomp/README.md.
+		CapDrop:     []string{"ALL"},
+		SecurityOpt: p.securityOpt(),
 	}
 	if p.memoryLimitBytes > 0 {
 		hostCfg.Resources.Memory = p.memoryLimitBytes
+		// Pin swap to the memory cap so the container cannot use ~2× the limit
+		// via swap — otherwise the OOM-shed guarantee below is only half real
+		// (reviewer B-nit). Equal Memory/MemorySwap = swap disabled for the
+		// container.
+		hostCfg.Resources.MemorySwap = p.memoryLimitBytes
 		// Shed the DESKTOP under memory pressure, never the tenant/agent (§10):
 		// a positive oom_score_adj makes the kernel prefer killing the sidecar.
 		hostCfg.OomScoreAdj = 500

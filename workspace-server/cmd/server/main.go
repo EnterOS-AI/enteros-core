@@ -371,7 +371,19 @@ func main() {
 	if envOr("MOLECULE_DESKTOP_ENABLED", "false") == "true" {
 		if prov != nil {
 			image := envOr("MOLECULE_DESKTOP_IMAGE", "registry.moleculesai.app/molecule-ai/molecule-desktop:latest")
-			sidecar := provisioner.NewLocalSidecarProvisioner(prov.DockerClient(), image, "wsnet", 6070, 10*time.Second, 2<<30)
+			// Optional operator seccomp override (absolute path). Empty → the
+			// provisioner's embedded Chromium-tuned default. A configured-but-
+			// unreadable path is fatal: silently falling back would ship a
+			// different isolation posture than the operator intended.
+			seccompProfile := ""
+			if pp := os.Getenv("MOLECULE_DESKTOP_SECCOMP_PROFILE"); pp != "" {
+				b, rerr := os.ReadFile(pp)
+				if rerr != nil {
+					log.Fatalf("Desktop: MOLECULE_DESKTOP_SECCOMP_PROFILE=%q unreadable: %v", pp, rerr)
+				}
+				seccompProfile = string(b)
+			}
+			sidecar := provisioner.NewLocalSidecarProvisioner(prov.DockerClient(), image, "wsnet", 6070, 10*time.Second, 2<<30, seccompProfile)
 			wh.SetSidecarProvisioner(sidecar)
 			store := handlers.NewDesktopLifecycleStore(db.DB)
 			gw := desktopgateway.New(

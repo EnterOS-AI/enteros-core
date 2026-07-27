@@ -366,3 +366,17 @@ Honest ledger. "✅" = code committed **and** verified here (`go test`/`vet`/`bu
 - ◻︎ **Cross-repo**: SDK codegen + `MatchesSSOT`; CP backend.
 - ◻︎ **Infra (the ship-blocker, decision 1)**: per-workspace network · egress · `userns-remap` · Redis auth.
 - ◻︎ **Terminal human gates**: image build/publish · CI · security review · production deploy.
+
+**Update (test-stack verification + security-review response — real Docker 29.5.3):**
+
+A reviewer subagent examined the branch and returned **BLOCK-for-production** with 5 ranked blockers; the branch's own restraint (gateway unwired until isolation is real) was credited as correct. The stack was then stood up on real Docker to verify and to close what's code-fixable:
+
+- ✅ **Image builds + runs.** `molecule-desktop:test` (1.55GB) builds end-to-end; control server answers `/healthz` in ~1s.
+- ✅ **Control-plane security verified end-to-end** on the running sidecar: `/screenshot` 401 without token / 200 PNG with token; `/input` 204 on valid click, 400 out-of-bounds. Constant-time bearer auth, coordinate bounds, no internal-caller exemption — all as designed (reviewer Q3/Q4: SOUND).
+- ✅ **B3 (Chromium sandbox) root-caused + FIXED + verified.** Empirically, the stock image shipped a Chromium that could not start (`zygote_host: No usable sandbox` → `<defunct>`; every screenshot was the blank Xvfb root). Cause: we correctly refuse `--no-sandbox`, so Chromium needs its unprivileged **userns** sandbox, which Docker's built-in seccomp profile blocks (unprivileged `clone(CLONE_NEWUSER)` denied; and, once caps are dropped, the chroot-setup syscalls `chroot`/`pivot_root`/`mount`/`umount2` too). Fix: a **Chromium-tuned seccomp profile** (`internal/provisioner/seccomp/desktop-sidecar.json` = moby default + those syscalls allowed) — no `--no-sandbox`, no `CAP_SYS_ADMIN`. Verified: Chromium renders a full 1280×800 kiosk page under it.
+- ✅ **B2 (container hardening) implemented + verified.** `StartDesktop` now sets `CapDrop:[ALL]`, `SecurityOpt:[no-new-privileges, seccomp=<tuned>]`, and `MemorySwap==Memory`. Confirmed on the running image that Chromium's sandbox stays active under exactly this config (B2 and B3 hold *together*). Provisioner tests assert all of it.
+- ✅ **B4 (credential-volume reap) — inline delete path wired.** `CascadeDelete` now `StopDesktop`+`WipeProfile` per workspace (best-effort, gated on `sidecarProv`). The wiped-DB orphan-sweeper-by-label pass remains ◻︎ (only reachable once the feature is enabled, which is itself gated on B1).
+- ✅ **Scroll-DoS nit fixed** — `|amount|` bounded to ±100 in the control server (test added).
+- ◻︎ **B1 (egress-deny RFC-1918 + Redis auth) — still the load-bearing blocker.** Confirmed by-IP reachability (per-workspace network blocks by-name only). This is host-level iptables (`DOCKER-USER`) / egress-proxy + a Redis password — operator work that cannot be safely applied on a shared live Docker host with running tenants. **The gateway stays unwired-by-default (`MOLECULE_DESKTOP_ENABLED=false`) until this lands.**
+- ◻︎ **B5 (unencrypted profile at rest)** — acceptable only *after* B1, for non-regulated data, with the honest operator posture documented. Rides on B1.
+- ✅ **`cmd/server` activation wiring** landed but **gated off** behind `MOLECULE_DESKTOP_ENABLED` (default false) — enabling before B1 would ship the verified by-IP cross-tenant exposure.

@@ -146,6 +146,32 @@ func TestControl_ClickOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+func TestControl_ScrollAmountBounded(t *testing.T) {
+	act := &fakeActuator{}
+	h := newTestServer(act)
+	// Over-magnitude scroll is rejected before dispatch — the actuator loops
+	// one click per unit, so an unbounded amount is a CPU DoS.
+	for _, body := range []string{
+		`{"type":"scroll","amount":2000000000}`,  // ~2e9 down
+		`{"type":"scroll","amount":-2000000000}`, // ~2e9 up
+		`{"type":"scroll","amount":101}`,         // just over the cap
+	} {
+		if rr := do(t, h, "POST", "/input", testToken, body); rr.Code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d, want 400", body, rr.Code)
+		}
+	}
+	if len(act.scrolls) != 0 {
+		t.Fatalf("out-of-range scrolls must NOT be dispatched, got %v", act.scrolls)
+	}
+	// A legitimate in-range scroll still works.
+	if rr := do(t, h, "POST", "/input", testToken, `{"type":"scroll","amount":100}`); rr.Code != http.StatusNoContent {
+		t.Fatalf("in-range scroll: got %d, want 204", rr.Code)
+	}
+	if len(act.scrolls) != 1 || act.scrolls[0] != 100 {
+		t.Fatalf("in-range scroll not dispatched: %v", act.scrolls)
+	}
+}
+
 func TestControl_UnknownAndMalformed(t *testing.T) {
 	act := &fakeActuator{}
 	h := newTestServer(act)
