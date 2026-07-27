@@ -369,7 +369,16 @@ func main() {
 	// prerequisite is provisioned. Self-host (local Docker) only for now; the
 	// CP/k8s backend is a separate follow-up.
 	if envOr("MOLECULE_DESKTOP_ENABLED", "false") == "true" {
-		if prov != nil {
+		// Egress interlock (decision 1 / §6.1): the desktop feature is safe to
+		// wire ONLY once the operator has applied the egress-deny firewall
+		// (deploy/desktop-egress-firewall.sh or the k8s NetworkPolicy) so a
+		// compromised sidecar cannot reach backend infra by host-published port
+		// or the cloud metadata IP. Refuse to wire the backend unless the
+		// operator affirms it — so the verified exposure can NEVER ship by
+		// misconfiguration. See deploy/desktop-operator-setup.md.
+		if envOr("MOLECULE_DESKTOP_EGRESS_CONFIRMED", "false") != "true" {
+			log.Println("Desktop: MOLECULE_DESKTOP_ENABLED=true but MOLECULE_DESKTOP_EGRESS_CONFIRMED!=true — refusing to wire the desktop backend until the egress-deny prerequisite is applied and confirmed (see deploy/desktop-operator-setup.md). Feature stays OFF.")
+		} else if prov != nil {
 			image := envOr("MOLECULE_DESKTOP_IMAGE", "registry.moleculesai.app/molecule-ai/molecule-desktop:latest")
 			// Optional operator seccomp override (absolute path). Empty → the
 			// provisioner's embedded Chromium-tuned default. A configured-but-

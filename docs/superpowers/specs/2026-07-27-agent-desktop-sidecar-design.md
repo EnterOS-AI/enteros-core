@@ -253,11 +253,11 @@ Not a one-var swap. v2 edits: (a) re-type `displayForward`/`realDisplayForward` 
 - [ ] Plugin-extraction seam matches the deferred RFC
 
 **Security (prerequisite — decision 1)**
-- [ ] Per-workspace Docker network / k8s NetworkPolicy
-- [ ] Backend-only network for Postgres/Redis/MinIO/LiteLLM; **Redis password**
-- [ ] Egress proxy + domain allowlist; deny RFC-1918 + metadata IP
-- [ ] `userns-remap` enabled; sidecar cap-drop + seccomp + `no-new-privileges`
-- [ ] Chrome sandbox stays on without `--no-sandbox` (verified)
+- [x] Per-workspace Docker network (code) / k8s NetworkPolicy (`deploy/desktop-egress-networkpolicy.yaml`)
+- [~] Backend-only network for Postgres/Redis/MinIO/LiteLLM; **Redis password** — operator runbook (`deploy/desktop-operator-setup.md`); apply on live host
+- [x] Deny RFC-1918 + metadata IP — **verified** (`scripts/desktop-egress-firewall.sh`, proven on Docker 29.5.3); domain-allowlist egress proxy is a further refinement (◻︎)
+- [x] Sidecar cap-drop + seccomp + `no-new-privileges` (code, verified); `userns-remap` = operator runbook step
+- [x] Chrome sandbox stays on without `--no-sandbox` (**verified** — Chromium-tuned seccomp profile)
 - [ ] Sidecar independent inbound auth; name excluded from internal-caller exemption
 - [ ] Secrets-at-rest: **deferred** — honest posture documented + follow-up RFC filed
 - [ ] Per-task credential scoping (primary control) + domain allowlist
@@ -380,3 +380,14 @@ A reviewer subagent examined the branch and returned **BLOCK-for-production** wi
 - ◻︎ **B1 (egress-deny RFC-1918 + Redis auth) — still the load-bearing blocker.** Confirmed by-IP reachability (per-workspace network blocks by-name only). This is host-level iptables (`DOCKER-USER`) / egress-proxy + a Redis password — operator work that cannot be safely applied on a shared live Docker host with running tenants. **The gateway stays unwired-by-default (`MOLECULE_DESKTOP_ENABLED=false`) until this lands.**
 - ◻︎ **B5 (unencrypted profile at rest)** — acceptable only *after* B1, for non-regulated data, with the honest operator posture documented. Rides on B1.
 - ✅ **`cmd/server` activation wiring** landed but **gated off** behind `MOLECULE_DESKTOP_ENABLED` (default false) — enabling before B1 would ship the verified by-IP cross-tenant exposure.
+
+**Update (B1 egress-deny — designed, VERIFIED on real Docker, shipped as operator artifacts + interlock):**
+
+B1 was the "load-bearing blocker." It is now precisely characterised and closed to the boundary of what can be done without touching a live cluster:
+
+- **Refined the threat model empirically (Docker 29.5.3).** A sidecar on its dedicated per-workspace network is ALREADY isolated from other Docker networks by-IP (Docker's `DOCKER-ISOLATION` chains) — the earlier "by-IP REACHED" finding was the sidecar on the *flat* net, not the isolated topology. The real residual exposure is narrower: **host-published infra ports via the gateway** (Postgres/Redis/MinIO/LiteLLM commonly `-p` to the host) and the **cloud metadata IP** (169.254.169.254).
+- **Verified the fix.** A `DOCKER-USER` deny of RFC-1918 + metadata as destination, scoped to the desktop subnet, makes the host-published port and metadata IP unreachable **while public-internet browsing still works** — proven end-to-end on a throwaway two-network stack.
+- **Shipped as operator artifacts (not auto-run privileged app code — that would over-expand the workspace-server blast radius):** `scripts/desktop-egress-firewall.sh` (label-driven, idempotent, verified), `deploy/desktop-egress-networkpolicy.yaml` (CP/k8s equivalent), and `deploy/desktop-operator-setup.md` (egress + Redis password + userns-remap runbook).
+- **Safety interlock.** `cmd/server` now refuses to wire the desktop backend unless `MOLECULE_DESKTOP_EGRESS_CONFIRMED=true` — the operator must affirm the firewall is applied, so the exposure **cannot ship by misconfiguration**.
+
+**Remaining to reach 100%-to-production (genuine human/infra gates, NOT autonomous):** apply the (now-verified) egress firewall + Redis password + userns-remap on the live host; cross-repo SDK codegen + `MatchesSSOT` and the CP backend (other toolchains/repos); image build+publish to the registry; a human-authorized production deploy. The honest verdict remains BLOCK-until-operator-applies-B1; every code-and-artifact prerequisite is now in place and verified.
