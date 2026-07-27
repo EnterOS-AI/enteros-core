@@ -4,7 +4,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"os"
 )
 
 // DeriveDesktopControlToken deterministically derives the per-sidecar control-
@@ -19,10 +18,4 @@ func DeriveDesktopControlToken(secret, workspaceID string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte("desktop-control:" + workspaceID))
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-}
-
-// desktopControlSecret is the secret the control-token derivation uses. Reuses
-// the display-session signing secret so operators configure a single secret.
-func desktopControlSecret() string {
-	return os.Getenv("DISPLAY_SESSION_SIGNING_SECRET")
 }
