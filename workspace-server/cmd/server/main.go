@@ -360,6 +360,13 @@ func main() {
 		wh.SetCPProvisioner(cpProv)
 	}
 
+	// Wake-lifecycle owner (PR-D): route this handler's proactive-wake emitters
+	// (restart-context) through the desired-state owner so a fired restart-context
+	// records a wake_intent + bumps desired_generation and shares one idempotency
+	// key decision→dispatch→delivery→marker. Nil-safe: unwired, restart-context
+	// keeps its legacy per-workspace key verbatim.
+	wh.SetWakeHooks(wh.DecideWake, wh.MarkWakeDelivered)
+
 	// #2930: independent A2A queue sweeper so queued requests drain even when a
 	// workspace stops heartbeating (e.g., after a transient restart trigger).
 	go wh.StartA2AQueueSweeper(ctx)
@@ -672,6 +679,11 @@ func main() {
 	// REQUEST_NUDGE_SWEEPER_INTERVAL_S.
 	if !strings.EqualFold(os.Getenv("REQUEST_NUDGE_SWEEPER_DISABLED"), "true") {
 		nudgeSweeper := handlers.NewRequestNudgeSweeper(nil)
+		// Wake-lifecycle owner (PR-D): route the inbox nudge through the
+		// desired-state owner (same gate as the stall watchdog) so a fired nudge
+		// mints a wake_intent + bumps desired_generation and shares one idempotency
+		// key decision→dispatch→delivery→marker.
+		nudgeSweeper.SetWakeHooks(wh.DecideWake, wh.MarkWakeDelivered)
 		go supervised.RunWithRecover(ctx, "request-nudge-sweeper", nudgeSweeper.Start)
 	}
 

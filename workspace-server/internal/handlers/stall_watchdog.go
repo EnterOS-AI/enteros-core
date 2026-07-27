@@ -366,15 +366,16 @@ func (s *StallWatchdog) probe(ctx context.Context, c stallCandidate, now time.Ti
 	// row → still a first detection). enqueue is always EnqueueA2A in
 	// production; the nil guard keeps a probe-disabled test/build sane.
 	if s.enqueue != nil {
-		body, err := buildStallProbeBody(c.workspaceID, mins, graceMins)
-		if err != nil {
-			return fmt.Errorf("build probe body: %w", err)
-		}
 		// Hourly-bucketed idempotency key: collapse duplicate probes for the
 		// same workspace at the queue layer too (defense in depth with the
 		// state row). Also the wake dedup seed when the generation loop is wired.
 		hourBucket := now.Truncate(time.Hour).Unix()
 		idemKey := fmt.Sprintf("stall-probe:%s:%d", c.workspaceID, hourBucket)
+		// metaKey is stamped into params.metadata.wake_idempotency_key ONLY when the
+		// wake owner is wired — it carries the OWNER's key, not the legacy queue key.
+		// Left empty on the unwired path so the probe body stays byte-identical to
+		// pre-PR-E (no params.metadata).
+		metaKey := ""
 
 		// Versioned-heartbeat GENERATION LOOP (PR-C): when wired, route the probe
 		// through the desired-state owner so it durably mints a wake_intent and
@@ -395,6 +396,16 @@ func (s *StallWatchdog) probe(ctx context.Context, c stallCandidate, now time.Ti
 				return nil
 			}
 			idemKey = decision.IdempotencyKey
+			metaKey = decision.IdempotencyKey
+		}
+
+		// Build the body AFTER the key is finalized so the wake owner's key is
+		// stamped into params.metadata.wake_idempotency_key (PR-E) — one key
+		// decision→dispatch→delivery→marker. metaKey is empty on the unwired path,
+		// so the body is byte-identical to pre-PR-E there.
+		body, err := buildStallProbeBody(c.workspaceID, mins, graceMins, metaKey)
+		if err != nil {
+			return fmt.Errorf("build probe body: %w", err)
 		}
 
 		if _, _, err := s.enqueue(ctx, c.workspaceID, "", PriorityCritical, body, "message/send", idemKey, nil); err != nil {
@@ -499,7 +510,13 @@ func (s *StallWatchdog) audit(ctx context.Context, workspaceID, action, detail s
 // leaks into My Chat as a blue user bubble (messagestore.selfSourceTypes must
 // list "self-stall"); without contextId it mints a fresh runtime session,
 // fragmenting the conversation (Langfuse session fragmentation, 2026-07-21).
-func buildStallProbeBody(workspaceID string, staleMins, graceMins int) ([]byte, error) {
+//
+// wakeIdempotencyKey (optional, PR-E) is stamped into params.metadata as
+// wake_idempotency_key when present so the wake owner's key rides the A2A
+// envelope (decision→dispatch→delivery→marker share one key). params.metadata is
+// additionalProperties:true and a sibling of params.message.metadata, so the
+// self-source reader is untouched. Omitted = byte-identical to pre-PR-E.
+func buildStallProbeBody(workspaceID string, staleMins, graceMins int, wakeIdempotencyKey ...string) ([]byte, error) {
 	text := fmt.Sprintf(
 		"Liveness check: you've had no recorded activity for over %d minutes while still marked busy "+
 			"(an active task is in progress). If you are working, reply or take an action now — anything "+
@@ -507,20 +524,24 @@ func buildStallProbeBody(workspaceID string, staleMins, graceMins int) ([]byte, 
 			"recover from a possible hang.",
 		staleMins, graceMins,
 	)
-	return json.Marshal(map[string]interface{}{
-		"method": "message/send",
-		"params": map[string]interface{}{
-			"message": map[string]interface{}{
-				"role":      "user",
-				"messageId": "stall-probe-" + uuid.New().String(),
-				"contextId": platformTurnContextID(workspaceID),
-				"parts":     []map[string]interface{}{{"kind": "text", "text": text}},
-				"metadata": map[string]interface{}{
-					"source":      "platform",
-					"kind":        "stall_probe",
-					"source_type": "self-stall",
-				},
+	params := map[string]interface{}{
+		"message": map[string]interface{}{
+			"role":      "user",
+			"messageId": "stall-probe-" + uuid.New().String(),
+			"contextId": platformTurnContextID(workspaceID),
+			"parts":     []map[string]interface{}{{"kind": "text", "text": text}},
+			"metadata": map[string]interface{}{
+				"source":      "platform",
+				"kind":        "stall_probe",
+				"source_type": "self-stall",
 			},
 		},
+	}
+	if len(wakeIdempotencyKey) > 0 && wakeIdempotencyKey[0] != "" {
+		params["metadata"] = map[string]interface{}{"wake_idempotency_key": wakeIdempotencyKey[0]}
+	}
+	return json.Marshal(map[string]interface{}{
+		"method": "message/send",
+		"params": params,
 	})
 }

@@ -475,6 +475,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	rh.SetFirstBootGreeter(handlers.FirstBootGreeter(
 		handlers.NewAgentMessageWriter(db.DB, broadcaster),
 		wh.ProxyA2ARequest,
+		// Wake-lifecycle owner (PR-D): record the greet intent + bump the desired
+		// generation and thread the shared idempotency key. Greet-once stays owned
+		// by the has_greeted marker (workspaceHasGreeted + claimGreetDelivery) — see
+		// GreetWakeHooks; Decision.Fire is intentionally not a fire gate.
+		handlers.GreetWakeHooks{Decide: wh.DecideWake, Delivered: wh.MarkWakeDelivered},
 	))
 	// Versioned-heartbeat GENERATION LOOP (PR-C): wire the convergence settle side
 	// so a beat reporting observed_generation >= desired_generation settles the
