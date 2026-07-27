@@ -38,7 +38,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, greeter func(workspaceID string, toolCount int), channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -471,19 +471,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// concierge flip / ordinary workspace's first register), drive a real
 	// agent turn so the agent greets the user in its own persona, delivered
 	// through the AgentMessageWriter SSOT (first_boot_greeting.go). A fresh
-	// onboarding lands in a chat where the agent has already spoken.
-	rh.SetFirstBootGreeter(handlers.FirstBootGreeter(
-		handlers.NewAgentMessageWriter(db.DB, broadcaster),
-		wh.ProxyA2ARequest,
-		// Wake-lifecycle owner (PR-D): record the greet intent + bump the desired
-		// generation and thread the shared idempotency key. Greet-once stays owned
-		// by the has_greeted marker (workspaceHasGreeted + claimGreetDelivery) — see
-		// GreetWakeHooks; Decision.Fire is intentionally not a fire gate.
-		handlers.GreetWakeHooks{Decide: wh.DecideWake, Delivered: wh.MarkWakeDelivered},
-	))
+	// onboarding lands in a chat where the agent has already spoken. The greeter
+	// is constructed in main.go (so the SAME instance also backs the wake re-drive
+	// re-emitter, wired there before the WakeRedriveSweeper starts) and handed in.
+	rh.SetFirstBootGreeter(greeter)
 	// Versioned-heartbeat GENERATION LOOP (PR-C): wire the convergence settle side
 	// so a beat reporting observed_generation >= desired_generation settles the
 	// converged wake intents. Same late-wiring nil-safe pattern as the greeter.
+	// (The RE-DRIVE side of the loop, PR-F, runs off a fleet-wide
+	// WakeRedriveSweeper wired in main.go — NOT the heartbeat path.)
 	rh.SetWakeSettler(wh.MarkWakeSettled)
 	r.POST("/registry/register", rh.Register)
 	r.POST("/registry/heartbeat", rh.Heartbeat)
