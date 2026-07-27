@@ -73,13 +73,11 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 SHIM="$WORK/shim"
 mkdir -p "$SHIM"
 
-# `sleep` is shimmed to a no-op so the poll/retry budgets do not make this a
-# two-minute unit test. It intentionally does NOT change any decision the
-# scripts make — only wall-clock.
-cat > "$SHIM/sleep" <<'FAKE_SLEEP'
-#!/usr/bin/env bash
-exit 0
-FAKE_SLEEP
+# NOTE: `sleep` is deliberately NOT shimmed. Every retry/poll budget below is
+# turned down to single-digit seconds instead. A no-op sleep turns the helper's
+# deadline loop into a hot spin that emits its retry line thousands of times,
+# which is both a false picture of the real timing and enough output to make the
+# assertions themselves flaky.
 
 # Mock control plane. Serves only what this gate's diagnostic-only path and its
 # teardown touch; anything else is an explicit 404 so a silently-changed request
@@ -192,7 +190,7 @@ case "$url" in
 esac
 FAKE_CURL
 
-chmod +x "$SHIM/curl" "$SHIM/sleep"
+chmod +x "$SHIM/curl"
 
 run_gate() {  # <scenario> <state-dir>
   local scenario="$1" state="$2"
@@ -206,9 +204,9 @@ run_gate() {  # <scenario> <state-dir>
   MOLECULE_ADMIN_TOKEN="fake-admin-token" \
   E2E_INFRA_BACKEND="local-docker" \
   E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
-  E2E_CP_PURGE_POLL_SECS=10 \
+  E2E_CP_PURGE_POLL_SECS=5 \
   E2E_CP_PURGE_POLL_INTERVAL=1 \
-  E2E_CP_PURGE_DELETE_RETRY_SECS=10 \
+  E2E_CP_PURGE_DELETE_RETRY_SECS=3 \
   PV_PROVISION_MODE="external" \
   PV_RUNTIMES="hermes" \
   PV_TOKEN_DIAGNOSTIC_ONLY=1 \
@@ -220,7 +218,7 @@ run_gate() {  # <scenario> <state-dir>
 echo "── A. transient 409 then 200 — the CP's own in-flight lifecycle op drains ──"
 A="$WORK/a"
 rc=$(run_gate transient-409 "$A")
-out_a=$(cat "$A/stdout.txt" "$A/stderr.txt" 2>/dev/null)
+out_a=$(tail -c 200000 "$A/stdout.txt" 2>/dev/null; tail -c 200000 "$A/stderr.txt" 2>/dev/null)
 deletes_a=$(grep -c '^DELETE ' "$A/calls.log" 2>/dev/null || echo 0)
 check "the gate's own exit code survives teardown" "0" "$rc"
 check_not_contains "no leak warning" "was not provably purged" "$out_a"
@@ -245,9 +243,10 @@ echo ""
 echo "── B. persistent 409 — must still FAIL CLOSED (a retry that can't fail is worse) ──"
 B="$WORK/b"
 rc=$(run_gate persistent-409 "$B")
-out_b=$(cat "$B/stdout.txt" "$B/stderr.txt" 2>/dev/null)
+out_b=$(tail -c 200000 "$B/stdout.txt" 2>/dev/null; tail -c 200000 "$B/stderr.txt" 2>/dev/null)
 check "unpurgeable org exits 4 (teardown left orphan resources)" "4" "$rc"
-check_contains "the persistent 409 is REPORTED, not swallowed" "409" "$out_b"
+check_contains "the persistent 409 is REPORTED, not swallowed" \
+  "DELETE still 409 (active lifecycle operation)" "$out_b"
 if [ -f "$B/purged" ]; then
   echo "  FAIL: mock CP purged the org in the persistent-409 case — bad negative control"
   FAIL=$((FAIL + 1))
