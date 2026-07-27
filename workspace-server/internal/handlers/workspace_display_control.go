@@ -49,14 +49,16 @@ WHERE workspace_display_control_locks.expires_at <= now()
 RETURNING controller, controlled_by, expires_at`
 
 type workspaceDisplayControlResponse struct {
-	Controller   string    `json:"controller"`
-	ControlledBy string    `json:"controlled_by,omitempty"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	SessionURL   string    `json:"session_url,omitempty"`
+	Controller     string    `json:"controller"`
+	ControlledBy   string    `json:"controlled_by,omitempty"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	SessionURL     string    `json:"session_url,omitempty"`
+	ViewSessionURL string    `json:"view_session_url,omitempty"`
 }
 
 type workspaceDisplayControlNoneResponse struct {
-	Controller string `json:"controller"`
+	Controller     string `json:"controller"`
+	ViewSessionURL string `json:"view_session_url,omitempty"`
 }
 
 type acquireDisplayControlRequest struct {
@@ -76,10 +78,15 @@ func (h *WorkspaceHandler) DisplayControl(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load display control"})
 		return
 	}
+	// Issue a view-only URL either way (§8): watching never requires holding
+	// control, so any authorized caller polling the lock state also gets a URL to
+	// watch. Empty when signing is unconfigured.
+	viewURL := signedDisplayViewerURL(c.Param("id"))
 	if !found {
-		c.JSON(http.StatusOK, workspaceDisplayControlNoneResponse{Controller: "none"})
+		c.JSON(http.StatusOK, workspaceDisplayControlNoneResponse{Controller: "none", ViewSessionURL: viewURL})
 		return
 	}
+	lock.ViewSessionURL = viewURL
 	c.JSON(http.StatusOK, lock)
 }
 
@@ -442,6 +449,22 @@ func displaySessionSigningSecret() string {
 // any authorized caller can watch regardless of who holds control. DisplaySession
 // accepts EITHER a valid viewer token OR a valid control token; only /input is
 // gated on holding the lock.
+// displayViewerTTL bounds a minted view-only session. Sight is low-stakes and
+// re-mintable on the next DisplayControl poll, so a short window is fine.
+const displayViewerTTL = 300 * time.Second
+
+// signedDisplayViewerURL mints a VIEW-ONLY session URL for a workspace — usable
+// by any authorized caller to watch regardless of who holds control (§8). Empty
+// when signing is unconfigured. This is the issuance half of the view/control
+// split; DisplaySession accepts the resulting token.
+func signedDisplayViewerURL(workspaceID string) string {
+	tok := signDisplayViewerToken(workspaceID, time.Now().Add(displayViewerTTL))
+	if tok == "" {
+		return ""
+	}
+	return fmt.Sprintf("/workspaces/%s/display/session/websockify#token=%s", url.PathEscape(workspaceID), tok)
+}
+
 func signDisplayViewerToken(workspaceID string, expiresAt time.Time) string {
 	secret := displaySessionSigningSecret()
 	if secret == "" || workspaceID == "" || expiresAt.IsZero() {

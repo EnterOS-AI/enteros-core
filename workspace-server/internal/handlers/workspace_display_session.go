@@ -77,8 +77,17 @@ func (h *WorkspaceHandler) DisplaySession(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load display control"})
 		return
 	}
-	if !found || !validateDisplaySessionToken(displaySessionTokenFromRequest(c.Request), workspaceID, lock.ControlledBy, lock.ExpiresAt) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "display control required"})
+	// View/control split (§8): accept EITHER a control token bound to the current
+	// lock holder OR a workspace-bound VIEW-ONLY token. Sight is never arbitrated,
+	// so a viewer who does not hold the lock can still watch; only /input is gated
+	// on holding control (in the gateway). (Reviewer N1: previously only the
+	// control token was accepted, so the viewer token was dead and this claim was
+	// false — now both are honored.)
+	tok := displaySessionTokenFromRequest(c.Request)
+	controlOK := found && validateDisplaySessionToken(tok, workspaceID, lock.ControlledBy, lock.ExpiresAt)
+	viewOK := validateDisplayViewerToken(tok, workspaceID)
+	if !controlOK && !viewOK {
+		c.JSON(http.StatusForbidden, gin.H{"error": "display control or view token required"})
 		return
 	}
 

@@ -1,9 +1,34 @@
 package handlers
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+// TestDisplayViewerURL_MintsAcceptableToken proves the issuance→acceptance loop
+// (reviewer N1): the URL DisplayControl hands out carries a viewer token that the
+// DisplaySession path (validateDisplayViewerToken) accepts, so a non-lock-holder
+// can actually watch.
+func TestDisplayViewerURL_MintsAcceptableToken(t *testing.T) {
+	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "test-secret")
+	u := signedDisplayViewerURL("ws-1")
+	if u == "" || !strings.Contains(u, "#token=") {
+		t.Fatalf("expected a viewer session URL with a token, got %q", u)
+	}
+	tok := u[strings.Index(u, "#token=")+len("#token="):]
+	if !validateDisplayViewerToken(tok, "ws-1") {
+		t.Fatal("token minted into the viewer URL must validate for its workspace")
+	}
+	if validateDisplayViewerToken(tok, "ws-2") {
+		t.Fatal("viewer URL token must not validate for another workspace")
+	}
+	// No secret -> no URL (fail-closed).
+	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "")
+	if signedDisplayViewerURL("ws-1") != "" {
+		t.Fatal("no secret -> empty viewer URL")
+	}
+}
 
 func TestDisplayViewerToken_DecoupledFromLockHolder(t *testing.T) {
 	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "test-secret")
