@@ -265,11 +265,11 @@ Not a one-var swap. v2 edits: (a) re-type `displayForward`/`realDisplayForward` 
 - [ ] Full navigation/input audit stream + real-time kill
 
 **Arbitration**
-- [ ] Viewer token bound to workspace, not lock holder; `DisplaySession` check de-coupled
-- [ ] Human-preempts-agent takeover (no admin-token requirement)
-- [ ] `/input` atomic check-and-act; fail-closed on no-lock
-- [ ] `LISTEN/NOTIFY` resume signal; `desktop_wait_for_control` blocking tool
-- [ ] Existing click tool consults the lock before acting
+- [x] Viewer token bound to workspace, not lock holder; `DisplaySession` check de-coupled (`signDisplayViewerToken`/`validateDisplayViewerToken`)
+- [x] Human-preempts-agent takeover (no admin-token requirement) — `acquireDisplayControlQuery` WHERE-clause; **verified against real PG16** (agent→user preempt succeeds; user→user steal blocked)
+- [x] `/input` atomic check-and-act; fail-closed on no-lock (gateway `AgentHoldsControl` → `ErrHumanInControl`)
+- [~] `LISTEN/NOTIFY` resume signal; `desktop_wait_for_control` blocking tool — the agent-side blocking tool is runtime-repo work (◻︎); platform pg_notify-on-release is the pairing follow-up
+- [x] Existing click tool consults the lock before acting (gateway gates every `/input`)
 
 **Lifecycle**
 - [ ] `last_agent_activity_at` + computer-use lease; teardown re-check under mutex
@@ -397,3 +397,4 @@ B1 was the "load-bearing blocker." It is now precisely characterised and closed 
 - ✅ **`MatchesSSOT` value-pin authored + proven end-to-end** (contract → generated Go → molecule-core pin passes via a local `replace`). Held as a ready patch (`scratchpad/computer_use_contract_ssot_test.go.ready`) — can't commit to molecule-core until the SDK module publishes (a committed local-path replace would break CI). Publish = the review/merge gate on the shared SDK repo.
 - ✅ **SSRF allowlist** (`ValidateSidecarTarget`) — every resolved sidecar target pinned to `wsdesk-<hex-id>:<6070|6080>` before the gateway or noVNC proxy forwards; wired into both; 3 tests (commit `31924ccc2`).
 - ✅ **Input hardening** — focus-verify (`getactivewindow` before type/key, so keystrokes never land in the void) + type `--delay`; on top of the existing move→settle→click; tests added. IME clipboard-paste fallback deferred (needs xclip in the image).
+- ✅ **Human-preempts-agent arbitration** — a user acquiring control now PREEMPTS an active agent lock with no admin token / no force (one WHERE clause in `acquireDisplayControlQuery`), while another user still can't steal a human's lock. **Verified against real PG16** (4-step integration test). Completes the view/control split: once preempted, the gateway fails the agent's next `/input` closed. The paired agent-side `desktop_wait_for_control` blocking tool + pg_notify-on-release remain runtime-repo/follow-up.

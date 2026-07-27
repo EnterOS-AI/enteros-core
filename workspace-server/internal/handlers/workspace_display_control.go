@@ -29,6 +29,25 @@ const (
 	displayControlMaxTTLSeconds     = 3600
 )
 
+// acquireDisplayControlQuery upserts the display-control lock. The WHERE clause
+// on the UPDATE is the arbitration policy (see AcquireDisplayControl for the
+// human-preempts-agent semantics); it is a package const so the real-PG
+// integration test exercises the EXACT statement the handler runs (no drift).
+const acquireDisplayControlQuery = `
+INSERT INTO workspace_display_control_locks
+    (workspace_id, controller, controlled_by, expires_at)
+VALUES
+    ($1, $2, $3, now() + ($4 * interval '1 second'))
+ON CONFLICT (workspace_id) DO UPDATE
+SET controller = EXCLUDED.controller,
+    controlled_by = EXCLUDED.controlled_by,
+    expires_at = EXCLUDED.expires_at,
+    updated_at = now()
+WHERE workspace_display_control_locks.expires_at <= now()
+   OR workspace_display_control_locks.controlled_by = EXCLUDED.controlled_by
+   OR (workspace_display_control_locks.controller = 'agent' AND EXCLUDED.controller = 'user')
+RETURNING controller, controlled_by, expires_at`
+
 type workspaceDisplayControlResponse struct {
 	Controller   string    `json:"controller"`
 	ControlledBy string    `json:"controlled_by,omitempty"`
@@ -108,19 +127,13 @@ func (h *WorkspaceHandler) AcquireDisplayControl(c *gin.Context) {
 		"ttl_seconds":   req.TTLSeconds,
 	})
 	var lock workspaceDisplayControlResponse
-	err := db.DB.QueryRowContext(c.Request.Context(), `
-INSERT INTO workspace_display_control_locks
-    (workspace_id, controller, controlled_by, expires_at)
-VALUES
-    ($1, $2, $3, now() + ($4 * interval '1 second'))
-ON CONFLICT (workspace_id) DO UPDATE
-SET controller = EXCLUDED.controller,
-    controlled_by = EXCLUDED.controlled_by,
-    expires_at = EXCLUDED.expires_at,
-    updated_at = now()
-WHERE workspace_display_control_locks.expires_at <= now()
-   OR workspace_display_control_locks.controlled_by = EXCLUDED.controlled_by
-RETURNING controller, controlled_by, expires_at`,
+	// Human-preempts-agent takeover (§8, checklist line 269): a user acquiring
+	// control PREEMPTS an active AGENT lock — the human is the ultimate authority
+	// and needs NO admin token to take the wheel (the third WHERE clause below).
+	// A user still cannot steal ANOTHER user's active lock (that path 409s and
+	// requires a force release). Once preempted, the gateway fails the agent's
+	// next /input closed (ErrHumanInControl), so control transfers atomically.
+	err := db.DB.QueryRowContext(c.Request.Context(), acquireDisplayControlQuery,
 		workspaceID, req.Controller, controlledBy, req.TTLSeconds,
 	).Scan(&lock.Controller, &lock.ControlledBy, &lock.ExpiresAt)
 	if err == nil {
