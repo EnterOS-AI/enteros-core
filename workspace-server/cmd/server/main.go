@@ -686,6 +686,11 @@ func main() {
 	// override via STALL_WATCHDOG_*_S. Disable via STALL_WATCHDOG_DISABLED=true.
 	if !strings.EqualFold(os.Getenv("STALL_WATCHDOG_DISABLED"), "true") {
 		stallWatchdog := handlers.NewStallWatchdog(nil, wh.RestartByID)
+		// Versioned-heartbeat GENERATION LOOP (PR-C): the stall probe is this PR's
+		// single live desired-generation bump point. Wiring the wake hooks makes a
+		// fired probe mint a wake_intent + bump desired_generation, which the
+		// heartbeat handler then hands down and settles on convergence.
+		stallWatchdog.SetWakeHooks(wh.DecideWake, wh.MarkWakeDelivered)
 		go supervised.RunWithRecover(ctx, "stall-watchdog", stallWatchdog.Start)
 	} else {
 		log.Printf("StallWatchdog: disabled via STALL_WATCHDOG_DISABLED")

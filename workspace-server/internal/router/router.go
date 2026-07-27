@@ -476,6 +476,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		handlers.NewAgentMessageWriter(db.DB, broadcaster),
 		wh.ProxyA2ARequest,
 	))
+	// Versioned-heartbeat GENERATION LOOP (PR-C): wire the convergence settle side
+	// so a beat reporting observed_generation >= desired_generation settles the
+	// converged wake intents. Same late-wiring nil-safe pattern as the greeter.
+	rh.SetWakeSettler(wh.MarkWakeSettled)
 	r.POST("/registry/register", rh.Register)
 	r.POST("/registry/heartbeat", rh.Heartbeat)
 	r.POST("/registry/update-card", rh.UpdateCard)
