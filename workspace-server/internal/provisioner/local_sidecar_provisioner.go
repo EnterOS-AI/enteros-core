@@ -1,0 +1,216 @@
+package provisioner
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+)
+
+// sidecarDocker is the narrow slice of the Docker SDK the local desktop-sidecar
+// provisioner needs. It is deliberately NOT the package's dockerClient
+// interface: the sidecar needs ContainerStop (graceful SIGTERM teardown — see
+// StopDesktop) which the tenant provisioner never calls, and a separate narrow
+// interface avoids widening dockerClient (and every fake that implements it)
+// for a method only this path uses. The real *client.Client satisfies it.
+type sidecarDocker interface {
+	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
+	ContainerInspect(ctx context.Context, name string) (container.InspectResponse, error)
+	ContainerStart(ctx context.Context, name string, options container.StartOptions) error
+	ContainerStop(ctx context.Context, name string, options container.StopOptions) error
+	ContainerRemove(ctx context.Context, name string, options container.RemoveOptions) error
+	VolumeCreate(ctx context.Context, options volume.CreateOptions) (volume.Volume, error)
+	VolumeRemove(ctx context.Context, volumeID string, force bool) error
+}
+
+// LocalSidecarProvisioner is the Docker (self-host) backend of
+// SidecarProvisioner. It runs the desktop as a lifecycle-coupled sibling
+// container "wsdesk-<id>" on the workspace's network — design decision 1
+// (co-located) / §7. It reuses the naming/label helpers (desktop_naming.go) so
+// the container is reap-able by LabelRole=desktop and never mis-parsed by the
+// tenant "ws-" name parsers.
+type LocalSidecarProvisioner struct {
+	cli sidecarDocker
+
+	// image is the desktop-sidecar image (Xorg + WM + Chrome + x11vnc +
+	// control server). Digest-pinned in production.
+	image string
+
+	// networkName is the Docker network the sidecar joins.
+	//
+	// SECURITY (§6.1, decision 1 — security first): production MUST set this
+	// to the workspace's DEDICATED per-workspace network, never the shared
+	// molecule-core-net. A credential-bearing browser on the flat shared
+	// network is a cross-tenant pivot (passwordless Redis, LiteLLM keys,
+	// other tenants). The lifecycle logic here is network-agnostic; the caller
+	// supplies the isolated network. Empty = no explicit network attach (test
+	// / not-yet-isolated; NOT a production-valid configuration).
+	networkName string
+
+	// controlPort is the sidecar control-server port the computer-use gateway
+	// and the display proxy dial.
+	controlPort int
+
+	// stopTimeout is the graceful-shutdown window: SIGTERM, wait up to this,
+	// then the daemon SIGKILLs. Long enough for Chrome/Xorg to flush their
+	// SQLite profile so the "logins persist" guarantee holds (§10).
+	stopTimeout time.Duration
+
+	// memoryLimitBytes caps the sidecar's RAM (§10 admission/OOM control). 0 =
+	// unbounded (not recommended in production — a runaway Chrome must not
+	// compete unbounded with the tenant).
+	memoryLimitBytes int64
+}
+
+// NewLocalSidecarProvisioner constructs the Docker desktop backend. See the
+// networkName doc for the production security requirement.
+func NewLocalSidecarProvisioner(cli sidecarDocker, image, networkName string, controlPort int, stopTimeout time.Duration, memoryLimitBytes int64) *LocalSidecarProvisioner {
+	if stopTimeout <= 0 {
+		stopTimeout = 10 * time.Second
+	}
+	return &LocalSidecarProvisioner{
+		cli:              cli,
+		image:            image,
+		networkName:      networkName,
+		controlPort:      controlPort,
+		stopTimeout:      stopTimeout,
+		memoryLimitBytes: memoryLimitBytes,
+	}
+}
+
+// Compile-time assertion: *LocalSidecarProvisioner satisfies SidecarProvisioner.
+var _ SidecarProvisioner = (*LocalSidecarProvisioner)(nil)
+
+func (p *LocalSidecarProvisioner) handle(workspaceID string, running bool) DesktopHandle {
+	return DesktopHandle{
+		Address: fmt.Sprintf("%s:%d", DesktopContainerName(workspaceID), p.controlPort),
+		Running: running,
+	}
+}
+
+// StartDesktop brings up the workspace's desktop sidecar, idempotently: if it
+// is already running, it returns the handle without creating a second one (the
+// agent's first tool call and a human opening the display can race, §10).
+func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg WorkspaceConfig) (DesktopHandle, error) {
+	if running, _ := p.DesktopRunning(ctx, cfg.WorkspaceID); running {
+		return p.handle(cfg.WorkspaceID, true), nil
+	}
+
+	name := DesktopContainerName(cfg.WorkspaceID)
+
+	// Persistent profile volume (cookies / live logins) — survives
+	// scale-to-zero; only WipeProfile deletes it. Idempotent create.
+	if _, err := p.cli.VolumeCreate(ctx, volume.CreateOptions{
+		Name:   DesktopProfileVolumeName(cfg.WorkspaceID),
+		Labels: desktopManagedLabels(),
+	}); err != nil {
+		return DesktopHandle{}, fmt.Errorf("create desktop profile volume: %w", err)
+	}
+
+	// Clear any stale exited same-name container so ContainerCreate doesn't
+	// 409. Best-effort; a missing container is fine.
+	if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true}); err != nil && !isNoSuchContainer(err) {
+		// Non-fatal: log-and-continue semantics — the create below will
+		// surface a real conflict if the stale container truly blocks it.
+		_ = err
+	}
+
+	hostCfg := &container.HostConfig{
+		Binds: []string{DesktopProfileVolumeName(cfg.WorkspaceID) + ":/home/desktop/profile"},
+		// "no": an on-demand sidecar must NOT resurrect after a graceful stop.
+		// "on-failure" would restart on the SIGTERM exit-143 the graceful stop
+		// produces; crash recovery is the platform re-calling StartDesktop
+		// (§10). Never "unless-stopped".
+		RestartPolicy: container.RestartPolicy{Name: "no"},
+	}
+	if p.memoryLimitBytes > 0 {
+		hostCfg.Resources.Memory = p.memoryLimitBytes
+		// Shed the DESKTOP under memory pressure, never the tenant/agent (§10):
+		// a positive oom_score_adj makes the kernel prefer killing the sidecar.
+		hostCfg.OomScoreAdj = 500
+	}
+
+	netCfg := &network.NetworkingConfig{}
+	if p.networkName != "" {
+		netCfg.EndpointsConfig = map[string]*network.EndpointSettings{
+			p.networkName: {Aliases: []string{name}},
+		}
+	}
+
+	if _, err := p.cli.ContainerCreate(ctx, &container.Config{
+		Image:  p.image,
+		Labels: desktopManagedLabels(),
+	}, hostCfg, netCfg, nil, name); err != nil {
+		return DesktopHandle{}, fmt.Errorf("create desktop sidecar: %w", err)
+	}
+	if err := p.cli.ContainerStart(ctx, name, container.StartOptions{}); err != nil {
+		return DesktopHandle{}, fmt.Errorf("start desktop sidecar: %w", err)
+	}
+	return p.handle(cfg.WorkspaceID, true), nil
+}
+
+// StopDesktop gracefully tears the sidecar down: SIGTERM + a flush window so
+// Chrome/Xorg close their SQLite profile cleanly, THEN remove. It MUST NOT copy
+// the tenant's force-remove — a SIGKILL mid-write corrupts the profile and
+// silently breaks "logins persist" (§10). Safe because the sidecar is
+// RestartPolicy "no" (no resurrection race to beat). The profile volume
+// survives; only WipeProfile deletes it. Idempotent.
+func (p *LocalSidecarProvisioner) StopDesktop(ctx context.Context, workspaceID string) error {
+	name := DesktopContainerName(workspaceID)
+	secs := int(p.stopTimeout.Seconds())
+	if err := p.cli.ContainerStop(ctx, name, container.StopOptions{Timeout: &secs}); err != nil {
+		if isNoSuchContainer(err) {
+			return nil
+		}
+		return fmt.Errorf("graceful stop desktop sidecar: %w", err)
+	}
+	// Not Force: the container is already stopped, so a plain remove suffices
+	// and there is no SIGKILL involved.
+	if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{}); err != nil {
+		if isNoSuchContainer(err) {
+			return nil
+		}
+		return fmt.Errorf("remove desktop sidecar: %w", err)
+	}
+	return nil
+}
+
+// DesktopRunning reports whether the sidecar container is currently up.
+func (p *LocalSidecarProvisioner) DesktopRunning(ctx context.Context, workspaceID string) (bool, error) {
+	insp, err := p.cli.ContainerInspect(ctx, DesktopContainerName(workspaceID))
+	if err != nil {
+		if isNoSuchContainer(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return insp.State != nil && insp.State.Running, nil
+}
+
+// WipeProfile destroys the persistent profile volume (cookies / live logins) —
+// the revoke/wipe path (§11). The sidecar should be stopped first so the
+// volume is not in use. Idempotent.
+func (p *LocalSidecarProvisioner) WipeProfile(ctx context.Context, workspaceID string) error {
+	if err := p.cli.VolumeRemove(ctx, DesktopProfileVolumeName(workspaceID), true); err != nil {
+		if isNoSuchVolume(err) {
+			return nil
+		}
+		return fmt.Errorf("wipe desktop profile volume: %w", err)
+	}
+	return nil
+}
+
+// isNoSuchContainer / isNoSuchVolume match both the real Docker SDK not-found
+// error text and the in-memory test fake ("No such container/volume: ...").
+func isNoSuchContainer(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No such container")
+}
+
+func isNoSuchVolume(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No such volume")
+}
