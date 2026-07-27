@@ -22,6 +22,10 @@ const (
 	workspaceDisplayMaxWidth      = 3840
 	workspaceDisplayMinHeight     = 600
 	workspaceDisplayMaxHeight     = 2160
+	// Desktop scale-to-zero idle bounds (seconds). 0 = unset/use default.
+	// Floor 30s avoids thrash; ceiling 24h caps a "never idle" misconfig.
+	workspaceDesktopIdleMinSeconds = 30
+	workspaceDesktopIdleMaxSeconds = 86400
 )
 
 type workspaceDisplayResponse struct {
@@ -366,6 +370,9 @@ func validateWorkspaceCompute(compute models.WorkspaceCompute) error {
 	if err := validateWorkspaceDisplayDimensions(compute.Display.Width, compute.Display.Height); err != nil {
 		return err
 	}
+	if err := validateWorkspaceDisplayIdleTimeout(compute.Display.IdleTimeoutSeconds); err != nil {
+		return err
+	}
 	// internal#734: the durable-data choice. CP re-validates the same enum at
 	// its provision edge (IsValidDataPersistence → 400); validating here too
 	// gives the user a clear workspace-server error before the CP round-trip.
@@ -391,6 +398,9 @@ func validateWorkspaceDisplayConfig(display models.WorkspaceComputeDisplay) erro
 	if err := validateWorkspaceDisplayDimensions(display.Width, display.Height); err != nil {
 		return err
 	}
+	if err := validateWorkspaceDisplayIdleTimeout(display.IdleTimeoutSeconds); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -403,6 +413,18 @@ func validateWorkspaceDisplayDimensions(width, height int) error {
 	}
 	if height != 0 && (height < workspaceDisplayMinHeight || height > workspaceDisplayMaxHeight) {
 		return fmt.Errorf("compute.display.height must be between %d and %d", workspaceDisplayMinHeight, workspaceDisplayMaxHeight)
+	}
+	return nil
+}
+
+// validateWorkspaceDisplayIdleTimeout bounds the desktop scale-to-zero idle
+// threshold. 0 means unset (the provisioner uses the deployment default).
+func validateWorkspaceDisplayIdleTimeout(seconds int) error {
+	if seconds < 0 {
+		return fmt.Errorf("compute.display.idle_timeout_seconds must be non-negative")
+	}
+	if seconds != 0 && (seconds < workspaceDesktopIdleMinSeconds || seconds > workspaceDesktopIdleMaxSeconds) {
+		return fmt.Errorf("compute.display.idle_timeout_seconds must be between %d and %d", workspaceDesktopIdleMinSeconds, workspaceDesktopIdleMaxSeconds)
 	}
 	return nil
 }
@@ -451,6 +473,7 @@ func workspaceComputeIsZero(compute models.WorkspaceCompute) bool {
 		compute.Display.Width == 0 &&
 		compute.Display.Height == 0 &&
 		compute.Display.Protocol == "" &&
+		compute.Display.IdleTimeoutSeconds == 0 &&
 		// A provider- or persistence-only compute is NOT zero — it must
 		// round-trip so GET returns those fields (canvas provider badge +
 		// data-persistence selector both read them back).
@@ -481,6 +504,9 @@ func workspaceComputeJSON(compute models.WorkspaceCompute) (string, error) {
 	}
 	if compute.Display.Protocol != "" {
 		display["protocol"] = compute.Display.Protocol
+	}
+	if compute.Display.IdleTimeoutSeconds != 0 {
+		display["idle_timeout_seconds"] = compute.Display.IdleTimeoutSeconds
 	}
 	if len(display) > 0 {
 		out["display"] = display
