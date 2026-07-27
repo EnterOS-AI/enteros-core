@@ -121,6 +121,12 @@ source "$(dirname "$0")/lib/collision-proof-slug.sh"
 # shellcheck source=lib/tenant_topology.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/tenant_topology.sh"
+# SSOT teardown contract (e2e_cp_delete_and_verify_purge): exact purge receipt +
+# audit row + exact-org absence, INCLUDING the bounded retry for the CP's
+# transient 409 "organization has an active lifecycle operation".
+# shellcheck source=lib/cp_purge_receipt.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/cp_purge_receipt.sh"
 
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { echo "[$(date +%H:%M:%S)] ❌ $*" >&2; exit 1; }
@@ -195,7 +201,29 @@ register_with_retry() {  # $1 = step label, $2 = request body
 CURL_COMMON=(-sS --fail-with-body --max-time 30)
 
 # ─── cleanup trap (mirrors full-saas) ────────────────────────────────────
+# The DELETE goes through the SSOT helper e2e_cp_delete_and_verify_purge
+# (lib/cp_purge_receipt.sh) — the SAME teardown contract full_saas, the
+# concierge lanes and the peer-visibility gate use.
+#
+# This lane used to hand-roll it: one fire-and-forget DELETE with its status
+# discarded (`>/dev/null 2>&1`), then a 60s poll of the org ROSTER for the slug
+# to disappear. That shape is unrecoverable against the control plane's
+# org-lifecycle fence — claimOrgPurge answers an immediate HTTP 409
+# "organization has an active lifecycle operation" while any org-scoped mutation
+# lease is open (including the CP's OWN asynchronous workspace provision for the
+# org this run just created), and a 409 writes NO purge audit row, so nothing
+# converges and nothing re-issues the DELETE. Worse here than elsewhere: this
+# scenario is ADVISORY in the ephemeral happy-path gate, so a leaked tenant was
+# suppressed to a warning instead of redding. Fixed once in the shared lib by
+# 3dd3675e2 and never propagated to this copy.
+#
+# The helper fails CLOSED (persistent 409, any other non-200, malformed or
+# mismatched receipt, or a surviving org → exit 4) and upgrades the assertion
+# from "the roster stopped listing it" to "exact purge receipt + exact completed
+# audit row + exact-org 404". The REQUIRE_LIVE false-green gate below is this
+# script's OWN extra assertion and still runs after it.
 CLEANUP_DONE=0
+ORG_CREATION_VERIFIED=0
 cleanup_org() {
   local entry_rc=$?
   if [ "$CLEANUP_DONE" = "1" ]; then return 0; fi
@@ -206,30 +234,21 @@ cleanup_org() {
     return 0
   fi
 
-  log "Cleanup: deleting tenant $SLUG..."
-  curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1 \
-    && ok "Teardown request accepted" \
-    || log "Teardown returned non-2xx (may already be gone)"
-
-  local leak_count=1 elapsed=0
-  while [ "$elapsed" -lt 60 ]; do
-    leak_count=$(curl "${CURL_COMMON[@]}" "$CP_URL/cp/admin/orgs" \
-      -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-      | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for o in d.get('orgs', []) if o.get('slug')=='$SLUG' and o.get('status') != 'purged'))" \
-      2>/dev/null || echo 1)
-    [ "$leak_count" = "0" ] && break
-    sleep 5
-    elapsed=$((elapsed + 5))
-  done
-
-  if [ "$leak_count" != "0" ]; then
-    echo "⚠️  LEAK: org $SLUG still present post-teardown (count=$leak_count)" >&2
-    exit 4
+  if [ "$ORG_CREATION_VERIFIED" = "1" ]; then
+    log "Cleanup: deleting tenant $SLUG..."
+    local purge_rc=0
+    e2e_cp_delete_and_verify_purge "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" || purge_rc=$?
+    case "$purge_rc" in
+      0) ok "Teardown clean — $SLUG provably purged, no orphan resources" ;;
+      2) exit 2 ;;
+      *)
+        echo "⚠️  LEAK: org $SLUG was not provably purged post-teardown" >&2
+        exit 4
+        ;;
+    esac
+  else
+    log "Cleanup: no verified creation-returned org identity for $SLUG — nothing this run created to delete"
   fi
-  ok "Teardown clean — no orphan resources for $SLUG (${elapsed}s)"
 
   # REQUIRE_LIVE fail-closed gate. Only meaningful on an OTHERWISE-CLEAN
   # exit (entry_rc==0): a script that completed all steps but somehow did
@@ -280,6 +299,10 @@ CREATE_RESP=$(admin_call POST /cp/admin/orgs \
 set -e
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
 [ -z "$ORG_ID" ] && fail "Org create response missing 'id': $(printf '%s' "$CREATE_RESP" | sanitize_http_body 2>/dev/null || printf '%s' "$CREATE_RESP")"
+# The creation-returned id is the teardown's collision-safe authority: the helper
+# refuses to DELETE a slug whose current org id is not this one.
+e2e_cp_validate_org_id "$ORG_ID"   || fail "Org create returned a non-UUID id ($ORG_ID) — refusing to arm a destructive teardown against it"
+ORG_CREATION_VERIFIED=1
 ok "Org created (id=$ORG_ID)"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────

@@ -152,6 +152,12 @@ source "$(dirname "$0")/lib/reconciler_container.sh"
 # shellcheck disable=SC1091
 # shellcheck source=lib/tenant_topology.sh
 source "$(dirname "$0")/lib/tenant_topology.sh"
+# SSOT teardown contract (e2e_cp_delete_and_verify_purge): exact purge receipt +
+# audit row + exact-org absence, INCLUDING the bounded retry for the CP's
+# transient 409 "organization has an active lifecycle operation".
+# shellcheck source=lib/cp_purge_receipt.sh
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/cp_purge_receipt.sh"
 # Kill primitive + leak sweep — provider-abstracted. The AWS lib is sourced ONLY
 # on the legacy AWS path (its e2e_* helpers are undefined on the molecules-server
 # path, and every call site is provider-branched below).
@@ -258,6 +264,7 @@ CURL_COMMON=(-sS --fail-with-body --max-time 30)
 # failure (exit 4). The trap is installed UP-FRONT so a mid-test failure
 # (including a failed PRIMARY assertion) still cleans up.
 CLEANUP_DONE=0
+ORG_CREATION_VERIFIED=0
 cleanup_org() {
   # Capture upstream exit code IMMEDIATELY — must be the first statement in
   # the trap, before any command (including the CLEANUP_DONE check) clobbers $?.
@@ -271,37 +278,48 @@ cleanup_org() {
     return 0
   fi
 
+  if [ "$ORG_CREATION_VERIFIED" != "1" ]; then
+    log "no verified creation-returned org identity for $SLUG — nothing this run created to delete"
+    case "$entry_rc" in
+      0|1|2|3|4) return 0 ;;
+      *) exit 1 ;;
+    esac
+  fi
+
   log "🧹 Tearing down org $SLUG..."
 
-  # 120s curl budget for the synchronous DELETE cascade (EC2 terminate alone
-  # is 30-60s), then poll up to 60s for organizations.status='purged'/gone.
-  if curl "${CURL_COMMON[@]}" --max-time 120 -X DELETE "$CP_URL/cp/admin/tenants/$SLUG" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{\"confirm\":\"$SLUG\"}" >/dev/null 2>&1; then
-    ok "Teardown request accepted"
-  else
-    log "Teardown returned non-2xx (may already be gone)"
-  fi
+  # The DELETE goes through the SSOT helper e2e_cp_delete_and_verify_purge
+  # (lib/cp_purge_receipt.sh) — the SAME teardown contract full_saas, the
+  # concierge lanes and the peer-visibility gate use.
+  #
+  # This lane used to hand-roll it: one fire-and-forget DELETE with its status
+  # discarded (`>/dev/null 2>&1`), then a 60s poll of the org ROSTER for the slug
+  # to disappear. That shape is unrecoverable against the control plane's
+  # org-lifecycle fence — claimOrgPurge answers an immediate HTTP 409
+  # "organization has an active lifecycle operation" while any org-scoped
+  # mutation lease is open (including the CP's OWN asynchronous workspace
+  # provision for the org this run just created), and a 409 writes NO purge audit
+  # row, so nothing converges and nothing re-issues the DELETE. Worse here than
+  # elsewhere: this scenario is ADVISORY in the ephemeral happy-path gate, so a
+  # leaked tenant was suppressed to a warning instead of redding. Fixed once in
+  # the shared lib by 3dd3675e2 and never propagated to this copy.
+  #
+  # The helper fails CLOSED (persistent 409, any other non-200, malformed or
+  # mismatched receipt, or a surviving org → exit 4) and upgrades the assertion
+  # from "the roster stopped listing it" to "exact purge receipt + exact
+  # completed audit row + exact-org 404". The workspace/instance leak scan below
+  # is this script's OWN extra assertion and still runs after it.
+  local purge_rc=0
+  e2e_cp_delete_and_verify_purge "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" || purge_rc=$?
+  case "$purge_rc" in
+    0) ok "Teardown request accepted and purge verified" ;;
+    2) exit 2 ;;
+    *)
+      echo "⚠️  LEAK: org $SLUG was not provably purged post-teardown" >&2
+      exit 4
+      ;;
+  esac
 
-  local leak_count=1
-  local elapsed=0
-  while [ "$elapsed" -lt 60 ]; do
-    leak_count=$(curl "${CURL_COMMON[@]}" "$CP_URL/cp/admin/orgs" \
-      -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null \
-      | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for o in d.get('orgs', []) if o.get('slug')=='$SLUG' and o.get('status') != 'purged'))" \
-      2>/dev/null || echo 1)
-    if [ "$leak_count" = "0" ]; then
-      break
-    fi
-    sleep 5
-    elapsed=$((elapsed + 5))
-  done
-
-  if [ "$leak_count" != "0" ]; then
-    echo "⚠️  LEAK: org $SLUG still present post-teardown after ${elapsed}s (count=$leak_count)" >&2
-    exit 4
-  fi
   local leak_rc=0
   verify_no_workspace_leaks "$SLUG" || leak_rc=$?
   if [ "$leak_rc" != "0" ]; then
@@ -310,7 +328,7 @@ cleanup_org() {
       *) exit 4 ;;
     esac
   fi
-  ok "Teardown clean — no orphan org or workspace box/container for $SLUG (${elapsed}s)"
+  ok "Teardown clean — no orphan org or workspace box/container for $SLUG"
 
   # Normalize unexpected upstream exit codes to 1 — `set -e` propagates the
   # raw exit code of the failing command (e.g. curl exits 22 under
@@ -362,6 +380,10 @@ CREATE_RESP="$CREATE_ORG_RESP"
 echo "$CREATE_RESP" | python3 -m json.tool >/dev/null || fail "Org create returned non-JSON: $CREATE_RESP"
 ORG_ID=$(echo "$CREATE_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))")
 [ -z "$ORG_ID" ] && fail "Org create response missing 'id': $CREATE_RESP"
+# The creation-returned id is the teardown's collision-safe authority: the helper
+# refuses to DELETE a slug whose current org id is not this one.
+e2e_cp_validate_org_id "$ORG_ID"   || fail "Org create returned a non-UUID id ($ORG_ID) — refusing to arm a destructive teardown against it"
+ORG_CREATION_VERIFIED=1
 ok "Org created (id=$ORG_ID)"
 
 # ─── 2. Wait for tenant provisioning ────────────────────────────────────

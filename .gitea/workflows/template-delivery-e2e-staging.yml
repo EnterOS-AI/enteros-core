@@ -40,6 +40,11 @@ jobs:
     timeout-minutes: 75
     env:
       MOLECULE_CP_URL: ${{ vars.CP_URL || 'https://staging-api.moleculesai.app' }}
+      # Required by the SSOT teardown helper (tests/e2e/lib/cp_purge_receipt.sh),
+      # which this job's harness now routes its tenant DELETE through. It refuses
+      # to run against any other backend rather than guessing — local-docker is
+      # the only active one. Declared here so the harness never has to assume it.
+      E2E_INFRA_BACKEND: local-docker
       E2E_EXPECTED_MODEL: moonshot/kimi-k2.6
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

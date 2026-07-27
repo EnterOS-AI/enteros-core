@@ -27,6 +27,12 @@ source "$SCRIPT_DIR/lib/collision-proof-slug.sh"
 # shellcheck source=lib/completion_assert.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/completion_assert.sh"
+# SSOT teardown contract (e2e_cp_delete_and_verify_purge): exact purge receipt +
+# audit row + exact-org absence, INCLUDING the bounded retry for the CP's
+# transient 409 "organization has an active lifecycle operation".
+# shellcheck source=lib/cp_purge_receipt.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/cp_purge_receipt.sh"
 
 CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load staging CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
@@ -53,12 +59,25 @@ ok()   { echo "[$(date +%H:%M:%S)] ✅ $*"; }
 
 # Preserve the historical cp455 identifier while retaining the mandatory
 # collision-proof UUID suffix under the control-plane's 32-character slug cap.
-SLUG_PREFIX="cp455-${RUNTIME}-"
+#
+# The `e2e-` head is LOAD-BEARING, not cosmetic. The bare `cp455-` prefix this
+# used to carry was outside every ephemeral-org policy in the system at once:
+# sweep-stale-e2e-orgs.yml reaps only ("e2e-", "rt-e2e-"), the CP's IsEphemeral
+# classifier keys on the same `e2e-` head, and the SSOT teardown helper
+# (lib/cp_purge_receipt.sh) refuses a destructive DELETE for any slug outside
+# that set. So an org this harness leaked — on a SIGKILL, a mid-provision
+# cancel, or the org-lifecycle 409 fixed below — was reachable by NO reaper and
+# no backstop, and stayed up until someone noticed. Renaming the prefix brings
+# the harness under all three at once; `e2e-cp455-claude-code-` is 22 chars, so
+# the helper degrades the context to the bare 8-char uuid anchor and the full
+# slug lands at 30 — inside the CP's 32-char cap.
+SLUG_PREFIX="e2e-cp455-${RUNTIME}-"
 SLUG="${SLUG_PREFIX}$(make_collision_proof_slug_suffix "${E2E_RUN_ID:-}" ${#SLUG_PREFIX})"
 assert_collision_proof_slug "$SLUG" || fail "collision-proof helper produced invalid slug '$SLUG'"
 
 WORKSPACE_ID=""
 ORG_ID=""
+ORG_CREATION_VERIFIED=0
 TENANT_TOKEN=""
 TENANT_URL=""
 RESULT_JSON="/tmp/cell-result.json"
@@ -98,20 +117,6 @@ with open(path, "w", encoding="utf-8") as fh:
 PY
 }
 
-org_present_count() {
-  curl "${CURL_COMMON[@]}" "$CP_URL/cp/admin/orgs?limit=500" \
-    -H "Authorization: Bearer ${ADMIN_TOKEN}" 2>/dev/null \
-    | SLUG="$SLUG" python3 -c '
-import json, os, sys
-try:
-    rows = json.load(sys.stdin).get("orgs", [])
-except Exception:
-    print(1); raise SystemExit
-slug = os.environ["SLUG"]
-print(sum(1 for row in rows if row.get("slug") == slug and row.get("status") != "purged" and row.get("instance_status") != "purged"))
-' 2>/dev/null || echo 1
-}
-
 on_exit() {
   local entry_code=$?
   EXIT_CODE="$entry_code"
@@ -119,32 +124,53 @@ on_exit() {
 
   if [ -n "$KEEP_ORG" ]; then
     TEARDOWN_STATUS="skipped_keep_org"
+  elif [ "$ORG_CREATION_VERIFIED" != "1" ]; then
+    TEARDOWN_STATUS="skipped_nothing_created"
+    log "no verified creation-returned org identity for $SLUG — nothing this run created to delete"
   else
     echo "::group::Teardown (trap)"
-    local teardown_code
-    teardown_code=$(curl "${CURL_COMMON[@]}" --max-time 120 \
-      -X DELETE -o /dev/null -w '%{http_code}' \
-      -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-      -H "Content-Type: application/json" \
-      -d "{\"confirm\":\"${SLUG}\"}" \
-      "$CP_URL/cp/admin/tenants/$SLUG" 2>/dev/null) || teardown_code=000
-    log "DELETE /cp/admin/tenants/$SLUG -> HTTP $teardown_code"
-
-    local remaining=1 waited=0
-    while [ "$waited" -lt 60 ]; do
-      remaining=$(org_present_count)
-      [ "$remaining" = "0" ] && break
-      sleep 5
-      waited=$((waited + 5))
-    done
-    if [ "$remaining" = "0" ]; then
-      TEARDOWN_STATUS="ok"
-      ok "Teardown verified: org absent after ${waited}s"
-    else
-      TEARDOWN_STATUS="leak_risk_org_present"
-      EXIT_CODE=6
-      echo "::error::org $SLUG is still present after teardown (${waited}s); leak risk"
-    fi
+    # The DELETE goes through the SSOT helper e2e_cp_delete_and_verify_purge
+    # (lib/cp_purge_receipt.sh) — the SAME teardown contract full_saas, the
+    # concierge lanes and the peer-visibility gate use.
+    #
+    # This harness used to hand-roll it: ONE DELETE (its status captured but
+    # never acted on beyond a log line), then a 60s poll of the org ROSTER. That
+    # shape is unrecoverable against the control plane's org-lifecycle fence —
+    # claimOrgPurge answers an immediate HTTP 409 "organization has an active
+    # lifecycle operation" while any org-scoped mutation lease is open,
+    # including the CP's OWN asynchronous workspace provision for the org this
+    # run just created. A 409 writes NO purge audit row, so the poll has nothing
+    # to converge on and nothing ever re-issues the DELETE: the org leaks, the
+    # poll burns its full 60s, and the run reports teardown_status
+    # leak_risk_org_present / exit 6 — blaming the product for a claim the
+    # harness never retried. Fixed once in the shared lib by 3dd3675e2 ("retry
+    # transient 409 'active lifecycle operation' on teardown DELETE") and never
+    # propagated to this hand-rolled copy.
+    #
+    # The helper fails CLOSED (persistent 409, any other non-200, malformed or
+    # mismatched receipt, or a surviving org) and upgrades the absence proof
+    # from "the roster stopped listing it" to "exact purge receipt + exact
+    # completed audit row + exact-org 404". This block's OWN contract — the
+    # structured TEARDOWN_STATUS in /tmp/cell-result.json and the distinct
+    # exit 6 for a leak — is preserved exactly.
+    local purge_rc=0
+    e2e_cp_delete_and_verify_purge "$CP_URL" "$ADMIN_TOKEN" "$SLUG" "$ORG_ID" || purge_rc=$?
+    case "$purge_rc" in
+      0)
+        TEARDOWN_STATUS="ok"
+        ok "Teardown verified: org $SLUG provably purged"
+        ;;
+      2)
+        TEARDOWN_STATUS="bad_env"
+        EXIT_CODE=2
+        echo "::error::teardown refused for $SLUG on a bad-env precondition (backend/origin/slug/token) — see [cp-purge] above"
+        ;;
+      *)
+        TEARDOWN_STATUS="leak_risk_org_present"
+        EXIT_CODE=6
+        echo "::error::org $SLUG was not provably purged after teardown; leak risk"
+        ;;
+    esac
     echo "::endgroup::"
   fi
 
@@ -255,6 +281,11 @@ try: print(json.load(sys.stdin).get("id", ""))
 except Exception: print("")
 ' 2>/dev/null || echo "")
 [ -n "$ORG_ID" ] || fail "org create response missing id: $(safe_body_preview "$PROVISION_RESP")"
+# The creation-returned id is the teardown's collision-safe authority: the helper
+# refuses to DELETE a slug whose current org id is not this one.
+e2e_cp_validate_org_id "$ORG_ID" \
+  || fail "org create returned a non-UUID id ($ORG_ID) — refusing to arm a destructive teardown against it"
+ORG_CREATION_VERIFIED=1
 
 deadline=$(( $(date +%s) + PROVISION_TIMEOUT_SECS ))
 LAST_STATUS=""
