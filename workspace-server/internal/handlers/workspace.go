@@ -134,6 +134,30 @@ type WorkspaceHandler struct {
 	// for async DB users (restart, provision) before asserting results.
 	// Matches the pattern from main commit 1c3b4ff3.
 	asyncWG sync.WaitGroup
+
+	// wakeDecide / wakeMarkDelivered route the restart-context wake through the
+	// wake-lifecycle desired-state owner (PR-D). BOTH nil by default: a bare
+	// &WorkspaceHandler{} (every existing unit test) leaves them unset, so the
+	// restart-context path keeps its pre-PR-D behavior verbatim — no wake_intents
+	// write, no generation bump, and enqueueRestartContext falls back to its
+	// legacy per-workspace idempotency key. Production wires them via SetWakeHooks
+	// to this handler's own DecideWake / MarkWakeDelivered. Mirrors the
+	// StallWatchdog.SetWakeHooks nil-safe late-wiring pattern.
+	wakeDecide        func(ctx context.Context, workspaceID string, kind WakeKind, dedupSeed string) (WakeDecision, error)
+	wakeMarkDelivered func(ctx context.Context, workspaceID, idempotencyKey string) error
+}
+
+// SetWakeHooks wires the wake-lifecycle desired-state owner into this handler's
+// proactive-wake emitters (currently restart-context, PR-D). Late-wiring and
+// nil-safe (mirrors StallWatchdog.SetWakeHooks / RegistryHandler's setters) so
+// the struct's zero value — and every existing bare-handler test — behaves
+// exactly as pre-PR-D. Production calls this once, after the handler exists.
+func (h *WorkspaceHandler) SetWakeHooks(
+	decide func(ctx context.Context, workspaceID string, kind WakeKind, dedupSeed string) (WakeDecision, error),
+	delivered func(ctx context.Context, workspaceID, idempotencyKey string) error,
+) {
+	h.wakeDecide = decide
+	h.wakeMarkDelivered = delivered
 }
 
 // deadProbeRecord tracks consecutive "container looks dead" observations

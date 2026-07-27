@@ -1,3 +1,5 @@
+import { SELF_SOURCE_TYPES as GENERATED_SELF_SOURCE_TYPES } from "./self-source-types.generated";
+
 export function extractAgentText(task: Record<string, unknown>): string {
   try {
     const directTexts = extractTextsFromParts(task.parts);
@@ -129,45 +131,24 @@ export function extractRequestText(body: Record<string, unknown> | null): string
   return (parts?.[0]?.text as string) || "";
 }
 
-/** SSOT set of A2A params.metadata.source_type markers the runtime
- *  stamps on messages a workspace sends TO ITSELF as routine wake nudges
- *  (NOT human-typed turns). Mirrors the runtime's _ROUTINE_SELF_SOURCE_TYPES
- *  (molecule_runtime/a2a_executor.py) and the server's selfSourceTypes
- *  (workspace-server/internal/messagestore/postgres_store.go). The
- *  canonical case is the heartbeat delegation-result harvester
- *  ("Delegation results are ready …"). "self-warmup" is the platform-fired
- *  concierge readiness probe ("Platform readiness check — no action needed."),
- *  a heartbeat internal that used to leak as a blue user bubble.
+/** SSOT set of A2A params.metadata.source_type markers a workspace stamps
+ *  on messages it sends TO ITSELF as routine/internal wakes (NOT human-typed
+ *  turns): a message carrying one is classified a system notice and must
+ *  NEVER render as a blue user bubble in loaded chat history.
  *
- *  This list MUST stay in exact parity with the Go selfSourceTypes SSOT
- *  in postgres_store.go — a marker missing here re-introduces the very
- *  bug this set exists to prevent: a self-wake rendering as a blue user
- *  bubble in loaded chat history. Parity is currently maintained by hand
- *  (this file drifted behind Go); the durable fix is a shared codegen
- *  contract that emits both the Go map and this set from one source
- *  (tracked follow-up). */
-export const SELF_SOURCE_TYPES: ReadonlySet<string> = new Set<string>([
-  "self-cron",
-  "self-harvester",
-  "self-idle",
-  "self-scheduler",
-  "self-goal-nudge",
-  "self-delegation-result",
-  "self-warmup",
-  // The platform's post-restart context snapshot (restart_context.go),
-  // delivered via the a2a queue — without this marker each drained
-  // snapshot rendered as a blue user bubble in My Chat.
-  "self-restart-context",
-  // The first-boot greeting's internal prompt (first_boot_greeting.go),
-  // persisted only when a busy-queued greet turn is drained later.
-  "self-first-boot-greet",
-  // Wake-lifecycle self-nudges (self-lifecycle / self-stall / self-nudge):
-  // the concierge wake-lifecycle internals that must surface as system
-  // notices, never as user turns.
-  "self-lifecycle",
-  "self-stall",
-  "self-nudge",
-]);
+ *  RFC follow-up #29: the marker set is now defined ONCE in the SDK contract
+ *  (molecule-ai-sdk contracts/workspace-comms/self-source-types.schema.json)
+ *  and codegen'd into the Go `molcontracts.SelfSourceTypes` (consumed by
+ *  workspace-server/internal/messagestore) and the `@enteros/contracts` TS
+ *  list. Because canvas has no npm dependency on the SDK, that generated list
+ *  is VENDORED at ./self-source-types.generated.ts (a DO-NOT-EDIT values
+ *  mirror); the drift guard that used to hand-parse the Go map is replaced by
+ *  the SDK's contracts-codegen-drift gate + the vendor-parity test in
+ *  __tests__/message-parser.test.ts. This is a ReadonlySet wrapper over the
+ *  generated ordered list so existing `.has()` callers are unchanged. */
+export const SELF_SOURCE_TYPES: ReadonlySet<string> = new Set<string>(
+  GENERATED_SELF_SOURCE_TYPES,
+);
 
 /** Read the typed source marker the runtime stamps on outbound
  *  self-messages: request_body.params.metadata.source_type (the sibling

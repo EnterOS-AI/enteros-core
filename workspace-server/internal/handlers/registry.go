@@ -120,6 +120,16 @@ type RegistryHandler struct {
 	// (unit tests / deployments without a schedule handler). Wired by the router
 	// to ScheduleHandler.RestoreInheritedRuntimeSchedules.
 	restoreSchedules ReconcileFunc
+	// wakeSettler settles the wake-lifecycle intents a heartbeat has converged
+	// (the versioned-heartbeat GENERATION LOOP, PR-C). Called when a beat reports
+	// observed_generation >= the workspace's desired_generation. nil-safe: the
+	// convergence step is skipped when unset (unit tests / deployments without a
+	// workspace handler). Wired late by the router to
+	// WorkspaceHandler.MarkWakeSettled — same nil-safe hook pattern as
+	// SetFirstBootGreeter so RegistryHandler need not depend on WorkspaceHandler's
+	// construction order (both live in package handlers; the func field decouples
+	// the wiring, not an import cycle).
+	wakeSettler func(ctx context.Context, workspaceID string, observedGen int64) error
 	// mcpRecoveryLastFire rate-limits the RCA#2970 deadlock-break reconcile (#33).
 	// The gate fails on EVERY heartbeat until the management MCP lands, so without
 	// a throttle a concierge that cannot recover (e.g. a missing plugin-source
@@ -170,6 +180,29 @@ func (h *RegistryHandler) fireFirstBootGreeting(workspaceID string, toolCount in
 		return
 	}
 	go h.firstBootGreeter(workspaceID, toolCount)
+}
+
+// SetWakeSettler wires the wake-lifecycle convergence hook — the settle side of
+// the versioned-heartbeat GENERATION LOOP (PR-C). Router wires this to
+// WorkspaceHandler.MarkWakeSettled after both handlers are constructed, keeping
+// RegistryHandler free of a construction-order dependency (same late-wiring
+// nil-safe pattern as SetFirstBootGreeter / SetQueueDrainFunc).
+func (h *RegistryHandler) SetWakeSettler(f func(ctx context.Context, workspaceID string, observedGen int64) error) {
+	h.wakeSettler = f
+}
+
+// fireWakeSettled runs the convergence settle for a heartbeat that reported an
+// observed_generation at/above the workspace's desired_generation. Synchronous
+// (a single UPDATE, negligible latency) but best-effort: a settle failure is
+// logged and swallowed so it never breaks the heartbeat's liveness ack. nil-safe
+// for tests / deployments that don't wire a workspace handler.
+func (h *RegistryHandler) fireWakeSettled(ctx context.Context, workspaceID string, observedGen int64) {
+	if h.wakeSettler == nil {
+		return
+	}
+	if err := h.wakeSettler(ctx, workspaceID, observedGen); err != nil {
+		log.Printf("Heartbeat: wake-settle failed for %s (observed_gen=%d): %v", workspaceID, observedGen, err)
+	}
 }
 
 // holdOnlineBroadcastForWarmingPlatform reports whether Register must NOT
@@ -1317,10 +1350,17 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	// prevStatus = "" on every heartbeat, so the prevStatus=='provisioning'
 	// reconcile trigger NEVER fired (the #32 regression returned). Select the
 	// column bare; it is never NULL.
+	//
+	// desired_generation is read on the SAME row so the heartbeat response can
+	// echo it down as resp["generation"] (the versioned-heartbeat GENERATION LOOP,
+	// PR-C). It MUST be emitted on every beat — including beats that carry no
+	// observed_generation — or a fresh runtime never learns the desired generation
+	// it is supposed to reconcile-and-echo, leaving the loop half-open.
 	var prevTask string
 	var prevSpend int64
 	var prevStatus string
-	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, ''), COALESCE(monthly_spend, 0), status FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask, &prevSpend, &prevStatus); err != nil {
+	var desiredGen int64
+	if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(current_task, ''), COALESCE(monthly_spend, 0), status, desired_generation FROM workspaces WHERE id = $1`, payload.WorkspaceID).Scan(&prevTask, &prevSpend, &prevStatus, &desiredGen); err != nil {
 		log.Printf("registry heartbeat: prev_task query failed for workspace %s: %v", payload.WorkspaceID, err)
 	}
 
@@ -1456,6 +1496,35 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 		}
 	}
 
+	// Versioned-heartbeat GENERATION LOOP (PR-C): persist the runtime's reported
+	// observed_generation and, once it has caught up to the desired generation,
+	// settle the converged wake intents.
+	//
+	// Gated on ObservedGeneration != nil so a runtime PREDATING the versioned-
+	// heartbeat contract (which sends no observed_generation) is a structural
+	// no-op — no write, no convergence claim. When present, the write is
+	// MONOTONIC via GREATEST(observed_generation, $observed): a stale or reordered
+	// beat carrying a lower value can never regress the column. Best-effort: a
+	// failure here is logged and must never break the heartbeat's liveness ack.
+	if payload.ObservedGeneration != nil {
+		if _, obsErr := db.DB.ExecContext(ctx, `
+			UPDATE workspaces SET
+				observed_generation = GREATEST(observed_generation, $1),
+				updated_at          = now()
+			WHERE id = $2 AND status != 'removed'
+		`, *payload.ObservedGeneration, payload.WorkspaceID); obsErr != nil {
+			log.Printf("Heartbeat: failed to persist observed_generation for %s: %v", payload.WorkspaceID, obsErr)
+		}
+
+		// CONVERGENCE: the runtime has reconciled at least up to desiredGen, so the
+		// delivered wake intents at/below the observed generation are done. Settling
+		// is delegated to the workspace handler's owner method via the nil-safe hook
+		// (MarkWakeSettled settles delivered intents with generation <= observed).
+		if *payload.ObservedGeneration >= desiredGen {
+			h.fireWakeSettled(ctx, payload.WorkspaceID, *payload.ObservedGeneration)
+		}
+	}
+
 	// RFC#2843 #32: fire the declared-plugin reconcile when THIS heartbeat just
 	// performed the provisioning→online self-heal (the inline CASE in the UPDATE
 	// above). This is the primary fresh-boot transition: a newly-provisioned
@@ -1587,6 +1656,14 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 	}
 
 	resp := gin.H{"status": "ok"}
+
+	// Versioned-heartbeat GENERATION LOOP (PR-C): hand the workspace's current
+	// desired-state generation down every beat (matches the SDK
+	// HeartbeatResponse.Generation json tag `generation`). The runtime echoes it
+	// back as request.observed_generation once reconciled, closing the loop. This
+	// is emitted unconditionally — a fresh runtime must learn a non-zero desired
+	// generation before it can ever report having converged to it.
+	resp["generation"] = desiredGen
 
 	// Deliver the platform_inbound_secret on every heartbeat. Mirrors
 	// the same field on /registry/register, but heartbeats are the

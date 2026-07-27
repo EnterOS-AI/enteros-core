@@ -82,6 +82,28 @@ const firstBootGreetSourceType = "self-first-boot-greet"
 // WorkspaceHandler.ProxyA2ARequest; tests substitute a stub.
 type a2aTurnFn func(ctx context.Context, workspaceID string, body []byte, callerID string, logActivity bool) (int, []byte, error)
 
+// GreetWakeHooks routes the first-boot greeting through the wake-lifecycle
+// desired-state owner (PR-D). Both funcs are OPTIONAL: FirstBootGreeter is
+// called with them in production (wired to WorkspaceHandler.DecideWake /
+// MarkWakeDelivered) and WITHOUT them in unit tests, where the greeter then
+// behaves exactly as pre-PR-D (no wake_intents write, no generation bump) so
+// the existing sqlmock expectations in first_boot_greeting_test.go stay
+// verbatim.
+//
+// CRITICAL — the owner does NOT arbitrate greet-once. The authoritative
+// greet-once dedup remains the has_greeted boot marker: workspaceHasGreeted for
+// the fast-path skip and claimGreetDelivery's compare-and-set at delivery. That
+// is why Decide's WakeDecision.Fire is deliberately NOT consulted as a fire gate
+// here — a box whose FIRST boot greet failed leaves has_greeted=false and MUST
+// re-greet on the next boot, even though the once-per-box wake intent already
+// exists (so a second Decide returns Fire=false). Decide is called only to
+// record the intent + bump the desired generation and to source the shared
+// idempotency key; the has_greeted machinery owns exactly-once end to end.
+type GreetWakeHooks struct {
+	Decide    func(ctx context.Context, workspaceID string, kind WakeKind, dedupSeed string) (WakeDecision, error)
+	Delivered func(ctx context.Context, workspaceID, idempotencyKey string) error
+}
+
 // firstBootGreetingPending makes the greet attempt EXCLUSIVE per workspace:
 // the greet-once history gate is check-then-act with a window as wide as the
 // 90s agent turn, so overlapping invocations (a register retry racing the
@@ -128,32 +150,44 @@ func firstBootFallbackText(toolCount int) string {
 // can recover the concierge's tool-count fallback text instead of degrading to
 // the role-agnostic zero-tool greeting (rule-1 finding #3). Read back via
 // firstBootToolCount.
-func buildFirstBootGreetPayload(workspaceID string, toolCount int) ([]byte, error) {
+//
+// wakeIdempotencyKey (optional, PR-E) is stamped into params.metadata as
+// wake_idempotency_key when present so the wake owner's decision key rides the
+// A2A envelope end to end (decision→dispatch→delivery→marker share one key).
+// params.metadata is additionalProperties:true so this is not a schema break,
+// and it is a sibling of params.message.metadata — the existing self-source /
+// tool-count readers (params.message.metadata) are untouched. Omitted (no key)
+// keeps the payload byte-identical to pre-PR-E.
+func buildFirstBootGreetPayload(workspaceID string, toolCount int, wakeIdempotencyKey ...string) ([]byte, error) {
+	params := map[string]any{
+		"message": map[string]any{
+			"messageId": uuid.New().String(),
+			"contextId": platformTurnContextID(workspaceID),
+			"role":      "user",
+			"parts":     []any{map[string]any{"kind": "text", "text": firstBootGreetPrompt}},
+			"metadata": map[string]any{
+				"source": "platform",
+				"kind":   "first_boot_greeting",
+				// SSOT self-message classifier (messagestore.selfSourceTypes):
+				// if this internal prompt is ever persisted (e.g. a
+				// busy-queued greet drained later), it renders as a system
+				// notice, never a blue user bubble.
+				"source_type":         firstBootGreetSourceType,
+				"first_boot_greeting": true,
+				// Concierge tool count — threaded decision→drain so the drain
+				// fallback keeps the tool-count greeting (rule-1 finding #3).
+				"first_boot_tool_count": toolCount,
+			},
+		},
+	}
+	if len(wakeIdempotencyKey) > 0 && wakeIdempotencyKey[0] != "" {
+		params["metadata"] = map[string]any{"wake_idempotency_key": wakeIdempotencyKey[0]}
+	}
 	return json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
 		"method":  "message/send",
-		"params": map[string]any{
-			"message": map[string]any{
-				"messageId": uuid.New().String(),
-				"contextId": platformTurnContextID(workspaceID),
-				"role":      "user",
-				"parts":     []any{map[string]any{"kind": "text", "text": firstBootGreetPrompt}},
-				"metadata": map[string]any{
-					"source": "platform",
-					"kind":   "first_boot_greeting",
-					// SSOT self-message classifier (messagestore.selfSourceTypes):
-					// if this internal prompt is ever persisted (e.g. a
-					// busy-queued greet drained later), it renders as a system
-					// notice, never a blue user bubble.
-					"source_type":         firstBootGreetSourceType,
-					"first_boot_greeting": true,
-					// Concierge tool count — threaded decision→drain so the drain
-					// fallback keeps the tool-count greeting (rule-1 finding #3).
-					"first_boot_tool_count": toolCount,
-				},
-			},
-		},
+		"params":  params,
 	})
 }
 
@@ -286,7 +320,11 @@ func deliverFirstBootGreeting(ctx context.Context, writer *AgentMessageWriter, w
 // FirstBootGreeter builds the greeting hook for RegistryHandler.
 // SetFirstBootGreeter. The returned func is invoked in its own goroutine by
 // fireFirstBootGreeting, so it may block on the agent turn freely.
-func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(workspaceID string, toolCount int) {
+func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn, wake ...GreetWakeHooks) func(workspaceID string, toolCount int) {
+	var hooks GreetWakeHooks
+	if len(wake) > 0 {
+		hooks = wake[0]
+	}
 	return func(workspaceID string, toolCount int) {
 		// Exclusive per workspace — see firstBootGreetingPending.
 		if _, alreadyRunning := firstBootGreetingPending.LoadOrStore(workspaceID, struct{}{}); alreadyRunning {
@@ -324,13 +362,31 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 			return
 		}
 
+		// Wake-lifecycle owner (PR-D): record the greet wake intent + bump the
+		// desired generation, and source the shared idempotency key. This does
+		// NOT arbitrate greet-once — the has_greeted gate above and the
+		// claimGreetDelivery CAS below own that (see GreetWakeHooks). Decision.Fire
+		// is therefore ignored: a failed first boot leaves has_greeted=false and
+		// must re-greet even though the once-per-box intent already exists (so a
+		// later Decide returns Fire=false with the SAME key). Best-effort — a
+		// DecideWake error never blocks the greeting; we just proceed keyless.
+		// Unwired (nil hook) = pre-PR-D behavior verbatim.
+		var wakeKey string
+		if hooks.Decide != nil {
+			if decision, derr := hooks.Decide(ctx, workspaceID, WakeFirstBootGreet, ""); derr != nil {
+				log.Printf("first-boot greeting: DecideWake failed for %s (%v) — proceeding; greet-once still owned by has_greeted", workspaceID, derr)
+			} else {
+				wakeKey = decision.IdempotencyKey
+			}
+		}
+
 		// Ask the agent to greet in its own voice. logActivity=false — the
 		// writer below is the single chat entry point (no duplicate rows). The
 		// toolCount is stamped into the payload metadata so a busy-queued drain
 		// (or its terminal-failure fallback) keeps the concierge tool-count text.
 		text := ""
 		if runTurn != nil {
-			if payload, err := buildFirstBootGreetPayload(workspaceID, toolCount); err == nil {
+			if payload, err := buildFirstBootGreetPayload(workspaceID, toolCount, wakeKey); err == nil {
 				status, resp, turnErr := runTurn(ctx, workspaceID, payload, "system:first-boot-greeting", false)
 				queued, _ := QueuedA2AResponse(resp)
 				switch {
@@ -377,6 +433,20 @@ func FirstBootGreeter(writer *AgentMessageWriter, runTurn a2aTurnFn) func(worksp
 		if err := deliverFirstBootGreeting(sendCtx, writer, workspaceID, text); err != nil {
 			log.Printf("first-boot greeting: send failed for %s: %v", workspaceID, err)
 			return
+		}
+
+		// Commit-on-delivery for the wake ledger: the greeting reached the user
+		// (or a racing wake already delivered — claimGreetDelivery deduped it),
+		// so flip the wake intent pending → delivered. Best-effort on a detached,
+		// freshly-budgeted ctx (the outer turn ctx may be near/at its deadline
+		// after a slow turn); a failure only leaves the intent to re-settle on a
+		// later convergence, never un-greets. No-op when the loop is unwired.
+		if hooks.Delivered != nil && wakeKey != "" {
+			markCtx, cancelMark := context.WithTimeout(context.WithoutCancel(ctx), greetRollbackTimeout)
+			if err := hooks.Delivered(markCtx, workspaceID, wakeKey); err != nil {
+				log.Printf("first-boot greeting: mark wake delivered failed for %s: %v", workspaceID, err)
+			}
+			cancelMark()
 		}
 		log.Printf("first-boot greeting: delivered to %s (in-character=%v)", workspaceID, runTurn != nil && text != firstBootFallbackText(toolCount))
 	}

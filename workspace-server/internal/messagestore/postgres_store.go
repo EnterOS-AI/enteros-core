@@ -17,11 +17,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"path"
 	"strings"
 	"time"
 
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/a2aresp"
 	"github.com/google/uuid"
+	molcontracts "go.moleculesai.app/sdk/gen/go/molcontracts"
 )
 
 // PostgresMessageStore is the platform-default impl. It queries the
@@ -37,64 +38,32 @@ func NewPostgresMessageStore(db *sql.DB) *PostgresMessageStore {
 	return &PostgresMessageStore{db: db}
 }
 
-// selfSourceTypes is the SSOT set of A2A params.metadata.source_type
-// markers the runtime stamps on messages a workspace sends TO ITSELF as
-// routine wake nudges — NOT human-typed turns. Mirrors the runtime's
-// _ROUTINE_SELF_SOURCE_TYPES (molecule_runtime/a2a_executor.py). The
-// canonical example is the heartbeat delegation-result harvester
-// ("self-harvester" / "self-delegation-result"): on detecting a
-// completed delegation it POSTs "Delegation results are ready. Review
-// them and take appropriate action." back to its own /a2a endpoint to
-// wake the agent (docs/api-protocol/registry-and-heartbeat.md).
-//
-// A request carrying one of these markers is classified Role="system"
-// (SystemKind="notice") and SURFACED as a distinct system message — it
-// must never render as a blue user bubble (the bug) nor be silently
-// dropped. The marker travels WITH the message (params.metadata), so the
-// classification is role-based at the source, not inferred from the text.
-//
-// "self-warmup" is the platform-fired concierge readiness probe
-// (handlers.buildConciergeWarmupBody / conciergeWarmupSourceType). It is a
-// heartbeat internal ("Platform readiness check — no action needed."), never a
-// human turn, so it is classified system/notice here — it used to leak as a
-// blue user bubble because it carried no source_type marker.
-var selfSourceTypes = map[string]bool{
-	"self-cron":              true,
-	"self-harvester":         true,
-	"self-idle":              true,
-	"self-scheduler":         true,
-	"self-goal-nudge":        true,
-	"self-delegation-result": true,
-	"self-warmup":            true,
-	// The platform's post-restart context snapshot (restart_context.go).
-	// Delivered via the a2a queue since 2026-07-19 (durable-enqueue fix),
-	// which routes through the ordinary ingest persist — without this marker
-	// each drained snapshot rendered as a blue user bubble in My Chat.
-	"self-restart-context": true,
-	// The first-boot greeting's internal prompt (first_boot_greeting.go) —
-	// persisted only when a busy-queued greet turn is drained later.
-	"self-first-boot-greet": true,
-	// The runtime's reprovision/lifecycle wake (source_type "self-lifecycle").
-	// A lifecycle turn is a routine self-wake, NOT a human turn — without this
-	// marker it was classified as a genuine user message and rendered as a blue
-	// user bubble (2026-07-25 live bug).
-	"self-lifecycle": true,
-	// The platform stall-watchdog liveness probe (stall_watchdog.go,
-	// buildStallProbeBody). Fired to itself when a workspace is silent-but-busy;
-	// an internal wake, never a human turn.
-	"self-stall": true,
-	// The platform request-nudge sweeper's unhandled-inbox reminder
-	// (request_nudge_sweeper.go, buildNudgeBody). Fired to an idle agent about
-	// its own stale inbox items; an internal wake, never a human turn.
-	"self-nudge": true,
-}
-
 // IsSelfSourceType reports whether a params.metadata.source_type marker
-// denotes an internal self-message. Exported so the A2A ingest/broadcast
-// path (handlers.persistUserMessageAtIngest) classifies live messages by
-// the same SSOT rule the history reader uses.
+// denotes an internal self-message — one a workspace sends TO ITSELF as a
+// routine/internal wake (cron tick, harvester, idle re-poke, lifecycle/warmup/
+// stall/nudge probe) rather than a human-typed turn. A request carrying one of
+// these markers is classified Role="system" (SystemKind="notice") and SURFACED
+// as a distinct system message — it must never render as a blue user bubble
+// (the bug) nor be silently dropped. The marker travels WITH the message
+// (params.metadata), so the classification is role-based at the source, not
+// inferred from the text.
+//
+// SSOT (RFC follow-up #29): the marker set is defined ONCE in the SDK contract
+// (contracts/workspace-comms/self-source-types.schema.json) and codegen'd into
+// molcontracts.SelfSourceTypes / molcontracts.IsSelfSourceType (and the canvas
+// SELF_SOURCE_TYPES) so the two consumers cannot drift. This function delegates
+// to that generated set — do NOT reintroduce a hand-written copy here. NOTE:
+// this CLASSIFICATION set is deliberately BROADER than the runtime's
+// _ROUTINE_SELF_SOURCE_TYPES drop-not-queue governance subset
+// (molecule_runtime/a2a_executor.py); the two must not be unified (several
+// markers here are platform-fired inbound wakes the runtime must deliver, not
+// drop — see the schema description).
+//
+// Exported so the A2A ingest/broadcast path
+// (handlers.persistUserMessageAtIngest) classifies live messages by the same
+// SSOT rule the history reader uses.
 func IsSelfSourceType(sourceType string) bool {
-	return selfSourceTypes[sourceType]
+	return molcontracts.IsSelfSourceType(sourceType)
 }
 
 // RequestSourceType reads the typed source marker the runtime stamps on
@@ -585,7 +554,7 @@ func extractFilesFromUserMessage(body json.RawMessage) []ChatAttachment {
 	if len(env.Params.Message) == 0 {
 		return nil
 	}
-	return extractFilesFromTask(env.Params.Message)
+	return toChatAttachments(a2aresp.Files(env.Params.Message))
 }
 
 // extractChatResponseText collects text from any of the response
@@ -604,259 +573,34 @@ func extractFilesFromUserMessage(body json.RawMessage) []ChatAttachment {
 // details-in-artifacts. The pre-collect first-wins silently
 // truncated 15k-char briefs and dropped artifact details.
 func extractChatResponseText(body json.RawMessage) string {
-	if len(body) == 0 {
-		return ""
+	if t := a2aresp.AllText(body); t != "" {
+		return t
 	}
-	// {"result": "string"}
-	var asString struct {
-		Result string `json:"result"`
-	}
-	if err := json.Unmarshal(body, &asString); err == nil && asString.Result != "" {
-		return asString.Result
-	}
-	// {"result": {object}} — try the structured shapes
+	// Preserve the messagestore-specific {"task":"<text>"} top-level fallback.
 	var asObject struct {
-		Result json.RawMessage `json:"result"`
-		Task   string          `json:"task"`
+		Task string `json:"task"`
 	}
-	if err := json.Unmarshal(body, &asObject); err != nil {
-		return ""
-	}
-	var collected []string
-	if len(asObject.Result) > 0 {
-		var resultObj struct {
-			Parts     []map[string]any  `json:"parts"`
-			Artifacts []json.RawMessage `json:"artifacts"`
-			Status    json.RawMessage   `json:"status"`
-			Message   json.RawMessage   `json:"message"`
-		}
-		if err := json.Unmarshal(asObject.Result, &resultObj); err == nil {
-			if t := joinTextParts(resultObj.Parts); t != "" {
-				collected = append(collected, t)
-			}
-			var rootTexts []string
-			for _, p := range resultObj.Parts {
-				if root, ok := p["root"].(map[string]any); ok {
-					if t, ok := root["text"].(string); ok && t != "" {
-						rootTexts = append(rootTexts, t)
-					}
-				}
-			}
-			if len(rootTexts) > 0 {
-				collected = append(collected, strings.Join(rootTexts, "\n"))
-			}
-			if len(resultObj.Status) > 0 {
-				var status struct {
-					Message struct {
-						Parts []map[string]any `json:"parts"`
-					} `json:"message"`
-				}
-				if err := json.Unmarshal(resultObj.Status, &status); err == nil {
-					if t := joinTextParts(status.Message.Parts); t != "" {
-						collected = append(collected, t)
-					}
-				}
-			}
-			if len(resultObj.Message) > 0 {
-				var msg struct {
-					Parts []map[string]any `json:"parts"`
-				}
-				if err := json.Unmarshal(resultObj.Message, &msg); err == nil {
-					if t := joinTextParts(msg.Parts); t != "" {
-						collected = append(collected, t)
-					}
-				}
-			}
-			for _, raw := range resultObj.Artifacts {
-				var art struct {
-					Parts []map[string]any `json:"parts"`
-				}
-				if err := json.Unmarshal(raw, &art); err == nil {
-					if t := joinTextParts(art.Parts); t != "" {
-						collected = append(collected, t)
-					}
-				}
-			}
-		}
-	}
-	if len(collected) > 0 {
-		return strings.Join(collected, "\n")
-	}
-	if asObject.Task != "" {
+	if err := json.Unmarshal(body, &asObject); err == nil && asObject.Task != "" {
 		return asObject.Task
 	}
 	return ""
 }
 
-func joinTextParts(parts []map[string]any) string {
-	var texts []string
-	for _, p := range parts {
-		kind, hasKind := p["kind"].(string)
-		typ, hasType := p["type"].(string)
-		hasDiscriminator := (hasKind && kind != "") || (hasType && typ != "")
-		isText := true
-		if hasDiscriminator {
-			isText = kind == "text" || typ == "text"
-		}
-		if !isText {
-			continue
-		}
-		if t, ok := p["text"].(string); ok && t != "" {
-			texts = append(texts, t)
-		}
-	}
-	return strings.Join(texts, "\n")
-}
-
 func extractFilesFromResponse(body json.RawMessage) []ChatAttachment {
-	if len(body) == 0 {
-		return nil
-	}
-	var probe struct {
-		Result json.RawMessage `json:"result"`
-	}
-	if err := json.Unmarshal(body, &probe); err != nil {
-		log.Printf("messagestore: unmarshal probe body: %v", err)
-	}
-	feed := body
-	if len(probe.Result) > 0 {
-		trimmed := bytesTrimSpace(probe.Result)
-		if len(trimmed) > 0 && trimmed[0] == '{' {
-			feed = probe.Result
-		}
-	}
-	return extractFilesFromTask(feed)
+	return toChatAttachments(a2aresp.Files(body))
 }
 
-// extractFilesFromTask walks parts[] + artifacts[].parts[] +
-// status.message.parts[] + message.parts[]. Mirrors canvas
-// extractFilesFromTask exactly — same v0 hot path + v1 protobuf
-// flat shape.
-func extractFilesFromTask(taskJSON json.RawMessage) []ChatAttachment {
-	if len(taskJSON) == 0 {
+// toChatAttachments maps the neutral a2aresp.File descriptors to the
+// messagestore ChatAttachment type (identical fields).
+func toChatAttachments(fs []a2aresp.File) []ChatAttachment {
+	if len(fs) == 0 {
 		return nil
 	}
-	var task struct {
-		Parts     []map[string]any  `json:"parts"`
-		Artifacts []json.RawMessage `json:"artifacts"`
-		Status    json.RawMessage   `json:"status"`
-		Message   json.RawMessage   `json:"message"`
-	}
-	if err := json.Unmarshal(taskJSON, &task); err != nil {
-		return nil
-	}
-	var out []ChatAttachment
-	out = appendFilesFromParts(out, task.Parts)
-	for _, raw := range task.Artifacts {
-		var art struct {
-			Parts []map[string]any `json:"parts"`
-		}
-		if err := json.Unmarshal(raw, &art); err == nil {
-			out = appendFilesFromParts(out, art.Parts)
-		}
-	}
-	if len(task.Status) > 0 {
-		var st struct {
-			Message struct {
-				Parts []map[string]any `json:"parts"`
-			} `json:"message"`
-		}
-		if err := json.Unmarshal(task.Status, &st); err == nil {
-			out = appendFilesFromParts(out, st.Message.Parts)
-		}
-	}
-	if len(task.Message) > 0 {
-		var msg struct {
-			Parts []map[string]any `json:"parts"`
-		}
-		if err := json.Unmarshal(task.Message, &msg); err == nil {
-			out = appendFilesFromParts(out, msg.Parts)
-		}
+	out := make([]ChatAttachment, 0, len(fs))
+	for _, f := range fs {
+		out = append(out, ChatAttachment{Name: f.Name, URI: f.URI, MimeType: f.MimeType, Size: f.Size})
 	}
 	return out
-}
-
-func appendFilesFromParts(out []ChatAttachment, parts []map[string]any) []ChatAttachment {
-	for _, raw := range parts {
-		v0 := false
-		if k, ok := raw["kind"].(string); ok && k == "file" {
-			v0 = true
-		}
-		if t, ok := raw["type"].(string); ok && t == "file" {
-			v0 = true
-		}
-		v1URL, _ := raw["url"].(string)
-		if !v0 && v1URL == "" {
-			continue
-		}
-		var att ChatAttachment
-		if v0 {
-			file, _ := raw["file"].(map[string]any)
-			if file == nil {
-				file = raw
-			}
-			uri, _ := file["uri"].(string)
-			if uri == "" {
-				continue
-			}
-			att.URI = uri
-			if name, _ := file["name"].(string); name != "" {
-				att.Name = name
-			} else {
-				att.Name = basename(uri)
-			}
-			if mt, ok := file["mimeType"].(string); ok {
-				att.MimeType = mt
-			}
-			if sz, ok := numericSize(file["size"]); ok {
-				att.Size = &sz
-			}
-		} else {
-			att.URI = v1URL
-			if name, _ := raw["filename"].(string); name != "" {
-				att.Name = name
-			} else {
-				att.Name = basename(v1URL)
-			}
-			if mt, ok := raw["mediaType"].(string); ok {
-				att.MimeType = mt
-			}
-		}
-		out = append(out, att)
-	}
-	return out
-}
-
-func numericSize(v any) (int64, bool) {
-	switch n := v.(type) {
-	case float64:
-		return int64(n), true
-	case int64:
-		return n, true
-	case int:
-		return int64(n), true
-	}
-	return 0, false
-}
-
-func basename(uri string) string {
-	cleaned := strings.TrimPrefix(uri, "workspace:")
-	cleaned = strings.TrimPrefix(cleaned, "https://")
-	cleaned = strings.TrimPrefix(cleaned, "http://")
-	if cleaned == "" {
-		return "file"
-	}
-	return path.Base(cleaned)
-}
-
-func bytesTrimSpace(b json.RawMessage) json.RawMessage {
-	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t' || b[0] == '\n' || b[0] == '\r') {
-		b = b[1:]
-	}
-	for len(b) > 0 && (b[len(b)-1] == ' ' || b[len(b)-1] == '\t' || b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
-		b = b[:len(b)-1]
-	}
-	return b
 }
 
 func newMessageID() string {
