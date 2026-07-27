@@ -22,6 +22,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/a2aresp"
 	"github.com/google/uuid"
+	molcontracts "go.moleculesai.app/sdk/gen/go/molcontracts"
 )
 
 // PostgresMessageStore is the platform-default impl. It queries the
@@ -37,64 +38,32 @@ func NewPostgresMessageStore(db *sql.DB) *PostgresMessageStore {
 	return &PostgresMessageStore{db: db}
 }
 
-// selfSourceTypes is the SSOT set of A2A params.metadata.source_type
-// markers the runtime stamps on messages a workspace sends TO ITSELF as
-// routine wake nudges — NOT human-typed turns. Mirrors the runtime's
-// _ROUTINE_SELF_SOURCE_TYPES (molecule_runtime/a2a_executor.py). The
-// canonical example is the heartbeat delegation-result harvester
-// ("self-harvester" / "self-delegation-result"): on detecting a
-// completed delegation it POSTs "Delegation results are ready. Review
-// them and take appropriate action." back to its own /a2a endpoint to
-// wake the agent (docs/api-protocol/registry-and-heartbeat.md).
-//
-// A request carrying one of these markers is classified Role="system"
-// (SystemKind="notice") and SURFACED as a distinct system message — it
-// must never render as a blue user bubble (the bug) nor be silently
-// dropped. The marker travels WITH the message (params.metadata), so the
-// classification is role-based at the source, not inferred from the text.
-//
-// "self-warmup" is the platform-fired concierge readiness probe
-// (handlers.buildConciergeWarmupBody / conciergeWarmupSourceType). It is a
-// heartbeat internal ("Platform readiness check — no action needed."), never a
-// human turn, so it is classified system/notice here — it used to leak as a
-// blue user bubble because it carried no source_type marker.
-var selfSourceTypes = map[string]bool{
-	"self-cron":              true,
-	"self-harvester":         true,
-	"self-idle":              true,
-	"self-scheduler":         true,
-	"self-goal-nudge":        true,
-	"self-delegation-result": true,
-	"self-warmup":            true,
-	// The platform's post-restart context snapshot (restart_context.go).
-	// Delivered via the a2a queue since 2026-07-19 (durable-enqueue fix),
-	// which routes through the ordinary ingest persist — without this marker
-	// each drained snapshot rendered as a blue user bubble in My Chat.
-	"self-restart-context": true,
-	// The first-boot greeting's internal prompt (first_boot_greeting.go) —
-	// persisted only when a busy-queued greet turn is drained later.
-	"self-first-boot-greet": true,
-	// The runtime's reprovision/lifecycle wake (source_type "self-lifecycle").
-	// A lifecycle turn is a routine self-wake, NOT a human turn — without this
-	// marker it was classified as a genuine user message and rendered as a blue
-	// user bubble (2026-07-25 live bug).
-	"self-lifecycle": true,
-	// The platform stall-watchdog liveness probe (stall_watchdog.go,
-	// buildStallProbeBody). Fired to itself when a workspace is silent-but-busy;
-	// an internal wake, never a human turn.
-	"self-stall": true,
-	// The platform request-nudge sweeper's unhandled-inbox reminder
-	// (request_nudge_sweeper.go, buildNudgeBody). Fired to an idle agent about
-	// its own stale inbox items; an internal wake, never a human turn.
-	"self-nudge": true,
-}
-
 // IsSelfSourceType reports whether a params.metadata.source_type marker
-// denotes an internal self-message. Exported so the A2A ingest/broadcast
-// path (handlers.persistUserMessageAtIngest) classifies live messages by
-// the same SSOT rule the history reader uses.
+// denotes an internal self-message — one a workspace sends TO ITSELF as a
+// routine/internal wake (cron tick, harvester, idle re-poke, lifecycle/warmup/
+// stall/nudge probe) rather than a human-typed turn. A request carrying one of
+// these markers is classified Role="system" (SystemKind="notice") and SURFACED
+// as a distinct system message — it must never render as a blue user bubble
+// (the bug) nor be silently dropped. The marker travels WITH the message
+// (params.metadata), so the classification is role-based at the source, not
+// inferred from the text.
+//
+// SSOT (RFC follow-up #29): the marker set is defined ONCE in the SDK contract
+// (contracts/workspace-comms/self-source-types.schema.json) and codegen'd into
+// molcontracts.SelfSourceTypes / molcontracts.IsSelfSourceType (and the canvas
+// SELF_SOURCE_TYPES) so the two consumers cannot drift. This function delegates
+// to that generated set — do NOT reintroduce a hand-written copy here. NOTE:
+// this CLASSIFICATION set is deliberately BROADER than the runtime's
+// _ROUTINE_SELF_SOURCE_TYPES drop-not-queue governance subset
+// (molecule_runtime/a2a_executor.py); the two must not be unified (several
+// markers here are platform-fired inbound wakes the runtime must deliver, not
+// drop — see the schema description).
+//
+// Exported so the A2A ingest/broadcast path
+// (handlers.persistUserMessageAtIngest) classifies live messages by the same
+// SSOT rule the history reader uses.
 func IsSelfSourceType(sourceType string) bool {
-	return selfSourceTypes[sourceType]
+	return molcontracts.IsSelfSourceType(sourceType)
 }
 
 // RequestSourceType reads the typed source marker the runtime stamps on
