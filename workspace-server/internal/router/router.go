@@ -696,6 +696,16 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.POST("/mcp", mcpRl.Middleware(), mcpH.Call)
 	}
 
+	// Desktop computer-use routes (design decision B): the authenticated seam
+	// the IN-CONTAINER agent desktop tool (a2a_tools_desktop.py, later a native
+	// kind:mcp plugin) calls — the platform layer is a gateway, NOT an MCP tool,
+	// so the agent surface stays plugin-extractable. screenshot = eyes (not
+	// lock-gated, §8); input = hands (gateway is fail-closed on the control
+	// lock -> 409 when a human holds control). wsAuth gates on the workspace
+	// bearer, same as the MCP endpoint.
+	wsAuth.GET("/desktop/screenshot", wh.DesktopScreenshot)
+	wsAuth.POST("/desktop/input", wh.DesktopInput)
+
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
 	// Protected by strict AdminAuth: a missing or invalid bearer is rejected in
 	// every environment, including fresh installs, and datastore errors fail closed.

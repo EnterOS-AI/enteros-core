@@ -61,7 +61,13 @@ type WorkspaceHandler struct {
 	// -> the availability-gate default, so the desktop feature is cleanly
 	// ABSENT (decision 4) rather than broken.
 	sidecarProv provisioner.SidecarProvisioner
-	platformURL string
+	// desktopGateway is the desktop enforcement gateway the desktop HTTP route
+	// proxies to (decision B: the authenticated seam the in-container agent
+	// tool calls; the platform layer is a gateway, NOT an MCP tool, so the agent
+	// surface stays in the runtime and remains plugin-extractable). nil ->
+	// routes report unavailable.
+	desktopGateway desktopGateway
+	platformURL    string
 	configsDir  string // path to workspace-configs-templates/ (for reading templates)
 	cacheDir    string // optional runtime-refreshed template cache; overrides configsDir by template id
 	// envMutators runs registered EnvMutator plugins right before
