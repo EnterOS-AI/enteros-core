@@ -164,6 +164,27 @@ func TestExecActuator_TypeRefusesWhenNoFocus(t *testing.T) {
 	}
 }
 
+func TestExecActuator_DisplayGeometry(t *testing.T) {
+	a := &ExecActuator{
+		run: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return []byte("1280 800\n"), nil
+		},
+	}
+	w, h, err := a.DisplayGeometry(context.Background())
+	if err != nil || w != 1280 || h != 800 {
+		t.Fatalf("DisplayGeometry = (%d,%d,%v), want (1280,800,nil)", w, h, err)
+	}
+
+	// Malformed output is an error (not a silent 0x0 that would pass a bad
+	// geometry check).
+	for _, bad := range []string{"", "1280", "1280 800 96", "wide tall"} {
+		a.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) { return []byte(bad), nil }
+		if _, _, err := a.DisplayGeometry(context.Background()); err == nil {
+			t.Errorf("DisplayGeometry(%q) = nil error, want failure", bad)
+		}
+	}
+}
+
 func TestExecActuator_Screenshot_ReadsFramebufferFile(t *testing.T) {
 	a, got := newRecordingActuator(t)
 	png, err := a.Screenshot(context.Background())

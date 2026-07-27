@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -38,6 +39,28 @@ func NewExecActuator() *ExecActuator {
 		sleep:        time.Sleep,
 		moveSettleMs: 40, // §9: let hover/focus handlers fire between move and click
 	}
+}
+
+// DisplayGeometry reports the actual pixel size of the X display via
+// `xdotool getdisplaygeometry` (output "WIDTH HEIGHT"). Used by the boot-time
+// geometry assert: if the real display is not the pinned resolution, every
+// coordinate the agent sends is off — the exact "wrong pixel" failure the fixed
+// coordinate contract (§3) exists to prevent — so a mismatch must surface.
+func (a *ExecActuator) DisplayGeometry(ctx context.Context) (width, height int, err error) {
+	out, err := a.run(ctx, "xdotool", "getdisplaygeometry")
+	if err != nil {
+		return 0, 0, fmt.Errorf("xdotool getdisplaygeometry: %w", err)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) != 2 {
+		return 0, 0, fmt.Errorf("unexpected getdisplaygeometry output %q", string(out))
+	}
+	w, werr := strconv.Atoi(fields[0])
+	h, herr := strconv.Atoi(fields[1])
+	if werr != nil || herr != nil || w <= 0 || h <= 0 {
+		return 0, 0, fmt.Errorf("non-numeric getdisplaygeometry output %q", string(out))
+	}
+	return w, h, nil
 }
 
 func (a *ExecActuator) Screenshot(ctx context.Context) ([]byte, error) {

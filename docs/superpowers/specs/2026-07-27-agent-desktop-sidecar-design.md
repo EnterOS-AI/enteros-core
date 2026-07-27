@@ -282,7 +282,7 @@ Not a one-var swap. v2 edits: (a) re-type `displayForward`/`realDisplayForward` 
 - [ ] Reconcile with `a2a_tools_desktop.py` (replace vs re-point decided)
 - [ ] Vision-capable-adapter gating in `tools/list`
 - [ ] Attachment-URI screenshot result; per-task cost budget documented
-- [ ] Chrome kiosk window pinning + geometry assert
+- [x] Chrome kiosk window pinning (entrypoint `--kiosk --window-size 1280,800`) + boot-time **geometry assert** (`DisplayGeometry` via `xdotool getdisplaygeometry` vs the pinned contract; logs loudly on mismatch — the wrong-pixel early-warning; verified `1280 800` in-container)
 - [x] Input hardening — settle/sync (move→settle→click) + focus-verify (getactivewindow before type/key) + type `--delay` + **IME clipboard-paste fallback** (long/non-ASCII text staged via xclip → Ctrl+V; xclip added to the image; clipboard round-trip **verified with non-ASCII in the hardened container**); tests cover all branches
 
 **Data model / proxy**
