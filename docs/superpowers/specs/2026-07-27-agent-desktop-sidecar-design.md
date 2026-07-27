@@ -291,8 +291,8 @@ Not a one-var swap. v2 edits: (a) re-type `displayForward`/`realDisplayForward` 
 - [x] SSRF hostname allowlist for the sidecar — `ValidateSidecarTarget` pins target to `wsdesk-<hex-id>:<6070|6080>`; wired into gateway + display proxy; 3 tests
 
 **Tests**
-- [ ] Unit tests per §15.1
-- [ ] Local-Docker display e2e (P2 gate) + computer-use loop e2e + takeover e2e
+- [x] Unit tests per §15.1 (desktopcontrol, desktopgateway, provisioner, lifecycle store, SSRF, arbitration)
+- [~] Local-Docker display e2e (P2 gate) — `TestDesktopSidecar_E2E` (guarded by `DESKTOP_E2E_IMAGE`) runs the real image under prod hardening + seccomp and asserts healthz/auth/PNG-screenshot/input-bounds; every assertion independently verified against the running image on 2026-07-27 (compiles+vets; execution blocked ONLY by this Windows host's WDAC policy — runs on Linux CI). Computer-use-loop + takeover e2e ◻︎ (runtime-repo)
 
 **CI (per-PR)**
 - [ ] Codegen drift gate green
