@@ -321,3 +321,29 @@ Not a one-var swap. v2 edits: (a) re-type `displayForward`/`realDisplayForward` 
 2. **Secrets-at-rest encryption deferred** — honest unencrypted posture + follow-up RFC (§6.4).
 3. **Re-point** `a2a_tools_desktop.py` via the 3-layer split; SSOT contract is the seam (§9).
 4. **No per-action human confirmation** — capability-is-authorization + tight credential scoping + AI escalation chain + audit (§6.3).
+
+## 24. Implementation status (2026-07-27, branch `feat/agent-desktop-sidecar`)
+
+Honest ledger. "✅" = code committed **and** verified here (`go test`/`vet`/`build` green; pre-existing Windows symlink failures filtered out). "◻︎" = pending; the note says what it's blocked on.
+
+**Done & verified (11 commits, ~40 tests):**
+- ✅ `SidecarProvisioner` interface + availability-gate backend
+- ✅ Local (Docker) backend — idempotent start, graceful profile-preserving stop, memory/oom caps, isolated-net attach, restart `no`, wipe
+- ✅ Collision-safe `wsdesk-` naming + role labels; agent-activity idle decision
+- ✅ `compute.display.idle_timeout_seconds` + validation; `workspace_desktop_lifecycle` migration
+- ✅ Desktop control server + exec actuator + `cmd/desktop-control-server`
+- ✅ `Dockerfile.desktop-sidecar` + entrypoint (image *artifact*; build/publish is a pipeline step)
+- ✅ Computer-use gateway — fail-closed lock, scale-from-zero, activity, per-sidecar auth
+- ✅ `WorkspaceHandler` wiring — `sidecarProv` + `…Auto` dispatchers (routing pins green)
+
+**Pending — needs a running stack to verify *properly* (integration into DB/service-dependent files):**
+- ◻︎ `computer` MCP-tool registration in `mcp.go` (text-only → attachment-URI result) + vision-adapter gating
+- ◻︎ Display-proxy re-home (`displayForward` re-type) + `GET /display` availability gate
+- ◻︎ Control-lock view/control split + human-preempts-agent + `LISTEN/NOTIFY` resume
+- ◻︎ Lifecycle store + idle sweeper (reusing `DesktopIsIdle`) + `wsdesk-` reap path + SSRF allowlist
+
+**Pending — cross-repo (own toolchains):** ◻︎ SDK contract + codegen + `MatchesSSOT` · ◻︎ runtime tool re-point · ◻︎ CP backend.
+
+**Pending — infra/operator:** ◻︎ per-workspace network · egress proxy · `userns-remap` · Redis auth.
+
+**Pending — terminal human/infra gates (not autonomous):** ◻︎ image build + registry publish · ◻︎ CI / local-Docker e2e in dind · ◻︎ **security review** · ◻︎ **human-authorized production deploy**.
