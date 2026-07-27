@@ -38,6 +38,7 @@ import (
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provlog"
 )
 
@@ -51,6 +52,40 @@ import (
 // deployments where no backend is available.
 func (h *WorkspaceHandler) HasProvisioner() bool {
 	return h.cpProv != nil || h.provisioner != nil
+}
+
+// desktopProvisioner returns the wired desktop-sidecar backend, or the
+// availability-gate backend when none is wired — so an unwired deployment sees
+// the desktop feature as ABSENT (DesktopRunning -> false,nil), never broken
+// (design §5, decision 4). This is the desktop analog of HasProvisioner /
+// the …Auto dispatch pattern.
+func (h *WorkspaceHandler) desktopProvisioner() provisioner.SidecarProvisioner {
+	if h.sidecarProv != nil {
+		return h.sidecarProv
+	}
+	return provisioner.NewUnavailableSidecarProvisioner()
+}
+
+// StartDesktopAuto scales the workspace's desktop sidecar from zero (idempotent)
+// and returns its reachable handle, routed through the wired backend.
+func (h *WorkspaceHandler) StartDesktopAuto(ctx context.Context, workspaceID string) (provisioner.DesktopHandle, error) {
+	return h.desktopProvisioner().StartDesktop(ctx, provisioner.WorkspaceConfig{WorkspaceID: workspaceID})
+}
+
+// StopDesktopAuto gracefully tears the desktop sidecar down (profile preserved).
+func (h *WorkspaceHandler) StopDesktopAuto(ctx context.Context, workspaceID string) error {
+	return h.desktopProvisioner().StopDesktop(ctx, workspaceID)
+}
+
+// DesktopRunningAuto reports whether the desktop sidecar is up.
+func (h *WorkspaceHandler) DesktopRunningAuto(ctx context.Context, workspaceID string) (bool, error) {
+	return h.desktopProvisioner().DesktopRunning(ctx, workspaceID)
+}
+
+// WipeDesktopProfileAuto destroys the persistent profile volume (revoke/wipe),
+// and is part of the permanent-delete-with-erase path (design §11).
+func (h *WorkspaceHandler) WipeDesktopProfileAuto(ctx context.Context, workspaceID string) error {
+	return h.desktopProvisioner().WipeProfile(ctx, workspaceID)
 }
 
 // IsSaaS reports whether the control-plane provisioner is wired. Hosted

@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Desktop Sidecar — Design Review (v2)</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  :root{
+    --bg:#fff; --fg:#1a1c20; --muted:#5b6472; --line:#e3e7ec; --card:#f7f9fb;
+    --accent:#3457d5; --accentbg:#eaf0ff;
+    --new:#1a7f47; --newbg:#e7f6ee; --reuse:#2a6fb0; --reusebg:#e8f2fb;
+    --cross:#9a6a12; --crossbg:#fbf1de; --risk:#b3261e; --riskbg:#fbe9e7;
+    --fix:#6d3bd1; --fixbg:#f0e9fc; --code:#0b3d91;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#14171c; --fg:#e6e9ee; --muted:#9aa4b2; --line:#2a2f37; --card:#1b1f26;
+      --accent:#7d9bff; --accentbg:#1d2740;
+      --new:#5cd08a; --newbg:#13291d; --reuse:#7fbdf0; --reusebg:#122536;
+      --cross:#e2b86a; --crossbg:#2e2410; --risk:#f2938b; --riskbg:#2e1614;
+      --fix:#c3a6f5; --fixbg:#241733; --code:#9db8ff;
+    }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:980px;margin:0 auto;padding:0 20px 120px}
+  header.hero{border-bottom:1px solid var(--line);padding:34px 0 22px;margin-bottom:8px}
+  header.hero h1{margin:0 0 6px;font-size:30px;letter-spacing:-.4px}
+  .sub{color:var(--muted);font-size:15px}
+  .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;vertical-align:middle}
+  .pill.v2{background:var(--fixbg);color:var(--fix)}
+  nav.toc{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);padding:10px 0;margin-bottom:26px;display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13.5px}
+  nav.toc a{color:var(--muted);text-decoration:none}
+  nav.toc a:hover{color:var(--accent)}
+  h2{margin:40px 0 12px;font-size:22px;letter-spacing:-.2px}
+  h2 .n{color:var(--muted);font-weight:600;margin-right:8px}
+  h3{margin:22px 0 8px;font-size:16.5px}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13.5px;color:var(--code);background:var(--card);padding:1px 5px;border-radius:5px}
+  .badge{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.3px;padding:2px 8px;border-radius:6px;text-transform:uppercase}
+  .b-new{background:var(--newbg);color:var(--new)} .b-reuse{background:var(--reusebg);color:var(--reuse)}
+  .b-cross{background:var(--crossbg);color:var(--cross)} .b-risk{background:var(--riskbg);color:var(--risk)}
+  .b-fix{background:var(--fixbg);color:var(--fix)}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--card);font-weight:600}
+  .diagram{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin:16px 0;overflow-x:auto}
+  .diagram .cap{font-size:13px;color:var(--muted);margin:0 0 6px}
+  .callout{border:1px solid var(--line);border-left-width:4px;border-radius:10px;padding:12px 16px;margin:14px 0;background:var(--card)}
+  .callout.risk{border-left-color:var(--risk);background:var(--riskbg)} .callout.fix{border-left-color:var(--fix);background:var(--fixbg)}
+  .callout.q{border-left-color:var(--accent);background:var(--accentbg)} .callout.sec{border-left-color:var(--risk)}
+  .callout h4{margin:0 0 6px;font-size:15px}
+  ul{margin:8px 0;padding-left:22px} li{margin:4px 0}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+  .decision{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .decision .k{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+  .decision .v{font-weight:600;margin:2px 0 4px}
+  .phase{display:flex;gap:12px;align-items:flex-start;padding:9px 0;border-top:1px dashed var(--line)}
+  .phase:first-child{border-top:none}
+  .phase .id{font-weight:700;color:var(--accent);min-width:44px}
+  .chk{columns:2;column-gap:28px} .chk h3{break-after:avoid} .chk ul{margin-top:2px}
+  @media(max-width:640px){.chk{columns:1}}
+  .fileref{color:var(--muted);font-size:12.5px}
+  footer{margin-top:60px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+  .mermaid{display:flex;justify-content:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>🖥️ Agent Desktop Sidecar <span class="pill v2">v2 · review-hardened</span></h1>
+  <div class="sub">Design review · 2026-07-27 · Enter OS (Docker now → k8s soon)</div>
+  <div class="sub" style="margin-top:8px">Full Linux desktop per workspace the <em>agent</em> drives — rebuilt after a five-lens adversarial review corrected several v1 assumptions.</div>
+</header>
+
+<section id="status">
+  <h2><span class="n">0</span>Implementation status <span class="pill v2">verified on real Docker 29.5.3 · 2026-07-27</span></h2>
+  <p>A security-review subagent returned <strong>BLOCK-for-production</strong> with 5 ranked blockers; the branch's restraint (backend unwired until isolation is real) was credited correct. A real Docker stack was then stood up to verify and to close everything code-fixable. The feature is <strong>code-complete and verified</strong>, gated OFF behind <code>MOLECULE_DESKTOP_ENABLED</code> + a <code>MOLECULE_DESKTOP_EGRESS_CONFIRMED</code> interlock so it cannot ship the exposure by misconfiguration.</p>
+  <table>
+    <tr><th>Area</th><th>State</th></tr>
+    <tr><td>Chromium sandbox under hardening (B2+B3)</td><td><span class="badge b-fix">verified</span> root-caused "no usable sandbox" → shipped Chromium-tuned seccomp profile; renders sandboxed under <code>--cap-drop ALL</code> + <code>no-new-privileges</code>, no <code>--no-sandbox</code></td></tr>
+    <tr><td>Credential-volume reap on delete (B4)</td><td><span class="badge b-fix">done</span> <code>StopDesktop</code>+<code>WipeProfile</code> in CascadeDelete</td></tr>
+    <tr><td>Egress-deny RFC-1918 + metadata (B1)</td><td><span class="badge b-fix">verified fix</span> host-published-port + metadata blocked, internet preserved — shipped as firewall script + k8s NetworkPolicy + runbook + interlock</td></tr>
+    <tr><td>Control-server auth/bounds · gateway arbitration · SSRF allowlist</td><td><span class="badge b-fix">verified</span> 401/200/204/400 e2e; <code>ValidateSidecarTarget</code> pins targets</td></tr>
+    <tr><td>Human-preempts-agent takeover</td><td><span class="badge b-fix">verified vs PG16</span> user preempts agent lock, no admin token; can't steal another user's</td></tr>
+    <tr><td>SDK <code>computer-use</code> codegen + <code>MatchesSSOT</code></td><td><span class="badge b-fix">proven</span> generated + value-pin passes end-to-end (held pending SDK module publish)</td></tr>
+    <tr><td>Egress apply on live host · Redis pw · userns-remap</td><td><span class="badge b-risk">operator gate</span> verified artifacts ready; must be applied on the live cluster</td></tr>
+    <tr><td>SDK branch merge · image publish · production deploy</td><td><span class="badge b-risk">human gate</span> outward / hard-to-reverse — require authorization</td></tr>
+  </table>
+</section>
+
+<nav class="toc">
+  <a href="#status">Status</a>
+  <a href="#changed">What the review changed</a>
+  <a href="#decisions">Decisions</a>
+  <a href="#ssot">SSOT + abstraction</a>
+  <a href="#arch">Architecture</a>
+  <a href="#security">Security-first</a>
+  <a href="#arb">Arbitration</a>
+  <a href="#lifecycle">Lifecycle</a>
+  <a href="#seq">Sequencing</a>
+  <a href="#phases">Phases</a>
+  <a href="#checklist">Checklist</a>
+  <a href="#open">Open decisions</a>
+</nav>
+
+<section id="changed">
+  <h2><span class="n">1</span>What the review changed (v1 → v2)</h2>
+  <p>Five adversarial reviewers verified v1 against the real code. Several load-bearing "reuse existing plumbing" claims were false. These are the corrections baked into v2:</p>
+  <table>
+    <tr><th>v1 claim</th><th>Reality</th><th>v2 fix</th></tr>
+    <tr><td>Control-lock already supports agent+human</td><td>Acquire can't preempt; noVNC token is bound to the lock holder → human can't take over <em>or even watch</em></td><td><span class="badge b-fix">split view from control</span></td></tr>
+    <tr><td>Display re-home is "reuse"</td><td>Local provisioner never reads <code>cfg.Display</code>; proxy is EC2-only → self-host display is <strong>greenfield</strong></td><td><span class="badge b-fix">greenfield + new local e2e</span></td></tr>
+    <tr><td>"Which model tier"</td><td>Runtime is multi-vendor incl. <strong>text-only</strong> adapters; native computer-use used nowhere; a desktop impl already exists (<code>a2a_tools_desktop.py</code>)</td><td><span class="badge b-fix">gate on vision adapter + reconcile</span></td></tr>
+    <tr><td>Isolated by default; blast radius stops at internet; encrypted at rest</td><td>Flat network, privileged tenants, passwordless Redis, <strong>no volume encryption exists</strong></td><td><span class="badge b-fix">per-workspace isolation = prerequisite</span></td></tr>
+    <tr><td>Sweeper mis-parse (risk #1)</td><td>Hex-guard blocks mis-reap; real bug is the <strong>credential volume can never be reaped → leaks forever</strong></td><td><span class="badge b-fix">real reap path + <code>wsdesk-</code> naming</span></td></tr>
+    <tr><td>Base64 image result (recommended)</td><td>Mutates the shared <code>dispatch</code> contract used by every tool</td><td><span class="badge b-fix">additive attachment-URI</span></td></tr>
+    <tr><td>Idle = VNC / last-input</td><td>Agent opens zero VNC connections → v1 signal reaps a working desktop</td><td><span class="badge b-fix">agent-activity lease</span></td></tr>
+    <tr><td>Force-remove teardown; restart no/on-failure</td><td>SIGKILL corrupts the Chrome profile; on-failure resurrects on SIGTERM</td><td><span class="badge b-fix">graceful stop + restart <code>no</code></span></td></tr>
+  </table>
+</section>
+
+<section id="decisions">
+  <h2><span class="n">2</span>Locked decisions</h2>
+  <div class="grid">
+    <div class="decision"><div class="k">1 · Security</div><div class="v">Security first — per-workspace isolation is a prerequisite</div></div>
+    <div class="decision"><div class="k">2 · Reuse</div><div class="v">Reconcile with existing <code>a2a_tools_desktop.py</code></div></div>
+    <div class="decision"><div class="k">3 · Structure</div><div class="v">Core impl behind an SDK-SSOT contract; plugin extraction = deferred RFC</div></div>
+    <div class="decision"><div class="k">4 · Sequencing</div><div class="v">Backend-neutral; Local/Docker first; CP = per-tier availability gate</div></div>
+  </div>
+  <p class="fileref">All four review decisions now resolved (see §Resolved): co-located desktop · encryption deferred · re-point the existing tool via a 3-layer split · capability-is-authorization + AI escalation (no per-action human gates).</p>
+</section>
+
+<section id="ssot">
+  <h2><span class="n">3</span>SSOT contract + abstraction</h2>
+  <div class="callout">
+    <h4>The contract IS the abstraction seam</h4>
+    Author <code>contracts/tool/computer-use.contract.json</code> in the SDK → codegen <code>molcontracts.ComputerUseContract</code> → workspace-server <strong>consumes + value-pins</strong> it (precedent: <code>mcp_plugin_delivery_contract.go</code> · <code>MatchesSSOT</code>). Zero new codegen machinery — rides the existing drift-gate + module-bump rails. It pins the coordinate geometry, action enum, control-server protocol, and the screenshot result shape so every consumer agrees. Extracting to a plugin later is a refactor <em>behind</em> this contract.
+  </div>
+  <div class="callout">
+    <h4>Backend-neutral <code>SidecarProvisioner</code></h4>
+    One interface, three backends behind the existing <code>…Auto</code> dispatcher: <span class="badge b-new">Local (Docker) — ships first</span> <span class="badge b-cross">CP (cloud) — deferred, returns "unavailable"</span> <span class="badge b-cross">k8s — at migration</span>. A missing backend is a clean <strong>per-tier availability gate</strong> (feature absent, nothing broken), not a build break. Self-host is fully functional standalone.
+  </div>
+</section>
+
+<section id="arch">
+  <h2><span class="n">4</span>Architecture</h2>
+  <div class="diagram">
+    <p class="cap">Topology — one workspace</p>
+    <pre class="mermaid">
+flowchart LR
+  human["Human browser"]
+  agent["Agent (vision-capable adapter only)"]
+  subgraph WS["Workspace (own per-workspace network)"]
+    direction TB
+    tenant["TENANT (Go + canvas)"]
+    tool["computer tool<br/>SSOT-contract-defined"]
+    proxy["DisplaySession proxy<br/>+ VIEW token (not lock-bound)"]
+    lock["control-lock<br/>governs /input only"]
+    sidecar["DESKTOP wsdesk-id<br/>Xorg + Chrome kiosk<br/>x11vnc :6080 + control srv (authed)"]
+    vol[("profile volume<br/>reaped on delete")]
+  end
+  egress["egress proxy<br/>domain allowlist"]
+  human -->|"view (always allowed)"| proxy
+  agent -->|"tool call"| tool
+  tool -->|"screenshot / input (authed)"| sidecar
+  tool -.->|"check-and-act"| lock
+  proxy --> sidecar
+  sidecar -->|"internet only"| egress
+  sidecar --- vol
+  classDef new fill:#e7f6ee,stroke:#1a7f47,color:#0f3d24;
+  class tool,sidecar new;
+    </pre>
+  </div>
+  <p class="fileref">Backend infra (Postgres / Redis-with-password / LiteLLM) sits on a separate backend-only network the sidecar can never reach.</p>
+</section>
+
+<section id="security">
+  <h2><span class="n">5</span>Security-first (the prerequisite)</h2>
+  <div class="callout sec">
+    <h4>Per-workspace network — mandatory before ship</h4>
+    Each workspace + its desktop on a dedicated network; backend infra (Postgres/Redis/MinIO/LiteLLM) on a backend-only net; sidecar internet egress through a domain-allowlist proxy. <strong>Set a Redis password now.</strong> Today everything shares one flat <code>molecule-core-net</code> with passwordless Redis — a compromised browser is a cross-tenant pivot.
+  </div>
+  <div class="callout sec">
+    <h4>Privileged-tenant reality</h4>
+    Tenants are T3/T4 (host-root capable) by design, so the sidecar being non-root isn't isolation alone. Enable daemon <code>userns-remap</code> (also fixes cross-tenant uid collisions); cap-drop + seccomp + <code>no-new-privileges</code> on the sidecar, reconciled with Chrome's sandbox (no <code>--no-sandbox</code>).
+  </div>
+  <div class="callout sec">
+    <h4>Governance — capability <em>is</em> authorization + AI escalation (decision 4)</h4>
+    <strong>No per-action human confirmation.</strong> The boundary is what the agent is provisioned to reach: if it isn't allowed, it never gets the credential — so <strong>credential scoping is the primary control</strong> (each task gets only the logins it needs). Domain allowlist per task; treat pages as untrusted. Serious/ambiguous matters <strong>escalate agent → team-lead → platform agent → user</strong>, reusing the existing <code>parent_id</code> hierarchy + A2A messaging + <code>send_message_to_user</code>. Full navigation/input audit + real-time kill.
+  </div>
+  <div class="callout sec">
+    <h4>Secrets at rest — deferred (decision 2)</h4>
+    No volume encryption exists in the codebase; we do <strong>not</strong> claim it. The profile volume ships unencrypted at rest for now (honest posture to operators); encryption is a tracked follow-up RFC — <strong>revisit before any regulated-data deployment</strong>.
+  </div>
+</section>
+
+<section id="arb">
+  <h2><span class="n">6</span>Arbitration — split view from control</h2>
+  <div class="diagram">
+    <p class="cap">View is always allowed; the lock governs /input only</p>
+    <pre class="mermaid">
+stateDiagram-v2
+  [*] --> AgentControl
+  AgentControl --> HumanControl: human PREEMPTS (no admin token)
+  HumanControl --> AgentControl: release / lease expires -> NOTIFY resume
+  note right of AgentControl
+    agent /input honored (fail-closed if no lock)
+    human can always VIEW (token bound to workspace)
+  end note
+  note right of HumanControl
+    agent parked via desktop_wait_for_control (long-poll)
+    woken by LISTEN/NOTIFY, not busy-loop
+  end note
+    </pre>
+  </div>
+</section>
+
+<section id="lifecycle">
+  <h2><span class="n">7</span>Lifecycle fixes</h2>
+  <ul>
+    <li><strong>Idle = agent control-server activity</strong> + a computer-use lease; re-check under the lifecycle mutex before teardown (the agent opens zero VNC connections).</li>
+    <li><strong>Non-blocking cold start</strong>; <strong>pre-build the sidecar image at tenant-provision</strong> so a wake is create-only, never a 12-min local build.</li>
+    <li><strong>Memory/oom caps + per-node admission</strong>; sidecar <code>oom_score_adj</code> above the tenant so pressure sheds the desktop, never the agent.</li>
+    <li><strong>Graceful <code>ContainerStop</code></strong> (SIGTERM + flush) — never force-remove (corrupts the profile). Restart policy <code>no</code>; recover crashes in the platform (<code>on-failure</code> banned).</li>
+    <li><strong>Credential-volume reap</strong> in the sweeper <em>and</em> inline delete; <code>wsdesk-&lt;id&gt;</code> naming so it can't be mis-parsed.</li>
+  </ul>
+</section>
+
+<section id="seq">
+  <h2><span class="n">8</span>Sequencing — why "self-host first"</h2>
+  <p>Not feature coupling — <strong>ownership</strong>. Local/Docker: workspace-server launches the container itself (all code here). Cloud: the control plane launches it, and <strong>has no scale-to-zero primitive today</strong> — net-new work in a separate repo. So the backend we own ships now; the cloud backend is a clean availability gate that lands when CP wires its half. On k8s without the backend, the desktop is <em>absent on that tier</em> (not slow) — nothing else is affected.</p>
+</section>
+
+<section id="phases">
+  <h2><span class="n">9</span>Phases</h2>
+  <div class="phase"><div class="id">P0</div><div>SDK contract + sidecar image/control server + <strong>per-workspace network + Redis auth + egress</strong> + uid spike</div></div>
+  <div class="phase"><div class="id">P1</div><div><code>SidecarProvisioner</code> Local(Docker) + dispatchers + <code>wsdesk-</code> naming + <strong>real reap path</strong></div></div>
+  <div class="phase"><div class="id">P1.5</div><div><strong>Local-Docker display e2e harness</strong> (the missing guardrail; gates P2)</div></div>
+  <div class="phase"><div class="id">P2</div><div>Display re-home + <strong>view/control split</strong> + preemption/handoff</div></div>
+  <div class="phase"><div class="id">P3</div><div><code>computer</code> tool (reconciled) + attachment-URI result + <strong>adapter gating</strong> + input hardening</div></div>
+  <div class="phase"><div class="id">P4</div><div>Lifecycle: agent-activity idle + pre-build + caps + graceful teardown + mutex</div></div>
+  <div class="phase"><div class="id">P5</div><div>Governance: domain allowlist + sensitive-action confirmation + audit + secrets-at-rest decision</div></div>
+  <div class="phase"><div class="id">P6</div><div><span class="badge b-cross">deferred</span> CP/k8s backend + scale-to-zero primitive (availability gate)</div></div>
+</section>
+
+<section id="checklist">
+  <h2><span class="n">10</span>Full checklist</h2>
+  <div class="chk">
+    <h3>SSOT</h3><ul><li>contract authored + generated + <code>go.mod</code> bump</li><li><code>MatchesSSOT</code> value-pin test</li></ul>
+    <h3>Abstraction</h3><ul><li><code>SidecarProvisioner</code> iface + Local impl</li><li>CP returns unavailable; per-tier gate</li><li>plugin-extraction seam</li></ul>
+    <h3>Security</h3><ul><li>per-workspace + backend-only nets</li><li>Redis password; egress allowlist</li><li>userns-remap; sidecar seccomp/caps</li><li>Chrome sandbox on; inbound auth</li><li>sensitive-action policy + audit</li><li>secrets-at-rest decision</li></ul>
+    <h3>Arbitration</h3><ul><li>viewer token not lock-bound</li><li>human preempts; <code>/input</code> fail-closed</li><li>NOTIFY resume + wait tool</li></ul>
+    <h3>Lifecycle</h3><ul><li>agent-activity lease + mutex re-check</li><li>pre-built image; caps + admission</li><li>graceful stop; restart <code>no</code></li></ul>
+    <h3>Compute/tool</h3><ul><li>reconcile <code>a2a_tools_desktop.py</code></li><li>vision-adapter gating</li><li>attachment-URI result; cost budget</li><li>Chrome kiosk pin; input hardening</li></ul>
+    <h3>Data/proxy</h3><ul><li><code>compute</code> jsonb + side table migrations</li><li><code>displayForward</code> re-typed; gate updated</li><li>SSRF allowlist for sidecar</li></ul>
+    <h3>Tests</h3><ul><li>unit per §15.1</li><li>local display e2e + loop e2e + takeover e2e</li></ul>
+    <h3>CI (per-PR)</h3><ul><li>codegen drift gate</li><li>go test/vet/golangci-lint/staticcheck</li><li>local e2e in dind; migration up/down</li></ul>
+    <h3>Docs</h3><ul><li>spec + this page refreshed</li><li>operator + runtime + API docs</li></ul>
+    <h3>Cleanup</h3><ul><li>duplicate desktop surface retired</li><li><code>instance_id</code>-readiness removed</li><li>v1 false claims purged; EC2 e2e re-scoped</li></ul>
+  </div>
+</section>
+
+<section id="open">
+  <h2><span class="n">11</span>Resolved decisions</h2>
+  <div class="callout fix"><h4>1 · Co-located ✓</h4>Pod (k8s) / VM (cloud) / lifecycle-coupled sibling (self-host). Self-host gets true container-level scale-to-zero; cloud is process-level until CP adds independent scheduling.</div>
+  <div class="callout fix"><h4>2 · Encryption deferred ✓</h4>Honest unencrypted posture now; tracked follow-up RFC; revisit before regulated data.</div>
+  <div class="callout fix"><h4>3 · Re-point via 3-layer split ✓</h4>Actuator (sidecar control server) · enforcement gateway (platform-Go) · agent tool (re-pointed <code>a2a_tools_desktop.py</code>, types generated from the SSOT contract). One surface, plugin-extractable.</div>
+  <div class="callout fix"><h4>4 · Capability = authorization ✓</h4>No human gates; tight credential scoping + AI escalation chain + audit.</div>
+</section>
+
+<footer>
+  Spec (SSOT): <code>docs/superpowers/specs/2026-07-27-agent-desktop-sidecar-design.md</code> · Plugin RFC: <code>…-plugin-extraction-rfc-followup.md</code> · Not committed (on <code>main</code>). Diagrams via mermaid CDN.
+</footer>
+
+</div>
+<script>
+  const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({ startOnLoad:true, theme: dark?'dark':'default', securityLevel:'loose', flowchart:{ htmlLabels:true, curve:'basis' } });
+</script>
+</body>
+</html>
