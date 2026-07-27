@@ -1214,6 +1214,59 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		}
 	}
 
+	// Per-install plugin settings (RFC plugin-config). A template's `plugins:`
+	// entries may carry `config:`; render each one to
+	// plugin-settings/<install-name>.json in the DELIVERED bundle so the runtime
+	// resolves it over the plugin's declared defaults
+	// (molecule_runtime/plugin_settings.py, runtime#357).
+	//
+	// MUST run BEFORE provisionWorkspaceAuto — that dispatch captures configFiles
+	// for the provision goroutine, exactly like the schedules render above.
+	//
+	// Layers 2-5 only. Layer 1 (contributes.configuration.*.default) is NOT
+	// rendered here and cannot be: it lives in the plugin's manifest, which core
+	// does not hold at provision time because plugins install post-online via the
+	// reconcile — strictly AFTER this file ships. The runtime supplies it.
+	//
+	// Byte-identical when no template plugin declares `config:`:
+	// renderPluginSettingsFiles returns nil and configFiles is left untouched
+	// (mergePluginSettingsIntoConfigFiles does not allocate for an empty set).
+	//
+	// Non-fatal throughout — a broken plugins block must never block a create.
+	if templatePath != "" {
+		if baseCfg, readErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); readErr == nil {
+			if rendered, rErr := renderPluginSettingsFiles(baseCfg, payload.Name); rErr != nil {
+				log.Printf("Create %s: rendering plugin settings: %v (continuing)", id, rErr)
+			} else if updated, n := mergePluginSettingsIntoConfigFiles(configFiles, rendered); n > 0 {
+				configFiles = updated
+				log.Printf("Create %s: delivered plugin settings for %d plugin(s)", id, n)
+			}
+		}
+	}
+
+	// SaaS leg: on a fresh tenant the real template config arrives via the Gitea
+	// asset channel, not the local templatePath (which may be empty or fall back
+	// to <runtime>-default and miss the real template's `plugins:` entirely).
+	// Render from the SAME fetched bytes the declared-plugin seeding below uses,
+	// so settings and declarations cannot disagree about which plugins exist.
+	//
+	// On key collision the FETCHED render wins (mergePluginSettingsIntoConfigFiles
+	// overwrites), which is correct: on SaaS the fetched bytes ARE the real
+	// template, while templatePath may be a <runtime>-default fallback that never
+	// declared these plugins at all.
+	if h.giteaTemplateFetcher != nil && payload.Template != "" {
+		if identity := templateIdentityForTemplateOrRuntime(payload.Template, payload.Runtime); identity != "" {
+			if fetched, ferr := h.giteaTemplateFetcher.Load(ctx, identity); ferr != nil {
+				log.Printf("Create %s: fetch template assets for plugin settings: %v (continuing)", id, ferr)
+			} else if rendered, rErr := renderPluginSettingsFiles(fetched["config.yaml"], payload.Name); rErr != nil {
+				log.Printf("Create %s: rendering fetched plugin settings: %v (continuing)", id, rErr)
+			} else if updated, n := mergePluginSettingsIntoConfigFiles(configFiles, rendered); n > 0 {
+				configFiles = updated
+				log.Printf("Create %s: delivered plugin settings for %d plugin(s) from fetched template", id, n)
+			}
+		}
+	}
+
 	// Payload-declared plugins (CreateWorkspacePayload.Plugins): the API-level
 	// equivalent of a template's `plugins:` block for callers that don't own a
 	// template (e.g. an e2e harness declaring a native plugin to exercise its
