@@ -472,7 +472,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// agent turn so the agent greets the user in its own persona, delivered
 	// through the AgentMessageWriter SSOT (first_boot_greeting.go). A fresh
 	// onboarding lands in a chat where the agent has already spoken.
-	rh.SetFirstBootGreeter(handlers.FirstBootGreeter(
+	greeter := handlers.FirstBootGreeter(
 		handlers.NewAgentMessageWriter(db.DB, broadcaster),
 		wh.ProxyA2ARequest,
 		// Wake-lifecycle owner (PR-D): record the greet intent + bump the desired
@@ -480,11 +480,24 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		// by the has_greeted marker (workspaceHasGreeted + claimGreetDelivery) — see
 		// GreetWakeHooks; Decision.Fire is intentionally not a fire gate.
 		handlers.GreetWakeHooks{Decide: wh.DecideWake, Delivered: wh.MarkWakeDelivered},
-	))
+	)
+	rh.SetFirstBootGreeter(greeter)
 	// Versioned-heartbeat GENERATION LOOP (PR-C): wire the convergence settle side
 	// so a beat reporting observed_generation >= desired_generation settles the
 	// converged wake intents. Same late-wiring nil-safe pattern as the greeter.
 	rh.SetWakeSettler(wh.MarkWakeSettled)
+	// GENERATION LOOP RE-DRIVE (PR-F): wire the re-drive side so a heartbeat also
+	// re-emits this workspace's STUCK wake intents (pending/dispatched that never
+	// delivered, or delivered-but-never-settled), bounded by an attempt cap. The
+	// re-emitter re-runs the greeter for a stuck greet — safe because greet-once
+	// stays owned by the has_greeted CAS, so a delivered greet re-runs to a no-op
+	// (never a double greeting); non-greet kinds are a no-op skip (they self-heal
+	// via their own sweepers, and the owner still bounds+drops them).
+	wh.SetWakeReEmitter(handlers.WakeReEmitter(greeter))
+	rh.SetWakeRedriver(func(ctx context.Context, workspaceID string) error {
+		_, err := wh.ReDriveStuckWakes(ctx, workspaceID)
+		return err
+	})
 	r.POST("/registry/register", rh.Register)
 	r.POST("/registry/heartbeat", rh.Heartbeat)
 	r.POST("/registry/update-card", rh.UpdateCard)

@@ -145,6 +145,14 @@ type WorkspaceHandler struct {
 	// StallWatchdog.SetWakeHooks nil-safe late-wiring pattern.
 	wakeDecide        func(ctx context.Context, workspaceID string, kind WakeKind, dedupSeed string) (WakeDecision, error)
 	wakeMarkDelivered func(ctx context.Context, workspaceID, idempotencyKey string) error
+
+	// wakeReEmit re-emits a STUCK wake intent through its existing idempotency
+	// key — the re-drive side of the generation loop (wake_redrive.go PR-F). nil
+	// by default: a bare &WorkspaceHandler{} leaves it unset, so ReDriveStuckWakes
+	// is a full no-op (nothing to re-emit ⇒ no scan, no bounding). Production wires
+	// it via SetWakeReEmitter to WakeReEmitter(greeter). Exactly-once safety is the
+	// re-emission path's own (has_greeted CAS / queue dedup), never re-drive's.
+	wakeReEmit func(ctx context.Context, workspaceID string, kind WakeKind, idempotencyKey string, generation int64) error
 }
 
 // SetWakeHooks wires the wake-lifecycle desired-state owner into this handler's
