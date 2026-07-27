@@ -201,3 +201,44 @@ func TestIntegration_WakeRedrive_SettledNeverReDriven(t *testing.T) {
 		t.Errorf("young intent mutated: attempts=%d status=%q, want attempts=0 status=delivered", a, s)
 	}
 }
+
+// TestIntegration_WakeRedriveSweeper_FleetSelectsOnlyStuck proves the sweeper's
+// fleet query, against a REAL engine, returns exactly the workspaces that have a
+// genuinely-stuck intent — and drives them — while excluding a workspace whose
+// only intents are settled/dropped (terminal) or too young. sqlmock cannot
+// evaluate the WHERE, so this is the end-to-end proof of the fleet predicate.
+func TestIntegration_WakeRedriveSweeper_FleetSelectsOnlyStuck(t *testing.T) {
+	conn := integrationDB_WakeLifecycle(t)
+	ctx := context.Background()
+
+	stuckWS := seedWakeWorkspace(t, conn, "test-wake-redrive-sweep-stuck")
+	cleanWS := seedWakeWorkspace(t, conn, "test-wake-redrive-sweep-clean")
+
+	// stuckWS has one old delivered-but-unsettled intent → must be swept.
+	seedAgedWakeIntent(t, conn, stuckWS, "first-boot-greet:"+stuckWS, "first-boot-greet", 1, "delivered", 20*time.Minute, 0)
+	// cleanWS has only terminal + too-young intents → must NOT be swept.
+	seedAgedWakeIntent(t, conn, cleanWS, "lifecycle:"+cleanWS+":settled", "lifecycle", 1, "settled", 30*time.Minute, 0)
+	seedAgedWakeIntent(t, conn, cleanWS, "lifecycle:"+cleanWS+":dropped", "lifecycle", 2, "dropped", 30*time.Minute, 0)
+	seedAgedWakeIntent(t, conn, cleanWS, "lifecycle:"+cleanWS+":young", "lifecycle", 3, "delivered", 1*time.Minute, 0)
+
+	rec := &recordingReEmitter{}
+	h := &WorkspaceHandler{}
+	h.SetWakeReEmitter(rec.emit)
+
+	sw := NewWakeRedriveSweeper(conn, h.ReDriveStuckWakes, h.WakeReEmitWired)
+	res := sw.Sweep(ctx)
+
+	if res.Workspaces != 1 || res.Redriven != 1 || res.Errors != 0 {
+		t.Fatalf("sweep result = %+v, want Workspaces=1 Redriven=1 Errors=0 (only the stuck ws)", res)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("re-emit invoked %d times, want 1 (only the stuck ws's intent)", rec.count())
+	}
+	if got := rec.calls[0]; got.workspaceID != stuckWS {
+		t.Errorf("re-emit for workspace %s, want the stuck ws %s (clean ws must be excluded)", got.workspaceID, stuckWS)
+	}
+	// The clean workspace's terminal/young intents are untouched.
+	if a, s := readWakeRedrive(t, conn, cleanWS, "lifecycle:"+cleanWS+":young"); a != 0 || s != "delivered" {
+		t.Errorf("clean ws young intent mutated: attempts=%d status=%q, want 0/delivered", a, s)
+	}
+}

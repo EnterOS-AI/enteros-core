@@ -367,6 +367,27 @@ func main() {
 	// keeps its legacy per-workspace key verbatim.
 	wh.SetWakeHooks(wh.DecideWake, wh.MarkWakeDelivered)
 
+	// First-boot greeting hook (first_boot_greeting.go): drives a real agent turn
+	// so a freshly-onboarded agent greets the user in its own persona. Constructed
+	// HERE (rather than inside router.Setup) so the SAME greeter instance backs
+	// BOTH the registry's SetFirstBootGreeter (wired in router.Setup, handed in
+	// below) AND the wake re-drive re-emitter wired just below — and so the
+	// re-emit hook is set on wh BEFORE the WakeRedriveSweeper starts (the sweep is
+	// a no-op until it is, but wiring it up front removes any startup-order doubt).
+	greeter := handlers.FirstBootGreeter(
+		handlers.NewAgentMessageWriter(db.DB, broadcaster),
+		wh.ProxyA2ARequest,
+		// Greet-once stays owned by the has_greeted marker (workspaceHasGreeted +
+		// claimGreetDelivery); Decision.Fire is intentionally not a fire gate.
+		handlers.GreetWakeHooks{Decide: wh.DecideWake, Delivered: wh.MarkWakeDelivered},
+	)
+	// GENERATION LOOP RE-DRIVE (PR-F): wire the re-emit side of the re-drive onto
+	// wh. The re-emitter re-runs the greeter for a stuck greet — safe because
+	// greet-once stays owned by the has_greeted CAS, so a delivered greet re-runs
+	// to a no-op (never a double greeting); non-greet kinds are a no-op skip. The
+	// fleet-wide WakeRedriveSweeper (started below) is what drives it periodically.
+	wh.SetWakeReEmitter(handlers.WakeReEmitter(greeter))
+
 	// #2930: independent A2A queue sweeper so queued requests drain even when a
 	// workspace stops heartbeating (e.g., after a transient restart trigger).
 	go wh.StartA2AQueueSweeper(ctx)
@@ -708,6 +729,22 @@ func main() {
 		log.Printf("StallWatchdog: disabled via STALL_WATCHDOG_DISABLED")
 	}
 
+	// GENERATION LOOP RE-DRIVE (PR-F): fleet-wide periodic sweeper that re-emits
+	// STUCK wake intents (pending/dispatched that never delivered, or
+	// delivered-but-never-settled) through their existing idempotency key, bounded
+	// by a per-intent attempt cap (dropped after redriveMaxAttempts). One fleet
+	// query per tick finds the distinct workspaces with a stuck intent, then
+	// ReDriveStuckWakes drives each. No-op until the re-emit hook is wired
+	// (SetWakeReEmitter above) — so this is nil-safe by construction. Default 5min
+	// cadence; override via WAKE_REDRIVE_SWEEPER_INTERVAL_S; disable via
+	// WAKE_REDRIVE_SWEEPER_DISABLED=true.
+	if !strings.EqualFold(os.Getenv("WAKE_REDRIVE_SWEEPER_DISABLED"), "true") {
+		redriveSweeper := handlers.NewWakeRedriveSweeper(nil, wh.ReDriveStuckWakes, wh.WakeReEmitWired)
+		go supervised.RunWithRecover(ctx, "wake-redrive-sweeper", redriveSweeper.Start)
+	} else {
+		log.Printf("WakeRedriveSweeper: disabled via WAKE_REDRIVE_SWEEPER_DISABLED")
+	}
+
 	// Channel Manager — social channel integrations (Telegram, Slack, etc.)
 	channelMgr := channels.NewManager(wh, broadcaster)
 	go supervised.RunWithRecover(ctx, "channel-manager", channelMgr.Start)
@@ -728,7 +765,7 @@ func main() {
 		defer cancel()
 		return refreshTemplates(ctx)
 	}
-	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, hostStateDir, bootTokens, wh, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
+	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, hostStateDir, bootTokens, wh, greeter, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
 
 	// Plugin drift sweeper — periodic detection of upstream plugin version drift
 	// (core#123). Scans workspace_plugins rows where tracked_ref != 'none',

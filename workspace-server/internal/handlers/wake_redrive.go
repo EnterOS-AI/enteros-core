@@ -59,12 +59,15 @@ package handlers
 //   echoes observed_generation within a beat or two, so only an intent stuck PAST
 //   that window is a genuine stall.
 //
-// WIRING. RegistryHandler fires ReDriveStuckWakes on the heartbeat convergence
-// path (the same place the settle runs, gated on a contract-aware beat), async
-// and best-effort so it adds no heartbeat latency and a failure never breaks the
-// liveness ack. Behind the established nil-safe hook pattern end to end:
-//   - RegistryHandler.wakeRedriver nil  → heartbeat never re-drives (unit tests,
-//     deployments without a workspace handler).
+// WIRING. A fleet-wide periodic sweeper (WakeRedriveSweeper, modeled on the
+// StallWatchdog / RequestNudgeSweeper pattern) owns the cadence: each tick runs
+// ONE fleet query for the DISTINCT workspaces that currently have a stuck intent,
+// then calls ReDriveStuckWakes per such workspace. Keeping re-drive on a periodic
+// sweep — rather than the hot heartbeat path — means one fleet query every few
+// minutes instead of a per-beat per-workspace scan, and the heartbeat stays
+// settle-only. Behind the established nil-safe hook pattern end to end:
+//   - WakeRedriveSweeper's re-emit hook nil → the sweep is a no-op (it does not
+//     even query the fleet): with nothing to re-emit there is nothing to drive.
 //   - WorkspaceHandler.wakeReEmit  nil  → ReDriveStuckWakes is a full no-op (it
 //     does not even scan): with nothing to re-emit there is nothing to drive.
 //
@@ -132,6 +135,12 @@ func (h *WorkspaceHandler) SetWakeReEmitter(
 ) {
 	h.wakeReEmit = reEmit
 }
+
+// WakeReEmitWired reports whether a re-emit hook is set on this handler. The
+// WakeRedriveSweeper consults it to skip its fleet query entirely when the loop
+// is unwired (nothing to re-emit ⇒ nothing to drive), keeping an unwired
+// deployment a true no-op rather than scanning every tick.
+func (h *WorkspaceHandler) WakeReEmitWired() bool { return h.wakeReEmit != nil }
 
 // ReDriveStuckWakes is the re-drive owner: it finds workspaceID's stuck wake
 // intents, re-emits each through its existing idempotency key (bounded), and

@@ -130,16 +130,6 @@ type RegistryHandler struct {
 	// construction order (both live in package handlers; the func field decouples
 	// the wiring, not an import cycle).
 	wakeSettler func(ctx context.Context, workspaceID string, observedGen int64) error
-	// wakeRedriver re-drives a workspace's STUCK wake intents — the RE-DRIVE side
-	// of the versioned-heartbeat GENERATION LOOP (PR-F, wake_redrive.go). Fired on
-	// the same contract-aware convergence beat as wakeSettler: settle handles the
-	// delivered intents the runtime HAS converged past; re-drive handles the ones
-	// that got stuck (pending/dispatched never delivered, or delivered-but-never-
-	// settled). nil-safe: the re-drive is skipped when unset (unit tests /
-	// deployments without a workspace handler). Wired late by the router to
-	// WorkspaceHandler.ReDriveStuckWakes — same nil-safe hook pattern as
-	// SetWakeSettler.
-	wakeRedriver func(ctx context.Context, workspaceID string) error
 	// mcpRecoveryLastFire rate-limits the RCA#2970 deadlock-break reconcile (#33).
 	// The gate fails on EVERY heartbeat until the management MCP lands, so without
 	// a throttle a concierge that cannot recover (e.g. a missing plugin-source
@@ -213,35 +203,6 @@ func (h *RegistryHandler) fireWakeSettled(ctx context.Context, workspaceID strin
 	if err := h.wakeSettler(ctx, workspaceID, observedGen); err != nil {
 		log.Printf("Heartbeat: wake-settle failed for %s (observed_gen=%d): %v", workspaceID, observedGen, err)
 	}
-}
-
-// SetWakeRedriver wires the wake-lifecycle RE-DRIVE hook — the re-drive side of
-// the versioned-heartbeat GENERATION LOOP (PR-F). Router wires this to
-// WorkspaceHandler.ReDriveStuckWakes after both handlers are constructed (same
-// late-wiring nil-safe pattern as SetWakeSettler).
-func (h *RegistryHandler) SetWakeRedriver(f func(ctx context.Context, workspaceID string) error) {
-	h.wakeRedriver = f
-}
-
-// fireWakeRedrive runs the stuck-intent re-drive for a workspace on a
-// contract-aware convergence beat. Fire-and-forget on a detached context: the
-// re-drive does a scan plus per-intent work (a greet re-emit can kick off a
-// ~90s agent turn), so it must never add latency to — or be cancelled by the
-// return of — the heartbeat handler. Best-effort: a failure is logged and
-// swallowed so it never breaks the heartbeat's liveness ack. nil-safe for tests
-// / deployments that don't wire a workspace handler.
-func (h *RegistryHandler) fireWakeRedrive(ctx context.Context, workspaceID string) {
-	if h.wakeRedriver == nil {
-		return
-	}
-	redrive := h.wakeRedriver
-	rctx := context.WithoutCancel(ctx)
-	wsID := workspaceID
-	globalGoAsync(func() {
-		if err := redrive(rctx, wsID); err != nil {
-			log.Printf("Heartbeat: wake re-drive failed for %s: %v", wsID, err)
-		}
-	})
 }
 
 // holdOnlineBroadcastForWarmingPlatform reports whether Register must NOT
@@ -1561,19 +1522,6 @@ func (h *RegistryHandler) Heartbeat(c *gin.Context) {
 		// (MarkWakeSettled settles delivered intents with generation <= observed).
 		if *payload.ObservedGeneration >= desiredGen {
 			h.fireWakeSettled(ctx, payload.WorkspaceID, *payload.ObservedGeneration)
-		}
-
-		// RE-DRIVE (PR-F): the settle above only advances intents the runtime HAS
-		// converged past. Independently, re-drive this workspace's STUCK intents —
-		// pending/dispatched that never delivered, or delivered-but-never-settled.
-		// Gated on desiredGen > 0 (a box that never minted a wake has nothing to
-		// re-drive) and fired async/best-effort. It runs on BOTH sides of
-		// convergence on purpose: a stuck PENDING intent is invisible to the settle
-		// even when observed >= desired (settle only touches DELIVERED rows), so
-		// gating re-drive on observed < desired would miss it. The owner's own
-		// age + attempt + interval bounds keep this cheap and safe on every beat.
-		if desiredGen > 0 {
-			h.fireWakeRedrive(ctx, payload.WorkspaceID)
 		}
 	}
 
