@@ -56,6 +56,11 @@ type WorkspaceHandler struct {
 	// SetCPProvisioner, which satisfies the interface — see the
 	// compile-time assertion in internal/provisioner/cp_provisioner.go.
 	cpProv      provisioner.CPProvisionerAPI
+	// sidecarProv is the desktop-sidecar backend (design §5). ONE backend: the
+	// Local (Docker) impl on self-host, the CP impl on SaaS (deferred), or nil
+	// -> the availability-gate default, so the desktop feature is cleanly
+	// ABSENT (decision 4) rather than broken.
+	sidecarProv provisioner.SidecarProvisioner
 	platformURL string
 	configsDir  string // path to workspace-configs-templates/ (for reading templates)
 	cacheDir    string // optional runtime-refreshed template cache; overrides configsDir by template id
@@ -330,6 +335,14 @@ func (h *WorkspaceHandler) WithSeedMemoryPlugin(p seedMemoryPluginAPI) *Workspac
 // the *CPProvisioner from NewCPProvisioner; tests pass a stub.
 func (h *WorkspaceHandler) SetCPProvisioner(cp provisioner.CPProvisionerAPI) {
 	h.cpProv = cp
+}
+
+// SetSidecarProvisioner wires the desktop-sidecar backend (design §5). Pass the
+// Local (Docker) backend on self-host, the CP backend on SaaS once wired, or
+// leave unset — the handler then defaults to the availability-gate backend so
+// the desktop feature is cleanly absent (decision 4), never broken.
+func (h *WorkspaceHandler) SetSidecarProvisioner(sp provisioner.SidecarProvisioner) {
+	h.sidecarProv = sp
 }
 
 // SetEnvMutators wires a provisionhook.Registry into the handler. Plugins
