@@ -249,8 +249,8 @@ Not a one-var swap. v2 edits: (a) re-type `displayForward`/`realDisplayForward` 
 - [ ] `SidecarProvisioner` interface + compile-time assertions
 - [ ] Local(Docker) impl; CP impl returns `ErrDesktopBackendUnavailable`
 - [ ] `StartDesktopAuto`/`StopDesktopAuto` dispatchers (existing `…Auto` shape)
-- [ ] Per-tier availability gate surfaced in `GET /display`
-- [ ] Plugin-extraction seam matches the deferred RFC
+- [x] Per-tier availability gate surfaced in `GET /display` (`desktop_route.go` → 503 on `ErrDesktopBackendUnavailable`)
+- [x] Plugin-extraction seam matches the deferred RFC (agent tool stays in runtime; platform is a gateway HTTP route, not an MCP tool — decision B)
 
 **Security (prerequisite — decision 1)**
 - [x] Per-workspace Docker network (code) / k8s NetworkPolicy (`deploy/desktop-egress-networkpolicy.yaml`)
