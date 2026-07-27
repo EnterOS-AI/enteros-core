@@ -351,4 +351,10 @@ Honest ledger. "✅" = code committed **and** verified here (`go test`/`vet`/`bu
 **Update (14 commits across 2 repos):**
 - ✅ SSOT `computer-use` contract authored in `molecule-ai-sdk-ssot` (branch `feat/computer-use-tool-contract`, JSON-valid). Codegen + workspace-server `MatchesSSOT` value-pin still ◻︎ (needs the SDK codegen toolchain + module bump).
 - ✅ `computer` MCP tool registered + wired to the gateway (4 tests). Screenshot returns a base64 data-URI interim; the attachment-URI result and vision-adapter gating are ◻︎ (need the workspace-write path + adapter lookup).
-- ◻︎ Still pending (needs a running stack): wire the gateway's DB-backed lock/activity/token adapters into `MCPHandler` construction · display-proxy re-home · control-lock view/control split · lifecycle store + idle sweeper · `wsdesk-` reap path · SSRF allowlist.
+- ◻︎ Still pending (needs a running stack): wire the gateway's DB-backed lock/activity/token adapters + `cmd/server` `SetDesktopGateway` · display-proxy re-home · control-lock view/control split · lifecycle store + idle sweeper · `wsdesk-` reap path · SSRF allowlist.
+
+**Update (decision B — plugin-driven surface, reconciled across 3 repos):**
+- ✅ **Core**: removed the platform `computer` MCP tool (a plugin dead-end — the static `mcp.go` bridge can't host a plugin tool); added the authenticated **desktop gateway HTTP route** `GET/POST /workspaces/:id/desktop/{screenshot,input}` on `wsAuth` (4 route tests). The platform layer is now a gateway, not a tool.
+- ✅ **Runtime** (`molecule-ai-workspace-runtime`, branch `feat/desktop-tool-repoint-to-gateway`): re-pointed `a2a_tools_desktop.py`'s screenshot/click/type/key from `chroot /host` to the gateway route (reuses `PLATFORM_URL`/`WORKSPACE_ID`/`auth_headers`; 409→pause). py_compile clean. Follow-up: `open_url`/`check` re-point + retire `_host_*`.
+- ✅ **SDK**: `computer-use` contract (branch `feat/computer-use-tool-contract`).
+- The agent surface staying in the runtime is exactly the native-`kind:mcp`-plugin extraction path (deferred RFC).
