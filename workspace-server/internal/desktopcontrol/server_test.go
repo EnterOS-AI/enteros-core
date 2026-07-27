@@ -16,6 +16,7 @@ type fakeActuator struct {
 	typed     []string
 	keys      []string
 	scrolls   []int
+	navs      []string
 	shots     int
 }
 
@@ -30,6 +31,10 @@ func (f *fakeActuator) Click(_ context.Context, x, y int, b string) error {
 func (f *fakeActuator) Type(_ context.Context, t string) error { f.typed = append(f.typed, t); return f.err }
 func (f *fakeActuator) Key(_ context.Context, k string) error  { f.keys = append(f.keys, k); return f.err }
 func (f *fakeActuator) Scroll(_ context.Context, n int) error  { f.scrolls = append(f.scrolls, n); return f.err }
+func (f *fakeActuator) Navigate(_ context.Context, u string) error {
+	f.navs = append(f.navs, u)
+	return f.err
+}
 
 const testToken = "sekret-token"
 
@@ -169,6 +174,33 @@ func TestControl_ScrollAmountBounded(t *testing.T) {
 	}
 	if len(act.scrolls) != 1 || act.scrolls[0] != 100 {
 		t.Fatalf("in-range scroll not dispatched: %v", act.scrolls)
+	}
+}
+
+func TestControl_Navigate(t *testing.T) {
+	act := &fakeActuator{}
+	h := newTestServer(act)
+	// Valid http(s) URL dispatches.
+	if rr := do(t, h, "POST", "/input", testToken, `{"type":"navigate","url":"https://example.com/x"}`); rr.Code != http.StatusNoContent {
+		t.Fatalf("navigate: got %d, want 204", rr.Code)
+	}
+	if len(act.navs) != 1 || act.navs[0] != "https://example.com/x" {
+		t.Fatalf("navigate not dispatched: %v", act.navs)
+	}
+	// Non-web schemes are rejected before dispatch (no file://, javascript:, etc.).
+	for _, body := range []string{
+		`{"type":"navigate","url":"file:///etc/passwd"}`,
+		`{"type":"navigate","url":"javascript:alert(1)"}`,
+		`{"type":"navigate","url":"chrome://settings"}`,
+		`{"type":"navigate","url":""}`,
+		`{"type":"navigate","url":"not a url"}`,
+	} {
+		if rr := do(t, h, "POST", "/input", testToken, body); rr.Code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d, want 400", body, rr.Code)
+		}
+	}
+	if len(act.navs) != 1 {
+		t.Fatalf("rejected navigations must NOT dispatch, got %v", act.navs)
 	}
 }
 

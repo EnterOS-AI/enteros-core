@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -43,13 +44,14 @@ type Geometry struct {
 // Action is one computer-use action. Mirrors the SSOT contract's action enum
 // (design §4). Exactly one action per /input request.
 type Action struct {
-	Type   string `json:"type"`             // screenshot|click|type|key|scroll
+	Type   string `json:"type"`             // screenshot|click|type|key|scroll|navigate
 	X      int    `json:"x,omitempty"`      // click target (0 <= x < Width)
 	Y      int    `json:"y,omitempty"`      // click target (0 <= y < Height)
 	Button string `json:"button,omitempty"` // left|right|middle (default left)
 	Text   string `json:"text,omitempty"`   // for type
 	Keys   string `json:"keys,omitempty"`   // for key, e.g. "ctrl+v", "Return"
 	Amount int    `json:"amount,omitempty"` // for scroll (signed; +down/-up)
+	URL    string `json:"url,omitempty"`    // for navigate (http/https only)
 }
 
 // Actuator performs actions against the real X display. Behind an interface so
@@ -60,6 +62,7 @@ type Actuator interface {
 	Type(ctx context.Context, text string) error
 	Key(ctx context.Context, keys string) error
 	Scroll(ctx context.Context, amount int) error
+	Navigate(ctx context.Context, url string) error
 }
 
 // Server is the control-server HTTP surface.
@@ -163,12 +166,27 @@ func (s *Server) validate(a Action) error {
 		if a.Amount > maxScrollAmount || a.Amount < -maxScrollAmount {
 			return fmt.Errorf("scroll amount %d out of range (max magnitude %d)", a.Amount, maxScrollAmount)
 		}
+	case "navigate":
+		if !isNavigableURL(a.URL) {
+			return fmt.Errorf("navigate requires an http(s) URL, got %q", a.URL)
+		}
 	case "screenshot":
 		// no-op action shape; screenshots normally use GET /screenshot.
 	default:
-		return fmt.Errorf("unsupported action type %q (want click|type|key|scroll|screenshot)", a.Type)
+		return fmt.Errorf("unsupported action type %q (want click|type|key|scroll|navigate|screenshot)", a.Type)
 	}
 	return nil
+}
+
+// isNavigableURL restricts navigation to real web URLs: http/https with a host.
+// This blocks file://, data:, javascript:, chrome:// and other schemes the agent
+// has no business driving the kiosk browser to.
+func isNavigableURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 func (s *Server) dispatch(ctx context.Context, a Action) error {
@@ -181,6 +199,8 @@ func (s *Server) dispatch(ctx context.Context, a Action) error {
 		return s.act.Click(ctx, a.X, a.Y, btn)
 	case "type":
 		return s.act.Type(ctx, a.Text)
+	case "navigate":
+		return s.act.Navigate(ctx, a.URL)
 	case "key":
 		return s.act.Key(ctx, a.Keys)
 	case "scroll":
