@@ -166,6 +166,36 @@ func (a *ExecActuator) Key(ctx context.Context, keys string) error {
 	return nil
 }
 
+// desktopProfileDir is the Chromium user-data-dir the entrypoint launches the
+// kiosk instance with. Navigate MUST reuse it so a second chromium invocation is
+// recognized as the same single instance and hands off the URL (navigating the
+// pinned window) instead of spawning a competing instance.
+const desktopProfileDir = "/home/desktop/profile"
+
+// Navigate points the kiosk browser at url. Chromium runs single-instance per
+// user-data-dir: a second `chromium <url>` invocation with the SAME profile dir
+// forwards the URL to the running instance, which navigates the pinned kiosk
+// window, then this invocation exits (verified 2026-07-27). --kiosk hides the
+// omnibox so keyboard navigation is unavailable; this is the open_url path.
+func (a *ExecActuator) Navigate(ctx context.Context, url string) error {
+	// Bound the hand-off (reviewer nit): a healthy running kiosk instance accepts
+	// the URL and this invocation exits in well under a second. If the primary
+	// instance has died, `chromium <url>` would instead spawn a NEW foreground
+	// (non-kiosk) instance that blocks until the browser exits — hanging the
+	// request goroutine on a request context that may have no deadline. Cap it so
+	// a dead primary fails fast (the platform re-provisions) instead of hanging.
+	nctx, cancel := context.WithTimeout(ctx, desktopNavigateTimeout)
+	defer cancel()
+	if _, err := a.run(nctx, "chromium", "--user-data-dir="+desktopProfileDir, url); err != nil {
+		return fmt.Errorf("chromium navigate: %w", err)
+	}
+	return nil
+}
+
+// desktopNavigateTimeout caps a single navigate hand-off. Far longer than a
+// healthy hand-off needs, short enough that a dead-primary spawn can't hang.
+const desktopNavigateTimeout = 10 * time.Second
+
 func (a *ExecActuator) Scroll(ctx context.Context, amount int) error {
 	// xdotool: button 4 = scroll up, 5 = scroll down; one click per notch.
 	btn := "5"
