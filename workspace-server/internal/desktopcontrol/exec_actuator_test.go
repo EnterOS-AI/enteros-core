@@ -2,6 +2,7 @@ package desktopcontrol
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,7 +70,11 @@ func TestExecActuator_TypeKeyScroll(t *testing.T) {
 	if err := a.Type(context.Background(), "hello world"); err != nil {
 		t.Fatal(err)
 	}
-	if j := joined((*got)[0]); j != "xdotool type --clearmodifiers -- hello world" {
+	// Focus is verified BEFORE typing (input hardening), then a delayed type.
+	if j := joined((*got)[0]); j != "xdotool getactivewindow" {
+		t.Fatalf("expected focus verify first, got %q", j)
+	}
+	if j := joined((*got)[1]); j != "xdotool type --clearmodifiers --delay 12 -- hello world" {
 		t.Fatalf("type cmd = %q", j)
 	}
 
@@ -77,7 +82,10 @@ func TestExecActuator_TypeKeyScroll(t *testing.T) {
 	if err := a.Key(context.Background(), "ctrl+v"); err != nil {
 		t.Fatal(err)
 	}
-	if j := joined((*got)[0]); j != "xdotool key --clearmodifiers ctrl+v" {
+	if j := joined((*got)[0]); j != "xdotool getactivewindow" {
+		t.Fatalf("expected focus verify first, got %q", j)
+	}
+	if j := joined((*got)[1]); j != "xdotool key --clearmodifiers ctrl+v" {
 		t.Fatalf("key cmd = %q", j)
 	}
 
@@ -93,6 +101,27 @@ func TestExecActuator_TypeKeyScroll(t *testing.T) {
 		if joined(c) != "xdotool click 4" {
 			t.Fatalf("scroll-up cmd = %q, want button 4", joined(c))
 		}
+	}
+}
+
+func TestExecActuator_TypeRefusesWhenNoFocus(t *testing.T) {
+	dir := t.TempDir()
+	a := &ExecActuator{
+		tmpDir: dir,
+		sleep:  func(time.Duration) {},
+		run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name == "xdotool" && len(args) > 0 && args[0] == "getactivewindow" {
+				return nil, errors.New("no active window")
+			}
+			t.Fatalf("keystroke sent despite no focus: %s %v", name, args)
+			return nil, nil
+		},
+	}
+	if err := a.Type(context.Background(), "secret"); err == nil {
+		t.Fatal("Type must error when no window is focused (keystrokes would land in the void)")
+	}
+	if err := a.Key(context.Background(), "Return"); err == nil {
+		t.Fatal("Key must error when no window is focused")
 	}
 }
 

@@ -67,14 +67,36 @@ func (a *ExecActuator) Click(ctx context.Context, x, y int, button string) error
 	return nil
 }
 
+// ensureFocus verifies an input target actually has focus before keystroke
+// injection (§ input hardening). Without it, xdotool type/key silently sends
+// keystrokes into the void when no window is focused, and the agent believes it
+// typed. In the kiosk sidecar there is always a focused window, so a failure
+// here means the display is wedged — surface it rather than pretend success.
+func (a *ExecActuator) ensureFocus(ctx context.Context) error {
+	if _, err := a.run(ctx, "xdotool", "getactivewindow"); err != nil {
+		return fmt.Errorf("no focused window for keystroke input: %w", err)
+	}
+	return nil
+}
+
 func (a *ExecActuator) Type(ctx context.Context, text string) error {
-	if _, err := a.run(ctx, "xdotool", "type", "--clearmodifiers", "--", text); err != nil {
+	if err := a.ensureFocus(ctx); err != nil {
+		return err
+	}
+	// --delay spaces keystrokes (ms) so fast injection doesn't outrun an input
+	// field's async JS handlers and drop characters (§ input hardening). NOTE:
+	// a clipboard "paste" fallback for very long / non-ASCII (IME) text is a
+	// follow-up — it needs xclip/xsel added to the sidecar image.
+	if _, err := a.run(ctx, "xdotool", "type", "--clearmodifiers", "--delay", "12", "--", text); err != nil {
 		return fmt.Errorf("xdotool type: %w", err)
 	}
 	return nil
 }
 
 func (a *ExecActuator) Key(ctx context.Context, keys string) error {
+	if err := a.ensureFocus(ctx); err != nil {
+		return err
+	}
 	if _, err := a.run(ctx, "xdotool", "key", "--clearmodifiers", keys); err != nil {
 		return fmt.Errorf("xdotool key: %w", err)
 	}

@@ -283,12 +283,12 @@ Not a one-var swap. v2 edits: (a) re-type `displayForward`/`realDisplayForward` 
 - [ ] Vision-capable-adapter gating in `tools/list`
 - [ ] Attachment-URI screenshot result; per-task cost budget documented
 - [ ] Chrome kiosk window pinning + geometry assert
-- [ ] Input hardening (settle/sync, IME paste fallback, focus verify)
+- [~] Input hardening — settle/sync (move→settle→click) + focus-verify (getactivewindow before type/key) + type `--delay` **done+tested**; IME clipboard-paste fallback ◻︎ (needs xclip in the image)
 
 **Data model / proxy**
 - [ ] `compute` jsonb + side table migrations (up/down)
-- [ ] `displayForward` re-typed to workspace id/target; readiness gate updated (both sites)
-- [ ] SSRF hostname allowlist for the sidecar
+- [x] `displayForward` re-typed to workspace id/target; readiness gate updated (both sites)
+- [x] SSRF hostname allowlist for the sidecar — `ValidateSidecarTarget` pins target to `wsdesk-<hex-id>:<6070|6080>`; wired into gateway + display proxy; 3 tests
 
 **Tests**
 - [ ] Unit tests per §15.1
@@ -391,3 +391,9 @@ B1 was the "load-bearing blocker." It is now precisely characterised and closed 
 - **Safety interlock.** `cmd/server` now refuses to wire the desktop backend unless `MOLECULE_DESKTOP_EGRESS_CONFIRMED=true` — the operator must affirm the firewall is applied, so the exposure **cannot ship by misconfiguration**.
 
 **Remaining to reach 100%-to-production (genuine human/infra gates, NOT autonomous):** apply the (now-verified) egress firewall + Redis password + userns-remap on the live host; cross-repo SDK codegen + `MatchesSSOT` and the CP backend (other toolchains/repos); image build+publish to the registry; a human-authorized production deploy. The honest verdict remains BLOCK-until-operator-applies-B1; every code-and-artifact prerequisite is now in place and verified.
+
+**Update (SDK codegen chain proven + more checklist code closed):**
+- ✅ **SDK codegen** (`molecule-ai-sdk-ssot`, branch `feat/computer-use-tool-contract`, commit `3b4df99`): `tools/gen-computer-use.mjs` derives `gen/go/molcontracts/computer_use_gen.go` from the contract (gofmt-piped, regen-stable, `go build/vet/test` green in `gen/go`).
+- ✅ **`MatchesSSOT` value-pin authored + proven end-to-end** (contract → generated Go → molecule-core pin passes via a local `replace`). Held as a ready patch (`scratchpad/computer_use_contract_ssot_test.go.ready`) — can't commit to molecule-core until the SDK module publishes (a committed local-path replace would break CI). Publish = the review/merge gate on the shared SDK repo.
+- ✅ **SSRF allowlist** (`ValidateSidecarTarget`) — every resolved sidecar target pinned to `wsdesk-<hex-id>:<6070|6080>` before the gateway or noVNC proxy forwards; wired into both; 3 tests (commit `31924ccc2`).
+- ✅ **Input hardening** — focus-verify (`getactivewindow` before type/key, so keystrokes never land in the void) + type `--delay`; on top of the existing move→settle→click; tests added. IME clipboard-paste fallback deferred (needs xclip in the image).
