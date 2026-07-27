@@ -724,5 +724,70 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# The loopback allowlist also covers `localhost` (the local-docker dev CP that
+# test_cleanup_verification_e2e.sh drives on https://localhost:8090) — but the
+# host set stays CLOSED. A hostname that merely embeds or suffixes a local name,
+# a userinfo smuggle, or a non-canonical port must all still fail closed, and
+# none of it is reachable at all without the explicit opt-in.
+localhost_default_rc=0
+e2e_cp_require_staging_origin "https://localhost:8090" >/dev/null 2>&1 || localhost_default_rc=$?
+localhost_opt_in_rc=0
+E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+  e2e_cp_require_staging_origin "https://localhost:8090" >/dev/null 2>&1 || localhost_opt_in_rc=$?
+http_localhost_rc=0
+E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+  e2e_cp_require_staging_origin "http://localhost:8090" >/dev/null 2>&1 || http_localhost_rc=$?
+if [ "$localhost_default_rc" = "2" ] \
+  && [ "$localhost_opt_in_rc" = "0" ] \
+  && [ "$http_localhost_rc" = "0" ]; then
+  echo "PASS: opt-in loopback allowlist covers localhost on http and https"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: localhost loopback origin not accepted under the explicit opt-in" >&2
+  FAIL=$((FAIL + 1))
+fi
+
+localhost_lookalikes_ok=1
+for bad in \
+  "https://localhost.attacker.invalid:8090" \
+  "https://notlocalhost:8090" \
+  "https://localhost:8090@attacker.invalid" \
+  "http://127.0.0.1:1@attacker.invalid" \
+  "https://localhost:8090/cp" \
+  "https://localhost:099999" \
+  "https://localhost" \
+  "ftp://localhost:8090"
+do
+  bad_rc=0
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+    e2e_cp_require_staging_origin "$bad" >/dev/null 2>&1 || bad_rc=$?
+  if [ "$bad_rc" != "2" ]; then
+    echo "FAIL: loopback allowlist accepted a non-loopback origin: $bad" >&2
+    localhost_lookalikes_ok=0
+  fi
+done
+if [ "$localhost_lookalikes_ok" = "1" ]; then
+  echo "PASS: loopback allowlist rejects lookalike hosts, userinfo smuggles and bad ports"
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+fi
+
+# E2E_CP_INSECURE only ever relaxes TLS verification for those same loopback
+# origins. Against staging it is a no-op, so it can never turn the admin bearer
+# into a MITM-harvestable secret on a real public origin.
+insecure_ok=1
+[ "$(E2E_CP_INSECURE=1 _e2e_cp_curl_flags "https://localhost:8090")" = "-k" ] || insecure_ok=0
+[ "$(E2E_CP_INSECURE=1 _e2e_cp_curl_flags "http://127.0.0.1:18080")" = "-k" ] || insecure_ok=0
+[ -z "$(E2E_CP_INSECURE=1 _e2e_cp_curl_flags "https://staging-api.moleculesai.app")" ] || insecure_ok=0
+[ -z "$(_e2e_cp_curl_flags "https://localhost:8090")" ] || insecure_ok=0
+if [ "$insecure_ok" = "1" ]; then
+  echo "PASS: E2E_CP_INSECURE relaxes TLS for loopback only, and is off by default"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: E2E_CP_INSECURE scope is wrong (must be loopback-only, default off)" >&2
+  FAIL=$((FAIL + 1))
+fi
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" = "0" ]

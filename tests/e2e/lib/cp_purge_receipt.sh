@@ -21,15 +21,38 @@ e2e_cp_require_staging_origin() {
   if [ "$cp_url" = "https://staging-api.moleculesai.app" ]; then
     return 0
   fi
+  # Explicit opt-in loopback test origins. The literal host set is closed —
+  # 127.0.0.1 (the ephemeral-CP dind harness) and localhost (the local-docker
+  # dev CP that tests/e2e/test_cleanup_verification_e2e.sh drives, which serves
+  # https on a self-signed cert). Both resolve to this machine and cannot be
+  # pointed at prod; anything else, including a DNS name that merely *looks*
+  # local, still fails closed. The scheme is bounded to http/https and the port
+  # to a canonical 1..65535 so no credential can be smuggled through a
+  # userinfo/host-suffix trick (`http://127.0.0.1:1@evil.example`, `...local.x`).
   if [ "${E2E_CP_ALLOW_EPHEMERAL_LOOPBACK:-0}" = "1" ] \
-    && [[ "$cp_url" =~ ^http://127\.0\.0\.1:([1-9][0-9]{0,4})$ ]]; then
-    port="${BASH_REMATCH[1]}"
+    && [[ "$cp_url" =~ ^https?://(127\.0\.0\.1|localhost):([1-9][0-9]{0,4})$ ]]; then
+    port="${BASH_REMATCH[2]}"
     if [ "$((10#$port))" -le 65535 ]; then
       return 0
     fi
   fi
   echo "[cp-purge] refusing to send the admin bearer outside the staging control-plane origin or explicit numeric-loopback test origin" >&2
   return 2
+}
+
+# Extra curl flags shared by every request this library makes.
+#
+# E2E_CP_INSECURE=1 adds -k. It is honored ONLY for the opt-in loopback test
+# origins accepted above (a local-docker dev CP terminates https on a
+# self-signed cert), never for staging: disabling verification against a real
+# public origin would turn the admin bearer into a MITM-harvestable secret.
+# Callers that do not set it get byte-identical behavior to before.
+_e2e_cp_curl_flags() {
+  local cp_url="${1:-}"
+  if [ "${E2E_CP_INSECURE:-0}" = "1" ] \
+    && [[ "$cp_url" =~ ^https?://(127\.0\.0\.1|localhost): ]]; then
+    printf '%s' "-k"
+  fi
 }
 
 e2e_cp_validate_org_id() {
@@ -65,13 +88,15 @@ _e2e_cp_probe_tenant_identity() {
   local slug="$3"
   local ua="${MOLECULE_UA:-curl/8.4.0}"
   local tmpdir body code org_id
+  local -a _cp_k=()
+  [ -n "$(_e2e_cp_curl_flags "$cp_url")" ] && _cp_k=(-k)
 
   E2E_CP_TENANT_STATE=inconclusive
   E2E_CP_TENANT_ORG_ID=""
   tmpdir=$(mktemp -d -t cp-tenant-probe-XXXXXX) || return 4
   body="$tmpdir/tenant.json"
 
-  if ! code=$(curl -sS -A "$ua" --max-time 30 \
+  if ! code=$(curl -sS ${_cp_k[@]+"${_cp_k[@]}"} -A "$ua" --max-time 30 \
       -o "$body" -w '%{http_code}' \
       "$cp_url/cp/admin/tenants/$slug/boot-events?limit=1" \
       -H "Authorization: Bearer $admin_token" 2>/dev/null); then
@@ -145,6 +170,8 @@ e2e_cp_fetch_org_roster_json() {
   local backend="${E2E_INFRA_BACKEND:-<unset>}"
   local ua="${MOLECULE_UA:-curl/8.4.0}"
   local tmpdir body code validated
+  local -a _cp_k=()
+  [ -n "$(_e2e_cp_curl_flags "$cp_url")" ] && _cp_k=(-k)
 
   E2E_INFRA_BACKEND="$backend" e2e_cp_require_local_backend || return $?
   e2e_cp_require_staging_origin "$cp_url" || return $?
@@ -155,7 +182,7 @@ e2e_cp_fetch_org_roster_json() {
 
   tmpdir=$(mktemp -d -t cp-roster-discovery-XXXXXX) || return 4
   body="$tmpdir/orgs.json"
-  if ! code=$(curl -sS -A "$ua" --max-time 30 \
+  if ! code=$(curl -sS ${_cp_k[@]+"${_cp_k[@]}"} -A "$ua" --max-time 30 \
       -o "$body" -w '%{http_code}' \
       "$cp_url/cp/admin/orgs?limit=500" \
       -H "Authorization: Bearer $admin_token" 2>/dev/null); then
@@ -213,6 +240,8 @@ e2e_cp_delete_and_verify_purge() {
   local audit_state audit_fields audit_purge_id predelete_org_id deadline
   local delete_started_epoch delete_deadline
   local delete_response_lost=0
+  local -a _cp_k=()
+  [ -n "$(_e2e_cp_curl_flags "$cp_url")" ] && _cp_k=(-k)
 
   E2E_CP_PURGE_RESULT=""
 
@@ -288,7 +317,7 @@ e2e_cp_delete_and_verify_purge() {
   delete_deadline=$(( $(date +%s) + delete_retry_secs ))
   while true; do
     delete_started_epoch=$(date +%s)
-    if ! delete_code=$(curl -sS -A "$ua" --max-time 120 \
+    if ! delete_code=$(curl -sS ${_cp_k[@]+"${_cp_k[@]}"} -A "$ua" --max-time 120 \
         -o "$delete_body" -w '%{http_code}' \
         -X DELETE "$cp_url/cp/admin/tenants/$slug" \
         -H "Authorization: Bearer $admin_token" \
@@ -356,7 +385,7 @@ print(purge_id, org_id, sep="\t")
   deadline=$(( $(date +%s) + poll_secs ))
   while true; do
     audit_code=""
-    if audit_code=$(curl -sS -A "$ua" --max-time 30 \
+    if audit_code=$(curl -sS ${_cp_k[@]+"${_cp_k[@]}"} -A "$ua" --max-time 30 \
         -o "$audit_body" -w '%{http_code}' \
         "$cp_url/cp/admin/purges?limit=500" \
         -H "Authorization: Bearer $admin_token"); then
