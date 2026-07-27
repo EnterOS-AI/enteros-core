@@ -347,3 +347,8 @@ Honest ledger. "✅" = code committed **and** verified here (`go test`/`vet`/`bu
 **Pending — infra/operator:** ◻︎ per-workspace network · egress proxy · `userns-remap` · Redis auth.
 
 **Pending — terminal human/infra gates (not autonomous):** ◻︎ image build + registry publish · ◻︎ CI / local-Docker e2e in dind · ◻︎ **security review** · ◻︎ **human-authorized production deploy**.
+
+**Update (14 commits across 2 repos):**
+- ✅ SSOT `computer-use` contract authored in `molecule-ai-sdk-ssot` (branch `feat/computer-use-tool-contract`, JSON-valid). Codegen + workspace-server `MatchesSSOT` value-pin still ◻︎ (needs the SDK codegen toolchain + module bump).
+- ✅ `computer` MCP tool registered + wired to the gateway (4 tests). Screenshot returns a base64 data-URI interim; the attachment-URI result and vision-adapter gating are ◻︎ (need the workspace-write path + adapter lookup).
+- ◻︎ Still pending (needs a running stack): wire the gateway's DB-backed lock/activity/token adapters into `MCPHandler` construction · display-proxy re-home · control-lock view/control split · lifecycle store + idle sweeper · `wsdesk-` reap path · SSRF allowlist.
