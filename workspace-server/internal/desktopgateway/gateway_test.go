@@ -36,7 +36,7 @@ type fakeLocks struct {
 	err  error
 }
 
-func (f fakeLocks) AgentHoldsControl(context.Context, string) (bool, error) { return f.held, f.err }
+func (f fakeLocks) AcquireAgentControl(context.Context, string) (bool, error) { return f.held, f.err }
 
 type fakeActivity struct{ n int }
 

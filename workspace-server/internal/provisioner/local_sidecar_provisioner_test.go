@@ -27,11 +27,13 @@ type fakeSidecarDocker struct {
 		name  string
 		force bool
 	}
-	volCreates  []volume.CreateOptions
-	volRemoves  []string
-	netsCreated []string
-	netsRemoved []string
-	running     map[string]bool
+	volCreates    []volume.CreateOptions
+	volRemoves    []string
+	netsCreated   []string
+	netsRemoved   []string
+	netsConnected []string // "net|container"
+	netsDisconn   []string // "net|container"
+	running       map[string]bool
 }
 
 func newFakeSidecarDocker() *fakeSidecarDocker { return &fakeSidecarDocker{running: map[string]bool{}} }
@@ -83,6 +85,14 @@ func (f *fakeSidecarDocker) NetworkRemove(_ context.Context, name string) error 
 	f.netsRemoved = append(f.netsRemoved, name)
 	return nil
 }
+func (f *fakeSidecarDocker) NetworkConnect(_ context.Context, net, container string, _ *network.EndpointSettings) error {
+	f.netsConnected = append(f.netsConnected, net+"|"+container)
+	return nil
+}
+func (f *fakeSidecarDocker) NetworkDisconnect(_ context.Context, net, container string, _ bool) error {
+	f.netsDisconn = append(f.netsDisconn, net+"|"+container)
+	return nil
+}
 
 const sidecarTestWS = "abc12345-6789-4def-8123-56789abcdef0"
 
@@ -90,6 +100,8 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 	f := newFakeSidecarDocker()
 	const prefix = "wsnet"
 	p := NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 1<<30, "") // "" → embedded Chromium-tuned seccomp default
+	p.SetControlTokenSecret("test-secret")
+	p.SetSelfContainerID("platform-xyz")
 
 	h, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS})
 	if err != nil {
@@ -175,6 +187,35 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 
 	if len(f.starts) != 1 || f.starts[0] != name {
 		t.Fatalf("container not started: %v", f.starts)
+	}
+
+	// B1: the sidecar MUST receive DESKTOP_CONTROL_TOKEN (else its control
+	// server log.Fatals and the container dies) + the pinned geometry.
+	wantTok := "DESKTOP_CONTROL_TOKEN=" + DeriveDesktopControlToken("test-secret", sidecarTestWS)
+	var haveTok, haveW, haveH bool
+	for _, e := range c.cfg.Env {
+		switch e {
+		case wantTok:
+			haveTok = true
+		case "DESKTOP_WIDTH=1280":
+			haveW = true
+		case "DESKTOP_HEIGHT=800":
+			haveH = true
+		}
+	}
+	if !haveTok {
+		t.Fatalf("sidecar Env missing derived DESKTOP_CONTROL_TOKEN: %v", c.cfg.Env)
+	}
+	if DeriveDesktopControlToken("test-secret", sidecarTestWS) == "" {
+		t.Fatal("derived control token is empty — control server would refuse to boot")
+	}
+	if !haveW || !haveH {
+		t.Fatalf("sidecar Env missing pinned geometry: %v", c.cfg.Env)
+	}
+	// B3: the PLATFORM is attached to the per-workspace network so it can reach
+	// the sidecar by name.
+	if len(f.netsConnected) != 1 || f.netsConnected[0] != wantNet+"|platform-xyz" {
+		t.Fatalf("platform not attached to per-workspace network: %v (want %q)", f.netsConnected, wantNet+"|platform-xyz")
 	}
 }
 

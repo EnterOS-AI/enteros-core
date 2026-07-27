@@ -39,6 +39,8 @@ type sidecarDocker interface {
 	VolumeRemove(ctx context.Context, volumeID string, force bool) error
 	NetworkCreate(ctx context.Context, name string, options network.CreateOptions) (network.CreateResponse, error)
 	NetworkRemove(ctx context.Context, networkID string) error
+	NetworkConnect(ctx context.Context, networkID, containerID string, config *network.EndpointSettings) error
+	NetworkDisconnect(ctx context.Context, networkID, containerID string, force bool) error
 }
 
 // LocalSidecarProvisioner is the Docker (self-host) backend of
@@ -91,7 +93,34 @@ type LocalSidecarProvisioner struct {
 	// seccomp/README.md for why a custom profile is required: the stock Docker
 	// profile blocks the Chromium userns sandbox under --cap-drop ALL.
 	seccompProfile string
+
+	// controlTokenSecret is the shared signing secret used to derive the
+	// per-sidecar DESKTOP_CONTROL_TOKEN the control server authenticates against
+	// (§6.5). The gateway's TokenResolver derives the SAME token from the SAME
+	// secret, so they agree without storing anything. Empty means the sidecar
+	// gets no token and its control server refuses to boot (fail-closed) — set
+	// it via SetControlTokenSecret in production wiring.
+	controlTokenSecret string
+
+	// selfContainerID identifies the platform's OWN container so StartDesktop can
+	// attach it to each per-workspace network — otherwise the platform (on the
+	// shared net) cannot resolve/reach the sidecar's "wsdesk-<id>" name on the
+	// isolated network (reviewer B3). Empty disables the attach (single-network
+	// dev/test).
+	selfContainerID string
 }
+
+// SetControlTokenSecret wires the shared secret used to derive each sidecar's
+// DESKTOP_CONTROL_TOKEN. Must match the secret the gateway's TokenResolver uses.
+func (p *LocalSidecarProvisioner) SetControlTokenSecret(secret string) { p.controlTokenSecret = secret }
+
+// SetSelfContainerID tells the provisioner which container is the platform, so it
+// can join each per-workspace network and reach the sidecar by name (B3).
+func (p *LocalSidecarProvisioner) SetSelfContainerID(id string) { p.selfContainerID = id }
+
+// desktopGeometry is the fixed resolution the sidecar and control server pin
+// (§3). Matches the image defaults + the coordinate contract.
+const desktopWidth, desktopHeight = 1280, 800
 
 // NewLocalSidecarProvisioner constructs the Docker desktop backend. See the
 // networkName doc for the production security requirement. seccompProfile is
@@ -219,14 +248,35 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 		}
 	}
 
+	// Env the sidecar's control server + entrypoint REQUIRE (reviewer B1): the
+	// control server log.Fatals without DESKTOP_CONTROL_TOKEN, so an env-less
+	// container boots and dies immediately. The token is derived from the shared
+	// secret — identical to the gateway's TokenResolver — so the two agree with
+	// nothing stored. Geometry is pinned to the coordinate contract.
+	env := []string{
+		"DESKTOP_CONTROL_TOKEN=" + DeriveDesktopControlToken(p.controlTokenSecret, cfg.WorkspaceID),
+		fmt.Sprintf("DESKTOP_WIDTH=%d", desktopWidth),
+		fmt.Sprintf("DESKTOP_HEIGHT=%d", desktopHeight),
+	}
 	if _, err := p.cli.ContainerCreate(ctx, &container.Config{
 		Image:  p.image,
+		Env:    env,
 		Labels: desktopManagedLabels(),
 	}, hostCfg, netCfg, nil, name); err != nil {
 		return DesktopHandle{}, fmt.Errorf("create desktop sidecar: %w", err)
 	}
 	if err := p.cli.ContainerStart(ctx, name, container.StartOptions{}); err != nil {
 		return DesktopHandle{}, fmt.Errorf("start desktop sidecar: %w", err)
+	}
+	// Attach the PLATFORM to the per-workspace network so the gateway + display
+	// proxy can reach the sidecar by its "wsdesk-<id>" name (reviewer B3). The
+	// sidecar stays OFF molecule-core-net — only the trusted platform joins the
+	// isolated net, so tenant/backend isolation is preserved while the platform
+	// gains reachability. Idempotent: an already-connected platform is fine.
+	if net := p.perWorkspaceNetwork(cfg.WorkspaceID); net != "" && p.selfContainerID != "" {
+		if err := p.cli.NetworkConnect(ctx, net, p.selfContainerID, nil); err != nil && !isAlreadyConnected(err) {
+			return DesktopHandle{}, fmt.Errorf("attach platform to per-workspace network: %w", err)
+		}
 	}
 	return p.handle(cfg.WorkspaceID, true), nil
 }
@@ -251,10 +301,16 @@ func (p *LocalSidecarProvisioner) StopDesktop(ctx context.Context, workspaceID s
 	if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{}); err != nil && !isNoSuchContainer(err) {
 		return fmt.Errorf("remove desktop sidecar: %w", err)
 	}
-	// Best-effort: remove the now-empty per-workspace network so it doesn't
-	// leak. A network still holding an endpoint (slow teardown) is left for a
-	// later sweep; don't fail the stop over it.
+	// Best-effort: detach the platform, then remove the now-empty per-workspace
+	// network so it doesn't leak. The platform must leave first or NetworkRemove
+	// fails on a network that still has an endpoint. A network still holding an
+	// endpoint (slow teardown) is left for a later sweep; don't fail the stop.
 	if net := p.perWorkspaceNetwork(workspaceID); net != "" {
+		if p.selfContainerID != "" {
+			if err := p.cli.NetworkDisconnect(ctx, net, p.selfContainerID, true); err != nil && !isNoSuchNetwork(err) {
+				_ = err
+			}
+		}
 		if err := p.cli.NetworkRemove(ctx, net); err != nil && !isNoSuchNetwork(err) {
 			_ = err
 		}
@@ -303,4 +359,10 @@ func isNetworkExists(err error) bool {
 
 func isNoSuchNetwork(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "No such network")
+}
+
+// isAlreadyConnected matches Docker's error when a container is already an
+// endpoint of a network — a benign no-op for the idempotent platform attach.
+func isAlreadyConnected(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "already exists in network")
 }

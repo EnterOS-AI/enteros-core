@@ -52,6 +52,41 @@ func (s *DesktopLifecycleStore) AgentHoldsControl(ctx context.Context, workspace
 	return n > 0, nil
 }
 
+// agentControlLeaseSeconds is how long an agent control lease lasts before it
+// must be refreshed. Every /input refreshes it, so a working agent holds control
+// continuously; once it stops acting the lease lapses and a human can acquire
+// without a preempt. Matches the user default TTL (displayControlDefaultTTLSeconds).
+const agentControlLeaseSeconds = 300
+
+// AcquireAgentControl grants or refreshes the AGENT's control lease UNLESS a
+// human currently holds an unexpired lock (design §8, reviewer B2). This is the
+// production path that lets the agent actually send input: capability-IS-
+// authorization — the agent drives by default; a human takes over by preempting
+// (AcquireDisplayControl inserts controller='user', which this query then
+// yields to). Returns true if the agent holds control after the call.
+func (s *DesktopLifecycleStore) AcquireAgentControl(ctx context.Context, workspaceID string) (bool, error) {
+	var controller string
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO workspace_display_control_locks (workspace_id, controller, controlled_by, expires_at)
+		VALUES ($1, 'agent', 'agent', now() + ($2 * interval '1 second'))
+		ON CONFLICT (workspace_id) DO UPDATE
+		SET controller = 'agent', controlled_by = 'agent',
+		    expires_at = EXCLUDED.expires_at, updated_at = now()
+		WHERE workspace_display_control_locks.controller = 'agent'
+		   OR workspace_display_control_locks.expires_at <= now()
+		RETURNING controller
+	`, workspaceID, agentControlLeaseSeconds).Scan(&controller)
+	if err == sql.ErrNoRows {
+		// A human holds an unexpired lock — the conflicting row didn't match the
+		// UPDATE's WHERE, so nothing was written. Agent must pause.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return controller == "agent", nil
+}
+
 // SetVNCPresence records live human VNC viewer count + last-input time (the
 // human side of the §10 liveness signal), upserting the row.
 func (s *DesktopLifecycleStore) SetVNCPresence(ctx context.Context, workspaceID string, connections int, lastInput time.Time) error {

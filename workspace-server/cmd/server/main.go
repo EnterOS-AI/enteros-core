@@ -392,7 +392,16 @@ func main() {
 				}
 				seccompProfile = string(b)
 			}
+			desktopSecret := os.Getenv("DISPLAY_SESSION_SIGNING_SECRET")
 			sidecar := provisioner.NewLocalSidecarProvisioner(prov.DockerClient(), image, "wsnet", 6070, 10*time.Second, 2<<30, seccompProfile)
+			// B1: the provisioner derives DESKTOP_CONTROL_TOKEN from the SAME
+			// secret the gateway's TokenResolver uses, so the sidecar's control
+			// server and the gateway agree. B3: tell the provisioner which
+			// container is the platform so it joins each per-workspace network and
+			// can reach the sidecar by name (HOSTNAME is the Docker-set container
+			// id; override via MOLECULE_DESKTOP_PLATFORM_CONTAINER).
+			sidecar.SetControlTokenSecret(desktopSecret)
+			sidecar.SetSelfContainerID(envOr("MOLECULE_DESKTOP_PLATFORM_CONTAINER", os.Getenv("HOSTNAME")))
 			wh.SetSidecarProvisioner(sidecar)
 			store := handlers.NewDesktopLifecycleStore(db.DB)
 			gw := desktopgateway.New(
@@ -400,7 +409,7 @@ func main() {
 				store, // LockChecker
 				store, // ActivityRecorder
 				func(_ context.Context, workspaceID string) (string, error) {
-					return handlers.DeriveDesktopControlToken(os.Getenv("DISPLAY_SESSION_SIGNING_SECRET"), workspaceID), nil
+					return provisioner.DeriveDesktopControlToken(desktopSecret, workspaceID), nil
 				},
 				nil,
 			)

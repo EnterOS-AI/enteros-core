@@ -17,11 +17,17 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
 
-// LockChecker reports whether a workspace's agent currently holds the
-// display-control lock (design §8). INPUT is gated on this; screenshots are not
-// (sight is never arbitrated).
+// LockChecker arbitrates the display-control lock (design §8). INPUT goes through
+// AcquireAgentControl; screenshots are not gated (sight is never arbitrated).
 type LockChecker interface {
-	AgentHoldsControl(ctx context.Context, workspaceID string) (bool, error)
+	// AcquireAgentControl grants (or refreshes) the AGENT's control lease unless
+	// a HUMAN currently holds control — capability-IS-authorization: the agent
+	// drives the desktop by default, and a human takes over by preempting
+	// (AcquireDisplayControl). Returns true if the agent holds control after the
+	// call, false if a human does. This is what makes /input actually work: a
+	// passive "does the agent hold control?" check is always false because
+	// nothing else grants the agent a lease (reviewer B2).
+	AcquireAgentControl(ctx context.Context, workspaceID string) (bool, error)
 }
 
 // ActivityRecorder bumps last_agent_activity_at — the authoritative liveness
@@ -84,9 +90,10 @@ func (g *Gateway) Screenshot(ctx context.Context, workspaceID string) ([]byte, e
 }
 
 // Input proxies POST /input, FAIL-CLOSED on the control lock (§8): the agent
-// must hold control, or the input is refused with ErrHumanInControl.
+// acquires/refreshes its control lease (yielding to a human who has preempted),
+// or the input is refused with ErrHumanInControl.
 func (g *Gateway) Input(ctx context.Context, workspaceID string, action json.RawMessage) error {
-	held, err := g.locks.AgentHoldsControl(ctx, workspaceID)
+	held, err := g.locks.AcquireAgentControl(ctx, workspaceID)
 	if err != nil {
 		return err // ambiguity -> fail closed (deny)
 	}
