@@ -235,3 +235,78 @@ describe("OrgTemplatesSection — import", () => {
     });
   });
 });
+
+// A template the server could not load is returned present-but-unavailable
+// (error/reason, workspaces: 0) instead of being silently omitted — the
+// loud-log/silent-wire shape that hid molecule-core#4889. The palette must
+// render it as NON-IMPORTABLE.
+//
+// This block exists because the gate shipped with zero coverage: review deleted
+// `|| isBroken` from the disabled prop and the entire canvas suite — 271 files,
+// 3892 tests — still passed. Not one test rendered an entry with reason set.
+// That is the same defect this PR fixes on the server, relocated to the client.
+describe("OrgTemplatesSection — broken templates are not importable", () => {
+  const BROKEN = [
+    { dir: "healthy", name: "Healthy Org", description: "fine", workspaces: 2 },
+    {
+      dir: "molecule-dev",
+      name: "molecule-dev",
+      description: "",
+      workspaces: 0,
+      error: "open /…/molecule-dev/org.yml: no such file or directory",
+      reason: "half_checkout",
+    },
+  ];
+
+  it("disables import for a broken template AND fires no POST when clicked", async () => {
+    mockGet.mockResolvedValue(BROKEN);
+    render(<OrgTemplatesSection />);
+    await expandSection();
+
+    const btn = screen
+      .getAllByRole("button")
+      .find((b) => b.textContent?.includes("Unavailable"))!;
+    expect(btn).toBeTruthy();
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+
+    // The disabled ATTRIBUTE alone would pass against a tile that merely looks
+    // dimmed. Assert the effect: clicking must not reach handleImport.
+    fireEvent.click(btn);
+    await act(async () => { await Promise.resolve(); });
+    expect(mockPost).not.toHaveBeenCalled();
+  });
+
+  it("still imports a healthy template alongside a broken one", async () => {
+    mockGet.mockResolvedValue(BROKEN);
+    render(<OrgTemplatesSection />);
+    await expandSection();
+
+    const btn = screen
+      .getAllByRole("button")
+      .find((b) => b.textContent?.includes("Import org"))!;
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(btn);
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    expect(mockPost.mock.calls[0][1]).toMatchObject({ dir: "healthy" });
+  });
+
+  // The server leaves `error` empty when the underlying err is nil, while
+  // `reason` is set from a string literal on every broken path. Gating on
+  // `error` therefore renders an ENABLED Import tile for such an entry —
+  // demonstrated by probe during review.
+  it("gates on reason, so an empty error string is still non-importable", async () => {
+    mockGet.mockResolvedValue([
+      { dir: "ghost", name: "ghost", description: "", workspaces: 0, error: "", reason: "half_checkout" },
+    ]);
+    render(<OrgTemplatesSection />);
+    await expandSection();
+
+    const btn = screen.getAllByRole("button").find((b) => b.textContent?.includes("Unavailable"))!;
+    expect(btn).toBeTruthy();
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(btn);
+    await act(async () => { await Promise.resolve(); });
+    expect(mockPost).not.toHaveBeenCalled();
+  });
+});
+
