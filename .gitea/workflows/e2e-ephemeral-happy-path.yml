@@ -469,7 +469,7 @@ jobs:
           set -euo pipefail
           ARM="${GATE_ARM:-}"
           if [ -z "$ARM" ]; then
-            echo "::error::NO ARM RAN. Every step in this job skipped, so the job would have posted SUCCESS on a REQUIRED context having proved nothing. Some `if:` condition is wrong — the gate did not run, and it did not honestly no-op either."
+            echo "::error::NO ARM RAN. Every step in this job skipped, so the job would have posted SUCCESS on a REQUIRED context having proved nothing. Some 'if:' condition is wrong — the gate did not run, and it did not honestly no-op either."
             exit 1
           fi
           echo "arm=$ARM"
