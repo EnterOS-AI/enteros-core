@@ -55,7 +55,7 @@ type WorkspaceHandler struct {
 	// auth chain. Production callers still pass *CPProvisioner via
 	// SetCPProvisioner, which satisfies the interface — see the
 	// compile-time assertion in internal/provisioner/cp_provisioner.go.
-	cpProv      provisioner.CPProvisionerAPI
+	cpProv provisioner.CPProvisionerAPI
 	// sidecarProv is the desktop-sidecar backend (design §5). ONE backend: the
 	// Local (Docker) impl on self-host, the CP impl on SaaS (deferred), or nil
 	// -> the availability-gate default, so the desktop feature is cleanly
@@ -68,8 +68,8 @@ type WorkspaceHandler struct {
 	// routes report unavailable.
 	desktopGateway desktopGateway
 	platformURL    string
-	configsDir  string // path to workspace-configs-templates/ (for reading templates)
-	cacheDir    string // optional runtime-refreshed template cache; overrides configsDir by template id
+	configsDir     string // path to workspace-configs-templates/ (for reading templates)
+	cacheDir       string // optional runtime-refreshed template cache; overrides configsDir by template id
 	// envMutators runs registered EnvMutator plugins right before
 	// container Start, after built-in secret loads. Nil = no plugins
 	// registered; Registry.Run handles a nil receiver as a no-op so the
@@ -1291,6 +1291,18 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 				configFiles = updated
 				log.Printf("Create %s: delivered plugin settings for %d plugin(s) from fetched template", id, n)
 			}
+		}
+	}
+
+	// Layer 6: record what the template supplied and overlay any operator
+	// override onto the bytes this workspace is about to receive. Without this
+	// the DB would remember an override while the freshly provisioned workspace
+	// quietly ran the template value — the edit would survive in storage and
+	// die on the box. Non-fatal; see applyPluginSettingsLayers.
+	if len(configFiles) > 0 && db.DB != nil {
+		if updated, n := applyPluginSettingsLayers(ctx, db.DB, id, configFiles); n > 0 {
+			configFiles = updated
+			log.Printf("Create %s: re-applied operator overrides to %d plugin settings file(s)", id, n)
 		}
 	}
 
