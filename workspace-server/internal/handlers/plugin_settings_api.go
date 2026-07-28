@@ -42,6 +42,14 @@ type patchPluginSettingsRequest struct {
 // Returns ok=false when a response has already been written.
 func resolvePluginParam(c *gin.Context, workspaceID string) (string, bool) {
 	requested := c.Param("plugin")
+	if db.DB == nil {
+		// Without the DB there is no install-name set to pin against. Say so —
+		// a 404 here would read as "no such plugin", which is a different and
+		// wrong answer. (GET/PATCH already check this; the declaration route
+		// did not need a DB before the pin, so the check belongs here.)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return "", false
+	}
 	resolved, err := resolvePluginInstallName(c.Request.Context(), db.DB, workspaceID, requested)
 	if err == nil {
 		return resolved, true
