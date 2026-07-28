@@ -359,6 +359,11 @@ jobs:
         name: Run live-container tests (MOLECULE_LIVE_DOCKER)
         env:
           MOLECULE_LIVE_DOCKER: "1"
+          # Unique per run for the same reason PG_NAME is: this workflow's
+          # concurrency group is keyed on the head SHA, so two handlers-touching
+          # PRs share one Docker daemon and a fixed box name would let each
+          # `docker rm -f` the other's container mid-test.
+          MOLECULE_LIVE_BOX_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -uo pipefail
           # The TestLiveBox_* suite proves things NO unit test can reach: that a
@@ -392,8 +397,28 @@ jobs:
             echo "::error::live-container gate SKIPPED ${nskip} test(s). A skip here means MOLECULE_LIVE_DOCKER did not take effect or the Docker daemon was unreachable — which is indistinguishable from a pass in the job summary, and is precisely the failure this gate exists to close."
             exit 1
           fi
-          if [ "${npass:-0}" -eq 0 ]; then
-            echo "::error::live-container gate ran ZERO tests (0 '--- PASS: TestLiveBox_' lines) but go test still exited 0. Check the -run regex ^TestLiveBox_ and that plugin_settings_writer_live_test.go still declares them."
+          # `npass -gt 0` is NOT enough, and this is not hypothetical: two of the
+          # seven TestLiveBox_* (UnsafeInstallNameNeverReachesTheBox,
+          # LiveWriteMatchesProvisionRenderByteForByte) never call
+          # liveDockerOrSkip — they are pure unit tests that happen to share the
+          # prefix. Refactor the five container tests away and this step scores
+          # npass=2 nskip=0 rc=0 and reports GREEN having started no container at
+          # all. Reproduced by execution, not argued: that is the same
+          # "artifact real, wiring absent" shape the step was written to close,
+          # reappearing inside the guard itself.
+          #
+          # So require a FLOOR, and name the one test that must have run.
+          LIVE_MIN=5
+          if [ "${npass:-0}" -lt "$LIVE_MIN" ]; then
+            echo "::error::live-container gate saw ${npass} '--- PASS: TestLiveBox_' line(s), expected at least ${LIVE_MIN}. Either a live test was removed/renamed without updating LIVE_MIN, or the -run regex ^TestLiveBox_ no longer matches the suite. Note that some TestLiveBox_* are pure unit tests, so a nonzero count alone does not prove a container ever started."
+            exit 1
+          fi
+          # The canary: the specific regression guard for the #4922 doubled-destPath
+          # bug, where every save silently wrote to /configs/configs/... while the
+          # API answered {"status":"saved"}. If THIS test stops running, the gate
+          # has lost the thing it was built for, whatever the counts say.
+          if ! grep -q -E '^[[:space:]]*--- PASS: TestLiveBox_FilesAPISaveActuallyLandsOnTheBox' "$LOG"; then
+            echo "::error::live-container gate did not run TestLiveBox_FilesAPISaveActuallyLandsOnTheBox — the #4922 regression guard. If it was deliberately renamed, update this check to the new name; do NOT delete the check."
             exit 1
           fi
 

@@ -51,7 +51,23 @@ func startLiveBox(t *testing.T) string {
 
 // liveWorkspaceID is the id the writer resolves; the container is named
 // ws-<id> so the REAL findContainer finds it.
-const liveWorkspaceID = "settings-writer-proof"
+//
+// It MUST be unique per CI run. This workflow's concurrency group is keyed on
+// the head SHA, so two handlers-touching PRs run their jobs concurrently against
+// ONE shared Docker daemon — the same reason Postgres is named
+// pg-handlers-${RUN_ID}-${RUN_ATTEMPT}. With a fixed name, startLiveBoxFor's
+// `docker rm -f` would evict the OTHER run's box mid-test; worse than a flaky
+// red, the file-count assertions could then read a box that belongs to a
+// different run and report a FALSE GREEN.
+var liveWorkspaceID = func() string {
+	// MOLECULE_LIVE_BOX_SUFFIX is set from ${RUN_ID}-${RUN_ATTEMPT} in CI and is
+	// empty for a local run, where a stable name is convenient and there is no
+	// concurrent peer to collide with.
+	if sfx := strings.TrimSpace(os.Getenv("MOLECULE_LIVE_BOX_SUFFIX")); sfx != "" {
+		return "settings-writer-proof-" + sfx
+	}
+	return "settings-writer-proof"
+}()
 
 func startLiveBoxFor(t *testing.T, workspaceID string) string {
 	t.Helper()
