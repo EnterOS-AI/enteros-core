@@ -344,7 +344,8 @@ func (p *LocalSidecarProvisioner) ensureEgressProxy(ctx context.Context, workspa
 		// Cap the proxy's RAM (reviewer note): it is a tiny stream-copy forward
 		// proxy, so 256MB is generous, and a compromised/runaway proxy must not
 		// pressure the host. Swap pinned to the cap; shed the proxy first.
-		Resources: container.Resources{Memory: proxyMemoryLimitBytes, MemorySwap: proxyMemoryLimitBytes, OomScoreAdj: 500},
+		Resources:   container.Resources{Memory: proxyMemoryLimitBytes, MemorySwap: proxyMemoryLimitBytes},
+		OomScoreAdj: 500,
 	}
 	netCfg := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
