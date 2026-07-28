@@ -15,6 +15,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"sort"
@@ -89,24 +90,33 @@ func parsePluginDeclaration(manifestYAML []byte) (pluginDeclaration, error) {
 	return out, nil
 }
 
+// errUnsafeInstallName is returned before ANY backend is touched when the
+// install name could address something outside plugins/<name>/. A sentinel
+// rather than a bare fmt.Errorf so a test can assert the guard actually fired:
+// with no reachable backend every name errors, so `err != nil` proves nothing
+// about the guard (see TestDeclaration_UnsafeInstallNameIsRefusedBeforeAnyRead).
+var errUnsafeInstallName = errors.New("unsafe plugin install name")
+
 // readPluginManifestFromWorkspace fetches an installed plugin's plugin.yaml off
-// the workspace. Mirrors ReadFile's backend dispatch.
+// the workspace.
+//
+// It goes through readWorkspaceConfigFile, which is the SAME three-way backend
+// dispatch writePluginSettingsToWorkspace uses. Before that it had one branch —
+// findContainer → docker exec — and findContainer returns "" whenever
+// h.docker == nil, i.e. on the docker-less CP tenant shape and on every
+// SaaS/EC2 workspace. A declared AND installed plugin 404'd on both, and the
+// endpoint was dead off local Docker.
+//
+// The three failure modes stay distinguishable in the returned error:
+// errWorkspaceFileAbsent (not installed), errWorkspaceUnreachable (cannot see
+// the box), errWorkspaceReadFailed (the backend errored).
 func (h *TemplatesHandler) readPluginManifestFromWorkspace(
 	ctx context.Context, workspaceID, installName string,
 ) ([]byte, error) {
-	if installName == "" || installName != path.Base(installName) {
-		return nil, fmt.Errorf("unsafe plugin install name %q", installName)
+	if installName == "" || installName != path.Base(installName) || installName == "." || installName == ".." {
+		return nil, fmt.Errorf("%w: %q", errUnsafeInstallName, installName)
 	}
-	rel := path.Join("plugins", installName, "plugin.yaml")
-
-	if containerName := h.findContainer(ctx, workspaceID); containerName != "" {
-		out, err := h.execInContainer(ctx, containerName, []string{"cat", path.Join("/configs", rel)})
-		if err != nil {
-			return nil, fmt.Errorf("read %s from %s: %w", rel, workspaceID, err)
-		}
-		return []byte(out), nil
-	}
-	return nil, fmt.Errorf("workspace %s has no running container to read %s from", workspaceID, rel)
+	return h.readWorkspaceConfigFile(ctx, workspaceID, path.Join("plugins", installName, "plugin.yaml"))
 }
 
 // renderSettingsExample generates the `.example` file for a plugin's settings.

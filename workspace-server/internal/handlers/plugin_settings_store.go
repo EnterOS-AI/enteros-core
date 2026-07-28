@@ -167,6 +167,55 @@ func writeTemplateConfig(ctx context.Context, db *sql.DB, workspaceID, pluginNam
 	return nil
 }
 
+// seedTemplateConfigIfEmpty records a `config` layer for a plugin whose row has
+// none, WITHOUT ever overwriting one that already exists.
+//
+// WHY THIS IS NEEDED AT ALL. writeTemplateConfig — the only writer of `config` —
+// is reached solely from applyPluginSettingsLayers, which is gated on
+// pluginSettingsLayersEnabled(). That flag ships OFF, so on the default
+// configuration `config` is NEVER populated, and the PATCH path's
+// effectiveSettings(config={}, overrides) collapses to the overrides alone.
+// Delivery is not flag-gated, so the wholesale file write then DELETED every
+// template-supplied key. Seeding `config` from what the box is actually running
+// closes that at the root: the effective map regains the template layer, and
+// GET regains the provenance to explain the un-overridden keys.
+//
+// The WHERE clause is what makes this safe to call on every PATCH: it can only
+// fill an EMPTY config, so it can never fight writeTemplateConfig, and like it,
+// it never touches `overrides` or `overrides_version`.
+//
+// Returns whether a config layer was actually written.
+func seedTemplateConfigIfEmpty(
+	ctx context.Context, db *sql.DB, workspaceID, pluginName string, values map[string]any,
+) (bool, error) {
+	if len(values) == 0 {
+		return false, nil
+	}
+	cfg := make(settingMap, len(values))
+	for k, v := range values {
+		cfg[k] = newSettingValue(v, layerTemplate, "template")
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return false, fmt.Errorf("encode seeded config: %w", err)
+	}
+	res, err := db.ExecContext(ctx,
+		`INSERT INTO workspace_plugin_settings (workspace_id, plugin_name, config)
+		      VALUES ($1, $2, $3::jsonb)
+		 ON CONFLICT (workspace_id, plugin_name)
+		 DO UPDATE SET config = EXCLUDED.config, updated_at = NOW()
+		       WHERE workspace_plugin_settings.config = '{}'::jsonb`,
+		workspaceID, pluginName, raw)
+	if err != nil {
+		return false, fmt.Errorf("seed config for %s/%s: %w", workspaceID, pluginName, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, nil // the write went through; the count is advisory
+	}
+	return n > 0, nil
+}
+
 // errOverridesVersionConflict signals a lost-update race: the caller edited a
 // version that is no longer current.
 var errOverridesVersionConflict = fmt.Errorf("overrides_version conflict")
@@ -189,6 +238,34 @@ func patchOverrides(
 		return 0, fmt.Errorf("begin overrides patch: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// SERIALISE THE READ-MODIFY-WRITE ON A KEY THAT EXISTS EVEN WHEN THE ROW
+	// DOES NOT.
+	//
+	// The SELECT below is `FOR UPDATE`, which locks a TUPLE — and takes NO LOCK
+	// AT ALL when there is no tuple to lock. On the FIRST write for a plugin the
+	// row does not exist yet, so two concurrent transactions both read ErrNoRows,
+	// both see current=0, both pass the compare-and-set at expectedVersion==0,
+	// both compute newVersion=1, and the second INSERT … ON CONFLICT DO UPDATE
+	// overwrites `overrides` WHOLESALE. Measured before this lock: 24 of 25
+	// concurrent first writes silently discarded one operator's edit, both
+	// callers getting 200 and version:1 and neither getting a 409.
+	//
+	// And the first write is not an edge case: `config` is only ever populated by
+	// writeTemplateConfig, which is flag-gated OFF by default, so the row comes
+	// into existence on the first PATCH. "Absent row" is the state every
+	// workspace starts in.
+	//
+	// pg_advisory_xact_lock takes a lock on the NAME rather than on a tuple, so
+	// it exists before the row does and is released automatically at COMMIT or
+	// ROLLBACK (no leak on an error path). Keyed on hashtext of
+	// workspace_id||plugin_name: a hash collision costs two unrelated plugins a
+	// little serialisation, never correctness.
+	if _, err = tx.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2))`,
+		workspaceID, pluginName); err != nil {
+		return 0, fmt.Errorf("lock plugin settings for %s/%s: %w", workspaceID, pluginName, err)
+	}
 
 	var ovrRaw []byte
 	var current int64
