@@ -11,6 +11,22 @@
 >
 > So Part A's PR tables below, and its preconditions marked **❌ NOT MET**, describe work that is **already done**. Reading this doc as current will mislead you into thinking a dual path still exists to fall back on — it does not. The only remaining P4b item is the physical `DROP TABLE`, which is tracked in the M3 milestone of the plugin-config plan.
 >
+> **Re-verified by execution 2026-07-27** (not by reading this doc's own claims):
+>
+> * Every symbol PR2–PR7 was to delete returns **zero non-test Go hits**: `scheduleBackendIsVolume`,
+>   `scheduleProxyKillEnv`, `MigrateToVolume`, `BackfillSchedulerPlugin`, `orgImportScheduleSQL`,
+>   `seedTemplateSchedules`, `migrateRuntimeSchedulesFromRemovedPredecessor`, `ReapOrphans`.
+>   The symbols PR3–PR6 said to **keep** are still there: `parseTemplateSchedules`, `pokeVolumeSchedules`,
+>   `volumeAdminScheduleHealth`, `ensureSchedulerPluginDeclared`.
+> * The routes were checked against the **engine's own route table** (`gin.Engine.Routes()` from a
+>   constructed `router.Setup`), not a regex over `router.go` — a `router.go`-only scan gives a wrong
+>   answer here, because `/admin/cutovers/native-channels/inventory` is registered in a *different*
+>   file and would be misreported as dead. `/admin/schedules/orphans`, `/admin/schedules/reap-orphans`,
+>   `migrate-to-volume` and `backfill-plugin` are all absent from that table; `/admin/schedules/health`
+>   is present.
+> * No `DROP TABLE workspace_schedules` migration exists in `workspace-server/migrations/`, so **PR8 is
+>   genuinely outstanding** — it is the one row in A.3 that is still real work.
+>
 > Part B (D3, the baked digest roster) has **not** been re-verified and may still be accurate.
 
 **Status:** planning artifact (reviewable deletion plan). The deletions themselves are **owner/CTO-gated** on the preconditions below and are **not** opened as PRs here — drafting them now would produce large, un-mergeable red-CI diffs against preconditions that are not yet met. The one **additive** precondition (P4b PR1, the direct-Create render leg) already landed as a sibling PR ([#4444](https://git.moleculesai.app/molecule-ai/molecule-core/pulls/4444), merged, main `76ad5eab`).
@@ -32,33 +48,54 @@ The scheduler moved to a per-workspace trigger plugin; the volume grid is now au
 
 | # | Precondition | Met? | Evidence / gate |
 |---|---|---|---|
-| P1 | Fleet 100% native — 4 prod tenants restarted onto **runtime-0.4.13**, `GET /admin/schedules/health` shows **zero** legacy-DB entries | ❌ NOT MET | health handler still reports DB rows; fleet pins pending (#4411 item 1) |
-| P2 | Backfill-plugin **dry-run → `?apply=true`** per tenant | ❌ NOT MET | owner/CTO-gated, #4411 step 2; route live at `POST /admin/schedules/backfill-plugin` (`router.go` → `schedh.BackfillSchedulerPlugin`) |
-| P3 | Per-workspace **migrate-to-volume** for every `source='runtime'` workspace: `migrated + skipped == total`, `failed == 0` | ❌ NOT MET | route live at `POST /admin/workspaces/:id/schedules/migrate-to-volume` (`router.go` → `schedh.MigrateToVolume`) |
-| P4 | **core#4435** volume-side org-re-import inheritance path shipped + deployed | ❌ NOT MET — **HARD BLOCKER** | [issue #4435](https://git.moleculesai.app/molecule-ai/molecule-core/issues/4435) open |
-| P5 | **runtime#318** `config.yaml` seed leg deployed fleet-wide | ❌ NOT MET | core leg landed (#4444); runtime seed leg + fleet deploy pending |
+| P1 | Fleet 100% native — `GET /admin/schedules/health` shows **zero** legacy-DB entries | ✅ **MOOT** | The health handler no longer *has* a legacy-DB leg to report from. `admin_schedules_health.go` reads the volume grid (`volumeAdminScheduleHealth`); its only SQL is a workspace-name lookup. A precondition phrased as "the DB leg shows nothing" cannot gate anything once the DB leg is deleted. |
+| P2 | Backfill-plugin **dry-run → `?apply=true`** per tenant | ✅ **MOOT — route deleted** | `POST /admin/schedules/backfill-plugin` **no longer exists**. `BackfillSchedulerPlugin` has zero Go references and the path is absent from the engine's route table; a call 404s. |
+| P3 | Per-workspace **migrate-to-volume** for every `source='runtime'` workspace | ✅ **MOOT — route deleted** | `POST /admin/workspaces/:id/schedules/migrate-to-volume` **no longer exists**. `MigrateToVolume` has zero Go references and the path is absent from the engine's route table; a call 404s. |
+| P4 | **core#4435** volume-side org-re-import inheritance path shipped + deployed | ⚠️ **UNVERIFIED — treat as still gating** | A volume-side restore path **is** present and wired: `schedules_inheritance.go` → `RestoreInheritedRuntimeSchedules`, hooked in via `SetRestoreSchedulesFunc` in `router.go`. But [issue #4435](https://git.moleculesai.app/molecule-ai/molecule-core/issues/4435) is **still open**, and whether that code fully closes the re-import carry-over gap was **not** established here — it needs a re-import exercised end to end, not a symbol grep. Do not downgrade this row on the strength of the symbol existing. |
+| P5 | **runtime#318** `config.yaml` seed leg deployed fleet-wide | ⚠️ **UNVERIFIED from this repo** | The core render leg landed (#4444). Whether the runtime seed leg is deployed fleet-wide is a fleet-state question that cannot be answered from a core checkout. |
 
 **No PR below may open until its row's gate is green.** The table-drop tail (PR8) additionally requires **≥1 release** of PR2–7 running in production so a rollback window exists (expand→contract).
+
+> **The gating above is now historical for PR2–PR7 — they have landed.** P1–P3 did not so much
+> get *satisfied* as get *deleted*: the routes and the DB leg they gated on are gone. What still
+> gates **PR8** is unchanged and still real — the P4 carry-over question, plus the ≥1-release soak.
 
 ### A.2 The single most important safety trap
 
 > **Dropping `workspace_schedules` before core#4435 ships SILENTLY and IRREVERSIBLY loses user-created schedules on the next org re-import.**
 
-Org re-import (`org_import.go`) re-seeds template schedules and, today, re-points runtime-created rows via `migrateRuntimeSchedulesFromRemovedPredecessor` (`org_import.go:992`, called at `org_import.go:682`). Until the **volume-side** inheritance path (#4435) exists, the volume grid has no equivalent "carry my `source='runtime'` schedules across a re-import" mechanism. If the DB table is dropped first, a re-import produces a workspace whose user schedules are simply **gone** — no error, no orphan row, nothing to reap. This is why P4 is a hard blocker gating **both** PR5 (which retires the DB migrate helper) and PR8 (the drop). Do not reorder around it.
+**This section was written when the DB was still the safety net. It no longer is — and that makes the
+trap worse, not better.** The DB-side helper this paragraph relied on,
+`migrateRuntimeSchedulesFromRemovedPredecessor`, **has already been deleted** (zero Go references), and
+nothing in core reads `workspace_schedules`. So the fallback described below is not something PR8 would
+*remove* — it is already gone. The DB table still physically exists, but it is inert: its rows are not
+read, not written, and not fired.
+
+What replaced it is `RestoreInheritedRuntimeSchedules` (`schedules_inheritance.go`, wired via
+`SetRestoreSchedulesFunc`) — the volume-side carry-over path. **Whether that path actually closes the
+re-import gap is not established:** issue #4435 is still open, and proving it needs an org re-import
+exercised end to end, with a schedule created at the workspace and checked for survival. A symbol
+existing is not the same as the gap being closed — that inference is exactly the failure mode this
+programme keeps hitting.
+
+The original hazard therefore still stands for **PR8**, restated for the current world: if an org
+re-import does not carry a workspace's own schedules across on the volume side, dropping the table
+removes the last place those rows existed, and the loss is silent — no error, no orphan row, nothing to
+reap. Establish the carry-over behaviour by running it before scheduling PR8.
 
 ### A.3 Ordered PR sequence
 
 | PR | What it deletes / changes | Gated on |
 |---|---|---|
 | **PR1** | **(DONE — sibling #4444)** Additive: render template/org schedules directly into the delivered `config.yaml` on the direct-Create path. Nothing removed. | — (landed, main `76ad5eab`) |
-| **PR2** | In `schedules.go`, remove the legacy DB-CRUD **else-arms** behind every `scheduleBackendIsVolume(...)` branch (the `FROM/INTO/UPDATE/DELETE workspace_schedules` blocks at `schedules.go:122,210,240,298,338,384,427,475,589`); make the volume proxy **unconditional**; delete `scheduleBackendIsVolume` (`schedules_proxy.go:48`) and the `SCHEDULE_VOLUME_PROXY_DISABLED` kill-switch (`schedules_proxy.go:39`, `scheduleProxyKillEnv`). | P1 |
-| **PR3** | Drop the DB **seed** path: `orgImportScheduleSQL` (`org.go:195`), the `org_import.go` seeding loop (`org_import.go:714`), and `seedTemplateSchedules` (`template_schedules.go:126`). **Keep `parseTemplateSchedules`** (`template_schedules.go:79`) — the config.yaml render leg (PR1/#4444) still needs it. | after PR1; P1 + P5 |
-| **PR4** | In `webhooks.go`, remove the legacy `UPDATE workspace_schedules SET next_run_at = now()` writes (`webhooks.go:444–447` and `489–492`). **Keep `pokeVolumeSchedules`** (`webhooks.go:353`) — it is the volume-native fire path. | P1 |
-| **PR5** | Retire `admin_schedules_health.go` legacy DB legs — `Health` DB path (`admin_schedules_health.go:151`), `Orphans` (`:282`), `ReapOrphans` (`:322`) — and `migrateRuntimeSchedulesFromRemovedPredecessor` (`org_import.go:992` + call site `:682`). Keep the volume health path (`volumeAdminScheduleHealth`, `admin_schedules_health.go:68`). Unregister the retired admin routes in `router.go` — `GET /admin/schedules/orphans` (`asHealth.Orphans`) and `POST /admin/schedules/reap-orphans` (`asHealth.ReapOrphans`); repoint or retire `GET /admin/schedules/health` (`asHealth.Health`) onto the volume path. | **AFTER core#4435 (P4)** |
-| **PR6** | Retire the ops routes `MigrateToVolume` (`schedules_proxy.go:471`) + `BackfillSchedulerPlugin` (`scheduler_plugin.go:152`) and their registrations in `router.go` (the `schedh.MigrateToVolume` + `schedh.BackfillSchedulerPlugin` routes). **Preserve `ensureSchedulerPluginDeclared`** (`scheduler_plugin.go:53`) — plugin-declare is still live. | after **P2 + P3 complete** (both backfills fleet-universal) |
-| **PR7** | Remove the remaining `workspace_crud.go` touchpoints: the cascade-list entry (`workspace_crud.go:695`), the enabled-count read (`:747`), and the disable-on-archive UPDATE (`:822`). | after PR2–6 |
-| **PR8** | The **drop migration**: `DROP INDEX IF EXISTS` (all four: `idx_schedules_workspace`, `idx_schedules_next_run`, `idx_schedules_workspace_name`) + `DROP TABLE IF EXISTS workspace_schedules`. `.down.sql` recreates the **full post-015/022/032/20260523 shape** — every column (incl. `source`, `consecutive_empty_runs`, `consecutive_sdk_errors`) + all indexes + the `workspace_schedules_source_check` constraint. Mirror the `20260520120000_drop_runtime_image_pins` precedent (`.up.sql`/`.down.sql`) **and** its content-shape test (`internal/db/migration_20260520_drop_runtime_image_pins_test.go`). | **AFTER PR2–7** AND **≥1 release** with the table left dormant (readers removed, table not yet dropped) for a rollback window (expand→contract) |
-| **PR9** | Anti-regression guard in `.gitea/scripts/tests/test_no_retired_deployment_artifacts.py`: content-negative assertion that `workspace_schedules` and `orgImportScheduleSQL` appear in **zero** non-test Go files; plus a migration-shape check. **Each arm negative-controlled (RED-first)** before the deletions land. | ships alongside PR8 (guard the end state) |
+| **PR2** ✅ **LANDED** | ~~In `schedules.go`, remove the legacy DB-CRUD **else-arms** behind every `scheduleBackendIsVolume(...)` branch (the `FROM/INTO/UPDATE/DELETE workspace_schedules` blocks at `schedules.go:122,210,240,298,338,384,427,475,589`); make the volume proxy **unconditional**; delete `scheduleBackendIsVolume` (`schedules_proxy.go:48`) and the `SCHEDULE_VOLUME_PROXY_DISABLED` kill-switch (`schedules_proxy.go:39`, `scheduleProxyKillEnv`).~~ **Done** — all four symbols return zero non-test Go hits; the volume proxy is unconditional. | ~~P1~~ |
+| **PR3** ✅ **LANDED** | ~~Drop the DB **seed** path: `orgImportScheduleSQL` (`org.go:195`), the `org_import.go` seeding loop (`org_import.go:714`), and `seedTemplateSchedules` (`template_schedules.go:126`). **Keep `parseTemplateSchedules`** (`template_schedules.go:79`) — the config.yaml render leg (PR1/#4444) still needs it.~~ **Done** — `orgImportScheduleSQL` and `seedTemplateSchedules` are gone (only a test *comment* still names them); `parseTemplateSchedules` correctly survives with 6 non-test callers. | ~~after PR1; P1 + P5~~ |
+| **PR4** ✅ **LANDED** | ~~In `webhooks.go`, remove the legacy `UPDATE workspace_schedules SET next_run_at = now()` writes (`webhooks.go:444–447` and `489–492`). **Keep `pokeVolumeSchedules`** (`webhooks.go:353`) — it is the volume-native fire path.~~ **Done** — no non-test Go file references `workspace_schedules` at all; `pokeVolumeSchedules` correctly survives. | ~~P1~~ |
+| **PR5** ✅ **LANDED** | ~~Retire `admin_schedules_health.go` legacy DB legs — `Health` DB path (`admin_schedules_health.go:151`), `Orphans` (`:282`), `ReapOrphans` (`:322`) — and `migrateRuntimeSchedulesFromRemovedPredecessor` (`org_import.go:992` + call site `:682`). Keep the volume health path (`volumeAdminScheduleHealth`, `admin_schedules_health.go:68`). Unregister the retired admin routes in `router.go` — `GET /admin/schedules/orphans` (`asHealth.Orphans`) and `POST /admin/schedules/reap-orphans` (`asHealth.ReapOrphans`); repoint or retire `GET /admin/schedules/health` (`asHealth.Health`) onto the volume path.~~ **Done** — `Orphans`/`ReapOrphans`/`migrateRuntimeSchedulesFromRemovedPredecessor` are gone and neither orphans route is in the engine's route table; `GET /admin/schedules/health` survives, repointed onto `volumeAdminScheduleHealth`. **Note this shipped despite the row's own `AFTER core#4435` gate, which is still open** — see P4. | ~~**AFTER core#4435 (P4)**~~ |
+| **PR6** ✅ **LANDED** | ~~Retire the ops routes `MigrateToVolume` (`schedules_proxy.go:471`) + `BackfillSchedulerPlugin` (`scheduler_plugin.go:152`) and their registrations in `router.go` (the `schedh.MigrateToVolume` + `schedh.BackfillSchedulerPlugin` routes). **Preserve `ensureSchedulerPluginDeclared`** (`scheduler_plugin.go:53`) — plugin-declare is still live.~~ **Done** — both handlers and both registrations are gone; `ensureSchedulerPluginDeclared` correctly survives (16 non-test references). | ~~after **P2 + P3 complete**~~ |
+| **PR7** ✅ **LANDED** | ~~Remove the remaining `workspace_crud.go` touchpoints: the cascade-list entry (`workspace_crud.go:695`), the enabled-count read (`:747`), and the disable-on-archive UPDATE (`:822`).~~ **Done** — zero non-test Go references to `workspace_schedules` remain anywhere in the tree. | ~~after PR2–6~~ |
+| **PR8** ⬜ **OUTSTANDING — the only real work left in Part A** | The **drop migration**: `DROP INDEX IF EXISTS` (all four: `idx_schedules_workspace`, `idx_schedules_next_run`, `idx_schedules_workspace_name`) + `DROP TABLE IF EXISTS workspace_schedules`. `.down.sql` recreates the **full post-015/022/032/20260523 shape** — every column (incl. `source`, `consecutive_empty_runs`, `consecutive_sdk_errors`) + all indexes + the `workspace_schedules_source_check` constraint. Mirror the `20260520120000_drop_runtime_image_pins` precedent (`.up.sql`/`.down.sql`) **and** its content-shape test (`internal/db/migration_20260520_drop_runtime_image_pins_test.go`). | **AFTER PR2–7** AND **≥1 release** with the table left dormant (readers removed, table not yet dropped) for a rollback window (expand→contract) |
+| **PR9** ⬜ **OUTSTANDING** | Anti-regression guard in `.gitea/scripts/tests/test_no_retired_deployment_artifacts.py`: content-negative assertion that `workspace_schedules` and `orgImportScheduleSQL` appear in **zero** non-test Go files; plus a migration-shape check. **Each arm negative-controlled (RED-first)** before the deletions land. Note the target file **already exists** but carries **no** `workspace_schedules` / `orgImportScheduleSQL` arm — the guard was never added, so the end state PR2–7 reached is currently unguarded against regression. | ships alongside PR8 (guard the end state) |
 
 ### A.4 Table shape the `.down.sql` must restore (PR8)
 
