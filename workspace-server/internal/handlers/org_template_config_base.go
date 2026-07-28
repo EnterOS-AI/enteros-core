@@ -23,6 +23,7 @@ package handlers
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -170,4 +171,47 @@ func templateDeclaredPlugins(templateYAML []byte) []string {
 // inheriting a template's plugins is only safe if a node can decline one.
 func mergePluginsWithTemplate(templatePlugins, defaultPlugins, wsPlugins []string) []string {
 	return mergePlugins(mergePlugins(templatePlugins, defaultPlugins), wsPlugins)
+}
+
+// resolveOrgNodeTemplateDir resolves an org node's `template:` to a directory
+// on disk, checking the TEMPLATE CACHE as well as the configs dir.
+//
+// M6 / FIX 0. Org import resolves a node's `template:` against `h.configsDir`
+// ONLY. But on SaaS the real template arrives through the Gitea asset channel
+// and lands in the template CACHE — `resolveTemplateDir` (the workspace-name
+// path) already knows this and checks `cacheDir` first. The org-node path never
+// did, so
+//
+//   - name: SEO
+//     template: seo-agent
+//
+// silently resolves to nothing on exactly the deployment where the template is
+// fetched rather than baked, and the node falls back to `<runtime>-default`.
+// That is a silent downgrade: the workspace provisions, just not from the
+// template the author named.
+//
+// Cache FIRST, matching resolveTemplateDir's precedence — a fetched template is
+// fresher than a baked one, and on a tenant whose image predates a template
+// change the baked copy is precisely the stale one.
+//
+// Both roots keep the same containment check the configs path already used:
+// `template` is untrusted YAML, so an absolute path or a `../` escape is
+// refused before any stat.
+func resolveOrgNodeTemplateDir(configsDir, cacheDir, template string) string {
+	if template == "" {
+		return ""
+	}
+	for _, root := range []string{cacheDir, configsDir} {
+		if root == "" {
+			continue
+		}
+		tp, err := resolveInsideRoot(root, template)
+		if err != nil {
+			continue // absolute / escaping — refused for BOTH roots, not just one
+		}
+		if info, statErr := os.Stat(tp); statErr == nil && info.IsDir() {
+			return tp
+		}
+	}
+	return ""
 }
