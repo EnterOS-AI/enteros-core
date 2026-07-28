@@ -53,4 +53,22 @@ func TestComputerUseContract_MatchesSSOT(t *testing.T) {
 	if molcontracts.ComputerUseInputSuccessStatus != 204 {
 		t.Errorf("input success status drift: SSOT %d, want 204", molcontracts.ComputerUseInputSuccessStatus)
 	}
+
+	// Action set: the SSOT enum must be exactly the actions the control server
+	// dispatches (internal/desktopcontrol), including "navigate" (open_url). A
+	// drift here means the agent could be offered an action the sidecar rejects,
+	// or a shipped action the contract doesn't document.
+	wantActions := map[string]bool{
+		"screenshot": true, "click": true, "type": true,
+		"key": true, "scroll": true, "navigate": true,
+	}
+	for _, a := range molcontracts.ComputerUseActions {
+		if !wantActions[a] {
+			t.Errorf("SSOT action %q is not a control-server action", a)
+		}
+		delete(wantActions, a)
+	}
+	if len(wantActions) != 0 {
+		t.Errorf("SSOT actions missing control-server actions: %v", wantActions)
+	}
 }

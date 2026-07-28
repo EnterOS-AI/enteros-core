@@ -51,6 +51,25 @@ func (h *WorkspaceHandler) DesktopScreenshot(c *gin.Context) {
 	c.Data(http.StatusOK, "image/png", png)
 }
 
+// DesktopControlStatus handles GET /workspaces/:id/desktop/control — reports
+// whether a HUMAN currently holds the display-control lock. The agent's
+// desktop_wait_for_control tool polls this to pause while a human is driving and
+// resume when control frees (§8 arbitration). Workspace-token gated (same wsAuth
+// group as screenshot/input) so the agent can call it directly; it reads only
+// the lock, never touches the sidecar, so it works regardless of scale state.
+func (h *WorkspaceHandler) DesktopControlStatus(c *gin.Context) {
+	lock, found, err := h.loadActiveDisplayControl(c, c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load display control"})
+		return
+	}
+	humanInControl := found && lock.Controller == "user"
+	c.JSON(http.StatusOK, gin.H{
+		"human_in_control":  humanInControl,
+		"agent_can_control": !humanInControl,
+	})
+}
+
 // DesktopInput handles POST /workspaces/:id/desktop/input — the agent's hands.
 // The gateway is FAIL-CLOSED on the control lock (§8): a human holding control
 // yields 409 so the agent pauses instead of fighting for the cursor.
