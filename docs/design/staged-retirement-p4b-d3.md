@@ -1,5 +1,18 @@
 # Staged-retirement runbook — P4b (drop `workspace_schedules`) + D3 (delete the baked digest roster)
 
+> ## ⚠️ Part A (P4b) has SHIPPED — this plan is stale
+>
+> Verified against current `main` on 2026-07-27:
+>
+> * `grep -rn "workspace_schedules" workspace-server/internal --include='*.go'` (excluding tests) returns **nothing** — no core code reads or writes the table.
+> * `SCHEDULE_VOLUME_PROXY_DISABLED` / `scheduleProxyKillEnv` **no longer exist**; the volume proxy is unconditional.
+> * `schedules_proxy.go`'s own header states it: *"the legacy dual-path core-DB schedule backend was retired in P4b."*
+> * History and Health are volume-proxied, not DB-backed.
+>
+> So Part A's PR tables below, and its preconditions marked **❌ NOT MET**, describe work that is **already done**. Reading this doc as current will mislead you into thinking a dual path still exists to fall back on — it does not. The only remaining P4b item is the physical `DROP TABLE`, which is tracked in the M3 milestone of the plugin-config plan.
+>
+> Part B (D3, the baked digest roster) has **not** been re-verified and may still be accurate.
+
 **Status:** planning artifact (reviewable deletion plan). The deletions themselves are **owner/CTO-gated** on the preconditions below and are **not** opened as PRs here — drafting them now would produce large, un-mergeable red-CI diffs against preconditions that are not yet met. The one **additive** precondition (P4b PR1, the direct-Create render leg) already landed as a sibling PR ([#4444](https://git.moleculesai.app/molecule-ai/molecule-core/pulls/4444), merged, main `76ad5eab`).
 
 **Companions:**

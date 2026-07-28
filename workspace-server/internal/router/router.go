@@ -38,7 +38,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, greeter func(workspaceID string, toolCount int), channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -471,19 +471,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// concierge flip / ordinary workspace's first register), drive a real
 	// agent turn so the agent greets the user in its own persona, delivered
 	// through the AgentMessageWriter SSOT (first_boot_greeting.go). A fresh
-	// onboarding lands in a chat where the agent has already spoken.
-	rh.SetFirstBootGreeter(handlers.FirstBootGreeter(
-		handlers.NewAgentMessageWriter(db.DB, broadcaster),
-		wh.ProxyA2ARequest,
-		// Wake-lifecycle owner (PR-D): record the greet intent + bump the desired
-		// generation and thread the shared idempotency key. Greet-once stays owned
-		// by the has_greeted marker (workspaceHasGreeted + claimGreetDelivery) — see
-		// GreetWakeHooks; Decision.Fire is intentionally not a fire gate.
-		handlers.GreetWakeHooks{Decide: wh.DecideWake, Delivered: wh.MarkWakeDelivered},
-	))
+	// onboarding lands in a chat where the agent has already spoken. The greeter
+	// is constructed in main.go (so the SAME instance also backs the wake re-drive
+	// re-emitter, wired there before the WakeRedriveSweeper starts) and handed in.
+	rh.SetFirstBootGreeter(greeter)
 	// Versioned-heartbeat GENERATION LOOP (PR-C): wire the convergence settle side
 	// so a beat reporting observed_generation >= desired_generation settles the
 	// converged wake intents. Same late-wiring nil-safe pattern as the greeter.
+	// (The RE-DRIVE side of the loop, PR-F, runs off a fleet-wide
+	// WakeRedriveSweeper wired in main.go — NOT the heartbeat path.)
 	rh.SetWakeSettler(wh.MarkWakeSettled)
 	r.POST("/registry/register", rh.Register)
 	r.POST("/registry/heartbeat", rh.Heartbeat)
@@ -699,6 +695,17 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.GET("/mcp/stream", mcpRl.Middleware(), mcpH.Stream)
 		wsAuth.POST("/mcp", mcpRl.Middleware(), mcpH.Call)
 	}
+
+	// Desktop computer-use routes (design decision B): the authenticated seam
+	// the IN-CONTAINER agent desktop tool (a2a_tools_desktop.py, later a native
+	// kind:mcp plugin) calls — the platform layer is a gateway, NOT an MCP tool,
+	// so the agent surface stays plugin-extractable. screenshot = eyes (not
+	// lock-gated, §8); input = hands (gateway is fail-closed on the control
+	// lock -> 409 when a human holds control). wsAuth gates on the workspace
+	// bearer, same as the MCP endpoint.
+	wsAuth.GET("/desktop/screenshot", wh.DesktopScreenshot)
+	wsAuth.POST("/desktop/input", wh.DesktopInput)
+	wsAuth.GET("/desktop/control", wh.DesktopControlStatus)
 
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
 	// Protected by strict AdminAuth: a missing or invalid bearer is rejected in

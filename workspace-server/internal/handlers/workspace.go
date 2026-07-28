@@ -56,7 +56,18 @@ type WorkspaceHandler struct {
 	// SetCPProvisioner, which satisfies the interface — see the
 	// compile-time assertion in internal/provisioner/cp_provisioner.go.
 	cpProv      provisioner.CPProvisionerAPI
-	platformURL string
+	// sidecarProv is the desktop-sidecar backend (design §5). ONE backend: the
+	// Local (Docker) impl on self-host, the CP impl on SaaS (deferred), or nil
+	// -> the availability-gate default, so the desktop feature is cleanly
+	// ABSENT (decision 4) rather than broken.
+	sidecarProv provisioner.SidecarProvisioner
+	// desktopGateway is the desktop enforcement gateway the desktop HTTP route
+	// proxies to (decision B: the authenticated seam the in-container agent
+	// tool calls; the platform layer is a gateway, NOT an MCP tool, so the agent
+	// surface stays in the runtime and remains plugin-extractable). nil ->
+	// routes report unavailable.
+	desktopGateway desktopGateway
+	platformURL    string
 	configsDir  string // path to workspace-configs-templates/ (for reading templates)
 	cacheDir    string // optional runtime-refreshed template cache; overrides configsDir by template id
 	// envMutators runs registered EnvMutator plugins right before
@@ -145,6 +156,14 @@ type WorkspaceHandler struct {
 	// StallWatchdog.SetWakeHooks nil-safe late-wiring pattern.
 	wakeDecide        func(ctx context.Context, workspaceID string, kind WakeKind, dedupSeed string) (WakeDecision, error)
 	wakeMarkDelivered func(ctx context.Context, workspaceID, idempotencyKey string) error
+
+	// wakeReEmit re-emits a STUCK wake intent through its existing idempotency
+	// key — the re-drive side of the generation loop (wake_redrive.go PR-F). nil
+	// by default: a bare &WorkspaceHandler{} leaves it unset, so ReDriveStuckWakes
+	// is a full no-op (nothing to re-emit ⇒ no scan, no bounding). Production wires
+	// it via SetWakeReEmitter to WakeReEmitter(greeter). Exactly-once safety is the
+	// re-emission path's own (has_greeted CAS / queue dedup), never re-drive's.
+	wakeReEmit func(ctx context.Context, workspaceID string, kind WakeKind, idempotencyKey string, generation int64) error
 }
 
 // SetWakeHooks wires the wake-lifecycle desired-state owner into this handler's
@@ -322,6 +341,14 @@ func (h *WorkspaceHandler) WithSeedMemoryPlugin(p seedMemoryPluginAPI) *Workspac
 // the *CPProvisioner from NewCPProvisioner; tests pass a stub.
 func (h *WorkspaceHandler) SetCPProvisioner(cp provisioner.CPProvisionerAPI) {
 	h.cpProv = cp
+}
+
+// SetSidecarProvisioner wires the desktop-sidecar backend (design §5). Pass the
+// Local (Docker) backend on self-host, the CP backend on SaaS once wired, or
+// leave unset — the handler then defaults to the availability-gate backend so
+// the desktop feature is cleanly absent (decision 4), never broken.
+func (h *WorkspaceHandler) SetSidecarProvisioner(sp provisioner.SidecarProvisioner) {
+	h.sidecarProv = sp
 }
 
 // SetEnvMutators wires a provisionhook.Registry into the handler. Plugins
@@ -1210,6 +1237,59 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 			// workspace_declared_plugins at dispatch time).
 			if declErr := ensureSchedulerPluginDeclared(ctx, id); declErr != nil {
 				log.Printf("Create %s: pre-provision scheduler plugin declare failed (non-fatal): %v", id, declErr)
+			}
+		}
+	}
+
+	// Per-install plugin settings (RFC plugin-config). A template's `plugins:`
+	// entries may carry `config:`; render each one to
+	// plugin-settings/<install-name>.json in the DELIVERED bundle so the runtime
+	// resolves it over the plugin's declared defaults
+	// (molecule_runtime/plugin_settings.py, runtime#357).
+	//
+	// MUST run BEFORE provisionWorkspaceAuto — that dispatch captures configFiles
+	// for the provision goroutine, exactly like the schedules render above.
+	//
+	// Layers 2-5 only. Layer 1 (contributes.configuration.*.default) is NOT
+	// rendered here and cannot be: it lives in the plugin's manifest, which core
+	// does not hold at provision time because plugins install post-online via the
+	// reconcile — strictly AFTER this file ships. The runtime supplies it.
+	//
+	// Byte-identical when no template plugin declares `config:`:
+	// renderPluginSettingsFiles returns nil and configFiles is left untouched
+	// (mergePluginSettingsIntoConfigFiles does not allocate for an empty set).
+	//
+	// Non-fatal throughout — a broken plugins block must never block a create.
+	if templatePath != "" {
+		if baseCfg, readErr := os.ReadFile(filepath.Join(templatePath, "config.yaml")); readErr == nil {
+			if rendered, rErr := renderPluginSettingsFiles(baseCfg, payload.Name); rErr != nil {
+				log.Printf("Create %s: rendering plugin settings: %v (continuing)", id, rErr)
+			} else if updated, n := mergePluginSettingsIntoConfigFiles(configFiles, rendered); n > 0 {
+				configFiles = updated
+				log.Printf("Create %s: delivered plugin settings for %d plugin(s)", id, n)
+			}
+		}
+	}
+
+	// SaaS leg: on a fresh tenant the real template config arrives via the Gitea
+	// asset channel, not the local templatePath (which may be empty or fall back
+	// to <runtime>-default and miss the real template's `plugins:` entirely).
+	// Render from the SAME fetched bytes the declared-plugin seeding below uses,
+	// so settings and declarations cannot disagree about which plugins exist.
+	//
+	// On key collision the FETCHED render wins (mergePluginSettingsIntoConfigFiles
+	// overwrites), which is correct: on SaaS the fetched bytes ARE the real
+	// template, while templatePath may be a <runtime>-default fallback that never
+	// declared these plugins at all.
+	if h.giteaTemplateFetcher != nil && payload.Template != "" {
+		if identity := templateIdentityForTemplateOrRuntime(payload.Template, payload.Runtime); identity != "" {
+			if fetched, ferr := h.giteaTemplateFetcher.Load(ctx, identity); ferr != nil {
+				log.Printf("Create %s: fetch template assets for plugin settings: %v (continuing)", id, ferr)
+			} else if rendered, rErr := renderPluginSettingsFiles(fetched["config.yaml"], payload.Name); rErr != nil {
+				log.Printf("Create %s: rendering fetched plugin settings: %v (continuing)", id, rErr)
+			} else if updated, n := mergePluginSettingsIntoConfigFiles(configFiles, rendered); n > 0 {
+				configFiles = updated
+				log.Printf("Create %s: delivered plugin settings for %d plugin(s) from fetched template", id, n)
 			}
 		}
 	}
