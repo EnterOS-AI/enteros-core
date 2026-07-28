@@ -51,10 +51,45 @@ func startLiveBox(t *testing.T) string {
 
 // liveWorkspaceID is the id the writer resolves; the container is named
 // ws-<id> so the REAL findContainer finds it.
-const liveWorkspaceID = "settings-writer-proof"
+//
+// It MUST be unique per CI run. This workflow's concurrency group is keyed on
+// the head SHA, so two handlers-touching PRs run their jobs concurrently against
+// ONE shared Docker daemon — the same reason Postgres is named
+// pg-handlers-${RUN_ID}-${RUN_ATTEMPT}. With a fixed name, startLiveBoxFor's
+// `docker rm -f` would evict the OTHER run's box mid-test; worse than a flaky
+// red, the file-count assertions could then read a box that belongs to a
+// different run and report a FALSE GREEN.
+var liveWorkspaceID = func() string {
+	// MOLECULE_LIVE_BOX_SUFFIX is set from ${RUN_ID}-${RUN_ATTEMPT} in CI and is
+	// empty for a local run, where a stable name is convenient and there is no
+	// concurrent peer to collide with.
+	if sfx := strings.TrimSpace(os.Getenv("MOLECULE_LIVE_BOX_SUFFIX")); sfx != "" {
+		return "settings-writer-proof-" + sfx
+	}
+	return "settings-writer-proof"
+}()
 
 func startLiveBoxFor(t *testing.T, workspaceID string) string {
 	t.Helper()
+	// The per-run suffix has to live in the ID, not here: the production path
+	// (writePluginSettingsToWorkspace / wireMockDBForWriter) resolves ws-<id>
+	// from the workspace id independently, so suffixing the container name here
+	// would leave the writer hunting for ws-<id> while the box is
+	// ws-<id>-<suffix>. That correctness constraint makes it a FOOTGUN: a new
+	// test that passes its own literal id silently opts out of per-run naming
+	// and reacquires the cross-run collision — whose worst outcome is not a
+	// flaky red but a FALSE GREEN, because the file-count assertions would be
+	// reading another run's container.
+	//
+	// So assert it instead of documenting it. In CI the suffix is always set;
+	// any id that does not carry it did not come from liveWorkspaceID.
+	if sfx := strings.TrimSpace(os.Getenv("MOLECULE_LIVE_BOX_SUFFIX")); sfx != "" &&
+		!strings.Contains(workspaceID, sfx) {
+		t.Fatalf("workspace id %q does not carry MOLECULE_LIVE_BOX_SUFFIX %q — "+
+			"derive it from liveWorkspaceID instead of a literal, or two concurrent "+
+			"CI runs will share the container name ws-%s and can read each other's box",
+			workspaceID, sfx, workspaceID)
+	}
 	name := "ws-" + workspaceID
 	_ = exec.Command("docker", "rm", "-f", name).Run()
 	out, err := exec.Command("docker", "run", "-d", "--name", name,
