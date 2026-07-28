@@ -23,6 +23,7 @@ package handlers
 
 import (
 	"fmt"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -109,4 +110,64 @@ func isEmptyConfigValue(v any) bool {
 	default:
 		return false
 	}
+}
+
+// templateDeclaredPlugins reads the `plugins:` a workspace template declares.
+//
+// M6 / FIX 3. Today `mergePlugins(defaults.Plugins, ws.Plugins)` unions the ORG
+// DEFAULTS with the NODE's own list and never looks at the template a node
+// references — so an org node written as
+//
+//   - name: SEO
+//     template: seo-agent
+//
+// does not get seo-agent's own declared plugins (seo-all and friends). The
+// template is the thing that knows which plugins its agent needs; the node
+// referenced it precisely to avoid restating them.
+//
+// Entries are source-contract strings, the same shape `plugins:` already uses
+// everywhere else (`gitea://owner/repo#ref` or a bare local name). Both the
+// bare-string and the {source, config} object forms are accepted, because a
+// template that sets per-install config (sdk#176) writes the object form.
+//
+// Tolerant: a malformed or absent block yields no plugins rather than an error.
+// A template that cannot be parsed must not fail an org import — the node still
+// provisions, just without inherited plugins.
+func templateDeclaredPlugins(templateYAML []byte) []string {
+	var doc struct {
+		Plugins []yaml.Node `yaml:"plugins"`
+	}
+	if err := yaml.Unmarshal(templateYAML, &doc); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(doc.Plugins))
+	for _, n := range doc.Plugins {
+		var s string
+		if err := n.Decode(&s); err == nil {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+			continue
+		}
+		var obj struct {
+			Source string `yaml:"source"`
+		}
+		if err := n.Decode(&obj); err == nil {
+			if src := strings.TrimSpace(obj.Source); src != "" {
+				out = append(out, src)
+			}
+		}
+	}
+	return out
+}
+
+// mergePluginsWithTemplate is the three-layer plugin precedence for a node that
+// references a template: TEMPLATE, then org DEFAULTS, then the NODE.
+//
+// It delegates to the existing mergePlugins so the opt-out grammar is shared
+// rather than reimplemented — a node can still drop an inherited plugin with a
+// leading "!" or "-", including one that came from the template. That matters:
+// inheriting a template's plugins is only safe if a node can decline one.
+func mergePluginsWithTemplate(templatePlugins, defaultPlugins, wsPlugins []string) []string {
+	return mergePlugins(mergePlugins(templatePlugins, defaultPlugins), wsPlugins)
 }
