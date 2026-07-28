@@ -22,8 +22,9 @@ Three consumers read the declaration:
 - an **ecosystem developer** reads `default` to run the plugin with no API call;
 - an **operator** reads `description` / `enum` to review a value and reuse it
   across workspaces;
-- the **platform UI** renders the plugin tab from `type` / `enum` / `default`,
-  and masks the field when `sensitive`.
+- the **platform UI** is specified to render a plugin tab from `type` / `enum` /
+  `default` and mask the field when `sensitive` — note this consumer is not built
+  yet; see the caveat under *When to mark a key `sensitive`*.
 
 ## Shape
 
@@ -115,24 +116,33 @@ the way the scheduler clamps `poll_seconds` to a 1s floor and falls back to 30.
 Mark `sensitive: true` for **credential-shaped values** — API keys, tokens,
 passwords, webhook secrets, connection strings with embedded credentials.
 
-What it buys you:
+What the contract says it buys you:
 
 - the platform UI **masks** the field;
 - the generated `.example` carries a **placeholder**, never a real value.
   Non-sensitive keys may carry a real example value.
 
-What it does **not** buy you: `sensitive` is a presentation and example-emission
-flag. It is not encryption, not access control, and not a separate secret store.
-The value still lands in a plain JSON file on the workspace volume and, if you
-interpolate it, in the daemon's environment. If a value must not exist on the
-box in plaintext, do not route it through plugin configuration at all.
+> **Caveat — the UI half is not shipped in this repo.** There is no plugin-config
+> tab in `canvas/` today, and nothing there reads `contributes.configuration` or
+> the `sensitive` flag. Declare it because it is the contract and because the
+> `.example` emitter and future tab will read it — but do **not** rely on masking
+> as a control that exists right now. (Verified by inspection of `canvas/src`:
+> the only `sensitive` field there belongs to `ChannelsTab`, which is unrelated.)
+
+What `sensitive` does **not** buy you, now or later: it is a presentation and
+example-emission flag. It is not encryption, not access control, and not a
+separate secret store. The value still lands in a plain JSON file on the
+workspace volume and, if you interpolate it, in the daemon's environment — and
+`/configs/plugin-settings/` is readable by anything in the workspace. If a value
+must not exist on the box in plaintext, do not route it through plugin
+configuration at all.
 
 > ### The flag is `sensitive`, not `secret` — and `secret` fails silently
 >
 > `configurationProperty` sets `additionalProperties: true`, so an unknown key is
 > **accepted**. Writing `secret: true` does not error anywhere — it validates
-> clean, and does nothing. The field is not masked and the `.example` emits the
-> real value.
+> clean, and does nothing — the key is simply not marked sensitive as far as any
+> consumer is concerned.
 >
 > Verified against the shipped schema: `sensitive` appears in it; the strings
 > `secret`, `scope` and `immutable` appear **zero** times. Validating
@@ -200,9 +210,9 @@ contributes:
 Four things worth copying from it:
 
 1. **Neither key is `sensitive`.** A poll interval and a schedule list are not
-   credential-shaped, so the UI shows them and the `.example` can carry real
-   values. Reach for `sensitive` when the value is a credential, not merely
-   because it is operational.
+   credential-shaped, so an example may carry a real value. Reach for
+   `sensitive` when the value is a credential, not merely because it is
+   operational or because it feels internal.
 2. **`poll_seconds` is consumed by interpolation, `schedules` is not.** An
    array does not flatten into an env var; the daemon reads it from the settings
    file. Mixing the two consumption styles in one plugin is normal.
