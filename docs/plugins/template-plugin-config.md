@@ -64,7 +64,7 @@ expect.**
 
 | Identity | Scheduler's value | What it keys |
 | --- | --- | --- |
-| **install name** — the checkout directory, derived from the source by `PluginNameFromSource` (the **repo**) | `molecule-ai-plugin-scheduler` | **the settings file** — core writes `plugin-settings/<this>.json`, the runtime reads it with the same key |
+| **install name** — the checkout directory, derived from **the `source:` string** by `PluginNameFromSource` (for the scheduler, the repo — but see the derivation table below, it is not always the repo) | `molecule-ai-plugin-scheduler` | **the settings file** — core writes `plugin-settings/<this>.json`, the runtime reads it with the same key |
 | **manifest name** — the manifest's own `name:` | `molecule-scheduler` | daemon provenance for `kind: channel` and `kind: trigger` |
 
 Core derives the filename from the **source string you wrote in the template**,
@@ -100,13 +100,29 @@ Note the plugin's own `plugin.yaml` comment currently names
 delivered filename is what the code produces, and the code uses the install
 name.
 
-### The rule
+### The rule, and how to derive the name
 
-**The settings filename is derived from your `source:` string, not from the
-plugin's name.** For `gitea://` and `github://` sources that is the **repo
-segment**. If you want to know the filename, derive it from the source the way
-core does, or read it off a provisioned workspace — do not read it off the
-manifest.
+**The settings filename comes from your `source:` string, never from the plugin's
+name.** It is not simply "the repo" — the derivation differs per scheme, and
+`gitea://` and `github://` disagree about subpaths. Executed against
+`PluginNameFromSource`:
+
+| `source:` | install name → `plugin-settings/<name>.json` |
+| --- | --- |
+| `gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0` | `molecule-ai-plugin-scheduler` (the repo) |
+| `gitea://molecule-ai/repo/plugins/my-plugin#sha:…` | `my-plugin` — **the last subpath segment, not the repo** |
+| `gitea://molecule-ai/repo/a/b/c` | `c` |
+| `github://owner/repo#sha:…` | `repo` |
+| `github://owner/repo/sub/dir` | `repo` — **github ignores the subpath**; gitea does not |
+| `local://my-plugin` / bare `my-plugin` | `my-plugin` |
+
+So a mono-repo `gitea://` source keys on its **subpath leaf**, while the same
+shape under `github://` keys on the **repo**. If you migrate a plugin between the
+two schemes, the settings filename can change underneath you and the settings
+silently stop applying.
+
+Do not compute this from memory. Derive it the way core does, or read the
+filename off a provisioned workspace — and never off the manifest.
 
 ## What core does with your `config:` block
 
@@ -124,10 +140,12 @@ manifest.
 Entries are processed in sorted-source order so a re-provision produces
 byte-identical output.
 
-Every failure mode in that list is **skip-and-log**, not fail-the-provision. So
-a mistake in your `config:` block surfaces as a provisioning log line and an
-absent setting — never as a failed create. If a value did not take, read the
-provision logs for `plugin settings:`.
+**Nothing in that list fails the provision.** A mistake in your `config:` block
+surfaces as a log line and an absent setting, never as a failed create — which is
+why these errors are easy to miss. If a value did not take, read the provision
+logs for `plugin settings:`. Note the blast radius differs by step: step 1 loses
+the settings for *every* plugin in the template, steps 2–4 lose only the offending
+entry.
 
 ## Where the values land, and when
 
@@ -173,9 +191,10 @@ key names against the plugin's `contributes.configuration.properties`.
 - [ ] Entry is the **object** form (`source:` + `config:`), not a bare string.
 - [ ] Key names match the plugin's declared `properties` — a typo is kept, not
       rejected.
-- [ ] If hand-writing or inspecting the file, it is named after the **repo**
-      (`molecule-ai-plugin-scheduler.json`), not the manifest
-      (`molecule-scheduler.json`).
+- [ ] If hand-writing or inspecting the file, its name was derived from the
+      **`source:` string** (`molecule-ai-plugin-scheduler.json`), not from the
+      manifest (`molecule-scheduler.json`) — and check the derivation table if
+      the source carries a subpath.
 - [ ] The change is expected to reach only **newly provisioned** workspaces.
 - [ ] Provision logs checked for `plugin settings:` skip lines if a value did
       not apply.
