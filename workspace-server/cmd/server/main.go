@@ -361,63 +361,57 @@ func main() {
 		wh.SetCPProvisioner(cpProv)
 	}
 
-	// Desktop computer-use wiring (design decision B). DISABLED by default:
-	// enabling it BEFORE the per-workspace-network egress-deny (§6.1) is in
-	// place would let a credential-bearing sidecar reach backend infra BY IP
-	// (a VERIFIED gap — a per-workspace network blocks by-name, not by-IP). So
-	// an operator flips MOLECULE_DESKTOP_ENABLED=true ONLY once the egress
-	// prerequisite is provisioned. Self-host (local Docker) only for now; the
-	// CP/k8s backend is a separate follow-up.
-	if envOr("MOLECULE_DESKTOP_ENABLED", "false") == "true" {
-		// Egress interlock (decision 1 / §6.1): the desktop feature is safe to
-		// wire ONLY once the operator has applied the egress-deny firewall
-		// (deploy/desktop-egress-firewall.sh or the k8s NetworkPolicy) so a
-		// compromised sidecar cannot reach backend infra by host-published port
-		// or the cloud metadata IP. Refuse to wire the backend unless the
-		// operator affirms it — so the verified exposure can NEVER ship by
-		// misconfiguration. See deploy/desktop-operator-setup.md.
-		if envOr("MOLECULE_DESKTOP_EGRESS_CONFIRMED", "false") != "true" {
-			log.Println("Desktop: MOLECULE_DESKTOP_ENABLED=true but MOLECULE_DESKTOP_EGRESS_CONFIRMED!=true — refusing to wire the desktop backend until the egress-deny prerequisite is applied and confirmed (see deploy/desktop-operator-setup.md). Feature stays OFF.")
-		} else if prov != nil {
-			image := envOr("MOLECULE_DESKTOP_IMAGE", "registry.moleculesai.app/molecule-ai/molecule-desktop:latest")
-			// Optional operator seccomp override (absolute path). Empty → the
-			// provisioner's embedded Chromium-tuned default. A configured-but-
-			// unreadable path is fatal: silently falling back would ship a
-			// different isolation posture than the operator intended.
-			seccompProfile := ""
-			if pp := os.Getenv("MOLECULE_DESKTOP_SECCOMP_PROFILE"); pp != "" {
-				b, rerr := os.ReadFile(pp)
-				if rerr != nil {
-					log.Fatalf("Desktop: MOLECULE_DESKTOP_SECCOMP_PROFILE=%q unreadable: %v", pp, rerr)
-				}
-				seccompProfile = string(b)
+	// Desktop computer-use wiring (design decision B). ON BY DEFAULT wherever a
+	// local Docker provisioner exists — no enablement flag, no operator egress
+	// step. Isolation is STRUCTURAL: the provisioner puts each sidecar on an
+	// INTERNAL per-workspace network whose ONLY route out is a per-workspace
+	// egress proxy that denies private/link-local destinations (§6.1,
+	// cmd/desktop-egress-proxy). A compromised browser therefore cannot reach
+	// backend infra, the host, other tenants, or the cloud metadata service —
+	// safe by construction, so no MOLECULE_DESKTOP_ENABLED / EGRESS_CONFIRMED
+	// gate. Set MOLECULE_DESKTOP_DISABLE=true to opt OUT. CP/k8s backend is a
+	// separate follow-up.
+	if prov != nil && envOr("MOLECULE_DESKTOP_DISABLE", "false") != "true" {
+		image := envOr("MOLECULE_DESKTOP_IMAGE", "registry.moleculesai.app/molecule-ai/molecule-desktop:latest")
+		// Optional operator seccomp override (absolute path). Empty → the
+		// provisioner's embedded Chromium-tuned default. A configured-but-
+		// unreadable path is fatal: silently falling back would ship a
+		// different isolation posture than the operator intended.
+		seccompProfile := ""
+		if pp := os.Getenv("MOLECULE_DESKTOP_SECCOMP_PROFILE"); pp != "" {
+			b, rerr := os.ReadFile(pp)
+			if rerr != nil {
+				log.Fatalf("Desktop: MOLECULE_DESKTOP_SECCOMP_PROFILE=%q unreadable: %v", pp, rerr)
 			}
-			desktopSecret := os.Getenv("DISPLAY_SESSION_SIGNING_SECRET")
-			sidecar := provisioner.NewLocalSidecarProvisioner(prov.DockerClient(), image, "wsnet", 6070, 10*time.Second, 2<<30, seccompProfile)
-			// B1: the provisioner derives DESKTOP_CONTROL_TOKEN from the SAME
-			// secret the gateway's TokenResolver uses, so the sidecar's control
-			// server and the gateway agree. B3: tell the provisioner which
-			// container is the platform so it joins each per-workspace network and
-			// can reach the sidecar by name (HOSTNAME is the Docker-set container
-			// id; override via MOLECULE_DESKTOP_PLATFORM_CONTAINER).
-			sidecar.SetControlTokenSecret(desktopSecret)
-			sidecar.SetSelfContainerID(envOr("MOLECULE_DESKTOP_PLATFORM_CONTAINER", os.Getenv("HOSTNAME")))
-			wh.SetSidecarProvisioner(sidecar)
-			store := handlers.NewDesktopLifecycleStore(db.DB)
-			gw := desktopgateway.New(
-				sidecar,
-				store, // LockChecker
-				store, // ActivityRecorder
-				func(_ context.Context, workspaceID string) (string, error) {
-					return provisioner.DeriveDesktopControlToken(desktopSecret, workspaceID), nil
-				},
-				nil,
-			)
-			wh.SetDesktopGateway(gw)
-			log.Println("Desktop: computer-use ENABLED (sidecar provisioner + gateway wired)")
-		} else {
-			log.Println("Desktop: MOLECULE_DESKTOP_ENABLED=true but no local Docker provisioner; skipping")
+			seccompProfile = string(b)
 		}
+		desktopSecret := os.Getenv("DISPLAY_SESSION_SIGNING_SECRET")
+		sidecar := provisioner.NewLocalSidecarProvisioner(prov.DockerClient(), image, "wsnet", 6070, 10*time.Second, 2<<30, seccompProfile)
+		// B1: the provisioner derives DESKTOP_CONTROL_TOKEN from the SAME secret
+		// the gateway's TokenResolver uses, so the sidecar's control server and
+		// the gateway agree. B3: tell the provisioner which container is the
+		// platform so it joins each per-workspace network and can reach the
+		// sidecar by name (HOSTNAME is the Docker-set container id; override via
+		// MOLECULE_DESKTOP_PLATFORM_CONTAINER). Optional egress-network override
+		// for the proxy's internet leg (default "bridge").
+		sidecar.SetControlTokenSecret(desktopSecret)
+		sidecar.SetSelfContainerID(envOr("MOLECULE_DESKTOP_PLATFORM_CONTAINER", os.Getenv("HOSTNAME")))
+		if egnet := os.Getenv("MOLECULE_DESKTOP_EGRESS_NETWORK"); egnet != "" {
+			sidecar.SetEgressNetwork(egnet)
+		}
+		wh.SetSidecarProvisioner(sidecar)
+		store := handlers.NewDesktopLifecycleStore(db.DB)
+		gw := desktopgateway.New(
+			sidecar,
+			store, // LockChecker
+			store, // ActivityRecorder
+			func(_ context.Context, workspaceID string) (string, error) {
+				return provisioner.DeriveDesktopControlToken(desktopSecret, workspaceID), nil
+			},
+			nil,
+		)
+		wh.SetDesktopGateway(gw)
+		log.Println("Desktop: computer-use ENABLED by default (structural egress isolation; set MOLECULE_DESKTOP_DISABLE=true to opt out)")
 	}
 
 	// Wake-lifecycle owner (PR-D): route this handler's proactive-wake emitters

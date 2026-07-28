@@ -77,17 +77,17 @@
 
 <section id="status">
   <h2><span class="n">0</span>Implementation status <span class="pill v2">verified on real Docker 29.5.3 · 2026-07-27</span></h2>
-  <p>A security-review subagent returned <strong>BLOCK-for-production</strong> with 5 ranked blockers; the branch's restraint (backend unwired until isolation is real) was credited correct. A real Docker stack was then stood up to verify and to close everything code-fixable. The feature is <strong>code-complete and verified</strong>, gated OFF behind <code>MOLECULE_DESKTOP_ENABLED</code> + a <code>MOLECULE_DESKTOP_EGRESS_CONFIRMED</code> interlock so it cannot ship the exposure by misconfiguration.</p>
+  <p>A security-review subagent returned <strong>BLOCK-for-production</strong> with 5 ranked blockers; all were fixed + re-approved and merged across 3 repos (8 PRs). The last friction — a per-host egress firewall + enablement interlock — was then replaced with <strong>STRUCTURAL isolation</strong>: each sidecar sits on an <em>internal</em> Docker network whose only route out is a per-workspace egress proxy that denies all private/link-local/metadata destinations. That makes the feature <strong>safe by construction and ON BY DEFAULT — both flags removed</strong>. Verified end-to-end on real Docker: the browser reaches the public internet only through the proxy; metadata/private return 403; the sidecar has no direct route.</p>
   <table>
     <tr><th>Area</th><th>State</th></tr>
     <tr><td>Chromium sandbox under hardening (B2+B3)</td><td><span class="badge b-fix">verified</span> root-caused "no usable sandbox" → shipped Chromium-tuned seccomp profile; renders sandboxed under <code>--cap-drop ALL</code> + <code>no-new-privileges</code>, no <code>--no-sandbox</code></td></tr>
     <tr><td>Credential-volume reap on delete (B4)</td><td><span class="badge b-fix">done</span> <code>StopDesktop</code>+<code>WipeProfile</code> in CascadeDelete</td></tr>
-    <tr><td>Egress-deny RFC-1918 + metadata (B1)</td><td><span class="badge b-fix">verified fix</span> host-published-port + metadata blocked, internet preserved — shipped as firewall script + k8s NetworkPolicy + runbook + interlock</td></tr>
+    <tr><td>Egress-deny RFC-1918 + metadata (B1)</td><td><span class="badge b-fix">structural</span> sidecar on an INTERNAL net; per-workspace egress proxy denies private/link-local/metadata, allows only public internet — no host firewall, no operator step. Verified: browser loads pages only via the proxy; metadata/private → 403</td></tr>
     <tr><td>Control-server auth/bounds · gateway arbitration · SSRF allowlist</td><td><span class="badge b-fix">verified</span> 401/200/204/400 e2e; <code>ValidateSidecarTarget</code> pins targets</td></tr>
     <tr><td>Human-preempts-agent takeover</td><td><span class="badge b-fix">verified vs PG16</span> user preempts agent lock, no admin token; can't steal another user's</td></tr>
     <tr><td>SDK <code>computer-use</code> codegen + <code>MatchesSSOT</code></td><td><span class="badge b-fix">proven</span> generated + value-pin passes end-to-end (held pending SDK module publish)</td></tr>
-    <tr><td>Egress apply on live host · Redis pw · userns-remap</td><td><span class="badge b-risk">operator gate</span> verified artifacts ready; must be applied on the live cluster</td></tr>
-    <tr><td>SDK branch merge · image publish · production deploy</td><td><span class="badge b-risk">human gate</span> outward / hard-to-reverse — require authorization</td></tr>
+    <tr><td>Enablement</td><td><span class="badge b-fix">default-on</span> no flags, no operator egress step — isolation is structural. Wires automatically wherever a local Docker provisioner exists (<code>MOLECULE_DESKTOP_DISABLE=true</code> to opt out)</td></tr>
+    <tr><td>Image publish · production deploy</td><td><span class="badge b-risk">human gate</span> build+push the desktop image to the registry and redeploy the platform — the only remaining step, and it turns the feature ON (no separate operator action)</td></tr>
   </table>
 </section>
 

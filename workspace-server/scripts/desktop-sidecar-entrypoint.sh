@@ -35,6 +35,16 @@ websockify --web=/usr/share/novnc 6080 localhost:5900 &
 # (cookies/logins survive scale-to-zero). device-scale-factor=1 keeps DPR=1.
 # Sandbox stays ON (the runtime provides the needed user namespaces); NEVER
 # pass --no-sandbox (§6.2).
+#
+# DESKTOP_PROXY (set by the provisioner) routes ALL browser egress through the
+# per-workspace egress proxy — the sidecar's only route off its internal network
+# (§6.1 structural isolation). --proxy-server applies it; the proxy denies
+# private/link-local dsts, so the browser cannot reach infra/host/metadata. When
+# unset (dev/no-network), Chromium goes direct.
+PROXY_ARGS=""
+if [ -n "${DESKTOP_PROXY:-}" ]; then
+	PROXY_ARGS="--proxy-server=${DESKTOP_PROXY}"
+fi
 chromium \
 	--user-data-dir=/home/desktop/profile \
 	--kiosk \
@@ -42,6 +52,7 @@ chromium \
 	--window-position=0,0 \
 	--window-size="${DESKTOP_WIDTH},${DESKTOP_HEIGHT}" \
 	--no-first-run --no-default-browser-check \
+	${PROXY_ARGS} \
 	about:blank &
 
 # ── Control server (agent hands/eyes) on :6070, authed per-sidecar. exec so it

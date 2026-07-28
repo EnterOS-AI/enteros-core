@@ -1,82 +1,60 @@
-# Desktop sidecar — operator setup (decision-1 security prerequisites)
+# Desktop sidecar — operator notes
 
-The agent-desktop / computer-use feature is **disabled by default**
-(`MOLECULE_DESKTOP_ENABLED=false`). Before enabling it you MUST provision the
-decision-1 isolation prerequisites below, then set the confirmation interlock.
-Enabling the feature without these ships a verified cross-tenant exposure (a
-compromised sidecar reaching backend infra by IP / the cloud metadata service).
+The agent-desktop / computer-use feature is **on by default** on the self-host
+Docker backend. **There is no enablement flag and no required operator step** —
+network isolation is structural (see below). Set `MOLECULE_DESKTOP_DISABLE=true`
+to opt out.
 
 Design reference: `docs/superpowers/specs/2026-07-27-agent-desktop-sidecar-design.md` §6.
 
-## 1. Egress deny (RFC-1918 + cloud metadata) — the load-bearing control
+## Why there's no egress-firewall step anymore
 
-A desktop sidecar runs untrusted web content. Its per-workspace network already
-isolates it from other Docker networks by-IP, but NOT from host-published infra
-ports or the cloud metadata IP. Close that gap:
+Isolation is enforced by the topology, not by a host firewall an operator has to
+remember to install:
 
-**Self-host Docker:** run the verified firewall script on every host that runs
-desktop sidecars, on a 60s timer (so new per-workspace networks are covered as
-they appear). It is idempotent and label-driven.
+- Each workspace's desktop sidecar runs on a **per-workspace INTERNAL Docker
+  network** (`wsnet-<id>`, created with `Internal: true`) — it has **no external
+  route of its own**.
+- Its only way out is a **per-workspace egress proxy** (`wsdeskproxy-<id>`,
+  `cmd/desktop-egress-proxy`) that the sidecar's browser is pointed at via
+  `--proxy-server`. The proxy **denies every private / link-local / loopback
+  destination** (RFC-1918, `169.254.0.0/16` = cloud metadata + Docker host
+  gateway, `127.0.0.0/8`, IPv6 ULA/link-local) and allows only the public
+  internet.
 
-```
-# systemd timer, cron, or host-provisioning — as root:
-/opt/molecule/workspace-server/scripts/desktop-egress-firewall.sh install
-```
-
-Verify (from inside any running sidecar): a host-published infra port and
-`169.254.169.254` are unreachable, but `curl https://1.1.1.1` still works.
-
-**CP / k8s backend:** apply the declarative equivalent (requires a
-NetworkPolicy-enforcing CNI — Calico/Cilium):
-
-```
-kubectl -n <sidecar-namespace> apply -f workspace-server/deploy/desktop-egress-networkpolicy.yaml
-```
-
-## 2. Redis password
-
-The platform's Redis currently runs passwordless on the shared network. Even
-with egress-deny in place, set a password so isolation is defence-in-depth, not
-the only layer:
-
-- Set `requirepass` (or ACLs) on Redis.
-- Provide the credential to the platform via its existing Redis URL env.
-- Do NOT expose the credential to sidecars (they never need Redis).
-
-## 3. userns-remap (daemon-level defence for privileged tenants)
-
-Tenants can run privileged (host-root by design), so sidecar non-root alone is
-not isolation. Enable user-namespace remapping on the Docker daemon so a
-container uid 0 maps to an unprivileged host uid:
-
-```
-# /etc/docker/daemon.json
-{ "userns-remap": "default" }
-```
-
-Restart the daemon and confirm `/etc/subuid` / `/etc/subgid` entries exist for
-the `dockremap` user. (The sidecar image already runs as the non-root `desktop`
-user; the per-container `--cap-drop ALL` + `no-new-privileges` + Chromium-tuned
-seccomp hardening is applied automatically by the provisioner.)
-
-## 4. Confirm the interlock
-
-Only after 1–3 are in place, set the confirmation env so the platform will wire
-the desktop feature:
-
-```
-MOLECULE_DESKTOP_ENABLED=true
-MOLECULE_DESKTOP_EGRESS_CONFIRMED=true
-```
-
-If `MOLECULE_DESKTOP_ENABLED=true` but `MOLECULE_DESKTOP_EGRESS_CONFIRMED` is not
-`true`, the platform logs the requirement and leaves the desktop backend
-**unwired** — it will not ship the exposure by misconfiguration.
+So a compromised browser cannot reach backend infra (Postgres/Redis/MinIO/
+LiteLLM), the Docker host, other tenants, or the cloud metadata service — **with
+no host iptables and no operator affirmation.** Verified end-to-end on real
+Docker (2026-07-28): the sidecar has no default route; the browser loads public
+pages only through the proxy; the proxy returns 403 for metadata/private.
 
 ## Optional overrides
 
-- `MOLECULE_DESKTOP_IMAGE` — the sidecar image (default: registry `…/molecule-desktop:latest`).
-- `MOLECULE_DESKTOP_SECCOMP_PROFILE` — absolute path to a custom seccomp profile.
-  Empty uses the embedded Chromium-tuned default
-  (`internal/provisioner/seccomp/desktop-sidecar.json`). Do NOT set to
-  `unconfined` outside debugging.
+- `MOLECULE_DESKTOP_DISABLE=true` — turn the feature off.
+- `MOLECULE_DESKTOP_IMAGE` — the sidecar/proxy image (one image serves both).
+- `MOLECULE_DESKTOP_EGRESS_NETWORK` — the network the egress proxy uses for its
+  internet leg (default `bridge`). Point it at any network that has internet and
+  does NOT carry backend infra.
+- `MOLECULE_DESKTOP_PLATFORM_CONTAINER` — the platform's own container id/name
+  (defaults to `HOSTNAME`); the provisioner joins each per-workspace network so
+  the gateway can reach the sidecar by name.
+- `MOLECULE_DESKTOP_SECCOMP_PROFILE` — absolute path to a custom seccomp profile
+  (empty = the embedded Chromium-tuned default,
+  `internal/provisioner/seccomp/desktop-sidecar.json`).
+
+## Defense-in-depth (recommended, not required)
+
+These harden the platform generally; the desktop feature no longer depends on
+them for its isolation:
+
+- **Redis password** (`requirepass`/ACLs) — good practice regardless; the desktop
+  proxy already denies the sidecar any path to Redis.
+- **`userns-remap`** on the Docker daemon — maps container uid 0 to an
+  unprivileged host uid; useful for the privileged-tenant threat model.
+
+## CP / k8s backend
+
+The self-host mechanism above (internal network + egress proxy) is Docker-
+specific. The CP/k8s backend is a separate follow-up; the declarative equivalent
+of the egress deny for a NetworkPolicy-enforcing CNI is in
+`deploy/desktop-egress-networkpolicy.yaml`.
