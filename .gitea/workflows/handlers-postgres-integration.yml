@@ -355,6 +355,48 @@ jobs:
             exit 1
           fi
 
+      - if: needs.detect-changes.outputs.handlers == 'true'
+        name: Run live-container tests (MOLECULE_LIVE_DOCKER)
+        env:
+          MOLECULE_LIVE_DOCKER: "1"
+        run: |
+          set -uo pipefail
+          # The TestLiveBox_* suite proves things NO unit test can reach: that a
+          # tar actually EXTRACTS where we think it does, and that a settings
+          # file lands in a running container. It exists because
+          # buildContainerFilesTar doubled destPath and every save silently
+          # wrote to /configs/configs/... while the API answered
+          # {"status":"saved"} — a bug whose unit test asserted the tar SHAPE
+          # and therefore pinned the bug as the contract.
+          #
+          # Those tests were gated on MOLECULE_LIVE_DOCKER=1 and NO WORKFLOW SET
+          # IT, so they ran once by hand and never again. That is the same
+          # "artifact real, wiring absent" class as the path-gated
+          # template-delivery lane and the plugin gate meta-ci reported as
+          # `planned` for its entire life. One-shot evidence is not coverage.
+          #
+          # Anti-vacuous guard, mirroring the integration step above but with an
+          # EXTRA arm: these tests SKIP rather than fail when the env var is
+          # unset or the daemon is unreachable, so `go test` exits 0 on exactly
+          # the input this step exists to catch. A SKIP here is a FAILURE.
+          LOG=$(mktemp)
+          rc=0
+          go test -timeout 10m -v ./internal/handlers/ -run '^TestLiveBox_' 2>&1 | tee "$LOG" || rc=$?
+          npass=$(grep -c -E '^[[:space:]]*--- PASS: TestLiveBox_' "$LOG" || true)
+          nskip=$(grep -c -E '^[[:space:]]*--- SKIP: TestLiveBox_' "$LOG" || true)
+          echo "TestLiveBox_: ${npass} passed, ${nskip} skipped"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if [ "${nskip:-0}" -ne 0 ]; then
+            echo "::error::live-container gate SKIPPED ${nskip} test(s). A skip here means MOLECULE_LIVE_DOCKER did not take effect or the Docker daemon was unreachable — which is indistinguishable from a pass in the job summary, and is precisely the failure this gate exists to close."
+            exit 1
+          fi
+          if [ "${npass:-0}" -eq 0 ]; then
+            echo "::error::live-container gate ran ZERO tests (0 '--- PASS: TestLiveBox_' lines) but go test still exited 0. Check the -run regex ^TestLiveBox_ and that plugin_settings_writer_live_test.go still declares them."
+            exit 1
+          fi
+
       # The scheduler integration gate (#2149) was retired with the core cron
       # scheduler itself (scheduler-as-trigger-plugin RFC, P4): internal/scheduler
       # no longer exists — schedules are fired by the runtime kind:trigger daemon.
