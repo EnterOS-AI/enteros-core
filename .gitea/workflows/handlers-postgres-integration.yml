@@ -399,7 +399,12 @@ jobs:
           # free pass. Only top-level results count.
           npass=$(grep -c -E '^--- PASS: TestLiveBox_' "$LOG" || true)
           nskip=$(grep -c -E '^[[:space:]]*--- SKIP: TestLiveBox_' "$LOG" || true)
-          echo "TestLiveBox_: ${npass} passed, ${nskip} skipped"
+          declared=$(grep -c '^func TestLiveBox_' ./internal/handlers/plugin_settings_writer_live_test.go || true)
+          if [ "${declared:-0}" -eq 0 ]; then
+            echo "::error::found ZERO 'func TestLiveBox_' declarations in internal/handlers/plugin_settings_writer_live_test.go — the file moved or was renamed, so this arm cannot check anything. Point it at the new path; do NOT delete it."
+            exit 1
+          fi
+          echo "TestLiveBox_: ${npass} passed, ${nskip} skipped, ${declared} declared"
           if [ "$rc" -ne 0 ]; then
             exit "$rc"
           fi
@@ -439,13 +444,12 @@ jobs:
           # The hardcoded floor stays BECAUSE it does the opposite job: `declared`
           # falls with a deletion, so on its own it would bless shrinking the suite
           # to nothing. Deletion must remain a conscious edit to LIVE_MIN.
-          declared=$(grep -c '^func TestLiveBox_' ./internal/handlers/plugin_settings_writer_live_test.go || true)
-          if [ "${declared:-0}" -eq 0 ]; then
-            echo "::error::found ZERO 'func TestLiveBox_' declarations in internal/handlers/plugin_settings_writer_live_test.go — the file moved or was renamed, so this arm cannot check anything. Point it at the new path; do NOT delete it."
+          if [ "${npass:-0}" -lt "$declared" ]; then
+            echo "::error::live-container gate: ${declared} TestLiveBox_* are declared in plugin_settings_writer_live_test.go but only ${npass} produced a top-level PASS. A declared test did not run — check the -run regex, a build tag, or a rename."
             exit 1
           fi
-          if [ "${npass:-0}" -ne "$declared" ]; then
-            echo "::error::live-container gate: ${declared} TestLiveBox_* are declared but only ${npass} produced a top-level PASS. A declared test did not run — check the -run regex, a build tag, or a rename."
+          if [ "${npass:-0}" -gt "$declared" ]; then
+            echo "::error::live-container gate: ${npass} top-level TestLiveBox_ PASS lines but only ${declared} declared in plugin_settings_writer_live_test.go. A TestLiveBox_* was added in ANOTHER file in this package, so `declared` no longer describes the suite this step measures — move it, or widen the grep to cover both files."
             exit 1
           fi
           if [ "${npass:-0}" -lt "$LIVE_MIN" ]; then
