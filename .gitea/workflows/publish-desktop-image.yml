@@ -1,0 +1,310 @@
+name: publish-desktop-image
+
+# The PUBLISH pipeline for the agent-desktop sidecar image
+# (workspace-server/Dockerfile.desktop-sidecar). Mirrors
+# publish-workspace-server-image.yml but is simpler: the desktop image bundles no
+# manifest deps (no workspace-configs/org-templates/plugins) — it's Xvfb + WM +
+# Chromium + the Go control-server + the Go egress-proxy.
+#
+# WHY THIS EXISTS
+# ---------------
+# The provisioner pulls `registry.moleculesai.app/molecule-ai/molecule-desktop:latest`
+# at runtime when it starts a workspace desktop sidecar (cmd/server default
+# MOLECULE_DESKTOP_IMAGE). Nothing rebuilt/published that image on merge, so a
+# code change to the desktop stack (control server, egress proxy, entrypoint,
+# Dockerfile) never produced a deployable artifact. This closes that gap: on a
+# merge to main touching the desktop stack, build the image and re-point :latest
+# to the CI-green build. Running platforms pick it up on the NEXT StartDesktop
+# (they `docker pull` :latest) — no tenant redeploy needed, because the desktop
+# image is a runtime-pulled sidecar, not baked into the platform image. (The
+# cmd/server wiring change ships via the tenant image pipeline.)
+#
+# Tag scheme (parallels publish-workspace-server-image.yml):
+#   :staging-<sha>  — immutable per-commit candidate built from main.
+#   :staging-latest — most recent BUILD from main (not gated).
+#   :latest         — most recent CI-GREEN build; only moved by promote-latest
+#                     (main only, after green push CI, honoring the
+#                     PROD_AUTO_DEPLOY_DISABLED production freeze). What the
+#                     provisioner pulls at runtime.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'workspace-server/Dockerfile.desktop-sidecar'
+      - 'workspace-server/scripts/desktop-sidecar-entrypoint.sh'
+      - 'workspace-server/cmd/desktop-control-server/**'
+      - 'workspace-server/cmd/desktop-egress-proxy/**'
+      - 'workspace-server/internal/desktopcontrol/**'
+      - 'workspace-server/internal/provisioner/seccomp/**'
+      - '.gitea/workflows/publish-desktop-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Serialize per-branch so two rapid pushes don't race two builds onto the moving
+# :staging-latest / :latest tags. Never abort a publish mid-push — the per-commit
+# :staging-<sha> tag is immutable, so a completed predecessor is a good artifact.
+concurrency:
+  group: publish-desktop-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+  # SSOT: the exact image ref the provisioner pulls (cmd/server default
+  # MOLECULE_DESKTOP_IMAGE). Overridable org/repo-wide via MOLECULE_DESKTOP_IMAGE
+  # without touching this workflow.
+  DESKTOP_IMAGE: ${{ vars.MOLECULE_DESKTOP_IMAGE || 'registry.moleculesai.app/molecule-ai/molecule-desktop' }}
+
+jobs:
+  # bp-exempt: post-merge desktop-image publication side effect; the source
+  # changes that trigger it were already gated by CI / all-required on the PR.
+  build-and-push:
+    name: Build & push desktop image
+    # robot-1's dedicated build box (same as the tenant publish). `[docker-host,
+    # robot-1]` = AND semantics: lands ONLY on robot-1 while satisfying
+    # lint-required-workflows-docker-host-pinned (docker-host present). Built +
+    # --loaded into robot-1's daemon, then pushed to the registry via the parallel
+    # chunked pusher; the provisioner pulls the CI-green :latest from the registry.
+    runs-on: [docker-host, robot-1]
+    timeout-minutes: 45
+    outputs:
+      staging_sha: ${{ steps.tags.outputs.staging_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify Docker daemon access
+        run: |
+          set -euo pipefail
+          echo "::group::Docker daemon health check"
+          docker_info="$(docker info 2>&1)" || {
+            echo "::error::Docker daemon is not accessible at /var/run/docker.sock"
+            printf '%s\n' "${docker_info}"
+            exit 1
+          }
+          printf '%s\n' "${docker_info}" | sed -n '1,5p'
+          echo "Docker daemon OK"
+          echo "::endgroup::"
+
+      # The publish runner's default HOME can be host-owned + non-writable, so
+      # docker credential saves fail. Point HOME + DOCKER_CONFIG at the writable
+      # job temp dir (same fix as publish-workspace-server-image.yml).
+      - name: Prepare writable HOME + Docker config
+        run: |
+          set -euo pipefail
+          H="$RUNNER_TEMP/desktop-publish-home"
+          mkdir -p "$H/.docker"
+          echo "HOME=$H" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$H/.docker" >> "$GITHUB_ENV"
+
+      # AUTO_SYNC_TOKEN (Infisical SSOT /shared/dev-utils, env=prod) reads the
+      # private operator-config repo to fetch the chunked pusher. Same source +
+      # fork-safety posture as the tenant publish.
+      - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
+        id: auto_sync_token
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -z "$AUTO_SYNC_TOKEN" ]; then
+            echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils"
+            exit 1
+          fi
+          echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
+          echo "AUTO_SYNC_TOKEN loaded from Infisical (len=${#AUTO_SYNC_TOKEN})"
+
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "staging_sha=staging-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # Build the desktop-sidecar image and --load it into robot-1's daemon under
+      # the SSOT-qualified name. Retry loop: buildkit EOF is often transient under
+      # memory pressure on the publish host. Build context is the repo root (the
+      # Dockerfile COPYs workspace-server/).
+      - name: Build desktop image (--load, staging-<sha> + staging-latest)
+        env:
+          DESKTOP_IMAGE: ${{ env.DESKTOP_IMAGE }}
+          TAG_SHA: staging-${{ steps.tags.outputs.sha }}
+          TAG_LATEST: staging-latest
+          GIT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          export DOCKER_BUILDKIT=1
+          built=0
+          for attempt in 1 2 3; do
+            echo "::notice::Desktop image build attempt ${attempt}/3 ..."
+            if docker build \
+                --file ./workspace-server/Dockerfile.desktop-sidecar \
+                --label "org.opencontainers.image.source=https://git.moleculesai.app/${REPO}" \
+                --label "org.opencontainers.image.revision=${GIT_SHA}" \
+                --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --label "molecule.workflow.run_id=${GITHUB_RUN_ID}" \
+                --tag "${DESKTOP_IMAGE}:${TAG_SHA}" \
+                --tag "${DESKTOP_IMAGE}:${TAG_LATEST}" \
+                . ; then
+              built=1
+              echo "::notice::Desktop image build succeeded on attempt ${attempt}"
+              break
+            fi
+            echo "::warning::Desktop image build attempt ${attempt} failed — retrying"
+            sleep 10
+          done
+          if [ "$built" -ne 1 ]; then
+            echo "::error::Desktop image build failed after 3 attempts"
+            exit 1
+          fi
+          docker image inspect "${DESKTOP_IMAGE}:${TAG_SHA}" --format 'built {{.Id}}' >/dev/null \
+            || { echo "::error::image ${DESKTOP_IMAGE}:${TAG_SHA} missing after build"; exit 1; }
+          echo "::notice::image present in host daemon: $(docker image inspect "${DESKTOP_IMAGE}:${TAG_SHA}" --format '{{.Id}}')"
+
+      # Publish via the PARALLEL CHUNKED PUSHER through the Cloudflare tunnel (the
+      # ~1.5GB desktop layers would 413 on a plain push at the CF ~100MB cap). SSOT
+      # pusher: molecule-ai/operator-config bin/registry-parallel-push.py. Same
+      # skip-if-no-token posture as the tenant publish.
+      - name: Publish desktop image to registry (chunked pusher through CF tunnel)
+        env:
+          DESKTOP_IMAGE: ${{ env.DESKTOP_IMAGE }}
+          TAG_SHA: staging-${{ steps.tags.outputs.sha }}
+          TAG_LATEST: staging-latest
+          IMAGE_REPO: molecule-ai/molecule-desktop
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          AUTO_SYNC_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
+          PUSHER_REF: ${{ vars.OPERATOR_CONFIG_PUSHER_REF || 'main' }}
+          GITHUB_SERVER_URL: ${{ env.GITHUB_SERVER_URL }}
+        run: |
+          set -uo pipefail
+          REG_HOST="${DESKTOP_IMAGE%%/*}"
+          LOCAL_IMAGE="${DESKTOP_IMAGE}:${TAG_SHA}"
+          if [ -z "${REG_TOKEN:-}" ]; then
+            echo "::notice::MOLECULE_REGISTRY_TOKEN not set — skipping registry push."
+            echo "::notice::The image is present in the build daemon as ${LOCAL_IMAGE}; wire the org secret to publish."
+            exit 0
+          fi
+          echo "::add-mask::$REG_TOKEN"
+          PUSHER="$RUNNER_TEMP/registry-parallel-push.py"
+          url="${GITHUB_SERVER_URL}/api/v1/repos/molecule-ai/operator-config/raw/bin/registry-parallel-push.py?ref=${PUSHER_REF}"
+          if ! curl -fsSL -H "Authorization: token ${AUTO_SYNC_TOKEN}" "$url" -o "$PUSHER"; then
+            echo "::warning::could not fetch the chunked pusher from operator-config@${PUSHER_REF}. Non-fatal; no registry push this run."
+            exit 0
+          fi
+          rc=0
+          for t in "$TAG_SHA" "$TAG_LATEST"; do
+            echo "::group::chunked push ${REG_HOST}/${IMAGE_REPO}:${t}"
+            if python3 "$PUSHER" --image "$LOCAL_IMAGE" --registry "$REG_HOST" \
+                 --repo "$IMAGE_REPO" --tag "$t" --user "$REG_USER"; then
+              echo "::notice::chunked-pushed ${REG_HOST}/${IMAGE_REPO}:${t}"
+            else
+              echo "::warning::chunked push of ${t} failed"; rc=1
+            fi
+            echo "::endgroup::"
+          done
+          if [ "$rc" != 0 ]; then
+            echo "::warning::one or more chunked pushes failed — investigate before relying on the registry."
+          fi
+          exit 0
+
+  # bp-exempt: post-merge prod :latest promote side effect; gated on green push CI
+  # for this SHA AND the PROD_AUTO_DEPLOY_DISABLED production freeze. Mirrors the
+  # tenant publish's promote-latest.
+  promote-latest:
+    name: Promote desktop :latest to CI-green build
+    needs: build-and-push
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: docker-host
+    timeout-minutes: 60
+    env:
+      DESKTOP_IMAGE: ${{ vars.MOLECULE_DESKTOP_IMAGE || 'registry.moleculesai.app/molecule-ai/molecule-desktop' }}
+      PROD_AUTO_DEPLOY_DISABLED: ${{ vars.PROD_AUTO_DEPLOY_DISABLED || secrets.PROD_AUTO_DEPLOY_DISABLED || '' }}
+    steps:
+      - name: Prepare writable HOME + Docker config
+        run: |
+          set -euo pipefail
+          H="$RUNNER_TEMP/desktop-promote-home"
+          mkdir -p "$H/.docker"
+          echo "HOME=$H" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$H/.docker" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Resolve promote gate (production freeze)
+        id: gate
+        env:
+          PROD_AUTO_DEPLOY_DISABLED: ${{ env.PROD_AUTO_DEPLOY_DISABLED }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PROD_AUTO_DEPLOY_DISABLED:-}" ]; then
+            case "$(printf '%s' "$PROD_AUTO_DEPLOY_DISABLED" | tr '[:upper:]' '[:lower:]')" in
+              1|true|yes|on|disabled|disable)
+                echo "enabled=false" >> "$GITHUB_OUTPUT"
+                echo "::notice::desktop :latest promote skipped: PROD_AUTO_DEPLOY_DISABLED=$PROD_AUTO_DEPLOY_DISABLED"
+                exit 0 ;;
+            esac
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for green push CI on this SHA
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEA_TOKEN:-}" ]; then
+            echo "::error::AUTO_SYNC_TOKEN required so the promote can wait for green CI on this SHA."
+            exit 1
+          fi
+          python3 .gitea/scripts/prod-auto-deploy.py wait-ci
+
+      - name: Promote :latest to the CI-green desktop image (registry manifest re-point)
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          DESKTOP_IMAGE: ${{ env.DESKTOP_IMAGE }}
+          STAGING_SHA_TAG: ${{ needs.build-and-push.outputs.staging_sha }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+        run: |
+          set -euo pipefail
+          SHA_TAG="${STAGING_SHA_TAG:-staging-${GITHUB_SHA::7}}"
+          REG_HOST="${DESKTOP_IMAGE%%/*}"
+          SRC="${DESKTOP_IMAGE}:${SHA_TAG}"
+          DST="${DESKTOP_IMAGE}:latest"
+          if [ -z "${REG_TOKEN:-}" ]; then
+            echo "::error::MOLECULE_REGISTRY_TOKEN required to re-point :latest in the registry."
+            exit 1
+          fi
+          echo "::add-mask::$REG_TOKEN"
+          printf '%s' "$REG_TOKEN" | docker login "$REG_HOST" --username "$REG_USER" --password-stdin >/dev/null
+          # Registry-level MANIFEST-ONLY re-point (no blob transfer — tunnel-safe
+          # without the chunked pusher). :latest becomes byte-identical to the
+          # CI-green :staging-<sha>. Running platforms pull it on the next
+          # StartDesktop.
+          docker buildx imagetools create --tag "$DST" "$SRC"
+          echo "::notice::re-pointed $DST -> $SRC (registry manifest)"
+          {
+            echo "## Desktop :latest promoted"
+            echo ""
+            echo "Re-pointed \`${DESKTOP_IMAGE}:latest\` -> \`${SHA_TAG}\` for commit \`${GITHUB_SHA::7}\`. Running platforms pull it on the next StartDesktop (runtime-pulled sidecar; no tenant redeploy needed)."
+          } >> "$GITHUB_STEP_SUMMARY"
