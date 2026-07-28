@@ -548,6 +548,9 @@ func (h *OrgHandler) ListTemplates(c *gin.Context) {
 				gitDir := filepath.Join(templateDir, ".git")
 				if _, gitErr := os.Stat(gitDir); gitErr == nil {
 					log.Printf("ListTemplates: WARNING %q has .git but no org.yaml/.yml — likely a half-checkout. Try 'cd %s && git checkout main -- .' to restore the working tree.", e.Name(), templateDir)
+					// Surface it: a half-clone is the exact case the operator
+					// needs to see, and it previously vanished from the palette.
+					templates = append(templates, brokenOrgTemplateEntry(e.Name(), "half_checkout", err))
 				}
 				continue
 			}
@@ -558,15 +561,24 @@ func (h *OrgHandler) ListTemplates(c *gin.Context) {
 		// errors — the previous silent-continue made a broken template
 		// show up as "no templates" in the Canvas palette with no log
 		// trail, which is how a fresh-clone user first discovers the gap.
+		// A template that fails to load is REPORTED, not dropped. Logging and
+		// `continue`-ing returns 200 with the template silently absent — the
+		// caller cannot distinguish "this org has 3 templates" from "it has 4
+		// and one is broken". That loud-log/silent-wire shape is how #4889 hid:
+		// molecule-dev was unimportable on every image while /org/templates
+		// happily returned the other two and the Canvas palette just looked
+		// short. The log line is kept; the response now carries the failure.
 		if expanded, err := resolveYAMLIncludes(data, templateDir); err == nil {
 			data = expanded
 		} else {
-			log.Printf("ListTemplates: skipping %s — !include expansion failed: %v", e.Name(), err)
+			log.Printf("ListTemplates: %s unavailable — !include expansion failed: %v", e.Name(), err)
+			templates = append(templates, brokenOrgTemplateEntry(e.Name(), "include_expansion_failed", err))
 			continue
 		}
 		var tmpl OrgTemplate
 		if err := yaml.Unmarshal(data, &tmpl); err != nil {
-			log.Printf("ListTemplates: skipping %s — yaml unmarshal failed: %v", e.Name(), err)
+			log.Printf("ListTemplates: %s unavailable — yaml unmarshal failed: %v", e.Name(), err)
+			templates = append(templates, brokenOrgTemplateEntry(e.Name(), "yaml_invalid", err))
 			continue
 		}
 		count := countWorkspaces(tmpl.Workspaces)
@@ -586,6 +598,31 @@ func (h *OrgHandler) ListTemplates(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, templates)
+}
+
+// brokenOrgTemplateEntry renders a template that could not be loaded as a
+// PRESENT-but-unavailable listing entry rather than omitting it.
+//
+// Shape is deliberately the same map as a healthy entry plus `error`/`reason`,
+// so existing consumers keep reading `dir`/`name`/`workspaces` without a nil
+// check, and a caller that wants to grey the row out only has to test for
+// `error`. `workspaces: 0` is honest — we could not parse a tree — and is what
+// stops a broken entry looking importable.
+func brokenOrgTemplateEntry(dir, reason string, err error) map[string]interface{} {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	return map[string]interface{}{
+		"dir":             dir,
+		"name":            dir,
+		"description":     "",
+		"workspaces":      0,
+		"required_env":    []string{},
+		"recommended_env": []string{},
+		"error":           msg,
+		"reason":          reason,
+	}
 }
 
 // Import handles POST /org/import — creates an entire org from a template.
