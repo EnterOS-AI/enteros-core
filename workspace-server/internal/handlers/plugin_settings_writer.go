@@ -28,7 +28,6 @@ import (
 	"fmt"
 	"log"
 	"path"
-	"sort"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
@@ -150,15 +149,4 @@ func (h *TemplatesHandler) deliverPluginSettings(
 		return false, nil
 	}
 	return true, nil
-}
-
-// sortedSettingKeys is a small helper for deterministic logging — callers log
-// which keys moved, and an unstable order makes those logs undiffable.
-func sortedSettingKeys(settings map[string]any) []string {
-	out := make([]string, 0, len(settings))
-	for k := range settings {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

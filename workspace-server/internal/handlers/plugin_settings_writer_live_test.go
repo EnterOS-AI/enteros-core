@@ -21,7 +21,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/docker/docker/client"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/db"
 )
 
 func liveDockerOrSkip(t *testing.T) *client.Client {
@@ -43,7 +46,16 @@ func liveDockerOrSkip(t *testing.T) *client.Client {
 // with a /configs tree. Returns its name; it is removed on cleanup.
 func startLiveBox(t *testing.T) string {
 	t.Helper()
-	name := "mol-settings-writer-proof"
+	return startLiveBoxFor(t, liveWorkspaceID)
+}
+
+// liveWorkspaceID is the id the writer resolves; the container is named
+// ws-<id> so the REAL findContainer finds it.
+const liveWorkspaceID = "settings-writer-proof"
+
+func startLiveBoxFor(t *testing.T, workspaceID string) string {
+	t.Helper()
+	name := "ws-" + workspaceID
 	_ = exec.Command("docker", "rm", "-f", name).Run()
 	out, err := exec.Command("docker", "run", "-d", "--name", name,
 		"alpine:3.20", "sh", "-c", "mkdir -p /configs/plugins && sleep 600").CombinedOutput()
@@ -234,5 +246,82 @@ func TestLiveBox_FilesAPISaveActuallyLandsOnTheBox(t *testing.T) {
 		"[ -e /configs/configs ] && echo EXISTS || echo absent").Output()
 	if strings.TrimSpace(string(out)) != "absent" {
 		t.Errorf("destPath was doubled — /configs/configs exists")
+	}
+}
+
+// wireMockDBForWriter stands up the two queries the REAL writer path issues:
+// its own workspaces lookup (backend selection) and findContainer's name
+// lookup. Without this, exercising writePluginSettingsToWorkspace would only
+// ever test copyFilesToContainer directly — which is what let the destPath
+// doubling hide in the first place.
+func wireMockDBForWriter(t *testing.T, workspaceID string) {
+	t.Helper()
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	prev := db.DB
+	db.DB = mockDB
+	t.Cleanup(func() { db.DB = prev; mockDB.Close() })
+
+	// Backend selection: a local-docker workspace carries a container NAME in
+	// instance_id, which must NOT route to the EC2/EIC leg.
+	mock.ExpectQuery(`SELECT COALESCE\(instance_id`).
+		WithArgs(workspaceID).
+		WillReturnRows(sqlmock.NewRows([]string{"instance_id", "runtime"}).
+			AddRow("ws-"+workspaceID, "openclaw"))
+	// findContainer's workspace-name lookup.
+	mock.ExpectQuery(`SELECT LOWER\(REPLACE\(name`).
+		WithArgs(workspaceID).
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("proof-ws"))
+}
+
+// TestLiveBox_RealWriterLandsSettingsOnARunningWorkspace drives the ACTUAL
+// entry point — backend dispatch included — not just the copy primitive.
+func TestLiveBox_RealWriterLandsSettingsOnARunningWorkspace(t *testing.T) {
+	cli := liveDockerOrSkip(t)
+	box := startLiveBox(t)
+	wireMockDBForWriter(t, liveWorkspaceID)
+	h := &TemplatesHandler{docker: cli}
+
+	if err := h.writePluginSettingsToWorkspace(context.Background(), liveWorkspaceID,
+		"molecule-ai-plugin-scheduler",
+		map[string]any{"poll_seconds": 15, "timezone": "America/Vancouver"}); err != nil {
+		t.Fatalf("writePluginSettingsToWorkspace: %v", err)
+	}
+
+	got := readFromBox(t, box, "/configs/"+pluginSettingsDirName+"/molecule-ai-plugin-scheduler.json")
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("not valid JSON on the box: %v\n%s", err, got)
+	}
+	if parsed["timezone"] != "America/Vancouver" || parsed["poll_seconds"] != float64(15) {
+		t.Errorf("settings did not land: %v", parsed)
+	}
+	t.Logf("REAL writer put %s on a running workspace", strings.TrimSpace(got))
+}
+
+// deliverPluginSettings = write + best-effort daemon reload. The box here has
+// no runtime serving /internal/daemons/reload, so the reload must NOT confirm —
+// and the writer must still report the durable write as successful. That
+// distinction is the point: "saved and live" is a stronger claim than "saved".
+func TestLiveBox_DeliverReportsWhenTheReloadDidNotConfirm(t *testing.T) {
+	cli := liveDockerOrSkip(t)
+	box := startLiveBox(t)
+	wireMockDBForWriter(t, liveWorkspaceID)
+	// armSchedulerPlugin issues its own workspaces lookup for the callback URL.
+	h := &TemplatesHandler{docker: cli}
+
+	reloaded, err := h.deliverPluginSettings(context.Background(), liveWorkspaceID,
+		"molecule-ai-plugin-scheduler", map[string]any{"timezone": "UTC"})
+	if err != nil {
+		t.Fatalf("deliverPluginSettings returned an error for a durable write: %v", err)
+	}
+	if reloaded {
+		t.Error("reload should NOT have confirmed — this box runs no workspace runtime")
+	}
+	// The file is on the box regardless: the change applies on next boot.
+	if got := readFromBox(t, box, "/configs/"+pluginSettingsDirName+"/molecule-ai-plugin-scheduler.json"); !strings.Contains(got, "UTC") {
+		t.Errorf("durable write did not land: %q", got)
 	}
 }
