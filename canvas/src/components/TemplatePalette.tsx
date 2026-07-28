@@ -48,8 +48,9 @@ export interface OrgTemplate {
    *  unavailable rather than omitted, so the palette shows the operator
    *  that a template exists and is broken instead of it silently
    *  vanishing — the failure shape that hid molecule-core#4889.
-   *  When set, the tile must be non-importable: `workspaces` is 0 but
-   *  that is a badge, not a gate. */
+   *  May be empty when the underlying error was nil — gate on `reason`,
+   *  not on this. `workspaces` is 0 for a broken entry but that is a badge,
+   *  not a gate. */
   error?: string;
   /** Machine-readable companion to `error`:
    *  include_expansion_failed | yaml_invalid | half_checkout */
@@ -295,7 +296,12 @@ export function OrgTemplatesSection() {
 
       {orgs.map((o) => {
         const isImporting = importing === o.dir;
-        const isBroken = Boolean(o.error);
+        // Gate on `reason`, NOT `error`. The server sets `reason` from a string
+        // literal on every broken path, but leaves `error` empty when the
+        // underlying err is nil (org.go's brokenOrgTemplateEntry) — and an
+        // entry with reason set and error "" would otherwise render as a fully
+        // enabled Import tile. Proven by probe during review.
+        const isBroken = Boolean(o.reason);
         return (
           <div
             key={o.dir}

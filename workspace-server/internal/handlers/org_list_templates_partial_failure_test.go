@@ -240,17 +240,56 @@ func TestListTemplates_ErrorMessageCarriesNoAbsolutePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The oracle is deliberately INDEPENDENT of how scrubTemplatePaths works.
+	// A previous revision re-implemented the scrubber's tokenizer here — same
+	// strings.Fields, same Trim set — so it asked the same question in the same
+	// words as the implementation and could not fail for any shape the scrubber
+	// missed. Review proved that with five real shapes (bracketed, parenthesised,
+	// angle-bracketed, key=value and file:// URI) that passed straight through
+	// BOTH. Asserting on the tmpdir root instead catches every one of them and
+	// cannot drift with the implementation.
 	for _, e := range decodeTemplates(t, newOrgTemplatesRequest(t, root)) {
 		msg, _ := e["error"].(string)
 		if msg == "" {
 			continue
 		}
-		for _, tok := range strings.Fields(msg) {
-			tok = strings.Trim(tok, `"'` + "`" + `:,`)
-			if strings.HasPrefix(tok, "/") && len(tok) > 1 {
-				t.Errorf("entry %v leaks an absolute server path in error: %q", e["dir"], msg)
-			}
+		if strings.Contains(msg, root) {
+			t.Errorf("entry %v leaks the server directory layout in error: %q (must not contain %q)", e["dir"], msg, root)
 		}
 	}
 }
 
+// TestScrubTemplatePaths_ShapesThatDefeatedTheTokenizer pins the five shapes a
+// tokenizing scrubber let through, plus the two it garbled. These are unit-level
+// because the handler only produces two of them today — the point is that the
+// invariant survives the next fmt.Errorf someone adds.
+func TestScrubTemplatePaths_ShapesThatDefeatedTheTokenizer(t *testing.T) {
+	secret := "/org-templates/molecule-dev"
+	for _, tc := range []struct{ name, in string }{
+		{"parenthesised", "external ref (" + secret + "/teams/eng.yaml) failed"},
+		{"bracketed", "read [" + secret + "/org.yaml] failed"},
+		{"key=value", "load path=" + secret + "/org.yaml failed"},
+		{"angle-bracketed", "cannot stat <" + secret + "/org.yaml>"},
+		{"uri", "err: file://" + secret + "/org.yaml unreadable"},
+		{"multiline", "yaml: line 2:\n  cannot unmarshal " + secret + "/org.yaml\n  into []T"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scrubTemplatePaths(tc.in)
+			if strings.Contains(got, secret) {
+				t.Errorf("layout leaked: %q", got)
+			}
+		})
+	}
+
+	// Absoluteness is itself the finding for an escape attempt — reducing
+	// /etc/passwd to "passwd" makes it read as an ordinary relative include.
+	esc := scrubTemplatePaths(`!include "/etc/passwd" at line 3: path escapes root`)
+	if !strings.Contains(esc, `"/`) {
+		t.Errorf("scrub deleted the evidence that the include was ABSOLUTE: %q", esc)
+	}
+
+	// Multi-line errors must stay multi-line; the tokenizer flattened them.
+	if ml := scrubTemplatePaths("a\n  b"); !strings.Contains(ml, "\n") {
+		t.Errorf("scrub destroyed newlines: %q", ml)
+	}
+}

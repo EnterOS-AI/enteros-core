@@ -10,7 +10,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -605,16 +607,23 @@ func (h *OrgHandler) ListTemplates(c *gin.Context) {
 // layout on the wire. Reason codes carry the machine meaning; the operator
 // gets the failing file, not its location.
 func scrubTemplatePaths(msg string) string {
-	var out []string
-	for _, tok := range strings.Fields(msg) {
-		trimmed := strings.Trim(tok, `"'`+"`"+`:,`)
-		if strings.HasPrefix(trimmed, "/") && len(trimmed) > 1 {
-			tok = strings.Replace(tok, trimmed, filepath.Base(trimmed), 1)
-		}
-		out = append(out, tok)
-	}
-	return strings.Join(out, " ")
+	return absPathRe.ReplaceAllStringFunc(msg, func(p string) string {
+		// Keep the leading slash. Whether an include was ABSOLUTE is itself the
+		// finding for "path escapes root" — replacing /etc/passwd with "passwd"
+		// deletes the security-relevant evidence and makes the message read as
+		// an ordinary relative include. /…/passwd hides the layout and keeps it.
+		return "/…/" + path.Base(p)
+	})
 }
+
+// absPathRe matches an absolute filesystem path without consuming the
+// punctuation that surrounds it in real error text. A previous revision
+// tokenized on strings.Fields and trimmed quotes, which (a) could not see a
+// path inside brackets, parens, angle brackets, key=value or a file:// URI, and
+// (b) destroyed newlines, flattening genuinely multi-line yaml errors, and
+// split paths containing spaces. Character-class exclusion handles all of those
+// without a tokenizer the test could accidentally mirror.
+var absPathRe = regexp.MustCompile(`/[^\s"'` + "`" + `<>()\[\],;]+`)
 
 // brokenOrgTemplateEntry renders a template that could not be loaded as a
 // PRESENT-but-unavailable listing entry rather than omitting it.
