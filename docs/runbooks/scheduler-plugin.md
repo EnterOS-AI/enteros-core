@@ -97,6 +97,54 @@ from `declareDefaultNativePlugins`:
 
 Reference: core#4541.
 
+## The scheduler owns its own configuration
+
+`molecule-scheduler` is a `kind: trigger` plugin that declares its own settings in
+its manifest — core does not model scheduler tuning, and there is no core-side
+knob for it. Its `contributes.configuration` declares two keys:
+
+| Key | Type | Manifest default | Effect |
+| --- | --- | --- | --- |
+| `poll_seconds` | integer | `30` | Grid scan interval. Interpolated into the daemon env as `MOLECULE_TRIGGER_POLL_SECONDS: "${config:poll_seconds}"`. The daemon clamps to a 1s floor and falls back to 30 on a missing/unparseable value. |
+| `schedules` | array | `[]` | Schedules this install **seeds** into the workspace grid, reconciled with `upsert_template` semantics: additive, keyed on name, a runtime/API edit of the same name wins, a user-deleted schedule is tombstoned and never resurrected. The default is empty on purpose — this plugin ships the daemon, not preset schedules. |
+
+Values reach the box as a delivered settings file, **not** as core config:
+
+```
+template config.yaml  plugins[].config
+        ↓  core   renderPluginSettingsFiles   (plugin_settings_delivery.go)
+/configs/plugin-settings/molecule-ai-plugin-scheduler.json
+        ↓  runtime  plugin_settings.resolve   (manifest defaults <- delivered)
+daemon env  MOLECULE_TRIGGER_POLL_SECONDS=…
+```
+
+> ### Operational trap: the settings file is named after the REPO
+>
+> The filename is the plugin's **install name**, derived from its source by
+> `PluginNameFromSource` — for the scheduler that is
+> **`molecule-ai-plugin-scheduler`**, the repo. It is *not* the manifest's own
+> `name:`, which is `molecule-scheduler`. Both identities are live at once for
+> this plugin: the daemon is owned by `molecule-scheduler`, while its settings
+> arrive as `molecule-ai-plugin-scheduler.json`.
+>
+> When debugging "my config did not take", look for
+> `/configs/plugin-settings/molecule-ai-plugin-scheduler.json`. A file at
+> `molecule-scheduler.json` is read by nothing and fails **silently** — the
+> runtime treats a missing settings file as a clean no-op and the daemon simply
+> runs on manifest defaults. (The plugin repo's own `plugin.yaml` comment
+> currently names `molecule-scheduler.json` here; that comment is wrong, and the
+> delivered filename is what the code actually produces.)
+
+**Delivery is Create-path only.** Both `renderPluginSettingsFiles` call sites sit
+inside `WorkspaceHandler.Create` — the local-template leg and the SaaS
+fetched-bytes leg — and the rendered files ride the provision bundle. Editing a
+template's `plugins[].config` therefore does not reach an existing workspace;
+that workspace has to be provisioned again. A live-edit path (layer 6) is **not in
+`main`** — the delivery module's own scope comment says so explicitly.
+
+See `docs/plugins/authoring-configuration.md` for the declaration contract and
+`docs/plugins/template-plugin-config.md` for setting the values.
+
 ## Health
 
 - **Runtime surface (volume-backed, authoritative for plugin workspaces):**
@@ -107,33 +155,38 @@ Reference: core#4541.
   first tick it falls back to `{"last_tick": null, "armed": <grid count>, "errors": {}}`
   so the surface is never blank. Run history:
   `GET /internal/schedules/history` (or `/{name}/history`).
-  **Note:** core's Canvas-facing Health/History routes
-  (`GET /workspaces/:id/schedules/health`, `.../:scheduleId/history`) still
-  read the legacy DB — their re-point to this surface is pending (scheduler
-  RFC P3 remainders). Until then, reach the runtime surface through the
-  platform's forward machinery or, with container access, read the volume
-  files directly: `<configs>/schedules/{schedules.yaml,schedule-health.json,schedule-history.json}`.
-- **Legacy admin surface:** `GET /admin/schedules/health` (`AdminAuth`) reads
-  `workspace_schedules` bookkeeping. **Caveat:** the trigger daemon does not
-  write that table, so plugin-fired workspaces show `never_run`/`stale` there
-  — that is re-point drift, not an outage. Confirm via the runtime surface
-  before paging anyone.
+- **Core's Canvas-facing routes are volume-proxied** — `GET /workspaces/:id/schedules/health`
+  and `GET /workspaces/:id/schedules/:scheduleId/history` forward to the runtime
+  surface above (`healthVolume` / `historyVolume` in `schedules_proxy.go`) and
+  return the same data the daemon writes. They do **not** read the legacy DB;
+  an earlier revision of this runbook said the re-point was still pending, which
+  is wrong — the proxy is unconditional and there is no DB arm behind it.
+- **Admin cross-workspace surface:** `GET /admin/schedules/health` (`AdminAuth`,
+  issue #618) reads the **volume** grid per workspace
+  (`volumeAdminScheduleHealth`); its only SQL is a workspace-name lookup. A
+  previous revision warned that plugin-fired workspaces would show
+  `never_run`/`stale` here because the daemon does not write
+  `workspace_schedules` — that caveat is obsolete, because this route no longer
+  consults that table. If it reports a schedule stale, treat it as real and
+  investigate rather than dismissing it as re-point drift.
+- With container access you can always read the volume files directly:
+  `<configs>/schedules/{schedules.yaml,schedule-health.json,schedule-history.json}`.
 
-## Backfill (remediate pre-P5 scheduled workspaces)
+## Backfill — the route is GONE
 
-Workspaces whose `workspace_schedules` rows predate per-workspace delivery
-have no plugin declared, so post-#4399 their schedules fire nowhere.
+> **`POST /admin/schedules/backfill-plugin` no longer exists.** The handler
+> (`BackfillSchedulerPlugin`) has zero Go references and the path is absent from
+> the engine's route table — a call returns **404**. The sibling one-shot lever
+> `POST /admin/workspaces/:id/schedules/migrate-to-volume` (`MigrateToVolume`) is
+> gone the same way. Both were P4b migration tooling for moving off the core DB,
+> and they went out with the DB path itself.
 
-```
-POST /admin/schedules/backfill-plugin          # AdminAuth — DRY-RUN (default)
-POST /admin/schedules/backfill-plugin?apply=true
-```
-
-- Dry-run is **read-only**: returns `{dry_run:true, would_declare, plugin,
-  source, workspace_ids, note}` — the exact blast radius, for CTO review.
-- `?apply=true` declares + best-effort hot-arms each listed workspace and
-  returns `{declared, failed, total, failures}`.
-- Idempotent — re-running never duplicates declarations.
+There is no backfill lever to run. The scheduler is now declared **unconditionally
+on every provision** (see *How a workspace gets the scheduler* above), so the
+population those routes existed to remediate — workspaces with schedules but no
+plugin — is refilled by provisioning rather than by an admin sweep. A workspace
+that is not firing needs the fleet-rollout path (a pin that carries the plugin,
+then a re-provision), not a backfill call.
 
 ## Hot-arm a single workspace
 
@@ -163,8 +216,9 @@ automatically on merge:
    `MOLECULE_DIGEST_PROVIDER_PLUGINS=1` for workspaces via the org/global
    secret env fan-out (flag-off is byte-identical; separate RFC, same rollout
    train).
-5. **Backfill apply** — run the backfill dry-run, review the list, then
-   `?apply=true` (step above).
+5. ~~**Backfill apply**~~ — **no longer a step.** The backfill route has been
+   deleted (see *Backfill — the route is GONE*); the every-provision declare
+   replaced it.
 6. **E2E flips** — set `E2E_SCHEDULER_CHECK=on` in
    `tests/e2e/ephemeral_cp_happy_path.sh` (activates autonomous-fire step 10d
    of `test_staging_full_saas.sh`) once the ephemeral runtime pin carries the
