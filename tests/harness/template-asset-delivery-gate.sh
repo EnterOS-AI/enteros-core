@@ -94,16 +94,49 @@ seed_required_env() {
     log "  WARN: $TEMPLATE_CONFIG absent — cannot derive required_env; a provision abort will be reported below if the template needs any"
     return 0
   fi
+  # PyYAML is NOT in tests/harness/requirements.txt, so it cannot be assumed on
+  # the runner — and under `set -e` a failing command substitution would abort
+  # this whole script silently. Hence: yaml when available, a scalar-list
+  # fallback parser when not, `|| true` so neither path can kill the gate, and
+  # the seeded names logged so the parse is visible rather than trusted.
   local names
   names="$(python3 -c '
-import sys, yaml
+import sys, re
+
 try:
-    d = yaml.safe_load(open(sys.argv[1])) or {}
-except Exception as e:
-    print("", end=""); sys.exit(0)
-req = ((d.get("runtime_config") or {}).get("required_env") or [])
-print("\n".join(n for n in req if isinstance(n, str) and n.strip()))
-' "$TEMPLATE_CONFIG" 2>/dev/null)"
+    text = open(sys.argv[1]).read()
+except Exception:
+    sys.exit(0)
+
+names = []
+try:
+    import yaml
+    doc = yaml.safe_load(text) or {}
+    names = ((doc.get("runtime_config") or {}).get("required_env") or [])
+except Exception:
+    # No PyYAML (or unparseable). runtime_config.required_env is a flat list of
+    # scalar names nested one level down, so a block scan is exact enough here
+    # and strictly better than skipping the seed and failing the provision.
+    in_rc = False
+    in_req = False
+    for line in text.splitlines():
+        if re.match(r"^runtime_config:\s*$", line):
+            in_rc, in_req = True, False
+            continue
+        if in_rc and re.match(r"^\S", line):      # dedent out of runtime_config
+            break
+        if in_rc and re.match(r"^\s{1,4}required_env:\s*$", line):
+            in_req = True
+            continue
+        if in_req:
+            m = re.match(r"^\s+-\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", line)
+            if m:
+                names.append(m.group(1))
+            elif line.strip():                    # any other key ends the list
+                in_req = False
+
+print("\n".join(n for n in names if isinstance(n, str) and n.strip()))
+' "$TEMPLATE_CONFIG" 2>/dev/null || true)"
   if [ -z "$names" ]; then
     log "  template declares no runtime_config.required_env — nothing to seed"
     return 0
