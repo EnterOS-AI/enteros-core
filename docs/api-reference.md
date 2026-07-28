@@ -58,11 +58,11 @@ Full contract: `docs/runbooks/admin-auth.md`.
 | GET | /workspaces/:id/a2a/queue/:queue_id | a2a_queue_status.go — same authentication as A2A send, followed by queue sender/target ownership checks |
 | POST | /workspaces/:id/delegate | delegation.go (async fire-and-forget) |
 | GET | /workspaces/:id/delegations | delegation.go (list delegation status) |
-| GET/POST | /workspaces/:id/schedules | schedules.go (cron CRUD). When the workspace advertises the `scheduler` capability (it runs the `kind: trigger` scheduler plugin), these routes proxy to the runtime's volume-backed `/internal/schedules*` API (schedules_proxy.go) — the volume grid is the source of truth; otherwise they serve the legacy `workspace_schedules` table (kept until P4b). `SCHEDULE_VOLUME_PROXY_DISABLED=1` forces the legacy path. |
-| PATCH/DELETE | /workspaces/:id/schedules/:scheduleId | schedules.go — same volume-proxy/legacy split as above; in the volume model `:scheduleId` is the schedule *name* |
-| POST | /workspaces/:id/schedules/:scheduleId/run | schedules.go (manual trigger) — volume path pokes the trigger daemon, which fires an autonomous `self-scheduler` turn (response carries `fired_by:"daemon"`); legacy path as before |
-| GET | /workspaces/:id/schedules/:scheduleId/history | schedules.go (past runs) — still reads core `activity_logs` `cron_run` rows; the volume re-point (runtime history file) is pending. Daemon fires on a plugin workspace do not write `activity_logs`, so use the runtime's history surface for those. |
-| GET | /workspaces/:id/schedules/health | schedules.go — peer-readable schedule health (issue #249); still reads the legacy table (volume re-point pending) |
+| GET/POST | /workspaces/:id/schedules | schedules.go (cron CRUD) — **unconditionally** proxied to the runtime's volume-backed `/internal/schedules*` API (schedules_proxy.go). The volume grid is the only source of truth. The legacy `workspace_schedules` dual path and its `SCHEDULE_VOLUME_PROXY_DISABLED` kill-switch were **removed in P4b**; core no longer reads that table anywhere. |
+| PATCH/DELETE | /workspaces/:id/schedules/:scheduleId | schedules.go — volume-proxied as above; `:scheduleId` is the schedule *name* (the grid's state key) |
+| POST | /workspaces/:id/schedules/:scheduleId/run | schedules.go (manual trigger) — pokes the trigger daemon, which fires an autonomous `self-scheduler` turn (response carries `fired_by:"daemon"`) |
+| GET | /workspaces/:id/schedules/:scheduleId/history | schedules.go (past runs) — **volume-proxied** to the runtime's history file (`scheduleHistoryLimit = 20`, mirroring the legacy window). Daemon fires are recorded there, not in `activity_logs`. |
+| GET | /workspaces/:id/schedules/health | schedules.go — peer-readable schedule health (issue #249); **volume-proxied** to the runtime's health surface |
 | POST | /admin/workspaces/:id/schedules/migrate-to-volume | schedules_proxy.go — `AdminAuth`; copies the workspace's `source='runtime'` schedule rows from the DB to its volume grid, idempotent; see `docs/guides/selfhost-schedule-migration.md` |
 | POST | /admin/schedules/backfill-plugin | scheduler_plugin.go — `AdminAuth`; declares the `molecule-scheduler` trigger plugin for every workspace with `workspace_schedules` rows; **dry-run by default**, `?apply=true` to declare + arm; see `docs/runbooks/scheduler-plugin.md` |
 | GET/POST | /workspaces/:id/channels | channels.go (social channel CRUD) |
@@ -113,7 +113,7 @@ Migration files live in `workspace-server/migrations/` (timestamp-named; check t
 | `canvas_layouts` | Per-workspace x/y canvas position |
 | `structure_events` | Append-only event log (workspace lifecycle, agent, approval events) |
 | `activity_logs` | A2A communications, task updates, agent logs, errors. Historical `cron_run` rows (with `error_detail`) were written by the retired core scheduler loop and still back the legacy History route; the per-workspace trigger daemon writes its run log to the workspace volume instead. |
-| `workspace_schedules` | **Legacy** cron store — expression, timezone, prompt, run bookkeeping, `source` (`'template'` for org/import-seeded, `'runtime'` for Canvas/API-created). For a workspace running the scheduler trigger plugin the volume grid is the source of truth and this table is bypassed by CRUD; it still serves non-plugin workspaces, template seeding, History/Health, admin health, and the webhook poke. Retired in P4b (issue #4411 item 5). |
+| `workspace_schedules` | **Retired (P4b).** Nothing in core reads or writes this table any more — the workspace's volume grid is the only schedule store. Rows left over from before the migration are inert: nothing reads them and nothing fires them. The table itself is dropped separately; see `docs/guides/selfhost-schedule-migration.md`. |
 | `workspace_channels` | Social channel integrations (Telegram, Slack, etc.) with JSONB config and allowlist |
 | `agents` | Agent records |
 | `workspace_secrets` | Per-workspace encrypted secrets |
