@@ -427,6 +427,27 @@ jobs:
           # and the step still scores 5 and reports GREEN. Measured population and
           # threshold population must be the same one.
           LIVE_MIN=7
+          # Second, independent arm: EVERY TestLiveBox_* declared in the file must
+          # have produced a top-level PASS. The floor alone couples this gate to a
+          # constant someone has to remember to bump — a reviewer pointed out that
+          # when core#4923 lands its two extra live tests, npass becomes 9 and a
+          # floor of 7 silently reacquires two tests of slack. Deriving the expected
+          # count from the source removes that coupling: adding tests needs no edit
+          # here, and a test that is declared but never runs (a -run typo, a build
+          # tag, a rename) is caught even though the floor is satisfied.
+          #
+          # The hardcoded floor stays BECAUSE it does the opposite job: `declared`
+          # falls with a deletion, so on its own it would bless shrinking the suite
+          # to nothing. Deletion must remain a conscious edit to LIVE_MIN.
+          declared=$(grep -c '^func TestLiveBox_' ./internal/handlers/plugin_settings_writer_live_test.go || true)
+          if [ "${declared:-0}" -eq 0 ]; then
+            echo "::error::found ZERO 'func TestLiveBox_' declarations in internal/handlers/plugin_settings_writer_live_test.go — the file moved or was renamed, so this arm cannot check anything. Point it at the new path; do NOT delete it."
+            exit 1
+          fi
+          if [ "${npass:-0}" -ne "$declared" ]; then
+            echo "::error::live-container gate: ${declared} TestLiveBox_* are declared but only ${npass} produced a top-level PASS. A declared test did not run — check the -run regex, a build tag, or a rename."
+            exit 1
+          fi
           if [ "${npass:-0}" -lt "$LIVE_MIN" ]; then
             echo "::error::live-container gate saw ${npass} top-level '--- PASS: TestLiveBox_' line(s), expected ${LIVE_MIN} (every TestLiveBox_* in plugin_settings_writer_live_test.go). A test was removed or renamed without updating LIVE_MIN, or the -run regex no longer matches the suite. Note two of them are pure unit tests, so a nonzero count alone does not prove a container ever started."
             exit 1
