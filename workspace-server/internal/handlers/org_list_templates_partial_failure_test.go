@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -169,3 +170,87 @@ func TestListTemplates_MalformedYAMLIsReported(t *testing.T) {
 		t.Errorf("reason = %v, want include_expansion_failed (expansion parses first)", got[0]["reason"])
 	}
 }
+
+// TestListTemplates_HalfCheckoutIsReported covers the third arm, which shipped
+// UNTESTED in the first revision of this change — an independent review proved
+// it by deleting only that append and watching all four tests still pass. The
+// PR body advertised a three-path negative control that was two-of-three.
+//
+// A half-checkout is a directory with .git but no org.yaml/org.yml — the shape
+// a truncated manifest clone leaves behind. It previously warned into the log
+// and vanished from the palette, which is the worst case for an operator: the
+// template they configured is simply not there.
+func TestListTemplates_HalfCheckoutIsReported(t *testing.T) {
+	root := t.TempDir()
+	writeOrgTemplateDir(t, root, "healthy", healthyOrgYAML)
+	// .git present, no org.yaml -> half checkout
+	if err := os.MkdirAll(filepath.Join(root, "molecule-dev", ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got := decodeTemplates(t, newOrgTemplatesRequest(t, root))
+
+	var bad map[string]interface{}
+	for _, e := range got {
+		if e["dir"] == "molecule-dev" {
+			bad = e
+		}
+	}
+	if bad == nil {
+		t.Fatalf("half-checkout template was OMITTED rather than reported; entries: %v", got)
+	}
+	if bad["reason"] != "half_checkout" {
+		t.Errorf("reason = %v, want half_checkout", bad["reason"])
+	}
+	if n, _ := bad["workspaces"].(float64); n != 0 {
+		t.Errorf("workspaces = %v, want 0", bad["workspaces"])
+	}
+}
+
+// TestListTemplates_EmptyDirWithoutGitIsStillSkipped pins the OTHER direction of
+// the half-checkout arm. Reporting every directory that merely lacks org.yaml
+// would turn scratch dirs into phantom "broken templates", so the .git stat is
+// load-bearing and must stay.
+func TestListTemplates_EmptyDirWithoutGitIsStillSkipped(t *testing.T) {
+	root := t.TempDir()
+	writeOrgTemplateDir(t, root, "healthy", healthyOrgYAML)
+	if err := os.MkdirAll(filepath.Join(root, "just-a-dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got := decodeTemplates(t, newOrgTemplatesRequest(t, root))
+	for _, e := range got {
+		if e["dir"] == "just-a-dir" {
+			t.Fatalf("a plain directory with no .git must NOT be reported as a broken template: %v", e)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want only the healthy one: %v", len(got), got)
+	}
+}
+
+// TestListTemplates_ErrorMessageCarriesNoAbsolutePath pins the wire-hygiene
+// decision. org.go's Import handler already withholds the input from its error
+// ("Audit 2026-05-09 (Core-Security)"), and it would be incoherent for the
+// listing to leak the server's directory layout that import deliberately hides.
+func TestListTemplates_ErrorMessageCarriesNoAbsolutePath(t *testing.T) {
+	root := t.TempDir()
+	writeOrgTemplateDir(t, root, "broken-include", "name: B\nworkspaces:\n  - !include ./missing/workspace.yaml\n")
+	if err := os.MkdirAll(filepath.Join(root, "half", ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, e := range decodeTemplates(t, newOrgTemplatesRequest(t, root)) {
+		msg, _ := e["error"].(string)
+		if msg == "" {
+			continue
+		}
+		for _, tok := range strings.Fields(msg) {
+			tok = strings.Trim(tok, `"'` + "`" + `:,`)
+			if strings.HasPrefix(tok, "/") && len(tok) > 1 {
+				t.Errorf("entry %v leaks an absolute server path in error: %q", e["dir"], msg)
+			}
+		}
+	}
+}
+

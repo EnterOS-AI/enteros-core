@@ -43,6 +43,17 @@ export interface OrgTemplate {
    *  warning with an "add now" affordance. Same union shape as
    *  `required_env`. */
   recommended_env?: EnvRequirement[];
+  /** Set when the server could not LOAD this template (broken !include,
+   *  invalid yaml, half-checkout). The entry is returned present-but-
+   *  unavailable rather than omitted, so the palette shows the operator
+   *  that a template exists and is broken instead of it silently
+   *  vanishing — the failure shape that hid molecule-core#4889.
+   *  When set, the tile must be non-importable: `workspaces` is 0 but
+   *  that is a badge, not a gate. */
+  error?: string;
+  /** Machine-readable companion to `error`:
+   *  include_expansion_failed | yaml_invalid | half_checkout */
+  reason?: string;
 }
 
 /** Fetch the list of org templates from the platform. Returns [] on error
@@ -284,20 +295,40 @@ export function OrgTemplatesSection() {
 
       {orgs.map((o) => {
         const isImporting = importing === o.dir;
+        const isBroken = Boolean(o.error);
         return (
           <div
             key={o.dir}
-            className="bg-surface-sunken/50 border border-line/60 rounded-xl p-3 hover:border-line/60 transition-all"
+            className={
+              isBroken
+                ? "bg-surface-sunken/30 border border-amber-500/40 rounded-xl p-3 opacity-70"
+                : "bg-surface-sunken/50 border border-line/60 rounded-xl p-3 hover:border-line/60 transition-all"
+            }
           >
             <div className="flex items-center justify-between mb-1">
               <span className="text-[12px] font-semibold text-ink truncate">
                 {o.name || o.dir}
               </span>
-              <span className="text-[9px] font-mono text-sky-400 bg-sky-950/40 px-1.5 py-0.5 rounded-md shrink-0">
-                {o.workspaces} workspaces
+              <span
+                className={
+                  isBroken
+                    ? "text-[9px] font-mono text-amber-400 bg-amber-950/40 px-1.5 py-0.5 rounded-md shrink-0"
+                    : "text-[9px] font-mono text-sky-400 bg-sky-950/40 px-1.5 py-0.5 rounded-md shrink-0"
+                }
+              >
+                {isBroken ? "unavailable" : `${o.workspaces} workspaces`}
               </span>
             </div>
-            {o.description && (
+            {isBroken && (
+              <p className="text-[10px] text-amber-400/90 mb-2.5 leading-relaxed break-words">
+                {o.reason === "half_checkout"
+                  ? "Incomplete checkout — no org.yaml. Re-run the template clone."
+                  : o.reason === "yaml_invalid"
+                    ? "Template YAML is invalid."
+                    : "Template could not be loaded (!include expansion failed)."}
+              </p>
+            )}
+            {!isBroken && o.description && (
               <p className="text-[10px] text-ink-mid mb-2.5 line-clamp-2 leading-relaxed">
                 {o.description}
               </p>
@@ -305,10 +336,11 @@ export function OrgTemplatesSection() {
             <button
               type="button"
               onClick={() => handleImport(o)}
-              disabled={isImporting}
+              disabled={isImporting || isBroken}
+              title={isBroken ? o.error : undefined}
               className="w-full px-2 py-1.5 bg-accent-strong/20 hover:bg-accent-strong/30 border border-accent/30 rounded-lg text-[10px] text-accent font-medium transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
             >
-              {isImporting ? "Importing…" : "Import org"}
+              {isBroken ? "Unavailable" : isImporting ? "Importing…" : "Import org"}
             </button>
           </div>
         );

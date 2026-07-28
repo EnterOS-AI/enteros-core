@@ -600,6 +600,22 @@ func (h *OrgHandler) ListTemplates(c *gin.Context) {
 	c.JSON(http.StatusOK, templates)
 }
 
+// scrubTemplatePaths reduces any absolute filesystem path in a template-load
+// error to its base name, so the listing never puts the server's directory
+// layout on the wire. Reason codes carry the machine meaning; the operator
+// gets the failing file, not its location.
+func scrubTemplatePaths(msg string) string {
+	var out []string
+	for _, tok := range strings.Fields(msg) {
+		trimmed := strings.Trim(tok, `"'`+"`"+`:,`)
+		if strings.HasPrefix(trimmed, "/") && len(trimmed) > 1 {
+			tok = strings.Replace(tok, trimmed, filepath.Base(trimmed), 1)
+		}
+		out = append(out, tok)
+	}
+	return strings.Join(out, " ")
+}
+
 // brokenOrgTemplateEntry renders a template that could not be loaded as a
 // PRESENT-but-unavailable listing entry rather than omitting it.
 //
@@ -609,9 +625,15 @@ func (h *OrgHandler) ListTemplates(c *gin.Context) {
 // `error`. `workspaces: 0` is honest — we could not parse a tree — and is what
 // stops a broken entry looking importable.
 func brokenOrgTemplateEntry(dir, reason string, err error) map[string]interface{} {
+	// The full error (with absolute server paths) stays in the log line the
+	// caller already emitted; the WIRE gets a path-free message. org.go's
+	// Import handler documents the same policy for this namespace
+	// ("Audit 2026-05-09 (Core-Security) … Drop the input from the message;
+	// log full context server-side"), and it would be incoherent for the
+	// listing to leak what the import deliberately withholds.
 	msg := ""
 	if err != nil {
-		msg = err.Error()
+		msg = scrubTemplatePaths(err.Error())
 	}
 	return map[string]interface{}{
 		"dir":             dir,
