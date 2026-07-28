@@ -945,6 +945,10 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// 409 rather than silently lost.
 	wsAuth.GET("/plugin-settings/:plugin", tmplh.GetPluginSettings)
 	wsAuth.PATCH("/plugin-settings/:plugin", tmplh.PatchPluginSettings)
+	// The plugin's OWN declaration, read live off the workspace, so the tab can
+	// render a form for a plugin the frontend has never seen. ?format=example
+	// returns the generated .example as text.
+	wsAuth.GET("/plugin-settings/:plugin/declaration", tmplh.GetPluginDeclaration)
 
 	// CORE-served boot-config fetch (the FINAL, platform-agnostic config path —
 	// no R2, no CP). Registered OUTSIDE the WorkspaceAuth group: the runtime holds

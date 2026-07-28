@@ -148,3 +148,51 @@ func (h *TemplatesHandler) PatchPluginSettings(c *gin.Context) {
 		"settings": resolveSettings(config, overrides), "detail": detail,
 	})
 }
+
+// GetPluginDeclaration handles
+// GET /workspaces/:id/plugin-settings/:plugin/declaration.
+//
+// Returns the plugin's OWN `contributes.configuration`, read live off the
+// workspace, so the plugin tab can render a form for a plugin the frontend has
+// never seen — the M5 done condition. `?format=example` returns the generated
+// `.example` instead, as text.
+func (h *TemplatesHandler) GetPluginDeclaration(c *gin.Context) {
+	workspaceID := c.Param("id")
+	pluginName := c.Param("plugin")
+	if _, err := pluginSettingsRelPath(pluginName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	manifest, err := h.readPluginManifestFromWorkspace(c.Request.Context(), workspaceID, pluginName)
+	if err != nil {
+		// Not installed / box unreachable is a 404 for this resource, not a 500:
+		// the tab asks about plugins the workspace may not have.
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":  "plugin manifest not readable on this workspace",
+			"detail": err.Error(),
+		})
+		return
+	}
+	decl, perr := parsePluginDeclaration(manifest)
+	if perr != nil {
+		// Tolerant by contract, matching the manifest schema's open anyOf: a
+		// malformed block yields no form rather than making the plugin look
+		// broken. Surfaced as a warning so an author can still see it.
+		log.Printf("GetPluginDeclaration %s/%s: %v", workspaceID, pluginName, perr)
+		c.JSON(http.StatusOK, gin.H{
+			"workspace_id": workspaceID, "plugin": pluginName,
+			"declaration": decl, "warning": "configuration block could not be parsed; no form rendered",
+		})
+		return
+	}
+
+	if c.Query("format") == "example" {
+		c.Header("Content-Type", "text/plain; charset=utf-8")
+		c.String(http.StatusOK, renderSettingsExample(pluginName, decl))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"workspace_id": workspaceID, "plugin": pluginName, "declaration": decl,
+	})
+}
