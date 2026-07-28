@@ -54,7 +54,13 @@
 ARG BASE_IMAGE_REGISTRY=registry.moleculesai.app/molecule-ai
 
 # ── Stage 1: Go platform binary ──────────────────────────────────────
-FROM ${BASE_IMAGE_REGISTRY}/golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c AS go-builder
+# ARGs consumed by a FROM must be declared BEFORE any FROM — an ARG declared
+# inside a stage is stage-scoped and resolves EMPTY in the next FROM line
+# ("invalid reference format"). All three bases are global here and
+# re-declared bare where used.
+ARG GOLANG_BASE=golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c
+ARG NODE_BASE=node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb
+FROM ${BASE_IMAGE_REGISTRY}/${GOLANG_BASE} AS go-builder
 WORKDIR /app
 COPY workspace-server/go.mod workspace-server/go.sum ./
 # github-app-auth plugin removed 2026-05-07 (#157): per-agent Gitea
@@ -111,7 +117,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 
 # ── Stage 2: Canvas Next.js standalone ────────────────────────────────
 ARG BASE_IMAGE_REGISTRY
-FROM ${BASE_IMAGE_REGISTRY}/node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb AS canvas-builder
+ARG NODE_BASE
+FROM ${BASE_IMAGE_REGISTRY}/${NODE_BASE} AS canvas-builder
 WORKDIR /canvas
 COPY canvas/package.json canvas/package-lock.json* ./
 RUN npm install
@@ -136,7 +143,8 @@ RUN npm run build
 
 # ── Stage 3: Runtime ──────────────────────────────────────────────────
 ARG BASE_IMAGE_REGISTRY
-FROM ${BASE_IMAGE_REGISTRY}/node:20-alpine@sha256:afdf98210b07b586eb71fa22ba2e432e058e4cd1304d31ed60888755b8c865fb
+ARG NODE_BASE
+FROM ${BASE_IMAGE_REGISTRY}/${NODE_BASE}
 RUN apk add --no-cache ca-certificates git tzdata openssh-client aws-cli
 
 # Non-root runtime for the Node.js canvas process.
