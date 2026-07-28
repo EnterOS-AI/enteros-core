@@ -360,7 +360,7 @@ jobs:
           git -C /tmp/mini-company-guard checkout -q FETCH_HEAD
           cd workspace-server
           MINI_COMPANY_DIR=/tmp/mini-company-guard \
-            go test ./internal/handlers/ -count=1 -v \
+            go test -tags mini_company_guard ./internal/handlers/ -count=1 -v \
             -run 'TestMiniCompanyOrgTemplate' 2>&1 | tee /tmp/test-mini-company.log
           for t in TestMiniCompanyOrgTemplate_SevenAgents TestMiniCompanyOrgTemplate_FourLevelShape; do
             if ! grep -q -- "--- PASS: $t" /tmp/test-mini-company.log; then

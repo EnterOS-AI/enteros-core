@@ -1,3 +1,20 @@
+//go:build mini_company_guard
+
+// This file compiles ONLY under the `mini_company_guard` build tag, mirroring
+// internal/handlers/testbusy_enabled_test.go and the e2e_busy_inject seam.
+//
+// WHY THE TAG. The guard deliberately FAILS (never skips) when CI is set and the
+// pinned tree is absent — a skip in CI is indistinguishable from a pass. But the
+// blanket `go test ./...` step in ci.yml runs BEFORE the dedicated step that
+// clones the tree, so without a tag the guard reds the whole Platform (Go) job
+// for the very reason it was written to be loud about. The tag keeps the blanket
+// run from seeing it; the dedicated step supplies the tree AND the tag, and
+// greps for both "--- PASS:" lines so it still cannot pass vacuously.
+//
+// Verified: this exact failure occurred on the first CI run of this guard
+// (job 865184, "mini-company org template not found ... CI must run this guard"),
+// which is the guard correctly reporting its own mis-wiring.
+
 package handlers
 
 import (
