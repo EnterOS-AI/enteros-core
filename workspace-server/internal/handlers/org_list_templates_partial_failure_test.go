@@ -281,6 +281,20 @@ func TestScrubTemplatePaths_ShapesThatDefeatedTheTokenizer(t *testing.T) {
 		})
 	}
 
+	// RELATIVE paths and repo slugs are template content, not server layout, and
+	// must survive intact. An unanchored regex ate their interiors:
+	// `./teams/engineering.yaml` -> `./…/engineering.yaml` identifies nothing,
+	// and the allowlist error hid the org you are told to allowlist.
+	for _, keep := range []string{
+		`!include "./teams/engineering.yaml" at line 3`,
+		`git.moleculesai.app/molecule-ai/tmpl not in MOLECULE_EXTERNAL_REPO_ALLOWLIST`,
+		`open teams/workspace.yaml: no such file or directory`,
+	} {
+		if got := scrubTemplatePaths(keep); got != keep {
+			t.Errorf("scrub mangled a relative path / repo slug:\n in: %q\nout: %q", keep, got)
+		}
+	}
+
 	// Absoluteness is itself the finding for an escape attempt — reducing
 	// /etc/passwd to "passwd" makes it read as an ordinary relative include.
 	esc := scrubTemplatePaths(`!include "/etc/passwd" at line 3: path escapes root`)

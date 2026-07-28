@@ -607,15 +607,27 @@ func (h *OrgHandler) ListTemplates(c *gin.Context) {
 // layout on the wire. Reason codes carry the machine meaning; the operator
 // gets the failing file, not its location.
 func scrubTemplatePaths(msg string) string {
-	return absPathRe.ReplaceAllStringFunc(msg, func(p string) string {
+	return absPathRe.ReplaceAllStringFunc(msg, func(m string) string {
+		// group 1 is the (possibly empty) preceding byte — preserve it verbatim.
+		i := strings.Index(m, "/")
+		prefix, p := m[:i], m[i:]
 		// Keep the leading slash. Whether an include was ABSOLUTE is itself the
 		// finding for "path escapes root" — replacing /etc/passwd with "passwd"
 		// deletes the security-relevant evidence and makes the message read as
 		// an ordinary relative include. /…/passwd hides the layout and keeps it.
-		return "/…/" + path.Base(p)
+		return prefix + "/…/" + path.Base(p)
 	})
 }
 
+// The match is ANCHORED: a `/`-run only counts when it starts a path, i.e. at
+// the start of the string or after a byte that cannot be part of a path segment.
+// Without that anchor the regex ate the interior of RELATIVE paths too —
+// `!include "./teams/engineering.yaml"` became `"./…/engineering.yaml"`, and
+// `git.moleculesai.app/molecule-ai/tmpl not in ALLOWLIST` became
+// `git.moleculesai.app/…/tmpl`, hiding the very org you are told to allowlist.
+// Neither is a leak (template content, not server layout) but both destroy the
+// evidence this function exists to preserve, on the MORE common path.
+//
 // absPathRe matches an absolute filesystem path without consuming the
 // punctuation that surrounds it in real error text. A previous revision
 // tokenized on strings.Fields and trimmed quotes, which (a) could not see a
@@ -623,16 +635,26 @@ func scrubTemplatePaths(msg string) string {
 // (b) destroyed newlines, flattening genuinely multi-line yaml errors, and
 // split paths containing spaces. Character-class exclusion handles all of those
 // without a tokenizer the test could accidentally mirror.
-var absPathRe = regexp.MustCompile(`/[^\s"'` + "`" + `<>()\[\],;]+`)
+var absPathRe = regexp.MustCompile(`(^|[^\w.~-])(/[^\s"'` + "`" + `<>()\[\],;]+)`)
 
 // brokenOrgTemplateEntry renders a template that could not be loaded as a
 // PRESENT-but-unavailable listing entry rather than omitting it.
 //
 // Shape is deliberately the same map as a healthy entry plus `error`/`reason`,
 // so existing consumers keep reading `dir`/`name`/`workspaces` without a nil
-// check, and a caller that wants to grey the row out only has to test for
-// `error`. `workspaces: 0` is honest — we could not parse a tree — and is what
-// stops a broken entry looking importable.
+// check.
+//
+// CLIENTS MUST GATE ON `reason`, NOT ON `error`. Every broken path here passes a
+// non-empty string literal for `reason`, but `error` is EMPTY whenever the
+// underlying err is nil — so a client keying on `error` renders such an entry as
+// importable. That is not hypothetical: canvas/src/components/TemplatePalette.tsx
+// shipped exactly that gate and a probe produced an enabled "Import org" button
+// for {reason:"half_checkout", error:""}.
+//
+// `workspaces: 0` is honest — we could not parse a tree — but it is a BADGE, NOT
+// A GATE. An earlier revision of this comment claimed it "stops a broken entry
+// looking importable"; review disproved that by execution (the palette mapped
+// every entry to an enabled Import button and dropped both new fields entirely).
 func brokenOrgTemplateEntry(dir, reason string, err error) map[string]interface{} {
 	// The full error (with absolute server paths) stays in the log line the
 	// caller already emitted; the WIRE gets a path-free message. org.go's

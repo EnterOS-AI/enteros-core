@@ -3,6 +3,10 @@ import { test, expect } from "@playwright/test";
 const API = process.env.E2E_API_URL ?? "http://localhost:8080";
 
 interface OrgTemplate {
+  /** Set when the server could not LOAD the template; such an entry renders
+   *  "Unavailable" and is not importable. Non-empty on every broken path
+   *  (unlike `error`, which is empty when the underlying err was nil). */
+  reason?: string;
   dir: string;
   name: string;
   workspaces: number;

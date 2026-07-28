@@ -301,7 +301,10 @@ export function OrgTemplatesSection() {
         // underlying err is nil (org.go's brokenOrgTemplateEntry) — and an
         // entry with reason set and error "" would otherwise render as a fully
         // enabled Import tile. Proven by probe during review.
-        const isBroken = Boolean(o.reason);
+        // `reason` is the contract field (non-empty on every broken path);
+        // `error` is included only to close the inverse shape {error:"x",
+        // reason:""} — not producible by the server today, but free to guard.
+        const isBroken = Boolean(o.reason || o.error);
         return (
           <div
             key={o.dir}
