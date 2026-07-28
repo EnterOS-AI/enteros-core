@@ -41,6 +41,12 @@ RUN go mod download
 COPY workspace-server/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" \
     -o /desktop-control-server ./cmd/desktop-control-server
+# The egress proxy runs from this SAME image (the provisioner starts a proxy
+# container with the `desktop-egress-proxy` command) — no separate image / extra
+# supply-chain artifact. It is the sidecar's only route off its internal network
+# and denies private/link-local destinations, making isolation structural.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" \
+    -o /desktop-egress-proxy ./cmd/desktop-egress-proxy
 
 # ── Stage 2: runtime desktop ─────────────────────────────────────────────
 # NOTE: bookworm-slim MUST be digest-pinned and mirrored into
@@ -64,6 +70,7 @@ RUN useradd -m -u 1000 -s /bin/bash desktop \
   && chown -R desktop:desktop /home/desktop
 
 COPY --from=control-builder /desktop-control-server /usr/local/bin/desktop-control-server
+COPY --from=control-builder /desktop-egress-proxy /usr/local/bin/desktop-egress-proxy
 COPY workspace-server/scripts/desktop-sidecar-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

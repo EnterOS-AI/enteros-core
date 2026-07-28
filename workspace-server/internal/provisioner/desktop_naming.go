@@ -38,6 +38,16 @@ func DesktopContainerName(workspaceID string) string {
 	return fmt.Sprintf("%s%s", desktopContainerNamePrefix, workspaceID)
 }
 
+// DesktopProxyContainerName returns the name of a workspace's egress-proxy
+// sidecar ("wsdeskproxy-<id>"). The proxy is the desktop's ONLY route off its
+// internal network; it denies private/link-local destinations (see
+// cmd/desktop-egress-proxy), so isolation is structural — no host firewall. The
+// prefix shares "wsdesk" so both are reaped by the same label/name sweeps but is
+// distinct from the desktop container's "wsdesk-" so they never collide.
+func DesktopProxyContainerName(workspaceID string) string {
+	return fmt.Sprintf("wsdeskproxy-%s", workspaceID)
+}
+
 // DesktopProfileVolumeName returns the Docker named volume holding the
 // desktop's persistent browser profile (cookies / live logins). It survives
 // scale-to-zero (StopDesktop) and is destroyed only by WipeProfile / prune.

@@ -58,18 +58,18 @@ type LocalSidecarProvisioner struct {
 
 	// networkPrefix names a DEDICATED PER-WORKSPACE network the sidecar is
 	// created on: "<networkPrefix>-<workspaceID>" (§6.1, decision 1 — security
-	// first). Each workspace's desktop gets its OWN network. StartDesktop
-	// creates it; StopDesktop removes it best-effort. Empty = no network attach
-	// (tests only; NOT production).
+	// first). Each workspace's desktop gets its OWN network, created INTERNAL
+	// (no external route). StartDesktop creates it; StopDesktop removes it
+	// best-effort. Empty = no network attach (tests only; NOT production).
 	//
-	// VERIFIED against real Docker (2026-07-27): a per-workspace network blocks
-	// reaching other containers BY NAME (Docker DNS is per-network) but NOT BY
-	// IP — bridge networks on one host still route to each other's subnets. So
-	// this is NECESSARY BUT NOT SUFFICIENT: it MUST be paired with egress
-	// control that denies RFC-1918 (the §6.1 egress proxy / a DOCKER-USER
-	// firewall rule), or a sidecar can still hit postgres/redis/litellm by IP.
-	// Do NOT treat "sidecar is on a per-workspace network" as "sidecar is
-	// isolated" until the egress-deny is in place.
+	// ISOLATION IS STRUCTURAL (verified 2026-07-28): the network is internal, so
+	// the sidecar has NO egress of its own — it can reach nothing but the
+	// per-workspace egress proxy (wsdeskproxy-<id>) on the same net. The proxy is
+	// the sidecar's only route out and DENIES private/link-local destinations
+	// (cmd/desktop-egress-proxy), so a compromised browser cannot reach backend
+	// infra, the host, other tenants, or the cloud metadata service — with NO
+	// host firewall and NO operator step. This is what makes the feature safe to
+	// run on by default.
 	networkPrefix string
 
 	// controlPort is the sidecar control-server port the computer-use gateway
@@ -108,11 +108,26 @@ type LocalSidecarProvisioner struct {
 	// isolated network (reviewer B3). Empty disables the attach (single-network
 	// dev/test).
 	selfContainerID string
+
+	// egressNetwork is the network the per-workspace egress PROXY joins as its
+	// second leg — its only route to the internet. The proxy denies
+	// private/link-local destinations, so this network merely needs internet;
+	// the desktop sidecar is NEVER on it. Empty defaults to the Docker "bridge"
+	// network (always present, has internet NAT, does not carry molecule infra).
+	egressNetwork string
 }
 
 // SetControlTokenSecret wires the shared secret used to derive each sidecar's
 // DESKTOP_CONTROL_TOKEN. Must match the secret the gateway's TokenResolver uses.
 func (p *LocalSidecarProvisioner) SetControlTokenSecret(secret string) { p.controlTokenSecret = secret }
+
+// SetEgressNetwork overrides the network the egress proxy uses for internet
+// egress (default "bridge").
+func (p *LocalSidecarProvisioner) SetEgressNetwork(name string) { p.egressNetwork = name }
+
+// desktopProxyPort is the port the per-workspace egress proxy listens on and the
+// sidecar's DESKTOP_PROXY points at.
+const desktopProxyPort = 3128
 
 // SetSelfContainerID tells the provisioner which container is the platform, so it
 // can join each per-workspace network and reach the sidecar by name (B3).
@@ -236,15 +251,22 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 
 	netCfg := &network.NetworkingConfig{}
 	if net := p.perWorkspaceNetwork(cfg.WorkspaceID); net != "" {
-		// Create the DEDICATED per-workspace network (idempotent: a re-create
-		// after a stale sidecar reuses it). This is the isolation boundary —
-		// the sidecar is on ONLY this network, never the shared molecule-core-
-		// net, so it cannot reach other tenants or the backend infra (§6.1).
-		if _, err := p.cli.NetworkCreate(ctx, net, network.CreateOptions{Labels: desktopManagedLabels()}); err != nil && !isNetworkExists(err) {
+		// Create the DEDICATED per-workspace network as INTERNAL (no external
+		// route). Idempotent. This is the isolation boundary — the sidecar is on
+		// ONLY this network, so it has NO egress of its own and can reach nothing
+		// but the egress proxy below (§6.1, structural isolation).
+		if _, err := p.cli.NetworkCreate(ctx, net, network.CreateOptions{Labels: desktopManagedLabels(), Internal: true}); err != nil && !isNetworkExists(err) {
 			return DesktopHandle{}, fmt.Errorf("create per-workspace network: %w", err)
 		}
 		netCfg.EndpointsConfig = map[string]*network.EndpointSettings{
 			net: {Aliases: []string{name}},
+		}
+		// Bring up the per-workspace egress proxy on this internal net (its only
+		// route out is the egress network; it DENIES private/link-local dsts). The
+		// sidecar's browser reaches the internet ONLY through it — structural
+		// isolation, no host firewall.
+		if err := p.ensureEgressProxy(ctx, cfg.WorkspaceID, net); err != nil {
+			return DesktopHandle{}, err
 		}
 	}
 
@@ -252,11 +274,16 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 	// control server log.Fatals without DESKTOP_CONTROL_TOKEN, so an env-less
 	// container boots and dies immediately. The token is derived from the shared
 	// secret — identical to the gateway's TokenResolver — so the two agree with
-	// nothing stored. Geometry is pinned to the coordinate contract.
+	// nothing stored. Geometry is pinned to the coordinate contract. DESKTOP_PROXY
+	// points Chromium at the per-workspace egress proxy (the sidecar's only way
+	// out; empty when no per-workspace network, i.e. tests).
 	env := []string{
 		"DESKTOP_CONTROL_TOKEN=" + DeriveDesktopControlToken(p.controlTokenSecret, cfg.WorkspaceID),
 		fmt.Sprintf("DESKTOP_WIDTH=%d", desktopWidth),
 		fmt.Sprintf("DESKTOP_HEIGHT=%d", desktopHeight),
+	}
+	if p.perWorkspaceNetwork(cfg.WorkspaceID) != "" {
+		env = append(env, fmt.Sprintf("DESKTOP_PROXY=http://%s:%d", DesktopProxyContainerName(cfg.WorkspaceID), desktopProxyPort))
 	}
 	if _, err := p.cli.ContainerCreate(ctx, &container.Config{
 		Image:  p.image,
@@ -281,6 +308,74 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 	return p.handle(cfg.WorkspaceID, true), nil
 }
 
+// egressNetworkName is the network the proxy uses for internet egress.
+func (p *LocalSidecarProvisioner) egressNetworkName() string {
+	if p.egressNetwork == "" {
+		return "bridge"
+	}
+	return p.egressNetwork
+}
+
+// ensureEgressProxy starts the per-workspace egress proxy (wsdeskproxy-<id>),
+// idempotently. The proxy is created ON the internal per-workspace net (aliased
+// so the sidecar reaches it by name) and ALSO attached to the egress network —
+// its only route to the internet. It runs the SAME desktop image with the
+// egress-proxy command (no separate image / supply-chain artifact), and is
+// hardened like the sidecar (cap-drop, no-new-privileges). Its deny-list
+// (cmd/desktop-egress-proxy) is what makes the sidecar's isolation structural.
+func (p *LocalSidecarProvisioner) ensureEgressProxy(ctx context.Context, workspaceID, internalNet string) error {
+	proxyName := DesktopProxyContainerName(workspaceID)
+	if insp, err := p.cli.ContainerInspect(ctx, proxyName); err == nil {
+		if insp.State != nil && insp.State.Running {
+			return nil // already up
+		}
+		// Stale exited proxy — clear it so create doesn't 409.
+		_ = p.cli.ContainerRemove(ctx, proxyName, container.RemoveOptions{Force: true})
+	}
+
+	hostCfg := &container.HostConfig{
+		RestartPolicy: container.RestartPolicy{Name: "no"},
+		CapDrop:       []string{"ALL"},
+		SecurityOpt:   []string{"no-new-privileges"},
+	}
+	netCfg := &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			internalNet: {Aliases: []string{proxyName}},
+		},
+	}
+	if _, err := p.cli.ContainerCreate(ctx, &container.Config{
+		Image: p.image,
+		// Override the desktop ENTRYPOINT: this container runs the proxy binary
+		// (under tini for signal/child handling), NOT the Xorg/Chromium desktop.
+		Entrypoint: []string{"/usr/bin/tini", "--", "/usr/local/bin/desktop-egress-proxy"},
+		Labels:     desktopManagedLabels(),
+	}, hostCfg, netCfg, nil, proxyName); err != nil {
+		return fmt.Errorf("create egress proxy: %w", err)
+	}
+	// Attach the egress leg (internet route) BEFORE start so the proxy has a
+	// route out the moment it comes up.
+	if err := p.cli.NetworkConnect(ctx, p.egressNetworkName(), proxyName, nil); err != nil && !isAlreadyConnected(err) {
+		return fmt.Errorf("attach egress proxy to egress network: %w", err)
+	}
+	if err := p.cli.ContainerStart(ctx, proxyName, container.StartOptions{}); err != nil {
+		return fmt.Errorf("start egress proxy: %w", err)
+	}
+	return nil
+}
+
+// stopEgressProxy tears down a workspace's egress proxy (best-effort). Called
+// from StopDesktop before the network is removed.
+func (p *LocalSidecarProvisioner) stopEgressProxy(ctx context.Context, workspaceID string) {
+	proxyName := DesktopProxyContainerName(workspaceID)
+	secs := int(p.stopTimeout.Seconds())
+	if err := p.cli.ContainerStop(ctx, proxyName, container.StopOptions{Timeout: &secs}); err != nil && !isNoSuchContainer(err) {
+		_ = err
+	}
+	if err := p.cli.ContainerRemove(ctx, proxyName, container.RemoveOptions{Force: true}); err != nil && !isNoSuchContainer(err) {
+		_ = err
+	}
+}
+
 // StopDesktop gracefully tears the sidecar down: SIGTERM + a flush window so
 // Chrome/Xorg close their SQLite profile cleanly, THEN remove. It MUST NOT copy
 // the tenant's force-remove — a SIGKILL mid-write corrupts the profile and
@@ -301,6 +396,9 @@ func (p *LocalSidecarProvisioner) StopDesktop(ctx context.Context, workspaceID s
 	if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{}); err != nil && !isNoSuchContainer(err) {
 		return fmt.Errorf("remove desktop sidecar: %w", err)
 	}
+	// Tear down the egress proxy too (it holds an endpoint on the per-workspace
+	// net, so it MUST go before NetworkRemove).
+	p.stopEgressProxy(ctx, workspaceID)
 	// Best-effort: detach the platform, then remove the now-empty per-workspace
 	// network so it doesn't leak. The platform must leave first or NetworkRemove
 	// fails on a network that still has an endpoint. A network still holding an

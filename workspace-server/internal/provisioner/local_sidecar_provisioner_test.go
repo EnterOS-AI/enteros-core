@@ -20,23 +20,47 @@ type sidecarCreateCall struct {
 }
 
 type fakeSidecarDocker struct {
-	creates    []sidecarCreateCall
-	starts     []string
-	stops      []string
-	removes    []struct {
+	creates []sidecarCreateCall
+	starts  []string
+	stops   []string
+	removes []struct {
 		name  string
 		force bool
 	}
 	volCreates    []volume.CreateOptions
 	volRemoves    []string
 	netsCreated   []string
+	netsInternal  map[string]bool // net name -> Internal flag
 	netsRemoved   []string
 	netsConnected []string // "net|container"
 	netsDisconn   []string // "net|container"
 	running       map[string]bool
 }
 
-func newFakeSidecarDocker() *fakeSidecarDocker { return &fakeSidecarDocker{running: map[string]bool{}} }
+func newFakeSidecarDocker() *fakeSidecarDocker {
+	return &fakeSidecarDocker{running: map[string]bool{}, netsInternal: map[string]bool{}}
+}
+
+// createByName returns the recorded ContainerCreate for name, or nil.
+func (f *fakeSidecarDocker) createByName(name string) *sidecarCreateCall {
+	for i := range f.creates {
+		if f.creates[i].name == name {
+			return &f.creates[i]
+		}
+	}
+	return nil
+}
+
+// removeForce returns whether a recorded remove of name used Force (and whether
+// any remove was recorded).
+func (f *fakeSidecarDocker) removeForce(name string) (force, found bool) {
+	for _, r := range f.removes {
+		if r.name == name {
+			return r.force, true
+		}
+	}
+	return false, false
+}
 
 func (f *fakeSidecarDocker) ContainerCreate(_ context.Context, cfg *container.Config, host *container.HostConfig, net *network.NetworkingConfig, _ *ocispec.Platform, name string) (container.CreateResponse, error) {
 	f.creates = append(f.creates, sidecarCreateCall{name: name, cfg: cfg, host: host, net: net})
@@ -77,8 +101,9 @@ func (f *fakeSidecarDocker) VolumeRemove(_ context.Context, name string, _ bool)
 	f.volRemoves = append(f.volRemoves, name)
 	return nil
 }
-func (f *fakeSidecarDocker) NetworkCreate(_ context.Context, name string, _ network.CreateOptions) (network.CreateResponse, error) {
+func (f *fakeSidecarDocker) NetworkCreate(_ context.Context, name string, opts network.CreateOptions) (network.CreateResponse, error) {
 	f.netsCreated = append(f.netsCreated, name)
+	f.netsInternal[name] = opts.Internal
 	return network.CreateResponse{ID: "net-" + name}, nil
 }
 func (f *fakeSidecarDocker) NetworkRemove(_ context.Context, name string) error {
@@ -120,12 +145,13 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 		t.Fatalf("profile volume missing role label: %v", f.volCreates[0].Labels)
 	}
 
-	if len(f.creates) != 1 {
-		t.Fatalf("want exactly 1 container create, got %d", len(f.creates))
+	// Two creates: the desktop sidecar + its egress proxy.
+	if len(f.creates) != 2 {
+		t.Fatalf("want 2 container creates (sidecar + proxy), got %d", len(f.creates))
 	}
-	c := f.creates[0]
-	if c.name != name {
-		t.Fatalf("container name = %q, want %q", c.name, name)
+	c := f.createByName(name)
+	if c == nil {
+		t.Fatalf("sidecar container %q not created", name)
 	}
 	if c.cfg.Image != "desk:img" {
 		t.Fatalf("image = %q, want desk:img", c.cfg.Image)
@@ -171,11 +197,14 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 	if seccompVal == "" || seccompVal == "unconfined" || !strings.HasPrefix(strings.TrimSpace(seccompVal), "{") {
 		t.Fatalf("SecurityOpt seccomp must be the embedded JSON profile, got %.40q", seccompVal)
 	}
-	// A DEDICATED per-workspace network was created, and the sidecar is
-	// attached to it (isolation boundary), with a name alias.
+	// A DEDICATED per-workspace network was created as INTERNAL (no egress), and
+	// the sidecar is attached to it with a name alias.
 	wantNet := prefix + "-" + sidecarTestWS
 	if len(f.netsCreated) != 1 || f.netsCreated[0] != wantNet {
 		t.Fatalf("per-workspace network not created: %v (want %q)", f.netsCreated, wantNet)
+	}
+	if !f.netsInternal[wantNet] {
+		t.Fatalf("per-workspace network %q MUST be Internal (no egress) — structural isolation", wantNet)
 	}
 	ep, ok := c.net.EndpointsConfig[wantNet]
 	if !ok {
@@ -185,14 +214,33 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 		t.Fatalf("network alias = %v, want %q", ep.Aliases, name)
 	}
 
-	if len(f.starts) != 1 || f.starts[0] != name {
-		t.Fatalf("container not started: %v", f.starts)
+	// The egress proxy was created, on the internal net (aliased), with the proxy
+	// entrypoint, and connected to the egress network for its internet route.
+	proxyName := DesktopProxyContainerName(sidecarTestWS)
+	pc := f.createByName(proxyName)
+	if pc == nil {
+		t.Fatalf("egress proxy %q not created", proxyName)
+	}
+	if len(pc.cfg.Entrypoint) == 0 || pc.cfg.Entrypoint[len(pc.cfg.Entrypoint)-1] != "/usr/local/bin/desktop-egress-proxy" {
+		t.Fatalf("proxy entrypoint = %v, want it to run desktop-egress-proxy", pc.cfg.Entrypoint)
+	}
+	if _, ok := pc.net.EndpointsConfig[wantNet]; !ok {
+		t.Fatalf("proxy not on the internal net %q: %+v", wantNet, pc.net.EndpointsConfig)
+	}
+	if !contains(f.netsConnected, "bridge|"+proxyName) {
+		t.Fatalf("proxy not connected to the egress network: %v", f.netsConnected)
 	}
 
-	// B1: the sidecar MUST receive DESKTOP_CONTROL_TOKEN (else its control
-	// server log.Fatals and the container dies) + the pinned geometry.
+	// Both containers started.
+	if !contains(f.starts, name) || !contains(f.starts, proxyName) {
+		t.Fatalf("sidecar + proxy not both started: %v", f.starts)
+	}
+
+	// B1: the sidecar MUST receive DESKTOP_CONTROL_TOKEN + pinned geometry, and
+	// DESKTOP_PROXY pointing at its egress proxy (its only route out).
 	wantTok := "DESKTOP_CONTROL_TOKEN=" + DeriveDesktopControlToken("test-secret", sidecarTestWS)
-	var haveTok, haveW, haveH bool
+	wantProxy := "DESKTOP_PROXY=http://" + proxyName + ":3128"
+	var haveTok, haveW, haveH, haveProxy bool
 	for _, e := range c.cfg.Env {
 		switch e {
 		case wantTok:
@@ -201,6 +249,8 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 			haveW = true
 		case "DESKTOP_HEIGHT=800":
 			haveH = true
+		case wantProxy:
+			haveProxy = true
 		}
 	}
 	if !haveTok {
@@ -212,11 +262,23 @@ func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 	if !haveW || !haveH {
 		t.Fatalf("sidecar Env missing pinned geometry: %v", c.cfg.Env)
 	}
+	if !haveProxy {
+		t.Fatalf("sidecar Env missing DESKTOP_PROXY (its only egress): %v", c.cfg.Env)
+	}
 	// B3: the PLATFORM is attached to the per-workspace network so it can reach
 	// the sidecar by name.
-	if len(f.netsConnected) != 1 || f.netsConnected[0] != wantNet+"|platform-xyz" {
+	if !contains(f.netsConnected, wantNet+"|platform-xyz") {
 		t.Fatalf("platform not attached to per-workspace network: %v (want %q)", f.netsConnected, wantNet+"|platform-xyz")
 	}
+}
+
+func contains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestLocalSidecar_StartDesktop_Idempotent(t *testing.T) {
@@ -245,12 +307,14 @@ func TestLocalSidecar_StopDesktop_GracefulPreservesProfile(t *testing.T) {
 	if err := p.StopDesktop(context.Background(), sidecarTestWS); err != nil {
 		t.Fatalf("StopDesktop: %v", err)
 	}
-	// Graceful stop (SIGTERM), not force-remove.
-	if len(f.stops) != 1 || f.stops[0] != name {
-		t.Fatalf("StopDesktop must gracefully stop the container: stops=%v", f.stops)
+	// The SIDECAR is gracefully stopped (SIGTERM) and removed NON-force, so its
+	// SQLite profile flushes cleanly (the proxy is stateless — its force-remove
+	// doesn't matter).
+	if !contains(f.stops, name) {
+		t.Fatalf("StopDesktop must gracefully stop the sidecar: stops=%v", f.stops)
 	}
-	if len(f.removes) != 1 || f.removes[0].force {
-		t.Fatalf("StopDesktop remove must be non-force (graceful): removes=%+v", f.removes)
+	if force, found := f.removeForce(name); !found || force {
+		t.Fatalf("sidecar remove must be non-force (graceful): force=%v found=%v", force, found)
 	}
 	// The profile volume (cookies / logins) MUST survive a stop.
 	if len(f.volRemoves) != 0 {
