@@ -449,7 +449,7 @@ jobs:
             exit 1
           fi
           if [ "${npass:-0}" -gt "$declared" ]; then
-            echo "::error::live-container gate: ${npass} top-level TestLiveBox_ PASS lines but only ${declared} declared in plugin_settings_writer_live_test.go. A TestLiveBox_* was added in ANOTHER file in this package, so `declared` no longer describes the suite this step measures — move it, or widen the grep to cover both files."
+            echo "::error::live-container gate: ${npass} top-level TestLiveBox_ PASS lines but only ${declared} declared in plugin_settings_writer_live_test.go. A TestLiveBox_* was added in ANOTHER file in this package, so 'declared' no longer describes the suite this step measures — move it, or widen the grep to cover both files."
             exit 1
           fi
           if [ "${npass:-0}" -lt "$LIVE_MIN" ]; then
