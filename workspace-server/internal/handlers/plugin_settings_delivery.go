@@ -1,0 +1,186 @@
+package handlers
+
+// plugin_settings_delivery.go — core's WRITER for per-install plugin settings.
+//
+// This is the other half of the slice landed in the runtime
+// (molecule-ai-workspace-runtime, plugin_settings.py). The runtime resolves a
+// plugin's DECLARED defaults (layer 1, which lives in the manifest on the box)
+// and merges a delivered file over them; nothing there authors that file. This
+// authors it.
+//
+//	template config.yaml            core (here)                    runtime
+//	  plugins:                        renders one JSON per          resolves layer 1
+//	    - source: gitea://…#sha   ->  plugin into ConfigFiles   ->  from the manifest,
+//	      config: {timezone: …}       plugin-settings/<n>.json      merges this over it
+//	                                                                -> DaemonSpec.env
+//
+// WHY THIS PATH
+//
+// ConfigFiles is core-GENERATED content, distinct from TemplateAssets
+// (template-FETCHED). Both provisioner legs already carry nested paths:
+// buildConfigFilesTar creates parent tar dir headers, and the CP addFile
+// path-cleans and rejects traversal. `system-prompt.md` is the existing
+// precedent for core adding a non-config.yaml file here.
+//
+// Settings deliberately do NOT go to /configs/plugins/<name>/ — the install
+// pipeline owns that directory and re-stages it (EIC does a literal `rm -rf`),
+// so anything written there dies on the next reconcile.
+//
+// SCOPE — layers 2..5 only, at provision time.
+//
+// Layer 1 is NOT rendered here and cannot be: core holds no plugin manifest at
+// provision time (plugins install post-online via the reconcile, strictly after
+// this file ships). The runtime supplies it. Layer 6 (live operator overrides)
+// is not built — see the RFC; this writer is the provision-time leg only.
+//
+// A template that declares no plugin config produces NO file and leaves
+// ConfigFiles byte-identical, so every existing workspace is unaffected.
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"path"
+	"sort"
+
+	"gopkg.in/yaml.v3"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
+)
+
+// pluginSettingsDirName mirrors PLUGIN_SETTINGS_DIRNAME in the runtime's
+// plugin_settings.py. Both sides must agree or the file lands where nothing
+// reads it.
+const pluginSettingsDirName = "plugin-settings"
+
+// maxPluginSettingsBytes bounds ONE plugin's rendered settings. The aggregate
+// ConfigFiles budget is enforced separately and is CP-only
+// (cpConfigFilesMaxBytes, 256 KiB, fail-closed); the local-Docker leg has no
+// cap. This per-entry bound keeps one hostile template from consuming the whole
+// aggregate before the provisioner ever sees it.
+const maxPluginSettingsBytes = 64 << 10
+
+// templatePluginEntry is one `plugins:` entry. It accepts BOTH the historical
+// bare-string form and the object form carrying config:
+//
+//	plugins:
+//	  - gitea://owner/repo#sha                    # unchanged, still valid
+//	  - source: gitea://owner/repo#sha
+//	    config: {timezone: America/Vancouver}
+//
+// Widening rather than replacing is deliberate: every template in the fleet
+// uses the string form today and must keep parsing byte-identically.
+type templatePluginEntry struct {
+	Source string
+	Config map[string]any
+}
+
+// UnmarshalYAML accepts a scalar (string → source only) or a mapping.
+func (e *templatePluginEntry) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		return value.Decode(&e.Source)
+	}
+	var alt struct {
+		Source string         `yaml:"source"`
+		Config map[string]any `yaml:"config"`
+	}
+	if err := value.Decode(&alt); err != nil {
+		return fmt.Errorf("plugin entry must be a source string or {source, config}: %w", err)
+	}
+	if alt.Source == "" {
+		return fmt.Errorf("plugin entry object is missing `source`")
+	}
+	e.Source, e.Config = alt.Source, alt.Config
+	return nil
+}
+
+// templateConfigPluginEntries is the settings-aware view of the same
+// `plugins:` block templateConfigPlugins reads. Kept separate so the existing
+// declared-set parse is untouched.
+type templateConfigPluginEntries struct {
+	Plugins []templatePluginEntry `yaml:"plugins"`
+}
+
+// renderPluginSettingsFiles turns a template's `plugins:` block into the
+// ConfigFiles entries that deliver each plugin's settings.
+//
+// Returns a map of RELATIVE path → JSON content, ready to merge into
+// configFiles. A plugin with no `config:` produces no entry — so a template
+// that uses only the string form yields an empty map and changes nothing.
+//
+// Per-entry validate-and-skip, matching the schedule renderer: one unusable
+// entry never drops its siblings. Returns an error only when the block itself
+// cannot be parsed, which callers should log and continue past (a broken
+// plugins block must never block provisioning).
+func renderPluginSettingsFiles(configYAML []byte, wsName string) (map[string][]byte, error) {
+	if len(configYAML) == 0 {
+		return nil, nil
+	}
+	var parsed templateConfigPluginEntries
+	if err := yaml.Unmarshal(configYAML, &parsed); err != nil {
+		return nil, fmt.Errorf("parse template plugins for settings: %w", err)
+	}
+	if len(parsed.Plugins) == 0 {
+		return nil, nil
+	}
+
+	out := map[string][]byte{}
+	// Deterministic order so a re-provision produces byte-identical output and
+	// does not churn the delivered bundle.
+	entries := make([]templatePluginEntry, len(parsed.Plugins))
+	copy(entries, parsed.Plugins)
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Source < entries[j].Source })
+
+	for _, entry := range entries {
+		if len(entry.Config) == 0 {
+			continue
+		}
+		// The opt-out markers the merge layer understands ("!name" / "-name")
+		// are removals, not installs — they carry no settings.
+		if len(entry.Source) > 0 && (entry.Source[0] == '!' || entry.Source[0] == '-') {
+			continue
+		}
+		name, err := plugins.PluginNameFromSource(entry.Source)
+		if err != nil {
+			log.Printf("%s: plugin settings: cannot derive install name from %q: %v — skipping", wsName, entry.Source, err)
+			continue
+		}
+		// The install name is the /configs/plugins/<name>/ key AND the settings
+		// filename. Both sides key on it; a name with a separator would escape
+		// the settings dir.
+		if name == "" || name != path.Base(name) {
+			log.Printf("%s: plugin settings: refusing unsafe install name %q — skipping", wsName, name)
+			continue
+		}
+		body, err := json.MarshalIndent(entry.Config, "", "  ")
+		if err != nil {
+			log.Printf("%s: plugin settings: %s config is not JSON-encodable: %v — skipping", wsName, name, err)
+			continue
+		}
+		if len(body) > maxPluginSettingsBytes {
+			log.Printf("%s: plugin settings: %s config is %d bytes (cap %d) — skipping", wsName, name, len(body), maxPluginSettingsBytes)
+			continue
+		}
+		out[path.Join(pluginSettingsDirName, name+".json")] = append(body, '\n')
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// mergePluginSettingsIntoConfigFiles adds rendered settings to a ConfigFiles
+// map, allocating it only when there is something to add. Returns the map and
+// how many files were added, so the caller can log a real count.
+func mergePluginSettingsIntoConfigFiles(configFiles map[string][]byte, rendered map[string][]byte) (map[string][]byte, int) {
+	if len(rendered) == 0 {
+		return configFiles, 0
+	}
+	if configFiles == nil {
+		configFiles = map[string][]byte{}
+	}
+	for name, body := range rendered {
+		configFiles[name] = body
+	}
+	return configFiles, len(rendered)
+}
