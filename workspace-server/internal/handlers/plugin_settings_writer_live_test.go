@@ -71,6 +71,25 @@ var liveWorkspaceID = func() string {
 
 func startLiveBoxFor(t *testing.T, workspaceID string) string {
 	t.Helper()
+	// The per-run suffix has to live in the ID, not here: the production path
+	// (writePluginSettingsToWorkspace / wireMockDBForWriter) resolves ws-<id>
+	// from the workspace id independently, so suffixing the container name here
+	// would leave the writer hunting for ws-<id> while the box is
+	// ws-<id>-<suffix>. That correctness constraint makes it a FOOTGUN: a new
+	// test that passes its own literal id silently opts out of per-run naming
+	// and reacquires the cross-run collision — whose worst outcome is not a
+	// flaky red but a FALSE GREEN, because the file-count assertions would be
+	// reading another run's container.
+	//
+	// So assert it instead of documenting it. In CI the suffix is always set;
+	// any id that does not carry it did not come from liveWorkspaceID.
+	if sfx := strings.TrimSpace(os.Getenv("MOLECULE_LIVE_BOX_SUFFIX")); sfx != "" &&
+		!strings.Contains(workspaceID, sfx) {
+		t.Fatalf("workspace id %q does not carry MOLECULE_LIVE_BOX_SUFFIX %q — "+
+			"derive it from liveWorkspaceID instead of a literal, or two concurrent "+
+			"CI runs will share the container name ws-%s and can read each other's box",
+			workspaceID, sfx, workspaceID)
+	}
 	name := "ws-" + workspaceID
 	_ = exec.Command("docker", "rm", "-f", name).Run()
 	out, err := exec.Command("docker", "run", "-d", "--name", name,
