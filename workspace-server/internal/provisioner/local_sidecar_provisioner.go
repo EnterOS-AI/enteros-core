@@ -129,6 +129,10 @@ func (p *LocalSidecarProvisioner) SetEgressNetwork(name string) { p.egressNetwor
 // sidecar's DESKTOP_PROXY points at.
 const desktopProxyPort = 3128
 
+// proxyMemoryLimitBytes caps the egress proxy's RAM (256MB) — a stream-copy
+// forward proxy needs little, and a runaway one must not pressure the host.
+const proxyMemoryLimitBytes = 256 << 20
+
 // SetSelfContainerID tells the provisioner which container is the platform, so it
 // can join each per-workspace network and reach the sidecar by name (B3).
 func (p *LocalSidecarProvisioner) SetSelfContainerID(id string) { p.selfContainerID = id }
@@ -337,6 +341,10 @@ func (p *LocalSidecarProvisioner) ensureEgressProxy(ctx context.Context, workspa
 		RestartPolicy: container.RestartPolicy{Name: "no"},
 		CapDrop:       []string{"ALL"},
 		SecurityOpt:   []string{"no-new-privileges"},
+		// Cap the proxy's RAM (reviewer note): it is a tiny stream-copy forward
+		// proxy, so 256MB is generous, and a compromised/runaway proxy must not
+		// pressure the host. Swap pinned to the cap; shed the proxy first.
+		Resources: container.Resources{Memory: proxyMemoryLimitBytes, MemorySwap: proxyMemoryLimitBytes, OomScoreAdj: 500},
 	}
 	netCfg := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
