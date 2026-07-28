@@ -15,6 +15,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -359,4 +360,66 @@ func TestLiveBox_DeliverReportsWhenTheReloadDidNotConfirm(t *testing.T) {
 	if got := readFromBox(t, box, "/configs/"+pluginSettingsDirName+"/molecule-ai-plugin-scheduler.json"); !strings.Contains(got, "UTC") {
 		t.Errorf("durable write did not land: %q", got)
 	}
+}
+
+// --- the READ leg, against a real container ---------------------------------
+//
+// B3: readPluginManifestFromWorkspace had ONE branch (findContainer → docker
+// exec) and its "file absent" case was indistinguishable from "the exec
+// failed", which is how "the box is unreachable" and "the plugin is not
+// installed" became the same 404. The replacement probes with a sentinel on
+// stdout so the two are separable. That probe had never executed against a real
+// container, so it is proven here rather than asserted.
+
+// TestLiveBox_ManifestReadWorksOnARunningContainer drives the REAL declaration
+// read end to end: install a plugin.yaml on the box, read it back through
+// readPluginManifestFromWorkspace, and parse a form out of it.
+func TestLiveBox_ManifestReadWorksOnARunningContainer(t *testing.T) {
+	cli := liveDockerOrSkip(t)
+	box := startLiveBox(t)
+	wireMockDBForWriter(t, liveWorkspaceID)
+	h := &TemplatesHandler{docker: cli}
+
+	if out, err := exec.Command("docker", "exec", box, "sh", "-c",
+		`mkdir -p /configs/plugins/molecule-ai-plugin-scheduler && `+
+			`printf 'name: molecule-scheduler\ncontributes:\n  configuration:\n    title: Scheduler\n    properties:\n      poll_seconds:\n        type: integer\n        default: 30\n' `+
+			`> /configs/plugins/molecule-ai-plugin-scheduler/plugin.yaml`).CombinedOutput(); err != nil {
+		t.Fatalf("stage the manifest: %v: %s", err, out)
+	}
+
+	manifest, err := h.readPluginManifestFromWorkspace(context.Background(),
+		liveWorkspaceID, "molecule-ai-plugin-scheduler")
+	if err != nil {
+		t.Fatalf("the container leg failed to read an INSTALLED plugin's manifest: %v", err)
+	}
+	decl, perr := parsePluginDeclaration(manifest)
+	if perr != nil {
+		t.Fatalf("parse: %v\n%s", perr, manifest)
+	}
+	if decl.Title != "Scheduler" || len(decl.Properties) != 1 {
+		t.Errorf("declaration did not survive the read: %+v", decl)
+	}
+	t.Logf("read %d bytes of plugin.yaml off a running container and rendered a %d-field form",
+		len(manifest), len(decl.Properties))
+}
+
+// The distinction B3 exists for: on the SAME reachable container, a plugin that
+// is NOT installed must report ABSENT (→404) while an unreachable box reports
+// UNREACHABLE (→503). If the exec probe could not tell them apart these would
+// collapse back into one status.
+func TestLiveBox_MissingManifestIsAbsentNotUnreachable(t *testing.T) {
+	cli := liveDockerOrSkip(t)
+	startLiveBox(t)
+	wireMockDBForWriter(t, liveWorkspaceID)
+	h := &TemplatesHandler{docker: cli}
+
+	_, err := h.readPluginManifestFromWorkspace(context.Background(),
+		liveWorkspaceID, "a-plugin-that-is-not-installed")
+	if !errors.Is(err, errWorkspaceFileAbsent) {
+		t.Fatalf("a reachable box missing the plugin must report ABSENT (→404), got %v", err)
+	}
+	if errors.Is(err, errWorkspaceUnreachable) || errors.Is(err, errWorkspaceReadFailed) {
+		t.Errorf("a reachable box was reported as unreadable: %v", err)
+	}
+	t.Logf("reachable box, plugin not installed → %v", err)
 }
