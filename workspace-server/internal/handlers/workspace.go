@@ -1299,7 +1299,7 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 	// the DB would remember an override while the freshly provisioned workspace
 	// quietly ran the template value — the edit would survive in storage and
 	// die on the box. Non-fatal; see applyPluginSettingsLayers.
-	if len(configFiles) > 0 && db.DB != nil {
+	if pluginSettingsLayersEnabled() && len(configFiles) > 0 && db.DB != nil {
 		if updated, n := applyPluginSettingsLayers(ctx, db.DB, id, configFiles); n > 0 {
 			configFiles = updated
 			log.Printf("Create %s: re-applied operator overrides to %d plugin settings file(s)", id, n)

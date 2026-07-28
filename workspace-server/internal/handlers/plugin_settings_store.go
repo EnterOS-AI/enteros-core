@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"path"
 	"strings"
 )
@@ -301,4 +302,27 @@ func pluginNameFromSettingsFile(name string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSuffix(file, ".json"), true
+}
+
+// pluginSettingsLayersEnabled gates the provision-time overlay.
+//
+// DEFAULT OFF. This is new behaviour on the Create path — the single most
+// blast-radius-sensitive code in the server — so it ships dark and is turned on
+// deliberately, rather than changing every provision the moment it merges.
+// With it off, provisioning is byte-identical to before: the rendered template
+// settings are delivered exactly as they were.
+//
+// Turning it on is what makes an operator override survive a re-provision ON
+// THE BOX (the DB half works either way). Flip it once the delivery e2e is
+// green with it enabled.
+//
+//	MOLECULE_PLUGIN_SETTINGS_LAYERS=1|true|yes   → on
+//	unset / anything else                        → off
+func pluginSettingsLayersEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MOLECULE_PLUGIN_SETTINGS_LAYERS"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
