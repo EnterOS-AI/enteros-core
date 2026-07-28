@@ -31,6 +31,42 @@ type patchPluginSettingsRequest struct {
 	Version *int64 `json:"version"`
 }
 
+// resolvePluginParam pins the request's `:plugin` to the workspace's real
+// INSTALL name and writes the error response itself when it cannot.
+//
+// Every layer-6 route goes through it, so no handler can accidentally use the
+// raw parameter: passing a plugin's MANIFEST name would otherwise address
+// plugin-settings/<manifest-name>.json — a file nothing reads — and return 200.
+// See plugin_settings_identity.go for why the two names diverge.
+//
+// Returns ok=false when a response has already been written.
+func resolvePluginParam(c *gin.Context, workspaceID string) (string, bool) {
+	requested := c.Param("plugin")
+	resolved, err := resolvePluginInstallName(c.Request.Context(), db.DB, workspaceID, requested)
+	if err == nil {
+		return resolved, true
+	}
+	if errors.Is(err, errPluginNotOnWorkspace) {
+		// Name the install names that WOULD have worked. A caller who passed
+		// the manifest name is one response away from the right one, instead
+		// of getting a silent success against a phantom file.
+		known, lerr := workspacePluginInstallNames(c.Request.Context(), db.DB, workspaceID)
+		if lerr != nil {
+			log.Printf("resolvePluginParam %s/%s: listing install names: %v", workspaceID, requested, lerr)
+		}
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":     "plugin is not declared or installed on this workspace",
+			"requested": requested,
+			"hint": "plugin settings are keyed on the INSTALL name (the plugins/<name>/ directory " +
+				"derived from the source repo), not the manifest's own `name:`",
+			"install_names": sortedNames(known),
+		})
+		return "", false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	return "", false
+}
+
 // GetPluginSettings handles GET /workspaces/:id/plugin-settings/:plugin.
 //
 // Returns every key with the layer that supplied it, so the plugin tab can
@@ -38,13 +74,12 @@ type patchPluginSettingsRequest struct {
 // provenance is stored on `config` and not only on `overrides`.
 func (h *TemplatesHandler) GetPluginSettings(c *gin.Context) {
 	workspaceID := c.Param("id")
-	pluginName := c.Param("plugin")
-	if _, err := pluginSettingsRelPath(pluginName); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
 	if db.DB == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	pluginName, ok := resolvePluginParam(c, workspaceID)
+	if !ok {
 		return
 	}
 
@@ -69,13 +104,14 @@ func (h *TemplatesHandler) GetPluginSettings(c *gin.Context) {
 // is how an operator ends up believing a setting is live when it is not.
 func (h *TemplatesHandler) PatchPluginSettings(c *gin.Context) {
 	workspaceID := c.Param("id")
-	pluginName := c.Param("plugin")
-	if _, err := pluginSettingsRelPath(pluginName); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
 	if db.DB == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+	// Resolve BEFORE reading the body: a write keyed on the manifest name must
+	// be refused, not saved somewhere nothing reads. See plugin_settings_identity.go.
+	pluginName, ok := resolvePluginParam(c, workspaceID)
+	if !ok {
 		return
 	}
 
@@ -158,9 +194,12 @@ func (h *TemplatesHandler) PatchPluginSettings(c *gin.Context) {
 // `.example` instead, as text.
 func (h *TemplatesHandler) GetPluginDeclaration(c *gin.Context) {
 	workspaceID := c.Param("id")
-	pluginName := c.Param("plugin")
-	if _, err := pluginSettingsRelPath(pluginName); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	// Same pin as GET/PATCH. readPluginManifestFromWorkspace addresses
+	// /configs/plugins/<name>/ — the install directory — so the manifest name
+	// would not find it either; resolving here makes that a named 404 instead
+	// of an opaque "manifest not readable".
+	pluginName, ok := resolvePluginParam(c, workspaceID)
+	if !ok {
 		return
 	}
 

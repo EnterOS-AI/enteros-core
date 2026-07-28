@@ -313,8 +313,24 @@ func pluginNameFromSettingsFile(name string) (string, bool) {
 // settings are delivered exactly as they were.
 //
 // Turning it on is what makes an operator override survive a re-provision ON
-// THE BOX (the DB half works either way). Flip it once the delivery e2e is
-// green with it enabled.
+// THE BOX (the DB half works either way).
+//
+// THE BISECT THIS FLAG WAS ALSO INTRODUCED FOR HAS CONCLUDED — and it cleared
+// this code. template-delivery-e2e was red for a reason with no connection to
+// the overlay: the seo-agent template declares runtime_config.required_env
+// (TENANT_*), the harness tenant supplied none of them, so preflight #5 aborted
+// the provision before cpProv.Start and the host-side /configs mirror was never
+// written. The gate read 0B and reported a "delivery REGRESSION" that never
+// happened. Fixed in tests/harness/template-asset-delivery-gate.sh; the tenant
+// log naming the abort is quoted on core#4923.
+//
+// So what remains here is a shipping-posture choice, not an open question: the
+// overlay is proven by TestIntegration_PluginSettings_ReprovisionDeliversThe
+// OverrideToTheBox against a real Postgres, and it stays dark only because
+// changing the Create path deserves a deliberate flip rather than an automatic
+// one at merge. Until it is flipped, layer 6 survives in the DATABASE but a
+// re-provisioned box still runs the template value — M4's done-condition is
+// not met on the box with the flag off. Flipping it is owner-gated.
 //
 //	MOLECULE_PLUGIN_SETTINGS_LAYERS=1|true|yes   → on
 //	unset / anything else                        → off
