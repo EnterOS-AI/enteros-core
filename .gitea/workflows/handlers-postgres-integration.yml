@@ -386,8 +386,18 @@ jobs:
           # the input this step exists to catch. A SKIP here is a FAILURE.
           LOG=$(mktemp)
           rc=0
-          go test -timeout 10m -v ./internal/handlers/ -run '^TestLiveBox_' 2>&1 | tee "$LOG" || rc=$?
-          npass=$(grep -c -E '^[[:space:]]*--- PASS: TestLiveBox_' "$LOG" || true)
+          # 2m, not 10m. The observed step time is ~4s and startLiveBoxFor already
+          # caps container readiness at 20s, so 10m buys nothing on a healthy run —
+          # it only pushes 5m+10m+5m past this job's timeout-minutes: 15, making a
+          # JOB-level kill newly reachable. That is strictly worse than a go-level
+          # timeout: it skips the `if: always()` stop-Postgres step and leaks a
+          # pg-handlers-* container, which the sweeper's ^ws- filter does not collect.
+          go test -timeout 2m -v ./internal/handlers/ -run '^TestLiveBox_' 2>&1 | tee "$LOG" || rc=$?
+          # Anchored at column 0 ON PURPOSE: `go test -v` indents SUBTEST results
+          # ("    --- PASS: Parent/child"). With a leading [[:space:]]* class, one
+          # function with six t.Run()s scores npass=7 and hands the floor below a
+          # free pass. Only top-level results count.
+          npass=$(grep -c -E '^--- PASS: TestLiveBox_' "$LOG" || true)
           nskip=$(grep -c -E '^[[:space:]]*--- SKIP: TestLiveBox_' "$LOG" || true)
           echo "TestLiveBox_: ${npass} passed, ${nskip} skipped"
           if [ "$rc" -ne 0 ]; then
@@ -408,16 +418,24 @@ jobs:
           # reappearing inside the guard itself.
           #
           # So require a FLOOR, and name the one test that must have run.
-          LIVE_MIN=5
+          # LIVE_MIN is the count of ALL TestLiveBox_* (7), NOT the count of
+          # Docker-gated ones (5). npass counts every matching PASS line, and two
+          # of the seven are pure unit tests, so a floor of 5 leaves exactly two
+          # tests of slack: drop RealWriterLandsSettingsOnARunningWorkspace and
+          # DeliverReportsWhenTheReloadDidNotConfirm — the two that drive the ACTUAL
+          # entry point including backend dispatch, not just the copy primitive —
+          # and the step still scores 5 and reports GREEN. Measured population and
+          # threshold population must be the same one.
+          LIVE_MIN=7
           if [ "${npass:-0}" -lt "$LIVE_MIN" ]; then
-            echo "::error::live-container gate saw ${npass} '--- PASS: TestLiveBox_' line(s), expected at least ${LIVE_MIN}. Either a live test was removed/renamed without updating LIVE_MIN, or the -run regex ^TestLiveBox_ no longer matches the suite. Note that some TestLiveBox_* are pure unit tests, so a nonzero count alone does not prove a container ever started."
+            echo "::error::live-container gate saw ${npass} top-level '--- PASS: TestLiveBox_' line(s), expected ${LIVE_MIN} (every TestLiveBox_* in plugin_settings_writer_live_test.go). A test was removed or renamed without updating LIVE_MIN, or the -run regex no longer matches the suite. Note two of them are pure unit tests, so a nonzero count alone does not prove a container ever started."
             exit 1
           fi
           # The canary: the specific regression guard for the #4922 doubled-destPath
           # bug, where every save silently wrote to /configs/configs/... while the
           # API answered {"status":"saved"}. If THIS test stops running, the gate
           # has lost the thing it was built for, whatever the counts say.
-          if ! grep -q -E '^[[:space:]]*--- PASS: TestLiveBox_FilesAPISaveActuallyLandsOnTheBox' "$LOG"; then
+          if ! grep -q -E '^--- PASS: TestLiveBox_FilesAPISaveActuallyLandsOnTheBox' "$LOG"; then
             echo "::error::live-container gate did not run TestLiveBox_FilesAPISaveActuallyLandsOnTheBox — the #4922 regression guard. If it was deliberately renamed, update this check to the new name; do NOT delete the check."
             exit 1
           fi
