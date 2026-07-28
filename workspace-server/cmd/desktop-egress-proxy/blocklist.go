@@ -17,14 +17,46 @@ import (
 // (Postgres/Redis/MinIO/LiteLLM), the host, other tenants, or steal cloud
 // credentials — with no host firewall and no operator step.
 func isBlockedIP(ip net.IP) bool {
-	return ip == nil ||
+	if ip == nil ||
 		ip.IsLoopback() ||
 		ip.IsPrivate() || // 10/8, 172.16/12, 192.168/16, fc00::/7
 		ip.IsLinkLocalUnicast() || // 169.254/16 (metadata + host gw), fe80::/10
 		ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() ||
 		ip.IsMulticast() ||
-		ip.IsUnspecified()
+		ip.IsUnspecified() {
+		return true
+	}
+	// Defense-in-depth against IPv6 transition mechanisms that embed an IPv4
+	// address: NAT64 (64:ff9b::/96) and 6to4 (2002::/16) can smuggle a private
+	// v4 (e.g. NAT64 of 169.254.169.254 = 64:ff9b::a9fe:a9fe) that the checks
+	// above miss because the OUTER v6 address is "public". If the embedded v4 is
+	// itself blocked, block the whole address. (v4-mapped ::ffff:0:0/96 is
+	// already handled by To4() inside IsPrivate/IsLinkLocalUnicast above.)
+	if v4 := embeddedV4(ip); v4 != nil && isBlockedIP(v4) {
+		return true
+	}
+	return false
+}
+
+// embeddedV4 returns the IPv4 address embedded in an IPv6 transition-mechanism
+// address (NAT64 64:ff9b::/96 or 6to4 2002::/16), or nil.
+func embeddedV4(ip net.IP) net.IP {
+	v6 := ip.To16()
+	if v6 == nil || ip.To4() != nil {
+		return nil // not v6, or already a v4 form
+	}
+	// NAT64 well-known prefix 64:ff9b::/96 → last 4 bytes are the v4.
+	if v6[0] == 0x00 && v6[1] == 0x64 && v6[2] == 0xff && v6[3] == 0x9b &&
+		v6[4] == 0 && v6[5] == 0 && v6[6] == 0 && v6[7] == 0 &&
+		v6[8] == 0 && v6[9] == 0 && v6[10] == 0 && v6[11] == 0 {
+		return net.IPv4(v6[12], v6[13], v6[14], v6[15])
+	}
+	// 6to4 2002::/16 → bytes 2..5 are the v4.
+	if v6[0] == 0x20 && v6[1] == 0x02 {
+		return net.IPv4(v6[2], v6[3], v6[4], v6[5])
+	}
+	return nil
 }
 
 // resolveAllowedIP resolves host and returns ONE public IP safe to dial, or an

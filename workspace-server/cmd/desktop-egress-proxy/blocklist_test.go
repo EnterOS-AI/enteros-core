@@ -7,18 +7,23 @@ import (
 
 func TestIsBlockedIP(t *testing.T) {
 	blocked := []string{
-		"10.0.0.1",        // RFC-1918
-		"172.16.5.4",      // RFC-1918
-		"172.31.255.255",  // RFC-1918 upper
-		"192.168.1.1",     // RFC-1918
-		"169.254.169.254", // cloud metadata
-		"169.254.0.1",     // link-local (docker host gw range)
-		"127.0.0.1",       // loopback
-		"0.0.0.0",         // unspecified
-		"::1",             // v6 loopback
-		"fe80::1",         // v6 link-local
-		"fc00::1",         // v6 ULA (private)
-		"224.0.0.1",       // multicast
+		"10.0.0.1",               // RFC-1918
+		"172.16.5.4",             // RFC-1918
+		"172.31.255.255",         // RFC-1918 upper
+		"192.168.1.1",            // RFC-1918
+		"169.254.169.254",        // cloud metadata
+		"169.254.0.1",            // link-local (docker host gw range)
+		"127.0.0.1",              // loopback
+		"0.0.0.0",                // unspecified
+		"::1",                    // v6 loopback
+		"fe80::1",                // v6 link-local
+		"fc00::1",                // v6 ULA (private)
+		"224.0.0.1",              // multicast
+		"::ffff:169.254.169.254", // v4-mapped metadata
+		"::ffff:10.0.0.1",        // v4-mapped private
+		"64:ff9b::a9fe:a9fe",     // NAT64 of metadata 169.254.169.254
+		"64:ff9b::a00:1",         // NAT64 of 10.0.0.1
+		"2002:a9fe:a9fe::1",      // 6to4 embedding 169.254.169.254
 	}
 	for _, s := range blocked {
 		if !isBlockedIP(net.ParseIP(s)) {
