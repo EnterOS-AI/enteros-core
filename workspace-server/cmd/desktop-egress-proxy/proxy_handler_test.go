@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"io"
 	"net"
@@ -10,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestHandle_DeniesPrivateDestinations verifies the HTTP surface refuses
@@ -59,54 +59,44 @@ func TestHandle_DeniesPrivateDestinations(t *testing.T) {
 	})
 }
 
-// TestHandle_DeniesNonWebPorts verifies the proxy is not a general TCP relay:
-// CONNECT is limited to 443 and plain HTTP to 80, so a compromised sidecar
-// cannot tunnel to SSH/SMTP/arbitrary C2 ports even on a public IP. The port is
-// vetted before any DNS/dial, so these return 403 without touching the network.
-func TestHandle_DeniesNonWebPorts(t *testing.T) {
-	// CONNECT to a PUBLIC IP on :22 → 403 (port, not IP).
-	t.Run("connect-public-ssh", func(t *testing.T) {
+// TestHandle_BlocksBlockedIPRegardlessOfPort verifies the security boundary is
+// the IP blocklist and is PORT-INDEPENDENT: a blocked (private/metadata)
+// destination is refused with 403 before any dial on a non-standard port just as
+// on 443/80. The proxy no longer restricts by port (a port allowlist added no
+// isolation — HTTPS C2/exfil rides 443 anyway — while breaking legitimate
+// alt-port sites like :8443), so the IP check must carry the boundary alone.
+func TestHandle_BlocksBlockedIPRegardlessOfPort(t *testing.T) {
+	// CONNECT to a PRIVATE IP on a non-standard port → still 403 (IP, port-agnostic).
+	t.Run("connect-private-altport", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodConnect, "http://example", nil)
-		req.Host = "1.1.1.1:22"
-		req.URL.Host = "1.1.1.1:22"
+		req.Host = "10.0.0.1:8443"
+		req.URL.Host = "10.0.0.1:8443"
 		rec := httptest.NewRecorder()
 		handle(rec, req)
 		if rec.Code != http.StatusForbidden {
-			t.Fatalf("CONNECT 1.1.1.1:22: got %d, want 403", rec.Code)
+			t.Fatalf("CONNECT 10.0.0.1:8443: got %d, want 403", rec.Code)
 		}
 	})
-	// Plain HTTP to a public IP on :8080 → 403 (port).
-	t.Run("http-public-nonstandard", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "http://1.1.1.1:8080/x", nil)
+	// Plain HTTP to a private IP on a non-standard port → still 403.
+	t.Run("http-private-altport", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.1:8080/x", nil)
 		rec := httptest.NewRecorder()
 		handle(rec, req)
 		if rec.Code != http.StatusForbidden {
-			t.Fatalf("GET 1.1.1.1:8080: got %d, want 403", rec.Code)
+			t.Fatalf("GET 192.168.1.1:8080: got %d, want 403", rec.Code)
 		}
 	})
-}
-
-// TestPortAllowlist unit-tests the port allowlist helpers directly: this is the
-// check that keeps the proxy an HTTPS/HTTP web egress rather than a general TCP
-// relay. The full CONNECT-443 allow path (which requires a live public endpoint
-// and a real dial) is covered by the live-container e2e, as with the deny tests.
-func TestPortAllowlist(t *testing.T) {
-	if !connectPortAllowed("443") {
-		t.Error("connectPortAllowed(443) = false, want true (HTTPS must pass)")
-	}
-	for _, p := range []string{"22", "80", "25", "8443", ""} {
-		if connectPortAllowed(p) {
-			t.Errorf("connectPortAllowed(%q) = true, want false", p)
+	// Metadata IP on a non-standard port → still 403.
+	t.Run("connect-metadata-altport", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodConnect, "http://example", nil)
+		req.Host = "169.254.169.254:9000"
+		req.URL.Host = "169.254.169.254:9000"
+		rec := httptest.NewRecorder()
+		handle(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("CONNECT metadata:9000: got %d, want 403", rec.Code)
 		}
-	}
-	if !httpPortAllowed("80") {
-		t.Error("httpPortAllowed(80) = false, want true (HTTP must pass)")
-	}
-	for _, p := range []string{"443", "8080", "22", ""} {
-		if httpPortAllowed(p) {
-			t.Errorf("httpPortAllowed(%q) = true, want false", p)
-		}
-	}
+	})
 }
 
 // tcpPair returns a connected pair of real TCP sockets (so CloseWrite / EOF
@@ -147,9 +137,7 @@ func TestTunnel_NoTruncationBidirectional(t *testing.T) {
 	clientOuter, clientInner := tcpPair(t) // test writes/reads clientOuter; tunnel uses clientInner
 	upstreamInner, upstreamOuter := tcpPair(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go tunnel(ctx, clientInner, upstreamInner)
+	go tunnel(clientInner, upstreamInner)
 
 	const n = 4 << 20 // 4 MiB, larger than any socket buffer
 	upload := make([]byte, n)
@@ -195,5 +183,43 @@ func TestTunnel_NoTruncationBidirectional(t *testing.T) {
 	}
 	if !bytes.Equal(gotDownload, download) {
 		t.Errorf("download truncated/corrupted: got %d bytes, want %d", len(gotDownload), len(download))
+	}
+}
+
+// TestTunnel_HungPeerDoesNotBlockForever is the regression guard for the
+// fd/goroutine leak (verified 2026-07-28): on a hijacked CONNECT the request
+// context is never cancelled while ServeHTTP is blocked in tunnel, so a peer that
+// half-closes one way but never sends EOF the other way must NOT hang tunnel
+// forever — the drain deadline has to force it closed. Here the client finishes
+// and half-closes, but the upstream never writes and never closes; tunnel must
+// still return within the (shortened) drain window.
+func TestTunnel_HungPeerDoesNotBlockForever(t *testing.T) {
+	orig := tunnelDrainTimeout
+	tunnelDrainTimeout = 200 * time.Millisecond
+	defer func() { tunnelDrainTimeout = orig }()
+
+	clientOuter, clientInner := tcpPair(t)
+	upstreamInner, upstreamOuter := tcpPair(t)
+	defer upstreamOuter.Close()
+
+	done := make(chan struct{})
+	go func() {
+		tunnel(clientInner, upstreamInner)
+		close(done)
+	}()
+
+	// Client sends a little then half-closes its write side (its reader stays open
+	// waiting for a response that never comes).
+	if _, err := clientOuter.Write([]byte("GET / HTTP/1.1\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	clientOuter.(*net.TCPConn).CloseWrite()
+	// upstreamOuter deliberately never writes and never closes — the hung peer.
+
+	select {
+	case <-done:
+		// tunnel returned — the drain deadline unblocked the stuck direction.
+	case <-time.After(5 * time.Second):
+		t.Fatal("tunnel did not return: a hung upstream leaked the goroutine + fds (drain deadline ineffective)")
 	}
 }

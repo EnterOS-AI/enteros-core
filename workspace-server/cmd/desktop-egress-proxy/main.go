@@ -26,22 +26,18 @@ import (
 
 const dialTimeout = 15 * time.Second
 
-// httpsPort / httpPort are the ONLY destination ports the proxy will reach. It
-// exists to permit web browsing, not to be a general TCP relay, so CONNECT
-// tunnels are limited to HTTPS (443) and plain-HTTP proxying to 80. A
-// compromised sidecar therefore cannot tunnel to SSH/SMTP or an arbitrary C2
-// port even though the destination IP is a public one.
+// httpsPort / httpPort are the DEFAULT destination ports assumed when a request
+// omits one (a bare CONNECT host, or an absolute-form http:// URL without a
+// port). The proxy does NOT restrict which port it will reach: the security
+// boundary is the IP blocklist (private/link-local/loopback/CGNAT denied), and a
+// port allowlist adds no real isolation — HTTPS-based C2/exfil rides 443, which
+// any web proxy must allow, so narrowing to 443/80 only broke legitimate sites
+// served on alt ports (e.g. https://host:8443, http://host:8080) without
+// containing an attacker (verified 2026-07-28).
 const (
 	httpsPort = "443"
 	httpPort  = "80"
 )
-
-// connectPortAllowed reports whether a CONNECT tunnel to port is permitted.
-func connectPortAllowed(port string) bool { return port == httpsPort }
-
-// httpPortAllowed reports whether a plain-HTTP proxied request to port is
-// permitted.
-func httpPortAllowed(port string) bool { return port == httpPort }
 
 func main() {
 	addr := os.Getenv("DESKTOP_PROXY_ADDR")
@@ -72,11 +68,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		host, port = r.Host, httpsPort
 	}
-	if !connectPortAllowed(port) {
-		log.Printf("DENY CONNECT %s: port %s not permitted (only %s)", r.Host, port, httpsPort)
-		http.Error(w, "destination port not permitted", http.StatusForbidden)
-		return
-	}
 	ip, err := resolveAllowedIP(host)
 	if err != nil {
 		log.Printf("DENY CONNECT %s: %v", r.Host, err)
@@ -103,19 +94,32 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		return
 	}
-	tunnel(r.Context(), client, upstream)
+	tunnel(client, upstream)
 }
 
-// tunnel bidirectionally copies between the client and upstream connections
-// until BOTH directions have finished. When one direction's reader hits EOF it
-// half-closes the peer's write end (CloseWrite) so the peer sees EOF without the
-// other direction being torn down — this is what stops a large upload still
-// draining after the download completes from being truncated (the previous
-// single-<-done teardown closed both sockets the instant the first copy
-// finished). The request context is bound so a client disconnect force-closes
-// both ends and neither goroutine can block forever on a peer that never sends
-// EOF.
-func tunnel(ctx context.Context, client, upstream net.Conn) {
+// tunnelDrainTimeout bounds how long the SECOND tunnel direction may keep
+// copying after the FIRST has finished and half-closed its peer. A well-behaved
+// peer, now seeing EOF, closes within milliseconds; this is purely a backstop
+// against a hung/malicious peer that never sends EOF. It is generous so it never
+// truncates real traffic (including a WebSocket that closes one way first). A var
+// (not const) only so the leak-regression test can shorten it.
+var tunnelDrainTimeout = 60 * time.Second
+
+// tunnel bidirectionally copies between the client and upstream connections.
+// When one direction's reader hits EOF it half-closes the peer's write end
+// (CloseWrite) so the peer sees EOF WITHOUT the other direction being torn down
+// — this stops a large upload still draining after the download completes from
+// being truncated (the older single-<-done teardown closed both sockets the
+// instant the first copy finished).
+//
+// Leak safety (verified 2026-07-28): this runs on a HIJACKED CONNECT connection,
+// whose request context is NOT cancelled until ServeHTTP returns — and ServeHTTP
+// is blocked right here in tunnel — so a ctx-done closer goroutine could never
+// fire mid-tunnel. Relying on it let a peer that never sends EOF block the second
+// io.Copy (and both fds + the goroutine) FOREVER. Instead, once the first
+// direction completes we put a drain DEADLINE on both conns, turning that
+// unbounded leak into a bounded wait, then force both closed.
+func tunnel(client, upstream net.Conn) {
 	type closeWriter interface{ CloseWrite() error }
 	done := make(chan struct{}, 2)
 	pipe := func(dst, src net.Conn) {
@@ -125,15 +129,19 @@ func tunnel(ctx context.Context, client, upstream net.Conn) {
 		}
 		done <- struct{}{}
 	}
-	go func() {
-		<-ctx.Done()
-		client.Close()
-		upstream.Close()
-	}()
 	go pipe(upstream, client)
 	go pipe(client, upstream)
+
+	<-done // one direction finished and half-closed its peer's write side
+	// Bound the still-open direction so a peer that never EOFs cannot hang it (and
+	// this goroutine + both sockets) indefinitely.
+	deadline := time.Now().Add(tunnelDrainTimeout)
+	_ = client.SetDeadline(deadline)
+	_ = upstream.SetDeadline(deadline)
 	<-done
-	<-done
+
+	client.Close()
+	upstream.Close()
 }
 
 // hopByHopHeaders are stripped when forwarding a plain-HTTP proxied request.
@@ -153,11 +161,6 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	port := r.URL.Port()
 	if port == "" {
 		port = httpPort
-	}
-	if !httpPortAllowed(port) {
-		log.Printf("DENY %s %s: port %s not permitted (only %s)", r.Method, r.URL, port, httpPort)
-		http.Error(w, "destination port not permitted", http.StatusForbidden)
-		return
 	}
 	host := r.URL.Hostname()
 	ip, err := resolveAllowedIP(host)

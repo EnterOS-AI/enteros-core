@@ -18,6 +18,7 @@ type fakeProv struct {
 	addr     string
 	starts   int
 	startErr error
+	scaledUp bool // reported as DesktopHandle.ScaledUp (the stopped->running edge)
 }
 
 func (f *fakeProv) StartDesktop(context.Context, provisioner.WorkspaceConfig) (provisioner.DesktopHandle, error) {
@@ -25,7 +26,7 @@ func (f *fakeProv) StartDesktop(context.Context, provisioner.WorkspaceConfig) (p
 	if f.startErr != nil {
 		return provisioner.DesktopHandle{}, f.startErr
 	}
-	return provisioner.DesktopHandle{Address: f.addr, Running: true}, nil
+	return provisioner.DesktopHandle{Address: f.addr, Running: true, ScaledUp: f.scaledUp}, nil
 }
 func (f *fakeProv) StopDesktop(context.Context, string) error            { return nil }
 func (f *fakeProv) DesktopRunning(context.Context, string) (bool, error) { return true, nil }
@@ -75,9 +76,9 @@ func (f *fakeDoer) Do(r *http.Request) (*http.Response, error) {
 func tokenFn(_ context.Context, _ string) (string, error) { return "sidecar-secret", nil }
 
 // Input must FAIL-CLOSED when the agent does not hold the control lock: no HTTP
-// call to the sidecar (§8). The desktop MAY have been confirmed up first
-// (ensureRunning precedes the lock check now), which is a cheap idempotent no-op
-// — but no /input is ever proxied while a human holds control.
+// call to the sidecar (§8) AND no scale-up. The control check precedes
+// ensureRunning, so a human-held desktop that was reaped to zero is NOT booted
+// back up just to refuse the input (verified 2026-07-28).
 func TestGateway_Input_FailsClosedWhenAgentLacksControl(t *testing.T) {
 	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusNoContent}
@@ -90,13 +91,17 @@ func TestGateway_Input_FailsClosedWhenAgentLacksControl(t *testing.T) {
 	if len(doer.reqs) != 0 {
 		t.Fatalf("must not proxy input when the agent lacks control")
 	}
+	if prov.starts != 0 {
+		t.Fatalf("must NOT scale up the desktop when a human holds control, got %d StartDesktop calls", prov.starts)
+	}
 }
 
-// When StartDesktop FAILS, Input must return the error WITHOUT acquiring the
-// agent control lease — otherwise every failing input burns a DB write and
-// leaves a stale 'agent in control' lock (reviewer finding: ensureRunning must
-// precede AcquireAgentControl).
-func TestGateway_Input_StartFailureSkipsControlAcquire(t *testing.T) {
+// When the agent holds control but StartDesktop FAILS, Input surfaces that error
+// (as a 5xx-class failure to the route). The lease WAS acquired — that is
+// correct: the agent legitimately holds control and is retrying — and crucially,
+// ensureRunning runs only AFTER the control check, so its failure can never be
+// mistaken for a human-in-control refusal (409). See finding-1 fix (2026-07-28).
+func TestGateway_Input_SurfacesStartFailureAfterAcquiringControl(t *testing.T) {
 	prov := &fakeProv{addr: "wsdesk-abc123:6070", startErr: errors.New("boom")}
 	doer := &fakeDoer{code: http.StatusNoContent}
 	locks := &fakeLocks{held: true}
@@ -106,18 +111,20 @@ func TestGateway_Input_StartFailureSkipsControlAcquire(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("want StartDesktop error surfaced, got %v", err)
 	}
-	if locks.acquires != 0 {
-		t.Fatalf("must NOT acquire agent control when the desktop failed to start, got %d acquires", locks.acquires)
+	if errors.Is(err, ErrHumanInControl) {
+		t.Fatalf("a scale-up failure must NOT masquerade as ErrHumanInControl (409), got %v", err)
 	}
 	if len(doer.reqs) != 0 {
 		t.Fatalf("must not proxy input when the desktop failed to start")
 	}
 }
 
-// On a successful scale-up the gateway records state='running' with the sidecar
-// address, so the idle sweeper can later find the desktop to reap (§10).
+// On a successful scale-up (the stopped->running edge, DesktopHandle.ScaledUp)
+// the gateway records state='running' with the sidecar address exactly once, so
+// the idle sweeper can later find the desktop to reap (§10). It must NOT re-write
+// the state on subsequent already-running forwards (finding-8 fix, 2026-07-28).
 func TestGateway_RecordsRunningStateOnScaleUp(t *testing.T) {
-	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
+	prov := &fakeProv{addr: "wsdesk-abc123:6070", scaledUp: true}
 	doer := &fakeDoer{code: http.StatusNoContent}
 	state := &fakeState{}
 	g := New(prov, &fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
@@ -131,6 +138,25 @@ func TestGateway_RecordsRunningStateOnScaleUp(t *testing.T) {
 	}
 	if state.addrs[0] != "wsdesk-abc123:6070" {
 		t.Fatalf("running state must carry the sidecar address, got %q", state.addrs[0])
+	}
+}
+
+// A forward on an ALREADY-running desktop (ScaledUp=false) must NOT re-record the
+// 'running' lifecycle state — that was a redundant per-screenshot DB upsert on
+// the hot path (finding-8 fix, 2026-07-28). recordActivity still upserts the
+// activity timestamp; only the state/address write is transition-only.
+func TestGateway_DoesNotRerecordStateWhenAlreadyRunning(t *testing.T) {
+	prov := &fakeProv{addr: "wsdesk-abc123:6070", scaledUp: false}
+	doer := &fakeDoer{code: http.StatusNoContent}
+	state := &fakeState{}
+	g := New(prov, &fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
+	g.SetStateRecorder(state)
+
+	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
+		t.Fatalf("Input: %v", err)
+	}
+	if len(state.states) != 0 {
+		t.Fatalf("must not record state on an already-running forward, got %v", state.states)
 	}
 }
 

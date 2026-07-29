@@ -108,21 +108,25 @@ func (g *Gateway) Screenshot(ctx context.Context, workspaceID string) ([]byte, e
 // acquires/refreshes its control lease (yielding to a human who has preempted),
 // or the input is refused with ErrHumanInControl.
 func (g *Gateway) Input(ctx context.Context, workspaceID string, action json.RawMessage) error {
-	// Confirm the desktop is up (and get its address) BEFORE touching the
-	// control lock: AcquireAgentControl is a DB upsert that writes a 300s agent
-	// lease, so acquiring it first would leave a stale 'agent in control' lock —
-	// and burn a DB write per failing input — whenever StartDesktop fails. On any
-	// scale-up failure we return before persisting any arbitration state.
-	addr, err := g.ensureRunning(ctx, workspaceID)
-	if err != nil {
-		return err
-	}
+	// Check the control lock FIRST, before any scale-up. AcquireAgentControl
+	// returns held=false when a human holds control; in that case we must refuse
+	// with ErrHumanInControl (-> 409) WITHOUT booting the desktop. Doing
+	// ensureRunning first would scale a reaped 2GB sidecar back from zero just to
+	// refuse the input, and would surface a scale-up/egress error as a 5xx
+	// "input failed" instead of the correct 409 "human in control" — misleading a
+	// client that pauses on 409 but retries on 5xx (verified 2026-07-28). When the
+	// agent legitimately holds control (held=true) the lease write is warranted,
+	// and only then do we ensure the desktop is up.
 	held, err := g.locks.AcquireAgentControl(ctx, workspaceID)
 	if err != nil {
 		return err // ambiguity -> fail closed (deny)
 	}
 	if !held {
 		return ErrHumanInControl
+	}
+	addr, err := g.ensureRunning(ctx, workspaceID)
+	if err != nil {
+		return err
 	}
 	g.recordActivity(ctx, workspaceID)
 	req, err := g.newReq(ctx, workspaceID, http.MethodPost, addr, "/input", bytes.NewReader(action))
@@ -162,9 +166,14 @@ func (g *Gateway) ensureRunning(ctx context.Context, workspaceID string) (string
 		return "", fmt.Errorf("refusing to forward to an invalid desktop target: %w", err)
 	}
 	// Record 'running' so scale-to-zero can find this desktop to evaluate for
-	// teardown (§10). Best-effort: a state-write failure must not fail the op the
-	// caller actually asked for, and the setter is optional (nil-safe).
-	if g.state != nil {
+	// teardown (§10) — but ONLY on the scale-up transition (h.ScaledUp), not on
+	// every hot-path forward. State + address don't change while the desktop stays
+	// up, so re-upserting them on every screenshot/input just doubled the write
+	// load on the lifecycle row (recordActivity already upserts last_activity each
+	// call). Best-effort: a state-write failure must not fail the op the caller
+	// asked for, and the setter is optional (nil-safe); a rare failed transition
+	// write is re-attempted on the next scale-up.
+	if h.ScaledUp && g.state != nil {
 		_ = g.state.SetState(ctx, workspaceID, "running", h.Address)
 	}
 	return h.Address, nil

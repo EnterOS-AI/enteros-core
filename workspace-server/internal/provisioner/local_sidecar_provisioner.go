@@ -4,7 +4,9 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -115,7 +117,21 @@ type LocalSidecarProvisioner struct {
 	// the desktop sidecar is NEVER on it. Empty defaults to the Docker "bridge"
 	// network (always present, has internet NAT, does not carry molecule infra).
 	egressNetwork string
+
+	// reconcileMu guards lastEgressReconcile. StartDesktop runs on the gateway's
+	// hot path (every screenshot/input), so the already-running fast path only
+	// reconciles egress plumbing at most once per egressReconcileInterval per
+	// workspace — see reconcileEgressBestEffort.
+	reconcileMu         sync.Mutex
+	lastEgressReconcile map[string]time.Time
 }
+
+// egressReconcileInterval throttles the best-effort egress reconcile on
+// StartDesktop's already-running fast path. StartDesktop is called on every
+// screenshot/input, but a dead egress proxy (RestartPolicy "no") is rare, so
+// reconciling once per this window per workspace keeps the interactive loop
+// cheap while still self-healing egress within the interval.
+const egressReconcileInterval = 30 * time.Second
 
 // SetControlTokenSecret wires the shared secret used to derive each sidecar's
 // DESKTOP_CONTROL_TOKEN. Must match the secret the gateway's TokenResolver uses.
@@ -153,13 +169,14 @@ func NewLocalSidecarProvisioner(cli sidecarDocker, image, networkPrefix string, 
 		seccompProfile = defaultDesktopSeccompProfile
 	}
 	return &LocalSidecarProvisioner{
-		cli:              cli,
-		image:            image,
-		networkPrefix:    networkPrefix,
-		controlPort:      controlPort,
-		stopTimeout:      stopTimeout,
-		memoryLimitBytes: memoryLimitBytes,
-		seccompProfile:   seccompProfile,
+		cli:                 cli,
+		image:               image,
+		networkPrefix:       networkPrefix,
+		controlPort:         controlPort,
+		stopTimeout:         stopTimeout,
+		memoryLimitBytes:    memoryLimitBytes,
+		seccompProfile:      seccompProfile,
+		lastEgressReconcile: make(map[string]time.Time),
 	}
 }
 
@@ -197,27 +214,55 @@ func (p *LocalSidecarProvisioner) handle(workspaceID string, running bool) Deskt
 	}
 }
 
+// reconcileEgressBestEffort re-establishes the sidecar's egress plumbing on the
+// already-running fast path WITHOUT ever failing the caller and WITHOUT taxing
+// the interactive loop. Screenshots/inputs on a healthy running desktop must
+// never break because egress (which they don't need) hiccuped, so errors are
+// logged and swallowed. StartDesktop is called on every screenshot/input, so a
+// per-workspace throttle keeps real Docker work to at most once per
+// egressReconcileInterval — a dead egress proxy self-heals within the interval
+// instead of on every forward. The timestamp is stamped before the work so
+// concurrent hot-path callers within the window skip the reconcile entirely.
+func (p *LocalSidecarProvisioner) reconcileEgressBestEffort(ctx context.Context, workspaceID, net string) {
+	p.reconcileMu.Lock()
+	if p.lastEgressReconcile == nil {
+		p.lastEgressReconcile = make(map[string]time.Time)
+	}
+	if last, ok := p.lastEgressReconcile[workspaceID]; ok && time.Since(last) < egressReconcileInterval {
+		p.reconcileMu.Unlock()
+		return
+	}
+	p.lastEgressReconcile[workspaceID] = time.Now()
+	p.reconcileMu.Unlock()
+
+	if err := p.ensureEgressProxy(ctx, workspaceID, net); err != nil {
+		log.Printf("desktop: best-effort egress-proxy reconcile for %s failed (non-fatal, running desktop still serves): %v", workspaceID, err)
+	}
+	if p.selfContainerID != "" {
+		if err := p.cli.NetworkConnect(ctx, net, p.selfContainerID, nil); err != nil && !isAlreadyConnected(err) {
+			log.Printf("desktop: best-effort platform network attach for %s failed (non-fatal): %v", workspaceID, err)
+		}
+	}
+}
+
 // StartDesktop brings up the workspace's desktop sidecar, idempotently: if it
 // is already running, it returns the handle without creating a second one (the
 // agent's first tool call and a human opening the display can race, §10).
 func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg WorkspaceConfig) (DesktopHandle, error) {
 	if running, _ := p.DesktopRunning(ctx, cfg.WorkspaceID); running {
-		// Even on the already-running fast path, RECONCILE the egress plumbing
-		// before returning: the egress proxy is RestartPolicy "no", so it can die
-		// while the sidecar keeps running, and the platform's network attachment
-		// can be lost — either leaves the sidecar wedged with no route out. Both
-		// operations are idempotent and cheap (ensureEgressProxy recreates a dead
-		// proxy; NetworkConnect is isAlreadyConnected-guarded), so a re-called
-		// StartDesktop self-heals the egress path instead of shortcutting past it.
+		// Already-running fast path. RECONCILE the egress plumbing best-effort —
+		// the egress proxy is RestartPolicy "no", so it can die while the sidecar
+		// keeps running, and the platform's network attachment can be lost. But
+		// this path is on the gateway's hot loop (Screenshot/Input call
+		// ensureRunning -> StartDesktop on every forward), and a screenshot needs
+		// NO egress, so the reconcile MUST NOT be able to fail the handle return:
+		// a transient egress/Docker hiccup must never blind the agent on a healthy
+		// running desktop. reconcileEgressBestEffort logs-and-continues and is
+		// throttled to egressReconcileInterval so we don't pay 2 Docker round-trips
+		// per screenshot. (Verified 2026-07-28: a fatal reconcile here regressed
+		// the "agent can ALWAYS see" invariant.)
 		if net := p.perWorkspaceNetwork(cfg.WorkspaceID); net != "" {
-			if err := p.ensureEgressProxy(ctx, cfg.WorkspaceID, net); err != nil {
-				return DesktopHandle{}, err
-			}
-			if p.selfContainerID != "" {
-				if err := p.cli.NetworkConnect(ctx, net, p.selfContainerID, nil); err != nil && !isAlreadyConnected(err) {
-					return DesktopHandle{}, fmt.Errorf("attach platform to per-workspace network: %w", err)
-				}
-			}
+			p.reconcileEgressBestEffort(ctx, cfg.WorkspaceID, net)
 		}
 		return p.handle(cfg.WorkspaceID, true), nil
 	}
@@ -326,7 +371,12 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 			return DesktopHandle{}, fmt.Errorf("attach platform to per-workspace network: %w", err)
 		}
 	}
-	return p.handle(cfg.WorkspaceID, true), nil
+	// This call transitioned the desktop stopped -> running, so mark ScaledUp: the
+	// gateway records the 'running' lifecycle state on exactly this edge rather
+	// than on every subsequent hot-path forward.
+	h := p.handle(cfg.WorkspaceID, true)
+	h.ScaledUp = true
+	return h, nil
 }
 
 // egressNetworkName is the network the proxy uses for internet egress.
@@ -411,22 +461,34 @@ func (p *LocalSidecarProvisioner) stopEgressProxy(ctx context.Context, workspace
 func (p *LocalSidecarProvisioner) StopDesktop(ctx context.Context, workspaceID string) error {
 	name := DesktopContainerName(workspaceID)
 	secs := int(p.stopTimeout.Seconds())
-	// Capture (do NOT early-return on) the sidecar stop/remove error: the egress
-	// proxy + per-workspace network must still be torn down even when the sidecar
-	// stop fails, or wsdeskproxy-<id> and the per-workspace network leak. Run the
-	// proxy/network cleanup below unconditionally, then surface the captured error.
+	// Capture (do NOT early-return on) the sidecar stop/remove outcome. isGone is
+	// true only when the sidecar is actually down — the stop succeeded, or the
+	// container was already absent. A genuine stop FAILURE leaves the sidecar
+	// RUNNING, and it still needs its egress proxy + network: tearing those down
+	// under a live sidecar would strand it egress-less and leak a network that
+	// NetworkRemove can't drop while the sidecar endpoint remains (verified
+	// 2026-07-28). So the proxy/network teardown below is gated on isGone; on a
+	// stop failure we surface the error and leave the plumbing for the caller's
+	// retry or a later sweep to reclaim.
 	var sidecarErr error
+	isGone := true
 	if err := p.cli.ContainerStop(ctx, name, container.StopOptions{Timeout: &secs}); err != nil {
 		if !isNoSuchContainer(err) {
 			sidecarErr = fmt.Errorf("graceful stop desktop sidecar: %w", err)
+			isGone = false
 		}
 	} else if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{}); err != nil && !isNoSuchContainer(err) {
 		// Not Force: the container is already stopped, so a plain remove suffices
-		// and there is no SIGKILL involved.
+		// and there is no SIGKILL involved. The sidecar IS stopped (ContainerStop
+		// succeeded), so it is gone for egress purposes even if the remove lagged.
 		sidecarErr = fmt.Errorf("remove desktop sidecar: %w", err)
 	}
-	// Tear down the egress proxy too (it holds an endpoint on the per-workspace
-	// net, so it MUST go before NetworkRemove).
+	if !isGone {
+		// Sidecar still running after a failed stop — do NOT sever its egress.
+		return sidecarErr
+	}
+	// Sidecar is down. Tear down the egress proxy (it holds an endpoint on the
+	// per-workspace net, so it MUST go before NetworkRemove) and then the network.
 	p.stopEgressProxy(ctx, workspaceID)
 	// Best-effort: detach the platform, then remove the now-empty per-workspace
 	// network so it doesn't leak. The platform must leave first or NetworkRemove
