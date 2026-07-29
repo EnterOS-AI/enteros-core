@@ -158,10 +158,6 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy requires an absolute-form request URI", http.StatusBadRequest)
 		return
 	}
-	port := r.URL.Port()
-	if port == "" {
-		port = httpPort
-	}
 	host := r.URL.Hostname()
 	ip, err := resolveAllowedIP(host)
 	if err != nil {
@@ -175,7 +171,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			_, port, splitErr := net.SplitHostPort(addr)
 			if splitErr != nil {
-				port = "80"
+				port = httpPort
 			}
 			d := &net.Dialer{Timeout: dialTimeout}
 			return d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
