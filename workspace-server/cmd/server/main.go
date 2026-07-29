@@ -379,9 +379,15 @@ func main() {
 		// as ENABLED yet 502-churn containers with no loud error. Refuse to wire it
 		// (an explicit, safe no-op) and tell the operator WHY, instead of silently
 		// churning. Desktop stays default-on only when the secret is present.
-		desktopSecret := os.Getenv("DISPLAY_SESSION_SIGNING_SECRET")
+		// Single signing root for the whole desktop feature (per-sidecar control
+		// token here + display session/viewer tokens in the handlers). Resolved,
+		// not hand-set: DISPLAY_SESSION_SIGNING_SECRET override → else derived from
+		// SECRETS_ENCRYPTION_KEY (prod boot already requires it) → else the
+		// managed-tenant shared secret. See handlers.DesktopSigningRoot. This is
+		// only "" in a dev env with none of those set.
+		desktopSecret := handlers.DesktopSigningRoot()
 		if desktopSecret == "" {
-			log.Println("Desktop: DISABLED — DISPLAY_SESSION_SIGNING_SECRET is unset, so the per-sidecar control token cannot be derived and every desktop sidecar would fail to boot. Set DISPLAY_SESSION_SIGNING_SECRET to enable computer-use.")
+			log.Println("Desktop: DISABLED — no signing root available (DISPLAY_SESSION_SIGNING_SECRET unset AND SECRETS_ENCRYPTION_KEY / MOLECULE_CP_SHARED_SECRET / PROVISION_SHARED_SECRET all unset), so the per-sidecar control token cannot be derived and every desktop sidecar would fail to boot. In prod SECRETS_ENCRYPTION_KEY is required, so this only trips in a misconfigured dev env.")
 		} else {
 			image := envOr("MOLECULE_DESKTOP_IMAGE", "registry.moleculesai.app/molecule-ai/molecule-desktop:latest")
 			// Optional operator seccomp override (absolute path). Empty → the

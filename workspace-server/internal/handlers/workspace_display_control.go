@@ -403,20 +403,20 @@ func signedDisplaySessionURL(workspaceID, controlledBy string, expiresAt time.Ti
 }
 
 func signDisplaySessionToken(workspaceID, controlledBy string, expiresAt time.Time) string {
-	secret := displaySessionSigningSecret()
-	if secret == "" || workspaceID == "" || controlledBy == "" || expiresAt.IsZero() {
+	key := deriveDisplayKey(workspaceID)
+	if key == nil || controlledBy == "" || expiresAt.IsZero() {
 		return ""
 	}
 	payload := strings.Join([]string{workspaceID, controlledBy, strconv.FormatInt(expiresAt.Unix(), 10)}, "|")
-	mac := hmac.New(sha256.New, []byte(secret))
+	mac := hmac.New(sha256.New, key)
 	_, _ = mac.Write([]byte(payload))
 	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func validateDisplaySessionToken(token, workspaceID, controlledBy string, expiresAt time.Time) bool {
-	secret := displaySessionSigningSecret()
+	key := deriveDisplayKey(workspaceID)
 	parts := strings.Split(token, ".")
-	if secret == "" || len(parts) != 2 || workspaceID == "" || controlledBy == "" || expiresAt.IsZero() || time.Now().After(expiresAt) {
+	if key == nil || len(parts) != 2 || controlledBy == "" || expiresAt.IsZero() || time.Now().After(expiresAt) {
 		return false
 	}
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
@@ -432,13 +432,62 @@ func validateDisplaySessionToken(token, workspaceID, controlledBy string, expire
 	if err != nil {
 		return false
 	}
-	mac := hmac.New(sha256.New, []byte(secret))
+	mac := hmac.New(sha256.New, key)
 	_, _ = mac.Write([]byte(payload))
 	return hmac.Equal(sig, mac.Sum(nil))
 }
 
+// DesktopSigningRoot resolves the root secret for ALL desktop token derivation —
+// the per-sidecar control token (provisioner + gateway's DeriveDesktopControlToken)
+// AND the display session/viewer tokens below. First non-empty wins:
+//
+//  1. DISPLAY_SESSION_SIGNING_SECRET — explicit operator override; a deployment
+//     that already sets it is byte-identical (zero behavior change).
+//  2. a subkey derived from SECRETS_ENCRYPTION_KEY — prod boot ALREADY refuses to
+//     start without this (fail-secure, main.go), so the desktop no longer needs a
+//     dedicated hand-set secret and can't be silently disabled by forgetting one.
+//  3. a subkey derived from MOLECULE_CP_SHARED_SECRET / PROVISION_SHARED_SECRET
+//     (the managed-tenant shared secret) as a further fallback.
+//
+// Returns "" only when NONE is present (a misconfigured dev env) — the same
+// fail-closed "then the desktop stays disabled" contract as before, minus the
+// hand-set-secret footgun. Derivation is HMAC with a domain-separation label, so
+// the desktop key is cryptographically independent of the source secret's other
+// uses (deriving a MAC subkey from a master key is standard KDF practice).
+func DesktopSigningRoot() string {
+	if s := os.Getenv("DISPLAY_SESSION_SIGNING_SECRET"); s != "" {
+		return s
+	}
+	for _, name := range []string{"SECRETS_ENCRYPTION_KEY", "MOLECULE_CP_SHARED_SECRET", "PROVISION_SHARED_SECRET"} {
+		if root := os.Getenv(name); root != "" {
+			mac := hmac.New(sha256.New, []byte(root))
+			_, _ = mac.Write([]byte("molecule-desktop-signing/v1"))
+			return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		}
+	}
+	return ""
+}
+
+// displaySessionSigningSecret reports the resolved desktop signing root (non-empty
+// == signing is configured). Callers that need to sign/verify a specific token use
+// deriveDisplayKey instead, which binds the key to the workspace.
 func displaySessionSigningSecret() string {
-	return os.Getenv("DISPLAY_SESSION_SIGNING_SECRET")
+	return DesktopSigningRoot()
+}
+
+// deriveDisplayKey returns the per-workspace HMAC key for display session/viewer
+// tokens: a distinct subkey of DesktopSigningRoot, domain-separated by purpose and
+// bound to the workspace so one workspace's signing key is independent of
+// another's — mirroring the per-sidecar DeriveDesktopControlToken. Returns nil
+// when signing is unconfigured or workspaceID is empty (callers then fail closed).
+func deriveDisplayKey(workspaceID string) []byte {
+	root := DesktopSigningRoot()
+	if root == "" || workspaceID == "" {
+		return nil
+	}
+	mac := hmac.New(sha256.New, []byte(root))
+	_, _ = mac.Write([]byte("molecule-display-token/v1|" + workspaceID))
+	return mac.Sum(nil)
 }
 
 // View/control split (design §8, review fix): the CONTROL token above binds to
@@ -466,12 +515,12 @@ func signedDisplayViewerURL(workspaceID string) string {
 }
 
 func signDisplayViewerToken(workspaceID string, expiresAt time.Time) string {
-	secret := displaySessionSigningSecret()
-	if secret == "" || workspaceID == "" || expiresAt.IsZero() {
+	key := deriveDisplayKey(workspaceID)
+	if key == nil || expiresAt.IsZero() {
 		return ""
 	}
 	payload := strings.Join([]string{"view", workspaceID, strconv.FormatInt(expiresAt.Unix(), 10)}, "|")
-	mac := hmac.New(sha256.New, []byte(secret))
+	mac := hmac.New(sha256.New, key)
 	_, _ = mac.Write([]byte(payload))
 	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
@@ -481,9 +530,9 @@ func signDisplayViewerToken(workspaceID string, expiresAt time.Time) string {
 // the validator needs NO knowledge of the lock holder or lease. This is what
 // decouples watching from controlling.
 func validateDisplayViewerToken(token, workspaceID string) bool {
-	secret := displaySessionSigningSecret()
+	key := deriveDisplayKey(workspaceID)
 	parts := strings.Split(token, ".")
-	if secret == "" || len(parts) != 2 || workspaceID == "" {
+	if key == nil || len(parts) != 2 {
 		return false
 	}
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
@@ -494,7 +543,7 @@ func validateDisplayViewerToken(token, workspaceID string) bool {
 	if err != nil {
 		return false
 	}
-	mac := hmac.New(sha256.New, []byte(secret))
+	mac := hmac.New(sha256.New, key)
 	_, _ = mac.Write(payloadBytes)
 	if !hmac.Equal(sig, mac.Sum(nil)) {
 		return false

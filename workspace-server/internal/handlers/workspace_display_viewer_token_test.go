@@ -6,6 +6,20 @@ import (
 	"time"
 )
 
+// clearDesktopSigningSources forces DesktopSigningRoot() to resolve to "" no
+// matter the ambient env — necessary because DesktopSigningRoot now falls back to
+// SECRETS_ENCRYPTION_KEY / MOLECULE_CP_SHARED_SECRET / PROVISION_SHARED_SECRET
+// when DISPLAY_SESSION_SIGNING_SECRET is unset, and other tests (e.g.
+// channels_test) set SECRETS_ENCRYPTION_KEY process-wide. Use it to exercise the
+// "signing unconfigured → fail closed" path deterministically.
+func clearDesktopSigningSources(t *testing.T) {
+	t.Helper()
+	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "")
+	t.Setenv("SECRETS_ENCRYPTION_KEY", "")
+	t.Setenv("MOLECULE_CP_SHARED_SECRET", "")
+	t.Setenv("PROVISION_SHARED_SECRET", "")
+}
+
 // TestDisplayViewerURL_MintsAcceptableToken proves the issuance→acceptance loop
 // (reviewer N1): the URL DisplayControl hands out carries a viewer token that the
 // DisplaySession path (validateDisplayViewerToken) accepts, so a non-lock-holder
@@ -23,10 +37,10 @@ func TestDisplayViewerURL_MintsAcceptableToken(t *testing.T) {
 	if validateDisplayViewerToken(tok, "ws-2") {
 		t.Fatal("viewer URL token must not validate for another workspace")
 	}
-	// No secret -> no URL (fail-closed).
-	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "")
+	// No signing root -> no URL (fail-closed).
+	clearDesktopSigningSources(t)
 	if signedDisplayViewerURL("ws-1") != "" {
-		t.Fatal("no secret -> empty viewer URL")
+		t.Fatal("no signing root -> empty viewer URL")
 	}
 }
 
@@ -68,11 +82,11 @@ func TestDisplayViewerToken_Expired(t *testing.T) {
 }
 
 func TestDisplayViewerToken_NoSecret(t *testing.T) {
-	t.Setenv("DISPLAY_SESSION_SIGNING_SECRET", "")
+	clearDesktopSigningSources(t)
 	if signDisplayViewerToken("ws-1", time.Now().Add(time.Minute)) != "" {
-		t.Fatal("no secret -> empty token")
+		t.Fatal("no signing root -> empty token")
 	}
 	if validateDisplayViewerToken("anything", "ws-1") {
-		t.Fatal("no secret -> validation must fail closed")
+		t.Fatal("no signing root -> validation must fail closed")
 	}
 }
