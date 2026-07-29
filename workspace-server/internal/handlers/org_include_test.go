@@ -228,25 +228,33 @@ func TestResolveYAMLIncludes_RealMoleculeDev(t *testing.T) {
 	}
 	expanded, err := resolveYAMLIncludes(data, tmp)
 	if err != nil {
-		// resolveYAMLIncludes fans out to !external sub-templates (e.g.
-		// molecule-dev-department) via nested git fetches. A fetch failure or a
-		// drifted external subtree is an EXTERNAL dependency problem, not a defect
-		// in molecule-core's resolver — which is covered hermetically by the
-		// local-fixture tests above. This is a best-effort integration smoke test
-		// (it already Skips when the outer clone fails / org.yaml is missing), so
-		// skip here too rather than hard-block every molecule-core PR's CI on
-		// external template state. Track a genuinely broken published template in
-		// its own repo.
-		t.Skipf("skipping external-integration check: resolveYAMLIncludes on real org.yaml failed (external template fetch/drift): %v", err)
+		// resolveYAMLIncludes fans out to the !external molecule-dev-department
+		// subtree via a nested git fetch. That external ref (v1.0.0) is
+		// DELIBERATELY HELD in a known-broken state by its owners — see the
+		// SECURITY HOLD note in molecule-ai-org-template-molecule-dev/org.yaml
+		// (molecule-core#4340 channels-without-allowlists; internal#1009 exact-tag
+		// repin gated on an owner-approved release; internal#1008 category_routing
+		// target-resolution). A fetch failure of a held/broken external ref is not
+		// a molecule-core defect. This is a best-effort integration SMOKE test (it
+		// already Skips when the outer clone fails / org.yaml is missing); skip on
+		// the external fetch too rather than hard-block EVERY molecule-core PR's
+		// Platform(Go) gate on an external ref the owners have frozen. IMPORTANT:
+		// molecule-core's resolver + OrgTemplate unmarshal stay HARD-gated by the
+		// hermetic local-fixture tests above (same struct, committed fixtures), so
+		// a real parser regression is still caught — only the live-external
+		// dependency is softened.
+		t.Skipf("skipping live-external org-template smoke (owner-held broken ref molecule-dev-department@v1.0.0; internal#1008/#1009, molecule-core#4340): resolveYAMLIncludes failed: %v", err)
 	}
 	var tmpl OrgTemplate
 	if err := yaml.Unmarshal(expanded, &tmpl); err != nil {
-		// The expanded YAML comes from EXTERNAL published templates; a schema
-		// drift there (e.g. a field that became a map where OrgTemplate expects a
-		// string) is an external-content problem, not a molecule-core parser
-		// regression (the parser is exercised hermetically above). Skip rather
-		// than fail the whole repo's CI — see the resolveYAMLIncludes note above.
-		t.Skipf("skipping external-integration check: expanded real template does not unmarshal (external schema drift): %v", err)
+		// The expanded YAML is composed from the EXTERNAL, owner-held
+		// molecule-dev-department@v1.0.0 subtree (see the resolveYAMLIncludes note
+		// above). Its current broken-held state produces a schema mismatch on
+		// unmarshal. This is external content the owners have frozen, not a
+		// molecule-core parser regression (the parser is hard-gated hermetically
+		// above). Skip rather than fail the whole repo's CI; the real fix lives in
+		// molecule-dev-department#15, gated on internal#1009.
+		t.Skipf("skipping live-external org-template smoke (owner-held broken ref molecule-dev-department@v1.0.0; internal#1008/#1009, molecule-core#4340): expanded template does not unmarshal: %v", err)
 	}
 	// Sanity: should have PM + Marketing Lead + Dev Lead (via !external) at
 	// top. PM's direct children were slimmed in Phase 3d: Dev Lead and its
