@@ -15,9 +15,10 @@ import (
 // --- fakes ---
 
 type fakeProv struct {
-	addr    string
-	starts  int
+	addr     string
+	starts   int
 	startErr error
+	scaledUp bool // reported as DesktopHandle.ScaledUp (the stopped->running edge)
 }
 
 func (f *fakeProv) StartDesktop(context.Context, provisioner.WorkspaceConfig) (provisioner.DesktopHandle, error) {
@@ -25,22 +26,46 @@ func (f *fakeProv) StartDesktop(context.Context, provisioner.WorkspaceConfig) (p
 	if f.startErr != nil {
 		return provisioner.DesktopHandle{}, f.startErr
 	}
-	return provisioner.DesktopHandle{Address: f.addr, Running: true}, nil
+	return provisioner.DesktopHandle{Address: f.addr, Running: true, ScaledUp: f.scaledUp}, nil
 }
-func (f *fakeProv) StopDesktop(context.Context, string) error              { return nil }
-func (f *fakeProv) DesktopRunning(context.Context, string) (bool, error)   { return true, nil }
-func (f *fakeProv) WipeProfile(context.Context, string) error             { return nil }
+func (f *fakeProv) StopDesktop(context.Context, string) error            { return nil }
+func (f *fakeProv) DesktopRunning(context.Context, string) (bool, error) { return true, nil }
+func (f *fakeProv) WipeProfile(context.Context, string) error            { return nil }
 
 type fakeLocks struct {
-	held bool
-	err  error
+	held     bool
+	err      error
+	acquires int
 }
 
-func (f fakeLocks) AcquireAgentControl(context.Context, string) (bool, error) { return f.held, f.err }
+func (f *fakeLocks) AcquireAgentControl(context.Context, string) (bool, error) {
+	f.acquires++
+	return f.held, f.err
+}
 
 type fakeActivity struct{ n int }
 
 func (f *fakeActivity) RecordAgentActivity(context.Context, string) error { f.n++; return nil }
+
+type fakeState struct {
+	states   []string // recorded (successful) states, in call order
+	addrs    []string
+	failNext int // number of leading SetState calls to fail before succeeding
+	attempts int // total SetState calls (including failures)
+	oks      int // successful SetState calls
+}
+
+func (f *fakeState) SetState(_ context.Context, _, state, addr string) error {
+	f.attempts++
+	if f.failNext > 0 {
+		f.failNext--
+		return errors.New("simulated state-write failure")
+	}
+	f.oks++
+	f.states = append(f.states, state)
+	f.addrs = append(f.addrs, addr)
+	return nil
+}
 
 type fakeDoer struct {
 	reqs []*http.Request
@@ -60,11 +85,13 @@ func (f *fakeDoer) Do(r *http.Request) (*http.Response, error) {
 func tokenFn(_ context.Context, _ string) (string, error) { return "sidecar-secret", nil }
 
 // Input must FAIL-CLOSED when the agent does not hold the control lock: no HTTP
-// call, no desktop start (§8).
+// call to the sidecar (§8) AND no scale-up. The control check precedes
+// ensureRunning, so a human-held desktop that was reaped to zero is NOT booted
+// back up just to refuse the input (verified 2026-07-28).
 func TestGateway_Input_FailsClosedWhenAgentLacksControl(t *testing.T) {
 	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusNoContent}
-	g := New(prov, fakeLocks{held: false}, &fakeActivity{}, tokenFn, doer)
+	g := New(prov, &fakeLocks{held: false}, &fakeActivity{}, tokenFn, doer)
 
 	err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`))
 	if !errors.Is(err, ErrHumanInControl) {
@@ -74,7 +101,99 @@ func TestGateway_Input_FailsClosedWhenAgentLacksControl(t *testing.T) {
 		t.Fatalf("must not proxy input when the agent lacks control")
 	}
 	if prov.starts != 0 {
-		t.Fatalf("must not start the desktop when input is refused")
+		t.Fatalf("must NOT scale up the desktop when a human holds control, got %d StartDesktop calls", prov.starts)
+	}
+}
+
+// When the agent holds control but StartDesktop FAILS, Input surfaces that error
+// (as a 5xx-class failure to the route). The lease WAS acquired — that is
+// correct: the agent legitimately holds control and is retrying — and crucially,
+// ensureRunning runs only AFTER the control check, so its failure can never be
+// mistaken for a human-in-control refusal (409). See finding-1 fix (2026-07-28).
+func TestGateway_Input_SurfacesStartFailureAfterAcquiringControl(t *testing.T) {
+	prov := &fakeProv{addr: "wsdesk-abc123:6070", startErr: errors.New("boom")}
+	doer := &fakeDoer{code: http.StatusNoContent}
+	locks := &fakeLocks{held: true}
+	g := New(prov, locks, &fakeActivity{}, tokenFn, doer)
+
+	err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`))
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("want StartDesktop error surfaced, got %v", err)
+	}
+	if errors.Is(err, ErrHumanInControl) {
+		t.Fatalf("a scale-up failure must NOT masquerade as ErrHumanInControl (409), got %v", err)
+	}
+	if len(doer.reqs) != 0 {
+		t.Fatalf("must not proxy input when the desktop failed to start")
+	}
+}
+
+// On a successful scale-up (the stopped->running edge, DesktopHandle.ScaledUp)
+// the gateway records state='running' with the sidecar address exactly once, so
+// the idle sweeper can later find the desktop to reap (§10). It must NOT re-write
+// the state on subsequent already-running forwards (finding-8 fix, 2026-07-28).
+func TestGateway_RecordsRunningStateOnScaleUp(t *testing.T) {
+	prov := &fakeProv{addr: "wsdesk-abc123:6070", scaledUp: true}
+	doer := &fakeDoer{code: http.StatusNoContent}
+	state := &fakeState{}
+	g := New(prov, &fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
+	g.SetStateRecorder(state)
+
+	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
+		t.Fatalf("Input: %v", err)
+	}
+	if len(state.states) != 1 || state.states[0] != "running" {
+		t.Fatalf("want one 'running' state recorded, got %v", state.states)
+	}
+	if state.addrs[0] != "wsdesk-abc123:6070" {
+		t.Fatalf("running state must carry the sidecar address, got %q", state.addrs[0])
+	}
+}
+
+// The gateway must not re-record 'running' on EVERY forward (that was the
+// redundant per-screenshot upsert). It writes at most once per confirmed-running
+// period: the first forward establishes the state (catch-up, so a failed
+// scale-up write can't permanently hide the desktop), and subsequent
+// already-running forwards skip the write (finding-8 fix + round-2 hardening,
+// 2026-07-28). recordActivity still upserts the activity timestamp every call.
+func TestGateway_RecordsRunningStateOnceThenSkips(t *testing.T) {
+	prov := &fakeProv{addr: "wsdesk-abc123:6070", scaledUp: false} // already-running fast path
+	doer := &fakeDoer{code: http.StatusNoContent}
+	state := &fakeState{}
+	g := New(prov, &fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
+	g.SetStateRecorder(state)
+
+	for i := 0; i < 3; i++ {
+		if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
+			t.Fatalf("Input #%d: %v", i, err)
+		}
+	}
+	if len(state.states) != 1 || state.states[0] != "running" {
+		t.Fatalf("want exactly one 'running' write across 3 forwards, got %v", state.states)
+	}
+}
+
+// If the state write FAILS, it must be RETRIED on the next forward rather than
+// swallowed forever — otherwise a single failed write permanently hides the
+// desktop from the idle sweeper (round-2 hardening, 2026-07-28).
+func TestGateway_RetriesStateWriteAfterFailure(t *testing.T) {
+	prov := &fakeProv{addr: "wsdesk-abc123:6070", scaledUp: true}
+	doer := &fakeDoer{code: http.StatusNoContent}
+	state := &fakeState{failNext: 1} // first SetState fails, then succeeds
+	g := New(prov, &fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
+	g.SetStateRecorder(state)
+
+	// First forward: SetState fails (not confirmed) -> still no error to caller.
+	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
+		t.Fatalf("Input #1: %v", err)
+	}
+	// Second forward (already-running, ScaledUp=false): must RETRY because the
+	// first write was never confirmed.
+	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
+		t.Fatalf("Input #2: %v", err)
+	}
+	if state.oks != 1 {
+		t.Fatalf("want the state write retried until one success, got %d successful writes (attempts=%d)", state.oks, state.attempts)
 	}
 }
 
@@ -82,7 +201,7 @@ func TestGateway_Input_ProxiesWhenAgentHoldsControl(t *testing.T) {
 	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusNoContent}
 	act := &fakeActivity{}
-	g := New(prov, fakeLocks{held: true}, act, tokenFn, doer)
+	g := New(prov, &fakeLocks{held: true}, act, tokenFn, doer)
 
 	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
 		t.Fatalf("Input: %v", err)
@@ -112,7 +231,7 @@ func TestGateway_Screenshot_NoLockCheck(t *testing.T) {
 	doer := &fakeDoer{code: http.StatusOK, body: "PNGBYTES"}
 	act := &fakeActivity{}
 	// held:false — but screenshots must still work.
-	g := New(prov, fakeLocks{held: false}, act, tokenFn, doer)
+	g := New(prov, &fakeLocks{held: false}, act, tokenFn, doer)
 
 	png, err := g.Screenshot(context.Background(), "w1")
 	if err != nil {
@@ -133,7 +252,7 @@ func TestGateway_Screenshot_NoLockCheck(t *testing.T) {
 func TestGateway_UnavailableBackendSurfaces(t *testing.T) {
 	prov := provisioner.NewUnavailableSidecarProvisioner()
 	doer := &fakeDoer{code: http.StatusOK}
-	g := New(prov, fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
+	g := New(prov, &fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
 
 	_, err := g.Screenshot(context.Background(), "w1")
 	if !errors.Is(err, provisioner.ErrDesktopBackendUnavailable) {
@@ -145,7 +264,7 @@ func TestGateway_UnavailableBackendSurfaces(t *testing.T) {
 func TestGateway_Input_LockErrorFailsClosed(t *testing.T) {
 	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusNoContent}
-	g := New(prov, fakeLocks{err: errors.New("db down")}, &fakeActivity{}, tokenFn, doer)
+	g := New(prov, &fakeLocks{err: errors.New("db down")}, &fakeActivity{}, tokenFn, doer)
 	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err == nil {
 		t.Fatalf("lock-check error must fail closed (return an error), got nil")
 	}

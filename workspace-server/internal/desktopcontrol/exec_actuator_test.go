@@ -164,6 +164,85 @@ func TestExecActuator_TypeRefusesWhenNoFocus(t *testing.T) {
 	}
 }
 
+func TestExecActuator_Navigate_PrimaryAliveHandsOffFast(t *testing.T) {
+	a, got := newRecordingActuator(t)
+	spawned := false
+	a.spawn = func(string, ...string) error { spawned = true; return nil }
+	if err := a.Navigate(context.Background(), "https://example.com"); err != nil {
+		t.Fatal(err)
+	}
+	// A live primary: exactly the single hand-off invocation, no kiosk relaunch.
+	if len(*got) != 1 {
+		t.Fatalf("healthy hand-off wants 1 cmd, got %d: %+v", len(*got), *got)
+	}
+	if j := joined((*got)[0]); j != "chromium --user-data-dir=/home/desktop/profile https://example.com" {
+		t.Fatalf("hand-off cmd = %q", j)
+	}
+	if spawned {
+		t.Fatal("must NOT relaunch kiosk when the primary is alive")
+	}
+}
+
+func TestExecActuator_Navigate_DeadPrimaryRelaunchesKiosk(t *testing.T) {
+	// Geometry + proxy come from the same env the entrypoint honors.
+	t.Setenv("DESKTOP_WIDTH", "1920")
+	t.Setenv("DESKTOP_HEIGHT", "1080")
+	t.Setenv("DESKTOP_PROXY", "http://egress:8080")
+
+	var spawns []recordedCmd
+	a := &ExecActuator{
+		tmpDir: t.TempDir(),
+		sleep:  func(time.Duration) {},
+		// Simulate a dead primary: the hand-off spawned a new foreground instance
+		// that blocked and got SIGKILLed at the timeout — surfaces as an error.
+		run: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return nil, context.DeadlineExceeded
+		},
+		spawn: func(name string, args ...string) error {
+			spawns = append(spawns, recordedCmd{name: name, args: args})
+			return nil
+		},
+	}
+	if err := a.Navigate(context.Background(), "https://example.com"); err != nil {
+		t.Fatalf("Navigate must self-heal, not error: %v", err)
+	}
+	if len(spawns) != 1 {
+		t.Fatalf("dead primary must trigger exactly one detached relaunch, got %d", len(spawns))
+	}
+	want := "chromium --user-data-dir=/home/desktop/profile --kiosk " +
+		"--force-device-scale-factor=1 --window-position=0,0 --window-size=1920,1080 " +
+		"--no-first-run --no-default-browser-check --proxy-server=http://egress:8080 " +
+		"https://example.com"
+	if j := joined(spawns[0]); j != want {
+		t.Fatalf("kiosk relaunch argv =\n  %q\nwant\n  %q", j, want)
+	}
+}
+
+func TestExecActuator_Navigate_DeadPrimaryDefaultsGeometryNoProxy(t *testing.T) {
+	// No env: geometry falls back to the 1280x800 contract and --proxy-server is
+	// omitted (matching the entrypoint's empty PROXY_ARGS branch).
+	t.Setenv("DESKTOP_WIDTH", "")
+	t.Setenv("DESKTOP_HEIGHT", "")
+	t.Setenv("DESKTOP_PROXY", "")
+
+	var spawns []recordedCmd
+	a := &ExecActuator{
+		tmpDir: t.TempDir(),
+		sleep:  func(time.Duration) {},
+		run:    func(_ context.Context, _ string, _ ...string) ([]byte, error) { return nil, errors.New("dead") },
+		spawn:  func(name string, args ...string) error { spawns = append(spawns, recordedCmd{name, args}); return nil },
+	}
+	if err := a.Navigate(context.Background(), "https://ex.com"); err != nil {
+		t.Fatal(err)
+	}
+	want := "chromium --user-data-dir=/home/desktop/profile --kiosk " +
+		"--force-device-scale-factor=1 --window-position=0,0 --window-size=1280,800 " +
+		"--no-first-run --no-default-browser-check https://ex.com"
+	if j := joined(spawns[0]); j != want {
+		t.Fatalf("default kiosk relaunch argv =\n  %q\nwant\n  %q", j, want)
+	}
+}
+
 func TestExecActuator_DisplayGeometry(t *testing.T) {
 	a := &ExecActuator{
 		run: func(_ context.Context, _ string, _ ...string) ([]byte, error) {

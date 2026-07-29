@@ -13,6 +13,9 @@ func TestIsBlockedIP(t *testing.T) {
 		"192.168.1.1",            // RFC-1918
 		"169.254.169.254",        // cloud metadata
 		"169.254.0.1",            // link-local (docker host gw range)
+		"100.64.0.1",             // RFC-6598 CGNAT lower edge
+		"100.100.100.200",        // Alibaba Cloud metadata (inside 100.64/10)
+		"100.127.255.255",        // RFC-6598 CGNAT upper edge
 		"127.0.0.1",              // loopback
 		"0.0.0.0",                // unspecified
 		"::1",                    // v6 loopback
@@ -36,6 +39,8 @@ func TestIsBlockedIP(t *testing.T) {
 		"93.184.216.34",        // example.com
 		"172.15.0.1",           // just below RFC-1918 172.16/12
 		"172.32.0.1",           // just above RFC-1918 172.16/12
+		"100.63.255.255",       // just below RFC-6598 100.64/10
+		"100.128.0.1",          // just above RFC-6598 100.64/10
 		"2606:4700:4700::1111", // public v6
 	}
 	for _, s := range allowed {
