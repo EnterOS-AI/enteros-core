@@ -35,6 +35,7 @@ type fakeSidecarDocker struct {
 	netsConnected []string // "net|container"
 	netsDisconn   []string // "net|container"
 	running       map[string]bool
+	stopErrs      map[string]error // name -> error ContainerStop returns (fault injection)
 }
 
 func newFakeSidecarDocker() *fakeSidecarDocker {
@@ -78,6 +79,9 @@ func (f *fakeSidecarDocker) ContainerStart(_ context.Context, name string, _ con
 	return nil
 }
 func (f *fakeSidecarDocker) ContainerStop(_ context.Context, name string, _ container.StopOptions) error {
+	if err := f.stopErrs[name]; err != nil {
+		return err
+	}
 	if !f.running[name] {
 		return errors.New("No such container: " + name)
 	}
@@ -293,8 +297,47 @@ func TestLocalSidecar_StartDesktop_Idempotent(t *testing.T) {
 	if !h.Running {
 		t.Fatalf("handle should report running")
 	}
-	if len(f.creates) != 0 {
-		t.Fatalf("idempotent start must not create a second sidecar, got %d creates", len(f.creates))
+	// Idempotent: the already-running sidecar is NOT recreated. (Reconciling the
+	// egress proxy on this path is expected — see the reconcile test below — so we
+	// assert on the sidecar specifically, not on total creates.)
+	if f.createByName(DesktopContainerName(sidecarTestWS)) != nil {
+		t.Fatalf("idempotent start must not recreate the sidecar, got creates=%v", f.creates)
+	}
+}
+
+func TestLocalSidecar_StartDesktop_RunningReconcilesEgressProxy(t *testing.T) {
+	f := newFakeSidecarDocker()
+	name := DesktopContainerName(sidecarTestWS)
+	// Sidecar is up, but its egress proxy has died (RestartPolicy "no") — leaving
+	// the sidecar wedged with no route out.
+	f.running[name] = true
+	const prefix = "wsnet"
+	p := NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 0, "unconfined")
+	p.SetSelfContainerID("platform-xyz")
+
+	h, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS})
+	if err != nil {
+		t.Fatalf("StartDesktop: %v", err)
+	}
+	if !h.Running {
+		t.Fatalf("handle should report running")
+	}
+	// The running sidecar is NOT recreated...
+	if f.createByName(name) != nil {
+		t.Fatalf("running sidecar must not be recreated: creates=%v", f.creates)
+	}
+	// ...but the dead proxy IS recreated and started (the reconcile self-heals egress).
+	proxyName := DesktopProxyContainerName(sidecarTestWS)
+	if f.createByName(proxyName) == nil {
+		t.Fatalf("StartDesktop must recreate the absent egress proxy on the already-running path: creates=%v", f.creates)
+	}
+	if !contains(f.starts, proxyName) {
+		t.Fatalf("recreated egress proxy must be started: starts=%v", f.starts)
+	}
+	// ...and the platform is (idempotently) re-attached to the per-workspace network.
+	wantNet := prefix + "-" + sidecarTestWS
+	if !contains(f.netsConnected, wantNet+"|platform-xyz") {
+		t.Fatalf("platform must be re-attached to the per-workspace network: %v", f.netsConnected)
 	}
 }
 
@@ -319,6 +362,41 @@ func TestLocalSidecar_StopDesktop_GracefulPreservesProfile(t *testing.T) {
 	// The profile volume (cookies / logins) MUST survive a stop.
 	if len(f.volRemoves) != 0 {
 		t.Fatalf("StopDesktop must NOT wipe the profile volume: %v", f.volRemoves)
+	}
+}
+
+func TestLocalSidecar_StopDesktop_CleansUpProxyAndNetworkWhenSidecarStopFails(t *testing.T) {
+	f := newFakeSidecarDocker()
+	name := DesktopContainerName(sidecarTestWS)
+	proxyName := DesktopProxyContainerName(sidecarTestWS)
+	f.running[name] = true
+	f.running[proxyName] = true
+	// Inject a generic (non-'No such container') sidecar stop failure.
+	f.stopErrs = map[string]error{name: errors.New("daemon boom")}
+	const prefix = "wsnet"
+	wantNet := prefix + "-" + sidecarTestWS
+	p := NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 0, "unconfined")
+	p.SetSelfContainerID("platform-xyz")
+
+	err := p.StopDesktop(context.Background(), sidecarTestWS)
+	if err == nil {
+		t.Fatalf("StopDesktop must surface the sidecar stop error")
+	}
+	// Despite the sidecar stop failing, the egress proxy is still stopped + removed
+	// so wsdeskproxy-<id> does not leak.
+	if !contains(f.stops, proxyName) {
+		t.Fatalf("egress proxy must still be stopped when the sidecar stop fails: stops=%v", f.stops)
+	}
+	if _, found := f.removeForce(proxyName); !found {
+		t.Fatalf("egress proxy must still be removed when the sidecar stop fails: removes=%v", f.removes)
+	}
+	// ...and the per-workspace network is still disconnected + removed so it does
+	// not leak either.
+	if !contains(f.netsDisconn, wantNet+"|platform-xyz") {
+		t.Fatalf("platform must still be disconnected from the per-workspace network: %v", f.netsDisconn)
+	}
+	if !contains(f.netsRemoved, wantNet) {
+		t.Fatalf("per-workspace network must still be removed when the sidecar stop fails: %v", f.netsRemoved)
 	}
 }
 

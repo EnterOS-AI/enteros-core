@@ -36,6 +36,15 @@ type ActivityRecorder interface {
 	RecordAgentActivity(ctx context.Context, workspaceID string) error
 }
 
+// StateRecorder persists the desktop lifecycle state so scale-to-zero can FIND
+// running desktops to evaluate for teardown (§10). Optional / nil-safe: when
+// unset, ensureRunning simply never records 'running', and the idle sweeper has
+// nothing to reap. Wired via SetStateRecorder rather than the constructor so
+// existing callers stay source-compatible.
+type StateRecorder interface {
+	SetState(ctx context.Context, workspaceID, state, sidecarAddress string) error
+}
+
 // TokenResolver returns the per-sidecar inbound bearer for a workspace (§6.5).
 type TokenResolver func(ctx context.Context, workspaceID string) (string, error)
 
@@ -53,6 +62,7 @@ type Gateway struct {
 	prov     provisioner.SidecarProvisioner
 	locks    LockChecker
 	activity ActivityRecorder
+	state    StateRecorder // optional; nil disables 'running' state recording
 	http     httpDoer
 	token    TokenResolver
 }
@@ -64,6 +74,11 @@ func New(prov provisioner.SidecarProvisioner, locks LockChecker, activity Activi
 	}
 	return &Gateway{prov: prov, locks: locks, activity: activity, http: doer, token: token}
 }
+
+// SetStateRecorder wires the optional lifecycle-state setter used to mark a
+// desktop 'running' on scale-up, so the idle sweeper can later find and reap it
+// (§10). Nil-safe: leaving it unset just disables state recording.
+func (g *Gateway) SetStateRecorder(s StateRecorder) { g.state = s }
 
 // Screenshot proxies GET /screenshot. Sight is NEVER arbitrated (§8): the agent
 // can always see, even while a human drives. Scale-from-zero on first use;
@@ -93,16 +108,21 @@ func (g *Gateway) Screenshot(ctx context.Context, workspaceID string) ([]byte, e
 // acquires/refreshes its control lease (yielding to a human who has preempted),
 // or the input is refused with ErrHumanInControl.
 func (g *Gateway) Input(ctx context.Context, workspaceID string, action json.RawMessage) error {
+	// Confirm the desktop is up (and get its address) BEFORE touching the
+	// control lock: AcquireAgentControl is a DB upsert that writes a 300s agent
+	// lease, so acquiring it first would leave a stale 'agent in control' lock —
+	// and burn a DB write per failing input — whenever StartDesktop fails. On any
+	// scale-up failure we return before persisting any arbitration state.
+	addr, err := g.ensureRunning(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
 	held, err := g.locks.AcquireAgentControl(ctx, workspaceID)
 	if err != nil {
 		return err // ambiguity -> fail closed (deny)
 	}
 	if !held {
 		return ErrHumanInControl
-	}
-	addr, err := g.ensureRunning(ctx, workspaceID)
-	if err != nil {
-		return err
 	}
 	g.recordActivity(ctx, workspaceID)
 	req, err := g.newReq(ctx, workspaceID, http.MethodPost, addr, "/input", bytes.NewReader(action))
@@ -140,6 +160,12 @@ func (g *Gateway) ensureRunning(ctx context.Context, workspaceID string) (string
 	// at the cloud metadata IP, a backend service, or an arbitrary host.
 	if err := provisioner.ValidateSidecarTarget(h.Address); err != nil {
 		return "", fmt.Errorf("refusing to forward to an invalid desktop target: %w", err)
+	}
+	// Record 'running' so scale-to-zero can find this desktop to evaluate for
+	// teardown (§10). Best-effort: a state-write failure must not fail the op the
+	// caller actually asked for, and the setter is optional (nil-safe).
+	if g.state != nil {
+		_ = g.state.SetState(ctx, workspaceID, "running", h.Address)
 	}
 	return h.Address, nil
 }

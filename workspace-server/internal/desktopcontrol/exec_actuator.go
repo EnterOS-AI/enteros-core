@@ -20,12 +20,26 @@ func execRunner(ctx context.Context, name string, args ...string) ([]byte, error
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
+// detachedSpawner starts an external command in a new session and returns
+// immediately WITHOUT waiting for it to exit. Injectable so the kiosk-relaunch
+// argument construction is unit-testable without a real chromium or X display.
+type detachedSpawner func(name string, args ...string) error
+
+// spawnDetached launches name via setsid(1) so the child runs in a NEW session,
+// detached from the control server's process group (a graceful SIGTERM to the
+// server won't reap it, §10) and outliving the request goroutine. It returns as
+// soon as the process is started — it never blocks on the browser staying up.
+func spawnDetached(name string, args ...string) error {
+	return exec.Command("setsid", append([]string{name}, args...)...).Start()
+}
+
 // ExecActuator drives the real X display: scrot for screenshots (a direct
 // framebuffer grab — NOT through VNC, so the agent's eyes are lossless; VNC is
 // for humans, design §9) and xdotool for input. It targets the sidecar's single
 // fixed display via the DISPLAY env the process inherits.
 type ExecActuator struct {
 	run          commandRunner
+	spawn        detachedSpawner
 	tmpDir       string
 	sleep        func(time.Duration)
 	moveSettleMs int
@@ -35,6 +49,7 @@ type ExecActuator struct {
 func NewExecActuator() *ExecActuator {
 	return &ExecActuator{
 		run:          execRunner,
+		spawn:        spawnDetached,
 		tmpDir:       os.TempDir(),
 		sleep:        time.Sleep,
 		moveSettleMs: 40, // §9: let hover/focus handlers fire between move and click
@@ -178,18 +193,66 @@ const desktopProfileDir = "/home/desktop/profile"
 // window, then this invocation exits (verified 2026-07-27). --kiosk hides the
 // omnibox so keyboard navigation is unavailable; this is the open_url path.
 func (a *ExecActuator) Navigate(ctx context.Context, url string) error {
-	// Bound the hand-off (reviewer nit): a healthy running kiosk instance accepts
-	// the URL and this invocation exits in well under a second. If the primary
-	// instance has died, `chromium <url>` would instead spawn a NEW foreground
-	// (non-kiosk) instance that blocks until the browser exits — hanging the
-	// request goroutine on a request context that may have no deadline. Cap it so
-	// a dead primary fails fast (the platform re-provisions) instead of hanging.
+	// Bound the hand-off: a healthy running kiosk instance accepts the URL and
+	// this invocation exits in well under a second. If the primary instance has
+	// died (crash/OOM) while the sidecar stays up, `chromium <url>` does NOT
+	// forward — it becomes a NEW foreground (non-kiosk) instance that blocks until
+	// the browser exits. The timeout SIGKILLs that blocked spawn so a dead primary
+	// fails fast instead of hanging the request goroutine.
 	nctx, cancel := context.WithTimeout(ctx, desktopNavigateTimeout)
 	defer cancel()
-	if _, err := a.run(nctx, "chromium", "--user-data-dir="+desktopProfileDir, url); err != nil {
-		return fmt.Errorf("chromium navigate: %w", err)
+	if _, err := a.run(nctx, "chromium", "--user-data-dir="+desktopProfileDir, url); err == nil {
+		// Primary alive: the hand-off forwarded the URL to the pinned kiosk window
+		// and exited. This is the common, fast path.
+		return nil
+	}
+	// Hand-off failed: the kiosk primary is gone, so nothing received the URL and
+	// the transient foreground instance we accidentally spawned was just killed.
+	// Self-heal by relaunching the kiosk instance ourselves — same flags the
+	// entrypoint uses, pointed at the target URL — detached so it outlives this
+	// request (not tied to ctx) and restores the pinned kiosk window. Without this
+	// open_url would stay permanently broken for the desktop after a browser crash.
+	if err := a.spawn("chromium", kioskRelaunchArgs(url)...); err != nil {
+		return fmt.Errorf("chromium kiosk relaunch: %w", err)
 	}
 	return nil
+}
+
+// kioskRelaunchArgs builds the chromium argv for restoring a dead kiosk primary,
+// mirroring the sidecar entrypoint: the same profile dir (so it is the single
+// instance), --kiosk to pin the window to the full fixed screen, DPR=1, geometry
+// from DESKTOP_WIDTH/HEIGHT (default 1280x800), and the egress --proxy-server
+// from DESKTOP_PROXY when set. The target URL is passed last as the start page.
+func kioskRelaunchArgs(url string) []string {
+	w, h := desktopGeometry()
+	args := []string{
+		"--user-data-dir=" + desktopProfileDir,
+		"--kiosk",
+		"--force-device-scale-factor=1",
+		"--window-position=0,0",
+		fmt.Sprintf("--window-size=%d,%d", w, h),
+		"--no-first-run",
+		"--no-default-browser-check",
+	}
+	if proxy := os.Getenv("DESKTOP_PROXY"); proxy != "" {
+		args = append(args, "--proxy-server="+proxy)
+	}
+	return append(args, url)
+}
+
+// desktopGeometry reads the pinned resolution from the same env the entrypoint
+// honors, defaulting to the 1280x800 coordinate contract when unset/invalid.
+func desktopGeometry() (width, height int) {
+	return envInt("DESKTOP_WIDTH", 1280), envInt("DESKTOP_HEIGHT", 800)
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
 }
 
 // desktopNavigateTimeout caps a single navigate hand-off. Far longer than a

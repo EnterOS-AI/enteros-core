@@ -26,6 +26,23 @@ import (
 
 const dialTimeout = 15 * time.Second
 
+// httpsPort / httpPort are the ONLY destination ports the proxy will reach. It
+// exists to permit web browsing, not to be a general TCP relay, so CONNECT
+// tunnels are limited to HTTPS (443) and plain-HTTP proxying to 80. A
+// compromised sidecar therefore cannot tunnel to SSH/SMTP or an arbitrary C2
+// port even though the destination IP is a public one.
+const (
+	httpsPort = "443"
+	httpPort  = "80"
+)
+
+// connectPortAllowed reports whether a CONNECT tunnel to port is permitted.
+func connectPortAllowed(port string) bool { return port == httpsPort }
+
+// httpPortAllowed reports whether a plain-HTTP proxied request to port is
+// permitted.
+func httpPortAllowed(port string) bool { return port == httpPort }
+
 func main() {
 	addr := os.Getenv("DESKTOP_PROXY_ADDR")
 	if addr == "" {
@@ -53,7 +70,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 func handleConnect(w http.ResponseWriter, r *http.Request) {
 	host, port, err := net.SplitHostPort(r.Host)
 	if err != nil {
-		host, port = r.Host, "443"
+		host, port = r.Host, httpsPort
+	}
+	if !connectPortAllowed(port) {
+		log.Printf("DENY CONNECT %s: port %s not permitted (only %s)", r.Host, port, httpsPort)
+		http.Error(w, "destination port not permitted", http.StatusForbidden)
+		return
 	}
 	ip, err := resolveAllowedIP(host)
 	if err != nil {
@@ -81,10 +103,36 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		return
 	}
-	// Pipe both directions until either side closes.
+	tunnel(r.Context(), client, upstream)
+}
+
+// tunnel bidirectionally copies between the client and upstream connections
+// until BOTH directions have finished. When one direction's reader hits EOF it
+// half-closes the peer's write end (CloseWrite) so the peer sees EOF without the
+// other direction being torn down — this is what stops a large upload still
+// draining after the download completes from being truncated (the previous
+// single-<-done teardown closed both sockets the instant the first copy
+// finished). The request context is bound so a client disconnect force-closes
+// both ends and neither goroutine can block forever on a peer that never sends
+// EOF.
+func tunnel(ctx context.Context, client, upstream net.Conn) {
+	type closeWriter interface{ CloseWrite() error }
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
+	pipe := func(dst, src net.Conn) {
+		_, _ = io.Copy(dst, src)
+		if cw, ok := dst.(closeWriter); ok {
+			_ = cw.CloseWrite() // signal EOF to the peer, keep its reader alive
+		}
+		done <- struct{}{}
+	}
+	go func() {
+		<-ctx.Done()
+		client.Close()
+		upstream.Close()
+	}()
+	go pipe(upstream, client)
+	go pipe(client, upstream)
+	<-done
 	<-done
 }
 
@@ -100,6 +148,15 @@ var hopByHopHeaders = []string{
 func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if !r.URL.IsAbs() || r.URL.Host == "" {
 		http.Error(w, "proxy requires an absolute-form request URI", http.StatusBadRequest)
+		return
+	}
+	port := r.URL.Port()
+	if port == "" {
+		port = httpPort
+	}
+	if !httpPortAllowed(port) {
+		log.Printf("DENY %s %s: port %s not permitted (only %s)", r.Method, r.URL, port, httpPort)
+		http.Error(w, "destination port not permitted", http.StatusForbidden)
 		return
 	}
 	host := r.URL.Hostname()

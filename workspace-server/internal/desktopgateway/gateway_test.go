@@ -15,8 +15,8 @@ import (
 // --- fakes ---
 
 type fakeProv struct {
-	addr    string
-	starts  int
+	addr     string
+	starts   int
 	startErr error
 }
 
@@ -27,20 +27,35 @@ func (f *fakeProv) StartDesktop(context.Context, provisioner.WorkspaceConfig) (p
 	}
 	return provisioner.DesktopHandle{Address: f.addr, Running: true}, nil
 }
-func (f *fakeProv) StopDesktop(context.Context, string) error              { return nil }
-func (f *fakeProv) DesktopRunning(context.Context, string) (bool, error)   { return true, nil }
-func (f *fakeProv) WipeProfile(context.Context, string) error             { return nil }
+func (f *fakeProv) StopDesktop(context.Context, string) error            { return nil }
+func (f *fakeProv) DesktopRunning(context.Context, string) (bool, error) { return true, nil }
+func (f *fakeProv) WipeProfile(context.Context, string) error            { return nil }
 
 type fakeLocks struct {
-	held bool
-	err  error
+	held     bool
+	err      error
+	acquires int
 }
 
-func (f fakeLocks) AcquireAgentControl(context.Context, string) (bool, error) { return f.held, f.err }
+func (f *fakeLocks) AcquireAgentControl(context.Context, string) (bool, error) {
+	f.acquires++
+	return f.held, f.err
+}
 
 type fakeActivity struct{ n int }
 
 func (f *fakeActivity) RecordAgentActivity(context.Context, string) error { f.n++; return nil }
+
+type fakeState struct {
+	states []string // recorded states, in call order
+	addrs  []string
+}
+
+func (f *fakeState) SetState(_ context.Context, _, state, addr string) error {
+	f.states = append(f.states, state)
+	f.addrs = append(f.addrs, addr)
+	return nil
+}
 
 type fakeDoer struct {
 	reqs []*http.Request
@@ -60,11 +75,13 @@ func (f *fakeDoer) Do(r *http.Request) (*http.Response, error) {
 func tokenFn(_ context.Context, _ string) (string, error) { return "sidecar-secret", nil }
 
 // Input must FAIL-CLOSED when the agent does not hold the control lock: no HTTP
-// call, no desktop start (§8).
+// call to the sidecar (§8). The desktop MAY have been confirmed up first
+// (ensureRunning precedes the lock check now), which is a cheap idempotent no-op
+// — but no /input is ever proxied while a human holds control.
 func TestGateway_Input_FailsClosedWhenAgentLacksControl(t *testing.T) {
 	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusNoContent}
-	g := New(prov, fakeLocks{held: false}, &fakeActivity{}, tokenFn, doer)
+	g := New(prov, &fakeLocks{held: false}, &fakeActivity{}, tokenFn, doer)
 
 	err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`))
 	if !errors.Is(err, ErrHumanInControl) {
@@ -73,8 +90,47 @@ func TestGateway_Input_FailsClosedWhenAgentLacksControl(t *testing.T) {
 	if len(doer.reqs) != 0 {
 		t.Fatalf("must not proxy input when the agent lacks control")
 	}
-	if prov.starts != 0 {
-		t.Fatalf("must not start the desktop when input is refused")
+}
+
+// When StartDesktop FAILS, Input must return the error WITHOUT acquiring the
+// agent control lease — otherwise every failing input burns a DB write and
+// leaves a stale 'agent in control' lock (reviewer finding: ensureRunning must
+// precede AcquireAgentControl).
+func TestGateway_Input_StartFailureSkipsControlAcquire(t *testing.T) {
+	prov := &fakeProv{addr: "wsdesk-abc123:6070", startErr: errors.New("boom")}
+	doer := &fakeDoer{code: http.StatusNoContent}
+	locks := &fakeLocks{held: true}
+	g := New(prov, locks, &fakeActivity{}, tokenFn, doer)
+
+	err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`))
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("want StartDesktop error surfaced, got %v", err)
+	}
+	if locks.acquires != 0 {
+		t.Fatalf("must NOT acquire agent control when the desktop failed to start, got %d acquires", locks.acquires)
+	}
+	if len(doer.reqs) != 0 {
+		t.Fatalf("must not proxy input when the desktop failed to start")
+	}
+}
+
+// On a successful scale-up the gateway records state='running' with the sidecar
+// address, so the idle sweeper can later find the desktop to reap (§10).
+func TestGateway_RecordsRunningStateOnScaleUp(t *testing.T) {
+	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
+	doer := &fakeDoer{code: http.StatusNoContent}
+	state := &fakeState{}
+	g := New(prov, &fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
+	g.SetStateRecorder(state)
+
+	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
+		t.Fatalf("Input: %v", err)
+	}
+	if len(state.states) != 1 || state.states[0] != "running" {
+		t.Fatalf("want one 'running' state recorded, got %v", state.states)
+	}
+	if state.addrs[0] != "wsdesk-abc123:6070" {
+		t.Fatalf("running state must carry the sidecar address, got %q", state.addrs[0])
 	}
 }
 
@@ -82,7 +138,7 @@ func TestGateway_Input_ProxiesWhenAgentHoldsControl(t *testing.T) {
 	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusNoContent}
 	act := &fakeActivity{}
-	g := New(prov, fakeLocks{held: true}, act, tokenFn, doer)
+	g := New(prov, &fakeLocks{held: true}, act, tokenFn, doer)
 
 	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
 		t.Fatalf("Input: %v", err)
@@ -112,7 +168,7 @@ func TestGateway_Screenshot_NoLockCheck(t *testing.T) {
 	doer := &fakeDoer{code: http.StatusOK, body: "PNGBYTES"}
 	act := &fakeActivity{}
 	// held:false — but screenshots must still work.
-	g := New(prov, fakeLocks{held: false}, act, tokenFn, doer)
+	g := New(prov, &fakeLocks{held: false}, act, tokenFn, doer)
 
 	png, err := g.Screenshot(context.Background(), "w1")
 	if err != nil {
@@ -133,7 +189,7 @@ func TestGateway_Screenshot_NoLockCheck(t *testing.T) {
 func TestGateway_UnavailableBackendSurfaces(t *testing.T) {
 	prov := provisioner.NewUnavailableSidecarProvisioner()
 	doer := &fakeDoer{code: http.StatusOK}
-	g := New(prov, fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
+	g := New(prov, &fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
 
 	_, err := g.Screenshot(context.Background(), "w1")
 	if !errors.Is(err, provisioner.ErrDesktopBackendUnavailable) {
@@ -145,7 +201,7 @@ func TestGateway_UnavailableBackendSurfaces(t *testing.T) {
 func TestGateway_Input_LockErrorFailsClosed(t *testing.T) {
 	prov := &fakeProv{addr: "wsdesk-abc123:6070"}
 	doer := &fakeDoer{code: http.StatusNoContent}
-	g := New(prov, fakeLocks{err: errors.New("db down")}, &fakeActivity{}, tokenFn, doer)
+	g := New(prov, &fakeLocks{err: errors.New("db down")}, &fakeActivity{}, tokenFn, doer)
 	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err == nil {
 		t.Fatalf("lock-check error must fail closed (return an error), got nil")
 	}
