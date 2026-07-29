@@ -58,6 +58,14 @@ func (h *WorkspaceHandler) DesktopScreenshot(c *gin.Context) {
 // group as screenshot/input) so the agent can call it directly; it reads only
 // the lock, never touches the sidecar, so it works regardless of scale state.
 func (h *WorkspaceHandler) DesktopControlStatus(c *gin.Context) {
+	if h.desktopGateway == nil {
+		// Mirror DesktopScreenshot/DesktopInput: when the feature is unavailable
+		// the status endpoint must agree with /input (503) instead of claiming the
+		// agent can drive — otherwise desktop_wait_for_control believes it may
+		// control and every subsequent /input returns 503.
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "desktop not available"})
+		return
+	}
 	lock, found, err := h.loadActiveDisplayControl(c, c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load display control"})

@@ -202,6 +202,23 @@ func (p *LocalSidecarProvisioner) handle(workspaceID string, running bool) Deskt
 // agent's first tool call and a human opening the display can race, §10).
 func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg WorkspaceConfig) (DesktopHandle, error) {
 	if running, _ := p.DesktopRunning(ctx, cfg.WorkspaceID); running {
+		// Even on the already-running fast path, RECONCILE the egress plumbing
+		// before returning: the egress proxy is RestartPolicy "no", so it can die
+		// while the sidecar keeps running, and the platform's network attachment
+		// can be lost — either leaves the sidecar wedged with no route out. Both
+		// operations are idempotent and cheap (ensureEgressProxy recreates a dead
+		// proxy; NetworkConnect is isAlreadyConnected-guarded), so a re-called
+		// StartDesktop self-heals the egress path instead of shortcutting past it.
+		if net := p.perWorkspaceNetwork(cfg.WorkspaceID); net != "" {
+			if err := p.ensureEgressProxy(ctx, cfg.WorkspaceID, net); err != nil {
+				return DesktopHandle{}, err
+			}
+			if p.selfContainerID != "" {
+				if err := p.cli.NetworkConnect(ctx, net, p.selfContainerID, nil); err != nil && !isAlreadyConnected(err) {
+					return DesktopHandle{}, fmt.Errorf("attach platform to per-workspace network: %w", err)
+				}
+			}
+		}
 		return p.handle(cfg.WorkspaceID, true), nil
 	}
 
@@ -394,16 +411,19 @@ func (p *LocalSidecarProvisioner) stopEgressProxy(ctx context.Context, workspace
 func (p *LocalSidecarProvisioner) StopDesktop(ctx context.Context, workspaceID string) error {
 	name := DesktopContainerName(workspaceID)
 	secs := int(p.stopTimeout.Seconds())
+	// Capture (do NOT early-return on) the sidecar stop/remove error: the egress
+	// proxy + per-workspace network must still be torn down even when the sidecar
+	// stop fails, or wsdeskproxy-<id> and the per-workspace network leak. Run the
+	// proxy/network cleanup below unconditionally, then surface the captured error.
+	var sidecarErr error
 	if err := p.cli.ContainerStop(ctx, name, container.StopOptions{Timeout: &secs}); err != nil {
-		if isNoSuchContainer(err) {
-			return nil
+		if !isNoSuchContainer(err) {
+			sidecarErr = fmt.Errorf("graceful stop desktop sidecar: %w", err)
 		}
-		return fmt.Errorf("graceful stop desktop sidecar: %w", err)
-	}
-	// Not Force: the container is already stopped, so a plain remove suffices
-	// and there is no SIGKILL involved.
-	if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{}); err != nil && !isNoSuchContainer(err) {
-		return fmt.Errorf("remove desktop sidecar: %w", err)
+	} else if err := p.cli.ContainerRemove(ctx, name, container.RemoveOptions{}); err != nil && !isNoSuchContainer(err) {
+		// Not Force: the container is already stopped, so a plain remove suffices
+		// and there is no SIGKILL involved.
+		sidecarErr = fmt.Errorf("remove desktop sidecar: %w", err)
 	}
 	// Tear down the egress proxy too (it holds an endpoint on the per-workspace
 	// net, so it MUST go before NetworkRemove).
@@ -422,7 +442,7 @@ func (p *LocalSidecarProvisioner) StopDesktop(ctx context.Context, workspaceID s
 			_ = err
 		}
 	}
-	return nil
+	return sidecarErr
 }
 
 // DesktopRunning reports whether the sidecar container is currently up.

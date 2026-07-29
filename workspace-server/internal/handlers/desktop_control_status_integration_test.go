@@ -54,6 +54,10 @@ func TestDesktopControlStatus_Integration(t *testing.T) {
 	}
 
 	h := &WorkspaceHandler{}
+	// DesktopControlStatus now 503s when the feature is unavailable (nil gateway),
+	// so wire a stub gateway to exercise the enabled/200 path — the status endpoint
+	// itself reads only the lock via the package-global DB, never the gateway.
+	h.SetDesktopGateway(&fakeDesktopGW{})
 	call := func() (humanInControl, agentCanControl bool) {
 		gin.SetMode(gin.TestMode)
 		w := httptest.NewRecorder()

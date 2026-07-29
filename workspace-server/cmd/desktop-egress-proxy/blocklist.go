@@ -5,10 +5,17 @@ import (
 	"net"
 )
 
+// sharedAddressSpace is the RFC 6598 carrier-grade-NAT range 100.64.0.0/10.
+// net.IP.IsPrivate() does NOT cover it, yet some clouds host their metadata
+// service inside it (Alibaba Cloud's is 100.100.100.200), so it must be blocked
+// here too or those credentials stay reachable.
+var _, sharedAddressSpace, _ = net.ParseCIDR("100.64.0.0/10")
+
 // isBlockedIP reports whether an IP must NOT be reachable through the desktop
 // egress proxy. It blocks everything that is not a globally-routable public
 // address: RFC-1918 private ranges (10/8, 172.16/12, 192.168/16, fc00::/7),
-// link-local (169.254/16 + fe80::/10 — this is the cloud metadata IP
+// RFC-6598 shared address space (100.64/10 — CGNAT, hosts some cloud metadata
+// services), link-local (169.254/16 + fe80::/10 — this is the cloud metadata IP
 // 169.254.169.254 AND the Docker host gateway), loopback, unspecified, and
 // multicast. This is the enforcement point that makes the desktop sidecar's
 // isolation structural: the sidecar sits on an internal Docker network with no
@@ -20,6 +27,7 @@ func isBlockedIP(ip net.IP) bool {
 	if ip == nil ||
 		ip.IsLoopback() ||
 		ip.IsPrivate() || // 10/8, 172.16/12, 192.168/16, fc00::/7
+		sharedAddressSpace.Contains(ip) || // 100.64/10 (RFC 6598 CGNAT)
 		ip.IsLinkLocalUnicast() || // 169.254/16 (metadata + host gw), fe80::/10
 		ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() ||

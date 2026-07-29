@@ -45,6 +45,18 @@ func TestDesktopRoute_UnavailableWhenNoGateway(t *testing.T) {
 	}
 }
 
+// GET /desktop/control with no gateway must return 503 so the status endpoint
+// agrees with /input — otherwise desktop_wait_for_control thinks it may drive
+// but every /input POST gets 503 (§8).
+func TestDesktopRoute_ControlStatusUnavailableWhenNoGateway(t *testing.T) {
+	h := &WorkspaceHandler{}
+	c, w := newDesktopReq("GET", "/desktop/control", "")
+	h.DesktopControlStatus(c)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no gateway: want 503, got %d", w.Code)
+	}
+}
+
 func TestDesktopRoute_Screenshot(t *testing.T) {
 	h := &WorkspaceHandler{}
 	h.SetDesktopGateway(&fakeDesktopGW{png: []byte("PNG")})
