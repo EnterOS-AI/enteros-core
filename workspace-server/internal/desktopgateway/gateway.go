@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
@@ -65,6 +66,15 @@ type Gateway struct {
 	state    StateRecorder // optional; nil disables 'running' state recording
 	http     httpDoer
 	token    TokenResolver
+
+	// recordedMu guards recordedRunning: the set of workspaces whose 'running'
+	// lifecycle state we have CONFIRMED-persisted this process. It lets
+	// ensureRunning skip the DB write on steady-state forwards (already recorded)
+	// while still retrying until the write succeeds — so a single failed
+	// best-effort write on the scale-up edge can't permanently hide the desktop
+	// from the idle sweeper (it would never be reaped otherwise).
+	recordedMu      sync.Mutex
+	recordedRunning map[string]struct{}
 }
 
 // New builds the gateway. doer defaults to http.DefaultClient when nil.
@@ -72,7 +82,7 @@ func New(prov provisioner.SidecarProvisioner, locks LockChecker, activity Activi
 	if doer == nil {
 		doer = http.DefaultClient
 	}
-	return &Gateway{prov: prov, locks: locks, activity: activity, http: doer, token: token}
+	return &Gateway{prov: prov, locks: locks, activity: activity, http: doer, token: token, recordedRunning: make(map[string]struct{})}
 }
 
 // SetStateRecorder wires the optional lifecycle-state setter used to mark a
@@ -108,21 +118,25 @@ func (g *Gateway) Screenshot(ctx context.Context, workspaceID string) ([]byte, e
 // acquires/refreshes its control lease (yielding to a human who has preempted),
 // or the input is refused with ErrHumanInControl.
 func (g *Gateway) Input(ctx context.Context, workspaceID string, action json.RawMessage) error {
-	// Confirm the desktop is up (and get its address) BEFORE touching the
-	// control lock: AcquireAgentControl is a DB upsert that writes a 300s agent
-	// lease, so acquiring it first would leave a stale 'agent in control' lock —
-	// and burn a DB write per failing input — whenever StartDesktop fails. On any
-	// scale-up failure we return before persisting any arbitration state.
-	addr, err := g.ensureRunning(ctx, workspaceID)
-	if err != nil {
-		return err
-	}
+	// Check the control lock FIRST, before any scale-up. AcquireAgentControl
+	// returns held=false when a human holds control; in that case we must refuse
+	// with ErrHumanInControl (-> 409) WITHOUT booting the desktop. Doing
+	// ensureRunning first would scale a reaped 2GB sidecar back from zero just to
+	// refuse the input, and would surface a scale-up/egress error as a 5xx
+	// "input failed" instead of the correct 409 "human in control" — misleading a
+	// client that pauses on 409 but retries on 5xx (verified 2026-07-28). When the
+	// agent legitimately holds control (held=true) the lease write is warranted,
+	// and only then do we ensure the desktop is up.
 	held, err := g.locks.AcquireAgentControl(ctx, workspaceID)
 	if err != nil {
 		return err // ambiguity -> fail closed (deny)
 	}
 	if !held {
 		return ErrHumanInControl
+	}
+	addr, err := g.ensureRunning(ctx, workspaceID)
+	if err != nil {
+		return err
 	}
 	g.recordActivity(ctx, workspaceID)
 	req, err := g.newReq(ctx, workspaceID, http.MethodPost, addr, "/input", bytes.NewReader(action))
@@ -162,10 +176,26 @@ func (g *Gateway) ensureRunning(ctx context.Context, workspaceID string) (string
 		return "", fmt.Errorf("refusing to forward to an invalid desktop target: %w", err)
 	}
 	// Record 'running' so scale-to-zero can find this desktop to evaluate for
-	// teardown (§10). Best-effort: a state-write failure must not fail the op the
-	// caller actually asked for, and the setter is optional (nil-safe).
+	// teardown (§10) — but avoid the per-forward DB write that re-upserted the
+	// unchanged state on every screenshot/input. Write when EITHER this call scaled
+	// the desktop up (h.ScaledUp) OR we have not yet confirmed the 'running' state
+	// is persisted (a prior best-effort write failed, or this is the first forward
+	// after a process restart). In steady state (already recorded) this is a no-op.
+	// Best-effort: a write failure must not fail the op the caller asked for and is
+	// simply retried on the next forward — crucially, a single failed transition
+	// write can no longer permanently hide the desktop from the sweeper (which
+	// would otherwise never reap the 2GB sidecar). The setter is optional (nil-safe).
 	if g.state != nil {
-		_ = g.state.SetState(ctx, workspaceID, "running", h.Address)
+		g.recordedMu.Lock()
+		_, recorded := g.recordedRunning[workspaceID]
+		g.recordedMu.Unlock()
+		if h.ScaledUp || !recorded {
+			if err := g.state.SetState(ctx, workspaceID, "running", h.Address); err == nil {
+				g.recordedMu.Lock()
+				g.recordedRunning[workspaceID] = struct{}{}
+				g.recordedMu.Unlock()
+			}
+		}
 	}
 	return h.Address, nil
 }

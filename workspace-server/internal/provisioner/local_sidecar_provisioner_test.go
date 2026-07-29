@@ -365,7 +365,12 @@ func TestLocalSidecar_StopDesktop_GracefulPreservesProfile(t *testing.T) {
 	}
 }
 
-func TestLocalSidecar_StopDesktop_CleansUpProxyAndNetworkWhenSidecarStopFails(t *testing.T) {
+// When the sidecar stop FAILS (container still running), StopDesktop must NOT
+// sever that live sidecar's egress: tearing down its proxy + network would strand
+// a running sidecar with no route out and leak a network NetworkRemove can't drop
+// while the sidecar endpoint remains. It surfaces the error and leaves the
+// plumbing for the caller's retry / a later sweep (finding-5 fix, 2026-07-28).
+func TestLocalSidecar_StopDesktop_LeavesProxyAndNetworkWhenSidecarStopFails(t *testing.T) {
 	f := newFakeSidecarDocker()
 	name := DesktopContainerName(sidecarTestWS)
 	proxyName := DesktopProxyContainerName(sidecarTestWS)
@@ -382,21 +387,47 @@ func TestLocalSidecar_StopDesktop_CleansUpProxyAndNetworkWhenSidecarStopFails(t 
 	if err == nil {
 		t.Fatalf("StopDesktop must surface the sidecar stop error")
 	}
-	// Despite the sidecar stop failing, the egress proxy is still stopped + removed
-	// so wsdeskproxy-<id> does not leak.
+	// The still-running sidecar keeps its egress: the proxy is NOT stopped/removed
+	// and the network is NOT removed.
+	if contains(f.stops, proxyName) {
+		t.Fatalf("egress proxy must NOT be stopped while the sidecar is still running: stops=%v", f.stops)
+	}
+	if _, found := f.removeForce(proxyName); found {
+		t.Fatalf("egress proxy must NOT be removed while the sidecar is still running: removes=%v", f.removes)
+	}
+	if contains(f.netsRemoved, wantNet) {
+		t.Fatalf("per-workspace network must NOT be removed while the sidecar is still running: %v", f.netsRemoved)
+	}
+}
+
+// On a SUCCESSFUL stop the sidecar is gone, so the egress proxy + per-workspace
+// network ARE torn down — otherwise wsdeskproxy-<id> and the network leak. This
+// is the leak-prevention counterpart to the still-running case above.
+func TestLocalSidecar_StopDesktop_TearsDownProxyAndNetworkOnSuccess(t *testing.T) {
+	f := newFakeSidecarDocker()
+	name := DesktopContainerName(sidecarTestWS)
+	proxyName := DesktopProxyContainerName(sidecarTestWS)
+	f.running[name] = true
+	f.running[proxyName] = true
+	const prefix = "wsnet"
+	wantNet := prefix + "-" + sidecarTestWS
+	p := NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 0, "unconfined")
+	p.SetSelfContainerID("platform-xyz")
+
+	if err := p.StopDesktop(context.Background(), sidecarTestWS); err != nil {
+		t.Fatalf("StopDesktop (success path): %v", err)
+	}
 	if !contains(f.stops, proxyName) {
-		t.Fatalf("egress proxy must still be stopped when the sidecar stop fails: stops=%v", f.stops)
+		t.Fatalf("egress proxy must be stopped after a successful sidecar stop: stops=%v", f.stops)
 	}
 	if _, found := f.removeForce(proxyName); !found {
-		t.Fatalf("egress proxy must still be removed when the sidecar stop fails: removes=%v", f.removes)
+		t.Fatalf("egress proxy must be removed after a successful sidecar stop: removes=%v", f.removes)
 	}
-	// ...and the per-workspace network is still disconnected + removed so it does
-	// not leak either.
 	if !contains(f.netsDisconn, wantNet+"|platform-xyz") {
-		t.Fatalf("platform must still be disconnected from the per-workspace network: %v", f.netsDisconn)
+		t.Fatalf("platform must be disconnected from the per-workspace network: %v", f.netsDisconn)
 	}
 	if !contains(f.netsRemoved, wantNet) {
-		t.Fatalf("per-workspace network must still be removed when the sidecar stop fails: %v", f.netsRemoved)
+		t.Fatalf("per-workspace network must be removed after a successful sidecar stop: %v", f.netsRemoved)
 	}
 }
 

@@ -206,14 +206,24 @@ func (a *ExecActuator) Navigate(ctx context.Context, url string) error {
 		// and exited. This is the common, fast path.
 		return nil
 	}
-	// Hand-off failed: the kiosk primary is gone, so nothing received the URL and
-	// the transient foreground instance we accidentally spawned was just killed.
-	// Self-heal by relaunching the kiosk instance ourselves — same flags the
-	// entrypoint uses, pointed at the target URL — detached so it outlives this
-	// request (not tied to ctx) and restores the pinned kiosk window. Without this
-	// open_url would stay permanently broken for the desktop after a browser crash.
+	// The hand-off did not succeed. If the CALLER's context (not merely our bounded
+	// hand-off timeout) is already done, the request was cancelled/deadlined
+	// upstream — report that honestly instead of spawning a detached browser and
+	// returning nil, which would tell the agent open_url SUCCEEDED for a navigation
+	// nobody awaited (verified 2026-07-28: the self-heal branch used to swallow
+	// this into a false SUCCESS).
+	if ctx.Err() != nil {
+		return fmt.Errorf("navigate hand-off aborted before completing: %w", ctx.Err())
+	}
+	// Otherwise the kiosk primary is gone/unresponsive (a dead primary makes the
+	// bounded hand-off block until SIGKILL). Self-heal by relaunching the kiosk
+	// instance ourselves — same flags the entrypoint uses, with the target URL as
+	// the start page so the relaunch IS the navigation — detached so it outlives
+	// this request and restores the pinned kiosk window. The agent's next
+	// screenshot verifies the result. Without this, open_url would stay permanently
+	// broken for the desktop after a browser crash.
 	if err := a.spawn("chromium", kioskRelaunchArgs(url)...); err != nil {
-		return fmt.Errorf("chromium kiosk relaunch: %w", err)
+		return fmt.Errorf("chromium kiosk relaunch after failed hand-off: %w", err)
 	}
 	return nil
 }

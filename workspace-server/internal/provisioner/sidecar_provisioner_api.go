@@ -13,6 +13,12 @@ import (
 type DesktopHandle struct {
 	Address string
 	Running bool
+	// ScaledUp is true only when THIS StartDesktop call transitioned the desktop
+	// from stopped to running (a fresh start), and false when it was already
+	// running. Callers use it to do transition-only work — e.g. recording the
+	// 'running' lifecycle state exactly once per scale-up instead of on every
+	// hot-path screenshot/input forward.
+	ScaledUp bool
 }
 
 // SidecarProvisioner is the backend-neutral contract for the per-workspace
