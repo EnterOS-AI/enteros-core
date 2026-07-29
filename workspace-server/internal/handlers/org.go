@@ -192,6 +192,24 @@ type OrgHandler struct {
 	channelMgr  *channels.Manager
 	configsDir  string
 	orgDir      string // path to org-templates/
+	// templateCacheDir is the SAME cache TemplatesHandler.resolveTemplateDir
+	// consults — threaded here so an org node's `template:` resolves from the
+	// FETCHED template cache as well as the baked configsDir (M6 / FIX 0).
+	// Without it, on SaaS (where templates arrive through the Gitea asset
+	// channel rather than the image) a `template: seo-agent` node silently
+	// fell back to `<runtime>-default`: the workspace provisioned, just not
+	// from the template the author named. Empty = configs-only, which is
+	// byte-identical to the pre-M6 behaviour.
+	templateCacheDir string
+}
+
+// WithTemplateCacheDir threads the fetched-template cache into org import.
+// Option-style rather than a constructor parameter so every existing
+// NewOrgHandler call site keeps compiling and keeps today's behaviour until
+// the router opts in — the same shape TemplatesHandler.WithCacheDir uses.
+func (h *OrgHandler) WithTemplateCacheDir(dir string) *OrgHandler {
+	h.templateCacheDir = dir
+	return h
 }
 
 func NewOrgHandler(wh *WorkspaceHandler, b *events.Broadcaster, p *provisioner.Provisioner, channelMgr *channels.Manager, configsDir, orgDir string) *OrgHandler {
@@ -390,7 +408,15 @@ type OrgDefaults struct {
 	Runtime       string   `yaml:"runtime" json:"runtime"`
 	Tier          int      `yaml:"tier" json:"tier"`
 	Model         string   `yaml:"model" json:"model"`
-	Plugins       []string `yaml:"plugins" json:"plugins"`
+	// Plugins accepts BOTH the bare-source string and the {source, config}
+	// object form, via the SSOT templatePluginEntry (plugin_settings_delivery.go)
+	// — the same type renderPluginSettingsFiles already uses. Before this it was
+	// []string, so a template that carried per-install config failed to
+	// unmarshal with `cannot unmarshal !!map into string` and the whole org
+	// import broke. The SDK contract (sdk#183) models exactly this oneOf; the Go
+	// type now mirrors it instead of being narrower than the contract it claims
+	// to implement.
+	Plugins       []templatePluginEntry `yaml:"plugins" json:"plugins"`
 	InitialPrompt string   `yaml:"initial_prompt" json:"initial_prompt"`
 	// InitialPromptFile is a file ref alternative to InitialPrompt. Path is
 	// resolved relative to the workspace's files_dir (or the org base dir
@@ -466,7 +492,8 @@ type OrgWorkspace struct {
 	Model           string   `yaml:"model" json:"model"`
 	WorkspaceDir    string   `yaml:"workspace_dir" json:"workspace_dir"`
 	WorkspaceAccess string   `yaml:"workspace_access" json:"workspace_access"` // #65: "none" (default), "read_only", "read_write"
-	Plugins         []string `yaml:"plugins" json:"plugins"`
+	// See OrgDefaults.Plugins — same SSOT entry type, same reason.
+	Plugins         []templatePluginEntry `yaml:"plugins" json:"plugins"`
 	// InitialPrompt is the one-shot boot prompt. Agents run this once on first
 	// start; the body often clones the repo, reads CLAUDE.md + system-prompt,
 	// and commits conventions to memory. InitialPromptFile is the file-ref

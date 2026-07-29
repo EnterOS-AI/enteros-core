@@ -354,15 +354,20 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			WorkspaceAccess: workspaceAccess,
 		}
 		templatePath := ""
+		// M6 / FIX 0: resolve cache-FIRST, then configs — mirroring
+		// TemplatesHandler.resolveTemplateDir. `template` comes from uploaded
+		// YAML and stays untrusted: resolveOrgNodeTemplateDir enforces the same
+		// resolveInsideRoot containment on BOTH roots, so an absolute path or a
+		// `../` escape is refused for each. Previously only configsDir was
+		// consulted, so on a deployment where templates are FETCHED rather than
+		// baked the node silently fell back to `<runtime>-default`.
 		if ws.Template != "" {
-			// `template` comes from the uploaded YAML — treat as untrusted.
-			// Only accept paths that stay inside h.configsDir.
-			if tp, err := resolveInsideRoot(h.configsDir, ws.Template); err == nil {
-				if _, statErr := os.Stat(tp); statErr == nil {
-					templatePath = tp
-				}
-			}
+			templatePath = resolveOrgNodeTemplateDir(h.configsDir, h.templateCacheDir, ws.Template)
 		}
+		// nodeTemplatePath is captured BEFORE files_dir overwrites templatePath
+		// below (files_dir repurposes the same variable for the asset copy), so
+		// FIX 1/2/3 read the TEMPLATE's config, never the files_dir.
+		nodeTemplatePath := templatePath
 		if templatePath == "" {
 			// #241: sanitizeRuntime() allowlists the runtime string so a
 			// crafted org.yaml cannot use it as a path-traversal oracle.
@@ -375,6 +380,37 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 
 		// Always generate default config.yaml (runtime, model, tier, etc.)
 		configFiles, cfgErr := h.workspace.ensureDefaultConfig(id, payload)
+		// M6 / FIX 1+2: a node that names a `template:` inherits that
+		// template's config as the BASE, with the generated config overlaid.
+		// Without this the template's `providers` registry, `models[]`, `env`,
+		// `skills`, `a2a` and `runtime_config` were dropped on the floor — the
+		// keys that exist ONLY in the template, which is the whole reason a
+		// node references one. Observed in production 2026-07-28: a live
+		// workspace's delivered config.yaml was the stock runtime template
+		// (`name: Hermes Agent`) with no plugins and no schedules, because the
+		// node's own config never reached it.
+		//
+		// GATED on an explicit `template:`. A node without one takes this
+		// branch not at all and keeps today's behaviour byte-for-byte, which is
+		// what makes it safe on a path that provisions whole orgs.
+		if cfgErr == nil && nodeTemplatePath != "" {
+			if generated, ok := configFiles["config.yaml"]; ok {
+				tmplCfg, readErr := os.ReadFile(filepath.Join(nodeTemplatePath, "config.yaml"))
+				if readErr == nil {
+					merged, mergeErr := mergeTemplateConfigBase(tmplCfg, generated)
+					if mergeErr != nil {
+						// Non-fatal by design: a malformed template config must
+						// not fail an org import. Keep the generated config and
+						// say so loudly rather than shipping a half-merge.
+						log.Printf("Org import: template config merge failed for %s (using generated config only): %v", ws.Name, mergeErr)
+					} else {
+						configFiles["config.yaml"] = merged
+					}
+				} else if !os.IsNotExist(readErr) {
+					log.Printf("Org import: cannot read template config.yaml for %s (using generated config only): %v", ws.Name, readErr)
+				}
+			}
+		}
 		if cfgErr != nil {
 			log.Printf("Org import: default config generation failed for %s: %v — marking workspace failed", ws.Name, cfgErr)
 			// Fail-closed: the workspace row + layout + broadcast are already
@@ -415,7 +451,20 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// name is derived from the source so the reconcile can diff declared
 		// vs installed without fetching.
 		seenPluginNames := map[string]string{} // name → first source that claimed it
-		for _, pluginSource := range mergePlugins(defaults.Plugins, ws.Plugins) {
+		// M6 / FIX 3: three-layer precedence TEMPLATE -> org DEFAULTS -> NODE.
+		// A node that references a template gets that template's own
+		// `plugins:` too — the template is the thing that knows which plugins
+		// its agent needs. Delegates to mergePlugins so the "!"/"-" opt-out
+		// grammar is shared, meaning a node can still DECLINE an inherited
+		// plugin. Template-first ordering: the first source to claim an install
+		// name wins on collision.
+		templatePlugins := []string(nil)
+		if nodeTemplatePath != "" {
+			if tmplCfg, readErr := os.ReadFile(filepath.Join(nodeTemplatePath, "config.yaml")); readErr == nil {
+				templatePlugins = templateDeclaredPlugins(tmplCfg)
+			}
+		}
+		for _, pluginSource := range mergePluginsWithTemplate(templatePlugins, pluginEntrySources(defaults.Plugins), pluginEntrySources(ws.Plugins)) {
 			pluginName, nameErr := plugins.PluginNameFromSource(pluginSource)
 			if nameErr != nil {
 				log.Printf("Org import: skipping plugin %q for %s — cannot derive install name: %v",

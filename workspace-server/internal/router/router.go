@@ -1001,7 +1001,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Org Templates
 	orgDir := findOrgDir(configsDir)
-	orgh := handlers.NewOrgHandler(wh, broadcaster, prov, channelMgr, configsDir, orgDir)
+	// M6 / FIX 0: same templateCacheDir the TemplatesHandler above uses, so an
+	// org node's `template:` resolves cache-first exactly like the
+	// workspace-name path already does. One cache, one SSOT.
+	orgh := handlers.NewOrgHandler(wh, broadcaster, prov, channelMgr, configsDir, orgDir).
+		WithTemplateCacheDir(templateCacheDir)
 	// #686: GET /org/templates exposes the org template catalogue (names, roles,
 	// configured system prompts). AdminAuth-gate to match /org/import.
 	r.GET("/org/templates", middleware.AdminAuth(db.DB), orgh.ListTemplates)

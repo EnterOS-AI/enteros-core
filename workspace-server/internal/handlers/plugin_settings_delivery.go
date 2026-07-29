@@ -94,6 +94,24 @@ func (e *templatePluginEntry) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// pluginEntrySources projects entries down to the source strings the merge /
+// dedup / opt-out layer works in. Kept as a projection rather than changing
+// mergePlugins' signature: the "!"/"-" opt-out grammar, the collision rules and
+// every existing caller stay exactly as they are, and the config half travels
+// separately to renderPluginSettingsFiles. One type, two views.
+func pluginEntrySources(entries []templatePluginEntry) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.Source != "" {
+			out = append(out, e.Source)
+		}
+	}
+	return out
+}
+
 // templateConfigPluginEntries is the settings-aware view of the same
 // `plugins:` block templateConfigPlugins reads. Kept separate so the existing
 // declared-set parse is untouched.
