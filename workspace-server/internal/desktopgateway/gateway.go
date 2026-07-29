@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
@@ -65,6 +66,15 @@ type Gateway struct {
 	state    StateRecorder // optional; nil disables 'running' state recording
 	http     httpDoer
 	token    TokenResolver
+
+	// recordedMu guards recordedRunning: the set of workspaces whose 'running'
+	// lifecycle state we have CONFIRMED-persisted this process. It lets
+	// ensureRunning skip the DB write on steady-state forwards (already recorded)
+	// while still retrying until the write succeeds — so a single failed
+	// best-effort write on the scale-up edge can't permanently hide the desktop
+	// from the idle sweeper (it would never be reaped otherwise).
+	recordedMu      sync.Mutex
+	recordedRunning map[string]struct{}
 }
 
 // New builds the gateway. doer defaults to http.DefaultClient when nil.
@@ -72,7 +82,7 @@ func New(prov provisioner.SidecarProvisioner, locks LockChecker, activity Activi
 	if doer == nil {
 		doer = http.DefaultClient
 	}
-	return &Gateway{prov: prov, locks: locks, activity: activity, http: doer, token: token}
+	return &Gateway{prov: prov, locks: locks, activity: activity, http: doer, token: token, recordedRunning: make(map[string]struct{})}
 }
 
 // SetStateRecorder wires the optional lifecycle-state setter used to mark a
@@ -166,15 +176,26 @@ func (g *Gateway) ensureRunning(ctx context.Context, workspaceID string) (string
 		return "", fmt.Errorf("refusing to forward to an invalid desktop target: %w", err)
 	}
 	// Record 'running' so scale-to-zero can find this desktop to evaluate for
-	// teardown (§10) — but ONLY on the scale-up transition (h.ScaledUp), not on
-	// every hot-path forward. State + address don't change while the desktop stays
-	// up, so re-upserting them on every screenshot/input just doubled the write
-	// load on the lifecycle row (recordActivity already upserts last_activity each
-	// call). Best-effort: a state-write failure must not fail the op the caller
-	// asked for, and the setter is optional (nil-safe); a rare failed transition
-	// write is re-attempted on the next scale-up.
-	if h.ScaledUp && g.state != nil {
-		_ = g.state.SetState(ctx, workspaceID, "running", h.Address)
+	// teardown (§10) — but avoid the per-forward DB write that re-upserted the
+	// unchanged state on every screenshot/input. Write when EITHER this call scaled
+	// the desktop up (h.ScaledUp) OR we have not yet confirmed the 'running' state
+	// is persisted (a prior best-effort write failed, or this is the first forward
+	// after a process restart). In steady state (already recorded) this is a no-op.
+	// Best-effort: a write failure must not fail the op the caller asked for and is
+	// simply retried on the next forward — crucially, a single failed transition
+	// write can no longer permanently hide the desktop from the sweeper (which
+	// would otherwise never reap the 2GB sidecar). The setter is optional (nil-safe).
+	if g.state != nil {
+		g.recordedMu.Lock()
+		_, recorded := g.recordedRunning[workspaceID]
+		g.recordedMu.Unlock()
+		if h.ScaledUp || !recorded {
+			if err := g.state.SetState(ctx, workspaceID, "running", h.Address); err == nil {
+				g.recordedMu.Lock()
+				g.recordedRunning[workspaceID] = struct{}{}
+				g.recordedMu.Unlock()
+			}
+		}
 	}
 	return h.Address, nil
 }

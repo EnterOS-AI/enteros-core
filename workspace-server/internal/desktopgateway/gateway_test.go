@@ -48,11 +48,20 @@ type fakeActivity struct{ n int }
 func (f *fakeActivity) RecordAgentActivity(context.Context, string) error { f.n++; return nil }
 
 type fakeState struct {
-	states []string // recorded states, in call order
-	addrs  []string
+	states   []string // recorded (successful) states, in call order
+	addrs    []string
+	failNext int // number of leading SetState calls to fail before succeeding
+	attempts int // total SetState calls (including failures)
+	oks      int // successful SetState calls
 }
 
 func (f *fakeState) SetState(_ context.Context, _, state, addr string) error {
+	f.attempts++
+	if f.failNext > 0 {
+		f.failNext--
+		return errors.New("simulated state-write failure")
+	}
+	f.oks++
 	f.states = append(f.states, state)
 	f.addrs = append(f.addrs, addr)
 	return nil
@@ -141,22 +150,50 @@ func TestGateway_RecordsRunningStateOnScaleUp(t *testing.T) {
 	}
 }
 
-// A forward on an ALREADY-running desktop (ScaledUp=false) must NOT re-record the
-// 'running' lifecycle state — that was a redundant per-screenshot DB upsert on
-// the hot path (finding-8 fix, 2026-07-28). recordActivity still upserts the
-// activity timestamp; only the state/address write is transition-only.
-func TestGateway_DoesNotRerecordStateWhenAlreadyRunning(t *testing.T) {
-	prov := &fakeProv{addr: "wsdesk-abc123:6070", scaledUp: false}
+// The gateway must not re-record 'running' on EVERY forward (that was the
+// redundant per-screenshot upsert). It writes at most once per confirmed-running
+// period: the first forward establishes the state (catch-up, so a failed
+// scale-up write can't permanently hide the desktop), and subsequent
+// already-running forwards skip the write (finding-8 fix + round-2 hardening,
+// 2026-07-28). recordActivity still upserts the activity timestamp every call.
+func TestGateway_RecordsRunningStateOnceThenSkips(t *testing.T) {
+	prov := &fakeProv{addr: "wsdesk-abc123:6070", scaledUp: false} // already-running fast path
 	doer := &fakeDoer{code: http.StatusNoContent}
 	state := &fakeState{}
 	g := New(prov, &fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
 	g.SetStateRecorder(state)
 
-	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
-		t.Fatalf("Input: %v", err)
+	for i := 0; i < 3; i++ {
+		if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
+			t.Fatalf("Input #%d: %v", i, err)
+		}
 	}
-	if len(state.states) != 0 {
-		t.Fatalf("must not record state on an already-running forward, got %v", state.states)
+	if len(state.states) != 1 || state.states[0] != "running" {
+		t.Fatalf("want exactly one 'running' write across 3 forwards, got %v", state.states)
+	}
+}
+
+// If the state write FAILS, it must be RETRIED on the next forward rather than
+// swallowed forever — otherwise a single failed write permanently hides the
+// desktop from the idle sweeper (round-2 hardening, 2026-07-28).
+func TestGateway_RetriesStateWriteAfterFailure(t *testing.T) {
+	prov := &fakeProv{addr: "wsdesk-abc123:6070", scaledUp: true}
+	doer := &fakeDoer{code: http.StatusNoContent}
+	state := &fakeState{failNext: 1} // first SetState fails, then succeeds
+	g := New(prov, &fakeLocks{held: true}, &fakeActivity{}, tokenFn, doer)
+	g.SetStateRecorder(state)
+
+	// First forward: SetState fails (not confirmed) -> still no error to caller.
+	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
+		t.Fatalf("Input #1: %v", err)
+	}
+	// Second forward (already-running, ScaledUp=false): must RETRY because the
+	// first write was never confirmed.
+	if err := g.Input(context.Background(), "w1", json.RawMessage(`{"type":"click","x":1,"y":1}`)); err != nil {
+		t.Fatalf("Input #2: %v", err)
+	}
+	if state.oks != 1 {
+		t.Fatalf("want the state write retried until one success, got %d successful writes (attempts=%d)", state.oks, state.attempts)
 	}
 }
 

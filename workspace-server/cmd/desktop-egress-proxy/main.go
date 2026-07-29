@@ -98,11 +98,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 // tunnelDrainTimeout bounds how long the SECOND tunnel direction may keep
-// copying after the FIRST has finished and half-closed its peer. A well-behaved
-// peer, now seeing EOF, closes within milliseconds; this is purely a backstop
-// against a hung/malicious peer that never sends EOF. It is generous so it never
-// truncates real traffic (including a WebSocket that closes one way first). A var
-// (not const) only so the leak-regression test can shorten it.
+// copying after the FIRST has finished and half-closed its peer. It is an
+// ABSOLUTE cap measured from that first half-close — a backstop against a
+// hung/malicious peer that never sends EOF, not an idle timeout. 60s is generous
+// enough that normal request/response traffic (where a peer seeing EOF closes in
+// milliseconds) completes well within it; the tradeoff is that a transfer which
+// keeps streaming for >60s AFTER its peer half-closed one direction would be cut.
+// That is rare and strictly preferable to the unbounded goroutine/fd leak it
+// replaces. A var (not const) only so the leak-regression test can shorten it.
 var tunnelDrainTimeout = 60 * time.Second
 
 // tunnel bidirectionally copies between the client and upstream connections.
