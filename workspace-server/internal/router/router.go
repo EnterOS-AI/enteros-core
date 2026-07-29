@@ -1005,7 +1005,11 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// org node's `template:` resolves cache-first exactly like the
 	// workspace-name path already does. One cache, one SSOT.
 	orgh := handlers.NewOrgHandler(wh, broadcaster, prov, channelMgr, configsDir, orgDir).
-		WithTemplateCacheDir(templateCacheDir)
+		WithTemplateCacheDir(templateCacheDir).
+		// Lets /org/import RE-DELIVER declared plugins[].config to workspaces
+		// that already exist. tmplh already carries the docker client the
+		// delivery primitive needs; org import depends only on the capability.
+		WithPluginSettingsDeliverer(tmplh)
 	// #686: GET /org/templates exposes the org template catalogue (names, roles,
 	// configured system prompts). AdminAuth-gate to match /org/import.
 	r.GET("/org/templates", middleware.AdminAuth(db.DB), orgh.ListTemplates)

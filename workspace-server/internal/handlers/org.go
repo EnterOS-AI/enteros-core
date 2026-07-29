@@ -201,6 +201,10 @@ type OrgHandler struct {
 	// from the template the author named. Empty = configs-only, which is
 	// byte-identical to the pre-M6 behaviour.
 	templateCacheDir string
+	// settingsDeliverer, when wired, lets org import RE-DELIVER an existing
+	// workspace's declared plugins[].config instead of skipping it. nil =
+	// today's behaviour (see org_redeliver_settings.go).
+	settingsDeliverer pluginSettingsDeliverer
 }
 
 // WithTemplateCacheDir threads the fetched-template cache into org import.
