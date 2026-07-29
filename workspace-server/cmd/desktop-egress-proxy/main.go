@@ -94,7 +94,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		return
 	}
-	tunnel(client, upstream)
+	tunnel(client, upstream, tunnelDrainTimeout)
 }
 
 // tunnelDrainTimeout bounds how long the SECOND tunnel direction may keep
@@ -105,8 +105,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 // milliseconds) completes well within it; the tradeoff is that a transfer which
 // keeps streaming for >60s AFTER its peer half-closed one direction would be cut.
 // That is rare and strictly preferable to the unbounded goroutine/fd leak it
-// replaces. A var (not const) only so the leak-regression test can shorten it.
-var tunnelDrainTimeout = 60 * time.Second
+// replaces. Passed into tunnel as a parameter (not read from a mutable global) so
+// tests can shorten it without a data race against a live tunnel goroutine.
+const tunnelDrainTimeout = 60 * time.Second
 
 // tunnel bidirectionally copies between the client and upstream connections.
 // When one direction's reader hits EOF it half-closes the peer's write end
@@ -120,9 +121,9 @@ var tunnelDrainTimeout = 60 * time.Second
 // is blocked right here in tunnel — so a ctx-done closer goroutine could never
 // fire mid-tunnel. Relying on it let a peer that never sends EOF block the second
 // io.Copy (and both fds + the goroutine) FOREVER. Instead, once the first
-// direction completes we put a drain DEADLINE on both conns, turning that
-// unbounded leak into a bounded wait, then force both closed.
-func tunnel(client, upstream net.Conn) {
+// direction completes we put a drain DEADLINE (drainTimeout) on both conns,
+// turning that unbounded leak into a bounded wait, then force both closed.
+func tunnel(client, upstream net.Conn, drainTimeout time.Duration) {
 	type closeWriter interface{ CloseWrite() error }
 	done := make(chan struct{}, 2)
 	pipe := func(dst, src net.Conn) {
@@ -138,7 +139,7 @@ func tunnel(client, upstream net.Conn) {
 	<-done // one direction finished and half-closed its peer's write side
 	// Bound the still-open direction so a peer that never EOFs cannot hang it (and
 	// this goroutine + both sockets) indefinitely.
-	deadline := time.Now().Add(tunnelDrainTimeout)
+	deadline := time.Now().Add(drainTimeout)
 	_ = client.SetDeadline(deadline)
 	_ = upstream.SetDeadline(deadline)
 	<-done

@@ -137,7 +137,7 @@ func TestTunnel_NoTruncationBidirectional(t *testing.T) {
 	clientOuter, clientInner := tcpPair(t) // test writes/reads clientOuter; tunnel uses clientInner
 	upstreamInner, upstreamOuter := tcpPair(t)
 
-	go tunnel(clientInner, upstreamInner)
+	go tunnel(clientInner, upstreamInner, tunnelDrainTimeout)
 
 	const n = 4 << 20 // 4 MiB, larger than any socket buffer
 	upload := make([]byte, n)
@@ -194,17 +194,13 @@ func TestTunnel_NoTruncationBidirectional(t *testing.T) {
 // and half-closes, but the upstream never writes and never closes; tunnel must
 // still return within the (shortened) drain window.
 func TestTunnel_HungPeerDoesNotBlockForever(t *testing.T) {
-	orig := tunnelDrainTimeout
-	tunnelDrainTimeout = 200 * time.Millisecond
-	defer func() { tunnelDrainTimeout = orig }()
-
 	clientOuter, clientInner := tcpPair(t)
 	upstreamInner, upstreamOuter := tcpPair(t)
 	defer upstreamOuter.Close()
 
 	done := make(chan struct{})
 	go func() {
-		tunnel(clientInner, upstreamInner)
+		tunnel(clientInner, upstreamInner, 200*time.Millisecond)
 		close(done)
 	}()
 
