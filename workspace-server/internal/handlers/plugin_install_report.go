@@ -25,10 +25,24 @@ package handlers
 // molcontracts.PluginInstallReportConciergeGated / …Durable.
 //
 // LIVENESS IS NOT `installed`. `installed` lists sources that reached the STAGING
-// tree; `swapped` says whether that tree was promoted. A partial build is never
-// promoted, so installed=[6] with swapped=false means nothing is live. The rule is
+// tree; `swapped` says whether that tree was promoted. A tree that was never
+// promoted is not live no matter how much reached staging, so installed=[6] with
+// swapped=false means nothing is live. The rule is
 // molcontracts.PluginInstallReportOutcomeRule and it is evaluated in exactly one
 // place (reportIsLive) so it cannot drift between writer, reader and operator.
+//
+// LIVENESS IS ALSO NOT `failed == []`. The runtime PROMOTES PARTIAL BUILDS by
+// design — molecule_runtime/plugin_sources.py, "A failed source fails THAT SOURCE
+// — not the whole tree", added after the staging test5 incident of 2026-07-13
+// where one unfetchable third-party plugin vetoed the swap and took the
+// concierge's own management MCP down with it. On a partial failure the runtime
+// carries every live dir the successful sources are not replacing into staging,
+// logs "promoting the N that succeeded", swaps, and sets swapped=True with a
+// NON-EMPTY failed list. Folding `failed == []` into liveness therefore reports a
+// workspace with 5 of 6 plugins live and one flaky gitea fetch as live=false — a
+// false alarm on a healthy box, which is the inverse of the lie this endpoint was
+// built to end. A non-empty `failed` on a promoted tree is a SEPARATE, weaker
+// signal: `degraded` (see reportIsDegraded).
 
 import (
 	"context"
@@ -55,6 +69,24 @@ const maxInstallReportSources = 256
 // maxInstallReportSourceLen bounds one source string. Sources are gitea:// URLs or
 // bare local names; the cap is generous for both.
 const maxInstallReportSourceLen = 512
+
+// maxInstallReportBody caps the request body BEFORE the decoder sees it.
+//
+// The two bounds above are checked AFTER ShouldBindJSON has already materialised
+// the whole body in memory, so on their own they bound what gets STORED and not
+// what gets ALLOCATED. This group is mounted under wsAuth, which also accepts the
+// ADMIN_TOKEN and an org key (wsauth_middleware.go), so "the caller is a
+// workspace" is not a size bound either. Every sibling caps first —
+// config.go's maxConfigBody, plugins_install.go's bodyMax.
+//
+// 512 KiB is DERIVED, not picked: the largest report the bounds above admit is
+// three lists of maxInstallReportSources entries at maxInstallReportSourceLen
+// bytes each, ~396 KiB of JSON with quoting and commas, plus a bounded
+// plugins_dir. The cap must exceed that or it would reject a legal report with a
+// 413 that the bounds would have accepted — TestPluginInstallReport_BodyCap*
+// pins both directions of that inequality so tightening one bound cannot
+// silently invalidate the other.
+const maxInstallReportBody = 512 << 10
 
 // pluginInstallReportBody is the wire shape. Field names come from the SDK
 // contract (molcontracts.PluginInstallReportField*); the struct tags below MUST
@@ -83,12 +115,37 @@ func NewPluginInstallReportHandler() *PluginInstallReportHandler {
 
 // reportIsLive is the contract's outcome rule, in the one place it lives:
 //
-//	live iff declared && swapped && failed == []
+//	live iff declared && swapped
+//
+// `swapped` is the whole of it: the runtime sets it only after _atomic_swap_dir
+// renamed the staging tree over plugins_dir, so swapped=true means the tree an
+// agent loads from IS the tree this report describes. `failed` deliberately does
+// NOT appear — the runtime promotes partial builds (see the file header), so a
+// failed source subtracts from WHAT is live without making the promotion not have
+// happened. That distinction is `degraded`, below.
+//
+// This is also what makes the migration's partial index — WHERE declared AND NOT
+// swapped — the exact complement of live, rather than a near-miss that quietly
+// disagrees with the API.
 //
 // Keep it a function even though it is a one-liner — the value of having it named
 // is that a caller cannot accidentally write `len(installed) > 0` instead.
-func reportIsLive(declared, swapped bool, failed []string) bool {
-	return declared && swapped && len(failed) == 0
+func reportIsLive(declared, swapped bool) bool {
+	return declared && swapped
+}
+
+// reportIsDegraded is the signal `failed` actually carries once liveness stops
+// swallowing it: the tree WAS promoted, and it is missing something that was asked
+// for. Plugins are live; not all of them.
+//
+// Scoped to live reports on purpose. On a report that never promoted, `failed` is
+// not a partial-coverage warning — it is one of the reasons nothing went live at
+// all, and calling that "degraded" would soften a hard failure into a caveat.
+//
+// Derived on read like Live, never stored: a stored copy is a second place for a
+// rule to drift, and this rule has now been got wrong once already.
+func reportIsDegraded(declared, swapped bool, failed []string) bool {
+	return reportIsLive(declared, swapped) && len(failed) > 0
 }
 
 // validateSources bounds one list, returning a reason when it is unusable.
@@ -121,8 +178,21 @@ func (h *PluginInstallReportHandler) Report(c *gin.Context) {
 		return
 	}
 
+	// Cap BEFORE the bind. maxInstallReportSources/…SourceLen below only fire once
+	// the decoder has already built the whole body in memory, so they cannot bound
+	// the allocation — only the write.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxInstallReportBody)
+
 	var body pluginInstallReportBody
 	if err := c.ShouldBindJSON(&body); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			// Distinct from the 400 below on purpose: "too big" and "malformed" are
+			// different runtime bugs, and a producer that hits this needs to know it
+			// was cut off rather than mis-serialised.
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "plugin-install-report body is too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid plugin-install-report body"})
 		return
 	}
@@ -157,11 +227,17 @@ func (h *PluginInstallReportHandler) Report(c *gin.Context) {
 	// One log line at the point of truth, because this is the record an operator
 	// greps when a workspace has no plugins. NOT-LIVE is called out explicitly:
 	// the counts alone read as success at a glance, which is the whole failure
-	// mode this endpoint exists to end.
-	if reportIsLive(*body.Declared, *body.Swapped, body.Failed) {
+	// mode this endpoint exists to end. DEGRADED is called out separately because
+	// it is the opposite hazard — it must NOT read as an outage, or the operator
+	// learns to ignore the line that one day means something.
+	switch {
+	case reportIsDegraded(*body.Declared, *body.Swapped, body.Failed):
+		log.Printf("plugin-install-report: %s LIVE (DEGRADED) — installed=%d skipped=%d failed=%d dir=%s",
+			workspaceID, len(body.Installed), len(body.Skipped), len(body.Failed), body.PluginsDir)
+	case reportIsLive(*body.Declared, *body.Swapped):
 		log.Printf("plugin-install-report: %s LIVE — installed=%d skipped=%d dir=%s",
 			workspaceID, len(body.Installed), len(body.Skipped), body.PluginsDir)
-	} else {
+	default:
 		log.Printf("plugin-install-report: %s NOT LIVE — declared=%t swapped=%t installed=%d failed=%d (%s)",
 			workspaceID, *body.Declared, *body.Swapped, len(body.Installed), len(body.Failed),
 			molcontracts.PluginInstallReportOutcomeRule)
@@ -235,6 +311,12 @@ type pluginInstallReportRow struct {
 	// be a second place for the outcome rule to live, and the rule is the thing
 	// most likely to be got wrong.
 	Live bool `json:"live"`
+	// Degraded is DERIVED on read via reportIsDegraded, likewise never stored. It
+	// is the signal that used to be folded into Live and lost there: the tree was
+	// promoted AND something declared is missing from it. live=true degraded=true
+	// is the runtime's partial-promotion outcome — plugins are running, and a
+	// source needs looking at. It is not an outage and must not be paged on as one.
+	Degraded bool `json:"degraded"`
 	// OutcomeRule is echoed so a reader looking at live=false learns WHY without
 	// having to find the contract.
 	OutcomeRule string `json:"outcome_rule"`
@@ -277,7 +359,8 @@ func loadPluginInstallReport(ctx context.Context, database *sql.DB, workspaceID 
 			}
 		}
 	}
-	row.Live = reportIsLive(row.Declared, row.Swapped, row.Failed)
+	row.Live = reportIsLive(row.Declared, row.Swapped)
+	row.Degraded = reportIsDegraded(row.Declared, row.Swapped, row.Failed)
 	row.OutcomeRule = molcontracts.PluginInstallReportOutcomeRule
 	return &row, nil
 }
