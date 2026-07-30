@@ -796,6 +796,22 @@ def test_ci_canvas_nextjs_steps_are_path_scoped_on_all_events():
         assert "github.event_name != 'pull_request'" not in expr
 
 
+def test_ci_canvas_rejects_high_production_dependency_advisories():
+    doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    steps = doc["jobs"]["canvas-build"]["steps"]
+    commands = [step.get("run", "") for step in steps]
+
+    install = "npm ci --include=optional --prefer-offline"
+    audit = "npm audit --omit=dev --audit-level=high"
+    build = "npm run build"
+    assert commands.count(audit) == 1
+    assert commands.index(install) < commands.index(audit) < commands.index(build)
+
+    audit_step = steps[commands.index(audit)]
+    assert "needs.changes.outputs.canvas == 'true'" in audit_step.get("if", "")
+    assert audit_step.get("continue-on-error") is not True
+
+
 def test_ci_shellcheck_steps_are_path_scoped_on_all_events():
     doc = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
     shellcheck = doc["jobs"]["shellcheck"]
