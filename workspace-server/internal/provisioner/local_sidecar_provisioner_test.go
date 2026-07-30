@@ -3,12 +3,15 @@ package provisioner
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
+	dockerimage "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -36,6 +39,8 @@ type fakeSidecarDocker struct {
 	netsDisconn   []string // "net|container"
 	running       map[string]bool
 	stopErrs      map[string]error // name -> error ContainerStop returns (fault injection)
+	imageMissing  bool             // when true, ImageInspect reports not-found so ensureImage must pull
+	imagePulls    []string         // refs passed to ImagePull
 }
 
 func newFakeSidecarDocker() *fakeSidecarDocker {
@@ -96,6 +101,17 @@ func (f *fakeSidecarDocker) ContainerRemove(_ context.Context, name string, opts
 	}{name, opts.Force})
 	delete(f.running, name)
 	return nil
+}
+func (f *fakeSidecarDocker) ImageInspect(_ context.Context, _ string, _ ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
+	if f.imageMissing {
+		return dockerimage.InspectResponse{}, errors.New("Error: No such image")
+	}
+	return dockerimage.InspectResponse{}, nil
+}
+func (f *fakeSidecarDocker) ImagePull(_ context.Context, ref string, _ dockerimage.PullOptions) (io.ReadCloser, error) {
+	f.imagePulls = append(f.imagePulls, ref)
+	f.imageMissing = false // pulled → now present
+	return io.NopCloser(strings.NewReader("")), nil
 }
 func (f *fakeSidecarDocker) VolumeCreate(_ context.Context, opts volume.CreateOptions) (volume.Volume, error) {
 	f.volCreates = append(f.volCreates, opts)
@@ -283,6 +299,44 @@ func contains(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// A CP/SaaS tenant never pre-seeds the desktop image, and ContainerCreate does
+// not pull — so the first StartDesktop MUST pull it, then still bring the
+// sidecar up. Regression guard for the "fresh org 503s forever" gap.
+func TestLocalSidecar_StartDesktop_PullsMissingImage(t *testing.T) {
+	f := newFakeSidecarDocker()
+	f.imageMissing = true // image absent locally, as on a fresh CP tenant
+	p := NewLocalSidecarProvisioner(f, "desk:img", "wsnet", 6070, 0, 1<<30, "")
+	p.SetControlTokenSecret("test-secret")
+	p.SetSelfContainerID("platform-xyz")
+
+	h, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS})
+	if err != nil {
+		t.Fatalf("StartDesktop with a missing image must pull, not fail: %v", err)
+	}
+	if len(f.imagePulls) != 1 || f.imagePulls[0] != "desk:img" {
+		t.Fatalf("expected exactly one pull of desk:img, got %v", f.imagePulls)
+	}
+	if !h.Running || f.createByName(DesktopContainerName(sidecarTestWS)) == nil {
+		t.Fatalf("sidecar must still be created after the pull: handle=%+v creates=%v", h, f.creates)
+	}
+}
+
+// When the image is already present, StartDesktop must NOT pull (the hot path
+// stays a single cheap inspect, no per-start network round-trip).
+func TestLocalSidecar_StartDesktop_PresentImageSkipsPull(t *testing.T) {
+	f := newFakeSidecarDocker() // imageMissing defaults false = present
+	p := NewLocalSidecarProvisioner(f, "desk:img", "wsnet", 6070, 0, 1<<30, "")
+	p.SetControlTokenSecret("test-secret")
+	p.SetSelfContainerID("platform-xyz")
+
+	if _, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS}); err != nil {
+		t.Fatalf("StartDesktop: %v", err)
+	}
+	if len(f.imagePulls) != 0 {
+		t.Fatalf("present image must not be pulled, got pulls=%v", f.imagePulls)
+	}
 }
 
 func TestLocalSidecar_StartDesktop_Idempotent(t *testing.T) {

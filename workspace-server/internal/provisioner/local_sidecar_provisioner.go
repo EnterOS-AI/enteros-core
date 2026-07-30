@@ -4,16 +4,25 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	dockerimage "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+// desktopImagePullTimeout bounds the ONE-TIME pull of the desktop image when a
+// tenant that has never run the desktop starts it (see ensureImage). Generous
+// because the image is ~GB and a cold registry is slow, but bounded so a wedged
+// registry can never leak the pull goroutine.
+const desktopImagePullTimeout = 10 * time.Minute
 
 // defaultDesktopSeccompProfile is the Chromium-tuned seccomp profile applied to
 // every sidecar (SecurityOpt "seccomp=<content>"). It is the upstream Docker
@@ -43,6 +52,11 @@ type sidecarDocker interface {
 	NetworkRemove(ctx context.Context, networkID string) error
 	NetworkConnect(ctx context.Context, networkID, containerID string, config *network.EndpointSettings) error
 	NetworkDisconnect(ctx context.Context, networkID, containerID string, force bool) error
+	// ImageInspect + ImagePull back ensureImage: ContainerCreate does NOT pull,
+	// so a CP/SaaS tenant that never pre-seeded the desktop image must fetch it
+	// on first StartDesktop. Signatures match the *client.Client SDK (v28).
+	ImageInspect(ctx context.Context, image string, opts ...client.ImageInspectOption) (dockerimage.InspectResponse, error)
+	ImagePull(ctx context.Context, ref string, opts dockerimage.PullOptions) (io.ReadCloser, error)
 }
 
 // LocalSidecarProvisioner is the Docker (self-host) backend of
@@ -248,6 +262,52 @@ func (p *LocalSidecarProvisioner) reconcileEgressBestEffort(ctx context.Context,
 // StartDesktop brings up the workspace's desktop sidecar, idempotently: if it
 // is already running, it returns the handle without creating a second one (the
 // agent's first tool call and a human opening the display can race, §10).
+// ensureImage guarantees the desktop sidecar image is present locally before
+// ContainerCreate (which never pulls). Present-image is the common case and
+// costs one cheap local inspect. When absent — a CP/SaaS tenant on first use —
+// it pulls, DETACHED from the caller's context: StartDesktop sits on the
+// gateway hot path, so the first (necessarily slow, ~GB) screenshot's client
+// timeout must not cancel the pull mid-stream and strand a half-image that
+// every subsequent call re-pulls from zero. The pull is instead bounded by
+// desktopImagePullTimeout; the first few starts return "not running yet" until
+// it lands, exactly like a normal cold boot. A transient (non-not-found)
+// inspect error is left for ContainerCreate to surface rather than forcing a
+// needless pull.
+func (p *LocalSidecarProvisioner) ensureImage(ctx context.Context) error {
+	if _, err := p.cli.ImageInspect(ctx, p.image); err == nil {
+		return nil
+	} else if !isImageNotFound(err) {
+		return nil
+	}
+	log.Printf("desktop: image %q not present — pulling (one-time, up to %s)", p.image, desktopImagePullTimeout)
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), desktopImagePullTimeout)
+	defer cancel()
+	rc, err := p.cli.ImagePull(pctx, p.image, dockerimage.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("pull desktop image %q: %w", p.image, err)
+	}
+	defer func() { _ = rc.Close() }()
+	// Drain the progress stream to completion — the pull is not finished until
+	// the reader hits EOF; discarding is fine, we only need the image local.
+	if _, err := io.Copy(io.Discard, rc); err != nil {
+		return fmt.Errorf("pull desktop image %q (stream): %w", p.image, err)
+	}
+	log.Printf("desktop: image %q pulled", p.image)
+	return nil
+}
+
+// isImageNotFound reports whether a Docker error means the image genuinely is
+// not present locally, versus a transient daemon error. Same string-match
+// rationale as isContainerNotFound (avoids an errdefs dependency; the message
+// is stable across daemon versions and is what the Docker CLI itself matches).
+func isImageNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "No such image") || strings.Contains(s, "not found")
+}
+
 func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg WorkspaceConfig) (DesktopHandle, error) {
 	if running, _ := p.DesktopRunning(ctx, cfg.WorkspaceID); running {
 		// Already-running fast path. RECONCILE the egress plumbing best-effort —
@@ -268,6 +328,13 @@ func (p *LocalSidecarProvisioner) StartDesktop(ctx context.Context, cfg Workspac
 	}
 
 	name := DesktopContainerName(cfg.WorkspaceID)
+
+	// ContainerCreate does NOT pull. On self-host the desktop image is seeded by
+	// the deploy; on a CP/SaaS tenant it is not, so the FIRST start must pull it
+	// (design §5 dependency). Idempotent once present.
+	if err := p.ensureImage(ctx); err != nil {
+		return DesktopHandle{}, err
+	}
 
 	// Persistent profile volume (cookies / live logins) — survives
 	// scale-to-zero; only WipeProfile deletes it. Idempotent create.
