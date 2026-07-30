@@ -13,10 +13,13 @@ import (
 )
 
 type fakeDesktopGW struct {
-	png           []byte
-	inputErr      error
-	screenshotErr error
-	inputs        []json.RawMessage
+	png            []byte
+	inputErr       error
+	screenshotErr  error
+	inputs         []json.RawMessage
+	ensureAddr     string
+	ensureErr      error
+	ensureRunCalls int
 }
 
 func (f *fakeDesktopGW) Screenshot(context.Context, string) ([]byte, error) {
@@ -25,6 +28,10 @@ func (f *fakeDesktopGW) Screenshot(context.Context, string) ([]byte, error) {
 func (f *fakeDesktopGW) Input(_ context.Context, _ string, a json.RawMessage) error {
 	f.inputs = append(f.inputs, a)
 	return f.inputErr
+}
+func (f *fakeDesktopGW) EnsureRunning(context.Context, string) (string, error) {
+	f.ensureRunCalls++
+	return f.ensureAddr, f.ensureErr
 }
 
 func newDesktopReq(method, path, body string) (*gin.Context, *httptest.ResponseRecorder) {
