@@ -656,6 +656,18 @@ jobs:
           # check missed. If a refactor weakens the gate to a shape check,
           # this step goes red on every PR.
           bash tests/e2e/test_completion_assert_unit.sh
+          # Anti-rot guard on the DELEGATION A2A POST's timeout budget. That
+          # call is raw curl (it authenticates as the PARENT WORKSPACE token,
+          # not the tenant admin) and so silently inherited CURL_COMMON's
+          # generic --max-time 30, while the parent leg overrides to 90s.
+          # `message/send` is synchronous — the POST waits out a full cold agent
+          # turn on a just-created child — so 30s took the REQUIRED ephemeral
+          # lane red twice on 2026-07-30 with curl_rc=28/http=000 (core#4961,
+          # core#4958). Offline: greps the harness. If an edit drops the
+          # override back to 30s, or converts it into a retry-on-rc=28 (which
+          # would risk double-delivering a non-idempotent delegation), this
+          # goes red on every PR.
+          bash tests/e2e/test_deleg_a2a_timeout_unit.sh
           # #1994 byok-routing presence-probe (lib/workspace_env_presence.sh) —
           # the shared MOLECULE_LLM_USAGE_TOKEN presence contract used by 8c +
           # the concierge auth gate. Offline: stubs tenant_call and locks the
