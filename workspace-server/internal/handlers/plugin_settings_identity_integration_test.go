@@ -62,6 +62,88 @@ func uninstallPlugin(t *testing.T, conn *sql.DB, ws, name string) {
 	}
 }
 
+// declarePluginWithSource declares a row whose plugin_name and source_raw
+// DISAGREE — the real production shape for the scheduler, which
+// ensureSchedulerPluginDeclared records under its MANIFEST name while carrying
+// the repo source. declarePlugin above cannot express this: it derives the source
+// from the name, so both always agree and the hazard is invisible.
+func declarePluginWithSource(t *testing.T, conn *sql.DB, ws, name, source string) {
+	t.Helper()
+	if _, err := conn.ExecContext(context.Background(), `
+		INSERT INTO workspace_declared_plugins (workspace_id, plugin_name, source_raw)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (workspace_id, plugin_name) DO UPDATE SET source_raw = $3`,
+		ws, name, source); err != nil {
+		t.Fatalf("declare %s (source %s): %v", name, source, err)
+	}
+}
+
+// THE PRODUCTION SHAPE, and the 404 it produced.
+//
+// ensureSchedulerPluginDeclared writes plugin_name = SchedulerPluginName
+// ("molecule-scheduler", the MANIFEST name) with source_raw = the scheduler repo.
+// Verified on a live prod concierge 2026-07-30: the allow-list therefore held
+// "molecule-scheduler" and NOT "molecule-ai-plugin-scheduler", so a GET/PATCH on
+// the install name — the only name the settings file, org-import re-delivery and
+// the runtime's plugin.name lookup all use — returned 404.
+//
+// Resolution derives the name from source_raw, so the install name resolves and
+// the manifest name stays refused. Both directions asserted: accepting the
+// manifest name would put the operator back on a path to a file nothing opens.
+func TestIntegration_PluginSettings_SchedulerDeclaredUnderManifestNameStillResolvesByInstallName(t *testing.T) {
+	conn := settingsTestDB(t)
+	ctx := context.Background()
+	ws := seedSettingsWorkspace(t, conn)
+
+	// Exactly what core writes at every provision.
+	declarePluginWithSource(t, conn, ws, identityManifestName,
+		"gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0")
+
+	got, err := resolvePluginInstallName(ctx, conn, ws, identityInstallName)
+	if err != nil {
+		t.Fatalf("install name must resolve when the row is stored under the manifest name: %v", err)
+	}
+	if got != identityInstallName {
+		t.Fatalf("resolved to %q, want %q", got, identityInstallName)
+	}
+
+	if _, err := resolvePluginInstallName(ctx, conn, ws, identityManifestName); !errors.Is(err, errPluginNotOnWorkspace) {
+		t.Fatalf("the manifest name must STAY refused (it addresses a file nothing opens), got %v", err)
+	}
+
+	// And the refusal hint must name the install name, or the 404 is unactionable.
+	known, err := workspacePluginInstallNames(ctx, conn, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := known[identityInstallName]; !ok {
+		t.Fatalf("allow-list must contain %q, got %v", identityInstallName, sortedNames(known))
+	}
+	if _, ok := known[identityManifestName]; ok {
+		t.Fatalf("allow-list must NOT contain the manifest name, got %v", sortedNames(known))
+	}
+}
+
+// A row whose source cannot be parsed must fall back to plugin_name rather than
+// vanish. Deriving the name is only safe if it never DROPS a plugin: a
+// hand-written bare local name has no repo to derive from, and an operator must
+// still be able to address its settings.
+func TestIntegration_PluginSettings_UnparseableSourceFallsBackToStoredName(t *testing.T) {
+	conn := settingsTestDB(t)
+	ctx := context.Background()
+	ws := seedSettingsWorkspace(t, conn)
+
+	declarePluginWithSource(t, conn, ws, "hand-rolled-plugin", "")
+
+	got, err := resolvePluginInstallName(ctx, conn, ws, "hand-rolled-plugin")
+	if err != nil {
+		t.Fatalf("a source-less row must still resolve by its stored name: %v", err)
+	}
+	if got != "hand-rolled-plugin" {
+		t.Fatalf("resolved to %q, want %q", got, "hand-rolled-plugin")
+	}
+}
+
 // THE PIN. The install name resolves; the manifest name is REFUSED.
 func TestIntegration_PluginSettings_LookupPinnedToInstallName(t *testing.T) {
 	conn := settingsTestDB(t)
