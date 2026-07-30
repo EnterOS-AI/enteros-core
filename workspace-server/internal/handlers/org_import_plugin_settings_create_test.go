@@ -32,6 +32,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -51,6 +53,24 @@ func drivePluginConfigImport(
 	t *testing.T, defaultsPlugins, nodePlugins []templatePluginEntry,
 ) provisioner.WorkspaceConfig {
 	t.Helper()
+	return drivePluginConfigImportWithTemplate(t, defaultsPlugins, nodePlugins, "", "")
+}
+
+// drivePluginConfigImportWithTemplate is the same driver with the TEMPLATE layer
+// available: when nodeTemplate is non-empty a template directory of that name is
+// written under the handler's configsDir carrying templateConfigYAML, and the org
+// node references it via `template:`.
+//
+// Split out rather than folded in because the template layer needs a real
+// directory on disk — org import reads `<configsDir>/<template>/config.yaml`, so
+// the layer cannot be exercised by passing entries in memory the way defaults and
+// node can. That asymmetry is exactly why the template layer of the three-layer
+// render had no end-to-end coverage until this.
+func drivePluginConfigImportWithTemplate(
+	t *testing.T, defaultsPlugins, nodePlugins []templatePluginEntry,
+	nodeTemplate, templateConfigYAML string,
+) provisioner.WorkspaceConfig {
+	t.Helper()
 
 	mock := setupTestDB(t)
 	mock.MatchExpectationsInOrder(false)
@@ -61,10 +81,20 @@ func drivePluginConfigImport(
 	t.Setenv("MOLECULE_DEPLOY_MODE", "saas")
 
 	broadcaster := newTestBroadcaster()
-	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", t.TempDir())
+	configsDir := t.TempDir()
+	wh := NewWorkspaceHandler(broadcaster, nil, "http://localhost:8080", configsDir)
 	capture := &captureCPProv{}
 	wh.SetCPProvisioner(capture)
-	h := &OrgHandler{workspace: wh, broadcaster: broadcaster}
+	h := &OrgHandler{workspace: wh, broadcaster: broadcaster, configsDir: configsDir}
+	if nodeTemplate != "" {
+		dir := filepath.Join(configsDir, nodeTemplate)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir template dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(templateConfigYAML), 0o644); err != nil {
+			t.Fatalf("write template config: %v", err)
+		}
+	}
 
 	mock.ExpectQuery(`INSERT INTO workspaces`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("ws-plugin-config-leaf"))
@@ -85,10 +115,11 @@ func drivePluginConfigImport(
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	ws := OrgWorkspace{
-		Name:    "Plugin Config Leaf",
-		Runtime: "claude-code",
-		Model:   "anthropic:claude-opus-4-7",
-		Plugins: nodePlugins,
+		Name:     "Plugin Config Leaf",
+		Runtime:  "claude-code",
+		Model:    "anthropic:claude-opus-4-7",
+		Plugins:  nodePlugins,
+		Template: nodeTemplate,
 	}
 
 	results := []map[string]interface{}{}
@@ -241,6 +272,68 @@ func TestOrgImport_NodeOptOutRemovesInheritedSettings(t *testing.T) {
 
 	if _, ok := cfg.ConfigFiles[schedulerSettingsRelPath]; ok {
 		t.Error("a declined plugin must not keep the settings file its inherited layer rendered")
+	}
+}
+
+// TestOrgImport_NodeTemplatePluginConfig_IsDelivered — the TEMPLATE layer, which
+// is the one that needs a real directory and therefore the one that was easiest
+// to leave untested.
+//
+// A node that names `template: <name>` inherits that template's `plugins:` (M6 /
+// FIX 3). Its `config:` has to travel with it — a template is exactly the thing
+// that knows how its own plugin should be configured.
+func TestOrgImport_NodeTemplatePluginConfig_IsDelivered(t *testing.T) {
+	cfg := drivePluginConfigImportWithTemplate(t, nil, nil, "seo-agent",
+		"runtime: claude-code\nplugins:\n  - source: "+SchedulerPluginSource+
+			"\n    config:\n      schedules:\n        - name: from-template\n")
+
+	if got := firstScheduleName(t, deliveredSchedulerSettings(t, cfg)); got != "from-template" {
+		t.Errorf("template layer not delivered, got %q", got)
+	}
+}
+
+// Precedence across ALL THREE layers at once, which no single-layer test can
+// establish: TEMPLATE -> org DEFAULTS -> NODE, last wins.
+func TestOrgImport_ThreeLayerPrecedence_NodeWinsOverDefaultsOverTemplate(t *testing.T) {
+	cfg := drivePluginConfigImportWithTemplate(t,
+		[]templatePluginEntry{{
+			Source: SchedulerPluginSource,
+			Config: map[string]any{"schedules": []any{map[string]any{"name": "from-defaults"}}},
+		}},
+		[]templatePluginEntry{{
+			Source: SchedulerPluginSource,
+			Config: map[string]any{"schedules": []any{map[string]any{"name": "from-node"}}},
+		}},
+		"seo-agent",
+		"runtime: claude-code\nplugins:\n  - source: "+SchedulerPluginSource+
+			"\n    config:\n      schedules:\n        - name: from-template\n")
+
+	if got := firstScheduleName(t, deliveredSchedulerSettings(t, cfg)); got != "from-node" {
+		t.Errorf("node must win over defaults and template, got %q", got)
+	}
+}
+
+// A node may DECLINE a plugin its template contributes. The declaration merge
+// already honours that; the settings must not survive it.
+func TestOrgImport_NodeDeclinesTemplatePlugin_SettingsGoToo(t *testing.T) {
+	cfg := drivePluginConfigImportWithTemplate(t, nil,
+		[]templatePluginEntry{{Source: "!" + SchedulerPluginSource}},
+		"seo-agent",
+		"runtime: claude-code\nplugins:\n  - source: "+SchedulerPluginSource+
+			"\n    config:\n      schedules:\n        - name: declined-template-entry\n")
+
+	if _, ok := cfg.ConfigFiles[schedulerSettingsRelPath]; ok {
+		t.Error("declining a template-contributed plugin must not leave its settings behind")
+	}
+}
+
+// A node with NO `template:` must be byte-identical to before — the M6 gating.
+func TestOrgImport_NoNodeTemplate_TemplateLayerIsNotConsulted(t *testing.T) {
+	cfg := drivePluginConfigImportWithTemplate(t, nil, nil, "", "")
+	for rel := range cfg.ConfigFiles {
+		if rel != "config.yaml" {
+			t.Errorf("unexpected delivered file %q when the node names no template", rel)
+		}
 	}
 }
 
