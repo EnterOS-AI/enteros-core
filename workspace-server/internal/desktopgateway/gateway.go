@@ -155,6 +155,16 @@ func (g *Gateway) Input(ctx context.Context, workspaceID string, action json.Raw
 	return nil
 }
 
+// EnsureRunning is the exported entry point for callers OUTSIDE the agent
+// screenshot/input path — specifically the human display path, which must bring
+// the desktop up when a human opens the viewer even if no agent has started it.
+// It goes through the same ensureRunning as the agent path, so scale-up records
+// the 'running' lifecycle state (the idle sweeper can still reap it) rather than
+// starting an unrecorded sidecar that would leak.
+func (g *Gateway) EnsureRunning(ctx context.Context, workspaceID string) (string, error) {
+	return g.ensureRunning(ctx, workspaceID)
+}
+
 // ensureRunning scales the desktop from zero if needed and returns the sidecar
 // address. StartDesktop is idempotent, so this is safe whether or not the
 // desktop is already up. On an unwired backend it returns
