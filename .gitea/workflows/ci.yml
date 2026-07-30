@@ -790,6 +790,16 @@ jobs:
           # no-match (or transient docker ps failure) as retryable under
           # errexit+pipefail instead of aborting the live staging harness.
           bash tests/e2e/lib/test_reconciler_container_unit.sh
+          # core#4980: a workspace status of `online` is not evidence that the
+          # container is up — they are separate events, and the self-host
+          # concierge lane (REQUIRED) reddened a comment-only PR by asserting
+          # `docker ps` the instant it read `online`. Offline (injected state
+          # reader, zero real sleeps): proves a late container is WAITED for and
+          # passes, an exited/dead one fails FAST on the first probe instead of
+          # burning the budget, and one that never appears fails at the bound
+          # with a DISTINCT message. Probe counts are asserted, so a regression
+          # that turns this into a can-only-pass sleep goes red here.
+          bash tests/e2e/lib/test_container_running_wait_unit.sh
           # core#4370: bounded idle-digest evidence polling and fail-closed
           # Docker preflight. Offline: proves missing Docker or an unreachable
           # daemon cannot silently skip E2E_IDLE_DIGEST_CHECK=on.
