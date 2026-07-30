@@ -12,6 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "tests" / "e2e" / "lib" / "redact_secrets.py"
+OPS_WORKFLOW = ROOT / ".gitea" / "workflows" / "test-ops-scripts.yml"
 E2E_SCRIPTS = (
     ROOT / "tests" / "e2e" / "test_staging_external_runtime.sh",
     ROOT / "tests" / "e2e" / "test_staging_full_saas.sh",
@@ -53,6 +54,16 @@ def _sanitizer_definition_precedes_calls(text: str) -> bool:
 
 
 class SanitizeHttpBodyTests(unittest.TestCase):
+    def test_required_ops_workflow_executes_this_contract_once(self) -> None:
+        workflow = OPS_WORKFLOW.read_text(encoding="utf-8")
+        command = "python3 tests/e2e/test_sanitize_http_body.py"
+
+        self.assertEqual(
+            workflow.count(command),
+            1,
+            "the required Ops Scripts context must execute the sanitizer contract once",
+        )
+
     def test_registration_json_redacts_secrets_but_keeps_proof_fields(self) -> None:
         sanitizer = _load_helper()
         payload = (

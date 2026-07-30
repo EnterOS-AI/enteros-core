@@ -195,6 +195,13 @@ jobs:
         # the logic into ci.yml) fails CI.
         run: bash .gitea/scripts/tests/test_all_required_check.sh
 
+      - name: E2E HTTP diagnostic sanitizer contract
+        # This required context runs for the E2E/workflow path shape changed by
+        # the redaction PR. Keep the behavioral test here as well as in ci.yml
+        # so a path-classifier decision cannot leave credential diagnostics
+        # locally green but unexecuted on the pull request.
+        run: python3 tests/e2e/test_sanitize_http_body.py
+
       - name: clone-manifest.sh tolerant-bootstrap contract (network-free)
         # Regression lock for the strict/best-effort split in clone-manifest.sh:
         # tokenless dev bootstrap must skip ONLY `private: true` repos and still
