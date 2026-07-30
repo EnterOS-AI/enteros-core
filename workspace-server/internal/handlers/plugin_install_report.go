@@ -297,8 +297,19 @@ func nonNilStrings(in []string) []string {
 	return in
 }
 
-// pluginInstallReportRow is the read shape returned by Get and embedded in the
-// workspace read.
+// pluginInstallReportRow is the read shape returned by Get.
+//
+// It is NOT embedded in the workspace read. That claim used to be made here and
+// in the SDK contract's `consumers` entry, and it was never true — nothing
+// outside Get calls loadPluginInstallReport. Because the contract is the
+// cross-repo SSOT, the false promise was what the next consumer would have
+// built against: a canvas/CP workspace-detail panel wired to a
+// `plugin_install_report` field on GET /workspaces/:id that does not exist, and
+// which would therefore have shipped permanently empty. molecule-ai-sdk#190
+// corrected the contract side; this corrects its twin here.
+//
+// If the workspace-read embed is wanted, it is a real feature to implement, not
+// a comment to restore.
 type pluginInstallReportRow struct {
 	Declared   bool      `json:"declared"`
 	PluginsDir string    `json:"plugins_dir"`
