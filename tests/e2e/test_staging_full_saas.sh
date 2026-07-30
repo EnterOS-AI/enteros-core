@@ -176,6 +176,11 @@ source "$(dirname "$0")/lib/collision-proof-slug.sh"
 # shellcheck source=lib/idle_digest_wait.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/idle_digest_wait.sh"
+# Signal-driven waits for the kind:trigger scheduler daemon (fire evidence vs a
+# wedged tick loop vs a live-but-not-yet-fired daemon). Unit-tested offline by
+# lib/test_trigger_daemon_wait_unit.sh.
+# shellcheck source=lib/trigger_daemon_wait.sh
+source "$(dirname "$0")/lib/trigger_daemon_wait.sh"
 # shellcheck source=lib/self_schedule_create_retry.sh
 # shellcheck disable=SC1091
 source "$(dirname "$0")/lib/self_schedule_create_retry.sh"
@@ -3101,83 +3106,32 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
       return 1
     }
 
-    # Age in whole seconds of the TARGET daemon's heartbeat, or "" when the
-    # heartbeat is absent/unreadable. Both the file and this clock are on the
-    # same box, so no skew correction is needed.
-    scheduler_tick_age_secs() {
-      local _health
-      [ -n "$_SCHED_TARGET_SC" ] || { echo ""; return 0; }
-      _health=$(docker exec "$_SCHED_TARGET_SC" sh -c 'cat /configs/schedules/schedule-health.json 2>/dev/null' 2>/dev/null) || true
-      [ -n "$_health" ] || { echo ""; return 0; }
-      HEALTH_JSON="$_health" python3 -c "
-import datetime as dt, json, os
-try:
-    tick = json.loads(os.environ['HEALTH_JSON']).get('last_tick')
-    if not tick:
-        print('')
-    else:
-        ts = dt.datetime.fromisoformat(tick)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=dt.timezone.utc)
-        print(int((dt.datetime.now(dt.timezone.utc) - ts).total_seconds()))
-except Exception:
-    print('')
-" 2>/dev/null || echo ""
-    }
-
     # ── 10d.4 Fire wait — driven by the daemon's liveness signal ─────────────
-    # The daemon (plugin >= v0.2.1 / SDK >= 0.5.6) never blocks its tick on a
-    # delivery: schedule-health.json's `last_tick` advances every poll even while
-    # a fire is in flight, and a wedged delivery is cancelled + RE-QUEUED by the
-    # daemon's own watchdog. That makes last_tick a TRUE liveness signal, so this
-    # step keys on evidence instead of counting seconds:
-    #
-    #   fire evidence            -> pass IMMEDIATELY (no residual sleep)
-    #   last_tick stale          -> FAIL FAST: the daemon stopped ticking while
-    #                               our schedule is armed on its grid. More time
-    #                               cannot help. This is the exact signature of
-    #                               the incident this wait was rewritten for
-    #                               (owner frozen at last_tick 21:16:57 for 6m22s
-    #                               while two idle siblings kept ticking).
-    #   otherwise                -> keep waiting; the daemon is PROVABLY alive.
-    #
-    # The hard cap is a never-hit backstop, and it must EXCEED the daemon's own
-    # delivery watchdog — otherwise we give up while a wedged fire is still being
-    # re-queued for its retry. The previous fixed 360s budget was SHORTER than
-    # that 600s watchdog, so it could not observe the recovery it was waiting on:
-    # any first fire landing in a settling window was an automatic red.
-    _SCHED_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}"
-    _SCHED_BACKSTOP_SECS="${E2E_SCHEDULER_TIMEOUT_SECS:-}"
-    if [ -z "$_SCHED_BACKSTOP_SECS" ]; then
-      _SCHED_BACKSTOP_SECS=$(( _SCHED_WATCHDOG_SECS * 3 ))
-    fi
-    # Six missed polls (>=60s) before calling a daemon dead: long enough that a
-    # loaded box never trips it, short enough to fail in ~1min instead of ~10.
-    _SCHED_STALE_SECS=$(( _SCHED_POLL_SECS * 6 ))
-    [ "$_SCHED_STALE_SECS" -ge 60 ] || _SCHED_STALE_SECS=60
+    # lib/trigger_daemon_wait.sh owns the policy (see its header for WHY a fixed
+    # budget was wrong here). Outcomes: 0 evidence, 2 the daemon stopped ticking
+    # while our schedule is armed (fail fast — more time cannot help), 1 the
+    # backstop elapsed while the daemon kept ticking (a different defect, so a
+    # different message). The backstop derives from the daemon's own delivery
+    # watchdog so it can never again be SHORTER than the thing it waits on.
+    _SCHED_STALE_SECS=$(trigger_daemon_stale_secs "$_SCHED_POLL_SECS")
+    _SCHED_BACKSTOP_SECS="${E2E_SCHEDULER_TIMEOUT_SECS:-$(TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}" trigger_daemon_backstop_secs)}"
 
-    log "    Scheduler: waiting for '$_SCHED_NAME' to fire — pass on fire evidence, FAIL FAST if ${_SCHED_TARGET_SC}'s last_tick goes stale (>${_SCHED_STALE_SECS}s), backstop ${_SCHED_BACKSTOP_SECS}s (>${_SCHED_WATCHDOG_SECS}s delivery watchdog; poll=${_SCHED_POLL_SECS}s)."
-    _sched_waited=0
-    while true; do
-      if scheduler_fire_probe; then
-        ok "    scheduler autonomously FIRED '$_SCHED_NAME' after ${_sched_waited}s (evidence: $_SCHED_FIRED)"
-        break
-      fi
-
-      _sched_tick_age=$(scheduler_tick_age_secs)
-      if [ -n "$_sched_tick_age" ] && [ "$_sched_tick_age" -gt "$_SCHED_STALE_SECS" ]; then
+    log "    Scheduler: waiting for '$_SCHED_NAME' to fire — pass on fire evidence, FAIL FAST if ${_SCHED_TARGET_SC}'s last_tick goes stale (>${_SCHED_STALE_SECS}s), backstop ${_SCHED_BACKSTOP_SECS}s (poll=${_SCHED_POLL_SECS}s)."
+    _sched_rc=0
+    trigger_daemon_wait "$_SCHED_TARGET_SC" "$_SCHED_BACKSTOP_SECS" "$_SCHED_POLL_SECS"       "$_SCHED_STALE_SECS" scheduler_fire_probe || _sched_rc=$?
+    case "$_sched_rc" in
+      0)
+        ok "    scheduler autonomously FIRED '$_SCHED_NAME' (evidence: $_SCHED_FIRED)"
+        ;;
+      2)
         scheduler_diagnostics
-        fail "Scheduler: the trigger daemon STOPPED TICKING. $_SCHED_TARGET_SC last wrote schedule-health.json ${_sched_tick_age}s ago (> ${_SCHED_STALE_SECS}s = 6x its ${_SCHED_POLL_SECS}s poll) while '$_SCHED_NAME' is armed on its own volume grid. A daemon at or after plugin v0.2.1 / SDK 0.5.6 advances last_tick every poll even mid-delivery, so a frozen heartbeat is not slowness — the tick loop is wedged (alive-but-hung: the supervisor sees a live process and never restarts it, and health keeps reporting armed:N/errors:{}). Waiting longer cannot fix this. Check the workspace is running a daemon at that version or newer: an older one delivers INSIDE the tick and freezes exactly this way."
-      fi
-
-      if [ "$_sched_waited" -ge "$_SCHED_BACKSTOP_SECS" ]; then
+        fail "Scheduler: the trigger daemon STOPPED TICKING. $_SCHED_TARGET_SC last wrote schedule-health.json ${TRIGGER_DAEMON_LAST_AGE}s ago (> ${_SCHED_STALE_SECS}s) while '$_SCHED_NAME' is armed on its own volume grid. A daemon at or after molecule-scheduler v0.2.1 / SDK 0.5.6 advances last_tick every poll even mid-delivery, so a frozen heartbeat is not slowness — the tick loop is wedged (alive-but-hung: the supervisor sees a live process and never restarts it, and health keeps reporting armed:N/errors:{}). Waiting longer cannot fix this. Check the workspace runs a daemon at that version or newer; an older one delivers INSIDE the tick and freezes exactly this way."
+        ;;
+      *)
         scheduler_diagnostics
-        fail "Scheduler: '$_SCHED_NAME' never fired within the ${_SCHED_BACKSTOP_SECS}s backstop, yet the daemon kept ticking the whole time (last_tick age ${_sched_tick_age:-unknown}s) — so this is NOT the frozen-tick failure. The grid/health/history diagnostics above name the leg: grid+health present but no history = the daemon is armed and alive but the delivery lane never completed a self-scheduler turn (agent unreachable for longer than the ${_SCHED_WATCHDOG_SECS}s watchdog can bridge, or the turn path is broken)."
-      fi
-
-      sleep "$_SCHED_POLL_SECS"
-      _sched_waited=$(( _sched_waited + _SCHED_POLL_SECS ))
-    done
+        fail "Scheduler: '$_SCHED_NAME' never fired within the ${_SCHED_BACKSTOP_SECS}s backstop, yet the daemon kept ticking the whole time (last_tick age ${TRIGGER_DAEMON_LAST_AGE:-unknown}s) — so this is NOT the frozen-tick failure. The grid/health/history diagnostics above name the leg: grid+health present but no history = the daemon is armed and alive but the delivery lane never completed a self-scheduler turn."
+        ;;
+    esac
 
     unset -f scheduler_capability_ready scheduler_create_once scheduler_grid_has_entry scheduler_fire_probe scheduler_tick_age_secs scheduler_diagnostics
   else
@@ -3259,7 +3213,10 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
     # AgentMessageWriter; a distinct token so a stale row on a recycled container
     # cannot false-pass and the fire alone cannot produce it.
     _DLV_MARKER="E2E-SMTU-DELIVER-${E2E_RUN_ID:-local}"
-    _DLV_FIRE_TIMEOUT_SECS="${E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-360}}"
+    # Backstop, not a budget: it must exceed the daemon's delivery watchdog for
+    # the same reason 10d's does (a 360s cap could expire while a wedged fire was
+    # still being re-queued for retry, so it could never observe the recovery).
+    _DLV_FIRE_TIMEOUT_SECS="${E2E_SCHEDULE_DELIVER_FIRE_TIMEOUT_SECS:-${E2E_SCHEDULER_TIMEOUT_SECS:-$(TRIGGER_DAEMON_WATCHDOG_SECS="${E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS:-600}" trigger_daemon_backstop_secs)}}"
     # DELIVER window spans MULTIPLE fires: a `* * * * *` schedule re-fires every
     # minute and each fire is an INDEPENDENT chance for the model to invoke the
     # tool. Polling across ≥3 fire cycles absorbs the occasional turn where a
@@ -3334,10 +3291,19 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
       done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
       return 1
     }
-    log "    DELIVER: polling FIRE evidence for '$_DLV_NAME' (up to ${_DLV_FIRE_TIMEOUT_SECS}s; poll=${_DLV_POLL_SECS}s)."
-    if ! idle_digest_wait "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_fire_probe; then
+    # Same signal-driven policy as 10d: this is the SAME daemon and the same
+    # failure mode, so it must not go back to guessing after a fixed budget.
+    # _DLV_GRID_EVIDENCE is the container whose grid carries THIS schedule.
+    _DLV_STALE_SECS=$(trigger_daemon_stale_secs "$_DLV_POLL_SECS")
+    log "    DELIVER: waiting for FIRE evidence for '$_DLV_NAME' — FAIL FAST if ${_DLV_GRID_EVIDENCE}'s last_tick goes stale (>${_DLV_STALE_SECS}s), backstop ${_DLV_FIRE_TIMEOUT_SECS}s (poll=${_DLV_POLL_SECS}s)."
+    _dlv_rc=0
+    trigger_daemon_wait "$_DLV_GRID_EVIDENCE" "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS"       "$_DLV_STALE_SECS" deliver_fire_probe || _dlv_rc=$?
+    if [ "$_dlv_rc" = "2" ]; then
       scheduler_deliver_diagnostics
-      fail "10g DELIVER: schedule '$_DLV_NAME' reached the grid but the daemon never FIRED it within ${_DLV_FIRE_TIMEOUT_SECS}s (grid present, no history) — a FIRE-path failure surfaced on the DELIVER schedule; see 10d for the shared mechanism."
+      fail "10g DELIVER: the trigger daemon STOPPED TICKING — $_DLV_GRID_EVIDENCE last wrote schedule-health.json ${TRIGGER_DAEMON_LAST_AGE}s ago (> ${_DLV_STALE_SECS}s) with '$_DLV_NAME' armed on its grid. Same wedged-tick signature as 10d (see that step's message); more time cannot help."
+    elif [ "$_dlv_rc" != "0" ]; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: schedule '$_DLV_NAME' reached the grid but the daemon never FIRED it within the ${_DLV_FIRE_TIMEOUT_SECS}s backstop, while still ticking (last_tick age ${TRIGGER_DAEMON_LAST_AGE:-unknown}s) — grid present, no history: a FIRE-path failure surfaced on the DELIVER schedule; see 10d for the shared mechanism."
     fi
     ok "    DELIVER schedule FIRED (evidence: $_DLV_FIRED) — turn self-scheduled; now asserting it DELIVERED"
 
@@ -3380,8 +3346,19 @@ sys.exit(1)
       [ "$_rc" = "0" ] && _DLV_DELIVERED="activity a2a_receive/notify row carries '$_DLV_MARKER'"
       return "$_rc"
     }
-    log "    DELIVER: polling delivery ground-truth (activity a2a_receive/notify row with marker '$_DLV_MARKER') for up to ${_DLV_DELIVER_TIMEOUT_SECS}s across ~$(( _DLV_DELIVER_TIMEOUT_SECS / 60 )) fire cycles (poll=${_DLV_POLL_SECS}s)."
-    if idle_digest_wait "$_DLV_DELIVER_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_probe; then
+    # This budget stays a real, reasoned window (multiple fire cycles absorb a
+    # nondeterministic model that acks in text without calling the tool) — it is
+    # NOT a blind guess like the fire waits were. But a wedged daemon must still
+    # fail fast rather than burn the whole window: no further fire can occur, so
+    # no further chance at the tool call exists.
+    log "    DELIVER: polling delivery ground-truth (activity a2a_receive/notify row with marker '$_DLV_MARKER') for up to ${_DLV_DELIVER_TIMEOUT_SECS}s across ~$(( _DLV_DELIVER_TIMEOUT_SECS / 60 )) fire cycles (poll=${_DLV_POLL_SECS}s; FAIL FAST if the daemon stops ticking)."
+    _dlv_deliver_rc=0
+    trigger_daemon_wait "$_DLV_GRID_EVIDENCE" "$_DLV_DELIVER_TIMEOUT_SECS" "$_DLV_POLL_SECS"       "$_DLV_STALE_SECS" deliver_probe || _dlv_deliver_rc=$?
+    if [ "$_dlv_deliver_rc" = "2" ]; then
+      scheduler_deliver_diagnostics
+      fail "10g DELIVER: the trigger daemon STOPPED TICKING mid-window — $_DLV_GRID_EVIDENCE last wrote schedule-health.json ${TRIGGER_DAEMON_LAST_AGE}s ago (> ${_DLV_STALE_SECS}s). No further fire can occur, so no further chance at the send_message_to_user call; the remaining window would have been dead time."
+    fi
+    if [ "$_dlv_deliver_rc" = "0" ]; then
       ok "    scheduler fired turn DELIVERED to the user via send_message_to_user (evidence: $_DLV_DELIVERED) — #4555 fire→deliver proven live on this real-LLM arm"
     else
       scheduler_deliver_diagnostics
