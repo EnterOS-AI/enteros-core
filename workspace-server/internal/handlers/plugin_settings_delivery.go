@@ -41,7 +41,7 @@ import (
 	"fmt"
 	"log"
 	"path"
-	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -94,6 +94,56 @@ func (e *templatePluginEntry) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// UnmarshalJSON mirrors UnmarshalYAML: a JSON string is a bare source, a JSON
+// object is {source, config}.
+//
+// This is NOT symmetry for its own sake — it is load-bearing. `plugins:` is
+// decoded from YAML on the file path but from JSON on POST /org/import with an
+// INLINE template (OrgTemplate binds via c.ShouldBindJSON). #4944 changed
+// OrgDefaults/OrgWorkspace.Plugins from []string to []templatePluginEntry and
+// gave the type only an UnmarshalYAML, so the inline-import path started
+// rejecting the BARE-STRING form that every template in the fleet uses:
+//
+//	json: cannot unmarshal string into Go struct field
+//	OrgDefaults.plugins of type handlers.templatePluginEntry
+//
+// Found by actually exercising /org/import against a live tenant, whose
+// defaults were `plugins: [browser-automation]` — the whole import 400'd with
+// "invalid request body". The object form decoded fine, which is why unit tests
+// over the YAML path stayed green: a widened type is only as wide as its
+// NARROWEST decoder.
+func (e *templatePluginEntry) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		e.Source = s
+		return nil
+	}
+	var alt struct {
+		Source string         `json:"source"`
+		Config map[string]any `json:"config"`
+	}
+	if err := json.Unmarshal(data, &alt); err != nil {
+		return fmt.Errorf("plugin entry must be a source string or {source, config}: %w", err)
+	}
+	if alt.Source == "" {
+		return fmt.Errorf("plugin entry object is missing `source`")
+	}
+	e.Source, e.Config = alt.Source, alt.Config
+	return nil
+}
+
+// MarshalJSON round-trips the same two forms so a re-serialised template stays
+// loadable: config-less entries collapse back to a plain string.
+func (e templatePluginEntry) MarshalJSON() ([]byte, error) {
+	if len(e.Config) == 0 {
+		return json.Marshal(e.Source)
+	}
+	return json.Marshal(struct {
+		Source string         `json:"source"`
+		Config map[string]any `json:"config"`
+	}{e.Source, e.Config})
+}
+
 // pluginEntrySources projects entries down to the source strings the merge /
 // dedup / opt-out layer works in. Kept as a projection rather than changing
 // mergePlugins' signature: the "!"/"-" opt-out grammar, the collision rules and
@@ -138,24 +188,100 @@ func renderPluginSettingsFiles(configYAML []byte, wsName string) (map[string][]b
 	if err := yaml.Unmarshal(configYAML, &parsed); err != nil {
 		return nil, fmt.Errorf("parse template plugins for settings: %w", err)
 	}
-	if len(parsed.Plugins) == 0 {
-		return nil, nil
+	return renderPluginSettingsFromEntries(wsName, parsed.Plugins), nil
+}
+
+// templateConfigPluginEntriesFrom decodes a template config.yaml's `plugins:`
+// block into entries, for callers that want to combine it with OTHER layers
+// rather than render it alone.
+//
+// Fail-soft: an unparseable block yields no entries and a log line. A malformed
+// template config must never block an org import — the same contract
+// renderPluginSettingsFiles' caller already honours by logging and continuing.
+func templateConfigPluginEntriesFrom(configYAML []byte, wsName string) []templatePluginEntry {
+	if len(configYAML) == 0 {
+		return nil
 	}
+	var parsed templateConfigPluginEntries
+	if err := yaml.Unmarshal(configYAML, &parsed); err != nil {
+		log.Printf("%s: plugin settings: cannot parse template plugins block: %v — template layer skipped", wsName, err)
+		return nil
+	}
+	return parsed.Plugins
+}
 
+// renderPluginSettingsFromEntries is the same renderer addressed by ENTRIES
+// rather than by a config.yaml document.
+//
+// Two callers need the identical projection from different starting points, and
+// only one of them has a config.yaml to parse:
+//
+//	WorkspaceHandler.Create   holds the template's config.yaml bytes
+//	POST /org/import          holds the org node's decoded `plugins:` lists and
+//	                          NEVER writes them into the generated config.yaml
+//
+// That asymmetry is why the create half of org import silently produced no
+// settings at all. Verified in production 2026-07-30 on the founder org: a node
+// declaring `plugins[].config.schedules` imported to a workspace whose /configs
+// carried no plugin-settings file, so the runtime's trigger-plugin seeding had
+// nothing to read and the schedule grid came back `[]`. Re-importing the SAME
+// template then delivered it via the skip path (#4947) — i.e. the first import
+// lost the config and the second one fixed it, with nothing to tell an operator
+// they had to run it twice.
+//
+// LAYERS are applied in order, last wins per install name, matching the
+// TEMPLATE -> org DEFAULTS -> NODE precedence the declaration merge already
+// uses. Passing one layer is the single-source case.
+//
+// ORDER WITHIN A LAYER IS THE AUTHORED ORDER, and the last entry to claim an
+// install name wins. That is a deliberate change from the previous
+// sort-by-source pass, which is why it is stated rather than left implicit:
+//
+//   - The output is a map keyed by file path, so sorting bought no byte-identity
+//     — its only observable effect was deciding which of two same-install-name
+//     entries in ONE layer survived, by source string.
+//   - `mergePlugins` — the declaration half of the same `plugins:` block —
+//     already resolves a same-layer `!X` then `X` in authored order. Sorting the
+//     settings pass made the two halves disagree about the same template text,
+//     with `!` (0x21) sorting ahead of every source so an opt-out could never
+//     lose to a later re-declaration even when the author clearly intended it to.
+//
+// Per-entry validate-and-skip: one unusable entry never drops its siblings.
+func renderPluginSettingsFromEntries(wsName string, layers ...[]templatePluginEntry) map[string][]byte {
 	out := map[string][]byte{}
-	// Deterministic order so a re-provision produces byte-identical output and
-	// does not churn the delivered bundle.
-	entries := make([]templatePluginEntry, len(parsed.Plugins))
-	copy(entries, parsed.Plugins)
-	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Source < entries[j].Source })
+	for _, layer := range layers {
+		renderPluginSettingsLayer(out, wsName, layer)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
 
+// renderPluginSettingsLayer applies one layer's entries to out, in order.
+func renderPluginSettingsLayer(out map[string][]byte, wsName string, entries []templatePluginEntry) {
 	for _, entry := range entries {
-		if len(entry.Config) == 0 {
+		// The opt-out markers the merge layer understands ("!source" /
+		// "-source") are REMOVALS. Skipping them is not enough: a node that
+		// DECLINES an inherited plugin would still receive the settings file the
+		// template/defaults layer rendered for it, and the workspace would carry
+		// live config for a plugin it deliberately does not have. Harmless to the
+		// runtime — nothing opens it — but it is exactly the stale-config class
+		// this milestone exists to stop shipping, and an operator reading
+		// /configs would be misled about what the box is configured to do.
+		if len(entry.Source) > 0 && (entry.Source[0] == '!' || entry.Source[0] == '-') {
+			target := strings.TrimLeft(entry.Source, "!-")
+			if target == "" {
+				continue
+			}
+			name, err := plugins.PluginNameFromSource(target)
+			if err != nil || name == "" || name != path.Base(name) {
+				continue
+			}
+			delete(out, path.Join(pluginSettingsDirName, name+".json"))
 			continue
 		}
-		// The opt-out markers the merge layer understands ("!name" / "-name")
-		// are removals, not installs — they carry no settings.
-		if len(entry.Source) > 0 && (entry.Source[0] == '!' || entry.Source[0] == '-') {
+		if len(entry.Config) == 0 {
 			continue
 		}
 		name, err := plugins.PluginNameFromSource(entry.Source)
@@ -181,10 +307,6 @@ func renderPluginSettingsFiles(configYAML []byte, wsName string) (map[string][]b
 		}
 		out[path.Join(pluginSettingsDirName, name+".json")] = append(body, '\n')
 	}
-	if len(out) == 0 {
-		return nil, nil
-	}
-	return out, nil
 }
 
 // mergePluginSettingsIntoConfigFiles adds rendered settings to a ConfigFiles

@@ -21,7 +21,14 @@ func TestNativeRegistry_SourcesByteIdenticalToRetiredConsts(t *testing.T) {
 		got        string
 		wantSource string
 	}{
-		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0"},
+		// v0.2.0 -> v0.2.1 (2026-07-30, deliberate): v0.2.1 regenerates the
+		// trigger daemon from SDK 0.5.6, where fire delivery is decoupled from
+		// the tick loop. v0.2.0 froze its whole poll loop on a delivery to a
+		// settling agent (last_tick stuck 6m22s, health still reporting
+		// armed:1/errors:{}), so a tenant's schedules stopped firing until the
+		// container was replaced. This literal is the frozen expectation, so
+		// bumping it here IS the review this gate exists to force.
+		{SchedulerPluginName, SchedulerPluginSource, "gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.1"},
 		{conciergePlatformMCPName, conciergePlatformMCPSource, "gitea://molecule-ai/molecule-ai-plugin-molecule-platform-mcp#main"},
 	}
 	for _, c := range cases {

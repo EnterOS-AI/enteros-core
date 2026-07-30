@@ -223,11 +223,25 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			"parent_id":   parentRef,
 			"tier":        tier,
 		})
+		// The workspace already exists, so create+provision is correctly
+		// skipped — but its DECLARED plugins[].config still has to reach the
+		// box. Before this, the skip returned here and the M6 config wiring
+		// below was never reached, so an existing workspace could never pick up
+		// a node's declared settings by ANY route (restart reuses stored
+		// config; tenant redeploy replaces only the control plane). That is how
+		// a live tenant ran stock template config while its org.yaml declared
+		// 11 schedules. Re-delivery makes /org/import the platform ability for
+		// this; nil deliverer = byte-identical to the old behaviour.
+		redelivered := h.redeliverDeclaredPluginSettings(ctx, existingID, ws.Name, ws.Plugins)
 		*results = append(*results, map[string]interface{}{
 			"id":      existingID,
 			"name":    ws.Name,
 			"tier":    tier,
 			"skipped": true,
+			// Reported so a caller can tell "skipped, nothing to do" apart from
+			// "skipped, but settings were refreshed" — the two were previously
+			// indistinguishable in the response.
+			"settings_redelivered": redelivered,
 		})
 		return h.recurseChildrenForImport(ws, existingID, absX, absY, defaults, orgBaseDir, results, provisionSem)
 	}
@@ -459,9 +473,14 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 		// plugin. Template-first ordering: the first source to claim an install
 		// name wins on collision.
 		templatePlugins := []string(nil)
+		templatePluginEntries := []templatePluginEntry(nil)
 		if nodeTemplatePath != "" {
 			if tmplCfg, readErr := os.ReadFile(filepath.Join(nodeTemplatePath, "config.yaml")); readErr == nil {
 				templatePlugins = templateDeclaredPlugins(tmplCfg)
+				// Same bytes, settings-aware view — so the template layer's
+				// `plugins[].config` reaches the box on this path too, not only
+				// on WorkspaceHandler.Create.
+				templatePluginEntries = templateConfigPluginEntriesFrom(tmplCfg, ws.Name)
 			}
 		}
 		for _, pluginSource := range mergePluginsWithTemplate(templatePlugins, pluginEntrySources(defaults.Plugins), pluginEntrySources(ws.Plugins)) {
@@ -484,6 +503,35 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 				log.Printf("Org import: failed to record declared plugin %s (%s) for %s: %v",
 					pluginName, pluginSource, ws.Name, recErr)
 			}
+		}
+
+		// DECLARING a plugin is not the same as CONFIGURING it. The loop above
+		// projects entries down to their source strings (pluginEntrySources) —
+		// which is right for the declared set, and drops `config:` on the floor.
+		// So a node declaring
+		//
+		//	plugins:
+		//	  - source: gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.0
+		//	    config:
+		//	      schedules: [...]
+		//
+		// got the plugin but never its schedules: nothing rendered
+		// plugin-settings/<install>.json into the provisioning bundle, and the
+		// runtime's trigger seeding reads exactly that file. Confirmed in
+		// production 2026-07-30 (founder-org canary): grid `[]` after a first
+		// import, populated only after a SECOND import took the skip path and
+		// re-delivered (#4947).
+		//
+		// Rendered into configFiles so the settings ride the SAME provisioning
+		// channel as config.yaml and land in the config volume the container
+		// actually mounts — as opposed to the live-write path, which is a
+		// best-effort optimisation for already-running workspaces.
+		if rendered := renderPluginSettingsFromEntries(
+			ws.Name, templatePluginEntries, defaults.Plugins, ws.Plugins,
+		); len(rendered) > 0 {
+			var added int
+			configFiles, added = mergePluginSettingsIntoConfigFiles(configFiles, rendered)
+			log.Printf("Org import: rendered %d plugin-settings file(s) for %s", added, ws.Name)
 		}
 
 		// Render category_routing into config.yaml so the agent can read its routing
