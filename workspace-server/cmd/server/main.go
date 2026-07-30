@@ -36,6 +36,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/docker/docker/client"
+
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/channels"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/codexauth"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/crypto"
@@ -88,6 +90,40 @@ func isSaaSDeployment() bool {
 		}
 	}
 	return strings.TrimSpace(os.Getenv("MOLECULE_ORG_ID")) != ""
+}
+
+// desktopDockerClient resolves the Docker client the desktop sidecar backend
+// should use, or nil if no Docker daemon is reachable. The desktop only needs a
+// Docker DAEMON — it is independent of how workspace boxes are provisioned:
+//
+//   - Self-host: the local box provisioner already holds a client; reuse it.
+//   - CP/SaaS tenant (box provisioner nil): build a client from the environment
+//     (docker.sock mounted or DOCKER_HOST set) and Ping it. If the tenant has
+//     local Docker access, the desktop runs exactly like self-host; if not, the
+//     desktop stays cleanly disabled (nil), never half-wired.
+//
+// This is the "CP works like self-host for display" path (until a k8s sidecar
+// backend lands, which is a drop-in SidecarProvisioner swap).
+func desktopDockerClient(prov *provisioner.Provisioner) *client.Client {
+	if prov != nil {
+		if c := prov.DockerClient(); c != nil {
+			return c
+		}
+	}
+	c, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		log.Printf("Desktop: no box provisioner and Docker client from env failed (%v) — desktop backend unavailable; mount /var/run/docker.sock or set DOCKER_HOST to enable computer-use on this tenant", err)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.Ping(ctx); err != nil {
+		log.Printf("Desktop: Docker daemon not reachable (%v) — desktop backend unavailable; mount /var/run/docker.sock or set DOCKER_HOST to enable computer-use on this tenant", err)
+		_ = c.Close()
+		return nil
+	}
+	log.Println("Desktop: using a local Docker client from env (CP tenant → self-host-style desktop backend)")
+	return c
 }
 
 func main() {
@@ -371,7 +407,15 @@ func main() {
 	// safe by construction, so no MOLECULE_DESKTOP_ENABLED / EGRESS_CONFIRMED
 	// gate. Set MOLECULE_DESKTOP_DISABLE=true to opt OUT. CP/k8s backend is a
 	// separate follow-up.
-	if prov != nil && envOr("MOLECULE_DESKTOP_DISABLE", "false") != "true" {
+	// The desktop sidecar backend only needs a DOCKER DAEMON — independent of how
+	// workspace BOXES are provisioned. On self-host the local box provisioner holds
+	// a client; on a CP/SaaS tenant the box provisioner is nil, but the tenant may
+	// still have a local Docker client (docker.sock mounted or DOCKER_HOST set), in
+	// which case the desktop runs exactly like self-host (operator directive
+	// 2026-07-30: "CP works like self-host for display until the k8s backend
+	// lands"). desktopDockerClient resolves the right client or nil.
+	desktopDocker := desktopDockerClient(prov)
+	if desktopDocker != nil && envOr("MOLECULE_DESKTOP_DISABLE", "false") != "true" {
 		// The sidecar's control server derives its DESKTOP_CONTROL_TOKEN from this
 		// secret, and the gateway's TokenResolver derives the matching bearer from
 		// the SAME secret. If it's unset, DeriveDesktopControlToken returns "" and
@@ -402,7 +446,7 @@ func main() {
 				}
 				seccompProfile = string(b)
 			}
-			sidecar := provisioner.NewLocalSidecarProvisioner(prov.DockerClient(), image, "wsnet", 6070, 10*time.Second, 2<<30, seccompProfile)
+			sidecar := provisioner.NewLocalSidecarProvisioner(desktopDocker, image, "wsnet", 6070, 10*time.Second, 2<<30, seccompProfile)
 			// B1: the provisioner derives DESKTOP_CONTROL_TOKEN from the SAME secret
 			// the gateway's TokenResolver uses, so the sidecar's control server and
 			// the gateway agree. B3: tell the provisioner which container is the
