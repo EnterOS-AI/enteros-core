@@ -121,8 +121,9 @@ func TestIntegration_PluginInstallReport_StagedButNotSwappedReadsNotLive(t *test
 	}
 	// Negative control: the naive predicate an operator (or a future reader) would
 	// reach for reports the opposite.
-	if !(len(row.Installed) > 0) {
-		t.Fatal("control is not exercising the hazard")
+	naiveSaysLive := len(row.Installed) > 0
+	if !naiveSaysLive {
+		t.Fatal("control is not exercising the hazard: the naive predicate must say live")
 	}
 }
 

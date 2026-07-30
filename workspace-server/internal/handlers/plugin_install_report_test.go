@@ -112,9 +112,11 @@ func TestReportIsLive_StagedEverythingPromotedNothingIsNotLive(t *testing.T) {
 	if reportIsLive(true, false, nil) {
 		t.Fatal("swapped=false must never be live")
 	}
-	// The negative control for the mistake itself: the naive predicate says yes.
-	if !(len(installed) > 0) {
-		t.Fatal("control is not exercising the hazard")
+	// The negative control for the mistake itself: the naive predicate — the one a
+	// reader reaches for instead of the rule — says this IS live.
+	naiveSaysLive := len(installed) > 0
+	if !naiveSaysLive {
+		t.Fatal("control is not exercising the hazard: the naive predicate must say live")
 	}
 }
 
