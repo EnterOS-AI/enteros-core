@@ -37,7 +37,7 @@
   ],
   "org_templates": [
     {"name": "mini-company", "repo": "molecule-ai/molecule-ai-org-template-mini-company", "ref": "33088ca03a5dca5f4ebd7c3014254a81a81faeed"},
-    {"name": "molecule-dev", "repo": "molecule-ai/molecule-ai-org-template-molecule-dev", "ref": "990d7b23f65dadd7afe05958a77eeb74082b4feb"},
+    {"name": "molecule-dev", "repo": "molecule-ai/molecule-ai-org-template-molecule-dev", "ref": "51e20676ebcf6703a3cf50be90665dc77392767d"},
     {"name": "ux-ab-lab", "repo": "molecule-ai/molecule-ai-org-template-ux-ab-lab", "ref": "76fe4821153cc35b3f073f6e4f18f766f5f3a251"}
   ]
 }
