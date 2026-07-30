@@ -88,6 +88,18 @@
 #                                stay LARGER than the watchdog, or the wait
 #                                expires while a wedged fire is still being
 #                                re-queued for retry.
+#   E2E_DELEG_A2A_TIMEOUT_SECS   per-attempt curl budget for the DELEGATION
+#                                A2A POST (section 10), default 90 — matching
+#                                a2a_send_or_poll_queue's budget for the PARENT
+#                                leg. `message/send` is SYNCHRONOUS, so that
+#                                POST waits out a full cold agent turn on a
+#                                just-created child workspace. It overrides
+#                                CURL_COMMON's generic --max-time 30, which is
+#                                not enough: cold-call latency routinely exceeds
+#                                30s on the first request after workspace boot,
+#                                and inheriting it took the REQUIRED ephemeral
+#                                lane red twice on 2026-07-30 with
+#                                curl_rc=28 / http=000.
 #   E2E_TRIGGER_DELIVERY_WATCHDOG_SECONDS
 #                                default 600, mirroring the daemon's own
 #                                MOLECULE_TRIGGER_DELIVERY_WATCHDOG_SECONDS.
@@ -2322,7 +2334,32 @@ except Exception:
     # workspace, not as the tenant admin. Must still send X-Molecule-Org-Id
     # or TenantGuard 404s — previously missing, caused section 10 to
     # fail rc=22 despite everything upstream being correct (2026-04-21).
-    DELEG_CODE=$(curl "${CURL_COMMON[@]}" -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
+    # Override CURL_COMMON's --max-time 30 for THIS call only, matching the
+    # budget a2a_send_or_poll_queue uses for the PARENT leg (--max-time 90).
+    #
+    # `message/send` is SYNCHRONOUS: the response carries the child's finished
+    # reply, which this step then reads as result.parts[0].text. So this POST
+    # waits out a full agent turn on a freshly-created CHILD workspace — cold
+    # adapter start, TLS to the LLM endpoint, first prompt, first token. The
+    # comment on the parent leg records why 30s cannot cover that: cold-call
+    # latency "routinely exceeds 30s on the first request after workspace boot",
+    # with observed P95 ~25-30s.
+    #
+    # This leg is raw curl (see below) because it authenticates as the PARENT
+    # workspace token rather than the tenant admin, and in being hand-rolled it
+    # silently inherited the generic 30s cap that the parent leg overrides. The
+    # result was a REQUIRED gate failing as
+    #   Delegation A2A POST failed after 1 attempt(s) (curl_rc=28, http=000)
+    # twice on 2026-07-30 (core#4961 08:59, core#4958 11:08) — curl_rc=28 is
+    # "operation timed out", http=000 means no response was ever received.
+    #
+    # Deliberately a TIMEOUT fix, not a retry: the retry loop below is scoped to
+    # cold-start HTTP statuses, and rc=28 is MAYBE-PROCESSED — the child may be
+    # mid-turn — so re-POSTing risks double-delivering the delegation. This is
+    # the same reasoning lib/workspace_create_retry.sh encodes as
+    # "curl timeout 28 → no retry" for the non-idempotent create.
+    DELEG_CODE=$(curl "${CURL_COMMON[@]}" --max-time "${E2E_DELEG_A2A_TIMEOUT_SECS:-90}" \
+      -X POST "$TENANT_URL/workspaces/$CHILD_ID/a2a" \
       -H "Authorization: Bearer $PARENT_WS_TOKEN" \
       -H "X-Molecule-Org-Id: $ORG_ID" \
       "${TENANT_ROUTE_HDRS[@]}" \
