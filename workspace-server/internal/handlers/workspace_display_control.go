@@ -331,6 +331,11 @@ func (h *WorkspaceHandler) displayControlEnabled(c *gin.Context, workspaceID str
 		return false
 	}
 	if compute.Display.Mode == "" || compute.Display.Mode == "none" {
+		// Sidecar computer-use backend wired → display is available regardless of
+		// the legacy compute.display opt-in (see Display availability handler).
+		if h.sidecarProv != nil {
+			return true
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "display not enabled"})
 		return false
 	}
