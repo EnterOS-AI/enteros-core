@@ -294,12 +294,16 @@ jobs:
           # fail if any didn't land — that would be a real regression we
           # want loud.
           # workspace_schedules added for the #2149 scheduler integration tests.
+          # workspace_plugin_install_reports added for the plugin-install-report
+          # suite: without it a silently-skipped migration 20260730060000 would make
+          # those tests fail on a confusing scan error instead of saying the table is
+          # missing — and this loop exists precisely so a skipped migration is loud.
           # workspace_auth_tokens + org_api_tokens added for the #2156
           # registry-auth TestIntegration_ suite (#2148). Without this
           # guard, a silently-skipped migration 020 (workspace_auth_tokens)
           # or 035 (org_api_tokens) would let the auth tests run against
           # missing tables and falsely green.
-          for tbl in delegations workspaces activity_logs pending_uploads workspace_schedules workspace_auth_tokens org_api_tokens; do
+          for tbl in delegations workspaces activity_logs pending_uploads workspace_schedules workspace_auth_tokens org_api_tokens workspace_plugin_install_reports; do
             if ! psql -h "${PG_HOST}" -U postgres -d molecule -tA \
                 -c "SELECT 1 FROM information_schema.tables WHERE table_name = '$tbl'" \
                 | grep -q 1; then

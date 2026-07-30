@@ -569,6 +569,18 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		beh := handlers.NewBootEventHandler(broadcaster)
 		wsAuth.POST("/boot-event", beh.Report)
 
+		// Plugin boot-install report — SDK contract contracts/plugin-install-report.
+		// DELIBERATELY UNLIKE the boot-step feed directly above it on the two axes
+		// that made a fleet-wide failure unobservable (#4953): every workspace
+		// reports regardless of kind (boot_step_emit is concierge-gated "so an
+		// ordinary, non-concierge tenant boot doesn't spam the endpoint"), and the
+		// report is PERSISTED (a BOOT_STEP is BroadcastOnly — presentation only, so
+		// it answers nothing for an operator asking an hour later). One POST per
+		// boot, not per boot phase.
+		pirh := handlers.NewPluginInstallReportHandler()
+		wsAuth.POST("/plugin-install-report", pirh.Report)
+		wsAuth.GET("/plugin-install-report", pirh.Get)
+
 		// Config
 		cfgh := handlers.NewConfigHandler()
 		wsAuth.GET("/config", cfgh.Get)
