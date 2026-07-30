@@ -41,7 +41,7 @@ import (
 	"fmt"
 	"log"
 	"path"
-	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -233,19 +233,24 @@ func templateConfigPluginEntriesFrom(configYAML []byte, wsName string) []templat
 // TEMPLATE -> org DEFAULTS -> NODE precedence the declaration merge already
 // uses. Passing one layer is the single-source case.
 //
+// ORDER WITHIN A LAYER IS THE AUTHORED ORDER, and the last entry to claim an
+// install name wins. That is a deliberate change from the previous
+// sort-by-source pass, which is why it is stated rather than left implicit:
+//
+//   - The output is a map keyed by file path, so sorting bought no byte-identity
+//     — its only observable effect was deciding which of two same-install-name
+//     entries in ONE layer survived, by source string.
+//   - `mergePlugins` — the declaration half of the same `plugins:` block —
+//     already resolves a same-layer `!X` then `X` in authored order. Sorting the
+//     settings pass made the two halves disagree about the same template text,
+//     with `!` (0x21) sorting ahead of every source so an opt-out could never
+//     lose to a later re-declaration even when the author clearly intended it to.
+//
 // Per-entry validate-and-skip: one unusable entry never drops its siblings.
 func renderPluginSettingsFromEntries(wsName string, layers ...[]templatePluginEntry) map[string][]byte {
 	out := map[string][]byte{}
 	for _, layer := range layers {
-		if len(layer) == 0 {
-			continue
-		}
-		// Deterministic order so a re-provision produces byte-identical output
-		// and does not churn the delivered bundle.
-		entries := make([]templatePluginEntry, len(layer))
-		copy(entries, layer)
-		sort.SliceStable(entries, func(i, j int) bool { return entries[i].Source < entries[j].Source })
-		renderPluginSettingsLayer(out, wsName, entries)
+		renderPluginSettingsLayer(out, wsName, layer)
 	}
 	if len(out) == 0 {
 		return nil
@@ -253,15 +258,30 @@ func renderPluginSettingsFromEntries(wsName string, layers ...[]templatePluginEn
 	return out
 }
 
-// renderPluginSettingsLayer renders one already-sorted layer into out.
+// renderPluginSettingsLayer applies one layer's entries to out, in order.
 func renderPluginSettingsLayer(out map[string][]byte, wsName string, entries []templatePluginEntry) {
 	for _, entry := range entries {
-		if len(entry.Config) == 0 {
+		// The opt-out markers the merge layer understands ("!source" /
+		// "-source") are REMOVALS. Skipping them is not enough: a node that
+		// DECLINES an inherited plugin would still receive the settings file the
+		// template/defaults layer rendered for it, and the workspace would carry
+		// live config for a plugin it deliberately does not have. Harmless to the
+		// runtime — nothing opens it — but it is exactly the stale-config class
+		// this milestone exists to stop shipping, and an operator reading
+		// /configs would be misled about what the box is configured to do.
+		if len(entry.Source) > 0 && (entry.Source[0] == '!' || entry.Source[0] == '-') {
+			target := strings.TrimLeft(entry.Source, "!-")
+			if target == "" {
+				continue
+			}
+			name, err := plugins.PluginNameFromSource(target)
+			if err != nil || name == "" || name != path.Base(name) {
+				continue
+			}
+			delete(out, path.Join(pluginSettingsDirName, name+".json"))
 			continue
 		}
-		// The opt-out markers the merge layer understands ("!name" / "-name")
-		// are removals, not installs — they carry no settings.
-		if len(entry.Source) > 0 && (entry.Source[0] == '!' || entry.Source[0] == '-') {
+		if len(entry.Config) == 0 {
 			continue
 		}
 		name, err := plugins.PluginNameFromSource(entry.Source)
