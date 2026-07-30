@@ -563,9 +563,13 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 
 	var workspaceName, workspaceStatus string
 	var activeTasks int
+	// parent_id is read here, before anything is destroyed, because it is the
+	// ANCHOR the audit event is filed under (auditDeleteAnchor). Reading it
+	// after the purge would be too late — the row is gone.
+	var workspaceParent sql.NullString
 	if err := db.DB.QueryRowContext(ctx,
-		`SELECT name, COALESCE(active_tasks, 0), status FROM workspaces WHERE id = $1`, id,
-	).Scan(&workspaceName, &activeTasks, &workspaceStatus); err != nil {
+		`SELECT name, COALESCE(active_tasks, 0), status, parent_id FROM workspaces WHERE id = $1`, id,
+	).Scan(&workspaceName, &activeTasks, &workspaceStatus, &workspaceParent); err != nil {
 		if err == sql.ErrNoRows {
 			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 			return
@@ -664,6 +668,26 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 	}
 	allIDs := append([]string{id}, descendantIDs...)
 
+	// Tamper-evident audit append. CascadeDelete has already marked the
+	// workspace (and descendants) removed, so the event is true from here on
+	// and is recorded even if a later Stop call 500s or the purge fails.
+	//
+	// Filed under the PARENT, not the target: the hard-purge branch below
+	// deletes audit_events for every purged workspace and the FK cascades on
+	// the workspaces row — so a row filed under the target would be erased by
+	// the very act it records.
+	deleteAnchor := auditDeleteAnchor(workspaceParent.String, id)
+	RecordAuditEvent(ctx, db.DB, auditEntryFromGin(c, deleteAnchor, AuditOpWorkspaceDelete, true, map[string]any{
+		"workspace_id":     id,
+		"workspace_name":   workspaceName,
+		"parent_id":        workspaceParent.String,
+		"erase_data":       erase,
+		"cascade_deleted":  len(descendantIDs),
+		"descendant_ids":   descendantIDs,
+		"active_tasks":     activeTasks,
+		"anchored_on_self": deleteAnchor == id,
+	}))
+
 	// If any Stop call failed, surface 500 so the client retries. The DB
 	// row is already 'removed' (idempotent), and Stop's instance_id
 	// lookup tolerates that — the retry replays the terminate. This is
@@ -730,6 +754,19 @@ func (h *WorkspaceHandler) Delete(c *gin.Context) {
 				h.namespaceCleanupFn(ctx, id)
 			}
 		}
+
+		// A hard purge is strictly more destructive than the soft delete
+		// already recorded above, and it is the operation that erased the
+		// purged workspaces' own audit rows — so it gets its own event, filed
+		// under the surviving anchor.
+		RecordAuditEvent(ctx, db.DB, auditEntryFromGin(c, deleteAnchor, AuditOpWorkspacePurge, true, map[string]any{
+			"workspace_id":     id,
+			"workspace_name":   workspaceName,
+			"parent_id":        workspaceParent.String,
+			"purged_ids":       allIDs,
+			"cascade_deleted":  len(descendantIDs),
+			"anchored_on_self": deleteAnchor == id,
+		}))
 
 		c.JSON(http.StatusOK, gin.H{"status": "purged", "cascade_deleted": len(descendantIDs)})
 		return
