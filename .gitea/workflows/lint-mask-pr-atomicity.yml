@@ -117,8 +117,9 @@ jobs:
     #      finds, including the one you only mentioned in passing.
     # The reference below must stay WITHIN 2 LINES of the directive or Tier 2e reds it.
     #
-    # mc#4344: pre-flip catch-22 blocks removing this mask; see the issue for definition-of-done.
-    continue-on-error: true
+    # The reference must be the FIRST tracker inside that window, so it lives inline on the
+    # directive itself and no superseded number appears on the two lines above.
+    continue-on-error: true  # mc#4959: 2026-07-30 renewal, expires 2026-08-13 — pre-flip catch-22 still blocks removing this mask; successor tracker carries definition-of-done.
     steps:
       - name: Check out PR head with full history (need base SHA blobs)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
