@@ -188,17 +188,73 @@ func renderPluginSettingsFiles(configYAML []byte, wsName string) (map[string][]b
 	if err := yaml.Unmarshal(configYAML, &parsed); err != nil {
 		return nil, fmt.Errorf("parse template plugins for settings: %w", err)
 	}
-	if len(parsed.Plugins) == 0 {
-		return nil, nil
+	return renderPluginSettingsFromEntries(wsName, parsed.Plugins), nil
+}
+
+// templateConfigPluginEntriesFrom decodes a template config.yaml's `plugins:`
+// block into entries, for callers that want to combine it with OTHER layers
+// rather than render it alone.
+//
+// Fail-soft: an unparseable block yields no entries and a log line. A malformed
+// template config must never block an org import — the same contract
+// renderPluginSettingsFiles' caller already honours by logging and continuing.
+func templateConfigPluginEntriesFrom(configYAML []byte, wsName string) []templatePluginEntry {
+	if len(configYAML) == 0 {
+		return nil
 	}
+	var parsed templateConfigPluginEntries
+	if err := yaml.Unmarshal(configYAML, &parsed); err != nil {
+		log.Printf("%s: plugin settings: cannot parse template plugins block: %v — template layer skipped", wsName, err)
+		return nil
+	}
+	return parsed.Plugins
+}
 
+// renderPluginSettingsFromEntries is the same renderer addressed by ENTRIES
+// rather than by a config.yaml document.
+//
+// Two callers need the identical projection from different starting points, and
+// only one of them has a config.yaml to parse:
+//
+//	WorkspaceHandler.Create   holds the template's config.yaml bytes
+//	POST /org/import          holds the org node's decoded `plugins:` lists and
+//	                          NEVER writes them into the generated config.yaml
+//
+// That asymmetry is why the create half of org import silently produced no
+// settings at all. Verified in production 2026-07-30 on the founder org: a node
+// declaring `plugins[].config.schedules` imported to a workspace whose /configs
+// carried no plugin-settings file, so the runtime's trigger-plugin seeding had
+// nothing to read and the schedule grid came back `[]`. Re-importing the SAME
+// template then delivered it via the skip path (#4947) — i.e. the first import
+// lost the config and the second one fixed it, with nothing to tell an operator
+// they had to run it twice.
+//
+// LAYERS are applied in order, last wins per install name, matching the
+// TEMPLATE -> org DEFAULTS -> NODE precedence the declaration merge already
+// uses. Passing one layer is the single-source case.
+//
+// Per-entry validate-and-skip: one unusable entry never drops its siblings.
+func renderPluginSettingsFromEntries(wsName string, layers ...[]templatePluginEntry) map[string][]byte {
 	out := map[string][]byte{}
-	// Deterministic order so a re-provision produces byte-identical output and
-	// does not churn the delivered bundle.
-	entries := make([]templatePluginEntry, len(parsed.Plugins))
-	copy(entries, parsed.Plugins)
-	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Source < entries[j].Source })
+	for _, layer := range layers {
+		if len(layer) == 0 {
+			continue
+		}
+		// Deterministic order so a re-provision produces byte-identical output
+		// and does not churn the delivered bundle.
+		entries := make([]templatePluginEntry, len(layer))
+		copy(entries, layer)
+		sort.SliceStable(entries, func(i, j int) bool { return entries[i].Source < entries[j].Source })
+		renderPluginSettingsLayer(out, wsName, entries)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
 
+// renderPluginSettingsLayer renders one already-sorted layer into out.
+func renderPluginSettingsLayer(out map[string][]byte, wsName string, entries []templatePluginEntry) {
 	for _, entry := range entries {
 		if len(entry.Config) == 0 {
 			continue
@@ -231,10 +287,6 @@ func renderPluginSettingsFiles(configYAML []byte, wsName string) (map[string][]b
 		}
 		out[path.Join(pluginSettingsDirName, name+".json")] = append(body, '\n')
 	}
-	if len(out) == 0 {
-		return nil, nil
-	}
-	return out, nil
 }
 
 // mergePluginSettingsIntoConfigFiles adds rendered settings to a ConfigFiles
