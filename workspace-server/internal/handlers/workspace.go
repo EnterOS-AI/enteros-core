@@ -911,6 +911,23 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// Tamper-evident audit append. Placed immediately after the commit — the
+	// workspaces row is durable from here on, so this is the earliest point at
+	// which "a workspace was created" is a true statement, and every later
+	// return path (external 201, provisioned 201, provisioning failure) is
+	// covered by the one call. agent_id records WHICH credential authenticated
+	// the AdminAuth-gated call; without it a create is unattributable after the
+	// fact (see the 2026-07-23 client-tenant incident).
+	RecordAuditEvent(ctx, db.DB, auditEntryFromGin(c, id, AuditOpWorkspaceCreate, false, map[string]any{
+		"workspace_id":   id,
+		"workspace_name": payload.Name,
+		"parent_id":      payload.ParentID,
+		"runtime":        payload.Runtime,
+		"template":       payload.Template,
+		"tier":           payload.Tier,
+		"external":       payload.External,
+	}))
+
 	// Persist canvas-selected model as the MODEL workspace_secret so it
 	// survives restart and is picked up by CP user-data when regenerating
 	// /configs/config.yaml. Without this, the applyRuntimeModelEnv

@@ -18,7 +18,11 @@ import {
   AuditEntryRow,
   AuditTrailPanel,
 } from "../AuditTrailPanel";
-import type { AuditEvent, AuditResponse } from "@/types/audit";
+import type {
+  AuditChainVerification,
+  AuditEvent,
+  AuditResponse,
+} from "@/types/audit";
 
 const mockGet = vi.mocked(api.get);
 const NOW = 1_745_000_000_000;
@@ -38,6 +42,7 @@ function makeEvent(overrides: Partial<AuditEvent> = {}): AuditEvent {
     prev_hmac: null,
     hmac: "test-hmac",
     workspace_id: "ws-a",
+    details: null,
     ...overrides,
   };
 }
@@ -45,9 +50,15 @@ function makeEvent(overrides: Partial<AuditEvent> = {}): AuditEvent {
 function makeResponse(
   events: AuditEvent[],
   total = events.length,
-  chainValid: boolean | null = true
+  chainValid: boolean | null = true,
+  chainVerification: AuditChainVerification = "verified"
 ): AuditResponse {
-  return { events, total, chain_valid: chainValid };
+  return {
+    events,
+    total,
+    chain_valid: chainValid,
+    chain_verification: chainVerification,
+  };
 }
 
 describe("formatAuditRelativeTime", () => {
