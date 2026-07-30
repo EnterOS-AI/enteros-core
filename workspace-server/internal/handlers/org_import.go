@@ -223,11 +223,25 @@ func (h *OrgHandler) createWorkspaceTree(ws OrgWorkspace, parentID *string, absX
 			"parent_id":   parentRef,
 			"tier":        tier,
 		})
+		// The workspace already exists, so create+provision is correctly
+		// skipped — but its DECLARED plugins[].config still has to reach the
+		// box. Before this, the skip returned here and the M6 config wiring
+		// below was never reached, so an existing workspace could never pick up
+		// a node's declared settings by ANY route (restart reuses stored
+		// config; tenant redeploy replaces only the control plane). That is how
+		// a live tenant ran stock template config while its org.yaml declared
+		// 11 schedules. Re-delivery makes /org/import the platform ability for
+		// this; nil deliverer = byte-identical to the old behaviour.
+		redelivered := h.redeliverDeclaredPluginSettings(ctx, existingID, ws.Name, ws.Plugins)
 		*results = append(*results, map[string]interface{}{
 			"id":      existingID,
 			"name":    ws.Name,
 			"tier":    tier,
 			"skipped": true,
+			// Reported so a caller can tell "skipped, nothing to do" apart from
+			// "skipped, but settings were refreshed" — the two were previously
+			// indistinguishable in the response.
+			"settings_redelivered": redelivered,
 		})
 		return h.recurseChildrenForImport(ws, existingID, absX, absY, defaults, orgBaseDir, results, provisionSem)
 	}
