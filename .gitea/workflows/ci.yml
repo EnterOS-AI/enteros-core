@@ -371,6 +371,45 @@ jobs:
           echo "mini-company org-template shape guard executed and passed ✓"
 
       - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: live org-template clone+resolve smoke (blocking gate)
+        # TestResolveYAMLIncludes_RealMoleculeDev clones the canonical
+        # molecule-ai-org-template-molecule-dev and runs the real !include /
+        # !external resolver against it. It USED to run implicitly in the
+        # default `go test` lanes, but its `git clone` + nested !external git
+        # fetch add UNBOUNDED, VARIABLE network time — under the diagnostic
+        # `go test -race -v -timeout 60s ./internal/handlers/...` step above,
+        # that variable time is what tipped the whole (already ~60s-under-race)
+        # package over the per-package cap, producing the recurring
+        # `panic: test timed out after 1m0s` flake. The test is now gated behind
+        # MOLECULE_LIVE_ORG_TEMPLATE=1 so the default lanes skip it instantly;
+        # the resolver logic stays covered there by the hermetic
+        # TestResolveYAMLIncludes_* fixture tests. This dedicated step restores
+        # the live smoke with a generous 5m timeout (no 60s cap, no -race), so
+        # network latency can never manufacture a timeout.
+        #
+        # Blocking is safe from network flakes: a clone/fetch failure or the
+        # deliberately-held-broken molecule-dev-department@v1.0.0 !external ref
+        # makes the test SKIP (t.Skip), not fail — it FAILS only on a genuine
+        # resolver/schema regression on the live composition, which is exactly
+        # the signal worth gating on.
+        #
+        # Non-vacuity: a `-run` filter that matches zero tests exits 0 with "no
+        # tests to run" — a vacuous green. We require the top-level result line
+        # (PASS or SKIP) to appear; its absence means the test was renamed or
+        # the filter is wrong, and fails this step.
+        env:
+          MOLECULE_LIVE_ORG_TEMPLATE: "1"
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout 5m -v ./internal/handlers/ \
+            -run '^TestResolveYAMLIncludes_RealMoleculeDev$' 2>&1 | tee /tmp/test-live-org.log
+          if ! grep -q -E '^(--- PASS|--- SKIP): TestResolveYAMLIncludes_RealMoleculeDev' /tmp/test-live-org.log; then
+            echo "::error::live org-template smoke did not execute TestResolveYAMLIncludes_RealMoleculeDev — vacuous pass (check the -run filter and that the test still exists)."
+            exit 1
+          fi
+          echo "live org-template clone+resolve smoke executed ✓"
+
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Race detection (advisory, non-blocking)
         # mc#1184: runs race detector as an advisory check so cold-runner
         # compile-time spikes don't block merges. Failures here surface in
