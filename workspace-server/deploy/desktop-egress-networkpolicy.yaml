@@ -1,0 +1,54 @@
+# desktop-egress-networkpolicy.yaml — the CP/k8s backend equivalent of
+# scripts/desktop-egress-firewall.sh (decision-1 / §6.1 egress-deny).
+#
+# Applies the SAME policy the Docker firewall script verifies: a desktop sidecar
+# pod may reach the public internet (for browsing) and DNS, but NOT any RFC-1918
+# address or the cloud metadata IP — so a compromised sidecar cannot reach
+# Postgres/Redis/MinIO/LiteLLM, other tenants, the node, or steal cloud creds.
+#
+# Assumes desktop sidecar pods carry `molecule.platform.role: desktop` (mirror of
+# the container LabelRole the Docker backend stamps). Requires a CNI that
+# enforces NetworkPolicy egress (Calico, Cilium, etc. — the stock kubenet does
+# NOT). Pair with per-workspace pod isolation and userns/PodSecurity hardening.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: desktop-sidecar-egress-deny-private
+  # namespace: set to the namespace desktop sidecars run in
+  labels:
+    app.kubernetes.io/part-of: molecule-desktop
+spec:
+  podSelector:
+    matchLabels:
+      molecule.platform.role: desktop
+  policyTypes:
+    - Egress
+  egress:
+    # 1) DNS to the in-cluster resolver only (kube-dns / CoreDNS). Without this,
+    #    the "except RFC-1918" block below would also blackhole cluster DNS.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 2) Public internet ONLY — everything except RFC-1918 and the metadata IP.
+    #    169.254.169.254/32 is inside the 169.254.0.0/16 link-local block, which
+    #    we exclude wholesale (nothing legitimate for a browser lives there).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443

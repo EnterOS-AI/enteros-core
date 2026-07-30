@@ -4,7 +4,7 @@
 # use this Makefile; CI calls docker compose / go test directly so the
 # Makefile can evolve without breaking the build.
 
-.PHONY: help dev up down logs build test e2e-peer-visibility e2e-concierge-creates-workspace e2e-ephemeral-happy-path e2e-ephemeral-boot e2e-ephemeral-scenario e2e-ephemeral-down openapi-spec openapi-spec-check gen gen-docker gen-check gen-check-docker
+.PHONY: help bundle-deps dev up down logs build build-upstream-base test e2e-peer-visibility e2e-concierge-creates-workspace e2e-ephemeral-happy-path e2e-ephemeral-boot e2e-ephemeral-scenario e2e-ephemeral-down openapi-spec openapi-spec-check gen gen-docker gen-check gen-check-docker
 
 # ─── Provider-registry SSOT codegen (internal#718) ─────────────────────
 # The Go module lives in workspace-server/. The checked-in artifact
@@ -29,11 +29,68 @@ DOCKER_RUN_WS = $(DOCKER) run --rm -v "$(CURDIR)/workspace-server":/src -w /src 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
-dev: ## Start the full stack with air hot-reload for the platform service.
+# ─── Manifest-managed template/plugin dirs ─────────────────────────────
+# `.tenant-bundle-deps/` is a REQUIRED build input: workspace-server/Dockerfile
+# COPYs .tenant-bundle-deps/{workspace-configs-templates,org-templates,plugins}
+# into the image. Nothing in a fresh checkout creates it — the dirs are
+# .gitignored and only CI populated them — so `make up` / `make build` failed
+# on a clean clone with an opaque COPY error.
+#
+# The top-level workspace-configs-templates/ org-templates/ plugins/ dirs are
+# the OTHER destination: docker-compose.yml bind-mounts them (CONFIGS_HOST_DIR,
+# PLUGINS_HOST_DIR) so a running stack sees the template palette. An empty
+# top-level dir is why Canvas silently shows no templates locally.
+#
+# clone-manifest.sh is idempotent — it skips any dir whose manifest-source
+# marker still matches manifest.json — so re-running is a fast no-op and it is
+# safe to hang off dev/up/build.
+#
+# Without a token this clones what is public and SKIPS repos the manifest marks
+# `"private": true` (a contributor should not need creds for a local stack).
+# Set MOLECULE_GITEA_TOKEN to populate the full palette.
+bundle-deps: ## Populate .tenant-bundle-deps/ + the template dirs from manifest.json (idempotent).
+	@command -v jq >/dev/null 2>&1 || { \
+	  echo "make bundle-deps: jq is required (brew install jq / apt-get install jq)"; \
+	  echo "  without it the template palette stays empty and the image build fails."; \
+	  exit 1; }
+	@# Strip JSON5-style // comments before jq sees the manifest (same as CI).
+	@sed '/^[[:space:]]*\/\//d' manifest.json > .manifest-stripped.json
+	@mkdir -p .tenant-bundle-deps
+	bash scripts/clone-manifest.sh .manifest-stripped.json \
+	  .tenant-bundle-deps/workspace-configs-templates \
+	  .tenant-bundle-deps/org-templates \
+	  .tenant-bundle-deps/plugins
+	bash scripts/clone-manifest.sh .manifest-stripped.json \
+	  workspace-configs-templates org-templates plugins
+	@rm -f .manifest-stripped.json
+	@echo "bundle-deps: image build input + bind-mounted template dirs are populated"
+
+dev: bundle-deps ## Start the full stack with air hot-reload for the platform service.
 	docker compose -f docker-compose.yml -f docker-compose.dev.yml up
 
-up: ## Start the full stack in production-shape mode (no air, normal Dockerfile).
+up: bundle-deps ## Start the full stack in production-shape mode (no air, normal Dockerfile).
 	docker compose up
+
+# ─── arm64 / Apple Silicon escape hatch ────────────────────────────────
+# The pinned base images live in a private mirror whose alpine:3.20 index
+# carries ONLY linux/amd64, so `docker build` on an arm64 host dies with
+# "no match for platform in manifest: not found" and molecule-core cannot be
+# built on Apple Silicon at all.
+#
+# This target builds against the UPSTREAM Docker Hub bases instead. The
+# mirrored amd64 image is alpine 3.20.10 — the same release as upstream — so
+# this is a same-content, more-architectures swap, not a version bump.
+#
+# The durable fix is mirroring the arm64 variant so CI and local builds share
+# one pinned reference again; that needs registry write access. CI keeps using
+# the pinned mirror defaults either way — this target is local-only.
+build-upstream-base: bundle-deps ## Build the platform image from UPSTREAM bases (arm64 / Apple Silicon).
+	docker build \
+	  --build-arg BASE_IMAGE_REGISTRY=docker.io/library \
+	  --build-arg GOLANG_BASE=golang:1.25-alpine \
+	  --build-arg ALPINE_BASE=alpine:3.20 \
+	  -f workspace-server/Dockerfile \
+	  -t molecule-core-platform:local .
 
 down: ## Stop the stack and remove containers (volumes preserved).
 	docker compose down
@@ -41,7 +98,7 @@ down: ## Stop the stack and remove containers (volumes preserved).
 logs: ## Tail logs from all services (Ctrl-C to detach).
 	docker compose logs -f
 
-build: ## Force a fresh build of the platform image (no cache).
+build: bundle-deps ## Force a fresh build of the platform image (no cache).
 	docker compose build --no-cache platform
 
 test: ## Run Go unit tests in workspace-server/.

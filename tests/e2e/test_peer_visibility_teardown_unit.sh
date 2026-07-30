@@ -22,14 +22,28 @@
 # curl that reproduces that exact CP behaviour, and asserts on the DEFAULT
 # teardown path (no knob injected):
 #
-#   A. transient 409 then 200  → the org is provably purged, the script's own
-#      exit code survives, and the DELETE was re-issued (>1 attempt).
-#   B. persistent 409          → still FAILS CLOSED with exit 4 and says so.
-#      A retry that could never fail would be a worse defect than the bug.
+#   A. transient 409 then 200  → the org is provably purged and the DELETE was
+#      re-issued (>1 attempt). This is the fix itself.
+#   B. persistent 409, STAGING → FAILS CLOSED with exit 4 and names the durable-
+#      leak remediation. A retry that could never fail would be a worse defect
+#      than the bug.
+#   C. persistent 409, EPHEMERAL CP → warns, keeps the [cp-purge] diagnosis, and
+#      does NOT fail the scenario. main 9fc3d764c established this carve-out:
+#      that control plane dies with the job so nothing durable leaks, and
+#      peer_visibility is in E2E_EPHEMERAL_EXTRA_GATING, so escalating turned an
+#      already-printed "GATE PASSED" into a merge-block (core#4923 run 584794).
 #
-# Fail direction is negative-controlled: against the pre-fix single-shot
-# teardown, case A exits 4 with the leak warning, so this file is RED before the
-# fix and GREEN after. It needs no docker, no network and no credentials.
+# B and C are the two arms of the SAME failure, split only by topology; both are
+# driven so neither arm can rot into a no-op. Note E2E_CP_ALLOW_EPHEMERAL_LOOPBACK
+# does double duty (ephemeral discriminator AND loopback-origin permit), which is
+# why the staging arm is reached by pointing MOLECULE_CP_URL at the literal staging
+# origin — see run_gate.
+#
+# Fail direction is negative-controlled, each arm independently (verified by
+# running the neutralised variant): killing the helper's 409 retry reds A; removing
+# the ephemeral carve-out reds C; removing the staging rc escalation reds B.
+# It needs no docker, no network and no credentials — all egress is via curl, and
+# curl is shimmed.
 
 set -uo pipefail
 
@@ -193,17 +207,37 @@ FAKE_CURL
 chmod +x "$SHIM/curl"
 
 run_gate() {  # <scenario> <state-dir>
-  local scenario="$1" state="$2"
+  local scenario="$1" state="$2" cp_mode="${3:-ephemeral}"
+  local cp_url ephemeral
+  # The teardown's rc-escalation arm is topology-dependent (see the MERGE NOTE in
+  # the target): on an EPHEMERAL CP a teardown that cannot prove the purge warns
+  # and preserves the scenario rc, because that control plane dies with the job;
+  # on STAGING it escalates to 4, because a leaked tenant there is durable and has
+  # caused a real provisioning outage. Both arms must be exercised or one of them
+  # is a no-op that nothing would catch regressing.
+  #
+  # E2E_CP_ALLOW_EPHEMERAL_LOOPBACK does double duty: it is both that discriminator
+  # AND what lets e2e_cp_require_staging_origin accept a numeric-loopback CP base.
+  # So the staging arm cannot be reached through a 127.0.0.1 mock. It is reached by
+  # pointing MOLECULE_CP_URL at the literal staging origin instead — the curl shim
+  # matches on request PATH, not host, so the same mock CP serves both modes and no
+  # real network call is made either way (verified: the shim's catch-all answers an
+  # explicit 404 for anything unmocked, so a wrong request shape reds).
+  case "$cp_mode" in
+    ephemeral) cp_url="http://127.0.0.1:9099";                 ephemeral=1 ;;
+    staging)   cp_url="https://staging-api.moleculesai.app";   ephemeral=0 ;;
+    *) echo "FAIL: unknown cp_mode '$cp_mode'" >&2; exit 1 ;;
+  esac
   mkdir -p "$state"
   PATH="$SHIM:$PATH" \
   FAKE_SCENARIO="$scenario" \
   FAKE_STATE_DIR="$state" \
-  MOLECULE_CP_URL="http://127.0.0.1:9099" \
+  MOLECULE_CP_URL="$cp_url" \
   MOLECULE_TENANT_URL="http://127.0.0.1:9099" \
   MOLECULE_TENANT_ROUTE_DOMAIN="lvh.me" \
   MOLECULE_ADMIN_TOKEN="fake-admin-token" \
   E2E_INFRA_BACKEND="local-docker" \
-  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK=1 \
+  E2E_CP_ALLOW_EPHEMERAL_LOOPBACK="$ephemeral" \
   E2E_CP_PURGE_POLL_SECS=5 \
   E2E_CP_PURGE_POLL_INTERVAL=1 \
   E2E_CP_PURGE_DELETE_RETRY_SECS=3 \
@@ -240,14 +274,44 @@ else
 fi
 
 echo ""
-echo "── B. persistent 409 — must still FAIL CLOSED (a retry that can't fail is worse) ──"
+echo "── B. persistent 409 on STAGING — must FAIL CLOSED (a retry that can't fail is worse) ──"
 B="$WORK/b"
-rc=$(run_gate persistent-409 "$B")
+rc=$(run_gate persistent-409 "$B" staging)
 out_b=$(tail -c 200000 "$B/stdout.txt" 2>/dev/null; tail -c 200000 "$B/stderr.txt" 2>/dev/null)
 check "unpurgeable org exits 4 (teardown left orphan resources)" "4" "$rc"
 check_contains "the persistent 409 is REPORTED, not swallowed" \
   "DELETE still 409 (active lifecycle operation)" "$out_b"
+check_contains "staging names the durable-leak remediation" \
+  "sweep-stale-e2e-orgs retries on a later main push" "$out_b"
 if [ -f "$B/purged" ]; then
+  echo "  FAIL: mock CP purged the org in the persistent-409 case — bad negative control"
+  FAIL=$((FAIL + 1))
+else
+  echo "  PASS: org genuinely never purged (negative control holds)"
+  PASS=$((PASS + 1))
+fi
+
+# The other arm of the same failure. main 9fc3d764c deliberately stopped an
+# unprovable purge from failing the scenario on the EPHEMERAL CP (that control
+# plane is destroyed with the job, and peer_visibility is in
+# E2E_EPHEMERAL_EXTRA_GATING, so escalating turned a printed "GATE PASSED" into a
+# merge-block — core#4923 run 584794). Pin that the carve-out is scoped to the rc
+# only: the [cp-purge] diagnosis must still reach the log, and it must NOT claim a
+# sweeper that never sees an ephemeral org. Without this case the ephemeral arm is
+# untested and a later edit could silently make it swallow the diagnosis too.
+echo ""
+echo "── C. same persistent 409 on the EPHEMERAL CP — warn, keep the diagnosis, do NOT fail ──"
+C="$WORK/c"
+rc=$(run_gate persistent-409 "$C" ephemeral)
+out_c=$(tail -c 200000 "$C/stdout.txt" 2>/dev/null; tail -c 200000 "$C/stderr.txt" 2>/dev/null)
+check "a disposable CP does not fail the passing scenario" "0" "$rc"
+check_contains "still says it was not provably purged" "was not provably purged" "$out_c"
+check_contains "names the ephemeral reason" "EPHEMERAL CP" "$out_c"
+check_contains "the persistent 409 diagnosis survives the carve-out" \
+  "DELETE still 409 (active lifecycle operation)" "$out_c"
+check_not_contains "does NOT point at a sweeper that never sees this org" \
+  "sweep-stale-e2e-orgs retries on a later main push" "$out_c"
+if [ -f "$C/purged" ]; then
   echo "  FAIL: mock CP purged the org in the persistent-409 case — bad negative control"
   FAIL=$((FAIL + 1))
 else

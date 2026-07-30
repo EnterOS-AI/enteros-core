@@ -537,6 +537,48 @@ func TestWorkspaceDisplay_NonDisplayWorkspaceReturnsUnavailable(t *testing.T) {
 	}
 }
 
+// TestWorkspaceDisplay_SidecarBackendMakesDisplayAvailable: with the desktop
+// sidecar computer-use backend WIRED, a workspace that declares NO legacy
+// compute.display opt-in is still reported display-available (mode
+// desktop-control) — the default-on decoupling, so a human can watch/take over
+// the desktop an agent can drive on any workspace. Contrast with
+// TestWorkspaceDisplay_NonDisplayWorkspaceReturnsUnavailable (no backend wired →
+// display_not_enabled).
+func TestWorkspaceDisplay_SidecarBackendMakesDisplayAvailable(t *testing.T) {
+	mock := setupTestDB(t)
+	setupTestRedis(t)
+	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	handler.SetSidecarProvisioner(&fakeSidecarProv{running: true})
+
+	mock.ExpectQuery(`SELECT COALESCE\(compute, '\{\}'::jsonb\), COALESCE\(instance_id, ''\) FROM workspaces WHERE id = \$1`).
+		WithArgs("ws-no-display").
+		WillReturnRows(sqlmock.NewRows([]string{"compute", "instance_id"}).AddRow(`{}`, ""))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws-no-display"}}
+	c.Request = httptest.NewRequest("GET", "/workspaces/ws-no-display/display", nil)
+
+	handler.Display(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse display response: %v", err)
+	}
+	if resp["available"] != true {
+		t.Fatalf("available = %v, want true (sidecar backend wired)", resp["available"])
+	}
+	if resp["mode"] != "desktop-control" {
+		t.Fatalf("mode = %v, want desktop-control", resp["mode"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
 func TestWorkspaceDisplay_DisplayConfiguredReturnsSessionUnavailableContract(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)

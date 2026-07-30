@@ -862,6 +862,22 @@ func (h *WorkspaceHandler) CascadeDelete(ctx context.Context, id string, erase b
 				log.Printf("CascadeDelete %s volume removal warning: %v", wsID, err)
 			}
 		}
+		// Desktop sidecar (if the computer-use feature provisioned one): tear it
+		// down AND wipe its profile volume. The workspace is being deleted, so the
+		// live-login profile (cookies / authenticated sessions) MUST NOT survive —
+		// otherwise the credential volume orphans forever (§11 revoke/wipe; the
+		// reviewer's B4, "highest integration risk"). Best-effort: a desktop
+		// teardown failure must never block the workspace delete — the orphan
+		// sweeper is the backstop. Gated on sidecarProv so it's a no-op unless the
+		// desktop feature is enabled.
+		if h.sidecarProv != nil {
+			if err := h.sidecarProv.StopDesktop(cleanupCtx, wsID); err != nil {
+				log.Printf("CascadeDelete %s desktop sidecar stop warning: %v", wsID, err)
+			}
+			if err := h.sidecarProv.WipeProfile(cleanupCtx, wsID); err != nil {
+				log.Printf("CascadeDelete %s desktop profile wipe warning: %v", wsID, err)
+			}
+		}
 	}
 
 	for _, descID := range descendantIDs {

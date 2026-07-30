@@ -32,7 +32,23 @@
 # Override (e.g. to refresh the mirror from upstream):
 #   --build-arg BASE_IMAGE_REGISTRY=docker.io/library
 ARG BASE_IMAGE_REGISTRY=registry.moleculesai.app/molecule-ai
-FROM ${BASE_IMAGE_REGISTRY}/golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c
+# Full base reference, overridable as a UNIT (registry AND digest together) —
+# the digest below is mirror-specific and does not exist on Docker Hub, so
+# swapping only BASE_IMAGE_REGISTRY cannot resolve.
+#
+# ARM64 NOTE: the mirrored golang image is amd64-only. Unlike the alpine mirror
+# (an OCI index that lists ONLY linux/amd64, which buildx rejects outright with
+# "no match for platform in manifest"), this one is a bare manifest, so Docker
+# accepts it on an arm64 host and the container runs under EMULATION — it
+# builds and works, just slowly, and `uname -m` inside reports x86_64.
+#
+# To build natively on Apple Silicon:
+#   docker build \
+#     --build-arg BASE_IMAGE_REGISTRY=docker.io/library \
+#     --build-arg GOLANG_BASE=golang:1.25-alpine \
+#     -f workspace-server/Dockerfile.dev .
+ARG GOLANG_BASE=golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c
+FROM ${BASE_IMAGE_REGISTRY}/${GOLANG_BASE}
 
 # air + git (for go mod) + ca-certs (for TLS) + tzdata (for time-zone DB)
 # + docker-cli + docker-cli-buildx so the platform binary can shell out to
@@ -41,8 +57,24 @@ FROM ${BASE_IMAGE_REGISTRY}/golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e
 # default but ships without buildx, producing
 # `ERROR: BuildKit is enabled but the buildx component is missing or broken`
 # on every `docker build`. docker-cli-buildx provides the buildx subcommand.
+# AIR IS PINNED, NOT @latest — do not "modernise" this back.
+#
+# air v1.67.2+ declares `go 1.26.0` in its go.mod. This base image is
+# golang:1.25-alpine and ships GOTOOLCHAIN=local, so there is no toolchain
+# auto-upgrade to rescue it: `go install air@latest` fails with
+#
+#   github.com/air-verse/air@v1.67.3 requires go >= 1.26.0
+#     (running go 1.25.12; GOTOOLCHAIN=local)
+#
+# and `go install` exits 1, so the IMAGE BUILD FAILS — which is exactly what
+# `make dev` was doing for everyone. v1.67.1 is the last release that still
+# declares `go 1.25`.
+#
+# When the base image moves to 1.26+, this pin can go back to @latest (or a
+# newer pin). Note the base is digest-pinned against a private mirror, so
+# bumping it is a separate change — see the BASE_IMAGE_REGISTRY note above.
 RUN apk add --no-cache git ca-certificates tzdata wget docker-cli docker-cli-buildx \
- && go install github.com/air-verse/air@latest
+ && go install github.com/air-verse/air@v1.67.1
 
 WORKDIR /app/workspace-server
 
