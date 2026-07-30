@@ -33,6 +33,12 @@
 # Negative control: SENTINEL_BROKEN=1 points the assertions at a fixture that
 # reproduces the pre-fix line, so every assertion below has a demonstrated fail
 # arm (a test you have not seen fail proves nothing).
+# PARENT_LEG_BUDGET and B below are consumed ONLY inside the single-quoted
+# assertion strings handed to ok()/eval, which shellcheck cannot follow — so it
+# reports them as unused. They ARE used. Same situation, same remedy as
+# test_workspace_create_retry_unit.sh's H_* fixtures. (File-level directive:
+# must precede the first command to apply file-wide.)
+# shellcheck disable=SC2034
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
