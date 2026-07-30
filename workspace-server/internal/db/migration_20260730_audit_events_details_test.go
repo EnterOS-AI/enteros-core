@@ -1,6 +1,6 @@
 package db
 
-// Shape test for 20260727120000_audit_events_details. The apply MECHANISM is
+// Shape test for 20260730120000_audit_events_details. The apply MECHANISM is
 // already proven by postgres_schema_migrations_test.go, so this pins the
 // properties that make the migration safe to run against live tenant DBs whose
 // audit_events table is in production use:
@@ -19,7 +19,7 @@ import (
 	"testing"
 )
 
-const auditDetailsMigrationBase = "20260727120000_audit_events_details"
+const auditDetailsMigrationBase = "20260730120000_audit_events_details"
 
 func readAuditDetailsMigration(t *testing.T, suffix string) string {
 	t.Helper()

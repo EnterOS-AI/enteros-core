@@ -389,20 +389,8 @@ func auditDeleteAnchor(parentID, targetID string) string {
 	return targetID
 }
 
-// auditParentID looks up a workspace's parent, returning "" when it has none
-// or the lookup fails. Only used to choose an anchor, so a failure degrades to
-// "file it under the target" rather than dropping the event.
-func auditParentID(ctx context.Context, database *sql.DB, id string) string {
-	if database == nil || id == "" {
-		return ""
-	}
-	var parent sql.NullString
-	if err := database.QueryRowContext(ctx,
-		`SELECT parent_id FROM workspaces WHERE id = $1`, id).Scan(&parent); err != nil {
-		return ""
-	}
-	if parent.Valid {
-		return parent.String
-	}
-	return ""
-}
+// NOTE: there is deliberately no auditParentID lookup helper here. The only
+// caller that needs a parent id (Delete, in workspace_crud.go) already reads
+// parent_id as part of the pre-delete SELECT it has to run anyway, and passes
+// it straight to auditDeleteAnchor — a second round-trip would be dead weight
+// and could disagree with the row the caller actually validated.

@@ -134,7 +134,7 @@ type auditEventRow struct {
 	// Details is the compact, key-sorted JSON payload naming the event's
 	// SUBJECT (deleted workspace id, revoked token id, client ip, …). Stored
 	// as TEXT, not JSONB, precisely so the bytes read back are the bytes
-	// signed — see migration 20260727120000. NULL on rows predating it.
+	// signed — see migration 20260730120000. NULL on rows predating it.
 	Details *string `json:"details"`
 }
 

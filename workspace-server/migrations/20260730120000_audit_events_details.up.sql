@@ -1,4 +1,4 @@
--- 20260727120000_audit_events_details.up.sql
+-- 20260730120000_audit_events_details.up.sql
 --
 -- Adds the `details` column to audit_events so a lifecycle event can name its
 -- SUBJECT (which workspace was deleted, which token id was revoked, the caller

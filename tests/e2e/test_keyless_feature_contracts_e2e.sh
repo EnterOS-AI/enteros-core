@@ -188,12 +188,32 @@ assert_contains "GET /budget (no auth → 401)" "401" "$(http_code GET "$BASE/wo
 
 # ===========================================================================
 # 4. Audit — GET /workspaces/:id/audit (wsAuth)
-#    EU AI Act ledger query (#594). Fresh ws → empty events, total 0,
-#    chain_valid null (AUDIT_LEDGER_SALT unset). Failure: bad RFC3339 from → 400.
+#    EU AI Act ledger query (#594). chain_valid null (AUDIT_LEDGER_SALT unset).
+#    Failure: bad RFC3339 from → 400.
+#
+#    A freshly-created workspace has EXACTLY ONE event: its own
+#    `workspace.create`. This assertion used to expect `"total":0`, which was
+#    only ever true because audit_events had no writer at all — the table was
+#    empty in prod for every tenant, which is the defect the audit producer
+#    fixes. `total 0 on a fresh ws` was therefore asserting the bug. The
+#    lifecycle producer instruments exactly five operations (workspace.create /
+#    .delete / .purge, auth_token.mint / .revoke — see AuditOp* in
+#    internal/handlers/audit_write.go), and none of the sections above this one
+#    (terminal-diagnose, webhooks, budget) touch any of them, so the count here
+#    is a stable 1 rather than order-dependent.
 # ===========================================================================
 echo "--- /audit ---"
 AUD=$(curl -s "$BASE/workspaces/$WS_ID/audit" "${AUTH[@]}")
-assert_contains "GET /audit (total 0 on fresh ws)" '"total":0' "$AUD"
+assert_contains "GET /audit (fresh ws has exactly its own create event)" '"total":1' "$AUD"
+assert_contains "GET /audit (the event is workspace.create)" '"operation":"workspace.create"' "$AUD"
+# The whole point of the producer: the event names its SUBJECT. A row that
+# records that *something* happened but not *to what* is the prod gap that left
+# a 2026-07-23 client-tenant workspace creation with no attributable record.
+assert_contains "GET /audit (create event is attributable to this workspace)" "\"workspace_id\":\"$WS_ID\"" "$AUD"
+# `details` is a TEXT column holding compact JSON (TEXT, not JSONB, so the bytes
+# read back are the bytes HMAC-signed), so it arrives JSON-escaped inside the
+# response — hence the backslashes. assert_contains greps -F, fixed-string.
+assert_contains "GET /audit (details name the subject)" '\"workspace_name\":\"Keyless Fixture\"' "$AUD"
 assert_contains "GET /audit (chain_valid null without salt)" '"chain_valid":null' "$AUD"
 assert_contains "GET /audit (bad 'from' → 400)" "400" \
   "$(http_code GET "$BASE/workspaces/$WS_ID/audit?from=not-a-date" "${AUTH[@]}")"
