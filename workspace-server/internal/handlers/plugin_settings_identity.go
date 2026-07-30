@@ -62,6 +62,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
 )
 
 // errPluginNotOnWorkspace is returned when the requested :plugin does not
@@ -73,10 +75,37 @@ var errPluginNotOnWorkspace = errors.New("plugin is not declared or installed on
 // seedTemplatePlugins/recordDeclaredPlugin) unioned with the INSTALLED set
 // (workspace_plugins — current state, written by the install pipeline).
 //
-// Both tables key on the install/destination name, and both are populated only
-// from plugins.PluginNameFromSource, so neither can contain a manifest-name
-// alias. That is what makes them a trustworthy allow-list: the resolver cannot
-// be taught an alias by a bad write.
+// THE NAME IS DERIVED FROM source_raw, NOT READ FROM plugin_name.
+//
+// The original version of this function trusted the stored `plugin_name` on the
+// premise that "both tables are populated only from plugins.PluginNameFromSource,
+// so neither can contain a manifest-name alias". That premise is false, and the
+// scheduler is the counter-example: ensureSchedulerPluginDeclared writes
+// SchedulerPluginName — the MANIFEST name "molecule-scheduler" — as plugin_name
+// (deliberately; see workspace_provision_shared.go on why declaring it twice
+// would create a duplicate boot-install). Core writes the alias itself.
+//
+// Observed on a live prod concierge 2026-07-30: the allow-list read
+//
+//	[…digest-goal, …digest-identity, …digest-mail, …digest-task-queue,
+//	 molecule-ai-plugin-molecule-platform-mcp, molecule-scheduler]
+//
+// so GET/PATCH /plugin-settings/molecule-ai-plugin-scheduler returned 404 — on
+// the ONLY name that works. The install directory is the repo name, the settings
+// file is `plugin-settings/<repo-name>.json`, org-import re-delivery keys on
+// PluginNameFromSource, and the runtime reads plugin.name (the checkout dir).
+// Every writer and reader agreed; the resolver alone disagreed, and it is the
+// gatekeeper, so the operator-facing surface was unaddressable in both
+// directions: the correct name refused, the accepted name pointing at a file
+// nothing opens.
+//
+// Deriving is also STRICTLY STRONGER than the property the comment claimed.
+// `source_raw` is the same column desiredPluginSources already destination-keys
+// on (plugins_tracking.go), so the two now agree by construction rather than by
+// coincidence — and a mis-keyed row cannot teach the resolver an alias, because
+// the stored name is no longer consulted for a row that has a parseable source.
+// Rows with an unparseable/empty source fall back to plugin_name so a
+// hand-written local-name plugin is never dropped.
 //
 // workspace_plugin_settings is deliberately NOT part of the union. It is the
 // table this resolver protects; sourcing the allow-list from it would let the
@@ -87,20 +116,26 @@ func workspacePluginInstallNames(ctx context.Context, database *sql.DB, workspac
 		return names, nil
 	}
 	rows, err := database.QueryContext(ctx, `
-		SELECT plugin_name FROM workspace_declared_plugins WHERE workspace_id = $1
+		SELECT plugin_name, COALESCE(source_raw, '') FROM workspace_declared_plugins WHERE workspace_id = $1
 		UNION
-		SELECT plugin_name FROM workspace_plugins          WHERE workspace_id = $1
+		SELECT plugin_name, COALESCE(source_raw, '') FROM workspace_plugins          WHERE workspace_id = $1
 	`, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("workspacePluginInstallNames: query: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var name string
-		if scanErr := rows.Scan(&name); scanErr != nil {
+		var name, sourceRaw string
+		if scanErr := rows.Scan(&name, &sourceRaw); scanErr != nil {
 			return nil, fmt.Errorf("workspacePluginInstallNames: scan: %w", scanErr)
 		}
-		if name = strings.TrimSpace(name); name != "" {
+		name = strings.TrimSpace(name)
+		if src := strings.TrimSpace(sourceRaw); src != "" {
+			if dest, derr := plugins.PluginNameFromSource(src); derr == nil && dest != "" {
+				name = dest
+			}
+		}
+		if name != "" {
 			names[name] = struct{}{}
 		}
 	}
