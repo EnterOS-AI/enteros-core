@@ -67,6 +67,14 @@ type PluginsHandler struct {
 	// the post-online reconcile (RFC#2843) without standing up Docker or an
 	// provider compute. nil in production → the reconcile calls deliverToContainer.
 	deliverOverride func(ctx context.Context, workspaceID string, r *stageResult) error
+	// stagingRoot is the parent directory resolveAndStage creates its
+	// per-install "molecule-plugin-fetch-*" dir under. Empty — the
+	// production default — is passed straight to os.MkdirTemp, which then
+	// uses the system temp dir exactly as before. Tests set it via
+	// WithStagingRoot so a staging-leak assertion can be absolute inside a
+	// directory the test exclusively owns, instead of a before/after delta
+	// over the shared os.TempDir() (core#4964).
+	stagingRoot string
 }
 
 // deliver dispatches the container-delivery step, honouring the test
@@ -109,6 +117,16 @@ func NewPluginsHandler(pluginsDir string, docker *client.Client, restartFunc fun
 // first request. Chainable.
 func (h *PluginsHandler) WithSourceResolver(resolver plugins.SourceResolver) *PluginsHandler {
 	h.sources.Register(resolver)
+	return h
+}
+
+// WithStagingRoot overrides the parent directory resolveAndStage stages
+// plugin fetches into. Production never calls it, leaving stagingRoot ""
+// so os.MkdirTemp keeps using the system temp dir; tests pass a
+// t.TempDir() so every molecule-plugin-fetch-* under it is theirs and a
+// leak assertion needs no ambient-state subtraction.
+func (h *PluginsHandler) WithStagingRoot(dir string) *PluginsHandler {
+	h.stagingRoot = dir
 	return h
 }
 
