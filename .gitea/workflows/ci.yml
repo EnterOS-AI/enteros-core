@@ -326,6 +326,51 @@ jobs:
           echo "e2e_busy_inject positive-control tests executed and passed ✓"
 
       - if: ${{ needs.changes.outputs.platform == 'true' }}
+        name: mini-company org-template shape guard (blocking gate)
+        # The mini-company org template is the showcase tree the plugin-config
+        # programme demonstrates against, and its shape (7 agents, 4 levels) is a
+        # contract: re-parenting an agent changes delegation flow, and the tree is
+        # split one-file-per-agent so a renamed file breaks !include expansion.
+        #
+        # This guard was previously recorded as "proven" by
+        #   MINI_COMPANY_DIR=<checkout> go test ./internal/handlers/ -run TestMiniCompany -v
+        # but TestMiniCompany was never committed — that command printed
+        # "no tests to run" then "PASS", a vacuous green (same class as the
+        # e2e_busy_inject seam above, task #112). The test now exists; this step
+        # is the other half — a test no workflow names is never run
+        # (feedback_verify_new_test_is_wired_to_ci).
+        #
+        # The tree is cloned at the EXACT ref manifest.json pins, so the guard
+        # validates the pin itself rather than some other checkout. The repo is
+        # public, so no credential is needed.
+        #
+        # Non-vacuity: the test FAILS (never skips) when CI is set and the tree is
+        # absent, and we additionally require both "--- PASS:" lines here, so a
+        # rename or a build break cannot produce a silent zero-test pass.
+        working-directory: .
+        run: |
+          set -euo pipefail
+          ref="$(python3 -c "import json;print(next(t['ref'] for t in json.load(open('manifest.json'))['org_templates'] if t['name']=='mini-company'))")"
+          echo "manifest.json pins mini-company at ${ref}"
+          rm -rf /tmp/mini-company-guard
+          git init -q /tmp/mini-company-guard
+          git -C /tmp/mini-company-guard remote add origin \
+            https://git.moleculesai.app/molecule-ai/molecule-ai-org-template-mini-company.git
+          git -C /tmp/mini-company-guard fetch -q --depth 1 origin "${ref}"
+          git -C /tmp/mini-company-guard checkout -q FETCH_HEAD
+          cd workspace-server
+          MINI_COMPANY_DIR=/tmp/mini-company-guard \
+            go test -tags mini_company_guard ./internal/handlers/ -count=1 -v \
+            -run 'TestMiniCompanyOrgTemplate' 2>&1 | tee /tmp/test-mini-company.log
+          for t in TestMiniCompanyOrgTemplate_SevenAgents TestMiniCompanyOrgTemplate_FourLevelShape; do
+            if ! grep -q -- "--- PASS: $t" /tmp/test-mini-company.log; then
+              echo "::error::mini-company guard did not execute $t — vacuous pass (check the -run filter and that the pinned ref resolved)."
+              exit 1
+            fi
+          done
+          echo "mini-company org-template shape guard executed and passed ✓"
+
+      - if: ${{ needs.changes.outputs.platform == 'true' }}
         name: Race detection (advisory, non-blocking)
         # mc#1184: runs race detector as an advisory check so cold-runner
         # compile-time spikes don't block merges. Failures here surface in

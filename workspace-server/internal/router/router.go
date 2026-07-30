@@ -38,7 +38,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, greeter func(workspaceID string, toolCount int), channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -471,19 +471,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// concierge flip / ordinary workspace's first register), drive a real
 	// agent turn so the agent greets the user in its own persona, delivered
 	// through the AgentMessageWriter SSOT (first_boot_greeting.go). A fresh
-	// onboarding lands in a chat where the agent has already spoken.
-	rh.SetFirstBootGreeter(handlers.FirstBootGreeter(
-		handlers.NewAgentMessageWriter(db.DB, broadcaster),
-		wh.ProxyA2ARequest,
-		// Wake-lifecycle owner (PR-D): record the greet intent + bump the desired
-		// generation and thread the shared idempotency key. Greet-once stays owned
-		// by the has_greeted marker (workspaceHasGreeted + claimGreetDelivery) — see
-		// GreetWakeHooks; Decision.Fire is intentionally not a fire gate.
-		handlers.GreetWakeHooks{Decide: wh.DecideWake, Delivered: wh.MarkWakeDelivered},
-	))
+	// onboarding lands in a chat where the agent has already spoken. The greeter
+	// is constructed in main.go (so the SAME instance also backs the wake re-drive
+	// re-emitter, wired there before the WakeRedriveSweeper starts) and handed in.
+	rh.SetFirstBootGreeter(greeter)
 	// Versioned-heartbeat GENERATION LOOP (PR-C): wire the convergence settle side
 	// so a beat reporting observed_generation >= desired_generation settles the
 	// converged wake intents. Same late-wiring nil-safe pattern as the greeter.
+	// (The RE-DRIVE side of the loop, PR-F, runs off a fleet-wide
+	// WakeRedriveSweeper wired in main.go — NOT the heartbeat path.)
 	rh.SetWakeSettler(wh.MarkWakeSettled)
 	r.POST("/registry/register", rh.Register)
 	r.POST("/registry/heartbeat", rh.Heartbeat)
@@ -699,6 +695,17 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		wsAuth.GET("/mcp/stream", mcpRl.Middleware(), mcpH.Stream)
 		wsAuth.POST("/mcp", mcpRl.Middleware(), mcpH.Call)
 	}
+
+	// Desktop computer-use routes (design decision B): the authenticated seam
+	// the IN-CONTAINER agent desktop tool (a2a_tools_desktop.py, later a native
+	// kind:mcp plugin) calls — the platform layer is a gateway, NOT an MCP tool,
+	// so the agent surface stays plugin-extractable. screenshot = eyes (not
+	// lock-gated, §8); input = hands (gateway is fail-closed on the control
+	// lock -> 409 when a human holds control). wsAuth gates on the workspace
+	// bearer, same as the MCP endpoint.
+	wsAuth.GET("/desktop/screenshot", wh.DesktopScreenshot)
+	wsAuth.POST("/desktop/input", wh.DesktopInput)
+	wsAuth.GET("/desktop/control", wh.DesktopControlStatus)
 
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
 	// Protected by strict AdminAuth: a missing or invalid bearer is rejected in
@@ -930,6 +937,19 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	wsAuth.PUT("/files/*path", tmplh.WriteFile)
 	wsAuth.DELETE("/files/*path", tmplh.DeleteFile)
 
+	// Per-install plugin settings (layer 6). NOT served through /files/*path on
+	// purpose: that route's side effect is a workspace RESTART, while a settings
+	// edit wants the file changed and the daemon reloaded — no restart, no lost
+	// session. GET returns every key with the layer that supplied it; PATCH is
+	// compare-and-set on overrides_version so a concurrent edit is refused with
+	// 409 rather than silently lost.
+	wsAuth.GET("/plugin-settings/:plugin", tmplh.GetPluginSettings)
+	wsAuth.PATCH("/plugin-settings/:plugin", tmplh.PatchPluginSettings)
+	// The plugin's OWN declaration, read live off the workspace, so the tab can
+	// render a form for a plugin the frontend has never seen. ?format=example
+	// returns the generated .example as text.
+	wsAuth.GET("/plugin-settings/:plugin/declaration", tmplh.GetPluginDeclaration)
+
 	// CORE-served boot-config fetch (the FINAL, platform-agnostic config path —
 	// no R2, no CP). Registered OUTSIDE the WorkspaceAuth group: the runtime holds
 	// a one-time BOOT token (minted by CPProvisioner into MOLECULE_CONFIG_BOOT_TOKEN,
@@ -981,7 +1001,15 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Org Templates
 	orgDir := findOrgDir(configsDir)
-	orgh := handlers.NewOrgHandler(wh, broadcaster, prov, channelMgr, configsDir, orgDir)
+	// M6 / FIX 0: same templateCacheDir the TemplatesHandler above uses, so an
+	// org node's `template:` resolves cache-first exactly like the
+	// workspace-name path already does. One cache, one SSOT.
+	orgh := handlers.NewOrgHandler(wh, broadcaster, prov, channelMgr, configsDir, orgDir).
+		WithTemplateCacheDir(templateCacheDir).
+		// Lets /org/import RE-DELIVER declared plugins[].config to workspaces
+		// that already exist. tmplh already carries the docker client the
+		// delivery primitive needs; org import depends only on the capability.
+		WithPluginSettingsDeliverer(tmplh)
 	// #686: GET /org/templates exposes the org template catalogue (names, roles,
 	// configured system prompts). AdminAuth-gate to match /org/import.
 	r.GET("/org/templates", middleware.AdminAuth(db.DB), orgh.ListTemplates)

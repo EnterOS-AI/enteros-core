@@ -31,7 +31,37 @@
 # Override (e.g. to refresh the mirror from upstream):
 #   --build-arg BASE_IMAGE_REGISTRY=docker.io/library
 ARG BASE_IMAGE_REGISTRY=registry.moleculesai.app/molecule-ai
-FROM ${BASE_IMAGE_REGISTRY}/golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c AS builder
+# Full base references, overridable as a UNIT.
+#
+# The digests below are MIRROR-SPECIFIC index digests — they do not exist on
+# Docker Hub, so overriding BASE_IMAGE_REGISTRY alone cannot work: the digest
+# would fail to resolve against the new registry. These args let a developer
+# swap registry AND digest together.
+#
+# WHY THIS EXISTS: the mirrored alpine:3.20 index carries ONLY linux/amd64,
+# while upstream alpine:3.20 is multi-arch. On an arm64 host the build dies at
+# the runtime stage with
+#
+#   no match for platform in manifest: not found
+#
+# so molecule-core could not be built on Apple Silicon at all. The mirrored
+# amd64 image is alpine 3.20.10 — byte-for-byte the same release as upstream —
+# so pointing at upstream is a same-content, more-architectures swap, not a
+# version bump.
+#
+# Apple Silicon / any arm64 host:
+#   make build-upstream-base        (or)
+#   docker build \
+#     --build-arg GOLANG_BASE=golang:1.25-alpine \
+#     --build-arg ALPINE_BASE=alpine:3.20 \
+#     --build-arg BASE_IMAGE_REGISTRY=docker.io/library ...
+#
+# The DURABLE fix is to mirror the arm64 variant so CI and local builds share
+# one pinned reference again; that needs registry write access. Until then this
+# arg is the escape hatch, and CI keeps using the pinned mirror defaults.
+ARG GOLANG_BASE=golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c
+ARG ALPINE_BASE=alpine:3.20@sha256:91bed4737195a1a9657c53334c35b0cd1cef217402d3d128a3de5aaee4bb25aa
+FROM ${BASE_IMAGE_REGISTRY}/${GOLANG_BASE} AS builder
 WORKDIR /app
 COPY workspace-server/go.mod workspace-server/go.sum ./
 # github-app-auth plugin removed 2026-05-07 (#157): per-agent Gitea
@@ -67,7 +97,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /memory-plugin ./cmd/memory-plugin-postgres
 
 ARG BASE_IMAGE_REGISTRY
-FROM ${BASE_IMAGE_REGISTRY}/alpine:3.20@sha256:91bed4737195a1a9657c53334c35b0cd1cef217402d3d128a3de5aaee4bb25aa
+ARG ALPINE_BASE
+FROM ${BASE_IMAGE_REGISTRY}/${ALPINE_BASE}
 # docker-cli + docker-cli-buildx are required by internal/provisioner/
 # localbuild.go which shells out via exec.Command("docker", "image",
 # "inspect"/"build"/"tag", ...) whenever Resolve().Mode ==

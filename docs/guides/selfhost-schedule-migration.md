@@ -60,25 +60,44 @@ seeding seam to close.
 - **Health:** the runtime's `GET /internal/schedules/health`
   (platform-inbound auth) — or `<configs>/schedules/schedule-health.json` —
   shows `last_tick` advancing and your schedules armed.
-- **History (fires):** the runtime's `GET /internal/schedules/history` — or
-  `<configs>/schedules/schedule-history.json` — records daemon fires. Note:
-  core's Canvas-facing History/Health routes still read the legacy DB (their
-  re-point is pending), so daemon fires will NOT appear there; check the
-  runtime surface or the volume files.
+- **History (fires):** core's Canvas-facing History and Health routes are
+  **volume-proxied** — they forward to the runtime and return the same window
+  the daemon writes (`scheduleHistoryLimit = 20`, mirroring the legacy query).
+  The runtime surfaces (`GET /internal/schedules/history` / `.../health`) and
+  the volume files `<configs>/schedules/schedule-history.json` and
+  `schedule-health.json` are the same data, read directly.
 
 ## Rollback posture
 
-Legacy DB reads linger until P4b (the `workspace_schedules` retirement —
-issue #4411 item 5), and the migration never deletes DB rows, so rollback is
-cheap:
+> **This section changed. P4b has landed.** Earlier revisions of this guide told
+> operators to set `SCHEDULE_VOLUME_PROXY_DISABLED=1` as the incident rollback.
+> **That variable no longer exists anywhere in core** — setting it today does
+> nothing, silently, which is the worst possible behaviour during an incident.
+> There is no dual-path kill-switch to fall back to.
 
-- Set `SCHEDULE_VOLUME_PROXY_DISABLED=1` on core to force the legacy DB path
-  for every workspace (the staged-cutover kill-switch in
-  `schedules_proxy.go`) — CRUD immediately serves the untouched DB rows again.
-  Note the DB rows will not reflect edits made on the volume in the interim,
-  and with the core loop retired (core#4399) nothing fires DB-only rows — the
-  kill-switch restores the *data* path, not a firing engine.
-- Do **not** hand-edit the volume grid to roll back; the store validates on
-  load and a corrupt grid is refused.
+The legacy dual-path core-DB schedule backend was **retired in P4b**. Core no
+longer stores or fires schedules, and nothing in core reads `workspace_schedules`
+any more — the grid on the workspace's persisted volume is the only copy that
+exists, and the workspace's `kind: trigger` scheduler plugin is the only thing
+that fires it.
 
-Keep the DB rows until P4b lands and your fleet is fully volume-backed.
+Practically, that means:
+
+- **There is no "switch back to the DB" lever.** Any DB rows left over from
+  before the migration are inert: nothing reads them and nothing fires them.
+  Restoring them would require re-introducing the retired backend, not flipping
+  a flag.
+- **Recovery is forward, at the workspace.** If a workspace's grid is wrong,
+  fix it through Canvas or `POST /workspaces/:id/schedules` (which writes the
+  volume through the proxy), or restore the workspace volume from a snapshot.
+- **Do not hand-edit the volume grid.** The store validates on load and a
+  corrupt grid is refused — you would take the workspace's scheduling down
+  entirely rather than partially.
+- **If the daemon is not firing**, the problem is almost never the grid. Check
+  that the workspace advertises the `scheduler` capability in its heartbeat and
+  that its pinned runtime image carries the plugin boot-install path — see
+  `docs/runbooks/scheduler-plugin.md`.
+
+The `MOLECULE_DECLARE_SCHEDULER_PLUGIN` flag documented in that runbook is a
+**roll-out** lever (it stops *new* provisions declaring the plugin); it is not a
+rollback for a workspace that has already migrated.

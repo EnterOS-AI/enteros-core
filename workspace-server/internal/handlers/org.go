@@ -10,7 +10,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -190,6 +192,28 @@ type OrgHandler struct {
 	channelMgr  *channels.Manager
 	configsDir  string
 	orgDir      string // path to org-templates/
+	// templateCacheDir is the SAME cache TemplatesHandler.resolveTemplateDir
+	// consults — threaded here so an org node's `template:` resolves from the
+	// FETCHED template cache as well as the baked configsDir (M6 / FIX 0).
+	// Without it, on SaaS (where templates arrive through the Gitea asset
+	// channel rather than the image) a `template: seo-agent` node silently
+	// fell back to `<runtime>-default`: the workspace provisioned, just not
+	// from the template the author named. Empty = configs-only, which is
+	// byte-identical to the pre-M6 behaviour.
+	templateCacheDir string
+	// settingsDeliverer, when wired, lets org import RE-DELIVER an existing
+	// workspace's declared plugins[].config instead of skipping it. nil =
+	// today's behaviour (see org_redeliver_settings.go).
+	settingsDeliverer pluginSettingsDeliverer
+}
+
+// WithTemplateCacheDir threads the fetched-template cache into org import.
+// Option-style rather than a constructor parameter so every existing
+// NewOrgHandler call site keeps compiling and keeps today's behaviour until
+// the router opts in — the same shape TemplatesHandler.WithCacheDir uses.
+func (h *OrgHandler) WithTemplateCacheDir(dir string) *OrgHandler {
+	h.templateCacheDir = dir
+	return h
 }
 
 func NewOrgHandler(wh *WorkspaceHandler, b *events.Broadcaster, p *provisioner.Provisioner, channelMgr *channels.Manager, configsDir, orgDir string) *OrgHandler {
@@ -388,7 +412,15 @@ type OrgDefaults struct {
 	Runtime       string   `yaml:"runtime" json:"runtime"`
 	Tier          int      `yaml:"tier" json:"tier"`
 	Model         string   `yaml:"model" json:"model"`
-	Plugins       []string `yaml:"plugins" json:"plugins"`
+	// Plugins accepts BOTH the bare-source string and the {source, config}
+	// object form, via the SSOT templatePluginEntry (plugin_settings_delivery.go)
+	// — the same type renderPluginSettingsFiles already uses. Before this it was
+	// []string, so a template that carried per-install config failed to
+	// unmarshal with `cannot unmarshal !!map into string` and the whole org
+	// import broke. The SDK contract (sdk#183) models exactly this oneOf; the Go
+	// type now mirrors it instead of being narrower than the contract it claims
+	// to implement.
+	Plugins       []templatePluginEntry `yaml:"plugins" json:"plugins"`
 	InitialPrompt string   `yaml:"initial_prompt" json:"initial_prompt"`
 	// InitialPromptFile is a file ref alternative to InitialPrompt. Path is
 	// resolved relative to the workspace's files_dir (or the org base dir
@@ -464,7 +496,8 @@ type OrgWorkspace struct {
 	Model           string   `yaml:"model" json:"model"`
 	WorkspaceDir    string   `yaml:"workspace_dir" json:"workspace_dir"`
 	WorkspaceAccess string   `yaml:"workspace_access" json:"workspace_access"` // #65: "none" (default), "read_only", "read_write"
-	Plugins         []string `yaml:"plugins" json:"plugins"`
+	// See OrgDefaults.Plugins — same SSOT entry type, same reason.
+	Plugins         []templatePluginEntry `yaml:"plugins" json:"plugins"`
 	// InitialPrompt is the one-shot boot prompt. Agents run this once on first
 	// start; the body often clones the repo, reads CLAUDE.md + system-prompt,
 	// and commits conventions to memory. InitialPromptFile is the file-ref
@@ -548,6 +581,9 @@ func (h *OrgHandler) ListTemplates(c *gin.Context) {
 				gitDir := filepath.Join(templateDir, ".git")
 				if _, gitErr := os.Stat(gitDir); gitErr == nil {
 					log.Printf("ListTemplates: WARNING %q has .git but no org.yaml/.yml — likely a half-checkout. Try 'cd %s && git checkout main -- .' to restore the working tree.", e.Name(), templateDir)
+					// Surface it: a half-clone is the exact case the operator
+					// needs to see, and it previously vanished from the palette.
+					templates = append(templates, brokenOrgTemplateEntry(e.Name(), "half_checkout", err))
 				}
 				continue
 			}
@@ -558,15 +594,24 @@ func (h *OrgHandler) ListTemplates(c *gin.Context) {
 		// errors — the previous silent-continue made a broken template
 		// show up as "no templates" in the Canvas palette with no log
 		// trail, which is how a fresh-clone user first discovers the gap.
+		// A template that fails to load is REPORTED, not dropped. Logging and
+		// `continue`-ing returns 200 with the template silently absent — the
+		// caller cannot distinguish "this org has 3 templates" from "it has 4
+		// and one is broken". That loud-log/silent-wire shape is how #4889 hid:
+		// molecule-dev was unimportable on every image while /org/templates
+		// happily returned the other two and the Canvas palette just looked
+		// short. The log line is kept; the response now carries the failure.
 		if expanded, err := resolveYAMLIncludes(data, templateDir); err == nil {
 			data = expanded
 		} else {
-			log.Printf("ListTemplates: skipping %s — !include expansion failed: %v", e.Name(), err)
+			log.Printf("ListTemplates: %s unavailable — !include expansion failed: %v", e.Name(), err)
+			templates = append(templates, brokenOrgTemplateEntry(e.Name(), "include_expansion_failed", err))
 			continue
 		}
 		var tmpl OrgTemplate
 		if err := yaml.Unmarshal(data, &tmpl); err != nil {
-			log.Printf("ListTemplates: skipping %s — yaml unmarshal failed: %v", e.Name(), err)
+			log.Printf("ListTemplates: %s unavailable — yaml unmarshal failed: %v", e.Name(), err)
+			templates = append(templates, brokenOrgTemplateEntry(e.Name(), "yaml_invalid", err))
 			continue
 		}
 		count := countWorkspaces(tmpl.Workspaces)
@@ -586,6 +631,82 @@ func (h *OrgHandler) ListTemplates(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, templates)
+}
+
+// scrubTemplatePaths reduces any absolute filesystem path in a template-load
+// error to its base name, so the listing never puts the server's directory
+// layout on the wire. Reason codes carry the machine meaning; the operator
+// gets the failing file, not its location.
+func scrubTemplatePaths(msg string) string {
+	return absPathRe.ReplaceAllStringFunc(msg, func(m string) string {
+		// group 1 is the (possibly empty) preceding byte — preserve it verbatim.
+		i := strings.Index(m, "/")
+		prefix, p := m[:i], m[i:]
+		// Keep the leading slash. Whether an include was ABSOLUTE is itself the
+		// finding for "path escapes root" — replacing /etc/passwd with "passwd"
+		// deletes the security-relevant evidence and makes the message read as
+		// an ordinary relative include. /…/passwd hides the layout and keeps it.
+		return prefix + "/…/" + path.Base(p)
+	})
+}
+
+// The match is ANCHORED: a `/`-run only counts when it starts a path, i.e. at
+// the start of the string or after a byte that cannot be part of a path segment.
+// Without that anchor the regex ate the interior of RELATIVE paths too —
+// `!include "./teams/engineering.yaml"` became `"./…/engineering.yaml"`, and
+// `git.moleculesai.app/molecule-ai/tmpl not in ALLOWLIST` became
+// `git.moleculesai.app/…/tmpl`, hiding the very org you are told to allowlist.
+// Neither is a leak (template content, not server layout) but both destroy the
+// evidence this function exists to preserve, on the MORE common path.
+//
+// absPathRe matches an absolute filesystem path without consuming the
+// punctuation that surrounds it in real error text. A previous revision
+// tokenized on strings.Fields and trimmed quotes, which (a) could not see a
+// path inside brackets, parens, angle brackets, key=value or a file:// URI, and
+// (b) destroyed newlines, flattening genuinely multi-line yaml errors, and
+// split paths containing spaces. Character-class exclusion handles all of those
+// without a tokenizer the test could accidentally mirror.
+var absPathRe = regexp.MustCompile(`(^|[^\w.~-])(/[^\s"'` + "`" + `<>()\[\],;]+)`)
+
+// brokenOrgTemplateEntry renders a template that could not be loaded as a
+// PRESENT-but-unavailable listing entry rather than omitting it.
+//
+// Shape is deliberately the same map as a healthy entry plus `error`/`reason`,
+// so existing consumers keep reading `dir`/`name`/`workspaces` without a nil
+// check.
+//
+// CLIENTS MUST GATE ON `reason`, NOT ON `error`. Every broken path here passes a
+// non-empty string literal for `reason`, but `error` is EMPTY whenever the
+// underlying err is nil — so a client keying on `error` renders such an entry as
+// importable. That is not hypothetical: canvas/src/components/TemplatePalette.tsx
+// shipped exactly that gate and a probe produced an enabled "Import org" button
+// for {reason:"half_checkout", error:""}.
+//
+// `workspaces: 0` is honest — we could not parse a tree — but it is a BADGE, NOT
+// A GATE. An earlier revision of this comment claimed it "stops a broken entry
+// looking importable"; review disproved that by execution (the palette mapped
+// every entry to an enabled Import button and dropped both new fields entirely).
+func brokenOrgTemplateEntry(dir, reason string, err error) map[string]interface{} {
+	// The full error (with absolute server paths) stays in the log line the
+	// caller already emitted; the WIRE gets a path-free message. org.go's
+	// Import handler documents the same policy for this namespace
+	// ("Audit 2026-05-09 (Core-Security) … Drop the input from the message;
+	// log full context server-side"), and it would be incoherent for the
+	// listing to leak what the import deliberately withholds.
+	msg := ""
+	if err != nil {
+		msg = scrubTemplatePaths(err.Error())
+	}
+	return map[string]interface{}{
+		"dir":             dir,
+		"name":            dir,
+		"description":     "",
+		"workspaces":      0,
+		"required_env":    []string{},
+		"recommended_env": []string{},
+		"error":           msg,
+		"reason":          reason,
+	}
 }
 
 // Import handles POST /org/import — creates an entire org from a template.
