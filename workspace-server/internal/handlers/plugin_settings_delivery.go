@@ -94,6 +94,56 @@ func (e *templatePluginEntry) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// UnmarshalJSON mirrors UnmarshalYAML: a JSON string is a bare source, a JSON
+// object is {source, config}.
+//
+// This is NOT symmetry for its own sake — it is load-bearing. `plugins:` is
+// decoded from YAML on the file path but from JSON on POST /org/import with an
+// INLINE template (OrgTemplate binds via c.ShouldBindJSON). #4944 changed
+// OrgDefaults/OrgWorkspace.Plugins from []string to []templatePluginEntry and
+// gave the type only an UnmarshalYAML, so the inline-import path started
+// rejecting the BARE-STRING form that every template in the fleet uses:
+//
+//	json: cannot unmarshal string into Go struct field
+//	OrgDefaults.plugins of type handlers.templatePluginEntry
+//
+// Found by actually exercising /org/import against a live tenant, whose
+// defaults were `plugins: [browser-automation]` — the whole import 400'd with
+// "invalid request body". The object form decoded fine, which is why unit tests
+// over the YAML path stayed green: a widened type is only as wide as its
+// NARROWEST decoder.
+func (e *templatePluginEntry) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		e.Source = s
+		return nil
+	}
+	var alt struct {
+		Source string         `json:"source"`
+		Config map[string]any `json:"config"`
+	}
+	if err := json.Unmarshal(data, &alt); err != nil {
+		return fmt.Errorf("plugin entry must be a source string or {source, config}: %w", err)
+	}
+	if alt.Source == "" {
+		return fmt.Errorf("plugin entry object is missing `source`")
+	}
+	e.Source, e.Config = alt.Source, alt.Config
+	return nil
+}
+
+// MarshalJSON round-trips the same two forms so a re-serialised template stays
+// loadable: config-less entries collapse back to a plain string.
+func (e templatePluginEntry) MarshalJSON() ([]byte, error) {
+	if len(e.Config) == 0 {
+		return json.Marshal(e.Source)
+	}
+	return json.Marshal(struct {
+		Source string         `json:"source"`
+		Config map[string]any `json:"config"`
+	}{e.Source, e.Config})
+}
+
 // pluginEntrySources projects entries down to the source strings the merge /
 // dedup / opt-out layer works in. Kept as a projection rather than changing
 // mergePlugins' signature: the "!"/"-" opt-out grammar, the collision rules and
