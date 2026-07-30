@@ -663,10 +663,15 @@ jobs:
           # `message/send` is synchronous — the POST waits out a full cold agent
           # turn on a just-created child — so 30s took the REQUIRED ephemeral
           # lane red twice on 2026-07-30 with curl_rc=28/http=000 (core#4961,
-          # core#4958). Offline: greps the harness. If an edit drops the
-          # override back to 30s, or converts it into a retry-on-rc=28 (which
-          # would risk double-delivering a non-idempotent delegation), this
-          # goes red on every PR.
+          # core#4958). Offline, but NOT a grep: it extracts the delegation
+          # retry loop and EXECUTES it against a stub curl, then asserts on the
+          # EFFECTIVE --max-time (curl is last-flag-wins, and CURL_COMMON is an
+          # array expansion no grep can see through) and on the OBSERVED attempt
+          # count under a scripted rc=28. So dropping the override back to 30s,
+          # moving it BEFORE "${CURL_COMMON[@]}" (same text, 30s effective), or
+          # converting it into a retry-on-rc=28 (which would risk double-
+          # delivering a non-idempotent delegation) each go red on every PR.
+          # Every run also re-proves its own fail arms against two fixtures.
           bash tests/e2e/test_deleg_a2a_timeout_unit.sh
           # #1994 byok-routing presence-probe (lib/workspace_env_presence.sh) —
           # the shared MOLECULE_LLM_USAGE_TOKEN presence contract used by 8c +
