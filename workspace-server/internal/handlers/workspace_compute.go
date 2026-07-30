@@ -681,6 +681,26 @@ func (h *WorkspaceHandler) Display(c *gin.Context) {
 		}
 	}
 	if compute.Display.Mode == "" || compute.Display.Mode == "none" {
+		// No LEGACY (EC2/DCV) display mode declared. But if the desktop-sidecar
+		// computer-use backend is wired, this workspace CAN show a desktop — an
+		// agent can drive a sidecar desktop on any workspace on demand, so a human
+		// must be able to watch/take over it too, without a separate per-workspace
+		// compute.display opt-in. Report available and let the human display path
+		// scale the sidecar up and proxy to its noVNC (design §8/§13). The frontend
+		// only needs available=true to render+connect; mode/protocol are labels.
+		if h.sidecarProv != nil {
+			c.JSON(http.StatusOK, workspaceDisplayResponse{
+				Available: true,
+				Mode:      "desktop-control",
+				Protocol:  "novnc",
+				// Fixed sidecar coordinate contract (design §3; matches the
+				// provisioner's desktopWidth/Height and the entrypoint default).
+				Width:  1280,
+				Height: 800,
+				Status: "ready",
+			})
+			return
+		}
 		c.JSON(http.StatusOK, workspaceDisplayResponse{
 			Available: false,
 			Reason:    "display_not_enabled",
