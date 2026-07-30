@@ -25,6 +25,11 @@ import (
 type desktopGateway interface {
 	Screenshot(ctx context.Context, workspaceID string) ([]byte, error)
 	Input(ctx context.Context, workspaceID string, action json.RawMessage) error
+	// EnsureRunning scales the desktop from zero if needed and records its
+	// 'running' lifecycle state. Used by the HUMAN display path so opening the
+	// view brings the desktop up (routed through the gateway — not StartDesktop
+	// directly — so the idle sweeper can still find and reap it).
+	EnsureRunning(ctx context.Context, workspaceID string) (string, error)
 }
 
 // SetDesktopGateway wires the desktop enforcement gateway. Unset (nil) makes the

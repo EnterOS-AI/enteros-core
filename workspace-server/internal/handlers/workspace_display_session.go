@@ -51,19 +51,33 @@ func (h *WorkspaceHandler) DisplaySession(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load display session"})
 		return
 	}
-	if display.Mode == "" || display.Mode == "none" {
-		c.JSON(http.StatusNotFound, gin.H{"error": "display not enabled"})
-		return
-	}
 	// Display re-home (§13): a deployment with a desktop-sidecar backend wired
 	// reaches the sidecar's noVNC directly over the per-workspace network (no
 	// EC2 instance_id / EIC tunnel). EC2 deployments keep the instance_id gate.
 	// (Per-workspace sidecar-vs-EC2 selection from the lifecycle table is a
 	// follow-up; the wired-backend flag is the deployment-level discriminator.)
 	useSidecar := h.sidecarProv != nil
+	// Display is enabled when the workspace declares a legacy display mode
+	// (EC2/DCV) OR the sidecar computer-use backend is wired — the latter needs no
+	// per-workspace compute.display opt-in (see the Display availability handler).
+	if (display.Mode == "" || display.Mode == "none") && !useSidecar {
+		c.JSON(http.StatusNotFound, gin.H{"error": "display not enabled"})
+		return
+	}
 	if !useSidecar && instanceID == "" {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "display session unavailable"})
 		return
+	}
+	// Bring the sidecar desktop up if it was scaled to zero, so a human opening
+	// the viewer connects even when no agent has started it. Routed through the
+	// gateway's EnsureRunning (not StartDesktop directly) so the 'running'
+	// lifecycle state is recorded and the idle sweeper can still reap it.
+	// Best-effort: if it errors we still attempt the proxy (it may already be up);
+	// a slow cold start surfaces as a proxy retry the frontend reconnects through.
+	if useSidecar && h.desktopGateway != nil {
+		if _, err := h.desktopGateway.EnsureRunning(c.Request.Context(), workspaceID); err != nil {
+			log.Printf("DisplaySession: ensure desktop running for %s failed (best-effort): %v", workspaceID, err)
+		}
 	}
 
 	proxyPath := c.Param("proxyPath")

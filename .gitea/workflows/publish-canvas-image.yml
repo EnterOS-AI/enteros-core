@@ -86,9 +86,13 @@ jobs:
     # candidate selectors only; no production selector or live host is touched.
     runs-on: [docker-host, robot-1]
     timeout-minutes: 45
-    # mc#4391 pre-flip soak (release blocker internal#1038): inspect clean
-    # post-main logs before removing this mask.
-    continue-on-error: true
+    # Pre-flip soak mask. Release blocker: internal#1038 (transactional immutable
+    # promotion). That cross-link is stated HERE, four lines clear of the directive,
+    # and deliberately not on the two lines immediately above it:
+    # lint_continue_on_error_tracking.py sets WINDOW = 2 and takes the FIRST tracker
+    # scanning [line-2, line+2] ascending, so any number in that band would be
+    # resolved INSTEAD of the live one and red the gate.
+    continue-on-error: true  # mc#4960: 2026-07-30 renewal, expires 2026-08-13 — inspect clean post-main build-and-push logs, then flip false; successor tracker carries definition-of-done.
     outputs:
       # Digest evidence is retained so the later fail-closed release gate can
       # consume the exact immutable candidate without rebuilding it.
