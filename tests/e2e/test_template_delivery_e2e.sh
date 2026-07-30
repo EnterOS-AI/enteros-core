@@ -10,28 +10,63 @@
 #      online.
 #   2. DYNAMIC PLUGIN channel (post-online): agent-skills are PLUGINS. They are
 #      NO LONGER delivered via the template-asset / provisioning channel. The
-#      seo-agent DECLARES the seo-all plugin (source
-#      gitea://molecule-ai/molecule-ai-workspace-template-seo-agent/agent-skills/seo-all#main),
-#      and the post-online reconcile (registry heartbeat transition-to-online →
-#      ReconcileWorkspacePlugins) installs it through the existing plugin
-#      install pipeline. It lands at /configs/plugins/seo-all/ (SKILL.md
-#      present) after the online→reconcile→install→restart cycle.
+#      seo-agent DECLARES a plugin, and the post-online reconcile (registry
+#      heartbeat transition-to-online → ReconcileWorkspacePlugins) installs it
+#      through the existing plugin install pipeline, after the
+#      online→reconcile→install→restart cycle.
+#
+# THE PLUGIN SHAPE CHANGED (2026-07-29). The seo-agent template no longer
+# declares the vendored `seo-all` skill package. It declares an ENTERSKILL
+# plugin delivered BY REFERENCE:
+#
+#   gitea://molecule-ai/molecule-ai-plugin-seo-ability#<ref>
+#
+# That wrapper contains NO ability content — ~9 files. Two things make it work,
+# and both are now asserted, because "the plugin directory exists" no longer
+# implies anything works:
+#   * contributes.mcpServers -> the composed TOOL surface, served by
+#     @enteros/skill-mcp, rendered to <configs>/.claude/settings.json
+#   * skills/<dir>/          -> the routing DOCS half, copied by
+#     AgentskillsAdaptor to /configs/skills/<dir>/
+#   * setup.sh               -> installs the ability (@enteros/skill-seo-ability)
+#     from PUBLIC npm into the plugin's own node_modules, under a 120s cap and a
+#     credential-scrubbed env.
 #
 # WHY THIS EXISTS — the bugs that shipped green because nothing asserted this:
 #   1. concierge booted with no MODEL  (MISSING_MODEL fail-closed) — #2966
 #   2. concierge booted with no IDENTITY (generic Claude Code)     — #2955
-#   3. seo-agent booted but the seo-all skill never installed       — #32
+#   3. seo-agent booted but the declared skill never installed      — #32
 # The unit/drift tests did not catch any of these because none provision a
 # fresh agent end-to-end and inspect the DELIVERED /configs. This does.
 #
-# Assertions (each maps to a real incident):
+# NEW failure modes this gate now covers (each is silent without it):
+#   4. only ONE half of an EnterSkill plugin installs. The SDK's own enterskill
+#      scaffold README warns a runtime may install "whichever half its
+#      kind-based selection resolves to". Half-installed = docs the agent cannot
+#      execute, or tools it has no routing docs for.
+#   5. WIRED BUT UNMOUNTABLE: setup.sh fails (npm unreachable, range
+#      unpublished, >120s) so the MCP server starts and serves ZERO tools.
+#   6. tarball ships source instead of a prebuilt dist -> setup.sh would have to
+#      compile and blows the 120s budget.
+#   7. the cutover silently did not happen: the retired plugin is STILL
+#      installed alongside the new one -> two SEO surfaces acting on one site.
+#
+# Assertions (each maps to a real incident or a real failure mode):
 #   A. seo-agent reaches online                       (catches MISSING_MODEL)
 #   B. GET /model == the template's declared model    (catches model drop)
 #   C. config.yaml delivered + REAL (> 1 KiB) via the ASSET channel
 #   D. prompts/ delivered (identity prompt) via the ASSET channel
-#   E. plugins/seo-all/SKILL.md installed via the post-online PLUGIN reconcile
-#      (catches skill drop, #32) — NOT the asset channel. Polled, because the
-#      install fires AFTER online and triggers a container restart.
+#   E. the DECLARED plugin's payload installs via the post-online reconcile
+#      (skill drop, #32) — NOT the asset channel. Polled: the install fires
+#      AFTER online and triggers a container restart.
+#   F. BOTH halves installed — docs at /configs/skills/<dir>/SKILL.md AND
+#      mcpServers['<name>'] in .claude/settings.json. Asserted separately so a
+#      failure names WHICH half is missing.        (failure mode 4)
+#   G. the ability is actually mounted from npm, with a prebuilt dist —
+#      i.e. by-reference resolved, not wired-but-unmountable. (5, 6)
+#   H. the cutover happened: the retired plugin is absent (H1) and skills still
+#      never arrive via the asset channel (H2). Both pinned to the RETIRED
+#      name — repointing them at the new plugin would make them vacuous. (7)
 #
 # Auth model + org-provision/teardown shape mirror test_staging_concierge_e2e.sh.
 #
@@ -41,7 +76,14 @@
 # Optional:
 #   E2E_SEO_TEMPLATE       default seo-agent
 #   E2E_EXPECTED_MODEL     default moonshot/kimi-k2.6
-#   E2E_EXPECTED_PLUGIN    default seo-all  (install name = last subpath segment)
+#   E2E_EXPECTED_PLUGIN    default molecule-ai-plugin-seo-ability
+#                          (install name = last path segment of the source
+#                           contract; no subpath ⇒ the repo name)
+#   E2E_EXPECTED_ABILITY_PKG default @enteros/skill-seo-ability (npm, public)
+#   E2E_EXPECTED_SKILL_DIR default seo-ability   (plugin skills/<dir>/)
+#   E2E_EXPECTED_MCP_NAME  default seo-ability   (contributes.mcpServers[].name)
+#   E2E_RETIRED_PLUGIN     default seo-all       (negative controls H1/H2 —
+#                          keep pinned to the RETIRED name or they go vacuous)
 #   E2E_PROVISION_TIMEOUT_SECS  default 900
 #   E2E_PLUGIN_INSTALL_TIMEOUT_SECS default 600 (online→reconcile→install→restart)
 #   E2E_KEEP_ORG           1 → skip teardown (debug)
@@ -53,7 +95,20 @@ CP_URL="${MOLECULE_CP_URL:-https://staging-api.moleculesai.app}"
 ADMIN_TOKEN="${MOLECULE_ADMIN_TOKEN:?MOLECULE_ADMIN_TOKEN required — load CP_ADMIN_API_TOKEN from Infisical /shared/controlplane-admin}"
 SEO_TEMPLATE="${E2E_SEO_TEMPLATE:-seo-agent}"
 EXPECTED_MODEL="${E2E_EXPECTED_MODEL:-moonshot/kimi-k2.6}"
-EXPECTED_PLUGIN="${E2E_EXPECTED_PLUGIN:-seo-all}"
+# The plugin the seo-agent template now DECLARES. Install name = last path
+# segment of the source contract; this source has NO subpath, so the name is the
+# repo name (workspace-server gitea resolver).
+EXPECTED_PLUGIN="${E2E_EXPECTED_PLUGIN:-molecule-ai-plugin-seo-ability}"
+# The EnterSkill ability the plugin mounts BY REFERENCE from public npm, and the
+# skill-docs directory name it contributes (plugin `skills/<dir>/`).
+EXPECTED_ABILITY_PKG="${E2E_EXPECTED_ABILITY_PKG:-@enteros/skill-seo-ability}"
+EXPECTED_SKILL_DIR="${E2E_EXPECTED_SKILL_DIR:-seo-ability}"
+EXPECTED_MCP_NAME="${E2E_EXPECTED_MCP_NAME:-seo-ability}"
+# The RETIRED plugin. Kept as its own variable ON PURPOSE: the negative controls
+# below must stay pinned to the thing that must NOT appear. Folding them onto
+# EXPECTED_PLUGIN would leave them checking a directory that never existed —
+# they would still print ok while asserting nothing.
+RETIRED_PLUGIN="${E2E_RETIRED_PLUGIN:-seo-all}"
 PROVISION_TIMEOUT_SECS="${E2E_PROVISION_TIMEOUT_SECS:-900}"
 PLUGIN_INSTALL_TIMEOUT_SECS="${E2E_PLUGIN_INSTALL_TIMEOUT_SECS:-600}"
 # Settle budget for the ASSET-channel assertions (C config.yaml, D prompts).
@@ -363,59 +418,170 @@ ok "C: config.yaml delivered ($CFG_SIZE B)"
 [ "${PROMPTS:-0}" -gt 0 ] || fail "D: prompts/ empty after ${ASSET_SETTLE_SECS}s — identity prompt NOT delivered"
 ok "D: prompts/ delivered ($PROMPTS file(s))"
 
-# E. plugins/seo-all/SKILL.md installed via the post-online PLUGIN reconcile —
-#    THE #32 regression assertion, under the NEW (RFC #2843) contract.
+# ─── helper: list one /configs path, classify what landed ────────────────────
+# Returns SKILL_MD | MANIFEST | COMPLETE_NO_SKILL | NONEMPTY | EMPTY.
+# MANIFEST (plugin.yaml) is the payload marker for a by-reference plugin whose
+# own SKILL.md is NESTED under skills/<dir>/ rather than at the payload root.
 #
-# The seo-all skill is NO LONGER on /configs via the asset channel. The
-# seo-agent template DECLARES it as a plugin; the registry heartbeat's
-# transition-to-online fires ReconcileWorkspacePlugins, which installs the
-# declared plugin through the standard pipeline. It lands at
-# /configs/plugins/seo-all/ with SKILL.md (+ a .complete marker), and a
-# first-time install triggers a container restart — so it is NOT present at
-# the instant of online. We POLL the asset channel paths are already asserted
-# (C/D above); here we wait for the plugin to land.
+# UNREADABLE is a DISTINCT state and must never collapse into EMPTY. The
+# absence assertions (H1/H2) would otherwise pass vacuously on a transport
+# error or a malformed body — a dead endpoint would read exactly like "the
+# retired plugin is gone". Same principle the config.yaml poll above already
+# applies: a timeout is NOT a read of a missing file. Callers that assert
+# PRESENCE may treat UNREADABLE as "keep polling"; callers that assert ABSENCE
+# MUST fail on it.
 #
-# Negative control: the skill MUST NOT arrive via the OLD asset path. If
-# agent-skills/seo-all/SKILL.md shows up, the decoupling regressed (the
-# provisioning channel is still smuggling skills) — fail loudly.
+# TWO guards, because CURL_COMMON has no --fail: curl exits 0 on HTTP 4xx/5xx
+# and prints the error body. So `rc != 0` catches only TRANSPORT failures
+# (timeout/DNS/refused), while an HTTP error arrives as a non-list JSON body and
+# is caught by the isinstance() check below. Removing either one re-opens the
+# vacuous-pass hole.
+classify_path() {
+  local body rc
+  body=$(tenant_call GET "/workspaces/$WID/files?path=$1" 2>/dev/null); rc=$?
+  [ "$rc" -ne 0 ] && { echo UNREADABLE; return; }
+  printf '%s' "$body" | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print('UNREADABLE'); raise SystemExit
+if not isinstance(d,list): print('UNREADABLE'); raise SystemExit
+paths=[f.get('path','') for f in d]
+if any(p.endswith('SKILL.md') for p in paths): print('SKILL_MD')
+elif any(p.endswith('plugin.yaml') for p in paths): print('MANIFEST')
+elif any(p.endswith('.complete') for p in paths): print('COMPLETE_NO_SKILL')
+elif paths: print('NONEMPTY')
+else: print('EMPTY')
+" 2>/dev/null || echo UNREADABLE
+}
+
+# ─── E. the DECLARED plugin installs via the post-online reconcile ───────────
+# THE #32 regression assertion, under the RFC #2843 contract AND the
+# by-reference plugin shape the seo-agent template now declares.
+#
+# The template DECLARES the wrapper plugin; the registry heartbeat's
+# transition-to-online fires ReconcileWorkspacePlugins, which resolves the
+# gitea source and installs it. A first-time install triggers a container
+# restart, so it is NOT present at the instant of online — hence the poll.
+#
+# WHAT CHANGED vs the seo-all era: the plugin no longer CONTAINS the skill. It
+# is a ~9-file wrapper whose setup.sh installs the ability from PUBLIC npm, and
+# whose contributes.mcpServers serves the composed tool surface. So "the plugin
+# directory exists" is necessary but nowhere near sufficient — E only proves the
+# payload landed. F, G and H prove it actually works.
 PLUGIN_PATH="plugins/$EXPECTED_PLUGIN"
 log "E: polling for plugin '$EXPECTED_PLUGIN' at /configs/$PLUGIN_PATH (≤${PLUGIN_INSTALL_TIMEOUT_SECS}s; online→reconcile→install→restart)"
 
-# Negative control — old asset-channel path must stay EMPTY.
-OLD_ASSET=$(tenant_call GET "/workspaces/$WID/files?path=agent-skills/$EXPECTED_PLUGIN" | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-paths=[f.get('path','') for f in d] if isinstance(d,list) else []
-print('SKILL_MD' if any(p.endswith('SKILL.md') for p in paths) else 'EMPTY')
-" 2>/dev/null || echo EMPTY)
-[ "$OLD_ASSET" = "SKILL_MD" ] && fail "E(neg): agent-skills/$EXPECTED_PLUGIN/SKILL.md present on the OLD asset channel — RFC#2843 decoupling REGRESSED; the provisioning channel is still delivering skills (it must not)."
-ok "E(neg): old asset-channel agent-skills/$EXPECTED_PLUGIN empty (decoupling holds)"
-
 PDEADLINE=$(( $(date +%s) + PLUGIN_INSTALL_TIMEOUT_SECS )); PLAST=""
-SKILLS=EMPTY
+PAYLOAD=EMPTY
 while true; do
   if [ "$(date +%s)" -gt "$PDEADLINE" ]; then
-    fail "E: plugin '$EXPECTED_PLUGIN' never installed at /configs/$PLUGIN_PATH within ${PLUGIN_INSTALL_TIMEOUT_SECS}s — the post-online reconcile did NOT install the declared seo-all plugin (#32 regression under the new dynamic-plugin contract). last=$PLAST"
+    fail "E: plugin '$EXPECTED_PLUGIN' never installed at /configs/$PLUGIN_PATH within ${PLUGIN_INSTALL_TIMEOUT_SECS}s — the post-online reconcile did NOT install the plugin the template declares. Check the template's plugins: entry resolves (gitea://molecule-ai/$EXPECTED_PLUGIN#<ref>) and that the box's read-only PAT can reach it. last=$PLAST"
   fi
-  SKILLS=$(tenant_call GET "/workspaces/$WID/files?path=$PLUGIN_PATH" | python3 -c "
+  PAYLOAD=$(classify_path "$PLUGIN_PATH")
+  [ "$PAYLOAD" != "$PLAST" ] && { log "    plugin payload → $PAYLOAD"; PLAST="$PAYLOAD"; }
+  case "$PAYLOAD" in
+    SKILL_MD|MANIFEST) break;;   # payload on disk (plugin.yaml and/or nested SKILL.md)
+    *) sleep 15;;                # EMPTY / NONEMPTY / COMPLETE_NO_SKILL → restart in flight
+  esac
+done
+ok "E: plugin '$EXPECTED_PLUGIN' payload installed via post-online reconcile ($PAYLOAD)"
+
+# ─── F. BOTH HALVES of the EnterSkill plugin are installed ───────────────────
+# THE headline assertion for the by-reference shape, and the one most likely to
+# regress silently. An EnterSkill plugin contributes TWO halves:
+#   tools -> contributes.mcpServers, wired by MCPServerAdaptor via
+#            ctx.register_mcp_server and rendered to <configs>/.claude/settings.json
+#   docs  -> skills/<dir>/, copied by AgentskillsAdaptor to /configs/skills/<dir>/
+#
+# The SDK's own enterskill scaffold README warns that a runtime may install
+# "whichever half its kind-based selection resolves to". MCPServerAdaptor does
+# in fact do both (it delegates skills/rules/setup.sh to AgentskillsAdaptor),
+# but that is precisely the kind of behaviour that regresses without a gate: a
+# half-installed plugin leaves an agent with docs it cannot execute, or tools it
+# has no routing docs for. Each half is asserted SEPARATELY so the failure names
+# which one is missing instead of just "plugin broken".
+SKILL_DOCS=$(classify_path "skills/$EXPECTED_SKILL_DIR")
+case "$SKILL_DOCS" in
+  SKILL_MD) ok "F(docs): docs half installed — /configs/skills/$EXPECTED_SKILL_DIR/SKILL.md present" ;;
+  UNREADABLE) fail "F(docs): could not read /configs/skills/$EXPECTED_SKILL_DIR — cannot prove the DOCS half installed. A transport or malformed-body error is not evidence of success." ;;
+  *) fail "F(docs): /configs/skills/$EXPECTED_SKILL_DIR/SKILL.md absent (state=$SKILL_DOCS) — the DOCS half did not install. The plugin ships skills/$EXPECTED_SKILL_DIR/SKILL.md; AgentskillsAdaptor should copy it to /configs/skills/. The agent would have the tool surface with no routing docs." ;;
+esac
+
+MCP_WIRED=$(tenant_call GET "/workspaces/$WID/files/.claude/settings.json" --max-time "$ASSET_READ_TIMEOUT_SECS" 2>/dev/null \
+  | python3 -c "
+import json,sys
+want=sys.argv[1]
+try: d=json.load(sys.stdin)
+except Exception: print('UNREADABLE'); raise SystemExit
+servers=d.get('mcpServers') if isinstance(d,dict) else None
+if not isinstance(servers,dict): print('NO_MCP_BLOCK'); raise SystemExit
+print('WIRED' if want in servers else 'MISSING:'+','.join(sorted(servers)[:6]))
+" "$EXPECTED_MCP_NAME" 2>/dev/null || echo UNREADABLE)
+case "$MCP_WIRED" in
+  WIRED) ok "F(tools): tool half wired — mcpServers['$EXPECTED_MCP_NAME'] present in .claude/settings.json" ;;
+  UNREADABLE) fail "F(tools): could not read/parse /configs/.claude/settings.json — cannot prove the TOOL half was wired. A transport or JSON error is NOT evidence of success." ;;
+  NO_MCP_BLOCK) fail "F(tools): .claude/settings.json has no mcpServers block — the TOOL half did not install. MCPServerAdaptor should have registered it via ctx.register_mcp_server; the agent has routing docs for tools that do not exist." ;;
+  *) fail "F(tools): mcpServers exists but '$EXPECTED_MCP_NAME' is absent ($MCP_WIRED) — the TOOL half did not install for THIS plugin." ;;
+esac
+
+# ─── G. by-reference actually resolved: the ability is mounted from npm ──────
+# E+F can both pass while the plugin is useless. setup.sh installs the ability
+# from public npm under a 120s cap with a credential-SCRUBBED env; if npm is
+# unreachable, the declared version range is unpublished, or the install
+# overruns, the MCP server is WIRED BUT UNMOUNTABLE — it starts, finds no
+# modules, and serves zero tools. That failure is invisible to E and F.
+#
+# dist/module.js is asserted deliberately: the whole 120s budget rests on the
+# published tarball shipping a PREBUILT dist. If a future publish ships source
+# only, setup.sh would have to compile and would blow the timeout — assert the
+# prebuilt artifact is there rather than waiting to be surprised in production.
+MOUNT_PATH="$PLUGIN_PATH/node_modules/$EXPECTED_ABILITY_PKG"
+MOUNTED=$(tenant_call GET "/workspaces/$WID/files?path=$MOUNT_PATH" | python3 -c "
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d=None
 paths=[f.get('path','') for f in d] if isinstance(d,list) else []
-# SKILL.md = the skill landed; .complete = atomic install finished; else partial/empty.
-if any(p.endswith('SKILL.md') for p in paths): print('SKILL_MD')
-elif any(p.endswith('.complete') for p in paths): print('COMPLETE_NO_SKILL')
-elif paths: print('NONEMPTY')
-else: print('EMPTY')
-" 2>/dev/null || echo EMPTY)
-  [ "$SKILLS" != "$PLAST" ] && { log "    plugin status → $SKILLS"; PLAST="$SKILLS"; }
-  case "$SKILLS" in
-    SKILL_MD) break;;            # the load-bearing success: the skill is on disk
-    *) sleep 15;;                # EMPTY / NONEMPTY / COMPLETE_NO_SKILL → keep polling (restart in flight)
-  esac
-done
-ok "E: plugin '$EXPECTED_PLUGIN' installed via post-online reconcile — /configs/$PLUGIN_PATH/SKILL.md present"
+has_manifest=any(p.endswith('.enterskill') for p in paths)
+has_dist=any(p.endswith('dist/module.js') for p in paths)
+if has_manifest and has_dist: print('MOUNTED_PREBUILT')
+elif has_manifest: print('MANIFEST_NO_DIST')
+elif paths: print('PARTIAL')
+else: print('ABSENT')
+" 2>/dev/null || echo ABSENT)
+case "$MOUNTED" in
+  MOUNTED_PREBUILT) ok "G: ability mounted BY REFERENCE from npm — $EXPECTED_ABILITY_PKG present at $MOUNT_PATH with a prebuilt dist" ;;
+  MANIFEST_NO_DIST) fail "G: $EXPECTED_ABILITY_PKG mounted but dist/module.js is MISSING — the published tarball did not ship a prebuilt dist. skill-core resolves handlers through the package exports default (./dist/module.js), so every tool call fails, and setup.sh cannot compile inside its 120s budget." ;;
+  PARTIAL) fail "G: $MOUNT_PATH exists but has neither .enterskill nor dist/module.js — setup.sh install was interrupted or partial." ;;
+  *) fail "G: $EXPECTED_ABILITY_PKG NOT mounted at $MOUNT_PATH — setup.sh did not install the ability. The MCP server is WIRED BUT UNMOUNTABLE: it will start and serve ZERO tools. Check npm reachability from the box, that the declared range is published, and that setup.sh finished inside its 120s cap (its env is credential-scrubbed by design, so a private-repo clone can never work here)." ;;
+esac
 
-ok "ALL DELIVERY ASSERTIONS PASSED — asset channel: config+prompts+model; plugin channel: $EXPECTED_PLUGIN"
-echo "PASS template-delivery-e2e: slug=$SLUG ws=$WID model=$MODEL config=${CFG_SIZE}B plugin=$EXPECTED_PLUGIN($SKILLS)" >&2
+# ─── H. the CUTOVER actually happened (negative controls) ────────────────────
+# Both controls stay pinned to $RETIRED_PLUGIN, never to $EXPECTED_PLUGIN. If
+# they were repointed at the new plugin they would check paths that never
+# existed and pass vacuously while printing ok.
+#
+# H1 proves the repoint TOOK EFFECT rather than merely adding a second plugin:
+# if the retired plugin is still installed, the template still declares it and
+# the workspace is running two SEO surfaces that can both act on the same site.
+RETIRED_STATE=$(classify_path "plugins/$RETIRED_PLUGIN")
+case "$RETIRED_STATE" in
+  EMPTY) ok "H1: retired plugin '$RETIRED_PLUGIN' absent (successful read) — cutover took effect" ;;
+  UNREADABLE) fail "H1: could not read /configs/plugins/$RETIRED_PLUGIN — this assertion proves ABSENCE, so an unreadable endpoint cannot satisfy it. A transport error is not evidence the retired plugin is gone." ;;
+  *) fail "H1: retired plugin '$RETIRED_PLUGIN' is STILL installed at /configs/plugins/$RETIRED_PLUGIN (got $RETIRED_STATE) — the cutover did not take effect. The template still declares it, so this workspace now has TWO SEO surfaces that can both act on the same site." ;;
+esac
+
+# H2 is the original RFC#2843 decoupling guard, unchanged in intent: skills must
+# never arrive through the provisioning/asset channel. It remains meaningful
+# because agent-skills/$RETIRED_PLUGIN/ still EXISTS in the template repo (it was
+# removed from plugins:, not deleted) — so this is a live path that a regression
+# could genuinely start smuggling.
+OLD_ASSET=$(classify_path "agent-skills/$RETIRED_PLUGIN")
+case "$OLD_ASSET" in
+  SKILL_MD) fail "H2: agent-skills/$RETIRED_PLUGIN/SKILL.md present on the OLD asset channel — RFC#2843 decoupling REGRESSED; the provisioning channel is still delivering skills (it must not)." ;;
+  UNREADABLE) fail "H2: could not read agent-skills/$RETIRED_PLUGIN — this assertion proves ABSENCE, so an unreadable endpoint cannot satisfy it. Previously this swallowed transport errors as EMPTY and passed vacuously." ;;
+  *) ok "H2: old asset-channel agent-skills/$RETIRED_PLUGIN carries no SKILL.md (successful read, state=$OLD_ASSET) — decoupling holds" ;;
+esac
+
+ok "ALL DELIVERY ASSERTIONS PASSED — asset channel: config+prompts+model; plugin channel: $EXPECTED_PLUGIN (both halves) mounting $EXPECTED_ABILITY_PKG by reference"
+echo "PASS template-delivery-e2e: slug=$SLUG ws=$WID model=$MODEL config=${CFG_SIZE}B plugin=$EXPECTED_PLUGIN payload=$PAYLOAD docs=$SKILL_DOCS tools=$MCP_WIRED ability=$MOUNTED retired=$RETIRED_STATE" >&2
 exit 0
