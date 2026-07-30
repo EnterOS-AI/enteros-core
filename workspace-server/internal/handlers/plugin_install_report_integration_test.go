@@ -87,7 +87,10 @@ func TestIntegration_PluginInstallReport_RoundTripsAndDerivesLiveness(t *testing
 		t.Errorf("plugins_dir did not round-trip: %q", row.PluginsDir)
 	}
 	if !row.Live {
-		t.Error("declared+swapped+no failures must derive live=true")
+		t.Error("declared+swapped must derive live=true")
+	}
+	if row.Degraded {
+		t.Error("nothing failed — a clean promotion must not read degraded")
 	}
 	if row.OutcomeRule == "" {
 		t.Error("the outcome rule must be echoed so live=false explains itself")
@@ -124,6 +127,56 @@ func TestIntegration_PluginInstallReport_StagedButNotSwappedReadsNotLive(t *test
 	naiveSaysLive := len(row.Installed) > 0
 	if !naiveSaysLive {
 		t.Fatal("control is not exercising the hazard: the naive predicate must say live")
+	}
+}
+
+// The runtime's PARTIAL-PROMOTION shape, round-tripped: swapped=true with a
+// non-empty failed list. molecule_runtime/plugin_sources.py carries the live dirs
+// forward, logs "promoting the N that succeeded", swaps, and reports exactly this.
+// The old rule folded `failed == []` into liveness and so read a box with 5 of 6
+// plugins running as live=false — a false alarm on a healthy workspace, which is
+// the same lie this table exists to end, with the sign flipped.
+func TestIntegration_PluginInstallReport_PartialPromotionReadsLiveAndDegraded(t *testing.T) {
+	conn := settingsTestDB(t)
+	ctx := context.Background()
+	ws := seedSettingsWorkspace(t, conn)
+
+	installed := []string{"scheduler", "mgmt-mcp", "digest", "memory", "canvas"}
+	failed := []string{"gitea://molecule-ai/molecule-ai-plugin-lark#deadbeef"}
+	if err := persistPluginInstallReport(ctx, conn, ws,
+		reportBody(true, true, installed, []string{}, failed, "/configs/plugins")); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	row, err := loadPluginInstallReport(ctx, conn, ws)
+	if err != nil || row == nil {
+		t.Fatalf("load: row=%v err=%v", row, err)
+	}
+	if !row.Live {
+		t.Error("the tree WAS promoted — 5 of 6 plugins are running, so this box is live")
+	}
+	if !row.Degraded {
+		t.Error("a promoted tree missing a declared source must read degraded, not live-and-clean")
+	}
+	if len(row.Failed) != 1 {
+		t.Errorf("the failed source must stay readable — it is the diagnostic: %#v", row.Failed)
+	}
+
+	// Negative control: the retired rule calls this healthy box not-live.
+	if retired := row.Declared && row.Swapped && len(row.Failed) == 0; retired {
+		t.Fatal("control is not exercising the hazard: the retired `failed == []` rule must disagree")
+	}
+
+	// And the fleet query an operator runs must agree with the API: this workspace
+	// is NOT one of the broken ones. A partial index that disagrees with `live` is
+	// how an operator ends up debugging a box the API already called healthy.
+	var inNotLive bool
+	if err := conn.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM workspace_plugin_install_reports
+		               WHERE workspace_id = $1 AND declared AND NOT swapped)`, ws).Scan(&inNotLive); err != nil {
+		t.Fatal(err)
+	}
+	if inNotLive {
+		t.Error("a partially-promoted workspace must not appear in the not-live fleet query")
 	}
 }
 

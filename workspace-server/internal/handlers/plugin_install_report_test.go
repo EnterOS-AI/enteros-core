@@ -17,6 +17,12 @@ package handlers
 //     different repo
 //  3. liveness being computed from `installed` instead of the contract's rule,
 //     which reports a staged-but-never-promoted build as a success
+//  4. liveness ALSO consulting `failed`, which reports a healthy box running 5 of
+//     6 plugins as an outage — the same lie with the sign flipped, and the worse
+//     one, because a signal that cries wolf gets ignored before it is ever right
+//  5. the body bounds being checked only AFTER the decoder has already
+//     materialised the body, so they bound what is stored and not what is
+//     allocated
 //
 // Each has a paired negative control, so a failure says which direction broke.
 
@@ -88,28 +94,129 @@ func TestReportIsLive_FollowsTheContractRule(t *testing.T) {
 		name     string
 		declared bool
 		swapped  bool
-		failed   []string
 		want     bool
 	}{
-		{"declared+swapped+no failures is live", true, true, nil, true},
-		{"staged but never swapped is NOT live", true, false, nil, false},
-		{"swapped with a failure is NOT live", true, true, []string{"gitea://o/r"}, false},
-		{"nothing declared is NOT live", false, true, nil, false},
-		{"empty failed slice counts as no failures", true, true, []string{}, true},
+		{"declared+swapped is live", true, true, true},
+		{"staged but never swapped is NOT live", true, false, false},
+		{"nothing declared is NOT live", false, true, false},
+		{"nothing declared and nothing swapped is NOT live", false, false, false},
 	}
 	for _, tc := range cases {
-		if got := reportIsLive(tc.declared, tc.swapped, tc.failed); got != tc.want {
+		if got := reportIsLive(tc.declared, tc.swapped); got != tc.want {
 			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
 		}
 	}
 }
 
+// THE finding this file was rewritten for. The runtime PROMOTES PARTIAL BUILDS —
+// molecule_runtime/plugin_sources.py: "A failed source fails THAT SOURCE — not the
+// whole tree", added after staging test5 on 2026-07-13, where the old
+// all-or-nothing veto let one unfetchable third-party plugin take the concierge's
+// own management MCP down with it. On a partial failure the runtime carries the
+// live dirs forward, logs "promoting the N that succeeded", swaps, and returns
+// swapped=True with a NON-EMPTY failed list.
+//
+// So the old rule (`… && len(failed) == 0`) called a workspace with 5 of 6 plugins
+// running and one flaky gitea fetch NOT LIVE. This endpoint exists to stop core
+// lying about plugin liveness; a false alarm on a healthy box is that same lie
+// with the sign flipped, and it is worse than the original because it trains an
+// operator to ignore the signal.
+func TestReportIsLive_PartialPromotionIsLive(t *testing.T) {
+	// The exact report the runtime sends after promoting 5 of 6 sources.
+	declared, swapped := true, true
+	failed := []string{"gitea://molecule-ai/molecule-ai-plugin-lark#deadbeef"}
+
+	if !reportIsLive(declared, swapped) {
+		t.Fatal("a promoted tree is LIVE — the runtime promotes partial builds on purpose")
+	}
+	if !reportIsDegraded(declared, swapped, failed) {
+		t.Error("a promoted tree with a failed source is DEGRADED — the signal `failed` actually carries")
+	}
+
+	// Negative control for the hazard itself: the RETIRED predicate — the one this
+	// change removed — calls the healthy box not-live. If this ever stops
+	// disagreeing, the test above has stopped exercising anything.
+	retiredRuleSaysLive := declared && swapped && len(failed) == 0
+	if retiredRuleSaysLive {
+		t.Fatal("control is not exercising the hazard: the retired `failed == []` rule must disagree")
+	}
+}
+
+func TestReportIsDegraded_OnlyDescribesAPromotedTree(t *testing.T) {
+	oops := []string{"gitea://o/r"}
+	cases := []struct {
+		name     string
+		declared bool
+		swapped  bool
+		failed   []string
+		want     bool
+	}{
+		{"promoted with a failure is degraded", true, true, oops, true},
+		{"promoted with no failures is not degraded", true, true, nil, false},
+		{"promoted with an empty failed slice is not degraded", true, true, []string{}, false},
+		// A report that never promoted is not "degraded" — `failed` there is one of
+		// the reasons NOTHING went live, and calling that degraded softens a hard
+		// failure into a caveat.
+		{"never promoted is not degraded, it is not live", true, false, oops, false},
+		{"nothing declared is not degraded", false, true, oops, false},
+	}
+	for _, tc := range cases {
+		if got := reportIsDegraded(tc.declared, tc.swapped, tc.failed); got != tc.want {
+			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// live and degraded must not be able to describe the same box two ways: degraded
+// is a REFINEMENT of live, so degraded ⇒ live for every input. Asserted over the
+// whole (declared × swapped × failed-shape) space rather than by example, because
+// the failure mode is an input nobody thought to write a case for.
+func TestReportIsLive_DegradedImpliesLiveAcrossEveryInput(t *testing.T) {
+	failedShapes := [][]string{nil, {}, {"one"}, {"one", "two"}}
+	for _, declared := range []bool{false, true} {
+		for _, swapped := range []bool{false, true} {
+			for _, failed := range failedShapes {
+				live := reportIsLive(declared, swapped)
+				degraded := reportIsDegraded(declared, swapped, failed)
+				if degraded && !live {
+					t.Errorf("declared=%v swapped=%v failed=%#v: degraded without live is not a state",
+						declared, swapped, failed)
+				}
+				// And liveness must never consult `failed` — that is the whole finding.
+				if live != (declared && swapped) {
+					t.Errorf("declared=%v swapped=%v failed=%#v: liveness must not depend on failed",
+						declared, swapped, failed)
+				}
+			}
+		}
+	}
+}
+
+// The migration's partial index is `WHERE declared AND NOT swapped`. It is the
+// operator's first query, and it must be the EXACT complement of live — a fleet
+// query that disagrees with the API is how an operator ends up debugging a
+// workspace the API already called healthy.
+func TestReportIsLive_MatchesTheFleetIndexPredicate(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		for _, swapped := range []bool{false, true} {
+			indexMatches := declared && !swapped // the migration's WHERE clause
+			live := reportIsLive(declared, swapped)
+			if declared && indexMatches == live {
+				t.Errorf("declared=%v swapped=%v: the not-live index and reportIsLive must be complements",
+					declared, swapped)
+			}
+		}
+	}
+}
+
 // THE case that motivated the rule. A build can stage every source and promote
-// none of them — a partial build is never swapped in. Counting `installed` reports
-// that as a success, which is exactly how the production symptom stayed invisible.
+// none of them — the runtime declines the swap when EVERY source failed, or when a
+// previous dir could not be carried forward, and leaves the live tree untouched.
+// Counting `installed` reports that as a success, which is exactly how the
+// production symptom stayed invisible.
 func TestReportIsLive_StagedEverythingPromotedNothingIsNotLive(t *testing.T) {
 	installed := []string{"a", "b", "c", "d", "e", "f"}
-	if reportIsLive(true, false, nil) {
+	if reportIsLive(true, false) {
 		t.Fatal("swapped=false must never be live")
 	}
 	// The negative control for the mistake itself: the naive predicate — the one a
@@ -205,6 +312,64 @@ func TestPluginInstallReport_OverLongSourceIsRefused(t *testing.T) {
 	w := postReport(t, `{"declared":true,"swapped":true,"failed":["`+long+`"]}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("an over-long source must be refused, got %d", w.Code)
+	}
+}
+
+// --- the body cap ----------------------------------------------------------
+//
+// maxInstallReportSources/…SourceLen are checked AFTER ShouldBindJSON, so on
+// their own they bound what gets STORED, not what gets ALLOCATED. The group is
+// mounted under wsAuth, which also accepts the ADMIN_TOKEN and an org key, so
+// "the caller is a workspace" is not a size bound either.
+
+// The attack shape, and the one the post-bind bounds cannot see at all: a body
+// that is perfectly LEGAL by every field check, made enormous by padding the
+// decoder will discard. Without a cap this decodes in full and answers 204.
+func TestPluginInstallReport_HugeButOtherwiseLegalBodyIsRefusedBeforeDecoding(t *testing.T) {
+	padding := strings.Repeat("x", 4<<20) // 4 MiB, ignored by the binding
+	w := postReport(t, `{"declared":true,"swapped":true,"installed":[],"skipped":[],"failed":[],"padding":"`+padding+`"}`)
+
+	if w.Code == molcontracts.PluginInstallReportSuccessStatus {
+		t.Fatalf("a %d-byte body was DECODED and accepted — every post-bind bound passed, "+
+			"because none of them can see padding the decoder throws away", len(padding))
+	}
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("an over-cap body must be refused with 413 (not %d) — a producer needs to know "+
+			"it was cut off rather than mis-serialised: %s", w.Code, w.Body.String())
+	}
+}
+
+// The cap must not be tighter than the bounds: a report at the maximum the field
+// checks admit has to survive it, or the endpoint 413s a report it would then have
+// stored. This pins the inequality so tightening either side cannot silently
+// invalidate the other.
+func TestPluginInstallReport_BodyCapAdmitsAMaximallyLegalReport(t *testing.T) {
+	source := `"` + strings.Repeat("s", maxInstallReportSourceLen) + `"`
+	list := "[" + strings.Repeat(source+",", maxInstallReportSources-1) + source + "]"
+	body := `{"declared":true,"swapped":true` +
+		`,"plugins_dir":"` + strings.Repeat("d", maxInstallReportSourceLen) + `"` +
+		`,"installed":` + list + `,"skipped":` + list + `,"failed":` + list + `}`
+
+	if len(body) > maxInstallReportBody {
+		t.Fatalf("the largest report the field bounds ADMIT (%d bytes) exceeds the body cap (%d) — "+
+			"the endpoint would 413 a report it would then have stored", len(body), maxInstallReportBody)
+	}
+	// Not a hypothetical bound: the real handler must take it.
+	w := postReport(t, body)
+	if w.Code != molcontracts.PluginInstallReportSuccessStatus {
+		t.Fatalf("a maximally-legal report must be accepted, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Negative control: the same construction one entry over the LIST bound is
+	// still well under the body cap, so it must be refused by the field check with
+	// a 400 — proving the cap has not quietly become the only bound in play.
+	over := `{"declared":true,"swapped":true,"installed":[` +
+		strings.Repeat(source+",", maxInstallReportSources) + source + `]}`
+	if len(over) >= maxInstallReportBody {
+		t.Fatalf("control is not exercising the field bound: %d bytes already trips the body cap", len(over))
+	}
+	if w := postReport(t, over); w.Code != http.StatusBadRequest {
+		t.Errorf("one entry over the list bound must be a 400 from the field check, got %d", w.Code)
 	}
 }
 
