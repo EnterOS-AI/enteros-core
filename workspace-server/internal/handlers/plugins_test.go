@@ -1133,9 +1133,46 @@ func TestResolveAndStage_NotFoundFromResolver(t *testing.T) {
 	}
 }
 
+// stagingDirsWithManifest returns the set of "molecule-plugin-fetch-*" dirs in
+// the shared system temp that currently hold a plugin.yaml.
+//
+// resolveAndStage stages into os.MkdirTemp("", "molecule-plugin-fetch-*"), i.e.
+// the SHARED system temp, not anything the test owns. So the raw set is global
+// process state: it includes dirs left by other tests, and — critically — dirs
+// orphaned by a PREVIOUS `go test` process that was killed before its cleanup
+// could run. Callers must therefore compare a before/after snapshot and judge
+// only the delta, never the absolute set.
+func stagingDirsWithManifest(t *testing.T) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	entries, _ := filepath.Glob(filepath.Join(os.TempDir(), "molecule-plugin-fetch-*"))
+	for _, e := range entries {
+		if _, err := os.Stat(filepath.Join(e, "plugin.yaml")); err == nil {
+			out[e] = true
+		}
+	}
+	return out
+}
+
 func TestResolveAndStage_CleansUpStagedDirOnError(t *testing.T) {
 	// Hostile resolver emits a file then returns a traversal name → 400.
 	// Verify the staged dir it used is NOT left behind.
+	//
+	// This asserts on a BEFORE/AFTER DELTA rather than on the absolute
+	// contents of os.TempDir(). The previous version globbed the whole shared
+	// temp dir and failed if ANY molecule-plugin-fetch-* held a plugin.yaml,
+	// which made its verdict a function of ambient state rather than of the
+	// code under test. CI reproduces that: ci.yml runs an advisory
+	// `go test -race -timeout 60s ./internal/handlers/...` immediately before
+	// the blocking coverage gate. That advisory run chronically exceeds its 60s
+	// budget and is SIGQUIT'd; when the kill lands while a plugin-install test
+	// is mid-Install (e.g. TestPluginInstall_RestartFalseSuppressed →
+	// driveInstall), the staged dir's cleanup never runs and an orphaned
+	// /tmp/molecule-plugin-fetch-*/plugin.yaml survives into the gate's fresh
+	// process — where this test reported another process's corpse as its own
+	// leak. Comparing only NEW dirs makes the assertion about this call.
+	before := stagingDirsWithManifest(t)
+
 	h := NewPluginsHandler(t.TempDir(), nil, nil).
 		WithSourceResolver(emitsName("hostile", "../../../etc/passwd"))
 	_, err := h.resolveAndStage(context.Background(), installRequest{Source: "hostile://x"})
@@ -1143,14 +1180,11 @@ func TestResolveAndStage_CleansUpStagedDirOnError(t *testing.T) {
 	if !errors.As(err, &he) || he.Status != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %v", err)
 	}
-	// Walk /tmp for leftover "molecule-plugin-fetch-*" dirs with the
-	// hostile resolver's marker. Probabilistic (can't pinpoint the exact
-	// dir), but a clean cleanup means none contain the plugin.yaml blob
-	// the resolver writes.
-	entries, _ := filepath.Glob(filepath.Join(os.TempDir(), "molecule-plugin-fetch-*"))
-	for _, e := range entries {
-		if _, err := os.Stat(filepath.Join(e, "plugin.yaml")); err == nil {
-			t.Errorf("leaked staging dir with plugin.yaml still present: %s", e)
+
+	for e := range stagingDirsWithManifest(t) {
+		if !before[e] {
+			t.Errorf("resolveAndStage leaked a staging dir it created: %s "+
+				"(still holds plugin.yaml after the error path returned)", e)
 		}
 	}
 }
