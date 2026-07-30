@@ -964,23 +964,49 @@ print(json.dumps(s))
   log "    idle-digest check ON: MOLECULE_IDLE_FIRE_SECONDS=${E2E_IDLE_FIRE_SECONDS:-30} injected into workspace secrets"
 fi
 
-# Scheduler autonomous-fire sub-step (P5c): with E2E_SCHEDULER_CHECK=on, declare
-# the molecule-scheduler kind:trigger plugin so the workspace boot-installs it
-# (per-workspace delivery — the runtime arms the daemon when the plugin is
-# present), and shrink the poll so a `* * * * *` schedule fires within the run.
-# Additive NON-LLM env only — same platform-managed guard rationale as the idle
-# block above. The plugin source is the public repo, fetched anonymously at boot.
+# Scheduler autonomous-fire sub-step (P5c): with E2E_SCHEDULER_CHECK=on, shrink
+# the trigger poll so a `* * * * *` schedule fires within the run. Additive
+# NON-LLM env only — same platform-managed guard rationale as the idle block
+# above.
+#
+# This block deliberately carries NO plugin-source literal and does NOT declare
+# the scheduler. Two independent reasons, either one sufficient:
+#
+#   1. A literal here is a DUPLICATE of the SSOT. WHICH source the scheduler
+#      installs from is owned by the SDK native-plugins registry
+#      (contracts/plugin/native-plugins.registry.json), consumed by core as the
+#      generated Go binding molcontracts through
+#      workspace-server/internal/handlers/plugin_registry.go
+#      (mustNativePluginSource(SchedulerPluginName) → SchedulerPluginSource).
+#      Nothing kept a copy in this file in step with it: the literal that used to
+#      sit here was still pinned two minor versions behind the registry, and the
+#      drift was invisible precisely because the declaration was also inert (2).
+#   2. The declaration was INERT. Declaring through the `secrets` channel does not
+#      survive provisioning: buildProvisionerConfig recomputes
+#      MOLECULE_DECLARED_PLUGINS from the declared-set SSOT (workspace_provision.go
+#      desiredPluginSources → envVars["MOLECULE_DECLARED_PLUGINS"]) and OVERWRITES
+#      whatever loadWorkspaceSecrets had seeded into that same map. This is the
+#      documented contract on CreateWorkspacePayload.Plugins, and the reason the
+#      10e digest block moved to the durable payload.plugins channel.
+#
+# What actually installs the scheduler is CORE: workspace_provision_shared.go
+# calls ensureSchedulerPluginDeclared on EVERY provision (default-on kill-switch
+# MOLECULE_DECLARE_SCHEDULER_PLUGIN), resolving the source from that same
+# registry. So 10d/10f/10g now gate the PRODUCTION declare path rather than a
+# test-injected one — if that path regresses, this e2e goes red, which is the
+# whole point of the step. A test that injects the thing it is meant to prove
+# proves the mechanism, never the value production actually uses.
+#
+# Guarded by lib/test_scheduler_source_ssot_unit.sh, which fails RED if any
+# pinned scheduler plugin source is reintroduced into tests/e2e/**/*.sh.
 if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ]; then
   SECRETS_JSON=$(SECRETS_JSON_IN="$SECRETS_JSON" python3 -c "
 import json, os
 s = json.loads(os.environ['SECRETS_JSON_IN'])
-src = os.environ.get('E2E_SCHEDULER_PLUGIN_SOURCE', 'gitea://molecule-ai/molecule-ai-plugin-scheduler#v0.2.1')
-existing = s.get('MOLECULE_DECLARED_PLUGINS', '').strip()
-s['MOLECULE_DECLARED_PLUGINS'] = (existing + ',' + src).strip(',') if existing else src
 s['MOLECULE_TRIGGER_POLL_SECONDS'] = os.environ.get('E2E_TRIGGER_POLL_SECONDS', '10')
 print(json.dumps(s))
 ")
-  log "    scheduler check ON: declared molecule-scheduler + MOLECULE_TRIGGER_POLL_SECONDS=${E2E_TRIGGER_POLL_SECONDS:-10}"
+  log "    scheduler check ON: MOLECULE_TRIGGER_POLL_SECONDS=${E2E_TRIGGER_POLL_SECONDS:-10} (the molecule-scheduler plugin itself is declared by core at provision from the SDK native-plugins registry — this harness carries no source literal)"
 fi
 
 # Self-schedule tool sub-step (10f): with E2E_SELF_SCHEDULE_CHECK=on, additively
@@ -3270,10 +3296,21 @@ if [ "${E2E_SCHEDULER_CHECK:-}" = "on" ] && [ "${E2E_SCHEDULE_DELIVER_CHECK:-on}
       done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^mol-ws-' || true)
       return 1
     }
-    log "10g/11 Scheduler DELIVER: created '$_DLV_NAME' (http=$_DLV_CODE); verifying it reached the volume grid (up to ${_DLV_FIRE_TIMEOUT_SECS}s; poll=${_DLV_POLL_SECS}s)."
-    if ! idle_digest_wait "$_DLV_FIRE_TIMEOUT_SECS" "$_DLV_POLL_SECS" deliver_grid_has; then
+    # This wait stays on plain idle_digest_wait — NOT trigger_daemon_wait — and
+    # on a SHORT derived budget rather than the fire backstop it used to reuse.
+    # It is about CORE ROUTING, not daemon liveness: the grid is written by core's
+    # synchronous create forward, the daemon only reads it, and the owning
+    # container (the argument trigger_daemon_wait requires) is the OUTPUT of this
+    # probe, not an input. The 201 above is the routing signal and it has already
+    # arrived — the runtime persists the entry before core relays 201 — so this
+    # only absorbs our own `docker ps` + `docker exec` observation latency. See the
+    # "grid-landing wait" block in lib/trigger_daemon_wait.sh for the full
+    # rationale and lib/test_trigger_daemon_wait_unit.sh for the bounds.
+    _DLV_GRID_CONFIRM_SECS=$(schedule_grid_confirm_secs "$_DLV_POLL_SECS")
+    log "10g/11 Scheduler DELIVER: created '$_DLV_NAME' (http=$_DLV_CODE); confirming it reached the volume grid (up to ${_DLV_GRID_CONFIRM_SECS}s; poll=${_DLV_POLL_SECS}s)."
+    if ! idle_digest_wait "$_DLV_GRID_CONFIRM_SECS" "$_DLV_POLL_SECS" deliver_grid_has; then
       scheduler_deliver_diagnostics
-      fail "10g DELIVER: schedule '$_DLV_NAME' never reached the volume grid within ${_DLV_FIRE_TIMEOUT_SECS}s — the create 2xx'd but did not land on the daemon's grid (routing regression specific to the DELIVER schedule; 10d's identical create DID land)."
+      fail "10g DELIVER: schedule '$_DLV_NAME' never reached the volume grid within ${_DLV_GRID_CONFIRM_SECS}s — core relayed http=$_DLV_CODE, which it does ONLY after the runtime persisted the entry, so the grid should have been on disk before the first probe. Core's ack and the volume therefore disagree: the create routed to a different workspace than the one whose containers we can see, or the runtime acked without writing. Deterministic — a longer wait cannot fix it (10d's identical create DID land)."
     fi
     ok "    DELIVER schedule '$_DLV_NAME' on the volume grid (evidence: $_DLV_GRID_EVIDENCE)"
 

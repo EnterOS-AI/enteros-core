@@ -682,6 +682,15 @@ jobs:
           # EXCEEDS the delivery watchdog: the old 360s budget was shorter than
           # the 600s timeout it waited on, so it could never observe a recovery.
           bash tests/e2e/lib/test_trigger_daemon_wait_unit.sh
+          # Native-plugin source SSOT: the harness must not hardcode a pinned
+          # plugin source. WHICH source the scheduler installs from is owned by
+          # the SDK native-plugins registry (consumed by core via molcontracts /
+          # plugin_registry.go); the fallback pin that used to live in
+          # test_staging_full_saas.sh sat two minor versions behind it, silently,
+          # and was inert on top of that (secrets-injected MOLECULE_DECLARED_PLUGINS
+          # is overwritten at provision). Fixture-driven both directions, then run
+          # over the real tests/e2e tree as the standing gate.
+          bash tests/e2e/lib/test_scheduler_source_ssot_unit.sh
           # Active local-Docker staging teardown must validate the exact
           # synchronous CP purge receipt/audit and exact-org absence. Offline
           # mocked-curl cases pin success plus malformed receipt, failed purge,
