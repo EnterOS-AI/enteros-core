@@ -160,6 +160,8 @@ go.moleculesai.app/plugin/gh-identity v0.0.0-20260509010445-788988195fce h1:ftm0
 go.moleculesai.app/plugin/gh-identity v0.0.0-20260509010445-788988195fce/go.mod h1:0aAqoDle2V7Cywso94MXdv1DH/HEe/0oZmcbqWYMK7g=
 go.moleculesai.app/sdk/gen/go v0.0.0-20260727233500-06683b3ae207 h1:CWjYtvYo4/vYgR+Y4PYUuQSUkfef3KDMUAvRuMMtWaE=
 go.moleculesai.app/sdk/gen/go v0.0.0-20260727233500-06683b3ae207/go.mod h1:rviOoLX5YCzWSc4Oyf+dKzFWNxbvaR49mJkNkAxyT5I=
+go.moleculesai.app/sdk/gen/go v0.0.0-20260730022200-3fdcfe6e2608 h1:JW8HtpeCm5YJgAeLSZq7+kyYxCFkAR9FG8dBWx4W4Bs=
+go.moleculesai.app/sdk/gen/go v0.0.0-20260730022200-3fdcfe6e2608/go.mod h1:rviOoLX5YCzWSc4Oyf+dKzFWNxbvaR49mJkNkAxyT5I=
 go.mongodb.org/mongo-driver/v2 v2.5.0 h1:yXUhImUjjAInNcpTcAlPHiT7bIXhshCTL3jVBkF3xaE=
 go.mongodb.org/mongo-driver/v2 v2.5.0/go.mod h1:yOI9kBsufol30iFsl1slpdq1I0eHPzybRWdyYUs8K/0=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
