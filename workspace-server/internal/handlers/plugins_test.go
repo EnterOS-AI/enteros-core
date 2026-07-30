@@ -1133,59 +1133,95 @@ func TestResolveAndStage_NotFoundFromResolver(t *testing.T) {
 	}
 }
 
-// stagingDirsWithManifest returns the set of "molecule-plugin-fetch-*" dirs in
-// the shared system temp that currently hold a plugin.yaml.
-//
-// resolveAndStage stages into os.MkdirTemp("", "molecule-plugin-fetch-*"), i.e.
-// the SHARED system temp, not anything the test owns. So the raw set is global
-// process state: it includes dirs left by other tests, and — critically — dirs
-// orphaned by a PREVIOUS `go test` process that was killed before its cleanup
-// could run. Callers must therefore compare a before/after snapshot and judge
-// only the delta, never the absolute set.
-func stagingDirsWithManifest(t *testing.T) map[string]bool {
+// stagingDirsIn returns every "molecule-plugin-fetch-*" dir directly under
+// root. Callers pass a root they exclusively own (see WithStagingRoot), so the
+// answer is entirely a function of the code under test — no ambient subtraction.
+func stagingDirsIn(t *testing.T, root string) []string {
 	t.Helper()
-	out := map[string]bool{}
-	entries, _ := filepath.Glob(filepath.Join(os.TempDir(), "molecule-plugin-fetch-*"))
-	for _, e := range entries {
-		if _, err := os.Stat(filepath.Join(e, "plugin.yaml")); err == nil {
-			out[e] = true
-		}
+	entries, err := filepath.Glob(filepath.Join(root, "molecule-plugin-fetch-*"))
+	if err != nil {
+		t.Fatalf("glob %s: %v", root, err)
 	}
-	return out
+	return entries
 }
 
 func TestResolveAndStage_CleansUpStagedDirOnError(t *testing.T) {
-	// Hostile resolver emits a file then returns a traversal name → 400.
-	// Verify the staged dir it used is NOT left behind.
+	// Every error path AFTER the staging dir is created must remove it.
 	//
-	// This asserts on a BEFORE/AFTER DELTA rather than on the absolute
-	// contents of os.TempDir(). The previous version globbed the whole shared
-	// temp dir and failed if ANY molecule-plugin-fetch-* held a plugin.yaml,
-	// which made its verdict a function of ambient state rather than of the
-	// code under test. CI reproduces that: ci.yml runs an advisory
-	// `go test -race -timeout 60s ./internal/handlers/...` immediately before
-	// the blocking coverage gate. That advisory run chronically exceeds its 60s
-	// budget and is SIGQUIT'd; when the kill lands while a plugin-install test
-	// is mid-Install (e.g. TestPluginInstall_RestartFalseSuppressed →
-	// driveInstall), the staged dir's cleanup never runs and an orphaned
-	// /tmp/molecule-plugin-fetch-*/plugin.yaml survives into the gate's fresh
-	// process — where this test reported another process's corpse as its own
-	// leak. Comparing only NEW dirs makes the assertion about this call.
-	before := stagingDirsWithManifest(t)
-
-	h := NewPluginsHandler(t.TempDir(), nil, nil).
-		WithSourceResolver(emitsName("hostile", "../../../etc/passwd"))
-	_, err := h.resolveAndStage(context.Background(), installRequest{Source: "hostile://x"})
-	var he *httpErr
-	if !errors.As(err, &he) || he.Status != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %v", err)
+	// The staging root is a t.TempDir() this test exclusively owns, so the
+	// assertion is ABSOLUTE — "nothing is left under my root" — rather than a
+	// before/after delta over the shared os.TempDir(). That keeps both
+	// properties the delta traded against each other:
+	//
+	//   * The false positive core#4964 fixed stays fixed. ci.yml runs an
+	//     advisory `go test -race -timeout 60s ./internal/handlers/...`
+	//     immediately before the blocking coverage gate; that run chronically
+	//     exceeds its 60s budget and is SIGQUIT'd, and a kill landing mid-
+	//     Install orphans a <systemtemp>/molecule-plugin-fetch-*/plugin.yaml
+	//     into the gate's fresh process. A private root cannot see another
+	//     process's corpses at all, so it cannot report one as its own leak.
+	//   * The leak detection the delta dropped comes back. A delta only ever
+	//     judges dirs created BETWEEN its two snapshots, so a staging dir
+	//     leaked by an earlier test in the same `go test` process sits in
+	//     `before` and is silently skipped. Owning the root means any dir
+	//     under it is this call's, so a leak from ANY error path is visible —
+	//     not just the traversal-name 400 that used to be the only case
+	//     driven here.
+	//
+	// Note the success path deliberately does NOT clean up: resolveAndStage
+	// hands StagedDir to the caller, whose defer owns it. So this test drives
+	// error paths only, but drives one per distinct cleanup() call site.
+	cases := []struct {
+		name       string
+		resolver   *fakeResolver
+		source     string
+		sha256     string
+		wantStatus int
+	}{
+		{
+			// cleanup() after resolver.Fetch fails.
+			name:       "resolver fetch error",
+			resolver:   alwaysErrs("boom", errors.New("upstream exploded")),
+			source:     "boom://x",
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			// cleanup() after validatePluginName rejects a traversal name.
+			name:       "hostile resolver plugin name",
+			resolver:   emitsName("hostile", "../../../etc/passwd"),
+			source:     "hostile://x",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// cleanup() after the caller-pinned SHA-256 fails to match.
+			name:       "caller-pinned sha256 mismatch",
+			resolver:   emitsName("shamm", "demo"),
+			source:     "shamm://x",
+			sha256:     "0000000000000000000000000000000000000000000000000000000000000000",
+			wantStatus: http.StatusUnprocessableEntity,
+		},
 	}
 
-	for e := range stagingDirsWithManifest(t) {
-		if !before[e] {
-			t.Errorf("resolveAndStage leaked a staging dir it created: %s "+
-				"(still holds plugin.yaml after the error path returned)", e)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stagingRoot := t.TempDir()
+			h := NewPluginsHandler(t.TempDir(), nil, nil).
+				WithStagingRoot(stagingRoot).
+				WithSourceResolver(tc.resolver)
+
+			_, err := h.resolveAndStage(context.Background(),
+				installRequest{Source: tc.source, SHA256: tc.sha256})
+			var he *httpErr
+			if !errors.As(err, &he) || he.Status != tc.wantStatus {
+				t.Fatalf("expected %d, got %v", tc.wantStatus, err)
+			}
+
+			if leaked := stagingDirsIn(t, stagingRoot); len(leaked) != 0 {
+				t.Errorf("resolveAndStage leaked %d staging dir(s) it created under "+
+					"its own staging root after the error path returned: %v",
+					len(leaked), leaked)
+			}
+		})
 	}
 }
 
