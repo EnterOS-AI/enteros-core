@@ -79,9 +79,31 @@ func integrationDB_Chain(t *testing.T) *sql.DB {
 	if err := conn.Ping(); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
+	// The platform sweep is NOT optional, and it is not cosmetic.
+	//
+	// uniq_workspaces_one_platform_root forbids a second parentless platform
+	// row, so a concierge leaked by an earlier suite makes the deferred arm's
+	// kind=platform INSERT collide. That arm used to t.Skipf on collision —
+	// which meant it PASSED the file in isolation and SILENTLY SKIPPED inside
+	// the full `-run ^TestIntegration_` suite CI actually runs, deleting the
+	// defect-3 guard from the only run that counts. Measured: PASS alone, SKIP
+	// in-suite.
+	//
+	// parent_id is a plain FK with no ON DELETE CASCADE, so the sweep must take
+	// descendants with it or it fails on workspaces_parent_id_fkey. The
+	// recursive CTE removes the subtree bottom-up at any depth.
+	//
+	// Safe because the handlers integration suite runs sequentially (single DB,
+	// no t.Parallel) and every test seeds the state it needs.
 	clear := func() {
-		if _, err := conn.ExecContext(context.Background(),
-			`DELETE FROM workspaces WHERE name LIKE 'itest-chain-%';`); err != nil {
+		if _, err := conn.ExecContext(context.Background(), `
+			WITH RECURSIVE doomed AS (
+			  SELECT id FROM workspaces WHERE kind = 'platform' OR name LIKE 'itest-chain-%'
+			  UNION ALL
+			  SELECT w.id FROM workspaces w JOIN doomed d ON w.parent_id = d.id
+			)
+			DELETE FROM workspaces WHERE id IN (SELECT id FROM doomed);
+		`); err != nil {
 			t.Fatalf("clear: %v", err)
 		}
 	}
@@ -232,7 +254,10 @@ func TestIntegration_ConvergenceChain_DeferredRestartKeepsDriftVisible(t *testin
 	if _, err := conn.ExecContext(ctx,
 		`INSERT INTO workspaces (id, name, status, kind) VALUES ($1,$2,'online','platform')`,
 		wsID, "itest-chain-"+wsID[:8]); err != nil {
-		t.Skipf("cannot seed a platform workspace (one may already exist): %v", err)
+		// NOT a Skip. A skip here silently deletes the defect-3 guard from the
+		// full-suite run; the clear() above sweeps leaked platform roots so a
+		// collision now means a real problem worth failing on.
+		t.Fatalf("seed platform workspace: %v", err)
 	}
 	if _, err := conn.ExecContext(ctx,
 		`INSERT INTO workspace_plugins (workspace_id, plugin_name, source_raw, tracked_ref, installed_sha)
