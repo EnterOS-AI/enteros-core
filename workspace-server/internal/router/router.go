@@ -778,6 +778,20 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		r.GET("/admin/delegations/stats", middleware.AdminAuth(db.DB), adH.Stats)
 	}
 
+	// Admin — the FLEET read over plugin-install reports (#4981 §1). The
+	// migration's `workspace_plugin_install_reports_not_live` partial index was
+	// created to answer "which workspaces booted with no live plugins" and no
+	// handler issued that query, so the question still needed direct DB access.
+	//
+	// AdminAuth, NOT the wsAuth group the POST/GET pair live in: those are bound
+	// to :id by WorkspaceAuth so a workspace can only see its own report, and this
+	// route returns rows for workspaces the caller never names. Same gate as the
+	// sibling operator reads above.
+	{
+		apirH := handlers.NewAdminPluginInstallReportsHandler(db.DB)
+		r.GET("/admin/plugin-install-reports", middleware.AdminAuth(db.DB), apirH.List)
+	}
+
 	// Admin — explicit registry-backed, single-host workspace image maintenance.
 	// Pulls from the configured registry and can remove matching ws-* containers
 	// so the local provisioner recreates them later. This is not the managed
