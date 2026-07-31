@@ -330,7 +330,12 @@ type pluginInstallReportRow struct {
 	Degraded bool `json:"degraded"`
 	// OutcomeRule is echoed so a reader looking at live=false learns WHY without
 	// having to find the contract.
-	OutcomeRule string `json:"outcome_rule"`
+	//
+	// omitempty is for the FLEET read (admin_plugin_install_reports.go), which
+	// embeds this struct and echoes the rule once on the envelope instead of
+	// repeating it on every row. Get always sets it, so its response shape is
+	// unchanged — there is no path where Get emits an empty outcome_rule.
+	OutcomeRule string `json:"outcome_rule,omitempty"`
 }
 
 // loadPluginInstallReport reads the latest report, or (nil, nil) when the
