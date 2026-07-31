@@ -37,7 +37,18 @@ ARG BASE_IMAGE_REGISTRY=registry.moleculesai.app/molecule-ai
 FROM ${BASE_IMAGE_REGISTRY}/golang:1.25-alpine@sha256:c4ea15b4a7912716eb362a022e2b12317762eca387423760bc59c0f9ae69423c AS control-builder
 WORKDIR /app
 COPY workspace-server/go.mod workspace-server/go.sum ./
-RUN go mod download
+# Bounded retry (#4968) — mirror of Dockerfile.tenant's go-builder; see that
+# file for the full rationale. The `exit 1` keeps a genuinely-down proxy
+# FAILING the build.
+RUN for i in 1 2 3; do \
+        go mod download && break; \
+        if [ "$i" -ge 3 ]; then \
+            echo "go mod download: FAILED after 3 attempts" >&2; \
+            exit 1; \
+        fi; \
+        echo "go mod download: attempt $i failed, retrying in $((i * 5))s" >&2; \
+        sleep $((i * 5)); \
+    done
 COPY workspace-server/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" \
     -o /desktop-control-server ./cmd/desktop-control-server
