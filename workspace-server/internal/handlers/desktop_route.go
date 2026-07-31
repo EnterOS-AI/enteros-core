@@ -30,6 +30,11 @@ type desktopGateway interface {
 	// view brings the desktop up (routed through the gateway — not StartDesktop
 	// directly — so the idle sweeper can still find and reap it).
 	EnsureRunning(ctx context.Context, workspaceID string) (string, error)
+	// ViewerConnected/ViewerDisconnected bracket a human display session so the
+	// idle sweeper does not reap the desktop while someone is watching (a live
+	// viewer is a liveness signal the agent-activity timer otherwise misses).
+	ViewerConnected(ctx context.Context, workspaceID string)
+	ViewerDisconnected(ctx context.Context, workspaceID string)
 }
 
 // SetDesktopGateway wires the desktop enforcement gateway. Unset (nil) makes the
