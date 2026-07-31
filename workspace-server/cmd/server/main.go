@@ -474,6 +474,10 @@ func main() {
 			// to reap (§10) — without this, RunningDesktopWorkspaceIDs is always
 			// empty and 2GB sidecars never scale to zero.
 			gw.SetStateRecorder(store)
+			// Live human-viewer presence: a display session marks the desktop
+			// watched so the idle sweeper won't reap it under a human (the
+			// agent-activity timer alone misses human-only sessions).
+			gw.SetVNCPresenceRecorder(store)
 			wh.SetDesktopGateway(gw)
 
 			// Scale-to-zero: reap idle desktop sidecars (§10). Source = the store's

@@ -28,7 +28,11 @@ openbox &
 # the platform's same-origin proxy + token gate front. The agent does NOT use
 # this — its screenshots are a direct framebuffer grab in the control server.
 x11vnc -display "$DISPLAY" -forever -shared -localhost -nopw -rfbport 5900 -quiet &
-websockify --web=/usr/share/novnc 6080 localhost:5900 &
+# --heartbeat: send a WebSocket ping every 25s so an IDLE viewer (a static screen
+# produces no framebuffer traffic) is not dropped by an upstream idle timeout
+# (the tunnel/CP proxy closed silent sockets at ~34s — "take over, idle, lose the
+# connection"). 25s < that window with margin; noVNC answers pings transparently.
+websockify --heartbeat=25 --web=/usr/share/novnc 6080 localhost:5900 &
 
 # ── Chromium: kiosk pins the WINDOW to the full fixed screen (§3 — pinning the
 # screen alone leaks a toolbar offset). Profile persists on the mounted volume
@@ -45,6 +49,18 @@ PROXY_ARGS=""
 if [ -n "${DESKTOP_PROXY:-}" ]; then
 	PROXY_ARGS="--proxy-server=${DESKTOP_PROXY}"
 fi
+# The profile volume is PERSISTENT (cookies/logins survive scale-to-zero). When a
+# reaped sidecar is recreated, the profile can still carry the previous
+# container's Chromium singleton guards (SingletonLock/Cookie/Socket) — it was
+# SIGKILLed on teardown, never cleaning them. The new Chromium then sees the lock
+# owned by "another Chromium process on another computer" (the old container's
+# hostname) and REFUSES TO START — the browser never comes up (black screen, no
+# egress; reads to a human as "no internet"). Exactly ONE Chromium ever uses this
+# profile, so clearing the stale guards on boot is safe and required for the
+# browser to survive a scale-to-zero/scale-up cycle.
+rm -f /home/desktop/profile/SingletonLock \
+      /home/desktop/profile/SingletonCookie \
+      /home/desktop/profile/SingletonSocket 2>/dev/null || true
 chromium \
 	--user-data-dir=/home/desktop/profile \
 	--kiosk \

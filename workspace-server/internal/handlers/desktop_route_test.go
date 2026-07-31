@@ -20,6 +20,8 @@ type fakeDesktopGW struct {
 	ensureAddr     string
 	ensureErr      error
 	ensureRunCalls int
+	viewerConn     int
+	viewerDisc     int
 }
 
 func (f *fakeDesktopGW) Screenshot(context.Context, string) ([]byte, error) {
@@ -33,6 +35,8 @@ func (f *fakeDesktopGW) EnsureRunning(context.Context, string) (string, error) {
 	f.ensureRunCalls++
 	return f.ensureAddr, f.ensureErr
 }
+func (f *fakeDesktopGW) ViewerConnected(context.Context, string)    { f.viewerConn++ }
+func (f *fakeDesktopGW) ViewerDisconnected(context.Context, string) { f.viewerDisc++ }
 
 func newDesktopReq(method, path, body string) (*gin.Context, *httptest.ResponseRecorder) {
 	gin.SetMode(gin.TestMode)

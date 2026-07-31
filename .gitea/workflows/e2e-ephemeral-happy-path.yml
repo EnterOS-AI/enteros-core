@@ -111,7 +111,7 @@ env:
   # TO BUMP: `git ls-remote https://git.moleculesai.app/molecule-ai/molecule-controlplane.git refs/heads/main`
   # and paste the SHA here, in its own PR, so the CP change is reviewed as what it
   # is — a change to what gates core.
-  CP_EPHEMERAL_REF: f6457ba5e2ef958b3815860fb728d14d488d77c8
+  CP_EPHEMERAL_REF: 17b6988c37e63bc50a34fc916b97407c54c0f7d4
 
 jobs:
   # Emits no context listed in required-contexts.txt — but it DOES post

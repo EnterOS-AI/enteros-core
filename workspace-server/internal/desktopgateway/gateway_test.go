@@ -7,10 +7,66 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
+
+type fakeVNCPresence struct {
+	mu    sync.Mutex
+	calls []int
+}
+
+func (f *fakeVNCPresence) SetVNCPresence(_ context.Context, _ string, connections int, _ time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, connections)
+	return nil
+}
+func (f *fakeVNCPresence) snapshot() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.calls...)
+}
+
+// A live human viewer must be counted and mirrored to the store so the idle
+// sweeper does not reap the desktop under the human (the bug the user hit taking
+// over the display). Overlapping viewers keep the count > 0 until the LAST one
+// leaves.
+func TestGateway_ViewerPresenceCountsAndMirrors(t *testing.T) {
+	g := New(&fakeProv{}, &fakeLocks{}, &fakeActivity{}, tokenFn, &fakeDoer{})
+	vnc := &fakeVNCPresence{}
+	g.SetVNCPresenceRecorder(vnc)
+	const ws = "w1"
+	g.ViewerConnected(context.Background(), ws)    // -> 1
+	g.ViewerConnected(context.Background(), ws)    // -> 2 (overlapping viewer)
+	g.ViewerDisconnected(context.Background(), ws) // -> 1 (still watched)
+	g.ViewerDisconnected(context.Background(), ws) // -> 0 (last one leaves)
+	got := vnc.snapshot()
+	want := []int{1, 2, 1, 0}
+	if len(got) != len(want) {
+		t.Fatalf("presence writes = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("presence writes = %v, want %v", got, want)
+		}
+	}
+}
+
+// A stray disconnect (e.g. a double-close) must never drive the count negative,
+// which would later let a real viewer's +1 land at 0 and the desktop be reaped.
+func TestGateway_ViewerDisconnectNeverGoesNegative(t *testing.T) {
+	g := New(&fakeProv{}, &fakeLocks{}, &fakeActivity{}, tokenFn, &fakeDoer{})
+	vnc := &fakeVNCPresence{}
+	g.SetVNCPresenceRecorder(vnc)
+	g.ViewerDisconnected(context.Background(), "w1")
+	if got := vnc.snapshot(); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("underflow write = %v, want [0]", got)
+	}
+}
 
 // --- fakes ---
 

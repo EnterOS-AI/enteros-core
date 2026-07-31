@@ -44,10 +44,19 @@ CREATE TABLE IF NOT EXISTS workspace_plugin_install_reports (
   -- atomically swapped into plugins_dir. A partial build is never promoted, so
   -- installed=[6 sources] with swapped=false means NOTHING went live — a state
   -- that was indistinguishable from success in every signal core had before this
-  -- table existed. Liveness is `declared AND swapped AND failed = []`
+  -- table existed. Liveness is `declared AND swapped`
   -- (molcontracts.PluginInstallReportOutcomeRule); reading `installed` alone is
   -- the mistake that rule exists to prevent, which is why no `live` column is
   -- stored here — a derived column would be one more place for the rule to drift.
+  --
+  -- `failed` is NOT part of liveness (corrected in core#4972; this comment still
+  -- carried the retired `AND failed = []` form). The runtime PROMOTES partial
+  -- builds on purpose — molecule_runtime/plugin_sources.py, "A failed source fails
+  -- THAT SOURCE — not the whole tree" — so swapped=true with a non-empty `failed`
+  -- means the successful sources ARE live. That case is `degraded`
+  -- (molcontracts.PluginInstallReportDegradedRule), also derived on read, and it
+  -- is why the fleet endpoint serves two arms rather than one. Comment-only fix:
+  -- the DDL below is unchanged and this migration replays identically.
   swapped       BOOLEAN     NOT NULL,
 
   reported_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
