@@ -50,9 +50,31 @@ func integrationDB_DriftApplier(t *testing.T) *sql.DB {
 	if err := conn.Ping(); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
+	// The slate-clear mirrors admin_plugin_drift_integration_test.go: the
+	// partial unique index uniq_workspaces_one_platform_root forbids a SECOND
+	// parentless platform row, so a leaked concierge from a predecessor suite
+	// makes our kind=platform INSERT collide. Caught exactly that way — this
+	// file passed in isolation and failed inside the full ^TestIntegration_
+	// run until the platform sweep was added.
+	//
+	// The platform sweep must take DESCENDANTS with it: workspaces.parent_id is
+	// a plain FK (no ON DELETE CASCADE), so deleting a leaked concierge that
+	// another suite left children under fails with workspaces_parent_id_fkey.
+	// The recursive CTE removes the subtree bottom-up in one statement, at any
+	// depth. Found the hard way — a flat `DELETE ... WHERE kind='platform'`
+	// passed in isolation and broke inside the full run.
+	//
+	// Safe because the handlers integration suite runs sequentially (single DB,
+	// no t.Parallel); every test seeds the state it needs in its own setup.
 	clear := func() {
-		if _, err := conn.ExecContext(context.Background(),
-			`DELETE FROM workspaces WHERE name LIKE 'itest-applier-%';`); err != nil {
+		if _, err := conn.ExecContext(context.Background(), `
+			WITH RECURSIVE doomed AS (
+			  SELECT id FROM workspaces WHERE kind = 'platform' OR name LIKE 'itest-applier-%'
+			  UNION ALL
+			  SELECT w.id FROM workspaces w JOIN doomed d ON w.parent_id = d.id
+			)
+			DELETE FROM workspaces WHERE id IN (SELECT id FROM doomed);
+		`); err != nil {
 			t.Fatalf("clear: %v", err)
 		}
 	}
