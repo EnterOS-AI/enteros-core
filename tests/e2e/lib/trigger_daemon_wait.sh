@@ -126,3 +126,47 @@ trigger_daemon_backstop_secs() {
   case "$watchdog" in ''|*[!0-9]*|0) watchdog=600 ;; esac
   printf '%s' $((watchdog * 3))
 }
+
+# ─── the grid-landing wait is deliberately NOT a trigger_daemon_wait ─────────
+#
+# Confirming that a just-created schedule reached the volume grid is a different
+# kind of wait from everything above, and forcing trigger_daemon_wait onto it
+# would be wrong twice over:
+#
+#   - WRONG SIGNAL. The grid file is written by CORE's synchronous create
+#     forward (schedules.go Create → createVolume → the runtime's
+#     /internal/schedules), not by the daemon's tick. The daemon only READS the
+#     grid. So the daemon's heartbeat carries no information about whether the
+#     create routed, and a healthy tick would happily mask a dead create path.
+#   - STRUCTURALLY IMPOSSIBLE. trigger_daemon_wait needs the OWNING container as
+#     its first argument, and at this point the owner is UNKNOWN — identifying it
+#     is the OUTPUT of the grid probe, not an input to it.
+#
+# The real routing signal has already been received: POST /schedules returns 201
+# only after the runtime accepted and persisted the entry (createVolume relays a
+# 2xx; a still-booting runtime is a retried 502/503/504 and finally a 503, never a
+# 201). So on the happy path the grid is ALREADY on disk before the first probe
+# runs, and the probe passes on that first poll. What remains is pure OBSERVATION
+# latency on our side — `docker ps` enumeration plus a `docker exec cat` — not
+# convergence we are waiting on.
+#
+# That is why this budget is short and derived, instead of the fire backstop the
+# step used to reuse: a grid that is still missing well after a 201 is a
+# DETERMINISTIC contradiction between core's ack and the volume, and waiting out
+# a 30-minute daemon backstop cannot resolve it — it only converts a fast, clear
+# failure into half an hour of dead CI time.
+#
+# schedule_grid_confirm_secs [poll-secs]
+#   ~3 observation attempts at the caller's poll interval, with a 30s floor (so a
+#   1s poll still gets a usable window) and a 120s ceiling. The CEILING is the
+#   load-bearing half: the poll comes from operator-tunable E2E_SCHEDULER_POLL_SECS,
+#   so without it a raised poll would silently restore exactly the multi-minute
+#   soak this replaces.
+schedule_grid_confirm_secs() {
+  local poll="${1:-10}" secs
+  case "$poll" in ''|*[!0-9]*|0) poll=10 ;; esac
+  secs=$((poll * 3))
+  [ "$secs" -ge 30 ] || secs=30
+  [ "$secs" -le 120 ] || secs=120
+  printf '%s' "$secs"
+}
