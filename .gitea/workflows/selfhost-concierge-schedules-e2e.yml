@@ -28,6 +28,7 @@ on:
       - 'tests/e2e/test_selfhost_concierge_schedules_e2e.sh'
       - 'tests/e2e/stub-runtime/**'
       - 'tests/e2e/_lib.sh'
+      - 'tests/e2e/lib/container_running_wait.sh'
       - '.gitea/workflows/selfhost-concierge-schedules-e2e.yml'
   pull_request:
     branches: [main, staging]
@@ -36,6 +37,7 @@ on:
       - 'tests/e2e/test_selfhost_concierge_schedules_e2e.sh'
       - 'tests/e2e/stub-runtime/**'
       - 'tests/e2e/_lib.sh'
+      - 'tests/e2e/lib/container_running_wait.sh'
       - '.gitea/workflows/selfhost-concierge-schedules-e2e.yml'
 
 concurrency:

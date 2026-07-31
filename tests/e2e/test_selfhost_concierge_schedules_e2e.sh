@@ -70,6 +70,8 @@
 #   E2E_TEMPLATES_DIR    required; == the platform's CONFIGS_DIR (template root)
 #   E2E_WS_MANIFEST      optional; concierge id is appended for run-scoped teardown
 #   ONLINE_TIMEOUT       default 300 (concierge provision->online budget)
+#   CONTAINER_READY_TIMEOUT default 60 (online -> container actually running;
+#                                 core#4980 — the two are separate events)
 #   GRID_TIMEOUT         default 120 (schedules-proxy readiness budget)
 #   CACHE_TAG            optional pin of the provisioner cache tag (else Gitea sha)
 #
@@ -81,6 +83,11 @@ export BASE
 # shellcheck disable=SC1091
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
+# Container-readiness wait policy (core#4980). Offline-tested by
+# lib/test_container_running_wait_unit.sh.
+# shellcheck disable=SC1091
+# shellcheck source=lib/container_running_wait.sh
+source "$(dirname "$0")/lib/container_running_wait.sh"
 
 ADMIN_TOKEN="${ADMIN_TOKEN:-${MOLECULE_ADMIN_TOKEN:-}}"
 export ADMIN_TOKEN MOLECULE_ADMIN_TOKEN="${ADMIN_TOKEN}"
@@ -342,7 +349,31 @@ while true; do
   sleep 5
 done
 CNAME="$(_container_name "$CONCIERGE_ID")"
-docker ps --format '{{.Names}}' | grep -Fxq "$CNAME" || die "concierge online but container $CNAME not running"
+# core#4980 — status `online` is NOT the signal this step needs. Core flips the
+# row when the agent registers; the container being up is a SEPARATE event, and
+# on a loaded runner it lags by seconds. Asserting `docker ps` the instant the
+# status flipped reddened this REQUIRED lane on a comment-only PR. Everything
+# below (docker exec, the config read) depends on a RUNNING container, so wait
+# for THAT — bounded, with both fail arms reachable and distinguishable:
+#   * exited/dead -> the container started and died; fail FAST (no budget burn).
+#   * never running within the bound -> distinct message, distinct cause.
+CONTAINER_READY_TIMEOUT="${CONTAINER_READY_TIMEOUT:-60}"
+CWAIT_RC=0
+wait_container_running "$CNAME" "$CONTAINER_READY_TIMEOUT" 2 || CWAIT_RC=$?
+case "$CWAIT_RC" in
+  0) : ;;
+  2)
+    echo "--- concierge container logs (tail) ---"
+    docker logs "$CNAME" 2>&1 | tail -n 60 || true
+    die "concierge container $CNAME is '${CONTAINER_WAIT_LAST_STATE}' — it started and DIED; the runtime aborted, this is not a readiness lag"
+    ;;
+  3) die "wait_container_running called with bad arguments (container='$CNAME' timeout='$CONTAINER_READY_TIMEOUT')" ;;
+  *)
+    echo "--- ws-* containers on this daemon ---"
+    docker ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -E '^ws-' || echo "  (none)"
+    die "concierge reported online but container $CNAME never reached running within ${CONTAINER_READY_TIMEOUT}s (last docker state='${CONTAINER_WAIT_LAST_STATE:-<absent>}')"
+    ;;
+esac
 pass "concierge online (container $CNAME running)"
 echo ""
 
