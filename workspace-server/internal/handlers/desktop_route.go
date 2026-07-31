@@ -35,6 +35,10 @@ type desktopGateway interface {
 	// viewer is a liveness signal the agent-activity timer otherwise misses).
 	ViewerConnected(ctx context.Context, workspaceID string)
 	ViewerDisconnected(ctx context.Context, workspaceID string)
+	// HumanNavigate points the desktop browser at a URL on behalf of a human who
+	// holds display control (kiosk has no address bar). Not agent-lock-gated — the
+	// caller is authorized by their display-control token in the handler.
+	HumanNavigate(ctx context.Context, workspaceID, url string) error
 }
 
 // SetDesktopGateway wires the desktop enforcement gateway. Unset (nil) makes the
@@ -109,6 +113,57 @@ func (h *WorkspaceHandler) DesktopInput(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "desktop not available"})
 		default:
 			c.JSON(http.StatusBadGateway, gin.H{"error": "input failed"})
+		}
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// desktopNavigateRequest is the body of POST /workspaces/:id/desktop/navigate.
+// token is the display-control token the human received from
+// /display/control/acquire — it proves the caller is the current controller
+// (a mere viewer may watch but not drive).
+type desktopNavigateRequest struct {
+	URL   string `json:"url"`
+	Token string `json:"token"`
+}
+
+// DesktopNavigate handles POST /workspaces/:id/desktop/navigate — the human
+// URL bar. Chromium runs --kiosk (no address bar), so a person who takes over
+// the display has no way to type a URL; this route lets the control-holder drive
+// the browser to one. It is authorized by the caller's display-control token
+// (NOT the agent lock — the human IS the controller), so only the person who
+// acquired control can navigate, and a view-only spectator cannot.
+func (h *WorkspaceHandler) DesktopNavigate(c *gin.Context) {
+	if h.desktopGateway == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "desktop not available"})
+		return
+	}
+	workspaceID := c.Param("id")
+	var req desktopNavigateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid navigate request"})
+		return
+	}
+	// Authorize: the caller must hold DISPLAY CONTROL. Validate their control
+	// token against the live lock (same check the control websocket uses).
+	lock, found, err := h.loadActiveDisplayControl(c, workspaceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load display control"})
+		return
+	}
+	if !found || !validateDisplaySessionToken(req.Token, workspaceID, lock.ControlledBy, lock.ExpiresAt) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "must hold display control to navigate"})
+		return
+	}
+	if err := h.desktopGateway.HumanNavigate(c.Request.Context(), workspaceID, req.URL); err != nil {
+		switch {
+		case errors.Is(err, desktopgateway.ErrInvalidNavigateURL):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "navigate requires an http(s) URL"})
+		case errors.Is(err, provisioner.ErrDesktopBackendUnavailable):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "desktop not available"})
+		default:
+			c.JSON(http.StatusBadGateway, gin.H{"error": "navigate failed"})
 		}
 		return
 	}

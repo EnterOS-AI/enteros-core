@@ -717,6 +717,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// bearer, same as the MCP endpoint.
 	wsAuth.GET("/desktop/screenshot", wh.DesktopScreenshot)
 	wsAuth.POST("/desktop/input", wh.DesktopInput)
+	wsAuth.POST("/desktop/navigate", wh.DesktopNavigate)
 	wsAuth.GET("/desktop/control", wh.DesktopControlStatus)
 
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
