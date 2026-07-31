@@ -60,8 +60,18 @@ It is derived from the source's `#fragment` by `trackFromSource`:
 | `#sha:abc…` | `sha:abc…` | yes | immutable pin, sweeper-owned |
 | `#main` | `ref:main` | yes | moving branch tip |
 | `#v0.2.1` | `ref:v0.2.1` | yes | bare tag name — see below |
+| `#973a35b7…` (bare 40-hex) | `ref:973a35b7…` | yes | bare commit SHA — see below |
 | *(no fragment)* | `none` | no | nothing upstream to chase |
 | `local://…` | `none` | no | no upstream at all |
+
+All three `ref:` cases are observed in production. A bare tag name and a bare
+commit SHA are both immutable in practice, so they resolve to a constant SHA
+and never report drift; the cost is one cheap `--depth=1` resolve per sweep
+that can never find anything. Classifying them as `tag:`/`sha:` up front would
+avoid that resolve, but the derivation is mirrored in the backfill migration,
+so any such rule must change in **both** places or the DB and the Go code
+diverge. Not worth that coupling for one avoided fetch per hour; recorded here
+so the behaviour is intentional rather than accidental.
 
 **Why `ref:` and not `branch:`.** `#main` and `#v0.2.1` are syntactically
 identical; classifying them would require a forge lookup. `ref:` is honest
