@@ -214,6 +214,17 @@ func TestIntegration_PluginRefTracking_BackfillIsIdempotent(t *testing.T) {
 	applyBackfillMigration(t, conn)
 	second := selectEligible(t, conn, wsID)
 
+	// Anti-vacuity: comparing two result sets proves nothing if the backfill
+	// contributed nothing to them. Assert on the BRANCH-pinned row by name —
+	// checking only len(first) > 0 is not enough, because the tag-pinned row
+	// is seeded already-eligible and keeps the set non-empty on its own.
+	// Verified by mutation: neutering the backfill's UPDATE must fail here.
+	if first["branch-pinned"] != "ref:main" {
+		t.Fatalf("backfill did not convert the branch pin (got %q, want %q) — "+
+			"the idempotence comparison below would pass vacuously",
+			first["branch-pinned"], "ref:main")
+	}
+
 	if len(first) != len(second) {
 		t.Fatalf("re-running the migration changed the result set: %v then %v", first, second)
 	}
