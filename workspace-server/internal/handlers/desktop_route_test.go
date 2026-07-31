@@ -22,6 +22,8 @@ type fakeDesktopGW struct {
 	ensureRunCalls int
 	viewerConn     int
 	viewerDisc     int
+	navigatedTo    []string
+	navigateErr    error
 }
 
 func (f *fakeDesktopGW) Screenshot(context.Context, string) ([]byte, error) {
@@ -37,6 +39,10 @@ func (f *fakeDesktopGW) EnsureRunning(context.Context, string) (string, error) {
 }
 func (f *fakeDesktopGW) ViewerConnected(context.Context, string)    { f.viewerConn++ }
 func (f *fakeDesktopGW) ViewerDisconnected(context.Context, string) { f.viewerDisc++ }
+func (f *fakeDesktopGW) HumanNavigate(_ context.Context, _, url string) error {
+	f.navigatedTo = append(f.navigatedTo, url)
+	return f.navigateErr
+}
 
 func newDesktopReq(method, path, body string) (*gin.Context, *httptest.ResponseRecorder) {
 	gin.SetMode(gin.TestMode)

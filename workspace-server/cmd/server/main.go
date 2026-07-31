@@ -908,7 +908,7 @@ func main() {
 		defer cancel()
 		return refreshTemplates(ctx)
 	}
-	r := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, hostStateDir, bootTokens, wh, greeter, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
+	r, driftH := router.Setup(hub, broadcaster, prov, platformURL, configsDir, templateCacheDir, hostStateDir, bootTokens, wh, greeter, channelMgr, memBundle, pluginRegistry, refreshTemplatesHTTP)
 
 	// Plugin drift sweeper — periodic detection of upstream plugin version drift
 	// (core#123). Scans workspace_plugins rows where tracked_ref != 'none',
@@ -918,6 +918,16 @@ func main() {
 	// Nil prov: Docker not available (test harness / local dev without Docker).
 	go supervised.RunWithRecover(ctx, "plugin-drift-sweeper", func(c context.Context) {
 		plugins.StartPluginDriftSweeper(c, pluginRegistry)
+	})
+
+	// Plugin drift APPLIER — the deterministic consumer of the queue the
+	// sweeper above fills (core#4977). Without it, drift is detected and
+	// enqueued but nothing ever applies it: the only previous consumer was the
+	// concierge's `plugin-auto-update` agent cron, which is absent entirely on
+	// a tenant whose schedules were never seeded. Convergence is a correctness
+	// property and must not depend on an LLM agent choosing to act.
+	go supervised.RunWithRecover(ctx, "plugin-drift-applier", func(c context.Context) {
+		handlers.StartPluginDriftApplier(c, driftH)
 	})
 
 	// HTTP server with graceful shutdown.

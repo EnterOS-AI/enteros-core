@@ -38,7 +38,7 @@ import (
 // (main.go) gets the same pluginResolver instance so it can share scheme
 // enumeration if a deployment registers extra schemes externally. A nil
 // pluginResolver is harmless: plgh still works with its built-in defaults.
-func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, greeter func(workspaceID string, toolCount int), channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) *gin.Engine {
+func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provisioner, platformURL, configsDir string, templateCacheDir string, hostStateDir string, bootTokens *provisioner.BootConfigTokenStore, wh *handlers.WorkspaceHandler, greeter func(workspaceID string, toolCount int), channelMgr *channels.Manager, memBundle *memwiring.Bundle, pluginResolver plugins.PluginResolver, refreshTemplates func(ctx *gin.Context) (any, error)) (*gin.Engine, *handlers.AdminPluginDriftHandler) {
 	r := gin.Default()
 
 	// Issue #179 — trust no reverse-proxy headers. Without this call Gin's
@@ -717,6 +717,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 	// bearer, same as the MCP endpoint.
 	wsAuth.GET("/desktop/screenshot", wh.DesktopScreenshot)
 	wsAuth.POST("/desktop/input", wh.DesktopInput)
+	wsAuth.POST("/desktop/navigate", wh.DesktopNavigate)
 	wsAuth.GET("/desktop/control", wh.DesktopControlStatus)
 
 	// Global secrets — /settings/secrets is the canonical path; /admin/secrets kept for backward compat.
@@ -893,8 +894,14 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 
 	// Admin — plugin version-subscription drift queue (core#123).
 	// List pending drift entries and apply approved updates.
+	//
+	// driftH is hoisted out of this block and RETURNED so cmd/server can run
+	// the deterministic queue drainer against the same handler
+	// (handlers.StartPluginDriftApplier, core#4977). Setup builds the handler
+	// graph; main owns goroutine lifecycles — the same split the drift
+	// sweeper already uses.
+	driftH := handlers.NewAdminPluginDriftHandler(plgh)
 	{
-		driftH := handlers.NewAdminPluginDriftHandler(plgh)
 		adminAuth := r.Group("", middleware.AdminAuth(db.DB))
 		adminAuth.GET("/admin/plugin-updates-pending", driftH.ListPending)
 		adminAuth.POST("/admin/plugin-updates/:id/apply", driftH.Apply)
@@ -1140,7 +1147,7 @@ func Setup(hub *ws.Hub, broadcaster *events.Broadcaster, prov *provisioner.Provi
 		r.NoRoute(canvasProxy)
 	}
 
-	return r
+	return r, driftH
 }
 
 func findPluginsDir(configsDir string) string {
