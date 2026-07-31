@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/provisioner"
 )
@@ -46,6 +47,18 @@ type StateRecorder interface {
 	SetState(ctx context.Context, workspaceID, state, sidecarAddress string) error
 }
 
+// VNCPresenceRecorder persists the live human-viewer count so the idle sweeper
+// does not reap a desktop that a human is actively watching (DesktopIsIdle
+// treats VNCConnections>0 as live). Optional / nil-safe, wired via
+// SetVNCPresenceRecorder. Without it, a human opening the viewer records NO
+// liveness — and because the idle timer runs off the last AGENT action (often
+// already stale when a human takes over), the desktop is reaped out from under
+// the viewer on the next sweep (~1 min). That is the "take over the display and
+// lose it" bug.
+type VNCPresenceRecorder interface {
+	SetVNCPresence(ctx context.Context, workspaceID string, connections int, lastInput time.Time) error
+}
+
 // TokenResolver returns the per-sidecar inbound bearer for a workspace (§6.5).
 type TokenResolver func(ctx context.Context, workspaceID string) (string, error)
 
@@ -75,6 +88,15 @@ type Gateway struct {
 	// from the idle sweeper (it would never be reaped otherwise).
 	recordedMu      sync.Mutex
 	recordedRunning map[string]struct{}
+
+	// vncPresence + viewers track live human viewers so the idle sweeper never
+	// reaps a desktop a human is watching. viewers is the in-process count per
+	// workspace (the authoritative live count for this process); each change is
+	// mirrored to the store via vncPresence. Optional; nil vncPresence disables
+	// the DB mirror (the counter still runs, harmlessly).
+	viewersMu   sync.Mutex
+	viewers     map[string]int
+	vncPresence VNCPresenceRecorder
 }
 
 // New builds the gateway. doer defaults to http.DefaultClient when nil.
@@ -82,13 +104,57 @@ func New(prov provisioner.SidecarProvisioner, locks LockChecker, activity Activi
 	if doer == nil {
 		doer = http.DefaultClient
 	}
-	return &Gateway{prov: prov, locks: locks, activity: activity, http: doer, token: token, recordedRunning: make(map[string]struct{})}
+	return &Gateway{prov: prov, locks: locks, activity: activity, http: doer, token: token, recordedRunning: make(map[string]struct{}), viewers: make(map[string]int)}
 }
 
 // SetStateRecorder wires the optional lifecycle-state setter used to mark a
 // desktop 'running' on scale-up, so the idle sweeper can later find and reap it
 // (§10). Nil-safe: leaving it unset just disables state recording.
 func (g *Gateway) SetStateRecorder(s StateRecorder) { g.state = s }
+
+// SetVNCPresenceRecorder wires the optional human-viewer presence sink so a live
+// display session suppresses idle teardown. Nil-safe.
+func (g *Gateway) SetVNCPresenceRecorder(v VNCPresenceRecorder) { g.vncPresence = v }
+
+// ViewerConnected records that a human display viewer has connected, keeping the
+// desktop alive for as long as anyone is watching. Call once per websockify
+// session, balanced by ViewerDisconnected. Best-effort mirror to the store.
+func (g *Gateway) ViewerConnected(ctx context.Context, workspaceID string) {
+	g.viewersMu.Lock()
+	g.viewers[workspaceID]++
+	n := g.viewers[workspaceID]
+	g.viewersMu.Unlock()
+	g.mirrorViewers(ctx, workspaceID, n)
+}
+
+// ViewerDisconnected records that a human viewer's session ended. When the last
+// viewer leaves, presence drops to zero and the desktop becomes eligible for the
+// normal idle teardown again.
+func (g *Gateway) ViewerDisconnected(ctx context.Context, workspaceID string) {
+	g.viewersMu.Lock()
+	if g.viewers[workspaceID] > 0 {
+		g.viewers[workspaceID]--
+	}
+	n := g.viewers[workspaceID]
+	if n == 0 {
+		delete(g.viewers, workspaceID)
+	}
+	g.viewersMu.Unlock()
+	g.mirrorViewers(ctx, workspaceID, n)
+}
+
+func (g *Gateway) mirrorViewers(ctx context.Context, workspaceID string, n int) {
+	if g.vncPresence == nil {
+		return
+	}
+	// Detach from the request context: ViewerDisconnected runs as the websocket
+	// tears down, when the request ctx is already cancelled — a cancelled ctx must
+	// not skip the "drop to zero" write, or a stale positive count would pin the
+	// desktop alive forever. Bounded so a stuck DB can't leak the goroutine.
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = g.vncPresence.SetVNCPresence(wctx, workspaceID, n, time.Now()) // best-effort
+}
 
 // Screenshot proxies GET /screenshot. Sight is NEVER arbitrated (§8): the agent
 // can always see, even while a human drives. Scale-from-zero on first use;
