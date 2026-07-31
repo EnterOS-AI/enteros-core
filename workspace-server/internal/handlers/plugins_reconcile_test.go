@@ -495,13 +495,55 @@ func TestReconcile_NoDeclared_NoQueriesBeyondFirst(t *testing.T) {
 	}
 }
 
+// NOTE (core#4977): the "#main" and "#v1.0" expectations here used to be
+// "none". That was this test encoding the bug as the contract — a bare ref
+// mapping to "none" is precisely what hid every real plugin from the drift
+// sweeper. They now assert the "ref:<name>" form; see
+// TestTrackFromSource_BareRefIsTracked for the regression coverage.
 func TestTrackFromSource(t *testing.T) {
 	cases := map[string]string{
-		"gitea://o/r/sub#main":      "none",
+		"gitea://o/r/sub#main":      "ref:main",
 		"gitea://o/r/sub#tag:v1.0":  "tag:v1.0",
 		"gitea://o/r/sub#sha:abc12": "sha:abc12",
 		"local://seo-all":           "none",
-		"github://o/r#v1.0":         "none", // bare branch/tag ref, not tag:/sha:
+		"github://o/r#v1.0":         "ref:v1.0", // bare ref → tracked as ref:
+	}
+	for in, want := range cases {
+		if got := trackFromSource(in); got != want {
+			t.Errorf("trackFromSource(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestTrackFromSource_BareRefIsTracked: a source whose #fragment is a moving
+// or unclassifiable ref must produce a TRACKED value ("ref:<name>"), not
+// "none".
+//
+// WHY THIS IS THE BUG (core#4977): trackFromSource previously returned "none"
+// for anything lacking a literal "tag:"/"sha:" prefix. Nothing in production
+// writes that prefixed form — real sources look like "#main" and "#v0.2.1" —
+// so every row landed on "none", the sweeper's `tracked_ref != 'none'` filter
+// matched zero rows fleet-wide, and a commit pushed to a branch-pinned plugin
+// never reached a running workspace.
+//
+// NON-VACUITY: the assertions below fail if trackFromSource reverts to
+// returning "none" for bare refs (the pre-fix behavior), and the tag:/sha:
+// cases fail if a fix over-corrected and swallowed the already-working pins.
+func TestTrackFromSource_BareRefIsTracked(t *testing.T) {
+	cases := map[string]string{
+		// The regression: bare refs are now tracked.
+		"gitea://o/r/sub#main":   "ref:main",
+		"gitea://o/r/sub#v0.2.1": "ref:v0.2.1",
+		"github://o/r#v1.0":      "ref:v1.0",
+
+		// Already-working pins must be preserved verbatim.
+		"gitea://o/r/sub#tag:v1.0":  "tag:v1.0",
+		"gitea://o/r/sub#sha:abc12": "sha:abc12",
+
+		// Genuinely untrackable: no moving upstream tip to chase.
+		"local://seo-all":     "none",
+		"gitea://o/r/sub":     "none",
+		"gitea://o/r/sub#":    "none",
 	}
 	for in, want := range cases {
 		if got := trackFromSource(in); got != want {
