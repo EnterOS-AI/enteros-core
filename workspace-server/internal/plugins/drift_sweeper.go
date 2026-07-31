@@ -117,6 +117,22 @@ func StartPluginDriftSweeper(ctx context.Context, resolver PluginResolver) {
 	}
 }
 
+// DriftEligibleQuery is the row-selection the sweeper runs each cycle: every
+// plugin opted into tracking that has a content baseline to compare against.
+//
+// Exported so the real-Postgres integration gate can execute THIS query rather
+// than a hand-copied restatement of it. That distinction is the whole point:
+// the core#4977 defect was that this predicate matched zero rows in
+// production while every unit test passed, because sqlmock returns canned rows
+// without ever evaluating a WHERE clause.
+const DriftEligibleQuery = `
+	SELECT wp.id, wp.workspace_id, wp.plugin_name, wp.source_raw,
+	       wp.tracked_ref, wp.installed_sha
+	  FROM workspace_plugins wp
+	 WHERE wp.tracked_ref != 'none'
+	   AND wp.installed_sha IS NOT NULL
+`
+
 // sweepDriftOnce runs one full drift-detection cycle.
 // Errors are non-fatal — each row is handled independently so a single
 // slow row doesn't block the rest of the sweep.
@@ -124,13 +140,7 @@ func sweepDriftOnce(parent context.Context, resolver PluginResolver) {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Minute)
 	defer cancel()
 
-	rows, err := db.DB.QueryContext(ctx, `
-		SELECT wp.id, wp.workspace_id, wp.plugin_name, wp.source_raw,
-		       wp.tracked_ref, wp.installed_sha
-		  FROM workspace_plugins wp
-		 WHERE wp.tracked_ref != 'none'
-		   AND wp.installed_sha IS NOT NULL
-	`)
+	rows, err := db.DB.QueryContext(ctx, DriftEligibleQuery)
 	if err != nil {
 		log.Printf("Plugin drift sweeper: SELECT failed: %v", err)
 		return
