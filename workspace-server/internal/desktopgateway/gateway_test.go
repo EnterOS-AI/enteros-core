@@ -56,6 +56,47 @@ func TestGateway_ViewerPresenceCountsAndMirrors(t *testing.T) {
 	}
 }
 
+// HumanNavigate must reject any non-http(s) / hostless URL BEFORE reaching the
+// sidecar (defense in depth against file://, javascript:, chrome://, etc.).
+func TestGateway_HumanNavigate_RejectsUnsafeURL(t *testing.T) {
+	doer := &fakeDoer{code: http.StatusNoContent}
+	g := New(&fakeProv{addr: "wsdesk-abc123:6070"}, &fakeLocks{}, &fakeActivity{}, tokenFn, doer)
+	for _, bad := range []string{"file:///etc/passwd", "javascript:alert(1)", "chrome://settings", "ftp://h/x", "notaurl", ""} {
+		if err := g.HumanNavigate(context.Background(), "w1", bad); !errors.Is(err, ErrInvalidNavigateURL) {
+			t.Fatalf("HumanNavigate(%q) = %v, want ErrInvalidNavigateURL", bad, err)
+		}
+	}
+	if len(doer.reqs) != 0 {
+		t.Fatalf("rejected URLs must never reach the sidecar, got %d reqs", len(doer.reqs))
+	}
+}
+
+// A valid URL is forwarded as a {"type":"navigate","url":...} action to the
+// sidecar /input — and does NOT require the agent lock (the human is the
+// controller; the handler authorizes them separately).
+func TestGateway_HumanNavigate_ForwardsNavigateAction(t *testing.T) {
+	doer := &fakeDoer{code: http.StatusNoContent}
+	g := New(&fakeProv{addr: "wsdesk-abc123:6070"}, &fakeLocks{held: false}, &fakeActivity{}, tokenFn, doer)
+	if err := g.HumanNavigate(context.Background(), "w1", "https://example.com/x"); err != nil {
+		t.Fatalf("HumanNavigate: %v", err)
+	}
+	if len(doer.reqs) != 1 {
+		t.Fatalf("want exactly 1 forwarded request, got %d", len(doer.reqs))
+	}
+	r := doer.reqs[0]
+	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/input") {
+		t.Fatalf("bad forward target: %s %s", r.Method, r.URL.Path)
+	}
+	body, _ := io.ReadAll(r.Body)
+	var got struct{ Type, URL string }
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("forwarded body not JSON: %s", body)
+	}
+	if got.Type != "navigate" || got.URL != "https://example.com/x" {
+		t.Fatalf("forwarded action = %s, want navigate https://example.com/x", body)
+	}
+}
+
 // A stray disconnect (e.g. a double-close) must never drive the count negative,
 // which would later let a real viewer's +1 land at 0 and the desktop be reaped.
 func TestGateway_ViewerDisconnectNeverGoesNegative(t *testing.T) {

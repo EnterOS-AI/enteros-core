@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -217,6 +218,51 @@ func (g *Gateway) Input(ctx context.Context, workspaceID string, action json.Raw
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("sidecar input: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ErrInvalidNavigateURL is returned by HumanNavigate for a non-http(s) or
+// hostless URL — surfaced as a 400 by the handler.
+var ErrInvalidNavigateURL = errors.New("navigate requires an http(s) URL with a host")
+
+// HumanNavigate points the desktop browser at url on behalf of a HUMAN who holds
+// display control. Unlike Input it does NOT arbitrate the agent lock — the human
+// IS the controller, and the platform handler authorizes them via their display
+// control token before calling this. Chromium runs --kiosk (no address bar), so
+// a URL bar in the human view is the only way for a person taking over to
+// browse; the control server actuates it by launching `chromium <url>` on the
+// running instance's profile, which has NO effect on the agent coordinate
+// contract. The scheme is re-checked here (defense in depth) even though the
+// control server also restricts navigation to http(s).
+func (g *Gateway) HumanNavigate(ctx context.Context, workspaceID, rawURL string) error {
+	if u, err := url.Parse(rawURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return ErrInvalidNavigateURL
+	}
+	addr, err := g.ensureRunning(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	g.recordActivity(ctx, workspaceID)
+	action, err := json.Marshal(struct {
+		Type string `json:"type"`
+		URL  string `json:"url"`
+	}{Type: "navigate", URL: rawURL})
+	if err != nil {
+		return err
+	}
+	req, err := g.newReq(ctx, workspaceID, http.MethodPost, addr, "/input", bytes.NewReader(action))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("sidecar navigate: status %d", resp.StatusCode)
 	}
 	return nil
 }
