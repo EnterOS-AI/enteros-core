@@ -24,8 +24,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/plugins"
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 // stubDriftStaging points the stage/deliver seams at in-memory fakes.

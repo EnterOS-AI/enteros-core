@@ -67,7 +67,6 @@ var (
 	errDriftPluginRowMissing    = errors.New("workspace_plugins row not found — plugin may have been uninstalled")
 )
 
-
 // Stage/deliver seams, mirroring the `resolveSourceSHA` seam in
 // plugins_reconcile.go. Production points them at the real pipeline; tests
 // swap them so the apply STATE MACHINE (what gets persisted after a deferred
