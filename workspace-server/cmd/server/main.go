@@ -429,9 +429,42 @@ func main() {
 		// SECRETS_ENCRYPTION_KEY (prod boot already requires it) → else the
 		// managed-tenant shared secret. See handlers.DesktopSigningRoot. This is
 		// only "" in a dev env with none of those set.
+		// §25.3 SECURITY — verify the isolation assumption the relaxed sidecar caps
+		// depend on. v3 grants the desktop passwordless sudo + Docker's default cap
+		// set + NO no-new-privileges, so cross-tenant isolation now relies on the
+		// daemon running userns-remap (so container-root != host-root). Nothing else
+		// enforces this, so query the daemon at startup: WARN loudly when remap is
+		// absent, and — if MOLECULE_DESKTOP_REQUIRE_USERNS=true — fail CLOSED by
+		// skipping only the desktop wiring (never a log.Fatal that takes down the
+		// whole platform, never a bare return that skips the rest of main).
+		usernsRemap := false
+		{
+			ictx, icancel := context.WithTimeout(context.Background(), 5*time.Second)
+			info, ierr := desktopDocker.Info(ictx)
+			icancel()
+			if ierr != nil {
+				log.Printf("Desktop: could not query Docker daemon security options (%v) — cannot verify userns-remap; proceeding, but confirm the daemon runs userns-remap for cross-tenant isolation (§25.3).", ierr)
+			} else {
+				for _, so := range info.SecurityOptions {
+					for _, field := range strings.Split(so, ",") {
+						switch strings.TrimSpace(field) {
+						case "name=userns", "name=rootless":
+							// rootless dockerd also maps container-root away from host-root.
+							usernsRemap = true
+						}
+					}
+				}
+			}
+		}
+		requireUserns := envOr("MOLECULE_DESKTOP_REQUIRE_USERNS", "false") == "true"
+		if !usernsRemap {
+			log.Printf("Desktop: WARNING — daemon userns-remap NOT detected. v3 grants the desktop passwordless sudo (container-root); WITHOUT userns-remap container-root == host-root, widening the container-escape surface (§25.3). Enable dockerd userns-remap, or set MOLECULE_DESKTOP_REQUIRE_USERNS=true to fail closed.")
+		}
 		desktopSecret := handlers.DesktopSigningRoot()
 		if desktopSecret == "" {
 			log.Println("Desktop: DISABLED — no signing root available (DISPLAY_SESSION_SIGNING_SECRET unset AND SECRETS_ENCRYPTION_KEY / MOLECULE_CP_SHARED_SECRET / PROVISION_SHARED_SECRET all unset), so the per-sidecar control token cannot be derived and every desktop sidecar would fail to boot. In prod SECRETS_ENCRYPTION_KEY is required, so this only trips in a misconfigured dev env.")
+		} else if requireUserns && !usernsRemap {
+			log.Println("Desktop: DISABLED — MOLECULE_DESKTOP_REQUIRE_USERNS=true but daemon userns-remap was not detected; refusing to wire the desktop backend (fail-closed §25.3). Enable dockerd userns-remap to turn the desktop back on.")
 		} else {
 			image := envOr("MOLECULE_DESKTOP_IMAGE", "registry.moleculesai.app/molecule-ai/molecule-desktop:latest")
 			// Optional operator seccomp override (absolute path). Empty → the
