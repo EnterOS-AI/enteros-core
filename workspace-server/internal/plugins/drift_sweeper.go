@@ -180,40 +180,44 @@ func sweepDriftOnce(parent context.Context, resolver PluginResolver) {
 	}
 }
 
-// resolveLatestSHA resolves the tracked ref to its current upstream SHA.
-// Handles both github:// and local:// sources; local sources are skipped
-// (no meaningful upstream to drift against).
-func resolveLatestSHA(ctx context.Context, resolver PluginResolver, sourceRaw, trackedRef string) (string, error) {
-	// Strip the scheme prefix to get the raw spec.
-	// sourceRaw is stored as the full string, e.g. "github://owner/repo#tag:v1.0.0"
+// driftSpecForTrackedRef builds the resolver spec for one sweep row: the
+// source's scheme is stripped and its #fragment replaced with the fragment
+// implied by tracked_ref.
+//
+// "tag:"/"sha:" values are passed through as-is — the resolvers understand
+// those prefixes. A "ref:<name>" value must be UNWRAPPED to a bare "#<name>",
+// because the prefix is our storage encoding, not something a forge can
+// resolve; sending "#ref:main" to git would look up a ref literally named
+// "ref:main" and fail (core#4977).
+func driftSpecForTrackedRef(sourceRaw, trackedRef string, schemes []string) string {
 	spec := sourceRaw
-	for _, scheme := range resolver.Schemes() {
+	for _, scheme := range schemes {
 		if strings.HasPrefix(spec, scheme+"://") {
 			spec = strings.TrimPrefix(spec, scheme+"://")
 			break
 		}
 	}
 
-	// Parse the ref from the tracked_ref field (e.g. "tag:v1.0.0").
-	// Prepend it as a # suffix so the resolver can fetch the right ref.
-	var refSuffix string
-	switch {
-	case strings.HasPrefix(trackedRef, "tag:"):
-		refSuffix = "#" + trackedRef
-	case strings.HasPrefix(trackedRef, "sha:"):
-		refSuffix = "#" + trackedRef
-	default:
-		// Bare ref (shouldn't happen per validateTrackedRef, but be safe).
-		refSuffix = "#" + trackedRef
+	fragment := trackedRef
+	if strings.HasPrefix(trackedRef, "ref:") {
+		fragment = strings.TrimPrefix(trackedRef, "ref:")
 	}
 
-	// If spec already has a # fragment, replace it with the tracked ref.
-	// (In practice source_raw always has one, but handle both cases.)
-	if strings.Contains(spec, "#") {
-		spec = strings.SplitN(spec, "#", 2)[0] + refSuffix
-	} else {
-		spec = spec + refSuffix
+	base := spec
+	if idx := strings.Index(spec, "#"); idx >= 0 {
+		base = spec[:idx]
 	}
+	return base + "#" + fragment
+}
+
+// resolveLatestSHA resolves the tracked ref to its current upstream SHA.
+// Handles both github:// and local:// sources; local sources are skipped
+// (no meaningful upstream to drift against).
+func resolveLatestSHA(ctx context.Context, resolver PluginResolver, sourceRaw, trackedRef string) (string, error) {
+	// Strip the scheme and replace the source's own #fragment with the one
+	// tracked_ref implies. tracked_ref is authoritative here: a "ref:<name>"
+	// value is unwrapped to a bare "#<name>" so the forge sees a real ref.
+	spec := driftSpecForTrackedRef(sourceRaw, trackedRef, resolver.Schemes())
 
 	// Pick the resolver by scheme. gitea:// sources (private-repo-subpath,
 	// RFC#2843) need the GiteaResolver — it injects the PAT and clones the
