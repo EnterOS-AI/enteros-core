@@ -81,6 +81,11 @@ var (
 	driftDeliverFn = func(h *PluginsHandler, ctx context.Context, workspaceID string, r *stageResult) error {
 		return h.DeliverForApply(ctx, workspaceID, r)
 	}
+	// driftRecordFn is seamed too so a test can OBSERVE whether the SHA was
+	// re-pinned. Relying on sqlmock's strictness for that is vacuous: an
+	// unexpected INSERT merely returns an error, and this call site treats a
+	// record failure as non-fatal, so the statement would fire unnoticed.
+	driftRecordFn = recordWorkspacePluginInstall
 )
 
 // driftApplyOutcome is the result of applying one queue entry.

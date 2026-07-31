@@ -54,6 +54,24 @@ func stubDriftStaging(t *testing.T, newSHA string, deliveredByPush bool) {
 	t.Cleanup(func() { driftStageFn, driftDeliverFn = origStage, origDeliver })
 }
 
+// recordSpy observes whether installed_sha was re-pinned. sqlmock cannot serve
+// this role: an unexpected INSERT only returns an error, and the apply path
+// treats a record failure as non-fatal, so the write would happen silently.
+type recordSpy struct {
+	calls []string // installed SHAs passed to the recorder
+	err   error    // returned to the caller when non-nil
+}
+
+func (r *recordSpy) install(t *testing.T) {
+	t.Helper()
+	orig := driftRecordFn
+	driftRecordFn = func(_ context.Context, _, _, _, _, installedSHA string) error {
+		r.calls = append(r.calls, installedSHA)
+		return r.err
+	}
+	t.Cleanup(func() { driftRecordFn = orig })
+}
+
 // expectDriftApplyPreamble wires the two reads every apply performs.
 func expectDriftApplyPreamble(mock sqlmock.Sqlmock, queueID, wsID, pluginName, sourceRaw string) {
 	mock.ExpectQuery(`SELECT workspace_id, plugin_name, tracked_ref, status\s+FROM plugin_update_queue`).
@@ -89,6 +107,8 @@ func TestApplyQueuedDrift_DeferredRestart_DoesNotRePinSHA(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	spy := &restartSpy{}
+	rec := &recordSpy{}
+	rec.install(t)
 	h := NewAdminPluginDriftHandler(NewPluginsHandler(t.TempDir(), nil, spy.fn))
 
 	outcome, err := h.applyQueuedDrift(context.Background(), queueID)
@@ -104,8 +124,14 @@ func TestApplyQueuedDrift_DeferredRestart_DoesNotRePinSHA(t *testing.T) {
 		t.Error("materialized=true, but no bytes were pushed AND no restart was dispatched — " +
 			"nothing reached the box")
 	}
-	// The load-bearing assertion: no workspace_plugins write was expected, so
-	// if the code re-pinned installed_sha sqlmock fails here.
+	// THE load-bearing assertion: the SHA must not have been re-pinned.
+	// Verified by mutation — restoring the pre-fix unconditional re-pin must
+	// fail exactly here.
+	if len(rec.calls) != 0 {
+		t.Errorf("installed_sha was re-pinned to %v after a DEFERRED restart — "+
+			"the box still has the old tree, so the sweeper would now see no drift "+
+			"and the concierge would be permanently stale while reporting converged", rec.calls)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet/unexpected statements: %v", err)
 	}
@@ -129,14 +155,14 @@ func TestApplyQueuedDrift_RestartDispatched_RePinsSHA(t *testing.T) {
 		WithArgs(wsID).
 		WillReturnRows(sqlmock.NewRows([]string{"kind", "status"}).AddRow("workspace", "online"))
 
-	// Because the restart lands, the new SHA MUST be persisted.
-	mock.ExpectExec(`INSERT INTO workspace_plugins`).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+	// The persist itself is observed through the record seam, not sqlmock.
 	mock.ExpectExec(`UPDATE plugin_update_queue SET status = 'applied'`).
 		WithArgs(queueID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	spy := &restartSpy{}
+	rec := &recordSpy{}
+	rec.install(t)
 	h := NewAdminPluginDriftHandler(NewPluginsHandler(t.TempDir(), nil, spy.fn))
 
 	outcome, err := h.applyQueuedDrift(context.Background(), queueID)
@@ -145,6 +171,10 @@ func TestApplyQueuedDrift_RestartDispatched_RePinsSHA(t *testing.T) {
 	}
 	waitGlobalAsyncForTest()
 
+	if len(rec.calls) != 1 || rec.calls[0] != newSHA {
+		t.Errorf("installed_sha re-pin calls = %v, want exactly [%s] — "+
+			"without the re-pin the sweeper re-queues this workspace forever", rec.calls, newSHA)
+	}
 	if !outcome.Restarting {
 		t.Error("restarting=false for an ordinary workspace — auto-apply would be broken")
 	}

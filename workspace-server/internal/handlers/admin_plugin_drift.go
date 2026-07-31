@@ -287,9 +287,14 @@ func (h *AdminPluginDriftHandler) applyQueuedDrift(ctx context.Context, queueID 
 	// the old SHA means the sweeper re-detects and re-queues, keeping the drift
 	// visible until the concierge is deliberately restarted.
 	if outcome.Materialized {
-		if err := recordWorkspacePluginInstall(ctx, entry.WorkspaceID, result.PluginName,
+		if err := driftRecordFn(ctx, entry.WorkspaceID, result.PluginName,
 			result.Source.Raw(), entry.TrackedRef, result.InstalledSHA); err != nil {
-			log.Printf("AdminPluginDrift: apply: recordWorkspacePluginInstall failed: %v (install succeeded)", err)
+			// Could not persist the new SHA, so we cannot claim convergence:
+			// the sweeper must keep seeing drift rather than trust a write that
+			// never landed.
+			log.Printf("AdminPluginDrift: apply: could NOT re-pin installed_sha for %s/%s: %v — reporting NOT converged so the sweeper re-queues",
+				entry.WorkspaceID, entry.PluginName, err)
+			outcome.Materialized = false
 		}
 	} else {
 		log.Printf("AdminPluginDrift: apply: %s/%s staged at %s but restart deferred — NOT re-pinning installed_sha so the sweeper keeps reporting drift",
