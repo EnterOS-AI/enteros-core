@@ -145,11 +145,28 @@ re-fetch the same entry every tick; the sweeper re-queues a fresh row hourly.
 | Detection interval | 1h | `plugins.DriftSweepInterval` |
 | Apply interval | 10m | `handlers.DriftApplyInterval` |
 | Applies per tick | 25 | `driftApplyMaxPerTick` |
+| First-drain settle | 2m | `handlers.DriftApplyStartupDelay` |
 | Per-fetch deadline | 60s | `plugins.ResolveRefDeadline` |
 
 The per-tick cap is a **restart budget**: each apply usually restarts a
 workspace, so an unbounded drain after a fan-out would bounce the fleet at
 once. Excess entries are picked up on the next tick.
+
+The settle delay exists for the same reason. The sweeper runs immediately at
+startup — safe, it only detects — but the applier must not, or a server boot
+would restart up to a full budget of workspaces within seconds of coming up.
+
+### First deploy after the backfill
+
+Expect a one-time burst. The backfill makes every previously-`none` row
+sweepable, so the first sweep queues drift for **every** branch-pinned plugin
+whose tip has moved since it was installed, fleet-wide. Those then roll at
+≤25 per 10 minutes, 2 minutes after the server settles.
+
+That is intended — it is the fleet converging for the first time — but it does
+mean the first post-deploy hour is the one time this system restarts many
+workspaces at once. Watch `GET /admin/plugin-updates-pending` drain, and note
+that tag/SHA-pinned plugins resolve to a constant and will *not* queue.
 
 Per-entry failures are isolated — one unreachable upstream must not stop the
 rest of the queue. A failed entry stays `pending` and is retried next tick.
