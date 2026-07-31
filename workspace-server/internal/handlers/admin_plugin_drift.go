@@ -128,6 +128,13 @@ func (h *AdminPluginDriftHandler) ListPending(c *gin.Context) {
 //
 // Idempotent: if the entry is already 'applied', returns 200 with the
 // workspace_id and plugin_name so callers can still poll for confirmation.
+// Apply handles POST /admin/plugin-updates/:id/apply.
+//
+// Thin HTTP shell over applyQueuedDrift — the SAME implementation the
+// deterministic queue drainer (plugin_drift_applier.go) runs. Keeping one
+// apply path is deliberate: a second copy for the drainer would drift from
+// this one, and the two would disagree about exactly the state machine that
+// decides whether a workspace converged.
 func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 	queueID := c.Param("id")
 	if queueID == "" {
@@ -135,14 +142,70 @@ func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
+	outcome, err := h.applyQueuedDrift(c.Request.Context(), queueID)
+	switch {
+	case errors.Is(err, errDriftEntryNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("queue entry %s not found", queueID)})
+		return
+	case errors.Is(err, errDriftEntryAlreadyApplied):
+		c.JSON(http.StatusOK, gin.H{
+			"status":       "already_applied",
+			"workspace_id": outcome.WorkspaceID,
+			"plugin_name":  outcome.PluginName,
+			"message":      "drift update was already applied",
+		})
+		return
+	case errors.Is(err, errDriftEntryDismissed):
+		c.JSON(http.StatusConflict, gin.H{
+			"error":        "queue entry was dismissed",
+			"workspace_id": outcome.WorkspaceID,
+			"plugin_name":  outcome.PluginName,
+		})
+		return
+	case errors.Is(err, errDriftPluginRowMissing):
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":        "workspace_plugins row not found — plugin may have been uninstalled",
+			"workspace_id": outcome.WorkspaceID,
+			"plugin_name":  outcome.PluginName,
+		})
+		return
+	case err != nil:
+		var he *httpErr
+		if errors.As(err, &he) {
+			c.JSON(he.Status, gin.H{
+				"error":    fmt.Sprintf("plugin apply failed: %v", he.Body["error"]),
+				"queue_id": queueID,
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin apply failed", "queue_id": queueID})
+		return
+	}
 
-	// Step 1: read and lock the queue entry.
+	c.JSON(http.StatusOK, gin.H{
+		"status":        "applied",
+		"workspace_id":  outcome.WorkspaceID,
+		"plugin_name":   outcome.PluginName,
+		"installed_sha": outcome.InstalledSHA,
+		"restarting":    outcome.Restarting,
+		"materialized":  outcome.Materialized,
+	})
+}
+
+// applyQueuedDrift applies one plugin_update_queue entry: re-stage the plugin
+// at its tracked ref, deliver it, re-pin the installed SHA, mark the entry
+// applied, and restart the workspace unless the self-brick guard defers it.
+//
+// Returns a populated outcome alongside the sentinel errors so the HTTP shell
+// can still name the workspace/plugin in its 404 / 409 bodies.
+func (h *AdminPluginDriftHandler) applyQueuedDrift(ctx context.Context, queueID string) (*driftApplyOutcome, error) {
+	outcome := &driftApplyOutcome{}
+
 	var entry struct {
-		WorkspaceID string `json:"workspace_id"`
-		PluginName  string `json:"plugin_name"`
-		TrackedRef  string `json:"tracked_ref"`
-		Status      string `json:"status"`
+		WorkspaceID string
+		PluginName  string
+		TrackedRef  string
+		Status      string
 	}
 	err := db.DB.QueryRowContext(ctx, `
 		SELECT workspace_id, plugin_name, tracked_ref, status
@@ -150,135 +213,102 @@ func (h *AdminPluginDriftHandler) Apply(c *gin.Context) {
 		 WHERE id = $1
 	`, queueID).Scan(&entry.WorkspaceID, &entry.PluginName, &entry.TrackedRef, &entry.Status)
 	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("queue entry %s not found", queueID)})
-		return
+		return outcome, errDriftEntryNotFound
 	}
 	if err != nil {
 		log.Printf("AdminPluginDrift: apply: query queue entry: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read queue entry"})
-		return
+		return outcome, fmt.Errorf("read queue entry: %w", err)
+	}
+	outcome.WorkspaceID = entry.WorkspaceID
+	outcome.PluginName = entry.PluginName
+
+	switch entry.Status {
+	case "applied":
+		return outcome, errDriftEntryAlreadyApplied
+	case "dismissed":
+		return outcome, errDriftEntryDismissed
 	}
 
-	if entry.Status == "applied" {
-		// Idempotent — already applied.
-		c.JSON(http.StatusOK, gin.H{
-			"status":       "already_applied",
-			"workspace_id": entry.WorkspaceID,
-			"plugin_name":  entry.PluginName,
-			"message":      "drift update was already applied",
-		})
-		return
-	}
-
-	if entry.Status == "dismissed" {
-		c.JSON(http.StatusConflict, gin.H{
-			"error":        "queue entry was dismissed",
-			"workspace_id": entry.WorkspaceID,
-			"plugin_name":  entry.PluginName,
-		})
-		return
-	}
-
-	// Step 2: read the workspace_plugins row to get source_raw.
 	var sourceRaw string
 	err = db.DB.QueryRowContext(ctx, `
 		SELECT source_raw FROM workspace_plugins
 		 WHERE workspace_id = $1 AND plugin_name = $2
 	`, entry.WorkspaceID, entry.PluginName).Scan(&sourceRaw)
 	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{
-			"error":        "workspace_plugins row not found — plugin may have been uninstalled",
-			"workspace_id": entry.WorkspaceID,
-			"plugin_name":  entry.PluginName,
-		})
-		return
+		return outcome, errDriftPluginRowMissing
 	}
 	if err != nil {
 		log.Printf("AdminPluginDrift: apply: query workspace_plugins: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read plugin record"})
-		return
+		return outcome, fmt.Errorf("read plugin record: %w", err)
 	}
 
-	// Step 3: re-install the plugin.
-	//
-	// We call h.pluginsHandler.Install indirectly via a subrequest to reuse
-	// the full install pipeline (resolve → stage → deliver → record).
-	// Construct the apply installRequest: same source as the existing row,
-	// same tracked_ref. The source_raw already encodes the pinned ref
-	// (e.g. "github://owner/repo#tag:v1.0.0"), so the resolver fetches
-	// the latest commit at that ref — the drift.
-	installReq := installRequest{
+	// Re-stage through the full install pipeline. source_raw already encodes
+	// the pinned ref, so the resolver fetches the current commit at that ref.
+	result, instErr := h.pluginsHandler.ResolveAndStageForApply(ctx, installRequest{
 		Source: sourceRaw,
 		Track:  entry.TrackedRef,
-	}
-	result, instErr := h.pluginsHandler.ResolveAndStageForApply(ctx, installReq)
+	})
 	if instErr != nil {
-		var he *httpErr
-		if errors.As(instErr, &he) {
-			c.JSON(he.Status, gin.H{
-				"error":    fmt.Sprintf("plugin install failed: %v", he.Body["error"]),
-				"queue_id": queueID,
-			})
-			return
-		}
 		log.Printf("AdminPluginDrift: apply: install failed for %s/%s: %v",
 			entry.WorkspaceID, entry.PluginName, instErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin install failed", "queue_id": queueID})
-		return
+		return outcome, instErr
 	}
 	defer func() { _ = os.RemoveAll(result.StagedDir) }()
+	outcome.InstalledSHA = result.InstalledSHA
 
-	// Deliver to the workspace container. Docker-less tenant (#206): the
-	// docker-push is RETIRED — errNoPushTarget means "deliver by pull". The
-	// declared row already carries the tracked ref, so the restart in step 5 lets
-	// the boot materializer pull the new commit. Skip the push and keep going
-	// (record the new SHA + restart below); no bytes copied in.
+	// Deliver. Docker-less tenant (#206): errNoPushTarget means "deliver by
+	// pull" — no bytes are copied and the RESTART below is what makes the boot
+	// installer fetch the new commit.
+	deliveredByPush := true
 	if err := h.pluginsHandler.DeliverForApply(ctx, entry.WorkspaceID, result); err != nil {
 		if errors.Is(err, errNoPushTarget) {
-			log.Printf("AdminPluginDrift: apply: docker-less workspace %s/%s — retiring docker-push, re-materialize on restart (pull)",
+			deliveredByPush = false
+			log.Printf("AdminPluginDrift: apply: docker-less workspace %s/%s — deliver by pull on restart",
 				entry.WorkspaceID, entry.PluginName)
 		} else {
-			var he *httpErr
-			if errors.As(err, &he) {
-				c.JSON(he.Status, gin.H{"error": fmt.Sprintf("plugin deliver failed: %v", he.Body["error"]), "queue_id": queueID})
-				return
-			}
 			log.Printf("AdminPluginDrift: apply: deliver failed for %s/%s: %v",
 				entry.WorkspaceID, entry.PluginName, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin deliver failed", "queue_id": queueID})
-			return
+			return outcome, err
 		}
 	}
 
-	// Record the install with the new SHA. This updates installed_sha on the
-	// workspace_plugins row so the next drift sweep finds no drift.
-	if err := recordWorkspacePluginInstall(ctx, entry.WorkspaceID, result.PluginName,
-		result.Source.Raw(), entry.TrackedRef, result.InstalledSHA); err != nil {
-		log.Printf("AdminPluginDrift: apply: recordWorkspacePluginInstall failed: %v (install succeeded)", err)
-		// Non-fatal: the plugin IS installed; just log and continue.
+	// Restart (or defer it, for a concierge in its fragile window).
+	outcome.Restarting = h.applyRestartAfterDrift(ctx, entry.WorkspaceID)
+
+	// Did the new bytes actually reach the box? Pushed bytes are already
+	// there; pull-delivery only lands if a restart was dispatched.
+	outcome.Materialized = deliveredByPush || outcome.Restarting
+
+	// Re-pin installed_sha ONLY when the bytes materialized.
+	//
+	// core#4977: advancing the SHA after a DEFERRED restart would tell the next
+	// drift sweep "already up to date" while the on-disk tree is still the old
+	// commit — a box that is permanently stale and reports converged. Leaving
+	// the old SHA means the sweeper re-detects and re-queues, keeping the drift
+	// visible until the concierge is deliberately restarted.
+	if outcome.Materialized {
+		if err := recordWorkspacePluginInstall(ctx, entry.WorkspaceID, result.PluginName,
+			result.Source.Raw(), entry.TrackedRef, result.InstalledSHA); err != nil {
+			log.Printf("AdminPluginDrift: apply: recordWorkspacePluginInstall failed: %v (install succeeded)", err)
+		}
+	} else {
+		log.Printf("AdminPluginDrift: apply: %s/%s staged at %s but restart deferred — NOT re-pinning installed_sha so the sweeper keeps reporting drift",
+			entry.WorkspaceID, entry.PluginName, shortSHA(result.InstalledSHA))
 	}
 
-	// Step 4: mark queue entry as applied.
+	// Mark the entry applied either way: we did everything we could for it.
+	// When materialization was deferred the sweeper re-queues a fresh pending
+	// row on its next tick, so the signal survives without the drainer
+	// re-fetching this same entry every tick.
 	if _, err := db.DB.ExecContext(ctx, `
 		UPDATE plugin_update_queue SET status = 'applied' WHERE id = $1
 	`, queueID); err != nil {
 		log.Printf("AdminPluginDrift: apply: failed to mark queue entry %s as applied: %v", queueID, err)
-		// Non-fatal: install succeeded; operator can retry or mark manually.
 	}
 
-	// Step 5: trigger workspace restart — UNLESS the target is the self-host
-	// platform concierge in its fragile lifecycle window (self-brick guard).
-	restarting := h.applyRestartAfterDrift(ctx, entry.WorkspaceID)
-
-	log.Printf("AdminPluginDrift: applied drift update for %s/%s (queue_id=%s, restarting=%t)",
-		entry.WorkspaceID, entry.PluginName, queueID, restarting)
-	c.JSON(http.StatusOK, gin.H{
-		"status":        "applied",
-		"workspace_id":  entry.WorkspaceID,
-		"plugin_name":   entry.PluginName,
-		"installed_sha": result.InstalledSHA,
-		"restarting":    restarting,
-	})
+	log.Printf("AdminPluginDrift: applied drift update for %s/%s (queue_id=%s, restarting=%t, materialized=%t)",
+		entry.WorkspaceID, entry.PluginName, queueID, outcome.Restarting, outcome.Materialized)
+	return outcome, nil
 }
 
 // applyRestartAfterDrift triggers the post-apply workspace restart for a drift
