@@ -38,6 +38,15 @@ var trackedRefValues = map[string]bool{
 //	"tag:vX.Y.Z"      — track a specific tag
 //	"tag:latest"      — track latest tag, drift on every new tag
 //	"sha:<full-sha>"  — pinned to commit SHA
+//	"ref:<name>"      — track whatever this ref resolves to right now
+//
+// The "ref:" form covers a source pinned to a moving branch ("#main") or to a
+// bare tag name ("#v0.2.1"). Those two are syntactically indistinguishable
+// without a forge lookup, so they share one form rather than guessing: an
+// immutable tag simply resolves to a constant SHA and never reports drift,
+// while a branch tip advances and does. Before this form existed both
+// collapsed to "none" and the drift sweeper's `tracked_ref != 'none'` filter
+// excluded every real-world plugin (core#4977).
 func validateTrackedRef(s string) (string, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -52,7 +61,10 @@ func validateTrackedRef(s string) (string, error) {
 	if strings.HasPrefix(s, "sha:") && len(s) > 4 {
 		return s, nil
 	}
-	return "", fmt.Errorf("invalid track value %q: expected 'none' | 'tag:vX.Y.Z' | 'tag:latest' | 'sha:<full>'", s)
+	if strings.HasPrefix(s, "ref:") && len(s) > 4 {
+		return s, nil
+	}
+	return "", fmt.Errorf("invalid track value %q: expected 'none' | 'tag:vX.Y.Z' | 'tag:latest' | 'sha:<full>' | 'ref:<name>'", s)
 }
 
 // recordWorkspacePluginInstall upserts the workspace_plugins row for a
