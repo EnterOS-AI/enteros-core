@@ -446,7 +446,19 @@ func main() {
 				}
 				seccompProfile = string(b)
 			}
-			sidecar := provisioner.NewLocalSidecarProvisioner(desktopDocker, image, "wsnet", 6070, 10*time.Second, 2<<30, seccompProfile)
+			// Memory ceiling for the sidecar (§10 OOM control). v3 is a FULL XFCE
+			// desktop that can run a browser + apt-installed apps (§25.2), so the old
+			// 2 GiB kiosk-browser cap is too tight — default 4 GiB, operator-overridable
+			// via MOLECULE_DESKTOP_MEMORY_BYTES for hosts that want more/less headroom.
+			desktopMemoryBytes := int64(4 << 30)
+			if mv := os.Getenv("MOLECULE_DESKTOP_MEMORY_BYTES"); mv != "" {
+				if parsed, perr := strconv.ParseInt(mv, 10, 64); perr == nil && parsed > 0 {
+					desktopMemoryBytes = parsed
+				} else {
+					log.Printf("Desktop: ignoring invalid MOLECULE_DESKTOP_MEMORY_BYTES=%q (want a positive integer byte count); using default %d", mv, desktopMemoryBytes)
+				}
+			}
+			sidecar := provisioner.NewLocalSidecarProvisioner(desktopDocker, image, "wsnet", 6070, 10*time.Second, desktopMemoryBytes, seccompProfile)
 			// B1: the provisioner derives DESKTOP_CONTROL_TOKEN from the SAME secret
 			// the gateway's TokenResolver uses, so the sidecar's control server and
 			// the gateway agree. B3: tell the provisioner which container is the
