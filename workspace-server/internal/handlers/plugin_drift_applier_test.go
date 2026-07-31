@@ -171,3 +171,58 @@ func TestDriftApplyBudget_IsBounded(t *testing.T) {
 			DriftApplyInterval, plugins.DriftSweepInterval)
 	}
 }
+
+// TestStartPluginDriftApplier_DoesNotDrainBeforeSettling: the applier must not
+// restart workspaces the instant the server boots.
+//
+// WHY: every apply usually dispatches a workspace RESTART. Draining at t=0
+// means a server boot (or a deploy) can roll up to driftApplyMaxPerTick boxes
+// within seconds, while the platform is still settling — and that is exactly
+// the moment the first post-backfill sweep will have queued drift for every
+// branch-pinned plugin in the fleet.
+//
+// Deterministic, no sleeps: with an ALREADY-CANCELLED context the ctx-aware
+// settle must win and the drain must never be reached.
+//
+// NON-VACUITY: the pre-fix code called DrainPendingDrift unconditionally
+// before the ticker loop, so it drained once even on a cancelled context and
+// this test fails. Verified by mutation.
+func TestStartPluginDriftApplier_DoesNotDrainBeforeSettling(t *testing.T) {
+	drained := 0
+	orig := driftDrainFn
+	driftDrainFn = func(context.Context, func(context.Context, string) (*driftApplyOutcome, error)) (int, int) {
+		drained++
+		return 0, 0
+	}
+	t.Cleanup(func() { driftDrainFn = orig })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already dead before the applier starts
+
+	h := NewAdminPluginDriftHandler(NewPluginsHandler(t.TempDir(), nil, func(string) {}))
+	StartPluginDriftApplier(ctx, h)
+
+	if drained != 0 {
+		t.Errorf("drained %d time(s) on a cancelled context — the applier restarted "+
+			"workspaces before settling, and would do so on every server boot", drained)
+	}
+}
+
+// TestStartPluginDriftApplier_DisabledWithoutPluginsHandler — a nil handler
+// must be an explicit no-op, never a nil deref in a supervised goroutine.
+func TestStartPluginDriftApplier_DisabledWithoutPluginsHandler(t *testing.T) {
+	drained := 0
+	orig := driftDrainFn
+	driftDrainFn = func(context.Context, func(context.Context, string) (*driftApplyOutcome, error)) (int, int) {
+		drained++
+		return 0, 0
+	}
+	t.Cleanup(func() { driftDrainFn = orig })
+
+	StartPluginDriftApplier(context.Background(), nil)
+	StartPluginDriftApplier(context.Background(), NewAdminPluginDriftHandler(nil))
+
+	if drained != 0 {
+		t.Errorf("drained %d time(s) with no plugins handler; want 0", drained)
+	}
+}

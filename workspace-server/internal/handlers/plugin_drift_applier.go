@@ -51,6 +51,30 @@ import (
 // case for a branch-pinned plugin is therefore ~1h (detect) + ~10m (apply).
 const DriftApplyInterval = 10 * time.Minute
 
+// DriftApplyStartupDelay is how long the applier waits before its FIRST drain.
+//
+// Unlike the sweeper — which only detects and is therefore free to run
+// immediately — each apply usually RESTARTS a workspace. Draining at t=0 would
+// mean every server boot can restart up to driftApplyMaxPerTick workspaces
+// within seconds of startup, while the platform is still settling and boxes are
+// reconnecting.
+//
+// That is sharpest on the first deploy of this feature: the backfill makes
+// every branch-pinned plugin sweepable at once, the sweeper's own
+// run-immediately-on-startup queues drift for all of them, and the applier
+// would then roll them straight away. Convergence is an hourly-scale property,
+// so trading a couple of minutes for not restarting the fleet during a deploy
+// window is free.
+//
+// A var, not a const, so tests can shorten it.
+var DriftApplyStartupDelay = 2 * time.Minute
+
+// driftDrainFn is the drain seam. Seamed for the same reason as the others in
+// this file: proving "the applier does NOT drain before the delay" needs an
+// observation, and neither sqlmock nor a log line provides one — an
+// unexpected query is swallowed by DrainPendingDrift's own error handling.
+var driftDrainFn = DrainPendingDrift
+
 // driftApplyMaxPerTick bounds how many entries one tick will apply. Each apply
 // does a git fetch + (usually) a workspace restart, so an unbounded drain
 // after a large fan-out event would restart the whole fleet at once. Excess
@@ -181,11 +205,22 @@ func StartPluginDriftApplier(ctx context.Context, h *AdminPluginDriftHandler) {
 		log.Println("Plugin drift applier: no plugins handler — applier disabled")
 		return
 	}
-	log.Printf("Plugin drift applier started — interval %s", DriftApplyInterval)
+	log.Printf("Plugin drift applier started — interval %s, first drain in %s",
+		DriftApplyInterval, DriftApplyStartupDelay)
 	ticker := time.NewTicker(DriftApplyInterval)
 	defer ticker.Stop()
 
-	DrainPendingDrift(ctx, h.applyQueuedDrift)
+	// Settle before the first drain — see DriftApplyStartupDelay. Ctx-aware so
+	// a shutdown during the delay exits instead of restarting boxes on the way
+	// out.
+	select {
+	case <-ctx.Done():
+		log.Println("Plugin drift applier: shutdown during startup delay")
+		return
+	case <-time.After(DriftApplyStartupDelay):
+	}
+
+	driftDrainFn(ctx, h.applyQueuedDrift)
 	for {
 		select {
 		case <-ctx.Done():
@@ -195,7 +230,7 @@ func StartPluginDriftApplier(ctx context.Context, h *AdminPluginDriftHandler) {
 			if ctx.Err() != nil {
 				continue
 			}
-			DrainPendingDrift(ctx, h.applyQueuedDrift)
+			driftDrainFn(ctx, h.applyQueuedDrift)
 		}
 	}
 }
