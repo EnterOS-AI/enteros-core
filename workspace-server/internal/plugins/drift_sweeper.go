@@ -301,6 +301,20 @@ func ResolveSourceSHA(ctx context.Context, resolver PluginResolver, sourceRaw st
 }
 
 // queueDriftEntry inserts a pending drift entry into plugin_update_queue.
+//
+// The ON CONFLICT clause MUST repeat `WHERE status = 'pending'`. The uniqueness
+// it infers is the PARTIAL index plugin_update_queue_pending_unique
+// (workspace_id, plugin_name) WHERE status = 'pending'; Postgres will not infer
+// a partial index unless the predicate matches, and instead rejects the whole
+// statement with "there is no unique or exclusion constraint matching the ON
+// CONFLICT specification".
+//
+// core#4977: without the predicate EVERY enqueue failed. The sweeper logs that
+// error and continues, so drift was detected forever and never queued — the
+// queue sat permanently empty and nothing ever converged. Confirmed live: a
+// workspace with real drift logged "drift detected ... queue drift ... failed"
+// on every sweep. Covered by a real-Postgres gate; sqlmock cannot catch it
+// because it never runs the planner.
 // ON CONFLICT (workspace_id, plugin_name) WHERE status = 'pending' DO NOTHING
 // makes this idempotent — re-drift while a row is already pending is a no-op.
 // Uses the partial unique index plugin_update_queue_pending_unique as the
@@ -310,7 +324,7 @@ func queueDriftEntry(ctx context.Context, workspaceID, pluginName, trackedRef, c
 		INSERT INTO plugin_update_queue
 		  (workspace_id, plugin_name, tracked_ref, current_sha, latest_sha)
 		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (workspace_id, plugin_name) DO NOTHING
+		ON CONFLICT (workspace_id, plugin_name) WHERE status = 'pending' DO NOTHING
 	`, workspaceID, pluginName, trackedRef, currentSHA, latestSHA)
 	return err
 }

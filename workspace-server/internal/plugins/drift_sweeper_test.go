@@ -193,6 +193,17 @@ func TestDriftSpecForTrackedRef_UnwrapsRefPrefix(t *testing.T) {
 
 		// Source with no fragment at all still gets the tracked ref appended.
 		{"gitea://org/repo", "ref:main", "org/repo#main"},
+
+		// The EXACT row observed on the reno-stars tenant that reported
+		// core#4977. Synthetic org/repo pairs cannot catch an owner-name or
+		// hyphen-handling regression, and this is the shape a customer is
+		// actually running — SSOT §5: assert the production ref shapes, never
+		// only the convenient ones.
+		{
+			"gitea://RenoStarsAI-production-client/reno-stars-coordinator#main",
+			"ref:main",
+			"RenoStarsAI-production-client/reno-stars-coordinator#main",
+		},
 	}
 	for _, tc := range cases {
 		got := driftSpecForTrackedRef(tc.sourceRaw, tc.trackedRef, schemes)

@@ -208,10 +208,65 @@ to fail when coverage disappears:
   injected `tag:`-prefixed form — testing the prefixed form is what would have
   passed while production stayed broken.
 
+### The chain gate
+
+Link-level tests are not sufficient here, and that is not a hypothetical: all
+four defects shipped with green link-level coverage. Each link passed in
+isolation while the pipeline as a whole moved nothing.
+
+`TestIntegration_ConvergenceChain` (`plugin_convergence_chain_integration_test.go`)
+therefore walks the whole state machine in one test — detect → enqueue → drain →
+apply → re-pin → quiet — against real Postgres, stubbing only the git fetch and
+the Docker restart. A negative arm asserts the inverse: when delivery does *not*
+land, the chain must stay noisy rather than record a convergence that never
+happened.
+
+Its worth is measured, not asserted. Re-introducing each defect kills it at a
+distinct link:
+
+| Re-introduced defect | Chain fails at |
+| --- | --- |
+| `trackFromSource` returns `"none"` | link 1, detect |
+| `ON CONFLICT` drops `WHERE status = 'pending'` | link 2, enqueue |
+| `driftApplyMaxPerTick = 0` | link 3, drain |
+| `Materialized` forced true | deferred arm, fake re-pin |
+
+Re-run that matrix if you restructure the file. A chain gate that survives its
+own defects is decoration.
+
+Note link 1 *derives* `tracked_ref` through `trackFromSource` rather than seeding
+the literal string. Seeding it by hand would hard-code the fix and let defect 1
+back in with the gate still green.
+
+### The partial-index lint
+
+`scripts/ops/check_onconflict_partial_index.py` fails any `ON CONFLICT`
+inference clause that targets a partial unique index without repeating its
+predicate — the defect that emptied this queue for the life of the feature.
+Postgres rejects such a statement at *runtime*; it compiles, it vets, and
+sqlmock returns a canned OK for it.
+
+The enforcing line is `test_real_tree_is_currently_clean` in
+`test_check_onconflict_partial_index.py`, which runs the scanner over the real
+tree; `.gitea/workflows/test-ops-scripts.yml` runs `unittest discover` from
+`scripts/ops` with a fail-closed collected-count guard. That workflow now also
+triggers on `workspace-server/**` — a guard CI does not run on the files it
+guards is not a guard.
+
+The lint refuses to pass when it parses zero partial indexes, because a scanner
+that inspects nothing would otherwise report success forever.
+
 CI: `.gitea/workflows/handlers-postgres-integration.yml`, selected by
 `-run ^TestIntegration_`. Its path profile (`.gitea/scripts/detect-changes.py`,
 `handlers-postgres`) includes `internal/plugins/`, `internal/router/`, and
 `cmd/server/` so a change that unwires the applier still triggers the gate.
+
+**Running the integration suite locally on Windows:** use `127.0.0.1`, not
+`localhost`, in `INTEGRATION_DB_URL`. `localhost` resolves to `::1` first and
+Docker Desktop's IPv6 loopback proxy drops fresh connections — measured 7
+failures in 38 runs, each a 30s `Ping` stall, versus 0 in 40 on `127.0.0.1`. It
+looks exactly like a flaky test and is not one. CI is unaffected: it reaches
+postgres by container hostname over the bridge.
 
 ---
 
@@ -230,3 +285,34 @@ CI: `.gitea/workflows/handlers-postgres-integration.yml`, selected by
    token must **not** be extended to read customer-owned repos.
 3. **A deferred concierge never self-heals.** By design — it converges on its
    next deliberate restart. The drift stays visible in the queue until then.
+4. **Convergence is asserted entirely CP-side; the box never reports a plugin
+   SHA.** This is the deepest gap on this page, and it bounds what §5 can
+   possibly prove.
+
+   `installed_sha` records what the control plane *believes* the box has.
+   `Materialized` — the gate that guards it — is derived from CP-side facts
+   (did a restart get dispatched, were bytes pushed), never from the box
+   confirming what it loaded. Every `installed_sha` comparison in the tree is
+   CP-record vs **upstream git**: `drift_sweeper.go`, `pluginFragmentStale`,
+   `plugin_drift_applier.go`. None is CP-record vs box.
+
+   The box does report, via `POST /workspaces/:id/plugin-install-report` into
+   `workspace_plugin_install_reports`, and `swapped` is a genuine execution-side
+   fact (the runtime atomically swapped the staging tree into `plugins_dir`).
+   But `installed` / `skipped` / `failed` are lists of **source strings** — the
+   payload carries no SHA, ref, commit, or version field at all. The heartbeat
+   is no better: `loaded_mcp_tools` is tool identity, and `registry.go` already
+   disclaims it as "PRESENCE, NOT CALLABILITY — and UNRELIABLE".
+
+   So nothing anywhere compares box-reported state against `installed_sha`, and
+   **no test can**: there is no version on the reporting side to compare. An
+   execution-vs-disk gate is not merely unwritten, it is currently
+   inexpressible. The unblocking change is a signal change — carry the resolved
+   per-plugin SHA in the install report — after which the invariant worth
+   gating is: *a workspace whose `installed_sha` advanced, whose latest report
+   says `declared AND NOT swapped`, is claiming convergence its own box
+   contradicts.* That partial index already exists
+   (`workspace_plugin_install_reports_not_live`).
+
+   Until then, treat "converged" on this page as *the CP has no evidence of
+   staleness*, which is weaker than *the box runs the pinned commit*.
