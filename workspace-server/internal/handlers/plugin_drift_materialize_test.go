@@ -30,7 +30,11 @@ import (
 
 // stubDriftStaging points the stage/deliver seams at in-memory fakes.
 // deliveredByPush=false reproduces the docker-less tenant (errNoPushTarget).
-func stubDriftStaging(t *testing.T, newSHA string, deliveredByPush bool) {
+// pluginName is a parameter, not a constant: a stub that hardcodes it silently
+// re-pins the WRONG workspace_plugins row, so a chain test asserting
+// convergence fails for a reason that has nothing to do with the code. Caught
+// exactly that way by the convergence-chain gate.
+func stubDriftStaging(t *testing.T, pluginName, newSHA string, deliveredByPush bool) {
 	t.Helper()
 	origStage, origDeliver := driftStageFn, driftDeliverFn
 	driftStageFn = func(_ *PluginsHandler, _ context.Context, req installRequest) (*stageResult, error) {
@@ -40,7 +44,7 @@ func stubDriftStaging(t *testing.T, newSHA string, deliveredByPush bool) {
 		}
 		return &stageResult{
 			StagedDir:    t.TempDir(),
-			PluginName:   "reno-stars-coordinator",
+			PluginName:   pluginName,
 			Source:       src,
 			InstalledSHA: newSHA,
 		}, nil
@@ -90,7 +94,7 @@ func expectDriftApplyPreamble(mock sqlmock.Sqlmock, queueID, wsID, pluginName, s
 // expectation is itself the assertion that installed_sha was NOT advanced.
 func TestApplyQueuedDrift_DeferredRestart_DoesNotRePinSHA(t *testing.T) {
 	mock := setupTestDB(t)
-	stubDriftStaging(t, "newsha0000000000000000000000000000000000", false /* deliver by pull */)
+	stubDriftStaging(t, "reno-stars-coordinator", "newsha0000000000000000000000000000000000", false /* deliver by pull */)
 
 	const queueID, wsID = "q-concierge", "concierge-ws-uuid"
 	expectDriftApplyPreamble(mock, queueID, wsID, "reno-stars-coordinator",
@@ -144,7 +148,7 @@ func TestApplyQueuedDrift_DeferredRestart_DoesNotRePinSHA(t *testing.T) {
 func TestApplyQueuedDrift_RestartDispatched_RePinsSHA(t *testing.T) {
 	mock := setupTestDB(t)
 	const newSHA = "newsha0000000000000000000000000000000000"
-	stubDriftStaging(t, newSHA, false /* deliver by pull; restart carries it */)
+	stubDriftStaging(t, "reno-stars-coordinator", newSHA, false /* deliver by pull; restart carries it */)
 
 	const queueID, wsID = "q-tenant", "tenant-ws-uuid"
 	expectDriftApplyPreamble(mock, queueID, wsID, "reno-stars-coordinator",

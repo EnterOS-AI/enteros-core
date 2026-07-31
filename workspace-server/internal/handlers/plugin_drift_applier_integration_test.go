@@ -179,7 +179,7 @@ func TestIntegration_DriftApplier_OrdinaryWorkspaceConverges(t *testing.T) {
 	wsID := seedApplierWorkspace(t, conn, "workspace", "online")
 	queueID := seedDriftRow(t, conn, wsID, "reno-stars-coordinator", applierSource, applierOldSHA, applierNewSHA)
 
-	stubDriftStaging(t, applierNewSHA, false /* docker-less: deliver by pull */)
+	stubDriftStaging(t, "reno-stars-coordinator", applierNewSHA, false /* docker-less: deliver by pull */)
 	spy := &restartSpy{}
 	h := NewAdminPluginDriftHandler(NewPluginsHandler(t.TempDir(), nil, spy.fn))
 
@@ -219,7 +219,7 @@ func TestIntegration_DriftApplier_DeferredConciergeStaysVisible(t *testing.T) {
 	wsID := seedApplierWorkspace(t, conn, "platform", "online") // concierge
 	queueID := seedDriftRow(t, conn, wsID, "reno-stars-coordinator", applierSource, applierOldSHA, applierNewSHA)
 
-	stubDriftStaging(t, applierNewSHA, false /* docker-less: deliver by pull */)
+	stubDriftStaging(t, "reno-stars-coordinator", applierNewSHA, false /* docker-less: deliver by pull */)
 	spy := &restartSpy{}
 	h := NewAdminPluginDriftHandler(NewPluginsHandler(t.TempDir(), nil, spy.fn))
 
