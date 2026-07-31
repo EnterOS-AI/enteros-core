@@ -94,5 +94,25 @@ trigger_daemon_wait c 60 10 60 "";            check "missing probe -> usage erro
 wd=600; bs=$(TRIGGER_DAEMON_WATCHDOG_SECS=$wd trigger_daemon_backstop_secs)
 [ "$bs" -gt "$wd" ] || { echo "FAIL: backstop $bs not greater than watchdog $wd"; FAILED=1; }
 
+# --- grid-landing confirm bound (core routing, NOT daemon liveness) ----------
+# The grid write is already acked by core's 201 before the first probe, so this
+# bound exists only to absorb docker-exec observation latency. Its CEILING is the
+# load-bearing part: the poll is operator-tunable, so without a cap a raised poll
+# would silently restore the multi-minute soak this replaced.
+[ "$(schedule_grid_confirm_secs 10)" = "30" ] || { echo "FAIL: grid-confirm(10) != 30"; FAILED=1; }
+[ "$(schedule_grid_confirm_secs 20)" = "60" ] || { echo "FAIL: grid-confirm(20) != 60"; FAILED=1; }
+[ "$(schedule_grid_confirm_secs 1)"  = "30" ] || { echo "FAIL: grid-confirm floor not 30"; FAILED=1; }
+[ "$(schedule_grid_confirm_secs 600)" = "120" ] || { echo "FAIL: grid-confirm ceiling not 120"; FAILED=1; }
+[ "$(schedule_grid_confirm_secs abc)" = "30" ] || { echo "FAIL: grid-confirm non-numeric poll not defaulted"; FAILED=1; }
+[ "$(schedule_grid_confirm_secs)"     = "30" ] || { echo "FAIL: grid-confirm missing poll not defaulted"; FAILED=1; }
+
+# It must stay STRICTLY SHORTER than the fire backstop it replaced at the 10g
+# grid step — that inequality IS the fix. A refactor that lets the two converge
+# puts a 30-minute wait back on a deterministic routing contradiction.
+gc=$(schedule_grid_confirm_secs 10); fb=$(TRIGGER_DAEMON_WATCHDOG_SECS=600 trigger_daemon_backstop_secs)
+[ "$gc" -lt "$fb" ] || { echo "FAIL: grid-confirm $gc not shorter than fire backstop $fb"; FAILED=1; }
+gc=$(schedule_grid_confirm_secs 600)
+[ "$gc" -lt "$fb" ] || { echo "FAIL: grid-confirm $gc (max poll) not shorter than fire backstop $fb"; FAILED=1; }
+
 if [ "$FAILED" = "0" ]; then echo "trigger_daemon_wait unit: OK"; else echo "trigger_daemon_wait unit: FAILURES"; fi
 exit $FAILED

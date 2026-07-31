@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -112,5 +113,65 @@ func TestDesktopRoute_InputForwardsAndReturns204(t *testing.T) {
 	}
 	if len(gw.inputs) != 1 {
 		t.Fatalf("input not forwarded to gateway")
+	}
+}
+
+// A URL bar navigate must be REFUSED (503) when the desktop backend isn't wired.
+func TestDesktopNavigate_UnavailableWithoutGateway(t *testing.T) {
+	h := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws1"}}
+	c.Request = httptest.NewRequest("POST", "/x", bytes.NewBufferString(`{"url":"https://example.com","token":"t"}`))
+	h.DesktopNavigate(c)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("nil gateway -> want 503, got %d", w.Code)
+	}
+}
+
+// Security gate: a caller who does NOT hold display control cannot navigate the
+// browser — no active lock -> 403, and the gateway is never asked to navigate.
+// (A view-only spectator or a stale token lands here too.)
+func TestDesktopNavigate_RejectsWhenNoControlHeld(t *testing.T) {
+	mock := setupTestDB(t)
+	h := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	gw := &fakeDesktopGW{}
+	h.SetDesktopGateway(gw)
+	mock.ExpectQuery(`SELECT controller, controlled_by, expires_at FROM workspace_display_control_locks WHERE workspace_id = \$1 AND expires_at > now\(\)`).
+		WithArgs("ws1").
+		WillReturnError(sql.ErrNoRows)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws1"}}
+	c.Request = httptest.NewRequest("POST", "/x", bytes.NewBufferString(`{"url":"https://example.com","token":"whatever"}`))
+	h.DesktopNavigate(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("no control lock -> want 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(gw.navigatedTo) != 0 {
+		t.Fatalf("a rejected caller must NOT reach the gateway, got navigations %v", gw.navigatedTo)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// A malformed body is a 400 before any control lookup or navigation.
+func TestDesktopNavigate_BadBody(t *testing.T) {
+	h := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
+	gw := &fakeDesktopGW{}
+	h.SetDesktopGateway(gw)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "id", Value: "ws1"}}
+	c.Request = httptest.NewRequest("POST", "/x", bytes.NewBufferString(`not json`))
+	h.DesktopNavigate(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("bad body -> want 400, got %d", w.Code)
+	}
+	if len(gw.navigatedTo) != 0 {
+		t.Fatalf("bad body must not navigate, got %v", gw.navigatedTo)
 	}
 }
