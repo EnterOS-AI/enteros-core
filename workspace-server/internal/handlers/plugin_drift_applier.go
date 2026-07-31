@@ -67,6 +67,22 @@ var (
 	errDriftPluginRowMissing    = errors.New("workspace_plugins row not found — plugin may have been uninstalled")
 )
 
+
+// Stage/deliver seams, mirroring the `resolveSourceSHA` seam in
+// plugins_reconcile.go. Production points them at the real pipeline; tests
+// swap them so the apply STATE MACHINE (what gets persisted after a deferred
+// restart) is exercisable without a git fetch or a Docker daemon — the branch
+// that decides whether a box is reported converged is exactly the branch that
+// must not be left untested.
+var (
+	driftStageFn = func(h *PluginsHandler, ctx context.Context, req installRequest) (*stageResult, error) {
+		return h.ResolveAndStageForApply(ctx, req)
+	}
+	driftDeliverFn = func(h *PluginsHandler, ctx context.Context, workspaceID string, r *stageResult) error {
+		return h.DeliverForApply(ctx, workspaceID, r)
+	}
+)
+
 // driftApplyOutcome is the result of applying one queue entry.
 type driftApplyOutcome struct {
 	WorkspaceID string

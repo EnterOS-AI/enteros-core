@@ -28,12 +28,19 @@ import (
 )
 
 // expectPendingSelect wires the drainer's SELECT and returns the given ids.
+//
+// WithArgs(driftApplyMaxPerTick) is load-bearing, not decoration: asserting the
+// CONSTANT's value elsewhere proves only that a number exists, not that the
+// drain actually passes it as the LIMIT. Verified by mutation — swapping the
+// call site to a hardcoded 100000 left every other test green until this
+// argument assertion was added.
 func expectPendingSelect(mock sqlmock.Sqlmock, ids ...string) {
 	rows := sqlmock.NewRows([]string{"id"})
 	for _, id := range ids {
 		rows = rows.AddRow(id)
 	}
 	mock.ExpectQuery(`SELECT id\s+FROM plugin_update_queue\s+WHERE status = 'pending'\s+ORDER BY created_at ASC\s+LIMIT`).
+		WithArgs(driftApplyMaxPerTick).
 		WillReturnRows(rows)
 }
 

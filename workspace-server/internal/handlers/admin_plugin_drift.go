@@ -244,7 +244,7 @@ func (h *AdminPluginDriftHandler) applyQueuedDrift(ctx context.Context, queueID 
 
 	// Re-stage through the full install pipeline. source_raw already encodes
 	// the pinned ref, so the resolver fetches the current commit at that ref.
-	result, instErr := h.pluginsHandler.ResolveAndStageForApply(ctx, installRequest{
+	result, instErr := driftStageFn(h.pluginsHandler, ctx, installRequest{
 		Source: sourceRaw,
 		Track:  entry.TrackedRef,
 	})
@@ -260,7 +260,7 @@ func (h *AdminPluginDriftHandler) applyQueuedDrift(ctx context.Context, queueID 
 	// pull" — no bytes are copied and the RESTART below is what makes the boot
 	// installer fetch the new commit.
 	deliveredByPush := true
-	if err := h.pluginsHandler.DeliverForApply(ctx, entry.WorkspaceID, result); err != nil {
+	if err := driftDeliverFn(h.pluginsHandler, ctx, entry.WorkspaceID, result); err != nil {
 		if errors.Is(err, errNoPushTarget) {
 			deliveredByPush = false
 			log.Printf("AdminPluginDrift: apply: docker-less workspace %s/%s — deliver by pull on restart",
