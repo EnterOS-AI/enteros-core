@@ -156,6 +156,24 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 			platformID, lastStatus, lastPresent, lastTools, requiredTool)
 	}
 
+	// core#5026 — the concierge reached online, so its boot-install report MUST be
+	// in the control plane by now. The runtime sends it before heartbeat.start()
+	// and online is unreachable without a heartbeat, so an absent report is not a
+	// race: it is a send that FAILED. On runtime 0.4.72 it failed on every boot,
+	// because the report went out as boot step 1 — before /registry/register minted
+	// the workspace bearer this route requires — and 401'd. Nothing noticed,
+	// because no gate had ever asked whether a report came out the other end, which
+	// is why the 0.4.72 promote was green. This is a FRESH org, so presence alone
+	// is exact here (no earlier boot could have left a row behind); the FRESHNESS
+	// half is asserted across the restart in TestWorkspaceLifecycle_Staging.
+	//
+	// Deliberately NOT behind an opt-in env flag. The fleet read
+	// (/admin/plugin-install-reports) and the molecule_plugin_install_degraded_
+	// workspaces gauge are both computed from this row, so a candidate that cannot
+	// write it ships an observability surface that reports a fleet nobody measured
+	// — exactly what a hard gate is for. A flag would make this a phantom gate.
+	assertBootInstallReportLanded(t, host, token, orgID, platformID, "platform agent (concierge)")
+
 	// The CALLABLE proof (Guard B core): drive a REAL A2A tool-use turn asking the
 	// concierge to actually RUN provision_workspace, and assert the deterministic
 	// side effect — a genuine kind='workspace' row with the requested name appears.
