@@ -1652,6 +1652,15 @@ func (s *stubFailingCPProv) StopAndPrune(_ context.Context, _ string) error {
 	panic("stubFailingCPProv.StopAndPrune not expected on the provisionWorkspaceCP failure path")
 }
 
+// EnsureImage satisfies the core#5019 pull-before-stop seam. These stubs
+// predate it; answering "ready" keeps their pre-#5019 behaviour EXACTLY
+// (the guard allows, the restart proceeds) so this stub carries no opinion
+// about the new branch. Tests that exercise the DECLINE path use
+// prewarmCPProv in workspace_restart_pull_before_stop_test.go.
+func (s *stubFailingCPProv) EnsureImage(_ context.Context, _ provisioner.EnsureImageRequest) (provisioner.EnsureImageResult, error) {
+	return provisioner.EnsureImageResult{Status: "ready"}, nil
+}
+
 func (s *stubFailingCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	panic("stubFailingCPProv.GetConsoleOutput not expected on the provisionWorkspaceCP failure path")
 }
@@ -2049,6 +2058,16 @@ func (s *stubInstanceIDPersistFailCPProv) Stop(_ context.Context, _ string) erro
 	return nil
 }
 func (s *stubInstanceIDPersistFailCPProv) StopAndPrune(_ context.Context, _ string) error { return nil }
+
+// EnsureImage satisfies the core#5019 pull-before-stop seam. These stubs
+// predate it; answering "ready" keeps their pre-#5019 behaviour EXACTLY
+// (the guard allows, the restart proceeds) so this stub carries no opinion
+// about the new branch. Tests that exercise the DECLINE path use
+// prewarmCPProv in workspace_restart_pull_before_stop_test.go.
+func (s *stubInstanceIDPersistFailCPProv) EnsureImage(_ context.Context, _ provisioner.EnsureImageRequest) (provisioner.EnsureImageResult, error) {
+	return provisioner.EnsureImageResult{Status: "ready"}, nil
+}
+
 func (s *stubInstanceIDPersistFailCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	return "", nil
 }

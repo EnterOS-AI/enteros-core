@@ -973,12 +973,23 @@ func coalesceRestart(workspaceID string, cycle func()) {
 // Docker path, so on SaaS (h.provisioner=nil) the auto-restart cycle silently
 // NPE'd before reaching the reprovision step — which is why every SaaS dead-
 // agent incident pre-this-fix required manual restart from canvas.
-func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID string) {
+func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID, runtime, template string) bool {
 	backend := "none"
 	if h.provisioner != nil {
 		backend = "docker"
 	} else if h.cpProv != nil {
 		backend = "cp"
+	}
+	// core#5019 (structural half): PULL BEFORE STOPPING. Ask the control plane
+	// to make the pinned image obtainable BEFORE destroying the container. A
+	// refusal means we keep what the user still has — a running workspace —
+	// rather than trading it for an image that may never arrive.
+	//
+	// Placed above the pre_stop emit on purpose: a declined restart must not
+	// leave a restart.pre_stop marker in the wire log for a stop that never
+	// happened. Ops read that sequence to reconstruct incidents.
+	if !h.ensurePinnedImageBeforeStop(ctx, workspaceID, runtime, template) {
+		return false
 	}
 	provlog.Event("restart.pre_stop", map[string]any{
 		"workspace_id": workspaceID,
@@ -996,6 +1007,70 @@ func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID strin
 	// is the earliest point where the backend Stop has been issued and the
 	// cache is guaranteed stale.
 	db.ClearWorkspaceKeys(ctx, workspaceID)
+	return true
+}
+
+// ensurePinnedImageBeforeStop reports whether it is safe to destroy this
+// workspace's container — core#5019's structural fix.
+//
+// A "restart" is a full RE-PROVISION: the control plane reads runtime_image_pins
+// at provision time, so adopting a newly promoted pin means obtaining that image
+// (~7GB). Pre-fix the tenant stopped first and discovered the image was missing
+// second, which is why an unobtainable image cost the workspace its container
+// for ~10 minutes. #5020 widened the provision budget so a cold pull usually
+// FINISHES; it does nothing for a pull that cannot succeed at all — a bad
+// digest, a registry outage, a full disk. This is that half.
+//
+// Decision table, and which way each branch fails:
+//
+//	no CP provisioner              -> ALLOW  (self-host/Docker: the local
+//	                                  provisioner owns its own image, there is
+//	                                  no CP seam to ask and nothing to guard)
+//	CP confirms                    -> ALLOW
+//	CP has no such endpoint (404)  -> ALLOW  (deliberate fail-OPEN, see below)
+//	anything else                  -> DECLINE (fail-CLOSED)
+//
+// The 404 branch is the single deliberate fail-open. During a rollout a tenant
+// can run ahead of its control plane; failing closed there would wedge EVERY
+// restart on the fleet, which is a much larger outage than the one being fixed.
+// It is also self-limiting: the moment CP ships the endpoint the branch stops
+// being reachable. Every other outcome fails closed.
+//
+// Not a substitute for the CP-side pre-warm on promote — it is the backstop for
+// when that has not happened. The two are complementary: pre-warm makes the
+// common path fast, this makes the uncommon path non-destructive.
+func (h *WorkspaceHandler) ensurePinnedImageBeforeStop(ctx context.Context, workspaceID, runtime, template string) bool {
+	if h.cpProv == nil {
+		return true
+	}
+	res, err := h.cpProv.EnsureImage(ctx, provisioner.EnsureImageRequest{
+		WorkspaceID: workspaceID,
+		Runtime:     runtime,
+		Template:    template,
+	})
+	if err == nil {
+		log.Printf("Restart: %s pinned image ready before stop (runtime=%q template=%q status=%q ref=%q) — core#5019 pull-before-stop",
+			workspaceID, runtime, template, res.Status, res.ImageRef)
+		return true
+	}
+	if errors.Is(err, provisioner.ErrEnsureImageUnsupported) {
+		log.Printf("Restart: %s control plane has no ensure-image endpoint — proceeding with the pre-core#5019 stop-then-provision ordering (runtime=%q). Upgrade the control plane to close the cold-adoption window.",
+			workspaceID, runtime)
+		return true
+	}
+	// LOUD: this is the branch that DECLINES a restart the caller asked for.
+	// Stable prefix so ops can grep it, and so it is distinguishable from an
+	// ordinary provision failure — nothing was broken here, something was
+	// PREVENTED from breaking.
+	log.Printf("IMAGE-PREWARM-DECLINED restart workspace_id=%s runtime=%q template=%q err=%q — the workspace was NOT stopped; it keeps its running container (core#5019)",
+		workspaceID, runtime, template, err.Error())
+	provlog.Event("restart.image_prewarm_declined", map[string]any{
+		"workspace_id": workspaceID,
+		"runtime":      runtime,
+		"template":     template,
+		"error":        err.Error(),
+	})
+	return false
 }
 
 // cpStopRetryAttempts caps total Stop attempts (initial + retries). 3 catches
@@ -1223,7 +1298,18 @@ func (h *WorkspaceHandler) runRestartCycle(workspaceID string) {
 	// behaviour.
 	h.gracefulPreRestart(ctx, workspaceID)
 
-	h.stopForRestart(ctx, workspaceID)
+	// core#5019: stopForRestart DECLINES when the pinned image cannot be made
+	// obtainable. Return without touching status — the container is still
+	// running and still heartbeating, so the workspace stays exactly as the
+	// user left it. Deliberately NOT markProvisionFailed: nothing failed, a
+	// destructive step was refused. The next restart (operator, plugin
+	// reconcile, or the reactive health path) retries, and by then the image
+	// has usually landed.
+	if !h.stopForRestart(ctx, workspaceID, dbRuntime, dbTemplate) {
+		log.Printf("Auto-restart: %s (%s) DECLINED — pinned image for runtime=%q template=%q could not be made available; the running container was left untouched (core#5019)",
+			wsName, workspaceID, dbRuntime, dbTemplate)
+		return
+	}
 
 	if _, err := db.DB.ExecContext(ctx,
 		// Clear mcp_unloaded_since — fresh warming clock for the new provisioning
