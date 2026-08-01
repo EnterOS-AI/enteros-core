@@ -52,6 +52,8 @@ func TestPluginInstallReport_StructTagsMatchTheContract(t *testing.T) {
 		"Skipped":    molcontracts.PluginInstallReportFieldSkipped,
 		"Failed":     molcontracts.PluginInstallReportFieldFailed,
 		"Swapped":    molcontracts.PluginInstallReportFieldSwapped,
+		// core#5007 — the box's own answer: declared source -> installed commit.
+		"InstalledRefs": molcontracts.PluginInstallReportFieldInstalledRefs,
 	}
 	rt := reflect.TypeOf(pluginInstallReportBody{})
 	if rt.NumField() != len(want) {
