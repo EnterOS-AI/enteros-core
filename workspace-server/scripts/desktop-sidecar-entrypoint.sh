@@ -30,7 +30,13 @@ rm -f "/tmp/.X${_dpynum}-lock" "/tmp/.X11-unix/X${_dpynum}" 2>/dev/null || true
 # ── Coordinate contract (§3): ONE resolution, pinned in the X screen, the
 # control server (DESKTOP_WIDTH/HEIGHT), and capture. DPI 96, no HiDPI, no
 # scaling anywhere — a mis-scaled click is impossible by construction.
-Xvfb "$DISPLAY" -screen 0 "${DESKTOP_WIDTH}x${DESKTOP_HEIGHT}x24" -dpi 96 -nolisten tcp &
+# `-s off` DISABLES the X screensaver at server creation. This matters now that
+# v3 runs a full XFCE session (unlike the old kiosk): after an idle timeout the
+# X server would BLANK the framebuffer, and the agent's direct framebuffer grab
+# would then return an all-black screenshot ("dead desktop" that is actually
+# fine). A runtime `xset s off` is a NO-OP on Xvfb (verified) — the flag at
+# server-creation is the only thing that sticks; Xvfb has no DPMS extension.
+Xvfb "$DISPLAY" -screen 0 "${DESKTOP_WIDTH}x${DESKTOP_HEIGHT}x24" -dpi 96 -nolisten tcp -s off &
 for _ in $(seq 1 50); do
 	xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
 	sleep 0.1
@@ -50,17 +56,24 @@ websockify --heartbeat=25 --web=/usr/share/novnc 6080 localhost:5900 &
 # internet is DESKTOP_PROXY. So apt (self-install) AND the browser MUST be
 # pointed at it, or they have no network at all. The proxy denies private/
 # link-local/loopback, so isolation is unchanged. Written with sudo (the desktop
-# user has passwordless sudo, §25.3); best-effort so a dev run with no proxy
-# still boots.
+# user has passwordless sudo, §25.3).
+#
+# FAIL-LOUD (not best-effort): when DESKTOP_PROXY is set the desktop has NO other
+# route out, so a FAILED proxy-config write means zero connectivity. Under this
+# file's `set -euo pipefail`, a failing `sudo tee`/`mkdir` now ABORTS boot — the
+# container exits non-zero, DesktopRunning() reports it down, and the platform
+# surfaces a dead sidecar instead of a mysteriously-offline "no internet" desktop
+# (which is far harder to diagnose). The `[ -n "$DESKTOP_PROXY" ]` gate — NOT
+# error-swallowing — is what keeps a dev/no-proxy run booting.
 if [ -n "${DESKTOP_PROXY:-}" ]; then
 	export http_proxy="${DESKTOP_PROXY}" https_proxy="${DESKTOP_PROXY}" no_proxy="localhost,127.0.0.1"
 	printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "${DESKTOP_PROXY}" "${DESKTOP_PROXY}" \
-		| sudo tee /etc/apt/apt.conf.d/01proxy >/dev/null 2>&1 || true
+		| sudo tee /etc/apt/apt.conf.d/01proxy >/dev/null
 	# Chromium reads its proxy from a managed policy, not http_proxy — pin the
 	# same proxy (host:port form) so the browser's egress is proxied too.
-	sudo mkdir -p /etc/chromium/policies/managed 2>/dev/null || true
+	sudo mkdir -p /etc/chromium/policies/managed
 	printf '{"ProxyMode":"fixed_servers","ProxyServer":"%s"}\n' "${DESKTOP_PROXY#http://}" \
-		| sudo tee /etc/chromium/policies/managed/proxy.json >/dev/null 2>&1 || true
+		| sudo tee /etc/chromium/policies/managed/proxy.json >/dev/null
 fi
 
 # ── Stale Chromium singleton cleanup (§25 / #4989). The profile is PERSISTENT
