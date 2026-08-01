@@ -68,6 +68,12 @@ type CPProvisioner struct {
 	adminToken    string // X-Molecule-Admin-Token — per-tenant identity (controlplane #118/#130)
 	cpAdminAPIKey string // Authorization: Bearer — gates /cp/admin/* (read-only ops routes; distinct secret from sharedSecret)
 	httpClient    *http.Client
+	// provisionHTTPClient carries ONLY the provision POST. core#5019: a
+	// workspace adopting a newly promoted template pin is stopped before the
+	// CP is asked to provision it, and the CP cannot answer until it holds the
+	// pinned image (~7GB). Sharing the 120s budget meant a cold pull blew the
+	// deadline and left the workspace with no container at all.
+	provisionHTTPClient *http.Client
 	// hostStateDir is the base dir for the host-side /configs mirror the Files
 	// API serves from when there is no docker.sock into the runtime container
 	// (#206 molecules-server). Empty disables the mirror (config still delivers
@@ -145,12 +151,13 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 	}
 
 	return &CPProvisioner{
-		baseURL:       baseURL,
-		orgID:         orgID,
-		sharedSecret:  sharedSecret,
-		adminToken:    adminToken,
-		cpAdminAPIKey: cpAdminAPIKey,
-		httpClient:    &http.Client{Timeout: 120 * time.Second},
+		baseURL:             baseURL,
+		orgID:               orgID,
+		sharedSecret:        sharedSecret,
+		adminToken:          adminToken,
+		cpAdminAPIKey:       cpAdminAPIKey,
+		httpClient:          &http.Client{Timeout: cpAPITimeout},
+		provisionHTTPClient: &http.Client{Timeout: cpProvisionTimeout},
 	}, nil
 }
 
@@ -162,6 +169,18 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 // deployments without a real CP still work (those don't hit a CP that
 // enforces either gate). In prod both are set by the controlplane
 // bootstrap, so both headers land on every outbound call.
+// cpAPITimeout bounds the small JSON calls to the CP (status, stop, console).
+// They are request/response only and must not hang a caller.
+const cpAPITimeout = 120 * time.Second
+
+// cpProvisionTimeout bounds the provision POST. The CP may have to pull a
+// multi-GB workspace image before it can answer -- guaranteed right after a
+// template promote, when no host has the new digest yet. Measured: a cold
+// 7.05GB pull, then the identical call returned in 13s once the image was
+// local. This is deliberately generous; the failure it prevents is not a slow
+// restart but a workspace left down (core#5019).
+const cpProvisionTimeout = 20 * time.Minute
+
 func (p *CPProvisioner) provisionAuthHeaders(req *http.Request) {
 	if p.sharedSecret != "" {
 		req.Header.Set("Authorization", "Bearer "+p.sharedSecret)
@@ -398,7 +417,12 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 	httpReq.Header.Set("Content-Type", "application/json")
 	p.provisionAuthHeaders(httpReq)
 
-	resp, err := p.httpClient.Do(httpReq)
+	// Provisioning gets its own budget -- see cpProvisionTimeout.
+	provisionClient := p.provisionHTTPClient
+	if provisionClient == nil {
+		provisionClient = p.httpClient
+	}
+	resp, err := provisionClient.Do(httpReq)
 	if err != nil {
 		return "", fmt.Errorf("cp provisioner: send: %w", err)
 	}
