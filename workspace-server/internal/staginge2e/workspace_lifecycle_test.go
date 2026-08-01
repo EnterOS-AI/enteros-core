@@ -86,6 +86,13 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 	// Baseline: the freshly-online workspace must actually serve A2A.
 	assertServes(t, tenantHost, token, orgID, wsID, "baseline (post-boot)")
 
+	// core#5026 baseline: the first boot must have produced a boot-install report.
+	// This is also the `before` snapshot the restart subtest advances from — the
+	// restart rule needs a server-clock baseline, and this is the only place that
+	// can honestly claim one (the workspace was created seconds ago by this run).
+	installReportBeforeRestart := assertBootInstallReportLanded(
+		t, tenantHost, token, orgID, wsID, "workspace (initial boot)")
+
 	// ── soft restart ────────────────────────────────────────────────────────
 	// online → provisioning → online; container must come back serveable.
 	t.Run("restart", func(t *testing.T) {
@@ -107,7 +114,28 @@ func TestWorkspaceLifecycle_Staging(t *testing.T) {
 		// Post-restart liveness/serve probe — proves the container is actually
 		// back, not just that the status row says online.
 		assertServes(t, tenantHost, token, orgID, wsID, "post-restart")
-		t.Logf("restart VERIFIED: online → provisioning → online + serveable")
+
+		// core#5026 — THE assertion this issue is about. issueAndInjectToken
+		// revokes the workspace's live instance tokens BEFORE minting the
+		// replacement, so the credential the previous boot held is dead the moment
+		// this restart begins. A runtime that posts its boot-install report before
+		// /registry/register (runtime 0.4.72 posted it as boot step 1 of 8) is
+		// therefore 401'd by construction on every restart, swallows it fail-soft,
+		// and leaves the stored row describing a boot that no longer exists.
+		// Measured on prod: the row read 2026-07-31T19:04 through many later boots,
+		// so /admin/plugin-install-reports and the
+		// molecule_plugin_install_degraded_workspaces gauge could neither clear
+		// when the box recovered nor fire when it broke.
+		//
+		// Presence alone cannot see that — the row IS there. Only ADVANCEMENT can,
+		// and only a restart produces it, which is why the assertion lives in this
+		// subtest and not next to the initial boot. Both timestamps come from the
+		// same tenant database through the same endpoint, so the comparison is
+		// immune to runner clock skew.
+		assertBootInstallReportAdvanced(t, tenantHost, token, orgID, wsID,
+			"workspace (across restart)", installReportBeforeRestart)
+
+		t.Logf("restart VERIFIED: online → provisioning → online + serveable + boot-install report re-sent")
 	})
 
 	// ── pause → resume ──────────────────────────────────────────────────────
