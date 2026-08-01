@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
 	dockerimage "github.com/docker/docker/api/types/image"
@@ -22,8 +23,14 @@ type sidecarCreateCall struct {
 	net  *network.NetworkingConfig
 }
 
+type sidecarUpdateCall struct {
+	name string
+	cfg  container.UpdateConfig
+}
+
 type fakeSidecarDocker struct {
 	creates []sidecarCreateCall
+	updates []sidecarUpdateCall
 	starts  []string
 	stops   []string
 	removes []struct {
@@ -41,11 +48,28 @@ type fakeSidecarDocker struct {
 	exists        map[string]bool  // §25.1: a container can EXIST while stopped (running=false)
 	stopErrs      map[string]error // name -> error ContainerStop returns (fault injection)
 	imageMissing  bool             // when true, ImageInspect reports not-found so ensureImage must pull
+	imageID       string           // ID ImageInspect returns as the DESIRED image (image-drift test); "" = default
 	imagePulls    []string         // refs passed to ImagePull
+	// Drift simulation (§25.1 desktopDriftReason): baked env + image ID per
+	// container, surfaced by ContainerInspect. Empty defaults → no drift.
+	configEnv      map[string][]string
+	containerImage map[string]string
+	// Self-heal simulation (§25.1 startedCrashed): a start that leaves the
+	// container immediately EXITED (crashOnStart) or OOM-killed (oomOnStart);
+	// consumed on the first start so the self-heal recreate boots healthy.
+	crashOnStart map[string]bool
+	oomOnStart   map[string]bool
+	crashed      map[string]bool // container currently in exited/crashed state
+	oomed        map[string]bool // exited due to OOM (must NOT self-heal)
 }
 
 func newFakeSidecarDocker() *fakeSidecarDocker {
-	return &fakeSidecarDocker{running: map[string]bool{}, exists: map[string]bool{}, netsInternal: map[string]bool{}}
+	return &fakeSidecarDocker{
+		running: map[string]bool{}, exists: map[string]bool{}, netsInternal: map[string]bool{},
+		configEnv: map[string][]string{}, containerImage: map[string]string{},
+		crashOnStart: map[string]bool{}, oomOnStart: map[string]bool{},
+		crashed: map[string]bool{}, oomed: map[string]bool{},
+	}
 }
 
 // createByName returns the recorded ContainerCreate for name, or nil.
@@ -77,17 +101,44 @@ func (f *fakeSidecarDocker) ContainerCreate(_ context.Context, cfg *container.Co
 func (f *fakeSidecarDocker) ContainerInspect(_ context.Context, name string) (container.InspectResponse, error) {
 	// §25.1: a container EXISTS whenever it is running OR was created/started and
 	// not yet removed (a stopped-but-persisted desktop). Running reflects only the
-	// live state.
-	if f.running[name] || f.exists[name] {
-		return container.InspectResponse{ContainerJSONBase: &container.ContainerJSONBase{Name: name, State: &container.State{Running: f.running[name]}}}, nil
+	// live state; a crashed container reports an exited/OOM state for startedCrashed.
+	if !f.running[name] && !f.exists[name] {
+		return container.InspectResponse{}, errors.New("No such container: " + name)
 	}
-	return container.InspectResponse{}, errors.New("No such container: " + name)
+	st := &container.State{Running: f.running[name]}
+	if f.crashed[name] {
+		st.Status = container.StateExited
+		st.ExitCode = 1
+		st.OOMKilled = f.oomed[name]
+	}
+	base := &container.ContainerJSONBase{Name: name, State: st}
+	if img, ok := f.containerImage[name]; ok {
+		base.Image = img
+	}
+	return container.InspectResponse{ContainerJSONBase: base, Config: &container.Config{Env: f.configEnv[name]}}, nil
 }
 func (f *fakeSidecarDocker) ContainerStart(_ context.Context, name string, _ container.StartOptions) error {
 	f.starts = append(f.starts, name)
-	f.running[name] = true
 	f.exists[name] = true
+	// Simulate an immediate crash-on-start (consumed once) so the self-heal path
+	// recreates and the SECOND start boots healthy. ContainerStart itself returns
+	// nil (as the real daemon does) even when the container exits right after.
+	if f.crashOnStart[name] || f.oomOnStart[name] {
+		f.oomed[name] = f.oomOnStart[name]
+		delete(f.crashOnStart, name)
+		delete(f.oomOnStart, name)
+		f.crashed[name] = true
+		f.running[name] = false
+		return nil
+	}
+	delete(f.crashed, name)
+	delete(f.oomed, name)
+	f.running[name] = true
 	return nil
+}
+func (f *fakeSidecarDocker) ContainerUpdate(_ context.Context, name string, cfg container.UpdateConfig) (container.UpdateResponse, error) {
+	f.updates = append(f.updates, sidecarUpdateCall{name: name, cfg: cfg})
+	return container.UpdateResponse{}, nil
 }
 func (f *fakeSidecarDocker) ContainerStop(_ context.Context, name string, _ container.StopOptions) error {
 	if err := f.stopErrs[name]; err != nil {
@@ -107,13 +158,17 @@ func (f *fakeSidecarDocker) ContainerRemove(_ context.Context, name string, opts
 	}{name, opts.Force})
 	delete(f.running, name)
 	delete(f.exists, name)
+	delete(f.crashed, name)
+	delete(f.oomed, name)
+	delete(f.configEnv, name)
+	delete(f.containerImage, name)
 	return nil
 }
 func (f *fakeSidecarDocker) ImageInspect(_ context.Context, _ string, _ ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
 	if f.imageMissing {
 		return dockerimage.InspectResponse{}, errors.New("Error: No such image")
 	}
-	return dockerimage.InspectResponse{}, nil
+	return dockerimage.InspectResponse{ID: f.imageID}, nil
 }
 func (f *fakeSidecarDocker) ImagePull(_ context.Context, ref string, _ dockerimage.PullOptions) (io.ReadCloser, error) {
 	f.imagePulls = append(f.imagePulls, ref)
@@ -147,6 +202,16 @@ func (f *fakeSidecarDocker) NetworkDisconnect(_ context.Context, net, container 
 }
 
 const sidecarTestWS = "abc12345-6789-4def-8123-56789abcdef0"
+
+// fastProbe shrinks the post-start self-heal probe window so restart-path tests
+// (a healthy fake stays Running, so startedCrashed polls to the deadline) don't
+// each pay the ~1.5s production window. Same-package access to the unexported
+// fields. Returns p for chaining.
+func fastProbe(p *LocalSidecarProvisioner) *LocalSidecarProvisioner {
+	p.startupProbeWindow = 30 * time.Millisecond
+	p.startupProbeTick = 5 * time.Millisecond
+	return p
+}
 
 func TestLocalSidecar_StartDesktop_CreatesLabeledIsolatedSidecar(t *testing.T) {
 	f := newFakeSidecarDocker()
@@ -468,12 +533,13 @@ func TestLocalSidecar_StopDesktop_LeavesProxyAndNetworkWhenSidecarStopFails(t *t
 	}
 }
 
-// On a SUCCESSFUL stop the STATELESS egress proxy is torn down (recreated on the
-// next start) and the platform is detached from the per-workspace network — but
-// the network itself is KEPT (§25.1): the stopped sidecar still holds an endpoint
-// on it (NetworkRemove would fail), and StartDesktop reuses it on wake. Only
-// WipeProfile tears the network down.
-func TestLocalSidecar_StopDesktop_TearsDownProxyButKeepsNetworkOnSuccess(t *testing.T) {
+// On a SUCCESSFUL stop the STATELESS egress proxy is torn down AND the
+// per-workspace network is removed (§25.1 proper lifecycle — net lifetime ==
+// desktop-RUNNING lifetime, so no idle net accumulates per ever-used workspace).
+// Teardown order: proxy removed → stopped sidecar disconnected → platform
+// disconnected → NetworkRemove the now-empty net. The persistent CONTAINER itself
+// is kept (only WipeProfile removes it).
+func TestLocalSidecar_StopDesktop_TearsDownProxyAndNetworkOnSuccess(t *testing.T) {
 	f := newFakeSidecarDocker()
 	name := DesktopContainerName(sidecarTestWS)
 	proxyName := DesktopProxyContainerName(sidecarTestWS)
@@ -493,15 +559,19 @@ func TestLocalSidecar_StopDesktop_TearsDownProxyButKeepsNetworkOnSuccess(t *test
 	if _, found := f.removeForce(proxyName); !found {
 		t.Fatalf("egress proxy must be removed after a successful sidecar stop: removes=%v", f.removes)
 	}
+	// The stopped sidecar's OWN endpoint must be disconnected so the net can be
+	// emptied (this is what the old code missed → the leak).
+	if !contains(f.netsDisconn, wantNet+"|"+name) {
+		t.Fatalf("stopped sidecar must be disconnected from the per-workspace network: %v", f.netsDisconn)
+	}
 	if !contains(f.netsDisconn, wantNet+"|platform-xyz") {
 		t.Fatalf("platform must be disconnected from the per-workspace network: %v", f.netsDisconn)
 	}
-	// The per-workspace network MUST be kept (persistent stopped sidecar holds an
-	// endpoint on it; StartDesktop reuses it).
-	if contains(f.netsRemoved, wantNet) {
-		t.Fatalf("per-workspace network must be KEPT after a stop (§25.1), not removed: %v", f.netsRemoved)
+	// The per-workspace network MUST be removed (proper lifecycle — no leak).
+	if !contains(f.netsRemoved, wantNet) {
+		t.Fatalf("per-workspace network must be REMOVED after a successful stop (§25.1 proper lifecycle): %v", f.netsRemoved)
 	}
-	// And the persistent sidecar container itself is not removed.
+	// But the persistent sidecar container itself is NOT removed.
 	if _, found := f.removeForce(name); found {
 		t.Fatalf("StopDesktop must KEEP the persistent sidecar container (§25.1): removes=%v", f.removes)
 	}
@@ -556,7 +626,7 @@ func TestLocalSidecar_StartDesktop_RestartsPersistedContainer(t *testing.T) {
 	// Simulate a container that EXISTS but is STOPPED (scaled to zero earlier).
 	f.exists[name] = true // running stays false
 
-	p := NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 0, "unconfined")
+	p := fastProbe(NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 0, "unconfined"))
 	p.SetSelfContainerID("platform-xyz")
 
 	h, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS})
@@ -575,8 +645,180 @@ func TestLocalSidecar_StartDesktop_RestartsPersistedContainer(t *testing.T) {
 	if len(f.volCreates) != 0 {
 		t.Fatalf("StartDesktop restart must not re-create the profile volume: %v", f.volCreates)
 	}
+	// §25.1 net re-attach: StopDesktop removed the net, so the restart MUST
+	// re-attach the freshly-created net to the persisted container (with its alias)
+	// so it comes up ON the internal net, never on bridge.
+	wantNet := prefix + "-" + sidecarTestWS
+	if !contains(f.netsConnected, wantNet+"|"+name) {
+		t.Fatalf("restart must re-attach the persisted sidecar to the per-workspace net: netsConnected=%v", f.netsConnected)
+	}
 	if !h.Running || !h.ScaledUp {
 		t.Fatalf("restart handle: got Running=%v ScaledUp=%v, want both true", h.Running, h.ScaledUp)
+	}
+}
+
+// §25.1 MEMORY RECONCILE: a raised memory ceiling reaches an EXISTING desktop via
+// ContainerUpdate on the wake (before start) — recreating would defeat
+// persistence. A first-ever create bakes the limit at create and must NOT update.
+func TestLocalSidecar_StartDesktop_ReconcilesMemoryOnRestart(t *testing.T) {
+	f := newFakeSidecarDocker()
+	const prefix = "wsnet"
+	name := DesktopContainerName(sidecarTestWS)
+	f.exists[name] = true // persisted, stopped
+	const newLimit = int64(4 << 30)
+	p := fastProbe(NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, newLimit, "unconfined"))
+
+	if _, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS}); err != nil {
+		t.Fatalf("StartDesktop: %v", err)
+	}
+	if len(f.updates) != 1 || f.updates[0].name != name {
+		t.Fatalf("restart must issue exactly one ContainerUpdate for the sidecar: %+v", f.updates)
+	}
+	if f.updates[0].cfg.Memory != newLimit || f.updates[0].cfg.MemorySwap != newLimit {
+		t.Fatalf("ContainerUpdate must set Memory==MemorySwap==%d, got %+v", newLimit, f.updates[0].cfg.Resources)
+	}
+	// The update must precede the start (cgroup created at the ceiling from t=0).
+	if len(f.starts) == 0 || len(f.updates) == 0 {
+		t.Fatalf("expected both an update and a start")
+	}
+}
+
+func TestLocalSidecar_StartDesktop_FirstCreateDoesNotUpdateMemory(t *testing.T) {
+	f := newFakeSidecarDocker() // nothing exists → first-ever create
+	p := fastProbe(NewLocalSidecarProvisioner(f, "desk:img", "wsnet", 6070, 0, 4<<30, "unconfined"))
+	if _, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS}); err != nil {
+		t.Fatalf("StartDesktop: %v", err)
+	}
+	if len(f.updates) != 0 {
+		t.Fatalf("first-ever create bakes the memory limit at create; must NOT ContainerUpdate: %+v", f.updates)
+	}
+}
+
+// §25.1 DRIFT RECONCILE: a control-token rotation (the derived token no longer
+// matches the baked one) forces a recreate — a plain restart would leave the
+// sidecar authing against the stale token and 401 the agent forever.
+func TestLocalSidecar_StartDesktop_RecreatesOnControlTokenDrift(t *testing.T) {
+	f := newFakeSidecarDocker()
+	const prefix = "wsnet"
+	name := DesktopContainerName(sidecarTestWS)
+	f.exists[name] = true
+	f.configEnv[name] = []string{"DESKTOP_CONTROL_TOKEN=STALE-TOKEN", "DESKTOP_WIDTH=1280"}
+	p := fastProbe(NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 0, "unconfined"))
+	p.SetControlTokenSecret("rotated-secret") // derives a token != STALE-TOKEN
+
+	if _, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS}); err != nil {
+		t.Fatalf("StartDesktop: %v", err)
+	}
+	if force, found := f.removeForce(name); !found || !force {
+		t.Fatalf("token drift must force-remove the stale container: removes=%v", f.removes)
+	}
+	c := f.createByName(name)
+	if c == nil {
+		t.Fatalf("token drift must recreate the container: creates=%v", f.creates)
+	}
+	wantTok := "DESKTOP_CONTROL_TOKEN=" + DeriveDesktopControlToken("rotated-secret", sidecarTestWS)
+	if !contains(c.cfg.Env, wantTok) {
+		t.Fatalf("recreated container must bake the NEW token %q: env=%v", wantTok, c.cfg.Env)
+	}
+}
+
+// §25.1 DRIFT RECONCILE: an image upgrade (the desired tag now resolves to a
+// different ID than the container's baked image) forces a recreate so the fix
+// actually boots.
+func TestLocalSidecar_StartDesktop_RecreatesOnImageDrift(t *testing.T) {
+	f := newFakeSidecarDocker()
+	const prefix = "wsnet"
+	name := DesktopContainerName(sidecarTestWS)
+	f.exists[name] = true
+	f.containerImage[name] = "sha256:OLD" // the container's baked image
+	f.imageID = "sha256:NEW"              // the desired tag now resolves here
+	p := fastProbe(NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 0, "unconfined"))
+	p.SetControlTokenSecret("s") // token matches (only image drifts)
+	f.configEnv[name] = []string{"DESKTOP_CONTROL_TOKEN=" + DeriveDesktopControlToken("s", sidecarTestWS)}
+
+	if _, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS}); err != nil {
+		t.Fatalf("StartDesktop: %v", err)
+	}
+	if force, found := f.removeForce(name); !found || !force {
+		t.Fatalf("image drift must force-remove the old container: removes=%v", f.removes)
+	}
+	if f.createByName(name) == nil {
+		t.Fatalf("image drift must recreate the container: creates=%v", f.creates)
+	}
+}
+
+// No drift (token + image match) → plain restart, NO recreate.
+func TestLocalSidecar_StartDesktop_NoDriftPlainRestart(t *testing.T) {
+	f := newFakeSidecarDocker()
+	const prefix = "wsnet"
+	name := DesktopContainerName(sidecarTestWS)
+	f.exists[name] = true
+	f.containerImage[name] = "sha256:SAME"
+	f.imageID = "sha256:SAME"
+	p := fastProbe(NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 0, "unconfined"))
+	p.SetControlTokenSecret("s")
+	f.configEnv[name] = []string{"DESKTOP_CONTROL_TOKEN=" + DeriveDesktopControlToken("s", sidecarTestWS)}
+
+	if _, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS}); err != nil {
+		t.Fatalf("StartDesktop: %v", err)
+	}
+	if _, found := f.removeForce(name); found {
+		t.Fatalf("matching token+image must NOT recreate: removes=%v", f.removes)
+	}
+	if f.createByName(name) != nil {
+		t.Fatalf("matching token+image must plain-restart, not recreate: creates=%v", f.creates)
+	}
+}
+
+// §25.1 SELF-HEAL: a persisted container that exits IMMEDIATELY after start
+// (corrupt writable layer) is recreated ONCE from the image; an OOM exit is NOT
+// self-healed (it is host memory pressure, not corruption — recreating would
+// discard a good layer).
+func TestLocalSidecar_StartDesktop_SelfHealsCrashedContainer(t *testing.T) {
+	f := newFakeSidecarDocker()
+	const prefix = "wsnet"
+	name := DesktopContainerName(sidecarTestWS)
+	f.exists[name] = true
+	f.crashOnStart[name] = true // first start exits immediately; consumed → 2nd boots
+	p := fastProbe(NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 0, "unconfined"))
+
+	if _, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS}); err != nil {
+		t.Fatalf("StartDesktop: %v", err)
+	}
+	if force, found := f.removeForce(name); !found || !force {
+		t.Fatalf("crashed sidecar must be force-removed for self-heal: removes=%v", f.removes)
+	}
+	if f.createByName(name) == nil {
+		t.Fatalf("self-heal must recreate the crashed container: creates=%v", f.creates)
+	}
+	// Two starts: the crashed one + the healthy recreate.
+	starts := 0
+	for _, s := range f.starts {
+		if s == name {
+			starts++
+		}
+	}
+	if starts != 2 {
+		t.Fatalf("self-heal expects 2 starts of the sidecar (crash + recreate), got %d: %v", starts, f.starts)
+	}
+}
+
+func TestLocalSidecar_StartDesktop_DoesNotSelfHealOnOOM(t *testing.T) {
+	f := newFakeSidecarDocker()
+	const prefix = "wsnet"
+	name := DesktopContainerName(sidecarTestWS)
+	f.exists[name] = true
+	f.oomOnStart[name] = true // exits, but OOMKilled → NOT corruption
+	p := fastProbe(NewLocalSidecarProvisioner(f, "desk:img", prefix, 6070, 0, 0, "unconfined"))
+
+	if _, err := p.StartDesktop(context.Background(), WorkspaceConfig{WorkspaceID: sidecarTestWS}); err != nil {
+		t.Fatalf("StartDesktop: %v", err)
+	}
+	if _, found := f.removeForce(name); found {
+		t.Fatalf("an OOM exit must NOT trigger a self-heal recreate (would discard a good layer): removes=%v", f.removes)
+	}
+	if f.createByName(name) != nil {
+		t.Fatalf("OOM must not recreate: creates=%v", f.creates)
 	}
 }
 
