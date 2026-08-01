@@ -183,6 +183,13 @@ func TestIsGeneratedArtifact(t *testing.T) {
 		"src/thing.egg-info/SOURCES.txt",
 		".pytest_cache/v/cache/lastfailed",
 		"pkg/.pytest_cache/CACHEDIR.TAG",
+		".mypy_cache/x.json",
+		// setuptools build output — the shape that survived the FIRST version of
+		// this fix and would have left the customer's restart loop running.
+		"build/lib/gmail_channel_molecule/daemon.py",
+		"build/lib.linux-x86_64-3.11/pkg/mod.py",
+		"build/bdist.linux-x86_64/wheel/thing.py",
+		"build/scripts-3.11/entry",
 	}
 	for _, rel := range generated {
 		if !isGeneratedArtifact(rel) {
@@ -203,6 +210,9 @@ func TestIsGeneratedArtifact(t *testing.T) {
 		// near-misses that are ordinary files, not generated caches
 		"docs/pycache-notes.md",
 		"pkg/egg-info-reader.py",
+		// a plugin that legitimately ships its own top-level build/ content
+		"build/README.md",
+		"src/build/helper.py",
 	}
 	for _, rel := range content {
 		if isGeneratedArtifact(rel) {

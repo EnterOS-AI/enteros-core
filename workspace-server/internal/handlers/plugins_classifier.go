@@ -152,8 +152,32 @@ func isGeneratedArtifact(rel string) bool {
 	}
 	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
 		if seg == "__pycache__" || seg == ".pytest_cache" ||
+			seg == ".mypy_cache" || seg == ".ruff_cache" ||
 			strings.HasSuffix(seg, ".egg-info") {
 			return true
+		}
+	}
+	// setuptools' build output. Scoped to the exact subdirectories setuptools
+	// writes (build/lib*, build/bdist*, build/scripts*) rather than all of
+	// `build/`, so a plugin that legitimately ships a top-level build/ of its
+	// own keeps that as content.
+	//
+	// Found by checking the fix against the REAL failing tree before shipping
+	// it: excluding bytecode and egg-info still left 6 differing files —
+	// build/lib/gmail_channel_molecule/*.py — so the loop would have survived
+	// the fix and the incident would have been declared closed while the
+	// customer stayed down.
+	// Segment-based, because setuptools decorates these names with the platform
+	// and interpreter version: build/lib.linux-x86_64-3.11/, build/scripts-3.11/,
+	// build/bdist.linux-x86_64/. Matching on a raw prefix missed the hyphenated
+	// forms.
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) > 2 && parts[0] == "build" {
+		for _, pre := range []string{"lib", "bdist", "scripts"} {
+			if parts[1] == pre || strings.HasPrefix(parts[1], pre+".") ||
+				strings.HasPrefix(parts[1], pre+"-") {
+				return true
+			}
 		}
 	}
 	return false
