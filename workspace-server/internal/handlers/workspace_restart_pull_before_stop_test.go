@@ -358,9 +358,14 @@ func TestRestartProvisionGate_ReleasedOnDeclinedPrewarm(t *testing.T) {
 	gate := acquireRestartProvisionGate("ws-gate")
 	locked := make(chan struct{})
 	go func() {
+		// Signal from INSIDE the critical section: acquiring the gate is the
+		// proof it was released, and closing the channel while holding it keeps
+		// staticcheck's SA2001 (empty critical section) honest rather than
+		// suppressed — an empty Lock/Unlock pair reads as a mistake even when
+		// it is deliberate.
 		gate.Lock()
-		gate.Unlock()
 		close(locked)
+		gate.Unlock()
 	}()
 	select {
 	case <-locked:
