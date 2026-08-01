@@ -86,6 +86,22 @@ func (h *PluginsHandler) classifyInstallChanges(
 	delete(stagedHashes, ".complete")
 	delete(liveHashes, ".complete")
 
+	// Drop RUNTIME-GENERATED artifacts for the same reason, and a sharper one:
+	// they exist only in the LIVE tree (the plugin's daemon writes them), never
+	// in a fresh clone, so counting them made the trees differ PERMANENTLY and
+	// every reconcile cold-restart the workspace forever. See the note on
+	// isGeneratedArtifact.
+	for rel := range stagedHashes {
+		if isGeneratedArtifact(rel) {
+			delete(stagedHashes, rel)
+		}
+	}
+	for rel := range liveHashes {
+		if isGeneratedArtifact(rel) {
+			delete(liveHashes, rel)
+		}
+	}
+
 	// Set difference: any file in one but not the other → cold.
 	for rel := range stagedHashes {
 		if _, ok := liveHashes[rel]; !ok {
@@ -110,6 +126,37 @@ func (h *PluginsHandler) classifyInstallChanges(
 		}
 	}
 	return classifyKindSkillContentOnly, nil
+}
+
+// isGeneratedArtifact reports whether a path is produced by RUNNING the plugin
+// rather than shipped by its author.
+//
+// Production incident, reno-stars 2026-08-01. The classifier compared a freshly
+// cloned staged tree against the LIVE tree and counted these as content. A
+// plugin whose daemon pip-installs itself (`.egg-info`) and imports its own
+// modules (`__pycache__/*.pyc`) therefore differed from staging permanently, so
+// every reconcile classified `cold` and triggered a restart — and every restart
+// fires fireReconcileOnline, which reconciles again:
+//
+//	reconcile -> cold -> restart -> online -> reconcile -> cold -> ...
+//
+// 24-32 restarts/hour on the customer's coordinator; the agent never survived
+// long enough to complete a turn. Same defect class as core#5009 (a content
+// comparison that counts generated artifacts as content), one layer up.
+//
+// Matching is on PATH SEGMENTS, never substrings, so a legitimately named file
+// like `docs/pycache-notes.md` or `pkg/egg-info-reader.py` is still content.
+func isGeneratedArtifact(rel string) bool {
+	if strings.HasSuffix(rel, ".pyc") || strings.HasSuffix(rel, ".pyo") {
+		return true
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		if seg == "__pycache__" || seg == ".pytest_cache" ||
+			strings.HasSuffix(seg, ".egg-info") {
+			return true
+		}
+	}
+	return false
 }
 
 // isSkillMarkdown returns true for any path whose basename is SKILL.md
