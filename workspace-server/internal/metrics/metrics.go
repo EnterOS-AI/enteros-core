@@ -206,6 +206,11 @@ func Handler() gin.HandlerFunc {
 		writeln(w, "# TYPE molecule_phantom_busy_resets_total counter")
 		fmt.Fprintf(w, "molecule_phantom_busy_resets_total %d\n", atomic.LoadInt64(&phantomBusyResets))
 
+		// ── Degraded plugin installs (core#4997) ───────────────────────────────
+		writeln(w, "# HELP molecule_plugin_install_degraded_workspaces Live workspaces whose declared plugin set is degraded right now (declared AND swapped AND failed != []). Non-zero means a declared plugin is missing from a running box; the boot fetch is fail-soft, so nothing else surfaces it — see core#4997.")
+		writeln(w, "# TYPE molecule_plugin_install_degraded_workspaces gauge")
+		fmt.Fprintf(w, "molecule_plugin_install_degraded_workspaces %d\n", atomic.LoadInt64(&degradedPluginWorkspaces))
+
 		// ── Pending-uploads sweeper ────────────────────────────────────────────
 		writeln(w, "# HELP molecule_pending_uploads_swept_total Pending-uploads rows deleted by the GC sweeper, by outcome.")
 		writeln(w, "# TYPE molecule_pending_uploads_swept_total counter")
@@ -221,3 +226,24 @@ func Handler() gin.HandlerFunc {
 func writeln(w http.ResponseWriter, s string) {
 	fmt.Fprintln(w, s)
 }
+
+// degradedPluginWorkspaces is a GAUGE (not a counter): the number of live
+// workspaces whose declared plugin set is degraded right now — declared AND
+// swapped AND failed != []. core#4997: that rule already existed and already
+// fired, but nothing consumed it, so a customer's declared plugin failed to
+// install on every boot for five days and was found by accident.
+//
+// A gauge because the alert must CLEAR when the fleet recovers; a cumulative
+// counter would only ever go up.
+var degradedPluginWorkspaces int64
+
+// SetDegradedPluginWorkspaces publishes the current degraded count. Called once
+// per sweep tick with the freshly measured value — including zero, so a
+// recovered fleet clears the alert. A failed measurement must NOT call this:
+// leaving the previous reading is honest, publishing 0 is a lie.
+func SetDegradedPluginWorkspaces(n int64) { atomic.StoreInt64(&degradedPluginWorkspaces, n) }
+
+// DegradedPluginWorkspaces returns the current gauge value. Dashboards read
+// molecule_plugin_install_degraded_workspaces from /metrics; this is the
+// unit-test escape hatch (mirrors PendingUploadsSweepCounts).
+func DegradedPluginWorkspaces() int64 { return atomic.LoadInt64(&degradedPluginWorkspaces) }
