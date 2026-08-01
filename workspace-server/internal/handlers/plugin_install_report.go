@@ -103,6 +103,12 @@ type pluginInstallReportBody struct {
 	Skipped    []string `json:"skipped"`
 	Failed     []string `json:"failed"`
 	Swapped    *bool    `json:"swapped"`
+	// core#5007: declared source -> the commit the BOX actually installed.
+	// A plain map, NOT a pointer: unlike declared/swapped there is no
+	// false-vs-absent trap to guard — an absent field and an empty object are
+	// both "no commits reported", and the column stays NULL for the former so a
+	// reader can still tell an old runtime from an empty install.
+	InstalledRefs map[string]string `json:"installed_refs"`
 }
 
 // PluginInstallReportHandler persists the runtime's boot-install outcome.
@@ -268,21 +274,35 @@ func persistPluginInstallReport(ctx context.Context, database *sql.DB, workspace
 	if err != nil {
 		return err
 	}
+	// NULL, not '{}', when the producer did not send the field: the column must
+	// keep saying "this runtime cannot tell me" apart from "this box installed
+	// nothing". Collapsing them would make every pre-0.4.72 box look like an
+	// empty install, which is the confident-lie failure the *bool fields above
+	// exist to refuse.
+	var installedRefs any
+	if body.InstalledRefs != nil {
+		encoded, mErr := json.Marshal(body.InstalledRefs)
+		if mErr != nil {
+			return mErr
+		}
+		installedRefs = string(encoded)
+	}
 	wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	_, err = database.ExecContext(wctx, `
 		INSERT INTO workspace_plugin_install_reports
-			(workspace_id, declared, plugins_dir, installed, skipped, failed, swapped, reported_at)
-		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, NOW())
+			(workspace_id, declared, plugins_dir, installed, skipped, failed, swapped, installed_refs, reported_at)
+		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8::jsonb, NOW())
 		ON CONFLICT (workspace_id) DO UPDATE SET
-			declared    = EXCLUDED.declared,
-			plugins_dir = EXCLUDED.plugins_dir,
-			installed   = EXCLUDED.installed,
-			skipped     = EXCLUDED.skipped,
-			failed      = EXCLUDED.failed,
-			swapped     = EXCLUDED.swapped,
-			reported_at = NOW()
-	`, workspaceID, *body.Declared, body.PluginsDir, string(installed), string(skipped), string(failed), *body.Swapped)
+			declared       = EXCLUDED.declared,
+			plugins_dir    = EXCLUDED.plugins_dir,
+			installed      = EXCLUDED.installed,
+			skipped        = EXCLUDED.skipped,
+			failed         = EXCLUDED.failed,
+			swapped        = EXCLUDED.swapped,
+			installed_refs = EXCLUDED.installed_refs,
+			reported_at    = NOW()
+	`, workspaceID, *body.Declared, body.PluginsDir, string(installed), string(skipped), string(failed), *body.Swapped, installedRefs)
 	return err
 }
 

@@ -52,6 +52,8 @@ func TestPluginInstallReport_StructTagsMatchTheContract(t *testing.T) {
 		"Skipped":    molcontracts.PluginInstallReportFieldSkipped,
 		"Failed":     molcontracts.PluginInstallReportFieldFailed,
 		"Swapped":    molcontracts.PluginInstallReportFieldSwapped,
+		// core#5007 — the box's own answer: declared source -> installed commit.
+		"InstalledRefs": molcontracts.PluginInstallReportFieldInstalledRefs,
 	}
 	rt := reflect.TypeOf(pluginInstallReportBody{})
 	if rt.NumField() != len(want) {
@@ -409,5 +411,46 @@ func TestPluginInstallReport_ContractInvariantsHold(t *testing.T) {
 	}
 	if !strings.Contains(molcontracts.PluginInstallReportOutcomeRule, "swapped") {
 		t.Errorf("the outcome rule must consult swapped, got %q", molcontracts.PluginInstallReportOutcomeRule)
+	}
+}
+
+// core#5007 — installed_refs: the commit the BOX reports it installed.
+//
+// The value that matters is NULL-vs-{}: a runtime older than 0.4.72 does not
+// send the field, and a reader must keep "this box cannot tell me" distinct from
+// "this box installed nothing". Collapsing them would make every un-upgraded box
+// look like an empty install — the same confident-lie failure the *bool fields
+// exist to refuse.
+func TestPluginInstallReportBody_InstalledRefsAbsentIsNotEmpty(t *testing.T) {
+	var withField, withoutField pluginInstallReportBody
+	if err := json.Unmarshal([]byte(`{"declared":true,"swapped":true,
+		"installed_refs":{"gitea://o/r#main":"abc"}}`), &withField); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"declared":true,"swapped":true}`), &withoutField); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if withField.InstalledRefs == nil {
+		t.Fatal("a sent installed_refs decoded as nil — the box's answer was dropped")
+	}
+	if got := withField.InstalledRefs["gitea://o/r#main"]; got != "abc" {
+		t.Errorf("installed_refs value = %q, want %q", got, "abc")
+	}
+	if withoutField.InstalledRefs != nil {
+		t.Error("an ABSENT installed_refs decoded as non-nil — the handler would " +
+			"store '{}' and an old runtime would be indistinguishable from a box " +
+			"that installed nothing")
+	}
+}
+
+// The struct tag must equal the SDK contract's wire name, or the producer's
+// field silently never lands.
+func TestPluginInstallReportBody_InstalledRefsUsesTheContractWireName(t *testing.T) {
+	var b pluginInstallReportBody
+	if err := json.Unmarshal([]byte(`{"installed_refs":{"s":"c"}}`), &b); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if b.InstalledRefs["s"] != "c" {
+		t.Error(`installed_refs did not bind — the json tag drifted from the contract`)
 	}
 }
