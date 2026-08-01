@@ -965,6 +965,17 @@ func main() {
 		plugins.StartPluginDriftSweeper(c, pluginRegistry)
 	})
 
+	// Degraded plugin-install sweeper (core#4997). The degraded rule already
+	// existed and already fired -- GET /admin/plugin-install-reports?status=degraded
+	// names the affected workspace and the failing source exactly -- but nothing
+	// consumed it, so a customer's declared plugin failed to install on every
+	// boot for five days and was found only by accident. This publishes the
+	// count as molecule_plugin_install_degraded_workspaces so a dashboard can
+	// alert on it. Read-only: it counts rows and never touches a workspace.
+	go supervised.RunWithRecover(ctx, "degraded-plugin-sweeper", func(c context.Context) {
+		handlers.StartDegradedPluginSweeper(c, db.DB)
+	})
+
 	// Plugin drift APPLIER — the deterministic consumer of the queue the
 	// sweeper above fills (core#4977). Without it, drift is detected and
 	// enqueued but nothing ever applies it: the only previous consumer was the
