@@ -34,6 +34,15 @@ import (
 type CPProvisionerAPI interface {
 	Start(ctx context.Context, cfg WorkspaceConfig) (string, error)
 	Stop(ctx context.Context, workspaceID string) error
+	// EnsureImage asks the control plane to make this workspace's pinned image
+	// obtainable BEFORE the caller stops anything (core#5019, structural half).
+	//
+	// Deliberately on THIS interface rather than behind an optional type
+	// assertion on *CPProvisioner: the guard's whole value is that a restart
+	// path cannot reach Stop without having asked first, and an optional
+	// interface is exactly the shape that lets a fake — or a future second
+	// implementation — silently skip the question and still compile.
+	EnsureImage(ctx context.Context, req EnsureImageRequest) (EnsureImageResult, error)
 	// StopAndPrune is Stop + "erase the durable data volume" (internal#734),
 	// for the permanent-delete-with-erase flow ONLY. Restart/recreate use Stop.
 	StopAndPrune(ctx context.Context, workspaceID string) error
@@ -74,6 +83,12 @@ type CPProvisioner struct {
 	// pinned image (~7GB). Sharing the 120s budget meant a cold pull blew the
 	// deadline and left the workspace with no container at all.
 	provisionHTTPClient *http.Client
+	// ensureImageHTTPClient carries ONLY the ensure-image pre-flight (core#5019,
+	// structural half). Separate from provisionHTTPClient because the two bound
+	// different operations: this one may spend minutes making a ~7GB pinned image
+	// present BEFORE the workspace is stopped; the provision that follows it is
+	// then fast. See cpEnsureImageTimeout.
+	ensureImageHTTPClient *http.Client
 	// hostStateDir is the base dir for the host-side /configs mirror the Files
 	// API serves from when there is no docker.sock into the runtime container
 	// (#206 molecules-server). Empty disables the mirror (config still delivers
@@ -156,8 +171,9 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 		sharedSecret:        sharedSecret,
 		adminToken:          adminToken,
 		cpAdminAPIKey:       cpAdminAPIKey,
-		httpClient:          &http.Client{Timeout: cpAPITimeout},
-		provisionHTTPClient: &http.Client{Timeout: cpProvisionTimeout},
+		httpClient:            &http.Client{Timeout: cpAPITimeout},
+		provisionHTTPClient:   &http.Client{Timeout: cpProvisionTimeout},
+		ensureImageHTTPClient: &http.Client{Timeout: cpEnsureImageTimeout},
 	}, nil
 }
 
