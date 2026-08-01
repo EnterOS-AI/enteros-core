@@ -2259,7 +2259,9 @@ func TestStopForRestart_SaaSPath_DispatchesViaCPProv(t *testing.T) {
 	cp := &fakeCPProv{}
 	handler.SetCPProvisioner(cp)
 
-	handler.stopForRestart(context.Background(), "ws-saas-restart")
+	if !handler.stopForRestart(context.Background(), "ws-saas-restart", "claude-code", "") {
+		t.Fatal("stopForRestart must not decline when the CP confirms the pinned image")
+	}
 
 	if cp.StopCalls() != 1 {
 		t.Fatalf("expected cpProv.Stop to be called once on SaaS auto-restart; got %d", cp.StopCalls())
@@ -2280,7 +2282,7 @@ func TestStopForRestart_NoProvisioner_NoOp(t *testing.T) {
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 	// no provisioner, no cpProv, no DB expectations set on mock — any
 	// unexpected query/exec will produce a sqlmock error.
-	handler.stopForRestart(context.Background(), "ws-orphan")
+	handler.stopForRestart(context.Background(), "ws-orphan", "claude-code", "")
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("stopForRestart no-provisioner path should not touch DB: %v", err)
 	}
@@ -2302,7 +2304,7 @@ func TestStopForRestart_ClearsCachedURL(t *testing.T) {
 
 	// No provisioner wired: stopForRestart is a no-op backend-wise, but it
 	// must still invalidate Redis routing keys.
-	handler.stopForRestart(context.Background(), wsID)
+	handler.stopForRestart(context.Background(), wsID, "claude-code", "")
 
 	_, err := db.GetCachedURL(context.Background(), wsID)
 	if err == nil {
@@ -2370,6 +2372,16 @@ func (f *fakeCPProv) StopAndPrune(_ context.Context, _ string) error {
 	f.stopCalls++
 	return nil
 }
+
+// EnsureImage satisfies the core#5019 pull-before-stop seam. These stubs
+// predate it; answering "ready" keeps their pre-#5019 behaviour EXACTLY
+// (the guard allows, the restart proceeds) so this stub carries no opinion
+// about the new branch. Tests that exercise the DECLINE path use
+// prewarmCPProv in workspace_restart_pull_before_stop_test.go.
+func (f *fakeCPProv) EnsureImage(_ context.Context, _ provisioner.EnsureImageRequest) (provisioner.EnsureImageResult, error) {
+	return provisioner.EnsureImageResult{Status: "ready"}, nil
+}
+
 func (f *fakeCPProv) GetConsoleOutput(_ context.Context, _ string) (string, error) {
 	return "", nil
 }

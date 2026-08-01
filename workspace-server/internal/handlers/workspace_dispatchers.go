@@ -478,6 +478,23 @@ func (h *WorkspaceHandler) RestartWorkspaceAutoOpts(ctx context.Context, workspa
 	// (provisionWorkspaceAuto, StopWorkspaceAuto) and the convention
 	// documented in docs/architecture/backends.md.
 	if h.cpProv != nil {
+		// core#5019 (structural half): PULL BEFORE STOPPING. This path is the
+		// manual POST /workspaces/:id/restart — it has its OWN stop leg and does
+		// not route through stopForRestart, so the guard is repeated here rather
+		// than inherited. Ask CP to make the pinned image obtainable first; a
+		// refusal means we keep the running container instead of trading it for
+		// an image that may never arrive.
+		//
+		// Unlock before returning: the gate is normally released by the provision
+		// goroutine's defer, and there is no goroutine on this arm. A stranded
+		// gate would lock the workspace out of every future restart, turning a
+		// recoverable "image not ready yet" into a permanent wedge.
+		if !h.ensurePinnedImageBeforeStop(ctx, workspaceID, payload.Runtime, payload.Template) {
+			gate.Unlock()
+			log.Printf("RestartWorkspaceAuto: %s DECLINED — pinned image for runtime=%q template=%q could not be made available; the running container was left untouched (core#5019)",
+				workspaceID, payload.Runtime, payload.Template)
+			return false
+		}
 		h.cpStopWithRetry(ctx, workspaceID, "RestartWorkspaceAuto")
 		// resetClaudeSession is Docker-only — CP has no session state to clear.
 		// h.goAsync (not raw `go`) so the goroutine is TRACKED on h.asyncWG
