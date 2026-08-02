@@ -127,9 +127,15 @@ func TestEnsureImage_WireProviderMatchesTheProvisionWire(t *testing.T) {
 	}
 
 	// Leg 2: the provision that follows it. Also no explicit provider — the
-	// canvas compute validator drops any id outside the cloud/billable picker
-	// set, and Molecules-Server is not in it, so this is the shape a real
+	// restart path carries identity fields only, so this is the shape a real
 	// local-docker workspace reaches Start with.
+	//
+	// (Historically the canvas compute validator ALSO stripped this: it derived
+	// its allowlist from the cloud/billable picker set, which excludes
+	// Molecules-Server, so the id could not survive a compute PATCH. That
+	// validator now derives from the full selectable set — see
+	// handlers.TestValidateWorkspaceCompute_AcceptsMoleculesServer — but the
+	// no-explicit-provider shape asserted here is still the production one.)
 	if _, err := p.Start(context.Background(), WorkspaceConfig{
 		WorkspaceID: "ws-5025", Runtime: "hermes", Template: "hermes",
 	}); err != nil {
