@@ -240,4 +240,12 @@ func TestEnsureImage_UnresolvableProviderStillAsks(t *testing.T) {
 	if _, ok := cp.bodies["/cp/workspaces/ensure-image"]; !ok {
 		t.Fatal("the pre-flight must still be sent when the provider cannot be resolved")
 	}
+	// And it must not INVENT one. A fabricated provider is worse than an absent
+	// one: absent is a known default the control plane resolves for itself,
+	// while a made-up id sends the pre-warm at a backend nothing runs on and the
+	// answer would be about that backend.
+	if got, present := cp.provider("/cp/workspaces/ensure-image"); present {
+		t.Fatalf("provider %q reached the wire although it could not be resolved — an unresolvable "+
+			"provider must be omitted, not guessed", got)
+	}
 }

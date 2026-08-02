@@ -102,11 +102,17 @@ func stubRowProvider(t *testing.T) {
 	// spend the real 1s/2s waiting for a decline we already expect.
 	shrinkPrewarmRetryForTest(t)
 	mock := setupTestDB(t)
-	// Any row read the pre-flight might make answers with the OTHER provider, so
-	// a wire carrying prewarmRowProvider proves the caller passed nothing.
+	// Any row read the pre-flight makes answers with the OTHER provider, so a
+	// wire carrying prewarmRowProvider proves the caller passed nothing and the
+	// provisioner's row fallback filled the gap. Registered once per allowed
+	// attempt: the pre-flight retries a refusing control plane, and an
+	// expectation that ran out after the first call would let the later requests
+	// carry no provider for a reason that has nothing to do with the caller.
 	mock.MatchExpectationsInOrder(false)
-	mock.ExpectQuery(`compute`).WillReturnRows(
-		mock.NewRows([]string{"provider"}).AddRow(prewarmRowProvider))
+	for i := 0; i < cpStopRetryAttempts; i++ {
+		mock.ExpectQuery(`compute`).WillReturnRows(
+			mock.NewRows([]string{"provider"}).AddRow(prewarmRowProvider))
+	}
 }
 
 // TestRestartWorkspaceAutoOpts_PrewarmWireCarriesTheProvisionProvider covers the
