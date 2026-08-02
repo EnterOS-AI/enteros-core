@@ -77,6 +77,52 @@ type MgmtMCPProbe struct {
 	// kind='workspace' row with the requested name appeared. This is the
 	// "genuinely callable" proof that presence-only checks cannot give.
 	WorkerProvisioned bool
+	// RequireCallable is the REQUIRE-LIVE posture for this run: the caller has
+	// declared that this invocation must satisfy the "genuinely callable" bar, so
+	// a run that merely DECLINED to exercise the A2A turn (AssertCallable=false)
+	// is a MISCONFIGURATION, not a weaker-but-acceptable pass.
+	//
+	// WHY IT EXISTS (the Gate-1.5 hole). AssertCallable is opt-in and defaults OFF
+	// (E2E_ASSERT_MGMT_MCP_CALLABLE is set only by the staging-tenant-cd deploy
+	// job). The k8s design doc's Gate 1.5 acceptance criterion is "a fresh org
+	// provisions onto k8s AND its concierge answers a real provision_workspace
+	// call — NOT a PONG", and it is discharged by an OPERATOR running Guard B by
+	// hand against the controlplane-test CP. On that hand path nothing sets
+	// E2E_ASSERT_MGMT_MCP_CALLABLE, so the verdict below would return ok=true on
+	// the presence-only branch — a GREEN that never made the tool call the gate
+	// exists to prove. RequireCallable makes that outcome RED instead.
+	//
+	// Mirrors the CP serving-e2e SERVING_E2E_REQUIRE_LIVE posture: under an
+	// explicit require-live flag, "this arm did not actually run" is a hard
+	// failure, not an optional arm.
+	RequireCallable bool
+}
+
+// GuardBMode resolves the two Guard B posture booleans from their raw env
+// values, in ONE pure place so the live test and its unit proof cannot drift.
+//
+//   - assertVal  = E2E_ASSERT_MGMT_MCP_CALLABLE (the deploy gate's opt-in)
+//   - requireVal = GUARD_B_REQUIRE_CALLABLE     (the require-live posture)
+//
+// requireCallable IMPLIES assertCallable: the whole point is that an operator
+// discharging Gate 1.5 sets ONE variable and cannot then receive a presence-only
+// green. Setting only assertVal keeps the historical deploy-gate behaviour
+// byte-for-byte (requireCallable=false), so this is add-only.
+func GuardBMode(assertVal, requireVal string) (assertCallable, requireCallable bool) {
+	requireCallable = isTruthyValue(requireVal)
+	assertCallable = isTruthyValue(assertVal) || requireCallable
+	return assertCallable, requireCallable
+}
+
+// isTruthyValue parses a permissive boolean env value (1/true/yes/on). Lives in
+// this untagged file so the pure logic and the tagged live test share one
+// definition.
+func isTruthyValue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // EvaluateMgmtMCPCallable is the Guard B verdict: (ok, human-readable reason).
@@ -85,6 +131,16 @@ type MgmtMCPProbe struct {
 // The ordering of checks is intentional (cheapest / most-specific failure first)
 // so a red gate names the ACTUAL regression class, not a generic timeout.
 func EvaluateMgmtMCPCallable(p MgmtMCPProbe) (ok bool, reason string) {
+	// 0. REQUIRE-LIVE (Gate 1.5). Checked FIRST and independently of every
+	//    observation, because it is not a fact about the fleet — it is a fact
+	//    about THIS RUN: the caller demanded the callable proof and the run did
+	//    not arm it. Every check below could pass on a healthy-looking presence-
+	//    only probe and hand back a green that never made a tool call, which is
+	//    exactly the vacuous-pass shape this gate exists to refuse.
+	if p.RequireCallable && !p.AssertCallable {
+		return false, "GUARD_B_REQUIRE_CALLABLE is set but this run did NOT arm the real A2A provision_workspace turn (AssertCallable=false) — a presence-only run cannot discharge the Gate 1.5 criterion 'its concierge answers a real provision_workspace call — NOT a PONG'. This is a misconfiguration of the run, not an optional arm"
+	}
+
 	// 1. Default-runtime skew (task#225/#226/test123). Only enforced when BOTH the
 	//    expectation is set AND the tenant actually surfaced a runtime; an
 	//    unobserved runtime relies on the workflow pin (documented) rather than

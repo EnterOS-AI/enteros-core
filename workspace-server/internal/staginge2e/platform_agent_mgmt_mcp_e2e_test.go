@@ -40,6 +40,43 @@ package staginge2e
 // mcp_server_present=true and that loaded_mcp_tools carries the contract's
 // provision_workspace verb — tightening "present" to "the lifecycle verb the org
 // actually needs is loaded".
+//
+// ---------------------------------------------------------------------------
+// GATE 1.5 (k8s design doc) — how an operator discharges it with this test
+// ---------------------------------------------------------------------------
+//
+// The doc's acceptance criterion is: "a fresh org provisions onto k8s AND its
+// concierge answers a real provision_workspace call — NOT a PONG", discharged by
+// running Guard B against the controlplane-test CP once its two Secrets exist and
+// the Deployment is scaled to 1.
+//
+// That is a HAND-RUN path, and two of this test's defaults are wrong for it:
+//
+//	1. E2E_ASSERT_MGMT_MCP_CALLABLE defaults OFF (only staging-tenant-cd sets it),
+//	   so the verdict would return the presence-only GREEN — a pass that never
+//	   made the tool call the criterion is about.
+//	2. requireStagingEnv SKIPs on unset STAGING_E2E / absent creds, and `go test`
+//	   reports a skipped-only package as `ok` — so a typo reads as a Gate-1.5 pass.
+//
+// GUARD_B_REQUIRE_CALLABLE=1 closes both: it implies the callable turn and turns
+// a missing precondition into a loud failure. The Gate-1.5 invocation is:
+//
+//	kubectl -n controlplane-test port-forward svc/controlplane 8080:8080 &
+//	cd workspace-server && \
+//	  STAGING_E2E=1 \
+//	  GUARD_B_REQUIRE_CALLABLE=1 \
+//	  CP_BASE_URL=http://127.0.0.1:8080 \
+//	  CP_ADMIN_API_TOKEN=<controlplane-test admin token> \
+//	  STAGING_TENANT_SUBDOMAIN_SUFFIX=<the cluster's tenant domain> \
+//	  E2E_PROVIDER=molecules-server \
+//	  go test -tags staging_e2e ./internal/staginge2e/ \
+//	    -run TestPlatformAgentMgmtMCP_Staging -count=1 -v -timeout 50m
+//
+// The port-forward is not incidental: cp-on-k8s.yaml exposes only a ClusterIP
+// Service (no IngressRoute), and validateStagingCPBase accepts loopback but
+// REFUSES an in-cluster DNS name like controlplane.controlplane-test.svc — it
+// will not send a CP admin bearer to an unvetted host. Loopback is the supported
+// route for a hand-run Gate 1.5.
 
 import (
 	"encoding/json"
@@ -55,6 +92,41 @@ import (
 )
 
 func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
+	// Guard B posture for THIS run, resolved by the same pure helper the unit
+	// proof exercises. GUARD_B_REQUIRE_CALLABLE is the require-live flag an
+	// operator sets when discharging the k8s design doc's Gate 1.5 ("a fresh org
+	// provisions onto k8s AND its concierge answers a real provision_workspace
+	// call — NOT a PONG"). It implies E2E_ASSERT_MGMT_MCP_CALLABLE.
+	assertCallable, requireCallable := GuardBMode(
+		os.Getenv("E2E_ASSERT_MGMT_MCP_CALLABLE"),
+		os.Getenv("GUARD_B_REQUIRE_CALLABLE"),
+	)
+
+	// REQUIRE-LIVE ENV PRE-CHECK (mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE).
+	// requireStagingEnv SKIPs on an unset STAGING_E2E or absent creds — and `go
+	// test` reports a package whose only test skipped as `ok`, so on the Gate-1.5
+	// hand path a mistyped env var reads as a PASS at the gate level. When the
+	// caller has declared require-live, a missing precondition is a
+	// MISCONFIGURATION of the run, not an optional arm: fail loud and name it.
+	// This runs BEFORE requireStagingEnv so the skip can never happen first.
+	if requireCallable {
+		var missing []string
+		if strings.TrimSpace(os.Getenv("STAGING_E2E")) != "1" {
+			missing = append(missing, "STAGING_E2E=1")
+		}
+		for _, k := range []string{"CP_BASE_URL", "CP_ADMIN_API_TOKEN"} {
+			if strings.TrimSpace(os.Getenv(k)) == "" {
+				missing = append(missing, k)
+			}
+		}
+		if len(missing) > 0 {
+			t.Fatalf("GUARD_B_REQUIRE_CALLABLE is set but this run cannot reach a control plane: missing %s. "+
+				"Under require-live a SKIP is a misconfiguration, not an optional arm — `go test` reports a "+
+				"skipped-only package as `ok`, so allowing the skip here would report Gate 1.5 green while "+
+				"asserting nothing.", strings.Join(missing, ", "))
+		}
+	}
+
 	cfg := requireStagingEnv(t)
 
 	slug := e2eSlug("mcp")
@@ -109,11 +181,9 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	// caught, not silently passed.
 	expectedRuntime := envOr("E2E_DEFAULT_RUNTIME", "hermes")
 
-	// Whether to require the REAL A2A callable turn (the deep proof) vs the
-	// online/presence-only assertion. The deploy gate sets
-	// E2E_ASSERT_MGMT_MCP_CALLABLE=1 so a fresh-org provision_workspace call is
-	// genuinely exercised; local runs default OFF (presence-only) to stay cheap.
-	assertCallable := isTruthy(envOr("E2E_ASSERT_MGMT_MCP_CALLABLE", ""))
+	// (assertCallable / requireCallable were resolved at the top of the test by
+	// GuardBMode, before requireStagingEnv, so the require-live pre-check runs
+	// ahead of any skip.)
 
 	// Wait for the concierge to reach status=online — which RCA #2970 makes
 	// UNREACHABLE unless its management MCP is present — collecting the row-reported
@@ -123,6 +193,7 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	probe.ExpectedRuntime = expectedRuntime
 	probe.RequiredTool = requiredTool
 	probe.AssertCallable = assertCallable
+	probe.RequireCallable = requireCallable
 	online := false
 	var lastStatus, lastPresent, lastTools string
 	for time.Now().Before(deadline) {
@@ -187,11 +258,11 @@ func TestPlatformAgentMgmtMCP_Staging(t *testing.T) {
 	// (platform_agent_mgmt_mcp_gate.go / _gate_test.go). RED names the regression class.
 	ok, reason := EvaluateMgmtMCPCallable(probe)
 	if !ok {
-		t.Fatalf("Guard B gate RED for fresh org %s (runtime=%q status=%q present=%s tools=[%s] callable_required=%v): %s",
-			slug, probe.ObservedRuntime, probe.Status, lastPresent, lastTools, assertCallable, reason)
+		t.Fatalf("Guard B gate RED for fresh org %s (runtime=%q status=%q present=%s tools=[%s] callable_armed=%v require_live=%v): %s",
+			slug, probe.ObservedRuntime, probe.Status, lastPresent, lastTools, assertCallable, requireCallable, reason)
 	}
-	t.Logf("Guard B gate GREEN for fresh org %s (runtime=%q expected=%q present=%s tools=[%s] callable_required=%v): %s",
-		slug, probe.ObservedRuntime, expectedRuntime, lastPresent, lastTools, assertCallable, reason)
+	t.Logf("Guard B gate GREEN for fresh org %s (runtime=%q expected=%q present=%s tools=[%s] callable_armed=%v require_live=%v): %s",
+		slug, probe.ObservedRuntime, expectedRuntime, lastPresent, lastTools, assertCallable, requireCallable, reason)
 }
 
 // assertTenantBuildIsCandidate enforces the ORDERING FIX: when the deploy path
@@ -314,14 +385,10 @@ func loadedMCPTools(body string) []string {
 // (containsStr moved to platform_agent_mgmt_mcp_gate.go — the untagged gate file —
 // so the pure verdict logic and this live test share one definition.)
 
-// isTruthy parses a permissive boolean env value (1/true/yes/on).
-func isTruthy(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
-		return true
-	}
-	return false
-}
+// isTruthy parses a permissive boolean env value (1/true/yes/on). Delegates to
+// the untagged isTruthyValue so the tagged live path and the unit-proven pure
+// path can never drift on what "on" means.
+func isTruthy(v string) bool { return isTruthyValue(v) }
 
 // envReadFirst returns the first non-empty env value among keys (alias support).
 func envReadFirst(keys ...string) string {
