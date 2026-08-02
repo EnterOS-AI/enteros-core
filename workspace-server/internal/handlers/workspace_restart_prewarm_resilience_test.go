@@ -188,6 +188,17 @@ func TestRestartPrewarmBudget_IsWellUnderTheClientTimeout(t *testing.T) {
 			"so the gate is still held for the full client timeout",
 			restartPrewarmBudget, provisioner.EnsureImageClientTimeout())
 	}
+	// The lower bound, and the one that is easy to get wrong in the direction
+	// that LOOKS safe. A budget too small to contain a real cold pull declines
+	// every restart while the pull is still legitimately in progress, so a
+	// workspace can never adopt a newly promoted pin — the guard would have
+	// converted "slow adoption" into "no adoption", which is worse than the
+	// outage it exists to prevent. 10 minutes is the measured 7.05GB cold-pull
+	// design point from core#5019.
+	if restartPrewarmBudget < 10*time.Minute {
+		t.Fatalf("restartPrewarmBudget (%s) is too short for the cold multi-GB pull this guard exists to "+
+			"WAIT for; a newly promoted pin would be refused on every restart forever", restartPrewarmBudget)
+	}
 }
 
 // TestRestartWorkspaceAutoOpts_PrewarmDoesNotHoldTheGate is finding 7's second

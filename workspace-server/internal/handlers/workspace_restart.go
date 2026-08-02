@@ -1116,11 +1116,22 @@ func (h *WorkspaceHandler) stopForRestart(ctx context.Context, workspaceID strin
 // restart/provision gate. A registry that hangs would then look exactly like a
 // workspace whose lifecycle has stopped.
 //
-// Deliberately smaller than provisioner.EnsureImageClientTimeout(): a budget at
-// or above it bounds nothing, since the client gives up first. Exceeding it
-// declines, which is the cheap outcome — the container is untouched and the next
-// restart cycle asks again. Package-level so tests can shrink it.
-var restartPrewarmBudget = 6 * time.Minute
+// It is bounded from BOTH sides, and the lower bound is the load-bearing one:
+//
+//   - Below provisioner.EnsureImageClientTimeout(), or it bounds nothing — the
+//     HTTP client would give up first and the gate would be held for the full
+//     client timeout anyway.
+//   - Comfortably above the measured cold-pull design point (the 7.05GB pull
+//     core#5019 was root-caused on). Too SMALL is not the safe direction it
+//     looks like: every restart would decline while a legitimate pull was still
+//     in progress, and a workspace could never adopt a newly promoted pin at
+//     all — the pre-flight would have turned "slow adoption" into "NO
+//     adoption", a worse failure than the one it prevents.
+//
+// Exceeding it declines, which is the cheap outcome: the container is untouched
+// and the next restart cycle asks again, by which time the pull has usually
+// landed. Package-level so tests can shrink it.
+var restartPrewarmBudget = 15 * time.Minute
 
 // ensurePinnedImageBeforeStop reports whether it is safe to destroy this
 // workspace's container — core#5019's structural fix.
