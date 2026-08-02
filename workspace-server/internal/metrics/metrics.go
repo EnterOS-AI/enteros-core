@@ -9,6 +9,8 @@
 //	molecule_http_request_duration_seconds{method,path}   - counter (sum, for avg rate)
 //	molecule_websocket_connections_active                  - gauge
 //	molecule_pending_uploads_swept_total{outcome}          - counter (acked|expired|error)
+//	molecule_plugin_install_degraded_workspaces            - gauge (ABSENT until a sweep succeeds)
+//	molecule_plugin_install_degraded_last_success_timestamp_seconds - gauge (0 = never)
 //	go_goroutines                                          - gauge
 //	go_memstats_alloc_bytes                                - gauge
 //	go_memstats_sys_bytes                                  - gauge
@@ -207,9 +209,28 @@ func Handler() gin.HandlerFunc {
 		fmt.Fprintf(w, "molecule_phantom_busy_resets_total %d\n", atomic.LoadInt64(&phantomBusyResets))
 
 		// ── Degraded plugin installs (core#4997) ───────────────────────────────
-		writeln(w, "# HELP molecule_plugin_install_degraded_workspaces Live workspaces whose declared plugin set is degraded right now (declared AND swapped AND failed != []). Non-zero means a declared plugin is missing from a running box; the boot fetch is fail-soft, so nothing else surfaces it — see core#4997.")
-		writeln(w, "# TYPE molecule_plugin_install_degraded_workspaces gauge")
-		fmt.Fprintf(w, "molecule_plugin_install_degraded_workspaces %d\n", atomic.LoadInt64(&degradedPluginWorkspaces))
+		//
+		// The last-success stamp is ALWAYS exported, including as 0 (the epoch)
+		// when nothing has ever been measured: an alert that requires freshness
+		// needs a series to evaluate, and "1970" reads as maximally stale, which
+		// is exactly the truth before the first sweep.
+		writeln(w, "# HELP molecule_plugin_install_degraded_last_success_timestamp_seconds Unix time of the last SUCCESSFUL degraded-install sweep, or 0 if none has completed. Alerts on molecule_plugin_install_degraded_workspaces must require this to be recent — a count is only as true as the reading behind it (core#5025).")
+		writeln(w, "# TYPE molecule_plugin_install_degraded_last_success_timestamp_seconds gauge")
+		fmt.Fprintf(w, "molecule_plugin_install_degraded_last_success_timestamp_seconds %d\n",
+			atomic.LoadInt64(&degradedPluginLastSweepUnix))
+
+		// The COUNT is omitted until a sweep has actually produced one.
+		// core#5025: printing the zero value made a disabled sweeper (nil db) or
+		// a persistently failing query serve "0 degraded workspaces" forever —
+		// byte-identical to a measured, healthy fleet. An absent series is
+		// visibly absent; a fabricated zero is invisibly wrong, and it is the
+		// same confident lie sweepDegradedPluginInstallsOnce refuses to tell on
+		// its own error path.
+		if atomic.LoadInt64(&degradedPluginLastSweepUnix) > 0 {
+			writeln(w, "# HELP molecule_plugin_install_degraded_workspaces Live workspaces (excluding removed) whose declared plugin set is degraded right now (declared AND swapped AND failed != []). Non-zero means a declared plugin is missing from a running box; the boot fetch is fail-soft, so nothing else surfaces it — see core#4997. Absent means no sweep has succeeded yet; see the _last_success_timestamp_seconds series.")
+			writeln(w, "# TYPE molecule_plugin_install_degraded_workspaces gauge")
+			fmt.Fprintf(w, "molecule_plugin_install_degraded_workspaces %d\n", atomic.LoadInt64(&degradedPluginWorkspaces))
+		}
 
 		// ── Pending-uploads sweeper ────────────────────────────────────────────
 		writeln(w, "# HELP molecule_pending_uploads_swept_total Pending-uploads rows deleted by the GC sweeper, by outcome.")
@@ -237,13 +258,45 @@ func writeln(w http.ResponseWriter, s string) {
 // counter would only ever go up.
 var degradedPluginWorkspaces int64
 
+// degradedPluginLastSweepUnix is the Unix time of the last SUCCESSFUL sweep, or
+// 0 when none has completed. It carries two jobs, and they are the same job:
+//
+//   - It is the "has this ever been measured" flag the exposition layer gates
+//     the count on. A separate bool would be a second thing to forget to set;
+//     one stamp cannot disagree with itself (core#5025 finding 6).
+//   - It is the staleness signal an alert requires, which covers the case
+//     absence cannot: a reading taken once at boot and frozen ever since.
+var degradedPluginLastSweepUnix int64
+
 // SetDegradedPluginWorkspaces publishes the current degraded count. Called once
 // per sweep tick with the freshly measured value — including zero, so a
 // recovered fleet clears the alert. A failed measurement must NOT call this:
 // leaving the previous reading is honest, publishing 0 is a lie.
-func SetDegradedPluginWorkspaces(n int64) { atomic.StoreInt64(&degradedPluginWorkspaces, n) }
+//
+// Calling it is what makes the count exportable at all, so it is also the ONLY
+// thing that can stamp the last-success time. The two writes are here together
+// so a caller cannot publish a number without dating it.
+func SetDegradedPluginWorkspaces(n int64) {
+	atomic.StoreInt64(&degradedPluginWorkspaces, n)
+	atomic.StoreInt64(&degradedPluginLastSweepUnix, time.Now().Unix())
+}
 
 // DegradedPluginWorkspaces returns the current gauge value. Dashboards read
 // molecule_plugin_install_degraded_workspaces from /metrics; this is the
 // unit-test escape hatch (mirrors PendingUploadsSweepCounts).
 func DegradedPluginWorkspaces() int64 { return atomic.LoadInt64(&degradedPluginWorkspaces) }
+
+// DegradedPluginLastSweepUnix returns the last-success stamp (0 = never). Test
+// escape hatch for the same reason as DegradedPluginWorkspaces.
+func DegradedPluginLastSweepUnix() int64 { return atomic.LoadInt64(&degradedPluginLastSweepUnix) }
+
+// ResetDegradedPluginWorkspacesForTest restores the never-measured state.
+//
+// Needed because the never-measured state is exactly what these package-level
+// vars can no longer be returned to by any production call — SetDegraded... only
+// ever moves forward. A test that could not reach it could only ever assert the
+// post-sweep behaviour, which is the half that already worked.
+func ResetDegradedPluginWorkspacesForTest() {
+	atomic.StoreInt64(&degradedPluginWorkspaces, 0)
+	atomic.StoreInt64(&degradedPluginLastSweepUnix, 0)
+}

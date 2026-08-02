@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -44,6 +45,61 @@ import (
 // POST /cp/workspaces/ensure-image (it answered 404 or 501). Callers treat it
 // as "proceed as before" — it is a version skew, not an image problem.
 var ErrEnsureImageUnsupported = errors.New("cp provisioner: ensure-image not supported by this control plane")
+
+// ErrEnsureImagePermanent marks a refusal that RETRYING CANNOT FIX: the control
+// plane understood the question and answered no. A digest that is not in the
+// registry, a workspace the CP will not resolve, a credential it rejects — three
+// more round trips return the same answer, and each one is spent holding the
+// per-workspace restart gate.
+//
+// Errors WITHOUT this marker (transport failures, 5xx, 429, an undecodable body)
+// say nothing about the image; they say the control plane is momentarily
+// unavailable. Callers retry those. See ensurePinnedImageBeforeStop.
+var ErrEnsureImagePermanent = errors.New("cp provisioner: ensure-image refused")
+
+// EnsureImageClientTimeout exposes the ensure-image HTTP budget so callers can
+// prove their own deadline actually bounds something. Without it, a caller
+// "budget" larger than this constant bounds nothing at all — the client gives up
+// first — and the test asserting the budget would pass while the gate was still
+// held for the full client timeout.
+func EnsureImageClientTimeout() time.Duration { return cpEnsureImageTimeout }
+
+// isCPRouteFamilyLive probes a route the control plane has served since long
+// before ensure-image existed, to distinguish "this CP predates the endpoint"
+// from "this URL does not reach the control plane at all".
+//
+// core#5025 finding 5: any 404 used to be read as version skew and FAIL OPEN. A
+// misconfigured base URL, a stale ingress rule or a proxy that lost the route
+// therefore degraded the whole fleet back to the pre-core#5019 destroy-then-pull
+// ordering — silently, while logging a reassuring compatibility skip. That is
+// the single most expensive way for this guard to be wrong, because it is
+// invisible.
+//
+// The detection is POSITIVE: a 404 counts as version skew only when the control
+// plane demonstrably serves /cp/workspaces/* and merely lacks this one route. A
+// CP too old to have ensure-image cannot emit a marker for a route it does not
+// have, so the signal has to come from a route it DOES have. Any non-404 answer
+// (including 4xx/5xx — those prove something is listening and routing) counts as
+// live; a second 404, or an unreachable host, does not.
+func (p *CPProvisioner) isCPRouteFamilyLive(ctx context.Context, workspaceID string) bool {
+	client := p.httpClient
+	if client == nil {
+		return false
+	}
+	u := fmt.Sprintf("%s/cp/workspaces/%s/status", p.baseURL, workspaceID)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return false
+	}
+	p.provisionAuthHeaders(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	return resp.StatusCode != http.StatusNotFound
+}
 
 // cpEnsureImageTimeout bounds the ensure-image POST.
 //
@@ -82,6 +138,46 @@ type EnsureImageResult struct {
 	Error string `json:"error,omitempty"`
 }
 
+// providerForWorkspace resolves the compute backend a workspace's box runs on.
+//
+// An explicit caller choice always wins: the provider-switch flow stops a box on
+// one backend and provisions the next on ANOTHER, so preferring the persisted
+// value there would act on the backend being abandoned. Otherwise the value is
+// read off the workspace row through resolveProvider — the SAME seam Stop
+// already uses, so the three legs of one restart (pre-warm, stop, provision)
+// cannot resolve three different boxes.
+//
+// Fail-SOFT: a DB hiccup returns the explicit value (usually "") rather than an
+// error. The alternative — failing the call — would make the pre-flight decline
+// the restart, so a transient DB blip would wedge restarts fleet-wide. An
+// unresolved provider is no worse than the pre-core#5025 wire.
+func (p *CPProvisioner) providerForWorkspace(ctx context.Context, workspaceID, explicit string) string {
+	if explicit != "" || workspaceID == "" {
+		return explicit
+	}
+	provider, err := resolveProvider(ctx, workspaceID)
+	if err != nil {
+		log.Printf("CP provisioner: could not resolve the compute provider for %s: %v — proceeding without it (the control plane will fall back to its own default)", workspaceID, err)
+		return explicit
+	}
+	return provider
+}
+
+// ensureImageStatusIsPermanent reports whether a non-2xx status is the control
+// plane ANSWERING (retrying returns the same answer) rather than the control
+// plane being UNAVAILABLE (retrying is the whole point).
+//
+// 4xx means the request was understood and refused — the core#5019 unobtainable
+// digest arrives as 422 and must fail closed immediately rather than spend three
+// backoffs holding the restart gate. The exceptions are the two 4xx codes that
+// are explicitly "try again": 408 and 429.
+func ensureImageStatusIsPermanent(status int) bool {
+	if status == http.StatusRequestTimeout || status == http.StatusTooManyRequests {
+		return false
+	}
+	return status >= 400 && status < 500
+}
+
 // EnsureImage asks the control plane to make this workspace's pinned image
 // obtainable before the caller stops anything.
 //
@@ -94,6 +190,14 @@ func (p *CPProvisioner) EnsureImage(ctx context.Context, req EnsureImageRequest)
 	if req.OrgID == "" {
 		req.OrgID = p.orgID
 	}
+	// core#5025: without this the `provider` field was ALWAYS absent on the
+	// ensure-image wire, and an absent provider is the SSOT default (AWS). The
+	// control plane therefore pre-warmed — or rather declined to pre-warm — an
+	// AWS box for a workspace that runs on the local-docker substrate, answered
+	// "not_applicable" with 200, and the tenant read that 2xx as permission to
+	// destroy the container. The guard reported success on every restart while
+	// guarding nothing.
+	req.Provider = p.providerForWorkspace(ctx, req.WorkspaceID, req.Provider)
 
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -130,8 +234,25 @@ func (p *CPProvisioner) EnsureImage(ctx context.Context, req EnsureImageRequest)
 	var result EnsureImageResult
 	unmarshalErr := json.Unmarshal(respBody, &result)
 
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNotImplemented {
+	// 501 is a POSITIVE signal on its own: the control plane routed the request
+	// and told us it does not implement it. 404 is not — see
+	// isCPRouteFamilyLive.
+	if resp.StatusCode == http.StatusNotImplemented {
 		return result, ErrEnsureImageUnsupported
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		if p.isCPRouteFamilyLive(ctx, req.WorkspaceID) {
+			return result, ErrEnsureImageUnsupported
+		}
+		// The control plane does not answer on /cp/workspaces/* at all, so this
+		// 404 came from a proxy, a stale route or a wrong base URL — not from a
+		// CP that predates the endpoint. Fail CLOSED. Treating it as version
+		// skew would put the entire fleet back on the core#5019 ordering while
+		// the log said "compatibility skip".
+		return result, fmt.Errorf(
+			"%w: ensure-image answered 404 and %s/cp/workspaces/* does not route either — "+
+				"this is a misrouted or misconfigured control-plane URL, not a control plane that "+
+				"predates the endpoint", ErrEnsureImagePermanent, p.baseURL)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Prefer the structured {"error": …}. Never echo the raw body: an
@@ -140,6 +261,9 @@ func (p *CPProvisioner) EnsureImage(ctx context.Context, req EnsureImageRequest)
 		msg := result.Error
 		if msg == "" {
 			msg = fmt.Sprintf("<unstructured body, %d bytes>", len(respBody))
+		}
+		if ensureImageStatusIsPermanent(resp.StatusCode) {
+			return result, fmt.Errorf("%w (%d): %s", ErrEnsureImagePermanent, resp.StatusCode, msg)
 		}
 		return result, fmt.Errorf("cp provisioner: ensure-image failed (%d): %s", resp.StatusCode, msg)
 	}

@@ -121,7 +121,18 @@ func TestEnsureImage_StatusMapping(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// A control plane that predates ensure-image still serves the
+				// rest of /cp/workspaces/*. That is the POSITIVE signal the 404
+				// compat branch requires (core#5025 finding 5): without it, a
+				// misrouted base URL would 404 identically and fail OPEN. The
+				// discrimination itself is pinned in
+				// cp_ensure_image_compat_test.go.
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"state":"running"}`))
+					return
+				}
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(tc.body))
 			}))

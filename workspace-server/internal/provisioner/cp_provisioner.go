@@ -166,11 +166,11 @@ func NewCPProvisioner() (*CPProvisioner, error) {
 	}
 
 	return &CPProvisioner{
-		baseURL:             baseURL,
-		orgID:               orgID,
-		sharedSecret:        sharedSecret,
-		adminToken:          adminToken,
-		cpAdminAPIKey:       cpAdminAPIKey,
+		baseURL:               baseURL,
+		orgID:                 orgID,
+		sharedSecret:          sharedSecret,
+		adminToken:            adminToken,
+		cpAdminAPIKey:         cpAdminAPIKey,
 		httpClient:            &http.Client{Timeout: cpAPITimeout},
 		provisionHTTPClient:   &http.Client{Timeout: cpProvisionTimeout},
 		ensureImageHTTPClient: &http.Client{Timeout: cpEnsureImageTimeout},
@@ -411,13 +411,20 @@ func (p *CPProvisioner) Start(ctx context.Context, cfg WorkspaceConfig) (string,
 		InstanceType:    cfg.InstanceType,
 		DiskGB:          cfg.DiskGB,
 		DataPersistence: cfg.DataPersistence,
-		Provider:        cfg.Provider,
-		Kind:            kind,
-		Display:         cfg.Display,
-		PlatformURL:     cfg.PlatformURL,
-		Env:             env,
-		ConfigFiles:     configFiles,
-		TemplateAssets:  templateAssets,
+		// core#5025: resolved through the SAME seam as EnsureImage and Stop.
+		// cfg.Provider arrives from payload.Compute.Provider, which the canvas
+		// compute VALIDATOR drops whenever the persisted id is outside the
+		// cloud/billable picker set (the local Molecules-Server box is not in
+		// it) — so a workspace could be pre-warmed for the box named on its row
+		// and then provisioned with no provider at all. The pre-flight is only a
+		// guard if it resolves the box the provision actually builds.
+		Provider:       p.providerForWorkspace(ctx, cfg.WorkspaceID, cfg.Provider),
+		Kind:           kind,
+		Display:        cfg.Display,
+		PlatformURL:    cfg.PlatformURL,
+		Env:            env,
+		ConfigFiles:    configFiles,
+		TemplateAssets: templateAssets,
 	}
 
 	body, err := json.Marshal(req)

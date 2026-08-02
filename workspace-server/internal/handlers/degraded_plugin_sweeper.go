@@ -16,16 +16,26 @@ import (
 // went unnoticed for five days, not five minutes).
 const DegradedPluginSweepInterval = 5 * time.Minute
 
-// degradedCountQuery builds the count query FROM the shared predicate rather
-// than restating it.
+// degradedCountQuery builds the count query FROM the shared relation AND the
+// shared predicate rather than restating either.
 //
 // admin_plugin_install_reports.go already flags the SQL/Go duplication of this
 // rule as a drift risk and pins the two to each other with a test. A third,
 // hand-written copy here is precisely how the alert would keep reporting 0
 // after the rule changed — a guard that reports success while covering nothing.
+//
+// core#5025 finding 8: reusing the PREDICATE was not enough, because the two
+// statements also disagreed about the RELATION. This query read
+// workspace_plugin_install_reports on its own while the contract endpoint
+// evaluated the same predicate over reports joined to workspaces, and deletes
+// here are soft — so a removed workspace's report row kept satisfying the
+// predicate and the gauge could never return to zero. Both readers now derive
+// from degradedFleetRelation, so there is one definition of "in scope" to
+// disagree about instead of two.
 func degradedCountQuery() string {
 	return fmt.Sprintf(
-		`SELECT count(*) FROM workspace_plugin_install_reports WHERE %s`,
+		`SELECT count(*) FROM %s WHERE %s`,
+		degradedFleetRelation,
 		degradedFleetPredicate,
 	)
 }
