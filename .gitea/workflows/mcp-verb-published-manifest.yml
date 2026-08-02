@@ -28,9 +28,24 @@ name: mcp-verb-published-manifest
 # mcp-plugin-delivery-contract-drift.yml). Promote into BP once it has soaked.
 #
 # AUTH: the read:package token for the molecule-ai npm registry is sourced from
-# the Infisical SSOT (NOT a Gitea Actions secret). It is MOLECULE_TEMPLATE_REPO_TOKEN
-# at /shared/controlplane (prod), which carries read:package on org molecule-ai —
-# the SAME token+path the merged mcp-server provenance gate (#70) fetches. The
+# the Infisical SSOT (NOT a Gitea Actions secret). It is MCP_SERVER_READPKG_TOKEN
+# at /shared/controlplane (prod) — a DEDICATED read:package-only token owned by
+# the `gitea-npm-publisher` machine user.
+#
+# It used to read MOLECULE_TEMPLATE_REPO_TOKEN from the same path, because that
+# token happened to carry read:package as well. That coupling broke: core#5018
+# deliberately re-minted the template token with `read:repository` ONLY (dropping
+# read:package) as a least-privilege narrowing, and revoked the old one. Template
+# cloning kept working, so nothing looked wrong — but this job started failing
+# with `npm error Incorrect or missing password`, and because it is path-triggered
+# on go.mod it had run ONCE in the following 100 workflow runs, so the breakage
+# sat latent.
+#
+# Worse than useless, in fact: @molecule-ai/mcp-server is anonymously readable
+# (verified: no-auth GET returns 200), so presenting the wrongly-scoped token
+# turned a working 200 into a 401. Keep this credential SEPARATE and
+# purpose-scoped so a narrowing of one consumer cannot silently disarm another.
+# The
 # only Gitea Actions secrets used here are the documented Infisical bootstrap
 # creds (INFISICAL_CI_CLIENT_ID / INFISICAL_CI_CLIENT_SECRET /
 # INFISICAL_CI_PROJECT_ID), already wired on this repo (reserved-path-review.yml
@@ -153,10 +168,10 @@ jobs:
               | python3 -c 'import json,sys; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); print(v if isinstance(v,str) and v else "")'
           }
 
-          MCP_SERVER_READPKG_TOKEN=$(read_secret MOLECULE_TEMPLATE_REPO_TOKEN %2Fshared%2Fcontrolplane)
+          MCP_SERVER_READPKG_TOKEN=$(read_secret MCP_SERVER_READPKG_TOKEN %2Fshared%2Fcontrolplane)
           echo "::add-mask::$MCP_SERVER_READPKG_TOKEN"
           if [ -z "$MCP_SERVER_READPKG_TOKEN" ]; then
-            echo "::error::Infisical returned empty for MOLECULE_TEMPLATE_REPO_TOKEN at /shared/controlplane (prod) — cannot resolve the published mcp-server manifest. Failing closed on a trusted context."
+            echo "::error::Infisical returned empty for MCP_SERVER_READPKG_TOKEN at /shared/controlplane (prod) — cannot resolve the published mcp-server manifest. Failing closed on a trusted context."
             exit 1
           fi
           echo "MCP_SERVER_READPKG_TOKEN=$MCP_SERVER_READPKG_TOKEN" >> "$GITHUB_ENV"
