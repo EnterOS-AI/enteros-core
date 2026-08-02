@@ -83,7 +83,7 @@ func TestStopForRestart_EmitsRestartPreStop(t *testing.T) {
 	read := captureProvLog(t)
 	h := &WorkspaceHandler{cpProv: &trackingCPProv{}}
 	defer func() { _ = recover() }()
-	h.stopForRestart(context.Background(), "ws-restart-1", "claude-code", "")
+	h.stopForRestart(context.Background(), "ws-restart-1", models.CreateWorkspacePayload{Runtime: "claude-code"})
 	got := read()
 	if !strings.Contains(got, "evt: restart.pre_stop ") {
 		t.Fatalf("expected restart.pre_stop emit, got log:\n%s", got)
@@ -104,7 +104,7 @@ func TestStopForRestart_EmitsRestartPreStop(t *testing.T) {
 func TestStopForRestart_EmitsBackendNoneWhenUnwired(t *testing.T) {
 	read := captureProvLog(t)
 	h := &WorkspaceHandler{} // both nil
-	h.stopForRestart(context.Background(), "ws-restart-2", "claude-code", "")
+	h.stopForRestart(context.Background(), "ws-restart-2", models.CreateWorkspacePayload{Runtime: "claude-code"})
 	got := read()
 	if !strings.Contains(got, `"backend":"none"`) {
 		t.Fatalf("expected backend=none for unwired handler: %s", got)

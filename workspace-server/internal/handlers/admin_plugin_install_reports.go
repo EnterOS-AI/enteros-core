@@ -165,12 +165,31 @@ func fleetReportFilterKeys() []string {
 // order, so the planner can walk the partial index instead of sorting a filtered
 // heap scan. It is also the order an operator wants — the most recent boot failure
 // is the one being investigated.
+// degradedFleetRelation is the SET OF ROWS every fleet-report question is asked
+// about: install-report rows joined to a workspace that still EXISTS.
+//
+// It is a constant, and both readers are built from it, because the two used to
+// be written out separately (core#5025 finding 8). The gauge counted
+// workspace_plugin_install_reports alone while this endpoint counted the join,
+// and the two answers diverged in the one way nobody checks: deletes here are
+// SOFT (workspace_crud writes status='removed' and leaves the row), so the
+// reports table's ON DELETE CASCADE never fires and a deleted workspace's report
+// row satisfies the predicate forever. The gauge could not return to zero, so
+// its alert could not clear, while the endpoint the alert sends an operator to
+// listed fewer workspaces than the number that paged them.
+//
+// `w.status <> 'removed'` is what makes "Live workspaces" — the metric's own HELP
+// text and this endpoint's whole purpose — true rather than aspirational. Every
+// other status (online, degraded, provisioning, paused, hibernated, failed) is a
+// workspace that still exists and whose missing plugin still matters.
+const degradedFleetRelation = `workspace_plugin_install_reports r
+		  JOIN workspaces w ON w.id = r.workspace_id AND w.status <> 'removed'`
+
 func fleetReportQuery(predicate string) string {
 	return `
 		SELECT r.workspace_id::text, w.name, r.declared, r.plugins_dir,
 		       r.installed, r.skipped, r.failed, r.swapped, r.reported_at
-		  FROM workspace_plugin_install_reports r
-		  JOIN workspaces w ON w.id = r.workspace_id
+		  FROM ` + degradedFleetRelation + `
 		 WHERE ` + predicate + `
 		 ORDER BY r.reported_at DESC
 		 LIMIT $1`

@@ -229,7 +229,7 @@ func (p *prewarmCPProv) GetConsoleOutput(_ context.Context, _ string) (string, e
 func TestEnsurePinnedImageBeforeStop_AllowsWhenCPConfirmsImage(t *testing.T) {
 	stub := &prewarmCPProv{ensureRes: provisioner.EnsureImageResult{Status: "ready", ImageRef: "reg/x@sha256:abc"}}
 	h := &WorkspaceHandler{cpProv: stub}
-	if !h.ensurePinnedImageBeforeStop(context.Background(), "ws-ok", "hermes", "hermes") {
+	if !h.ensurePinnedImageBeforeStop(context.Background(), "ws-ok", models.CreateWorkspacePayload{Runtime: "hermes", Template: "hermes"}) {
 		t.Fatal("a CP that confirms the pinned image is ready must ALLOW the stop")
 	}
 	if len(stub.calls) != 1 || stub.calls[0] != "EnsureImage" {
@@ -246,7 +246,7 @@ func TestEnsurePinnedImageBeforeStop_DeclinesWhenImageCannotBeObtained(t *testin
 	// disk-full class the longer timeout does nothing for.
 	stub := &prewarmCPProv{ensureErr: errors.New("manifest unknown: sha256:93dfaf12… not found in registry")}
 	h := &WorkspaceHandler{cpProv: stub}
-	if h.ensurePinnedImageBeforeStop(context.Background(), "ws-bad-digest", "hermes", "hermes") {
+	if h.ensurePinnedImageBeforeStop(context.Background(), "ws-bad-digest", models.CreateWorkspacePayload{Runtime: "hermes", Template: "hermes"}) {
 		t.Fatal("an unobtainable pinned image must DECLINE the stop — the running container is the only thing the user still has")
 	}
 }
@@ -258,7 +258,7 @@ func TestEnsurePinnedImageBeforeStop_AllowsOnOlderControlPlane(t *testing.T) {
 	// larger outage than the one being fixed. Any OTHER error still declines.
 	stub := &prewarmCPProv{ensureErr: provisioner.ErrEnsureImageUnsupported}
 	h := &WorkspaceHandler{cpProv: stub}
-	if !h.ensurePinnedImageBeforeStop(context.Background(), "ws-old-cp", "hermes", "hermes") {
+	if !h.ensurePinnedImageBeforeStop(context.Background(), "ws-old-cp", models.CreateWorkspacePayload{Runtime: "hermes", Template: "hermes"}) {
 		t.Fatal("a control plane without the ensure-image endpoint must not block restarts (pre-#5019 behaviour)")
 	}
 }
@@ -267,7 +267,7 @@ func TestEnsurePinnedImageBeforeStop_AllowsWhenNoCPProvisioner(t *testing.T) {
 	// Self-hosted / Docker path: there is no CP seam to ask, and the local
 	// provisioner resolves its own image. Nothing to guard, nothing to block.
 	h := &WorkspaceHandler{}
-	if !h.ensurePinnedImageBeforeStop(context.Background(), "ws-selfhost", "claude-code", "") {
+	if !h.ensurePinnedImageBeforeStop(context.Background(), "ws-selfhost", models.CreateWorkspacePayload{Runtime: "claude-code"}) {
 		t.Fatal("a handler with no CP provisioner must not block the Docker restart path")
 	}
 }
@@ -277,7 +277,7 @@ func TestStopForRestart_DeclinedPrewarmNeverReachesStop(t *testing.T) {
 	stub := &prewarmCPProv{ensureErr: errors.New("registry unreachable")}
 	h := &WorkspaceHandler{cpProv: stub}
 
-	stopped := h.stopForRestart(context.Background(), "ws-decline", "hermes", "hermes")
+	stopped := h.stopForRestart(context.Background(), "ws-decline", models.CreateWorkspacePayload{Runtime: "hermes", Template: "hermes"})
 
 	if stopped {
 		t.Fatal("stopForRestart must report false when the prewarm declined")
@@ -308,7 +308,7 @@ func TestStopForRestart_AllowedPrewarmStopsAfterEnsuring(t *testing.T) {
 	h := &WorkspaceHandler{cpProv: stub}
 	defer func() { _ = recover() }() // db.ClearWorkspaceKeys touches a nil Redis client under test
 
-	stopped := h.stopForRestart(context.Background(), "ws-allow", "hermes", "hermes")
+	stopped := h.stopForRestart(context.Background(), "ws-allow", models.CreateWorkspacePayload{Runtime: "hermes", Template: "hermes"})
 
 	if !stopped {
 		t.Fatal("stopForRestart must report true when the prewarm allowed the stop")

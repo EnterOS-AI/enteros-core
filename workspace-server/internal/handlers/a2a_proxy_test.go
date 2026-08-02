@@ -2259,7 +2259,7 @@ func TestStopForRestart_SaaSPath_DispatchesViaCPProv(t *testing.T) {
 	cp := &fakeCPProv{}
 	handler.SetCPProvisioner(cp)
 
-	if !handler.stopForRestart(context.Background(), "ws-saas-restart", "claude-code", "") {
+	if !handler.stopForRestart(context.Background(), "ws-saas-restart", models.CreateWorkspacePayload{Runtime: "claude-code"}) {
 		t.Fatal("stopForRestart must not decline when the CP confirms the pinned image")
 	}
 
@@ -2282,7 +2282,7 @@ func TestStopForRestart_NoProvisioner_NoOp(t *testing.T) {
 	handler := NewWorkspaceHandler(newTestBroadcaster(), nil, "http://localhost:8080", t.TempDir())
 	// no provisioner, no cpProv, no DB expectations set on mock — any
 	// unexpected query/exec will produce a sqlmock error.
-	handler.stopForRestart(context.Background(), "ws-orphan", "claude-code", "")
+	handler.stopForRestart(context.Background(), "ws-orphan", models.CreateWorkspacePayload{Runtime: "claude-code"})
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("stopForRestart no-provisioner path should not touch DB: %v", err)
 	}
@@ -2304,7 +2304,7 @@ func TestStopForRestart_ClearsCachedURL(t *testing.T) {
 
 	// No provisioner wired: stopForRestart is a no-op backend-wise, but it
 	// must still invalidate Redis routing keys.
-	handler.stopForRestart(context.Background(), wsID, "claude-code", "")
+	handler.stopForRestart(context.Background(), wsID, models.CreateWorkspacePayload{Runtime: "claude-code"})
 
 	_, err := db.GetCachedURL(context.Background(), wsID)
 	if err == nil {
