@@ -457,6 +457,28 @@ func (h *WorkspaceHandler) RestartWorkspaceAuto(ctx context.Context, workspaceID
 // flag to operators — it reads ?reset_session=true from the query
 // string when an operator wants to force a fresh session.
 func (h *WorkspaceHandler) RestartWorkspaceAutoOpts(ctx context.Context, workspaceID, templatePath string, configFiles map[string][]byte, payload models.CreateWorkspacePayload, resetClaudeSession bool) bool {
+	// core#5019 (structural half): PULL BEFORE STOPPING. This path is the manual
+	// POST /workspaces/:id/restart — it has its OWN stop leg and does not route
+	// through stopForRestart, so the guard is repeated here rather than
+	// inherited. Ask CP to make the pinned image obtainable first; a refusal
+	// means we keep the running container instead of trading it for an image
+	// that may never arrive.
+	//
+	// core#5025 finding 7: run it BEFORE taking the per-workspace gate below.
+	// The pre-flight is a QUESTION, not a mutation — it starts no container and
+	// stops none — and it is the one step here that can legitimately take
+	// minutes. Holding the gate across it made a slow or hung pull freeze every
+	// restart, heal and provision path for that workspace, so a registry stall
+	// presented as a dead workspace. Nothing is serialised by taking the gate
+	// later: the gate exists to keep two Stop+Start cycles from racing on the
+	// same ws-<id>, and neither has begun yet.
+	if h.cpProv != nil && !h.ensurePinnedImageBeforeStop(ctx, workspaceID, payload) {
+		log.Printf("RestartWorkspaceAuto: %s DECLINED — pinned image for runtime=%q template=%q could not be made available; the running container was left untouched (core#5019)",
+			workspaceID, payload.Runtime, payload.Template)
+		h.markRestartDeclined(ctx, workspaceID, payload.Name, payload.Runtime, payload.Template)
+		return false
+	}
+
 	// Per-workspace restart/provision GATE: serializes the Stop+Start
 	// cycle for this ws-<id> against any concurrent programmatic
 	// RestartByID path (runRestartCycle). Without this gate, the
@@ -472,28 +494,6 @@ func (h *WorkspaceHandler) RestartWorkspaceAutoOpts(ctx context.Context, workspa
 	// provision) but the gate is held by that goroutine — Unlock
 	// happens at the end of the provision, after the new container
 	// is up.
-	// core#5019 (structural half): PULL BEFORE STOPPING. This path is the manual
-	// POST /workspaces/:id/restart — it has its OWN stop leg and does not route
-	// through stopForRestart, so the guard is repeated here rather than
-	// inherited. Ask CP to make the pinned image obtainable first; a refusal
-	// means we keep the running container instead of trading it for an image
-	// that may never arrive.
-	//
-	// core#5025 finding 7: run it BEFORE taking the per-workspace gate. The
-	// pre-flight is a question, not a mutation — it starts no container and
-	// stops none — and it is the one step here that can legitimately take
-	// minutes. Holding the gate across it made a slow or hung pull freeze every
-	// restart, heal and provision path for that workspace, so a registry stall
-	// presented as a dead workspace. Nothing is serialised by taking the gate
-	// later: the gate exists to keep two Stop+Start cycles from racing on the
-	// same ws-<id>, and neither has begun yet.
-	if h.cpProv != nil && !h.ensurePinnedImageBeforeStop(ctx, workspaceID, payload) {
-		log.Printf("RestartWorkspaceAuto: %s DECLINED — pinned image for runtime=%q template=%q could not be made available; the running container was left untouched (core#5019)",
-			workspaceID, payload.Runtime, payload.Template)
-		h.markRestartDeclined(ctx, workspaceID, payload.Name, payload.Runtime, payload.Template)
-		return false
-	}
-
 	gate := acquireRestartProvisionGate(workspaceID)
 	gate.Lock()
 	// Stop leg first. CP-first ordering matches the other dispatchers

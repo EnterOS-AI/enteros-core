@@ -1218,24 +1218,34 @@ func (h *WorkspaceHandler) ensurePinnedImageBeforeStop(ctx context.Context, work
 		}
 		log.Printf("Restart: %s pre-warm attempt %d/%d failed (%v) — retrying in %s; a control plane that is momentarily unreachable says nothing about the image",
 			workspaceID, attempt, cpStopRetryAttempts, err, delay)
+		// Sleep with ctx awareness, exactly as cpStopWithRetryErr does: a
+		// budget that only bounds the CALLS and not the waits between them
+		// would still hold the caller for the full backoff chain.
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			err = fmt.Errorf("pre-warm budget %s exhausted after %d attempt(s): %w", restartPrewarmBudget, attempt, err)
-			attempt = cpStopRetryAttempts
+			return h.declineRestart(ctx, workspaceID, runtime, template, err)
 		case <-timer.C:
-		}
-		if ctx.Err() != nil {
-			break
 		}
 		delay *= 2
 	}
 
-	// LOUD: this is the branch that DECLINES a restart the caller asked for.
-	// Stable prefix so ops can grep it, and so it is distinguishable from an
-	// ordinary provision failure — nothing was broken here, something was
-	// PREVENTED from breaking.
+	return h.declineRestart(ctx, workspaceID, runtime, template, err)
+}
+
+// declineRestart is the single exit for "we will not destroy this container".
+//
+// One function rather than a copy at each exit: the budget-exhausted path and
+// the attempts-exhausted path must produce the SAME wire log, or an incident
+// reconstructed from provlog would show a decline for one cause and silence for
+// the other.
+//
+// LOUD by design. The prefix is stable so ops can grep it, and it is worded to
+// be distinguishable from an ordinary provision failure — nothing was broken
+// here, something was PREVENTED from breaking.
+func (h *WorkspaceHandler) declineRestart(_ context.Context, workspaceID, runtime, template string, err error) bool {
 	log.Printf("IMAGE-PREWARM-DECLINED restart workspace_id=%s runtime=%q template=%q err=%q — the workspace was NOT stopped; it keeps its running container (core#5019)",
 		workspaceID, runtime, template, err.Error())
 	provlog.Event("restart.image_prewarm_declined", map[string]any{
