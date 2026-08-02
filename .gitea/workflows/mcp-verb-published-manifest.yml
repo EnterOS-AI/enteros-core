@@ -101,9 +101,9 @@ jobs:
           node-version: '20'
 
       # Source the read:package token from the Infisical SSOT (NOT a Gitea
-      # Actions secret). It is MOLECULE_TEMPLATE_REPO_TOKEN at /shared/controlplane
-      # (prod) — the SAME token+path the merged mcp-server provenance gate (#70)
-      # fetches; that token carries read:package on org molecule-ai. The only
+      # Actions secret). It is MCP_SERVER_READPKG_TOKEN at /shared/controlplane
+      # (prod) — a DEDICATED read:package-only token (see the AUTH note in the
+      # header for why this must NOT be shared with the template-repo token). The only
       # Gitea Actions secrets consumed are the documented Infisical bootstrap
       # creds (INFISICAL_CI_CLIENT_ID / INFISICAL_CI_CLIENT_SECRET /
       # INFISICAL_CI_PROJECT_ID — the same ones reserved-path-review.yml already
