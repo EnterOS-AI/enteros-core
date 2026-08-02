@@ -248,6 +248,16 @@ jobs:
       # presence-only. This is the deep "callable" proof that catches a
       # present-but-not-runnable verb (the flaw that let regressions reach prod).
       E2E_ASSERT_MGMT_MCP_CALLABLE: '1'
+      # REQUIRE-LIVE posture (mirrors CP serving-e2e SERVING_E2E_REQUIRE_LIVE).
+      # requireStagingEnv SKIPs when STAGING_E2E/CP_BASE_URL/CP_ADMIN_API_TOKEN
+      # are absent, and `go test` reports a skipped-only package as `ok` — so a
+      # credential that silently stopped resolving would turn this HARD GATE into
+      # a green that asserted nothing, and under the `["*"]` branch-protection
+      # wildcard that green is indistinguishable from a real one. Under this flag
+      # a missing precondition is a LOUD FAILURE: a skip is a misconfiguration of
+      # CI, not an optional arm. It also makes the callable turn non-optional, so
+      # the gate can never silently degrade to presence-only.
+      GUARD_B_REQUIRE_CALLABLE: '1'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Force-fail hook (prove a red gate rolls back the fleet)
