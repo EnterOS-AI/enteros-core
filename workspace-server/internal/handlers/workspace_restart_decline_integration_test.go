@@ -208,3 +208,84 @@ func TestIntegration_ManualRestart_AllowedPrewarmDoesClearTheURL(t *testing.T) {
 			"destroyed container (core#3220)", gotURL)
 	}
 }
+
+// declineRecord reads the operator-visible evidence a declined restart is
+// required to leave: the reason on the row and the durable event.
+func declineRecord(t *testing.T, conn *sql.DB, id string) (reason string, events_ int) {
+	t.Helper()
+	var lastErr sql.NullString
+	if err := conn.QueryRow(`SELECT last_sample_error FROM workspaces WHERE id = $1`, id).Scan(&lastErr); err != nil {
+		t.Fatalf("read last_sample_error: %v", err)
+	}
+	if err := conn.QueryRow(
+		`SELECT count(*) FROM structure_events WHERE workspace_id = $1 AND event_type = $2`,
+		id, string(events.EventWorkspaceRestartDeclined)).Scan(&events_); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	return lastErr.String, events_
+}
+
+// TestIntegration_AutoRestartCycle_DeclineIsRecordedByTheCycleItself drives the
+// PROGRAMMATIC path end to end.
+//
+// Asserting markRestartDeclined works is not the same claim as asserting the
+// restart cycle calls it — and the second is the one that matters, because the
+// pre-fix bug was precisely that the cycle returned without recording anything.
+// A mutation that deletes the call from runRestartCycle must fail here.
+func TestIntegration_AutoRestartCycle_DeclineIsRecordedByTheCycleItself(t *testing.T) {
+	conn := restartDeclineDB(t)
+	setupTestRedis(t)
+	id, url := seedRoutableWorkspace(t, conn, "cycle-decline")
+
+	stub := &prewarmCPProv{ensureErr: errors.New("manifest unknown: sha256:93dfaf12")}
+	h := &WorkspaceHandler{cpProv: stub, broadcaster: newTestBroadcaster()}
+
+	h.runRestartCycle(id)
+	h.waitAsyncForTest()
+
+	for _, c := range stub.calls {
+		if c == "Stop" || c == "StopAndPrune" || c == "Start" {
+			t.Fatalf("precondition: an unobtainable image must stop and reprovision NOTHING; calls=%v", stub.calls)
+		}
+	}
+
+	reason, n := declineRecord(t, conn, id)
+	if reason == "" || n != 1 {
+		t.Fatalf("the auto-restart cycle declined and left last_sample_error=%q, %d durable event(s). "+
+			"An unrecoverable restart with no record is indistinguishable from a restart nobody ran — "+
+			"which is exactly how this went unnoticed.", reason, n)
+	}
+
+	status, gotURL := declineWorkspaceRow(t, conn, id)
+	if gotURL != url {
+		t.Errorf("the declined cycle cleared url (%q, was %q) — its container was never stopped", gotURL, url)
+	}
+	if status == string(models.StatusProvisioning) {
+		t.Errorf("status=provisioning after a restart that never started: the row now claims a "+
+			"transition that was refused (status=%q)", status)
+	}
+}
+
+// TestIntegration_ManualRestart_DeclineIsRecordedByTheDispatcher is the same
+// claim for the manual entry point, which has its own decline branch.
+func TestIntegration_ManualRestart_DeclineIsRecordedByTheDispatcher(t *testing.T) {
+	conn := restartDeclineDB(t)
+	setupTestRedis(t)
+	id, _ := seedRoutableWorkspace(t, conn, "dispatch-decline")
+
+	h := &WorkspaceHandler{
+		cpProv:      &prewarmCPProv{ensureErr: errors.New("no space left on device")},
+		broadcaster: newTestBroadcaster(),
+	}
+	if h.RestartWorkspaceAutoOpts(context.Background(), id, "", nil,
+		models.CreateWorkspacePayload{Name: "dispatch-decline", Runtime: "hermes"}, false) {
+		t.Fatal("precondition: the declined restart must report that nothing was dispatched")
+	}
+	h.waitAsyncForTest()
+
+	reason, n := declineRecord(t, conn, id)
+	if reason == "" || n != 1 {
+		t.Fatalf("the manual restart path declined and left last_sample_error=%q, %d durable event(s) — "+
+			"the operator who clicked Restart gets a 200 and no explanation anywhere", reason, n)
+	}
+}

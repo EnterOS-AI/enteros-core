@@ -182,3 +182,71 @@ func TestEnsureImage_RefusalsAreClassifiedPermanent(t *testing.T) {
 		}
 	}
 }
+
+// TestEnsureImage_404WithAnUnANSWERABLEProbeFailsClosed covers the probe's own
+// failure, which is a DIFFERENT situation from the probe answering 404.
+//
+// A half-broken path — the ensure-image route answers 404 while the probe can
+// not complete at all (connection dropped, TLS reset, a proxy that hangs up on
+// the second request) — tells us nothing about whether this deployment has the
+// endpoint. Reading "I could not check" as "old control plane" would restore the
+// fail-open on exactly the transient conditions that produce spurious 404s.
+func TestEnsureImage_404WithAnUnanswerableProbeFailsClosed(t *testing.T) {
+	stubResolveProvider(t, "")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			// Hang up mid-request: the client gets a transport error, not a
+			// status code.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("test server does not support hijack")
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("404 page not found"))
+	}))
+	defer srv.Close()
+
+	_, err := newEnsureImageTestProvisioner(srv.URL).
+		EnsureImage(context.Background(), EnsureImageRequest{WorkspaceID: "ws-halfbroken", Runtime: "hermes"})
+	if errors.Is(err, ErrEnsureImageUnsupported) {
+		t.Fatal("a probe that could not complete is not evidence of version skew. \"I could not check\" " +
+			"must never fail OPEN — that is the whole shape of core#5025 finding 5.")
+	}
+	if err == nil {
+		t.Fatal("a 404 we could not corroborate must not read as permission to destroy the container")
+	}
+}
+
+// TestEnsureImage_404WithNoProbeClientFailsClosed — an unwired HTTP client means
+// the capability probe cannot run at all.
+//
+// The direction matters more than it looks: this is the one branch where the
+// evidence is missing for a reason INSIDE this process, and a wiring bug that
+// silently restored the fail-open would degrade the whole fleet with nothing
+// external to blame it on. No evidence is not evidence of an old control plane.
+func TestEnsureImage_404WithNoProbeClientFailsClosed(t *testing.T) {
+	stubResolveProvider(t, "")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("404 page not found"))
+	}))
+	defer srv.Close()
+
+	p := newEnsureImageTestProvisioner(srv.URL)
+	p.httpClient = nil // the probe has nothing to call with
+
+	_, err := p.EnsureImage(context.Background(), EnsureImageRequest{WorkspaceID: "ws-unwired", Runtime: "hermes"})
+	if errors.Is(err, ErrEnsureImageUnsupported) {
+		t.Fatal("with no client to probe with, the 404 is uncorroborated and must fail CLOSED")
+	}
+	if err == nil {
+		t.Fatal("an uncorroborated 404 must not read as permission")
+	}
+}
