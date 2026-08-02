@@ -14,6 +14,7 @@ import (
 	"git.moleculesai.app/molecule-ai/molecule-core/workspace-server/internal/models"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
+	sdkcp "go.moleculesai.app/sdk/gen/go/cloudprovider"
 )
 
 func TestValidateWorkspaceCompute_AcceptsPhase1SizingAndDisplayNone(t *testing.T) {
@@ -36,9 +37,17 @@ func TestValidateWorkspaceCompute_RejectsUnknownInstanceType(t *testing.T) {
 	}
 }
 
-// Multi-provider: compute.provider must be "" (default AWS) or one of the wired
-// cloud backends. Pins the allowlist to the controlplane cloudprovider SSOT
-// (Supported = {aws, hetzner, gcp}); if the SSOT changes, update both sides.
+// Multi-provider: compute.provider must be "" (the default) or a SELECTABLE
+// provider from the SDK cloudprovider SSOT — every id in sdkcp.All plus its
+// accepted wire aliases.
+//
+// This used to pin the hardcoded set {aws, gcp, hetzner}, mirroring
+// sdkcp.CloudIDs(). That pin was the bug's fossil: CloudIDs is the BILLABLE cloud
+// subset, and using it as a validation allowlist made this validator 400 the
+// local Molecules-Server box — the only substrate prod runs on. The set is now
+// DERIVED from the SSOT so it cannot be re-narrowed by hand, and
+// TestValidateWorkspaceCompute_AcceptsMoleculesServer covers the local box
+// explicitly.
 func TestValidateWorkspaceCompute_Provider(t *testing.T) {
 	for _, ok := range []string{"", "aws", "gcp", "hetzner"} {
 		c := models.WorkspaceCompute{Provider: ok}
@@ -46,20 +55,116 @@ func TestValidateWorkspaceCompute_Provider(t *testing.T) {
 			t.Errorf("provider=%q must be accepted: %v", ok, err)
 		}
 	}
+	// Matching is EXACT: a wrong-cased or unknown id still 400s rather than being
+	// silently normalized into a valid one.
 	for _, bad := range []string{"AWS", "azure", "digitalocean", "ec2", "google", "hetzner-cloud"} {
 		c := models.WorkspaceCompute{Provider: bad}
 		if err := validateWorkspaceCompute(c); err == nil {
 			t.Errorf("provider=%q must be rejected", bad)
 		}
 	}
-	// Pin the exact SSOT-mirrored set so a silent drift fails here.
-	want := map[string]struct{}{"aws": {}, "gcp": {}, "hetzner": {}}
+	// Derive the expected set from the SSOT so a silent drift in EITHER direction
+	// fails here — a provider added to the SSOT but not accepted, or an entry in
+	// the allowlist that no longer corresponds to any SSOT id/alias.
+	want := map[string]struct{}{}
+	for _, p := range sdkcp.All {
+		want[p.ID] = struct{}{}
+		for _, a := range p.Aliases {
+			want[a] = struct{}{}
+		}
+	}
 	if len(workspaceComputeProviderAllowlist) != len(want) {
-		t.Fatalf("provider allowlist drifted from SSOT {aws,gcp,hetzner}: %v", workspaceComputeProviderAllowlist)
+		t.Fatalf("provider allowlist %v drifted from the SSOT-derived set %v",
+			workspaceComputeProviderAllowlist, want)
 	}
 	for p := range want {
 		if _, ok := workspaceComputeProviderAllowlist[p]; !ok {
 			t.Fatalf("provider allowlist missing %q (SSOT drift)", p)
+		}
+	}
+	for p := range workspaceComputeProviderAllowlist {
+		if _, ok := want[p]; !ok {
+			t.Fatalf("provider allowlist has %q, which is not an SSOT id or alias", p)
+		}
+	}
+}
+
+// TestValidateWorkspaceCompute_AcceptsMoleculesServer is the regression gate for
+// the substrate PRODUCTION ACTUALLY RUNS ON.
+//
+// THE BUG. validateWorkspaceCompute derived its allowlist from sdkcp.CloudIDs().
+// CloudIDs is a COST grouping — the providers with per-hour/per-GB cloud billing —
+// and it deliberately EXCLUDES the local self-hosted box, which has no cloud cost.
+// The SDK even has a test asserting Molecules-Server must not be in it, and that
+// test is right.
+//
+// Using a cost grouping as a VALIDATION allowlist meant the canvas validator
+// rejected "molecules-server" with a 400 — the only substrate every prod tenant
+// runs on (all 7 prod organizations.provider rows are 'local'). IDs() is the
+// accessor that means "everything selectable"; that is what a validator wants.
+//
+// The assertion is deliberately on the SDK's local box (sdkcp.MoleculesServer and
+// its aliases), not on a literal, so it tracks the SSOT rather than a copy of it.
+func TestValidateWorkspaceCompute_AcceptsMoleculesServer(t *testing.T) {
+	// The canonical id and both accepted wire aliases must all validate: the CP
+	// re-provision path POSTs provider="local", and "docker" is the
+	// PROVISIONER_BACKEND spelling.
+	for _, id := range []string{sdkcp.MoleculesServer, "local", "docker"} {
+		c := models.WorkspaceCompute{Provider: id}
+		if err := validateWorkspaceCompute(c); err != nil {
+			t.Errorf("provider=%q must be accepted — it is the substrate prod runs on: %v", id, err)
+		}
+	}
+
+	// The allowlist must be the FULL selectable set, not the billable cloud subset.
+	for _, id := range sdkcp.IDs() {
+		if _, ok := workspaceComputeProviderAllowlist[id]; !ok {
+			t.Errorf("selectable provider %q missing from the validation allowlist — "+
+				"the allowlist must derive from sdkcp.IDs()/All (everything selectable), "+
+				"not sdkcp.CloudIDs() (the billable cloud subset)", id)
+		}
+	}
+	// …and every accepted wire ALIAS, because those are what actually arrive:
+	// the CP re-provision path POSTs "local", and workspace_set_compute_instance
+	// PERSISTS the backend key, so compute.provider on a real Molecules-Server row
+	// literally reads "local".
+	var wantN int
+	for _, p := range sdkcp.All {
+		wantN += 1 + len(p.Aliases)
+		for _, a := range p.Aliases {
+			if _, ok := workspaceComputeProviderAllowlist[a]; !ok {
+				t.Errorf("accepted wire alias %q (of %q) missing from the validation allowlist", a, p.ID)
+			}
+		}
+	}
+	if len(workspaceComputeProviderAllowlist) != wantN {
+		t.Errorf("validation allowlist has %d entries, want %d (every selectable id + its aliases): %v",
+			len(workspaceComputeProviderAllowlist), wantN, workspaceComputeProviderAllowlist)
+	}
+
+	// GUARD, both directions. CloudIDs() must KEEP excluding the local box — this
+	// fix must not be "achieved" by widening the cost grouping, which would put a
+	// zero-cost box into the billing/pricing set. The canvas instance-type catalog
+	// (workspaceComputeProvidersOrdered) legitimately stays cloud-only: the local
+	// box has no machine-size catalog.
+	for _, id := range sdkcp.CloudIDs() {
+		if id == sdkcp.MoleculesServer {
+			t.Fatalf("Molecules-Server leaked into CloudIDs() — CloudIDs is a cost " +
+				"grouping and must not be widened to fix a validation bug")
+		}
+	}
+	for _, id := range workspaceComputeProvidersOrdered {
+		if id == sdkcp.MoleculesServer {
+			t.Fatalf("Molecules-Server leaked into the canvas instance-type provider " +
+				"list, which has no machine-size catalog for it")
+		}
+	}
+
+	// An unknown provider must STILL be rejected — widening the allowlist must not
+	// have turned it into a pass-through.
+	for _, bad := range []string{"azure", "digitalocean", "molecules_server", "MOLECULES-SERVER"} {
+		if err := validateWorkspaceCompute(models.WorkspaceCompute{Provider: bad}); err == nil {
+			t.Errorf("provider=%q must still be rejected", bad)
 		}
 	}
 }
@@ -401,14 +506,29 @@ func TestComputeOptions_AllowlistDerivedFromOrderedSSOT(t *testing.T) {
 	if len(workspaceComputeInstanceAllowlist) != len(workspaceComputeInstanceTypesOrdered) {
 		t.Fatalf("allowlist has providers not present in the ordered SSOT")
 	}
-	// Provider allowlist derived from the ordered providers.
-	if len(workspaceComputeProviderAllowlist) != len(workspaceComputeProvidersOrdered) {
-		t.Fatalf("provider allowlist (%d) drifted from ordered providers (%d)", len(workspaceComputeProviderAllowlist), len(workspaceComputeProvidersOrdered))
-	}
+	// The VALIDATION allowlist is a strict SUPERSET of the ordered canvas
+	// providers, not equal to it. The two lists answer different questions and are
+	// deliberately decoupled:
+	//
+	//	workspaceComputeProvidersOrdered   = sdkcp.CloudIDs() — the providers with a
+	//	                                     machine-size catalog the canvas renders
+	//	workspaceComputeProviderAllowlist  = sdkcp.All (ids + aliases) — everything a
+	//	                                     caller may legally select
+	//
+	// They used to be the same set, which is exactly the bug: the local
+	// Molecules-Server box has no instance-type catalog (so it is rightly absent
+	// from the ordered list) but IS selectable — and it is the substrate prod runs
+	// on, so validating against the ordered list 400'd it.
 	for _, p := range workspaceComputeProvidersOrdered {
 		if _, ok := workspaceComputeProviderAllowlist[p]; !ok {
-			t.Fatalf("provider allowlist missing ordered provider %q", p)
+			t.Fatalf("provider allowlist missing ordered provider %q — every provider the "+
+				"canvas can render must validate", p)
 		}
+	}
+	if len(workspaceComputeProviderAllowlist) <= len(workspaceComputeProvidersOrdered) {
+		t.Fatalf("provider allowlist (%d) must be a strict superset of the ordered canvas "+
+			"providers (%d): it also carries the local box and the wire aliases",
+			len(workspaceComputeProviderAllowlist), len(workspaceComputeProvidersOrdered))
 	}
 }
 
