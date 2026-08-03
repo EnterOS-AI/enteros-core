@@ -1350,6 +1350,62 @@ func (h *WorkspaceHandler) Create(c *gin.Context) {
 		}
 	}
 
+	// molecule-core#5035 — REQUIRED-ENV FAIL-FAST AT THE CREATE BOUNDARY.
+	//
+	// Empirical trigger (org reno-stars, 2026-08-02): the seo-agent template
+	// declares runtime_config.required_env: [TENANT_NAME, TENANT_DOMAIN,
+	// TENANT_DOMAIN_APEX, TENANT_DOMAIN_FULL, TENANT_TIMEZONE] and none were
+	// set for that org. Create logged at 21:36:11, the provision goroutine
+	// refused correctly at 21:36:15 — and the handler still answered 201
+	// Created at 21:36:17. The caller was handed a workspace id and a
+	// `provisioning` status for something the platform had ALREADY decided to
+	// refuse; it surfaced later only as status=failed with compute={}.
+	//
+	// This runs the SAME check (missingRequiredEnv, via
+	// createBoundaryMissingRequiredEnv) against the SAME config source the
+	// provision-time preflight uses, over the SAME secret env
+	// (loadWorkspaceSecrets) — no parallel validator, no new store. It runs
+	// here, at the end of config assembly, because this is the first point
+	// where the delivered config.yaml is final AND the payload's secrets are
+	// committed, and the last point before the async dispatch.
+	//
+	// Response shape matches the TEMPLATE_UNAVAILABLE gate above: the
+	// workspace row is already committed, so mark it failed (which also
+	// persists the reason to last_sample_error — the field this issue's read
+	// fix now surfaces) and return 422 naming the missing vars. No backend
+	// was picked, so there is nothing to deprovision.
+	//
+	// Fails OPEN on anything undecidable at this boundary — no readable
+	// config.yaml, a secret-load failure, a var a provision-time injector may
+	// supply (isProvisionInjectedEnv), or a self-host stack where
+	// applySelfHostTenantDefaults fills the TENANT_* vars itself. The
+	// provision-time preflight is unchanged and remains the backstop.
+	if reqEnv, _, _, secErr := loadWorkspaceSecrets(ctx, id); secErr == "" && reqEnv != nil {
+		if !PlatformManagedProxyConfigured() {
+			// Self-host: the provisioner generates branded TENANT_* placeholders
+			// rather than failing first boot (2026-07-19 operator decision), so
+			// mirror that here or the gate would 422 a create the provisioner
+			// would have happily completed.
+			applySelfHostTenantDefaults(reqEnv, createBoundaryMissingRequiredEnv(configFiles, templatePath, reqEnv))
+		}
+		if missing := createBoundaryMissingRequiredEnv(configFiles, templatePath, reqEnv); len(missing) > 0 {
+			msg := formatMissingEnvError(missing)
+			log.Printf("Create: 422 MISSING_REQUIRED_ENV (template=%q runtime=%q): %v [molecule-core#5035 create-boundary hard-reject]", payload.Template, payload.Runtime, missing)
+			h.markProvisionFailed(ctx, id, msg, map[string]interface{}{
+				"code":    "MISSING_REQUIRED_ENV",
+				"missing": missing,
+			})
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":    msg,
+				"missing":  missing,
+				"template": payload.Template,
+				"runtime":  payload.Runtime,
+				"code":     "MISSING_REQUIRED_ENV",
+			})
+			return
+		}
+	}
+
 	// Auto-provision — pick backend: control plane (SaaS) or Docker (self-hosted).
 	// Routing AND the no-backend mark-failed path are both inside
 	// provisionWorkspaceAuto (single source of truth). The Create-specific
@@ -1737,11 +1793,27 @@ func (h *WorkspaceHandler) Get(c *gin.Context) {
 
 	// Strip sensitive fields — GET /workspaces/:id is on the open router.
 	// Any caller with a valid UUID would otherwise read operational data.
+	//
+	// last_sample_error is NOT stripped (molecule-core#5035). It used to be,
+	// as "internal error details", and that strip is the whole reason a
+	// refused provision presented as a SILENT one: the platform records a
+	// precise, actionable reason in the column (markProvisionFailed persists
+	// the same abort message it broadcasts as WORKSPACE_PROVISION_FAILED),
+	// GET /workspaces already returns it, and this single-workspace read —
+	// the one canvas nodes and every operator poll actually hit — dropped it.
+	// Org reno-stars sat on a `failed` workspace with compute={} and no
+	// visible cause for weeks; the stored reason named the five unset
+	// TENANT_* vars and the exact place to set them.
+	//
+	// The strings are user-facing by construction: formatMissingEnvError /
+	// formatMissingModelError and friends are written to be rendered verbatim
+	// in the canvas Events tab and Details banner, and the same text is
+	// already published to clients on the WORKSPACE_PROVISION_FAILED event.
+	// The genuinely sensitive fields below stay stripped.
 	delete(ws, "budget_limit")
 	delete(ws, "monthly_spend")
-	delete(ws, "current_task")      // operational surveillance risk (#955)
-	delete(ws, "last_sample_error") // internal error details
-	delete(ws, "workspace_dir")     // host path disclosure
+	delete(ws, "current_task")  // operational surveillance risk (#955)
+	delete(ws, "workspace_dir") // host path disclosure
 
 	// #817: expose last_outbound_at so orchestrators can detect silent
 	// workspaces. Non-sensitive — just a timestamp of the most recent

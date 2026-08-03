@@ -1472,9 +1472,15 @@ func TestWorkspaceGet_FinancialFieldsStripped(t *testing.T) {
 }
 
 // TestWorkspaceGet_SensitiveFieldsStripped verifies that GET /workspaces/:id
-// does NOT expose current_task, last_sample_error, or workspace_dir. These
-// leak operational surveillance data and host paths to any caller with a
-// valid UUID. (#955)
+// does NOT expose current_task or workspace_dir. These leak operational
+// surveillance data and host paths to any caller with a valid UUID. (#955)
+//
+// last_sample_error was REMOVED from this strip set by molecule-core#5035: it
+// is the platform's own recorded reason for a failed provision, is already
+// published to the same clients via the WORKSPACE_PROVISION_FAILED broadcast
+// and via GET /workspaces, and stripping it here is what made a refused
+// provision indistinguishable from a silent one. See
+// TestWorkspaceGet_SurfacesLastSampleError for the positive assertion.
 func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 	mock := setupTestDB(t)
 	setupTestRedis(t)
@@ -1519,10 +1525,15 @@ func TestWorkspaceGet_SensitiveFieldsStripped(t *testing.T) {
 		t.Fatalf("failed to parse response: %v", err)
 	}
 
-	for _, field := range []string{"current_task", "last_sample_error", "workspace_dir"} {
+	for _, field := range []string{"current_task", "workspace_dir"} {
 		if _, present := resp[field]; present {
 			t.Errorf("%s must not appear in public GET response (got %v)", field, resp[field])
 		}
+	}
+	// #5035: the recorded failure reason IS returned — it is the only
+	// diagnosis surface a tenant has for a failed provision.
+	if got, present := resp["last_sample_error"]; !present || got != "panic: internal error at /secret/path.go:42" {
+		t.Errorf("last_sample_error must be surfaced on the public GET response (#5035), got %v (present=%v)", got, present)
 	}
 
 	// Sanity: discovery fields still present
