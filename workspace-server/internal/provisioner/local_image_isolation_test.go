@@ -2,6 +2,8 @@ package provisioner
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -139,5 +141,35 @@ func TestEnsureLocalImage_FailsClosedOnAnUnusableIsolationToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), LocalImageIsolationEnv) {
 		t.Errorf("error %q does not name %s — an operator cannot fix what the message does not point at", err, LocalImageIsolationEnv)
+	}
+}
+
+// The isolation is a CONTRACT BETWEEN TWO LANGUAGES: this package RESOLVES the
+// tag, and tests/e2e/*.sh WRITE it. Nothing in Go breaks if the constant is
+// renamed — the Go tests would follow it — but the shell would keep exporting
+// the old name and every "isolated" job would quietly land back on the shared
+// tag, which is core#5031 with the fix installed. So pin the literal, and pin
+// that the shell halves still name it.
+//
+// (Mutation testing found this: renaming LocalImageIsolationEnv was the one
+// mutant the Go suite could not kill.)
+func TestLocalImageIsolationEnv_IsTheNameTheE2EScriptsExport(t *testing.T) {
+	const want = "MOLECULE_LOCAL_IMAGE_ISOLATION"
+	if LocalImageIsolationEnv != want {
+		t.Fatalf("LocalImageIsolationEnv = %q, want %q — renaming it silently decouples the Go resolver from the shell writers", LocalImageIsolationEnv, want)
+	}
+
+	repo := filepath.Join("..", "..", "..")
+	for _, rel := range []string{
+		filepath.Join("tests", "e2e", "test_local_provision_lifecycle_e2e.sh"),
+		filepath.Join("tests", "e2e", "test_selfhost_concierge_schedules_e2e.sh"),
+	} {
+		body, err := os.ReadFile(filepath.Join(repo, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		if !strings.Contains(string(body), LocalImageIsolationEnv) {
+			t.Errorf("%s does not reference %s — it writes a tag this package will not resolve", rel, LocalImageIsolationEnv)
+		}
 	}
 }
